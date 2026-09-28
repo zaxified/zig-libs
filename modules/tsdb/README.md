@@ -152,11 +152,11 @@ never shrinks its file** and exposes no compaction/vacuum — so `liveSize`/`swe
 budget on the point data, never on `stat().size` (which a caller reads for itself, e.g. via its
 own `Io.Dir.statFile`).
 
-⚠ **Retention does not yet bound the file either.** kvtree keeps a leaf that deletes have emptied
-(no node merge yet), and time-series keys only move forward, so those leaves are never written
-again: a store that appends and sweeps at the same rate still grows (~60 KiB per 1000 points in
-and out, measured 2026-09-28). The fix is in kvtree's backlog (node merge / removing emptied
-leaves); until then a long-running store needs a cap on the file of its own.
+**Retention does bound the file**, though: kvtree recycles the pages of leaves a sweep empties, so
+a store that appends and sweeps at the same rate reaches a steady size (since 2026-09-28; before,
+the emptied leaves stayed in the tree and the file grew ~60 KiB per 1000 points in and out). The
+steady size is above `liveSize`: pages are not repacked, and pages freed while a reader holds a
+snapshot wait for it.
 
 ## Not in v1 (deliberate, see `SPEC.md`)
 

@@ -198,13 +198,33 @@ pub fn commit(
     // COW-apply down the tree; thread split separators back up, growing new
     // root levels for as long as the previous level still split.
     var pieces = try applyRec(&ctx, base.root, ops);
+    if (pieces.len == 0) {
+        // Every key is gone (`applyRec` drops emptied nodes): the new tree is
+        // the same single empty leaf a fresh file starts with.
+        pieces = try finishNodes(format.LeafBuilder, &ctx, format.LeafBuilder.init(arena));
+    }
     while (pieces.len > 1) {
         var nb = format.BranchBuilder.init(arena, pieces[0].id);
         for (pieces[1..]) |p|
             nb.cells.append(arena, .{ .sep = p.sep, .child = p.id }) catch return error.OutOfMemory;
         pieces = try finishNodes(format.BranchBuilder, &ctx, nb);
     }
-    const new_root = pieces[0].id;
+    var new_root = pieces[0].id;
+    // Root collapse: once children were dropped, the root may be a branch
+    // with a single child left, and so may that child. Each such level is
+    // replaced by its child. Only the root level ever goes, so every leaf
+    // stays at the same depth. The page given up is either one this commit
+    // wrote or a base page this commit makes unreachable; both are dead from
+    // the new tree on, which is what `ctx.freed` holds.
+    if (ctx.dropped) while (true) {
+        var rp: [page_size]u8 = undefined;
+        try readForCommit(pager, new_root, &rp);
+        if ((format.kindOf(&rp) orelse return error.Corrupt) != .branch) break;
+        const br = format.Branch.init(&rp);
+        if (br.count() != 0) break;
+        ctx.freed.append(arena, new_root) catch return error.OutOfMemory;
+        new_root = br.leftmost();
+    };
     const new_txn = base.txn_id + 1;
 
     // Every page in the old freelist chain is dead too (it was rebuilt above
@@ -272,6 +292,9 @@ const Ctx = struct {
     /// Base-tree pages made dead by this commit (parked on the freelist only
     /// after all of this commit's allocations — see `commit`'s doc comment).
     freed: std.ArrayList(PageId) = .empty,
+    /// A node was left empty and dropped from its parent this commit, so the
+    /// root may need collapsing (see `commit`).
+    dropped: bool = false,
 
     /// A fresh page for the new tree version: reuse a freed page only past
     /// the MVCC reclaim gate, otherwise grow the file.
@@ -324,7 +347,15 @@ fn reduceChanges(arena: Allocator, changes: []const Change) CommitError![]Op {
 /// original node becomes dead; the replacement piece(s) are written to fresh
 /// pages and returned for the parent to link (piece 0 in place, the rest
 /// inserted with their separators — the parent-insert half of a split).
-fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
+///
+/// No pieces at all means the subtree holds no key any more: a leaf the ops
+/// emptied, or a branch all of whose children went that way. The parent then
+/// drops the child together with its separator, so the page goes to the
+/// freelist instead of staying in the tree as an empty leaf for ever. That
+/// used to be the case, and a key range that only moves forward (a time
+/// series: append at the right, retention deletes at the left) never
+/// overwrote those leaves, so deleting old data did not stop the file growing.
+fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
     var page: [page_size]u8 = undefined;
     try readForCommit(ctx.pager, id, &page);
     ctx.freed.append(ctx.arena, id) catch return error.OutOfMemory;
@@ -342,6 +373,10 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
                     _ = b.del(op.key);
                 }
             }
+            if (b.entries.items.len == 0) {
+                ctx.dropped = true;
+                return &.{};
+            }
             return finishNodes(format.LeafBuilder, ctx, b);
         },
         .branch => {
@@ -353,36 +388,48 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
             // Rebuild the branch, routing each op run to its child: child i
             // covers [sep[i-1], sep[i]) with a key EQUAL to a separator going
             // right — the exact dual of the read path's childIndexFor.
-            var nb = format.BranchBuilder.init(ctx.arena, b.leftmost());
+            var nb = format.BranchBuilder.init(ctx.arena, undefined);
             // Every base cell plus one per op is the most a rebuild without
             // splits can hold; a split past that grows the list normally.
             nb.cells.ensureTotalCapacityPrecise(ctx.arena, ncells + ops.len) catch return error.OutOfMemory;
+            // The first child that survives becomes `leftmost` and its
+            // separator is dropped. When that is not the old leftmost (it was
+            // emptied), the new leftmost covers everything below the next
+            // separator, which is right: nothing below it is left.
+            var have_leftmost = false;
             var op_i: usize = 0;
             var ci: usize = 0;
             while (ci <= ncells) : (ci += 1) {
                 const child = b.childAtIndex(ci);
-                if (ci > 0)
-                    nb.cells.append(ctx.arena, .{ .sep = b.keyAt(ci - 1), .child = child }) catch return error.OutOfMemory;
+                const sep: []const u8 = if (ci > 0) b.keyAt(ci - 1) else "";
                 const start = op_i;
                 while (op_i < ops.len and
                     (ci == ncells or std.mem.lessThan(u8, ops[op_i].key, b.keyAt(ci))))
                     op_i += 1;
-                if (op_i > start) {
-                    const sub = try applyRec(ctx, child, ops[start..op_i]);
-                    // First piece replaces the child pointer in place…
-                    if (ci == 0)
-                        nb.leftmost = sub[0].id
-                    else
-                        nb.cells.items[nb.cells.items.len - 1].child = sub[0].id;
-                    // …each further piece threads its promoted separator in
-                    // right after it (recursive split, parent-insert half).
-                    for (sub[1..]) |p|
-                        nb.cells.append(ctx.arena, .{ .sep = p.sep, .child = p.id }) catch return error.OutOfMemory;
-                }
                 // An untouched child keeps its page: structural sharing with
                 // the base version is what makes MVCC snapshots cheap.
+                const one = [1]Piece{.{ .sep = sep, .id = child }};
+                const sub: []const Piece = if (op_i > start) try applyRec(ctx, child, ops[start..op_i]) else &one;
+                // No pieces: the child was emptied and goes, separator and
+                // all. Otherwise the first piece takes the child's place
+                // (under the child's separator) and each further piece
+                // threads its promoted separator in after it (recursive
+                // split, parent-insert half).
+                for (sub, 0..) |p, k| {
+                    if (!have_leftmost) {
+                        nb.leftmost = p.id;
+                        have_leftmost = true;
+                    } else {
+                        const cell_sep = if (k == 0) sep else p.sep;
+                        nb.cells.append(ctx.arena, .{ .sep = cell_sep, .child = p.id }) catch return error.OutOfMemory;
+                    }
+                }
             }
             std.debug.assert(op_i == ops.len);
+            if (!have_leftmost) {
+                ctx.dropped = true;
+                return &.{};
+            }
             return finishNodes(format.BranchBuilder, ctx, nb);
         },
     }
@@ -391,7 +438,7 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
 /// Split `first` for as long as any piece overflows, then write every piece
 /// to a freshly-allocated page. Works for leaves and branches (both split
 /// types expose `{ right, sep }`).
-fn finishNodes(comptime B: type, ctx: *Ctx, first: B) CommitError![]Piece {
+fn finishNodes(comptime B: type, ctx: *Ctx, first: B) CommitError![]const Piece {
     if (!first.overflows()) {
         // The common case -- one node in, one page out -- takes no lists.
         const pieces = ctx.arena.alloc(Piece, 1) catch return error.OutOfMemory;

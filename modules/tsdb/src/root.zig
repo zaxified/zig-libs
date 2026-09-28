@@ -2064,3 +2064,31 @@ test "F1: CorruptIndex/CorruptPoint reject paths actually fire on a malformed va
         try testing.expectError(error.CorruptPoint, r.next());
     }
 }
+
+test "retention bounds the file: appending and sweeping at the same rate reaches a steady size" {
+    // The 2026-09-28 measurement, as a test: 1000 points in and 1000 swept
+    // per round grew the file ~60 KiB a round, linearly, because kvtree kept
+    // the leaves the sweep emptied and a series never writes below its
+    // cutoff again. kvtree now drops emptied leaves, so their pages recycle.
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("cpu", &.{});
+
+    const per_round = 1000;
+    const live_rounds = 4;
+    var points: [per_round]Sample = undefined;
+    var hw: [2]u64 = undefined;
+    var round: i64 = 0;
+    while (round < 80) : (round += 1) {
+        for (&points, 0..) |*p, i| p.* = .{ .ts = round * per_round + @as(i64, @intCast(i)), .value = @floatFromInt(i) };
+        try fx.db.appendBatch(&.{.{ .series = s, .points = &points }});
+        _ = try fx.db.sweep((round - live_rounds + 1) * per_round, .{});
+        if (round == 39) hw[0] = fx.tree.meta_rec.high_water;
+        if (round == 79) hw[1] = fx.tree.meta_rec.high_water;
+    }
+    try testing.expectEqual(hw[0], hw[1]);
+    const got = try collect(testing.allocator, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, live_rounds * per_round), got.len);
+    try testing.expectEqual(@as(i64, (80 - live_rounds) * per_round), got[0].ts);
+}

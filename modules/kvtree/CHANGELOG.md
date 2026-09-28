@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BEHAVIOURAL, not breaking: a node left empty by deletes leaves the tree**
+  (found adopting `tsdb` in ttydesk). A commit that empties a leaf drops it from its parent with its
+  separator, a branch left with no children goes too, and the root collapses while it is a branch
+  with a single child; the pages go to the freelist under the usual reclaim gate. Before, emptied
+  leaves stayed in the tree for good, so a key range that only moves forward (tsdb retention)
+  never reused them: the file grew ~60 KiB per 1000 points appended and swept; it now reaches a
+  steady size. On-disk format unchanged and existing files keep working, but an empty leaf
+  already in one goes only when a commit touches its key range — for a time series that is never,
+  so a file that grew before this keeps those pages (rebuild it to get them back). No API change.
 - **2026-09-22** — **`Txn.getRef`: a read inside a transaction without the
   copy.** A buffered change is lent from the txn's arena, anything else from
   the base tree exactly as `Db.getRef` lends it; release before the txn is

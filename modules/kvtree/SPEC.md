@@ -140,7 +140,8 @@ accounting; it is named separately because the MVCC-safety property is
 genuinely distinct from crash-atomicity (LMDB implements them in separate
 places), not to pad the tier. Everything else — page/node codecs, in-node
 binary search, B-tree node **split** (textbook, unit-tested directly; deletes
-are in-place with no merge/rebalance yet — see backlog), the
+are in-place with no merge/rebalance yet — see backlog — except that a node
+left EMPTY is dropped, below), the
 `Pager`, the freelist container, the read/descend/cursor path, and fresh-store
 init — is mechanical scaffold, written and green today. If a future reviewer
 finds `reclaimGate` collapses cleanly into `commit`, folding it in is fair; the
@@ -203,26 +204,41 @@ for lockless readers, and crash-recovery to a committed prefix — under the sam
 `fsync`-honesty caveat `kv` documents (a lying drive/hypervisor is below this
 library). Cross-*process* exclusion is not provided (one `Db` per store).
 
+**Emptied nodes leave the tree** (2026-09-28, found adopting tsdb in ttydesk). A
+leaf that a commit's deletes leave with no entries is not written back: `applyRec`
+returns no pieces for it and the parent drops the child together with its
+separator (when the dropped child was the leftmost, the next surviving child
+becomes leftmost and its separator goes — it now covers everything below the
+following separator, which holds no keys). A branch all of whose children went
+the same way is dropped in turn, and a commit that deletes every key ends with a
+single empty leaf root, as a fresh file starts. Every dropped page was visited by
+the commit, so it is already in `ctx.freed` and reaches the freelist under the
+same reclaim gate as any COW-dead page — an open snapshot still pins it. Once
+something was dropped, `commit` collapses the root while it is a branch with a
+single child (the replaced page goes to `ctx.freed` too). Only whole subtrees and
+the root level ever disappear, so every leaf stays at one depth. Before this,
+emptied leaves stayed in the tree, and a key range that only moves forward (a time
+series: append at the right, retention deletes at the left) never wrote to them
+again — measured: tsdb appending and sweeping 1000 points a round grew the file
+~60 KiB a round, linearly; now it reaches a steady size (`tsdb` test "retention
+bounds the file", `kvtree` test "retention on a forward-moving key range …").
+Tests: a random model check with range deletes, delete-all and open snapshots
+over a 3–4-level tree (long keys), checking after every commit that leaves share
+one depth, no non-root leaf is empty, the root is never a one-child branch, every
+key is inside its separator range, and every page below `high_water` is a meta,
+tree, freelist-chain or freelist-entry page (a dropped page never handed to the
+freelist would be lost). Six schemata mutants of the change are all killed.
+
 ## Backlog / deferred (mechanical, orthogonal to the Fable core)
 
 - **Overflow pages** for keys/values larger than a page fits (today: rejected
   with `error.EntryTooLarge`), mirroring `kv`'s large-value handling.
 - **Node merge / rebalance-by-borrow** on underflow (today: deletes remove the
-  key in place — underflowed and empty leaves persist until overwritten, which
+  key in place — an underfull leaf stays as it is until written again, which
   wastes space but never corrupts; merging and borrowing from a fuller sibling
-  are mechanical additions).
-  ⚠ **Priority raised (2026-09-28, found adopting tsdb in ttydesk):** "until
-  overwritten" never happens for a key range that only moves forward — tsdb's
-  time series (append at the right, retention deletes at the left). The
-  emptied leaves stay in the tree and are never recycled, so retention does
-  NOT bound the file: measured on one series, 1000 points appended + 1000
-  swept per commit round grows the file ~60 KiB per round, linearly, whatever
-  the live size (8–64 KiB live all grow alike; same with `sweep` and
-  `sweepToBudget`). Minimum fix: a delete that empties a leaf removes it from
-  its parent (and collapses a branch left with one child), so the page goes to
-  the freelist; merge/borrow on underflow is the full version. ttydesk
-  (`src/diskhist.zig`, `zig-libs request: kvtree`) latches its history off at
-  the file cap meanwhile.
+  are mechanical additions). The case that made the file grow without bound —
+  a leaf left EMPTY — is handled since 2026-09-28 (see "Emptied nodes leave the
+  tree" above); what is left is space efficiency under random deletes.
 - **Automatic freelist/space reclamation thresholds** and an in-memory page
   cache (compose with `ramcache`).
 

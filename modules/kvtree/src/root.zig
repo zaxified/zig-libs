@@ -1282,3 +1282,256 @@ test "getRef on a store that cannot lend is CannotLend, never a silent copy" {
     try std.testing.expectError(error.CannotLend, txn.getRef("b"));
     try std.testing.expectError(error.CannotLend, txn.getRef("k"));
 }
+
+// ── emptied nodes leave the tree (2026-09-28) ────────────────────────────────
+//
+// A delete that empties a leaf drops it from its parent, a branch left with
+// no children goes the same way, and a root left with one child collapses.
+// Before this, emptied leaves stayed in the tree for good: a key range that
+// only moves forward (tsdb's series, found adopting tsdb in ttydesk) never
+// wrote to them again, so retention deleted data and the file kept growing.
+
+/// A key long enough that a branch holds ~10 separators and a leaf ~9
+/// entries, so a few thousand keys make a tree 3-4 levels deep: the drops
+/// under test happen at every level, not just in one root leaf.
+const long_key_len = 300;
+
+fn longKey(buf: *[long_key_len]u8, id: u64) []const u8 {
+    std.mem.writeInt(u64, buf[0..8], id, .big);
+    @memset(buf[8..], 'k');
+    return buf;
+}
+
+const TreeShape = struct { depth: ?usize = null, tree_pages: usize = 0, keys: usize = 0 };
+
+/// Walk the current tree and check what dropping emptied nodes must keep
+/// true: every leaf at one depth, no empty leaf but an empty root, no root
+/// branch with a single child, every key inside its parent's separator range.
+/// Then the page accounting: every page below `high_water` is a meta page, a
+/// tree page, a freelist chain page or a freelist entry -- a page dropped
+/// from the tree but never handed to the freelist would be lost for good.
+fn checkTreeShape(db: *Db) !TreeShape {
+    var shape: TreeShape = .{};
+    try walkShape(db, db.meta_rec.root, 0, null, null, true, &shape);
+    var chain = try pager_mod.readFreelistChain(testing.allocator, &db.pager, db.meta_rec.free_root);
+    defer chain.deinit(testing.allocator);
+    try testing.expectEqual(db.meta_rec.high_water, format.first_data_page + shape.tree_pages + chain.pages.items.len + chain.fl.len());
+    return shape;
+}
+
+fn walkShape(db: *Db, id: PageId, depth: usize, lo: ?[]const u8, hi: ?[]const u8, is_root: bool, shape: *TreeShape) !void {
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(id, &page);
+    shape.tree_pages += 1;
+    switch (format.kindOf(&page).?) {
+        .leaf => {
+            const leaf = format.Leaf.init(&page);
+            if (!is_root) try testing.expect(leaf.count() > 0);
+            if (shape.depth) |d| try testing.expectEqual(d, depth) else shape.depth = depth;
+            var i: usize = 0;
+            while (i < leaf.count()) : (i += 1) {
+                const k = leaf.keyAt(i);
+                if (lo) |l| try testing.expect(!std.mem.lessThan(u8, k, l));
+                if (hi) |h| try testing.expect(std.mem.lessThan(u8, k, h));
+            }
+            shape.keys += leaf.count();
+        },
+        .branch => {
+            const br = format.Branch.init(&page);
+            if (is_root) try testing.expect(br.count() > 0);
+            var i: usize = 0;
+            while (i <= br.count()) : (i += 1) {
+                const clo = if (i == 0) lo else br.keyAt(i - 1);
+                const chi = if (i == br.count()) hi else br.keyAt(i);
+                try walkShape(db, br.childAtIndex(i), depth + 1, clo, chi, false, shape);
+            }
+        },
+    }
+}
+
+test "retention on a forward-moving key range keeps the file bounded (emptied leaves are recycled)" {
+    // tsdb's shape: every round appends a block of new keys at the right and
+    // deletes the oldest block at the left, so the live size is constant.
+    // Measured before the fix (tsdb, one series): the file grew ~60 KiB per
+    // round, linearly, whatever the live size.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "ts.kvt", .{});
+    defer db.close();
+
+    const block: u64 = 300;
+    const live_blocks: u64 = 4;
+    var hw_at: [3]u64 = undefined;
+    var round: u64 = 0;
+    while (round < 90) : (round += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try db.begin();
+        var i: u64 = 0;
+        while (i < block) : (i += 1) {
+            const kb = try a.create([long_key_len]u8);
+            try txn.put(longKey(kb, round * block + i), "value-0123456789");
+            if (round >= live_blocks) {
+                const db_ = try a.create([long_key_len]u8);
+                try txn.del(longKey(db_, (round - live_blocks) * block + i));
+            }
+        }
+        try txn.commit();
+
+        const shape = try checkTreeShape(&db);
+        try testing.expectEqual(@as(usize, @intCast(@min(round + 1, live_blocks) * block)), shape.keys);
+        if (round == 29) hw_at[0] = db.meta_rec.high_water;
+        if (round == 59) hw_at[1] = db.meta_rec.high_water;
+        if (round == 89) hw_at[2] = db.meta_rec.high_water;
+    }
+    // The old code grew by ~35 pages a round here; a steady state grows by 0.
+    try testing.expectEqual(hw_at[0], hw_at[1]);
+    try testing.expectEqual(hw_at[1], hw_at[2]);
+
+    // The data is the last `live_blocks` blocks, in order.
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    var want: u64 = (90 - live_blocks) * block;
+    while (try cur.next()) |e| : (want += 1)
+        try testing.expectEqual(want, std.mem.readInt(u64, e.key[0..8], .big));
+    try testing.expectEqual(@as(u64, 90 * block), want);
+}
+
+test "deletes that empty leaves, branches and the whole tree agree with a model, open snapshots included" {
+    const key_space = 2500;
+    const Model = [key_space]?u32;
+    const OpenSnap = struct { snap: Snapshot, model: *Model };
+
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{});
+        defer db.close();
+
+        var model: Model = @splat(null);
+        var snaps: std.ArrayList(OpenSnap) = .empty;
+        defer {
+            for (snaps.items) |*s| {
+                s.snap.release();
+                testing.allocator.destroy(s.model);
+            }
+            snaps.deinit(testing.allocator);
+        }
+
+        var round: u32 = 0;
+        while (round < 120) : (round += 1) {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var txn = try db.begin();
+            const Put = struct {
+                fn put(t: *Txn, al: Allocator, m: *Model, id: usize, ver: u32) !void {
+                    const kb = try al.create([long_key_len]u8);
+                    try t.put(longKey(kb, id), try std.fmt.allocPrint(al, "v{d:0>15}", .{ver}));
+                    m[id] = ver;
+                }
+                fn del(t: *Txn, al: Allocator, m: *Model, id: usize) !void {
+                    const kb = try al.create([long_key_len]u8);
+                    try t.del(longKey(kb, id));
+                    m[id] = null;
+                }
+            };
+            switch (r.uintLessThan(u8, 20)) {
+                // A contiguous run of new or overwritten keys: fills leaves.
+                0...6 => {
+                    const start = r.uintLessThan(usize, key_space);
+                    const n = r.uintLessThan(usize, 400);
+                    for (start..@min(key_space, start + n)) |id| try Put.put(&txn, a, &model, id, round);
+                },
+                // A contiguous range delete: empties whole leaves and branches.
+                7...11 => {
+                    const start = r.uintLessThan(usize, key_space);
+                    const n = r.uintLessThan(usize, 800);
+                    for (start..@min(key_space, start + n)) |id| try Put.del(&txn, a, &model, id);
+                },
+                // Scattered puts and deletes, including deletes of absent keys.
+                12...18 => for (0..1 + r.uintLessThan(usize, 60)) |_| {
+                    const id = r.uintLessThan(usize, key_space);
+                    if (r.boolean()) try Put.put(&txn, a, &model, id, round) else try Put.del(&txn, a, &model, id);
+                },
+                // Everything goes (and, in one commit, some of it comes back).
+                else => {
+                    for (0..key_space) |id| try Put.del(&txn, a, &model, id);
+                    if (r.boolean()) for (0..r.uintLessThan(usize, 30)) |_|
+                        try Put.put(&txn, a, &model, r.uintLessThan(usize, key_space), round);
+                },
+            }
+            try txn.commit();
+
+            _ = try checkTreeShape(&db);
+            try expectMatchesModel(try db.cursor(), &model);
+
+            // Snapshots pin pages the drops free; recycling one under a
+            // reader would show as a snapshot that no longer matches.
+            if (snaps.items.len < 3 and r.uintLessThan(u8, 5) == 0) {
+                const m = try testing.allocator.create(Model);
+                m.* = model;
+                try snaps.append(testing.allocator, .{ .snap = try db.snapshot(), .model = m });
+            }
+            var i: usize = 0;
+            while (i < snaps.items.len) {
+                const s = &snaps.items[i];
+                try expectMatchesModel(try s.snap.cursor(), s.model);
+                if (r.uintLessThan(u8, 6) == 0) {
+                    s.snap.release();
+                    testing.allocator.destroy(s.model);
+                    _ = snaps.swapRemove(i);
+                } else i += 1;
+            }
+        }
+    }
+}
+
+fn expectMatchesModel(cursor_in: Cursor, model: []const ?u32) !void {
+    var cur = cursor_in;
+    defer cur.deinit();
+    try cur.first();
+    var next_id: usize = 0;
+    while (try cur.next()) |e| {
+        const id: usize = @intCast(std.mem.readInt(u64, e.key[0..8], .big));
+        while (next_id < id) : (next_id += 1) try testing.expect(model[next_id] == null);
+        var vb: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&vb, "v{d:0>15}", .{model[id].?}), e.val);
+        next_id = id + 1;
+    }
+    while (next_id < model.len) : (next_id += 1) try testing.expect(model[next_id] == null);
+}
+
+test "a two-level tree whose leaves all empty but one collapses to that leaf" {
+    // Only leaves are dropped here (no branch empties), and the root is left
+    // with one child: the collapse has to happen on leaf drops alone.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+    defer db.close();
+    var kb: [long_key_len]u8 = undefined;
+    for (0..40) |id| try db.put(longKey(&kb, id), "v");
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(db.meta_rec.root, &page);
+    try testing.expectEqual(format.NodeKind.branch, format.kindOf(&page).?);
+    try testing.expectEqual(@as(?usize, 1), (try checkTreeShape(&db)).depth);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var txn = try db.begin();
+    for (0..39) |id| try txn.del(longKey(try arena.allocator().create([long_key_len]u8), id));
+    try txn.commit();
+
+    try db.pager.readPage(db.meta_rec.root, &page);
+    try testing.expectEqual(format.NodeKind.leaf, format.kindOf(&page).?);
+    const shape = try checkTreeShape(&db);
+    try testing.expectEqual(@as(usize, 1), shape.keys);
+    try expectGet(&db, longKey(&kb, 39), "v");
+}

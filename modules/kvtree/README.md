@@ -24,7 +24,8 @@ that see a consistent snapshot without blocking the writer.
 > and a crash-point sweep over every storage side effect of a commit, across
 > all four `kv.SimStorage` crash modes. Remaining scaffold simplifications
 > (documented in `SPEC.md`'s backlog): no overflow pages for entries larger
-> than a page, merge-less deletes (empty leaves persist until overwritten).
+> than a page, merge-less deletes (a leaf a delete EMPTIES leaves the tree and
+> its page is recycled; an underfull one stays until written again).
 > The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
 > more pages than one page holds chains another, so nothing is silently
 > leaked. Chain-storage pages are recycled from the freelist like tree pages;

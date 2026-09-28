@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Retention now bounds the file: with kvtree dropping emptied leaves (same day),
+  appending and sweeping at the same rate reaches a steady file size instead of growing ~60 KiB
+  per 1000 points. No tsdb code change; README/SPEC corrected and a test pins the steady size.
 - **2026-09-28** — Series listing, multi-series batches, a size budget — requested by ttydesk
   (2026-09-27), which worked around all three in `src/diskhist.zig` (each marked `zig-libs
   request: tsdb — …`; the new API lets that workaround be deleted). New: `Db.seriesIterator()`
