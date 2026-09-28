@@ -44,3 +44,12 @@ modules/websocket/tools/oracle_handshake.py <scratch>/verify_response_probe
 **Measured 2026-09-17: 10/10 cases agree** (6 client-side `verifyResponse` cases, 4
 server-side `acceptHandshake` cases) — no case where this module's ACCEPT/REJECT
 decision differs from python-websockets'. Needs `pip install websockets==15.0.1`.
+
+**Stale as of 2026-09-28** for one row: `acceptHandshake`'s new `Origin` allow-list
+(SPEC.md "Server-side `Origin` check") makes the `server_cases` "Origin: https://evil.example"
+case a *known, deliberate* divergence rather than an agreement — this module's default policy
+now rejects it (`error.OriginNotAllowed`, Origin's host doesn't match `Host: h`), while
+python-websockets' bare `ServerProtocol` has no origin policy of its own to check it against.
+The other 9 rows are unaffected. Not re-run for this change (no python/go environment
+available); re-running would now report 9/10, with this row's comment in
+`verify_response_probe.zig` explaining why.

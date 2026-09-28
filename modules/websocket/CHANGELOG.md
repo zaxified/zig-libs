@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (requested by qap security review M6.2,
+  2026-09-24): `acceptHandshake` now checks the request's `Origin` header.
+  `ServerAcceptOptions` gains `origins: []const []const u8 = &.{}` (new field with a default, so
+  every existing call site — including `bacnet`'s `sc_ws.serverAccept`, which never sends an
+  `Origin`, and this module's own `example/main.zig` — keeps compiling and behaving unchanged for
+  requests with no `Origin` header). The default policy: no `Origin` header is allowed (RFC 6455
+  requires browsers to send one, so its absence means a non-browser caller); an `Origin` whose
+  authority matches the request's `Host` header, case-insensitively and byte-for-byte (no
+  default-port guessing — this module never learns the transport, so it cannot assume a scheme's
+  default port), is allowed; anything else is the new `error.OriginNotAllowed` (a typical caller
+  maps it to HTTP 403). Passing a non-empty `origins` list replaces the same-host default with an
+  explicit allow-list (`"*"` = any origin), the same shape as gorilla's `Upgrader.CheckOrigin`. A
+  duplicated `Origin` header is `error.DuplicateHeader`, same as the other handshake-critical
+  headers this module already checks. **Behavioural, not breaking, because no signature changed**
+  — but a caller whose clients send a cross-origin `Origin` header and relied on it being ignored
+  will now see `acceptHandshake` reject those requests; pass `.origins = &.{"*"}` to keep the old
+  "don't check" behavior explicitly. See SPEC.md's "`Origin` allow-list" for the full design and
+  matching rule, and `handshake.zig`'s `ServerAcceptOptions.origins` doc comment for the exact
+  API. Fixes the one case flagged stale in `tools/README.md`'s differential-oracle result (the
+  module now diverges from python-websockets' bare `ServerProtocol`, which enforces no `Origin`
+  policy of its own — a deliberate, documented divergence, not a regression).
+
 - **2026-09-24** — **New `handshake.respond(rw, accept)`**: answers a validated handshake from an
   `http.Server` handler — `Sec-WebSocket-Accept` (+ `Sec-WebSocket-Protocol`) and the 101 through
   `http`'s new `ResponseWriter.upgrade`. `writeResponse` stays for callers that own the raw writer.

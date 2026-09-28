@@ -89,6 +89,14 @@ const server_cases = [_]Case{
         "Sec-WebSocket-Key: " ++ KEY ++ "\r\n" ++
         "Sec-WebSocket-Version: 13, 8\r\n" ++
         "\r\n" },
+    // 2026-09-28: this case is now a KNOWN, DELIBERATE divergence, not an
+    // agreement — see SPEC.md's "Server-side Origin check" entry. Before
+    // that date neither side checked `Origin` at all, which is exactly the
+    // gap that entry closes: `acceptHandshake(head, .{})`'s default policy
+    // now rejects this (Origin's host `evil.example` != `Host: h`,
+    // `error.OriginNotAllowed`), while python-websockets' bare
+    // `ServerProtocol` still has no origin policy of its own to invoke here.
+    // `tools/README.md`'s measured agreement count is scoped to exclude it.
     .{ .name = "Origin: https://evil.example", .raw = "GET / HTTP/1.1\r\n" ++
         "Host: h\r\n" ++
         "Upgrade: websocket\r\n" ++

@@ -38,8 +38,8 @@ pub const HandshakeError = error{
     /// base64-encoded nonce (§4.2.1 point 5) — always exactly 24 base64
     /// characters for 16 bytes.
     InvalidKey,
-    /// `Upgrade`, `Connection`, `Sec-WebSocket-Version` or
-    /// `Sec-WebSocket-Key` appeared more than once (server-side request), or
+    /// `Upgrade`, `Connection`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`
+    /// or `Origin` appeared more than once (server-side request), or
     /// `Upgrade`, `Connection`, `Sec-WebSocket-Accept` or
     /// `Sec-WebSocket-Protocol` appeared more than once (client-side
     /// response). RFC 6455 §4.1/§4.2.1 say nothing about a duplicated
@@ -82,6 +82,16 @@ pub const HandshakeError = error{
     /// defense against a caller that forwards attacker-controlled values
     /// (e.g. `extra_headers` built from a cookie or bearer token).
     InvalidRequestField,
+    /// (Server side) the request's `Origin` header was rejected by
+    /// `ServerAcceptOptions.origins` — see that field's doc comment for the
+    /// exact default and matching rule. RFC 6455 itself enforces nothing
+    /// about `Origin` (unlike a plain cross-origin HTTP request, CORS never
+    /// applies to a WebSocket upgrade), so a server that relies on ambient
+    /// browser credentials (a session cookie, a client TLS certificate)
+    /// over the resulting connection is otherwise reachable from any page
+    /// the victim's browser has open. A typical caller maps this to
+    /// HTTP 403.
+    OriginNotAllowed,
 };
 
 /// SHA-1(key ++ guid), base64-encoded — RFC 6455 §1.3/§4.2.2 point 5.4.
@@ -127,6 +137,47 @@ pub const ServerAcceptOptions = struct {
     /// subprotocol negotiation happens and `ServerAccept.protocol` is
     /// always null.
     protocols: []const []const u8 = &.{},
+    /// `Origin` allow-list (qap security review M6.2, 2026-09-28). RFC 6455
+    /// requires every browser to send `Origin` on a WebSocket handshake
+    /// (§1.3) but the base protocol enforces nothing about its value —
+    /// unlike an ordinary cross-origin HTTP request, CORS never applies to a
+    /// WebSocket upgrade — so without a check here, any page a victim's
+    /// browser has open can open a socket to this server *as that browser*,
+    /// carrying its cookies and TLS client certificate. gorilla/websocket
+    /// (`Upgrader.CheckOrigin`) and Node `ws` (`verifyClient`) both default
+    /// to rejecting this; so does this module.
+    ///
+    /// **Empty (the default): same-host.** A request with no `Origin`
+    /// header at all (every browser sends one on a WebSocket handshake, so
+    /// this is a non-browser client — curl, a server-to-server client, this
+    /// module's own client side) is allowed; otherwise the `Origin`
+    /// header's authority (the part after `"scheme://"`) is compared
+    /// case-insensitively against the request's own `Host` header and must
+    /// match byte-for-byte. There is deliberately no default-port
+    /// normalization (`Origin: https://a.example` does NOT match
+    /// `Host: a.example:443`): this module is transport-agnostic (root.zig)
+    /// and never learns whether the connection arrived over plain TCP, TLS,
+    /// or a TLS-terminating proxy on some other port, so guessing which
+    /// scheme's default port applies would be guessing blind. `Origin: null`
+    /// (a browser's opaque origin — a sandboxed iframe, a `data:`/`file:`
+    /// page) and any other value with no `"://"` has no authority to
+    /// compare and is rejected.
+    ///
+    /// **Non-empty: an explicit allow-list, checked instead of (not in
+    /// addition to) the same-host default** — the same shape as gorilla's
+    /// `Upgrader.CheckOrigin`, where supplying a custom function replaces
+    /// its own same-origin default rather than layering onto it. A request
+    /// with no `Origin` header is still allowed (it isn't a browser
+    /// handshake, so there is nothing for this list to check); a request
+    /// that has one must match an entry case-insensitively against the
+    /// header's exact value (scheme included), or the list must contain the
+    /// literal entry `"*"` (allow any origin, opt-in — matching
+    /// `CheckOrigin` unconditionally returning true). A caller that wants
+    /// its own site's origin allowed alongside a partner's must list its
+    /// own origin explicitly; it is not implied by the same-host rule once
+    /// a list is given, so a real deployment doesn't get quietly widened by
+    /// forgetting the request wasn't actually cross-site.
+    origins: []const []const u8 = &.{},
 };
 
 pub const ServerAccept = struct {
@@ -151,7 +202,7 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
     // came first while an intermediary reading the last would believe a
     // different subprotocol won. Same class as the other four, closed the
     // same way.
-    inline for (.{ "upgrade", "connection", "sec-websocket-version", "sec-websocket-key", "sec-websocket-protocol" }) |name| {
+    inline for (.{ "upgrade", "connection", "sec-websocket-version", "sec-websocket-key", "sec-websocket-protocol", "origin" }) |name| {
         if (countHeader(head, name) > 1) return error.DuplicateHeader;
     }
 
@@ -166,6 +217,8 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
 
     const key = head.header("sec-websocket-key") orelse return error.MissingKey;
     try validateKey(key);
+
+    if (!originAllowed(head, options.origins)) return error.OriginNotAllowed;
 
     var protocol: ?[]const u8 = null;
     if (options.protocols.len > 0) {
@@ -202,6 +255,35 @@ fn selectProtocol(offered: []const u8, allowed: []const []const u8) ?[]const u8 
         }
     }
     return null;
+}
+
+/// `ServerAcceptOptions.origins` check (see its doc comment for the full
+/// rule). `head`, not just the raw `Origin` value, because the same-host
+/// default needs the request's own `Host` header too.
+fn originAllowed(head: h1.RequestHead, allowed: []const []const u8) bool {
+    const origin = head.header("origin") orelse return true; // no Origin: not a browser handshake
+
+    if (allowed.len == 0) {
+        // Default: same-host. The Origin's authority — the part after
+        // "scheme://" — compared case-insensitively against `Host`,
+        // verbatim, with no default-port guessing (see the doc comment on
+        // `ServerAcceptOptions.origins` for why). `Origin: null` and
+        // anything else with no "://" has no authority to extract and is
+        // rejected.
+        const host = head.header("host") orelse return false;
+        const sep = std.mem.indexOf(u8, origin, "://") orelse return false;
+        const authority = origin[sep + 3 ..];
+        return authority.len != 0 and std.ascii.eqlIgnoreCase(authority, host);
+    }
+
+    // Non-empty: an explicit allow-list, checked INSTEAD of the same-host
+    // default (see the doc comment) — "*" allows any origin, otherwise the
+    // header's exact value (scheme included) must match an entry.
+    for (allowed) |a| {
+        if (std.mem.eql(u8, a, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(origin, a)) return true;
+    }
+    return false;
 }
 
 /// Write the `101 Switching Protocols` response (§4.2.2) for a validated
@@ -418,7 +500,11 @@ test "acceptHandshake: RFC 1.3 example request" {
         "Sec-WebSocket-Protocol: chat, superchat\r\n" ++
         "Sec-WebSocket-Version: 13\r\n";
     const head = try h1.RequestHead.parse(req);
-    const accept = try acceptHandshake(head, .{ .protocols = &.{"chat"} });
+    // The RFC's own worked example has `Origin: http://example.com` against
+    // `Host: server.example.com` -- a real cross-origin request under the
+    // default same-host policy (this is a byte-fidelity test of the RFC
+    // vector, not an origin-policy test, so `"*"` opts out of it here).
+    const accept = try acceptHandshake(head, .{ .protocols = &.{"chat"}, .origins = &.{"*"} });
     try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &accept.accept_key);
     try testing.expectEqualStrings("chat", accept.protocol.?);
 
@@ -502,6 +588,101 @@ test "acceptHandshake: no protocols offered -> no negotiation, always null" {
     const head = try h1.RequestHead.parse(req);
     const accept = try acceptHandshake(head, .{});
     try testing.expectEqual(@as(?[]const u8, null), accept.protocol);
+}
+
+// ── ServerAcceptOptions.origins (qap security review M6.2, 2026-09-28) ────
+//
+// Each test would pass vacuously if the `originAllowed` check were deleted
+// (every request here is otherwise a valid RFC 6455 upgrade), so the assert
+// is always on `acceptHandshake`'s outcome for that exact request, not on a
+// helper called in isolation.
+
+test "acceptHandshake: default policy, absent Origin is allowed (not a browser)" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    _ = try acceptHandshake(head, .{});
+}
+
+test "acceptHandshake: default policy, same-host Origin is allowed" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://h\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    _ = try acceptHandshake(head, .{});
+}
+
+test "acceptHandshake: default policy, same-host match is case-insensitive" {
+    const req = "GET /chat HTTP/1.1\r\nHost: Api.Example.Test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: HTTPS://api.EXAMPLE.test\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    _ = try acceptHandshake(head, .{});
+}
+
+test "acceptHandshake: default policy, cross-origin Origin is rejected" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://evil.example\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.OriginNotAllowed, acceptHandshake(head, .{}));
+}
+
+test "acceptHandshake: default policy, matching port is required (no default-port guessing)" {
+    // Positive control: Origin and Host agree on the port, byte-for-byte.
+    {
+        const req = "GET /chat HTTP/1.1\r\nHost: a.example:8443\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://a.example:8443\r\nSec-WebSocket-Version: 13\r\n";
+        const head = try h1.RequestHead.parse(req);
+        _ = try acceptHandshake(head, .{});
+    }
+    // A port in Origin but not in Host (or vice versa) is a mismatch, not a
+    // guessed default -- even though 8443 vs. no-port would be a very
+    // plausible https-behind-a-reverse-proxy pairing in the real world.
+    {
+        const req = "GET /chat HTTP/1.1\r\nHost: a.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://a.example:8443\r\nSec-WebSocket-Version: 13\r\n";
+        const head = try h1.RequestHead.parse(req);
+        try testing.expectError(error.OriginNotAllowed, acceptHandshake(head, .{}));
+    }
+}
+
+test "acceptHandshake: default policy, malformed Origin (no scheme) is rejected" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: not-a-url\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.OriginNotAllowed, acceptHandshake(head, .{}));
+}
+
+test "acceptHandshake: default policy, Origin: null (browser opaque origin) is rejected" {
+    // Browsers send the literal string "null" for a sandboxed iframe or a
+    // data:/file: page -- not a parse error, but it has no authority to
+    // compare and is not automatically trusted just because it's a browser.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: null\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.OriginNotAllowed, acceptHandshake(head, .{}));
+}
+
+test "acceptHandshake: origins allow-list matches a listed origin, case-insensitively" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: HTTPS://Partner.Example\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    _ = try acceptHandshake(head, .{ .origins = &.{"https://partner.example"} });
+}
+
+test "acceptHandshake: origins allow-list rejects an unlisted origin, even one matching Host" {
+    // The list REPLACES the same-host default rather than adding to it
+    // (ServerAcceptOptions.origins doc comment) -- this Origin would pass
+    // the default policy (it matches Host) but the caller asked for exactly
+    // one origin and this isn't it.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://h\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.OriginNotAllowed, acceptHandshake(head, .{ .origins = &.{"https://partner.example"} }));
+}
+
+test "acceptHandshake: origins = \"*\" allows any origin" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://anything.example\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    _ = try acceptHandshake(head, .{ .origins = &.{"*"} });
+}
+
+test "acceptHandshake: rejects a duplicated Origin header" {
+    // Same class as the other five duplicated-header checks above: an
+    // intermediary that combines or picks-last from two Origin values would
+    // derive a different admit/deny decision than this parser's first-wins
+    // `head.header()` does.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://h\r\nOrigin: https://evil.example\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.DuplicateHeader, acceptHandshake(head, .{}));
 }
 
 test "client round trip: generateKey + writeRequest + verifyResponse" {

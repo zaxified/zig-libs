@@ -38,8 +38,12 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   `respond(rw, accept)` (server; `respond` answers from an `http.Server` handler); `generateKey(random) [24]u8` / `writeRequest(w, options)` /
   `verifyResponse(head, key, offered_protocols) ClientVerifyResult` (client); shared
   `computeAcceptKey(key) [28]u8`. Subprotocol negotiation via `ServerAcceptOptions.protocols` /
-  `ClientRequestOptions.protocols`. Every malformed/non-conformant handshake is a typed
-  `HandshakeError`, never a panic.
+  `ClientRequestOptions.protocols`. `ServerAcceptOptions.origins` is the server's `Origin`
+  allow-list (empty default = same-host: no `Origin` header, or one whose host matches the
+  request's `Host`; `"*"` allows any origin; a non-empty list otherwise replaces the same-host
+  default with an explicit allow-list) — a mismatch is `error.OriginNotAllowed`, typically mapped
+  to HTTP 403; see SPEC.md for the exact matching rule (case-insensitivity, port handling, `Origin:
+  null`). Every malformed/non-conformant handshake is a typed `HandshakeError`, never a panic.
 - **`frame`** — `Opcode` (continuation/text/binary/close/ping/pong), `Frame`, `Role` (`.server` /
   `.client` — which masking direction to enforce on parse), `parseFrame(buf, role,
   max_frame_size) FrameError!ParseResult` (streaming: `.frame`, `.need_more`, or a typed error —
@@ -69,7 +73,7 @@ copied.
 
 ## Verification
 
-`zig build test-websocket` — 77 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
+`zig build test-websocket` — 100 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
 handshake worked example and the §5.7 frame examples byte-exact (both parse and serialize),
 plus constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
 RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, each with a

@@ -24,6 +24,29 @@ convention), and `verifyResponse` recomputes the expected accept value and rejec
 cache, proxy, or non-WebSocket-aware server that answered `101` without actually understanding the
 protocol.
 
+**`Origin` allow-list** (requested by qap security review M6.2, 2026-09-28). RFC 6455 requires
+every browser to send `Origin` on a WebSocket handshake (§1.3) but the base protocol enforces
+nothing about its value: unlike an ordinary cross-origin HTTP request, CORS never applies to a
+WebSocket upgrade, so a server that leans on ambient browser credentials (a session cookie, a TLS
+client certificate) over the resulting connection could otherwise be driven cross-site by any page
+the victim's browser has open. `ServerAcceptOptions.origins` closes it: empty (the default) allows
+a request with no `Origin` header (not a browser handshake) or one whose `Origin` authority
+matches the request's own `Host` header, case-insensitively and byte-for-byte, with no default-port
+guessing — this module is transport-agnostic (root.zig) and never learns whether the connection
+came in over plain TCP, TLS, or a TLS-terminating proxy on some other port, so it cannot safely
+assume which scheme's default port a bare `Host` implies. A non-empty list is an explicit
+allow-list checked *instead of* the same-host default (matching gorilla's `Upgrader.CheckOrigin`,
+where a custom function replaces the built-in same-origin check rather than layering onto it);
+`"*"` in the list allows any origin. `Origin: null` and any value with no `"scheme://"` prefix have
+no authority to compare and are rejected by the default. A mismatch, or a listed-but-non-matching
+origin, is `error.OriginNotAllowed` — a typical caller maps it to HTTP 403. A duplicated `Origin`
+header is `error.DuplicateHeader`, same as every other handshake-critical header this module
+checks (§ below): an intermediary that combined or picked the last of two `Origin` values would
+derive a different admit/deny decision than this parser's first-wins `head.header()` does. See
+`ServerAcceptOptions.origins`'s doc comment (`handshake.zig`) for the exact matching rule and its
+test suite for the case list (allowed/refused/absent Origin, same-host default, allow-list match,
+`"*"`, case-insensitivity, port mismatch, malformed Origin, `Origin: null`, duplicate header).
+
 **Frame layer.** `frame.parseFrame(buf: []u8, role, max_frame_size)` is a streaming, allocation-free
 parser: `buf` is mutable because a masked payload is unmasked **in-place**, so `Frame.payload`
 always aliases plaintext application data regardless of whether the wire frame was masked. Three
@@ -147,14 +170,14 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   *does* read the response's `Sec-WebSocket-Extensions` (RFC 6455 §4.1 point 5), but only to reject
   it: since this module never offers an extension, any value the server names there is by
   definition one the client never requested, so the header's mere presence is
-  `error.UnexpectedExtension`. Also out of scope: origin-header policy / CSRF-via-WebSocket-handshake
-  checks (the caller's — this module surfaces the `Origin` header like any other but doesn't police
-  it, since the correct policy is application-specific), and automatic ping/keepalive scheduling
-  (the caller drives the event loop; `frame.pongFor` is the one building block provided).
+  `error.UnexpectedExtension`. Also out of scope: automatic ping/keepalive scheduling (the caller
+  drives the event loop; `frame.pongFor` is the one building block provided). **`Origin` policy is
+  no longer out of scope** — see "`Origin` allow-list" below; a caller that genuinely wants no
+  policy at all still can, explicitly, via `.origins = &.{"*"}`.
 
 ## Verification
 
-`zig build test-websocket` — 77 offline tests, green in Debug + ReleaseFast.
+`zig build test-websocket` — 100 offline tests, green in Debug + ReleaseFast.
 - **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example
   (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone
   `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the
@@ -315,8 +338,6 @@ bytes of a code point), checked per frame, and the whole-message check dropped. 
 has the same shape and baselines the four cases (`scripts/conformance-baseline/autobahn.tsv`).
 
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-**Server-side `Origin` check** — REQUESTED (2026-09-24, qap security review M6.2). `handshake.acceptHandshake` accepts any `Origin`, so a server that trusts ambient browser credentials (cookies, a TLS client certificate) can be hijacked across sites: another site's page opens the socket as the user, and CORS does not apply to WebSockets. gorilla/websocket (`Upgrader.CheckOrigin`, default = same host) and Node `ws` (`verifyClient`) both check it. Ideal API: `AcceptOptions.origins: []const []const u8` (allow-list, `"*"` = any), with the default letting through a request without `Origin` or one whose host equals `Host`, and a distinct error (`error.OriginNotAllowed` → 403). qap does it itself for now: `ws.originAllowed` (`src/ws.zig`, marked `zig-libs request: websocket`).
 
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
