@@ -359,3 +359,33 @@ test "the size estimates count the workers, and hold as a bound" {
         try zstd.estimateStreamSize(.{ .level = 3, .pledged_size = zstdmt.job_size_min, .advanced = .{ .nb_workers = 2 } }),
     );
 }
+
+test "a prefix is raw content unless told otherwise, as ZSTD_CCtx_refPrefix's" {
+    // With workers and long-distance matching the content type shows: only
+    // a raw prefix is loaded into the serial LDM state (libzstd makes any
+    // other an internal CDict). `zstd --patch-from` depends on it.
+    const gpa = std.testing.allocator;
+    const base = try gpa.alloc(u8, 600_000);
+    defer gpa.free(base);
+    corpus.generate(.{ .name = "", .len = base.len, .kind = .words, .seed = 11 }, base);
+    const src = try std.mem.concat(gpa, u8, &.{ base[0..90_000], "CHANGED", base[90_000..] });
+    defer gpa.free(src);
+    const out = try gpa.alloc(u8, 3 * zstd.compressBound(src.len));
+    defer gpa.free(out);
+    const adv: zstd.Advanced = .{ .nb_workers = 2, .long_distance_matching = .enable, .window_log = 20 };
+    const types = [_]?zstd.DictContentType{ null, .raw_content, .auto };
+    var frames: [3][]const u8 = undefined;
+    var at: usize = 0;
+    for (types, &frames) |ct, *f| {
+        const prefix: zstd.Prefix = if (ct) |c| .{ .bytes = base, .content_type = c } else .{ .bytes = base };
+        var s = try zstd.Stream.init(gpa, .{ .level = 1, .advanced = adv, .dictionary = .{ .prefix = prefix }, .pledged_size = src.len });
+        defer s.deinit();
+        var o: zstd.OutBuffer = .{ .dst = out[at..] };
+        var in: zstd.InBuffer = .{ .src = src };
+        while (try s.compressStream2(&o, &in, .end) != 0) {}
+        f.* = o.dst[0..o.pos];
+        at += o.pos;
+    }
+    try std.testing.expectEqualSlices(u8, frames[1], frames[0]);
+    try std.testing.expect(frames[0].len * 10 < frames[2].len); // the LDM found the prefix
+}

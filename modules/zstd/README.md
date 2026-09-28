@@ -411,6 +411,10 @@ the *head* of the content when the header needs room. Content only (a
 raw-content dictionary): `coverContent` / `fastCoverContent` (and `*Into`).
 `getDictId`, `getDictHeaderSize` read a finished one.
 
+Messages: libzstd's trainers talk on stderr by `notificationLevel`; here
+every trainer's parameters take `.notify = .{ .level = 2, .writer = w }`
+for the same text at the same levels (nothing without a writer).
+
 Memory: `memory_limit` (default 256 MiB) bounds all the working memory —
 content selection (cover: 8 bytes per sample byte, `estimateCoverMemory`;
 fastCover: 6 · 2^f bytes, `estimateFastCoverMemory`), finalization and the

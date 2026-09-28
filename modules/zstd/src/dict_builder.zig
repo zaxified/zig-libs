@@ -127,6 +127,8 @@ pub const CoverParams = struct {
     /// Working-memory ceiling (the dictionary buffer not counted); see
     /// `estimateCoverMemory` for the content selection's share.
     memory_limit: usize = default_memory_limit,
+    /// `zParams.notificationLevel` (see `Notify`).
+    notify: Notify = .{},
 };
 
 /// `ZDICT_fastCover_params_t` as `ZDICT_trainFromBuffer_fastCover` reads it.
@@ -148,6 +150,8 @@ pub const FastCoverParams = struct {
     /// Working-memory ceiling (the dictionary buffer not counted); see
     /// `estimateFastCoverMemory` for the content selection's share.
     memory_limit: usize = default_memory_limit,
+    /// `zParams.notificationLevel` (see `Notify`).
+    notify: Notify = .{},
 };
 
 // ---------------------------------------------------------------------------
@@ -192,6 +196,17 @@ pub fn dmerCount(training_size: u64, d: u32) u64 {
     return if (training_size < read_len) 0 else training_size - read_len + 1;
 }
 
+/// `zParams.notificationLevel` and where the messages go (`zdict.Notify`).
+pub const Notify = zdict.Notify;
+
+/// `COVER_warnOnSmallCorpus`: at level 1, when the samples have fewer
+/// than ten d-mers per dictionary byte.
+pub fn warnOnSmallCorpus(max_dict_size: usize, nb_dmers: usize, n: Notify) void {
+    const ratio = @as(f64, @floatFromInt(nb_dmers)) / @as(f64, @floatFromInt(max_dict_size));
+    if (ratio >= 10) return;
+    n.at(1, "WARNING: The maximum dictionary size {d} is too large compared to the source size {d}! size(source)/size(dictionary) = {d:.6}, but it should be >= 10! This may lead to a subpar dictionary! We recommend training on sources at least 10x, and preferably 100x the size of the dictionary! \n", .{ @as(u32, @truncate(max_dict_size)), @as(u32, @truncate(nb_dmers)), ratio });
+}
+
 /// How `COVER_ctx_init` / `FASTCOVER_ctx_init` split the samples into a
 /// training and a testing share, with their checks.
 pub const Split = struct {
@@ -201,6 +216,12 @@ pub const Split = struct {
     training_size: u64,
 
     pub fn init(samples: Samples, d: u32, split_point: f64) Error!Split {
+        return initNotify(.cover, samples, d, split_point, .{});
+    }
+
+    /// `init` with the context's messages: a refusal's reason at level 1
+    /// (worded as `trainer`'s), then the shares at level 2.
+    fn initNotify(trainer: Trainer, samples: Samples, d: u32, split_point: f64, n: Notify) Error!Split {
         // libzstd's callers check the split point before the context; the
         // context-level API here checks it itself (NaN passes, as there).
         if (split_point <= 0 or split_point > 1) return error.ParameterOutOfBound;
@@ -211,13 +232,33 @@ pub const Split = struct {
         const nb_train: usize = if (split_point < 1.0) @intFromFloat(@as(f64, @floatFromInt(nb)) * split_point) else nb;
         const nb_test: usize = if (split_point < 1.0) nb - nb_train else nb;
         const training_size = if (split_point < 1.0) sum(samples.sizes[0..nb_train]) else total;
-        if (total < @max(d, 8) or total >= max_samples_size) return error.SrcSizeWrong;
-        if (nb_train < 5) return error.SrcSizeWrong;
-        if (nb_test < 1) return error.SrcSizeWrong;
+        if (total < @max(d, 8) or total >= max_samples_size) {
+            n.at(1, "Total samples size is too large ({d} MB), maximum size is {d} MB\n", .{ @as(u32, @truncate(total >> 20)), max_samples_size >> 20 });
+            return error.SrcSizeWrong;
+        }
+        // Check if there are at least 5 training samples
+        if (nb_train < 5) {
+            if (trainer == .cover)
+                n.at(1, "Total number of training samples is {d} and is invalid.", .{nb_train})
+            else
+                n.at(1, "Total number of training samples is {d} and is invalid\n", .{nb_train});
+            return error.SrcSizeWrong;
+        }
+        // Check if there's testing sample
+        if (nb_test < 1) {
+            if (trainer == .cover)
+                n.at(1, "Total number of testing samples is {d} and is invalid.", .{nb_test})
+            else
+                n.at(1, "Total number of testing samples is {d} and is invalid.\n", .{nb_test});
+            return error.SrcSizeWrong;
+        }
         // A training share shorter than one d-mer: libzstd's size arithmetic
         // underflows there (reachable only with a split point below 1);
         // refused here instead.
         if (training_size < @max(d, 8)) return error.SrcSizeWrong;
+        const test_size = if (split_point < 1.0) total - training_size else total;
+        n.at(2, "Training on {d} samples of total size {d}\n", .{ nb_train, @as(u32, @truncate(training_size)) });
+        n.at(2, "Testing on {d} samples of total size {d}\n", .{ nb_test, @as(u32, @truncate(test_size)) });
         return .{ .nb_train_samples = nb_train, .nb_test_samples = nb_test, .total_size = total, .training_size = training_size };
     }
 
@@ -363,7 +404,11 @@ pub const CoverContext = struct {
     /// `COVER_ctx_init`. Refuses (`error.MemoryLimitExceeded`) before
     /// allocating when `memory` exceeds `memory_limit`.
     pub fn init(gpa: Allocator, samples: Samples, d: u32, split_point: f64, memory_limit: usize) Error!CoverContext {
-        const split: Split = try .init(samples, d, split_point);
+        return initNotify(gpa, samples, d, split_point, memory_limit, .{});
+    }
+
+    fn initNotify(gpa: Allocator, samples: Samples, d: u32, split_point: f64, memory_limit: usize, n: Notify) Error!CoverContext {
+        const split: Split = try .initNotify(.cover, samples, d, split_point, n);
         const suffix_size = split.nbDmers(d);
         if (memory(samples.sizes.len, suffix_size) > memory_limit) return error.MemoryLimitExceeded;
         const offsets = try offsetsOf(gpa, samples.sizes);
@@ -388,8 +433,10 @@ pub const CoverContext = struct {
         // the element's address and glibc's qsort_r is a merge sort, so
         // within a d-mer the positions stay ascending; the (d-mer, position)
         // order here is that same total order, whatever the sort.
+        n.at(2, "Constructing partial suffix array\n", .{});
         for (suffix, 0..) |*s, i| s.* = @intCast(i);
         std.sort.pdq(u32, suffix, &ctx, strictLessThan);
+        n.at(2, "Computing frequencies\n", .{});
         // `COVER_groupBy` with `COVER_group`: each run of equal d-mers.
         var start: usize = 0;
         while (start < suffix.len) {
@@ -506,8 +553,14 @@ pub const CoverContext = struct {
     /// content is `dict[tail..]`. Consumes `freqs` (a copy of `ctx.freqs`,
     /// or `ctx.freqs` itself for a single build).
     pub fn buildDictionary(ctx: *const CoverContext, freqs: []u32, active: *ActiveDmers, dict: []u8, k: u32, d: u32) usize {
+        return ctx.buildDictionaryNotify(freqs, active, dict, k, d, .{});
+    }
+
+    fn buildDictionaryNotify(ctx: *const CoverContext, freqs: []u32, active: *ActiveDmers, dict: []u8, k: u32, d: u32, n: Notify) usize {
         var tail = dict.len;
         const epochs = computeEpochs(@truncate(dict.len), @intCast(ctx.suffix_size), k, 4);
+        n.at(2, "Breaking content into {d} epochs of size {d}\n", .{ epochs.num, epochs.size });
+        defer n.at(2, Notify.clear79, .{});
         const max_zero_score_run: usize = @max(10, @min(100, epochs.num >> 3));
         var zero_score_run: usize = 0;
         var epoch: usize = 0;
@@ -576,16 +629,32 @@ pub fn estimateCoverMemory(total_samples_size: u64, nb_samples: usize, params: C
 /// is `dict[dict.len - n ..]` for the returned n (the rest of `dict` is
 /// left as it was). Checks in libzstd's order, then the memory ceiling.
 pub fn coverContentInto(gpa: Allocator, dict: []u8, samples: Samples, params: CoverParams) Error!usize {
-    if (!checkCoverParameters(params.k, params.d, 1.0, dict.len)) return error.ParameterOutOfBound;
-    if (samples.sizes.len == 0) return error.SrcSizeWrong;
-    if (dict.len < dict_size_min) return error.DstSizeTooSmall;
-    const split: Split = try .init(samples, params.d, 1.0);
+    const n = params.notify;
+    if (!checkCoverParameters(params.k, params.d, 1.0, dict.len)) {
+        n.at(1, "Cover parameters incorrect\n", .{});
+        return error.ParameterOutOfBound;
+    }
+    if (samples.sizes.len == 0) {
+        n.at(1, "Cover must have at least one input file\n", .{});
+        return error.SrcSizeWrong;
+    }
+    if (dict.len < dict_size_min) {
+        n.at(1, "dictBufferCapacity must be at least {d}\n", .{dict_size_min});
+        return error.DstSizeTooSmall;
+    }
+    const split: Split = Split.init(samples, params.d, 1.0) catch |e| {
+        // again, for the context's reason (it stops where it did)
+        _ = Split.initNotify(.cover, samples, params.d, 1.0, n) catch {};
+        return e;
+    };
     if (estimateCoverMemory(split.total_size, samples.sizes.len, params) > params.memory_limit) return error.MemoryLimitExceeded;
-    var ctx: CoverContext = try .init(gpa, samples, params.d, 1.0, params.memory_limit);
+    var ctx: CoverContext = try .initNotify(gpa, samples, params.d, 1.0, params.memory_limit, n);
     defer ctx.deinit(gpa);
+    warnOnSmallCorpus(dict.len, ctx.suffix_size, n);
     var active: ActiveDmers = try .init(gpa, params.k - params.d + 1);
     defer active.deinit(gpa);
-    const tail = ctx.buildDictionary(ctx.freqs, &active, dict, params.k, params.d);
+    n.at(2, "Building dictionary\n", .{});
+    const tail = ctx.buildDictionaryNotify(ctx.freqs, &active, dict, params.k, params.d, n);
     return dict.len - tail;
 }
 
@@ -665,7 +734,11 @@ pub const FastCoverContext = struct {
     /// 1..31. Refuses before allocating when `memory` exceeds
     /// `memory_limit`.
     pub fn init(gpa: Allocator, samples: Samples, d: u32, split_point: f64, f: u32, accel: Accel, memory_limit: usize) Error!FastCoverContext {
-        const split: Split = try .init(samples, d, split_point);
+        return initNotify(gpa, samples, d, split_point, f, accel, memory_limit, .{});
+    }
+
+    fn initNotify(gpa: Allocator, samples: Samples, d: u32, split_point: f64, f: u32, accel: Accel, memory_limit: usize, n: Notify) Error!FastCoverContext {
+        const split: Split = try .initNotify(.fast_cover, samples, d, split_point, n);
         if (memory(samples.sizes.len, f) > memory_limit) return error.MemoryLimitExceeded;
         const offsets = try offsetsOf(gpa, samples.sizes);
         errdefer gpa.free(offsets);
@@ -683,6 +756,7 @@ pub const FastCoverContext = struct {
             .f = f,
             .accel = accel,
         };
+        n.at(2, "Computing frequencies\n", .{});
         ctx.computeFrequency(freqs);
         return ctx;
     }
@@ -745,8 +819,14 @@ pub const FastCoverContext = struct {
     /// `FASTCOVER_buildDictionary`: as `CoverContext.buildDictionary`, with
     /// one pass planned and a stop after 10 empty epochs in a row.
     pub fn buildDictionary(ctx: *const FastCoverContext, freqs: []u32, dict: []u8, k: u32, d: u32, segment_freqs: []u16) usize {
+        return ctx.buildDictionaryNotify(freqs, dict, k, d, segment_freqs, .{});
+    }
+
+    fn buildDictionaryNotify(ctx: *const FastCoverContext, freqs: []u32, dict: []u8, k: u32, d: u32, segment_freqs: []u16, n: Notify) usize {
         var tail = dict.len;
         const epochs = computeEpochs(@truncate(dict.len), @intCast(ctx.nb_dmers), k, 1);
+        n.at(2, "Breaking content into {d} epochs of size {d}\n", .{ epochs.num, epochs.size });
+        defer n.at(2, Notify.clear79, .{});
         const max_zero_score_run: usize = 10;
         var zero_score_run: usize = 0;
         var epoch: usize = 0;
@@ -808,19 +888,36 @@ pub fn estimateFastCoverMemory(nb_samples: usize, params: FastCoverParams) u64 {
 /// `ZDICT_trainFromBuffer_fastCover` up to its finalization; see
 /// `coverContentInto`.
 pub fn fastCoverContentInto(gpa: Allocator, dict: []u8, samples: Samples, params: FastCoverParams) Error!usize {
+    const n = params.notify;
     const f = resolvedF(params.f);
     const accel = resolvedAccel(params.accel);
-    if (!checkFastCoverParameters(params.k, params.d, 1.0, dict.len, f, accel)) return error.ParameterOutOfBound;
-    if (samples.sizes.len == 0) return error.SrcSizeWrong;
-    if (dict.len < dict_size_min) return error.DstSizeTooSmall;
-    _ = try Split.init(samples, params.d, 1.0);
+    if (!checkFastCoverParameters(params.k, params.d, 1.0, dict.len, f, accel)) {
+        n.at(1, "FASTCOVER parameters incorrect\n", .{});
+        return error.ParameterOutOfBound;
+    }
+    if (samples.sizes.len == 0) {
+        n.at(1, "FASTCOVER must have at least one input file\n", .{});
+        return error.SrcSizeWrong;
+    }
+    if (dict.len < dict_size_min) {
+        n.at(1, "dictBufferCapacity must be at least {d}\n", .{dict_size_min});
+        return error.DstSizeTooSmall;
+    }
+    _ = Split.init(samples, params.d, 1.0) catch |e| {
+        // again, for the context's reason (it stops where it did)
+        _ = Split.initNotify(.fast_cover, samples, params.d, 1.0, n) catch {};
+        n.at(1, "Failed to initialize context\n", .{});
+        return e;
+    };
     if (estimateFastCoverMemory(samples.sizes.len, params) > params.memory_limit) return error.MemoryLimitExceeded;
-    var ctx: FastCoverContext = try .init(gpa, samples, params.d, 1.0, f, accel_table[accel], params.memory_limit);
+    var ctx: FastCoverContext = try .initNotify(gpa, samples, params.d, 1.0, f, accel_table[accel], params.memory_limit, n);
     defer ctx.deinit(gpa);
+    warnOnSmallCorpus(dict.len, ctx.nb_dmers, n);
+    n.at(2, "Building dictionary\n", .{});
     const segment_freqs = try gpa.alloc(u16, @as(usize, 1) << @intCast(f));
     defer gpa.free(segment_freqs);
     @memset(segment_freqs, 0);
-    const tail = ctx.buildDictionary(ctx.freqs, dict, params.k, params.d, segment_freqs);
+    const tail = ctx.buildDictionaryNotify(ctx.freqs, dict, params.k, params.d, segment_freqs, n);
     return dict.len - tail;
 }
 
@@ -867,6 +964,10 @@ pub const OptimizeParams = struct {
     /// at once (refused alone, it is `error.MemoryLimitExceeded`, as with
     /// one thread). The allocator must be thread-safe.
     nb_threads: u32 = 1,
+    /// `zParams.notificationLevel` (see `Notify`): the optimizer's own
+    /// messages at this level, its contexts' and candidates' one lower, as
+    /// libzstd turns its global level down while it runs.
+    notify: Notify = .{},
 };
 
 pub const Trainer = enum { cover, fast_cover };
@@ -1052,6 +1153,8 @@ fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
         d: u32 = 0,
         slots: []Slot = &.{},
         threads: []std.Thread = &.{},
+        /// The optimizer's level; its contexts and candidates get one lower.
+        notify: Notify = .{},
 
         /// One candidate (`COVER_tryParameters`): its content built on a
         /// copy of the context's frequencies, then scored.
@@ -1069,15 +1172,15 @@ fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
                 if (trainer == .cover) {
                     var active: ActiveDmers = try .init(a, k - d + 1);
                     defer active.deinit(a);
-                    break :blk ctx.buildDictionary(freqs, &active, slot.scratch, k, d);
+                    break :blk ctx.buildDictionaryNotify(freqs, &active, slot.scratch, k, d, o.notify.lowered());
                 } else {
                     const segment_freqs = try a.alloc(u16, ctx.freqs.len);
                     defer a.free(segment_freqs);
                     @memset(segment_freqs, 0);
-                    break :blk ctx.buildDictionary(freqs, slot.scratch, k, d, segment_freqs);
+                    break :blk ctx.buildDictionaryNotify(freqs, slot.scratch, k, d, segment_freqs, o.notify.lowered());
                 }
             };
-            return o.scorer.select(Candidate{
+            const selection = try o.scorer.select(Candidate{
                 .content = slot.scratch[tail..],
                 .buffer = slot.scratch,
                 .capacity = o.capacity,
@@ -1090,6 +1193,8 @@ fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
                 .offsets = ctx.offsets,
                 .gpa = a,
             });
+            if (selection == null) o.notify.lowered().at(1, "Failed to select dictionary\n", .{});
+            return selection;
         }
 
         fn worker(o: *Self, slot: *Slot) void {
@@ -1185,11 +1290,13 @@ fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
             while (next.* <= o.grid.k_max) {
                 const k: u32 = @intCast(next.*);
                 next.* += o.grid.k_step_size;
+                o.notify.at(3, "k={d}\n", .{k});
                 const ok = if (trainer == .cover)
                     checkCoverParameters(k, o.d, o.grid.split_point, o.capacity)
                 else
                     checkFastCoverParameters(k, o.d, o.grid.split_point, o.capacity, o.ctx.f, o.grid.accel);
                 if (ok) return k;
+                o.notify.lowered().at(1, if (trainer == .cover) "Cover parameters incorrect\n" else "FASTCOVER parameters incorrect\n", .{});
             }
             return null;
         }
@@ -1203,9 +1310,13 @@ var optimize_slots: std.atomic.Value(usize) = .init(0);
 var optimize_static_par: std.atomic.Value(usize) = .init(0);
 
 fn optimize(comptime trainer: Trainer, gpa: Allocator, budget: ?*LimitedAllocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) (Optimizer(trainer, @TypeOf(scorer)).Err || Error)!Optimized {
-    const grid: OptimizeGrid = try .init(trainer, params, samples.sizes.len, dict.len);
+    const n = params.notify;
+    const grid: OptimizeGrid = OptimizeGrid.init(trainer, params, samples.sizes.len, dict.len) catch |e| {
+        gridRefusal(trainer, params, samples.sizes.len, dict.len, n);
+        return e;
+    };
     const O = Optimizer(trainer, @TypeOf(scorer));
-    var o: O = .{ .gpa = gpa, .budget = budget, .meta = if (budget) |b| b.child else gpa, .scorer = scorer, .grid = grid, .capacity = dict.len, .samples = samples };
+    var o: O = .{ .gpa = gpa, .budget = budget, .meta = if (budget) |b| b.child else gpa, .scorer = scorer, .grid = grid, .capacity = dict.len, .samples = samples, .notify = n };
     // no more slots than one d has candidates
     const per_d: u64 = 1 + (grid.k_max - grid.k_min) / grid.k_step_size;
     const threads: u64 = if (builtin.single_threaded) 1 else @max(params.nb_threads, 1);
@@ -1214,16 +1325,26 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, budget: ?*LimitedAllocato
     optimize_slots.store(o.slots.len, .monotonic);
     var best: ?Optimized = null;
     var best_size: u64 = std.math.maxInt(u64);
+    n.at(2, "Trying {d} different sets of parameters\n", .{grid.iterations});
+    var warned = false;
     // u64 counters: libzstd's unsigned ones wrap (and loop forever) when
     // d or k is near 2^32.
     var d64: u64 = grid.d_min;
     while (d64 <= grid.d_max) : (d64 += 2) {
         const d: u32 = @intCast(d64);
-        var ctx: O.Ctx = if (trainer == .cover)
-            try .init(gpa, samples, d, grid.split_point, params.memory_limit)
+        n.at(3, "d={d}\n", .{d});
+        var ctx: O.Ctx = (if (trainer == .cover)
+            O.Ctx.initNotify(gpa, samples, d, grid.split_point, params.memory_limit, n.lowered())
         else
-            try .init(gpa, samples, d, grid.split_point, grid.f, accel_table[grid.accel], params.memory_limit);
+            O.Ctx.initNotify(gpa, samples, d, grid.split_point, grid.f, accel_table[grid.accel], params.memory_limit, n.lowered())) catch |e| {
+            if (e != error.MemoryLimitExceeded and e != error.OutOfMemory) n.at(1, "Failed to initialize context\n", .{});
+            return e;
+        };
         defer ctx.deinit(gpa);
+        if (!warned) {
+            warnOnSmallCorpus(dict.len, if (trainer == .cover) ctx.suffix_size else ctx.nb_dmers, n);
+            warned = true;
+        }
         o.ctx = &ctx;
         o.d = d;
         const ctx_memory = O.Ctx.memory(samples.sizes.len, if (trainer == .cover) ctx.suffix_size else grid.f);
@@ -1278,7 +1399,32 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, budget: ?*LimitedAllocato
             in_flight -= 1;
         }
     }
+    n.at(2, Notify.clear79, .{});
     return best orelse error.NoCandidate;
+}
+
+/// The optimizers' refusals before any work (`OptimizeGrid.init`'s order),
+/// as each reports them. Cover's "no samples" and "capacity" checks print
+/// at libzstd's global level from an earlier call (0 in a fresh process,
+/// so nothing here); fastCover's at the caller's.
+fn gridRefusal(comptime trainer: Trainer, p: OptimizeParams, nb_samples: usize, capacity: usize, n: Notify) void {
+    const default_split: f64 = if (trainer == .cover) cover_default_split_point else fastcover_default_split_point;
+    const split_point = if (p.split_point <= 0.0) default_split else p.split_point;
+    const d_max = if (p.d == 0) 8 else p.d;
+    const k_min = if (p.k == 0) 50 else p.k;
+    const k_max = if (p.k == 0) 2000 else p.k;
+    const accel = resolvedAccel(p.accel);
+    if (split_point <= 0 or split_point > 1) {
+        n.at(1, if (trainer == .cover) "Incorrect parameters\n" else "Incorrect splitPoint\n", .{});
+    } else if (trainer == .fast_cover and (accel == 0 or accel > fastcover_max_accel)) {
+        n.at(1, "Incorrect accel\n", .{});
+    } else if (k_min < d_max or k_max < k_min) {
+        n.at(1, if (trainer == .cover) "Incorrect parameters\n" else "Incorrect k\n", .{});
+    } else if (trainer == .fast_cover and nb_samples == 0) {
+        n.at(1, "FASTCOVER must have at least one input file\n", .{});
+    } else if (trainer == .fast_cover and capacity < dict_size_min) {
+        n.at(1, "dictBufferCapacity must be at least {d}\n", .{dict_size_min});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1447,8 @@ pub const FinalizeParams = struct {
     /// Working-memory ceiling: the compressor and `CDict` that measure the
     /// samples (the dictionary buffer not counted).
     memory_limit: usize = default_memory_limit,
+    /// `notificationLevel` (see `Notify`).
+    notify: Notify = .{},
 };
 
 /// An allocator that refuses (`OutOfMemory`) any allocation taking the
@@ -1457,7 +1605,7 @@ fn zdictSamples(s: Samples, nb: usize) zdict.Samples {
 /// size.
 pub fn finalizeDictionary(gpa: Allocator, dict: []u8, content: []const u8, samples: Samples, p: FinalizeParams) Error!usize {
     var lim: LimitedAllocator = .init(gpa, p.memory_limit);
-    return zdict.finalizeDictionary(lim.allocator(), dict, content, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| lim.map(finalizeError(e));
+    return zdict.finalizeDictionary(lim.allocator(), dict, content, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify }) catch |e| lim.map(finalizeError(e));
 }
 
 /// `ZDICT_addEntropyTablesFromBuffer` (`_advanced`; see
@@ -1465,7 +1613,7 @@ pub fn finalizeDictionary(gpa: Allocator, dict: []u8, content: []const u8, sampl
 /// `content_size` bytes of `dict`.
 pub fn addEntropyTablesFromBuffer(gpa: Allocator, dict: []u8, content_size: usize, samples: Samples, p: FinalizeParams) Error!usize {
     var lim: LimitedAllocator = .init(gpa, p.memory_limit);
-    return zdict.addEntropyTablesFromBuffer(lim.allocator(), dict, content_size, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| lim.map(finalizeError(e));
+    return zdict.addEntropyTablesFromBuffer(lim.allocator(), dict, content_size, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify }) catch |e| lim.map(finalizeError(e));
 }
 
 /// `COVER_checkTotalCompressedSize`: the finished dictionary's size plus
@@ -1510,6 +1658,8 @@ pub const SelectParams = struct {
     shrink: bool = false,
     /// `shrinkDictMaxRegression`, in percent.
     shrink_max_regression: u32 = 0,
+    /// `zParams.notificationLevel` for finalization (see `Notify`).
+    notify: Notify = .{},
 };
 
 /// `COVER_selectDict`: finalize the content `buffer[buffer.len - content_len
@@ -1525,7 +1675,7 @@ pub fn selectDict(gpa: Allocator, buffer: []const u8, content_len: usize, sample
     const capacity = buffer.len;
     const content = buffer[capacity - content_len ..];
     const regression_tolerance = @as(f64, @floatFromInt(p.shrink_max_regression)) / 100.0 + 1.00;
-    const zp: zdict.Params = .{ .level = p.level, .dict_id = p.dict_id };
+    const zp: zdict.Params = .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify };
     const fs = zdictSamples(samples, nb_finalize_samples);
 
     const largest_buf = try gpa.alloc(u8, capacity);
@@ -1577,9 +1727,11 @@ const SelectScorer = struct {
     gpa: Allocator,
     level: i32,
     dict_id: u32,
+    /// The candidates' level (one below the optimizer's).
+    notify: Notify = .{},
 
     fn select(s: *SelectScorer, c: Candidate) Error!?Selection {
-        return selectDict(c.gpa, c.buffer, c.content.len, c.samples, c.offsets, c.nb_finalize_samples, c.nb_train_samples, c.split_point, .{ .level = s.level, .dict_id = s.dict_id });
+        return selectDict(c.gpa, c.buffer, c.content.len, c.samples, c.offsets, c.nb_finalize_samples, c.nb_train_samples, c.split_point, .{ .level = s.level, .dict_id = s.dict_id, .notify = s.notify });
     }
 
     fn release(s: *SelectScorer, sel: Selection) void {
@@ -1608,7 +1760,7 @@ fn optimizeFinished(comptime trainer: Trainer, gpa: Allocator, dict: []u8, sampl
     if (p.level > max_level) return error.LevelUnsupported;
     var lim: LimitedAllocator = .init(gpa, p.memory_limit);
     const a = lim.allocator();
-    var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
+    var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id, .notify = p.notify.lowered() };
     return optimize(trainer, a, &lim, dict, samples, p, &scorer) catch |e| lim.map(e);
 }
 
@@ -1638,7 +1790,9 @@ pub fn trainCover(gpa: Allocator, dict: []u8, samples: Samples, p: CoverParams) 
 
 fn trainCoverImpl(gpa: Allocator, dict: []u8, samples: Samples, p: CoverParams) Error!usize {
     const n = try coverContentInto(gpa, dict, samples, p);
-    return zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| finalizeError(e);
+    const size = zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify }) catch |e| return finalizeError(e);
+    p.notify.at(2, "Constructed dictionary of size {d}\n", .{size});
+    return size;
 }
 
 /// `ZDICT_trainFromBuffer_fastCover`; see `trainCover`. Finalization uses
@@ -1653,7 +1807,9 @@ fn trainFastCoverImpl(gpa: Allocator, dict: []u8, samples: Samples, p: FastCover
     const n = try fastCoverContentInto(gpa, dict, samples, p);
     // nbFinalizeSamples: of the training samples (all of them: split 1)
     const nb_finalize: usize = @intCast(@as(u64, samples.sizes.len) * accel_table[resolvedAccel(p.accel)].finalize / 100);
-    return zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, nb_finalize), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| finalizeError(e);
+    const size = zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, nb_finalize), .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify }) catch |e| return finalizeError(e);
+    p.notify.at(2, "Constructed dictionary of size {d}\n", .{size});
+    return size;
 }
 
 /// A trainer and its parameters, for `trainFromSlices`.
@@ -1715,7 +1871,7 @@ fn trainSlicesImpl(a: Allocator, lim: *LimitedAllocator, dict: []u8, slices: []c
         },
         inline .optimize_cover, .optimize_fast_cover => |p, tag| {
             if (p.level > max_level) return error.LevelUnsupported;
-            var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
+            var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id, .notify = p.notify.lowered() };
             return (try optimize(if (tag == .optimize_cover) .cover else .fast_cover, a, lim, dict, samples, p, &scorer)).size;
         },
     }

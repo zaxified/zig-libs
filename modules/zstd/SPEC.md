@@ -565,7 +565,8 @@ their sum, and the hash and chain logs for a window covering both
 input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
 
 - **Loaded into the context** (`dtlm_fast`): a `.prefix` (for one frame
-  only, raw by default: `ZSTD_CCtx_refPrefix`), `compressUsingDict`
+  only, raw content by default: `ZSTD_CCtx_refPrefix`; `zstd.Prefix`),
+  `compressUsingDict`
   (`ZSTD_compress_usingDict`: the level, every other parameter default),
   and a `CDict` *with a level* when the input is at least 128 KB and six
   times the dictionary (its content, reloaded with the input's parameters),
@@ -594,7 +595,12 @@ a context before `ZSTD_compress2` / `ZSTD_compressStream2`: `.raw` is
 the frame's parameters (no level of its own, so copied or attached, never
 reloaded), for one call (`Compressor.compress`) or for every frame until
 `reset` (`Stream`); `.cdict` is `ZSTD_CCtx_refCDict`;
-`.prefix` is `ZSTD_CCtx_refPrefix_advanced`. `compressUsingCDict` is
+`.prefix` is `ZSTD_CCtx_refPrefix_advanced` -- with the content type left
+at its default, raw, `ZSTD_CCtx_refPrefix` (until 2026-09-28 the default
+was `.auto`, shared with `.raw`: the same bytes single-threaded for any
+input without the dictionary magic, but with workers such a prefix became
+a `CDict` and never reached the long-distance matcher, so `zstd
+--patch-from` with threads lost its long matches). `compressUsingCDict` is
 `ZSTD_compress_usingCDict_advanced`: the CDict's parameters (for inputs up
 to 128 KB or six times the dictionary, or a CDict without a level) with
 the window widened to the input up to 512 KB — the switches resolved
@@ -1439,7 +1445,25 @@ with more, for the same memory. The allocator must be thread-safe with
 samples as `[]const []const u8` and copies them into one buffer (the
 trainers need them contiguous: segments cross sample boundaries); the copy
 counts against the limit. Levels above 22 are `LevelUnsupported` (libzstd
-clamps). Nothing is printed (`notificationLevel`).
+clamps).
+
+**Messages** (`zParams.notificationLevel`): every trainer's parameters,
+finalization's included, take a `Notify` -- a level and a writer -- and
+write what libzstd's trainers write to stderr, the same text at the same
+levels (1 errors, 2 progress: the `zstd` command's default, 3 details, 4
+debug), each message flushed; without a writer, nothing. As in libzstd,
+an optimizer prints its own lines at its level and turns the level down
+by one for its contexts and candidates ("to clean up display at level 2
+and below"), and cover's optimizer reports "no samples" and a capacity
+below 256 at libzstd's global level from an earlier call -- 0 in a fresh
+process, so nothing here. Not written: the percentages libzstd prints at
+most every 150 ms of CPU time (`DISPLAYUPDATE`), which no fixed text can
+match. Candidates running at once on several threads write whole
+messages one at a time, in the order they come, as libzstd's interleave.
+The text is pinned against the `zstd` command
+(`example-apps/zstd-cli`'s parity runs: 48 training scenarios, every
+message and dictionary byte-identical); `dict_golden_test.zig` pins which
+levels let what through.
 
 **Memory.** Besides the dictionary buffer, cover allocates the offsets
 ((n + 1) · 8), the suffix array and the d-mer map (2 · 4 · `suffixSize`,
@@ -2863,7 +2887,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
-  `getCParams` / `adjustCParams`, `ZSTD_versionNumber`.
+  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 for `zstd-cli`:
+  `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
+  the other bounds). ⏭ `getFrameProgression` is the next one a consumer
+  wants: `zstd-cli`'s progress counter shows what it handed to the stream
+  in its place (its README).
 - **Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**:
   libzstd 1.5.7's `programs/` options, file handling and output, checked
   against the real CLI. The module's contract stays the library API (*What
@@ -2875,16 +2903,23 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `smoke.sh` re-checks a subset in CI when a 1.5.7 `zstd` is installed. It
   asked the module for `DecompressStream.Options.max_window_size`
   (`ZSTD_DCtx_setMaxWindowSize`, for `--memory=#`), added the same day.
-  Left (refused by name today): `--train*`, `--adapt` (needs
-  `getFrameProgression`, see Z24/Z25), `--patch-from`, `--zstd=`, `-r`,
-  `--filelist`, `--output-dir-*`, the progress counter.
+  Stage 2 done 2026-09-28: `--zstd=`, `--max`, `--show-default-cparams`,
+  `-r`, `--filelist`, `--output-dir-flat`/`-mirror`, `--patch-from`,
+  `--train`/`--train-cover`/`--train-fastcover` (asking the module for the
+  trainers' messages, *Dictionary training*), the progress counter,
+  `--fake-*-is-console`, `-b` without a file, `-p`; about 220 more
+  scenarios equal to the C command (the app's README). It found the
+  prefix's default content type (*Dictionaries*). Left (refused by name):
+  `--adapt` (Z24, and `getFrameProgression` of Z25), `--train-legacy` (no
+  legacy trainer here), `--trace`.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
   `zig-out/bin/zstd -b` print the same columns — equal sizes and ratios
   (checked in `smoke.sh`, with dictionaries digested once per run as
-  `ZSTD_initLocalDict` does), the speeds being the comparison. Not ported:
-  `-b` without a file (lorem ipsum / `-P#` synthetic data).
+  `ZSTD_initLocalDict` does), the speeds being the comparison. `-b`
+  without a file (lorem ipsum / `-P#` synthetic data) followed with Z26's
+  stage 2.
 
 ## Open
 

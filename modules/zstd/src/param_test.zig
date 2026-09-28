@@ -393,3 +393,29 @@ test "a magicless frame that starts like a skippable magic number is still a fra
         try std.testing.expectEqualSlices(u8, content, o.dst[0..o.pos]);
     }
 }
+
+test "getCParams gives ZSTD_getCParams' parameters" {
+    // from `zstd --show-default-cparams` 1.5.7 (`ZSTD_getCParams(level,
+    // fileSize, dictSize)`); a 0-byte file counts as an unknown size
+    const Case = struct { level: i32, size: ?u64, dict: u64, want: [7]u32 };
+    const cases = [_]Case{
+        .{ .level = 1, .size = 1000, .dict = 0, .want = .{ 10, 10, 11, 1, 5, 0, 1 } },
+        .{ .level = 3, .size = 1000, .dict = 0, .want = .{ 10, 10, 11, 2, 4, 0, 2 } },
+        .{ .level = 19, .size = 1000, .dict = 0, .want = .{ 10, 11, 11, 8, 3, 256, 9 } },
+        .{ .level = -5, .size = 1000, .dict = 0, .want = .{ 10, 10, 11, 1, 5, 5, 1 } },
+        .{ .level = 3, .size = 200000, .dict = 0, .want = .{ 18, 16, 16, 1, 4, 0, 2 } },
+        .{ .level = -5, .size = 200000, .dict = 0, .want = .{ 18, 12, 13, 1, 5, 5, 1 } },
+        .{ .level = 19, .size = 5000000, .dict = 0, .want = .{ 23, 24, 22, 7, 3, 256, 9 } },
+        .{ .level = 22, .size = 5000000, .dict = 0, .want = .{ 23, 24, 24, 9, 3, 999, 9 } },
+        .{ .level = 3, .size = 0, .dict = 0, .want = .{ 21, 16, 17, 1, 5, 0, 2 } },
+        .{ .level = 3, .size = null, .dict = 0, .want = .{ 21, 16, 17, 1, 5, 0, 2 } },
+        .{ .level = 19, .size = 1000, .dict = 100000, .want = .{ 17, 18, 17, 5, 3, 256, 9 } },
+        // above the maximum: level 22's row
+        .{ .level = 40, .size = 5000000, .dict = 0, .want = .{ 23, 24, 24, 9, 3, 999, 9 } },
+    };
+    for (cases) |c| {
+        const cp = zstd.getCParams(c.level, c.size, c.dict);
+        const got = [7]u32{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @intFromEnum(cp.strategy) };
+        try std.testing.expectEqualSlices(u32, &c.want, &got);
+    }
+}

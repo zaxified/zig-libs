@@ -491,9 +491,23 @@ pub const Dict = union(enum) {
     /// A dictionary digested beforehand; its level, if it has one, replaces
     /// the frame's.
     cdict: *const CDict,
-    /// Loaded into the context for this frame only, raw by default
-    /// (`ZSTD_CCtx_refPrefix`): the input is compressed as its continuation.
-    prefix: RawDict,
+    /// Loaded into the context for this frame only, raw content by
+    /// default as `ZSTD_CCtx_refPrefix` has it (`.auto` or `.full` is
+    /// `ZSTD_CCtx_refPrefix_advanced`): the input is compressed as its
+    /// continuation.
+    prefix: Prefix,
+};
+
+/// A prefix (`Dict.prefix`): unlike a loaded dictionary's, its content
+/// type defaults to raw. With workers, only a raw prefix reaches the
+/// long-distance matcher (libzstd makes any other an internal `CDict`).
+pub const Prefix = struct {
+    bytes: []const u8,
+    content_type: cdict_mod.ContentType = .raw_content,
+
+    pub fn raw(p: Prefix) RawDict {
+        return .{ .bytes = p.bytes, .content_type = p.content_type };
+    }
 };
 
 pub const RawDict = struct {
@@ -962,7 +976,7 @@ pub const Compressor = struct {
                 level = c.compression_level;
             },
             .prefix => |p| if (p.bytes.len != 0) {
-                prefix = p;
+                prefix = p.raw();
             },
         }
         const dict_size: u64 = if (prefix) |p| p.bytes.len else if (cdict) |c| c.content.len else 0;

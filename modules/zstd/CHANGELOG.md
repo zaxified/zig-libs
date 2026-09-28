@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BEHAVIOURAL, not breaking:** `Dictionary.prefix` takes
+  a `zstd.Prefix`, whose content type defaults to raw -- `ZSTD_CCtx_refPrefix`,
+  as its documentation always said -- where it shared `.raw`'s `.auto`. The
+  bytes change only with workers and long-distance matching: a prefix left at
+  the default now reaches the long-distance matcher, as libzstd's does
+  (`zstd --patch-from -T2` of a 600 KB file: 114 → 91 bytes, libzstd's).
+  Code that sets `.content_type` is unaffected.
+- **2026-09-28** — `dict_builder`: the trainers' messages (`Notify`,
+  libzstd's `zParams.notificationLevel` with a writer) on every trainer's
+  and finalization's parameters -- libzstd's text at libzstd's levels, but
+  for the CPU-timed percentages.
+- **2026-09-28** — `zstd.getCParams` (`ZSTD_getCParams`), `zstd.CParams`,
+  and `zstd.limits` (`ZSTD_WINDOWLOG_MAX` and the other parameter bounds).
+  First consumer: `zstd-cli`'s `--show-default-cparams`, `--max` and
+  `--patch-from`.
 - **2026-09-27** — **NO CONSUMER-VISIBLE CHANGE:** the decoder's
   overlapping match copy (offset < 16) moves 8 bytes per load/store instead
   of one byte at a time, as libzstd's `ZSTD_copy8` does: RLE-heavy input

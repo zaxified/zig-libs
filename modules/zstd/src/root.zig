@@ -120,6 +120,9 @@ pub const SequenceError = frame.Compressor.SequenceError || error{LevelUnsupport
 /// A compression dictionary: see `Options.dictionary`.
 pub const Dictionary = frame.Dict;
 pub const RawDictionary = frame.RawDict;
+/// A prefix (`Dictionary.prefix`, `ZSTD_CCtx_refPrefix`): raw content
+/// unless told otherwise.
+pub const Prefix = frame.Prefix;
 /// `ZSTD_dictContentType_e`: raw content, a full zstd dictionary (magic
 /// number, ID, entropy tables, repcodes, content), or either by its first
 /// four bytes.
@@ -153,6 +156,50 @@ pub const Error = frame.Error || error{
 pub const max_level = params.max_level;
 pub const min_level = params.min_level;
 pub const default_level = params.default_level;
+
+/// libzstd's parameter bounds (`ZSTD_WINDOWLOG_MAX` and friends in
+/// `zstd.h`, for a 64-bit `usize` unless noted): what `Advanced` accepts.
+pub const limits = struct {
+    pub const window_log_min = params.window_log_min;
+    /// 31, or 30 on a 32-bit `usize`.
+    pub const window_log_max = params.window_log_max;
+    pub const chain_log_min = params.chain_log_min;
+    pub const chain_log_max = params.chain_log_max;
+    pub const hash_log_min = params.hash_log_min;
+    pub const hash_log_max = params.hash_log_max;
+    pub const search_log_min = params.search_log_min;
+    pub const search_log_max = params.search_log_max;
+    pub const min_match_min = params.min_match_min;
+    pub const min_match_max = params.min_match_max;
+    pub const target_length_max = params.target_length_max;
+    pub const overlap_log_max = params.overlap_log_max;
+    /// `ZSTDMT_NBWORKERS_MAX`, `ZSTDMT_JOBSIZE_MAX` (64-bit).
+    pub const nb_workers_max = params.nb_workers_max;
+    pub const job_size_max = params.job_size_max;
+    /// `ZSTD_LDM_HASHLOG_MAX` = `ZSTD_HASHLOG_MAX`.
+    pub const ldm_hash_log_max = params.hash_log_max;
+    pub const ldm_min_match_min = params.ldm_min_match_min;
+    pub const ldm_min_match_max = params.ldm_min_match_max;
+    pub const ldm_bucket_size_log_min = params.ldm_bucket_size_log_min;
+    pub const ldm_bucket_size_log_max = params.ldm_bucket_size_log_max;
+    pub const ldm_hash_rate_log_max = params.ldm_hash_rate_log_max;
+};
+
+/// `ZSTD_compressionParameters`: window, table and search sizes and the
+/// strategy that a level resolves to.
+pub const CParams = params.CParams;
+
+/// `ZSTD_getCParams`: the parameters `level` uses for an input of
+/// `src_size` bytes with a dictionary of `dict_size` bytes (0: none),
+/// already shrunk to them. `src_size` null or 0 means unknown, as in
+/// libzstd. A level above `max_level` gives `max_level`'s parameters, one
+/// below `min_level` gives `min_level`'s, and 0 the default level's. What
+/// a compressor finally uses can differ: advanced parameters, long-distance
+/// matching and the way a dictionary is used take part there.
+pub fn getCParams(level: i32, src_size: ?u64, dict_size: u64) CParams {
+    const size = src_size orelse params.unknown_size;
+    return params.getInternal(@min(level, max_level), if (size == 0) params.unknown_size else size, dict_size, .unknown);
+}
 
 /// Worst-case compressed size of `src_size` bytes (`ZSTD_compressBound`).
 pub fn compressBound(src_size: usize) usize {

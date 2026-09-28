@@ -63,6 +63,58 @@ pub const Params = struct {
     level: i32 = 0,
     /// `dictID`: 0 = derived from the content (`defaultDictId`).
     dict_id: u32 = 0,
+    /// `notificationLevel`, and where the messages go.
+    notify: Notify = .{},
+};
+
+/// `zParams.notificationLevel`: libzstd's trainers and finalization write
+/// what they do to stderr -- 1 errors, 2 progress (the `zstd` command's
+/// default), 3 details, 4 debug -- and so do these, to `writer` (nowhere
+/// without one), each message flushed. The same text at the same levels,
+/// except the percentages libzstd prints at most every 150 ms of CPU time
+/// (`DISPLAYUPDATE`): never here. Messages of an optimizer's candidates
+/// built at once on several threads are written whole, one at a time, in
+/// the order they come, as libzstd's are.
+pub const Notify = struct {
+    level: u32 = 0,
+    writer: ?*std.Io.Writer = null,
+
+    pub fn at(n: Notify, l: u32, comptime fmt: []const u8, args: anytype) void {
+        if (n.level < l) return;
+        const w = n.writer orelse return;
+        lock.lock();
+        defer lock.unlock();
+        w.print(fmt, args) catch {};
+        w.flush() catch {};
+    }
+
+    /// The level libzstd's optimizers turn their global one down to while
+    /// they run, "to clean up display at level 2 and below".
+    pub fn lowered(n: Notify) Notify {
+        var m = n;
+        m.level = n.level -| 1;
+        return m;
+    }
+
+    /// `"\r%79s\r"` / `"\r%70s\r"`: a cleared line.
+    pub const clear79 = "\r" ++ " " ** 79 ++ "\r";
+    pub const clear70 = "\r" ++ " " ** 70 ++ "\r";
+
+    /// One writer at a time: a futex word, 0 free and 1 taken.
+    const lock = struct {
+        var word: std.atomic.Value(u32) = .init(0);
+        fn io() std.Io {
+            return std.Io.Threaded.global_single_threaded.io();
+        }
+        fn lock() void {
+            while (word.cmpxchgWeak(0, 1, .acquire, .monotonic) != null)
+                io().futexWaitUncancelable(u32, &word.raw, 1);
+        }
+        fn unlock() void {
+            word.store(0, .release);
+            io().futexWake(u32, &word.raw, 1);
+        }
+    };
 };
 
 /// `ZDICT_getDictID`: the ID of a zstd dictionary, 0 if `dict` is not one.
@@ -134,7 +186,9 @@ pub fn finalizeDictionary(gpa: Allocator, dict: []u8, content: []const u8, sampl
     var h_size: usize = 8;
 
     // entropy tables
-    h_size += try analyzeEntropy(gpa, header[h_size..], level, samples, content);
+    p.notify.at(2, Notify.clear70, .{}); // clean display line
+    p.notify.at(2, "statistics ... \n", .{});
+    h_size += try analyzeEntropy(gpa, header[h_size..], level, samples, content, p.notify);
 
     // Shrink the content size if it doesn't fit in the buffer
     var content_size = content.len;
@@ -170,7 +224,9 @@ pub fn addEntropyTablesFromBuffer(gpa: Allocator, dict: []u8, content_size: usiz
     var h_size: usize = 8;
 
     // calculate entropy tables
-    h_size += try analyzeEntropy(gpa, dict[h_size..], level, samples, dict[dict.len - content_size ..]);
+    p.notify.at(2, Notify.clear70, .{}); // clean display line
+    p.notify.at(2, "statistics ... \n", .{});
+    h_size += try analyzeEntropy(gpa, dict[h_size..], level, samples, dict[dict.len - content_size ..], p.notify);
 
     // add dictionary header (after entropy tables)
     std.mem.writeInt(u32, dict[0..4], magic_dictionary, .little);
@@ -187,7 +243,7 @@ pub fn addEntropyTablesFromBuffer(gpa: Allocator, dict: []u8, content_size: usiz
 /// `ZDICT_analyzeEntropy`: compress every sample through `content`, count
 /// the literals and the sequences' codes, and write the Huffman table, the
 /// three FSE tables and the repcodes into `dst`. Returns their size.
-fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, content: []const u8) Error!usize {
+fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, content: []const u8, n: Notify) Error!usize {
     const offcode_max = fse.highbit32(@truncate(content.len + (128 << 10)));
     if (offcode_max > offcode_max_all) return error.DictionaryCreationFailed; // too large dictionary
 
@@ -201,7 +257,7 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
     // default repcodes instead; the ranking is not ported.)
 
     var total_src_size: usize = 0;
-    for (samples.sizes) |n| total_src_size +%= n;
+    for (samples.sizes) |size| total_src_size +%= size;
     const average_sample_size = total_src_size / @max(samples.sizes.len, 1);
     // ZSTD_getParams: a size hint of 0 is unknown
     const cp = params.getInternal(level, if (average_sample_size == 0) params.unknown_size else average_sample_size, content.len, .unknown);
@@ -222,13 +278,13 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
             .strategy = cp.strategy,
         },
     }) catch |e| return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
+        error.OutOfMemory => oom(n),
         else => unreachable, // raw content from in-range parameters
     };
     defer cdict.deinit();
     var comp: frame.Compressor = .initEmpty(gpa);
     defer comp.deinit();
-    const work_place = try gpa.alloc(u8, params.block_size_max_abs);
+    const work_place = gpa.alloc(u8, params.block_size_max_abs) catch return oom(n);
     defer gpa.free(work_place);
 
     // collect stats on all samples
@@ -240,11 +296,17 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
         // ZDICT_countEStats
         comp.beginUsingCDict(&cdict) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => continue, // "ZSTD_compressBegin_usingCDict failed"
+            else => {
+                n.at(1, "warning : ZSTD_compressBegin_usingCDict failed \n", .{});
+                continue;
+            },
         };
         // a sample larger than the context's block (its window can be the
         // CDict's, smaller than `block_size_max`) is not counted
-        const c_size = comp.compressBlockOnly(work_place, src) catch continue;
+        const c_size = comp.compressBlockOnly(work_place, src) catch {
+            n.at(3, "warning : could not compress sample size {d} \n", .{src.len});
+            continue;
+        };
         if (c_size == 0) continue; // block is not compressible
         const ss = comp.seqStore();
         for (ss.lits[0..ss.n_lit]) |b| count_lit[b] += 1;
@@ -254,10 +316,20 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
         for (ss.ll_code[0..ss.n_seq]) |c| lit_length_count[c] += 1;
     }
 
+    if (n.level >= 4) {
+        // writeStats
+        n.at(4, "Offset Code Frequencies : \n", .{});
+        for (offcode_count[0 .. offcode_max + 1], 0..) |c, u| n.at(4, "{d: >2} :{d: >7} \n", .{ u, c });
+    }
+
     // analyze, build stats, starting with literals
     var huf_table: huf.CTable = .{};
-    var huff_log: u32 = huf.buildCTable(&huf_table, &count_lit, 255, huf.table_log_default) catch return error.Generic;
+    var huff_log: u32 = huf.buildCTable(&huf_table, &count_lit, 255, huf.table_log_default) catch {
+        n.at(1, " HUF_buildCTable error \n", .{});
+        return error.Generic;
+    };
     if (huff_log == 8) {
+        n.at(2, "warning : pathological dataset : literals are not compressible : samples are noisy or too regular \n", .{});
         // not compressible: would fail in HUF_writeCTable; a "mostly flat
         // but still compressible" distribution instead (ZDICT_flatLit)
         for (count_lit[1..]) |*c| c.* = 2;
@@ -271,17 +343,17 @@ fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, conte
     var offcode_ncount: [offcode_max_all + 1]i16 = @splat(0);
     var match_length_ncount: [sequences.max_ml + 1]i16 = undefined;
     var lit_length_ncount: [sequences.max_ll + 1]i16 = undefined;
-    const off_log = try normalize(&offcode_ncount, sequences.off_fse_log, &offcode_count, offcode_max);
-    const ml_log = try normalize(&match_length_ncount, sequences.ml_fse_log, &match_length_count, sequences.max_ml);
-    const ll_log = try normalize(&lit_length_ncount, sequences.ll_fse_log, &lit_length_count, sequences.max_ll);
+    const off_log = normalize(&offcode_ncount, sequences.off_fse_log, &offcode_count, offcode_max) catch |e| return fail(n, e, "FSE_normalizeCount error with offcodeCount \n");
+    const ml_log = normalize(&match_length_ncount, sequences.ml_fse_log, &match_length_count, sequences.max_ml) catch |e| return fail(n, e, "FSE_normalizeCount error with matchLengthCount \n");
+    const ll_log = normalize(&lit_length_ncount, sequences.ll_fse_log, &lit_length_count, sequences.max_ll) catch |e| return fail(n, e, "FSE_normalizeCount error with litLengthCount \n");
 
     // write result to buffer
     var op: usize = 0;
-    op += huf.writeCTable(dst, &huf_table, 255, huff_log) catch |e| return tableError(e);
-    op += fse.writeNCount(dst[op..], &offcode_ncount, offcode_max_all, off_log) catch |e| return tableError(e);
-    op += fse.writeNCount(dst[op..], &match_length_ncount, sequences.max_ml, ml_log) catch |e| return tableError(e);
-    op += fse.writeNCount(dst[op..], &lit_length_ncount, sequences.max_ll, ll_log) catch |e| return tableError(e);
-    if (dst.len - op < 12) return error.DstSizeTooSmall; // not enough space to write RepOffsets
+    op += huf.writeCTable(dst, &huf_table, 255, huff_log) catch |e| return fail(n, tableError(e), "HUF_writeCTable error \n");
+    op += fse.writeNCount(dst[op..], &offcode_ncount, offcode_max_all, off_log) catch |e| return fail(n, tableError(e), "FSE_writeNCount error with offcodeNCount \n");
+    op += fse.writeNCount(dst[op..], &match_length_ncount, sequences.max_ml, ml_log) catch |e| return fail(n, tableError(e), "FSE_writeNCount error with matchLengthNCount \n");
+    op += fse.writeNCount(dst[op..], &lit_length_ncount, sequences.max_ll, ll_log) catch |e| return fail(n, tableError(e), "FSE_writeNCount error with litlengthNCount \n");
+    if (dst.len - op < 12) return fail(n, error.DstSizeTooSmall, "not enough space to write RepOffsets \n");
     for (rep_start_value, 0..) |r, i| std.mem.writeInt(u32, dst[op + 4 * i ..][0..4], r, .little);
     return op + 12;
 }
@@ -292,6 +364,17 @@ fn normalize(norm: []i16, log: u32, count: []const u32, max: u32) Error!u32 {
     var total: usize = 0;
     for (count[0 .. max + 1]) |c| total += c;
     return fse.normalizeCount(norm, log, count, total, max, true) catch error.Generic;
+}
+
+/// A failure libzstd reports at level 1 before returning it.
+fn fail(n: Notify, e: Error, comptime msg: []const u8) Error {
+    n.at(1, msg, .{});
+    return e;
+}
+
+fn oom(n: Notify) Error {
+    n.at(1, "Not enough memory \n", .{});
+    return error.OutOfMemory;
 }
 
 fn tableError(e: anyerror) Error {

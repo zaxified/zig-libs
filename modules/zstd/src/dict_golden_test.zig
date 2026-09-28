@@ -238,3 +238,40 @@ fn finished(threads: []const u32) !void {
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
+
+test "the trainers' messages follow the notification level, as libzstd's" {
+    // The text itself is pinned against the `zstd` command (the CLI app's
+    // smoke.sh); here, which messages each level lets through.
+    const gpa = std.testing.allocator;
+    const gen = try samples.generate(gpa, samples.find("json-200"));
+    defer gen.deinit(gpa);
+    const s: db.Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    const dict = try gpa.alloc(u8, 4096);
+    defer gpa.free(dict);
+
+    var buf: [8192]u8 = undefined;
+    for ([_]u32{ 0, 1, 2 }) |level| {
+        var w: std.Io.Writer = .fixed(&buf);
+        const n = try db.trainFastCover(gpa, dict, s, .{ .k = 200, .notify = .{ .level = level, .writer = &w } });
+        const out = w.buffered();
+        switch (level) {
+            0 => try std.testing.expectEqualStrings("", out),
+            // only the small-corpus warning is at level 1
+            1 => try std.testing.expect(std.mem.indexOf(u8, out, "Training on") == null),
+            else => {
+                try std.testing.expect(std.mem.startsWith(u8, out, "Training on 200 samples of total size "));
+                var end: [64]u8 = undefined;
+                try std.testing.expect(std.mem.endsWith(u8, out, try std.fmt.bufPrint(&end, "statistics ... \nConstructed dictionary of size {d}\n", .{n})));
+                try std.testing.expect(std.mem.indexOf(u8, out, "Building dictionary\nBreaking content into ") != null);
+            },
+        }
+    }
+    // an optimizer at level 2: its own lines; its candidates' (one level
+    // lower) say nothing
+    var w: std.Io.Writer = .fixed(&buf);
+    _ = try db.optimizeFastCover(gpa, dict, s, .{ .d = 8, .steps = 4, .notify = .{ .level = 2, .writer = &w } });
+    const out = w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "Trying 5 different sets of parameters\n"));
+    try std.testing.expect(std.mem.endsWith(u8, out, db.Notify.clear79));
+    try std.testing.expect(std.mem.indexOf(u8, out, "statistics") == null);
+}
