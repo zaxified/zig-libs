@@ -119,7 +119,9 @@ A frame compressed with a dictionary decodes via `Decompressor`'s
 `DecompressOptions` (the free `zstd.decompress` takes none) or
 `DecompressStreamOptions`, either raw bytes (`.dictionary`) or a digested
 `zstd.DDict` (`.ddict`, load once and reuse — `zstd.DDict.init`/
-`initByReference`, `.raw_content`/`.full`/`.auto` content types), plus
+`initByReference`, `.raw_content`/`.full`/`.auto` content types; its
+tables are read in place, so it stays alive and unmoved while its frames
+decode), plus
 `.ddicts` for `ZSTD_d_refMultipleDDicts` (pick by the frame's dictionary
 ID) and, for streaming, `.prefix` for a one-frame `ZSTD_DCtx_refPrefix`:
 

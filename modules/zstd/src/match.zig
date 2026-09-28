@@ -173,18 +173,14 @@ pub const MatchState = struct {
     pub fn countInDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        const a = ms.dict[p_in - ms.dict_base ..][0..n];
-        const b = ms.dict[p_match - ms.dict_base ..][0..n];
-        return std.mem.indexOfDiff(u8, a, b) orelse n;
+        return countRuns(ms.dict[p_in - ms.dict_base ..][0..n], ms.dict[p_match - ms.dict_base ..][0..n]);
     }
 
     /// `ZSTD_count` with the match side in the extDict.
     fn countDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        const a = ms.src[p_in - ms.src_base ..][0..n];
-        const b = ms.dict[p_match - ms.dict_base ..][0..n];
-        return std.mem.indexOfDiff(u8, a, b) orelse n;
+        return countRuns(ms.src[p_in - ms.src_base ..][0..n], ms.dict[p_match - ms.dict_base ..][0..n]);
     }
 
     /// `ZSTD_count`: length of the common run at `p_in` and `p_match`,
@@ -415,6 +411,24 @@ pub fn reduceTable(table: []u32, reducer: u32, preserve_mark: bool) void {
     }
 }
 
+/// `ZSTD_count` over two runs of equal length that lie in different
+/// segments (the prefix against the extDict or an attached `CDict`, as
+/// `ZSTD_count_2segments` counts to `vEnd`): how many leading bytes agree,
+/// compared 8 at a time as `ZSTD_count` does, then byte by byte. Neither
+/// run is read past its end -- the 8-byte reads stop where `ZSTD_count`'s
+/// stop, at `pInLoopLimit`.
+pub inline fn countRuns(in: []const u8, m: []const u8) usize {
+    std.debug.assert(in.len == m.len);
+    const n = in.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const d = std.mem.readInt(u64, in[i..][0..8], .little) ^ std.mem.readInt(u64, m[i..][0..8], .little);
+        if (d != 0) return i + (@ctz(d) >> 3);
+    }
+    while (i < n and in[i] == m[i]) i += 1;
+    return i;
+}
+
 /// libzstd's `window.base` for the prefix: index `i` is the byte at
 /// `addr + i`. The match finders' inner loops read through it rather than
 /// through `MatchState.src`, whose fields the compiler must reload after
@@ -468,7 +482,7 @@ pub const Base = struct {
         var n: usize = 0;
         if (v_end > p_in) {
             const len = v_end - p_in;
-            n = std.mem.indexOfDiff(u8, b.ptr(p_in, len)[0..len], b.dictPtr(p_match, len)[0..len]) orelse len;
+            n = countRuns(b.ptr(p_in, len)[0..len], b.dictPtr(p_match, len)[0..len]);
         }
         if (p_match + n != m_end) return n;
         return n + b.count(p_in + n, i_start, i_end);
@@ -501,7 +515,7 @@ pub const Base = struct {
     pub inline fn countInDict(b: Base, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        return std.mem.indexOfDiff(u8, b.dictPtr(p_in, n)[0..n], b.dictPtr(p_match, n)[0..n]) orelse n;
+        return countRuns(b.dictPtr(p_in, n)[0..n], b.dictPtr(p_match, n)[0..n]);
     }
     /// `ZSTD_hashPtr` for `mls` in 4..8.
     pub inline fn hash(b: Base, idx: usize, h_bits: u32, comptime mls: u32) usize {
@@ -580,27 +594,42 @@ inline fn comparePackedTags(a: usize, b: usize) bool {
 /// `end` into the `fast` hash table (with `.full`, the others too where
 /// their slot is empty); tagged for a `CDict`. Long-distance matching calls
 /// it (`.fast`, `.for_cctx`) before it runs `fast` on a stretch of
-/// literals; a dictionary's content is loaded with it.
+/// literals; a dictionary's content is loaded with it. Specialised on
+/// `min_match`, `dtlm` and `tfp` (libzstd's `ZSTD_fillHashTableForCDict`
+/// and `ZSTD_fillHashTableForCCtx`, whose `ZSTD_hashPtr` switch the C
+/// compiler hoists out of the loop).
 pub fn fillHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    switch (dtlm) {
+        inline else => |d| switch (tfp) {
+            inline else => |t| switch (ms.cp.min_match) {
+                inline 5, 6, 7, 8 => |m| fillHashTableT(ms, end, d, t, m),
+                else => fillHashTableT(ms, end, d, t, 4),
+            },
+        },
+    }
+}
+
+fn fillHashTableT(ms: *MatchState, end: usize, comptime dtlm: TableLoad, comptime tfp: FillPurpose, comptime mls: u32) void {
     const tagged = tfp == .for_cdict;
+    // the input through a local base: a store into `hash_table` may alias
+    // `ms.src` (see `Base`)
+    const b: Base = .of(ms);
     const hash_table = ms.hash_table;
     const h_bits = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
-    const mls = ms.cp.min_match;
     const fill_step = 3;
     var ip: usize = ms.next_to_update;
     // `ip + fastHashFillStep < iend + 2`, iend = end - HASH_READ_SIZE
     while (ip + fill_step + hash_read_size < end + 2) : (ip += fill_step) {
         const curr: u32 = @intCast(ip);
-        const h0 = ms.hash(ip, h_bits, mls);
+        const h0 = b.hash(ip, h_bits, mls);
         if (tagged) writeTaggedIndex(hash_table, h0, curr) else hash_table[h0] = curr;
         if (dtlm == .fast) continue;
         // Only load extra positions for ZSTD_dtlm_full
-        var p: u32 = 1;
-        while (p < fill_step) : (p += 1) {
-            const h = ms.hash(ip + p, h_bits, mls);
+        inline for (1..fill_step) |p| {
+            const h = b.hash(ip + p, h_bits, mls);
             if (tagged) {
-                if (hash_table[h >> tag_bits] == 0) writeTaggedIndex(hash_table, h, curr + p); // not yet filled
-            } else if (hash_table[h] == 0) hash_table[h] = curr + p;
+                if (hash_table[h >> tag_bits] == 0) writeTaggedIndex(hash_table, h, curr + @as(u32, p)); // not yet filled
+            } else if (hash_table[h] == 0) hash_table[h] = curr + @as(u32, p);
         }
     }
 }
@@ -613,12 +642,24 @@ pub fn fillHashTable(ms: *MatchState, end: usize) void {
 /// `ZSTD_fillDoubleHashTable`: every third position from `next_to_update`
 /// up to `end` into both of `dfast`'s tables (with `.full`, the two after
 /// it into the long table where their slot is empty); tagged for a
-/// `CDict`.
+/// `CDict`. Specialised as `fillHashTableFor` is
+/// (`ZSTD_fillDoubleHashTableForCDict`, `ZSTD_fillDoubleHashTableForCCtx`).
 pub fn fillDoubleHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    switch (dtlm) {
+        inline else => |d| switch (tfp) {
+            inline else => |t| switch (ms.cp.min_match) {
+                inline 5, 6, 7, 8 => |m| fillDoubleHashTableT(ms, end, d, t, m),
+                else => fillDoubleHashTableT(ms, end, d, t, 4),
+            },
+        },
+    }
+}
+
+fn fillDoubleHashTableT(ms: *MatchState, end: usize, comptime dtlm: TableLoad, comptime tfp: FillPurpose, comptime mls: u32) void {
     const tagged = tfp == .for_cdict;
+    const b: Base = .of(ms);
     const hash_large = ms.hash_table;
     const h_bits_l = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
-    const mls = ms.cp.min_match;
     const hash_small = ms.chain_table;
     const h_bits_s = ms.cp.chain_log + if (tagged) @as(u32, tag_bits) else 0;
     const fill_step = 3;
@@ -626,19 +667,17 @@ pub fn fillDoubleHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp:
     // `ip + fastHashFillStep - 1 <= iend`, iend = end - HASH_READ_SIZE
     while (ip + fill_step - 1 + hash_read_size <= end) : (ip += fill_step) {
         const curr: u32 = @intCast(ip);
-        var i: u32 = 0;
-        while (i < fill_step) : (i += 1) {
-            const sm = ms.hash(ip + i, h_bits_s, mls);
-            const lg = ms.hash(ip + i, h_bits_l, 8);
+        // only load extra positions for ZSTD_dtlm_full
+        inline for (0..if (dtlm == .fast) 1 else fill_step) |i| {
+            const sm = b.hash(ip + i, h_bits_s, mls);
+            const lg = b.hash(ip + i, h_bits_l, 8);
             if (tagged) {
-                if (i == 0) writeTaggedIndex(hash_small, sm, curr + i);
-                if (i == 0 or hash_large[lg >> tag_bits] == 0) writeTaggedIndex(hash_large, lg, curr + i);
+                if (i == 0) writeTaggedIndex(hash_small, sm, curr);
+                if (i == 0 or hash_large[lg >> tag_bits] == 0) writeTaggedIndex(hash_large, lg, curr + @as(u32, i));
             } else {
-                if (i == 0) hash_small[sm] = curr + i;
-                if (i == 0 or hash_large[lg] == 0) hash_large[lg] = curr + i;
+                if (i == 0) hash_small[sm] = curr;
+                if (i == 0 or hash_large[lg] == 0) hash_large[lg] = curr + @as(u32, i);
             }
-            // Only load extra positions for ZSTD_dtlm_full
-            if (dtlm == .fast) break;
         }
     }
 }
@@ -1434,7 +1473,7 @@ fn countAcrossDict(w: Base, dms: *const MatchState, p_in: usize, p_match: usize,
     var n: usize = 0;
     if (v_end > p_in) {
         const len = v_end - p_in;
-        n = std.mem.indexOfDiff(u8, w.bytes(p_in, v_end), dms.bytes(p_match, p_match + len)) orelse len;
+        n = countRuns(w.bytes(p_in, v_end), dms.bytes(p_match, p_match + len));
     }
     if (p_match + n != m_end) return n;
     return n + w.count(p_in + n, i_start, i_end);
@@ -1901,4 +1940,22 @@ test "current_max matches libzstd's ZSTD_CURRENT_MAX for this target's usize wid
     // formula, so a change to one side cannot silently agree with itself.
     const want: u32 = if (@sizeOf(usize) == 4) 2000 << 20 else 3500 << 20;
     try std.testing.expectEqual(want, current_max);
+}
+
+test "countRuns counts the common head of two runs, at every length and every first difference" {
+    // runs of 0..40 bytes (the word loop, its tail, and both), differing
+    // at each position or nowhere; the answer is the byte loop's
+    var a: [40]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @truncate(i *% 37 +% 11);
+    var b = a;
+    for (0..a.len + 1) |n| {
+        try std.testing.expectEqual(n, countRuns(a[0..n], b[0..n]));
+        for (0..n) |d| {
+            b[d] ^= 0x80;
+            try std.testing.expectEqual(d, countRuns(a[0..n], b[0..n]));
+            b[d] = a[d] ^ @as(u8, 1) << @as(u3, @intCast(d % 8)); // a one-bit difference
+            try std.testing.expectEqual(d, countRuns(a[0..n], b[0..n]));
+            b[d] = a[d];
+        }
+    }
 }

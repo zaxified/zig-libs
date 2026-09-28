@@ -478,9 +478,7 @@ fn count2SegmentsDms(ms: *const MatchState, dms: *const MatchState, p_in: usize,
     var match_length: usize = 0;
     if (v_end > p_in) {
         const n = v_end - p_in;
-        const a = ms.src[p_in - ms.src_base ..][0..n];
-        const b = dms.src[p_match - dms.src_base ..][0..n];
-        match_length = std.mem.indexOfDiff(u8, a, b) orelse n;
+        match_length = match.countRuns(ms.src[p_in - ms.src_base ..][0..n], dms.src[p_match - dms.src_base ..][0..n]);
     }
     if (p_match + match_length != m_end) return match_length;
     return match_length + ms.count(p_in + match_length, i_start, i_end);
@@ -819,16 +817,19 @@ pub fn compressBlockUltra2(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart:
         src_size > predef_threshold)
     {
         initStatsUltra(ms, ss, rep, istart, src_size);
+        // the block's bytes now sit `src_size` indices higher
+        return compressBlock(ms, ss, rep, istart + src_size, src_size, 2);
     }
     return compressBlock(ms, ss, rep, istart, src_size, 2);
 }
 
 /// `ZSTD_initStats_ultra`: a first pass whose sequences are thrown away but
-/// whose statistics stay. libzstd then invalidates the whole block for match
-/// finding by moving the window base back by `src_size`, so every index
-/// already in a table falls below the new low limit. Every index comparison
-/// the finders make is relative to the window limits, so emptying the tables
-/// and restarting insertion at the block is the same.
+/// whose statistics stay. Then, as libzstd does, the whole block is
+/// invalidated for match finding by moving the window base back by
+/// `src_size` (`window.base -= srcSize`: every index goes up by `src_size`)
+/// and the low limit up to the block's new first index, so every index the
+/// first pass left in the tables falls below it -- no table is cleared.
+/// The caller compresses the block again at its new index.
 fn initStatsUltra(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) void {
     var tmp_rep = rep.*;
     std.debug.assert(ms.opt.?.lit_length_sum == 0);
@@ -838,9 +839,9 @@ fn initStatsUltra(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src
     _ = compressBlock(ms, ss, &tmp_rep, istart, src_size, 2); // generate stats into ms.opt
     // invalidate first scan from history, only keep entropy stats
     ss.reset();
-    @memset(ms.hash_table, 0);
-    @memset(ms.chain_table, 0);
-    @memset(ms.hash_table3, 0);
+    ms.src_base += src_size; // ms->window.base -= srcSize
+    ms.dict_limit += src_size;
+    ms.low_limit = ms.dict_limit;
     ms.next_to_update = ms.dict_limit;
 }
 

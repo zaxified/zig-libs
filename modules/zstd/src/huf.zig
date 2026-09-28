@@ -433,7 +433,11 @@ fn compressWeights(dst: []u8, weights: []const u8) Error!usize {
     const table_log = fse.optimalTableLog(max_fse_table_log_for_huff_header, weights.len, max_symbol);
     _ = try fse.normalizeCount(&norm, table_log, &counts, weights.len, max_symbol, false);
     var op = try fse.writeNCount(dst, &norm, max_symbol, table_log);
-    var ct: fse.CTable = .{};
+    // `undefined`, not `.{}`: `build` sets every field it reads back, and
+    // Zig 0.16 lowers `.{}` of the table (its `undefined` defaults
+    // included) to a byte-wise `memset` of all 1.4 KB, for every Huffman
+    // table written (Z32)
+    var ct: fse.CTable = undefined;
     try ct.build(&norm, max_symbol, table_log);
     const c_size = fse.compressUsingCTable(dst[op..], weights, &ct);
     if (c_size == 0) return 0;

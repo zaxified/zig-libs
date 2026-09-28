@@ -5,6 +5,44 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Faster decoding with a trained `DDict` (Z32): the
+  context points at the `DDict`'s entropy tables for a frame, as libzstd's
+  `ZSTD_copyDDictParameters` does, instead of copying their 27 KB per
+  frame — −51–54 % instructions for 100 B frames (0.58–1.09× libzstd's
+  cycles, from 2.29–3.32×), −15–20 % at 1 KB; an undigested
+  `.dictionary` reads its tables straight into the context (−3–6 %). Same
+  output. The `DDict` value itself (not only its content) must now stay
+  alive and unmoved while a frame that uses it decodes; a
+  `Decompressor.copyFrom` taken inside such a frame reads the same `DDict`.
+- **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** tests only -- 9 more
+  `ZSTD_copyCCtx` goldens (`testdata/copy_goldens.zig` gains a `params`
+  column for zcopy's new mode `F`), decoder-copy and shared-pool tests, from
+  a mutation sweep of the Z25/Z29 additions; no code under `src/` beyond
+  tests and test data changed.
+- **2026-09-28** — Faster small frames and dictionary set-up (Z32, the
+  same bytes): `Compressor.compress` no longer clears 5.8 KB per call, nor
+  `begin` the `btopt` statistics, nor each Huffman header its FSE table;
+  the copy path clears the 3-byte hash table word-wise and shifts the
+  tagged tables in vectors, and `CDict` creation clears word-wise. 100 B
+  frames without a dictionary at levels 1–3 take 1.03–1.11× libzstd's
+  cycles (were 1.63–1.78×), through a copied `CDict` 0.95–1.21× (were
+  2.0–3.1×), a `.raw` dictionary at level 9 1.08–1.14× (were 1.66–1.78×).
+  `frame.Compressor.initStream2` / `setupStream2` take a
+  `*frame.LocalCDict` instead of a `*?CDict` (module-internal callers).
+- **2026-09-28** — `btultra2` (levels 19–22; from 18 up to 128 KB of
+  input, from 16 up to 16 KB) no longer clears its tables after the first
+  block's statistics pass: the window's base moves on as libzstd's
+  `ZSTD_initStats_ultra` does -- the same bytes, 1–2 % fewer instructions
+  (Z32).
+- **2026-09-28** — Faster dictionary loading at levels 1–4, the same bytes
+  (Z32): the `fast`/`dfast` tables of a dictionary are filled by code
+  specialised at compile time -- `compressUsingDict` at level 1 from
+  1.20–1.55× libzstd's instructions to 0.76–0.96×, a `CDict` per call at
+  levels 1 and 3 from 1.29–1.67× to 0.85–1.27×.
+- **2026-09-28** — Faster with a dictionary, the same bytes (Z32): match
+  lengths into a dictionary (extDict or an attached `CDict`) are counted 8
+  bytes at a time, as without one -- level 9 with a reused `CDict` from
+  1.14–1.43× libzstd's instructions to 1.04–1.09×.
 - **2026-09-28** — The decoder in a caller's memory, with exact sizes
   (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
   (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never
