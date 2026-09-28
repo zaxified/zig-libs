@@ -2768,7 +2768,8 @@ the API in question, plus goldens and a mutation sweep. Consumers as of
 **qap** wants HTTP `Content-Encoding: zstd` (Z1a now, Z1 later);
 dictionaries are undecided.
 
-- **Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**
+- ~~**Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**~~
+  Done 2026-09-26 (every part below; what Z1d left is Z29).
   ~~**Z1a**~~ `FrameWriter`, done 2026-09-23. ~~**Z1-1**~~ done 2026-09-23:
   `Stream` with `continue`/`flush`/`end` over buffered input and output,
   pledged or unknown size, the window in two segments, and the extDict
@@ -2791,8 +2792,7 @@ dictionaries are undecided.
     block, the raw and RLE fallbacks, the epilogue); a stable output takes
     any room, as libzstd's. The one-shot API still asks for
     `compressBound` (`error.NoSpaceLeft`): its callers get the whole frame
-    or nothing, and libzstd's `ZSTD_compress2` below the bound is left for
-    a caller that asks.
+    or nothing, and libzstd's `ZSTD_compress2` below the bound is Z29.
 - ~~**Z2 — Decoder.**~~ ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
@@ -2807,7 +2807,8 @@ dictionaries are undecided.
 - ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
   *Algorithm*. (The row tag table needs no reduction: it holds tags and
   in-row heads, not indices.)
-- **Z4 — Compression with a dictionary.** ~~**D0**~~ done 2026-09-24
+- ~~**Z4 — Compression with a dictionary.**~~ Done 2026-09-26 (every part
+  below). ~~**D0**~~ done 2026-09-24
   (see *Dictionaries*): raw-content and full dictionaries, `CDict`, the
   load / copy / reload paths and the attach decision, prefixes,
   `compressUsingDict` / `compressUsingCDict`, the dictionary ID and its
@@ -2842,7 +2843,8 @@ dictionaries are undecided.
   parameters, and the path below `btopt`.
 - ~~**Z8 — `targetCBlockSize`.**~~ Done 2026-09-24, see *Advanced
   parameters*.
-- **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines).
+- ~~**Z9 — Multithreaded compression**~~ (`zstdmt_compress.c`, ~1 900 lines).
+  Done 2026-09-25.
   ~~**Z9a**~~ done 2026-09-25 (see *Multithreading*): jobs, overlap, the
   round buffer, LDM and the checksum across jobs, flushing, dictionaries,
   `ZSTD_compress2` and `ZSTD_compressStream2` with workers. ~~**Z9b**~~
@@ -2933,7 +2935,8 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   frame"); the adaptation itself -- `FIO_compressZstdFrame`'s statistics
   over `frameProgression`/`toFlushNow` -- is `zstd-cli`'s `--adapt`, as it
   is libzstd's command's.
-- **Z25 — API gaps, on a consumer's request:** a shared thread pool
+- **Z25 — API gaps** (deferred 2026-09-26 for want of a consumer, not for
+  a reason against; the goal is libzstd's full API): a shared thread pool
   (`ZSTD_CCtx_refThreadPool`), MT progress (`ZSTD_getFrameProgression`,
   `ZSTD_toFlushNow`), the decoder in a caller's workspace with exact
   estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
@@ -2945,7 +2948,8 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
   whose single-threaded numbers `zstd-cli -vvvv --progress` prints equal
   to the C command's (its `smoke.sh` compares them).
-- **Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**:
+- ~~**Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**~~
+  Done 2026-09-28 (what it refuses by name is Z31):
   libzstd 1.5.7's `programs/` options, file handling and output, checked
   against the real CLI. The module's contract stays the library API (*What
   is deliberately not done*); the app is its first full consumer. Stage 1
@@ -2965,6 +2969,21 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   prefix's default content type (*Dictionaries*). `--adapt` done
   2026-09-28 (Z24). Left (refused by name): `--train-legacy` (no legacy
   trainer here), `--trace`.
+- **Z29 — One-shot compression into less room than `compressBound`.**
+  `ZSTD_compress2` takes any capacity and fails with `dstSize_tooSmall`
+  only when the frame does not fit; `compress` asks for the bound
+  (`error.NoSpaceLeft`). The capacity checks exist since Z1d (the stream
+  and the frame path use them); the one-shot entry points do not yet.
+  Deferred 2026-09-26 only for want of a caller.
+- **Z30 — Legacy frame formats (pre-v0.8).** libzstd 1.5.7 is built by
+  default with `ZSTD_LEGACY_SUPPORT=5` and decodes v0.5–v0.7 frames
+  (2015–2016, before the format was frozen); this decoder refuses them.
+  Written down as "no" in Z2 without a reason: to decide.
+- **Z31 — What `zstd-cli` refuses by name:** `--train-legacy` (needs
+  libzstd's legacy trainer, `ZDICT_trainFromBuffer_legacy`, over
+  divsufsort -- written down as "no" in Z5 without a reason) and
+  `--trace` (libzstd's `ZSTD_TRACE` hooks writing a per-file CSV). To
+  decide.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
