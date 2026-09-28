@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `btultra2` (levels 19–22; from 18 up to 128 KB of
+  input, from 16 up to 16 KB) no longer clears its tables after the first
+  block's statistics pass: the window's base moves on as libzstd's
+  `ZSTD_initStats_ultra` does -- the same bytes, 1–2 % fewer instructions
+  (Z32).
 - **2026-09-28** — Faster dictionary loading at levels 1–4, the same bytes
   (Z32): the `fast`/`dfast` tables of a dictionary are filled by code
   specialised at compile time -- `compressUsingDict` at level 1 from
