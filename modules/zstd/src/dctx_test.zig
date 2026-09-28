@@ -444,3 +444,40 @@ test "copyFrom (ZSTD_copyDCtx): a prepared context copied before and during a fr
     }
     try std.testing.expectEqualSlices(u8, src[0..op], out_a[0..op]);
 }
+
+test "copyFrom (ZSTD_copyDCtx) mid-frame with a DDict: the copy reads the same DDict's tables" {
+    // A DDict's entropy tables are pointed at, not copied, for a frame
+    // (`ZSTD_copyDDictParameters`), so a copy taken inside that frame
+    // points at the same DDict, as libzstd's does. lit_repeat_frame's
+    // literals reuse the dictionary's Huffman table (`set_repeat`).
+    var dd = try zstd.DDict.init(gpa, dict_kats.full_dict, .auto);
+    defer dd.deinit(gpa);
+    const z = dict_kats.lit_repeat_frame;
+    var a = try zstd.Decompressor.init(gpa, .{ .ddict = &dd });
+    defer a.deinit();
+    a.begin();
+    var ip: usize = 0;
+    while (a.stage != .decompress_last_block) {
+        const k = a.nextSrcSizeToDecompress();
+        try std.testing.expectEqual(0, try a.decompressContinue(&.{}, z[ip..][0..k]));
+        ip += k;
+    }
+    try std.testing.expect(a.st.huf_ptr == &dd.entropy.huf and a.st.ll_ptr == &dd.entropy.ll);
+    try std.testing.expect(a.st.of_ptr == &dd.entropy.of and a.st.ml_ptr == &dd.entropy.ml);
+    var b = try zstd.Decompressor.init(gpa, .{});
+    defer b.deinit();
+    b.copyFrom(&a);
+    try std.testing.expect(b.st.huf_ptr == &dd.entropy.huf and b.st.ll_ptr == &dd.entropy.ll);
+    for ([_]*zstd.Decompressor{ &a, &b }) |x| {
+        var out: [256]u8 = undefined;
+        var xi = ip;
+        var xo: usize = 0;
+        while (x.nextSrcSizeToDecompress() != 0) {
+            const k = x.nextSrcSizeToDecompress();
+            xo += try x.decompressContinue(out[xo..], z[xi..][0..k]);
+            xi += k;
+        }
+        try std.testing.expectEqual(z.len, xi);
+        try std.testing.expectEqualStrings(dict_kats.lit_repeat_content, out[0..xo]);
+    }
+}

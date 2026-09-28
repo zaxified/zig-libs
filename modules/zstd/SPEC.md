@@ -1335,6 +1335,17 @@ content size that follows (`rep == 0 or rep > content_size` is
 `error.DictionaryCorrupted`); `.raw_content` skips all of that, `.full`
 requires it (`error.DictionaryCorrupted` otherwise), `.auto` falls back to
 raw content when the magic number is absent or the buffer is under 8 bytes.
+A frame decoded with a `DDict` reads its tables in place: as
+`ZSTD_copyDDictParameters` points `LLTptr`/`OFTptr`/`MLTptr`/`HUFptr` at
+the `DDict`'s, the context's `ll_ptr`/`of_ptr`/`ml_ptr`/`huf_ptr` point
+into it and only the repeat offsets are copied (Z32; the 27 KB of tables
+were copied per frame before). A block that builds a table of its own
+points back at the context's, a `repeat` block keeps what is pointed at,
+and `Decompressor.copyFrom` taken inside such a frame points at the same
+`DDict`, as `ZSTD_copyDCtx`'s copy does. So the `DDict` value, which holds
+the tables, must stay alive and unmoved while a frame that uses it is
+decoded. The undigested `Options.dictionary` loads its tables into the
+context's own (`ZSTD_loadDEntropy(&dctx->entropy, ...)`).
 
 **A dictionary's content becomes history the same way this port's history
 already works: as an address range `checkContinuity` can compare against a
@@ -2857,13 +2868,22 @@ levels:
 | call | 100 B | 1 KB | 4 KB | 16 KB |
 |---|---|---|---|---|
 | `DDict` reused, raw content | 0.88–1.07 / 0.90–1.03 | 1.18–1.22 / 1.14–1.15 | 0.98–1.13 / 1.15–1.19 | 1.03–1.10 / 1.19–1.21 |
-| `DDict` reused, trained | 2.47–3.54 / 2.02–2.12 | 1.43–1.78 / 1.46–1.52 | 0.95–1.27 / 1.32–1.36 | 1.00–1.15 / 1.23–1.30 |
+| `DDict` reused, trained | 0.58–1.09 / 1.00–1.03 | 0.90–1.14 / 1.21–1.26 | 1.05–1.13 / 1.23–1.26 | 0.95–1.20 / 1.20–1.25 |
 | bytes each call, raw content | 0.81–1.20 / 0.91–1.04 | 1.13–1.69 / 1.15–1.16 | 1.07–1.56 / 1.15–1.19 | 1.00–1.35 / 1.19–1.21 |
-| bytes each call, trained | 1.11–1.57 / 1.20–1.21 | 1.20–1.65 / 1.21–1.22 | 1.13–1.28 / 1.21–1.23 | 1.02–1.19 / 1.21–1.24 |
+| bytes each call, trained | 0.79–1.21 / 1.13–1.14 | 1.02–1.58 / 1.14–1.16 | 0.72–1.05 / 1.16–1.19 | 1.08–1.22 / 1.17–1.20 |
 
 (`ZSTD_decompress_usingDDict` on a `ZSTD_createDDict`,
 `ZSTD_decompress_usingDict`; `Decompressor` with `.ddict` or
-`.dictionary`.)
+`.dictionary`.) The two trained rows are Z32's (2026-09-28, the same
+method, the base build measured alongside): the context now points at a
+`DDict`'s entropy tables instead of copying them per frame, and an
+undigested dictionary's tables are read straight into the context's.
+Against the build before, instructions (the cycles moved by up to ±30 %
+at equal instructions again) for the reused trained `DDict`: −51–54 % at
+100 B (cycles 0.24–0.33×; before 2.29–3.32 / 2.08–2.19 against libzstd),
+−15–20 % at 1 KB, −4–9 % at 4 KB, −1–3 % at 16 KB; bytes each call,
+trained: −3–6 %. Raw-content dictionaries and decoding without one: the
+same instructions (±0.03 %).
 
 Training, 1 KB samples of the training halves (1.7 MB and 2 MB), cycles
 port ÷ libzstd (CSV, JSON), wall seconds libzstd → port: `train`
@@ -2912,11 +2932,10 @@ equalled its single-threaded one on these inputs too.
   a jump table at every position, the window's base is reloaded from the
   `MatchState` after each table store (Z11's aliasing, fixed in the
   searches, not here), and the tagged/`dtlm` choices are run-time.
-- **The decoder copies a `DDict`'s entropy tables into the context for
-  every frame** (`Decompressor.applyEntropy`: 27 KB), where libzstd's
-  `ZSTD_copyDDictParameters` points the context at the `DDict`'s: 64 % of
-  the cycles (`memmove`) for 100 B frames with a trained dictionary, gone
-  in the noise from 4 KB. A raw-content `DDict` has no tables: 0.9–1.2×.
+- ~~**The decoder copies a `DDict`'s entropy tables into the context for
+  every frame**~~ (27 KB, 64 % of the cycles for 100 B frames with a
+  trained dictionary): closed by Z32, the context points at them as
+  libzstd's `ZSTD_copyDDictParameters` does (the table above).
 
 None of these changes a byte. Closing them is Z32.
 
@@ -3462,8 +3481,10 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `fill.zig` what is still `@memset` per frame or per `CDict`
   (`resetByCopyingCDict`'s 3-byte hash table, `CDict.create`'s tables and
   tag table); `fillHashTableFor` specialised on `min_match` and the table
-  kind, on a `match.Base`; the decoder pointing at a `DDict`'s entropy
-  tables instead of copying them each frame. Re-measure with Z19's method.
+  kind, on a `match.Base`; ~~the decoder pointing at a `DDict`'s entropy
+  tables instead of copying them each frame~~ (done 2026-09-28, *Speed*,
+  "Dictionaries", and *Decoder*, "Dictionaries"). Re-measure with Z19's
+  method.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
@@ -3536,7 +3557,8 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
   which address they hold.
 
-  Dropping `applyEntropy`'s `st.rep = e.rep` (the dictionary's repeat
+  Dropping `applyEntropy`'s `st.rep = e.rep` (since Z32 in
+  `applyDDictEntropy`; `applyRawDictionary` loads them) (the dictionary's repeat
   offsets never reach the decoder) survived every encoder-made frame: a
   dictionary with repeat offsets 50/60/70 in place of 1/4/8 decoded the
   same under both across 5 corpus inputs × 5 levels and 150 more (input,

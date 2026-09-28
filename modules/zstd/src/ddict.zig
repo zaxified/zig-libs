@@ -52,7 +52,10 @@ pub const Entropy = struct {
 
 /// A digested dictionary (`ZSTD_DDict`): its content (by copy or by
 /// reference) and, for a zstd-format dictionary, the entropy tables read
-/// from it once.
+/// from it once. A decoder reads those tables in place, where this value
+/// holds them (`ZSTD_copyDDictParameters` points the context at them), so
+/// the value itself -- not only its content -- must stay alive and where
+/// it is until every frame decoded with it is done.
 pub const DDict = struct {
     /// The whole dictionary buffer, as given to `init`/`initByReference`
     /// -- reachable as history in full, header included (see above).
@@ -179,17 +182,34 @@ fn readEntropyFse(space: *dblock.SeqTable, src: []const u8, max_sv_declared: u32
 /// consumed (header through the repeat offsets); the rest of `dict` is
 /// its content.
 pub fn loadDEntropy(entropy: *Entropy, dict: []const u8) Error!usize {
+    return loadDEntropyInto(.{ .huf = &entropy.huf, .ll = &entropy.ll, .of = &entropy.of, .ml = &entropy.ml, .rep = &entropy.rep }, dict);
+}
+
+/// Where `loadDEntropyInto` writes: an `Entropy`'s fields, or a decoding
+/// context's own tables (`ZSTD_loadDEntropy(&dctx->entropy, ...)`, the
+/// undigested one-shot dictionary).
+pub const Tables = struct {
+    huf: *huf.DTable,
+    ll: *dblock.SeqTable,
+    of: *dblock.SeqTable,
+    ml: *dblock.SeqTable,
+    rep: *[3]u32,
+};
+
+/// `loadDEntropy` into `t`. On an error the tables may be partly written,
+/// as libzstd's are.
+pub fn loadDEntropyInto(t: Tables, dict: []const u8) Error!usize {
     if (dict.len <= 8) return error.DictionaryCorrupted;
     var pos: usize = 8; // magic (4) + dictID (4)
 
-    pos += huf.readDTableX2(&entropy.huf, dict[pos..]) catch return error.DictionaryCorrupted;
+    pos += huf.readDTableX2(t.huf, dict[pos..]) catch return error.DictionaryCorrupted;
     if (pos > dict.len) return error.DictionaryCorrupted;
 
-    pos += try readEntropyFse(&entropy.of, dict[pos..], dblock.max_off, dblock.off_fse_log, &dblock.of_base, &dblock.of_bits);
+    pos += try readEntropyFse(t.of, dict[pos..], dblock.max_off, dblock.off_fse_log, &dblock.of_base, &dblock.of_bits);
     if (pos > dict.len) return error.DictionaryCorrupted;
-    pos += try readEntropyFse(&entropy.ml, dict[pos..], dblock.max_ml, dblock.ml_fse_log, &dblock.ml_base, &seqs.ml_bits);
+    pos += try readEntropyFse(t.ml, dict[pos..], dblock.max_ml, dblock.ml_fse_log, &dblock.ml_base, &seqs.ml_bits);
     if (pos > dict.len) return error.DictionaryCorrupted;
-    pos += try readEntropyFse(&entropy.ll, dict[pos..], dblock.max_ll, dblock.ll_fse_log, &dblock.ll_base, &seqs.ll_bits);
+    pos += try readEntropyFse(t.ll, dict[pos..], dblock.max_ll, dblock.ll_fse_log, &dblock.ll_base, &seqs.ll_bits);
     if (pos > dict.len) return error.DictionaryCorrupted;
 
     if (pos + 12 > dict.len) return error.DictionaryCorrupted;
@@ -198,7 +218,7 @@ pub fn loadDEntropy(entropy: *Entropy, dict: []const u8) Error!usize {
         const rep = readLE32(dict, pos);
         pos += 4;
         if (rep == 0 or rep > content_size) return error.DictionaryCorrupted;
-        entropy.rep[i] = rep;
+        t.rep[i] = rep;
     }
     return pos;
 }

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Faster decoding with a trained `DDict` (Z32): the
+  context points at the `DDict`'s entropy tables for a frame, as libzstd's
+  `ZSTD_copyDDictParameters` does, instead of copying their 27 KB per
+  frame — −51–54 % instructions for 100 B frames (0.58–1.09× libzstd's
+  cycles, from 2.29–3.32×), −15–20 % at 1 KB; an undigested
+  `.dictionary` reads its tables straight into the context (−3–6 %). Same
+  output. The `DDict` value itself (not only its content) must now stay
+  alive and unmoved while a frame that uses it decodes; a
+  `Decompressor.copyFrom` taken inside such a frame reads the same `DDict`.
 - **2026-09-28** — The decoder in a caller's memory, with exact sizes
   (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
   (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never
