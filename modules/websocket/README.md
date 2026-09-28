@@ -73,7 +73,7 @@ copied.
 
 ## Verification
 
-`zig build test-websocket` — 100 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
+`zig build test-websocket` — 104 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
 handshake worked example and the §5.7 frame examples byte-exact (both parse and serialize),
 plus constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
 RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, each with a

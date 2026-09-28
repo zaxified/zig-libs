@@ -15,6 +15,122 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 
+/// Incremental (streaming) UTF-8 validator (RFC 6455 §8.1/§5.6, "Fail-fast
+/// UTF-8 across fragments" — found by qap's Autobahn lane, 2026-09-26; fixed
+/// 2026-09-28). Carries at most the state of one partially-consumed
+/// multi-byte sequence across calls, which is what lets a text message's
+/// UTF-8 be checked one fragment at a time instead of only once the whole
+/// message is reassembled — a code point legitimately split across two
+/// WebSocket fragments (§5.4 permits this) must not fail here, but a byte
+/// that can never become part of valid UTF-8 must fail as soon as it is
+/// seen, not after every remaining fragment has also been read and copied.
+///
+/// This is NOT a second, independently-invented UTF-8 validator: it is
+/// `std.unicode.utf8ValidateSlice`'s own algorithm (a range-table check —
+/// see that function's `first[]` table and the `info >> 4`-selected
+/// continuation-byte range) decomposed into one state transition per byte,
+/// using the identical table and the identical per-position ranges. Whether
+/// std rejects a truncated-at-the-end sequence before or after checking an
+/// individual continuation byte's range differs from what this validator
+/// does step by step, but the two can never disagree on the final verdict
+/// for a complete byte string: every check either algorithm makes (valid
+/// lead byte, size, per-position continuation range, no trailing partial
+/// sequence) is a separate necessary condition ANDed into one boolean, so
+/// evaluation order cannot change the result. `Connection`'s equivalence
+/// test (below) checks exactly this, over many strings split at every
+/// possible fragment boundary.
+pub const IncrementalUtf8 = struct {
+    /// Continuation bytes still needed to complete the multi-byte sequence
+    /// currently in progress. 0 = ready for a new lead byte or an ASCII
+    /// byte (the state at a valid message boundary).
+    remaining: u2 = 0,
+    /// Valid range for the very next continuation byte. Only the byte
+    /// immediately following a lead byte is narrowed (this is what excludes
+    /// overlong encodings and the surrogate range — exactly what std's
+    /// `info >> 4` selects for that one byte); every continuation byte
+    /// after that uses the generic 0x80-0xBF range, restored here the
+    /// moment the narrowed byte is consumed.
+    accept_lo: u8 = 0x80,
+    accept_hi: u8 = 0xBF,
+
+    // Lead-byte classification codes and the 256-entry table built from
+    // them, copied byte-for-byte from `std.unicode.utf8ValidateSliceImpl`'s
+    // private `first[]` table (`.cannot_encode_surrogate_half` variant —
+    // WebSocket text must not encode a surrogate half, same as std's
+    // default `utf8ValidateSlice`) rather than re-derived, so the two can
+    // never silently diverge on which bytes are legal lead bytes or how a
+    // lead byte's value narrows its first continuation byte's range.
+    const xx: u8 = 0xF1; // invalid start byte
+    const as: u8 = 0xF0; // ASCII (never read: filtered by the `< 0x80` check below)
+    const s1: u8 = 0x02; // accept 0 (generic), size 2
+    const s2: u8 = 0x13; // accept 1 (0xA0-0xBF), size 3 -- excludes overlong 3-byte (lead 0xE0)
+    const s3: u8 = 0x03; // accept 0 (generic), size 3
+    const s4: u8 = 0x23; // accept 2 (0x80-0x9F), size 3 -- excludes surrogates D800-DFFF (lead 0xED)
+    const s5: u8 = 0x34; // accept 3 (0x90-0xBF), size 4 -- excludes overlong 4-byte (lead 0xF0)
+    const s6: u8 = 0x04; // accept 0 (generic), size 4
+    const s7: u8 = 0x44; // accept 4 (0x80-0x8F), size 4 -- excludes > U+10FFFF (lead 0xF4)
+    const lead_byte_info = [_]u8{as} ** 128 ++ [_]u8{xx} ** 64 ++ [_]u8{
+        xx, xx, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1,
+        s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1, s1,
+        s2, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s3, s4, s3, s3,
+        s5, s6, s6, s6, s7, xx, xx, xx, xx, xx, xx, xx, xx, xx, xx, xx,
+    };
+
+    /// Feed the next chunk of bytes -- a whole frame payload, a handful of
+    /// bytes, or the entire message at once; the result is the same either
+    /// way. Returns as soon as a byte is seen that can never become part of
+    /// valid UTF-8 (RFC 6455 §8.1's "fail the connection" on invalid UTF-8,
+    /// applied at the earliest byte that makes it certain, not only once
+    /// the complete message has been read).
+    pub fn feed(self: *IncrementalUtf8, bytes: []const u8) error{InvalidUtf8}!void {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            if (self.remaining == 0) {
+                // Fast path: a run of ASCII bytes needs no state at all.
+                while (i < bytes.len and bytes[i] < 0x80) i += 1;
+                if (i >= bytes.len) break;
+            }
+            try self.feedByte(bytes[i]);
+            i += 1;
+        }
+    }
+
+    fn feedByte(self: *IncrementalUtf8, b: u8) error{InvalidUtf8}!void {
+        if (self.remaining == 0) {
+            if (b < 0x80) return; // ASCII
+            const info = lead_byte_info[b];
+            if (info == xx) return error.InvalidUtf8;
+            self.remaining = @intCast((info & 7) - 1); // size - 1 continuation bytes
+            self.accept_lo = 0x80;
+            self.accept_hi = 0xBF;
+            switch (info >> 4) {
+                0 => {},
+                1 => self.accept_lo = 0xA0,
+                2 => self.accept_hi = 0x9F,
+                3 => self.accept_lo = 0x90,
+                4 => self.accept_hi = 0x8F,
+                else => unreachable,
+            }
+            return;
+        }
+        if (b < self.accept_lo or b > self.accept_hi) return error.InvalidUtf8;
+        self.remaining -= 1;
+        // Only the byte right after the lead byte is narrowed -- every
+        // continuation byte after that uses the generic range (matches
+        // std: c2/c3 are always checked against plain 0x80-0xBF).
+        self.accept_lo = 0x80;
+        self.accept_hi = 0xBF;
+    }
+
+    /// Call once the message is complete (FIN received). A partial sequence
+    /// still pending here means the message ended mid-code-point -- every
+    /// byte seen was individually fine, but RFC 3629 requires a complete
+    /// sequence, and this one never got its last continuation byte(s).
+    pub fn finish(self: *const IncrementalUtf8) error{InvalidUtf8}!void {
+        if (self.remaining != 0) return error.InvalidUtf8;
+    }
+};
+
 pub const Connection = struct {
     role: frame.Role,
     /// Per-frame payload cap, forwarded to `frame.parseFrame` (close 1009).
@@ -66,6 +182,14 @@ pub const Connection = struct {
     /// Frames received while `close_received` was already true (the frame
     /// that SETS `close_received` does not count itself).
     frames_after_close: u32 = 0,
+    /// "Fail-fast UTF-8 across fragments", 2026-09-28: incremental UTF-8
+    /// state for the text message currently being reassembled (meaningless,
+    /// and never fed, while `fragment_opcode` is `.binary` or null). Reset
+    /// to `.{}` whenever a new fragmented TEXT message starts; every
+    /// fragment's payload is fed to it as that fragment arrives, so invalid
+    /// UTF-8 in an early fragment is caught at that fragment instead of
+    /// only once the whole message has been reassembled.
+    text_utf8: IncrementalUtf8 = .{},
 
     pub fn init(role: frame.Role, message_buf: []u8, max_frame_size: u64) Connection {
         return .{ .role = role, .max_frame_size = max_frame_size, .message_buf = message_buf };
@@ -151,6 +275,7 @@ pub const Connection = struct {
             self.fragment_opcode = null;
             self.message_len = 0;
             self.fragment_count = 0;
+            self.text_utf8 = .{};
         }
         const parsed = switch (try frame.parseFrame(buf, self.role, self.max_frame_size)) {
             .need_more => return .{ .event = .need_more, .consumed = 0 },
@@ -196,13 +321,30 @@ pub const Connection = struct {
                 const start_opcode = self.fragment_opcode orelse return error.InvalidFragmentation;
                 self.fragment_count += 1;
                 if (self.fragment_count > self.max_fragments) return error.TooManyFragments;
+                // Fed BEFORE `appendFragment`, so an invalid byte anywhere in
+                // THIS fragment's payload fails this call -- the whole point
+                // of "fail-fast across fragments" -- rather than after the
+                // (pointless, at that point) copy into `message_buf`.
+                if (start_opcode == .text) try self.text_utf8.feed(parsed.payload);
                 try self.appendFragment(parsed.payload);
                 if (!parsed.fin) return .{ .event = .frame_consumed, .consumed = parsed.consumed };
 
                 self.fragment_opcode = null;
                 self.fragment_count = 0;
                 const payload = self.message_buf[0..self.message_len];
-                if (start_opcode == .text and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+                if (start_opcode == .text) {
+                    // A message ending mid-code-point: every byte fed so far
+                    // was individually fine, but the sequence never got its
+                    // last continuation byte(s) (RFC 3629).
+                    try self.text_utf8.finish();
+                    // Debug/ReleaseSafe cross-check only (`IncrementalUtf8`'s
+                    // doc comment explains why the two can't actually
+                    // disagree): `std.debug.assert` is not evaluated for its
+                    // side effect in ReleaseFast, so this is never the thing
+                    // actually enforcing §5.6 there -- `text_utf8.finish()`
+                    // above is.
+                    std.debug.assert(std.unicode.utf8ValidateSlice(payload));
+                }
                 return .{ .event = .{ .message = .{ .opcode = start_opcode, .payload = payload } }, .consumed = parsed.consumed };
             },
             .text, .binary => {
@@ -216,13 +358,26 @@ pub const Connection = struct {
                     // copy into `message_buf`); the buffer's *length* is what
                     // is being honoured here, not its storage.
                     if (parsed.payload.len > self.message_buf.len) return error.MessageTooLarge;
-                    if (parsed.opcode == .text and !std.unicode.utf8ValidateSlice(parsed.payload))
-                        return error.InvalidUtf8;
+                    if (parsed.opcode == .text) {
+                        // Single-frame message: routed through the same
+                        // incremental validator as the reassembly path (one
+                        // implementation of "is this valid UTF-8", not two)
+                        // — feed the whole payload, then check it didn't end
+                        // mid-code-point.
+                        var v: IncrementalUtf8 = .{};
+                        try v.feed(parsed.payload);
+                        try v.finish();
+                        std.debug.assert(std.unicode.utf8ValidateSlice(parsed.payload)); // see the .continuation branch's comment
+                    }
                     return .{ .event = .{ .message = .{ .opcode = parsed.opcode, .payload = parsed.payload } }, .consumed = parsed.consumed };
                 }
                 self.fragment_opcode = parsed.opcode;
                 self.fragment_count = 1;
                 self.message_len = 0;
+                if (parsed.opcode == .text) {
+                    self.text_utf8 = .{};
+                    try self.text_utf8.feed(parsed.payload);
+                }
                 try self.appendFragment(parsed.payload);
                 return .{ .event = .frame_consumed, .consumed = parsed.consumed };
             },
@@ -313,8 +468,11 @@ test "a UTF-8 codepoint split across fragment boundaries validates correctly" {
 // UTF-16 surrogate halves and pairs, and the non-character code points that
 // RFC 3629 permits) is transcribed below, each wrapped in a real single-frame
 // unmasked text message and fed through `Connection.receive` — the same
-// code path (`std.unicode.utf8ValidateSlice` at connection.zig:131/145) a
-// live Autobahn run would have exercised.
+// validation (`IncrementalUtf8`, 2026-09-28 — `std.unicode.utf8ValidateSlice`
+// itself before that date) a live Autobahn run would have exercised. This
+// corpus is also reused below (`checkUtf8EquivalenceAtEverySplit`) to prove
+// `IncrementalUtf8` agrees with `utf8ValidateSlice` regardless of where a
+// message is split into fragments.
 const Utf8Vector = struct { bytes: []const u8, valid: bool, label: []const u8 };
 const kuhn_utf8_vectors = [_]Utf8Vector{
     // 1 — some correct UTF-8 text.
@@ -408,6 +566,82 @@ test "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus (Mar
                 return e;
             };
         }
+    }
+}
+
+// ── IncrementalUtf8 vs. std.unicode.utf8ValidateSlice: the equivalence ─────
+//
+// "Fail-fast UTF-8 across fragments", 2026-09-28. `IncrementalUtf8`'s doc
+// comment argues BY CONSTRUCTION that it cannot disagree with
+// `utf8ValidateSlice` on a complete byte string, no matter how that string is
+// chopped into feed() calls -- every check either algorithm makes is one
+// necessary condition ANDed into a single boolean, so evaluation order can't
+// change the answer. This is the executable version of that argument: run
+// both over the same bytes, at every possible split point, and fail loudly
+// on the first disagreement rather than trusting the argument alone.
+fn checkUtf8EquivalenceAtEverySplit(bytes: []const u8) !void {
+    const want = std.unicode.utf8ValidateSlice(bytes);
+
+    // Two-way split at every boundary, including the two degenerate splits
+    // (everything fed in one call, or nothing in the first call at all).
+    var split: usize = 0;
+    while (split <= bytes.len) : (split += 1) {
+        var v: IncrementalUtf8 = .{};
+        const got = blk: {
+            v.feed(bytes[0..split]) catch break :blk false;
+            v.feed(bytes[split..]) catch break :blk false;
+            v.finish() catch break :blk false;
+            break :blk true;
+        };
+        if (got != want) {
+            std.debug.print("split={d} bytes={x} want={} got={}\n", .{ split, bytes, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Fully fragmented, one byte per feed() call -- the extreme case that
+    // subsumes every coarser split above, since a byte's state transition
+    // never depends on where a chunk boundary happened to fall.
+    {
+        var v: IncrementalUtf8 = .{};
+        const got = blk: {
+            for (bytes, 0..) |_, i| v.feed(bytes[i .. i + 1]) catch break :blk false;
+            v.finish() catch break :blk false;
+            break :blk true;
+        };
+        if (got != want) {
+            std.debug.print("byte-by-byte bytes={x} want={} got={}\n", .{ bytes, want, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "IncrementalUtf8 agrees with utf8ValidateSlice at every fragment split (Kuhn corpus)" {
+    // Reuses the frozen external-anchor corpus above -- it already covers
+    // every UTF-8 edge case that matters (overlongs, surrogates, truncated
+    // sequences, boundary code points), so the equivalence claim is checked
+    // against real adversarial data, not just a handful of hand-picked
+    // strings.
+    for (kuhn_utf8_vectors) |v| try checkUtf8EquivalenceAtEverySplit(v.bytes);
+    try checkUtf8EquivalenceAtEverySplit("A\xE2\x82\xACB"); // "A€B"
+    try checkUtf8EquivalenceAtEverySplit("hello, world");
+    try checkUtf8EquivalenceAtEverySplit("");
+    try checkUtf8EquivalenceAtEverySplit("\xF0\x9F\x98\x80"); // U+1F600, 4-byte
+}
+
+test "IncrementalUtf8 agrees with utf8ValidateSlice on random byte strings (fixed seed)" {
+    // Not UTF-8-shaped input in general -- most draws are garbage, which is
+    // the point: the Kuhn corpus above is curated edge cases, this is
+    // unstructured bytes exercising combinations nobody curated by hand.
+    // Fixed seed, so this is deterministic and never skips.
+    var prng = std.Random.DefaultPrng.init(20260928);
+    const random = prng.random();
+    var buf: [24]u8 = undefined;
+    var iter: usize = 0;
+    while (iter < 500) : (iter += 1) {
+        const len = random.intRangeAtMost(usize, 0, buf.len);
+        random.bytes(buf[0..len]);
+        try checkUtf8EquivalenceAtEverySplit(buf[0..len]);
     }
 }
 
@@ -694,13 +928,52 @@ test "invalid UTF-8 single-frame text message is rejected (close 1007)" {
     try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
 }
 
-test "invalid UTF-8 reassembled text message is rejected (close 1007)" {
+// "Fail-fast UTF-8 across fragments", 2026-09-28. Before this fix, invalid
+// UTF-8 in the FIRST fragment of a message was not refused until the LAST
+// fragment arrived (validation ran once, over the reassembled whole, only
+// once `fin` was seen) -- this exact test used to assert `_ = try
+// conn.receive(&wire1);` (the first call SUCCEEDING) and only expect
+// `InvalidUtf8` from the second call. Autobahn|Testsuite scores this
+// NON-STRICT (§6.4.1-4): RFC 6455 §8.1 requires the failure, not a
+// particular frame for it to happen on, but every fragment already
+// received and copied into `message_buf` before the rejection is wasted
+// work an attacker can induce arbitrarily many times over.
+test "invalid UTF-8 in the first fragment is rejected at that frame, not delayed to FIN (close 1007)" {
     var scratch: [16]u8 = undefined;
     var conn: Connection = .init(.client, &scratch, 1 << 20);
     var wire1 = [_]u8{ 0x01, 0x01, 0xff }; // text, fin=0, invalid lead byte
-    _ = try conn.receive(&wire1);
-    var wire2 = [_]u8{ 0x80, 0x01, 'x' };
+    // The error fires on THIS call.
+    try testing.expectError(error.InvalidUtf8, conn.receive(&wire1));
+    try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
+}
+
+// Same fix, the other fragment position: a LATER fragment's invalid byte
+// must also be caught at ITS frame, not only once FIN arrives -- proving the
+// per-frame check isn't special-cased to the first fragment.
+test "invalid UTF-8 in a later fragment is rejected at that frame, not delayed to FIN" {
+    var scratch: [16]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    var wire1 = [_]u8{ 0x01, 0x01, 'A' }; // text, fin=0, valid ASCII
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire1)).event);
+    var wire2 = [_]u8{ 0x00, 0x01, 0xff }; // continuation, fin=0, invalid lead byte
     try testing.expectError(error.InvalidUtf8, conn.receive(&wire2));
+}
+
+// The flip side of fail-fast: a code point legitimately split across
+// fragments must still be ACCEPTED (already covered above), but a message
+// that ENDS with one still pending -- FIN arrives with no more bytes to
+// complete it -- must be refused. Every byte fed so far was individually
+// fine; the sequence just never got its last continuation byte(s).
+test "a message ending mid-code-point (FIN with a pending sequence) is rejected (close 1007)" {
+    var scratch: [16]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    // 0xE2 0x82 -- the first two bytes of '€' (0xE2 0x82 0xAC) -- a valid,
+    // in-progress 3-byte sequence missing its last byte.
+    var wire1 = [_]u8{ 0x01, 0x02, 0xE2, 0x82 }; // text, fin=0
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire1)).event);
+    var wire2 = [_]u8{ 0x80, 0x00 }; // continuation, fin=1, EMPTY -- nothing left to complete it
+    try testing.expectError(error.InvalidUtf8, conn.receive(&wire2));
+    try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
 }
 
 test "close frame surfaces code + reason and updates close_received" {

@@ -72,13 +72,27 @@ the buffer's *length* is the caller's stated memory budget for one message, and 
 one-frame message could walk past would not be a budget at all. Control frames (ping/pong/
 close) are dispatched before fragmentation state is even consulted, which is what makes
 interleaving them mid-fragmentation "just work" — no special-casing needed. UTF-8 validation
-(§5.6, required for `text`/`.continuation`-reassembled-as-text) runs against the **complete**
-message: a single unfragmented frame validates directly against its payload with no copy; a
-reassembled one validates `message_buf[0..message_len]` once the final fragment arrives. This is
-correct per the RFC's actual requirement (the *message* must be valid UTF-8) and is exercised by a
-test that deliberately splits a multi-byte codepoint across two fragments — the split bytes are
-*not* independently valid UTF-8, only the reassembled whole is, proving the deferred-validation
-design doesn't false-positive on legitimate fragmentation.
+(§5.6, required for `text`/`.continuation`-reassembled-as-text) is **incremental, checked per
+fragment as it arrives** (`IncrementalUtf8`, 2026-09-28 — found by qap's Autobahn lane, 2026-09-26;
+before this date it ran once, against the reassembled whole, only once `FIN` arrived, which
+Autobahn|Testsuite scores §6.4.1-4 NON-STRICT: RFC 6455 §8.1 requires the failure, not its timing,
+but every other library checked — autobahn-python, gorilla, tungstenite — fails at the fragment
+that makes it certain). `IncrementalUtf8` carries the state of at most one partially-consumed
+multi-byte sequence (a code point split across fragments, which §5.4 explicitly permits, must not
+fail) across `Connection.receive` calls: each fragment's payload is fed to it as that fragment
+arrives, so a byte that can never become valid UTF-8 fails at the fragment it's in, and a message
+that ends (`FIN`) with a sequence still pending fails too, even though every byte seen was
+individually fine. It is not a second, independently-invented UTF-8 validator — it is
+`std.unicode.utf8ValidateSlice`'s own range-table algorithm decomposed into one state transition
+per byte, using the identical lookup table; a single-frame message is routed through it exactly the
+same way (feed the whole payload in one call, then check for a trailing partial sequence), so there
+is one implementation of "is this valid UTF-8", and `utf8ValidateSlice` survives only as a
+`std.debug.assert` cross-check on the ACCEPT path (compiled out in ReleaseFast — never what actually
+enforces §5.6 there). Proven equivalent to `utf8ValidateSlice` by a test that runs both over the
+frozen Kuhn corpus (below) and 500 fixed-seed-random byte strings, at every possible fragment split
+point of each, rather than only the one hand-picked split ("A€B" cut mid-codepoint) this paragraph
+used to rely on as its sole proof that deferred validation doesn't false-positive on legitimate
+fragmentation — an attacker choosing where to split a message is not obliged to pick that split.
 
 ## Threat model / out of scope
 
@@ -177,7 +191,7 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
 
 ## Verification
 
-`zig build test-websocket` — 100 offline tests, green in Debug + ReleaseFast.
+`zig build test-websocket` — 104 offline tests, green in Debug + ReleaseFast.
 - **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example
   (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone
   `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the
@@ -327,15 +341,6 @@ previous self-authored close-code tests reproduces the module's state before thi
 The RED comes from the foreign corpus and from nothing else.
 
 ## Backlog / deferred
-
-**Fail-fast UTF-8 across fragments** — BACKLOG (2026-09-26, found by qap's Autobahn lane). A text
-message is validated when it is complete (`connection.zig` `utf8ValidateSlice` over the reassembled
-payload), so invalid UTF-8 in the first fragment of a long message is refused (1007) only after the
-last one arrives. Autobahn|Testsuite scores §6.4.1-4 NON-STRICT for it; RFC 6455 §8.1 requires the
-failure, not its timing, but the other libraries (autobahn-python, gorilla, tungstenite) fail at the
-fragment. Wanted: an incremental validator carried across frames (the state is at most 3 pending
-bytes of a code point), checked per frame, and the whole-message check dropped. qap's own `ws.Core`
-has the same shape and baselines the four cases (`scripts/conformance-baseline/autobahn.tsv`).
 
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 

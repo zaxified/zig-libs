@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane, 2026-09-26):
+  `Connection.receive` now validates a text message's UTF-8 (§5.6) incrementally, per fragment, via
+  the new `IncrementalUtf8` (`connection.zig`) — invalid UTF-8 in an early fragment is now refused
+  (`error.InvalidUtf8`, close 1007) at that fragment, not only once the whole message has been
+  reassembled at `FIN`. Before this, Autobahn|Testsuite scored §6.4.1-4 NON-STRICT: RFC 6455 §8.1
+  requires the failure, not its timing, but every other library checked (autobahn-python, gorilla,
+  tungstenite) fails at the fragment. A code point legitimately split across fragments (§5.4) is
+  still accepted; a message that ends (`FIN`) with a multi-byte sequence still pending is now also
+  refused, which it previously was not by construction (there was no cross-fragment state to notice
+  it). `IncrementalUtf8` is `std.unicode.utf8ValidateSlice`'s own algorithm decomposed into one
+  state transition per byte, not a second implementation — proven equivalent to it over the frozen
+  Kuhn corpus and 500 fixed-seed-random byte strings, at every possible fragment split point
+  (`connection.zig`'s new equivalence tests). The single-frame (unfragmented) text path is now
+  routed through the same validator for the same reason (`utf8ValidateSlice` survives only as a
+  `std.debug.assert` cross-check on the accept path, compiled out in ReleaseFast). **Behavioural,
+  not breaking:** no signature changed, and every message that was already accepted or already
+  rejected keeps that same verdict (proven by the new equivalence tests) — the only observable
+  difference is *when* a message that was always going to be rejected gets rejected: at the
+  fragment carrying the offending byte instead of only once `FIN` arrives. A message ending
+  mid-code-point was already caught at `FIN` by the old whole-message check and still is; that case
+  is unchanged. See SPEC.md's "Connection" paragraph for the design and equivalence argument.
+
 - **2026-09-28** — **BEHAVIOURAL, not breaking** (requested by qap security review M6.2,
   2026-09-24): `acceptHandshake` now checks the request's `Origin` header.
   `ServerAcceptOptions` gains `origins: []const []const u8 = &.{}` (new field with a default, so
