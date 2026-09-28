@@ -415,7 +415,10 @@ pub const Options = struct {
     /// `ZSTD_decompress_usingDDict`: a pre-digested dictionary, applied
     /// to every frame. Its whole buffer (header included, for a
     /// zstd-format dictionary) is reachable as history -- libzstd's real
-    /// behaviour (`ZSTD_copyDDictParameters`), not a simplification.
+    /// behaviour (`ZSTD_copyDDictParameters`), not a simplification. Its
+    /// entropy tables are read in place, not copied: the `DDict` value
+    /// (as every entry of `ddicts`) must stay alive and unmoved while a
+    /// frame that uses it is decoded.
     ddict: ?*const ddict_mod.DDict = null,
     /// `ZSTD_d_refMultipleDDicts`: pick the dictionary by each frame's
     /// dictionary ID from this set (falling back to `ddict` when no
@@ -520,6 +523,7 @@ pub const Decompressor = struct {
 
     fn fromState(gpa: ?std.mem.Allocator, st: *dblock.State, options: Options) Decompressor {
         st.* = .{};
+        st.huf_ptr = &st.huf; // defined before any `begin` (`copyFrom` compares it)
         // the slack behind the literals is read (and overwritten) by wildcopy
         @memset(st.lit_buf[block_size_max..], 0);
         return .{ .gpa = gpa, .st = st, .options = options, .expected = headerPrefixSize(options.format) };
@@ -547,10 +551,13 @@ pub const Decompressor = struct {
     /// `d` keeps its own memory (allocator or workspace) and literal
     /// buffer, which holds nothing between blocks. libzstd copies the
     /// struct up to its buffers, table pointers included, so a copy's
-    /// tables stay those of `src`; here they point into `d`'s own copy,
-    /// which differs only if `src` changes or goes away first. It leaves
-    /// out the frame header buffer, which this copies too (a copy taken
-    /// in the middle of a header goes on with it here).
+    /// tables stay those of `src`. Here a table `src` built itself is
+    /// pointed at in `d`'s own copy, which differs only if `src` changes
+    /// or goes away first; a table `src` reads from a `DDict` (or a
+    /// predefined one) stays that one, as in libzstd -- the `DDict` must
+    /// outlive the copy's frame as well. libzstd leaves out the frame
+    /// header buffer, which this copies too (a copy taken in the middle of
+    /// a header goes on with it here).
     pub fn copyFrom(d: *Decompressor, src: *const Decompressor) void {
         if (d == src) return;
         const st = d.st;
@@ -563,7 +570,7 @@ pub const Decompressor = struct {
         st.ll_ptr = if (s.ll_ptr == &s.ll) &st.ll else s.ll_ptr;
         st.of_ptr = if (s.of_ptr == &s.of) &st.of else s.of_ptr;
         st.ml_ptr = if (s.ml_ptr == &s.ml) &st.ml else s.ml_ptr;
-        st.huf_ptr = &st.huf;
+        st.huf_ptr = if (s.huf_ptr == &s.huf) &st.huf else s.huf_ptr;
         st.lit_entropy = s.lit_entropy;
         st.fse_entropy = s.fse_entropy;
         st.block_size_max = s.block_size_max;
@@ -619,19 +626,42 @@ pub const Decompressor = struct {
         d.prev_end_addr = d.prefix_addr + content.len;
     }
 
-    fn applyEntropy(d: *Decompressor, e: *const ddict_mod.Entropy) void {
+    /// `ZSTD_copyDDictParameters`' entropy part: the context decodes
+    /// through the `DDict`'s own tables, which it only points at (27 KB not
+    /// copied per frame); only the repeat offsets are copied. A block that
+    /// builds a table of its own points the context back at its own space,
+    /// a `repeat` block keeps what is pointed at (dblock.zig), as libzstd's
+    /// `LLTptr`/`OFTptr`/`MLTptr`/`HUFptr` do.
+    fn applyDDictEntropy(d: *Decompressor, e: *const ddict_mod.Entropy) void {
         const st = d.st;
-        st.huf = e.huf;
-        st.of = e.of;
-        st.ml = e.ml;
-        st.ll = e.ll;
+        st.ll_ptr = &e.ll;
+        st.of_ptr = &e.of;
+        st.ml_ptr = &e.ml;
+        st.huf_ptr = &e.huf;
+        st.rep = e.rep;
+        st.lit_entropy = true;
+        st.fse_entropy = true;
+    }
+
+    /// `ZSTD_decompress_insertDictionary`: raw dictionary bytes. A
+    /// zstd-format one's entropy tables are read into the context's own
+    /// tables (`ZSTD_loadDEntropy(&dctx->entropy, ...)`, which `begin`
+    /// pointed the context at) and its header is left out of the history.
+    fn applyRawDictionary(d: *Decompressor, raw: []const u8) Error!void {
+        if (raw.len < 8 or readLE32(raw, 0) != ddict_mod.magic_dictionary) {
+            d.setHistoryFrom(raw);
+            return;
+        }
+        d.dict_id = readLE32(raw, 4);
+        const st = d.st;
+        const consumed = ddict_mod.loadDEntropyInto(.{ .huf = &st.huf, .ll = &st.ll, .of = &st.of, .ml = &st.ml, .rep = &st.rep }, raw) catch return error.DictionaryCorrupted;
         st.ll_ptr = &st.ll;
         st.of_ptr = &st.of;
         st.ml_ptr = &st.ml;
         st.huf_ptr = &st.huf;
-        st.rep = e.rep;
         st.lit_entropy = true;
         st.fse_entropy = true;
+        d.setHistoryFrom(raw[consumed..]);
     }
 
     /// `ZSTD_DDictHashSet_getDDict`, rewritten as a linear scan (this
@@ -691,21 +721,10 @@ pub const Decompressor = struct {
             d.setHistoryFrom(p);
             return;
         }
-        if (d.options.dictionary) |raw| {
-            if (raw.len < 8 or readLE32(raw, 0) != ddict_mod.magic_dictionary) {
-                d.setHistoryFrom(raw);
-                return;
-            }
-            d.dict_id = readLE32(raw, 4);
-            var e: ddict_mod.Entropy = .{};
-            const consumed = ddict_mod.loadDEntropy(&e, raw) catch return error.DictionaryCorrupted;
-            d.applyEntropy(&e);
-            d.setHistoryFrom(raw[consumed..]);
-            return;
-        }
+        if (d.options.dictionary) |raw| return d.applyRawDictionary(raw);
         if (d.selectDDict(frame_dict_id)) |dd| {
             d.dict_id = dd.dict_id;
-            if (dd.entropy_present) d.applyEntropy(&dd.entropy);
+            if (dd.entropy_present) d.applyDDictEntropy(&dd.entropy);
             d.setHistoryFrom(dd.content);
         }
     }
@@ -722,21 +741,10 @@ pub const Decompressor = struct {
             d.setHistoryFrom(p);
             return;
         }
-        if (d.options.dictionary) |raw| {
-            if (raw.len < 8 or readLE32(raw, 0) != ddict_mod.magic_dictionary) {
-                d.setHistoryFrom(raw);
-                return;
-            }
-            d.dict_id = readLE32(raw, 4);
-            var e: ddict_mod.Entropy = .{};
-            const consumed = ddict_mod.loadDEntropy(&e, raw) catch return error.DictionaryCorrupted;
-            d.applyEntropy(&e);
-            d.setHistoryFrom(raw[consumed..]);
-            return;
-        }
+        if (d.options.dictionary) |raw| return d.applyRawDictionary(raw);
         if (fixed_ddict) |dd| {
             d.dict_id = dd.dict_id;
-            if (dd.entropy_present) d.applyEntropy(&dd.entropy);
+            if (dd.entropy_present) d.applyDDictEntropy(&dd.entropy);
             d.setHistoryFrom(dd.content);
         }
     }

@@ -307,8 +307,8 @@ pub const Compressor = struct {
     /// `dst` decides only whether the frame fits: exactly its length does.
     fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options, pool: ?*ThreadPool) Error!usize {
         try fo.advanced.check();
-        var local: ?CDict = null;
-        defer if (local) |*l| l.deinit();
+        var local: frame.LocalCDict = .{ .cdict = undefined, .made = false };
+        defer local.deinit();
         const setup = try c.ctx.setupStream2(fo, src.len, null, &local);
         if (c.mt == null) {
             const gpa = c.ctx.gpa orelse return error.OutOfMemory; // a static context

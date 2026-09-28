@@ -141,7 +141,7 @@ pub const Stream = struct {
     expected_in: struct { ptr: [*]const u8 = undefined, len: usize = 0, pos: usize = 0 } = .{},
     expected_out_room: usize = 0,
     /// The stream's own `CDict` for a `.raw` dictionary (`localDict`).
-    local_cdict: ?cdict_mod.CDict = null,
+    local_cdict: frame.LocalCDict = .{ .cdict = undefined, .made = false },
     /// Test seam, set before the first call: index overflow corrected as
     /// libzstd's fuzzing build does it (`frame.Options.
     /// overflow_correct_frequently`), which reaches the correction of a
@@ -184,7 +184,7 @@ pub const Stream = struct {
 
     pub fn deinit(s: *Stream) void {
         if (s.mt) |m| m.destroy();
-        if (s.local_cdict) |*l| l.deinit();
+        s.local_cdict.deinit();
         s.comp.deinit();
         s.* = undefined;
     }
@@ -197,8 +197,7 @@ pub const Stream = struct {
         try checkOptions(opts);
         if (s.mt) |m| m.abandon();
         // ZSTD_clearAllDicts
-        if (s.local_cdict) |*l| l.deinit();
-        s.local_cdict = null;
+        s.local_cdict.deinit();
         s.opts = opts;
         s.pledged = opts.pledged_size;
         s.stage = .init;

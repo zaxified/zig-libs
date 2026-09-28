@@ -505,16 +505,44 @@ test "a context moves between its own pool and shared ones between frames" {
     defer b.destroy();
     var c: zstd.Compressor = .init(gpa);
     defer c.deinit();
-    for ([_]?*zstd.ThreadPool{ a, null, b, b, null, a }) |p| {
+    // (straight from one shared pool to another, and its own pool kept
+    // from one frame to the next, as libzstd keeps it)
+    var own: ?*zstd.ThreadPool = null;
+    for ([_]?*zstd.ThreadPool{ a, b, null, null, b, b, null, a }) |p| {
         const n = try c.compress(out, src, .{ .level = 3, .advanced = adv, .thread_pool = p });
         try std.testing.expectEqualSlices(u8, want[0..n_want], out[0..n]);
         const m = c.mt.?;
         try std.testing.expectEqual(p == null, m.own_pool);
         if (p) |q| try std.testing.expect(m.pool == q);
+        if (p == null) {
+            if (own) |o| try std.testing.expect(m.pool == o);
+            own = m.pool;
+        } else own = null;
     }
-    // a shared pool is never resized by a context's worker count
+    // a shared pool is never resized by a context's worker count; its own
+    // is, both ways (the bytes do not depend on the worker count)
     try std.testing.expectEqual(@as(u32, 1), a.n_threads);
     try std.testing.expectEqual(@as(u32, 4), b.n_threads);
+    for ([_]u32{ 4, 1, 3 }) |nw| {
+        const n = try c.compress(out, src, .{ .level = 3, .advanced = .{ .nb_workers = nw, .job_size = 1 } });
+        try std.testing.expectEqualSlices(u8, want[0..n_want], out[0..n]);
+        try std.testing.expectEqual(nw, c.mt.?.pool.n_threads);
+    }
+    // a stream takes the pool too, and its estimate leaves the workers'
+    // workspaces to it
+    {
+        const sopts: zstd.StreamOptions = .{ .level = 3, .pledged_size = src.len, .advanced = adv, .thread_pool = b };
+        var s = try zstd.Stream.init(gpa, sopts);
+        defer s.deinit();
+        var o: zstd.OutBuffer = .{ .dst = out };
+        var in: zstd.InBuffer = .{ .src = src };
+        while (try s.compressStream2(&o, &in, .end) != 0) {}
+        try std.testing.expectEqualSlices(u8, want[0..n_want], out[0..o.pos]);
+        try std.testing.expect(!s.mt.?.own_pool and s.mt.?.pool == b);
+        const est_s = try zstd.estimateStreamSize(sopts);
+        try std.testing.expect(est_s < try zstd.estimateStreamSize(.{ .level = 3, .pledged_size = src.len, .advanced = adv }));
+        try std.testing.expect(held(s.mt, s.workspaceSize()) <= est_s);
+    }
     // with a shared pool, the estimate leaves the workers' workspaces to it
     const est_own = try zstd.estimateCompressorSize(src.len, .{ .level = 3, .advanced = adv });
     const est_shared = try zstd.estimateCompressorSize(src.len, .{ .level = 3, .advanced = adv, .thread_pool = a });

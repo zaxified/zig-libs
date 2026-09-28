@@ -39,7 +39,8 @@ mkdir -p "$work"
     "$R/seq-manifest.txt")
 
 # case dict mode level pledged copy-pledged chunks flags capacity cparams
-# ("-": none / unknown / default; see zcopy.c)
+# ("-": none / unknown / default; see zcopy.c; for mode F the last column
+# is the parameter list)
 plans="
 words-16384 zd-words L 1 - - 1 0 - -
 words-16384 zd-words L 3 - 16384 3 0 - -
@@ -69,6 +70,15 @@ words-16384 zd-words C 1 16384 - 2 3 - -
 words-16384 zd-words c 3 - - 1 0 - -
 csv-131073 raw-csv-30000 c 9 - 131073 2 0 - -
 mix-106 raw-words-8000 c 16 - - 1 0 - -
+csv-131073 raw-words-8000 C 5 100000 131073 2 0 - -
+csv-131073 raw-words-8000 C 16 100000 131073 1 0 - -
+words-16384 raw-words-8000 L 9 - - 2 8 - -
+words-16384 raw-words-8000 A 13 16384 16384 1 8 - -
+mix-106 raw-words-8000 L 16 - - 1 8 - -
+csv-131073 - F 3 - 131073 2 0 - maxBlockSize=4096
+csv-131073 - F 5 - - 1 0 - useRowMatchFinder=2
+mix-200000-0 - F 16 - - 1 0 - splitAfterSequences=2
+mix-10086 - F 3 - 300000 1 0 - enableLongDistanceMatching=1,ldmHashLog=15,ldmMinMatch=6,ldmBucketSizeLog=6,ldmHashRateLog=2
 "
 
 errname() {
@@ -91,7 +101,7 @@ out="$mod/src/testdata/copy_goldens.zig"
     echo "//! error a call failed with; \`copy_after\` is ZSTD_copyCCtx of the used original."
     echo ""
     echo "pub const Frame = struct { len: usize = 0, sha256: *const [64]u8 = &@splat('-'), err: []const u8 = \"\" };"
-    echo "pub const Row = struct { case: []const u8, dict: ?[]const u8, mode: u8, level: i32, pledged: ?u64, copy_pledged: ?u64, chunks: u32, flags: u32, capacity: ?usize, cparams: ?[7]u32, copy1: Frame, copy2: Frame, orig: Frame, copy_after: []const u8 };"
+    echo "pub const Row = struct { case: []const u8, dict: ?[]const u8, mode: u8, level: i32, pledged: ?u64, copy_pledged: ?u64, chunks: u32, flags: u32, capacity: ?usize, cparams: ?[7]u32, params: ?[]const u8, copy1: Frame, copy2: Frame, orig: Frame, copy_after: []const u8 };"
     echo ""
     echo "pub const rows = [_]Row{"
     echo "$plans" | while read -r c d m l p cp ch fl cap cps; do
@@ -115,8 +125,14 @@ out="$mod/src/testdata/copy_goldens.zig"
         [ "$after" = ok ] || after=$(errname "$after")
         opt() { [ "$1" = - ] && echo null || echo "$1"; }
         dq=$([ "$d" = - ] && echo null || echo "\"$d\"")
-        cpq=$([ "$cps" = - ] && echo null || echo ".{ $cps }")
-        echo "    .{ .case = \"$c\", .dict = $dq, .mode = '$m', .level = $l, .pledged = $(opt "$p"), .copy_pledged = $(opt "$cp"), .chunks = $ch, .flags = $fl, .capacity = $(opt "$cap"), .cparams = $cpq,"
+        if [ "$m" = F ]; then
+            cpq=null
+            pq="\"$cps\""
+        else
+            cpq=$([ "$cps" = - ] && echo null || echo ".{ $cps }")
+            pq=null
+        fi
+        echo "    .{ .case = \"$c\", .dict = $dq, .mode = '$m', .level = $l, .pledged = $(opt "$p"), .copy_pledged = $(opt "$cp"), .chunks = $ch, .flags = $fl, .capacity = $(opt "$cap"), .cparams = $cpq, .params = $pq,"
         echo "       .copy1 = $(frame copy1), .copy2 = $(frame copy2), .orig = $(frame orig), .copy_after = \"$after\" },"
     done
     echo "};"
