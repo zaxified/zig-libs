@@ -276,8 +276,12 @@ const Pool = struct {
             if (pool.shutdown.load(.acquire)) return;
             const t = pool.taken.load(.acquire);
             if (t < pool.posted.load(.acquire)) {
+                // Read the job before claiming it: once claimed, its slot
+                // may be posted to again as soon as `finished` passes it,
+                // which a later job finishing first can make happen.
+                const job = @atomicLoad(*Job, &pool.queue[pool.slot(t)], .monotonic);
                 if (pool.taken.cmpxchgWeak(t, t + 1, .acq_rel, .monotonic) == null)
-                    pool.queue[pool.slot(t)].run(&pool.cctxs[idx], &pool.finished);
+                    job.run(&pool.cctxs[idx], &pool.finished);
                 continue;
             }
             Futex.wait(&pool.wake_seq, seq);
@@ -287,7 +291,7 @@ const Pool = struct {
     fn tryAdd(pool: *Pool, job: *Job) bool {
         const p = pool.posted.load(.monotonic);
         if (p - pool.finished.load(.acquire) >= @as(u32, @intCast(pool.threads.len))) return false;
-        pool.queue[pool.slot(p)] = job;
+        @atomicStore(*Job, &pool.queue[pool.slot(p)], job, .monotonic);
         pool.posted.store(p + 1, .release);
         _ = pool.wake_seq.fetchAdd(1, .release);
         Futex.wake(&pool.wake_seq, 1);
