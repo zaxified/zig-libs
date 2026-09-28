@@ -3597,3 +3597,102 @@ pub const seq_cases = [_]SeqCase{
     .{ .name = "prod-fallback-reps-1", .input = "ldm-far-mix-200000-20", .cmd = "prod:2", .params = "maxBlockSize=1024,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{16} },
     .{ .name = "sprod-fail-fallback", .input = "csv-600000", .cmd = "sprod:3:70000", .params = "enableSeqProducerFallback=1", .levels = &.{ 1, 7 } },
 };
+
+/// Goldens for a destination below `compressBound` (Z29): corpus case
+/// `input` compressed one-shot at `level` with `params` (`param_cases`'
+/// grammar, `nbWorkers` included) and, optionally, dictionary `dict` used
+/// as `path` says (`.load`, `.cdict`, `.prefix`, `.usingdict`,
+/// `.usingcdict`), into the least room libzstd succeeds in -- the recipe
+/// bisects it with `tools/zref.c`'s capacity argument and checks that one
+/// byte less is `dstSize_tooSmall` -- with the frame libzstd writes there.
+pub const RoomCase = struct {
+    name: []const u8,
+    /// A `cases` entry by name, or "" for `gen`.
+    input: []const u8 = "",
+    /// An input of its own (written as `room-in-<name>`).
+    gen: ?Case = null,
+    level: i32,
+    checksum: bool = false,
+    params: []const u8 = "-",
+    dict: ?[]const u8 = null,
+    path: DictPath = .load,
+};
+
+pub const room_cases = [_]RoomCase{
+    // tiny: the frame header asks for 18 bytes of room
+    .{ .name = "room-empty", .input = "empty", .level = 3 },
+    .{ .name = "room-empty-ck", .input = "empty", .level = 3, .checksum = true },
+    .{ .name = "room-one", .input = "one", .level = 1 },
+    .{ .name = "room-seven-ck", .input = "seven", .level = 3, .checksum = true },
+    .{ .name = "room-mix-772", .input = "mix-772", .level = 3 },
+    .{ .name = "room-skewed-180", .input = "skewed-180", .level = 7 },
+    // 33 bytes of csv: the least room holds the input as one raw block (42
+    // bytes), less than the compressed frame (35 bytes) needs to be written
+    // (43); with the checksum the compressed frame (39) fits in 43 first
+    .{ .name = "room-csv-33-raw", .gen = .{ .name = "", .len = 33, .kind = .csv, .seed = 1 }, .level = 3 },
+    .{ .name = "room-csv-33-l19-ck", .gen = .{ .name = "", .len = 33, .kind = .csv, .seed = 1 }, .level = 19, .checksum = true },
+    .{ .name = "room-words-1000", .input = "words-1000", .level = 3 },
+    .{ .name = "room-words-1000-l19", .input = "words-1000", .level = 19, .checksum = true },
+    // one block, then several: every level family
+    .{ .name = "room-words-16385-fast", .input = "words-16385", .level = -5 },
+    .{ .name = "room-words-16385-lazy", .input = "words-16385", .level = 7 },
+    .{ .name = "room-csv-600000-l1", .input = "csv-600000", .level = 1, .checksum = true },
+    .{ .name = "room-csv-600000-l3", .input = "csv-600000", .level = 3 },
+    .{ .name = "room-csv-600000-l12", .input = "csv-600000", .level = 12 },
+    .{ .name = "room-csv-600000-l19", .input = "csv-600000", .level = 19 },
+    .{ .name = "room-alternating-l16", .input = "alternating", .level = 16 },
+    // raw blocks (the room is the frame), RLE blocks
+    .{ .name = "room-random-300000", .input = "random-300000", .level = 3, .checksum = true },
+    .{ .name = "room-zeros-300000", .input = "zeros-300000", .level = 3 },
+    .{ .name = "room-rle-text-rle", .input = "rle-text-rle", .level = 5, .checksum = true },
+    // advanced parameters: sub-blocks, the pre-splitter, small blocks, a
+    // magicless frame without its size, long-distance matching
+    .{ .name = "room-csv-131073-tcb", .input = "csv-131073", .level = 3, .params = "targetCBlockSize=1340" },
+    .{ .name = "room-words-262145-split", .input = "words-262145", .level = 3, .params = "blockSplitterLevel=6" },
+    .{ .name = "room-words-262145-post", .input = "words-262145", .level = 12, .params = "splitAfterSequences=1" },
+    .{ .name = "room-words-262145-mbs", .input = "words-262145", .level = 3, .params = "maxBlockSize=4096" },
+    .{ .name = "room-words-16385-magicless", .input = "words-16385", .level = 3, .params = "format=1,contentSizeFlag=0" },
+    .{ .name = "room-csv-600000-ldm", .input = "csv-600000", .level = 6, .params = "enableLongDistanceMatching=1" },
+    // workers: the room decides only whether the frame fits
+    .{ .name = "room-far-repeat-mt", .input = "far-repeat", .level = 3, .params = "nbWorkers=2,jobSize=524288" },
+    .{ .name = "room-alternating-mt-ck", .input = "alternating", .level = 1, .checksum = true, .params = "nbWorkers=3,jobSize=524288" },
+    // dictionaries, every one-shot way of using one
+    .{ .name = "room-usingdict", .input = "csv-131073", .level = 3, .dict = "zd-csv", .path = .usingdict },
+    .{ .name = "room-usingcdict-ck", .input = "words-16385", .level = 5, .checksum = true, .dict = "zd-words", .path = .usingcdict },
+    .{ .name = "room-cdict-attached", .input = "words-16385", .level = 3, .dict = "zd-words", .path = .cdict },
+    .{ .name = "room-load", .input = "csv-600000", .level = 1, .dict = "raw-csv-30000", .path = .load },
+    .{ .name = "room-prefix", .input = "words-1000", .level = 19, .dict = "raw-words-8000", .path = .prefix },
+};
+
+/// The queries `ZSTD_adjustCParams` and `ZSTD_getCParams` are pinned on
+/// (`param_test.zig`, through `tools/zparams.c`): `cparams_samples` draws
+/// of parameters, input and dictionary sizes around every bound and size
+/// class, each field also above `maxInt(i32)` (negative to libzstd's clamp),
+/// sizes up to 2^64 - 1 (a dictionary that wraps the window's sum). One
+/// line each, the grammar `zparams` reads.
+pub const cparams_samples = 100_000;
+
+pub fn cparamsSample(i: usize, buf: []u8) []const u8 {
+    const pick = struct {
+        fn f(r: *Rng, comptime T: type, vs: []const T) T {
+            return vs[@intCast(r.below(vs.len))];
+        }
+    }.f;
+    const m32 = 0x80000000;
+    const windows = [_]u64{ 0, 1, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 27, 29, 30, 31, 32, 40, 0x7fffffff, m32, 0xffffffff };
+    const chains = [_]u64{ 0, 5, 6, 7, 10, 12, 15, 16, 18, 20, 22, 24, 26, 28, 29, 30, 31, m32 };
+    const hashes = [_]u64{ 0, 5, 6, 7, 10, 12, 13, 15, 16, 17, 19, 20, 22, 23, 24, 25, 26, 28, 29, 30, 31, 0xffffffff };
+    const searches = [_]u64{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 29, 30, 31, m32 + 1 };
+    const min_matches = [_]u64{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 100, 0xffffffff };
+    const target_lengths = [_]u64{ 0, 1, 8, 16, 999, 131072, 131073, 0x7fffffff, m32 };
+    const sizes = [_]u64{ 0, 1, 2, 63, 64, 65, 100, 500, 512, 513, 1000, 1024, 1025, 4096, 16384, 16385, 65536, 131072, 131073, 262144, 262145, 1 << 20, (1 << 20) + 1, 1 << 25, (1 << 30) - 1, 1 << 30, (1 << 30) + 1, 1 << 31, 5_000_000_000, std.math.maxInt(u64) - 1, std.math.maxInt(u64) };
+    const dicts = [_]u64{ 0, 0, 0, 1, 100, 500, 1000, 8000, 32768, 100000, 1 << 20, 1 << 30, (1 << 30) + 1, 1 << 31, 1 << 40, std.math.maxInt(u64) - (1 << 17) + 1, std.math.maxInt(u64) - (1 << 10) + 1, std.math.maxInt(u64) };
+    const q_levels = [_]i64{ -200000, -131073, -131072, -100, -5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 100 };
+    var r: Rng = .{ .s = @as(u64, i) *% 0x2545F4914F6CDD1D +% 0x5A };
+    if (r.below(4) == 0) return std.fmt.bufPrint(buf, "g {d} {d} {d}", .{ pick(&r, i64, &q_levels), pick(&r, u64, &sizes), pick(&r, u64, &dicts) }) catch unreachable;
+    return std.fmt.bufPrint(buf, "a {d} {d} {d} {d} {d} {d} {d} {d} {d}", .{
+        pick(&r, u64, &windows),  pick(&r, u64, &chains),      pick(&r, u64, &hashes),
+        pick(&r, u64, &searches), pick(&r, u64, &min_matches), pick(&r, u64, &target_lengths),
+        1 + r.below(9),           pick(&r, u64, &sizes),       pick(&r, u64, &dicts),
+    }) catch unreachable;
+}

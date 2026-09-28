@@ -2,7 +2,7 @@
 /* zref -- differential oracle: compress a file with libzstd exactly the way
  * modules/zstd does (one-shot ZSTD_compress2, content size in the header).
  *
- *   zref <level> <checksum 0|1> <in> <out> [strategy [ldm 0|1 [window_log [params [dict]]]]]
+ *   zref <level> <checksum 0|1> <in> <out> [strategy [ldm 0|1 [window_log [params [dict [capacity]]]]]]
  *
  * With a strategy (1 = fast ... 9 = btultra2) it is forced through
  * ZSTD_c_strategy on top of the level, which reaches strategy/size pairs no
@@ -41,6 +41,13 @@
  * cdict, usingdict and usingcdict take only 0). The frame is decoded back
  * with the dictionary (libzstd's decoder) and must give the input: exit 8
  * otherwise.
+ *
+ * `capacity` is the destination's size in bytes ("-" or absent:
+ * ZSTD_compressBound of the input), allocated exactly, so that libzstd
+ * decides with that room whether the frame fits (`dstSize_tooSmall`) and
+ * how its blocks are stored -- the module's one-shot entry points with a
+ * `dst` of that length. On an error the exit status is 5 and stderr holds
+ * libzstd's error name.
  *
  * Compiled with -DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1 against the
  * library sources (gen-goldens.sh does), it is the reference for
@@ -151,8 +158,8 @@ static int paramValue(char const* list, char const* name, int dflt)
 
 int main(int argc, char** argv)
 {
-    if (argc < 5 || argc > 10) {
-        fprintf(stderr, "usage: zref <level> <checksum 0|1> <in> <out> [strategy [ldm 0|1 [window_log [params [dict]]]]]\n");
+    if (argc < 5 || argc > 11) {
+        fprintf(stderr, "usage: zref <level> <checksum 0|1> <in> <out> [strategy [ldm 0|1 [window_log [params [dict [capacity]]]]]]\n");
         return 2;
     }
     int const level = atoi(argv[1]);
@@ -164,7 +171,7 @@ int main(int argc, char** argv)
     int ctype = 0;
     size_t dsize = 0;
     char* dict = NULL;
-    if (argc == 10 && strcmp(argv[9], "-")) {
+    if (argc >= 10 && strcmp(argv[9], "-")) {
         char const* const c1 = strchr(argv[9], ':');
         char const* const c2 = c1 ? strchr(c1 + 1, ':') : NULL;
         if (!c2 || (size_t)(c1 - argv[9]) >= sizeof(mode)) { fprintf(stderr, "bad dict %s\n", argv[9]); return 2; }
@@ -182,8 +189,8 @@ int main(int argc, char** argv)
     char* const src = adjacent ? buf + dsize : buf;
     long const n = (long)sz;
 
-    size_t const cap = ZSTD_compressBound((size_t)n);
-    char* const dst = malloc(cap);
+    size_t const cap = argc == 11 && strcmp(argv[10], "-") ? (size_t)strtoull(argv[10], NULL, 10) : ZSTD_compressBound((size_t)n);
+    char* const dst = malloc(cap ? cap : 1);
     ZSTD_CCtx* const cctx = ZSTD_createCCtx();
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, checksum);

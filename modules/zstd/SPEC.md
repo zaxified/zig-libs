@@ -43,8 +43,9 @@ Not here yet, and a reader might expect it (each is a backlog item):
 
 ## Algorithm
 
-libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
-`compressBound`-sized destination goes through `ZSTD_compressEnd_public`):
+libzstd's one-shot path (`ZSTD_compress2` with the whole input goes, its
+buffers stable, through `ZSTD_compressEnd_public` straight into the
+destination, whatever its size -- *One-shot into any room* below):
 
 1. **Parameters** (`params.zig`): row `level` (0 → 3, negative → row 0 with
    `targetLength = -level`) of the table chosen by source size (≤16 KB,
@@ -227,6 +228,30 @@ workspace leaves out the buffers the caller's stand in for, and
 `ZSTD_CCtx_reset` leaves the input a waiting frame held back on the
 context (the next frame would take it off its own input); `reset` drops it.
 
+**One-shot into any room** (Z29, 2026-09-28). `ZSTD_compress2` is
+`ZSTD_compressStream2(..., ZSTD_e_end)` with both buffers stable, so its
+single pass is `ZSTD_compressEnd` straight into the caller's destination
+at any capacity; `ZSTD_compress_usingDict` (and so `ZSTD_compressCCtx`)
+and `ZSTD_compress_usingCDict_advanced` call `ZSTD_compressEnd` directly.
+`compress`, `Compressor.compress`, `compressUsingDict` and
+`compressUsingCDict` do the same with any `dst`: the room left meets the
+capacity checks above, so a frame fits where libzstd's does and is then
+libzstd's frame *for that room*, which is not always the frame
+`compressBound` gives. A block whose compressed form does not fit in what
+is left is stored raw where the raw block fits; a small input (tens of
+bytes) can therefore fit, as one raw block, in less room than its
+compressed frame needs with the checks' slack, and the frame is the raw
+one (33 bytes of csv at level 3: a 35-byte compressed frame that needs
+43 bytes of room to be written, and a 42-byte raw frame that fits in 42). Where nothing fits it is
+`error.DstSizeTooSmall` (`dstSize_tooSmall`; until Z29 anything below
+`compressBound` was refused as `error.NoSpaceLeft`), `dst` holding a
+partial frame. With workers (an input over `ZSTDMT_JOBSIZE_MIN`) the jobs
+compress into buffers of their own and only the flush meets `dst`: the
+frame is the same bytes at any room and fits exactly in its length; one
+byte less leaves `ZSTDMT_compressStream_generic` with bytes to flush,
+which `ZSTD_compress2` reports as `dstSize_tooSmall`, the jobs are
+abandoned and the context serves the next frame as a fresh one.
+
 **`StreamWriter`** (`stream_writer.zig`) is a `std.Io.Writer` over a
 `Stream` in the buffered modes: each drain of the writer's buffer (and what
 did not fit in it) is `continue`, `flush` is `flush`, `finish` sends what
@@ -389,6 +414,22 @@ or whose sub-blocks together would, is one raw block; a block of fewer than
 the first). The frame is not bound by `compressBound` sub-block by
 sub-block: a superblock of a raw block's size or more is replaced by the
 raw block, as libzstd does.
+
+**Parameter queries.** `getCParams(level, src_size, dict_size)` is
+`ZSTD_getCParams` (`ZSTD_getCParams_internal` in `ZSTD_cpm_unknown` mode),
+`adjustCParams(cp, src_size, dict_size)` is `ZSTD_adjustCParams`: each
+field clamped into `ZSTD_cParam_getBounds` compared as an `int` (so a
+value above `maxInt(i32)` takes the lower bound, as in libzstd), then
+`ZSTD_adjustCParams_internal` in `ZSTD_cpm_unknown` mode with the row match
+finder assumed; for both a size of 0 or null is unknown. A dictionary size
+near 2^64 wraps the window's sum in `ZSTD_dictAndWindowLog` as libzstd's
+unsigned arithmetic does. Pinned (2026-09-28) on 100 000 queries drawn
+around every bound and size class (`corpus.cparamsSample`, 3/4
+`adjustCParams`, 1/4 `getCParams`) answered by libzstd through
+`tools/zparams.c`: the answers' SHA-256 and the first 64 in full
+(`testdata/cparams_goldens.zig`), all equal. `limits` holds the bounds,
+`version_number` (10507) and `version_string` ("1.5.7") are
+`ZSTD_versionNumber` / `ZSTD_versionString` of the release reproduced.
 
 The five dictionary parameters are described in *Dictionaries*, the four
 sequence parameters in *Sequences*. `prefetchCDictTables`
@@ -1650,7 +1691,7 @@ fuzz driver: a reader stuck on one damaged `.zst`).
 | level | `min_level` (-131072) … 22; lower is clamped, higher is `error.LevelUnsupported` | `ZSTD_minCLevel()` / `ZSTD_maxCLevel()`; libzstd clamps above 22 too, which would hand a caller a level it did not ask for |
 | memory | level 22 above 64 MB: 512 MiB binary tree + 128 MiB hash + 64 MiB LDM table + 32 KiB bucket offsets (≈ 820 MB peak on a 70 MB input, as libzstd) | the level's own table sizes; nothing is capped, as libzstd caps nothing |
 | input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit, 2000 MiB on 32-bit -- *Portability*) the indices are rescaled, as libzstd does (see *Algorithm*) |
-| destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
+| destination | any: `compressBound(src.len)` always suffices; with less, libzstd's frame for that room (raw blocks where compressed ones do not fit) or `error.DstSizeTooSmall` where libzstd says `dstSize_tooSmall` (Z29) | `ZSTD_compress2`, `ZSTD_compress_usingDict`, `ZSTD_compress_usingCDict_advanced`: libzstd's own capacity checks |
 | block | 128 KB | format |
 | stream level | as one-shot (`stream_max_level` = `max_level`) | level 22 without a pledged size uses a 128 MB window and long-distance matching (window log 27, as libzstd), ≈ 1 GB |
 | advanced parameters | libzstd's bounds (see *Advanced parameters*), else `error.ParameterOutOfBound` | `ZSTD_cParam_getBounds`, 64-bit |
@@ -1666,7 +1707,7 @@ fuzz driver: a reader stuck on one damaged `.zst`).
 | decode block | streaming: decoded size ≤ `Block_Maximum_Size`; one-shot: as libzstd, only a compressed block's output is bounded (see *Decoder*) | RFC 8878; `ZSTD_decompressContinue` / `ZSTD_decompressFrame` |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
-pin the level refusal and the destination bound, `stream_test.zig` the
+pin the level refusal and a destination below the bound, `stream_test.zig` the
 stream's level refusal, the pledged size both ways and the frame after the
 end, `context_test.zig` the estimates and a static workspace's bound.
 `FrameWriter` takes a nonempty buffer and holds `compressBound(buffer.len)`
@@ -1905,6 +1946,32 @@ check (the epilogue always follows the header's writer), the RLE block's
 reach it, and no case does) -- and 3 guards with no case found: a
 block-splitter partition, and a sub-block or its RLE literals, starting
 within 2 or 3 bytes of the end.
+
+**One-shot into any room** (Z29, 2026-09-28): 33 golden rows
+(`corpus.room_cases`, `testdata/room_goldens.zig`) -- tiny, one-block and
+multi-block inputs at every level family, raw and RLE blocks, sub-blocks,
+both splitters, 4 KB blocks, a magicless frame without its size,
+long-distance matching, workers (with the checksum), and each one-shot way
+of using a dictionary (`usingdict`, `usingcdict`, an attached `CDict`, a
+loaded one, a prefix): the least room libzstd succeeds in, bisected with
+`zref`'s capacity argument, the recipe checking that one byte less is
+`dstSize_tooSmall`. This port gives the same frame there and
+`error.DstSizeTooSmall` one byte short, in a context reused across the
+rows; one row's frame at its least room is the raw one (33 bytes of csv,
+see *Algorithm*), which the test counts. The least room is the frame plus
+the checks' slack -- 4 to 16 bytes in these rows, 18 in all for a frame
+shorter than the header's reservation -- and exactly the frame for raw
+blocks and with workers. A diff loop against `zref` (15 865 runs: random text, words,
+noise, runs and mixes of 0-1.3 MB, levels -5-22, 22 parameter sets
+including workers and sub-blocks, a dictionary in a quarter of them, each
+at a capacity near the frame's length, one anywhere in [0, bound] and one
+of 0/1/17/18/19/the length): 6 854 identical (19 of them frames other than
+the bound's), 9 005 refused alike, none different; and 6 more, in the
+2 376 against a `zref` built with AddressSanitizer, where libzstd wrote
+past the end of 18-19 bytes of room (`ZSTD_compressSubBlock_literal`'s
+unchecked copy of the Huffman description, with `targetCBlockSize`) and
+this port refuses, as Z1d recorded. A context that ran out of room gives
+the next frame as a fresh one (unit test, with and without workers).
 
 59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
 and `dfast` extDict variants, overflow correction of two segments,
@@ -2790,9 +2857,8 @@ dictionaries are undecided.
   - ~~**Z1d — compression into less room than `compressBound`.**~~ done
     2026-09-26: libzstd's capacity checks in the frame path (header, each
     block, the raw and RLE fallbacks, the epilogue); a stable output takes
-    any room, as libzstd's. The one-shot API still asks for
-    `compressBound` (`error.NoSpaceLeft`): its callers get the whole frame
-    or nothing, and libzstd's `ZSTD_compress2` below the bound is Z29.
+    any room, as libzstd's. The one-shot API below the bound followed
+    with Z29.
 - ~~**Z2 — Decoder.**~~ ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
@@ -2941,8 +3007,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `ZSTD_toFlushNow`), the decoder in a caller's workspace with exact
   estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
-  `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
-  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 for `zstd-cli`:
+  `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, ~~public
+  `adjustCParams`, `ZSTD_versionNumber`~~ (done 2026-09-28:
+  `adjustCParams`, `ZSTD_adjustCParams` with its clamp, pinned with
+  `getCParams` on 100 000 queries through `tools/zparams.c`, *Advanced
+  parameters*; `version_number` / `version_string`). Done 2026-09-28 for `zstd-cli`:
   `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
   the other bounds); `Stream.frameProgression` (`ZSTD_getFrameProgression`,
   with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
@@ -2969,12 +3038,12 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   prefix's default content type (*Dictionaries*). `--adapt` done
   2026-09-28 (Z24). Left (refused by name): `--train-legacy` (no legacy
   trainer here), `--trace`.
-- **Z29 — One-shot compression into less room than `compressBound`.**
-  `ZSTD_compress2` takes any capacity and fails with `dstSize_tooSmall`
-  only when the frame does not fit; `compress` asks for the bound
-  (`error.NoSpaceLeft`). The capacity checks exist since Z1d (the stream
-  and the frame path use them); the one-shot entry points do not yet.
-  Deferred 2026-09-26 only for want of a caller.
+- ~~**Z29 — One-shot compression into less room than `compressBound`.**~~
+  Done 2026-09-28, see *Algorithm* ("One-shot into any room"):
+  `compress`, `Compressor.compress` (with workers too),
+  `compressUsingDict` and `compressUsingCDict` take any `dst`, with
+  libzstd's frame for that room or `error.DstSizeTooSmall` where libzstd
+  fails (`error.NoSpaceLeft` is gone from `zstd.Error`).
 - **Z30 — Legacy frame formats (pre-v0.8).** libzstd 1.5.7 is built by
   default with `ZSTD_LEGACY_SUPPORT=5` and decodes v0.5–v0.7 frames
   (2015–2016, before the format was frozen); this decoder refuses them.

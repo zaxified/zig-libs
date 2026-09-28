@@ -419,3 +419,69 @@ test "getCParams gives ZSTD_getCParams' parameters" {
         try std.testing.expectEqualSlices(u32, &c.want, &got);
     }
 }
+
+/// One `corpus.cparamsSample` query answered here: `adjustCParams` or
+/// `getCParams`, with the arguments `tools/zparams.c` passes to libzstd.
+fn answerQuery(line: []const u8) ![7]u32 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    const kind = it.next().?;
+    var v: [9]u64 = undefined;
+    var n: usize = 0;
+    while (it.next()) |tok| : (n += 1) v[n] = @truncate(@as(u128, @bitCast(try std.fmt.parseInt(i128, tok, 10))));
+    const cp = if (kind[0] == 'g')
+        zstd.getCParams(@intCast(@as(i64, @bitCast(v[0]))), v[1], v[2])
+    else
+        zstd.adjustCParams(.{
+            // (unsigned) as zparams casts them
+            .window_log = @truncate(v[0]),
+            .chain_log = @truncate(v[1]),
+            .hash_log = @truncate(v[2]),
+            .search_log = @truncate(v[3]),
+            .min_match = @truncate(v[4]),
+            .target_length = @truncate(v[5]),
+            .strategy = @enumFromInt(v[6]),
+        }, v[7], v[8]);
+    return .{ cp.window_log, cp.chain_log, cp.hash_log, cp.search_log, cp.min_match, cp.target_length, @intFromEnum(cp.strategy) };
+}
+
+test "adjustCParams and getCParams answer as ZSTD_adjustCParams and ZSTD_getCParams" {
+    const want = @import("testdata/cparams_goldens.zig");
+    try std.testing.expectEqual(@as(usize, corpus.cparams_samples), want.count);
+    var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+    var line: [256]u8 = undefined;
+    var text: [96]u8 = undefined;
+    for (0..corpus.cparams_samples) |i| {
+        const q = corpus.cparamsSample(i, &line);
+        const a = try answerQuery(q);
+        if (i < want.first.len and !std.mem.eql(u32, &want.first[i], &a)) {
+            std.debug.print("{s}: {any}, libzstd {any}\n", .{ q, a, want.first[i] });
+            return error.TestUnexpectedResult;
+        }
+        h.update(try std.fmt.bufPrint(&text, "{d} {d} {d} {d} {d} {d} {d}\n", .{ a[0], a[1], a[2], a[3], a[4], a[5], a[6] }));
+    }
+    try std.testing.expectEqualStrings(want.sha256, &std.fmt.bytesToHex(h.finalResult(), .lower));
+}
+
+test "adjustCParams clamps as libzstd does, then shrinks to the sizes" {
+    const max: zstd.CParams = .{ .window_log = 31, .chain_log = 30, .hash_log = 30, .search_log = 30, .min_match = 7, .target_length = 131072, .strategy = .btultra2 };
+    // out of range both ways (above maxInt(i32) is negative to libzstd)
+    const wild: zstd.CParams = .{ .window_log = 40, .chain_log = 0x8000_0000, .hash_log = 99, .search_log = 0, .min_match = 1, .target_length = 1 << 20, .strategy = .btultra2 };
+    const got = zstd.adjustCParams(wild, null, 0);
+    try std.testing.expectEqual(zstd.CParams{ .window_log = zstd.limits.window_log_max, .chain_log = zstd.limits.chain_log_min, .hash_log = zstd.limits.hash_log_max, .search_log = zstd.limits.search_log_min, .min_match = zstd.limits.min_match_min, .target_length = zstd.limits.target_length_max, .strategy = .btultra2 }, got);
+    // unknown size, no dictionary: nothing shrinks (0 is unknown too)
+    if (@sizeOf(usize) == 8) {
+        try std.testing.expectEqual(max, zstd.adjustCParams(max, null, 0));
+        try std.testing.expectEqual(max, zstd.adjustCParams(max, 0, 0));
+    }
+    // 1000 bytes: window 10, hash window + 1, chain to the window (binary
+    // tree: one more)
+    const small = zstd.adjustCParams(max, 1000, 0);
+    try std.testing.expectEqual(@as(u32, 10), small.window_log);
+    try std.testing.expectEqual(@as(u32, 11), small.hash_log);
+    try std.testing.expectEqual(@as(u32, 11), small.chain_log);
+    // the row match finder's 32 hashed bits: lazy2 with search log 4
+    const lazy: zstd.CParams = .{ .window_log = 27, .chain_log = 24, .hash_log = 30, .search_log = 4, .min_match = 5, .target_length = 16, .strategy = .lazy2 };
+    try std.testing.expectEqual(@as(u32, 28), zstd.adjustCParams(lazy, null, 0).hash_log);
+    // a dictionary with an unknown size keeps the window, not the tables
+    try std.testing.expectEqual(@as(u32, 27), zstd.adjustCParams(lazy, null, 1 << 20).window_log);
+}

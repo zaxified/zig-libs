@@ -91,10 +91,11 @@ const zstd = @import("zstd");
 const frame = try zstd.compressAlloc(gpa, data, .{ .level = 3 });
 defer gpa.free(frame);
 
-// Or into your own buffer, which must hold compressBound(data.len) bytes.
+// Or into your own buffer: compressBound(data.len) bytes always suffice.
 var buf = try gpa.alloc(u8, zstd.compressBound(data.len));
 const n = try zstd.compress(gpa, buf, data, .{ .level = 1, .checksum = true });
-// buf[0..n] is the frame.
+// buf[0..n] is the frame. A smaller buffer works as with ZSTD_compress2:
+// libzstd's frame for that room, or error.DstSizeTooSmall where libzstd fails.
 
 // Decode: into a new buffer sized from the header (at most max_size) ...
 const back = try zstd.decompressAlloc(gpa, frame, 1 << 30);
@@ -306,6 +307,14 @@ unknown size chosen as for about that many bytes), and so does
 `error.ParameterOutOfBound`. `writeSkippableFrame` writes a skippable frame
 (`ZSTD_writeSkippableFrame`).
 
+`zstd.getCParams(level, src_size, dict_size)` gives the parameters a level
+resolves to (`ZSTD_getCParams`) and `zstd.adjustCParams(cp, src_size,
+dict_size)` clamps and shrinks explicit ones for an input and dictionary
+size (`ZSTD_adjustCParams`), both answering as libzstd does; `zstd.limits`
+holds the parameter bounds (`ZSTD_WINDOWLOG_MAX` ...), and
+`zstd.version_number` (10507) / `zstd.version_string` ("1.5.7") the libzstd
+release reproduced (`ZSTD_versionNumber`, `ZSTD_versionString`).
+
 Compressing with a dictionary — the same bytes as libzstd with the
 dictionary set the same way:
 
@@ -375,8 +384,8 @@ call fails instead. Errors: `ExternalSequencesInvalid`,
 `ParameterCombinationUnsupported` (a producer with LDM or workers). See
 SPEC.md, *Sequences*.
 
-Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
-(`dst` below `compressBound`), `OutOfMemory`, and with a dictionary
+Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `DstSizeTooSmall`
+(the frame does not fit in `dst`, libzstd's `dstSize_tooSmall`), `OutOfMemory`, and with a dictionary
 `DictionaryCorrupted`, `DictionaryWrong`, `DictAttachUnsupported`. There is no input size limit: past 3500 MiB
 the indices are rescaled as libzstd does (the whole input still has to be in
 memory, and so does its `compressBound`).

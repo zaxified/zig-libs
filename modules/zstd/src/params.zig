@@ -209,7 +209,9 @@ fn dictAndWindowLog(window_log: u32, src_size: u64, dict_size: u64) u32 {
     // the window already fits both the source and the dictionary
     if (window_size >= dict_size +% src_size) return window_log;
     if (dict_and_window_size >= @as(u64, 1) << window_log_max) return window_log_max;
-    return highbit32(@intCast(dict_and_window_size - 1)) + 1;
+    // (U32)dictAndWindowSize - 1, wrapping as in C for a size_t dictionary
+    // near 2^64 (`ZSTD_adjustCParams` takes any)
+    return highbit32(@as(u32, @truncate(dict_and_window_size)) -% 1) + 1;
 }
 
 /// `ZSTD_CDictIndicesAreTagged`: a CDict for `fast` and `dfast` keeps an
@@ -272,6 +274,28 @@ pub fn adjustInternal(cp_in: CParams, src_size_in: u64, dict_size_in: u64, mode:
         if (cp.hash_log > max_hash_log) cp.hash_log = max_hash_log;
     }
     return cp;
+}
+
+/// `ZSTD_clampCParams`: each field into `ZSTD_cParam_getBounds`' range,
+/// compared as libzstd compares it, as an `int` (a value above
+/// `maxInt(i32)` is negative there and takes the lower bound). The
+/// strategy is always in range here.
+pub fn clampCParams(cp: CParams) CParams {
+    const clamp = struct {
+        fn f(v: u32, lo: u32, hi: u32) u32 {
+            const x: i32 = @bitCast(v);
+            return if (x < @as(i32, @intCast(lo))) lo else if (x > @as(i32, @intCast(hi))) hi else v;
+        }
+    }.f;
+    return .{
+        .window_log = clamp(cp.window_log, window_log_min, window_log_max),
+        .chain_log = clamp(cp.chain_log, chain_log_min, chain_log_max),
+        .hash_log = clamp(cp.hash_log, hash_log_min, hash_log_max),
+        .search_log = clamp(cp.search_log, search_log_min, search_log_max),
+        .min_match = clamp(cp.min_match, min_match_min, min_match_max),
+        .target_length = clamp(cp.target_length, 0, target_length_max),
+        .strategy = cp.strategy,
+    };
 }
 
 fn adjust(cp_in: CParams, src_size: u64) CParams {

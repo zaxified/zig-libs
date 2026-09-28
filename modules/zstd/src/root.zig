@@ -201,15 +201,42 @@ pub fn getCParams(level: i32, src_size: ?u64, dict_size: u64) CParams {
     return params.getInternal(@min(level, max_level), if (size == 0) params.unknown_size else size, dict_size, .unknown);
 }
 
+/// `ZSTD_adjustCParams`: `cp` clamped into libzstd's bounds (`limits`;
+/// as libzstd, a field above `maxInt(i32)` counts as negative and takes the
+/// lower bound), then shrunk for an input of `src_size` bytes with a
+/// dictionary of `dict_size` bytes (0: none) -- the window to the input and
+/// the dictionary, the hash and chain tables to the window -- as
+/// `getCParams` shrinks a level's. `src_size` null or 0 means unknown.
+/// Nothing is shrunk for an unknown size and no dictionary; with the row
+/// match finder assumed, `greedy`..`lazy2` keep `hash_log` within its 32
+/// hashed bits.
+pub fn adjustCParams(cp: CParams, src_size: ?u64, dict_size: u64) CParams {
+    const size = src_size orelse params.unknown_size;
+    return params.adjustInternal(params.clampCParams(cp), if (size == 0) params.unknown_size else size, dict_size, .unknown, .auto);
+}
+
+/// `ZSTD_VERSION_NUMBER` / `ZSTD_versionNumber()`: the libzstd release whose
+/// output this module reproduces, as major * 100 * 100 + minor * 100 +
+/// release.
+pub const version_number: u32 = 10507;
+/// `ZSTD_VERSION_STRING` / `ZSTD_versionString()`.
+pub const version_string = "1.5.7";
+
 /// Worst-case compressed size of `src_size` bytes (`ZSTD_compressBound`).
 pub fn compressBound(src_size: usize) usize {
     return frame.compressBound(src_size);
 }
 
-/// Compress `src` into one frame in `dst`, which must hold at least
-/// `compressBound(src.len)` bytes. Returns the frame length. `gpa` is used
-/// for the match tables and block buffers only, all freed before returning;
-/// a `Compressor` keeps them for the next frame.
+/// Compress `src` into one frame in `dst` (`ZSTD_compress2`). Returns the
+/// frame length. `dst` may have any length, as in libzstd:
+/// `compressBound(src.len)` always suffices; with less, the frame is
+/// libzstd's for that room (a block whose compressed form does not fit in
+/// what is left is stored raw) or, where libzstd's is
+/// `dstSize_tooSmall`, `error.DstSizeTooSmall` -- a frame needs a few bytes
+/// more than its length while it is written (18 for the header, 6 before
+/// each block). `gpa` is used for the match tables and block buffers only,
+/// all freed before returning; a `Compressor` keeps them for the next
+/// frame.
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
     var c: Compressor = .init(gpa);
     defer c.deinit();
@@ -261,10 +288,9 @@ pub const Compressor = struct {
     }
 
     /// `ZSTD_compress2` with workers: one `ZSTD_e_end` call over the whole
-    /// input.
+    /// input. The jobs compress into buffers of their own, so the room in
+    /// `dst` decides only whether the frame fits: exactly its length does.
     fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options) Error!usize {
-        const bound = compressBound(src.len);
-        if (dst.len < bound) return error.NoSpaceLeft;
         try fo.advanced.check();
         var local: ?CDict = null;
         defer if (local) |*l| l.deinit();
@@ -276,15 +302,17 @@ pub const Compressor = struct {
         const mt = c.mt.?;
         try mt.initFrame(setup, src.len);
         var in: stream.InBuffer = .{ .src = src };
-        var out: stream.OutBuffer = .{ .dst = dst[0..bound] };
+        var out: stream.OutBuffer = .{ .dst = dst };
         const left = mt.compressStream2(&out, &in, .end) catch |e| switch (e) {
             // the input is the pledged size, and `end` follows no `continue`
             error.SrcSizeWrong, error.StageWrong => unreachable,
             else => |x| return x,
         };
+        // ZSTD_compress2: "compression not completed, due to lack of output
+        // space"
         if (left != 0) {
             mt.abandon();
-            return error.NoSpaceLeft;
+            return error.DstSizeTooSmall;
         }
         return out.pos;
     }
@@ -343,7 +371,8 @@ pub const Compressor = struct {
     /// dictionary by its magic number, else raw content) loaded into the
     /// context, at `level` with every other parameter at its default and
     /// the parameters sized for the input and the dictionary together.
-    /// `dst` must hold `compressBound(src.len)` bytes.
+    /// With an empty `dict` it is `ZSTD_compressCCtx`. `dst` as in
+    /// `zstd.compress`.
     pub fn compressUsingDict(c: *Compressor, dst: []u8, src: []const u8, dict: []const u8, level: i32) Error!usize {
         if (level > max_level) return error.LevelUnsupported;
         return c.ctx.compressUsingDict(dst, src, dict, level);
@@ -351,7 +380,8 @@ pub const Compressor = struct {
 
     /// `ZSTD_compress_usingCDict_advanced` (`ZSTD_compress_usingCDict` with
     /// the default `fp`): one frame of `src` with `cdict` and its
-    /// parameters, every other parameter at its default.
+    /// parameters, every other parameter at its default. `dst` as in
+    /// `zstd.compress`.
     pub fn compressUsingCDict(c: *Compressor, dst: []u8, src: []const u8, cdict: *const CDict, fp: FrameParams) Error!usize {
         return c.ctx.compressUsingCDict(dst, src, cdict, fp);
     }
@@ -562,6 +592,7 @@ test {
     _ = @import("stream_test.zig");
     _ = @import("zstdmt.zig");
     _ = @import("mt_test.zig");
+    _ = @import("room_test.zig");
     _ = @import("dbits.zig");
     _ = @import("huf_dec.zig");
     _ = @import("dblock.zig");
@@ -658,7 +689,22 @@ test "a skippable frame is written as libzstd writes it and read back" {
     try std.testing.expectEqual(@as(usize, 3), try decompress(std.testing.allocator, &out, both[0 .. n + z.len]));
 }
 
-test "a destination below the bound is refused" {
-    var buf: [8]u8 = undefined;
-    try std.testing.expectError(error.NoSpaceLeft, compress(std.testing.allocator, &buf, "hello", .{}));
+test "a destination below the bound: libzstd's frame, or DstSizeTooSmall where libzstd fails" {
+    // zref: a 14-byte frame, which libzstd writes into 18 bytes of room (the
+    // header asks for ZSTD_FRAMEHEADERSIZE_MAX) and not into 17
+    const want = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, 'h', 'e', 'l', 'l', 'o' };
+    var buf: [18]u8 = undefined;
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqualSlices(u8, &want, buf[0..try compress(gpa, &buf, "hello", .{})]);
+    try std.testing.expectError(error.DstSizeTooSmall, compress(gpa, buf[0..17], "hello", .{}));
+    try std.testing.expectError(error.DstSizeTooSmall, compress(gpa, buf[0..0], "hello", .{}));
+    var c: Compressor = .init(gpa);
+    defer c.deinit();
+    try std.testing.expectEqualSlices(u8, &want, buf[0..try c.compressUsingDict(&buf, "hello", "", 3)]);
+    try std.testing.expectError(error.DstSizeTooSmall, c.compressUsingDict(buf[0..17], "hello", "", 3));
+}
+
+test "version: libzstd 1.5.7" {
+    try std.testing.expectEqual(@as(u32, 10507), version_number);
+    try std.testing.expectEqualStrings("1.5.7", version_string);
 }

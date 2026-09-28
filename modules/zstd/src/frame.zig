@@ -19,10 +19,10 @@ const CDict = cdict_mod.CDict;
 const seqapi = @import("seqapi.zig");
 pub const SequenceProducer = seqapi.SequenceProducer;
 
-pub const Error = error{
-    /// `dst` is smaller than `compressBound(src.len)`.
-    NoSpaceLeft,
-} || BeginError || BlockError;
+/// What a one-shot frame can fail with; `error.DstSizeTooSmall` (in
+/// `BlockError`) when the frame does not fit in `dst` by libzstd's capacity
+/// rules.
+pub const Error = BeginError || BlockError;
 
 /// What compressing a block can fail with: only with an external sequence
 /// producer (`Options.sequence_producer`) or while collecting sequences
@@ -557,8 +557,8 @@ pub const FrameParams = struct {
     dict_id: bool = true,
 };
 
-/// One-shot frame on a fresh context. `dst.len` must be at least
-/// `compressBound(src.len)`.
+/// One-shot frame on a fresh context, into a `dst` of any length (see
+/// `Compressor.compressFrame`).
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
     var comp: Compressor = .initEmpty(gpa);
     defer comp.deinit();
@@ -801,18 +801,18 @@ pub const Compressor = struct {
     }
 
     /// One whole frame of `src` (`ZSTD_compress2`, with `opts.dict` set on
-    /// the context), on this context.
+    /// the context), on this context. `dst` may have any length: as
+    /// `ZSTD_compress2` -- a stable output, so `ZSTD_compressEnd` straight
+    /// into it -- libzstd's capacity checks decide, with the room `dst`
+    /// leaves, whether each block is stored compressed or raw and whether
+    /// the frame fits at all (`error.DstSizeTooSmall` if not; `dst` then
+    /// holds a partial frame). `compressBound(src.len)` always suffices.
     pub fn compressFrame(comp: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
-        const bound = compressBound(src.len);
-        if (dst.len < bound) return error.NoSpaceLeft;
-        // libzstd is given exactly the bound (zref); the room a block may use
-        // can decide whether it is stored compressed
-        const out = dst[0..bound];
         try opts.advanced.check();
         var local: ?CDict = null;
         defer if (local) |*l| l.deinit();
         try comp.initStream2(opts, src.len, null, false, &local);
-        return comp.finishFrame(out, src, opts);
+        return comp.finishFrame(dst, src, opts);
     }
 
     fn finishFrame(comp: *Compressor, out: []u8, src: []const u8, opts: Options) BlockError!usize {
@@ -828,14 +828,13 @@ pub const Compressor = struct {
     /// `ZSTD_compress_usingDict`: one frame of `src` with `dict` (raw
     /// content, or a full dictionary by its magic number) loaded into the
     /// context, at `level` with every other parameter at its default, sized
-    /// for the input and the dictionary together.
+    /// for the input and the dictionary together. `dst` as in
+    /// `compressFrame`.
     pub fn compressUsingDict(comp: *Compressor, dst: []u8, src: []const u8, dict: []const u8, level: i32) Error!usize {
-        const bound = compressBound(src.len);
-        if (dst.len < bound) return error.NoSpaceLeft;
         const cp = params.getInternal(level, src.len, dict.len, .no_attach_dict);
         const opts: Options = .{ .level = if (level == 0) params.default_level else level, .checksum = false };
         try comp.beginInternal(.{ .bytes = dict }, null, cp, src.len, opts, false);
-        return comp.finishFrame(dst[0..bound], src, opts);
+        return comp.finishFrame(dst, src, opts);
     }
 
     /// `ZSTD_compress_usingCDict_advanced`: one frame of `src` with
@@ -843,9 +842,8 @@ pub const Compressor = struct {
     /// up to 512 KB) for inputs up to 128 KB or six times the dictionary,
     /// else -- a CDict with a level -- the level's for the input size and
     /// the dictionary loaded anew. Every other parameter at its default.
+    /// `dst` as in `compressFrame`.
     pub fn compressUsingCDict(comp: *Compressor, dst: []u8, src: []const u8, cdict: *const CDict, fp: FrameParams) Error!usize {
-        const bound = compressBound(src.len);
-        if (dst.len < bound) return error.NoSpaceLeft;
         const pledged: u64 = src.len;
         const dict_size: u64 = cdict.content.len;
         var cp = if (pledged < use_cdict_params_src_size_cutoff or pledged < dict_size * use_cdict_params_dict_size_multiplier or
@@ -870,7 +868,7 @@ pub const Compressor = struct {
         }
         const opts: Options = .{ .level = cdict.compression_level, .checksum = fp.checksum, .advanced = adv };
         try comp.beginInternal(null, cdict, cp, src.len, opts, false);
-        return comp.finishFrame(dst[0..bound], src, opts);
+        return comp.finishFrame(dst, src, opts);
     }
 
     fn resolved(on: bool) params.Switch {
@@ -1316,8 +1314,9 @@ pub const Compressor = struct {
     /// `ZSTD_compressContinue_internal` in frame mode: the frame header on
     /// the first call, then `chunk` as one or more blocks, the last of them
     /// marked last when `last_chunk`. `dst.len` is the room libzstd would
-    /// have (a block that does not fit is stored raw), at least
-    /// `compressBound(chunk.len)` plus the header. Returns the bytes written.
+    /// have (a block whose compressed form does not fit is stored raw, and
+    /// one that does not fit either way is `error.DstSizeTooSmall`).
+    /// Returns the bytes written.
     pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) (SizeError || BlockError)!usize {
         var fh_size: usize = 0;
         if (comp.stage == .init) {

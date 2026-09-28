@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BREAKING (error name):** one-shot compression takes a
+  destination of any size, as `ZSTD_compress2` does (Z29): `compress`,
+  `Compressor.compress` (with workers too), `compressUsingDict` and
+  `compressUsingCDict` write libzstd's frame for the room given (blocks that
+  do not fit compressed are stored raw) or fail with `error.DstSizeTooSmall`
+  exactly where libzstd fails with `dstSize_tooSmall` -- pinned on the least
+  room libzstd succeeds in for 33 cases (goldens) and a diff loop over random
+  capacities. `error.NoSpaceLeft`, which refused anything below
+  `compressBound`, is gone from `zstd.Error`; code that caught it catches
+  `error.DstSizeTooSmall`. A `compressBound`-sized `dst` gives the same bytes
+  as before.
+- **2026-09-28** — `zstd.adjustCParams` (`ZSTD_adjustCParams`: clamp, then
+  shrink to the input and dictionary sizes), `zstd.version_number` /
+  `zstd.version_string` (`ZSTD_versionNumber` / `ZSTD_versionString`: 10507,
+  "1.5.7"). `adjustCParams` and `getCParams` pinned against libzstd on 100 000
+  queries (`tools/zparams.c`).
 - **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
   ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
   after the next call take the new level, as libzstd's
