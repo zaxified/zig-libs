@@ -53,6 +53,12 @@ test "every multithreaded case has a golden row, and nothing else does" {
 /// `mc` at `level` with `workers` workers, into `out` (one-shot) or a new
 /// allocation (streamed; the caller frees it).
 fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Stream, mc: corpus.MtCase, level: i32, ck: bool, workers: u32, dict: []const u8, src: []const u8, out: []u8) ![]const u8 {
+    return compressCaseOn(gpa, ctx, strm, null, mc, level, ck, workers, dict, src, out);
+}
+
+/// `compressCase` on `pool` (null: the contexts' own); a stream takes the
+/// pool it was made with.
+fn compressCaseOn(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Stream, pool: ?*zstd.ThreadPool, mc: corpus.MtCase, level: i32, ck: bool, workers: u32, dict: []const u8, src: []const u8, out: []u8) ![]const u8 {
     const ctype: zstd.DictContentType = @enumFromInt(mc.content_type);
     var cdict: ?zstd.CDict = null;
     defer if (cdict) |*c| c.deinit();
@@ -73,7 +79,7 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
     }
     var adv = if (std.mem.eql(u8, mc.params, "-")) zstd.Advanced{} else try param_test.parse(mc.params);
     adv.nb_workers = workers;
-    const n = try ctx.compress(out, src, .{ .level = level, .checksum = ck, .advanced = adv, .dictionary = d });
+    const n = try ctx.compress(out, src, .{ .level = level, .checksum = ck, .advanced = adv, .dictionary = d, .thread_pool = pool });
     return out[0..n];
 }
 
@@ -186,6 +192,7 @@ test "the jobs are threads: one frame is cut into several, posted to the pool" {
     // 512 KB jobs (a job size under the minimum counts as the minimum)
     try std.testing.expectEqual(zstdmt.job_size_min, mt.target_section_size);
     try std.testing.expectEqual(@as(usize, 4), mt.pool.threads.len);
+    try std.testing.expect(mt.own_pool);
     try std.testing.expectEqual(@as(u32, 3), mt.pool.posted.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 3), mt.pool.finished.load(.monotonic));
     try std.testing.expect(mt.all_jobs_completed);
@@ -388,4 +395,131 @@ test "a prefix is raw content unless told otherwise, as ZSTD_CCtx_refPrefix's" {
     }
     try std.testing.expectEqualSlices(u8, frames[1], frames[0]);
     try std.testing.expect(frames[0].len * 10 < frames[2].len); // the LDM found the prefix
+}
+
+/// Every multithreaded case on `pool` with `workers` workers, through one
+/// `Compressor` and one `Stream` of this thread's, cases `part` of every
+/// `parts`, against the goldens; the mismatches.
+fn runOnPool(gpa: std.mem.Allocator, pool: *zstd.ThreadPool, workers: u32, part: usize, parts: usize) !usize {
+    var ctx: zstd.Compressor = .init(gpa);
+    defer ctx.deinit();
+    var strm = try zstd.Stream.init(gpa, .{ .thread_pool = pool });
+    defer strm.deinit();
+    var mismatches: usize = 0;
+    for (corpus.mt_cases, 0..) |mc, i| {
+        if (i % parts != part) continue;
+        const src = try gpa.alloc(u8, mc.input.len);
+        defer gpa.free(src);
+        corpus.generate(mc.input, src);
+        const dict_buf = try gpa.alloc(u8, if (mc.dict) |name| corpus.dictLen(corpus.findDict(name), &trained) else 0);
+        defer gpa.free(dict_buf);
+        const dict = if (mc.dict) |name| dict_buf[0..corpus.buildDict(corpus.findDict(name), &trained, dict_buf)] else dict_buf;
+        const out = try gpa.alloc(u8, zstd.compressBound(src.len));
+        defer gpa.free(out);
+        for (mc.levels) |level| for (mc.checksums) |ck| {
+            const g = find(mc, level, ck).?;
+            const z = try compressCaseOn(gpa, &ctx, &strm, pool, mc, level, ck, workers, dict, src, out);
+            defer if (mc.schedule != null) gpa.free(z);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(z, &digest, .{});
+            if (z.len != g.len or !std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), g.sha256)) {
+                std.debug.print("MISMATCH on a shared pool {s} level {d} checksum {} workers {d}: {d} bytes, libzstd {d}\n", .{ mc.name, level, ck, workers, z.len, g.len });
+                mismatches += 1;
+            }
+        };
+    }
+    // (the multithreaded contexts were on the pool, never on one of their own)
+    if (ctx.mt) |m| try std.testing.expect(!m.own_pool and m.pool == pool);
+    if (strm.mt) |m| try std.testing.expect(!m.own_pool and m.pool == pool);
+    return mismatches;
+}
+
+test "a shared thread pool gives the same bytes, smaller or larger than nb_workers" {
+    if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest; // see above
+    const gpa = std.testing.allocator;
+    // two threads for three workers: jobs wait for a free thread
+    const small = try zstd.ThreadPool.create(gpa, 2, .{});
+    defer small.destroy();
+    try std.testing.expectEqual(@as(usize, 0), try runOnPool(gpa, small, 3, 0, 1));
+    // eight threads for one worker: more jobs run at once than nb_workers
+    // (libzstd then borrows more contexts than it keeps)
+    const large = try zstd.ThreadPool.create(gpa, 8, .{});
+    defer large.destroy();
+    try std.testing.expectEqual(@as(usize, 0), try runOnPool(gpa, large, 1, 0, 1));
+    try std.testing.expect(large.memorySize() > 0);
+}
+
+const Shared = struct {
+    pool: *zstd.ThreadPool,
+    part: usize,
+    parts: usize,
+    workers: u32,
+    result: anyerror!usize = 0,
+
+    fn run(sh: *Shared) void {
+        sh.result = runOnPool(std.testing.allocator, sh.pool, sh.workers, sh.part, sh.parts);
+    }
+};
+
+fn concurrently(pool: *zstd.ThreadPool) !void {
+    var parts: [3]Shared = undefined;
+    var threads: [3]std.Thread = undefined;
+    for (&parts, &threads, 0..) |*p, *t, i| {
+        p.* = .{ .pool = pool, .part = i, .parts = parts.len, .workers = @intCast(2 + i) };
+        t.* = try std.Thread.spawn(.{}, Shared.run, .{p});
+    }
+    for (threads) |t| t.join();
+    for (parts) |p| try std.testing.expectEqual(@as(usize, 0), try p.result);
+}
+
+test "compressors and streams on several threads share one pool at once" {
+    if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest; // see above
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // std.Thread workers and the process-global futex
+    const pool = try zstd.ThreadPool.create(gpa, 3, .{});
+    defer pool.destroy();
+    try concurrently(pool);
+    // the workers as a caller's `Io` tasks, waiting on its futex
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io_pool = try zstd.ThreadPool.create(gpa, 3, .{ .io = threaded.io() });
+    defer io_pool.destroy();
+    try concurrently(io_pool);
+}
+
+test "a context moves between its own pool and shared ones between frames" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 1_200_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 12 }, src);
+    const out = try gpa.alloc(u8, zstd.compressBound(src.len));
+    defer gpa.free(out);
+    const want = try gpa.alloc(u8, zstd.compressBound(src.len));
+    defer gpa.free(want);
+    const adv: zstd.Advanced = .{ .nb_workers = 2, .job_size = 1 };
+    const n_want = try zstd.compress(gpa, want, src, .{ .level = 3, .advanced = adv });
+    const a = try zstd.ThreadPool.create(gpa, 1, .{});
+    defer a.destroy();
+    const b = try zstd.ThreadPool.create(gpa, 4, .{});
+    defer b.destroy();
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    for ([_]?*zstd.ThreadPool{ a, null, b, b, null, a }) |p| {
+        const n = try c.compress(out, src, .{ .level = 3, .advanced = adv, .thread_pool = p });
+        try std.testing.expectEqualSlices(u8, want[0..n_want], out[0..n]);
+        const m = c.mt.?;
+        try std.testing.expectEqual(p == null, m.own_pool);
+        if (p) |q| try std.testing.expect(m.pool == q);
+    }
+    // a shared pool is never resized by a context's worker count
+    try std.testing.expectEqual(@as(u32, 1), a.n_threads);
+    try std.testing.expectEqual(@as(u32, 4), b.n_threads);
+    // with a shared pool, the estimate leaves the workers' workspaces to it
+    const est_own = try zstd.estimateCompressorSize(src.len, .{ .level = 3, .advanced = adv });
+    const est_shared = try zstd.estimateCompressorSize(src.len, .{ .level = 3, .advanced = adv, .thread_pool = a });
+    try std.testing.expect(est_shared < est_own);
+    _ = try c.compress(out, src, .{ .level = 3, .advanced = adv, .thread_pool = b });
+    try std.testing.expect(c.mt.?.memorySize() + c.workspaceSize() <= est_shared);
+    try std.testing.expectError(error.ParameterOutOfBound, zstd.ThreadPool.create(gpa, 0, .{}));
 }

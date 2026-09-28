@@ -96,7 +96,22 @@ pub const Options = struct {
     /// `advanced.enable_seq_producer_fallback`, the match finder still runs
     /// for the blocks it fails on.
     sequence_producer: ?SequenceProducer = null,
+    /// `ZSTD_CCtx_refThreadPool`: with `advanced.nb_workers`, the jobs run
+    /// on this shared pool instead of a pool of the context's own; null
+    /// (`ZSTD_CCtx_refThreadPool(cctx, NULL)`) is the context's own. The
+    /// bytes are the same. The pool must outlive the context.
+    thread_pool: ?*ThreadPool = null,
 };
+
+/// `ZSTD_threadPool`: worker threads, each with a compression context,
+/// that any number of compressors and streams with `Advanced.nb_workers`
+/// share (`Options.thread_pool`, `StreamOptions.thread_pool`) --
+/// `ZSTD_createThreadPool` is `ThreadPool.create`, `ZSTD_freeThreadPool`
+/// `destroy`. A context with `nb_workers` above the pool's thread count
+/// runs as many jobs at once as there are threads free. Built on a
+/// caller's `std.Io` when given one (its concurrency and futex), else on
+/// `std.Thread`s. See SPEC.md, *Multithreading*.
+pub const ThreadPool = zstdmt.ThreadPool;
 
 /// `ZSTD_Sequence`: a match and the literals before it, as the
 /// sequence-level API (`Compressor.compressSequences`,
@@ -256,13 +271,13 @@ pub const Compressor = struct {
         const fo = frameOptions(opts);
         // ZSTD_compress2 goes through ZSTD_compressStream2, which leaves an
         // input of up to ZSTDMT_JOBSIZE_MIN to the calling thread
-        if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo);
+        if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo, opts.thread_pool);
         return c.ctx.compressFrame(dst, src, fo);
     }
 
     /// `ZSTD_compress2` with workers: one `ZSTD_e_end` call over the whole
     /// input.
-    fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options) Error!usize {
+    fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options, pool: ?*ThreadPool) Error!usize {
         const bound = compressBound(src.len);
         if (dst.len < bound) return error.NoSpaceLeft;
         try fo.advanced.check();
@@ -271,10 +286,10 @@ pub const Compressor = struct {
         const setup = try c.ctx.setupStream2(fo, src.len, null, &local);
         if (c.mt == null) {
             const gpa = c.ctx.gpa orelse return error.OutOfMemory; // a static context
-            c.mt = try zstdmt.MtCtx.create(gpa, fo.advanced.nb_workers, c.mt_run_inline);
+            c.mt = try zstdmt.MtCtx.create(gpa, fo.advanced.nb_workers, c.mt_run_inline, pool);
         }
         const mt = c.mt.?;
-        try mt.initFrame(setup, src.len);
+        try mt.initFrame(setup, src.len, pool);
         var in: stream.InBuffer = .{ .src = src };
         var out: stream.OutBuffer = .{ .dst = dst[0..bound] };
         const left = mt.compressStream2(&out, &in, .end) catch |e| switch (e) {
@@ -356,11 +371,110 @@ pub const Compressor = struct {
         return c.ctx.compressUsingCDict(dst, src, cdict, fp);
     }
 
+    // ---- Buffer-less compression (deprecated in libzstd in favour of the
+    // streaming API; kept here as part of its API, and because
+    // `ZSTD_copyCCtx` copies a context prepared by it) ----
+
+    /// Set the context up for one frame, fed afterwards by
+    /// `compressContinue` and ended by `compressEnd` (libzstd's
+    /// `ZSTD_compressBegin*`). No thread of its own: `nb_workers` does not
+    /// apply. A dictionary is used by reference: its bytes (or the `CDict`)
+    /// must stay until the frame ends -- and while a copy
+    /// (`copyFrom`) of this context compresses.
+    pub fn begin(c: *Compressor, how: Begin) Error!void {
+        switch (how) {
+            .level => |b| {
+                if (b.level > max_level) return error.LevelUnsupported;
+                try c.ctx.beginUsingDict(b.dict, b.level);
+            },
+            .advanced => |b| try c.ctx.beginAdvanced(b.dict, b.cparams, b.frame, b.pledged_size),
+            .cdict => |b| _ = try c.ctx.beginUsingCDictAdvanced(b.cdict, b.frame, b.pledged_size),
+        }
+    }
+
+    /// `ZSTD_compressContinue`: the frame header on the first call, then
+    /// `src` as blocks, none of them the last. The input so far must stay
+    /// where it was, unmodified, within the window: it is the history the
+    /// next calls match against (input that does not follow the previous
+    /// call's in memory starts a new segment, the old one kept as the
+    /// extDict; input overwriting it cuts it short). `dst` may have any
+    /// size: too little room is `error.DstSizeTooSmall`, and the frame
+    /// cannot go on (as in libzstd). `compressBound(src.len)` plus 18 bytes
+    /// for the header is always enough.
+    pub fn compressContinue(c: *Compressor, dst: []u8, src: []const u8) BufferlessError!usize {
+        if (c.ctx.stage == .created) return error.StageWrong; // missing init (ZSTD_compressBegin)
+        return c.ctx.compressContinue(dst, src, false);
+    }
+
+    /// `ZSTD_compressEnd`: `src` as the last blocks (an empty one when
+    /// needed), then the checksum; a pledged size must be met exactly
+    /// (`error.SrcSizeWrong`). The context then needs another `begin`.
+    pub fn compressEnd(c: *Compressor, dst: []u8, src: []const u8) BufferlessError!usize {
+        if (c.ctx.stage == .created) return error.StageWrong; // missing init (ZSTD_compressBegin)
+        const n = try c.ctx.compressContinue(dst, src, true);
+        const m = try c.ctx.writeEpilogue(dst[n..]);
+        if (c.ctx.pledged) |p| if (p != c.ctx.consumed) return error.SrcSizeWrong;
+        return n + m;
+    }
+
+    /// `ZSTD_copyCCtx`: this context set up as a copy of `prepared`, which
+    /// must have been through `begin` and nothing since
+    /// (`error.StageWrong`), for a frame of `pledged_size` bytes -- null, or
+    /// 0 as in libzstd, is an unknown size, which leaves the size out of
+    /// the header. What it saves is `begin`'s work, loading a dictionary
+    /// above all. Frames from the copy are libzstd's frames from its copy,
+    /// which are not always those `prepared` would give: the copy keeps the
+    /// table parameters, tables, window, dictionary ID and entropy tables,
+    /// but not the row match finder's tags (`greedy`..`lazy2`, levels 5..12
+    /// by default: this context keeps its own, so its earlier frames can
+    /// show), an attached `CDict` (a `.cdict` begun for a small or unknown
+    /// size), long-distance matching's table, nor any other parameter:
+    /// frame parameters are the content size (when known), no checksum and
+    /// the dictionary ID, and the rest are the defaults (a new libzstd
+    /// context's). What `prepared` references (a dictionary's bytes, a
+    /// `CDict`) must outlive the copy's frame. Allocates only when this
+    /// context's workspace is too small; a static one fails with
+    /// `error.OutOfMemory`.
+    pub fn copyFrom(c: *Compressor, prepared: *const Compressor, pledged_size: ?u64) BufferlessError!void {
+        const pledged: ?u64 = if (pledged_size) |n| (if (n == 0) null else n) else null;
+        try c.ctx.copyFrom(&prepared.ctx, pledged);
+    }
+
     /// The bytes the workspace holds now (`ZSTD_sizeof_CCtx` less the
     /// context itself).
     pub fn workspaceSize(c: *const Compressor) usize {
         return c.ctx.ws.len;
     }
+};
+
+/// How `Compressor.begin` sets a context up (the `ZSTD_compressBegin*`
+/// family). A dictionary is a full one by its magic number, else raw
+/// content.
+pub const Begin = union(enum) {
+    /// `ZSTD_compressBegin_usingDict` (`ZSTD_compressBegin` without a
+    /// dictionary): `level`'s parameters for an unknown size and a
+    /// dictionary of `dict.len` bytes; no content size in the header, no
+    /// checksum.
+    level: struct { level: i32 = default_level, dict: []const u8 = &.{} },
+    /// `ZSTD_compressBegin_advanced`: explicit parameters (see
+    /// `getCParams`; out of libzstd's bounds is
+    /// `error.ParameterOutOfBound`), frame parameters, and the frame's size
+    /// (null: unknown); every other parameter at its default.
+    advanced: struct { cparams: CParams, frame: FrameParams = .{}, dict: []const u8 = &.{}, pledged_size: ?u64 = null },
+    /// `ZSTD_compressBegin_usingCDict_advanced`
+    /// (`ZSTD_compressBegin_usingCDict`: `.{ .content_size = false }` and
+    /// an unknown size): the CDict's parameters, as
+    /// `compressUsingCDict` takes them for the size.
+    cdict: struct { cdict: *const CDict, frame: FrameParams = .{ .content_size = false }, pledged_size: ?u64 = null },
+};
+
+/// What the buffer-less calls can fail with besides `Error`.
+pub const BufferlessError = Error || error{
+    /// `stage_wrong`: `compressContinue`/`compressEnd` without a `begin`;
+    /// `copyFrom` of a context not just begun.
+    StageWrong,
+    /// `srcSize_wrong`: more input than pledged, or less at the end.
+    SrcSizeWrong,
 };
 
 /// A caller's workspace for `Compressor.initStatic` / `Stream.initStatic`.
@@ -372,16 +486,18 @@ pub const workspace_alignment = frame.workspace_alignment;
 /// port's layout, not libzstd's number); null for the most that any input
 /// size needs (`ZSTD_estimateCCtxSize`). With `Advanced.nb_workers`, an
 /// input over `zstdmt.job_size_min` goes to the workers: the most they hold
-/// (`zstdmt.estimateSize`; libzstd refuses to estimate with workers); null
-/// counts both kinds of input, which one context keeps side by side.
+/// (`zstdmt.estimateSize`; libzstd refuses to estimate with workers) -- with
+/// `opts.thread_pool`, less the workers' workspaces, which are the pool's;
+/// null counts both kinds of input, which one context keeps side by side.
 pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
     try opts.advanced.check();
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
+    const shared = opts.thread_pool != null;
     if (opts.advanced.nb_workers > 0) {
         if (src_size) |n| {
-            if (n > zstdmt.job_size_min) return zstdmt.estimateSize(fo, n, null);
-        } else return estimateCompressorSingle(null, fo) + zstdmt.estimateSize(fo, null, null);
+            if (n > zstdmt.job_size_min) return zstdmt.estimateSize(fo, n, null, shared);
+        } else return estimateCompressorSingle(null, fo) + zstdmt.estimateSize(fo, null, null, shared);
     }
     return estimateCompressorSingle(src_size, fo);
 }
@@ -591,6 +707,7 @@ test {
     _ = @import("param_test.zig");
     _ = @import("context_test.zig");
     _ = @import("dctx_test.zig");
+    _ = @import("copy_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("dict_builder.zig");
     _ = @import("zdict.zig");
