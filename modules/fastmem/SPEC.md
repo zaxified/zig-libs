@@ -45,8 +45,10 @@ library loaded into it.
   middle + tail) and every alignment of the middle.
 - Page-scale lengths (4095..12289) at odd offsets.
 - C semantics: returns `dest`, uses the low byte of `c`, `len == 0` writes nothing.
-- The test binary itself exports the symbol, so the whole test runner's own
-  `@memset`s run through it, and one test proves the linked `memset` is this one.
+- The test binary itself exports the symbol (from inside the test that checks
+  it, never from a file-level `comptime` block, which would collide with
+  `check-pubfn-reach` analysing `exportSymbols`), so the whole test runner's own
+  `@memset`s run through it, and that test proves the linked `memset` is this one.
 - Shown to go red: moving the middle loop's start one vector later fails the first
   two tests (2026-09-28).
 

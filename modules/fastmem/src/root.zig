@@ -125,12 +125,6 @@ fn setSmall(d: [*]u8, c: u8, n: usize) void {
 
 const testing = std.testing;
 
-// The test binary exports the symbol, so every `@memset` in it — std's test
-// runner and allocator included — runs through `set`.
-comptime {
-    if (builtin.is_test and !builtin.link_libc) exportSymbols();
-}
-
 test "set: every length 0..300 at every offset 0..63 writes exactly its range" {
     var canvas: [512]u8 align(64) = undefined;
     for ([_]u8{ 0x00, 0xA5, 0xFF }) |c| {
@@ -175,6 +169,14 @@ test "memset: C semantics -- returns dest, takes the low byte of c, len 0 touche
 
 test "the export took effect: the linked `memset` is this module's" {
     if (builtin.link_libc) return error.SkipZigTest;
+    // Exported HERE rather than from a file-level `comptime` block: the export
+    // is global either way (every `@memset` in the test binary, std's runner and
+    // allocator included, then runs through `set`), but a file-level block also
+    // fires in any build that merely imports this file under `zig test` --
+    // `check-pubfn-reach` does, and analysing `exportSymbols`' body there is a
+    // second `@export` of the same name: "exported symbol collision"
+    // (CI run 36443590540, 2026-09-28).
+    comptime exportSymbols();
     const linked = @extern(*const fn (?[*]u8, c_int, usize) callconv(.c) ?[*]u8, .{ .name = "memset" });
     try testing.expectEqual(@intFromPtr(&memset), @intFromPtr(linked));
     // And a runtime-length @memset goes through it with the right result.
