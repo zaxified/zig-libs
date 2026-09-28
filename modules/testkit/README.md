@@ -20,6 +20,7 @@ place to put things a test might one day want.
 | `verboseSkip` / `skip` | 42 byte-identical copies across 26 modules |
 | `hex.bytes` | 18 byte-identical copies across 8 modules |
 | `expectHex` / `expectBytes` | every `goldens.zig` spelled it differently |
+| `fuzz.driver.run` / `fuzz.Rng` / `fuzz.driver.hit` | the deterministic fuzz driver, copied by hand into seglog and zstd (2026-09-27) before qap needed it a third time |
 
 The golden comparison is the one piece that is *better* than what it replaced,
 not merely shared — see below.
@@ -49,6 +50,40 @@ const owned = try testkit.hex.alloc(gpa, wire_hex);         // allocated
 try testkit.expectHex("45000054...", frame);
 try testkit.expectBytes(expected, actual);
 ```
+
+## The deterministic fuzz driver
+
+`zig build --fuzz` explores; it cannot give a verdict (no progress, exit 0 on a
+crash, a hang is invisible). `fuzz.driver.run` runs the same harness over
+inputs drawn from seeds, in the ordinary ReleaseSafe test binary, with a
+watchdog per input:
+
+```zig
+fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const n = src.slice(&buf);
+    if (n > 100) testkit.fuzz.driver.hit("long input");   // reach, printed at the end
+    try parse(gpa, buf[0..n]);
+}
+test "fuzz: the parser" {                       // exploration, optional
+    try std.testing.fuzz({}, struct {
+        fn f(_: void, s: *std.testing.Smith) !void { return harness(std.testing.Smith, s, std.testing.allocator); }
+    }.f, .{});
+}
+test "fuzz driver: the parser" {                // the verdict
+    try testkit.fuzz.driver.run(harness, .{ .prefix = "MOD_FUZZ", .name = "parser" });
+}
+```
+
+`MOD_FUZZ=<runs>[,<first seed>]` runs it (unset: skipped), `MOD_FUZZ_ONLY`
+selects harnesses by name, `MOD_FUZZ_MS` is the limit per input (2000),
+`MOD_FUZZ_SEEDFILE` holds the current harness and seed for a crash,
+`MOD_FUZZ_INPUT` replays a saved `--fuzz` input. Output: `runs …` about once a
+second, `DONE <name> runs=… in … ms`, `REACH <name> <label>=<n>`, and
+`FAIL <name> seed=N: <error>` / `HANG <name> seed=N` (exit 124). One job per
+core with disjoint seed ranges is the caller's runner. The source of choices
+is `fuzz.Rng` — never `Smith{ .in = random bytes }`, which answers the range
+minimum for almost every draw.
 
 ## The golden diff
 

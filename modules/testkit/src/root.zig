@@ -43,6 +43,7 @@ pub const meta = .{
 test {
     _ = hex;
     _ = fuzz;
+    _ = fuzz.driver;
     _ = @import("golden.zig");
 }
 

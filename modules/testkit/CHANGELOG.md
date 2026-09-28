@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **New `fuzz.driver`: the deterministic fuzz driver.** `fuzz.driver.run(harness,
+  .{ .prefix, .name })` runs a harness generic over its source of choices over seeded inputs in the
+  ordinary test binary — a watchdog per input (`HANG <name> seed=N`, exit 124), `FAIL <name>
+  seed=N`, the current seed in a seed file, a progress line a second, replay of a saved `--fuzz`
+  input, a leak-finding allocator without stack traces — and `fuzz.driver.hit(label)` counts reach,
+  printed as `REACH`. `fuzz.Rng` is `Smith`'s drawing methods from a PRNG. The third copy of the
+  driver seglog and zstd carry by hand; first consumer qap. Additive.
+
 - **2026-09-07** — **`fuzz.Cursor`: how a *structured* harness reads a corpus
   seed.** `seed`/`seedHex`/`seedInto` serve a harness that decodes a frame;
   `check-fuzz-reach`'s R1 class is the other kind — state machines and

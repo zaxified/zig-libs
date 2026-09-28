@@ -46,6 +46,10 @@
 
 const std = @import("std");
 
+/// The deterministic driver (`<PREFIX>=<runs>[,<seed>]`): the verdict run.
+pub const driver = @import("fuzz_driver.zig");
+pub const Rng = driver.Rng;
+
 /// A corpus entry carrying `frame` verbatim.
 ///
 ///     const seeds = [_][]const u8{
