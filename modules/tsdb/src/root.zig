@@ -89,6 +89,10 @@ pub const Error = codec.CanonError ||
 /// One sample of one series.
 pub const Sample = struct { ts: Timestamp, value: f64 };
 
+/// One series' points for `Db.appendBatch` — same shape as `appendMany`'s
+/// `(series, points)` pair, batched across several series into one call.
+pub const SeriesBatch = struct { series: SeriesId, points: []const Sample };
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 /// A time-series view over a `kvtree.Db` the CALLER owns and keeps alive.
@@ -215,6 +219,53 @@ pub const Db = struct {
         return self.tree.get(gpa, &rev_key);
     }
 
+    /// Every registered series, id + parsed descriptor, in ascending id
+    /// order. Replaces walking ids `1, 2, 3, …` until one is missing (which
+    /// only ever worked because ids happen to be dense today — this reads
+    /// the reverse index directly, so it stays correct if that ever
+    /// changes). Holds an MVCC snapshot like `range` — `defer it.deinit()`.
+    pub fn seriesIterator(self: *Db) Error!SeriesIterator {
+        var snap = try self.tree.snapshot();
+        errdefer snap.release();
+        var cur = try snap.cursor();
+        errdefer cur.deinit();
+        try cur.seek(&[_]u8{codec.tag_series_rev});
+        return .{ .snap = snap, .cur = cur, .mode = .all };
+    }
+
+    /// Every series registered under exactly `name`, filtered to those whose
+    /// labels are a SUPERSET of `filter` — every `(name, value)` pair in
+    /// `filter` must be present with an equal value; the series may carry
+    /// further labels `filter` says nothing about. For a reader that knows
+    /// the metric name but not every label value up front (ttydesk's own
+    /// `key`/`field` disambiguation: today it walks and decodes every series
+    /// in the store to find the ones for one source, `src/diskhist.zig`,
+    /// marked `zig-libs request: tsdb — list series`).
+    ///
+    /// `filter` is borrowed — it must outlive the returned iterator, same
+    /// convention as `labels` in `seriesId`. Scans only the series registered
+    /// under `name` (a name-prefix range over the forward index), never the
+    /// whole series catalog, so a store with many metric names costs this
+    /// call nothing proportional to the ones that don't match.
+    pub fn findSeries(self: *Db, name: []const u8, filter: []const Label) Error!SeriesIterator {
+        if (name.len > codec.max_component_len) return error.ComponentTooLong;
+        var snap = try self.tree.snapshot();
+        errdefer snap.release();
+        var cur = try snap.cursor();
+        errdefer cur.deinit();
+        var prefix: [1 + 2 + codec.max_component_len]u8 = undefined;
+        prefix[0] = codec.tag_series_index;
+        std.mem.writeInt(u16, prefix[1..3], @intCast(name.len), .big);
+        @memcpy(prefix[3..][0..name.len], name);
+        const prefix_len = 3 + name.len;
+        try cur.seek(prefix[0..prefix_len]);
+        return .{ .snap = snap, .cur = cur, .mode = .{ .by_name = .{
+            .prefix = prefix,
+            .prefix_len = prefix_len,
+            .filter = filter,
+        } } };
+    }
+
     fn indexKey(
         self: *Db,
         out: *std.ArrayList(u8),
@@ -263,6 +314,41 @@ pub const Db = struct {
                 const key = codec.pointKey(series, p.ts);
                 const val = codec.encodeValue(p.value);
                 try txn.put(&key, &val);
+            }
+        }
+        try txn.commit();
+    }
+
+    /// Append points for MULTIPLE series in ONE transaction — a crash or an
+    /// error partway through leaves every series untouched, never some
+    /// committed and others not. A flush across N series via `appendMany`
+    /// (one call per series) is N transactions and therefore N commits of
+    /// kvtree's own COW protocol (two `fsync`s each: one for the written
+    /// pages, one for the meta swap that makes the commit durable — see
+    /// `kvtree/src/core.zig`'s `commit`) — `appendBatch` is a CONSTANT number
+    /// of commits (one) regardless of how many series are in `batches`, not
+    /// one per series. Replaces ttydesk's own per-series-transaction flush
+    /// loop (`src/diskhist.zig`, marked `zig-libs request: tsdb — append
+    /// points of many series in one transaction`).
+    pub fn appendBatch(self: *Db, batches: []const SeriesBatch) Error!void {
+        var any = false;
+        for (batches) |b| {
+            if (b.points.len != 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+
+        var txn = try self.tree.begin();
+        {
+            errdefer txn.rollback();
+            for (batches) |b| {
+                for (b.points) |p| {
+                    const key = codec.pointKey(b.series, p.ts);
+                    const val = codec.encodeValue(p.value);
+                    try txn.put(&key, &val);
+                }
             }
         }
         try txn.commit();
@@ -459,6 +545,199 @@ pub const Db = struct {
         @memcpy(st.buf[0..key.len], key);
         return st;
     }
+
+    // ── size budget ──────────────────────────────────────────────────────────
+    //
+    // `sweep`/`sweepChunk` above retire data by AGE: a caller picks a cutoff
+    // and everything older goes. That is a policy decision this module cannot
+    // make on the caller's behalf — but a caller that instead wants "keep the
+    // disk usage under N bytes" needs the module to answer "how big is the
+    // LIVE data" and "delete the globally oldest points until it fits", which
+    // `sweep` alone does not give: a per-series cutoff sweep does not know
+    // what counts as "oldest" ACROSS series.
+    //
+    // kvtree never shrinks the underlying file — freed pages are recycled
+    // (COW page reuse) but the file's high-water mark only ever grows, and
+    // kvtree exposes no compaction/vacuum operation that would repack it
+    // smaller (checked: no such method exists on `kvtree.Db`; SPEC.md §6
+    // already documents "merge-less deletes" and a non-shrinking file as
+    // inherited kvtree caveats). So `liveSize`/`sweepToBudget` are
+    // deliberately about LIVE data — the point entries retention can still
+    // reclaim — not `stat().size`, which a caller reads for itself (ttydesk's
+    // own `fileSize()`, `src/diskhist.zig`) and which these two functions
+    // cannot promise to shrink.
+
+    /// Live point-data size, in bytes: `(number of samples) *
+    /// codec.point_entry_bytes`. EXACT, not an estimate — every point key and
+    /// value is fixed-width (see `codec.point_entry_bytes`), so a point count
+    /// converts to a byte count with no rounding or sampling. Excludes the
+    /// series index/reverse-index entries (small — one per series, never
+    /// touched by retention) and kvtree's own on-disk page/freelist overhead
+    /// (the file itself never shrinks — see this section's doc comment
+    /// above). Costs one forward scan of the point partition: O(live points).
+    pub fn liveSize(self: *Db) Error!u64 {
+        var cur = try self.tree.cursor();
+        defer cur.deinit();
+        try cur.seek(&[_]u8{codec.tag_point});
+        var count: u64 = 0;
+        while (try cur.next()) |e| {
+            _ = codec.decodePointKey(e.key) orelse break; // left the point partition
+            count += 1;
+        }
+        return count * codec.point_entry_bytes;
+    }
+
+    pub const SweepToBudgetOptions = struct {
+        /// Deletions per committed transaction. Bounds one transaction's
+        /// size, same role as `SweepOptions.chunk_deletes` — but see the
+        /// doc comment on `sweepToBudget` for why chunking here does NOT
+        /// give the same resumability `sweep` has.
+        chunk_deletes: usize = 4096,
+        /// Upper bound on deletions this call will make. `sweepToBudget`
+        /// seeds one probe per series up front (see its doc comment); this
+        /// additionally bounds the deletions themselves, the same way
+        /// `SweepOptions.chunk_examines` bounds one retention chunk's work.
+        max_deletes: usize = 65536,
+    };
+
+    pub const SweepToBudgetResult = struct {
+        /// `liveSize()` before this call.
+        before: u64,
+        /// `liveSize()` after. Exact: `before - after == deleted *
+        /// codec.point_entry_bytes` (see `liveSize`'s doc comment on why
+        /// this needs no re-scan to compute).
+        after: u64,
+        /// Points deleted by this call.
+        deleted: usize = 0,
+        /// True iff `after <= max_bytes`. False means `max_deletes` was hit
+        /// before the budget was met — call again to continue.
+        done: bool = false,
+    };
+
+    /// Delete the globally OLDEST points — across every series, by
+    /// timestamp, not by key order — until live data is at most `max_bytes`,
+    /// or until `opts.max_deletes` is spent (call again to continue). A
+    /// no-op, `.done = true`, if the budget is already met.
+    ///
+    /// **Why not `sweep` with a computed cutoff.** A point key sorts
+    /// `(series, timestamp)` — series-MAJOR — so "the earliest keys in the
+    /// tree" is NOT "the oldest points in the store": series 9 can hold data
+    /// from a decade ago while series 0 was created five minutes ago. Age
+    /// retention (`sweep`) is fine with this because it applies ONE cutoff
+    /// independently to every series; a size BUDGET has no such per-series
+    /// answer — "which points are `oldest`" is a comparison across series,
+    /// and only their timestamps answer it.
+    ///
+    /// **The algorithm**: a k-way merge over per-series "current oldest
+    /// surviving point" candidates, seeded once via `seriesIterator` (one
+    /// tree probe per series) and kept in a min-heap ordered by timestamp
+    /// (ties broken by series id, for determinism). Popping the heap's
+    /// minimum and re-probing that one series for its next point costs
+    /// O(log(series count)) per deletion — NOT a rescan of the whole store,
+    /// and NOT a bisection over candidate cutoffs (which would need many
+    /// full-store passes to evaluate each candidate). Because every point is
+    /// fixed-width (`codec.point_entry_bytes`), the number of points to
+    /// delete is computed exactly from `liveSize()` up front — no repeated
+    /// re-measurement is needed as deletions are collected.
+    ///
+    /// **Crash-safety — narrower than `sweep`'s.** Each chunk of
+    /// `opts.chunk_deletes` deletions commits atomically (kvtree's COW
+    /// commit), so a crash mid-call leaves a CONSISTENT tree — never a
+    /// torn chunk. But unlike `sweep`, there is no persisted resume record:
+    /// a crash (or hitting `max_deletes`) leaves the merge's in-memory
+    /// progress on the floor. This is still CORRECT, just not linear the way
+    /// resumed retention is — the next call recomputes `liveSize` and
+    /// reseeds the heap from scratch, which costs one more series-count
+    /// probe pass but reaches the same end state (deleting the globally
+    /// oldest points is idempotent in the same sense `sweep`'s cutoff delete
+    /// is: re-running never un-deletes anything or deletes the wrong ones).
+    /// A future version could persist a resume record shaped like `sweep`'s,
+    /// keyed by `max_bytes` instead of a cutoff; not built for v1 — this is
+    /// a scope decision, matching how `sweep` itself once lacked resumability
+    /// (SPEC.md §5) until that specific gap was closed deliberately.
+    pub fn sweepToBudget(self: *Db, max_bytes: u64, opts: SweepToBudgetOptions) Error!SweepToBudgetResult {
+        const before = try self.liveSize();
+        if (before <= max_bytes) return .{ .before = before, .after = before, .done = true };
+
+        const excess = before - max_bytes;
+        const needed: u64 = (excess + codec.point_entry_bytes - 1) / codec.point_entry_bytes;
+        const want: usize = @intCast(@min(@as(u64, opts.max_deletes), needed));
+
+        const Candidate = struct { key: [codec.point_key_len]u8, series: SeriesId };
+        const less = struct {
+            fn f(_: void, a: Candidate, b: Candidate) std.math.Order {
+                const pa = codec.decodePointKey(&a.key).?;
+                const pb = codec.decodePointKey(&b.key).?;
+                if (pa.ts != pb.ts) return std.math.order(pa.ts, pb.ts);
+                return std.math.order(pa.series, pb.series); // deterministic tie-break
+            }
+        }.f;
+
+        var heap: std.PriorityQueue(Candidate, void, less) = .empty;
+        defer heap.deinit(self.gpa);
+        {
+            var it = try self.seriesIterator();
+            defer it.deinit();
+            while (try it.next(self.gpa)) |entry_val| {
+                var entry_mut = entry_val;
+                const entry = &entry_mut;
+                defer entry.deinit(self.gpa);
+                if (try self.firstPointOf(entry.id)) |k| try heap.push(self.gpa, .{ .key = k, .series = entry.id });
+            }
+        }
+
+        var deletes: std.ArrayList([codec.point_key_len]u8) = .empty;
+        defer deletes.deinit(self.gpa);
+        while (deletes.items.len < want) {
+            const cand = heap.pop() orelse break; // no live points anywhere
+            try deletes.append(self.gpa, cand.key);
+            if (try self.nextPointAfter(cand.key)) |k| try heap.push(self.gpa, .{ .key = k, .series = cand.series });
+        }
+
+        var deleted: usize = 0;
+        var i: usize = 0;
+        while (i < deletes.items.len) {
+            const end = @min(i + opts.chunk_deletes, deletes.items.len);
+            var txn = try self.tree.begin();
+            {
+                errdefer txn.rollback();
+                for (deletes.items[i..end]) |*k| try txn.del(k);
+            }
+            try txn.commit();
+            deleted += end - i;
+            i = end;
+        }
+
+        const after = before - @as(u64, deleted) * codec.point_entry_bytes;
+        return .{ .before = before, .after = after, .deleted = deleted, .done = after <= max_bytes };
+    }
+
+    /// `series`'s current oldest surviving point, or null if it has none.
+    fn firstPointOf(self: *Db, series: SeriesId) Error!?[codec.point_key_len]u8 {
+        var cur = try self.tree.cursor();
+        defer cur.deinit();
+        const start = codec.seriesStartKey(series);
+        try cur.seek(&start);
+        const e = (try cur.next()) orelse return null;
+        const p = codec.decodePointKey(e.key) orelse return null;
+        if (p.series != series) return null; // this series has no points
+        return e.key[0..codec.point_key_len].*;
+    }
+
+    /// The next surviving point strictly after `key`, WITHIN THE SAME
+    /// SERIES `key` belongs to — never the next series' first point, which
+    /// would silently merge two series' timelines.
+    fn nextPointAfter(self: *Db, key: [codec.point_key_len]u8) Error!?[codec.point_key_len]u8 {
+        const want_series = codec.decodePointKey(&key).?.series;
+        var cur = try self.tree.cursor();
+        defer cur.deinit();
+        const succ = codec.pointKeySuccessor(key);
+        try cur.seek(&succ);
+        const e = (try cur.next()) orelse return null;
+        const p = codec.decodePointKey(e.key) orelse return null;
+        if (p.series != want_series) return null; // exhausted this series
+        return e.key[0..codec.point_key_len].*;
+    }
 };
 
 /// `version(1) | cutoff (raw i64 BE, equality only) | resume key bytes`.
@@ -494,6 +773,117 @@ const ScanPos = struct {
         return self.buf[0..self.len];
     }
 };
+
+// ── series listing ──────────────────────────────────────────────────────────
+
+/// One series from `Db.seriesIterator`/`Db.findSeries`: its id and its
+/// parsed (name, labels) descriptor. Fully owned — `descriptor`'s slices
+/// point into `canon`, not into any iterator-internal buffer, so an entry
+/// stays valid past the iterator's next `next()` call or even its `deinit`.
+/// `deinit` frees both.
+pub const SeriesEntry = struct {
+    id: SeriesId,
+    /// Owned canonical bytes; `descriptor.name`/`.labels[].name`/`.value`
+    /// are subslices of this, per `codec.parseCanonical`.
+    canon: []u8,
+    descriptor: Descriptor,
+
+    pub fn deinit(self: *SeriesEntry, gpa: Allocator) void {
+        self.descriptor.deinit(gpa);
+        gpa.free(self.canon);
+        self.* = undefined;
+    }
+};
+
+/// A streaming series-listing iterator (`Db.seriesIterator` / `Db.findSeries`).
+/// Holds an MVCC snapshot, same contract as `Range`: concurrent commits do
+/// not disturb it, and a leaked one pins kvtree's page reclaim — always
+/// `defer it.deinit()`.
+pub const SeriesIterator = struct {
+    snap: kvtree.Snapshot,
+    cur: kvtree.Cursor,
+    mode: Mode,
+
+    const Mode = union(enum) {
+        /// `Db.seriesIterator`: the whole reverse index, in id order.
+        all,
+        /// `Db.findSeries`: the forward index, bounded to one name's
+        /// contiguous key range (see `Db.findSeries`), filtered by labels.
+        by_name: struct {
+            prefix: [1 + 2 + codec.max_component_len]u8,
+            prefix_len: usize,
+            filter: []const Label,
+        },
+    };
+
+    /// The next matching series, or null once the scan is exhausted (the
+    /// reverse index ends / the name-prefix range ends). Allocates the
+    /// returned entry's `canon` buffer and `descriptor.labels` on `gpa` —
+    /// the caller's to free via `SeriesEntry.deinit`.
+    pub fn next(self: *SeriesIterator, gpa: Allocator) Error!?SeriesEntry {
+        while (true) {
+            const e = (try self.cur.next()) orelse return null;
+            switch (self.mode) {
+                .all => {
+                    if (e.key.len != 9 or e.key[0] != codec.tag_series_rev) return null;
+                    const id = std.mem.readInt(u64, e.key[1..9], .big);
+                    return try self.decodeEntry(gpa, id, e.val);
+                },
+                .by_name => |m| {
+                    const prefix = m.prefix[0..m.prefix_len];
+                    if (e.key.len < prefix.len or !std.mem.eql(u8, e.key[0..prefix.len], prefix))
+                        return null; // left this name's contiguous key range
+                    if (e.val.len != 8) return error.CorruptIndex;
+                    const id = std.mem.readInt(u64, e.val[0..8], .big);
+                    const entry = try self.decodeEntry(gpa, id, e.key[1..]);
+                    if (!labelsMatch(entry.descriptor.labels, m.filter)) {
+                        var mut = entry;
+                        mut.deinit(gpa);
+                        continue; // keep scanning within this name's range
+                    }
+                    return entry;
+                },
+            }
+        }
+    }
+
+    /// Dupe `canon_bytes` onto `gpa` and parse it — see `SeriesEntry`'s doc
+    /// comment for why this is a fresh copy rather than a slice borrowed
+    /// from the cursor's own (next-call-invalidated) leaf buffer.
+    fn decodeEntry(self: *SeriesIterator, gpa: Allocator, id: SeriesId, canon_bytes: []const u8) Error!SeriesEntry {
+        _ = self;
+        const canon = try gpa.dupe(u8, canon_bytes);
+        errdefer gpa.free(canon);
+        const descriptor = codec.parseCanonical(gpa, canon) catch |err| switch (err) {
+            error.Malformed => return error.CorruptIndex,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return .{ .id = id, .canon = canon, .descriptor = descriptor };
+    }
+
+    pub fn deinit(self: *SeriesIterator) void {
+        self.cur.deinit();
+        self.snap.release();
+        self.* = undefined;
+    }
+};
+
+/// True iff every `(name, value)` pair in `filter` is present in `have`
+/// (label-name equality, case-sensitive, exact value match). `have` may
+/// carry further labels `filter` says nothing about.
+fn labelsMatch(have: []const Label, filter: []const Label) bool {
+    for (filter) |f| {
+        var found = false;
+        for (have) |h| {
+            if (std.mem.eql(u8, h.name, f.name) and std.mem.eql(u8, h.value, f.value)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 // ── Range ────────────────────────────────────────────────────────────────────
 
@@ -665,6 +1055,115 @@ test "lookupSeries does not create; unknown series reads empty" {
     try testing.expectEqual(s, (try fx.db.lookupSeries("nope", &.{})).?);
 }
 
+// ── series listing ──────────────────────────────────────────────────────────
+
+test "seriesIterator: empty store yields nothing" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    var it = try fx.db.seriesIterator();
+    defer it.deinit();
+    try testing.expect((try it.next(testing.allocator)) == null);
+}
+
+test "seriesIterator: every created series comes back, in id order, with its descriptor" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+
+    const a = try fx.db.seriesId("cpu", &.{.{ .name = "host", .value = "a" }});
+    const b = try fx.db.seriesId("mem", &.{});
+    const c = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "b" }, .{ .name = "core", .value = "0" } });
+
+    var it = try fx.db.seriesIterator();
+    defer it.deinit();
+
+    var seen: std.ArrayList(SeriesId) = .empty;
+    defer seen.deinit(gpa);
+    var last_id: SeriesId = 0;
+    while (try it.next(gpa)) |entry_val| {
+        var entry_mut = entry_val;
+        const entry = &entry_mut;
+        defer entry.deinit(gpa);
+        try testing.expect(entry.id > last_id); // ascending id order
+        last_id = entry.id;
+        try seen.append(gpa, entry.id);
+        if (entry.id == a) {
+            try testing.expectEqualStrings("cpu", entry.descriptor.name);
+            try testing.expectEqual(@as(usize, 1), entry.descriptor.labels.len);
+        } else if (entry.id == c) {
+            try testing.expectEqualStrings("cpu", entry.descriptor.name);
+            try testing.expectEqual(@as(usize, 2), entry.descriptor.labels.len);
+        } else if (entry.id == b) {
+            try testing.expectEqualStrings("mem", entry.descriptor.name);
+            try testing.expectEqual(@as(usize, 0), entry.descriptor.labels.len);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), seen.items.len);
+}
+
+test "findSeries: filters by name and by a label subset, leaving unrelated series out" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+
+    const cpu_a = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "a" }, .{ .name = "core", .value = "0" } });
+    const cpu_a1 = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "a" }, .{ .name = "core", .value = "1" } });
+    const cpu_b = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "b" }, .{ .name = "core", .value = "0" } });
+    _ = try fx.db.seriesId("mem", &.{.{ .name = "host", .value = "a" }}); // different name: must never match
+
+    // Name only: every "cpu" series, regardless of labels.
+    {
+        var it = try fx.db.findSeries("cpu", &.{});
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next(gpa)) |e_val| {
+            var e_mut = e_val;
+            const e = &e_mut;
+            defer e.deinit(gpa);
+            try testing.expectEqualStrings("cpu", e.descriptor.name);
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 3), count);
+    }
+
+    // Name + a label subset: only host=a, both cores.
+    {
+        var it = try fx.db.findSeries("cpu", &.{.{ .name = "host", .value = "a" }});
+        defer it.deinit();
+        var got: std.ArrayList(SeriesId) = .empty;
+        defer got.deinit(gpa);
+        while (try it.next(gpa)) |e_val| {
+            var e_mut = e_val;
+            const e = &e_mut;
+            defer e.deinit(gpa);
+            try got.append(gpa, e.id);
+        }
+        try testing.expectEqual(@as(usize, 2), got.items.len);
+        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_a) != null);
+        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_a1) != null);
+        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_b) == null);
+    }
+
+    // Name + a fully specific label set: exactly one match.
+    {
+        var it = try fx.db.findSeries("cpu", &.{ .{ .name = "host", .value = "b" }, .{ .name = "core", .value = "0" } });
+        defer it.deinit();
+        var only = (try it.next(gpa)).?;
+        defer only.deinit(gpa);
+        try testing.expectEqual(cpu_b, only.id);
+        try testing.expect((try it.next(gpa)) == null);
+    }
+
+    // A name that was never registered: no matches, not an error.
+    {
+        var it = try fx.db.findSeries("disk", &.{});
+        defer it.deinit();
+        try testing.expect((try it.next(gpa)) == null);
+    }
+}
+
 test "range: half-open [from, to) and never bleeds into a neighbouring series" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
@@ -747,6 +1246,147 @@ test "range streams: iterating thousands of points allocates nothing at this lay
     try testing.expectEqual(@as(usize, n), count);
 
     fx.db.gpa = testing.allocator;
+}
+
+// ── appendBatch ──────────────────────────────────────────────────────────────
+
+test "appendBatch: commits points for multiple series at once" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+    try fx.db.appendBatch(&.{
+        .{ .series = a, .points = &.{ .{ .ts = 1, .value = 10 }, .{ .ts = 2, .value = 20 } } },
+        .{ .series = b, .points = &.{.{ .ts = 5, .value = 50 }} },
+    });
+
+    const ga = try collect(gpa, &fx.db, a, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(ga);
+    try testing.expectEqual(@as(usize, 2), ga.len);
+    const gb = try collect(gpa, &fx.db, b, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(gb);
+    try testing.expectEqual(@as(usize, 1), gb.len);
+    try testing.expectEqual(@as(f64, 50), gb[0].value);
+}
+
+test "appendBatch: an empty call and a call whose series all have zero points are no-ops" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("a", &.{});
+
+    try fx.db.appendBatch(&.{});
+    try fx.db.appendBatch(&.{.{ .series = a, .points = &.{} }});
+    try testing.expectEqual(@as(usize, 0), try totalPoints(gpa, &fx.db, &.{a}));
+}
+
+test "appendBatch: an allocation failure partway through leaves NOTHING committed — all series or none" {
+    // Same guarantee `appendMany` already gives for one series, extended
+    // across a whole batch: `appendBatch` wraps every series' puts in ONE
+    // kvtree transaction, so a failure partway through (here: the
+    // underlying tree's allocator running out) must roll back everything,
+    // not just the series it happened to fail inside.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+
+    // Swap the underlying kvtree's allocator (what `Txn.put`'s key/val
+    // dupes come from — see `kvtree.Txn.put`) for one that fails a few
+    // allocations in, well before either series' points are fully buffered.
+    var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 2 });
+    fx.tree.gpa = fa.allocator();
+    const batches = [_]SeriesBatch{
+        .{ .series = a, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+        .{ .series = b, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+    };
+    try testing.expectError(error.OutOfMemory, fx.db.appendBatch(&batches));
+    fx.tree.gpa = gpa; // restore before any further use of the tree
+
+    try testing.expectEqual(@as(usize, 0), try totalPoints(gpa, &fx.db, &.{ a, b }));
+}
+
+test "appendBatch: a crash mid-batch loses everything or nothing, never a partial series set" {
+    const gpa = testing.allocator;
+    const CrashMode = @FieldType(kvtree.SimStorage, "crash_mode");
+    const modes = [_]CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        var crash_at: usize = 0;
+        var survived_without_crashing = false;
+        while (!survived_without_crashing) : (crash_at += 1) {
+            try testing.expect(crash_at < 200);
+
+            var fx = try Fixture.init(gpa);
+            defer fx.deinit();
+            const a = try fx.db.seriesId("a", &.{});
+            const b = try fx.db.seriesId("b", &.{});
+            const c = try fx.db.seriesId("c", &.{});
+
+            fx.sim.crash_mode = mode;
+            fx.sim.reorder_seed = 0xba7 +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
+            fx.sim.ops_until_crash = crash_at;
+            const batches = [_]SeriesBatch{
+                .{ .series = a, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+                .{ .series = b, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+                .{ .series = c, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+            };
+            if (fx.db.appendBatch(&batches)) |_| {
+                survived_without_crashing = true;
+            } else |_| {}
+            fx.sim.reboot();
+            try fx.reopen();
+
+            const na = try totalPoints(gpa, &fx.db, &.{a});
+            const nb = try totalPoints(gpa, &fx.db, &.{b});
+            const nc = try totalPoints(gpa, &fx.db, &.{c});
+            // Every series has the SAME count (0 or 2) -- the batch is one
+            // transaction, so a crash can never leave one series filled and
+            // another empty.
+            try testing.expectEqual(na, nb);
+            try testing.expectEqual(nb, nc);
+            try testing.expect(na == 0 or na == 2);
+        }
+    }
+}
+
+test "appendBatch commits ALL series in one transaction: sync count is constant, not per series" {
+    const gpa = testing.allocator;
+    var sim = kvtree.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var counting = CountingStorage{ .inner = sim.storage() };
+    var tree = try kvtree.Db.open(gpa, counting.storage(), "series.kvt", .{});
+    defer tree.close();
+    var db = Db.init(gpa, &tree);
+    defer db.deinit();
+
+    const a = try db.seriesId("a", &.{});
+    const b = try db.seriesId("b", &.{});
+    const c = try db.seriesId("c", &.{});
+
+    // One series' worth of points, for the single-transaction baseline.
+    const before_single = counting.sync_count;
+    try db.appendMany(a, &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } });
+    const per_single_txn = counting.sync_count - before_single;
+    try testing.expect(per_single_txn > 0); // a real commit must sync at least once
+
+    // Three series' worth of points in ONE appendBatch call.
+    const before_batch = counting.sync_count;
+    try db.appendBatch(&.{
+        .{ .series = a, .points = &.{ .{ .ts = 3, .value = 3 }, .{ .ts = 4, .value = 4 } } },
+        .{ .series = b, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+        .{ .series = c, .points = &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } } },
+    });
+    const per_batch_txn = counting.sync_count - before_batch;
+
+    // Same sync cost as ONE `appendMany` call, whatever it is (kvtree's own
+    // commit protocol) -- NOT three times as much, which is what three
+    // separate `appendMany` calls (one per series) would have cost.
+    try testing.expectEqual(per_single_txn, per_batch_txn);
 }
 
 // ── retention ────────────────────────────────────────────────────────────────
@@ -1081,6 +1721,116 @@ test "retention leaves other tenants of the tree untouched" {
     try testing.expectEqualStrings("keep me", v);
 }
 
+// ── size budget ──────────────────────────────────────────────────────────────
+
+test "liveSize: empty store is zero; grows and shrinks exactly with point count" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    try testing.expectEqual(@as(u64, 0), try fx.db.liveSize());
+
+    const s = try fx.db.seriesId("m", &.{});
+    try fx.db.appendMany(s, &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 }, .{ .ts = 3, .value = 3 } });
+    try testing.expectEqual(@as(u64, 3 * codec.point_entry_bytes), try fx.db.liveSize());
+
+    _ = try fx.db.sweep(2, .{}); // deletes ts 1 only (strict <)
+    try testing.expectEqual(@as(u64, 2 * codec.point_entry_bytes), try fx.db.liveSize());
+}
+
+test "sweepToBudget: a no-op when the budget is already met" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    try fx.db.appendMany(s, &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } });
+    const size = try fx.db.liveSize();
+
+    const r = try fx.db.sweepToBudget(size, .{}); // exactly at budget
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 0), r.deleted);
+    try testing.expectEqual(size, r.before);
+    try testing.expectEqual(size, r.after);
+    try testing.expectEqual(@as(usize, 2), try totalPoints(gpa, &fx.db, &.{s}));
+
+    const r2 = try fx.db.sweepToBudget(size + 1000, .{}); // budget well above size
+    try testing.expect(r2.done);
+    try testing.expectEqual(@as(usize, 0), r2.deleted);
+}
+
+test "sweepToBudget: drops the globally OLDEST points across series first, not key order" {
+    // series A gets the LOWER id (sorts first in key order) but the NEWER
+    // timestamps; series B gets the HIGHER id but the OLDER timestamps. A
+    // budget sweep that (wrongly) walked key order would delete from A
+    // first; the correct, timestamp-driven merge must delete from B.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+
+    const a = try fx.db.seriesId("a", &.{}); // id 1 — created first
+    const b = try fx.db.seriesId("b", &.{}); // id 2 — created second
+    var pts_a: std.ArrayList(Sample) = .empty;
+    defer pts_a.deinit(gpa);
+    for (0..10) |i| try pts_a.append(gpa, .{ .ts = @intCast(1000 + i), .value = @floatFromInt(i) }); // NEWER
+    var pts_b: std.ArrayList(Sample) = .empty;
+    defer pts_b.deinit(gpa);
+    for (0..10) |i| try pts_b.append(gpa, .{ .ts = @intCast(i), .value = @floatFromInt(i) }); // OLDER
+    try fx.db.appendMany(a, pts_a.items);
+    try fx.db.appendMany(b, pts_b.items);
+
+    const before = try fx.db.liveSize(); // 20 points
+    try testing.expectEqual(@as(u64, 20 * codec.point_entry_bytes), before);
+
+    // Ask to drop exactly 5 points' worth.
+    const budget = before - 5 * codec.point_entry_bytes;
+    const r = try fx.db.sweepToBudget(budget, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 5), r.deleted);
+    try testing.expectEqual(before, r.before);
+    try testing.expectEqual(budget, r.after);
+
+    // Series A (the NEWER data) is untouched...
+    try testing.expectEqual(@as(usize, 10), try totalPoints(gpa, &fx.db, &.{a}));
+    // ...series B lost exactly its 5 oldest points (ts 0..4), keeping 5..9.
+    const gb = try collect(gpa, &fx.db, b, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(gb);
+    try testing.expectEqual(@as(usize, 5), gb.len);
+    try testing.expectEqual(@as(Timestamp, 5), gb[0].ts);
+    try testing.expectEqual(@as(Timestamp, 9), gb[gb.len - 1].ts);
+}
+
+test "sweepToBudget: max_deletes bounds one call; a second call finishes the job" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    var pts: std.ArrayList(Sample) = .empty;
+    defer pts.deinit(gpa);
+    for (0..10) |i| try pts.append(gpa, .{ .ts = @intCast(i), .value = @floatFromInt(i) });
+    try fx.db.appendMany(s, pts.items);
+
+    const before = try fx.db.liveSize();
+    const budget = before - 8 * codec.point_entry_bytes; // needs 8 deletions
+
+    const r1 = try fx.db.sweepToBudget(budget, .{ .max_deletes = 3 });
+    try testing.expect(!r1.done);
+    try testing.expectEqual(@as(usize, 3), r1.deleted);
+
+    const r2 = try fx.db.sweepToBudget(budget, .{ .max_deletes = 3 });
+    try testing.expect(!r2.done);
+    try testing.expectEqual(@as(usize, 3), r2.deleted);
+
+    const r3 = try fx.db.sweepToBudget(budget, .{ .max_deletes = 3 });
+    try testing.expect(r3.done);
+    try testing.expectEqual(@as(usize, 2), r3.deleted); // 8 - 3 - 3 = 2 left
+
+    try testing.expectEqual(budget, try fx.db.liveSize());
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(Timestamp, 8), got[0].ts); // the two newest survive
+    try testing.expectEqual(@as(Timestamp, 9), got[1].ts);
+}
+
 test "persistence: samples survive a real filesystem round trip" {
     const gpa = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1114,6 +1864,12 @@ test "persistence: samples survive a real filesystem round trip" {
 const CountingStorage = struct {
     inner: kvtree.Storage,
     pread_count: usize = 0,
+    /// Counts `sync` calls reaching the inner backend — used to prove
+    /// `appendBatch` commits every series in ONE transaction (a constant
+    /// number of syncs per call, kvtree's own COW commit protocol,
+    /// independent of how many series/points are in the batch) rather than
+    /// one transaction per series.
+    sync_count: usize = 0,
 
     fn cast(ctx: *anyopaque) *CountingStorage {
         return @ptrCast(@alignCast(ctx));
@@ -1133,7 +1889,9 @@ const CountingStorage = struct {
         return cast(ctx).inner.writeAll(h, bytes, off);
     }
     fn vSync(ctx: *anyopaque, h: kvtree.Storage.Handle) kvtree.Storage.Error!void {
-        return cast(ctx).inner.sync(h);
+        const self = cast(ctx);
+        self.sync_count += 1;
+        return self.inner.sync(h);
     }
     fn vTruncate(ctx: *anyopaque, h: kvtree.Storage.Handle, len: u64) kvtree.Storage.Error!void {
         return cast(ctx).inner.truncate(h, len);

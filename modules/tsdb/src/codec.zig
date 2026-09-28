@@ -58,6 +58,12 @@ pub const point_key_len = 1 + 8 + 8;
 /// A point key plus one byte — the successor used to resume a scan strictly
 /// after a given point (see `pointKeySuccessor`).
 pub const max_scan_key_len = point_key_len + 1;
+/// On-disk cost of one point entry: the key (`point_key_len`) plus its
+/// 8-byte value. Every point is exactly this many bytes — fixed-width keys
+/// and values, no variable-length encoding anywhere in the point partition —
+/// so a point *count* converts to a byte budget exactly, never an estimate.
+/// Used by `Db.liveSize`/`Db.sweepToBudget`.
+pub const point_entry_bytes: u64 = point_key_len + 8;
 
 pub const meta_key_next_series = [_]u8{ tag_meta, 's' };
 pub const meta_key_retention = [_]u8{ tag_meta, 'r' };

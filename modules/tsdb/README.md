@@ -103,6 +103,56 @@ Each chunk is **one transaction** that deletes at most `chunk_deletes` points
 Series index entries are **not** removed by retention — a series that loses
 every point keeps its id, so re-appearing data lands in the same series.
 
+## Listing series, batched writes, a size budget
+
+```zig
+// Every registered series, id order, id + parsed (name, labels) descriptor.
+var it = try db.seriesIterator();
+defer it.deinit();
+while (try it.next(gpa)) |*entry| {
+    defer entry.deinit(gpa);
+    use(entry.id, entry.descriptor.name, entry.descriptor.labels);
+}
+
+// A known metric name, labels not all known up front: filter by a SUBSET —
+// every listed label must match; the series may carry further labels too.
+var m = try db.findSeries("cpu_seconds", &.{.{ .name = "host", .value = "web-1" }});
+defer m.deinit();
+while (try m.next(gpa)) |*entry| { defer entry.deinit(gpa); use(entry.id); }
+
+// N series in ONE transaction — a constant number of fsyncs, not one per
+// series — and a crash or an error partway through leaves EVERY series in
+// the batch untouched, never some committed and others not.
+try db.appendBatch(&.{
+    .{ .series = cpu, .points = &.{.{ .ts = 1, .value = 1 }} },
+    .{ .series = mem, .points = &.{.{ .ts = 1, .value = 2 }} },
+});
+
+// A byte BUDGET on live data (kvtree never shrinks the file — see below):
+// drops the globally oldest points, by timestamp across every series, until
+// live data fits (or opts.max_deletes is spent — call again to continue).
+const size = try db.liveSize();               // exact: every point is 25 bytes
+const r = try db.sweepToBudget(64 << 20, .{});
+// r.before / r.after / r.deleted / r.done
+```
+
+`seriesIterator`/`findSeries` return a `SeriesIterator` — MVCC-snapshotted like `Range`, so
+`defer it.deinit()` — whose `next()` hands back a fully OWNED `SeriesEntry` (`defer
+entry.deinit(gpa)`): its descriptor's name/label slices point into their own copy, not into any
+buffer the next `next()` call would invalidate.
+
+`sweepToBudget` solves a different problem than `sweep`: a point key sorts `(series, timestamp)`
+— series-major — so "the earliest keys in the tree" is not "the oldest points in the store" (one
+series can hold decade-old data while another is five minutes old). It merges every series'
+current-oldest candidate in a min-heap ordered by timestamp rather than rescanning the whole store
+per decision. Its crash-safety is narrower than `sweep`'s: each chunk of deletions commits
+atomically, but there is no persisted resume record, so an interrupted call's progress is not
+resumed — the next call just recomputes and reseeds (still correct, just not linear). **kvtree
+never shrinks its file** (freed pages are recycled, not released back to the filesystem) and
+exposes no compaction/vacuum — so `liveSize`/`sweepToBudget` are a budget on the point data
+retention can actually reclaim, never on `stat().size` (which a caller reads for itself, e.g. via
+its own `Io.Dir.statFile`, the way ttydesk's own workaround already did).
+
 ## Not in v1 (deliberate, see `SPEC.md`)
 
 Sample compression (Gorilla-style delta-of-delta timestamps + XOR floats),

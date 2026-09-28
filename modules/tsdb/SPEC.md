@@ -146,6 +146,69 @@ keeps its id, so re-appearing data lands in the same series.
 deletes anything nor advances its position while claiming more work would spin
 forever, so it stops instead.
 
+## 5a. Series listing, multi-series batches, a size budget — DONE 2026-09-28
+
+Requested by ttydesk (2026-09-27), which worked around all three (`src/diskhist.zig`, each marked
+`zig-libs request: tsdb — …`); the new API lets that workaround be deleted.
+
+**Series listing (`Db.seriesIterator`, `Db.findSeries`).** ttydesk resolved "what series exist"
+by walking ids `1, 2, 3, …` via `seriesCanonical` until one was missing — correct only because ids
+happen to be dense today. `seriesIterator` reads the REVERSE index (`tag_series_rev`) directly, in
+id order, decoding each entry's canonical bytes into a `Descriptor` — no assumption about id
+density. `findSeries(name, filter)` exploits a property of the canonical encoding
+(`canonicalize`, §4) that is not obvious from the byte-lexicographic ordering alone: because every
+component is length-prefixed, all series index entries (`tag_series_index | canonical(name,
+labels)`) sharing the SAME `name` share an identical byte PREFIX (`tag | u16(name.len) | name`)
+regardless of their labels — so a single bounded range scan from that prefix, stopping the instant
+a key stops matching it, visits exactly the series registered under `name` and nothing else. Each
+match is then filtered by `filter: []const Label` — a SUPERSET check (every `filter` label must be
+present with an equal value; extra labels on the series are fine) — covering ttydesk's own
+`key`/`field` disambiguation without it decoding every series in the store. Both return a
+`SeriesIterator` (streaming, MVCC-snapshotted like `Range`); each `next()` call fully OWNS its
+`SeriesEntry` (a fresh `canon` copy the descriptor's slices point into) rather than borrowing from
+the cursor's next-call-invalidated leaf buffer, so an entry survives past the following `next()`
+call — unlike `Range.next()`'s `Sample`, which carries no slices and has no such concern.
+
+**Multi-series batches (`Db.appendBatch`).** `appendMany` commits once per series; flushing N
+series is N kvtree transactions, each with kvtree's own two-`fsync` COW commit protocol
+(`kvtree/src/core.zig`'s `commit`: one `fsync` for the written pages, one for the meta-page swap
+that is the linearization point) — so N series cost 2N fsyncs, not N as ttydesk's own comment
+assumed. `appendBatch([]const struct{ series, points })` wraps every series' points in ONE
+transaction: a CONSTANT number of fsyncs (kvtree's fixed per-commit cost) regardless of how many
+series are in the batch, and — the atomicity property that actually matters — a crash or an error
+partway through leaves EVERY series in the batch untouched, never some committed and others not.
+Verified two ways: a `FailingAllocator`-induced failure partway through a batch leaves zero points
+for every series in it (not just the one it failed in), and a `kv.SimStorage` crash sweep across a
+batch of three series asserts all three end up with the SAME point count (0 or the full batch) —
+never a partial set.
+
+**A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree never shrinks its file — recycled
+pages are reused (COW) but the high-water mark only grows, and it exposes no compaction/vacuum
+operation that would repack the file smaller (checked directly against `kvtree.Db`'s public API:
+there is none). So a byte BUDGET can only ever be a budget on LIVE data, never on file size — a
+distinction ttydesk's own comment already states ("kvtree reuses freed pages but does not shrink
+the file"). `liveSize()` counts point entries only (not the tiny, retention-untouched series
+index/reverse-index, and not kvtree's own page/freelist overhead) and is EXACT, not an estimate:
+every point key and value is fixed-width (`codec.point_entry_bytes` = 25), so a point count
+converts to a byte count with no rounding.
+`sweepToBudget(max_bytes, opts)` deletes the globally OLDEST points — by timestamp, across every
+series — until live data fits, or `opts.max_deletes` is spent (call again to continue; idempotent,
+like `sweep`'s cutoff delete). This is NOT the same problem `sweep`'s cutoff deletion solves: a
+point key sorts `(series, timestamp)` — series-MAJOR — so "the earliest keys in the tree" is not
+"the oldest points in the store" (series 9 can hold decade-old data while series 0 is five minutes
+old). A cutoff-bisection approach was considered and rejected: evaluating each candidate cutoff
+would need a fresh full-store scan, and a `[minInt, maxInt]` search converges in ~64 rescans in the
+worst case — expensive for a large store. Instead, `sweepToBudget` runs a k-way merge over
+per-series "current oldest surviving point" candidates in a min-heap ordered by timestamp (ties
+broken by series id), seeded once via `seriesIterator` (one probe per series) and re-probed
+per deletion (`O(log(series count))` each) — no rescan proportional to store size. **Narrower
+crash-safety than `sweep`'s**: each chunk of `opts.chunk_deletes` deletions commits atomically, so
+a crash never leaves a torn chunk, but there is no persisted resume record — an interrupted call's
+in-memory merge progress is lost, and the next call recomputes `liveSize` and reseeds from scratch.
+Still correct (idempotent, same end state), just not linear the way `sweep`'s resumed retention is
+— a deliberate v1 scope decision, not an oversight, exactly like `sweep`'s own resumability was
+before it was built (§5's history).
+
 ## 6. Threat model / what can go wrong
 
 - **Untrusted key bytes.** Point keys come from this module, but the tree can be
@@ -166,7 +229,7 @@ forever, so it stops instead.
 
 ## 7. Verification
 
-`zig build test-tsdb` — 27 tests, **no skips**, green in Debug, ReleaseSafe and
+`zig build test-tsdb` — 46 tests, **no skips**, green in Debug, ReleaseSafe and
 ReleaseFast.
 
 - **Codec property tests** (§2): pairwise order identity over boundary +
@@ -183,6 +246,22 @@ ReleaseFast.
   equality, the linearity bound, resume across a full close/reopen,
   larger-cutoff restart, `chunk_examines` bounding a no-op sweep, empty store,
   and non-interference with a foreign key in the same tree.
+- **Series listing** (§5a): `seriesIterator` over an empty store and over several created series
+  (ascending id order, each entry's descriptor checked); `findSeries` filtering by name alone, by
+  name plus a label subset, by a fully-specific label set, and against a name that was never
+  registered.
+- **`appendBatch`** (§5a): multiple series committed by one call; an empty batch and an
+  all-zero-points batch are no-ops; a `FailingAllocator`-induced failure partway through leaves
+  every series in the batch at zero points, not just the one it failed in; a `kv.SimStorage` crash
+  sweep across a three-series batch asserts all three end up with the SAME point count; a
+  `CountingStorage`-wrapped comparison shows one `appendBatch` call over three series costs the
+  SAME sync count as one `appendMany` call over one series (constant, not per-series).
+- **Size budget** (§5a): `liveSize` zero on an empty store and exact after appends/a sweep; a
+  no-op `sweepToBudget` when the budget is already met (both exactly-at and well-above); dropping
+  the globally oldest points across two series with DELIBERATELY misleading id-vs-timestamp
+  ordering (lower id, newer data vs. higher id, older data) to distinguish true timestamp order
+  from key order; `max_deletes` bounding one call, with a second and third call finishing the job
+  and the final surviving points being the newest ones.
 - **Crash sweeps** over `kv.SimStorage`: the crash point is swept across every
   storage side effect of (a) a chunked retention sweep and (b) a series-id
   allocation, in all four crash modes (`lose_unsynced`, `torn_tail`,
@@ -232,17 +311,10 @@ section is its citation.
 
 ## 9. Backlog — deliberate v1 non-goals
 
-- **Series listing, multi-series batches, a size budget** (from ttydesk, 2026-09-27). (1) No way
-  to enumerate series: a reader that does not know label values up front cannot find them --
-  wanted `Db.seriesIterator()` (id + parsed descriptor) and `Db.findSeries(name, label filter)`.
-  (2) `appendMany` commits per series, so flushing N series is N transactions (N fsyncs) --
-  wanted `Db.appendBatch([]const struct{ series, points })` in one transaction. (3) Retention is
-  by age only and kvtree never shrinks the file -- wanted `sweepToBudget(max_bytes)` (oldest
-  points first, by live data size) and a way to read the live size. ttydesk walks series ids
-  1, 2, 3 … until one is missing, flushes on its own thread, and halves its retention window
-  while over a cap (`src/diskhist.zig`, marked `zig-libs request: tsdb — …`). Precedent:
-  Prometheus TSDB label matchers and `--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB
-  multi-series writes; the wgs lesson (13 GB in an afternoon) is (3).
+~~**Series listing, multi-series batches, a size budget**~~ — **DONE 2026-09-28**, see §5a above.
+Precedent this design followed: Prometheus TSDB label matchers and
+`--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB multi-series writes; the wgs lesson
+(13 GB in an afternoon) is why the size budget exists at all.
 
 Named as scope decisions, not omissions.
 

@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Series listing, multi-series batches, a size budget — requested by ttydesk
+  (2026-09-27), which worked around all three in `src/diskhist.zig` (each marked `zig-libs
+  request: tsdb — …`; the new API lets that workaround be deleted). New: `Db.seriesIterator()`
+  (every registered series, id order, id + parsed `Descriptor`, replacing a walk of ids `1, 2,
+  3, …` that only worked because ids happen to be dense today) and `Db.findSeries(name, filter)`
+  (a bounded name-prefix range scan over the forward index, filtered by a label SUPERSET check —
+  covers "I know the metric but not every label value" without decoding every series in the
+  store); both return the new `SeriesIterator`/`SeriesEntry` (MVCC-snapshotted like `Range`, each
+  entry fully owned so it survives past the next `next()` call). `Db.appendBatch([]const
+  SeriesBatch{ series, points })`: every series in one kvtree transaction — a CONSTANT number of
+  commits (and therefore fsyncs) regardless of how many series are batched, not one per series;
+  a crash or an error partway through leaves every series in the batch untouched, verified both
+  by a `FailingAllocator` failure and a `kv.SimStorage` crash sweep. `Db.liveSize()` (exact
+  point-data byte count — every point is fixed-width, so this needs no estimate) and
+  `Db.sweepToBudget(max_bytes, opts)` (deletes the globally OLDEST points, by timestamp across
+  every series — not by key order, which sorts series-major — via a k-way merge over per-series
+  candidates, not a full-store rescan). kvtree exposes no compaction/vacuum and never shrinks its
+  file, so `sweepToBudget` is explicitly a budget on LIVE data, never on file size — see SPEC.md
+  §5a for the full design, including `sweepToBudget`'s narrower (non-resumable) crash-safety
+  compared to `sweep`'s. Purely additive — no existing type, field, or behavior changed.
+
 - **2026-09-07** — Test-only, no production change: both fuzz targets ran one input.
   `fuzzParseCanonical` and `fuzzDecodePointKey` each opened `smith.bytes(&buf)` and then
   drew a length with `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as
