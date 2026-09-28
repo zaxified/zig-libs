@@ -30,6 +30,15 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   for parsing, signature verification and `iss`/`aud`/`exp`/`nbf` — the OIDC-specific `azp`/`nonce`
   checks are the only new logic, layered on top of the returned `ParsedToken`.
 
+- **Token issuance** (2026-09-28, requested by qap): `encode(gpa, claims, key, opts)` /
+  `encodeJson(gpa, claims_json, key, opts)` in `encode.zig` build the compact JWS. The key is a
+  `SigningKey` whose variant fixes `alg` (RFC 8725 §2.1: never the caller's word alone; `none` is
+  unrepresentable); `SigningKey.verificationKey()` gives the matching `Key`. HMAC secrets shorter
+  than the hash output are refused (RFC 7518 §3.2 MUST); `encodeJson` refuses a payload that is
+  not one JSON object. Signatures are deterministic (ECDSA per RFC 6979, Ed25519, ML-DSA with an
+  empty context per RFC 9964). Every algorithm is tested by a round trip through
+  `parseAndVerify`.
+
 ## Threat model / out of scope
 
 This is the security core; the defenses are the point:
@@ -95,7 +104,7 @@ This is the security core; the defenses are the point:
   JWKS (`fetchJwks`/`Provider`) **refuses** `kty:"oct"` keys (`JwkSkipReason.oct_from_network`) — a
   published JWKS is attacker-readable, so a symmetric key there would let anyone forge HS\* tokens.
   Symmetric keys are trusted only from a locally-configured `parseJwks` set.
-- **Out of scope:** token *issuance*/signing; encryption (JWE); `x5c` chain validation; revocation
+- **Out of scope:** RS*/PS*/ES512 *signing* (issuance covers HS*, ES256/384, EdDSA, ML-DSA); encryption (JWE); `x5c` chain validation; revocation
   lists / token introspection (RFC 7662); `c_hash`/`at_hash` (implicit/hybrid-flow-only checks —
   P7 covers the authorization *code* flow, where they do not apply). Provider trust rests on TLS to
   the issuer (via the `http` client / `Fetcher`); P7's `TokenRequest`/`buildAuthorizationUrl` carry
@@ -165,13 +174,9 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 - **OAuth2 error-response parsing (RFC 6749 §5.2)** — DEFERRED: `parseTokenResponse` assumes a
   200-status success body; a non-200 response's `{"error": …}` shape is a caller concern (check the
   HTTP status before parsing) rather than a second typed parser this pass adds.
-- **Token issuance / signing** — BACKLOG (2026-09-22, found by qap). "Out of scope: token
-  issuance/signing" above was a scope choice, and it leaves a gap every JWT library in other
-  languages fills (jsonwebtoken, jose, PyJWT all encode+sign): a consumer that mints its own
-  service tokens, and every test that needs a token, hand-rolls base64url + HMAC/ECDSA today
-  (qap's `auth_jwt_test.zig` does exactly that). Wanted: `encode(header, claims, key)` for the
-  algorithms `verify` already supports, over the same `Key` union, with the RFC 8725 rules
-  (`alg` taken from the key, never from the caller alone; no `none`).
+- **RS\* signing** — `encode` does not offer RS256/384/512: std has no RSA signing, and the
+  `rsa` module's `signPkcs1v15` would become a new dependency of jwt (a root `build.zig`
+  change). Add it when a consumer needs RSA-issued tokens. Still open.
 - **`Guard` over a static `JwkSet`** — BACKLOG (2026-09-22, found by qap). `Guard` requires a
   `*Provider` (a network-fetching JWKS cache). A resource server whose keys come from its own
   configuration — the common small-deployment case — has to build a Provider around a fake

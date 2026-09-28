@@ -878,6 +878,17 @@ fn verifyMlDsa(
     sig.verify(parsed.signing_input, pk) catch return error.BadSignature;
 }
 
+/// Token issuance, the inverse of `parseAndVerify` (`encode.zig`): a
+/// `SigningKey` whose variant fixes `alg`, and `encode`/`encodeJson` building
+/// the compact JWS. Wanted by qap (service tokens, and every test that needs
+/// a token), 2026-09-22.
+pub const SigningKey = encode_mod.SigningKey;
+pub const EncodeOptions = encode_mod.EncodeOptions;
+pub const EncodeError = encode_mod.EncodeError;
+pub const encode = encode_mod.encode;
+pub const encodeJson = encode_mod.encodeJson;
+const encode_mod = @import("encode.zig");
+
 /// Errors from the one-call `parseAndVerify`.
 pub const ParseAndVerifyError = ParseError || VerifyError || ValidateError;
 
@@ -4243,6 +4254,7 @@ test "verify: EdDSA generated round-trip through a full token" {
 // binary -- see CONVENTIONS.md §6 step 3, the dark-tests rule.
 test {
     _ = @import("rfc9964_vectors.zig");
+    _ = @import("encode.zig");
 }
 
 test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Token issuance**: `encode` (claims serialized by `std.json`) and `encodeJson`
+  (a JSON object verbatim) over a new `SigningKey` (HS256/384/512, ES256, ES384, EdDSA,
+  ML-DSA-44/65/87) whose variant fixes `alg`; `EncodeOptions` sets `typ`/`kid`. Short HMAC
+  secrets are refused (RFC 7518 §3.2). Additive. Wanted by qap, whose tests hand-rolled tokens.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `HttpFetcher` body-read cancel test canceled after a fixed
   sleep. It now cancel once the client is inside the socket read under test (`ReadCueIo`, a
   `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
