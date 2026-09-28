@@ -93,6 +93,20 @@ the zig-libs authors (MIT).
   `elicitation:{}` meaning form-only for backwards compatibility) are enforced at the send seam.
   `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
   is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
+- **`clientInfo` is recorded per peer too — DONE 2026-09-28** (requested by ttydesk). `initialize`'s
+  `clientInfo` (`name`, `version`, optional `title`) is parsed by `ClientInfo.parse` and, unlike
+  `capabilities`, treated **leniently**: it is self-reported metadata this module never gates a
+  decision on, so a missing or malformed `clientInfo` records `PeerState.client = null` and never
+  fails the handshake (per spec `clientInfo` is required, but a client that gets this wrong still
+  gets to initialize). Each field is copied into `Server`-owned memory (`ClientInfo.dupe`, on
+  `self.gpa` — the parsed value lives on the per-message arena and does not outlive the call),
+  truncated to `Server.max_client_info_field_len` bytes (default 256) at a UTF-8 codepoint boundary
+  rather than rejected — an over-long field is informational noise, not a reason to refuse a
+  handshake. Read back with `server.clientInfo(peer)` / `call.clientInfo()` (mirroring
+  `clientCapabilities`). A re-`initialize` frees the previous copy before installing the new one
+  (dupe-then-free-old-then-assign, so a dupe OOM never frees a still-valid previous copy); both
+  `forgetPeer` and `Server.deinit` free every peer's copy, so a `PeerState` with `client` set never
+  outlives its owner without releasing that memory.
 - **Peer scoping.** `handleMessageFrom(msg, out, peer)` correlates a response only to a pending
   request issued to the *same* peer; `handleMessage` is `peer = 0`. Not a wildcard in either
   direction. Scoping covers the **handshake state and the pending budget** as well as correlation
@@ -171,6 +185,11 @@ handler failure, and progress notifications interleaving before the result; gold
 template-uri resolution + -32002 on an unresolvable uri, `prompts/get` argument substitution +
 -32602/-32603; duplicate registration rejected; blank-line/CRLF tolerance; and a full in-process
 `initialize → initialized → tools/list → tools/call` round-trip over an in-memory pipe via `serve`.
+`clientInfo` recording: name/version/title captured and replaced wholesale on re-handshake; missing
+or malformed `clientInfo` (absent, no `version`, not an object) never fails the handshake and
+records `null`; an over-long field is truncated to `max_client_info_field_len` at a UTF-8 boundary
+rather than rejected; `forgetPeer` and a re-`initialize` each free the previous copy with no leak
+(`testing.allocator`-caught).
 
 Sampling/elicitation are anchored on the **specification's own JSON examples**, not on
 self-consistency: the emitted `sampling/createMessage` line (2025-11-25 "Creating Messages"), the
@@ -256,14 +275,8 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 `URLElicitationRequiredError` (-32042) is exposed as a code but not as a helper that builds its
 `data.elicitations` payload.
 
-- **`clientInfo` is not recorded per peer** (2026-09-27, ttydesk). `initialize` parses only the
-  capabilities and the version into `PeerState`; the client's `clientInfo` (`name`, `version`,
-  optional `title`) is dropped. A server that audits what its tools do (ttydesk runs actions
-  on behalf of an AI client and writes who asked to the journal) wants to name the client.
-  ttydesk works around it by reading `clientInfo.name` from the `initialize` line itself
-  before `handleMessage` (`src/mcpserve.zig`). Ideal: `PeerState.client: ?ClientInfo` with
-  `name`/`version`/`title` copied into server-owned memory, readable as
-  `server.clientInfo(peer)` and `call.clientInfo()`; freed on `forgetPeer`.
+~~**`clientInfo` is not recorded per peer**~~ — **DONE 2026-09-28**, see the "Design & invariants"
+bullet above (`ClientInfo`, `PeerState.client`, `server.clientInfo`/`call.clientInfo`).
 
 ## Status
 

@@ -51,6 +51,16 @@ MCP spec 2025-11-25.
   advertised** in `server.clientCapabilities(peer)` — the gate on the two
   server→client requests below. Recorded **per peer**: `initialize` is a
   per-connection act, so one session's handshake never moves another's gate.
+  It also records the client's self-identification: `server.clientInfo(peer)`
+  (and `call.clientInfo()` inside a tool call) returns the `initialize`
+  request's `clientInfo` — `name`, `version`, optional `title` — copied into
+  server-owned memory and freed on the next `initialize` from the same peer
+  or on `forgetPeer`. Null before a handshake or when `clientInfo` was
+  missing or malformed (per spec it is required, but a client that gets it
+  wrong still gets to initialize — only the gate-relevant `capabilities` is
+  fail-closed). Each field is capped at `Server.max_client_info_field_len`
+  bytes (default 256, truncated at a UTF-8 boundary, never a reason to
+  refuse the handshake).
 - **Sampling / elicitation (server→client requests):**
   `sendSamplingRequest` (`sampling/createMessage`) and
   `sendElicitationRequest` (`elicitation/create`), plus `cancelRequest`

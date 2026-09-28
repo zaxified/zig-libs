@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `initialize`'s `clientInfo` (`name`, `version`, optional `title`) is now
+  recorded per peer, requested by ttydesk (2026-09-27): previously only `capabilities` and the
+  negotiated version were kept in `PeerState`, so a server that wants to name which client made
+  a call had to re-parse the `initialize` line itself. New `pub const ClientInfo` (`name`,
+  `version`, `title: ?[]const u8`), `PeerState.client: ?ClientInfo`, `Server.clientInfo(peer)` and
+  `ToolCall.clientInfo()` (mirroring `clientCapabilities`). Each field is copied onto the
+  `Server`'s own allocator (the parsed value lives on the per-message arena) and capped at the new
+  `Server.max_client_info_field_len` (default 256 bytes, truncated at a UTF-8 boundary). A missing
+  or malformed `clientInfo` records `null` and — unlike a malformed `capabilities` — never fails
+  the handshake: `clientInfo` is self-reported metadata this module never gates a decision on. A
+  re-`initialize` frees the previous copy before installing the new one; `forgetPeer` and
+  `Server.deinit` free it too. Purely additive — `PeerState` still constructs the same way for
+  existing callers (`client` defaults to `null`), and no existing behavior changed.
+
 - **2026-09-07** — Fuzz reach: neither fuzz target reached what it names. `fuzzHandleMessage`
   opened `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`;
   `bytes` consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a

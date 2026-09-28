@@ -461,6 +461,86 @@ fn present(v: ?std.json.Value) ?std.json.Value {
     return x;
 }
 
+/// A client's self-identification from `initialize`'s `clientInfo`: `name`
+/// and `version` (both spec-required) plus the optional `title` (a
+/// human-readable display name, spec 2025-06-18+). Every field a `PeerState`
+/// holds is a copy in `Server`-owned memory — see `dupe` — because the
+/// `std.json.Value` this is parsed from lives on the per-message arena and
+/// does not outlive `handleMessage`'s call.
+pub const ClientInfo = struct {
+    name: []const u8,
+    version: []const u8,
+    title: ?[]const u8 = null,
+
+    /// Parse `clientInfo` from `initialize`'s params. Missing or malformed —
+    /// not an object, or `name`/`version` absent or non-string — yields
+    /// `null`. Per the MCP spec `clientInfo` is required, but this module
+    /// treats an absent or malformed one the same way `ClientCapabilities`
+    /// treats a malformed capability: **leniently**. `clientInfo` is
+    /// self-reported metadata this module never gates a decision on (unlike
+    /// `capabilities`, which is the sampling/elicitation permission gate), so
+    /// there is nothing to fail closed *against* — a client that gets this
+    /// wrong still gets to initialize. A present-but-non-string `title` is
+    /// treated as absent rather than failing the whole `clientInfo`.
+    fn parse(value: ?std.json.Value) ?ClientInfo {
+        const v = present(value) orelse return null;
+        if (v != .object) return null;
+        const name_v = present(v.object.get("name")) orelse return null;
+        const version_v = present(v.object.get("version")) orelse return null;
+        if (name_v != .string or version_v != .string) return null;
+        var title: ?[]const u8 = null;
+        if (present(v.object.get("title"))) |t| {
+            if (t == .string) title = t.string;
+        }
+        return .{ .name = name_v.string, .version = version_v.string, .title = title };
+    }
+
+    /// Copy `self` into memory owned by `gpa`, one allocation per field, each
+    /// truncated to at most `max_len` bytes at a UTF-8 codepoint boundary
+    /// (`truncateUtf8` — JSON strings are always valid UTF-8; an unsafe byte
+    /// cut could hand back invalid UTF-8 in a `[]const u8` every other string
+    /// in this module assumes is text). The bound exists because `name`/
+    /// `version`/`title` are attacker-controlled and, unlike a JSON-RPC
+    /// line's `max_line_len`, have no framing limit of their own — over-long
+    /// fields are silently truncated, never a reason to refuse the
+    /// handshake (see `parse`'s leniency note).
+    fn dupe(self: ClientInfo, gpa: std.mem.Allocator, max_len: usize) error{OutOfMemory}!ClientInfo {
+        const name = try gpa.dupe(u8, truncateUtf8(self.name, max_len));
+        errdefer gpa.free(name);
+        const version = try gpa.dupe(u8, truncateUtf8(self.version, max_len));
+        errdefer gpa.free(version);
+        return .{
+            .name = name,
+            .version = version,
+            .title = if (self.title) |t| try gpa.dupe(u8, truncateUtf8(t, max_len)) else null,
+        };
+    }
+
+    /// Release a copy made by `dupe`.
+    fn free(self: ClientInfo, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.version);
+        if (self.title) |t| gpa.free(t);
+    }
+};
+
+/// `s[0..max_len]`, backed off so the cut never lands inside a multi-byte
+/// UTF-8 sequence. `s` is a no-op (returned as-is) when it already fits, or
+/// when it somehow fails UTF-8 validation (defensive only — a
+/// `std.json.Value.string` is already validated by the parser).
+fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    const view = std.unicode.Utf8View.init(s) catch return s[0..max_len];
+    var it = view.iterator();
+    var end: usize = 0;
+    while (it.nextCodepointSlice()) |cp| {
+        const next_end = end + cp.len;
+        if (next_end > max_len) break;
+        end = next_end;
+    }
+    return s[0..end];
+}
+
 // ── server→client requests: sampling + elicitation ──────────────────────────
 //
 // Everything above flows client→server: a message arrives, a handler runs, one
@@ -1121,6 +1201,15 @@ pub const PeerState = struct {
     /// The revision this peer's `initialize` settled on. Defaults to our
     /// latest so a pre-handshake encoder picks the newest shape.
     negotiated_version: []const u8 = protocol_version,
+    /// This peer's `initialize`.`clientInfo` — `name`/`version`/optional
+    /// `title`, copied into `Server`-owned memory (see `ClientInfo.dupe`).
+    /// Null before any `initialize`, or when the client's `clientInfo` was
+    /// missing or malformed (see `ClientInfo.parse`; never fails the
+    /// handshake). A re-`initialize` frees the old copy and replaces it
+    /// wholesale, same as `capabilities`; `Server.forgetPeer` and
+    /// `Server.deinit` free it too — see both for why a `PeerState` cannot
+    /// just be dropped once this field is non-null.
+    client: ?ClientInfo = null,
 };
 
 /// Whether a negotiated protocol revision knows elicitation *modes*. The
@@ -1413,6 +1502,12 @@ pub const ToolCall = struct {
         return self.server.clientCapabilities(self.peer);
     }
 
+    /// What the calling client self-identified as at `initialize` — see
+    /// `Server.clientInfo`. Null if it never sent a (well-formed) `clientInfo`.
+    pub fn clientInfo(self: *const ToolCall) ?ClientInfo {
+        return self.server.clientInfo(self.peer);
+    }
+
     /// Append raw bytes to the result. OOM is swallowed (a truncated tool
     /// result surfaces to the agent as malformed output, never as a crash).
     pub fn write(self: *ToolCall, bytes: []const u8) void {
@@ -1652,6 +1747,11 @@ pub const Server = struct {
     /// not, and past it an `initialize` from an unknown peer is refused
     /// rather than served.
     max_peers: usize = 4096,
+    /// Cap, in bytes, on each field of a peer's recorded `clientInfo`
+    /// (`name`, `version`, `title`) — see `ClientInfo.dupe`. An over-long
+    /// field is truncated (at a UTF-8 boundary), never a reason to reject
+    /// the handshake.
+    max_client_info_field_len: usize = 256,
     /// Outbound (server→client) requests awaiting the client's response.
     pending: std.ArrayList(Pending) = .empty,
     /// Next server→client request id. Monotonic and **never reused**: an id is
@@ -1674,6 +1774,9 @@ pub const Server = struct {
         self.resources.deinit(self.gpa);
         self.resource_templates.deinit(self.gpa);
         self.prompts.deinit(self.gpa);
+        for (self.peers.items) |p| {
+            if (p.client) |ci| ci.free(self.gpa);
+        }
         self.peers.deinit(self.gpa);
         self.pending.deinit(self.gpa);
     }
@@ -1704,6 +1807,15 @@ pub const Server = struct {
         return self.peerState(peer).negotiated_version;
     }
 
+    /// What `peer` self-identified as at `initialize` (`clientInfo`'s
+    /// `name`/`version`/optional `title`). Null before a handshake, or when
+    /// the client's `clientInfo` was missing or malformed — see
+    /// `ClientInfo.parse`. The returned slices are owned by this `Server` and
+    /// valid until the next `initialize` from the same peer or `forgetPeer`.
+    pub fn clientInfo(self: *const Server, peer: u64) ?ClientInfo {
+        return self.peerState(peer).client;
+    }
+
     /// Forget everything about `peer`: its handshake state and every pending
     /// server→client request issued to it. A multiplexing transport calls
     /// this when a session ends, so a `Server` that outlives many sessions
@@ -1717,6 +1829,7 @@ pub const Server = struct {
         }
         for (self.peers.items, 0..) |p, j| {
             if (p.peer == peer) {
+                if (p.client) |ci| ci.free(self.gpa);
                 _ = self.peers.orderedRemove(j);
                 return;
             }
@@ -2226,15 +2339,18 @@ pub const Server = struct {
         // back when supported; otherwise answer with our latest.
         var requested: ?[]const u8 = null;
         var caps: ?std.json.Value = null;
+        var client_info_raw: ?std.json.Value = null;
         if (params_opt) |params| {
             if (params == .object) {
                 if (params.object.get("protocolVersion")) |pv| {
                     if (pv == .string) requested = pv.string;
                 }
                 caps = params.object.get("capabilities");
+                client_info_raw = params.object.get("clientInfo");
             }
         }
         const version = negotiateVersion(requested);
+        const parsed_client_info = ClientInfo.parse(client_info_raw);
         // Record what the CLIENT can do: this is the gate on every server→client
         // request (see `ClientCapabilities`). A re-`initialize` replaces it
         // wholesale — capabilities never accumulate across handshakes — and it
@@ -2246,6 +2362,13 @@ pub const Server = struct {
         };
         slot.negotiated_version = version;
         slot.capabilities = ClientCapabilities.parse(caps);
+        // `clientInfo`'s strings live on this call's arena — dupe onto `gpa`
+        // BEFORE touching `slot.client` so a dupe failure (OOM) never frees
+        // the peer's previous, still-valid copy.
+        var new_client: ?ClientInfo = null;
+        if (parsed_client_info) |ci| new_client = try ci.dupe(self.gpa, self.max_client_info_field_len);
+        if (slot.client) |old| old.free(self.gpa);
+        slot.client = new_client;
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
@@ -4011,6 +4134,117 @@ test "initialize: client capabilities are captured (and replaced on re-handshake
     try testing.expect(!s.clientCapabilities(0).sampling);
     try testing.expect(!s.clientCapabilities(0).elicitation);
     try testing.expectEqualStrings("2025-06-18", s.negotiatedVersion(0));
+}
+
+fn dupeAndFreeClientInfo(gpa: std.mem.Allocator, ci: ClientInfo) !void {
+    const c = try ci.dupe(gpa, 256);
+    c.free(gpa);
+}
+
+test "ClientInfo.dupe frees what it copied when a later copy fails" {
+    const ci: ClientInfo = .{ .name = "n", .version = "v", .title = "t" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dupeAndFreeClientInfo, .{ci});
+}
+
+test "initialize: clientInfo is recorded (name, version, title present/absent)" {
+    var s = testServer(null);
+    defer s.deinit();
+    try testing.expect(s.clientInfo(0) == null);
+
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"acme-cli","version":"1.0.0","title":"Acme CLI"}}}
+    );
+    var ci = s.clientInfo(0).?;
+    try testing.expectEqualStrings("acme-cli", ci.name);
+    try testing.expectEqualStrings("1.0.0", ci.version);
+    try testing.expectEqualStrings("Acme CLI", ci.title.?);
+
+    // A second initialize replaces it wholesale, same as capabilities. No
+    // `title` this time -> absent, not the previous one lingering.
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"other-cli","version":"2.0.0"}}}
+    );
+    ci = s.clientInfo(0).?;
+    try testing.expectEqualStrings("other-cli", ci.name);
+    try testing.expectEqualStrings("2.0.0", ci.version);
+    try testing.expect(ci.title == null);
+}
+
+test "initialize: missing or malformed clientInfo never fails the handshake" {
+    var s = testServer(null);
+    defer s.deinit();
+
+    // No `clientInfo` field at all.
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+    );
+    try testing.expect(s.clientInfo(0) == null);
+
+    // `clientInfo` present but malformed (missing the spec-required
+    // `version`) -- per `ClientCapabilities`'s leniency convention this fails
+    // the recorded info closed (null), never the handshake itself: the
+    // negotiated version is still returned, not an error.
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"only-a-name"}}}
+    );
+    try testing.expect(s.clientInfo(0) == null);
+    try testing.expectEqualStrings("2025-11-25", s.negotiatedVersion(0));
+
+    // `clientInfo` not even an object.
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":"nope"}}
+    );
+    try testing.expect(s.clientInfo(0) == null);
+}
+
+test "initialize: an over-long clientInfo field is truncated, not rejected" {
+    var s = testServer(null);
+    defer s.deinit();
+    try testing.expect(s.max_client_info_field_len < 300); // the test assumes the default cap
+
+    const long_name = "a" ** 300;
+    const msg = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"1\"}}}}}}",
+        .{long_name},
+    );
+    defer testing.allocator.free(msg);
+    try feed(&s, msg);
+
+    const ci = s.clientInfo(0).?;
+    try testing.expectEqual(s.max_client_info_field_len, ci.name.len);
+    try testing.expect(std.mem.allEqual(u8, ci.name, 'a'));
+}
+
+test "initialize: re-handshake frees the previous clientInfo copy (no leak)" {
+    // Regression: `slot.client` used to be overwritten directly, so a second
+    // `initialize` from the same peer leaked the first `dupe`'d copy.
+    // `testing.allocator` (the gpa `testServer` builds `Server` on) catches
+    // that as a leak if `handleInitialize` ever regresses.
+    var s = testServer(null);
+    defer s.deinit();
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"first","version":"1","title":"First"}}}
+    );
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"second","version":"2"}}}
+    );
+    const ci = s.clientInfo(0).?;
+    try testing.expectEqualStrings("second", ci.name);
+    // `s.deinit()` (deferred above) must free this last copy too, and
+    // `testing.allocator` fails the test on any leftover allocation.
+}
+
+test "forgetPeer frees the peer's clientInfo copy too (no leak)" {
+    var s = testServer(null);
+    defer s.deinit();
+    try feed(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"gone","version":"1"}}}
+    );
+    try testing.expect(s.clientInfo(0) != null);
+    s.forgetPeer(0);
+    try testing.expect(s.clientInfo(0) == null);
+    // `s.deinit()` must not double-free or trip `testing.allocator` here.
 }
 
 test "ClientCapabilities.parse: the spec's declaration shapes" {
