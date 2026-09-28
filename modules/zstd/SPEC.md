@@ -1680,7 +1680,8 @@ to 600 KB × levels 11…22 without checksum, plus 14 cases golden at one level
 each, 15 compressed with long-distance matching switched on by hand and 13
 with index overflow correction run often (a small window set by hand, and
 libzstd built with `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`), also at one to
-three levels each (2029 frames), the length and
+three levels each, and 9 inputs laid out by hand for one boundary each
+(*Constructed boundaries* below) at one level (2038 frames), the length and
 SHA-256 of the frame libzstd v1.5.7 (`f8745da6`) emits via `ZSTD_compress2`.
 The optimal-parser levels cost 10–40× a lazy one, and the checksum trailer
 does not depend on the level, hence the narrower set there
@@ -1714,7 +1715,7 @@ Nine mutations still pass, and are left so on purpose:
 | `dfast` `idxl1 > prefixLowest` → `>=` | index 2 is never inserted, and the prefix only moves once the input passes the 2 MB window |
 | RLE block when `cSize < 25` → `< 24` | a block of one repeated byte compresses to far fewer than 24 bytes |
 | Huffman `largest <= n/128 + 4`, `total >= n - 1`, `hSize + 12 >= n`, sampled `largestTotal <= 68` | masked: at equality the literals are near-uniform and the section is stored raw by the `minGain` check that follows anyway |
-| `mostFrequent < nbSeq >> (log - 1)` → `<=` | reachable in principle; 50 000 generated inputs did not hit equality. **Uncovered.** |
+| `mostFrequent < nbSeq >> (log - 1)` → `<=` | covered since 2026-09-28 by a constructed case (`cseq-ml-most-frequent-edge`, *Constructed boundaries* below); 50 000 generated inputs had not hit equality |
 
 The lazy strategies (levels 4–8) got the same treatment on 2026-09-22: 43
 mutations of `lazy.zig`, the lazy half of `sequences.zig` and the new
@@ -1735,7 +1736,7 @@ the sweep, the hash salt:
 | `nextToUpdate` raised to `lowLimit` before a block | unreachable one-shot: insertion trails the parser by at most a block, the window's low end only moves once the input passes the window |
 | row `hashLog` cap `24 + rowLog` → `23 + rowLog` | unreachable at levels ≤ 10 (hash logs ≤ 23, cap ≥ 28); binds from level 22 |
 | hash salt → 0 | equivalent: the salt XORs every hash before the shift, a bijection on (row, tag) that leaves every collision in place — on a reused context too (see *Contexts*) |
-| `nbSeq >= 2048` → `>` in `ZSTD_NCountCost` | reachable in principle: a block of exactly 2048 sequences whose cost comparison flips on the low-probability rule; 4 000 generated seeds × 7 kinds × 6 sizes did not hit it. **Uncovered.** |
+| `nbSeq >= 2048` → `>` in `ZSTD_NCountCost` | covered since 2026-09-28 by a constructed case (`cseq-ncount-2048`, *Constructed boundaries* below); 4 000 generated seeds × 7 kinds × 6 sizes had not hit it |
 
 `btlazy2` (levels 9–10) followed on the same day: 35 mutations of the
 binary-tree code in `lazy.zig` and of `max_level`. 11 were caught by the
@@ -1766,8 +1767,8 @@ offsets btopt surcharges), and 33 survive:
 | predefined prices (literal 6 bits, offset `16 +`), the `srcSize <= 8` switch to them, `btultra2`'s `srcSize > 8` seeding pass; `ZSTD_BLOCKSIZE_MAX` literal length | unreachable: prices are predefined only for a first block of 8 bytes or less, where the parser (which stops 8 bytes before the end) never runs; a literal run of a whole 128 KB block likewise never reaches the parser |
 | `sufficient_len` cap 4095 → 4094; split estimate error `nbSeq * 10`; 196 → 195 splits; sequence buffer sized `/4` for `minMatch` 3 | unreachable: `targetLength` is at most 999; a table the estimate just built from the same counts represents every symbol; 196 profitable splits need ~30 000 sequences in one block; more than `blockSize / 4` sequences need matches under 4 bytes on average — the last only sizes a buffer (an overrun is a bounds panic, not a different frame) |
 | DUBT insertion `matchIndex > windowLow` → `>=`; DUBT `maxDistance` − 1 | equivalent without a dictionary (re-examined 2026-09-26, the size had been thought the obstacle): the parameters keep `chainLog <= windowLog + 1` (`ZSTD_adjustCParams`' cycle log), so `btLow = curr − (2^windowLog − 1)` already stops the tree at the window's last index; the node `>=` would link lies below every later search's own window. Only a dictionary (`dictAndWindowLog`) lets `chainLog` past that; not hunted there |
-| `insertBt1`'s window low at `curr` instead of `target` | reachable in principle: the extra node (older than the window at `target`) is cut off by every later search's window, so only its effect on `insertBt1`'s returned skip (a match over 384 bytes with it) could change the frame. Three constructed inputs (period 65 535 / 65 500 noise under `windowLog` 16, edits 1 in 64 and 1 in 2048, levels 13, 16, 19; libzstd's frames matched) did not show it. **Uncovered.** |
-| tree low end `matchIndex <= btLow` → `<` (insertion, both sides — `insertBt1` and DUBT); DUBT `unsortLimit` → `btLow` (differs only for a candidate at index 2); a 3-byte-hash match of exactly `targetLength`; a tree match of exactly 4096 bytes (`> ZSTD_OPT_NUM` → `>=`); split literal estimate thresholds (`largest <= n/128 + 4`, repeat when `old < n`, `hSize + 12 >= n`, `old <= hSize + new`); estimate header sizes at 1024 literals and 128 sequences | reachable in principle, each at an equality; ten minutes of seed search per mutation (tens of thousands of inputs of 70 KB–600 KB at the levels concerned) did not hit one. **Uncovered.** |
+| `insertBt1`'s window low at `curr` instead of `target` | covered since 2026-09-28 (`insertbt1-window`, *Constructed boundaries* below). Before: reachable in principle: the extra node (older than the window at `target`) is cut off by every later search's window, so only its effect on `insertBt1`'s returned skip (a match over 384 bytes with it) could change the frame. Three constructed inputs (period 65 535 / 65 500 noise under `windowLog` 16, edits 1 in 64 and 1 in 2048, levels 13, 16, 19; libzstd's frames matched) did not show it |
+| tree low end `matchIndex <= btLow` → `<` (insertion, both sides — `insertBt1` and DUBT); DUBT `unsortLimit` → `btLow` (differs only for a candidate at index 2); a 3-byte-hash match of exactly `targetLength`; a tree match of exactly 4096 bytes (`> ZSTD_OPT_NUM` → `>=`); split literal estimate thresholds (`largest <= n/128 + 4`, repeat when `old < n`, `hSize + 12 >= n`, `old <= hSize + new`); estimate header sizes at 1024 literals and 128 sequences | covered since 2026-09-28 by constructed cases (*Constructed boundaries* below), except two proved equivalent there: the estimate's header at 128 sequences, and `old <= hSize + new` for the post-splitter (a superblock case covers it). Ten minutes of seed search per mutation (tens of thousands of inputs of 70 KB–600 KB at the levels concerned) had not hit one |
 
 Long-distance matching (level 22) got its own sweep on 2026-09-22: 47
 mutations of `ldm.zig`, the LDM candidate code in `opt.zig`, the LDM switch
@@ -1786,7 +1787,7 @@ the 140 MB comparison below, and 16 survive:
 |---|---|
 | LDM window raising neither `lowLimit` nor `dictLimit` | reached only past 128 MB of input (window log 27); caught by `zref` on a 140 MB input whose last 10 MB repeat its first at a distance of 130 MB — the module's output matches libzstd's, both mutants do not |
 | hash log floor 6 → 7; `srcSize < minMatchLength` → `<=`; `literalsBytesRemaining >= blockBytesRemaining` → `>`; a candidate cut at the block end `>` → `>=`, or skipping its full length; the candidate's initial end position | equivalent: at a 1 KB window (the only place the floor binds) the table is one bucket that fewer than 64 splits never fill; a chunk of exactly the minimum length has no byte left to hash; at the equality the candidate starts and ends at the block end, where no position lies, and the store is discarded with the block; the first fetch overwrites the initial value |
-| backward extension stopping one byte above the prefix start; the last hashable byte (`ilimit`) one further; a split exactly at the previous match's end searched (`split < anchor` → `<=`); a table entry exactly at the lowest valid index; an overlapping match that ends exactly where hashing stopped (`>` → `>=`); continuing the batch after skipping an overlap; a batch of 32; another XXH64 seed; the checksum from bits 31..62; a candidate of exactly `minMatch` | reachable in principle; four minutes of seed search each (about 2 000 inputs of 3–600 KB at levels 16–22, 300 000 of 40 B–2.5 KB for the two small-window ones) did not hit one. The index equality needs the window past 128 MB. **Uncovered.** |
+| backward extension stopping one byte above the prefix start; the last hashable byte (`ilimit`) one further; a split exactly at the previous match's end searched (`split < anchor` → `<=`); a table entry exactly at the lowest valid index; an overlapping match that ends exactly where hashing stopped (`>` → `>=`); continuing the batch after skipping an overlap; a batch of 32; another XXH64 seed; the checksum from bits 31..62; a candidate of exactly `minMatch` | covered since 2026-09-28 by one parameter case (`words-16384` with LDM, splits at almost every byte, 1.5 KB blocks and a 2 KB window: *Constructed boundaries* below), except the checksum from bits 31..62, proved equivalent there. Four minutes of seed search each at levels 16–22 with LDM's own parameters had not hit one |
 
 Long-distance matching as an option (Z7, 2026-09-24) got 38 mutations of
 the LDM path below `btopt` (`ldm.blockCompress` and its helpers, the table
@@ -2393,8 +2394,8 @@ match finder reads), 6 equivalent, 2 uncovered:
 | no-delimiter copier: `start_pos >= lit_length` → `>`; `second_half < minMatch` → `<=`; `end_pos > lit_length` → `>=` in the split branch | equivalent: at each equality both branches leave the same lengths (a literal length of 0, an adjustment of 0, a first half of 0 that falls to the same "end before the match") |
 | `ZSTD_convertBlockSequences`' history without resolution for 3 sequences (`>= 4` → `> 4`, the 2-sequence branch's `rep[2]`) | equivalent: `compressSequencesAndLiterals` has no match finder and no later reader of the history unless repcode resolution is on, and then this branch does not run |
 | the empty-frame special case of `compressSequencesAndLiterals` dropped | equivalent: every path through it fails anyway (a 1-byte block size leaves room for no sequence) |
-| a producer's trailing delimiter not recognised (appended again) | reachable only when the producer fills its whole buffer, `sequenceBound(block)` sequences, which needs zero-length sequences; the example producer makes none. **Uncovered.** |
-| the collector's history updated with the long literal length (`+ 0x10000`) instead of the stored 16 bits | differs only for a literal length of exactly 65 536 before a match in `generateSequences`. **Uncovered.** |
+| a producer's trailing delimiter not recognised (appended again) | covered since 2026-09-28: the example producer's mode bit 12 pads its parse with empty delimiters to the whole buffer, which libzstd reads past the first one (`prod-full-buffer`); the mutant refuses it |
+| the collector's history updated with the long literal length (`+ 0x10000`) instead of the stored 16 bits | covered since 2026-09-28 by an input laid out for it (`gen-ll-65536`): a repcode match after exactly 65 536 literals, then another; libzstd reports the second one's offset from the history it updated as if the literal length were 0 (1 rather than 1000 -- a libzstd bug the port keeps: the output no longer rebuilds its input) |
 
 The LDM raw-sequence mutations Z7 left (`maybeSplitSequence`,
 `ZSTD_ldm_skipSequences`; 9 as swept here) were run against multithreaded
@@ -2411,6 +2412,69 @@ the skip's `src_size < ml` → `<=`, where a 0-byte match carries 0
 literals). (A first hunt driver rejected `jobSize` on both sides and
 compared stale files; the finds above were each checked by hand against
 `zref`.)
+
+**Constructed boundaries** (Z25, 2026-09-28). The compressor's
+reachable boundaries that the seed searches above never hit got a case
+each, built rather than searched for: the input bytes, the parameters,
+and -- where statistics decide -- the exact sequences, handed over through
+`compressSequences` or replayed by the example producer (`prod:8192`:
+mode bit 13 returns the case's hand-made list block by block; bit 12 pads
+its parse with empty delimiters to the whole buffer). For each: the
+equality derived from libzstd's and the port's source, a counter at the
+comparison in a throwaway copy showing the case reaches it, the mutant
+(one schemata build, `<` for `<=` and the like) giving other bytes (or a
+safety panic) on it, and the bytes libzstd gives pinned in the golden
+lists. Inputs that are not corpus cases already are `laid_out` layouts in
+`corpus.zig` (`laidOut` says how each one works); every case matched
+libzstd the first time.
+
+| boundary | case |
+|---|---|
+| a producer filling its whole buffer, trailing delimiter last | `prod-full-buffer` |
+| `generateSequences`' history after a literal length of exactly 65 536 | `gen-ll-65536` (input `ll-65536`, level 13) |
+| `mostFrequent < nbSeq >> (log - 1)` below `lazy` | `cseq-ml-most-frequent-edge`: 320 sequences, match-length codes 1..32 ten times each |
+| `ZSTD_NCountCost`'s low-probability counts from exactly 2048 sequences | `cseq-ncount-2048`: a match-length histogram over 2048 sequences (found by a search over histograms with the module's own cost functions) on which a new table beats the predefined one by 3 bits with the rule and loses by 5 without |
+| a tree match of exactly `ZSTD_OPT_NUM` (4096) goes on searching | `tree-4096`, level 13 |
+| a 3-byte-hash match of exactly `targetLength` goes on into the tree | `hash3-target`, level 14 |
+| `insertBt1`'s window from the target, not the inserted position | `insertbt1-window` with `windowLog=10,targetLength=4`, level 13: a 2000-byte repeat 700 back makes the tree update insert its last 708 positions at once; at the position's own window their twins 700 back would give matches over 384 bytes and skip later insertions a 40-byte copy then needs |
+| the tree's low end in `insertBt1` (`<=`, both sides) | `two-symbols-16384-0` with `strategy=7,windowLog=10,chainLog=6,targetLength=4,minMatch=4`, level 16 |
+| ... and in DUBT insertion, both sides | `two-symbols-16384-0` with `strategy=6,windowLog=10,chainLog=6,searchLog=3`, level 12 |
+| DUBT's unsorted walk limited by the window too (`unsortLimit` → `btLow`) | a stream case: `words-16384`, `strategy=6,chainLog=11,windowLog=10,searchLog=1,e8192,e*`, level 12 -- the second frame continues the first one's window, whose entries lie below the new low limit; the mutant walks into them and overflows an index (a panic in ReleaseSafe). "Only a candidate at index 2" (above) held for a fresh context alone |
+| the post-splitter's "no gain" (`largest <= n/128 + 4`) | `prod-split-largest`: the whole block's literals exactly at the limit, each half Huffman-coded |
+| a split half of exactly 1024 literals (header 4 bytes, not 3) | `prod-split-1024`: halves and whole estimated to exactly 0 bytes of gain |
+| the previous table at exactly `n` bytes (`old < n`) | `prod-split-repeat`: a first block leaves dyadic 1/7/8/9-bit codes; 70 literals of 7, 8 and 9 bits cost exactly 8 bits each under them and do not shrink under their own; a knob (46 matches one byte longer) sets the halves' estimates 1 byte above the whole's, and the old table's estimate would add 3 to the whole |
+| `old <= hSize + new` at equality | `prod-superblock-repeat` (a superblock: kept old table against a new one written) |
+| `hSize + 12 >= n` at equality | `prod-superblock-h12`, under a full dictionary (`zd-words`) |
+| LDM: backward extension down to the prefix start; the last hashable byte; a split exactly at the previous match's end; an entry exactly at the lowest valid index; a match ending exactly where hashing stopped; the batch left after such a skip; the batch size; the XXH64 seed; a forward match of exactly `minMatchLength` | one parameter case, `words-16384` with `enableLongDistanceMatching=1,windowLog=11,maxBlockSize=1500,ldmHashRateLog=1,ldmMinMatch=4`, level 1 (splits at almost every byte, a window that slides every block, sequences taken as they are below `btopt`); all nine mutants give other bytes |
+
+Proved equivalent instead, like the proofs above:
+
+- The post-splitter's sequence header at exactly 128 sequences
+  (`nbSeq >= 128` → `>`): `ZSTD_deriveBlockSplits` estimates only ranges
+  of at least 300 sequences and their halves, so every estimate is of 150
+  sequences or more; nothing else calls that estimate.
+- The post-splitter's `old <= hSize + new` at equality: the repeat
+  estimate (`old` plus the headers) and the new table's (`new + hSize`
+  plus the same headers) are then the same number. Superblocks, which
+  share the function, act on the choice itself, and are covered.
+- `hSize + 12 >= n` without a dictionary is unreachable: the two choices
+  differ only when `hSize + new < old < n = hSize + 12`, i.e. `new < 12`
+  bytes, so at most 95 literals, while without a dictionary's valid table
+  literals are considered only from 64; a header of 52 bytes or more for
+  a table of so few symbols is never written (its weights compress, and
+  the raw form needs over 100 symbols).
+- LDM's checksum from bits 31..62 rather than 32..63: the checksum only
+  filters candidates before the forward count, and a candidate whose
+  hashed `minMatchLength` bytes differ fails that count anyway, so no
+  choice of the checksum's bits changes a match; equal bytes give equal
+  checksums either way.
+
+The case for `generateSequences` after 65 536 literals shows a libzstd
+bug the port keeps (byte-identical output): `ZSTD_copyBlockSequences`
+updates its offset history from the 16 bits the sequence store keeps, 0
+for 65 536, so a repcode after it is reported against the wrong history
+(offset 1 rather than 1000 in `ll-65536`), and the sequences no longer
+rebuild their input; `seq_test.zig` skips that check for this case.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -2995,14 +3059,6 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 
 ## Open
 
-- Sequences (Z10): a producer that fills its whole buffer with a
-  trailing delimiter, and a literal length of exactly 65 536 in
-  `generateSequences`, have no case (see *Anchoring*).
-- Reachable boundaries without a case: the sequence encoding-type
-  heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality, the table
-  pricing's low-probability switch at exactly 2048 sequences, and 13
-  equalities in the optimal parsers and the post-splitter's estimates, and
-  10 in long-distance matching (see *Anchoring*).
 - Dictionaries (Z2c mutation sweep, widened per the coordinator's request:
   48 mutations across every bounds/length check and error branch of
   `loadDEntropy` and its header parsing, the content-type dispatch, dictID

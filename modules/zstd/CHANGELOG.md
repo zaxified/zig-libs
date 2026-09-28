@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Tests only (Z25): the compressor's reachable boundaries
+  that seed searches never hit got a constructed case each -- 9 corpus
+  inputs laid out by hand (`laid_out`), 9 sequence-API cases (hand-made
+  lists through `compressSequences` or replayed by the example producer,
+  new mode bits 12 and 13 in `tools/zseq.c` and `seq_test.zig`), 4
+  parameter cases and 1 two-frame stream case, all byte-identical to
+  libzstd: 26 boundary mutants of the sequence API, the encoding-type
+  heuristic, the table pricing, the optimal parsers' trees, the
+  post-splitter's and superblocks' literal statistics and long-distance
+  matching are now killed, 2 more proved equivalent (SPEC.md, *Anchoring*,
+  *Constructed boundaries*). Found on the way: libzstd's
+  `ZSTD_generateSequences` reports a wrong offset after a literal length of
+  exactly 65 536 (kept, byte-identical).
 - **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
   ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
   after the next call take the new level, as libzstd's

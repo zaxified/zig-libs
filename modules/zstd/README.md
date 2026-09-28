@@ -50,10 +50,11 @@ libc.
 - **Output:** one frame, content size in the header, optional content checksum
   (`checksum = true`). Byte-identical to `ZSTD_compress2()` with the same
   level and checksum setting — pinned by the golden test on a 56-case corpus
-  (2029 frames: every case at levels -5…10 with and without checksum, cases up
+  (every case at levels -5…10 with and without checksum, cases up
   to 600 KB at levels 11–22, 14 cases found by mutation testing at the one
   level each pins, 15 compressed with long-distance matching switched
-  on by hand, and 13 with index overflow correction run often), and against
+  on by hand, 13 with index overflow correction run often, and 9 inputs laid
+  out by hand for one compressor boundary each: 2038 frames), and against
   libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
   3500 MiB index limit.
 - **Speed:** within about 10 % of libzstd at every level, one-shot and
@@ -518,7 +519,7 @@ need checking — the way it is used, content type, parameters, levels
 (`src/testdata/cdict_goldens.zig`), which the recipe also decodes back
 with the dictionary.
 
-`src/seq_test.zig` does it for the sequence-level API: 118 cases, 172 rows
+`src/seq_test.zig` does it for the sequence-level API: 127 cases, 181 rows
 (`generateSequences` at every strategy family, with the post-splitter,
 LDM and a dictionary; `compressSequences` with and without delimiters,
 repcode resolution both ways, validation, small and RLE blocks, damaged
