@@ -456,8 +456,13 @@ pub const OutBuffer = stream.OutBuffer;
 pub const stream_max_level = stream.max_level;
 
 /// Decoding context (libzstd's `ZSTD_DCtx`): reuse it across calls to
-/// avoid reallocating its ~190 KB of tables.
+/// avoid reallocating its ~160 KB of tables, or place them in a caller's
+/// `Workspace` (`initStatic`, `ZSTD_initStaticDCtx`).
 pub const Decompressor = dec.Decompressor;
+/// `ZSTD_estimateDCtxSize`: the memory a `Decompressor` holds besides its
+/// handle, exactly (this port's, not libzstd's number), and the smallest
+/// workspace `Decompressor.initStatic` takes.
+pub const estimateDecompressorSize = dec.estimateDCtxSize;
 pub const DecompressOptions = dec.Options;
 /// Errors named after libzstd's error codes (`ZSTD_error_*`).
 pub const DecompressError = dec.Error;
@@ -501,6 +506,16 @@ pub const DecompressStreamOptions = dstream.Options;
 pub const DecompressStreamError = dstream.Error;
 /// A `std.Io.Reader` of the decompressed content of another reader.
 pub const DecompressReader = dstream.Reader;
+/// `ZSTD_estimateDStreamSize`: the memory a `DecompressStream` with these
+/// options holds besides its handle for a frame of window `window_size`
+/// and unknown content size -- exactly, and an upper bound for any frame
+/// with a smaller window; the smallest workspace
+/// `DecompressStream.initStatic` decodes such frames in. See
+/// dstream.zig.
+pub const estimateDecompressStreamSize = dstream.estimateSize;
+/// `ZSTD_estimateDStreamSize_fromFrame`: as `estimateDecompressStreamSize`,
+/// exactly for the frame whose header starts `src`.
+pub const estimateDecompressStreamSizeFromFrame = dstream.estimateSizeFromFrame;
 
 /// Decode every frame in `src` into `dst` (`ZSTD_decompress`): returns
 /// the number of bytes written. Concatenated and skippable frames are
@@ -575,6 +590,7 @@ test {
     _ = @import("golden_test.zig");
     _ = @import("param_test.zig");
     _ = @import("context_test.zig");
+    _ = @import("dctx_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("dict_builder.zig");
     _ = @import("zdict.zig");

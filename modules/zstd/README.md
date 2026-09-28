@@ -99,7 +99,7 @@ const n = try zstd.compress(gpa, buf, data, .{ .level = 1, .checksum = true });
 // Decode: into a new buffer sized from the header (at most max_size) ...
 const back = try zstd.decompressAlloc(gpa, frame, 1 << 30);
 defer gpa.free(back);
-// ... or into your own; reuse a Decompressor to keep its ~190 KB of tables.
+// ... or into your own; reuse a Decompressor to keep its ~160 KB of tables.
 var dec = try zstd.Decompressor.init(gpa, .{});
 defer dec.deinit();
 const out = try gpa.alloc(u8, data.len);
@@ -150,6 +150,26 @@ returns 0 when a frame is fully decoded and flushed. It keeps one window
 plus two blocks of output ring and refuses frames asking for more than a
 128 MB window unless `window_log_max` says otherwise (libzstd's default);
 `stable_output` decodes straight into a caller's buffer that stays put.
+`max_block_size` (`ZSTD_d_maxBlockSize`, 1 KiB..128 KiB, both decoders)
+refuses frames with larger blocks, as libzstd does, and shrinks the
+stream's buffers to match -- for frames made with the compressor's
+`advanced.max_block_size`.
+
+The decoder's memory is known in advance, exactly, and can be the caller's
+(`ZSTD_initStaticDCtx` / `DStream` / `DDict`) -- nothing is allocated, and a
+frame needing more is `error.OutOfMemory`:
+
+```zig
+const opts: zstd.DecompressStreamOptions = .{ .max_window_size = 1 << 20 };
+const size = try zstd.estimateDecompressStreamSize(1 << 20, opts); // any frame up to a 1 MiB window
+const ws = try gpa.alignedAlloc(u8, .fromByteUnits(zstd.workspace_alignment), size);
+var s = try zstd.DecompressStream.initStatic(ws, opts);
+// one-shot: zstd.Decompressor.initStatic(ws, .{}) in estimateDecompressorSize() bytes;
+// a dictionary: zstd.DDict.initStatic(dws, dict, .auto, true) in DDict.estimateSize(dict.len, true)
+```
+
+`estimateDecompressStreamSizeFromFrame(header, opts)` sizes for one frame
+exactly; `Decompressor.copyFrom` is `ZSTD_copyDCtx`.
 
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns. For many frames, keep a context — its one
@@ -531,6 +551,11 @@ libzstd's, or failing with libzstd's error (`src/testdata/seq_goldens.zig`,
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced
 when too small or long too big, and indexing restarting near its limit.
+`src/dctx_test.zig` does it for the decoder (a workspace of each estimate
+decodes, one byte less does not, over the window and block-size grid),
+and pins `max_block_size` against libzstd: 240 verdicts and buffer sizes
+on libzstd-made frames (`src/testdata/mbs_kats.zig`,
+`tools/gen-mbs-kats.sh`), and `copyFrom`.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
 this one, and feeds the decoder arbitrary bytes one-shot, streamed and

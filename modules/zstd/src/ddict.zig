@@ -59,6 +59,9 @@ pub const DDict = struct {
     content: []const u8,
     /// Set when `content` is an owned copy (`init`), freed by `deinit`.
     owned: bool = false,
+    /// Set when `content` is a copy, owned (`init`) or in a caller's
+    /// workspace (`initStatic`): `memorySize` counts it.
+    copied: bool = false,
     /// `ZSTD_getDictID_fromDDict`: 0 for a raw-content dictionary or one
     /// too short / without the magic number.
     dict_id: u32 = 0,
@@ -69,9 +72,42 @@ pub const DDict = struct {
     pub fn init(gpa: std.mem.Allocator, dict: []const u8, content_type: DictContentType) (error{OutOfMemory} || Error)!DDict {
         const buf = try gpa.dupe(u8, dict);
         errdefer gpa.free(buf);
-        var d: DDict = .{ .content = buf, .owned = true };
+        var d: DDict = .{ .content = buf, .owned = true, .copied = true };
         try d.loadEntropy(content_type);
         return d;
+    }
+
+    /// `ZSTD_initStaticDDict`: with `copied` (`ZSTD_dlm_byCopy`) the
+    /// content is copied into the first `dict.len` bytes of the caller's
+    /// `workspace`, which must outlive the `DDict` and is never freed by it
+    /// (a smaller one is `error.OutOfMemory`); without (`ZSTD_dlm_byRef`)
+    /// `dict` is referenced and the workspace is not used, as
+    /// `initByReference`. The entropy tables live in the `DDict` value
+    /// itself: `estimateSize` is all the memory besides it.
+    pub fn initStatic(workspace: []u8, dict: []const u8, content_type: DictContentType, copied: bool) (error{OutOfMemory} || Error)!DDict {
+        if (!copied) return initByReference(dict, content_type);
+        if (workspace.len < dict.len) return error.OutOfMemory;
+        const buf = workspace[0..dict.len];
+        @memcpy(buf, dict);
+        var d: DDict = .{ .content = buf, .copied = true };
+        try d.loadEntropy(content_type);
+        return d;
+    }
+
+    /// `ZSTD_estimateDDictSize`: the memory a `DDict` of `dict_size` bytes
+    /// takes besides the `DDict` value -- its content, when `copied` (by
+    /// `init` or `initStatic`), else nothing -- and so the smallest
+    /// workspace `initStatic` takes. Exact for this port; libzstd's also
+    /// counts its struct, which holds the entropy tables (27 352 bytes on
+    /// x86-64).
+    pub fn estimateSize(dict_size: usize, copied: bool) usize {
+        return if (copied) dict_size else 0;
+    }
+
+    /// `ZSTD_sizeof_DDict` less the `DDict` value: the copied content, if
+    /// any (`estimateSize`).
+    pub fn memorySize(d: *const DDict) usize {
+        return estimateSize(d.content.len, d.copied);
     }
 
     /// `ZSTD_createDDict_advanced` with `ZSTD_dlm_byRef`: `dict` must
