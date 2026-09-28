@@ -80,16 +80,60 @@ pub const Csrf = struct {
         return out;
     }
 
-    /// Whether `presented` is a valid token for `session_id`. Decodes both to
-    /// raw MACs and compares with `std.crypto.timing_safe.eql` — never
+    /// Whether `presented_tok` is a valid token for `session_id`. Decodes both
+    /// to raw MACs and compares with `std.crypto.timing_safe.eql` — never
     /// `std.mem.eql`. A wrong length or non-hex token is rejected (false).
-    pub fn verify(c: *const Csrf, session_id: []const u8, presented: []const u8) bool {
-        if (presented.len != token_hex_len) return false;
+    pub fn verify(c: *const Csrf, session_id: []const u8, presented_tok: []const u8) bool {
+        if (presented_tok.len != token_hex_len) return false;
         var got: [mac_length]u8 = undefined;
-        _ = std.fmt.hexToBytes(&got, presented) catch return false;
+        _ = std.fmt.hexToBytes(&got, presented_tok) catch return false;
         var want: [mac_length]u8 = undefined;
         Hmac.create(&want, session_id, &c.key);
         return std.crypto.timing_safe.eql([mac_length]u8, want, got);
+    }
+
+    /// The token presented on `req`: the header value first, then the
+    /// query-parameter fallback. Both trimmed; empty counts as absent. Public
+    /// so a caller driving the core `Csrf`/`sessions` API directly — without
+    /// `router`'s `middleware` — can extract the token the same way the
+    /// middleware does instead of copying this logic (requested for qap
+    /// M11.4, 2026-09-27: qap's own `src/sessions.zig` had a private
+    /// `presentedToken` duplicate). `middlewareRun` and `check` both call this
+    /// one implementation, so they cannot drift apart.
+    pub fn presented(c: *const Csrf, req: *const http.Server.Request) ?[]const u8 {
+        if (req.header(c.header_name)) |v| {
+            const t = std.mem.trim(u8, v, " \t");
+            if (t.len != 0) return t;
+        }
+        if (queryValue(req.query, c.form_field)) |v| {
+            if (v.len != 0) return v;
+        }
+        return null;
+    }
+
+    /// The whole CSRF guard, minus the middleware's 403 response: true iff
+    /// `req` carries a session cookie AND a presented token (`presented`,
+    /// above) AND that token `verify`s against the session id — the exact
+    /// three conditions `middlewareRun` requires before letting a guarded
+    /// method through, evaluated here through the same `presented`/`verify`
+    /// calls so the two can never disagree (`middlewareRun` calls `check`
+    /// itself, see below).
+    ///
+    /// **Does not apply the middleware's safe-method exemption** — `check`
+    /// never looks at `req.method`, so it does not treat GET/HEAD as
+    /// automatically valid. That is the deliberate choice: a caller reaching
+    /// for `check` directly (bypassing the middleware, e.g. from a
+    /// hidden-form-field handler) is asking "is this a valid token for this
+    /// session", full stop, for whatever method the request actually used —
+    /// silently returning `true` for a method the caller never asked to
+    /// exempt would be the surprising behaviour. The middleware supplies the
+    /// method exemption itself, by only calling `check` for the methods in
+    /// `c.methods` (see `middlewareRun`); safe methods take a separate path
+    /// (no token required, a fresh one issued instead).
+    pub fn check(c: *const Csrf, req: *const http.Server.Request) bool {
+        const session_id = cookies.get(req, c.session_cookie) orelse return false;
+        const presented_tok = c.presented(req) orelse return false;
+        return c.verify(session_id, presented_tok);
     }
 
     /// A `router.Middleware` enforcing the guard. Place it after the sessions
@@ -131,18 +175,20 @@ pub const Csrf = struct {
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const c: *const Csrf = @ptrCast(@alignCast(state.?));
-    const sid = cookies.get(ctx.req, c.session_cookie);
 
+    // Guarded method: the whole decision is `check` (session cookie +
+    // presented token + verify) — this is the one call site, so the
+    // middleware and `Csrf.check` can never drift apart.
     if (guarded(c.methods, ctx.req.method)) {
-        const session_id = sid orelse return forbidden(ctx);
-        const presented = presentedToken(c, ctx.req) orelse return forbidden(ctx);
-        if (!c.verify(session_id, presented)) return forbidden(ctx);
+        if (!c.check(ctx.req)) return forbidden(ctx);
         return next.run(ctx);
     }
 
     // Safe method: run, then hand back a fresh token to echo next time.
     try next.run(ctx);
-    if (c.issue_on_safe) if (sid) |session_id| c.issue(ctx.res, session_id);
+    if (c.issue_on_safe) {
+        if (cookies.get(ctx.req, c.session_cookie)) |session_id| c.issue(ctx.res, session_id);
+    }
 }
 
 fn guarded(methods: []const http.Method, m: http.Method) bool {
@@ -150,19 +196,6 @@ fn guarded(methods: []const http.Method, m: http.Method) bool {
         if (g == m) return true;
     }
     return false;
-}
-
-/// The token presented on the request: the header value first, then the
-/// query-parameter fallback. Both trimmed; empty counts as absent.
-fn presentedToken(c: *const Csrf, req: *const http.Server.Request) ?[]const u8 {
-    if (req.header(c.header_name)) |v| {
-        const t = std.mem.trim(u8, v, " \t");
-        if (t.len != 0) return t;
-    }
-    if (queryValue(req.query, c.form_field)) |v| {
-        if (v.len != 0) return v;
-    }
-    return null;
 }
 
 /// First value of query parameter `name` in a raw `k=v&k2=v2` string, verbatim.
@@ -410,4 +443,128 @@ test "middleware: query-parameter fallback token is accepted" {
     defer testing.allocator.free(req);
     var out: [4096]u8 = undefined;
     try expectStatus(runWire(&r, req, &out), "200");
+}
+
+// ── Csrf.presented / Csrf.check (public core API) ──────────────────────────
+//
+// These handlers reach the `Csrf` under test through `ctx.state` (the
+// Router's application-state slot), the same way a real app's routes would,
+// rather than through the middleware -- `presented`/`check` are meant to be
+// usable by a caller who is NOT running `Csrf.middleware` at all.
+
+fn hReportPresented(ctx: *router.Ctx) anyerror!void {
+    const c: *const Csrf = @ptrCast(@alignCast(ctx.state.?));
+    if (c.presented(ctx.req)) |p| {
+        try ctx.res.writeAll(p);
+    } else {
+        try ctx.res.writeAll("<absent>");
+    }
+}
+
+fn hReportCheck(ctx: *router.Ctx) anyerror!void {
+    const c: *const Csrf = @ptrCast(@alignCast(ctx.state.?));
+    try ctx.res.writeAll(if (c.check(ctx.req)) "true" else "false");
+}
+
+test "Csrf.presented: header, query fallback, header wins, absent" {
+    const c = Csrf{ .key = @splat(0x66) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.get("/p", hReportPresented);
+
+    var out1: [4096]u8 = undefined;
+    const header_only = runWire(&r, "GET /p HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: from-header\r\nConnection: close\r\n\r\n", &out1);
+    try testing.expect(std.mem.endsWith(u8, header_only, "from-header"));
+
+    var out2: [4096]u8 = undefined;
+    const query_only = runWire(&r, "GET /p?csrf_token=from-query HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out2);
+    try testing.expect(std.mem.endsWith(u8, query_only, "from-query"));
+
+    // Both present -> header wins (matches presentedToken's original order).
+    var out3: [4096]u8 = undefined;
+    const both = runWire(&r, "GET /p?csrf_token=from-query HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: from-header\r\nConnection: close\r\n\r\n", &out3);
+    try testing.expect(std.mem.endsWith(u8, both, "from-header"));
+
+    var out4: [4096]u8 = undefined;
+    const absent = runWire(&r, "GET /p HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out4);
+    try testing.expect(std.mem.endsWith(u8, absent, "<absent>"));
+}
+
+test "Csrf.check: false on missing cookie, false on wrong token, true on the right one" {
+    const c = Csrf{ .key = @splat(0x77) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.get("/c", hReportCheck);
+
+    var buf: [token_hex_len]u8 = undefined;
+    const tok = c.token("sess1", &buf);
+
+    // A valid-looking token but no session cookie at all -> false.
+    const req1 = try std.fmt.allocPrint(testing.allocator, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
+    defer testing.allocator.free(req1);
+    var out1: [4096]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, runWire(&r, req1, &out1), "false"));
+
+    // Session cookie present, but the token does not verify -> false.
+    var out2: [4096]u8 = undefined;
+    const wrong_token = runWire(&r, "GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: " ++ ("0" ** token_hex_len) ++ "\r\nConnection: close\r\n\r\n", &out2);
+    try testing.expect(std.mem.endsWith(u8, wrong_token, "false"));
+
+    // Session cookie + the matching token -> true.
+    const req3 = try std.fmt.allocPrint(testing.allocator, "GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
+    defer testing.allocator.free(req3);
+    var out3: [4096]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, runWire(&r, req3, &out3), "true"));
+}
+
+/// Runs only if `middlewareRun`'s guarded branch already decided `c.check`
+/// was true for this exact `ctx.req` -- asserting it again here from inside
+/// the handler pins that the two can never disagree, since `middlewareRun`
+/// calls the very same `check` (see the middleware source) rather than a
+/// second, independently-written copy of the guard logic.
+fn hOkAndCheckAgrees(ctx: *router.Ctx) anyerror!void {
+    const c: *const Csrf = @ptrCast(@alignCast(ctx.state.?));
+    try testing.expect(c.check(ctx.req));
+    try ctx.res.writeAll("ok");
+}
+
+test "middleware and Csrf.check agree: a request the middleware lets through also passes check" {
+    const c = Csrf{ .key = @splat(0x88) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.use(c.middleware());
+    try r.post("/", hOkAndCheckAgrees);
+
+    var buf: [token_hex_len]u8 = undefined;
+    const tok = c.token("sess-agree", &buf);
+    const req = try std.fmt.allocPrint(testing.allocator, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess-agree\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok});
+    defer testing.allocator.free(req);
+    var out: [4096]u8 = undefined;
+    const got = runWire(&r, req, &out);
+    try expectStatus(got, "200");
+    try testing.expect(std.mem.endsWith(u8, got, "ok"));
+}
+
+test "middleware and Csrf.check agree: a request the middleware 403s also fails check" {
+    const c = Csrf{ .key = @splat(0x99) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.use(c.middleware());
+    try r.post("/", hOk);
+    // Same Csrf/session shape, reached through a SAFE (unguarded) method so
+    // the handler runs and can report `check` directly on an otherwise
+    // identical request -- no token presented, same session cookie.
+    try r.get("/check-mirror", hReportCheck);
+
+    var out_post: [4096]u8 = undefined;
+    const denied = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess-deny\r\nConnection: close\r\n\r\n", &out_post);
+    try expectStatus(denied, "403");
+
+    var out_get: [4096]u8 = undefined;
+    const mirrored = runWire(&r, "GET /check-mirror HTTP/1.1\r\nHost: t\r\nCookie: session=sess-deny\r\nConnection: close\r\n\r\n", &out_get);
+    try testing.expect(std.mem.endsWith(u8, mirrored, "false"));
 }

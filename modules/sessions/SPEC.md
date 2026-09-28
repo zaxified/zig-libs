@@ -127,7 +127,7 @@ connection server) built its `Config.sessions` on them.
 
 ## Verification
 
-34 offline tests in `scripts/modtest sessions` (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
+38 offline tests in `scripts/modtest sessions` (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
 core (10): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
 regenerate (old id dead / data carried), **cross-request race — stale save cannot resurrect a
 concurrently destroyed session**, **cross-request race — stale save cannot resurrect a concurrently
@@ -139,10 +139,13 @@ cap 256) do not evict a logged-in session**, `keep()` persists an unwritten sess
 `persist_untouched_sessions` restores storing every new session, revoke
 expires+evicts, same-request revoke does not get resurrected by the trailing save, same-request
 regenerate persists only the new id (old id stays dead, post-rotation data survives),
-small-buffer early-flush (no cookie-buffer corruption). CSRF (6): token/verify round-trip + tamper,
+small-buffer early-flush (no cookie-buffer corruption). CSRF (10): token/verify round-trip + tamper,
 per-key distinctness, safe-GET issues a non-HttpOnly cookie, POST 403 without a token / 200 with
-the right one, cross-session token rejected, query-param fallback. Plus the dark-tests aggregator
-pulling in `csrf.zig`. Run: `zig build test-sessions`.
+the right one, cross-session token rejected, query-param fallback, **`presented`** (header, query
+fallback, header wins over query, absent), **`check`** (false: no session cookie / wrong token;
+true: matching session cookie + token), **middleware/`check` agreement** (a request the middleware
+lets through also passes `check`; a request the middleware 403s also fails `check`). Plus the
+dark-tests aggregator pulling in `csrf.zig`. Run: `zig build test-sessions`.
 
 ## Backlog / deferred
 
@@ -167,11 +170,16 @@ pulling in `csrf.zig`. Run: `zig build test-sessions`.
   concurrent data writes.
 - **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
   design notes); callers use `Csrf.verify` directly.
-- **Public `Csrf.presented(req)`** (from qap M11.4, 2026-09-27) — the header-then-query token
-  extraction is the private `presentedToken`, so a caller that uses the core without the `router`
-  middleware (qap's `src/sessions.zig` `presentedToken`) has to copy it. Expose it, and a
-  `Csrf.check(req) bool` (session cookie + presented token + `verify`), which is the whole guard
-  minus the middleware's 403.
+- ~~**Public `Csrf.presented(req)`**~~ — **DONE 2026-09-28** (requested by qap M11.4). The
+  header-then-query token extraction that used to be the private `presentedToken` is now
+  `pub fn presented(c: *const Csrf, req) ?[]const u8` — same extraction order (header, then the
+  query-param fallback), so a caller driving the core `Csrf` API without `router`'s `middleware`
+  no longer has to copy it. Also added `pub fn check(c: *const Csrf, req) bool`: the whole guard
+  minus the middleware's 403 — session cookie present, a token `presented`, and it `verify`s.
+  `check` deliberately does **not** apply the middleware's safe-method exemption (it never reads
+  `req.method`), so it cannot surprise a caller into treating an unchecked GET as valid — only
+  `middleware` special-cases safe methods. `middlewareRun` was refactored to call `c.check`
+  itself for the guarded branch, so the two can no longer drift.
 
 ## Status
 

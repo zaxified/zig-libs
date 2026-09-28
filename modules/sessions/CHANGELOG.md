@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Csrf`: the private header-then-query token extraction (`presentedToken`) is
+  now public as `Csrf.presented(req)`, same extraction order, unchanged. Added
+  `Csrf.check(req) bool` — the whole CSRF guard minus the middleware's 403 response: session
+  cookie present, a token `presented`, and it `verify`s. Requested by qap M11.4 (2026-09-27):
+  qap's own core-only sessions usage had to duplicate `presentedToken` to guard requests without
+  going through `router`'s `Csrf.middleware`. `check` does **not** apply the middleware's
+  safe-method exemption — it never reads `req.method` — so it cannot silently report a valid
+  guard for an unchecked GET; only `middleware` special-cases safe methods. `middlewareRun` now
+  calls `c.check` itself for the guarded branch instead of re-deriving the same three conditions,
+  so the middleware and `check` cannot drift apart. Purely additive — no existing behavior
+  changed.
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 finding LOW#1. The middleware no longer stores a session it
   created for the current request unless the handler called `setData`, the new `Session.keep()`,
   or `Manager.regenerate`; such a request gets no `Set-Cookie`. Before, every cookieless request

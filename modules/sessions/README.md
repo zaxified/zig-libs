@@ -74,6 +74,16 @@ handler owns the streamed request body, so a middleware that drained it to find
 a `csrf_token` field would steal it. An app that renders a classic hidden form
 field parses its own body and calls the pure `Csrf.verify(session_id, field)`.
 
+A caller that does not run `Csrf.middleware` at all — using the core module
+directly under a different router — can still reuse the exact same guard:
+`Csrf.presented(req)` is the public header-then-query token extraction (the
+one `middleware` itself calls), and `Csrf.check(req)` is the whole guard minus
+the 403 response: session cookie present, a token presented, and it `verify`s.
+`check` does **not** apply the middleware's safe-method exemption — it never
+looks at the request method, so calling it on a GET tells you whether that GET
+carried a valid token, not "GET is always fine". Only `Csrf.middleware` treats
+safe methods specially.
+
 ## Concurrency & the no-copy cookie buffer
 
 A built `Manager`/`Csrf` is immutable and shared across `http.Server`'s
