@@ -2464,14 +2464,45 @@ fn isAtJwtTyp(typ: ?[]const u8) bool {
         std.ascii.eqlIgnoreCase(t, "application/at+jwt");
 }
 
+/// `Provider.verify` over a caller-held set: parse → select the key (`kid`,
+/// or the single usable key) → signature → claims. Nothing is fetched, so
+/// an unknown `kid` is `NoMatchingKey` at once. `claim_opts.issuer` must not
+/// be `.provider` (`Guard.init` refuses that combination).
+fn verifyWithStaticJwks(
+    gpa: std.mem.Allocator,
+    jwks: *const JwkSet,
+    token: []const u8,
+    now_s: i64,
+    claim_opts: Provider.ClaimOptions,
+) Provider.Error!ParsedToken {
+    var parsed = try parse(gpa, token);
+    errdefer parsed.deinit();
+    const resolved = jwks.selectKey(parsed.header) orelse return error.NoMatchingKey;
+    try verifySignature(&parsed, resolved.key);
+    const issuer_policy: IssuerPolicy = switch (claim_opts.issuer) {
+        .required => |s| .{ .required = s },
+        .any => .any,
+        .provider => return error.IssuerNotConfigured,
+    };
+    try validateClaims(parsed.claims, .{
+        .now_s = now_s,
+        .leeway_s = claim_opts.leeway_s,
+        .issuer = issuer_policy,
+        .audience = claim_opts.audience,
+        .require_exp = claim_opts.require_exp,
+        .reject_future_iat = claim_opts.reject_future_iat,
+    });
+    return parsed;
+}
+
 /// A framework-agnostic RFC 6750 Bearer + RFC 9068 access-token guard over a
-/// `Provider`. Configure it once (it precomputes its `WWW-Authenticate`
+/// `Provider` or a static `JwkSet` (`Options.jwks`). Configure it once (it precomputes its `WWW-Authenticate`
 /// challenge strings at `init` — stable memory the caller may hand to any
 /// response writer) and call `authenticate` per request. The `Guard` and its
 /// `Provider` must outlive every in-flight request, at stable addresses.
 pub const Guard = struct {
     gpa: std.mem.Allocator,
-    provider: *Provider,
+    source: KeySource,
     claim_opts: Provider.ClaimOptions,
     /// Scopes every request must carry (conjunction — ALL required), gpa-owned.
     required_scopes: [][]const u8,
@@ -2483,9 +2514,28 @@ pub const Guard = struct {
     challenge_invalid: []const u8,
     challenge_scope: ?[]const u8,
 
+    /// Where the guard's verification keys come from.
+    pub const KeySource = union(enum) {
+        /// A fetching, caching JWKS `Provider` (OIDC discovery or a
+        /// `jwks_uri`).
+        provider: *Provider,
+        /// A caller-held set — keys from the server's own configuration, the
+        /// common small-deployment case. Read-only here: nothing is fetched.
+        jwks: *const JwkSet,
+    };
+
     pub const Options = struct {
         /// The verifier backing the guard. Must outlive every request.
-        provider: *Provider,
+        /// Exactly one of `provider` and `jwks` is set.
+        provider: ?*Provider = null,
+        /// A static key set instead of a `Provider` (2026-09-28, requested
+        /// by qap): a resource server whose keys come from its own
+        /// configuration gets the same Bearer extraction, `at+jwt` check,
+        /// scope policy and RFC 6750 challenges without a fake fetcher.
+        /// Must outlive every request. `claim_opts.issuer` must then be
+        /// `.required` or `.any` — there is no provider issuer to default to,
+        /// so `.provider` fails `init` with `error.IssuerNotConfigured`.
+        jwks: ?*const JwkSet = null,
         /// Claim policy handed to `Provider.verify`. REQUIRED — `audience`
         /// has no default (`.required = "…"` to bind tokens to this resource
         /// server per RFC 8725 §3.9, or a conscious `.any`).
@@ -2506,10 +2556,25 @@ pub const Guard = struct {
         realm: ?[]const u8 = null,
     };
 
-    pub const InitError = error{ OutOfMemory, InvalidRealm };
+    pub const InitError = error{
+        OutOfMemory,
+        InvalidRealm,
+        /// Neither or both of `Options.provider` and `Options.jwks` set.
+        InvalidKeySource,
+        /// `Options.jwks` with `claim_opts.issuer == .provider`: a static
+        /// set has no issuer to enforce. Pin `.required` or opt out `.any`.
+        IssuerNotConfigured,
+    };
 
     pub fn init(gpa: std.mem.Allocator, options: Guard.Options) InitError!Guard {
         if (options.realm) |r| try validateRealm(r);
+        const source: KeySource = if (options.provider) |p| blk: {
+            if (options.jwks != null) return error.InvalidKeySource;
+            break :blk .{ .provider = p };
+        } else if (options.jwks) |j| blk: {
+            if (options.claim_opts.issuer == .provider) return error.IssuerNotConfigured;
+            break :blk .{ .jwks = j };
+        } else return error.InvalidKeySource;
 
         const challenge_missing = try allocBearerChallenge(gpa, .{ .realm = options.realm });
         errdefer gpa.free(challenge_missing);
@@ -2533,7 +2598,7 @@ pub const Guard = struct {
 
         return .{
             .gpa = gpa,
-            .provider = options.provider,
+            .source = source,
             .claim_opts = options.claim_opts,
             .required_scopes = scopes,
             .require_at_jwt_typ = options.require_at_jwt_typ,
@@ -2567,9 +2632,14 @@ pub const Guard = struct {
         const token = resourceBearerToken(req) orelse return error.MissingToken;
 
         const now_s = g.clock.now();
-        g.lock.acquire();
-        const verify_result = g.provider.verify(tok_gpa, token, now_s, g.claim_opts);
-        g.lock.release();
+        const verify_result = switch (g.source) {
+            .provider => |p| blk: {
+                g.lock.acquire();
+                defer g.lock.release();
+                break :blk p.verify(tok_gpa, token, now_s, g.claim_opts);
+            },
+            .jwks => |j| verifyWithStaticJwks(tok_gpa, j, token, now_s, g.claim_opts),
+        };
 
         var verified = verify_result catch |err| {
             // verify frees its own partial token on failure and never leaks it.
@@ -6853,6 +6923,55 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "401");
     }
+}
+
+test "Guard over a static JwkSet: same policy, no fetcher; init refuses a bad key source" {
+    const gpa = testing.allocator;
+    var jwks = try parseJwks(gpa, rs_jwks_json);
+    defer jwks.deinit();
+
+    const claim_opts: Provider.ClaimOptions = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } };
+    // Neither, both, and a static set with the provider-issuer default.
+    try testing.expectError(error.InvalidKeySource, Guard.init(gpa, .{ .claim_opts = claim_opts }));
+    var stub: ScriptFetcher = .{ .script = &.{} };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
+    defer provider.deinit();
+    try testing.expectError(error.InvalidKeySource, Guard.init(gpa, .{ .provider = &provider, .jwks = &jwks, .claim_opts = claim_opts }));
+    try testing.expectError(error.IssuerNotConfigured, Guard.init(gpa, .{ .jwks = &jwks, .claim_opts = .{ .audience = .any } }));
+
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var guard = try Guard.init(gpa, .{
+        .jwks = &jwks,
+        .claim_opts = claim_opts,
+        .required_scopes = &.{"read"},
+        .clock = fc.clock(),
+        .realm = "svc",
+    });
+    defer guard.deinit();
+    test_guard = &guard;
+    defer test_guard = null;
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.get("/data", guardTestHandler);
+
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    const cases = [_]struct { claims: []const u8, status: []const u8 }{
+        .{ .claims = "{\"iss\":\"https://issuer.example\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":2000,\"scope\":\"read\"}", .status = "200" },
+        .{ .claims = "{\"iss\":\"https://evil.example\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":2000,\"scope\":\"read\"}", .status = "401" },
+        .{ .claims = "{\"iss\":\"https://issuer.example\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":500,\"scope\":\"read\"}", .status = "401" },
+        .{ .claims = "{\"iss\":\"https://issuer.example\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":2000,\"scope\":\"write\"}", .status = "403" },
+    };
+    inline for (cases) |c| {
+        const tok = mintRs256(&tok_buf, c.claims);
+        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        try resExpectStatus(resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf), c.status);
+    }
+    // Nothing was fetched: the stub had no script and was never asked.
+    try testing.expectEqual(@as(usize, 0), stub.calls);
 }
 
 test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array scope" {

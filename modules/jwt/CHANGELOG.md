@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Guard` over a static `JwkSet`: `Guard.Options.jwks` as an alternative to
+  `provider` (now optional; exactly one must be set, `error.InvalidKeySource` otherwise). The
+  guard's `provider` field became `source: Guard.KeySource`. `Guard.InitError` gains
+  `InvalidKeySource` and `IssuerNotConfigured` (static set + `issuer = .provider`). Existing
+  `.provider = &p` callers compile unchanged. Wanted by qap.
+
 - **2026-09-28** — **Token issuance**: `encode` (claims serialized by `std.json`) and `encodeJson`
   (a JSON object verbatim) over a new `SigningKey` (HS256/384/512, ES256, ES384, EdDSA,
   ML-DSA-44/65/87) whose variant fixes `alg`; `EncodeOptions` sets `typ`/`kid`. Short HMAC

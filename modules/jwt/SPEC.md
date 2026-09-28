@@ -177,12 +177,11 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 - **RS\* signing** — `encode` does not offer RS256/384/512: std has no RSA signing, and the
   `rsa` module's `signPkcs1v15` would become a new dependency of jwt (a root `build.zig`
   change). Add it when a consumer needs RSA-issued tokens. Still open.
-- **`Guard` over a static `JwkSet`** — BACKLOG (2026-09-22, found by qap). `Guard` requires a
-  `*Provider` (a network-fetching JWKS cache). A resource server whose keys come from its own
-  configuration — the common small-deployment case — has to build a Provider around a fake
-  fetcher or drop down to `parseVerifyJwks` and re-implement the Bearer extraction, `at+jwt`
-  typ check, scope policy and RFC 6750 challenges `Guard` already has. Wanted: a key source that
-  is either a Provider or a caller-held `*const JwkSet`.
+- ~~**`Guard` over a static `JwkSet`**~~ — DONE 2026-09-28 (found by qap): `Guard.Options.jwks`
+  (exactly one of `provider`/`jwks`, else `error.InvalidKeySource`) runs the same Bearer
+  extraction, `at+jwt` check, scope policy and RFC 6750 challenges over a caller-held set;
+  nothing is fetched, so an unknown `kid` is refused at once. A static set has no issuer to
+  default to, so `claim_opts.issuer = .provider` fails `init` (`error.IssuerNotConfigured`).
 - No other module-local backlog recorded (README has no Deferred section).
 
 - **Refuse a plain-HTTP key source** (from qap M11.8, 2026-09-28). `discover` accepts an
