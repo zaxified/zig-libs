@@ -2036,4 +2036,13 @@ pub const rows = [_]Golden{
     .{ .case = "ocf-mix-20000-128-w12", .level = 11, .checksum = false, .len = 7118, .sha256 = "90b204e040ab55f312e981a4c4cd956cead1c1d6a256c4f576fb3e29faafa6ed" },
     .{ .case = "ocf-ldm-mix-600000-244-w13", .level = 18, .checksum = false, .len = 272345, .sha256 = "a036f39a8cf3ab4dfab90ae929859c73b24d774e5ea6a86448556d8a3e7f9736" },
     .{ .case = "ocf-ldm-mix-600000-67-w11", .level = 19, .checksum = false, .len = 246227, .sha256 = "adc9d959da661914c3ffe7da240d2e323be9878703795bbf18b5e6a61e1629b5" },
+    .{ .case = "ll-65536", .level = 13, .checksum = false, .len = 66716, .sha256 = "5810288e2a344f02448a370b25f18ac4c3a4d276b54c9fd6b9ea7de6cfacfeb1" },
+    .{ .case = "tree-4096", .level = 13, .checksum = false, .len = 8529, .sha256 = "7ff2133b1393de5e14dcd542ccb4811c711656f6dc9320dc7f1a9358ff88e6e5" },
+    .{ .case = "hash3-target", .level = 14, .checksum = false, .len = 19875, .sha256 = "b8c3b5eb68cc5d043e2cabd322554026bcbc7ed3ce360194b66f2a683318be68" },
+    .{ .case = "insertbt1-window", .level = 13, .checksum = false, .len = 1139, .sha256 = "c64a5ebcdeff4b1ab33319fb481b34af30deec4469bbbe6687cbfa41166e0417" },
+    .{ .case = "split-largest", .level = 3, .checksum = false, .len = 176, .sha256 = "23405027b367b983b6cd581a2733ca7f88f8f1222245b68f06e29c2d590c92e2" },
+    .{ .case = "split-1024", .level = 3, .checksum = false, .len = 176, .sha256 = "33cf0e2e1dcbe413dfb1339b2dbc503bd1c75933c299059e46b76eba1d7336aa" },
+    .{ .case = "split-repeat", .level = 3, .checksum = false, .len = 477, .sha256 = "7037d9ee741a5e8b7c3932e4a0fbb64f275f2c739173b00f8df04c719dc360ca" },
+    .{ .case = "superblock-repeat", .level = 3, .checksum = false, .len = 833, .sha256 = "5c679d0061a36d4261e569a5af4bd1d046362a17418605ce784a36064aedde5b" },
+    .{ .case = "superblock-h12", .level = 3, .checksum = false, .len = 38, .sha256 = "431a9443144607d72e1a3f778883e0670b76aae99f1c0b6c85750f7e55e6e739" },
 };

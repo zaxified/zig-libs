@@ -697,4 +697,6 @@ pub const rows = [_]Golden{
     .{ .case = "empty", .level = 3, .checksum = true, .schedule = "stableOutBuffer=1,o18,c*,e0", .len = 13, .sha256 = "355382acc32b88120e9126b76f46642081ac688504fa6534980405b2942c4d9f" },
     .{ .case = "words-16385", .level = 3, .checksum = false, .schedule = "stableOutBuffer=1,o3604,c*,f0,e0", .len = 3599, .sha256 = "d24ee60162f0ddfd4d48c529f336eb29c6a296aa5a60bdc33d5598d4a322f610" },
     .{ .case = "words-16385", .level = 3, .checksum = true, .schedule = "stableOutBuffer=1,o3604,c*,f0,e0", .len = 3603, .sha256 = "741ee4e1584012f9444c3ee7fc91a7c2be3db7aaaa05695607b239a0a15eb8ea" },
+    .{ .case = "words-16384", .level = 12, .checksum = false, .schedule = "strategy=6,chainLog=11,windowLog=10,searchLog=1,e8192,e*", .len = 4485, .sha256 = "9c40c51f3743f5a6e035953cf88af74329c6f3fbde5564e348d542439bf10251" },
+    .{ .case = "words-16384", .level = 12, .checksum = true, .schedule = "strategy=6,chainLog=11,windowLog=10,searchLog=1,e8192,e*", .len = 4493, .sha256 = "78b13412b8218f6043e983c52c414bc70f04ac2a6b581cb6a27e1388fd72cce8" },
 };
