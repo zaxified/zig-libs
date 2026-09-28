@@ -19,6 +19,16 @@
 //! request bodies can be streamed via `requestStreaming` (fixed length or
 //! chunked), so bodies larger than memory never get buffered.
 //!
+//! ⚠ Sandboxes. The blocking phases of a request — name resolution +
+//! `connect`, the TLS handshake, the response-head read — run on a task of
+//! the `Io` (`runBounded`: the only way std 0.16 can put a deadline on
+//! them), i.e. on one of `std.Io.Threaded`'s pool threads, not on the
+//! thread that called `request`. A per-thread confinement (Landlock,
+//! `setuid`, seccomp) applied after that pool started does not cover it.
+//! Make the `Io` after the sandbox, or set `Options.inline_blocking`. The
+//! CA bundle is read from the filesystem on the first HTTPS request; load it
+//! before confining with `loadCaBundle` or a shared `CaBundle`.
+//!
 //! Implementation notes: TLS via `std.crypto.tls` (never `std.http.Client`),
 //! hostname resolution via `std.Io.net.HostName` (to be swapped for the
 //! `dns` module when it lands), URL/host splitting via `netaddr`.
@@ -107,6 +117,25 @@ pool: Pool,
 /// the pool is doing its job.
 dial_count: std.atomic.Value(usize) = .init(0),
 
+/// A CA bundle with its own lock, loadable once and shareable between
+/// clients (`Options.shared_ca`). All methods are thread-safe.
+pub const CaBundle = struct {
+    bundle: std.crypto.Certificate.Bundle = .empty,
+    lock: std.Io.RwLock = .init,
+    scanned: bool = false,
+
+    /// Scan the system CA store, once; later calls return at once. Call it
+    /// before confining the process if the store will be unreadable after.
+    pub fn load(ca: *CaBundle, gpa: std.mem.Allocator, io: std.Io) Error!void {
+        return loadCa(gpa, io, &ca.lock, &ca.bundle, &ca.scanned);
+    }
+
+    pub fn deinit(ca: *CaBundle, gpa: std.mem.Allocator) void {
+        ca.bundle.deinit(gpa);
+        ca.* = undefined;
+    }
+};
+
 pub const Options = struct {
     /// Budget for one dial — name resolution plus `connect` — after which
     /// the dial fails with `error.Timeout`; 0 = unbounded. Applies to every
@@ -149,6 +178,25 @@ pub const Options = struct {
     /// (`connectH2Over`) there is no `Client` to read this from, so set
     /// `h2_client.Options.user_agent` on that call yourself.
     user_agent: []const u8 = "zig-libs-http/0.1",
+    /// A CA bundle shared by several clients, loaded once (`CaBundle.load`)
+    /// — e.g. before a process confines itself (Landlock), for clients made
+    /// later on other threads. Borrowed: it must outlive the client, which
+    /// never frees it. Null (default): the client loads its own on the first
+    /// HTTPS request.
+    shared_ca: ?*CaBundle = null,
+    /// Run every blocking phase (resolve + connect, TLS handshake, head read)
+    /// on the calling thread instead of on a task of the `Io`'s pool.
+    ///
+    /// ⚠ Why it matters: with `std.Io.Threaded`, those phases run on the
+    /// pool's threads (`runBounded`, the only way std 0.16 can bound them),
+    /// whichever thread called `request`. A per-thread sandbox — Landlock,
+    /// `setuid`, seccomp applied to the calling thread — does NOT confine a
+    /// pool thread spawned before it, so that work runs unconfined. Either
+    /// make the `Io` after the sandbox, or set this. The price:
+    /// `connect_timeout_ms` and `total_timeout_ms` no longer interrupt a
+    /// blocked phase (nothing can cancel a syscall on the caller's own
+    /// thread); only the checks between phases remain.
+    inline_blocking: bool = false,
     /// h1 keep-alive connection pooling (see the module doc). Defaults on;
     /// set `.enabled = false` for the old one-connection-per-request
     /// behavior (every request explicitly sends `Connection: close`).
@@ -362,7 +410,7 @@ pub fn poolSweep(c: *Client) void {
 /// always call `Response.deinit`.
 pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
     const deadline = c.totalDeadline() orelse return c.requestInner(method, url_text, options);
-    return runBounded(c.io, deadline, requestInner, .{ c, method, url_text, options }) catch |err| switch (err) {
+    return runBounded(c.io, c.options.inline_blocking, deadline, requestInner, .{ c, method, url_text, options }) catch |err| switch (err) {
         // See `connectStream` for the same fallback: without a spare unit of
         // concurrency there is nothing to cancel, so the exchange runs on
         // this thread with only the between-phase deadline checks below.
@@ -523,7 +571,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
 /// this call graph provably TLS-free rather than merely usually-TLS-free.
 pub fn requestPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
     const deadline = c.totalDeadline() orelse return c.requestInnerPlain(method, url_text, options);
-    return runBounded(c.io, deadline, requestInnerPlain, .{ c, method, url_text, options }) catch |err| switch (err) {
+    return runBounded(c.io, c.options.inline_blocking, deadline, requestInnerPlain, .{ c, method, url_text, options }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => c.requestInnerPlain(method, url_text, options),
         else => |e| e,
     };
@@ -716,7 +764,7 @@ pub const Upload = struct {
     pub fn finish(u: *Upload) Error!Response {
         const c = u.conn.client;
         const deadline = c.totalDeadline() orelse return u.finishInner();
-        return runBounded(c.io, deadline, finishInner, .{u}) catch |err| switch (err) {
+        return runBounded(c.io, c.options.inline_blocking, deadline, finishInner, .{u}) catch |err| switch (err) {
             // Same fallback as `Client.request`; see `connectStream`.
             error.ConcurrencyUnavailable => u.finishInner(),
             else => |e| e,
@@ -1721,7 +1769,12 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
             .insecure_no_verify => .no_verification,
         },
         .ca = switch (o.tls.verify) {
-            .strict => .{ .bundle = .{
+            .strict => .{ .bundle = if (c.options.shared_ca) |ca| .{
+                .gpa = c.gpa,
+                .io = io,
+                .lock = &ca.lock,
+                .bundle = &ca.bundle,
+            } else .{
                 .gpa = c.gpa,
                 .io = io,
                 .lock = &c.ca_lock,
@@ -1756,7 +1809,7 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
 /// nameserver black hole is bounded by `connect_timeout_ms` as well.
 fn connectStream(c: *Client, url: http.Url) Error!net.Stream {
     const deadline = c.connectDeadline() orelse return c.connectStreamBlocking(url);
-    return runBounded(c.io, deadline, connectStreamBlocking, .{ c, url }) catch |err| switch (err) {
+    return runBounded(c.io, c.options.inline_blocking, deadline, connectStreamBlocking, .{ c, url }) catch |err| switch (err) {
         // No spare unit of concurrency (single-threaded build, or a
         // `Threaded` whose `concurrent_limit` is exhausted). Connecting
         // anyway on this thread is the pre-existing behavior and keeps such
@@ -1791,25 +1844,43 @@ fn mapConnectError(err: anyerror) Error {
     };
 }
 
-/// Load the system CA bundle once (lazily, like std.http.Client).
+/// Load the system CA bundle once (lazily, like std.http.Client): the
+/// shared one when `Options.shared_ca` is set, else the client's own.
 fn ensureCaBundle(c: *Client) Error!void {
-    const io = c.io;
+    if (c.options.shared_ca) |ca| return ca.load(c.gpa, c.io);
+    return loadCa(c.gpa, c.io, &c.ca_lock, &c.ca_bundle, &c.ca_scanned);
+}
+
+/// Load the CA bundle now instead of on the first HTTPS request — for a
+/// process that confines itself after startup and would then be unable to
+/// read the system store. Idempotent. With `Options.shared_ca`, loads that.
+pub fn loadCaBundle(c: *Client) Error!void {
+    return c.ensureCaBundle();
+}
+
+fn loadCa(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    lock: *std.Io.RwLock,
+    target: *std.crypto.Certificate.Bundle,
+    scanned: *bool,
+) Error!void {
     {
-        c.ca_lock.lockShared(io) catch return error.Canceled;
-        defer c.ca_lock.unlockShared(io);
-        if (c.ca_scanned) return;
+        lock.lockShared(io) catch return error.Canceled;
+        defer lock.unlockShared(io);
+        if (scanned.*) return;
     }
     var bundle: std.crypto.Certificate.Bundle = .empty;
-    defer bundle.deinit(c.gpa);
-    bundle.rescan(c.gpa, io, std.Io.Clock.real.now(io)) catch |err| switch (err) {
+    defer bundle.deinit(gpa);
+    bundle.rescan(gpa, io, std.Io.Clock.real.now(io)) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return error.CertificateBundleLoadFailure,
     };
-    c.ca_lock.lock(io) catch return error.Canceled;
-    defer c.ca_lock.unlock(io);
-    if (!c.ca_scanned) {
-        c.ca_scanned = true;
-        std.mem.swap(std.crypto.Certificate.Bundle, &c.ca_bundle, &bundle);
+    lock.lock(io) catch return error.Canceled;
+    defer lock.unlock(io);
+    if (!scanned.*) {
+        scanned.* = true;
+        std.mem.swap(std.crypto.Certificate.Bundle, target, &bundle);
     }
 }
 
@@ -1853,6 +1924,7 @@ fn BoundedResult(comptime func: anytype) type {
 ///     it, and each one documents the choice.
 fn runBounded(
     io: std.Io,
+    inline_only: bool,
     deadline: ?std.Io.Clock.Timestamp,
     comptime func: anytype,
     args: std.meta.ArgsTuple(@TypeOf(func)),
@@ -1874,6 +1946,9 @@ fn runBounded(
         }
     };
 
+    // `Options.inline_blocking`: take the call sites' existing
+    // no-concurrency path — the caller's thread, unbounded.
+    if (inline_only) return error.ConcurrencyUnavailable;
     var ctx: Ctx = .{ .io = io, .args = args };
     var future = try io.concurrent(Ctx.run, .{&ctx});
 
@@ -3754,7 +3829,7 @@ fn testConnectOnce(io: std.Io, target: net.IpAddress) Error!net.Stream {
 fn fillAcceptQueue(io: std.Io, target: net.IpAddress, held: []net.Stream) !usize {
     for (held, 0..) |*slot, n| {
         const d: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(250), .clock = .awake });
-        slot.* = runBounded(io, d, testConnectOnce, .{ io, target }) catch |err| switch (err) {
+        slot.* = runBounded(io, false, d, testConnectOnce, .{ io, target }) catch |err| switch (err) {
             error.Timeout => return n,
             else => |e| return e,
         };
@@ -4849,4 +4924,50 @@ test "pool: concurrent acquire/release from many threads is leak-free and race-f
     // `testing.allocator` catches any leak or double-free across the whole
     // run.
     try testing.expect(client.poolIdleCount() <= 8);
+}
+
+test "runBounded: inline_only takes the caller's-thread path without starting a task" {
+    const Probe = struct {
+        var ran: bool = false;
+        fn f() error{ Nope, Timeout, Canceled }!u8 {
+            ran = true;
+            return 7;
+        }
+    };
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expectError(error.ConcurrencyUnavailable, runBounded(io, true, null, Probe.f, .{}));
+    try testing.expect(!Probe.ran);
+    try testing.expectEqual(@as(u8, 7), try runBounded(io, false, null, Probe.f, .{}));
+    try testing.expect(Probe.ran);
+}
+
+test "CaBundle: shared by two clients, loaded once, never freed by a client" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ca: CaBundle = .{};
+    defer ca.deinit(testing.allocator);
+    var a = Client.init(io, testing.allocator, .{ .shared_ca = &ca });
+    var b = Client.init(io, testing.allocator, .{ .shared_ca = &ca });
+    a.loadCaBundle() catch |err| switch (err) {
+        // A host without a readable system store: nothing to share.
+        error.CertificateBundleLoadFailure => {
+            a.deinit();
+            b.deinit();
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    try testing.expect(ca.scanned);
+    try testing.expect(!a.ca_scanned and !b.ca_scanned); // neither loaded its own
+    const n = ca.bundle.map.count();
+    try b.loadCaBundle(); // already loaded: a no-op
+    try testing.expectEqual(n, ca.bundle.map.count());
+    a.deinit();
+    b.deinit();
+    // `ca` is still intact here and freed by its owner (the defer above);
+    // a client freeing it would double-free under testing.allocator.
+    try testing.expect(ca.scanned);
 }

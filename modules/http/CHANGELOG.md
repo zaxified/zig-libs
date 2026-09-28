@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Client.loadCaBundle()` (eager CA load), `Client.CaBundle` shared between
+  clients via `Options.shared_ca` (borrowed), and `Options.inline_blocking` (blocking phases on
+  the calling thread, not the `Io` pool — for per-thread sandboxes; timeouts then only between
+  phases). The module doc now warns that those phases run on pool threads. Additive. Wanted by
+  qap M11.8, which moved `ca_bundle`/`ca_scanned` between clients by hand.
+
 - **2026-09-28** — `ResponseWriter.bodyBytesSent`: body octets on the wire after any content
   coding, without chunk framing (`%b`), for every body mode incl. chunked, compressed and
   until-close; `h1.ChunkedWriter.payload_len` counts chunk payload. Additive. For accesslog and
