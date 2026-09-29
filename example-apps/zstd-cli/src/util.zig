@@ -229,5 +229,6 @@ test "a whole .. component, and the names the mirror joins" {
     try std.testing.expectEqualStrings("x/a", dirName("x/a/f"));
     try std.testing.expectEqualStrings("a", trimPath("./a"));
     try std.testing.expectEqualStrings("a", trimPath("/a"));
-    try std.testing.expectEqualStrings("/a", trimPath(".//a"));
+    // Both steps apply, as in libzstd: `./` goes, then the `/` it left in front.
+    try std.testing.expectEqualStrings("a", trimPath(".//a"));
 }
