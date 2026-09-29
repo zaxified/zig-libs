@@ -162,6 +162,7 @@ pub fn commit(
     base: Meta,
     changes: []const Change,
     oldest_reader_txn: u64,
+    shrink_min_pages: u64,
 ) CommitError!Meta {
     if (changes.len == 0) return base; // an empty txn commits nothing
 
@@ -184,6 +185,8 @@ pub fn commit(
         else => error.Storage,
     };
     var fl = base_chain.fl;
+    // Lowest page first (see `sortHighestFirst`): what lets the tail empty.
+    fl.sortHighestFirst(arena) catch return error.OutOfMemory;
 
     var ctx = Ctx{
         .arena = arena,
@@ -198,6 +201,10 @@ pub fn commit(
     // COW-apply down the tree; thread split separators back up, growing new
     // root levels for as long as the previous level still split.
     var pieces = try applyRec(&ctx, base.root, ops);
+    // An underfull root has no sibling to merge with: it is written as it is.
+    if (pieces.len == 1) if (pieces[0].pending) |node| {
+        pieces = try writeNode(&ctx, node);
+    };
     if (pieces.len == 0) {
         // Every key is gone (`applyRec` drops emptied nodes): the new tree is
         // the same single empty leaf a fresh file starts with.
@@ -210,8 +217,8 @@ pub fn commit(
         pieces = try finishNodes(format.BranchBuilder, &ctx, nb);
     }
     var new_root = pieces[0].id;
-    // Root collapse: once children were dropped, the root may be a branch
-    // with a single child left, and so may that child. Each such level is
+    // Root collapse: once children were dropped or merged, the root may be a
+    // branch with a single child left, and so may that child. Each such level is
     // replaced by its child. Only the root level ever goes, so every leaf
     // stays at the same depth. The page given up is either one this commit
     // wrote or a base page this commit makes unreachable; both are dead from
@@ -231,6 +238,15 @@ pub fn commit(
     // into `fl`) — chaining means this can be more than one page.
     for (base_chain.pages.items) |pid|
         ctx.freed.append(arena, pid) catch return error.OutOfMemory;
+
+    // Giving the tail back: a run of free pages at the end of the file that
+    // no reader can reach leaves the store -- the high water drops below it,
+    // so the new meta does not count it. Like the chain's storage below, it
+    // is taken from entries earlier txns freed, before this commit parks the
+    // base pages it made dead. The FILE is shortened only by the commit
+    // after this one (see after fsync #2).
+    pager.high_water = fl.cutTail(arena, pager.high_water, oldest_reader_txn, shrink_min_pages) catch
+        return error.OutOfMemory;
 
     // Reserve the chain's OWN storage before parking anything this commit
     // freed, and the order is load-bearing: right now every entry in `fl` was
@@ -274,6 +290,16 @@ pub fn commit(
     // fsync #2: the linearization point — the commit exists iff this returns.
     pager.sync() catch return error.CommitFailed;
 
+    // Shorten the file to what the TWO metas on it need: this one and its
+    // base, which stays on media as the fallback `recover` adopts if this one
+    // is ever unreadable -- and a meta whose high water exceeds the file is
+    // rejected. So pages a commit gave back leave the file one commit later,
+    // when both metas agree they are gone. Past fsync #2 the commit exists
+    // whatever happens here; a failed truncate leaves a longer file, which
+    // is all it would have cost to skip it.
+    const keep = @max(new_meta.high_water, base.high_water);
+    if (pager.file_pages > keep) pager.truncateTo(keep) catch {};
+
     return new_meta;
 }
 
@@ -282,7 +308,14 @@ pub fn commit(
 /// One replacement page for a subtree: `pieces[0]` takes the original child's
 /// slot (its `sep` is never read); every further piece carries the separator
 /// promoted/carried out of the split that created it.
-const Piece = struct { sep: []const u8, id: PageId };
+///
+/// `pending` is an UNDERFULL node not written yet (`id` is meaningless): the
+/// parent merges it with a sibling (`mergePair`), and writing it first would
+/// be a page written only to be freed. Only a lone piece is ever pending.
+const Piece = struct { sep: []const u8, id: PageId, pending: ?Node = null };
+
+/// A node on the commit path, decoded and mutable.
+const Node = union(enum) { leaf: format.LeafBuilder, branch: format.BranchBuilder };
 
 /// The final effect on one key after folding a txn's ordered change list.
 const Op = struct { key: []const u8, val: ?[]const u8 };
@@ -295,8 +328,8 @@ const Ctx = struct {
     /// Base-tree pages made dead by this commit (parked on the freelist only
     /// after all of this commit's allocations — see `commit`'s doc comment).
     freed: std.ArrayList(PageId) = .empty,
-    /// A node was left empty and dropped from its parent this commit, so the
-    /// root may need collapsing (see `commit`).
+    /// A node was left empty and dropped from its parent, or two were merged
+    /// into one, this commit, so the root may need collapsing (see `commit`).
     dropped: bool = false,
     /// This commit wrote an overflow value (the meta goes to `format_v3`).
     wrote_overflow: bool = false,
@@ -393,6 +426,7 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
                 ctx.dropped = true;
                 return &.{};
             }
+            if (b.underflows()) return pendingPiece(ctx, .{ .leaf = b });
             return finishNodes(format.LeafBuilder, ctx, b);
         },
         .branch => {
@@ -401,18 +435,16 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
             // borrowed from `page`, which outlives `finishNodes` below.
             const b = format.Branch.init(&page);
             const ncells: usize = b.count();
-            // Rebuild the branch, routing each op run to its child: child i
-            // covers [sep[i-1], sep[i]) with a key EQUAL to a separator going
-            // right — the exact dual of the read path's childIndexFor.
-            var nb = format.BranchBuilder.init(ctx.arena, undefined);
-            // Every base cell plus one per op is the most a rebuild without
+            // The new node's children, in order: `kids[0].sep` is never read
+            // (it becomes `leftmost`), every other kid carries the separator
+            // it sits right of.
+            var kids: std.ArrayList(Piece) = .empty;
+            // Every base child plus one per op is the most a rebuild without
             // splits can hold; a split past that grows the list normally.
-            nb.cells.ensureTotalCapacityPrecise(ctx.arena, ncells + ops.len) catch return error.OutOfMemory;
-            // The first child that survives becomes `leftmost` and its
-            // separator is dropped. When that is not the old leftmost (it was
-            // emptied), the new leftmost covers everything below the next
-            // separator, which is right: nothing below it is left.
-            var have_leftmost = false;
+            kids.ensureTotalCapacityPrecise(ctx.arena, ncells + 1 + ops.len) catch return error.OutOfMemory;
+            // Route each op run to its child: child i covers [sep[i-1],
+            // sep[i]) with a key EQUAL to a separator going right — the exact
+            // dual of the read path's childIndexFor.
             var op_i: usize = 0;
             var ci: usize = 0;
             while (ci <= ncells) : (ci += 1) {
@@ -424,31 +456,143 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
                     op_i += 1;
                 // An untouched child keeps its page: structural sharing with
                 // the base version is what makes MVCC snapshots cheap.
-                const one = [1]Piece{.{ .sep = sep, .id = child }};
-                const sub: []const Piece = if (op_i > start) try applyRec(ctx, child, ops[start..op_i]) else &one;
+                if (op_i == start) {
+                    kids.append(ctx.arena, .{ .sep = sep, .id = child }) catch return error.OutOfMemory;
+                    continue;
+                }
                 // No pieces: the child was emptied and goes, separator and
                 // all. Otherwise the first piece takes the child's place
                 // (under the child's separator) and each further piece
                 // threads its promoted separator in after it (recursive
                 // split, parent-insert half).
+                const sub = try applyRec(ctx, child, ops[start..op_i]);
                 for (sub, 0..) |p, k| {
-                    if (!have_leftmost) {
-                        nb.leftmost = p.id;
-                        have_leftmost = true;
-                    } else {
-                        const cell_sep = if (k == 0) sep else p.sep;
-                        nb.cells.append(ctx.arena, .{ .sep = cell_sep, .child = p.id }) catch return error.OutOfMemory;
-                    }
+                    var kid = p;
+                    if (k == 0) kid.sep = sep;
+                    kids.append(ctx.arena, kid) catch return error.OutOfMemory;
                 }
             }
             std.debug.assert(op_i == ops.len);
-            if (!have_leftmost) {
+            if (kids.items.len == 0) {
                 ctx.dropped = true;
                 return &.{};
             }
+            // The first child that survives is `leftmost`, its separator
+            // dropped. When that is not the old leftmost (it was emptied), it
+            // covers everything below the next separator, which is right:
+            // nothing below it is left.
+            try mergeUnderfull(ctx, &kids);
+            var nb = format.BranchBuilder.init(ctx.arena, kids.items[0].id);
+            nb.cells.ensureTotalCapacityPrecise(ctx.arena, kids.items.len - 1) catch return error.OutOfMemory;
+            for (kids.items[1..]) |k| nb.cells.appendAssumeCapacity(.{ .sep = k.sep, .child = k.id });
+            if (nb.underflows()) return pendingPiece(ctx, .{ .branch = nb });
             return finishNodes(format.BranchBuilder, ctx, nb);
         },
     }
+}
+
+/// A lone underfull node, handed up unwritten for the parent to merge.
+///
+/// Re-homed first: a builder borrows its keys and values, here from the page
+/// buffer on `applyRec`'s stack, which is gone once it returns. The node is
+/// encoded into a page in the arena and decoded back -- it fits a page, it is
+/// underfull -- so what the parent merges borrows from memory that lives as
+/// long as the commit.
+fn pendingPiece(ctx: *Ctx, node: Node) CommitError![]const Piece {
+    const buf = ctx.arena.create([page_size]u8) catch return error.OutOfMemory;
+    const homed: Node = switch (node) {
+        .leaf => |l| blk: {
+            l.encode(buf);
+            break :blk .{ .leaf = format.LeafBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory };
+        },
+        .branch => |br| blk: {
+            br.encode(buf);
+            break :blk .{ .branch = format.BranchBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory };
+        },
+    };
+    const pieces = ctx.arena.alloc(Piece, 1) catch return error.OutOfMemory;
+    pieces[0] = .{ .sep = "", .id = undefined, .pending = homed };
+    return pieces;
+}
+
+/// Write a node and whatever its split makes of it.
+fn writeNode(ctx: *Ctx, node: Node) CommitError![]const Piece {
+    return switch (node) {
+        .leaf => |l| finishNodes(format.LeafBuilder, ctx, l),
+        .branch => |br| finishNodes(format.BranchBuilder, ctx, br),
+    };
+}
+
+/// Merge every pending (underfull) kid with a neighbour -- the right one when
+/// there is one, else the left -- and leave `kids` all written. The pair
+/// becomes one node, or two with the bytes shared out again when it does not
+/// fit a page: merge and borrow are the same operation here, a split of the
+/// pair's union. The neighbour's page, if it had one, is dead after this and
+/// goes to `ctx.freed`; so does a page written earlier in this commit (a split
+/// piece), which costs one page written for nothing and happens only when a
+/// split lands next to an underfull node. A lone kid has no neighbour: it is
+/// written as it is, and the parent it leaves with one child is itself
+/// underfull and merged a level up (or collapsed, at the root).
+fn mergeUnderfull(ctx: *Ctx, kids: *std.ArrayList(Piece)) CommitError!void {
+    var j: usize = 0;
+    while (j < kids.items.len) {
+        if (kids.items[j].pending == null) {
+            j += 1;
+            continue;
+        }
+        if (kids.items.len == 1) {
+            const written = try writeNode(ctx, kids.items[0].pending.?);
+            kids.replaceRange(ctx.arena, 0, 1, written) catch return error.OutOfMemory;
+            break;
+        }
+        const l = if (j + 1 < kids.items.len) j else j - 1;
+        var merged = try mergePair(ctx, kids.items[l], kids.items[l + 1]);
+        // The pair's first piece takes the left kid's place and separator.
+        const out = ctx.arena.dupe(Piece, merged) catch return error.OutOfMemory;
+        out[0].sep = kids.items[l].sep;
+        merged = out;
+        kids.replaceRange(ctx.arena, l, 2, merged) catch return error.OutOfMemory;
+        ctx.dropped = true;
+        j = l + merged.len;
+    }
+}
+
+/// The union of two adjacent kids of one branch, written (and split again if
+/// it does not fit a page). `right.sep` is the separator between them: a leaf
+/// pair does not need it (a split recomputes one from the keys), a branch pair
+/// pulls it down between the left half's cells and the right half's leftmost.
+fn mergePair(ctx: *Ctx, left: Piece, right: Piece) CommitError![]const Piece {
+    const ln = try nodeOf(ctx, left);
+    const rn = try nodeOf(ctx, right);
+    switch (ln) {
+        .leaf => |lb| {
+            if (rn != .leaf) return error.Corrupt; // siblings share a level
+            var m = lb;
+            m.entries.appendSlice(ctx.arena, rn.leaf.entries.items) catch return error.OutOfMemory;
+            return finishNodes(format.LeafBuilder, ctx, m);
+        },
+        .branch => |bb| {
+            if (rn != .branch) return error.Corrupt;
+            var m = bb;
+            m.cells.append(ctx.arena, .{ .sep = right.sep, .child = rn.branch.leftmost }) catch return error.OutOfMemory;
+            m.cells.appendSlice(ctx.arena, rn.branch.cells.items) catch return error.OutOfMemory;
+            return finishNodes(format.BranchBuilder, ctx, m);
+        },
+    }
+}
+
+/// A kid as a mutable node: its pending builder, or its page decoded (the
+/// page is then dead -- the merge replaces it -- and goes to `ctx.freed`). The
+/// page buffer lives in the arena: the builder borrows its keys and values.
+fn nodeOf(ctx: *Ctx, kid: Piece) CommitError!Node {
+    if (kid.pending) |n| return n;
+    const buf = ctx.arena.create([page_size]u8) catch return error.OutOfMemory;
+    try readForCommit(ctx.pager, kid.id, buf);
+    ctx.freed.append(ctx.arena, kid.id) catch return error.OutOfMemory;
+    return switch (format.kindOf(buf) orelse return error.Corrupt) {
+        .leaf => .{ .leaf = format.LeafBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory },
+        .branch => .{ .branch = format.BranchBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory },
+    };
 }
 
 /// Write `val` as a fresh overflow chain and return its reference (the first

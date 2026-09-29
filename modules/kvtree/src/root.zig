@@ -29,7 +29,9 @@
 //! real `Db` through commit/snapshot schedules and a crash-point sweep on
 //! `kv.SimStorage` (see `harness.zig`). A value too large for a page lives in a
 //! chain of overflow pages (`get` and cursors read it; `getRef` cannot lend
-//! it); keys stay inline. What is still open is in SPEC.md's backlog.
+//! it); keys stay inline. A node a commit leaves under a quarter full is
+//! merged with a sibling, and a free run at the end of the file is given back
+//! (`Options.shrink_min_pages`). What is still open is in SPEC.md's backlog.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -137,6 +139,8 @@ pub const Db = struct {
     /// actually survived"). Reads (`get`/`cursor`/`snapshot`) are unaffected
     /// — they still serve the last version this `Db` knows to be good.
     poisoned: bool = false,
+    /// `Options.shrink_min_pages`.
+    shrink_min_pages: u32,
     /// True while a read-write transaction obtained from `begin` has not yet
     /// been consumed by `commit`/`rollback`. Single-writer is a documented
     /// caller contract; this is its enforcement — the same-process sibling of
@@ -191,6 +195,7 @@ pub const Db = struct {
             return error.NotAKvtreeFile;
         } else {
             pager.high_water = size / page_size;
+            pager.file_pages = pager.high_water;
             meta_rec = core.recover(gpa, &pager) catch |e| switch (e) {
                 error.Unrecoverable => {
                     // Neither meta slot decoding at all (wrong magic/version/
@@ -217,6 +222,7 @@ pub const Db = struct {
             .lock_file = lock_file,
             .next_txn = meta_rec.txn_id + 1,
             .open_snapshots = .empty,
+            .shrink_min_pages = options.shrink_min_pages,
         };
     }
 
@@ -410,6 +416,15 @@ pub const Db = struct {
 pub const Options = struct {
     /// Cross-process exclusion policy (default: on). See `LockPolicy`.
     lock: LockPolicy = .exclusive,
+    /// Give the end of the file back once at least this many pages there are
+    /// free and no open snapshot or cursor can still reach them: the high
+    /// water drops in that commit and the file is truncated by the next one.
+    /// 0 = never shrink (the file only ever grows, as before 2026-09-29).
+    /// Only a free TAIL goes; free pages below a live one are reused by later
+    /// commits but not given back (that would take moving live pages down).
+    /// The default, 16 pages (64 KiB), keeps a store that breathes by a few
+    /// pages per commit from truncating and regrowing its file every time.
+    shrink_min_pages: u32 = 16,
 };
 
 pub const LockPolicy = enum {
@@ -503,6 +518,7 @@ pub const Txn = struct {
             self.base,
             self.changes.items,
             self.db.oldestReader(),
+            self.db.shrink_min_pages,
         ) catch |e| {
             // CommitFailed means the outcome is indeterminate (see the error's
             // doc): `meta_rec` may already be stale relative to the file.
@@ -1819,4 +1835,335 @@ test "overflow values: getRef lends an inline value and refuses an overflow one 
     try expectGet(&db, "o", big);
     // The leaf page lent for the refused lookup was released (testing.allocator
     // reports a leak otherwise).
+}
+
+// ── merging underfull nodes ─────────────────────────────────────────────────
+// A node a commit leaves under a quarter full is merged with a sibling (and
+// split again by bytes when the pair does not fit a page: a borrow).
+
+const Fill = struct { leaves: usize = 0, branches: usize = 0, underfull_leaves: usize = 0 };
+
+fn countFill(db: *Db, id: PageId, is_root: bool, fill: *Fill) !void {
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(id, &page);
+    switch (format.kindOf(&page).?) {
+        .leaf => {
+            fill.leaves += 1;
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const b = try format.LeafBuilder.fromPage(arena.allocator(), &page);
+            if (!is_root and b.underflows()) fill.underfull_leaves += 1;
+        },
+        .branch => {
+            fill.branches += 1;
+            const br = format.Branch.init(&page);
+            var i: usize = 0;
+            while (i <= br.count()) : (i += 1) try countFill(db, br.childAtIndex(i), false, fill);
+        },
+    }
+}
+
+test "scattered deletes merge underfull leaves and branches: the tree shrinks with its data" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{});
+    defer db.close();
+    const n = 3000;
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var txn = try db.begin();
+        for (0..n) |id| try txn.put(longKey(try arena.allocator().create([long_key_len]u8), id), "v");
+        try txn.commit();
+    }
+    var before: Fill = .{};
+    try countFill(&db, db.meta_rec.root, true, &before);
+
+    // Keep one key in ten, deleted in scattered batches so every leaf is
+    // touched by several commits, as a real retention or cleanup would.
+    var prng = std.Random.DefaultPrng.init(7);
+    var order: [n]u32 = undefined;
+    for (&order, 0..) |*o, i| o.* = @intCast(i);
+    prng.random().shuffle(u32, &order);
+    var k: usize = 0;
+    while (k < n) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var txn = try db.begin();
+        const end = @min(n, k + 250);
+        for (order[k..end]) |id| if (id % 10 != 0)
+            try txn.del(longKey(try arena.allocator().create([long_key_len]u8), id));
+        try txn.commit();
+        k = end;
+        _ = try checkTreeShape(&db);
+    }
+    var after: Fill = .{};
+    try countFill(&db, db.meta_rec.root, true, &after);
+    const shape = try checkTreeShape(&db);
+    try testing.expectEqual(@as(usize, n / 10), shape.keys);
+    // Without merging, a scattered delete empties almost no leaf: nearly all
+    // of the original leaves would stay, each a tenth full. With it the
+    // leaves hold the survivors at a quarter full or more.
+    try testing.expect(after.leaves * 4 <= before.leaves);
+    try testing.expect(after.branches < before.branches);
+    try testing.expect(after.underfull_leaves * 4 <= after.leaves);
+    try expectMatchesEvery10th(&db, n);
+}
+
+fn expectMatchesEvery10th(db: *Db, n: usize) !void {
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    var want: u64 = 0;
+    while (try cur.next()) |e| : (want += 10) {
+        try testing.expectEqual(want, std.mem.readInt(u64, e.key[0..8], .big));
+        try testing.expectEqualStrings("v", e.val);
+    }
+    try testing.expectEqual(@as(u64, n), want);
+}
+
+test "a merge that does not fit a page is split again by bytes: leaves of mixed value sizes" {
+    // Big and small values interleaved: a count midpoint would leave halves
+    // of very different sizes; a byte split keeps both above a quarter.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "b.kvt", .{});
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big = try filled(a, 1500, 1);
+    var txn = try db.begin();
+    for (0..400) |id| {
+        var kb: [8]u8 = undefined;
+        std.mem.writeInt(u64, &kb, id, .big);
+        try txn.put(try a.dupe(u8, &kb), if (id % 7 == 0) big else "s");
+    }
+    try txn.commit();
+    for (0..4) |round| {
+        var t = try db.begin();
+        for (0..400) |id| if (id % 4 == round) {
+            var kb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &kb, id, .big);
+            try t.del(try a.dupe(u8, &kb));
+        };
+        try t.commit();
+        const shape = try checkTreeShape(&db);
+        try testing.expectEqual(@as(usize, 400 - 100 * (round + 1)), shape.keys);
+        var fill: Fill = .{};
+        try countFill(&db, db.meta_rec.root, true, &fill);
+        try testing.expect(fill.underfull_leaves * 4 <= fill.leaves);
+        for (0..400) |id| {
+            var kb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &kb, id, .big);
+            try expectGet(&db, &kb, if (id % 4 <= round) null else if (id % 7 == 0) big else "s");
+        }
+    }
+}
+
+// ── giving the file's tail back ─────────────────────────────────────────────
+
+fn fileBytes(sim: *kv.SimStorage, path: []const u8) usize {
+    return sim.fileContent(path).?.len;
+}
+
+/// Fill `n` long keys in one commit, then delete all but the first `keep`.
+fn fillThenShrink(db: *Db, n: usize, keep: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn = try db.begin();
+    for (0..n) |id| try txn.put(longKey(try a.create([long_key_len]u8), id), "v");
+    try txn.commit();
+    var del = try db.begin();
+    for (keep..n) |id| try del.del(longKey(try a.create([long_key_len]u8), id));
+    try del.commit();
+}
+
+/// A few ordinary commits: each moves the tree's live path to the lowest free
+/// pages, and the next one can then give the emptied tail back.
+fn touch(db: *Db, rounds: usize) !void {
+    var kb: [long_key_len]u8 = undefined;
+    for (0..rounds) |r| try db.put(longKey(&kb, 0), if (r % 2 == 0) "a" else "b");
+}
+
+test "a store that loses most of its data gives the end of its file back" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{});
+    defer db.close();
+    try fillThenShrink(&db, 3000, 100);
+    const peak = db.meta_rec.high_water;
+    try testing.expect(peak > 200);
+    try touch(&db, 6);
+    _ = try checkTreeShape(&db); // the pages given back are nobody's now
+    // The tree of 100 keys is a dozen pages; the rest of the file is gone.
+    try testing.expect(db.meta_rec.high_water * 4 < peak);
+    try testing.expectEqual(@as(usize, @intCast(db.meta_rec.high_water * page_size)), fileBytes(&sim, "g.kvt"));
+    var kb: [long_key_len]u8 = undefined;
+    try expectGet(&db, longKey(&kb, 99), "v");
+    try expectGet(&db, longKey(&kb, 100), null);
+
+    // And it opens again: the metas agree with the shorter file.
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{});
+    try expectGet(&db, longKey(&kb, 42), "v");
+    _ = try checkTreeShape(&db);
+}
+
+test "the tail a snapshot can still reach stays until it is released" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "p.kvt", .{});
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        var txn = try db.begin();
+        for (0..3000) |id| try txn.put(longKey(try arena.allocator().create([long_key_len]u8), id), "v");
+        try txn.commit();
+    }
+    var snap = try db.snapshot();
+    var released = false;
+    defer if (!released) snap.release();
+    const peak = db.meta_rec.high_water;
+    {
+        var del = try db.begin();
+        for (100..3000) |id| try del.del(longKey(try arena.allocator().create([long_key_len]u8), id));
+        try del.commit();
+    }
+    try touch(&db, 6);
+    // Every page the snapshot's tree used is still there, and still its.
+    try testing.expect(db.meta_rec.high_water >= peak);
+    var kb: [long_key_len]u8 = undefined;
+    const v = (try snap.get(testing.allocator, longKey(&kb, 2999))).?;
+    testing.allocator.free(v);
+    snap.release();
+    released = true;
+    try touch(&db, 6);
+    try testing.expect(db.meta_rec.high_water * 4 < peak);
+    _ = try checkTreeShape(&db);
+}
+
+test "shrink_min_pages = 0 never gives pages back; the default ignores a small free tail" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "n.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    try fillThenShrink(&db, 3000, 100);
+    const peak = db.meta_rec.high_water;
+    try touch(&db, 6);
+    try testing.expect(db.meta_rec.high_water >= peak);
+    _ = try checkTreeShape(&db);
+
+    // A store that frees fewer than 16 pages at its end keeps its file.
+    var sim2 = kv.SimStorage.init(testing.allocator);
+    defer sim2.deinit();
+    sim2.allow_overwrite = true;
+    var db2 = try Db.open(testing.allocator, sim2.storage(), "s.kvt", .{});
+    defer db2.close();
+    try fillThenShrink(&db2, 60, 50);
+    const hw = db2.meta_rec.high_water;
+    try touch(&db2, 6);
+    try testing.expect(db2.meta_rec.high_water + 16 > hw);
+}
+
+test "overflow values: recovery refuses a chain whose last page is not an overflow page, or whose end is wrong" {
+    const big = try filled(testing.allocator, 3 * format.ovf_data, 5);
+    defer testing.allocator.free(big);
+    for ([_]enum { kind_of_last, next_of_last, next_of_first }{ .kind_of_last, .next_of_last, .next_of_first }) |how| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var pages: [3]PageId = undefined;
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "e.kvt", .{});
+            defer db.close();
+            try db.put("v", big);
+            try db.put("w", "second commit: both metas reach the chain");
+            var page: [page_size]u8 = undefined;
+            try db.pager.readPage(db.meta_rec.root, &page);
+            const leaf = format.Leaf.init(&page);
+            pages[0] = leaf.ovfFirst(leaf.search("v").index);
+            for (1..3) |k| {
+                try db.pager.readPage(pages[k - 1], &page);
+                pages[k] = format.overflowNext(&page).?;
+            }
+        }
+        const off = @as(usize, switch (how) {
+            .kind_of_last, .next_of_last => pages[2],
+            .next_of_first => pages[0],
+        }) * page_size;
+        const bytes = sim.fileContent("e.kvt").?;
+        switch (how) {
+            // The last page, `next` still 0: only its kind byte is wrong.
+            .kind_of_last => bytes[off] = @intFromEnum(format.NodeKind.leaf),
+            // A chain that does not end where its length says.
+            .next_of_last => std.mem.writeInt(u32, bytes[off + 4 ..][0..4], pages[0], .little),
+            .next_of_first => std.mem.writeInt(u32, bytes[off + 4 ..][0..4], 0, .little),
+        }
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "e.kvt", .{}));
+    }
+}
+
+test "after the file is shortened the older meta still opens: it is the fallback if the newest breaks" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var kb: [long_key_len]u8 = undefined;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "f.kvt", .{});
+        defer db.close();
+        try fillThenShrink(&db, 3000, 100);
+        const peak = db.meta_rec.high_water;
+        // Commit until the file itself has shrunk, then once more.
+        var r: usize = 0;
+        while (fileBytes(&sim, "f.kvt") >= peak * page_size) : (r += 1) {
+            try testing.expect(r < 10);
+            try touch(&db, 1);
+        }
+    }
+    // Break the newest meta: `recover` must fall back to the other slot,
+    // whose high water the shortened file still has to cover.
+    const bytes = sim.fileContent("f.kvt").?;
+    var newest: usize = 0;
+    var best: u64 = 0;
+    for ([_]usize{ 0, 1 }) |slot| {
+        const m = format.Meta.decode(bytes[slot * page_size ..][0..page_size]).?;
+        if (m.txn_id >= best) {
+            best = m.txn_id;
+            newest = slot;
+        }
+    }
+    sim.flipByte("f.kvt", newest * page_size + 12);
+    var db = try Db.open(testing.allocator, sim.storage(), "f.kvt", .{});
+    defer db.close();
+    try testing.expectEqual(best - 1, db.meta_rec.txn_id);
+    try expectGet(&db, longKey(&kb, 7), "v");
+}
+
+test "a free tail shorter than shrink_min_pages stays; one at least that long goes" {
+    for ([_]u32{ 16, 2 }) |min| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var db = try Db.open(testing.allocator, sim.storage(), "q.kvt", .{ .shrink_min_pages = min });
+        defer db.close();
+        try fillThenShrink(&db, 200, 140);
+        const hw = db.meta_rec.high_water;
+        // The free tail here is three pages (the last live leaf sits just
+        // below it): under the default threshold, over a threshold of 2.
+        try touch(&db, 6);
+        if (min == 16) {
+            try testing.expect(db.meta_rec.high_water >= hw);
+        } else {
+            try testing.expect(db.meta_rec.high_water + 3 <= hw);
+        }
+        _ = try checkTreeShape(&db);
+    }
 }

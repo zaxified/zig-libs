@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Underfull nodes (under a quarter of a page after a commit) are merged with a
+  sibling, and split again by bytes when the pair does not fit a page (borrow); node splits now
+  balance bytes, not entry counts. Scattered deletes no longer leave a tree of nearly empty
+  leaves.
+- **2026-09-29** — The file shrinks: a free run of at least `Options.shrink_min_pages` (default
+  16, 0 = never) at the end of the file that no snapshot or cursor can reach is given back — the
+  high water drops in that commit and the file is truncated by the next. Allocation now takes the
+  lowest reusable page, so live pages drift to the front of the file.
+
 - **2026-09-29** — Overflow values: a value too large for a page (up to 2 GiB − 1) is stored in a
   chain of overflow pages instead of failing with `error.EntryTooLarge`; `get` and cursors read
   it, `getRef` returns `error.CannotLend` for it. Values that fit a page stay inline as before.

@@ -580,14 +580,19 @@ pub const LeafBuilder = struct {
         encodeLeaf(page, self.entries.items);
     }
 
-    /// Split an overflowing leaf into two, at the entry midpoint. Returns the
+    /// Split an overflowing leaf into two, where the halves' BYTES are closest
+    /// to equal (not their entry counts: with values of mixed sizes a count
+    /// midpoint can leave one half nearly empty, and an underfull half is
+    /// merged straight back by the next commit that touches it). Returns the
     /// right half plus the separator key (== the right half's first key). The
     /// receiver becomes the left half. The separator is the one copy made:
     /// it is promoted into a parent that outlives this leaf's page frame.
     pub fn split(self: *LeafBuilder) !SplitLeaf {
         const n = self.entries.items.len;
         std.debug.assert(n >= 2);
-        const mid = n / 2;
+        const sizes = try self.arena.alloc(usize, n);
+        for (self.entries.items, sizes) |e, *z| z.* = slot_len + leafCellBytes(e.key.len, e.val.len);
+        const mid = balancedCut(sizes, false);
         var right = LeafBuilder.init(self.arena);
         try right.entries.ensureTotalCapacityPrecise(self.arena, n - mid);
         for (self.entries.items[mid..]) |e|
@@ -650,18 +655,25 @@ pub const BranchBuilder = struct {
         return self.byteSize() > page_size;
     }
 
+    pub fn underflows(self: *const BranchBuilder) bool {
+        return self.byteSize() < page_size / 4;
+    }
+
     pub fn encode(self: *const BranchBuilder, page: *[page_size]u8) void {
         encodeBranch(page, self.leftmost, self.cells.items);
     }
 
-    /// Split an overflowing branch. The middle separator is promoted OUT (it
-    /// becomes the parent's separator and does not live in either half — proper
-    /// B-tree branch split), the right half's leftmost child is the promoted
-    /// cell's child.
+    /// Split an overflowing branch where the halves' bytes are closest to
+    /// equal (see `LeafBuilder.split`). The cut separator is promoted OUT (it
+    /// becomes the parent's separator and does not live in either half —
+    /// proper B-tree branch split), the right half's leftmost child is the
+    /// promoted cell's child.
     pub fn split(self: *BranchBuilder) !SplitBranch {
         const n = self.cells.items.len;
         std.debug.assert(n >= 2);
-        const mid = n / 2;
+        const sizes = try self.arena.alloc(usize, n);
+        for (self.cells.items, sizes) |c, *z| z.* = slot_len + branchCellBytes(c.sep.len);
+        const mid = balancedCut(sizes, true);
         const promoted = self.cells.items[mid];
         var right = BranchBuilder.init(self.arena, promoted.child);
         try right.cells.ensureTotalCapacityPrecise(self.arena, self.cells.items.len - mid);
@@ -675,6 +687,29 @@ pub const BranchBuilder = struct {
 };
 
 pub const SplitBranch = struct { right: BranchBuilder, sep: []const u8 };
+
+/// Where to cut a node of cells sized `sizes` (n >= 2) so the larger half is
+/// as small as it can be: the first cell of the right half for a leaf, the
+/// promoted cell for a branch (`promote`: it belongs to neither half). Always
+/// in `1..n-1`, so both halves of a leaf hold an entry, and a branch's left
+/// half keeps a separator.
+fn balancedCut(sizes: []const usize, promote: bool) usize {
+    var total: usize = 0;
+    for (sizes) |z| total += z;
+    var best: usize = 1;
+    var best_max: usize = std.math.maxInt(usize);
+    var left: usize = 0;
+    for (1..sizes.len) |mid| {
+        left += sizes[mid - 1];
+        const right = total - left - (if (promote) sizes[mid] else 0);
+        const worst = @max(left, right);
+        if (worst < best_max) {
+            best_max = worst;
+            best = mid;
+        }
+    }
+    return best;
+}
 
 // ── low-level cell sizing + slotted-page encoders ────────────────────────────
 
@@ -940,4 +975,60 @@ test "branchViewSafe rejects a structurally in-bounds but unsorted slot director
     @memcpy(page[hdr_len .. hdr_len + slot_len], &slot1);
     @memcpy(page[hdr_len + slot_len .. hdr_len + 2 * slot_len], &slot0);
     try testing.expect(branchViewSafe(&page) == null);
+}
+
+test "leaf split cuts where the bytes balance, not at the entry midpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b = LeafBuilder.init(a);
+    const big: [3000]u8 = @splat('b');
+    try b.put("a", &big);
+    for (0..10) |i| try b.put(try std.fmt.allocPrint(a, "k{d}", .{i}), "small");
+    const sp = try b.split();
+    // The big entry alone is the heavier half; a count midpoint would have
+    // put four small ones next to it.
+    try testing.expectEqual(@as(usize, 1), b.entries.items.len);
+    try testing.expectEqual(@as(usize, 10), sp.right.entries.items.len);
+}
+
+test "branch split leaves the promoted separator out of the balance" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Cells of 10, 50 and 50 bytes: promoting the middle one leaves halves of
+    // 10 and 50; counting it on the right would pick the third (60 and 0).
+    var b = BranchBuilder.init(a, 1);
+    const k2: [42]u8 = @splat('c');
+    const k3: [42]u8 = @splat('d');
+    try b.insert("ab", 2);
+    try b.insert(&k2, 3);
+    try b.insert(&k3, 4);
+    const sp = try b.split();
+    try testing.expectEqualStrings(&k2, sp.sep);
+    try testing.expectEqual(@as(usize, 1), b.cells.items.len);
+    try testing.expectEqual(@as(usize, 1), sp.right.cells.items.len);
+}
+
+test "leafViewSafe rejects an overflow reference of length zero" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var b = LeafBuilder.init(arena_state.allocator());
+    const ref = [_]u8{ 9, 0, 0, 0 };
+    try b.putOverflow("k", &ref, 1);
+    var page: [page_size]u8 = undefined;
+    b.encode(&page);
+    try testing.expect(leafViewSafe(&page) != null);
+    try testing.expectEqual(@as(?u32, 1), Leaf.init(&page).ovfLen(0));
+    // Clear the length bits, keep the flag: no value anyone wrote.
+    const o = std.mem.readInt(u16, page[hdr_len..][0..2], .little);
+    std.mem.writeInt(u32, page[o + 2 ..][0..4], ovf_flag, .little);
+    try testing.expect(leafViewSafe(&page) == null);
+}
+
+test "the inline limit is the page: a cell that exactly fills an empty leaf stays inline" {
+    // header 8 + one slot 2 + cell (2 + 4 + key + value) = 4096
+    const vlen = page_size - hdr_len - slot_len - 6 - 1;
+    try testing.expect(fitsInline(1, vlen));
+    try testing.expect(!fitsInline(1, vlen + 1));
 }

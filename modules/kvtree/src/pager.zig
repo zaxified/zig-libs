@@ -37,9 +37,14 @@ pub const Pager = struct {
     /// Total pages the file has been grown to; the next never-used page id.
     /// Mirrors `Meta.high_water`; `core.commit` advances it and persists it.
     high_water: u64,
+    /// Pages the file holds as far as this pager knows: raised by every
+    /// write past it, set by `open` from the file's size and lowered by
+    /// `truncateTo`. It can exceed `high_water` after a commit gave pages
+    /// back (see `core.commit`, "Giving the tail back").
+    file_pages: u64 = 0,
 
     pub fn init(store: kv.Storage, handle: kv.Storage.Handle, high_water: u64) Pager {
-        return .{ .store = store, .handle = handle, .high_water = high_water };
+        return .{ .store = store, .handle = handle, .high_water = high_water, .file_pages = high_water };
     }
 
     /// Read page `id` fully into `buf`. A short read (page not fully present)
@@ -72,6 +77,13 @@ pub const Pager = struct {
     /// `core.commit`). Writing at/after end-of-file extends it.
     pub fn writePage(self: *Pager, id: PageId, buf: *const [page_size]u8) StorageError!void {
         try self.store.writeAll(self.handle, buf, offsetOf(id));
+        self.file_pages = @max(self.file_pages, @as(u64, id) + 1);
+    }
+
+    /// Shorten the file to `pages` pages.
+    pub fn truncateTo(self: *Pager, pages: u64) StorageError!void {
+        try self.store.truncate(self.handle, pages * page_size);
+        self.file_pages = pages;
     }
 
     pub fn sync(self: *Pager) StorageError!void {
@@ -150,6 +162,27 @@ pub const Freelist = struct {
         try self.free_txns.append(gpa, free_txn);
     }
 
+    /// Order the entries by page id, highest first, so `popReusable` -- which
+    /// takes from the end -- hands out the LOWEST reusable page. Live pages
+    /// then drift towards the front of the file and free ones gather at its
+    /// end, where `cutTail` can give them back; taking whichever entry was
+    /// pushed last scattered live pages over the whole file for good.
+    pub fn sortHighestFirst(self: *Freelist, gpa: Allocator) Allocator.Error!void {
+        const Entry = struct { id: PageId, txn: u64 };
+        const tmp = try gpa.alloc(Entry, self.ids.items.len);
+        defer gpa.free(tmp);
+        for (tmp, self.ids.items, self.free_txns.items) |*e, id, txn| e.* = .{ .id = id, .txn = txn };
+        std.mem.sort(Entry, tmp, {}, struct {
+            fn gt(_: void, a: Entry, b: Entry) bool {
+                return a.id > b.id;
+            }
+        }.gt);
+        for (tmp, self.ids.items, self.free_txns.items) |e, *id, *txn| {
+            id.* = e.id;
+            txn.* = e.txn;
+        }
+    }
+
     /// Pull a page that is safe to reuse given the oldest live reader, or null
     /// if none qualifies (caller then grows the file). FABLE-REACHED: the
     /// safety decision is `core.reclaimGate`, a gated stub — so this is only
@@ -166,6 +199,47 @@ pub const Freelist = struct {
             }
         }
         return null;
+    }
+
+    /// Take the free pages at the END of the file off the list and return the
+    /// new high water: the longest run `[k, high_water)` whose every page is
+    /// an entry the reclaim gate lets go -- no open reader can reach it -- or
+    /// `high_water` itself when that run is shorter than `min_pages` (0 =
+    /// never). Every entry was freed by an earlier txn, so none is part of
+    /// the base tree either (the argument `reserveChain` rests on), which is
+    /// why this too must run before the in-flight commit parks its own dead
+    /// pages. Only a free suffix can go: a free page below a live one stays on
+    /// the list, since moving live pages down is compaction, not this.
+    pub fn cutTail(self: *Freelist, gpa: Allocator, high_water: u64, oldest_reader_txn: u64, min_pages: u64) Allocator.Error!u64 {
+        if (min_pages == 0 or high_water <= format.first_data_page) return high_water;
+        // Cheap exit for the common commit: the last page is live.
+        const last: PageId = @intCast(high_water - 1);
+        for (self.ids.items, self.free_txns.items) |id, txn| {
+            if (id == last and core.reclaimGate(txn, oldest_reader_txn)) break;
+        } else return high_water;
+
+        var cand: std.ArrayList(PageId) = .empty;
+        defer cand.deinit(gpa);
+        for (self.ids.items, self.free_txns.items) |id, txn|
+            if (core.reclaimGate(txn, oldest_reader_txn)) try cand.append(gpa, id);
+        std.mem.sort(PageId, cand.items, {}, std.sort.desc(PageId));
+        var new_hw = high_water;
+        for (cand.items) |id| {
+            if (id + 1 != new_hw or new_hw <= format.first_data_page) break;
+            new_hw -= 1;
+        }
+        if (high_water - new_hw < min_pages) return high_water;
+        // Every entry at or above `new_hw` is in the run (a page there that
+        // is not free, or not reusable, would have stopped it), so dropping
+        // them all drops exactly the run.
+        var i: usize = 0;
+        while (i < self.ids.items.len) {
+            if (self.ids.items[i] >= new_hw) {
+                _ = self.ids.swapRemove(i);
+                _ = self.free_txns.swapRemove(i);
+            } else i += 1;
+        }
+        return new_hw;
     }
 
     /// Entries the chain will hold if `extra` more are pushed, rounded up to

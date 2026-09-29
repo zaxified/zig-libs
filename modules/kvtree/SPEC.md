@@ -248,6 +248,42 @@ key is inside its separator range, and every page below `high_water` is a meta,
 tree, freelist-chain or freelist-entry page (a dropped page never handed to the
 freelist would be lost). Six schemata mutants of the change are all killed.
 
+**Underfull nodes are merged** (2026-09-29). A node a commit leaves under a
+quarter of a page is not written at once: `applyRec` hands it up as a pending
+builder, and the parent merges it with a sibling — the right one when there is
+one — into the union of the two. A union that does not fit a page is split
+again where its BYTES balance (`balancedCut`; the split used to cut at the entry
+midpoint, which with mixed value sizes could leave one half nearly empty), so
+merge and borrow are one operation. Both levels: a branch pair pulls the
+separator between them down between the left cells and the right leftmost. The
+sibling's page (or a split piece written earlier in the same commit) is dead
+after it and goes to `ctx.freed`; a merge sets `ctx.dropped`, so a root left
+with one child collapses as after a drop. A pending builder is re-homed into
+the commit arena before it leaves `applyRec`, whose page buffer it borrowed.
+Tests: scattered deletes keeping one key in ten shrink the leaves at least 4×
+and the branches too, with at most a quarter of the leaves underfull; mixed
+value sizes; a crash sweep over a merging commit; the existing model check and
+page accounting run through merges at every level.
+
+**The file gives its tail back** (2026-09-29). A run of free pages at the END
+of the file that the reclaim gate lets go (no reader can reach them) leaves the
+store: `Freelist.cutTail` takes those entries off the list and the commit's
+meta gets the lower high water — before the commit parks its own dead pages,
+for the reason `reserveChain` gives. The file is truncated after fsync #2 to
+the larger of the new meta's and its base's high water: the base meta stays on
+media as `recover`'s fallback, and a meta whose high water exceeds the file is
+rejected, so pages leave the file one commit after they leave the store. A
+failed truncate costs only a longer file. `Options.shrink_min_pages` (default
+16 pages; 0 = never) keeps a store that breathes by a few pages from truncating
+and regrowing every commit. To give the tail a chance to empty, the freelist is
+sorted by page id once per commit and `allocPage` takes the LOWEST reusable
+page, so rewritten live pages drift towards the front of the file. Tests: a
+store that loses most of its data shrinks its file (and reopens), a snapshot
+holds the tail until released, both threshold directions, the older meta still
+opens after a truncate, and a crash sweep over commits that cut and truncate.
+Mutation check (26 schemata mutants over overflow, merge and shrink): all
+killed after the tests the first run asked for.
+
 ## Backlog / deferred (mechanical, orthogonal to the Fable core)
 
 - ~~**Overflow pages**~~ — DONE 2026-09-29 for values (see "On-disk layout"):
@@ -258,14 +294,16 @@ freelist would be lost). Six schemata mutants of the change are all killed.
   recycling with page accounting, a snapshot holding a replaced chain, a broken
   chain (read → `Corrupt`, recovery refuses), `getRef` on both kinds, and the
   crash sweep over commits that write, overwrite and free chains.
-- **Node merge / rebalance-by-borrow** on underflow (today: deletes remove the
-  key in place — an underfull leaf stays as it is until written again, which
-  wastes space but never corrupts; merging and borrowing from a fuller sibling
-  are mechanical additions). The case that made the file grow without bound —
-  a leaf left EMPTY — is handled since 2026-09-28 (see "Emptied nodes leave the
-  tree" above); what is left is space efficiency under random deletes.
-- **Automatic freelist/space reclamation thresholds** and an in-memory page
-  cache (compose with `ramcache`).
+- ~~**Node merge / rebalance-by-borrow**~~ — DONE 2026-09-29, see "Underfull
+  nodes are merged" above.
+- ~~**Automatic freelist/space reclamation thresholds**~~ — DONE 2026-09-29, see
+  "The file gives its tail back" above. The in-memory page cache half is the
+  `pagecache` module (a `Storage` in front of the backend), so nothing is left
+  to compose here.
+- **Compaction** (moving live pages down so a free page BELOW a live one can
+  leave the file too) — not built. The lowest-page-first allocation makes live
+  pages drift down on their own as commits rewrite them, so a store that keeps
+  writing ends up with a free tail; a store that stops writing keeps its holes.
 
 ## Status line
 

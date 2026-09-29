@@ -511,6 +511,134 @@ test "real Db: crash at a commit that writes, overwrites and frees overflow chai
     try crashSweep(3 * format.ovf_data + 17, true);
 }
 
+test "real Db: crash at a commit that merges underfull nodes recovers to one side of it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Each epoch starts from the same committed baseline (a two-level tree of
+    // ~30 leaves) on a fresh sim, then crashes at side effect `crash_at` of a
+    // commit whose scattered deletes leave most leaves underfull, so it merges
+    // siblings (reading them, freeing their pages, writing the unions) and
+    // collapses branches. Recovery must give the baseline or the baseline
+    // without the deleted keys -- never a merge half done.
+    const n = 360;
+    var val: [100]u8 = undefined;
+    @memset(&val, 'm');
+    const modes = [_]kv.CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        const seeds: usize = if (mode == .reorder_unsynced) 3 else 1;
+        for (0..seeds) |seed| {
+            var crash_at: usize = 0;
+            var progressed = false;
+            while (!progressed) : (crash_at += 1) {
+                try testing.expect(crash_at < 400);
+                var sim = kv.SimStorage.init(gpa);
+                defer sim.deinit();
+                sim.allow_overwrite = true;
+                sim.crash_mode = mode;
+                var scratch = std.heap.ArenaAllocator.init(gpa);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                var before = Model.init(a);
+                var after = Model.init(a);
+                {
+                    var db = try kvtree.Db.open(gpa, sim.storage(), "mg.kvt", .{});
+                    defer db.close();
+                    var txn = try db.begin();
+                    for (0..n) |id| {
+                        const key = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                        try txn.put(key, &val);
+                        try before.put(key, &val);
+                        if (id % 6 == 0) try after.put(key, &val);
+                    }
+                    try txn.commit();
+                }
+                sim.reorder_seed = 0x3e7 +% (@as(u64, seed) *% 512 + @as(u64, crash_at)) *% 0x9e3779b97f4a7c15;
+                sim.ops_until_crash = crash_at;
+                attempt: {
+                    var db = kvtree.Db.open(gpa, sim.storage(), "mg.kvt", .{}) catch break :attempt;
+                    defer db.close();
+                    var txn = db.begin() catch break :attempt;
+                    for (0..n) |id| if (id % 6 != 0)
+                        try txn.del(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}));
+                    txn.commit() catch break :attempt;
+                    progressed = true;
+                }
+                sim.reboot();
+                var db = try kvtree.Db.open(gpa, sim.storage(), "mg.kvt", .{});
+                defer db.close();
+                var cur = try db.cursor();
+                defer cur.deinit();
+                const recovered = try drainCursor(&cur, a);
+                try checkRecoveredPrefix(&.{ before.entries(), after.entries() }, recovered);
+            }
+        }
+    }
+}
+
+test "real Db: crash at a commit that gives the file's tail back recovers to one side of it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // A store that lost most of its data: a few ordinary commits later its
+    // free tail is cut (the high water drops) and then truncated (the file
+    // shortens, one commit after). `settle` varies how far that has gone when
+    // the in-flight commit starts, so the sweep crashes inside a cut, inside
+    // a truncate, and inside commits after both.
+    var val: [120]u8 = undefined;
+    @memset(&val, 't');
+    const modes = [_]kv.CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| for (0..4) |settle| {
+        var crash_at: usize = 0;
+        var progressed = false;
+        while (!progressed) : (crash_at += 1) {
+            try testing.expect(crash_at < 200);
+            var sim = kv.SimStorage.init(gpa);
+            defer sim.deinit();
+            sim.allow_overwrite = true;
+            sim.crash_mode = mode;
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var before = Model.init(a);
+            {
+                var db = try kvtree.Db.open(gpa, sim.storage(), "sh.kvt", .{});
+                defer db.close();
+                var txn = try db.begin();
+                for (0..900) |id| try txn.put(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}), &val);
+                try txn.commit();
+                const peak = db.meta_rec.high_water;
+                defer if (settle == 3) {
+                    // Teeth: by now the tail was cut AND the file truncated,
+                    // so the sweep below really crashes around both.
+                    testing.expect(db.meta_rec.high_water * 2 < peak) catch @panic("tail not cut");
+                    testing.expect(sim.fileContent("sh.kvt").?.len < peak * kvtree.page_size) catch @panic("file not truncated");
+                };
+                var del = try db.begin();
+                for (20..900) |id| try del.del(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}));
+                try del.commit();
+                for (0..20) |id| try before.put(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}), &val);
+                for (0..settle) |_| try db.put("key00000", &val);
+            }
+            var after = try before.clone(a);
+            try after.put("key00001", "new");
+            sim.reorder_seed = 0x5a1 +% (@as(u64, settle) *% 256 + @as(u64, crash_at)) *% 0x9e3779b97f4a7c15;
+            sim.ops_until_crash = crash_at;
+            attempt: {
+                var db = kvtree.Db.open(gpa, sim.storage(), "sh.kvt", .{}) catch break :attempt;
+                defer db.close();
+                db.put("key00001", "new") catch break :attempt;
+                progressed = !sim.crashed;
+            }
+            sim.reboot();
+            var db = try kvtree.Db.open(gpa, sim.storage(), "sh.kvt", .{});
+            defer db.close();
+            var cur = try db.cursor();
+            defer cur.deinit();
+            const recovered = try drainCursor(&cur, a);
+            try checkRecoveredPrefix(&.{ before.entries(), after.entries() }, recovered);
+        }
+    };
+}
+
 /// The crash-point sweep behind the two tests above, over values of
 /// `val_len` bytes; with `overwrite`, the baseline key holds such a value too
 /// and every in-flight commit overwrites it with another.
