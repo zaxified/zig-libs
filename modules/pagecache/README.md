@@ -43,6 +43,12 @@ through one would be invisible to the other. kvtree's exclusive lock refuses a
 second opener on a path, so its own usage cannot reach this; a caller driving
 `pc.storage()` directly can.
 
+**Options.** `page_size` (default kvtree's), `max_pages` (required, the RAM
+budget) and `read_ahead_pages` (default `0` = off). With `k > 0` a sequential
+full-page `pread` miss reads the next `k` pages in the same inner read
+(clamped to EOF and the budget); random access never triggers it. Off by
+default; it only cuts inner read *calls*.
+
 `preadRef`/`releasePage` are the zero-copy borrow seam: a borrowed page is not
 an eviction candidate while the borrow is outstanding, so `resident_pages` can
 exceed `max_pages` by the number of live borrows (`borrowed_pages`). kvtree's

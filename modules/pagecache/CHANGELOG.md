@@ -8,6 +8,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — `list` (kv's new optional `Storage.list`) is forwarded to the inner
   `Storage`; `null` when the inner one cannot list.
 
+- **2026-09-29** — Two backlog items done. (1) `truncate` and sub-page/failed writes now
+  invalidate only the affected handle's pages (truncate: only those at or past the new length,
+  partial boundary page included); a borrow across it stays valid. `create_truncate` open,
+  `rename` and `delete` keep the whole-cache `clear()` on purpose (handle -> path is opaque);
+  the narrowings state their one-handle-per-path precondition. (2) Opt-in read-ahead:
+  `Options.read_ahead_pages` (default 0, behaviour unchanged) reads the following pages in one
+  inner `pread` on a sequential full-page miss, clamped to EOF and budget, inserted as ordinary
+  evictable entries only after the read returned; a write-epoch guard keeps it fiber-reentrant.
+  New `Stats.readahead_pages`.
+
 - **2026-09-29** — Contract: fiber-reentrant on one thread. With an inner `Storage` that
   parks the calling fiber on I/O, a second fiber reading the page whose fill was in flight got
   a HIT on the unfilled slot (`preadRef` reserves before it reads) -- and a kvtree commit

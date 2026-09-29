@@ -226,6 +226,29 @@ test "pagecache: F3 copy/allocation cost of a page read, copying seam vs borrow 
         });
     }
 
+    // ── read-ahead variant of the sequential sweep ──────────────────────────
+    // Reports ns and how many inner preads the sweep needed. On this
+    // in-memory backend an inner read is a memcpy, so do NOT read a speedup
+    // into it; the figure that carries over to a real backend is the read
+    // count (`misses` = inner reads issued by the sweep).
+    for ([_]u32{ 0, 7 }) |k| {
+        var sim = kvtree.SimStorage.init(gpa);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = budget_pages, .read_ahead_pages = k });
+        defer pc.deinit();
+        const h = try seed(gpa, &pc);
+        const st = pc.storage();
+        const m0 = pc.misses;
+        const t0 = nowNs();
+        for (0..iters) |i| _ = try st.pread(h, buf, (i % file_pages) * page_size);
+        const ns = (nowNs() - t0) / iters;
+        std.debug.print(
+            "  sweep read_ahead_pages={d}: {d} ns/access, {d} missed accesses, {d} pages read ahead\n",
+            .{ k, ns, pc.misses - m0, pc.stats().readahead_pages },
+        );
+    }
+
     std.debug.print(
         "  (copies/access are byte-exact whole-page copies by construction, not a\n" ++
             "   measurement; allocs/access is counted by a wrapping allocator, and the\n" ++

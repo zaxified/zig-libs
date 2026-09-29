@@ -71,11 +71,27 @@ invalidation is as narrow as its scope:
   the resident set. The backend recycles handle numbers and the key space is
   `(handle, page_index)`, so leaving any of them behind would serve one file's
   bytes for another's.
-- **`create_truncate` open, `truncate`, `rename`, `delete`, non-page-aligned
-  writes, and a failed write** still take a whole-cache `clear()` (a failed
-  full-page write removes just that page). All are rare or never issued by
-  kvtree, which opens `open_or_create`, never truncates in normal operation,
-  never renames or deletes, and only ever writes full pages.
+- **`truncate`** removes only the truncated handle's pages at or past the new
+  length (index `>= len / page_size`: a partial boundary page goes too). The
+  old size, read before the truncate, bounds the candidate span; a small span
+  removes key by key, a large one (`> 4 * max_pages`), an unknown old size or
+  a *failed* truncate (media state unknown) sweeps the handle's prefix. A
+  growing truncate removes nothing: no resident page can lie past the old end.
+  A borrow of a removed page keeps its bytes (ramcache's doomed-entry rule).
+- **Non-page-aligned writes and their failure** drop the writing handle's
+  pages (prefix sweep); a failed full-page write still removes just that page.
+- **`create_truncate` open, `rename`, `delete`** still take a whole-cache
+  `clear()`, deliberately: handle -> path is opaque to the cache, so it cannot
+  tell which *other* still-open handles hold pages of the affected file (F2
+  test case 1 pins exactly that: a truncating open through a second handle
+  must empty the first handle's pages). kvtree never renames or deletes and
+  opens `open_or_create`, so these are rare.
+
+**The narrowings rest on one-handle-per-path** (see below): pages of the same
+file cached under a *different* handle are outside the narrowed scope, which is
+the same precondition write-through already has (a write through h1 never
+refreshes pages cached under h2). Where that cannot be assumed
+(`create_truncate`, `rename`, `delete`) the invalidation stays whole-cache.
 
 ⚠ **What made `close` narrow before 2026-09-03 was a side table** of every
 page index each handle had ever touched. It was populated best-effort, so a
@@ -247,6 +263,33 @@ the copying path's second buffer is the *caller's*, not the cache's), and the
 extra index work over `get`+`put`. Its claim is one fewer copy, not fewer
 nanoseconds; against a real `read(2)` both are noise.
 
+## Read-ahead
+
+`Options.read_ahead_pages = k` (default 0). On a full-page `pread` **miss** of page
+`i` whose handle's previous full-page access (hit, miss or `preadRef`) was page `i-1`,
+the cache asks `size(h)`, clamps to the whole pages present (never past EOF) and to
+`max_pages - 1` extra pages, and issues ONE inner `pread` of up to `k + 1` pages into a
+scratch buffer. Page `i` is copied to the caller; the extra pages are then `put` as
+ordinary, unpinned, evictable entries, extras first and page `i` last (so at a tiny budget
+the requested page is the one that stays). The sequence detector is an 8-slot lossy table
+(a forgotten handle costs one missed read-ahead, never correctness).
+
+Why this is sound:
+- **Budget.** Pages enter through `put`, which enforces `max_pages`; a borrowed page is not
+  an eviction candidate, so read-ahead can never displace one.
+- **Only media bytes.** Extras are inserted only after the read returned, and only the whole
+  pages it returned (a short read or a partial tail page is never cached). A failed inner
+  read caches nothing and falls back to the ordinary single-page read.
+- **Fiber-reentrancy.** No reservations: nothing unfilled is ever visible, so there is
+  nothing for a second fiber to hit. The price is that a write landing during the parked
+  inner read could be overtaken by the older prefetched bytes; a write epoch (bumped on
+  entry and exit of every write/truncate/open-truncate/rename/delete) is compared across
+  the read, and the extras are dropped if it moved. Pinned by a test that writes a
+  prefetched page from inside the inner `pread`.
+
+Not claimed: any speedup. The in-memory `SimStorage` makes an inner read a memcpy;
+`bench.zig` prints a read-ahead sweep for the read count only.
+
 ## Backlog / non-goals
 
 - ~~Not fiber-reentrant: a reserved page is visible before it is filled~~ -- **fixed 2026-09-29**
@@ -254,15 +297,15 @@ nanoseconds; against a real `read(2)` both are noise.
   module doc states the contract ("fiber-reentrant on one thread") and two tests interleave a
   second caller at every inner call (`YieldStorage`), including a kvtree commit running while a
   reader is parked mid-fill of the root page.
-- **Narrowing the remaining `clear()`s.** `close` is narrow (by key prefix);
-  `truncate` still clears every open file's pages although only the truncated
-  handle's are affected — `removeMatching` would narrow it the same way. Not
-  needed for kvtree's access pattern, which does not truncate in normal
-  operation.
+- ~~**Narrowing the remaining `clear()`s.**~~ **DONE 2026-09-29.** `truncate` and
+  sub-page/failed writes are narrowed to the handle (truncate: only pages at or past the new
+  length); `create_truncate` open, `rename` and `delete` stay whole-cache on purpose (see
+  Invalidation: handle -> path is opaque, so other handles on the same file cannot be found).
 - **Write-back / dirty buffering.** Deliberately excluded — incompatible with
   kvtree's ordered-commit durability model.
-- **Prefetch / read-ahead.** A sequential-scan read-ahead could reduce misses
-  during range scans; out of scope for v0 (transparency + bounding first).
+- ~~**Prefetch / read-ahead.**~~ **DONE 2026-09-29**, opt-in (`Options.read_ahead_pages`, default 0 =
+  unchanged behaviour; see Read-ahead below). Only the copying `pread` path prefetches; a
+  `preadRef` miss records the access but does not read ahead (its slot is a single reservation).
 - **Cross-thread sharing.** Inherits `single_owner` from both `ramcache` and
   `kvtree`; a shared deployment must wrap the owner in its own lock.
 

@@ -46,6 +46,16 @@
 //! module is for. See SPEC.md for the full design and the write-back
 //! rejection argument.
 //!
+//! **One handle per path.** Pages are keyed by (handle, page index), so two
+//! handles open on the SAME path are two unrelated key spaces (a write through
+//! one never refreshes the other's pages). Every narrow invalidation here
+//! (`truncate`, sub-page writes, `close`) relies on that precondition; the ones
+//! that cannot (`create_truncate` open, `rename`, `delete`: handle -> path is
+//! opaque) clear the whole cache.
+//!
+//! **Read-ahead** (opt-in, `Options.read_ahead_pages`): see the option and
+//! SPEC.md.
+//!
 //! **Fiber-reentrant on one thread.** Single-owner means one thread, not one
 //! call at a time: when the inner `Storage` parks the calling fiber on its
 //! I/O (qap's io_uring owner ring does), another fiber on the same thread may
@@ -95,6 +105,14 @@ pub const Options = struct {
     /// RAM budget expressed as the maximum number of resident pages. Total
     /// resident value bytes are therefore bounded by `max_pages * page_size`.
     max_pages: usize,
+    /// Sequential read-ahead depth, in pages. `0` (the default) is the module
+    /// exactly as it was: one inner `pread` per missed page. With `k > 0`, a
+    /// full-page `pread` miss on page `i` of a handle whose previous full-page
+    /// access was page `i - 1` reads pages `i .. i + k` in ONE inner `pread`
+    /// (clamped to the file's size and to `max_pages - 1` extra pages) and
+    /// keeps the extra pages as ordinary, unpinned, evictable entries. See
+    /// SPEC.md § "Read-ahead" for the safety argument.
+    read_ahead_pages: u32 = 0,
 };
 
 /// One borrowed page: `bytes` points **into cache storage**, not into a
@@ -136,6 +154,9 @@ pub const Stats = struct {
     /// `preadRef` misses filled straight into cache storage: one copy (the
     /// inner `pread`) instead of the two a `pread` miss pays.
     ref_misses: u64,
+    /// Pages inserted by read-ahead (beyond the one the caller asked for).
+    /// Always 0 when `Options.read_ahead_pages == 0`.
+    readahead_pages: u64,
 };
 
 /// A bounded, write-through page cache in front of one inner `Storage`.
@@ -150,6 +171,21 @@ pub const PageCache = struct {
     ref_hits: u64 = 0,
     ref_misses: u64 = 0,
     gpa: std.mem.Allocator,
+    max_pages: usize,
+    read_ahead_pages: u32,
+    readahead_inserted: u64 = 0,
+    /// Bumped on entry and exit of every operation that can change what media
+    /// holds (`writeAll`, `truncate`, truncating `open`, `rename`, `delete`).
+    /// A read-ahead compares it across its inner `pread`: if it moved, a
+    /// second fiber may have written a page the read is about to describe with
+    /// older bytes, so the prefetched pages are dropped instead of inserted.
+    epoch: u64 = 0,
+    /// Per-handle "last full-page index accessed", a tiny lossy table: a
+    /// forgotten handle only costs one missed read-ahead, never correctness.
+    seq: [seq_slots]SeqSlot = [_]SeqSlot{.{}} ** seq_slots,
+    seq_next: usize = 0,
+    const seq_slots = 8;
+    const SeqSlot = struct { handle: Storage.Handle = 0, last: u64 = 0, valid: bool = false };
     /// Key layout for a cached page: the backend handle (so two files opened
     /// through the same cache never alias) followed by the page index.
     const key_len = 4 + 8;
@@ -170,6 +206,8 @@ pub const PageCache = struct {
             }),
             .page_size = options.page_size,
             .gpa = gpa,
+            .max_pages = options.max_pages,
+            .read_ahead_pages = options.read_ahead_pages,
         };
     }
 
@@ -195,6 +233,7 @@ pub const PageCache = struct {
             .borrowed_pages = self.cache.stats.pinned,
             .ref_hits = self.ref_hits,
             .ref_misses = self.ref_misses,
+            .readahead_pages = self.readahead_inserted,
         };
     }
 
@@ -224,6 +263,7 @@ pub const PageCache = struct {
         if (!self.isFullPage(off, len)) return null;
         const page_index = off / self.page_size;
         const key = pageKey(h, page_index);
+        _ = self.noteAccess(h, page_index);
 
         if (self.cache.pin(&key, 0, 0)) |borrow| {
             self.ref_hits += 1;
@@ -280,6 +320,94 @@ pub const PageCache = struct {
         return k;
     }
 
+    /// Record a full-page access of `h` at `page_index`; returns whether it
+    /// continued a sequential run (the previous one was `page_index - 1`).
+    fn noteAccess(self: *PageCache, h: Storage.Handle, page_index: u64) bool {
+        for (&self.seq) |*sl| {
+            if (sl.valid and sl.handle == h) {
+                const sequential = page_index > 0 and sl.last == page_index - 1;
+                sl.last = page_index;
+                return sequential;
+            }
+        }
+        self.seq[self.seq_next] = .{ .handle = h, .last = page_index, .valid = true };
+        self.seq_next = (self.seq_next + 1) % seq_slots;
+        return false;
+    }
+
+    fn forgetAccess(self: *PageCache, h: Storage.Handle) void {
+        for (&self.seq) |*sl| {
+            if (sl.valid and sl.handle == h) sl.valid = false;
+        }
+    }
+
+    fn dropHandle(self: *PageCache, h: Storage.Handle) void {
+        const prefix = handlePrefix(h);
+        _ = self.cache.removeMatching(&prefix);
+    }
+
+    /// Drop the cached pages of `h` that a truncate to `len` can have changed:
+    /// every page at index `>= len / page_size` (the boundary page, when `len`
+    /// is not page-aligned, is partial afterwards and must go too). ramcache
+    /// has no predicate removal, so this removes the candidate keys one by one
+    /// when their span is small and otherwise sweeps the whole handle by
+    /// prefix (a sound superset). `old_size == null` (or a failed truncate,
+    /// whose media state is unknown) also means the sweep.
+    fn dropFrom(self: *PageCache, h: Storage.Handle, len: u64, old_size: ?u64, known: bool) void {
+        if (known) if (old_size) |os| {
+            const first = len / self.page_size;
+            const end = os / self.page_size + @intFromBool(os % self.page_size != 0);
+            if (end <= first) return; // grew or unchanged: no resident page lies past the old end
+            if (end - first <= 4 * self.max_pages) {
+                var i = first;
+                while (i < end) : (i += 1) {
+                    const key = pageKey(h, i);
+                    _ = self.cache.remove(&key);
+                }
+                return;
+            }
+        };
+        const prefix = handlePrefix(h);
+        _ = self.cache.removeMatching(&prefix);
+    }
+
+    /// Read-ahead on a sequential full-page miss of page `off / page_size`:
+    /// one inner `pread` of up to `read_ahead_pages + 1` pages into a scratch
+    /// buffer. Returns the page-`i` result for the caller (already copied into
+    /// `buf`) or `null` when read-ahead did not apply / did not work and the
+    /// caller must take the ordinary single-page path.
+    fn readAhead(self: *PageCache, h: Storage.Handle, buf: []u8, off: u64) ?usize {
+        const ps = self.page_size;
+        const extra_cap: u64 = @min(self.read_ahead_pages, self.max_pages -| 1);
+        if (extra_cap == 0) return null;
+        const size = self.inner.size(h) catch return null;
+        if (size <= off) return null;
+        const avail_pages = (size - off) / ps; // whole pages present from `off`
+        const total: usize = @intCast(@min(avail_pages, extra_cap + 1));
+        if (total < 2) return null;
+        const tmp = self.gpa.alloc(u8, total * ps) catch return null;
+        defer self.gpa.free(tmp);
+        const epoch0 = self.epoch;
+        const n = self.inner.pread(h, tmp, off) catch return null;
+        if (n < ps) return null; // let the ordinary path see and report it
+        @memcpy(buf, tmp[0..ps]);
+        const got = n / ps; // whole pages media really returned
+        const index = off / ps;
+        if (self.epoch == epoch0) {
+            // Extra pages first, the requested page last, so at a tiny budget
+            // the page the caller asked for is the one that stays.
+            var j: usize = 1;
+            while (j < got) : (j += 1) {
+                const key = pageKey(h, index + j);
+                self.cache.put(&key, tmp[j * ps ..][0..ps], 0, 0, 0);
+                self.readahead_inserted += 1;
+            }
+        }
+        const key = pageKey(h, index);
+        self.cache.put(&key, buf, 0, 0, 0);
+        return ps;
+    }
+
     // ── Storage vtable ───────────────────────────────────────────────────────
 
     const vtable = Storage.VTable{
@@ -307,11 +435,16 @@ pub const PageCache = struct {
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
         const self = cast(ctx);
         const h = try self.inner.open(path, mode);
-        // A truncating open discards the file's contents; any pages we still
-        // hold for a reused handle number would be stale. ramcache exposes no
-        // per-key removal, so drop the whole set — correctness over precision;
-        // this path is rare (kvtree opens open_or_create).
-        if (mode == .create_truncate) self.cache.clear();
+        // A truncating open discards the file's contents. Pages cached under
+        // ANOTHER still-open handle on the same path would go stale, and
+        // handle -> path is opaque here, so this stays a whole-cache clear
+        // (the new handle's own prefix would not cover them; pinned by the F2
+        // test). Rare: kvtree opens open_or_create.
+        if (mode == .create_truncate) {
+            self.epoch +%= 1;
+            self.cache.clear();
+            self.forgetAccess(h);
+        }
         return h;
     }
 
@@ -327,12 +460,16 @@ pub const PageCache = struct {
         if (!self.isFullPage(off, buf.len)) return self.inner.pread(h, buf, off);
 
         const key = pageKey(h, off / self.page_size);
+        const sequential = self.noteAccess(h, off / self.page_size);
         if (self.cache.get(&key, 0, 0)) |cached| {
             @memcpy(buf, cached); // cached.len == page_size == buf.len
             self.hits += 1;
             return self.page_size;
         }
         self.misses += 1;
+        if (sequential and self.read_ahead_pages > 0) {
+            if (self.readAhead(h, buf, off)) |n| return n;
+        }
         const n = try self.inner.pread(h, buf, off);
         // Only a full, present page is a cacheable unit (a short read means the
         // page is not fully on media — never cache a partial page).
@@ -356,12 +493,17 @@ pub const PageCache = struct {
         // invariant in the direction that hides damage. After a failed write
         // the media state is unknown, so the only answer we can honestly give
         // is "absent": drop it and let the next read go to media.
+        self.epoch +%= 1;
+        defer self.epoch +%= 1;
         self.inner.writeAll(h, bytes, off) catch |err| {
             if (self.isFullPage(off, bytes.len)) {
                 const failed_key = pageKey(h, off / self.page_size);
                 _ = self.cache.remove(&failed_key);
             } else {
-                self.cache.clear();
+                // Sub-page/unaligned failed write: media state unknown for
+                // this handle's pages. Narrowed to the handle (precondition:
+                // one handle per path, see SPEC).
+                self.dropHandle(h);
             }
             return err;
         };
@@ -373,10 +515,14 @@ pub const PageCache = struct {
             // succeeds and never mis-admits), else offer it to the cache.
             self.cache.put(&key, bytes, 0, 0, 0);
         } else {
-            // A sub-page or unaligned write could partially overlap resident
-            // pages we cannot selectively invalidate; drop everything to stay
-            // correct. kvtree never issues such a write, so this is defensive.
-            self.cache.clear();
+            // A sub-page or unaligned write could partially overlap several
+            // resident pages we cannot pick out cheaply; drop every page of
+            // THIS handle. Other handles' pages are other files, unless two
+            // handles share a path -- the one-handle-per-path precondition
+            // that write-through already relies on (a write through h1 never
+            // refreshes pages cached under h2). kvtree never issues such a
+            // write, so this is defensive.
+            self.dropHandle(h);
         }
     }
 
@@ -386,13 +532,20 @@ pub const PageCache = struct {
 
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
         const self = cast(ctx);
-        try self.inner.truncate(h, len);
-        // Truncation can drop pages we hold. This clears every open file's
-        // pages, not only this handle's -- `removeMatching(handlePrefix(h))`
-        // would narrow it, but kvtree does not truncate in normal operation,
-        // so the coarse form is left until a caller needs otherwise (SPEC
-        // backlog).
-        self.cache.clear();
+        // Only THIS handle's pages can be affected (the cache key starts with
+        // the handle, and SPEC's precondition is one handle per path), and of
+        // those only the pages at or past the new length -- see `dropFrom`.
+        // The old size bounds the candidate span; it is read before the
+        // truncate because afterwards it is gone.
+        const old_size: ?u64 = self.inner.size(h) catch null;
+        self.epoch +%= 1;
+        const result = self.inner.truncate(h, len);
+        self.epoch +%= 1;
+        // Also on failure: a failed truncate leaves the media state unknown,
+        // and "absent" is the only honest answer (see `vWriteAll`).
+        self.dropFrom(h, len, old_size, if (result) |_| true else |_| false);
+        self.forgetAccess(h);
+        return result;
     }
 
     fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
@@ -414,17 +567,20 @@ pub const PageCache = struct {
         // to a DIFFERENT file through the recycled handle number.
         const prefix = handlePrefix(h);
         _ = self.cache.removeMatching(&prefix);
+        self.forgetAccess(h);
     }
 
     fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
         const self = cast(ctx);
         try self.inner.rename(old_path, new_path);
-        self.cache.clear(); // paths→handles is opaque here; be safe
+        self.epoch +%= 1;
+        self.cache.clear(); // paths→handles is opaque here: cannot tell which handles' pages moved
     }
 
     fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
         const self = cast(ctx);
         try self.inner.delete(path);
+        self.epoch +%= 1;
         self.cache.clear();
     }
 
@@ -1787,4 +1943,412 @@ test "W3: kvtree Txn.getRef -- buffered changes shadow the tree, tree values are
 
     try txn.commit();
     try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
+
+// ── narrowed truncate + read-ahead tests ─────────────────────────────────────
+
+/// Forwarding `Storage` that counts inner `pread`s, can fail the next one, and
+/// can run a hook right after an inner `pread` has read its bytes (the moment a
+/// second fiber could run while the first is parked on I/O).
+const CountingStorage = struct {
+    inner: Storage,
+    preads: usize = 0,
+    fail_next_pread: bool = false,
+    hook: ?*const fn (*CountingStorage) void = null,
+    hook_pc: ?*PageCache = null,
+
+    fn cast(ctx: *anyopaque) *CountingStorage {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
+        return cast(ctx).inner.open(path, mode);
+    }
+    fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+        return cast(ctx).inner.size(h);
+    }
+    fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
+        const self = cast(ctx);
+        self.preads += 1;
+        if (self.fail_next_pread) {
+            self.fail_next_pread = false;
+            return error.NoSpaceLeft;
+        }
+        const n = try self.inner.pread(h, buf, off);
+        if (self.hook) |f| {
+            self.hook = null; // once
+            f(self);
+        }
+        return n;
+    }
+    fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
+        return cast(ctx).inner.writeAll(h, bytes, off);
+    }
+    fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        return cast(ctx).inner.sync(h);
+    }
+    fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
+        return cast(ctx).inner.truncate(h, len);
+    }
+    fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
+        cast(ctx).inner.close(h);
+    }
+    fn vRename(ctx: *anyopaque, a: []const u8, b: []const u8) Storage.Error!void {
+        return cast(ctx).inner.rename(a, b);
+    }
+    fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
+        return cast(ctx).inner.delete(path);
+    }
+    fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
+        return cast(ctx).inner.syncDir();
+    }
+    fn vTryLock(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
+    }
+    const vtable = Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLock,
+    };
+    fn storage(self: *CountingStorage) Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+/// Write `n` pages to `h`, page `i` filled with `base + i`.
+fn fillFile(gpa: std.mem.Allocator, st: Storage, h: Storage.Handle, n: usize, base: u8) !void {
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    for (0..n) |i| {
+        @memset(page, base +% @as(u8, @truncate(i)));
+        try st.writeAll(h, page, i * default_page_size);
+    }
+}
+
+test "narrowed truncate: another handle's pages survive; truncated handle's stale pages are gone after regrow" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const a = try st.open("a", .create_truncate);
+    const b = try st.open("b", .create_truncate);
+    try fillFile(gpa, st, a, 4, 0x10);
+    try fillFile(gpa, st, b, 3, 0x50);
+    try testing.expectEqual(@as(usize, 7), pc.stats().resident_pages);
+
+    // Truncate `a` to 1.5 pages: page 0 stays, page 1 is partial (must go),
+    // pages 2..3 go. `b` is untouched.
+    try st.truncate(a, default_page_size + default_page_size / 2);
+    try testing.expectEqual(@as(usize, 1 + 3), pc.stats().resident_pages);
+
+    // b's pages are still hits: no inner read.
+    var buf: [default_page_size]u8 = undefined;
+    const preads = cs.preads;
+    for (0..3) |i| {
+        _ = try st.pread(b, &buf, i * default_page_size);
+        try testing.expectEqual(@as(u8, 0x50 + @as(u8, @truncate(i))), buf[0]);
+    }
+    _ = try st.pread(a, &buf, 0); // a's page 0 kept: hit
+    try testing.expectEqual(preads, cs.preads);
+    try testing.expectEqual(@as(u8, 0x10), buf[0]);
+
+    // Regrow `a` and write NEW bytes over the old range: never the old ones.
+    // (SimStorage cannot extend by truncate; regrow by writing.)
+    try fillFile(gpa, st, a, 4, 0xA0);
+    for (0..4) |i| {
+        _ = try st.pread(a, &buf, i * default_page_size);
+        try testing.expectEqual(@as(u8, 0xA0 + @as(u8, @truncate(i))), buf[0]);
+    }
+    // Cut again, regrow with only page 0 rewritten: page 1 must not come back
+    // from the cache with its 0xA1 bytes -- the file ends after page 0.
+    try st.truncate(a, default_page_size);
+    try testing.expectEqual(@as(usize, 0), try st.pread(a, &buf, default_page_size));
+    _ = try st.pread(a, &buf, 0); // page 0 (below the cut) keeps its bytes
+    try testing.expectEqual(@as(u8, 0xA0), buf[0]);
+}
+
+test "narrowed truncate: a huge span falls back to the handle sweep and still leaves other handles alone" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 2 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const a = try st.open("a", .create_truncate);
+    const b = try st.open("b", .create_truncate);
+    try fillFile(gpa, st, a, 20, 1); // span 20 > 4 * max_pages: sweep path
+    try fillFile(gpa, st, b, 1, 0x70);
+    try st.truncate(a, 0);
+    var buf: [default_page_size]u8 = undefined;
+    const hits = pc.hits;
+    _ = try st.pread(b, &buf, 0);
+    try testing.expectEqual(hits + 1, pc.hits);
+    try testing.expectEqual(@as(usize, 0), try st.pread(a, &buf, 0));
+}
+
+test "narrowed truncate: a borrow outstanding across it stays valid, other handle unaffected" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try seedPages(gpa, &pc, st, 3);
+    const other = try st.open("other", .create_truncate);
+    try fillFile(gpa, st, other, 1, 0x33);
+
+    const borrowed = (try pc.preadRef(h, default_page_size, default_page_size)).?;
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages); // h:1 + other:0
+
+    try st.truncate(h, default_page_size); // page 1 is now past the end
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages); // only `other`
+    for (borrowed.bytes) |x| try testing.expectEqual(@as(u8, 2), x); // snapshot intact
+    var buf: [default_page_size]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try st.pread(h, &buf, default_page_size)); // no stale hit
+    const hits = pc.hits;
+    _ = try st.pread(other, &buf, 0);
+    try testing.expectEqual(hits + 1, pc.hits);
+    pc.releasePage(borrowed);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
+
+test "narrowed sub-page write: only the written handle's pages are dropped" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const a = try st.open("a", .create_truncate);
+    const b = try st.open("b", .create_truncate);
+    try fillFile(gpa, st, a, 2, 1);
+    try fillFile(gpa, st, b, 2, 9);
+    try st.writeAll(a, "Z", 7);
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages); // b's two
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(a, &buf, 0);
+    try testing.expectEqual(@as(u8, 'Z'), buf[7]);
+}
+
+/// Sequential scan of `n` pages through `st`, returning the concatenation.
+fn scanAll(gpa: std.mem.Allocator, st: Storage, h: Storage.Handle, n: usize) ![]u8 {
+    const out = try gpa.alloc(u8, n * default_page_size);
+    errdefer gpa.free(out);
+    for (0..n) |i| {
+        const got = try st.pread(h, out[i * default_page_size ..][0..default_page_size], i * default_page_size);
+        try testing.expectEqual(@as(usize, default_page_size), got);
+    }
+    return out;
+}
+
+test "read-ahead: a sequential scan makes fewer inner reads and returns identical bytes; off = today's behaviour" {
+    const gpa = testing.allocator;
+    const n = 40;
+    var expect: ?[]u8 = null;
+    defer if (expect) |e| gpa.free(e);
+    var reads: [2]usize = undefined;
+    for ([_]u32{ 0, 7 }, 0..) |k, which| {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var cs = CountingStorage{ .inner = sim.storage() };
+        var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = k });
+        defer pc.deinit();
+        const st = pc.storage();
+        const h = try st.open("f", .create_truncate);
+        try fillFile(gpa, st, h, n, 3);
+        pc.cache.clear();
+        cs.preads = 0;
+        const got = try scanAll(gpa, st, h, n);
+        defer gpa.free(got);
+        reads[which] = cs.preads;
+        if (k == 0) {
+            expect = try gpa.dupe(u8, got);
+            try testing.expectEqual(@as(usize, n), cs.preads);
+            try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+        } else {
+            try testing.expectEqualSlices(u8, expect.?, got);
+            try testing.expect(pc.stats().readahead_pages > 0);
+            try testing.expect(pc.stats().resident_pages <= 16);
+        }
+    }
+    try testing.expect(reads[1] < reads[0] / 2);
+}
+
+test "read-ahead: random (non-sequential) access triggers none" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 4 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 30, 0);
+    pc.cache.clear();
+    cs.preads = 0;
+    var buf: [default_page_size]u8 = undefined;
+    for ([_]usize{ 5, 20, 2, 11, 27, 8, 14 }) |i| _ = try st.pread(h, &buf, i * default_page_size);
+    try testing.expectEqual(@as(usize, 7), cs.preads);
+    try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+}
+
+test "read-ahead: never past end of file, partial tail page never cached" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 4, 1);
+    try st.writeAll(h, "tail", 4 * default_page_size); // 4 whole pages + a 4-byte tail
+    pc.cache.clear();
+    cs.preads = 0;
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    _ = try st.pread(h, &buf, default_page_size); // sequential: pages 1..3 in one read
+    try testing.expectEqual(@as(usize, 2), cs.preads);
+    try testing.expectEqual(@as(usize, 4), pc.stats().resident_pages); // 0..3, not the tail
+    for (2..4) |i| {
+        _ = try st.pread(h, &buf, i * default_page_size);
+        try testing.expectEqual(@as(u8, 1 + @as(u8, @truncate(i))), buf[0]);
+    }
+    try testing.expectEqual(@as(usize, 2), cs.preads);
+    // The tail is not a full page: a short read, returned, never cached.
+    try testing.expectEqual(@as(usize, 4), try st.pread(h, &buf, 4 * default_page_size));
+    try testing.expectEqual(@as(usize, 4), pc.stats().resident_pages);
+}
+
+test "read-ahead: a failed inner read caches nothing false and the ordinary path answers" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 4 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    cs.fail_next_pread = true; // the read-ahead attempt fails ...
+    _ = try st.pread(h, &buf, default_page_size); // ... the fallback single read succeeds
+    try testing.expectEqual(@as(u8, 2), buf[0]);
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages); // pages 0 and 1 only
+    try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+    // Without read-ahead the failure surfaces and nothing is cached.
+    var failing = CountingStorage{ .inner = sim.storage() };
+    var pc2 = PageCache.init(gpa, failing.storage(), .{ .max_pages = 4 });
+    defer pc2.deinit();
+    failing.fail_next_pread = true;
+    try testing.expectError(error.NoSpaceLeft, pc2.storage().pread(h, &buf, 0));
+    try testing.expectEqual(@as(usize, 0), pc2.stats().resident_pages);
+}
+
+fn writeDuringReadAhead(cs: *CountingStorage) void {
+    // A "second fiber" writes page 3 while the first is parked in its inner
+    // pread (whose bytes for page 3 are already the OLD ones).
+    var fresh: [default_page_size]u8 = undefined;
+    @memset(&fresh, 0xEE);
+    cs.hook_pc.?.storage().writeAll(0, &fresh, 3 * default_page_size) catch unreachable;
+}
+
+test "read-ahead: a write landing during the inner read is never overwritten by older prefetched bytes" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 5 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try testing.expectEqual(@as(Storage.Handle, 0), h);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    cs.hook = writeDuringReadAhead;
+    cs.hook_pc = &pc;
+    _ = try st.pread(h, &buf, default_page_size); // read-ahead 1..6, hook writes page 3
+    _ = try st.pread(h, &buf, 3 * default_page_size);
+    for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x);
+}
+
+test "read-ahead: budget of one page still holds and reads stay correct" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 1, .read_ahead_pages = 6 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 10, 1);
+    const got = try scanAll(gpa, st, h, 10);
+    defer gpa.free(got);
+    for (0..10) |i| try testing.expectEqual(@as(u8, 1 + @as(u8, @truncate(i))), got[i * default_page_size]);
+    try testing.expect(pc.stats().resident_pages <= 1);
+}
+
+test "read-ahead: a borrowed page is not evicted by read-ahead" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 4, .read_ahead_pages = 6 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try seedPages(gpa, &pc, st, 12);
+    const borrowed = (try pc.preadRef(h, default_page_size, 11 * default_page_size)).?;
+    const got = try scanAll(gpa, st, h, 11);
+    defer gpa.free(got);
+    for (borrowed.bytes) |x| try testing.expectEqual(@as(u8, 12), x);
+    try testing.expectEqual(@as(usize, 1), pc.stats().borrowed_pages);
+    pc.releasePage(borrowed);
+}
+
+test "read-ahead: transparency, kvtree over PageCache(Sim) with read-ahead == raw Sim" {
+    const gpa = testing.allocator;
+    var raw_sim = kv.SimStorage.init(gpa);
+    defer raw_sim.deinit();
+    raw_sim.allow_overwrite = true;
+    var raw_db = try kvtree.Db.open(gpa, raw_sim.storage(), "t.kvt", .{});
+    defer raw_db.close();
+
+    var cached_sim = kv.SimStorage.init(gpa);
+    defer cached_sim.deinit();
+    cached_sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, cached_sim.storage(), .{ .max_pages = 8, .read_ahead_pages = 4 });
+    defer pc.deinit();
+    var cached_db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer cached_db.close();
+
+    const scratch = try gpa.alloc(u8, 64);
+    defer gpa.free(scratch);
+    try runWorkload(&raw_db, 0xA11CE, 1500, 200, 64, scratch);
+    try runWorkload(&cached_db, 0xA11CE, 1500, 200, 64, scratch);
+
+    const raw_dump = try dumpScan(gpa, &raw_db);
+    defer gpa.free(raw_dump);
+    const cached_dump = try dumpScan(gpa, &cached_db);
+    defer gpa.free(cached_dump);
+    try testing.expectEqualStrings(raw_dump, cached_dump);
+    try testing.expect(raw_dump.len > 0);
+    try testing.expect(pc.cache.stats.entries <= 8);
 }
