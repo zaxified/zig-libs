@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fix (Linux): `runTimeout` / `run` with `Spec.cancel` no longer wait without a
+  deadline for a child that closes its stdout and stderr and keeps running. The killer used to
+  stop at the pipes' EOF; now the run waits for the exit itself (not reaping, so a late signal
+  cannot hit a recycled pid) while the deadline and the token still apply. Found while adding
+  graceful cancellation.
+
 - **2026-09-29** — **Graceful cancellation and line-framed stdout**, both opt-in.
   (1) `Spec.cancel_grace_ns` (default `null` = SIGKILL at once, as before): `Cancel` and
   `runTimeout`'s deadline send SIGTERM first (to the group with `new_process_group`) and SIGKILL

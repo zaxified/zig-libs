@@ -496,6 +496,25 @@ fn childExited(pid: std.posix.pid_t) bool {
     return info.code != 0;
 }
 
+/// Block until `child` has exited, WITHOUT reaping it: the zombie keeps its
+/// pid, so a signal the killer thread sends meanwhile can never reach a
+/// recycled one. Linux only (`waitid` with `WNOWAIT`); elsewhere it returns
+/// at once, and a child that closed its pipes but runs on is waited for, not
+/// killed (see `runKilled`).
+fn waitExitNoReap(child: *std.process.Child) void {
+    if (builtin.os.tag != .linux) return;
+    const id = child.id orelse return;
+    const L = std.os.linux;
+    while (true) {
+        var info = std.mem.zeroes(L.siginfo_t);
+        const rc = L.waitid(.PID, id, &info, L.W.EXITED | L.W.NOWAIT, null);
+        switch (std.posix.errno(rc)) {
+            .INTR => continue,
+            else => return, // exited, or not ours to wait for (ECHILD)
+        }
+    }
+}
+
 const grace_poll_ns: u64 = 5 * std.time.ns_per_ms;
 
 /// Wait up to `grace_ns` for the child to exit; `true` if it did (or `stop`
@@ -1082,6 +1101,13 @@ fn runKilled(
     // `pump_grace_ns` above), so stopping it here is safe. Stop the killer
     // BEFORE reaping so no signal can race a reaped (and possibly reused) pid.
     pumps.join();
+    // The pipes reaching EOF does not mean the child is gone: one that closes
+    // its stdout and stderr and runs on used to stop the killer here, and was
+    // then waited for without a deadline -- `runTimeout` did not return until
+    // the child chose to exit. Wait for the exit itself (not reaping, so the
+    // pid stays ours) while the killer still guards the deadline and the
+    // cancel token.
+    waitExitNoReap(&child);
     finished.store(true, .release);
     killer_wake.set(io);
     killer.join();
@@ -1838,6 +1864,51 @@ test "runTimeout: kills a child that outlives the deadline" {
 
     try testing.expect(out.term == .signal); // SIGKILL'd, not exited
     try testing.expect(elapsed < 5 * std.time.ns_per_s); // returned promptly
+}
+
+test "runTimeout: a child that closes stdout and stderr and runs on is still killed at the deadline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // `waitExitNoReap` is Linux-only
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const start = monoNowNs();
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; sleep 30" },
+    }, "", 200 * std.time.ns_per_ms);
+    defer out.deinit(testing.allocator);
+    const elapsed = monoNowNs() - start;
+
+    try testing.expect(out.term == .signal);
+    try testing.expect(out.timed_out);
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+}
+
+test "Cancel: a child that closes its pipes and runs on is still ended by the token" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    const T = struct {
+        fn later(c: *Cancel, i: std.Io) void {
+            sleepNs(300 * std.time.ns_per_ms);
+            c.request(i);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, T.later, .{ &cancel, io });
+    defer t.join();
+    const start = monoNowNs();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; sleep 30" },
+        .cancel = &cancel,
+    }, "");
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.canceled);
+    try testing.expect(monoNowNs() - start < 5 * std.time.ns_per_s);
 }
 
 test "F1: runTimeout returns within its own deadline even when a backgrounded grandchild keeps stdout's pipe open" {

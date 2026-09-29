@@ -129,9 +129,12 @@ stdout cannot hold the return past the grace, and an unrequested token changes n
   what happened. Streaming: `Handle.terminate(grace_ns) bool` / `terminateGroup` — blocking, from
   the owning thread, `true` = exited within the grace. Windows: no SIGTERM, TerminateProcess at
   once, grace ignored. Non-Linux POSIX: exit is only noticed via pipe EOF (run) or never
-  (`terminate` always SIGKILLs after the grace, harmlessly at a zombie). Known, pre-existing and
-  unchanged: a child that closes its stdout/stderr and keeps running makes `runKilled` stop the
-  killer once the pipes hit EOF, so it is then waited for, not killed.
+  (`terminate` always SIGKILLs after the grace, harmlessly at a zombie). ~~A child that closes its
+  stdout/stderr and keeps running made `runKilled` stop the killer once the pipes hit EOF, so it
+  was then waited for, not killed~~ — fixed 2026-09-29 on Linux: after the pumps end, `runKilled`
+  waits for the exit itself (`waitid` with `WNOWAIT`, so the pid stays ours) while the killer
+  still guards the deadline and the token. Other POSIX targets keep the old behaviour (no
+  non-reaping wait there).
 - ~~**Line-delimited / NDJSON stdout mode**~~ — DONE 2026-09-29. `Callbacks.on_stdout_line`
   (replaces `on_stdout` when set) + `max_line_bytes` (default 1 MiB): `LineFramer` reassembles
   across reads. Decisions: `\n` stripped and ONE trailing `\r` stripped; empty lines delivered;
