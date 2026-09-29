@@ -91,6 +91,7 @@
 //! never set. See the tests at the bottom of this file.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Re-exported so callers can name the types without a second std path.
 pub const Edwards25519 = std.crypto.ecc.Edwards25519;
@@ -371,10 +372,13 @@ pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
 
 /// `std.crypto.dh.X25519` with key generation on the fixed-base comb.
 ///
-/// Same declarations, lengths and byte formats as std's `X25519`;
-/// `scalarmult` (the shared secret against a peer's public key) IS std's
-/// ladder, unchanged. Only `recoverPublicKey` — and through it
-/// `KeyPair.generateDeterministic` / `generate` — takes the comb.
+/// Same declarations, lengths and byte formats as std's `X25519`.
+/// `recoverPublicKey` — and through it `KeyPair.generateDeterministic` /
+/// `generate` — takes the comb. `scalarmult` (the shared secret against a
+/// peer's public key) is the RFC 7748 Montgomery ladder on a 4×64-bit field
+/// core in x86-64 MULX (BMI2) / ADCX+ADOX (ADX) assembly where the build
+/// target has those features, else std's ladder (§ "X25519 shared secret"
+/// below, SPEC.md § P6).
 pub const X25519 = struct {
     const Std = std.crypto.dh.X25519;
 
@@ -424,8 +428,639 @@ pub const X25519 = struct {
         return q.z.add(q.y).mul(q.z.sub(q.y).invert()).toBytes();
     }
 
-    /// Compute the X25519 shared secret — std's ladder, unchanged.
-    pub const scalarmult = Std.scalarmult;
+    /// Compute the X25519 shared secret — byte-exact with std's `scalarmult`,
+    /// including `error.IdentityElement` for an all-zero result (which, for
+    /// a clamped scalar, happens iff `public_key` is a small-order point).
+    /// The backend is fixed at compile time: `x25519_backend`.
+    pub fn scalarmult(secret_key: [secret_length]u8, public_key: [public_length]u8) IdentityElementError![shared_length]u8 {
+        const b: X25519Backend = if (builtin.is_test) (test_hooks.forced orelse x25519_backend) else x25519_backend;
+        switch (b) {
+            .stdlib => return Std.scalarmult(secret_key, public_key),
+            .mulx => if (comptime fe64.bmi2) return sharedSecret(false, secret_key, public_key) else unreachable,
+            .mulx_adx => if (comptime fe64.adx) return sharedSecret(true, secret_key, public_key) else unreachable,
+        }
+    }
+};
+
+// ── X25519 shared secret: a 4×64-bit field core in MULX/ADX assembly (P6) ─
+//
+// qap's TLS churn lane (2026-09-29) had the shared-secret ladder as its
+// largest single item, 18.65 % of CPU. std's field is 5×51-bit limbs with
+// u128 products (25 multiplies per field multiplication); on x86-64 with
+// BMI2 the natural representation is 4×64-bit limbs, 16 `mulx` per
+// multiplication and 10 per squaring, with the 512-bit product folded by
+// `2^256 ≡ 38 (mod p)`. This is the representation of the published x86-64
+// Curve25519 work (Oliveira, López, Hışıl, Faz-Hernández, Rodríguez-
+// Henríquez, "How to (pre-)compute a ladder", SAC 2017; Nath & Sarkar,
+// "Efficient arithmetic in (pseudo-)Mersenne prime order fields", 2018) and
+// is implemented here from that description and from RFC 7748 §5 — no code
+// from any implementation was read or transcribed (SPEC.md § P6,
+// provenance).
+//
+// Representation: `[4]u64`, little-endian limbs, value in `[0, 2^256)`,
+// only CONGRUENT mod p = 2^255 − 19 — never reduced below p until `toBytes`.
+// Every operation maps `[0, 2^256)` into `[0, 2^256)`; there is no
+// intermediate bound to track, which is what makes the arithmetic total.
+//
+// Constant time: every asm block is straight-line (no jump; every address
+// is the one state pointer plus a compile-time offset), and uses only
+// `mov`, `add`/`adc`/`sub`/`sbb`, `adcx`/`adox`, `mulx`, `imul` by a
+// constant, `and`, `xor` — instruction classes Intel lists as having data-
+// operand-independent timing. That is a statement about the instructions,
+// not a guarantee about any microarchitecture (SPEC.md § Threat model).
+// Conditional folds of a carry are a mask (`sbb r,r; and $38,r`), never a
+// branch. The ladder swap is an xor mask; the inversion is a fixed Fermat
+// chain. Evidence: ctgrind target `x25519` (SPEC.md § P6), not this comment.
+
+/// Which implementation computes `X25519.scalarmult`.
+const X25519Backend = enum {
+    /// `std.crypto.dh.X25519.scalarmult`, unchanged.
+    stdlib,
+    /// 4×64-bit field, `mulx` with single `adc` carry chains (BMI2).
+    mulx,
+    /// 4×64-bit field, `mulx` with two carry chains `adcx`/`adox` (BMI2+ADX).
+    mulx_adx,
+};
+
+/// The backend `X25519.scalarmult` uses in this build (tests read it as
+/// `test_hooks.default`): fixed at compile
+/// time from the target's CPU features, and only where the LLVM backend
+/// emits the code (the self-hosted x86 backend is for the edit loop only,
+/// `.claude/rules/zig-pitfalls.md`). A baseline `x86_64` target — or any
+/// other architecture — gets std's ladder.
+const x25519_backend: X25519Backend = if (fe64.adx) .mulx_adx else if (fe64.bmi2) .mulx else .stdlib;
+
+/// Test-only: force a backend so one test run holds every compiled path to
+/// std. Empty outside `zig test`, so no production path can read it.
+pub const test_hooks = if (builtin.is_test) struct {
+    pub var forced: ?X25519Backend = null;
+
+    /// The backend this build dispatches to when nothing is forced.
+    pub const default = x25519_backend;
+
+    /// Whether `b` is compiled into this build.
+    pub fn available(b: X25519Backend) bool {
+        return switch (b) {
+            .stdlib => true,
+            .mulx => fe64.bmi2,
+            .mulx_adx => fe64.adx,
+        };
+    }
+} else struct {};
+
+/// RFC 7748 §5 `X25519(k, u)` on the 4×64 field, then std's all-zero check.
+fn sharedSecret(comptime adx: bool, secret_key: [32]u8, public_key: [32]u8) std.crypto.errors.IdentityElementError![32]u8 {
+    var k = secret_key;
+    defer std.crypto.secureZero(u8, &k);
+    Edwards25519.scalar.clamp(&k); // std's clamp: bits 0-2 and 255 cleared, 254 set
+    const out = ladder(adx, &k, &public_key);
+    // std returns `error.IdentityElement` when the result is zero, and the
+    // shape is kept. The zero flag is computed without a branch; the one
+    // branch is on that flag, which is a function of the PUBLIC point alone:
+    // a clamped `k` is `8·m` with `k ∈ [2^254, 2^255)`, so `k·P = O` iff the
+    // order of `P` divides 8 (curve) or 4 (twist) — the prime-order parts `L`
+    // and `L'` cannot divide `k` (`8L`, `4L'` fall outside the range or are
+    // not multiples of 8; SPEC.md § P6). It is therefore declassified for
+    // memcheck (a no-op without `-fvalgrind`), so the ctgrind harness keeps
+    // measuring the secret instead of flagging an RFC 7748 §6.1 check.
+    var acc: u8 = 0;
+    for (out) |byte| acc |= byte;
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&acc));
+    if (acc == 0) return error.IdentityElement;
+    return out;
+}
+
+/// The Montgomery ladder of RFC 7748 §5 over bits 254..0 of the clamped `k`
+/// (bit 255 is zero after clamping — std's `ladder(p, s, 255)` does the same
+/// 255 steps), `u` with its top bit masked.
+fn ladder(comptime adx: bool, k: *const [32]u8, u: *const [32]u8) [32]u8 {
+    const F = fe64.Ops(adx);
+    var st: fe64.State = undefined;
+    st[@intFromEnum(fe64.Slot.x1)] = fe64.fromBytes(u);
+    st[@intFromEnum(fe64.Slot.x2)] = .{ 1, 0, 0, 0 };
+    st[@intFromEnum(fe64.Slot.z2)] = .{ 0, 0, 0, 0 };
+    st[@intFromEnum(fe64.Slot.x3)] = st[@intFromEnum(fe64.Slot.x1)];
+    st[@intFromEnum(fe64.Slot.z3)] = .{ 1, 0, 0, 0 };
+    var swap: u64 = 0;
+    var t: usize = 255;
+    while (t > 0) {
+        t -= 1;
+        const bit: u64 = (k[t >> 3] >> @as(u3, @truncate(t))) & 1;
+        swap ^= bit;
+        fe64.cswap(swap, &st, .x2, .x3);
+        fe64.cswap(swap, &st, .z2, .z3);
+        swap = bit;
+        F.add(&st, .a, .x2, .z2); // A = x2 + z2
+        F.sq(&st, .aa, .a); // AA = A²
+        F.sub(&st, .b, .x2, .z2); // B = x2 − z2
+        F.sq(&st, .bb, .b); // BB = B²
+        F.sub(&st, .e, .aa, .bb); // E = AA − BB
+        F.add(&st, .c, .x3, .z3); // C = x3 + z3
+        F.sub(&st, .d, .x3, .z3); // D = x3 − z3
+        F.fmul(&st, .da, .d, .a); // DA = D·A
+        F.fmul(&st, .cb, .c, .b); // CB = C·B
+        F.add(&st, .t, .da, .cb);
+        F.sq(&st, .x3, .t); // x3 = (DA + CB)²
+        F.sub(&st, .t, .da, .cb);
+        F.sq(&st, .t, .t);
+        F.fmul(&st, .z3, .x1, .t); // z3 = x1·(DA − CB)²
+        F.fmul(&st, .x2, .aa, .bb); // x2 = AA·BB
+        F.mul121665(&st, .t, .e);
+        F.add(&st, .t, .aa, .t);
+        F.fmul(&st, .z2, .e, .t); // z2 = E·(AA + a24·E)
+    }
+    fe64.cswap(swap, &st, .x2, .x3);
+    fe64.cswap(swap, &st, .z2, .z3);
+    F.invert(&st, .zi, .z2);
+    F.fmul(&st, .r, .x2, .zi);
+    return fe64.toBytes(&st[@intFromEnum(fe64.Slot.r)]);
+}
+
+/// GF(2^255 − 19) on four 64-bit limbs; see the section comment above.
+const fe64 = struct {
+    const Limbs = [4]u64;
+
+    /// Inline asm only where LLVM emits it — never the self-hosted backend.
+    const x86_asm = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm;
+    const bmi2 = x86_asm and std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
+    const adx = bmi2 and std.Target.x86.featureSetHas(builtin.cpu.features, .adx);
+
+    /// Every field element the ladder and the inversion touch lives in ONE
+    /// array, and an operation names its operands by slot: the asm then
+    /// needs a single base register and addresses each operand at a
+    /// compile-time offset from it. Three pointer operands plus the eleven
+    /// registers the multiplication uses do not fit once LLVM reserves a
+    /// frame/base pointer (ReleaseFast: "inline assembly requires more
+    /// registers than available").
+    const Slot = enum(u8) {
+        x1,
+        x2,
+        z2,
+        x3,
+        z3,
+        a,
+        aa,
+        b,
+        bb,
+        e,
+        c,
+        d,
+        da,
+        cb,
+        t,
+        zi,
+        r, // ladder
+        v2,
+        v9,
+        v11,
+        v5,
+        v10,
+        v20,
+        v40,
+        v50,
+        v100,
+        v200,
+        v250, // inversion chain
+        p,
+        q, // tests only
+    };
+    const State = [@typeInfo(Slot).@"enum".fields.len]Limbs;
+
+    /// RFC 7748 §5 decodeUCoordinate: little-endian, top bit masked. A value
+    /// in `[p, 2^255)` is kept as is — it is congruent, which is all the
+    /// arithmetic needs.
+    fn fromBytes(s: *const [32]u8) Limbs {
+        return .{
+            std.mem.readInt(u64, s[0..8], .little),
+            std.mem.readInt(u64, s[8..16], .little),
+            std.mem.readInt(u64, s[16..24], .little),
+            std.mem.readInt(u64, s[24..32], .little) & 0x7fff_ffff_ffff_ffff,
+        };
+    }
+
+    /// Fully reduce `[0, 2^256)` to `[0, p)` and encode — branch-free.
+    fn toBytes(a: *const Limbs) [32]u8 {
+        // v = a mod 2^255 + 19·a[255]  ∈ [0, 2^255 + 19)
+        const top = a[3] >> 63;
+        var v: u256 = @as(u256, a[3] & 0x7fff_ffff_ffff_ffff) << 192 |
+            @as(u256, a[2]) << 128 | @as(u256, a[1]) << 64 | a[0];
+        v += (0 -% top) & 19;
+        // v ≥ p  ⇔  bit 255 of v + 19 is set; then the answer is v + 19 − 2^255.
+        const w = v + 19;
+        const ge: u256 = 0 -% (w >> 255);
+        const r = ((w & ~(@as(u256, 1) << 255)) & ge) | (v & ~ge);
+        var out: [32]u8 = undefined;
+        std.mem.writeInt(u256, &out, r, .little);
+        return out;
+    }
+
+    /// Swap slots `a` and `b` iff `swap == 1`, by an xor mask (RFC 7748 §5
+    /// cswap).
+    fn cswap(swap: u64, st: *State, comptime a: Slot, comptime b: Slot) void {
+        const m = 0 -% swap;
+        for (&st[@intFromEnum(a)], &st[@intFromEnum(b)]) |*x, *y| {
+            const t = m & (x.* ^ y.*);
+            x.* ^= t;
+            y.* ^= t;
+        }
+    }
+
+    const clobbers: std.builtin.assembly.Clobbers = .{
+        .rax = true,
+        .rbx = true,
+        .rdx = true,
+        .r8 = true,
+        .r9 = true,
+        .r10 = true,
+        .r11 = true,
+        .r12 = true,
+        .r13 = true,
+        .r14 = true,
+        .r15 = true,
+        .cc = true,
+        .memory = true,
+    };
+
+    /// The asm bodies below address their operands as `N(%[o])`, `N(%[a])`,
+    /// `N(%[b])`; this rewrites each to `N+<slot offset>(%[p])` against the
+    /// one state pointer.
+    fn rebase(comptime src: []const u8, comptime o: Slot, comptime a: Slot, comptime b: Slot) []const u8 {
+        comptime {
+            @setEvalBranchQuota(10_000_000);
+            var s = src;
+            for (.{ .{ "(%[o])", o }, .{ "(%[a])", a }, .{ "(%[b])", b } }) |r| {
+                s = replace(s, r[0], std.fmt.comptimePrint("+{d}(%[p])", .{@as(usize, @intFromEnum(r[1])) * @sizeOf(Limbs)}));
+            }
+            return s;
+        }
+    }
+
+    fn replace(comptime s: []const u8, comptime needle: []const u8, comptime with: []const u8) []const u8 {
+        comptime {
+            @setEvalBranchQuota(10_000_000);
+            var buf: [std.mem.replacementSize(u8, s, needle, with)]u8 = undefined;
+            _ = std.mem.replace(u8, s, needle, with, &buf);
+            const final = buf;
+            return &final;
+        }
+    }
+
+    fn Ops(comptime use_adx: bool) type {
+        return struct {
+            inline fn run(comptime body: []const u8, st: *State, comptime o: Slot, comptime a: Slot, comptime b: Slot) void {
+                asm volatile (rebase(body, o, a, b)
+                    :
+                    : [p] "r" (st),
+                    : clobbers);
+            }
+
+            /// `o = a · b`. `o` may alias an input on the ADX path, which
+            /// writes `o` only after its last read; the MULX-only path parks
+            /// finished product words in `o` mid-way, so there it must not.
+            inline fn fmul(st: *State, comptime o: Slot, comptime a: Slot, comptime b: Slot) void {
+                if (use_adx) {
+                    run(mul_adx, st, o, a, b);
+                } else {
+                    comptime std.debug.assert(o != a and o != b);
+                    run(mul_mulx, st, o, a, b);
+                }
+            }
+
+            /// `o = a²`; `o` may alias `a` (written after the last read).
+            inline fn sq(st: *State, comptime o: Slot, comptime a: Slot) void {
+                run(sq_mulx, st, o, a, a);
+            }
+
+            /// `o = a + b`; `o` may alias either input.
+            inline fn add(st: *State, comptime o: Slot, comptime a: Slot, comptime b: Slot) void {
+                run(add_asm, st, o, a, b);
+            }
+
+            /// `o = a − b`; `o` may alias either input.
+            inline fn sub(st: *State, comptime o: Slot, comptime a: Slot, comptime b: Slot) void {
+                run(sub_asm, st, o, a, b);
+            }
+
+            /// `o = a · 121665` — RFC 7748's `a24 = (486662 − 2) / 4`.
+            inline fn mul121665(st: *State, comptime o: Slot, comptime a: Slot) void {
+                run(mul121665_asm, st, o, a, a);
+            }
+
+            /// `o = a^(2^n)`, `n ≥ 1`.
+            inline fn sqN(st: *State, comptime o: Slot, comptime a: Slot, comptime n: usize) void {
+                sq(st, o, a);
+                for (1..n) |_| sq(st, o, o);
+            }
+
+            /// `o = z^(p−2)` by a fixed chain of 254 squarings and 11
+            /// multiplications (the count Bernstein gives in "Curve25519: new
+            /// Diffie-Hellman speed records", PKC 2006); `0 ↦ 0`, as std's
+            /// `invert`. The exponent of each intermediate is in the comments.
+            /// Uses slots `t` and `v*`; `o` must be none of them.
+            fn invert(st: *State, comptime o: Slot, comptime z: Slot) void {
+                sq(st, .v2, z); // 2
+                sqN(st, .t, .v2, 2); // 8
+                fmul(st, .v9, .t, z); // 9
+                fmul(st, .v11, .v9, .v2); // 11
+                sq(st, .t, .v11); // 22
+                fmul(st, .v5, .t, .v9); // 2^5 − 1
+                sqN(st, .t, .v5, 5);
+                fmul(st, .v10, .t, .v5); // 2^10 − 1
+                sqN(st, .t, .v10, 10);
+                fmul(st, .v20, .t, .v10); // 2^20 − 1
+                sqN(st, .t, .v20, 20);
+                fmul(st, .v40, .t, .v20); // 2^40 − 1
+                sqN(st, .t, .v40, 10);
+                fmul(st, .v50, .t, .v10); // 2^50 − 1
+                sqN(st, .t, .v50, 50);
+                fmul(st, .v100, .t, .v50); // 2^100 − 1
+                sqN(st, .t, .v100, 100);
+                fmul(st, .v200, .t, .v100); // 2^200 − 1
+                sqN(st, .t, .v200, 50);
+                fmul(st, .v250, .t, .v50); // 2^250 − 1
+                sqN(st, .t, .v250, 5); // 2^255 − 2^5
+                fmul(st, o, .t, .v11); // 2^255 − 21 = p − 2
+            }
+        };
+    }
+
+    // ── the asm bodies (AT&T syntax: `op src, dst`; `mulx src, lo, hi`) ──
+    //
+    // All read their operands through `N(%[a])`/`N(%[b])` and write the
+    // result through `N(%[o])` — `rebase` turns those into offsets from the
+    // one state pointer. Every body reads its inputs completely before its
+    // first store to `o` except `mul_mulx`, which parks the three finished
+    // low words of the product in `o` to free registers (so `Ops.fmul`
+    // asserts `o` distinct from its inputs there).
+
+    /// Fold a 5-word value `r8,r9,r10,r11 + 2^256·<top>` (top < 2^32) into
+    /// four words: `+38·top`, then one more `+38` if that carried (a second
+    /// carry is impossible: after a wrap the low words are < 38·2^32).
+    fn foldTop(comptime top: []const u8, comptime w: [4][]const u8) []const u8 {
+        return "imulq $38, " ++ top ++ ", %%rax\n" ++
+            "addq %%rax, " ++ w[0] ++ "\n" ++
+            "adcq $0, " ++ w[1] ++ "\n" ++
+            "adcq $0, " ++ w[2] ++ "\n" ++
+            "adcq $0, " ++ w[3] ++ "\n" ++
+            "sbbq %%rax, %%rax\n" ++
+            "andq $38, %%rax\n" ++
+            "addq %%rax, " ++ w[0] ++ "\n" ++
+            "movq " ++ w[0] ++ ", 0(%[o])\n" ++
+            "movq " ++ w[1] ++ ", 8(%[o])\n" ++
+            "movq " ++ w[2] ++ ", 16(%[o])\n" ++
+            "movq " ++ w[3] ++ ", 24(%[o])\n";
+    }
+
+    /// 512-bit product in r8..r15 (t0..t7) → `t0..t3 + 38·(t4..t7)`, single
+    /// carry chain (MULX only). The five-word `38·high` is formed first in
+    /// rax,rbx,r12,r13,r15, then added to the low half.
+    const reduce_r8_r15 =
+        \\movl $38, %%edx
+        \\mulxq %%r12, %%rax, %%r12
+        \\mulxq %%r13, %%rbx, %%r13
+        \\addq %%r12, %%rbx
+        \\mulxq %%r14, %%r12, %%r14
+        \\adcq %%r13, %%r12
+        \\mulxq %%r15, %%r13, %%r15
+        \\adcq %%r14, %%r13
+        \\adcq $0, %%r15
+        \\addq %%rax, %%r8
+        \\adcq %%rbx, %%r9
+        \\adcq %%r12, %%r10
+        \\adcq %%r13, %%r11
+        \\adcq $0, %%r15
+        \\
+    ++ foldTop("%%r15", .{ "%%r8", "%%r9", "%%r10", "%%r11" });
+
+    /// Same reduction with two interleaved carry chains (ADX): CF carries
+    /// the low words of `38·t_{4+j}` into t_j, OF the high words into
+    /// t_{j+1}; rbx is the zero register.
+    const reduce_r8_r15_adx =
+        \\movl $38, %%edx
+        \\xorl %%ebx, %%ebx
+        \\mulxq %%r12, %%rax, %%r12
+        \\adcxq %%rax, %%r8
+        \\adoxq %%r12, %%r9
+        \\mulxq %%r13, %%rax, %%r13
+        \\adcxq %%rax, %%r9
+        \\adoxq %%r13, %%r10
+        \\mulxq %%r14, %%rax, %%r14
+        \\adcxq %%rax, %%r10
+        \\adoxq %%r14, %%r11
+        \\mulxq %%r15, %%rax, %%r15
+        \\adcxq %%rax, %%r11
+        \\adoxq %%rbx, %%r15
+        \\adcxq %%rbx, %%r15
+        \\
+    ++ foldTop("%%r15", .{ "%%r8", "%%r9", "%%r10", "%%r11" });
+
+    /// Row 0 of a schoolbook product, `a · b0` into r8..r12 (one chain).
+    const row0 =
+        \\movq 0(%[b]), %%rdx
+        \\mulxq 0(%[a]), %%r8, %%r9
+        \\mulxq 8(%[a]), %%rax, %%r10
+        \\addq %%rax, %%r9
+        \\mulxq 16(%[a]), %%rax, %%r11
+        \\adcq %%rax, %%r10
+        \\mulxq 24(%[a]), %%rax, %%r12
+        \\adcq %%rax, %%r11
+        \\adcq $0, %%r12
+        \\
+    ;
+
+    /// Row `i` (1..3) with ADX: `a · b_i` accumulated into t_i..t_{i+4};
+    /// `xor` zeroes the fresh top word t_{i+4} and clears CF and OF.
+    fn rowAdx(comptime i: u8, comptime t: [5][]const u8) []const u8 {
+        const off = std.fmt.comptimePrint("{d}", .{8 * @as(u32, i)});
+        var s: []const u8 = "movq " ++ off ++ "(%[b]), %%rdx\n" ++
+            "xorl " ++ t[4] ++ "d, " ++ t[4] ++ "d\n";
+        for (0..4) |j| {
+            const aoff = std.fmt.comptimePrint("{d}", .{8 * j});
+            s = s ++ "mulxq " ++ aoff ++ "(%[a]), %%rax, %%rbx\n" ++
+                "adcxq %%rax, " ++ t[j] ++ "\n" ++
+                "adoxq %%rbx, " ++ t[j + 1] ++ "\n";
+        }
+        return s ++ "adcq $0, " ++ t[4] ++ "\n";
+    }
+
+    const mul_adx = row0 ++
+        rowAdx(1, .{ "%%r9", "%%r10", "%%r11", "%%r12", "%%r13" }) ++
+        rowAdx(2, .{ "%%r10", "%%r11", "%%r12", "%%r13", "%%r14" }) ++
+        rowAdx(3, .{ "%%r11", "%%r12", "%%r13", "%%r14", "%%r15" }) ++
+        reduce_r8_r15_adx;
+
+    /// Row `i` (1..3), MULX only: the row product `a · b_i` is formed as five
+    /// words in r13,r14,r15,rbx,<top> with one chain, then added into
+    /// t_i..t_{i+3},<top> with a second. `top` holds t_{i−1} on entry, which
+    /// is final by then: it is parked in `o[i−1]` and the register reused as
+    /// the new top word t_{i+4}.
+    fn rowMulx(comptime i: u8, comptime t: [4][]const u8, comptime top: []const u8) []const u8 {
+        const off = std.fmt.comptimePrint("{d}", .{8 * @as(u32, i)});
+        const park = std.fmt.comptimePrint("{d}", .{8 * (@as(u32, i) - 1)});
+        return "movq " ++ top ++ ", " ++ park ++ "(%[o])\n" ++
+            "movq " ++ off ++ "(%[b]), %%rdx\n" ++
+            \\mulxq 0(%[a]), %%r13, %%r14
+            \\mulxq 8(%[a]), %%rax, %%r15
+            \\addq %%rax, %%r14
+            \\mulxq 16(%[a]), %%rax, %%rbx
+            \\adcq %%rax, %%r15
+            \\
+        ++ "mulxq 24(%[a]), %%rax, " ++ top ++ "\n" ++
+            "adcq %%rax, %%rbx\n" ++
+            "adcq $0, " ++ top ++ "\n" ++
+            "addq %%r13, " ++ t[0] ++ "\n" ++
+            "adcq %%r14, " ++ t[1] ++ "\n" ++
+            "adcq %%r15, " ++ t[2] ++ "\n" ++
+            "adcq %%rbx, " ++ t[3] ++ "\n" ++
+            "adcq $0, " ++ top ++ "\n";
+    }
+
+    // Register walk (t_k = product word k): after row 0 t0..t4 = r8..r12;
+    // row 1 parks t0 and reuses r8 as t5; row 2 parks t1, r9 = t6; row 3
+    // parks t2, r10 = t7. Product: o[0..3) = t0..t2, r11 = t3, and
+    // t4..t7 = r12, r8, r9, r10.
+    const mul_mulx = row0 ++
+        rowMulx(1, .{ "%%r9", "%%r10", "%%r11", "%%r12" }, "%%r8") ++
+        rowMulx(2, .{ "%%r10", "%%r11", "%%r12", "%%r8" }, "%%r9") ++
+        rowMulx(3, .{ "%%r11", "%%r12", "%%r8", "%%r9" }, "%%r10") ++
+        // 38·(t4..t7) as five words r13,r14,r15,rbx,r12, then + (t0..t3).
+        \\movl $38, %%edx
+        \\mulxq %%r12, %%r13, %%r14
+        \\mulxq %%r8, %%rax, %%r15
+        \\addq %%rax, %%r14
+        \\mulxq %%r9, %%rax, %%rbx
+        \\adcq %%rax, %%r15
+        \\mulxq %%r10, %%rax, %%r12
+        \\adcq %%rax, %%rbx
+        \\adcq $0, %%r12
+        \\addq 0(%[o]), %%r13
+        \\adcq 8(%[o]), %%r14
+        \\adcq 16(%[o]), %%r15
+        \\adcq %%r11, %%rbx
+        \\adcq $0, %%r12
+        \\
+    ++ foldTop("%%r12", .{ "%%r13", "%%r14", "%%r15", "%%rbx" });
+
+    /// Squaring: the six cross products a_i·a_j (i < j) into t1..t6, doubled
+    /// by an add chain into t1..t7, plus the four squares a_i² on the
+    /// diagonal — 10 `mulx`. One chain at a time, so MULX only.
+    const sq_mulx =
+        // a0·(a1, a2, a3) → t1..t4 = r9..r12
+        \\movq 0(%[a]), %%rdx
+        \\mulxq 8(%[a]), %%r9, %%r10
+        \\mulxq 16(%[a]), %%rax, %%r11
+        \\addq %%rax, %%r10
+        \\mulxq 24(%[a]), %%rax, %%r12
+        \\adcq %%rax, %%r11
+        \\adcq $0, %%r12
+        // a1·(a2, a3): three words (rax, r15, r13) at t3..t5
+        \\movq 8(%[a]), %%rdx
+        \\mulxq 16(%[a]), %%rax, %%rbx
+        \\mulxq 24(%[a]), %%r15, %%r13
+        \\addq %%rbx, %%r15
+        \\adcq $0, %%r13
+        \\addq %%rax, %%r11
+        \\adcq %%r15, %%r12
+        \\adcq $0, %%r13
+        // a2·a3 → t5, t6 = r13, r14
+        \\movq 16(%[a]), %%rdx
+        \\mulxq 24(%[a]), %%rax, %%r14
+        \\addq %%rax, %%r13
+        \\adcq $0, %%r14
+        // ×2 into t1..t7 (r15 = t7 = the bit shifted out)
+        \\xorl %%r15d, %%r15d
+        \\addq %%r9, %%r9
+        \\adcq %%r10, %%r10
+        \\adcq %%r11, %%r11
+        \\adcq %%r12, %%r12
+        \\adcq %%r13, %%r13
+        \\adcq %%r14, %%r14
+        \\adcq $0, %%r15
+        // + a0², a1², a2², a3² on the diagonal (t0 = r8); `mov` and `mulx`
+        // leave CF alone, so this is one chain
+        \\movq 0(%[a]), %%rdx
+        \\mulxq %%rdx, %%r8, %%rax
+        \\addq %%rax, %%r9
+        \\movq 8(%[a]), %%rdx
+        \\mulxq %%rdx, %%rax, %%rbx
+        \\adcq %%rax, %%r10
+        \\adcq %%rbx, %%r11
+        \\movq 16(%[a]), %%rdx
+        \\mulxq %%rdx, %%rax, %%rbx
+        \\adcq %%rax, %%r12
+        \\adcq %%rbx, %%r13
+        \\movq 24(%[a]), %%rdx
+        \\mulxq %%rdx, %%rax, %%rbx
+        \\adcq %%rax, %%r14
+        \\adcq %%rbx, %%r15
+        \\
+    ++ reduce_r8_r15;
+
+    /// `a + b`: a 257-bit sum, the carry folded as +38, and a second +38 if
+    /// that fold carried (then the low words are < 38, so no third).
+    const add_asm =
+        \\movq 0(%[a]), %%r8
+        \\movq 8(%[a]), %%r9
+        \\movq 16(%[a]), %%r10
+        \\movq 24(%[a]), %%r11
+        \\addq 0(%[b]), %%r8
+        \\adcq 8(%[b]), %%r9
+        \\adcq 16(%[b]), %%r10
+        \\adcq 24(%[b]), %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\addq %%rax, %%r8
+        \\adcq $0, %%r9
+        \\adcq $0, %%r10
+        \\adcq $0, %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\addq %%rax, %%r8
+        \\movq %%r8, 0(%[o])
+        \\movq %%r9, 8(%[o])
+        \\movq %%r10, 16(%[o])
+        \\movq %%r11, 24(%[o])
+    ;
+
+    /// `a − b`: a borrow means `+2^256 ≡ +38` was added, so 38 is taken off;
+    /// if that borrows again the value was < 38 and one more −38 cannot.
+    const sub_asm =
+        \\movq 0(%[a]), %%r8
+        \\movq 8(%[a]), %%r9
+        \\movq 16(%[a]), %%r10
+        \\movq 24(%[a]), %%r11
+        \\subq 0(%[b]), %%r8
+        \\sbbq 8(%[b]), %%r9
+        \\sbbq 16(%[b]), %%r10
+        \\sbbq 24(%[b]), %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\subq %%rax, %%r8
+        \\sbbq $0, %%r9
+        \\sbbq $0, %%r10
+        \\sbbq $0, %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\subq %%rax, %%r8
+        \\movq %%r8, 0(%[o])
+        \\movq %%r9, 8(%[o])
+        \\movq %%r10, 16(%[o])
+        \\movq %%r11, 24(%[o])
+    ;
+
+    /// `a · 121665`: a five-word product (top < 2^17), folded.
+    const mul121665_asm =
+        \\movl $121665, %%edx
+        \\mulxq 0(%[a]), %%r8, %%r9
+        \\mulxq 8(%[a]), %%rax, %%r10
+        \\addq %%rax, %%r9
+        \\mulxq 16(%[a]), %%rax, %%r11
+        \\adcq %%rax, %%r10
+        \\mulxq 24(%[a]), %%rax, %%r12
+        \\adcq %%rax, %%r11
+        \\adcq $0, %%r12
+        \\
+    ++ foldTop("%%r12", .{ "%%r8", "%%r9", "%%r10", "%%r11" });
 };
 
 /// `s * B` over Ristretto255 against the ristretto255 base point — the
@@ -967,4 +1602,323 @@ fn hex32(comptime h: *const [64]u8) [32]u8 {
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, h) catch unreachable;
     return out;
+}
+
+// ── X25519 shared secret on the 4×64 field (P6) ──────────────────────────
+
+const all_x25519_backends = [_]X25519Backend{ .stdlib, .mulx, .mulx_adx };
+
+/// Every backend compiled into this build, forced in turn. `.stdlib` is
+/// always there; the asm ones exist on an x86-64 LLVM build whose target
+/// has BMI2 (and ADX) — the native build on any x86-64 CI runner or laptop.
+fn x25519BackendCount() usize {
+    var n: usize = 0;
+    for (all_x25519_backends) |b| n += @intFromBool(test_hooks.available(b));
+    return n;
+}
+
+test "P6 X25519: the dispatch follows the target's CPU features" {
+    const want: X25519Backend = if (fe64.adx) .mulx_adx else if (fe64.bmi2) .mulx else .stdlib;
+    try testing.expectEqual(want, test_hooks.default);
+    if (builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm) {
+        const f = builtin.cpu.features;
+        try testing.expectEqual(std.Target.x86.featureSetHas(f, .bmi2), test_hooks.available(.mulx));
+        try testing.expectEqual(std.Target.x86.featureSetHas(f, .bmi2) and std.Target.x86.featureSetHas(f, .adx), test_hooks.available(.mulx_adx));
+    }
+}
+
+test "P6 X25519: RFC 7748 §5.2 vectors and the 1 / 1,000 iteration chains, every backend" {
+    defer test_hooks.forced = null;
+    const V = struct { k: [32]u8, u: [32]u8, out: [32]u8 };
+    const vectors = [_]V{
+        .{
+            .k = hex32("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+            .u = hex32("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"),
+            .out = hex32("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"),
+        },
+        .{
+            .k = hex32("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+            // top bit of u set: RFC 7748 §5 masks it
+            .u = hex32("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"),
+            .out = hex32("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"),
+        },
+    };
+    const one = hex32("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    const thousand = hex32("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+    for (all_x25519_backends) |b| {
+        if (!test_hooks.available(b)) continue;
+        test_hooks.forced = b;
+        for (vectors) |v| try testing.expectEqualSlices(u8, &v.out, &(try X25519.scalarmult(v.k, v.u)));
+        var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
+        var u = k;
+        for (1..1001) |i| {
+            const out = try X25519.scalarmult(k, u);
+            u = k;
+            k = out;
+            if (i == 1) try testing.expectEqualSlices(u8, &one, &k);
+        }
+        testing.expectEqualSlices(u8, &thousand, &k) catch |e| {
+            std.debug.print("backend {t}\n", .{b});
+            return e;
+        };
+    }
+}
+
+test "P6 X25519: RFC 7748 §5.2 1,000,000 iterations (opt-in: CT25519_RFC7748_MILLION)" {
+    if (std.testing.environ.getPosix("CT25519_RFC7748_MILLION") == null) return error.SkipZigTest;
+    // Only the build's own backend: ~35-50 s per backend at ReleaseFast.
+    const million = hex32("7c3911e0ab2586fd864497297e575e6f3bc601c0883c30df5f4dd2d24f665424");
+    var k: [32]u8 = [_]u8{9} ++ [_]u8{0} ** 31;
+    var u = k;
+    for (0..1_000_000) |_| {
+        const out = try X25519.scalarmult(k, u);
+        u = k;
+        k = out;
+    }
+    try testing.expectEqualSlices(u8, &million, &k);
+}
+
+test "P6 X25519: RFC 7748 §6.1 Diffie-Hellman, every backend" {
+    defer test_hooks.forced = null;
+    const alice_sk = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    const alice_pk = hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    const bob_sk = hex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    const bob_pk = hex32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+    const shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+    const nine = [_]u8{9} ++ [_]u8{0} ** 31;
+    for (all_x25519_backends) |b| {
+        if (!test_hooks.available(b)) continue;
+        test_hooks.forced = b;
+        // the public keys through the LADDER over u = 9, not the comb
+        try testing.expectEqualSlices(u8, &alice_pk, &(try X25519.scalarmult(alice_sk, nine)));
+        try testing.expectEqualSlices(u8, &bob_pk, &(try X25519.scalarmult(bob_sk, nine)));
+        try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(alice_sk, bob_pk)));
+        try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(bob_sk, alice_pk)));
+    }
+}
+
+/// `std.crypto.dh.X25519.scalarmult` and the forced backend agree on the
+/// value AND on `error.IdentityElement`.
+fn expectScalarmultMatchesStd(b: X25519Backend, k: [32]u8, u: [32]u8) !void {
+    const want = std.crypto.dh.X25519.scalarmult(k, u);
+    test_hooks.forced = b;
+    const got = X25519.scalarmult(k, u);
+    if (want) |w| {
+        if (got) |g| {
+            if (std.mem.eql(u8, &w, &g)) return;
+        } else |_| {}
+    } else |we| {
+        if (got) |_| {} else |ge| if (we == ge) return;
+    }
+    std.debug.print("backend {t}\n  k={x}\n  u={x}\n  std={any}\n  got={any}\n", .{ b, k, u, want, got });
+    return error.TestExpectedEqual;
+}
+
+/// Montgomery u of an Edwards25519 point, `(Z + Y)/(Z − Y)` — identity ↦ 0
+/// (std's `invert(0) = 0`), so small-order Edwards points give small-order u.
+fn montgomeryU(p: Edwards25519) [32]u8 {
+    return p.z.add(p.y).mul(p.z.sub(p.y).invert()).toBytes();
+}
+
+/// u-coordinate edge cases: the canonical and non-canonical small values,
+/// p−1, p, p+1, 2^255−1, every low-order point of the curve (from an
+/// order-8 Edwards point), and their non-canonical `+p` twins where < 2^255.
+fn edgeUs(buf: *[40][32]u8) []const [32]u8 {
+    var n: usize = 0;
+    const p: u256 = (1 << 255) - 19;
+    const ints = [_]u256{ 0, 1, 2, 9, 19, p - 1, p, p + 1, p + 9, p + 18, (1 << 255) - 1, (1 << 256) - 1, (1 << 255), (1 << 64) - 1, 1 << 64, (1 << 128) - 1, (1 << 192) - 1 };
+    for (ints) |x| {
+        std.mem.writeInt(u256, &buf[n], x, .little);
+        n += 1;
+    }
+    const torsion_bytes = [_]u8{
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b,
+        0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39,
+        0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+    };
+    const t8 = Edwards25519.fromBytes(torsion_bytes) catch unreachable;
+    var q = t8;
+    for (1..8) |_| {
+        buf[n] = montgomeryU(q);
+        const v = std.mem.readInt(u256, &buf[n], .little);
+        n += 1;
+        if (v + p < (1 << 255)) {
+            std.mem.writeInt(u256, &buf[n], v + p, .little);
+            n += 1;
+        }
+        q = q.add(t8);
+    }
+    return buf[0..n];
+}
+
+test "P6 X25519: edge u-coordinates and low-order points agree with std, every backend" {
+    defer test_hooks.forced = null;
+    var buf: [40][32]u8 = undefined;
+    const us = edgeUs(&buf);
+    // The low-order points really are: std answers error.IdentityElement.
+    var low_order: usize = 0;
+    const k = hex32("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    for (us) |u| {
+        if (std.crypto.dh.X25519.scalarmult(k, u)) |_| {} else |_| low_order += 1;
+    }
+    try testing.expect(low_order >= 6); // 0, 1, p−1, p, p+1 and the order-4/8 points
+    var n: u32 = 0;
+    for (all_x25519_backends) |b| {
+        if (!test_hooks.available(b)) continue;
+        for (us) |u| {
+            for (0..8) |i| {
+                var wide: [64]u8 = undefined;
+                std.crypto.hash.sha2.Sha512.hash(std.mem.asBytes(&n), &wide, .{});
+                n += 1;
+                var sk = wide[0..32].*;
+                if (i == 0) sk = @splat(0);
+                if (i == 1) sk = @splat(0xff);
+                try expectScalarmultMatchesStd(b, sk, u);
+                // RFC 7748 §5: the top bit of u is ignored
+                var u_hi = u;
+                u_hi[31] |= 0x80;
+                try expectScalarmultMatchesStd(b, sk, u_hi);
+            }
+        }
+    }
+}
+
+test "P6 X25519: randomized differential vs std over raw scalars and raw u (thousands, every backend)" {
+    defer test_hooks.forced = null;
+    const trials: usize = if (builtin.mode == .Debug) 300 else 5000;
+    var prng = std.Random.DefaultPrng.init(0x7748_0006);
+    const random = prng.random();
+    for (all_x25519_backends) |b| {
+        if (b == .stdlib or !test_hooks.available(b)) continue;
+        for (0..trials) |_| {
+            var k: [32]u8 = undefined;
+            var u: [32]u8 = undefined;
+            random.bytes(&k);
+            random.bytes(&u); // raw: top bit set half the time, a few non-canonical
+            try expectScalarmultMatchesStd(b, k, u);
+        }
+    }
+}
+
+// Field level: every 4×64 operation against u512 arithmetic mod p.
+
+const p25519: u512 = (1 << 255) - 19;
+
+fn limbsOf(x: u256) fe64.Limbs {
+    return .{ @truncate(x), @truncate(x >> 64), @truncate(x >> 128), @truncate(x >> 192) };
+}
+
+fn canonical(a: fe64.Limbs) u512 {
+    const bytes = fe64.toBytes(&a);
+    return std.mem.readInt(u256, &bytes, .little);
+}
+
+/// Values that sit on every limb boundary and around p, 2p and 2^256.
+const field_edges = blk: {
+    const p: u256 = (1 << 255) - 19;
+    break :blk [_]u256{
+        0,              1,                  2,                  18,                                                                                19,                                                                                37,
+        38,             39,                 p - 1,              p,                                                                                 p + 1,                                                                             p + 18,
+        (1 << 255) - 1, 1 << 255,           2 * p - 1,          2 * p,                                                                             2 * p + 1,                                                                         2 * p + 37,
+        ~@as(u256, 0),  ~@as(u256, 0) - 37, ~@as(u256, 0) - 38, (1 << 64) - 1,                                                                     1 << 64,                                                                           (1 << 128) - 1,
+        1 << 128,       (1 << 192) - 1,     1 << 192,           0xffff_ffff_ffff_ffff_0000_0000_0000_0000_ffff_ffff_ffff_ffff_0000_0000_0000_0000, 0x8000_0000_0000_0000_8000_0000_0000_0000_8000_0000_0000_0000_8000_0000_0000_0000,
+        0x7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_ffec, // p − 1 spelled out
+    };
+};
+
+/// One operation on fresh copies of `x`, `y` in slots `p`, `q`; `o` chooses
+/// the output slot, so the aliasing cases (`o` = an input) run too.
+fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665, invert }, comptime o: fe64.Slot, x: u256, y: u256) u512 {
+    const F = fe64.Ops(adx);
+    var st: fe64.State = undefined;
+    for (&st) |*l| l.* = .{ 0xdead, 0xbeef, 0xdead, 0xbeef }; // no stale answer to find
+    st[@intFromEnum(fe64.Slot.p)] = limbsOf(x);
+    st[@intFromEnum(fe64.Slot.q)] = limbsOf(y);
+    switch (op) {
+        .mul => F.fmul(&st, o, .p, .q),
+        .sq => F.sq(&st, o, .p),
+        .add => F.add(&st, o, .p, .q),
+        .sub => F.sub(&st, o, .p, .q),
+        .mul121665 => F.mul121665(&st, o, .p),
+        .invert => F.invert(&st, o, .p),
+    }
+    return canonical(st[@intFromEnum(o)]);
+}
+
+fn checkFieldPair(comptime adx: bool, x: u256, y: u256) !void {
+    const X: u512 = x;
+    const Y: u512 = y;
+    const want_mul = (X * Y) % p25519;
+    const want_sq = (X * X) % p25519;
+    const want_add = (X + Y) % p25519;
+    const want_sub = (X % p25519 + p25519 - Y % p25519) % p25519;
+    const want_a24 = (X * 121665) % p25519;
+    const cases = [_]struct { name: []const u8, got: u512, want: u512 }{
+        .{ .name = "mul", .got = fieldOp(adx, .mul, .r, x, y), .want = want_mul },
+        .{ .name = "sq", .got = fieldOp(adx, .sq, .r, x, y), .want = want_sq },
+        .{ .name = "sq in place", .got = fieldOp(adx, .sq, .p, x, y), .want = want_sq },
+        .{ .name = "add", .got = fieldOp(adx, .add, .r, x, y), .want = want_add },
+        .{ .name = "add o=a", .got = fieldOp(adx, .add, .p, x, y), .want = want_add },
+        .{ .name = "add o=b", .got = fieldOp(adx, .add, .q, x, y), .want = want_add },
+        .{ .name = "sub", .got = fieldOp(adx, .sub, .r, x, y), .want = want_sub },
+        .{ .name = "sub o=a", .got = fieldOp(adx, .sub, .p, x, y), .want = want_sub },
+        .{ .name = "sub o=b", .got = fieldOp(adx, .sub, .q, x, y), .want = want_sub },
+        .{ .name = "mul121665", .got = fieldOp(adx, .mul121665, .r, x, y), .want = want_a24 },
+        .{ .name = "mul121665 in place", .got = fieldOp(adx, .mul121665, .p, x, y), .want = want_a24 },
+        .{ .name = "toBytes", .got = canonical(limbsOf(x)), .want = X % p25519 },
+    };
+    for (cases) |c| if (c.got != c.want) {
+        std.debug.print("adx={} {s}: x={x} y={x}\n  got  {x}\n  want {x}\n", .{ adx, c.name, x, y, c.got, c.want });
+        return error.TestExpectedEqual;
+    };
+    if (adx) { // the ADX multiplication may write over an input
+        try testing.expectEqual(want_mul, fieldOp(adx, .mul, .p, x, y));
+        try testing.expectEqual(want_mul, fieldOp(adx, .mul, .q, x, y));
+    }
+}
+
+test "P6 fe64: mul/sq/add/sub/mul121665/toBytes vs u512 mod p, edges × edges and random, every asm path" {
+    if (!fe64.bmi2) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xfe64_2559);
+    const random = prng.random();
+    const trials: usize = if (builtin.mode == .Debug) 3000 else 100_000;
+    inline for (.{ false, true }) |adx| {
+        if (comptime (if (adx) fe64.adx else fe64.bmi2)) {
+            for (field_edges) |x| for (field_edges) |y| try checkFieldPair(adx, x, y);
+            for (0..trials) |i| {
+                var x = random.int(u256);
+                var y = random.int(u256);
+                // bias two thirds of the draws towards saturated limbs, where
+                // every carry chain runs its full length
+                if (i % 3 == 1) x |= ~@as(u256, 0) << @intCast(random.uintLessThan(u9, 256));
+                if (i % 3 == 2) y = ~(random.int(u256) & random.int(u256) & random.int(u256));
+                try checkFieldPair(adx, x, y);
+                try checkFieldPair(adx, x, field_edges[i % field_edges.len]);
+            }
+        }
+    }
+}
+
+test "P6 fe64: invert is z^(p-2) — z·z⁻¹ ≡ 1, and 0, p ↦ 0" {
+    if (!fe64.bmi2) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x1_2559);
+    const random = prng.random();
+    inline for (.{ false, true }) |adx| {
+        if (comptime (if (adx) fe64.adx else fe64.bmi2)) {
+            for (0..field_edges.len + 64) |i| {
+                const x = if (i < field_edges.len) field_edges[i] else random.int(u256);
+                const inv = fieldOp(adx, .invert, .r, x, 0);
+                const X: u512 = x;
+                if (X % p25519 == 0) {
+                    try testing.expectEqual(@as(u512, 0), inv);
+                } else {
+                    try testing.expectEqual(@as(u512, 1), (inv * (X % p25519)) % p25519);
+                }
+            }
+        }
+    }
+}
+
+test "P6 X25519: scalarmult keeps std's signature (drop-in for qap's TLS shim)" {
+    try testing.expectEqual(@TypeOf(std.crypto.dh.X25519.scalarmult), @TypeOf(X25519.scalarmult));
 }

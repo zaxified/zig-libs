@@ -107,7 +107,12 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
 ///   every scalar derived from the tainted secret, public runtime points
 ///   (audit `bulletproofs` B9: the prove-side MSM).
 /// `x25519` — `X25519.recoverPublicKey`: the comb plus the Edwards→Montgomery
-///   map (one `Fe.invert`), the tainted seed as the secret key.
+///   map (one `Fe.invert`), the tainted seed as the secret key; THEN
+///   `X25519.scalarmult` of the same tainted key against a public peer key
+///   decoded at run time (RFC 7748 §6.1 Bob's) — the shared-secret ladder on
+///   whatever backend this build dispatches to (the 4×64 MULX/ADX asm on an
+///   x86-64 target with BMI2, P6). Both results are printed (`result=`,
+///   `shared=`), so the witness covers both paths.
 const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm, x25519 };
 const Taint = enum { yes, no };
 
@@ -132,6 +137,12 @@ fn parseTarget(s: []const u8) !Target {
 const base_encoding = [32]u8{
     0xe2, 0xf2, 0xae, 0x0a, 0x6a, 0xbc, 0x4e, 0x71, 0xa8, 0x84, 0xa9, 0x61, 0xc5, 0x00, 0x51, 0x5f,
     0x58, 0xe3, 0x0b, 0x6a, 0xa5, 0x82, 0xdd, 0x8d, 0xb6, 0xa6, 0x59, 0x45, 0xe0, 0x8d, 0x2d, 0x76,
+};
+
+/// RFC 7748 §6.1: Bob's public key, the `x25519` target's peer.
+const x25519_peer = [32]u8{
+    0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35, 0x37,
+    0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88, 0x2b, 0x4f,
 };
 
 fn runtimePoint() !Ristretto255 {
@@ -190,6 +201,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .x25519 => {
             out_bytes = ct25519.X25519.recoverPublicKey(sec) catch @panic("identity: impossible for a clamped scalar");
+            // Public, runtime: the peer's key must not fold at comptime.
+            const peer = reloadVolatile(&x25519_peer);
+            // A low-order peer key is the only way to get the error, and
+            // this one is not — the branch is on a public outcome.
+            const shared = ct25519.X25519.scalarmult(sec, peer) catch @panic("peer key is not low-order");
+            std.debug.print("shared={x}\n", .{shared});
         },
         .msm => {
             var scalars: [9][32]u8 = undefined;

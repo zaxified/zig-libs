@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **`X25519.scalarmult` on a 4×64-bit field core in x86-64
+  MULX/ADX assembly (P6).** No API change: same signature, same bytes,
+  `error.IdentityElement` on an all-zero result as std. Dispatch at compile
+  time: BMI2+ADX → `mulx` with `adcx`/`adox` carry chains; BMI2 only (qap's
+  `x86_64_v3` target) → `mulx` with `adc` chains; anything else, or the
+  self-hosted backend → std's ladder. Constant-time: straight-line asm, fixed
+  offsets from one state pointer, masked swap and folds, fixed inversion
+  chain; the one zero-output branch depends on the public point only and is
+  declassified for memcheck. Evidence (SPEC.md § P6): RFC 7748 §5.2 (incl.
+  1 000 iterations) and §6.1 on every backend, std differential over 5 000
+  random + edge inputs per backend, field ops vs `u512` mod p; ctgrind
+  `x25519` target extended to the shared secret — 4 witness / 0 in-module on
+  both asm paths, positive controls 1 in-module each. ReleaseFast bench, same
+  process: MULX+ADX 1.23× std (43.9–45.7 vs 53.9–56.1 µs), MULX only
+  1.16–1.23×. First consumer: qap's TLS fork, where the shared secret was
+  18.65 % of the churn lane.
 - **2026-09-28** — **New `X25519`: std's `X25519` shape with key generation
   on the C3 comb.** Additive API. `recoverPublicKey` = `clamp(sk)·B` on the
   fixed-base comb, then `u = (Z + Y)/(Z − Y)` (one inversion); `scalarmult`

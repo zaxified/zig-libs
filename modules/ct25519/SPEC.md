@@ -293,10 +293,184 @@ of `L` in that range are `4L..7L`, none divisible by 8. The
   [2.28..2.62]; `mulBase` comb 21.x vs ladder 55 in the same run, so the map
   costs under a microsecond.
 
-**Limits.** Only key generation changes; the shared secret is still std's
-ladder, and a faster variable-base X25519 would be a field-core question
-(backlog, not planned: 1.15× headroom). A consumer that needs
-`KeyPair.fromEd25519`/`publicKeyFromEd25519` takes them from std.
+**Limits.** Only key generation changes here; the shared secret is § P6
+below. A consumer that needs `KeyPair.fromEd25519`/`publicKeyFromEd25519`
+takes them from std.
+
+## P6 — X25519 shared secret on a 4×64-bit field core in MULX/ADX assembly (2026-09-29)
+
+**Why.** qap's TLS churn lane (2026-09-29, after the comb took key
+generation) had `X25519.scalarmult` — the shared-secret ladder over the
+peer's `u` — as its largest single item, **18.65 % of CPU**. std's ladder is
+RFC 7748 §5 on a 5×51-bit field with `u128` products: 25 multiplies per
+field multiplication, ~1.15× behind OpenSSL's.
+
+**Technique and sources.** GF(2^255 − 19) on four 64-bit limbs, the x86-64
+representation of Oliveira, López, Hışıl, Faz-Hernández, Rodríguez-
+Henríquez, "How to (pre-)compute a ladder: improving the performance of
+X25519 and X448" (SAC 2017) and Nath & Sarkar, "Efficient arithmetic in
+(pseudo-)Mersenne prime order fields" (IACR ePrint 2018/985), implemented
+from those descriptions and the arithmetic itself:
+
+- a value is `[4]u64` in `[0, 2^256)`, only **congruent** mod p — every
+  operation maps `[0, 2^256)` into `[0, 2^256)`, so no intermediate bound
+  has to be tracked; `toBytes` is the only full reduction (fold bit 255 as
+  `+19`, then subtract p under a mask derived from bit 255 of `v + 19`);
+- multiplication: 4×4 schoolbook, 16 `mulx`, then `t0..t3 + 38·(t4..t7)`
+  (`2^256 ≡ 38`), the fifth word folded as `+38·top` and one more masked
+  `+38` if that carried (a second carry is impossible: after a wrap the low
+  words are below `38·2^32`); squaring: 6 cross products doubled by an add
+  chain plus 4 diagonal squares, 10 `mulx`, same reduction; `add`/`sub`: a
+  257-bit sum/difference, the carry/borrow folded as `±38` twice by mask;
+  `·121665` (RFC 7748's `a24`): 4 `mulx` and a fold;
+- the ladder is RFC 7748 §5 verbatim (`x_2 = AA·BB`,
+  `z_2 = E·(AA + a24·E)`), 255 steps over bits 254..0 of the clamped scalar
+  (std's `ladder(p, s, 255)` runs the same steps), the swap an xor mask
+  (`cswap`), then `x_2 · z_2^(p−2)` by a fixed chain of 254 squarings and 11
+  multiplications;
+- all field elements of the ladder and the inversion live in ONE array and
+  every operation addresses its operands as compile-time offsets from one
+  base register. The first draft passed three pointers per operation; with
+  the multiplication's eleven registers that compiled in Debug and failed
+  in ReleaseFast ("inline assembly requires more registers than available",
+  2026-09-29), where LLVM reserves a frame/base pointer.
+
+**Dispatch (compile time, never CPUID).**
+
+| build | `X25519.scalarmult` |
+|---|---|
+| x86-64, LLVM backend, target has `bmi2` and `adx` | `mulx` + two carry chains (`adcx` on CF, `adox` on OF) in the multiplication and its reduction; squaring, add/sub as below |
+| x86-64, LLVM backend, `bmi2` without `adx` — e.g. qap's `accel-amd64` = `x86_64_v3+aes+pclmul` | `mulx` with single `adc` carry chains everywhere (the row product is formed as five words first, then added; three finished product words are parked in the output slot to free registers) |
+| anything else: baseline `x86_64`, other architectures, the self-hosted backend | std's `std.crypto.dh.X25519.scalarmult`, unchanged |
+
+The asm is compiled only where the LLVM backend emits it
+(`builtin.zig_backend == .stage2_llvm`, `.claude/rules/zig-pitfalls.md`),
+and only with the feature in the build target — there is no run-time
+detection, so a binary never executes an instruction its target does not
+promise. The MULX-only path exists because qap's deployment target has BMI2
+and not ADX (x86-64-v3 does not include ADX); on this Kaby Lake it runs at
+the same ratio to std as the ADX path. `test_hooks.forced` (test builds
+only, empty otherwise — the `sha2` pattern) lets one test run hold every
+compiled path to std.
+
+**Constant-time argument, per instruction class.**
+
+- *Control flow:* every asm block is straight-line; the ladder loop and the
+  inversion chain run a fixed number of iterations (255, 254 + 11); the
+  bit index is the loop counter.
+- *Memory addresses:* the state pointer plus compile-time offsets; the only
+  secret-derived index would be the swap, and it is an xor mask over both
+  slots (`m = 0 − bit`, `t = m & (x ⊕ y)`), not a selection.
+- *Arithmetic:* `mov`, `add`/`adc`/`sub`/`sbb`, `adcx`/`adox`, `mulx`,
+  `imul` by the constant 38, `and`, `xor` — classes Intel lists as having
+  data-operand-independent timing. No division, no variable shift, no
+  `cmov` needed. Carry folds are `sbb r,r; and $38,r; add r,…`.
+- *The one branch:* std's API returns `error.IdentityElement` for an
+  all-zero shared secret, and `scalarmult` keeps that shape (drop-in for
+  qap's TLS shim, which binds the function type). The zero flag is an OR
+  over the output bytes; the branch on it depends on the PUBLIC point only:
+  a clamped `k = 8·m ∈ [2^254, 2^255)`, and `k·P = O` iff the order of `P`
+  divides `k`. On the curve (order `8L`) the prime part `L` would need
+  `L | m`, but the multiples of `L` in range are `4L..7L`, none divisible by
+  8; on the twist (order `4L' = 2p + 2 − 8L`, `L' ≈ 2^253`) the multiples
+  of `L'` in range are `3L'` and `4L'` (`2L'` is just below `2^254`, `4L'`
+  just below `2^255`), neither divisible by 8. So
+  the output is zero iff `P` has order dividing 8 (curve) or 4 (twist) — a
+  property of the peer's key. The flag is therefore declassified for
+  memcheck (`makeMemDefined`, a no-op without `-fvalgrind`), exactly one
+  byte, so the harness keeps measuring the secret.
+- *What the claim is not:* the § "Threat model / limits" boundary applies
+  unchanged — a statement about the instructions and the machine code
+  measured, not about any microarchitecture, and ctgrind (below) is the
+  evidence, not this list.
+
+**Evidence.**
+
+- *External vectors, every backend:* RFC 7748 §5.2's two vectors (the
+  second has the top bit of `u` set), the 1- and 1 000-iteration chains,
+  §6.1's key pairs through the LADDER over `u = 9` and the shared secret
+  both ways. The 1 000 000-iteration chain is opt-in
+  (`CT25519_RFC7748_MILLION=1`, the build's default backend only).
+- *Differential vs std, every asm backend:* 5 000 random raw
+  (scalar, `u`) pairs per backend in ReleaseFast (300 in Debug) — raw means
+  the top bit of `u` is set half the time and the scalar is unclamped; and
+  the edge `u`s 0, 1, 2, 9, 19, p−1, p, p+1, p+9, p+18, 2^255−1, 2^256−1,
+  2^255, limb boundaries, every Montgomery `u` of the order-2/4/8 points
+  (mapped from an order-8 Edwards point) and their non-canonical `+p` twins,
+  each × 8 scalars (incl. all-zero and all-one) × top bit of `u` clear and
+  set; the value AND `error.IdentityElement` must agree, and the test
+  asserts std rejects ≥ 6 of the edge points, so the error path is
+  exercised.
+- *Field level vs `u512` mod p, both asm paths:* `mul`, `sq`, `add`, `sub`,
+  `·121665`, `toBytes` over 30 edge values × 30 (0, 1, 18, 19, 37, 38, 39,
+  p−1, p, p+1, p+18, 2^255±1, 2p−1, 2p, 2p+1, 2^256−1, 2^256−38, 2^256−39,
+  every limb boundary, alternating half-words), and 100 000 random pairs
+  (3 000 in Debug), two thirds biased to saturated limbs so every carry
+  chain runs its full length; the in-place forms (`o` = an input) of every
+  op that allows them; `invert` as `z·z⁻¹ ≡ 1` and `0, p ↦ 0`. Every
+  state slot is pre-filled with junk, so a stale answer cannot pass.
+- *ctgrind target `x25519`* (`scripts/checks/ctgrind.sh ct25519`,
+  ReleaseFast, `-fvalgrind`, zig 0.16.0, valgrind 3.26.0, native Kaby Lake
+  = the MULX+ADX path), now running `recoverPublicKey` AND `scalarmult` of
+  the same tainted key against RFC 7748 §6.1 Bob's key (decoded at run
+  time) and printing both results:
+
+  | build / variant | total | in `root.zig` | witness | note |
+  |---|---|---|---|---|
+  | native (MULX+ADX), tainted | 4 | **0** | 4 | `result=` and `shared=` prints — taint reached the shared secret |
+  | native, untainted / no `-fvalgrind` | 0 / 0 | 0 | 0 | control / trap |
+  | `-mcpu=x86_64_v3` (MULX only, qap's path), tainted | 4 | **0** | 4 | built by hand, same harness |
+  | positive control: declassify removed | 5 | **1** | 4 | at `if (acc == 0)` in `sharedSecret` |
+  | positive control: `cswap` as `if (swap != 0) swap(…)`, native | 3 | **1** | 2 | at the mutated line; `shared=` no longer tainted (the data no longer carries the bit) |
+  | same, `-mcpu=x86_64_v3` | 3 | **1** | 2 | the MULX-only build is seen too |
+
+  The mutants ran on a copy under `.zig-cache` and were deleted. On a
+  build without BMI2 the target measures std's ladder, whose own
+  `isZero` branch (`curve25519.zig`) the pattern does not attribute — the
+  row would go red there, which is the right failure: it would be
+  measuring a different path.
+- *Bench* (`CT25519_BENCH=1 scripts/modtest ct25519 -Doptimize=ReleaseFast`,
+  7 interleaved rounds, µs/op CPU time, median [min..max]): see the table
+  in § "P6 bench" below.
+
+**P6 bench.** Two ReleaseFast runs, 2026-09-29, Kaby Lake i7-7920HQ,
+zig 0.16.0, under `hw run` (a shared, low-weight slice — the control pair's
+spread says so), 7 interleaved rounds each, µs/op CPU time, median
+[min..max], `std` = `std.crypto.dh.X25519.scalarmult` in the same process:
+
+| path | run | new | std | median ratio | paired [min..max] | best-of-7 ratio |
+|---|---|---|---|---|---|---|
+| MULX+ADX (this machine's default) | 1 | 43.9 [41.9..50.6] | 53.9 [51.1..62.1] | **1.23×** | 1.18..1.27 | 1.22× |
+| MULX+ADX | 2 | 45.7 [44.9..46.8] | 56.1 [53.1..58.2] | **1.23×** | 1.15..1.28 | 1.18× |
+| MULX only (qap's `x86_64_v3` path) | 1 | 46.6 [45.6..47.4] | 57.4 [54.4..68.9] | **1.23×** | 1.18..1.48 | 1.19× |
+| MULX only | 2 | 47.2 [45.6..48.6] | 54.9 [51.8..56.0] | **1.16×** | 1.12..1.21 | 1.14× |
+
+The runtime-point control pair (unchanged code on both sides) read 1.00× and
+0.95× [0.68..1.05] in the same runs. At an assumed ~3 GHz (not measured in
+cycles) the new ladder is ~130 k cycles against std's ~160 k; the published
+MULX/ADX ladders report ~95–110 k on Skylake-class cores (see the backlog).
+
+**Why the gain outweighs the new code.** 18.65 % of qap's churn-lane CPU was this ladder; 1.16–1.23× on it is
+~3 % of that lane's CPU, on the one operation every TLS 1.3 / ECDHE
+handshake performs with a secret, without a change to the API, the bytes or
+the constant-time evidence (the ctgrind target now covers it, with positive
+controls that fire on both asm paths). The cost is ~250 lines of
+straight-line asm in five bodies, each held to `u512` arithmetic on every
+limb boundary, and std's ladder kept as the fallback and the oracle. It is
+smaller than the comb's 2.4×: the field core was only ~1.15× behind OpenSSL
+to begin with.
+
+**Backlog / deferred (P6).**
+- A fused ladder step — one asm block per step with `x2, z2, x3, z3` kept in
+  registers, add/sub pairs merged — is where the published x86-64 ladders
+  get their remaining margin (~95–110 k cycles on Skylake-class cores
+  against ~130 k here). Not planned: it trades ~200 lines of reviewable asm
+  per operation for one ~1 000-line block, for an estimated further 10–25 %.
+- ADX in the squaring (the doubling and the diagonal as two chains); helps
+  only the ADX build, which qap's target is not.
+- `meta.doc` still describes only the comb; mentioning the shared secret
+  needs `zig build gen-catalog` (root README), outside a module-only change.
+
 
 ## Threat model / limits
 

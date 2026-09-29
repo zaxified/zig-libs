@@ -223,7 +223,7 @@ oscore	ReleaseFast	unprotect	1	1	71a979efe6e701d2	ed85db89e3d7e9fd
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	3af4421d3df4cd83	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	1eae4e8bf12a8d65	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -236,10 +236,20 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	3af4421d3df4cd83	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	3af4421d3df4cd83	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	3af4421d3df4cd83	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	3af4421d3df4cd83	55f7fb062759921f
+ct25519	ReleaseFast	comb	1	0	1eae4e8bf12a8d65	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	1eae4e8bf12a8d65	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	1eae4e8bf12a8d65	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	1eae4e8bf12a8d65	55f7fb062759921f
+# x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
+# (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
+# tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
+# ladder on the 4x64 MULX/ADX asm field (P6) on an x86-64 build with BMI2.
+# 4 witness contexts (`result=` and `shared=` printHex), 0 in root.zig. The
+# one all-zero-output branch `scalarmult` keeps for std's IdentityElement
+# shape is declassified (a function of the public point only, SPEC.md § P6);
+# positive controls in SPEC.md § P6: without the declassify 1 in-file at that
+# line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
+ct25519	ReleaseFast	x25519	1	0	1eae4e8bf12a8d65	8af2fe8213b778aa
 decaf448	ReleaseFast	scalarmul	1	0	e664aa6778fea0b1	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now

@@ -33,7 +33,8 @@ chain of doublings instead of one ladder per term, constant-time in every
 scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
 audit `bulletproofs` B9; SPEC.md § B9).
 
-**`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs); `scalarmult` is std's. Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
+**`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs). Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
+Since 2026-09-29 `scalarmult` (the shared secret) runs the RFC 7748 ladder on a 4×64-bit field in x86-64 `mulx` (BMI2) / `adcx`+`adox` (ADX) inline assembly when the build target has those features and the backend is LLVM — chosen at compile time, std's ladder otherwise — 1.16–1.23× std's ladder in ReleaseFast (≈ 44–47 vs 54–57 µs, both asm paths). Same signature and bytes as std's, `error.IdentityElement` included; held to std over RFC 7748 §5.2/§6.1, thousands of random and edge inputs per backend, and a field-level `u512` differential; the ctgrind `x25519` target now covers it (0 contexts in the module, positive controls fire). SPEC.md § P6.
 
 **`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
 2026-09-16, audit C3).** The base point used to run the same 16-entry window
@@ -98,6 +99,10 @@ identity rejection removed — the algorithm is the textbook 4-bit fixed-window
 scalar multiplication. The fixed-base comb follows the published description
 in Bernstein, Duif, Lange, Schwabe, Yang, "High-speed high-security
 signatures" (J. Cryptogr. Eng. 2012) §4; its table is generated at comptime
-from std's point operations, not copied from any implementation's table. No
-third-party source ported, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+from std's point operations, not copied from any implementation's table. The
+X25519 shared-secret field core (P6) is written from RFC 7748 §5 and the
+published 4×64-bit representation (Oliveira et al., "How to (pre-)compute a
+ladder", SAC 2017; Nath & Sarkar, IACR ePrint 2018/985); no implementation's
+source — OpenSSL, BoringSSL/fiat-crypto, the Linux kernel, libsodium or any
+other — was read or transcribed for it. No third-party source ported, so no
+`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).

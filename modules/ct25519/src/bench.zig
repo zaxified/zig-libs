@@ -19,6 +19,8 @@
 //!   ladder over the comptime table, which IS the pre-C3 `mulBase`;
 //! - `mulRistrettoBase` (comb) vs `mulRistretto(basePoint, s)` (ladder);
 //! - `X25519.recoverPublicKey` (comb + one inversion) vs std's Montgomery ladder;
+//! - `X25519.scalarmult` (the shared secret, P6) on each compiled 4×64 asm
+//!   path — MULX+ADX and MULX only — vs std's 5×51 ladder;
 //! - `mulRistretto` over a runtime point (ladder, unchanged by C3) vs std's
 //!   `Ristretto255.mul` — the control pair: C3 changed neither side, so its
 //!   ratio should sit near 1 and a drift there says the machine moved.
@@ -46,7 +48,17 @@ fn lessThan(_: void, a: f64, b: f64) bool {
 const rounds = 7;
 const nscalars = 64;
 
-const Op = enum { comb_base, ladder_base, comb_ristretto, ladder_ristretto, ladder_var, std_var, x25519_comb, x25519_std };
+const Op = enum { comb_base, ladder_base, comb_ristretto, ladder_ristretto, ladder_var, std_var, x25519_comb, x25519_std, dh_std, dh_mulx, dh_adx };
+
+/// The peer's public key for the shared-secret ops (a u-coordinate derived
+/// at run time, so nothing about it folds at comptime).
+var peer_u: [32]u8 = undefined;
+
+fn dh(b: anytype, s: [32]u8) [32]u8 {
+    ct.test_hooks.forced = b;
+    defer ct.test_hooks.forced = null;
+    return ct.X25519.scalarmult(s, peer_u) catch unreachable;
+}
 
 fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255) u8 {
     var acc: u8 = 0;
@@ -61,6 +73,9 @@ fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255)
             .std_var => (pv.mul(s) catch unreachable).toBytes(),
             .x25519_comb => ct.X25519.recoverPublicKey(s) catch unreachable,
             .x25519_std => std.crypto.dh.X25519.recoverPublicKey(s) catch unreachable,
+            .dh_std => dh(.stdlib, s),
+            .dh_mulx => dh(.mulx, s),
+            .dh_adx => dh(.mulx_adx, s),
         };
         acc ^= b[i % 32];
     }
@@ -108,5 +123,9 @@ test "bench (opt-in via CT25519_BENCH)" {
     chk ^= pair("base point, ristretto255", .comb_ristretto, .ladder_ristretto, iters, &scalars, pv);
     chk ^= pair("runtime point (control)", .ladder_var, .std_var, iters, &scalars, pv);
     chk ^= pair("X25519 public key", .x25519_comb, .x25519_std, iters, &scalars, pv);
+    peer_u = try std.crypto.dh.X25519.recoverPublicKey(scalars[7]);
+    std.debug.print("X25519 shared secret: this build dispatches to {t}\n", .{ct.test_hooks.default});
+    if (ct.test_hooks.available(.mulx_adx)) chk ^= pair("X25519 shared, MULX+ADX", .dh_adx, .dh_std, iters, &scalars, pv);
+    if (ct.test_hooks.available(.mulx)) chk ^= pair("X25519 shared, MULX only", .dh_mulx, .dh_std, iters, &scalars, pv);
     std.debug.print("checksum={d}\n", .{chk});
 }
