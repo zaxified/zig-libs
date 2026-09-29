@@ -1800,6 +1800,12 @@ pub const RefreshError = error{
 ///   byte cache would only add a re-parse per hit.
 /// - No hidden clock: every entry point takes `now_s`, like the rest of the
 ///   module (and refresh scheduling is therefore deterministic in tests).
+///   That one wall-clock `now_s` drives both the claims and the refresh
+///   intervals, so a `now_s` BEFORE a recorded fetch/attempt (the clock was
+///   stepped back: NTP, a VM restored from a snapshot) counts as the
+///   interval having passed. Otherwise a step back of Δ froze both the TTL
+///   re-fetch and the unknown-`kid` refresh for Δ, and a key rotated inside
+///   it was a 401 for Δ (found from qap, research register H6, 2026-09-29).
 /// - Fail closed: a failed TTL/rotation refresh surfaces as its typed error
 ///   instead of silently serving stale keys forever. (P6 middleware can
 ///   layer a serve-stale policy on top if wanted.)
@@ -1936,7 +1942,7 @@ pub const Provider = struct {
         now_s: i64,
         claim_opts: ClaimOptions,
     ) Error!ParsedToken {
-        if (p.jwks == null or now_s -| p.fetched_at_s >= @as(i64, p.options.ttl_s)) {
+        if (p.jwks == null or intervalPassed(p.fetched_at_s, now_s, p.options.ttl_s)) {
             try p.refresh(now_s);
         }
 
@@ -1978,7 +1984,14 @@ pub const Provider = struct {
 
     fn refreshAllowed(p: *const Provider, now_s: i64) bool {
         const last = p.last_attempt_s orelse return true;
-        return now_s -| last >= @as(i64, p.options.min_refresh_interval_s);
+        return intervalPassed(last, now_s, p.options.min_refresh_interval_s);
+    }
+
+    /// `interval_s` has passed since `since_s` -- or the clock went back
+    /// past `since_s`, which says nothing about how much time passed; the
+    /// refresh then re-bases the mark on the new timeline (see the type doc).
+    fn intervalPassed(since_s: i64, now_s: i64, interval_s: u32) bool {
+        return now_s < since_s or now_s -| since_s >= @as(i64, interval_s);
     }
 };
 
@@ -6300,6 +6313,82 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
     v_new3.deinit();
     try testing.expectEqual(@as(usize, 4), stub.calls);
     try testing.expectEqual(stub.script.len, stub.next); // script fully consumed
+}
+
+test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rotation refresh" {
+    // qap research register H6: after a step back of 1 h, `now_s -
+    // fetched_at_s` stayed negative for the hour, so neither refresh could
+    // fire and a token signed with a freshly rotated key was NoMatchingKey.
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
+    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x72} ** 32);
+    const pub_old = kp_old.public_key.toBytes();
+    const pub_new = kp_new.public_key.toBytes();
+    var old_b64: [43]u8 = undefined;
+    var new_b64: [43]u8 = undefined;
+    var v1_buf: [256]u8 = undefined;
+    var v2_buf: [256]u8 = undefined;
+    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&old_b64, &pub_old)});
+    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&new_b64, &pub_new)});
+
+    var stub: ScriptFetcher = .{
+        .script = &.{
+            .{ .url = test_jwks_url, .body = jwks_v1 }, // lazy first load
+            .{ .url = test_jwks_url, .body = jwks_v1 }, // the step back re-bases the TTL
+            .{ .url = test_jwks_url, .body = jwks_v2 }, // rotation refresh
+        },
+    };
+    var provider = Provider.init(gpa, stub.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 300,
+        .min_refresh_interval_s = 30,
+    });
+    defer provider.deinit();
+    const opts: Provider.ClaimOptions = .{ .issuer = .any, .audience = .any };
+
+    var buf_old: [512]u8 = undefined;
+    const si_old = signingInputInto(&buf_old,
+        \\{"alg":"EdDSA","kid":"old"}
+    ,
+        \\{"exp":90000}
+    );
+    const sig_old = (try kp_old.sign(si_old, null)).toBytes();
+    const token_old = finishToken(&buf_old, si_old.len, &sig_old);
+    var buf_new: [512]u8 = undefined;
+    const si_new = signingInputInto(&buf_new,
+        \\{"alg":"EdDSA","kid":"new"}
+    ,
+        \\{"exp":90000}
+    );
+    const sig_new = (try kp_new.sign(si_new, null)).toBytes();
+    const token_new = finishToken(&buf_new, si_new.len, &sig_new);
+
+    var a = try provider.verify(gpa, token_old, 10_000, opts);
+    a.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // The clock is stepped back one hour: the TTL mark lies in the future,
+    // so the next verify re-fetches and re-bases it on the new timeline.
+    var b = try provider.verify(gpa, token_old, 6_400, opts);
+    b.deinit();
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // Inside the TTL on the new timeline: served from cache.
+    var c = try provider.verify(gpa, token_old, 6_420, opts);
+    c.deinit();
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // The issuer rotates 40 s after the step: the unknown kid gets its
+    // refresh (30 s since the re-based attempt), not a 1 h wait.
+    var d = try provider.verify(gpa, token_new, 6_440, opts);
+    d.deinit();
+    try testing.expectEqual(@as(usize, 3), stub.calls);
+    try testing.expectEqual(stub.script.len, stub.next);
 }
 
 test "Provider: refresh failures are typed, old keys survive a failed refresh" {

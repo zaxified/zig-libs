@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fixed: `Provider` froze both JWKS refreshes after a backward clock step.
+  One wall-clock `now_s` drives the claims and the `ttl_s` / `min_refresh_interval_s`
+  bookkeeping, so after a step back of Δ (NTP, a VM restored from a snapshot) `now_s -
+  fetched_at_s` stayed negative for Δ: no TTL re-fetch, no unknown-`kid` refresh, and a key
+  the issuer rotated inside that window was `NoMatchingKey` (a 401) for Δ. A `now_s` before a
+  recorded mark now counts as the interval having passed; the refresh re-bases the mark.
+  Found from qap (research register H6), which had the same bug in its own refresher.
+
 - **2026-09-28** — **Verified-token cache** (opt-in): `VerifiedCache(Value)` remembers a token
   that verified until its `exp`, keyed by a SipHash-2-4-128 MAC (random per-cache key from
   `io.randomSecure`, so `init` takes an `Io`) over the exact token bytes and the claim policy,
