@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **HPACK encoder: the dynamic-table search is two hash probes, not a scan.**
+  `Encoder.findField` compared every dynamic entry's name with `mem.eql` for each field (2.8 % of
+  the h2 saturation lane). The encoder's table now keeps two maps, name hash -> newest entry and
+  (name, value) hash -> newest entry, keyed by a per-entry sequence number (so §2.3.3 index
+  shifts and evictions need no re-numbering); a hit is verified against the entry's bytes and a
+  64-bit collision falls back to the old scan. The chosen indices, and so the encoded bytes,
+  are identical: exact match in the static table first, else the newest dynamic exact match,
+  name index = the static one, else the newest dynamic entry with that name. The decoder's table
+  is not indexed. No API change. Pinned by a differential test that keeps the old `findField` and
+  `encodeField` as oracles over random field sequences (evictions, table-size updates, sensitive
+  fields, Huffman on/off) and compares indices, table state and encoded bytes.
+
 - **2026-09-29** — **h2 DATA of 2 KiB or more is written to the connection's writer uncopied.**
   New `h2.Connection.writeData(w, stream_id, data, end_stream)`: `sendData`'s checks, frame
   split and flow-control/state accounting (one shared implementation), with each frame written

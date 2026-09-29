@@ -635,6 +635,20 @@ const DynamicTable = struct {
     size: usize = 0,
     /// Current maximum (§4.2); insertions evict down to this.
     max_size: usize,
+    /// Number of entries evicted so far. Entry `entries.items[j]` has the
+    /// sequence number `evicted + j`; dynamic index `i` (1 = newest) is the
+    /// entry with sequence `evicted + len - i`, so a sequence number is a
+    /// stable name for an entry across inserts and evictions (§2.3.3 shifts
+    /// every index on an insert; sequences do not).
+    evicted: u64 = 0,
+    /// Encoder side only: `name_index` / `pair_index` map a hash of the
+    /// entry's name / of (name, value) to the sequence of the NEWEST entry with
+    /// that hash, which is the one a newest-first scan would meet first. The
+    /// decoder addresses by index and never searches, so it keeps `indexed`
+    /// false and pays nothing.
+    indexed: bool = false,
+    name_index: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    pair_index: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     /// `name ++ value` in a single allocation, split at `name_len` — one
     /// alloc and one free per entry instead of two, and the compare the
@@ -642,6 +656,9 @@ const DynamicTable = struct {
     const TableEntry = struct {
         buf: []u8,
         name_len: usize,
+        /// `hashName` / `hashPair` of this entry; 0 unless the table is `indexed`.
+        name_hash: u64 = 0,
+        pair_hash: u64 = 0,
 
         fn name(e: TableEntry) []const u8 {
             return e.buf[0..e.name_len];
@@ -651,6 +668,16 @@ const DynamicTable = struct {
         }
     };
 
+    fn hashName(name: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, name);
+    }
+
+    /// `name_hash` seeds the value hash, so (name, value) splits that share
+    /// a concatenation ("ab"+"c" / "a"+"bc") hash apart.
+    fn hashPair(name_hash: u64, value: []const u8) u64 {
+        return std.hash.Wyhash.hash(name_hash, value);
+    }
+
     fn entrySize(name: []const u8, value: []const u8) usize {
         return name.len + value.len + entry_overhead;
     }
@@ -658,6 +685,8 @@ const DynamicTable = struct {
     fn deinit(t: *DynamicTable, gpa: Allocator) void {
         for (t.entries.items) |e| gpa.free(e.buf);
         t.entries.deinit(gpa);
+        t.name_index.deinit(gpa);
+        t.pair_index.deinit(gpa);
         t.* = undefined;
     }
 
@@ -671,8 +700,26 @@ const DynamicTable = struct {
         return t.entries.items[t.entries.items.len - i];
     }
 
+    /// The entry with sequence number `seq` (must be live).
+    fn bySeq(t: *const DynamicTable, seq: u64) TableEntry {
+        return t.entries.items[@intCast(seq - t.evicted)];
+    }
+
+    /// Dynamic index (1 = newest) of the live entry with sequence `seq`.
+    fn indexOfSeq(t: *const DynamicTable, seq: u64) usize {
+        return @intCast(t.evicted + t.entries.items.len - seq);
+    }
+
     fn evictOldest(t: *DynamicTable, gpa: Allocator) void {
         const e = t.entries.orderedRemove(0);
+        if (t.indexed) {
+            // The oldest entry can be the newest of its hash only when it is
+            // the last one left with that hash; otherwise the map already
+            // points at a newer entry and stays.
+            if (t.name_index.get(e.name_hash) == t.evicted) _ = t.name_index.remove(e.name_hash);
+            if (t.pair_index.get(e.pair_hash) == t.evicted) _ = t.pair_index.remove(e.pair_hash);
+        }
+        t.evicted += 1;
         t.size -= e.buf.len + entry_overhead;
         gpa.free(e.buf);
     }
@@ -697,7 +744,20 @@ const DynamicTable = struct {
         errdefer gpa.free(buf);
         @memcpy(buf[0..name.len], name);
         @memcpy(buf[name.len..], value);
-        try t.entries.append(gpa, .{ .buf = buf, .name_len = name.len });
+        var entry: TableEntry = .{ .buf = buf, .name_len = name.len };
+        if (t.indexed) {
+            // Reserve first: nothing below may fail once the entry is in.
+            try t.name_index.ensureUnusedCapacity(gpa, 1);
+            try t.pair_index.ensureUnusedCapacity(gpa, 1);
+            entry.name_hash = hashName(name);
+            entry.pair_hash = hashPair(entry.name_hash, value);
+        }
+        try t.entries.append(gpa, entry);
+        if (t.indexed) {
+            const seq = t.evicted + t.entries.items.len - 1;
+            t.name_index.putAssumeCapacity(entry.name_hash, seq);
+            t.pair_index.putAssumeCapacity(entry.pair_hash, seq);
+        }
         t.size += esize;
     }
 
@@ -975,7 +1035,7 @@ pub const Encoder = struct {
     pub fn init(gpa: Allocator, options: Options) Encoder {
         return .{
             .gpa = gpa,
-            .table = .{ .max_size = options.max_table_size },
+            .table = .{ .max_size = options.max_table_size, .indexed = true },
             .huffman = options.huffman,
         };
     }
@@ -1101,6 +1161,31 @@ pub const Encoder = struct {
                 }
             }
         }
+        const t = &e.table;
+        if (t.entries.items.len == 0) return m;
+        // Two probes instead of a newest-first scan comparing every name.
+        // A hit is verified against the entry's bytes; a 64-bit collision
+        // (the map then names an entry of another key) falls back to the scan,
+        // so the answer is the scan's answer in every case.
+        const nh = DynamicTable.hashName(f.name);
+        if (m.name == null) {
+            const seq = t.name_index.get(nh) orelse return m; // no such name, so no pair either
+            const en = t.bySeq(seq);
+            if (!std.mem.eql(u8, en.name(), f.name)) return e.scanDynamic(f, m);
+            m.name = static_table.len + t.indexOfSeq(seq);
+        }
+        const pseq = t.pair_index.get(DynamicTable.hashPair(nh, f.value)) orelse return m;
+        const ep = t.bySeq(pseq);
+        if (!std.mem.eql(u8, ep.name(), f.name) or !std.mem.eql(u8, ep.value(), f.value))
+            return e.scanDynamic(f, m);
+        m.exact = static_table.len + t.indexOfSeq(pseq);
+        return m;
+    }
+
+    /// The linear newest-first dynamic-table scan the index replaces; the
+    /// collision fallback. `m` carries the static-table result in.
+    fn scanDynamic(e: *const Encoder, f: Field, m_in: Match) Match {
+        var m = m_in;
         const n = e.table.count();
         var i: usize = 1;
         while (i <= n) : (i += 1) {
@@ -1957,4 +2042,230 @@ test "corpus: every huffman seed reaches both decoders, and the octets decoded a
     // refusals before the draw was fixed; 15 / 171 / 3 after.
     try testing.expectEqual(@as(usize, 171), decoded);
     try testing.expectEqual(@as(usize, 3), refused);
+}
+
+// ── encoder search index: differential against the previous findField ───────
+
+/// `Encoder.findField` as it was before the dynamic-table index: static
+/// run, then a newest-first `mem.eql` scan of the whole dynamic table. Kept
+/// only as the test oracle.
+fn findFieldOld(e: *const Encoder, f: Field) Encoder.Match {
+    var m: Encoder.Match = .{};
+    if (static_names.get(f.name)) |run| {
+        m.name = run.first;
+        var i: usize = run.first;
+        while (i < run.first + run.count) : (i += 1) {
+            if (std.mem.eql(u8, static_table[i - 1].value, f.value)) {
+                m.exact = i;
+                return m;
+            }
+        }
+    }
+    const n = e.table.count();
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        const entry = e.table.get(i).?;
+        if (!std.mem.eql(u8, entry.name(), f.name)) continue;
+        if (m.name == null) m.name = static_table.len + i;
+        if (std.mem.eql(u8, entry.value(), f.value)) {
+            m.exact = static_table.len + i;
+            return m;
+        }
+    }
+    return m;
+}
+
+/// `Encoder.encodeField` with the old search, on an encoder whose own
+/// `findField` is never consulted. Same emission code, so any byte difference
+/// comes from the search result alone.
+fn encodeFieldOld(e: *Encoder, f: Field, out: *std.ArrayList(u8)) !void {
+    if (f.sensitive) {
+        try e.encodeLiteral(f, 0x10, 4, findFieldOld(e, f).name, out);
+        return;
+    }
+    const m = findFieldOld(e, f);
+    if (m.exact) |index| {
+        try appendInt(e.gpa, out, 0x80, 7, index);
+        return;
+    }
+    try e.encodeLiteral(f, 0x40, 6, m.name, out);
+    try e.table.add(e.gpa, f.name, f.value);
+}
+
+const diff_static_names = [_][]const u8{
+    ":status", ":method",       ":path",         "content-type", "content-length", "date",
+    "server",  "cache-control", "vary",          "set-cookie",   "etag",           "accept-encoding",
+    "cookie",  "location",      "authorization",
+};
+const diff_static_values = [_][]const u8{
+    "200",         "204",           "206",       "304", "404",      "500",        "201", "GET", "POST", "/",
+    "/index.html", "gzip, deflate", "text/html", "",    "no-cache", "max-age=60",
+};
+
+fn diffField(rnd: std.Random, buf: *[80]u8) Field {
+    var f: Field = undefined;
+    // Name: static (~50 %), a few custom repeated names, or a fresh random one.
+    switch (rnd.uintLessThan(u8, 10)) {
+        0...4 => f.name = diff_static_names[rnd.uintLessThan(usize, diff_static_names.len)],
+        5...7 => {
+            const custom = [_][]const u8{ "x-a", "x-b", "x-request-id", "x-trace", "x-abcdefghijklmnop" };
+            f.name = custom[rnd.uintLessThan(usize, custom.len)];
+        },
+        else => {
+            const n = 1 + rnd.uintLessThan(usize, 12);
+            for (buf[0..n]) |*c| c.* = 'a' + rnd.uintLessThan(u8, 26);
+            f.name = buf[0..n];
+        },
+    }
+    // Value: a small pool (repeats), or random of varied length (0..60).
+    if (rnd.uintLessThan(u8, 10) < 6) {
+        f.value = diff_static_values[rnd.uintLessThan(usize, diff_static_values.len)];
+    } else {
+        // Mostly short over 3 symbols (so repeats occur), sometimes long.
+        const n = if (rnd.uintLessThan(u8, 8) == 0) rnd.uintLessThan(usize, 60) else rnd.uintLessThan(usize, 3);
+        for (buf[20..][0..n]) |*c| c.* = 'a' + rnd.uintLessThan(u8, 3);
+        f.value = buf[20..][0..n];
+    }
+    f.sensitive = rnd.uintLessThan(u8, 20) == 0;
+    return f;
+}
+
+test "encoder search: indexed findField equals the old scan; bytes identical (random sequences)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7541_0001);
+    const rnd = prng.random();
+    var total_fields: usize = 0;
+    var dyn_exact: usize = 0;
+    var dyn_name_only: usize = 0;
+    var evictions: u64 = 0;
+
+    for (0..60) |round| {
+        const max: usize = switch (round % 5) {
+            0 => 96, // tiny: ~2 entries, constant eviction
+            1 => 300,
+            2 => 1000,
+            3 => 4096,
+            else => 0, // no table at all until an update raises it
+        };
+        const mode: Encoder.HuffmanMode = if (round % 2 == 0) .auto else .never;
+        var enc = Encoder.init(gpa, .{ .max_table_size = max, .huffman = mode });
+        defer enc.deinit();
+        var ref = Encoder.init(gpa, .{ .max_table_size = max, .huffman = mode });
+        defer ref.deinit();
+        var dec = Decoder.init(gpa, .{ .max_table_size = 4096 });
+        defer dec.deinit();
+
+        for (0..40) |_| {
+            // Occasionally change the table size: both encoders alike.
+            if (rnd.uintLessThan(u8, 8) == 0) {
+                const sizes = [_]usize{ 0, 40, 96, 200, 512, 4096 };
+                const ns = sizes[rnd.uintLessThan(usize, sizes.len)];
+                enc.setMaxTableSize(ns);
+                ref.setMaxTableSize(ns);
+            }
+            var fields: [8]Field = undefined;
+            var bufs: [8][80]u8 = undefined;
+            const nf = 1 + rnd.uintLessThan(usize, fields.len);
+            for (fields[0..nf], 0..) |*f, i| f.* = diffField(rnd, &bufs[i]);
+
+            var a: std.ArrayList(u8) = .empty;
+            defer a.deinit(gpa);
+            var b: std.ArrayList(u8) = .empty;
+            defer b.deinit(gpa);
+
+            // Encoder pre-block updates, then field by field so the index answer
+            // is compared against the oracle at the exact table state it is asked in.
+            try enc.encodeBlock(&.{}, &a); // emits pending §6.3 updates only
+            try ref.encodeBlock(&.{}, &b);
+            for (fields[0..nf]) |f| {
+                const got = enc.findField(f);
+                const want = findFieldOld(&enc, f);
+                try testing.expectEqual(want.exact, got.exact);
+                try testing.expectEqual(want.name, got.name);
+                // The collision fallback is the old scan verbatim (when the
+                // static table had no exact hit; otherwise findField returns early).
+                if (want.exact == null or want.exact.? > static_table.len) {
+                    var m0: Encoder.Match = .{};
+                    if (static_names.get(f.name)) |run| m0.name = run.first;
+                    const sc = enc.scanDynamic(f, m0);
+                    try testing.expectEqual(want.exact, sc.exact);
+                    try testing.expectEqual(want.name, sc.name);
+                }
+                total_fields += 1;
+                if (got.exact) |x| {
+                    if (x > static_table.len) dyn_exact += 1;
+                } else if (got.name) |x| {
+                    if (x > static_table.len) dyn_name_only += 1;
+                }
+                const before = enc.table.evicted;
+                try enc.encodeField(f, &a);
+                try encodeFieldOld(&ref, f, &b);
+                evictions += enc.table.evicted - before;
+                try testing.expectEqual(ref.table.count(), enc.table.count());
+                try testing.expectEqual(ref.table.size, enc.table.size);
+            }
+            try testing.expectEqualSlices(u8, b.items, a.items);
+
+            // What was emitted must decode to the fields that went in
+            // (sensitive ones included; the decoder only tracks the flag).
+            var hl = try dec.decodeBlock(a.items);
+            defer hl.deinit(gpa);
+            try testing.expectEqual(nf, hl.fields.len);
+            for (fields[0..nf], hl.fields) |f, g| {
+                try testing.expectEqualStrings(f.name, g.name);
+                try testing.expectEqualStrings(f.value, g.value);
+            }
+        }
+        // Index and table stay consistent: every live entry is reachable.
+        var i: usize = 1;
+        while (enc.table.get(i)) |te| : (i += 1) {
+            const f: Field = .{ .name = te.name(), .value = te.value() };
+            try testing.expectEqual(findFieldOld(&enc, f).exact, enc.findField(f).exact);
+            try testing.expect(enc.findField(f).exact != null);
+        }
+        // Nothing stale: the maps never hold more keys than live entries.
+        try testing.expect(enc.table.name_index.count() <= enc.table.count());
+        try testing.expect(enc.table.pair_index.count() <= enc.table.count());
+    }
+    // The run must actually have exercised dynamic hits and eviction.
+    if (total_fields <= 5000 or dyn_exact <= 100 or dyn_name_only <= 200 or evictions <= 200)
+        std.debug.print("coverage: fields={d} dyn_exact={d} dyn_name_only={d} evictions={d}\n", .{ total_fields, dyn_exact, dyn_name_only, evictions });
+    try testing.expect(total_fields > 5000);
+    try testing.expect(dyn_exact > 100);
+    try testing.expect(dyn_name_only > 200);
+    try testing.expect(evictions > 200);
+}
+
+test "encoder search: same name+value re-added after eviction, and duplicate names (newest wins)" {
+    const gpa = testing.allocator;
+    var enc = Encoder.init(gpa, .{ .max_table_size = 4096 });
+    defer enc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    // Three values under one custom name: index of the name = the newest.
+    try enc.encodeBlock(&.{
+        .{ .name = "x-k", .value = "1" },
+        .{ .name = "x-k", .value = "2" },
+        .{ .name = "x-k", .value = "3" },
+    }, &out);
+    var m = enc.findField(.{ .name = "x-k", .value = "9" });
+    try testing.expectEqual(@as(?u64, 62), m.name); // newest = dynamic index 1
+    try testing.expectEqual(@as(?u64, null), m.exact);
+    m = enc.findField(.{ .name = "x-k", .value = "1" });
+    try testing.expectEqual(@as(?u64, 64), m.exact); // oldest of the three
+    // Shrink so only the newest survives, then the older pair is gone from the index too.
+    enc.setMaxTableSize(DynamicTable.entrySize("x-k", "3"));
+    try testing.expectEqual(@as(usize, 1), enc.dynamicTableCount());
+    m = enc.findField(.{ .name = "x-k", .value = "1" });
+    try testing.expectEqual(@as(?u64, 62), m.name);
+    try testing.expectEqual(@as(?u64, null), m.exact);
+    enc.setMaxTableSize(0);
+    m = enc.findField(.{ .name = "x-k", .value = "3" });
+    try testing.expectEqual(@as(?u64, null), m.name);
+    try testing.expectEqual(@as(?u64, null), m.exact);
+    // Same pair re-added after the table was emptied.
+    enc.setMaxTableSize(4096);
+    try enc.encodeBlock(&.{.{ .name = "x-k", .value = "1" }}, &out);
+    m = enc.findField(.{ .name = "x-k", .value = "1" });
+    try testing.expectEqual(@as(?u64, 62), m.exact);
 }
