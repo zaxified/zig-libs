@@ -118,10 +118,11 @@ table.
 - ~~**Baseline x86_64 Debug build fails**~~ — **FIXED 2026-09-29** (the
   PCLMUL path exists only where the backend can emit it, see *Dispatch*;
   crc32c's SSE4.2 path and aesgcm's AES-NI kernel had the same defect and the
-  same fix). The check half is still open: no gate builds a module for a
-  baseline x86_64 target under the self-hosted backend, so the class can come
-  back unnoticed. Measured 2026-09-29 over the 13 modules with inline asm: only
-  these three failed. Was:
+  same fix). The check half is REJECTED (user, 2026-09-29): the self-hosted
+  backend is for the edit loop only, every gate and CI lane builds with LLVM,
+  so no lane will build under it. The class can come back unnoticed; it only affects a Debug
+  build that emits a binary with the self-hosted backend. Measured 2026-09-29
+  over the 13 modules with inline asm: only these three failed. Was:
 - **Baseline x86_64 Debug build fails (found 2026-09-29 by qap's
   `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
   chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline
