@@ -470,10 +470,17 @@ pub const PageCache = struct {
         if (sequential and self.read_ahead_pages > 0) {
             if (self.readAhead(h, buf, off)) |n| return n;
         }
+        const epoch0 = self.epoch;
         const n = try self.inner.pread(h, buf, off);
         // Only a full, present page is a cacheable unit (a short read means the
-        // page is not fully on media — never cache a partial page).
-        if (n == self.page_size) {
+        // page is not fully on media — never cache a partial page). And only
+        // bytes no mutation raced: over an inner `Storage` that parks the
+        // fiber, a write through this cache can land while this read is
+        // parked, and it has already put the NEWER bytes -- inserting these
+        // would replace them with older ones, a stale hit served for as long
+        // as the page stays resident. The caller still gets what media held
+        // when it read; only the cache skips it.
+        if (n == self.page_size and self.epoch == epoch0) {
             self.cache.put(&key, buf, 0, 0, 0);
         }
         return n;
@@ -2290,6 +2297,32 @@ test "read-ahead: a write landing during the inner read is never overwritten by 
     _ = try st.pread(h, &buf, default_page_size); // read-ahead 1..6, hook writes page 3
     _ = try st.pread(h, &buf, 3 * default_page_size);
     for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x);
+}
+
+test "a write landing during a plain miss's inner read is not overwritten by the older bytes" {
+    // The same race without read-ahead: page 3 missed, its inner pread got
+    // the old bytes, and a second fiber wrote page 3 before the read resumed.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try testing.expectEqual(@as(Storage.Handle, 0), h);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    cs.hook = writeDuringReadAhead;
+    cs.hook_pc = &pc;
+    _ = try st.pread(h, &buf, 3 * default_page_size); // parked read of page 3
+    for (buf) |x| try testing.expectEqual(@as(u8, 4), x); // what media held when it read
+    const reads = cs.preads;
+    _ = try st.pread(h, &buf, 3 * default_page_size);
+    for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x);
+    try testing.expectEqual(reads, cs.preads); // and served from the cache, not re-read
 }
 
 test "read-ahead: budget of one page still holds and reads stay correct" {

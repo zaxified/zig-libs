@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fix: a plain `pread` miss could put OLDER bytes over a write that landed while
+  its inner read was parked (a fiber-reentrant caller over a suspending `Storage`), leaving a
+  stale page served as a hit. The miss now caches only when no mutation ran during the read
+  (the write epoch read-ahead already used). Found reviewing the read-ahead change.
+
 - **2026-09-29** — `list` (kv's new optional `Storage.list`) is forwarded to the inner
   `Storage`; `null` when the inner one cannot list.
 
