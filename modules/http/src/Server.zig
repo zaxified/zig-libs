@@ -513,7 +513,8 @@ pub const Options = struct {
     /// is then refused with 415 rather than handing the handler compressed
     /// bytes. Any other non-identity `Content-Encoding` answers 415
     /// regardless of this knob. Costs an extra ~68 KiB (decoder window) per
-    /// connection while enabled.
+    /// connection while enabled. Reaches the h1 loop and h2c alike (on h2
+    /// per gzip stream, see `h2_server.Options`).
     max_decompressed_request_bytes: u64 = 0,
     /// Check the inbound gzip trailer's CRC-32 and ISIZE against the
     /// decompressed bytes, failing the body read on a mismatch (a corrupt
@@ -1120,6 +1121,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .compression = o.compression,
                 .gzip_scratch = gz,
                 .encoder_provider = o.encoder_provider,
+                .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
+                .verify_inbound_trailer = o.verify_inbound_trailer,
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
                 // Deliberately not forwarded: the h2 codec's working memory

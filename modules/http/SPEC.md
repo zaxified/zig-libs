@@ -157,7 +157,7 @@ Hardened for direct internet exposure (no reverse proxy required):
   resets on every successful write — it drops a peer that stops reading outright, but not one that
   keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
   comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
-  zip-bomb-capped (`max_decompressed_request_bytes` → 413). **Inbound gzip trailer verification**
+  zip-bomb-capped (`max_decompressed_request_bytes` → 413, h1 and h2c alike). **Inbound gzip trailer verification**
   (`Options.verify_inbound_trailer`, off by default — DONE 2026-09-28, see backlog strikethrough
   below): std's `flate.Decompress` reads the RFC 1952 trailer but never checks its CRC-32/ISIZE, so
   a corrupt-trailer body decodes and reaches the handler as long as the deflate stream itself
@@ -306,11 +306,10 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
-- **h2 inbound gzip decode.** h1 decodes a `Content-Encoding: gzip` request when
-  `max_decompressed_request_bytes` is set; `h2_server` refuses every non-identity coding with 415
-  (2026-09-29, h1 parity for the refusal). A deployment with inbound decode on therefore answers
-  the same gzip request 200 on h1 and 415 on h2 — safe, but a divergence. Ideal: the same
-  `GunzipBody` wrapper over the h2 request body (buffered and `stream_request`), same cap.
+- ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
+  / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request
+  body (buffered and `stream_request`), same cap and 413, working memory from the stream's arena
+  only for a gzip request. Was: h1 decoded a gzip request, h2 answered the same request 415.
 
 - ~~**Inbound gzip: verify the trailer**~~ — **DONE 2026-09-28** (found the same day wiring
   `crc32` into `gzip.zig`). std's `flate.Decompress` reads the gzip trailer but never checks its

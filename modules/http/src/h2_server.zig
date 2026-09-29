@@ -245,6 +245,21 @@ pub const Options = struct {
     /// served concurrently (`dispatcher`, h2 fibers) the provider must be
     /// safe for that.
     encoder_provider: ?Server.EncoderProvider = null,
+    /// Transparent inbound gzip request-body decoding, h1 parity
+    /// (`Server.Options.max_decompressed_request_bytes`, which `connMain`
+    /// forwards here): a `Content-Encoding: gzip` request body reaches the
+    /// handler's `req.reader()` decompressed, capped at this many
+    /// **decompressed** bytes (over it: 413 when nothing was sent yet). 0 =
+    /// off: a gzip request is 415, like every other non-identity coding.
+    /// The decoder's working memory (`Server.GunzipScratch`, ~68 KiB) is
+    /// taken from the stream's arena only for a gzip request, so it is
+    /// per concurrent gzip STREAM -- bounded by `Limits.max_concurrent_streams`
+    /// -- where h1 holds one per connection.
+    max_decompressed_request_bytes: u64 = 0,
+    /// Check the inbound gzip trailer (CRC-32, ISIZE); see
+    /// `Server.Options.verify_inbound_trailer`. Only alongside
+    /// `max_decompressed_request_bytes`.
+    verify_inbound_trailer: bool = false,
     /// Lifecycle observer (see `Server.ConnState`): .new/.closed per
     /// connection, .active/.idle around each request stream served.
     on_conn_state: ?Server.ConnStateFn = null,
@@ -1692,12 +1707,18 @@ const Session = struct {
 
         // Inbound Content-Encoding, h1 parity (`Server.serveOne`): a body
         // this server cannot decode never reaches the handler as opaque
-        // bytes. h2 decodes nothing inbound, so every non-identity coding --
-        // `gzip` included, as on h1 with decoding off -- is 415. Two fields
-        // are a coding list (RFC 9110 §5.3), which h1 refuses too. Before
-        // this the same gzip PUT was a 415 on h1 and a stored compressed blob
-        // on h2 (qap research register H9, 2026-09-29).
-        if (content_encodings > 1 or gzip.requestContentEncoding(content_encoding) != .identity)
+        // bytes. `gzip` is decoded when `max_decompressed_request_bytes` is
+        // set; any other non-identity coding -- and `gzip` with decoding
+        // off -- is 415. Two fields are a coding list (RFC 9110 §5.3), which
+        // h1 refuses too. Before the refusal the same gzip PUT was a 415 on
+        // h1 and a stored compressed blob on h2 (qap research register H9,
+        // 2026-09-29).
+        const req_encoding: gzip.RequestEncoding = if (content_encodings > 1)
+            .unsupported
+        else
+            gzip.requestContentEncoding(content_encoding);
+        const decode_gzip = req_encoding == .gzip and s.opts.max_decompressed_request_bytes != 0;
+        if (req_encoding == .unsupported or (req_encoding == .gzip and !decode_gzip))
             return s.respondError(id, 415);
 
         // ── synthesize the h1-shaped request the handler expects ────────
@@ -1823,6 +1844,26 @@ const Session = struct {
             .conn_request_index = req_index,
             .stream_id = id,
         };
+        // Inbound gzip decoding, as `Server.serveOne` wires it: the handler's
+        // `req.reader()` reads the plaintext through the flate decoder under
+        // the decompressed-byte cap, while `body` stays the raw source. The
+        // working memory comes from the stream's arena, and only here, so a
+        // stream without a gzip body pays nothing; it held plaintext, so it
+        // is zeroed before the arena takes it back, like `body_scratch`.
+        var gunzip_body: Server.GunzipBody = undefined;
+        const gunzip_scratch: ?*Server.GunzipScratch = if (decode_gzip)
+            arena.create(Server.GunzipScratch) catch return .close
+        else
+            null;
+        defer if (gunzip_scratch) |sc| zeroize.zeroize(std.mem.asBytes(sc));
+        if (gunzip_scratch) |sc| {
+            const src = body.reader();
+            const container: std.compress.flate.Container = if (s.opts.verify_inbound_trailer) .raw else .gzip;
+            sc.decompress = .init(src, container, &sc.window);
+            gunzip_body = .init(&sc.decompress.reader, s.opts.max_decompressed_request_bytes, &sc.out);
+            if (s.opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = src };
+            req.decoded = &gunzip_body.reader;
+        }
 
         // ── run the handler against the stock ResponseWriter ────────────
         var date_buf: [Server.http_date_len]u8 = undefined;
@@ -1892,7 +1933,8 @@ const Session = struct {
                 // simply discarded and a clean status takes its place —
                 // exactly the old behavior, which held for every response
                 // because every response was staged whole.
-                return s.respondError(id, if (sb.exceeded) 413 else 500);
+                const over = sb.exceeded or (gunzip_scratch != null and gunzip_body.exceeded);
+                return s.respondError(id, if (over) 413 else 500);
             }
             // Part of the response IS on the wire and cannot be retracted.
             // h1 closes the connection here; h2 can do better and kill just
@@ -3509,6 +3551,182 @@ test "h2c serve: a request Content-Encoding other than identity is 415 before th
     // The control: identity is a plaintext body and reaches the handler.
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_identity).status);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+/// gzip-compress `plain` into a freshly allocated buffer (caller frees); the
+/// shape of `Server`'s own test helper for the h1 decode tests.
+fn gzipOf(plain: []const u8) ![]u8 {
+    const scratch = try testing.allocator.create(Server.GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    var aw: Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer aw.deinit();
+    try gzip.initCompress(&scratch.compress, &aw.writer, &scratch.window, .gzip, gzip.levelOptions(6));
+    try scratch.compress.writer.writeAll(plain);
+    try scratch.compress.finish();
+    return testing.allocator.dupe(u8, aw.written());
+}
+
+/// A POST to `path` carrying `content-encoding: <coding>`, its body to follow.
+fn postEncoded(path: []const u8, coding: []const u8) [5]hpack.Field {
+    return .{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "t" },
+        .{ .name = "content-encoding", .value = coding },
+    };
+}
+
+/// 52 plain bytes: repetitive, so the gzip member is shorter than the text.
+const gz_plain = "gzipped-body!" ** 4;
+
+test "h2c serve: a gzip request body is decoded for the handler when max_decompressed_request_bytes is set, as on h1" {
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    try testing.expect(compressed.len < gz_plain.len);
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_gzip = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid_gzip, compressed, true);
+    const sid_alias = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "x-gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid_alias, compressed, true);
+    // Decoding gzip does not open the door to the codings it does not decode.
+    const sid_br = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "br"), false);
+    try peer.conn.sendData(&peer.wire, sid_br, compressed, true);
+    const sid_plain = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    try peer.conn.sendData(&peer.wire, sid_plain, "as sent", true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .max_decompressed_request_bytes = 1 << 20 }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_gzip).status);
+    try testing.expectEqualStrings(gz_plain, peer.resp(sid_gzip).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_alias).status);
+    try testing.expectEqualStrings(gz_plain, peer.resp(sid_alias).body.items);
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid_br).status);
+    try testing.expectEqualStrings("as sent", peer.resp(sid_plain).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: a gzip request body over the decompressed cap is 413 (zip-bomb guard), the connection lives on" {
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_over = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid_over, compressed, true);
+    const sid_after = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [16384]u8 = undefined;
+    // 16 < 52 decoded octets: the handler's read fails before it answers.
+    try runOffline(&peer, .{ .handler = testHandler, .max_decompressed_request_bytes = 16 }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 413), peer.resp(sid_over).status);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_after).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: verify_inbound_trailer refuses a gzip body whose CRC-32 does not match, and passes a sound one" {
+    const gpa = testing.allocator;
+    const sound = try gzipOf(gz_plain);
+    defer gpa.free(sound);
+    const corrupt = try gpa.dupe(u8, sound);
+    defer gpa.free(corrupt);
+    corrupt[corrupt.len - 8] ^= 0x01; // the trailer's CRC-32, first octet
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_sound = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid_sound, sound, true);
+    const sid_corrupt = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid_corrupt, corrupt, true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .max_decompressed_request_bytes = 1 << 20,
+        .verify_inbound_trailer = true,
+    }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_sound).status);
+    try testing.expectEqualStrings(gz_plain, peer.resp(sid_sound).body.items);
+    // Any undecodable body: a generic 500, as on h1.
+    try testing.expectEqual(@as(u16, 500), peer.resp(sid_corrupt).status);
+}
+
+test "h2c serve: a streamed gzip request body is decoded as it lands" {
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/stream-echo", "gzip"), false);
+    // Two DATA frames, split inside the deflate stream.
+    const half = compressed.len / 2;
+    try peer.conn.sendData(&peer.wire, sid, compressed[0..half], false);
+    try peer.conn.sendData(&peer.wire, sid, compressed[half..], true);
+
+    var out_buf: [16384]u8 = undefined;
+    var opts = streamOpts();
+    opts.max_decompressed_request_bytes = 1 << 20;
+    try runOffline(&peer, opts, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqualStrings(gz_plain, peer.resp(sid).body.items);
+}
+
+test "h2c integration: Server forwards max_decompressed_request_bytes to h2c" {
+    // `connMain` builds `h2_server.Options` field by field; a knob it does
+    // not copy is silently off on h2 while h1 honours it.
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = Server.init(io, gpa, .{
+        .handler = testHandler,
+        .enable_h2c = true,
+        .max_decompressed_request_bytes = 1 << 20,
+    });
+    defer server.deinit();
+    try bindOrSkip(&server);
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid, compressed, true);
+    try peer.sendWire(&sw.interface);
+    while (peer.resps.getPtr(sid) == null or !peer.resp(sid).end) {
+        try peer.pumpSocket(&sr.interface);
+        try peer.sendWire(&sw.interface);
+    }
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqualStrings(gz_plain, peer.resp(sid).body.items);
 }
 
 test "h2c serve: a `host` field beside :authority must agree (§8.3.1), is written into the handler's block once, and stands in for a missing :authority" {

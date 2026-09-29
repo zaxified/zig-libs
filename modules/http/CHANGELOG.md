@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **h2 decodes a gzip request body, as h1 does.** `h2_server.Options` gained
+  `max_decompressed_request_bytes` and `verify_inbound_trailer` (same meaning as on
+  `Server.Options`, which `connMain` now forwards to h2c): a `Content-Encoding: gzip` (or
+  `x-gzip`) request body reaches the handler's `req.reader()` decompressed through the same
+  `Server.GunzipBody`, buffered and `stream_request` bodies alike, with the same cap (over it:
+  413) and the same optional trailer check. Every other coding is still 415. The decoder's
+  ~68 KiB of working memory comes from the stream's arena, only for a gzip request, and is zeroed
+  after it. Behaviour change for a `Server` with decoding on: the gzip request h2 answered 415
+  since the entry below is now decoded, as h1 always did.
+
 - **2026-09-29** — **h2 refuses a request `Content-Encoding` it cannot decode, as h1 does.**
   `h2_server` never looked at the request's `Content-Encoding`: a gzip PUT was a 415 on h1 and
   reached the handler over h2 as the compressed bytes with the header attached — two protocol
