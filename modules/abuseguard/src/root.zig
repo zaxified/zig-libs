@@ -36,6 +36,14 @@
 //!   rejected, never admitted uncounted (contrast `ratelimit`, which fails
 //!   open — a missed *rate* decision is a nuisance, an uncounted
 //!   *connection* is exactly the resource being defended).
+//!   That default is itself a lockout vector: N addresses each holding one
+//!   idle connection under every cap fill the store, and every NEW address
+//!   is refused while the holders are served (measured from qap, 2026-09-29:
+//!   4096 loopback addresses; over IPv6 per /64 a free /48 is 65 536 keys).
+//!   `Options.on_store_full = .admit_untracked` is the opt-out: such a
+//!   connection skips the per-IP cap and reputation, but it is still
+//!   COUNTED — in `total_conns` and against `max_conns_total` — so the
+//!   global bound holds for it as for everyone else.
 //! - **fail2ban:** `record(ip, weight)` ≈ a failregex hit; `ban_threshold`
 //!   ≈ maxretry; `greylist_ttl_ms` ≈ bantime; strike decay ≈ findtime
 //!   (approximated as a leaky bucket: one strike drains per
@@ -179,8 +187,17 @@ pub const Options = struct {
     /// connections are never evicted; banned entries only as a last
     /// resort). When nothing is evictable — every tracked IP has a live
     /// connection — new IPs are rejected (nginx zone-exhausted semantics),
-    /// so size this ≥ any `max_conns_total`. Must be ≥ 1.
+    /// so size this ≥ any `max_conns_total`. Must be ≥ 1. What happens
+    /// past it is `on_store_full`.
     max_tracked_ips: usize = 4096,
+    /// A new IP that cannot be tracked (store full of live connections, or
+    /// the allocator failed): `.reject` → `.store_full` (fail-closed, the
+    /// default); `.admit_untracked` → `.admitted_untracked`: no entry, so no
+    /// per-IP cap, ban or greylist applies to it, but it counts in
+    /// `total_conns` and `max_conns_total` still refuses it. Pick it when
+    /// the lockout is worse than an uncapped address — and then set
+    /// `max_conns_total`, the one bound left on those connections.
+    on_store_full: StoreFull = .reject,
     /// Time source — inject a fake for deterministic tests. The store never
     /// reads a wall clock on its own.
     clock: Clock = .monotonic,
@@ -195,10 +212,14 @@ pub const Options = struct {
     middleware_key: MiddlewareKey = .peer_ip,
 };
 
+/// `Options.on_store_full`.
+pub const StoreFull = enum { reject, admit_untracked };
+
 // ── the guard ───────────────────────────────────────────────────────────────
 
-/// `admit`'s verdict — anything but `.admitted` maps to a `.reject` at the
-/// server hook (which closes the socket without writing a byte).
+/// `admit`'s verdict — anything but `.admitted` / `.admitted_untracked`
+/// maps to a `.reject` at the server hook (which closes the socket without
+/// writing a byte).
 pub const AdmitVerdict = enum {
     /// Connection admitted; the per-IP and total counters were incremented.
     /// Pair with exactly one `connClosed` when the connection ends.
@@ -215,6 +236,10 @@ pub const AdmitVerdict = enum {
     /// allocator failed) — refused, nginx zone-exhausted semantics
     /// (fail-closed; see the module doc).
     store_full,
+    /// The store was full and `on_store_full = .admit_untracked`: admitted
+    /// with no entry, counted in the total only. Pair with exactly one
+    /// `connClosedUntracked` (or `connClosed`, which falls back to it).
+    admitted_untracked,
 };
 
 /// The reputation store + admission engine. Allocator-explicit, bounded,
@@ -230,7 +255,10 @@ pub const Guard = struct {
     /// Front = most recently touched; eviction scans from the back.
     lru: std.DoublyLinkedList = .{},
     /// Live admitted connections across all IPs (the global cap's counter).
+    /// Invariant: `total_conns == Σ active_conns + untracked_conns`.
     total_conns: usize = 0,
+    /// Live connections admitted with no entry (`.admitted_untracked`).
+    untracked_conns: usize = 0,
 
     const Key = [16]u8;
 
@@ -295,8 +323,10 @@ pub const Guard = struct {
 
     /// Decide one incoming connection from `ip` at the injected clock's
     /// now: reject when banned / greylisted / over the per-IP cap / over
-    /// the global cap / untrackable — otherwise count it and admit.
-    /// Thread-safe. Every `.admitted` must be paired with one `connClosed`.
+    /// the global cap / untrackable (unless `on_store_full` admits it
+    /// untracked) — otherwise count it and admit. Thread-safe. Every
+    /// `.admitted` must be paired with one `connClosed`, every
+    /// `.admitted_untracked` with one `connClosedUntracked`.
     pub fn admit(g: *Guard, ip: netaddr.Ip) AdmitVerdict {
         const now_ns = g.options.clock.now();
         lockSpin(&g.lock);
@@ -306,7 +336,14 @@ pub const Guard = struct {
         if (g.options.max_conns_total) |max| {
             if (g.total_conns >= max) return .total_cap;
         }
-        const e = g.getOrCreate(ip.as16(), now_ns) orelse return .store_full;
+        const e = g.getOrCreate(ip.as16(), now_ns) orelse switch (g.options.on_store_full) {
+            .reject => return .store_full,
+            .admit_untracked => {
+                g.untracked_conns += 1;
+                g.total_conns += 1;
+                return .admitted_untracked;
+            },
+        };
         if (e.banned) return .banned;
         if (now_ns < e.greylisted_until_ns) return .greylisted;
         e.greylisted_until_ns = 0; // lazy expiry
@@ -318,20 +355,44 @@ pub const Guard = struct {
         return .admitted;
     }
 
-    /// Release the slot `admit` counted for `ip`. Unmatched calls (an IP
-    /// that was never admitted) are ignored — counters never go negative.
+    /// Release the slot `admit` counted for `ip`. With no live slot for
+    /// `ip` it releases an untracked one if any is live (the server hook
+    /// knows only the peer, not which verdict admitted it); past that,
+    /// unmatched calls are ignored — counters never go negative. The
+    /// fallback can briefly credit the wrong side when an untracked address
+    /// later gets an entry too: its untracked close takes the tracked slot,
+    /// the tracked close then takes the untracked one — the totals end
+    /// exact, the per-IP count ran one low in between. A caller that knows
+    /// the verdict calls `connClosedUntracked` and is exact throughout.
     /// Thread-safe.
     pub fn connClosed(g: *Guard, ip: netaddr.Ip) void {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return;
-        if (e.active_conns == 0) return;
-        e.active_conns -= 1;
+        if (g.map.get(ip.as16())) |e| if (e.active_conns != 0) {
+            e.active_conns -= 1;
+            g.total_conns -|= 1;
+            return;
+        };
+        g.releaseUntracked();
+    }
+
+    /// Release a connection `admit` answered `.admitted_untracked`.
+    /// Unmatched calls are ignored. Thread-safe.
+    pub fn connClosedUntracked(g: *Guard) void {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        g.releaseUntracked();
+    }
+
+    fn releaseUntracked(g: *Guard) void {
+        if (g.untracked_conns == 0) return;
+        g.untracked_conns -= 1;
         g.total_conns -|= 1;
     }
 
     /// Force `ip`'s live-connection count to `live`, adjusting the global
-    /// counter by the delta (invariant `total_conns == Σ active_conns` is
+    /// counter by the delta (invariant `total_conns == Σ active_conns +
+    /// untracked_conns` is
     /// preserved; neither counter can go negative). This is the recovery
     /// path for the one leak `admit`/`connClosed` cannot close on their own:
     /// the documented server edge where an *admitted* connection is dropped
@@ -469,6 +530,15 @@ pub const Guard = struct {
         return g.total_conns;
     }
 
+    /// Live connections admitted untracked (`.admitted_untracked`), a
+    /// subset of `totalConns`. Non-zero means the store is (or was) full
+    /// of live addresses. Thread-safe.
+    pub fn untrackedConns(g: *Guard) usize {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        return g.untracked_conns;
+    }
+
     /// Distinct IPs currently tracked (≤ `max_tracked_ips`). Thread-safe.
     pub fn trackedCount(g: *Guard) usize {
         lockSpin(&g.lock);
@@ -587,7 +657,10 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 
 fn onConnectHook(ctx: ?*anyopaque, peer: net.IpAddress) http.Server.ConnDecision {
     const g: *Guard = @ptrCast(@alignCast(ctx.?));
-    return if (g.admit(ipOf(peer)) == .admitted) .accept else .reject;
+    return switch (g.admit(ipOf(peer))) {
+        .admitted, .admitted_untracked => .accept,
+        .banned, .greylisted, .per_ip_cap, .total_cap, .store_full => .reject,
+    };
 }
 
 fn onConnStateHook(ctx: ?*anyopaque, peer: ?net.IpAddress, state: http.Server.ConnState) void {
@@ -931,6 +1004,26 @@ test "keying: IPv4-mapped IPv6 and plain IPv4 are one client, one entry" {
 
 // ── tests: admission (offline, driving the wired hook pair) ─────────────────
 
+test "hooks: an untracked admission is accepted at the hook, and .closed releases it" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_tracked_ips = 1,
+        .on_store_full = .admit_untracked,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const holder = mkPeer4("203.0.113.20", 1111);
+    const late = mkPeer4("203.0.113.21", 1111);
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, holder));
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, late));
+    try testing.expectEqual(@as(usize, 1), g.untrackedConns());
+    hookState(&g, late, .closed);
+    try testing.expectEqual(@as(usize, 0), g.untrackedConns());
+    try testing.expectEqual(@as(usize, 1), g.totalConns());
+    hookState(&g, holder, .closed);
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
 test "hooks: per-IP counter inc/dec via the onConnect/onConnState pair" {
     var tc: TestClock = .{};
     var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 2, .clock = tc.clock() });
@@ -1093,6 +1186,86 @@ test "bounded store: live connections are never evicted; store_full rejects; emp
     try testing.expectEqual(@as(u32, 1), g.connCount(mkIp("10.3.0.1")));
     g.connClosed(mkIp("10.3.0.1"));
     g.connClosed(mkIp("10.3.0.3"));
+}
+
+test "store full, on_store_full = .admit_untracked: admitted with no entry, still under max_conns_total" {
+    // The lockout the fail-closed default allows (qap research register H5):
+    // every entry holds a live connection, so a new address is untrackable.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_tracked_ips = 2,
+        .max_conns_total = 4,
+        .on_store_full = .admit_untracked,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.9.0.1")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.9.0.2")));
+    try testing.expectEqual(AdmitVerdict.admitted_untracked, g.admit(mkIp("10.9.0.3")));
+    try testing.expectEqual(AdmitVerdict.admitted_untracked, g.admit(mkIp("10.9.0.4")));
+    // No entry was made for either, and both are in the total ...
+    try testing.expectEqual(@as(usize, 2), g.trackedCount());
+    try testing.expectEqual(@as(usize, 2), g.untrackedConns());
+    try testing.expectEqual(@as(usize, 4), g.totalConns());
+    // ... so the global cap refuses the next one, untracked or not.
+    try testing.expectEqual(AdmitVerdict.total_cap, g.admit(mkIp("10.9.0.5")));
+
+    // Exact release, then the fallback: `connClosed` on an address with no
+    // live slot takes an untracked one (what the server hook does).
+    g.connClosedUntracked();
+    g.connClosed(mkIp("10.9.0.4"));
+    try testing.expectEqual(@as(usize, 0), g.untrackedConns());
+    try testing.expectEqual(@as(usize, 2), g.totalConns());
+    // Nothing left to release: unmatched closes stay no-ops.
+    g.connClosedUntracked();
+    g.connClosed(mkIp("10.9.0.9"));
+    try testing.expectEqual(@as(usize, 2), g.totalConns());
+
+    g.connClosed(mkIp("10.9.0.1"));
+    g.connClosed(mkIp("10.9.0.2"));
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
+test "admit_untracked: an untracked address that later gets an entry -- the totals end exact" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_tracked_ips = 1,
+        .on_store_full = .admit_untracked,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+
+    const a = mkIp("10.9.1.1");
+    const b = mkIp("10.9.1.2");
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(a));
+    try testing.expectEqual(AdmitVerdict.admitted_untracked, g.admit(b));
+    g.connClosed(a); // a's entry empties, the next insert reclaims it
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(b)); // b tracked now
+    try testing.expectEqual(@as(usize, 2), g.totalConns());
+
+    // The hook closes b's untracked connection first: it takes the tracked
+    // slot (the per-IP count runs one low) ...
+    g.connClosed(b);
+    try testing.expectEqual(@as(u32, 0), g.connCount(b));
+    // ... and the tracked close takes the untracked one: back to zero.
+    g.connClosed(b);
+    try testing.expectEqual(@as(usize, 0), g.untrackedConns());
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
+test "the default stays fail-closed: store_full, nothing counted" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.9.2.1")));
+    try testing.expectEqual(AdmitVerdict.store_full, g.admit(mkIp("10.9.2.2")));
+    try testing.expectEqual(@as(usize, 1), g.totalConns());
+    try testing.expectEqual(@as(usize, 0), g.untrackedConns());
+    // The fallback has nothing to take.
+    g.connClosed(mkIp("10.9.2.2"));
+    try testing.expectEqual(@as(usize, 1), g.totalConns());
+    g.connClosed(mkIp("10.9.2.1"));
 }
 
 test "bounded store: banned entries are evicted last" {

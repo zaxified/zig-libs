@@ -22,6 +22,9 @@ IP reputation + connection-abuse defense for a directly internet-facing `http.Se
   last resort. When nothing is evictable, new IPs are **rejected** (nginx zone-exhausted semantics,
   deliberately fail-closed — contrast `ratelimit`'s fail-open, since an uncountable connection is
   exactly the resource being defended). Size `max_tracked_ips` ≥ `max_conns_total`.
+  `on_store_full = .admit_untracked` (opt-in) turns that lockout into an untracked admission
+  (`.admitted_untracked`, released by `connClosedUntracked`, or by `connClosed` as a fallback when
+  the address holds no live slot) that still counts in `total_conns` / `max_conns_total`.
 - **Concurrency:** threadsafe, internally synchronized (spinlock + O(1) LRU relink, same pattern as
   `ratelimit`); clock injected (default posix `clock_gettime`), never read internally, so every
   ban/greylist/decay test is deterministic.
@@ -47,19 +50,10 @@ ban/unban, greylist TTL re-admit, record-driven escalation; (2) router auto-stri
 escalating a 404 path scanner to accept-time rejection, then TTL re-admits.
 
 ## Backlog / deferred
-- **Fail-closed store as a lockout (qap research register H5, measured 2026-09-29).** 4096 idle
-  keep-alive connections from 4096 loopback addresses — one each, under every per-IP cap — filled
-  the default store, and every NEW address got `store_full` while the holders were served: the
-  defence against exhaustion is itself an exhaustion vector (a small IPv4 botnet; over IPv6 per /64
-  a free /48 is 65 536 keys). qap works around it in `src/gate.zig` (`admitConnection`,
-  `Abuse.on_store_full = .admit`): it maps `store_full` to an untracked admission. The gap that
-  workaround cannot close from outside: an untracked connection is not counted in
-  `max_conns_total` (the total is bumped only after `getOrCreate`). Ideal API: an option
-  `on_store_full: enum { reject, admit_untracked }` whose `admit_untracked` returns a distinct
-  verdict, still counts the connection in `total_conns` (and still enforces `max_conns_total`),
-  and a matching `connClosedUntracked()` that only decrements the total. Also consider a comptime/
-  init assertion or warning when `max_conns_total` is null or > `max_tracked_ips` (the sizing rule
-  above is only prose today).
+- ~~Fail-closed store as a lockout~~ — **done 2026-09-29**: `Options.on_store_full =
+  .admit_untracked` (qap research register H5). Still open from that entry: no init assertion or
+  warning when `max_conns_total` is null with `.admit_untracked` (then nothing bounds untracked
+  connections); left to the consumer's config validation for now.
 - Otherwise none found beyond the pre-public security/similarity review pass (repo-wide, not
   abuseguard-specific).
 

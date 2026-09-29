@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Added: `Options.on_store_full` (`.reject` default, `.admit_untracked`).
+  The fail-closed store was itself a lockout: 4096 addresses each holding one idle
+  connection filled the default store and every NEW address got `store_full` while the
+  holders were served (measured from qap). `.admit_untracked` admits such an address with
+  no entry — new verdict `.admitted_untracked`, released by `connClosedUntracked` (or by
+  `connClosed`, which falls back to it when the address holds no live slot) — and still
+  counts it in `total_conns`, so `max_conns_total` bounds it. `untrackedConns()` reports
+  them. ⚠ `AdmitVerdict` has a new member: an exhaustive `switch` on it must add it.
+
 - **2026-08-25** — Fixed: `ban_threshold` was unreachable in every configuration that
   decays strikes. The drain was continuous, so three unit strikes arriving in the same
   microsecond summed to 2.99997 and a threshold of 3 needed a *fourth* strike — for any

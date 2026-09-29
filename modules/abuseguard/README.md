@@ -110,6 +110,11 @@ Diagnostics: `connCount(ip)`, `totalConns()`, `trackedCount()`.
   like every other reject). The guard is deliberately **fail-closed**
   (contrast `ratelimit`'s fail-open): an uncountable connection is exactly
   the resource being defended. Size `max_tracked_ips` ≥ `max_conns_total`.
+  The default is itself a lockout vector — N addresses holding one idle
+  connection each fill the store and every *new* address is refused — so
+  `on_store_full = .admit_untracked` admits such an address with no entry
+  (`.admitted_untracked`: no per-IP cap, ban or greylist) but still counts
+  it in `max_conns_total`; set that cap when you pick it.
 - **Scope:** a ban/greylist affects new admissions only; connections
   already admitted run until they close (pair with the server's
   read/write/request timeouts). Known server edge: if `http.Server` drops
