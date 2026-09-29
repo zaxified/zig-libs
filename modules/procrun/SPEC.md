@@ -119,20 +119,47 @@ stdout cannot hold the return past the grace, and an unrequested token changes n
 
 ## Backlog / deferred
 
-- **Graceful cancellation** — `Cancel` sends SIGKILL at once, as the deadline does. A
-  SIGTERM-then-grace-then-SIGKILL policy (Go's `Cmd.Cancel` + `WaitDelay`) would let a child
-  clean up; add it when a consumer needs it. Still open.
-- **Line-delimited / NDJSON stdout mode** — v1 delivers raw pipe chunks only; a framed/line mode
-  would spare consumers reassembly. Still open.
+- ~~**Graceful cancellation**~~ — DONE 2026-09-29. `Spec.cancel_grace_ns: ?u64` (default null =
+  SIGKILL at once, unchanged): on `Cancel.request` or the `runTimeout` deadline the killer thread
+  sends SIGTERM (to `-pgid` with `new_process_group`), polls every 5 ms for the direct child to
+  exit (Linux: `waitid(WNOHANG|WNOWAIT|WEXITED)`, non-consuming, so `waitTolerant` still gets the
+  status), then SIGKILLs. The deadline path's pump deadline grows by the grace, keeping the
+  invariant that SIGKILL was sent before the drainers give up. `Output.timed_out` (new; the
+  deadline, as opposed to `canceled`) and `Output.grace_expired` (SIGKILL followed SIGTERM) say
+  what happened. Streaming: `Handle.terminate(grace_ns) bool` / `terminateGroup` — blocking, from
+  the owning thread, `true` = exited within the grace. Windows: no SIGTERM, TerminateProcess at
+  once, grace ignored. Non-Linux POSIX: exit is only noticed via pipe EOF (run) or never
+  (`terminate` always SIGKILLs after the grace, harmlessly at a zombie). Known, pre-existing and
+  unchanged: a child that closes its stdout/stderr and keeps running makes `runKilled` stop the
+  killer once the pipes hit EOF, so it is then waited for, not killed.
+- ~~**Line-delimited / NDJSON stdout mode**~~ — DONE 2026-09-29. `Callbacks.on_stdout_line`
+  (replaces `on_stdout` when set) + `max_line_bytes` (default 1 MiB): `LineFramer` reassembles
+  across reads. Decisions: `\n` stripped and ONE trailing `\r` stripped; empty lines delivered;
+  a final unterminated line is flushed at EOF; an over-long line is delivered once, cut to
+  `max_line_bytes` with `truncated = true`, the rest discarded to the next `\n` (so memory is
+  bounded and the next line is intact; an allocation failure is treated the same way); backpressure
+  is one permit per delivered line, acked once per callback, so a chunk holding many lines can
+  block the reader mid-chunk. No JSON parser. stderr is unchanged (raw chunks).
 - **Windows reap-race coverage** — the `TerminateProcess`/`create_no_window` branch compiles but is
   untested for the POSIX-specific regression this module exists to fix. Still open.
   `new_process_group`/`RlimitSpec` are also POSIX-only (`new_process_group` is a documented no-op,
   `rlimit` is `error.OperationUnsupported`) on Windows.
-- **Type-level "consumed" marker** — a move-only handle preventing a double-`wait`/double-reap at
-  compile time. Still open.
+- ~~**Type-level "consumed" marker**~~ — REJECTED 2026-09-29. Zig has no move-only/linear types:
+  `Handle` is a plain by-value struct (a pointer), so any compile-time marker (a phantom type
+  parameter, a `wait` that returns a different type) is defeated by copying the value, and the
+  language cannot flag a use after `wait`. A runtime check does not work either: `wait` frees the
+  state the flag would live in (a second `wait` is a use-after-free, not a detectable state), and
+  keeping the state alive would leak per handle; `wait(*Handle)` that nulls its pointer would
+  break the existing by-value signature for a check that still misses copies. The contract stays
+  documented ("call `wait` exactly once").
 - **PATH-resolution policy** — explicit control over `argv[0]` PATH resolution independent of
   `argsafe` (now wired in for argv *sanitization* via `runValidated`/`buildValidatedArgv`). Still
-  open as a general knob. ~~One specific gap in it~~ — F2, 2026-09-10, fixed: under `Spec.rlimit`
+  open, deliberately not done 2026-09-29: it is not a small knob. Today resolution is fixed to the
+  PARENT's `PATH` (std does it itself). Any real policy (`.parent` | `.child_env` | `.none`/
+  explicit `path` string) needs our own resolver for everything but `.parent` — including the
+  non-rlimit path, where `std.process.spawn` cannot be told to search another `PATH` — plus a
+  decision on X_OK-vs-file semantics and on `env_mode = .merge` (whose PATH?). Do it when a
+  consumer states which policy it needs. ~~One specific gap in it~~ — F2, 2026-09-10, fixed: under `Spec.rlimit`
   the `exec "$@"` inside the wrapper shell used to resolve a `/`-less `argv[0]` against the
   SHELL's (i.e. the child's, per `env_mode`) `PATH`, breaking `Spec`'s own documented promise that
   resolution "ALWAYS reads from the real parent process environment, regardless of `env_mode`" —

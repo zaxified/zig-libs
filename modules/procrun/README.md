@@ -95,6 +95,29 @@ h3.killGroup(); // SIGKILL to -pgid; cancelGroup()/signalGroup(n) also exist
 _ = h3.wait();
 // runTimeout also grouped-kills on deadline when new_process_group is set.
 
+// Graceful stop (opt-in, POSIX): SIGTERM first, SIGKILL only after the grace.
+// Applies to Spec.cancel and runTimeout's deadline (to the group with
+// new_process_group). null (default) = SIGKILL at once, as before.
+var g = try procrun.runTimeout(gpa, io, .{
+    .argv = &.{ "some-server" },
+    .cancel_grace_ns = 5 * std.time.ns_per_s,
+}, "", 30 * std.time.ns_per_s);
+defer g.deinit(gpa);
+// g.timed_out / g.canceled say why it was stopped; g.grace_expired == true means
+// it ignored SIGTERM and was SIGKILLed. Streaming twin, blocking, from the owner:
+//   const exited_in_grace = h.terminate(5 * std.time.ns_per_s); // terminateGroup(ns)
+
+// Line-framed stdout (NDJSON etc.): one callback per line, no reassembly.
+const hl = try procrun.spawnStreaming(gpa, io, .{ .argv = &.{"tail-events"} }, .{
+    .ctx = &my_sink,
+    // fn (ctx, line: []const u8, truncated: bool) void -- `\n` (and one
+    // trailing `\r`) stripped; a final line without `\n` is delivered at EOF.
+    .on_stdout_line = onLine, // replaces on_stdout
+    .max_line_bytes = 64 * 1024, // longer line: first 64 KiB, truncated = true
+});
+// h.ack() once per LINE (one stdout permit per line). Parse each line yourself.
+_ = hl.wait();
+
 // rlimit sandbox: applied to the child before it execs the real program.
 var limited = try procrun.run(gpa, io, .{
     .argv = &.{ "some-untrusted-tool", "arg" },
@@ -132,19 +155,27 @@ re-encoding to `i32`.
 
 ## Backlog (deferred from v1)
 
-- **Line-delimited / NDJSON stdout mode.** v1 delivers raw pipe chunks only; a
-  framed/line mode would spare consumers reassembly.
 - **Windows depth.** The `TerminateProcess` / `create_no_window` branch is
   present and the module compiles for Windows, but the reap-race regression is a
   POSIX phenomenon — Windows reap-race coverage is deferred. `new_process_group`
   and `rlimit` are POSIX-only for the same reason (see below).
-- **Type-level "consumed" marker.** A move-only handle preventing a
-  double-`wait`/double-reap at compile time.
 - **PATH-resolution policy.** Explicit control over `argv[0]` PATH resolution
   (see `Spec`'s doc comment for current behavior) — independent of the
-  `argsafe` *sanitization* integration below, which has landed.
+  `argsafe` *sanitization* integration below, which has landed. Open, and not
+  a one-line knob: see `SPEC.md`.
+
+Rejected: a type-level "consumed" marker for `Handle` (Zig has no move-only
+types; see `SPEC.md`).
 
 Done since v1:
+
+- **Graceful cancellation.** `Spec.cancel_grace_ns` (blocking runs: `Cancel`
+  and the `runTimeout` deadline) and `Handle.terminate`/`terminateGroup`
+  (streaming): SIGTERM, wait up to the grace, then SIGKILL. `Output.timed_out`
+  and `Output.grace_expired` report what happened. POSIX-only.
+- **Line-delimited / NDJSON stdout mode.** `Callbacks.on_stdout_line` +
+  `max_line_bytes`: bounded reassembly across chunks, one callback and one
+  backpressure permit per line, final unterminated line flushed at EOF.
 
 - **Process-group / whole-tree kill.** `Spec.new_process_group` (`setpgid(0,
   0)` between fork and exec) plus `Handle.cancelGroup`/`killGroup`/

@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **Graceful cancellation and line-framed stdout**, both opt-in.
+  (1) `Spec.cancel_grace_ns` (default `null` = SIGKILL at once, as before): `Cancel` and
+  `runTimeout`'s deadline send SIGTERM first (to the group with `new_process_group`) and SIGKILL
+  only if the child has not exited within the grace; streaming handles get the blocking
+  `Handle.terminate(grace_ns)` / `terminateGroup(grace_ns)` (`true` = exited in time). New
+  `Output.timed_out` (the deadline ended the child) and `Output.grace_expired` (SIGKILL followed
+  SIGTERM), both default `false`. POSIX-only; Windows kills at once. (2) `Callbacks.on_stdout_line`
+  + `max_line_bytes` (new `default_max_line_bytes`, 1 MiB): one callback per line across chunk
+  boundaries, `\n` and one trailing `\r` stripped, final unterminated line flushed at EOF, an
+  over-long line delivered once truncated with `truncated = true`; one backpressure permit per
+  line. Also decided: a type-level "consumed" `Handle` marker is REJECTED (no move-only types in
+  Zig); PATH-resolution policy stays open (see SPEC).
+
 - **2026-09-28** — **Cancel a blocking run from another thread**: new `Cancel` token, passed as
   `Spec.cancel`. `Cancel.request` makes `run`/`runTimeout` SIGKILL the child (the group with
   `new_process_group`) and return what was captured with the new `Output.canceled` set,

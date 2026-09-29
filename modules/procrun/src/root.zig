@@ -54,6 +54,9 @@ pub const default_max_output_bytes: usize = 64 * 1024 * 1024;
 /// behind by before the reader thread blocks (see `Handle.ack`).
 pub const default_stream_permits: usize = 32;
 
+/// Default `Callbacks.max_line_bytes`.
+pub const default_max_line_bytes: usize = 1024 * 1024;
+
 /// How a child's standard stream is wired.
 pub const StdioMode = enum {
     /// Spawn the child with the stream closed (advanced; child may hit EBADF).
@@ -128,6 +131,22 @@ pub const Spec = struct {
     /// The token is borrowed and must outlive the call. `null` (default)
     /// keeps `run` free of the extra thread a cancelable run needs.
     cancel: ?*Cancel = null,
+    /// Graceful-stop policy for `Spec.cancel` and `runTimeout`'s deadline
+    /// (Go's `Cmd.Cancel` + `WaitDelay`). `null` (default): SIGKILL at once,
+    /// as before. A value: send SIGTERM first (to the whole group with
+    /// `new_process_group`, exactly as the kill would go), wait up to this
+    /// many nanoseconds for the direct child to exit, and only then SIGKILL.
+    /// `Output.grace_expired` says which of the two happened. The grace
+    /// starts at the deadline, so `runTimeout` is bounded by roughly
+    /// `timeout_ns + cancel_grace_ns` (plus `pump_grace_ns`). Applies to
+    /// blocking runs only — for a streaming handle see `Handle.terminate`.
+    /// POSIX-only: Windows has no SIGTERM, so `TerminateProcess` runs at
+    /// once and the value is ignored (same as `new_process_group`). Exit
+    /// detection is exact on Linux (`waitid`); on other POSIX targets the
+    /// run only notices the exit when its pipes reach EOF, so a child that
+    /// exits on SIGTERM while a descendant holds a pipe is reported with
+    /// `grace_expired` even though the SIGKILL then hits a zombie.
+    cancel_grace_ns: ?u64 = null,
 };
 
 /// A cancellation token for blocking runs (`Spec.cancel`) — Go's
@@ -250,6 +269,14 @@ pub const Output = struct {
     /// sent the kill. `term` still says how it actually ended — a child
     /// that had just exited on its own keeps its `.exited` code.
     canceled: bool = false,
+    /// `runTimeout`'s own deadline elapsed while the child ran, and the child
+    /// was sent the stop (SIGTERM or SIGKILL, see `Spec.cancel_grace_ns`).
+    /// Together with `canceled` this says WHY `term` is a signal.
+    timed_out: bool = false,
+    /// Only with `Spec.cancel_grace_ns`: the child did not exit within the
+    /// grace after SIGTERM and was SIGKILLed. `false` while `canceled` or
+    /// `timed_out` is set means it exited on its own within the grace.
+    grace_expired: bool = false,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -454,6 +481,45 @@ fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool
             std.posix.kill(-id, sig) catch {};
         },
     }
+}
+
+/// Has `pid` already exited (zombie, not yet reaped by us)? Exact on Linux:
+/// `waitid(WNOHANG | WNOWAIT | WEXITED)` fills `code` only when a child is
+/// waitable, and never consumes the status. A pid that is no longer ours
+/// (`ECHILD`) counts as exited. Other targets cannot ask cheaply: `false`.
+fn childExited(pid: std.posix.pid_t) bool {
+    if (builtin.os.tag != .linux) return false;
+    const L = std.os.linux;
+    var info = std.mem.zeroes(L.siginfo_t);
+    const rc = L.waitid(.PID, pid, &info, L.W.NOHANG | L.W.NOWAIT | L.W.EXITED, null);
+    if (std.posix.errno(rc) == .CHILD) return true;
+    return info.code != 0;
+}
+
+const grace_poll_ns: u64 = 5 * std.time.ns_per_ms;
+
+/// Wait up to `grace_ns` for the child to exit; `true` if it did (or `stop`
+/// was raised, meaning the caller already knows the run is over).
+fn waitExitWithin(child: *std.process.Child, grace_ns: u64, stop: ?*const std.atomic.Value(bool)) bool {
+    const id = child.id orelse return true;
+    const end_ns = monoNowNs() +| grace_ns;
+    while (true) {
+        if (childExited(id)) return true;
+        if (stop) |s| if (s.load(.acquire)) return true;
+        const rem = remainingNs(end_ns);
+        if (rem == 0) return false;
+        sleepNs(@min(rem, grace_poll_ns));
+    }
+}
+
+/// SIGTERM, wait up to `grace_ns`, SIGKILL if still running. `group` signals
+/// `-pgid` (caller guarantees `new_process_group`). Returns `true` if the
+/// child exited within the grace (no SIGKILL sent). Not on Windows.
+fn termThenKill(child: *std.process.Child, group: bool, grace_ns: u64, stop: ?*const std.atomic.Value(bool)) bool {
+    if (group) deliverGroup(child, .term, 0, true) else deliver(child, .term, 0);
+    if (waitExitWithin(child, grace_ns, stop)) return true;
+    if (group) deliverGroup(child, .kill, 0, true) else deliver(child, .kill, 0);
+    return false;
 }
 
 // ── spawn helper ────────────────────────────────────────────────────────────
@@ -967,7 +1033,7 @@ fn runKilled(
     var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child, .cancelable = spec.cancel != null };
     errdefer pumps.deinit();
     // The drain deadline sits `pump_grace_ns` AFTER the killer's own
-    // deadline, on purpose: `killerLoop` is guaranteed to have already sent
+    // deadline (plus the SIGTERM grace, if any), on purpose: `killerLoop` is guaranteed to have already sent
     // SIGKILL by the time the pumps give up (its polling granularity, plus
     // scheduling slop, is well inside this margin). That ordering matters —
     // if the pumps' deadline could fire FIRST, `done.store(true)` below
@@ -975,12 +1041,14 @@ fn runKilled(
     // `done` right before delivering the signal), and the child would then
     // never be reaped at all: `waitTolerant` blocks until it actually exits.
     const pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
-    const pump_deadline_ns: ?u64 = if (timeout_ns) |t| start_ns +| t +| pump_grace_ns else null;
+    const pump_deadline_ns: ?u64 = if (timeout_ns) |t| start_ns +| t +| (spec.cancel_grace_ns orelse 0) +| pump_grace_ns else null;
     try pumps.start(spec.max_output_bytes, stdin_body, pump_deadline_ns);
 
     var killer_wake: std.Io.Event = .unset;
     var finished: std.atomic.Value(bool) = .init(false);
     var canceled: std.atomic.Value(bool) = .init(false);
+    var timed_out: std.atomic.Value(bool) = .init(false);
+    var grace_expired: std.atomic.Value(bool) = .init(false);
     var waiter: Cancel.Waiter = .{ .wake = &killer_wake };
     if (spec.cancel) |c| c.add(io, &waiter);
     defer if (spec.cancel) |c| c.remove(io, &waiter);
@@ -993,7 +1061,10 @@ fn runKilled(
         .cancel = spec.cancel,
         .canceled = &canceled,
         .stop_ns = &pumps.stop_ns,
-        .grace_ns = pump_grace_ns,
+        .pump_grace_ns = pump_grace_ns,
+        .term_grace_ns = if (builtin.os.tag == .windows) null else spec.cancel_grace_ns,
+        .timed_out = &timed_out,
+        .grace_expired = &grace_expired,
         .grouped = spec.new_process_group,
     }}) catch |e| {
         // Without a killer nothing bounds the pumps: end the child first.
@@ -1019,6 +1090,8 @@ fn runKilled(
     const term = waitTolerant(io, &child);
     var out = try finish(&pumps, term);
     out.canceled = canceled.load(.acquire);
+    out.timed_out = timed_out.load(.acquire);
+    out.grace_expired = grace_expired.load(.acquire);
     return out;
 }
 
@@ -1054,12 +1127,26 @@ const KillJob = struct {
     /// The drainers' late deadline, set to now + `grace_ns` after a
     /// cancellation kill (see `Drainer.stop_ns`).
     stop_ns: *std.atomic.Value(u64),
-    grace_ns: u64,
+    pump_grace_ns: u64,
+    /// `Spec.cancel_grace_ns` (POSIX): SIGTERM first, SIGKILL after this.
+    term_grace_ns: ?u64 = null,
+    /// Set when the deadline (not a cancel) ended the child.
+    timed_out: *std.atomic.Value(bool),
+    /// Set when the grace elapsed and SIGKILL followed the SIGTERM.
+    grace_expired: *std.atomic.Value(bool),
     /// Kill the child's whole process group instead of just the child
     /// itself — set from `Spec.new_process_group`; see `deliverGroup`.
     grouped: bool = false,
 
-    fn kill(j: KillJob) void {
+    /// End the child: SIGKILL, or SIGTERM then (after the grace) SIGKILL.
+    fn end(j: KillJob) void {
+        if (j.term_grace_ns) |g| {
+            if (termThenKill(j.child, j.grouped, g, j.finished)) return;
+            // `finished` means the pipes closed and the run is winding down:
+            // not an expiry, and the SIGKILL just sent hits a finished child.
+            if (!j.finished.load(.acquire)) j.grace_expired.store(true, .release);
+            return;
+        }
         if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
     }
 };
@@ -1079,8 +1166,8 @@ fn killerLoop(j: KillJob) void {
         if (j.finished.load(.acquire)) return;
         if (j.cancel) |c| if (c.isRequested()) {
             j.canceled.store(true, .release);
-            j.kill();
-            j.stop_ns.store(monoNowNs() +| j.grace_ns, .release);
+            j.end();
+            j.stop_ns.store(monoNowNs() +| j.pump_grace_ns, .release);
             return;
         };
         if (deadline_ns) |dl| {
@@ -1096,7 +1183,8 @@ fn killerLoop(j: KillJob) void {
         if (builtin.is_test) _ = killer_wakeups_for_testing.fetchAdd(1, .monotonic);
     }
     if (j.finished.load(.acquire)) return;
-    j.kill();
+    j.timed_out.store(true, .release);
+    j.end();
 }
 
 /// Test-only counter (F4 regression guard): how many times `killerLoop` came
@@ -1302,6 +1390,27 @@ pub const Callbacks = struct {
     ctx: ?*anyopaque = null,
     on_stdout: ?*const fn (ctx: ?*anyopaque, chunk: []const u8) void = null,
     on_stderr: ?*const fn (ctx: ?*anyopaque, chunk: []const u8) void = null,
+    /// Line-framed stdout (opt-in; when set it REPLACES `on_stdout`, which is
+    /// then never called). The reader reassembles pipe chunks and calls this
+    /// once per line, with the `\n` removed and ONE trailing `\r` stripped
+    /// (so CRLF and LF streams look alike; further `\r` bytes are payload).
+    /// An empty line is delivered as an empty slice. A final line the child
+    /// ends without `\n` is delivered at EOF (nothing is delivered for an
+    /// empty remainder). Lines are bounded by `max_line_bytes`: a longer line
+    /// is delivered ONCE, cut to its first `max_line_bytes` bytes, with
+    /// `truncated = true`; the rest of it is discarded up to the next `\n`
+    /// (so a hostile child cannot grow the buffer, and the following line is
+    /// intact). `line` is valid only during the call. NDJSON is just "parse
+    /// each `line`"; this module has no JSON parser.
+    ///
+    /// Backpressure: one stdout permit per LINE instead of per chunk — the
+    /// reader takes a permit before each call and the consumer `ack`s once
+    /// per call, exactly as with `on_stdout` (one chunk may yield many lines,
+    /// so a slow consumer blocks the reader mid-chunk, which is the point).
+    on_stdout_line: ?*const fn (ctx: ?*anyopaque, line: []const u8, truncated: bool) void = null,
+    /// Longest line kept by `on_stdout_line` (see there). The line buffer
+    /// grows on demand up to this bound, never beyond.
+    max_line_bytes: usize = default_max_line_bytes,
     /// Fires once from `Handle.wait`, after both reader threads have drained.
     on_exit: ?*const fn (ctx: ?*anyopaque, term: Term) void = null,
 };
@@ -1340,6 +1449,37 @@ pub const Handle = struct {
     pub fn cancel(h: Handle) void {
         deliver(&h.ctx.child, .term, 0);
         wake(h.ctx);
+    }
+
+    /// Graceful stop for a streaming child (Go's `Cmd.Cancel` + `WaitDelay`,
+    /// the streaming twin of `Spec.cancel_grace_ns`): SIGTERM, then wait up
+    /// to `grace_ns` for the child to exit, then SIGKILL. Blocks the calling
+    /// thread (never a reader thread) for at most `grace_ns`; call it from
+    /// the thread that owns the `Handle`, and still call `wait` afterwards.
+    /// Returns `true` if the child exited within the grace, `false` if it had
+    /// to be SIGKILLed. Exit detection is exact on Linux; elsewhere the
+    /// grace always runs out (SIGKILL then hits a zombie, harmless) and the
+    /// result is `false`. Windows: TerminateProcess at once, returns `false`.
+    pub fn terminate(h: Handle, grace_ns: u64) bool {
+        return h.terminateImpl(false, grace_ns);
+    }
+
+    /// `terminate` for the child's whole process GROUP (SIGTERM, then SIGKILL
+    /// to `-pgid`). A documented no-op returning `false` unless
+    /// `Spec.new_process_group` was set (see `grouped`). The exit awaited is
+    /// the group leader's (the direct child).
+    pub fn terminateGroup(h: Handle, grace_ns: u64) bool {
+        if (!h.ctx.grouped) return false;
+        return h.terminateImpl(true, grace_ns);
+    }
+
+    fn terminateImpl(h: Handle, group: bool, grace_ns: u64) bool {
+        wake(h.ctx); // free a reader parked on backpressure first
+        if (builtin.os.tag == .windows) {
+            deliver(&h.ctx.child, .kill, 0);
+            return false;
+        }
+        return termThenKill(&h.ctx.child, group, grace_ns, null);
     }
 
     /// Force the child to terminate now (SIGKILL; TerminateProcess on Windows).
@@ -1494,6 +1634,18 @@ fn streamOutLoop(ctx: *StreamCtx) void {
     ctx.child.stdout = null;
     defer f.close(io);
     var rbuf: [8192]u8 = undefined;
+    if (ctx.cb.on_stdout_line != null) {
+        var framer: LineFramer = .{ .gpa = ctx.gpa, .max = ctx.cb.max_line_bytes };
+        defer framer.deinit();
+        const sink: StreamLineSink = .{ .ctx = ctx };
+        while (true) {
+            const n = f.readStreaming(io, &.{rbuf[0..]}) catch break;
+            if (n == 0) break;
+            framer.feed(rbuf[0..n], sink);
+        }
+        framer.finish(sink);
+        return;
+    }
     while (true) {
         const n = f.readStreaming(io, &.{rbuf[0..]}) catch break;
         if (n == 0) break;
@@ -1501,6 +1653,63 @@ fn streamOutLoop(ctx: *StreamCtx) void {
         if (ctx.cb.on_stdout) |cbf| cbf(ctx.cb.ctx, rbuf[0..n]);
     }
 }
+
+/// Splits a byte stream into lines across arbitrary chunk boundaries with a
+/// bounded buffer (see `Callbacks.on_stdout_line` for the contract). `sink`
+/// is any value with `fn line(sink, bytes: []const u8, truncated: bool) void`.
+const LineFramer = struct {
+    gpa: std.mem.Allocator,
+    max: usize,
+    buf: std.ArrayList(u8) = .empty,
+    /// The current line already overflowed `max`; the excess is discarded.
+    over: bool = false,
+
+    fn deinit(f: *LineFramer) void {
+        f.buf.deinit(f.gpa);
+    }
+
+    fn append(f: *LineFramer, bytes: []const u8) void {
+        const room = f.max - @min(f.max, f.buf.items.len);
+        const take = @min(room, bytes.len);
+        if (take > 0) f.buf.appendSlice(f.gpa, bytes[0..take]) catch {
+            f.over = true; // out of memory: drop like an overflow
+            return;
+        };
+        if (take < bytes.len) f.over = true;
+    }
+
+    fn emit(f: *LineFramer, sink: anytype) void {
+        var l: []const u8 = f.buf.items;
+        if (!f.over and l.len > 0 and l[l.len - 1] == '\r') l = l[0 .. l.len - 1];
+        sink.line(l, f.over);
+        f.buf.clearRetainingCapacity();
+        f.over = false;
+    }
+
+    fn feed(f: *LineFramer, chunk: []const u8, sink: anytype) void {
+        var rest = chunk;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |i| {
+            f.append(rest[0..i]);
+            f.emit(sink);
+            rest = rest[i + 1 ..];
+        }
+        f.append(rest);
+    }
+
+    /// EOF: flush an unterminated final line (nothing for an empty one).
+    fn finish(f: *LineFramer, sink: anytype) void {
+        if (f.buf.items.len > 0 or f.over) f.emit(sink);
+    }
+};
+
+const StreamLineSink = struct {
+    ctx: *StreamCtx,
+
+    fn line(s: StreamLineSink, bytes: []const u8, truncated: bool) void {
+        s.ctx.sema.waitUncancelable(s.ctx.io);
+        if (s.ctx.cb.on_stdout_line) |cbf| cbf(s.ctx.cb.ctx, bytes, truncated);
+    }
+};
 
 fn streamErrLoop(ctx: *StreamCtx) void {
     const io = ctx.io;
@@ -2617,4 +2826,358 @@ test "a pid reaped out-of-band is not signalled: stillOurChild is the gate" {
     // thread and a stranger's process group.
     try testing.expect(child.id != null);
     try testing.expect(!stillOurChild(pid));
+}
+
+// ── graceful cancellation ───────────────────────────────────────────────────
+
+/// A shell that prints `ready`, then idles; on SIGTERM it either says
+/// `got-term` and exits 0 (`honour`) or ignores it (`ignore`).
+const term_honouring_sh = "trap 'echo got-term; exit 0' TERM; echo ready; while :; do sleep 0.05; done";
+const term_ignoring_sh = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
+
+test "cancel_grace_ns: a child that honours SIGTERM exits on its own within the grace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    const t = try std.Thread.spawn(.{}, requestAfter, .{ &cancel, io, 300 });
+    defer t.join();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_honouring_sh },
+        .cancel = &cancel,
+        .cancel_grace_ns = 5 * std.time.ns_per_s,
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.canceled);
+    try testing.expect(!out.timed_out);
+    try testing.expect(!out.grace_expired);
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("ready\ngot-term\n", out.stdout);
+}
+
+test "cancel_grace_ns: a child ignoring SIGTERM is SIGKILLed after the grace" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    const t = try std.Thread.spawn(.{}, requestAfter, .{ &cancel, io, 300 });
+    defer t.join();
+    const start = monoNowNs();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_ignoring_sh },
+        .cancel = &cancel,
+        .cancel_grace_ns = 400 * std.time.ns_per_ms,
+    }, "");
+    defer out.deinit(testing.allocator);
+    const elapsed = monoNowNs() - start;
+
+    try testing.expect(out.canceled);
+    try testing.expect(out.grace_expired);
+    try testing.expect(out.term == .signal);
+    try testing.expectEqual(std.posix.SIG.KILL, out.term.signal);
+    // The grace was really waited out (300 ms request + 400 ms grace).
+    try testing.expect(elapsed >= 650 * std.time.ns_per_ms);
+    try testing.expect(elapsed < 4 * std.time.ns_per_s);
+    try testing.expectEqualStrings("ready\n", out.stdout);
+}
+
+test "cancel_grace_ns: runTimeout's deadline sends SIGTERM first and reports timed_out" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var honoured = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_honouring_sh },
+        .cancel_grace_ns = 5 * std.time.ns_per_s,
+    }, "", 400 * std.time.ns_per_ms);
+    defer honoured.deinit(testing.allocator);
+    try testing.expect(honoured.timed_out);
+    try testing.expect(!honoured.canceled);
+    try testing.expect(!honoured.grace_expired);
+    try testing.expect(honoured.term == .exited);
+    try testing.expectEqualStrings("ready\ngot-term\n", honoured.stdout);
+
+    var ignored = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_ignoring_sh },
+        .cancel_grace_ns = 300 * std.time.ns_per_ms,
+    }, "", 400 * std.time.ns_per_ms);
+    defer ignored.deinit(testing.allocator);
+    try testing.expect(ignored.timed_out);
+    try testing.expect(ignored.grace_expired);
+    try testing.expect(ignored.term == .signal);
+    try testing.expectEqual(std.posix.SIG.KILL, ignored.term.signal);
+}
+
+test "cancel_grace_ns: without it, the deadline still SIGKILLs at once and reports timed_out" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_honouring_sh },
+    }, "", 300 * std.time.ns_per_ms);
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.timed_out);
+    try testing.expect(!out.grace_expired);
+    try testing.expect(out.term == .signal);
+    try testing.expectEqual(std.posix.SIG.KILL, out.term.signal);
+}
+
+test "cancel_grace_ns: new_process_group sends SIGTERM to the whole group" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The direct shell defers TERM to a no-op trap but its `sleep` child dies: only a
+    // group signal ends it early, and the shell then carries on to `after`.
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "trap : TERM; echo ready; sleep 30; echo after" },
+        .new_process_group = true,
+        .cancel_grace_ns = 3 * std.time.ns_per_s,
+    }, "", 300 * std.time.ns_per_ms);
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.timed_out);
+    try testing.expect(!out.grace_expired);
+    try testing.expectEqualStrings("ready\nafter\n", out.stdout);
+}
+
+const StreamSink = struct {
+    gpa: std.mem.Allocator,
+    out: std.ArrayList(u8) = .empty,
+    h: ?Handle = null,
+    fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+        const s: *StreamSink = @ptrCast(@alignCast(cx.?));
+        s.out.appendSlice(s.gpa, chunk) catch {};
+        if (s.h) |h| h.ack();
+    }
+};
+
+test "Handle.terminate: SIGTERM honoured within the grace, then SIGKILL for one that ignores it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sink: StreamSink = .{ .gpa = testing.allocator };
+    defer sink.out.deinit(testing.allocator);
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_honouring_sh },
+    }, .{ .ctx = &sink, .on_stdout = StreamSink.onOut });
+    sink.h = h;
+    sleepNs(300 * std.time.ns_per_ms);
+    try testing.expect(h.terminate(5 * std.time.ns_per_s));
+    const term = h.wait();
+    try testing.expect(term == .exited);
+    try testing.expectEqualStrings("ready\ngot-term\n", sink.out.items);
+
+    var sink2: StreamSink = .{ .gpa = testing.allocator };
+    defer sink2.out.deinit(testing.allocator);
+    const h2 = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", term_ignoring_sh },
+    }, .{ .ctx = &sink2, .on_stdout = StreamSink.onOut });
+    sink2.h = h2;
+    sleepNs(300 * std.time.ns_per_ms);
+    try testing.expect(!h2.terminate(300 * std.time.ns_per_ms));
+    const term2 = h2.wait();
+    try testing.expect(term2 == .signal);
+    try testing.expectEqual(std.posix.SIG.KILL, term2.signal);
+}
+
+test "Handle.terminateGroup: no-op without new_process_group, group-wide with it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdout = .close,
+        .stderr = .close,
+    }, .{});
+    try testing.expect(!h.terminateGroup(std.time.ns_per_s)); // no-op, child untouched
+    try testing.expect(h.terminate(std.time.ns_per_s));
+    try testing.expect(h.wait() == .signal);
+
+    const g = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "trap : TERM; sleep 30; echo after" },
+        .new_process_group = true,
+        .stderr = .close,
+    }, .{});
+    sleepNs(200 * std.time.ns_per_ms);
+    try testing.expect(g.terminateGroup(3 * std.time.ns_per_s)); // sleep dies, sh returns
+    try testing.expect(g.wait() == .exited);
+}
+
+// ── line-delimited stdout ───────────────────────────────────────────────────
+
+const LineLog = struct {
+    gpa: std.mem.Allocator,
+    lines: std.ArrayList([]u8) = .empty,
+    flags: std.ArrayList(bool) = .empty,
+    h: ?Handle = null,
+
+    fn line(s: *LineLog, bytes: []const u8, truncated: bool) void {
+        s.lines.append(s.gpa, s.gpa.dupe(u8, bytes) catch return) catch return;
+        s.flags.append(s.gpa, truncated) catch return;
+    }
+    fn onLine(cx: ?*anyopaque, bytes: []const u8, truncated: bool) void {
+        const s: *LineLog = @ptrCast(@alignCast(cx.?));
+        s.line(bytes, truncated);
+        if (s.h) |h| h.ack();
+    }
+    fn deinit(s: *LineLog) void {
+        for (s.lines.items) |l| s.gpa.free(l);
+        s.lines.deinit(s.gpa);
+        s.flags.deinit(s.gpa);
+    }
+};
+
+/// Adapter so the framer's `sink.line(...)` reaches a `*LineLog`.
+const LogSink = struct {
+    log: *LineLog,
+    fn line(s: LogSink, bytes: []const u8, truncated: bool) void {
+        s.log.line(bytes, truncated);
+    }
+};
+
+fn expectLines(log: *const LineLog, want: []const []const u8) !void {
+    try testing.expectEqual(want.len, log.lines.items.len);
+    for (want, log.lines.items) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "LineFramer: lines split across chunks, CRLF, empty lines and a final unterminated line" {
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const sink: LogSink = .{ .log = &log };
+    var f: LineFramer = .{ .gpa = testing.allocator, .max = 64 };
+    defer f.deinit();
+
+    // Boundaries fall inside a line, right before the `\n`, and between `\r` and `\n`.
+    for ([_][]const u8{ "al", "pha\nbe", "ta", "\n", "\ngam\r", "\nmid\r\r", "\ndel", "ta" }) |c| f.feed(c, sink);
+    try expectLines(&log, &.{ "alpha", "beta", "", "gam", "mid\r" });
+    f.finish(sink);
+    try expectLines(&log, &.{ "alpha", "beta", "", "gam", "mid\r", "delta" });
+    for (log.flags.items) |t| try testing.expect(!t);
+}
+
+test "LineFramer: an empty remainder at EOF delivers nothing; one byte per feed works" {
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const sink: LogSink = .{ .log = &log };
+    var f: LineFramer = .{ .gpa = testing.allocator, .max = 8 };
+    defer f.deinit();
+    for ("a\nbc\n") |b| f.feed(&.{b}, sink);
+    f.finish(sink);
+    try expectLines(&log, &.{ "a", "bc" });
+}
+
+test "LineFramer: an over-long line is cut, flagged once, and the next line is intact" {
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const sink: LogSink = .{ .log = &log };
+    var f: LineFramer = .{ .gpa = testing.allocator, .max = 4 };
+    defer f.deinit();
+
+    f.feed("abcdefgh", sink); // overflows while still unterminated
+    f.feed("ijkl\nok\nexactly4\nabcd\nxyz", sink);
+    f.finish(sink);
+    try expectLines(&log, &.{ "abcd", "ok", "exac", "abcd", "xyz" });
+    try testing.expectEqualSlices(bool, &.{ true, false, true, false, false }, log.flags.items);
+    var big: [100_000]u8 = @splat(65);
+    f.feed(&big, sink); // never buffers more than `max`, whatever arrives
+    try testing.expectEqual(@as(usize, 4), f.buf.items.len);
+}
+
+test "LineFramer: an over-long unterminated final line is flushed truncated" {
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const sink: LogSink = .{ .log = &log };
+    var f: LineFramer = .{ .gpa = testing.allocator, .max = 3 };
+    defer f.deinit();
+    f.feed("abcdef", sink);
+    f.finish(sink);
+    try expectLines(&log, &.{"abc"});
+    try testing.expectEqualSlices(bool, &.{true}, log.flags.items);
+}
+
+test "spawnStreaming: on_stdout_line delivers lines from a real child, incl. a final one without newline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Output arrives in several separate writes with a pause, so lines
+    // really are split across pipe reads.
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "printf '{\"a\":1}\\n{\"b\"'; sleep 0.1; printf ':2}\\r\\n\\nlast'" },
+    }, .{ .ctx = &log, .on_stdout_line = LineLog.onLine });
+    log.h = h;
+    try testing.expect(h.wait() == .exited);
+    try expectLines(&log, &.{ "{\"a\":1}", "{\"b\":2}", "", "last" });
+}
+
+test "spawnStreaming: on_stdout_line truncates an over-long line and keeps the next" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    // 20000 'x' (larger than one 8 KiB read), then a short line.
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "head -c 20000 /dev/zero | tr '\\0' x; echo; echo tail" },
+    }, .{ .ctx = &log, .on_stdout_line = LineLog.onLine, .max_line_bytes = 100 });
+    log.h = h;
+    try testing.expect(h.wait() == .exited);
+    try testing.expectEqual(@as(usize, 2), log.lines.items.len);
+    try testing.expectEqual(@as(usize, 100), log.lines.items[0].len);
+    try testing.expect(log.flags.items[0]);
+    try testing.expectEqualStrings("tail", log.lines.items[1]);
+    try testing.expect(!log.flags.items[1]);
+}
+
+test "spawnStreaming: on_stdout_line respects stdout permits (one per line)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 2 permits, no ack from the callback: exactly 2 of the 5 lines may be
+    // delivered until the owner acks; then the rest flow.
+    var log: LineLog = .{ .gpa = testing.allocator };
+    defer log.deinit();
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "printf 'a\\nb\\nc\\nd\\ne\\n'" },
+        .stream_permits = 2,
+    }, .{ .ctx = &log, .on_stdout_line = LineLog.onLine });
+    // `log.h` stays null: onLine does not ack.
+    sleepNs(300 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), log.lines.items.len);
+    h.ack();
+    h.ack();
+    h.ack();
+    try testing.expect(h.wait() == .exited);
+    try expectLines(&log, &.{ "a", "b", "c", "d", "e" });
 }
