@@ -189,6 +189,32 @@ pub const Storage = struct {
         token: *anyopaque,
     };
 
+    /// The names `list` found, sorted bytewise ascending. The slice and every
+    /// name in it belong to the allocator passed to `list`; `deinit` frees them.
+    pub const Listing = struct {
+        names: [][]u8,
+
+        pub fn deinit(l: Listing, gpa: Allocator) void {
+            for (l.names) |n| gpa.free(n);
+            gpa.free(l.names);
+        }
+
+        /// For backend authors: sort `names` (each owned by `gpa`) and take
+        /// them over as a `Listing`. Frees them if that fails.
+        pub fn fromOwned(gpa: Allocator, names: *std.ArrayList([]u8)) Allocator.Error!Listing {
+            errdefer {
+                for (names.items) |n| gpa.free(n);
+                names.deinit(gpa);
+            }
+            std.mem.sort([]u8, names.items, {}, struct {
+                fn lessThan(_: void, a: []u8, b: []u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.lessThan);
+            return .{ .names = try names.toOwnedSlice(gpa) };
+        }
+    };
+
     pub const Error = error{
         /// SimStorage only: the simulated machine died at this operation.
         Crashed,
@@ -249,6 +275,11 @@ pub const Storage = struct {
         /// Optional data-only sync (`Storage.syncData`). `null` means the
         /// backend has none, and `syncData` falls back to `sync`.
         syncData: ?*const fn (ctx: *anyopaque, h: Handle) Error!void = null,
+        /// Optional directory listing (`Storage.list`). `null` (the default)
+        /// means this backend cannot list; a decorator whose inner backend
+        /// cannot returns `null` from its own slot. Defaulted for the same
+        /// reason as `preadRef`.
+        list: ?*const fn (ctx: *anyopaque, gpa: Allocator, prefix: []const u8) Error!?Listing = null,
 
         /// Self-check for a backend author: true iff `preadRef` and
         /// `releaseRef` are either both set or both null. `Storage.releaseRef`
@@ -356,6 +387,28 @@ pub const Storage = struct {
     pub fn syncData(s: Storage, h: Handle) Error!void {
         if (s.vtable.syncData) |f| return f(s.ctx, h);
         return s.vtable.sync(s.ctx, h);
+    }
+
+    /// The files in this backend's namespace whose names start with
+    /// `prefix` (`""` for all), sorted bytewise ascending; `null` when the
+    /// backend cannot list. Regular files only, a symbolic link counting as
+    /// what it points to — what `open` would open; not recursive. The view
+    /// is the running process's: a name created but not yet made durable by
+    /// `syncDir` is listed, and a crash may take it away again. Not a
+    /// snapshot against a concurrent create or delete.
+    ///
+    /// What it is for: recovery and tooling that must find files nothing
+    /// else records — e.g. rebuilding a lost manifest from the segment files
+    /// it listed, or finding strays to clean up.
+    ///
+    /// ⚠ Never derive what a store *is* from a listing on the normal path.
+    /// A store that opened whatever files looked like its own would adopt
+    /// any stray file of the right name (a half-written segment, a restored
+    /// backup, an operator's copy); a durable record of its files (a
+    /// manifest) is what says which ones belong. `Db` itself never lists.
+    pub fn list(s: Storage, gpa: Allocator, prefix: []const u8) Error!?Listing {
+        const f = s.vtable.list orelse return null;
+        return f(s.ctx, gpa, prefix);
     }
     pub fn close(s: Storage, h: Handle) void {
         s.vtable.close(s.ctx, h);
@@ -501,6 +554,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             .tryLockExclusive = vTryLockExclusive,
             .allocate = if (is_linux) vAllocate else null,
             .syncData = if (is_linux) vSyncData else null,
+            .list = vList,
         };
 
         const is_linux = @import("builtin").os.tag == .linux;
@@ -637,6 +691,40 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             defer d.close(self.io);
             const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
             as_file.sync(self.io) catch |e| return mapErr(e);
+        }
+
+        fn vList(ctx: *anyopaque, gpa: Allocator, prefix: []const u8) Storage.Error!?Storage.Listing {
+            const self = cast(ctx);
+            // `dir` may be an O_PATH handle, which cannot be read (see `vSyncDir`).
+            const d = self.dir.openDir(self.io, ".", .{ .iterate = true }) catch |e| return mapErr(e);
+            defer d.close(self.io);
+            var names: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (names.items) |n| gpa.free(n);
+                names.deinit(gpa);
+            }
+            var it = d.iterate();
+            while (it.next(self.io) catch |e| return mapErr(e)) |entry| {
+                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+                if (!try isFile(self.io, d, entry)) continue;
+                try names.append(gpa, try gpa.dupe(u8, entry.name));
+            }
+            return try Storage.Listing.fromOwned(gpa, &names);
+        }
+
+        /// A regular file, or a link to one: what `open` would open. A
+        /// filesystem that does not report kinds in its entries (`.unknown`)
+        /// is asked with a `stat`; a name gone meanwhile, or a dangling link,
+        /// is not a file.
+        fn isFile(io: std.Io, d: std.Io.Dir, entry: std.Io.Dir.Entry) Storage.Error!bool {
+            return switch (entry.kind) {
+                .file => true,
+                .sym_link, .unknown => if (d.statFile(io, entry.name, .{})) |st| st.kind == .file else |e| switch (e) {
+                    error.FileNotFound => false,
+                    else => mapErr(e),
+                },
+                else => false,
+            };
         }
 
         /// `flock(fd, LOCK_EX | LOCK_NB)` (POSIX) / `NtLockFile` with fail-
@@ -2222,6 +2310,66 @@ test "FsStorage: allocate reserves zeros past the data; syncData makes writes in
     const ro = try st.open("f", .read_only);
     defer st.close(ro);
     try std.testing.expectError(error.AccessDenied, st.allocate(ro, 8192));
+}
+
+fn expectNames(listing: ?Storage.Listing, want: []const []const u8) !void {
+    const l = listing orelse return error.TestExpectedListing;
+    defer l.deinit(testing.allocator);
+    try testing.expectEqual(want.len, l.names.len);
+    for (want, l.names) |w, n| try testing.expectEqualStrings(w, n);
+}
+
+test "FsStorage.list: the files under a prefix, sorted; directories and dangling links left out" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+    const gpa = testing.allocator;
+
+    try expectNames(try st.list(gpa, ""), &.{});
+    for ([_][]const u8{ "seg-2.log", "MANIFEST", "seg-10.log", "seg-1.log" }) |name| st.close(try st.open(name, .create_new));
+    try tmp.dir.createDir(testing.io, "seg-dir", .default_dir);
+    try tmp.dir.symLink(testing.io, "seg-1.log", "seg-link", .{});
+    try tmp.dir.symLink(testing.io, "gone", "seg-dangling", .{});
+
+    // Bytewise order, not numeric: the caller parses its own ids.
+    try expectNames(try st.list(gpa, "seg-"), &.{ "seg-1.log", "seg-10.log", "seg-2.log", "seg-link" });
+    try expectNames(try st.list(gpa, ""), &.{ "MANIFEST", "seg-1.log", "seg-10.log", "seg-2.log", "seg-link" });
+    try expectNames(try st.list(gpa, "MANIFEST.tmp"), &.{});
+
+    try st.delete("seg-2.log");
+    try expectNames(try st.list(gpa, "seg-2"), &.{});
+}
+
+test "SimStorage.list: the running view; a crash takes back a name syncDir never made durable" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const gpa = testing.allocator;
+
+    st.close(try st.open("seg-1", .create_new));
+    try st.syncDir();
+    st.close(try st.open("seg-2", .create_new));
+    st.close(try st.open("other", .create_new));
+    const ops = sim.ops_seen;
+    try expectNames(try st.list(gpa, "seg-"), &.{ "seg-1", "seg-2" }); // seg-2 not durable yet
+    try testing.expectEqual(ops, sim.ops_seen); // a pure read, not an injection point
+
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.delete("other"));
+    try testing.expectError(error.Crashed, st.list(gpa, ""));
+    sim.reboot();
+    try expectNames(try st.list(gpa, ""), &.{"seg-1"});
+}
+
+test "Storage.list: a backend without it answers null, not an empty listing" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var vt = sim.storage().vtable.*;
+    vt.list = null;
+    const st: Storage = .{ .ctx = &sim, .vtable = &vt };
+    st.close(try st.open("f", .create_new));
+    try testing.expect(try st.list(testing.allocator, "") == null);
 }
 
 test "Storage: a backend without allocate answers false; syncData falls back to sync" {

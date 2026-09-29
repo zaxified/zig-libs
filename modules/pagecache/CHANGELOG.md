@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — `list` (kv's new optional `Storage.list`) is forwarded to the inner
+  `Storage`; `null` when the inner one cannot list.
+
 - **2026-09-29** — Contract: fiber-reentrant on one thread. With an inner `Storage` that
   parks the calling fiber on I/O, a second fiber reading the page whose fill was in flight got
   a HIT on the unfilled slot (`preadRef` reserves before it reads) -- and a kvtree commit

@@ -63,7 +63,7 @@
 //!
 //! Injection points (side effects that count toward `ops_until_crash`):
 //! `open`, `writeAll`, `sync` (and `syncData`), `allocate`, `truncate`,
-//! `rename`, `delete`, `syncDir`, `tryLockExclusive`. Pure reads (`pread`, `size`) and `close` are not side
+//! `rename`, `delete`, `syncDir`, `tryLockExclusive`. Pure reads (`pread`, `size`, `list`) and `close` are not side
 //! effects — crashing "at" them is indistinguishable from crashing before
 //! the next side effect.
 
@@ -487,7 +487,26 @@ pub const SimStorage = struct {
         // `fdatasync` may skip — is needed to read the bytes back, so it
         // persists too. What `fdatasync` really skips (times) is not modelled.
         .syncData = vSync,
+        .list = vList,
     };
+
+    /// The volatile namespace, as a running process's `readdir` sees it: a
+    /// name not yet `syncDir`'d is listed, and gone again after a crash
+    /// that drops it. A pure read, like `pread` — not an injection point.
+    fn vList(ctx: *anyopaque, gpa: Allocator, prefix: []const u8) Storage.Error!?Storage.Listing {
+        const self = cast(ctx);
+        if (self.crashed) return error.Crashed;
+        var names: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (names.items) |n| gpa.free(n);
+            names.deinit(gpa);
+        }
+        var it = self.names.keyIterator();
+        while (it.next()) |k| {
+            if (std.mem.startsWith(u8, k.*, prefix)) try names.append(gpa, try gpa.dupe(u8, k.*));
+        }
+        return try Storage.Listing.fromOwned(gpa, &names);
+    }
 
     fn cast(ctx: *anyopaque) *SimStorage {
         return @ptrCast(@alignCast(ctx));

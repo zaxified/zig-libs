@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — `Storage.list(gpa, prefix)`: the backend's files under a prefix, sorted, as an
+  owned `Storage.Listing`; `null` from a backend that cannot list (new optional
+  `VTable.list`, default `null`). `FsStorage` and `SimStorage` implement it (the simulator lists
+  its volatile namespace, a pure read). For recovery and tooling — `Db` never lists
+  (requested by egw-hub's `seglog` manifest rebuild).
+
 - **2026-09-28** — `Storage.OpenMode.create_new`: create the file or fail with the new
   `error.PathAlreadyExists` (`O_CREAT|O_EXCL`), atomically, never emptying an existing
   file. `SimStorage` models it (an un-synced name is taken until a crash loses it).

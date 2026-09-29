@@ -301,6 +301,7 @@ pub const PageCache = struct {
         // copying path and knows it.
         .preadRef = vPreadRef,
         .releaseRef = vReleaseRef,
+        .list = vList,
     };
 
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
@@ -429,6 +430,12 @@ pub const PageCache = struct {
 
     fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
         return cast(ctx).inner.syncDir();
+    }
+
+    /// Forwarded verbatim: the cache holds pages, not names. An inner
+    /// backend that cannot list makes this one answer `null` too.
+    fn vList(ctx: *anyopaque, gpa: std.mem.Allocator, prefix: []const u8) Storage.Error!?Storage.Listing {
+        return cast(ctx).inner.list(gpa, prefix);
     }
 
     /// Forwarded verbatim: the cross-process lock belongs to the real backing
@@ -910,6 +917,28 @@ test "F4: vTryLockExclusive forwards to the inner Storage verbatim (dead in kvtr
     st.close(a); // releases; there is no unlock op
     try testing.expect(try st.tryLockExclusive(b));
     st.close(b);
+}
+
+test "list forwards to the inner Storage, and says null when the inner one cannot list" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    st.close(try st.open("b", .create_new));
+    st.close(try st.open("a", .create_new));
+    const l = (try st.list(gpa, "")).?;
+    defer l.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), l.names.len);
+    try testing.expectEqualStrings("a", l.names[0]);
+    try testing.expectEqualStrings("b", l.names[1]);
+
+    var vt = sim.storage().vtable.*;
+    vt.list = null;
+    var pc2 = PageCache.init(gpa, .{ .ctx = &sim, .vtable = &vt }, .{ .max_pages = 8 });
+    defer pc2.deinit();
+    try testing.expect(try pc2.storage().list(gpa, "") == null);
 }
 
 /// Write `n` distinct full pages (page `i` filled with byte `i+1`) through
