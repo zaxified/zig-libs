@@ -1552,6 +1552,8 @@ const Session = struct {
         var scheme: ?[]const u8 = null;
         var authority: ?[]const u8 = null;
         var content_length: ?u64 = null;
+        var content_encoding: ?[]const u8 = null;
+        var content_encodings: usize = 0;
         var pseudo_done = false;
         var malformed = false;
         for (req_headers.fields) |f| {
@@ -1613,6 +1615,10 @@ const Session = struct {
                             if (prev != n) malformed = true;
                         } else content_length = n;
                     } else |_| malformed = true;
+                }
+                if (std.mem.eql(u8, f.name, "content-encoding")) {
+                    content_encoding = f.value;
+                    content_encodings += 1;
                 }
                 if (malformed) break;
             }
@@ -1683,6 +1689,16 @@ const Session = struct {
                 path = Server.normalizePathInto(norm_buf, path);
             }
         }
+
+        // Inbound Content-Encoding, h1 parity (`Server.serveOne`): a body
+        // this server cannot decode never reaches the handler as opaque
+        // bytes. h2 decodes nothing inbound, so every non-identity coding --
+        // `gzip` included, as on h1 with decoding off -- is 415. Two fields
+        // are a coding list (RFC 9110 §5.3), which h1 refuses too. Before
+        // this the same gzip PUT was a 415 on h1 and a stored compressed blob
+        // on h2 (qap research register H9, 2026-09-29).
+        if (content_encodings > 1 or gzip.requestContentEncoding(content_encoding) != .identity)
+            return s.respondError(id, 415);
 
         // ── synthesize the h1-shaped request the handler expects ────────
         // `Request.header`/`iterateHeaders` read a raw header block, so one
@@ -3461,6 +3477,37 @@ test "h2c serve: :path gets the h1 path guard — dot segments collapsed, %00 �
     try testing.expectEqual(@as(u16, 414), peer.resp(sid_long).status);
     try testing.expectEqual(@as(u16, 400), peer.resp(sid_star_get).status);
     try testing.expectEqual(@as(u16, 404), peer.resp(sid_star_options).status); // reached the handler
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: a request Content-Encoding other than identity is 415 before the handler, as on h1" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const sid_gzip = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-encoding", "gzip"), true);
+    const sid_br = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-encoding", "br"), true);
+    const sid_list = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-encoding", "gzip, br"), true);
+    const sid_identity = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-encoding", "identity"), true);
+    const sid_twice = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = ":authority", .value = "t" },
+        .{ .name = "content-encoding", .value = "identity" },
+        .{ .name = "content-encoding", .value = "gzip" },
+    }, true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid_gzip).status);
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid_br).status);
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid_list).status);
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid_twice).status);
+    // The control: identity is a plaintext body and reaches the handler.
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_identity).status);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 

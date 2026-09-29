@@ -306,6 +306,12 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **h2 inbound gzip decode.** h1 decodes a `Content-Encoding: gzip` request when
+  `max_decompressed_request_bytes` is set; `h2_server` refuses every non-identity coding with 415
+  (2026-09-29, h1 parity for the refusal). A deployment with inbound decode on therefore answers
+  the same gzip request 200 on h1 and 415 on h2 — safe, but a divergence. Ideal: the same
+  `GunzipBody` wrapper over the h2 request body (buffered and `stream_request`), same cap.
+
 - ~~**Inbound gzip: verify the trailer**~~ — **DONE 2026-09-28** (found the same day wiring
   `crc32` into `gzip.zig`). std's `flate.Decompress` reads the gzip trailer but never checks its
   CRC-32 or ISIZE, so a request body with a corrupt trailer was accepted as long as the deflate

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **h2 refuses a request `Content-Encoding` it cannot decode, as h1 does.**
+  `h2_server` never looked at the request's `Content-Encoding`: a gzip PUT was a 415 on h1 and
+  reached the handler over h2 as the compressed bytes with the header attached — two protocol
+  front-ends, two meanings for the same request (found from qap, research register H9). Now any
+  non-identity coding, a coding list, or two `content-encoding` fields answer 415 before the
+  handler. h2 decodes nothing inbound, so `gzip` is refused there even where h1 would decode it
+  (`max_decompressed_request_bytes`) — a refusal, never opaque bytes. Behaviour change for a
+  client that sent compressed bodies over h2.
+
 - **2026-09-28** — **Inbound gzip trailer verification, opt-in.** `Options.verify_inbound_trailer`
   (mirrored on `StreamOptions`, off by default): checks the RFC 1952 trailer's CRC-32 and ISIZE of
   a decompressed request body against the plain bytes actually produced, failing the body read on
