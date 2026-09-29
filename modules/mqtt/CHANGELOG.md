@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Broker: `Config.tap_wills` (off by default) hands a Will to the publish tap
+  (`onPublishFn`) when an ungraceful end publishes it, so a recorder or bridge built on the tap
+  no longer loses Wills; the verdict is honoured (`.consume`/`.refuse` keep it from subscribers
+  and the retained store). Requested by egw-proxy.
+
 - **2026-09-29** — `Broker.rxRoom(conn)` and `Client.rxRoom()`: how many bytes `feed` takes now
   (the receive buffer's room after compaction), so a reader in fixed chunks feeds what fits,
   processes, and feeds the rest instead of hitting `RxBufferFull` (requested by egw-hub).

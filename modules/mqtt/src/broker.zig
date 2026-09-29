@@ -952,6 +952,26 @@ pub const Config = struct {
         retain: bool,
     ) PublishVerdict = null,
     publish_ctx: ?*anyopaque = null,
+
+    /// Hand a Will to `onPublishFn` too, as a publish of the connection whose
+    /// ungraceful end it announces. Off by default, so a tap that exists to see
+    /// what clients sent keeps seeing only that.
+    ///
+    /// Without it a recorder or bridge built on the tap — the tap's documented
+    /// purpose — loses every Will unless it also subscribes: the broker
+    /// publishes a Will from `remove`, through fan-out only. egw-proxy's ring
+    /// recorded a gateway's `status = connected` 17 times and its
+    /// `disconnected` Will never.
+    ///
+    /// The Will reaches the tap after the dying connection is out of the index
+    /// (the ordering `remove` keeps for fan-out, A1 M2), on the thread that
+    /// calls `remove`, with no broker lock held — `Broker.publish` from inside
+    /// works, as for any tap call. It has passed the ACL already: a Will is
+    /// judged at CONNECT. The verdict means what it means for a client's
+    /// publish, minus the connection, which is gone: `.accept` — retained store
+    /// and fan-out; `.consume` — neither; `.refuse` — neither, counted in
+    /// `tapRefusals`. There is no publisher left to resend a refused Will.
+    tap_wills: bool = false,
 };
 
 /// What `Config.onPublishFn` decides about one PUBLISH.
@@ -1397,6 +1417,16 @@ pub const Broker = struct {
             b.allocator.free(wt);
             if (wp) |p| b.allocator.free(p);
         }
+        if (b.config.tap_wills) if (b.config.onPublishFn) |tap| {
+            switch (tap(b.config.publish_ctx, wt, if (wp) |p| p else &.{}, conn.will_qos, conn.will_retain)) {
+                .accept => {},
+                .refuse => {
+                    _ = b.tap_refusals.fetchAdd(1, .monotonic);
+                    return;
+                },
+                .consume => return,
+            }
+        };
         b.fanout(.{
             .topic = wt,
             .payload = if (wp) |p| p else &.{},
@@ -5438,6 +5468,67 @@ test "rxRoom: a read holding one packet's tail and the next one's head is fed in
 
     b.remove(p);
     b.remove(s);
+}
+
+test "tap_wills: the tap sees an ungraceful end's Will, with no subscriber; off, it does not" {
+    const will: packet.Will = .{ .topic = "sn/1/status", .message = "disconnected", .qos = .at_least_once, .retain = true };
+    for ([_]bool{ false, true }) |on| {
+        var rec: TapRecorder = .{};
+        var b = Broker.init(testing.allocator, .{
+            .onPublishFn = TapRecorder.onPublish,
+            .publish_ctx = &rec,
+            .tap_wills = on,
+        });
+        defer b.deinit();
+        var tt: TestTransport = .{};
+        const dying = try connectWithWill(&b, &tt, "gw", will);
+        try testing.expectEqual(@as(usize, 0), rec.calls); // CONNECT is not a publish
+        b.remove(dying); // no DISCONNECT: an ungraceful end
+        if (!on) {
+            try testing.expectEqual(@as(usize, 0), rec.calls);
+            try testing.expectEqual(@as(usize, 1), b.retained.items.len); // published all the same
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 1), rec.calls);
+        try testing.expectEqualStrings("sn/1/status", rec.seenTopic());
+        try testing.expectEqualStrings("disconnected", rec.seenPayload());
+        try testing.expectEqual(QoS.at_least_once, rec.qos);
+        try testing.expect(rec.retain);
+        try testing.expectEqual(@as(usize, 1), b.retained.items.len); // .accept: taken
+    }
+}
+
+test "tap_wills: a clean DISCONNECT has no Will to show; consume and refuse keep it from subscribers" {
+    const will: packet.Will = .{ .topic = "sn/1/status", .message = "disconnected", .retain = true };
+    // A clean end: nothing reaches the tap.
+    {
+        var rec: TapRecorder = .{};
+        var b = Broker.init(testing.allocator, .{ .onPublishFn = TapRecorder.onPublish, .publish_ctx = &rec, .tap_wills = true });
+        defer b.deinit();
+        var tt: TestTransport = .{};
+        const c = try connectWithWill(&b, &tt, "gw", will);
+        try b.feed(c, &.{ 0xE0, 0x00 }); // DISCONNECT
+        try testing.expectEqual(Disposition.close, try b.process(c, 0));
+        b.remove(c);
+        try testing.expectEqual(@as(usize, 0), rec.calls);
+    }
+    for ([_]PublishVerdict{ .consume, .refuse }) |verdict| {
+        var rec: TapRecorder = .{ .verdict = verdict };
+        var b = Broker.init(testing.allocator, .{ .onPublishFn = TapRecorder.onPublish, .publish_ctx = &rec, .tap_wills = true });
+        defer b.deinit();
+        var watcher_tt: TestTransport = .{};
+        const watcher = try connectClient(&b, &watcher_tt, "watcher", 0, 0);
+        try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+        _ = (try watcher_tt.next()).?; // SUBACK
+        var tt: TestTransport = .{};
+        const dying = try connectWithWill(&b, &tt, "gw", will);
+        b.remove(dying);
+        try testing.expectEqual(@as(usize, 1), rec.calls);
+        try testing.expect((try watcher_tt.next()) == null); // not fanned out
+        try testing.expectEqual(@as(usize, 0), b.retained.items.len); // not retained
+        try testing.expectEqual(@as(u64, if (verdict == .refuse) 1 else 0), b.tapRefusals());
+        b.remove(watcher);
+    }
 }
 
 test "A1 M2: the dying client is not written its own Will; other subscribers are" {
