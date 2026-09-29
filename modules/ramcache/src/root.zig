@@ -357,9 +357,10 @@ pub const Cache = struct {
         /// Value bytes this node owns while doomed (`doom_idx != not_queued`);
         /// otherwise the value belongs to the map `Entry` and this is empty.
         owned: []u8 = &.{},
-        /// False between `reserve` and `commit`: the entry is published and
-        /// findable, but its bytes are uninitialized. Only `on_evict` reads
-        /// this — an entry can die in that window (overwritten, removed,
+        /// False between `reserve` and `commit`: the entry is in the map, but
+        /// its bytes are uninitialized, so `get`, `pin` and `drainDirty` treat
+        /// it as absent (`lookupFilled`), and `on_evict` stays silent for it
+        /// — an entry can die in that window (overwritten, removed,
         /// cleared, TTL-dropped) and its value must not be handed to a
         /// caller's hook, which is the rule `discard` already states for
         /// itself. Every other way of creating an entry writes its value
@@ -469,7 +470,7 @@ pub const Cache = struct {
     /// replaced, evicted, or the cache is cleared.
     pub fn get(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?[]const u8 {
         self.noteAccess(key);
-        const e = self.map.getPtr(key) orelse {
+        const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
             return null;
         };
@@ -782,7 +783,7 @@ pub const Cache = struct {
     /// `release` re-files it as recently used.
     pub fn pin(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?Borrow {
         self.noteAccess(key);
-        const e = self.map.getPtr(key) orelse {
+        const e = self.lookupFilled(key) orelse {
             self.stats.misses += 1;
             return null;
         };
@@ -811,8 +812,16 @@ pub const Cache = struct {
     /// hand back a writable borrow of it, so a caller that would otherwise
     /// fill a scratch buffer and then `put` (two copies of the payload) can
     /// produce the value straight into its final home (one). The entry is
-    /// pinned from birth: it is visible to `get`/`pin` immediately, so fill it
-    /// before returning to code that could read it.
+    /// pinned from birth, and until `commit` it is a MISS for `get`, `pin`
+    /// and `drainDirty`: its bytes are uninitialized, and the producer may
+    /// have to wait for them -- a fiber reading a page from disk into the
+    /// slot parks there, and another fiber on the same thread may look the
+    /// key up meanwhile (found from qap's research register H4, 2026-09-29:
+    /// `pagecache.preadRef` does exactly that). The reader then fetches for
+    /// itself; whichever `put`/`reserve` lands later replaces the other, and
+    /// a borrow of the replaced one keeps its bytes (the doomed-entry rule).
+    /// The key still occupies its map slot and its bytes count against the
+    /// budget from `reserve` on.
     ///
     /// Finish with `commit` (keep it, downgrade to a read borrow) or `discard`
     /// (the fill failed — remove it without ever exposing the garbage).
@@ -911,6 +920,9 @@ pub const Cache = struct {
             return;
         }
         if (n.pins != 1) {
+            // Unreachable through the public API since an unfilled entry is a
+            // miss for `pin` (2026-09-29); kept, because the price of being
+            // wrong about that is garbage served, not a slower path.
             // The caller also `pin`ned the key it was filling, so ours is not
             // the last release and the entry cannot simply be destroyed here.
             // It must still leave the map: "removed without ever exposing the
@@ -1021,11 +1033,21 @@ pub const Cache = struct {
     pub fn drainDirty(self: *Cache, cb: DirtyFn, ctx: ?*anyopaque) void {
         var it = self.map.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.dirty) cb(ctx, kv.key_ptr.*, kv.value_ptr.value);
+            // A reservation is dirty from birth and its bytes are garbage
+            // until `commit`: there is nothing to write behind yet.
+            if (kv.value_ptr.dirty and kv.value_ptr.node.filled) cb(ctx, kv.key_ptr.*, kv.value_ptr.value);
         }
     }
 
     // ── internals ───────────────────────────────────────────────────────────
+
+    /// The entry for `key` if it holds a value -- a reservation that has not
+    /// been `commit`ted yet does not (see `reserve`), and reads as a miss.
+    fn lookupFilled(self: *Cache, key: []const u8) ?*Entry {
+        const e = self.map.getPtr(key) orelse return null;
+        return if (e.node.filled) e else null;
+    }
+
     fn syncStats(self: *Cache) void {
         self.stats.entries = self.map.count();
         self.stats.bytes = self.bytes;
@@ -2112,29 +2134,49 @@ test "fuzz: arbitrary borrow-seam operation sequences keep every structural inva
     try testing.fuzz({}, fuzzSeam, .{});
 }
 
-test "borrow: discarding a reservation the caller also pinned still removes it" {
-    // `discard`'s fallback for "somebody else is holding this too". The
-    // contract is that the entry goes away without its garbage ever being
-    // exposed, so it has to leave the map here as well — the second borrow
-    // keeps the storage alive, it does not keep the entry findable.
+test "borrow: a reservation is a miss until it is committed, for get, pin and drainDirty" {
+    // qap research register H4: the producer of a reservation may park
+    // mid-fill (a fiber reading the page from disk into the slot), and a
+    // second fiber on the same thread may look the key up meanwhile. Before
+    // this, `get` answered a HIT on the uninitialized bytes and `pin` lent
+    // them; `drainDirty` handed them to a write-behind flusher, since a
+    // reservation is dirty from birth.
     var c = testCache(1 << 20, 16);
     defer c.deinit();
     c.put("bystander", "B", 0, 0, 0);
 
     const f = c.reserve("half", 8, 0, 0, 0).?;
-    const also = c.pin("half", 0, 0).?; // a second borrow of the same entry
-    c.discard(f);
-
+    @memset(f.bytes, 0xAA); // stands in for "whatever the heap held"
     try testing.expect(c.get("half", 0, 0) == null);
     try testing.expect(c.pin("half", 0, 0) == null);
-    try testing.expect(!c.isPinned("half")); // not resident...
-    try testing.expectEqual(@as(usize, 1), c.stats.pinned); // ...but still borrowed
-    try testing.expectEqual(@as(usize, 8), also.bytes.len); // storage still alive
-    try testing.expectEqual(@as(usize, 1), c.bytes); // and out of the accounting
+    const Seen = struct {
+        var n: usize = 0;
+        fn cb(_: ?*anyopaque, key: []const u8, _: []const u8) void {
+            if (std.mem.eql(u8, key, "half")) n += 1;
+        }
+    };
+    Seen.n = 0;
+    c.drainDirty(Seen.cb, null);
+    try testing.expectEqual(@as(usize, 0), Seen.n);
 
-    c.release(also);
-    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
+    // The waiting reader fetched for itself and `put` its copy first: that
+    // copy is what the cache serves, and the late fill still lands in the
+    // borrow its producer is handed -- then goes with it.
+    c.put("half", "readers!", 0, 0, 0);
+    @memcpy(f.bytes, "producer");
+    const b = c.commit(f);
+    try testing.expectEqualStrings("producer", b.bytes);
+    try testing.expectEqualStrings("readers!", c.get("half", 0, 0).?);
+    c.release(b);
+    try testing.expectEqualStrings("readers!", c.get("half", 0, 0).?);
+
+    // Committed: visible, and dirty for the flusher.
+    const f2 = c.reserve("full", 4, 0, 0, 0).?;
+    @memcpy(f2.bytes, "done");
+    c.release(c.commit(f2));
+    try testing.expectEqualStrings("done", c.get("full", 0, 0).?);
     try testing.expectEqualStrings("B", c.get("bystander", 0, 0).?);
+    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
 }
 
 test "a replace whose value dupe fails drops the key rather than serving pre-write bytes" {

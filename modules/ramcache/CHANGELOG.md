@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fixed: a reservation (`reserve`, before `commit`) was a HIT for `get`
+  and lendable by `pin` with its uninitialized bytes, and `drainDirty` handed them to a
+  flusher (a reservation is dirty from birth). Harmless while the producer fills before
+  anyone else can look -- not when it parks on I/O in between (a fiber reading a page into
+  the slot; pagecache's `preadRef` does). Unfilled entries are now a miss for all three.
+  Found for qap's research register H4.
+
 - **2026-09-21** — **A cache under miss pressure no longer degrades to a
   whole-table probe per lookup.** std's open-addressing map leaves a tombstone
   per removal and hands the slot back to `available`, so a remove-then-insert
