@@ -27,10 +27,9 @@
 //! MVCC page-reuse gate — is implemented in `core.zig` and
 //! `gate.fable_core_implemented` is flipped, so the property tests drive the
 //! real `Db` through commit/snapshot schedules and a crash-point sweep on
-//! `kv.SimStorage` (see `harness.zig`). Remaining scaffold simplifications are
-//! documented in SPEC.md's backlog (overflow pages, freelist chaining — the
-//! single freelist page LEAKS excess freed ids when full, never corrupts —
-//! and rebalance-by-borrow).
+//! `kv.SimStorage` (see `harness.zig`). A value too large for a page lives in a
+//! chain of overflow pages (`get` and cursors read it; `getRef` cannot lend
+//! it); keys stay inline. What is still open is in SPEC.md's backlog.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -288,7 +287,11 @@ pub const Db = struct {
     /// bytes for the borrower (pagecache F3). Hold it briefly all the same: a
     /// borrowed page cannot be evicted.
     ///
-    /// `error.CannotLend` from a store that holds no bytes to lend. There is
+    /// `error.CannotLend` from a store that holds no bytes to lend, and for a
+    /// value larger than a page, which lives in overflow pages and is not one
+    /// run of bytes anywhere (`get` reads it). A value that fits a page is
+    /// never stored that way, so whether a key lends depends only on its
+    /// value's size, never on the store's history. There is
     /// deliberately no silent fall-back to `get`: the caller chose this call
     /// to avoid the copy and the allocation, and a fall-back would make
     /// "did it?" unanswerable -- the same rule `preadRef` itself keeps.
@@ -566,6 +569,10 @@ fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef
                     pager.releasePageRef(ref);
                     return null;
                 }
+                if (leaf.ovfLen(found.index) != null) {
+                    pager.releasePageRef(ref);
+                    return error.CannotLend;
+                }
                 return .{ .bytes = leaf.valAt(found.index), .pager = pager, .ref = ref };
             },
         }
@@ -597,9 +604,34 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
                 const leaf = format.Leaf.init(bytes);
                 const s = leaf.search(key);
                 if (!s.found) return null;
+                if (leaf.ovfLen(s.index)) |len| {
+                    const out = try gpa.alloc(u8, len);
+                    errdefer gpa.free(out);
+                    try readOverflow(pager, leaf.ovfFirst(s.index), out);
+                    return out;
+                }
                 return try gpa.dupe(u8, leaf.valAt(s.index));
             },
         }
+    }
+}
+
+/// Read the overflow value whose chain starts at `first` into `out` (exactly
+/// its length). A page that is not an overflow page, or a chain that ends
+/// early, is `error.Corrupt`: node and overflow pages carry no CRC, so the
+/// kind byte and the `next` pointer are all there is to check.
+fn readOverflow(pager: *Pager, first: PageId, out: []u8) (kv.Storage.Error || error{Corrupt})!void {
+    var page: [page_size]u8 = undefined;
+    var id = first;
+    var done: usize = 0;
+    while (done < out.len) {
+        if (id < format.first_data_page or id >= pager.high_water) return error.Corrupt;
+        try pager.readPage(id, &page);
+        const next = format.overflowNext(&page) orelse return error.Corrupt;
+        const take = @min(out.len - done, format.ovf_data);
+        @memcpy(out[done..][0..take], format.overflowData(&page)[0..take]);
+        done += take;
+        id = next;
     }
 }
 
@@ -612,6 +644,9 @@ pub const Cursor = struct {
     pager: *Pager,
     root: PageId,
     stack: std.ArrayList(Frame),
+    /// Where an overflow value is assembled for `next` to yield; reused, so a
+    /// yielded value is valid until the next call, like an inline one.
+    ovf_buf: std.ArrayList(u8) = .empty,
     /// Set when the cursor owns its reclaim-gate pin — i.e. it came straight
     /// from `Db.cursor`. A cursor over a `Snapshot` leaves this null, because
     /// the snapshot already holds the pin and releasing it twice would drop
@@ -633,6 +668,7 @@ pub const Cursor = struct {
     pub fn deinit(self: *Cursor) void {
         if (self.pin) |p| p.db.releaseSnapshot(p.txn_id);
         self.stack.deinit(self.gpa);
+        self.ovf_buf.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -689,9 +725,14 @@ pub const Cursor = struct {
             const top = &self.stack.items[self.stack.items.len - 1];
             const leaf = format.Leaf.init(&top.page);
             if (top.idx < leaf.count()) {
-                const out = KV{ .key = leaf.keyAt(top.idx), .val = leaf.valAt(top.idx) };
+                const i = top.idx;
                 top.idx += 1;
-                return out;
+                if (leaf.ovfLen(i)) |len| {
+                    try self.ovf_buf.resize(self.gpa, len);
+                    try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
+                    return .{ .key = leaf.keyAt(i), .val = self.ovf_buf.items };
+                }
+                return .{ .key = leaf.keyAt(i), .val = leaf.valAt(i) };
             }
             // Leaf exhausted → climb to the nearest ancestor with a next child.
             _ = self.stack.pop();
@@ -1314,20 +1355,21 @@ fn longKey(buf: *[long_key_len]u8, id: u64) []const u8 {
     return buf;
 }
 
-const TreeShape = struct { depth: ?usize = null, tree_pages: usize = 0, keys: usize = 0 };
+const TreeShape = struct { depth: ?usize = null, tree_pages: usize = 0, keys: usize = 0, ovf_pages: usize = 0 };
 
 /// Walk the current tree and check what dropping emptied nodes must keep
 /// true: every leaf at one depth, no empty leaf but an empty root, no root
 /// branch with a single child, every key inside its parent's separator range.
 /// Then the page accounting: every page below `high_water` is a meta page, a
-/// tree page, a freelist chain page or a freelist entry -- a page dropped
-/// from the tree but never handed to the freelist would be lost for good.
+/// tree page, an overflow page, a freelist chain page or a freelist entry -- a
+/// page dropped from the tree (or a chain from a value) but never handed to
+/// the freelist would be lost for good.
 fn checkTreeShape(db: *Db) !TreeShape {
     var shape: TreeShape = .{};
     try walkShape(db, db.meta_rec.root, 0, null, null, true, &shape);
     var chain = try pager_mod.readFreelistChain(testing.allocator, &db.pager, db.meta_rec.free_root);
     defer chain.deinit(testing.allocator);
-    try testing.expectEqual(db.meta_rec.high_water, format.first_data_page + shape.tree_pages + chain.pages.items.len + chain.fl.len());
+    try testing.expectEqual(db.meta_rec.high_water, format.first_data_page + shape.tree_pages + shape.ovf_pages + chain.pages.items.len + chain.fl.len());
     return shape;
 }
 
@@ -1345,6 +1387,17 @@ fn walkShape(db: *Db, id: PageId, depth: usize, lo: ?[]const u8, hi: ?[]const u8
                 const k = leaf.keyAt(i);
                 if (lo) |l| try testing.expect(!std.mem.lessThan(u8, k, l));
                 if (hi) |h| try testing.expect(std.mem.lessThan(u8, k, h));
+                if (leaf.ovfLen(i)) |len| {
+                    // Exactly the pages the length needs, each an overflow page.
+                    var ovf: [page_size]u8 = undefined;
+                    var pid = leaf.ovfFirst(i);
+                    for (0..format.ovfPages(len)) |_| {
+                        try db.pager.readPage(pid, &ovf);
+                        pid = format.overflowNext(&ovf).?;
+                        shape.ovf_pages += 1;
+                    }
+                    try testing.expectEqual(@as(PageId, 0), pid);
+                }
             }
             shape.keys += leaf.count();
         },
@@ -1546,4 +1599,224 @@ test "a two-level tree whose leaves all empty but one collapses to that leaf" {
     const shape = try checkTreeShape(&db);
     try testing.expectEqual(@as(usize, 1), shape.keys);
     try expectGet(&db, longKey(&kb, 39), "v");
+}
+
+// ── overflow values ─────────────────────────────────────────────────────────
+// A value whose cell does not fit an empty leaf lives in a chain of overflow
+// pages; everything that fits stays inline, as before overflow existed.
+
+/// The longest value that stays inline next to `key`.
+fn maxInline(key: []const u8) usize {
+    var n: usize = 0;
+    while (format.fitsInline(key.len, n + 1)) n += 1;
+    return n;
+}
+
+fn filled(a: Allocator, len: usize, seed: u8) ![]u8 {
+    const v = try a.alloc(u8, len);
+    for (v, 0..) |*b, i| b.* = seed +% @as(u8, @truncate(i *% 31));
+    return v;
+}
+
+test "overflow values: every size round-trips through get, cursor and a reopen; the format moves to v3 only then" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const inline_max = maxInline("k0");
+    const sizes = [_]usize{ 0, 1, inline_max, inline_max + 1, format.ovf_data, format.ovf_data + 1, 3 * format.ovf_data + 17, 100_000 };
+    var vals: [sizes.len][]u8 = undefined;
+    for (sizes, &vals, 0..) |n, *v, i| v.* = try filled(a, n, @intCast(i));
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "o.kvt", .{});
+        defer db.close();
+        try db.put("small", "x");
+        try testing.expectEqual(format.format_v2, db.meta_rec.version);
+        var txn = try db.begin();
+        for (vals, 0..) |v, i| try txn.put(try std.fmt.allocPrint(a, "k{d}", .{i}), v);
+        try txn.commit();
+        try testing.expectEqual(format.format_v3, db.meta_rec.version);
+        _ = try checkTreeShape(&db);
+    }
+    // Reopened: `recover` walks and validates every chain, then reads agree.
+    var db = try Db.open(testing.allocator, sim.storage(), "o.kvt", .{});
+    defer db.close();
+    try testing.expectEqual(format.format_v3, db.meta_rec.version);
+    for (vals, 0..) |v, i| {
+        const got = (try db.get(testing.allocator, try std.fmt.allocPrint(a, "k{d}", .{i}))).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, v, got);
+    }
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    var i: usize = 0;
+    while (try cur.next()) |e| : (i += 1) {
+        if (i == sizes.len) {
+            try testing.expectEqualStrings("small", e.key);
+            continue;
+        }
+        try testing.expectEqualSlices(u8, vals[i], e.val);
+    }
+    try testing.expectEqual(sizes.len + 1, i);
+    // A commit that writes no overflow value keeps v3 (sticky).
+    try db.put("small", "y");
+    try testing.expectEqual(format.format_v3, db.meta_rec.version);
+}
+
+test "overflow values: overwrite and delete recycle their chains; a steady overwrite stops growing the file" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "r.kvt", .{});
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big = try filled(a, 5 * format.ovf_data, 1);
+    const bigger = try filled(a, 9 * format.ovf_data + 3, 2);
+    try db.put("v", big);
+    try expectGet(&db, "v", big);
+    try db.put("v", bigger); // overflow -> overflow
+    try expectGet(&db, "v", bigger);
+    try db.put("v", "tiny"); // overflow -> inline
+    try expectGet(&db, "v", "tiny");
+    try db.put("v", big); // inline -> overflow
+    try expectGet(&db, "v", big);
+    _ = try checkTreeShape(&db); // every freed chain page is on the freelist
+    try db.del("v");
+    try expectGet(&db, "v", null);
+    const shape = try checkTreeShape(&db);
+    try testing.expectEqual(@as(usize, 0), shape.ovf_pages);
+
+    var hw: [2]u64 = undefined;
+    for (0..40) |round| {
+        try db.put("v", if (round % 2 == 0) big else bigger);
+        if (round == 19) hw[0] = db.meta_rec.high_water;
+        if (round == 39) hw[1] = db.meta_rec.high_water;
+    }
+    try testing.expectEqual(hw[0], hw[1]);
+    _ = try checkTreeShape(&db);
+}
+
+test "overflow values: a snapshot keeps the chain it saw while the writer replaces and deletes it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const old = try filled(a, 4 * format.ovf_data, 7);
+    try db.put("v", old);
+    var snap = try db.snapshot();
+    defer snap.release();
+    // Enough commits that pages freed after the snapshot would be recycled
+    // if the reclaim gate did not hold them.
+    for (0..12) |round| {
+        try db.put("v", try filled(a, 4 * format.ovf_data, @intCast(round + 20)));
+        try db.put("pad", try filled(a, 2 * format.ovf_data, @intCast(round)));
+    }
+    try db.del("v");
+    const got = (try snap.get(testing.allocator, "v")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, old, got);
+}
+
+test "overflow values: a key too long for an overflow reference is EntryTooLarge, and nothing is written" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+    var key: [page_size]u8 = @splat('k');
+    var klen: usize = 1;
+    while (format.fitsOverflowRef(klen + 1)) klen += 1;
+    const big = try filled(testing.allocator, 2 * format.ovf_data, 3);
+    defer testing.allocator.free(big);
+    try db.put(key[0..klen], big); // the longest key that still fits
+    try expectGet(&db, key[0..klen], big);
+    const hw = db.meta_rec.high_water;
+    try testing.expectError(error.EntryTooLarge, db.put(key[0 .. klen + 1], big));
+    try testing.expectEqual(hw, db.meta_rec.high_water);
+    try db.put("after", "ok"); // the Db is not poisoned by it
+}
+
+test "overflow values: a broken chain is Corrupt on read, and recovery refuses a tree that has one" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    const big = try filled(testing.allocator, 3 * format.ovf_data, 5);
+    defer testing.allocator.free(big);
+    var chain_page: PageId = undefined;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+        defer db.close();
+        try db.put("v", big);
+        try db.put("w", "second commit: both metas now reach the chain");
+        var page: [page_size]u8 = undefined;
+        try db.pager.readPage(db.meta_rec.root, &page);
+        const leaf = format.Leaf.init(&page);
+        const s = leaf.search("v");
+        try db.pager.readPage(leaf.ovfFirst(s.index), &page);
+        chain_page = format.overflowNext(&page).?; // the second page of three
+        // A read that meets a page that is not an overflow page fails closed.
+        sim.flipByte("c.kvt", @as(usize, chain_page) * page_size); // kind 2 -> 0x42
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "v"));
+    }
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "c.kvt", .{}));
+}
+
+/// `SimStorage` with a lending `preadRef`: a copy of the page on the heap,
+/// freed on release. Enough to drive `getRef` through the borrow path.
+const LendingSim = struct {
+    sim: kv.SimStorage,
+    vt: kv.Storage.VTable = undefined,
+
+    fn storage(self: *LendingSim) kv.Storage {
+        self.vt = self.sim.storage().vtable.*;
+        self.vt.preadRef = preadRef;
+        self.vt.releaseRef = releaseRef;
+        return .{ .ctx = &self.sim, .vtable = &self.vt };
+    }
+    fn preadRef(ctx: *anyopaque, h: kv.Storage.Handle, len: usize, off: u64) kv.Storage.Error!?kv.Storage.Ref {
+        const sim: *kv.SimStorage = @ptrCast(@alignCast(ctx));
+        const buf = try testing.allocator.alloc(u8, len);
+        errdefer testing.allocator.free(buf);
+        if (try sim.storage().pread(h, buf, off) != len) {
+            testing.allocator.free(buf);
+            return null;
+        }
+        return .{ .bytes = buf, .token = buf.ptr };
+    }
+    fn releaseRef(_: *anyopaque, ref: kv.Storage.Ref) void {
+        testing.allocator.free(ref.bytes);
+    }
+};
+
+test "overflow values: getRef lends an inline value and refuses an overflow one (get reads it)" {
+    var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
+    defer ls.sim.deinit();
+    ls.sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, ls.storage(), "l.kvt", .{});
+    defer db.close();
+    const inline_val = try filled(testing.allocator, maxInline("i"), 1);
+    defer testing.allocator.free(inline_val);
+    const big = try filled(testing.allocator, maxInline("o") + 1, 2);
+    defer testing.allocator.free(big);
+    try db.put("i", inline_val);
+    try db.put("o", big);
+    var r = (try db.getRef("i")).?;
+    try testing.expectEqualSlices(u8, inline_val, r.bytes);
+    r.release();
+    try testing.expectError(error.CannotLend, db.getRef("o"));
+    try expectGet(&db, "o", big);
+    // The leaf page lent for the refused lookup was released (testing.allocator
+    // reports a leak otherwise).
 }

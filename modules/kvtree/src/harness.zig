@@ -498,6 +498,23 @@ test "real Db: snapshot isolation + serializability under a commit schedule (gat
 
 test "real Db: crash at a commit recovers to a committed prefix (gated)" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
+    try crashSweep(700, false);
+}
+
+test "real Db: crash at a commit that writes, overwrites and frees overflow chains" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    // Values of three overflow pages and a bit: every in-flight key writes a
+    // chain, and the baseline's overflow value is overwritten, so its chain
+    // is freed in the same commit. A recovered tree must read every value
+    // back whole -- a chain page lost to a crash would show as a torn value
+    // or as `error.Corrupt`, both of which fail the check.
+    try crashSweep(3 * format.ovf_data + 17, true);
+}
+
+/// The crash-point sweep behind the two tests above, over values of
+/// `val_len` bytes; with `overwrite`, the baseline key holds such a value too
+/// and every in-flight commit overwrites it with another.
+fn crashSweep(comptime val_len: usize, comptime overwrite: bool) !void {
     const gpa = testing.allocator;
 
     // Sweep the crash point across EVERY storage side effect of an
@@ -517,14 +534,17 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
         defer model_owner.deinit();
         var model = Model.init(model_owner.allocator()); // committed truth
 
+        var base_val: [val_len]u8 = undefined;
+        @memset(&base_val, 'b');
         { // committed baseline, no crash scheduled
             var db = try kvtree.Db.open(gpa, sim.storage(), "rec.kvt", .{});
             defer db.close();
-            try db.put("committed", "1");
-            try model.put("committed", "1");
+            const first: []const u8 = if (overwrite) &base_val else "1";
+            try db.put("committed", first);
+            try model.put("committed", first);
         }
 
-        var val: [700]u8 = undefined;
+        var val: [val_len]u8 = undefined;
         @memset(&val, 'y');
         // `.reorder_unsynced` is the only mode that can persist a LATER write
         // (the meta) while losing an EARLIER one (a data page) — the exact
@@ -539,7 +559,7 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
             while (!progressed) : (crash_at += 1) {
                 // An open+commit is a short bounded op sequence; the sweep
                 // must terminate by outrunning it.
-                try testing.expect(crash_at < 64);
+                try testing.expect(crash_at < 64 + 4 * format.ovfPages(val_len));
                 var keybufs: [3][12]u8 = undefined;
                 var keys: [3][]const u8 = undefined;
                 for (&keybufs, &keys, 0..) |*kb, *key, k|
@@ -559,6 +579,7 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
                     inflight_txn = db.meta_rec.txn_id + 1;
                     var txn = db.begin() catch break :attempt;
                     for (keys) |key| try txn.put(key, &val);
+                    if (overwrite) try txn.put("committed", &val);
                     txn.commit() catch break :attempt; // consumes txn either way
                     progressed = true; // the whole schedule ran past the crash point
                 }
@@ -599,6 +620,7 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
                 const recovered = try drainCursor(&cur, scratch.allocator());
                 var with_inflight = try model.clone(scratch.allocator());
                 for (keys) |key| try with_inflight.put(key, &val);
+                if (overwrite) try with_inflight.put("committed", &val);
                 const candidates: []const []const Obs = if (inflight_meta_destroyed)
                     &.{model.entries()}
                 else
@@ -608,6 +630,13 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
                 // Whatever recovery adopted is the new committed truth.
                 if (entriesEqual(with_inflight.entries(), recovered)) {
                     for (keys) |key| try model.put(key, &val);
+                    if (overwrite) try model.put("committed", &val);
+                }
+                // The next epoch overwrites a baseline that holds `base_val`
+                // again, so every commit frees a chain, not just the first.
+                if (overwrite) {
+                    try db.put("committed", &base_val);
+                    try model.put("committed", &base_val);
                 }
             }
         }

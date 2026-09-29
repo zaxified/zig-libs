@@ -49,11 +49,76 @@ const meta_magic = "ZKVT";
 /// or CRC of their own -- this version, checked in `Meta.decode`, is the ONLY
 /// thing standing between an old file and a chain walk into arbitrary pages, so
 /// opening a v1 file must fail closed rather than misread it.
-const format_version: u32 = 2;
+///
+/// Bumped 2 -> 3 for overflow values (a leaf cell whose value lives in a chain
+/// of overflow pages, flagged in its `val_len`) -- but only for a store that
+/// has one: a commit writes v3 once it writes an overflow value, and every
+/// commit after it keeps v3 (`Meta.version`). A store that never held a value
+/// larger than a page stays v2 and opens with an older build. A v3 store is
+/// refused by one (its `decode` accepts exactly its own version), where the
+/// alternative -- reading a flagged `val_len` as a length -- would reject the
+/// newest meta in `recover` and silently adopt the one before it.
+pub const format_v2: u32 = 2;
+pub const format_v3: u32 = 3;
 
 /// A single leaf entry (borrowed slices into a page buffer, or into a builder's
-/// arena — never owns).
-pub const Entry = struct { key: []const u8, val: []const u8 };
+/// arena — never owns). For an overflow value (`ovf_len` set) `val` is not the
+/// value but its `ovf_ref_len`-byte reference: the first overflow page's id.
+pub const Entry = struct { key: []const u8, val: []const u8, ovf_len: ?u32 = null };
+
+// ── Overflow values ──────────────────────────────────────────────────────────
+//
+// A value whose cell does not fit an otherwise-empty leaf lives in a chain of
+// OVERFLOW pages, and its leaf cell carries only a reference: `val_len` has its
+// top bit set (`ovf_flag`), the low 31 bits are the value's length, and the
+// cell's value bytes are the first overflow page's id. Everything that fits a
+// leaf stays inline, exactly as before overflow existed -- so a store's inline
+// values, and `getRef`'s ability to lend them, never change with this.
+//
+// An overflow page is `kind(1) = overflow_kind, 0(3), next(4)` and then up to
+// `ovf_data` value bytes; `next` is 0 on the last page. The chain is written
+// once, copy-on-write like everything else: a new or overwritten value gets a
+// fresh chain, and the old one goes to the freelist with the leaf's other dead
+// pages. A leaf rewritten for another key's sake keeps the reference as it is,
+// so the chain is shared between versions like an untouched subtree is.
+
+/// `val_len`'s top bit: the value is in overflow pages.
+pub const ovf_flag: u32 = 0x8000_0000;
+/// Bytes of a leaf cell's value field that hold an overflow reference.
+pub const ovf_ref_len = 4;
+/// The longest value a store accepts (the low 31 bits of `val_len`).
+pub const max_value_len: usize = ovf_flag - 1;
+/// An overflow page's kind byte -- never a `NodeKind`, so `kindOf` answers
+/// `null` for it and a tree walk that reaches one reports corruption.
+pub const overflow_kind: u8 = 2;
+const ovf_hdr = 8;
+/// Value bytes one overflow page holds.
+pub const ovf_data = page_size - ovf_hdr;
+
+/// Overflow pages a value of `len` bytes takes.
+pub fn ovfPages(len: usize) usize {
+    return (len + ovf_data - 1) / ovf_data;
+}
+
+/// Write one overflow page: `data` (at most `ovf_data` bytes) then zeros.
+pub fn encodeOverflow(page: *[page_size]u8, next: PageId, data: []const u8) void {
+    std.debug.assert(data.len <= ovf_data);
+    zeroPage(page);
+    page[0] = overflow_kind;
+    std.mem.writeInt(u32, page[4..8], next, .little);
+    @memcpy(page[ovf_hdr..][0..data.len], data);
+}
+
+/// An overflow page's `next` pointer, or `null` when the page is not one.
+pub fn overflowNext(page: *const [page_size]u8) ?PageId {
+    if (page[0] != overflow_kind) return null;
+    return std.mem.readInt(u32, page[4..8], .little);
+}
+
+/// An overflow page's value bytes (all of them; the caller takes its share).
+pub fn overflowData(page: *const [page_size]u8) *const [ovf_data]u8 {
+    return page[ovf_hdr..];
+}
 
 /// Zero a whole page with 32-byte volatile vector stores.
 ///
@@ -92,13 +157,18 @@ pub const Meta = struct {
     /// Total pages the file has ever grown to; the next never-before-used page
     /// id. Every valid page id in a committed tree is `< high_water`.
     high_water: u64,
+    /// `format_v2`, or `format_v3` once the store has held an overflow value
+    /// (see `format_v3`). Sticky: a commit never writes a lower version than
+    /// its base.
+    version: u32 = format_v2,
 
     const crc_off = 44; // bytes [0..44) are covered by the CRC at [44..48)
 
     pub fn encode(self: Meta, page: *[page_size]u8) void {
         zeroPage(page);
         @memcpy(page[0..4], meta_magic);
-        std.mem.writeInt(u32, page[4..8], format_version, .little);
+        std.debug.assert(self.version == format_v2 or self.version == format_v3);
+        std.mem.writeInt(u32, page[4..8], self.version, .little);
         std.mem.writeInt(u32, page[8..12], @intCast(page_size), .little);
         std.mem.writeInt(u64, page[12..20], self.txn_id, .little);
         std.mem.writeInt(u32, page[20..24], self.root, .little);
@@ -115,7 +185,8 @@ pub const Meta = struct {
     /// whether it is the one to *adopt* is `core.recover`'s call.
     pub fn decode(page: *const [page_size]u8) ?Meta {
         if (!std.mem.eql(u8, page[0..4], meta_magic)) return null;
-        if (std.mem.readInt(u32, page[4..8], .little) != format_version) return null;
+        const version = std.mem.readInt(u32, page[4..8], .little);
+        if (version != format_v2 and version != format_v3) return null;
         if (std.mem.readInt(u32, page[8..12], .little) != page_size) return null;
         const want = std.mem.readInt(u32, page[crc_off .. crc_off + 4][0..4], .little);
         if (crc32.hash(page[0..crc_off]) != want) return null;
@@ -125,6 +196,7 @@ pub const Meta = struct {
             .free_root = std.mem.readInt(u32, page[24..28], .little),
             .free_count = std.mem.readInt(u64, page[28..36], .little),
             .high_water = std.mem.readInt(u64, page[36..44], .little),
+            .version = version,
         };
     }
 };
@@ -194,11 +266,31 @@ pub const Leaf = struct {
         return self.page[o + 6 ..][0..klen];
     }
 
+    /// The value of entry `i` -- or, for an overflow value (`ovfLen`), its
+    /// `ovf_ref_len`-byte reference; see `entryAt`.
     pub fn valAt(self: Leaf, i: usize) []const u8 {
         const o = slotOffset(self.page, i);
         const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
-        const vlen = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw;
         return self.page[o + 6 + klen ..][0..vlen];
+    }
+
+    /// The length of entry `i`'s value when it lives in overflow pages, else
+    /// `null` (the value is `valAt(i)` itself).
+    pub fn ovfLen(self: Leaf, i: usize) ?u32 {
+        const o = slotOffset(self.page, i);
+        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+        return if (raw & ovf_flag != 0) raw & ~ovf_flag else null;
+    }
+
+    /// The first overflow page of entry `i`, whose `ovfLen` is set.
+    pub fn ovfFirst(self: Leaf, i: usize) PageId {
+        return std.mem.readInt(u32, self.valAt(i)[0..ovf_ref_len], .little);
+    }
+
+    pub fn entryAt(self: Leaf, i: usize) Entry {
+        return .{ .key = self.keyAt(i), .val = self.valAt(i), .ovf_len = self.ovfLen(i) };
     }
 
     pub fn search(self: Leaf, key: []const u8) Search {
@@ -329,8 +421,12 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
         const o = slotOffset(page, i);
         if (o < dir_end or o + 6 > page_size) return null;
         const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
-        const vlen = std.mem.readInt(u32, page[o + 2 .. o + 6][0..4], .little);
-        if (o + 6 + @as(usize, klen) + @as(usize, vlen) > page_size) return null;
+        const raw = std.mem.readInt(u32, page[o + 2 .. o + 6][0..4], .little);
+        // An overflow reference: a length of 0 is no value anyone wrote (a
+        // value that short is inline), so it is corruption, not a chain.
+        if (raw == ovf_flag) return null;
+        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw;
+        if (o + 6 + @as(usize, klen) + vlen > page_size) return null;
     }
     return Leaf.init(page);
 }
@@ -359,10 +455,20 @@ fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
 // buffer can be reused freely. This is the mechanical half of the B-tree; the
 // COW page-allocation + durability wrapping around it is `core.commit`.
 
-/// A key/value pair a single leaf can never hold, no matter how empty (would
-/// not fit one page even alone) — the scaffold rejects it; overflow pages for
-/// large values are a documented backlog item (see SPEC.md).
+/// A key/value pair no leaf can hold even with its value in overflow pages: a
+/// key whose cell with an overflow reference does not fit an empty page, or a
+/// value longer than `max_value_len`.
 pub const oversize_error = error.EntryTooLarge;
+
+/// Does `(key, value)` fit an otherwise-empty leaf inline?
+pub fn fitsInline(klen: usize, vlen: usize) bool {
+    return vlen <= max_value_len and leafCellBytes(klen, vlen) + hdr_len + slot_len <= page_size;
+}
+
+/// Does a key of `klen` fit an otherwise-empty leaf with an overflow reference?
+pub fn fitsOverflowRef(klen: usize) bool {
+    return leafCellBytes(klen, ovf_ref_len) + hdr_len + slot_len <= page_size;
+}
 
 /// Node builders BORROW every key, value and separator handed to them --
 /// from the page they were decoded from (`fromPage`), from the caller's
@@ -398,7 +504,7 @@ pub const LeafBuilder = struct {
         try b.entries.ensureTotalCapacityPrecise(arena, @as(usize, n) + 1);
         var i: usize = 0;
         while (i < n) : (i += 1)
-            b.entries.appendAssumeCapacity(.{ .key = leaf.keyAt(i), .val = leaf.valAt(i) });
+            b.entries.appendAssumeCapacity(leaf.entryAt(i));
         return b;
     }
 
@@ -410,10 +516,22 @@ pub const LeafBuilder = struct {
     /// key over ~4080 bytes to fail here first; removed rather than left to
     /// read as a live invariant it never was).
     pub fn put(self: *LeafBuilder, key: []const u8, val: []const u8) !void {
-        if (leafCellBytes(key.len, val.len) + hdr_len + slot_len > page_size)
-            return oversize_error;
-        const s = self.search(key);
-        const e = Entry{ .key = key, .val = val };
+        if (!fitsInline(key.len, val.len)) return oversize_error;
+        try self.set(.{ .key = key, .val = val });
+    }
+
+    /// Insert or overwrite `key` with a reference to an overflow value of
+    /// `len` bytes whose chain starts at page `first_ref` (`ovf_ref_len`
+    /// bytes, borrowed like every other slice here). The chain is the
+    /// caller's to write; a builder does no I/O.
+    pub fn putOverflow(self: *LeafBuilder, key: []const u8, first_ref: []const u8, len: u32) !void {
+        std.debug.assert(first_ref.len == ovf_ref_len and len != 0 and len <= max_value_len);
+        if (!fitsOverflowRef(key.len)) return oversize_error;
+        try self.set(.{ .key = key, .val = first_ref, .ovf_len = len });
+    }
+
+    fn set(self: *LeafBuilder, e: Entry) !void {
+        const s = self.search(e.key);
         if (s.found) {
             self.entries.items[s.index] = e;
         } else {
@@ -582,7 +700,8 @@ fn encodeLeaf(page: *[page_size]u8, entries: []const Entry) void {
         const cell = leafCellBytes(e.key.len, e.val.len);
         tail -= cell;
         std.mem.writeInt(u16, page[tail .. tail + 2][0..2], @intCast(e.key.len), .little);
-        std.mem.writeInt(u32, page[tail + 2 .. tail + 6][0..4], @intCast(e.val.len), .little);
+        const vlen: u32 = if (e.ovf_len) |l| ovf_flag | l else @intCast(e.val.len);
+        std.mem.writeInt(u32, page[tail + 2 .. tail + 6][0..4], vlen, .little);
         @memcpy(page[tail + 6 ..][0..e.key.len], e.key);
         @memcpy(page[tail + 6 + e.key.len ..][0..e.val.len], e.val);
         const slot = hdr_len + i * slot_len;

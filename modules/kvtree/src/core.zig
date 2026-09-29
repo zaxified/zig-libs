@@ -262,6 +262,9 @@ pub fn commit(
         .free_root = new_free_root,
         .free_count = fl.len(),
         .high_water = pager.high_water,
+        // Sticky (see `format.format_v3`): the first commit that writes an
+        // overflow value moves the store to v3, and it stays there.
+        .version = if (ctx.wrote_overflow) format.format_v3 else base.version,
     };
     new_meta.encode(&buf);
     // The slot `base` does NOT occupy (strict txn-parity alternation).
@@ -295,6 +298,8 @@ const Ctx = struct {
     /// A node was left empty and dropped from its parent this commit, so the
     /// root may need collapsing (see `commit`).
     dropped: bool = false,
+    /// This commit wrote an overflow value (the meta goes to `format_v3`).
+    wrote_overflow: bool = false,
 
     /// A fresh page for the new tree version: reuse a freed page only past
     /// the MVCC reclaim gate, otherwise grow the file.
@@ -364,11 +369,22 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
         .leaf => {
             var b = format.LeafBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
             for (ops) |op| {
+                // The value this op replaces or deletes dies with it: an
+                // overflow chain goes to the freelist like a COW-dead node.
+                const s = b.search(op.key);
+                if (s.found) if (b.entries.items[s.index].ovf_len) |len|
+                    try freeOverflow(ctx, std.mem.readInt(u32, b.entries.items[s.index].val[0..format.ovf_ref_len], .little), len);
                 if (op.val) |v| {
-                    b.put(op.key, v) catch |e| return switch (e) {
-                        error.EntryTooLarge => error.EntryTooLarge,
-                        error.OutOfMemory => error.OutOfMemory,
-                    };
+                    if (format.fitsInline(op.key.len, v.len)) {
+                        b.put(op.key, v) catch return error.OutOfMemory;
+                    } else {
+                        if (v.len > format.max_value_len or !format.fitsOverflowRef(op.key.len)) return error.EntryTooLarge;
+                        const ref = try writeOverflow(ctx, v);
+                        b.putOverflow(op.key, ref, @intCast(v.len)) catch |e| return switch (e) {
+                            error.EntryTooLarge => error.EntryTooLarge,
+                            error.OutOfMemory => error.OutOfMemory,
+                        };
+                    }
                 } else {
                     _ = b.del(op.key);
                 }
@@ -432,6 +448,44 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
             }
             return finishNodes(format.BranchBuilder, ctx, nb);
         },
+    }
+}
+
+/// Write `val` as a fresh overflow chain and return its reference (the first
+/// page's id, `ovf_ref_len` bytes in the commit arena). Pages come from
+/// `allocPage` like a node's, so they are recycled past the reclaim gate or
+/// grown, never taken from this commit's own dead pages.
+fn writeOverflow(ctx: *Ctx, val: []const u8) CommitError![]const u8 {
+    const n = format.ovfPages(val.len);
+    std.debug.assert(n > 0);
+    const ids = ctx.arena.alloc(PageId, n) catch return error.OutOfMemory;
+    for (ids) |*id| id.* = ctx.allocPage();
+    var buf: [page_size]u8 = undefined;
+    for (ids, 0..) |id, k| {
+        const start = k * format.ovf_data;
+        const end = @min(val.len, start + format.ovf_data);
+        format.encodeOverflow(&buf, if (k + 1 < n) ids[k + 1] else 0, val[start..end]);
+        ctx.pager.writePage(id, &buf) catch return error.CommitFailed;
+    }
+    ctx.wrote_overflow = true;
+    const ref = ctx.arena.alloc(u8, format.ovf_ref_len) catch return error.OutOfMemory;
+    std.mem.writeInt(u32, ref[0..format.ovf_ref_len], ids[0], .little);
+    return ref;
+}
+
+/// Hand every page of the overflow chain at `first` (a value of `len` bytes)
+/// to `ctx.freed`. The chain belongs to the base tree, so its pages are
+/// read, not trusted: a page that is not an overflow page, or a chain that
+/// ends early, is corruption.
+fn freeOverflow(ctx: *Ctx, first: PageId, len: u32) CommitError!void {
+    var id = first;
+    var buf: [page_size]u8 = undefined;
+    for (0..format.ovfPages(len)) |_| {
+        if (id < format.first_data_page or id >= ctx.pager.high_water) return error.Corrupt;
+        try readForCommit(ctx.pager, id, &buf);
+        const next = format.overflowNext(&buf) orelse return error.Corrupt;
+        ctx.freed.append(ctx.arena, id) catch return error.OutOfMemory;
+        id = next;
     }
 }
 
@@ -559,7 +613,31 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
             // read path, which indexes the page with no bounds check of its
             // own. See `format.leafViewSafe`.
             @intFromEnum(format.NodeKind.leaf) => {
-                if (format.leafViewSafe(&buf) == null) return false;
+                const leaf = format.leafViewSafe(&buf) orelse return false;
+                var i: usize = 0;
+                while (i < leaf.count()) : (i += 1) {
+                    const len = leaf.ovfLen(i) orelse continue;
+                    // The chain, trusting nothing: exactly the pages its length
+                    // needs, each in bounds and an overflow page, the last one
+                    // ending it. Counted into `visited`, so chains that share or
+                    // loop through pages still hit the global bound.
+                    var ovf_buf: [page_size]u8 = undefined;
+                    var pid = leaf.ovfFirst(i);
+                    const pages = format.ovfPages(len);
+                    for (0..pages) |k| {
+                        visited += 1;
+                        if (visited > m.high_water) return false;
+                        if (!pageIdOk(pid, m.high_water)) return false;
+                        pager.readPage(pid, &ovf_buf) catch |e| switch (e) {
+                            error.Corrupt => return false,
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => return error.Storage,
+                        };
+                        const next = format.overflowNext(&ovf_buf) orelse return false;
+                        if ((next == 0) != (k + 1 == pages)) return false;
+                        pid = next;
+                    }
+                }
             },
             @intFromEnum(format.NodeKind.branch) => {
                 const br = format.branchViewSafe(&buf) orelse return false;

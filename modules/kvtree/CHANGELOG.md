@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Overflow values: a value too large for a page (up to 2 GiB − 1) is stored in a
+  chain of overflow pages instead of failing with `error.EntryTooLarge`; `get` and cursors read
+  it, `getRef` returns `error.CannotLend` for it. Values that fit a page stay inline as before.
+  On-disk format 3, written only once a store holds such a value — a store that never does keeps
+  format 2 and still opens with older builds. Keys stay inline (`error.EntryTooLarge` for a key
+  that does not fit a page).
+
 - **2026-09-29** — Documented (and pinned by pagecache's interleaving tests): reads of the
   committed version (`get`, `getRef`, `snapshot`, `cursor`) are safe while a commit of the same
   `Db` is parked in its storage I/O on another fiber of the owner thread; a parked unpinned read

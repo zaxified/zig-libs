@@ -83,6 +83,25 @@ Single 4 KiB page unit (`format.zig`):
   Reserving after would let a commit overwrite a page its own base tree needs,
   a hole that only a crash between the two fsyncs would reveal.
 
+An **overflow page** holds part of a value too large for a leaf:
+`kind(1) = 2, 0(3), next(4)`, then up to 4088 value bytes; `next` is 0 on the
+last page. The leaf cell of such a value sets the top bit of its `val_len`
+(the low 31 bits are the value's length, so a value is at most 2 GiB − 1) and
+carries the first overflow page's id where the value would be. Only a cell
+that does not fit an otherwise-empty leaf goes this way, so every value that
+was inline before overflow existed still is, and `getRef` lends exactly what
+it lent before (an overflow value is `error.CannotLend`; `get` reads it). Keys
+stay inline: a key whose cell with a 4-byte reference does not fit a page is
+`error.EntryTooLarge`. A chain is written once, copy-on-write: a new or
+overwritten value gets a fresh chain from `allocPage`, the replaced or deleted
+value's chain goes to `ctx.freed` with the leaf, and a leaf rewritten for
+another key keeps the reference, sharing the chain between versions like an
+untouched subtree. `recover` walks every chain as it walks the tree (in bounds,
+kind byte 2, exactly the pages the length needs, the last one ending it).
+The meta's format version is 3 once the store has held an overflow value and 2
+otherwise (sticky): a store that never did still opens with an older build,
+and one that did is refused by it instead of misread.
+
 A **node** is a slotted page: an 8-byte header (kind, count, and — for a branch
 — the leftmost child), a `count`-entry directory of 2-byte cell offsets kept in
 ascending key order, then variable-length cells packed from the end of the page
@@ -231,8 +250,14 @@ freelist would be lost). Six schemata mutants of the change are all killed.
 
 ## Backlog / deferred (mechanical, orthogonal to the Fable core)
 
-- **Overflow pages** for keys/values larger than a page fits (today: rejected
-  with `error.EntryTooLarge`), mirroring `kv`'s large-value handling.
+- ~~**Overflow pages**~~ — DONE 2026-09-29 for values (see "On-disk layout"):
+  chains of overflow pages, format v3 only once used. Keys stay inline by
+  design (LMDB does the same): a separator is a copy of a key, and a branch that
+  had to chase overflow chains to route a lookup would pay a page read per
+  comparison. Tests: round trips at every size boundary, overwrite/delete
+  recycling with page accounting, a snapshot holding a replaced chain, a broken
+  chain (read → `Corrupt`, recovery refuses), `getRef` on both kinds, and the
+  crash sweep over commits that write, overwrite and free chains.
 - **Node merge / rebalance-by-borrow** on underflow (today: deletes remove the
   key in place — an underfull leaf stays as it is until written again, which
   wastes space but never corrupts; merging and borrowing from a fuller sibling
