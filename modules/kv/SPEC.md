@@ -191,6 +191,17 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
   `sync` (crash at/after the rename has no un-synced window), so recovery never depends on intra-file
   write ordering. No product-code change was required — the temp-then-atomic-rename discipline was
   already sound; the deliverable is the harness coverage that proves it.
+- **`Storage` has no directory listing** — GAP (2026-09-29, egw-hub `seglog`, audit finding L4).
+  The vtable can open, rename and delete a path, but cannot say which paths exist. `seglog`'s
+  `manifestRebuild` (`egw-hub/seglog/src/root.zig`, doc comment citing this request) therefore
+  takes the segment ids from its caller (an operator's `ls`, or `egw-hub`'s
+  `seglog_cli.manifestRebuild`) instead of discovering them. Wanted: an optional vtable slot in
+  the style of `preadRef` (`?*const fn` defaulting to `null` = "cannot list"), e.g.
+  `list(ctx, prefix, gpa) Error!?[][]u8` over the backend's own namespace — `FsStorage` via
+  `Dir.iterate`, `SimStorage`/VOPR over their file maps (so crash tests can see stray files).
+  Every file-system abstraction has it (`readdir`, Go `fs.ReadDirFS`, Rust `read_dir`). ⚠ Keep
+  it optional and never used by `open`/replay: a log that derived its files from names would
+  adopt any stray file that looked like one (the reason `seglog` keeps a `MANIFEST`).
 
 ## Status
 
