@@ -278,6 +278,17 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 
 ## Backlog / deferred
 
+- **`Provider` measures its JWKS intervals on the wall clock (found from qap, research register H6,
+  2026-09-29).** `Provider.verify(gpa, token, now_s, …)` uses one caller-supplied `now_s` for the
+  token's `exp`/`nbf` AND for `ttl_s` / `min_refresh_interval_s` (`src/root.zig` `fetched_at_s`,
+  `last_attempt_s`, `refreshAllowed`); `ResourceServer`/`Guard` feed it `Clock.system`
+  (`CLOCK_REALTIME`). After a backward step of Δ (NTP, a VM restored from a snapshot) neither the
+  TTL re-fetch nor the unknown-`kid` refresh can fire for Δ — a rotated key is a 401 for Δ. qap
+  hit the same bug in its own refresher and fixed it there (`src/auth_jwt.zig`: interval clock
+  `CLOCK_BOOTTIME` by default + rebase on a backward step); qap does not use `Provider`. Ideal
+  API: a second, interval clock on `Provider.Options` (default boot/monotonic) — or `verify`
+  taking `mono_s` beside `now_s` — with wall time used only for claims; and a `Clock.boot`
+  beside `Clock.system`.
 - **Mandatory audience/issuer + oct-from-network** were flagged as open decisions in the pre-public
   review — now **RESOLVED** (safe-by-default, 2026-07-09; see Threat model above). The repo-wide
   adversarial security pass (2026-07-10) confirmed the rest: const-time compare, alg-confusion
