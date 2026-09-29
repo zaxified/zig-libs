@@ -109,3 +109,16 @@ table.
 
 - A caller wanting to force the table path (benchmarks, bit-exact audits)
   uses `hashWith(.table, …)`; there is no global override.
+
+## Backlog / deferred
+
+- **Baseline x86_64 Debug build fails (found 2026-09-29 by qap's
+  `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
+  chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline
+  `pclmulqdq` is compiled for every x86_64 target; Zig 0.16's self-hosted
+  x86_64 backend (Debug) cannot encode it for a CPU model without `pclmul`
+  (`error(x86_64_encoder): no encoding found for: none pclmulqdq`). LLVM
+  builds are unaffected. Fix: compile the runtime-dispatched PCLMUL path only
+  where the backend can emit it (`builtin.zig_backend != .stage2_x86_64`, or
+  the target already has `pclmul`), else the table -- and add a Debug
+  `-Dtarget=x86_64-linux` build of the module to its checks.
