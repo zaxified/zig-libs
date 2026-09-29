@@ -688,12 +688,17 @@ var server = std.http.Server.init(
 
 After writing or modifying Zig code, verify with this sequence:
 1. `zig build` — catch compilation errors, match against Quick Fixes above
-2. `zig build test` — run unit tests
-3. `zig build -Doptimize=ReleaseFast test` — detect undefined behavior (UB checks enabled in optimized builds)
+2. `zig build test` — run unit tests (Debug; build test runs with LLVM, see below)
+3. Before a release: `zig build test -Doptimize=ReleaseSafe` and `-Doptimize=ReleaseFast` —
+   ReleaseSafe keeps the safety checks with the optimizer on; ReleaseFast turns them off and
+   shows bugs that exist only in optimized code (inlining, inline-asm constraints, reads of
+   `undefined`)
 
 **Development speed tips:**
 - `zig build --watch -fincremental` — incremental compilation, rebuilds on file change
-- 0.15.x uses self-hosted x86_64 backend by default — ~5x faster Debug builds than LLVM
+- Debug on x86_64 Linux uses the self-hosted backend: 2–6x faster to compile than LLVM, but
+  its code runs 2–3x slower. Use it for the edit loop and LLVM (`-fllvm`, `.use_llvm = true`)
+  for test runs — see [0.16 gotchas](references/zig-016-gotchas.md), "Two backends"
 
 ## Common Pitfalls
 

@@ -1,12 +1,12 @@
 {
   "repository": "https://github.com/zaxified/zig-skills",
-  "tag": "v0.16.0-r2",
-  "commit": "be65603a77b62795aa02a38b81192c280cadb09f",
-  "content_id": "fa9263ca904fac2618b12a79f9abb4159652157da46253b7eeb4b8309f617798",
+  "tag": "v0.16.0-r3",
+  "commit": "8ccc9ff6491171133f7e831aa5c52c986137b704",
+  "content_id": "59438162f0018414c47d9f22af083f80c803c8e6bbe45e4cf0864a9fed002a68",
   "files": [
     {
       "path": "SKILL.md",
-      "sha256": "ad95f1dba24b2981fc7f1df9a6c0dc5cb58e7f71a70ef5e9b8a92e71c6274782"
+      "sha256": "0b08965650e7d4b22d59e7666800eafbaeac78ce0f9f2d5942c37352fe9b3b1a"
     },
     {
       "path": "references/builtins.md",
@@ -250,7 +250,7 @@
     },
     {
       "path": "references/zig-016-gotchas.md",
-      "sha256": "df6e79b7e25f1ce313ae206a17886e2a7c9dae8ab788b7148a4be1fed1e13a80"
+      "sha256": "1b498bd0ecaf93b056d0c6fb76875370035136b30f9125c27b444e9904017b3e"
     }
   ]
 }
