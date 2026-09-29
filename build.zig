@@ -379,6 +379,7 @@ const module_list = [_]Module{
     .{ .name = "k256", .libs = &.{"crypto"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" } },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
+    .{ .name = "sha2", .libs = &.{"crypto"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
