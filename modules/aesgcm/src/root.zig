@@ -293,8 +293,14 @@ fn powersFor(ad_len: usize, m_len: usize) usize {
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 /// The x86-64 kernel can be compiled at all: an x86-64 target and a backend
-/// that passes vectors to inline assembly (the C backend does not).
-const x86_asm = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c;
+/// that passes vectors to inline assembly (the C backend does not) and can
+/// encode AES-NI, PCLMULQDQ and SSSE3 for it. Zig 0.16's self-hosted x86_64
+/// backend (the Debug default) encodes only what the target CPU model has,
+/// so there the kernel exists only when the target guarantees all three;
+/// LLVM assembles it for any x86_64 target.
+const x86_asm = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and
+    (builtin.zig_backend != .stage2_x86_64 or
+        (builtin.cpu.has(.x86, .aes) and builtin.cpu.has(.x86, .pclmul) and builtin.cpu.has(.x86, .ssse3)));
 
 /// 0 = not yet detected, else `@intFromEnum(Backend) + 1`. Detection is
 /// idempotent, so two threads racing to fill it store the same value.
@@ -1125,7 +1131,10 @@ test "every single-bit change of tag, ciphertext or AD is refused, and the outpu
 }
 
 test "the 32-bit counter wraps modulo 2^32 and leaves the nonce bits alone (inc32)" {
-    if (!available(.aesni)) return error.SkipZigTest;
+    // `x86_asm` first: comptime-false, it keeps the kernel below out of builds
+    // that cannot compile it (another arch, the self-hosted backend on a
+    // baseline CPU); `available` alone is a run-time check.
+    if (!x86_asm or !available(.aesni)) return error.SkipZigTest;
     // Not reachable through the API — a 96-bit nonce starts the counter at
     // 2 and the length bound stops it at 2^32 − 1 — so the kernel is driven
     // directly from counters just below the wrap, through a full stitched
@@ -1176,7 +1185,7 @@ test "the 32-bit counter wraps modulo 2^32 and leaves the nonce bits alone (inc3
 }
 
 test "the x86 key expansion and GHASH multiply agree with std" {
-    if (!available(.aesni)) return error.SkipZigTest;
+    if (!x86_asm or !available(.aesni)) return error.SkipZigTest; // `x86_asm`: see the inc32 test
     var prng = std.Random.DefaultPrng.init(4);
     const rnd = prng.random();
     for (0..50) |_| {
@@ -1224,7 +1233,7 @@ test "backend picks AES-NI when the CPU has it" {
     const b = backend();
     try testing.expect(available(b));
     try testing.expect(available(.generic));
-    if (builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c) {
+    if (x86_asm) {
         try testing.expectEqual(if (cpuidAesni()) Backend.aesni else Backend.generic, b);
     } else {
         try testing.expectEqual(Backend.generic, b);

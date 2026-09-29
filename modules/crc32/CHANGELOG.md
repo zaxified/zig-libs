@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
+  or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
+  backend cannot encode the run-time-dispatched PCLMULQDQ path for such a CPU. That build now uses
+  the table; LLVM builds and targets that have the instruction are unchanged. Found by qap's
+  portability check.
 - **2026-09-28** — New module: CRC-32 (IEEE 802.3 / gzip / zlib / PNG) with x86-64
   PCLMULQDQ folding and the ARMv8 `crc32x` instructions chosen at run time, and a
   slicing-by-8 fallback, against std's bytewise ~0.4 GB/s; `hash`, `extend`, `combine`,

@@ -36,7 +36,10 @@ without the conditioning; `extend(c, b) = ~reg(b, ~c)`.
 that backend is fixed at compile time. Otherwise the first call detects it —
 CPUID leaf 1 ECX bit 20 (Intel SDM vol. 2A, CPUID), or `getauxval(AT_HWCAP)`
 bit 7 `HWCAP_CRC32` on Linux arm64 — and caches it in one atomic byte.
-Detection is idempotent, so a race stores the same value twice. The last
+Detection is idempotent, so a race stores the same value twice. The
+self-hosted x86_64 backend (the Debug default) encodes only what the target
+CPU model has, so on a target without `sse4_2` that build has no SSE4.2 path
+and is the table (`sse42_emittable`; LLVM builds keep the run-time path). The last
 bytes go through the table because Zig 0.16's self-hosted x86 backend (Debug)
 cannot encode the byte-wide `crc32b` form.
 

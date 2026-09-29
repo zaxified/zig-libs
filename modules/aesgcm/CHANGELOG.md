@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
+  or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
+  backend cannot encode the run-time-dispatched AES-NI kernel for such a CPU. That build now uses
+  `.generic`; LLVM builds and targets that have the instruction are unchanged. Found by qap's
+  portability check.
 - **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** a ctgrind harness
   (`src/ctgrind_harness.zig`, a separate program, not part of the API)
   measures the constant-time claim: with key and plaintext tainted, the only

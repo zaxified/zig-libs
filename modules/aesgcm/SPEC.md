@@ -77,8 +77,10 @@ std's `aes_gcm` code path minus the key expansion and the `E(K, 0)`.
 **Dispatch**: `.aesni` is fixed at compile time when the target has `aes`,
 `pclmul` and `ssse3`; otherwise the first call reads CPUID leaf 1 ECX (AES bit
 25, PCLMULQDQ bit 1, SSSE3 bit 9) and caches the answer in an atomic byte
-(idempotent, so a race stores the same value). Not x86-64, or the C backend
-(which cannot pass vectors to inline assembly): `.generic`. arm64 is not
+(idempotent, so a race stores the same value). Not x86-64, the C backend
+(which cannot pass vectors to inline assembly), or the self-hosted x86_64
+backend (the Debug default, which encodes only what the target CPU model has)
+on a target lacking one of the three: `.generic`. arm64 is not
 detected at run time: std's primitives there are hardware exactly when the
 build target has `aes`, as for std itself.
 

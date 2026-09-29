@@ -105,7 +105,7 @@ pub fn backend() Backend {
 pub fn available(b: Backend) bool {
     return switch (b) {
         .table => true,
-        .sse42 => builtin.cpu.arch == .x86_64 and ((comptime staticBackend() == .sse42) or cpuidSse42()),
+        .sse42 => sse42_emittable and ((comptime staticBackend() == .sse42) or cpuidSse42()),
         .armv8 => builtin.cpu.arch == .aarch64 and ((comptime staticBackend() == .armv8) or hwcapCrc32()),
     };
 }
@@ -123,11 +123,19 @@ pub fn hashWith(b: Backend, bytes: []const u8) ?u32 {
 /// idempotent, so two threads racing to fill it store the same value.
 var detected: std.atomic.Value(u8) = .init(0);
 
+/// The SSE4.2 `crc32` instruction can be compiled at all. Zig 0.16's
+/// self-hosted x86_64 backend (the Debug default) encodes only what the
+/// target CPU model has, so there the run-time-dispatched path exists only
+/// when the target guarantees SSE4.2 anyway; LLVM assembles it for any
+/// x86_64 target.
+const sse42_emittable = builtin.cpu.arch == .x86_64 and
+    (builtin.zig_backend != .stage2_x86_64 or std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2));
+
 /// The backend the build target guarantees, when it guarantees one.
 fn staticBackend() ?Backend {
     const cpu = builtin.cpu;
     return switch (cpu.arch) {
-        .x86_64 => if (std.Target.x86.featureSetHas(cpu.features, .sse4_2)) .sse42 else null,
+        .x86_64 => if (std.Target.x86.featureSetHas(cpu.features, .sse4_2)) .sse42 else if (sse42_emittable) null else .table,
         .aarch64 => if (std.Target.aarch64.featureSetHas(cpu.features, .crc)) .armv8 else null,
         else => .table,
     };
@@ -135,7 +143,7 @@ fn staticBackend() ?Backend {
 
 fn detect() Backend {
     return switch (builtin.cpu.arch) {
-        .x86_64 => if (cpuidSse42()) .sse42 else .table,
+        .x86_64 => if (sse42_emittable and cpuidSse42()) .sse42 else .table,
         .aarch64 => if (hwcapCrc32()) .armv8 else .table,
         else => .table,
     };
@@ -169,7 +177,7 @@ fn hwcapCrc32() bool {
 fn raw(b: Backend, reg: u32, bytes: []const u8) u32 {
     return switch (b) {
         .table => tableUpdate(reg, bytes),
-        .sse42 => if (builtin.cpu.arch == .x86_64) threeWay(X86, reg, bytes) else unreachable,
+        .sse42 => if (sse42_emittable) threeWay(X86, reg, bytes) else unreachable,
         .armv8 => if (builtin.cpu.arch == .aarch64) threeWay(Arm, reg, bytes) else unreachable,
     };
 }
@@ -362,7 +370,9 @@ test "published vectors: the CRC catalogue check value and RFC 3720 B.4" {
             ran += 1;
         }
     }
-    try testing.expect(ran >= 2 * cases.len); // the table and this CPU's hardware
+    // The table and this CPU's hardware, when this build can contain a hardware path.
+    const paths: usize = if (sse42_emittable or builtin.cpu.arch == .aarch64) 2 else 1;
+    try testing.expect(ran >= paths * cases.len);
     for (cases) |c| try testing.expectEqual(c[1], hash(c[0]));
 }
 
@@ -400,15 +410,15 @@ test "every backend agrees with std's implementation at every length and alignme
     }
     // On the machines this suite runs on (x86-64 with SSE4.2, arm64 with CRC)
     // a hardware path exists, and a suite that never took it proves nothing
-    // about it.
-    if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) try testing.expect(hw_checked);
+    // about it — unless this build cannot contain one.
+    if (sse42_emittable or builtin.cpu.arch == .aarch64) try testing.expect(hw_checked);
 }
 
 test "backend picks the hardware when the CPU has it" {
     const b = backend();
     try testing.expect(available(b));
     switch (builtin.cpu.arch) {
-        .x86_64 => try testing.expectEqual(if (cpuidSse42()) Backend.sse42 else Backend.table, b),
+        .x86_64 => try testing.expectEqual(if (sse42_emittable and cpuidSse42()) Backend.sse42 else Backend.table, b),
         .aarch64 => try testing.expectEqual(if (available(.armv8)) Backend.armv8 else Backend.table, b),
         else => try testing.expectEqual(Backend.table, b),
     }

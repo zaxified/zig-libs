@@ -51,7 +51,10 @@ conditioning; `extend(c, b) = ~reg(b, ~c)`.
 that backend is fixed at compile time. Otherwise the first call detects it —
 CPUID leaf 1 ECX bit 1 (PCLMULQDQ), or `getauxval(AT_HWCAP)` bit 7
 `HWCAP_CRC32` on Linux arm64 — and caches it in one atomic byte (a race
-stores the same value twice). Zig 0.16 has no per-function target features,
+stores the same value twice). The exception is the self-hosted x86_64
+backend (the Debug default) on a target without `pclmul`: it encodes only
+what the target CPU model has, so that build has no PCLMUL path and is the
+table (`pclmul_emittable`; LLVM builds keep the run-time path). Zig 0.16 has no per-function target features,
 so every hardware instruction is inline assembly. On x86-64 each
 `pclmulqdq` is its own asm statement with register operands only: the
 self-hosted x86 backend (the Debug default) rejects an SSE memory operand
@@ -112,6 +115,13 @@ table.
 
 ## Backlog / deferred
 
+- ~~**Baseline x86_64 Debug build fails**~~ — **FIXED 2026-09-29** (the
+  PCLMUL path exists only where the backend can emit it, see *Dispatch*;
+  crc32c's SSE4.2 path and aesgcm's AES-NI kernel had the same defect and the
+  same fix). The check half is still open: no gate builds a module for a
+  baseline x86_64 target under the self-hosted backend, so the class can come
+  back unnoticed. Measured 2026-09-29 over the 13 modules with inline asm: only
+  these three failed. Was:
 - **Baseline x86_64 Debug build fails (found 2026-09-29 by qap's
   `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
   chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline

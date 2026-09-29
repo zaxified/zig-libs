@@ -113,7 +113,7 @@ pub fn available(b: Backend) bool {
         .table => true,
         // `backend()` picks the hardware whenever the CPU has it, and caches
         // the detection (CPUID is slow, and a VM exit under a hypervisor).
-        .pclmul => builtin.cpu.arch == .x86_64 and backend() == .pclmul,
+        .pclmul => pclmul_emittable and backend() == .pclmul,
         .armv8 => builtin.cpu.arch == .aarch64 and backend() == .armv8,
     };
 }
@@ -131,11 +131,18 @@ pub fn hashWith(b: Backend, bytes: []const u8) ?u32 {
 /// idempotent, so two threads racing to fill it store the same value.
 var detected: std.atomic.Value(u8) = .init(0);
 
+/// `pclmulqdq` can be compiled at all. Zig 0.16's self-hosted x86_64 backend
+/// (the Debug default) encodes only what the target CPU model has, so there
+/// the run-time-dispatched path exists only when the target guarantees
+/// PCLMULQDQ anyway; LLVM assembles it for any x86_64 target.
+const pclmul_emittable = builtin.cpu.arch == .x86_64 and
+    (builtin.zig_backend != .stage2_x86_64 or std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul));
+
 /// The backend the build target guarantees, when it guarantees one.
 fn staticBackend() ?Backend {
     const cpu = builtin.cpu;
     return switch (cpu.arch) {
-        .x86_64 => if (std.Target.x86.featureSetHas(cpu.features, .pclmul)) .pclmul else null,
+        .x86_64 => if (std.Target.x86.featureSetHas(cpu.features, .pclmul)) .pclmul else if (pclmul_emittable) null else .table,
         .aarch64 => if (std.Target.aarch64.featureSetHas(cpu.features, .crc)) .armv8 else null,
         else => .table,
     };
@@ -143,7 +150,7 @@ fn staticBackend() ?Backend {
 
 fn detect() Backend {
     return switch (builtin.cpu.arch) {
-        .x86_64 => if (cpuidPclmul()) .pclmul else .table,
+        .x86_64 => if (pclmul_emittable and cpuidPclmul()) .pclmul else .table,
         .aarch64 => if (hwcapCrc32()) .armv8 else .table,
         else => .table,
     };
@@ -177,7 +184,7 @@ fn hwcapCrc32() bool {
 fn raw(b: Backend, reg: u32, bytes: []const u8) u32 {
     return switch (b) {
         .table => tableUpdate(reg, bytes),
-        .pclmul => if (builtin.cpu.arch == .x86_64) pclmulUpdate(reg, bytes) else unreachable,
+        .pclmul => if (pclmul_emittable) pclmulUpdate(reg, bytes) else unreachable,
         .armv8 => if (builtin.cpu.arch == .aarch64) threeWay(reg, bytes) else unreachable,
     };
 }
@@ -578,15 +585,15 @@ test "every backend agrees with std's implementation at every length and alignme
     }
     // On the machines this suite runs on (x86-64 with PCLMULQDQ, arm64 with
     // CRC) a hardware path exists, and a suite that never took it proves
-    // nothing about it.
-    if (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) try testing.expect(hw_checked);
+    // nothing about it — unless this build cannot contain one.
+    if (pclmul_emittable or builtin.cpu.arch == .aarch64) try testing.expect(hw_checked);
 }
 
 test "backend picks the hardware when the CPU has it" {
     const b = backend();
     try testing.expect(available(b));
     switch (builtin.cpu.arch) {
-        .x86_64 => try testing.expectEqual(if (cpuidPclmul()) Backend.pclmul else Backend.table, b),
+        .x86_64 => try testing.expectEqual(if (pclmul_emittable and cpuidPclmul()) Backend.pclmul else Backend.table, b),
         .aarch64 => try testing.expectEqual(if (available(.armv8)) Backend.armv8 else Backend.table, b),
         else => try testing.expectEqual(Backend.table, b),
     }
