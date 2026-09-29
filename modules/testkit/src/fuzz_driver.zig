@@ -176,7 +176,7 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
     }
     const limit_ms = if (env(&kb, opts.prefix, "_MS")) |m| try std.fmt.parseInt(u64, m, 10) else opts.default_limit_ms;
 
-    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init; // global-alloc-ok: the driver's own leak detector around each harness run, called only from `test` blocks
     const gpa = da.allocator();
     defer if (da.deinit() == .leak) @panic("fuzz driver: leak");
 
