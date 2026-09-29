@@ -23,6 +23,7 @@
 //! primitives against external anchors.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const group = @import("group.zig");
 const scalarmod = @import("scalar.zig");
 
@@ -232,7 +233,7 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
         // `Scalar.fromBytes` rejects `>= n`, which is exactly RFC 6979's
         // "discard and re-derive" condition; zero is discarded too.
         if (Scalar.fromBytes(v, .big)) |cand| {
-            if (!cand.isZero()) return cand;
+            if (!cand.isZero() and !test_retry.take()) return cand;
         } else |_| {}
         var buf2: [32 + 1]u8 = undefined;
         buf2[0..32].* = v;
@@ -242,6 +243,24 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
         mac.mac(&v, &v);
     }
 }
+
+/// Test builds only: discard this many candidates as if they were `>= n`, to
+/// reach RFC 6979's re-derive step (3.2 h.3: `K = HMAC_K(V || 0x00)`), which a
+/// real P-256 key hits with probability ~2^-32 per candidate -- no random test
+/// ever gets there, and a K that stops being re-keyed there went unnoticed
+/// (mutant, 2026-09-29). Outside tests `take` is a constant false.
+const test_retry = if (builtin.is_test) struct {
+    var reject: u32 = 0;
+    fn take() bool {
+        if (reject == 0) return false;
+        reject -= 1;
+        return true;
+    }
+} else struct {
+    inline fn take() bool {
+        return false;
+    }
+};
 
 /// HMAC-SHA-256 under one fixed 32-byte key with the key schedule done once:
 /// the two SHA-256 states that have absorbed `K ^ ipad` and `K ^ opad` are kept
@@ -436,7 +455,7 @@ fn rfc6979NonceOld(privkey: [32]u8, hash32: [32]u8) Scalar {
     while (true) {
         HmacSha256.create(&v, &v, &k);
         if (Scalar.fromBytes(v, .big)) |cand| {
-            if (!cand.isZero()) return cand;
+            if (!cand.isZero() and !test_retry.take()) return cand;
         } else |_| {}
         var buf2: [32 + 1]u8 = undefined;
         buf2[0..32].* = v;
@@ -503,6 +522,28 @@ test "rfc6979Nonce equals the previous implementation (random keys and hashes)" 
         const want = rfc6979NonceOld(x, h).toBytes(.big);
         const got = rfc6979Nonce(x, h).toBytes(.big);
         try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "rfc6979Nonce: the re-derive step (forced) equals the previous implementation" {
+    defer test_retry.reject = 0;
+    var prng = std.Random.DefaultPrng.init(0x6979_0003);
+    const rnd = prng.random();
+    for (0..200) |i| {
+        var x: [32]u8 = undefined;
+        var h: [32]u8 = undefined;
+        rnd.bytes(&x);
+        rnd.bytes(&h);
+        const rejects: u32 = @intCast(1 + i % 3);
+        test_retry.reject = 0;
+        const first = rfc6979Nonce(x, h).toBytes(.big);
+        test_retry.reject = rejects;
+        const want = rfc6979NonceOld(x, h).toBytes(.big);
+        test_retry.reject = rejects;
+        const got = rfc6979Nonce(x, h).toBytes(.big);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+        // The retry really ran: a different nonce than the first candidate.
+        try std.testing.expect(!std.mem.eql(u8, &first, &got));
     }
 }
 
