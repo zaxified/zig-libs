@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Contract: fiber-reentrant on one thread. With an inner `Storage` that
+  parks the calling fiber on I/O, a second fiber reading the page whose fill was in flight got
+  a HIT on the unfilled slot (`preadRef` reserves before it reads) -- and a kvtree commit
+  reading its base tree that way would write a corrupt tree. Fixed in ramcache (unfilled
+  reservations are a miss); pinned here by tests that interleave a reader and a commit at
+  every storage call, both directions. Found for qap's research register H4.
+
 - **2026-09-03** — Drift re-audit. **The per-handle "pages ever touched" side
   table is gone**; `vClose` now sweeps the resident set by key prefix
   (`ramcache.removeMatching`). The table had two structural defects. It grew

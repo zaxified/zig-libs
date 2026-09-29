@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — Documented (and pinned by pagecache's interleaving tests): reads of the
+  committed version (`get`, `getRef`, `snapshot`, `cursor`) are safe while a commit of the same
+  `Db` is parked in its storage I/O on another fiber of the owner thread; a parked unpinned read
+  must end before the next commit begins. What qap's `Serial` needs to serve reads while a
+  commit's fsync is in flight (research register H4).
+
 - **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** the meta-page CRC-32 comes from the new
   `crc32` module instead of `std.hash.Crc32` — the same values, so the on-disk format is
   unchanged. New dependency: `crc32`.

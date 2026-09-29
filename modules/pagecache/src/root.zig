@@ -45,6 +45,17 @@
 //! one-hit pages cannot flush the hot set — exactly the hot-cold tiering this
 //! module is for. See SPEC.md for the full design and the write-back
 //! rejection argument.
+//!
+//! **Fiber-reentrant on one thread.** Single-owner means one thread, not one
+//! call at a time: when the inner `Storage` parks the calling fiber on its
+//! I/O (qap's io_uring owner ring does), another fiber on the same thread may
+//! call in meanwhile. Every inner call is made with the cache in a state a
+//! second caller may see: a write reaches media before the cache is touched,
+//! and a page being read into its slot is a miss for everyone else until it
+//! is filled (ramcache hides unfilled reservations) -- so the second caller
+//! reads it for itself and never sees the unfilled bytes. Found and pinned
+//! for qap's research register H4 (2026-09-29): a kvtree reader and a commit
+//! interleaved at every storage call, both directions.
 
 const std = @import("std");
 const kvtree = @import("kvtree");
@@ -1267,6 +1278,278 @@ test "a write that FAILS never leaves the cache holding bytes media does not hav
     try testing.expectEqualSlices(u8, &raw, &buf); // cached == media, torn or not
     try testing.expectEqual(@as(u8, 0x22), buf[0]); // and it really is torn
     try testing.expectEqual(@as(u8, 0x11), buf[default_page_size - 1]);
+}
+
+/// An inner `Storage` whose `pread` first runs `hook` once -- what another
+/// fiber on the same thread does while the reading fiber is parked on its
+/// disk read (qap's `Serial` owner ring suspends exactly there). The hook
+/// re-enters the SAME `PageCache`, so the test sees every cache state that a
+/// read in flight leaves visible.
+const YieldStorage = struct {
+    inner: Storage,
+    hook: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    hook_ctx: *anyopaque = undefined,
+    hook_err: ?anyerror = null,
+    /// false: the hook runs once, on the next `pread`. true: on EVERY
+    /// `pread`, `writeAll` and `sync` -- each a point where a fiber parks --
+    /// except the ones the hook itself makes.
+    every: bool = false,
+    in_hook: bool = false,
+    fired: usize = 0,
+
+    fn cast(ctx: *anyopaque) *YieldStorage {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn park(self: *YieldStorage) void {
+        const hk = self.hook orelse return;
+        if (self.in_hook) return;
+        if (!self.every) self.hook = null;
+        self.in_hook = true;
+        defer self.in_hook = false;
+        self.fired += 1;
+        hk(self.hook_ctx) catch |e| {
+            if (self.hook_err == null) self.hook_err = e;
+        };
+    }
+    fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
+        const self = cast(ctx);
+        self.park();
+        return self.inner.pread(h, buf, off);
+    }
+    fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
+        return cast(ctx).inner.open(path, mode);
+    }
+    fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+        return cast(ctx).inner.size(h);
+    }
+    fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
+        const self = cast(ctx);
+        if (self.every) self.park();
+        return self.inner.writeAll(h, bytes, off);
+    }
+    fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        const self = cast(ctx);
+        if (self.every) self.park();
+        return self.inner.sync(h);
+    }
+    fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
+        return cast(ctx).inner.truncate(h, len);
+    }
+    fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
+        cast(ctx).inner.close(h);
+    }
+    fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
+        return cast(ctx).inner.rename(old_path, new_path);
+    }
+    fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
+        return cast(ctx).inner.delete(path);
+    }
+    fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
+        return cast(ctx).inner.syncDir();
+    }
+    fn vTryLock(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
+    }
+    const vtable = Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLock,
+    };
+    fn storage(self: *YieldStorage) Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+test "fiber-reentrant: a read of a page whose fill is in flight gets the page, never the unfilled slot" {
+    // qap research register H4 (2026-09-29): `preadRef`'s miss reserves the
+    // cache slot and then reads into it. A reader that suspends in that read
+    // (a fiber) lets a second one in; before ramcache hid unfilled entries,
+    // the second one got a HIT on the uninitialized slot -- and a kvtree
+    // commit reading its base tree that way writes a corrupt tree.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var ys = YieldStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, ys.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    @memset(page, 0x5C);
+    const h = try st.open("f", .create_truncate);
+    // Written straight to media, so the first read of it is a miss.
+    try sim.storage().writeAll(h, page, 0);
+
+    const Second = struct {
+        pc: *PageCache,
+        h: Storage.Handle,
+        want: []const u8,
+        fn run(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The zero-copy path, then the copying one, for the same page.
+            const got = (try self.pc.preadRef(self.h, default_page_size, 0)) orelse return error.NotLent;
+            defer self.pc.releasePage(got);
+            if (!std.mem.eql(u8, got.bytes, self.want)) return error.ServedTheUnfilledSlot;
+            var buf: [default_page_size]u8 = undefined;
+            _ = try self.pc.storage().pread(self.h, &buf, 0);
+            if (!std.mem.eql(u8, &buf, self.want)) return error.ServedTheUnfilledSlot;
+        }
+    };
+    var second: Second = .{ .pc = &pc, .h = h, .want = page };
+
+    // First reader: the borrow path, parked mid-fill.
+    ys.hook = Second.run;
+    ys.hook_ctx = &second;
+    const first = (try pc.preadRef(h, default_page_size, 0)) orelse return error.NotLent;
+    try testing.expect(ys.hook_err == null);
+    try testing.expectEqualSlices(u8, page, first.bytes);
+    pc.releasePage(first);
+
+    // First reader on the copying path, same shape, a fresh cache state.
+    pc.cache.clear();
+    ys.hook = Second.run;
+    ys.hook_ctx = &second;
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expect(ys.hook_err == null);
+    try testing.expectEqualSlices(u8, page, &buf);
+
+    // What is left resident is the page, and nothing is still borrowed.
+    const after = (try pc.preadRef(h, default_page_size, 0)).?;
+    try testing.expectEqualSlices(u8, page, after.bytes);
+    pc.releasePage(after);
+    try testing.expectEqual(@as(usize, 0), pc.cache.stats.pinned);
+    st.close(h);
+}
+
+test "fiber-reentrant: kvtree reads the committed version at every point a commit parks" {
+    // The contract qap's `Serial` relies on to serve reads while a commit's
+    // fsync is in flight (research register H4): with the Db's commit parked
+    // in ANY of its storage calls -- a base-page read, a page write, either
+    // fsync -- a second fiber on the same thread may read, and reads the last
+    // committed version. Cold cache, so both sides fill pages as they go.
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var ys = YieldStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, ys.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    var db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer db.close();
+
+    const n = 300;
+    var kbuf: [32]u8 = undefined;
+    var vbuf: [48]u8 = undefined;
+    {
+        var txn = try db.begin();
+        for (0..n) |i| {
+            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            try txn.put(key, try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}));
+        }
+        try txn.commit();
+    }
+
+    const Reader = struct {
+        db: *kvtree.Db,
+        /// The committed version of the even keys; odd keys stay "old".
+        even: []const u8,
+        next: usize = 0,
+        fn run(ctx: *anyopaque) anyerror!void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            // A few keys per park, walking the whole key space over the commit.
+            for (0..3) |_| {
+                const i = r.next % n;
+                r.next += 37;
+                var kb: [32]u8 = undefined;
+                var wb: [48]u8 = undefined;
+                const key = try std.fmt.bufPrint(&kb, "key{d:0>5}", .{i});
+                const ver = if (i % 2 == 0) r.even else "old";
+                const want = try std.fmt.bufPrint(&wb, "{s}-{d}", .{ ver, i });
+                var got = (try r.db.getRef(key)) orelse return error.KeyMissing;
+                defer got.release();
+                if (!std.mem.eql(u8, got.bytes, want)) return error.SawAnUncommittedOrCorruptValue;
+            }
+        }
+    };
+    var reader: Reader = .{ .db = &db, .even = "old" };
+
+    for (0..2) |round| {
+        pc.cache.clear(); // cold: the commit and the reader both miss
+        var txn = try db.begin();
+        const ver = if (round == 0) "new" else "newer";
+        for (0..n) |i| {
+            if (i % 2 == 1) continue; // half the keys, so base pages are shared
+            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            try txn.put(key, try std.fmt.bufPrint(&vbuf, "{s}-{d}", .{ ver, i }));
+        }
+        ys.hook = Reader.run;
+        ys.hook_ctx = &reader;
+        ys.every = true;
+        ys.fired = 0;
+        // What is committed while this commit runs: the previous round's.
+        reader.even = if (round == 0) "old" else "new";
+        try txn.commit();
+        ys.hook = null;
+        try testing.expect(ys.hook_err == null);
+        try testing.expect(ys.fired >= 4); // base reads, writes, both fsyncs
+
+        // And after it, the new version.
+        for (0..n) |i| {
+            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            var got = (try db.getRef(key)).?;
+            defer got.release();
+            const want = if (i % 2 == 1) try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}) else try std.fmt.bufPrint(&vbuf, "{s}-{d}", .{ ver, i });
+            try testing.expectEqualSlices(u8, want, got.bytes);
+        }
+    }
+
+    // The other direction, the one that corrupted: the READER parks mid-fill
+    // (its first read is the root page) and a whole commit runs meanwhile,
+    // reading that same root as its base. Before ramcache hid unfilled
+    // entries the commit's base read was a HIT on the unfilled slot.
+    const Committer = struct {
+        db: *kvtree.Db,
+        fn run(ctx: *anyopaque) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            var txn = try c.db.begin();
+            var kb: [32]u8 = undefined;
+            for (0..n) |i| {
+                if (i % 3 != 0) continue;
+                try txn.put(try std.fmt.bufPrint(&kb, "key{d:0>5}", .{i}), "third");
+            }
+            try txn.commit();
+        }
+    };
+    var committer: Committer = .{ .db = &db };
+    pc.cache.clear();
+    ys.every = false;
+    ys.hook = Committer.run;
+    ys.hook_ctx = &committer;
+    {
+        // key00001: odd, not a multiple of 3 -- "old" before and after.
+        var got = (try db.getRef("key00001")).?;
+        defer got.release();
+        try testing.expectEqualStrings("old-1", got.bytes);
+    }
+    try testing.expect(ys.hook_err == null);
+    for (0..n) |i| {
+        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        var got = (try db.getRef(key)).?;
+        defer got.release();
+        const want = if (i % 3 == 0) "third" else if (i % 2 == 1) try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}) else try std.fmt.bufPrint(&vbuf, "newer-{d}", .{i});
+        try testing.expectEqualSlices(u8, want, got.bytes);
+    }
+    try testing.expectEqual(@as(usize, 0), pc.cache.stats.pinned);
 }
 
 test "a page that is not fully present is never cached, however many times it is read" {

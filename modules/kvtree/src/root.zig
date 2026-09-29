@@ -292,6 +292,18 @@ pub const Db = struct {
     /// deliberately no silent fall-back to `get`: the caller chose this call
     /// to avoid the copy and the allocation, and a fall-back would make
     /// "did it?" unanswerable -- the same rule `preadRef` itself keeps.
+    ///
+    /// **During a commit.** `get`, `getRef`, `snapshot` and `cursor` may be
+    /// called while a `Txn.commit` of this `Db` is parked in its storage I/O
+    /// -- another fiber on the owner thread, over a `Storage` that suspends
+    /// (for `pagecache`, see its "fiber-reentrant" note). They read the last
+    /// committed version: `meta_rec` changes only when the commit returns,
+    /// and a commit writes only pages the committed tree does not reach. One
+    /// rule for the caller: a `get`/`getRef` that is itself parked must end
+    /// before the NEXT commit begins. That commit may recycle the pages the
+    /// one before it freed, which are this read's tree; a `snapshot` or
+    /// `cursor` pins its version and is exempt. qap's `Serial` keeps the rule
+    /// by running such reads on the owner fiber, which starts every commit.
     pub fn getRef(self: *Db, key: []const u8) GetRefError!?ValueRef {
         if (!self.pager.store.canLend()) return error.CannotLend;
         return lookupRef(&self.pager, self.meta_rec.root, key);

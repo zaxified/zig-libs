@@ -249,19 +249,11 @@ nanoseconds; against a real `read(2)` both are noise.
 
 ## Backlog / non-goals
 
-- **Not fiber-reentrant: a reserved page is visible before it is filled (found from qap H4,
-  2026-09-29).** `preadRef`'s miss path does `cache.reserve(key)` → `inner.pread` into the slot →
-  `cache.commit`. `ramcache.reserve` makes the entry visible to `get`/`pin` at once, with
-  UNINITIALIZED bytes ("fill it before returning to code that could read it"). With an inner
-  `Storage` whose I/O suspends the calling fiber (qap's `Serial` owner ring does exactly that), a
-  second fiber on the same thread that reads the same page during that `pread` gets a HIT on
-  garbage -- and if that fiber is a kvtree commit reading a base page, it writes a corrupt tree.
-  Unreachable today: every consumer drives the cache from one fiber. It blocks the obvious fix for
-  qap H4 (serve reads on a second owner fiber while the commit's fsync is in flight). Ideal: a
-  reserved-but-unfilled entry is a miss for `get`/`pin` (ramcache: `filled == false` → invisible,
-  or a `reserveHidden`), so a concurrent reader falls back to its own `pread`; then state the
-  contract as "fiber-reentrant on one thread" in the module doc and test it with a `Storage` whose
-  `pread` yields to a second reader mid-fill.
+- ~~Not fiber-reentrant: a reserved page is visible before it is filled~~ -- **fixed 2026-09-29**
+  (qap H4): ramcache now treats an unfilled reservation as a miss for `get`/`pin`/`drainDirty`; the
+  module doc states the contract ("fiber-reentrant on one thread") and two tests interleave a
+  second caller at every inner call (`YieldStorage`), including a kvtree commit running while a
+  reader is parked mid-fill of the root page.
 - **Narrowing the remaining `clear()`s.** `close` is narrow (by key prefix);
   `truncate` still clears every open file's pages although only the truncated
   handle's are affected — `removeMatching` would narrow it the same way. Not
