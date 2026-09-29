@@ -8,6 +8,9 @@ const std = @import("std");
 // part of the published module graph. `netaddr` is http's only dependency
 // (see the root build.zig's module_list) — wired here the same way, by path.
 pub fn build(b: *std.Build) void {
+    // LLVM unless -Dselfhosted: the self-hosted backend is for the edit loop only.
+    const selfhosted = b.option(bool, "selfhosted", "Use Zig's self-hosted backend in Debug (edit loop only)") orelse false;
+    const use_llvm: ?bool = if (selfhosted) null else true;
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -61,6 +64,7 @@ pub fn build(b: *std.Build) void {
         });
         root_mod.addImport("http", http_mod);
         const exe = b.addExecutable(.{
+            .use_llvm = use_llvm,
             .name = "probe_" ++ which,
             .root_module = root_mod,
             .linkage = .static,
@@ -83,6 +87,7 @@ pub fn build(b: *std.Build) void {
         syms_mod.addImport("http", http_mod);
         syms_mod.strip = false;
         const syms_exe = b.addExecutable(.{
+            .use_llvm = use_llvm,
             .name = "probe_" ++ which ++ "_syms",
             .root_module = syms_mod,
             .linkage = .static,

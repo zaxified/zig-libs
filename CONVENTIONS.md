@@ -466,9 +466,9 @@ reference, not a re-explanation of everything the README already covers.
    rather than the total, which is exactly the bug that let `ratelimit` report `18/18 passed`
    with 3 tests dark. See `scripts/lib/dark-tests.sh`'s header for why this must ask the compiler
    instead of matching source statically.
-4. `zig build test-<name>` (per module) and `zig build test` (all) — green in **all three
-   release lanes**: `-Doptimize=ReleaseSafe`, `-Doptimize=ReleaseFast`, `-Dstrict-debug`
-   (§7.1 says what each one proves that the others cannot); `zig fmt --check
+4. `zig build test-<name>` (per module) and `zig build test` (all) — green in **both
+   release lanes**: `-Doptimize=ReleaseSafe` and `-Doptimize=ReleaseFast`
+   (§7.1 says what each one proves that the other cannot); `zig fmt --check
    modules/<name>` clean.
 
    > **Install the commit-time formatting guard once per clone:**
@@ -605,8 +605,7 @@ lane proves something the others cannot:
 
 | Lane | What it proves |
 |------|----------------|
-| default (Debug, heavy modules at `ReleaseSafe`) | correctness with every safety check armed, fast enough to run on each change |
-| `-Dstrict-debug` | **compile only, no tests run.** That the collection *builds* in real Debug, heavy modules included — the default lane relaxes those to `ReleaseSafe` for wall-clock, so nothing else compiles them in Debug at all. It is a live question because an integrator developing against these modules builds them in Debug even though nobody ships that way. Running the tests here was measured (2026-08-15) to prove nothing the `ReleaseSafe` lane does not: Debug arms the same safety checks and merely skips optimisation, which makes it *weaker* at exposing UB; tests that run only in Debug: **0**; tests that skip in Debug: **15**, so the lane returned 48/63 where its siblings returned 63/63. If a Debug-only test is ever written, this lane has to go back to running them — that count is how you would notice |
+| default (Debug with LLVM, heavy modules at `ReleaseSafe`) | correctness with every safety check armed, fast enough to run on each change (CI push lane). Every compile step uses LLVM unless `-Dselfhosted`; the self-hosted backend is for the edit loop only and no lane uses it (2026-09-29, which also dropped the compile-only `-Dstrict-debug` lane: after the switch it compiled nothing the push lane does not) |
 | `-Doptimize=ReleaseFast` | the code is free of undefined behaviour that the safety checks would otherwise mask, and of anything that only holds because of them |
 | `-Doptimize=ReleaseSafe` | the combination the other two never form — optimisations *and* safety checks armed. Not a formality: it is the lane that caught the only real defect of 2026-08-12 (a use-after-scope) while Debug and ReleaseFast both passed it by luck (`f88a102`). Integrators build in all three, so all three must pass |
 
@@ -831,7 +830,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
-  tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`, `-Dstrict-debug` —
+  tests green in both release lanes — `ReleaseSafe` and `ReleaseFast` —
   plus oracle/KAT verification where one exists). What varies
   is *scope*: anything unfinished or unverified is stated as an explicit caveat in the
   module's README-catalog row and SPEC (e.g. dnp3's "Secure Authentication scaffolded only",

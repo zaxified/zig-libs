@@ -15,10 +15,14 @@ const std = @import("std");
 //   zig build run                         # default paths
 //   zig build run -- <out.zig> <zoneinfo> # explicit
 pub fn build(b: *std.Build) void {
+    // LLVM unless -Dselfhosted: the self-hosted backend is for the edit loop only.
+    const selfhosted = b.option(bool, "selfhosted", "Use Zig's self-hosted backend in Debug (edit loop only)") orelse false;
+    const use_llvm: ?bool = if (selfhosted) null else true;
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
+        .use_llvm = use_llvm,
         .name = "tz-gen",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),

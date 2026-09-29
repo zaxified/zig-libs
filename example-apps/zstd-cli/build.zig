@@ -3,6 +3,9 @@ const std = @import("std");
 // A consumer's build.zig, written the way a consumer writes one: zig-libs is a
 // package dependency, and the zstd module is taken from it by name.
 pub fn build(b: *std.Build) void {
+    // LLVM unless -Dselfhosted: the self-hosted backend is for the edit loop only.
+    const selfhosted = b.option(bool, "selfhosted", "Use Zig's self-hosted backend in Debug (edit loop only)") orelse false;
+    const use_llvm: ?bool = if (selfhosted) null else true;
     const target = b.standardTargetOptions(.{});
     // ReleaseFast by default: this is a compression tool, and the byte-exact
     // frames do not depend on the mode. `-Doptimize=ReleaseSafe` keeps every
@@ -17,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const zstd = zig_libs.module("zstd");
 
     const exe = b.addExecutable(.{
+        .use_llvm = use_llvm,
         .name = "zstd",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -33,6 +37,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Build and run (pass args after --, e.g. -- -19 file)").dependOn(&run.step);
 
     const tests = b.addTest(.{
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

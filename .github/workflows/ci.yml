@@ -57,7 +57,6 @@ on:
           - modules ReleaseSafe amd64
           - modules ReleaseFast amd64
           - modules ReleaseSafe arm64
-          - compile-only strict Debug amd64
           - examples ReleaseSafe amd64
           - examples ReleaseFast amd64
           - examples ReleaseSafe arm64
@@ -185,8 +184,9 @@ concurrency:
 #
 # THE LANES THEMSELVES are deliberate. Compute-heavy modules build at ReleaseSafe
 # when Debug is requested (see `heavy` in build.zig — it takes `bls12_381`, the
-# suite's critical path, from minutes to seconds). `-Dstrict-debug` forces it back, keeping
-# CONVENTIONS §6.4's "green in Debug and ReleaseFast" honest. Integrators build
+# suite's critical path, from minutes to seconds). The compile-only `-Dstrict-debug`
+# lane was dropped on 2026-09-29: every compile step now uses LLVM (`-Dselfhosted`
+# is for the edit loop only), so it compiled nothing the push lane does not. Integrators build
 # in all three release modes; ReleaseSafe was the only one no lane covered — and
 # it earned its place on 2026-08-12 by being the only lane that caught a
 # use-after-scope in http's response path that every other lane passed by luck
@@ -266,7 +266,10 @@ jobs:
     # every module in the shard: a cold run of ~75 modules. Since 2026-09-18 a
     # DRIVER change (test.sh, scripts/lib, scripts/checks) re-keys nothing and
     # runs the smoke set instead; see cmd_changed.
-    timeout-minutes: 75
+    # 90, not 75, since 2026-09-29: the default mode compiles with LLVM now (not
+    # the self-hosted backend), 2-6x more compile time per module, and a
+    # re-keying push is ~75 modules cold per shard.
+    timeout-minutes: 90
     # ⭐ THREE SHARDS, like the full lanes (2026-09-18). On an ordinary push each
     # shard finds most of its modules stamped and is minutes, so the split
     # costs two runner start-ups. It is there for the push that re-keys
@@ -602,22 +605,6 @@ jobs:
           lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
           lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
           lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
-          # ⚠ `build`, NOT `modules` — this lane COMPILES every module and every
-          # example in real Debug and RUNS NOTHING, and that is the whole claim
-          # it can support. Nobody consumes this collection in Debug: it ships
-          # source, and the mode is the integrator's decision. What is worth
-          # asking of Debug is that the code compiles there, which is a live
-          # question, because an integrator developing against these modules
-          # does build them in Debug -- heavy ones included, and this is the only
-          # lane that ever compiles those in real Debug at all.
-          #
-          # Running the tests here proved nothing measurable. Debug and
-          # ReleaseSafe arm the same safety checks; Debug merely does not
-          # optimise, which makes it weaker at exposing UB, and the one
-          # documented cross-mode catch went the other way. Tests that run only
-          # in Debug: zero. Tests that SKIP in Debug: fifteen. See `cmd_build`
-          # in scripts/test.sh.
-          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":30,"skip_live":""}')
           # BOTH release modes run the examples, and that is deliberate: the two
           # catch different classes and both are documented here. ReleaseFast is
           # where `qrscan`'s uninitialised perspective terms showed (Debug and

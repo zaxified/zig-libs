@@ -404,6 +404,20 @@ pub fn build(b: *std.Build) void {
     const heavy_optimize: std.builtin.OptimizeMode =
         if (optimize == .Debug and !strict_debug) .ReleaseSafe else optimize;
 
+    // Every compile step uses LLVM unless `-Dselfhosted` asks otherwise. The
+    // self-hosted x86_64 backend (Zig 0.16's Debug default on x86_64 Linux)
+    // compiles 2-6x faster but its code runs 2-3x slower, and its encoder
+    // accepts only instructions the target CPU model has, so a Debug build of
+    // a runtime-dispatched asm path fails for a baseline CPU (crc32, crc32c,
+    // aesgcm, 2026-09-29). It is for the edit loop only; no gate or CI lane
+    // uses it. `use_llvm = true` is a no-op in the release modes.
+    const selfhosted = b.option(
+        bool,
+        "selfhosted",
+        "Use Zig's self-hosted backend in Debug (edit loop only; no gate uses it)",
+    ) orelse false;
+    const use_llvm: ?bool = if (selfhosted) null else true;
+
     // `-Dtest-filter=<substring>` — compile only the tests whose name contains
     // one of these. Added for `scripts/fuzz-sweep.sh`: `--fuzz` puts every fuzz
     // test of a module in ONE process, so the first harness to crash takes the
@@ -552,6 +566,7 @@ pub fn build(b: *std.Build) void {
         const unit_tests = b.addTest(.{
             .name = m.name,
             .root_module = test_root,
+            .use_llvm = use_llvm,
             .filters = test_filters,
         });
         const run = b.addRunArtifact(unit_tests);
@@ -617,6 +632,7 @@ pub fn build(b: *std.Build) void {
             const interop_exe = b.addExecutable(.{
                 .name = b.fmt("interop-{s}", .{m.name}),
                 .root_module = interop_mod,
+                .use_llvm = use_llvm,
             });
             const interop_run = b.addRunArtifact(interop_exe);
             if (b.args) |args| interop_run.addArgs(args);
@@ -653,6 +669,7 @@ pub fn build(b: *std.Build) void {
             const live_exe = b.addExecutable(.{
                 .name = b.fmt("live-{s}", .{m.name}),
                 .root_module = live_mod,
+                .use_llvm = use_llvm,
             });
             const live_run = b.addRunArtifact(live_exe);
             if (b.args) |args| live_run.addArgs(args);
@@ -699,6 +716,7 @@ pub fn build(b: *std.Build) void {
         const force_tests = b.addTest(.{
             .name = b.fmt("force-{s}", .{m.name}),
             .root_module = force_mod,
+            .use_llvm = use_llvm,
         });
         if (in_group) check_pubfn_reach.dependOn(&force_tests.step);
 
@@ -778,6 +796,7 @@ pub fn build(b: *std.Build) void {
             const example = b.addExecutable(.{
                 .name = b.fmt("example-{s}", .{m.name}),
                 .root_module = example_mod,
+                .use_llvm = use_llvm,
             });
             if (in_group) check_examples.dependOn(&example.step);
             // Per-module entry point, so one example can be compiled on its
@@ -976,7 +995,7 @@ pub fn build(b: *std.Build) void {
                 for (m.test_deps) |dep| t.addImport(dep, cross_mods[ti].get(dep).?);
                 break :blk t;
             };
-            const cross_test = b.addTest(.{ .name = step_name, .root_module = test_root });
+            const cross_test = b.addTest(.{ .name = step_name, .root_module = test_root, .use_llvm = use_llvm });
             const one = b.step(
                 step_name,
                 b.fmt("Compile {s}'s tests and public surface for {s} (true status, not baseline-checked)", .{ m.name, ct.label() }),
@@ -1010,6 +1029,7 @@ pub fn build(b: *std.Build) void {
             const cross_force = b.addTest(.{
                 .name = b.fmt("force-{s}", .{step_name}),
                 .root_module = cross_force_mod,
+                .use_llvm = use_llvm,
             });
             one.dependOn(&cross_force.step);
 
@@ -1200,7 +1220,7 @@ pub fn build(b: *std.Build) void {
         });
         // Exactly what a consumer gets: the published module and nothing else.
         probe.addImport(m.name, mods.get(m.name).?);
-        const obj = b.addObject(.{ .name = b.fmt("testonly-{s}", .{m.name}), .root_module = probe });
+        const obj = b.addObject(.{ .name = b.fmt("testonly-{s}", .{m.name}), .root_module = probe, .use_llvm = use_llvm });
         testonly.dependOn(&obj.step);
     }
     test_step.dependOn(testonly);
@@ -1519,7 +1539,7 @@ pub fn build(b: *std.Build) void {
                 .strip = false,
             });
             for (deps) |dep| hmod.addImport(dep, mods.get(dep).?);
-            const exe = b.addExecutable(.{ .name = b.fmt("ctgrind-{s}", .{name}), .root_module = hmod });
+            const exe = b.addExecutable(.{ .name = b.fmt("ctgrind-{s}", .{name}), .root_module = hmod, .use_llvm = use_llvm });
             const inst = b.addInstallArtifact(exe, .{
                 .dest_dir = .{ .override = .{ .custom = "ctgrind" } },
             });
@@ -1571,7 +1591,7 @@ pub fn build(b: *std.Build) void {
             .valgrind = true,
         });
         for (deps) |dep| cmod.addImport(dep, mods.get(dep).?);
-        const cexe = b.addExecutable(.{ .name = b.fmt("check-ctgrind-{s}", .{name}), .root_module = cmod });
+        const cexe = b.addExecutable(.{ .name = b.fmt("check-ctgrind-{s}", .{name}), .root_module = cmod, .use_llvm = use_llvm });
         check_ctgrind.dependOn(&cexe.step);
     }
     test_step.dependOn(check_ctgrind);
@@ -5769,7 +5789,7 @@ fn renderPortableTable(
             "Every one of the {d} modules above claims `.linux64` (Linux, amd64 or arm64) — the " ++
             "collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually " ++
             "**run**, not merely compiled: the CI matrix executes every module's tests in " ++
-            "`ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That " ++
+            "`ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That " ++
             "claim is not repeated below for all {d} modules — a linux64-only module has nothing " ++
             "further to show here.\n\n" ++
             "{d} of them additionally claim a cross-compile target in `meta.targets` " ++

@@ -484,14 +484,12 @@ and a lane that runs nothing exits **1**, not 0.
 Compute-heavy modules (pairings, hash-based signatures, FHE, scrypt, RSA) build
 at ReleaseSafe when Debug is requested — same safety checks, a fraction of the
 wall clock, since they are the suite's critical path. `-Dstrict-debug` forces
-real Debug.
+real Debug (no CI lane uses it since 2026-09-29).
 
-CI runs three lanes off this one command — default, `-Dstrict-debug` and
-`-Doptimize=ReleaseFast` — as separate jobs, so the slow one does not gate the
-fast one. The strict-debug lane is not optional bookkeeping: without it the
-plain lane no longer proves anything about real Debug for the heavy modules,
-and CONVENTIONS §6.4's "green in Debug and ReleaseFast" would quietly stop
-meaning what it says.
+Every compile step uses the LLVM backend unless `-Dselfhosted` is passed; the
+self-hosted backend is for the edit loop only and no lane uses it. CI runs the
+push lane (`changed`, default mode) on every push and the `ReleaseSafe` and
+`ReleaseFast` full lanes on a tag or `workflow_dispatch`.
 
 ## Privileged tests
 

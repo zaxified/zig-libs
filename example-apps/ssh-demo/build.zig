@@ -4,6 +4,9 @@ const std = @import("std");
 // package dependency, and `ssh` is taken from it by name. Nothing here reaches
 // into the collection's own build — that is the point of this directory.
 pub fn build(b: *std.Build) void {
+    // LLVM unless -Dselfhosted: the self-hosted backend is for the edit loop only.
+    const selfhosted = b.option(bool, "selfhosted", "Use Zig's self-hosted backend in Debug (edit loop only)") orelse false;
+    const use_llvm: ?bool = if (selfhosted) null else true;
     const target = b.standardTargetOptions(.{});
     // ReleaseSafe by default. Every safety check stays on, which is what you
     // want from a network-facing binary; `-Doptimize=ReleaseFast` if you have
@@ -26,6 +29,7 @@ pub fn build(b: *std.Build) void {
     const zig_libs = b.dependency("zig_libs", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
+        .use_llvm = use_llvm,
         .name = "ssh-demo",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
