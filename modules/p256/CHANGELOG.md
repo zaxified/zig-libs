@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **Performance: the RFC 6979 nonce derivation keys HMAC-SHA-256 once per K.**
+  `ecdsaSignDeterministic`'s DRBG called `HmacSha256.create` for every step, re-absorbing the
+  key's inner and outer pads each time although K changes only twice per nonce. A private
+  `KeyedHmac` keeps the two SHA-256 states after `K ^ ipad` / `K ^ opad` and clones them per
+  message (2 compressions for a short message instead of 4). For the usual first-candidate nonce
+  that is 22 -> 18 compressions. No API change; the nonce and the signature bytes are identical
+  (kept-as-oracle copy of the old function, 3000 random key/hash pairs, plus the RFC 6979 A.2.5
+  `k` values for "sample" and "test"). No key-dependent branch or index added: pad derivation and
+  absorption are data-independent; the module's existing rejection loop is unchanged.
+
 - **2026-09-28** — **Performance: ECDSA sign 97 → 29 µs, verify 261 → 128 µs
   (std's generic `EcdsaP256Sha256.verify` over this group 413 → 125 µs)**, same
   core, interleaved before/after, ReleaseFast. No API removed or changed; three

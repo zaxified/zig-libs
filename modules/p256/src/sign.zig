@@ -214,18 +214,21 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
     buf[32] = 0x00;
     buf[33..65].* = privkey;
     buf[65..97].* = h1;
-    HmacSha256.create(&k, &buf, &k);
-    HmacSha256.create(&v, &v, &k);
+    var mac = KeyedHmac.init(&k);
+    mac.mac(&k, &buf);
+    mac = KeyedHmac.init(&k);
+    mac.mac(&v, &v);
 
     buf[0..32].* = v;
     buf[32] = 0x01;
     buf[33..65].* = privkey;
     buf[65..97].* = h1;
-    HmacSha256.create(&k, &buf, &k);
-    HmacSha256.create(&v, &v, &k);
+    mac.mac(&k, &buf);
+    mac = KeyedHmac.init(&k);
+    mac.mac(&v, &v);
 
     while (true) {
-        HmacSha256.create(&v, &v, &k);
+        mac.mac(&v, &v);
         // `Scalar.fromBytes` rejects `>= n`, which is exactly RFC 6979's
         // "discard and re-derive" condition; zero is discarded too.
         if (Scalar.fromBytes(v, .big)) |cand| {
@@ -234,10 +237,50 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
         var buf2: [32 + 1]u8 = undefined;
         buf2[0..32].* = v;
         buf2[32] = 0x00;
-        HmacSha256.create(&k, &buf2, &k);
-        HmacSha256.create(&v, &v, &k);
+        mac.mac(&k, &buf2);
+        mac = KeyedHmac.init(&k);
+        mac.mac(&v, &v);
     }
 }
+
+/// HMAC-SHA-256 under one fixed 32-byte key with the key schedule done once:
+/// the two SHA-256 states that have absorbed `K ^ ipad` and `K ^ opad` are kept
+/// and cloned per message, so a MAC costs 2 compressions for a short message
+/// instead of `HmacSha256.create`'s 4 (which re-absorbs both pads every call).
+/// The RFC 6979 DRBG changes K only twice per nonce, but calls `HMAC_K(V)`
+/// several times under the same K. Byte-identical to `HmacSha256.create` (the
+/// differential test below). Constant-time: pad derivation and absorption
+/// are data-independent, no branch or index depends on the key bytes.
+const KeyedHmac = struct {
+    inner: Sha256,
+    outer: Sha256,
+
+    fn init(key: *const [32]u8) KeyedHmac {
+        var ipad: [Sha256.block_length]u8 = @splat(0x36);
+        var opad: [Sha256.block_length]u8 = @splat(0x5c);
+        for (key, 0..) |kb, i| {
+            ipad[i] ^= kb;
+            opad[i] ^= kb;
+        }
+        var self: KeyedHmac = .{ .inner = Sha256.init(.{}), .outer = Sha256.init(.{}) };
+        self.inner.update(&ipad);
+        self.outer.update(&opad);
+        std.crypto.secureZero(u8, &ipad);
+        std.crypto.secureZero(u8, &opad);
+        return self;
+    }
+
+    /// `out = HMAC_K(msg)`; `out` may alias `msg` (the digest is written last).
+    fn mac(self: *const KeyedHmac, out: *[32]u8, msg: []const u8) void {
+        var h = self.inner;
+        h.update(msg);
+        var d: [32]u8 = undefined;
+        h.final(&d);
+        var o = self.outer;
+        o.update(&d);
+        o.final(out);
+    }
+};
 
 /// Sign `SHA-256(msg)` with the RFC 6979 deterministic nonce — no entropy
 /// source, and the same message under the same key always yields the same
@@ -363,4 +406,119 @@ test "EcdsaP256Sha256 cross-verifies with std both directions" {
     // std-signed ⇒ verifies under p256.
     const sig_std = try std_kp.sign(msg, null);
     try EcdsaP256Sha256.Signature.fromBytes(sig_std.toBytes()).verify(msg, kp.public_key);
+}
+
+// ── KeyedHmac / rfc6979Nonce: differential against the previous code ────────
+
+/// The implementation before `KeyedHmac`: one `HmacSha256.create` per step,
+/// re-absorbing both key pads every time. Kept only as the test oracle.
+fn rfc6979NonceOld(privkey: [32]u8, hash32: [32]u8) Scalar {
+    const h1 = reduceToScalar(hash32).toBytes(.big);
+
+    var v: [32]u8 = [_]u8{0x01} ** 32;
+    var k: [32]u8 = [_]u8{0x00} ** 32;
+
+    var buf: [32 + 1 + 32 + 32]u8 = undefined;
+    buf[0..32].* = v;
+    buf[32] = 0x00;
+    buf[33..65].* = privkey;
+    buf[65..97].* = h1;
+    HmacSha256.create(&k, &buf, &k);
+    HmacSha256.create(&v, &v, &k);
+
+    buf[0..32].* = v;
+    buf[32] = 0x01;
+    buf[33..65].* = privkey;
+    buf[65..97].* = h1;
+    HmacSha256.create(&k, &buf, &k);
+    HmacSha256.create(&v, &v, &k);
+
+    while (true) {
+        HmacSha256.create(&v, &v, &k);
+        if (Scalar.fromBytes(v, .big)) |cand| {
+            if (!cand.isZero()) return cand;
+        } else |_| {}
+        var buf2: [32 + 1]u8 = undefined;
+        buf2[0..32].* = v;
+        buf2[32] = 0x00;
+        HmacSha256.create(&k, &buf2, &k);
+        HmacSha256.create(&v, &v, &k);
+    }
+}
+
+fn hex32(s: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
+test "rfc6979Nonce: RFC 6979 A.2.5 P-256/SHA-256 k for \"sample\" and \"test\"" {
+    const x = hex32("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+    const cases = [_]struct { msg: []const u8, k: []const u8 }{
+        .{ .msg = "sample", .k = "A6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60" },
+        .{ .msg = "test", .k = "D16B6AE827F17175E040871A1C7EC3500192C4C92677336EC2537ACAEE0008E0" },
+    };
+    for (cases) |c| {
+        var h: [32]u8 = undefined;
+        Sha256.hash(c.msg, &h, .{});
+        const k = rfc6979Nonce(x, h);
+        try std.testing.expectEqualSlices(u8, &hex32(c.k), &k.toBytes(.big));
+    }
+}
+
+test "KeyedHmac is byte-identical to HmacSha256.create (random keys, lengths 0..200)" {
+    var prng = std.Random.DefaultPrng.init(0x6979_0001);
+    const rnd = prng.random();
+    var msg: [200]u8 = undefined;
+    for (0..2000) |_| {
+        var key: [32]u8 = undefined;
+        rnd.bytes(&key);
+        rnd.bytes(&msg);
+        const len = rnd.uintAtMost(usize, msg.len);
+        var want: [32]u8 = undefined;
+        HmacSha256.create(&want, msg[0..len], &key);
+        const km = KeyedHmac.init(&key);
+        var got: [32]u8 = undefined;
+        km.mac(&got, msg[0..len]);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+        // Reusable: a second message under the same schedule.
+        HmacSha256.create(&want, msg[0 .. len / 2], &key);
+        km.mac(&got, msg[0 .. len / 2]);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "rfc6979Nonce equals the previous implementation (random keys and hashes)" {
+    var prng = std.Random.DefaultPrng.init(0x6979_0002);
+    const rnd = prng.random();
+    for (0..3000) |i| {
+        var x: [32]u8 = undefined;
+        var h: [32]u8 = undefined;
+        rnd.bytes(&x);
+        rnd.bytes(&h);
+        // Edge inputs: all-zero and all-ones hashes / keys now and then.
+        if (i % 500 == 1) @memset(&h, 0);
+        if (i % 500 == 2) @memset(&h, 0xff);
+        if (i % 500 == 3) @memset(&x, 0xff);
+        const want = rfc6979NonceOld(x, h).toBytes(.big);
+        const got = rfc6979Nonce(x, h).toBytes(.big);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "ecdsaSignDeterministic: signature bytes unchanged vs the old nonce" {
+    var prng = std.Random.DefaultPrng.init(0x6979_0003);
+    const rnd = prng.random();
+    var msg: [64]u8 = undefined;
+    for (0..200) |_| {
+        var sk: [32]u8 = undefined;
+        rnd.bytes(&sk);
+        rnd.bytes(&msg);
+        const m = msg[0..rnd.uintAtMost(usize, msg.len)];
+        const sig = ecdsaSignDeterministic(sk, m) catch continue; // sk >= n: not a key
+        var h: [32]u8 = undefined;
+        Sha256.hash(m, &h, .{});
+        const old_sig = try ecdsaSign(sk, m, rfc6979NonceOld(sk, h).toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &old_sig, &sig);
+    }
 }
