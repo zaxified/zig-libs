@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **h2 DATA of 2 KiB or more is written to the connection's writer uncopied.**
+  New `h2.Connection.writeData(w, stream_id, data, end_stream)`: `sendData`'s checks, frame
+  split and flow-control/state accounting (one shared implementation), with each frame written
+  to a `std.Io.Writer` as its 9-octet header followed by the caller's own slice instead of being
+  appended to a list. `h2_server` uses it for a DATA payload of `direct_data_min` (2 KiB) or
+  more, after spilling the staged `wire` into the writer in the same critical section, so frame
+  order is unchanged; smaller payloads are staged as before. Frames on the wire are identical;
+  what changes is one `memcpy` of the payload fewer (the copy into `wire`), and over a buffered
+  TLS writer the payload now reaches the record body from the handler's bytes directly.
+
 - **2026-09-29** — **h2 decodes a gzip request body, as h1 does.** `h2_server.Options` gained
   `max_decompressed_request_bytes` and `verify_inbound_trailer` (same meaning as on
   `Server.Options`, which `connMain` now forwards to h2c): a `Content-Encoding: gzip` (or

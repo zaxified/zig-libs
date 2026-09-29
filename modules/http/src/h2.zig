@@ -771,7 +771,9 @@ pub const Event = union(enum) {
 ///
 /// Sending: `sendPreface` first, then `startStream`/`sendHeaders`/
 /// `sendData`/... — each appends wire bytes to the caller's `out` list and
-/// keeps stream states + flow-control windows in step.
+/// keeps stream states + flow-control windows in step. `writeData` is the
+/// one exception: DATA written straight to a `std.Io.Writer`, payload
+/// uncopied, for a caller that has already put its staged list there.
 pub const Connection = struct {
     gpa: Allocator,
     role: Role,
@@ -1065,6 +1067,75 @@ pub const Connection = struct {
         data: []const u8,
         end_stream: bool,
     ) SendError!void {
+        return c.dataFrames(ListSink, .{ .gpa = c.gpa, .out = out }, stream_id, data, end_stream);
+    }
+
+    pub const WriteDataError = SendError || std.Io.Writer.Error;
+
+    /// `sendData` straight into a writer: the same checks, frame split and
+    /// flow-control/state accounting, the same frames on the wire -- but
+    /// each frame is written to `w` as its 9-octet header followed by the
+    /// caller's own slice of `data`, which is never copied into a list
+    /// first. For a large payload over a buffered socket or TLS writer that
+    /// is one copy fewer: the bytes go from `data` to the writer's sink.
+    ///
+    /// Ordering is the caller's: anything it staged with the list-based
+    /// `send*` calls must reach `w` before this, or the frames go out of
+    /// order. On `WindowExhausted`/`InvalidStream`/`StreamNotWritable`
+    /// nothing is written. On `WriteFailed` a frame may be partly written
+    /// and the windows are not charged: the connection's byte stream is
+    /// broken and it must not be used further.
+    pub fn writeData(
+        c: *Connection,
+        w: *std.Io.Writer,
+        stream_id: u31,
+        data: []const u8,
+        end_stream: bool,
+    ) WriteDataError!void {
+        return c.dataFrames(WriterSink, .{ .w = w }, stream_id, data, end_stream);
+    }
+
+    /// Where `dataFrames` puts each frame: appended to a list (`sendData`).
+    const ListSink = struct {
+        gpa: Allocator,
+        out: *std.ArrayList(u8),
+
+        const SinkError = Allocator.Error;
+
+        fn frame(s: ListSink, stream_id: u31, chunk: []const u8, end_stream: bool) SinkError!void {
+            try encodeData(s.gpa, s.out, stream_id, chunk, .{ .end_stream = end_stream });
+        }
+    };
+
+    /// ...or written, header then payload, to a writer (`writeData`).
+    const WriterSink = struct {
+        w: *std.Io.Writer,
+
+        const SinkError = std.Io.Writer.Error;
+
+        fn frame(s: WriterSink, stream_id: u31, chunk: []const u8, end_stream: bool) SinkError!void {
+            const h: FrameHeader = .{
+                .length = @intCast(chunk.len),
+                .frame_type = .data,
+                .flags = if (end_stream) Flags.end_stream else 0,
+                .stream_id = stream_id,
+            };
+            try s.w.writeAll(&h.encode());
+            try s.w.writeAll(chunk);
+        }
+    };
+
+    /// The one implementation behind `sendData` and `writeData`: validate,
+    /// split per the peer's SETTINGS_MAX_FRAME_SIZE, hand each frame to
+    /// `sink`, then charge both windows and move the stream state.
+    fn dataFrames(
+        c: *Connection,
+        comptime Sink: type,
+        sink: Sink,
+        stream_id: u31,
+        data: []const u8,
+        end_stream: bool,
+    ) (SendError || Sink.SinkError)!void {
         const st = c.streams.getPtr(stream_id) orelse
             return if (c.everExisted(stream_id))
                 error.StreamNotWritable // closed and retired
@@ -1084,7 +1155,7 @@ pub const Connection = struct {
             const chunk = data[off..][0..n];
             off += n;
             const last = off == data.len;
-            try encodeData(c.gpa, out, stream_id, chunk, .{ .end_stream = end_stream and last });
+            try sink.frame(stream_id, chunk, end_stream and last);
             if (last) break;
         }
         c.conn_send_window -= len;
@@ -2641,6 +2712,149 @@ test "connection: send-side guards — windows, states, stream ids" {
     const sid2 = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, true);
     try testing.expectEqual(@as(u31, 3), sid2);
     try testing.expectEqual(StreamState.half_closed_local, client.stream(sid2).?.state);
+}
+
+/// Drive `sendData` on `a` and `writeData` on `b` -- two connections in the
+/// same state -- with the same call, and require the same outcome, the same
+/// bytes and the same state afterwards.
+fn expectSameData(a: *Connection, b: *Connection, sid: u31, data: []const u8, end_stream: bool) !void {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    const listed = a.sendData(&list, sid, data, end_stream);
+    const written = b.writeData(&aw.writer, sid, data, end_stream);
+    if (listed) |_| try written else |err| try testing.expectError(err, written);
+
+    try testing.expectEqualSlices(u8, list.items, aw.written());
+    try testing.expectEqual(a.conn_send_window, b.conn_send_window);
+    try testing.expectEqual(a.data_sent_since_window_update, b.data_sent_since_window_update);
+    const sa = a.stream(sid);
+    const sb = b.stream(sid);
+    try testing.expectEqual(sa == null, sb == null);
+    if (sa) |s| {
+        try testing.expectEqual(s.state, sb.?.state);
+        try testing.expectEqual(s.send_window, sb.?.send_window);
+    }
+}
+
+test "connection: writeData puts the same frames on the wire as sendData, and fails the same way" {
+    const gpa = testing.allocator;
+    var a = try testServer();
+    defer a.deinit();
+    var b = try testServer();
+    defer b.deinit();
+
+    // One request stream on each (HEADERS + END_STREAM: half-closed remote,
+    // which is where a server's DATA goes), and the response head.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    for ([_]*Connection{ &a, &b }) |c| {
+        try c.recv(wire.items, &out, &events);
+        clearEvents(&events);
+        try c.sendHeaders(&out, 1, &.{.{ .name = ":status", .value = "200" }}, false);
+        // Test-only: a 100-octet frame limit (a real peer cannot advertise
+        // less than 16384) and a stingy 250-octet stream window, so splits
+        // and refusals happen on small inputs.
+        c.remote_settings.max_frame_size = 100;
+        c.streams.getPtr(1).?.send_window = 250;
+    }
+
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*p, i| p.* = @truncate(i *% 7 +% 3);
+
+    try expectSameData(&a, &b, 1, "", false); // an empty DATA frame
+    try expectSameData(&a, &b, 1, payload[0..230], false); // 100 + 100 + 30
+    try expectSameData(&a, &b, 1, payload[0..21], false); // 20 left: WindowExhausted, nothing sent
+    try testing.expectEqual(@as(i64, 20), a.stream(1).?.send_window);
+    try expectSameData(&a, &b, 1, payload[0..20], false); // exactly the window
+    try expectSameData(&a, &b, 1, payload[0..1], false); // window 0: refused
+    try testing.expectEqual(@as(i64, 0), b.stream(1).?.send_window);
+
+    // Credit arrives; the rest goes with END_STREAM on the last frame only,
+    // and the stream is retired on both.
+    for ([_]*Connection{ &a, &b }) |c| c.streams.getPtr(1).?.send_window += 400;
+    try expectSameData(&a, &b, 1, &payload, true); // 100 + 100 + 100, END_STREAM
+    try testing.expect(!b.streams.contains(1)); // retired: `stream` reports it .closed
+    try testing.expectEqual(StreamState.closed, b.stream(1).?.state);
+    try expectSameData(&a, &b, 1, payload[0..1], false); // closed: StreamNotWritable
+    try expectSameData(&a, &b, 99, payload[0..1], false); // never existed: InvalidStream
+}
+
+test "connection: writeData hands the writer the caller's slice, not a copy of it" {
+    // The point of `writeData`: the payload reaches the writer's `drain` as
+    // the caller's own memory. A writer with a buffer too small for a frame
+    // shows it -- every payload octet has to arrive as a `data` slice.
+    const Spy = struct {
+        interface: std.Io.Writer,
+        sink: std.ArrayList(u8) = .empty,
+        watch: []const u8,
+        direct: usize = 0,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const s: *@This() = @fieldParentPtr("interface", w);
+            s.sink.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+            w.end = 0;
+            var n: usize = 0;
+            for (data, 0..) |d, i| {
+                const times = if (i == data.len - 1) splat else 1;
+                for (0..times) |_| {
+                    s.sink.appendSlice(testing.allocator, d) catch return error.WriteFailed;
+                    n += d.len;
+                }
+                const lo = @intFromPtr(s.watch.ptr);
+                if (@intFromPtr(d.ptr) >= lo and @intFromPtr(d.ptr) < lo + s.watch.len) s.direct += d.len;
+            }
+            return n;
+        }
+    };
+
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    try conn.recv(wire.items, &out, &events);
+
+    const payload = try gpa.alloc(u8, 40_000); // 16384 + 16384 + 7232
+    defer gpa.free(payload);
+    @memset(payload, 'P');
+    var buf: [16]u8 = undefined;
+    var spy: Spy = .{
+        .interface = .{ .vtable = &.{ .drain = Spy.drain }, .buffer = &buf },
+        .watch = payload,
+    };
+    defer spy.sink.deinit(gpa);
+    try conn.writeData(&spy.interface, 1, payload, true);
+    try spy.interface.flush();
+
+    try testing.expectEqual(payload.len, spy.direct);
+    // Three frames, 9 header octets each, the payload unchanged between them.
+    try testing.expectEqual(payload.len + 3 * frame_header_len, spy.sink.items.len);
+    var off: usize = 0;
+    var got: usize = 0;
+    while (off < spy.sink.items.len) {
+        const h = FrameHeader.decode(spy.sink.items[off..][0..frame_header_len]);
+        try testing.expectEqual(FrameType.data, h.frame_type);
+        off += frame_header_len;
+        try testing.expect(std.mem.allEqual(u8, spy.sink.items[off..][0..h.length], 'P'));
+        off += h.length;
+        got += h.length;
+        try testing.expectEqual(off == spy.sink.items.len, h.flags & Flags.end_stream != 0);
+    }
+    try testing.expectEqual(payload.len, got);
 }
 
 // ── DoS-hardening tests (CVE-2023-44487, CVE-2024-27316, flood guards) ──────

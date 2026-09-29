@@ -353,8 +353,8 @@ pub const Detached = struct {
             if (s.conn.stream(id) == null) return error.StreamGone;
             return error.WouldBlock;
         }
-        s.conn.sendData(&s.wire, id, bytes, false) catch |err| switch (err) {
-            error.OutOfMemory => return error.Overloaded,
+        s.sendDataFrames(id, bytes, false) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => return error.Overloaded,
             error.WindowExhausted => return error.WouldBlock,
             else => return error.StreamGone,
         };
@@ -751,7 +751,8 @@ const Session = struct {
     /// module's idiom (`h2_upstream.lockBlocking`, `Client.lockSpin`). No
     /// new synchronisation primitive is invented here.
     ///
-    /// **Held across a socket write** (`flushWire`), on purpose: staging a
+    /// **Held across a socket write** (`flushWire`, and the direct DATA
+    /// write in `sendDataFrames`, which spills `wire` first), on purpose: staging a
     /// frame and putting it on the wire in one section is what keeps the
     /// HPACK dynamic table in step with the bytes the peer actually sees
     /// (invariant 1), and it makes `wire` FIFO for every producer
@@ -1084,6 +1085,40 @@ const Session = struct {
         if (s.wire.items.len == 0) return;
         try s.out.writeAll(s.wire.items);
         s.wire.clearRetainingCapacity();
+    }
+
+    /// The smallest DATA payload `sendDataFrames` writes straight to `out`
+    /// instead of staging in `wire`. Below it the second copy (`wire` into
+    /// `out`) costs less than the extra writer calls and the frame header
+    /// travelling on its own, and a small response keeps leaving in the one
+    /// staged block with its HEADERS; above it the copy is what dominates --
+    /// a bulk response over TLS was spending a sixth of its time in
+    /// `memcpy`, most of it here.
+    const direct_data_min = 2 * 1024;
+
+    /// DATA on stream `id`, flow control already checked by the caller:
+    /// small payloads staged in `wire` like every other frame, large ones
+    /// written to `out` without the copy (`h2.Connection.writeData`).
+    /// **Caller holds `mu`**, and follows with `stageWire` as after any
+    /// other staged frame.
+    ///
+    /// **Invariant 2 across two buffers.** The bypass is only FIFO because
+    /// `wire` is spilled into `out` first, in the same critical section:
+    /// whatever was staged before this frame (its stream's HEADERS, a PING
+    /// ACK, another stream's DATA) reaches `out` before it, and nothing can
+    /// be staged between the spill and the write. `writeData` refuses
+    /// (window, stream state) before writing anything, so a refusal after
+    /// the spill has only moved bytes one buffer along, not reordered them.
+    fn sendDataFrames(
+        s: *Session,
+        id: u31,
+        bytes: []const u8,
+        end_stream: bool,
+    ) h2.Connection.WriteDataError!void {
+        if (bytes.len < direct_data_min)
+            return s.conn.sendData(&s.wire, id, bytes, end_stream);
+        try s.spillWire();
+        try s.conn.writeData(s.out, id, bytes, end_stream);
     }
 
     /// Flush staged wire bytes through the (timeout-guarded) socket writer.
@@ -2424,9 +2459,9 @@ const Framer = struct {
                 if (win <= 0) break :blk .wait;
                 n = @min(body.len - off, @as(usize, @intCast(win)));
                 const last = end_stream and off + n == body.len;
-                s.conn.sendData(&s.wire, f.id, body[off..][0..n], last) catch |err|
+                s.sendDataFrames(f.id, body[off..][0..n], last) catch |err|
                     switch (err) {
-                        error.OutOfMemory => break :blk .dead_close,
+                        error.OutOfMemory, error.WriteFailed => break :blk .dead_close,
                         // Raced a SETTINGS window shrink applied meanwhile.
                         error.WindowExhausted => break :blk .wait,
                         else => break :blk .dead_keep, // stream reset: abandon
@@ -4672,6 +4707,122 @@ test "h2 streaming response: a body inside the buffer is framed exactly as befor
     try testing.expectEqualStrings("5", c.header("content-length").?);
 }
 
+/// A handler with one route more than `testHandler`: `/bulk`, a body far
+/// past `Session.direct_data_min`, in a byte no frame header starts with.
+const Bulk = struct {
+    const body: [60_000]u8 = @splat('Z');
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        if (std.mem.eql(u8, req.path, "/bulk")) return rw.writeAll(&body);
+        // Twice over: past the connection window as well as a stream one.
+        if (std.mem.eql(u8, req.path, "/bulk2")) {
+            try rw.writeAll(&body);
+            return rw.writeAll(&body);
+        }
+        return testHandler(req, rw);
+    }
+};
+
+/// A socket stand-in that keeps everything the server wrote and counts the
+/// octets that reached it as whole slices of `Bulk.body` octets: DATA
+/// payload handed over directly. A spill of `wire` never counts -- every
+/// staged block starts with a frame header, and no header is all 'Z'.
+const DirectSpy = struct {
+    interface: Writer,
+    sink: std.ArrayList(u8) = .empty,
+    direct: usize = 0,
+
+    fn init(buffer: []u8) DirectSpy {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const s: *DirectSpy = @alignCast(@fieldParentPtr("interface", w));
+        s.sink.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data, 0..) |d, i| {
+            const times = if (i == data.len - 1) splat else 1;
+            for (0..times) |_| {
+                s.sink.appendSlice(testing.allocator, d) catch return error.WriteFailed;
+                n += d.len;
+            }
+            if (d.len >= Session.direct_data_min and std.mem.allEqual(u8, d, 'Z'))
+                s.direct += d.len;
+        }
+        return n;
+    }
+};
+
+test "h2 direct DATA: a large response bypasses the staging buffer, in order with the frames staged before and after it (offline)" {
+    // Stream A is the large one; a PING rides between the two requests, so
+    // its ACK is staged in `wire` when A's first direct write happens; B is
+    // small and staged normally after A. The direct path must spill `wire`
+    // first -- otherwise A's DATA would overtake its own HEADERS.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_a = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/bulk"), true);
+    try peer.conn.sendPing(&peer.wire, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const sid_b = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var in: Reader = .fixed(peer.wire.items);
+    var buf: [64]u8 = undefined;
+    var spy: DirectSpy = .init(&buf);
+    defer spy.sink.deinit(gpa);
+    // `/bulk` fits the 65 535-octet initial windows: the offline peer can
+    // send no WINDOW_UPDATE in answer to what it has not yet received.
+    serve(gpa, .{ .handler = Bulk.handler }, &in, &spy.interface);
+    peer.wire.clearRetainingCapacity();
+    try spy.interface.flush();
+
+    // Mechanism: the bulk of A's payload reached the writer uncopied.
+    try testing.expect(spy.direct >= 50_000);
+
+    // Order, frame by frame, as the peer would read them.
+    var ping_ack: ?usize = null;
+    var head_a: ?usize = null;
+    var head_b: ?usize = null;
+    var first_data_a: ?usize = null;
+    var last_data_a: ?usize = null;
+    var off: usize = 0;
+    var idx: usize = 0;
+    while (off + h2.frame_header_len <= spy.sink.items.len) : (idx += 1) {
+        const h = h2.FrameHeader.decode(spy.sink.items[off..][0..h2.frame_header_len]);
+        switch (h.frame_type) {
+            .ping => if (h.flags & h2.Flags.ack != 0) {
+                ping_ack = idx;
+            },
+            .headers => if (h.stream_id == sid_a) {
+                head_a = idx;
+            } else if (h.stream_id == sid_b) {
+                head_b = idx;
+            },
+            .data => if (h.stream_id == sid_a) {
+                if (first_data_a == null) first_data_a = idx;
+                last_data_a = idx;
+            },
+            else => {},
+        }
+        off += h2.frame_header_len + h.length;
+    }
+    try testing.expectEqual(spy.sink.items.len, off); // whole frames only
+    try testing.expect(ping_ack.? < head_a.?);
+    try testing.expect(head_a.? < first_data_a.?);
+    try testing.expect(last_data_a.? < head_b.?);
+
+    // Content: both intact, A ended by its own last DATA frame.
+    try peer.feed(spy.sink.items);
+    const a = peer.resp(sid_a);
+    try testing.expectEqual(@as(u16, 200), a.status);
+    try testing.expectEqualSlices(u8, &Bulk.body, a.body.items);
+    try testing.expect(a.data_end_stream);
+    try testing.expectEqualStrings("hello", peer.resp(sid_b).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
 // ── loopback integration (Server.enable_h2c end to end) ─────────────────────
 
 fn serveWrap(s: *Server) void {
@@ -5018,6 +5169,66 @@ test "h2c integration: response body honors the client's flow-control window" {
         @as(i64, h2.default_initial_window_size),
         peer.conn.conn_recv_window,
     );
+}
+
+test "h2c integration: a stingy window splits a directly written body, and every frame stays inside it" {
+    // `/bulk2` is 120 000 octets: past the connection window, and with a
+    // 5 000-octet stream window each grant funds one chunk at a time -- a
+    // full one goes the direct way (`direct_data_min` is below it), a
+    // partial grant may be small enough to be staged. The peer's own
+    // `h2.Connection` enforces its receive windows, so one DATA octet over
+    // the credit fails `pumpSocket` with FLOW_CONTROL_ERROR.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = Server.init(io, gpa, .{ .handler = Bulk.handler, .enable_h2c = true });
+    defer server.deinit();
+    try bindOrSkip(&server);
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    const stream_window = 5000;
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = stream_window });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/bulk2"), true);
+    try peer.sendWire(&sw.interface);
+
+    var granted: usize = 0;
+    while (peer.resps.getPtr(sid) == null or !peer.resp(sid).end) {
+        try peer.pumpSocket(&sr.interface);
+        if (peer.resps.getPtr(sid)) |c| {
+            const got = c.body.items.len;
+            if (got > granted) {
+                const inc: u31 = @intCast(got - granted);
+                try peer.conn.sendWindowUpdate(&peer.wire, 0, inc);
+                if (!c.end) try peer.conn.sendWindowUpdate(&peer.wire, sid, inc);
+                granted = got;
+            }
+        }
+        try peer.sendWire(&sw.interface);
+    }
+
+    const r = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqual(2 * Bulk.body.len, r.body.items.len);
+    try testing.expect(std.mem.allEqual(u8, r.body.items, 'Z'));
+    try testing.expect(r.data_frames >= 2 * Bulk.body.len / stream_window);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), r.rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 
 test "h2c integration: large POST body streams past the 64 KiB initial window" {
