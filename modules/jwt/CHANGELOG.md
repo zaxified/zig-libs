@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — **`Provider` can measure its refresh intervals on a clock that never steps.**
+  `ProviderOptions.interval_clock` (default null: the intervals follow the caller's `now_s`, as
+  before) and `Clock.boot` (seconds since boot counting suspend: CLOCK_BOOTTIME on Linux,
+  CLOCK_MONOTONIC on other POSIX, QueryPerformanceCounter on Windows). With it a wall-clock step
+  forward no longer expires the JWKS TTL early and a step back cannot touch the intervals at all;
+  `ttl_s` and `min_refresh_interval_s` both run on it, the claims (`exp`/`nbf`/`iat`) stay on
+  `now_s`. Additive, no behaviour change unless set.
+
 - **2026-09-29** — Fixed: `Provider` froze both JWKS refreshes after a backward clock step.
   One wall-clock `now_s` drives the claims and the `ttl_s` / `min_refresh_interval_s`
   bookkeeping, so after a step back of Δ (NTP, a VM restored from a snapshot) `now_s -

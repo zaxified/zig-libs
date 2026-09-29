@@ -1800,12 +1800,16 @@ pub const RefreshError = error{
 ///   byte cache would only add a re-parse per hit.
 /// - No hidden clock: every entry point takes `now_s`, like the rest of the
 ///   module (and refresh scheduling is therefore deterministic in tests).
-///   That one wall-clock `now_s` drives both the claims and the refresh
-///   intervals, so a `now_s` BEFORE a recorded fetch/attempt (the clock was
-///   stepped back: NTP, a VM restored from a snapshot) counts as the
-///   interval having passed. Otherwise a step back of Δ froze both the TTL
-///   re-fetch and the unknown-`kid` refresh for Δ, and a key rotated inside
-///   it was a 401 for Δ (found from qap, research register H6, 2026-09-29).
+///   By default that one wall-clock `now_s` drives both the claims and the
+///   refresh intervals, so a `now_s` BEFORE a recorded fetch/attempt (the
+///   clock was stepped back: NTP, a VM restored from a snapshot) counts as
+///   the interval having passed. Otherwise a step back of Δ froze both the
+///   TTL re-fetch and the unknown-`kid` refresh for Δ, and a key rotated
+///   inside it was a 401 for Δ (found from qap, research register H6,
+///   2026-09-29). A step FORWARD still expires the TTL early (one extra
+///   fetch); `ProviderOptions.interval_clock = .boot` measures the
+///   intervals on a clock that never steps, and leaves `now_s` to the
+///   claims alone.
 /// - Fail closed: a failed TTL/rotation refresh surfaces as its typed error
 ///   instead of silently serving stale keys forever. (P6 middleware can
 ///   layer a serve-stale policy on top if wanted.)
@@ -1820,10 +1824,11 @@ pub const Provider = struct {
     metadata: ?Metadata = null,
     /// The current key set; null until the first successful refresh.
     jwks: ?JwkSet = null,
-    /// When the current set was fetched (drives `ttl_s`).
+    /// When the current set was fetched (drives `ttl_s`). On the interval
+    /// timeline: `now_s`, or `ProviderOptions.interval_clock` when set.
     fetched_at_s: i64 = 0,
     /// When a refresh was last *attempted*, success or failure — the
-    /// `min_refresh_interval_s` reference point.
+    /// `min_refresh_interval_s` reference point. Same timeline.
     last_attempt_s: ?i64 = null,
 
     pub const ProviderOptions = struct {
@@ -1843,6 +1848,13 @@ pub const Provider = struct {
         /// Off: a plain-HTTP key source fails every refresh with
         /// `error.InsecureKeySource`.
         allow_plain_http: bool = false,
+        /// The clock `ttl_s` and `min_refresh_interval_s` are measured on,
+        /// in seconds. Null (the default, no hidden clock): the `now_s`
+        /// each call passes, whose steps the intervals then follow -- a step
+        /// forward expires the TTL early, a step back re-fetches once (see
+        /// the type doc). `Clock.boot` never steps; in production it is the
+        /// better choice. `now_s` stays the claims' clock either way.
+        interval_clock: ?Clock = null,
     };
 
     /// How `Provider.verify` decides the expected `iss`. Unlike the low-level
@@ -1906,7 +1918,8 @@ pub const Provider = struct {
     /// rate-limiting whether it succeeds or fails; the old set stays in
     /// place on failure.
     pub fn refresh(p: *Provider, now_s: i64) RefreshError!void {
-        p.last_attempt_s = now_s;
+        const at = p.intervalNow(now_s);
+        p.last_attempt_s = at;
         const jwks_uri = p.options.jwks_uri orelse blk: {
             if (p.metadata == null) {
                 p.metadata = discoverWith(p.gpa, p.fetcher, p.options.issuer.?, p.keySourceOptions()) catch |err|
@@ -1925,7 +1938,7 @@ pub const Provider = struct {
         };
         if (p.jwks) |*old| old.deinit();
         p.jwks = fresh;
-        p.fetched_at_s = now_s;
+        p.fetched_at_s = at;
     }
 
     /// The turnkey call: ensure the JWKS is loaded and fresh (lazy first
@@ -1942,7 +1955,7 @@ pub const Provider = struct {
         now_s: i64,
         claim_opts: ClaimOptions,
     ) Error!ParsedToken {
-        if (p.jwks == null or intervalPassed(p.fetched_at_s, now_s, p.options.ttl_s)) {
+        if (p.jwks == null or intervalPassed(p.fetched_at_s, p.intervalNow(now_s), p.options.ttl_s)) {
             try p.refresh(now_s);
         }
 
@@ -1984,7 +1997,13 @@ pub const Provider = struct {
 
     fn refreshAllowed(p: *const Provider, now_s: i64) bool {
         const last = p.last_attempt_s orelse return true;
-        return intervalPassed(last, now_s, p.options.min_refresh_interval_s);
+        return intervalPassed(last, p.intervalNow(now_s), p.options.min_refresh_interval_s);
+    }
+
+    /// Now on the interval timeline: `interval_clock`, else the caller's `now_s`.
+    fn intervalNow(p: *const Provider, now_s: i64) i64 {
+        const c = p.options.interval_clock orelse return now_s;
+        return c.now();
     }
 
     /// `interval_s` has passed since `since_s` -- or the clock went back
@@ -2012,6 +2031,11 @@ pub const Clock = struct {
 
     /// The OS wall clock (`std.time.timestamp`). The production default.
     pub const system: Clock = .{ .nowFn = systemNowS };
+    /// Seconds since boot, counting suspend, never stepped (Linux
+    /// CLOCK_BOOTTIME; CLOCK_MONOTONIC on other POSIX systems,
+    /// QueryPerformanceCounter on Windows). An interval clock, not a date:
+    /// for `Provider.ProviderOptions.interval_clock`, never for claims.
+    pub const boot: Clock = .{ .nowFn = bootNowS };
 
     pub fn now(c: Clock) i64 {
         return c.nowFn(c.ctx);
@@ -2029,6 +2053,28 @@ fn systemNowS(_: ?*anyopaque) i64 {
         else => {
             var ts: std.posix.timespec = undefined;
             if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+            return @intCast(ts.sec);
+        },
+    }
+}
+
+fn bootNowS(_: ?*anyopaque) i64 {
+    switch (builtin.os.tag) {
+        .windows => {
+            var qpf: std.os.windows.LARGE_INTEGER = undefined;
+            var qpc: std.os.windows.LARGE_INTEGER = undefined;
+            if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
+            if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
+            const freq: u64 = @bitCast(qpf);
+            const count: u64 = @bitCast(qpc);
+            return @intCast(count / freq);
+        },
+        else => {
+            // Suspend counts: a TTL is about time passing, and a machine
+            // that slept an hour holds an hour-old key set.
+            const id: std.posix.clockid_t = if (builtin.os.tag == .linux) .BOOTTIME else .MONOTONIC;
+            var ts: std.posix.timespec = undefined;
+            if (std.posix.errno(std.posix.system.clock_gettime(id, &ts)) != .SUCCESS) return 0;
             return @intCast(ts.sec);
         },
     }
@@ -6389,6 +6435,131 @@ test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rot
     d.deinit();
     try testing.expectEqual(@as(usize, 3), stub.calls);
     try testing.expectEqual(stub.script.len, stub.next);
+}
+
+/// An interval clock the test moves by hand.
+const ManualClock = struct {
+    s: i64,
+    fn clock(m: *ManualClock) Clock {
+        return .{ .ctx = m, .nowFn = read };
+    }
+    fn read(ctx: ?*anyopaque) i64 {
+        return @as(*ManualClock, @ptrCast(@alignCast(ctx.?))).s;
+    }
+};
+
+test "Provider: with an interval clock a wall step forward does not expire the TTL; the claims still use now_s" {
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const kp_old = try Ed25519.KeyPair.generateDeterministic([_]u8{0x73} ** 32);
+    const kp_new = try Ed25519.KeyPair.generateDeterministic([_]u8{0x74} ** 32);
+    const pub_old = kp_old.public_key.toBytes();
+    const pub_new = kp_new.public_key.toBytes();
+    var old_b64: [43]u8 = undefined;
+    var new_b64: [43]u8 = undefined;
+    var v1_buf: [256]u8 = undefined;
+    var v2_buf: [256]u8 = undefined;
+    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&old_b64, &pub_old)});
+    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&new_b64, &pub_new)});
+
+    var buf_old: [512]u8 = undefined;
+    const si_old = signingInputInto(&buf_old,
+        \\{"alg":"EdDSA","kid":"old"}
+    ,
+        \\{"exp":90000}
+    );
+    const sig_old = (try kp_old.sign(si_old, null)).toBytes();
+    const token_old = finishToken(&buf_old, si_old.len, &sig_old);
+    var buf_short: [512]u8 = undefined;
+    const si_short = signingInputInto(&buf_short,
+        \\{"alg":"EdDSA","kid":"old"}
+    ,
+        \\{"exp":12000}
+    );
+    const sig_short = (try kp_old.sign(si_short, null)).toBytes();
+    const token_short = finishToken(&buf_short, si_short.len, &sig_short);
+    var buf_new: [512]u8 = undefined;
+    const si_new = signingInputInto(&buf_new,
+        \\{"alg":"EdDSA","kid":"new"}
+    ,
+        \\{"exp":90000}
+    );
+    const sig_new = (try kp_new.sign(si_new, null)).toBytes();
+    const token_new = finishToken(&buf_new, si_new.len, &sig_new);
+    const opts: Provider.ClaimOptions = .{ .issuer = .any, .audience = .any };
+
+    // The control: without an interval clock the step forward is the TTL
+    // passing, and costs a fetch.
+    {
+        var stub: ScriptFetcher = .{ .script = &.{
+            .{ .url = test_jwks_url, .body = jwks_v1 },
+            .{ .url = test_jwks_url, .body = jwks_v1 },
+        } };
+        var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 300 });
+        defer provider.deinit();
+        var a = try provider.verify(gpa, token_old, 10_000, opts);
+        a.deinit();
+        var b = try provider.verify(gpa, token_old, 13_600, opts);
+        b.deinit();
+        try testing.expectEqual(@as(usize, 2), stub.calls);
+    }
+
+    var boot: ManualClock = .{ .s = 100 };
+    var stub: ScriptFetcher = .{
+        .script = &.{
+            .{ .url = test_jwks_url, .body = jwks_v1 }, // lazy first load
+            .{ .url = test_jwks_url, .body = jwks_v1 }, // TTL on the interval clock
+            .{ .url = test_jwks_url, .body = jwks_v2 }, // rotation refresh
+        },
+    };
+    var provider = Provider.init(gpa, stub.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 300,
+        .min_refresh_interval_s = 30,
+        .interval_clock = boot.clock(),
+    });
+    defer provider.deinit();
+
+    var a = try provider.verify(gpa, token_old, 10_000, opts);
+    a.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+
+    // The wall clock steps an hour forward, 10 s pass: no fetch.
+    boot.s = 110;
+    var b = try provider.verify(gpa, token_old, 13_600, opts);
+    b.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+    // The claims are still judged on now_s: exp 12000 is past at 13600.
+    try testing.expectError(error.Expired, provider.verify(gpa, token_short, 13_600, opts));
+
+    // 300 s on the interval clock: the TTL re-fetch.
+    boot.s = 400;
+    var c = try provider.verify(gpa, token_old, 13_610, opts);
+    c.deinit();
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // An unknown kid 5 s after that attempt waits for min_refresh_interval_s
+    // on the same clock, whatever the wall clock says ...
+    boot.s = 405;
+    try testing.expectError(error.NoMatchingKey, provider.verify(gpa, token_new, 20_000, opts));
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+    // ... and gets its refresh at 30 s.
+    boot.s = 430;
+    var d = try provider.verify(gpa, token_new, 13_640, opts);
+    d.deinit();
+    try testing.expectEqual(@as(usize, 3), stub.calls);
+    try testing.expectEqual(stub.script.len, stub.next);
+}
+
+test "Clock.boot: seconds that do not go backwards" {
+    const a = Clock.boot.now();
+    const b = Clock.boot.now();
+    try testing.expect(a > 0);
+    try testing.expect(b >= a);
 }
 
 test "Provider: refresh failures are typed, old keys survive a failed refresh" {
