@@ -297,6 +297,14 @@ pub const Client = struct {
         c.rx_len += bytes.len;
     }
 
+    /// How many bytes `feed` takes now: the receive buffer's room once what
+    /// `poll` consumed is compacted away. Feed at most this much, `poll`, and
+    /// feed the rest. 0 with nothing left to poll means an incomplete packet
+    /// as large as the buffer: it can never complete, so drop the connection.
+    pub fn rxRoom(c: *const Client) usize {
+        return c.rx_buf.len - (c.rx_len -| c.rx_consumed);
+    }
+
     /// Decode buffered broker packets, advance the QoS state machines
     /// (sending PUBACK/PUBREC/PUBREL/PUBCOMP as needed) and return the next
     /// application-visible event, or null once no complete packet remains.
@@ -991,8 +999,12 @@ test "rx buffer is bounded: overflow is a typed error" {
     var rx: [8]u8 = undefined;
     var tx: [64]u8 = undefined;
     var c = Client.init(tt.transport(), .{ .rx = &rx, .tx = &tx });
+    try testing.expectEqual(@as(usize, 8), c.rxRoom());
     try c.feed(&.{ 0x30, 0x40, 0x00, 0x01 });
+    try testing.expectEqual(@as(usize, 4), c.rxRoom());
     try testing.expectError(error.RxBufferFull, c.feed(&.{ 0, 0, 0, 0, 0 }));
+    try c.feed(&.{ 0, 0, 0, 0 });
+    try testing.expectEqual(@as(usize, 0), c.rxRoom());
 }
 
 test "TcpTransport compiles (never dialed in tests)" {

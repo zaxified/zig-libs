@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-29** — `Broker.rxRoom(conn)` and `Client.rxRoom()`: how many bytes `feed` takes now
+  (the receive buffer's room after compaction), so a reader in fixed chunks feeds what fits,
+  processes, and feeds the rest instead of hitting `RxBufferFull` (requested by egw-hub).
+
 - **2026-09-28** — Broker, egw audit S1 fixes. **The Will is ACL-checked**: `authorizeFn` sees
   the Will topic as a publish at CONNECT, and a denial refuses the CONNECT (`not_authorized`);
   `AuthRequest.will` (new `WillInfo`) carries it to authentication. **Retained store bounded in

@@ -1498,6 +1498,19 @@ pub const Broker = struct {
         conn.rx_len += bytes.len;
     }
 
+    /// How many bytes `feed` takes from `conn` now: the receive buffer's room
+    /// once what `process` consumed is compacted away. A server reading in
+    /// fixed chunks feeds at most this much, runs `process`, and feeds the
+    /// rest — a read that holds the tail of one packet and the head of the
+    /// next then never overflows. 0 after `process` returned `.keep` means
+    /// the buffered bytes are an incomplete packet as large as the buffer
+    /// (`Config.max_packet_size`): it can never complete, so drop the
+    /// connection. Lock-free, like `feed`.
+    pub fn rxRoom(b: *const Broker, conn: *const Connection) usize {
+        _ = b;
+        return conn.rx_buf.len - (conn.rx_len -| conn.rx_consumed);
+    }
+
     /// Decode every complete packet currently buffered for `conn`, advance its
     /// state machine and fan out PUBLISHes. `now` is the caller's clock (ms) —
     /// recorded as the connection's last-packet time for keep-alive. Returns
@@ -5373,6 +5386,57 @@ test "A1 M1: a server publish that exactly fills max_packet_size is still delive
     @memset(&over, 'z');
     try testing.expectError(error.PayloadTooLarge, b.publish("t", &over, .at_most_once, false));
 
+    b.remove(s);
+}
+
+test "rxRoom: a read holding one packet's tail and the next one's head is fed in two steps, not refused" {
+    // Two 35-byte PUBLISHes in one 70-byte read, a 64-byte receive buffer:
+    // `feed` refuses the read whole; fed `rxRoom` at a time with `process`
+    // between, both arrive.
+    const cfg = Config{ .max_packet_size = 64 };
+    var b = Broker.init(testing.allocator, cfg);
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_most_once }});
+    _ = (try ts.next()).?; // SUBACK
+    var tp = TestTransport{};
+    const p = try connectClient(&b, &tp, "P", 60, 0);
+
+    var read: [128]u8 = undefined;
+    var payloads: [2][30]u8 = .{ @splat('a'), @splat('b') };
+    var len: usize = 0;
+    for (&payloads) |*pl| len += (try packet.encodePublish(read[len..], .{ .topic = "t", .payload = pl, .qos = .at_most_once })).len;
+    try testing.expectEqual(@as(usize, 70), len);
+    try testing.expectEqual(@as(usize, 64), b.rxRoom(p));
+    try testing.expectError(error.RxBufferFull, b.feed(p, read[0..len]));
+
+    var rest: []const u8 = read[0..len];
+    var steps: usize = 0;
+    while (rest.len > 0) : (steps += 1) {
+        const n = @min(rest.len, b.rxRoom(p));
+        try testing.expect(n > 0);
+        try b.feed(p, rest[0..n]);
+        try testing.expectEqual(Disposition.keep, try b.process(p, 0));
+        rest = rest[n..];
+    }
+    try testing.expectEqual(@as(usize, 2), steps);
+    try testing.expectEqual(@as(usize, 64), b.rxRoom(p)); // all consumed
+    for (&payloads) |*pl| {
+        const got = (try ts.next()).?;
+        try testing.expectEqualSlices(u8, pl, got.publish.payload);
+    }
+
+    // A packet longer than the buffer can never complete: the room runs
+    // out with `process` still waiting — the caller's cue to drop it.
+    const head = [_]u8{ 0x30, 100 }; // PUBLISH, remaining length 100
+    try b.feed(p, &head);
+    var filler: [62]u8 = @splat(0);
+    try b.feed(p, &filler);
+    try testing.expectEqual(Disposition.keep, try b.process(p, 0));
+    try testing.expectEqual(@as(usize, 0), b.rxRoom(p));
+
+    b.remove(p);
     b.remove(s);
 }
 

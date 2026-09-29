@@ -13,7 +13,7 @@ exclusion, plus `validateName`/`validateFilter` (spec §4.7). `Client` — behin
 `Transport` write seam: `feed` takes incoming bytes, `poll(now)` decodes and advances the QoS state
 machines (QoS 1 PUBLISH→PUBACK, QoS 2 PUBLISH→PUBREC→PUBREL→PUBCOMP, auto-acks, exactly-once
 receive dedup); bounded packet-id pool (wrap 65535→1, in-use guard, typed exhaustion error); bounded
-rx buffer (overflow is a typed error). Caller drives the clock — every call takes `now` (ms); `tick`
+rx buffer (overflow is a typed error; `rxRoom()` says how much `feed` takes now). Caller drives the clock — every call takes `now` (ms); `tick`
 sends keep-alive PINGREQ; `publishDup` retransmits with DUP. Concurrency: single-owner (one owner
 drives feed/poll/tick). `Broker` — the mirror image: owns the shared connection set, a **topic-filter trie** subscription
 index (levels on `/`, `+`/`#` children, `$`-topic exclusion — matched only along a published topic's
@@ -296,7 +296,7 @@ Mutants (one schemata build): skipping the Will ACL, the owner check, and the by
 update and on a new topic — each caught by its own test.
 
 ## Backlog / deferred
-**`Broker.rxRoom(conn)`: how much `feed` takes now** — GAP (2026-09-28, egw-hub audit R13). `feed` refuses a slice that overflows the receive buffer (`RxBufferFull`) without saying how much would fit, so a server reading in fixed chunks drops a client whose read holds the tail of one large packet and the head of the next, though `process` would consume the complete one first. egw-hub feeds in slices sized from `Connection`'s `rx_buf.len - (rx_len - rx_consumed)` (`egw-hub/src/loop.zig`, `rxRoom`, comment `zig-libs request: mqtt`), which reads internals. Wanted: `pub fn rxRoom(b, conn) usize` (the room after compaction), or `feed` returning how many bytes it took. Every buffered-stream API reports this (a writer's free space, `SSL_write` partial counts).
+**`Broker.rxRoom(conn)` / `Client.rxRoom()`: how much `feed` takes now** — DONE (2026-09-29, requested by egw-hub audit R13). The receive buffer's room once what `process`/`poll` consumed is compacted away, so a server reading in fixed chunks feeds at most that, processes, and feeds the rest instead of dropping a client whose read holds the tail of one packet and the head of the next. 0 after `process` returned `.keep` = an incomplete packet as large as the buffer, which can never complete. Test: "rxRoom: a read holding one packet's tail…".
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,

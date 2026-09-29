@@ -153,7 +153,7 @@ _ = try client.publish(now(), "plant/1/cmd", "on", .{ .qos = .at_least_once });
 
 // pump loop: read → feed → poll → tick
 const n = try tt.readSome(&net_buf);
-try client.feed(net_buf[0..n]);
+try client.feed(net_buf[0..n]); // at most `client.rxRoom()` bytes fit
 while (try client.poll(now())) |event| switch (event) {
     .message => |m| handle(m.topic, m.payload),
     else => {},
