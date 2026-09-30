@@ -32,7 +32,7 @@ const Permission = struct { action: []const u8, resource: []const u8 };
 const Error = error{ OutOfMemory, UnknownRole, CyclicHierarchy, ConflictingRole };
 
 var engine = rbac.Engine.init(allocator);
-defer engine.deinit(); // frees everything the engine owns (one internal arena)
+defer engine.deinit(); // frees everything the engine still owns
 
 try engine.addRole("viewer");
 try engine.addRole("editor");
@@ -50,10 +50,21 @@ try engine.assignRole("alice", "viewer");   // error.ConflictingRole on an SoD v
 
 const decision = engine.check("alice", "read", "doc"); // -> Decision
 if (decision.isPermit()) { ... }
+
+// Revoke / remove (NIST DeassignUser / RevokePermission / DeleteRole). Absent relation ->
+// `false` (no-op); unknown role -> error.UnknownRole. Removal frees memory (no tombstones).
+_ = try engine.unassignRole("alice", "viewer");                          // error{UnknownRole}!bool
+_ = try engine.removePermission("editor", .{ .action = "write", .resource = "doc" }); // error{UnknownRole}!bool
+_ = try engine.removeHierarchy("editor", "viewer");                      // error{UnknownRole}!bool
+_ = try engine.removeStaticSoD("payer", "approver");                     // error{UnknownRole}!bool
+try engine.removeRole("editor"); // cascade: its permissions, assignments, hierarchy edges, SoD pairs
+                                 // (error{UnknownRole}!void; inheritance is not bridged across it)
 ```
 
-All strings passed to a mutating `Engine` method are duped into the engine's internal arena
-— callers never need to keep arguments alive past the call.
+All strings passed to a mutating `Engine` method are duped into individually owned allocations
+— callers never need to keep arguments alive past the call — and freed again when the item is
+removed, so a long-lived engine's memory follows the live policy, not its change history. Every
+`add*` is idempotent.
 
 ## ABAC API
 

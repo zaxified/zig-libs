@@ -358,7 +358,7 @@ way to recognise it.
 | [`metrics`](modules/metrics/README.md) | 2 | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware + access-log writer (combined/JSON) | posix | router, http |
 | [`openapi`](modules/openapi/README.md) | 2 | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | [`ratelimit`](modules/ratelimit/README.md) | 2 | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |
-| [`rbac`](modules/rbac/README.md) | 3 | Authorization decision engine — NIST RBAC (hierarchical + static SoD) and a depth-bounded ABAC condition-tree evaluator with structural default-deny | any | — |
+| [`rbac`](modules/rbac/README.md) | 2 | Authorization decision engine — NIST RBAC (hierarchical + static SoD) and a depth-bounded ABAC condition-tree evaluator with structural default-deny | any | — |
 | [`requestid`](modules/requestid/README.md) | 2 | Request/correlation-ID middleware — adopts incoming `X-Request-Id` or generates one, echoes on response, exposed via `current()` | any | router, http |
 | [`resilience`](modules/resilience/README.md) | 2 | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
 | [`router`](modules/router/README.md) | 2 | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | any | http |

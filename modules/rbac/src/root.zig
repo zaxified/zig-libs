@@ -8,7 +8,8 @@
 //!     roles, permissions, user→role assignment, role→role seniority
 //!     (senior roles inherit junior permissions, cycle-checked at insert
 //!     time), and static separation-of-duty (a user may never hold two
-//!     roles declared mutually exclusive).
+//!     roles declared mutually exclusive). Every add has a remove
+//!     (`unassignRole`, `removePermission`, `removeRole`, `removeHierarchy`).
 //!   * `abac` — a small, depth-bounded policy-expression evaluator: a typed
 //!     condition tree (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/`In`/`And`/`Or`/`Not`)
 //!     over `{subject, resource, action, environment}` attributes, combined
@@ -17,7 +18,7 @@
 //!
 //! This is a decision engine, not a persistence layer: both models are
 //! built/loaded into memory by the caller (`rbac.Engine` owns its own
-//! duped-string storage in an arena; `abac.Policy`/`abac.Attributes` borrow
+//! duped strings and frees them on removal; `abac.Policy`/`abac.Attributes` borrow
 //! whatever the caller passes in and must outlive the `evaluate` call).
 //!
 //! No crypto, no I/O, no external policy-file format — see SPEC.md for what
@@ -96,49 +97,117 @@ pub const rbac = struct {
         /// Direct junior roles: this role inherits their permissions,
         /// transitively — "senior roles inherit junior permissions".
         juniors: std.ArrayListUnmanaged([]const u8) = .empty,
+
+        fn deinit(self: *RoleData, gpa: Allocator) void {
+            for (self.permissions.items) |p| {
+                gpa.free(p.action);
+                gpa.free(p.resource);
+            }
+            self.permissions.deinit(gpa);
+            for (self.juniors.items) |j| gpa.free(j);
+            self.juniors.deinit(gpa);
+        }
     };
 
     const SoDPair = struct { a: []const u8, b: []const u8 };
 
+    /// The set of role names directly assigned to one user (keys owned).
+    const RoleSet = std.StringHashMapUnmanaged(void);
+
     /// In-memory RBAC engine: roles, permissions, hierarchy, user
     /// assignments, static separation-of-duty. Every string handed to a
-    /// mutating method is duped into an internal arena, so callers never
-    /// need to keep their arguments alive — `deinit` frees everything the
-    /// engine owns in one shot.
+    /// mutating method is duped into an individually owned allocation, so
+    /// callers never need to keep their arguments alive, and every removal
+    /// (`unassignRole`, `removePermission`, `removeRole`, `removeHierarchy`,
+    /// `removeStaticSoD`) frees what it drops — memory tracks the LIVE
+    /// policy, not the history of changes. `deinit` frees everything.
+    ///
+    /// Every add operation is idempotent (re-adding something present is a
+    /// no-op that allocates nothing), so repeated add/remove of the same
+    /// item cannot grow the engine.
     pub const Engine = struct {
-        arena: std.heap.ArenaAllocator,
+        gpa: Allocator,
         roles: std.StringHashMapUnmanaged(RoleData) = .empty,
-        /// user -> set of directly assigned role names.
-        assignments: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)) = .empty,
+        /// user -> set of directly assigned role names. A user with no
+        /// remaining roles has NO entry (removed with its last role).
+        assignments: std.StringHashMapUnmanaged(RoleSet) = .empty,
         sod: std.ArrayListUnmanaged(SoDPair) = .empty,
 
         pub fn init(allocator: Allocator) Engine {
-            return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+            return .{ .gpa = allocator };
         }
 
         pub fn deinit(self: *Engine) void {
-            self.arena.deinit();
+            const gpa = self.gpa;
+            var rit = self.roles.iterator();
+            while (rit.next()) |e| {
+                gpa.free(e.key_ptr.*);
+                e.value_ptr.deinit(gpa);
+            }
+            self.roles.deinit(gpa);
+            var ait = self.assignments.iterator();
+            while (ait.next()) |e| {
+                gpa.free(e.key_ptr.*);
+                freeRoleSet(gpa, e.value_ptr);
+            }
+            self.assignments.deinit(gpa);
+            for (self.sod.items) |p| {
+                gpa.free(p.a);
+                gpa.free(p.b);
+            }
+            self.sod.deinit(gpa);
             self.* = undefined;
         }
 
+        fn freeRoleSet(gpa: Allocator, set: *RoleSet) void {
+            var it = set.keyIterator();
+            while (it.next()) |k| gpa.free(k.*);
+            set.deinit(gpa);
+        }
+
         fn dupe(self: *Engine, s: []const u8) Error![]const u8 {
-            return try self.arena.allocator().dupe(u8, s);
+            return try self.gpa.dupe(u8, s);
         }
 
         /// Idempotent: re-adding a known role name is a no-op.
         pub fn addRole(self: *Engine, name: []const u8) Error!void {
             if (self.roles.contains(name)) return;
             const owned = try self.dupe(name);
-            try self.roles.put(self.arena.allocator(), owned, .{});
+            errdefer self.gpa.free(owned);
+            try self.roles.put(self.gpa, owned, .{});
         }
 
+        /// Idempotent: granting a permission the role already holds
+        /// directly is a no-op.
         pub fn addPermission(self: *Engine, role: []const u8, perm: Permission) Error!void {
             const rd = self.roles.getPtr(role) orelse return error.UnknownRole;
-            const owned: Permission = .{
-                .action = try self.dupe(perm.action),
-                .resource = try self.dupe(perm.resource),
-            };
-            try rd.permissions.append(self.arena.allocator(), owned);
+            if (self.roleGrantsDirect(role, perm.action, perm.resource)) return;
+            const action = try self.dupe(perm.action);
+            errdefer self.gpa.free(action);
+            const resource = try self.dupe(perm.resource);
+            errdefer self.gpa.free(resource);
+            try rd.permissions.append(self.gpa, .{ .action = action, .resource = resource });
+        }
+
+        /// Revoke the direct grant `perm` from `role`. Returns `true` if the
+        /// grant was present, `false` if the role never held it (no-op).
+        /// Only the DIRECT grant is removed: a senior role that also
+        /// reaches the same permission through another junior keeps it.
+        /// `error.UnknownRole` if `role` does not exist.
+        pub fn removePermission(self: *Engine, role: []const u8, perm: Permission) error{UnknownRole}!bool {
+            const rd = self.roles.getPtr(role) orelse return error.UnknownRole;
+            var removed = false;
+            var i: usize = 0;
+            while (i < rd.permissions.items.len) {
+                const p = rd.permissions.items[i];
+                if (std.mem.eql(u8, p.action, perm.action) and std.mem.eql(u8, p.resource, perm.resource)) {
+                    self.gpa.free(p.action);
+                    self.gpa.free(p.resource);
+                    _ = rd.permissions.orderedRemove(i);
+                    removed = true;
+                } else i += 1;
+            }
+            return removed;
         }
 
         /// `senior` inherits every permission `junior` has, directly and
@@ -146,19 +215,46 @@ pub const rbac = struct {
         /// that would close a cycle (`error.CyclicHierarchy`) — checked
         /// BEFORE the edge is added, so the juniors graph is always a DAG
         /// and permission resolution (`check`) never needs its own cycle
-        /// guard.
+        /// guard. Idempotent: an existing edge is a no-op.
         pub fn addHierarchy(self: *Engine, senior: []const u8, junior: []const u8) Error!void {
             if (!self.roles.contains(senior)) return error.UnknownRole;
             if (!self.roles.contains(junior)) return error.UnknownRole;
             if (std.mem.eql(u8, senior, junior)) return error.CyclicHierarchy;
-            if (try self.reachable(junior, senior)) return error.CyclicHierarchy;
             const rd = self.roles.getPtr(senior).?;
-            try rd.juniors.append(self.arena.allocator(), try self.dupe(junior));
+            for (rd.juniors.items) |j| {
+                if (std.mem.eql(u8, j, junior)) return;
+            }
+            if (try self.reachable(junior, senior)) return error.CyclicHierarchy;
+            const owned = try self.dupe(junior);
+            errdefer self.gpa.free(owned);
+            try rd.juniors.append(self.gpa, owned);
+        }
+
+        /// Drop the direct inheritance edge `senior` -> `junior`. Returns
+        /// `true` if the edge existed, `false` otherwise (no-op). Only that
+        /// one edge goes: permissions `senior` still reaches through another
+        /// path (a diamond) are kept; everything reachable only through the
+        /// edge is revoked transitively — `check` walks the live graph, there
+        /// is no cached closure to go stale. `error.UnknownRole` if either
+        /// role does not exist.
+        pub fn removeHierarchy(self: *Engine, senior: []const u8, junior: []const u8) error{UnknownRole}!bool {
+            const rd = self.roles.getPtr(senior) orelse return error.UnknownRole;
+            if (!self.roles.contains(junior)) return error.UnknownRole;
+            for (rd.juniors.items, 0..) |j, i| {
+                if (std.mem.eql(u8, j, junior)) {
+                    self.gpa.free(j);
+                    _ = rd.juniors.orderedRemove(i);
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// Iterative DFS over the juniors graph: is `to` reachable from `from`?
         fn reachable(self: *Engine, from: []const u8, to: []const u8) Error!bool {
-            const scratch = self.arena.allocator();
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const scratch = arena.allocator();
             var visited: std.StringHashMapUnmanaged(void) = .empty;
             var stack: std.ArrayListUnmanaged([]const u8) = .empty;
             try stack.append(scratch, from);
@@ -174,14 +270,39 @@ pub const rbac = struct {
 
         /// Static separation-of-duty: `role_a` and `role_b` may never both
         /// be assigned to the same user. Dynamic (session-based) SoD is out
-        /// of scope for this module — see SPEC.md.
+        /// of scope for this module — see SPEC.md. Idempotent (either
+        /// order). Declaring a pair does not inspect existing assignments.
         pub fn addStaticSoD(self: *Engine, role_a: []const u8, role_b: []const u8) Error!void {
             if (!self.roles.contains(role_a)) return error.UnknownRole;
             if (!self.roles.contains(role_b)) return error.UnknownRole;
-            try self.sod.append(self.arena.allocator(), .{
-                .a = try self.dupe(role_a),
-                .b = try self.dupe(role_b),
-            });
+            if (self.conflicts(role_a, role_b)) return;
+            const a = try self.dupe(role_a);
+            errdefer self.gpa.free(a);
+            const b = try self.dupe(role_b);
+            errdefer self.gpa.free(b);
+            try self.sod.append(self.gpa, .{ .a = a, .b = b });
+        }
+
+        /// Lift a static SoD declaration (either order). Returns `true` if
+        /// the pair was declared. Existing assignments are untouched.
+        /// `error.UnknownRole` if either role does not exist.
+        pub fn removeStaticSoD(self: *Engine, role_a: []const u8, role_b: []const u8) error{UnknownRole}!bool {
+            if (!self.roles.contains(role_a)) return error.UnknownRole;
+            if (!self.roles.contains(role_b)) return error.UnknownRole;
+            var removed = false;
+            var i: usize = 0;
+            while (i < self.sod.items.len) {
+                const pair = self.sod.items[i];
+                if ((std.mem.eql(u8, pair.a, role_a) and std.mem.eql(u8, pair.b, role_b)) or
+                    (std.mem.eql(u8, pair.a, role_b) and std.mem.eql(u8, pair.b, role_a)))
+                {
+                    self.gpa.free(pair.a);
+                    self.gpa.free(pair.b);
+                    _ = self.sod.orderedRemove(i);
+                    removed = true;
+                } else i += 1;
+            }
+            return removed;
         }
 
         fn conflicts(self: *const Engine, a: []const u8, b: []const u8) bool {
@@ -194,7 +315,7 @@ pub const rbac = struct {
 
         /// Assign `role` to `user`. Rejects (`error.ConflictingRole`) if the
         /// user already holds a role declared statically mutually exclusive
-        /// with `role`.
+        /// with `role`. Idempotent for an existing assignment.
         pub fn assignRole(self: *Engine, user: []const u8, role: []const u8) Error!void {
             if (!self.roles.contains(role)) return error.UnknownRole;
             if (self.assignments.getPtr(user)) |existing| {
@@ -202,11 +323,92 @@ pub const rbac = struct {
                 while (it.next()) |held| {
                     if (self.conflicts(held.*, role)) return error.ConflictingRole;
                 }
+                if (existing.contains(role)) return;
+                const r = try self.dupe(role);
+                errdefer self.gpa.free(r);
+                try existing.put(self.gpa, r, {});
+                return;
             }
-            const scratch = self.arena.allocator();
-            const gop = try self.assignments.getOrPut(scratch, try self.dupe(user));
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            _ = try gop.value_ptr.getOrPut(scratch, try self.dupe(role));
+            const u = try self.dupe(user);
+            errdefer self.gpa.free(u);
+            const r = try self.dupe(role);
+            errdefer self.gpa.free(r);
+            var set: RoleSet = .empty;
+            errdefer set.deinit(self.gpa);
+            try set.put(self.gpa, r, {});
+            try self.assignments.put(self.gpa, u, set);
+        }
+
+        /// Take `role` away from `user`. Returns `true` if the user held it
+        /// directly, `false` otherwise (no-op). A user's last role removes
+        /// the user's entry entirely. Roles the user still reaches through
+        /// the hierarchy of another assigned role are unaffected.
+        /// `error.UnknownRole` if `role` does not exist (mirrors
+        /// `assignRole`; a role deleted by `removeRole` is no longer known).
+        pub fn unassignRole(self: *Engine, user: []const u8, role: []const u8) error{UnknownRole}!bool {
+            if (!self.roles.contains(role)) return error.UnknownRole;
+            const set = self.assignments.getPtr(user) orelse return false;
+            const kv = set.fetchRemove(role) orelse return false;
+            self.gpa.free(kv.key);
+            if (set.count() == 0) {
+                var removed = self.assignments.fetchRemove(user).?;
+                freeRoleSet(self.gpa, &removed.value);
+                self.gpa.free(removed.key);
+            }
+            return true;
+        }
+
+        /// NIST `DeleteRole`: delete `name` and everything that refers to
+        /// it — its direct permissions, every assignment of it to a user
+        /// (users left with no roles are dropped), every hierarchy edge into
+        /// or out of it, and every static SoD pair naming it. Cascade, not
+        /// refuse. Inheritance is NOT bridged: with A > B > C, deleting B
+        /// leaves A without C (add `addHierarchy(A, C)` first to keep it).
+        /// Other roles are otherwise unaffected. `error.UnknownRole` if the
+        /// role does not exist. Cannot fail with OutOfMemory (frees only).
+        pub fn removeRole(self: *Engine, name: []const u8) error{UnknownRole}!void {
+            const gpa = self.gpa;
+            var kv = self.roles.fetchRemove(name) orelse return error.UnknownRole;
+            kv.value.deinit(gpa);
+            gpa.free(kv.key);
+
+            // Hierarchy edges into the role.
+            var rit = self.roles.valueIterator();
+            while (rit.next()) |rd| {
+                var i: usize = 0;
+                while (i < rd.juniors.items.len) {
+                    const j = rd.juniors.items[i];
+                    if (std.mem.eql(u8, j, name)) {
+                        gpa.free(j);
+                        _ = rd.juniors.orderedRemove(i);
+                    } else i += 1;
+                }
+            }
+
+            // Assignments; drop users left without roles. Removing the
+            // current entry during iteration is safe: removal only marks
+            // the slot, it never moves or reallocates.
+            var ait = self.assignments.iterator();
+            while (ait.next()) |e| {
+                if (e.value_ptr.fetchRemove(name)) |k| gpa.free(k.key);
+                if (e.value_ptr.count() == 0) {
+                    const user = e.key_ptr.*;
+                    freeRoleSet(gpa, e.value_ptr);
+                    self.assignments.removeByPtr(e.key_ptr);
+                    gpa.free(user);
+                }
+            }
+
+            // SoD pairs naming the role.
+            var i: usize = 0;
+            while (i < self.sod.items.len) {
+                const pair = self.sod.items[i];
+                if (std.mem.eql(u8, pair.a, name) or std.mem.eql(u8, pair.b, name)) {
+                    gpa.free(pair.a);
+                    gpa.free(pair.b);
+                    _ = self.sod.orderedRemove(i);
+                } else i += 1;
+            }
         }
 
         fn roleGrantsDirect(self: *const Engine, role: []const u8, action: []const u8, resource: []const u8) bool {
@@ -772,6 +974,423 @@ test "rbac: addPermission/addHierarchy/addStaticSoD reject an unknown role" {
     try testing.expectError(error.UnknownRole, e.addHierarchy("ghost", "known"));
     try testing.expectError(error.UnknownRole, e.addStaticSoD("known", "ghost"));
     try testing.expectError(error.UnknownRole, e.assignRole("someone", "ghost"));
+}
+
+// -- RBAC: revoke / remove -----------------------------------------------------
+
+fn expectPermit(e: *const rbac.Engine, user: []const u8, action: []const u8, resource: []const u8) !void {
+    try testing.expectEqual(Result.permit, e.check(user, action, resource).result);
+}
+fn expectDeny(e: *const rbac.Engine, user: []const u8, action: []const u8, resource: []const u8) !void {
+    try testing.expectEqual(Result.deny, e.check(user, action, resource).result);
+}
+
+test "rbac: unassignRole revokes the grant (sibling: other users and roles keep theirs)" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    try e.assignRole("alice", "viewer");
+    try e.assignRole("alice", "editor");
+    try e.assignRole("bob", "viewer");
+    try expectPermit(&e, "alice", "read", "doc");
+
+    try testing.expect(try e.unassignRole("alice", "viewer"));
+    try expectDeny(&e, "alice", "read", "doc");
+    try expectPermit(&e, "alice", "write", "doc"); // her other role stays
+    try expectPermit(&e, "bob", "read", "doc"); // other users unaffected
+
+    // Last role gone: the user is dropped, still default-deny.
+    try testing.expect(try e.unassignRole("alice", "editor"));
+    try expectDeny(&e, "alice", "write", "doc");
+    try testing.expectEqual(@as(usize, 1), e.assignments.count());
+    // Assign again after revoke works.
+    try e.assignRole("alice", "viewer");
+    try expectPermit(&e, "alice", "read", "doc");
+}
+
+test "rbac: unassignRole of a role held only via inheritance is a no-op" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    try e.addHierarchy("editor", "viewer");
+    try e.assignRole("bob", "editor");
+    try testing.expect(!(try e.unassignRole("bob", "viewer"))); // never assigned directly
+    try expectPermit(&e, "bob", "read", "doc"); // inheritance intact
+}
+
+test "rbac: removePermission revokes the direct grant and inherited copies" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    try e.addPermission("viewer", .{ .action = "list", .resource = "doc" });
+    try e.addHierarchy("editor", "viewer");
+    try e.assignRole("alice", "viewer");
+    try e.assignRole("bob", "editor");
+    try expectPermit(&e, "alice", "read", "doc");
+    try expectPermit(&e, "bob", "read", "doc");
+
+    try testing.expect(try e.removePermission("viewer", .{ .action = "read", .resource = "doc" }));
+    try expectDeny(&e, "alice", "read", "doc");
+    try expectDeny(&e, "bob", "read", "doc"); // inherited copy gone too
+    try expectPermit(&e, "alice", "list", "doc"); // sibling permission stays
+    try expectPermit(&e, "bob", "write", "doc"); // senior's own permission stays
+    // Only the exact (action, resource) pair goes.
+    try e.addPermission("viewer", .{ .action = "read", .resource = "other" });
+    try testing.expect(!(try e.removePermission("viewer", .{ .action = "read", .resource = "doc" })));
+    try expectPermit(&e, "alice", "read", "other");
+}
+
+test "rbac: addPermission/addHierarchy/addStaticSoD are idempotent, one removal undoes them" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    try e.addPermission("viewer", .{ .action = "read", .resource = "doc" }); // duplicate
+    try e.addHierarchy("editor", "viewer");
+    try e.addHierarchy("editor", "viewer"); // duplicate
+    try e.addStaticSoD("editor", "viewer");
+    try e.addStaticSoD("viewer", "editor"); // duplicate, other order
+    try testing.expectEqual(@as(usize, 1), e.roles.get("viewer").?.permissions.items.len);
+    try testing.expectEqual(@as(usize, 1), e.roles.get("editor").?.juniors.items.len);
+    try testing.expectEqual(@as(usize, 1), e.sod.items.len);
+
+    try e.assignRole("bob", "editor");
+    try testing.expect(try e.removePermission("viewer", .{ .action = "read", .resource = "doc" }));
+    try expectDeny(&e, "bob", "read", "doc"); // a single removal fully revokes
+    try testing.expect(try e.removeHierarchy("editor", "viewer"));
+    try testing.expect(!(try e.removeHierarchy("editor", "viewer")));
+    try testing.expect(try e.removeStaticSoD("viewer", "editor"));
+    try testing.expect(!(try e.removeStaticSoD("editor", "viewer")));
+}
+
+test "rbac: removeRole cascades — assignments, permissions, edges, SoD; others unaffected" {
+    var e = rbac.Engine.init(testing.allocator);
+    defer e.deinit();
+    for ([_][]const u8{ "admin", "editor", "viewer", "auditor" }) |r| try e.addRole(r);
+    try e.addPermission("admin", .{ .action = "delete", .resource = "doc" });
+    try e.addPermission("editor", .{ .action = "write", .resource = "doc" });
+    try e.addPermission("viewer", .{ .action = "read", .resource = "doc" });
+    try e.addPermission("auditor", .{ .action = "audit", .resource = "log" });
+    try e.addHierarchy("admin", "editor");
+    try e.addHierarchy("editor", "viewer");
+    try e.addStaticSoD("editor", "auditor");
+    try e.assignRole("alice", "editor"); // holds the doomed role only
+    try e.assignRole("bob", "editor");
+    try e.assignRole("bob", "viewer"); // holds another role too
+    try e.assignRole("carol", "admin"); // reaches it only via hierarchy
+    try e.assignRole("dave", "auditor");
+    try expectPermit(&e, "carol", "write", "doc");
+
+    try e.removeRole("editor");
+
+    try testing.expect(!e.roles.contains("editor"));
+    try expectDeny(&e, "alice", "write", "doc"); // former holder
+    try expectDeny(&e, "alice", "read", "doc");
+    try expectDeny(&e, "bob", "write", "doc");
+    try expectPermit(&e, "bob", "read", "doc"); // bob's other role survives
+    try expectDeny(&e, "carol", "write", "doc"); // inherited grant gone
+    try expectPermit(&e, "carol", "delete", "doc"); // admin's own stays
+    try expectDeny(&e, "carol", "read", "doc"); // not bridged through the hole
+    try expectPermit(&e, "dave", "audit", "log"); // unrelated role unaffected
+    try testing.expect(!e.assignments.contains("alice")); // user without roles dropped
+    try testing.expectEqual(@as(usize, 0), e.roles.get("admin").?.juniors.items.len);
+    try testing.expectEqual(@as(usize, 1), e.roles.get("viewer").?.permissions.items.len);
+    try testing.expectEqual(@as(usize, 0), e.sod.items.len);
+    // Assigning/unassigning the deleted role is now UnknownRole.
+    try testing.expectError(error.UnknownRole, e.assignRole("alice", "editor"));
+    try testing.expectError(error.UnknownRole, e.unassignRole("bob", "editor"));
+    try testing.expectError(error.UnknownRole, e.addHierarchy("admin", "editor"));
+    // Re-creating the name yields a fresh, empty role (nothing resurrected).
+    try e.addRole("editor");
+    try e.assignRole("erin", "editor");
+    try expectDeny(&e, "erin", "write", "doc");
+    try expectDeny(&e, "alice", "write", "doc");
+    try e.assignRole("dave", "editor"); // the old editor/auditor SoD is gone
+}
+
+test "rbac: removeHierarchy in a chain A>B>C revokes C's permission from A" {
+    var e = rbac.Engine.init(testing.allocator);
+    defer e.deinit();
+    for ([_][]const u8{ "a", "b", "c" }) |r| try e.addRole(r);
+    try e.addPermission("c", .{ .action = "read", .resource = "c" });
+    try e.addPermission("b", .{ .action = "read", .resource = "b" });
+    try e.addHierarchy("a", "b");
+    try e.addHierarchy("b", "c");
+    try e.assignRole("u", "a");
+    try expectPermit(&e, "u", "read", "c");
+    try expectPermit(&e, "u", "read", "b");
+
+    // Middle edge: A keeps B, loses C.
+    try testing.expect(try e.removeHierarchy("b", "c"));
+    try expectDeny(&e, "u", "read", "c");
+    try expectPermit(&e, "u", "read", "b");
+
+    // Sibling: the edge can be restored, and removing the TOP edge instead
+    // drops both B and C from A.
+    try e.addHierarchy("b", "c");
+    try expectPermit(&e, "u", "read", "c");
+    try testing.expect(try e.removeHierarchy("a", "b"));
+    try expectDeny(&e, "u", "read", "c");
+    try expectDeny(&e, "u", "read", "b");
+    // Removal reopens what the cycle check forbade: c > a is now legal.
+    try e.addHierarchy("c", "a");
+}
+
+test "rbac: removeHierarchy in a diamond keeps the permission reachable via the other path" {
+    var e = rbac.Engine.init(testing.allocator);
+    defer e.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |r| try e.addRole(r);
+    try e.addPermission("d", .{ .action = "read", .resource = "d" });
+    try e.addHierarchy("a", "b");
+    try e.addHierarchy("a", "c");
+    try e.addHierarchy("b", "d");
+    try e.addHierarchy("c", "d");
+    try e.assignRole("u", "a");
+
+    try testing.expect(try e.removeHierarchy("a", "b"));
+    try expectPermit(&e, "u", "read", "d"); // still via a > c > d
+    try testing.expect(try e.removeHierarchy("a", "c"));
+    try expectDeny(&e, "u", "read", "d"); // last path gone
+}
+
+test "rbac: SoD interaction — unassign frees the conflict, removeStaticSoD lifts it" {
+    var e = rbac.Engine.init(testing.allocator);
+    defer e.deinit();
+    try e.addRole("payer");
+    try e.addRole("approver");
+    try e.addStaticSoD("payer", "approver");
+    try e.assignRole("dave", "payer");
+    try testing.expectError(error.ConflictingRole, e.assignRole("dave", "approver"));
+
+    try testing.expect(try e.unassignRole("dave", "payer"));
+    try e.assignRole("dave", "approver"); // no longer conflicts
+    try testing.expectError(error.ConflictingRole, e.assignRole("dave", "payer"));
+
+    try testing.expect(try e.removeStaticSoD("approver", "payer"));
+    try e.assignRole("dave", "payer"); // constraint lifted
+    // Lifting SoD leaves existing assignments alone; re-declaring is allowed.
+    try e.addStaticSoD("payer", "approver");
+    try testing.expectEqual(@as(usize, 2), e.assignments.get("dave").?.count());
+}
+
+test "rbac: removing a missing item — unknown role errors, absent relation is a no-op false" {
+    var e = try buildBasicEngine(testing.allocator);
+    defer e.deinit();
+    const p: rbac.Permission = .{ .action = "read", .resource = "doc" };
+
+    try testing.expectError(error.UnknownRole, e.removeRole("ghost"));
+    try testing.expectError(error.UnknownRole, e.unassignRole("alice", "ghost"));
+    try testing.expectError(error.UnknownRole, e.removePermission("ghost", p));
+    try testing.expectError(error.UnknownRole, e.removeHierarchy("ghost", "viewer"));
+    try testing.expectError(error.UnknownRole, e.removeHierarchy("viewer", "ghost"));
+    try testing.expectError(error.UnknownRole, e.removeStaticSoD("ghost", "viewer"));
+
+    try testing.expect(!(try e.unassignRole("nobody", "viewer")));
+    try testing.expect(!(try e.removePermission("editor", p)));
+    try testing.expect(!(try e.removeHierarchy("editor", "viewer")));
+    try testing.expect(!(try e.removeStaticSoD("editor", "viewer")));
+    try e.removeRole("editor");
+    try testing.expectError(error.UnknownRole, e.removeRole("editor")); // second delete
+    // The engine is intact after all of the above.
+    try e.assignRole("alice", "viewer");
+    try expectPermit(&e, "alice", "read", "doc");
+}
+
+test "rbac: churn — assign/unassign and friends 10k times keep memory bounded" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var e = rbac.Engine.init(fa.allocator());
+    defer e.deinit();
+    try e.addRole("keep");
+    try e.addPermission("keep", .{ .action = "read", .resource = "doc" });
+    try e.assignRole("holder", "keep");
+
+    const Round = struct {
+        fn run(eng: *rbac.Engine, i: usize) !void {
+            var buf: [24]u8 = undefined;
+            const user = std.fmt.bufPrint(&buf, "user-{d}", .{i}) catch unreachable;
+            try eng.assignRole("u", "keep"); // the same pair over and over
+            try eng.assignRole("u", "keep"); // duplicate assign must not allocate
+            _ = try eng.unassignRole("u", "keep");
+            try eng.assignRole(user, "keep"); // a fresh user every round
+            _ = try eng.unassignRole(user, "keep");
+            try eng.addRole("tmp");
+            try eng.addPermission("tmp", .{ .action = "x", .resource = "y" });
+            try eng.addPermission("tmp", .{ .action = "x", .resource = "y" });
+            try eng.addHierarchy("tmp", "keep");
+            try eng.addStaticSoD("tmp", "keep");
+            try eng.assignRole("t", "tmp");
+            if (i % 2 == 0) {
+                try eng.removeRole("tmp"); // cascade path
+            } else {
+                _ = try eng.unassignRole("t", "tmp");
+                _ = try eng.removePermission("tmp", .{ .action = "x", .resource = "y" });
+                _ = try eng.removeHierarchy("tmp", "keep");
+                _ = try eng.removeStaticSoD("tmp", "keep");
+                try eng.removeRole("tmp");
+            }
+        }
+    };
+
+    // Warm up (hash maps reach their working capacity), then measure.
+    for (0..16) |i| try Round.run(&e, i);
+    const live_before = fa.allocated_bytes - fa.freed_bytes;
+    for (16..10_016) |i| try Round.run(&e, i); // 10k: a leak of even one byte per round would show
+    const live_after = fa.allocated_bytes - fa.freed_bytes;
+
+    try testing.expect(live_after <= live_before + 256); // slack for map capacity steps
+    try testing.expectEqual(@as(usize, 1), e.roles.count());
+    try testing.expectEqual(@as(usize, 1), e.assignments.count());
+    try testing.expectEqual(@as(usize, 0), e.sod.items.len);
+    try expectPermit(&e, "holder", "read", "doc");
+}
+
+/// Naive reference model of the whole engine over a tiny universe:
+/// boolean matrices, effective permissions recomputed from scratch.
+const RefModel = struct {
+    const R = 5;
+    const U = 3;
+    const P = 3;
+    exists: [R]bool,
+    perm: [R][P]bool,
+    edge: [R][R]bool, // edge[s][j]: s is senior of j
+    assign: [U][R]bool,
+    sod: [R][R]bool, // symmetric
+
+    fn reaches(m: *const RefModel, from: usize, to: usize) bool {
+        if (from == to) return true;
+        for (0..R) |j| {
+            if (m.edge[from][j] and m.reaches(j, to)) return true;
+        }
+        return false;
+    }
+
+    fn effective(m: *const RefModel, u: usize, p: usize) bool {
+        for (0..R) |r| {
+            if (!m.assign[u][r]) continue;
+            for (0..R) |t| {
+                if (m.reaches(r, t) and m.perm[t][p]) return true;
+            }
+        }
+        return false;
+    }
+};
+
+test "rbac: random add/remove sequences agree with a naive recomputation" {
+    const role_names = [_][]const u8{ "r0", "r1", "r2", "r3", "r4" };
+    const user_names = [_][]const u8{ "u0", "u1", "u2" };
+    const actions = [_][]const u8{ "p0", "p1", "p2" };
+    const R = RefModel.R;
+    const U = RefModel.U;
+    const P = RefModel.P;
+
+    var prng = std.Random.DefaultPrng.init(0x5eed_0b1e);
+    const rnd = prng.random();
+
+    for (0..6) |_| { // six independent engines from one deterministic stream
+        var e = rbac.Engine.init(testing.allocator);
+        defer e.deinit();
+        var m = std.mem.zeroes(RefModel);
+
+        for (0..1500) |step| {
+            const r = rnd.uintLessThan(usize, R);
+            const r2 = rnd.uintLessThan(usize, R);
+            const u = rnd.uintLessThan(usize, U);
+            const p = rnd.uintLessThan(usize, P);
+            const perm: rbac.Permission = .{ .action = actions[p], .resource = "res" };
+            switch (rnd.uintLessThan(u8, 10)) {
+                0 => {
+                    try e.addRole(role_names[r]);
+                    m.exists[r] = true;
+                },
+                1 => {
+                    if (m.exists[r]) {
+                        try e.removeRole(role_names[r]);
+                        m.exists[r] = false;
+                        m.perm[r] = @splat(false);
+                        for (0..R) |j| {
+                            m.edge[r][j] = false;
+                            m.edge[j][r] = false;
+                            m.sod[r][j] = false;
+                            m.sod[j][r] = false;
+                        }
+                        for (0..U) |k| m.assign[k][r] = false;
+                    } else try testing.expectError(error.UnknownRole, e.removeRole(role_names[r]));
+                },
+                2 => {
+                    if (m.exists[r]) {
+                        try e.addPermission(role_names[r], perm);
+                        m.perm[r][p] = true;
+                    } else try testing.expectError(error.UnknownRole, e.addPermission(role_names[r], perm));
+                },
+                3 => {
+                    if (m.exists[r]) {
+                        try testing.expectEqual(m.perm[r][p], try e.removePermission(role_names[r], perm));
+                        m.perm[r][p] = false;
+                    } else try testing.expectError(error.UnknownRole, e.removePermission(role_names[r], perm));
+                },
+                4 => {
+                    const res = e.addHierarchy(role_names[r], role_names[r2]);
+                    if (!m.exists[r] or !m.exists[r2]) {
+                        try testing.expectError(error.UnknownRole, res);
+                    } else if (r == r2 or m.reaches(r2, r)) {
+                        try testing.expectError(error.CyclicHierarchy, res);
+                    } else {
+                        try res;
+                        m.edge[r][r2] = true;
+                    }
+                },
+                5 => {
+                    if (m.exists[r] and m.exists[r2]) {
+                        try testing.expectEqual(m.edge[r][r2], try e.removeHierarchy(role_names[r], role_names[r2]));
+                        m.edge[r][r2] = false;
+                    } else try testing.expectError(error.UnknownRole, e.removeHierarchy(role_names[r], role_names[r2]));
+                },
+                6 => {
+                    const res = e.assignRole(user_names[u], role_names[r]);
+                    if (!m.exists[r]) {
+                        try testing.expectError(error.UnknownRole, res);
+                    } else {
+                        var clash = false;
+                        for (0..R) |h| {
+                            if (m.assign[u][h] and m.sod[h][r]) clash = true;
+                        }
+                        if (clash) {
+                            try testing.expectError(error.ConflictingRole, res);
+                        } else {
+                            try res;
+                            m.assign[u][r] = true;
+                        }
+                    }
+                },
+                7 => {
+                    if (m.exists[r]) {
+                        try testing.expectEqual(m.assign[u][r], try e.unassignRole(user_names[u], role_names[r]));
+                        m.assign[u][r] = false;
+                    } else try testing.expectError(error.UnknownRole, e.unassignRole(user_names[u], role_names[r]));
+                },
+                8 => {
+                    if (m.exists[r] and m.exists[r2]) {
+                        try e.addStaticSoD(role_names[r], role_names[r2]);
+                        m.sod[r][r2] = true;
+                        m.sod[r2][r] = true;
+                    } else try testing.expectError(error.UnknownRole, e.addStaticSoD(role_names[r], role_names[r2]));
+                },
+                else => {
+                    if (m.exists[r] and m.exists[r2]) {
+                        try testing.expectEqual(m.sod[r][r2], try e.removeStaticSoD(role_names[r], role_names[r2]));
+                        m.sod[r][r2] = false;
+                        m.sod[r2][r] = false;
+                    } else try testing.expectError(error.UnknownRole, e.removeStaticSoD(role_names[r], role_names[r2]));
+                },
+            }
+            // Full comparison of every decision after every step.
+            for (0..U) |k| {
+                for (0..P) |q| {
+                    const want = m.effective(k, q);
+                    const got = e.check(user_names[k], actions[q], "res").isPermit();
+                    if (want != got) {
+                        std.debug.print("mismatch at step {d}: user {d} perm {d} want {} got {}\n", .{ step, k, q, want, got });
+                        return error.TestExpectedEqual;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // -- ABAC ---------------------------------------------------------------------
