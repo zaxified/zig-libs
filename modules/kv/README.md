@@ -49,19 +49,42 @@ _ = db.exists("key");              // in-memory
 _ = db.count();                    // in-memory
 if (db.deadBytes() > 1 << 20)      // caller-driven compaction (v0)
     try db.compact();              // temp + fsync + rename + dir-fsync swap
+
+// Listing: sorted copies of the live keys under a prefix ("" = all).
+const ks = try db.keys(gpa, "user:");
+defer ks.deinit(gpa);
+for (ks.keys) |k| _ = k;
+
+// Expiry (wall clock, ms since the Unix epoch — survives a restart):
+try db.putTtl("sess:ab12", "…", 30 * 60 * 1000);      // absent 30 min from now
+try db.putExpiring("otp:42", "…", deadline_ms);        // absent from deadline_ms on
+_ = db.expiresAt("sess:ab12");                         // ?Expiry: .never / .at_ms
 ```
+
+Expired keys are absent to `get`, `exists`, `count` and `keys` at once; `open`
+and `compact` drop them from memory and from the file, and `deadBytes` counts
+them as waste. Nothing expires in the background: memory and disk are freed by
+the next `compact` (or restart). A store that never writes an expiring key never
+reads the clock and keeps `count` O(1).
 
 Options: `read_verify` (default true) re-checks the whole record CRC on every
 `get`, so even post-`open` file rot is caught — corrupt data is **never**
 served. `lock` (default `.exclusive`) takes the cross-process lock described
-below; `.none` opts out.
+below; `.none` opts out. `clock` (default `CLOCK_REALTIME`) decides expiry;
+tests inject their own.
 
-## On-disk format (v1, little-endian)
+## On-disk format (v1/v2, little-endian)
 
 ```
-header:  "ZKVL" | version:u32            (8 bytes)
-record:  crc32:u32 | op:u8 (0=put 1=del) | key_len:u32 | val_len:u32 | key | value
+header:  "ZKVL" | version:u32            (8 bytes; 1, or 2 once a key has expired-capable records)
+record:  crc32:u32 | op:u8 (0=put 1=del 2=put-with-expiry) | key_len:u32 | val_len:u32
+         | [expires_at:i64, op 2 only] | key | value
 ```
+
+A store stays at version 1 until its first expiring put, which upgrades it by
+one compaction (atomic rewrite, never an in-place header edit). An older build
+of this module refuses a version-2 file with `error.UnsupportedVersion` rather
+than taking op 2 for a torn record and truncating the log there.
 
 CRC-32 (IEEE) covers everything after the crc field. `open` replays the log
 to rebuild the keydir; replay stops at the first torn/corrupt record and

@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — Key listing and per-key expiry (maturity task C9). `Db.keys(gpa, prefix)`:
+  sorted copies of the live keys under a prefix (new `KeyList`). `Db.putExpiring(key, value,
+  expires_at_ms)` / `Db.putTtl(key, value, ttl_ms)` / `Db.expiresAt(key) ?Expiry`: an expired key
+  is absent to every read at once and dropped from memory and file by `open` and `compact`.
+  Wall clock (`Options.clock`, default `CLOCK_REALTIME`, new `Clock`), read only while the store
+  holds expiring keys. On-disk format **v2** (new op 2 with an `expires_at` field); a v1 store
+  is upgraded by one compaction at its first expiring put, and stays v1 otherwise. ⚠ A build
+  of `kv` older than this refuses a v2 file (`error.UnsupportedVersion`) — do not downgrade a
+  store that has used expiry. A deleted key whose expiry had already passed still gets its
+  tombstone, so a wall clock stepped back cannot revive it. Crash sweep over the upgrade and
+  expiry workload in all four crash modes; mutation-checked (22 of 23 killed, the survivor
+  equivalent to the CRC check).
+
 - **2026-09-29** — `Storage.list(gpa, prefix)`: the backend's files under a prefix, sorted, as an
   owned `Storage.Listing`; `null` from a backend that cannot list (new optional
   `VTable.list`, default `null`). `FsStorage` and `SimStorage` implement it (the simulator lists

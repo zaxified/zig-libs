@@ -54,6 +54,11 @@
 //! can crash the "machine" at every single injection point — the bounded
 //! mini-VOPR sweep in `fault_test.zig` is the module's reliability argument.
 //!
+//! **Key expiry** (`putExpiring`/`putTtl`): an expired key is absent to every
+//! read at once; `open` and `compact` drop it from memory and file. Wall clock
+//! (`Options.clock`), read only while expiring keys exist. Format v2, reached by
+//! one compaction at the first expiring put — see SPEC § "Key expiry".
+//!
 //! Future phases (deliberately NOT in v0): full randomized VOPR at scale,
 //! immutable/MVCC on-disk structure (HAMT/B-tree) with lockless readers,
 //! ordered/ranged scans, transactions/batches, secondary indexes, automatic
@@ -93,34 +98,88 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 
 // ── on-disk format ───────────────────────────────────────────────────────────
 //
-// File header (8 bytes):        Record (13 + key_len + value_len bytes):
+// File header (8 bytes):        Record (13 [+ 8] + key_len + value_len bytes):
 //   [0..4)  magic "ZKVL"          [0..4)   crc32 (IEEE) over bytes [4..end)
-//   [4..8)  version u32 LE = 1    [4]      op: 0 = put, 1 = del
-//                                 [5..9)   key_len   u32 LE
-//                                 [9..13)  value_len u32 LE (0 for del)
-//                                 [13..13+key_len)        key bytes
-//                                 [13+key_len .. end)     value bytes
+//   [4..8)  version u32 LE        [4]      op: 0 = put, 1 = del, 2 = put with expiry
+//           1 = ops 0 and 1       [5..9)   key_len   u32 LE
+//           2 = also op 2         [9..13)  value_len u32 LE (0 for del)
+//                                 op 2 only: [13..21) expires_at i64 LE (ms since
+//                                            the Unix epoch, never `no_expiry`)
+//                                 then key bytes, then value bytes
+//
+// A store stays at version 1 until its first expiring put, which upgrades it by
+// compaction (the atomic rewrite, never an in-place header write). A reader that
+// knows only version 1 refuses a version-2 file (`UnsupportedVersion`) instead of
+// meeting op 2 mid-log, taking it for a torn record and truncating live data.
 
 const file_magic = "ZKVL";
-const file_version: u32 = 1;
+const version_plain: u32 = 1;
+const version_expiry: u32 = 2;
 const header_len = 8;
 const rec_fixed = 13;
+const exp_len = 8;
 
 const op_put: u8 = 0;
 const op_del: u8 = 1;
+const op_put_exp: u8 = 2;
+
+/// The keydir's "this record has no expiry" marker. Never written to disk: an
+/// op-2 record carrying it is not one this module wrote, and reads as corrupt.
+const no_expiry: i64 = std.math.maxInt(i64);
 
 fn recordLen(key_len: u64, value_len: u64) u64 {
     return rec_fixed + key_len + value_len;
 }
 
+fn recordLenExp(expires: bool, key_len: u64, value_len: u64) u64 {
+    return recordLen(key_len, value_len) + @as(u64, if (expires) exp_len else 0);
+}
+
 /// Serialize one record into `buf` (`buf.len == recordLen(...)`).
 fn encodeRecord(buf: []u8, op: u8, key: []const u8, value: []const u8) void {
+    encodeRecordExp(buf, op, no_expiry, key, value);
+}
+
+/// Serialize one record; `op_put_exp` carries `expires_at` (`buf.len ==
+/// recordLenExp(true, ...)`), every other op ignores it.
+fn encodeRecordExp(buf: []u8, op: u8, expires_at: i64, key: []const u8, value: []const u8) void {
     buf[4] = op;
     std.mem.writeInt(u32, buf[5..9], @intCast(key.len), .little);
     std.mem.writeInt(u32, buf[9..13], @intCast(value.len), .little);
-    @memcpy(buf[rec_fixed..][0..key.len], key);
-    @memcpy(buf[rec_fixed + key.len ..][0..value.len], value);
+    var body: usize = rec_fixed;
+    if (op == op_put_exp) {
+        std.mem.writeInt(i64, buf[rec_fixed..][0..exp_len], expires_at, .little);
+        body += exp_len;
+    }
+    @memcpy(buf[body..][0..key.len], key);
+    @memcpy(buf[body + key.len ..][0..value.len], value);
     std.mem.writeInt(u32, buf[0..4], std.hash.Crc32.hash(buf[4..]), .little);
+}
+
+// ── wall clock (expiry only) ─────────────────────────────────────────────────
+
+/// Wall-clock source for key expiry, in milliseconds since the Unix epoch.
+/// Wall time and not monotonic time, because an expiry is stored on disk and
+/// must still mean the same instant after a reboot, when a monotonic clock
+/// starts over. Read only for keys that carry an expiry: a store that never
+/// calls `putExpiring`/`putTtl` never reads it. Injected so tests are
+/// deterministic.
+pub const Clock = struct {
+    ctx: ?*anyopaque = null,
+    nowFn: *const fn (?*anyopaque) i64,
+
+    /// `CLOCK_REALTIME`, the production default.
+    pub const realtime: Clock = .{ .nowFn = realtimeNowMs };
+
+    pub fn now(c: Clock) i64 {
+        return c.nowFn(c.ctx);
+    }
+};
+
+fn realtimeNowMs(_: ?*anyopaque) i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
 
 // ── Storage: the injectable seam ─────────────────────────────────────────────
@@ -749,6 +808,30 @@ pub const Options = struct {
 
     /// Cross-process exclusion policy (default: on). See `LockPolicy`.
     lock: LockPolicy = .exclusive,
+
+    /// Wall clock that decides whether an expiring key is still live. Read
+    /// only when the store holds expiring keys. See `Clock`.
+    clock: Clock = .realtime,
+};
+
+/// A key's expiry, as `expiresAt` reports it.
+pub const Expiry = union(enum) {
+    /// Written by `put`: lives until overwritten or deleted.
+    never,
+    /// Written by `putExpiring`/`putTtl`: absent from `at_ms` on (ms since the
+    /// Unix epoch, `Options.clock`).
+    at_ms: i64,
+};
+
+/// Live keys as `keys` returns them, sorted bytewise ascending. The slice and
+/// every key in it belong to the allocator passed to `keys`.
+pub const KeyList = struct {
+    keys: [][]u8,
+
+    pub fn deinit(l: KeyList, gpa: Allocator) void {
+        for (l.keys) |k| gpa.free(k);
+        gpa.free(l.keys);
+    }
 };
 
 pub const LockPolicy = enum {
@@ -818,15 +901,37 @@ pub const Db = struct {
     poisoned: bool,
     lock: std.atomic.Mutex,
     options: Options,
+    /// On-disk format version of the open data file: `version_plain` until
+    /// the first expiring put upgrades it (see the format comment).
+    version: u32,
+    /// Keydir entries that carry an expiry. While it is 0 no operation reads
+    /// the clock and `count` stays O(1).
+    expiring: usize,
 
     const Entry = struct {
         /// Absolute file offset of the record.
         off: u64,
         key_len: u32,
         val_len: u32,
+        /// `no_expiry`, or the ms instant (Unix epoch) from which the key is
+        /// absent.
+        expires_at: i64 = no_expiry,
+
+        fn expires(e: Entry) bool {
+            return e.expires_at != no_expiry;
+        }
 
         fn recLen(e: Entry) u64 {
-            return recordLen(e.key_len, e.val_len);
+            return recordLenExp(e.expires(), e.key_len, e.val_len);
+        }
+
+        /// Offset of the key bytes inside the file.
+        fn keyOff(e: Entry) u64 {
+            return e.off + rec_fixed + @as(u64, if (e.expires()) exp_len else 0);
+        }
+
+        fn liveAt(e: Entry, now: i64) bool {
+            return now < e.expires_at;
         }
     };
 
@@ -858,6 +963,8 @@ pub const Db = struct {
             .poisoned = false,
             .lock = .unlocked,
             .options = options,
+            .version = version_plain,
+            .expiring = 0,
         };
         errdefer gpa.free(self.path);
         self.tmp_path = try std.fmt.allocPrint(gpa, "{s}.compact", .{path});
@@ -904,7 +1011,7 @@ pub const Db = struct {
             const n = try store.pread(self.file, have[0..@intCast(file_size)], 0);
             var want: [header_len]u8 = undefined;
             want[0..4].* = file_magic.*;
-            std.mem.writeInt(u32, want[4..8], file_version, .little);
+            std.mem.writeInt(u32, want[4..8], version_plain, .little);
             if (!std.mem.eql(u8, have[0..n], want[0..n])) return error.NotAKvFile;
             if (file_size != 0) try store.truncate(self.file, 0);
             try store.writeAll(self.file, &want, 0);
@@ -913,7 +1020,8 @@ pub const Db = struct {
             var hdr: [header_len]u8 = undefined;
             try store.preadFull(self.file, &hdr, 0);
             if (!std.mem.eql(u8, hdr[0..4], file_magic)) return error.NotAKvFile;
-            if (std.mem.readInt(u32, hdr[4..8], .little) != file_version)
+            self.version = std.mem.readInt(u32, hdr[4..8], .little);
+            if (self.version != version_plain and self.version != version_expiry)
                 return error.UnsupportedVersion;
             try self.replay(file_size);
         }
@@ -940,17 +1048,54 @@ pub const Db = struct {
     /// Insert or overwrite `key`. Durable when this returns: the record has
     /// been appended AND fsync'd (see the module doc for what fsync can and
     /// cannot promise). On a storage error the store poisons itself.
+    /// Overwriting an expiring key removes its expiry.
     pub fn put(self: *Db, key: []const u8, value: []const u8) MutateError!void {
         lockSpin(&self.lock);
         defer self.lock.unlock();
+        return self.putLocked(key, value, no_expiry);
+    }
+
+    /// `put` with an expiry: from `expires_at_ms` (ms since the Unix epoch,
+    /// read against `Options.clock`) on, `key` is absent to every read,
+    /// `keys` and `count`; `compact` and `open` drop it from the file and
+    /// memory. An instant already past is accepted and leaves the key absent
+    /// at once (Redis `SET … EXAT` in the past does the same).
+    ///
+    /// The first expiring put into a store still at format version 1
+    /// upgrades it to version 2 by running `compact` first — one full rewrite,
+    /// once in the store's life — so that a reader knowing only version 1
+    /// refuses the file instead of truncating it at the first expiring
+    /// record. Compaction errors are returned as they are from `compact`.
+    pub fn putExpiring(self: *Db, key: []const u8, value: []const u8, expires_at_ms: i64) CompactError!void {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        if (self.poisoned) return error.Poisoned;
+        // `no_expiry` is the keydir's marker, not an instant; a key living to
+        // the end of i64 time is a key without expiry.
+        if (expires_at_ms == no_expiry) return self.putLocked(key, value, no_expiry);
+        if (self.version < version_expiry) try self.compactLocked(version_expiry);
+        return self.putLocked(key, value, expires_at_ms);
+    }
+
+    /// `putExpiring` at `ttl_ms` from now (`Options.clock`), saturating.
+    pub fn putTtl(self: *Db, key: []const u8, value: []const u8, ttl_ms: u64) CompactError!void {
+        const now = self.options.clock.now();
+        const ttl: i64 = std.math.cast(i64, ttl_ms) orelse std.math.maxInt(i64);
+        // Saturates at `no_expiry`: a TTL past the end of i64 time never expires.
+        return self.putExpiring(key, value, now +| ttl);
+    }
+
+    fn putLocked(self: *Db, key: []const u8, value: []const u8, expires_at: i64) MutateError!void {
         if (self.poisoned) return error.Poisoned;
         if (key.len > std.math.maxInt(u32)) return error.KeyTooLong;
         if (value.len > std.math.maxInt(u32)) return error.ValueTooLong;
+        const expires = expires_at != no_expiry;
+        std.debug.assert(!expires or self.version >= version_expiry);
 
-        const rec_len: usize = @intCast(recordLen(key.len, value.len));
+        const rec_len: usize = @intCast(recordLenExp(expires, key.len, value.len));
         const rec = try self.gpa.alloc(u8, rec_len);
         defer self.gpa.free(rec);
-        encodeRecord(rec, op_put, key, value);
+        encodeRecordExp(rec, if (expires) op_put_exp else op_put, expires_at, key, value);
 
         // Reserve all keydir memory BEFORE the write hits the disk, so a
         // durable record can never fail to be reflected in memory.
@@ -974,18 +1119,23 @@ pub const Db = struct {
             return e;
         };
 
-        const entry = Entry{ .off = self.end, .key_len = @intCast(key.len), .val_len = @intCast(value.len) };
+        const entry = Entry{ .off = self.end, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at };
         if (existing) |e| {
             self.dead_bytes += e.recLen();
+            if (e.expires()) self.expiring -= 1;
             e.* = entry;
         } else {
             self.keydir.putAssumeCapacity(new_key.?, entry);
         }
+        if (expires) self.expiring += 1;
         self.end += rec_len;
     }
 
     /// Delete `key` (append a durable tombstone). Deleting an absent key is
-    /// a no-op — no I/O, no error.
+    /// a no-op — no I/O, no error. A key that has expired but is still in
+    /// memory (not yet dropped by `compact`/`open`) gets its tombstone
+    /// anyway: without it, a wall clock stepped back before the expiry would
+    /// bring the deleted key back.
     pub fn delete(self: *Db, key: []const u8) MutateError!void {
         lockSpin(&self.lock);
         defer self.lock.unlock();
@@ -1007,20 +1157,29 @@ pub const Db = struct {
         };
 
         self.dead_bytes += existing.recLen() + rec_len;
+        if (existing.expires()) self.expiring -= 1;
         const kv = self.keydir.fetchRemove(key).?;
         self.gpa.free(@constCast(kv.key));
         self.end += rec_len;
     }
 
+    /// The keydir entry of `key` if it is live now. Caller holds the lock.
+    /// Reads the clock only for an entry that carries an expiry.
+    fn liveEntry(self: *Db, key: []const u8) ?Entry {
+        const e = self.keydir.get(key) orelse return null;
+        if (e.expires() and !e.liveAt(self.options.clock.now())) return null;
+        return e;
+    }
+
     /// Read the current value of `key` into memory allocated from `gpa`
-    /// (caller frees), or null if absent. With `Options.read_verify` (the
+    /// (caller frees), or null if absent or expired. With `Options.read_verify` (the
     /// default) the whole record's CRC is re-checked — a rotten record
     /// yields `error.Corrupt`, never bad bytes. Reads work on a poisoned
     /// store (they describe the last consistent state).
     pub fn get(self: *Db, gpa: Allocator, key: []const u8) GetError!?[]u8 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        const e = self.keydir.get(key) orelse return null;
+        const e = self.liveEntry(key) orelse return null;
 
         const value = try gpa.alloc(u8, e.val_len);
         errdefer gpa.free(value);
@@ -1039,7 +1198,7 @@ pub const Db = struct {
     pub fn getBuf(self: *Db, buf: []u8, key: []const u8) (GetError || error{BufferTooSmall})!?[]u8 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        const e = self.keydir.get(key) orelse return null;
+        const e = self.liveEntry(key) orelse return null;
         if (e.val_len > buf.len) return error.BufferTooSmall;
         const value = buf[0..e.val_len];
         try self.readValueLocked(e, key, value);
@@ -1051,35 +1210,47 @@ pub const Db = struct {
     pub fn valueLen(self: *Db, key: []const u8) ?u32 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        const e = self.keydir.get(key) orelse return null;
+        const e = self.liveEntry(key) orelse return null;
         return e.val_len;
+    }
+
+    /// `key`'s expiry, or null if absent or already expired. Pure in-memory.
+    pub fn expiresAt(self: *Db, key: []const u8) ?Expiry {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const e = self.liveEntry(key) orelse return null;
+        return if (e.expires()) .{ .at_ms = e.expires_at } else .never;
     }
 
     /// Fill `value` (already sized to `e.val_len`) from the log. Caller holds
     /// the lock.
-    fn readValueLocked(self: *Db, e: anytype, key: []const u8, value: []u8) GetError!void {
-        const val_off = e.off + rec_fixed + e.key_len;
+    fn readValueLocked(self: *Db, e: Entry, key: []const u8, value: []u8) GetError!void {
+        const key_off = e.keyOff();
+        const val_off = key_off + e.key_len;
 
         if (!self.options.read_verify) {
             return self.store.preadFull(self.file, value, val_off);
         }
 
         // Full-record verification: header fields must match the keydir and
-        // the CRC must hold over op+lens+key+value.
-        var hdr: [rec_fixed]u8 = undefined;
-        try self.store.preadFull(self.file, &hdr, e.off);
-        if (hdr[4] != op_put or
+        // the CRC must hold over op+lens[+expiry]+key+value.
+        var hdr: [rec_fixed + exp_len]u8 = undefined;
+        const hdr_len: usize = @intCast(key_off - e.off);
+        try self.store.preadFull(self.file, hdr[0..hdr_len], e.off);
+        if (hdr[4] != (if (e.expires()) op_put_exp else op_put) or
             std.mem.readInt(u32, hdr[5..9], .little) != e.key_len or
             std.mem.readInt(u32, hdr[9..13], .little) != e.val_len)
             return error.Corrupt;
+        if (e.expires() and std.mem.readInt(i64, hdr[rec_fixed..][0..exp_len], .little) != e.expires_at)
+            return error.Corrupt;
         var crc = std.hash.Crc32.init();
-        crc.update(hdr[4..]);
+        crc.update(hdr[4..hdr_len]);
         // Stream the key in bounded chunks; it must equal the requested key.
         var kbuf: [512]u8 = undefined;
         var koff: u64 = 0;
         while (koff < e.key_len) {
             const n: usize = @intCast(@min(kbuf.len, e.key_len - koff));
-            try self.store.preadFull(self.file, kbuf[0..n], e.off + rec_fixed + koff);
+            try self.store.preadFull(self.file, kbuf[0..n], key_off + koff);
             if (!std.mem.eql(u8, kbuf[0..n], key[@intCast(koff)..][0..n])) return error.Corrupt;
             crc.update(kbuf[0..n]);
             koff += n;
@@ -1093,23 +1264,67 @@ pub const Db = struct {
     pub fn exists(self: *Db, key: []const u8) bool {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        return self.keydir.contains(key);
+        return self.liveEntry(key) != null;
     }
 
-    /// Number of live keys (pure in-memory).
+    /// Number of live keys (pure in-memory). O(1) while no key carries an
+    /// expiry; otherwise one pass over the keydir, since a key can expire
+    /// without any operation touching it.
     pub fn count(self: *Db) usize {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        return self.keydir.count();
+        if (self.expiring == 0) return self.keydir.count();
+        const now = self.options.clock.now();
+        var n: usize = 0;
+        var it = self.keydir.valueIterator();
+        while (it.next()) |e| n += @intFromBool(e.liveAt(now));
+        return n;
     }
 
-    /// Bytes the log currently wastes on overwritten/deleted records —
-    /// the caller's signal for when `compact` is worth it (v0 compaction is
-    /// caller-driven; automatic thresholds are a noted phase).
+    /// Copies of the live keys that start with `prefix` (`""` = all), sorted
+    /// bytewise ascending — Bitcask's `list_keys`. A snapshot taken under the
+    /// lock: later writes do not change it. Pure in-memory; the values are
+    /// not read (use `get` per key).
+    pub fn keys(self: *Db, gpa: Allocator, prefix: []const u8) Allocator.Error!KeyList {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |k| gpa.free(k);
+            out.deinit(gpa);
+        }
+        {
+            lockSpin(&self.lock);
+            defer self.lock.unlock();
+            const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
+            var it = self.keydir.iterator();
+            while (it.next()) |kv| {
+                if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
+                if (kv.value_ptr.expires() and !kv.value_ptr.liveAt(now)) continue;
+                try out.ensureUnusedCapacity(gpa, 1);
+                out.appendAssumeCapacity(try gpa.dupe(u8, kv.key_ptr.*));
+            }
+        }
+        std.mem.sort([]u8, out.items, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        return .{ .keys = try out.toOwnedSlice(gpa) };
+    }
+
+    /// Bytes the log currently wastes on overwritten/deleted records and on
+    /// expired keys — the caller's signal for when `compact` is worth it (v0
+    /// compaction is caller-driven; automatic thresholds are a noted phase).
     pub fn deadBytes(self: *Db) u64 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        return self.dead_bytes;
+        if (self.expiring == 0) return self.dead_bytes;
+        const now = self.options.clock.now();
+        var dead = self.dead_bytes;
+        var it = self.keydir.valueIterator();
+        while (it.next()) |e| {
+            if (!e.liveAt(now)) dead += e.recLen();
+        }
+        return dead;
     }
 
     /// Rewrite live records into a fresh file and atomically swap it in
@@ -1118,16 +1333,27 @@ pub const Db = struct {
     /// old or the complete new file is what `open` finds — never a mix.
     /// Errors before the rename leave the store fully usable (the temp is
     /// discarded); errors at/after the rename poison the store (the
-    /// namespace state is uncertain until reopen).
+    /// namespace state is uncertain until reopen). Expired keys are left out
+    /// of the new file and dropped from memory.
     pub fn compact(self: *Db) CompactError!void {
         lockSpin(&self.lock);
         defer self.lock.unlock();
         if (self.poisoned) return error.Poisoned;
+        return self.compactLocked(self.version);
+    }
 
+    /// `compact` writing the new file at format `version`. Caller holds the
+    /// lock and has checked `poisoned`.
+    fn compactLocked(self: *Db, version: u32) CompactError!void {
         const NewOff = struct { e: *Entry, off: u64 };
         var moves: std.ArrayListUnmanaged(NewOff) = .empty;
         defer moves.deinit(self.gpa);
         try moves.ensureTotalCapacity(self.gpa, self.keydir.count());
+        // Expired keys: left out of the new file, removed from the keydir
+        // only once the new file is in place.
+        var expired: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expired.deinit(self.gpa);
+        const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
 
         const tmp = try self.store.open(self.tmp_path, .create_truncate);
         var swapped = false;
@@ -1138,13 +1364,17 @@ pub const Db = struct {
 
         var hdr: [header_len]u8 = undefined;
         hdr[0..4].* = file_magic.*;
-        std.mem.writeInt(u32, hdr[4..8], file_version, .little);
+        std.mem.writeInt(u32, hdr[4..8], version, .little);
         try self.store.writeAll(tmp, &hdr, 0);
 
         var new_end: u64 = header_len;
         var it = self.keydir.iterator();
         while (it.next()) |kv| {
             const e = kv.value_ptr;
+            if (!e.liveAt(now)) {
+                try expired.append(self.gpa, kv.key_ptr.*);
+                continue;
+            }
             const rec_len: usize = @intCast(e.recLen());
             const rec = try self.gpa.alloc(u8, rec_len);
             defer self.gpa.free(rec);
@@ -1173,8 +1403,16 @@ pub const Db = struct {
         self.file = tmp;
         swapped = true;
         for (moves.items) |m| m.e.off = m.off;
+        // Removal leaves the other entries in place (no rehash), so the
+        // pointers above stayed valid; drop the expired ones only now.
+        for (expired.items) |k| {
+            const kv = self.keydir.fetchRemove(k).?;
+            self.gpa.free(@constCast(kv.key));
+            self.expiring -= 1;
+        }
         self.end = new_end;
         self.dead_bytes = 0;
+        self.version = version;
     }
 
     // ── internals ───────────────────────────────────────────────────────────
@@ -1188,59 +1426,72 @@ pub const Db = struct {
     /// Replay the log from after the header, rebuilding the keydir. Stops at
     /// the first torn/corrupt record and truncates the file back to the last
     /// good one (crash recovery: committed data survives, a half-written
-    /// tail is discarded).
+    /// tail is discarded). A record that has expired by now counts as a
+    /// delete of its key: it is the key's latest word, and it says "absent".
     fn replay(self: *Db, file_size: u64) OpenError!void {
+        // The clock is read once, and only for a file that can hold expiry.
+        const now: i64 = if (self.version >= version_expiry) self.options.clock.now() else 0;
         var off: u64 = header_len;
         scan: while (off < file_size) {
             const remaining = file_size - off;
             if (remaining < rec_fixed) break; // torn fixed header
-            var hdr: [rec_fixed]u8 = undefined;
-            try self.store.preadFull(self.file, &hdr, off);
+            var hdr: [rec_fixed + exp_len]u8 = undefined;
+            try self.store.preadFull(self.file, hdr[0..rec_fixed], off);
             const op = hdr[4];
             const key_len = std.mem.readInt(u32, hdr[5..9], .little);
             const val_len = std.mem.readInt(u32, hdr[9..13], .little);
-            if (op != op_put and op != op_del) break; // corrupt op byte
+            if (op != op_put and op != op_del and op != op_put_exp) break; // corrupt op byte
+            if (op == op_put_exp and self.version < version_expiry) break; // not in a v1 file
             if (op == op_del and val_len != 0) break;
-            if (@as(u64, key_len) + val_len > remaining - rec_fixed) break; // torn body
+            const expires = op == op_put_exp;
+            const body: u64 = rec_fixed + @as(u64, if (expires) exp_len else 0);
+            if (body > remaining) break; // torn expiry field
+            if (@as(u64, key_len) + val_len > remaining - body) break; // torn body
+            var expires_at: i64 = no_expiry;
+            if (expires) {
+                try self.store.preadFull(self.file, hdr[rec_fixed..][0..exp_len], off + rec_fixed);
+                expires_at = std.mem.readInt(i64, hdr[rec_fixed..][0..exp_len], .little);
+            }
 
-            // CRC over op+lens+key+value, streaming the value in bounded
+            // CRC over op+lens[+expiry]+key+value, streaming the value in bounded
             // chunks (only the key is materialized — it may enter the keydir).
             var crc = std.hash.Crc32.init();
-            crc.update(hdr[4..]);
+            crc.update(hdr[4..@intCast(body)]);
             const key = try self.gpa.alloc(u8, key_len);
             var key_owned = true;
             defer if (key_owned) self.gpa.free(key);
-            try self.store.preadFull(self.file, key, off + rec_fixed);
+            try self.store.preadFull(self.file, key, off + body);
             crc.update(key);
             var vbuf: [4096]u8 = undefined;
             var voff: u64 = 0;
             while (voff < val_len) {
                 const n: usize = @intCast(@min(vbuf.len, val_len - voff));
-                try self.store.preadFull(self.file, vbuf[0..n], off + rec_fixed + key_len + voff);
+                try self.store.preadFull(self.file, vbuf[0..n], off + body + key_len + voff);
                 crc.update(vbuf[0..n]);
                 voff += n;
             }
             if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) break :scan; // torn/corrupt
+            // CRC-valid, but not a record this module writes.
+            if (expires and expires_at == no_expiry) break :scan;
 
-            const rec_len = recordLen(key_len, val_len);
-            switch (op) {
-                op_put => {
-                    const gop = try self.keydir.getOrPut(self.gpa, key);
-                    if (gop.found_existing) {
-                        self.dead_bytes += gop.value_ptr.recLen();
-                    } else {
-                        key_owned = false; // the keydir owns it now
-                    }
-                    gop.value_ptr.* = .{ .off = off, .key_len = key_len, .val_len = val_len };
-                },
-                op_del => {
-                    if (self.keydir.fetchRemove(key)) |kv| {
-                        self.dead_bytes += kv.value.recLen();
-                        self.gpa.free(@constCast(kv.key));
-                    }
-                    self.dead_bytes += rec_len;
-                },
-                else => unreachable,
+            const rec_len = body + key_len + val_len;
+            if (op == op_del or (expires and expires_at <= now)) {
+                if (self.keydir.fetchRemove(key)) |kv| {
+                    self.dead_bytes += kv.value.recLen();
+                    if (kv.value.expires()) self.expiring -= 1;
+                    self.gpa.free(@constCast(kv.key));
+                }
+                self.dead_bytes += rec_len;
+            } else {
+                const gop = try self.keydir.getOrPut(self.gpa, key);
+                if (gop.found_existing) {
+                    self.dead_bytes += gop.value_ptr.recLen();
+                    if (gop.value_ptr.expires()) self.expiring -= 1;
+                } else {
+                    key_owned = false; // the keydir owns it now
+                }
+                gop.value_ptr.* = .{ .off = off, .key_len = key_len, .val_len = val_len, .expires_at = expires_at };
+                if (expires) self.expiring += 1;
             }
             off += rec_len;
         }
@@ -1307,6 +1558,351 @@ test "put/get/overwrite/delete/exists/count" {
     try testing.expectEqual(@as(usize, 1), db.count());
     try db.delete("never-existed"); // absent delete = no-op
     try testing.expectEqual(@as(usize, 1), db.count());
+}
+
+/// A wall clock the test moves by hand.
+const ManualClock = struct {
+    now_ms: i64,
+
+    fn clock(mc: *ManualClock) Clock {
+        return .{ .ctx = mc, .nowFn = nowFn };
+    }
+
+    fn nowFn(ctx: ?*anyopaque) i64 {
+        const mc: *ManualClock = @ptrCast(@alignCast(ctx.?));
+        return mc.now_ms;
+    }
+};
+
+/// `Db.expiring` must equal the number of keydir entries carrying an expiry:
+/// it decides whether `count`, `keys` and `deadBytes` may skip the clock.
+fn expectExpiringConsistent(db: *Db) !void {
+    var n: usize = 0;
+    var it = db.keydir.valueIterator();
+    while (it.next()) |e| n += @intFromBool(e.expires());
+    try testing.expectEqual(n, db.expiring);
+}
+
+fn fileVersion(sim: *SimStorage, name: []const u8) u32 {
+    return std.mem.readInt(u32, sim.fileContent(name).?[4..8], .little);
+}
+
+test "expiry: a key is live before its instant, absent from it on, everywhere" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 10_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+
+    try db.put("plain", "p");
+    try db.putExpiring("sess", "s", 10_500);
+    try db.putTtl("ttl", "t", 200); // 10_200
+    try expectGet(&db, "sess", "s");
+    try testing.expectEqual(@as(usize, 3), db.count());
+    try testing.expectEqual(Expiry{ .at_ms = 10_500 }, db.expiresAt("sess").?);
+    try testing.expectEqual(Expiry{ .at_ms = 10_200 }, db.expiresAt("ttl").?);
+    try testing.expectEqual(Expiry.never, db.expiresAt("plain").?);
+    const dead_before = db.deadBytes();
+
+    mc.now_ms = 10_200; // `ttl` expires AT its instant, not after it
+    try expectGet(&db, "ttl", null);
+    try testing.expect(!db.exists("ttl"));
+    try testing.expect(db.valueLen("ttl") == null);
+    try testing.expect(db.expiresAt("ttl") == null);
+    var buf: [8]u8 = undefined;
+    try testing.expect((try db.getBuf(&buf, "ttl")) == null);
+    try testing.expectEqual(@as(usize, 2), db.count());
+    try testing.expect(db.deadBytes() > dead_before); // the expired record is waste now
+    try expectGet(&db, "sess", "s");
+
+    mc.now_ms = 10_499;
+    try expectGet(&db, "sess", "s");
+    mc.now_ms = 10_500;
+    try expectGet(&db, "sess", null);
+    try testing.expectEqual(@as(usize, 1), db.count());
+    try expectGet(&db, "plain", "p");
+}
+
+test "expiry: overwrite with put clears it; an instant already past leaves the key absent" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+
+    try db.putExpiring("k", "v1", 2_000);
+    try testing.expectEqual(@as(usize, 1), db.expiring);
+    try db.put("k", "v2");
+    try testing.expectEqual(@as(usize, 0), db.expiring); // count() is O(1) again
+    mc.now_ms = 5_000;
+    try expectGet(&db, "k", "v2");
+    try testing.expectEqual(Expiry.never, db.expiresAt("k").?);
+    try testing.expectEqual(@as(usize, 1), db.count());
+
+    try db.putExpiring("k", "old", 4_999); // past: the key is gone
+    try expectGet(&db, "k", null);
+    try testing.expectEqual(@as(usize, 0), db.count());
+
+    // `no_expiry` is not an instant; putTtl past the end of time saturates to it.
+    try db.putExpiring("forever", "f", std.math.maxInt(i64));
+    try db.putTtl("forever2", "f", std.math.maxInt(u64));
+    try testing.expectEqual(Expiry.never, db.expiresAt("forever").?);
+    try testing.expectEqual(Expiry.never, db.expiresAt("forever2").?);
+}
+
+test "expiry: the first expiring put upgrades v1 to v2 by compaction, data intact" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        try db.put("a", "1");
+        try db.put("a", "2"); // dead weight the upgrade drops
+        try db.put("b", "3");
+        try testing.expectEqual(@as(u32, 1), fileVersion(&sim, "db"));
+        try testing.expect(db.deadBytes() > 0);
+        try db.putExpiring("e", "x", 9_000);
+        try testing.expectEqual(@as(u32, 2), fileVersion(&sim, "db"));
+        try testing.expectEqual(@as(u64, 0), db.deadBytes()); // the upgrade compacted
+        try expectGet(&db, "a", "2");
+        try expectGet(&db, "b", "3");
+        try expectGet(&db, "e", "x");
+    }
+    // Reopen: the v2 file replays, the expiry survives.
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try expectGet(&db, "e", "x");
+    try testing.expectEqual(Expiry{ .at_ms = 9_000 }, db.expiresAt("e").?);
+    try testing.expectEqual(@as(usize, 3), db.count());
+}
+
+test "expiry: stores that never expire stay version 1 and never read the clock" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const Panicking = struct {
+        fn now(_: ?*anyopaque) i64 {
+            @panic("clock read by a store without expiring keys");
+        }
+    };
+    const opts: Options = .{ .clock = .{ .nowFn = Panicking.now } };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", opts);
+        defer db.close();
+        try db.put("a", "1");
+        try db.put("b", "2");
+        try db.putExpiring("c", "3", std.math.maxInt(i64)); // "never" needs no upgrade
+        try db.delete("a");
+        _ = db.count();
+        _ = db.deadBytes();
+        const ks = try db.keys(testing.allocator, "");
+        ks.deinit(testing.allocator);
+        try expectGet(&db, "b", "2");
+        try db.compact();
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", opts);
+    defer db.close();
+    try testing.expectEqual(@as(u32, 1), fileVersion(&sim, "db"));
+}
+
+test "expiry: the expiring-key counter follows put, overwrite, delete, replay and compaction" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        try db.putExpiring("a", "1", 5_000);
+        try db.putExpiring("a", "2", 6_000); // expiring over expiring
+        try db.putExpiring("b", "1", 5_000);
+        try db.putExpiring("c", "1", 1_500);
+        try db.put("b", "plain"); // plain over expiring
+        try db.putExpiring("d", "1", 7_000);
+        try db.delete("d"); // delete of an expiring key
+        try db.putExpiring("e", "1", 7_000);
+        try expectExpiringConsistent(&db);
+        try testing.expectEqual(@as(usize, 3), db.expiring); // a, c, e
+    }
+    mc.now_ms = 2_000; // "c" has expired: replay drops it
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        try expectExpiringConsistent(&db);
+        try testing.expectEqual(@as(usize, 2), db.expiring); // a, e
+        mc.now_ms = 6_500; // "a" expires while open
+        try db.compact();
+        try expectExpiringConsistent(&db);
+        try testing.expectEqual(@as(usize, 1), db.expiring); // e
+        try db.putExpiring("e", "gone", 100); // expired at once, over an expiring key
+        try expectExpiringConsistent(&db);
+    }
+    // Replay: an expired record over an expiring one, a delete over an expiring one.
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try expectExpiringConsistent(&db);
+    try testing.expectEqual(@as(usize, 0), db.expiring);
+    try testing.expectEqual(@as(usize, 1), db.count()); // b
+}
+
+test "expiry: open and compact drop expired keys from memory and file" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        try db.putExpiring("short", "SHORTVALUE", 2_000);
+        try db.putExpiring("long", "LONGVALUE", 9_000);
+        try db.put("plain", "PLAINVALUE");
+    }
+    mc.now_ms = 3_000;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        // Replay treated the expired record as a delete: gone from the keydir,
+        // counted as waste.
+        try testing.expect(!db.keydir.contains("short"));
+        try testing.expectEqual(@as(usize, 1), db.expiring);
+        try testing.expectEqual(@as(u64, recordLenExp(true, 5, 10)), db.deadBytes());
+        try db.compact();
+        try testing.expect(std.mem.indexOf(u8, sim.fileContent("db").?, "SHORTVALUE") == null);
+        try testing.expectEqual(@as(u64, 0), db.deadBytes());
+
+        mc.now_ms = 9_000; // "long" expires while open; compact drops it
+        try testing.expectEqual(@as(usize, 1), db.count());
+        try db.compact();
+        try testing.expect(!db.keydir.contains("long"));
+        try testing.expectEqual(@as(usize, 0), db.expiring);
+        const file = sim.fileContent("db").?;
+        try testing.expect(std.mem.indexOf(u8, file, "LONGVALUE") == null);
+        try testing.expect(std.mem.indexOf(u8, file, "PLAINVALUE") != null);
+        try expectGet(&db, "plain", "PLAINVALUE");
+    }
+}
+
+test "expiry: deleting an expired key still writes a tombstone (a clock stepped back cannot revive it)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+        defer db.close();
+        try db.putExpiring("k", "v", 2_000);
+        mc.now_ms = 2_500;
+        try db.delete("k");
+        mc.now_ms = 1_500; // NTP steps the clock back
+        try expectGet(&db, "k", null);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try expectGet(&db, "k", null);
+}
+
+test "expiry: an expiring record in a version-1 file is not a record (replay stops there)" {
+    // Build a v1 file by hand whose second record is op 2: a v1 file can
+    // only come from a writer that never wrote op 2, so it is corrupt.
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var file: [header_len + rec_fixed + 1 + 1 + rec_fixed + exp_len + 1 + 1]u8 = undefined;
+    file[0..4].* = file_magic.*;
+    std.mem.writeInt(u32, file[4..8], version_plain, .little);
+    encodeRecord(file[header_len..][0 .. rec_fixed + 2], op_put, "a", "1");
+    encodeRecordExp(file[header_len + rec_fixed + 2 ..], op_put_exp, 5_000, "b", "2");
+    try sim.installFile("db", &file);
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try expectGet(&db, "a", "1");
+    try expectGet(&db, "b", null);
+    try testing.expectEqual(@as(usize, header_len + rec_fixed + 2), sim.fileContent("db").?.len);
+
+    // The same record in a version-2 file is live.
+    var sim2 = SimStorage.init(testing.allocator);
+    defer sim2.deinit();
+    std.mem.writeInt(u32, file[4..8], version_expiry, .little);
+    try sim2.installFile("db", &file);
+    var db2 = try Db.open(testing.allocator, sim2.storage(), "db", .{ .clock = mc.clock() });
+    defer db2.close();
+    try expectGet(&db2, "b", "2");
+}
+
+test "expiry: a CRC-valid op-2 record carrying the no-expiry marker is refused" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var file: [header_len + rec_fixed + exp_len + 2]u8 = undefined;
+    file[0..4].* = file_magic.*;
+    std.mem.writeInt(u32, file[4..8], version_expiry, .little);
+    encodeRecordExp(file[header_len..], op_put_exp, no_expiry, "b", "2");
+    try sim.installFile("db", &file);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "b", null);
+    try testing.expectEqual(@as(usize, header_len), sim.fileContent("db").?.len);
+}
+
+test "expiry: read_verify catches a rotted expiry field" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try db.putExpiring("k", "v", 5_000);
+    const off = db.keydir.get("k").?.off;
+    sim.flipByte("db", off + rec_fixed + 1); // inside expires_at
+    try testing.expectError(error.Corrupt, db.get(testing.allocator, "k"));
+}
+
+test "keys: sorted snapshot of live keys, prefix-filtered, expired and deleted left out" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+
+    {
+        const empty = try db.keys(testing.allocator, "");
+        defer empty.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), empty.keys.len);
+    }
+    for ([_][]const u8{ "user:2", "sess:b", "user:10", "sess:a", "", "user:1" }) |k| try db.put(k, "x");
+    try db.delete("sess:b");
+    try db.putExpiring("sess:c", "x", 1_500);
+    try db.putExpiring("sess:d", "x", 3_000);
+    mc.now_ms = 2_000;
+
+    const all = try db.keys(testing.allocator, "");
+    defer all.deinit(testing.allocator);
+    const want_all = [_][]const u8{ "", "sess:a", "sess:d", "user:1", "user:10", "user:2" };
+    try testing.expectEqual(want_all.len, all.keys.len);
+    for (want_all, all.keys) |w, g| try testing.expectEqualStrings(w, g);
+
+    const sess = try db.keys(testing.allocator, "sess:");
+    defer sess.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), sess.keys.len);
+    try testing.expectEqualStrings("sess:a", sess.keys[0]);
+    try testing.expectEqualStrings("sess:d", sess.keys[1]);
+
+    // A snapshot: later writes do not reach it.
+    try db.delete("sess:a");
+    try testing.expectEqualStrings("sess:a", sess.keys[0]);
+}
+
+test "keys: out-of-memory mid-listing frees what it copied" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| try db.put(k, "x");
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const r = db.keys(fa.allocator(), "");
+        if (r) |ks| {
+            ks.deinit(fa.allocator());
+            break;
+        } else |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
+    try testing.expect(fail_index > 4);
 }
 
 test "persistence: close and reopen recovers everything" {
@@ -1577,6 +2173,12 @@ test "foreign file is refused; newer version is refused" {
     std.mem.writeInt(u32, hdr[4..8], 999, .little);
     try sim.installFile("future", &hdr);
     try testing.expectError(error.UnsupportedVersion, Db.open(testing.allocator, sim.storage(), "future", .{}));
+    // The versions this module writes are 1 and 2; neither neighbour passes.
+    for ([_]u32{ 0, 3 }) |v| {
+        std.mem.writeInt(u32, hdr[4..8], v, .little);
+        try sim.installFile("neighbour", &hdr);
+        try testing.expectError(error.UnsupportedVersion, Db.open(testing.allocator, sim.storage(), "neighbour", .{}));
+    }
 }
 
 test "torn header remnant that IS our magic prefix is adopted as fresh" {

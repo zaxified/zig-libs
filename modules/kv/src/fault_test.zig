@@ -41,7 +41,18 @@ const Step = union(enum) {
     put: struct { k: []const u8, v: []const u8 },
     del: []const u8,
     compact,
+    /// `putExpiring` at `at` against `test_clock` (fixed at `test_now`).
+    put_exp: struct { k: []const u8, v: []const u8, at: i64 },
 };
+
+/// The sweep's wall clock never moves: an expiry is either past or future
+/// for the whole run, so the model knows which without a clock of its own.
+const test_now: i64 = 1_000_000;
+fn fixedNow(_: ?*anyopaque) i64 {
+    return test_now;
+}
+const test_clock: kv.Clock = .{ .nowFn = fixedNow };
+const test_options: kv.Options = .{ .clock = test_clock };
 
 const big_value = "B" ** 3000; // multi-chunk on the replay CRC path
 
@@ -66,6 +77,27 @@ const script = [_]Step{
     .{ .put = .{ .k = "zeta", .v = "z" } },
 };
 
+/// The expiry workload: a version-1 store with live data takes its first
+/// expiring put (the upgrade-by-compaction), then mixes expiring, plain and
+/// already-expired puts through an overwrite, a delete and a compaction that
+/// must drop the expired key. A crash inside the upgrade must leave either
+/// the old version-1 file or the complete version-2 one.
+const expiry_script = [_]Step{
+    .{ .put = .{ .k = "alpha", .v = "1" } },
+    .{ .put = .{ .k = "beta", .v = "two" } },
+    .{ .put = .{ .k = "alpha", .v = "1-overwritten" } },
+    .{ .put_exp = .{ .k = "sess", .v = "live", .at = test_now + 60_000 } }, // upgrade happens here
+    .{ .put_exp = .{ .k = "gone", .v = "stale", .at = test_now - 1 } }, // absent at once
+    .{ .put_exp = .{ .k = "beta", .v = "expiring-beta", .at = test_now + 5 } },
+    .{ .put = .{ .k = "sess2", .v = big_value } },
+    .{ .put_exp = .{ .k = "alpha", .v = "dies", .at = test_now } }, // `at == now` is expired
+    .compact, // drops "gone" and "alpha"
+    .{ .put = .{ .k = "beta", .v = "plain-again" } }, // overwrite clears the expiry
+    .{ .del = "sess" },
+    .{ .put_exp = .{ .k = "late", .v = "l", .at = test_now + 1 } },
+    .compact,
+};
+
 /// Apply `steps` to a pure in-memory model of the store's logical state.
 /// Values are static script slices — no ownership.
 const Model = struct {
@@ -80,6 +112,11 @@ const Model = struct {
             .put => |p| try m.map.put(gpa, p.k, p.v),
             .del => |k| _ = m.map.swapRemove(k),
             .compact => {},
+            .put_exp => |p| if (p.at > test_now)
+                try m.map.put(gpa, p.k, p.v)
+            else {
+                _ = m.map.swapRemove(p.k);
+            },
         };
     }
 };
@@ -97,24 +134,29 @@ const RunOutcome = struct {
 /// Run the whole workload against `sim`. Returns how far it got before the
 /// scheduled crash (if any) fired.
 fn runScript(sim: *SimStorage) RunOutcome {
+    return runSteps(sim, &script);
+}
+
+fn runSteps(sim: *SimStorage, steps: []const Step) RunOutcome {
     const st = sim.storage();
-    var db = Db.open(testing.allocator, st, db_name, .{}) catch |e| switch (e) {
+    var db = Db.open(testing.allocator, st, db_name, test_options) catch |e| switch (e) {
         error.Crashed => return .{ .completed = 0, .crashed = true },
         else => std.debug.panic("workload open failed with {t}, not a crash", .{e}),
     };
     defer db.close();
-    for (script, 0..) |step, i| {
+    for (steps, 0..) |step, i| {
         const result: anyerror!void = switch (step) {
             .put => |p| db.put(p.k, p.v),
             .del => |k| db.delete(k),
             .compact => db.compact(),
+            .put_exp => |p| db.putExpiring(p.k, p.v, p.at),
         };
         result catch |e| switch (e) {
             error.Crashed => return .{ .completed = i, .crashed = true },
             else => std.debug.panic("workload step {d} failed with {t}, not a crash", .{ i, e }),
         };
     }
-    return .{ .completed = script.len, .crashed = false };
+    return .{ .completed = steps.len, .crashed = false };
 }
 
 /// Does the recovered store's state equal `model` exactly?
@@ -131,20 +173,24 @@ fn matchesModel(db: *Db, model: *const Model) !bool {
 
 /// Reboot after the crash, reopen, and assert the recovery invariants.
 fn verifyRecovery(sim: *SimStorage, outcome: RunOutcome) !void {
+    return verifySteps(sim, &script, outcome);
+}
+
+fn verifySteps(sim: *SimStorage, steps: []const Step, outcome: RunOutcome) !void {
     sim.reboot();
-    var db = try Db.open(testing.allocator, sim.storage(), db_name, .{});
+    var db = try Db.open(testing.allocator, sim.storage(), db_name, test_options);
     defer db.close();
 
     // The recovered state must be the acknowledged model, or (only if a step
     // was in flight) the model with that one step atomically applied.
     var before: Model = .{};
     defer before.deinit(testing.allocator);
-    try before.apply(testing.allocator, script[0..outcome.completed]);
+    try before.apply(testing.allocator, steps[0..outcome.completed]);
     var ok = try matchesModel(&db, &before);
-    if (!ok and outcome.crashed and outcome.completed < script.len) {
+    if (!ok and outcome.crashed and outcome.completed < steps.len) {
         var after: Model = .{};
         defer after.deinit(testing.allocator);
-        try after.apply(testing.allocator, script[0 .. outcome.completed + 1]);
+        try after.apply(testing.allocator, steps[0 .. outcome.completed + 1]);
         ok = try matchesModel(&db, &after);
     }
     try testing.expect(ok);
@@ -206,6 +252,51 @@ test "fault-injection sweep: crash at EVERY storage side effect, all modes" {
             };
         }
     }
+}
+
+test "fault-injection sweep: expiring puts, the v1→v2 upgrade and expiry-dropping compaction" {
+    var total: usize = 0;
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const out = runSteps(&sim, &expiry_script);
+        try testing.expect(!out.crashed);
+        total = sim.ops_seen;
+        try verifySteps(&sim, &expiry_script, out);
+        // Teeth: the run ended on a version-2 file with the expired keys
+        // gone from it, not merely hidden.
+        const file = sim.fileContent(db_name).?;
+        try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, file[4..8], .little));
+        try testing.expect(std.mem.indexOf(u8, file, "stale") == null);
+        try testing.expect(std.mem.indexOf(u8, file, "dies") == null);
+    }
+    try testing.expect(total >= 40);
+
+    var holes: usize = 0;
+    for ([_]CrashMode{ .lose_unsynced, .keep_unsynced, .torn_tail, .reorder_unsynced }) |mode| {
+        for ([_]u64{ 1, 2, 3 }) |seed| {
+            if (mode != .reorder_unsynced and seed != 1) continue;
+            var point: usize = 0;
+            while (point < total) : (point += 1) {
+                var sim = SimStorage.init(testing.allocator);
+                defer sim.deinit();
+                sim.crash_mode = mode;
+                sim.reorder_seed = seed;
+                sim.ops_until_crash = point;
+                const out = runSteps(&sim, &expiry_script);
+                try testing.expect(out.crashed);
+                holes += sim.holes_punched;
+                verifySteps(&sim, &expiry_script, out) catch |e| {
+                    std.debug.print(
+                        "expiry sweep FAILED: mode={t} seed={d} crash_point={d}/{d} completed_steps={d}\n",
+                        .{ mode, seed, point, total, out.completed },
+                    );
+                    return e;
+                };
+            }
+        }
+    }
+    try testing.expect(holes > 0);
 }
 
 test "fault-injection sweep: non-contiguous (reordered) unsynced persistence" {
