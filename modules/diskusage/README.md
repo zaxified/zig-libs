@@ -106,6 +106,37 @@ afterwards.
 | `count_hard_links` | `--count-links` | `false` — count once per `(dev, ino)`, like `du` |
 | `one_file_system` | `-x` | `false` |
 | `backend` | — | `null`, probe `statx` once per scan |
+| `threads` | diskus / dua / gdu are parallel | `1` = sequential; `0` = one worker per CPU; `n` = `n` workers |
+| `should_descend` | `--exclude` / `-d N` (pruning half) | `null`, enter everything |
+
+### Parallel walk and pruning
+
+```zig
+// Walk directories concurrently: same Report as the sequential walk.
+const r = try diskusage.scanPath(gpa, io, "/var", .{ .threads = 0 }); // 0 = per CPU
+
+// Never open a subtree: the predicate runs before the directory is opened.
+fn keep(ctx: ?*anyopaque, rel: []const u8, depth: u32) diskusage.Descend {
+    _ = ctx; _ = depth;
+    if (std.mem.eql(u8, rel, "cache")) return .exclude; // du --exclude: gone entirely
+    if (std.mem.eql(u8, rel, "mnt"))   return .skip;    // counted as one entry, not entered
+    return .yes;
+}
+const r2 = try diskusage.scanPath(gpa, io, "/var", .{
+    .threads = 4,
+    .should_descend = .{ .func = keep },
+});
+```
+
+`threads != 1` needs an `Io` with threads (`std.Io.Threaded` has them by
+default; with none, the run is merely sequential). The `Report` and the root
+total are identical to the sequential walk's. What may differ: the order of
+sibling directories at `on_directory`, and — for a file with hard links in
+*several* directories — which directory it is attributed to. Post-order still
+holds, and every callback (`on_directory`, `on_error`, `should_descend`) still
+runs one at a time, so a sink needs no lock. `Report.directories_pruned` counts
+what the predicate turned away. The speed-up is not measured in this module;
+see SPEC.md "Parallel traversal" for the design and its bounds.
 
 There is deliberately **no** apparent-versus-allocated switch: `Totals` always
 carries both, from the same `lstat`.
@@ -141,6 +172,9 @@ diff <(du -B1 /some/tree | sort -k2) \
 up per entry, and different `du` implementations round differently — a harness
 that called that a failure would be worse than no harness.
 
+`diskusage-demo -j N` walks in parallel (`-j 0`: one worker per CPU); its
+table is the same, so the same diff applies.
+
 `diskusage-demo --explain` prints what `du` has no column for: the sparse gap
 (apparent minus allocated, from one traversal instead of two runs), the
 hard-link saving, and which stat backend this host actually supports.
@@ -160,9 +194,9 @@ load-bearing here in a way it is not for `diskfree`.
 
 - Following symlinks (`du -L`/`-D`) — not `du`'s default, and an invitation to
   a non-terminating traversal.
-- `--exclude`, `--threshold`, `--separate-dirs`, `--inodes`, `--time` —
-  reporting and filtering policy a caller can express over `DirSink` and
-  `Report`.
+- `--threshold`, `--separate-dirs`, `--inodes`, `--time` and `--exclude`'s
+  pattern language — reporting and filtering policy a caller can express over
+  `DirSink` and `Report` (pruning itself is `should_descend`).
 - Human-readable / block-size formatting: exact bytes only, for the same
   reason `diskfree` computes no use-percentage.
 - A per-entry sink (`du -a`) — a small symmetric extension, deferred until a

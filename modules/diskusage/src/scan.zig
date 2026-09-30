@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const stat = @import("stat.zig");
+const parallel = @import("parallel.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -78,13 +79,15 @@ pub const Totals = struct {
     /// Number of entries whose sizes are included above.
     entries: u64 = 0,
 
-    fn add(self: *Totals, other: Totals) void {
+    /// Internal: shared with `parallel.zig`.
+    pub fn add(self: *Totals, other: Totals) void {
         self.allocated_bytes +|= other.allocated_bytes;
         self.apparent_bytes +|= other.apparent_bytes;
         self.entries +|= other.entries;
     }
 
-    fn addEntry(self: *Totals, s: stat.FileStat) void {
+    /// Internal: shared with `parallel.zig`.
+    pub fn addEntry(self: *Totals, s: stat.FileStat) void {
         self.allocated_bytes +|= s.allocatedBytes();
         // See the `apparent_bytes` doc comment for why a directory's
         // st_size is excluded from this one sum and only this one.
@@ -118,6 +121,10 @@ pub const Report = struct {
     /// `one_file_system` was set and they live on a different device. They
     /// contribute nothing to any total; see `Options.one_file_system`.
     other_filesystems_skipped: u64 = 0,
+    /// Directories `Options.should_descend` answered `.skip` or `.exclude`
+    /// for. A `.skip` directory is also in `directories` and `total`; an
+    /// `.exclude` one is only here.
+    directories_pruned: u64 = 0,
     /// Entries that could not be stat'd or directories that could not be
     /// opened. Every one of them was also passed to `Options.on_error`.
     /// A nonzero value here is what a `du`-shaped tool turns into exit 1.
@@ -154,6 +161,31 @@ pub const DirSink = struct {
     fn report(self: DirSink, path: []const u8, depth: u32, totals: Totals) SinkError!void {
         return self.func(self.context, path, depth, totals);
     }
+};
+
+/// What `Options.should_descend` decides about one directory.
+pub const Descend = enum {
+    /// Enter it: the normal case.
+    yes,
+    /// Count the directory itself (its own size, one entry, reported to
+    /// `on_directory` with just that) but never open it: `du -d N`'s shape.
+    skip,
+    /// Drop it as if it were not there — not counted, not reported, never
+    /// opened: `du --exclude`'s shape.
+    exclude,
+};
+
+/// Asked once per directory below the scan root, after the directory's own
+/// `lstat` and the one-filesystem check and before it is opened — so a
+/// subtree answered `.skip`/`.exclude` costs no `open`, no listing and no
+/// `lstat` of anything inside it (a post-hoc filter over `DirSink` cannot
+/// avoid those). `path` is relative to the scan root and borrowed;
+/// `depth` is 1 for a child of the root. Files are not asked about.
+///
+/// With `Options.threads != 1` it is still never called concurrently.
+pub const DescendFilter = struct {
+    context: ?*anyopaque = null,
+    func: *const fn (context: ?*anyopaque, path: []const u8, depth: u32) Descend,
 };
 
 /// A `DirSink` may fail (it usually writes somewhere). It reports that as
@@ -200,6 +232,17 @@ pub const Options = struct {
     backend: ?stat.Backend = null,
     on_error: ?ErrorSink = null,
     on_directory: ?DirSink = null,
+    /// Prune predicate; see `DescendFilter`. `null` enters everything.
+    should_descend: ?DescendFilter = null,
+    /// Workers for the traversal, the calling thread included. `1` (the
+    /// default) is the sequential walk; `0` means one per logical CPU; any
+    /// other count walks directories concurrently through `std.Io` (the
+    /// `Io` decides how many threads it really has — fewer only makes the
+    /// run slower). The `Report` is identical to the sequential one; what
+    /// may differ is documented in SPEC "Parallel traversal": the order of
+    /// sibling directories at the sinks, and which link of a multiply linked
+    /// file is the one counted. Every callback still runs one at a time.
+    threads: u32 = 1,
 };
 
 pub const ScanError = error{
@@ -253,6 +296,8 @@ pub fn scanAt(
 
     var dir = try base.openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(io);
+
+    if (options.threads != 1) return parallel.walk(gpa, io, dir, root_stat, backend, options, null);
 
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
@@ -313,6 +358,19 @@ pub fn scanAt(
             continue;
         }
 
+        // The prune predicate, before anything is opened. `.exclude` drops
+        // the directory as `du --exclude` does; `.skip` keeps it as an
+        // entry and only declines to descend (handled at the `enter` below).
+        var pruned = false;
+        if (st.isDir()) if (options.should_descend) |f| switch (f.func(f.context, entry.path, depth)) {
+            .yes => {},
+            .skip => pruned = true,
+            .exclude => {
+                report.directories_pruned += 1;
+                continue;
+            },
+        };
+
         // Hard-link de-duplication, exactly where `du` does it: only for
         // non-directories with more than one link, so an ordinary tree pays
         // nothing for the hash map at all.
@@ -340,6 +398,13 @@ pub fn scanAt(
         // `enter` insists on `kind == .directory`, and `kind` comes from
         // `d_type`, which some filesystems report as `.unknown`. The stat
         // above already knows the truth, so say so.
+        if (pruned) {
+            report.directories_pruned += 1;
+            if (options.on_directory) |sink| try sink.report(entry.path, depth, sub);
+            parent.totals.add(sub);
+            continue;
+        }
+
         var dir_entry = entry;
         dir_entry.kind = .directory;
         walker.enter(io, dir_entry) catch |err| {
@@ -449,7 +514,7 @@ fn closeFrame(gpa: Allocator, frames: *std.ArrayList(Frame), sink: ?DirSink) Sin
 ///
 /// Extracted from `scanAt` so the comparison has a test — the branch that
 /// uses it is reachable only under a live race.
-fn openedAsExpected(backend: stat.Backend, handle: i32, expected: stat.Id) bool {
+pub fn openedAsExpected(backend: stat.Backend, handle: i32, expected: stat.Id) bool {
     const opened_st = stat.lstatAt(backend, handle, ".") catch return false;
     return std.meta.eql(opened_st.id(), expected);
 }
@@ -462,7 +527,7 @@ fn currentPath(frames: []const Frame) []const u8 {
     return frames[frames.len - 1].path;
 }
 
-fn classify(report: *Report, s: stat.FileStat) void {
+pub fn classify(report: *Report, s: stat.FileStat) void {
     if (s.isDir()) {
         report.directories += 1;
     } else if (s.isSymLink()) {

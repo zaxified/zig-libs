@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Added: parallel traversal (`Options.threads`) and a
+  prune predicate (`Options.should_descend`).** `threads = 0` (one worker per
+  CPU) or `n` walks directories concurrently over `std.Io.Group`, with one
+  shared hard-link set, so `Report` and the root total equal the sequential
+  walk's (differential tests at 2, 3, 8 and per-CPU workers; which link of a
+  multiply linked file is counted, and the order of sibling directories at the
+  sinks, may differ). The default stays `1`, the unchanged sequential walk.
+  `should_descend` is asked before a directory is opened and may answer
+  `.skip` (count the directory, do not enter it), `.exclude` (drop it like
+  `du --exclude`) or `.yes`, so a pruned subtree costs no `open`, listing or
+  `lstat` inside it; `Report.directories_pruned` counts them. Callbacks run
+  one at a time in both modes. The speed-up is not measured. The demo gains
+  `-j N`.
+
 - **2026-09-07** — **Test-only: `fuzzLstatPath`'s corpus worked, but only by
   accident, and one seed was one constant away from silently emptying.** The
   harness drew `len = smith.valueRangeAtMost(u16, 0, fuzz_path_buf_len)` and

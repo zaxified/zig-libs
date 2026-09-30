@@ -22,13 +22,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 |---|---|---|--:|---|---|
 | [coreutils/coreutils](https://github.com/coreutils/coreutils) (`du`) — **reference** | C | GPL-3.0 | 5.3k | v9.12 (2026-09-14) | The yardstick: this module's demo output is diffed byte for byte against `du -B1`. `du` also offers `-L`/`-D`, `-a`, `--exclude`, `--threshold`, `--time`, `--inodes`, `-d`; here those are policy left to the caller (SPEC "deliberately not done"). |
 | [uutils/coreutils](https://github.com/uutils/coreutils) (`du`) | Rust | MIT | 24.2k | 0.12.0 (2026-09-17) | Second black-box oracle; differs from GNU on `-x` for cross-device files, which this module documents and resolves to GNU. |
-| [sharkdp/diskus](https://github.com/sharkdp/diskus) | Rust | Apache-2.0 | 1.2k | v0.9.0 (2025-12-06) | "Parallelized version of `du -sh`", README claims ~10x faster than `du` on a cold cache (8-core laptop). This module walks single-threaded. |
+| [sharkdp/diskus](https://github.com/sharkdp/diskus) | Rust | Apache-2.0 | 1.2k | v0.9.0 (2025-12-06) | "Parallelized version of `du -sh`", README claims ~10x faster than `du` on a cold cache (8-core laptop). This module walks single-threaded by default and in parallel with `Options.threads` (SPEC "Parallel traversal"; the speed-up is not measured here). |
 | [Byron/dua-cli](https://github.com/Byron/dua-cli) | Rust | MIT | 6.3k | v2.45.0 (2026-09-12) | Parallel by default, interactive browser and delete mode (README). An application, not a library. |
 | [bootandy/dust](https://github.com/bootandy/dust) | Rust | Apache-2.0 | 12.4k | v1.2.6 (2026-09-16) | Tree view with depth limit, bars and filters *(inferred from README/flags)*. Application. |
 | [dundee/gdu](https://github.com/dundee/gdu) | Go | MIT | 6.0k | v5.37.0 (2026-08-18) | Parallel, interactive; depth and file-type exclusion flags (README). Application. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | `std.Io.File.Stat` has no `st_blocks` / `st_dev`, and `std.os.linux` has no `Stat` (checked, SPEC "Why a raw syscall layer"); no du-style walker. No Zig disk-usage library found (`gh search repos` for zig + "disk usage du": nothing relevant). |
 
-**Where we are ahead:** the only library on the list (the others are applications), and the only pure-Zig one; `st_blocks`/`st_dev` via `statx` or nine per-architecture `fstatat` structs, checked against qemu-user on 17 architectures; allocation and hard-link semantics matching `du`'s, with the GNU/uutils `-x` divergence measured and documented; per-directory post-order sink and per-entry error sink; no libc. **Where we are behind:** walks on one thread (diskus, dua, gdu are parallel), Linux only, and `du`'s filtering/reporting flags are all left to the caller.
+**Where we are ahead:** the only library on the list (the others are applications), and the only pure-Zig one; `st_blocks`/`st_dev` via `statx` or nine per-architecture `fstatat` structs, checked against qemu-user on 17 architectures; allocation and hard-link semantics matching `du`'s, with the GNU/uutils `-x` divergence measured and documented; per-directory post-order sink and per-entry error sink; no libc. **Where we are behind:** Linux only; parallel traversal is opt-in (`threads`, default 1) and its speed-up has not been measured against diskus/dua/gdu; and `du`'s filtering/reporting flags are left to the caller — except pruning, which needs the walk's cooperation and is `Options.should_descend`.
 
 ## What this module is, and what it is not
 
@@ -171,6 +171,97 @@ Per-directory subtotals fall out of the traversal: a stack of frames indexed
 by depth, closed when an entry at a shallower depth arrives. Children are
 therefore delivered before parents and the root last — `du`'s own output
 order, not a sort applied afterwards.
+
+### Pruning: `Options.should_descend`
+
+A post-hoc filter over `DirSink` cannot save the I/O of an excluded subtree —
+it is stat'ed and listed before the filter sees it. `should_descend` is asked
+once per directory below the root, after that directory's own `lstat` and the
+one-filesystem check and **before it is opened**, with its root-relative path
+and depth. Three answers, because `du` has two different shapes and a caller
+should not have to choose the wrong one:
+
+* `.yes` — enter it.
+* `.skip` — count the directory itself (one entry, its own size, reported to
+  `on_directory` with just that) and never open it, like an unreadable
+  directory but without the error (`du -d N`'s shape).
+* `.exclude` — drop it as if absent: not counted, not reported, never opened
+  (`du --exclude`'s shape). Only `Report.directories_pruned` records it.
+
+Files are not asked about: a file is already `lstat`'ed by the time it is
+known to be one, so refusing it saves nothing. The predicate is the same code
+path in the sequential and the parallel walk (the tests run both) and is
+never called concurrently.
+
+### Parallel traversal: `Options.threads`
+
+`threads = 1` (the default) is the sequential walk above, unchanged.
+`threads = 0` means one per logical CPU, any other `n` means `n` workers, the
+calling thread being one. Sequential stays the default because the oracle
+evidence (GNU/uutils diffs, mutation runs, the TOCTOU measurement) is about it,
+and a caller with a cheap tree or a single core gains nothing from the
+machinery. The speed-up is **not measured here**; diskus's ~10x is its own
+claim about a cold cache.
+
+`src/parallel.zig`, not `walkSelectively`: one node per directory, one shared
+LIFO stack behind one `std.Io.Mutex` + `Condition`, workers started with
+`std.Io.Group.async`. A worker pops a node, opens it relative to its still open
+parent (`O_NOFOLLOW`, then the same `(dev, ino)` identity re-check as the
+sequential walk), lists it, `lstat`s every entry against the directory fd
+(so still no `PATH_MAX` ceiling), accumulates the non-directories locally and
+pushes the subdirectories it wants entered.
+
+**Why the result is identical.**
+
+* Each entry is counted by exactly one scan under the same rules, so every
+  counter is a sum of the same terms in another order; all sums saturate, and
+  saturating unsigned addition is commutative and associative, so not even a
+  saturated result depends on the order.
+* The hard-link set is **one** set behind the run's mutex, so a multiply
+  linked file is counted by exactly one of its links. *Which* link may differ
+  from the sequential walk and between runs: `Report` and the root total are
+  identical, the per-directory attribution of a file with links in several
+  directories is not (GNU `du` has the same order dependence). Links within
+  one directory change nothing.
+* A directory completes when its own listing is done and every child pushed
+  from it has completed (`pending`); the last to finish reports it and folds
+  it into its parent, iteratively (no recursion, so depth costs no stack). So
+  `DirSink` keeps its contract — children before parents, the root last, once
+  each — and only the order among siblings is unspecified.
+* Error and skip handling are the sequential code's, per entry: an
+  unreadable directory is counted, reported once, still holds its own size.
+
+**Bounds.** Concurrency is at most `threads` (fewer if the `Io` has fewer
+threads: `Io.async` then runs the worker inline, which is slower, never
+different). Memory: the stack is LIFO, so it holds the unstarted subdirectories
+of the directories on the workers' current paths — the widest listings, as in
+`fts`'s directory build — each a name plus, only when a callback can read it,
+a path copy; not the whole tree. A directory fd stays open until its last
+child is opened and no longer, so open descriptors track the depth of the
+active paths, as the sequential walk's stack does.
+
+**Callbacks.** `on_directory`, `on_error` and `should_descend` run under the
+run's mutex: never concurrently, so a sink needs no lock of its own, and must
+not call back into the scan. A slow sink therefore serialises the run.
+
+**Failure and cleanup.** After the root is open only out-of-memory and
+`error.SinkFailed` are fatal. The first sets `aborted`; workers stop listing but
+keep popping the stack in *discard* mode so every node's bookkeeping still
+completes — each fd closed, each allocation freed, no task outliving `scanAt`
+— and callbacks stop being called. Tested by a failing sink (no leak, no
+hang; the sink is called exactly until it fails) and by an allocation-failure
+sweep of the parallel path (run with `async_limit = .nothing`, so every worker
+is inline and the allocation sequence is deterministic).
+
+**Evidence.** In-module differential tests compare the parallel `Report`
+(every counter) and, on trees without cross-directory hard links, every
+per-directory subtotal against the sequential walk on a generated tree (random
+nesting, a 25-level chain, a 100-wide directory, hard links, symlinks that
+would loop if followed) at 2, 3, 8 and one-per-CPU workers, plus post-order
+and an unreadable directory. There is **no GNU-`du` comparison inside the
+module's tests** — that oracle is the demo binary diffed against `du -B1`
+(see Anchoring), and the demo takes `-j N` to run it in parallel mode (the
+self-check also runs both modes and compares them).
 
 ## The `du` compatibility decisions
 
@@ -432,9 +523,11 @@ its own test: removed, red; restored, green.
 
 - **Following symlinks (`du -L`/`-D`).** Not `du`'s default, not this
   module's question, and an invitation to a non-terminating traversal.
-- **`--separate-dirs`, `--threshold`, `--exclude`, `--inodes`, `--time`.**
-  Reporting and filtering policy, all expressible by a caller over `DirSink`
-  and `Report` without the module holding an opinion.
+- **`--separate-dirs`, `--threshold`, `--inodes`, `--time`, and `--exclude`'s
+  pattern language.** Reporting and filtering policy, all expressible by a
+  caller over `DirSink` and `Report` without the module holding an opinion.
+  (The one part that needs the walk's cooperation — not descending — is
+  `Options.should_descend`; the caller brings the pattern.)
 - **Block-size formatting and human-readable units.** The same reasoning
   `diskfree` gives for not computing a use-percentage: there is no single
   correct rounding rule to bake in, GNU and busybox pick differently, and a
@@ -448,8 +541,9 @@ its own test: removed, red; restored, green.
 
 ## Backlog / deferred
 
-- (survey 2026-09-30) **Parallel traversal** — diskus/dua/gdu are parallel and advertise it as the reason to use them (diskus README: ~10x on a cold cache); on a large SSD tree a user notices seconds versus tens of seconds. Effort: medium (work queue over `std.Io` group, per-thread hard-link set merge or shared locked set). Fits CONVENTIONS §2.
-- (survey 2026-09-30) **Exclude / prune predicate** — `du --exclude` is common; a caller can only filter after the walk, which still stats the excluded subtree. A `should_descend` callback would let a caller prune. Effort: small. Fits §2 (the SPEC calls filtering policy, but pruning saves I/O, which a post-hoc filter cannot).
+None open. Both 2026-09-30 survey items — parallel traversal and a prune
+predicate — are built (see "Parallel traversal" and "Pruning" under
+Wire format / algorithm).
 
 ## Open
 

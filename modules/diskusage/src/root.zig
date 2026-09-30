@@ -63,6 +63,7 @@ pub const meta = .{
 
 pub const stat = @import("stat.zig");
 pub const scan = @import("scan.zig");
+const parallel = @import("parallel.zig");
 
 // Re-exported at the top level for the common case: a consumer reaches for
 // this module saying "how big is this tree", not "give me the scan
@@ -74,6 +75,8 @@ pub const Report = scan.Report;
 pub const Totals = scan.Totals;
 pub const ErrorSink = scan.ErrorSink;
 pub const DirSink = scan.DirSink;
+pub const Descend = scan.Descend;
+pub const DescendFilter = scan.DescendFilter;
 pub const SinkError = scan.SinkError;
 pub const ScanError = scan.ScanError;
 pub const FileStat = stat.FileStat;
@@ -85,4 +88,5 @@ test {
     // (CONVENTIONS.md §6 step 3, the dark-tests rule).
     _ = stat;
     _ = scan;
+    _ = parallel;
 }

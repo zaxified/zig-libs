@@ -44,6 +44,8 @@ const usage_text =
     \\  -s              summarise: only the total for each argument
     \\  -d N            print directories at most N levels deep (du --max-depth=N)
     \\  -x              stay on one filesystem (du -x / --one-file-system)
+    \\  -j N            walk with N parallel workers (0: one per CPU); the table
+    \\                  is the same as the sequential walk's, sibling order aside
     \\  -l              count every hard link, not once per (dev, ino)
     \\                  (du --count-links)
     \\  --apparent      report st_size instead of st_blocks*512
@@ -59,6 +61,10 @@ const usage_text =
     \\With no path argument, the current directory is scanned.
     \\
 ;
+
+fn excludeSub(_: ?*anyopaque, path: []const u8, _: u32) diskusage.Descend {
+    return if (std.mem.eql(u8, path, "sub")) .exclude else .yes;
+}
 
 /// Build a tree whose byte total is known by construction, walk it, and check
 /// the module agrees. The sizes are arithmetic a reader can redo, not a number
@@ -95,6 +101,17 @@ fn selfDemo(io: std.Io, gpa: Allocator) !u8 {
         );
         return error.ApparentTotalMismatch;
     }
+    // The parallel walk must give the very same report.
+    for ([_]u32{ 2, 4, 0 }) |n| {
+        const par = try diskusage.scanPath(gpa, io, base, .{ .threads = n });
+        if (!std.meta.eql(par, report)) {
+            std.debug.print("diskusage-demo: parallel walk ({d} workers) disagrees with the sequential one\n", .{n});
+            return error.ParallelMismatch;
+        }
+    }
+    // A pruned directory is never entered: `sub` holds 2 of the 3 files.
+    const pruned = try diskusage.scanPath(gpa, io, base, .{ .should_descend = .{ .func = excludeSub } });
+    if (pruned.regular_files != 1 or pruned.directories_pruned != 1) return error.PruneMismatch;
     if (report.regular_files != files.len) {
         std.debug.print(
             "diskusage-demo: counted {d} regular files, expected {d}\n",
@@ -179,6 +196,7 @@ fn runOne(gpa: Allocator, io: std.Io, out: *std.Io.Writer, path: []const u8, opt
     const report = diskusage.scanPath(gpa, io, path, .{
         .one_file_system = opts.one_file_system,
         .count_hard_links = opts.count_hard_links,
+        .threads = opts.threads,
         .on_directory = .{ .context = &printer, .func = Printer.onDirectory },
         .on_error = .{ .context = &reporter, .func = Reporter.onError },
     }) catch |err| switch (err) {
@@ -346,6 +364,7 @@ const Options = struct {
     max_depth: ?u32 = null,
     one_file_system: bool = false,
     count_hard_links: bool = false,
+    threads: u32 = 1,
     apparent: bool = false,
     explain: bool = false,
     /// Raw argv slices — the process's own argv outlives `main`, so these
@@ -365,6 +384,9 @@ fn parseArgs(args: *std.process.Args.Iterator) !Options {
             o.one_file_system = true;
         } else if (std.mem.eql(u8, arg, "-l")) {
             o.count_hard_links = true;
+        } else if (std.mem.eql(u8, arg, "-j")) {
+            const v = args.next() orelse return error.BadUsage;
+            o.threads = std.fmt.parseInt(u32, v, 10) catch return error.BadUsage;
         } else if (std.mem.eql(u8, arg, "--apparent")) {
             o.apparent = true;
         } else if (std.mem.eql(u8, arg, "--explain")) {
