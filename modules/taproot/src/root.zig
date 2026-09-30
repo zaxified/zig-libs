@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! taproot — BIP341 key-path output-key tweaking for Bitcoin Taproot
-//! (SegWit version 1 outputs): the `"TapTweak"` tagged hash, the tweaked
-//! public/secret key types + codecs, and the two crypto cores that turn an
-//! internal BIP340 key into its Taproot output key/scalar.
+//! taproot — BIP341 output construction for Bitcoin Taproot (SegWit version
+//! 1 outputs): the `"TapTweak"` tagged hash, the tweaked public/secret key
+//! types + codecs, the two crypto cores that turn an internal BIP340 key into
+//! its Taproot output key/scalar, and script-tree building (Merkle root and
+//! control blocks) for script-path spends.
+//!
+//! Script trees (`tree.zig`, re-exported below): `tapLeafHash`/`tapBranchHash`,
+//! `buildFromTree`/`buildFromLeaves` (explicit shape or BIP371 depth list) →
+//! `SpendInfo` with the Merkle root, output key and each leaf's control block.
 //!
 //! **Status: complete.** The `"TapTweak"` tagged hash, `TweakedPublicKey`
 //! codec, error types, AND both crypto cores — `tweakPublicKey` (BIP341's
@@ -35,7 +40,7 @@ const Scalar = scalar.Scalar;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "BIP341 Taproot key-path output-key tweaking — `tweakPublicKey`/`tweakSecretKey` built over `bip340`.",
+    .doc = "BIP341 Taproot output construction — key tweaking (`tweakPublicKey`/`tweakSecretKey`) and script trees (Merkle root, per-leaf control blocks) built over `bip340`.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -287,6 +292,24 @@ pub fn tweakSecretKey(internal_sk: bip340.SecretKey, merkle_root: ?[32]u8) Tweak
     return d.add(t).toBytes(.big);
 }
 
+// ── script trees (BIP341 §"Constructing and Spending Taproot Outputs") ──
+
+/// Script-tree construction: leaf/branch hashes, Merkle root, output key and
+/// per-leaf control blocks. See `tree.zig`.
+pub const tree = @import("tree.zig");
+pub const tapLeafHash = tree.tapLeafHash;
+pub const tapBranchHash = tree.tapBranchHash;
+pub const Leaf = tree.Leaf;
+pub const Node = tree.Node;
+pub const DepthLeaf = tree.DepthLeaf;
+pub const SpendInfo = tree.SpendInfo;
+pub const buildFromTree = tree.buildFromTree;
+pub const buildFromLeaves = tree.buildFromLeaves;
+/// BIP341 wallet-vector script trees (test data, not API): exported so a
+/// sibling module's cross-check tests (`bitcoinscript`) can reuse them.
+/// Compiled only where referenced.
+pub const tree_vectors = @import("tree_vectors.zig");
+
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s
@@ -295,6 +318,9 @@ pub fn tweakSecretKey(internal_sk: bip340.SecretKey, merkle_root: ?[32]u8) Tweak
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("tree.zig");
+    _ = @import("tree_vectors.zig");
+    _ = @import("tree_test.zig");
 }
 
 test "meta.model_after names BIP341" {

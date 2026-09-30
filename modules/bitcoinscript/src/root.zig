@@ -112,6 +112,7 @@ test {
     _ = @import("e2e_test.zig");
     _ = @import("dos_test.zig");
     _ = @import("tapscript_test.zig");
+    _ = @import("taproot_builder_xcheck_test.zig");
     _ = @import("precomputed_test.zig");
     _ = @import("findanddelete_test.zig");
     _ = @import("scriptcode_test.zig");

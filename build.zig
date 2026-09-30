@@ -314,7 +314,7 @@ const module_list = [_]Module{
     .{ .name = "taproot", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
     .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"}, .test_deps = &.{"testkit"} },
     .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript", "ripemd160" }, .test_deps = &.{"testkit"} },
-    .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .test_deps = &.{"testkit"} },
+    .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .test_deps = &.{ "testkit", "taproot" } },
     .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"}, .test_deps = &.{"testkit"} },
     .{ .name = "lnwire", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" }, .test_deps = &.{"testkit"} },

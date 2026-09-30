@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** a new test file cross-checks `taproot`'s script-tree
+  builder against this module's consensus verifier (`tapscript.tapleafHash`, `verifyCommitment` accept
+  every built control block and reject flipped parity, path, key and script); `taproot` is a test-only
+  dependency, production code and dependencies are unchanged.
+
 - **2026-09-15** — **Internal only, no behaviour change:** `sigcheck.zig`'s private
   `reduceToScalar` + `ecdsaVerifyDigest` (a byte-for-byte copy of
   `k256.sign.ecdsaVerify`'s arithmetic, minus the internal SHA-256, because

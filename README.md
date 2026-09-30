@@ -581,7 +581,7 @@ way to recognise it.
 | [`slhdsa`](modules/slhdsa/README.md) | 2 | SLH-DSA (FIPS 205, standardized SPHINCS+) — post-quantum stateless hash-based signatures, all twelve parameter sets, NIST-KAT-verified. | any | — |
 | [`spake2plus`](modules/spake2plus/README.md) | 2 | SPAKE2+ — an augmented PAKE (RFC 9383), P-256/SHA-256 (the Matter/Thread commissioning PAKE); resists server-compromise. | any | p256 |
 | [`sphinx`](modules/sphinx/README.md) | 3 | Lightning BOLT#4 Sphinx onion routing — forward ECDH blinding chain, layered packet construction, constant-time layer peeling. | any | k256 |
-| [`taproot`](modules/taproot/README.md) | 3 | BIP341 Taproot key-path output-key tweaking — `tweakPublicKey`/`tweakSecretKey` built over `bip340`. | any | bip340, k256 |
+| [`taproot`](modules/taproot/README.md) | 2 | BIP341 Taproot output construction — key tweaking (`tweakPublicKey`/`tweakSecretKey`) and script trees (Merkle root, per-leaf control blocks) built over `bip340`. | any | bip340, k256 |
 | [`tenantkex`](modules/tenantkex/README.md) | 2 | Per-tenant key exchange — a Noise_IK handshake (via `noise`) between provider edges, deriving directional channel keys for `aeadframe`. | any | noise |
 | [`tfhe`](modules/tfhe/README.md) | 4 | TFHE/FHEW programmable gate bootstrapping — unbounded-depth FHE via blind rotation over a power-of-two torus. **Toy parameters only, no security level claimed.** | any | entropy |
 | [`threshold_ecdsa`](modules/threshold_ecdsa/README.md) | 4 | GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen through online signing, producing standard verifiable ECDSA sigs. **Audit warranted before production use.** | any | paillier, montint |
