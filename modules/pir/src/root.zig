@@ -145,6 +145,7 @@ test {
     _ = pir_mod;
     _ = verify_mod;
     _ = @import("privacy_test.zig");
+    _ = @import("kat_test.zig");
     _ = @import("bench.zig");
 }
 

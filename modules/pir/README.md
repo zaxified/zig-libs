@@ -272,10 +272,14 @@ correctness is exhaustive and exact; the privacy tests are a mix of exact
 structural assertions and one honestly-labelled statistical test with negative
 controls; and **no external test vector exists for this composition** — PIR
 over a DPF is not a standardised protocol. The DPF underneath is separately
-anchored in `fss`.
+anchored in `fss`; the composition is re-derived byte-exact by an independent
+Python implementation (`tools/rederive.py` -> `src/kat_vectors.zig`, oracle
+REDERIVED).
 
 **Provenance:** clean-room from the public literature (Gilboa–Ishai
 "Distributed Point Functions and Their Applications", EUROCRYPT 2014;
 Boyle–Gilboa–Ishai, ACM CCS 2016). No third-party source ported, no
 third-party implementation consulted — so per `CONVENTIONS.md` §5 there is no
-`NOTICE` entry; the citations live in `SPEC.md`.
+`NOTICE` entry; the citations live in `SPEC.md`. The committed test vectors
+(`src/kat_vectors.zig`) are generated data from our own tooling
+(`tools/rederive.py`, stdlib-only Python); no third-party data is included.
