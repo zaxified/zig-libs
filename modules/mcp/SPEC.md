@@ -33,8 +33,7 @@ source is off limits and was not opened.
 byte-for-byte to the specification's own JSON examples (`spec_anchor_index` + canary); per-peer handshake and pending
 state, capability-gated sampling/elicitation with schema and URL-safety validation (credential-field refusal,
 loopback-only http), never-panic error policy, newline framing fuzzed. **Where we are behind:** serves 2026-07-28 statelessly
-alongside the `initialize` revisions (since 2026-09-30), but without that revision's multi round-trip pattern
-(`InputRequiredResult`), so sampling/elicitation reach only session clients; no pagination, `listChanged`
+alongside the `initialize` revisions (since 2026-09-30), multi round-trip requests included; no pagination, `listChanged`
 notifications / `subscriptions/listen`, completions, logging, tasks; server role only (HTTP is the sibling
 `mcp-http`, still session-era; no client) (→ Backlog items).
 
@@ -54,6 +53,35 @@ notifications / `subscriptions/listen`, completions, logging, tasks; server role
   `PeerState` is untouched, so it cannot lift or drop the gate of a session sharing its peer handle (the
   re-audit F11 failure in the other direction). Server→client requests from a modern call are refused with
   `error.StatelessRequest` — the revision removed them — before anything is written or made pending.
+- **Multi round-trip requests (MRTR, basic/patterns/mrtr.mdx) replace them on the modern path.**
+  `ToolCall.input`, `PromptRequest.input` and `ResourceRequest.input` are an `InputRound`: what this retry
+  carries (`params.inputResponses` → `response`/`elicitation`/`sampling`, `params.requestState` →
+  `receivedState`) and what the next round needs (`ask(key, InputRequest)`, `setState`). Asking anything
+  makes the reply an `InputRequiredResult` (`resultType:"input_required"`, `inputRequests` and/or
+  `requestState`, `_meta.serverInfo`, never a caching hint) and discards the handler's normal output and
+  return value — "ask wins", on all three methods; a declining resource template's asks are discarded
+  with its contents, since declining means "not mine". Nothing is pending between rounds: the handler
+  runs to completion each time, so a tool that needs a completion is now one tool (the session path still
+  needs two calls). `ask` runs the same checks as `send*Request` (`checkSamplingRequest`/
+  `checkElicitationRequest`, one code path) against the **request's** `_meta` capabilities (mrtr.mdx: MUST
+  NOT ask what the client did not declare), and keys must be non-empty and unique. Requests are serialized
+  at `ask` time onto the arena, so handler-local strings may die right after. A non-object
+  `inputResponses` or non-string `requestState` is -32602; `null` means absent. On the session path both
+  fields are ignored (earlier revisions have neither) and `ask`/`setState` refuse with
+  `error.SessionRequest` (new `InputError`, separate from `SendError` so existing exhaustive switches keep
+  compiling). An answer that arrives unasked is treated like one that was asked for: the client is the
+  user's agent and could have answered either way. The typed accessors return null for an absent **or**
+  undecodable answer, which makes the spec's "ask again rather than fail" the natural handler shape.
+- **`requestState` is attacker-controlled (mrtr.mdx MUST); `StateSeal` protects it.** HMAC-SHA-256 over
+  version, expiry and payload **plus** a binding recomputed on `open`: method, target (tool/prompt name,
+  resource uri), principal and a caller `extra` (e.g. a digest of the arguments that matter), each
+  length-prefixed so no two bindings share an encoding. Token = base64url-nopad(`0x01 ‖ expiry:u64be ‖
+  mac ‖ payload`). The MAC is checked (constant time) before the expiry, and a wrong binding is
+  indistinguishable from tampering (`StateInvalid`); expiry is `StateExpired`. Not encrypted (the client can
+  read the payload) and not single-use — both said on the type, as the spec warns. No clock is read:
+  `now_sec` is the caller's. `InputRound.sealState`/`openState` fill method and target from the round.
+  `roots/list` is not offered as an input request (roots are deprecated in 2026-07-28 and were never
+  implemented here).
 - **Result shape follows the era, and only the modern era changed.** `beginResult`/`endResult` add
   `resultType`, `_meta.serverInfo` (`name`, `version`, `title` only when set) and, on the six cacheable
   methods, `ttlMs`/`cacheScope`; a session result is byte-identical to before (all session goldens pass
@@ -306,7 +334,13 @@ example; only `supportedVersions` differs, theirs being a modern-only server), a
 (no `nextCursor`). `UnsupportedProtocolVersionError` matches the schema example except the `supported`
 list. Self-pinned only: the -32602 texts for malformed `_meta`, the modern -32601 for `ping`, the
 `servedStatelessly` split, the non-object `structuredContent` rule, the caching defaults, and the
-per-request isolation from `PeerState`. Not yet run: a differential test against the TypeScript SDK client
+per-request isolation from `PeerState`. **MRTR** is anchored on the revision's `InputRequests`,
+`InputResponses` and state-only `InputRequiredResult` examples: a two-round tool asks for the example pair
+and its `inputRequests` is value-equal to the `InputRequests` example (which carries `"mode":"form"`; the
+combined `InputRequiredResult` example omits it and is not used), the retry carries the `InputResponses`
+example verbatim and completes from it, and the load-shedding reply is value-equal to its example.
+Self-pinned: the -32602 texts, "ask wins", the template discard rule and the `StateSeal` format (tested by
+flipping every byte of a token, every binding field, both expiry edges). Not yet run: a differential test against the TypeScript SDK client
 (planned in Backlog).
 
 Provenance: these are literal JSON snippets from the MCP specification quoted as test-oracle data,
@@ -358,9 +392,8 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
   `serverInfo`, `CacheableResult`, the renumbered codes, -32602 resource-not-found, `ping` refused, `title`/
   `icons`/annotations, non-object `structuredContent`; see "Design & invariants"). M1–M3 landed as one step,
   not three: every new output had to be gated by era from the first line, or the session goldens would have
-  changed. Still open from the plan: **MRTR** (`InputRequiredResult` + `inputResponses`/`requestState`
-  retries — core to 2026-07-28, so it belongs here, not only in M5), and **M5** (`mcp-http`). The
-  differential run against the TypeScript SDK client is still to do.
+  changed. **MRTR DONE 2026-09-30** (`InputRound`, `StateSeal`; see "Design & invariants"). Still open from
+  the plan: **M5** (`mcp-http`). The differential run against the TypeScript SDK client is still to do.
 - **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
   `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
   largest break since the transport rewrite: **MCP becomes stateless**.

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Multi round-trip requests (spec 2026-07-28, basic/patterns/mrtr.mdx).** A modern
+  `tools/call`, `prompts/get` or `resources/read` can ask the client for input: new `InputRound` on
+  `ToolCall.input`, `PromptRequest.input`, `ResourceRequest.input` — `ask(key, InputRequest)` (sampling or
+  elicitation, gated by the request's `_meta` capabilities, same checks as the session path), `setState`,
+  and on the retry `response`/`elicitation`/`sampling`/`receivedState`. Anything asked turns the reply into
+  an `InputRequiredResult` (`resultType:"input_required"`). A malformed `inputResponses`/`requestState` is
+  -32602. New `StateSeal` (HMAC-SHA-256 integrity for `requestState`, bound to method, target, principal
+  and expiry; `InputRound.sealState`/`openState`), `InputError`, `InputRequest`, `RequestCheckError`.
+  Session-path replies unchanged; `SendError` unchanged. Anchored on the spec's `InputRequests`,
+  `InputResponses` and state-only `InputRequiredResult` examples.
+
 - **2026-09-30** — **MCP spec 2026-07-28, served alongside the `initialize` revisions** (plan M1–M4 in
   SPEC.md). A request whose `params._meta` carries `io.modelcontextprotocol/protocolVersion` is served
   statelessly: capabilities and client identity from that `_meta` (`ModernRequest`, reached through

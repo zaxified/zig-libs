@@ -26,7 +26,10 @@
 //! client identity come from that `_meta`, never from an earlier message; its
 //! result carries `resultType`, `_meta.io.modelcontextprotocol/serverInfo` and,
 //! on the cacheable methods, `ttlMs`/`cacheScope`; `server/discover` answers
-//! it; `ping` does not exist for it. Every other request takes the
+//! it; `ping` does not exist for it. Instead of server→client requests, a
+//! modern `tools/call`, `prompts/get` or `resources/read` asks the client for
+//! input with an `InputRequiredResult` and is retried with the answers (multi
+//! round-trip requests — `InputRound`, `StateSeal`). Every other request takes the
 //! `initialize`-session path below, byte-for-byte as before — so an existing
 //! client never sees a changed reply.
 //!
@@ -809,8 +812,8 @@ fn writeImplementation(jw: *std.json.Stringify, info: *const Info) std.Io.Writer
 }
 
 /// Open a result object: `{`, plus the `resultType` a 2026-07-28 result MUST
-/// carry. This module only ever produces final results, so it is always
-/// `"complete"`.
+/// carry — `"complete"` here; the one other kind this module writes,
+/// `"input_required"`, has its own builder (`buildInputRequiredResult`).
 fn beginResult(jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
     try jw.beginObject();
     if (modern) {
@@ -1716,6 +1719,18 @@ pub fn writeElicitationRequestLine(
 ) (std.Io.Writer.Error || error{SchemaNotJson})!void {
     try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":", .{ id, OriginatedMethod.@"elicitation/create".wire() });
     var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try writeElicitationParams(arena, &jw, req, emit_mode);
+    try w.writeAll("}\n");
+}
+
+/// The `params` object of an `elicitation/create` — shared by the session
+/// request line and a 2026-07-28 `inputRequests` entry.
+fn writeElicitationParams(
+    arena: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    req: ElicitationRequest,
+    emit_mode: bool,
+) (std.Io.Writer.Error || error{SchemaNotJson})!void {
     try jw.beginObject();
     switch (req) {
         // Spec example order: mode, message, requestedSchema.
@@ -1727,7 +1742,7 @@ pub fn writeElicitationRequestLine(
             try jw.objectField("message");
             try jw.write(f.message);
             try jw.objectField("requestedSchema");
-            writeRawJson(arena, &jw, f.requested_schema) catch |err| switch (err) {
+            writeRawJson(arena, jw, f.requested_schema) catch |err| switch (err) {
                 error.WriteFailed => return error.WriteFailed,
                 else => return error.SchemaNotJson,
             };
@@ -1745,8 +1760,408 @@ pub fn writeElicitationRequestLine(
         },
     }
     try jw.endObject();
-    try w.writeAll("}\n");
 }
+
+/// Everything a sampling or elicitation request can be refused for before it
+/// goes anywhere — the capability gate plus the payload checks. Shared by the
+/// session path (`Server.send*Request`) and the 2026-07-28 path
+/// (`InputRound.ask`), so neither can drift from the other.
+pub const RequestCheckError = error{
+    SamplingNotSupported,
+    ElicitationNotSupported,
+    ElicitationFormNotSupported,
+    ElicitationUrlNotSupported,
+    NoMessages,
+    InvalidMaxTokens,
+    InvalidPriority,
+    InvalidUrl,
+    EmptyMessage,
+    MissingElicitationId,
+} || SchemaError;
+
+fn checkSamplingRequest(caps: ClientCapabilities, req: SamplingRequest) RequestCheckError!void {
+    if (!caps.sampling) return error.SamplingNotSupported;
+    if (req.messages.len == 0) return error.NoMessages;
+    if (req.max_tokens == 0) return error.InvalidMaxTokens;
+    if (req.model_preferences) |mp| {
+        for ([_]?f64{ mp.cost_priority, mp.speed_priority, mp.intelligence_priority }) |p_opt| {
+            const p = p_opt orelse continue;
+            if (!(p >= 0.0) or !(p <= 1.0)) return error.InvalidPriority; // NaN too
+        }
+    }
+}
+
+fn checkElicitationRequest(arena: std.mem.Allocator, caps: ClientCapabilities, req: ElicitationRequest) RequestCheckError!void {
+    if (!caps.elicitation) return error.ElicitationNotSupported;
+    switch (req) {
+        .form => |f| {
+            if (!caps.elicitation_form) return error.ElicitationFormNotSupported;
+            if (f.message.len == 0) return error.EmptyMessage;
+            try validateElicitationSchema(arena, f.requested_schema);
+        },
+        .url => |u| {
+            if (!caps.elicitation_url) return error.ElicitationUrlNotSupported;
+            if (u.message.len == 0) return error.EmptyMessage;
+            if (u.elicitation_id.len == 0) return error.MissingElicitationId;
+            if (!isSafeElicitationUrl(u.url)) return error.InvalidUrl;
+        },
+    }
+}
+
+// ── multi round-trip requests (2026-07-28, basic/patterns/mrtr.mdx) ─────────
+//
+// The 2026-07-28 revision removed server→client requests. A `tools/call`,
+// `prompts/get` or `resources/read` that needs something from the client —
+// an LLM completion, user input — now *answers* with an `InputRequiredResult`
+// (`resultType: "input_required"`) listing what it needs under keys it picks,
+// and the client **retries the original request** with a new JSON-RPC id,
+// carrying the answers under the same keys in `params.inputResponses` and the
+// server's opaque `requestState` echoed verbatim.
+//
+// That is exactly the shape the session path could not offer: the handler
+// runs to completion on every round, and the answer arrives as input to the
+// next run, so a tool that needs a completion to produce its result is now
+// one tool, not the "ask on this call, act on the next" pair the session API
+// forces (see the server→client section above). Nothing is pending on the
+// server between rounds — which is the revision's point: the retry may land
+// on a different server instance.
+//
+// Each round is independent. The handler reads what it has (`response`,
+// `elicitation`, `sampling`, `receivedState`), and either produces its normal
+// result or asks again (`ask`, `setState`). Whatever it asked for wins: once
+// any request or state is set, the response is an `InputRequiredResult` and
+// the handler's normal output is discarded.
+//
+// **`requestState` comes back from the client and is attacker-controlled**
+// (the spec's MUST). A handler that lets it influence authorization, resource
+// access or business logic must protect it; `StateSeal` does that (HMAC over
+// the state plus the request it belongs to, the principal and an expiry).
+
+/// One entry of `InputRequiredResult.inputRequests`. `roots/list` (the third
+/// kind the spec allows) is not offered: roots are deprecated in 2026-07-28 and
+/// this module never implemented them on the session path either.
+pub const InputRequest = union(enum) {
+    sampling: SamplingRequest,
+    elicitation: ElicitationRequest,
+};
+
+/// What `InputRound.ask`/`setState` can refuse.
+pub const InputError = error{
+    OutOfMemory,
+    /// The request came in on the `initialize`-session path, which has no
+    /// multi round-trip pattern — use `ToolCall.requestSampling`/
+    /// `requestElicitation` there.
+    SessionRequest,
+    /// Keys are the client's only link between a request and its answer
+    /// (mrtr.mdx: "MUST be unique within the scope of the request").
+    EmptyInputKey,
+    DuplicateInputKey,
+    /// `setState("")`: an empty state cannot be told apart from none on retry.
+    EmptyRequestState,
+} || RequestCheckError;
+
+/// The multi round-trip side of one 2026-07-28 `tools/call`, `prompts/get` or
+/// `resources/read` — present on `ToolCall.input`, `PromptRequest.input` and
+/// `ResourceRequest.input`.
+///
+/// **Received** (this round's retry, if it is one): `response`/`elicitation`/
+/// `sampling` read `params.inputResponses`; `receivedState` is
+/// `params.requestState`. Both are null on a first attempt, and always on the
+/// session path (earlier revisions have neither field; a stray one is
+/// ignored, not interpreted).
+///
+/// **Asked** (the next round): `ask` adds an `inputRequests` entry, `setState`
+/// sets `requestState`. Either one turns this round's reply into an
+/// `InputRequiredResult`. Everything is serialized when it is called, so the
+/// request's strings need not outlive the call.
+///
+/// A client may omit an answer, send one the server did not ask for, or send a
+/// malformed one. The spec's advice for a missing answer the handler needs is
+/// to ask again rather than fail, which is what the typed accessors' `null`
+/// makes natural: `if (call.input.elicitation("login")) |r| … else try
+/// call.input.ask("login", …)`. The client is the user's agent, so an answer
+/// that arrives unasked is no less trustworthy than one that was asked for —
+/// the client could have accepted either way.
+pub const InputRound = struct {
+    /// Per-request arena; everything here dies with the response.
+    arena: std.mem.Allocator = std.mem.Allocator.failing,
+    /// Null on the session path: `ask`/`setState` refuse with
+    /// `error.SessionRequest`, the accessors return null.
+    modern: ?*const ModernRequest = null,
+    /// The method this round belongs to (`tools/call`, …) and its target (the
+    /// tool or prompt name, the resource uri) — what `StateSeal` binds a state
+    /// to.
+    method: []const u8 = "",
+    target: []const u8 = "",
+    /// `params.inputResponses` of this retry.
+    responses: ?std.json.ObjectMap = null,
+    /// `params.requestState` of this retry. Attacker-controlled.
+    state_in: ?[]const u8 = null,
+
+    /// Serialized `"key":{method,params}` members, comma-joined.
+    requests_json: std.ArrayList(u8) = .empty,
+    keys: std.ArrayList([]const u8) = .empty,
+    state_out: ?[]const u8 = null,
+
+    /// This retry's raw answer under `key`, or null.
+    pub fn response(self: *const InputRound, key: []const u8) ?std.json.Value {
+        const r = self.responses orelse return null;
+        return r.get(key);
+    }
+
+    /// The `ElicitResult` under `key`; null when absent or not decodable —
+    /// ask again. A `decline`/`cancel` decodes: it is the user's answer.
+    pub fn elicitation(self: *const InputRound, key: []const u8) ?ElicitationResult {
+        const v = self.response(key) orelse return null;
+        return ElicitationResult.parse(v) catch null;
+    }
+
+    /// The `CreateMessageResult` under `key`; null when absent or not
+    /// decodable (a tool-use content array included, as on the session path).
+    pub fn sampling(self: *const InputRound, key: []const u8) ?SamplingResult {
+        const v = self.response(key) orelse return null;
+        return SamplingResult.parse(v) catch null;
+    }
+
+    /// The `requestState` the client echoed, verbatim and **unverified**. Use
+    /// `StateSeal.open` when the state carries anything the client must not
+    /// be able to choose.
+    pub fn receivedState(self: *const InputRound) ?[]const u8 {
+        return self.state_in;
+    }
+
+    /// Ask the client for one more input before this request can finish.
+    /// The same checks as the session path apply, against the capabilities
+    /// this request's `_meta` declared (mrtr.mdx: a server "MUST NOT send an
+    /// `inputRequests` that the client has not declared support for").
+    pub fn ask(self: *InputRound, key: []const u8, req: InputRequest) InputError!void {
+        const modern = self.modern orelse return error.SessionRequest;
+        if (key.len == 0) return error.EmptyInputKey;
+        for (self.keys.items) |k| {
+            if (eql(k, key)) return error.DuplicateInputKey;
+        }
+        switch (req) {
+            .sampling => |s| try checkSamplingRequest(modern.capabilities, s),
+            .elicitation => |e| try checkElicitationRequest(self.arena, modern.capabilities, e),
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        writeInputRequestMember(self.arena, &jw, key, req) catch |err| switch (err) {
+            error.SchemaNotJson => return error.SchemaNotJson, // unreachable: validated above
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        const member = aw.written();
+        // `jw` opened no object of its own, so the member is `"key":{…}`
+        // without the separator the enclosing object would have written.
+        if (self.requests_json.items.len != 0) try self.requests_json.append(self.arena, ',');
+        try self.requests_json.appendSlice(self.arena, member);
+        try self.keys.append(self.arena, try self.arena.dupe(u8, key));
+    }
+
+    /// Set the `requestState` the client must echo on its retry. Alone (no
+    /// `ask`) it is the spec's load-shedding shape: "retry, and bring this".
+    pub fn setState(self: *InputRound, state: []const u8) InputError!void {
+        if (self.modern == null) return error.SessionRequest;
+        if (state.len == 0) return error.EmptyRequestState;
+        self.state_out = try self.arena.dupe(u8, state);
+    }
+
+    /// `StateSeal.seal` bound to this round's method and target, then
+    /// `setState`.
+    pub fn sealState(self: *InputRound, seal: *const StateSeal, payload: []const u8, opts: StateSeal.SealOptions) InputError!void {
+        if (self.modern == null) return error.SessionRequest;
+        const token = try seal.seal(self.arena, self.binding(opts.principal), payload, opts.now_sec, opts.ttl_sec);
+        try self.setState(token);
+    }
+
+    /// `StateSeal.open` on the received state, bound to this round's method
+    /// and target. Null when there is no received state; an error when there
+    /// is one and it fails verification — the spec's "MUST reject".
+    pub fn openState(self: *const InputRound, seal: *const StateSeal, principal: []const u8, now_sec: i64) StateSeal.OpenError!?[]const u8 {
+        const token = self.state_in orelse return null;
+        return try seal.open(self.arena, self.binding(principal), token, now_sec);
+    }
+
+    fn binding(self: *const InputRound, principal: []const u8) StateSeal.Binding {
+        return .{ .method = self.method, .target = self.target, .principal = principal };
+    }
+
+    /// Forget everything asked so far (a declining resource template).
+    fn resetAsked(self: *InputRound) void {
+        self.requests_json.clearRetainingCapacity();
+        self.keys.clearRetainingCapacity();
+        self.state_out = null;
+    }
+
+    /// Whether this round's reply is an `InputRequiredResult`.
+    pub fn inputRequired(self: *const InputRound) bool {
+        return self.keys.items.len != 0 or self.state_out != null;
+    }
+
+    /// Read `inputResponses`/`requestState` from a 2026-07-28 request's params.
+    /// A wrong type is the caller's -32602 (mrtr.mdx "Error Handling": a
+    /// malformed `InputResponses` is a protocol error).
+    fn fromParams(
+        arena: std.mem.Allocator,
+        modern: ?*const ModernRequest,
+        method: []const u8,
+        target: []const u8,
+        params: std.json.ObjectMap,
+    ) error{ InvalidInputResponses, InvalidRequestState }!InputRound {
+        var r: InputRound = .{ .arena = arena, .modern = modern, .method = method, .target = target };
+        if (modern == null) return r;
+        if (present(params.get("inputResponses"))) |v| {
+            if (v != .object) return error.InvalidInputResponses;
+            r.responses = v.object;
+        }
+        if (present(params.get("requestState"))) |v| {
+            if (v != .string) return error.InvalidRequestState;
+            r.state_in = v.string;
+        }
+        return r;
+    }
+};
+
+/// One `"key":{"method":…,"params":…}` member of `inputRequests`, in the
+/// member order of the spec's `InputRequests` example.
+fn writeInputRequestMember(arena: std.mem.Allocator, jw: *std.json.Stringify, key: []const u8, req: InputRequest) (std.Io.Writer.Error || error{SchemaNotJson})!void {
+    // A bare member: `jw` must not add the comma of an enclosing object, so
+    // write the key through the raw writer.
+    try std.json.Stringify.encodeJsonString(key, .{}, jw.writer);
+    try jw.writer.writeByte(':');
+    try jw.beginObject();
+    try jw.objectField("method");
+    switch (req) {
+        .sampling => |s| {
+            try jw.write(OriginatedMethod.@"sampling/createMessage".wire());
+            try jw.objectField("params");
+            try writeSamplingParams(jw, s);
+        },
+        .elicitation => |e| {
+            try jw.write(OriginatedMethod.@"elicitation/create".wire());
+            try jw.objectField("params");
+            // 2026-07-28 knows modes, so form mode names itself.
+            try writeElicitationParams(arena, jw, e, true);
+        },
+    }
+    try jw.endObject();
+}
+
+/// Serialize one `InputRequiredResult` (`resultType` first, like every
+/// 2026-07-28 result this module writes).
+fn buildInputRequiredResult(jw: *std.json.Stringify, round: *const InputRound, info: *const Info) std.Io.Writer.Error!void {
+    try jw.beginObject();
+    try jw.objectField("resultType");
+    try jw.write("input_required");
+    if (round.keys.items.len != 0) {
+        try jw.objectField("inputRequests");
+        // The members were serialized by `ask`; splice them in verbatim.
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('{');
+        try jw.writer.writeAll(round.requests_json.items);
+        try jw.writer.writeByte('}');
+        jw.endWriteRaw();
+    }
+    if (round.state_out) |st| {
+        try jw.objectField("requestState");
+        try jw.write(st);
+    }
+    try endResult(jw, info, true, null);
+}
+
+/// Integrity protection for `requestState` (mrtr.mdx, server requirements 4–5):
+/// HMAC-SHA-256 over the state **and** what it may be used for — the method,
+/// its target (tool/prompt name, resource uri), the authenticated principal,
+/// an expiry and any caller-chosen `extra` (e.g. a digest of the arguments
+/// that matter) — so a state is refused if it is altered, presented late,
+/// presented by a different principal, or replayed onto a different request.
+/// Only the expiry and the payload travel; the rest is recomputed on `open`.
+///
+/// The payload is **not encrypted**: the client can read it. Put nothing in
+/// it the client must not see. As the spec warns, this bounds replay but does
+/// not make a state single-use; a one-time redemption needs server-side
+/// bookkeeping.
+///
+/// Token: `base64url-nopad( 0x01 ‖ expiry:u64be ‖ mac[32] ‖ payload )`.
+/// This module reads no clock — `now_sec` is the caller's.
+pub const StateSeal = struct {
+    /// Keep it secret, 32 random bytes; every instance that may receive a
+    /// retry needs the same key.
+    key: [32]u8,
+
+    pub const version: u8 = 1;
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    const header_len = 1 + 8 + Hmac.mac_length;
+
+    pub const Binding = struct {
+        method: []const u8,
+        target: []const u8,
+        principal: []const u8 = "",
+        extra: []const u8 = "",
+    };
+
+    pub const SealOptions = struct {
+        now_sec: i64,
+        /// The spec asks for "a short expiry".
+        ttl_sec: u32 = 600,
+        principal: []const u8 = "",
+    };
+
+    pub const OpenError = error{
+        OutOfMemory,
+        /// Not a token this seal produced: bad encoding, wrong version, a
+        /// MAC that does not verify (altered, or bound to another
+        /// method/target/principal/extra — indistinguishable by design).
+        StateInvalid,
+        /// Verified, but presented at or after its expiry.
+        StateExpired,
+    };
+
+    pub fn seal(self: *const StateSeal, arena: std.mem.Allocator, b: Binding, payload: []const u8, now_sec: i64, ttl_sec: u32) error{OutOfMemory}![]const u8 {
+        const expiry: u64 = @intCast(@max(0, now_sec) + ttl_sec);
+        const raw = try arena.alloc(u8, header_len + payload.len);
+        raw[0] = version;
+        std.mem.writeInt(u64, raw[1..9], expiry, .big);
+        @memcpy(raw[header_len..], payload);
+        self.mac(raw[9..header_len], b, raw[0..9], payload);
+        const enc = std.base64.url_safe_no_pad.Encoder;
+        const out = try arena.alloc(u8, enc.calcSize(raw.len));
+        return enc.encode(out, raw);
+    }
+
+    /// Verify `token` against `b` and return its payload (arena-owned).
+    /// The MAC is checked before the expiry, so an attacker learns nothing
+    /// from the difference.
+    pub fn open(self: *const StateSeal, arena: std.mem.Allocator, b: Binding, token: []const u8, now_sec: i64) OpenError![]const u8 {
+        const dec = std.base64.url_safe_no_pad.Decoder;
+        const n = dec.calcSizeForSlice(token) catch return error.StateInvalid;
+        if (n < header_len) return error.StateInvalid;
+        const raw = try arena.alloc(u8, n);
+        dec.decode(raw, token) catch return error.StateInvalid;
+        if (raw[0] != version) return error.StateInvalid;
+        var want: [Hmac.mac_length]u8 = undefined;
+        self.mac(&want, b, raw[0..9], raw[header_len..]);
+        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, raw[9..header_len].*)) return error.StateInvalid;
+        const expiry = std.mem.readInt(u64, raw[1..9], .big);
+        if (now_sec < 0 or @as(u64, @intCast(now_sec)) >= expiry) return error.StateExpired;
+        return raw[header_len..];
+    }
+
+    fn mac(self: *const StateSeal, out: *[Hmac.mac_length]u8, b: Binding, head: *const [9]u8, payload: []const u8) void {
+        var h = Hmac.init(&self.key);
+        h.update("mcp-request-state");
+        h.update(head);
+        // Length-prefixed, so no two different bindings share an encoding.
+        for ([_][]const u8{ b.method, b.target, b.principal, b.extra, payload }) |field| {
+            var len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len, @intCast(field.len), .big);
+            h.update(&len);
+            h.update(field);
+        }
+        h.final(out);
+    }
+};
 
 // ── tool registration ───────────────────────────────────────────────────────
 
@@ -1779,6 +2194,11 @@ pub const ToolCall = struct {
     /// Set when this call arrived as a stateless 2026-07-28 request: what its
     /// `_meta` declared. Null = an `initialize`-session call. Arena lifetime.
     modern: ?*const ModernRequest = null,
+    /// The multi round-trip side of a 2026-07-28 call: the answers this retry
+    /// carries, and `ask`/`setState` for the next round. Asking anything turns
+    /// the reply into an `InputRequiredResult`; the text written to `out` and
+    /// the handler's return value are then discarded.
+    input: InputRound = .{},
 
     /// Ask the client's LLM for a completion, from inside a tool call.
     ///
@@ -1788,6 +2208,10 @@ pub const ToolCall = struct {
     /// A tool that needs the completion to produce its answer must be modelled
     /// as two calls (ask now, act on the next call). There is no way around
     /// that: the answer cannot arrive while this handler owns the loop.
+    ///
+    /// On a 2026-07-28 call this refuses with `error.StatelessRequest`; that
+    /// revision asks through `input.ask` instead, and there the answer does
+    /// arrive within the same tool (on the client's retry).
     pub fn requestSampling(self: *ToolCall, req: SamplingRequest, opts: RequestOptions) SendError!u64 {
         if (self.modern != null) return error.StatelessRequest;
         var o = opts;
@@ -1926,6 +2350,11 @@ pub const ResourceRequest = struct {
     /// is `.private`, a static file may live longer) overwrites it. Ignored
     /// on the session path, which has no caching fields.
     cache: CacheHint = .{},
+    /// Multi round-trip (2026-07-28): see `InputRound` and `ToolCall.input`.
+    /// A template handler that declines (`false`) has its asks discarded with
+    /// its contents; any other handler that asked gets an
+    /// `InputRequiredResult`, whatever it returned.
+    input: InputRound = .{},
 
     const ContentItem = struct {
         uri: []const u8,
@@ -2013,6 +2442,10 @@ pub const PromptRequest = struct {
     args: std.json.Value,
     /// Accumulated messages (internal; fill via `message`).
     messages: std.ArrayList(Message) = .empty,
+    /// Multi round-trip (2026-07-28): see `InputRound` and `ToolCall.input`.
+    /// Asking anything turns the reply into an `InputRequiredResult`, whatever
+    /// the handler returns.
+    input: InputRound = .{},
 
     /// MCP prompt message roles — the same `Role` the sampling surface uses
     /// (aliased so both spell it the way the spec does).
@@ -2284,15 +2717,7 @@ pub const Server = struct {
         opts: RequestOptions,
     ) SendError!u64 {
         const peer_state = self.peerState(opts.peer);
-        if (!peer_state.capabilities.sampling) return error.SamplingNotSupported;
-        if (req.messages.len == 0) return error.NoMessages;
-        if (req.max_tokens == 0) return error.InvalidMaxTokens;
-        if (req.model_preferences) |mp| {
-            for ([_]?f64{ mp.cost_priority, mp.speed_priority, mp.intelligence_priority }) |p_opt| {
-                const p = p_opt orelse continue;
-                if (!(p >= 0.0) or !(p <= 1.0)) return error.InvalidPriority; // NaN too
-            }
-        }
+        try checkSamplingRequest(peer_state.capabilities, req);
         if (self.pendingFor(opts.peer) >= self.max_pending) return error.TooManyPending;
 
         const id = self.allocRequestId();
@@ -2331,25 +2756,12 @@ pub const Server = struct {
         opts: RequestOptions,
     ) SendError!u64 {
         const peer_state = self.peerState(opts.peer);
-        if (!peer_state.capabilities.elicitation) return error.ElicitationNotSupported;
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        switch (req) {
-            .form => |f| {
-                if (!peer_state.capabilities.elicitation_form) return error.ElicitationFormNotSupported;
-                if (f.message.len == 0) return error.EmptyMessage;
-                try validateElicitationSchema(arena, f.requested_schema);
-            },
-            .url => |u| {
-                if (!peer_state.capabilities.elicitation_url) return error.ElicitationUrlNotSupported;
-                if (u.message.len == 0) return error.EmptyMessage;
-                if (u.elicitation_id.len == 0) return error.MissingElicitationId;
-                if (!isSafeElicitationUrl(u.url)) return error.InvalidUrl;
-            },
-        }
+        try checkElicitationRequest(arena, peer_state.capabilities, req);
         if (self.pendingFor(opts.peer) >= self.max_pending) return error.TooManyPending;
 
         const id = self.allocRequestId();
@@ -2709,10 +3121,10 @@ pub const Server = struct {
             .ping => try sendResultRaw(arena, out, id, "{}"),
             .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer, modern),
             .@"resources/list" => try self.handleResourcesList(arena, out, id, modern != null),
-            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), modern != null),
+            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), modern),
             .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id, modern != null),
             .@"prompts/list" => try self.handlePromptsList(arena, out, id, modern != null),
-            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), modern != null),
+            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), modern),
         }
     }
 
@@ -2922,6 +3334,10 @@ pub const Server = struct {
             break :blk Progress{ .out = out, .token_json = token_json };
         };
 
+        const round = InputRound.fromParams(arena, modern, "tools/call", tool.name, params.object) catch |err| {
+            return sendInputParamsError(arena, out, id, err);
+        };
+
         var tool_buf: std.ArrayList(u8) = .empty;
         var call = ToolCall{
             .arena = arena,
@@ -2932,8 +3348,10 @@ pub const Server = struct {
             .transport = out,
             .peer = peer,
             .modern = modern,
+            .input = round,
         };
         const is_error = tool.handler(tool.ctx, &call);
+        if (call.input.inputRequired()) return self.sendInputRequired(arena, out, id, &call.input);
         try sendToolResult(arena, out, id, tool_buf.items, .{
             .allow_structured = tool.allow_structured,
             .is_error = is_error,
@@ -3015,7 +3433,8 @@ pub const Server = struct {
     /// the contents the handler filled. Unresolvable uri => -32002 on the
     /// session path; -32602 with `data.uri` on a 2026-07-28 request, which
     /// forbids -32002 (server/resources.mdx "Error Handling").
-    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern: bool) Error!void {
+    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern_req: ?*const ModernRequest) Error!void {
+        const modern = modern_req != null;
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
         };
@@ -3029,20 +3448,26 @@ pub const Server = struct {
             return sendError(arena, out, id, error_code.invalid_params, "Invalid uri");
         }
 
-        var req = ResourceRequest{ .arena = arena, .uri = uri_v.string, .cache = self.read_cache };
+        const round = InputRound.fromParams(arena, modern_req, "resources/read", uri_v.string, params.object) catch |err| {
+            return sendInputParamsError(arena, out, id, err);
+        };
+
+        var req = ResourceRequest{ .arena = arena, .uri = uri_v.string, .cache = self.read_cache, .input = round };
         const found = blk: {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
             for (self.resource_templates.items) |*t| {
                 const handler = t.handler orelse continue;
                 if (handler(t.ctx, &req)) break :blk true;
-                // A declining template may have written partial contents (or
-                // a caching hint) before bailing — discard them before trying
-                // the next one.
+                // A declining template may have written partial contents, a
+                // caching hint or an input request before bailing — discard
+                // them before trying the next one.
                 req.contents.clearRetainingCapacity();
                 req.cache = self.read_cache;
+                req.input.resetAsked();
             }
             break :blk false;
         };
+        if (req.input.inputRequired()) return self.sendInputRequired(arena, out, id, &req.input);
         if (!found) {
             if (modern) return sendErrorWithData(arena, out, id, error_code.invalid_params, "Resource not found", .{ .uri = req.uri });
             return sendError(arena, out, id, error_code.resource_not_found, "Resource not found");
@@ -3104,7 +3529,8 @@ pub const Server = struct {
     /// `prompts/get`: validate params + the declared required arguments
     /// (-32602 on any miss, so a handler never sees an incomplete required
     /// set), dispatch to the handler, send the rendered messages.
-    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern: bool) Error!void {
+    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern_req: ?*const ModernRequest) Error!void {
+        const modern = modern_req != null;
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
         };
@@ -3139,8 +3565,14 @@ pub const Server = struct {
             }
         }
 
-        var req = PromptRequest{ .arena = arena, .args = args };
-        if (!prompt.handler(prompt.ctx, &req)) {
+        const round = InputRound.fromParams(arena, modern_req, "prompts/get", prompt.name, params.object) catch |err| {
+            return sendInputParamsError(arena, out, id, err);
+        };
+
+        var req = PromptRequest{ .arena = arena, .args = args, .input = round };
+        const ok = prompt.handler(prompt.ctx, &req);
+        if (req.input.inputRequired()) return self.sendInputRequired(arena, out, id, &req.input);
+        if (!ok) {
             return sendError(arena, out, id, error_code.internal_error, "Prompt failed");
         }
 
@@ -3149,7 +3581,25 @@ pub const Server = struct {
         buildPromptResult(&jw, prompt, &req, &self.info, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
+
+    /// Answer a request whose handler asked for input with an
+    /// `InputRequiredResult` instead of its normal result.
+    fn sendInputRequired(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, round: *const InputRound) Error!void {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        buildInputRequiredResult(&jw, round, &self.info) catch return error.OutOfMemory;
+        try sendResultRaw(arena, out, id, aw.written());
+    }
 };
+
+/// -32602 for an `inputResponses` that is not an object or a `requestState`
+/// that is not a string (mrtr.mdx "Error Handling").
+fn sendInputParamsError(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, err: error{ InvalidInputResponses, InvalidRequestState }) Error!void {
+    return sendError(arena, out, id, error_code.invalid_params, switch (err) {
+        error.InvalidInputResponses => "Invalid inputResponses",
+        error.InvalidRequestState => "Invalid requestState",
+    });
+}
 
 /// Serialize one `resources/read` result: `{"contents":[{uri, mimeType?,
 /// text|blob}, …]}` — `blob` carries the base64 the handler's `blob()` call
@@ -8027,4 +8477,428 @@ test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (cana
     }
     try testing.expectEqual(@as(usize, 4), literal);
     try testing.expectEqual(@as(usize, 8), modern_spec_anchor_index.len);
+}
+
+// ── multi round-trip requests (2026-07-28) ──────────────────────────────────
+//
+// Anchored on the revision's own MRTR examples: `schema/2026-07-28/examples/
+// InputRequests/elicitation-and-sampling-input-requests.json`,
+// `InputResponses/elicitation-and-sampling-input-responses.json` and
+// `InputRequiredResult/input-required-result-with-request-state-only.json`,
+// quoted verbatim below.
+
+/// `_meta` of a modern request whose client declared form elicitation and
+/// sampling, closed.
+const mrtr_meta =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"elicitation":{},"sampling":{}}}
+;
+
+/// The spec's weather-like tool made two-round: on the first attempt it asks
+/// for the GitHub login and the capital of France (the spec's example pair)
+/// plus a state; on the retry it answers from what came back.
+const MrtrProbe = struct {
+    ask_result: ?InputError!void = null,
+    rounds: u32 = 0,
+};
+
+fn mrtrHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const p: *MrtrProbe = @ptrCast(@alignCast(ctx.?));
+    p.rounds += 1;
+    const login = call.input.elicitation("github_login");
+    const capital = call.input.sampling("capital_of_france");
+    if (login == null or capital == null) {
+        p.ask_result = askSpecPair(call);
+        call.write("never sent");
+        return false;
+    }
+    const name = login.?.content.?.object.get("name").?.string;
+    call.print("{s}|{s}|{s}", .{ name, capital.?.content.text, call.input.receivedState() orelse "-" });
+    return false;
+}
+
+fn askSpecPair(call: *ToolCall) InputError!void {
+    try call.input.ask("github_login", .{ .elicitation = .{ .form = .{
+        .message = "Please provide your GitHub username",
+        .requested_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}",
+    } } });
+    try call.input.ask("capital_of_france", .{ .sampling = .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "What is the capital of France?" } }},
+        .max_tokens = 100,
+    } });
+    try call.input.setState("eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0");
+}
+
+test "2026-07-28 MRTR anchor: a tool asks for the spec's InputRequests, then completes from the spec's InputResponses" {
+    var probe = MrtrProbe{};
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "login", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &mrtrHandler, .ctx = &probe });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Round 1: the reply is an InputRequiredResult whose `inputRequests` is
+    // value-equal to the spec's InputRequests example.
+    const first = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"login\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(first);
+    try probe.ask_result.?;
+    const got = try std.json.parseFromSliceLeaky(std.json.Value, arena, first, .{});
+    const result = got.object.get("result").?.object;
+    try testing.expectEqualStrings("input_required", result.get("resultType").?.string);
+    try testing.expectEqualStrings("eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0", result.get("requestState").?.string);
+    try testing.expect(result.get("_meta").?.object.get(meta_key.server_info) != null);
+    try testing.expect(result.get("content") == null); // the tool's text is discarded
+    try testing.expectEqual(@as(usize, 4), result.count());
+    const want_requests = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{
+        \\  "github_login": {
+        \\    "method": "elicitation/create",
+        \\    "params": {
+        \\      "mode": "form",
+        \\      "message": "Please provide your GitHub username",
+        \\      "requestedSchema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "name": {
+        \\            "type": "string"
+        \\          }
+        \\        },
+        \\        "required": ["name"]
+        \\      }
+        \\    }
+        \\  },
+        \\  "capital_of_france": {
+        \\    "method": "sampling/createMessage",
+        \\    "params": {
+        \\      "messages": [
+        \\        {
+        \\          "role": "user",
+        \\          "content": {
+        \\            "type": "text",
+        \\            "text": "What is the capital of France?"
+        \\          }
+        \\        }
+        \\      ],
+        \\      "maxTokens": 100
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    if (!jsonValueEql(result.get("inputRequests").?, want_requests)) {
+        std.debug.print("\n got: {s}\n", .{first});
+        return error.TestExpectedEqual;
+    }
+
+    // Round 2: the retry (new id) carries the spec's InputResponses example
+    // and echoes the state; the same tool now completes.
+    const retry = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"login\"," ++ mrtr_meta ++
+        \\,"requestState":"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0","inputResponses":{
+        \\  "github_login": {
+        \\    "action": "accept",
+        \\    "content": {
+        \\      "name": "octocat"
+        \\    }
+        \\  },
+        \\  "capital_of_france": {
+        \\    "role": "assistant",
+        \\    "content": {
+        \\      "type": "text",
+        \\      "text": "The capital of France is Paris."
+        \\    },
+        \\    "model": "claude-3-sonnet-20240307",
+        \\    "stopReason": "endTurn"
+        \\  }
+        \\}}}
+    ;
+    const second = try replyTo(&s, retry);
+    defer testing.allocator.free(second);
+    try testing.expectEqual(@as(u32, 2), probe.rounds);
+    try testing.expect(std.mem.indexOf(u8, second, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "\"text\":\"octocat|The capital of France is Paris.|eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0\"") != null);
+    // Nothing was ever pending on the server between the rounds.
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
+}
+
+fn stateOnlyHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.input.setState("eyJwcm9ncmVzcyI6IjUwJSIsInN0YXRlIjoicHJvY2Vzc2luZyJ9") catch unreachable;
+    return true; // ignored: the state wins
+}
+
+test "2026-07-28 MRTR anchor: request state only (load shedding)" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "busy", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &stateOnlyHandler });
+    // InputRequiredResult/input-required-result-with-request-state-only.json
+    // as the `result` of our reply to a `tools/call` (id 1).
+    try expectSpecResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"busy\"," ++ modern_meta_open ++ "}}}",
+        \\{"jsonrpc":"2.0","id":1,"result":
+        \\{
+        \\  "resultType": "input_required",
+        \\  "requestState": "eyJwcm9ncmVzcyI6IjUwJSIsInN0YXRlIjoicHJvY2Vzc2luZyJ9"
+        \\}
+        \\}
+    , &.{});
+}
+
+const AskOutcome = struct {
+    err: ?InputError = null,
+    required: bool = false,
+    responses_seen: bool = false,
+};
+
+fn gateHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const o: *AskOutcome = @ptrCast(@alignCast(ctx.?));
+    o.responses_seen = call.input.response("k") != null or call.input.receivedState() != null;
+    call.input.ask("k", .{ .elicitation = .{ .form = .{ .message = "m", .requested_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}" } } }) catch |e| {
+        o.err = e;
+    };
+    o.required = call.input.inputRequired();
+    call.write("plain");
+    return false;
+}
+
+test "2026-07-28 MRTR: asks are gated by the request's declared capabilities; the session path has no MRTR" {
+    var o = AskOutcome{};
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "g", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &gateHandler, .ctx = &o });
+
+    // Modern, but no elicitation declared: refused, and the reply is the
+    // tool's normal result.
+    const r1 = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"g\"," ++ modern_meta_open ++ "}}}");
+    defer testing.allocator.free(r1);
+    try testing.expectEqual(@as(?InputError, error.ElicitationNotSupported), o.err);
+    try testing.expect(!o.required);
+    try testing.expect(std.mem.indexOf(u8, r1, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "\"text\":\"plain\"") != null);
+
+    // Session path: a stray inputResponses/requestState is not read, and
+    // asking is refused.
+    o = .{};
+    const r2 = try replyTo(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"g","inputResponses":{"k":{"action":"accept"}},"requestState":"x"}}
+    );
+    defer testing.allocator.free(r2);
+    try testing.expectEqual(@as(?InputError, error.SessionRequest), o.err);
+    try testing.expect(!o.responses_seen);
+    try testing.expect(std.mem.indexOf(u8, r2, "input_required") == null);
+    try testing.expect(std.mem.indexOf(u8, r2, "\"text\":\"plain\"") != null);
+
+    // Declared: asked.
+    o = .{};
+    const r3 = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"g\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(r3);
+    try testing.expectEqual(@as(?InputError, null), o.err);
+    try testing.expect(o.required);
+    try testing.expect(std.mem.indexOf(u8, r3, "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r3, "plain") == null);
+}
+
+test "2026-07-28 MRTR: a malformed inputResponses or requestState is -32602" {
+    var o = AskOutcome{};
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "g", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &gateHandler, .ctx = &o });
+    const cases = [_]struct { extra: []const u8, msg: []const u8 }{
+        .{ .extra = ",\"inputResponses\":[]", .msg = "Invalid inputResponses" },
+        .{ .extra = ",\"inputResponses\":\"k\"", .msg = "Invalid inputResponses" },
+        .{ .extra = ",\"requestState\":5", .msg = "Invalid requestState" },
+        .{ .extra = ",\"requestState\":{}", .msg = "Invalid requestState" },
+    };
+    for (cases) |c| {
+        var buf: [512]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"g\",{s}{s}}}}}", .{ mrtr_meta, c.extra });
+        const line = try replyTo(&s, msg);
+        defer testing.allocator.free(line);
+        try testing.expect(std.mem.indexOf(u8, line, "\"code\":-32602") != null);
+        try testing.expect(std.mem.indexOf(u8, line, c.msg) != null);
+    }
+    // null means absent, as elsewhere in this module.
+    const ok = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"g\"," ++ mrtr_meta ++ ",\"inputResponses\":null,\"requestState\":null}}");
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.indexOf(u8, ok, "input_required") != null);
+}
+
+fn keyRulesHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const errs: *[4]?InputError = @ptrCast(@alignCast(ctx.?));
+    const req: InputRequest = .{ .sampling = .{ .messages = &.{.{ .role = .user, .content = .{ .text = "q" } }}, .max_tokens = 1 } };
+    errs[0] = if (call.input.ask("", req)) |_| null else |e| e;
+    call.input.ask("a", req) catch unreachable;
+    errs[1] = if (call.input.ask("a", req)) |_| null else |e| e;
+    errs[2] = if (call.input.setState("")) |_| null else |e| e;
+    errs[3] = if (call.input.ask("b", .{ .sampling = .{ .messages = &.{}, .max_tokens = 1 } })) |_| null else |e| e;
+    return false;
+}
+
+test "2026-07-28 MRTR: keys are non-empty and unique, the state non-empty, the payload checked as on the session path" {
+    var errs: [4]?InputError = @splat(null);
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "k", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &keyRulesHandler, .ctx = &errs });
+    const line = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"k\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(line);
+    try testing.expectEqual(@as(?InputError, error.EmptyInputKey), errs[0]);
+    try testing.expectEqual(@as(?InputError, error.DuplicateInputKey), errs[1]);
+    try testing.expectEqual(@as(?InputError, error.EmptyRequestState), errs[2]);
+    try testing.expectEqual(@as(?InputError, error.NoMessages), errs[3]);
+    // Only the one accepted request went out, once.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "sampling/createMessage"));
+    try testing.expect(std.mem.indexOf(u8, line, "requestState") == null);
+}
+
+fn askingTemplate(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    const accept = @intFromPtr(ctx) == 1;
+    req.input.ask(if (accept) "yes" else "no", .{ .elicitation = .{ .form = .{ .message = "m", .requested_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}" } } }) catch unreachable;
+    return accept;
+}
+
+fn askingPrompt(ctx: ?*anyopaque, req: *PromptRequest) bool {
+    _ = ctx;
+    req.input.setState("s1") catch {}; // error.SessionRequest on the session path
+    return false; // ignored when the state was set: the state wins
+}
+
+test "2026-07-28 MRTR: resources/read and prompts/get; a declining template's asks are discarded" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "a://{x}", .name = "decliner", .handler = &askingTemplate, .ctx = @ptrFromInt(2) });
+    try s.addResourceTemplate(.{ .uri_template = "a://{y}", .name = "acceptor", .handler = &askingTemplate, .ctx = @ptrFromInt(1) });
+    try s.addPrompt(.{ .name = "p", .handler = &askingPrompt });
+
+    const r = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"a://1\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "\"yes\":") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "\"no\":") == null);
+    // Not a cacheable answer: no ttlMs/cacheScope on an InputRequiredResult.
+    try testing.expect(std.mem.indexOf(u8, r, "ttlMs") == null);
+
+    const p = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(p);
+    try testing.expect(std.mem.indexOf(u8, p, "\"resultType\":\"input_required\",\"requestState\":\"s1\"") != null);
+
+    // Session path: the same prompt's setState is refused, so its `false`
+    // stands and the get fails as before.
+    const legacy = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}");
+    defer testing.allocator.free(legacy);
+    try testing.expect(std.mem.indexOf(u8, legacy, "\"code\":-32603") != null);
+}
+
+test "StateSeal: round trip; tampering, rebinding, expiry and garbage are refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const seal: StateSeal = .{ .key = @splat(7) };
+    const b: StateSeal.Binding = .{ .method = "tools/call", .target = "pay", .principal = "alice" };
+    const tok = try seal.seal(arena, b, "{\"step\":2}", 1000, 60);
+
+    try testing.expectEqualStrings("{\"step\":2}", try seal.open(arena, b, tok, 1000));
+    try testing.expectEqualStrings("{\"step\":2}", try seal.open(arena, b, tok, 1059));
+    try testing.expectError(error.StateExpired, seal.open(arena, b, tok, 1060));
+    try testing.expectError(error.StateExpired, seal.open(arena, b, tok, -1));
+
+    // Every bound field matters, and so does the key.
+    const others = [_]StateSeal.Binding{
+        .{ .method = "prompts/get", .target = "pay", .principal = "alice" },
+        .{ .method = "tools/call", .target = "refund", .principal = "alice" },
+        .{ .method = "tools/call", .target = "pay", .principal = "mallory" },
+        .{ .method = "tools/call", .target = "pay", .principal = "alice", .extra = "x" },
+        // Length prefixes: moving a byte between fields is a different binding.
+        .{ .method = "tools/cal", .target = "lpay", .principal = "alice" },
+    };
+    for (others) |o| try testing.expectError(error.StateInvalid, seal.open(arena, o, tok, 1000));
+    const other_key: StateSeal = .{ .key = @splat(8) };
+    try testing.expectError(error.StateInvalid, other_key.open(arena, b, tok, 1000));
+
+    // Flip each byte of the decoded token in turn (version, expiry, MAC,
+    // payload): all refused — a later expiry included.
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const raw = try arena.alloc(u8, try dec.calcSizeForSlice(tok));
+    try dec.decode(raw, tok);
+    for (0..raw.len) |i| {
+        raw[i] ^= 0x01;
+        defer raw[i] ^= 0x01;
+        const t = try arena.alloc(u8, enc.calcSize(raw.len));
+        try testing.expectError(error.StateInvalid, seal.open(arena, b, enc.encode(t, raw), 1000));
+    }
+    // Truncated to the header, shorter still, not base64 at all.
+    const hdr = try arena.alloc(u8, enc.calcSize(StateSeal.header_len));
+    try testing.expectError(error.StateInvalid, seal.open(arena, b, enc.encode(hdr, raw[0..StateSeal.header_len]), 1000));
+    try testing.expectError(error.StateInvalid, seal.open(arena, b, tok[0..10], 1000));
+    try testing.expectError(error.StateInvalid, seal.open(arena, b, "", 1000));
+    try testing.expectError(error.StateInvalid, seal.open(arena, b, "!!!!", 1000));
+    // An empty payload is a valid state.
+    try testing.expectEqualStrings("", try seal.open(arena, b, try seal.seal(arena, b, "", 0, 1), 0));
+}
+
+const SealProbe = struct {
+    seal: StateSeal = .{ .key = @splat(3) },
+    now: i64 = 100,
+    opened: ?[]const u8 = null,
+    open_err: ?StateSeal.OpenError = null,
+    buf: [32]u8 = undefined,
+};
+
+fn sealingHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const p: *SealProbe = @ptrCast(@alignCast(ctx.?));
+    const got = call.input.openState(&p.seal, "alice", p.now) catch |e| {
+        p.open_err = e;
+        return call.fail("bad state");
+    };
+    if (got) |payload| {
+        @memcpy(p.buf[0..payload.len], payload);
+        p.opened = p.buf[0..payload.len];
+        call.write("done");
+        return false;
+    }
+    call.input.sealState(&p.seal, "cart=42", .{ .now_sec = p.now, .ttl_sec = 30, .principal = "alice" }) catch unreachable;
+    return false;
+}
+
+test "2026-07-28 MRTR: sealState/openState bind the state to the round's method and target" {
+    var p = SealProbe{};
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "pay", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &sealingHandler, .ctx = &p });
+    try s.addTool(.{ .name = "refund", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &sealingHandler, .ctx = &p });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"pay\"," ++ mrtr_meta ++ "}}");
+    defer testing.allocator.free(first);
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, first, .{});
+    const token = v.object.get("result").?.object.get("requestState").?.string;
+
+    const retry = struct {
+        fn line(a: std.mem.Allocator, tool: []const u8, tok: []const u8) ![]u8 {
+            return std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s},\"requestState\":\"{s}\"}}}}", .{ tool, mrtr_meta, tok });
+        }
+    }.line;
+
+    // The same state replayed onto another tool: refused.
+    const wrong = try replyTo(&s, try retry(arena, "refund", token));
+    defer testing.allocator.free(wrong);
+    try testing.expectEqual(@as(?StateSeal.OpenError, error.StateInvalid), p.open_err);
+    try testing.expect(p.opened == null);
+
+    // Presented after its expiry: refused.
+    p.open_err = null;
+    p.now = 130;
+    const late = try replyTo(&s, try retry(arena, "pay", token));
+    defer testing.allocator.free(late);
+    try testing.expectEqual(@as(?StateSeal.OpenError, error.StateExpired), p.open_err);
+
+    // In time, on the tool that issued it: opened.
+    p.open_err = null;
+    p.now = 129;
+    const ok = try replyTo(&s, try retry(arena, "pay", token));
+    defer testing.allocator.free(ok);
+    try testing.expectEqual(@as(?StateSeal.OpenError, null), p.open_err);
+    try testing.expectEqualStrings("cart=42", p.opened.?);
+    try testing.expect(std.mem.indexOf(u8, ok, "\"text\":\"done\"") != null);
 }

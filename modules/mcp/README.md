@@ -213,7 +213,8 @@ A tool handler can issue one mid-call (`call.requestSampling` /
 `call.requestElicitation`); the request line goes out before the tool result.
 The answer still arrives later, so a tool that *needs* it must be two calls:
 ask on the first, act on the second. There is no third option that this
-transport can express.
+transport can express — on the session path. Spec 2026-07-28 has one (next
+section).
 
 - **Capability-gated, per peer.** Both refuse (`error.SamplingNotSupported` /
   `error.ElicitationNotSupported`, and per-mode `Elicitation{Form,Url}NotSupported`)
@@ -267,3 +268,62 @@ over an in-memory pipe. For sampling/elicitation: request lines compared
 and per-mode gating, the schema subset, the credential refusal, response
 correlation (by id, out of order, wrong peer, unknown id, after cancel), and an
 ask-then-act round-trip over `serve`.
+
+## Multi round-trip requests (spec 2026-07-28)
+
+Spec 2026-07-28 removed server→client requests. A `tools/call`, `prompts/get`
+or `resources/read` that needs input instead **answers** with an
+`InputRequiredResult`, and the client **retries** the same request with the
+answers. The handler runs to completion on every round, so a tool that needs
+an LLM completion or a user's answer is one tool:
+
+```zig
+fn deploy(ctx: ?*anyopaque, call: *mcp.ToolCall) bool {
+    // Round 2+: the retry carries the answer under the key we chose.
+    if (call.input.elicitation("branch")) |r| {
+        if (r.action != .accept) return call.fail("cancelled");
+        const branch = r.content.?.object.get("branch").?.string;
+        call.print("deploying {s}", .{branch});
+        return false;
+    }
+    // Round 1 (or the client left it out): ask. Anything asked makes the
+    // reply an InputRequiredResult; what the handler wrote is discarded.
+    call.input.ask("branch", .{ .elicitation = .{ .form = .{
+        .message = "Which branch should I deploy?",
+        .requested_schema =
+            \\{"type":"object","properties":{"branch":{"type":"string"}},"required":["branch"]}
+        ,
+    } } }) catch |err| return call.fail(@errorName(err));
+    return false;
+}
+```
+
+- `call.input` exists on `ToolCall`, `PromptRequest` and `ResourceRequest`.
+  Read: `response(key)` (raw), `elicitation(key)`, `sampling(key)` (null when
+  absent or undecodable — ask again), `receivedState()`. Ask: `ask(key, .{
+  .sampling = … } / .{ .elicitation = … })`, `setState(bytes)` (alone it is
+  the spec's "retry later, bring this").
+- Gated by the capabilities **this request's** `_meta` declares, with the
+  same payload checks as the session path (schema subset, credential-field
+  refusal, safe URLs). On a session-path call `ask`/`setState` return
+  `error.SessionRequest`; use `call.requestSampling`/`requestElicitation` there.
+- **`requestState` comes back from the client and is attacker-controlled.**
+  If it decides anything, seal it:
+
+  ```zig
+  const seal: mcp.StateSeal = .{ .key = app.state_key }; // 32 secret bytes, same on every instance
+  const state = call.input.openState(&seal, principal, now_sec) catch
+      return call.fail("stale or forged state"); // StateInvalid / StateExpired
+  if (state) |payload| {
+      // verified: issued by us, for this tool, this principal, not expired
+      _ = payload;
+  } else {
+      call.input.sealState(&seal, "cart=42", .{ .now_sec = now_sec, .ttl_sec = 300, .principal = principal }) catch
+          return call.fail("out of memory");
+  }
+  ```
+
+  HMAC-SHA-256 over the payload, the expiry, the method, the tool/prompt name
+  or resource uri, the principal and an optional `extra` (a digest of the
+  arguments that matter). The payload is readable by the client, and a state
+  is not single-use: a one-time redemption needs server-side bookkeeping.
