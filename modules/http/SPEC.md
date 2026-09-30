@@ -445,6 +445,16 @@ pending a native std TLS server.
 - **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists; blocked on that dependency.
 - **Client cookie jar** *(survey 2026-09-30)* — Go `net/http` ships `CookieJar`. Server-side `Cookie:` parsing and a `Set-Cookie` builder are the sibling `cookies` module's job (see its SPEC); a client-side jar (domain/path matching, carrying cookies across redirects) exists in neither. Effort: medium. Fits §2.
 - **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed only so the gap is on record. Effort: very large; pure Zig possible but no consumer. Not a priority.
+- **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(qap R4, 2026-09-30)* — the writer is
+  ~6 KB, 4 KiB of it `header_buf`, of which a small response touches a few dozen bytes. On a
+  fiber-per-connection server the untouched tail sits between touched frames and costs a stack
+  page per connection: measured in qap h1 saturation, `header_copy_bytes` 4096 -> 512 took
+  `serveStep`'s frame 10,232 -> 6,648 B and the resident stack 8 -> 7 pages (-4 KiB/conn). The h2
+  side is fixed differently (writer in the stream arena, 2026-09-30). Shape of a fix: the copy
+  budget as a caller-provided slice (e.g. from `StreamBuffers` / the pool slab) instead of an
+  inline array -- an API change to every `ResponseWriter` constructor, for one page. ⚠ Moving the
+  WHOLE writer into the pool slab was tried and lost (see `PooledBuffers.slabSize`). Effort: small-
+  medium. Deferred: small gain.
 
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,
