@@ -6,7 +6,10 @@ A spreadsheet (Excel, LibreOffice Calc, Google Sheets) treats a cell whose
 first byte is `=`, `+`, `-`, `@`, or a leading tab/CR as a **formula** and
 evaluates it — the `=cmd|'/c calc'!A1` / DDE class of attack. This module
 neutralizes such a cell by prefixing a single apostrophe (`'`), forcing the
-spreadsheet to render the cell as literal text.
+spreadsheet to render the cell as literal text. A leading LF, `|` or `%` is
+guarded as well (the union of go-safe-csv-writer's and defusedcsv's sets;
+hardening beyond OWASP — a value that genuinely starts with `%` or `|` gains
+the apostrophe).
 
 - The injection guard only; decimal-separator
   remapping and RFC 4180 quoting are deliberately left to the CSV writer /

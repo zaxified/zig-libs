@@ -7,6 +7,14 @@
 //! neutralizes such a cell by prefixing a single apostrophe (`'`), which forces
 //! the spreadsheet to render the cell as literal text.
 //!
+//! Beyond OWASP's set, a leading LF, `|` and `%` are guarded too (decision
+//! 2026-09-30): the union of what the ecosystem's guards cover
+//! (go-safe-csv-writer guards LF; Python's defusedcsv guards `|` and `%`, the
+//! DDE pipe and the `%` of some import paths). Whether a given spreadsheet
+//! evaluates such a cell is unsettled, so this is hardening, and it has a
+//! price: a value that really begins with `%` (`%20`, `%PATH%`) or `|` comes
+//! out with the apostrophe in front.
+//!
 //! Signed-number exception: `+` and `-` also legitimately lead a number
 //! (`-12.34`, `+5`, `+.5`) or a `+`-prefixed international phone number
 //! (`+420 555 0101`). Prefixing those would corrupt the value, so a `+`/`-`
@@ -23,7 +31,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads).",
+    .doc = "CSV formula-injection guard: OWASP's `=`/`+`/`-`/`@`/tab/CR cell leads, plus LF, `|` and `%`.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -58,6 +66,8 @@ pub fn needsGuardSep(value: []const u8, decimal_sep: u8) bool {
     if (value.len == 0) return false;
     return switch (value[0]) {
         '=', '@', '\t', '\r' => true,
+        // Hardening beyond OWASP (see the module doc): LF, the DDE pipe, `%`.
+        '\n', '|', '%' => true,
         // A '+' / '-' lead is a signed *number* (safe, passes unguarded) ONLY
         // when it is a signed number all the way through; otherwise it is a
         // formula and must be guarded.
@@ -222,6 +232,14 @@ test "writeSafe: each dangerous lead char individually" {
     try expectSafe("@x", "'@x");
     try expectSafe("\tx", "'\tx"); // leading tab
     try expectSafe("\rx", "'\rx"); // leading CR
+    // Beyond OWASP (2026-09-30): leading LF, pipe, percent.
+    try expectSafe("\nx", "'\nx");
+    try expectSafe("|cmd", "'|cmd");
+    try expectSafe("%20", "'%20");
+    // ...only as the lead.
+    try expectSafe("a|b", "a|b");
+    try expectSafe("50%", "50%");
+    try expectSafe("x\ny", "x\ny");
     // '+' / '-' followed by a non-numeric byte:
     try expectSafe("+a", "'+a");
     try expectSafe("-a", "'-a");

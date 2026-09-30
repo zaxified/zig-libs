@@ -22,7 +22,7 @@ de-facto reference is the OWASP "CSV Injection" guidance, and every implementati
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) — **reference** | guidance (no code) | CC-BY-SA site *(inferred)* | — | — | Lists the dangerous leads `=`, `+`, `-`, `@`, tab, CR and recommends an apostrophe prefix; this module implements exactly that set (test `each dangerous lead char individually`) and adds a signed-number exception. The OWASP-recommended sanitisation also wraps fields in double quotes and doubles `"` (as go-safe-csv-writer's README describes it; OWASP page not re-read), which is the CSV writer's job (`csvstream.writeField`). |
+| [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) — **reference** | guidance (no code) | CC-BY-SA site *(inferred)* | — | — | Lists the dangerous leads `=`, `+`, `-`, `@`, tab, CR and recommends an apostrophe prefix; this module implements that set (test `each dangerous lead char individually`), adds a signed-number exception, and since 2026-09-30 also guards LF, `|` and `%`. The OWASP-recommended sanitisation also wraps fields in double quotes and doubles `"` (as go-safe-csv-writer's README describes it; OWASP page not re-read), which is the CSV writer's job (`csvstream.writeField`). |
 | [raphaelm/defusedcsv](https://github.com/raphaelm/defusedcsv) | Python | Apache-2.0 (README) | 27 | no releases (push 2025-09-03) | Drop-in for the `csv` module. Guards leads `@ + - = \| %` (adds pipe and percent) and escapes `\|` inside those cells; no number exception, so it corrupts `-12.34` and phone numbers (its README says the files change "of course"). |
 | [samber/go-safe-csv-writer](https://github.com/samber/go-safe-csv-writer) | Go | MIT | 5 | v0.2.0 (2025-12-17) | Fork of Go `encoding/csv`: quotes every field, guards leads `= + - @ \t \r \n` (adds LF) and also fields with a quote/separator followed by a dangerous character; guard+writer in one. |
 | [zvory/csv-safe](https://github.com/zvory/csv-safe) | Ruby | MIT | 40 | no releases (push 2026-06-12) | Wraps Ruby's `CSV`: sanitises on write, and adds a converter that sanitises on read *(as its README states)*. |
@@ -31,12 +31,12 @@ de-facto reference is the OWASP "CSV Injection" guidance, and every implementati
 **Where we are ahead:** the only formula-injection guard in Zig; the signed-number exception is checked over the whole cell, so
 `-12.34`, `+.5` and `+420 555 0101` survive while `-1+cmd|'/c calc'!A1` is guarded (audit F1; tested against the OWASP
 WSTG payloads); locale decimal separator (`*Sep` variants); allocation-free streaming (`writeSafe`). **Where we are
-behind:** no guard for a leading `|`, `%` or LF (defusedcsv / go-safe-csv-writer guard them), no Unicode lookalike
+behind:** no Unicode lookalike
 handling (listed as out of scope), and it is not wired into a writer (a caller composes `writeSafe` with
 `csvstream.writeField`).
 
 ## Design & invariants
-- Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR) by
+- Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR, and since 2026-09-30 LF, `|`, `%`) by
   prefixing a single apostrophe (`guard_char`), forcing literal-text rendering.
 - **Signed-number exception:** a `+`/`-` lead passes unguarded only when **every** byte after the
   sign is a digit, the decimal separator or a space — so `-12.34`, `+.5` and `+420 555 0101` pass,
@@ -71,7 +71,7 @@ boundaries, not TODOs).
 
 **Missing and it matters** *(survey 2026-09-30)*:
 
-- **Leading `\n`, `|` and `%` as guarded leads** *(survey 2026-09-30)*: go-safe-csv-writer guards LF; defusedcsv guards `|` and `%`.
+- ~~**Leading `\n`, `|` and `%` as guarded leads**~~ *(survey 2026-09-30)* — **DONE 2026-09-30 (user: follow the union)**; the price (a `%`/`|`-led value gains the apostrophe) is in the module doc. Was: go-safe-csv-writer guards LF; defusedcsv guards `|` and `%`.
   Whether a spreadsheet evaluates a cell led by them is unsettled (OWASP lists neither), so this is a hardening
   question, not a proven hole: decide with the user whether to follow the union of the ecosystem's lead sets (over-guarding
   a `%`-led value like `%20` changes data). Effort: small. Fits §2: yes.
