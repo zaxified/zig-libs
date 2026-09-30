@@ -1806,15 +1806,26 @@ const Session = struct {
         // allocation. As four separate `arena.alloc` calls they also made the
         // arena take a second chunk from the gpa, so the saving is both the
         // arena's own bookkeeping and one malloc/free pair per request.
+        //
+        // ⭐ The `ResponseWriter` too, at the front of the slab. It is ~6 KB
+        // (`header_buf` alone is 4 KiB) of which a small response touches a
+        // few hundred bytes, and as a local it made this frame 15 KB: on a
+        // fiber-per-connection server every connection kept the pages that
+        // frame had touched -- spread over five, all dead between requests,
+        // measured in qap under h2 saturation (2026-09-30). In the arena it
+        // goes back after every stream and the next stream reuses it warm.
+        const RW = Server.ResponseWriter;
         const scratch_len = 4096;
         const framer_buf_len = 256;
-        const slab = arena.alloc(
+        const slab = arena.alignedAlloc(
             u8,
-            scratch_len * @as(usize, if (streaming) 2 else 1) +
+            .of(RW),
+            @sizeOf(RW) + scratch_len * @as(usize, if (streaming) 2 else 1) +
                 s.opts.response_buffer_size + framer_buf_len,
         ) catch return .close;
-        const body_scratch = slab[0..scratch_len];
-        var cut: usize = scratch_len;
+        const rw: *RW = @ptrCast(slab[0..@sizeOf(RW)]);
+        const body_scratch = slab[@sizeOf(RW)..][0..scratch_len];
+        var cut: usize = @sizeOf(RW) + scratch_len;
         // Only one of the two body surfaces is ever wired into `body`, so
         // they share `body_scratch`; the streaming one needs a second buffer
         // (see `StreamBody.scratch`) and only takes its slice when it is live.
@@ -1920,7 +1931,9 @@ const Session = struct {
         // §8.1.2.1 wants the pseudo-header first and the sink sees the status
         // last, so its slot is reserved now and filled in `sinkHeadDone`.
         framer.fields.append(arena, .{ .name = ":status", .value = "" }) catch return .close;
-        var rw: Server.ResponseWriter = .init(&framer.interface, body_buf, &chunk_buf, .{
+        // `initAt`, not `rw.* = .init(...)`: `init` returns by value, and the
+        // value was built in a second 6 KB temporary in this frame and copied.
+        Server.ResponseWriter.initAt(rw, &framer.interface, body_buf, &chunk_buf, .{
             .head_request = method == .head,
             .date = date,
             .server_name = s.opts.server_name,
@@ -1935,11 +1948,12 @@ const Session = struct {
             .field_sink = framer.sink(),
         });
         // Every return below, a detached stream's included: the writer is
-        // this frame's, and `Detached` pushes raw DATA, never through it.
+        // this stream's (the arena's), and `Detached` pushes raw DATA, never
+        // through it.
         defer rw.releaseEncoder();
         sb.req = &req;
         var failed = false;
-        s.opts.handler(&req, &rw) catch {
+        s.opts.handler(&req, rw) catch {
             failed = true;
         };
         // A detach intercepts BEFORE `rw.end`, which would terminate the
@@ -1948,7 +1962,7 @@ const Session = struct {
         // a worker's stream, so the flag is ignored and the response ends
         // normally — as `ResponseWriter.detach` documents.
         if (!failed and rw.detached and !s.threaded) {
-            if (s.detachJob(&framer, &rw, id)) return .keep;
+            if (s.detachJob(&framer, rw, id)) return .keep;
         }
         if (!failed) rw.end() catch {
             failed = true; // e.g. body ≠ declared Content-Length

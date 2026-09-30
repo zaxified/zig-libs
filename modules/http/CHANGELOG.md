@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **h2: a stream's `ResponseWriter` lives in the stream's arena, not on the
+  serving task's stack.** `Session.serveJob` built it with `init` (return by value), so its frame
+  held the ~6 KB writer (`header_buf` alone is 4 KiB) twice -- the local and the temporary it was
+  copied from -- and was 15,064 bytes. It is now cut from the front of the per-stream slab the
+  scratch buffers already come from (no extra allocation) and initialised in place (`initAt`);
+  the frame is 2,664 bytes. On a fiber-per-connection server every connection kept the stack
+  pages that frame had touched, dead between requests: measured in qap's h2 saturation lane,
+  anon memory 49.2 -> 37.4 KiB per connection, requests/s +15.6 % (cycles/request -13 %, the
+  6 KB copy and its cache footprint gone). No API change.
+
 - **2026-09-29** — **HPACK encoder: the dynamic-table search is two hash probes, not a scan.**
   `Encoder.findField` compared every dynamic entry's name with `mem.eql` for each field (2.8 % of
   the h2 saturation lane). The encoder's table now keeps two maps, name hash -> newest entry and
