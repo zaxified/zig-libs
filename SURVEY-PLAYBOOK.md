@@ -52,6 +52,15 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
    Zig, no C, no libc, no external dependencies). Split the verdicts three ways:
    **missing and it matters** / **deliberately not doing it** / **nobody does this**.
 
+## Where the verdict goes
+
+The survey ends by setting the module's **`**Scope:**` line** in the `## Maturity` card of its
+`SPEC.md` — `parity`, `core`, `mvp` or `poc`, naming the reference implementation and the
+survey date (definitions in `modules/_template/SPEC.md`) — and by filing the "missing and it
+matters" items under the SPEC's `## Backlog / deferred`. Then run `zig build gen-catalog`:
+the module's grade loses its provisional `?` and may go down. A survey that leaves the Scope
+line at `unsurveyed` has not finished.
+
 ## Standing rules
 
 - Mark every claim as verified or inferred. An unmarked guess is worse than a gap.

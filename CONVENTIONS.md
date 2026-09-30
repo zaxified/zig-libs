@@ -829,14 +829,29 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   the generated copy satisfied the check on the hand-written one's behalf, and a wrong
   Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
-- **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
+- **Maturity = a computed grade over a per-module card, plus the explicit caveats**
+  (revised 2026-09-30; before that, caveats only). Every module meets the same floor (§6/§7:
   tests green in both release lanes — `ReleaseSafe` and `ReleaseFast` —
-  plus oracle/KAT verification where one exists). What varies
-  is *scope*: anything unfinished or unverified is stated as an explicit caveat in the
-  module's README-catalog row and SPEC (e.g. dnp3's "Secure Authentication scaffolded only",
-  ebpf's "real-kernel verifier acceptance unverified"). A per-module `stability` tier tag
-  (stable/beta/experimental) was considered and rejected: coarse tiers hide exactly the
-  detail the caveat lines carry, and would rot.
+  plus oracle/KAT verification where one exists). Above the floor, each module's `SPEC.md`
+  (`README.md` for the few without one) opens with a `## Maturity` card — **Scope** against
+  other implementations (`parity`/`core`/`mvp`/`poc`, set only by a survey per
+  `SURVEY-PLAYBOOK.md`, otherwise `unsurveyed`), **Audit** (latest in-house review and latest
+  mutation run, dated), **Known defects**, **Downstream consumer** — and the anchor grade
+  supplies the evidence axis. The **grade** is 1 (best) … 5 (fix now), the worst of those axes;
+  `?` marks it provisional while the scope is unsurveyed. The exact rule is `maturityGrade` in
+  `build.zig`, the scale is explained in the README's "Module grades", and the grade appears in
+  the catalog next to the module's description.
+  **Why this is not the tier label rejected earlier.** A per-module `stability` tag
+  (stable/beta/experimental) was rejected because a coarse word hides exactly the detail the
+  caveat lines carry, and rots. The grade answers both: it is never chosen, only computed from
+  named axes, and the card prints the axis that caps it next to the number — so a 3 says what
+  would make it a 2, and the caveat lines (dnp3's "Secure Authentication scaffolded only",
+  ebpf's "real-kernel verifier acceptance unverified") stay where they were. Against rot:
+  `gen-catalog` writes both the card's Grade line and the catalog cell from one computation,
+  `check-catalog-table` fails when either is stale, and a surveyed scope must carry its date.
+  What the gate cannot see is a hand-written axis going out of date (a scope surveyed before a
+  big feature landed, an audit older than the code) — `zig build maturity-report` is the
+  maintainer's list for that, worst first.
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.

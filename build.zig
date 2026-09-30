@@ -1134,8 +1134,8 @@ pub fn build(b: *std.Build) void {
     // that settled that), so this is a formatter for arrangement, not a
     // renderer for content.
     inline for (.{
-        .{ false, "check-catalog-table", "Verify README.md's module catalog matches module_list + each module's meta.doc/meta.platform_note" },
-        .{ true, "gen-catalog", "Regenerate README.md's module catalog from module_list + each module's meta.doc/meta.platform_note" },
+        .{ false, "check-catalog-table", "Verify README.md's module catalog (and each maturity card's Grade line) matches module_list + meta.doc/meta.platform_note + the maturity cards" },
+        .{ true, "gen-catalog", "Regenerate README.md's module catalog and each maturity card's Grade line from module_list + meta.doc/meta.platform_note + the maturity cards" },
     }) |cfg| {
         const st = b.allocator.create(CatalogStep) catch @panic("OOM");
         st.* = .{
@@ -1143,6 +1143,16 @@ pub fn build(b: *std.Build) void {
             .write = cfg[0],
         };
         b.step(cfg[1], cfg[2]).dependOn(&st.step);
+    }
+
+    // `zig build maturity-report` — the maintainer's view of the maturity
+    // cards: one TSV line per module, worst grade first, with the axis that
+    // caps it. The README shows a consumer the grade; this shows us what to
+    // work on (survey the scope, add an external anchor, run the audit).
+    {
+        const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        st.* = std.Build.Step.init(.{ .id = .custom, .name = "maturity-report", .owner = b, .makeFn = printMaturityReport });
+        b.step("maturity-report", "Print every module's maturity grade as TSV, worst first (grade, module, limited by, scope, audit, consumer)").dependOn(st);
     }
 
     // `zig build app-list` — the names in `example_apps`, one per line, so
@@ -2437,6 +2447,9 @@ fn renderLibsTable(b: *std.Build) []const u8 {
 /// its parts, never from the README:
 ///
 ///   Module    -- `module_list`'s `.name`
+///   Grade     -- computed from the module's maturity card (`maturityGrade`);
+///                the same run writes the card's own `**Grade:**` line, so the
+///                README cell and the card cannot disagree
 ///   What it does -- the module's own `meta.doc`
 ///   Platform  -- the module's own `meta.platform_note`
 ///   Deps      -- `module_list`'s `.deps`
@@ -2462,6 +2475,7 @@ const CatalogStep = struct {
         doc: []const u8,
         platform_note: []const u8,
         deps: []const []const u8,
+        grade: []const u8,
         home: ?[]const u8, // null = this section is its home
     };
 
@@ -2472,9 +2486,9 @@ const CatalogStep = struct {
     fn renderRow(b: *std.Build, w: *std.Io.Writer, r: Row) void {
         const deps = if (r.deps.len == 0) "—" else std.mem.join(b.allocator, ", ", r.deps) catch @panic("OOM");
         if (r.home) |h| {
-            w.print("| [`{s}`](modules/{s}/README.md) *({s})* | {s} | {s} | {s} |\n", .{ r.name, r.name, h, r.doc, r.platform_note, deps }) catch @panic("OOM");
+            w.print("| [`{s}`](modules/{s}/README.md) *({s})* | {s} | {s} | {s} | {s} |\n", .{ r.name, r.name, h, r.grade, r.doc, r.platform_note, deps }) catch @panic("OOM");
         } else {
-            w.print("| [`{s}`](modules/{s}/README.md) | {s} | {s} | {s} |\n", .{ r.name, r.name, r.doc, r.platform_note, deps }) catch @panic("OOM");
+            w.print("| [`{s}`](modules/{s}/README.md) | {s} | {s} | {s} | {s} |\n", .{ r.name, r.name, r.grade, r.doc, r.platform_note, deps }) catch @panic("OOM");
         }
     }
 
@@ -2488,7 +2502,12 @@ const CatalogStep = struct {
         // Collect each module's prose from its OWN source, which is the point:
         // a blurb that has drifted from the code is noticed while editing the
         // code, not while scrolling a 230-row table in another file.
-        var docs = std.StringHashMap(struct { doc: []const u8, note: []const u8 }).init(b.allocator);
+        var docs = std.StringHashMap(struct { doc: []const u8, note: []const u8, grade: []const u8 }).init(b.allocator);
+        // Maturity cards whose generated `**Grade:**` line is not what the rule
+        // gives today, as (path, corrected file) -- written by gen-catalog,
+        // reported by check-catalog-table.
+        var stale_cards: std.ArrayList(struct { path: []const u8, data: []const u8 }) = .empty;
+        var card_failed = false;
         for (module_list) |m| {
             const src = b.build_root.handle.readFileAlloc(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), b.allocator, .limited(2 * 1024 * 1024)) catch |err| {
                 std.log.err("{s}: cannot read modules/{s}/src/root.zig: {t}", .{ verb, m.name, err });
@@ -2513,8 +2532,19 @@ const CatalogStep = struct {
                 );
                 return step.fail("{s}: unfilled catalog entry", .{verb});
             }
-            docs.put(m.name, .{ .doc = doc, .note = note }) catch @panic("OOM");
+            const mat = moduleMaturity(b, io, m.name) orelse {
+                card_failed = true;
+                continue;
+            };
+            const grade = maturityGrade(b, mat) orelse {
+                card_failed = true;
+                continue;
+            };
+            const fixed = withGradeLine(b, mat.src, grade.line(b));
+            if (!std.mem.eql(u8, fixed, mat.src)) stale_cards.append(b.allocator, .{ .path = mat.path, .data = fixed }) catch @panic("OOM");
+            docs.put(m.name, .{ .doc = doc, .note = note, .grade = grade.cell(b) }) catch @panic("OOM");
         }
+        if (card_failed) return step.fail("{s}: a module's maturity card is missing or malformed (logged above)", .{verb});
 
         const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
             std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });
@@ -2541,22 +2571,22 @@ const CatalogStep = struct {
                 for (module_list) |m| {
                     const d = docs.get(m.name).?;
                     if (std.mem.eql(u8, m.libs[0], ls.lib)) {
-                        primary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .home = null }) catch @panic("OOM");
+                        primary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .grade = d.grade, .home = null }) catch @panic("OOM");
                         continue;
                     }
                     for (m.libs[1..]) |extra| {
                         if (!std.mem.eql(u8, extra, ls.lib)) continue;
-                        secondary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .home = m.libs[0] }) catch @panic("OOM");
+                        secondary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .grade = d.grade, .home = m.libs[0] }) catch @panic("OOM");
                     }
                 }
                 std.mem.sort(Row, primary.items, {}, lessThan);
                 std.mem.sort(Row, secondary.items, {}, lessThan);
 
-                w.writeAll("\n\n| Module | What it does | Platform | Deps |\n|---|---|---|---|\n") catch @panic("OOM");
+                w.writeAll("\n\n| Module | [Grade](#module-grades) | What it does | Platform | Deps |\n|---|:-:|---|---|---|\n") catch @panic("OOM");
                 for (primary.items) |r| renderRow(b, w, r);
                 if (secondary.items.len > 0) {
                     w.print(
-                        "\n**Also worth reaching for from `{s}`** — these are filed under another library (in brackets), and appear here because a consumer working in `{s}` has a use for them:\n\n| Module | What it does | Platform | Deps |\n|---|---|---|---|\n",
+                        "\n**Also worth reaching for from `{s}`** — these are filed under another library (in brackets), and appear here because a consumer working in `{s}` has a use for them:\n\n| Module | [Grade](#module-grades) | What it does | Platform | Deps |\n|---|:-:|---|---|---|\n",
                         .{ ls.lib, ls.lib },
                     ) catch @panic("OOM");
                     for (secondary.items) |r| renderRow(b, w, r);
@@ -2567,6 +2597,13 @@ const CatalogStep = struct {
         const updated = out.written();
 
         if (self.write) {
+            for (stale_cards.items) |c| {
+                b.build_root.handle.writeFile(io, .{ .sub_path = c.path, .data = c.data }) catch |err| {
+                    std.log.err("gen-catalog: cannot write {s}: {t}", .{ c.path, err });
+                    return step.fail("gen-catalog: write failed", .{});
+                };
+            }
+            if (stale_cards.items.len > 0) std.log.info("gen-catalog: {d} maturity card grade line(s) updated", .{stale_cards.items.len});
             if (std.mem.eql(u8, updated, readme)) {
                 std.log.info("gen-catalog: README.md already matches the sources", .{});
                 return;
@@ -2577,6 +2614,12 @@ const CatalogStep = struct {
             };
             std.log.info("gen-catalog: README.md updated", .{});
             return;
+        }
+        for (stale_cards.items) |c| {
+            std.log.err("check-catalog-table: {s}: its `**Grade:**` line is not what the card's axes give", .{c.path});
+        }
+        if (stale_cards.items.len > 0) {
+            return step.fail("check-catalog-table: {d} maturity card grade line(s) STALE -- run `zig build gen-catalog` and commit the result", .{stale_cards.items.len});
         }
         if (!std.mem.eql(u8, updated, readme)) {
             return step.fail(
@@ -2630,6 +2673,44 @@ fn printAppList(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     var buf: [512]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(b.graph.io, &buf);
     try stdout.interface.writeAll(out.written());
+    try stdout.interface.flush();
+}
+
+fn printMaturityReport(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const Line = struct { n: u8, text: []const u8 };
+    var lines: std.ArrayList(Line) = .empty;
+    var failed = false;
+    for (module_list) |m| {
+        const mat = moduleMaturity(b, io, m.name) orelse {
+            failed = true;
+            continue;
+        };
+        const g = maturityGrade(b, mat) orelse {
+            failed = true;
+            continue;
+        };
+        const scope_line = maturityLine(m.name, mat.path, mat.src, "**Scope:** ").?;
+        const audit_line = maturityLine(m.name, mat.path, mat.src, "**Audit:** ").?;
+        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            g.cell(b),                               m.name,
+            if (g.limits.len > 0) g.limits else "-", scope_line,
+            audit_line,                              if (mat.consumer) "consumer" else "-",
+        }) }) catch @panic("OOM");
+    }
+    if (failed) return step.fail("maturity-report: a module's maturity card is missing or malformed (logged above)", .{});
+    std.mem.sort(Line, lines.items, {}, struct {
+        fn lt(_: void, a: Line, c: Line) bool {
+            if (a.n != c.n) return a.n > c.n;
+            return std.mem.lessThan(u8, a.text, c.text);
+        }
+    }.lt);
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    try stdout.interface.writeAll("grade\tmodule\tlimited by\tscope\taudit\tconsumer\n");
+    for (lines.items) |l| try stdout.interface.writeAll(l.text);
     try stdout.interface.flush();
 }
 
@@ -4017,6 +4098,240 @@ fn moduleAnchorGrade(b: *std.Build, io: std.Io, name: []const u8) ?AnchorGrade {
         .oracle = std.mem.trim(u8, line[sep_at + sep.len ..], " \t"),
         .path = path,
     };
+}
+
+/// A module's maturity card: the `## Maturity` section of `modules/<name>/SPEC.md`
+/// (`README.md` for the modules that have no SPEC.md, the same fallback as
+/// `moduleAnchorGrade`). Four lines are written by hand and one is generated:
+///
+///   **Grade:** ...                    -- generated by `zig build gen-catalog`
+///   **Scope:** unsurveyed | <parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)
+///   **Audit:** review <date|?|none> · mutation <date|?|none>
+///   **Known defects:** none recorded | <what, and where it is tracked>
+///   **Downstream consumer:** yes | no
+///
+/// The evidence axis is NOT restated here: it is the module's anchor grade, read
+/// from its one line by `moduleAnchorGrade`, so the card cannot disagree with it.
+///
+/// WHY A CARD AND NOT A TIER LABEL. A stable/beta/experimental tag was rejected
+/// earlier (CONVENTIONS.md §8) because one coarse word hides the detail and rots.
+/// The grade answers both objections: it is computed from named axes by the rule
+/// in `maturityGrade` -- never chosen by feel -- and the axis that caps it is
+/// printed beside it, so a 3 says what would make it a 2.
+const Maturity = struct {
+    path: []const u8,
+    src: []const u8,
+    scope: enum { unsurveyed, parity, core, mvp, poc },
+    review: bool,
+    mutation: bool,
+    /// null = "none recorded"
+    defects: ?[]const u8,
+    consumer: bool,
+    anchor: AnchorGrade,
+};
+
+const maturity_heading = "\n## Maturity\n";
+const maturity_grade_prefix = "**Grade:** ";
+
+/// The rest of the one line in `src` that starts with `prefix`. Null (and a log
+/// line naming the fix) when it is missing or stated twice -- a second copy of a
+/// card line is how the repository-level tables this repo retired went stale.
+fn maturityLine(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8) ?[]const u8 {
+    const needle = "\n" ++ prefix;
+    const at = std.mem.indexOf(u8, src, needle) orelse {
+        std.log.err("module '{s}': {s} has no `{s}` line in its `## Maturity` card (see modules/_template/SPEC.md)", .{ name, path, prefix });
+        return null;
+    };
+    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+        std.log.err("module '{s}': {s} states `{s}` twice", .{ name, path, prefix });
+        return null;
+    }
+    const rest = src[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.mem.trim(u8, rest[0..end], " \t\r");
+}
+
+fn isAuditDate(v: []const u8) bool {
+    if (std.mem.eql(u8, v, "?")) return true;
+    if (v.len != 10 or v[4] != '-' or v[7] != '-') return false;
+    for (v, 0..) |c, i| {
+        if (i == 4 or i == 7) continue;
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// Parse a module's maturity card. Null means a failure the caller must report,
+/// never "no card, so no grade": a module without one would otherwise drop out
+/// of the catalog's grade column silently.
+fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
+    const anchor = moduleAnchorGrade(b, io, name) orelse return null;
+    const path = anchor.path;
+    const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch {
+        std.log.err("module '{s}': cannot read {s} for its maturity card", .{ name, path });
+        return null;
+    };
+    if (std.mem.indexOf(u8, src, maturity_heading) == null) {
+        std.log.err("module '{s}': {s} has no `## Maturity` card (see modules/_template/SPEC.md)", .{ name, path });
+        return null;
+    }
+    _ = maturityLine(name, path, src, maturity_grade_prefix) orelse return null;
+
+    const scope_line = maturityLine(name, path, src, "**Scope:** ") orelse return null;
+    const scope: @FieldType(Maturity, "scope") = blk: {
+        if (std.mem.eql(u8, scope_line, "unsurveyed")) break :blk .unsurveyed;
+        inline for (.{ "parity", "core", "mvp", "poc" }) |word| {
+            if (std.mem.startsWith(u8, scope_line, word ++ " — ")) {
+                // A surveyed scope is a claim about other implementations at a
+                // point in time; without the date nobody can tell it has aged.
+                if (std.mem.indexOf(u8, scope_line, "(surveyed 20") == null) {
+                    std.log.err("module '{s}': {s} `**Scope:**` names no `(surveyed YYYY-MM-DD)`", .{ name, path });
+                    return null;
+                }
+                break :blk @field(@FieldType(Maturity, "scope"), word);
+            }
+        }
+        std.log.err(
+            "module '{s}': {s} `**Scope:** {s}` -- expected `unsurveyed` or `<parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)`",
+            .{ name, path, scope_line },
+        );
+        return null;
+    };
+
+    const audit_line = maturityLine(name, path, src, "**Audit:** ") orelse return null;
+    const audit_ok = std.mem.startsWith(u8, audit_line, "review ") and std.mem.indexOf(u8, audit_line, " · mutation ") != null;
+    if (!audit_ok) {
+        std.log.err("module '{s}': {s} `**Audit:** {s}` -- expected `review <YYYY-MM-DD|?|none> · mutation <YYYY-MM-DD|?|none>`", .{ name, path, audit_line });
+        return null;
+    }
+    const sep = std.mem.indexOf(u8, audit_line, " · mutation ").?;
+    const review_v = audit_line["review ".len..sep];
+    const mutation_v = audit_line[sep + " · mutation ".len ..];
+    for ([_][]const u8{ review_v, mutation_v }) |v| {
+        if (!std.mem.eql(u8, v, "none") and !isAuditDate(v)) {
+            std.log.err("module '{s}': {s} `**Audit:**` value '{s}' is not YYYY-MM-DD, `?` or `none`", .{ name, path, v });
+            return null;
+        }
+    }
+
+    const defects_line = maturityLine(name, path, src, "**Known defects:** ") orelse return null;
+    if (defects_line.len == 0) {
+        std.log.err("module '{s}': {s} `**Known defects:**` is empty -- write `none recorded` or name the defect", .{ name, path });
+        return null;
+    }
+
+    const consumer_line = maturityLine(name, path, src, "**Downstream consumer:** ") orelse return null;
+    const consumer = if (std.mem.eql(u8, consumer_line, "yes")) true else if (std.mem.eql(u8, consumer_line, "no")) false else {
+        std.log.err("module '{s}': {s} `**Downstream consumer:** {s}` -- expected `yes` or `no`", .{ name, path, consumer_line });
+        return null;
+    };
+
+    return .{
+        .path = path,
+        .src = src,
+        .scope = scope,
+        .review = !std.mem.eql(u8, review_v, "none"),
+        .mutation = !std.mem.eql(u8, mutation_v, "none"),
+        .defects = if (std.mem.eql(u8, defects_line, "none recorded")) null else defects_line,
+        .consumer = consumer,
+        .anchor = anchor,
+    };
+}
+
+/// The grade, 1 (best) .. 5 (fix now) -- the Czech school scale. It is the WORST
+/// of the axes below, so it can only be raised by fixing the axis that caps it:
+///
+///   scope     parity 1 · core 2 · mvp 3 · poc 4 · unsurveyed -> provisional (`?`)
+///   evidence  oracle EXTERNAL 1 · MIXED 2 · REDERIVED 3 · SELF 4 · n/a (class C/D,
+///             no outside truth exists) -> no cap
+///   audit     review + mutation run 1 · only one of them 2 · neither 3
+///   defects   any known open defect 5
+///
+/// "Provisional" means the scope axis is unknown, so the grade is an upper bound:
+/// a survey can lower it, never raise it.
+const MaturityGrade = struct {
+    n: u8,
+    provisional: bool,
+    /// ", "-joined axes that cap the grade; empty for a 1.
+    limits: []const u8,
+
+    fn cell(g: MaturityGrade, b: *std.Build) []const u8 {
+        return b.fmt("{d}{s}", .{ g.n, if (g.provisional) "?" else "" });
+    }
+
+    fn line(g: MaturityGrade, b: *std.Build) []const u8 {
+        var out: std.Io.Writer.Allocating = .init(b.allocator);
+        const w = &out.writer;
+        w.print("{s}{s}", .{ maturity_grade_prefix, g.cell(b) }) catch @panic("OOM");
+        if (g.limits.len > 0) w.print(" · limited by {s}", .{g.limits}) catch @panic("OOM");
+        if (g.provisional) w.writeAll(" · provisional: scope against other implementations not surveyed yet") catch @panic("OOM");
+        w.writeAll(" *(generated by `zig build gen-catalog`)*") catch @panic("OOM");
+        return out.written();
+    }
+};
+
+fn maturityGrade(b: *std.Build, m: Maturity) ?MaturityGrade {
+    const Axis = struct { n: u8, why: []const u8 };
+    var axes: [4]?Axis = .{ null, null, null, null };
+
+    axes[0] = switch (m.scope) {
+        .unsurveyed => null,
+        .parity => .{ .n = 1, .why = "scope (parity)" },
+        .core => .{ .n = 2, .why = "scope (core)" },
+        .mvp => .{ .n = 3, .why = "scope (mvp)" },
+        .poc => .{ .n = 4, .why = "scope (poc)" },
+    };
+
+    const oracle = m.anchor.oracle;
+    const word_end = std.mem.indexOfAny(u8, oracle, " \t(") orelse oracle.len;
+    const word = oracle[0..word_end];
+    axes[1] = if (std.mem.eql(u8, word, "EXTERNAL"))
+        .{ .n = 1, .why = "evidence (oracle EXTERNAL)" }
+    else if (std.mem.eql(u8, word, "MIXED"))
+        .{ .n = 2, .why = "evidence (oracle MIXED)" }
+    else if (std.mem.eql(u8, word, "REDERIVED"))
+        .{ .n = 3, .why = "evidence (oracle REDERIVED)" }
+    else if (std.mem.eql(u8, word, "SELF"))
+        .{ .n = 4, .why = "evidence (oracle SELF)" }
+    else if (std.mem.eql(u8, word, "n/a"))
+        null
+    else {
+        std.log.err("module anchor oracle '{s}' in {s} is not EXTERNAL/MIXED/REDERIVED/SELF/n/a", .{ oracle, m.path });
+        return null;
+    };
+
+    axes[2] = if (m.review and m.mutation)
+        .{ .n = 1, .why = "audit" }
+    else if (m.review)
+        .{ .n = 2, .why = "audit (no mutation run recorded)" }
+    else if (m.mutation)
+        .{ .n = 2, .why = "audit (no review recorded)" }
+    else
+        .{ .n = 3, .why = "audit (none recorded)" };
+
+    if (m.defects != null) axes[3] = .{ .n = 5, .why = "a known defect" };
+
+    var n: u8 = 1;
+    for (axes) |a| {
+        if (a) |x| n = @max(n, x.n);
+    }
+    var limits: std.ArrayList(u8) = .empty;
+    for (axes) |a| {
+        const x = a orelse continue;
+        if (n == 1 or x.n != n) continue;
+        if (limits.items.len > 0) limits.appendSlice(b.allocator, ", ") catch @panic("OOM");
+        limits.appendSlice(b.allocator, x.why) catch @panic("OOM");
+    }
+    // A 5 is already the floor, so an unsurveyed scope cannot lower it further.
+    return .{ .n = n, .provisional = m.scope == .unsurveyed and n < 5, .limits = limits.items };
+}
+
+/// `m.src` with its `**Grade:**` line replaced by `line`.
+fn withGradeLine(b: *std.Build, src: []const u8, line: []const u8) []const u8 {
+    const needle = "\n" ++ maturity_grade_prefix;
+    const at = std.mem.indexOf(u8, src, needle).? + 1;
+    const end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+    return std.mem.concat(b.allocator, u8, &.{ src[0..at], line, src[end..] }) catch @panic("OOM");
 }
 
 /// Oracle-provenance gate: every module states, beside its own tests, where the

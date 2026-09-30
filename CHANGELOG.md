@@ -24,6 +24,17 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Module grades (2026-09-30).** Every catalog row now carries a grade, 1 (best) to 5
+  (fix now), and every module's `SPEC.md` (`README.md` for the few without one) opens with a
+  `## Maturity` card — scope against other implementations, audit (latest review and mutation
+  run), known defects, downstream consumer; the evidence axis is the anchor grade. The grade is
+  the worst axis, computed by `maturityGrade` in `build.zig` and written by `zig build
+  gen-catalog`; `?` marks it provisional until the module is surveyed per
+  `SURVEY-PLAYBOOK.md`. `zig build maturity-report` lists every module worst first. Replaces
+  the rule that maturity is carried by caveat lines alone (CONVENTIONS.md §8). At introduction
+  only `zstd` is surveyed (parity with libzstd 1.5.7, grade 1); the rest are provisional —
+  56 at 1?, 163 at 2?, 9 at 3?, 9 at 4?.
+
 - **New `example-apps/`:** standalone applications built on zig-libs, each its
   own project with its own `build.zig`/`build.zig.zon` and a dependency pinned
   to a dated release tag. Copy a directory anywhere, run `./init.sh`, get a

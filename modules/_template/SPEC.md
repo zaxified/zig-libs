@@ -6,6 +6,39 @@
      unanswered question, and this file is where a reader goes to find out
      what was decided and what was refused. -->
 
+## Maturity
+
+**Grade:** *(written by `zig build gen-catalog` — never by hand)*
+
+**Scope:** unsurveyed
+
+**Audit:** review none · mutation none
+
+**Known defects:** none recorded
+
+**Downstream consumer:** no
+
+<!-- The card a consumer reads first, and the one the README catalog's Grade
+     column is computed from. Four lines are yours; the Grade line is generated
+     from them plus the anchor grade below (CONVENTIONS.md §8, "Maturity").
+
+     Scope     — how much of what a user expects this module covers, against the
+                 reference implementation and the notable Rust/Go/C ones. Set only
+                 by a survey (SURVEY-PLAYBOOK.md), never by feel:
+                 `parity — <reference, version> (surveyed YYYY-MM-DD)` nothing a
+                   user would notice is missing;
+                 `core — …` the main use cases, gaps listed under Backlog;
+                 `mvp — …` the happy path, gaps a user will hit;
+                 `poc — …` a demonstration, not for production.
+                 `unsurveyed` until then — the grade then carries a `?`.
+     Audit     — the latest `review` (a security/adversarial audit of THIS module
+                 whose findings or verdict are recorded) and the latest `mutation`
+                 run over its tests: YYYY-MM-DD, `?` when it happened but the date
+                 is lost, `none`.
+     Known defects — an open defect that makes the module unsafe to rely on. Any
+                 text other than `none recorded` sets the grade to 5.
+     Downstream consumer — `yes` if a project outside this repo depends on it. -->
+
 ## What this module is, and what it is not
 
 One paragraph. Then the scope line that matters most: **what a reader might
