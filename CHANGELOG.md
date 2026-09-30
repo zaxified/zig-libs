@@ -34,6 +34,11 @@ directory.
   the rule that maturity is carried by caveat lines alone (CONVENTIONS.md §8). At introduction
   only `zstd` is surveyed (parity with libzstd 1.5.7, grade 1); the rest are provisional —
   56 at 1?, 163 at 2?, 9 at 3?, 9 at 4?.
+  **First survey wave, same day:** 25 modules used downstream (the HTTP stack, web auth and
+  state, crypto/TLS, storage and codecs) surveyed against their Rust/Go/C/Zig counterparts;
+  each SPEC gained a `## Compared with` table (link, language, licence, stars, activity) and
+  `(survey 2026-09-30)` backlog items. Verdicts: 20 `core`, 5 `mvp` (abuseguard, acme, brotli,
+  kv, sessions). A surveyed Scope now requires that section (`check-catalog-table`).
 
 - **New `example-apps/`:** standalone applications built on zig-libs, each its
   own project with its own `build.zig`/`build.zig.zon` and a dependency pinned

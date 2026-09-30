@@ -14,6 +14,24 @@
 
 Consumer view, API and purpose: [README.md](README.md).
 
+## Compared with
+
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
+
+| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
+|---|---|---|--:|---|---|
+| [facebook/zstd](https://github.com/facebook/zstd) (libzstd) — **reference** | C | BSD-3-Clause OR GPL-2.0 | 28.0k | v1.5.7 (2025-02-19) | The yardstick: this module's output is checked byte for byte against it (`tools/zref.c`). Has run-time BMI2 dispatch and the legacy v0.5–v0.7 decoders; this module does not. |
+| [klauspost/compress](https://github.com/klauspost/compress) `zstd` | Go | BSD-3-Clause | 5.7k | v1.20.1 (2026-09-25) | Pure Go, own encoder with four speed levels, which its README equates to zstd levels 1, 3, 7 and 11 by ratio — not libzstd's 22, and not libzstd's bytes. Concurrent stream encoding. |
+| [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (`ruzstd`) | Rust | MIT | 451 | v0.9.0 (2026-07-26) | Pure Rust; its README: a "fully operational" decoder, and a compressor that "does not yet reach the speed, ratio or configurability of the original zstd library". |
+| [gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) (`zstd` crate) | Rust | BSD-3-Clause | 657 | v0.14.0 (2026-09-04) | Bindings to libzstd — full features, but links the C library. |
+| [DataDog/zstd](https://github.com/DataDog/zstd) | Go (cgo) | BSD-3-Clause | 806 | v1.5.7+patch2 (2026-04-21) | cgo bindings to libzstd — same trade-off as the Rust bindings. |
+| Zig `std.compress.zstd` | Zig | MIT | — | Zig 0.16.0 | Decoder only (`Decompress`; checked in 0.16.0's `lib/std/compress/`): no compressor, no dictionaries, no training. |
+
+**Where we are ahead:** of the implementations above that do not link libzstd, the only one
+that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
+dictionaries, training, multithreading and the seekable format without linking C. **Where we
+are behind:** run-time CPU dispatch (Z22) and the legacy formats (refused).
+
 ## What this module is, and what it is not
 
 A Zstandard **compressor** that reproduces libzstd 1.5.7's output byte for
@@ -32,26 +50,16 @@ file-by-file map.
 
 **Goal (2026-09-22): production quality — as close to libzstd's feature set
 and behaviour as possible, so that a Zig program never needs to link libzstd.**
-Today it is the compressor and the decoder, each one-shot and streaming;
-everything else libzstd offers is in *Backlog / deferred* below,
-with its cost.
+Reached (2026-09-30): beyond the compressor and the decoder, dictionaries
+(compressing and decompressing with one, and training with finalization),
+multithreading, the sequence-level API and the seekable format are here, each
+in its own section below. What libzstd has and this module does not is one
+backlog item and two refusals:
 
-Not here yet, and a reader might expect it (each is a backlog item):
-
-- **Part of dictionaries (Z2c, Z4, Z5b).** Compressing with a dictionary is
-  here (see *Dictionaries*), attaching included for every strategy now
-  (`fast`/`dfast`: D1; `greedy`…`btlazy2`: D2; the optimal parsers: D3).
-  **Decompression with a dictionary is done too** (Z2c, see *Decoder*):
-  raw-content and zstd-format dictionaries, a digested `DDict`,
-  `ZSTD_d_refMultipleDDicts`, one-shot and streaming; a frame that names a
-  dictionary this module was not given is `error.DictionaryWrong`. Of
-  training, the content selection is here (*Dictionary training*);
-  finalization is not.
-- **The whole streaming API.** `Stream` (see *Algorithm*) does libzstd's
-  buffered modes and the stable-buffer ones (`ZSTD_c_stableInBuffer`,
-  `ZSTD_c_stableOutBuffer`), frame after frame on one context;
-  `StreamWriter` is a `std.Io.Writer` over it (libzstd's bytes), and
-  `FrameWriter` (Z1a) a `std.Io.Writer` of independent one-shot frames.
+- **Run-time CPU dispatch (Z22).** libzstd picks its BMI2 paths at run time;
+  here the paths are fixed at compile time. Waits on Zig (see *Backlog*).
+- **Legacy frame formats v0.5–v0.7, the legacy dictionary trainer and
+  `--trace`** — refused; see *What is deliberately not done*.
 
 ## Algorithm
 

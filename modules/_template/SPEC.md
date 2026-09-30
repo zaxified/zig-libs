@@ -39,6 +39,21 @@
                  text other than `none recorded` sets the grade to 5.
      Downstream consumer — `yes` if a project outside this repo depends on it. -->
 
+## Compared with
+
+<!-- Required once Scope is surveyed (check-catalog-table enforces it): who
+     "the competition" is, so the Scope verdict can be checked and re-run.
+     Written by the survey (SURVEY-PLAYBOOK.md). Stars and activity go stale,
+     hence the date. Delete this section while Scope is `unsurveyed`. -->
+
+Surveyed YYYY-MM-DD per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
+
+| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
+|---|---|---|--:|---|---|
+| [owner/repo](https://github.com/owner/repo) — **reference** | Rust | MIT | 12.3k | v1.2.3 (2026-08) | … |
+
+**Where we are ahead:** … · **Where we are behind:** … (→ Backlog items)
+
 ## What this module is, and what it is not
 
 One paragraph. Then the scope line that matters most: **what a reader might

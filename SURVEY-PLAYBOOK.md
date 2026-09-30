@@ -44,7 +44,10 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
    specific — "supports X" is useless. Separate what the **tests exercise** from what
    the **prose asserts**.
 2. **How do we compare?** Find the notable Rust and Go implementations — verify they
-   exist and are maintained rather than assuming from memory. Compare on what a real
+   exist and are maintained rather than assuming from memory — and the **Zig alternatives**
+   (`std` and the ecosystem): for a Zig consumer they are the closest competition. Where
+   a de-facto reference implementation exists (often C: libzstd, OpenSSL, curl), it is
+   the Scope line's yardstick. Compare on what a real
    user notices, not on line counts. Say plainly where **we are ahead**; the pilot found
    two such places and that mattered as much as the gaps.
 3. **What is worth finishing?** A ranked list. Each item: what it is, why a user would
@@ -56,8 +59,11 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
 
 The survey ends by setting the module's **`**Scope:**` line** in the `## Maturity` card of its
 `SPEC.md` — `parity`, `core`, `mvp` or `poc`, naming the reference implementation and the
-survey date (definitions in `modules/_template/SPEC.md`) — and by filing the "missing and it
-matters" items under the SPEC's `## Backlog / deferred`. Then run `zig build gen-catalog`:
+survey date (definitions in `modules/_template/SPEC.md`) — by writing the SPEC's
+`## Compared with` table (every project compared against: link, language, licence, stars,
+latest release or push, what a user notices; the reference marked; `check-catalog-table`
+refuses a surveyed Scope without it), and by filing the "missing and it matters" items under
+the SPEC's `## Backlog / deferred`. Then run `zig build gen-catalog`:
 the module's grade loses its provisional `?` and may go down. A survey that leaves the Scope
 line at `unsurveyed` has not finished.
 

@@ -4188,6 +4188,12 @@ fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
                     std.log.err("module '{s}': {s} `**Scope:**` names no `(surveyed YYYY-MM-DD)`", .{ name, path });
                     return null;
                 }
+                // The verdict is only as good as the list it was measured
+                // against; a reader must be able to see who "the competition" was.
+                if (std.mem.indexOf(u8, src, "\n## Compared with\n") == null) {
+                    std.log.err("module '{s}': {s} has a surveyed `**Scope:**` but no `## Compared with` section naming what it was surveyed against", .{ name, path });
+                    return null;
+                }
                 break :blk @field(@FieldType(Maturity, "scope"), word);
             }
         }

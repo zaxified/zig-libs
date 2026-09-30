@@ -20,7 +20,7 @@ Provenance: original work of the zig-libs authors (MIT). No third-party code.
 - **`GET` / `HEAD` only** — anything else answers **405** with an `Allow: GET, HEAD` header.
 - **`Content-Type`** from an embedded MIME table (html/css/js/json/svg/png/jpg/webp/woff2/wasm/
   txt/xml/pdf/… ), a caller override list, and a configurable default (`application/octet-stream`).
-- **`Content-Length`**, **`Last-Modified`** (file mtime) and a strong **`ETag`** from
+- **`Content-Length`**, **`Last-Modified`** (file mtime) and a weak **`ETag`** (`W/`; strong is opt-in) from
   **size + mtime** (the cheap default — no file read; see SPEC.md for the content-hash alternative).
 - **Conditional requests** (RFC 9110): `If-None-Match` / `If-Modified-Since` → **304**,
   `If-Match` / `If-Unmodified-Since` → **412** — via the `http.conditional` helper.

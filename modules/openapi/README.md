@@ -6,7 +6,8 @@ the spec is derived from the live `Router.routes()` table and per-route
 `RouteDoc` metadata (`Router.addDoc`), so the docs cannot drift from the
 code. Closes the Web service / API cluster.
 
-- Nothing comparable in Zig std or the ecosystem.
+- Nothing comparable in Zig std; the ecosystem has only small experiments tied to their own
+  frameworks (zchema, nilo, zapi — 2–4 GitHub stars on 2026-09-30). See `SPEC.md` § Compared with.
 - **Model after:** FastAPI's auto-generated spec (the emitted document
   shape — operation key order, path-parameter objects, the default
   `"Successful Response"` 200) and utoipa (Rust; route-metadata→spec
