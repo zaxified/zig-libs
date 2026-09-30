@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — Anchor grade corrected from class A · oracle SELF to **class D · oracle n/a**: the
+  8-byte header is this module's own format (no third party implements it), so there is no outside
+  truth to anchor on. Documentation only; grade 4 → 2 follows from the honest class, not new evidence.
+
 - **2026-09-07** — **`fuzzDecode` handed `decode` an EMPTY frame on every input,
   and the version-byte bias that would have rescued it never ran either.**
 
