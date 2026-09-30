@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **A commit's scratch arena is kept across commits.** `core.commit` built a
+  fresh `ArenaAllocator` over the `Db`'s allocator per commit and freed it; once the scratch
+  outgrew the allocator's size classes every chunk was an `mmap`/`munmap` pair and its pages
+  faulted again on every commit. `Db` now owns `commit_scratch`, reset after each commit with
+  `retain_with_limit = commit_scratch_retain` (1 MiB). Measured in qap's durable PUT lane: minor
+  faults per request 1.69 -> 0.001, instructions per request -7 %, requests/s +4.7 %. No API
+  change for `Db` users; `core.commit` takes the arena instead of an allocator.
+
 - **2026-09-29** — Underfull nodes (under a quarter of a page after a commit) are merged with a
   sibling, and split again by bytes when the pair does not fit a page (borrow); node splits now
   balance bytes, not entry counts. Scattered deletes no longer leave a tree of nearly empty

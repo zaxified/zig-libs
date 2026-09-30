@@ -141,6 +141,9 @@ pub const Db = struct {
     poisoned: bool = false,
     /// `Options.shrink_min_pages`.
     shrink_min_pages: u32,
+    /// `core.commit`'s scratch, kept across commits (one at a time: `in_txn`)
+    /// and reset after each. See `core.commit_scratch_retain`.
+    commit_scratch: std.heap.ArenaAllocator,
     /// True while a read-write transaction obtained from `begin` has not yet
     /// been consumed by `commit`/`rollback`. Single-writer is a documented
     /// caller contract; this is its enforcement — the same-process sibling of
@@ -223,10 +226,12 @@ pub const Db = struct {
             .next_txn = meta_rec.txn_id + 1,
             .open_snapshots = .empty,
             .shrink_min_pages = options.shrink_min_pages,
+            .commit_scratch = .init(gpa),
         };
     }
 
     pub fn close(self: *Db) void {
+        self.commit_scratch.deinit();
         self.pager.store.close(self.pager.handle);
         if (self.lock_file) |lh| self.pager.store.close(lh);
         self.gpa.free(self.lock_path);
@@ -513,7 +518,7 @@ pub const Txn = struct {
             self.* = undefined;
         }
         const new_meta = core.commit(
-            self.db.gpa,
+            &self.db.commit_scratch,
             &self.db.pager,
             self.base,
             self.changes.items,

@@ -98,6 +98,18 @@ pub const RecoverError = error{
 
 // ── 1. commit — the atomic-commit invariant (crash-safety kernel) ────────────
 
+/// How much of a commit's scratch arena is kept for the next commit.
+///
+/// ⛔ A fresh arena per commit was the old shape. Once a commit's scratch
+/// outgrows the general-purpose allocator's size classes, every chunk is an
+/// `mmap` on the way in and a `munmap` on the way out, and every page of it
+/// faults again on the next commit. Measured in qap's `wdur` lane (durable
+/// PUT, 2026-09-30): 1.69 minor faults per request (0.30 at the 09-28 pin,
+/// before this module's 09-29 changes grew the scratch), ~5 k kernel
+/// instructions each; retained, 0.001, and -7 % instructions per request.
+/// The limit bounds what one huge commit leaves behind.
+pub const commit_scratch_retain = 1 << 20;
+
 /// Apply `changes` to the tree rooted at `base`, copy-on-write, and make the
 /// result durable as a new committed version — atomically with respect to a
 /// crash at ANY point.
@@ -157,7 +169,7 @@ pub const RecoverError = error{
 /// keeps it safe. Banning it was the original design and it made the file grow
 /// without bound, since every commit rewrites the chain.
 pub fn commit(
-    gpa: Allocator,
+    scratch: *std.heap.ArenaAllocator,
     pager: *Pager,
     base: Meta,
     changes: []const Change,
@@ -166,9 +178,9 @@ pub fn commit(
 ) CommitError!Meta {
     if (changes.len == 0) return base; // an empty txn commits nothing
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // The caller's arena, reset and not freed: see `commit_scratch_retain`.
+    defer _ = scratch.reset(.{ .retain_with_limit = commit_scratch_retain });
+    const arena = scratch.allocator();
 
     // A failed commit must leave the pager exactly at the base state: pages
     // grown but never durably written would otherwise poison the NEXT commit
