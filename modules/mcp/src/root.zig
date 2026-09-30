@@ -19,7 +19,18 @@
 //! JSON-RPC **batch arrays are not supported** — MCP does not use them; an
 //! array input gets a -32600 Invalid request.
 //!
-//! Protocol surface (per the MCP spec revision 2025-11-25):
+//! **Two eras, one server** (spec 2026-07-28, basic/versioning.mdx, "dual-era
+//! server"). A request whose `params._meta` carries
+//! `io.modelcontextprotocol/protocolVersion` is a *modern* (2026-07-28)
+//! request and is served statelessly: its version, client capabilities and
+//! client identity come from that `_meta`, never from an earlier message; its
+//! result carries `resultType`, `_meta.io.modelcontextprotocol/serverInfo` and,
+//! on the cacheable methods, `ttlMs`/`cacheScope`; `server/discover` answers
+//! it; `ping` does not exist for it. Every other request takes the
+//! `initialize`-session path below, byte-for-byte as before — so an existing
+//! client never sees a changed reply.
+//!
+//! Protocol surface of the session path (spec revision 2025-11-25):
 //!   * `initialize` — protocol-version negotiation (echo the client's
 //!     requested revision when supported, else answer with our latest) +
 //!     server capabilities (`tools` always; `resources`/`prompts` only when
@@ -100,7 +111,7 @@ pub const meta = .{
     .platform = .any,
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner
-    .model_after = "MCP spec 2025-11-25 + JSON-RPC 2.0",
+    .model_after = "MCP spec 2026-07-28 (stateless) + 2025-11-25/2025-06-18 (initialize) + JSON-RPC 2.0",
     .deps = .{}, // std only (std.json + std.Io reader/writer)
 };
 
@@ -114,16 +125,50 @@ pub const protocol_version = "2025-11-25";
 /// with the latest (`protocol_version`).
 pub const supported_versions = [_][]const u8{ "2025-11-25", "2025-06-18" };
 
-/// JSON-RPC 2.0 standard error codes + the MCP-defined resource error (the
-/// only codes this server emits).
+/// The stateless revision: a request naming it in `_meta` is served on its
+/// own, with no handshake (spec 2026-07-28, basic/index.mdx "Statelessness").
+pub const modern_protocol_version = "2026-07-28";
+
+/// Revisions served statelessly — the only ones a `_meta` protocolVersion may
+/// name. A `_meta` naming anything else, a session revision included, gets
+/// `UnsupportedProtocolVersionError`: those revisions are reached through
+/// `initialize`, not through per-request metadata.
+pub const modern_versions = [_][]const u8{modern_protocol_version};
+
+/// Every revision this server speaks, newest first: what `server/discover`
+/// advertises and what `UnsupportedProtocolVersionError.data.supported`
+/// lists (the spec's own example lists a session revision there too).
+pub const all_versions = modern_versions ++ supported_versions;
+
+/// The reserved `_meta` keys this module reads or writes (spec 2026-07-28,
+/// basic/index.mdx "Per-request protocol fields").
+pub const meta_key = struct {
+    pub const protocol_version = "io.modelcontextprotocol/protocolVersion";
+    pub const client_capabilities = "io.modelcontextprotocol/clientCapabilities";
+    pub const client_info = "io.modelcontextprotocol/clientInfo";
+    pub const server_info = "io.modelcontextprotocol/serverInfo";
+};
+
+/// JSON-RPC 2.0 standard error codes + the MCP-defined ones.
 pub const error_code = struct {
     pub const parse_error: i32 = -32700;
     pub const invalid_request: i32 = -32600;
     pub const method_not_found: i32 = -32601;
     pub const invalid_params: i32 = -32602;
     pub const internal_error: i32 = -32603;
-    /// MCP spec: `resources/read` on a uri no resource resolves.
+    /// MCP spec up to 2025-11-25: `resources/read` on a uri no resource
+    /// resolves. Session path only — 2026-07-28 forbids emitting it and uses
+    /// `invalid_params` with `data.uri` instead (server/resources.mdx).
     pub const resource_not_found: i32 = -32002;
+    /// MCP 2026-07-28: Streamable HTTP headers disagree with the body. A
+    /// transport's code (`mcp-http`); never emitted here.
+    pub const header_mismatch: i32 = -32020;
+    /// MCP 2026-07-28: the request needs a client capability its `_meta` did
+    /// not declare (`data.requiredCapabilities`). For the application.
+    pub const missing_required_client_capability: i32 = -32021;
+    /// MCP 2026-07-28: the `_meta` protocolVersion is not one of
+    /// `modern_versions` (`data.supported`, `data.requested`).
+    pub const unsupported_protocol_version: i32 = -32022;
     /// MCP spec (sampling): the client's user rejected the sampling request.
     /// Received, never emitted — this server is the requester there.
     pub const user_rejected: i32 = -1;
@@ -182,6 +227,27 @@ pub const DispatchMethod = enum {
     @"resources/templates/list",
     @"prompts/list",
     @"prompts/get",
+    @"server/discover",
+
+    /// Whether a 2026-07-28 (stateless) request may call it. The handshake
+    /// pair and `ping` were removed in that revision, so a modern request for
+    /// one gets -32601; `server/discover` exists only there. Dispatch and the
+    /// modern spec-anchor canary both read this, so a new method is either
+    /// answered statelessly *and* anchored, or neither.
+    pub fn servedStatelessly(self: DispatchMethod) bool {
+        return switch (self) {
+            .initialize, .@"notifications/initialized", .ping => false,
+            .@"tools/list",
+            .@"tools/call",
+            .@"resources/list",
+            .@"resources/read",
+            .@"resources/templates/list",
+            .@"prompts/list",
+            .@"prompts/get",
+            .@"server/discover",
+            => true,
+        };
+    }
 };
 
 /// Every method this server ORIGINATES (server→client request or
@@ -211,17 +277,41 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "initialize", .anchor = .partial, .reason = "spec's lifecycle.mdx request (roots/sampling/elicitation/tasks capabilities, extended clientInfo) decodes verbatim; the response cannot be byte-identical because this server always advertises its own fixed, narrower capability set (no logging, no tasks, listChanged:false) -- a deliberate design choice (SPEC.md), not a gap" },
     .{ .method = "notifications/initialized", .anchor = .literal_example, .reason = "" },
     .{ .method = "ping", .anchor = .literal_example, .reason = "" },
-    .{ .method = "tools/list", .anchor = .partial, .reason = "spec's tools.mdx request (with a pagination cursor, which this module ignores by design -- pagination is out of scope) decodes verbatim; the response cannot be byte-identical because the spec's example Tool carries title/icons/execution fields this module's Tool struct does not have" },
+    .{ .method = "tools/list", .anchor = .partial, .reason = "spec's tools.mdx request (with a pagination cursor, which this module ignores by design -- pagination is out of scope) decodes verbatim; the response is not compared: the spec's example Tool carries an `execution` field (tasks) this module does not produce. title/icons exist since 2026-09-30 and are compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "tools/call", .anchor = .literal_example, .reason = "" },
-    .{ .method = "resources/list", .anchor = .partial, .reason = "spec's resources.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response cannot be byte-identical because the spec's example Resource carries a title/icons field this module's Resource struct does not have" },
+    .{ .method = "resources/list", .anchor = .partial, .reason = "spec's resources.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Resource shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "resources/read", .anchor = .literal_example, .reason = "" },
-    .{ .method = "resources/templates/list", .anchor = .partial, .reason = "spec's resources.mdx request (no params) decodes trivially; the response cannot be byte-identical because the spec's example ResourceTemplate carries title/icons fields this module's ResourceTemplate struct does not have" },
-    .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response cannot be byte-identical because the spec's example Prompt carries title/icons fields this module's Prompt struct does not have" },
+    .{ .method = "resources/templates/list", .anchor = .partial, .reason = "spec's resources.mdx request (no params) decodes trivially; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same ResourceTemplate shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
+    .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Prompt shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
+    .{ .method = "server/discover", .anchor = .no_example, .reason = "stateless-only (2026-07-28): no session revision defines it, and a session-path request for it lacks the _meta version and is answered -32602. Its anchor is in modern_spec_anchor_index" },
     .{ .method = "notifications/progress", .anchor = .literal_example, .reason = "" },
     .{ .method = "sampling/createMessage", .anchor = .literal_example, .reason = "" },
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Also: this module only ever SENDS notifications/cancelled (giving up on its own outbound sampling/elicitation request); it has no dispatch branch for a client cancelling an in-progress tools/call (an unknown id-less notification is silently dropped, which the spec explicitly permits)" },
+};
+
+/// The same "nothing silently filtered" index for the **stateless** path
+/// (spec 2026-07-28): one entry per `DispatchMethod` that
+/// `servedStatelessly`, anchored on that revision's own examples
+/// (`schema/2026-07-28/examples/**` and the `docs/specification/2026-07-28`
+/// pages). Its canary checks it against `servedStatelessly` both ways.
+///
+/// `.literal_example` here means **value-equal**, not byte-identical: the
+/// response parses to the same JSON value as the spec's example, member order
+/// aside (the spec's examples are pretty-printed in the author's order; ours
+/// puts `resultType` first). `_meta` is dropped from our side only where the
+/// example omits it (`serverInfo` is a SHOULD the examples skip); the
+/// `server/discover` example carries it and is compared with it.
+pub const modern_spec_anchor_index = [_]MethodAnchor{
+    .{ .method = "server/discover", .anchor = .partial, .reason = "both the schema example and server/discover.mdx's example match value-for-value except supportedVersions: theirs is a modern-only server listing [\"2026-07-28\"], ours is dual-era and lists the session revisions too -- which basic/versioning.mdx's own UnsupportedProtocolVersionError example does" },
+    .{ .method = "tools/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor: pagination is not implemented (the whole catalog is one page)" },
+    .{ .method = "tools/call", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (no pagination)" },
+    .{ .method = "resources/read", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/templates/list", .anchor = .literal_example, .reason = "" },
+    .{ .method = "prompts/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (no pagination)" },
+    .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
 };
 
 /// Everything `handleMessage`/`serve` can fail with. Malformed *input* never
@@ -539,6 +629,215 @@ fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
         end = next_end;
     }
     return s[0..end];
+}
+
+// ── the stateless (2026-07-28) request path ─────────────────────────────────
+
+/// What a 2026-07-28 request declared about itself in `params._meta` — the
+/// stateless stand-in for a peer's `initialize`. Built per request and never
+/// stored: it lives on the per-message arena, so every slice in it (the
+/// `client` strings included) is valid only for the handler call.
+///
+/// Nothing here reads or writes `PeerState`. The spec's rule is that a server
+/// "MUST NOT rely on prior requests over the same connection to establish
+/// context", and the converse holds too: a modern request must not move the
+/// gate of a session that shares its peer handle.
+pub const ModernRequest = struct {
+    /// One of `modern_versions` — our static literal, not the request's slice.
+    version: []const u8,
+    /// `_meta` clientCapabilities, parsed with the same fail-closed rules as
+    /// an `initialize` (`ClientCapabilities.parse`).
+    capabilities: ClientCapabilities,
+    /// `_meta` clientInfo (optional; SHOULD be sent). Lenient like the
+    /// session path: missing or malformed is null, never a refusal.
+    client: ?ClientInfo,
+};
+
+/// How one request asks to be served.
+const Era = union(enum) {
+    /// No `_meta` protocolVersion: the `initialize`-session path.
+    legacy,
+    modern: ModernRequest,
+    /// Names a protocolVersion but breaks the per-request field rules — the
+    /// spec's "malformed" (-32602). The payload is the error message.
+    malformed: []const u8,
+    /// A protocolVersion outside `modern_versions` (-32022). The payload is
+    /// the requested version, echoed in `data.requested`.
+    unsupported: []const u8,
+};
+
+/// Sort a request into its era (spec 2026-07-28, basic/versioning.mdx: "a
+/// request carrying modern per-request `_meta` is served statelessly").
+///
+/// The **presence of the protocolVersion key** is the switch, and nothing
+/// weaker: a session-era client already sends `_meta` (a `progressToken`), so
+/// "has `_meta`" would misfile it. Once the key is there the request has opted
+/// into the modern rules and is held to them — both required fields present
+/// (clientCapabilities an object, as its schema type says), or -32602.
+/// Presence is checked before the version so a request that is malformed *and*
+/// names an unknown version is told the thing it can fix without a retry
+/// loop.
+fn classifyRequest(params_opt: ?std.json.Value) Era {
+    const params = params_opt orelse return .legacy;
+    if (params != .object) return .legacy;
+    const meta_v = params.object.get("_meta") orelse return .legacy;
+    if (meta_v != .object) return .legacy;
+    const pv = meta_v.object.get(meta_key.protocol_version) orelse return .legacy;
+    if (pv != .string) return .{ .malformed = "Invalid " ++ meta_key.protocol_version };
+    const caps = meta_v.object.get(meta_key.client_capabilities) orelse
+        return .{ .malformed = "Missing " ++ meta_key.client_capabilities };
+    if (caps != .object) return .{ .malformed = "Invalid " ++ meta_key.client_capabilities };
+    const version = for (modern_versions) |v| {
+        if (eql(v, pv.string)) break v;
+    } else return .{ .unsupported = pv.string };
+    return .{ .modern = .{
+        .version = version,
+        .capabilities = ClientCapabilities.parse(caps),
+        .client = ClientInfo.parse(meta_v.object.get(meta_key.client_info)),
+    } };
+}
+
+/// `cacheScope` of a 2026-07-28 cacheable result (server/utilities/caching.mdx).
+pub const CacheScope = enum { public, private };
+
+/// The `ttlMs` + `cacheScope` hint a 2026-07-28 cacheable result MUST carry
+/// (`server/discover`, the four list methods, `resources/read`).
+///
+/// The default — 0 ms, private — is exactly what a client assumes when the
+/// hint is absent ("immediately stale", never shared across authorization
+/// contexts), so a server that configures nothing promises nothing. Raise it
+/// only for what really is stable, and use `.public` only for results that are
+/// the same for every caller: a shared cache will serve a `.public` answer to
+/// a different access token.
+pub const CacheHint = struct {
+    ttl_ms: u64 = 0,
+    scope: CacheScope = .private,
+};
+
+/// One display icon for a tool, resource, template or prompt (spec
+/// 2025-11-25+ `Icon`). `src` should be an `https:` or `data:` URI; the
+/// spec makes the *client* reject anything else, this module passes it
+/// through as registered.
+pub const Icon = struct {
+    src: []const u8,
+    mime_type: ?[]const u8 = null,
+    /// e.g. `"48x48"`, or `"any"` for a scalable format.
+    sizes: []const []const u8 = &.{},
+    theme: ?Theme = null,
+
+    pub const Theme = enum { light, dark };
+};
+
+/// Tool behaviour hints (spec `ToolAnnotations`). Every field is optional and
+/// omitted when null. They are **hints**: a client may use `read_only_hint`
+/// to auto-approve a call, so set it only when it is true.
+pub const ToolAnnotations = struct {
+    title: ?[]const u8 = null,
+    read_only_hint: ?bool = null,
+    destructive_hint: ?bool = null,
+    idempotent_hint: ?bool = null,
+    open_world_hint: ?bool = null,
+};
+
+/// `title` + `icons` of a primitive, each omitted when unset.
+fn writeTitleIcons(jw: *std.json.Stringify, title: ?[]const u8, icons: []const Icon) std.Io.Writer.Error!void {
+    if (title) |t| {
+        try jw.objectField("title");
+        try jw.write(t);
+    }
+    if (icons.len == 0) return;
+    try jw.objectField("icons");
+    try jw.beginArray();
+    for (icons) |icon| {
+        try jw.beginObject();
+        try jw.objectField("src");
+        try jw.write(icon.src);
+        if (icon.mime_type) |m| {
+            try jw.objectField("mimeType");
+            try jw.write(m);
+        }
+        if (icon.sizes.len != 0) {
+            try jw.objectField("sizes");
+            try jw.write(icon.sizes);
+        }
+        if (icon.theme) |th| {
+            try jw.objectField("theme");
+            try jw.write(@tagName(th));
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
+
+fn writeToolAnnotations(jw: *std.json.Stringify, a: ToolAnnotations) std.Io.Writer.Error!void {
+    try jw.objectField("annotations");
+    try jw.beginObject();
+    if (a.title) |t| {
+        try jw.objectField("title");
+        try jw.write(t);
+    }
+    const hints = [_]struct { []const u8, ?bool }{
+        .{ "readOnlyHint", a.read_only_hint },
+        .{ "destructiveHint", a.destructive_hint },
+        .{ "idempotentHint", a.idempotent_hint },
+        .{ "openWorldHint", a.open_world_hint },
+    };
+    for (hints) |h| {
+        if (h[1]) |b| {
+            try jw.objectField(h[0]);
+            try jw.write(b);
+        }
+    }
+    try jw.endObject();
+}
+
+/// The spec's `Implementation` for this server, as the 2026-07-28
+/// `_meta.io.modelcontextprotocol/serverInfo` carries it: `name`, `version`,
+/// and `title` only when one was set (the session path's `initialize` keeps
+/// its own `title`-defaults-to-`name` shape).
+fn writeImplementation(jw: *std.json.Stringify, info: *const Info) std.Io.Writer.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(info.name);
+    if (info.title) |t| {
+        try jw.objectField("title");
+        try jw.write(t);
+    }
+    try jw.objectField("version");
+    try jw.write(info.version);
+    try jw.endObject();
+}
+
+/// Open a result object: `{`, plus the `resultType` a 2026-07-28 result MUST
+/// carry. This module only ever produces final results, so it is always
+/// `"complete"`.
+fn beginResult(jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
+    try jw.beginObject();
+    if (modern) {
+        try jw.objectField("resultType");
+        try jw.write("complete");
+    }
+}
+
+/// Close a result object. For a 2026-07-28 request it first adds
+/// `_meta.io.modelcontextprotocol/serverInfo` (SHOULD, basic/index.mdx) and,
+/// on a cacheable method, `ttlMs` + `cacheScope` (MUST, caching.mdx). A
+/// session-path result gets neither, so its bytes do not change.
+fn endResult(jw: *std.json.Stringify, info: *const Info, modern: bool, cache: ?CacheHint) std.Io.Writer.Error!void {
+    if (modern) {
+        try jw.objectField("_meta");
+        try jw.beginObject();
+        try jw.objectField(meta_key.server_info);
+        try writeImplementation(jw, info);
+        try jw.endObject();
+        if (cache) |c| {
+            try jw.objectField("ttlMs");
+            try jw.write(c.ttl_ms);
+            try jw.objectField("cacheScope");
+            try jw.write(@tagName(c.scope));
+        }
+    }
+    try jw.endObject();
 }
 
 // ── server→client requests: sampling + elicitation ──────────────────────────
@@ -1167,6 +1466,11 @@ pub const SendError = error{
     InvalidUrl,
     EmptyMessage,
     MissingElicitationId,
+    /// The call arrived as a stateless 2026-07-28 request. That revision
+    /// removed server→client requests — the multi round-trip pattern
+    /// (`InputRequiredResult`) replaces them — so there is nothing to send
+    /// one on, and a modern client would not recognise it.
+    StatelessRequest,
 } || SchemaError;
 
 const Pending = struct {
@@ -1472,6 +1776,9 @@ pub const ToolCall = struct {
     /// requests issued from this call inherit it, so the answer can only be
     /// correlated back from the same client.
     peer: u64 = 0,
+    /// Set when this call arrived as a stateless 2026-07-28 request: what its
+    /// `_meta` declared. Null = an `initialize`-session call. Arena lifetime.
+    modern: ?*const ModernRequest = null,
 
     /// Ask the client's LLM for a completion, from inside a tool call.
     ///
@@ -1482,6 +1789,7 @@ pub const ToolCall = struct {
     /// as two calls (ask now, act on the next call). There is no way around
     /// that: the answer cannot arrive while this handler owns the loop.
     pub fn requestSampling(self: *ToolCall, req: SamplingRequest, opts: RequestOptions) SendError!u64 {
+        if (self.modern != null) return error.StatelessRequest;
         var o = opts;
         o.peer = self.peer; // the answer can only come from the caller
         return self.server.sendSamplingRequest(self.transport, req, o);
@@ -1490,22 +1798,35 @@ pub const ToolCall = struct {
     /// Ask the client to collect user input, from inside a tool call. Same
     /// non-waiting contract as `requestSampling`.
     pub fn requestElicitation(self: *ToolCall, req: ElicitationRequest, opts: RequestOptions) SendError!u64 {
+        if (self.modern != null) return error.StatelessRequest;
         var o = opts;
         o.peer = self.peer;
         return self.server.sendElicitationRequest(self.transport, req, o);
     }
 
-    /// What the client declared at `initialize` — check this before offering a
-    /// feature that depends on sampling or elicitation, rather than issuing a
-    /// request and handling the refusal.
+    /// What the client declared — in this request's `_meta` for a 2026-07-28
+    /// call, at `initialize` otherwise. Check this before offering a feature
+    /// that depends on sampling or elicitation, rather than issuing a request
+    /// and handling the refusal.
     pub fn clientCapabilities(self: *const ToolCall) ClientCapabilities {
+        if (self.modern) |r| return r.capabilities;
         return self.server.clientCapabilities(self.peer);
     }
 
-    /// What the calling client self-identified as at `initialize` — see
-    /// `Server.clientInfo`. Null if it never sent a (well-formed) `clientInfo`.
+    /// What the calling client self-identified as — this request's `_meta`
+    /// clientInfo for a 2026-07-28 call (valid for this call only), its
+    /// `initialize` otherwise (see `Server.clientInfo`). Null if it sent no
+    /// well-formed one.
     pub fn clientInfo(self: *const ToolCall) ?ClientInfo {
+        if (self.modern) |r| return r.client;
         return self.server.clientInfo(self.peer);
+    }
+
+    /// The protocol revision this call is served under: the request's own
+    /// for a 2026-07-28 call, the peer's negotiated one otherwise.
+    pub fn protocolVersion(self: *const ToolCall) []const u8 {
+        if (self.modern) |r| return r.version;
+        return self.server.negotiatedVersion(self.peer);
     }
 
     /// Append raw bytes to the result. OOM is swallowed (a truncated tool
@@ -1563,12 +1884,24 @@ pub const Handler = *const fn (ctx: ?*anyopaque, call: *ToolCall) bool;
 /// carries it parsed as `structuredContent`; set false for tools whose output
 /// is a stream (e.g. NDJSON) so a trivially single-object output never
 /// changes the contract.
+///
+/// `title`, `icons` and `annotations` are display metadata, emitted in
+/// `tools/list` when set and omitted otherwise.
+///
+/// On a 2026-07-28 call `structuredContent` may be any JSON value, not just an
+/// object (tools.mdx "Structured Content"). This module takes that wider
+/// reading only for a tool that declares an `output_schema`: for one that does
+/// not, a bare `42` or `"ok"` in the output is far more likely text than a
+/// structured result, so it stays text-only, as on the session path.
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     input_schema: []const u8,
     output_schema: []const u8 = "",
     allow_structured: bool = true,
+    title: ?[]const u8 = null,
+    icons: []const Icon = &.{},
+    annotations: ?ToolAnnotations = null,
     handler: Handler,
     /// Opaque app-state pointer threaded to every call of this tool.
     ctx: ?*anyopaque = null,
@@ -1588,6 +1921,11 @@ pub const ResourceRequest = struct {
     uri: []const u8,
     /// Accumulated content items (internal; fill via `text`/`blob`).
     contents: std.ArrayList(ContentItem) = .empty,
+    /// The caching hint a 2026-07-28 read answers with. Starts as
+    /// `Server.read_cache`; a handler that knows better (a per-user document
+    /// is `.private`, a static file may live longer) overwrites it. Ignored
+    /// on the session path, which has no caching fields.
+    cache: CacheHint = .{},
 
     const ContentItem = struct {
         uri: []const u8,
@@ -1630,6 +1968,8 @@ pub const Resource = struct {
     name: []const u8,
     description: []const u8 = "",
     mime_type: []const u8 = "",
+    title: ?[]const u8 = null,
+    icons: []const Icon = &.{},
     handler: ResourceHandler,
     /// Opaque app-state pointer threaded to every read of this resource.
     ctx: ?*anyopaque = null,
@@ -1645,6 +1985,8 @@ pub const ResourceTemplate = struct {
     name: []const u8,
     description: []const u8 = "",
     mime_type: []const u8 = "",
+    title: ?[]const u8 = null,
+    icons: []const Icon = &.{},
     handler: ?ResourceHandler = null,
     /// Opaque app-state pointer threaded to every read this template serves.
     ctx: ?*anyopaque = null,
@@ -1716,6 +2058,8 @@ pub const Prompt = struct {
     name: []const u8,
     description: []const u8 = "",
     arguments: []const PromptArgument = &.{},
+    title: ?[]const u8 = null,
+    icons: []const Icon = &.{},
     handler: PromptHandler,
     /// Opaque app-state pointer threaded to every get of this prompt.
     ctx: ?*anyopaque = null,
@@ -1758,6 +2102,13 @@ pub const Server = struct {
     /// burnt when it is allocated, even if the send then fails, so a late
     /// answer can never be matched to a different request.
     next_request_id: u64 = 1,
+    /// Caching hint on the 2026-07-28 `server/discover` and list results
+    /// (`tools/list`, `resources/list`, `resources/templates/list`,
+    /// `prompts/list`). See `CacheHint` for why the default caches nothing.
+    list_cache: CacheHint = .{},
+    /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
+    /// override it per read (`ResourceRequest.cache`).
+    read_cache: CacheHint = .{},
     /// Cap on unanswered server→client requests **per peer**. A client that
     /// simply never answers must not grow this without bound; past the cap
     /// `send*` returns `error.TooManyPending`. Counted per peer so one
@@ -2311,12 +2662,41 @@ pub const Server = struct {
         if (id == null) return;
         const m = dm orelse
             return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+
+        // Which era this request speaks — see `classifyRequest`. `initialize`
+        // is the session opener whatever its `_meta` says: a dual-era server
+        // "selects legacy semantics" on it (basic/versioning.mdx).
+        const era: Era = if (m == .initialize) .legacy else classifyRequest(obj.get("params"));
+        const modern: ?*const ModernRequest = switch (era) {
+            .legacy => null,
+            .modern => |*r| r,
+            .malformed => |why| return sendError(arena, out, id, error_code.invalid_params, why),
+            .unsupported => |requested| return sendErrorWithData(
+                arena,
+                out,
+                id,
+                error_code.unsupported_protocol_version,
+                "Unsupported protocol version",
+                .{ .supported = all_versions[0..], .requested = requested },
+            ),
+        };
+
+        if (modern != null and !m.servedStatelessly())
+            return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+
         switch (m) {
             // Handled above, before the id check — a notification by definition.
             .@"notifications/initialized" => unreachable,
             .initialize => try self.handleInitialize(arena, out, id, obj.get("params"), peer),
+            // Stateless-only, and the spec makes it mandatory. Without the
+            // `_meta` version it is a malformed modern request, not a session
+            // one — no session-era client sends it.
+            .@"server/discover" => {
+                if (modern == null) return sendError(arena, out, id, error_code.invalid_params, "Missing " ++ meta_key.protocol_version);
+                try self.handleDiscover(arena, out, id);
+            },
             .@"tools/list" => {
-                const list = self.buildToolsList(arena) catch |err| switch (err) {
+                const list = self.buildToolsList(arena, modern != null) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // A registered schema literal that is not valid JSON is a
                     // server-side defect — surface it as -32603, don't crash.
@@ -2324,14 +2704,59 @@ pub const Server = struct {
                 };
                 try sendResultRaw(arena, out, id, list);
             },
+            // Session-only: 2026-07-28 removed it (changelog "Major changes"
+            // 5), and `servedStatelessly` has already refused a modern one.
             .ping => try sendResultRaw(arena, out, id, "{}"),
-            .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer),
-            .@"resources/list" => try self.handleResourcesList(arena, out, id),
-            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params")),
-            .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id),
-            .@"prompts/list" => try self.handlePromptsList(arena, out, id),
-            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params")),
+            .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer, modern),
+            .@"resources/list" => try self.handleResourcesList(arena, out, id, modern != null),
+            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), modern != null),
+            .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id, modern != null),
+            .@"prompts/list" => try self.handlePromptsList(arena, out, id, modern != null),
+            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), modern != null),
         }
+    }
+
+    /// `server/discover` (spec 2026-07-28, server/discover.mdx): every
+    /// revision we speak, the capabilities in their stateless shape, our
+    /// identity, the instructions, and the caching hint.
+    ///
+    /// The capabilities follow the session rule (`tools` always, `resources`/
+    /// `prompts` only with a non-empty catalog) but drop the `listChanged:false`
+    /// / `subscribe:false` members: absent means the same thing, and in this
+    /// revision both belong to `subscriptions/listen`, which this module does
+    /// not serve.
+    fn handleDiscover(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value) Error!void {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        self.buildDiscoverResult(&jw) catch return error.OutOfMemory;
+        try sendResultRaw(arena, out, id, aw.written());
+    }
+
+    fn buildDiscoverResult(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
+        try beginResult(jw, true);
+        try jw.objectField("supportedVersions");
+        try jw.write(all_versions[0..]);
+        try jw.objectField("capabilities");
+        try jw.beginObject();
+        try jw.objectField("tools");
+        try jw.beginObject();
+        try jw.endObject();
+        if (self.resources.items.len != 0 or self.resource_templates.items.len != 0) {
+            try jw.objectField("resources");
+            try jw.beginObject();
+            try jw.endObject();
+        }
+        if (self.prompts.items.len != 0) {
+            try jw.objectField("prompts");
+            try jw.beginObject();
+            try jw.endObject();
+        }
+        try jw.endObject();
+        if (self.info.instructions) |instr| {
+            try jw.objectField("instructions");
+            try jw.write(instr);
+        }
+        try endResult(jw, &self.info, true, self.list_cache);
     }
 
     fn handleInitialize(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64) Error!void {
@@ -2432,16 +2857,21 @@ pub const Server = struct {
     /// The `input_schema`/`output_schema` literals are parsed to a Value and
     /// re-emitted, so they flow through the same serializer (single source:
     /// the registered Tool) and an invalid literal is caught here.
-    fn buildToolsList(self: *const Server, arena: std.mem.Allocator) ![]u8 {
+    ///
+    /// Tools come out in registration order, which is what 2026-07-28 asks
+    /// for ("SHOULD return tools in a deterministic order", for client caches
+    /// and LLM prompt-cache hits): the same registrations give the same bytes.
+    fn buildToolsList(self: *const Server, arena: std.mem.Allocator, modern: bool) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        try jw.beginObject();
+        try beginResult(&jw, modern);
         try jw.objectField("tools");
         try jw.beginArray();
         for (self.tools.items) |t| {
             try jw.beginObject();
             try jw.objectField("name");
             try jw.write(t.name);
+            try writeTitleIcons(&jw, t.title, t.icons);
             try jw.objectField("description");
             try jw.write(t.description);
             try jw.objectField("inputSchema");
@@ -2450,14 +2880,15 @@ pub const Server = struct {
                 try jw.objectField("outputSchema");
                 try writeRawJson(arena, &jw, t.output_schema);
             }
+            if (t.annotations) |a| try writeToolAnnotations(&jw, a);
             try jw.endObject();
         }
         try jw.endArray();
-        try jw.endObject();
+        try endResult(&jw, &self.info, modern, self.list_cache);
         return aw.written();
     }
 
-    fn handleCall(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64) Error!void {
+    fn handleCall(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, modern: ?*const ModernRequest) Error!void {
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
         };
@@ -2500,22 +2931,28 @@ pub const Server = struct {
             .server = self,
             .transport = out,
             .peer = peer,
+            .modern = modern,
         };
         const is_error = tool.handler(tool.ctx, &call);
-        try sendToolResult(arena, out, id, tool_buf.items, tool.allow_structured, is_error);
+        try sendToolResult(arena, out, id, tool_buf.items, .{
+            .allow_structured = tool.allow_structured,
+            .is_error = is_error,
+            .any_structured_value = modern != null and tool.output_schema.len != 0,
+            .server_info = if (modern != null) &self.info else null,
+        });
     }
 
     /// Assemble + send the `resources/list` result from the registered
     /// catalog (no pagination — never emits `nextCursor`).
-    fn handleResourcesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value) Error!void {
+    fn handleResourcesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildResourcesList(&jw) catch return error.OutOfMemory;
+        self.buildResourcesList(&jw, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 
-    fn buildResourcesList(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
-        try jw.beginObject();
+    fn buildResourcesList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
+        try beginResult(jw, modern);
         try jw.objectField("resources");
         try jw.beginArray();
         for (self.resources.items) |r| {
@@ -2524,6 +2961,7 @@ pub const Server = struct {
             try jw.write(r.uri);
             try jw.objectField("name");
             try jw.write(r.name);
+            try writeTitleIcons(jw, r.title, r.icons);
             if (r.description.len != 0) {
                 try jw.objectField("description");
                 try jw.write(r.description);
@@ -2535,20 +2973,20 @@ pub const Server = struct {
             try jw.endObject();
         }
         try jw.endArray();
-        try jw.endObject();
+        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     /// Assemble + send the `resources/templates/list` result from the
     /// registered template catalog.
-    fn handleTemplatesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value) Error!void {
+    fn handleTemplatesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildTemplatesList(&jw) catch return error.OutOfMemory;
+        self.buildTemplatesList(&jw, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 
-    fn buildTemplatesList(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
-        try jw.beginObject();
+    fn buildTemplatesList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
+        try beginResult(jw, modern);
         try jw.objectField("resourceTemplates");
         try jw.beginArray();
         for (self.resource_templates.items) |t| {
@@ -2557,6 +2995,7 @@ pub const Server = struct {
             try jw.write(t.uri_template);
             try jw.objectField("name");
             try jw.write(t.name);
+            try writeTitleIcons(jw, t.title, t.icons);
             if (t.description.len != 0) {
                 try jw.objectField("description");
                 try jw.write(t.description);
@@ -2568,13 +3007,15 @@ pub const Server = struct {
             try jw.endObject();
         }
         try jw.endArray();
-        try jw.endObject();
+        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     /// `resources/read`: validate params, resolve the uri (exact resource
     /// match first, then template handlers in registration order), and send
-    /// the contents the handler filled. Unresolvable uri => -32002.
-    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value) Error!void {
+    /// the contents the handler filled. Unresolvable uri => -32002 on the
+    /// session path; -32602 with `data.uri` on a 2026-07-28 request, which
+    /// forbids -32002 (server/resources.mdx "Error Handling").
+    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern: bool) Error!void {
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
         };
@@ -2588,45 +3029,49 @@ pub const Server = struct {
             return sendError(arena, out, id, error_code.invalid_params, "Invalid uri");
         }
 
-        var req = ResourceRequest{ .arena = arena, .uri = uri_v.string };
+        var req = ResourceRequest{ .arena = arena, .uri = uri_v.string, .cache = self.read_cache };
         const found = blk: {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
             for (self.resource_templates.items) |*t| {
                 const handler = t.handler orelse continue;
                 if (handler(t.ctx, &req)) break :blk true;
-                // A declining template may have written partial contents
-                // before bailing — discard them before trying the next one.
+                // A declining template may have written partial contents (or
+                // a caching hint) before bailing — discard them before trying
+                // the next one.
                 req.contents.clearRetainingCapacity();
+                req.cache = self.read_cache;
             }
             break :blk false;
         };
         if (!found) {
+            if (modern) return sendErrorWithData(arena, out, id, error_code.invalid_params, "Resource not found", .{ .uri = req.uri });
             return sendError(arena, out, id, error_code.resource_not_found, "Resource not found");
         }
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        buildReadResult(&jw, &req) catch return error.OutOfMemory;
+        buildReadResult(&jw, &req, &self.info, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 
     /// Assemble + send the `prompts/list` result from the registered catalog
     /// (no pagination — never emits `nextCursor`).
-    fn handlePromptsList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value) Error!void {
+    fn handlePromptsList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildPromptsList(&jw) catch return error.OutOfMemory;
+        self.buildPromptsList(&jw, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 
-    fn buildPromptsList(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
-        try jw.beginObject();
+    fn buildPromptsList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
+        try beginResult(jw, modern);
         try jw.objectField("prompts");
         try jw.beginArray();
         for (self.prompts.items) |p| {
             try jw.beginObject();
             try jw.objectField("name");
             try jw.write(p.name);
+            try writeTitleIcons(jw, p.title, p.icons);
             if (p.description.len != 0) {
                 try jw.objectField("description");
                 try jw.write(p.description);
@@ -2653,13 +3098,13 @@ pub const Server = struct {
             try jw.endObject();
         }
         try jw.endArray();
-        try jw.endObject();
+        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     /// `prompts/get`: validate params + the declared required arguments
     /// (-32602 on any miss, so a handler never sees an incomplete required
     /// set), dispatch to the handler, send the rendered messages.
-    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value) Error!void {
+    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern: bool) Error!void {
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
         };
@@ -2701,7 +3146,7 @@ pub const Server = struct {
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        buildPromptResult(&jw, prompt, &req) catch return error.OutOfMemory;
+        buildPromptResult(&jw, prompt, &req, &self.info, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 };
@@ -2709,8 +3154,8 @@ pub const Server = struct {
 /// Serialize one `resources/read` result: `{"contents":[{uri, mimeType?,
 /// text|blob}, …]}` — `blob` carries the base64 the handler's `blob()` call
 /// already encoded.
-fn buildReadResult(jw: *std.json.Stringify, req: *const ResourceRequest) std.Io.Writer.Error!void {
-    try jw.beginObject();
+fn buildReadResult(jw: *std.json.Stringify, req: *const ResourceRequest, info: *const Info, modern: bool) std.Io.Writer.Error!void {
+    try beginResult(jw, modern);
     try jw.objectField("contents");
     try jw.beginArray();
     for (req.contents.items) |c| {
@@ -2726,14 +3171,14 @@ fn buildReadResult(jw: *std.json.Stringify, req: *const ResourceRequest) std.Io.
         try jw.endObject();
     }
     try jw.endArray();
-    try jw.endObject();
+    try endResult(jw, info, modern, req.cache);
 }
 
 /// Serialize one `prompts/get` result: `{description?, messages:[{role,
 /// content:{type:"text", text}}, …]}` — description comes from the
 /// registration (omitted when "").
-fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const PromptRequest) std.Io.Writer.Error!void {
-    try jw.beginObject();
+fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const PromptRequest, info: *const Info, modern: bool) std.Io.Writer.Error!void {
+    try beginResult(jw, modern);
     if (prompt.description.len != 0) {
         try jw.objectField("description");
         try jw.write(prompt.description);
@@ -2754,7 +3199,9 @@ fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const
         try jw.endObject();
     }
     try jw.endArray();
-    try jw.endObject();
+    // Not a cacheable method: `prompts/get` renders from the caller's
+    // arguments, and the spec lists no caching hint for it.
+    try endResult(jw, info, modern, null);
 }
 
 // ── response senders (build one line on the arena, write it, flush) ─────────
@@ -2774,6 +3221,26 @@ fn sendError(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value,
     try flushLine(out, aw.written());
 }
 
+/// An error response with a `data` member — the 2026-07-28 shapes that carry
+/// one (`UnsupportedProtocolVersionError`, resource-not-found's `uri`).
+/// `data` is any value `std.json.Stringify` can write, so every string in it
+/// is escaped the same way as the rest of the line.
+fn sendErrorWithData(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, code: i32, msg: []const u8, data: anytype) Error!void {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    buildErrorWithData(&aw.writer, id, code, msg, data) catch return error.OutOfMemory;
+    try flushLine(out, aw.written());
+}
+
+fn buildErrorWithData(w: *std.Io.Writer, id: ?std.json.Value, code: i32, msg: []const u8, data: anytype) std.Io.Writer.Error!void {
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(w, id);
+    try w.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
+    try std.json.Stringify.encodeJsonString(msg, .{}, w);
+    try w.writeAll(",\"data\":");
+    try std.json.Stringify.value(data, .{}, w);
+    try w.writeAll("}}\n");
+}
+
 fn sendResultRaw(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, raw: []const u8) Error!void {
     var aw: std.Io.Writer.Allocating = .init(arena);
     writeResultLine(&aw.writer, id, raw) catch return error.OutOfMemory;
@@ -2787,23 +3254,47 @@ fn sendResultRaw(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Va
 /// so an error/text blob never emits invalid structure. `isError:true` marks
 /// a tool failure so the agent notices; a domain `{"ok":false}` answer keeps
 /// `isError:false`.
-fn sendToolResult(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, text: []const u8, allow_structured: bool, is_error: bool) Error!void {
+const ToolResultOptions = struct {
+    allow_structured: bool,
+    is_error: bool,
+    /// 2026-07-28 call to a tool with an `output_schema`: `structuredContent`
+    /// may be any JSON value, not only an object (see `Tool`).
+    any_structured_value: bool = false,
+    /// Non-null exactly for a 2026-07-28 call: adds `resultType` and
+    /// `_meta.serverInfo`.
+    server_info: ?*const Info = null,
+};
+
+fn sendToolResult(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, text: []const u8, opts: ToolResultOptions) Error!void {
     var aw: std.Io.Writer.Allocating = .init(arena);
-    buildToolResultLine(arena, &aw.writer, id, text, allow_structured, is_error) catch return error.OutOfMemory;
+    buildToolResultLine(arena, &aw.writer, id, text, opts) catch return error.OutOfMemory;
     try flushLine(out, aw.written());
 }
 
-fn buildToolResultLine(gpa: std.mem.Allocator, w: *std.Io.Writer, id: ?std.json.Value, text: []const u8, allow_structured: bool, is_error: bool) std.Io.Writer.Error!void {
+fn buildToolResultLine(gpa: std.mem.Allocator, w: *std.Io.Writer, id: ?std.json.Value, text: []const u8, opts: ToolResultOptions) std.Io.Writer.Error!void {
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeId(w, id);
-    try w.writeAll(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
+    try w.writeAll(",\"result\":{");
+    if (opts.server_info != null) try w.writeAll("\"resultType\":\"complete\",");
+    try w.writeAll("\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.encodeJsonString(text, .{}, w);
     try w.writeAll("}]");
-    if (allow_structured and isSingleJsonObject(gpa, text)) {
+    const structured = opts.allow_structured and
+        (isSingleJsonObject(gpa, text) or (opts.any_structured_value and isSingleJsonValue(gpa, text)));
+    if (structured) {
         try w.writeAll(",\"structuredContent\":");
         try writeStrippingNewlines(w, text);
     }
-    try w.writeAll(if (is_error) ",\"isError\":true}}\n" else ",\"isError\":false}}\n");
+    try w.writeAll(if (opts.is_error) ",\"isError\":true" else ",\"isError\":false");
+    if (opts.server_info) |info| {
+        try w.writeAll(",\"_meta\":{");
+        try std.json.Stringify.encodeJsonString(meta_key.server_info, .{}, w);
+        try w.writeAll(":");
+        var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+        try writeImplementation(&jw, info);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}}\n");
 }
 
 /// Emit a raw JSON-Schema literal through the serializer: parse it to a Value
@@ -2879,6 +3370,14 @@ fn isSingleJsonObject(gpa: std.mem.Allocator, text: []const u8) bool {
     if (i >= text.len or text[i] != '{') return false;
     // `validate` accepts exactly one top-level value plus trailing
     // whitespace, so NDJSON and any trailing garbage are refused here too.
+    return std.json.validate(gpa, text) catch false;
+}
+
+/// True when `text` is exactly one JSON value of any kind plus whitespace —
+/// the 2026-07-28 `structuredContent` shape. Same `std.json` check as
+/// `isSingleJsonObject`, for the same reasons (it is what makes the newline
+/// strip safe), minus the leading-`{` requirement.
+fn isSingleJsonValue(gpa: std.mem.Allocator, text: []const u8) bool {
     return std.json.validate(gpa, text) catch false;
 }
 
@@ -5856,7 +6355,7 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
     }
     try testing.expectEqual(@as(usize, 8), literal);
     try testing.expectEqual(@as(usize, 6), partial);
-    try testing.expectEqual(@as(usize, 0), no_example);
+    try testing.expectEqual(@as(usize, 1), no_example);
 }
 
 test "initialize: decodes the spec's own request verbatim (lifecycle.mdx)" {
@@ -6636,4 +7135,896 @@ fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
         try buildFuzzResponse(&c, &line.writer, c.word());
         try deliverFuzzLine(&s, line.written(), c.word());
     }
+}
+
+// ── spec 2026-07-28: the stateless path ─────────────────────────────────────
+//
+// The oracle strings below are quoted verbatim from the MCP specification
+// repository (`schema/2026-07-28/examples/**` and the
+// `docs/specification/2026-07-28/**` pages) — the same citation relationship,
+// and the same provenance reasoning, as the 2025-11-25 anchors above. Where a
+// test changes one byte of a quoted request (an `id`), it says so.
+
+/// JSON value equality with object members compared as a set: the spec's
+/// examples are pretty-printed in their author's member order, ours puts
+/// `resultType` first, and neither order carries meaning.
+fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
+    switch (a) {
+        .null => return b == .null,
+        .bool => |x| return b == .bool and b.bool == x,
+        .integer, .float, .number_string => {
+            const fa = jsonNumber(a) orelse return false;
+            const fb = jsonNumber(b) orelse return false;
+            return fa == fb;
+        },
+        .string => |x| return b == .string and eql(x, b.string),
+        .array => |x| {
+            if (b != .array or b.array.items.len != x.items.len) return false;
+            for (x.items, b.array.items) |ea, eb| {
+                if (!jsonValueEql(ea, eb)) return false;
+            }
+            return true;
+        },
+        .object => |x| {
+            if (b != .object or b.object.count() != x.count()) return false;
+            var it = x.iterator();
+            while (it.next()) |e| {
+                const other = b.object.get(e.key_ptr.*) orelse return false;
+                if (!jsonValueEql(e.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+fn jsonNumber(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |str| std.fmt.parseFloat(f64, str) catch null,
+        else => null,
+    };
+}
+
+/// Feed the spec's literal `request`; our reply must be exactly one line and
+/// value-equal to the spec's literal `expected` response, after two
+/// adjustments, both visible at the call site: each field in `drop_expected`
+/// is removed from both `result`s (a field this module does not produce, or
+/// produces differently — named in the anchor's reason and checked on its own
+/// by the test; it must really be in the example, so a stale drop list
+/// fails), and our `result._meta` is removed when the example has none
+/// (`serverInfo` is a SHOULD the examples skip).
+fn expectSpecResponse(s: *Server, request: []const u8, expected: []const u8, drop_expected: []const []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(request, &aw.writer);
+    const line = aw.written();
+    try testing.expect(line.len != 0 and line[line.len - 1] == '\n');
+    try testing.expect(std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') == null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var got = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+    var want = try std.json.parseFromSliceLeaky(std.json.Value, arena, expected, .{});
+    if (want.object.getPtr("result")) |wr| {
+        const got_result: ?*std.json.Value = if (got == .object) got.object.getPtr("result") else null;
+        const gr: ?*std.json.Value = if (got_result) |r| (if (r.* == .object) r else null) else null;
+        for (drop_expected) |k| {
+            try testing.expect(wr.object.orderedRemove(k));
+            if (gr) |r| _ = r.object.orderedRemove(k);
+        }
+        if (wr.object.get("_meta") == null) {
+            if (gr) |r| _ = r.object.orderedRemove("_meta");
+        }
+    }
+    if (!jsonValueEql(got, want)) {
+        std.debug.print("\n got: {s}\nwant: {s}\n", .{ line, expected });
+        return error.TestExpectedEqual;
+    }
+}
+
+/// Feed one message and return our reply line (caller frees).
+fn replyTo(s: *Server, msg: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try s.handleMessage(msg, &aw.writer);
+    return aw.toOwnedSlice();
+}
+
+/// The `_meta` every modern request in these tests carries, minus the
+/// closing brace so a test can add members. `clientCapabilities` is `{}`.
+const modern_meta_open =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ExampleClient","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}
+;
+
+fn specWeatherHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    const loc = call.strArg("location") orelse return call.fail("missing 'location'");
+    call.print("Current weather in {s}:\nTemperature: 72°F\nConditions: Partly cloudy", .{loc});
+    return false;
+}
+
+/// The `get_weather` tool exactly as schema/2026-07-28's ListToolsResult
+/// example describes it.
+const spec_weather_tool = Tool{
+    .name = "get_weather",
+    .title = "Weather Information Provider",
+    .description = "Get current weather information for a location",
+    .input_schema =
+    \\{"type":"object","properties":{"location":{"type":"string","description":"City name or zip code"}},"required":["location"]}
+    ,
+    .icons = &.{.{ .src = "https://example.com/weather-icon.png", .mime_type = "image/png", .sizes = &.{"48x48"} }},
+    .handler = &specWeatherHandler,
+};
+
+fn specMainRsHandler(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    _ = ctx;
+    req.text(req.uri, "text/x-rust", "fn main() {\n    println!(\"Hello world!\");\n}");
+    return true;
+}
+
+fn specMainRsPrivateHandler(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    if (!specMainRsHandler(ctx, req)) return false;
+    req.cache = .{ .ttl_ms = 60000, .scope = .private };
+    return true;
+}
+
+fn specCodeReviewHandler(ctx: ?*anyopaque, req: *PromptRequest) bool {
+    _ = ctx;
+    const code = req.strArg("code") orelse return false;
+    req.printMessage(.user, "Please review this Python code:\n{s}", .{code});
+    return true;
+}
+
+const spec_discover_request =
+    \\{
+    \\  "jsonrpc": "2.0",
+    \\  "id": "discover-1",
+    \\  "method": "server/discover",
+    \\  "params": {
+    \\    "_meta": {
+    \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    \\      "io.modelcontextprotocol/clientInfo": {
+    \\        "name": "ExampleClient",
+    \\        "version": "1.0.0"
+    \\      },
+    \\      "io.modelcontextprotocol/clientCapabilities": {}
+    \\    }
+    \\  }
+    \\}
+;
+
+test "2026-07-28 anchor: server/discover (schema example + discover.mdx example)" {
+    var s = Server.init(testing.allocator, .{ .name = "ExampleServer", .version = "1.0.0" });
+    defer s.deinit();
+    try s.addTool(spec_weather_tool);
+    try s.addResource(.{ .uri = "file:///project/src/main.rs", .name = "main.rs", .handler = &specMainRsHandler });
+    s.list_cache = .{ .ttl_ms = 3600000, .scope = .public };
+
+    // schema/2026-07-28/examples/DiscoverResultResponse/discover-result-response.json
+    try expectSpecResponse(&s, spec_discover_request,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "discover-1",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "supportedVersions": ["2026-07-28"],
+        \\    "capabilities": {
+        \\      "tools": {},
+        \\      "resources": {}
+        \\    },
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/serverInfo": {
+        \\        "name": "ExampleServer",
+        \\        "version": "1.0.0"
+        \\      }
+        \\    },
+        \\    "ttlMs": 3600000,
+        \\    "cacheScope": "public"
+        \\  }
+        \\}
+    , &.{"supportedVersions"});
+
+    // docs/specification/2026-07-28/server/discover.mdx "Response" (adds
+    // `instructions`).
+    s.info.instructions = "This server provides weather and resource utilities.";
+    try expectSpecResponse(&s, spec_discover_request,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "discover-1",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "supportedVersions": ["2026-07-28"],
+        \\    "capabilities": {
+        \\      "tools": {},
+        \\      "resources": {}
+        \\    },
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/serverInfo": {
+        \\        "name": "ExampleServer",
+        \\        "version": "1.0.0"
+        \\      }
+        \\    },
+        \\    "instructions": "This server provides weather and resource utilities.",
+        \\    "ttlMs": 3600000,
+        \\    "cacheScope": "public"
+        \\  }
+        \\}
+    , &.{"supportedVersions"});
+
+    // The dropped member, pinned: a dual-era server lists every revision it
+    // speaks, stateless first.
+    const line = try replyTo(&s, spec_discover_request);
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line,
+        \\"supportedVersions":["2026-07-28","2025-11-25","2025-06-18"]
+    ) != null);
+}
+
+test "2026-07-28 anchor: tools/list and tools/call (schema examples)" {
+    var s = Server.init(testing.allocator, .{ .name = "ExampleServer", .version = "1.0.0" });
+    defer s.deinit();
+    try s.addTool(spec_weather_tool);
+    s.list_cache = .{ .ttl_ms = 3600000, .scope = .public };
+
+    // ListToolsRequest/list-tools-request.json → ListToolsResultResponse/list-tools-result-response.json
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-tools-example",
+        \\  "method": "tools/list",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-tools-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "tools": [
+        \\      {
+        \\        "name": "get_weather",
+        \\        "title": "Weather Information Provider",
+        \\        "description": "Get current weather information for a location",
+        \\        "inputSchema": {
+        \\          "type": "object",
+        \\          "properties": {
+        \\            "location": {
+        \\              "type": "string",
+        \\              "description": "City name or zip code"
+        \\            }
+        \\          },
+        \\          "required": ["location"]
+        \\        },
+        \\        "icons": [
+        \\          {
+        \\            "src": "https://example.com/weather-icon.png",
+        \\            "mimeType": "image/png",
+        \\            "sizes": ["48x48"]
+        \\          }
+        \\        ]
+        \\      }
+        \\    ],
+        \\    "nextCursor": "next-page-cursor",
+        \\    "ttlMs": 3600000,
+        \\    "cacheScope": "public"
+        \\  }
+        \\}
+    , &.{"nextCursor"});
+
+    // CallToolRequest/call-tool-request.json → CallToolResultResponse/call-tool-result-response.json
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "call-tool-example",
+        \\  "method": "tools/call",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    },
+        \\    "name": "get_weather",
+        \\    "arguments": {
+        \\      "location": "New York"
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "call-tool-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "content": [
+        \\      {
+        \\        "type": "text",
+        \\        "text": "Current weather in New York:\nTemperature: 72°F\nConditions: Partly cloudy"
+        \\      }
+        \\    ],
+        \\    "isError": false
+        \\  }
+        \\}
+    , &.{});
+}
+
+test "2026-07-28 anchor: resources/list, resources/templates/list, resources/read (schema examples)" {
+    var s = Server.init(testing.allocator, .{ .name = "ExampleServer", .version = "1.0.0" });
+    defer s.deinit();
+    try s.addResource(.{
+        .uri = "file:///project/src/main.rs",
+        .name = "main.rs",
+        .title = "Rust Software Application Main File",
+        .description = "Primary application entry point",
+        .mime_type = "text/x-rust",
+        .icons = &.{.{ .src = "https://example.com/rust-file-icon.png", .mime_type = "image/png", .sizes = &.{"48x48"} }},
+        .handler = &specMainRsPrivateHandler,
+    });
+    try s.addResourceTemplate(.{
+        .uri_template = "file:///{path}",
+        .name = "Project Files",
+        .title = "Project Files",
+        .description = "Access files in the project directory",
+        .mime_type = "application/octet-stream",
+        .icons = &.{.{ .src = "https://example.com/folder-icon.png", .mime_type = "image/png", .sizes = &.{"48x48"} }},
+    });
+
+    // ListResourcesRequest → ListResourcesResultResponse
+    s.list_cache = .{ .ttl_ms = 600000, .scope = .private };
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-resources-example",
+        \\  "method": "resources/list",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-resources-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "resources": [
+        \\      {
+        \\        "uri": "file:///project/src/main.rs",
+        \\        "name": "main.rs",
+        \\        "title": "Rust Software Application Main File",
+        \\        "description": "Primary application entry point",
+        \\        "mimeType": "text/x-rust",
+        \\        "icons": [
+        \\          {
+        \\            "src": "https://example.com/rust-file-icon.png",
+        \\            "mimeType": "image/png",
+        \\            "sizes": ["48x48"]
+        \\          }
+        \\        ]
+        \\      }
+        \\    ],
+        \\    "nextCursor": "eyJwYWdlIjogM30=",
+        \\    "ttlMs": 600000,
+        \\    "cacheScope": "private"
+        \\  }
+        \\}
+    , &.{"nextCursor"});
+
+    // ListResourceTemplatesRequest → ListResourceTemplatesResultResponse
+    s.list_cache = .{ .ttl_ms = 3600000, .scope = .public };
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-resource-templates-example",
+        \\  "method": "resources/templates/list",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-resource-templates-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "resourceTemplates": [
+        \\      {
+        \\        "uriTemplate": "file:///{path}",
+        \\        "name": "Project Files",
+        \\        "title": "Project Files",
+        \\        "description": "Access files in the project directory",
+        \\        "mimeType": "application/octet-stream",
+        \\        "icons": [
+        \\          {
+        \\            "src": "https://example.com/folder-icon.png",
+        \\            "mimeType": "image/png",
+        \\            "sizes": ["48x48"]
+        \\          }
+        \\        ]
+        \\      }
+        \\    ],
+        \\    "ttlMs": 3600000,
+        \\    "cacheScope": "public"
+        \\  }
+        \\}
+    , &.{});
+
+    // ReadResourceRequest/read-resource-request.json →
+    // ReadResourceResultResponse/read-resource-result-response-with-ttl.json.
+    // The two files use different ids; the request's `id` is changed to the
+    // response's, nothing else. The TTL comes from the handler overriding the
+    // server default (`ResourceRequest.cache`).
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "read-resource-with-ttl-example",
+        \\  "method": "resources/read",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    },
+        \\    "uri": "file:///project/src/main.rs"
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "read-resource-with-ttl-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "contents": [
+        \\      {
+        \\        "uri": "file:///project/src/main.rs",
+        \\        "mimeType": "text/x-rust",
+        \\        "text": "fn main() {\n    println!(\"Hello world!\");\n}"
+        \\      }
+        \\    ],
+        \\    "ttlMs": 60000,
+        \\    "cacheScope": "private"
+        \\  }
+        \\}
+    , &.{});
+
+    // server/resources.mdx "Error Handling": the not-found error, compacted —
+    // -32602 with data.uri, never the session path's -32002.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{
+    ++ modern_meta_open ++
+        \\},"uri":"file:///nonexistent.txt"}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Resource not found","data":{"uri":"file:///nonexistent.txt"}}}
+        \\
+    );
+    // The session path keeps its revision's code.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"file:///nonexistent.txt"}}
+    ,
+        \\{"jsonrpc":"2.0","id":6,"error":{"code":-32002,"message":"Resource not found"}}
+        \\
+    );
+}
+
+test "2026-07-28 anchor: prompts/list and prompts/get (schema examples)" {
+    var s = Server.init(testing.allocator, .{ .name = "ExampleServer", .version = "1.0.0" });
+    defer s.deinit();
+    try s.addPrompt(.{
+        .name = "code_review",
+        .title = "Request Code Review",
+        .description = "Asks the LLM to analyze code quality and suggest improvements",
+        .arguments = &.{.{ .name = "code", .description = "The code to review", .required = true }},
+        .icons = &.{.{ .src = "https://example.com/review-icon.svg", .mime_type = "image/svg+xml", .sizes = &.{"any"} }},
+        .handler = &specCodeReviewHandler,
+    });
+    s.list_cache = .{ .ttl_ms = 600000, .scope = .public };
+
+    // ListPromptsRequest → ListPromptsResultResponse
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-prompts-example",
+        \\  "method": "prompts/list",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "list-prompts-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "prompts": [
+        \\      {
+        \\        "name": "code_review",
+        \\        "title": "Request Code Review",
+        \\        "description": "Asks the LLM to analyze code quality and suggest improvements",
+        \\        "arguments": [
+        \\          {
+        \\            "name": "code",
+        \\            "description": "The code to review",
+        \\            "required": true
+        \\          }
+        \\        ],
+        \\        "icons": [
+        \\          {
+        \\            "src": "https://example.com/review-icon.svg",
+        \\            "mimeType": "image/svg+xml",
+        \\            "sizes": ["any"]
+        \\          }
+        \\        ]
+        \\      }
+        \\    ],
+        \\    "nextCursor": "next-page-cursor",
+        \\    "ttlMs": 600000,
+        \\    "cacheScope": "public"
+        \\  }
+        \\}
+    , &.{"nextCursor"});
+
+    // GetPromptRequest → GetPromptResultResponse. The two examples describe
+    // the prompt differently ("Asks the LLM…" in the list, "Code review
+    // prompt" in the get); this module has one description per prompt, so the
+    // get runs against a registration carrying the get example's.
+    s.prompts.items[0].description = "Code review prompt";
+    try expectSpecResponse(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "get-prompt-example",
+        \\  "method": "prompts/get",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    },
+        \\    "name": "code_review",
+        \\    "arguments": {
+        \\      "code": "def hello():\n    print('world')"
+        \\    }
+        \\  }
+        \\}
+    ,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "get-prompt-example",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "description": "Code review prompt",
+        \\    "messages": [
+        \\      {
+        \\        "role": "user",
+        \\        "content": {
+        \\          "type": "text",
+        \\          "text": "Please review this Python code:\ndef hello():\n    print('world')"
+        \\        }
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    , &.{});
+}
+
+test "2026-07-28: UnsupportedProtocolVersionError lists every revision and echoes the request" {
+    var s = testServer(null);
+    defer s.deinit();
+    // schema example UnsupportedProtocolVersionError/unsupported-version.json
+    // is this line with `supported` = ["2026-07-28","2025-11-25"]: a
+    // different server's list, not a different shape.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28","2025-11-25","2025-06-18"],"requested":"1900-01-01"}}}
+        \\
+    );
+    // A session revision named in `_meta` is not a stateless one: it is
+    // reached through `initialize`, and the refusal says which ones exist.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28","2025-11-25","2025-06-18"],"requested":"2025-11-25"}}}
+        \\
+    );
+    // The requested string is escaped, not spliced.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"a\"b\n","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28","2025-11-25","2025-06-18"],"requested":"a\"b\n"}}}
+        \\
+    );
+}
+
+test "2026-07-28: malformed per-request metadata is -32602; removed methods are -32601" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Missing the required clientCapabilities.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Missing io.modelcontextprotocol/clientCapabilities"}}
+        \\
+    );
+    // Wrong types for both required fields.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728,"io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid io.modelcontextprotocol/protocolVersion"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":[]}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid io.modelcontextprotocol/clientCapabilities"}}
+        \\
+    );
+    // Malformed is reported before an unknown version.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Missing io.modelcontextprotocol/clientCapabilities"}}
+        \\
+    );
+    // server/discover without the version is a malformed modern request.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"server/discover"}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Missing io.modelcontextprotocol/protocolVersion"}}
+        \\
+    );
+    // `ping` does not exist in 2026-07-28 …
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"ping\",\"params\":{" ++ modern_meta_open ++ "}}}",
+        \\{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    );
+    // … and still answers on the session path.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":7,"result":{}}
+        \\
+    );
+    // `initialize` is the session opener whatever its `_meta` says.
+    const line = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"," ++ modern_meta_open ++ "}}}");
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.startsWith(u8, line, "{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{\"protocolVersion\":\"2025-11-25\""));
+    // A request whose `_meta` has no protocolVersion stays on the session
+    // path — session clients send `_meta` too (progressToken).
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\",\"params\":{\"_meta\":{\"progressToken\":1}}}",
+        \\{"jsonrpc":"2.0","id":9,"result":{}}
+        \\
+    );
+}
+
+test "2026-07-28: a modern tools/call result carries resultType and serverInfo; the session one does not" {
+    var app = TestApp{};
+    var s = testServer(&app);
+    defer s.deinit();
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"}," ++ modern_meta_open ++ "}}}",
+        \\{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"{\"echo\":\"hi\",\"calls\":1}"}],"structuredContent":{"echo":"hi","calls":1},"isError":false,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"test-srv","version":"1.2.3"}}}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"echo\":\"hi\",\"calls\":2}"}],"structuredContent":{"echo":"hi","calls":2},"isError":false}}
+        \\
+    );
+    // `title` set → serverInfo carries it.
+    s.info.title = "Test Server";
+    const line = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/list\",\"params\":{" ++ modern_meta_open ++ "}}}");
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.endsWith(u8, line,
+        \\"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"test-srv","title":"Test Server","version":"1.2.3"}},"ttlMs":0,"cacheScope":"private"}}
+        \\
+    ));
+}
+
+const ModernProbe = struct {
+    elicitation: bool = false,
+    sampling: bool = false,
+    version: []const u8 = "",
+    client_name: [32]u8 = @splat(0),
+    client_name_len: usize = 0,
+    send_result: ?SendError!u64 = null,
+};
+
+fn modernProbeHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const p: *ModernProbe = @ptrCast(@alignCast(ctx.?));
+    const caps = call.clientCapabilities();
+    p.elicitation = caps.elicitation;
+    p.sampling = caps.sampling;
+    p.version = call.protocolVersion();
+    if (call.clientInfo()) |ci| {
+        p.client_name_len = @min(ci.name.len, p.client_name.len);
+        @memcpy(p.client_name[0..p.client_name_len], ci.name[0..p.client_name_len]);
+    }
+    p.send_result = call.requestElicitation(.{ .form = .{
+        .message = "Your name?",
+        .requested_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}",
+    } }, .{});
+    call.write("ok");
+    return false;
+}
+
+test "2026-07-28: capabilities come from the request's _meta, never from (or into) a session" {
+    var probe = ModernProbe{};
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "probe", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &modernProbeHandler, .ctx = &probe });
+
+    // A session on peer 0 that declared nothing.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}", &aw.writer);
+    aw.clearRetainingCapacity();
+
+    // A modern request on the same peer declaring elicitation.
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ModernClient","version":"2"},"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}
+    , &aw.writer);
+    try testing.expect(probe.elicitation);
+    try testing.expect(!probe.sampling);
+    try testing.expectEqualStrings("2026-07-28", probe.version);
+    try testing.expectEqualStrings("ModernClient", probe.client_name[0..probe.client_name_len]);
+    // No server→client request exists in that revision — the declared
+    // capability does not change that, and nothing went on the wire or into
+    // the pending table.
+    try testing.expectError(error.StatelessRequest, probe.send_result.?);
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "elicitation/create") == null);
+    // The session's gate did not move.
+    try testing.expect(!s.clientCapabilities(0).elicitation);
+    try testing.expectEqual(@as(usize, 1), s.peers.items.len);
+
+    // And a modern request on a peer that never handshook creates no state.
+    aw.clearRetainingCapacity();
+    try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\"," ++ modern_meta_open ++ "}}}", &aw.writer, 77);
+    try testing.expect(!probe.elicitation);
+    try testing.expectEqual(@as(usize, 1), s.peers.items.len);
+}
+
+fn arrayOutHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.write("[1,2]");
+    return false;
+}
+
+test "2026-07-28: non-object structuredContent only for a modern call to a tool with an outputSchema" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "typed", .description = "d", .input_schema = "{\"type\":\"object\"}", .output_schema = "{\"type\":\"array\"}", .handler = &arrayOutHandler });
+    try s.addTool(.{ .name = "untyped", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = &arrayOutHandler });
+
+    const Case = struct { tool: []const u8, modern: bool, structured: bool };
+    const cases = [_]Case{
+        .{ .tool = "typed", .modern = true, .structured = true },
+        .{ .tool = "typed", .modern = false, .structured = false }, // session revisions: objects only
+        .{ .tool = "untyped", .modern = true, .structured = false }, // no schema: text stays text
+        .{ .tool = "untyped", .modern = false, .structured = false },
+    };
+    for (cases) |c| {
+        var buf: [512]u8 = undefined;
+        const msg = if (c.modern)
+            try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s}}}}}}}", .{ c.tool, modern_meta_open })
+        else
+            try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\"}}}}", .{c.tool});
+        const line = try replyTo(&s, msg);
+        defer testing.allocator.free(line);
+        try testing.expectEqual(c.structured, std.mem.indexOf(u8, line, "\"structuredContent\":[1,2]") != null);
+        try testing.expect(c.structured or std.mem.indexOf(u8, line, "structuredContent") == null);
+    }
+}
+
+fn decliningCacheTemplate(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    _ = ctx;
+    req.cache = .{ .ttl_ms = 999, .scope = .public };
+    req.text(req.uri, "", "partial");
+    return false;
+}
+
+fn acceptingTemplate(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    _ = ctx;
+    req.text(req.uri, "", "body");
+    return true;
+}
+
+test "2026-07-28: resources/read caching hint — server default, and a declining template's hint is discarded" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "x:///a/{p}", .name = "a", .handler = &decliningCacheTemplate });
+    try s.addResourceTemplate(.{ .uri_template = "x:///b/{p}", .name = "b", .handler = &acceptingTemplate });
+    s.read_cache = .{ .ttl_ms = 5, .scope = .private };
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"x:///q\"," ++ modern_meta_open ++ "}}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","contents":[{"uri":"x:///q","text":"body"}],"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"srv","version":"1"}},"ttlMs":5,"cacheScope":"private"}}
+        \\
+    );
+    // The session path has no caching fields at all.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"x:///q\"}}",
+        \\{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"x:///q","text":"body"}]}}
+        \\
+    );
+}
+
+test "tools/list: title, icons and annotations are emitted when set (session path too)" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "t",
+        .title = "T",
+        .description = "d",
+        .input_schema = "{\"type\":\"object\"}",
+        .icons = &.{.{ .src = "https://e.example/i.png", .mime_type = "image/png", .sizes = &.{"48x48"}, .theme = .dark }},
+        .annotations = .{ .read_only_hint = true, .destructive_hint = false },
+        .handler = &plainTextHandler,
+    });
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"t","title":"T","icons":[{"src":"https://e.example/i.png","mimeType":"image/png","sizes":["48x48"],"theme":"dark"}],"description":"d","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false}}]}}
+        \\
+    );
+}
+
+test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (canary)" {
+    // Both directions, as the session canary: every method a modern request
+    // may call is anchored here, and nothing here is unreachable statelessly.
+    inline for (std.meta.fields(DispatchMethod)) |f| {
+        const m: DispatchMethod = @enumFromInt(f.value);
+        var found = false;
+        for (modern_spec_anchor_index) |a| {
+            if (eql(a.method, f.name)) found = true;
+        }
+        testing.expectEqual(m.servedStatelessly(), found) catch {
+            std.debug.print("servedStatelessly/anchor mismatch: {s}\n", .{f.name});
+            return error.TestUnexpectedResult;
+        };
+    }
+    for (modern_spec_anchor_index, 0..) |a, i| {
+        const m = std.meta.stringToEnum(DispatchMethod, a.method) orelse return error.TestUnexpectedResult;
+        try testing.expect(m.servedStatelessly());
+        for (modern_spec_anchor_index[i + 1 ..]) |b| try testing.expect(!eql(a.method, b.method));
+        if (a.anchor != .literal_example) try testing.expect(a.reason.len != 0);
+    }
+    var literal: usize = 0;
+    for (modern_spec_anchor_index) |a| {
+        if (a.anchor == .literal_example) literal += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), literal);
+    try testing.expectEqual(@as(usize, 8), modern_spec_anchor_index.len);
 }

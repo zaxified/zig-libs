@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **MCP spec 2026-07-28, served alongside the `initialize` revisions** (plan M1–M4 in
+  SPEC.md). A request whose `params._meta` carries `io.modelcontextprotocol/protocolVersion` is served
+  statelessly: capabilities and client identity from that `_meta` (`ModernRequest`, reached through
+  `ToolCall.modern`; `call.clientCapabilities()`/`clientInfo()` read it, new `call.protocolVersion()`),
+  results with `resultType` and `_meta.io.modelcontextprotocol/serverInfo`, `ttlMs`/`cacheScope` on
+  `server/discover`, the list methods and `resources/read` (new `CacheHint`, `Server.list_cache`,
+  `Server.read_cache`, `ResourceRequest.cache`; default 0 ms / private). New `server/discover`. Refusals:
+  malformed `_meta` -32602, unknown revision -32022 with `data.supported`/`requested`, `ping` and the
+  handshake -32601, missing resource -32602 with `data.uri`. New constants `modern_protocol_version`,
+  `modern_versions`, `all_versions`, `meta_key`, `error_code.{header_mismatch, missing_required_client_capability,
+  unsupported_protocol_version}`; `DispatchMethod.servedStatelessly`, `modern_spec_anchor_index`.
+  ⚠ `SendError` gains `StatelessRequest` (a modern tool call cannot send a server→client request): an
+  exhaustive `switch` over `SendError` needs the arm. Also new, in both eras: optional `title`/`icons` on
+  `Tool`/`Resource`/`ResourceTemplate`/`Prompt` (`Icon`) and `Tool.annotations` (`ToolAnnotations`); a
+  modern call to a tool with an `output_schema` may return any JSON value as `structuredContent`.
+  Session-path replies are byte-identical to before.
+
 - **2026-09-28** — `initialize`'s `clientInfo` (`name`, `version`, optional `title`) is now
   recorded per peer, requested by ttydesk (2026-09-27): previously only `capabilities` and the
   negotiated version were kept in `PeerState`, so a server that wants to name which client made

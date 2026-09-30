@@ -17,6 +17,36 @@ MCP spec 2025-11-25.
 
 ## Protocol surface
 
+**Two protocol eras on one server.** MCP 2026-07-28 made the protocol stateless:
+no `initialize`, every request states its revision and the client's capabilities
+in `params._meta`. This server speaks both eras at once, per request (the spec's
+"dual-era server"):
+
+- A request whose `_meta` carries `io.modelcontextprotocol/protocolVersion` is a
+  **2026-07-28 request**. It is served on its own; nothing is read from or written
+  to the peer's session state. Its result carries `resultType: "complete"` and
+  `_meta["io.modelcontextprotocol/serverInfo"]`; `server/discover`, the four list
+  methods and `resources/read` also carry `ttlMs` + `cacheScope`
+  (`Server.list_cache`, `Server.read_cache`, per read `ResourceRequest.cache`;
+  default `0` / `"private"`, i.e. "do not cache"). `server/discover` answers
+  with every revision this server speaks. A missing or mistyped required `_meta`
+  field is `-32602`; a revision outside `modern_versions` is `-32022`
+  (`UnsupportedProtocolVersionError`, listing the supported ones); `ping` and the
+  handshake are `-32601`; a missing resource is `-32602` with `data.uri`.
+  Inside a tool, `call.clientCapabilities()` / `call.clientInfo()` /
+  `call.protocolVersion()` report the request's own `_meta`, and
+  `requestSampling` / `requestElicitation` return `error.StatelessRequest`
+  (that revision replaced server→client requests with the multi round-trip
+  pattern, not implemented yet).
+- **Every other request** takes the `initialize`-session path described below,
+  byte-for-byte as before.
+
+`Tool`, `Resource`, `ResourceTemplate` and `Prompt` take optional `title` and
+`icons`; `Tool` also takes `annotations` (`readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint`). They are emitted in both eras when set.
+
+Session path:
+
 - `initialize` — **protocol-version negotiation** (echoes the client's
   requested revision when supported — `2025-11-25`, `2025-06-18` — else
   answers with the latest) + server capabilities (`tools`, `listChanged:
