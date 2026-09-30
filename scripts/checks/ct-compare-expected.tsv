@@ -28,6 +28,7 @@ modules/iec62351/src/goose.zig	5	2
 modules/jwe/src/enc.zig	1	0
 modules/jwt/src/cache.zig	1	7
 modules/jwt/src/root.zig	1	30
+modules/mcp/src/root.zig	1	8
 modules/megolm/src/cipher.zig	1	1
 modules/minisign/src/root.zig	1	19
 modules/mls/src/keyschedule.zig	2	14
