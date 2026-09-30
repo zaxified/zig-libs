@@ -4,7 +4,8 @@
 //! `lockfree.MpmcQueue`. A closed roster of `std.Thread`s pulls type-erased
 //! jobs off a shared Michael-Scott queue and runs them; the pool owns its
 //! threads and offers a clean lifecycle: `init` → `submit`/`Submitter.submit`
-//! → `drain` (graceful) or `shutdownNow` (abrupt) → `deinit`.
+//! → `drain` (graceful) or `shutdownNow` (abrupt) → `deinit`. `wait` blocks
+//! until the pool is idle without shutting it down.
 //!
 //! This is the execution substrate for the P2 write-behind data-layer
 //! coordinator (DL5): it submits "flush this dirty entry to the sink" jobs and
@@ -244,6 +245,15 @@ pub const WorkerPool = struct {
     submitted: std.atomic.Value(u64) = .init(0),
     completed: std.atomic.Value(u64) = .init(0),
 
+    /// `wait` callers blocked (or about to block) on `done_gen`. A worker
+    /// finishing a job bumps `done_gen` and wakes only when this is nonzero,
+    /// so a pool nobody waits on pays one load per job and no syscall.
+    waiters: std.atomic.Value(usize) = .init(0),
+    /// Completion generation for `wait`: bumped after a job completes while a
+    /// waiter is registered, and after a shutdown. Waiters park on a
+    /// snapshot of it (same compare-at-entry argument as `notify`).
+    done_gen: std.atomic.Value(u32) = .init(0),
+
     /// `JobBox`es handed out by `boxes` and not yet returned to it.
     ///
     /// This exists because a leaked box is **invisible to the allocator**:
@@ -361,6 +371,45 @@ pub const WorkerPool = struct {
         for (self.workers) |*w| w.thread.join();
         self.freeQueuedBoxes();
         self.state.store(.stopped, .seq_cst);
+        // Dropped jobs will never complete: release any `wait` caller.
+        self.wakeWaiters();
+    }
+
+    /// Block until every job accepted so far has run — nothing queued,
+    /// nothing in flight — with the pool still running afterwards; it keeps
+    /// accepting work (Pithikos C-Thread-Pool's `thpool_wait`, a `WaitGroup`
+    /// over the whole pool). Returns `true` once the pool is idle, `false`
+    /// when it was shut down with `shutdownNow` instead (dropped jobs never
+    /// complete, so waiting on them would hang). After `drain` it returns
+    /// `true` at once.
+    ///
+    /// Idle means `completedCount() == submittedCount()`, observed at one
+    /// instant. Producers that keep submitting can therefore keep a waiter
+    /// waiting: pause them for a guaranteed return, as with `drain`. Any
+    /// number of threads may wait at once.
+    ///
+    /// **Never call it from a job of the same pool**: that job counts as not
+    /// yet completed, so the wait could only end by its own completion — a
+    /// deadlock. It is detected and panics instead of hanging.
+    ///
+    /// Lost-wakeup argument: the waiter registers (`waiters`) BEFORE it
+    /// snapshots `done_gen` and checks the counts; a worker increments
+    /// `completed` BEFORE it reads `waiters` (both seq_cst). So a completion
+    /// the check missed necessarily sees the registration, bumps `done_gen`,
+    /// and the park on the stale snapshot returns at once.
+    pub fn wait(self: *WorkerPool) bool {
+        if (current_pool == self) @panic("workerpool: wait() called from a job of the same pool (would deadlock)");
+        _ = self.waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.waiters.fetchSub(1, .seq_cst);
+        while (true) {
+            const gen = self.done_gen.load(.seq_cst);
+            if (self.completed.load(.seq_cst) == self.submitted.load(.seq_cst)) return true;
+            switch (self.state.load(.seq_cst)) {
+                .running, .draining => {},
+                .stopping_now, .stopped => return false,
+            }
+            self.io.futexWaitUncancelable(u32, &self.done_gen.raw, gen);
+        }
     }
 
     /// Stop (gracefully, if still running) and release every resource. Safe to
@@ -495,6 +544,12 @@ pub const WorkerPool = struct {
         self.io.futexWake(u32, &self.notify.raw, std.math.maxInt(u32));
     }
 
+    /// Bump the completion generation and wake every `wait` caller.
+    fn wakeWaiters(self: *WorkerPool) void {
+        _ = self.done_gen.fetchAdd(1, .seq_cst);
+        self.io.futexWake(u32, &self.done_gen.raw, std.math.maxInt(u32));
+    }
+
     /// Run one dequeued job. The box is released back to the pool BEFORE the
     /// closure runs, so a long job does not pin box storage; `func`/`ctx` are
     /// copied out first.
@@ -504,7 +559,10 @@ pub const WorkerPool = struct {
         const ctx = box.ctx;
         self.releaseBox(box);
         func(ctx);
-        _ = self.completed.fetchAdd(1, .monotonic);
+        // seq_cst, not monotonic: `wait`'s lost-wakeup argument needs this
+        // increment ordered before the `waiters` load below.
+        _ = self.completed.fetchAdd(1, .seq_cst);
+        if (self.waiters.load(.seq_cst) > 0) self.wakeWaiters();
     }
 
     /// Drain any jobs still in the queue without running them, freeing their
@@ -553,11 +611,16 @@ pub const Submitter = struct {
 ///   watchdog.
 var park_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
+/// The pool whose worker the current thread is, if any — how `wait` detects
+/// being called from one of its own jobs.
+threadlocal var current_pool: ?*const WorkerPool = null;
+
 // The worker thread body. A free function (not a method) so `std.Thread.spawn`
 // can name it; takes the stable `*Worker`.
 fn workerRun(w: *Worker) void {
     const self = w.pool;
     const p = w.participant;
+    current_pool = self;
     outer: while (true) {
         const st = self.state.load(.seq_cst);
         // Abrupt stop: drop whatever is queued, exit now (in-flight job, if
@@ -1505,4 +1568,128 @@ test "default n_workers derives from cpu count and is ≥ 1" {
 test "meta is well-formed" {
     try testing.expect(meta.platform == .any);
     try testing.expect(meta.concurrency == .threadsafe);
+}
+
+// ── wait() ───────────────────────────────────────────────────────────────────
+
+test "wait: returns at once on an idle pool, and after the work while the pool keeps running" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 3 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    try testing.expect(pool.wait()); // nothing submitted
+
+    var c = SpinCounter{};
+    for (0..200) |_| try pool.submit(.{ .func = spinIncr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 200), c.n.load(.seq_cst));
+    try testing.expectEqual(pool.submittedCount(), pool.completedCount());
+
+    // Still running: more work, another wait.
+    for (0..300) |_| try pool.submit(.{ .func = spinIncr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 500), c.n.load(.seq_cst));
+
+    // After drain, wait reports idle at once.
+    pool.drain();
+    try testing.expect(pool.wait());
+}
+
+fn waitThread(pool: *WorkerPool, out: *std.atomic.Value(u32)) void {
+    out.store(if (pool.wait()) 1 else 2, .seq_cst);
+}
+
+test "wait: several waiters at once all return" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = SpinCounter{};
+    for (0..400) |_| try pool.submit(.{ .func = spinIncr, .ctx = &c });
+    var results: [4]std.atomic.Value(u32) = @splat(.init(0));
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &results) |*t, *r| t.* = try std.Thread.spawn(.{}, waitThread, .{ pool, r });
+    for (threads) |t| t.join();
+    for (results) |r| try testing.expectEqual(@as(u32, 1), r.load(.seq_cst));
+    try testing.expectEqual(@as(u64, 400), c.n.load(.seq_cst));
+}
+
+test "wait: no lost wakeup — thousands of submit-one-then-wait rounds" {
+    // Each round leaves the waiter racing the single completion that ends it:
+    // a missed wake would park the waiter forever and trip the watchdog.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 4 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 20_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    const rounds: u64 = 5000;
+    for (0..rounds) |i| {
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        try testing.expect(pool.wait());
+        try testing.expectEqual(@as(u64, i + 1), c.n.load(.seq_cst));
+    }
+}
+
+/// A job that blocks until its gate opens — to hold a worker busy while a
+/// shutdown and a waiter race.
+const Gate = struct {
+    io: std.Io,
+    open: std.atomic.Value(u32) = .init(0),
+    entered: std.atomic.Value(u32) = .init(0),
+};
+fn gatedJob(ctx: *anyopaque) void {
+    const g: *Gate = @ptrCast(@alignCast(ctx));
+    g.entered.store(1, .seq_cst);
+    g.io.futexWake(u32, &g.entered.raw, std.math.maxInt(u32));
+    while (g.open.load(.seq_cst) == 0) g.io.futexWaitUncancelable(u32, &g.open.raw, 0);
+}
+
+fn shutdownThread(pool: *WorkerPool) void {
+    pool.shutdownNow();
+}
+
+test "wait: shutdownNow releases a waiter with false instead of hanging on dropped jobs" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var gate = Gate{ .io = io };
+    var c = Counter{};
+    try pool.submit(.{ .func = gatedJob, .ctx = &gate });
+    for (0..50) |_| try pool.submit(.{ .func = incr, .ctx = &c }); // queued behind the gate
+    while (gate.entered.load(.seq_cst) == 0) io.futexWaitUncancelable(u32, &gate.entered.raw, 0);
+
+    var result = std.atomic.Value(u32).init(0);
+    const waiter = try std.Thread.spawn(.{}, waitThread, .{ pool, &result });
+    const stopper = try std.Thread.spawn(.{}, shutdownThread, .{pool});
+    // shutdownNow needs the in-flight job to finish before it can join.
+    while (pool.state.load(.seq_cst) == .running) std.atomic.spinLoopHint();
+    gate.open.store(1, .seq_cst);
+    io.futexWake(u32, &gate.open.raw, std.math.maxInt(u32));
+    stopper.join();
+    waiter.join();
+
+    try testing.expectEqual(@as(u32, 2), result.load(.seq_cst)); // false: shut down
+    try testing.expect(pool.completedCount() < pool.submittedCount()); // jobs were dropped
+    try testing.expect(!pool.wait()); // and a later wait says so at once
 }

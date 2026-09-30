@@ -45,6 +45,12 @@ pool.drain();              // stop accepting; run everything queued; join
   **own** EBR participant, for **lock-free concurrent** enqueue (genuinely
   exercises the MS-queue's multi-producer side). Bounded by
   `Options.max_submitters`; release with `Submitter.deinit`.
+- `WorkerPool.wait() bool` — block until every accepted job has run (nothing
+  queued, nothing in flight) and **keep the pool running** — the
+  batch-then-barrier pattern. `true` once idle, `false` if `shutdownNow` dropped
+  jobs instead. Producers must pause for a guaranteed return (as for `drain`);
+  never call it from one of the pool's own jobs (it panics rather than
+  deadlocks).
 - `WorkerPool.drain()` — **graceful**: stop accepting, run every already-queued
   and in-flight job, join all workers. After it returns the queue is empty and
   every submitted job has run.

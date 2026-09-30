@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **New `WorkerPool.wait() bool`: block until the pool is idle without shutting it
+  down** (Pithikos `thpool_wait`). Waiters park on their own futex word; a worker wakes them only when
+  one is registered, so a pool nobody waits on pays one extra load per job. `false` after a
+  `shutdownNow` that dropped jobs; a call from one of the pool's own jobs panics (it would deadlock).
+  `completed` is now incremented seq_cst (was monotonic) — the lost-wakeup argument needs it.
+
 - **2026-09-25** — **New `Options.spin_ns`: a worker keeps looking before it parks.** With short
   jobs every job paid a `futexWake` and a park (two futex syscalls per job, measured by an
   embedder). A worker that finds the queue empty now watches for a submit for up to `spin_ns`
