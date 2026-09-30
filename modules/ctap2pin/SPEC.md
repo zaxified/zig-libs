@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go / Rust client libraries (e.g. [mohammadv184/go-fido2](https://github.com/mohammadv184/go-fido2), MIT, 6 stars) | Go, Rust | mixed | small | 2026 | Small, young client projects with the same protocol pair and the command layer *(inferred)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No CTAP. AES-CBC is absent from std (this module carries its own). |
 
-**Where we are ahead:** of Zig `std` and any Zig ecosystem library we know of, both protocols with both sides' primitives usable (platform `encapsulate`, plus `ecdhZ`/`kdf` for an authenticator), RNG-agnostic and deterministic by design, every primitive anchored to NIST/RFC vectors and the framing byte-exact to a captured python-fido2 run; a real API gap (`authenticate` keyed by a `pinUvAuthToken`) surfaced by that anchoring and fixed. **Where we are behind:** the `clientPin` command layer (set/change PIN, tokens with permissions, retries) and the CTAP2 CBOR/HID transport beneath it; both references ship those.
+**Where we are ahead:** of Zig `std` and any Zig ecosystem library we know of, both protocols with both sides' primitives usable (platform `encapsulate`, plus `ecdhZ`/`kdf` for an authenticator), RNG-agnostic and deterministic by design, every primitive anchored to NIST/RFC vectors and the framing byte-exact to a captured python-fido2 run; a real API gap (`authenticate` keyed by a `pinUvAuthToken`) surfaced by that anchoring and fixed. **Where we are behind:** nothing at this layer; the `clientPin` command layer and CTAPHID framing the references bundle live in the sibling `ctap2` (2026-09-30).
 
 ## Design
 
@@ -142,8 +142,9 @@ updated; behavior for shared-secret keys is bit-for-bit unchanged.
 
 ## Non-goals
 
-- CBOR / COSE_Key codecs and the `clientPin` command framing (a future
-  `ctap2` module's job; this module is the pure crypto layer beneath it).
+- CBOR / COSE_Key codecs and the `clientPin` command framing (the sibling
+  `ctap2` module's job since 2026-09-30; this module is the pure crypto layer
+  beneath it).
 - PIN policy (hashing, retries, `pinUvAuthToken` state machines).
 - Protocol One's platform-side per-command key regeneration policy
   (callers regenerate by supplying a fresh scalar).
@@ -161,5 +162,5 @@ updated; behavior for shared-secret keys is bit-for-bit unchanged.
 
 ## Backlog / deferred
 
-- **`clientPin` command layer (getPinToken, getPinUvAuthTokenUsingPinWithPermissions, setPIN, changePIN, retries) over a caller-supplied CBOR/transport** (survey 2026-09-30). python-fido2 and libfido2 users get PIN handling in one call; here they get the primitives only. The SPEC's Non-goals place it in a future `ctap2` module (none exists in the catalogue), so this is a new-module question, not a defect of this one. Effort: medium-large incl. CTAPHID. Fits §2 (transport I/O would be the caller's).
+- ~~**`clientPin` command layer**~~ *(survey 2026-09-30)* — **DONE 2026-09-30 as the new module `ctap2`** (every clientPIN subcommand over both protocols, getInfo, CTAPHID framing; its request bytes asserted equal to python-fido2's). This module stays the crypto layer beneath it.
 

@@ -335,6 +335,7 @@ const module_list = [_]Module{
     .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "otp", .libs = &.{"crypto"}, .deps = &.{"base32"}, .test_deps = &.{"testkit"} },
     .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"} },
+    .{ .name = "ctap2", .libs = &.{"crypto"}, .deps = &.{ "cbor", "ctap2pin" }, .test_deps = &.{"testkit"} },
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .test_deps = &.{"testkit"} },

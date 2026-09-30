@@ -1,0 +1,38 @@
+ctap2 — provenance note
+=======================
+
+Kept as a module-local NOTICE (same placement as the sibling `ctap2pin`).
+
+Provenance
+----------
+
+ctap2 is a clean-room implementation from the FIDO Alliance "Client to
+Authenticator Protocol (CTAP) 2.1" specification (proposed standard 2021-06-15
+with the 2022-06-21 errata): §6.4 authenticatorGetInfo, §6.5.5
+authenticatorClientPIN, §8.2 status codes and §11.2 USB HID (CTAPHID) message
+and packet structure. The specification is public; its wire layouts and
+algorithms are not copyrightable expression (merger doctrine; see
+CONVENTIONS.md §5). No reference implementation's source (python-fido2,
+libfido2, or any other) was read, ported or consulted as a design reference.
+
+Oracle note (`src/fido2_vectors.zig`, `src/oracle_test.zig`,
+`tools/gen_fido2_vectors.py`): the request bytes this module sends for every
+authenticatorClientPIN subcommand and both PIN/UV protocols are asserted equal,
+byte for byte, to those sent by Yubico's `python-fido2` SDK (version 2.2.1,
+BSD-2-Clause) run once as a black-box test oracle. Only its public API was
+driven (`fido2.ctap2.Ctap2` and `fido2.ctap2.pin.ClientPin` over a fake device
+implementing the public `fido2.ctap.CtapDevice` interface); its source was not
+consulted or copied, and no design was taken from it (root NOTICE §0's
+black-box-oracle exemption applies; this SDK usage needs no entry there). The
+captured bytes are frozen in `fido2_vectors.zig`; the test suite opens no
+socket and runs no Python. The only values injected are the platform ECDH
+scalar (via a monkeypatched `generate_private_key`) and the protocol-Two IVs
+(via a monkeypatched `os.urandom`), so that the capture is reproducible.
+
+The status-code table and the CTAPHID constants were transcribed from the
+specification text.
+
+`std.crypto` is used through the sibling modules `cbor` and `ctap2pin`
+(all cryptography and all CBOR live there).
+
+No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
