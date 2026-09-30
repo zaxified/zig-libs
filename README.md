@@ -478,7 +478,7 @@ way to recognise it.
 | [`rsa`](modules/rsa/README.md) *(crypto)* | 2 | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
 | [`sphinx`](modules/sphinx/README.md) *(crypto)* | 3 | Lightning BOLT#4 Sphinx onion routing — forward ECDH blinding chain, layered packet construction, constant-time layer peeling. | any | k256 |
 | [`tlsclient`](modules/tlsclient/README.md) *(crypto)* | 3 | std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 (no basicConstraints check). | any | x509 |
-| [`x509`](modules/x509/README.md) *(crypto)* | 2 | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates. | any | rsa, slhdsa |
+| [`x509`](modules/x509/README.md) *(crypto)* | 2 | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3). | any | rsa, slhdsa |
 | [`xml`](modules/xml/README.md) *(web)* | 3 | Namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree; DOCTYPE-reject default blocks XXE/billion-laughs/depth-bomb. Foundation for `xmldsig`/`saml` | any | — |
 
 ### Data & storage
@@ -591,7 +591,7 @@ way to recognise it.
 | [`vdf`](modules/vdf/README.md) | 3 | Wesolowski Verifiable Delay Function over an RSA hidden-order group — sequential-squaring delay with prove/verify. A caller-supplied modulus needs a trusted setup. | any | montint |
 | [`voprf`](modules/voprf/README.md) | 3 | (V)OPRF — Oblivious Pseudorandom Functions (RFC 9497), ristretto255-SHA-512: OPRF, verifiable, and partially-oblivious modes with DLEQ proofs. | any | ct25519 |
 | [`webauthn`](modules/webauthn/README.md) | 2 | WebAuthn / FIDO2 Relying-Party **verifier** (W3C Level 3) — assertion + registration ceremony checks, plus attestation verification. Verification only. | any | cbor, rsa, p256, x509 |
-| [`x509`](modules/x509/README.md) | 2 | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates. | any | rsa, slhdsa |
+| [`x509`](modules/x509/README.md) | 2 | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3). | any | rsa, slhdsa |
 | [`xmss`](modules/xmss/README.md) | 3 | XMSS (RFC 8391), single-tree SHA-256 — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first. | any | — |
 
 **Also worth reaching for from `crypto`** — these are filed under another library (in brackets), and appear here because a consumer working in `crypto` has a use for them:

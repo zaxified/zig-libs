@@ -156,6 +156,9 @@ pub const chain = @import("chain.zig");
 /// `safe.zig`'s doc comment and `SPEC.md`.
 pub const safe = @import("safe.zig");
 
+/// Certificate revocation lists (RFC 5280 §5, §6.3): parse + `checkRevocation`.
+pub const crl = @import("crl.zig");
+
 /// Re-exported at the top level for ergonomic `x509.verifyChain(...)` — the
 /// module's single most important entry point once implemented.
 pub const verifyChain = chain.verifyChain;
@@ -185,7 +188,7 @@ pub const SpkiError = safe.SpkiError;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates.",
+    .doc = "X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -208,4 +211,6 @@ test {
     _ = algorithm;
     _ = chain;
     _ = safe;
+    _ = crl;
+    _ = @import("crl_test.zig");
 }

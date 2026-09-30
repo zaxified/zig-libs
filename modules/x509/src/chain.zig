@@ -619,6 +619,144 @@ pub fn verifySlhDsaLink(
     }
 }
 
+// ── signed objects other than certificates (CRLs) ───────────────────────────
+
+/// A signed structure with the certificate's outer shape — `SEQUENCE { tbs,
+/// signatureAlgorithm, signatureValue }` — that is not a certificate: a CRL
+/// (RFC 5280 §5.1). Offsets are into `buffer`.
+pub const SignedData = struct {
+    buffer: []const u8,
+    /// The `tbs…` TLV (tag+length+content): what was signed.
+    message_slice: der.Element.Slice,
+    /// `signatureValue` BIT STRING content, unused-bits octet stripped.
+    signature_slice: der.Element.Slice,
+    /// Outer `signatureAlgorithm` OID bytes and its `parameters` TLV.
+    sig_alg_oid: []const u8,
+    sig_alg_params: ?[]const u8,
+    /// The object's issuer `Name` (RDNSequence content), which must equal
+    /// the issuer certificate's subject.
+    issuer_slice: der.Element.Slice,
+};
+
+/// Verify `data`'s signature under `issuer_der`'s key, with the same
+/// algorithm dispatch `verifyLink` applies to a certificate: ML-DSA,
+/// SLH-DSA and RSASSA-PSS here, everything std names through
+/// `Certificate.Parsed.verify`. Checks that `data`'s issuer name equals the
+/// issuer certificate's subject. Validity windows are the caller's (a CRL has
+/// thisUpdate/nextUpdate, not notBefore/notAfter).
+pub fn verifySignedBy(data: SignedData, issuer_der: CertDer) VerifyChainError!void {
+    const issuer_cert: Certificate = .{ .buffer = issuer_der, .index = 0 };
+    const issuer_shape = try parseShape(issuer_cert);
+    const data_issuer = data.buffer[data.issuer_slice.start..data.issuer_slice.end];
+    const message = data.buffer[data.message_slice.start..data.message_slice.end];
+    const signature = data.buffer[data.signature_slice.start..data.signature_slice.end];
+
+    if (algorithm.MlDsa.map.get(data.sig_alg_oid)) |set| {
+        switch (issuer_shape.pub_key_algo) {
+            .ml_dsa => |issuer_set| if (issuer_set != set) return error.CertificateSignatureAlgorithmMismatch,
+            else => return error.CertificateSignatureAlgorithmMismatch,
+        }
+        if (!std.mem.eql(u8, data_issuer, issuer_shape.subject)) return error.CertificateIssuerMismatch;
+        const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+        switch (set) {
+            inline else => |comptime_set| {
+                const Impl = algorithm.MlDsa.Impl(comptime_set);
+                if (key_bytes.len != Impl.PublicKey.encoded_length) return error.CertificatePublicKeyInvalid;
+                if (signature.len != Impl.Signature.encoded_length) return error.CertificateSignatureInvalidLength;
+                const pub_key = Impl.PublicKey.fromBytes(key_bytes[0..Impl.PublicKey.encoded_length].*) catch
+                    return error.CertificatePublicKeyInvalid;
+                const sig = Impl.Signature.fromBytes(signature[0..Impl.Signature.encoded_length].*) catch
+                    return error.CertificateSignatureInvalid;
+                sig.verify(message, pub_key) catch return error.CertificateSignatureInvalid;
+            },
+        }
+        return;
+    }
+
+    if (algorithm.SlhDsa.map.get(data.sig_alg_oid)) |set| {
+        switch (issuer_shape.pub_key_algo) {
+            .slh_dsa => |issuer_set| if (issuer_set != set) return error.CertificateSignatureAlgorithmMismatch,
+            else => return error.CertificateSignatureAlgorithmMismatch,
+        }
+        if (!std.mem.eql(u8, data_issuer, issuer_shape.subject)) return error.CertificateIssuerMismatch;
+        const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+        switch (set) {
+            inline else => |comptime_set| {
+                const Impl = algorithm.SlhDsa.Impl(comptime_set);
+                if (key_bytes.len != Impl.public_key_length) return error.CertificatePublicKeyInvalid;
+                if (signature.len != Impl.signature_length) return error.CertificateSignatureInvalidLength;
+                const pub_key = Impl.PublicKey.fromBytes(key_bytes[0..Impl.public_key_length].*);
+                if (!Impl.verify(signature, message, pub_key, "")) return error.CertificateSignatureInvalid;
+            },
+        }
+        return;
+    }
+
+    if (Certificate.AlgorithmCategory.map.get(data.sig_alg_oid) == .rsassa_pss) {
+        if (!std.mem.eql(u8, data_issuer, issuer_shape.subject)) return error.CertificateIssuerMismatch;
+        const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);
+        const params = try parsePssParams(data.sig_alg_params);
+        switch (params.hash) {
+            inline else => |h| {
+                const Hash = switch (h) {
+                    .sha1 => std.crypto.hash.Sha1,
+                    .sha224 => std.crypto.hash.sha2.Sha224,
+                    .sha256 => std.crypto.hash.sha2.Sha256,
+                    .sha384 => std.crypto.hash.sha2.Sha384,
+                    .sha512 => std.crypto.hash.sha2.Sha512,
+                };
+                rsa.verifyPss(issuer_pub_key, Hash, message, signature, params.salt_len) catch
+                    return error.CertificateSignatureInvalid;
+            },
+        }
+        return;
+    }
+
+    // Everything std names: a `Parsed` view of the signed object carrying
+    // exactly what `Parsed.verify` reads from its subject argument — issuer
+    // name, validity (made unbounded: the caller checks the object's own
+    // window), algorithm, message, signature.
+    const sig_alg = Certificate.Algorithm.map.get(data.sig_alg_oid) orelse
+        return error.CertificateSignatureAlgorithmUnsupported;
+    const subject: Certificate.Parsed = .{
+        .certificate = .{ .buffer = data.buffer, .index = 0 },
+        .issuer_slice = data.issuer_slice,
+        .subject_slice = der.Element.Slice.empty,
+        .common_name_slice = der.Element.Slice.empty,
+        .signature_slice = data.signature_slice,
+        .signature_algorithm = sig_alg,
+        .pub_key_algo = .rsaEncryption, // not read from the subject side
+        .pub_key_slice = der.Element.Slice.empty,
+        .message_slice = data.message_slice,
+        .subject_alt_name_slice = der.Element.Slice.empty,
+        .validity = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+        .version = .v3,
+    };
+    const issuer_parsed = issuer_cert.parse() catch |err| switch (err) {
+        error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, issuer_shape),
+        else => |e| return e,
+    };
+    try subject.verify(issuer_parsed, 0);
+}
+
+/// The certificate's `serialNumber` (INTEGER content) and issuer `Name`
+/// (RDNSequence content), read with the same bounded walk as path
+/// validation — for revocation lookups.
+pub fn certSerialAndIssuer(cert_der: CertDer) Certificate.ParseError!struct { serial: []const u8, issuer: []const u8 } {
+    const shape = try parseShape(.{ .buffer = cert_der, .index = 0 });
+    return .{ .serial = shape.serial, .issuer = shape.issuer };
+}
+
+/// The raw extnValue of the certificate's extension `id`, or null.
+pub fn certExtensionValue(cert_der: CertDer, id: Certificate.ExtensionId) VerifyChainError!?[]const u8 {
+    return findExtensionValue(cert_der, id);
+}
+
+/// `basicConstraints.cA` of a certificate (false when the extension is absent).
+pub fn certIsCa(cert_der: CertDer) VerifyChainError!bool {
+    return (try findBasicConstraints(cert_der)).is_ca;
+}
+
 // ── raw-DER structural walk (PSS-safe: never calls Certificate.parse) ──────
 
 /// Everything `chain.zig` needs from a certificate's structure that
@@ -634,6 +772,8 @@ pub fn verifySlhDsaLink(
 /// `signatureAlgorithm`/`signatureValue` fields extensions.zig has no need
 /// for.
 const Shape = struct {
+    /// `serialNumber` INTEGER content bytes, as encoded.
+    serial: []const u8,
     /// Raw `RDNSequence` content bytes — same convention as
     /// `Certificate.Parsed.issuer()`/`.subject()` (no outer SEQUENCE
     /// tag/length), so byte-equality comparisons between the two are valid.
@@ -741,7 +881,9 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const sig_elem = try extensions.parseElement(bytes, sig_algo.slice.end);
     const signature_slice = try parseBitStringSafe(cert, sig_elem);
 
+    if (serial_number.identifier.tag != .integer) return error.CertificateFieldHasWrongDataType;
     return .{
+        .serial = bytes[serial_number.slice.start..serial_number.slice.end],
         .issuer = bytes[issuer.slice.start..issuer.slice.end],
         .subject = bytes[subject.slice.start..subject.slice.end],
         .issuer_slice = issuer.slice,

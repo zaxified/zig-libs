@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — CRL revocation checking (maturity task B2): new `x509.crl` with `parse` and
+  `checkRevocation(crl_der, cert_der, issuer_der, .{ .now_sec })` → `.good` /
+  `.revoked{time, reason, invalidity}`. Checks structure, algorithm agreement, issuer names,
+  signature, `cRLSign`, AKI/SKI, freshness and IDP scope (partitioned CRLs such as Let's
+  Encrypt's are matched against the certificate's CRL distribution points); fails closed on
+  delta and indirect CRLs, reason-limited scopes and unknown critical extensions. New
+  `chain.verifySignedBy` (a CRL or other certificate-shaped signed object, with the same
+  algorithm dispatch as a chain link), `chain.certSerialAndIssuer`, `chain.certExtensionValue`,
+  `chain.certIsCa`. Fixtures from Python `cryptography` + OpenSSL 3.5
+  (`tools/gen_crl_fixtures.py`), every good/revoked/out-of-scope verdict confirmed by
+  `openssl verify -crl_check`; RSA, RSASSA-PSS, P-256, P-384, Ed25519 and ML-DSA-44 CRLs;
+  every truncation and single-byte tampering tested. Schemata mutation run over `crl.zig`:
+  25 of 25 killed (after four fixtures added for the first-round survivors).
+
 - **2026-09-16** — documentation only: the PKCS#1 v1.5 dispatch numbers are
   re-measured on today's tree (audit X2). `rsa.PublicKey.fromDer` is 453 µs
   against the 352 µs threshold that would make switching worth it, and a
