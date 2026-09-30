@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — `KvStore`: a persistent `Store` over a caller-owned `kv.Db`, so sessions
+  survive a restart (maturity task C8). Records under `prefix ++ id` (default `"session:"`),
+  generation-framed like `RamcacheStore`, CAS under its own lock, `kv` expiry refreshed by
+  every save as the backstop for abandoned sessions; fails closed after any `kv` write error.
+  New `Clock.realtime` (wall ns) and `Store.VTable.persistent` (default false, so existing
+  vtables are unchanged); `Manager.init` returns the new `error.MonotonicClockWithPersistentStore`
+  for `Clock.monotonic` over a persistent store, whose timestamps a reboot would put in the
+  "future" and keep alive past the absolute timeout. New dependency: `kv`.
+
 - **2026-09-28** — `Csrf`: the private header-then-query token extraction (`presentedToken`) is
   now public as `Csrf.presented(req)`, same extraction order, unchanged. Added
   `Csrf.check(req) bool` — the whole CSRF guard minus the middleware's 403 response: session

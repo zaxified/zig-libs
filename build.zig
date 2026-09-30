@@ -285,7 +285,7 @@ const module_list = [_]Module{
     .{ .name = "csvsafe", .libs = &.{"format"} },
     .{ .name = "numparse", .libs = &.{"format"}, .deps = &.{"decimal"} },
     .{ .name = "argsafe", .libs = &.{"os"} },
-    .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy", "kv" }, .test_deps = &.{"testkit"} },
     .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{"kv"} },
     .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"} },
     .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true },

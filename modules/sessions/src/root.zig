@@ -7,8 +7,8 @@
 //! (`std.Io.random`, threaded in at construction — never the removed
 //! `std.crypto.random`, never a test-only `DefaultPrng`), so a session id can
 //! be neither guessed nor forged. The state lives in a pluggable `Store`
-//! (default: a bounded, TTL-evicting `ramcache`); the cookie carries only the
-//! id.
+//! (default: a bounded, TTL-evicting `ramcache`; `KvStore` keeps sessions
+//! across a restart in a `kv` store); the cookie carries only the id.
 //!
 //! ## What the middleware does (`Manager.middleware`)
 //!
@@ -66,6 +66,7 @@ const http = @import("http");
 const cookies = @import("cookies");
 const ramcache = @import("ramcache");
 const entropy = @import("entropy");
+const kv = @import("kv");
 
 const csrf = @import("csrf.zig");
 
@@ -84,7 +85,7 @@ pub const meta = .{
     // Store, whose default impl serializes cache access behind its own lock.
     .concurrency = .threadsafe,
     .model_after = "OWASP Session Management + CSRF Prevention Cheat Sheets",
-    .deps = .{ "router", "http", "cookies", "ramcache", "entropy" }, // entropy: the session-id draw
+    .deps = .{ "router", "http", "cookies", "ramcache", "entropy", "kv" }, // entropy: the session-id draw; kv: KvStore
 };
 
 const Allocator = std.mem.Allocator;
@@ -125,16 +126,27 @@ const record_header_len = 16;
 
 // ── clock injection (deterministic under test) ──────────────────────────────
 
-/// Monotonic time source for timeout accounting, injected so tests are
-/// deterministic. Non-decreasing; only differences matter (the store is
-/// in-memory and never persists, so a monotonic origin is fine).
+/// Time source for timeout accounting (ns), injected so tests are
+/// deterministic. Only differences matter, and the timestamps are stored in
+/// the session record — so the clock must keep its origin for as long as a
+/// record lives. `monotonic` does within one boot, which is all an in-process
+/// store (`RamcacheStore`) needs; a store that survives a restart
+/// (`KvStore`) needs `realtime`, and `Manager.init` refuses the pair
+/// `monotonic` + persistent store.
 pub const Clock = struct {
     ctx: ?*anyopaque = null,
     nowFn: *const fn (?*anyopaque) i64,
 
-    /// The OS monotonic clock — the production default and the only place the
-    /// module reads a real clock.
+    /// The OS monotonic clock — the default, for in-process stores.
     pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
+
+    /// `CLOCK_REALTIME` (ns since the Unix epoch) — for a persistent store.
+    /// After a reboot the monotonic clock starts over near zero, so a record
+    /// stamped before it would look created in the future and outlive its
+    /// absolute timeout; wall time keeps the origin. A wall clock can be
+    /// stepped (NTP): a step forward expires sessions early, a step back
+    /// extends them by the step.
+    pub const realtime: Clock = .{ .nowFn = realtimeNowNs };
 
     pub fn now(c: Clock) i64 {
         return c.nowFn(c.ctx);
@@ -159,6 +171,12 @@ fn monotonicNowNs(_: ?*anyopaque) i64 {
             return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
         },
     }
+}
+
+fn realtimeNowNs(_: ?*anyopaque) i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 // ── the Store interface ─────────────────────────────────────────────────────
@@ -213,6 +231,9 @@ pub const Store = struct {
         /// pre-delete generation fails closed — a delete always wins over a
         /// concurrent stale save.
         delete: *const fn (ptr: *anyopaque, id: []const u8) void,
+        /// The records outlive the process. `Manager.init` then refuses
+        /// `Clock.monotonic`, whose origin a reboot resets (see `Clock`).
+        persistent: bool = false,
     };
 
     pub fn get(s: Store, gpa: Allocator, id: []const u8) StoreError!?Loaded {
@@ -315,6 +336,136 @@ pub const RamcacheStore = struct {
         var tomb: [gen_prefix_len]u8 = undefined;
         std.mem.writeInt(u64, tomb[0..gen_prefix_len], next, .little);
         self.cache.put(id, &tomb, now, self.ttl_ns, 0);
+    }
+};
+
+/// A persistent `Store` over a caller-owned `kv.Db`: sessions survive a
+/// restart of the server. Each record is stored under `prefix ++ id`, framed
+/// `[generation u64 LE] ++ record` like `RamcacheStore`, with a `kv` expiry of
+/// `ttl_ms` refreshed by every save — the backstop that removes abandoned
+/// sessions, which `Manager` would otherwise only evict when their cookie
+/// comes back. Expired records leave memory and disk at the `Db`'s next
+/// `compact` (the caller's, as for any `kv` store) or reopen.
+///
+/// - **CAS:** read-compare-write under this store's own lock, as in
+///   `RamcacheStore`. `delete` removes the key (no tombstone): an absent key
+///   reads as generation 0 and every stale save expects `>= 1`, so a delete
+///   still wins.
+/// - **Cost:** every save and delete is a `kv` write + `fsync` under the
+///   lock, and the middleware saves on every request that carries a session
+///   (the rolling idle window). That caps session-carrying requests at the
+///   disk's fsync rate — `kv` measured ~300/s appending on NVMe ext4.
+/// - **Fail closed:** after any `kv` error on a write this store answers
+///   every `get` with "absent" and refuses every `put`, until it is rebuilt
+///   over a reopened `Db`. A failed `delete` (logout) must not leave the
+///   session loadable, and `kv` itself refuses writes once poisoned.
+/// - **Clock:** the manager over it must use `Clock.realtime` (enforced by
+///   `Manager.init`). The `kv` expiry uses the `Db`'s own `Options.clock`.
+pub const KvStore = struct {
+    db: *kv.Db,
+    prefix_buf: [max_prefix_len]u8 = undefined,
+    prefix_len: usize = 0,
+    ttl_ms: u64,
+    lock: std.atomic.Mutex = .unlocked,
+    failed: std.atomic.Value(bool) = .init(false),
+
+    pub const max_prefix_len = 64;
+
+    pub const Config = struct {
+        /// Prepended to every session id, so the `Db` can hold other data
+        /// too and `db.keys(gpa, prefix)` lists the sessions.
+        prefix: []const u8 = "session:",
+        /// `kv` expiry per record, refreshed by every save. It should cover
+        /// the longest a session may live (the absolute timeout); 0 = none.
+        ttl_ms: u64 = @intCast(@divTrunc(default_absolute_timeout_ns, std.time.ns_per_ms)),
+    };
+
+    pub fn init(db: *kv.Db, options: Config) error{PrefixTooLong}!KvStore {
+        if (options.prefix.len > max_prefix_len) return error.PrefixTooLong;
+        var self: KvStore = .{ .db = db, .ttl_ms = options.ttl_ms, .prefix_len = options.prefix.len };
+        @memcpy(self.prefix_buf[0..options.prefix.len], options.prefix);
+        return self;
+    }
+
+    /// The `Store` view. The `KvStore` must outlive the `Manager` using it,
+    /// at a stable address.
+    pub fn store(self: *KvStore) Store {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// True once a `kv` write failed; from then on the store is closed.
+    pub fn hasFailed(self: *const KvStore) bool {
+        return self.failed.load(.acquire);
+    }
+
+    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .persistent = true };
+
+    const gen_prefix_len = 8;
+    const KeyBuf = [max_prefix_len + 2 * max_id_bytes]u8;
+    const ValueBuf = [gen_prefix_len + record_header_len + max_session_bytes]u8;
+
+    /// `prefix ++ id` in `buf`, or null for an id no `Manager` mints.
+    fn key(self: *const KvStore, buf: *KeyBuf, id: []const u8) ?[]const u8 {
+        if (id.len > 2 * max_id_bytes) return null;
+        @memcpy(buf[0..self.prefix_len], self.prefix_buf[0..self.prefix_len]);
+        @memcpy(buf[self.prefix_len..][0..id.len], id);
+        return buf[0 .. self.prefix_len + id.len];
+    }
+
+    /// The stored value under `k`, or null when absent, unreadable or not a
+    /// framed record. Caller holds the lock.
+    fn read(self: *KvStore, buf: *ValueBuf, k: []const u8) ?[]u8 {
+        const v = (self.db.getBuf(buf, k) catch return null) orelse return null;
+        if (v.len < gen_prefix_len + record_header_len) return null;
+        return v;
+    }
+
+    fn getImpl(ptr: *anyopaque, gpa: Allocator, id: []const u8) StoreError!?Loaded {
+        const self: *KvStore = @ptrCast(@alignCast(ptr));
+        var kbuf: KeyBuf = undefined;
+        const k = self.key(&kbuf, id) orelse return null;
+        var vbuf: ValueBuf = undefined;
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        if (self.hasFailed()) return null;
+        const v = self.read(&vbuf, k) orelse return null;
+        return .{
+            .record = try gpa.dupe(u8, v[gen_prefix_len..]),
+            .generation = std.mem.readInt(u64, v[0..gen_prefix_len], .little),
+        };
+    }
+
+    fn putImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation {
+        const self: *KvStore = @ptrCast(@alignCast(ptr));
+        var kbuf: KeyBuf = undefined;
+        const k = self.key(&kbuf, id) orelse return null;
+        var vbuf: ValueBuf = undefined;
+        if (record.len > vbuf.len - gen_prefix_len) return null; // never in practice
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        if (self.hasFailed()) return null;
+        // The compare of the CAS — atomic with the write below under the lock.
+        const current: Generation = if (self.read(&vbuf, k)) |v| std.mem.readInt(u64, v[0..gen_prefix_len], .little) else 0;
+        if (current != expected) return null; // stale write dropped
+        const next: Generation = expected + 1;
+        std.mem.writeInt(u64, vbuf[0..gen_prefix_len], next, .little);
+        @memcpy(vbuf[gen_prefix_len..][0..record.len], record);
+        const value = vbuf[0 .. gen_prefix_len + record.len];
+        const written = if (self.ttl_ms == 0) self.db.put(k, value) else self.db.putTtl(k, value, self.ttl_ms);
+        written catch {
+            self.failed.store(true, .release);
+            return null;
+        };
+        return next;
+    }
+
+    fn deleteImpl(ptr: *anyopaque, id: []const u8) void {
+        const self: *KvStore = @ptrCast(@alignCast(ptr));
+        var kbuf: KeyBuf = undefined;
+        const k = self.key(&kbuf, id) orelse return;
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        self.db.delete(k) catch self.failed.store(true, .release);
     }
 };
 
@@ -483,12 +634,18 @@ pub const Manager = struct {
         /// `max_id_bytes` (overflows the id buffers).
         InvalidIdBytes,
         EmptyCookieName,
+        /// `Clock.monotonic` over a store whose records outlive the process:
+        /// after a reboot every stored timestamp would lie in the "future"
+        /// and no session would reach its timeouts. Use `Clock.realtime`.
+        MonotonicClockWithPersistentStore,
     };
 
     pub fn init(gpa: Allocator, store: Store, options: Options) InitError!Manager {
         if (options.id_bytes < min_id_bytes or options.id_bytes > max_id_bytes)
             return error.InvalidIdBytes;
         if (options.cookie_name.len == 0) return error.EmptyCookieName;
+        if (store.vtable.persistent and options.clock.nowFn == Clock.monotonic.nowFn)
+            return error.MonotonicClockWithPersistentStore;
         return .{
             .store = store,
             .gpa = gpa,
@@ -1035,6 +1192,253 @@ test "single-owner save succeeds and bumps the generation; a second concurrent s
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
     try testing.expectEqualStrings("v=2", l.data()); // b's write survived, not c's
+}
+
+// ── KvStore ─────────────────────────────────────────────────────────────────
+
+/// A `kv` wall clock (ms) the test moves by hand.
+const ManualKvClock = struct {
+    now_ms: i64 = 1_000_000,
+    fn clock(mc: *ManualKvClock) kv.Clock {
+        return .{ .ctx = mc, .nowFn = read };
+    }
+    fn read(ctx: ?*anyopaque) i64 {
+        const mc: *ManualKvClock = @ptrCast(@alignCast(ctx.?));
+        return mc.now_ms;
+    }
+};
+
+/// A simulated disk, a `kv.Db` on it, a `KvStore` over that and a manager.
+/// `restart` closes and reopens the `Db` on the same simulated disk.
+const KvEnv = struct {
+    sim: kv.SimStorage,
+    db: kv.Db = undefined,
+    store: KvStore = undefined,
+    kv_clk: ManualKvClock = .{},
+    clk: ManualClock = .{ .now_ns = 1000 },
+
+    const path = "sessions.kv";
+
+    fn init(e: *KvEnv) !void {
+        e.* = .{ .sim = kv.SimStorage.init(testing.allocator) };
+        try e.open();
+    }
+    fn open(e: *KvEnv) !void {
+        e.db = try kv.Db.open(testing.allocator, e.sim.storage(), path, .{ .clock = e.kv_clk.clock() });
+        e.store = try KvStore.init(&e.db, .{ .ttl_ms = 60_000 });
+    }
+    fn restart(e: *KvEnv) !void {
+        e.db.close();
+        try e.open();
+    }
+    fn deinit(e: *KvEnv) void {
+        e.db.close();
+        e.sim.deinit();
+    }
+    fn manager(e: *KvEnv) !Manager {
+        return try Manager.init(testing.allocator, e.store.store(), .{
+            .io = testing.io,
+            .clock = e.clk.clock(),
+            .idle_timeout_ns = 10_000,
+            .absolute_timeout_ns = 100_000,
+        });
+    }
+    fn storeKey(e: *KvEnv, buf: *KvStore.KeyBuf, id: []const u8) []const u8 {
+        return e.store.key(buf, id).?;
+    }
+};
+
+test "KvStore: sessions survive a restart of the store" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var s: Session = .{};
+    const id = blk: {
+        var m = try env.manager();
+        m.create(&s);
+        try s.setData("uid=42");
+        try testing.expect(m.persist(&s));
+        try testing.expect(m.persist(&s)); // generation 2
+        break :blk try testing.allocator.dupe(u8, s.id());
+    };
+    defer testing.allocator.free(id);
+
+    try env.restart(); // the server process comes back
+    var m = try env.manager();
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+    try testing.expectEqualStrings("uid=42", l.data());
+    try testing.expectEqual(s.created_ns, l.created_ns);
+    try testing.expectEqual(@as(Generation, 2), l.generation);
+    // The CAS carries on from the stored generation.
+    try testing.expect(m.persist(&l));
+    try testing.expectEqual(@as(Generation, 3), l.generation);
+}
+
+test "KvStore: a stale save cannot resurrect a destroyed or rotated session; first writer wins" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+
+    // Destroy wins.
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("uid=7");
+    try testing.expect(m.persist(&s));
+    var b: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &b));
+    m.store.delete(s.id());
+    try testing.expect(!m.persist(&b));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
+    // The delete reached the disk: gone after a restart too.
+    const dead_id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(dead_id);
+    try env.restart();
+    m = try env.manager();
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(dead_id, &l));
+
+    // Regenerate wins.
+    var r: Session = .{};
+    m.create(&r);
+    try testing.expect(m.persist(&r));
+    const old_id = try testing.allocator.dupe(u8, r.id());
+    defer testing.allocator.free(old_id);
+    var stale: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(old_id, &stale));
+    m.regenerate(&r);
+    try testing.expect(!m.persist(&stale));
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(old_id, &l));
+    try testing.expect(m.persist(&r));
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(r.id(), &l));
+
+    // Two data writes from the same generation: the first wins.
+    var c1: Session = .{};
+    var c2: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(r.id(), &c1));
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(r.id(), &c2));
+    try c1.setData("v=1");
+    try c2.setData("v=2");
+    try testing.expect(m.persist(&c1));
+    try testing.expect(!m.persist(&c2));
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(r.id(), &l));
+    try testing.expectEqualStrings("v=1", l.data());
+}
+
+test "KvStore: every save refreshes the kv expiry backstop; an abandoned session goes away" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expect(m.persist(&s));
+    var kbuf: KvStore.KeyBuf = undefined;
+    const k = env.storeKey(&kbuf, s.id());
+    try testing.expectEqual(kv.Expiry{ .at_ms = env.kv_clk.now_ms + 60_000 }, env.db.expiresAt(k).?);
+
+    env.kv_clk.now_ms += 30_000;
+    try testing.expect(m.persist(&s)); // a request came: the backstop moves
+    try testing.expectEqual(kv.Expiry{ .at_ms = env.kv_clk.now_ms + 60_000 }, env.db.expiresAt(k).?);
+
+    env.kv_clk.now_ms += 60_000; // abandoned: its cookie never came back
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
+    try env.db.compact();
+    try testing.expectEqual(@as(usize, 0), env.db.count());
+    try testing.expect(!env.db.keydir.contains(k));
+
+    // ttl_ms = 0: no expiry at all.
+    env.store = try KvStore.init(&env.db, .{ .ttl_ms = 0 });
+    m = try env.manager();
+    m.create(&s);
+    try testing.expect(m.persist(&s));
+    try testing.expectEqual(kv.Expiry.never, env.db.expiresAt(env.storeKey(&kbuf, s.id())).?);
+}
+
+test "KvStore: a failed kv write closes the store (a logout that did not reach the disk cannot be undone by a read)" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expect(m.persist(&s));
+
+    env.sim.ops_until_crash = 0; // the logout's kv write fails
+    m.store.delete(s.id());
+    try testing.expect(env.store.hasFailed());
+    // The record is still readable from kv (reads survive a poisoned Db) —
+    // KvStore must not serve it.
+    var kbuf: KvStore.KeyBuf = undefined;
+    try testing.expect(env.db.exists(env.storeKey(&kbuf, s.id())));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
+    // And nothing is written any more.
+    var fresh: Session = .{};
+    m.create(&fresh);
+    try testing.expect(!m.persist(&fresh));
+
+    // A failed save closes it too.
+    env.sim.reboot();
+    try env.restart();
+    m = try env.manager();
+    try testing.expect(!env.store.hasFailed());
+    env.sim.ops_until_crash = 0;
+    m.create(&fresh);
+    try testing.expect(!m.persist(&fresh));
+    try testing.expect(env.store.hasFailed());
+    env.sim.reboot();
+}
+
+test "KvStore: sessions live under their prefix next to other data; ids no manager mints are refused" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    try env.db.put("user:1", "not a session");
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expect(m.persist(&s));
+
+    const sessions = try env.db.keys(testing.allocator, "session:");
+    defer sessions.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), sessions.keys.len);
+    try testing.expectEqualStrings(s.id(), sessions.keys[0]["session:".len..]);
+
+    // A cookie naming a non-session key under no prefix, or an oversized id.
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup("user:1", &l));
+    const long_id = "a" ** (2 * max_id_bytes + 1);
+    try testing.expect(m.store.put(long_id, "0123456789abcdef", 0) == null);
+    const got = try m.store.get(testing.allocator, long_id);
+    try testing.expect(got == null);
+    // A value that is not a framed record reads as absent.
+    try env.db.put("session:short", "xy");
+    try testing.expect((try m.store.get(testing.allocator, "short")) == null);
+
+    try testing.expectError(error.PrefixTooLong, KvStore.init(&env.db, .{ .prefix = "p" ** (KvStore.max_prefix_len + 1) }));
+}
+
+test "Manager.init refuses the monotonic clock over a persistent store" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    try testing.expectError(error.MonotonicClockWithPersistentStore, Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io }));
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = .realtime });
+    // An in-process store keeps the monotonic default.
+    var cache = newCache();
+    defer cache.deinit();
+    var rs: RamcacheStore = .{ .cache = &cache };
+    _ = try Manager.init(testing.allocator, rs.store(), .{ .io = testing.io });
+}
+
+test "Clock.realtime is wall time: nanoseconds since the Unix epoch" {
+    const now = Clock.realtime.now();
+    // Later than 2026-01-01 and earlier than 2100-01-01.
+    try testing.expect(now > 1_767_225_600 * std.time.ns_per_s);
+    try testing.expect(now < 4_102_444_800 * std.time.ns_per_s);
 }
 
 test "min_id_bytes floor: default and at-floor id_bytes are accepted" {

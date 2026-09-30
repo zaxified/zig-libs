@@ -24,6 +24,26 @@ fn dashboard(ctx: *router.Ctx) anyerror!void {
 }
 ```
 
+### Sessions that survive a restart — `KvStore`
+
+```zig
+var db = try kv.Db.open(gpa, fs_store.storage(), "sessions.kv", .{});
+defer db.close();
+var store = try sessions.KvStore.init(&db, .{}); // prefix "session:", 12 h kv expiry
+var mgr = try sessions.Manager.init(gpa, store.store(), .{ .io = io, .clock = .realtime });
+// now and then: if (db.deadBytes() > 1 << 20) try db.compact();
+```
+
+Records go to a `kv` store under `prefix ++ id`, with a `kv` expiry refreshed by
+every save that drops abandoned sessions at the next `compact`. The manager
+needs `Clock.realtime` — `Manager.init` refuses the monotonic default over a
+persistent store, whose origin a reboot resets. Every save is an `fsync`, and
+the middleware saves on every request with a session: throughput is bounded by
+the disk's fsync rate (~300/s measured by `kv` on NVMe ext4). After a failed
+`kv` write the store answers "no session" to everything until rebuilt over a
+reopened `Db` (fail closed: a logout that did not reach the disk must not be
+undone by a read).
+
 ## What the middleware does
 
 On each request it **loads** the session named by the cookie (rejecting and
@@ -101,7 +121,7 @@ default `.monotonic` clock touches the OS.
 
 ## Not handled (deferred)
 
-Distributed `Store` (Redis adapter — implement the `Store` vtable);
+Distributed `Store` shared by several servers (Redis adapter — implement the `Store` vtable);
 signed-cookie *stateless* sessions (no server store); `SameSite=None`
 cross-site flows; CSRF token rotation / synchronizer-token mode and
 `Csrf.key` provisioning/rotation; logout-everywhere (a user→sessions index);
