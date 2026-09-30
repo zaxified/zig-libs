@@ -72,6 +72,13 @@ notifications / `subscriptions/listen`, completions, logging, tasks; server role
   compiling). An answer that arrives unasked is treated like one that was asked for: the client is the
   user's agent and could have answered either way. The typed accessors return null for an absent **or**
   undecodable answer, which makes the spec's "ask again rather than fail" the natural handler shape.
+- **`subscriptions/listen` acknowledges nothing and closes gracefully.** This server emits no change
+  notification of any kind, so it honours none of the requested types: the acknowledgment (MUST be the
+  first message, `_meta.subscriptionId` = the request's id) carries `notifications: {}` ("types the
+  server does not support are omitted"), and the completion result follows at once — the spec's
+  graceful closure, which a client reads as "ended", not as a drop to reconnect after. Holding a stream
+  open that could never carry anything would tie a connection to no purpose. A non-object filter is
+  -32602; on the session path it is -32602 like `server/discover` (no session revision has it).
 - **`requestState` is attacker-controlled (mrtr.mdx MUST); `StateSeal` protects it.** HMAC-SHA-256 over
   version, expiry and payload **plus** a binding recomputed on `open`: method, target (tool/prompt name,
   resource uri), principal and a caller `extra` (e.g. a digest of the arguments that matter), each
@@ -393,7 +400,17 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
   `icons`/annotations, non-object `structuredContent`; see "Design & invariants"). M1–M3 landed as one step,
   not three: every new output had to be gated by era from the first line, or the session goldens would have
   changed. **MRTR DONE 2026-09-30** (`InputRound`, `StateSeal`; see "Design & invariants"). Still open from
-  the plan: **M5** (`mcp-http`). The differential run against the TypeScript SDK client is still to do.
+  the plan: ~~**M5** (`mcp-http`)~~ — **DONE 2026-09-30** (see `mcp-http`'s SPEC), with `subscriptions/listen`
+  answered here (below). The differential run against the TypeScript SDK client is still to do.
+- **Held-open `subscriptions/listen`** (2026-09-30, M5 follow-up). Today `listen` acknowledges an empty
+  filter and closes at once (see "Design & invariants"), because nothing here emits a change
+  notification. It becomes real together with the `list_changed` / resource-subscription item below:
+  a push seam in this module plus a held-open response in `http`/`mcp-http`. Effort: medium-large.
+- **Validate `x-mcp-header` at `addTool`** (2026-09-30, M5 follow-up). The spec makes a tool whose
+  annotation breaks the rules (not a `properties`-only chain, `number` type, duplicate names,
+  non-token name) invalid for a client, which then drops it from its list; `mcp-http` checks only the
+  annotations that are valid. Refusing such a tool at registration would surface the defect to the
+  server author instead of silently hiding the tool from HTTP clients. Effort: small.
 - **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
   `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
   largest break since the transport rewrite: **MCP becomes stateless**.

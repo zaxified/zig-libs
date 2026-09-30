@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **`subscriptions/listen`** (spec 2026-07-28, basic/patterns/subscriptions.mdx):
+  answered with the acknowledgment of an empty filter (`notifications/subscriptions/acknowledged`,
+  `_meta.io.modelcontextprotocol/subscriptionId`) followed at once by the graceful-close result, since
+  this server emits no change notifications. New `DispatchMethod.@"subscriptions/listen"`,
+  `OriginatedMethod.@"notifications/subscriptions/acknowledged"`, `meta_key.subscription_id`. ⚠ An
+  exhaustive `switch` over either enum needs the new arm.
+
 - **2026-09-30** — **Multi round-trip requests (spec 2026-07-28, basic/patterns/mrtr.mdx).** A modern
   `tools/call`, `prompts/get` or `resources/read` can ask the client for input: new `InputRound` on
   `ToolCall.input`, `PromptRequest.input`, `ResourceRequest.input` — `ask(key, InputRequest)` (sampling or

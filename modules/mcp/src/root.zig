@@ -150,6 +150,9 @@ pub const meta_key = struct {
     pub const client_capabilities = "io.modelcontextprotocol/clientCapabilities";
     pub const client_info = "io.modelcontextprotocol/clientInfo";
     pub const server_info = "io.modelcontextprotocol/serverInfo";
+    /// basic/patterns/subscriptions.mdx: the `subscriptions/listen` request's
+    /// JSON-RPC id, on every message of that subscription.
+    pub const subscription_id = "io.modelcontextprotocol/subscriptionId";
 };
 
 /// JSON-RPC 2.0 standard error codes + the MCP-defined ones.
@@ -231,6 +234,7 @@ pub const DispatchMethod = enum {
     @"prompts/list",
     @"prompts/get",
     @"server/discover",
+    @"subscriptions/listen",
 
     /// Whether a 2026-07-28 (stateless) request may call it. The handshake
     /// pair and `ping` were removed in that revision, so a modern request for
@@ -248,6 +252,7 @@ pub const DispatchMethod = enum {
             .@"prompts/list",
             .@"prompts/get",
             .@"server/discover",
+            .@"subscriptions/listen",
             => true,
         };
     }
@@ -262,6 +267,7 @@ pub const OriginatedMethod = enum {
     @"notifications/cancelled",
     @"sampling/createMessage",
     @"elicitation/create",
+    @"notifications/subscriptions/acknowledged",
 
     pub fn wire(self: OriginatedMethod) []const u8 {
         return @tagName(self);
@@ -288,6 +294,8 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Prompt shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
     .{ .method = "server/discover", .anchor = .no_example, .reason = "stateless-only (2026-07-28): no session revision defines it, and a session-path request for it lacks the _meta version and is answered -32602. Its anchor is in modern_spec_anchor_index" },
+    .{ .method = "subscriptions/listen", .anchor = .no_example, .reason = "stateless-only (2026-07-28): no session revision defines it (resources/subscribe and the GET stream were its predecessors, neither implemented here); a session-path request lacks the _meta version and is answered -32602. Its anchor is in modern_spec_anchor_index" },
+    .{ .method = "notifications/subscriptions/acknowledged", .anchor = .no_example, .reason = "stateless-only: written only as the first message of a subscriptions/listen answer, and anchored with it in modern_spec_anchor_index" },
     .{ .method = "notifications/progress", .anchor = .literal_example, .reason = "" },
     .{ .method = "sampling/createMessage", .anchor = .literal_example, .reason = "" },
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
@@ -315,6 +323,7 @@ pub const modern_spec_anchor_index = [_]MethodAnchor{
     .{ .method = "resources/templates/list", .anchor = .literal_example, .reason = "" },
     .{ .method = "prompts/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (no pagination)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
+    .{ .method = "subscriptions/listen", .anchor = .partial, .reason = "the acknowledgment and the graceful-close response are value-equal to the schema examples (listen-acknowledged.json, listen-closed-response.json) except the acknowledged `notifications` filter: this server emits no change notification of any kind, so it honours none of the requested types, acknowledges `{}` (subscriptions.mdx: unsupported types are omitted) and ends the subscription at once with the completion result; the closing result also carries serverInfo, which the example omits" },
 };
 
 /// Everything `handleMessage`/`serve` can fail with. Malformed *input* never
@@ -3107,6 +3116,11 @@ pub const Server = struct {
                 if (modern == null) return sendError(arena, out, id, error_code.invalid_params, "Missing " ++ meta_key.protocol_version);
                 try self.handleDiscover(arena, out, id);
             },
+            // Stateless-only, like `server/discover`.
+            .@"subscriptions/listen" => {
+                if (modern == null) return sendError(arena, out, id, error_code.invalid_params, "Missing " ++ meta_key.protocol_version);
+                try self.handleListen(arena, out, id.?, obj.get("params"));
+            },
             .@"tools/list" => {
                 const list = self.buildToolsList(arena, modern != null) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -3135,13 +3149,40 @@ pub const Server = struct {
     /// The capabilities follow the session rule (`tools` always, `resources`/
     /// `prompts` only with a non-empty catalog) but drop the `listChanged:false`
     /// / `subscribe:false` members: absent means the same thing, and in this
-    /// revision both belong to `subscriptions/listen`, which this module does
-    /// not serve.
+    /// revision both belong to `subscriptions/listen`, which this module
+    /// answers with an empty acknowledgment (see `handleListen`).
     fn handleDiscover(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value) Error!void {
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
         self.buildDiscoverResult(&jw) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
+    }
+
+    /// `subscriptions/listen` (basic/patterns/subscriptions.mdx). This server
+    /// emits no change notification of any kind — `tools`/`prompts`/
+    /// `resources` never change after registration as far as it knows, and
+    /// resource subscriptions are not implemented — so it honours none of the
+    /// requested types. It says so rather than holding a stream open that
+    /// would never carry anything: the acknowledgment (MUST come first)
+    /// carries an empty filter ("types the server does not support are
+    /// omitted"), and the completion result follows at once, which is the
+    /// spec's graceful closure — a client reads it as "ended cleanly", not as
+    /// a drop to reconnect after. Two lines on `out`; over HTTP they are the
+    /// two events of the request's SSE stream.
+    ///
+    /// The filter itself must be an object when present (-32602 otherwise);
+    /// its members are not interpreted, since none can be honoured.
+    fn handleListen(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: std.json.Value, params_opt: ?std.json.Value) Error!void {
+        if (params_opt) |params| {
+            if (params == .object) {
+                if (present(params.object.get("notifications"))) |f| {
+                    if (f != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid notifications filter");
+                }
+            }
+        }
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        buildListenLines(&aw.writer, id, &self.info) catch return error.OutOfMemory;
+        try flushLine(out, aw.written());
     }
 
     fn buildDiscoverResult(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
@@ -3591,6 +3632,30 @@ pub const Server = struct {
         try sendResultRaw(arena, out, id, aw.written());
     }
 };
+
+/// The two lines of a `subscriptions/listen` answer (see `Server.handleListen`):
+/// the acknowledgment with an empty filter, then the completion result, both
+/// carrying the request's id as `subscriptionId`.
+fn buildListenLines(w: *std.Io.Writer, id: std.json.Value, info: *const Info) std.Io.Writer.Error!void {
+    try w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{", .{OriginatedMethod.@"notifications/subscriptions/acknowledged".wire()});
+    try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
+    try w.writeByte(':');
+    try writeId(w, id);
+    try w.writeAll("},\"notifications\":{}}}\n");
+
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(w, id);
+    try w.writeAll(",\"result\":{\"resultType\":\"complete\",\"_meta\":{");
+    try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
+    try w.writeByte(':');
+    try writeId(w, id);
+    try w.writeByte(',');
+    try std.json.Stringify.encodeJsonString(meta_key.server_info, .{}, w);
+    try w.writeByte(':');
+    var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try writeImplementation(&jw, info);
+    try w.writeAll("}}}\n");
+}
 
 /// -32602 for an `inputResponses` that is not an object or a `requestState`
 /// that is not a string (mrtr.mdx "Error Handling").
@@ -6805,7 +6870,7 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
     }
     try testing.expectEqual(@as(usize, 8), literal);
     try testing.expectEqual(@as(usize, 6), partial);
-    try testing.expectEqual(@as(usize, 1), no_example);
+    try testing.expectEqual(@as(usize, 3), no_example);
 }
 
 test "initialize: decodes the spec's own request verbatim (lifecycle.mdx)" {
@@ -8476,7 +8541,7 @@ test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (cana
         if (a.anchor == .literal_example) literal += 1;
     }
     try testing.expectEqual(@as(usize, 4), literal);
-    try testing.expectEqual(@as(usize, 8), modern_spec_anchor_index.len);
+    try testing.expectEqual(@as(usize, 9), modern_spec_anchor_index.len);
 }
 
 // ── multi round-trip requests (2026-07-28) ──────────────────────────────────
@@ -8901,4 +8966,99 @@ test "2026-07-28 MRTR: sealState/openState bind the state to the round's method 
     try testing.expectEqual(@as(?StateSeal.OpenError, null), p.open_err);
     try testing.expectEqualStrings("cart=42", p.opened.?);
     try testing.expect(std.mem.indexOf(u8, ok, "\"text\":\"done\"") != null);
+}
+
+// ── subscriptions/listen (2026-07-28) ───────────────────────────────────────
+
+test "2026-07-28 anchor: subscriptions/listen acknowledges an empty filter and closes gracefully (schema examples)" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    // SubscriptionsListenRequest/listen-for-list-changes.json, verbatim.
+    const out = try replyTo(&s,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "listen-1",
+        \\  "method": "subscriptions/listen",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        \\      "io.modelcontextprotocol/clientInfo": {
+        \\        "name": "ExampleClient",
+        \\        "version": "1.0.0"
+        \\      },
+        \\      "io.modelcontextprotocol/clientCapabilities": {}
+        \\    },
+        \\    "notifications": {
+        \\      "toolsListChanged": true,
+        \\      "resourceSubscriptions": ["file:///project/config.json"]
+        \\    }
+        \\  }
+        \\}
+    );
+    defer testing.allocator.free(out);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    const ack_line = lines.next().?;
+    const close_line = lines.next().?;
+    try testing.expect(lines.next() == null);
+
+    // SubscriptionsAcknowledgedNotification/listen-acknowledged.json, with the
+    // one difference the anchor index names: nothing is honoured, so `{}`.
+    var want_ack = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "method": "notifications/subscriptions/acknowledged",
+        \\  "params": {
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/subscriptionId": "listen-1"
+        \\    },
+        \\    "notifications": {
+        \\      "toolsListChanged": true,
+        \\      "resourceSubscriptions": ["file:///project/config.json"]
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    try want_ack.object.getPtr("params").?.object.put(arena, "notifications", .{ .object = .empty });
+    const got_ack = try std.json.parseFromSliceLeaky(std.json.Value, arena, ack_line, .{});
+    try testing.expect(jsonValueEql(got_ack, want_ack));
+
+    // SubscriptionsListenResultResponse/listen-closed-response.json; ours
+    // also carries serverInfo (SHOULD), removed before comparing.
+    const want_close = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{
+        \\  "jsonrpc": "2.0",
+        \\  "id": "listen-1",
+        \\  "result": {
+        \\    "resultType": "complete",
+        \\    "_meta": {
+        \\      "io.modelcontextprotocol/subscriptionId": "listen-1"
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    var got_close = try std.json.parseFromSliceLeaky(std.json.Value, arena, close_line, .{});
+    const got_meta = got_close.object.getPtr("result").?.object.getPtr("_meta").?;
+    try testing.expect(got_meta.object.orderedRemove(meta_key.server_info));
+    try testing.expect(jsonValueEql(got_close, want_close));
+}
+
+test "subscriptions/listen: integer ids echo as integers; a non-object filter is -32602; the session path has no listen" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    const ok = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta_open ++ "}}}");
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.startsWith(u8, ok, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},\"notifications\":{}}}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7,"));
+
+    const bad = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta_open ++ "},\"notifications\":[]}}");
+    defer testing.allocator.free(bad);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32602,\"message\":\"Invalid notifications filter\"}}\n", bad);
+
+    const legacy = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\",\"params\":{}}");
+    defer testing.allocator.free(legacy);
+    try testing.expect(std.mem.indexOf(u8, legacy, "\"code\":-32602") != null);
+    try testing.expect(std.mem.indexOf(u8, legacy, "acknowledged") == null);
 }
