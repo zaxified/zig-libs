@@ -311,10 +311,53 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 
 **Survey 2026-09-30 — missing and it matters** (all fit CONVENTIONS §2: pure Zig, std only):
 
-- (survey 2026-09-30) **Spec revision 2026-07-28.** The official SDKs (TypeScript, Python, Go, Rust) all target it;
-  this module answers `initialize` with at most 2025-11-25. Why: a client that requires the new revision or its new
-  lifecycle (Rust README speaks of "legacy MCP lifecycle" vs a new one, server discovery, routing headers) may not
-  fall back. Effort: read the revision's changelog first (size unknown); medium-large.
+- **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
+  `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
+  largest break since the transport rewrite: **MCP becomes stateless**.
+  - **What changes for this module** (a server core; `mcp-http` has its own list, below):
+    - the `initialize` / `notifications/initialized` handshake is **removed**. Every request carries
+      `_meta` `io.modelcontextprotocol/protocolVersion`, `…/clientCapabilities` and (SHOULD)
+      `…/clientInfo`. A mismatch is `UnsupportedProtocolVersionError` (`-32022`);
+    - **`server/discover` is new and MUST be implemented**: supported versions, capabilities,
+      identity. Clients may probe it on stdio for backward compatibility;
+    - every result carries **`resultType: "complete"`** and SHOULD carry `_meta`
+      `io.modelcontextprotocol/serverInfo`;
+    - **`ping` and `logging/setLevel` are removed**; the log level travels per request in `_meta`;
+    - the list results and `resources/read` become a `CacheableResult` with required `ttlMs` and
+      `cacheScope`. `tools/list` SHOULD be in a deterministic order;
+    - resource-not-found moves from `-32002` to `-32602`. The new error codes are renumbered into
+      `-32020…-32099`;
+    - `inputSchema`/`outputSchema` accept any JSON Schema 2020-12, and `structuredContent` any
+      JSON value;
+    - `extensions` in the capabilities; tasks move out of the core into the
+      `io.modelcontextprotocol/tasks` extension; roots, sampling and logging are Deprecated
+      (earliest removal on or after 2027-07-28).
+  - **Strategy: both revisions, negotiated per request — never a flag day.** Our consumers (bxp-mcp,
+    axp-mcp, ttydesk) are driven by clients we do not control. The rule:
+    - a request whose `_meta` names 2026-07-28 is served statelessly;
+    - an `initialize` naming 2025-11-25 or 2025-06-18 keeps today's session path;
+    - `server/discover` answers both.
+    Remove the old path only once no consumer's client needs it, and not before the spec's own
+    12-month window for anything it deprecates.
+  - **Phases** (each a commit with its own tests):
+    - **M1:** `server/discover`, `resultType`, `serverInfo` in `_meta`, the renumbered error codes,
+      deterministic `tools/list`. Additive, harmless to old clients.
+    - **M2:** the stateless request path — per-request version and capabilities from `_meta`,
+      `UnsupportedProtocolVersionError`, `ping`/`setLevel` refused under 2026-07-28 only, the
+      per-request log level.
+    - **M3:** `CacheableResult` (`ttlMs`, `cacheScope`) and the resource-not-found code, gated by
+      the negotiated version.
+    - **M4:** the loosened schemas. It pairs with the `title`/`icons`/annotations item below.
+    - **M5:** `mcp-http`, once its own survey lands. The changes: no `Mcp-Session-Id` under
+      2026-07-28, the required `Mcp-Method`/`Mcp-Name` headers (`HeaderMismatchError` `-32020`),
+      `subscriptions/listen` in place of the GET stream and `resources/subscribe`, no
+      `Last-Event-ID` resumability, and **MRTR** (`InputRequiredResult`, `resultType:
+      "input_required"`) in place of its server-initiated sampling and elicitation requests.
+  - **Anchor:** the spec's own examples, as today, plus a differential run against the official
+    TypeScript SDK 2.2.0 client as a black-box peer over stdio. Its source is off limits
+    (mid-relicensing), running it is not. That oracle goes into `modules/mcp/tools/`.
+  - **Effort:** M1–M4 medium (about two sessions); M5 medium-large. Consumer repins follow each
+    phase.
 - (survey 2026-09-30) **`title`, `icons` and tool annotations** (`readOnlyHint`, `destructiveHint`, …) on `Tool`,
   `Resource`, `ResourceTemplate`, `Prompt`. Why: clients use them for display and for auto-approving read-only tools;
   the SDK examples set them routinely. Effort: small (optional fields + golden updates).
@@ -328,8 +371,9 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
   Why: clients cancel long tool calls; the handler never learns. Effort: small-medium (needs a cancel flag in
   `ToolCall`).
 - (survey 2026-09-30) **`completion/complete`** (argument autocompletion for prompts/templates). Effort: small-medium.
-- (survey 2026-09-30) **Tasks (long-running tool invocations)** — a headline feature of the newest revision in the
-  Rust README. Effort: large; check the spec first.
+- (survey 2026-09-30) **Tasks (long-running tool invocations)** — in 2026-07-28 an official *extension*
+  (`io.modelcontextprotocol/tasks`: `tasks/get` polling, `tasks/update`), no longer core. After the plan above, on
+  demand. Effort: large.
 - Not filed (deprecated upstream): **logging** (`logging/setLevel`, `notifications/message`) — Go README: roots,
   sampling and logging deprecated by SEP-2577 in 2026-07-28. Note this also ages the module's own sampling surface.
 

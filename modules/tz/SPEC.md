@@ -98,7 +98,18 @@ than by these tests alone).
   differently-behaved before the footer takes over) table from identical input data.
 - **Local wall-clock to instant** *(survey 2026-09-30)*: `localToUnix(zone, y, m, d, hh, mm, ss, policy)` with an explicit policy for the DST gap (nonexistent time) and overlap (ambiguous time: earlier/later/error). Why: parsing "2026-03-29 02:30 Europe/Prague" is the commonest reason to load a zone at all; today the caller must probe `offsetAt` by hand and gets the gap/overlap cases wrong. Effort: small–medium (pure arithmetic over the existing `offsetAt`). Fits CONVENTIONS §2. Composes with `datefmt.partsToUnix`.
 - **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
-- **Pre-1970 history** *(survey 2026-09-30)*: decision needed, not a defect — the table folds everything before 1970 into `init_off`, so historical timestamps (archives, genealogy, old logs) get the 1970 offset. Emitting the full `zic -b fat` history would grow `tz_data.zig`; a build option or a second table would keep the default small. Effort: medium. Fits §2 if the size is acceptable.
+- **Pre-1970 history** *(survey 2026-09-30; decided 2026-09-30)*: *not now*, for size. The
+  table folds everything before 1970 into `init_off`, so a pre-1970 instant gets the 1970
+  offset. The trim is deliberate: the tables cost bxp +347 KB in ReleaseSmall (862 → 1209 KB,
+  +40 %) when they landed there (2026-07-01), and full `zic -b fat` history would add to that
+  for every consumer. If a consumer needs history, it comes as a **build option selecting a
+  fuller table**, so size-sensitive consumers keep today's default.
+- **Halve the tables: store transition times as `i32` deltas from a per-zone epoch (or a
+  varint)** *(carried over from bxp, 2026-07-01, "try in the future")*: the tables are almost
+  all `i64` absolute times at 16 B per entry after alignment. Touches `scripts/gen/tz-gen`
+  (emit deltas) and `offsetAt` (rebuild the absolute time inside the binary search); a pure
+  size win, to be measured against the decode cost. It would also make the history option
+  above cheaper.
 
 ## Status
 `extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in

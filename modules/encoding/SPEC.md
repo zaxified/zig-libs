@@ -63,7 +63,7 @@ representation in the target page becomes `'?'`, and invalid/truncated UTF-8 pas
 verbatim byte-for-byte, resynchronising **one byte at a time** so a delimiter following bad input is
 never swallowed. Neither direction ever errors on content (only on allocation failure) — so hostile/malformed input cannot crash or hang transcoding,
 only silently degrade fidelity (which is the documented, deliberate contract, not a bug to fix).
-Out of scope, intentionally not planned: broader WHATWG Encoding Standard coverage — other
+Out of scope *not now* (reason under *Backlog / deferred*): broader WHATWG Encoding Standard coverage — other
 single-byte pages (windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS, EUC-JP,
 GBK/GB18030, Big5), and UTF-16. The `build(&overrides)` table pattern would generalize but there is
 no in-house need beyond the European subset; reopen only on a concrete requirement.
@@ -84,7 +84,12 @@ Per the 2026-07-09 extraction-scope note: broader/CJK coverage is explicitly out
 planned — no further backlog item recorded. The module README's "Out of scope" section is the
 canonical statement of this boundary.
 - **UTF-16 (LE/BE) with BOM detection** *(survey 2026-09-30)*: add `utf16le`/`utf16be` to `Encoding` (decode and encode) and an optional BOM sniff. Why: Excel "Unicode Text" and many Windows exports are UTF-16LE; encoding_rs and the Standard cover it, and `std.unicode` already has the LE conversion. Effort: small. Fits CONVENTIONS §2.
-- **More single-byte pages, Cyrillic first** *(survey 2026-09-30)*: windows-1251, KOI8-R/U, then windows-1253/1254/1255/1256/1257/1258 and iso-8859-3..16, through the existing `build(&overrides)` table pattern with WHATWG `index-*.txt` vendored as data. Why: windows-1251 is the most common non-Western legacy page and the obvious next request; each page is a table plus a 128-pair normative test. Note the SPEC says "not planned; reopen only on a concrete requirement" — recorded here because a typical user of the reference hits it. Effort: small per page. Fits §2.
+- **More single-byte pages (windows-1251, KOI8-R/U, windows-1253..1258, ISO-8859-3..16)** —
+  *not now* (decided 2026-09-30): no consumer has needed them — bxp, the main user, has not — and
+  every table ships in every consumer's binary, which bxp watches in ReleaseSmall. When one is
+  needed, it lands through the existing `build(&overrides)` table pattern with the WHATWG
+  `index-*.txt` vendored as data, and behind a build option if the set grows, so a size-sensitive
+  consumer does not carry pages it never uses.
 - **Streaming decoder/encoder** *(survey 2026-09-30)*: stateful decode of chunked input (needed only for multi-byte/UTF-8 boundaries once UTF-16 lands; single-byte pages are stateless). Why: reading large exports without buffering the whole file. Effort: medium. Fits §2.
 
 ## Status

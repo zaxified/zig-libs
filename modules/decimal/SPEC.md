@@ -48,7 +48,8 @@ Not security-sensitive — the contract is numerical correctness. The i256 scali
 parse accumulator are overflow-checked so hostile input (huge mantissa × exponent) yields a clean
 error, never a trap. Out of scope for `Decimal` specifically: arbitrary/unbounded precision (scale
 fixed at 12 — see `BigDecimal` below for that), locale/grouping-aware parsing (caller strips
-separators), currency semantics, float interchange.
+separators), currency semantics. Float interchange is planned only as an explicit boundary
+bridge (*Backlog*, float bridge) — never inside an arithmetic path.
 
 ## BigDecimal — arbitrary precision (big.zig)
 
@@ -187,7 +188,17 @@ None open. The rounding core (`roundedDivMag`) is implemented and KAT-covered, a
 closed. Deliberately not built: GDA's general `power` with non-integer exponents (needs `exp`/`ln`
 on bignums — a separate transcendental-function project), a GDA context/flag register, and
 scientific-notation output.
-- **Float bridge** *(survey 2026-09-30)*: `Decimal.fromFloat` (exact or shortest-round-trip, with a rounding mode) and `Decimal.toFloat`. Why: Python `Decimal.from_float`/`float(d)` and rust-decimal both offer it, and consumers meet `f64` in JSON and sensor data at the boundary; today they format-then-parse by hand. Note the module's "no floats anywhere" stance is about the arithmetic paths — a boundary conversion via `std.fmt` keeps the core float-free. Effort: small. Fits CONVENTIONS §2.
+- **Float bridge** *(survey 2026-09-30; decided 2026-09-30 — build it, for parity with the
+  competition)*: `Decimal.fromFloat` and `Decimal.toFloat` (and the `BigDecimal` pair), as
+  Python's `Decimal.from_float`/`float(d)` and rust_decimal offer. Rules: `fromFloat` refuses NaN
+  and ±Inf with an error (never a trap, never a silent 0), converts the binary value **exactly** to
+  the scale and then rounds with an explicit rounding mode (Python's `from_float` is exact too;
+  the shortest-round-trip reading is a second, named entry point for "what the user typed");
+  `toFloat` returns the correctly rounded nearest `f64`. The bridge lives only at these entry
+  points: no arithmetic path calls them, so the module's no-float guarantee holds for every
+  computation, and a consumer that wants a float-free pipeline — bxp, which removed its f64
+  round-trips after `@intFromFloat` defects — keeps it by not calling them. Effort: small. Fits
+  CONVENTIONS §2.
 
 ## Status
 `extract · any · util · reentrant` · deps: none (std only) — canonical source is `pub const meta` in

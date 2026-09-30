@@ -124,9 +124,8 @@ From README "Deferred (not implemented in v1)", now trimmed to what's still actu
   and the new writer's escaping, and no concrete consumer has asked for a non-RFC dialect yet.
 - **Strict RFC 4180 opt-in mode:** (a) multi-line quoted fields spanning `\n` and (b) a
   trailing-delimiter emitting a final empty field. Both still deviate by design (see the
-  `splitFields` trailing-delimiter test and the lazy-quotes note above) — (a) in particular would
-  force a real parser rewrite (the whole bounded-memory chunking design leans on "every `\n` is a
-  safe record boundary"), so it stays deferred rather than being bolted on.
+  `splitFields` trailing-delimiter test and the lazy-quotes note above). For (a) see the design
+  proposal below: an opt-in mode with a bounded span, not a parser rewrite.
 
 Implemented this round (previously listed here as deferred): configurable delimiter at the
 `StreamReader` level (`Options.delimiter` + `nextFields`), BOM detection/stripping (`stripBom`,
@@ -134,12 +133,45 @@ automatic in `StreamReader.next`), header-row capture (`Header`), typed field co
 (`parseInt`/`parseFloat`/`parseBool`), CSV writing (`writeField`/`writeRecord`, RFC 4180 quoting-on-
 output), and field-count/arity validation (`Header.validateArity`/`validateArity`).
 
-- **Multi-line quoted fields (strict mode)** *(survey 2026-09-30)*: already named above as the
-  strict RFC 4180 opt-in; the survey raises its priority. Go `encoding/csv`, rust-csv and both Zig
-  peers read a quoted field that contains a newline; exports from spreadsheets and databases
-  (free-text cells, addresses) contain them routinely, so a typical user gets silently wrong
-  rows (flagged `unbalanced_quote`, but split). Effort L: breaks the "every `\n` is a chunk
-  boundary" invariant, needs quote-state carried across chunks and offsets kept intact. Fits §2.
+- **Multi-line quoted fields — design proposal (2026-09-30)**, replacing the survey item of the
+  same day. bxp tracks the consumer side as roadmap K6 ("opt-in `csv_multiline_quotes`").
+  **Why it has looked unsolvable.** Three things collide:
+  1. **Chunk boundaries.** Every `\n` being a record boundary is what lets `ChunkReader` cut a
+     chunk at its last `\n` without parsing.
+  2. **Ambiguity.** An unbalanced quote is genuinely ambiguous: it is either the start of a
+     multi-line field or a stray byte, and no local rule tells them apart.
+  3. **Silent row loss.** The one time bxp spanned lines, IMDb `title.basics.tsv` (12.5 M rows,
+     2 stray quotes 255 866 lines apart) lost ~256 k rows silently, and the open quote grew the
+     buffer without bound. Lazy quotes (2026-06-04) fixed that by giving up spanning.
+
+  **Proposal: spanning as an opt-in mode here, the policy switch in the consumer.**
+  - *Where.* The capability goes here, not in bxp. The parser and `ChunkReader` live in this
+    module, every competitor (Go `encoding/csv`, Python `csv`, rust-csv, both Zig peers) reads
+    such fields, and a second parser in a consumer is the dual-parser anti-pattern bxp already
+    removed once. bxp exposes it as the config switch `csv_multiline_quotes` (K6). The default
+    stays lazy quotes, which is bxp's safety choice and this module's default.
+  - *API.* `Options.quoted_newlines: enum { end_record, span } = .end_record`, honoured by
+    `LineIterator`, `ChunkReader` and `StreamReader`.
+  - *Chunking in `.span` mode.* `ChunkReader` carries the quote state across chunks and cuts at
+    the last newline that lies **outside** quotes: a forward scan (memchr for `"` and `\n`)
+    instead of `lastIndexOfScalar`. This costs no parallelism, because chunks are cut serially
+    today anyway; bxp's workers evaluate records inside chunks that are already cut
+    (`pipeline.zig`).
+  - *Resolving the ambiguity: bounded lookahead with a local fallback.* A quoted field may
+    span at most `max_quoted_lines` physical lines (default e.g. 64) and at most
+    `max_record_len` bytes. If the closing quote is not found within that bound, the opening
+    quote is declared stray: the record is re-read under the lazy rule and flagged
+    `unbalanced_quote`, and a warning is emitted. The damage an unbalanced quote can do is then
+    capped at one record's look-ahead, never 256 k rows, and memory stays bounded.
+  - *Second check.* When a `Header` is known, a spanned record whose field count differs from
+    the header's also falls back to the lazy reading. bxp found that a field-count check alone
+    does not catch a merge, but together with the line cap it rejects the re-balanced pair that
+    fooled it.
+  - *Tests.* The IMDb shape (two stray quotes far apart) must give 1:1 rows plus 2 warnings in
+    `.span` mode, as it does in `.end_record` mode. csv-spectrum's multi-line cases must pass in
+    `.span` mode. Chunk-boundary tests must put the embedded newline exactly at a chunk edge.
+  - *Effort:* M (a quote-aware boundary scan, the bounded span in `LineIterator`, the fallback),
+    not a parser rewrite: the lazy path stays the default and is untouched.
 - **Serde-style record → struct mapping** *(survey 2026-09-30)*: rust-csv and Go csv libraries
   (`gocsv`, `csvutil`) deserialize rows into structs; here `Header` + `parseInt`/`parseFloat` are
   manual. Effort M (comptime struct reflection over `nextFields`). Fits §2.

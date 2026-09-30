@@ -119,7 +119,12 @@ Full JSON5 spec gaps, not covered and not added in this extraction:
   rewrites whitespace, only comments/keys/commas/quotes.
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
   `{ out, next_id }` pair; no structured line/col/severity type yet).
-- **JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; decide a policy for `Infinity`/`NaN` (JSON has none: error, `null` or string). Why: json5-rs's README lists them among the basic features and the upstream corpus tests them; a config with `timeout: .5` fails today with an opaque `std.json` error. Effort: small–medium (the scanner already walks values to skip strings). Fits CONVENTIONS §2. Supersedes the SPEC list above for these items.
+- **JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a
+  clear message — JSON has no such numbers, and the main consumer, bxp, rejects non-finite values
+  everywhere else as a safety rule), with an **opt-in `non_finite = .quoted`** that rewrites them to
+  the strings `"Infinity"`, `"-Infinity"`, `"NaN"`: `std.json` decodes a string into an `f64` field
+  through `std.fmt.parseFloat`, which reads exactly those, so a typed struct gets the same `inf`/`nan`
+  the reference json5 (JS) produces. Never `null` — that silently loses the value. Why: json5-rs's README lists them among the basic features and the upstream corpus tests them; a config with `timeout: .5` fails today with an opaque `std.json` error. Effort: small–medium (the scanner already walks values to skip strings). Fits CONVENTIONS §2. Supersedes the SPEC list above for these items.
 - **String line continuations and JSON5 whitespace** *(survey 2026-09-30)*: backslash-newline inside strings, form feed/vertical tab/Unicode spaces/BOM between tokens. Why: the remaining corpus fixtures; hand-wrapped long strings in configs use the former. Effort: small. Fits §2.
 
 ## Status
