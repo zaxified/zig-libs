@@ -12,10 +12,11 @@
 //!    (covers busybox + GNU `tar`): regular files, directories, symlinks,
 //!    hard links, the GNU long-name ('L') / long-link ('K') extensions, the
 //!    ustar `prefix` field, GNU/star base-256 size fields, and pax extended
-//!    headers ('x'): `path`, `linkpath` and `size` override the ustar fields
+//!    headers ('x'): `path`, `linkpath`, `size`, `uid`, `gid` and `mtime`
+//!    (whole seconds + nanoseconds, may be negative) override the ustar fields
 //!    (what Python's tarfile, Go's archive/tar and bsdtar write for a long
-//!    name or a file over 8 GiB), other pax records are parsed past; a
-//!    malformed pax header is `error.BadHeader`. Global pax headers ('g') are
+//!    name, a file over 8 GiB, a large id or a fractional time), other pax
+//!    records are parsed past; a malformed pax header is `error.BadHeader`. Global pax headers ('g') are
 //!    skipped: a global `path`/`size` has no per-entry meaning. Unknown typeflags
 //!    surface as `.other` so the caller decides. Every header is checksum-
 //!    verified and bounds-checked — truncated/garbage input yields an error,
@@ -24,6 +25,9 @@
 //!  - `Writer` (portable): emits ustar blocks with GNU 'L'/'K' records for
 //!    >100-byte paths/link targets, correct checksums, 512-byte blocking and
 //!    the two zero trailer blocks. Byte-faithful round-trip with `Reader`.
+//!    `WriteOptions.long_names = .pax` instead emits a pax 'x' record set for
+//!    whatever ustar cannot hold (long path/link, size over 8 GiB, ids over
+//!    2 097 151, negative or fractional mtime).
 //!  - `packTarGz` (portable): caller-supplied entries → gzip-compressed tar
 //!    via `std.compress.flate`, streaming.
 //!  - `packDir` (Linux): walk filesystem roots and pack a gzip tar with real
@@ -87,8 +91,15 @@ pub const Entry = struct {
     mode: u32 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
-    /// Seconds since the epoch. The writer clamps negative values to 0.
+    /// Whole seconds since the epoch (floor: the instant is `mtime` plus
+    /// `mtime_nsec` nanoseconds, so -1.25 s is `mtime = -2`,
+    /// `mtime_nsec = 750_000_000`). Negative or over `0o77777777777` is
+    /// `error.FieldOutOfRange` for a GNU-mode writer, a pax record in pax mode.
     mtime: i64 = 0,
+    /// Sub-second part of the mtime, 0..999_999_999. Only a pax `mtime`
+    /// record carries it: the reader fills it from one (else 0), the pax-mode
+    /// writer emits it, the GNU-mode writer drops it (ustar has no room).
+    mtime_nsec: u32 = 0,
     /// Content byte count (files; 0 for dirs/symlinks/hardlinks).
     size: u64 = 0,
     /// Symlink target / hard-link target ('2'/'1' entries), else "".
@@ -116,6 +127,7 @@ pub const Entry = struct {
             .uid = self.uid,
             .gid = self.gid,
             .mtime = self.mtime,
+            .mtime_nsec = self.mtime_nsec,
             .size = self.size,
             .link_target = link_target,
             .typeflag = self.typeflag,
@@ -134,6 +146,7 @@ pub const OwnedEntry = struct {
     uid: u32 = 0,
     gid: u32 = 0,
     mtime: i64 = 0,
+    mtime_nsec: u32 = 0,
     size: u64 = 0,
     link_target: []u8 = &.{},
     typeflag: u8 = 0,
@@ -180,13 +193,16 @@ pub const Reader = struct {
     /// real entry.
     pending_path: ?[]u8 = null,
     pending_link: ?[]u8 = null,
-    /// `path`, `linkpath` and `size` from a pax extended header ('x') for the
-    /// next real entry. They win over GNU 'L'/'K' and over the ustar fields:
+    /// `path`, `linkpath`, `size`, `uid`, `gid` and `mtime` from a pax extended
+    /// header ('x') for the next real entry. They win over GNU 'L'/'K' and over the ustar fields:
     /// the header's own fields are only the fallback a pax-unaware reader
     /// sees (a truncated name, a size of 0 for a file over 8 GiB).
     pax_path: ?[]u8 = null,
     pax_link: ?[]u8 = null,
     pax_size: ?u64 = null,
+    pax_uid: ?u32 = null,
+    pax_gid: ?u32 = null,
+    pax_mtime: ?PaxTime = null,
     /// Unconsumed content bytes of the current entry + its block padding.
     remaining: u64 = 0,
     pad: u64 = 0,
@@ -291,6 +307,14 @@ pub const Reader = struct {
             // desynchronise from the stream.
             const size: u64 = if (self.pax_size) |ps| ps else h.size;
             self.pax_size = null;
+            // pax uid/gid/mtime likewise replace the header's fields (which a
+            // pax writer leaves 0 when the real value does not fit).
+            const uid: u32 = self.pax_uid orelse h.uid;
+            const gid: u32 = self.pax_gid orelse h.gid;
+            const mtime: PaxTime = self.pax_mtime orelse .{ .sec = h.mtime, .nsec = 0 };
+            self.pax_uid = null;
+            self.pax_gid = null;
+            self.pax_mtime = null;
             if (size > std.math.maxInt(u64) - block_size) return error.BadHeader;
 
             const kind: Kind = switch (h.typeflag) {
@@ -329,9 +353,10 @@ pub const Reader = struct {
                 .path = std.mem.sliceTo(self.path_buf, 0),
                 .kind = kind,
                 .mode = h.mode,
-                .uid = h.uid,
-                .gid = h.gid,
-                .mtime = h.mtime,
+                .uid = uid,
+                .gid = gid,
+                .mtime = mtime.sec,
+                .mtime_nsec = mtime.nsec,
                 // Reported as the content actually present, not as the header
                 // claims — matching what GNU tar reports for these types.
                 .size = if (carries_content) size else 0,
@@ -367,12 +392,15 @@ pub const Reader = struct {
     }
 
     /// Read a pax extended header ('x') and keep the records this reader
-    /// honours: `path`, `linkpath`, `size`. Every record is checked for shape
+    /// honours: `path`, `linkpath`, `size`, `uid`, `gid`, `mtime`. Every record is checked for shape
     /// — `<len> <key>=<value>\n`, `len` counting the whole record — and a
     /// malformed one refuses the archive rather than being skipped: a record
     /// a reader cannot delimit is one it cannot know it has not misread.
     /// An empty value deletes the keyword (POSIX), i.e. falls back to the
-    /// header field.
+    /// header field. A numeric record that is not a number (`uid=x`,
+    /// `mtime=1.2.3`, an id over `u32`, a time over `i64`) is `BadHeader` too:
+    /// silently keeping the header's value would report a different owner or
+    /// time than the archive states. A repeated keyword: the last one wins.
     fn readPax(self: *Reader, size: u64) ReadError!void {
         if (size > max_pax_len) return error.BadHeader;
         const buf = try self.gpa.alloc(u8, @intCast(size));
@@ -406,6 +434,12 @@ pub const Reader = struct {
                 }
                 for (value) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
                 self.pax_size = std.fmt.parseInt(u64, value, 10) catch return error.BadHeader;
+            } else if (std.mem.eql(u8, key, "uid")) {
+                self.pax_uid = try parsePaxId(value);
+            } else if (std.mem.eql(u8, key, "gid")) {
+                self.pax_gid = try parsePaxId(value);
+            } else if (std.mem.eql(u8, key, "mtime")) {
+                self.pax_mtime = try parsePaxTime(value);
             }
         }
     }
@@ -442,6 +476,40 @@ const Hdr = struct {
     size: u64,
     typeflag: u8,
 };
+
+/// A pax time: the instant is `sec` + `nsec`/1e9 with `nsec` in 0..999_999_999
+/// (floor semantics, so a negative fractional time has `sec` one lower).
+const PaxTime = struct { sec: i64, nsec: u32 };
+
+/// A pax `uid`/`gid` value: decimal digits fitting `u32` (`Entry`'s id type).
+/// Empty is `null` (the keyword is deleted).
+fn parsePaxId(value: []const u8) error{BadHeader}!?u32 {
+    if (value.len == 0) return null;
+    for (value) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+    return std.fmt.parseInt(u32, value, 10) catch return error.BadHeader;
+}
+
+/// A pax `mtime` value: `[-]digits[.digits]`. Digits after the ninth of the
+/// fraction are dropped (nanosecond resolution). Empty is `null`.
+fn parsePaxTime(value: []const u8) error{BadHeader}!?PaxTime {
+    if (value.len == 0) return null;
+    const neg = value[0] == '-';
+    const rest = if (neg) value[1..] else value;
+    const dot = std.mem.indexOfScalar(u8, rest, '.');
+    const int_part = if (dot) |d| rest[0..d] else rest;
+    const frac_part = if (dot) |d| rest[d + 1 ..] else "";
+    if (int_part.len == 0 or (dot != null and frac_part.len == 0)) return error.BadHeader;
+    for (int_part) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+    for (frac_part) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+    const mag = std.fmt.parseInt(u64, int_part, 10) catch return error.BadHeader;
+    if (mag > std.math.maxInt(i64)) return error.BadHeader;
+    var nsec: u32 = 0;
+    for (0..9) |i| nsec = nsec * 10 + (if (i < frac_part.len) @as(u32, frac_part[i] - '0') else 0);
+    const m: i64 = @intCast(mag);
+    if (!neg) return .{ .sec = m, .nsec = nsec };
+    if (nsec == 0) return .{ .sec = -m, .nsec = 0 };
+    return .{ .sec = -m - 1, .nsec = 1_000_000_000 - nsec };
+}
 
 fn parseHeader(block: *const [block_size]u8) error{BadHeader}!Hdr {
     // The ustar `prefix` field only exists under the POSIX magic
@@ -540,7 +608,12 @@ pub const WriteError = error{
     UnsupportedKind,
     /// A numeric header field does not fit its ustar octal field: `mode`,
     /// `uid` or `gid` above `0o7777777` (7 digits, 21 bits), or `mtime`
-    /// outside `0..0o77777777777` (11 digits, 33 bits).
+    /// outside `0..0o77777777777` (11 digits, 33 bits) — the latter two only
+    /// in GNU mode; `WriteOptions.long_names = .pax` carries them in a pax
+    /// record instead. Also `mtime_nsec` above 999_999_999, in either mode,
+    /// and a `path` or link target containing a NUL byte: no tar form can
+    /// carry one (a ustar field and a GNU 'L' record end at the first NUL, so
+    /// the name would come back truncated; this module's pax reader refuses it).
     ///
     /// Refused rather than truncated. The octal fields discard high bits
     /// silently, and for an id that is not a cosmetic loss: uid `0o10000000`
@@ -561,14 +634,44 @@ const max_octal_8 = 0o7777777;
 /// Largest value a 12-byte ustar octal field can carry (11 digits + NUL).
 const max_octal_12 = 0o77777777777;
 
+/// How the writer carries what a ustar header cannot hold.
+pub const LongNames = enum {
+    /// GNU 'L'/'K' records for a path/link target over 100 bytes; a uid/gid,
+    /// negative or huge mtime is `error.FieldOutOfRange`, a size over 8 GiB
+    /// uses base-256, a fractional mtime loses its fraction. The default, and
+    /// what every release before pax writing emitted (output byte-identical).
+    gnu,
+    /// A pax extended header ('x') with the records `path`, `linkpath`, `size`,
+    /// `uid`, `gid`, `mtime` for exactly the fields that do not fit — read by
+    /// bsdtar, Go, Python and GNU tar alike. A path over 100 bytes first tries
+    /// the ustar `prefix`/`name` split (no record then); the ustar field of a
+    /// value carried by a record holds 0 (a truncated name for paths; base-256
+    /// for a size), as GNU tar and Python write it.
+    pax,
+};
+
+pub const WriteOptions = struct {
+    long_names: LongNames = .gnu,
+};
+
+/// Name of the ustar block that carries a pax 'x' record set (as bsdtar and
+/// Python's tarfile name it).
+const pax_header_name = "././@PaxHeader";
+const max_nsec = 999_999_999;
+
 /// ustar/GNU tar emitter. `writeEntry` for in-memory content; or
 /// `writeHeader` + stream `size` bytes to `dst` + `writePadding(size)` for
 /// large files. `finish()` terminates the archive (two zero blocks).
 pub const Writer = struct {
     dst: *std.Io.Writer,
+    options: WriteOptions = .{},
 
     pub fn init(dst: *std.Io.Writer) Writer {
         return .{ .dst = dst };
+    }
+
+    pub fn initOptions(dst: *std.Io.Writer, options: WriteOptions) Writer {
+        return .{ .dst = dst, .options = options };
     }
 
     /// Write one complete entry with in-memory content. For `.file` the
@@ -589,7 +692,7 @@ pub const Writer = struct {
     }
 
     /// Write a header (preceded by GNU 'L'/'K' records for >100-byte
-    /// strings). For a regular file the caller streams `e.size` content
+    /// strings, or by a pax 'x' header in `.pax` mode — see `LongNames`). For a regular file the caller streams `e.size` content
     /// bytes to `self.dst` next, then calls `writePadding(e.size)`;
     /// dirs/symlinks/hardlinks have no content.
     pub fn writeHeader(self: Writer, e: Entry) WriteError!void {
@@ -606,6 +709,11 @@ pub const Writer = struct {
         // refused entry never leaves a half-written header (or a 'L'/'K'
         // record with no header behind it) in the stream.
         if (e.mode > max_octal_8) return error.FieldOutOfRange;
+        if (e.mtime_nsec > max_nsec) return error.FieldOutOfRange;
+        if (std.mem.indexOfScalar(u8, e.path, 0) != null) return error.FieldOutOfRange;
+        if ((e.kind == .symlink or e.kind == .hardlink) and std.mem.indexOfScalar(u8, e.link_target, 0) != null)
+            return error.FieldOutOfRange;
+        if (self.options.long_names == .pax) return writePaxHeader(w, &block, e, typeflag);
         if (e.uid > max_octal_8) return error.FieldOutOfRange;
         if (e.gid > max_octal_8) return error.FieldOutOfRange;
         if (e.mtime < 0 or e.mtime > max_octal_12) return error.FieldOutOfRange;
@@ -636,6 +744,128 @@ pub const Writer = struct {
         try writeZeros(self.dst, block_size * 2);
     }
 };
+
+const PaxRec = struct { key: []const u8, value: []const u8 };
+
+/// Length of one pax record `"<len> <key>=<value>\n"`, where `<len>` counts
+/// the whole record including its own digits: the fixed point of
+/// `len = digits(len) + 1 + body`, found by growing the digit count.
+fn paxRecordLen(key: []const u8, value: []const u8) usize {
+    const body = key.len + 1 + value.len + 1; // key=value\n
+    var digits: usize = 1;
+    while (std.fmt.count("{d}", .{body + 1 + digits}) != digits) digits += 1;
+    return body + 1 + digits;
+}
+
+/// Index of the '/' at which `path` splits into a ustar `prefix` (at most 155
+/// bytes) and a `name` (1..100 bytes), or null when it does not.
+fn splitPrefix(path: []const u8) ?usize {
+    if (path.len < 3) return null;
+    var i = @min(155, path.len - 2);
+    while (i > 0) : (i -= 1) {
+        if (path[i] == '/' and path.len - i - 1 <= 100) return i;
+    }
+    return null;
+}
+
+/// `[-]sec[.frac]` for the instant `sec` + `nsec`/1e9: the fraction has its
+/// trailing zeros trimmed and is omitted when zero; a negative instant with a
+/// fraction prints as the negated magnitude (`-2` s + 0.75 s -> `-1.25`).
+fn formatPaxTime(buf: *[32]u8, sec: i64, nsec: u32) []const u8 {
+    const neg = sec < 0;
+    var whole: u64 = @abs(sec);
+    var frac: u32 = nsec;
+    if (neg and nsec != 0) {
+        whole -= 1;
+        frac = 1_000_000_000 - nsec;
+    }
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{s}{d}", .{ if (neg) "-" else "", whole }) catch unreachable;
+    if (frac != 0) {
+        var digits: [9]u8 = undefined;
+        _ = std.fmt.bufPrint(&digits, "{d:0>9}", .{frac}) catch unreachable;
+        w.print(".{s}", .{std.mem.trimEnd(u8, &digits, "0")}) catch unreachable;
+    }
+    return w.buffered();
+}
+
+/// `.pax` mode of `Writer.writeHeader`: a pax 'x' header for the fields the
+/// ustar block cannot hold (records in key order, as Go writes them), then the
+/// ustar block itself. Nothing is emitted unless every field was validated
+/// (the caller checked `mode` and `mtime_nsec`; the rest cannot fail).
+fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag: u8) WriteError!void {
+    const link: []const u8 = if (e.kind == .symlink or e.kind == .hardlink) e.link_target else "";
+    const size: u64 = if (e.kind == .file) e.size else 0;
+
+    var name = e.path;
+    var prefix: []const u8 = "";
+    var pax_path = false;
+    if (e.path.len > 100) {
+        if (splitPrefix(e.path)) |i| {
+            prefix = e.path[0..i];
+            name = e.path[i + 1 ..];
+        } else pax_path = true;
+    }
+    const time_fits = e.mtime >= 0 and e.mtime <= max_octal_12;
+
+    var gid_buf: [16]u8 = undefined;
+    var uid_buf: [16]u8 = undefined;
+    var size_buf: [24]u8 = undefined;
+    var time_buf: [32]u8 = undefined;
+    var recs: [6]PaxRec = undefined;
+    var n: usize = 0;
+    if (e.gid > max_octal_8) {
+        recs[n] = .{ .key = "gid", .value = std.fmt.bufPrint(&gid_buf, "{d}", .{e.gid}) catch unreachable };
+        n += 1;
+    }
+    if (link.len > 100) {
+        recs[n] = .{ .key = "linkpath", .value = link };
+        n += 1;
+    }
+    if (!time_fits or e.mtime_nsec != 0) {
+        recs[n] = .{ .key = "mtime", .value = formatPaxTime(&time_buf, e.mtime, e.mtime_nsec) };
+        n += 1;
+    }
+    if (pax_path) {
+        recs[n] = .{ .key = "path", .value = e.path };
+        n += 1;
+    }
+    if (size > max_octal_12) {
+        recs[n] = .{ .key = "size", .value = std.fmt.bufPrint(&size_buf, "{d}", .{size}) catch unreachable };
+        n += 1;
+    }
+    if (e.uid > max_octal_8) {
+        recs[n] = .{ .key = "uid", .value = std.fmt.bufPrint(&uid_buf, "{d}", .{e.uid}) catch unreachable };
+        n += 1;
+    }
+
+    if (n > 0) {
+        var total: usize = 0;
+        for (recs[0..n]) |r| total += paxRecordLen(r.key, r.value);
+        emitHeader(block, pax_header_name, "", 0o644, 0, 0, total, 0, 'x');
+        try w.writeAll(block);
+        for (recs[0..n]) |r|
+            try w.print("{d} {s}={s}\n", .{ paxRecordLen(r.key, r.value), r.key, r.value });
+        try writeZeros(w, padding(total));
+    }
+
+    emitHeader(
+        block,
+        name,
+        link,
+        e.mode,
+        if (e.uid > max_octal_8) 0 else e.uid,
+        if (e.gid > max_octal_8) 0 else e.gid,
+        size,
+        if (time_fits) e.mtime else 0,
+        typeflag,
+    );
+    if (prefix.len > 0) {
+        copyTrunc(block[345..500], prefix);
+        fixChecksum(block);
+    }
+    try w.writeAll(block);
+}
 
 fn writeGnuLong(w: *std.Io.Writer, block: *[block_size]u8, kind: u8, value: []const u8) std.Io.Writer.Error!void {
     emitHeader(block, gnu_longlink_name, "", 0, 0, 0, value.len + 1, 0, kind);
@@ -669,7 +899,11 @@ fn emitHeader(
     copyTrunc(block[157..257], linkname);
     @memcpy(block[257..263], "ustar\x00");
     @memcpy(block[263..265], "00");
+    fixChecksum(block);
+}
 
+/// (Re)compute the checksum field: unsigned byte sum with the field as spaces.
+fn fixChecksum(block: *[block_size]u8) void {
     @memset(block[148..156], ' ');
     var sum: u64 = 0;
     for (block) |b| sum += b;
@@ -1509,6 +1743,182 @@ test "pax 'x': a malformed or hostile header -> error.BadHeader, never a misread
     try testing.expectError(error.BadHeader, tr.next());
 }
 
+test "pax 'x' uid/gid/mtime override the header fields and do not leak onto the next entry" {
+    var rb: [3][64]u8 = undefined;
+    const payload = try std.mem.concat(testing.allocator, u8, &.{
+        paxRecord(&rb[0], "uid", "3000000"),
+        paxRecord(&rb[1], "gid", "4000001"),
+        paxRecord(&rb[2], "mtime", "1727700007.123456789"),
+    });
+    defer testing.allocator.free(payload);
+
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "PaxHeaders/x", "", 0, 0, 0, payload.len, 0, 'x');
+    try dst.writeAll(&block);
+    try dst.writeAll(payload);
+    try writeZeros(&dst, padding(payload.len));
+    emitHeader(&block, "first", "", 0o644, 1, 2, 0, 3, '0');
+    try dst.writeAll(&block);
+    emitHeader(&block, "second", "", 0o644, 1, 2, 0, 3, '0');
+    try dst.writeAll(&block);
+    try writeZeros(&dst, 2 * block_size);
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    const a = (try tr.next()).?;
+    try testing.expectEqual(@as(u32, 3_000_000), a.uid);
+    try testing.expectEqual(@as(u32, 4_000_001), a.gid);
+    try testing.expectEqual(@as(i64, 1_727_700_007), a.mtime);
+    try testing.expectEqual(@as(u32, 123_456_789), a.mtime_nsec);
+    const b = (try tr.next()).?;
+    try testing.expectEqual(@as(u32, 1), b.uid);
+    try testing.expectEqual(@as(u32, 2), b.gid);
+    try testing.expectEqual(@as(i64, 3), b.mtime);
+    try testing.expectEqual(@as(u32, 0), b.mtime_nsec);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "pax 'x' uid/gid/mtime: an empty value deletes the keyword, a repeated keyword's last one wins" {
+    var rb: [5][64]u8 = undefined;
+    const payload = try std.mem.concat(testing.allocator, u8, &.{
+        paxRecord(&rb[0], "uid", "9"),
+        paxRecord(&rb[1], "uid", ""), // deletes the 9
+        paxRecord(&rb[2], "gid", "5"),
+        paxRecord(&rb[3], "gid", "6"), // last wins
+        paxRecord(&rb[4], "mtime", ""),
+    });
+    defer testing.allocator.free(payload);
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var real_block: [block_size]u8 = undefined;
+    emitHeader(&real_block, "f", "", 0o644, 11, 12, 0, 13, '0');
+    try paxArchive(&dst, payload, &real_block, "");
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    const e = (try tr.next()).?;
+    try testing.expectEqual(@as(u32, 11), e.uid);
+    try testing.expectEqual(@as(u32, 6), e.gid);
+    try testing.expectEqual(@as(i64, 13), e.mtime);
+}
+
+test "pax mtime parsing: sign, fraction, floor semantics, digit cut-off" {
+    const Case = struct { in: []const u8, sec: i64, nsec: u32 };
+    const ok = [_]Case{
+        .{ .in = "0", .sec = 0, .nsec = 0 },
+        .{ .in = "-0", .sec = 0, .nsec = 0 },
+        .{ .in = "1727700007", .sec = 1_727_700_007, .nsec = 0 },
+        .{ .in = "1727700007.5", .sec = 1_727_700_007, .nsec = 500_000_000 },
+        .{ .in = "1727700007.123456789", .sec = 1_727_700_007, .nsec = 123_456_789 },
+        .{ .in = "1.000000001", .sec = 1, .nsec = 1 },
+        .{ .in = "1.1234567899999", .sec = 1, .nsec = 123_456_789 }, // cut, not rounded
+        .{ .in = "007.0", .sec = 7, .nsec = 0 },
+        .{ .in = "-1", .sec = -1, .nsec = 0 },
+        .{ .in = "-1.25", .sec = -2, .nsec = 750_000_000 }, // floor: -2 + 0.75
+        .{ .in = "-0.5", .sec = -1, .nsec = 500_000_000 },
+        .{ .in = "-315619199.5", .sec = -315_619_200, .nsec = 500_000_000 },
+        .{ .in = "9223372036854775807", .sec = std.math.maxInt(i64), .nsec = 0 },
+        .{ .in = "-9223372036854775807", .sec = -std.math.maxInt(i64), .nsec = 0 },
+        .{ .in = "-9223372036854775807.5", .sec = std.math.minInt(i64), .nsec = 500_000_000 },
+    };
+    for (ok) |c| {
+        const t = (try parsePaxTime(c.in)).?;
+        testing.expectEqual(c.sec, t.sec) catch |err| {
+            std.debug.print("pax mtime {s}: sec\n", .{c.in});
+            return err;
+        };
+        testing.expectEqual(c.nsec, t.nsec) catch |err| {
+            std.debug.print("pax mtime {s}: nsec\n", .{c.in});
+            return err;
+        };
+    }
+    try testing.expectEqual(@as(?PaxTime, null), try parsePaxTime(""));
+    const bad = [_][]const u8{
+        "-",   ".5",  "-.5",  "1.",  "1.2.3", "--1",  "+1",                  " 1",                   "1 ",
+        "abc", "1e9", "0x10", "1,5", "1.5x",  "1.-5", "9223372036854775808", "-9223372036854775808", "99999999999999999999999",
+    };
+    for (bad) |v| {
+        testing.expectError(error.BadHeader, parsePaxTime(v)) catch |err| {
+            std.debug.print("pax mtime not refused: {s}\n", .{v});
+            return err;
+        };
+    }
+}
+
+test "pax 'x' uid/gid/mtime: garbage, overflow or a lying length -> error.BadHeader, never a panic" {
+    const pairs = [_][2][]const u8{
+        .{ "uid", "x" }, .{ "uid", "-1" }, .{ "uid", "+1" },
+        .{ "uid", "1e3" },     .{ "uid", " 5" },              .{ "uid", "4294967296" }, // over u32
+        .{ "gid", "0x10" },    .{ "gid", "5.5" },             .{ "gid", "99999999999999999999" },
+        .{ "mtime", "abc" },   .{ "mtime", "1." },            .{ "mtime", ".5" },
+        .{ "mtime", "1.2.3" }, .{ "mtime", "1727700007.5x" }, .{ "mtime", "9223372036854775808" },
+    };
+    for (pairs) |kv| {
+        var rb: [128]u8 = undefined;
+        var buf: [8 * block_size]u8 = undefined;
+        var dst: std.Io.Writer = .fixed(&buf);
+        var real_block: [block_size]u8 = undefined;
+        emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 0, 0, '0');
+        try paxArchive(&dst, paxRecord(&rb, kv[0], kv[1]), &real_block, "");
+        var src: std.Io.Reader = .fixed(dst.buffered());
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+        testing.expectError(error.BadHeader, tr.next()) catch |err| {
+            std.debug.print("pax {s}={s} not refused\n", .{ kv[0], kv[1] });
+            return err;
+        };
+    }
+
+    // The length prefix lies: too long, too short, or trailing junk behind a
+    // correct record.
+    const lies = [_][]const u8{
+        "9 uid=5\n", // real length is 8
+        "7 uid=5\n",
+        "20 uid=5\n",
+        "8 uid=5\nzzz",
+        "8 uid=5\n\n",
+        "0 uid=5\n",
+    };
+    for (lies) |payload| {
+        var buf: [8 * block_size]u8 = undefined;
+        var dst: std.Io.Writer = .fixed(&buf);
+        var real_block: [block_size]u8 = undefined;
+        emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 0, 0, '0');
+        try paxArchive(&dst, payload, &real_block, "");
+        var src: std.Io.Reader = .fixed(dst.buffered());
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+        testing.expectError(error.BadHeader, tr.next()) catch |err| {
+            std.debug.print("pax payload not refused: {s}\n", .{payload});
+            return err;
+        };
+    }
+}
+
+test "pax 'x': a path over max_name_len inside a payload under max_pax_len -> error.BadHeader" {
+    const gpa = testing.allocator;
+    const long = try gpa.alloc(u8, max_name_len + 1);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    const rb = try gpa.alloc(u8, max_name_len + 64);
+    defer gpa.free(rb);
+    const rec = paxRecord(rb, "path", long);
+    const buf = try gpa.alloc(u8, rec.len + 8 * block_size);
+    defer gpa.free(buf);
+    var dst: std.Io.Writer = .fixed(buf);
+    var real_block: [block_size]u8 = undefined;
+    emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 0, 0, '0');
+    try paxArchive(&dst, rec, &real_block, "");
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
+}
+
 test "pax global header ('g') is still skipped, including its padding" {
     var rb: [64]u8 = undefined;
     const rec = paxRecord(&rb, "comment", "made by someone");
@@ -1701,6 +2111,12 @@ test "writer refuses a numeric field that does not fit, instead of truncating it
     try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mode = max_octal_8 + 1 }, ""));
     try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mtime = max_octal_12 + 1 }, ""));
     try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mtime = -1 }, ""));
+    // A NUL in a name has no tar form in either mode (it would come back
+    // truncated, or be refused by the pax reader).
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "a\x00b" }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "l", .kind = .symlink, .link_target = "t\x00" }, ""));
+    const pw = Writer.initOptions(tw.dst, .{ .long_names = .pax });
+    try testing.expectError(error.FieldOutOfRange, pw.writeEntry(.{ .path = "p" ** 150 ++ "\x00" }, ""));
 
     // The refusal happens before any byte is emitted, so a rejected entry
     // leaves no partial header (and no orphan 'L' record) in the stream.
@@ -2181,6 +2597,60 @@ test "GNU tar extracts + lists our archive (external cross-check)" {
     }
 }
 
+test "GNU tar lists + extracts our pax-mode archive (external cross-check of the pax writer)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const probe = systemTar(gpa, io, tmp.dir, &.{ "tar", "--version" }) catch return error.SkipZigTest;
+    const probe_res = probe orelse return error.SkipZigTest;
+    gpa.free(probe_res.stdout);
+    gpa.free(probe_res.stderr);
+
+    const long_path = "p" ** 150; // one component: no prefix split, so a pax `path`
+    const long_target = "t" ** 130;
+    {
+        var f = try tmp.dir.createFile(io, "ours-pax.tar", .{});
+        defer f.close(io);
+        var fbuf: [8192]u8 = undefined;
+        var fw = f.writer(io, &fbuf);
+        const tw = Writer.initOptions(&fw.interface, .{ .long_names = .pax });
+        try tw.writeEntry(.{
+            .path = long_path,
+            .mode = 0o644,
+            .uid = 5_000_000,
+            .gid = 6_000_000,
+            .mtime = 1_727_700_007,
+            .mtime_nsec = 500_000_000,
+        }, "pax content\n");
+        try tw.writeEntry(.{ .path = "link", .kind = .symlink, .link_target = long_target, .mode = 0o777, .mtime = 1_600_000_000 }, "");
+        try tw.finish();
+        try fw.interface.flush();
+    }
+
+    {
+        const res = (try systemTar(gpa, io, tmp.dir, &.{ "tar", "--numeric-owner", "--full-time", "-tvvf", "ours-pax.tar" })).?;
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        try testing.expect(std.mem.indexOf(u8, res.stdout, "5000000/6000000") != null);
+        try testing.expect(std.mem.indexOf(u8, res.stdout, ":07.5 " ++ long_path) != null); // the .5 s survived
+        try testing.expect(std.mem.indexOf(u8, res.stdout, "link -> " ++ long_target) != null);
+    }
+    {
+        try tmp.dir.createDirPath(io, "out");
+        const res = (try systemTar(gpa, io, tmp.dir, &.{ "tar", "-xf", "ours-pax.tar", "-C", "out" })).?;
+        gpa.free(res.stdout);
+        gpa.free(res.stderr);
+        const body = try tmp.dir.readFileAlloc(io, "out/" ++ long_path, gpa, .limited(1024));
+        defer gpa.free(body);
+        try testing.expectEqualStrings("pax content\n", body);
+        var lbuf: [256]u8 = undefined;
+        const tlen = try tmp.dir.readLink(io, "out/link", &lbuf);
+        try testing.expectEqualStrings(long_target, lbuf[0..tlen]);
+    }
+}
+
 // ── offline write-path anchor (real GNU tar captures, no subprocess) ──────
 //
 // Complements the live cross-check above (host-gated, skips without a `tar`
@@ -2188,4 +2658,5 @@ test "GNU tar extracts + lists our archive (external cross-check)" {
 // subprocess and no skip path — see write_golden_test.zig's doc comment.
 test {
     _ = @import("write_golden_test.zig");
+    _ = @import("pax_test.zig");
 }

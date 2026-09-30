@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Additive** (C17): pax `uid`, `gid` and `mtime` records are honoured on read
+  and pax 'x' headers can be written. `Entry` gains `mtime_nsec: u32 = 0` (also on `OwnedEntry`;
+  `mtime` stays whole seconds, floor semantics: -1.25 s is `mtime = -2`, `mtime_nsec = 750_000_000`).
+  The reader takes `uid`/`gid` (decimal, must fit `u32`) and `mtime` (`[-]sec[.frac]`, fraction cut at
+  nine digits) from a pax header over the ustar fields, as `path`/`linkpath`/`size` already did; an
+  empty value deletes the keyword, a repeated one is last-wins, a non-numeric or over-range value is
+  `error.BadHeader` (previously such records were skipped). New `WriteOptions{ .long_names = .gnu | .pax }`
+  and `Writer.initOptions`; `Writer.init` and the default `.gnu` output are byte-identical to before.
+  `.pax` writes a `././@PaxHeader` 'x' record set (`gid linkpath mtime path size uid`, exact
+  `"<len> <key>=<value>\n"` form) for what ustar cannot hold, tries the ustar `prefix`/`name` split
+  for a long path first, and carries negative/out-of-range/fractional mtimes and ids over 0o7777777
+  that `.gnu` refuses with `FieldOutOfRange`. `mtime_nsec` above 999 999 999 is `FieldOutOfRange` in
+  both modes. Anchored to GNU tar 1.35 `--format=pax` and Python `tarfile` archives
+  (`testdata/read_pax_*.tar`).
+  Write direction cross-checked by the coordinator on an archive this module wrote in `.pax` mode
+  (150-byte path, uid 5000000 / gid 6000000, mtime 1727700007.5, mtime -1.25, a 130-byte symlink
+  target): GNU tar 1.35 `-tvv --numeric-owner` and Python 3.14 `tarfile` both read every field back
+  (GNU tar prints the negative fractional time shifted, Python gives -1.25 exactly). Also: a `path`
+  or link target containing NUL is now `FieldOutOfRange` in both modes (no tar form carries one; it
+  came back truncated before).
+
 - **2026-09-30** — **BEHAVIOURAL, not breaking:** the reader honours pax extended headers
   ('x'). `path`, `linkpath` and `size` now override the ustar fields, as Python's tarfile
   (PAX_FORMAT is its default since 3.8), Go's archive/tar and bsdtar intend for a name over

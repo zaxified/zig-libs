@@ -46,12 +46,17 @@ try tw.finish(); // two zero trailer blocks
 // Large files: tw.writeHeader(entry) -> stream entry.size bytes to dst
 // -> tw.writePadding(entry.size).
 
+// pax instead of GNU 'L'/'K' (what bsdtar, Go and Python read and write): also
+// carries ids over 2 097 151, negative / out-of-range / fractional mtimes
+// (`.mtime_nsec`) and sizes over 8 GiB as pax records.
+var pw = tar.Writer.initOptions(dst, .{ .long_names = .pax });
+
 // Read: streaming, bounded memory (only names are buffered, 64 KiB cap).
 var tr = tar.Reader.init(gpa, src);
 defer tr.deinit();
 while (try tr.next()) |e| {
     // e.path, e.kind (.file/.dir/.symlink/.hardlink/.other), e.mode,
-    // e.uid, e.gid, e.mtime, e.size, e.link_target
+    // e.uid, e.gid, e.mtime (+ e.mtime_nsec), e.size, e.link_target
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = try tr.read(&buf); // stream content; 0 = entry done
@@ -86,11 +91,35 @@ const stats2 = try tar.packDirToPath(io, gpa, &.{"/etc/config"}, "/backups/confi
   ('5'), symlinks ('2'), hard links ('1'), GNU long-name ('L') / long-link
   ('K') records, the ustar `prefix` field (only under the POSIX
   `ustar\0` magic — GNU reuses those bytes), octal and GNU/star base-256
-  size fields. pax ('x'/'g') payloads are skipped, never fatal; other
-  typeflags surface as `.other` with the raw flag in `Entry.typeflag`.
+  size fields, pax 'x' headers: `path`, `linkpath`, `size`, `uid`, `gid` and
+  `mtime` (whole seconds + `Entry.mtime_nsec`, negative allowed) override the
+  ustar fields, other records are parsed past, a malformed record or a
+  non-numeric/over-range `uid`/`gid`/`mtime` is `error.BadHeader`; pax global
+  ('g') headers are skipped; other typeflags surface as `.other` with the raw
+  flag in `Entry.typeflag`.
 - **Write:** ustar blocks + GNU 'L'/'K' records for >100-byte paths/link
   targets, correct checksum, 512-byte blocking, two zero trailer blocks;
-  base-256 size field for files ≥ 8 GiB; negative mtimes clamp to 0.
+  base-256 size field for files ≥ 8 GiB; a negative or over-range mtime, or a
+  uid/gid over 0o7777777, is `error.FieldOutOfRange`; a fractional mtime loses
+  its fraction. That is the default (`WriteOptions.long_names = .gnu`).
+  With `.pax` the writer emits a pax 'x' header for exactly what ustar cannot
+  hold (path not splittable into prefix/name, link target over 100 bytes, size
+  over 8 GiB, uid/gid over 0o7777777, mtime outside the octal range or with a
+  fraction); a splittable long path uses the ustar `prefix` and needs no header.
+
+### pax writing: cross-check
+
+The exact pax bytes are pinned by hand-computed tests; the `GNU tar lists +
+extracts our pax-mode archive` test in `src/root.zig` runs system GNU tar on
+one. To inspect an archive written in pax mode by hand (write it with
+`Writer.initOptions(w, .{ .long_names = .pax })`, e.g. path `"p" ** 150`,
+uid 5000000, gid 6000000, mtime 1727700007 + nsec 500000000):
+
+```sh
+tar --numeric-owner --full-time -tvvf out.tar        # 5000000/6000000 ... :07.5 ppp...
+python3 -c "import tarfile; [print(len(m.name), m.uid, m.gid, m.mtime) for m in tarfile.open('out.tar').getmembers()]"
+# -> 150 5000000 6000000 1727700007.5
+```
 
 ## Design notes
 
