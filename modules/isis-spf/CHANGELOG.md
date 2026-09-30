@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Added: LAN transit through pseudonodes.** A pseudonode LSP
+  (LSP-ID octet 6 ≠ 0) and member advertisements toward a pseudonode used to be
+  dropped, so a broadcast circuit was invisible to SPF. Now every member that
+  lists the pseudonode AND is listed back by the pseudonode's LSP (the two-way
+  check on the LAN) reaches every other such member at its own metric toward
+  the pseudonode (`addLanArcs`; the zero-cost pseudonode→member half is folded
+  in, so no zero-weight arc and no pseudonode vertex). A pseudonode is never a
+  route destination. Routes over databases with LANs change accordingly; P2P-only
+  databases are unaffected. Found missing by `isis-sim`'s LAN circuits.
+
 - **2026-09-07** — **`fuzzComputeOverLsdb` built both of its LSPs with a ZERO-octet
   TLV region, so the SPF it exists to fuzz ran over a graph with no edges.**
 

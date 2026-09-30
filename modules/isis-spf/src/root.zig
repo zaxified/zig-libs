@@ -32,8 +32,10 @@
 //!      first hop after the root (walking the tree's predecessor chain) and the
 //!      total metric, emitting `dest → { next_hop, metric }`, sorted by dest.
 //!
-//! Scope: **point-to-point topology → SPF → next-hop table**. LAN pseudonodes,
-//! multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload
+//! Scope: **point-to-point and LAN topology → SPF → next-hop table**. A LAN
+//! pseudonode is transit only: members it lists and that list it back are
+//! joined by arcs at each member's own metric (`addLanArcs`, since
+//! 2026-09-30). Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload
 //! bit's transit exclusion, and incremental SPF are deferred — see `SPEC.md`.
 
 const std = @import("std");
@@ -288,6 +290,15 @@ fn computeInternal(
     // origins: every system-id that originated at least one (non-pseudonode) LSP.
     var origins: std.AutoHashMapUnmanaged(SystemId, void) = .empty;
     defer origins.deinit(gpa);
+    // LAN transit (ISO 10589 §7.2 / Annex C, RFC 1195): a pseudonode is named
+    // by 7 octets (the DIS system-id + circuit id). `pn_lists` holds
+    // (pseudonode ++ member) for every IS a pseudonode LSP lists; `to_pn`
+    // holds (member ++ pseudonode) → the member's own advertised metric
+    // toward the pseudonode.
+    var pn_lists: std.AutoHashMapUnmanaged([13]u8, void) = .empty;
+    defer pn_lists.deinit(gpa);
+    var to_pn: std.AutoHashMapUnmanaged([13]u8, spf.Weight) = .empty;
+    defer to_pn.deinit(gpa);
 
     var view_it = db.iterator(now);
     while (view_it.next()) |ev| {
@@ -316,8 +327,13 @@ fn computeInternal(
         // A stored LSP is well-formed at the header/framing level, but decode
         // defensively anyway — a decode failure just skips this LSP.
         const lsp = isis.Lsp.decode(ev.bytes) catch continue;
-        // This increment models P2P only: skip pseudonode LSPs (LSP-ID octet 6).
-        if (lsp.lsp_id[6] != 0) continue;
+        if (lsp.lsp_id[6] != 0) {
+            // A pseudonode LSP: record which ISs it lists (their metric is 0 by
+            // definition and not used). It is not an origin — a pseudonode is
+            // never a route destination.
+            try collectPseudonodeMembers(gpa, &pn_lists, lsp);
+            continue;
+        }
         const from: SystemId = lsp.lsp_id[0..6].*;
         try origins.put(gpa, from, {});
 
@@ -328,7 +344,6 @@ fn computeInternal(
             isis.tlvs.code.extended_is_reachability => {
                 var eit = isis.tlvs.ExtIsReachIterator.init(t.value);
                 while (eit.next() catch break) |e| {
-                    if (e.neighbour_id[6] != 0) continue; // pseudonode neighbour
                     // RFC 5305 §3 max-link-metric: this direction MUST NOT be
                     // considered during normal SPF. Excluded outright — not
                     // added as an edge at all — rather than admitted at its
@@ -336,15 +351,22 @@ fn computeInternal(
                     // path of last resort when nothing else reaches the
                     // destination.
                     if (e.metric == max_link_metric) continue;
+                    if (e.neighbour_id[6] != 0) {
+                        try addToPseudonode(gpa, &to_pn, from, e.neighbour_id, e.metric);
+                        continue;
+                    }
                     try addDirected(gpa, &directed, from, e.neighbour_id[0..6].*, e.metric);
                 }
             },
             isis.tlvs.code.is_neighbours_lsp => {
                 var iit = isis.tlvs.IsReachIterator.init(t.value) catch continue;
                 while (iit.next() catch break) |e| {
-                    if (e.neighbour_id[6] != 0) continue; // pseudonode neighbour
                     // Old-style default metric: the value is the low 6 bits; the
                     // high bits are I/E / supported flags.
+                    if (e.neighbour_id[6] != 0) {
+                        try addToPseudonode(gpa, &to_pn, from, e.neighbour_id, e.default_metric & 0x3f);
+                        continue;
+                    }
                     try addDirected(gpa, &directed, from, e.neighbour_id[0..6].*, e.default_metric & 0x3f);
                 }
             },
@@ -403,6 +425,9 @@ fn computeInternal(
         // control tests below pin.
         if (rev == null) try arcs.put(gpa, rev_key, fwd);
     }
+
+    // ── 2b. LAN transit through pseudonodes ─────────────────────────────────
+    try addLanArcs(gpa, &arcs, &pn_lists, &to_pn, opts.require_two_way);
 
     // ── 3. intern system-ids → dense NodeIds (sorted, deterministic) ─────────
     // Node set = every arc endpoint, plus `local` if it originated an LSP (so
@@ -490,6 +515,97 @@ fn computeInternal(
 /// The metric is clamped to `>= 1`: `spf-ect` rejects a zero weight (it could
 /// otherwise form a predecessor cycle), and a genuinely 0-cost IS-IS link is
 /// treated as cost 1.
+/// Record `from`'s advertisement of pseudonode `pn` at `raw_metric`
+/// (clamped to ≥ 1 like every arc weight; the minimum wins).
+fn addToPseudonode(
+    gpa: Allocator,
+    to_pn: *std.AutoHashMapUnmanaged([13]u8, spf.Weight),
+    from: SystemId,
+    pn: [7]u8,
+    raw_metric: anytype,
+) Allocator.Error!void {
+    const weight: spf.Weight = @max(@as(spf.Weight, 1), @as(spf.Weight, raw_metric));
+    var key: [13]u8 = undefined;
+    key[0..6].* = from;
+    key[6..13].* = pn;
+    const gop = try to_pn.getOrPut(gpa, key);
+    if (!gop.found_existing or weight < gop.value_ptr.*) gop.value_ptr.* = weight;
+}
+
+/// Every IS (neighbour-id octet 6 = 0) a pseudonode LSP lists, keyed
+/// (pseudonode ++ member). All fragments of one pseudonode land in the same
+/// set. Metrics from a pseudonode are 0 by definition and are not read.
+fn collectPseudonodeMembers(
+    gpa: Allocator,
+    pn_lists: *std.AutoHashMapUnmanaged([13]u8, void),
+    lsp: isis.Lsp,
+) Allocator.Error!void {
+    const pn: [7]u8 = lsp.lsp_id[0..7].*;
+    var tlv_it = lsp.tlvIterator();
+    while (tlv_it.next() catch return) |t| switch (t.code) {
+        isis.tlvs.code.extended_is_reachability => {
+            var eit = isis.tlvs.ExtIsReachIterator.init(t.value);
+            while (eit.next() catch break) |e| {
+                if (e.neighbour_id[6] != 0) continue;
+                try pn_lists.put(gpa, pnKey(pn, e.neighbour_id[0..6].*), {});
+            }
+        },
+        isis.tlvs.code.is_neighbours_lsp => {
+            var iit = isis.tlvs.IsReachIterator.init(t.value) catch continue;
+            while (iit.next() catch break) |e| {
+                if (e.neighbour_id[6] != 0) continue;
+                try pn_lists.put(gpa, pnKey(pn, e.neighbour_id[0..6].*), {});
+            }
+        },
+        else => {},
+    };
+}
+
+fn pnKey(pn: [7]u8, member: SystemId) [13]u8 {
+    var key: [13]u8 = undefined;
+    key[0..7].* = pn;
+    key[7..13].* = member;
+    return key;
+}
+
+/// A LAN as SPF sees it (ISO 10589 Annex C / RFC 1195): member X reaches the
+/// pseudonode P at X's own advertised metric, and P reaches every member at
+/// cost 0. The zero-cost second half is folded in here: for every pair of
+/// ADMITTED members X ≠ Y of P, an arc X ⟶ Y at metric(X ⟶ P) — the same
+/// distances without a zero-weight arc (which `spf-ect` rejects) and without
+/// a pseudonode vertex that could be mistaken for a destination. A member is
+/// admitted only when the two-way check passes on the LAN too: X lists P and
+/// P's LSP lists X (§7.2.8.2's rule, with the pseudonode speaking for the
+/// LAN). Where a point-to-point arc X ⟶ Y exists as well, the cheaper wins.
+/// With `require_two_way = false` (the broken positive control only) a member
+/// that lists P is admitted without P's confirmation.
+fn addLanArcs(
+    gpa: Allocator,
+    arcs: *std.AutoHashMapUnmanaged([12]u8, spf.Weight),
+    pn_lists: *const std.AutoHashMapUnmanaged([13]u8, void),
+    to_pn: *const std.AutoHashMapUnmanaged([13]u8, spf.Weight),
+    require_two_way: bool,
+) Allocator.Error!void {
+    const Admitted = struct { member: SystemId, pn: [7]u8, metric: spf.Weight };
+    var admitted: std.ArrayList(Admitted) = .empty;
+    defer admitted.deinit(gpa);
+    var it = to_pn.iterator();
+    while (it.next()) |kv| {
+        const member: SystemId = kv.key_ptr[0..6].*;
+        const pn: [7]u8 = kv.key_ptr[6..13].*;
+        if (require_two_way and !pn_lists.contains(pnKey(pn, member))) continue;
+        try admitted.append(gpa, .{ .member = member, .pn = pn, .metric = kv.value_ptr.* });
+    }
+    for (admitted.items) |x| for (admitted.items) |y| {
+        if (!std.mem.eql(u8, &x.pn, &y.pn) or std.mem.eql(u8, &x.member, &y.member)) continue;
+        var key: [12]u8 = undefined;
+        key[0..6].* = x.member;
+        key[6..12].* = y.member;
+        const gop = try arcs.getOrPut(gpa, key);
+        if (!gop.found_existing or x.metric < gop.value_ptr.*) gop.value_ptr.* = x.metric;
+    };
+}
+
 fn addDirected(
     gpa: Allocator,
     directed: *std.AutoHashMapUnmanaged([12]u8, spf.Weight),
@@ -821,38 +937,24 @@ test "old-style #2 default metric: the I/E bit is masked off, not folded into th
     try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 7 }, table.lookup(b).?);
 }
 
-// ── LAN pseudonode neighbour filter ──────────────────────────────────────────
+// ── LAN transit through a pseudonode ─────────────────────────────────────────
 //
 // A LAN's designated IS (DIS) originates a pseudonode LSP whose LSP-ID has a
-// non-zero pseudonode octet (octet 6), and every router on the LAN — including
-// the DIS's own *real* LSP — advertises reachability to that pseudonode id,
-// not to each other directly (ISO 10589 §7.2.5 / RFC 1195). This module's
-// scope note (top of file) is explicit that LAN transit through the
-// pseudonode-as-zero-cost-vertex is NOT modelled here (deferred); the filter
-// at the two `neighbour_id[6] != 0` sites exists so that a reachability entry
-// *pointing at* a pseudonode is simply dropped rather than being silently
-// mistaken for a direct edge to whatever router happens to share the
-// pseudonode's first six octets (its DIS).
+// non-zero pseudonode octet (octet 6), and every router on the LAN — the DIS's
+// own real LSP included — advertises reachability to that pseudonode id, not to
+// each other (ISO 10589 §7.2.5 / RFC 1195). `addLanArcs` turns that into arcs
+// between the admitted members. Until 2026-09-30 this module dropped every
+// pseudonode entry (LAN transit was deferred); these fixtures pinned the drop
+// and now pin the transit.
 //
-// A bare single-LAN fixture (three routers, one pseudonode, nothing else)
-// cannot distinguish "filter present" from "filter deleted": every non-DIS
-// router's entry collapses to an edge *into* the DIS, but the DIS's own
-// mirror entry collapses to a self-loop that `addDirected` already drops
-// unconditionally — so the two-way check fails identically whether or not the
-// filter runs, and the route table comes out empty either way (a green-
-// either-way trap). The fixture below adds one genuine, independently-two-way
-// point-to-point adjacency between the DIS and one LAN member, deliberately
-// costed *higher* than the LAN's advertised cost to the pseudonode. If the
-// filter is deleted, the cheap LAN-collapsed entry merges into the same
-// (from, to) directed key as the real P2P entry and `addDirected` keeps the
-// minimum — silently undercutting a real link's metric with a bogus one. That
-// corruption is exactly what the filter prevents, and it shows up as a wrong
-// `Route.metric`, not as a missing/extra route — so it survives even though
-// the edge exists (and is two-way-valid) in both cases.
-test "pseudonode neighbour filter (#22 extended): a LAN must not cheapen a real router adjacency" {
+// What the first fixture discriminates: the classic wrong reading maps the
+// pseudonode id onto its DIS (the first six octets), which makes X and Y
+// neighbours of D but never of each other. Y's route (via the LAN, next hop
+// Y itself, cost 5) exists only with real pseudonode transit.
+test "LAN transit (#22 extended): members reach each other through the pseudonode at their own metric" {
     const d = sysId(0x50); // the LAN's DIS; owns the pseudonode
-    const x = sysId(0x10); // LAN member; also has a genuine, pricier P2P link to D
-    const y = sysId(0x90); // LAN-only member: no other connectivity, stays unreachable
+    const x = sysId(0x10); // LAN member; also has a pricier P2P link to D
+    const y = sysId(0x90); // LAN-only member
 
     const pn_d: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01 }; // D's pseudonode neighbour id
     const d7: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0 };
@@ -862,9 +964,7 @@ test "pseudonode neighbour filter (#22 extended): a LAN must not cheapen a real 
     defer db.deinit();
 
     // The pseudonode's own LSP (LSP-ID octet 6 = 0x01): lists every attached
-    // router at cost 0, per ISO 10589. Included for fixture realism; this
-    // module's separate P2P-only *origin* filter (root.zig, `lsp.lsp_id[6] !=
-    // 0`) skips this LSP entirely regardless of the filter under test here.
+    // router at cost 0, per ISO 10589.
     {
         var buf: [256]u8 = undefined;
         var lb = try isis.pdu.LspBuilder.init(&buf, .{
@@ -880,19 +980,15 @@ test "pseudonode neighbour filter (#22 extended): a LAN must not cheapen a real 
         _ = try db.insert(lb.finish(), null, 0);
     }
 
-    // X: reachability to the pseudonode (cheap, cost 5) AND a genuine,
-    // independent P2P adjacency to D (expensive, cost 100).
+    // X: the LAN (cost 5) AND an independent P2P adjacency to D (cost 100).
     try insertReachLspRaw(&db, x, 1, &.{
         .{ .nbr7 = pn_d, .metric = 5 },
         .{ .nbr7 = d7, .metric = 100 },
     });
-    // D: its own mirror reachability to the pseudonode (collapses to a
-    // self-loop; `addDirected` drops it) AND the reciprocal P2P to X.
     try insertReachLspRaw(&db, d, 1, &.{
         .{ .nbr7 = pn_d, .metric = 5 },
         .{ .nbr7 = x7, .metric = 100 },
     });
-    // Y: LAN-only — its sole advertisement is to the pseudonode.
     try insertReachLspRaw(&db, y, 1, &.{
         .{ .nbr7 = pn_d, .metric = 5 },
     });
@@ -900,17 +996,19 @@ test "pseudonode neighbour filter (#22 extended): a LAN must not cheapen a real 
     var table = try compute(testing.allocator, &db, x, 0);
     defer table.deinit();
 
-    // Correct (filter present): the LAN contributes no edges at all. The only
-    // route is the real P2P adjacency to D, at its real cost (100) — NOT the
-    // LAN's cost (5). Y is unreachable (its one-way LAN advertisement never
-    // gets a reciprocal, regardless of this filter).
-    try testing.expectEqual(@as(usize, 2), table.routes.len);
+    // The LAN is the cheaper path to D (5 < 100) and the only one to Y; the
+    // pseudonode itself is never a destination.
+    try testing.expectEqual(@as(usize, 3), table.routes.len);
     try testing.expectEqual(Route{ .dest = x, .next_hop = x, .metric = 0 }, table.lookup(x).?);
-    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 100 }, table.lookup(d).?);
-    try testing.expect(table.lookup(y) == null);
+    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 5 }, table.lookup(d).?);
+    try testing.expectEqual(Route{ .dest = y, .next_hop = y, .metric = 5 }, table.lookup(y).?);
 }
 
-test "pseudonode neighbour filter (#2 old-style): a LAN must not cheapen a real router adjacency" {
+// Without the pseudonode's own LSP the LAN fails the two-way check (nobody
+// speaks for the LAN), so it contributes nothing and the real P2P metric
+// stands — the same guard the old "neighbour filter" test pinned, now for the
+// right reason.
+test "LAN (#2 old-style) without a pseudonode LSP: not admitted, the real P2P metric stands" {
     const d = sysId(0x51);
     const x = sysId(0x11);
     const y = sysId(0x91);
@@ -1041,6 +1139,108 @@ test "pseudonode ORIGIN filter: the pseudonode's own LSP must not itself supply 
     try testing.expectEqual(@as(usize, 3), table.routes.len);
     try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 100 }, table.lookup(d).?);
     try testing.expectEqual(Route{ .dest = z, .next_hop = d, .metric = 200 }, table.lookup(z).?);
+}
+
+/// A pseudonode LSP for `dis`/circuit 1 listing `members`.
+fn insertPseudonodeLsp(db: *lsdb.Lsdb, dis: SystemId, members: []const SystemId) !void {
+    var buf: [512]u8 = undefined;
+    var lb = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ dis[0], dis[1], dis[2], dis[3], dis[4], dis[5], 0x01, 0 },
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    for (members) |m| try isis.tlvs.addExtendedIsReach(&lb.tlvs, .{ m[0], m[1], m[2], m[3], m[4], m[5], 0 }, 0, &.{});
+    _ = try db.insert(lb.finish(), null, 0);
+}
+
+fn pnOf(dis: SystemId) [7]u8 {
+    return .{ dis[0], dis[1], dis[2], dis[3], dis[4], dis[5], 0x01 };
+}
+
+test "LAN transit: a 4-member LAN is a full mesh at each member's own metric, asymmetric where the metrics are" {
+    const a = sysId(0x01);
+    const b = sysId(0x02);
+    const c = sysId(0x03);
+    const e = sysId(0x04);
+    const pn = pnOf(b); // B is the DIS
+    for ([_]SystemId{ a, c }) |root| {
+        var db = lsdb.Lsdb.init(testing.allocator, cfgFor(root));
+        defer db.deinit();
+        try insertPseudonodeLsp(&db, b, &.{ a, b, c, e });
+        try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+        try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pn, .metric = 20 }});
+        try insertReachLspRaw(&db, c, 1, &.{.{ .nbr7 = pn, .metric = 30 }});
+        try insertReachLspRaw(&db, e, 1, &.{.{ .nbr7 = pn, .metric = 40 }});
+        var table = try compute(testing.allocator, &db, root, 0);
+        defer table.deinit();
+        try testing.expectEqual(@as(usize, 4), table.routes.len);
+        // Every other member is one LAN hop away at the ROOT's metric toward
+        // the pseudonode: 10 from A, 30 from C.
+        const cost: u32 = if (std.mem.eql(u8, &root, &a)) 10 else 30;
+        for ([_]SystemId{ a, b, c, e }) |dst| {
+            if (std.mem.eql(u8, &dst, &root)) continue;
+            try testing.expectEqual(Route{ .dest = dst, .next_hop = dst, .metric = cost }, table.lookup(dst).?);
+        }
+    }
+}
+
+test "LAN transit: a LAN and a P2P tail compose — the tail is reached through the LAN member" {
+    const a = sysId(0x01);
+    const b = sysId(0x02);
+    const c = sysId(0x03);
+    const z = sysId(0x09);
+    const pn = pnOf(a);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertPseudonodeLsp(&db, a, &.{ a, b, c });
+    try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+    try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+    try insertReachLspRaw(&db, c, 1, &.{ .{ .nbr7 = pn, .metric = 10 }, .{ .nbr7 = .{ z[0], z[1], z[2], z[3], z[4], z[5], 0 }, .metric = 5 } });
+    try insertReachLspRaw(&db, z, 1, &.{.{ .nbr7 = .{ c[0], c[1], c[2], c[3], c[4], c[5], 0 }, .metric = 5 }});
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(Route{ .dest = c, .next_hop = c, .metric = 10 }, table.lookup(c).?);
+    try testing.expectEqual(Route{ .dest = z, .next_hop = c, .metric = 15 }, table.lookup(z).?);
+}
+
+test "LAN transit: a member the pseudonode does not list back is not admitted (two-way on the LAN)" {
+    const a = sysId(0x01);
+    const b = sysId(0x02);
+    const c = sysId(0x03);
+    const pn = pnOf(a);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertPseudonodeLsp(&db, a, &.{ a, b }); // C is not listed
+    try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+    try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+    try insertReachLspRaw(&db, c, 1, &.{.{ .nbr7 = pn, .metric = 1 }});
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 10 }, table.lookup(b).?);
+    try testing.expect(table.lookup(c) == null);
+
+    // The broken positive control (no two-way check) admits C: the check,
+    // not an accident of the fixture, is what kept it out.
+    var broken = try computeWithBrokenTwoWayForTesting(testing.allocator, &db, a, 0, false);
+    defer broken.deinit();
+    try testing.expect(broken.lookup(c) != null);
+}
+
+test "LAN transit: a pseudonode that lists nobody, or only one member, adds no arc" {
+    const a = sysId(0x01);
+    const b = sysId(0x02);
+    const pn = pnOf(a);
+    for ([_][]const SystemId{ &.{}, &.{a} }) |listed| {
+        var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+        defer db.deinit();
+        try insertPseudonodeLsp(&db, a, listed);
+        try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+        try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expect(table.lookup(b) == null);
+    }
 }
 
 test "robustness: a malformed reachability TLV is skipped; the valid rest still routes" {

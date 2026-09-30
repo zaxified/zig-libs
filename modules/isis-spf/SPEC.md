@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Per-level SPF with pseudonode zero-cost edges, overload-bit transit avoidance, 64-bit metric accumulation, ECMP, back-off (design doc). |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | Computes no routes (README: "the package computes no routes on its own"). |
 
-**Where we are ahead:** exact directed-metric handling with the ISO Annex C.2.4 clause quoted and frozen against live FRR (asymmetric links resolve to the same cost as FRR), a deterministic sorted-intern so identical databases give byte-identical tables, and `asymmetric_links`/`reject_asymmetric` reporting that is SPB-relevant (802.1aq needs symmetric metrics); bounded, allocation-free next-hop resolution. **Where we are behind:** point-to-point only — pseudonode LSPs and neighbours are skipped (`rg -n 'neighbour_id\[6\]|pseudonode' isis-spf/src/root.zig`), so any LAN circuit is invisible; no IP/prefix reachability leaves — the table maps system-ids, not prefixes; no overload-bit transit exclusion (bit decoded, ignored); single path per destination, no ECMP set (by design for SPB via `spf-ect`, but IP users expect it); no MT, no L1/L2 leaking, no incremental SPF (→ Backlog).
+**Where we are ahead:** exact directed-metric handling with the ISO Annex C.2.4 clause quoted and frozen against live FRR (asymmetric links resolve to the same cost as FRR), a deterministic sorted-intern so identical databases give byte-identical tables, and `asymmetric_links`/`reject_asymmetric` reporting that is SPB-relevant (802.1aq needs symmetric metrics); bounded, allocation-free next-hop resolution. **Where we are behind:** LAN transit is folded into member-to-member arcs (distances exact, but no pseudonode vertex in the tree); no IP/prefix reachability leaves — the table maps system-ids, not prefixes; no overload-bit transit exclusion (bit decoded, ignored); single path per destination, no ECMP set (by design for SPB via `spf-ect`, but IP users expect it); no MT, no L1/L2 leaking, no incremental SPF (→ Backlog).
 
 ## 1. Scope
 
@@ -62,11 +62,12 @@ intern, graph construction, and next-hop/metric resolution.
 ### 3.1 Topology extraction
 
 Iterate the LSDB at `now`. Skip request placeholders (no bytes). Decode each LSP
-(a decode failure skips only that LSP). Skip **pseudonode LSPs** (LSP-ID octet 6
-≠ 0 — this increment is P2P-only). The origin is `lsp_id[0..6]`. Walk the LSP's
-TLVs; from #22 and #2 records collect directed advertisements `(from ⟶
-neighbour[0..6], metric)`. A **pseudonode neighbour** (neighbour-id octet 6 ≠ 0)
-is skipped. A malformed TLV or reachability record terminates that LSP's walk
+(a decode failure skips only that LSP). A **pseudonode LSP** (LSP-ID octet 6 ≠ 0)
+contributes only the set of ISs it lists (§3.2b); it is never an origin. The
+origin of every other LSP is `lsp_id[0..6]`. Walk the LSP's TLVs; from #22 and
+#2 records collect directed advertisements `(from ⟶ neighbour[0..6], metric)`. A
+**pseudonode neighbour** (neighbour-id octet 6 ≠ 0) is recorded as the member's
+advertisement toward that 7-octet pseudonode id instead. A malformed TLV or reachability record terminates that LSP's walk
 (the records parsed before it still count); every other LSP is unaffected.
 
 Directed advertisements are deduped per ordered `(from, to)` pair, keeping the
@@ -196,13 +197,29 @@ node↔id tables, graph, tree) is freed before returning; the leak check runs un
 `deinit`. Given the same database and `now`, the table is byte-for-byte identical
 across runs (a permanent test pins this).
 
-## 6. Deferred (with the reason)
+### 3.2b LAN transit through pseudonodes (since 2026-09-30)
 
-- **LAN pseudonodes.** Pseudonode LSPs (LSP-ID octet 6 ≠ 0) and pseudonode
-  neighbours are skipped this increment. Modelling them means treating a
-  pseudonode as a transparent transit node (0-cost from the pseudonode to each
-  attached IS) so a LAN collapses to a full mesh through it. Cheap to add later;
-  needs its own tests.
+ISO 10589 Annex C / RFC 1195 model a LAN as a pseudonode vertex: member X
+reaches it at X's own advertised metric, and it reaches every member at cost 0.
+`addLanArcs` folds the zero-cost half in: for every pair of **admitted** members
+X ≠ Y of pseudonode P it adds the arc X ⟶ Y at metric(X ⟶ P). That gives the
+same distances as a pseudonode vertex, without a zero-weight arc (which
+`spf-ect` rejects) and without a vertex that could appear as a destination or
+next hop. A member is admitted when the two-way check passes on the LAN: X
+lists P, and P's LSP (any fragment) lists X — the pseudonode speaks for the
+LAN, as each router speaks for its P2P links. Where a P2P arc X ⟶ Y exists as
+well, the cheaper one wins. The broken positive control (`require_two_way =
+false`) admits a member that lists P without P's confirmation. Metrics toward a
+pseudonode are clamped to ≥ 1 like every other arc.
+
+Tests: a 4-member LAN (full mesh at each member's own metric, asymmetric where
+the metrics are), a LAN composing with a P2P tail, a member the pseudonode does
+not list back (excluded, and admitted by the broken control), a pseudonode that
+lists nobody or one member, the DIS-collapse misreading (a LAN-only member is
+reachable only with real transit), and the pre-existing guards (no pseudonode
+LSP → no LAN; the pseudonode's own LSP never supplies a route).
+
+## 6. Deferred (with the reason)
 - **Multi-level (L1/L2) route leaking.** One level per computation here; the
   L1↔L2 attached-bit default route and prefix leaking are a separate layer.
 - **IP / prefix reachability leaves.** The SPB fabric this targets forwards on
@@ -223,7 +240,6 @@ across runs (a permanent test pins this).
 
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
-- **LAN pseudonodes in SPF** (pseudonode as zero-cost transit vertex) (survey 2026-09-30). Why: any broadcast circuit vanishes from the topology today; holo/goisis/FRR all model it. Effort: ~2–3 days; SPEC §6 notes it as cheap. Fits §2: yes.
 - **IP/IPv6 prefix leaves** (#135/#236 as SPT leaves, best-path selection) (survey 2026-09-30). Why: without it the module cannot produce IP routes for an ordinary IS-IS user; needs the typed reachability TLVs in `isis`. Effort: ~1 week. Fits §2: yes.
 - **Overload-bit transit exclusion** (survey 2026-09-30). Why: operators set it to drain a node; FRR/holo/goisis honour it. Needs a transit-exclusion hook in `spf-ect` (SPEC §6 says the graph module must not be modified — a `spf-ect` backlog item). Effort: ~2 days. Fits §2: yes.
 - **ECMP next-hop sets** (survey 2026-09-30). Why: IP IS-IS load-shares over equal-cost paths (`max_paths` in holo); the deterministic single-path result is right for SPB only. Needs multi-parent output from `spf-ect`. Effort: ~3 days. Fits §2: yes.
