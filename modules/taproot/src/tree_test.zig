@@ -231,12 +231,15 @@ test "fuzz: buildFromLeaves never panics; success implies a complete tree with m
 fn fuzzBuild(_: void, smith: *std.testing.Smith) !void {
     var scripts: [8][16]u8 = undefined;
     var list: [8]tree.DepthLeaf = undefined;
-    const n: usize = smith.value(u8) % 9;
+    // Full-width draws reduced by hand: a `u8` draw reads eight input bytes
+    // and answers its minimum unless they already fit, which collapsed every
+    // seed into one input (`check-fuzz-reach` R1; testkit/src/fuzz.zig).
+    const n: usize = @intCast(smith.value(u64) % 9);
     for (0..n) |i| {
-        const raw = smith.value(u8);
+        const raw: u8 = @truncate(smith.value(u64));
         const depth: u8 = if (raw >= 250) raw - 120 else raw % 5; // 0..4, or 130..135 (too deep)
         const len = smith.slice(&scripts[i]);
-        list[i] = .{ .depth = depth, .version = smith.value(u8), .script = scripts[i][0..len] };
+        list[i] = .{ .depth = depth, .version = @truncate(smith.value(u64)), .script = scripts[i][0..len] };
     }
     const k = try internalKey();
     var info = tree.buildFromLeaves(ta, k, list[0..n]) catch return;
