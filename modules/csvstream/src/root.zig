@@ -15,6 +15,9 @@
 //! twist: a '\n' ALWAYS ends a record, so an unbalanced quote is a one-line
 //! problem (flagged via `LineSlice.unbalanced_quote`) instead of swallowing the
 //! rest of the file — which is also what makes every '\n' a safe chunk boundary.
+//! RFC 4180's multi-line quoted fields are an opt-in: `QuotedNewlines.span`
+//! (`LineIterator.initSpan`, `StreamReader.Options.quoted_newlines`), bounded
+//! so a stray quote still costs one record, never the file (`SpanConfig`).
 
 const std = @import("std");
 
@@ -67,6 +70,26 @@ pub const OverflowPolicy = line.OverflowPolicy;
 
 /// Caller policy for `splitFieldsOpts`.
 pub const SplitOptions = line.SplitOptions;
+
+/// How a newline inside a quoted field is read: `.end_record` (default, every
+/// `\n` ends a record) or `.span` (RFC 4180 multi-line fields, bounded).
+pub const QuotedNewlines = line.QuotedNewlines;
+
+/// `.span` mode's bound: max newlines per quoted field, max record bytes, and
+/// an optional field-count check; past it an opening quote is declared stray.
+pub const SpanConfig = line.SpanConfig;
+
+/// `.span` mode's field-count check (`none`, `first_record`, `count`).
+pub const FieldCheck = line.FieldCheck;
+
+/// The `.span` record scanner `ChunkReader` and `LineIterator` share.
+pub const SpanScanner = line.SpanScanner;
+
+/// Default `SpanConfig.max_quoted_lines` (64).
+pub const default_max_quoted_lines = line.default_max_quoted_lines;
+
+/// The true field count of one record, independent of any buffer.
+pub const countFields = line.countFields;
 
 // ── Streaming layer (file → records with absolute offsets) ────────────────────
 

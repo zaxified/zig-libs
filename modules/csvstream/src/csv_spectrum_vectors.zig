@@ -6,9 +6,10 @@
 //! path.extname(csvs[i].name))`), not assumed. DO NOT hand-edit `csv`/`json`
 //! -- regenerate from testdata/csv-spectrum/ if the corpus is ever re-vendored.
 //!
-//! `out_of_scope`, when non-null, names why this module has never claimed to
-//! handle this case -- either a documented README/SPEC deviation, or (one
-//! case) a defect in the corpus fixture pair itself. These entries are NOT
+//! `out_of_scope`, when non-null, names why a case cannot be asserted -- one
+//! case, a defect in the corpus fixture pair itself. (The three multi-line
+//! cases were out of scope too until `.span` mode existed; they are now
+//! `needs_span`.) These entries are NOT
 //! asserted against the expected JSON by csv_spectrum_test.zig, but they ARE
 //! counted, so silently dropping one changes a checked total instead of
 //! vanishing quietly.
@@ -18,14 +19,12 @@ pub const Vector = struct {
     csv: []const u8,
     json: []const u8,
     out_of_scope: ?[]const u8 = null,
+    /// The fixture has a quoted field spanning a newline: it is asserted
+    /// only in `.span` mode (`QuotedNewlines.span`). The default
+    /// `.end_record` mode reads it differently by design — SPEC.md
+    /// "Deliberate RFC 4180 deviation".
+    needs_span: bool = false,
 };
-
-const multiline_reason =
-    "quoted field spans a physical newline -- SPEC.md 'Deliberate RFC 4180 " ++
-    "deviation' documents that a '\\n' ALWAYS ends a record in this module " ++
-    "(à la Go encoding/csv LazyQuotes), by design, so every '\\n' is a safe " ++
-    "streaming chunk boundary. Not a bug: the README's 'Deferred' section " ++
-    "lists strict multi-line quoted fields as a permanently deferred item.";
 
 pub const vectors = [_]Vector{
     .{
@@ -69,19 +68,19 @@ pub const vectors = [_]Vector{
         .name = "newlines",
         .csv = @embedFile("testdata/csv-spectrum/csvs/newlines.csv"),
         .json = @embedFile("testdata/csv-spectrum/json/newlines.json"),
-        .out_of_scope = multiline_reason,
+        .needs_span = true,
     },
     .{
         .name = "newlines_crlf",
         .csv = @embedFile("testdata/csv-spectrum/csvs/newlines_crlf.csv"),
         .json = @embedFile("testdata/csv-spectrum/json/newlines_crlf.json"),
-        .out_of_scope = multiline_reason,
+        .needs_span = true,
     },
     .{
         .name = "quotes_and_newlines",
         .csv = @embedFile("testdata/csv-spectrum/csvs/quotes_and_newlines.csv"),
         .json = @embedFile("testdata/csv-spectrum/json/quotes_and_newlines.json"),
-        .out_of_scope = multiline_reason,
+        .needs_span = true,
     },
     .{
         .name = "simple",

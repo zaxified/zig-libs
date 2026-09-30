@@ -28,9 +28,12 @@ const vectors_mod = @import("csv_spectrum_vectors.zig");
 /// module's own public in-memory API (the layer the corpus is testing --
 /// "parse CSV text into rows of fields"). Returns owned-by-`arena` row
 /// slices so callers never worry about the per-record borrow contract.
-fn parseRows(arena: std.mem.Allocator, bytes: []const u8) ![][][]const u8 {
+fn parseRows(arena: std.mem.Allocator, bytes: []const u8, mode: csv.QuotedNewlines) ![][][]const u8 {
     var rows = std.array_list.Managed([][]const u8).init(arena);
-    var it = csv.LineIterator.init(bytes, '"', 0);
+    var it = switch (mode) {
+        .end_record => csv.LineIterator.init(bytes, '"', 0),
+        .span => csv.LineIterator.initSpan(bytes, '"', 0, .{}),
+    };
     while (it.next()) |rec| {
         var fbuf: [64][]const u8 = undefined;
         const fields = try csv.splitFields(rec.bytes, &fbuf, ',', '"', arena);
@@ -96,16 +99,47 @@ test "csv-spectrum corpus: vendored count matches expectation (canary)" {
     // re-classify any new/changed case, don't just adjust these numbers.
     try testing.expectEqual(@as(usize, 12), vectors_mod.vectors.len);
     var out_of_scope_count: usize = 0;
+    var needs_span_count: usize = 0;
     for (vectors_mod.vectors) |v| {
         if (v.out_of_scope != null) out_of_scope_count += 1;
+        if (v.needs_span) needs_span_count += 1;
     }
-    try testing.expectEqual(@as(usize, 4), out_of_scope_count);
+    try testing.expectEqual(@as(usize, 1), out_of_scope_count);
+    try testing.expectEqual(@as(usize, 3), needs_span_count);
 }
 
 test "csv-spectrum corpus: in-scope fixtures match the upstream expected JSON" {
+    // Default mode: every fixture but the multi-line ones.
+    const r = try runCorpus(.end_record);
+    try testing.expectEqual(@as(usize, 1), r.skipped_out_of_scope);
+    try testing.expectEqual(@as(usize, 3), r.skipped_needs_span);
+    try testing.expectEqual(@as(usize, 8), r.checked);
+    try testing.expectEqual(@as(usize, 0), r.mismatches);
+}
+
+test "csv-spectrum corpus: in .span mode the multi-line fixtures match too" {
+    // `.span` mode must read the single-line fixtures exactly as the default
+    // does AND the three multi-line ones as the corpus expects: 11 of 12,
+    // the twelfth being the corpus's own broken pair.
+    const r = try runCorpus(.span);
+    try testing.expectEqual(@as(usize, 1), r.skipped_out_of_scope);
+    try testing.expectEqual(@as(usize, 0), r.skipped_needs_span);
+    try testing.expectEqual(@as(usize, 11), r.checked);
+    try testing.expectEqual(@as(usize, 0), r.mismatches);
+}
+
+const CorpusResult = struct {
+    checked: usize = 0,
+    skipped_out_of_scope: usize = 0,
+    skipped_needs_span: usize = 0,
+    mismatches: usize = 0,
+};
+
+fn runCorpus(mode: csv.QuotedNewlines) !CorpusResult {
     const alloc = testing.allocator;
     var checked: usize = 0;
     var skipped_out_of_scope: usize = 0;
+    var skipped_needs_span: usize = 0;
     var mismatches: usize = 0;
 
     for (vectors_mod.vectors) |v| {
@@ -115,11 +149,15 @@ test "csv-spectrum corpus: in-scope fixtures match the upstream expected JSON" {
 
         // Every fixture, in-scope or not, must parse without crashing/OOMing --
         // that much is asserted unconditionally.
-        const rows = try parseRows(arena, v.csv);
+        const rows = try parseRows(arena, v.csv, mode);
 
         if (v.out_of_scope) |reason| {
             _ = reason;
             skipped_out_of_scope += 1;
+            continue;
+        }
+        if (v.needs_span and mode != .span) {
+            skipped_needs_span += 1;
             continue;
         }
 
@@ -157,8 +195,11 @@ test "csv-spectrum corpus: in-scope fixtures match the upstream expected JSON" {
         checked += 1;
     }
 
-    try testing.expectEqual(@as(usize, 4), skipped_out_of_scope);
-    try testing.expectEqual(@as(usize, 8), checked);
-    try testing.expectEqual(vectors_mod.vectors.len, checked + skipped_out_of_scope);
-    try testing.expectEqual(@as(usize, 0), mismatches);
+    try testing.expectEqual(vectors_mod.vectors.len, checked + skipped_out_of_scope + skipped_needs_span);
+    return .{
+        .checked = checked,
+        .skipped_out_of_scope = skipped_out_of_scope,
+        .skipped_needs_span = skipped_needs_span,
+        .mismatches = mismatches,
+    };
 }

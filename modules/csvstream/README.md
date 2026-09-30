@@ -149,6 +149,33 @@ problem (flagged by `LineSlice.unbalanced_quote`) instead of swallowing the rest
 of the file — which is also what makes every `\n` a safe chunk boundary for
 bounded-memory streaming. Quoting still protects the *delimiter* within a line.
 
+### Multi-line quoted fields: opt-in `.span` mode
+
+RFC 4180's newline inside a quoted field is available as an opt-in, bounded so
+that a stray quote still costs one record, never the file:
+
+```zig
+var sr = try csv.StreamReader.init(io, gpa, file, .{
+    .quoted_newlines = .span,       // default .end_record
+    .max_quoted_lines = 64,         // newlines one quoted field may contain
+    .field_check = .first_record,   // a spanned record must be as wide as the header
+});
+// In memory: csv.LineIterator.initSpan(bytes, '"', 0, .{ .field_check = .first_record })
+```
+
+- Only a quote at the **start of a field** opens a quoted field; `5" floppy`
+  stays literal (as in RFC 4180, Go, and `splitFields`).
+- An opening quote with no closing quote within `max_quoted_lines` newlines or
+  `max_record_len` bytes (or before the end of input), or a spanned record whose
+  field count differs from `field_check`'s, is **declared stray**: that record
+  is re-read as one physical line and flagged `unbalanced_quote`. The next
+  record starts on the following line.
+- `LineSlice.spanned` marks a record that covers more than one line; a
+  `\r\n` inside a quoted field is kept verbatim.
+- Chunks are cut after the last complete record as the same scanner reads
+  it, so offsets and records are identical for every chunk size (tested from
+  1 byte up), and memory stays at `capacityBound()`.
+
 ## Tests
 
 `zig build test-csvstream` (headless; green in Debug and
@@ -164,25 +191,22 @@ in.
 External anchor: `csv_spectrum_test.zig` drives `LineIterator`/`splitFields`
 through the vendored `maxogden/csv-spectrum` acid-test corpus
 (`csv_spectrum_vectors.zig`), comparing against the corpus's own expected JSON
-— 8 of 12 fixtures are in documented scope; 4 are out of scope (3 test
-multi-line quoted fields, which this module deliberately does not support —
-see "Quoting semantics" above — and 1 has an internally inconsistent
-fixture pair). See NOTICE for provenance.
+— 8 of 12 fixtures match in the default mode, 11 of 12 in `.span` mode (the
+three extra ones have multi-line quoted fields); the twelfth has an internally
+inconsistent fixture pair. See NOTICE for provenance.
 
 ## Deferred (not implemented)
 
-Two items remain deliberately out of scope:
+Two items remain deliberately out of scope (multi-line quoted fields are
+now the opt-in `.span` mode above):
 
 - **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both
   quoting and escaping; some dialects (`\`-escaped) use a different one. Would
   touch `splitFields`/`LineIterator` and the writer's escaping together, and no
   concrete consumer needs a non-RFC dialect yet.
-- **Strict RFC 4180 opt-in mode:** (a) multi-line quoted fields spanning `\n`
-  and (b) a trailing-delimiter emitting a final empty field — both currently
-  deviate by design (see the `splitFields` trailing-delimiter test and the
-  lazy-quotes note above). (a) in particular would force a real parser
-  rewrite: the bounded-memory chunking design leans on "every `\n` is a safe
-  record boundary," so it stays deferred rather than bolted on.
+- **A trailing delimiter emitting a final empty field** (RFC 4180; `a,b,`
+  → 3 fields). Deviates by design today — see the `splitFields`
+  trailing-delimiter test.
 
 Everything else previously listed here (configurable delimiter, header-row
 handling, typed field coercion, CSV writing, BOM handling, field-count

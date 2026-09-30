@@ -229,9 +229,215 @@ pub const LineSlice = struct {
     /// open quote — i.e. the line carries an unbalanced/stray quote char.
     /// The record is still emitted (the stray quote is treated as a literal
     /// byte, "lazy quotes" semantics); the flag lets the caller warn so the
-    /// situation isn't silent. See `LineIterator.next`.
+    /// situation isn't silent. See `LineIterator.next`. In `.span` mode it is
+    /// set exactly when an opening quote was declared stray and the record
+    /// fell back to one physical line (see `SpanConfig`).
     unbalanced_quote: bool = false,
+    /// `.span` mode only: the record contains a newline inside a quoted
+    /// field, i.e. it covers more than one physical line.
+    spanned: bool = false,
 };
+
+/// How a newline inside a quoted field is read.
+pub const QuotedNewlines = enum {
+    /// Every `\n` ends a record, open quote or not ("lazy quotes"). The
+    /// default: a stray quote costs one line, never the rest of the file,
+    /// and every `\n` is a chunk boundary.
+    end_record,
+    /// RFC 4180 §2 rule 6: a quoted field may contain newlines — bounded.
+    /// See `SpanConfig`.
+    span,
+};
+
+/// Default cap on the newlines one quoted field may contain in `.span` mode.
+pub const default_max_quoted_lines: usize = 64;
+
+/// Which field count a spanned record must have to keep its span.
+pub const FieldCheck = union(enum) {
+    /// No field-count check.
+    none,
+    /// The first non-empty record (the header) sets the count.
+    first_record,
+    /// A count the caller knows.
+    count: usize,
+};
+
+/// `.span` mode: quoted fields may cross newlines, within a bound.
+///
+/// **Why a bound.** An opening quote is ambiguous: the start of a multi-line
+/// field, or a stray byte. No local rule tells them apart, and reading a stray
+/// quote as an opener swallows everything up to the next stray quote — bxp
+/// once lost ~256 k rows of IMDb `title.basics.tsv` to two of them. So a
+/// quoted field may contain at most `max_quoted_lines` newlines and the record
+/// at most `max_record_len` bytes; past either, the opening quote is declared
+/// stray and the record is re-read as one physical line, flagged
+/// `unbalanced_quote`. A stray quote then costs one record's look-ahead, never
+/// the file, and memory stays bounded. `field_check` adds a second test: a
+/// spanned record whose field count differs from the expected one falls back
+/// the same way — the line cap alone lets through two stray quotes that happen
+/// to lie close together.
+///
+/// **What opens a quoted field.** Only a quote at the start of a field. A
+/// quote inside an unquoted field (`5" floppy`) is a literal byte, as in RFC
+/// 4180 and Go `encoding/csv`, and as `splitFields` already reads it. Inside
+/// a quoted field, `""` is an escaped quote, a quote followed by the
+/// delimiter, `\n`, `\r\n` or the end of input closes the field, and any other
+/// quote is literal (Go's `LazyQuotes` rule, again matching `splitFields`).
+pub const SpanConfig = struct {
+    delimiter: u8 = ',',
+    max_quoted_lines: usize = default_max_quoted_lines,
+    /// Byte cap on one spanned record. `StreamReader` sets it to its own
+    /// `max_record_len`; in memory it defaults to no cap.
+    max_record_len: usize = std.math.maxInt(usize),
+    field_check: FieldCheck = .none,
+};
+
+/// The `.span` record scanner: `SpanConfig` plus what it has learned so far
+/// (the header's field count under `.first_record`). One function decides
+/// where every spanned record ends — `ChunkReader` (to cut chunks) and
+/// `LineIterator` (to split them) both call it, so the two cannot disagree.
+pub const SpanScanner = struct {
+    quote: u8,
+    cfg: SpanConfig,
+    /// The field count a spanned record must have, once known.
+    expected_fields: ?usize = null,
+    /// Still waiting for the first non-empty record (`.first_record`).
+    awaiting_header: bool = false,
+
+    pub fn init(quote: u8, cfg: SpanConfig) SpanScanner {
+        return .{
+            .quote = quote,
+            .cfg = cfg,
+            .expected_fields = switch (cfg.field_check) {
+                .count => |n| n,
+                else => null,
+            },
+            .awaiting_header = cfg.field_check == .first_record,
+        };
+    }
+
+    pub const Scan = union(enum) {
+        /// A record: `bytes[start..end]` (the terminator and any `\r` before
+        /// it not yet stripped); the next record starts at `next`.
+        record: struct { end: usize, next: usize, spanned: bool, unbalanced: bool },
+        /// More bytes are needed to decide; only when `at_eof` is false.
+        incomplete,
+    };
+
+    /// Scan one record starting at `start`. `at_eof`: `bytes` ends where the
+    /// input ends (true in memory and for a chunk already cut on a record
+    /// boundary); false while a `ChunkReader` still has bytes to read.
+    ///
+    /// Why the chunk cut and the split agree: every decision here depends
+    /// only on bytes up to what decided it. A record that closes normally
+    /// lies wholly inside the chunk; a record that fell back was decided by
+    /// look-ahead that lay in the buffer, and when the chunk is cut before that
+    /// look-ahead, the re-scan meets the chunk's end still inside the quote and
+    /// falls back at EOF — to the same physical line.
+    pub fn scan(self: *SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
+        const r = self.scanRaw(bytes, start, at_eof);
+        if (r == .record and self.awaiting_header) {
+            const rec = trimCr(bytes[start..r.record.end]);
+            if (rec.len != 0) {
+                self.awaiting_header = false;
+                self.expected_fields = countFields(rec, self.cfg.delimiter, self.quote);
+            }
+        }
+        return r;
+    }
+
+    fn scanRaw(self: *const SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
+        const quote = self.quote;
+        const delim = self.cfg.delimiter;
+        var pos = start;
+        var field_start = true;
+        var in_q = false;
+        var spanned = false;
+        var q_lines: usize = 0;
+        while (pos < bytes.len) {
+            const c = bytes[pos];
+            if (in_q) {
+                if (c == quote) {
+                    // The byte after a quote decides escape vs close vs
+                    // literal; at the buffer's end it is not known yet.
+                    if (pos + 1 >= bytes.len) {
+                        if (!at_eof) return .incomplete;
+                        in_q = false;
+                        pos += 1;
+                        continue;
+                    }
+                    const n = bytes[pos + 1];
+                    if (n == quote) {
+                        pos += 2;
+                        continue;
+                    }
+                    if (n == delim or n == '\n') {
+                        in_q = false;
+                        pos += 1;
+                        continue;
+                    }
+                    if (n == '\r') {
+                        if (pos + 2 >= bytes.len) {
+                            if (!at_eof) return .incomplete;
+                            in_q = false;
+                            pos += 1;
+                            continue;
+                        }
+                        if (bytes[pos + 2] == '\n') {
+                            in_q = false;
+                            pos += 1;
+                            continue;
+                        }
+                    }
+                    pos += 1; // a literal quote inside the field
+                } else {
+                    if (c == '\n') {
+                        spanned = true;
+                        q_lines += 1;
+                        if (q_lines > self.cfg.max_quoted_lines) return lazyFallback(bytes, start, at_eof);
+                    }
+                    pos += 1;
+                }
+                if (spanned and pos - start >= self.cfg.max_record_len) return lazyFallback(bytes, start, at_eof);
+            } else {
+                if (c == '\n') return self.finish(bytes, start, pos, pos + 1, spanned, at_eof);
+                if (field_start and quote != 0 and c == quote) {
+                    in_q = true;
+                    field_start = false;
+                } else field_start = c == delim;
+                pos += 1;
+            }
+        }
+        if (!at_eof) return .incomplete;
+        // The input ended inside a quote: the opener had no closer at all.
+        if (in_q) return lazyFallback(bytes, start, true);
+        return self.finish(bytes, start, bytes.len, bytes.len, spanned, true);
+    }
+
+    fn finish(self: *const SpanScanner, bytes: []const u8, start: usize, end: usize, next: usize, spanned: bool, at_eof: bool) Scan {
+        if (spanned) {
+            if (self.expected_fields) |want| {
+                if (countFields(trimCr(bytes[start..end]), self.cfg.delimiter, self.quote) != want)
+                    return lazyFallback(bytes, start, at_eof);
+            }
+        }
+        return .{ .record = .{ .end = end, .next = next, .spanned = spanned, .unbalanced = false } };
+    }
+
+    /// The opening quote was stray: the record is the physical line it
+    /// starts on, as `.end_record` mode reads it.
+    fn lazyFallback(bytes: []const u8, start: usize, at_eof: bool) Scan {
+        if (std.mem.indexOfScalarPos(u8, bytes, start, '\n')) |nl|
+            return .{ .record = .{ .end = nl, .next = nl + 1, .spanned = false, .unbalanced = true } };
+        if (!at_eof) return .incomplete;
+        return .{ .record = .{ .end = bytes.len, .next = bytes.len, .spanned = false, .unbalanced = true } };
+    }
+};
+
+fn trimCr(rec: []const u8) []const u8 {
+    if (rec.len > 0 and rec[rec.len - 1] == '\r') return rec[0 .. rec.len - 1];
+    return rec;
+}
 
 /// Quote-aware streaming iterator over CSV records held in a single in-memory
 /// buffer. The caller pulls one record at a time; emitted `LineSlice.bytes`
@@ -259,17 +465,34 @@ pub const LineSlice = struct {
 ///
 /// Empty records (consecutive `\n` or trailing `\n` at EOF) are skipped.
 /// Returns `null` once the buffer is exhausted.
+///
+/// `initSpan` selects `.span` mode instead: quoted fields may contain
+/// newlines, within `SpanConfig`'s bound. The buffer's end is the input's end.
 pub const LineIterator = struct {
     bytes: []const u8,
     quote: u8,
     base_offset: u64,
     pos: usize,
+    /// Non-null in `.span` mode. Carries what it learned (the header's field
+    /// count) from record to record.
+    span: ?SpanScanner = null,
 
     pub fn init(bytes: []const u8, quote: u8, base_offset: u64) LineIterator {
         return .{ .bytes = bytes, .quote = quote, .base_offset = base_offset, .pos = 0 };
     }
 
+    pub fn initSpan(bytes: []const u8, quote: u8, base_offset: u64, cfg: SpanConfig) LineIterator {
+        return initSpanScanner(bytes, base_offset, SpanScanner.init(quote, cfg));
+    }
+
+    /// `.span` mode continuing an existing scanner's state — how
+    /// `StreamReader` carries the header's field count from chunk to chunk.
+    pub fn initSpanScanner(bytes: []const u8, base_offset: u64, scanner: SpanScanner) LineIterator {
+        return .{ .bytes = bytes, .quote = scanner.quote, .base_offset = base_offset, .pos = 0, .span = scanner };
+    }
+
     pub fn next(self: *LineIterator) ?LineSlice {
+        if (self.span != null) return self.nextSpan();
         // Skip leading empty records so the first call returns the first
         // non-empty record.
         while (self.pos < self.bytes.len) {
@@ -301,6 +524,25 @@ pub const LineIterator = struct {
             if (rec.len > 0 and rec[rec.len - 1] == '\r') rec = rec[0 .. rec.len - 1];
             if (rec.len == 0) continue; // skip empty record, try next
             return .{ .bytes = rec, .byte_offset = self.base_offset + rec_start, .unbalanced_quote = unbalanced };
+        }
+        return null;
+    }
+
+    fn nextSpan(self: *LineIterator) ?LineSlice {
+        const scanner = &self.span.?;
+        while (self.pos < self.bytes.len) {
+            const rec_start = self.pos;
+            // `at_eof` is true, so the scan always yields a record.
+            const r = scanner.scan(self.bytes, rec_start, true).record;
+            self.pos = r.next;
+            const rec = trimCr(self.bytes[rec_start..r.end]);
+            if (rec.len == 0) continue;
+            return .{
+                .bytes = rec,
+                .byte_offset = self.base_offset + rec_start,
+                .unbalanced_quote = r.unbalanced,
+                .spanned = r.spanned,
+            };
         }
         return null;
     }
@@ -1051,4 +1293,167 @@ test "the cleanup frees only the copies, never a field borrowed from the record"
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     try std.testing.expectEqual(failing.allocations, failing.deallocations);
     try std.testing.expect(failing.allocations >= 100);
+}
+
+// ── `.span` mode ─────────────────────────────────────────────────────────────
+
+/// Collect every record `.span` mode yields for `bytes` (arena-owned copies).
+fn spanRecords(arena: std.mem.Allocator, bytes: []const u8, cfg: SpanConfig) ![]LineSlice {
+    var out: std.ArrayList(LineSlice) = .empty;
+    var it = LineIterator.initSpan(bytes, '"', 0, cfg);
+    while (it.next()) |r| try out.append(arena, r);
+    return out.items;
+}
+
+test "span: a quoted field crosses a newline (csv-spectrum newlines shape)" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const recs = try spanRecords(arena_state.allocator(), "a,b,c\n1,2,3\n\"Once upon \na time\",5,6\n7,8,9\n", .{});
+    try t.expectEqual(@as(usize, 4), recs.len);
+    try t.expectEqualStrings("\"Once upon \na time\",5,6", recs[2].bytes);
+    try t.expect(recs[2].spanned and !recs[2].unbalanced_quote);
+    try t.expectEqual(@as(u64, 12), recs[2].byte_offset);
+    try t.expect(!recs[1].spanned and !recs[3].spanned);
+    // The in-line splitter reads the spanned record into the right fields.
+    var fbuf: [4][]const u8 = undefined;
+    const fields = try splitFields(recs[2].bytes, &fbuf, ',', '"', arena_state.allocator());
+    try t.expectEqual(@as(usize, 3), fields.len);
+    try t.expectEqualStrings("Once upon \na time", fields[0]);
+}
+
+test "span: CRLF inside a quoted field is kept, the record's own CRLF is stripped" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const recs = try spanRecords(arena_state.allocator(), "a,b\r\n\"x\r\ny\",z\r\n", .{});
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expectEqualStrings("\"x\r\ny\",z", recs[1].bytes);
+}
+
+test "span: doubled quotes and newlines together (csv-spectrum quotes_and_newlines shape)" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const recs = try spanRecords(arena, "a,b\n1,\"ha \n\"\"ha\"\" \nha\"\n3,4\n", .{});
+    try t.expectEqual(@as(usize, 3), recs.len);
+    var fbuf: [4][]const u8 = undefined;
+    const fields = try splitFields(recs[1].bytes, &fbuf, ',', '"', arena);
+    try t.expectEqualStrings("ha \n\"ha\" \nha", fields[1]);
+}
+
+test "span: a quote inside an unquoted field is literal and opens nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const recs = try spanRecords(arena_state.allocator(), "a,5\" floppy,c\nd,e,f\n", .{});
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expect(!recs[0].spanned and !recs[0].unbalanced_quote);
+    try t.expectEqualStrings("d,e,f", recs[1].bytes);
+}
+
+test "span: the IMDb shape — two stray field-start quotes far apart give 1:1 rows and two flags" {
+    // bxp's `title.basics.tsv` failure: stray quotes 255 866 lines apart. Here
+    // 200 apart, well past the 64-line cap.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(arena, "id\ttitle\n");
+    for (0..202) |i| {
+        if (i == 1 or i == 201)
+            try body.print(arena, "{d}\t\"Rock\n", .{i})
+        else
+            try body.print(arena, "{d}\tplain\n", .{i});
+    }
+    const recs = try spanRecords(arena, body.items, .{ .delimiter = '\t' });
+    try t.expectEqual(@as(usize, 203), recs.len); // header + 202 rows, none merged
+    var flagged: usize = 0;
+    for (recs) |r| {
+        try t.expect(!r.spanned);
+        if (r.unbalanced_quote) flagged += 1;
+    }
+    try t.expectEqual(@as(usize, 2), flagged);
+    try t.expectEqualStrings("1\t\"Rock", recs[2].bytes);
+}
+
+test "span: max_quoted_lines is the exact bound" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A quoted field with exactly `n` newlines, then one more record.
+    const build = struct {
+        fn f(a: std.mem.Allocator, n: usize) ![]const u8 {
+            var b: std.ArrayList(u8) = .empty;
+            try b.appendSlice(a, "\"x");
+            for (0..n) |_| try b.appendSlice(a, "\ny");
+            try b.appendSlice(a, "\",1\nz,2\n");
+            return b.items;
+        }
+    }.f;
+    const at_cap = try spanRecords(arena, try build(arena, 3), .{ .max_quoted_lines = 3 });
+    try t.expectEqual(@as(usize, 2), at_cap.len);
+    try t.expect(at_cap[0].spanned);
+    const past_cap = try spanRecords(arena, try build(arena, 4), .{ .max_quoted_lines = 3 });
+    // Fallback: the opener's line, then every following physical line.
+    try t.expectEqual(@as(usize, 6), past_cap.len);
+    try t.expect(past_cap[0].unbalanced_quote and !past_cap[0].spanned);
+    try t.expectEqualStrings("\"x", past_cap[0].bytes);
+}
+
+test "span: field_check catches two stray quotes that lie close together" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Row 1 opens a stray field-start quote; a stray quote in row 3 closes it.
+    // Read as a span they re-balance into one 3-line record of 4 fields under
+    // a 3-field header.
+    const body = "a,b,c\n1,\"x,y\n2,m,n\n3\",q,z\n4,r,s\n";
+    const lax = try spanRecords(arena, body, .{});
+    try t.expectEqual(@as(usize, 3), lax.len); // merged: what the line cap alone lets through
+    try t.expect(lax[1].spanned);
+    const checked = try spanRecords(arena, body, .{ .field_check = .first_record });
+    try t.expectEqual(@as(usize, 5), checked.len);
+    try t.expect(checked[1].unbalanced_quote and !checked[1].spanned);
+    try t.expectEqualStrings("2,m,n", checked[2].bytes);
+    // A genuine multi-line field with the right width survives the check.
+    const good = try spanRecords(arena, "a,b\n\"x\ny\",1\n", .{ .field_check = .first_record });
+    try t.expectEqual(@as(usize, 2), good.len);
+    try t.expect(good[1].spanned);
+    // `.count` is the same check with a caller-known width.
+    const counted = try spanRecords(arena, "\"x\ny\",1\n", .{ .field_check = .{ .count = 3 } });
+    try t.expectEqual(@as(usize, 2), counted.len);
+}
+
+test "span: max_record_len caps a spanned record; EOF inside a quote falls back" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const capped = try spanRecords(arena, "\"aaaa\nbbbbbbbbbbbbbbbb\nc\",1\n", .{ .max_record_len = 12 });
+    try t.expect(capped[0].unbalanced_quote);
+    try t.expectEqualStrings("\"aaaa", capped[0].bytes);
+    const open = try spanRecords(arena, "a,b\n1,\"never closed\n2,3", .{});
+    try t.expectEqual(@as(usize, 3), open.len);
+    try t.expect(open[1].unbalanced_quote);
+    try t.expectEqualStrings("2,3", open[2].bytes);
+}
+
+test "span: quote == 0 disables quoting entirely" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var out: std.ArrayList(LineSlice) = .empty;
+    var it = LineIterator.initSpan("\"a\nb\"\n", 0, 0, .{});
+    while (it.next()) |r| try out.append(arena_state.allocator(), r);
+    try t.expectEqual(@as(usize, 2), out.items.len);
+}
+
+test "span: the record scanner and splitFields agree on where fields end" {
+    // Lazy-quote shapes inside a quoted field: `"a"b"` is one field `a"b`.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const recs = try spanRecords(arena, "\"a\"b\nc\",d\ne,f\n", .{});
+    try t.expectEqual(@as(usize, 2), recs.len);
+    var fbuf: [4][]const u8 = undefined;
+    const fields = try splitFields(recs[0].bytes, &fbuf, ',', '"', arena);
+    try t.expectEqual(@as(usize, 2), fields.len);
+    try t.expectEqualStrings("a\"b\nc", fields[0]);
+    try t.expectEqual(@as(usize, 2), countFields(recs[0].bytes, ',', '"'));
 }

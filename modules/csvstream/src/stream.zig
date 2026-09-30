@@ -67,6 +67,10 @@ pub const ChunkReader = struct {
     /// chunk size when the caller passes 0 — there is NO 10 MiB floor under it
     /// any more; that floor was F5 and `initMax` below says why it went.
     max_record_len: usize,
+    /// `.span` mode (set with `setSpan`): chunks are cut after the last
+    /// complete record as `line.SpanScanner` reads it, not at the last `\n`.
+    /// Holds the scanner state as of the start of the unread residual.
+    span: ?line.SpanScanner = null,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
         return initMax(io, alloc, file, chunk_size, 0);
@@ -115,6 +119,46 @@ pub const ChunkReader = struct {
         self.buffer.deinit();
     }
 
+    /// Switch to `.span` mode before the first `nextChunk`. The scanner's
+    /// `max_record_len` is forced to this reader's, so a spanned record hits
+    /// the fallback before the buffer reaches its bound, never
+    /// `error.RecordTooLong`.
+    pub fn setSpan(self: *ChunkReader, quote: u8, cfg: line.SpanConfig) void {
+        var c = cfg;
+        c.max_record_len = self.max_record_len;
+        self.span = line.SpanScanner.init(quote, c);
+    }
+
+    /// Where the chunk ends: one past the last record boundary in the buffer,
+    /// or null when the buffer holds no complete record yet. Lazy mode: the
+    /// last `\n`. Span mode: scan records forward from the residual's start
+    /// with the scanner, committing its state only for the records emitted.
+    fn findCut(self: *ChunkReader) ?usize {
+        var scanner = self.span orelse {
+            const b = findLastBoundary(self.buffer.items) orelse return null;
+            return b + 1;
+        };
+        const bytes = self.buffer.items;
+        // `StreamReader` strips a leading BOM before splitting the first
+        // chunk; the cut must be computed on the same bytes, or a quote right
+        // after the BOM opens a field for one and not the other.
+        var pos: usize = if (self.chunk_start_in_file == 0 and std.mem.startsWith(u8, bytes, line.utf8_bom)) line.utf8_bom.len else 0;
+        var cut: ?usize = null;
+        var committed = scanner;
+        while (pos < bytes.len) {
+            switch (scanner.scan(bytes, pos, false)) {
+                .incomplete => break,
+                .record => |r| {
+                    pos = r.next;
+                    cut = r.next;
+                    committed = scanner;
+                },
+            }
+        }
+        if (cut != null) self.span = committed;
+        return cut;
+    }
+
     /// Returns the next chunk of bytes ending at a record boundary (the last
     /// '\n' in the window). At EOF, returns the remaining bytes verbatim.
     /// Returns null when nothing is left.
@@ -137,8 +181,8 @@ pub const ChunkReader = struct {
             self.last_emit_len = 0;
         }
         while (true) {
-            if (findLastBoundary(self.buffer.items)) |boundary| {
-                self.last_emit_len = boundary + 1;
+            if (self.findCut()) |cut| {
+                self.last_emit_len = cut;
                 return self.buffer.items[0..self.last_emit_len];
             }
             if (self.eof) {
@@ -195,8 +239,11 @@ pub const ChunkReader = struct {
 /// one `LineSlice` at a time with an ABSOLUTE file byte offset, in bounded
 /// memory regardless of file size.
 ///
-/// Because chunks always end on a '\n', no record ever spans a chunk boundary,
-/// so each chunk's iterator drains cleanly before the next chunk loads.
+/// Because chunks always end on a record boundary, no record ever spans a chunk
+/// boundary, so each chunk's iterator drains cleanly before the next chunk
+/// loads. In `.span` mode (`Options.quoted_newlines`) that boundary is the end
+/// of the last complete record as `line.SpanScanner` reads it — the same
+/// function then splits the chunk, so the two agree.
 ///
 /// Borrow contract: the `bytes` of a returned `LineSlice` point into the
 /// reader's internal buffer and stay valid only until the next `next()` call
@@ -225,15 +272,35 @@ pub const StreamReader = struct {
         /// Longest single record this reader will buffer before returning
         /// `error.RecordTooLong`. 0 = the resolved chunk size, which makes the
         /// reader's peak twice the chunk size (`ChunkReader.capacityBound()`).
+        /// In `.span` mode it is also the byte cap on one spanned record.
         max_record_len: usize = 0,
+        /// `.end_record` (default): every `\n` ends a record. `.span`: a
+        /// quoted field may contain newlines, bounded — see `line.SpanConfig`.
+        quoted_newlines: line.QuotedNewlines = .end_record,
+        /// `.span` mode: newlines one quoted field may contain before its
+        /// opening quote is declared stray.
+        max_quoted_lines: usize = line.default_max_quoted_lines,
+        /// `.span` mode: the field count a spanned record must have to keep
+        /// its span. `.first_record` = the header's.
+        field_check: line.FieldCheck = .none,
     };
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, opts: Options) !StreamReader {
+        var chunks = try ChunkReader.initMax(io, alloc, file, opts.chunk_size, opts.max_record_len);
+        var lines = LineIterator.init("", opts.quote, 0);
+        if (opts.quoted_newlines == .span) {
+            chunks.setSpan(opts.quote, .{
+                .delimiter = opts.delimiter,
+                .max_quoted_lines = opts.max_quoted_lines,
+                .field_check = opts.field_check,
+            });
+            lines = LineIterator.initSpanScanner("", 0, chunks.span.?);
+        }
         return .{
-            .chunks = try ChunkReader.initMax(io, alloc, file, opts.chunk_size, opts.max_record_len),
+            .chunks = chunks,
             .quote = opts.quote,
             .delimiter = opts.delimiter,
-            .lines = LineIterator.init("", opts.quote, 0),
+            .lines = lines,
         };
     }
 
@@ -261,7 +328,12 @@ pub const StreamReader = struct {
                     }
                 }
             }
-            self.lines = LineIterator.init(bytes, self.quote, base_offset);
+            // Span mode: the drained iterator's scanner is exactly the state
+            // at this chunk's start (it has read every record before it).
+            self.lines = if (self.lines.span) |scanner|
+                LineIterator.initSpanScanner(bytes, base_offset, scanner)
+            else
+                LineIterator.init(bytes, self.quote, base_offset);
         }
     }
 
@@ -699,4 +771,109 @@ test "max_record_len is the caller's, and defaults to the chunk size" {
     defer sr2.deinit();
     try std.testing.expectEqual(@as(usize, 16384), sr2.chunks.max_record_len);
     try std.testing.expect((try sr2.next()) != null);
+}
+
+// ── `.span` mode across chunks ──────────────────────────────────────────────
+
+test "StreamReader .span: every chunk size yields exactly the in-memory records" {
+    // The consistency claim of `SpanScanner.scan`: chunk cuts computed with
+    // `at_eof = false` and splits computed with `at_eof = true` agree. Checked
+    // against the whole-buffer reading for every chunk size from 1 byte up,
+    // so an embedded newline, a `""`, a CRLF and a fallback each land exactly
+    // on a chunk edge somewhere in the sweep.
+    const body = line.utf8_bom ++
+        "\"h1\",h2,h3\r\n" ++
+        "1,\"multi\r\nline\",x\n" ++
+        "2,\"a \"\"q\"\"\nb\",y\n" ++
+        "3,\"stray\n" ++ // stray opener: the line cap (2) is exceeded below
+        "4,p,q\n5,r,s\n6,t,u\n" ++
+        "7,\"x\ny\ny\",z\n" ++ // 2 newlines: at the cap, spans
+        "8,\"u\nv\",w,EXTRA\n" ++ // spans, but 4 fields under a 3-field header
+        "9,last,\"open at eof";
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg: line.SpanConfig = .{ .max_quoted_lines = 2, .field_check = .first_record };
+
+    var want: std.ArrayList(LineSlice) = .empty;
+    var it = LineIterator.initSpan(body[line.utf8_bom.len..], '"', line.utf8_bom.len, cfg);
+    while (it.next()) |r| try want.append(arena, r);
+    try t.expect(want.items.len > 10);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "span.csv", .data = body });
+    for (1..body.len + 2) |chunk_size| {
+        var f = try tmp.dir.openFile(t.io, "span.csv", .{});
+        defer f.close(t.io);
+        var sr = try StreamReader.init(t.io, t.allocator, f, .{
+            .chunk_size = chunk_size,
+            .max_record_len = 4096,
+            .quoted_newlines = .span,
+            .max_quoted_lines = cfg.max_quoted_lines,
+            .field_check = cfg.field_check,
+        });
+        defer sr.deinit();
+        for (want.items) |w| {
+            const g = (try sr.next()) orelse {
+                std.debug.print("chunk_size {d}: ended early before offset {d}\n", .{ chunk_size, w.byte_offset });
+                return error.TestUnexpectedResult;
+            };
+            t.expectEqualStrings(w.bytes, g.bytes) catch |e| {
+                std.debug.print("chunk_size {d}, offset {d}\n", .{ chunk_size, w.byte_offset });
+                return e;
+            };
+            try t.expectEqual(w.byte_offset, g.byte_offset);
+            try t.expectEqual(w.spanned, g.spanned);
+            try t.expectEqual(w.unbalanced_quote, g.unbalanced_quote);
+        }
+        try t.expect((try sr.next()) == null);
+    }
+
+    // And the in-memory reading is the intended one.
+    try t.expectEqualStrings("\"h1\",h2,h3", want.items[0].bytes);
+    try t.expect(want.items[1].spanned and want.items[2].spanned);
+    try t.expect(want.items[3].unbalanced_quote); // `3,"stray`
+    try t.expect(want.items[7].spanned); // row 7
+    try t.expect(want.items[8].unbalanced_quote); // row 8: wrong width
+}
+
+test "StreamReader .span: a spanned record past max_record_len falls back instead of RecordTooLong" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var body: [300]u8 = undefined;
+    @memset(&body, 'a');
+    body[0] = '"';
+    // The opener's quoted field would run past 64 bytes; every line itself
+    // stays under it.
+    for ([_]usize{ 20, 60, 100, 140, 180, 220, 260, 299 }) |i| body[i] = '\n';
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "long.csv", .data = &body });
+    var f = try tmp.dir.openFile(t.io, "long.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{
+        .chunk_size = 32,
+        .max_record_len = 64,
+        .quoted_newlines = .span,
+        .max_quoted_lines = 1000,
+    });
+    defer sr.deinit();
+    const first = (try sr.next()).?;
+    try t.expect(first.unbalanced_quote);
+    try t.expectEqual(@as(usize, 20), first.bytes.len);
+    var n: usize = 1;
+    while (try sr.next()) |_| n += 1;
+    try t.expectEqual(@as(usize, 8), n);
+}
+
+test "StreamReader .span: a newline-free record is still RecordTooLong" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var body: [200]u8 = undefined;
+    @memset(&body, 'a');
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "nonl.csv", .data = &body });
+    var f = try tmp.dir.openFile(t.io, "nonl.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{ .chunk_size = 32, .max_record_len = 64, .quoted_newlines = .span });
+    defer sr.deinit();
+    try t.expectError(error.RecordTooLong, sr.next());
 }

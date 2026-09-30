@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Multi-line quoted fields as an opt-in `.span` mode** (additive; the default is
+  unchanged). `StreamReader.Options.quoted_newlines = .span` (+ `max_quoted_lines`, default 64, and
+  `field_check`: `.none` / `.first_record` / `.count`), `LineIterator.initSpan`/`initSpanScanner`,
+  `ChunkReader.setSpan`. A quoted field may contain newlines within that bound; past it (or at EOF
+  inside a quote, or on a field-count mismatch) the opening quote is declared stray and the record is
+  its first physical line, flagged `unbalanced_quote`. Only a field-start quote opens a quoted field.
+  New `LineSlice.spanned`, and the scanner itself as `SpanScanner`. `countFields` is now exported from
+  the module root (it was `pub` in `line.zig` only, though the docs pointed callers at it). csv-spectrum:
+  11 of 12 fixtures now asserted in `.span` mode (was 8 of 12). For bxp's K6 `csv_multiline_quotes`.
+
 - **2026-09-18** — **New `freeFields(line, fields, alloc)`** (additive). A split's
   escaped-quote fields are copies from `alloc`, and until now a caller with a
   general-purpose allocator had no way to tell which fields those were: only the
