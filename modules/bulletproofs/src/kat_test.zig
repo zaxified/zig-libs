@@ -2,17 +2,12 @@
 
 //! kat_test — the Bulletproofs property/soundness KAT harness.
 //!
-//! **No byte-exact third-party vector is possible here** (see
-//! `transcript.zig`'s module doc comment: this module's Fiat-Shamir
-//! transcript is self-contained and NOT dalek/Merlin-compatible, so a
-//! proof this module produces cannot be checked against any published
-//! Bulletproofs test vector, which are all tied to a specific
-//! implementation's transcript). Verification is therefore
-//! PROPERTY-based (completeness: an honest prover's proof verifies) and
-//! SOUNDNESS-based (a cheating prover's proof — out-of-range value,
-//! tampered proof field, wrong commitment, mismatched parameters — does
-//! NOT verify), per CONVENTIONS.md §7's "pure logic" tier (property +
-//! round-trip, no external oracle available).
+//! This file is the PROPERTY half (completeness: an honest prover's proof
+//! verifies) and the SOUNDNESS half (a cheating prover's proof —
+//! out-of-range value, tampered proof field, wrong commitment, mismatched
+//! parameters — does NOT verify). The byte-exact external half, against
+//! dalek and merlin, is `interop_test.zig` (since 2026-09-30; before that
+//! the transcript was module-defined and no external vector could apply).
 //!
 //! Every test that calls `prove`/`verify`/`proveIpa`/`verifyIpa` — i.e.
 //! that would hit one of `ipa.zig`/`rangeproof.zig`'s `@panic

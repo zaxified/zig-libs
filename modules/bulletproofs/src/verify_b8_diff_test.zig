@@ -80,11 +80,16 @@ fn refIpaSides(
     const rounds: usize = std.math.log2_int(usize, n);
     if (proof.l_vec.len != rounds or proof.r_vec.len != rounds) return null;
 
+    // The 2026-09-30 dalek transcript (domain separator, identity
+    // refusal) is replayed here as well; it is transcript protocol, not
+    // the B8 change.
+    transcript.appendMessage("dom-sep", "ipp v1");
+    transcript.appendU64("n", n);
     var u: [64][32]u8 = undefined;
     var u_inv: [64][32]u8 = undefined;
     for (0..rounds) |j| {
-        transcript.appendPoint("L", proof.l_vec[j]);
-        transcript.appendPoint("R", proof.r_vec[j]);
+        transcript.validateAndAppendPoint("L", proof.l_vec[j]) catch return null;
+        transcript.validateAndAppendPoint("R", proof.r_vec[j]) catch return null;
         u[j] = transcript.challengeScalar("u");
         u_inv[j] = refInvertScalar(u[j]);
     }
@@ -146,14 +151,14 @@ fn refVerify(
 
     const scratch = talloc;
 
-    transcript.appendU64("n", n);
+    rangeproof.appendDomainSep(transcript, n);
     transcript.appendPoint("V", v);
-    transcript.appendPoint("A", proof.a);
-    transcript.appendPoint("S", proof.s);
+    transcript.validateAndAppendPoint("A", proof.a) catch return false;
+    transcript.validateAndAppendPoint("S", proof.s) catch return false;
     const y = transcript.challengeScalar("y");
     const z = transcript.challengeScalar("z");
-    transcript.appendPoint("T1", proof.t1);
-    transcript.appendPoint("T2", proof.t2);
+    transcript.validateAndAppendPoint("T_1", proof.t1) catch return false;
+    transcript.validateAndAppendPoint("T_2", proof.t2) catch return false;
     const x = transcript.challengeScalar("x");
     const z2 = scalar.mul(z, z);
     const x2 = scalar.mul(x, x);
@@ -166,9 +171,9 @@ fn refVerify(
         .add(scalarvec.mulCt(proof.t2, x2));
     if (!lhs.equivalent(rhs)) return false;
 
-    transcript.appendScalar("t_hat", proof.t_hat);
-    transcript.appendScalar("tau_x", proof.tau_x);
-    transcript.appendScalar("mu", proof.mu);
+    transcript.appendScalar("t_x", proof.t_hat);
+    transcript.appendScalar("t_x_blinding", proof.tau_x);
+    transcript.appendScalar("e_blinding", proof.mu);
     const w = transcript.challengeScalar("w");
     const q = scalarvec.mulCt(gens.g, w);
 
@@ -329,7 +334,7 @@ fn forge(
         .add(try scalarvec.multiScalarMul(s_r, gens.h_vec));
 
     var t = Transcript.init(rangeproof.transcript_domain);
-    t.appendU64("n", n);
+    rangeproof.appendDomainSep(&t, n);
     const v_scalar = u64Scalar(v);
     const v_point = rangeproof.commit(gens, v_scalar, gamma);
     t.appendPoint("V", v_point);
@@ -355,8 +360,8 @@ fn forge(
     const tau2 = randomScalar(random);
     const t1_commit = scalarvec.mulCt(gens.g, t1).add(scalarvec.mulCt(gens.h, tau1));
     const t2_commit = scalarvec.mulCt(gens.g, t2).add(scalarvec.mulCt(gens.h, tau2));
-    t.appendPoint("T1", t1_commit);
-    t.appendPoint("T2", t2_commit);
+    t.appendPoint("T_1", t1_commit);
+    t.appendPoint("T_2", t2_commit);
     const x = t.challengeScalar("x");
     const x2 = scalar.mul(x, x);
 
@@ -374,9 +379,9 @@ fn forge(
     const tau_x = scalar.add(scalar.mulAdd(tau2, x2, scalar.mul(tau1, x)), scalar.mul(z2, gamma));
     const mu = scalar.mulAdd(rho, x, alpha);
 
-    t.appendScalar("t_hat", t_hat);
-    t.appendScalar("tau_x", tau_x);
-    t.appendScalar("mu", mu);
+    t.appendScalar("t_x", t_hat);
+    t.appendScalar("t_x_blinding", tau_x);
+    t.appendScalar("e_blinding", mu);
     const w = t.challengeScalar("w");
     const q = scalarvec.mulCt(gens.g, w);
     const y_inv = refInvertScalar(y);
@@ -426,14 +431,14 @@ test "B8 diff: honest proofs at every width verify identically, bytes of P and b
     try std.testing.expectEqual(tally.cases, tally.reached_ipa);
 }
 
-const WireField = enum(u8) { A, S, T1, T2, tau_x, mu, t_hat, rounds, L, R, a, b };
+/// dalek's layout: seven fixed fields, then `(L, R)` per round, `a`, `b`.
+const WireField = enum(u8) { A, S, T1, T2, t_hat, tau_x, mu, L, R, a, b };
 
 fn wireField(off: usize, len: usize) WireField {
     if (off < 224) return @enumFromInt(off / 32);
-    if (off < 228) return .rounds;
     if (off >= len - 32) return .b;
     if (off >= len - 64) return .a;
-    return if ((off - 228) % 64 < 32) .L else .R;
+    return if ((off - 224) % 64 < 32) .L else .R;
 }
 
 test "B8 diff: a single-bit flip at every byte of every wire field is rejected identically" {
@@ -448,8 +453,16 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
     var prng = std.Random.DefaultPrng.init(0xB8_0002);
     const random = prng.random();
     for (widths) |n| {
-        const fx = try Fixture.honest(n, random.int(u64), randomScalar(random));
-        defer fx.deinit();
+        // The proof comes from the seeded `forge` (honest mode), not from
+        // `rangeproof.prove`: whether a flipped point still DECODES depends on
+        // the bytes, so a getrandom-blinded proof made the "every field
+        // decoded at least once" check below flaky in Debug's sparse sample
+        // (seen 2026-09-30). Seeded, the outcome is the same on every run.
+        const gens = try Generators.init(talloc, n);
+        defer gens.deinit(talloc);
+        const v: u64 = if (n < 64) random.int(u64) & ((@as(u64, 1) << @intCast(n)) - 1) else random.int(u64);
+        const fx = try forge(gens, v, randomScalar(random), false, random);
+        defer fx.proof.deinit(talloc);
         const bytes = try fx.proof.toBytesAlloc(talloc);
         defer talloc.free(bytes);
         const work = try talloc.dupe(u8, bytes);
@@ -459,7 +472,7 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
         {
             const back = try RangeProof.fromBytesAlloc(talloc, work);
             defer back.deinit(talloc);
-            try std.testing.expect((try diffOne(fx.gens, fx.v_point, back)).verdict);
+            try std.testing.expect((try diffOne(gens, fx.v_point, back)).verdict);
         }
 
         var decoded: [field_count]usize = @splat(0);
@@ -477,22 +490,15 @@ test "B8 diff: a single-bit flip at every byte of every wire field is rejected i
                 defer forged.deinit(talloc);
                 const f = @intFromEnum(wireField(off, bytes.len));
                 decoded[f] += 1;
-                const got = try diffOne(fx.gens, fx.v_point, forged);
+                const got = try diffOne(gens, fx.v_point, forged);
                 try std.testing.expect(!got.verdict);
                 if (got.reached_ipa) reached[f] += 1;
             }
         }
-        // Not blind: every field but the rounds header put flips past the
-        // codec (a header flip changes the implied length, which the codec
-        // always refuses), and every field bound after check 1 — mu, the IPA
-        // points, the IPA scalars — put forgeries into the IPA.
-        for (std.enums.values(WireField)) |f| {
-            if (f == .rounds and n > 1) {
-                try std.testing.expectEqual(@as(usize, 0), decoded[@intFromEnum(f)]);
-            } else {
-                try std.testing.expect(decoded[@intFromEnum(f)] > 0);
-            }
-        }
+        // Not blind: every field put flips past the codec, and every field
+        // bound after check 1 — mu, the IPA points, the IPA scalars — put
+        // forgeries into the IPA.
+        for (std.enums.values(WireField)) |f| try std.testing.expect(decoded[@intFromEnum(f)] > 0);
         for ([_]WireField{ .mu, .L, .R, .a, .b }) |f| try std.testing.expect(reached[@intFromEnum(f)] > 0);
     }
 }

@@ -45,8 +45,9 @@
 //! 3. **Blinding vectors + commit `S`.** Sample secret `s_L`, `s_R`
 //!    (random length-`n` vectors) and secret `rho` (random scalar).
 //!    `S = rho*gens.h + <s_L, gens.g_vec> + <s_R, gens.h_vec>`.
-//! 4. **Transcript + challenges `y`, `z`.** `transcript.appendPoint("V",
-//!    V);` (binding the public commitment — do this once, before `A`/`S`,
+//! 4. **Transcript + challenges `y`, `z`.** `appendDomainSep(transcript,
+//!    n)` (dalek's `rangeproof_domain_sep`: `"rangeproof v1"`, `n`, `m = 1`),
+//!    then `transcript.appendPoint("V", V);` (binding the public commitment — do this once, before `A`/`S`,
 //!    so `y`/`z` also depend on WHICH value is being proven, not just the
 //!    proof shape); `transcript.appendPoint("A", A);
 //!    transcript.appendPoint("S", S);` then `y =
@@ -73,8 +74,8 @@
 //!    scalars). `T1 = t1*gens.g + tau1*gens.h`, `T2 = t2*gens.g +
 //!    tau2*gens.h` (`gens.g`/`gens.h` — the SAME base points `V` itself
 //!    was committed under, NOT `g_vec`/`h_vec`).
-//! 7. **Transcript + challenge `x`.** `transcript.appendPoint("T1", T1);
-//!    transcript.appendPoint("T2", T2); const x =
+//! 7. **Transcript + challenge `x`.** `transcript.appendPoint("T_1", T1);
+//!    transcript.appendPoint("T_2", T2); const x =
 //!    transcript.challengeScalar("x");`.
 //! 8. **Evaluate + response scalars.**
 //!    ```text
@@ -97,8 +98,9 @@
 //!    instead fold `y^{-n}` into `r_vec` directly before calling the IPA
 //!    with UNSCALED `h_vec`, which is mathematically equivalent and
 //!    simpler to implement first). `q` is itself transcript-derived:
-//!    `transcript.appendScalar("t_hat", t_hat); transcript.appendScalar
-//!    ("tau_x", tau_x); transcript.appendScalar("mu", mu); const w =
+//!    `transcript.appendScalar("t_x", t_hat); transcript.appendScalar
+//!    ("t_x_blinding", tau_x); transcript.appendScalar("e_blinding", mu);
+//!    const w =
 //!    transcript.challengeScalar("w"); const q = gens.g.mul(w)` (paper
 //!    §4.2's trick for binding the IPA to THIS proof instance, so an IPA
 //!    proof crafted for a different `t_hat` cannot be replayed here).
@@ -111,8 +113,11 @@
 //!
 //! Replays steps 4/7/9's transcript operations from the PROOF's own `A`/
 //! `S`/`T1`/`T2`/`tau_x`/`mu`/`t_hat` fields (and the public `V`) to
-//! recover the SAME `y`, `z`, `x`, `w` the prover derived, then checks
-//! TWO equations:
+//! recover the SAME `y`, `z`, `x`, `w` the prover derived — binding
+//! `A`/`S`/`T1`/`T2` and the IPA's `L`/`R` with `validateAndAppendPoint`,
+//! which refuses the identity as dalek's verifier does — then checks TWO
+//! equations (dalek folds both into one random linear combination; the
+//! verdict is the same):
 //!
 //! - **The `t_hat` relation** (paper eq. (72)):
 //!   ```text
@@ -138,10 +143,19 @@
 //!
 //! Provenance: Bünz, Bootle, Boneh, Poelstra, Wuille, Maxwell,
 //! "Bulletproofs: Short Proofs for Confidential Transactions and More",
-//! IEEE S&P 2018 (eprint.iacr.org/2017/1066), §4.1/§4.2. Cross-referenced
-//! against dalek-cryptography/bulletproofs's `range_proof.rs` for the
-//! SHAPE of the construction (which scalars/points are committed in which
-//! order) — no source ported, see NOTICE.
+//! IEEE S&P 2018 (eprint.iacr.org/2017/1066), §4.1/§4.2.
+//!
+//! ## Wire compatibility with dalek
+//!
+//! The transcript (Merlin, `transcript.zig`), its labels and order, the
+//! generators (`generators.zig`) and the byte layout (`RangeProof.
+//! toBytesAlloc`) are dalek-cryptography/bulletproofs 4.0's (MIT), read from
+//! its `src/range_proof/mod.rs`, `src/inner_product_proof.rs`,
+//! `src/transcript.rs` and `src/generators.rs`; the algebra was already the
+//! paper's. A proof made here verifies under dalek's
+//! `RangeProof::verify_single` and the reverse, given the same transcript
+//! label and `n` in {8, 16, 32, 64} (dalek refuses other widths) —
+//! `interop_test.zig` asserts both directions. See NOTICE.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -160,6 +174,14 @@ const InnerProductProof = ipa.InnerProductProof;
 /// this same transcript for the rest of the protocol, including the IPA
 /// sub-step — see the module doc comment's step 9).
 pub const transcript_domain = "bulletproofs/range-proof/v1";
+
+/// dalek's `rangeproof_domain_sep(n, m)` with `m = 1` (single-value proofs
+/// only). Both `prove` and `verify` call it first, before `V`.
+pub fn appendDomainSep(transcript: *Transcript, n: usize) void {
+    transcript.appendMessage("dom-sep", "rangeproof v1");
+    transcript.appendU64("n", n);
+    transcript.appendU64("m", 1);
+}
 
 /// `v*gens.g + gamma*gens.h` — Bulletproofs' Pedersen VALUE commitment
 /// (distinct from the vector Pedersen commitments `A`/`S`/`T1`/`T2` a
@@ -288,12 +310,10 @@ pub const RangeProof = struct {
         self.ipa.deinit(allocator);
     }
 
-    /// `A(32) || S(32) || T1(32) || T2(32) || tau_x(32) || mu(32) ||
-    /// t_hat(32) || <ipa.toBytesAlloc() bytes>`. REAL — mechanical
-    /// concatenation; the trailing IPA sub-proof needs no outer length
-    /// prefix since `InnerProductProof.fromBytesAlloc`'s own leading
-    /// `rounds` field self-describes its exact remaining length (see that
-    /// function's doc comment).
+    /// `A(32) || S(32) || T1(32) || T2(32) || t_hat(32) || tau_x(32) ||
+    /// mu(32) || <ipa.toBytesAlloc() bytes>` — dalek's
+    /// `RangeProof::to_bytes` (there `t_x`, `t_x_blinding`, `e_blinding`).
+    /// The IPA tail's round count is implied by the remaining length.
     pub fn toBytesAlloc(self: RangeProof, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         const ipa_bytes = try self.ipa.toBytesAlloc(allocator);
         defer allocator.free(ipa_bytes);
@@ -308,11 +328,11 @@ pub const RangeProof = struct {
         off += 32;
         out[off..][0..32].* = self.t2.toBytes();
         off += 32;
+        out[off..][0..32].* = self.t_hat;
+        off += 32;
         out[off..][0..32].* = self.tau_x;
         off += 32;
         out[off..][0..32].* = self.mu;
-        off += 32;
-        out[off..][0..32].* = self.t_hat;
         off += 32;
         @memcpy(out[off..], ipa_bytes);
         return out;
@@ -342,14 +362,14 @@ pub const RangeProof = struct {
         // keeps every raw scalar field in this module's two codecs held to
         // the same canonical-encoding standard as the point fields next to
         // them, rather than only the ones a live exploit was found for.
+        const t_hat = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(t_hat) catch return error.InvalidEncoding;
+        off += 32;
         const tau_x = bytes[off..][0..32].*;
         scalar.rejectNonCanonical(tau_x) catch return error.InvalidEncoding;
         off += 32;
         const mu = bytes[off..][0..32].*;
         scalar.rejectNonCanonical(mu) catch return error.InvalidEncoding;
-        off += 32;
-        const t_hat = bytes[off..][0..32].*;
-        scalar.rejectNonCanonical(t_hat) catch return error.InvalidEncoding;
         off += 32;
         const ipa_proof = InnerProductProof.fromBytesAlloc(allocator, bytes[off..]) catch return error.InvalidEncoding;
         return .{ .a = a, .s = s, .t1 = t1, .t2 = t2, .tau_x = tau_x, .mu = mu, .t_hat = t_hat, .ipa = ipa_proof };
@@ -506,7 +526,7 @@ noinline fn proveInner(
     //    challenge derivation this changes. Then bind V (recomputed from
     //    the witness — the same point the verifier is handed), then A/S;
     //    draw y, z.
-    transcript.appendU64("n", n);
+    appendDomainSep(transcript, n);
     var v_bytes = scalarvec.zero;
     defer std.crypto.secureZero(u8, &v_bytes);
     std.mem.writeInt(u64, v_bytes[0..8], v_val, .little);
@@ -551,8 +571,8 @@ noinline fn proveInner(
     const tau2 = randomScalar();
     const t1_commit = mulOrIdentity(gens.g, t1_scalar).add(mulOrIdentity(gens.h, tau1));
     const t2_commit = mulOrIdentity(gens.g, t2_scalar).add(mulOrIdentity(gens.h, tau2));
-    transcript.appendPoint("T1", t1_commit);
-    transcript.appendPoint("T2", t2_commit);
+    transcript.appendPoint("T_1", t1_commit);
+    transcript.appendPoint("T_2", t2_commit);
     const x = transcript.challengeScalar("x");
     const x2 = scalar.mul(x, x);
 
@@ -579,9 +599,9 @@ noinline fn proveInner(
     // 9. Bind the response scalars, derive w -> Q = w*G (binding the IPA
     //    to THIS proof instance), rescale H'_i = y^{-i}*H_i, run the IPA
     //    on (l(x), r(x)) over the SAME continuing transcript.
-    transcript.appendScalar("t_hat", t_hat);
-    transcript.appendScalar("tau_x", tau_x);
-    transcript.appendScalar("mu", mu);
+    transcript.appendScalar("t_x", t_hat);
+    transcript.appendScalar("t_x_blinding", tau_x);
+    transcript.appendScalar("e_blinding", mu);
     const w = transcript.challengeScalar("w");
     const q = mulOrIdentity(gens.g, w);
 
@@ -685,14 +705,15 @@ pub fn verifyTraced(
     // B10) — must mirror `prove`'s call exactly, same argument, same
     // position, or completeness breaks immediately (see the regression test
     // in this file's test block).
-    transcript.appendU64("n", n);
+    appendDomainSep(transcript, n);
     transcript.appendPoint("V", v);
-    transcript.appendPoint("A", proof.a);
-    transcript.appendPoint("S", proof.s);
+    // dalek's verifier refuses an identity A/S/T_1/T_2 before binding it.
+    transcript.validateAndAppendPoint("A", proof.a) catch return false;
+    transcript.validateAndAppendPoint("S", proof.s) catch return false;
     const y = transcript.challengeScalar("y");
     const z = transcript.challengeScalar("z");
-    transcript.appendPoint("T1", proof.t1);
-    transcript.appendPoint("T2", proof.t2);
+    transcript.validateAndAppendPoint("T_1", proof.t1) catch return false;
+    transcript.validateAndAppendPoint("T_2", proof.t2) catch return false;
     const x = transcript.challengeScalar("x");
     const z2 = scalar.mul(z, z);
     const x2 = scalar.mul(x, x);
@@ -708,9 +729,9 @@ pub fn verifyTraced(
     if (!lhs.equivalent(rhs)) return false;
 
     // Replay step 9: bind the response scalars, derive w -> Q = w*G.
-    transcript.appendScalar("t_hat", proof.t_hat);
-    transcript.appendScalar("tau_x", proof.tau_x);
-    transcript.appendScalar("mu", proof.mu);
+    transcript.appendScalar("t_x", proof.t_hat);
+    transcript.appendScalar("t_x_blinding", proof.tau_x);
+    transcript.appendScalar("e_blinding", proof.mu);
     const w = transcript.challengeScalar("w");
     const q = mulOrIdentity(gens.g, w);
 
@@ -1022,21 +1043,23 @@ const rp_fuzz_buf_len = 1024;
 /// seed can be a decodable proof without a real transcript behind it.
 const rp_identity_hex = "00" ** 32;
 const rp_bad_point_hex = "ff" ** 32;
-/// `a, s, t1, t2` (four points) then `tau_x, mu, t_hat` (three raw scalars).
+/// `a, s, t1, t2` (four points) then `t_hat, tau_x, mu` (three raw scalars).
 const rp_fixed_hex = rp_identity_hex ** 4 ++ "01" ** 32 ++ "02" ** 32 ++ "03" ** 32;
 
+// Rewritten 2026-09-30 for dalek's layout: the nested IPA has no rounds
+// field any more, its round count is implied by the remaining length.
 const rp_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
     fuzzseed.seedHex("00" ** 223), // one octet short of the 224-octet fixed part
     fuzzseed.seedHex("00" ** 224), // the fixed part alone: the IPA tail is empty, so the nested decode refuses
-    fuzzseed.seedHex(rp_fixed_hex ++ "00000000" ++ "00" ** 64), // a complete, ACCEPTED proof with a rounds = 0 IPA
-    fuzzseed.seedHex(rp_fixed_hex ++ "00000001" ++ rp_identity_hex ** 2 ++ "00" ** 64), // accepted, one IPA round
-    fuzzseed.seedHex(rp_fixed_hex ++ "00000006" ++ rp_identity_hex ** 12 ++ "44" ** 64), // six rounds - the IPA width an n = 64 range proof produces
-    fuzzseed.seedHex(rp_bad_point_hex ++ rp_identity_hex ** 3 ++ "00" ** 96 ++ "00000000" ++ "00" ** 64), // `a` is not a valid point: refused on the FIRST of the four
-    fuzzseed.seedHex(rp_identity_hex ** 3 ++ rp_bad_point_hex ++ "00" ** 96 ++ "00000000" ++ "00" ** 64), // `t2` is not a valid point: refused on the LAST of the four
-    fuzzseed.seedHex(rp_fixed_hex ++ "00000001" ++ rp_bad_point_hex ++ rp_identity_hex ++ "00" ** 64), // the fixed part decodes and the nested IPA then fails
-    fuzzseed.seedHex(rp_fixed_hex ++ "00000000" ++ "00" ** 63), // the IPA tail one octet short
-    fuzzseed.seedHex(rp_fixed_hex ++ "ffffffff" ++ "00" ** 64), // an absurd nested rounds count behind a valid fixed part
+    fuzzseed.seedHex(rp_fixed_hex ++ "00" ** 64), // a complete, ACCEPTED proof with a rounds = 0 IPA
+    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 2 ++ "00" ** 64), // accepted, one IPA round
+    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 12 ++ "44" ** 64), // six rounds - the IPA width an n = 64 range proof produces
+    fuzzseed.seedHex(rp_bad_point_hex ++ rp_identity_hex ** 3 ++ "00" ** 96 ++ "00" ** 64), // `a` is not a valid point: refused on the FIRST of the four
+    fuzzseed.seedHex(rp_identity_hex ** 3 ++ rp_bad_point_hex ++ "00" ** 96 ++ "00" ** 64), // `t2` is not a valid point: refused on the LAST of the four
+    fuzzseed.seedHex(rp_fixed_hex ++ rp_bad_point_hex ++ rp_identity_hex ++ "00" ** 64), // the fixed part decodes and the nested IPA then fails
+    fuzzseed.seedHex(rp_fixed_hex ++ "00" ** 63), // the IPA tail one octet short
+    fuzzseed.seedHex(rp_fixed_hex ++ rp_identity_hex ** 3 ++ "00" ** 64), // an odd element count behind a valid fixed part: an L without its R
     fuzzseed.seedHex("ff" ** 224), // every one of the four points invalid
 };
 

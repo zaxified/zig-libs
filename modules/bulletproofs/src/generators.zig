@@ -19,68 +19,63 @@
 //! point deterministically from a public label via a hash-to-curve map, so
 //! nobody can have chosen it to hide a known relation.
 //!
-//! ## Construction
+//! ## Construction — dalek's (`bulletproofs` 4.0 `src/generators.rs`)
 //!
-//! `SHA-512(domain || label || suffix)` -> 64 bytes ->
-//! `Ristretto255.fromUniform` (the Elligator2-based one-way map RFC 9496
-//! §4.3.4 specifies for ristretto255 — the sibling `voprf` module's
-//! `root.zig` doc comment documents the identical primitive backing RFC
-//! 9497's `HashToGroup`). `fromUniform` only requires uniformly-random-
-//! looking INPUT bytes; since there is no cross-implementation KAT this
-//! module's generators need to hit (see `transcript.zig`'s "no dalek
-//! byte-compatibility" note — the same reasoning applies here: every
-//! Bulletproofs implementation picks its own generator-derivation scheme),
-//! a plain domain-separated `SHA-512(label)` is exactly as sound as a more
-//! elaborate XOF-based chain, and simpler to implement and audit.
+//! - `g` (dalek `PedersenGens::B`): the Ristretto255 base point.
+//! - `h` (dalek `PedersenGens::B_blinding`):
+//!   `fromUniform(SHA3-512(encode(g)))` — dalek's
+//!   `RistrettoPoint::hash_from_bytes::<Sha3_512>` of the compressed base
+//!   point.
+//! - `g_vec` / `h_vec` (dalek `BulletproofGens` party 0): one SHAKE256 XOF
+//!   per vector, absorbing `"GeneratorsChain" || label` with
+//!   `label = 'G' || LE32(0)` resp. `'H' || LE32(0)`; each generator is
+//!   `fromUniform` of the next 64 squeezed bytes. The chain is one stream,
+//!   so a larger `n` extends a smaller one (the shared-prefix test below).
 //!
-//! dalek's `bulletproofs` crate derives its own generators in the same
-//! SPIRIT (a `GeneratorsChain` seeded from a fixed label, read through
-//! `RistrettoPoint::from_uniform_bytes` — see its `generators.rs`) — cited
-//! here as a design reference for the SHAPE (two base points + two
-//! per-index vectors, NUMS-derived, no trusted setup), not for the exact
-//! hash construction (dalek's chain runs a SHAKE256 XOF; this module uses
-//! fixed-label SHA-512 per point instead, deliberately simpler since no
-//! cross-implementation byte-exactness is a goal — see SPEC.md and NOTICE).
+//! `fromUniform` is RFC 9496 §4.3.4's one-way map, the same function as
+//! dalek's `RistrettoPoint::from_uniform_bytes`. Until 2026-09-30 the points
+//! came from a module-defined SHA-512 construction; they were moved to
+//! dalek's so that proofs interoperate (`interop_test.zig` pins them against
+//! values printed by the crate itself). Only party 0 exists here because
+//! only single-value proofs do (SPEC.md "Out of scope").
 
 const std = @import("std");
 const Ristretto255 = std.crypto.ecc.Ristretto255;
-const Sha512 = std.crypto.hash.sha2.Sha512;
+const Sha3_512 = std.crypto.hash.sha3.Sha3_512;
+const Shake256 = std.crypto.hash.sha3.Shake256;
 
-/// Domain-separation prefix for every generator this module derives.
-/// Bumping this string to a "v2" value would silently repoint EVERY
-/// commitment made under "v1" onto different, unrelated points — a
-/// deliberate versioning seam, the same discipline this repo's
-/// `threshold_ecdsa` module documents for its own `pi_mod_domain`/
-/// `pi_prm_domain` tags.
-pub const domain = "zig-libs/bulletproofs/generators/v1";
+/// dalek's `GeneratorsChain`: SHAKE256 over `"GeneratorsChain" || label`,
+/// read 64 bytes per point.
+const GeneratorsChain = struct {
+    xof: Shake256,
 
-/// `SHA-512(domain || label || suffix)` -> `Ristretto255.fromUniform`.
-/// Ordinary hashing plus the std NUMS map — no secret-dependent branching,
-/// no "irreducible" cryptographic judgment.
-fn hashToPoint(label: []const u8, suffix: []const u8) Ristretto255 {
-    var h = Sha512.init(.{});
-    h.update(domain);
-    h.update(label);
-    h.update(suffix);
+    fn init(label: []const u8) GeneratorsChain {
+        var xof = Shake256.init(.{});
+        xof.update("GeneratorsChain");
+        xof.update(label);
+        return .{ .xof = xof };
+    }
+
+    fn next(self: *GeneratorsChain) Ristretto255 {
+        var wide: [64]u8 = undefined;
+        self.xof.squeeze(&wide);
+        return Ristretto255.fromUniform(wide);
+    }
+};
+
+/// Party `party`'s chain label: the tag byte, then the index as LE32.
+fn chainLabel(tag: u8, party: u32) [5]u8 {
+    var label: [5]u8 = undefined;
+    label[0] = tag;
+    std.mem.writeInt(u32, label[1..5], party, .little);
+    return label;
+}
+
+/// dalek's `PedersenGens::default().B_blinding`.
+fn blindingBase() Ristretto255 {
     var wide: [64]u8 = undefined;
-    h.final(&wide);
+    Sha3_512.hash(&Ristretto255.basePoint.toBytes(), &wide, .{});
     return Ristretto255.fromUniform(wide);
-}
-
-/// One deterministically-derived generator with no index suffix — used for
-/// the two BASE points `g`/`h` (see `Generators.init`).
-fn basePointFor(label: []const u8) Ristretto255 {
-    return hashToPoint(label, &.{});
-}
-
-/// The `i`-th deterministically-derived vector generator: `hashToPoint
-/// (label, index_LE64(i))`. `i` is encoded little-endian, matching
-/// `std.crypto.ecc.Ristretto255.scalar`'s own byte order convention used
-/// throughout this module.
-fn vectorPointFor(label: []const u8, i: usize) Ristretto255 {
-    var suffix: [8]u8 = undefined;
-    std.mem.writeInt(u64, &suffix, @intCast(i), .little);
-    return hashToPoint(label, &suffix);
 }
 
 /// The full generator set an `n`-bit range proof needs: two base points
@@ -97,7 +92,7 @@ pub const Generators = struct {
 
     /// Derives a fresh `n`-wide generator set. `g_vec`/`h_vec` are
     /// allocated via `allocator` (freed by `deinit`). Every point is
-    /// INDEPENDENTLY re-derivable from `(domain, label, i)` alone — no
+    /// INDEPENDENTLY re-derivable from the fixed chain labels alone — no
     /// randomness, no shared mutable state — so two callers (e.g. a
     /// prover and a verifier in different processes) that call `init`
     /// with the same `n` always get byte-identical generators, which is
@@ -108,11 +103,13 @@ pub const Generators = struct {
         errdefer allocator.free(g_vec);
         const h_vec = try allocator.alloc(Ristretto255, n);
         errdefer allocator.free(h_vec);
-        for (g_vec, 0..) |*p, i| p.* = vectorPointFor("G", i);
-        for (h_vec, 0..) |*p, i| p.* = vectorPointFor("H", i);
+        var g_chain = GeneratorsChain.init(&chainLabel('G', 0));
+        for (g_vec) |*p| p.* = g_chain.next();
+        var h_chain = GeneratorsChain.init(&chainLabel('H', 0));
+        for (h_vec) |*p| p.* = h_chain.next();
         return .{
-            .g = basePointFor("g"),
-            .h = basePointFor("h"),
+            .g = Ristretto255.basePoint,
+            .h = blindingBase(),
             .g_vec = g_vec,
             .h_vec = h_vec,
             .n = n,
@@ -180,44 +177,9 @@ test "different n values still agree on the shared prefix" {
     for (small.h_vec, big.h_vec[0..small.n]) |a, b| try std.testing.expectEqualSlices(u8, &a.toBytes(), &b.toBytes());
 }
 
-// ── B7 (A1 audit): a value-level KAT, not just relational tests ────────────
-//
-// Every test above this line only checks RELATIONS (determinism, distinctness,
-// non-identity, shared-prefix agreement) -- none of them pin an actual byte
-// value. `domain` above documents that bumping it to a "v2" string would
-// "silently repoint EVERY commitment made under v1 onto different, unrelated
-// points" -- a refactor of the hash construction (reordered `h.update` calls,
-// a different index encoding, an accidental domain-string edit) would pass
-// every relational test above and STILL repoint every commitment. Audit
-// finding B7: `W11` (deleting the domain string from the hash) survived the
-// full 58/58 suite. These values were read off this exact toolchain via a
-// throwaway probe test (`std.debug.print`, discarded after use) and are
-// pinned here as the value-level anchor those relational tests cannot be.
-test "generators KAT: g/h/g_vec[0]/h_vec[0]/h_vec[63] are pinned byte values (n=64)" {
-    const gens = try Generators.init(std.testing.allocator, 64);
-    defer gens.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings(
-        "b84995b6253945c1c3304cb8381da9703de6b6102afdaaafaadee39c5efb8937",
-        &std.fmt.bytesToHex(gens.g.toBytes(), .lower),
-    );
-    try std.testing.expectEqualStrings(
-        "b4ac3c51bae8a7651b1933820a92dccebf0607ca91dd19f21b5efa113a5a250d",
-        &std.fmt.bytesToHex(gens.h.toBytes(), .lower),
-    );
-    try std.testing.expectEqualStrings(
-        "04ce1a60f3bfba388352d5da929ae6a70c06e01c5377af1c26775bf52772b952",
-        &std.fmt.bytesToHex(gens.g_vec[0].toBytes(), .lower),
-    );
-    try std.testing.expectEqualStrings(
-        "9400d71d527df020f94180f3eb5bd77d1371539e5b95d88529235168654d1b2f",
-        &std.fmt.bytesToHex(gens.h_vec[0].toBytes(), .lower),
-    );
-    try std.testing.expectEqualStrings(
-        "b4d3c2fcbaa2b4e97ddbe1883ed094716f71b1de446e933a2e60682e9da3d164",
-        &std.fmt.bytesToHex(gens.h_vec[63].toBytes(), .lower),
-    );
-}
+// B7 (A1 audit) asked for a value-level KAT here, because every test above
+// only checks relations. The values are now dalek's and are pinned against
+// the crate's own output in `interop_test.zig`.
 
 test "n = 0 gives empty vectors without error" {
     const gens = try Generators.init(std.testing.allocator, 0);

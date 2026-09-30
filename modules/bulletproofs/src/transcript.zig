@@ -1,276 +1,299 @@
 // SPDX-License-Identifier: MIT
 
-//! transcript — a self-contained SHA-512-based Fiat-Shamir transcript for
-//! Bulletproofs.
+//! transcript — Merlin v1.0 Fiat-Shamir transcripts (STROBE-128 over
+//! Keccak-f[1600]), byte-compatible with the `merlin` crate that dalek's
+//! `bulletproofs` binds every range proof to.
 //!
-//! **REAL — not a Fable stub.**
+//! Until 2026-09-30 this file was a module-defined SHA-512 hash chain, so a
+//! proof made here verified only here. Anchoring the module against dalek
+//! (task A1 of the maturity survey) needs the same challenge derivation on
+//! both sides, and Merlin is that derivation: nothing else stood between the
+//! two implementations (the protocol algebra already matched, see
+//! `rangeproof.zig`). Merlin is small — the STROBE subset below is the whole
+//! of it — and `std` ships the permutation, so the zero-dependency rule
+//! holds.
 //!
-//! dalek's `bulletproofs` crate uses Merlin (a STROBE-based transcript
-//! protocol — itself a separate cryptographic primitive/spec, not merely a
-//! hash) to bind a protocol's public values and prover messages into each
-//! challenge. Depending on Merlin here would pull a second, unrelated
-//! primitive (STROBE's duplex construction) into this repo purely to
-//! reproduce ONE module's proof format, and this repo has no existing
-//! STROBE/Merlin implementation to build on — CONVENTIONS.md's "prefer
-//! std; build a dep only where std has a real gap" directive, plus the
-//! zero-dep rule, both point away from that. Instead: a self-contained,
-//! domain-separated, incremental-hash transcript with SHA-512 as its only
-//! primitive (already used throughout this module for `generators.zig`'s
-//! `hashToPoint`).
+//! ## Construction (Merlin 1.0, `merlin` crate `src/strobe.rs` and
+//! `src/transcript.rs`)
 //!
-//! **Consequence — read before assuming byte-compatibility with dalek or
-//! any other Bulletproofs implementation.** Every implementation's
-//! Fiat-Shamir transcript is DIFFERENT unless a spec pins one down, and
-//! the Bulletproofs paper does not (Fiat-Shamir instantiation is always
-//! implementation-defined — the same posture this repo's `threshold_ecdsa`
-//! module documents for its own Πprm/Πmod transcripts; see
-//! `aux_proofs.zig`'s header comment). A proof produced by THIS module's
-//! `rangeproof.prove`/`ipa.proveIpa` only verifies against THIS module's
-//! `rangeproof.verify`/`ipa.verifyIpa` — internally self-consistent
-//! (soundness holds end-to-end) but NOT a wire-compatible Bulletproofs
-//! proof against dalek, libsecp256k1-zkp, or any other implementation.
-//! The KAT harness (`kat_test.zig`) is therefore PROPERTY-and-SOUNDNESS
-//! based (completeness + tamper-rejection + cross-commitment-rejection),
-//! never byte-exact against a published third-party vector — see
-//! `SPEC.md`.
+//! A STROBE-128 duplex (rate 166 bytes of the 200-byte Keccak-f[1600]
+//! state) initialised with the protocol label `"Merlin v1.0"`, then:
 //!
-//! ## Construction
+//! - `init(label)`: `appendMessage("dom-sep", label)`.
+//! - `appendMessage(label, msg)`: `meta-AD(label)`, `meta-AD(LE32(len))`
+//!   (continued), `AD(msg)`.
+//! - `challengeBytes(label, dest)`: `meta-AD(label)`,
+//!   `meta-AD(LE32(dest.len))` (continued), `PRF(dest)`.
 //!
-//! A hash CHAIN, not a sponge/duplex: `state` is a running 64-byte SHA-512
-//! digest. Each `append*` call re-hashes `state || tag || len(label) ||
-//! label || len(data) || data` into a fresh `state`, so every subsequent
-//! challenge depends on everything appended so far, in order (the
-//! Fiat-Shamir binding property). `challengeScalar` derives a challenge
-//! from `state || "challenge" || len(label) || label` and then RATCHETS
-//! `state` forward by absorbing the produced challenge bytes back in, so
-//! requesting a second challenge under the same label — or replaying part
-//! of a transcript — can never reproduce an earlier challenge (the same
-//! non-replayability property a STROBE-based transcript's own
-//! state-advance step provides, achieved here by an explicit extra absorb
-//! instead of a duplex permutation).
+//! Only the operations Merlin uses are implemented (meta-AD, AD, PRF); STROBE
+//! `KEY`, the transport flag and the transcript RNG are not, because the
+//! prover here draws its blinding from the OS (see `rangeproof.zig`'s
+//! `randomScalar`), not from `build_rng()`. Blinding randomness is not bound
+//! by any challenge, so that choice does not affect compatibility.
 //!
-//! Length-prefixing every appended field closes the classic
-//! transcript-binding gap where `H(a || b)` collides with `H(a' || b')`
-//! whenever `a||b == a'||b'` but `a != a'` — the same discipline
-//! `zkproofs.zig`/`aux_proofs.zig`'s `appendLenPrefixed` already applies
-//! elsewhere in this repo.
+//! The dalek-level helpers (`appendPoint`, `appendScalar`, `appendU64`,
+//! `validateAndAppendPoint`, `challengeScalar`) are dalek's
+//! `TranscriptProtocol` trait (`bulletproofs` 4.0 `src/transcript.rs`):
+//! points and scalars go in as their 32-byte canonical encodings, a `u64` as
+//! 8 little-endian bytes, and a challenge scalar is 64 PRF bytes reduced
+//! mod `L`.
+//!
+//! Anchored by `interop_test.zig`: Merlin challenges and dalek range proofs
+//! produced by the Rust crates (`tools/dalek/`).
 
 const std = @import("std");
-const Sha512 = std.crypto.hash.sha2.Sha512;
 const Ristretto255 = std.crypto.ecc.Ristretto255;
 const scalar = Ristretto255.scalar;
+const KeccakF1600 = std.crypto.core.keccak.KeccakF(1600);
+
+/// STROBE-128 rate in bytes: 200 - 2*16 (security) - 2 (padding).
+const strobe_r: u8 = 166;
+
+const flag_i: u8 = 1;
+const flag_a: u8 = 1 << 1;
+const flag_c: u8 = 1 << 2;
+const flag_m: u8 = 1 << 4;
+const flag_k: u8 = 1 << 5;
+
+/// The subset of STROBE v1.0.2 (security level 128) Merlin runs on.
+const Strobe128 = struct {
+    state: [200]u8,
+    pos: u8,
+    pos_begin: u8,
+    cur_flags: u8,
+
+    fn init(protocol_label: []const u8) Strobe128 {
+        var st = [_]u8{0} ** 200;
+        st[0..6].* = .{ 1, strobe_r + 2, 1, 0, 1, 96 };
+        st[6..18].* = "STROBEv1.0.2".*;
+        permute(&st);
+        var s: Strobe128 = .{ .state = st, .pos = 0, .pos_begin = 0, .cur_flags = 0 };
+        s.metaAd(protocol_label, false);
+        return s;
+    }
+
+    /// Keccak-f[1600] over the state read as 25 little-endian lanes (the
+    /// byte order STROBE and the `keccak` crate use), independent of the
+    /// host's endianness.
+    fn permute(st: *[200]u8) void {
+        var k = KeccakF1600.init(st.*);
+        k.permute();
+        for (k.st, 0..) |lane, i| std.mem.writeInt(u64, st[i * 8 ..][0..8], lane, .little);
+    }
+
+    fn runF(self: *Strobe128) void {
+        self.state[self.pos] ^= self.pos_begin;
+        self.state[self.pos + 1] ^= 0x04;
+        self.state[strobe_r + 1] ^= 0x80;
+        permute(&self.state);
+        self.pos = 0;
+        self.pos_begin = 0;
+    }
+
+    fn absorb(self: *Strobe128, data: []const u8) void {
+        for (data) |byte| {
+            self.state[self.pos] ^= byte;
+            self.pos += 1;
+            if (self.pos == strobe_r) self.runF();
+        }
+    }
+
+    fn squeeze(self: *Strobe128, out: []u8) void {
+        for (out) |*byte| {
+            byte.* = self.state[self.pos];
+            self.state[self.pos] = 0;
+            self.pos += 1;
+            if (self.pos == strobe_r) self.runF();
+        }
+    }
+
+    fn beginOp(self: *Strobe128, flags: u8, more: bool) void {
+        if (more) {
+            // Merlin only ever continues the op it just began.
+            std.debug.assert(self.cur_flags == flags);
+            return;
+        }
+        const old_begin = self.pos_begin;
+        self.pos_begin = self.pos + 1;
+        self.cur_flags = flags;
+        self.absorb(&.{ old_begin, flags });
+        const force_f = (flags & (flag_c | flag_k)) != 0;
+        if (force_f and self.pos != 0) self.runF();
+    }
+
+    fn metaAd(self: *Strobe128, data: []const u8, more: bool) void {
+        self.beginOp(flag_m | flag_a, more);
+        self.absorb(data);
+    }
+
+    fn ad(self: *Strobe128, data: []const u8, more: bool) void {
+        self.beginOp(flag_a, more);
+        self.absorb(data);
+    }
+
+    fn prf(self: *Strobe128, out: []u8, more: bool) void {
+        self.beginOp(flag_i | flag_a | flag_c, more);
+        self.squeeze(out);
+    }
+};
 
 pub const Transcript = struct {
-    state: [64]u8,
+    strobe: Strobe128,
 
-    /// Starts a fresh transcript, domain-separated by `label` (e.g.
-    /// `"bulletproofs/range-proof/v1"`, `"bulletproofs/ipa/v1"` — see
-    /// `rangeproof.zig`/`ipa.zig`'s domain constants). Two transcripts
-    /// started with DIFFERENT labels never produce the same challenge for
-    /// identical subsequent appends (the label is absorbed before
-    /// anything else).
+    /// Merlin's `Transcript::new(label)`. dalek leaves the label to the
+    /// application (its doctests use `b"doctest example"`); prover and
+    /// verifier must agree on it. `rangeproof.transcript_domain` is this
+    /// module's default.
     pub fn init(label: []const u8) Transcript {
-        var h = Sha512.init(.{});
-        h.update("zig-libs/bulletproofs/transcript/v1");
-        h.update(label);
-        var state: [64]u8 = undefined;
-        h.final(&state);
-        return .{ .state = state };
+        var t: Transcript = .{ .strobe = Strobe128.init("Merlin v1.0") };
+        t.appendMessage("dom-sep", label);
+        return t;
     }
 
-    fn absorb(self: *Transcript, tag: u8, label: []const u8, data: []const u8) void {
-        var h = Sha512.init(.{});
-        h.update(&self.state);
-        h.update(&[_]u8{tag});
-        var label_len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &label_len, label.len, .little);
-        h.update(&label_len);
-        h.update(label);
-        var data_len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &data_len, data.len, .little);
-        h.update(&data_len);
-        h.update(data);
-        h.final(&self.state);
+    /// Merlin's `append_message`. `msg.len` must fit in a `u32` (Merlin
+    /// asserts the same); every caller here appends at most 32 bytes.
+    pub fn appendMessage(self: *Transcript, label: []const u8, msg: []const u8) void {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(msg.len), .little);
+        self.strobe.metaAd(label, false);
+        self.strobe.metaAd(&len, true);
+        self.strobe.ad(msg, false);
     }
 
-    /// Binds a public Ristretto255 point (32-byte canonical encoding) —
-    /// e.g. range-proof commitments `V`/`A`/`S`/`T1`/`T2`, or an IPA
-    /// round's `L`/`R`.
-    pub fn appendPoint(self: *Transcript, label: []const u8, p: Ristretto255) void {
-        const bytes = p.toBytes();
-        self.absorb('P', label, &bytes);
-    }
-
-    /// Binds a public scalar (32-byte little-endian canonical encoding).
-    /// NEVER call this on a SECRET scalar — the transcript is computed
-    /// identically by prover and verifier, so anything absorbed into it
-    /// must already be something the verifier independently has (a
-    /// published proof field or public input), never the witness.
-    pub fn appendScalar(self: *Transcript, label: []const u8, s: [32]u8) void {
-        self.absorb('S', label, &s);
-    }
-
-    /// Binds a public `u64` (e.g. the bit-width `n`), little-endian.
+    /// Merlin's `append_u64`: 8 little-endian bytes.
     pub fn appendU64(self: *Transcript, label: []const u8, v: u64) void {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, v, .little);
-        self.absorb('U', label, &buf);
+        self.appendMessage(label, &buf);
     }
 
-    /// Squeezes a Fiat-Shamir challenge scalar, then ratchets `state`
-    /// forward (see the module doc comment). Reducing the 64-byte digest
-    /// via `scalar.reduce64` is the same wide reduction `voprf`'s
-    /// `HashToScalar` and Ed25519's own `Scalar.fromBytes64` use — a
-    /// uniform-over-`[0, L)` reduction of a uniformly random 64-byte
-    /// input (RFC 9380 Appendix B / RFC 8032's scalar-reduction
-    /// convention).
+    /// Binds a public Ristretto255 point by its canonical encoding.
+    pub fn appendPoint(self: *Transcript, label: []const u8, p: Ristretto255) void {
+        const bytes = p.toBytes();
+        self.appendMessage(label, &bytes);
+    }
+
+    /// dalek's `validate_and_append_point`: the verifier's form for every
+    /// prover-chosen point. The identity is refused before anything is
+    /// absorbed (dalek returns `VerificationError` there, so the transcript
+    /// state after a refusal does not matter).
+    pub fn validateAndAppendPoint(self: *Transcript, label: []const u8, p: Ristretto255) error{IdentityElement}!void {
+        const bytes = p.toBytes();
+        if (std.mem.allEqual(u8, &bytes, 0)) return error.IdentityElement;
+        self.appendMessage(label, &bytes);
+    }
+
+    /// Binds a public scalar (32-byte little-endian canonical encoding).
+    /// NEVER call this on a SECRET scalar — prover and verifier compute the
+    /// transcript identically, so everything absorbed is public.
+    pub fn appendScalar(self: *Transcript, label: []const u8, s: [32]u8) void {
+        self.appendMessage(label, &s);
+    }
+
+    /// Merlin's `challenge_bytes`.
+    pub fn challengeBytes(self: *Transcript, label: []const u8, out: []u8) void {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(out.len), .little);
+        self.strobe.metaAd(label, false);
+        self.strobe.metaAd(&len, true);
+        self.strobe.prf(out, false);
+    }
+
+    /// dalek's `challenge_scalar`: 64 challenge bytes, wide-reduced mod `L`
+    /// (`Scalar::from_bytes_mod_order_wide`).
     pub fn challengeScalar(self: *Transcript, label: []const u8) [32]u8 {
-        var h = Sha512.init(.{});
-        h.update(&self.state);
-        h.update("challenge");
-        var label_len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &label_len, label.len, .little);
-        h.update(&label_len);
-        h.update(label);
         var wide: [64]u8 = undefined;
-        h.final(&wide);
-        // Ratchet: fold the produced challenge back into state so a
-        // second challengeScalar call (same or different label) can
-        // never reproduce this value.
-        self.absorb('C', label, &wide);
+        self.challengeBytes(label, &wide);
         return scalar.reduce64(wide);
     }
 };
 
 // ── tests ─────────────────────────────────────────────────────────────────
+// Byte-exact agreement with the `merlin` crate is asserted in
+// `interop_test.zig`; these are the local properties.
 
 test "init is deterministic and label-separated" {
-    const t1 = Transcript.init("a");
-    const t2 = Transcript.init("a");
-    try std.testing.expectEqualSlices(u8, &t1.state, &t2.state);
-
-    const t3 = Transcript.init("b");
-    try std.testing.expect(!std.mem.eql(u8, &t1.state, &t3.state));
+    var t1 = Transcript.init("a");
+    var t2 = Transcript.init("a");
+    var t3 = Transcript.init("b");
+    const c1 = t1.challengeScalar("c");
+    const c2 = t2.challengeScalar("c");
+    const c3 = t3.challengeScalar("c");
+    try std.testing.expectEqualSlices(u8, &c1, &c2);
+    try std.testing.expect(!std.mem.eql(u8, &c1, &c3));
 }
 
-test "appendPoint changes state and is order-sensitive" {
-    var t1 = Transcript.init("x");
-    var t2 = Transcript.init("x");
+test "appendPoint is value- and order-sensitive" {
     const g = Ristretto255.basePoint;
     const h = g.dbl();
 
-    const before = t1.state;
+    var t1 = Transcript.init("x");
     t1.appendPoint("p", g);
-    try std.testing.expect(!std.mem.eql(u8, &before, &t1.state));
+    var t2 = Transcript.init("x");
+    t2.appendPoint("p", h);
+    try std.testing.expect(!std.mem.eql(u8, &t1.strobe.state, &t2.strobe.state));
 
-    t2.appendPoint("p", g);
-    try std.testing.expectEqualSlices(u8, &t1.state, &t2.state);
-
-    var t3 = Transcript.init("x");
-    t3.appendPoint("p", h);
-    try std.testing.expect(!std.mem.eql(u8, &t1.state, &t3.state));
-
-    // Order matters: appending g then h differs from h then g.
     var t4 = Transcript.init("x");
     t4.appendPoint("p", g);
     t4.appendPoint("q", h);
     var t5 = Transcript.init("x");
     t5.appendPoint("q", h);
     t5.appendPoint("p", g);
-    try std.testing.expect(!std.mem.eql(u8, &t4.state, &t5.state));
+    try std.testing.expect(!std.mem.eql(u8, &t4.strobe.state, &t5.strobe.state));
 }
 
-test "appendScalar/appendU64 are label- and value-sensitive" {
+test "the label/message boundary is framed: moving a byte across it changes the challenge" {
+    // Merlin frames each message by a separate meta-AD op for the label and
+    // a LE32 length; "ab"+"" and "a"+"b" absorb the same bytes in sequence
+    // and differ only in that framing.
     var t1 = Transcript.init("x");
     var t2 = Transcript.init("x");
-    t1.appendScalar("s", [_]u8{1} ++ [_]u8{0} ** 31);
-    t2.appendScalar("s", [_]u8{2} ++ [_]u8{0} ** 31);
-    try std.testing.expect(!std.mem.eql(u8, &t1.state, &t2.state));
-
-    var t3 = Transcript.init("x");
-    var t4 = Transcript.init("x");
-    t3.appendU64("n", 64);
-    t4.appendU64("n", 32);
-    try std.testing.expect(!std.mem.eql(u8, &t3.state, &t4.state));
-
-    // Length-prefixing prevents a "label||data" concatenation collision:
-    // appendScalar("ab", zero) must differ from appendScalar("a", <the
-    // byte 'b' followed by 31 zero bytes>) even though the naive
-    // concatenations would otherwise coincide.
-    var t5 = Transcript.init("x");
-    var t6 = Transcript.init("x");
-    t5.appendScalar("ab", [_]u8{0} ** 32);
-    t6.appendScalar("a", [_]u8{'b'} ++ [_]u8{0} ** 31);
-    try std.testing.expect(!std.mem.eql(u8, &t5.state, &t6.state));
-}
-
-test "challengeScalar is deterministic given identical prior transcript, and canonical" {
-    var t1 = Transcript.init("chal");
-    var t2 = Transcript.init("chal");
-    t1.appendU64("n", 8);
-    t2.appendU64("n", 8);
-
-    const c1 = t1.challengeScalar("y");
-    const c2 = t2.challengeScalar("y");
-    try std.testing.expectEqualSlices(u8, &c1, &c2);
-    try scalar.rejectNonCanonical(c1);
-}
-
-test "challengeScalar ratchets state: repeated calls under the same label differ" {
-    var t = Transcript.init("ratchet");
-    const c1 = t.challengeScalar("y");
-    const c2 = t.challengeScalar("y");
+    t1.appendMessage("ab", "");
+    t2.appendMessage("a", "b");
+    const c1 = t1.challengeScalar("c");
+    const c2 = t2.challengeScalar("c");
     try std.testing.expect(!std.mem.eql(u8, &c1, &c2));
 }
 
-test "absorb: length-prefixing prevents a REAL label/data boundary collision (audit B15)" {
-    // The existing test above ("Length-prefixing prevents...") compares
-    // `appendScalar("ab", 32 zero bytes)` against `appendScalar("a", 'b' ++
-    // 31 zero bytes)` -- but `appendScalar`'s data is always exactly 32
-    // bytes, so those two calls absorb 34 and 33 total bytes respectively.
-    // Different total lengths already differ under SHA-512 regardless of
-    // prefixing, so `W07` (deleting the two `writeInt` length-prefix calls)
-    // survives that test unchanged, 58/58 -- audit finding B15: the test
-    // asserts a property it cannot actually falsify.
-    //
-    // A genuine collision needs the UNPREFIXED concatenation `tag||label||
-    // data` to be byte-identical across two different (label, data) splits.
-    // `absorb` is private but same-file-accessible: calling it directly
-    // (instead of through the fixed-width `appendScalar`/`appendPoint`)
-    // lets `data` vary in length, which is what makes a real collision
-    // constructible: `"ab" ++ ""` and `"a" ++ "b"` are the same three bytes
-    // (tag, then 'a','b') split at a different label/data boundary.
+test "validateAndAppendPoint refuses the identity and absorbs nothing" {
+    var t = Transcript.init("x");
+    const before = t.strobe;
+    const identity: Ristretto255 = .{ .p = std.crypto.ecc.Edwards25519.identityElement };
+    try std.testing.expectError(error.IdentityElement, t.validateAndAppendPoint("A", identity));
+    try std.testing.expectEqualDeep(before, t.strobe);
+
     var t1 = Transcript.init("x");
     var t2 = Transcript.init("x");
-    t1.absorb('S', "ab", "");
-    t2.absorb('S', "a", "b");
-    // With length-prefixing (the real code): label_len differs (2 vs 1), so
-    // the states differ. Without it (W07), `tag||label||data` is identical
-    // for both and this assertion is exactly the one that would fail.
-    try std.testing.expect(!std.mem.eql(u8, &t1.state, &t2.state));
+    try t1.validateAndAppendPoint("A", Ristretto255.basePoint);
+    t2.appendPoint("A", Ristretto255.basePoint);
+    try std.testing.expectEqualDeep(t1.strobe, t2.strobe);
 }
 
-test "challengeScalar is label-sensitive" {
-    var t1 = Transcript.init("z");
-    var t2 = Transcript.init("z");
-    const y = t1.challengeScalar("y");
-    const z = t2.challengeScalar("z");
-    try std.testing.expect(!std.mem.eql(u8, &y, &z));
+test "challengeScalar is canonical and a second draw under the same label differs" {
+    var t = Transcript.init("ratchet");
+    const c1 = t.challengeScalar("y");
+    const c2 = t.challengeScalar("y");
+    try scalar.rejectNonCanonical(c1);
+    try std.testing.expect(!std.mem.eql(u8, &c1, &c2));
+}
+
+test "a long message crosses the 166-byte rate boundary deterministically" {
+    const msg = [_]u8{99} ** 1024;
+    var t1 = Transcript.init("x");
+    var t2 = Transcript.init("x");
+    t1.appendMessage("m", &msg);
+    t2.appendMessage("m", &msg);
+    var o1: [300]u8 = undefined;
+    var o2: [300]u8 = undefined;
+    t1.challengeBytes("c", &o1);
+    t2.challengeBytes("c", &o2);
+    try std.testing.expectEqualSlices(u8, &o1, &o2);
 }
 
 test "challengeScalar: 300 draws carry real entropy (audit B3: Fiat-Shamir truncation is unguarded)" {
-    // Audit finding B3: nothing in this module's test suite checks the
-    // DISTRIBUTION of a drawn challenge -- only that it is deterministic,
-    // ratcheted, and label-sensitive (the tests above). A regression that
-    // truncates `challengeScalar`'s entropy (e.g. zeroing all but the low
-    // byte of the 64-byte digest before reduction, as the audit's `W27`
-    // mutation did) would still pass every one of those: truncating to one
-    // of 256 possible VALUES is still deterministic, still ratchets to a
-    // DIFFERENT (still-truncated) value next call, and still differs
-    // between two different labels most of the time.
-    //
-    // Two independent checks that a low-entropy draw fails and a real
-    // SHA-512-derived one passes:
+    // Audit finding B3: determinism, ratcheting and label separation all
+    // survive a challenge truncated to a handful of values; these two checks
+    // do not.
     var t = Transcript.init("entropy-probe");
     var challenges: [300][32]u8 = undefined;
     for (&challenges, 0..) |*c, i| {
@@ -279,23 +302,14 @@ test "challengeScalar: 300 draws carry real entropy (audit B3: Fiat-Shamir trunc
         c.* = t.challengeScalar(label);
     }
 
-    // (1) No two of the 300 draws collide. At full ~252-bit entropy this is
-    // certain; at the W27 mutation's 256 possible values, 300 draws from a
-    // 256-value space collide with overwhelming probability (birthday
-    // bound: ~1 - exp(-300*299/2/256) is indistinguishable from 1).
+    // (1) No two of the 300 draws collide.
     for (challenges[0 .. challenges.len - 1], 0..) |ci, i| {
         for (challenges[i + 1 ..]) |cj| {
             try std.testing.expect(!std.mem.eql(u8, &ci, &cj));
         }
     }
 
-    // (2) The high byte (challenges are little-endian, so index 31 is the
-    // MOST significant) takes on more than a handful of distinct values.
-    // `W27` (`@memset(wide[1..], 0)` before reduction) fixes every byte
-    // above the low one to 0, so this would see exactly 1 distinct value;
-    // `W26` (truncate to 64 bits before reduction) would see very few, since
-    // the top ~24 bytes collapse to 0. A real SHA-512 draw over 300 samples
-    // sees dozens.
+    // (2) The most significant byte takes more than a handful of values.
     var seen = std.AutoHashMap(u8, void).init(std.testing.allocator);
     defer seen.deinit();
     for (challenges) |c| try seen.put(c[31], {});

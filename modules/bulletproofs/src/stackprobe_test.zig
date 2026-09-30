@@ -109,7 +109,7 @@ fn vBytes() [32]u8 {
 /// from the public points.
 fn z2Gamma() [32]u8 {
     var t = bp.Transcript.init(bp.rangeproof_domain);
-    t.appendU64("n", gens.n);
+    rangeproof.appendDomainSep(&t, gens.n);
     t.appendPoint("V", bp.commit(gens, vBytes(), secret_gamma));
     t.appendPoint("A", last_a);
     t.appendPoint("S", last_s);

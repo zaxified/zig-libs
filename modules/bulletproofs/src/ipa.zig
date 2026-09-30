@@ -165,17 +165,14 @@ pub const InnerProductProof = struct {
         allocator.free(self.r_vec);
     }
 
-    /// `rounds(u32 BE) || (L_i(32) || R_i(32)) * rounds || a(32) || b(32)`.
-    /// REAL — mechanical length-prefixed point/scalar concatenation, the
-    /// same shape `rangeproof.RangeProof.toBytesAlloc` uses for its own
-    /// fixed fields.
+    /// `(L_i(32) || R_i(32)) * rounds || a(32) || b(32)` — dalek's
+    /// `InnerProductProof::to_bytes`. The round count is implied by the
+    /// length.
     pub fn toBytesAlloc(self: InnerProductProof, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         std.debug.assert(self.l_vec.len == self.r_vec.len);
         const rounds = self.l_vec.len;
-        const out = try allocator.alloc(u8, 4 + rounds * 64 + 64);
+        const out = try allocator.alloc(u8, rounds * 64 + 64);
         var off: usize = 0;
-        std.mem.writeInt(u32, out[0..4], @intCast(rounds), .big);
-        off += 4;
         for (self.l_vec, self.r_vec) |l, r| {
             out[off..][0..32].* = l.toBytes();
             off += 32;
@@ -191,23 +188,24 @@ pub const InnerProductProof = struct {
 
     pub const FromBytesError = error{ InvalidEncoding, OutOfMemory };
 
-    /// Inverse of `toBytesAlloc`. `bytes.len` MUST equal exactly the
-    /// length implied by its own leading `rounds` field — this exact-length
-    /// check is what lets `rangeproof.RangeProof.fromBytesAlloc` hand this
-    /// function a trailing sub-slice with no extra outer length prefix
-    /// (see that file's codec).
+    /// Inverse of `toBytesAlloc`, with dalek's `from_bytes` length rules:
+    /// a whole number of 32-byte elements, an even number of them, at least
+    /// the two final scalars, fewer than 32 rounds. Points are decoded here
+    /// (dalek defers that to verification; a non-canonical point is
+    /// rejected either way).
     pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) FromBytesError!InnerProductProof {
-        if (bytes.len < 4) return error.InvalidEncoding;
-        const rounds = std.mem.readInt(u32, bytes[0..4], .big);
-        const expected_len = 4 + @as(usize, rounds) * 64 + 64;
-        if (bytes.len != expected_len) return error.InvalidEncoding;
+        if (bytes.len % 32 != 0) return error.InvalidEncoding;
+        const elements = bytes.len / 32;
+        if (elements < 2 or (elements - 2) % 2 != 0) return error.InvalidEncoding;
+        const rounds = (elements - 2) / 2;
+        if (rounds >= 32) return error.InvalidEncoding;
 
         const l_vec = try allocator.alloc(Ristretto255, rounds);
         errdefer allocator.free(l_vec);
         const r_vec = try allocator.alloc(Ristretto255, rounds);
         errdefer allocator.free(r_vec);
 
-        var off: usize = 4;
+        var off: usize = 0;
         for (l_vec, r_vec) |*l, *r| {
             l.* = Ristretto255.fromBytes(bytes[off..][0..32].*) catch return error.InvalidEncoding;
             off += 32;
@@ -237,6 +235,12 @@ pub const InnerProductProof = struct {
     }
 };
 
+/// dalek's `innerproduct_domain_sep(n)`.
+fn appendDomainSep(transcript: *Transcript, n: usize) void {
+    transcript.appendMessage("dom-sep", "ipp v1");
+    transcript.appendU64("n", n);
+}
+
 pub const IpaError = error{
     LengthMismatch,
     NotPowerOfTwo,
@@ -259,6 +263,9 @@ pub fn proveIpa(
     if (a_in.len == 0 or !std.math.isPowerOfTwo(a_in.len)) return error.NotPowerOfTwo;
 
     const rounds: usize = std.math.log2_int(usize, a_in.len);
+
+    // dalek's `innerproduct_domain_sep(n)`.
+    appendDomainSep(transcript, a_in.len);
 
     // Working copies — each round folds in place, halving the live prefix.
     // `a`/`b` are the secret witness: best-effort zeroed before free (the
@@ -389,6 +396,8 @@ pub fn equationSides(
     const rounds: usize = std.math.log2_int(usize, n);
     if (proof.l_vec.len != rounds or proof.r_vec.len != rounds) return null;
 
+    appendDomainSep(transcript, n);
+
     // `rounds <= 63` always (n fits in a usize), so a fixed stack array
     // keeps this verifier allocation-free (its signature has no
     // allocator).
@@ -396,8 +405,9 @@ pub fn equationSides(
     var u_inv: [64][32]u8 = undefined;
     for (0..rounds) |j| {
         // Replay the prover's exact transcript ops: L/R bound before u.
-        transcript.appendPoint("L", proof.l_vec[j]);
-        transcript.appendPoint("R", proof.r_vec[j]);
+        // dalek's verifier refuses an identity L/R before binding it.
+        transcript.validateAndAppendPoint("L", proof.l_vec[j]) catch return null;
+        transcript.validateAndAppendPoint("R", proof.r_vec[j]) catch return null;
         u[j] = transcript.challengeScalar("u");
         u_inv[j] = invertScalar(u[j]);
     }
@@ -502,7 +512,7 @@ test "InnerProductProof: byte round-trip, rounds=3" {
 
     const bytes = try proof.toBytesAlloc(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqual(@as(usize, 4 + 3 * 64 + 64), bytes.len);
+    try std.testing.expectEqual(@as(usize, 3 * 64 + 64), bytes.len);
 
     const back = try InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes);
     defer back.deinit(std.testing.allocator);
@@ -519,7 +529,7 @@ test "InnerProductProof: byte round-trip, rounds=0 (n=1 base case)" {
     defer proof.deinit(std.testing.allocator);
     const bytes = try proof.toBytesAlloc(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqual(@as(usize, 4 + 64), bytes.len);
+    try std.testing.expectEqual(@as(usize, 64), bytes.len);
     const back = try InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes);
     defer back.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, &proof.a, &back.a);
@@ -534,6 +544,8 @@ test "InnerProductProof.fromBytesAlloc: rejects truncated / wrong-length input" 
 
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes[0 .. bytes.len - 1]));
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes[0..2]));
+    // Whole elements but an odd count: one L without its R.
+    try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes[32..]));
 
     var too_long = try std.testing.allocator.alloc(u8, bytes.len + 1);
     defer std.testing.allocator.free(too_long);
@@ -551,13 +563,13 @@ test "InnerProductProof.fromBytesAlloc: rejects a non-canonical point encoding" 
     var corrupt = try std.testing.allocator.dupe(u8, bytes);
     defer std.testing.allocator.free(corrupt);
     // All-0xff is not a valid canonical Ristretto255 encoding.
-    @memset(corrupt[4..36], 0xff);
+    @memset(corrupt[0..32], 0xff);
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, corrupt));
 }
 
 test "InnerProductProof.fromBytesAlloc: rejects non-canonical a/b scalars (audit B1: wire malleability)" {
-    // rounds=0: no L/R points in the wire layout, so `a` starts right after
-    // the 4-byte rounds header and `b` right after `a` -- mutating those two
+    // rounds=0: no L/R points in the wire layout, so `a` is the first 32
+    // bytes and `b` the next 32 -- mutating those two
     // fixed offsets touches only the SCALAR fields, not a point encoding.
     const proof = try fakeProof(std.testing.allocator, 0);
     defer proof.deinit(std.testing.allocator);
@@ -578,12 +590,12 @@ test "InnerProductProof.fromBytesAlloc: rejects non-canonical a/b scalars (audit
 
     var mutated_a = try std.testing.allocator.dupe(u8, bytes);
     defer std.testing.allocator.free(mutated_a);
-    addLittleEndian(mutated_a[4..36], l_bytes);
+    addLittleEndian(mutated_a[0..32], l_bytes);
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, mutated_a));
 
     var mutated_b = try std.testing.allocator.dupe(u8, bytes);
     defer std.testing.allocator.free(mutated_b);
-    addLittleEndian(mutated_b[36..68], l_bytes);
+    addLittleEndian(mutated_b[32..64], l_bytes);
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, mutated_b));
 
     // Positive control: the untampered encoding must still decode.
@@ -640,9 +652,9 @@ test "proveIpa: zero length rejected before reaching the stub" {
 
 const fuzzseed = @import("testkit").fuzz;
 
-/// `4 + rounds*64 + 64`, so 1024 octets is a 14-round proof with room to
-/// spare — well past the 6-round (n=64) proofs this module produces, and the
-/// encoding is exact-length, so anything bigger could only ever be refused.
+/// `rounds*64 + 64`, so 1024 octets is a 15-round proof — well past the
+/// 6-round (n=64) proofs this module produces, and the encoding is
+/// exact-length, so anything bigger could only ever be refused.
 pub const ipa_fuzz_buf_len = 1024;
 
 /// The all-zero 32 octets are the Ristretto255 IDENTITY, which
@@ -654,18 +666,16 @@ const ipa_bad_point_hex = "ff" ** 32;
 
 pub const ipa_seeds = [_][]const u8{
     fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
-    fuzzseed.seedHex("000000"), // three octets: below the 4-octet rounds field
-    fuzzseed.seedHex("00000000"), // the rounds field alone, with the 64 trailing octets missing
-    fuzzseed.seedHex("00000000" ++ "00" ** 64), // ⭐ rounds = 0: the shortest ACCEPTED proof, a and b only
-    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 64), // ⭐ rounds = 1, both points the identity: accepted
-    fuzzseed.seedHex("00000002" ++ ipa_identity_hex ** 4 ++ "11" ** 64), // rounds = 2, non-zero a and b scalars
-    fuzzseed.seedHex("00000001" ++ ipa_bad_point_hex ++ ipa_identity_hex ++ "00" ** 64), // ⭐ L is not a valid point: the errdefer-freed path
-    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ++ ipa_bad_point_hex ++ "00" ** 64), // R is not a valid point, one loop iteration further in
-    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 63), // one octet short of the declared length
-    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 65), // one octet over
-    fuzzseed.seedHex("0000000e" ++ ipa_identity_hex ** 28 ++ "00" ** 64), // ⭐ rounds = 14: the largest proof that fits the buffer
-    fuzzseed.seedHex("ffffffff" ++ "00" ** 64), // ⭐ rounds = 2^32-1: `expected_len` is 274877906944, and no allocation may be attempted
-    fuzzseed.seedHex("80000000" ++ "00" ** 64), // the high bit of the rounds field set
+    fuzzseed.seedHex("00" ** 63), // one octet short of the two final scalars
+    fuzzseed.seedHex("00" ** 64), // ⭐ rounds = 0: the shortest ACCEPTED proof, a and b only
+    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 64), // ⭐ rounds = 1, both points the identity: accepted
+    fuzzseed.seedHex(ipa_identity_hex ** 4 ++ "11" ** 64), // rounds = 2, non-canonical a and b scalars
+    fuzzseed.seedHex(ipa_bad_point_hex ++ ipa_identity_hex ++ "00" ** 64), // ⭐ L is not a valid point: the errdefer-freed path
+    fuzzseed.seedHex(ipa_identity_hex ++ ipa_bad_point_hex ++ "00" ** 64), // R is not a valid point, one loop iteration further in
+    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 63), // not a whole number of elements (one octet short)
+    fuzzseed.seedHex(ipa_identity_hex ** 2 ++ "00" ** 65), // one octet over
+    fuzzseed.seedHex(ipa_identity_hex ** 3 ++ "00" ** 64), // an odd element count: an L without its R
+    fuzzseed.seedHex(ipa_identity_hex ** 28 ++ "00" ** 64), // ⭐ rounds = 14
 };
 
 fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
@@ -706,6 +716,8 @@ test "corpus: every IPA seed reaches the decoder, and the rounds decoded are pin
     // One seed is deliberately the empty slice.
     try std.testing.expectEqual(ipa_seeds.len - 1, nonempty);
     // Measured 2026-09-07. Before the draw was restructured both were 0.
+    // The seeds were rewritten 2026-09-30 for dalek's length-implied layout
+    // (no rounds field); the accepted set is the same three proofs.
     // ⭐ Re-measured 2026-09-10 after audit finding B1's fix (non-canonical
     // `a`/`b` now rejected): the `rounds=2` seed's `a`/`b` bytes are
     // `0x11` repeated 32 times, whose top byte (0x11) exceeds the scalar

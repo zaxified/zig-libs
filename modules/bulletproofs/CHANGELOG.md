@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — ⚠ **Breaking (wire format): now wire-compatible with
+  dalek-cryptography/bulletproofs 4.0.** The Fiat-Shamir transcript is Merlin
+  v1.0 (`Transcript` gains `appendMessage`, `challengeBytes`,
+  `validateAndAppendPoint`), the transcript labels and order are dalek's, the
+  generators are dalek's (`h` = SHA3-512 of the base point, `g_vec`/`h_vec`
+  from dalek's SHAKE256 `GeneratorsChain`), and the byte layout is dalek's
+  (`t_hat, tau_x, mu` in that order; the IPA tail lost its 4-byte round
+  count). The verifier now refuses an identity `A`/`S`/`T1`/`T2`/`L`/`R`, as
+  dalek's does. Proofs and commitments made by earlier revisions do not verify
+  any more (no consumer existed). New `interop_test.zig` anchors the module on
+  merlin and dalek run as black boxes (`tools/dalek/`): 8 merlin challenges,
+  14 dalek proofs accepted here, 16 proofs from `prove` accepted by dalek.
+  Oracle SELF -> EXTERNAL. The Debug wire-flip test in
+  `verify_b8_diff_test.zig` now proves with the seeded `forge` instead of the
+  getrandom prover: which flipped points still decode depends on the bytes,
+  and a random proof made it flaky.
 - **2026-09-15** — Audit finding B12. Security fix, no API change: `prove` left
   secrets on the dead stack that `secureZero` on its named locals could not
   reach. Measured at ReleaseFast after `prove(n=64)` returned: `v_bytes` ×1 on

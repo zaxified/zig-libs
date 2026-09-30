@@ -1,0 +1,12 @@
+[package]
+name = "bulletproofs_dalek_vectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bulletproofs = "=4.0.0"
+curve25519-dalek-ng = "4"
+hex = "0.4"
+merlin = "=3.0.0"
+rand_chacha = "0.3"

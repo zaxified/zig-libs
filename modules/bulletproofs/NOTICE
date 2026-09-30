@@ -20,37 +20,31 @@ doctrine note (the same posture this repo's other spec-derived modules,
 e.g. `frost`/`voprf`/`threshold_ecdsa`, take for their own IETF/academic
 sources).
 
-dalek-cryptography/bulletproofs (Rust, MIT/Apache-2.0 dual-licensed,
-github.com/dalek-cryptography/bulletproofs) was consulted as a DESIGN
-REFERENCE for the overall SHAPE of the construction (which scalars/points
-get committed in which order; the per-round fold direction in the IPA;
-the range proof's polynomial-construction layout) — no source was ported.
-Two deliberate, explicit divergences from dalek's implementation:
+dalek-cryptography/bulletproofs (Rust, MIT, crates.io `bulletproofs`
+4.0.0) and its transcript crate `merlin` 3.0.0 (MIT) are the wire
+reference since 2026-09-30. Their source was read for the facts a
+compatible implementation has to reproduce: Merlin's STROBE-128 subset and
+message framing (`transcript.zig`), dalek's transcript labels and their
+order, the identity checks in its verifier, the generator derivation
+(`GeneratorsChain` over SHAKE256, `B_blinding` from SHA3-512;
+`generators.zig`) and the proof byte layout (`rangeproof.zig`, `ipa.zig`).
+These are interface facts, re-expressed in Zig over `std`; no Rust code was
+translated line for line, and the prover keeps its own structure (OS
+entropy for the blinding, no transcript RNG, constant-time ladders). Before
+that date the module used a self-made SHA-512 transcript and SHA-512
+generators and was not wire-compatible with anything; the change is
+recorded in CHANGELOG.md.
 
-1. **Transcript**: dalek uses Merlin (a STROBE-based transcript protocol,
-   itself a separate specification/primitive — github.com/dalek-
-   cryptography/merlin). This module uses its own self-contained
-   SHA-512-based hash-chain transcript (`transcript.zig`) instead — see
-   that file's module doc comment and `SPEC.md`'s "Transcript" section
-   for the full rationale (no Merlin/STROBE implementation exists
-   elsewhere in this repo to build on; the Bulletproofs paper itself does
-   not mandate a specific transcript construction). Consequence: this
-   module's proofs are NOT wire-compatible with dalek's (or any other
-   implementation's) proofs — internally self-consistent only.
-2. **Generator derivation**: dalek's `GeneratorsChain` runs a SHAKE256
-   XOF read incrementally through `RistrettoPoint::from_uniform_bytes`.
-   This module instead derives each generator independently via
-   `SHA-512(domain || label || suffix) -> Ristretto255.fromUniform`
-   (`generators.zig`) — simpler, and moot given point (1) already rules
-   out cross-implementation byte-exactness as a goal.
+The dalek and merlin crates are also run, as black boxes, by
+`tools/dalek/` to produce the vectors in `src/interop_vectors.zig`.
 
 `std.crypto.ecc.Ristretto255` (group operations, `fromUniform`'s
 Elligator2-based one-way map per RFC 9496 §4.3.4) and
 `std.crypto.ecc.Ristretto255.scalar`/`.scalar.Scalar` (the shared
 Edwards25519 scalar field: `add`/`sub`/`mul`/`mulAdd`/`neg`/`reduce64`/
 `rejectNonCanonical`, and `Scalar.fromBytes(..).invert().toBytes()` for
-constant-time inversion) and `std.crypto.hash.sha2.Sha512` (MIT, part of
-Zig itself) are used via their public APIs; no new curve, field, or hash
+constant-time inversion), `std.crypto.core.keccak`, `std.crypto.hash.sha3`
+(SHA3-512, SHAKE256) (MIT, part of Zig itself) are used via their public APIs; no new curve, field, or hash
 primitive is implemented here. The sibling `frost`/`voprf` modules'
 `root.zig` doc comments were consulted for this repo's existing
 Ristretto255-usage conventions (scalars-as-raw-`[32]u8`, `meta` tag

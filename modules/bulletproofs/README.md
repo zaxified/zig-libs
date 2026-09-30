@@ -9,7 +9,7 @@ size is **logarithmic** in `n` — the construction behind Confidential
 Transactions, Monero-style range proofs, and many zk-rollup circuits.
 
 **Status: complete.** The generator derivation, the Pedersen commitment,
-the self-contained Fiat-Shamir transcript, both proof structs' byte
+the Merlin Fiat-Shamir transcript, both proof structs' byte
 codecs, and every mechanical scalar/vector/multi-scalar-mult helper are
 REAL and tested. The two genuinely irreducible zero-knowledge cores — the
 Inner-Product Argument (`ipa.zig`'s `proveIpa`/`verifyIpa`) and the
@@ -23,12 +23,13 @@ design and the verification methodology.
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `generators.zig` | **REAL.** `Generators` — deterministic NUMS generator derivation (`g`, `h`, `g_vec`, `h_vec`) |
-| `transcript.zig` | **REAL.** `Transcript` — self-contained SHA-512 Fiat-Shamir transcript (NOT dalek/Merlin-compatible — see below) |
+| `transcript.zig` | **REAL.** `Transcript` — Merlin v1.0 (STROBE-128) Fiat-Shamir transcript, byte-compatible with the `merlin` crate |
 | `scalarvec.zig` | **REAL.** Scalar/vector arithmetic (`innerProduct`, `hadamard`, `addVec`/`subVec`/`scaleVec`, `powers`) + `multiScalarMul` over Ristretto255 |
 | `ipa.zig` | **FABLE CORE (implemented):** `proveIpa`/`verifyIpa`. `InnerProductProof`'s struct + byte codec are REAL |
 | `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`. `commit`, `deltaYZ`, and `RangeProof`'s struct + byte codec are REAL |
 | `gate.zig` | The single switch (`core_implemented`) gating the two cores' tests |
 | `kat_test.zig` | The property/soundness KAT harness (completeness + soundness scenarios) |
+| `interop_test.zig` | The external anchor: merlin transcripts and dalek range proofs in both directions (`interop_vectors.zig`, from `tools/dalek/`) |
 
 ## Import
 
@@ -72,28 +73,27 @@ construction time, before any commitment is built.
   unconditionally, including zero, and `src/ctgrind_harness.zig` measures
   **0 in-file contexts** with `v` and `gamma` tainted through `prove`. ⚠ The
   blinding `prove` draws internally is outside that measurement. See SPEC.md.
-- **Not wire-compatible with dalek / any other Bulletproofs
-  implementation** — this module's Fiat-Shamir transcript is its own
-  SHA-512 chain (see below); verification is property/soundness-based, not
-  byte-exact against a third-party vector.
+- **Single-value proofs only**, `n` a power of two; dalek interoperates
+  for `n` in {8, 16, 32, 64} (it refuses other widths).
 
-## Transcript — module-defined, not dalek/Merlin-compatible
+## Wire compatibility — dalek-cryptography/bulletproofs 4.0
 
-This module's Fiat-Shamir transcript (`transcript.zig`) is a
-self-contained SHA-512 hash chain, not Merlin (the STROBE-based
-transcript protocol dalek's `bulletproofs` crate uses). Every
-Bulletproofs implementation's transcript is implementation-defined — the
-paper does not pin one down — so a proof from this module verifies only
-against this module's own `verify`/`verifyIpa`; it is internally
-self-consistent (soundness holds end-to-end) but **not** wire-compatible
-with dalek, libsecp256k1-zkp, or any other implementation. See
-[SPEC.md](SPEC.md) for the full rationale.
+Since 2026-09-30 the transcript (Merlin), the generators and the byte
+layout are dalek's, so proofs cross in both directions: a dalek
+`RangeProof::to_bytes()` decodes with `RangeProof.fromBytesAlloc` and
+verifies with `verify`, and a proof from `prove` verifies under dalek's
+`verify_single`. Both sides must start the transcript with the same label
+(dalek leaves it to the application; this module's default is
+`rangeproof_domain`). `interop_test.zig` asserts both directions against
+vectors the crates produced (`tools/dalek/`). Proofs made before that date
+by this module do not verify any more (see CHANGELOG.md). Not compatible
+with secp256k1-zkp or Monero (other curves and transcripts).
 
 ## Import graph
 
 ```
 bulletproofs → ct25519 (scalarvec.mulCt, the constant-time secret-scalar ladder)
-bulletproofs → std.crypto.ecc.Ristretto255 / std.crypto.hash.sha2.Sha512
+bulletproofs → std.crypto.ecc.Ristretto255 / std.crypto.core.keccak / std.crypto.hash.sha3
 ```
 
 One sibling-module dependency, `ct25519` (`meta.deps = .{"ct25519"}`) — this
@@ -117,8 +117,8 @@ completeness check), out-of-range rejection, an exhaustive per-field
 tamper suite (every proof element — `A`/`S`/`T1`/`T2`/`tau_x`/`mu`/`t_hat`,
 every IPA `L_i`/`R_i`, and the final `a`/`b` — flipped and re-verified,
 each must reject), cross-commitment rejection, and mismatched-`n`
-rejection. See [SPEC.md](SPEC.md) for why no byte-exact third-party vector
-is possible here — property + soundness testing is this module's complete,
-final verification methodology.
+rejection. `interop_test.zig` adds the byte-exact external anchor (merlin
+challenges, dalek proofs accepted here, this module's proofs accepted by
+dalek); see [SPEC.md](SPEC.md) "Anchoring".
 
 Provenance: see [NOTICE](NOTICE).

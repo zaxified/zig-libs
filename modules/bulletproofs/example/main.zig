@@ -16,8 +16,9 @@
 //!
 //! Two things a consumer has to internalise and this file demonstrates: the
 //! generators are NUMS-derived, so prover and verifier build identical ones
-//! without exchanging anything; and the Fiat-Shamir transcript is this
-//! module's own, so a proof only ever verifies against this module.
+//! without exchanging anything; and prover and verifier must start the
+//! Fiat-Shamir transcript with the same label — the proof bytes are dalek's
+//! (`RangeProof::to_bytes`), so the other side may as well be dalek.
 
 const std = @import("std");
 const bulletproofs = @import("bulletproofs");
