@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **ECDSA P-384 responders, and SHA-384/512 with either curve.** The responder's
+  curve is read from its SPKI `namedCurve` (RFC 5480); P-256/SHA-256 keeps the `p256` verifier, every
+  other pair (P-384 with SHA-256/384/512, P-256 with SHA-384/512) goes to `std.crypto.sign.ecdsa`
+  after a strict DER decode (`derToRawStrict` — std's `Signature.fromDer` accepts short negative and
+  non-minimal INTEGERs). ECC-issued certificates whose responder signs with P-384 used to fail with
+  `UnsupportedSignatureAlgorithm`. Anchored on three OpenSSL-made and -verified responses (direct
+  SHA-384, direct SHA-256 on P-384, delegated P-384 `revoked`).
+
 - **2026-09-14** — **BEHAVIOURAL (refuses more):** audit `x509` X5, handed over from this module's
   F1 and handed back: the certificate is parsed here, not in `x509`. A delegated response whose
   embedded responder certificate had its outer `signatureAlgorithm` NULL parameters (`05 00`)

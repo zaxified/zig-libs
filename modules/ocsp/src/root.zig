@@ -24,8 +24,8 @@
 //!   key hash, OR a delegated responder cert carried in the response, directly
 //!   signed by the issuer and bearing the id-kp-OCSPSigning EKU — RFC 6960
 //!   §4.2.2.2); (2) the `tbsResponseData` signature verifies under the
-//!   responder's key (RSA PKCS#1 v1.5 SHA-1/256/384/512, or ECDSA-P256
-//!   SHA-256); (3) the `CertID` in the matched `SingleResponse` recomputes
+//!   responder's key (RSA PKCS#1 v1.5 SHA-1/256/384/512, or ECDSA on P-256
+//!   or P-384 with SHA-256/384/512); (3) the `CertID` in the matched `SingleResponse` recomputes
 //!   exactly to the subject cert (issuerNameHash/issuerKeyHash/serial) so the
 //!   response actually applies to it; (4) `thisUpdate <= now <= nextUpdate`
 //!   (caller-supplied `now_unix`, never a system clock; a configurable max-age
@@ -69,12 +69,12 @@
 //! - Full path building for the delegated responder beyond the single
 //!   issuer→responder link RFC 6960 §4.2.2.2 requires (the responder MUST be
 //!   directly issued by the CA that issued the certificate in question).
-//! - ECDSA-P256 with SHA-384/512 responder signatures (SHA-256 is the standard
-//!   pairing and the only one seen in practice); RSA covers all three digests.
+//! - ECDSA on curves other than P-256/P-384, and Ed25519 responder signatures.
 //!
 //! Provenance: clean-room from RFC 6960 (a public IETF specification). Built on
 //! this repo's `x509` (DER reader + EKU), `rsa` (RFC 8017 PKCS#1) and `p256`
-//! (ECDSA-P256) modules. See SPEC.md / README.md.
+//! (ECDSA-P256) modules, and `std.crypto.sign.ecdsa` for P-384 and the
+//! non-SHA-256 P-256 pairings. See SPEC.md / README.md.
 
 const std = @import("std");
 const x509 = @import("x509");
@@ -127,6 +127,11 @@ const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x
 const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
 const oid_sha512_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
 const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }; // 1.2.840.10045.4.3.2
+const oid_ecdsa_sha384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 }; // 1.2.840.10045.4.3.3
+const oid_ecdsa_sha512 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04 }; // 1.2.840.10045.4.3.4
+// SPKI namedCurve parameters (RFC 5480 §2.1.1.1).
+const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
+const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 }; // 1.3.132.0.34
 
 // ── low-level bounded DER reader (all on x509's parseElement) ────────────────
 
@@ -276,7 +281,10 @@ fn digest(algo: HashAlgo, data: []const u8, out: *[64]u8) []const u8 {
 
 // ── certificate structure walk (local, bounded, no Certificate.parse) ───────
 
-const PubKeyAlgo = enum { rsa, ec, other };
+/// The key type of a certificate's SPKI. EC keys are split by named curve
+/// (RFC 5480): the curve, not the signature OID, decides the verifier, and a
+/// signature OID never says which curve signed.
+const PubKeyAlgo = enum { rsa, ec_p256, ec_p384, other };
 
 /// The certificate fields OCSP needs, as views over the input DER. Produced by
 /// `parseCert` with the bounds-safe reader — never `std.crypto.Certificate.parse`.
@@ -294,9 +302,16 @@ const CertView = struct {
     signature: []const u8, // signatureValue BIT STRING value (unused-bits octet stripped)
 };
 
-fn classifyPubKey(oid: []const u8) PubKeyAlgo {
+/// `params` is the AlgorithmIdentifier's parameters content (an OID for EC's
+/// namedCurve), or null when absent. An EC key without a named curve, or on a
+/// curve other than P-256/P-384, is `.other` — refused later as unsupported.
+fn classifyPubKey(oid: []const u8, params: ?[]const u8) PubKeyAlgo {
     if (std.mem.eql(u8, oid, &oid_rsa_encryption)) return .rsa;
-    if (std.mem.eql(u8, oid, &oid_ec_public_key)) return .ec;
+    if (std.mem.eql(u8, oid, &oid_ec_public_key)) {
+        const curve = params orelse return .other;
+        if (std.mem.eql(u8, curve, &oid_prime256v1)) return .ec_p256;
+        if (std.mem.eql(u8, curve, &oid_secp384r1)) return .ec_p384;
+    }
     return .other;
 }
 
@@ -342,7 +357,15 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
     try wantTag(alg_seq, TAG_SEQUENCE);
     const alg_oid = try el(bytes, alg_seq.slice.start);
     try wantTag(alg_oid, TAG_OID);
-    const pub_algo = classifyPubKey(contentOf(bytes, alg_oid));
+    // namedCurve OID, when the parameters are one (EC); RSA's NULL is not.
+    const curve: ?[]const u8 = blk: {
+        if (alg_oid.slice.end == alg_seq.slice.end) break :blk null;
+        const params = try el(bytes, alg_oid.slice.end);
+        try closes(params.slice.end, alg_seq.slice.end);
+        if (rawTag(params) != TAG_OID) break :blk null;
+        break :blk contentOf(bytes, params);
+    };
+    const pub_algo = classifyPubKey(contentOf(bytes, alg_oid), curve);
     const spk = try el(bytes, alg_seq.slice.end);
     try wantTag(spk, TAG_BITSTRING);
     const spk_content = contentOf(bytes, spk);
@@ -1145,7 +1168,7 @@ fn parseRevoked(bytes: []const u8, revoked: Element) VerifyError!CertStatus {
 
 // ── responder signature verification ────────────────────────────────────────
 
-const SigScheme = enum { rsa_sha1, rsa_sha256, rsa_sha384, rsa_sha512, ecdsa_sha256 };
+const SigScheme = enum { rsa_sha1, rsa_sha256, rsa_sha384, rsa_sha512, ecdsa_sha256, ecdsa_sha384, ecdsa_sha512 };
 
 fn sigSchemeFromOid(oid: []const u8) ?SigScheme {
     if (std.mem.eql(u8, oid, &oid_sha256_rsa)) return .rsa_sha256;
@@ -1153,6 +1176,8 @@ fn sigSchemeFromOid(oid: []const u8) ?SigScheme {
     if (std.mem.eql(u8, oid, &oid_sha512_rsa)) return .rsa_sha512;
     if (std.mem.eql(u8, oid, &oid_sha1_rsa)) return .rsa_sha1;
     if (std.mem.eql(u8, oid, &oid_ecdsa_sha256)) return .ecdsa_sha256;
+    if (std.mem.eql(u8, oid, &oid_ecdsa_sha384)) return .ecdsa_sha384;
+    if (std.mem.eql(u8, oid, &oid_ecdsa_sha512)) return .ecdsa_sha512;
     return null;
 }
 
@@ -1180,12 +1205,89 @@ fn verifySignature(
             };
             ok catch return error.SignatureInvalid;
         },
-        .ecdsa_sha256 => {
-            if (algo != .ec) return error.UnsupportedSignatureAlgorithm;
-            const rs = ecdsaDerToRs(signature) orelse return error.SignatureInvalid;
-            if (!p256.sign.ecdsaVerify(key_bits, msg, rs)) return error.SignatureInvalid;
+        .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 => switch (algo) {
+            // P-256 with SHA-256 keeps the sibling `p256` verifier it has
+            // always used; every other curve/hash pair goes to std's generic
+            // ECDSA. Any hash with any curve is legal (RFC 5758 §3.2); ECC
+            // CAs sign OCSP with P-384/SHA-384 (the gap closed 2026-09-30).
+            .ec_p256 => switch (scheme) {
+                .ecdsa_sha256 => {
+                    const rs = ecdsaDerToRs(signature) orelse return error.SignatureInvalid;
+                    if (!p256.sign.ecdsaVerify(key_bits, msg, rs)) return error.SignatureInvalid;
+                },
+                .ecdsa_sha384 => try stdEcdsaVerify(std.crypto.ecc.P256, Sha384, key_bits, msg, signature),
+                .ecdsa_sha512 => try stdEcdsaVerify(std.crypto.ecc.P256, Sha512, key_bits, msg, signature),
+                else => unreachable,
+            },
+            .ec_p384 => switch (scheme) {
+                .ecdsa_sha256 => try stdEcdsaVerify(std.crypto.ecc.P384, Sha256, key_bits, msg, signature),
+                .ecdsa_sha384 => try stdEcdsaVerify(std.crypto.ecc.P384, Sha384, key_bits, msg, signature),
+                .ecdsa_sha512 => try stdEcdsaVerify(std.crypto.ecc.P384, Sha512, key_bits, msg, signature),
+                else => unreachable,
+            },
+            .rsa, .other => return error.UnsupportedSignatureAlgorithm,
         },
     }
+}
+
+/// ECDSA over `Curve` with `Hash` via `std.crypto.sign.ecdsa`. The DER
+/// signature goes through `derToRawStrict`, never std's `Signature.fromDer`:
+/// that one accepts a negative INTEGER shorter than the scalar and a
+/// redundant leading zero, the malleable encodings this module already
+/// removed once (see `ecdsaDerToRs`).
+fn stdEcdsaVerify(comptime Curve: type, comptime Hash: type, key_bits: []const u8, msg: []const u8, sig_der: []const u8) VerifyError!void {
+    const E = std.crypto.sign.ecdsa.Ecdsa(Curve, Hash);
+    const n = Curve.scalar.encoded_length;
+    const pk = E.PublicKey.fromSec1(key_bits) catch return error.InvalidResponderKey;
+    const raw = derToRawStrict(n, sig_der) orelse return error.SignatureInvalid;
+    const sig = E.Signature.fromBytes(raw);
+    sig.verify(msg, pk) catch return error.SignatureInvalid;
+}
+
+/// Strict DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` to a
+/// fixed `r || s` of `2n` bytes — the same rules as `p256.sign.derToRaw`
+/// (anchored on Wycheproof there), generalized over the scalar length:
+/// definite minimal lengths, positive minimal INTEGERs, nothing trailing
+/// inside or after the SEQUENCE. Any other shape is null.
+fn derToRawStrict(comptime n: usize, sig_der: []const u8) ?[2 * n]u8 {
+    if (sig_der.len < 2 or sig_der[0] != 0x30) return null;
+    const body = derLen(sig_der[1..]) orelse return null;
+    if (body.len_bytes + 1 + body.len != sig_der.len) return null;
+    var rest = sig_der[1 + body.len_bytes ..][0..body.len];
+    var out = [_]u8{0} ** (2 * n);
+    inline for (.{ 0, n }) |off| {
+        if (rest.len < 2 or rest[0] != 0x02) return null;
+        const int = derLen(rest[1..]) orelse return null;
+        const start = 1 + int.len_bytes;
+        if (start + int.len > rest.len) return null;
+        const v = rest[start..][0..int.len];
+        if (v.len == 0) return null; // INTEGER must have content
+        if (v[0] & 0x80 != 0) return null; // negative
+        if (v[0] == 0 and (v.len == 1 or v[1] & 0x80 == 0)) return null; // non-minimal
+        const mag = if (v[0] == 0) v[1..] else v;
+        if (mag.len > n) return null;
+        @memcpy(out[off + n - mag.len ..][0..mag.len], mag);
+        rest = rest[start + int.len ..];
+    }
+    if (rest.len != 0) return null;
+    return out;
+}
+
+const DerLen = struct { len: usize, len_bytes: usize };
+
+/// DER definite-form length, minimal: short form below 128, otherwise one or
+/// two length octets with no leading zero (two span any ECDSA signature).
+fn derLen(bytes: []const u8) ?DerLen {
+    if (bytes.len == 0) return null;
+    const first = bytes[0];
+    if (first < 0x80) return .{ .len = first, .len_bytes = 1 };
+    const k = first & 0x7f;
+    if (k == 0 or k > 2 or bytes.len < 1 + k) return null;
+    if (bytes[1] == 0) return null;
+    var v: usize = 0;
+    for (bytes[1..][0..k]) |b| v = (v << 8) | b;
+    if (v < 0x80) return null;
+    return .{ .len = v, .len_bytes = 1 + k };
 }
 
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into a
@@ -1254,4 +1356,38 @@ test "ECDSA DER: encodings that DER forbids are rejected (Wycheproof rows)" {
 test {
     _ = @import("ocsp_test.zig");
     _ = @import("goldens.zig");
+    _ = @import("p384_test.zig");
+}
+
+test "derToRawStrict: P-384-sized encodings DER forbids are refused" {
+    // Built around one valid 48-byte (r, s): r = 0x01 ‖ 0x00*47, s = 0x7f*48.
+    const r = [_]u8{0x01} ++ [_]u8{0} ** 47;
+    const s = [_]u8{0x7f} ** 48;
+    const good = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
+    const raw = derToRawStrict(48, &good).?;
+    try std.testing.expectEqualSlices(u8, &(r ++ s), &raw);
+    // A high-bit r needs its sign octet: with it, accepted; without, negative.
+    const hi = [_]u8{0x80} ++ [_]u8{0} ** 47;
+    const with_pad = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x00 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &with_pad) != null);
+    const negative = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &negative) == null);
+    // A SHORT negative r — what std's `Signature.fromDer` lets through.
+    const short_neg = [_]u8{ 0x30, 2 + 1 + 2 + 48, 0x02, 1, 0x81, 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &short_neg) == null);
+    // A redundant leading zero on a short r (non-minimal) — also std-accepted.
+    const nonmin = [_]u8{ 0x30, 2 + 2 + 2 + 48, 0x02, 2, 0x00, 0x01, 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &nonmin) == null);
+    // Trailing byte after the SEQUENCE, and inside it.
+    const after = good ++ [_]u8{0x00};
+    try std.testing.expect(derToRawStrict(48, &after) == null);
+    var inside = [_]u8{ 0x30, 2 + 48 + 2 + 48 + 1, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s ++ [_]u8{0x00};
+    try std.testing.expect(derToRawStrict(48, &inside) == null);
+    // A 49-byte magnitude does not fit the scalar.
+    const too_long = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x01 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &too_long) == null);
+    // A non-minimal long-form length for a short body.
+    const long_form = [_]u8{ 0x30, 0x81, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
+    try std.testing.expect(derToRawStrict(48, &long_form) == null);
+    inside[1] = 0; // silence "never mutated"
 }

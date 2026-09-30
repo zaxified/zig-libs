@@ -14,7 +14,7 @@ buffer. `verify` is the security core: it authorizes the responder (issuing CA
 itself, matched by name or key hash, **or** a delegated responder cert carried
 in the response, directly signed by the issuer and bearing the
 `id-kp-OCSPSigning` EKU — RFC 6960 §4.2.2.2), verifies the `tbsResponseData`
-signature (RSA PKCS#1 v1.5 SHA-1/256/384/512, ECDSA-P256 SHA-256), confirms the
+signature (RSA PKCS#1 v1.5 SHA-1/256/384/512; ECDSA P-256/P-384 with SHA-256/384/512), confirms the
 `CertID` binds to the subject certificate (recomputed issuerNameHash /
 issuerKeyHash / serial), checks freshness against a caller-supplied `now_unix`,
 and matches a request nonce if one was sent. `zig build test-ocsp` (Debug +
@@ -79,7 +79,7 @@ switch (verdict.status) {
 - **Deferred, by design:** OCSP *stapling* wire integration (the TLS server's
   job), CRL-based revocation (separate mechanism), full delegated-responder
   path building beyond the single issuer→responder link RFC 6960 requires, and
-  ECDSA-P256 with SHA-384/512 (SHA-256 is the standard pairing). See `SPEC.md`.
+  Ed25519/P-521 responder signatures. See `SPEC.md`.
 
 Provenance: clean-room from RFC 6960 (a public IETF specification). See
 `SPEC.md` and `NOTICE`.
