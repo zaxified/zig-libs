@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **`ioctl.drvinfo()` and `ioctl.driverStats()`: `ethtool -i` and plain `ethtool -S`.**
+  New `src/ioctl.zig`, exactly two `SIOCETHTOOL` entry points (`ETHTOOL_GDRVINFO`;
+  `GSSET_INFO` + `GSTRINGS` + `GSTATS`) over `std.os.linux`, no libc. They have no netlink
+  message, and the user decided (option B) to add just these two rather than leave the most
+  used ethtool calls out. Typed errors (`InvalidInterfaceName` before any syscall,
+  `NoSuchDevice`, `NotSupported`, `PermissionDenied`, ...); the counter count is bounded
+  (65536) and re-checked, one retry then `StatsChanged`; scratch buffers are sized for the
+  bound because the kernel copies out by its own count. Tests: hand-built reply images plus a
+  live field-by-field comparison against the `ethtool` binary. No other ioctl command is
+  added. Docs (README, SPEC §4, `root.zig` and `stats.zig` headers) no longer say "no ioctl".
 - **2026-09-07** — **all four fuzz harnesses fetched their input and threw it away — and the
   collapse made them look perfect.** Each opened `smith.bytes(&raw)` and then sliced the buffer
   to `smith.valueRangeAtMost(u16, 0, raw.len)`; a `Smith` ranged draw reads eight input octets

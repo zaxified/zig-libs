@@ -7,8 +7,8 @@
 //!
 //! Plain `ethtool -S <dev>` prints the driver's *own* counter array, which has
 //! no netlink message at all — it still goes through the legacy
-//! `SIOCETHTOOL`/`ETHTOOL_GSTATS` ioctl, and this module does not implement it
-//! (see SPEC.md's deferred list). What `STATS_GET` returns is the newer,
+//! `SIOCETHTOOL`/`ETHTOOL_GSTATS` ioctl, which lives in `ioctl.zig`
+//! (`driverStats`), not here. What `STATS_GET` returns is the newer,
 //! standardised set: IEEE 802.3 `eth-mac`/`eth-ctrl`, RFC 2819 `rmon` and
 //! `eth-phy`, which is what `ethtool -S <dev> --groups eth-mac …` asks for and
 //! what a monitoring consumer actually wants, because the names are the

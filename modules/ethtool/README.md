@@ -4,7 +4,8 @@ Native **Ethernet device control** over the kernel's modern `ethtool`
 generic-netlink family: link settings and state, ring / coalesce / pause /
 channel parameters, netdev feature flags, the standardised statistics groups,
 the kernel's own string tables and pluggable-module (SFP/QSFP) access — no
-`ethtool` shell-out, no `SIOCETHTOOL` ioctl, no libc.
+`ethtool` shell-out, no libc, and exactly two `SIOCETHTOOL` ioctls
+(`ethtool -i` and plain `ethtool -S`, which have no netlink message).
 
 - No maintained pure-Zig ethtool-netlink client exists.
 - **Model after:** the kernel UAPI (`linux/ethtool_netlink_generated.h`,
@@ -37,7 +38,7 @@ against this module's — no `ethtool` source consulted, studied or ported. DATA
 | **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, the `monitor` multicast group |
 | **Escape hatch** | `Ethtool.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
 | **Deferred** | WOL, EEE, FEC, PRIVFLAGS, DEBUG, TSINFO/TSCONFIG, cable test, RSS, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see `SPEC.md` |
-| **Not here, permanently** | the legacy `SIOCETHTOOL` **ioctl** API. That is what `ethtool -i` (driver/firmware/bus info) and plain `ethtool -S` (the driver's private counter array) still use — there is no netlink message for either. See "What is not here" below. |
+| **Two ioctls, nothing more** | `ioctl.drvinfo()` (`ethtool -i`: driver/version/firmware/bus info) and `ioctl.driverStats()` (plain `ethtool -S`: the driver's private counter array) over `SIOCETHTOOL` — there is no netlink message for either. No other legacy ioctl command is or will be here. See "The two ioctl calls" below. |
 
 ## API
 
@@ -205,23 +206,34 @@ if (std.os.linux.poll(&pfd, 1, 5000) > 0) {
 Same seam discipline as the sibling `nl80211`, `netconf` and `ebpf` modules:
 threading policy belongs to the application.
 
-## What is not here
+## The two ioctl calls
 
-This module speaks **ethtool netlink**, not the legacy ioctl. Two things a
-user of the `ethtool` CLI expects are therefore absent, and no amount of
-netlink will produce them:
+Everything above is ethtool netlink. Two things a user of the `ethtool` CLI
+expects have no netlink message (an `strace` of `ethtool -i` shows no netlink
+traffic at all), so `ethtool.ioctl` reaches them over `SIOCETHTOOL` with plain
+`std.os.linux` syscalls, no libc, no privileges:
 
-- **`ethtool -i`** — driver name, firmware version, bus id. There is no
-  `ETHTOOL_MSG_DRVINFO_GET`; the CLI still uses
-  `SIOCETHTOOL`/`ETHTOOL_GDRVINFO` for it. (An `strace` of `ethtool -i` emits
-  no netlink traffic at all — that is how it was confirmed.)
-- **plain `ethtool -S`** — the driver's own free-form counter array, likewise
-  ioctl-only. What `STATS_GET` returns is the newer *standardised* set
-  (`eth-mac`, `eth-ctrl`, `rmon`, `eth-phy`), which is what
-  `ethtool -S <dev> --groups …` asks for and what a monitoring consumer
-  actually wants — the names are IEEE 802.3 / RFC 2819's rather than each
-  driver's invention. Most drivers implement **none** of them and answer with
-  groups that are present but empty; that is a normal reply, not an error.
+```zig
+const info = try ethtool.ioctl.drvinfo("eth0");            // ethtool -i
+std.debug.print("{s} {s} fw={s} bus={s}\n", .{
+    info.driver(), info.version(), info.firmwareVersion(), info.busInfo(),
+});
+
+var st = try ethtool.ioctl.driverStats(gpa, "eth0");       // plain ethtool -S
+defer st.deinit(gpa);
+for (0..st.count()) |i| std.debug.print("{s}: {d}\n", .{ st.name(i), st.value(i) });
+```
+
+- Errors are typed: `InvalidInterfaceName` (checked before any syscall),
+  `NoSuchDevice`, `NotSupported`, `PermissionDenied`, and for `driverStats`
+  also `TooManyStats` (more than `ioctl.max_stats` = 65536 counters),
+  `StatsChanged` and `BadReply`.
+- The counter count is read first and can change before the names and values
+  are read; the sequence is retried once, then `StatsChanged`.
+- `STATS_GET` (above) is a different thing: the newer standardised groups
+  (`eth-mac`, `eth-ctrl`, `rmon`, `eth-phy`), which most drivers leave empty.
+  That is a normal reply, not an error.
+- No other ioctl command is implemented, and none that netlink already covers.
 
 ## Design notes
 

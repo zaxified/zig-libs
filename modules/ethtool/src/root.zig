@@ -3,7 +3,8 @@
 //! `ethtool` generic-netlink family: link settings and state, ring / coalesce /
 //! pause / channel parameters, netdev feature flags, the standardised
 //! statistics groups, the kernel's own string tables and pluggable-module
-//! access — with no `ethtool` shell-out, no ioctl and no libc.
+//! access — with no `ethtool` shell-out and no libc (plus exactly two `SIOCETHTOOL`
+//! ioctls, see `ioctl.zig`).
 //!
 //! ```zig
 //! const ethtool = @import("ethtool");
@@ -30,12 +31,12 @@
 //!
 //! ## What this module is, and is not
 //!
-//! * **This is the netlink API, not the ioctl one.** Everything here rides
-//!   `ETHTOOL_MSG_*` over generic netlink. The legacy `SIOCETHTOOL` path is
-//!   **not** implemented, which has one visible consequence: `ethtool -i`
+//! * **This is the netlink API.** Everything here rides `ETHTOOL_MSG_*` over
+//!   generic netlink. The one exception is `ioctl.zig`: `ethtool -i`
 //!   (driver/firmware/bus info) and plain `ethtool -S` (the driver's private
-//!   counter array) have *no netlink message at all* and are therefore not
-//!   here. See SPEC.md for the honest deferred list.
+//!   counter array) have *no netlink message at all*, so `ioctl.drvinfo()` and
+//!   `ioctl.driverStats()` reach them over `SIOCETHTOOL`. Those two calls are
+//!   the whole ioctl surface; no other legacy command is implemented.
 //! * **Implemented:** `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`,
 //!   `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`,
 //!   `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`,
@@ -120,6 +121,9 @@ pub const stats = @import("stats.zig");
 pub const moduleinfo = @import("moduleinfo.zig");
 /// The socket client and the `monitor` notification socket.
 pub const client = @import("client.zig");
+/// The two `SIOCETHTOOL` calls with no netlink message: `drvinfo()` and
+/// `driverStats()`.
+pub const ioctl = @import("ioctl.zig");
 
 /// The generic-netlink transport this family rides on, re-exported so a caller
 /// does not need a second import to drive the raw escape hatch.
@@ -772,5 +776,6 @@ test {
     _ = stats;
     _ = moduleinfo;
     _ = client;
+    _ = ioctl;
     _ = @import("goldens.zig");
 }
