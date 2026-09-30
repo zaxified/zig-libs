@@ -70,6 +70,8 @@ const DecodeError = cbor.DecodeError; // error{ Truncated, Malformed, DepthLimit
 const EncodeError = cbor.EncodeError; // Allocator.Error
 
 fn decode(a: Allocator, bytes: []const u8, opts: cbor.DecodeOptions) DecodeError!Value;
+// One item from the front + the bytes it took; the rest is the caller's (no TrailingGarbage):
+fn decodePrefix(a: Allocator, bytes: []const u8, opts: cbor.DecodeOptions) DecodeError!cbor.Prefix; // { value, len }
 fn encode(a: Allocator, value: Value, opts: cbor.EncodeOptions) EncodeError![]u8;
 fn freeValue(a: Allocator, value: Value) void; // release a decoded tree without an arena
 

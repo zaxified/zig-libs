@@ -132,7 +132,8 @@ no `COSE_Mac0`/`Encrypt0`/`Sign`.
 
 ## Threat model / out of scope
 
-`decode` is the security boundary — it is the only function in this module that touches untrusted
+`decode` (and `decodePrefix`, the same decoder without the trailing-bytes check, added 2026-09-30 for
+WebAuthn `authenticatorData`) is the security boundary — the only code in this module that touches untrusted
 bytes, and it is fail-closed (typed `DecodeError`, never a panic/OOB — see hardening above).
 `encode`/the `cose` layer operate on caller-constructed or already-decoded `Value` trees and are
 not re-validated against a "misuse" contract (e.g. `Value.simple` outside `0..19 ∪ 32..255`, or a

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **authenticatorData extensions (ED flag) are accepted.** The credential public key
+  is split off with the new `cbor.decodePrefix`; with ED set the rest must be exactly one CBOR map,
+  returned raw in the new `AuthenticatorData.extensions`. ⚠ Error set: `ExtensionsNotSupported` is
+  gone; new `InvalidExtensions` (ED set, not exactly one map) and `TrailingData` (bytes after the
+  last structure the flags announce — before, trailing bytes after signCount with AT and ED clear
+  were silently ignored). Anchored on two ED blobs made and read back by python-fido2 2.2.1.
+
 - **2026-09-10** — **A1 F4 closed: §8.2.1's `id-fido-gen-ce-aaguid` certificate binding was
   never checked.** `verifyLeafCertSignature` (the `packed`/x5c path) now calls
   `checkAaguidExtension`, an independent DER walk over the leaf certificate via

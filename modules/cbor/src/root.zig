@@ -256,6 +256,25 @@ pub fn decode(allocator: Allocator, bytes: []const u8, options: DecodeOptions) D
     return v;
 }
 
+/// One decoded item and the number of input bytes it occupied.
+pub const Prefix = struct {
+    value: Value,
+    len: usize,
+};
+
+/// Decode the ONE CBOR item at the start of `bytes` and report how many bytes
+/// it took; whatever follows is left to the caller. For formats that put a
+/// CBOR item in front of other data with no length of its own — WebAuthn
+/// `authenticatorData`'s credential public key followed by the extensions
+/// map, or an RFC 8949 §5.1 CBOR sequence read item by item. Same limits,
+/// allocation and cleanup contract as `decode`; `decode` is this plus the
+/// no-trailing-bytes check.
+pub fn decodePrefix(allocator: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Prefix {
+    var d: Decoder = .{ .bytes = bytes, .pos = 0, .allocator = allocator, .max_depth = options.max_depth };
+    const v = try d.decodeValue(0);
+    return .{ .value = v, .len = d.pos };
+}
+
 const Arg = union(enum) { value: u64, indefinite };
 
 const Decoder = struct {
@@ -871,4 +890,27 @@ test "smoke: encode/decode round-trip a small map" {
     try std.testing.expect(decoded == .map);
     try std.testing.expectEqual(@as(usize, 2), decoded.map.len);
     try std.testing.expectEqualStrings("a", decoded.map[0].value.text);
+}
+
+test "decodePrefix: one item from the front, its length, the rest left alone" {
+    const a = std.testing.allocator;
+    // [1, {"a": h'0102'}] followed by 0xf5 (true) and a stray 0x00.
+    const bytes = [_]u8{ 0x82, 0x01, 0xa1, 0x61, 'a', 0x42, 0x01, 0x02, 0xf5, 0x00 };
+    const first = try decodePrefix(a, &bytes, .{});
+    defer freeValue(a, first.value);
+    try std.testing.expectEqual(@as(usize, 8), first.len);
+    try std.testing.expectEqual(@as(usize, 2), first.value.array.len);
+    // Read the next item of the sequence from where the first ended.
+    const second = try decodePrefix(a, bytes[first.len..], .{});
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expect(second.value.bool);
+    // `decode` on the same bytes refuses the trailing data, as before.
+    try std.testing.expectError(error.TrailingGarbage, decode(a, &bytes, .{}));
+    // Without trailing bytes the two agree.
+    const whole = try decodePrefix(a, bytes[0..8], .{});
+    defer freeValue(a, whole.value);
+    try std.testing.expectEqual(@as(usize, 8), whole.len);
+    // A truncated item is still an error, not a short length.
+    try std.testing.expectError(error.Truncated, decodePrefix(a, bytes[0..5], .{}));
+    try std.testing.expectError(error.Truncated, decodePrefix(a, &.{}, .{}));
 }

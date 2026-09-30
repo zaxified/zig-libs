@@ -297,7 +297,12 @@ pub const max_credential_id_len: u16 = 1023;
 
 pub const AuthDataError = error{
     Truncated,
-    ExtensionsNotSupported,
+    /// ED (flags bit 7) is set but what follows is not exactly one CBOR map
+    /// (§6.1: "extensions ... a CBOR map").
+    InvalidExtensions,
+    /// Bytes remain after the last structure the flags announce — §6.1's
+    /// layout is exact.
+    TrailingData,
     /// `credentialIdLength` exceeds `max_credential_id_len` (§6.5.2).
     CredentialIdTooLong,
     /// BE=0 with BS=1 — an authenticator state §6.1 forbids.
@@ -316,6 +321,11 @@ pub const AuthenticatorData = struct {
     flags: Flags,
     sign_count: u32,
     attested_credential_data: ?AttestedCredentialData,
+    /// The authenticator extension outputs (ED set): the raw CBOR map,
+    /// borrowed from the input like `credential_id` — decode it with `cbor`
+    /// when an extension matters (`credProtect`, `hmac-secret`, …). Null when
+    /// ED is clear.
+    extensions: ?[]const u8 = null,
 
     /// WebAuthn §6.1 flags byte, bit 0 (LSB) first.
     pub const Flags = packed struct(u8) {
@@ -331,13 +341,15 @@ pub const AuthenticatorData = struct {
 };
 
 /// Parse `authenticatorData` (WebAuthn §6.1): `rpIdHash(32) || flags(1) ||
-/// signCount(4, BE) || [attestedCredentialData]`. Extension data (flags bit
-/// ED) is structurally detected and rejected with
-/// `error.ExtensionsNotSupported` — this module has no byte-accounting CBOR
-/// decoder to know where the (variable-length) credential public key ends
-/// and trailing extensions begin when both are present; see SPEC.md
-/// "Deferred". `allocator` is used only when `attestedCredentialData` is
-/// present (to decode its CBOR credential public key).
+/// signCount(4, BE) || [attestedCredentialData] || [extensions]`. The
+/// credential public key is a CBOR item with no length of its own, so it is
+/// decoded with `cbor.decodePrefix` to learn where it ends; the extensions
+/// (ED set) must then be exactly one CBOR map, returned raw in `extensions`.
+/// Anything after the last structure the flags announce is
+/// `error.TrailingData`. (Until 2026-09-30 an ED-set input was refused
+/// outright — `ExtensionsNotSupported` — so security keys returning
+/// `credProtect` or `hmac-secret` outputs could not register or sign in.)
+/// `allocator` holds the decoded credential key and transient CBOR trees.
 pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataError!AuthenticatorData {
     if (raw.len < 37) return error.Truncated;
     var rp_id_hash: [32]u8 = undefined;
@@ -346,6 +358,7 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
     const sign_count = std.mem.readInt(u32, raw[33..37], .big);
 
     var attested: ?AttestedCredentialData = null;
+    var rest: []const u8 = raw[37..];
     if (flags.attested_credential_data) {
         if (raw.len < 37 + 16 + 2) return error.Truncated;
         var aaguid: [16]u8 = undefined;
@@ -360,15 +373,24 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
         if (raw.len < cred_id_end) return error.Truncated;
         const credential_id = raw[cred_id_start..cred_id_end];
 
-        if (flags.extension_data) return error.ExtensionsNotSupported;
-        const pubkey_bytes = raw[cred_id_end..];
-
-        const decoded = try cbor.decode(allocator, pubkey_bytes, .{});
-        const key = try parseCredentialKey(decoded);
+        const decoded = try cbor.decodePrefix(allocator, raw[cred_id_end..], .{});
+        const key = try parseCredentialKey(decoded.value);
         attested = .{ .aaguid = aaguid, .credential_id = credential_id, .credential_public_key = key };
-    } else if (flags.extension_data) {
-        return error.ExtensionsNotSupported;
+        rest = raw[cred_id_end + decoded.len ..];
     }
+
+    var extensions: ?[]const u8 = null;
+    if (flags.extension_data) {
+        const ext = cbor.decode(allocator, rest, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidExtensions, // truncated, not one item, trailing bytes
+        };
+        defer cbor.freeValue(allocator, ext);
+        if (ext != .map) return error.InvalidExtensions;
+        extensions = rest;
+        rest = &.{};
+    }
+    if (rest.len != 0) return error.TrailingData;
 
     // WebAuthn L3 §6.1: BE=0 means the credential cannot be backed up, so
     // BS=1 alongside it is a contradiction the authenticator must not emit —
@@ -377,7 +399,7 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
     // as a policy choice; it was a skipped step.
     if (!flags.backup_eligible and flags.backup_state) return error.BackupStateInconsistent;
 
-    return .{ .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count, .attested_credential_data = attested };
+    return .{ .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count, .attested_credential_data = attested, .extensions = extensions };
 }
 
 // ── signature verification dispatch (ES256 / EdDSA / RS256) ────────────────
@@ -1195,8 +1217,9 @@ const auth_data_reject_seeds = [_][]const u8{
     seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16), // AT, an AAGUID, and nothing else
     seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\xff\xff"), // a credential-id length of 65535
     seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x04" ++ "\xaa\xbb\xcc\xdd"), // a 4-octet credential id and no COSE key
-    seed("\xCC" ** 32 ++ "\xc1\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x01\xaa\xa0"), // AT and ED together: the unsupported combination
-    seed("\x00" ** 300), // 300 zero octets
+    seed("\xCC" ** 32 ++ "\xc1\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x01\xaa\xa0"), // AT and ED, an empty map where the COSE key belongs
+    seed("\x00" ** 300), // 300 zero octets: no AT/ED flag, so 263 trailing octets (TrailingData since 2026-09-30)
+    seed("\xCC" ** 32 ++ "\x81\x00\x00\x00\x07" ++ "\xa1\x61x\x01"), // UP|ED and a one-entry extensions map {"x": 1}: accepted
 };
 
 /// The whole corpus: the shapes above plus a real registration

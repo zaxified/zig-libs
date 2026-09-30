@@ -1343,30 +1343,76 @@ test "authData: BE=0 with BS=1 is refused (re-audit F6 — §6.1 / §7.1 step 11
     }
 }
 
-test "authData: the extension-data rejection has teeth in both branches (re-audit F8)" {
-    // `error.ExtensionsNotSupported` is documented as "a structural, typed
-    // rejection, not a silent misparse" and as "proven by the adversarial
-    // test suite". Every §16 vector has ED=0, and no synthetic ED-set input
-    // existed anywhere, so both branches could be deleted with 55/55 green.
+test "authData: extension data (ED) is parsed, and malformed extensions have teeth (re-audit F8)" {
+    // Until 2026-09-30 ED was refused outright (`ExtensionsNotSupported`);
+    // re-audit F8 had found that refusal untested. It is now accepted — so
+    // the teeth are on the malformed cases instead: the extensions must be
+    // exactly one CBOR map, and nothing may follow it.
+    //
+    // External oracle: both inputs below were produced AND parsed back by
+    // Yubico's python-fido2 2.2.1 (`fido2.webauthn.AuthenticatorData.create`
+    // / `AuthenticatorData(bytes)`), a black box, on 2026-09-30:
+    //   registration: rpIdHash=SHA-256("example.org"), flags UP|UV|AT|ED
+    //     (0xc5), signCount 0, aaguid 00..0f, credential id c1 x16, an ES256
+    //     key, extensions {"credProtect": 2, "hmac-secret": True} — python-
+    //     fido2 reads back flags 0xc5 and exactly those extensions;
+    //   assertion: flags UP|ED (0x81), signCount 7, extensions
+    //     {"hmac-secret": h'00..1f'}.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+
+    var reg_buf: [fido2_reg_hex.len / 2]u8 = undefined;
+    const reg = try std.fmt.hexToBytes(&reg_buf, fido2_reg_hex);
+    const parsed = try webauthn.parseAuthenticatorData(a, reg);
+    try testing.expect(parsed.flags.extension_data and parsed.flags.attested_credential_data);
+    try testing.expectEqual(@as(u32, 0), parsed.sign_count);
+    try testing.expectEqualSlices(u8, &([_]u8{0xc1} ** 16), parsed.attested_credential_data.?.credential_id);
+    var ext_buf: [fido2_reg_ext_hex.len / 2]u8 = undefined;
+    try testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&ext_buf, fido2_reg_ext_hex), parsed.extensions.?);
+    // The raw map decodes to what python-fido2 read: credProtect = 2.
+    const ext = try cbor.decode(a, parsed.extensions.?, .{});
+    try testing.expectEqual(@as(usize, 2), ext.map.len);
+    try testing.expectEqualStrings("credProtect", ext.map[0].key.text);
+    try testing.expectEqual(@as(u64, 2), ext.map[0].value.uint);
+
+    var asr_buf: [fido2_asr_hex.len / 2]u8 = undefined;
+    const asr = try std.fmt.hexToBytes(&asr_buf, fido2_asr_hex);
+    const pa = try webauthn.parseAuthenticatorData(a, asr);
+    try testing.expectEqual(@as(u32, 7), pa.sign_count);
+    try testing.expect(pa.attested_credential_data == null);
+    try testing.expectEqual(@as(usize, asr.len - 37), pa.extensions.?.len);
+
+    // Teeth. ED set, nothing after: python-fido2 raises too.
+    try testing.expectError(error.InvalidExtensions, webauthn.parseAuthenticatorData(a, asr[0..37]));
+    // ED set, a byte after the map: python-fido2 raises "Wrong length".
+    const trailing = try std.mem.concat(a, u8, &.{ asr, &.{0x00} });
+    try testing.expectError(error.InvalidExtensions, webauthn.parseAuthenticatorData(a, trailing));
+    // ED set, a CBOR item that is not a map (python-fido2 accepts this one;
+    // §6.1 says "a CBOR map", so this module is stricter on purpose).
+    const not_map = try std.mem.concat(a, u8, &.{ asr[0..37], &.{0x01} });
+    try testing.expectError(error.InvalidExtensions, webauthn.parseAuthenticatorData(a, not_map));
+    // ED set on a registration whose extensions are cut short.
+    try testing.expectError(error.InvalidExtensions, webauthn.parseAuthenticatorData(a, reg[0 .. reg.len - 1]));
+    // ED clear but bytes after the key, or after signCount: TrailingData.
+    const reg_no_ed = try a.dupe(u8, reg);
+    reg_no_ed[32] &= ~@as(u8, 0x80);
+    try testing.expectError(error.TrailingData, webauthn.parseAuthenticatorData(a, reg_no_ed));
+    const bare_extra = try a.dupe(u8, asr);
+    bare_extra[32] &= ~@as(u8, 0x80);
+    try testing.expectError(error.TrailingData, webauthn.parseAuthenticatorData(a, bare_extra));
+
+    // And the §16 vector with ED forced on, now without anything after the
+    // key: not a silent accept — the missing map is caught.
     const v = vectors.none_es256;
     const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
-    // ED is bit 7 (0x80). With AT set (the attested-credential branch)...
     const with_at = try withFlags(a, auth_data, auth_data[32] | 0x80);
-    try testing.expectError(
-        error.ExtensionsNotSupported,
-        webauthn.parseAuthenticatorData(a, with_at),
-    );
-    // ...and with AT clear (the other branch), on a bare 37-byte authData.
-    const bare = try a.dupe(u8, auth_data[0..37]);
-    bare[32] = (bare[32] & ~@as(u8, 0x40)) | 0x80;
-    try testing.expectError(
-        error.ExtensionsNotSupported,
-        webauthn.parseAuthenticatorData(a, bare),
-    );
+    try testing.expectError(error.InvalidExtensions, webauthn.parseAuthenticatorData(a, with_at));
 }
+
+const fido2_reg_hex = "bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b5c500000000000102030405060708090a0b0c0d0e0f0010c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1a5010203262001215820471c3e758c4904285bba7e53118ed0f524adeb0757d25bd2f8e7b0d76dfa714c225820dd520f7aca8a8b917acc37f51de8f0c9bbe3ad858382e702dc25a12d09f7a858a26b6372656450726f74656374026b686d61632d736563726574f5";
+const fido2_reg_ext_hex = "a26b6372656450726f74656374026b686d61632d736563726574f5";
+const fido2_asr_hex = "bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b58100000007a16b686d61632d7365637265745820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
 test "authData: credentialIdLength is capped at 1023 (re-audit F13 — §6.5.2)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **New `decodePrefix(allocator, bytes, options) !Prefix`**: decode the one item at
+  the start of `bytes` and report how many bytes it took (`Prefix{ value, len }`), leaving the rest to
+  the caller — for data that puts a CBOR item with no length of its own in front of more data
+  (WebAuthn `authenticatorData`) and for reading an RFC 8949 §5.1 sequence item by item. `decode` is
+  unchanged (it is `decodePrefix` plus the trailing-bytes check).
+
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
   changed. `README.md` said the RFCs are public specifications and no NOTICE entry was
   needed — an answer about this module's CODE, applied to vectors it never mentioned.
