@@ -12,9 +12,10 @@ already implement its KDF. This module has **zero dependency** on
 `HandshakeState` methods (spec §5) run for real over the
 comptime-parameterized `Suite` — DH exchange, AEAD seal/open, and the
 HKDF/HMAC ratchet — and the handshake-pattern data (§7/§9 token sequences
-for `NN`/`NK`/`XX`/`IK`) is real as well. Exercised end-to-end by the
-sibling `bolt8` module, whose BOLT#8 appendix vectors are byte-exact over
-this framework. See `SPEC.md` for the verification detail.
+for `NN`/`NK`/`XX`/`IK`) is real as well. The sibling `bolt8` does NOT run on
+`HandshakeState`: the suite accepts only X25519 (`dhName` in `src/state.zig`),
+so `bolt8` drives its secp256k1 handshake with its own state
+(`bolt8/src/handshake.zig`). See `SPEC.md` for the verification detail.
 
 - **Model after:** Noise Protocol Framework rev 34 (noiseprotocol.org);
   design ref cacophony (Haskell) / noise-c / snow (Rust) — shape only, no

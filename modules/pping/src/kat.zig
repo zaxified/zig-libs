@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! kat — known-answer scenarios for `Estimator.observe`, i.e. for the
-//! whole pping pipeline including the Fable-stub core (`match.matchEcho`).
+//! whole pping pipeline including the matching core (`match.matchEcho`).
 //! Every test here drives `Estimator` through a hand-built sequence of
 //! `Observation`s with a KNOWN expected sequence of `RttSample`s, including
 //! the adversarial cases the module doc / `match.matchEcho`'s doc contract
@@ -10,12 +10,10 @@
 //! and one clean single RTT.
 //!
 //! Every test in this file calls `Estimator.observe`, which calls into
-//! `match.matchEcho` — the Fable stub. Each test therefore starts with a
-//! gate check (`if (!root.fable_core_implemented) return error.SkipZigTest;`)
-//! so `zig build test-pping` reports these as SKIP, not PASS, until a Fable
-//! pass fills in `matchEcho` (see `gate.zig`). The scenarios themselves are
-//! written and reviewable NOW — only the assertions against the real
-//! algorithm's output wait on the core.
+//! `match.matchEcho`. Each test starts with a gate check
+//! (`if (!root.fable_core_implemented) return error.SkipZigTest;`) left from
+//! the time the core was a stub; the gate is on (`gate.zig`), so every
+//! scenario runs and asserts against the implemented algorithm.
 
 const std = @import("std");
 const root = @import("root.zig");
