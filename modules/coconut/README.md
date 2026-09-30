@@ -97,5 +97,9 @@ publication, not a copyrightable implementation) — no third-party source porte
 or studied as a design reference, so no `NOTICE` entry (CONVENTIONS §5, same as
 `bbs`/`frost`/`dkg`). The reference implementations `asonnino/coconut` (Python)
 and `nymtech/coconut` (Rust/Go) were consulted only black-box, to confirm no
-public byte-exact test vectors exist (see `SPEC.md` §3). Adds nothing to
+public byte-exact test vectors exist (see `SPEC.md` §3). The committed test
+vectors in `src/interop_vectors.zig` were observed from a third-party library
+run as a black-box oracle: docknetwork/crypto's `coconut-crypto` 0.14.0
+(Apache-2.0), driven by our own tooling (`tools/vectors/`); they are values it
+computed from seeded inputs, no source of it was copied. Adds nothing to
 `bls12_381`'s field/group/pairing math.

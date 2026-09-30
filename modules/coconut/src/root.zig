@@ -133,6 +133,7 @@ test {
     _ = keys;
     _ = credential;
     _ = @import("harness_test.zig");
+    _ = @import("interop_test.zig");
 }
 
 test "meta.model_after names Coconut" {
