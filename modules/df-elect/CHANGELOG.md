@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — ⚠ **Breaking: N-member segments, RFC DF algorithms and
+  failover.** `EdgeSegment` is now `{ id, esi, members: []Member{node, addr},
+  tags }` (members sorted by address, `validate`); the DF is per
+  `<segment, Ethernet tag>`: RFC 7432 §8.5 mod N (`moduloDf`), RFC 8584 §3.2
+  HRW (`hrwDf`, `hrwWeight`) or preference-based (`preferenceDf`,
+  `Member.pref`, what FRRouting runs), selected by `ElectConfig.algorithm`. Roles fail
+  over: `stepRole` gives a role up at once and takes one after `df_wait`
+  (default 150; `DfElect.init` refuses `df_wait <= hello_period`). `Hello`
+  gains `view` and `BumFrame` gains `tag`; both are 17 octets. A member is
+  named DF only when its own view and every live peer's advertised view name
+  it — the fuzzer found a one-way link cut (`link_down` is directional) that
+  duplicated without it. The old static single-owner election (zero duplicates,
+  no failover) is gone, and with it `decide`/`SegmentView`/`Decision`/
+  `maxBadDfWindow`/`worstBadDfWindow`: split-horizon stays zero-tolerance,
+  duplicates are now allowed only within `maxDuplicateWindow` after a heal
+  (`firstUnexplainedDuplicate`), and zero-DF is bounded by `maxZeroDfWindow`
+  from the last disruption (`worstZeroDfWindow`). Fuzz sweep over both
+  algorithms: worst duplicate 50 ticks after a heal (bound 100), worst zero-DF
+  377 (bound 420). New REDERIVED vectors from `tools/rederive.py` and an
+  EXTERNAL check of the preference choice against 12 phases observed from
+  FRRouting 10.7.1 in rootless podman (`tools/frr/`); oracle n/a (class D) ->
+  MIXED (class B), scope poc -> mvp; a failing
+  sweep now prints its fault schedule. Scenario topology: a 3-member and a
+  2-member segment sharing two tags.
+
 - **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
   (F6): `BrokenAlwaysDf` fires from its own BUM-flooding traffic alone,
   with no injected fault (the "positive control" test already proves it

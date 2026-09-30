@@ -26,52 +26,98 @@ const NodeId = netsim.NodeId;
 
 pub const SegmentId = u32;
 
-/// A customer site dual-homed to exactly two edge nodes. `priority[i]` is a
-/// static, link-state-derived tie-break input to election for `nodes[i]`
-/// (lower value wins ties; mirrors an EVPN Ethernet Segment's per-PE ordinal,
-/// RFC 7432 §8.5) — carried explicitly here rather than derived from `NodeId`
-/// so the election function in `election.zig` never needs a second source of
-/// truth for "who wins a tie".
+/// An Ethernet tag (a VLAN, or the lowest VLAN of a bundle — RFC 7432 §8.5).
+/// DF election is per `<segment, tag>`.
+pub const Tag = u32;
+
+/// One member of an edge segment: the fabric node and the address the DF
+/// algorithms order and hash by (RFC 7432 §8.5's "Originating Router's IP
+/// address", an IPv4 address as a host-order `u32`).
+pub const Member = struct {
+    node: NodeId,
+    addr: u32,
+    /// DF preference for `Algorithm.preference` (RFC 8584 registry type 2,
+    /// "preference-based"; FRRouting's `es-df-pref`). Higher wins. The
+    /// default is FRR's (and the preference-based draft's) 32767.
+    pref: u16 = 32767,
+};
+
+/// Upper bound on members per segment. The election works on stack buffers of
+/// this size; a real Ethernet segment is multihomed to a handful of PEs.
+pub const max_members = 16;
+
+/// A customer site multihomed to N edge nodes (an EVPN Ethernet Segment).
+/// `members` must be sorted by strictly ascending `addr` with distinct nodes —
+/// the ordinal list RFC 7432 §8.5 step 3 builds — and at most `max_members`
+/// long; `validate` checks both.
 pub const EdgeSegment = struct {
     id: SegmentId,
-    nodes: [2]NodeId,
-    priority: [2]u32,
+    /// The 10-octet ESI; only HRW (RFC 8584 §3.2) hashes it.
+    esi: [10]u8,
+    members: []const Member,
+    /// The Ethernet tags configured on this segment.
+    tags: []const Tag,
 
-    /// Is `node` one of this segment's two members, and if so which slot?
-    pub fn indexOf(self: EdgeSegment, node: NodeId) ?u1 {
-        if (self.nodes[0] == node) return 0;
-        if (self.nodes[1] == node) return 1;
+    pub const Error = error{ TooManyMembers, NoMembers, MembersNotSorted, DuplicateNode };
+
+    pub fn validate(self: EdgeSegment) Error!void {
+        if (self.members.len == 0) return error.NoMembers;
+        if (self.members.len > max_members) return error.TooManyMembers;
+        for (self.members[1..], 1..) |m, i| {
+            if (m.addr <= self.members[i - 1].addr) return error.MembersNotSorted;
+        }
+        for (self.members, 0..) |m, i| {
+            for (self.members[i + 1 ..]) |o| if (o.node == m.node) return error.DuplicateNode;
+        }
+    }
+
+    /// Is `node` one of this segment's members, and if so at which ordinal?
+    pub fn indexOf(self: EdgeSegment, node: NodeId) ?usize {
+        for (self.members, 0..) |m, i| if (m.node == node) return i;
         return null;
     }
 
-    /// The OTHER member of this segment (undefined if `node` is not a
-    /// member — callers only call this after `indexOf` succeeded).
-    pub fn otherOf(self: EdgeSegment, node: NodeId) NodeId {
-        return if (self.nodes[0] == node) self.nodes[1] else self.nodes[0];
-    }
-
-    /// `node`'s own election priority, or `null` if it is not a member.
-    pub fn priorityOf(self: EdgeSegment, node: NodeId) ?u32 {
-        if (self.indexOf(node)) |i| return self.priority[i];
+    /// Position of `tag` in `tags`, or `null` if the segment does not carry it.
+    pub fn tagIndex(self: EdgeSegment, tag: Tag) ?usize {
+        for (self.tags, 0..) |t, i| if (t == tag) return i;
         return null;
     }
 };
 
+/// Which RFC function maps a candidate list and a tag to a DF.
+pub const Algorithm = enum {
+    /// RFC 7432 §8.5 "service carving": ordinal `tag mod N` over the list
+    /// sorted by address.
+    modulo,
+    /// RFC 8584 §3.2 Highest Random Weight over `(tag, ESI, address)`.
+    hrw,
+    /// Preference-based (DF Alg 2 in the RFC 8584 registry): the highest
+    /// `Member.pref` is DF for every tag of the segment, ties to the least
+    /// address. What FRRouting's EVPN multihoming runs; the rule is taken
+    /// from FRR's observed behaviour (`tools/frr/`), the preference-based
+    /// draft itself was not read.
+    preference,
+};
+
 pub const ElectConfig = struct {
-    /// How often an edge node re-floods a Hello for each segment it belongs to.
+    /// How often an edge node re-floods a Hello for its segment, and
+    /// re-evaluates its DF roles.
     hello_period: netsim.Time = 50,
-    /// A peer is presumed unreachable once this many ticks pass without a
-    /// fresh Hello from it. Must be a small multiple of `hello_period` (a
-    /// single dropped Hello must not flip liveness — the classic hold-timer
-    /// shape shared by IS-IS/OSPF/BGP).
+    /// A member is presumed gone once this many ticks pass without a fresh
+    /// Hello from it. A small multiple of `hello_period`, so a single dropped
+    /// Hello does not flip liveness (the hold-timer shape of IS-IS/OSPF/BGP).
     stale_after: netsim.Time = 170,
-    /// How often a BUM frame is originated (network-side AND per-segment
-    /// CE-side), for the scenario/property tests. Not itself part of the
-    /// election's own duty — a real deployment's BUM rate is data-plane
-    /// driven, not timer driven; this is purely a test-traffic generator.
-    /// Kept low enough relative to the sim's `until` that the per-origin
-    /// sequence number never reaches `bum_seen`'s 64-bit dedup window (see
-    /// that field's doc in `protocol.zig`).
+    /// RFC 7432 §8.5 step 2 / RFC 8584 §2.1 DF_Wait: a member takes a DF role
+    /// only after its own view has named it DF continuously for this long.
+    /// Giving a role up is immediate. Must exceed `hello_period` plus the
+    /// fabric's flood delay: that is what keeps a member whose view is still
+    /// empty (startup, restart) from taking roles before the Hellos arrive.
+    df_wait: netsim.Time = 150,
+    algorithm: Algorithm = .modulo,
+    /// How often a BUM frame is originated (network-side and per-segment
+    /// CE-side), for the scenario/property tests only; kept low enough that
+    /// the per-origin sequence number stays inside `bum_seen`'s 64-bit dedup
+    /// window (see that field in `protocol.zig`).
     bum_period: netsim.Time = 40,
 };
 
@@ -108,14 +154,20 @@ pub const Hello = struct {
     origin: NodeId,
     seq: u32,
     segment: SegmentId,
+    /// The members `origin` currently sees on `segment`, itself included:
+    /// bit i = `EdgeSegment.members[i]`. Receivers use it to notice that a
+    /// peer does NOT see them (a one-way failure) and yield — see
+    /// `protocol.DfElect.refreshRoles`.
+    view: u32,
 
-    pub const wire_len = 13;
+    pub const wire_len = 17;
 
     pub fn encode(self: Hello, buf: *[wire_len]u8) void {
         buf[0] = @intFromEnum(MsgTag.hello);
         std.mem.writeInt(u32, buf[1..5], self.origin, .little);
         std.mem.writeInt(u32, buf[5..9], self.seq, .little);
         std.mem.writeInt(u32, buf[9..13], self.segment, .little);
+        std.mem.writeInt(u32, buf[13..17], self.view, .little);
     }
 
     pub fn decode(payload: []const u8) DecodeError!Hello {
@@ -132,6 +184,7 @@ pub const Hello = struct {
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
             .segment = std.mem.readInt(u32, payload[9..13], .little),
+            .view = std.mem.readInt(u32, payload[13..17], .little),
         };
     }
 };
@@ -149,14 +202,18 @@ pub const BumFrame = struct {
     origin: NodeId,
     seq: u32,
     ingress_segment: SegmentId,
+    /// The frame's Ethernet tag: only a segment carrying it can receive the
+    /// frame, and only the DF for `<segment, tag>` delivers it.
+    tag: Tag,
 
-    pub const wire_len = 13;
+    pub const wire_len = 17;
 
     pub fn encode(self: BumFrame, buf: *[wire_len]u8) void {
         buf[0] = @intFromEnum(MsgTag.bum);
         std.mem.writeInt(u32, buf[1..5], self.origin, .little);
         std.mem.writeInt(u32, buf[5..9], self.seq, .little);
         std.mem.writeInt(u32, buf[9..13], self.ingress_segment, .little);
+        std.mem.writeInt(u32, buf[13..17], self.tag, .little);
     }
 
     pub fn decode(payload: []const u8) DecodeError!BumFrame {
@@ -166,6 +223,7 @@ pub const BumFrame = struct {
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
             .ingress_segment = std.mem.readInt(u32, payload[9..13], .little),
+            .tag = std.mem.readInt(u32, payload[13..17], .little),
         };
     }
 
@@ -181,27 +239,29 @@ const testing = std.testing;
 
 test "Hello round-trips through its wire encoding" {
     var buf: [Hello.wire_len]u8 = undefined;
-    const h = Hello{ .origin = 7, .seq = 900, .segment = 3 };
+    const h = Hello{ .origin = 7, .seq = 900, .segment = 3, .view = 0b101 };
     h.encode(&buf);
     try testing.expectEqual(MsgTag.hello, try tagOf(&buf));
     const h2 = try Hello.decode(&buf);
     try testing.expectEqual(h.origin, h2.origin);
     try testing.expectEqual(h.seq, h2.seq);
     try testing.expectEqual(h.segment, h2.segment);
+    try testing.expectEqual(h.view, h2.view);
 }
 
 test "BumFrame round-trips through its wire encoding, including the ingress tag" {
     var buf: [BumFrame.wire_len]u8 = undefined;
-    const f = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = no_ingress };
+    const f = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = no_ingress, .tag = 4094 };
     f.encode(&buf);
     try testing.expectEqual(MsgTag.bum, try tagOf(&buf));
     const f2 = try BumFrame.decode(&buf);
     try testing.expectEqual(f.origin, f2.origin);
     try testing.expectEqual(f.seq, f2.seq);
     try testing.expectEqual(f.ingress_segment, f2.ingress_segment);
+    try testing.expectEqual(f.tag, f2.tag);
     try testing.expectEqual(@as(u64, (2 << 32) | 55), f.id());
 
-    const g = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = 9 };
+    const g = BumFrame{ .origin = 2, .seq = 55, .ingress_segment = 9, .tag = 10 };
     var buf2: [BumFrame.wire_len]u8 = undefined;
     g.encode(&buf2);
     const g2 = try BumFrame.decode(&buf2);
@@ -212,16 +272,23 @@ test "BumFrame round-trips through its wire encoding, including the ingress tag"
     try testing.expectEqual(f.id(), g.id());
 }
 
-test "EdgeSegment.indexOf / otherOf / priorityOf" {
-    const seg = EdgeSegment{ .id = 1, .nodes = .{ 4, 9 }, .priority = .{ 10, 20 } };
-    try testing.expectEqual(@as(?u1, 0), seg.indexOf(4));
-    try testing.expectEqual(@as(?u1, 1), seg.indexOf(9));
-    try testing.expectEqual(@as(?u1, null), seg.indexOf(5));
-    try testing.expectEqual(@as(NodeId, 9), seg.otherOf(4));
-    try testing.expectEqual(@as(NodeId, 4), seg.otherOf(9));
-    try testing.expectEqual(@as(?u32, 10), seg.priorityOf(4));
-    try testing.expectEqual(@as(?u32, 20), seg.priorityOf(9));
-    try testing.expectEqual(@as(?u32, null), seg.priorityOf(5));
+test "EdgeSegment: indexOf, tagIndex and validate" {
+    const members = [_]Member{ .{ .node = 4, .addr = 0x0a000001 }, .{ .node = 9, .addr = 0x0a000002 }, .{ .node = 2, .addr = 0x0a000003 } };
+    const seg = EdgeSegment{ .id = 1, .esi = @splat(0), .members = &members, .tags = &.{ 10, 20 } };
+    try seg.validate();
+    try testing.expectEqual(@as(?usize, 0), seg.indexOf(4));
+    try testing.expectEqual(@as(?usize, 2), seg.indexOf(2));
+    try testing.expectEqual(@as(?usize, null), seg.indexOf(5));
+    try testing.expectEqual(@as(?usize, 1), seg.tagIndex(20));
+    try testing.expectEqual(@as(?usize, null), seg.tagIndex(30));
+
+    const unsorted = [_]Member{ .{ .node = 4, .addr = 2 }, .{ .node = 9, .addr = 1 } };
+    try testing.expectError(error.MembersNotSorted, (EdgeSegment{ .id = 1, .esi = @splat(0), .members = &unsorted, .tags = &.{} }).validate());
+    const equal_addr = [_]Member{ .{ .node = 4, .addr = 1 }, .{ .node = 9, .addr = 1 } };
+    try testing.expectError(error.MembersNotSorted, (EdgeSegment{ .id = 1, .esi = @splat(0), .members = &equal_addr, .tags = &.{} }).validate());
+    const dup = [_]Member{ .{ .node = 4, .addr = 1 }, .{ .node = 4, .addr = 2 } };
+    try testing.expectError(error.DuplicateNode, (EdgeSegment{ .id = 1, .esi = @splat(0), .members = &dup, .tags = &.{} }).validate());
+    try testing.expectError(error.NoMembers, (EdgeSegment{ .id = 1, .esi = @splat(0), .members = &.{}, .tags = &.{} }).validate());
 }
 
 // ── rejection tests: both decoders fail closed ──────────────────────────────
@@ -231,10 +298,12 @@ test "tagOf and the frame decoders reject short and undefined input" {
     // The exact reproducer from the bug report.
     try testing.expectError(error.Truncated, Hello.decode(&[_]u8{0}));
     try testing.expectError(error.Truncated, BumFrame.decode(&[_]u8{1}));
+    // A BUM frame in the pre-2026-09-30 13-octet layout (no tag) is short.
+    try testing.expectError(error.Truncated, BumFrame.decode(&([_]u8{1} ++ [_]u8{0} ** 12)));
 
     // Every prefix of a valid frame is rejected; the full frame still decodes.
     var buf: [Hello.wire_len]u8 = undefined;
-    (Hello{ .origin = 1, .seq = 1, .segment = 1 }).encode(&buf);
+    (Hello{ .origin = 1, .seq = 1, .segment = 1, .view = 1 }).encode(&buf);
     for (0..buf.len) |n| try testing.expectError(error.Truncated, Hello.decode(buf[0..n]));
     _ = try Hello.decode(&buf);
 
@@ -270,8 +339,8 @@ const tag_seeds = [_][]const u8{
     seedHex("01"), // MsgTag.bum
     seedHex("02"), // the first undefined tag: the "invalid enum value" panic this decoder exists to prevent
     seedHex("ff"), // the top of the byte range
-    seedHex("000700000001000000030000"), // a Hello frame: what a dispatch site actually passes
-    seedHex("010700000001000000ffffffff"), // a BUM frame with the `no_ingress` sentinel
+    seedHex("0007000000010000000300000001000000"), // a Hello frame: what a dispatch site actually passes
+    seedHex("010700000001000000ffffffff0a000000"), // a BUM frame with the `no_ingress` sentinel
     seedHex(""), // zero length → Truncated; the ONLY input this target ran before today
 };
 
@@ -317,17 +386,18 @@ test "corpus: every tag seed reaches tagOf, and the tags resolved are pinned" {
 }
 
 /// Whole frames, in the format the length draw reads. The buffer is
-/// `Hello.wire_len * 2` = 26 octets and the longest seed here is 26, which is
+/// `Hello.wire_len * 2` = 34 octets and the longest seed here is 34, which is
 /// the point: a seed longer than the buffer is not a large seed, it is the
 /// EMPTY one.
 const frame_seeds = [_][]const u8{
-    seedHex("000700000001000000030000"), // Hello, one octet short of `wire_len` → Truncated
-    seedHex("00070000000100000003000000"), // Hello{ origin = 7, seq = 1, segment = 3 }
-    seedHex("010700000001000000ffffffff"), // BumFrame{ origin = 7, seq = 1, ingress = no_ingress }
-    seedHex("01070000000100000003000000"), // BumFrame with a real segment id
-    seedHex("00ffffffffffffffffffffffff"), // Hello with every field saturated
-    seedHex("0007000000010000000300000001070000000200000003000000"), // two frames back to back: 26 octets, the buffer exactly
-    seedHex("7f070000000100000003000000"), // a tag that is neither: both decoders must refuse
+    seedHex("00070000000100000003000000010000"), // Hello, one octet short of `wire_len` → Truncated
+    seedHex("0007000000010000000300000005000000"), // Hello{ origin = 7, seq = 1, segment = 3, view = 0b101 }
+    seedHex("010700000001000000ffffffff0a000000"), // BumFrame{ origin = 7, seq = 1, ingress = no_ingress, tag = 10 }
+    seedHex("010700000001000000030000000b000000"), // BumFrame with a real segment id, tag = 11
+    seedHex("010700000001000000ffffffff"), // a BUM frame in the old 13-octet layout, no tag → Truncated
+    seedHex("00ffffffffffffffffffffffffffffffff"), // Hello with every field saturated
+    seedHex("00070000000100000003000000010000000007000000020000000300000001000000"), // two Hellos back to back: 34 octets, the buffer exactly
+    seedHex("7f0700000001000000030000000a000000"), // a tag that is neither: both decoders must refuse
     seedHex("00"), // a lone tag octet
     seedHex(""), // zero length; the collapsed harness's only input
 };
@@ -368,6 +438,7 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
         } else |_| {}
     }
     // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 decoded, id sum 0.
+    // Seeds re-cut 2026-09-30 for the 17-octet Hello and BumFrame; same counts.
     try testing.expectEqual(frame_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 3), hellos);
     try testing.expectEqual(@as(usize, 2), bums);
@@ -375,14 +446,14 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
 }
 
 test "decode refuses the sibling message: identical layouts must not cross-decode" {
-    // Hello and BumFrame are both 13 bytes with a u32 triple, so the tag byte
-    // is the ONLY thing separating them. Decoding one as the other used to
-    // succeed and silently reinterpret the third field — `no_ingress`
+    // Hello and BumFrame are both 17 octets with a u32 quadruple, so the tag
+    // byte is the ONLY thing separating them. Decoding one as the other used
+    // to succeed and silently reinterpret the third field — `no_ingress`
     // (0xFFFFFFFF) arriving as a segment id.
     var hello_buf: [Hello.wire_len]u8 = undefined;
-    (Hello{ .origin = 7, .seq = 1, .segment = 3 }).encode(&hello_buf);
+    (Hello{ .origin = 7, .seq = 1, .segment = 3, .view = 1 }).encode(&hello_buf);
     var bum_buf: [BumFrame.wire_len]u8 = undefined;
-    (BumFrame{ .origin = 7, .seq = 1, .ingress_segment = no_ingress }).encode(&bum_buf);
+    (BumFrame{ .origin = 7, .seq = 1, .ingress_segment = no_ingress, .tag = 10 }).encode(&bum_buf);
 
     try testing.expectError(error.InvalidEncoding, BumFrame.decode(&hello_buf));
     try testing.expectError(error.InvalidEncoding, Hello.decode(&bum_buf));

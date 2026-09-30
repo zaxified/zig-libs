@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! What an edge node on a dual-homed customer segment does with `df-elect`:
-//! decode an inbound Hello off the fabric, decide whether this node is the
-//! Designated Forwarder for its segment, and gate a BUM frame with the
-//! split-horizon rule before forwarding it.
+//! What an edge node on a multihomed customer segment does with `df-elect`:
+//! decode a peer's Hello off the fabric, work out which member is the
+//! Designated Forwarder for each Ethernet tag (RFC 7432 mod N and RFC 8584
+//! HRW), take a role only after the DF wait, fail over when a peer
+//! disappears, and gate a BUM frame with split-horizon before delivering it.
 //!
 //! This is an example in the gate sense — it is built by
 //! `zig build check-examples` against the PUBLISHED module (`deps` only, no
@@ -24,67 +25,78 @@ fn must(ok: bool, src: std.builtin.SourceLocation) void {
     if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
 }
 
-/// The segment this node (id 3) shares with its peer (id 4). Lower priority
-/// wins the DF election — node 3 is the owner here.
+/// A site multihomed to three edge nodes (the PE addresses order them).
+const members = [_]df_elect.Member{
+    .{ .node = 3, .addr = 0x0a00_0003 },
+    .{ .node = 4, .addr = 0x0a00_0004 },
+    .{ .node = 5, .addr = 0x0a00_0005 },
+};
 const segment: df_elect.EdgeSegment = .{
     .id = 1,
-    .nodes = .{ 3, 4 },
-    .priority = .{ 10, 20 },
+    .esi = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x01 },
+    .members = &members,
+    .tags = &.{ 10, 11, 12 },
 };
 
 pub fn main() !void {
-    // A Hello just arrived off the wire from the peer, claiming liveness on
-    // this segment. Decode it the way a real dispatch loop would.
-    var hello_buf: [df_elect.Hello.wire_len]u8 = undefined;
-    (df_elect.Hello{ .origin = 4, .seq = 900, .segment = segment.id }).encode(&hello_buf);
+    try segment.validate();
+    const cfg: df_elect.ElectConfig = .{};
 
+    // A Hello arrives from node 4: it is alive and sees all three members.
+    var hello_buf: [df_elect.Hello.wire_len]u8 = undefined;
+    (df_elect.Hello{ .origin = 4, .seq = 900, .segment = segment.id, .view = 0b111 }).encode(&hello_buf);
     const hello = df_elect.Hello.decode(&hello_buf) catch |err| switch (err) {
         error.Truncated, error.InvalidEncoding => {
             std.debug.print("malformed Hello, dropping\n", .{});
             return;
         },
     };
-    std.debug.print("Hello from node {d}, seq {d}, segment {d}\n", .{ hello.origin, hello.seq, hello.segment });
+    std.debug.print("Hello from node {d}, seq {d}, view 0b{b:0>3}\n", .{ hello.origin, hello.seq, hello.view });
 
-    // Build this node's view of the segment from what it knows (its own
-    // priority from the static topology, the peer's liveness from the Hello
-    // just decoded) and ask for a DF decision.
-    const self_id = segment.nodes[0];
-    const peer_id = segment.otherOf(self_id);
-    const view: df_elect.SegmentView = .{
-        .self_id = self_id,
-        .self_priority = segment.priorityOf(self_id).?,
-        .peer_id = peer_id,
-        .peer_priority = segment.priorityOf(peer_id).?,
-        .peer_alive = true, // a fresh Hello was just seen
-    };
+    // Service carving over the full member list: tag V goes to ordinal
+    // V mod 3 (RFC 7432 §8.5); HRW spreads the same tags by hash.
+    for (segment.tags) |tag| {
+        const by_mod = df_elect.designatedForwarder(.modulo, segment.esi, &members, tag).?;
+        const by_hrw = df_elect.designatedForwarder(.hrw, segment.esi, &members, tag).?;
+        std.debug.print("tag {d}: DF by mod-N = node {d}, by HRW = node {d}\n", .{ tag, by_mod, by_hrw });
+    }
+    must(df_elect.designatedForwarder(.modulo, segment.esi, &members, 10).? == 4, @src()); // 10 mod 3 = 1
 
-    // No concrete frame in flight yet — this is the standing DF status.
-    const standing = df_elect.decide(view, null, segment.id);
-    std.debug.print("node {d} is_df={}\n", .{ self_id, standing.is_df });
+    // This node is 4, the mod-N DF for tag 10. It takes the role only after
+    // its view has named it for `df_wait` ticks.
+    var role: df_elect.Role = .{};
+    role = df_elect.stepRole(role, true, 1000, cfg.df_wait);
+    must(!role.is_df, @src());
+    role = df_elect.stepRole(role, true, 1000 + cfg.df_wait, cfg.df_wait);
+    must(role.is_df, @src());
+    std.debug.print("node 4 holds tag 10 after the {d}-tick DF wait\n", .{cfg.df_wait});
 
-    // A BUM frame arrives from the network side (no ingress segment) and
-    // must be gated by split-horizon before this node forwards it toward
-    // its own segment.
+    // Node 5 goes silent past `stale_after`: the survivors re-carve. Tag 11
+    // was node 5's (11 mod 3 = 2); over {3, 4} it becomes 11 mod 2 = 1.
+    const survivors = members[0..2];
+    const new_df = df_elect.designatedForwarder(.modulo, segment.esi, survivors, 11).?;
+    std.debug.print("node 5 gone: tag 11 fails over to node {d}\n", .{new_df});
+    must(new_df == 4, @src());
+
+    // A network-side BUM frame on tag 10 may be delivered by the DF; a frame
+    // that ingressed from this very segment must never be reflected back.
     var wan_buf: [df_elect.BumFrame.wire_len]u8 = undefined;
-    (df_elect.BumFrame{ .origin = 99, .seq = 1, .ingress_segment = df_elect.no_ingress }).encode(&wan_buf);
-    const wan_frame = try df_elect.BumFrame.decode(&wan_buf);
-    const wan_decision = df_elect.decide(view, wan_frame.ingress_segment, segment.id);
-    std.debug.print("WAN-side frame: is_df={} allow_forward={}\n", .{ standing.is_df, wan_decision.allow_forward });
+    (df_elect.BumFrame{ .origin = 99, .seq = 1, .ingress_segment = df_elect.no_ingress, .tag = 10 }).encode(&wan_buf);
+    const wan = try df_elect.BumFrame.decode(&wan_buf);
+    const deliver_wan = role.is_df and df_elect.allowForward(wan.ingress_segment, segment.id);
+    std.debug.print("WAN-side frame on tag {d}: deliver={}\n", .{ wan.tag, deliver_wan });
+    must(deliver_wan, @src());
 
-    // A BUM frame that ingressed from THIS segment's own CE side must never
-    // be reflected back onto it, independent of DF status — the
-    // split-horizon backstop.
     var ce_buf: [df_elect.BumFrame.wire_len]u8 = undefined;
-    (df_elect.BumFrame{ .origin = peer_id, .seq = 2, .ingress_segment = segment.id }).encode(&ce_buf);
-    const ce_frame = try df_elect.BumFrame.decode(&ce_buf);
-    const ce_decision = df_elect.decide(view, ce_frame.ingress_segment, segment.id);
-    std.debug.print("same-segment frame: allow_forward={} (must be false)\n", .{ce_decision.allow_forward});
-    must(!ce_decision.allow_forward, @src());
+    (df_elect.BumFrame{ .origin = 3, .seq = 2, .ingress_segment = segment.id, .tag = 10 }).encode(&ce_buf);
+    const ce = try df_elect.BumFrame.decode(&ce_buf);
+    const deliver_ce = role.is_df and df_elect.allowForward(ce.ingress_segment, segment.id);
+    std.debug.print("same-segment frame: deliver={} (must be false)\n", .{deliver_ce});
+    must(!deliver_ce, @src());
 
-    // A truncated frame off the wire must be rejected by name, not panic.
+    // A truncated frame off the wire is rejected by name, not a panic.
     if (df_elect.Hello.decode(hello_buf[0..3])) |_| {
-        unreachable;
+        must(false, @src());
     } else |err| switch (err) {
         error.Truncated => std.debug.print("truncated Hello correctly rejected\n", .{}),
         error.InvalidEncoding => return err,

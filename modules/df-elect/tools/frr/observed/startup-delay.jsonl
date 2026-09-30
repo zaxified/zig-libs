@@ -1,0 +1,40 @@
+{"scenario":"startup-delay","t_ms":14.2,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"startup-delay","t_ms":23.6,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"startup-delay","t_ms":162.1,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"startup-delay","t_ms":257.8,"kind":"note","event":"prefs 100 100 100"}
+{"scenario":"startup-delay","t_ms":2297.8,"kind":"action","event":"pe_restart 10.0.0.3 (default startup-delay)"}
+{"scenario":"startup-delay","t_ms":2351.6,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100}}
+{"scenario":"startup-delay","t_ms":2436.4,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100}}
+{"scenario":"startup-delay","t_ms":2871.1,"pe":"10.0.0.3","es":null,"df":false,"df_pref":null,"flags":[],"peers":{}}
+{"scenario":"startup-delay","t_ms":2986.6,"kind":"note","event":"zebra: {}"}
+{"scenario":"startup-delay","t_ms":3103.4,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nonDF","operUp","readyForBgp"],"peers":{}}
+{"scenario":"startup-delay","t_ms":4058.1,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"startup-delay","t_ms":5188.5,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"startup-delay","t_ms":5199.3,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"startup-delay","t_ms":13220.1,"kind":"note","event":"t+10s: startupDelayTimer=00:02:49 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":23491.7,"kind":"note","event":"t+20s: startupDelayTimer=00:02:39 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":33770.8,"kind":"note","event":"t+30s: startupDelayTimer=00:02:29 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":44004.1,"kind":"note","event":"t+40s: startupDelayTimer=00:02:18 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":54273.4,"kind":"note","event":"t+50s: startupDelayTimer=00:02:08 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":64527.2,"kind":"note","event":"t+60s: startupDelayTimer=00:01:58 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":74810.5,"kind":"note","event":"t+70s: startupDelayTimer=00:01:48 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":85081.4,"kind":"note","event":"t+80s: startupDelayTimer=00:01:37 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":95315.0,"kind":"note","event":"t+90s: startupDelayTimer=00:01:27 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":105534.0,"kind":"note","event":"t+100s: startupDelayTimer=00:01:17 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":115837.3,"kind":"note","event":"t+110s: startupDelayTimer=00:01:07 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":126107.4,"kind":"note","event":"t+120s: startupDelayTimer=00:00:56 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":136451.8,"kind":"note","event":"t+130s: startupDelayTimer=00:00:46 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":146717.6,"kind":"note","event":"t+140s: startupDelayTimer=00:00:36 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":156945.3,"kind":"note","event":"t+150s: startupDelayTimer=00:00:25 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":167200.3,"kind":"note","event":"t+160s: startupDelayTimer=00:00:15 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":177435.4,"kind":"note","event":"t+170s: startupDelayTimer=00:00:05 uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":187671.1,"kind":"note","event":"t+180s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":198013.2,"kind":"note","event":"t+190s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":208417.9,"kind":"note","event":"t+200s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":218675.1,"kind":"note","event":"t+210s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":228956.2,"kind":"note","event":"t+220s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":239181.3,"kind":"note","event":"t+230s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":249414.9,"kind":"note","event":"t+240s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":259641.7,"kind":"note","event":"t+250s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":269869.4,"kind":"note","event":"t+260s: startupDelayTimer=--:--:-- uplinkActive=0 es=no"}
+{"scenario":"startup-delay","t_ms":2297.8,"summary":"no_df_change","after":"pe_restart 10.0.0.3 (default startup-delay)","df":["10.0.0.1"]}

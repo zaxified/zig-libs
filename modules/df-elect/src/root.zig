@@ -1,24 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! df-elect — Designated-Forwarder election + split-horizon, partition-correct.
+//! df-elect — Designated-Forwarder election with failover + split-horizon for
+//! an N-member multihomed edge segment, derived from a link-state Hello flood.
 //!
-//! Built for an encrypted L2VPN fabric over WireGuard: a
-//! customer site dual-homed to two edge nodes forms an edge segment; exactly one node
-//! must be the Designated Forwarder for BUM traffic toward the site, deterministically
-//! from link-state, and — the hard part — correct under arbitrary network partition
-//! (never two DFs beyond a bounded window, never zero DFs beyond a bounded window, no
-//! duplicate/loop injection). Model-checked in `netsim` under partition/heal schedules
-//! with explicit bounded-badness claims. Split-horizon prevents same-segment reflection.
-//!
-//! **Status: complete — harness and core both implemented.** The
-//! `netsim.Protocol` consumer (Hello + BUM flooding, `protocol.zig`), both
-//! zero-tolerance invariant checks and the bounded-DF-window post-run
-//! analyzer (`checks.zig`), the property/shrink/teeth test harness, and a
-//! deliberately-broken positive control (`protocol.BrokenAlwaysDf`) are all
-//! real and pass today. The irreducible algorithm itself — `election.decide`
-//! (see `election.zig`) — is also implemented (no longer a stub); `gate.
-//! fable_core_implemented` is `true`, so the tests that drive `DfElect`
-//! through netsim's partition/heal fuzzer run for real and report PASS, not
-//! SKIP.
+//! Built for an encrypted L2VPN fabric over WireGuard, where there is no BGP to
+//! carry EVPN's Ethernet Segment routes: a customer site multihomed to N edge
+//! nodes forms an edge segment, and for each Ethernet tag exactly one member
+//! must deliver multi-destination (BUM) traffic toward the site. The DF is
+//! computed per `<segment, tag>` by RFC 7432 §8.5 service carving (`modulo`)
+//! or RFC 8584 §3.2 Highest Random Weight (`hrw`) over the members a node
+//! currently sees; a member gives a role up at once and takes one only after
+//! `df_wait`. Model-checked in `netsim` under partition, link, crash, restart
+//! and clock-jump faults: split-horizon never fails, duplicates occur only in
+//! the heal race right after connectivity returns, and a dead DF is replaced
+//! within a bounded window (`checks.zig`). See SPEC.md.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -26,7 +20,7 @@ const netsim = @import("netsim");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Partition-correct Designated-Forwarder election (static link-state total order, duplicate-freedom argument) + split-horizon; bounded-badness model-checked in netsim",
+    .doc = "EVPN-style Designated-Forwarder election for N-member segments (RFC 7432 mod-N, RFC 8584 HRW) with DF-wait failover + split-horizon, from a link-state flood; model-checked in netsim",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -35,7 +29,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,
-    .model_after = "EVPN ESI/DF-election + split-horizon (RFC 7432), link-state derived",
+    .model_after = "EVPN DF election (RFC 7432 §8.5 service carving, RFC 8584 §2.1 DF wait + §3.2 HRW) + split-horizon (RFC 7432 §8.3), link-state derived; FRRouting EVPN multihoming observed as a black box",
     .deps = .{"netsim"},
 };
 
@@ -43,7 +37,11 @@ pub const meta = .{
 
 const types = @import("types.zig");
 pub const SegmentId = types.SegmentId;
+pub const Tag = types.Tag;
+pub const Member = types.Member;
+pub const max_members = types.max_members;
 pub const EdgeSegment = types.EdgeSegment;
+pub const Algorithm = types.Algorithm;
 pub const ElectConfig = types.ElectConfig;
 pub const Hello = types.Hello;
 pub const BumFrame = types.BumFrame;
@@ -51,18 +49,24 @@ pub const BumFrame = types.BumFrame;
 pub const DecodeError = types.DecodeError;
 pub const no_ingress = types.no_ingress;
 
-/// FABLE tier — see `election.zig`. `decide` is the irreducible algorithm;
-/// everything else in this module (below) is fully real today.
 const election = @import("election.zig");
-pub const SegmentView = election.SegmentView;
-pub const Decision = election.Decision;
-pub const decide = election.decide;
+pub const designatedForwarder = election.designatedForwarder;
+pub const moduloDf = election.moduloDf;
+pub const hrwDf = election.hrwDf;
+pub const hrwWeight = election.hrwWeight;
+pub const preferenceDf = election.preferenceDf;
+pub const Role = election.Role;
+pub const stepRole = election.stepRole;
+pub const allowForward = election.allowForward;
 
 const checks = @import("checks.zig");
 pub const DeliveryChecker = checks.DeliveryChecker;
+pub const Duplicate = checks.Duplicate;
 pub const DfTransition = checks.DfTransition;
-pub const maxBadDfWindow = checks.maxBadDfWindow;
-pub const worstBadDfWindow = checks.worstBadDfWindow;
+pub const maxDuplicateWindow = checks.maxDuplicateWindow;
+pub const maxZeroDfWindow = checks.maxZeroDfWindow;
+pub const firstUnexplainedDuplicate = checks.firstUnexplainedDuplicate;
+pub const worstZeroDfWindow = checks.worstZeroDfWindow;
 
 const protocol = @import("protocol.zig");
 pub const DfElect = protocol.DfElect;
@@ -72,7 +76,7 @@ pub const scenario = protocol.scenario;
 pub const segments = protocol.segments;
 
 const gate = @import("gate.zig");
-/// Flip once `election.decide` is a real implementation — see `gate.zig`.
+/// See `gate.zig`.
 pub const fable_core_implemented = gate.fable_core_implemented;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
@@ -90,6 +94,8 @@ test {
     _ = @import("checks.zig");
     _ = @import("protocol.zig");
     _ = @import("gate.zig");
+    _ = @import("kat_test.zig");
+    _ = @import("frr_test.zig");
 }
 
 test "smoke: module imports and re-exports resolve" {

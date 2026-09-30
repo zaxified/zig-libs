@@ -1,272 +1,289 @@
 // SPDX-License-Identifier: MIT
 
-//! election — the irreducible algorithm this module exists to prove. THE
-//! FABLE CORE (see `decide` below): a deterministic Designated-Forwarder
-//! election from a node's own link-state view (no second election protocol,
-//! no side-channel vote) that stays correct — bounded dual-DF and bounded
-//! zero-DF windows, never worse — across arbitrary partition and heal, plus
-//! the split-horizon rule, which must hold with ZERO tolerance even DURING a
-//! transient dual-DF window (it is EVPN's local-bias backstop, not itself
-//! subject to a settling window — see `checks.zig`'s module doc for why the
-//! two are checked two different ways).
+//! election — the Designated-Forwarder decision for an N-member edge segment:
+//! which member delivers multi-destination (BUM) traffic for each
+//! `<segment, Ethernet tag>`, derived from the member's own link-state view
+//! (a Hello flood, no BGP), with failover when a member disappears.
 //!
-//! **Why this is hard, and what EVPN does instead:** EVPN gets DF election
-//! "for free" from BGP. Every PE runs a full-mesh iBGP (or route-reflector)
-//! session per peer; each PE advertises an Ethernet A-D per-ES route for
-//! every Ethernet Segment it is multi-homed to, and BGP's own session
-//! liveness + route withdrawal machinery IS the "who is currently reachable
-//! for this ES" view — the DF is then just a deterministic ordinal function
-//! over the ordered list of PEs that have an active advertisement (RFC 7432
-//! §8.5's default algorithm: sort by PE address, `DF = list[(ES-ordinal) mod
-//! N]`). A link-state fabric has no BGP session to lean on: `protocol.zig`
-//! floods plain link-state Hellos (the same primitive SPF itself would use),
-//! and THIS function must derive the equivalent "list of currently-live
-//! members for this segment" guarantee — and the partition-correctness proof
-//! that goes with it — purely from that flood, with no second protocol
-//! layered on top. That derivation is the module's actual contribution.
+//! Three pure pieces, composed by `protocol.zig`:
 //!
-//! **The two failure modes a correct `decide` must avoid:**
-//!  - *Dual DF*: both edge nodes of a segment believe they are DF at once →
-//!    the segment receives every BUM frame twice.
-//!  - *Zero DF*: neither believes it → the segment receives no BUM traffic
-//!    at all (a silent black hole, worse than a duplicate because nothing
-//!    signals the failure).
-//! Neither can be avoided with zero settling time — a genuinely partitioned
-//! node cannot instantaneously learn that fact — so both are budgeted a
-//! `checks.maxBadDfWindow` window instead of being outlawed outright. What
-//! MUST be avoided outright, always, is split-horizon: an unbounded window on
-//! that one is a live forwarding loop into the customer's own site, not a
-//! transient blip.
+//!  - **The DF function** (`designatedForwarder`): given the candidate list
+//!    (the members this node currently believes alive, itself included) and a
+//!    tag, name the DF. Three algorithms: `modulo` — RFC 7432 §8.5 service
+//!    carving, ordinal `tag mod N` over the list sorted by address; `hrw` —
+//!    RFC 8584 §3.2 Highest Random Weight over `(tag, ESI, address)`; and
+//!    `preference` — highest per-member preference, one DF per segment, the
+//!    rule FRRouting runs (checked against it in `frr_test.zig`).
+//!  - **The role state machine** (`stepRole`): a member gives a DF role up
+//!    the moment its view stops naming it, and takes one only after its view
+//!    has named it continuously for `df_wait` — RFC 7432 §8.5 step 2's timer
+//!    and RFC 8584 §2.1's DF_Wait, reduced to the one asymmetry that matters.
+//!  - **Split-horizon** (`allowForward`): never deliver a frame back into the
+//!    segment it ingressed from (RFC 7432 §8.3), independent of DF state.
+//!
+//! ## What is guaranteed, and why duplicates are bounded rather than zero
+//!
+//! Until 2026-09-30 this module elected a STATIC owner that never changed —
+//! `is_df` ignored liveness completely. That bought zero duplicate delivery
+//! and cost availability without bound: a dead owner black-holed its segment
+//! for ever. The argument for it still stands and says exactly what failover
+//! costs: `decide` sees only the local view, a Hello flood cannot tell "peer
+//! dead" from "peer unreachable from me", and after a partition heals a BUM
+//! frame and the next Hello race across the healed cut. Any rule that lets a
+//! survivor take over a role will, in that race, briefly have two members
+//! answering DF for one `<segment, tag>` while one frame reaches both. EVPN
+//! accepts the same window (RFC 8584 §1.3 discusses it). So the guarantees
+//! are now:
+//!
+//!  1. **Split-horizon: zero tolerance**, always — unchanged.
+//!  2. **Duplicates only right after connectivity is restored**: a duplicate
+//!     delivery must follow a heal / link-up / restart within
+//!     `checks.maxDuplicateWindow` — the time for the next Hello to cross.
+//!     Anywhere else it is a bug. In particular startup is duplicate-free:
+//!     every member starts with a view containing only itself (so every view
+//!     names itself DF for every tag), and `df_wait > hello_period` + flood
+//!     delay lets the first Hellos arrive and shrink that claim before any
+//!     role is taken. `df_wait = 0` makes the startup race visible again —
+//!     `protocol.zig` keeps that as a negative control.
+//!  3. **Zero-DF bounded**: after the DF for `<segment, tag>` dies, some
+//!     surviving member holds the role within `checks.maxZeroDfWindow`
+//!     (detection `stale_after` + `df_wait` + evaluation granularity).
+//!  4. **Partitions elect per side**: each side of a partition that holds
+//!     members carves the tags among its own members. Two DFs for one tag on
+//!     opposite sides is not a fault — no frame reaches both — and closes on
+//!     heal as in (2).
+//!
+//! ## Why losing is immediate and gaining waits
+//!
+//! Dual DF needs two members that each believe they hold the role. Giving a
+//! role up as soon as the view says so shortens every dual window to the time
+//! the loser needs to HEAR the other member; making the gain wait means a
+//! transiently wrong view (the empty view at startup, a view skewed by a
+//! delayed Hello) is corrected before it acts. The asymmetry cannot remove
+//! the heal race — both sides legitimately held the role during the
+//! partition — which is why (2) is a window and not zero.
 
 const std = @import("std");
 const netsim = @import("netsim");
 const types = @import("types.zig");
 
 const NodeId = netsim.NodeId;
+const Time = netsim.Time;
 const SegmentId = types.SegmentId;
+const Tag = types.Tag;
+const Member = types.Member;
+const Algorithm = types.Algorithm;
 
-/// What a node currently believes about its OWN segment, derived purely from
-/// its own flooded link-state (no second election protocol — this IS the SPF
-/// view `protocol.zig` already maintains for Hello flooding).
-pub const SegmentView = struct {
-    self_id: NodeId,
-    self_priority: u32,
-    peer_id: NodeId,
-    peer_priority: u32,
-    /// Has a fresh Hello from `peer_id` been seen within
-    /// `types.ElectConfig.stale_after` ticks of the caller's current time?
-    /// `false` also covers "never seen a Hello from this peer at all" —
-    /// `decide` cannot distinguish "never up" from "just went down" from
-    /// this view alone (neither can a real link-state node).
-    peer_alive: bool,
-};
+/// RFC 7432 §8.5 step 3: `candidates` sorted by ascending address (the
+/// caller keeps them in `EdgeSegment.members` order, which `validate`
+/// requires to be sorted); the member with ordinal `tag mod N` is DF.
+pub fn moduloDf(candidates: []const Member, tag: Tag) ?NodeId {
+    if (candidates.len == 0) return null;
+    return candidates[tag % candidates.len].node;
+}
 
-pub const Decision = struct {
-    /// Does `view.self_id` currently consider itself the DF for this segment?
-    is_df: bool,
-    /// Split-horizon gate for ONE specific frame: may a frame that ingressed
-    /// from `ingress_segment` (`null` = network/WAN-side, no ingress
-    /// segment) be forwarded out toward `this_segment`? Independent of
-    /// `is_df` in this return value — `protocol.zig` ANDs both before acting
-    /// (defense in depth), but a correct implementation must NEVER return
-    /// `allow_forward = true` when `ingress_segment == this_segment`,
-    /// regardless of `is_df` or which node is asking. That invariant is
-    /// checked live, with zero tolerance, by `checks.DeliveryChecker`.
-    allow_forward: bool,
-};
+/// RFC 8584 §3.2: `D(V, Es)` is CRC-32 of the 4-octet tag followed by the
+/// 10-octet ESI, both in network byte order, with the most significant bit
+/// dropped.
+pub fn hrwDigest(tag: Tag, esi: [10]u8) u32 {
+    var stream: [14]u8 = undefined;
+    std.mem.writeInt(u32, stream[0..4], tag, .big);
+    stream[4..14].* = esi;
+    return std.hash.Crc32.hash(&stream) & 0x7fff_ffff;
+}
 
-/// Decide DF status for `view.self_id` on segment `this_segment`, and (when a
-/// concrete frame is in flight) the split-horizon gate for a frame that
-/// ingressed from `ingress_segment`. Must be a PURE function of its inputs —
-/// no hidden state, no clock reads, no I/O — so `protocol.zig` can call it
-/// from anywhere (on every Hello that changes the view, on every BUM frame
-/// that needs a forwarding decision) with identical guarantees, and so that
-/// "deterministic from link-state" is actually true: two nodes with the same
-/// view of a segment must reach the same `is_df` verdict WITHOUT talking to
-/// each other about the verdict itself (only about the view, via Hellos).
-///
-/// See `checks.maxBadDfWindow` for the bound this function's convergence
-/// behavior is measured against, and `checks.zig`'s module doc for why
-/// dual-DF/zero-DF get a settling window while split-horizon does not.
-///
-/// ── THE RULE, AND WHY IT IS THE ONLY SAFE ONE ────────────────────────────
-///
-/// Nominally: elect, among the members of `this_segment` the local view
-/// considers alive+attached, the winner of the static total order (lowest
-/// `priority` value, ties by lowest node id — the order `types.EdgeSegment`
-/// declares). For a two-member segment that expands to four cases:
-///
-///   |            | owner (order winner) | backup (order loser) |
-///   | peer alive |     DF (wins)        |    not DF (loses)    |
-///   | peer stale |  DF (sole member)    |     ??? — see below  |
-///
-/// The one free choice is the backup's stale cell — "I am the only member I
-/// can see, so I am DF" is the symmetric, intuitively-correct fill (and what
-/// naive EVPN-style re-election would do). It is WRONG here, and provably so
-/// against `checks.DeliveryChecker`'s zero-tolerance duplicate invariant:
-///
-///  - *Startup:* the first network-side BUM frame is originated before the
-///    first Hello round completes (any config where traffic can precede
-///    liveness convergence — here `bum_period < hello_period`). It floods to
-///    BOTH members while BOTH still see `peer_alive = false`; under the
-///    symmetric fill both self-promote and both deliver → duplicate, on
-///    every schedule, no partition needed.
-///  - *Heal race:* after a partition heals, a BUM frame and the peer's next
-///    Hello race across the healed cut on the same links; nothing orders
-///    them. A frame that beats the Hello reaches the backup while its view
-///    still says stale (→ self-promoted) and the owner while the owner is
-///    DF (the owner is DF in EVERY view) → duplicate. The window is small
-///    but the invariant has ZERO tolerance — "small" is still a loop seed.
-///
-/// Generalizing: `decide` is a pure function of the LOCAL view, and around a
-/// heal every (owner-view, backup-view) ∈ {alive,stale}² combination is
-/// simultaneously reachable while one frame reaches both members. Duplicate
-/// freedom therefore requires: for every such pair, at most one member
-/// answers DF. The owner must answer DF when stale (else a real peer death
-/// would black-hole the segment forever — an UNBOUNDED zero-DF window), so
-/// the backup may answer DF in NO reachable view: `is_df` must be
-/// independent of `peer_alive`. The election collapses to the static total
-/// order — which is exactly the guarantee EVPN's BGP-fed DF list provides
-/// (RFC 7432 §8.5 is a deterministic ordinal over a list all PEs agree on;
-/// the liveness feed only ever REMOVES the dead, it never lets the survivor
-/// side invent a second concurrent forwarder for the same reachable frame).
-/// A link-state Hello flood cannot distinguish "peer dead" from "peer
-/// unreachable-from-me", so the only view-derived fact both members can
-/// never disagree about is the static order itself.
-///
-/// *Bounded-badness accounting* (`checks.maxBadDfWindow` = 2·(stale_after +
-/// hello_period) = 440 with the default config): under this rule dual-DF
-/// NEVER occurs (only the owner ever answers DF), and zero-DF occurs only
-/// from t=0 until the owner's first `decide` call — at latest its first
-/// Hello-timer tick, one `hello_period` (= 50) after start/restart — far
-/// inside the budget. Partitions and heals cause no DF transitions at all.
-/// The trade this buys safety with is availability, not correctness: while
-/// the owner is partitioned from a frame's origin, the segment receives
-/// nothing (a bounded-by-the-partition black hole on the backup's side) —
-/// the same trade single-active EVPN multi-homing makes, and the only one
-/// available without a second protocol (fencing/consensus) on top.
-///
-/// ── SPLIT-HORIZON ─────────────────────────────────────────────────────────
-///
-/// Independent of election state, by design (see `Decision.allow_forward`):
-/// a frame may be forwarded toward `this_segment` unless it INGRESSED from
-/// `this_segment` (`ingress_segment == this_segment`). `null` (no concrete
-/// frame / WAN-side) always forwards. `types.no_ingress` compares unequal to
-/// every real segment id by construction, so it needs no special case. This
-/// must not depend on `is_df` or liveness: it is the local-bias backstop
-/// that holds even mid-transient, with zero tolerance.
-pub fn decide(view: SegmentView, ingress_segment: ?SegmentId, this_segment: SegmentId) Decision {
-    return .{
-        .is_df = winsTotalOrder(view),
-        .allow_forward = if (ingress_segment) |ingress| ingress != this_segment else true,
+/// RFC 8584 §3.2:
+/// `Wrand(V, Es, Si) = (1103515245((1103515245.Si+12345) XOR D(V, Es))+12345) (mod 2^31)`.
+/// Only the low 31 bits of `addr` matter; multiplication, addition and XOR
+/// all commute with reduction mod 2^31, so wrapping `u32` arithmetic masked
+/// at the end is exact.
+pub fn hrwWeight(tag: Tag, esi: [10]u8, addr: u32) u32 {
+    const inner = 1103515245 *% addr +% 12345;
+    return (1103515245 *% (inner ^ hrwDigest(tag, esi)) +% 12345) & 0x7fff_ffff;
+}
+
+/// RFC 8584 §3.2 step 1: the highest weight wins; on a tie, the numerically
+/// least address.
+pub fn hrwDf(candidates: []const Member, tag: Tag, esi: [10]u8) ?NodeId {
+    var best: ?Member = null;
+    var best_w: u32 = 0;
+    for (candidates) |m| {
+        const w = hrwWeight(tag, esi, m.addr);
+        if (best == null or w > best_w or (w == best_w and m.addr < best.?.addr)) {
+            best = m;
+            best_w = w;
+        }
+    }
+    return if (best) |b| b.node else null;
+}
+
+/// Preference-based DF: highest `pref`, ties to the numerically least
+/// address; the same member for every tag (FRR elects per Ethernet Segment).
+pub fn preferenceDf(candidates: []const Member) ?NodeId {
+    var best: ?Member = null;
+    for (candidates) |m| {
+        if (best == null or m.pref > best.?.pref or (m.pref == best.?.pref and m.addr < best.?.addr)) best = m;
+    }
+    return if (best) |b| b.node else null;
+}
+
+/// The DF for `tag` among `candidates` under `algorithm`, or `null` if there
+/// is no candidate. Pure: two members with the same candidate list always
+/// name the same DF — that is what makes the election need no vote.
+pub fn designatedForwarder(algorithm: Algorithm, esi: [10]u8, candidates: []const Member, tag: Tag) ?NodeId {
+    return switch (algorithm) {
+        .modulo => moduloDf(candidates, tag),
+        .hrw => hrwDf(candidates, tag, esi),
+        .preference => preferenceDf(candidates),
     };
 }
 
-/// The static total order over a segment's two members: lowest `priority`
-/// value wins (see `types.EdgeSegment.priority`), ties broken by lowest node
-/// id. Both members compute the same winner from any view — the agreement
-/// `is_df` safety rests on (see `decide`'s doc for why `peer_alive` must not
-/// participate).
-fn winsTotalOrder(view: SegmentView) bool {
-    if (view.self_priority != view.peer_priority)
-        return view.self_priority < view.peer_priority;
-    return view.self_id < view.peer_id;
+/// One member's standing for one `<segment, tag>`.
+pub const Role = struct {
+    is_df: bool = false,
+    /// When the view started naming this member DF while it did not hold the
+    /// role yet; `null` when no gain is pending.
+    want_since: ?Time = null,
+};
+
+/// Advance a role given whether the member's current view names it DF.
+/// Losing is immediate (and cancels a pending gain); gaining needs the view
+/// to have named it continuously for `df_wait`. `df_wait = 0` gains at the
+/// first evaluation — only the negative control uses that.
+pub fn stepRole(role: Role, named: bool, now: Time, df_wait: Time) Role {
+    if (!named) return .{};
+    if (role.is_df) return role;
+    const since = role.want_since orelse now;
+    if (now -| since >= df_wait) return .{ .is_df = true };
+    return .{ .want_since = since };
 }
+
+/// Split-horizon (RFC 7432 §8.3 local bias): may a frame that ingressed from
+/// `ingress_segment` (`null` = network side) be delivered to `this_segment`?
+/// Deliberately independent of DF state and liveness — it must hold with
+/// zero tolerance even inside a dual-DF window. `types.no_ingress` differs
+/// from every real segment id, so it needs no special case.
+pub fn allowForward(ingress_segment: ?SegmentId, this_segment: SegmentId) bool {
+    const ingress = ingress_segment orelse return true;
+    return ingress != this_segment;
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+// Byte-level agreement of the two DF functions with an independent
+// re-derivation lives in `kat_test.zig`; these are the local properties.
 
 const testing = std.testing;
 
-test "decide: the priority order actually picks the LOWER-priority member as DF" {
-    // This is THE documented rule ("lowest priority value wins") and it had
-    // zero direct coverage: every existing test either avoided calling
-    // `decide` at all, or drove it only through the full netsim scenario,
-    // whose safety invariants (no duplicate delivery, no split-horizon
-    // violation) are satisfied EQUALLY whichever member wins — they never
-    // check WHICH one does. A `winsTotalOrder` with the comparison
-    // backwards (higher priority wins) would still pass every other test in
-    // this module because the safety proof only needs "exactly one member
-    // answers DF, consistently" — not "the right one".
-    const lower_is_self = SegmentView{
-        .self_id = 3,
-        .self_priority = 10,
-        .peer_id = 4,
-        .peer_priority = 20,
-        .peer_alive = true,
-    };
-    try testing.expect(winsTotalOrder(lower_is_self));
+const three = [_]Member{
+    .{ .node = 3, .addr = 0x0a00_0001 },
+    .{ .node = 4, .addr = 0x0a00_0002 },
+    .{ .node = 5, .addr = 0x0a00_0003 },
+};
 
-    const higher_is_self = SegmentView{
-        .self_id = 4,
-        .self_priority = 20,
-        .peer_id = 3,
-        .peer_priority = 10,
-        .peer_alive = true,
-    };
-    try testing.expect(!winsTotalOrder(higher_is_self));
+test "moduloDf: ordinal tag mod N over the address-sorted list (RFC 7432 §8.5)" {
+    try testing.expectEqual(@as(?NodeId, 3), moduloDf(&three, 0));
+    try testing.expectEqual(@as(?NodeId, 4), moduloDf(&three, 10)); // 10 mod 3 = 1
+    try testing.expectEqual(@as(?NodeId, 5), moduloDf(&three, 11));
+    try testing.expectEqual(@as(?NodeId, 3), moduloDf(&three, 12));
+    // A member drops out: the carving is recomputed over the survivors.
+    try testing.expectEqual(@as(?NodeId, 5), moduloDf(&.{ three[0], three[2] }, 11));
+    try testing.expectEqual(@as(?NodeId, null), moduloDf(&.{}, 11));
 }
 
-test "decide: equal-priority tie-break by lowest node id — an entirely dead branch in the sim scenario" {
-    // Neither SEG_A ({10,20}) nor SEG_B ({15,5}) ever has equal priorities,
-    // so this branch of `winsTotalOrder` is unreachable from ANY netsim-
-    // driven test in this module, including the seed-sweep fuzzers — a
-    // reversed tie-break (`self_id > peer_id`) would never be exercised.
-    const lower_id_is_self = SegmentView{
-        .self_id = 3,
-        .self_priority = 10,
-        .peer_id = 4,
-        .peer_priority = 10,
-        .peer_alive = true,
-    };
-    try testing.expect(winsTotalOrder(lower_id_is_self));
-
-    const higher_id_is_self = SegmentView{
-        .self_id = 4,
-        .self_priority = 10,
-        .peer_id = 3,
-        .peer_priority = 10,
-        .peer_alive = true,
-    };
-    try testing.expect(!winsTotalOrder(higher_id_is_self));
+test "moduloDf: every tag has exactly one DF and the load is even" {
+    var count = [_]usize{ 0, 0, 0 };
+    var tag: Tag = 0;
+    while (tag < 300) : (tag += 1) {
+        const df = moduloDf(&three, tag).?;
+        count[df - 3] += 1;
+    }
+    try testing.expectEqual([_]usize{ 100, 100, 100 }, count);
 }
 
-test "decide: the documented owner/backup x alive/stale table, incl. the crucial asymmetric backup-stale cell" {
-    // From the module doc's table: owner is DF whether the peer is alive or
-    // stale; the backup is NOT DF even when the peer (owner) looks stale —
-    // the one counter-intuitive cell that the whole duplicate-freedom proof
-    // hinges on (`is_df` must be independent of `peer_alive`).
-    const owner_peer_alive = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = true };
-    const owner_peer_stale = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = false };
-    const backup_peer_alive = SegmentView{ .self_id = 4, .self_priority = 20, .peer_id = 3, .peer_priority = 10, .peer_alive = true };
-    const backup_peer_stale = SegmentView{ .self_id = 4, .self_priority = 20, .peer_id = 3, .peer_priority = 10, .peer_alive = false };
+test "hrwDf: highest weight wins, ties go to the least address, and it is minimally disruptive" {
+    const esi = [10]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var tag: Tag = 0;
+    var moved: usize = 0;
+    var had_3: usize = 0;
+    while (tag < 200) : (tag += 1) {
+        const df = hrwDf(&three, tag, esi).?;
+        // The winner's weight is at least every other member's.
+        const w = hrwWeight(tag, esi, three[df - 3].addr);
+        for (three) |m| try testing.expect(w >= hrwWeight(tag, esi, m.addr));
+        // Removing a member that is NOT the DF never moves the role (RFC 8584
+        // §3.2's "no needless disruption"); removing the DF always does.
+        const without_5 = hrwDf(&.{ three[0], three[1] }, tag, esi).?;
+        if (df != 5) try testing.expectEqual(df, without_5) else moved += 1;
+        if (df == 3) had_3 += 1;
+    }
+    try testing.expect(moved > 0 and moved < 200);
+    try testing.expect(had_3 > 0 and had_3 < 200);
 
-    try testing.expect(decide(owner_peer_alive, null, 1).is_df);
-    try testing.expect(decide(owner_peer_stale, null, 1).is_df);
-    try testing.expect(!decide(backup_peer_alive, null, 1).is_df);
-    try testing.expect(!decide(backup_peer_stale, null, 1).is_df); // the asymmetric cell
+    // Tie: two members with the same low 31 address bits have equal weight;
+    // the numerically least address wins.
+    const tied = [_]Member{ .{ .node = 8, .addr = 0x8000_0005 }, .{ .node = 7, .addr = 0x0000_0005 } };
+    try testing.expectEqual(hrwWeight(1, esi, tied[0].addr), hrwWeight(1, esi, tied[1].addr));
+    try testing.expectEqual(@as(?NodeId, 7), hrwDf(&tied, 1, esi));
 }
 
-test "decide: split-horizon gate — forwards everywhere except back onto the ingress segment" {
-    const view = SegmentView{ .self_id = 3, .self_priority = 10, .peer_id = 4, .peer_priority = 20, .peer_alive = true };
-    // No ingress (network/WAN-side origin): always forwards.
-    try testing.expect(decide(view, null, 1).allow_forward);
-    // CE-side frame ingressing from a DIFFERENT segment: forwards.
-    try testing.expect(decide(view, 2, 1).allow_forward);
-    // CE-side frame ingressing from THIS segment: must be blocked, with zero
-    // tolerance, independent of is_df.
-    try testing.expect(!decide(view, 1, 1).allow_forward);
+test "hrwWeight: masked to 31 bits and sensitive to the ESI" {
+    const a = [10]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const b = [10]u8{ 9, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var differ: usize = 0;
+    var tag: Tag = 0;
+    while (tag < 64) : (tag += 1) {
+        try testing.expect(hrwWeight(tag, a, 0x0a00_0001) < 0x8000_0000);
+        if (hrwWeight(tag, a, 0x0a00_0001) != hrwWeight(tag, b, 0x0a00_0001)) differ += 1;
+    }
+    try testing.expect(differ > 60);
 }
 
-test "SegmentView / Decision are plain data (compiles, no stub call)" {
-    const view = SegmentView{
-        .self_id = 1,
-        .self_priority = 10,
-        .peer_id = 2,
-        .peer_priority = 20,
-        .peer_alive = true,
+test "stepRole: losing is immediate, gaining waits df_wait of continuous naming" {
+    var r: Role = .{};
+    r = stepRole(r, true, 100, 150);
+    try testing.expect(!r.is_df);
+    try testing.expectEqual(@as(?Time, 100), r.want_since);
+    r = stepRole(r, true, 249, 150);
+    try testing.expect(!r.is_df);
+    r = stepRole(r, true, 250, 150);
+    try testing.expect(r.is_df);
+    // Still named: keeps the role, no new wait.
+    r = stepRole(r, true, 900, 150);
+    try testing.expect(r.is_df);
+    // Not named: loses at once.
+    r = stepRole(r, false, 901, 150);
+    try testing.expect(!r.is_df);
+    try testing.expectEqual(@as(?Time, null), r.want_since);
+
+    // An interruption restarts the wait.
+    r = stepRole(.{}, true, 0, 150);
+    r = stepRole(r, false, 100, 150);
+    r = stepRole(r, true, 120, 150);
+    r = stepRole(r, true, 200, 150);
+    try testing.expect(!r.is_df);
+    r = stepRole(r, true, 270, 150);
+    try testing.expect(r.is_df);
+
+    // df_wait = 0 gains at the first evaluation (the negative control's mode).
+    try testing.expect(stepRole(.{}, true, 5, 0).is_df);
+}
+
+test "preferenceDf: highest preference, ties to the least address, one DF for every tag" {
+    const m = [_]Member{
+        .{ .node = 3, .addr = 0x0a00_0001, .pref = 100 },
+        .{ .node = 4, .addr = 0x0a00_0002, .pref = 300 },
+        .{ .node = 5, .addr = 0x0a00_0003, .pref = 300 },
     };
-    try testing.expectEqual(@as(NodeId, 1), view.self_id);
-    try testing.expectEqual(@as(NodeId, 2), view.peer_id);
-    try testing.expect(view.peer_alive);
+    try testing.expectEqual(@as(?NodeId, 4), preferenceDf(&m));
+    for ([_]Tag{ 0, 10, 4094 }) |tag| try testing.expectEqual(@as(?NodeId, 4), designatedForwarder(.preference, @splat(0), &m, tag));
+    // Default preferences everywhere: the least address.
+    try testing.expectEqual(@as(?NodeId, 3), preferenceDf(&three));
+    try testing.expectEqual(@as(?NodeId, null), preferenceDf(&.{}));
+}
 
-    const d = Decision{ .is_df = true, .allow_forward = false };
-    try testing.expect(d.is_df and !d.allow_forward);
+test "allowForward: everywhere except back onto the ingress segment" {
+    try testing.expect(allowForward(null, 1));
+    try testing.expect(allowForward(types.no_ingress, 1));
+    try testing.expect(allowForward(2, 1));
+    try testing.expect(!allowForward(1, 1));
 }

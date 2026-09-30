@@ -1,0 +1,34 @@
+{"scenario":"df-link-down","t_ms":56.0,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":123.0,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":188.9,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":200}}
+{"scenario":"df-link-down","t_ms":203.6,"kind":"note","event":"prefs 100 200 300"}
+{"scenario":"df-link-down","t_ms":2521.0,"kind":"note","event":"phase distinct-prefs-100-200-300: DF is 10.0.0.3"}
+{"scenario":"df-link-down","t_ms":2525.1,"kind":"action","event":"link_down 10.0.0.3"}
+{"scenario":"df-link-down","t_ms":2598.2,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","nonDF","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":200}}
+{"scenario":"df-link-down","t_ms":2651.0,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100}}
+{"scenario":"df-link-down","t_ms":2705.7,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200}}
+{"scenario":"df-link-down","t_ms":10375.6,"kind":"action","event":"link_up 10.0.0.3"}
+{"scenario":"df-link-down","t_ms":10554.6,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":200}}
+{"scenario":"df-link-down","t_ms":10595.4,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":10641.8,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":24458.1,"kind":"action","event":"set_prefs 100 100 100"}
+{"scenario":"df-link-down","t_ms":24846.4,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":24910.8,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":300}}
+{"scenario":"df-link-down","t_ms":24949.1,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-link-down","t_ms":25063.3,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-link-down","t_ms":25076.2,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":25141.9,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":32839.4,"kind":"note","event":"phase equal-prefs: DF is 10.0.0.1"}
+{"scenario":"df-link-down","t_ms":32844.3,"kind":"action","event":"link_down 10.0.0.1"}
+{"scenario":"df-link-down","t_ms":32984.0,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":33034.7,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100}}
+{"scenario":"df-link-down","t_ms":33042.4,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":40708.4,"kind":"action","event":"link_up 10.0.0.1"}
+{"scenario":"df-link-down","t_ms":40921.0,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":40988.7,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-link-down","t_ms":40998.2,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"df-link-down","t_ms":2525.1,"summary":"df_change","after":"link_down 10.0.0.3","df_before":["10.0.0.3"],"df_after":["10.0.0.2"],"first_change_ms":73.1,"settled_ms":125.9}
+{"scenario":"df-link-down","t_ms":10375.6,"summary":"df_change","after":"link_up 10.0.0.3","df_before":["10.0.0.2"],"df_after":["10.0.0.3"],"first_change_ms":179.0,"settled_ms":219.8}
+{"scenario":"df-link-down","t_ms":24458.1,"summary":"df_change","after":"set_prefs 100 100 100","df_before":["10.0.0.3"],"df_after":["10.0.0.1"],"first_change_ms":605.2,"settled_ms":683.8}
+{"scenario":"df-link-down","t_ms":32844.3,"summary":"df_change","after":"link_down 10.0.0.1","df_before":["10.0.0.1"],"df_after":["10.0.0.2"],"first_change_ms":139.7,"settled_ms":198.1}
+{"scenario":"df-link-down","t_ms":40708.4,"summary":"df_change","after":"link_up 10.0.0.1","df_before":["10.0.0.2"],"df_after":["10.0.0.1"],"first_change_ms":212.6,"settled_ms":289.8}

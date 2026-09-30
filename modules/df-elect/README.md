@@ -1,80 +1,86 @@
 # df-elect
 
-Designated-Forwarder election + split-horizon for a link-state L2VPN fabric,
-**partition-correct**. A customer site dual-homed to two edge nodes forms an
-*edge segment*; for broadcast/unknown-unicast/multicast (BUM) traffic toward
-that site exactly one of the two nodes must be the Designated Forwarder (DF),
-chosen **deterministically from each node's own flooded link-state view** — no
-second election protocol, no side-channel vote. The hard part is staying
-correct when the network partitions: the segment must never see a frame
-*twice* (dual-DF), never reflect a frame back into the segment it came from
-(split-horizon), and never black-hole traffic for longer than a bounded
-settling window (zero-DF). Model-checked in `netsim` under partition/heal fault
-fuzzing with explicit zero-tolerance invariants and a bounded-badness window.
+EVPN-style Designated-Forwarder election with failover, plus split-horizon,
+for a link-state L2VPN fabric that has no BGP. A customer site multihomed to N
+edge nodes forms an *edge segment* (an EVPN Ethernet Segment); for every
+Ethernet tag on it, exactly one member must deliver broadcast / unknown-unicast
+/ multicast (BUM) traffic toward the site. Each member works the DF out from
+its own view of a flooded Hello — who it currently hears, and who they hear —
+with RFC 7432 §8.5 service carving (`modulo`, tag mod N), RFC 8584 §3.2
+Highest Random Weight (`hrw`) or preference-based election (`preference`, what
+FRRouting runs); it gives a role up at once and takes one only after
+`df_wait`. Model-checked in `netsim` under partitions, one-way link cuts,
+crashes, restarts and clock jumps: split-horizon never fails, a duplicate
+happens only in the heal race right after connectivity returns, and a dead DF
+is replaced within a bounded window.
 
 ```zig
 const dfe = @import("df-elect");
 
-// A node's own view of its segment, derived purely from its link-state flood:
-const view = dfe.SegmentView{
-    .self_id = 3,      .self_priority = 10,
-    .peer_id = 4,      .peer_priority = 20,
-    .peer_alive = false, // deliberately NOT consulted by the election — see SPEC
-};
-const d = dfe.decide(view, ingress_segment, this_segment);
-// d.is_df        — may this node forward BUM to the segment at all?
-// d.allow_forward — split-horizon gate for one specific frame
-if (d.is_df and d.allow_forward) forwardToSegment(frame);
+// Who is DF for tag 10 among the members this node currently sees?
+const df = dfe.designatedForwarder(.modulo, segment.esi, live_members, 10);
+
+// Take the role only after the view has named us for df_wait; drop it at once.
+role = dfe.stepRole(role, df == self, now, cfg.df_wait);
+
+// Deliver a BUM frame only as DF, and never back into its ingress segment.
+if (role.is_df and dfe.allowForward(frame.ingress_segment, segment.id)) deliver(frame);
 ```
 
-- `decide(view, ingress_segment, this_segment) Decision` — the irreducible
-  core. A **pure** function (no state, no clock, no I/O): `is_df` is the static
-  total-order winner of the segment (lowest `priority`, ties by lowest node id),
-  **independent of `peer_alive`**; `allow_forward` is `ingress_segment !=
-  this_segment` (`null` ingress = WAN-side, always forwards). Why the election
-  ignores peer liveness — the whole point of the module — is proved in `SPEC.md`
-  (a backup that self-promotes on a stale peer provably breaks duplicate-freedom).
-- `SegmentView` / `Decision` — the plain-data input/output of `decide`.
-- `EdgeSegment` / `SegmentId` / `ElectConfig` — segment topology metadata (two
-  members + per-member static priority) and the hold-timer config
-  (`hello_period`, `stale_after`, test-traffic `bum_period`).
-- `Hello` / `BumFrame` / `no_ingress` — the two wire messages the protocol
-  floods (link-state liveness + BUM traffic) and the sentinel ingress tag.
-- `DeliveryChecker` / `DfTransition` / `maxBadDfWindow` / `worstBadDfWindow` —
-  the invariant machinery: a live zero-tolerance duplicate/split-horizon
-  checker, and a post-run analyzer that measures the worst DF-count-!=-1 window
-  against the declared bound `2·(stale_after + hello_period)`.
-- `DfElect` — the real `netsim.Protocol` consumer (Hello + BUM flood calling
-  `decide`). `BrokenAlwaysDf` — the deliberately-wrong positive control that
-  proves `DeliveryChecker` has teeth (reuses the exact same checker type).
-- `scenario` / `segments` — the shared test topology (a 3-node core triangle +
-  two edge segments dual-homed to different core nodes, so a core-internal
-  partition can genuinely split a segment's own two edge nodes apart).
+- `designatedForwarder(algorithm, esi, candidates, tag) ?NodeId` — the DF
+  function, pure: `moduloDf` (RFC 7432 §8.5: ordinal `tag mod N` over the
+  address-sorted list), `hrwDf` (RFC 8584 §3.2: highest
+  `hrwWeight(tag, esi, addr)`, ties to the least address) or `preferenceDf`
+  (highest `Member.pref`, ties to the least address, one DF per segment —
+  checked against FRRouting observed as a black box).
+- `Role` / `stepRole(role, named, now, df_wait)` — the per-tag role state
+  machine: losing is immediate, gaining waits `df_wait` of continuous naming
+  (RFC 7432 §8.5 step 2 / RFC 8584 §2.1 DF_Wait).
+- `allowForward(ingress, this_segment)` — split-horizon (RFC 7432 §8.3),
+  independent of DF state.
+- `EdgeSegment` (id, ESI, address-sorted `members`, `tags`; `validate`),
+  `Member`, `Tag`, `Algorithm`, `ElectConfig` (`hello_period`, `stale_after`,
+  `df_wait`, `algorithm`).
+- `Hello` (origin, seq, segment, `view` = the members the origin sees) /
+  `BumFrame` (origin, seq, ingress segment, tag) / `no_ingress` — the two
+  17-octet wire messages; both decoders fail closed.
+- `DfElect` — the `netsim.Protocol` that runs it all over a Hello flood. A
+  member is named DF only when its own view AND every live peer's advertised
+  view name it, which makes a one-way failure safe (the member nobody hears
+  yields). `BrokenAlwaysDf` — the positive control.
+- `DeliveryChecker`, `firstUnexplainedDuplicate` / `maxDuplicateWindow`,
+  `worstZeroDfWindow` / `maxZeroDfWindow` — the invariant machinery.
 
-- **Role:** util. **Platform:** any. **Deps:** `netsim` (the seeded
-  discrete-event simulator + partition/heal fault fuzzer that drives the
-  property test). **Concurrency:** single-owner — `DfElect` holds mutable
-  per-run state; `decide` itself is pure and re-entrant.
+- **Role:** util. **Platform:** any. **Deps:** `netsim`. **Concurrency:**
+  single-owner — `DfElect` holds per-run state; the DF functions and
+  `stepRole` are pure.
 
-Provenance: clean-room from the EVPN multihoming design (RFC 7432 §8.5 DF
-election + §8.3 split-horizon), re-derived for a link-state (Hello-flood)
-fabric that has no BGP session to lean on. No third-party source consulted or
+Provenance: clean-room from RFC 7432 (§8.3, §8.5) and RFC 8584 (§2.1, §3.2),
+re-derived for a Hello-flood fabric. The committed test vectors
+(`src/kat_vectors.zig`) are generated data from our own tooling
+(`tools/rederive.py`, stdlib-only Python). FRRouting (GPL-2.0-or-later) is
+observed as a black box by `tools/frr/` (its outputs are committed as
+observation data, no FRR source was read). No third-party source consulted or
 copied.
 
 ## Verification
 
-`zig build test-df-elect` — offline, green in Debug **and** ReleaseFast, no
-leaks, **0 skipped** (the Fable core is implemented, so the two gated tests
-below run for real):
+`zig build test-df-elect` — offline; the fuzz sweep runs 120 seeds per
+algorithm in Debug and 400 optimized:
 
-- a live zero-tolerance seed sweep (partition/heal fuzzed) that finds **no**
-  `DuplicateDelivery` and **no** `SplitHorizonViolation` against the real
-  election, and
-- a per-seed bounded-badness check that the worst observed DF-count-!=-1 window
-  stays within `maxBadDfWindow` (= 440 with the default config);
-- plus the positive control (`BrokenAlwaysDf` *does* trip the checker), a
-  fuzzed shrink test, and unit tests for the wire codecs, the checker, and the
-  window analyzer.
+- split-horizon: zero violations (live check, halts the run);
+- duplicates: every one follows a heal / link-up / restart within
+  `maxDuplicateWindow` (= 100; measured worst 50 ticks);
+- zero-DF: every stretch without a DF, measured from the last disruptive
+  fault, stays within `maxZeroDfWindow` (= 420; measured worst 377);
+- fault-free runs: no duplicate at all, and the roles settle on the RFC
+  assignment; explicit failover (DF crash + restart) and partition/heal cases;
+- negative control: `df_wait = 0` duplicates at startup with no fault to
+  explain it; positive control `BrokenAlwaysDf` trips the checker;
+- REDERIVED: `kat_test.zig` checks `hrwWeight`, `moduloDf` and `hrwDf`
+  against an independent Python re-derivation of the RFC formulas;
+- EXTERNAL: `frr_test.zig` checks `preferenceDf` against 12 settled phases
+  observed from FRRouting 10.7.1 (`tools/frr/`).
 
-See `SPEC.md` for the partition-correctness argument (why the election must
-collapse to the static order) and the bounded-badness accounting.
+See `SPEC.md` for the argument (why failover makes duplicates bounded rather
+than zero, why the view consensus is needed) and the measured numbers.

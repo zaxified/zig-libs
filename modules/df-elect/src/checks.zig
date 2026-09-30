@@ -1,27 +1,26 @@
 // SPDX-License-Identifier: MIT
 
-//! checks — the invariant proof. Two DIFFERENT kinds of invariant, checked
-//! two DIFFERENT ways, on purpose:
+//! checks — the invariants, and how each one is checked:
 //!
-//!  1. **Zero-tolerance**, checked LIVE via netsim's `Protocol.checkFn` (so a
-//!     violation halts the run and captures the exact reproducer trace).
-//!     Exactly two things are NEVER allowed, not even for one tick:
-//!       - `error.DuplicateDelivery` — the same BUM frame delivered twice to
-//!         the same segment.
-//!       - `error.SplitHorizonViolation` — a frame delivered back into the
-//!         segment it ingressed from.
-//!     See `DeliveryChecker`.
-//!  2. **Bounded-badness**, checked POST-RUN over the full DF-status
-//!     transition log: at most / at least one DF per segment, allowed to be
-//!     transiently wrong ONLY within `maxBadDfWindow` ticks of a topology
-//!     change (or of startup). This is a liveness property, not a safety
-//!     one — flagging it as a live `checkFn` error would be WRONG, because
-//!     the transient window is legal by design, not a bug. So it is measured
-//!     instead of asserted inline: `worstBadDfWindow` reconstructs the
-//!     per-segment DF-count-over-time step function from a transition log
-//!     and returns the worst "count != 1" interval observed; the CALLER
-//!     compares that measurement against the declared bound. See
-//!     `worstBadDfWindow` + `maxBadDfWindow`.
+//!  1. **Split-horizon, zero tolerance, LIVE** via netsim's
+//!     `Protocol.checkFn`: a frame delivered back into the segment it
+//!     ingressed from halts the run with the exact reproducer trace
+//!     (`error.SplitHorizonViolation`). See `DeliveryChecker`.
+//!  2. **Duplicates, bounded, POST-RUN**: the checker records every second
+//!     delivery of a frame to a segment with its time. With failover a
+//!     duplicate is legal only in the heal race (`election.zig` module doc),
+//!     so `firstUnexplainedDuplicate` requires each one to follow a
+//!     connectivity-restoring fault (heal, link up, node restart) within
+//!     `maxDuplicateWindow`. The positive control and the fault-free runs use
+//!     `duplicates_fatal`, which turns any duplicate into a live
+//!     `error.DuplicateDelivery`.
+//!  3. **Zero-DF, bounded, POST-RUN**: `worstZeroDfWindow` rebuilds, per
+//!     `<segment, tag>`, how many live members hold the role over time and
+//!     returns the longest stretch with none while at least one member was
+//!     up; the caller compares it with `maxZeroDfWindow`. Two DFs at once is
+//!     not measured as bad: across a partition it is the design (each side
+//!     serves its own component), and where it matters — one frame reaching
+//!     both — it shows up as a duplicate under (2).
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -31,48 +30,55 @@ const NodeId = netsim.NodeId;
 const Time = netsim.Time;
 const Allocator = std.mem.Allocator;
 const SegmentId = types.SegmentId;
+const Tag = types.Tag;
 const EdgeSegment = types.EdgeSegment;
 const ElectConfig = types.ElectConfig;
 
-// ── 1. zero-tolerance: DeliveryChecker ──────────────────────────────────────
+// ── 1 + 2. DeliveryChecker ─────────────────────────────────────────────────
 
-/// Shared verbatim by BOTH the real (stub-gated) `protocol.DfElect` and the
-/// positive-control `protocol.BrokenAlwaysDf`, so a violation either one
-/// trips is provably the SAME check (see `protocol.zig`'s positive-control
-/// tests — the whole point of a positive control is that it exercises the
-/// real proof machinery, not a copy of it).
+pub const Duplicate = struct {
+    time: Time,
+    segment: SegmentId,
+    tag: Tag,
+    frame_id: u64,
+};
+
+/// Shared verbatim by the real `protocol.DfElect` and the positive-control
+/// `protocol.BrokenAlwaysDf`, so a violation either trips is provably the
+/// same check.
 pub const DeliveryChecker = struct {
     const Key = struct { frame_id: u64, segment: u64 };
 
     delivered: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    duplicates: std.ArrayList(Duplicate) = .empty,
+    /// When set, a duplicate is a live violation like split-horizon.
+    duplicates_fatal: bool = false,
     /// Sticky: set the instant a bad delivery is observed; `check()` turns it
-    /// into a `netsim.Protocol.checkFn` error on that SAME event (mirrors
-    /// `netsim`'s own `LoopyForward` pattern: accumulate in the message
-    /// handler, assert in `check`).
+    /// into a `netsim.Protocol.checkFn` error on that same event (netsim's
+    /// own `LoopyForward` pattern: accumulate in the handler, assert in
+    /// `check`).
     violation: ?anyerror = null,
 
     pub fn deinit(self: *DeliveryChecker, gpa: Allocator) void {
         self.delivered.deinit(gpa);
+        self.duplicates.deinit(gpa);
         self.* = undefined;
     }
 
     pub fn reset(self: *DeliveryChecker) void {
         self.delivered.clearRetainingCapacity();
+        self.duplicates.clearRetainingCapacity();
         self.violation = null;
     }
 
-    /// Record a BUM frame's delivery to `segment`. Sets `violation` (does
-    /// NOT return it — `check()` is where a `Protocol.checkFn` must surface
-    /// it, see the module doc) if this is a second delivery of the same
-    /// frame to the same segment, or if the frame is being reflected back
-    /// into the very segment it ingressed from. First violation wins and
-    /// stays sticky for the rest of the run — netsim stops at the first
-    /// `check()` failure anyway, but staying sticky keeps this type correct
-    /// even if a caller keeps recording after the fact (e.g. in a unit test).
+    /// Record a BUM frame's delivery to `segment` at `time`. First violation
+    /// wins and stays sticky.
     pub fn recordDelivery(
         self: *DeliveryChecker,
         gpa: Allocator,
+        time: Time,
         segment: SegmentId,
+        tag: Tag,
         frame_id: u64,
         ingress_segment: SegmentId,
     ) Allocator.Error!void {
@@ -81,238 +87,366 @@ pub const DeliveryChecker = struct {
             self.violation = error.SplitHorizonViolation;
             return;
         }
-        const key = Key{ .frame_id = frame_id, .segment = segment };
-        const gop = try self.delivered.getOrPut(gpa, key);
+        const gop = try self.delivered.getOrPut(gpa, .{ .frame_id = frame_id, .segment = segment });
         if (gop.found_existing) {
-            self.violation = error.DuplicateDelivery;
-            return;
+            try self.duplicates.append(gpa, .{ .time = time, .segment = segment, .tag = tag, .frame_id = frame_id });
+            if (self.duplicates_fatal) self.violation = error.DuplicateDelivery;
         }
     }
 
-    /// `netsim.Protocol.checkFn` body (wrap in the protocol's own `check`,
-    /// which also has to cast `ctx`).
+    /// `netsim.Protocol.checkFn` body.
     pub fn check(self: *const DeliveryChecker) anyerror!void {
         if (self.violation) |e| return e;
     }
 };
 
-// ── 2. bounded-badness: DF transition log + post-run window analyzer ───────
-
-pub const DfTransition = struct {
-    time: Time,
-    segment: SegmentId,
-    node: NodeId,
-    is_df: bool,
-};
-
-/// Worst-case ticks a segment may need to reconverge to EXACTLY one DF after
-/// a topology change (partition, heal, link up/down, crash, restart) or
-/// since startup. Reasoning, spelled out because it is a declared SPEC bound
-/// the real election in `election.zig` must satisfy — not a law of physics:
-///   - the stale side needs up to `stale_after` ticks to notice a severed
-///     peer at all (by construction: a single dropped Hello must not flip
-///     liveness, so staleness detection is deliberately not instant);
-///   - a just-healed side needs up to one more `hello_period` for the next
-///     Hello to land and re-establish liveness;
-///   - a flat 2x multiplier over that sum budgets core flood-propagation
-///     delay plus one full round-trip of confirmation, so a multi-hop core
-///     (not just a direct edge-to-edge link) doesn't need re-derivation.
-/// Retune this once the real algorithm's measured settling behavior is in —
-/// this is the bound the harness enforces, not a promise about the eventual
-/// implementation's true worst case.
-pub fn maxBadDfWindow(cfg: ElectConfig) Time {
-    return 2 * (cfg.stale_after + cfg.hello_period);
+/// How long after connectivity is restored a duplicate may still happen: the
+/// next Hello has to be sent (up to `hello_period`) and to cross the fabric,
+/// then the losing member drops the role at once. The flood budget is a
+/// second `hello_period`, generous for this module's topologies (a handful
+/// of hops of a few ticks each); `protocol.zig` prints the measured worst.
+pub fn maxDuplicateWindow(cfg: ElectConfig) Time {
+    return 2 * cfg.hello_period;
 }
 
-const SegState = struct {
-    member: [2]bool = .{ false, false },
-    count: u8 = 0,
-    /// Ticks since which `count != 1` has been continuously true for this
-    /// segment. `0` at construction: with both members starting at
-    /// `is_df = false`, `count = 0 != 1` from t=0 until the first DF
-    /// transition — startup counts as the first "topology change".
-    bad_since: ?Time = 0,
-    worst: Time = 0,
-};
-
-/// Reconstruct each segment's DF-count-over-time step function from
-/// `transitions` and return the WORST observed "count != 1" window across
-/// all of `segments`, closing out any window still open at `until`.
-///
-/// `transitions` MUST already be time-ordered (true of any log recorded by
-/// `protocol.DfElect`, which appends during netsim's strictly
-/// (time, seq)-ordered event processing — see `netsim`'s `EventHeap`).
-/// Pure otherwise: no netsim `Sim` dependency, no allocation beyond one
-/// `segments.len`-sized scratch buffer, so it is fully testable with
-/// hand-written synthetic transitions (see the tests below) without ever
-/// running a real `Protocol`.
-pub fn worstBadDfWindow(
-    gpa: Allocator,
-    transitions: []const DfTransition,
-    segments: []const EdgeSegment,
-    until: Time,
-) Allocator.Error!Time {
-    const states = try gpa.alloc(SegState, segments.len);
-    defer gpa.free(states);
-    for (states) |*s| s.* = .{};
-
-    for (transitions) |t| {
-        const seg_idx = indexOfSegment(segments, t.segment) orelse continue;
-        const seg = segments[seg_idx];
-        const member_idx = seg.indexOf(t.node) orelse continue;
-        const st = &states[seg_idx];
-
-        if (st.member[member_idx] == t.is_df) continue; // not an actual flip
-        const was_one = st.count == 1;
-        st.member[member_idx] = t.is_df;
-        st.count = @as(u8, @intFromBool(st.member[0])) + @as(u8, @intFromBool(st.member[1]));
-        const is_one = st.count == 1;
-
-        if (was_one and !is_one) {
-            st.bad_since = t.time;
-        } else if (!was_one and is_one) {
-            if (st.bad_since) |since| {
-                std.debug.assert(t.time >= since);
-                st.worst = @max(st.worst, t.time - since);
-                st.bad_since = null;
-            }
-        }
-    }
-
-    var worst: Time = 0;
-    for (states) |*st| {
-        if (st.bad_since) |since| {
-            std.debug.assert(until >= since);
-            st.worst = @max(st.worst, until - since);
-        }
-        worst = @max(worst, st.worst);
-    }
-    return worst;
+/// Is `kind` a fault after which the heal race may produce a duplicate?
+fn restoresConnectivity(kind: netsim.FaultKind) bool {
+    return switch (kind) {
+        .heal, .link_up, .restart_node => true,
+        else => false,
+    };
 }
 
-fn indexOfSegment(segments: []const EdgeSegment, id: SegmentId) ?usize {
-    for (segments, 0..) |s, i| {
-        if (s.id == id) return i;
+/// The first duplicate NOT within `window` after a connectivity-restoring
+/// fault in `trace` (sorted by time or not), or `null` if every duplicate is
+/// explained.
+pub fn firstUnexplainedDuplicate(
+    duplicates: []const Duplicate,
+    trace: []const netsim.FaultEvent,
+    window: Time,
+) ?Duplicate {
+    outer: for (duplicates) |d| {
+        for (trace) |e| {
+            if (!restoresConnectivity(e.kind)) continue;
+            if (e.time <= d.time and d.time - e.time <= window) continue :outer;
+        }
+        return d;
     }
     return null;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────
+// ── 3. zero-DF windows ─────────────────────────────────────────────────────
+
+pub const DfTransition = struct {
+    time: Time,
+    segment: SegmentId,
+    tag: Tag,
+    node: NodeId,
+    is_df: bool,
+};
+
+/// Worst ticks a `<segment, tag>` may go without a DF while a member is up:
+/// the DF's Hellos stop, the survivors notice after `stale_after`, the new DF
+/// waits `df_wait`, and evaluation runs on the Hello tick, which adds up to
+/// one `hello_period` at each of the two steps. Startup fits the same bound
+/// (`df_wait` plus two ticks).
+pub fn maxZeroDfWindow(cfg: ElectConfig) Time {
+    return cfg.stale_after + cfg.df_wait + 2 * cfg.hello_period;
+}
+
+const TagKey = struct { segment: SegmentId, tag: Tag };
+
+const TagState = struct {
+    /// Bit i = `members[i]` currently claims the role.
+    holders: u32 = 0,
+    zero_since: ?Time = 0,
+    worst: ZeroWindow = .{},
+};
+
+/// The longest zero-DF stretch found, and where.
+pub const ZeroWindow = struct {
+    len: Time = 0,
+    segment: SegmentId = 0,
+    tag: Tag = 0,
+    start: Time = 0,
+
+    fn consider(self: *ZeroWindow, seg: SegmentId, tag: Tag, start: Time, end: Time) void {
+        if (end - start > self.len) self.* = .{ .len = end - start, .segment = seg, .tag = tag, .start = start };
+    }
+};
+
+/// Is `kind` a fault that can legitimately start a zero-DF stretch (or
+/// extend one): anything that changes who can hear whom, who is up, or a
+/// node's clock. Single-message faults (drop/dup/delay once) are not: one
+/// lost Hello never flips liveness, by `stale_after`'s construction.
+fn disrupts(kind: netsim.FaultKind) bool {
+    return switch (kind) {
+        .link_down, .link_up, .partition, .heal, .crash_node, .restart_node, .clock_jump => true,
+        .drop_once, .dup_once, .delay_once => false,
+    };
+}
+
+/// Rebuild, per `<segment, tag>`, the set of members holding the role over
+/// `[0, until)` from `transitions` (time-ordered, as `protocol.DfElect`
+/// records them) and `trace` (crashed members hold nothing), and return the
+/// worst stretch with no holder while at least one member was up — measured
+/// from startup or from the LAST disruptive fault before the stretch ended,
+/// whichever is later. That is the bound's meaning: the election must
+/// recover within it once the fabric stops changing; a schedule that keeps
+/// disrupting can keep a tag without a DF, as it can any failover protocol.
+/// (A fault anywhere counts, even on a node unrelated to the segment — a
+/// deliberate leniency, stated.)
+pub fn worstZeroDfWindow(
+    gpa: Allocator,
+    transitions: []const DfTransition,
+    segments: []const EdgeSegment,
+    trace: []const netsim.FaultEvent,
+    node_count: usize,
+    until: Time,
+) Allocator.Error!ZeroWindow {
+    var states: std.AutoHashMapUnmanaged(TagKey, TagState) = .empty;
+    defer states.deinit(gpa);
+    for (segments) |s| for (s.tags) |t| try states.put(gpa, .{ .segment = s.id, .tag = t }, .{});
+
+    const crashed = try gpa.alloc(bool, node_count);
+    defer gpa.free(crashed);
+    @memset(crashed, false);
+
+    // Crash/restart events in time order.
+    var faults: std.ArrayList(netsim.FaultEvent) = .empty;
+    defer faults.deinit(gpa);
+    for (trace) |e| switch (e.kind) {
+        .crash_node, .restart_node => try faults.append(gpa, e),
+        else => {},
+    };
+    std.mem.sort(netsim.FaultEvent, faults.items, {}, struct {
+        fn lt(_: void, a: netsim.FaultEvent, b: netsim.FaultEvent) bool {
+            return a.time < b.time;
+        }
+    }.lt);
+
+    var disruptions: std.ArrayList(Time) = .empty;
+    defer disruptions.deinit(gpa);
+    for (trace) |e| if (disrupts(e.kind)) try disruptions.append(gpa, e.time);
+    std.mem.sort(Time, disruptions.items, {}, std.sort.asc(Time));
+
+    var ti: usize = 0;
+    var fi: usize = 0;
+    while (ti < transitions.len or fi < faults.items.len) {
+        // Faults first at equal times: a restart's own transitions (logged
+        // from its onStart) come after it.
+        const take_fault = fi < faults.items.len and
+            (ti >= transitions.len or faults.items[fi].time <= transitions[ti].time);
+        const now = if (take_fault) faults.items[fi].time else transitions[ti].time;
+        if (take_fault) {
+            const e = faults.items[fi];
+            fi += 1;
+            switch (e.kind) {
+                .crash_node => |c| if (c.node < node_count) {
+                    crashed[c.node] = true;
+                },
+                .restart_node => |r| if (r.node < node_count) {
+                    crashed[r.node] = false;
+                },
+                else => unreachable,
+            }
+        } else {
+            const t = transitions[ti];
+            ti += 1;
+            const seg = findSegment(segments, t.segment) orelse continue;
+            const idx = seg.indexOf(t.node) orelse continue;
+            const st = states.getPtr(.{ .segment = t.segment, .tag = t.tag }) orelse continue;
+            const bit = @as(u32, 1) << @intCast(idx);
+            if (t.is_df) st.holders |= bit else st.holders &= ~bit;
+        }
+        // Re-evaluate every <segment, tag> after the event.
+        for (segments) |seg| {
+            const any_up = anyMemberUp(seg, crashed);
+            for (seg.tags) |tag| {
+                const st = states.getPtr(.{ .segment = seg.id, .tag = tag }).?;
+                const live = liveHolders(seg, st.holders, crashed);
+                const bad = live == 0 and any_up;
+                if (bad) {
+                    if (st.zero_since == null) st.zero_since = now;
+                } else if (st.zero_since) |since| {
+                    st.worst.consider(seg.id, tag, anchor(disruptions.items, since, now), now);
+                    st.zero_since = null;
+                }
+            }
+        }
+    }
+
+    var worst: ZeroWindow = .{};
+    var it = states.iterator();
+    while (it.next()) |e| {
+        const st = e.value_ptr;
+        if (st.zero_since) |since| if (until > since) st.worst.consider(e.key_ptr.segment, e.key_ptr.tag, anchor(disruptions.items, since, until), until);
+        if (st.worst.len > worst.len) worst = st.worst;
+    }
+    return worst;
+}
+
+/// Where a zero stretch `[start, end)` is measured from: `start`, or the last
+/// disruption at or before `end` if that is later.
+fn anchor(disruptions: []const Time, start: Time, end: Time) Time {
+    var a = start;
+    for (disruptions) |t| {
+        if (t > end) break;
+        a = @max(a, t);
+    }
+    return a;
+}
+
+fn findSegment(segments: []const EdgeSegment, id: SegmentId) ?EdgeSegment {
+    for (segments) |s| if (s.id == id) return s;
+    return null;
+}
+
+fn anyMemberUp(seg: EdgeSegment, crashed: []const bool) bool {
+    for (seg.members) |m| if (m.node >= crashed.len or !crashed[m.node]) return true;
+    return false;
+}
+
+fn liveHolders(seg: EdgeSegment, holders: u32, crashed: []const bool) usize {
+    var n: usize = 0;
+    for (seg.members, 0..) |m, i| {
+        const up = m.node >= crashed.len or !crashed[m.node];
+        if (up and holders & (@as(u32, 1) << @intCast(i)) != 0) n += 1;
+    }
+    return n;
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "DeliveryChecker: a clean run of distinct frames to distinct segments never violates" {
-    var dc = DeliveryChecker{};
+test "DeliveryChecker: distinct frames and one frame to distinct segments are fine" {
+    var dc = DeliveryChecker{ .duplicates_fatal = true };
     defer dc.deinit(testing.allocator);
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress);
-    try dc.recordDelivery(testing.allocator, 2, 100, types.no_ingress); // same frame, DIFFERENT segment — legitimate
-    try dc.recordDelivery(testing.allocator, 1, 101, types.no_ingress);
+    try dc.recordDelivery(testing.allocator, 1, 1, 10, 100, types.no_ingress);
+    try dc.recordDelivery(testing.allocator, 2, 2, 10, 100, types.no_ingress);
+    try dc.recordDelivery(testing.allocator, 3, 1, 10, 101, types.no_ingress);
     try dc.check();
+    try testing.expectEqual(@as(usize, 0), dc.duplicates.items.len);
 }
 
-test "DeliveryChecker: a second delivery of the same frame to the same segment is a duplicate" {
+test "DeliveryChecker: a duplicate is recorded with its time, and is fatal only when asked" {
     var dc = DeliveryChecker{};
     defer dc.deinit(testing.allocator);
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress);
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress);
-    try testing.expectError(error.DuplicateDelivery, dc.check());
+    try dc.recordDelivery(testing.allocator, 5, 1, 10, 100, types.no_ingress);
+    try dc.recordDelivery(testing.allocator, 9, 1, 10, 100, types.no_ingress);
+    try dc.check();
+    try testing.expectEqual(@as(usize, 1), dc.duplicates.items.len);
+    try testing.expectEqual(@as(Time, 9), dc.duplicates.items[0].time);
+
+    var fatal = DeliveryChecker{ .duplicates_fatal = true };
+    defer fatal.deinit(testing.allocator);
+    try fatal.recordDelivery(testing.allocator, 5, 1, 10, 100, types.no_ingress);
+    try fatal.recordDelivery(testing.allocator, 9, 1, 10, 100, types.no_ingress);
+    try testing.expectError(error.DuplicateDelivery, fatal.check());
 }
 
-test "DeliveryChecker: delivery back into the ingress segment is a split-horizon violation" {
+test "DeliveryChecker: split-horizon is fatal in every mode, sticky, and cleared by reset" {
     var dc = DeliveryChecker{};
     defer dc.deinit(testing.allocator);
-    try dc.recordDelivery(testing.allocator, 5, 200, 5); // ingress_segment == segment
+    try dc.recordDelivery(testing.allocator, 1, 5, 10, 200, 5);
     try testing.expectError(error.SplitHorizonViolation, dc.check());
-}
-
-test "DeliveryChecker: sticky — the FIRST violation wins, a later one does not overwrite it" {
-    var dc = DeliveryChecker{};
-    defer dc.deinit(testing.allocator);
-    try dc.recordDelivery(testing.allocator, 5, 200, 5); // split-horizon first
-    try dc.recordDelivery(testing.allocator, 1, 300, types.no_ingress);
-    try dc.recordDelivery(testing.allocator, 1, 300, types.no_ingress); // would-be duplicate, second
+    try dc.recordDelivery(testing.allocator, 2, 1, 10, 300, types.no_ingress);
     try testing.expectError(error.SplitHorizonViolation, dc.check());
-}
-
-test "DeliveryChecker: reset clears both the dedup table and the sticky violation" {
-    var dc = DeliveryChecker{};
-    defer dc.deinit(testing.allocator);
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress);
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress);
-    try testing.expectError(error.DuplicateDelivery, dc.check());
     dc.reset();
     try dc.check();
-    try dc.recordDelivery(testing.allocator, 1, 100, types.no_ingress); // same frame id, fresh table
-    try dc.check();
+    try testing.expectEqual(@as(usize, 0), dc.duplicates.items.len);
 }
 
-test "maxBadDfWindow: a documented function of the hold-timer config, not a bare constant" {
-    const cfg = ElectConfig{ .hello_period = 50, .stale_after = 170 };
-    try testing.expectEqual(@as(Time, 440), maxBadDfWindow(cfg));
-    const tighter = ElectConfig{ .hello_period = 10, .stale_after = 30 };
-    try testing.expectEqual(@as(Time, 80), maxBadDfWindow(tighter));
-}
-
-const seg_a = EdgeSegment{ .id = 1, .nodes = .{ 10, 11 }, .priority = .{ 1, 2 } };
-
-test "worstBadDfWindow: immediate convergence at t=0 measures a zero window" {
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true },
+test "firstUnexplainedDuplicate: only a restoring fault within the window explains a duplicate" {
+    const dups = [_]Duplicate{
+        .{ .time = 530, .segment = 1, .tag = 10, .frame_id = 1 },
+        .{ .time = 900, .segment = 1, .tag = 10, .frame_id = 2 },
     };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{seg_a}, 1000);
-    try testing.expectEqual(@as(Time, 0), worst);
+    const heal_500 = [_]netsim.FaultEvent{.{ .time = 500, .kind = .{ .heal = .{ .id = 1 } } }};
+    // 530 is explained by the heal at 500; 900 is not.
+    try testing.expectEqual(@as(Time, 900), firstUnexplainedDuplicate(&dups, &heal_500, 100).?.time);
+    try testing.expectEqual(@as(?Duplicate, null), firstUnexplainedDuplicate(dups[0..1], &heal_500, 100));
+    // A cut does not explain a duplicate; a fault AFTER the duplicate neither.
+    const cut = [_]netsim.FaultEvent{
+        .{ .time = 520, .kind = .{ .link_down = .{ .a = 0, .b = 1 } } },
+        .{ .time = 531, .kind = .{ .link_up = .{ .a = 0, .b = 1 } } },
+    };
+    try testing.expectEqual(@as(Time, 530), firstUnexplainedDuplicate(dups[0..1], &cut, 100).?.time);
+    // No trace at all: every duplicate is unexplained.
+    try testing.expect(firstUnexplainedDuplicate(dups[0..1], &.{}, 100) != null);
 }
 
-test "worstBadDfWindow: a bounded gap between losing and regaining a DF measures correctly" {
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true }, // converges immediately
-        .{ .time = 100, .segment = 1, .node = 10, .is_df = false }, // node 10 goes stale — count=0
-        .{ .time = 140, .segment = 1, .node = 11, .is_df = true }, // node 11 takes over — count=1
-    };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{seg_a}, 1000);
-    try testing.expectEqual(@as(Time, 40), worst);
-    try testing.expect(worst <= maxBadDfWindow(.{}));
+test "maxZeroDfWindow / maxDuplicateWindow: functions of the config" {
+    try testing.expectEqual(@as(Time, 170 + 150 + 100), maxZeroDfWindow(.{}));
+    try testing.expectEqual(@as(Time, 100), maxDuplicateWindow(.{}));
+    try testing.expectEqual(@as(Time, 30 + 20 + 20), maxZeroDfWindow(.{ .hello_period = 10, .stale_after = 30, .df_wait = 20 }));
 }
 
-test "worstBadDfWindow: teeth — a window left open past `until` is measured as still-bad, and can exceed the bound" {
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true },
-        .{ .time = 200, .segment = 1, .node = 10, .is_df = false }, // count=0, never repaired
+const members_a = [_]types.Member{ .{ .node = 10, .addr = 1 }, .{ .node = 11, .addr = 2 } };
+const seg_a = EdgeSegment{ .id = 1, .esi = @splat(0), .members = &members_a, .tags = &.{ 7, 8 } };
+
+test "worstZeroDfWindow: startup counts until the first holder, per tag" {
+    const tr = [_]DfTransition{
+        .{ .time = 200, .segment = 1, .tag = 7, .node = 10, .is_df = true },
+        .{ .time = 250, .segment = 1, .tag = 8, .node = 11, .is_df = true },
     };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{seg_a}, 1000);
-    try testing.expectEqual(@as(Time, 800), worst); // 1000 - 200
-    try testing.expect(worst > maxBadDfWindow(.{})); // 800 > 440 — this WOULD fail a real property test
+    try testing.expectEqual(@as(Time, 250), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &.{}, 12, 1000)).len);
 }
 
-test "worstBadDfWindow: teeth — an overlong recovery gap is measured larger than the bound" {
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true },
-        .{ .time = 100, .segment = 1, .node = 10, .is_df = false },
-        .{ .time = 900, .segment = 1, .node = 11, .is_df = true }, // took 800 ticks to recover
+test "worstZeroDfWindow: a crashed holder stops counting at the crash, and the takeover closes the window" {
+    const tr = [_]DfTransition{
+        .{ .time = 0, .segment = 1, .tag = 7, .node = 10, .is_df = true },
+        .{ .time = 0, .segment = 1, .tag = 8, .node = 11, .is_df = true },
+        // node 10 crashes at 300 (trace); its role is still logged as held.
+        .{ .time = 640, .segment = 1, .tag = 7, .node = 11, .is_df = true },
     };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{seg_a}, 1000);
-    try testing.expectEqual(@as(Time, 800), worst);
-    try testing.expect(worst > maxBadDfWindow(.{}));
+    const trace = [_]netsim.FaultEvent{.{ .time = 300, .kind = .{ .crash_node = .{ .node = 10 } } }};
+    try testing.expectEqual(@as(Time, 340), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &trace, 12, 1000)).len);
+    // Without the trace the dead holder would hide the gap entirely.
+    try testing.expectEqual(@as(Time, 0), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &.{}, 12, 1000)).len);
 }
 
-test "worstBadDfWindow: dual-DF (count=2) is measured exactly like zero-DF (count=0) — both are 'count != 1'" {
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true },
-        .{ .time = 50, .segment = 1, .node = 11, .is_df = true }, // both now believe DF — count=2
-        .{ .time = 90, .segment = 1, .node = 11, .is_df = false }, // back to exactly one — count=1
+test "worstZeroDfWindow: a gap with every member down is not counted; one left open at `until` is" {
+    const tr = [_]DfTransition{
+        .{ .time = 0, .segment = 1, .tag = 7, .node = 10, .is_df = true },
+        .{ .time = 0, .segment = 1, .tag = 8, .node = 10, .is_df = true },
     };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{seg_a}, 1000);
-    try testing.expectEqual(@as(Time, 40), worst); // 90 - 50
+    const both_down = [_]netsim.FaultEvent{
+        .{ .time = 100, .kind = .{ .crash_node = .{ .node = 10 } } },
+        .{ .time = 100, .kind = .{ .crash_node = .{ .node = 11 } } },
+    };
+    try testing.expectEqual(@as(Time, 0), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &both_down, 12, 1000)).len);
+    const one_down = both_down[0..1];
+    // node 11 is up and never takes over: open until 1000.
+    try testing.expectEqual(@as(Time, 900), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, one_down, 12, 1000)).len);
 }
 
-test "worstBadDfWindow: independent segments do not leak into each other's window" {
-    const seg_b = EdgeSegment{ .id = 2, .nodes = .{ 20, 21 }, .priority = .{ 1, 2 } };
-    const transitions = [_]DfTransition{
-        .{ .time = 0, .segment = 1, .node = 10, .is_df = true }, // seg 1: converges immediately
-        .{ .time = 0, .segment = 2, .node = 20, .is_df = true },
-        .{ .time = 300, .segment = 2, .node = 20, .is_df = false }, // seg 2: goes bad late, recovers fast
-        .{ .time = 330, .segment = 2, .node = 21, .is_df = true },
+test "worstZeroDfWindow: measured from the last disruption, not from a startup that the fault interrupted" {
+    // Nobody holds tag 7 from t=0 to 450; a partition at 198 is the last
+    // disruption, so the recovery is measured as 252 ticks.
+    const tr = [_]DfTransition{
+        .{ .time = 0, .segment = 1, .tag = 8, .node = 10, .is_df = true },
+        .{ .time = 450, .segment = 1, .tag = 7, .node = 11, .is_df = true },
     };
-    const worst = try worstBadDfWindow(testing.allocator, &transitions, &.{ seg_a, seg_b }, 1000);
-    try testing.expectEqual(@as(Time, 30), worst); // seg 2's 30-tick gap dominates seg 1's 0
+    const cut = [_]NodeId{10};
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 198, .kind = .{ .partition = .{ .id = 1, .cut = &cut } } },
+        .{ .time = 300, .kind = .{ .drop_once = .{ .a = 10, .b = 11 } } }, // not a disruption
+        .{ .time = 900, .kind = .{ .heal = .{ .id = 1 } } }, // after the stretch: ignored
+    };
+    const zw = try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &trace, 12, 1000);
+    try testing.expectEqual(@as(Time, 252), zw.len);
+    try testing.expectEqual(@as(Time, 198), zw.start);
+    try testing.expectEqual(@as(Tag, 7), zw.tag);
+}
+
+test "worstZeroDfWindow: two holders at once is not a zero window" {
+    const tr = [_]DfTransition{
+        .{ .time = 0, .segment = 1, .tag = 7, .node = 10, .is_df = true },
+        .{ .time = 0, .segment = 1, .tag = 8, .node = 10, .is_df = true },
+        .{ .time = 50, .segment = 1, .tag = 7, .node = 11, .is_df = true },
+        .{ .time = 90, .segment = 1, .tag = 7, .node = 10, .is_df = false },
+    };
+    try testing.expectEqual(@as(Time, 0), (try worstZeroDfWindow(testing.allocator, &tr, &.{seg_a}, &.{}, 12, 1000)).len);
 }

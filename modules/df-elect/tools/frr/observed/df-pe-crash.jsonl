@@ -1,0 +1,39 @@
+{"scenario":"df-pe-crash","t_ms":53.0,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":117.4,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":194.8,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":200}}
+{"scenario":"df-pe-crash","t_ms":211.7,"kind":"note","event":"prefs 100 200 300"}
+{"scenario":"df-pe-crash","t_ms":2545.8,"kind":"note","event":"phase distinct-prefs: DF is 10.0.0.3"}
+{"scenario":"df-pe-crash","t_ms":2551.2,"kind":"action","event":"pe_down 10.0.0.3"}
+{"scenario":"df-pe-crash","t_ms":2654.5,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100}}
+{"scenario":"df-pe-crash","t_ms":2702.5,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200}}
+{"scenario":"df-pe-crash","t_ms":9882.2,"kind":"action","event":"pe_up 10.0.0.3"}
+{"scenario":"df-pe-crash","t_ms":10333.7,"pe":"10.0.0.3","es":null,"df":false,"df_pref":null,"flags":[],"peers":{}}
+{"scenario":"df-pe-crash","t_ms":10450.1,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":300,"flags":["bridgePort","local","nonDF","operUp","readyForBgp"],"peers":{}}
+{"scenario":"df-pe-crash","t_ms":13467.5,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","operUp","readyForBgp"],"peers":{}}
+{"scenario":"df-pe-crash","t_ms":36544.2,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":200,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":37671.1,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":200,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":37679.6,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":200}}
+{"scenario":"df-pe-crash","t_ms":49861.5,"kind":"action","event":"set_prefs 100 100 100"}
+{"scenario":"df-pe-crash","t_ms":50203.0,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":50273.7,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":300}}
+{"scenario":"df-pe-crash","t_ms":50310.0,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":300,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-pe-crash","t_ms":50426.3,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-pe-crash","t_ms":50506.7,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":50551.3,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":58264.6,"kind":"note","event":"phase equal-prefs: DF is 10.0.0.1"}
+{"scenario":"df-pe-crash","t_ms":58270.5,"kind":"action","event":"pe_down 10.0.0.1"}
+{"scenario":"df-pe-crash","t_ms":58318.0,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":58422.9,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100}}
+{"scenario":"df-pe-crash","t_ms":66825.8,"kind":"action","event":"pe_up 10.0.0.1"}
+{"scenario":"df-pe-crash","t_ms":67320.8,"pe":"10.0.0.1","es":null,"df":false,"df_pref":null,"flags":[],"peers":{}}
+{"scenario":"df-pe-crash","t_ms":67441.1,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nonDF","operUp","readyForBgp"],"peers":{}}
+{"scenario":"df-pe-crash","t_ms":69539.3,"pe":"10.0.0.3","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.2":100}}
+{"scenario":"df-pe-crash","t_ms":69648.9,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":70465.5,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":97487.0,"pe":"10.0.0.2","es":"03:00:00:00:aa:00:01:00:00:01","df":false,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","nonDF","operUp","readyForBgp","remote"],"peers":{"10.0.0.1":100,"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":98592.1,"pe":"10.0.0.1","es":"03:00:00:00:aa:00:01:00:00:01","df":true,"df_pref":100,"flags":["bridgePort","local","nexthopGroupActive","operUp","readyForBgp","remote"],"peers":{"10.0.0.2":100,"10.0.0.3":100}}
+{"scenario":"df-pe-crash","t_ms":2551.2,"summary":"df_change","after":"pe_down 10.0.0.3","df_before":[],"df_after":["10.0.0.2"],"first_change_ms":103.3,"settled_ms":103.3}
+{"scenario":"df-pe-crash","t_ms":9882.2,"summary":"df_change","after":"pe_up 10.0.0.3","df_before":["10.0.0.2"],"df_after":["10.0.0.3"],"first_change_ms":3585.3,"settled_ms":26662.0}
+{"scenario":"df-pe-crash","t_ms":49861.5,"summary":"df_change","after":"set_prefs 100 100 100","df_before":["10.0.0.3"],"df_after":["10.0.0.1"],"first_change_ms":564.8,"settled_ms":645.2}
+{"scenario":"df-pe-crash","t_ms":58270.5,"summary":"df_change","after":"pe_down 10.0.0.1","df_before":[],"df_after":["10.0.0.2"],"first_change_ms":47.5,"settled_ms":47.5}
+{"scenario":"df-pe-crash","t_ms":66825.8,"summary":"df_change","after":"pe_up 10.0.0.1","df_before":["10.0.0.2"],"df_after":["10.0.0.1"],"first_change_ms":3639.7,"settled_ms":30661.2}
