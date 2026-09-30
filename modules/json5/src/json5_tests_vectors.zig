@@ -6,10 +6,13 @@
 //! `expect` is derived mechanically from the upstream extension convention (see
 //! json5-tests/README.md): `.json`/`.json5` must parse, `.js`/`.txt` must be rejected.
 //!
-//! `out_of_scope`, when non-null, names a specific README "Deferred" bullet this module
-//! has never claimed to implement -- these entries are NOT asserted against `expect` by
-//! json5_tests_test.zig, but they ARE counted, so silently dropping one changes a checked
-//! total instead of vanishing quietly.
+//! `out_of_scope`, when non-null, says why an entry is NOT asserted against `expect` by
+//! the ordinary loop in json5_tests_test.zig, but it IS counted, so silently dropping one
+//! changes a checked total instead of vanishing quietly. Since 2026-09-30 the only such
+//! entries are the five fixtures containing `Infinity`/`NaN`, which are an error by default
+//! and get their own test (default -> error, `non_finite = .quoted` -> parses). The 32
+//! fixtures for hex, `.5`/`5.`, `+1`, line continuations and JSON5 whitespace that used to
+//! be listed here are asserted normally now (37 -> 5 out of scope).
 
 pub const Expect = enum { must_parse, must_reject };
 
@@ -135,13 +138,12 @@ pub const vectors = [_]Vector{
         .path = "misc/readme-example.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/misc/readme-example.json5"),
-        .out_of_scope = "combines hex + leading-dot + Infinity + leading-plus numeric extensions (README Deferred #1/2/3/5) -- the JSON5.org spec's own canonical example",
+        .out_of_scope = "mixes hex, `.5`, `+10` and a string line continuation (all rewritten since 2026-09-30, and now asserted through the non-finite test) with `Infinity`, an ERROR by default; json5_tests_test.zig asserts the error under the default and that it parses under `non_finite = .quoted`",
     },
     .{
         .path = "misc/valid-whitespace.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/misc/valid-whitespace.json5"),
-        .out_of_scope = "JSON5-only extra whitespace character (form feed, U+000C) before a token -- README Deferred #6 (newly documented; this preprocessor never claimed to rewrite whitespace, only comments/keys/commas/quotes, and std.json's whitespace grammar is ASCII space/tab/CR/LF only)",
     },
     .{
         .path = "new-lines/comment-cr.json5",
@@ -162,25 +164,21 @@ pub const vectors = [_]Vector{
         .path = "new-lines/escaped-cr.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/new-lines/escaped-cr.json5"),
-        .out_of_scope = "backslash-newline line continuation inside strings -- README Deferred #4 (not implemented)",
     },
     .{
         .path = "new-lines/escaped-crlf.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/new-lines/escaped-crlf.json5"),
-        .out_of_scope = "backslash-newline line continuation inside strings -- README Deferred #4 (not implemented)",
     },
     .{
         .path = "new-lines/escaped-lf.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/new-lines/escaped-lf.json5"),
-        .out_of_scope = "backslash-newline line continuation inside strings -- README Deferred #4 (not implemented)",
     },
     .{
         .path = "numbers/float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/float-leading-zero.json",
@@ -191,13 +189,11 @@ pub const vectors = [_]Vector{
         .path = "numbers/float-trailing-decimal-point-with-integer-exponent.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/float-trailing-decimal-point-with-integer-exponent.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/float-with-integer-exponent.json",
@@ -218,31 +214,27 @@ pub const vectors = [_]Vector{
         .path = "numbers/hexadecimal-lowercase-letter.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/hexadecimal-lowercase-letter.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/hexadecimal-uppercase-x.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/hexadecimal-uppercase-x.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/hexadecimal-with-integer-exponent.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/hexadecimal-with-integer-exponent.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/infinity.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/infinity.json5"),
-        .out_of_scope = "+Infinity/-Infinity/NaN literals -- README Deferred #3 (not implemented)",
+        .out_of_scope = "`Infinity`/`NaN` decided 2026-09-30: an ERROR by default (no JSON form), so this must_parse fixture stays unasserted in the ordinary loop; json5_tests_test.zig asserts the error under the default and that it parses under `non_finite = .quoted`",
     },
     .{
         .path = "numbers/integer-with-float-exponent.txt",
@@ -318,13 +310,12 @@ pub const vectors = [_]Vector{
         .path = "numbers/nan.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/nan.json5"),
-        .out_of_scope = "+Infinity/-Infinity/NaN literals -- README Deferred #3 (not implemented)",
+        .out_of_scope = "`Infinity`/`NaN` decided 2026-09-30: an ERROR by default (no JSON form), so this must_parse fixture stays unasserted in the ordinary loop; json5_tests_test.zig asserts the error under the default and that it parses under `non_finite = .quoted`",
     },
     .{
         .path = "numbers/negative-float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/negative-float-leading-zero.json",
@@ -335,7 +326,6 @@ pub const vectors = [_]Vector{
         .path = "numbers/negative-float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/negative-float.json",
@@ -346,13 +336,12 @@ pub const vectors = [_]Vector{
         .path = "numbers/negative-hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/negative-infinity.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-infinity.json5"),
-        .out_of_scope = "+Infinity/-Infinity/NaN literals -- README Deferred #3 (not implemented)",
+        .out_of_scope = "`Infinity`/`NaN` decided 2026-09-30: an ERROR by default (no JSON form), so this must_parse fixture stays unasserted in the ordinary loop; json5_tests_test.zig asserts the error under the default and that it parses under `non_finite = .quoted`",
     },
     .{
         .path = "numbers/negative-integer.json",
@@ -373,13 +362,11 @@ pub const vectors = [_]Vector{
         .path = "numbers/negative-zero-float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-zero-float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/negative-zero-float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-zero-float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/negative-zero-float.json",
@@ -390,7 +377,6 @@ pub const vectors = [_]Vector{
         .path = "numbers/negative-zero-hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/negative-zero-hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/negative-zero-integer.json",
@@ -421,43 +407,37 @@ pub const vectors = [_]Vector{
         .path = "numbers/positive-float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/positive-float-leading-zero.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-float-leading-zero.json5"),
-        .out_of_scope = "leading '+' sign on numbers -- README Deferred #5 (newly documented by this sweep; preprocessor never touches numeric bytes, and JSON/std.json disallows a leading '+')",
     },
     .{
         .path = "numbers/positive-float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/positive-float.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-float.json5"),
-        .out_of_scope = "leading '+' sign on numbers -- README Deferred #5 (newly documented by this sweep; preprocessor never touches numeric bytes, and JSON/std.json disallows a leading '+')",
     },
     .{
         .path = "numbers/positive-hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/positive-infinity.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-infinity.json5"),
-        .out_of_scope = "+Infinity/-Infinity/NaN literals -- README Deferred #3 (not implemented)",
+        .out_of_scope = "`Infinity`/`NaN` decided 2026-09-30: an ERROR by default (no JSON form), so this must_parse fixture stays unasserted in the ordinary loop; json5_tests_test.zig asserts the error under the default and that it parses under `non_finite = .quoted`",
     },
     .{
         .path = "numbers/positive-integer.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-integer.json5"),
-        .out_of_scope = "leading '+' sign on numbers -- README Deferred #5 (newly documented by this sweep; preprocessor never touches numeric bytes, and JSON/std.json disallows a leading '+')",
     },
     .{
         .path = "numbers/positive-noctal.js",
@@ -473,31 +453,26 @@ pub const vectors = [_]Vector{
         .path = "numbers/positive-zero-float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-zero-float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/positive-zero-float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-zero-float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/positive-zero-float.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-zero-float.json5"),
-        .out_of_scope = "leading '+' sign on numbers -- README Deferred #5 (newly documented by this sweep; preprocessor never touches numeric bytes, and JSON/std.json disallows a leading '+')",
     },
     .{
         .path = "numbers/positive-zero-hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-zero-hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/positive-zero-integer.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/positive-zero-integer.json5"),
-        .out_of_scope = "leading '+' sign on numbers -- README Deferred #5 (newly documented by this sweep; preprocessor never touches numeric bytes, and JSON/std.json disallows a leading '+')",
     },
     .{
         .path = "numbers/positive-zero-octal.txt",
@@ -508,13 +483,11 @@ pub const vectors = [_]Vector{
         .path = "numbers/zero-float-leading-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/zero-float-leading-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/zero-float-trailing-decimal-point.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/zero-float-trailing-decimal-point.json5"),
-        .out_of_scope = "leading/trailing-dot numbers -- README Deferred #2 (not implemented)",
     },
     .{
         .path = "numbers/zero-float.json",
@@ -525,7 +498,6 @@ pub const vectors = [_]Vector{
         .path = "numbers/zero-hexadecimal.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/numbers/zero-hexadecimal.json5"),
-        .out_of_scope = "hex numeric literals -- README Deferred #1 (not implemented; preprocessor never touches numeric bytes)",
     },
     .{
         .path = "numbers/zero-integer-with-integer-exponent.json",
@@ -606,7 +578,6 @@ pub const vectors = [_]Vector{
         .path = "strings/multi-line-string.json5",
         .expect = .must_parse,
         .content = @embedFile("testdata/json5-tests/strings/multi-line-string.json5"),
-        .out_of_scope = "backslash-newline line continuation inside strings -- README Deferred #4 (not implemented)",
     },
     .{
         .path = "strings/single-quoted-string.json5",

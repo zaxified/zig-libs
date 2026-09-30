@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! json5 — single-pass JSON5→JSON preprocessor (comments, unquoted keys,
-//! trailing commas, single-quote strings) + a source-location annotated variant.
+//! trailing commas, single-quote strings, hex/`.5`/`5.`/`+1` numbers, string line
+//! continuations, JSON5 whitespace; `Infinity`/`NaN` per `Options.non_finite`)
+//! + a source-location annotated variant.
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings).",
+    .doc = "Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings, JSON5 numbers, line continuations).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -20,8 +22,48 @@ pub const meta = .{
     .deps = .{},
 };
 
+/// What to do with the JSON5 non-finite numbers `Infinity`, `-Infinity`,
+/// `+Infinity` and `NaN` (JSON has no such numbers).
+pub const NonFinite = enum {
+    /// The default. `preprocess` fails with `error.NonFiniteNumber` (and fills
+    /// `Options.diagnostic`); `preprocessAnnotated` passes the token through
+    /// unchanged so `std.json` rejects it, like every other deferred construct.
+    reject,
+    /// Rewrite them to the JSON STRINGS `"Infinity"`, `"-Infinity"`, `"NaN"`
+    /// (`+Infinity` and `-NaN`/`+NaN` lose their sign). `std.json` decodes a
+    /// string into an `f64` field through `std.fmt.parseFloat`, which reads
+    /// exactly those, so a typed struct gets the `inf`/`nan` the reference
+    /// json5 (JS) produces. Never `null`: that would silently lose the value.
+    /// Into a `std.json.Value` or an untyped field they are plain strings.
+    quoted,
+};
+
+/// Where and why `preprocess` refused a document. Filled only on an error the
+/// module itself raises (`NonFiniteNumber`, `HexLiteralTooLarge`).
+pub const Diagnostic = struct {
+    /// 1-based source line of the offending literal.
+    line: usize = 0,
+    /// A static, human-readable message; empty until an error sets it.
+    message: []const u8 = "",
+};
+
+pub const Options = struct {
+    non_finite: NonFinite = .reject,
+    /// Optional out-parameter for the error's line and message. Not used by
+    /// `preprocessAnnotated`, which never fails on the input.
+    diagnostic: ?*Diagnostic = null,
+};
+
 /// Preprocess JSON5 source and return a new slice owned by alloc.
+/// Besides `error.OutOfMemory` it fails with `error.NonFiniteNumber`
+/// (`Infinity`/`NaN` under the default `.reject`) and `error.HexLiteralTooLarge`
+/// (a hex literal with more than `hex_digits_max` significant digits).
 pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    return preprocessWithOptions(alloc, input, .{});
+}
+
+/// `preprocess` with `Options`.
+pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, options: Options) ![]u8 {
     const prefix = try diagnosticPrefix(alloc, input, "$err_trace_");
     defer alloc.free(prefix);
     var lines: LineCounter = .{};
@@ -46,12 +88,24 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
             i += 1;
             while (i < input.len) {
                 const sc = input[i];
+                if (sc == '\\' and i + 1 < input.len) {
+                    // JSON5 line continuation: backslash + line terminator
+                    // contributes nothing to the string value. JSON has no such
+                    // escape, so drop both — and never look at the next byte
+                    // as an ordinary escape (`\` + CR + LF is ONE terminator).
+                    const lt = lineTerminatorLen(input, i + 1);
+                    if (lt > 0) {
+                        i += 1 + lt;
+                        continue;
+                    }
+                    try out.append(alloc, sc);
+                    try out.append(alloc, input[i + 1]);
+                    i += 2;
+                    continue;
+                }
                 try out.append(alloc, sc);
                 i += 1;
-                if (sc == '\\' and i < input.len) {
-                    try out.append(alloc, input[i]);
-                    i += 1;
-                } else if (sc == '"') break;
+                if (sc == '"') break;
             }
             continue;
         }
@@ -65,6 +119,11 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                 const sc = input[i];
                 i += 1;
                 if (sc == '\\' and i < input.len) {
+                    const lt = lineTerminatorLen(input, i);
+                    if (lt > 0) { // line continuation, see the double-quoted branch
+                        i += lt;
+                        continue;
+                    }
                     const esc = input[i];
                     i += 1;
                     if (esc == '\'') {
@@ -104,8 +163,9 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                 // bare-CR file had no line terminator anywhere for this loop
                 // to find, so it silently consumed the rest of the input
                 // (including any closing braces) as "comment". Found by the
-                // json5-tests corpus: new-lines/comment-cr.json5.
-                while (i < input.len and input[i] != '\n' and input[i] != '\r') i += 1;
+                // json5-tests corpus: new-lines/comment-cr.json5. U+2028/U+2029
+                // end it too (JSON5 line terminators).
+                while (i < input.len and input[i] != '\n' and input[i] != '\r' and !isLsPs(input, i)) i += 1;
                 continue;
             }
             if (input[i + 1] == '*') { // multi-line
@@ -141,6 +201,26 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                 try out.append(alloc, ' ');
                 continue;
             }
+        }
+
+        // ── JSON5-only whitespace → one plain space ─────────────────────────
+        // Before the key/recovery branches: in key position an unrecognised
+        // byte would otherwise be routed into error recovery.
+        if (c == 0x0B or c == 0x0C or c >= 0x80) {
+            const wl = json5WsLen(input, i);
+            if (wl > 0) {
+                try out.append(alloc, ' ');
+                i += wl;
+                continue;
+            }
+        }
+
+        // ── numeric literal (hex, .5, 5., +1, Infinity, NaN) ────────────────
+        // Value position only: `Infinity` as an object KEY is an identifier,
+        // and a key never starts with a digit.
+        if (!key_pos and (std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.' or c == 'I' or c == 'N')) {
+            i = try emitNumber(alloc, &out, input, i, options, true, &lines);
+            continue;
         }
 
         // ── structural tokens ────────────────────────────────────────────────
@@ -194,9 +274,9 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                     // Peek ahead past whitespace to find ':'. Only horizontal
                     // whitespace here — a newline terminates the unquoted key
                     // identifier in the simple preprocessor (annotated variant
-                    // handles newlines inside keys separately).
-                    var j = i;
-                    while (j < input.len and (input[j] == ' ' or input[j] == '\t')) : (j += 1) {}
+                    // handles newlines inside keys separately). JSON5-only
+                    // horizontal whitespace (NBSP, form feed, …) counts.
+                    const j = skipJson5Ws(input, i, false);
                     if (j >= input.len or input[j] == ':') {
                         // Normal path: output quoted key
                         try out.append(alloc, '"');
@@ -353,35 +433,263 @@ fn removeTrailingComma(out: *std.ArrayList(u8)) void {
     }
 }
 
-/// Return the 1-based line number of position `pos` in `input`.
-/// One numeric literal, starting at `start`, as the end index just past it.
-/// Deliberately permissive — hex (`0x1f`), a leading or trailing dot, and an
-/// exponent with a sign are all JSON5, and anything this accepts that JSON
-/// does not is handed to `std.json` to reject. What matters is that the whole
-/// literal is consumed as ONE token, so no part of it is later mistaken for
-/// something else.
-fn scanNumber(input: []const u8, start: usize) usize {
-    var i = start;
-    if (i < input.len and (input[i] == '+' or input[i] == '-')) i += 1;
-    if (i + 1 < input.len and input[i] == '0' and (input[i + 1] == 'x' or input[i + 1] == 'X')) {
-        i += 2;
-        while (i < input.len and std.ascii.isHex(input[i])) : (i += 1) {}
-        return i;
-    }
-    while (i < input.len and (std.ascii.isDigit(input[i]) or input[i] == '.')) : (i += 1) {}
-    if (i < input.len and (input[i] == 'e' or input[i] == 'E')) {
-        var j = i + 1;
-        if (j < input.len and (input[j] == '+' or input[j] == '-')) j += 1;
-        // Only an exponent with at least one digit is part of the number; a
-        // bare `e` is a bare identifier and must stay one.
-        if (j < input.len and std.ascii.isDigit(input[j])) {
-            i = j;
-            while (i < input.len and std.ascii.isDigit(input[i])) : (i += 1) {}
+/// The most significant hex digits a `0x…` literal may have (leading zeros do
+/// not count): 256 digits = 1024 bits, which is already beyond the largest
+/// finite `f64` (2^1024 - 1 needs exactly 256). Bigger is refused rather than
+/// converted, so the conversion stays a fixed-size stack computation and a
+/// hostile 1 MB literal costs nothing.
+pub const hex_digits_max = 256;
+
+/// 16^256 = 2^1024 < 10^309, i.e. 35 limbs of nine decimal digits; one spare.
+const hex_limbs_max = 36;
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// True iff a numeric token that ended at `end` runs on into something that
+/// cannot follow a number (`1.2.3`, `0x1.5`, `1abc`). JSON5 forbids an
+/// identifier start or digit right after a numeric literal; rewriting the
+/// prefix and letting the tail become a SECOND token would join two tokens into
+/// a fabricated valid one (`0x1.5` -> `1` + `.5` -> `10.5`), the same failure
+/// as a deleted comment gluing `[1/*c*/2]` into `[12]`.
+fn numberContinues(input: []const u8, end: usize) bool {
+    return end < input.len and (isIdentByte(input[end]) or input[end] == '.');
+}
+
+/// Copy a malformed numeric token through verbatim — for `std.json` to reject
+/// — extended over the whole junk run after `from`, so no fragment of it is
+/// re-scanned as a number of its own. Returns the end index (> `start`).
+fn copyMalformedNumber(alloc: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8, start: usize, from: usize) !usize {
+    var e = from;
+    while (e < input.len and (isIdentByte(input[e]) or input[e] == '.')) : (e += 1) {}
+    try out.appendSlice(alloc, input[start..e]);
+    return e;
+}
+
+/// `word` (`Infinity` / `NaN`) at `i`, not glued to a longer identifier.
+fn wordAt(input: []const u8, i: usize, comptime word: []const u8) bool {
+    if (!std.mem.startsWith(u8, input[@min(i, input.len)..], word)) return false;
+    return i + word.len >= input.len or !isIdentByte(input[i + word.len]);
+}
+
+/// Append `digits` (hex digits, no leading zeros, at most `hex_digits_max`) as
+/// an exact decimal integer. Little-endian limbs in base 10^9 on the stack:
+/// multiply by 16, add the digit, carry — no allocation, no float rounding.
+fn appendHexAsDecimal(alloc: std.mem.Allocator, out: *std.ArrayList(u8), digits: []const u8) !void {
+    if (digits.len == 0) return out.append(alloc, '0');
+    const base: u64 = 1_000_000_000;
+    var limbs: [hex_limbs_max]u32 = undefined;
+    limbs[0] = 0;
+    var n: usize = 1;
+    for (digits) |h| {
+        var carry: u64 = std.fmt.charToDigit(h, 16) catch unreachable; // caller scanned isHex
+        for (limbs[0..n]) |*l| {
+            const v = @as(u64, l.*) * 16 + carry;
+            l.* = @intCast(v % base);
+            carry = v / base;
+        }
+        if (carry > 0) {
+            limbs[n] = @intCast(carry);
+            n += 1;
         }
     }
-    // A lone sign or dot is not a number; leave it to the byte-copy path
-    // rather than consuming nothing and spinning.
-    return if (i == start) start + 1 else i;
+    var buf: [9]u8 = undefined;
+    try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d}", .{limbs[n - 1]}) catch unreachable);
+    var k = n - 1;
+    while (k > 0) {
+        k -= 1;
+        try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d:0>9}", .{limbs[k]}) catch unreachable);
+    }
+}
+
+/// One JSON5 numeric literal starting at `start` (an optional sign, then a
+/// digit, `.`, or `Infinity`/`NaN`), rewritten into JSON and appended to
+/// `out`. Returns the end index just past the consumed source. Always
+/// consumes at least one byte.
+///
+/// - `+1` -> `1`; `.5` -> `0.5`; `5.` -> `5`; `5.e2` -> `5e2`; `-.5e3` -> `-0.5e3`
+///   (the exponent is copied verbatim, so every already-valid number comes out
+///   byte-identical).
+/// - `0x1A` / `-0xff` / `0X1a` -> the exact decimal integer, any length up to
+///   `hex_digits_max` digits (`std.json` reads a big integer as a number
+///   string or a float). More than that is `error.HexLiteralTooLarge` when
+///   `strict`, else passed through verbatim.
+/// - `Infinity` / `NaN` with an optional sign: per `options.non_finite`.
+///   `strict` (`preprocess`) makes `.reject` an error; the annotated entry point
+///   is not strict and copies the token through.
+/// - Anything else that merely looks numeric (`01`, `1.2.3`, `0x`, `1e`) is
+///   copied verbatim, whole, for `std.json` to reject; a leading zero is NOT
+///   stripped, so `01` stays invalid exactly as in JSON5.
+///
+/// Called in value position only, and never from inside a string or comment,
+/// so `.5` there is untouched by construction.
+fn emitNumber(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    input: []const u8,
+    start: usize,
+    options: Options,
+    strict: bool,
+    lines: *LineCounter,
+) !usize {
+    var i = start;
+    var negative = false;
+    if (i < input.len and (input[i] == '+' or input[i] == '-')) {
+        negative = input[i] == '-';
+        i += 1;
+    }
+
+    inline for (.{ "Infinity", "NaN" }) |word| {
+        if (wordAt(input, i, word)) {
+            const end = i + word.len;
+            switch (options.non_finite) {
+                .quoted => {
+                    try out.append(alloc, '"');
+                    if (negative and word[0] == 'I') try out.append(alloc, '-');
+                    try out.appendSlice(alloc, word);
+                    try out.append(alloc, '"');
+                },
+                .reject => {
+                    if (strict) {
+                        if (options.diagnostic) |d| d.* = .{
+                            .line = lines.at(input, start),
+                            .message = "non-finite number (Infinity/NaN) has no JSON form; " ++
+                                "pass Options{ .non_finite = .quoted } to accept it as a string",
+                        };
+                        return error.NonFiniteNumber;
+                    }
+                    try out.appendSlice(alloc, input[start..end]);
+                },
+            }
+            return end;
+        }
+    }
+
+    // A lone sign, or a stray `I`/`N` that is no non-finite word: one byte
+    // through, so the caller always makes progress and what follows is
+    // scanned as itself (`-foo` keeps its bare-identifier handling).
+    if (i >= input.len or !(std.ascii.isDigit(input[i]) or input[i] == '.')) {
+        try out.append(alloc, input[start]);
+        return start + 1;
+    }
+
+    if (i + 1 < input.len and input[i] == '0' and (input[i + 1] == 'x' or input[i + 1] == 'X')) {
+        var j = i + 2;
+        while (j < input.len and std.ascii.isHex(input[j])) : (j += 1) {}
+        if (j == i + 2 or numberContinues(input, j)) return copyMalformedNumber(alloc, out, input, start, j);
+        var z = i + 2;
+        while (z < j and input[z] == '0') : (z += 1) {}
+        const digits = input[z..j];
+        if (digits.len > hex_digits_max) {
+            if (!strict) {
+                try out.appendSlice(alloc, input[start..j]);
+                return j;
+            }
+            if (options.diagnostic) |d| d.* = .{
+                .line = lines.at(input, start),
+                .message = "hexadecimal literal has more than 256 significant digits (beyond any finite f64)",
+            };
+            return error.HexLiteralTooLarge;
+        }
+        if (negative) try out.append(alloc, '-');
+        try appendHexAsDecimal(alloc, out, digits);
+        return j;
+    }
+
+    var j = i;
+    while (j < input.len and std.ascii.isDigit(input[j])) : (j += 1) {}
+    const int = input[i..j];
+    var frac: []const u8 = "";
+    if (j < input.len and input[j] == '.') {
+        j += 1;
+        const f0 = j;
+        while (j < input.len and std.ascii.isDigit(input[j])) : (j += 1) {}
+        frac = input[f0..j];
+    }
+    var exp: []const u8 = "";
+    if (j < input.len and (input[j] == 'e' or input[j] == 'E')) {
+        var k = j + 1;
+        if (k < input.len and (input[k] == '+' or input[k] == '-')) k += 1;
+        // Only an exponent with at least one digit is part of the number; a
+        // bare `e` is a bare identifier and must stay one.
+        if (k < input.len and std.ascii.isDigit(input[k])) {
+            while (k < input.len and std.ascii.isDigit(input[k])) : (k += 1) {}
+            exp = input[j..k];
+            j = k;
+        }
+    }
+    // `.` alone, `.e5`: no digit anywhere in the mantissa.
+    if ((int.len == 0 and frac.len == 0) or numberContinues(input, j)) {
+        return copyMalformedNumber(alloc, out, input, start, j);
+    }
+    if (negative) try out.append(alloc, '-');
+    if (int.len == 0) try out.append(alloc, '0') else try out.appendSlice(alloc, int);
+    if (frac.len > 0) {
+        try out.append(alloc, '.');
+        try out.appendSlice(alloc, frac);
+    }
+    try out.appendSlice(alloc, exp);
+    return j;
+}
+
+/// Byte length of the JSON5 whitespace character at `i` that is NOT JSON
+/// whitespace, or 0: form feed, vertical tab, NBSP U+00A0, U+1680,
+/// U+2000..U+200A, U+2028/U+2029 (also line terminators), U+202F, U+205F,
+/// U+3000 (the Unicode Zs spaces) and the BOM U+FEFF. Plain space, tab, CR and
+/// LF are not here — `std.json` already accepts them.
+fn json5WsLen(input: []const u8, i: usize) usize {
+    const c = input[i];
+    if (c == 0x0B or c == 0x0C) return 1;
+    if (c < 0x80) return 0;
+    if (c == 0xC2) return if (i + 1 < input.len and input[i + 1] == 0xA0) 2 else 0;
+    if (i + 2 >= input.len) return 0;
+    const b1 = input[i + 1];
+    const b2 = input[i + 2];
+    const hit = switch (c) {
+        0xE1 => b1 == 0x9A and b2 == 0x80, // U+1680
+        0xE2 => (b1 == 0x80 and ((b2 >= 0x80 and b2 <= 0x8A) or b2 == 0xA8 or b2 == 0xA9 or b2 == 0xAF)) or
+            (b1 == 0x81 and b2 == 0x9F), // U+2000..200A, 2028, 2029, 202F, 205F
+        0xE3 => b1 == 0x80 and b2 == 0x80, // U+3000
+        0xEF => b1 == 0xBB and b2 == 0xBF, // U+FEFF
+        else => false,
+    };
+    return if (hit) 3 else 0;
+}
+
+/// U+2028 (LINE SEPARATOR) or U+2029 (PARAGRAPH SEPARATOR) at `i`.
+fn isLsPs(input: []const u8, i: usize) bool {
+    return i + 2 < input.len and input[i] == 0xE2 and input[i + 1] == 0x80 and (input[i + 2] == 0xA8 or input[i + 2] == 0xA9);
+}
+
+/// Byte length of the JSON5 line terminator at `i` (LF, CR, CRLF, U+2028,
+/// U+2029), or 0. CRLF is ONE terminator.
+fn lineTerminatorLen(input: []const u8, i: usize) usize {
+    if (i >= input.len) return 0;
+    return switch (input[i]) {
+        '\n' => 1,
+        '\r' => if (i + 1 < input.len and input[i + 1] == '\n') 2 else 1,
+        0xE2 => if (isLsPs(input, i)) 3 else 0,
+        else => 0,
+    };
+}
+
+/// First index at or after `from` that is not whitespace: space and tab, the
+/// JSON5-only kinds, and — with `newlines` — CR/LF too. Without `newlines` the
+/// two JSON5 line terminators U+2028/U+2029 stop the skip as well.
+fn skipJson5Ws(input: []const u8, from: usize, comptime newlines: bool) usize {
+    var j = from;
+    while (j < input.len) {
+        const c = input[j];
+        if (c == ' ' or c == '\t' or (newlines and (c == '\n' or c == '\r'))) {
+            j += 1;
+            continue;
+        }
+        const w = json5WsLen(input, j);
+        if (w == 0 or (!newlines and isLsPs(input, j))) break;
+        j += w;
+    }
+    return j;
 }
 
 /// The `:` that terminates a malformed key, starting the search at `from`.
@@ -658,6 +966,14 @@ fn isInObject(nest: []const u8) bool {
 /// site: gate any change here behind the existing recovery unit tests, not
 /// just the happy path.
 pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !AnnotatedResult {
+    return preprocessAnnotatedWithOptions(alloc, input, .{});
+}
+
+/// `preprocessAnnotated` with `Options`. Only `non_finite` matters here:
+/// this entry point never fails on the input, so under `.reject` a non-finite
+/// number is passed through verbatim (`std.json` then rejects it — recovery
+/// must not change whether the document parses) and `diagnostic` stays untouched.
+pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u8, options: Options) !AnnotatedResult {
     const prefix = try diagnosticPrefix(alloc, input, "$err_");
     defer alloc.free(prefix);
     var lines: LineCounter = .{};
@@ -715,6 +1031,13 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     i = skipValue(input, i);
                     break;
                 }
+                if (sc == '\\' and i + 1 < input.len) {
+                    const lt = lineTerminatorLen(input, i + 1);
+                    if (lt > 0) { // line continuation: see `preprocessWithOptions`
+                        i += 1 + lt;
+                        continue;
+                    }
+                }
                 try out.append(alloc, sc);
                 i += 1;
                 if (sc == '\\' and i < input.len) {
@@ -769,6 +1092,11 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 }
                 i += 1;
                 if (sc == '\\' and i < input.len) {
+                    const lt = lineTerminatorLen(input, i);
+                    if (lt > 0) { // line continuation: see `preprocessWithOptions`
+                        i += lt;
+                        continue;
+                    }
                     const esc = input[i];
                     i += 1;
                     if (esc == '\'') {
@@ -816,7 +1144,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 i += 2;
                 // See preprocess()'s identical fix: bare '\r' is also a line
                 // terminator (old Mac-style line endings), not just '\n'.
-                while (i < input.len and input[i] != '\n' and input[i] != '\r') i += 1;
+                while (i < input.len and input[i] != '\n' and input[i] != '\r' and !isLsPs(input, i)) i += 1;
                 continue;
             }
             if (input[i + 1] == '*') {
@@ -852,6 +1180,16 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 // a valid document with a fabricated value, which is worse
                 // than a rejection (W2 re-audit 2026-09-02, `json5` F6).
                 try out.append(alloc, ' ');
+                continue;
+            }
+        }
+
+        // ── JSON5-only whitespace → one plain space (see `preprocessWithOptions`)
+        if (c == 0x0B or c == 0x0C or c >= 0x80) {
+            const wl = json5WsLen(input, i);
+            if (wl > 0) {
+                try out.append(alloc, ' ');
+                i += wl;
                 continue;
             }
         }
@@ -907,8 +1245,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     }
                     // Peek past ALL whitespace incl. \n/\r — catches keys
                     // split by a newline (`file_type_o\n  ut: ...`).
-                    var j = i;
-                    while (j < input.len and isWs(input[j])) : (j += 1) {}
+                    const j = skipJson5Ws(input, i, true);
                     if (j >= input.len or input[j] == ':') {
                         try out.append(alloc, '"');
                         try out.appendSlice(alloc, input[key_start..i]);
@@ -961,9 +1298,11 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     // vendored in this repo exercise it, and none of them ran
                     // against this entry point
                     // (W2 re-audit 2026-09-02, `json5` F1).
-                    const num_start = i;
-                    i = scanNumber(input, i);
-                    try out.appendSlice(alloc, input[num_start..i]);
+                    //
+                    // The literal is also REWRITTEN here (hex, `.5`, `5.`, `+1`,
+                    // signed non-finite) by the same helper `preprocess` uses, so
+                    // the two entry points cannot disagree on a number.
+                    i = try emitNumber(alloc, &out, input, i, options, false, &lines);
                 } else if (!key_pos and std.ascii.isAlphabetic(c)) {
                     // Bare identifier in value position. Two cases:
                     //   (a) Followed by ':' inside an object → the comma between the
@@ -1009,18 +1348,23 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     } else {
                         // Case (b): pass JSON keywords through; wrap anything else.
                         i = jp;
-                        if (std.mem.eql(u8, ident, "true") or
+                        if (options.non_finite == .quoted and
+                            (std.mem.eql(u8, ident, "Infinity") or std.mem.eql(u8, ident, "NaN")))
+                        {
+                            try out.append(alloc, '"');
+                            try out.appendSlice(alloc, ident);
+                            try out.append(alloc, '"');
+                        } else if (std.mem.eql(u8, ident, "true") or
                             std.mem.eql(u8, ident, "false") or
                             std.mem.eql(u8, ident, "null") or
-                            // `Infinity`/`NaN` are JSON5 NUMBERS this module
-                            // defers (README Deferred #3). Wrapping them in
-                            // quotes did not defer them — it fabricated the
-                            // string "Infinity" where a number belonged, and
-                            // made a document parse that `preprocess` (and
-                            // the deferred contract) rejects. Pass them
-                            // through for `std.json` to refuse, like every
-                            // other deferred construct
-                            // (W2 re-audit 2026-09-02, `json5` F2).
+                            // `Infinity`/`NaN` are JSON5 NUMBERS. Under the
+                            // default `.reject` they are passed through for
+                            // `std.json` to refuse. Wrapping them in quotes
+                            // there fabricated the string "Infinity" where a
+                            // number belonged, and made a document parse that
+                            // `preprocess` rejects (W2 re-audit 2026-09-02,
+                            // `json5` F2). Under the explicit opt-in
+                            // `.quoted` (above) the string IS the contract.
                             std.mem.eql(u8, ident, "Infinity") or
                             std.mem.eql(u8, ident, "NaN"))
                         {
@@ -1790,4 +2134,435 @@ test "the local seed helper produces what Smith.slice reads back" {
     var buf: [32]u8 = undefined;
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
+}
+
+// ── JSON5 numeric literals, line continuations, JSON5 whitespace ────────────
+
+/// Both entry points, same options, same bytes out. The two share `emitNumber`
+/// on purpose; asserting both keeps them from drifting apart.
+fn expectRewriteOpts(src: []const u8, options: Options, want: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const plain = try preprocessWithOptions(alloc, src, options);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(want, plain);
+    const r = try preprocessAnnotatedWithOptions(alloc, src, options);
+    defer alloc.free(r.out);
+    try std.testing.expectEqualStrings(want, r.out);
+}
+
+fn expectRewrite(src: []const u8, want: []const u8) !void {
+    return expectRewriteOpts(src, .{}, want);
+}
+
+test "numeric literals: every JSON5 form becomes a plain JSON number" {
+    const cases = [_][2][]const u8{
+        .{ "[0x1A]", "[26]" },
+        .{ "[-0xff]", "[-255]" },
+        .{ "[0X1a]", "[26]" }, // upper-case X
+        .{ "[+0x1]", "[1]" },
+        .{ "[0x0]", "[0]" },
+        .{ "[-0x0]", "[-0]" },
+        .{ "[0x000ff]", "[255]" }, // leading zeros after the prefix carry no value
+        .{ "[0xDEADbeef]", "[3735928559]" },
+        .{ "[0xc8e4]", "[51428]" }, // `e` is a hex digit here, not an exponent
+        .{ "[.5]", "[0.5]" },
+        .{ "[5.]", "[5]" },
+        .{ "[-.5]", "[-0.5]" },
+        .{ "[+.5]", "[0.5]" },
+        .{ "[+1]", "[1]" },
+        .{ "[+0.0]", "[0.0]" },
+        .{ "[.5e3]", "[0.5e3]" },
+        .{ "[5.e2]", "[5e2]" }, // the JSON5 grammar allows `5.` before an exponent
+        .{ "[-5.E-2]", "[-5E-2]" },
+        .{ "[+1.5e+2]", "[1.5e+2]" },
+        // already-valid numbers come out byte-identical
+        .{ "[1, 2.5, -3, 0, -0, 1e10, 2E-3, 0.5]", "[1, 2.5, -3, 0, -0, 1e10, 2E-3, 0.5]" },
+        .{ "5.", "5" }, // top level
+        .{ "{a: .5, b: 0x10, c: +1}", "{\"a\": 0.5, \"b\": 16, \"c\": 1}" },
+        .{ "{\"a\": [.5, {b: -.5}]}", "{\"a\": [0.5, {\"b\": -0.5}]}" },
+    };
+    for (cases) |c| try expectRewrite(c[0], c[1]);
+}
+
+test "numeric literals: a hex value of any length becomes its exact decimal integer" {
+    const alloc = std.testing.allocator;
+    // 2^64 - 1, 2^64 and 2^128 - 1 — past u64, still exact (not a rounded float).
+    try expectRewrite("[0xFFFFFFFFFFFFFFFF]", "[18446744073709551615]");
+    try expectRewrite("[0x10000000000000000]", "[18446744073709551616]");
+    var buf: [64]u8 = undefined;
+    const max128 = try std.fmt.bufPrint(&buf, "[{d}]", .{std.math.maxInt(u128)});
+    try expectRewrite("[0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF]", max128);
+
+    // The largest accepted literal — 256 significant digits, 2^1024 - 1 — is
+    // checked against an independent bignum rather than a typed-in constant.
+    const digits = "F" ** hex_digits_max;
+    const out = try preprocess(alloc, "[0x" ++ digits ++ "]");
+    defer alloc.free(out);
+    try std.testing.expectEqual(@as(u8, '['), out[0]);
+    try std.testing.expectEqual(@as(u8, ']'), out[out.len - 1]);
+    var got = try std.math.big.int.Managed.init(alloc);
+    defer got.deinit();
+    try got.setString(10, out[1 .. out.len - 1]);
+    var want = try std.math.big.int.Managed.init(alloc);
+    defer want.deinit();
+    try want.setString(16, digits);
+    try std.testing.expect(got.eql(want));
+    // …and the same value with leading zeros in front of it.
+    const padded = try preprocess(alloc, "[0x00000" ++ digits ++ "]");
+    defer alloc.free(padded);
+    try std.testing.expectEqualStrings(out, padded);
+}
+
+test "numeric literals: a hex value beyond 256 significant digits is an error, not a rounding" {
+    const alloc = std.testing.allocator;
+    const src = "[0x1" ++ "0" ** hex_digits_max ++ "]"; // 257 digits
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.HexLiteralTooLarge, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
+    try std.testing.expectEqual(@as(usize, 1), diag.line);
+    try std.testing.expect(diag.message.len > 0);
+    // The annotated entry never fails: verbatim, and `std.json` refuses it.
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    try std.testing.expectEqualStrings(src, r.out);
+    try std.testing.expect(!jsonParses(alloc, r.out));
+}
+
+test "numeric literals: a hostile megabyte-class hex literal is refused cheaply, output stays bounded" {
+    const alloc = std.testing.allocator;
+    const big = try alloc.alloc(u8, 200_000);
+    defer alloc.free(big);
+    @memset(big, 'F');
+    const src = try std.mem.concat(alloc, u8, &.{ "[0x", big, "]" });
+    defer alloc.free(src);
+    try std.testing.expectError(error.HexLiteralTooLarge, preprocess(alloc, src));
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    try std.testing.expectEqual(src.len, r.out.len);
+}
+
+test "numeric literals: malformed ones pass through whole, for std.json to reject" {
+    // Not a single fragment may be re-scanned as a number of its own:
+    // `0x1.5` must not become `1` + `.5` -> `10.5`.
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "[01]", // JSON5 forbids a leading zero, and so must the output
+        "[-01]",
+        "[0x]",
+        "[0xG]",
+        "[0x1.5]",
+        "[1.2.3]",
+        "[.]",
+        "[1e]",
+        "[1e+]",
+        "[+]",
+        "[-.e5]",
+        "[1abc]",
+        "[..5]",
+        "[00.5]",
+    };
+    for (cases) |src| {
+        try expectRewrite(src, src);
+        try std.testing.expect(!jsonParses(alloc, src));
+    }
+}
+
+test "numeric literals: a stray sign or word keeps its old handling" {
+    // `-foo` is not a number: the `-` goes through alone and `foo` is a bare
+    // identifier again (the annotated entry wraps and reports it).
+    const alloc = std.testing.allocator;
+    const plain = try preprocess(alloc, "[-foo]");
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("[-foo]", plain);
+    const r = try preprocessAnnotated(alloc, "{a: -foo}");
+    defer alloc.free(r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "$err_1") != null);
+}
+
+test "non-finite numbers: an error by default, with a line and a message" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{ "[Infinity]", "[-Infinity]", "[+Infinity]", "[NaN]", "[-NaN]", "[+NaN]", "NaN", "{a: Infinity}" };
+    for (cases) |src| {
+        var diag: Diagnostic = .{};
+        try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
+        try std.testing.expectEqual(@as(usize, 1), diag.line);
+        try std.testing.expect(std.mem.indexOf(u8, diag.message, ".quoted") != null);
+        try std.testing.expectError(error.NonFiniteNumber, preprocess(alloc, src)); // no diagnostic asked for
+    }
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, "{\n  a: 1,\n  b: NaN,\n}", .{ .diagnostic = &diag }));
+    try std.testing.expectEqual(@as(usize, 3), diag.line);
+}
+
+test "non-finite numbers: the annotated entry passes them through, so recovery never changes the verdict" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{ "[NaN]", "[-Infinity]", "[+Infinity]", "{a: Infinity}", "{a: -NaN}" };
+    for (cases) |src| {
+        const r = try preprocessAnnotated(alloc, src);
+        defer alloc.free(r.out);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "$err") == null);
+        try std.testing.expect(!jsonParses(alloc, r.out));
+    }
+    try std.testing.expectEqual(@as(u32, 1), (try annotatedNextId(alloc, "[NaN]")));
+}
+
+fn annotatedNextId(alloc: std.mem.Allocator, src: []const u8) !u32 {
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    return r.next_id;
+}
+
+test "non_finite = .quoted: rewritten to the strings Infinity, -Infinity, NaN" {
+    const q: Options = .{ .non_finite = .quoted };
+    try expectRewriteOpts(
+        "[Infinity, -Infinity, +Infinity, NaN, -NaN, +NaN]",
+        q,
+        "[\"Infinity\", \"-Infinity\", \"Infinity\", \"NaN\", \"NaN\", \"NaN\"]",
+    );
+    try expectRewriteOpts("{a: NaN, b: -Infinity}", q, "{\"a\": \"NaN\", \"b\": \"-Infinity\"}");
+    try expectRewriteOpts("NaN", q, "\"NaN\"");
+    // keys are identifiers, not numbers
+    try expectRewriteOpts("{Infinity: 1, NaN: 2}", q, "{\"Infinity\": 1, \"NaN\": 2}");
+    // glued to a longer identifier it is no non-finite word: left alone, still invalid
+    const alloc = std.testing.allocator;
+    const glued = try preprocessWithOptions(alloc, "[Infinityx]", q);
+    defer alloc.free(glued);
+    try std.testing.expectEqualStrings("[Infinityx]", glued);
+    try std.testing.expect(!jsonParses(alloc, glued));
+    // the other numeric rewrites are independent of the option
+    try expectRewriteOpts("[.5, 0x10, +1]", q, "[0.5, 16, 1]");
+}
+
+test "the same bytes inside strings, comments and keys are never rewritten" {
+    const alloc = std.testing.allocator;
+    const src =
+        "{\"a\": \".5 0x1A +1 5. Infinity -NaN\", 'b': '.5 0x1A +1 5. NaN',\n" ++
+        "  // .5 0x1A +1 Infinity NaN\n" ++
+        "  c: 1, /* .5 0x1A +1 Infinity NaN */ d: 2,\n" ++
+        "  \"0x1A\": 3, '.5': 4, 'NaN': 5, e: [ 'Infinity', \".5\" ] }";
+    inline for (.{ NonFinite.reject, NonFinite.quoted }) |mode| {
+        inline for (.{ false, true }) |annotated| {
+            const options: Options = .{ .non_finite = mode };
+            const out = if (annotated) blk: {
+                const r = try preprocessAnnotatedWithOptions(alloc, src, options);
+                break :blk r.out;
+            } else try preprocessWithOptions(alloc, src, options);
+            defer alloc.free(out);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+            defer parsed.deinit();
+            const o = parsed.value.object;
+            try std.testing.expectEqual(@as(usize, 8), o.count());
+            try std.testing.expectEqualStrings(".5 0x1A +1 5. Infinity -NaN", o.get("a").?.string);
+            try std.testing.expectEqualStrings(".5 0x1A +1 5. NaN", o.get("b").?.string);
+            try std.testing.expectEqual(@as(i64, 1), o.get("c").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), o.get("d").?.integer);
+            try std.testing.expectEqual(@as(i64, 3), o.get("0x1A").?.integer);
+            try std.testing.expectEqual(@as(i64, 4), o.get(".5").?.integer);
+            try std.testing.expectEqual(@as(i64, 5), o.get("NaN").?.integer);
+            try std.testing.expectEqualStrings("Infinity", o.get("e").?.array.items[0].string);
+            try std.testing.expectEqualStrings(".5", o.get("e").?.array.items[1].string);
+        }
+    }
+}
+
+const line_terminators = [_][]const u8{ "\n", "\r\n", "\r", "\u{2028}", "\u{2029}" };
+
+test "line continuation: backslash + any line terminator disappears from a string" {
+    const alloc = std.testing.allocator;
+    inline for (line_terminators) |lt| {
+        try expectRewrite("[\"ab\\" ++ lt ++ "cd\"]", "[\"abcd\"]");
+        try expectRewrite("['ab\\" ++ lt ++ "cd']", "[\"abcd\"]");
+        // two in a row, and one at the very start and end of the string
+        try expectRewrite("[\"\\" ++ lt ++ "a\\" ++ lt ++ "\\" ++ lt ++ "b\\" ++ lt ++ "\"]", "[\"ab\"]");
+        // as the value of a key, in the annotated entry's object branch too
+        try expectRewrite("{k: 'x\\" ++ lt ++ "y'}", "{\"k\": \"xy\"}");
+    }
+    // CRLF is ONE terminator: nothing of it may survive as an escape or a raw byte.
+    const out = try preprocess(alloc, "[\"a\\\r\nb\"]");
+    defer alloc.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ab", parsed.value.array.items[0].string);
+}
+
+test "line continuation: only a REAL backslash starts one, and only inside a string" {
+    // `\\` is an escaped backslash, so the newline after it is a raw one:
+    // untouched (and std.json rejects the raw control byte).
+    const alloc = std.testing.allocator;
+    const raw = "[\"a\\\\\nb\"]";
+    const out = try preprocess(alloc, raw);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(raw, out);
+    try std.testing.expect(!jsonParses(alloc, out));
+    // an ordinary escape stays an escape
+    try expectRewrite("[\"a\\nb\"]", "[\"a\\nb\"]");
+    // a comment has no continuation: the backslash-newline ends it like any newline
+    inline for (line_terminators) |lt| {
+        const o2 = try preprocess(alloc, "[1, // c \\" ++ lt ++ "2]");
+        defer alloc.free(o2);
+        const p = try std.json.parseFromSlice(std.json.Value, alloc, o2, .{});
+        defer p.deinit();
+        try std.testing.expectEqual(@as(usize, 2), p.value.array.items.len);
+    }
+    // a truncated backslash-terminator at end of input must not read out of bounds
+    _ = try annotatedNextId(alloc, "\"ab\\\xE2\x80");
+    const t = try preprocess(alloc, "['ab\\\xE2");
+    alloc.free(t);
+    const t2 = try preprocess(alloc, "\"ab\\");
+    alloc.free(t2);
+}
+
+const ws_kinds = [_][]const u8{
+    "\x0B", // vertical tab
+    "\x0C", // form feed
+    "\u{00A0}", // NBSP
+    "\u{FEFF}", // BOM / ZWNBSP
+    "\u{2028}", // LINE SEPARATOR
+    "\u{2029}", // PARAGRAPH SEPARATOR
+    "\u{1680}", // Ogham space mark (Zs)
+    "\u{2000}", // en quad (Zs)
+    "\u{2003}", // em space (Zs)
+    "\u{200A}", // hair space (Zs)
+    "\u{202F}", // narrow NBSP (Zs)
+    "\u{205F}", // medium mathematical space (Zs)
+    "\u{3000}", // ideographic space (Zs)
+};
+
+test "JSON5 whitespace between tokens becomes a plain space" {
+    const alloc = std.testing.allocator;
+    inline for (ws_kinds) |ws| {
+        try expectRewrite("[1," ++ ws ++ "2]", "[1, 2]");
+        try expectRewrite("[" ++ ws ++ "1" ++ ws ++ "]", "[ 1 ]");
+        try expectRewrite("{" ++ ws ++ "a: 1}", "{ \"a\": 1}");
+        // between an unquoted key and its colon the key must still be a key.
+        // (U+2028/U+2029 are line terminators, and `preprocess` deliberately
+        // ends an unquoted key at a newline — see its key peek.)
+        if (comptime !(std.mem.eql(u8, ws, "\u{2028}") or std.mem.eql(u8, ws, "\u{2029}"))) {
+            try expectRewrite("{a" ++ ws ++ ": 1}", "{\"a\" : 1}");
+        }
+        try expectRewrite("{\"a\":" ++ ws ++ "1," ++ ws ++ "}", "{\"a\": 1}");
+        // and the result is a document std.json reads
+        const out = try preprocess(alloc, ws ++ "{" ++ ws ++ "a:" ++ ws ++ "[" ++ ws ++ "1" ++ ws ++ "]" ++ ws ++ "}" ++ ws);
+        defer alloc.free(out);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("a").?.array.items[0].integer);
+    }
+}
+
+test "JSON5 whitespace is left alone inside strings, and lookalikes are not whitespace" {
+    const alloc = std.testing.allocator;
+    const inside = "[\"a\u{00A0}b\u{FEFF}c\u{2028}d\u{3000}e\"]";
+    try expectRewrite(inside, inside);
+    try expectRewrite("['a\u{00A0}b']", "[\"a\u{00A0}b\"]");
+    // U+200B (zero width space) and U+00A1 are NOT Zs: rewriting them would
+    // accept a document JSON5 rejects.
+    inline for (.{ "\u{200B}", "\u{00A1}", "\u{2027}", "\u{180E}", "\u{3001}" }) |odd| {
+        try expectRewrite("[" ++ odd ++ "1]", "[" ++ odd ++ "1]");
+        try std.testing.expect(!jsonParses(alloc, "[" ++ odd ++ "1]"));
+    }
+    // U+2028/U+2029 end a `//` comment (they are JSON5 line terminators)
+    inline for (.{ "\u{2028}", "\u{2029}" }) |lt| {
+        const out = try preprocess(alloc, "[1, // c" ++ lt ++ "2]");
+        defer alloc.free(out);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    }
+    // truncated multi-byte sequences at end of input: no panic, no rewrite
+    inline for (ws_kinds) |ws| {
+        inline for (0..ws.len) |k| {
+            const src = "[1," ++ ws[0..k];
+            const out = try preprocess(alloc, src);
+            alloc.free(out);
+            const r = try preprocessAnnotated(alloc, src);
+            alloc.free(r.out);
+        }
+    }
+}
+
+test "std.json reads the rewritten output of a combined document into a typed struct" {
+    const alloc = std.testing.allocator;
+    const Cfg = struct {
+        timeout: f64,
+        retries: i32,
+        mask: u64,
+        neg: i64,
+        half: f64,
+        ratio: f64,
+        big: f64,
+        inf: f64,
+        ninf: f64,
+        pinf: f64,
+        nan: f64,
+        name: []const u8,
+        tags: []const []const u8,
+    };
+    const src =
+        "\u{FEFF}{ // a JSON5 config\n" ++
+        "  timeout:\u{00A0}.5,\n" ++
+        "  retries: +3,\x0C\n" ++
+        "  mask: 0xDEADbeef,\n" ++
+        "  neg: -0x10,\n" ++
+        "  half: 5.,\n" ++
+        "  ratio: -.25e1,\n" ++
+        "  big: 0xFFFFFFFFFFFFFFFFFF, /* 2^72 - 1 */\n" ++
+        "  inf: Infinity,\n" ++
+        "  ninf: -Infinity,\n" ++
+        "  pinf: +Infinity,\n" ++
+        "  nan: NaN,\n" ++
+        "  name: 'multi\\\r\nline',\u{2028}\n" ++
+        "  tags: ['a', \"b\", 'c\\\u{2029}d',],\n" ++
+        "}";
+    // the default refuses, with the reason
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.NonFiniteNumber, preprocessWithOptions(alloc, src, .{ .diagnostic = &diag }));
+    try std.testing.expectEqual(@as(usize, 9), diag.line);
+
+    inline for (.{ false, true }) |annotated| {
+        const options: Options = .{ .non_finite = .quoted };
+        const out = if (annotated) blk: {
+            const r = try preprocessAnnotatedWithOptions(alloc, src, options);
+            break :blk r.out;
+        } else try preprocessWithOptions(alloc, src, options);
+        defer alloc.free(out);
+        const parsed = try std.json.parseFromSlice(Cfg, alloc, out, .{});
+        defer parsed.deinit();
+        const v = parsed.value;
+        try std.testing.expectEqual(@as(f64, 0.5), v.timeout);
+        try std.testing.expectEqual(@as(i32, 3), v.retries);
+        try std.testing.expectEqual(@as(u64, 0xDEADBEEF), v.mask);
+        try std.testing.expectEqual(@as(i64, -16), v.neg);
+        try std.testing.expectEqual(@as(f64, 5.0), v.half);
+        try std.testing.expectEqual(@as(f64, -2.5), v.ratio);
+        try std.testing.expectEqual(@as(f64, 0x1p72), v.big);
+        try std.testing.expect(std.math.isInf(v.inf) and v.inf > 0);
+        try std.testing.expect(std.math.isInf(v.ninf) and v.ninf < 0);
+        try std.testing.expect(std.math.isInf(v.pinf) and v.pinf > 0);
+        try std.testing.expect(std.math.isNan(v.nan));
+        try std.testing.expectEqualStrings("multiline", v.name);
+        try std.testing.expectEqual(@as(usize, 3), v.tags.len);
+        try std.testing.expectEqualStrings("cd", v.tags[2]);
+    }
+}
+
+test "the two entry points agree on whether the new forms parse" {
+    const alloc = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "[.5, 0x1A, +1, 5.]",   "[0x1.5]",     "[1.2.3]",    "[NaN]",
+        "{a: Infinity, b: .5}", "['a\\\nb']",  "[1,\x0C2]",  "{a b: .5}",
+        "[0x]",                 "[-Infinity]", "{a: -foo}",  "[+]",
+        "{\"a\": 0xFF, }",      "[1/*c*/.5]",  "[.5/*c*/2]", "\u{FEFF}[1]",
+    };
+    inline for (.{ NonFinite.reject, NonFinite.quoted }) |mode| {
+        for (inputs) |src| {
+            const options: Options = .{ .non_finite = mode };
+            const plain_ok = if (preprocessWithOptions(alloc, src, options)) |o| blk: {
+                defer alloc.free(o);
+                break :blk jsonParses(alloc, o);
+            } else |_| false;
+            const r = try preprocessAnnotatedWithOptions(alloc, src, options);
+            defer alloc.free(r.out);
+            try std.testing.expectEqual(plain_ok, jsonParses(alloc, r.out));
+        }
+    }
 }

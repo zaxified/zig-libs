@@ -15,9 +15,11 @@
 //! `std.json.parseFromSlice`, which is where JSON5-vs-JSON syntax actually
 //! gets enforced.
 //!
-//! Vectors marked `out_of_scope` are counted (`total_out_of_scope` below is
-//! a canary against silently dropping one) but not asserted against
-//! `expect` -- each names a specific README "Deferred" bullet.
+//! Vectors marked `out_of_scope` are counted (the canary below guards against
+//! silently dropping one) but not asserted against `expect` in the ordinary
+//! loop. Since 2026-09-30 those are exactly the five fixtures containing
+//! `Infinity`/`NaN`, which are an ERROR by default; their own test asserts that
+//! and that `non_finite = .quoted` makes them parse.
 //!
 //! `known_disagreement` vectors ARE asserted, but against the OPPOSITE of
 //! `expect` -- pinning a case where this module's own recovery-by-design
@@ -68,7 +70,11 @@ fn isKnownDisagreement(path: []const u8) bool {
 /// Run one fixture through preprocess -> std.json and report whether the
 /// result is parseable JSON.
 fn actuallyParses(alloc: std.mem.Allocator, content: []const u8) !bool {
-    const out = try json5.preprocess(alloc, content);
+    // `Infinity`/`NaN` are refused by default: that is a rejection here.
+    const out = json5.preprocess(alloc, content) catch |err| switch (err) {
+        error.NonFiniteNumber => return false,
+        else => return err,
+    };
     defer alloc.free(out);
     // duplicate_field_behavior: std.json defaults to erroring on a repeated
     // key, but JSON syntax permits duplicate keys (objects/duplicate-keys.json
@@ -93,7 +99,7 @@ test "json5-tests corpus: vendored count matches expectation (canary)" {
     for (vectors_mod.vectors) |v| {
         if (v.out_of_scope != null) out_of_scope_count += 1;
     }
-    try testing.expectEqual(@as(usize, 37), out_of_scope_count);
+    try testing.expectEqual(@as(usize, 5), out_of_scope_count);
 }
 
 test "json5-tests corpus: in-scope fixtures match the upstream extension convention" {
@@ -109,9 +115,7 @@ test "json5-tests corpus: in-scope fixtures match the upstream extension convent
     // whichever one happens to sort first.
     for (vectors_mod.vectors) |v| {
         if (v.out_of_scope) |_| {
-            // Still must not crash/OOM even though we don't assert the verdict.
-            const out = try json5.preprocess(alloc, v.content);
-            alloc.free(out);
+            // Asserted by "the non-finite fixtures" below, not by the extension.
             skipped_out_of_scope += 1;
             continue;
         }
@@ -145,10 +149,26 @@ test "json5-tests corpus: in-scope fixtures match the upstream extension convent
     }
 
     try testing.expectEqual(@as(usize, 2), skipped_disagreement);
-    try testing.expectEqual(@as(usize, 37), skipped_out_of_scope);
+    try testing.expectEqual(@as(usize, 5), skipped_out_of_scope);
     try testing.expectEqual(vectors_mod.vectors.len, checked + skipped_out_of_scope + skipped_disagreement);
     try testing.expectEqual(@as(usize, 0), resolved_disagreements);
     try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "json5-tests corpus: the non-finite fixtures are an error by default and parse under .quoted" {
+    const alloc = testing.allocator;
+    var seen: usize = 0;
+    for (vectors_mod.vectors) |v| {
+        if (v.out_of_scope == null) continue;
+        seen += 1;
+        try testing.expectError(error.NonFiniteNumber, json5.preprocess(alloc, v.content));
+        const out = try json5.preprocessWithOptions(alloc, v.content, .{ .non_finite = .quoted });
+        defer alloc.free(out);
+        // Every one of these is a must-parse fixture upstream.
+        try testing.expectEqual(Expect.must_parse, v.expect);
+        try testing.expect(try parsesAsJson(alloc, out));
+    }
+    try testing.expectEqual(@as(usize, 5), seen);
 }
 
 test "json5-tests corpus: the two entry points agree on the document" {
@@ -160,31 +180,41 @@ test "json5-tests corpus: the two entry points agree on the document" {
     // The property asserted is a DIFFERENTIAL, not the README's old absolute
     // "the output is always valid JSON" — that claim is not achievable and
     // never was: empty input cannot become valid JSON, and a JSON5 construct
-    // this module defers (`.5`, `5.`, `0x`, an escaped line continuation) is
-    // passed through verbatim for `std.json` to reject, which is the intended
-    // division of labour. What IS achievable, and what a caller relies on, is
+    // this module cannot express (`Infinity`/`NaN` by default, a malformed
+    // number) is passed through verbatim for `std.json` to reject, which is the
+    // intended division of labour. What IS achievable, and what a caller relies on, is
     // that turning diagnostics on does not change whether the document
     // parses. Eight must-parse plain-JSON numbers failed exactly this before
     // the exponent fix.
     var disagreements: usize = 0;
-    for (vectors_mod.vectors) |v| {
-        const plain = try json5.preprocess(alloc, v.content);
-        defer alloc.free(plain);
-        const r = try json5.preprocessAnnotated(alloc, v.content);
-        defer alloc.free(r.out);
+    // Both non-finite modes: under the default `preprocess` REFUSES the five
+    // Infinity/NaN fixtures (counted as "does not parse") and the annotated
+    // entry passes the token through, which `std.json` rejects too.
+    inline for (.{ json5.NonFinite.reject, json5.NonFinite.quoted }) |mode| {
+        const options: json5.Options = .{ .non_finite = mode };
+        for (vectors_mod.vectors) |v| {
+            const r = try json5.preprocessAnnotatedWithOptions(alloc, v.content, options);
+            defer alloc.free(r.out);
 
-        const plain_ok = parsesAsJson(alloc, plain) catch |e| return e;
-        const ann_ok = parsesAsJson(alloc, r.out) catch |e| return e;
-        if (plain_ok != ann_ok) {
-            disagreements += 1;
-            std.debug.print(
-                "\n{s}: preprocess parses={}, preprocessAnnotated parses={}\n  in : {s}\n  out: {s}\n",
-                .{ v.path, plain_ok, ann_ok, v.content, r.out },
-            );
+            const plain_ok = if (json5.preprocessWithOptions(alloc, v.content, options)) |plain| blk: {
+                defer alloc.free(plain);
+                break :blk try parsesAsJson(alloc, plain);
+            } else |e| switch (e) {
+                error.NonFiniteNumber => false,
+                else => return e,
+            };
+            const ann_ok = try parsesAsJson(alloc, r.out);
+            if (plain_ok != ann_ok) {
+                disagreements += 1;
+                std.debug.print(
+                    "\n{s} ({s}): preprocess parses={}, preprocessAnnotated parses={}\n  in : {s}\n  out: {s}\n",
+                    .{ v.path, @tagName(mode), plain_ok, ann_ok, v.content, r.out },
+                );
+            }
         }
     }
     if (disagreements != 0) {
-        std.debug.print("\n{d} of {d} fixtures disagree between the two entry points\n", .{ disagreements, vectors_mod.vectors.len });
+        std.debug.print("\n{d} fixture runs disagree between the two entry points\n", .{disagreements});
         return error.EntryPointsDisagree;
     }
 }

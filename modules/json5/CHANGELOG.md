@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **JSON5 numeric literals, string line continuations and JSON5 whitespace**
+  (survey items; scope raised from mvp to core). Both entry points now rewrite into plain JSON:
+  hex `0x1A`/`-0xff`/`0X1a` → the exact decimal integer (any value up to
+  `hex_digits_max` = 256 significant hex digits; longer is `error.HexLiteralTooLarge`, passed through
+  verbatim by the annotated entry), `.5` → `0.5`, `5.` → `5`, `5.e2` → `5e2`, `+1` → `1`; backslash +
+  LF/CR/CRLF/U+2028/U+2029 inside a string is removed; form feed, vertical tab, NBSP, BOM,
+  U+2028/2029 and the Unicode Zs spaces between tokens become one space, and U+2028/2029 end a `//`
+  comment. Malformed numbers (`01`, `0x`, `0x1.5`, `1.2.3`) pass through whole so `std.json`
+  rejects them and no fragment is re-scanned as a second number. Nothing inside strings, comments
+  or keys is touched. **`Infinity`/`-Infinity`/`+Infinity`/`NaN`: an error by default**
+  (`error.NonFiniteNumber`, plus `Options.diagnostic` with line and message); opt-in
+  `Options{ .non_finite = .quoted }` rewrites them to the strings `"Infinity"`/`"-Infinity"`/`"NaN"`
+  (never `null`), which `std.json` reads into an `f64` as `inf`/`nan`. New API:
+  `preprocessWithOptions`, `preprocessAnnotatedWithOptions`, `Options`, `NonFinite`, `Diagnostic`,
+  `hex_digits_max`; `preprocess`/`preprocessAnnotated` keep their signatures but `preprocess` can now
+  return the two new errors. Corpus: 37 → 5 out-of-scope fixtures (only the `Infinity`/`NaN` ones,
+  asserted by a test of their own).
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/json5_tests_vectors.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
