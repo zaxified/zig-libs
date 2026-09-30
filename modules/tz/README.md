@@ -51,6 +51,22 @@ spelling exactly). `offsetAt`:
    year, falling back to the last transition's offset if the footer can't be
    evaluated (see Defer below).
 
+### Local wall-clock time → UTC
+
+```zig
+// `local` is the wall clock read as if it were UTC (datefmt.partsToUnix of the local fields).
+fn resolveLocal(zone: *const tz.Zone, local: i64) tz.LocalTime;
+// .unique: i64 | .ambiguous: {earlier, later} (fold) | .nonexistent: {earlier, later} (gap)
+fn localToUtc(zone: *const tz.Zone, local: i64, policy: tz.Disambiguation) !i64;
+// policy: .compatible (fold→earlier, gap→later; java.time/Python fold=0), .earlier, .later,
+//         .reject (error.AmbiguousLocalTime / error.NonexistentLocalTime)
+```
+
+Prague, 2024-03-31 02:30 (skipped): `.compatible`/`.later` → 01:30Z (reads as
+03:30 CEST), `.earlier` → 00:30Z (01:30 CET). 2024-10-27 02:30 (twice):
+`.earlier` → 00:30Z (CEST), `.later` → 01:30Z (CET). The policy is an explicit
+argument: there is no silent default for a time that does not exist.
+
 ## Defer (not in this extraction)
 
 - The POSIX footer parser evaluates all three POSIX rule forms: `Mm.w.d`

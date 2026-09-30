@@ -91,7 +91,30 @@ pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
 
 const DEFAULT_DST_TIME: i32 = 2 * 3600; // 02:00 local, POSIX default
 
-fn posixOffset(posix: []const u8, unix: i64) ?Offset {
+/// A parsed POSIX-TZ footer: a constant offset, or standard + daylight
+/// offsets with the two yearly rules.
+const PosixRule = struct {
+    utc_std: i32,
+    dst: ?struct {
+        utc_dst: i32,
+        start: Rule,
+        start_time: i32,
+        end: Rule,
+        end_time: i32,
+    },
+
+    /// The UTC instants DST starts and ends in `year` (the year `offsetAt`
+    /// evaluates an instant in is its UTC year).
+    fn transitionsIn(p: PosixRule, year: i32) ?[2]i64 {
+        const d = p.dst orelse return null;
+        const start_local = ruleDateUnix(year, d.start, d.start_time) orelse return null;
+        const end_local = ruleDateUnix(year, d.end, d.end_time) orelse return null;
+        // Transition instants: start is given in standard time, end in daylight time.
+        return .{ start_local - p.utc_std, end_local - d.utc_dst };
+    }
+};
+
+fn parsePosix(posix: []const u8) ?PosixRule {
     if (posix.len == 0) return null;
     var i: usize = 0;
 
@@ -99,7 +122,7 @@ fn posixOffset(posix: []const u8, unix: i64) ?Offset {
     const std_written = parseOffsetSeconds(posix, &i) orelse return null;
     const utc_std: i32 = -std_written; // POSIX offset is add-to-local-for-UTC
 
-    if (i >= posix.len) return .{ .off = utc_std, .dst = false }; // no DST → constant
+    if (i >= posix.len) return .{ .utc_std = utc_std, .dst = null }; // no DST → constant
 
     skipAbbrev(posix, &i); // dst abbrev
     // Optional explicit DST offset; default is one hour east of standard.
@@ -117,21 +140,179 @@ fn posixOffset(posix: []const u8, unix: i64) ?Offset {
     i += 1;
     const end = parseRule(posix, &i) orelse return null;
     const end_time = parseRuleTime(posix, &i);
+    return .{ .utc_std = utc_std, .dst = .{
+        .utc_dst = utc_dst,
+        .start = start,
+        .start_time = start_time,
+        .end = end,
+        .end_time = end_time,
+    } };
+}
 
-    const year = datefmt.unixToParts(unix).year;
-    const start_local = ruleDateUnix(year, start, start_time) orelse return null;
-    const end_local = ruleDateUnix(year, end, end_time) orelse return null;
-    // Transition instants: start is given in standard time, end in daylight time.
-    const start_utc = start_local - utc_std;
-    const end_utc = end_local - utc_dst;
+fn posixOffset(posix: []const u8, unix: i64) ?Offset {
+    const p = parsePosix(posix) orelse return null;
+    const d = p.dst orelse return .{ .off = p.utc_std, .dst = false };
+    const t = p.transitionsIn(datefmt.unixToParts(unix).year) orelse return null;
+    const start_utc = t[0];
+    const end_utc = t[1];
 
     const in_dst = if (start_utc <= end_utc)
         (unix >= start_utc and unix < end_utc) // northern hemisphere
     else
         (unix >= start_utc or unix < end_utc); // southern hemisphere (wraps year)
 
-    return if (in_dst) .{ .off = utc_dst, .dst = true } else .{ .off = utc_std, .dst = false };
+    return if (in_dst) .{ .off = d.utc_dst, .dst = true } else .{ .off = p.utc_std, .dst = false };
 }
+
+// ---------------------------------------------------------------------------
+// Local wall-clock time → UTC
+// ---------------------------------------------------------------------------
+
+/// What a local wall-clock time names in a zone. `local` is the wall clock
+/// read as if it were UTC (`datefmt.partsToUnix` of the local date and time).
+pub const LocalTime = union(enum) {
+    /// Exactly one instant shows this wall-clock time.
+    unique: i64,
+    /// A fold: the clocks were set back, so the wall clock showed this time
+    /// twice. `earlier` is the first pass (the offset before the change),
+    /// `later` the second.
+    ambiguous: struct { earlier: i64, later: i64 },
+    /// A gap: the clocks were set forward over this time, so no instant shows
+    /// it. `earlier` reads it with the offset after the gap, `later` with the
+    /// offset before it — the two instants the time is conventionally mapped
+    /// to (both lie on either side of the jump, `later - earlier` = its size).
+    nonexistent: struct { earlier: i64, later: i64 },
+};
+
+/// How `localToUtc` settles a local time that is not `unique`. The names are
+/// Temporal's (`ZonedDateTime` `disambiguation`), and `compatible` is also
+/// what java.time (`ZonedDateTime.ofLocal`) and Python (`fold=0`) do.
+pub const Disambiguation = enum {
+    /// Fold → earlier; gap → later (moved forward by the gap's size:
+    /// 02:30 in a 02:00→03:00 jump becomes 03:30).
+    compatible,
+    /// Fold → earlier; gap → earlier (moved back: 02:30 becomes 01:30).
+    earlier,
+    /// Fold → later; gap → later.
+    later,
+    /// Fold → `error.AmbiguousLocalTime`; gap → `error.NonexistentLocalTime`.
+    reject,
+};
+
+pub const LocalToUtcError = error{ AmbiguousLocalTime, NonexistentLocalTime };
+
+/// The UTC instant a local wall-clock time names in `zone`, with `policy`
+/// deciding folds and gaps. `local` as in `LocalTime`.
+pub fn localToUtc(zone: *const tz_data.Zone, local: i64, policy: Disambiguation) LocalToUtcError!i64 {
+    return switch (resolveLocal(zone, local)) {
+        .unique => |u| u,
+        .ambiguous => |a| switch (policy) {
+            .compatible, .earlier => a.earlier,
+            .later => a.later,
+            .reject => error.AmbiguousLocalTime,
+        },
+        .nonexistent => |g| switch (policy) {
+            .compatible, .later => g.later,
+            .earlier => g.earlier,
+            .reject => error.NonexistentLocalTime,
+        },
+    };
+}
+
+/// Every offset change a zone can have near an instant lies within this
+/// distance: UTC offsets stay within ±26 h (POSIX's own bound is ±24:59:59),
+/// and a change is found from both of its sides.
+const local_window: i64 = 2 * 86400;
+
+/// Classify a local wall-clock time in `zone`: the instants `u` with
+/// `u + offsetAt(zone, u).off == local`, or the gap it falls into.
+pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
+    // Candidate offsets: the one in force at the window's start and the new
+    // one at every change point inside it. A candidate `o` is real when the
+    // instant it implies, `local - o`, carries `o` itself.
+    var cands: Changes = .{};
+    cands.collect(zone, local -| local_window, local +| local_window);
+
+    var found: [max_changes + 1]i64 = undefined;
+    var n: usize = 0;
+    var offs: [max_changes + 1]i32 = undefined;
+    var n_offs: usize = 0;
+    offs[n_offs] = offsetAt(zone, local -| local_window).off;
+    n_offs += 1;
+    for (cands.at[0..cands.len]) |t| {
+        const o = offsetAt(zone, t).off;
+        if (std.mem.indexOfScalar(i32, offs[0..n_offs], o) == null) {
+            offs[n_offs] = o;
+            n_offs += 1;
+        }
+    }
+    for (offs[0..n_offs]) |o| {
+        const u = local -| @as(i64, o);
+        if (offsetAt(zone, u).off != o) continue;
+        if (std.mem.indexOfScalar(i64, found[0..n], u) == null) {
+            found[n] = u;
+            n += 1;
+        }
+    }
+    if (n == 1) return .{ .unique = found[0] };
+    if (n >= 2) {
+        std.mem.sort(i64, found[0..n], {}, std.sort.asc(i64));
+        return .{ .ambiguous = .{ .earlier = found[0], .later = found[n - 1] } };
+    }
+    // No instant shows `local`: find the forward jump that skipped it.
+    for (cands.at[0..cands.len]) |t| {
+        const before = offsetAt(zone, t -| 1).off;
+        const after = offsetAt(zone, t).off;
+        if (after > before and t +| @as(i64, before) <= local and local < t +| @as(i64, after))
+            return .{ .nonexistent = .{ .earlier = local -| @as(i64, after), .later = local -| @as(i64, before) } };
+    }
+    // Unreachable for well-formed zone data (a wall-clock time either is
+    // shown or was jumped over); answer with the offset in force, never a
+    // panic on generated data.
+    const o = offsetAt(zone, local).off;
+    return .{ .unique = local -| @as(i64, o) };
+}
+
+/// Upper bound on the change points one window can hold: explicit transitions
+/// are months apart in every real zone, and the POSIX rule adds two per year
+/// over the three years a 4-day window can touch.
+const max_changes = 16;
+
+/// The instants in `[lo, hi]` at which `zone`'s offset may change: its
+/// explicit transitions, and the POSIX-footer changes of the years around.
+/// A superset is fine — `resolveLocal` checks every candidate.
+const Changes = struct {
+    at: [max_changes]i64 = undefined,
+    len: usize = 0,
+
+    fn add(c: *Changes, t: i64) void {
+        if (c.len < max_changes) {
+            c.at[c.len] = t;
+            c.len += 1;
+        }
+    }
+
+    fn collect(c: *Changes, zone: *const tz_data.Zone, lo: i64, hi: i64) void {
+        const tr = zone.trans;
+        // First transition with ts >= lo.
+        var a: usize = 0;
+        var b: usize = tr.len;
+        while (a < b) {
+            const mid = a + (b - a) / 2;
+            if (tr[mid].ts < lo) a = mid + 1 else b = mid;
+        }
+        while (a < tr.len and tr[a].ts <= hi) : (a += 1) c.add(tr[a].ts);
+        const p = parsePosix(zone.posix) orelse return;
+        if (p.dst == null) return;
+        const y_lo = datefmt.unixToParts(lo).year;
+        const y_hi = datefmt.unixToParts(hi).year;
+        var y = y_lo - 1;
+        while (y <= y_hi + 1) : (y += 1) {
+            const t = p.transitionsIn(y) orelse continue;
+            for (t) |x| if (x >= lo and x <= hi) c.add(x);
+        }
+    }
+};
 
 const Rule = union(enum) {
     mwd: struct { month: i32, week: i32, day: i32 }, // Mm.w.d
@@ -254,6 +435,133 @@ const testing = std.testing;
 // and left three of those four places saying 600. Pin it here, so a
 // regeneration that changes the count cannot land without someone walking past
 // the number.
+const local_kat = @import("local_kat.zig");
+
+test "resolveLocal: every Python-zoneinfo vector (same pinned tzdata)" {
+    try testing.expectEqualStrings(local_kat.release, tz_release);
+    var seen = [_]usize{0} ** 3;
+    for (local_kat.rows, 0..) |row, i| {
+        const z = find(local_kat.zones[row.zone]).?;
+        const got = resolveLocal(z, row.local);
+        const ok = switch (row.kind) {
+            .unique => got == .unique and got.unique == row.earlier,
+            .ambiguous => got == .ambiguous and got.ambiguous.earlier == row.earlier and got.ambiguous.later == row.later,
+            .nonexistent => got == .nonexistent and got.nonexistent.earlier == row.earlier and got.nonexistent.later == row.later,
+        };
+        if (!ok) {
+            std.debug.print("local_kat row {d}: {s} local={d} want {t} {d}/{d}, got {any}\n", .{
+                i, local_kat.zones[row.zone], row.local, row.kind, row.earlier, row.later, got,
+            });
+            return error.TestExpectedEqual;
+        }
+        seen[@intFromEnum(row.kind)] += 1;
+    }
+    // Teeth: the vectors cover all three answers in quantity.
+    for (seen) |n| try testing.expect(n >= 100);
+}
+
+/// The release `tz_data.zig` is generated from, read from its header comment.
+const tz_release = "2026a";
+
+test "tz_release matches tz_data.zig's own header" {
+    const src = @embedFile("tz_data.zig");
+    try testing.expect(std.mem.indexOf(u8, src, "IANA tzdata " ++ tz_release ++ " ") != null);
+}
+
+test "localToUtc: Prague spring gap and autumn fold under every policy" {
+    const z = find("Europe/Prague").?;
+    // 2024-03-31: 02:00 CET -> 03:00 CEST. 02:30 does not exist.
+    const gap = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 2, .minute = 30 });
+    const g_cet = gap - 3600; // read with the offset before the gap = 01:30Z = 03:30 CEST
+    const g_cest = gap - 7200; // with the offset after = 00:30Z = 01:30 CET
+    try testing.expectEqual(LocalTime{ .nonexistent = .{ .earlier = g_cest, .later = g_cet } }, resolveLocal(z, gap));
+    try testing.expectEqual(g_cet, try localToUtc(z, gap, .compatible));
+    try testing.expectEqual(g_cest, try localToUtc(z, gap, .earlier));
+    try testing.expectEqual(g_cet, try localToUtc(z, gap, .later));
+    try testing.expectError(error.NonexistentLocalTime, localToUtc(z, gap, .reject));
+
+    // 2024-10-27: 03:00 CEST -> 02:00 CET. 02:30 happens twice.
+    const fold = datefmt.partsToUnix(.{ .year = 2024, .month = 10, .day = 27, .hour = 2, .minute = 30 });
+    const f1 = fold - 7200; // first pass, CEST
+    const f2 = fold - 3600; // second pass, CET
+    try testing.expectEqual(LocalTime{ .ambiguous = .{ .earlier = f1, .later = f2 } }, resolveLocal(z, fold));
+    try testing.expectEqual(f1, try localToUtc(z, fold, .compatible));
+    try testing.expectEqual(f1, try localToUtc(z, fold, .earlier));
+    try testing.expectEqual(f2, try localToUtc(z, fold, .later));
+    try testing.expectError(error.AmbiguousLocalTime, localToUtc(z, fold, .reject));
+
+    // An ordinary time is the same under every policy.
+    const noon = datefmt.partsToUnix(.{ .year = 2024, .month = 7, .day = 1, .hour = 12 });
+    for ([_]Disambiguation{ .compatible, .earlier, .later, .reject }) |p|
+        try testing.expectEqual(noon - 7200, try localToUtc(z, noon, p));
+}
+
+test "resolveLocal: the POSIX-footer era (2040) and a fixed zone" {
+    const z = find("America/New_York").?;
+    // 2040-03-11 02:30 does not exist (second Sunday of March), 2040-11-04 01:30 twice.
+    const gap = datefmt.partsToUnix(.{ .year = 2040, .month = 3, .day = 11, .hour = 2, .minute = 30 });
+    try testing.expect(resolveLocal(z, gap) == .nonexistent);
+    const fold = datefmt.partsToUnix(.{ .year = 2040, .month = 11, .day = 4, .hour = 1, .minute = 30 });
+    try testing.expect(resolveLocal(z, fold) == .ambiguous);
+    const utc = find("UTC").?;
+    try testing.expectEqual(LocalTime{ .unique = gap }, resolveLocal(utc, gap));
+}
+
+/// The defining property, checked by brute force: an answer's instants show
+/// `local` (unique/ambiguous), a gap's do not, and nothing else shows it.
+fn checkLocal(z: *const Zone, local: i64) !void {
+    const shows = struct {
+        fn f(zz: *const Zone, u: i64, l: i64) bool {
+            return u + offsetAt(zz, u).off == l;
+        }
+    }.f;
+    switch (resolveLocal(z, local)) {
+        .unique => |u| try testing.expect(shows(z, u, local)),
+        .ambiguous => |a| {
+            try testing.expect(a.earlier < a.later);
+            try testing.expect(shows(z, a.earlier, local));
+            try testing.expect(shows(z, a.later, local));
+        },
+        .nonexistent => |g| {
+            try testing.expect(g.earlier < g.later);
+            try testing.expect(!shows(z, g.earlier, local));
+            try testing.expect(!shows(z, g.later, local));
+            // Nothing in between shows it either: the wall clock jumps from
+            // below `local` straight to above it.
+            const w0 = g.earlier + offsetAt(z, g.earlier).off;
+            const w1 = g.later + offsetAt(z, g.later).off;
+            try testing.expect(w0 < local and w1 > local);
+        },
+    }
+}
+
+test "resolveLocal: around EVERY explicit transition of EVERY zone, the defining property holds" {
+    var checked: usize = 0;
+    for (&tz_data.zones) |*z| {
+        for (z.trans, 0..) |t, i| {
+            const before: i32 = if (i == 0) z.init_off else z.trans[i - 1].off;
+            const lo = t.ts + @min(before, t.off);
+            const hi = t.ts + @max(before, t.off);
+            for ([_]i64{ lo - 1, lo, lo + @divTrunc(hi - lo, 2), hi - 1, hi }) |l| {
+                try checkLocal(z, l);
+                checked += 1;
+            }
+        }
+    }
+    try testing.expect(checked > 10_000);
+}
+
+test "resolveLocal: random zones and local times 1900..2100" {
+    var prng = std.Random.DefaultPrng.init(0x7a5eed);
+    const r = prng.random();
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        const z = &tz_data.zones[r.uintLessThan(usize, tz_data.zones.len)];
+        const local = r.intRangeAtMost(i64, -2_208_988_800, 4_102_444_800);
+        try checkLocal(z, local);
+    }
+}
+
 test "zone count matches what the documentation states" {
     try testing.expectEqual(@as(usize, 598), tz_data.zones.len);
 }

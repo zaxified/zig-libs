@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — Local wall-clock time → UTC (maturity task C6): `resolveLocal(zone, local)`
+  classifies a local time as `unique`, `ambiguous` (fold: both instants) or `nonexistent` (gap:
+  the instants it maps to with the offset after / before the jump), and `localToUtc(zone, local,
+  policy)` applies a `Disambiguation` — `compatible` (fold→earlier, gap→later, as java.time and
+  Python `fold=0`), `earlier`, `later` or `reject` (new `AmbiguousLocalTime` /
+  `NonexistentLocalTime`). Works in the POSIX-footer era too. Anchored on 1 760 vectors from
+  Python `zoneinfo` over the same pinned tzdata 2026a (`tools/gen_local_kat.py`, 12 zones incl.
+  Samoa's skipped day, Lord Howe's 30-min DST, Casablanca, Troll), plus the defining property
+  checked around every explicit transition of all 598 zones and at 20 000 random local times.
+
 - **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence, and one of
   them **already had a corpus that never reached the code under test**. `fuzzFindNeverPanics`
   went through `buildZoneName`, whose first draw was `smith.valueRangeAtMost(u8, 0, 2)`; a
