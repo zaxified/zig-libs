@@ -61,7 +61,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   serving either proof on an attacker-influenced host would mis-issue — the caller must only run this
   for domains it controls.
 - Replay-nonce handling follows the RFC; the CA enforces anti-replay.
-- Out of scope: DNS-01 challenge, wildcard certs (need DNS-01), certificate storage/rotation
+- Not yet: DNS-01 challenge and therefore wildcard certs — a gap, in *Backlog / deferred*
+  (user, 2026-09-30). Out of scope: certificate storage/rotation
   scheduling, OCSP, and **running the TLS listener** — for TLS-ALPN-01 the caller must serve the
   validation cert from `TlsAlpnResponder` under ALPN `acme-tls/1` (BYO-TLS `http` seam or a proxy);
   for HTTP-01 the caller runs the port-80 `http.Server`. RSA account keys not supported (ES256 only).

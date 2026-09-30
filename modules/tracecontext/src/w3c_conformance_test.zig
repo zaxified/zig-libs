@@ -14,11 +14,6 @@
 //! Exclusion categories (`out_of_scope` on a vector, still counted by the
 //! canary below, never silently dropped):
 //!
-//!   - forward-compat traceparent versions ("cc" and friends): this module
-//!     rejects any non-"00" version outright rather than implementing the
-//!     spec's SHOULD-level forward-compatible fallback parse for higher
-//!     versions. See `w3c_vectors.zig`'s `reason_forward_compat` and
-//!     SPEC.md's Backlog.
 //!   - strict tracestate list-member GRAMMAR (illegal key/value characters,
 //!     the 256-char key cap, the 32-member cap): this module's tracestate
 //!     validation is a deliberate light byte-class guard over the WHOLE
@@ -138,8 +133,8 @@ test "W3C trace-context conformance corpus: must-accept/must-reject vectors" {
             return err;
         };
     }
-    try testing.expectEqual(@as(usize, 58), executed);
-    try testing.expectEqual(@as(usize, 15), excluded);
+    try testing.expectEqual(@as(usize, 61), executed);
+    try testing.expectEqual(@as(usize, 12), excluded);
 }
 
 test "W3C trace-context conformance corpus: vendored count matches expectation (canary)" {

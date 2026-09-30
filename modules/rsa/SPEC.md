@@ -183,6 +183,30 @@ consumer that feels them, and the consumer who would (`qap`) is expected to solv
 performance question first and push the result back. This section exists so that arrives
 as a measurement rather than a rediscovery.
 
+## What is deliberately not done
+
+- **RSAES-PKCS1-v1_5 encryption and decryption** (decided 2026-09-30). *Never* as a
+  general-purpose decrypt; the encrypt side *not now*.
+  - **Why no decrypt.** Whether a v1.5 decrypt succeeds is itself the secret a Bleichenbacher
+    attacker needs, and the timing variant (the Marvin attack, 2023) was found in OpenSSL,
+    GnuTLS, NSS, Mbed TLS, BouncyCastle, Apple corecrypto and the Linux kernel — code with far
+    more review than this. Go deprecates `EncryptPKCS1v15`/`DecryptPKCS1v15` as "dangerous and
+    should not be used"; draft-irtf-cfrg-rsa-guidance-10 (2026-09-11) says support "SHOULD be
+    disabled in default configuration" and "SHOULD NOT be supported in any part of online
+    (network-accessible) protocols or API endpoints". A convenience function here would be such
+    an endpoint for every caller that did not read this paragraph.
+  - **How legacy interop is served instead.** The protocols that still mandate v1.5 key
+    transport (XML Encryption `rsa-1_5` from older SAML IdPs, OpenPGP's RSA per RFC 9580, CMS,
+    TLS 1.2 RSA key exchange) get it in *their* module, on top of the raw `rsadpCrt*`
+    primitives, **off by default and with implicit rejection** (a deterministic decoy on a
+    padding failure, as OpenSSL does since 3.2). `xmlenc` is the precedent: `allow_weak_rsa15`,
+    decoy-derived key. So a consumer talking to a five-year-old peer is not stuck — Debian 11's
+    OpenSSL 1.1.1 speaks OAEP wherever the protocol lets it choose, and where the protocol fixes
+    v1.5 (GnuPG 2.2's OpenPGP, an older SAML IdP) the protocol module carries the gated path.
+  - **The encrypt side** creates no oracle (the risk sits with whoever decrypts), so it is
+    *not now* rather than *never*: it goes into the first protocol module that must send to a
+    v1.5-only receiver, not here as a general API.
+
 ## Backlog / deferred
 
 - The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT — see "Verification"

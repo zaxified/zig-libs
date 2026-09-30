@@ -75,8 +75,8 @@ if (acme.needsRenewal(cert.chain_pem, now_unix, 30)) {
 }
 ```
 
-Scope notes: HTTP-01 and TLS-ALPN-01 (dns-01 out of scope), therefore no
-wildcard certificates; P-256/ES256 keys only (account and certificate);
+Scope notes: HTTP-01 and TLS-ALPN-01; DNS-01 is not implemented yet (a backlog gap),
+therefore no wildcard certificates; P-256/ES256 keys only (account and certificate);
 key/cert PEM I/O covers RFC 5915 `EC PRIVATE KEY` (no PKCS#8).
 
 ## TLS-ALPN-01 (RFC 8737)

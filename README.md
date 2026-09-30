@@ -340,18 +340,18 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`aaa-gate`](modules/aaa-gate/README.md) | 2? | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
+| [`aaa-gate`](modules/aaa-gate/README.md) | 2 | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | [`abuseguard`](modules/abuseguard/README.md) | 3 | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
-| [`accesslog`](modules/accesslog/README.md) | 2? | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge | any | http |
+| [`accesslog`](modules/accesslog/README.md) | 2 | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge | any | http |
 | [`acme`](modules/acme/README.md) | 3 | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router, entropy |
 | [`aescbc`](modules/aescbc/README.md) | 2? | Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 2? | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | — |
 | [`brotli`](modules/brotli/README.md) | 3 | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
 | [`cors`](modules/cors/README.md) | 2 | CORS preflight + header injection (secure defaults) | any | router, http |
 | [`grpc`](modules/grpc/README.md) | 1? | gRPC client **and** server over HTTP/2 (over `protobuf`) — no code generation; all four call shapes (unary/streaming/bidi); untrusted declared length never sizes an allocation | any | http, protobuf |
-| [`health`](modules/health/README.md) | 2? | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
+| [`health`](modules/health/README.md) | 2 | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
 | [`http`](modules/http/README.md) | 2 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32 |
-| [`idempotency`](modules/idempotency/README.md) | 1? | Idempotency-Key dedup of unsafe retries — middleware + ramcache-backed store replaying a cached response without re-running the handler | any | router, http, ramcache |
+| [`idempotency`](modules/idempotency/README.md) | 2 | Idempotency-Key dedup of unsafe retries — middleware + ramcache-backed store replaying a cached response without re-running the handler | any | router, http, ramcache |
 | [`jwe`](modules/jwe/README.md) | 2? | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption; A192* unsupported (no AES-192 in std) | any | rsa, p256, aescbc, aeskw |
 | [`jwt`](modules/jwt/README.md) | 2 | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256 |
 | [`llmclient`](modules/llmclient/README.md) | 2? | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
@@ -359,17 +359,17 @@ way to recognise it.
 | [`openapi`](modules/openapi/README.md) | 2 | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | [`ratelimit`](modules/ratelimit/README.md) | 2 | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |
 | [`rbac`](modules/rbac/README.md) | 2? | Authorization decision engine — NIST RBAC (hierarchical + static SoD) and a depth-bounded ABAC condition-tree evaluator with structural default-deny | any | — |
-| [`requestid`](modules/requestid/README.md) | 2? | Request/correlation-ID middleware — adopts incoming `X-Request-Id` or generates one, echoes on response, exposed via `current()` | any | router, http |
-| [`resilience`](modules/resilience/README.md) | 2? | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
+| [`requestid`](modules/requestid/README.md) | 2 | Request/correlation-ID middleware — adopts incoming `X-Request-Id` or generates one, echoes on response, exposed via `current()` | any | router, http |
+| [`resilience`](modules/resilience/README.md) | 2 | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
 | [`router`](modules/router/README.md) | 2 | REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405 | any | http |
 | [`saml`](modules/saml/README.md) | 2? | SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, IdP-metadata parser; decrypts `EncryptedAssertion` via `xmlenc` | any | xmldsig, xml, xmlenc, rsa, x509, datefmt |
 | [`security-headers`](modules/security-headers/README.md) | 2 | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | any | router, http |
 | [`sessions`](modules/sessions/README.md) | 3 | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy |
 | [`staticfiles`](modules/staticfiles/README.md) | 2 | Path-traversal-safe static file handler over `http` — MIME by extension, ETag/conditional 304, byte-range 206/416; symlinks not followed, dotfiles refused by default | any | http |
 | [`throttle`](modules/throttle/README.md) | 2? | Global concurrency limit + load-shedding → 503 | posix | router, http |
-| [`tracecontext`](modules/tracecontext/README.md) | 2? | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http |
+| [`tracecontext`](modules/tracecontext/README.md) | 2 | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http |
 | [`upstream`](modules/upstream/README.md) | 2? | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA, per-upstream breaker+bulkhead, active+passive health checks | any | resilience, probe |
-| [`validate`](modules/validate/README.md) | 2? | Request body/query/params validation → aggregated 400 (typed + schema + string-format checks) + JSON DoS caps (depth/array/field size) | any | router, http, netaddr |
+| [`validate`](modules/validate/README.md) | 2 | Request body/query/params validation → aggregated 400 (typed + schema + string-format checks) + JSON DoS caps (depth/array/field size) | any | router, http, netaddr |
 | [`webhooksig`](modules/webhooksig/README.md) | 2? | HMAC webhook signatures (GitHub-style `sha256=<hex>`) — sign/verify (constant-time) + gating middleware, key rotation. Stripe's scheme not implemented | any | router, http |
 | [`websocket`](modules/websocket/README.md) | 2 | RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; no permessage-deflate | any | http |
 | [`xml`](modules/xml/README.md) | 2? | Namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree; DOCTYPE-reject default blocks XXE/billion-laughs/depth-bomb. Foundation for `xmldsig`/`saml` | any | — |
@@ -381,7 +381,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`entropy`](modules/entropy/README.md) *(crypto)* | 1? | Fail-closed entropy source — `fill` draws from `std.Io.randomSecure` or aborts the process; no generator, no silent degrade. **Panics on failure.** | any | — |
-| [`netaddr`](modules/netaddr/README.md) *(net)* | 2? | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix) | any | — |
+| [`netaddr`](modules/netaddr/README.md) *(net)* | 2 | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix) | any | — |
 | [`p256`](modules/p256/README.md) *(crypto)* | 2 | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | 2? | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | 2 | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
@@ -398,7 +398,7 @@ way to recognise it.
 | [`devlink`](modules/devlink/README.md) | 2? | Linux devlink over genetlink — device/port enumeration, port split/unsplit, parameter/resource inspection, region snapshots, health reporters, eswitch mode | **linux** | genetlink, netlink |
 | [`df-elect`](modules/df-elect/README.md) | 2? | Partition-correct Designated-Forwarder election (static link-state total order, duplicate-freedom argument) + split-horizon; bounded-badness model-checked in netsim | any | netsim |
 | [`dnp3`](modules/dnp3/README.md) | 2? | DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation. Secure Auth (g120) scaffolded only, no crypto | any | aeskw |
-| [`dns`](modules/dns/README.md) | 2? | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
+| [`dns`](modules/dns/README.md) | 2 | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
 | [`dnssec`](modules/dnssec/README.md) | 1? | Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence | any | dns, rsa |
 | [`ebpf`](modules/ebpf/README.md) | 1? | eBPF program generation over `std.os.linux.bpf` — bytecode builders (kprobe counter, XDP filter, ring-buffer emitter); real-kernel verifier acceptance unverified in CI | **linux** | netlink |
 | [`enip`](modules/enip/README.md) | 1? | EtherNet/IP + CIP — encapsulation layer (register/SendRRData/SendUnitData), CIP messaging, connection manager, tag/symbolic path client for Logix controllers | any | netaddr |
@@ -406,7 +406,7 @@ way to recognise it.
 | [`ethtool`](modules/ethtool/README.md) | 2? | Ethernet device control over the ethtool netlink family — link settings/state, ring/coalesce/pause/channel params, feature flags, per-queue/driver stats | **linux** | genetlink, netlink |
 | [`fleetsim`](modules/fleetsim/README.md) | 1? | In-process simulated device fleet — hosts protocol responders (Modbus, DNP3, IEC 104, S7comm, BACnet, EtherNet/IP, OPC UA) as nodes on one deterministic scheduler | any | modbus, dnp3, iec104, s7comm, bacnet, enip, opcua, netsim |
 | [`genetlink`](modules/genetlink/README.md) | 2? | Generic-netlink (genl) transport — genlmsghdr framing + nlctrl family-id resolution; shared foundation for ethtool/devlink/nl80211/wireguard clients | **linux** | netlink |
-| [`icmp`](modules/icmp/README.md) | 2? | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | **linux** | seqmap, netaddr |
+| [`icmp`](modules/icmp/README.md) | 2 | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | **linux** | seqmap, netaddr |
 | [`iec104`](modules/iec104/README.md) | 1? | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec, transport-agnostic master (controlling station) | any | — |
 | [`iec61850`](modules/iec61850/README.md) | 1? | IEC 61850 substation automation — MMS (ISO 9506) client over ISO-on-TCP with the ACSI object model, plus GOOSE publish/subscribe + SV sampled values | any | xml |
 | [`iec62351`](modules/iec62351/README.md) | 2? | IEC 62351 power-systems security — GOOSE/SV authentication (62351-6) over caller-supplied PDU bytes, MMS application authentication (62351-4), checkable TLS policy | any | x509, rsa |
@@ -427,8 +427,8 @@ way to recognise it.
 | [`loopfree-reconv`](modules/loopfree-reconv/README.md) | 2? | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop); netsim-verified under fuzzing | any | netsim, spf-ect |
 | [`loopix`](modules/loopix/README.md) | 2? | Loopix mixnet (Piotrowska et al. — Nym's design) — Poisson mix + cover traffic over `sphinx`, model-checked in netsim against a global-passive-adversary anonymity invariant | any | netsim, sphinx |
 | [`modbus`](modules/modbus/README.md) | 2? | Modbus TCP (MBAP) + RTU (CRC-16) codec, master client **and slave server** — core function codes, diagnostics, exceptions, transport-agnostic seam | any | — |
-| [`mqtt`](modules/mqtt/README.md) | 2? | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
-| [`netaddr`](modules/netaddr/README.md) | 2? | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix) | any | — |
+| [`mqtt`](modules/mqtt/README.md) | 3 | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
+| [`netaddr`](modules/netaddr/README.md) | 2 | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix) | any | — |
 | [`netconf`](modules/netconf/README.md) | 2? | NETCONF client (RFC 6241) over SSH — RFC 6242 framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies | any | ssh, xml |
 | [`netlink`](modules/netlink/README.md) | 2? | rtnetlink read **and** write — dumps (links/addresses/routes/neighbors) and RTM_NEW*/DEL* writes; byte-exact vs iproute2 goldens + netns round-trip | **linux** | — |
 | [`netsim`](modules/netsim/README.md) | 1? | Deterministic seeded discrete-event network simulator (latency/loss/partition/clock-skew, failure fuzzer, byte-exact replay) — model-checking harness for fabric algorithms | any | — |
@@ -436,7 +436,7 @@ way to recognise it.
 | [`nl80211`](modules/nl80211/README.md) | 1? | Wi-Fi control over nl80211 genetlink — interface/wiphy enumeration, scan trigger + BSS results, connect/disconnect, station/link stats, regulatory domain | **linux** | genetlink, netlink |
 | [`opcua`](modules/opcua/README.md) | 2? | OPC-UA (IEC 62541) **client and server** — opc.tcp transport, secure channel (`#None` or Basic256Sha256 at Sign/SignAndEncrypt, both client and server), sessions, Read/Write/Browse/Call + subscriptions | any | rsa, x509 |
 | [`pagecache`](modules/pagecache/README.md) | 2 | Bounded write-through page cache between `kvtree`'s pager and its `Storage` — hot-cold tiering (W-TinyLFU via ramcache) with an RSS budget; transparent to callers | any | kvtree, ramcache |
-| [`pathmtu`](modules/pathmtu/README.md) | 2? | Path MTU discovery — kernel-cache read (`query`) **and** an authoritative DF-bit binary search (`probe`) that detects ICMP black holes the cache can't see | **linux** | icmp, netaddr |
+| [`pathmtu`](modules/pathmtu/README.md) | 2 | Path MTU discovery — kernel-cache read (`query`) **and** an authoritative DF-bit binary search (`probe`) that detects ICMP black holes the cache can't see | **linux** | icmp, netaddr |
 | [`pbb`](modules/pbb/README.md) | 2? | IEEE 802.1ah Provider Backbone Bridge (MAC-in-MAC) codec — wraps a customer frame in a backbone header + I-TAG (24-bit I-SID); real-Ethernet SPB encap, distinct from `l2encap` | any | — |
 | [`pping`](modules/pping/README.md) | 2? | Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — bounded per-direction table, no double-counting of duplicate/delayed ACKs | any | — |
 | [`probe`](modules/probe/README.md) | 2? | TCP-connect reachability prober — up/refused/timeout + RTT, fan-out with bounded concurrency, latency aggregation | any | netaddr, latency-stats |
@@ -451,18 +451,18 @@ way to recognise it.
 | [`shardstore`](modules/shardstore/README.md) | 2? | Key-sharding router over N independent `kvtree` stores — multi-core write parallelism (per-shard single-writer, cross-shard parallel) | any | kvtree |
 | [`smtp`](modules/smtp/README.md) | 2? | SMTP client (RFC 5321) — ESMTP EHLO negotiation, STARTTLS seam, AUTH PLAIN/LOGIN, pipelining, MIME message composition (RFC 5322/2045) | any | netaddr |
 | [`snmp`](modules/snmp/README.md) | 1? | SNMP v1/v2c/v3 — BER/ASN.1 codec, manager client (get/next/bulk/set/walk) + trap/notification receiver + USM auth (HMAC-MD5/SHA-1 and RFC 7860 SHA-224/256/384/512, constant-time) and privacy (DES-CBC, AES-128-CFB), KAT- and net-snmp-anchored | any | — |
-| [`sntp`](modules/sntp/README.md) | 2? | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
+| [`sntp`](modules/sntp/README.md) | 2 | SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay | any | — |
 | [`spbfib`](modules/spbfib/README.md) | 4? | SPB (802.1aq) forwarding addressing — unicast B-MAC FIB from an `isis-spf` route table + SPBM multicast-DA construction; one congruent ECT path per dest, no per-flow ECMP | any | isis-spf |
 | [`spf-ect`](modules/spf-ect/README.md) | 2? | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (RFC 6329 idea generalized) + maximally-disjoint second tree; pure graph algorithm | any | — |
 | [`ssh`](modules/ssh/README.md) | 2? | SSH-2.0 (RFC 4253) **client + server** — KEX incl. ML-KEM-768 hybrid, userauth (publickey/password) + channels (exec/subsystem); vs OpenSSH-validated. **Linux-only** | linux | rsa |
-| [`stun`](modules/stun/README.md) | 2? | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
-| [`syslog`](modules/syslog/README.md) | 2? | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol) | any (local delivery: linux) | datefmt |
+| [`stun`](modules/stun/README.md) | 3 | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
+| [`syslog`](modules/syslog/README.md) | 2 | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol) | any (local delivery: linux) | datefmt |
 | [`tc`](modules/tc/README.md) | 1? | Traffic control over rtnetlink — qdiscs (netem/htb/tbf/fq_codel/cake), htb classes, u32/flower filters + action families; byte-exact to iproute2 (retires `tc` shell-outs) | **linux** | netlink |
 | [`tcplan`](modules/tcplan/README.md) | 2? | Compiles a hierarchical shaping topology (site→AP→subscriber) into a deterministic ordered plan of `tc` ops — mq root + per-CPU HTB trees + CAKE leaves; pure, caller executes | linux | tc |
-| [`traceroute`](modules/traceroute/README.md) | 2? | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | **linux** | icmp, netaddr, latency-stats |
+| [`traceroute`](modules/traceroute/README.md) | 3 | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | **linux** | icmp, netaddr, latency-stats |
 | [`whois`](modules/whois/README.md) | 2? | RFC 3912 whois client — query format + referral chasing (IANA→registrar) + field extraction, transport-agnostic seam | any | netaddr |
 | [`wireguard`](modules/wireguard/README.md) | 2? | Native WireGuard device config over genetlink (retires `wg` shell-outs), plus the Noise_IKpsk2 handshake **and** the transport-data seal/open crypto data plane | **linux** | netlink, genetlink, chachapoly, entropy, netaddr |
-| [`workerpool`](modules/workerpool/README.md) | 2? | In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown | any | lockfree |
+| [`workerpool`](modules/workerpool/README.md) | 3 | In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown | any | lockfree |
 | [`writebehind`](modules/writebehind/README.md) | 2? | Crash-safe write-behind cache coordinator — fast in-memory acks, async flush to a durable `Sink` via `workerpool`; WAL written before ack so a crash-recovered write survives | any | ramcache, workerpool, jobqueue, kvtree |
 | [`xdp-classifier`](modules/xdp-classifier/README.md) | 2? | XDP packet classifier for a LibreQoS-style edge shaper — IPv4 prefix→traffic-class via LPM-trie lookup, per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map) | **linux** | ebpf |
 
@@ -474,7 +474,7 @@ way to recognise it.
 | [`http`](modules/http/README.md) *(web)* | 2 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32 |
 | [`kvtree`](modules/kvtree/README.md) *(storage)* | 2 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) *(storage)* | 2 | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
-| [`resilience`](modules/resilience/README.md) *(web)* | 2? | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
+| [`resilience`](modules/resilience/README.md) *(web)* | 2 | Circuit breaker + retry/backoff + timeout + bulkhead (concurrency limiter) for calling upstreams (generic) | posix | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | 2 | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
 | [`sphinx`](modules/sphinx/README.md) *(crypto)* | 2? | Lightning BOLT#4 Sphinx onion routing — forward ECDH blinding chain, layered packet construction, constant-time layer peeling. | any | k256 |
 | [`tlsclient`](modules/tlsclient/README.md) *(crypto)* | 2? | std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 (no basicConstraints check). | any | x509 |
@@ -487,18 +487,18 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`blobstore`](modules/blobstore/README.md) | 1? | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
 | [`dataset`](modules/dataset/README.md) | 2? | Canonical in-memory columnar-typed table — the normalization seam between data sources and consumers. | any | — |
-| [`decimal`](modules/decimal/README.md) | 1? | Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale. | any | — |
+| [`decimal`](modules/decimal/README.md) | 2 | Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale. | any | — |
 | [`filestore`](modules/filestore/README.md) | 2? | DB-less durable keyed document store — one atomically-written file per record, plus a typed-JSON convenience layer. | posix | — |
 | [`finstats`](modules/finstats/README.md) | 2? | Portfolio/financial statistics over `dataset` — XIRR, TWR, risk, beta, Monte-Carlo, correlation matrix. | any | dataset |
 | [`fuzzysearch`](modules/fuzzysearch/README.md) | 2? | Bounded-edit-distance typo-tolerant lookup over a static string set — DoS-bounded, the typo-tolerant sibling of `trie`. | any | trie |
 | [`geoindex`](modules/geoindex/README.md) | 2? | Static spatial index for bbox and nearest-neighbour queries over a large fixed geo-point set — DoS-bounded, zero-copy. | any | — |
 | [`jobqueue`](modules/jobqueue/README.md) | 2? | Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority. | posix | kv |
-| [`jsonshape`](modules/jsonshape/README.md) | 1? | JSON → `dataset` reshaping — dot-path descent and typed column projection (a minimal jq-style subset). | any | dataset |
+| [`jsonshape`](modules/jsonshape/README.md) | 3 | JSON → `dataset` reshaping — dot-path descent and typed column projection (a minimal jq-style subset). | any | dataset |
 | [`kv`](modules/kv/README.md) | 3 | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | — |
 | [`kvtree`](modules/kvtree/README.md) | 2 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`tabular`](modules/tabular/README.md) | 2? | Dataset algebra (pandas/dplyr-style verbs) over `dataset` — aggregate/pivot/resample/rolling/join, fx-aware. | any | dataset |
-| [`trie`](modules/trie/README.md) | 2? | Prefix index for instant autocomplete over a large static string set. | any | — |
+| [`trie`](modules/trie/README.md) | 3 | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 1? | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, crash-safe retention-by-age. | any | kvtree |
 
 **Also worth reaching for from `storage`** — these are filed under another library (in brackets), and appear here because a consumer working in `storage` has a use for them:
@@ -611,19 +611,19 @@ way to recognise it.
 | [`crc32c`](modules/crc32c/README.md) | 2? | CRC-32C (Castagnoli) — SSE4.2 and ARMv8 CRC instructions picked at run time (three interleaved streams), slicing-by-8 fallback; streaming, extend, combine. | any (x86-64 SSE4.2 / arm64 CRC asm + portable fallback) | — |
 | [`csvsafe`](modules/csvsafe/README.md) | 2? | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads). | any | — |
 | [`csvstream`](modules/csvstream/README.md) | 2? | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
-| [`datefmt`](modules/datefmt/README.md) | 2? | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
-| [`encoding`](modules/encoding/README.md) | 2? | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
+| [`datefmt`](modules/datefmt/README.md) | 3 | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
+| [`encoding`](modules/encoding/README.md) | 3 | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
 | [`framing`](modules/framing/README.md) | 2? | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
-| [`ini`](modules/ini/README.md) | 3? | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
+| [`ini`](modules/ini/README.md) | 3 | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
 | [`jinja`](modules/jinja/README.md) | 1? | Jinja2-compatible template engine — expressions, control flow, template inheritance/macros/imports, over a symlink-contained loader. | any | — |
-| [`json5`](modules/json5/README.md) | 2? | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings). | any | — |
+| [`json5`](modules/json5/README.md) | 3 | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings). | any | — |
 | [`linkheader`](modules/linkheader/README.md) | 2? | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), plus `pagination` helpers and `find(rel)`; zero-alloc. | any | — |
-| [`numparse`](modules/numparse/README.md) | 2? | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`. | any | decimal |
+| [`numparse`](modules/numparse/README.md) | 3 | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`. | any | decimal |
 | [`protobuf`](modules/protobuf/README.md) | 2? | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`qr`](modules/qr/README.md) | 2? | QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction, structured append; SVG and terminal renderers, allocation-free. | any | — |
 | [`qrscan`](modules/qrscan/README.md) | 3? | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) at any rotation and moderate tilt, and sample it into a `qr.Matrix`; block-adaptive binarisation, connected-component finder location, allocation-free. | any | qr |
 | [`tar`](modules/tar/README.md) | 2? | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip. | any (packer: linux) | — |
-| [`tz`](modules/tz/README.md) | 2? | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
+| [`tz`](modules/tz/README.md) | 3 | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | 1? | YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | 2? | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
 | [`zstd`](modules/zstd/README.md) | 1 | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
@@ -632,25 +632,25 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`decimal`](modules/decimal/README.md) *(storage)* | 1? | Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale. | any | — |
+| [`decimal`](modules/decimal/README.md) *(storage)* | 2 | Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale. | any | — |
 | [`http`](modules/http/README.md) *(web)* | 2 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32 |
 
 ### Host / OS / agent — process, sandboxing, IPC, and the agent-side glue
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`argsafe`](modules/argsafe/README.md) | 2? | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
+| [`argsafe`](modules/argsafe/README.md) | 2 | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
 | [`diagnostics`](modules/diagnostics/README.md) | 2? | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
 | [`diskfree`](modules/diskfree/README.md) | 3? | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
 | [`diskusage`](modules/diskusage/README.md) | 2? | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
-| [`fastmem`](modules/fastmem/README.md) | 3? | Vectorised memset (32-byte stores, overlapping head/tail) that an executable without libc can export to replace compiler_rt's byte-at-a-time one for every caller, std included; opt-in. | any (portable @Vector code; the export refuses libc-linked builds) | — |
+| [`fastmem`](modules/fastmem/README.md) | 3 | Vectorised memset (32-byte stores, overlapping head/tail) that an executable without libc can export to replace compiler_rt's byte-at-a-time one for every caller, std included; opt-in. | any (portable @Vector code; the export refuses libc-linked builds) | — |
 | [`ipcbus`](modules/ipcbus/README.md) | 2? | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
 | [`mcp`](modules/mcp/README.md) | 2? | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | — |
 | [`mcp-http`](modules/mcp-http/README.md) | 2? | MCP Streamable HTTP transport (2025-06-18) — `POST /mcp` with JSON or live SSE, resumable sessions, Origin (DNS-rebind) guard. | any | router, http, mcp |
 | [`pollworker`](modules/pollworker/README.md) | 2? | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
-| [`procrun`](modules/procrun/README.md) | 1? | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
-| [`sandbox`](modules/sandbox/README.md) | 1? | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
-| [`testkit`](modules/testkit/README.md) | 2? | Test-only shared harness (hex decoding for KAT vectors, golden byte-comparison, verbose-skip convention); wired via build.zig test_deps, absent from consumer imports | any | — |
+| [`procrun`](modules/procrun/README.md) | 3 | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
+| [`sandbox`](modules/sandbox/README.md) | 3 | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
+| [`testkit`](modules/testkit/README.md) | 2 | Test-only shared harness (hex decoding for KAT vectors, golden byte-comparison, verbose-skip convention); wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`uci`](modules/uci/README.md) | 2? | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
 
 **Also worth reaching for from `os`** — these are filed under another library (in brackets), and appear here because a consumer working in `os` has a use for them:

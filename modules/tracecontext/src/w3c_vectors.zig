@@ -73,16 +73,6 @@ const parent_id_a = "1234567890123456";
 // Reason strings for excluded categories, named once so every vector that
 // shares a reason is provably consistent (a typo in one copy would no longer
 // silently diverge from the others).
-const reason_forward_compat =
-    "traceparent versions other than \"00\" are not implemented: our parser " ++
-    "rejects any non-\"00\" version outright (ParseError.BadVersion), rather " ++
-    "than attempting the spec's documented forward-compatible fallback parse " ++
-    "for higher versions (spec 20-http_request_header_format.md, " ++
-    "\"Versioning of traceparent\"). That section uses SHOULD, not MUST, for " ++
-    "the fallback-parse behavior, so rejecting an unknown version outright " ++
-    "is spec-conformant — just not what this specific conformance-suite test " ++
-    "asserts. Recorded as a deliberate scope decision in SPEC.md's Backlog, " ++
-    "not silently dropped.";
 const reason_strict_grammar =
     "full tracestate list-member GRAMMAR validation (per-key charset, the " ++
     "lcalpha/DIGIT-leading rule, 256-char key length cap, 32-member cap) is " ++
@@ -178,30 +168,21 @@ pub const vectors = [_]Vector{
     },
     .{
         .source_test = "test_traceparent_version_0xcc",
-        .doc = "higher version 'cc' -> spec's forward-compatible fallback parse SHOULD keep the trace-id; not implemented here",
+        .doc = "higher version 'cc' -> spec's forward-compatible fallback parse keeps the trace-id",
         .headers = &.{.{ .name = "traceparent", .value = "cc-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-01" }},
         .traceparent = .{ .preserved = trace_id_a },
-        .out_of_scope = reason_forward_compat,
     },
     .{
         .source_test = "test_traceparent_version_0xcc",
-        .doc = "higher version 'cc' with additive trailing fields -> still parseable per the forward-compat rule; not implemented here",
+        .doc = "higher version 'cc' with additive trailing fields -> still parseable per the forward-compat rule",
         .headers = &.{.{ .name = "traceparent", .value = "cc-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-01-what-the-future-will-be-like" }},
         .traceparent = .{ .preserved = trace_id_a },
-        .out_of_scope = reason_forward_compat,
     },
     .{
         .source_test = "test_traceparent_version_0xcc",
         .doc = "higher version 'cc' but the flags field is followed by '.' not '-' -> malformed even under the forward-compat rule, rejected",
         .headers = &.{.{ .name = "traceparent", .value = "cc-" ++ trace_id_a ++ "-" ++ parent_id_a ++ "-01.what-the-future-will-be-like" }},
         .traceparent = .{ .changed_from = &.{trace_id_a} },
-        // Not excluded for the forward-compat reason: our all-non-"00"-rejected
-        // parser already produces the expected verdict here by coincidence
-        // (both "don't understand cc" and "correctly detect this cc is
-        // malformed" reject it) — grouped with its sibling cases anyway so the
-        // whole test_traceparent_version_0xcc method reads as one exclusion,
-        // not two in-scope stragglers plus one excluded.
-        .out_of_scope = reason_forward_compat,
     },
     .{
         .source_test = "test_traceparent_version_0xff",

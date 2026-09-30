@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** the W3C suite's three
+  `test_traceparent_version_0xcc` vectors run again. They had stayed marked out of scope
+  ("forward-compat not implemented") after forward-compatible parsing landed on 2026-08-02, so
+  the conformance test skipped exactly what the code does; now 61 executed, 12 excluded.
+  `SPEC.md` no longer says higher versions are rejected.
 - **2026-09-09** — Docs: `SPEC.md`'s pointer to the W3C corpus provenance was `../NOTICE`,
   which from the module directory resolves to `modules/NOTICE` — a path that has never existed.
   It means this module's own `NOTICE`. Found by the new link-resolution check in
