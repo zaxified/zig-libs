@@ -26,8 +26,9 @@ NOTICE entry needed.
 2. **Encode ← `Value`.** `cbor.encode(allocator, value, .{})` always emits definite-length,
    shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization"). Pass
    `.{ .canonical = true }` to additionally sort every map's entries by the bytewise order of their
-   *encoded* keys (RFC 8949 §4.2.1 core-deterministic encoding) — together this produces
-   core-deterministic output.
+   *encoded* keys (RFC 8949 §4.2.1's map-key rule). That is core-deterministic output only for
+   values without floats: a float keeps the width it was given, while §4.2.1 asks for the shortest
+   one that preserves the value.
 3. **COSE (`cose.zig`).** `cose.parseKey`/`cose.encodeEc2Key`/`cose.encodeOkpKey` for `COSE_Key`
    (EC2/OKP public keys — the shape `ctap2pin`'s inline `PublicKey{x,y}` generalizes — plus AKP,
    RFC 9964's post-quantum key type, whose ML-DSA parameter set comes from the REQUIRED `alg` and

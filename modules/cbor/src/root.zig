@@ -23,8 +23,9 @@
 //! shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization").
 //! `EncodeOptions.canonical = true` additionally sorts every map's entries
 //! by the bytewise order of their *encoded* keys (RFC 8949 §4.2.1 core
-//! deterministic encoding's map-key rule) — together this produces
-//! core-deterministic output. Float width is never re-minimized: a
+//! deterministic encoding's map-key rule). That is core-deterministic output
+//! only for values without floats: float width is never re-minimized, while
+//! §4.2.1 asks for the shortest float that keeps the value. A
 //! `Value.f64` always re-encodes as an 8-byte float, matching whatever width
 //! `decode()` (or the caller) chose — see README for why.
 //!
