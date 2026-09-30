@@ -291,7 +291,7 @@ data or production keys appear.
 - **HMAC-SHA256 signature method** *(survey 2026-09-30)*: shared-secret XML-DSig (WS-Security style); not used in SAML. Effort: small. Fits §2: yes. Low priority.
 - **Signing (enveloped) for the IdP side and for tests/tools** *(survey 2026-09-30)*: goxmldsig and signxml sign;
   a user building an IdP or metadata signer cannot. The SPEC's out-of-scope list makes this a scope decision, not a
-  gap: raised as a question, not filed as a commitment. Effort: medium. Fits §2: yes.
+  gap: raised as a question, not filed as a commitment. **Decided 2026-09-30 (user): not now** — stays here without priority. Effort: medium. Fits §2: yes.
 
 **Deliberately not done** (already given above under *Out of scope* / *KeyInfo trust model*): XPath/XSLT transforms,
 external references, DTD-typed ID normalisation, trusting `KeyInfo` for the key, feeding the embedded cert to `std.crypto.Certificate`.

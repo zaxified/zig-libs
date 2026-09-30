@@ -308,4 +308,4 @@ respective sibling modules. AES-GCM and base64 remain from std.
   The SPEC's Scope section makes this a scope decision, not a gap: raised as a question. Effort: medium. Fits §2: yes.
 
 **Deliberately not done** (given above under *Scope* / *Security posture*): CipherReference, `ds:Transforms` on the
-ciphertext, RetrievalMethod / KeyInfo trust, super-encryption; 3DES is not listed and is a legacy algorithm (no reason recorded in the SPEC: see the report's question).
+ciphertext, RetrievalMethod / KeyInfo trust, super-encryption; 3DES is not listed and is a legacy algorithm — **deliberately absent (decision 2026-09-30, user)**: a 64-bit block cipher (Sweet32), disallowed by NIST SP 800-131A for encryption since 2024; a legacy IdP that still sends `tripledes-cbc` is refused, not decrypted.

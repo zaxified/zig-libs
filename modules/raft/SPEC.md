@@ -277,6 +277,9 @@ is safe (never loses required durable state); `onStart` re-derives the volatile
 role as follower. The `PersistentState` codec keeps the exact durable-triple
 contract tested independently.
 
+**Decision 2026-09-30 (user): stays a poc.** Snapshots, membership change, pre-vote and a runnable node API (the mvp list) are not planned; the module remains a `netsim.Protocol` model of Raft. No consumer needs more, so the grade 4 is the
+honest one and no promotion work is planned; revisit only when a consumer appears.
+
 ## Backlog
 
 1. ~~Implement the four Fable-core decision functions; flip the gate; make the

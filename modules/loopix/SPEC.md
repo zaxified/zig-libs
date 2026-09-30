@@ -220,6 +220,9 @@ real):
   netsim across a seed sweep, asserting `AnonymityBound` holds — see "Part 2
   result" above for the measured separation from the FIFO/no-cover controls.
 
+**Decision 2026-09-30 (user): stays a poc.** A deployable mix node (network I/O, key management, the Nym wire format) is not wanted; the module remains a model-checked simulation of the protocol. No consumer needs more, so the grade 4 is the
+honest one and no promotion work is planned; revisit only when a consumer appears.
+
 ## Backlog / deferred
 
 - **A deployable Loopix node/client (real transport)** (survey 2026-09-30): today the module cannot carry a byte over a network; Nym and Katzenpost can. Needs providers with mailboxes, a PKI/epoch directory, sender-chosen delays in the Sphinx header (the SPEC's "Scoped out of Phase 1" list). Effort L. Fits §2 (pure Zig) but overlaps `sphinx`/`noise` work; decide whether it is wanted at all before starting.
