@@ -3,7 +3,7 @@
 //! as an INPUT FILTER to an up/suspect/down verdict (see root.zig's module doc for
 //! the full problem statement).
 //!
-//! FABLE CORE — `decide` below is the implemented hysteresis kernel. Its design
+//! HYSTERESIS CORE — `decide` below is the implemented hysteresis kernel. Its design
 //! contract (including the adjudicated monotonicity trade-off) is documented on
 //! `decide` itself; `scoring.zig` (detection latency, failover budget) and
 //! `property.zig` (monotone path cost, up-boundary monotonicity, the pinned

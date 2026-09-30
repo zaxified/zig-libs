@@ -72,11 +72,11 @@ pub const LinkState = enum {
 
 /// Hysteresis knobs. All fields here are consumed entirely by `core.decide` — this
 /// struct just declares and documents the shape of the tuning surface; the semantics
-/// (how a threshold is actually applied) are the Fable core's to define.
+/// (how a threshold is actually applied) are the hysteresis core's (`core.zig`) to define.
 pub const Config = struct {
     /// Nominal echo-probe cadence the caller intends to drive `onProbeReply` /
     /// `onProbeTimeout` at. The Estimator does not schedule probes itself (the
-    /// caller's clock drives it) — this is a hint the Fable core may use to
+    /// caller's clock drives it) — this is a hint the hysteresis core may use to
     /// interpret the threshold fields below in probe-count-equivalent terms.
     probe_interval: Time = 200,
 
@@ -123,7 +123,7 @@ pub const Probe = struct {
 
 /// Fixed capacity of `Estimator.history`. Bounded by construction — the
 /// Estimator's memory footprint does not grow with the length of the probe
-/// stream (see `property.zig`'s bounded-memory test). 64 gives the Fable core a
+/// stream (see `property.zig`'s bounded-memory test). 64 gives the hysteresis core a
 /// hysteresis window of many probe intervals without needing an allocator.
 pub const history_capacity: usize = 64;
 
@@ -135,7 +135,7 @@ pub const history_capacity: usize = 64;
 pub const Estimator = struct {
     cfg: Config,
     /// Cumulative RTT/jitter/loss statistics since `init` (see `latency-stats`);
-    /// read via `snapshot()`. The Fable core may also read this directly.
+    /// read via `snapshot()`. The hysteresis core may also read this directly.
     stats: latency_stats.Accumulator = latency_stats.Accumulator.init(),
     /// The current (and, between calls, the previous — see `core.decide`'s doc)
     /// verdict. This is the ONLY place damping/smoothing state may persist
@@ -146,7 +146,7 @@ pub const Estimator = struct {
     history_len: usize = 0,
     history_head: usize = 0,
     /// Consecutive unanswered probes since the last reply (resets to 0 on any
-    /// reply) — mechanical bookkeeping the Fable core may use directly instead
+    /// reply) — mechanical bookkeeping the hysteresis core may use directly instead
     /// of re-deriving it from `history`.
     consecutive_timeouts: u32 = 0,
     /// Total probes observed (replies + timeouts).
@@ -224,7 +224,7 @@ pub const Estimator = struct {
     }
 };
 
-// ── smoke: the shell works WITHOUT ever touching the Fable stub ─────────────
+// ── smoke: the shell works WITHOUT ever touching the hysteresis core ─────────────
 
 test "smoke: Estimator constructs with defaults and starts .up with no history" {
     const est = Estimator.init(.{});

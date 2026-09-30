@@ -25,8 +25,8 @@ over byte-exact canonical data, so a `.secure` verdict on those vectors is
 itself the byte-exactness proof; the matching tampered cases return `.bogus`.
 See `src/oracle_test.zig` + `src/oracle_vectors.zig`.
 
-**Not (yet) implemented:** RFC 8624 algorithm-downgrade policy; and RFC 9276
-NSEC3 iteration-count caps. The plain-NSEC (non-NSEC3) denial proof
+**Not (yet) implemented:** RFC 8624 algorithm-downgrade policy. (The RFC 9276
+NSEC3 iteration cap is in: `nsec3.max_nsec3_iterations` = 100.) The plain-NSEC (non-NSEC3) denial proof
 (`nsec.proveDenial`) is implemented and unit-tested against the RFC 4034 §6.1
 canonical ordering plus positive/adversarial cases, but is not yet
 `ldns`-oracle-verified the way the NSEC3 proof is. See SPEC.md "Threat model /

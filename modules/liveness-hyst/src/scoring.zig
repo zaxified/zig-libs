@@ -41,7 +41,7 @@ const WEEK: Time = 7 * 24 * 60 * 60 * SEC;
 // These are the executable form of the design's headline claim. They are
 // documented placeholders in the sense that the exact numbers came from this
 // scaffolding pass, not a separately-published spec — but they ARE the bounds
-// the Fable core in `core.zig` must satisfy; tune them here (with rationale) if
+// the hysteresis core in `core.zig` must satisfy; tune them here (with rationale) if
 // the design settles on different numbers.
 
 /// Detection-latency bound on a genuine, sustained hard failure.
@@ -156,7 +156,7 @@ test "scoring: the flapping corpus generator covers a duty-cycle sweep" {
         _ = try netsim.replay(gpa, case, fault_trace, null);
         // Exercises the corpus generator across the sweep; the precise budget is
         // asserted only for the documented 30% case above (tighten to a
-        // per-duty-cycle bound once the Fable core's actual trade-off curve is
+        // per-duty-cycle bound once the hysteresis core's actual trade-off curve is
         // known — a 70%-down link plausibly SHOULD fail over more).
         _ = countFailovers(prober.transitions.items);
     }
