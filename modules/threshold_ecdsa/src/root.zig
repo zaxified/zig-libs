@@ -15,7 +15,7 @@
 //! secp256k1 ECDSA signature verifying under `std.crypto.sign.ecdsa
 //! .EcdsaSecp256k1Sha256`).** One security layer remains a documented,
 //! deliberate scope cut: GG20's identifiable-abort culprit-naming apparatus
-//! (`signing.identifyAbortCulprit`) is `@panic`-stubbed — "abort-only v1"
+//! is not implemented and has no public entry point — "abort-only v1"
 //! never returns a bad signature but cannot name a culprit on abort; see
 //! `signing.zig`'s module doc comment for the exact boundary. The
 //! Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
@@ -2083,9 +2083,9 @@ test {
 
 // Pull the `signing` submodule's tests into this module's test binary —
 // same dark-tests rule. Phase 2d's `signWithShares` is REAL end to end
-// (its decisive std-ECDSA-verify test PASSES, does not panic); only
-// `identifyAbortCulprit` (not exercised by any test — it always panics by
-// design) represents deferred work. See `signing.zig`'s module doc comment.
+// (its decisive std-ECDSA-verify test PASSES, does not panic); identifiable
+// abort is deferred work with no public stub. See `signing.zig`'s module doc
+// comment.
 test {
     _ = signing;
 }

@@ -96,9 +96,9 @@
 //! SOMETHING was inconsistent, not WHO. Closing this — proving cross-
 //! session `k_i`/`γ_i`/`w_i` consistency and, on failure, opening enough
 //! transcript material to name a culprit — is GG20's actual identifiable-
-//! abort apparatus (paper §4's "Identifiable Abort" rounds) and is left as
-//! `identifyAbortCulprit` (below), `@panic`-stubbed: it is paper-exact
-//! machinery this scaffold pass deliberately did not guess at.
+//! abort apparatus (paper §4's "Identifiable Abort" rounds). It is not
+//! implemented and has no public entry point (the `@panic` stub was removed
+//! 2026-09-30); see the comment near the end of this file and SPEC.md.
 //!
 //! ## Zig std GAP: none new — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`
 //! (the FINAL verification target), `std.crypto.ecc.Secp256k1`, and
@@ -859,50 +859,39 @@ pub fn signWithSharesOptions(
     return sig;
 }
 
-/// **STUB (TODO(core)).** GG20's actual identifiable-abort apparatus (paper
-/// §4's "Identifiable Abort" rounds): when `signWithShares` returns
-/// `error.SigningAborted`, name EXACTLY which party's `k_i`/`γ_i`/`w_i` was
-/// used inconsistently across two different pairwise MtA sessions (the
-/// residual gap `signWithShares`'s "abort-only v1" posture does not close
-/// — see the module doc comment's "Identifiable abort scope" section for
-/// the precise threat this closes and why it does NOT threaten the "never
-/// return a bad signature" invariant, only attribution). A real
-/// implementation needs:
-///
-///   1. Every party to RETAIN its pairwise MtA transcripts (the `c_a`/
-///      `c_b`/proof values `runCheckedMtA`/`runCheckedMtAwc` currently
-///      discard once each pairwise round finishes) tagged by session.
-///   2. On final-signature failure, an opening/decommitment sub-protocol
-///      (GG20's Rounds 6/7) that lets an auditor cross-check a party's
-///      committed `k_i`/`γ_i` against what it actually fed into EVERY
-///      pairwise session, and produce a publicly-checkable fault
-///      attributable to one party index.
-///
-/// See GG20 (R. Gennaro, S. Goldfeder, IACR ePrint 2020/540) §4 for the
-/// exact construction — deliberately NOT transcribed here (this scaffold
-/// pass did not have the paper's identifiable-abort sections open; guessing
-/// paper-exact machinery would be worse than an honest stub).
-pub fn identifyAbortCulprit(shares: []const root.KeyShare, transcripts: anytype) noreturn {
-    _ = shares;
-    _ = transcripts;
-    @panic("TODO(core): GG20 identifiable-abort culprit identification (IACR ePrint 2020/540 §4). " ++
-        "signWithShares implements the weaker 'abort-only v1' posture (see this module's doc comment): " ++
-        "it never returns an invalid signature, but cannot name a culprit when it aborts. A full " ++
-        "implementation needs signWithShares to start RETAINING each pairwise MtA transcript (currently " ++
-        "discarded after each round) plus the paper's opening/decommitment sub-protocol.");
-}
+// ── Identifiable abort: NOT implemented (no public stub) ──────────────────
+//
+// There used to be a `pub fn identifyAbortCulprit(...) noreturn` here whose
+// only behaviour was `@panic`. Removed 2026-09-30: a public function that can
+// only crash compiles in a caller and fails at run time, which is worse than
+// its absence. The gap is recorded in SPEC.md (*Backlog*); what an
+// implementation needs:
+//
+// **STUB (TODO(core)).** GG20's actual identifiable-abort apparatus (paper
+// §4's "Identifiable Abort" rounds): when `signWithShares` returns
+// `error.SigningAborted`, name EXACTLY which party's `k_i`/`γ_i`/`w_i` was
+// used inconsistently across two different pairwise MtA sessions (the
+// residual gap `signWithShares`'s "abort-only v1" posture does not close
+// — see the module doc comment's "Identifiable abort scope" section for
+// the precise threat this closes and why it does NOT threaten the "never
+// return a bad signature" invariant, only attribution). A real
+// implementation needs:
+//
+//   1. Every party to RETAIN its pairwise MtA transcripts (the `c_a`/
+//      `c_b`/proof values `runCheckedMtA`/`runCheckedMtAwc` currently
+//      discard once each pairwise round finishes) tagged by session.
+//   2. On final-signature failure, an opening/decommitment sub-protocol
+//      (GG20's Rounds 6/7) that lets an auditor cross-check a party's
+//      committed `k_i`/`γ_i` against what it actually fed into EVERY
+//      pairwise session, and produce a publicly-checkable fault
+//      attributable to one party index.
+//
+// See GG20 (R. Gennaro, S. Goldfeder, IACR ePrint 2020/540) §4 for the
+// exact construction — deliberately NOT transcribed here (this scaffold
+// pass did not have the paper's identifiable-abort sections open; guessing
+// paper-exact machinery would be worse than an honest stub).
 
 // ── tests ────────────────────────────────────────────────────────────────
-
-test "identifyAbortCulprit is analysed even though nothing may call it" {
-    // It is `noreturn` and panics -- a documented GG20 stub -- so no test can
-    // call it. It is also generic (`transcripts: anytype`), which means a
-    // reference does not analyse its body either and `check-pubfn-reach` is
-    // blind to it. `@TypeOf` of a call instantiates the body for its return
-    // type without emitting the call, which is the only way to keep a broken
-    // edit to this function from compiling green.
-    try std.testing.expectEqual(noreturn, @TypeOf(identifyAbortCulprit(&[_]root.KeyShare{}, {})));
-}
 
 const testing = std.testing;
 

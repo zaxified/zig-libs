@@ -634,9 +634,10 @@ signature" integrity invariant holds regardless — but honest parties learn
 only THAT something was inconsistent, not WHO. Closing this (GG20 §4's
 actual "Identifiable Abort" rounds: retaining every pairwise MtA transcript
 and, on failure, an opening/decommitment sub-protocol that names a culprit)
-is left as `signing.identifyAbortCulprit`, `@panic`-stubbed with the
-construction referenced (not transcribed — this scaffold pass did not have
-that section of the paper open; see the function's own doc comment).
+is not implemented and has no public entry point (a `@panic`-stubbed
+`signing.identifyAbortCulprit` existed until 2026-09-30 and was removed, because a
+public function that can only crash fails in the caller at run time; the
+construction it referenced is kept as a comment near the end of `signing.zig`).
 
 **Const-time posture.** `k_i`/`γ_i`/`w_i`/`s_i` and every MtA/MtAwc
 intermediate are SECRET and flow entirely through already-constant-time
@@ -931,7 +932,7 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   Phase 2d inherits this same residual audit debt, since `signing.zig` is
   built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
 - Phase 2d: GG20's full identifiable-abort culprit-naming apparatus
-  (`signing.identifyAbortCulprit`, `@panic`-stubbed) — see the dedicated
+  (not implemented, no public stub) — see the dedicated
   Phase 2d section above for the exact boundary of what "abort-only v1"
   does and does not cover.
 - Phase 2d's Γ commit-reveal knowledge proof (`signing.SchnorrProof`) is a
@@ -975,7 +976,7 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 
 - **Per-participant signing/keygen state machine (message in, message out) instead of only `signWithShares`** (survey 2026-09-30): every competitor lets each party run in its own process; an in-process driver over all shares means the signer sees everyone's secret, so the module cannot be used as MPC custody, only simulated. Effort: large (round structs already exist: `GammaCommitment`, `GammaReveal`, `DeltaShare`, `SigShare`). Fits CONVENTIONS §2 (I/O stays outside).
 - **Dealer-free keygen wired in** (survey 2026-09-30): the trusted dealer sees `x`. Sibling `dkg` (GJKR) exists but is a lockstep simulation and does not exchange Paillier / aux proofs; finishing both together is the real fix. Effort: large. Fits §2.
-- **Identifiable abort (`identifyAbortCulprit`)** (survey 2026-09-30): the public function is a `@panic` stub; multi-party-sig and cggmp21 name the culprit. Already listed under Backlog above; effort large (GG20 §4 or CGGMP21). Fits §2. Consider removing the panicking public symbol until implemented.
+- **Identifiable abort** (survey 2026-09-30): multi-party-sig and cggmp21 name the culprit. Already listed under Backlog above; effort large (GG20 §4 or CGGMP21). Fits §2. The panicking public stub the survey flagged was removed 2026-09-30.
 - **Pre-signing / 1-round online signing (CGGMP21)** (survey 2026-09-30): the standard way to get low-latency signatures; needs the per-participant state machine first. Effort: large. Fits §2.
 - **Key refresh / resharing** (survey 2026-09-30): tss-lib resharing, cggmp21 refresh. Effort: large. Fits §2. Lower priority than the state machine.
 

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **BREAKING:** `signing.identifyAbortCulprit` is removed. It was a public
+  `noreturn` function whose only behaviour was `@panic` (GG20 identifiable abort is not
+  implemented), so a caller compiled and then crashed at run time. Identifiable abort stays a
+  backlog item (SPEC.md); `signWithShares` is unchanged — it never returns an invalid signature
+  and reports `error.SigningAborted` without naming a culprit. No in-repo consumer.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 R2. `zkproofs.mulAddBytes` (private,
   the `e*x + addend` Sigma-protocol response arithmetic behind s1/s2/t1/t2) had a
   carry-propagation tail that exited as soon as `carry != 0` went false — a real branch on

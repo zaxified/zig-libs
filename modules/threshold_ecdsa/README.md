@@ -138,12 +138,12 @@ same Shamir+Feldman primitives `keygenTrustedDealer` composes), and
 comment for why a real deployment never calls it. See `src/signing.zig` for
 the full Phase-2d API (`signWithShares`, `lagrangeCoefficient`, the
 `GammaCommitment`/`SchnorrProof`/`GammaReveal`/`DeltaShare`/`SigShare`
-round-message types, and the `identifyAbortCulprit` stub).
+round-message types).
 
 ## Backlog
 
-- **Phase 2d identifiable abort (deferred — `signing.zig`'s
-  `identifyAbortCulprit`, `@panic`-stubbed):** GG20's actual
+- **Phase 2d identifiable abort (deferred — no public entry point; the
+  `@panic`-stubbed `identifyAbortCulprit` was removed 2026-09-30):** GG20's actual
   identifiable-abort apparatus (IACR ePrint 2020/540 §4) — when
   `signWithShares` returns `error.SigningAborted`, name EXACTLY which
   party's `k_i`/`γ_i`/`w_i` was used inconsistently across two different
