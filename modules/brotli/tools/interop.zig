@@ -171,27 +171,31 @@ fn note(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("NOTE      " ++ fmt ++ "\n", args);
 }
 
-fn frozenFor(name: []const u8) ?corpus.blessed.Blessed {
+fn frozenFor(name: []const u8, effort: []const u8) ?corpus.blessed.Blessed {
     for (corpus.blessed.entries) |e| {
-        if (std.mem.eql(u8, e.name, name)) return e;
+        if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.effort, effort)) return e;
     }
     return null;
+}
+
+fn effortOf(tag: []const u8) brotli.Effort {
+    return std.meta.stringToEnum(brotli.Effort, tag).?;
 }
 
 // ── direction A: the reference decodes what WE emit ─────────────────────────
 
 /// Returns our stream, blessed by the reference, or null if anything failed.
-fn blessShape(ref: *Ref, shape: corpus.Shape) !?[]u8 {
+fn blessShape(ref: *Ref, shape: corpus.Shape, effort: []const u8) !?[]u8 {
     const gpa = ref.gpa;
     const input = try corpus.build(gpa, shape);
     defer gpa.free(input);
 
-    const stream = try brotli.compress(gpa, input);
+    const stream = try brotli.compressWith(gpa, input, .{ .effort = effortOf(effort) });
     errdefer gpa.free(stream);
 
     const back = ref.decompress(stream) catch |e| switch (e) {
         error.ReferenceRejected => {
-            bad("{s}: google/brotli REFUSED our {d}-byte stream", .{ shape.name, stream.len });
+            bad("{s} ({s}): google/brotli REFUSED our {d}-byte stream", .{ shape.name, effort, stream.len });
             gpa.free(stream);
             return null;
         },
@@ -200,7 +204,7 @@ fn blessShape(ref: *Ref, shape: corpus.Shape) !?[]u8 {
     defer gpa.free(back);
 
     if (!std.mem.eql(u8, input, back)) {
-        bad("{s}: google/brotli decoded our stream to different bytes ({d} in, {d} out)", .{ shape.name, input.len, back.len });
+        bad("{s} ({s}): google/brotli decoded our stream to different bytes ({d} in, {d} out)", .{ shape.name, effort, input.len, back.len });
         gpa.free(stream);
         return null;
     }
@@ -210,20 +214,20 @@ fn blessShape(ref: *Ref, shape: corpus.Shape) !?[]u8 {
 
 fn checkEncoderDirection(ref: *Ref) !void {
     const gpa = ref.gpa;
-    for (corpus.shapes) |shape| {
-        const stream = (try blessShape(ref, shape)) orelse continue;
+    for (corpus.efforts) |effort| for (corpus.shapes) |shape| {
+        const stream = (try blessShape(ref, shape, effort)) orelse continue;
         defer gpa.free(stream);
 
         // …and is the committed record still about THESE bytes?
-        const frozen = frozenFor(shape.name) orelse {
-            bad("{s}: no frozen entry — run with --capture", .{shape.name});
+        const frozen = frozenFor(shape.name, effort) orelse {
+            bad("{s} ({s}): no frozen entry — run with --capture", .{ shape.name, effort });
             continue;
         };
         const d = digestOf(stream);
         if (frozen.stream_len != stream.len or !std.mem.eql(u8, frozen.stream_sha256, &d)) {
-            bad("{s}: the encoder no longer emits the stream the fixture pins ({d} -> {d} bytes) — run with --capture", .{ shape.name, frozen.stream_len, stream.len });
+            bad("{s} ({s}): the encoder no longer emits the stream the fixture pins ({d} -> {d} bytes) — run with --capture", .{ shape.name, effort, frozen.stream_len, stream.len });
         } else ok();
-    }
+    };
 }
 
 // ── direction B: we decode what the REFERENCE emits ─────────────────────────
@@ -300,9 +304,9 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
         \\
         \\//! What google/brotli said about THIS encoder's output, frozen.
         \\//!
-        \\//! For every shape in `interop_corpus.zig`, the reference decompressed
-        \\//! the stream `brotli.compress` produced and got the input back, byte for
-        \\//! byte. `stream_sha256` identifies the exact stream that happened to;
+        \\//! For every shape in `interop_corpus.zig` and every encoder effort, the
+        \\//! reference decompressed the stream `brotli.compressWith` produced and got
+        \\//! the input back, byte for byte. `stream_sha256` identifies the exact stream that happened to;
         \\//! `input_sha256` identifies the exact input, so a corpus generator that
         \\//! drifts is told apart from an encoder that drifts.
         \\//!
@@ -323,6 +327,8 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
         \\
         \\pub const Blessed = struct {{
         \\    name: []const u8,
+        \\    /// `brotli.Effort` tag.
+        \\    effort: []const u8,
         \\    input_len: usize,
         \\    /// SHA-256 of the input, lowercase hex.
         \\    input_sha256: []const u8,
@@ -336,24 +342,24 @@ fn captureBlessed(ref: *Ref, provenance: []const u8) !void {
     , .{provenance});
 
     var blessed_count: usize = 0;
-    for (corpus.shapes) |shape| {
+    for (corpus.efforts) |effort| for (corpus.shapes) |shape| {
         const input = try corpus.build(gpa, shape);
         defer gpa.free(input);
-        const stream = (try blessShape(ref, shape)) orelse {
-            std.debug.print("REFUSING TO CAPTURE: '{s}' was not blessed by the reference\n", .{shape.name});
+        const stream = (try blessShape(ref, shape, effort)) orelse {
+            std.debug.print("REFUSING TO CAPTURE: '{s}' ({s}) was not blessed by the reference\n", .{ shape.name, effort });
             return error.ReferenceRejectedOurStream;
         };
         defer gpa.free(stream);
         blessed_count += 1;
 
-        try out.print(gpa, "    .{{ .name = \"{s}\", .input_len = {d}, .input_sha256 = \"{s}\", .stream_len = {d}, .stream_sha256 = \"{s}\" }},\n", .{
-            shape.name, input.len, &digestOf(input), stream.len, &digestOf(stream),
+        try out.print(gpa, "    .{{ .name = \"{s}\", .effort = \"{s}\", .input_len = {d}, .input_sha256 = \"{s}\", .stream_len = {d}, .stream_sha256 = \"{s}\" }},\n", .{
+            shape.name, effort, input.len, &digestOf(input), stream.len, &digestOf(stream),
         });
-    }
+    };
     try out.appendSlice(gpa, "};\n");
 
     try std.Io.Dir.cwd().writeFile(ref.io, .{ .sub_path = blessed_path, .data = out.items });
-    std.debug.print("wrote {s} ({d} shapes)\n", .{ blessed_path, blessed_count });
+    std.debug.print("wrote {s} ({d} shape x effort streams)\n", .{ blessed_path, blessed_count });
 }
 
 // ── entry point ─────────────────────────────────────────────────────────────

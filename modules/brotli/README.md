@@ -47,8 +47,11 @@ const n = try brotli.decompressStream(gpa, &body_reader, &file_writer, .{});
 
 // Compress. Fails only on allocation — blocks that will not shrink are
 // stored verbatim, so the result is always a valid `br` body.
-const br = try brotli.compress(gpa, data);
+const br = try brotli.compress(gpa, data);                    // effort .default
 defer gpa.free(br);
+// .fast (≈ reference q1–q5, as fast as before), .default (between q5 and q9),
+// .best (for content compressed once and served many times).
+const br_best = try brotli.compressWith(gpa, data, .{ .effort = .best });
 
 // Errors: brotli.BrotliError (TruncatedInput, InvalidHuffman, InvalidDistance,
 // InvalidDictionary, OutputTooLarge, InvalidPadding, ...).

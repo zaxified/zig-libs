@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Encoder: effort levels and a stronger encoder** (maturity task C19, second half).
+  New `compressWith(gpa, input, .{ .effort = .fast | .default | .best })`, `CompressOptions`, `Effort`;
+  `compress` = `.default`. Matches are scored by the bits they save (the block's literal entropy
+  against the distance's cost) rather than by length, and reach 65 535 bytes (was 512); distance
+  short codes and implicit-distance commands mirror the decoder's ring of recent distances; literal
+  context modelling (UTF8/LSB6, clustered to ≤ 16 codes, checked on real bits against one code) at
+  `.default` and `.best`. `alice29.txt`: 54 605 → 51 467 (default) / 50 736 (best) bytes, reference
+  q5 52 809, q9 51 054; `zeros` 651 → 27. ⚠ `compress` output bytes change (still valid `br`,
+  re-blessed by google/brotli): the interop fixture now blesses every shape at all three efforts
+  (135 streams, `interop_blessed.zig` gains an `effort` field).
+
 - **2026-09-30** — **Streaming decoder: `decompressStream(gpa, reader, writer, options)`** (maturity
   task C19, first half). Memory is the window — grown from 64 KiB only as far as the output needs —
   never the whole output; output reaches the writer at every meta-block end. The one-shot and the

@@ -52,12 +52,12 @@ fn digestOf(bytes: []const u8) [64]u8 {
 /// The frozen record for `name`, or a compile error if there is none. A shape
 /// with no blessed entry would be a shape that silently stopped being checked
 /// — the exact failure this split has to avoid, so it is a build failure.
-fn frozen(comptime name: []const u8) blessed.Blessed {
-    // 45 shapes x a name comparison each, resolved at comptime: the default
-    // 1000-branch budget does not cover it.
-    @setEvalBranchQuota(20_000);
+fn frozen(comptime name: []const u8, comptime effort: []const u8) blessed.Blessed {
+    // 135 entries (45 shapes x 3 efforts) x two name comparisons each,
+    // resolved at comptime: the default 1000-branch budget does not cover it.
+    @setEvalBranchQuota(200_000);
     inline for (blessed.entries) |e| {
-        if (comptime std.mem.eql(u8, e.name, name)) return e;
+        if (comptime std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.effort, effort)) return e;
     }
     @compileError("no blessed entry for shape '" ++ name ++
         "' — run: zig build interop-brotli -- --capture");
@@ -87,8 +87,8 @@ test "interop replay: our decoder reproduces the plaintext from google/brotli's 
 
 test "interop replay: the encoder still emits the exact streams google/brotli accepted" {
     const gpa = testing.allocator;
-    inline for (corpus.shapes) |shape| {
-        const record = comptime frozen(shape.name);
+    inline for (corpus.efforts) |effort| inline for (corpus.shapes) |shape| {
+        const record = comptime frozen(shape.name, effort);
 
         const input = try corpus.build(gpa, shape);
         defer gpa.free(input);
@@ -104,7 +104,7 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
             return e;
         };
 
-        const stream = try brotli.compress(gpa, input);
+        const stream = try brotli.compressWith(gpa, input, .{ .effort = @field(brotli.Effort, effort) });
         defer gpa.free(stream);
         testing.expectEqual(record.stream_len, stream.len) catch |e| {
             std.debug.print(
@@ -124,7 +124,7 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
             , .{shape.name});
             return e;
         };
-    }
+    };
 }
 
 // ── count canary ────────────────────────────────────────────────────────────
@@ -134,15 +134,19 @@ test "interop replay: the encoder still emits the exact streams google/brotli ac
 // direction — a shape deleted while its blessing lingers — and a capture run
 // that silently produced fewer entries than it meant to.
 
-test "interop replay: coverage canary — 45 blessed shapes, 24 reference streams" {
+test "interop replay: coverage canary — 45 shapes x 3 efforts blessed, 24 reference streams" {
     try testing.expectEqual(@as(usize, 45), corpus.shapes.len);
-    try testing.expectEqual(@as(usize, 45), blessed.entries.len);
+    try testing.expectEqual(@as(usize, 3), corpus.efforts.len);
+    try testing.expectEqual(@as(usize, 45 * 3), blessed.entries.len);
     try testing.expectEqual(@as(usize, 24), corpus.ref_streams.len);
 
-    // Every blessed name is a shape name, in order: a renamed shape must not
-    // silently pick up a neighbour's blessing.
-    for (corpus.shapes, blessed.entries) |s, e| {
-        try testing.expectEqualStrings(s.name, e.name);
+    // Every blessed entry is (effort, shape), in capture order: a renamed
+    // shape must not silently pick up a neighbour's blessing.
+    for (corpus.efforts, 0..) |effort, ei| {
+        for (corpus.shapes, blessed.entries[ei * 45 ..][0..45]) |s, e| {
+            try testing.expectEqualStrings(s.name, e.name);
+            try testing.expectEqualStrings(effort, e.effort);
+        }
     }
 
     // The multi-meta-block shapes really do straddle the boundary — the point

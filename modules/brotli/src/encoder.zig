@@ -5,29 +5,39 @@
 //!
 //! ## What it emits
 //!
-//! One meta-block per `compressed_block_size` bytes of input. Each block is
-//! tried as a compressed meta-block first (`NBLTYPES = 1` for all three
-//! categories, `NPOSTFIX = NDIRECT = 0`, one context mode, an all-zero context
-//! map so the literal code is context-free) and is kept only if it came out
-//! **strictly smaller** than storing those bytes verbatim; otherwise the block
-//! is rolled back out of the bit writer and re-emitted as an uncompressed
-//! meta-block. The fallback is therefore a real, exercised path, not an
-//! accident — see the `fallback` tests.
+//! One meta-block per `CompressOptions.block_size` (default 1 MiB) of input.
+//! Each block is tried as a compressed meta-block first (`NBLTYPES = 1` for
+//! all three categories, `NPOSTFIX = NDIRECT = 0`) and is kept only if it came
+//! out **strictly smaller** than storing those bytes verbatim; otherwise the
+//! block is rolled back out of the bit writer and re-emitted as an
+//! uncompressed meta-block. The fallback is therefore a real, exercised path,
+//! not an accident — see the `fallback` tests.
+//!
+//! Inside a compressed block (2026-09-30):
+//!
+//! - **Matches are chosen by the bits they save** (`Matcher.gain`), not by
+//!   length: the literals covered, priced at the block's order-0 entropy,
+//!   minus the distance's cost. Up to 65 535 bytes long; the search depth is
+//!   the effort (`Effort`: 8 / 32 / 256 candidates), one lazy step.
+//! - **Distance short codes and implicit distances**: the encoder mirrors the
+//!   decoder's ring of the last four distances (`DistRing`) and names a
+//!   distance by its short code (0..15, no extra bits) when it can; a copy at
+//!   the last distance whose lengths fit uses an implicit-distance command
+//!   and no distance symbol at all.
+//! - **Literal context modelling** (not at `.fast`): per-context histograms
+//!   for the UTF8 and LSB6 modes, clustered greedily by estimated bits into
+//!   at most 16 codes, the cheaper mode kept — and then checked on real bits
+//!   against a single literal code, keeping the shorter block.
 //!
 //! ## What it deliberately does not do
 //!
-//! - No block splitting (`NBLTYPES` is always 1), no literal context modelling,
-//!   no static-dictionary references, no `NPOSTFIX`/`NDIRECT` tuning.
-//! - **No distance short codes.** Codes 0..15 index the decoder's ring buffer
-//!   of recent distances; every distance emitted here is an explicit code
-//!   (>= 16), and no implicit-distance command symbol is ever used. That costs
-//!   a few bits per repeated distance and buys the encoder freedom from having
-//!   to mirror the decoder's ring-buffer state exactly. Explicit distances
-//!   still *update* the decoder's ring buffer; nothing here ever reads it.
+//! - No block splitting (`NBLTYPES` is always 1), no static-dictionary
+//!   references, no `NPOSTFIX`/`NDIRECT` tuning, no MSB6/SIGNED context modes
+//!   (never the cheaper choice on the measured corpus), no optimal parse.
 //!
-//! The result is a genuine compressor (roughly 2.5-3.5x on English text) that
-//! is not competitive with `brotli -q 11`, and is never worse than store mode
-//! by more than the two-bit final-meta-block marker.
+//! The result: `alice29.txt` 51 467 bytes at `.default` (reference q5: 52 809,
+//! q9: 51 054, q11: 46 487), 50 736 at `.best`; never worse than store mode by
+//! more than the two-bit final-meta-block marker.
 //!
 //! ## How the bit-level format is anchored
 //!
@@ -58,10 +68,10 @@ const compressed_block_size = 1 << 20;
 const chain_log_max = 20;
 const hash_log_max = 17;
 const min_match = 4;
-const max_match = 512;
-/// Hash-chain candidates inspected per position. The match finder is a plain
-/// hash chain with one lazy-match step; it is not meant to be competitive.
-const max_chain = 8;
+/// Longest match searched for. Long runs (a file of zeros) are where a short
+/// cap hurt most: 512 left `zeros` at 651 bytes, 65 535 at 26 (the reference's
+/// q11: 14). Copy lengths themselves reach far higher (RFC 7932 copy code 23).
+const max_match = 65535;
 
 /// Errors that make the encoder give up on *compressing* a block. They never
 /// escape `compress`: the block is stored verbatim instead.
@@ -178,6 +188,40 @@ fn distanceCode(d: u32) ?struct { sym: u16, extra: u32, nbits: u5 } {
     return null;
 }
 
+/// The decoder's ring of the last four distances, as RFC 7932 §4 defines it,
+/// so the encoder can name a distance by a short code (0..15, no extra bits)
+/// when the decoder will compute the same one. Code 0 (the last distance) and
+/// the implicit-distance commands leave the ring as it is; every other code
+/// pushes its distance. It persists across meta-blocks, as the decoder's does
+/// — and so must be rolled back with a block that is stored instead.
+const DistRing = struct {
+    /// Most recent first; the RFC's initial values.
+    last: [4]u32 = .{ 4, 11, 15, 16 },
+
+    /// `packed_deltas` of the decoder: codes 4..9 are last-1, last+1, last-2,
+    /// last+2, last-3, last+3; codes 10..15 the same around the second-last.
+    const deltas = [6]i64{ -1, 1, -2, 2, -3, 3 };
+
+    fn shortCode(self: *const DistRing, d: u32) ?u16 {
+        for (self.last, 0..) |l, i| {
+            if (l == d) return @intCast(i);
+        }
+        for ([2]u16{ 4, 10 }, 0..) |first, which| {
+            for (deltas, 0..) |delta, k| {
+                if (@as(i64, self.last[which]) + delta == d) return first + @as(u16, @intCast(k));
+            }
+        }
+        return null;
+    }
+
+    /// Account for one copy at distance `d` named by `code` (0..15, or null
+    /// for an explicit code).
+    fn update(self: *DistRing, d: u32, code: ?u16) void {
+        if (code == 0) return;
+        self.last = .{ d, self.last[0], self.last[1], self.last[2] };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Insert-and-copy command tables, derived from `tables.cmd_lut` (the authority
 // the decoder itself uses) rather than re-deriving the RFC's ranges by hand.
@@ -189,6 +233,10 @@ const CmdTables = struct {
     copy_nbits: [24]u5,
     /// `sym[insert_code][copy_code]` for the explicit-distance form.
     sym: [24][24]u16,
+    /// The implicit-distance form (distance = the last one, no distance
+    /// symbol at all), where one exists: insert codes 0..7 with copy codes
+    /// 0..15. `0xffff` elsewhere.
+    implicit: [24][24]u16,
 };
 
 const cmd_tables: CmdTables = blk: {
@@ -212,13 +260,14 @@ const cmd_tables: CmdTables = blk: {
         .copy_off = cpy,
         .copy_nbits = .{0} ** 24,
         .sym = .{.{0xffff} ** 24} ** 24,
+        .implicit = .{.{0xffff} ** 24} ** 24,
     };
     for (tables.cmd_lut, 0..) |e, s| {
         const ic = indexOf(&ins, e.insert_len_offset);
         const cc = indexOf(&cpy, e.copy_len_offset);
         t.insert_nbits[ic] = @intCast(e.insert_len_extra_bits);
         t.copy_nbits[cc] = @intCast(e.copy_len_extra_bits);
-        if (e.distance_code < 0) t.sym[ic][cc] = @intCast(s);
+        if (e.distance_code < 0) t.sym[ic][cc] = @intCast(s) else t.implicit[ic][cc] = @intCast(s);
     }
     for (t.sym) |row| for (row) |s| {
         if (s == 0xffff) @compileError("no explicit-distance command symbol for some (insert, copy) pair");
@@ -632,9 +681,14 @@ fn buildAndWriteCode(
 // ---------------------------------------------------------------------------
 // Match finding: one hash chain over 4-byte hashes, one lazy step.
 
-const Match = struct { len: u32, dist: u32 };
+const Match = struct { len: u32, dist: u32, gain: f32 };
 
 const Matcher = struct {
+    /// Candidates walked per lookup (`Effort.chainDepth`).
+    chain_depth: usize,
+    /// Estimated bits a literal costs in the current block (its order-0
+    /// entropy): what a match saves per byte it covers. Set per block.
+    lit_cost: f32 = 8,
     head: []u32,
     prev: []u32,
     mask: usize,
@@ -643,7 +697,7 @@ const Matcher = struct {
 
     const empty: u32 = 0xffff_ffff;
 
-    fn init(gpa: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!Matcher {
+    fn init(gpa: std.mem.Allocator, data: []const u8, chain_depth: usize) std.mem.Allocator.Error!Matcher {
         // Both tables are sized to the input: compressing a few hundred bytes
         // must not cost a fixed half-megabyte of zeroed hash table.
         var chain_log: u6 = 1;
@@ -658,6 +712,7 @@ const Matcher = struct {
         @memset(head, empty);
         @memset(prev, empty);
         return .{
+            .chain_depth = chain_depth,
             .head = head,
             .prev = prev,
             .mask = size - 1,
@@ -684,16 +739,30 @@ const Matcher = struct {
         self.head[h] = @intCast(p);
     }
 
-    /// Longest match for `p` that ends at or before `limit` and is at most
-    /// `max_dist` back. Returns null below `min_match`.
+    /// The match's estimated saving in bits: the literals it replaces minus
+    /// what naming it costs — the distance's extra bits (about log2 of it)
+    /// and a few bits of command and distance symbol. On text a literal costs
+    /// 4-5 bits and nearly every match pays; on random bytes over a small
+    /// alphabet a literal costs 2-3 and a far, short match loses (measured:
+    /// `alpha5_flat` 10 417 bytes with the longest match taken, worse the
+    /// deeper the search looked, against ~9 000 for no matches at all).
+    fn gain(self: *const Matcher, len: usize, dist: usize) f32 {
+        const dist_bits: f32 = @floatFromInt(std.math.log2_int(usize, dist));
+        return @as(f32, @floatFromInt(len)) * self.lit_cost - dist_bits - 6;
+    }
+
+    /// The match for `p` that saves the most bits (`gain`), ending at or
+    /// before `limit`, at most `max_dist` back. Null below `min_match` or
+    /// when no candidate saves anything.
     fn find(self: *const Matcher, p: usize, max_dist: usize, limit: usize) ?Match {
         if (p + min_match > limit) return null;
         const max_len = @min(limit - p, max_match);
         var best_len: usize = 0;
         var best_dist: usize = 0;
+        var best_gain: f32 = 0;
         var cand = self.head[self.hash(p)];
         var depth: usize = 0;
-        while (cand != empty and depth < max_chain) : (depth += 1) {
+        while (cand != empty and depth < self.chain_depth) : (depth += 1) {
             const c: usize = cand;
             if (c >= p) break;
             const d = p - c;
@@ -703,10 +772,14 @@ const Matcher = struct {
             if (best_len == 0 or self.data[c + best_len] == self.data[p + best_len]) {
                 var l: usize = 0;
                 while (l < max_len and self.data[c + l] == self.data[p + l]) l += 1;
-                if (l > best_len) {
-                    best_len = l;
-                    best_dist = d;
-                    if (l == max_len) break;
+                if (l >= min_match) {
+                    const g = self.gain(l, d);
+                    if (g > best_gain) {
+                        best_gain = g;
+                        best_len = l;
+                        best_dist = d;
+                        if (l == max_len) break;
+                    }
                 }
             }
             const next = self.prev[c & self.mask];
@@ -714,7 +787,7 @@ const Matcher = struct {
             cand = next;
         }
         if (best_len < min_match) return null;
-        return .{ .len = @intCast(best_len), .dist = @intCast(best_dist) };
+        return .{ .len = @intCast(best_len), .dist = @intCast(best_dist), .gain = best_gain };
     }
 };
 
@@ -745,6 +818,14 @@ fn buildCommands(
     var lit_start = start;
     var pending: ?Match = null;
 
+    // The block's order-0 entropy, as the price of a literal.
+    var hist = [_]u32{0} ** 256;
+    for (matcher.data[start..end]) |b| hist[b] += 1;
+    var sum: f64 = 0;
+    for (hist) |c| sum += nlog2n(c);
+    const n: f64 = @floatFromInt(end - start);
+    matcher.lit_cost = @floatCast(@max(1.0, (nlog2n(end - start) - sum) / n));
+
     while (p < end) {
         const m = pending orelse matcher.find(p, @min(max_dist, p), end);
         pending = null;
@@ -756,7 +837,9 @@ fn buildCommands(
         matcher.insert(p);
         if (p + 1 < end) {
             if (matcher.find(p + 1, @min(max_dist, p + 1), end)) |b| {
-                if (b.len > m.?.len) {
+                // One literal more is spent to take `b`, so it must save
+                // more than that literal costs on top of what `m` saves.
+                if (b.gain > m.?.gain + matcher.lit_cost) {
                     pending = b;
                     p += 1; // spend one more literal, take the better match
                     continue;
@@ -781,6 +864,277 @@ fn buildCommands(
 }
 
 // ---------------------------------------------------------------------------
+// Literal context modelling (RFC 7932 §7.1, §7.3).
+//
+// The decoder picks the literal prefix code by a context id computed from the
+// two previous output bytes (`tables.context_lookup`, one of four modes) and a
+// context map from the 64 ids to NTREES codes. The encoder histograms the
+// block's literals per context, clusters the 64 histograms greedily — merge the
+// pair whose union costs the fewest extra bits, while that is cheaper than
+// keeping them apart — and tries every mode, keeping the cheapest. The cost is
+// an estimate (Shannon bits plus a flat per-code header guess); the store-mode
+// comparison afterwards is on real bits.
+
+const num_contexts = 1 << tables.literal_context_bits;
+/// NTREES cap for the literal map: more codes cost more headers than they save
+/// on the block sizes this encoder emits.
+const max_literal_trees = 16;
+
+/// Scratch for `clusterLiterals`, on the heap: ~100 KiB.
+const ClusterScratch = struct {
+    hist: [num_contexts][tables.num_literal_symbols]u32,
+    sets: [num_contexts]SymbolSet,
+    delta: [num_contexts][num_contexts]f64,
+};
+
+const LiteralModel = struct {
+    mode: u2 = 0,
+    /// Context id -> literal code.
+    map: [num_contexts]u8 = @splat(0),
+    ntrees: u8 = 1,
+    /// One histogram per literal code.
+    counts: [max_literal_trees][tables.num_literal_symbols]u32 = @splat(@splat(0)),
+};
+
+fn contextId(mode: u2, p1: u8, p2: u8) u6 {
+    const lut = tables.context_lookup[@as(usize, mode) * 512 ..][0..512];
+    return @intCast(lut[p1] | lut[256 + @as(usize, p2)]);
+}
+
+/// `n * log2(n)` for small counts, where most of a context's counts fall.
+const nlog2n_table: [4096]f32 = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [4096]f32 = undefined;
+    t[0] = 0;
+    for (1..4096) |i| {
+        const x: f64 = @floatFromInt(i);
+        t[i] = @floatCast(x * @log2(x));
+    }
+    break :blk t;
+};
+
+fn nlog2n(n: u64) f64 {
+    if (n < nlog2n_table.len) return nlog2n_table[n];
+    const x: f64 = @floatFromInt(n);
+    return x * @log2(x);
+}
+
+/// Estimated bits to code `h` with its own prefix code: the entropy of the
+/// counts (`T log T - sum c log c`) plus a rough header price per used symbol.
+fn histogramCost(h: *const [tables.num_literal_symbols]u32) f64 {
+    var total: u64 = 0;
+    var used: u32 = 0;
+    var sum: f64 = 0;
+    for (h) |c| {
+        if (c == 0) continue;
+        total += c;
+        used += 1;
+        sum += nlog2n(c);
+    }
+    if (total == 0) return 0;
+    return nlog2n(total) - sum + 40 + 5 * @as(f64, @floatFromInt(used));
+}
+
+fn addInto(dst: *[tables.num_literal_symbols]u32, src: *const [tables.num_literal_symbols]u32) void {
+    for (dst, src) |*d, x| d.* += x;
+}
+
+/// Which literals a histogram uses, as a 256-bit set.
+const SymbolSet = [4]u64;
+
+fn symbolSet(h: *const [tables.num_literal_symbols]u32) SymbolSet {
+    var set: SymbolSet = @splat(0);
+    for (h, 0..) |c, i| {
+        if (c != 0) set[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+    }
+    return set;
+}
+
+/// `histogramCost(a + b)` without building the sum, walking only the
+/// symbols either uses — a handful on small inputs, where clustering is
+/// otherwise a fixed cost of 2016 pairs x 256 symbols per mode.
+fn unionCost(a: *const [tables.num_literal_symbols]u32, b: *const [tables.num_literal_symbols]u32, sa: SymbolSet, sb: SymbolSet) f64 {
+    var total: u64 = 0;
+    var used: u32 = 0;
+    var sum: f64 = 0;
+    for (0..4) |w| {
+        var bits = sa[w] | sb[w];
+        while (bits != 0) {
+            const i = w * 64 + @ctz(bits);
+            bits &= bits - 1;
+            const c: u64 = @as(u64, a[i]) + b[i];
+            total += c;
+            used += 1;
+            sum += nlog2n(c);
+        }
+    }
+    if (total == 0) return 0;
+    return nlog2n(total) - sum + 40 + 5 * @as(f64, @floatFromInt(used));
+}
+
+/// Cluster the per-context histograms of `mode` for `input[start..end)`'s
+/// literals (`lits` marks literal positions) and return the model with its
+/// estimated cost.
+fn clusterLiterals(input: []const u8, start: usize, cmds: []const Cmd, mode: u2, scratch: *ClusterScratch, out: *LiteralModel) f64 {
+    const hist = &scratch.hist;
+    hist.* = @splat(@splat(0));
+    var pos = start;
+    for (cmds) |c| {
+        for (0..c.insert_len) |k| {
+            const q = pos + k;
+            const p1: u8 = if (q >= 1) input[q - 1] else 0;
+            const p2: u8 = if (q >= 2) input[q - 2] else 0;
+            hist[contextId(mode, p1, p2)][input[q]] += 1;
+        }
+        pos += c.insert_len + c.copy_len;
+    }
+
+    // Clusters start as the non-empty contexts.
+    var cluster_of: [num_contexts]u8 = @splat(0);
+    var members: [num_contexts]bool = @splat(false); // cluster id alive
+    var cost: [num_contexts]f64 = @splat(0);
+    var any = false;
+    for (0..num_contexts) |i| {
+        var nonempty = false;
+        for (hist[i]) |c| {
+            if (c != 0) nonempty = true;
+        }
+        cluster_of[i] = @intCast(i);
+        members[i] = nonempty;
+        if (nonempty) {
+            cost[i] = histogramCost(&hist[i]);
+            any = true;
+        }
+    }
+    if (!any) {
+        out.* = .{ .mode = mode };
+        out.counts[0][0] = 1;
+        return 0;
+    }
+
+    // Pairwise merge deltas, recomputed only for the merged cluster.
+    const delta = &scratch.delta;
+    const sets = &scratch.sets;
+    for (0..num_contexts) |i| sets[i] = symbolSet(&hist[i]);
+    for (0..num_contexts) |a| {
+        for (a + 1..num_contexts) |b| {
+            if (!members[a] or !members[b]) continue;
+            delta[a][b] = unionCost(&hist[a], &hist[b], sets[a], sets[b]) - cost[a] - cost[b];
+        }
+    }
+    var alive: usize = 0;
+    for (members) |m| alive += @intFromBool(m);
+    while (alive > 1) {
+        var best: f64 = std.math.inf(f64);
+        var ba: usize = 0;
+        var bb: usize = 0;
+        for (0..num_contexts) |a| {
+            if (!members[a]) continue;
+            for (a + 1..num_contexts) |b| {
+                if (!members[b]) continue;
+                if (delta[a][b] < best) {
+                    best = delta[a][b];
+                    ba = a;
+                    bb = b;
+                }
+            }
+        }
+        // Stop when no merge saves bits and the cap is met.
+        if (best >= 0 and alive <= max_literal_trees) break;
+        addInto(&hist[ba], &hist[bb]);
+        for (&sets[ba], sets[bb]) |*x, y| x.* |= y;
+        cost[ba] = histogramCost(&hist[ba]);
+        members[bb] = false;
+        for (&cluster_of) |*c| {
+            if (c.* == bb) c.* = @intCast(ba);
+        }
+        alive -= 1;
+        for (0..num_contexts) |x| {
+            if (x == ba or !members[x]) continue;
+            const d = unionCost(&hist[ba], &hist[x], sets[ba], sets[x]) - cost[ba] - cost[x];
+            if (x < ba) delta[x][ba] = d else delta[ba][x] = d;
+        }
+    }
+
+    // Renumber the surviving clusters 0..ntrees-1.
+    var renum: [num_contexts]u8 = @splat(0xff);
+    var n: u8 = 0;
+    var total: f64 = 0;
+    out.* = .{ .mode = mode };
+    for (0..num_contexts) |i| {
+        if (!members[i]) continue;
+        renum[i] = n;
+        out.counts[n] = hist[i];
+        total += cost[i];
+        n += 1;
+    }
+    out.ntrees = n;
+    for (0..num_contexts) |i| {
+        // A context no literal used joins code 0; the map entry is free.
+        out.map[i] = if (renum[cluster_of[i]] != 0xff) renum[cluster_of[i]] else 0;
+    }
+    // The context map itself: roughly two bits per entry beyond one tree.
+    if (n > 1) total += 2 * num_contexts;
+    return total;
+}
+
+/// The literal model for a block: context-free (one code) at `.fast`, or
+/// when the literals are too few or too random for contexts to pay; else the
+/// cheapest clustering over the UTF8 and LSB6 context modes. MSB6 and SIGNED
+/// are not tried: over the whole measured corpus (text, UTF-16, small random
+/// alphabets, binary) neither ever won, so emitting them would be a path the
+/// reference decoder never checked from this side, for no measured gain.
+fn chooseLiteralModel(gpa: std.mem.Allocator, input: []const u8, start: usize, cmds: []const Cmd, effort: Effort, out: *LiteralModel) std.mem.Allocator.Error!void {
+    out.* = .{};
+    var n_lits: u64 = 0;
+    var pos = start;
+    for (cmds) |c| {
+        for (input[pos..][0..c.insert_len]) |b| out.counts[0][b] += 1;
+        n_lits += c.insert_len;
+        pos += c.insert_len + c.copy_len;
+    }
+    if (effort == .fast or n_lits < 256) return;
+    // Near 8 bits a literal: no context will find structure a single code
+    // misses (random or already-compressed bytes).
+    if (histogramCost(&out.counts[0]) > 7.9 * @as(f64, @floatFromInt(n_lits))) return;
+
+    const scratch = try gpa.create(ClusterScratch);
+    defer gpa.destroy(scratch);
+    const single = histogramCost(&out.counts[0]);
+    var best_cost = single;
+    var trial: LiteralModel = undefined;
+    for ([_]u2{ 2, 0 }) |mode| {
+        const c = clusterLiterals(input, start, cmds, mode, scratch, &trial);
+        if (c < best_cost) {
+            best_cost = c;
+            out.* = trial;
+        }
+    }
+}
+
+fn writeVarLenUint8(w: *BitWriter, v: u8) std.mem.Allocator.Error!void {
+    if (v == 0) return w.writeBits(0, 1);
+    try w.writeBits(1, 1);
+    const n: u3 = @intCast(std.math.log2_int(u8, v));
+    try w.writeBits(n, 3);
+    if (n != 0) try w.writeBits(v - (@as(u32, 1) << n), n);
+}
+
+/// NTREES and, above one tree, the map: no run-length codes (RLEMAX = 0), a
+/// prefix code over the tree ids, no inverse move-to-front.
+fn writeContextMap(gpa: std.mem.Allocator, w: *BitWriter, map: []const u8, ntrees: u8) GiveUp!void {
+    try writeVarLenUint8(w, ntrees - 1);
+    if (ntrees == 1) return;
+    try w.writeBits(0, 1); // RLEMAX = 0
+    var counts = [_]u32{0} ** 256;
+    for (map) |v| counts[v] += 1;
+    var code = try buildAndWriteCode(gpa, w, counts[0..ntrees], ntrees);
+    defer code.deinit(gpa);
+    for (map) |v| try code.emit(w, v);
+    try w.writeBits(0, 1); // IMTF = 0
+}
+
+// ---------------------------------------------------------------------------
 // Meta-block writers.
 
 /// Write one compressed meta-block for `input[start..end)`.
@@ -792,7 +1146,12 @@ fn writeCompressedBlock(
     end: usize,
     cmds: []const Cmd,
     is_last: bool,
-) GiveUp!void {
+    ring: *DistRing,
+    effort: Effort,
+    /// Context-free literals whatever the effort (the real-bits check in
+    /// `compressWith`).
+    single_literal_code: bool,
+) GiveUp!u8 {
     const n = end - start;
     if (n == 0 or n > max_store_block) return error.EncoderInvariant;
     if (cmds.len == 0) return error.EncoderInvariant;
@@ -812,7 +1171,6 @@ fn writeCompressedBlock(
     const res = try gpa.alloc(Resolved, cmds.len);
     defer gpa.free(res);
 
-    var lit_counts = [_]u32{0} ** tables.num_literal_symbols;
     const cmd_counts = try gpa.alloc(u32, tables.num_command_symbols);
     defer gpa.free(cmd_counts);
     @memset(cmd_counts, 0);
@@ -828,7 +1186,13 @@ fn writeCompressedBlock(
         const cl: u32 = if (c.copy_len == 0) cmd_tables.copy_off[0] else c.copy_len;
         const cc = lengthCode(&cmd_tables.copy_off, &cmd_tables.copy_nbits, cl) orelse
             return error.EncoderInvariant;
-        const sym = cmd_tables.sym[ic.code][cc.code];
+        // A copy at the last distance needs no distance symbol at all when
+        // the lengths fit an implicit-distance command; the final
+        // literals-only command reads no distance either way.
+        const short: ?u16 = if (c.copy_len != 0) ring.shortCode(c.dist) else null;
+        const implicit = cmd_tables.implicit[ic.code][cc.code];
+        const use_implicit = implicit != 0xffff and (c.copy_len == 0 or short == 0);
+        const sym = if (use_implicit) implicit else cmd_tables.sym[ic.code][cc.code];
 
         var r: Resolved = .{
             .sym = sym,
@@ -839,19 +1203,25 @@ fn writeCompressedBlock(
             .dist_sym = 0,
             .dist_extra = 0,
             .dist_nbits = 0,
-            .has_dist = c.copy_len != 0,
+            .has_dist = c.copy_len != 0 and !use_implicit,
         };
-        if (r.has_dist) {
+        if (c.copy_len != 0) {
             if (c.dist == 0 or c.dist > lit_pos + c.insert_len) return error.EncoderInvariant;
-            const dc = distanceCode(c.dist) orelse return error.EncoderInvariant;
-            r.dist_sym = dc.sym;
-            r.dist_extra = dc.extra;
-            r.dist_nbits = dc.nbits;
-            dist_counts[dc.sym] += 1;
+            ring.update(c.dist, short);
+        }
+        if (r.has_dist) {
+            if (short) |code| {
+                r.dist_sym = code;
+            } else {
+                const dc = distanceCode(c.dist) orelse return error.EncoderInvariant;
+                r.dist_sym = dc.sym;
+                r.dist_extra = dc.extra;
+                r.dist_nbits = dc.nbits;
+            }
+            dist_counts[r.dist_sym] += 1;
         }
         res[i] = r;
         cmd_counts[sym] += 1;
-        for (input[lit_pos..][0..c.insert_len]) |b| lit_counts[b] += 1;
         lit_pos += c.insert_len;
         covered += c.insert_len + c.copy_len;
         lit_pos += c.copy_len;
@@ -860,12 +1230,19 @@ fn writeCompressedBlock(
     // would run past the end of the meta-block.
     if (covered != n) return error.EncoderInvariant;
 
-    // Every alphabet needs at least one symbol even when unused.
-    var lit_any = false;
-    for (lit_counts) |c| {
-        if (c != 0) lit_any = true;
+    const model = try gpa.create(LiteralModel);
+    defer gpa.destroy(model);
+    try chooseLiteralModel(gpa, input, start, cmds, if (single_literal_code) .fast else effort, model);
+    // Every code needs at least one symbol even when unused.
+    for (model.counts[0..model.ntrees]) |*h| {
+        var any = false;
+        for (h) |c| {
+            if (c != 0) any = true;
+        }
+        if (!any) h[0] = 1;
     }
-    if (!lit_any) lit_counts[0] = 1;
+
+    // Every alphabet needs at least one symbol even when unused.
     var dist_any = false;
     for (dist_counts) |c| {
         if (c != 0) dist_any = true;
@@ -892,16 +1269,19 @@ fn writeCompressedBlock(
     try w.writeBits(0, 1);
     // NPOSTFIX = 0, NDIRECT = 0.
     try w.writeBits(0, 6);
-    // One literal block type => one context mode; LSB6 (irrelevant: the
-    // context map below is all zeros, so the literal code is context-free).
-    try w.writeBits(0, 2);
-    // Literal and distance context maps: NTREES = 1 => a single zero bit each,
-    // and the map is implicitly all zeros.
-    try w.writeBits(0, 1);
+    // One literal block type => one context mode.
+    try w.writeBits(model.mode, 2);
+    // The literal context map; the distance map is a single tree (one zero
+    // bit, the map implicitly all zeros).
+    try writeContextMap(gpa, w, &model.map, model.ntrees);
     try w.writeBits(0, 1);
 
-    var lit_code = try buildAndWriteCode(gpa, w, &lit_counts, tables.num_literal_symbols);
-    defer lit_code.deinit(gpa);
+    var lit_codes: [max_literal_trees]Code = undefined;
+    var built: usize = 0;
+    defer for (lit_codes[0..built]) |*c| c.deinit(gpa);
+    while (built < model.ntrees) : (built += 1) {
+        lit_codes[built] = try buildAndWriteCode(gpa, w, &model.counts[built], tables.num_literal_symbols);
+    }
     var cmd_code = try buildAndWriteCode(gpa, w, cmd_counts, tables.num_command_symbols);
     defer cmd_code.deinit(gpa);
     var dist_code = try buildAndWriteCode(gpa, w, &dist_counts, dist_alphabet_size);
@@ -913,14 +1293,39 @@ fn writeCompressedBlock(
         try cmd_code.emit(w, r.sym);
         if (r.insert_nbits != 0) try w.writeBits(r.insert_extra, r.insert_nbits);
         if (r.copy_nbits != 0) try w.writeBits(r.copy_extra, r.copy_nbits);
-        for (input[lit_pos..][0..c.insert_len]) |b| try lit_code.emit(w, b);
+        for (lit_pos..lit_pos + c.insert_len) |q| {
+            const p1: u8 = if (q >= 1) input[q - 1] else 0;
+            const p2: u8 = if (q >= 2) input[q - 2] else 0;
+            try lit_codes[model.map[contextId(model.mode, p1, p2)]].emit(w, input[q]);
+        }
         lit_pos += c.insert_len;
         if (r.has_dist) {
             try dist_code.emit(w, r.dist_sym);
             if (r.dist_nbits != 0) try w.writeBits(r.dist_extra, r.dist_nbits);
-            lit_pos += c.copy_len;
         }
+        lit_pos += c.copy_len;
     }
+    return model.ntrees;
+}
+
+/// `writeCompressedBlock`, with a give-up (not OOM) as null: the caller
+/// stores the block instead. Returns the number of literal codes used.
+fn tryBlock(
+    gpa: std.mem.Allocator,
+    w: *BitWriter,
+    input: []const u8,
+    start: usize,
+    end: usize,
+    cmds: []const Cmd,
+    is_last: bool,
+    ring: *DistRing,
+    effort: Effort,
+    single_literal_code: bool,
+) std.mem.Allocator.Error!?u8 {
+    return writeCompressedBlock(gpa, w, input, start, end, cmds, is_last, ring, effort, single_literal_code) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 /// Bit position after storing `n` bytes verbatim starting from bit `pos`.
@@ -963,12 +1368,39 @@ fn writeStoreBlock(w: *BitWriter, bytes: []const u8) std.mem.Allocator.Error!voi
 /// (or cannot encode smaller than its raw bytes) is stored verbatim instead, so
 /// the output is always a conformant `Content-Encoding: br` body.
 pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {
-    return compressBlocks(gpa, input, compressed_block_size);
+    return compressWith(gpa, input, .{});
 }
 
-/// `compress` with a chosen meta-block size (1..`compressed_block_size`).
-/// Internal: tests use a small one to get a stream of many meta-blocks.
-pub fn compressBlocks(gpa: std.mem.Allocator, input: []const u8, block_size: usize) std.mem.Allocator.Error![]u8 {
+/// How hard the encoder looks. Every level emits a valid stream and falls
+/// back to storing a block that will not shrink; they differ in time spent.
+pub const Effort = enum {
+    /// Shallow match search (8 candidates), one literal code per block.
+    fast,
+    /// 32 candidates; literal context modelling (UTF8 / LSB6 modes).
+    default,
+    /// 256 candidates, context modelling as `.default`. For content
+    /// compressed once and served many times.
+    best,
+
+    fn chainDepth(e: Effort) usize {
+        return switch (e) {
+            .fast => 8,
+            .default => 32,
+            .best => 256,
+        };
+    }
+};
+
+pub const CompressOptions = struct {
+    effort: Effort = .default,
+    /// Input bytes per meta-block (1..1 MiB). Each block gets its own codes:
+    /// smaller blocks adapt to changing data but pay more headers.
+    block_size: usize = compressed_block_size,
+};
+
+/// `compress` with options.
+pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
+    const block_size = opts.block_size;
     std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
     var w = BitWriter{ .gpa = gpa };
     errdefer w.buf.deinit(gpa);
@@ -985,7 +1417,7 @@ pub fn compressBlocks(gpa: std.mem.Allocator, input: []const u8, block_size: usi
     }
     const max_backward = (@as(usize, 1) << wbits) - 16;
 
-    var matcher = try Matcher.init(gpa, input);
+    var matcher = try Matcher.init(gpa, input, opts.effort.chainDepth());
     defer matcher.deinit(gpa);
     const max_dist = @min(max_backward, matcher.mask);
 
@@ -993,6 +1425,7 @@ pub fn compressBlocks(gpa: std.mem.Allocator, input: []const u8, block_size: usi
     defer cmds.deinit(gpa);
 
     var emitted_last = false;
+    var ring: DistRing = .{};
     var off: usize = 0;
     while (off < input.len) {
         const n = @min(input.len - off, block_size);
@@ -1006,12 +1439,30 @@ pub fn compressBlocks(gpa: std.mem.Allocator, input: []const u8, block_size: usi
         const before = w.bitPos();
         const store_bits = storeCostBits(before, n);
         var kept = false;
-        if (writeCompressedBlock(gpa, &w, input, off, end, cmds.items, is_last)) |_| {
-            kept = w.bitPos() < store_bits;
-        } else |e| {
-            if (e == error.OutOfMemory) return error.OutOfMemory;
+        var trial = ring;
+        const first = try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &trial, opts.effort, false);
+        var ok = first != null;
+        // The context model was chosen on estimated bits. When it split the
+        // literals, write the block once more with a single literal code and
+        // keep whichever is really shorter (a flat, small alphabet is where
+        // the estimate overfits: `alpha5_flat` came out 1.4 % larger with
+        // contexts than without).
+        if (first != null and first.? > 1) {
+            const ctx_end = w.bitPos();
+            w.rollback(m);
+            var single_ring = ring;
+            const single = try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &single_ring, opts.effort, true);
+            if (single == null or ctx_end < w.bitPos()) {
+                w.rollback(m);
+                trial = ring;
+                ok = (try tryBlock(gpa, &w, input, off, end, cmds.items, is_last, &trial, opts.effort, false)) != null;
+            } else {
+                trial = single_ring;
+            }
         }
+        kept = ok and w.bitPos() < store_bits;
         if (kept) {
+            ring = trial; // a stored block leaves the decoder's ring alone
             emitted_last = is_last;
         } else {
             w.rollback(m);

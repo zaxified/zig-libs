@@ -247,5 +247,11 @@ pub const ref_streams = [_]RefStream{
     .{ .input = "empty", .quality = 11, .lgwin = 22, .file = "empty.q11.w22.br" },
 };
 
+/// Every encoder effort, blessed separately: they emit different streams
+/// (match search depth, context modelling or not), so one blessing cannot
+/// stand for the others. Tag names, so the corpus needs no import of
+/// the encoder.
+pub const efforts = [_][]const u8{ "fast", "default", "best" };
+
 /// What the reference's decoder said about our encoder's output, frozen.
 pub const blessed = @import("testdata/interop_blessed.zig");

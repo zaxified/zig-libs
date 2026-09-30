@@ -221,7 +221,7 @@ test "stream: tables do not pile up across meta-blocks (1024 meta-blocks)" {
     const input = try gpa.alloc(u8, len);
     defer gpa.free(input);
     for (input, 0..) |*b, i| b.* = corpus.alice[(i * 7) % corpus.alice.len];
-    const comp = try @import("encoder.zig").compressBlocks(gpa, input, 2048);
+    const comp = try brotli.compressWith(gpa, input, .{ .block_size = 2048 });
     defer gpa.free(comp);
 
     var peak: PeakAllocator = .{ .child = gpa };
