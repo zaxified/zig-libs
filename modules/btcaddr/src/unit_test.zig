@@ -222,3 +222,48 @@ test "helpers: typed rejections" {
     try testing.expectError(error.WitnessScriptTooLarge, btcaddr.p2wshOfWitnessScript(big[0..10001]));
     try testing.expectError(error.WitnessScriptTooLarge, btcaddr.p2shP2wshOfWitnessScript(big[0..10001]));
 }
+
+// ── fuzz: the two entry points that take untrusted strings ────────────────
+
+const testkit = @import("testkit");
+
+const fuzz_seeds = [_][]const u8{
+    testkit.fuzz.seed("1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo"),
+    testkit.fuzz.seed("36j4NfKv6Akva9amjWrLG6MuSQym1GuEmm"),
+    testkit.fuzz.seed("bc1qvyq0cc6rahyvsazfdje0twl7ez82ndmuac2lhv"),
+    testkit.fuzz.seed("BC1P83N3AU0RJYLEFXQ2NC2XH2Y4JZZ4PM6ZXJ4MW5PAGDJJR2A9F36S6JJNNU"),
+    testkit.fuzz.seed("tb1p35n52jy6xkm4wd905tdy8qtagrn73kqdz73xe4zxpvq9t3fp50aqk3s6gz"),
+    testkit.fuzz.seed("bcrt1pfwxjqvtt4tcxrtdluukfmy2dv7xd2qzdfy6kajv5nwn4yam3wxkq3553uh"),
+    testkit.fuzz.seed("L5nJeqKmpHp4P7F8ZYyjwc5a7P4d8EabuGAzfGJk7yC1BJyzNaEd"),
+    testkit.fuzz.seed("cV83kKisF3RQSvXbUCm9ox3kaz5JjEUBWcx8tNydfGJcyeUxuH47"),
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: toScriptPubKey and wifDecode never panic; what they accept round-trips" {
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &fuzz_seeds });
+}
+
+fn fuzzDecode(_: void, smith: *testing.Smith) !void {
+    var text: [128]u8 = undefined;
+    const len: usize = smith.slice(&text);
+    const s = text[0..len];
+
+    if (btcaddr.toScriptPubKey(s)) |d| {
+        // An accepted address is the canonical encoding of its script on
+        // one of the chains it claims (bech32: modulo case).
+        const net: btcaddr.Network = inline for (.{ .mainnet, .testnet, .signet, .regtest }) |n| {
+            if (d.chains.contains(n)) break n;
+        } else return error.NoChain;
+        const back = try btcaddr.fromScriptPubKey(d.script(), net);
+        try testing.expect(std.ascii.eqlIgnoreCase(back.slice(), s));
+    } else |_| {}
+
+    if (btcaddr.wifDecode(s)) |w_const| {
+        var w = w_const;
+        defer w.wipe();
+        const net: btcaddr.Network = if (w.chains.contains(.mainnet)) .mainnet else .testnet;
+        var out: [btcaddr.max_wif_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &out);
+        try testing.expectEqualStrings(s, try btcaddr.wifEncode(&w.key, w.compressed, net, &out));
+    } else |_| {}
+}

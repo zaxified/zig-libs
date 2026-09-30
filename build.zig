@@ -383,7 +383,7 @@ const module_list = [_]Module{
     .{ .name = "sha2", .libs = &.{"crypto"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },
-    .{ .name = "btcaddr", .libs = &.{"crypto"}, .deps = &.{ "bech32", "ripemd160" } },
+    .{ .name = "btcaddr", .libs = &.{"crypto"}, .deps = &.{ "bech32", "ripemd160" }, .test_deps = &.{"testkit"} },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };

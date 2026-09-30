@@ -150,7 +150,7 @@ re-formats and re-parses.
 
 ## Fuzz
 
-The former `**Fuzz exemption:** EMIT-ONLY` (2026-08-14) no longer holds: since
+The former fuzz exemption (EMIT-ONLY, 2026-08-14) no longer holds: since
 2026-09-30 `otpauth.parse` decodes an attacker-reachable string. It has a harness
 (`fuzz: parse never panics ...` in `src/otpauth.zig`); `hotp`/`totp` themselves
 still take only a provisioned `key`.

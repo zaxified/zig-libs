@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** a fuzz harness over `toScriptPubKey` and
+  `wifDecode` (tests only) and `example/main.zig`, a wallet's send-to field and key import.
+
 - **2026-09-30** — New module: the Bitcoin address layer above `bech32`. scriptPubKey <->
   address for P2PKH, P2SH, P2WPKH, P2WSH, P2TR and witness v1..v16 (BIP350); network
   detection that reports the SET of networks a string is valid on (testnet, signet and regtest
