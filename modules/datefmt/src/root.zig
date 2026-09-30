@@ -18,6 +18,8 @@
 //!   DD/D day · hh/h hour 24h · ii/i hour 12h (needs A/a) · mm/m minute
 //!   ss/s second · A/a AM-PM (upper/lower) · ZZ UTC offset ±HH:MM (or Z)
 //!   EEEE full day name · EEE/EE/E short day name · e day-of-week 1-7 (Mon=1)
+//!   SSS/SSSSSS/SSSSSSSSS fraction of a second, 3/6/9 digits (ms/µs/ns)
+//!   GGGG ISO week-year · WW/W ISO week number (01-53 / 1-53)
 //!   [text] literal · [*] wildcard (skip until next token)
 
 const std = @import("std");
@@ -70,6 +72,12 @@ pub const date_tokens = [_]DateTokenDoc{
     .{ .token = "EEEE", .meaning = "Full day name", .example = "Monday" },
     .{ .token = "EEE/EE/E", .meaning = "Short day name", .example = "Mon" },
     .{ .token = "e", .meaning = "Day of week as number (1 = Mon … 7 = Sun)", .example = "1" },
+    .{ .token = "SSS", .meaning = "Fraction of a second, 3 digits (milliseconds; format truncates)", .example = "123" },
+    .{ .token = "SSSSSS", .meaning = "Fraction of a second, 6 digits (microseconds; format truncates)", .example = "123456" },
+    .{ .token = "SSSSSSSSS", .meaning = "Fraction of a second, 9 digits (nanoseconds)", .example = "123456789" },
+    .{ .token = "GGGG", .meaning = "4-digit ISO week-year (the year owning the ISO week)", .example = "2009" },
+    .{ .token = "WW", .meaning = "2-digit ISO week number (01–53)", .example = "53" },
+    .{ .token = "W", .meaning = "1–2 digit ISO week number", .example = "5" },
     .{ .token = "[text]", .meaning = "Literal text (escaped inside format string)", .example = "[T] → T" },
     .{ .token = "[*]", .meaning = "Wildcard — skip until the next token", .example = "skips Z, timezone suffix" },
 };
@@ -91,6 +99,12 @@ pub const DateParts = struct {
     hour: u32 = 0,
     minute: u32 = 0,
     second: u32 = 0,
+    /// Sub-second part in nanoseconds (0..999_999_999), the finest unit any
+    /// token carries. Set by the `SSS`/`SSSSSS`/`SSSSSSSSS` tokens and by
+    /// `parseXsdDateTimeNs`; `format` truncates it to the token's width.
+    /// Calendar arithmetic (`addDays`/`addMonths`) preserves it; `partsToUnix`
+    /// ignores it (whole seconds).
+    nanosecond: u32 = 0,
     /// UTC offset in minutes carried by a `ZZ` token (`+02:00` → 120, `Z` → 0);
     /// null when the format has no offset token. Only the parse→format reshuffle
     /// and TZ-aware callers read it; calendar arithmetic ignores it.
@@ -133,6 +147,42 @@ pub fn isoWeekday(epoch_day: i64) u32 {
     return @intCast(@mod(epoch_day + 3, 7) + 1);
 }
 
+/// ISO 8601 week date of a civil day: the week-year (the year owning the
+/// week — differs from the calendar year near Jan 1 / Dec 31) and week number.
+pub const IsoWeek = struct {
+    year: i32,
+    week: u32, // 1..53
+};
+
+/// ISO 8601 week of `parts` (Monday-based weeks; week 1 is the one holding the
+/// year's first Thursday). Pre-1970 safe; only year/month/day are read.
+pub fn isoWeek(parts: DateParts) IsoWeek {
+    const day = ymdToEpochDay(parts.year, parts.month, parts.day);
+    // The Thursday of the same ISO week decides the week-year.
+    const thursday = day - @as(i64, isoWeekday(day)) + 4;
+    const ty = epochDayToYmd(thursday).year;
+    const week: u32 = @intCast(@divFloor(thursday - ymdToEpochDay(ty, 1, 1), 7) + 1);
+    return .{ .year = ty, .week = week };
+}
+
+/// Number of ISO weeks (52 or 53) in ISO week-year `iso_year`. Dec 28 always
+/// lies in the last ISO week of its year.
+pub fn isoWeeksInYear(iso_year: i32) u32 {
+    return isoWeek(.{ .year = iso_year, .month = 12, .day = 28 }).week;
+}
+
+/// Inverse of `isoWeek`: epoch day of ISO `weekday` (Mon=1 … Sun=7) in week
+/// `week` of ISO week-year `iso_year`. Null when `week` is not in
+/// 1..`isoWeeksInYear(iso_year)` or `weekday` is not in 1..7.
+pub fn isoWeekDateToEpochDay(iso_year: i32, week: u32, weekday: u32) ?i64 {
+    if (weekday < 1 or weekday > 7) return null;
+    if (week < 1 or week > isoWeeksInYear(iso_year)) return null;
+    // Jan 4 always lies in week 1; back up to that week's Monday.
+    const jan4 = ymdToEpochDay(iso_year, 1, 4);
+    const week1_monday = jan4 - @as(i64, isoWeekday(jan4)) + 1;
+    return week1_monday + (@as(i64, week) - 1) * 7 + (@as(i64, weekday) - 1);
+}
+
 /// Unix seconds for a UTC wall-clock `DateParts` (offset field ignored — the
 /// caller decides whether the parts are UTC or a zone-local pseudo-instant).
 /// Pre-1970 safe via the civil core.
@@ -164,11 +214,13 @@ pub fn daysInMonth(year: i32, month: u32) u32 {
 }
 
 /// True when every field of `p` is in range (month 1-12, day valid for the
-/// month, hour 0-23, minute/second 0-59). Year is unconstrained.
+/// month, hour 0-23, minute/second 0-59, nanosecond < 1e9). Year is
+/// unconstrained.
 pub fn validate(p: DateParts) bool {
     if (p.month < 1 or p.month > 12) return false;
     if (p.day < 1 or p.day > daysInMonth(p.year, p.month)) return false;
     if (p.hour > 23 or p.minute > 59 or p.second > 59) return false;
+    if (p.nanosecond > 999_999_999) return false;
     return true;
 }
 
@@ -241,6 +293,10 @@ const Token = union(enum) {
     ampm_upper, // A
     ampm_lower, // a
     tz_offset, // ZZ — UTC offset ±HH:MM (or a literal Z = +00:00)
+    fraction: u8, // SSS / SSSSSS / SSSSSSSSS — payload = digit count (3/6/9)
+    iso_year, // GGGG — ISO week-year
+    iso_week_full, // WW
+    iso_week_short, // W
     wildcard, // [*]
     literal: []const u8, // [text] or any unrecognised run
 };
@@ -262,7 +318,11 @@ fn matchAt(s: []const u8, pos: usize, needle: []const u8) bool {
 
 /// Ordered longest-first so e.g. "YYYY" wins over "YY" and "MMMM" over "MMM".
 const token_table = [_]struct { lit: []const u8, tok: Token }{
+    .{ .lit = "SSSSSSSSS", .tok = .{ .fraction = 9 } },
+    .{ .lit = "SSSSSS", .tok = .{ .fraction = 6 } },
+    .{ .lit = "SSS", .tok = .{ .fraction = 3 } },
     .{ .lit = "YYYY", .tok = .year_full },
+    .{ .lit = "GGGG", .tok = .iso_year },
     .{ .lit = "MMMM", .tok = .month_name_long },
     .{ .lit = "EEEE", .tok = .day_name_long },
     .{ .lit = "MMM", .tok = .month_name_short },
@@ -274,8 +334,10 @@ const token_table = [_]struct { lit: []const u8, tok: Token }{
     .{ .lit = "mm", .tok = .minute_full },
     .{ .lit = "ss", .tok = .second_full },
     .{ .lit = "ZZ", .tok = .tz_offset },
+    .{ .lit = "WW", .tok = .iso_week_full },
     .{ .lit = "YY", .tok = .year_short },
     .{ .lit = "EE", .tok = .day_name_short },
+    .{ .lit = "W", .tok = .iso_week_short },
     .{ .lit = "M", .tok = .month_short },
     .{ .lit = "D", .tok = .day_short },
     .{ .lit = "i", .tok = .hour_12_short },
@@ -398,17 +460,22 @@ fn skipUntilNextToken(s: []const u8, pos: usize, next: Token) ParseError!usize {
             }
             return ParseError.InvalidFormat;
         },
-        .year_full => {
+        .year_full, .iso_year => {
             var i = pos;
             while (i + 4 <= s.len) : (i += 1) if (isAllDigits(s[i .. i + 4])) return i;
             return ParseError.InvalidFormat;
         },
-        .year_short, .month_full, .day_full, .hour_24_full, .hour_12_full, .minute_full, .second_full => {
+        .fraction => |n| {
+            var i = pos;
+            while (i + n <= s.len) : (i += 1) if (isAllDigits(s[i .. i + n])) return i;
+            return ParseError.InvalidFormat;
+        },
+        .year_short, .month_full, .day_full, .hour_24_full, .hour_12_full, .minute_full, .second_full, .iso_week_full => {
             var i = pos;
             while (i + 2 <= s.len) : (i += 1) if (isAllDigits(s[i .. i + 2])) return i;
             return ParseError.InvalidFormat;
         },
-        .month_short, .day_short, .hour_24_short, .hour_12_short, .minute_short, .second_short, .day_of_week => {
+        .month_short, .day_short, .hour_24_short, .hour_12_short, .minute_short, .second_short, .day_of_week, .iso_week_short => {
             var i = pos;
             while (i < s.len) : (i += 1) if (s[i] >= '0' and s[i] <= '9') return i;
             return ParseError.InvalidFormat;
@@ -465,12 +532,29 @@ const Builder = struct {
     hour: u32 = 0,
     minute: u32 = 0,
     second: u32 = 0,
+    nanosecond: u32 = 0,
     is_pm: ?bool = null,
     off_min: ?i32 = null,
+    iso_year: ?i32 = null,
+    iso_week: ?u32 = null,
+    iso_dow: ?u32 = null,
 };
 
 fn parseUint(comptime T: type, s: []const u8, err: ParseError) ParseError!T {
     return std.fmt.parseInt(T, s, 10) catch return err;
+}
+
+/// Read exactly `digits` ASCII digits at `input[p..]` as a fraction of a
+/// second and scale to nanoseconds ("5" width 3 is not accepted; "500" → 5e8).
+fn parseFraction(input: []const u8, p: usize, digits: u8) ParseError!u32 {
+    if (p + digits > input.len) return ParseError.InvalidFormat;
+    const field = input[p .. p + digits];
+    if (!isAllDigits(field)) return ParseError.InvalidTime; // no sign, no '_'
+    var v: u32 = 0;
+    for (field) |c| v = v * 10 + (c - '0'); // ≤ 999_999_999 fits u32
+    var scale: u32 = 1;
+    for (0..@as(usize, 9 - digits)) |_| scale *= 10;
+    return v * scale;
 }
 
 /// Parse `input` against `fmt`, returning the extracted `DateParts`. Missing
@@ -478,6 +562,14 @@ fn parseUint(comptime T: type, s: []const u8, err: ParseError) ParseError!T {
 /// 00:00:00. Ranges are validated (`InvalidDate` / `InvalidTime`) but the year
 /// has no lower bound — pre-1970 dates parse fine. This never converts to an
 /// epoch timestamp, so a parse→format reshuffle round-trips any year losslessly.
+///
+/// Fraction tokens (`SSS`/`SSSSSS`/`SSSSSSSSS`) read exactly 3/6/9 digits into
+/// `nanosecond`. ISO week tokens: when the format has `GGGG` and/or `W`/`WW`,
+/// the date is derived from the ISO week date (`GGGG` defaults to `YYYY`, then
+/// 1970; week defaults to 1; the `e` token supplies the weekday, default
+/// Monday) and overrides any `YYYY`/`MM`/`DD` in the same format. A week that
+/// does not exist in that week-year (0, or 53 in a 52-week year) is
+/// `InvalidDate`.
 pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
     const tk = try tokenize(fmt);
     var b = Builder{};
@@ -541,7 +633,28 @@ pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
                 if (end == p) return ParseError.InvalidFormat;
                 const dow = try parseUint(u32, input[p..end], ParseError.InvalidDate);
                 if (dow < 1 or dow > 7) return ParseError.InvalidDate;
-                p = end; // informational
+                p = end;
+                b.iso_dow = dow; // informational unless a week token is present
+            },
+            .fraction => |n| {
+                b.nanosecond = try parseFraction(input, p, n);
+                p += n;
+            },
+            .iso_year => {
+                if (p + 4 > input.len) return ParseError.InvalidFormat;
+                if (!isAllDigits(input[p .. p + 4])) return ParseError.InvalidDate;
+                b.iso_year = try parseUint(i32, input[p .. p + 4], ParseError.InvalidDate);
+                p += 4;
+            },
+            .iso_week_full => {
+                if (p + 2 > input.len) return ParseError.InvalidFormat;
+                b.iso_week = try parseUint(u32, input[p .. p + 2], ParseError.InvalidDate);
+                p += 2;
+            },
+            .iso_week_short => {
+                const end = findNumberEnd(input, p, 2);
+                b.iso_week = try parseUint(u32, input[p..end], ParseError.InvalidDate);
+                p = end;
             },
             .hour_24_full, .hour_12_full => {
                 if (p + 2 > input.len) return ParseError.InvalidFormat;
@@ -630,17 +743,27 @@ pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
         }
     }
 
-    const result = DateParts{
+    var result = DateParts{
         .year = b.year orelse 1970,
         .month = b.month orelse 1,
         .day = b.day orelse 1,
         .hour = b.hour,
         .minute = b.minute,
         .second = b.second,
+        .nanosecond = b.nanosecond,
         .off_min = b.off_min,
     };
+    // ISO week date: resolve to the civil date it names.
+    if (b.iso_year != null or b.iso_week != null) {
+        const ed = isoWeekDateToEpochDay(b.iso_year orelse result.year, b.iso_week orelse 1, b.iso_dow orelse 1) orelse
+            return ParseError.InvalidDate;
+        const ymd = epochDayToYmd(ed);
+        result.year = ymd.year;
+        result.month = ymd.month;
+        result.day = ymd.day;
+    }
     if (!validate(result)) {
-        if (result.hour > 23 or result.minute > 59 or result.second > 59) return ParseError.InvalidTime;
+        if (result.hour > 23 or result.minute > 59 or result.second > 59 or result.nanosecond > 999_999_999) return ParseError.InvalidTime;
         return ParseError.InvalidDate;
     }
     return result;
@@ -701,6 +824,21 @@ pub fn format(alloc: std.mem.Allocator, parts: DateParts, fmt: []const u8) ![]u8
                 const mag: u32 = @intCast(if (om < 0) -om else om);
                 try w.print("{c}{d:0>2}:{d:0>2}", .{ sign, mag / 60, mag % 60 });
             },
+            .fraction => |n| {
+                if (parts.nanosecond > 999_999_999) return error.InvalidTime;
+                switch (n) { // truncates (never rounds) to the token's width
+                    3 => try w.print("{d:0>3}", .{parts.nanosecond / 1_000_000}),
+                    6 => try w.print("{d:0>6}", .{parts.nanosecond / 1_000}),
+                    else => try w.print("{d:0>9}", .{parts.nanosecond}),
+                }
+            },
+            .iso_year => {
+                const iy = isoWeek(parts).year;
+                if (iy < 0) return error.InvalidDate; // same contract as YYYY
+                try w.print("{d:0>4}", .{@as(u32, @intCast(iy))});
+            },
+            .iso_week_full => try w.print("{d:0>2}", .{isoWeek(parts).week}),
+            .iso_week_short => try w.print("{d}", .{isoWeek(parts).week}),
             .wildcard => {}, // nothing to emit on the format side
             .literal => |lit| try w.writeAll(lit),
         }
@@ -712,12 +850,13 @@ pub fn format(alloc: std.mem.Allocator, parts: DateParts, fmt: []const u8) ![]u8
 // Calendar arithmetic (pre-1970 safe — operates on civil days, never u64)
 // ---------------------------------------------------------------------------
 
-/// Add `n` calendar days, preserving the time of day.
+/// Add `n` calendar days, preserving the time of day (incl. the fraction).
 pub fn addDays(parts: DateParts, n: i64) DateParts {
     var r = epochDayToYmd(ymdToEpochDay(parts.year, parts.month, parts.day) + n);
     r.hour = parts.hour;
     r.minute = parts.minute;
     r.second = parts.second;
+    r.nanosecond = parts.nanosecond;
     return r;
 }
 
@@ -735,6 +874,7 @@ pub fn addMonths(parts: DateParts, n: i32) DateParts {
         .hour = parts.hour,
         .minute = parts.minute,
         .second = parts.second,
+        .nanosecond = parts.nanosecond,
     };
 }
 
@@ -832,8 +972,9 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
 }
 
 /// Parse an `xsd:dateTime` (SAML/XML-Schema) timestamp to Unix seconds:
-/// `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. Fractional seconds are accepted
-/// and truncated (second granularity only); a missing timezone is treated as
+/// `YYYY-MM-DDThh:mm:ss(.frac)?(Z|±hh:mm)?`. Fractional seconds (any number
+/// of digits, ≥ 1) are accepted and dropped — this returns whole seconds; use
+/// `parseXsdDateTimeNs` to keep the fraction. A missing timezone is treated as
 /// UTC.
 ///
 /// This is deliberately a SEPARATE entry point from `parse`, not a `fmt`
@@ -841,9 +982,10 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
 /// same grammar and a single token-based function cannot honestly serve both:
 ///   - the timezone offset here REQUIRES the `:` (`+02:00`, never `+0200`),
 ///     which `parse`'s `ZZ` token deliberately accepts either way;
-///   - fractional seconds have no token in `parse`'s vocabulary at all (a
-///     format string has no way to say "optionally `.ddd`, then optionally a
-///     zone");
+///   - the fraction has a variable digit count and is optional, which the
+///     fixed-width `SSS`/`SSSSSS`/`SSSSSSSSS` tokens of `parse` cannot say
+///     (a format string has no way to say "optionally `.ddd`, then optionally
+///     a zone");
 ///   - `parse` has no end-of-input check — trailing garbage after the last
 ///     token is silently ignored. This parser requires the whole string to be
 ///     consumed;
@@ -865,6 +1007,26 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
 /// consumer) can `try` this directly into its own typed errors without an
 /// explicit conversion at every call site.
 pub fn parseXsdDateTime(s: []const u8) error{InvalidDateTime}!i64 {
+    return (try parseXsdDateTimeNs(s)).unix;
+}
+
+/// An `xsd:dateTime` / RFC 3339 instant: whole Unix seconds (UTC, offset
+/// applied) plus the sub-second part.
+pub const XsdInstant = struct {
+    unix: i64,
+    /// Fraction of the second in nanoseconds, 0..999_999_999. It is always the
+    /// non-negative fraction of the wall-clock second: for an instant before
+    /// the epoch the true time is `unix` seconds PLUS `nanosecond` ns
+    /// (floor semantics, like `unixToParts`), never minus.
+    nanosecond: u32,
+};
+
+/// Same grammar and strictness as `parseXsdDateTime`, but keeps the fraction.
+/// Any number (≥ 1) of fraction digits is accepted, as RFC 3339 / XSD allow;
+/// digits beyond the 9th (sub-nanosecond) are validated as digits and then
+/// TRUNCATED, never rounded. A leap second (`:60`) is returned as-is: `unix`
+/// is the second after `:59` (`23:59:60Z` == next-day `00:00:00Z`).
+pub fn parseXsdDateTimeNs(s: []const u8) error{InvalidDateTime}!XsdInstant {
     // Minimum: "YYYY-MM-DDThh:mm:ss" = 19 chars.
     if (s.len < 19) return error.InvalidDateTime;
     if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') {
@@ -883,11 +1045,18 @@ pub fn parseXsdDateTime(s: []const u8) error{InvalidDateTime}!i64 {
     if (hour > 23 or min > 59 or sec > 60) return error.InvalidDateTime; // :60 = leap second
 
     var i: usize = 19;
-    // Optional fractional seconds (ignored).
+    // Optional fractional seconds: keep the first 9 digits, truncate the rest.
+    var nanos: u32 = 0;
     if (i < s.len and s[i] == '.') {
         i += 1;
         const frac_start = i;
-        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        var scale: u32 = 100_000_000; // weight of the next digit
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            if (scale > 0) {
+                nanos += @as(u32, s[i] - '0') * scale;
+                scale /= 10;
+            }
+        }
         if (i == frac_start) return error.InvalidDateTime;
     }
     // Optional timezone: `Z`/`z`, or a signed `±hh:mm` (colon required).
@@ -910,7 +1079,7 @@ pub fn parseXsdDateTime(s: []const u8) error{InvalidDateTime}!i64 {
 
     const days = ymdToEpochDay(year, month, day);
     const secs = days * 86400 + hour * 3600 + min * 60 + sec;
-    return secs - tz_offset_secs;
+    return .{ .unix = secs - tz_offset_secs, .nanosecond = nanos };
 }
 
 /// Digit-only fixed-field parse: every byte must be `0`-`9` (no sign, no
@@ -1173,6 +1342,38 @@ test "parseXsdDateTime: fractional seconds truncated, lowercase t/z tolerated" {
     try testing.expectEqual(@as(i64, 1717243200), try parseXsdDateTime("2024-06-01t12:00:00.123456z"));
 }
 
+test "parseXsdDateTimeNs: keeps the fraction, 1..9+ digits, truncates beyond 9" {
+    const base: i64 = 1717243200; // 2024-06-01T12:00:00Z
+    const cases = [_]struct { s: []const u8, ns: u32 }{
+        .{ .s = "2024-06-01T12:00:00.5Z", .ns = 500_000_000 },
+        .{ .s = "2024-06-01T12:00:00.12Z", .ns = 120_000_000 },
+        .{ .s = "2024-06-01T12:00:00.123Z", .ns = 123_000_000 },
+        .{ .s = "2024-06-01T12:00:00.1234Z", .ns = 123_400_000 },
+        .{ .s = "2024-06-01T12:00:00.123456Z", .ns = 123_456_000 },
+        .{ .s = "2024-06-01T12:00:00.1234567Z", .ns = 123_456_700 },
+        .{ .s = "2024-06-01T12:00:00.12345678Z", .ns = 123_456_780 },
+        .{ .s = "2024-06-01T12:00:00.123456789Z", .ns = 123_456_789 },
+        .{ .s = "2024-06-01T12:00:00.1234567899Z", .ns = 123_456_789 }, // 10th digit truncated, not rounded
+        .{ .s = "2024-06-01T12:00:00.999999999999Z", .ns = 999_999_999 },
+        .{ .s = "2024-06-01T12:00:00.000000001Z", .ns = 1 },
+        .{ .s = "2024-06-01T12:00:00.000Z", .ns = 0 },
+        .{ .s = "2024-06-01T12:00:00Z", .ns = 0 }, // no fraction
+    };
+    for (cases) |c| {
+        const r = try parseXsdDateTimeNs(c.s);
+        try testing.expectEqual(base, r.unix);
+        try testing.expectEqual(c.ns, r.nanosecond);
+    }
+    // The fraction survives an offset and does not disturb it.
+    const off = try parseXsdDateTimeNs("2024-06-01T12:00:00.25+02:00");
+    try testing.expectEqual(@as(i64, 1717236000), off.unix);
+    try testing.expectEqual(@as(u32, 250_000_000), off.nanosecond);
+    // Malformed fractions stay typed errors.
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTimeNs("2024-06-01T12:00:00.Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTimeNs("2024-06-01T12:00:00.1x2Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTimeNs("2024-06-01T12:00:00."));
+}
+
 test "parseXsdDateTime: numeric timezone offset applied" {
     try testing.expectEqual(@as(i64, 1717236000), try parseXsdDateTime("2024-06-01T12:00:00+02:00"));
     try testing.expectEqual(@as(i64, 1717250400), try parseXsdDateTime("2024-06-01T12:00:00-02:00"));
@@ -1284,4 +1485,193 @@ test "partsToUnix / unixToParts round-trip across the epoch" {
     try testing.expectEqual(@as(i32, 1969), pre.year);
     try testing.expectEqual(@as(u32, 23), pre.hour);
     try testing.expectEqual(@as(u32, 59), pre.second);
+}
+
+test "fraction tokens: format at 3/6/9 digits truncates, never rounds" {
+    const a = testing.allocator;
+    const p = DateParts{ .year = 2024, .month = 3, .day = 7, .hour = 14, .minute = 5, .second = 9, .nanosecond = 123_456_789 };
+    const cases = [_]struct { fmt: []const u8, want: []const u8 }{
+        .{ .fmt = "hh:mm:ss.SSS", .want = "14:05:09.123" },
+        .{ .fmt = "hh:mm:ss.SSSSSS", .want = "14:05:09.123456" },
+        .{ .fmt = "hh:mm:ss.SSSSSSSSS", .want = "14:05:09.123456789" },
+        .{ .fmt = "YYYY-MM-DD[T]hh:mm:ss.SSS[Z]", .want = "2024-03-07T14:05:09.123Z" },
+    };
+    for (cases) |c| {
+        const got = try format(a, p, c.fmt);
+        defer a.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+    // Leading zeros are kept; 999_999_999 ns is .999 in ms (truncated, not 1.000).
+    const z = try format(a, .{ .nanosecond = 5_000_000 }, "SSS/SSSSSS/SSSSSSSSS");
+    defer a.free(z);
+    try testing.expectEqualStrings("005/005000/005000000", z);
+    const t = try format(a, .{ .nanosecond = 999_999_999 }, "SSS");
+    defer a.free(t);
+    try testing.expectEqualStrings("999", t);
+    // Default nanosecond is 0 → zeros; an out-of-range value is an error, not garbage.
+    const d = try format(a, .{}, "SSS");
+    defer a.free(d);
+    try testing.expectEqualStrings("000", d);
+    try testing.expectError(error.InvalidTime, format(a, .{ .nanosecond = 1_000_000_000 }, "SSS"));
+}
+
+test "fraction tokens: parse scales to nanoseconds, fixed width, never panics" {
+    const f = "YYYY-MM-DD[T]hh:mm:ss.";
+    try testing.expectEqual(@as(u32, 123_000_000), (try parse("2024-03-07T14:05:09.123", f ++ "SSS")).nanosecond);
+    try testing.expectEqual(@as(u32, 123_456_000), (try parse("2024-03-07T14:05:09.123456", f ++ "SSSSSS")).nanosecond);
+    try testing.expectEqual(@as(u32, 123_456_789), (try parse("2024-03-07T14:05:09.123456789", f ++ "SSSSSSSSS")).nanosecond);
+    try testing.expectEqual(@as(u32, 7_000_000), (try parse("2024-03-07T14:05:09.007", f ++ "SSS")).nanosecond);
+    // Trailing zone after the fraction still works.
+    const z = try parse("2024-03-07T14:05:09.250+02:00", f ++ "SSSZZ");
+    try testing.expectEqual(@as(u32, 250_000_000), z.nanosecond);
+    try testing.expectEqual(@as(?i32, 120), z.off_min);
+    // No fraction token → 0.
+    try testing.expectEqual(@as(u32, 0), (try parse("2024-03-07T14:05:09", "YYYY-MM-DD[T]hh:mm:ss")).nanosecond);
+    // Too short / not digits / signed → typed errors.
+    try testing.expectError(ParseError.InvalidFormat, parse("2024-03-07T14:05:09.12", f ++ "SSS"));
+    try testing.expectError(ParseError.InvalidTime, parse("2024-03-07T14:05:09.1x3", f ++ "SSS"));
+    try testing.expectError(ParseError.InvalidTime, parse("2024-03-07T14:05:09.+12", f ++ "SSS"));
+    // [*] before a fraction token skips to the first 3-digit run.
+    try testing.expectEqual(@as(u32, 250_000_000), (try parse("09,250", "ss[*]SSS")).nanosecond);
+}
+
+test "fraction: parse → format round trip, and arithmetic preserves it" {
+    const a = testing.allocator;
+    const fmt = "YYYY-MM-DD[T]hh:mm:ss.SSSSSSSSS";
+    const s = "2024-03-07T14:05:09.123456789";
+    const p = try parse(s, fmt);
+    const back = try format(a, p, fmt);
+    defer a.free(back);
+    try testing.expectEqualStrings(s, back);
+    try testing.expectEqual(@as(u32, 123_456_789), addDays(p, 30).nanosecond);
+    try testing.expectEqual(@as(u32, 123_456_789), addMonths(p, 1).nanosecond);
+    try testing.expect(validate(p));
+    try testing.expect(!validate(.{ .nanosecond = 1_000_000_000 }));
+    // XSD → parts → format keeps the fraction too.
+    const x = try parseXsdDateTimeNs("2024-03-07T14:05:09.5Z");
+    const xp = unixToParts(x.unix);
+    var q = xp;
+    q.nanosecond = x.nanosecond;
+    const xs = try format(a, q, "hh:mm:ss.SSS");
+    defer a.free(xs);
+    try testing.expectEqualStrings("14:05:09.500", xs);
+}
+
+test "isoWeek: dates checked against Python datetime.date(y,m,d).isocalendar()" {
+    // Expected values come from an EXTERNAL oracle, run 2026-09-30:
+    //   python3 -c "import datetime; print(datetime.date(y,m,d).isocalendar())"
+    //   2004-12-31 (2004, 53, 5)   2005-01-01 (2004, 53, 6)   2005-01-02 (2004, 53, 7)
+    //   2007-12-31 (2008,  1, 1)   2008-12-28 (2008, 52, 7)   2008-12-29 (2009,  1, 1)
+    //   2009-12-31 (2009, 53, 4)   2010-01-03 (2009, 53, 7)   2020-12-31 (2020, 53, 4)
+    //   2021-01-03 (2020, 53, 7)   2024-12-30 (2025,  1, 1)   2026-09-30 (2026, 40, 3)
+    const cases = [_]struct { y: i32, m: u32, d: u32, iy: i32, w: u32, wd: u32 }{
+        .{ .y = 2004, .m = 12, .d = 31, .iy = 2004, .w = 53, .wd = 5 },
+        .{ .y = 2005, .m = 1, .d = 1, .iy = 2004, .w = 53, .wd = 6 },
+        .{ .y = 2005, .m = 1, .d = 2, .iy = 2004, .w = 53, .wd = 7 },
+        .{ .y = 2007, .m = 12, .d = 31, .iy = 2008, .w = 1, .wd = 1 },
+        .{ .y = 2008, .m = 12, .d = 28, .iy = 2008, .w = 52, .wd = 7 },
+        .{ .y = 2008, .m = 12, .d = 29, .iy = 2009, .w = 1, .wd = 1 },
+        .{ .y = 2009, .m = 12, .d = 31, .iy = 2009, .w = 53, .wd = 4 },
+        .{ .y = 2010, .m = 1, .d = 3, .iy = 2009, .w = 53, .wd = 7 },
+        .{ .y = 2020, .m = 12, .d = 31, .iy = 2020, .w = 53, .wd = 4 },
+        .{ .y = 2021, .m = 1, .d = 3, .iy = 2020, .w = 53, .wd = 7 },
+        .{ .y = 2024, .m = 12, .d = 30, .iy = 2025, .w = 1, .wd = 1 },
+        .{ .y = 2026, .m = 9, .d = 30, .iy = 2026, .w = 40, .wd = 3 },
+    };
+    for (cases) |c| {
+        const r = isoWeek(.{ .year = c.y, .month = c.m, .day = c.d });
+        try testing.expectEqual(c.iy, r.year);
+        try testing.expectEqual(c.w, r.week);
+        const ed = ymdToEpochDay(c.y, c.m, c.d);
+        try testing.expectEqual(c.wd, isoWeekday(ed));
+        // The inverse must land back on the same civil day.
+        try testing.expectEqual(@as(?i64, ed), isoWeekDateToEpochDay(c.iy, c.w, c.wd));
+    }
+}
+
+test "isoWeek: brute-force inverse over 1900..2100, 53-week years, pre-1970" {
+    var d: i64 = ymdToEpochDay(1900, 1, 1);
+    const end = ymdToEpochDay(2100, 12, 31);
+    while (d <= end) : (d += 1) {
+        const ymd = epochDayToYmd(d);
+        const w = isoWeek(ymd);
+        try testing.expect(w.week >= 1 and w.week <= isoWeeksInYear(w.year));
+        try testing.expectEqual(@as(?i64, d), isoWeekDateToEpochDay(w.year, w.week, isoWeekday(d)));
+    }
+    // 53-week years (2004, 2009, 2015, 2020, 2026) vs 52-week neighbours.
+    try testing.expectEqual(@as(u32, 53), isoWeeksInYear(2004));
+    try testing.expectEqual(@as(u32, 53), isoWeeksInYear(2020));
+    try testing.expectEqual(@as(u32, 53), isoWeeksInYear(2026));
+    try testing.expectEqual(@as(u32, 52), isoWeeksInYear(2025));
+    try testing.expectEqual(@as(u32, 52), isoWeeksInYear(2008));
+    // Nonexistent weeks / weekdays are null, not rolled over.
+    try testing.expect(isoWeekDateToEpochDay(2025, 53, 1) == null);
+    try testing.expect(isoWeekDateToEpochDay(2025, 0, 1) == null);
+    try testing.expect(isoWeekDateToEpochDay(2025, 1, 0) == null);
+    try testing.expect(isoWeekDateToEpochDay(2025, 1, 8) == null);
+}
+
+test "ISO week tokens: format (GGGG, WW, W, e)" {
+    const a = testing.allocator;
+    const cases = [_]struct { p: DateParts, fmt: []const u8, want: []const u8 }{
+        .{ .p = .{ .year = 2005, .month = 1, .day = 1 }, .fmt = "GGGG-[W]WW-e", .want = "2004-W53-6" }, // oracle: (2004, 53, 6)
+        .{ .p = .{ .year = 2007, .month = 12, .day = 31 }, .fmt = "GGGG-[W]WW-e", .want = "2008-W01-1" }, // (2008, 1, 1)
+        .{ .p = .{ .year = 2024, .month = 12, .day = 30 }, .fmt = "GGGG-[W]W-e", .want = "2025-W1-1" }, // (2025, 1, 1)
+        .{ .p = .{ .year = 2026, .month = 9, .day = 30 }, .fmt = "YYYY/GGGG [W]WW", .want = "2026/2026 W40" }, // (2026, 40, 3)
+        .{ .p = .{ .year = 2010, .month = 1, .day = 3 }, .fmt = "YYYY-MM-DD → GGGG-[W]WW", .want = "2010-01-03 → 2009-W53" }, // (2009, 53, 7)
+    };
+    for (cases) |c| {
+        const got = try format(a, c.p, c.fmt);
+        defer a.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "ISO week tokens: parse resolves the civil date; round-trips with format" {
+    const a = testing.allocator;
+    const fmt = "GGGG-[W]WW-e";
+    // (input, expected civil date) — dates from the Python oracle rows above.
+    const cases = [_]struct { s: []const u8, want: DateParts }{
+        .{ .s = "2004-W53-6", .want = .{ .year = 2005, .month = 1, .day = 1 } },
+        .{ .s = "2004-W53-5", .want = .{ .year = 2004, .month = 12, .day = 31 } },
+        .{ .s = "2008-W01-1", .want = .{ .year = 2007, .month = 12, .day = 31 } },
+        .{ .s = "2009-W01-1", .want = .{ .year = 2008, .month = 12, .day = 29 } },
+        .{ .s = "2020-W53-7", .want = .{ .year = 2021, .month = 1, .day = 3 } },
+        .{ .s = "2025-W01-1", .want = .{ .year = 2024, .month = 12, .day = 30 } },
+        .{ .s = "2026-W40-3", .want = .{ .year = 2026, .month = 9, .day = 30 } },
+    };
+    for (cases) |c| {
+        const got = try parse(c.s, fmt);
+        try testing.expectEqual(c.want, got);
+        const back = try format(a, got, fmt);
+        defer a.free(back);
+        try testing.expectEqualStrings(c.s, back);
+    }
+    // Weekday defaults to Monday; short week token; week combined with time + fraction.
+    try testing.expectEqual(DateParts{ .year = 2024, .month = 12, .day = 30 }, try parse("2025-W1", "GGGG-[W]W"));
+    const t = try parse("2026-W40-3 08:30:00.500", "GGGG-[W]WW-e hh:mm:ss.SSS");
+    try testing.expectEqual(DateParts{ .year = 2026, .month = 9, .day = 30, .hour = 8, .minute = 30, .nanosecond = 500_000_000 }, t);
+    // Nonexistent weeks / bad weekdays are rejected, never rolled over.
+    try testing.expectError(ParseError.InvalidDate, parse("2025-W53-1", fmt)); // 2025 has 52 weeks
+    try testing.expectError(ParseError.InvalidDate, parse("2025-W00-1", fmt));
+    try testing.expectError(ParseError.InvalidDate, parse("2025-W54-1", fmt));
+    try testing.expectError(ParseError.InvalidDate, parse("2025-W10-8", fmt));
+    try testing.expectError(ParseError.InvalidDate, parse("2025-W10-0", fmt));
+    try testing.expectError(ParseError.InvalidDate, parse("20x5-W10-1", fmt));
+    try testing.expectError(ParseError.InvalidFormat, parse("2025-W1", fmt)); // truncated
+    // A format without week tokens is unaffected: `e` stays informational.
+    try testing.expectEqual(@as(i32, 1970), (try parse("4", "e")).year);
+}
+
+test "new tokens are in the vocabulary (firstInvalidFormatChar) and doc table" {
+    try testing.expect(firstInvalidFormatChar("GGGG-[W]WW-e hh:mm:ss.SSS") == null);
+    try testing.expect(firstInvalidFormatChar("ss.SSSSSSSSS") == null);
+    try testing.expect(firstInvalidFormatChar("ss.SS") != null); // only 3/6/9 wide
+    var found: usize = 0;
+    for (date_tokens) |t| {
+        for ([_][]const u8{ "SSS", "SSSSSS", "SSSSSSSSS", "GGGG", "WW", "W" }) |want| {
+            if (std.mem.eql(u8, t.token, want)) found += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), found);
 }

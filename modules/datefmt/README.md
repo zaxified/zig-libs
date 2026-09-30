@@ -36,8 +36,17 @@ mm/m  minute                ss/s second
 A/a   AM/PM upper/lower     ZZ   UTC offset ±HH:MM (parses literal Z as +00:00)
 EEEE  full day name         EEE/EE/E short day name
 e     day-of-week 1-7 (Mon=1)
+SSS / SSSSSS / SSSSSSSSS  fraction of a second, 3 / 6 / 9 digits (ms / us / ns)
+GGGG  ISO week-year         WW/W ISO week number (2 / 1-2 digit)
 [text] literal              [*]  wildcard — skip until the next token
 ```
+
+Fraction tokens are fixed-width (exactly 3/6/9 digits on parse; `format`
+truncates, never rounds). With `GGGG` and/or `W`/`WW` in a format, `parse`
+derives the civil date from the ISO week date (`e` = weekday, default Monday;
+`GGGG` defaults to `YYYY`, then 1970) and overrides `YYYY`/`MM`/`DD`; a week
+that does not exist (0, or 53 in a 52-week year) is `InvalidDate`. So
+`GGGG-[W]WW-e` round-trips `2004-W53-6` <-> 2005-01-01.
 
 `date_tokens: [_]DateTokenDoc` carries this table as data (token/meaning/
 example), for callers that want to render a reference/diagnostic UI.
@@ -50,14 +59,20 @@ const datefmt = @import("datefmt");
 const DateParts = struct {
     year: i32 = 1970, month: u32 = 1, day: u32 = 1,
     hour: u32 = 0, minute: u32 = 0, second: u32 = 0,
+    nanosecond: u32 = 0,    // sub-second part, 0..999_999_999; SSS/SSSSSS/SSSSSSSSS
     off_min: ?i32 = null,   // set by a ZZ token; null if the format has none
 };
+
+const IsoWeek = struct { year: i32, week: u32 };   // ISO week-year + week 1..53
 
 // Civil core
 fn ymdToEpochDay(year: i32, month: u32, day: u32) i64;
 fn epochDayToYmd(epoch_day: i64) DateParts;
 fn isoWeekday(epoch_day: i64) u32;              // Mon=1 … Sun=7
-fn partsToUnix(p: DateParts) i64;
+fn isoWeek(parts: DateParts) IsoWeek;           // ISO 8601 week of a civil day
+fn isoWeeksInYear(iso_year: i32) u32;            // 52 or 53
+fn isoWeekDateToEpochDay(iso_year, week, weekday) ?i64;  // inverse; null if nonexistent
+fn partsToUnix(p: DateParts) i64;                // whole seconds (ignores nanosecond)
 fn unixToParts(unix: i64) DateParts;
 fn isLeapYear(year: i32) bool;
 fn daysInMonth(year: i32, month: u32) u32;
@@ -80,6 +95,8 @@ fn nthWeekdayOfMonth(year, month, weekday, n) ?DateParts;  // DST-boundary primi
 // Strict ISO + validation helpers
 fn parseIsoDate(s) ParseError!DateParts;         // strict YYYY-MM-DD
 fn formatIsoDate(alloc, parts) ![]const u8;
+fn parseXsdDateTime(s) error{InvalidDateTime}!i64;            // unix seconds; fraction dropped
+fn parseXsdDateTimeNs(s) error{InvalidDateTime}!XsdInstant;   // { unix: i64, nanosecond: u32 }
 fn firstInvalidFormatChar(fmt) ?usize;           // diagnostic: offset of first bad token
 ```
 
@@ -97,9 +114,6 @@ zig fmt --check modules/datefmt
 
 - **Locale-aware month/day names** — the name tables are English `Jan`…`Dec` /
   `Mon`…`Sun` only; no locale table or i18n hook.
-- **ISO-week-date** (`YYYY-Www-D`, ISO 8601 week numbering) — not in the
-  token vocabulary; `isoWeekday` gives weekday-in-week only, not
-  week-of-year.
 - **Timezone-aware formatting/conversion** (IANA tz database, DST rules,
   offset lookup by zone name) — `ZZ` only carries a raw UTC-offset literal
   through parse/format; there is no zone database. Intentionally a **separate

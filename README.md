@@ -611,7 +611,7 @@ way to recognise it.
 | [`crc32c`](modules/crc32c/README.md) | 2 | CRC-32C (Castagnoli) — SSE4.2 and ARMv8 CRC instructions picked at run time (three interleaved streams), slicing-by-8 fallback; streaming, extend, combine. | any (x86-64 SSE4.2 / arm64 CRC asm + portable fallback) | — |
 | [`csvsafe`](modules/csvsafe/README.md) | 2 | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads). | any | — |
 | [`csvstream`](modules/csvstream/README.md) | 2 | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
-| [`datefmt`](modules/datefmt/README.md) | 3 | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
+| [`datefmt`](modules/datefmt/README.md) | 2 | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
 | [`encoding`](modules/encoding/README.md) | 3 | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
 | [`framing`](modules/framing/README.md) | 3 | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
 | [`ini`](modules/ini/README.md) | 3 | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
