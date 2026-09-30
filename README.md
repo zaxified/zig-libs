@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 239 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 240 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -529,6 +529,7 @@ way to recognise it.
 | [`bn254`](modules/bn254/README.md) | 2 | BN254 / alt-bn128 curve — field tower/groups, optimal-ate pairing, EIP-196/197 EVM precompiles, and a Groth16 zkSNARK **verifier**. | any | — |
 | [`bolt3`](modules/bolt3/README.md) | 3 | Lightning BOLT#3 key derivation — per-commitment blinded keys, split-secret revocation keys, shachain secret generation. | any | k256 |
 | [`bolt8`](modules/bolt8/README.md) | 2 | Lightning BOLT#8 encrypted transport (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — handshake plus transport with periodic key rotation. | any | noise, k256 |
+| [`btcaddr`](modules/btcaddr/README.md) | 3 | Bitcoin address layer -- scriptPubKey <-> address (P2PKH/P2SH/P2WPKH/P2WSH/P2TR/witness v1-16), network detection, WIF keys, P2SH/P2WSH helpers. | any | bech32, ripemd160 |
 | [`btcp2p`](modules/btcp2p/README.md) | 3 | Bitcoin P2P wire-message codec — envelope, version/verack handshake, inventory/data messages. Codec only: no chain state or validation. | any | bitcointx |
 | [`bulletproofs`](modules/bulletproofs/README.md) | 4 | Bulletproofs — zero-knowledge range proofs over Ristretto255, proving a Pedersen-committed value is in range with logarithmic proof size. | linux | ct25519 |
 | [`chachapoly`](modules/chachapoly/README.md) | 2 | SIMD-accelerated ChaCha20-Poly1305 AEAD (RFC 8439) — a throughput-specialized, byte-exact duplicate of `std.crypto.aead.chacha_poly`. | any (SIMD via `@Vector`) | — |

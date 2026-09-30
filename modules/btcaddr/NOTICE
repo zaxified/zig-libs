@@ -1,0 +1,45 @@
+btcaddr — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). It additionally
+reproduces third-party TEST-CASE DATA whose copyright notice must be preserved
+in any copy. Redistributing this module — alone or as part of zig-libs — must
+keep this file with it.
+
+This adds no condition beyond MIT's own: it is the same "preserve the notice"
+requirement that already applies to zig-libs' own code, owed to a different
+author. No third-party SOURCE CODE is present — only test vectors.
+
+## Bitcoin Core `key_io_valid.json` and `key_io_invalid.json`
+
+`src/core_vectors.zig` reproduces, in full and in file order, the two address /
+WIF conformance corpora published by the Bitcoin Core project at
+`src/test/data/key_io_valid.json` (70 rows) and `src/test/data/key_io_invalid.json`
+(70 rows), fetched from `master` at commit
+`e7aef7e86da79000aa42f5ba6d13b0d123d9da7c` (the two files last changed at
+`7c200ece80575d399a552f5757c07ac2c8c7ec6c` and
+`fa506add25cbe5efbbabca647f5378c4128cf945`). The Zig file is produced by
+`tools/gen_core_vectors.py`; its header records the file hashes.
+
+Bitcoin Core is licensed under the MIT License:
+
+    Copyright (c) 2009-2026 The Bitcoin Core developers
+    Copyright (c) 2009-2026 Bitcoin Developers
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
