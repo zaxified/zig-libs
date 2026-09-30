@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — Lossy medium measured and LSP aging/refresh/purge in the run
+  (survey backlog). `Options.link_overrides` (per-link `LinkConfig`), `Options.aging`
+  (`Lsdb.tick` on a per-node timer, own-LSP refresh at age 900 of MaxAge 1200,
+  ZeroAgeLifetime purge/removal, ISO numbers at 1 tick = 1 s), `Fabric.crash`,
+  `Fabric.stats`/`last_log`/`dropsBetween`/`holds`/`holdsPurge`/`remainingLifetime`.
+  New `MEASURED:` loss sweep (16/16 seeds converge at 0–30 % loss, convergence
+  9 → 92 ticks, LSPs sent 192 → 363), aging steady-state / dead-originator /
+  refresh-disabled negative-control tests; `check` allows an LSP to vanish only
+  after being a purge. `SPEC.md` §10–§11. `scripts/modtest isis-sim`: 31/31.
+
 - **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
   (F2): `netsim.RunOutcome` gained a `.cap_exceeded` variant carrying
   exactly the condition `runToConvergence` used to re-derive by hand

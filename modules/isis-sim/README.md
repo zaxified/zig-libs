@@ -11,11 +11,13 @@ after a link failure. It is the end-to-end proof that the five-layer stack
 works **together**, not just per-module.
 
 Status: **integration harness** — flooding + LSDB convergence, SPF route
-consistency, one mid-run link-fail **reconvergence**, and **partition** detection,
-on a small (≤ 6-node) **static-adjacency P2P** fabric. Deliberately deferred: the
-adjacency FSM (`isis-adj`), node crash/restart, LSP purge/aging races during a
-run, LAN pseudonodes, the SPB data-plane, scale/perf, and topology fuzzing — see
-`SPEC.md`.
+consistency, one mid-run link-fail **reconvergence**, **partition** detection, a
+**lossy medium** (loss/duplication/reordering/jitter, per link or fabric-wide,
+with the convergence cost measured) and **LSP aging, refresh and purge** (a dead
+originator's LSP ages out and SPF drops it), on a small (≤ 6-node)
+**static-adjacency P2P** fabric. Deliberately deferred: the adjacency FSM
+(`isis-adj`), restart of a crashed node, LAN pseudonodes, the SPB data-plane,
+scale/perf, and topology fuzzing — see `SPEC.md`.
 
 Model after: **`netsim`'s `Protocol` seam** (the VOPR-style discrete-event
 network simulator) driving the **ISO/IEC 10589** IS-IS control plane already
@@ -39,7 +41,7 @@ netsim node *n* maps deterministically to the 6-octet system-id of `n + 1`
 |------|-----------------------|
 | **onStart(node)** | Originate the node's own LSP — one Extended IS Reachability (#22) entry per currently-up neighbour, sequence 1 — and `lsdb.insert` it self-originated (`arrival_iface = null` → SRM on every circuit). Arm the first flooding poll; pre-arm one timer per scheduled link failure this node terminates. |
 | **onMessage(node, from, payload)** | `isis.decode` the PDU: an **LSP** → `lsdb.insert(bytes, arrival_iface, now)` (sets SRM to flood onward + SSN to ack); a **CSNP/PSNP** → `lsdb.reconcileCsnp`/`reconcilePsnp`. Then arm a flooding poll so the next `poll` drains the freshly-set flags. |
-| **onTimer(node, id)** | id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
+| **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
 | **check** | A safety invariant run after every event: no node's LSDB ever holds more than `node_count` distinct LSP-IDs (a runaway/corruption tripwire). |
 
 ## The three proofs
@@ -58,6 +60,31 @@ netsim node *n* maps deterministically to the 6-octet system-id of `n + 1`
 - **Partition.** Failing a leaf's only link makes that leaf **unreachable** in
   every other node's SPF — a partition is *detected*, bounded by the step cap, not
   a hang.
+
+## Lossy medium and aging
+
+```zig
+// 20% loss on every link, plus one much worse link; retransmission must be on.
+var fab = try sim.Fabric.initWithOptions(gpa, topo, seed, .{
+    .link = .{ .latency = 2, .loss_permille = 200 },
+    .link_overrides = &.{.{ .a = 1, .b = 2, .link = .{ .latency = 2, .loss_permille = 500 } }},
+    .retransmit_interval = 40,
+});
+// LSP aging at ISO's numbers (1 tick = 1 s): MaxAge 1200, refresh at 900,
+// ZeroAgeLifetime 60. A crashed node is never announced dead — its LSP just ages out.
+var aged = try sim.Fabric.initWithOptions(gpa, topo, seed, .{ .aging = .{} });
+aged.crash = .{ .node = 2, .time = 1_000 };
+```
+
+`fab.stats` (`Stats`) reports what a run cost: LSPs/SNPs sent, messages the
+medium dropped/duplicated, the time of the last LSDB change (convergence time),
+refreshes and purges. Measured on the 4-node line over 16 seeds: converges on
+every seed at 0/5/10/20/30 % loss; mean convergence 9 → 35 → 67 → 84 → 92 ticks,
+LSPs sent 192 → 363, drops 0 → 209 (SPEC §10). With aging, a steady state over
+3.3 lifetimes purges nothing (16 refreshes, every LSP at sequence 5); a crashed
+node's LSP is purged everywhere at ~MaxAge, removed after ZeroAgeLifetime, and
+dropped from SPF; with refresh disabled every foreign LSP is purged (negative
+control) — SPEC §11.
 
 ## Termination & quiescence
 
@@ -110,6 +137,12 @@ const nh = try fab.reaches(gpa, 3, 0); // next-hop system-id D→A, or null
 ```
 zig build test-isis-sim
 ```
+
+Also covers: the **lossy-medium `MEASURED:` sweep** (with positive controls that
+loss really drops messages and slows convergence), per-link impairment,
+duplication, byte-for-byte lossy replay, and the **aging** scenarios (steady-state
+refresh, dead originator purge → removal → SPF, refresh-disabled negative control,
+reset/replay, and a `check` teeth test).
 
 Covers: **convergence** (4-node line + 5-node cyclic topology — every LSDB holds
 all originators at the right sequence); **SPF consistency** (all-pairs

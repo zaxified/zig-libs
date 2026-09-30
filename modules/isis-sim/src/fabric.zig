@@ -30,8 +30,8 @@
 //!     node's LSDB ever holds more than `node_count` distinct LSP-IDs (a
 //!     runaway/corruption tripwire; correct flooding stores exactly one LSP per
 //!     originator), and (2) no node's stored sequence number for an originator
-//!     ever decreases, and no LSP it already holds ever disappears (nothing ages
-//!     or is purged here). Both have a permanent positive control in the tests,
+//!     ever decreases, and no LSP it already holds ever disappears — unless aging
+//!     is on (`Options.aging`) and the LSP was a purge first. Both have a permanent positive control in the tests,
 //!     so each is known to be capable of firing — see `extra_fragments` and
 //!     `broken_wipe_node`. A violation is recorded in `Fabric.violation` as well
 //!     as stopping the run.
@@ -154,6 +154,9 @@ const timer_poll: u64 = 0;
 /// "This node cold-restarted": drop its LSDB and its flooding state and
 /// re-originate (see `Fabric.restart`).
 const timer_restart: u64 = 1;
+/// "Age this node's LSDB now" (`Options.aging`): `tick` the database, refresh the
+/// node's own LSP if it is due, and re-arm.
+const timer_age: u64 = 2;
 /// Failure-reaction timer ids start here (distinct from `timer_poll`); the
 /// failure index is added on.
 const fail_timer_base: u64 = 1 << 32;
@@ -214,6 +217,69 @@ pub const Options = struct {
     /// `.not_quiescent` — a runaway is a different diagnosis from mere
     /// under-convergence — was consequently pinned by nothing.
     max_events_cap: u64 = 200_000,
+    /// Per-link overrides of `link`: the impairments of one specific undirected
+    /// link (both directions), everything else keeping `link`. Every entry must
+    /// name an existing edge (asserted at `init`, so a typo cannot be a silently
+    /// perfect link).
+    link_overrides: []const LinkOverride = &.{},
+    /// LSP aging, refresh and purge in the run (SPEC §10). `null` (the default)
+    /// is the original harness: lifetimes stamped high and never `tick`ed, so
+    /// nothing ages.
+    aging: ?Aging = null,
+};
+
+/// One link's medium, replacing `Options.link` for the undirected edge `a`-`b`.
+pub const LinkOverride = struct {
+    a: NodeId,
+    b: NodeId,
+    link: netsim.LinkConfig,
+};
+
+/// LSP aging in the simulated run. One netsim tick stands for one second of
+/// protocol time, so the defaults are ISO/IEC 10589's own numbers — MaxAge 1200,
+/// `maximumLSPGenerationInterval` 900 (refresh when 300 remain), ZeroAgeLifetime
+/// 60 — and it is the *network* that is scaled: a link takes 2 ticks (2 s, not
+/// milliseconds), which only makes every race in the aging path easier to hit.
+pub const Aging = struct {
+    /// Remaining Lifetime (MaxAge) stamped into every originated LSP.
+    lifetime: u16 = 1200,
+    /// The originator re-originates its LSP once its Remaining Lifetime has fallen
+    /// to this (`isis-lsdb`'s `refresh_threshold`). Must be below `lifetime`.
+    refresh_threshold: u16 = 300,
+    /// ZeroAgeLifetime: how long a purge is held (and flooded) before removal.
+    zero_age_lifetime: u16 = 60,
+    /// The period of each node's aging timer (`Lsdb.tick`). Refresh happens on the
+    /// first tick at or after the threshold, so this is the refresh granularity;
+    /// it must be shorter than `zero_age_lifetime` or a purge could enter and
+    /// leave the database between two ticks.
+    tick_interval: Time = 10,
+    /// `false` is the negative control: a node never re-originates because its
+    /// LSP is ageing (nor because a neighbour challenged it), so every LSP must
+    /// eventually be purged by the rest of the fabric — which proves the aging
+    /// path is live rather than merely never triggered.
+    refresh: bool = true,
+};
+
+/// Counters for the last `runToConvergence`. Everything measured by the
+/// `MEASURED:` tests comes from here.
+pub const Stats = struct {
+    /// PDUs handed to the medium (`sim.send`), by kind.
+    lsp_tx: u64 = 0,
+    snp_tx: u64 = 0,
+    /// From the netsim event log: deliveries, drops (probabilistic loss, a
+    /// `drop_once`, and messages arriving over a severed link or at a crashed
+    /// node — all are `drop` in the log) and duplicate copies injected.
+    net_delivered: u64 = 0,
+    net_dropped: u64 = 0,
+    net_duplicated: u64 = 0,
+    /// The simulated time of the last event that changed any LSDB (an LSP stored
+    /// anywhere, or originated) — the convergence time of the run.
+    last_change: Time = 0,
+    /// Aging: own-LSP refreshes, purges entered by aging, purges removed after
+    /// ZeroAgeLifetime — summed over all nodes.
+    refreshes: u64 = 0,
+    purges_entered: u64 = 0,
+    purges_removed: u64 = 0,
 };
 
 // ── the Fabric (the Protocol context) ────────────────────────────────────────
@@ -279,6 +345,23 @@ pub const Fabric = struct {
     /// but a database summary can discover that it is missing anything.
     restart: ?struct { node: NodeId, time: Time } = null,
 
+    /// A scheduled **crash**: at `time`, netsim stops `node` (`crash_node`) — no
+    /// message is delivered to it, no timer fires, and it never comes back. The
+    /// neighbours are NOT told (there is no hello / hold timer here, SPEC §8), so
+    /// the only thing that can remove the dead node's LSP from the fabric is
+    /// aging: this is what makes the MaxAge purge path observable.
+    crash: ?struct { node: NodeId, time: Time } = null,
+
+    /// Counters of the last run (see `Stats`); zeroed at the top of every drive.
+    stats: Stats = .{},
+    /// The netsim event log of the last run, kept so a test can ask a question the
+    /// counters do not answer (`dropsBetween`).
+    last_log: netsim.Log = .{},
+
+    /// Per-(node, originator): the last stored copy was a purge. The only way an
+    /// LSP a node holds may disappear when aging is on is to be purged first.
+    seen_purge: []bool,
+
     /// Positive control for the SNP path: when true, `onMessage` drops every
     /// CSNP and PSNP, so `reconcileCsnp`/`reconcilePsnp` never run. Flooding
     /// (LSP + SRM + retransmit) is untouched. Every lossy test in this module
@@ -307,6 +390,18 @@ pub const Fabric = struct {
             gpa.free(ns.neighbours);
             gpa.free(ns.link_failed);
         };
+
+        if (opts.aging) |a| {
+            std.debug.assert(a.refresh_threshold < a.lifetime);
+            std.debug.assert(a.tick_interval > 0 and a.tick_interval < a.zero_age_lifetime);
+        }
+        for (opts.link_overrides) |o| {
+            var found = false;
+            for (topo.edges) |e| {
+                if ((e.a == o.a and e.b == o.b) or (e.a == o.b and e.b == o.a)) found = true;
+            }
+            std.debug.assert(found);
+        }
 
         for (nodes, 0..) |*ns, i| {
             const node: NodeId = @intCast(i);
@@ -338,7 +433,7 @@ pub const Fabric = struct {
                 .system_id = sys,
                 .neighbours = neighbours,
                 .link_failed = link_failed,
-                .lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(sys, degree, topo.node_count)),
+                .lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(sys, degree, topo.node_count, opts)),
                 .sched = isis_flood.Scheduler.init(gpa, schedConfig(sys, opts)),
                 .seq = 0,
             };
@@ -348,9 +443,19 @@ pub const Fabric = struct {
         // Sized n×n; the `initialized`/`nodes` errdefers above still cover a
         // failure here, so no extra unwind is needed.
         const seen_seq = try gpa.alloc(u32, topo.node_count * topo.node_count);
+        errdefer gpa.free(seen_seq);
         @memset(seen_seq, 0);
+        const seen_purge = try gpa.alloc(bool, topo.node_count * topo.node_count);
+        @memset(seen_purge, false);
 
-        return .{ .gpa = gpa, .nodes = nodes, .seed = seed, .opts = opts, .seen_seq = seen_seq };
+        return .{
+            .gpa = gpa,
+            .nodes = nodes,
+            .seed = seed,
+            .opts = opts,
+            .seen_seq = seen_seq,
+            .seen_purge = seen_purge,
+        };
     }
 
     pub fn deinit(self: *Fabric) void {
@@ -361,19 +466,26 @@ pub const Fabric = struct {
             self.gpa.free(ns.link_failed);
         }
         self.gpa.free(self.seen_seq);
+        self.gpa.free(self.seen_purge);
         self.gpa.free(self.nodes);
+        self.last_log.deinit(self.gpa);
         self.failures.deinit(self.gpa);
         self.extra_faults.deinit(self.gpa);
         self.* = undefined;
     }
 
-    fn lsdbConfig(sys: SystemId, degree: usize, node_count: u32) isis_lsdb.Config {
-        return .{
+    fn lsdbConfig(sys: SystemId, degree: usize, node_count: u32, opts: Options) isis_lsdb.Config {
+        var cfg: isis_lsdb.Config = .{
             .local_system_id = sys,
             .interface_count = @intCast(degree),
             // One LSP per originator + slack; bounds the store, never hit here.
             .capacity = node_count + 8,
         };
+        if (opts.aging) |a| {
+            cfg.zero_age_lifetime = a.zero_age_lifetime;
+            cfg.refresh_threshold = a.refresh_threshold;
+        }
+        return cfg;
     }
 
     fn schedConfig(sys: SystemId, opts: Options) isis_flood.Config {
@@ -423,7 +535,7 @@ pub const Fabric = struct {
         for (self.nodes, 0..) |*ns, i| {
             const node_count: u32 = @intCast(self.nodes.len);
             ns.lsdb.deinit();
-            ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, node_count));
+            ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, node_count, self.opts));
             ns.sched.deinit();
             ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
             ns.seq = 0;
@@ -433,8 +545,10 @@ pub const Fabric = struct {
         // Per-run invariant state (netsim calls `reset` at the top of every
         // drive, so this is the run's baseline).
         @memset(self.seen_seq, 0);
+        @memset(self.seen_purge, false);
         self.violation = null;
         self.wipe_done = false;
+        self.stats = .{};
     }
 
     fn onStart(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId) anyerror!void {
@@ -442,6 +556,9 @@ pub const Fabric = struct {
         const now = sim.timeNow();
         try self.originate(node, now);
         try sim.setTimer(node, poll_delay, timer_poll);
+        if (self.opts.aging) |a| {
+            if (a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
+        }
         // Pre-arm the failure-reaction timers for links this node terminates.
         for (self.failures.items, 0..) |f, k| {
             if (f.a == node or f.b == node) {
@@ -467,7 +584,7 @@ pub const Fabric = struct {
         const ns = &self.nodes[node];
         const n = self.nodes.len;
         ns.lsdb.deinit();
-        ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(n)));
+        ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(n), self.opts));
         ns.sched.deinit();
         ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
         // `check`'s monotonicity invariant is "no stored sequence goes backwards
@@ -475,6 +592,7 @@ pub const Fabric = struct {
         // marks of the restarting node only — every other node's row, and this
         // node's own future, stay under the invariant.
         @memset(self.seen_seq[node * n ..][0..n], 0);
+        @memset(self.seen_purge[node * n ..][0..n], false);
         try self.originate(node, now);
     }
 
@@ -486,7 +604,21 @@ pub const Fabric = struct {
 
         const pdu = isis.decode(payload) catch return; // hostile/short bytes: ignore
         switch (pdu) {
-            .lsp => _ = try ns.lsdb.insert(payload, iface, now),
+            .lsp => {
+                const r = try ns.lsdb.insert(payload, iface, now);
+                if (r.stored) self.stats.last_change = now;
+                // ISO 10589 §7.3.16.1: a neighbour holds a NEWER copy of (or a
+                // purge for) OUR LSP. It was refused and flagged; the owner
+                // re-originates above the challenger so the fabric re-learns it.
+                if (r.self_challenge) |ch| {
+                    if (self.opts.aging) |a| {
+                        if (a.refresh) {
+                            ns.seq = @max(ns.seq, ch);
+                            try self.originate(node, now);
+                        }
+                    }
+                }
+            },
             // The SNP positive control: drop the summary rather than reconcile
             // it, leaving flooding as the only mechanism in the fabric.
             .csnp => |c| {
@@ -510,7 +642,7 @@ pub const Fabric = struct {
                 ns.lsdb.deinit();
                 ns.lsdb = isis_lsdb.Lsdb.init(
                     self.gpa,
-                    lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(self.nodes.len)),
+                    lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(self.nodes.len), self.opts),
                 );
             }
         }
@@ -526,6 +658,8 @@ pub const Fabric = struct {
 
         if (timer_id == timer_restart) {
             try self.coldRestart(node, now);
+        } else if (timer_id == timer_age) {
+            try self.ageNode(sim, node, now);
         } else if (timer_id >= fail_timer_base) {
             const ns = &self.nodes[node];
             // `timer_id` is `u64` because `fail_timer_base = 1 << 32` is used
@@ -545,6 +679,28 @@ pub const Fabric = struct {
             try self.originate(node, now);
         }
         try self.pollAndSend(sim, node, now);
+    }
+
+    /// One aging pass for `node` (`Options.aging`): advance its LSDB to `now`
+    /// (`Lsdb.tick` — ages every stored LSP, purges a non-self one whose Remaining
+    /// Lifetime reached zero and floods the purge, removes a purge after
+    /// ZeroAgeLifetime), then — ISO 10589 §7.3.16.4 — re-originate the node's OWN
+    /// LSP at a bumped sequence number if `tick` flagged it for refresh, and re-arm.
+    fn ageNode(self: *Fabric, sim: *netsim.Sim, node: NodeId, now: Time) anyerror!void {
+        const a = self.opts.aging.?;
+        const ns = &self.nodes[node];
+        const rep = ns.lsdb.tick(now);
+        self.stats.purges_entered += rep.entered_purge;
+        self.stats.purges_removed += rep.removed;
+        const own = lspIdOf(ns.system_id, 0);
+        if (a.refresh and ns.lsdb.refreshPending(own)) {
+            // A challenge (a neighbour's newer copy) also sets `refresh_pending`;
+            // land above it, not merely above our own last sequence number.
+            if (ns.lsdb.get(own, now)) |v| ns.seq = @max(ns.seq, v.challenge_sequence);
+            try self.originate(node, now);
+            self.stats.refreshes += 1;
+        }
+        if (now + a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
     }
 
     /// Record and raise a safety-invariant violation. `check` never overwrites
@@ -580,10 +736,19 @@ pub const Fabric = struct {
             var origin: usize = 0;
             while (origin < n) : (origin += 1) {
                 const id = lspIdOf(systemIdForNode(@intCast(origin)), 0);
-                const cur: u32 = if (ns.lsdb.get(id, 0)) |v| v.sequence_number else 0;
+                const view = ns.lsdb.get(id, 0);
+                const cur: u32 = if (view) |v| v.sequence_number else 0;
                 const slot = &self.seen_seq[node * n + origin];
-                if (cur < slot.*) return self.violate(error.SequenceRegression);
+                const purged = &self.seen_purge[node * n + origin];
+                if (cur < slot.*) {
+                    // With aging on, an LSP may legitimately leave the database —
+                    // but only by the road ISO 10589 §7.3.16.4 gives it: it was
+                    // observed as a purge first, and only then removed. A LIVE
+                    // copy vanishing is still a violation.
+                    if (self.opts.aging == null or cur != 0 or !purged.*) return self.violate(error.SequenceRegression);
+                }
                 slot.* = cur;
+                purged.* = if (view) |v| v.is_purge else false;
             }
         }
     }
@@ -598,8 +763,9 @@ pub const Fabric = struct {
         ns.seq += 1;
 
         var buf: [1024]u8 = undefined;
+        self.stats.last_change = now;
         var b = try isis.pdu.LspBuilder.init(&buf, .{
-            .remaining_lifetime = lsp_lifetime,
+            .remaining_lifetime = self.stampedLifetime(),
             .lsp_id = lspIdOf(ns.system_id, 0),
             .sequence_number = ns.seq,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
@@ -626,13 +792,19 @@ pub const Fabric = struct {
         while (frag <= self.extra_fragments) : (frag += 1) {
             var fbuf: [1024]u8 = undefined;
             var fb = try isis.pdu.LspBuilder.init(&fbuf, .{
-                .remaining_lifetime = lsp_lifetime,
+                .remaining_lifetime = self.stampedLifetime(),
                 .lsp_id = lspIdOf(ns.system_id, frag),
                 .sequence_number = ns.seq,
                 .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
             });
             _ = try ns.lsdb.insert(fb.finishStamped(), null, now);
         }
+    }
+
+    /// The Remaining Lifetime an originated LSP carries: MaxAge when aging is on,
+    /// otherwise "high enough that nothing ever ages" (the harness never ticks).
+    fn stampedLifetime(self: *const Fabric) u16 {
+        return if (self.opts.aging) |a| a.lifetime else lsp_lifetime;
     }
 
     /// Run one flooding poll for `node` and physically send every effect to the
@@ -646,6 +818,10 @@ pub const Fabric = struct {
         const r = ns.sched.poll(now, up, &ns.lsdb, &out, &scratch);
 
         for (r.effects) |e| {
+            switch (e.kind) {
+                .lsp => self.stats.lsp_tx += 1,
+                .psnp, .csnp => self.stats.snp_tx += 1,
+            }
             const nbr = ns.neighbours[e.iface].node;
             try sim.send(node, nbr, e.bytes);
         }
@@ -704,6 +880,9 @@ pub const Fabric = struct {
         // caller registered. `netsim.replay` sorts by time, so append order
         // does not matter.
         try trace.appendSlice(self.gpa, self.extra_faults.items);
+        if (self.crash) |c| {
+            try trace.append(self.gpa, .{ .time = c.time, .kind = .{ .crash_node = .{ .node = c.node } } });
+        }
 
         const case = netsim.Case{
             .seed = self.seed,
@@ -718,7 +897,8 @@ pub const Fabric = struct {
         g_active_fabric = self;
         defer g_active_fabric = null;
 
-        const result = try netsim.replay(self.gpa, case, trace.items, null);
+        const result = try netsim.replay(self.gpa, case, trace.items, &self.last_log);
+        self.countLog();
         if (result.outcome == .violated) return .safety_violated;
         // netsim audit F2: the engine itself now distinguishes "hit the
         // event-count backstop" from a clean finish (`RunOutcome
@@ -731,6 +911,39 @@ pub const Fabric = struct {
         return .converged;
     }
 
+    /// Fill the network counters of `stats` from the last run's event log.
+    fn countLog(self: *Fabric) void {
+        for (self.last_log.entries.items) |e| switch (e.tag) {
+            .deliver => self.stats.net_delivered += 1,
+            .drop => self.stats.net_dropped += 1,
+            .dup => self.stats.net_duplicated += 1,
+            else => {},
+        };
+    }
+
+    /// How many messages the medium dropped on the directed hop `from → to` in
+    /// the last run (loss, `drop_once`, or a dead link/node — see `Stats`).
+    pub fn dropsBetween(self: *const Fabric, from: NodeId, to: NodeId) u64 {
+        var n: u64 = 0;
+        for (self.last_log.entries.items) |e| {
+            if (e.tag == .drop and e.a == from and e.b == to) n += 1;
+        }
+        return n;
+    }
+
+    /// Whether `node` has been crashed by `Fabric.crash` by the end of the run.
+    fn isDead(self: *const Fabric, node: NodeId) bool {
+        const c = self.crash orelse return false;
+        return c.node == node and c.time <= self.horizon;
+    }
+
+    /// The time at which the LSDBs are read back: the end of the run when LSPs
+    /// age (a copy must be judged by what remains of its lifetime *then*), and 0
+    /// otherwise (lifetimes are stamped so high that nothing ever ages).
+    fn readTime(self: *const Fabric) Time {
+        return if (self.opts.aging != null) self.horizon else 0;
+    }
+
     // ── convergence / quiescence inspection ──────────────────────────────────
 
     /// A node is quiescent when it has nothing left to flood (no SRM) and nothing
@@ -739,8 +952,15 @@ pub const Fabric = struct {
     /// down link never acks, so the re-origination that set SRM on it can never
     /// clear it, and that circuit is never polled.
     fn quiescent(self: *const Fabric, node: NodeId) bool {
+        // A crashed node has stopped; a circuit toward it never acks (nothing
+        // tells its neighbours it is gone — SPEC §8), so like a failed circuit it
+        // is ignored rather than counted as pending work.
+        if (self.isDead(node)) return true;
         const ns = &self.nodes[node];
-        const up = self.upInterfaces(node);
+        var up = self.upInterfaces(node);
+        for (ns.neighbours, 0..) |nb, i| {
+            if (self.isDead(nb.node)) up.unset(i);
+        }
         var srm = ns.lsdb.interfacesWithSrm();
         srm.setIntersection(up);
         if (srm.count() != 0) return false;
@@ -767,12 +987,17 @@ pub const Fabric = struct {
     /// SPF-reachability accessors there instead).
     pub fn lsdbsAgree(self: *const Fabric) bool {
         const now: Time = 0;
+        // A crashed node's frozen database is not part of the fabric any more.
+        var first: NodeId = 0;
+        while (first < self.nodes.len and self.isDead(first)) first += 1;
+        if (first == self.nodes.len) return true;
         var origin: NodeId = 0;
         while (origin < self.nodes.len) : (origin += 1) {
             const id = lspIdOf(systemIdForNode(origin), 0);
-            const ref = self.nodes[0].lsdb.get(id, now);
-            var node: NodeId = 1;
+            const ref = self.nodes[first].lsdb.get(id, now);
+            var node: NodeId = first + 1;
             while (node < self.nodes.len) : (node += 1) {
+                if (self.isDead(node)) continue;
                 const got = self.nodes[node].lsdb.get(id, now);
                 if ((ref == null) != (got == null)) return false;
                 if (ref) |rv| {
@@ -799,6 +1024,25 @@ pub const Fabric = struct {
         return v.sequence_number;
     }
 
+    /// Whether `node`'s database holds an LSP for `origin` in any form (an active
+    /// copy or a purge awaiting removal).
+    pub fn holds(self: *const Fabric, node: NodeId, origin: NodeId) bool {
+        return self.nodes[node].lsdb.get(lspIdOf(systemIdForNode(origin), 0), 0) != null;
+    }
+
+    /// Whether `node` holds `origin`'s LSP as a purge (zero lifetime, retained
+    /// header only, waiting out ZeroAgeLifetime).
+    pub fn holdsPurge(self: *const Fabric, node: NodeId, origin: NodeId) bool {
+        const v = self.nodes[node].lsdb.get(lspIdOf(systemIdForNode(origin), 0), 0) orelse return false;
+        return v.is_purge;
+    }
+
+    /// The Remaining Lifetime `node` reads for `origin`'s LSP at the end of the
+    /// run, or null when it holds none.
+    pub fn remainingLifetime(self: *const Fabric, node: NodeId, origin: NodeId) ?u16 {
+        return self.nodes[node].lsdb.remainingLifetime(lspIdOf(systemIdForNode(origin), 0), self.readTime());
+    }
+
     /// The current sequence number of `node`'s own LSP (how many times it has
     /// originated).
     pub fn selfSequence(self: *const Fabric, node: NodeId) u32 {
@@ -813,7 +1057,7 @@ pub const Fabric = struct {
     /// Compute `node`'s SPF forwarding table from its (converged) LSDB. Caller
     /// owns the result — call `.deinit()`.
     pub fn routes(self: *const Fabric, gpa: Allocator, node: NodeId) Allocator.Error!isis_spf.RouteTable {
-        return isis_spf.compute(gpa, &self.nodes[node].lsdb, self.nodes[node].system_id, 0);
+        return isis_spf.compute(gpa, &self.nodes[node].lsdb, self.nodes[node].system_id, self.readTime());
     }
 
     /// Whether `from` can reach `to` in its SPF table, and if so the next-hop
@@ -843,7 +1087,11 @@ fn buildScenario(sim: *netsim.Sim) anyerror!void {
     for (fab.nodes, 0..) |ns, a| {
         for (ns.neighbours) |nb| {
             if (@as(usize, nb.node) > a) {
-                try sim.addBiLink(@intCast(a), nb.node, fab.opts.link);
+                var cfg = fab.opts.link;
+                for (fab.opts.link_overrides) |o| {
+                    if ((o.a == a and o.b == nb.node) or (o.b == a and o.a == nb.node)) cfg = o.link;
+                }
+                try sim.addBiLink(@intCast(a), nb.node, cfg);
             }
         }
     }
@@ -1494,4 +1742,347 @@ test "one-shot faults: a partition that heals re-synchronises both sides" {
         }
     }
     try testing.expectEqual(@as(?anyerror, null), fab.violation);
+}
+
+// ── the lossy medium, MEASURED ───────────────────────────────────────────────
+//
+// The tests above show that flooding converges over an imperfect medium; these
+// say how much the imperfection costs. Each run is one deterministic seed, the
+// numbers are sums over a fixed seed set, and every setting has a control: a
+// medium whose loss is silently ignored would show zero drops and the same
+// convergence time as a perfect one, and the positive controls below fail on
+// exactly that.
+
+const Sweep = struct {
+    converged: u32 = 0,
+    agreed: u32 = 0,
+    drops: u64 = 0,
+    lsp_tx: u64 = 0,
+    /// Sum and worst case of `Stats.last_change` over the seeds.
+    change_sum: Time = 0,
+    change_max: Time = 0,
+};
+
+/// Run the 4-node line over `link` for seeds 1..=`seeds` and total the outcome.
+fn sweepLine(link: netsim.LinkConfig, overrides: []const LinkOverride, seeds: u64) !Sweep {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var opts = lossy_opts_base;
+    opts.link = link;
+    opts.link_overrides = overrides;
+    var out: Sweep = .{};
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, seed *% 0x9E3779B97F4A7C15, opts);
+        defer fab.deinit();
+        const outcome = try fab.runToConvergence(lossy_step_cap);
+        if (outcome == .converged) out.converged += 1;
+        if (fab.lsdbsAgree()) out.agreed += 1;
+        out.drops += fab.stats.net_dropped;
+        out.lsp_tx += fab.stats.lsp_tx;
+        out.change_sum += fab.stats.last_change;
+        out.change_max = @max(out.change_max, fab.stats.last_change);
+    }
+    return out;
+}
+
+test "MEASURED: convergence time and LSP retransmissions grow with the loss rate" {
+    const seeds: u64 = 16;
+    const rates = [_]u16{ 0, 50, 100, 200, 300 };
+    var pts: [rates.len]Sweep = undefined;
+    for (rates, 0..) |permille, i| {
+        pts[i] = try sweepLine(.{ .latency = link_latency, .loss_permille = permille }, &.{}, seeds);
+        std.debug.print(
+            "MEASURED loss={d}%o: converged {d}/{d} agree {d}/{d} drops {d} lsp_tx {d} last_change mean {d} max {d}\n",
+            .{
+                permille,      pts[i].converged,          seeds,             pts[i].agreed, seeds, pts[i].drops,
+                pts[i].lsp_tx, pts[i].change_sum / seeds, pts[i].change_max,
+            },
+        );
+    }
+
+    // Flooding converges at every rate, on every seed — the claim under test.
+    for (pts) |p| {
+        try testing.expectEqual(@as(u32, seeds), p.converged);
+        try testing.expectEqual(@as(u32, seeds), p.agreed);
+    }
+
+    // Positive control 1: loss really happens. A perfect medium drops nothing
+    // (no fault is scheduled), every lossy one does, and more loss drops more.
+    try testing.expectEqual(@as(u64, 0), pts[0].drops);
+    var i: usize = 1;
+    while (i < rates.len) : (i += 1) {
+        try testing.expect(pts[i].drops > 0);
+        try testing.expect(pts[i].drops > pts[i - 1].drops);
+    }
+
+    // Positive control 2: the cost shows up where it should. With no loss the
+    // fabric settles at once; with loss it waits out retransmit timers, so it is
+    // strictly slower, and sends more LSPs than the lossless minimum.
+    try testing.expect(pts[0].change_sum < pts[2].change_sum);
+    try testing.expect(pts[2].change_sum < pts[4].change_sum);
+    try testing.expect(pts[0].lsp_tx < pts[4].lsp_tx);
+    // Bound: measured worst case over 16 seeds at 30% loss is 129 ticks (three
+    // 40-tick retransmit periods after the ~9-tick lossless settle); 400 leaves
+    // headroom for a different seed set without hiding a real regression.
+    try testing.expect(pts[4].change_max <= 400);
+}
+
+test "lossy medium: a per-link override impairs exactly that link" {
+    // Only the middle link B-C is lossy; A-B and C-D stay perfect.
+    const only_bc = [_]LinkOverride{
+        .{ .a = 1, .b = 2, .link = .{ .latency = link_latency, .loss_permille = 500 } },
+    };
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var opts = lossy_opts_base;
+    opts.link_overrides = &only_bc;
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xB0B, opts);
+    defer fab.deinit();
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lossy_step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    // The impaired link lost messages; the perfect ones lost none.
+    try testing.expect(fab.dropsBetween(1, 2) + fab.dropsBetween(2, 1) > 0);
+    try testing.expectEqual(@as(u64, 0), fab.dropsBetween(0, 1) + fab.dropsBetween(1, 0));
+    try testing.expectEqual(@as(u64, 0), fab.dropsBetween(2, 3) + fab.dropsBetween(3, 2));
+
+    // Control: the same seed with no override drops nothing anywhere.
+    var clean = try Fabric.initWithOptions(testing.allocator, topo, 0xB0B, lossy_opts_base);
+    defer clean.deinit();
+    try testing.expectEqual(Outcome.converged, try clean.runToConvergence(lossy_step_cap));
+    try testing.expectEqual(@as(u64, 0), clean.stats.net_dropped);
+}
+
+test "lossy medium: duplication alone is counted and harmless" {
+    // Duplication alone (no loss): the medium injects duplicates (seen in the
+    // counters) and the fabric still settles with one LSP per originator.
+    const s = try sweepLine(.{ .latency = link_latency, .dup_permille = 300 }, &.{}, 8);
+    try testing.expectEqual(@as(u32, 8), s.converged);
+    try testing.expectEqual(@as(u32, 8), s.agreed);
+    try testing.expectEqual(@as(u64, 0), s.drops);
+    var edges: [3]Edge = undefined;
+    var fab = try Fabric.initWithOptions(testing.allocator, lineTopology(&edges), 5, .{
+        .retransmit_interval = 40,
+        .link = .{ .latency = link_latency, .dup_permille = 300 },
+    });
+    defer fab.deinit();
+    _ = try fab.runToConvergence(lossy_step_cap);
+    try testing.expect(fab.stats.net_duplicated > 0);
+}
+
+test "determinism: a lossy run replays byte-for-byte, and a re-run of the same Fabric matches" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var opts = lossy_opts_base;
+    opts.link = .{ .latency = link_latency, .jitter = 2, .loss_permille = 200, .dup_permille = 100, .reorder_permille = 100, .reorder_extra = 5 };
+
+    var f1 = try Fabric.initWithOptions(testing.allocator, topo, 0xD1CE, opts);
+    defer f1.deinit();
+    var f2 = try Fabric.initWithOptions(testing.allocator, topo, 0xD1CE, opts);
+    defer f2.deinit();
+    _ = try f1.runToConvergence(lossy_step_cap);
+    _ = try f2.runToConvergence(lossy_step_cap);
+    try testing.expect(std.meta.eql(f1.stats, f2.stats));
+    try testing.expect(f1.last_log.eql(&f2.last_log));
+    try testing.expect(f1.stats.net_dropped > 0);
+
+    // The reset contract: the very same Fabric driven again starts from the t=0
+    // baseline (netsim calls `reset`), so it reproduces its own first run.
+    const first = f1.stats;
+    _ = try f1.runToConvergence(lossy_step_cap);
+    try testing.expect(std.meta.eql(first, f1.stats));
+    try testing.expect(f1.last_log.eql(&f2.last_log));
+}
+
+// ── LSP aging, refresh and purge in the run ─────────────────────────────────
+//
+// `Options.aging` drives `isis-lsdb`'s `tick` from the simulated clock on every
+// node. Defaults are ISO's own numbers at one tick = one second: MaxAge 1200, an
+// originator refreshes when 300 remain (i.e. at age 900), ZeroAgeLifetime 60,
+// aging timer every 10 ticks.
+
+const age_ring = [_]Edge{
+    .{ .a = 0, .b = 1, .metric = 10 },
+    .{ .a = 1, .b = 2, .metric = 10 },
+    .{ .a = 2, .b = 3, .metric = 10 },
+    .{ .a = 3, .b = 0, .metric = 10 },
+};
+
+test "aging: steady state over several lifetimes — every LSP refreshed, none purged" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA6E, .{ .aging = .{} });
+    defer fab.deinit();
+
+    // 4 000 ticks = 3.3 MaxAges. Refreshes fall at ages 900, 1800, 2700, 3600.
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(4_000));
+    try testing.expectEqual(@as(?anyerror, null), fab.violation);
+    try testing.expect(fab.lsdbsAgree());
+
+    // Nothing was purged or removed — while the aging path demonstrably ran: 4
+    // nodes × 4 refreshes, so every originator is at sequence 1 + 4 everywhere.
+    try testing.expectEqual(@as(u64, 0), fab.stats.purges_entered);
+    try testing.expectEqual(@as(u64, 0), fab.stats.purges_removed);
+    try testing.expectEqual(@as(u64, 16), fab.stats.refreshes);
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        try testing.expectEqual(@as(u32, 5), fab.selfSequence(node));
+        var origin: NodeId = 0;
+        while (origin < 4) : (origin += 1) {
+            try testing.expectEqual(@as(?u32, 5), fab.storedSequence(node, origin));
+            // Refreshed at age 3 600, so ~600 of 1 200 remain at the end, never 0.
+            const rem = fab.remainingLifetime(node, origin).?;
+            try testing.expect(rem > 300 and rem <= 1_200);
+        }
+    }
+    // SPF still routes over the aged database.
+    try testing.expectEqual(systemIdForNode(1), (try fab.reaches(testing.allocator, 0, 3)).?);
+}
+
+test "aging: refresh survives a lossy medium" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var seed: u64 = 1;
+    var refreshes: u64 = 0;
+    var drops: u64 = 0;
+    while (seed <= 8) : (seed += 1) {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, seed *% 0x9E3779B97F4A7C15, .{
+            .aging = .{},
+            .retransmit_interval = 40,
+            .link = .{ .latency = link_latency, .loss_permille = 200 },
+        });
+        defer fab.deinit();
+        try testing.expectEqual(Outcome.converged, try fab.runToConvergence(4_000));
+        try testing.expectEqual(@as(?anyerror, null), fab.violation);
+        try testing.expect(fab.lsdbsAgree());
+        try testing.expectEqual(@as(u64, 0), fab.stats.purges_entered);
+        refreshes += fab.stats.refreshes;
+        drops += fab.stats.net_dropped;
+    }
+    try testing.expectEqual(@as(u64, 8 * 16), refreshes);
+    try testing.expect(drops > 0); // the loss was real
+}
+
+test "aging: an originator that dies is purged everywhere, then removed, and SPF drops it" {
+    // Ring A-B-C-D-A; C (node 2) crashes at t = 1000, after its refresh at 900.
+    // Nobody is told — only aging can remove its LSP: the copies last refreshed
+    // at ~902-906 reach Remaining Lifetime 0 at ~2102-2106 (first tick: 2110).
+    const dead: NodeId = 2;
+    const Run = struct {
+        fn go(horizon: Time) !Fabric {
+            var fab = try Fabric.initWithOptions(testing.allocator, .{ .node_count = 4, .edges = &age_ring }, 0xDEAD, .{ .aging = .{} });
+            errdefer fab.deinit();
+            fab.crash = .{ .node = dead, .time = 1_000 };
+            try testing.expectEqual(Outcome.converged, try fab.runToConvergence(horizon));
+            try testing.expectEqual(@as(?anyerror, null), fab.violation);
+            return fab;
+        }
+    };
+    const alive = [_]NodeId{ 0, 1, 3 };
+
+    // Before MaxAge: the dead node's LSP is still there and still routed to.
+    {
+        var fab = try Run.go(1_500);
+        defer fab.deinit();
+        for (alive) |n| {
+            try testing.expect(fab.holds(n, dead) and !fab.holdsPurge(n, dead));
+            try testing.expect(fab.remainingLifetime(n, dead).? > 0);
+        }
+        try testing.expect((try fab.reaches(testing.allocator, 0, dead)) != null);
+        try testing.expectEqual(@as(u64, 0), fab.stats.purges_entered);
+    }
+    // Just after MaxAge: the purge is in every alive database (flooded as a
+    // header-only zero-lifetime LSP), held for ZeroAgeLifetime, and SPF has
+    // already stopped using the dead node.
+    {
+        var fab = try Run.go(2_130);
+        defer fab.deinit();
+        for (alive) |n| try testing.expect(fab.holdsPurge(n, dead));
+        try testing.expect(fab.stats.purges_entered >= 1);
+        try testing.expectEqual(@as(u64, 0), fab.stats.purges_removed);
+        try testing.expect((try fab.reaches(testing.allocator, 0, dead)) == null);
+        try testing.expect((try fab.reaches(testing.allocator, 0, 1)) != null);
+    }
+    // After ZeroAgeLifetime: removed everywhere; the survivors agree and their own
+    // LSPs kept refreshing throughout.
+    {
+        var fab = try Run.go(3_000);
+        defer fab.deinit();
+        for (alive) |n| {
+            try testing.expect(!fab.holds(n, dead));
+            try testing.expect(fab.holds(n, n));
+            try testing.expect(fab.selfSequence(n) >= 3);
+        }
+        try testing.expectEqual(@as(u64, 3), fab.stats.purges_removed);
+        try testing.expect(fab.lsdbsAgree());
+        try testing.expect((try fab.reaches(testing.allocator, 0, dead)) == null);
+        try testing.expect((try fab.reaches(testing.allocator, 0, 1)) != null);
+        // Nothing but the dead node's LSP was ever purged.
+        try testing.expect(fab.stats.purges_entered <= 3);
+    }
+}
+
+test "aging: NEGATIVE CONTROL — with refresh disabled every LSP is purged in steady state" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+
+    // Control: with refresh the identical fabric, same horizon, purges nothing.
+    var live = try Fabric.initWithOptions(testing.allocator, topo, 0xC0DE, .{ .aging = .{} });
+    defer live.deinit();
+    try testing.expectEqual(Outcome.converged, try live.runToConvergence(1_230));
+    try testing.expectEqual(@as(u64, 0), live.stats.purges_entered);
+    try testing.expectEqual(@as(u64, 4), live.stats.refreshes);
+
+    // Refresh off: at ~1206-1209 every copy of another node's LSP reaches
+    // Remaining Lifetime 0 (first tick after: 1210), so at 1230 all 12 foreign
+    // copies are purges, while each node's own LSP is never purged by its own
+    // aging (it is flagged for refresh — and ignored).
+    var dead = try Fabric.initWithOptions(testing.allocator, topo, 0xC0DE, .{ .aging = .{ .refresh = false } });
+    defer dead.deinit();
+    _ = try dead.runToConvergence(1_230);
+    try testing.expectEqual(@as(?anyerror, null), dead.violation);
+    try testing.expectEqual(@as(u64, 0), dead.stats.refreshes);
+    try testing.expect(dead.stats.purges_entered >= 12);
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        var origin: NodeId = 0;
+        while (origin < 4) : (origin += 1) {
+            if (origin == node) {
+                try testing.expect(!dead.holdsPurge(node, origin));
+            } else {
+                try testing.expect(dead.holdsPurge(node, origin));
+            }
+        }
+    }
+    // And the fabric no longer agrees on live topology: nobody can route.
+    try testing.expect((try dead.reaches(testing.allocator, 0, 3)) == null);
+    try testing.expect((try live.reaches(testing.allocator, 0, 3)) != null);
+}
+
+test "aging: replaying an aging run reproduces it (reset restores the aging state)" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0x5EED, .{ .aging = .{} });
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(2_000));
+    const first = fab.stats;
+    const seq = fab.selfSequence(0);
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(2_000));
+    try testing.expect(std.meta.eql(first, fab.stats));
+    try testing.expectEqual(seq, fab.selfSequence(0));
+    try testing.expect(fab.stats.refreshes > 0);
+}
+
+test "TEETH: a live LSP vanishing during an aging run is still a violation" {
+    // With aging on the sequence invariant must still catch an LSP that leaves
+    // the database WITHOUT having been purged first (a purge-then-remove is the
+    // only legal exit). `broken_wipe_node` drops a whole database mid-run.
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0x5E9, .{ .aging = .{} });
+    defer fab.deinit();
+    fab.broken_wipe_node = 2;
+    try testing.expectEqual(Outcome.safety_violated, try fab.runToConvergence(2_000));
+    try testing.expectEqual(@as(?anyerror, error.SequenceRegression), fab.violation);
 }

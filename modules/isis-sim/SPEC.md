@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) interop suite | Go | Apache-2.0 — README only | 0 | v0.9.0 (2026-09-25) | "Continuous interop against FRR" (README) — tests a real daemon against a real peer, not a model. |
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` tests | Rust | MIT | 541 | v0.9.0 | Packet-level and northbound conformance tests; no in-process multi-node simulator found *(inferred from the source listing)*. |
 
-**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, point-to-point only, lossless medium, no adjacency FSM (a netsim link *is* the adjacency), no aging/refresh (`tick` never called), no LAN/DIS, no fault fuzzing, no traffic (SPEC §8). It proves the composition works; it is not a lab a user configures.
+**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, point-to-point only, no adjacency FSM (a netsim link *is* the adjacency — so a dead node is found only by its LSP aging out, never by a hold timer), no LAN/DIS, no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10) and LSP aging, refresh and purge (SPEC §11) are in the run; what is still missing there is the *interaction* with a real adjacency layer. It proves the composition works; it is not a lab a user configures.
 
 ## 1. What this module is
 
@@ -93,12 +93,21 @@ the harness owns all per-node isis state in `ctx`.
   cannot repair, and therefore the configuration in which the CSNP resync path is
   measurable at all. Measured result in `fabric.zig` (`MEASURED:` tests): SNPs
   dropped → 1 of 4 originators recovered; SNPs reconciled → 4 of 4, with the
-  retransmit interval inert in both.
-- **checkFn** enforces `lsdb.count() ≤ node_count` on every node after every
-  event (a runaway/corruption tripwire).
-- **resetFn** deinits+re-inits every LSDB/scheduler and clears seq/link_failed to
-  the t=0 baseline (allocation-free: `deinit` frees, the re-`init`s allocate
-  nothing), so the same ctx can be replayed repeatedly.
+  retransmit interval inert in both. With `Options.aging` set, `onStart` also
+  arms the per-node aging timer (`timer_age`, §11), whose handler `tick`s the LSDB
+  and re-originates the node's own LSP when it is due.
+- **checkFn** enforces, on every node after every event, `lsdb.count() ≤
+  node_count` (a runaway/corruption tripwire) and that a stored sequence number
+  never goes backwards and an LSP a node holds never disappears. With aging on
+  (§11) the second rule relaxes by exactly one legal exit: an LSP may vanish
+  only if the last state `check` saw for it was a purge (§7.3.16.4: purge, hold
+  for ZeroAgeLifetime, remove); a live copy vanishing is still a violation
+  (`TEETH: a live LSP vanishing during an aging run…`).
+- **resetFn** deinits+re-inits every LSDB/scheduler (with the aging config, if
+  any) and clears seq/link_failed, the per-run invariant state and the `Stats`
+  counters to the t=0 baseline (allocation-free: `deinit` frees, the re-`init`s
+  allocate nothing), so the same ctx can be replayed repeatedly — pinned for both
+  the lossy and the aging configuration by the two replay tests.
 
 ### Why link-state changes are a *timer*, not an observation
 
@@ -130,19 +139,21 @@ would flood at all. And it must be *deterministic*, because every copy of an
 originator's LSP at a given sequence number must compare `.same` under
 `isis-lsdb`'s §7.3.16.1 rule (a differing checksum against an active copy reads
 as *newer* and re-floods forever) — which holds, because every node holds the
-identical bytes the originator emitted. Remaining
-Lifetime is stamped high and the harness never `tick`s the LSDBs, so nothing ages
-during a run (aging races are deferred, §7).
+identical bytes the originator emitted. The
+Remaining Lifetime stamped is `Options.aging.lifetime` (MaxAge) when aging is on
+(§11); otherwise it is stamped high and the harness never `tick`s the LSDBs, so
+nothing ages during the run.
 
 ## 5. Convergence, quiescence, and reconvergence
 
 - **Flooding.** SRM-flagged LSPs are flooded by `isis-flood.poll`, sent to the
   neighbour on each effect's circuit; the receiver's `insert` sets SRM (flood
   onward) and SSN (ack); the ack (PSNP) reconciles into the sender's LSDB and
-  clears SRM. The medium is **lossless** (no netsim loss/dup configured), so every
-  flooded LSP is acknowledged and SRM clears without retransmission —
-  `min_lsp_transmission_interval` is set beyond the run horizon so retransmit is
-  inert and flooding is purely event-driven. Exactly one (initial) CSNP fires per
+  clears SRM. By default the medium is **lossless** (`Options.link` has no
+  loss/dup), so every flooded LSP is acknowledged and SRM clears without
+  retransmission — `min_lsp_transmission_interval` is set beyond the run horizon
+  so retransmit is inert and flooding is purely event-driven. An impaired medium
+  (§10) must lower `Options.retransmit_interval`, or a dropped LSP is never resent. Exactly one (initial) CSNP fires per
   circuit (the CSNP cadence is set beyond the horizon), exercising the
   `reconcileCsnp` path without periodic churn.
 - **Self-terminating re-arm.** `pollAndSend` re-arms the poll only when the poll
@@ -197,12 +208,16 @@ always working regardless, this test would stop failing.
 - **Adjacency FSM (`isis-adj`).** A netsim link is the adjacency; no hello /
   three-way handshake / hold-timer. This is the one stack layer the capstone omits.
 - **Node crash / restart.** A control-plane cold restart *is* modelled
-  (`Fabric.restart`, above) because it is the only way to exercise CSNP resync.
-  netsim's own transport-level `crash_node` / `restart_node`, and LSP
-  purge/refresh-on-restart races, remain out of scope.
-- **LSP purge & aging races.** The harness never `tick`s the LSDBs, so
-  MaxAge/ZeroAgeLifetime purge and self-refresh do not interleave with flooding
-  here.
+  (`Fabric.restart`, above) because it is the only way to exercise CSNP resync,
+  and a permanent transport-level crash is modelled (`Fabric.crash`, §11) because
+  it is the way to make an LSP age out. A crashed node **restarting** (netsim
+  `restart_node`), and the purge/refresh-on-restart races that follow, remain out
+  of scope — they need a restarted node to re-learn a sequence number from its
+  neighbours' copies of its own LSP.
+- **LSP purge & aging races.** In scope since §11 (P2P, lossless and lossy):
+  refresh, MaxAge purge, ZeroAgeLifetime removal. Not modelled: a node that
+  *purges its own* LSP on purpose (graceful shutdown), sequence-number
+  exhaustion, and Remaining-Lifetime decrement in transit.
 - **LAN / pseudonodes.** P2P circuits only; no DIS, no pseudonode LSPs.
 - **SPB data-plane.** Control-plane convergence only; no `l2forward`/PBB
   forwarding.
@@ -214,20 +229,128 @@ always working regardless, this test would stop failing.
 
 ## 9. Verification
 
-`zig build test-isis-sim`, green in Debug + ReleaseFast, `zig fmt` clean. The
-tests are the golden-topology convergence + SPF-consistency + reconvergence +
-partition + quiescence + determinism proofs plus the positive control, all under
+`zig build test-isis-sim`, `zig fmt` clean. The tests are the golden-topology
+convergence + SPF-consistency + reconvergence + partition + quiescence +
+determinism proofs plus the positive control, the lossy-medium `MEASURED:` sweep
+(§10) and the aging scenarios with their negative control (§11), all under
 `std.testing.allocator` (leak-checked). See `README.md` for the per-test summary.
 Provenance: composes sibling modules over `netsim`; clean-room from ISO/IEC 10589,
 no third-party source ported — no `/NOTICE` entry.
+
+## 10. Lossy medium
+
+`Options.link` (fabric-wide) and `Options.link_overrides` (one undirected link,
+both directions) carry a `netsim.LinkConfig`: latency, jitter, `loss_permille`,
+`dup_permille`, `reorder_permille`/`reorder_extra`. `buildScenario` applies the
+override that matches an edge, else `link`; an override naming no edge is an
+assertion at `init`, so a typo cannot become a silently perfect link.
+
+**Why flooding survives loss.** On P2P `isis-lsdb` clears SRM only when the
+neighbour demonstrably holds the LSP (PSNP ack, or a summary comparing `.same`),
+so every undelivered LSP leaves SRM set at the sender and the retransmit timer
+(`Options.retransmit_interval`, `isis-flood`'s `min_lsp_transmission_interval`)
+sends it again. This is *retransmission*, not CSNP: a CSNP can only re-set an
+SRM that is already set (§5, and the restart measurement in §3). The retransmit
+interval must therefore be inside the horizon on any lossy run.
+
+**What is measured** (`Stats`, one `runToConvergence`; sums over seeds 1..16 on
+the 4-node line, retransmit interval 40, `fabric.zig`
+`MEASURED: convergence time and LSP retransmissions grow with the loss rate`):
+
+| loss | converged | messages dropped | LSPs sent | last LSDB change (mean / worst tick) |
+|--:|--:|--:|--:|--:|
+| 0 %  | 16/16 | 0   | 192 | 9 / 9 |
+| 5 %  | 16/16 | 32  | 220 | 35 / 86 |
+| 10 % | 16/16 | 91  | 269 | 67 / 129 |
+| 20 % | 16/16 | 167 | 338 | 84 / 129 |
+| 30 % | 16/16 | 209 | 363 | 92 / 129 |
+
+`Stats.last_change` is the convergence time (the last tick at which any LSDB
+changed); "LSPs sent" counts every LSP PDU handed to the medium, so its excess
+over the lossless 192 is the retransmission cost. The test asserts: every seed
+converges and agrees at every rate; **drops are 0 at 0 % and strictly increase
+with the rate** (positive control: an ignored loss setting drops nothing);
+convergence is strictly slower at 10 % than 0 % and at 30 % than 10 %; LSPs sent
+at 30 % exceed the lossless count; worst case ≤ 400 ticks. Companion tests: a
+per-link override drops on exactly that link (`dropsBetween`, from the netsim
+event log kept in `Fabric.last_log`) and nowhere else; duplication alone is
+counted and harmless; a lossy run replays byte-for-byte and re-running the same
+`Fabric` reproduces it (reset contract).
+
+**Modelled vs real.** Loss is i.i.d. per message from netsim's seeded PRNG — no
+burst loss, no per-PDU-type loss, no queue overflow. `net_dropped` counts every
+`drop` in the netsim log, i.e. also messages arriving over a severed link or at
+a crashed node, so "loss happened" is only meaningful on a run with no
+`link_down`/crash (the tests using it are such runs).
+
+## 11. LSP aging, refresh and purge
+
+`Options.aging: ?Aging` turns on ISO/IEC 10589 §7.3.16.4 aging. Every node arms
+a `timer_age` every `tick_interval`; its handler (`ageNode`) calls
+`isis-lsdb`'s `tick(now)` with the sim clock, then, if the node's own LSP is
+flagged `refresh_pending`, re-originates it at a bumped sequence number
+(landing above any `challenge_sequence`), and re-arms. `tick` itself does the
+rest: a non-self LSP whose Remaining Lifetime reaches 0 becomes a purge
+(header-only, SRM on every circuit — the existing flooding path carries it), and
+a purge is removed `zero_age_lifetime` later; a self LSP is never purged by
+aging, only flagged. A received newer copy of, or purge for, one's *own* LSP
+(§7.3.16.1 own-LSP rule) triggers re-origination above the challenger.
+
+**Scaling.** One tick = one second of protocol time, so the `Aging` defaults are
+ISO's numbers unchanged: MaxAge (`lifetime`) 1200, refresh at 900
+(`refresh_threshold` 300 remaining), ZeroAgeLifetime 60, aging timer every 10.
+It is the network that is not to scale: a hop costs 2 ticks (plus 1 poll delay),
+i.e. seconds instead of milliseconds, which only widens every race window. A
+run of 4 000 ticks is 3.3 lifetimes and costs ~1 s of Debug test time.
+`readTime()` is the horizon when aging is on (lifetimes are judged at the end of
+the run — SPF excludes zero-lifetime and purged LSPs) and 0 otherwise.
+
+**Crash.** `Fabric.crash = .{ .node, .time }` adds netsim's `crash_node`
+(permanent). Neighbours are not told — there is no hello/hold timer (§8) — so
+the crashed node's LSP is removed by aging alone, which is the point of the
+scenario. The crashed node and circuits toward it are ignored by the quiescence
+test and by `lsdbsAgree` (a frozen database is not part of the fabric).
+
+**Scenarios (all in `fabric.zig`).**
+- *Steady state*: 4-node line, 4 000 ticks, lossless: `purges_entered == 0`,
+  `purges_removed == 0`, `refreshes == 16` (4 nodes × refreshes at ages 900,
+  1800, 2700, 3600), every LSP at sequence 5 on every node, remaining lifetime
+  in (300, 1200], all LSDBs agree, SPF routes. The same over a 20 % lossy
+  medium on 8 seeds (retransmission carries each refresh): 128 refreshes, no
+  purge, and drops > 0.
+- *Dead originator*: ring A-B-C-D, node C crashes at 1 000 (after its refresh at
+  900). At horizon 1 500 its LSP is still held, unpurged and routed to; at
+  2 130 (first expiry tick 2 110) every survivor holds it as a **purge** and SPF
+  no longer routes to C; at 3 000 (purge held 60) it is removed at all three
+  survivors (`purges_removed == 3`), the survivors agree and their own LSPs
+  kept refreshing.
+- *Negative control*: `Aging{ .refresh = false }` — at 1 230 all 12 foreign copies
+  on the line are purges while the fabric with refresh, same horizon, has purged
+  nothing (4 refreshes at age 900); SPF has no route. This proves the aging path
+  is live and that the steady-state result is refresh's doing, not a purge path
+  that never fires.
+- *Reset/replay*: re-running an aging `Fabric` reproduces its stats and sequence.
+- *TEETH*: with aging on, `check` still reports `SequenceRegression` when a live
+  LSP vanishes without having been a purge.
+
+**Modelled vs real.** No Remaining-Lifetime decrement in transit (a received
+copy is stamped fresh with the lifetime in the PDU), no random jitter of the
+refresh time (ISO §7.3.21 asks for one; all nodes refresh in lock-step at age
+900, which is the worst case for flood bursts), one LSP per node (no
+fragments), no purge-on-shutdown, no restart of the crashed node, and
+`Options.csnp_interval` stays inert in the aging tests — so a CSNP-driven
+*resurrection* of an already-purged LSP (a survivor that lags the others'
+expiry re-advertising it) is not exercised; the tick alignment of the nodes
+(all copies expire within one 10-tick window, far inside ZeroAgeLifetime) is
+what keeps that race closed here.
 
 ## Backlog / deferred
 
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
 - **Wire `isis-adj` into the fabric** (real hello exchange, hold-timer failure detection instead of the scheduled re-origination shim) (survey 2026-09-30). Why: removes the biggest caveat of the harness (SPEC §3) and exercises the adjacency layer under loss. Effort: ~2–3 days. Fits §2: yes.
-- **Arbitrary topology and fault-schedule input, larger fabrics, lossy medium** (survey 2026-09-30). Why: a user cannot describe their own fabric today; `netsim` already offers `run`/`shrink`. Effort: ~2 days. Fits §2: yes.
-- **Aging, purge and refresh in the run** (survey 2026-09-30). Why: MaxAge/ZeroAgeLifetime races are where real IS-IS bugs live. Effort: ~2 days. Fits §2: yes.
+- **Arbitrary topology and fault-schedule input, larger fabrics** (survey 2026-09-30; the *lossy medium* part of this item is done, §10). Why: a user cannot describe their own fabric today; `netsim` already offers `run`/`shrink`. Effort: ~2 days. Fits §2: yes.
+- ~~Aging, purge and refresh in the run~~ — done 2026-09-30, §11. What is left of it: graceful self-purge, restart of a crashed node, sequence exhaustion.
 
 ## Anchoring
 

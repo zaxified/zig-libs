@@ -21,8 +21,13 @@
 //!   - `runToConvergence(max_steps)` — drive the fabric through `netsim.replay`
 //!     to a quiesced steady state, or `.safety_violated` / `.event_cap_exceeded`
 //!     / `.not_quiescent` (see `Outcome`) short of it.
-//!   - `lsdbsAgree`, `routes`, `reaches`, `selfSequence`, `systemIdOf` — inspect
-//!     the converged state.
+//!   - `Fabric.initWithOptions(.., Options)` — impair the medium (`Options.link`
+//!     fabric-wide, `link_overrides` per link: loss / duplication / reordering /
+//!     jitter) and/or turn on LSP aging (`Options.aging`: `Lsdb.tick` driven from
+//!     the sim clock, own-LSP refresh, MaxAge purge). `Fabric.crash` stops a node.
+//!   - `lsdbsAgree`, `routes`, `reaches`, `selfSequence`, `systemIdOf`, `stats`,
+//!     `holds`, `holdsPurge`, `remainingLifetime`, `dropsBetween` — inspect the
+//!     converged state and what the run cost.
 
 const std = @import("std");
 
@@ -49,6 +54,10 @@ pub const Fabric = fabric.Fabric;
 pub const Topology = fabric.Topology;
 pub const Edge = fabric.Edge;
 pub const Outcome = fabric.Outcome;
+pub const Options = fabric.Options;
+pub const LinkOverride = fabric.LinkOverride;
+pub const Aging = fabric.Aging;
+pub const Stats = fabric.Stats;
 pub const SystemId = fabric.SystemId;
 pub const systemIdForNode = fabric.systemIdForNode;
 

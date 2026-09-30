@@ -77,4 +77,37 @@ pub fn main() !void {
     const reached = try fab.reaches(gpa, 0, 2);
     std.debug.print("node0 reaches node2: {}\n", .{reached != null});
     if (reached == null) return error.ExpectedReachability;
+
+    // ── the imperfect medium ────────────────────────────────────────────────
+    // The same ring, 20% of every link's messages dropped. Flooding still
+    // converges because unacknowledged LSPs are retransmitted; `stats` proves
+    // the loss was real (a silently perfect medium would report 0 drops).
+    var lossy = try isis_sim.Fabric.initWithOptions(gpa, .{ .node_count = 4, .edges = &edges }, 7, .{
+        .link = .{ .latency = 2, .loss_permille = 200 },
+        .retransmit_interval = 40,
+    });
+    defer lossy.deinit();
+    if (try lossy.runToConvergence(20_000) != .converged) return error.LossyNotConverged;
+    if (!lossy.lsdbsAgree()) return error.LsdbsDisagree;
+    std.debug.print("lossy: {d} messages dropped, converged at t={d}\n", .{ lossy.stats.net_dropped, lossy.stats.last_change });
+    if (lossy.stats.net_dropped == 0) return error.LossWasIgnored;
+
+    // ── LSP aging: refresh keeps LSPs alive, a dead originator ages out ─────
+    // One tick = one second, so the default `Aging` is ISO's MaxAge 1200 /
+    // refresh at 900 / ZeroAgeLifetime 60. Node 2 crashes at t=1000 without
+    // telling anyone; 3000 ticks later its LSP has been purged and removed
+    // everywhere and no route to it is left, while the survivors' own LSPs
+    // kept being refreshed.
+    var aging = try isis_sim.Fabric.initWithOptions(gpa, .{ .node_count = 4, .edges = &edges }, 9, .{
+        .aging = .{},
+    });
+    defer aging.deinit();
+    aging.crash = .{ .node = 2, .time = 1_000 };
+    if (try aging.runToConvergence(3_000) != .converged) return error.AgingNotConverged;
+    std.debug.print("aging: {d} refreshes, {d} purges removed, node0 holds node2's LSP: {}\n", .{
+        aging.stats.refreshes, aging.stats.purges_removed, aging.holds(0, 2),
+    });
+    if (aging.holds(0, 2) or aging.stats.purges_removed == 0) return error.DeadLspNotAged;
+    if ((try aging.reaches(gpa, 0, 2)) != null) return error.DeadNodeStillRouted;
+    if ((try aging.reaches(gpa, 0, 1)) == null) return error.SurvivorUnreachable;
 }
