@@ -390,12 +390,17 @@ Survey findings (survey 2026-09-30), ranked by how often `ethtool(8)` users reac
 5. **`TSINFO_GET`** (survey 2026-09-30) — `ethtool -T`, first stop for PTP setup. Effort: small-medium.
 6. **Cable test (`CABLE_TEST_ACT`/`TDR`)** (survey 2026-09-30) — needs request/notification correlation. Effort: medium.
 
-Not deferred but **permanently out of scope**: the legacy `SIOCETHTOOL` ioctl
-API, and with it `ethtool -i` (drvinfo) and plain `ethtool -S` (the driver's
-private counter array). Neither has a netlink message; implementing them would
-mean a second, unrelated transport inside a module whose whole premise is the
-netlink one. A consumer that needs drvinfo should read
-`/sys/class/net/<dev>/device/{vendor,device}` and the driver link, or shell out.
+**Decided 2026-09-30 (user, option B): a small, bounded `SIOCETHTOOL` part — planned.**
+`ethtool -i` (drvinfo: driver, firmware version, bus id) and plain `ethtool -S` (the driver's
+private counter array) have no netlink message and never will; they are the reference tool's
+most-used calls. So this module gets exactly two ioctl entry points, `drvinfo()`
+(`ETHTOOL_GDRVINFO`) and `driverStats()` (`ETHTOOL_GSSET_INFO` + `ETHTOOL_GSTRINGS` +
+`ETHTOOL_GSTATS`), in pure Zig over `std.os.linux.ioctl`, with no libc, in their own
+`src/ioctl.zig`. That is what ethtool(8) itself does: netlink where a message exists, ioctl
+where none does. The kernel keeps these ioctls as stable uAPI. The earlier refusal ("a second,
+unrelated transport") holds for everything else. No other ioctl command is added, and nothing
+that netlink already covers is duplicated. Effort about 150–250 lines; anchor on captured
+`ethtool -i`/`-S` output from a real NIC, like the netlink goldens.
 
 Also deliberately absent: **SFF-8472 / SFF-8636 / CMIS decoding.**
 `moduleEeprom` returns raw bytes and stops there; turning them into vendor
