@@ -13,10 +13,8 @@
 //! No `std.heap.DebugAllocator`: this module allocates nowhere (module doc
 //! comment: "No allocator, no internal clock or RNG").
 //!
-//! No `otpauth://` URI form: the module has none (its whole surface is
-//! `hotp`/`totp`/`fmtCode`/`totpVerify` plus the RFC math underneath) — so
-//! that part of the brief has nothing to exercise here. Noted rather than
-//! invented.
+//! `otpauth://` URIs (`otp.otpauth`, added 2026-09-30) are exercised by their own
+//! tests in `src/otpauth.zig`, not here.
 //!
 //! No named-error negative vectors for HOTP/TOTP itself: `hotp`/`totp` take
 //! a caller-owned raw key and counter/time (not untrusted wire bytes), so

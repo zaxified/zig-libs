@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — New: `otp.otpauth` — `parse` / `format` for `otpauth://totp/`
+  and `otpauth://hotp/` provisioning URIs (Google Key Uri Format; output shape as
+  pyotp's `provisioning_uri`), bounded and allocation-free, with `KeyUri.totpCode`
+  / `hotpCode`. Secrets are base32 via the new `base32` module: `otp` now
+  **depends on `base32`** (`meta.deps`, `build.zig`). The module's former
+  `EMIT-ONLY` fuzz exemption is withdrawn; `parse` has a fuzz harness. Additive;
+  no existing API changed.
 - **2026-08-23** — **Breaking:** `fmtCode`, `hotpFmt`, and `totpFmt` return
   `FmtCodeError![]u8` (`error{OutputTooSmall}`) instead of `[]u8`. `fmtCode`
   used to guard `out.len >= digits` with `std.debug.assert` before writing

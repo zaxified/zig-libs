@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 238 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 239 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -563,7 +563,7 @@ way to recognise it.
 | [`ocspcache`](modules/ocspcache/README.md) | 2 | OCSP-stapling fetch + cache over `ocsp` — AIA responder discovery, verify-before-cache, refresh-ahead expiry, soft-fail on outage. | any | ocsp, http, x509 |
 | [`opaque`](modules/opaque/README.md) | 3 | OPAQUE — an asymmetric PAKE (RFC 9807), ristretto255-SHA-512 + 3DH — registration and login/AKE. Server compromise reveals no password. | any | voprf, ct25519 |
 | [`oscore`](modules/oscore/README.md) | 2 | OSCORE (RFC 8613) — end-to-end object security for CoAP: HKDF context derivation, AES-CCM AEAD, anti-replay sliding window. | any | — |
-| [`otp`](modules/otp/README.md) | 3 | HOTP + TOTP one-time passwords (RFC 4226 / RFC 6238) — the 2FA-authenticator primitive; caller supplies the counter/time (no wall clock). | any | — |
+| [`otp`](modules/otp/README.md) | 2 | HOTP + TOTP one-time passwords (RFC 4226 / RFC 6238) — the 2FA-authenticator primitive; caller supplies the counter/time (no wall clock); `otpauth://` provisioning-URI parse/format (base32 secrets). | any | base32 |
 | [`p256`](modules/p256/README.md) | 2 | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`paillier`](modules/paillier/README.md) | 2 | Paillier additively-homomorphic public-key encryption (EUROCRYPT 1999) — 2048-bit keygen, encrypt/decrypt, homomorphic add; const-time decrypt path. | any | montint |
 | [`pir`](modules/pir/README.md) | 4 | Two-server Private Information Retrieval over `fss`'s DPF — fetch a record without either server learning the index. **Two colluding servers recover it immediately.** | any | fss |
@@ -604,6 +604,7 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
+| [`base32`](modules/base32/README.md) | 3 | Base32 codec (RFC 4648 §6 + base32hex §7) — strict by default (canonical trailing bits, exact padding), opt-in lenient decode (optional padding, lowercase, whitespace); the encoding of TOTP secrets. | any | — |
 | [`blobmsg`](modules/blobmsg/README.md) | 2 | OpenWRT ubus client + blob/blobmsg wire codec. | **linux** (codec itself: any) | — |
 | [`cbor`](modules/cbor/README.md) | 3 | CBOR (RFC 8949) codec — all 8 major types, canonical encoding option, untrusted-input hardened; plus a minimal COSE (RFC 9052) layer. | any | — |
 | [`cookies`](modules/cookies/README.md) | 2 | HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded. | any | http |

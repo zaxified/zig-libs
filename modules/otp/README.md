@@ -13,6 +13,7 @@ RFC 6238 Appendix B table (all 6 times × 3 hash functions).** See
 | File | Contents |
 |---|---|
 | `src/root.zig` | `Algorithm`, `dynamicTruncate`, `hotp`/`hotpFmt`, `timeStep`, `totp`/`totpFmt`, `totpVerify`, `fmtCode` |
+| `src/otpauth.zig` | `otpauth://` provisioning URIs: `parse`, `format`, `KeyUri` (+ `totpCode`/`hotpCode`) |
 | `src/kat_vectors.zig` | RFC 4226 Appendix D + RFC 6238 Appendix B tables, embedded |
 | `src/kat_test.zig` | Full KAT assertions + verify-window tests |
 
@@ -65,8 +66,23 @@ const shown = otp.totpFmt(.sha1, secret, now_unix, 30, 0, 6, &buf);
 const ok = otp.totpVerify(.sha1, secret, now_unix, 30, 0, 6, submitted, 1);
 ```
 
-Secrets here are raw bytes: decode the Base32 form from a provisioning
-URI before calling (out of scope for this module — see `SPEC.md`).
+Secrets to `hotp`/`totp` are raw bytes. The Base32 form found in
+authenticator apps and `otpauth://` URIs is handled by `otp.otpauth`
+(backed by the `base32` module):
+
+```zig
+var buf: [2048]u8 = undefined; // uri.len bytes always suffice
+const k = try otp.otpauth.parse(uri, &buf); // slices point into buf
+const code = try k.totpCode(now_unix); // runtime algorithm/digits/period from the URI
+
+var w = std.Io.Writer.fixed(&out);
+try otp.otpauth.format(&w, k); // the URI pyotp's provisioning_uri would write
+```
+
+`parse` is bounded (`max_uri_len` = 2048), allocation-free and fail-closed
+(one typed error per fault). Unknown query parameters are ignored, a repeated
+known one is an error, `issuer=` must equal the label prefix when both are
+present, `digits` is 6..8, `period` 1..86400. `SPEC.md` lists every decision.
 
 ## Tests
 

@@ -23,16 +23,24 @@
 //! (HOTP) or the unix time (TOTP), so every result is reproducible and the
 //! RFC vectors are assertable as-is.
 //!
+//! `otpauth` parses and formats the `otpauth://totp/...` / `otpauth://hotp/...`
+//! provisioning URIs authenticator apps scan (secret in base32, via the
+//! `base32` module); the parser is bounded and allocation-free.
+//!
 //! Provenance: clean-room from RFC 4226 / RFC 6238 (public IETF
 //! specifications); test vectors transcribed from the RFC appendices.
 //! See `../NOTICE`.
 
 const std = @import("std");
 
+/// `otpauth://` provisioning URIs: `parse` (bounded, allocation-free) and
+/// `format`. See `otpauth.zig`.
+pub const otpauth = @import("otpauth.zig");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "HOTP + TOTP one-time passwords (RFC 4226 / RFC 6238) — the 2FA-authenticator primitive; caller supplies the counter/time (no wall clock).",
+    .doc = "HOTP + TOTP one-time passwords (RFC 4226 / RFC 6238) — the 2FA-authenticator primitive; caller supplies the counter/time (no wall clock); `otpauth://` provisioning-URI parse/format (base32 secrets).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -42,7 +50,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant, // all functions are pure
     .model_after = "RFC 4226 / RFC 6238 reference algorithms (pseudocode in the RFCs)",
-    .deps = .{}, // std.crypto.auth.hmac only
+    .deps = .{"base32"}, // secret decoding/encoding for otpauth:// URIs; HMAC is std.crypto.auth.hmac
 };
 
 /// HMAC hash function for the OTP, per RFC 6238 §1.2. RFC 4226 HOTP is
@@ -248,6 +256,7 @@ test "totpVerify accepts the correct code and rejects wrong ones (constant-time 
 }
 
 test {
+    _ = @import("otpauth.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
 }

@@ -36,6 +36,12 @@ documented in `src/kat_vectors.zig`.
 are used via their public APIs (MIT, part of Zig itself); nothing is
 reimplemented.
 
+`src/otpauth.zig` (added 2026-09-30) implements the Google Authenticator
+"Key Uri Format" (public wiki page, read for the format; its two example URIs
+are used as test vectors) and matches the output shape of pyotp's
+`provisioning_uri` (MIT; behaviour recalled from its documentation, no source
+copied).
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
 **Status: complete — HOTP, TOTP, formatting, and ±skew verification all
