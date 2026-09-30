@@ -40,7 +40,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01 issuance + renewal, ES256 JWS, CSR",
+    .doc = "Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.

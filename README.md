@@ -343,7 +343,7 @@ way to recognise it.
 | [`aaa-gate`](modules/aaa-gate/README.md) | 2 | Bearer + API-key auth (constant-time) + audit hook + denied-request throttle | any | router, http |
 | [`abuseguard`](modules/abuseguard/README.md) | 3 | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
 | [`accesslog`](modules/accesslog/README.md) | 2 | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge | any | http |
-| [`acme`](modules/acme/README.md) | 2 | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01 issuance + renewal, ES256 JWS, CSR | any | http, router, entropy |
+| [`acme`](modules/acme/README.md) | 2 | Let's Encrypt / ACME v2 (RFC 8555) — HTTP-01, TLS-ALPN-01 and DNS-01 (wildcard) issuance + renewal, ES256 JWS, CSR | any | http, router, entropy |
 | [`aescbc`](modules/aescbc/README.md) | 2 | Raw AES-CBC (NIST SP800-38A) + PKCS#7/XML-Enc padding helpers, zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 2 | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | — |
 | [`brotli`](modules/brotli/README.md) | 3 | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
