@@ -1,30 +1,80 @@
 // SPDX-License-Identifier: MIT
-//! Least-significant-bit-first bit reader over an in-memory Brotli stream.
+//! Least-significant-bit-first bit reader over a Brotli stream — an in-memory
+//! slice, or a `std.Io.Reader` pulled from as bits are needed.
 
 const std = @import("std");
 const BrotliError = @import("errors.zig").BrotliError;
 const huffman = @import("huffman.zig");
 
 pub const BitReader = struct {
+    /// The bytes at hand: the whole input for a slice, the reader's buffered
+    /// bytes for a stream.
     data: []const u8,
     byte_pos: usize = 0,
     acc: u64 = 0,
     cnt: u32 = 0, // number of valid low bits in `acc`
+    /// Streaming source; `data` is always a view of its buffer. Null for a
+    /// slice, and once the source has ended or failed.
+    source: ?*std.Io.Reader = null,
+    /// The source reported `ReadFailed` (not an end of stream): the caller
+    /// turns the resulting `TruncatedInput` back into that.
+    read_failed: bool = false,
+    /// Bytes consumed from `source` in earlier chunks.
+    consumed_before: u64 = 0,
 
     pub fn init(data: []const u8) BitReader {
         return .{ .data = data };
     }
 
+    /// Pull from `r`. Its buffer must be non-empty. Up to 8 bytes past the
+    /// end of the Brotli stream may be consumed from it (the accumulator reads
+    /// ahead); `finish` gives back what `data` still holds.
+    pub fn initStream(r: *std.Io.Reader) BitReader {
+        return .{ .data = r.buffered(), .source = r };
+    }
+
+    /// Input bytes taken so far (into the accumulator or copied out).
+    pub fn consumedBytes(self: *const BitReader) u64 {
+        return self.consumed_before + self.byte_pos;
+    }
+
+    /// Hand the unread part of the current chunk back to the source.
+    pub fn finish(self: *BitReader) void {
+        const r = self.source orelse return;
+        r.toss(self.byte_pos);
+        self.consumed_before += self.byte_pos;
+        self.byte_pos = 0;
+        self.data = r.buffered();
+    }
+
+    /// `data` is used up: fetch the next chunk. False at the end of input
+    /// (always, for a slice).
+    fn nextChunk(self: *BitReader) bool {
+        const r = self.source orelse return false;
+        r.toss(self.byte_pos);
+        self.consumed_before += self.byte_pos;
+        self.byte_pos = 0;
+        self.data = &.{};
+        // `fillMore` may add nothing without it being the end of the stream
+        // (its own doc); only `EndOfStream` is.
+        while (true) {
+            r.fillMore() catch |err| {
+                if (err == error.ReadFailed) self.read_failed = true;
+                self.source = null;
+                return false;
+            };
+            self.data = r.buffered();
+            if (self.data.len != 0) return true;
+        }
+    }
+
     fn refill(self: *BitReader) void {
-        while (self.cnt <= 56 and self.byte_pos < self.data.len) {
+        while (self.cnt <= 56) {
+            if (self.byte_pos == self.data.len and !self.nextChunk()) return;
             self.acc |= @as(u64, self.data[self.byte_pos]) << @intCast(self.cnt);
             self.byte_pos += 1;
             self.cnt += 8;
         }
-    }
-
-    pub fn availableBits(self: *const BitReader) usize {
-        return self.cnt + (self.data.len - self.byte_pos) * 8;
     }
 
     fn mask(n: u32) u64 {
@@ -80,19 +130,24 @@ pub const BitReader = struct {
             dst[i] = @truncate(self.acc & 0xff);
             self.dropBits(8);
         }
-        const remaining = dst.len - i;
-        if (remaining == 0) return;
-        if (self.byte_pos + remaining > self.data.len) return error.TruncatedInput;
-        @memcpy(dst[i..], self.data[self.byte_pos..][0..remaining]);
-        self.byte_pos += remaining;
+        while (i < dst.len) {
+            if (self.byte_pos == self.data.len and !self.nextChunk()) return error.TruncatedInput;
+            const n = @min(dst.len - i, self.data.len - self.byte_pos);
+            @memcpy(dst[i..][0..n], self.data[self.byte_pos..][0..n]);
+            self.byte_pos += n;
+            i += n;
+        }
     }
 
     /// Skip `n` byte-aligned bytes. Precondition: byte aligned.
     pub fn skipAlignedBytes(self: *BitReader, n: usize) BrotliError!void {
         var rem = n;
         while (rem > 0 and self.cnt >= 8) : (rem -= 1) self.dropBits(8);
-        if (rem == 0) return;
-        if (self.byte_pos + rem > self.data.len) return error.TruncatedInput;
-        self.byte_pos += rem;
+        while (rem > 0) {
+            if (self.byte_pos == self.data.len and !self.nextChunk()) return error.TruncatedInput;
+            const k = @min(rem, self.data.len - self.byte_pos);
+            self.byte_pos += k;
+            rem -= k;
+        }
     }
 };

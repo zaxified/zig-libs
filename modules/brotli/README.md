@@ -40,6 +40,11 @@ const brotli = @import("brotli");
 const out = try brotli.decompress(gpa, input, .{});          // default cap 256 MiB
 const out = try brotli.decompress(gpa, input, .{ .max_output = 8 << 20 });
 
+// Streaming: reader in, writer out. Memory is the window (≤ 16 MiB, and
+// only as much as the output needs), not the output.
+const n = try brotli.decompressStream(gpa, &body_reader, &file_writer, .{});
+// Errors: brotli.StreamError = BrotliError + ReadFailed + WriteFailed.
+
 // Compress. Fails only on allocation — blocks that will not shrink are
 // stored verbatim, so the result is always a valid `br` body.
 const br = try brotli.compress(gpa, data);

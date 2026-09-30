@@ -55,6 +55,11 @@ pub const Options = decoder.Options;
 /// Decompress a complete Brotli stream. Caller owns the returned slice.
 pub const decompress = decoder.decompress;
 
+/// Decompress from a `std.Io.Reader` to a `std.Io.Writer`, holding only the
+/// window — never the whole output. See `decoder.decompressStream`.
+pub const decompressStream = decoder.decompressStream;
+pub const StreamError = decoder.StreamError;
+
 /// Compress `input` into a valid Brotli stream. Caller owns the returned slice.
 /// Fails only on allocation: any block that will not compress is stored
 /// verbatim, so the result is always a conformant `br` body.
@@ -70,6 +75,7 @@ test {
     // fixtures — no python3, no child process, no skip path. The live run that
     // produced them is `tools/interop.zig`.
     _ = @import("interop_replay_test.zig");
+    _ = @import("stream_test.zig");
 }
 
 fn expectDecodes(comptime name: []const u8) !void {
@@ -549,8 +555,24 @@ fn fuzzDecompress(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
 
-    const r = decompress(testing.allocator, buf[0..len], .{ .max_output = 1 << 20 });
-    if (r) |ok| testing.allocator.free(ok) else |_| {}
+    const opts: Options = .{ .max_output = 1 << 20 };
+    const r = decompress(testing.allocator, buf[0..len], opts);
+    defer if (r) |ok| testing.allocator.free(ok) else |_| {};
+
+    // Differential: the streaming decoder shares the decoding logic but not
+    // the bit input or the output store, so on every input it must reach the
+    // same verdict — the same bytes, or the same error. (Under this cap the
+    // ratio bound cannot differ: `min_output_floor` equals `max_output`.)
+    var in: std.Io.Reader = .fixed(buf[0..len]);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const sr = decompressStream(testing.allocator, &in, &out.writer, opts);
+    if (r) |ok| {
+        _ = try sr;
+        try testing.expectEqualSlices(u8, ok, out.written());
+    } else |e| {
+        try testing.expectError(e, sr);
+    }
 }
 
 test "corpus: every reference stream reaches the decoder, and the output is pinned" {

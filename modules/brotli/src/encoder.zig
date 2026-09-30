@@ -963,6 +963,13 @@ fn writeStoreBlock(w: *BitWriter, bytes: []const u8) std.mem.Allocator.Error!voi
 /// (or cannot encode smaller than its raw bytes) is stored verbatim instead, so
 /// the output is always a conformant `Content-Encoding: br` body.
 pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {
+    return compressBlocks(gpa, input, compressed_block_size);
+}
+
+/// `compress` with a chosen meta-block size (1..`compressed_block_size`).
+/// Internal: tests use a small one to get a stream of many meta-blocks.
+pub fn compressBlocks(gpa: std.mem.Allocator, input: []const u8, block_size: usize) std.mem.Allocator.Error![]u8 {
+    std.debug.assert(block_size >= 1 and block_size <= compressed_block_size);
     var w = BitWriter{ .gpa = gpa };
     errdefer w.buf.deinit(gpa);
 
@@ -988,7 +995,7 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
     var emitted_last = false;
     var off: usize = 0;
     while (off < input.len) {
-        const n = @min(input.len - off, compressed_block_size);
+        const n = @min(input.len - off, block_size);
         const end = off + n;
         const is_last = end == input.len;
 

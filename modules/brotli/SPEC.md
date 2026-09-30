@@ -20,14 +20,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [google/brotli](https://github.com/google/brotli) — **reference** | C | MIT | 14.9k | v1.2.0 (2025-10-27) | The yardstick and this module's interop oracle. Qualities 0–11, streaming encoder and decoder, large-window mode, custom/shared dictionaries, `q11` ratio (`alice29.txt` 46 487 B vs ours 54 605 B). This module: decoder complete and byte-exact for RFC 7932 streams, but one-shot only, one fixed encoder "quality", no large window. |
+| [google/brotli](https://github.com/google/brotli) — **reference** | C | MIT | 14.9k | v1.2.0 (2025-10-27) | The yardstick and this module's interop oracle. Qualities 0–11, streaming encoder and decoder, large-window mode, custom/shared dictionaries, `q11` ratio (`alice29.txt` 46 487 B vs ours 54 605 B). This module: decoder complete and byte-exact for RFC 7932 streams, one-shot or streaming (since 2026-09-30), one fixed encoder "quality", no large window. |
 | [dropbox/rust-brotli](https://github.com/dropbox/rust-brotli) | Rust | BSD-3-Clause (repo also carries `LICENSE.MIT`) | 943 | pushed 2026-09-02 (crates.io releases continue; GitHub releases stale) | Pure-Rust port of the reference: all qualities, streaming, `no_std`, multithreaded compress. *(inferred from README)* |
 | [andybalholm/brotli](https://github.com/andybalholm/brotli) | Go | MIT | 736 | pushed 2026-09-30 (no releases; tagged versions) | Go translation of the reference C: qualities 0–11, `io.Reader`/`io.Writer` streaming; the common Go choice for `Content-Encoding: br`. |
 | [muhammad-fiaz/brotli.zig](https://github.com/muhammad-fiaz/brotli.zig) | Zig | MIT | 1 | pushed 2026-08-24 (no releases) | A native-Zig Brotli of unverified completeness *(README not evaluated in depth; inferred)*. |
 | [akunaakwei/zig-brotli](https://github.com/akunaakwei/zig-brotli) / [Scythe-Technology/zbrotli](https://github.com/Scythe-Technology/zbrotli) | Zig (wrap C) | zlib / MIT | 1 / 0 | pushed 2026-04-18 / 2026-06-05 | Build-system wrappers or bindings for google/brotli's C — full features, but link C. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.16.0 | `flate`, `zstd` (decoder), `lzma`, `xz`; **no brotli** (checked by module README, not re-verified against 0.16.0's `lib/std/compress/`). |
 
-**Where we are ahead:** pure Zig with no C — unlike the wrappers, an HTTPS server gets `br` decoding with no C toolchain; complete RFC 7932 decoder (static dictionary, all context modes) with a typed-error/no-panic posture and an enforced output cap; encoder output verified by the reference decoder over 45 input shapes; hermetic suite replaying captured reference streams. **Where we are behind:** no streaming API (decode or encode), no quality levels and a weak encoder (no block splitting, no context modelling, no dictionary references, no distance short codes; 17 % worse than `q11`, ~3× worse on runs), no large-window, no custom dictionary (→ Backlog items).
+**Where we are ahead:** pure Zig with no C — unlike the wrappers, an HTTPS server gets `br` decoding with no C toolchain; complete RFC 7932 decoder (static dictionary, all context modes) with a typed-error/no-panic posture and an enforced output cap; encoder output verified by the reference decoder over 45 input shapes; hermetic suite replaying captured reference streams. **Where we are behind:** no streaming encoder (the decoder streams since 2026-09-30, `decompressStream`), no quality levels and a weak encoder (no block splitting, no context modelling, no dictionary references, no distance short codes; 17 % worse than `q11`, ~3× worse on runs), no large-window, no custom dictionary (→ Backlog items).
 
 ## Scope & honesty
 
@@ -147,6 +147,36 @@ block the encoder cannot encode at all (a give-up error rather than a bad
 stream) is stored too. So `compress` is never more than a few bytes of framing
 larger than its input, and `compress` itself never fails except on allocation.
 
+## Streaming decoder (`decompressStream`, 2026-09-30)
+
+- **Push design, one function:** `decompressStream(gpa, in: *std.Io.Reader, out: *std.Io.Writer,
+  options) StreamError!u64` pulls bits from `in` as it needs them and writes output to `out` at the
+  end of every meta-block and whenever the window fills. A pull-style `std.Io.Reader` over the
+  decompressed bytes would need the decoder to suspend mid-command; not done (Backlog).
+- **One decoder, two output stores.** The decoding logic is `DecoderOf(Sink)`; `ListSink` is the
+  one-shot `decompress` (the whole output is the window, as before), `RingSink` the stream. The bit
+  reader is the same too: over a slice, or over a reader's buffer, fetching the next chunk only on
+  the slow path. So the two cannot disagree on a verdict — and the differential fuzz driver checks
+  exactly that (below).
+- **Memory = window, and only as much of it as the output needs.** The ring holds the last
+  `1 << WBITS` bytes (every backward distance fits: `max_backward` is 16 less). It starts at 64 KiB and
+  doubles while the output is still shorter than the window — before its first wrap it is linear, so
+  growing is a copy — so a 43-byte body under a 4 MiB window costs 64 KiB. Under a `max_output` below
+  the window the ring stops at that cap. Per-meta-block tables live in an arena reset at the start of
+  every meta-block (both decoders), so a long stream's tables do not pile up: 1024 meta-blocks measured
+  2.11 MB peak with the reset, 2.98 MB without.
+- **The ratio bound needs the input length, which a stream does not know.** `RingSink` measures it
+  against the input consumed so far, so a stream whose output runs ahead of its input by more than
+  `max_ratio` past `min_output_floor` is refused even if the whole body would have passed
+  `decompress`. An uncompressed meta-block counts its own bytes as consumed (`reserveStored`) —
+  without that, a stored block above the 1 MiB floor was refused as a bomb before its bytes arrived
+  (pinned by a test on 1.25 MiB of stored blocks).
+- **The two ends' failures are themselves:** `ReadFailed` from `in` (not the `TruncatedInput` it would
+  otherwise surface as) and `WriteFailed` from `out`. `std.Io.Reader.fillMore` may add no bytes
+  without it being the end of the stream (its own contract); only `EndOfStream` ends the input.
+- **Read-ahead:** the bit accumulator reads up to 8 bytes ahead, so bytes after the Brotli stream on
+  the same reader may be consumed; `in` must have a non-empty buffer.
+
 ## DoS / safety posture
 
 - **Output cap**: `decompress(gpa, input, .{ .max_output = N })` bounds the
@@ -228,6 +258,23 @@ larger than its input, and `compress` itself never fails except on allocation.
 - All tests pass in **Debug** and **ReleaseFast** (`zig build test-brotli`
   [`-Doptimize=ReleaseFast`]).
 
+- **Streaming decoder** (`src/stream_test.zig`): every committed vector and all 24 google/brotli
+  streams decode to their plaintext through `decompressStream` — whole, in 61-byte pieces, and the
+  small ones in 1/3/7-byte slivers (chunk boundaries at every decoder state); our encoder's streams for
+  seven interop shapes; every truncation of four streams fails with *the same error* as `decompress`;
+  memory (a peak-tracking allocator): 4 MiB out through a 2 MiB window stays under 3.25 MiB, a 43-byte
+  body under a 4 MiB window under 256 KiB, 1024 meta-blocks' tables do not accumulate; the cap, the
+  ratio floor, stored blocks above the floor; `ReadFailed`/`WriteFailed` from failing ends.
+- **Differential fuzz driver** (`BROTLI_FUZZ=<runs>[,<seed>]`, testkit's deterministic driver):
+  valid streams damaged in their headers, truncated or spliced, fed to both decoders (the streaming
+  one in random piece sizes) — the verdicts must match, bytes or error. 2026-09-30: 230 000 runs
+  (≈3 000/s, ReleaseSafe) clean; reach per run: ≈32 % decoded, the rest spread over truncation, prefix
+  code, dictionary, distance and cap errors. Harness checked by planted mutants (schemata, one build):
+  4 of 5 killed (a ring that never flushes, `back(d)` off by one, growth that loses the history, a
+  chunk boundary that drops a byte); the survivor — the stored copy ignoring the unwritten-bytes bound
+  — is equivalent, because the ring is flushed at the end of every meta-block, so that bound never
+  binds at the start of a stored block.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -240,7 +287,7 @@ larger than its input, and `compress` itself never fails except on allocation.
 ## Backlog / deferred
 
 
-- **Streaming decoder (`std.Io.Reader`)** *(survey 2026-09-30)* — every other Brotli library streams; one-shot forces a whole-body buffer, a real cost for HTTP clients decoding large `br` responses. Effort: medium (the decoder state machine is already meta-block structured; needs resumable bit input). Fits CONVENTIONS §2.
+- ~~**Streaming decoder (`std.Io.Reader`)** *(survey 2026-09-30)*~~ — **DONE 2026-09-30** as `decompressStream` (push: reader in, writer out; see § "Streaming decoder"). Still open: a pull-style `std.Io.Reader` over the decompressed bytes (needs a decoder that suspends mid-command), and giving back the read-ahead bytes after the stream.
 - **Streaming encoder (`std.Io.Writer`) + quality levels** *(survey 2026-09-30)* — a server wants to compress chunks as it writes, and to trade speed for ratio; today there is one setting. Effort: medium for streaming, large for real levels. Fits §2.
 - **Encoder quality: block splitting, literal context modelling, static-dictionary references, distance short codes** *(survey 2026-09-30)* — the unimplemented items already listed under "Deliberately not implemented" are what separate us from `q5`–`q11` (17 % on `alice29.txt`, far more on repetitive data). Effort: large each. Fits §2 (all are RFC 7932 features; clean-room from the RFC).
 - **Large-window extension and custom (shared) dictionaries** *(survey 2026-09-30)* — decoder currently rejects WBITS > 24 as `InvalidWindowBits`; rarely met on the web, so low priority. Effort: small-medium. Fits §2.

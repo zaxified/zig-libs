@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Streaming decoder: `decompressStream(gpa, reader, writer, options)`** (maturity
+  task C19, first half). Memory is the window — grown from 64 KiB only as far as the output needs —
+  never the whole output; output reaches the writer at every meta-block end. The one-shot and the
+  streaming decoder share one decoding core (`DecoderOf(Sink)`) and one bit reader, and a new
+  deterministic differential fuzz driver (`BROTLI_FUZZ`) holds them to the same verdict on damaged
+  streams. Also, for both: per-meta-block tables are freed at every meta-block instead of at the end
+  (a long stream's tables no longer accumulate). New `StreamError`; `decompress`'s behaviour is
+  unchanged (all interop replays pass as before).
+
 - **2026-09-09** — The nine source files without an SPDX header have one: MIT, matching the
   two that already did. 229 of 231 modules carry the header on `root.zig`, and this was one
   of the two that did not — awkwardly, the module that carries an attribution CONDITION for
