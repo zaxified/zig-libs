@@ -3,7 +3,9 @@
 //! quic-crypto — the RFC 9001 (Using TLS to Secure QUIC) CRYPTO SEAM:
 //! Initial-secret derivation (§5.2), per-secret key/iv/hp derivation (§5.1),
 //! AEAD packet protection (§5.3), header protection (§5.4), and key update
-//! (§6). **Engine-agnostic and standalone** — it owns NO QUIC transport state
+//! (§6), the Retry Integrity Tag (§5.8), and the QUIC v2 (RFC 9369) variants
+//! of all of it, selected by a `Version` (`.v1` is the default of the
+//! unsuffixed functions). **Engine-agnostic and standalone** — it owns NO QUIC transport state
 //! machine: no streams, no loss detection, no ACK logic, no handshake flight,
 //! no packet-number reconstruction. It transforms caller-supplied bytes
 //! (connection IDs, traffic secrets, packet headers, payloads, packet
@@ -69,14 +71,24 @@ pub const initial = @import("initial.zig");
 pub const keyschedule = @import("keyschedule.zig");
 pub const protection = @import("protection.zig");
 pub const headerprot = @import("headerprot.zig");
+pub const version = @import("version.zig");
+pub const retry = @import("retry.zig");
 
 // Convenience re-exports of the most-used public symbols.
 pub const initial_salt_v1 = initial.initial_salt_v1;
 pub const InitialSecrets = initial.InitialSecrets;
+pub const initial_salt_v2 = initial.initial_salt_v2;
 pub const deriveInitialSecrets = initial.deriveInitialSecrets;
+pub const deriveInitialSecretsFor = initial.deriveInitialSecretsFor;
 pub const PacketKeys = keyschedule.PacketKeys;
 pub const derivePacketKeys = keyschedule.derivePacketKeys;
+pub const derivePacketKeysFor = keyschedule.derivePacketKeysFor;
 pub const advanceKeys = keyschedule.advanceKeys;
+pub const advanceKeysFor = keyschedule.advanceKeysFor;
+pub const Version = version.Version;
+pub const LongPacketType = version.LongPacketType;
+pub const computeRetryTag = retry.computeRetryTag;
+pub const verifyRetryTag = retry.verifyRetryTag;
 pub const Protection = protection.Protection;
 pub const HeaderForm = headerprot.HeaderForm;
 
@@ -95,7 +107,7 @@ pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 9001 (TLS for QUIC) crypto seam — secret derivation, AEAD packet protection, header protection, key update; engine-agnostic.",
+    .doc = "RFC 9001 (TLS for QUIC) crypto seam — secret derivation, AEAD packet protection, header protection, key update, Retry integrity tag, QUIC v1 + v2 (RFC 9369); engine-agnostic.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -128,6 +140,9 @@ test {
     _ = keyschedule;
     _ = protection;
     _ = headerprot;
+    _ = version;
+    _ = retry;
+    _ = @import("rfc9369_vectors.zig");
 }
 
 test "meta.deps is exactly {chachapoly} — quic-crypto still does not import dtls" {

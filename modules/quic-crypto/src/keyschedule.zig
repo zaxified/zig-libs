@@ -24,6 +24,9 @@
 //! pattern), which is exactly correct here and must NOT be forked.
 
 const std = @import("std");
+const version = @import("version.zig");
+
+pub const Version = version.Version;
 
 /// The per-secret packet-protection material RFC 9001 §5.1 derives. `key`
 /// and `hp` are `key_len` wide (16 for AES-128-GCM, 32 for AES-256-GCM /
@@ -56,10 +59,23 @@ pub fn derivePacketKeys(
     comptime key_len: usize,
     traffic_secret: [Hkdf.prk_length]u8,
 ) PacketKeys(key_len) {
+    return derivePacketKeysFor(.v1, Hkdf, key_len, traffic_secret);
+}
+
+/// `derivePacketKeys` for an explicit QUIC version: `.v1` uses the
+/// `"quic key"`/`"quic iv"`/`"quic hp"` labels, `.v2` the RFC 9369 §3.3.2
+/// `"quicv2 key"`/`"quicv2 iv"`/`"quicv2 hp"` labels. Nothing else differs.
+pub fn derivePacketKeysFor(
+    ver: Version,
+    comptime Hkdf: type,
+    comptime key_len: usize,
+    traffic_secret: [Hkdf.prk_length]u8,
+) PacketKeys(key_len) {
+    const l = ver.labels();
     return .{
-        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, "quic key", "", key_len),
-        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, "quic iv", "", 12),
-        .hp = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, "quic hp", "", key_len),
+        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.key, "", key_len),
+        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.iv, "", 12),
+        .hp = std.crypto.tls.hkdfExpandLabel(Hkdf, traffic_secret, l.hp, "", key_len),
     };
 }
 
@@ -94,11 +110,23 @@ pub fn advanceKeys(
     comptime key_len: usize,
     current_secret: [Hkdf.prk_length]u8,
 ) KeyUpdate(Hkdf, key_len) {
-    const next_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, current_secret, "quic ku", "", Hkdf.prk_length);
+    return advanceKeysFor(.v1, Hkdf, key_len, current_secret);
+}
+
+/// `advanceKeys` for an explicit QUIC version (`.v2`: `"quicv2 ku"`,
+/// `"quicv2 key"`, `"quicv2 iv"` — RFC 9369 §3.3.2). hp still unchanged.
+pub fn advanceKeysFor(
+    ver: Version,
+    comptime Hkdf: type,
+    comptime key_len: usize,
+    current_secret: [Hkdf.prk_length]u8,
+) KeyUpdate(Hkdf, key_len) {
+    const l = ver.labels();
+    const next_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, current_secret, l.ku, "", Hkdf.prk_length);
     return .{
         .next_secret = next_secret,
-        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, "quic key", "", key_len),
-        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, "quic iv", "", 12),
+        .key = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.key, "", key_len),
+        .iv = std.crypto.tls.hkdfExpandLabel(Hkdf, next_secret, l.iv, "", 12),
         // hp is intentionally NOT re-derived — RFC 9001 §6.1.
     };
 }

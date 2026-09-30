@@ -2,7 +2,7 @@
 
 The **RFC 9001 (Using TLS to Secure QUIC) crypto seam** — Initial-secret
 derivation, per-secret key/iv/hp derivation, AEAD packet protection, header
-protection, and key update. **Engine-agnostic and standalone:** it owns no
+protection, key update, the Retry Integrity Tag (§5.8) and QUIC v2 (RFC 9369). **Engine-agnostic and standalone:** it owns no
 QUIC transport state machine (no streams, no loss detection, no ACK logic, no
 handshake flight, no packet-number reconstruction) — it transforms
 caller-supplied bytes into key material / protected-or-opened bytes and back.
@@ -39,6 +39,14 @@ record and the threat model.
   first byte, read the PN length from its low 2 bits, THEN unmask that many
   packet-number bytes.
 
+- **`src/retry.zig` — §5.8 Retry integrity tag.** `computeRetryTag(ver, odcid,
+  retry_no_tag)` (server) and `verifyRetryTag(ver, odcid, retry_packet)`
+  (client; typed `error.IntegrityFailed`, no allocator).
+- **`src/version.zig` — QUIC v1 / v2 (RFC 9369).** `Version` (`.v1`, `.v2`) with
+  the per-version Initial salt, HKDF labels, Retry key/nonce and long-header
+  packet-type codes. `deriveInitialSecretsFor`, `derivePacketKeysFor`,
+  `advanceKeysFor` take a `Version`; the unsuffixed functions stay v1.
+
 ## Import
 
 ```zig
@@ -66,6 +74,20 @@ const mask = quic.headerprot.computeMaskAes(&k.hp, sample);
 try quic.headerprot.apply(packet, .long, pn_offset, pn_len, mask);          // send
 const r = try quic.headerprot.remove(packet, .long, pn_offset, mask);        // receive => r.pn_len
 ```
+
+```zig
+// QUIC v2 (RFC 9369): the same calls with a Version; v1 is the default.
+const s2 = quic.deriveInitialSecretsFor(.v2, client_dcid);
+const k2 = quic.derivePacketKeysFor(.v2, HkdfSha256, 16, s2.client_initial_secret);
+
+// §5.8 Retry integrity: server appends the tag, client verifies it.
+const tag = try quic.computeRetryTag(.v1, odcid, retry_without_tag);
+try quic.verifyRetryTag(.v1, odcid, retry_packet_with_tag); // error.IntegrityFailed on mismatch
+```
+
+Choosing the version (RFC 9368 negotiation, Retry uses the original version)
+and parsing the version-specific long-header type bits
+(`Version.longPacketTypeBits`) are the transport's job.
 
 ## Verify
 

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Retry Integrity Tag (RFC 9001 §5.8) and QUIC v2 (RFC 9369).**
+  New `retry.computeRetryTag` / `verifyRetryTag` (AES-128-GCM over the Retry
+  Pseudo-Packet, fixed per-version key/nonce) and `Version` (`.v1`, `.v2`) with
+  `deriveInitialSecretsFor`, `derivePacketKeysFor`, `advanceKeysFor` (v2 salt
+  and `quicv2 *` labels), plus the v2 Retry key/nonce and the v1/v2 long-header
+  packet-type codes. The existing unsuffixed functions are unchanged and mean
+  v1. Anchored on RFC 9001 A.4 and RFC 9369 A.1-A.5, byte-exact, with negative
+  tests. Scope raised from mvp to core: the module now covers the crypto a
+  client or server needs for v1 and v2 including Retry.
+
 - **2026-09-07** — **Test-only: `fuzzRemove` called `remove` with an EMPTY
   packet, a zero offset and an all-zero mask on every run, and so never got
   past its first line.** The harness drew `smith.bytes(&packet)` and then four

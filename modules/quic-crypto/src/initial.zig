@@ -13,15 +13,18 @@
 //! `deriveInitialSecrets` byte-exact.
 
 const std = @import("std");
+const version = @import("version.zig");
+
+pub const Version = version.Version;
 
 /// RFC 9001 §5.2: the fixed QUIC v1 HKDF-Extract salt used to derive the
 /// Initial secret from the client's Destination Connection ID. "Future
 /// versions of QUIC SHOULD generate a new salt value" — this constant is
 /// version-specific (v1), not a QUIC-wide invariant.
-pub const initial_salt_v1: [20]u8 = .{
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-};
+pub const initial_salt_v1: [20]u8 = version.initial_salt_v1;
+
+/// RFC 9369 §3.3.1: the fixed QUIC v2 Initial salt.
+pub const initial_salt_v2: [20]u8 = version.initial_salt_v2;
 
 /// The two directional secrets §5.2 derives from one Destination Connection
 /// ID. Always 32 bytes (SHA-256) — RFC 9001 §5.2: "The hash function for
@@ -52,8 +55,16 @@ pub const InitialSecrets = struct {
 /// prefix fork the way RFC 9147/DTLS 1.3 does (see root.zig's module doc,
 /// "the key finding", and SPEC.md).
 pub fn deriveInitialSecrets(client_dcid: []const u8) InitialSecrets {
+    return deriveInitialSecretsFor(.v1, client_dcid);
+}
+
+/// `deriveInitialSecrets` for an explicit QUIC version: the same §5.2 chain
+/// with that version's Initial salt (RFC 9369 §3.3.1 for `.v2`). The
+/// `"client in"` / `"server in"` labels are NOT versioned — RFC 9369 §3.3.2
+/// changes only the key/iv/hp/ku labels.
+pub fn deriveInitialSecretsFor(ver: Version, client_dcid: []const u8) InitialSecrets {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    const initial_secret = Hkdf.extract(&initial_salt_v1, client_dcid);
+    const initial_secret = Hkdf.extract(ver.initialSalt(), client_dcid);
     return .{
         .client_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "client in", "", 32),
         .server_initial_secret = std.crypto.tls.hkdfExpandLabel(Hkdf, initial_secret, "server in", "", 32),
@@ -103,4 +114,23 @@ test "deriveInitialSecrets: App. A.1 client + server initial secrets" {
     const s = deriveInitialSecrets(&client_dst_connection_id);
     try testing.expectEqualSlices(u8, &rfc_client_initial_secret, &s.client_initial_secret);
     try testing.expectEqualSlices(u8, &rfc_server_initial_secret, &s.server_initial_secret);
+}
+
+// RFC 9369 Appendix A.1 (p. 8-9 of the RFC text): the same DCID under the v2
+// salt. Values copied from https://www.rfc-editor.org/rfc/rfc9369.txt.
+test "deriveInitialSecretsFor(.v2): RFC 9369 App. A.1 initial secrets" {
+    const initial_secret = HkdfSha256.extract(&initial_salt_v2, &client_dst_connection_id);
+    try testing.expectEqualSlices(u8, &hexTo(32, "2062e8b3cd8d52092614b8071d0aa1fb7c2e3ac193f78b280e72d8f5751f6aba"), &initial_secret);
+    const s = deriveInitialSecretsFor(.v2, &client_dst_connection_id);
+    try testing.expectEqualSlices(u8, &hexTo(32, "14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b"), &s.client_initial_secret);
+    try testing.expectEqualSlices(u8, &hexTo(32, "0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1"), &s.server_initial_secret);
+}
+
+test "deriveInitialSecretsFor(.v1) is deriveInitialSecrets; v1 and v2 differ" {
+    const a = deriveInitialSecrets(&client_dst_connection_id);
+    const b = deriveInitialSecretsFor(.v1, &client_dst_connection_id);
+    try testing.expectEqualSlices(u8, &a.client_initial_secret, &b.client_initial_secret);
+    try testing.expectEqualSlices(u8, &a.server_initial_secret, &b.server_initial_secret);
+    const c = deriveInitialSecretsFor(.v2, &client_dst_connection_id);
+    try testing.expect(!std.mem.eql(u8, &a.client_initial_secret, &c.client_initial_secret));
 }
