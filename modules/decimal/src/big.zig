@@ -543,6 +543,128 @@ pub const BigDecimal = struct {
     pub const stripTrailingZeros = normalize;
 
     // -----------------------------------------------------------------
+    // Float bridge — the ONLY place an `f64` meets this type. Nothing
+    // above or below calls these: no arithmetic path (`add`/`sub`/`mul`/
+    // `div`/`rescale`/`sqrt`/`pow`/…) takes, returns or computes with a
+    // float, so the module's no-float guarantee holds for every
+    // computation; a pipeline that never calls these entry points is
+    // float-free. Even here no floating-point *arithmetic* happens: an
+    // `f64` is only bit-inspected on the way in (`f64Binary`,
+    // `f64Shortest`) and handed to `std.fmt.parseFloat` on the way out.
+    // -----------------------------------------------------------------
+
+    /// `NotFinite` = the input was NaN or ±Inf (refused, never a trap and
+    /// never a silent 0). The rest is `rescale`'s error set.
+    pub const FromFloatError = error{NotFinite} || Error;
+
+    /// The **exact** value of a finite `f64` — Python's `Decimal.from_float`.
+    /// An `f64` is `m × 2^e`, so it is a terminating decimal: for `e < 0`,
+    /// `m × 2^e = m × 5^(-e) × 10^e`, and the result is `m × 5^(-e)` at
+    /// exponent `e` (`0.1` becomes the 55-digit
+    /// `0.1000000000000000055511151231257827021181583404541015625`; the
+    /// smallest subnormal is 751 significant digits). `m` is taken odd, so
+    /// the exponent is the shortest one that still holds the value exactly
+    /// (`0.5` is `5` at exponent −1). Nothing is rounded. `-0.0` and `0.0`
+    /// both give zero. `error.NotFinite` on NaN / ±Inf.
+    pub fn fromFloatExact(allocator: Allocator, x: f64) (error{NotFinite} || Allocator.Error)!BigDecimal {
+        const p = try f64Binary(x);
+        var coeff = try Managed.initSet(allocator, p.m);
+        errdefer coeff.deinit();
+        var exponent: i32 = 0;
+        if (p.m != 0) {
+            if (p.e >= 0) {
+                var shifted = try Managed.init(allocator);
+                errdefer shifted.deinit();
+                try shifted.shiftLeft(&coeff, @intCast(p.e));
+                coeff.deinit();
+                coeff = shifted;
+            } else {
+                var five = try Managed.initSet(allocator, 5);
+                defer five.deinit();
+                var p5 = try Managed.init(allocator);
+                defer p5.deinit();
+                try p5.pow(&five, @intCast(-p.e));
+                var prod = try Managed.init(allocator);
+                errdefer prod.deinit();
+                try prod.mul(&coeff, &p5);
+                coeff.deinit();
+                coeff = prod;
+                exponent = p.e;
+            }
+            coeff.setSign(!p.neg);
+        }
+        return .{ .coeff = coeff, .exponent = exponent };
+    }
+
+    /// `x` converted **exactly** (`fromFloatExact`) and then rounded to
+    /// `new_scale` fractional digits (result exponent `-new_scale`; a negative
+    /// scale rounds to tens/hundreds/…) with the caller's explicit `mode` —
+    /// the same `rescale` path every other rounding-sensitive op uses, so
+    /// there is exactly one rounding step and no double rounding. Consequence
+    /// worth knowing: `2.675` is stored as `2.67499999999999982…`, i.e.
+    /// *below* the tie, so `fromFloat(2.675, 2, .half_up)` is `2.67`, not
+    /// `2.68` — this is what Python's `Decimal(2.675).quantize(Decimal('0.01'),
+    /// ROUND_HALF_UP)` gives. For "what the user typed" use `fromFloatShortest`.
+    /// `error.NotFinite` on NaN / ±Inf; `error.Overflow` when the scale or
+    /// the digits to drop exceed `max_align_shift`.
+    pub fn fromFloat(allocator: Allocator, x: f64, new_scale: i32, mode: RoundingMode) FromFloatError!BigDecimal {
+        const exponent: i32 = std.math.cast(i32, -@as(i64, new_scale)) orelse return error.Overflow;
+        var exact = try fromFloatExact(allocator, x);
+        defer exact.deinit();
+        return rescale(allocator, exact, exponent, mode);
+    }
+
+    /// The **shortest decimal that round-trips** to `x` — what Zig's `{d}`/`{e}`
+    /// float formatting prints and Python's `repr(x)` shows: `0.1` is exactly
+    /// `1` at exponent −1, not the 55-digit binary expansion. This is the
+    /// "what the user typed" reading; it is not the value of the `f64`
+    /// (`toFloat(fromFloatShortest(x)) == x` for every finite `x`, but
+    /// `fromFloatShortest(x)` and `fromFloatExact(x)` differ). No rounding is
+    /// involved (≤ 17 significant digits); use `rescale` afterwards to
+    /// quantize. `error.NotFinite` on NaN / ±Inf.
+    pub fn fromFloatShortest(allocator: Allocator, x: f64) (error{NotFinite} || Allocator.Error)!BigDecimal {
+        const p = try f64Shortest(x);
+        var coeff = try Managed.initSet(allocator, p.digits);
+        errdefer coeff.deinit();
+        if (p.digits != 0) coeff.setSign(!p.neg);
+        return .{ .coeff = coeff, .exponent = p.exp10 };
+    }
+
+    /// The nearest `f64` to this value, **correctly rounded, ties to even**
+    /// (IEEE 754 roundTiesToEven), subnormals included. Implemented by
+    /// writing the exact digits as `<coeff>e<exponent>` and handing them to
+    /// `std.fmt.parseFloat(f64, …)`, which is correctly rounded for any
+    /// number of digits (Eisel–Lemire with an exact big-decimal fallback);
+    /// no floating-point arithmetic is done here. Exponent-only magnitudes
+    /// are short-circuited first, so a hostile exponent (`1e2000000000`)
+    /// never reaches the parser as a huge string.
+    ///
+    /// **Out of range is not an error** (total function, like Python's
+    /// `float(Decimal('1e400'))` → `inf`, and like IEEE conversion): a value
+    /// beyond the largest finite `f64` (or exactly at the rounding tie above
+    /// it) is `±inf`; a value below half of the smallest subnormal
+    /// underflows to a signed zero (`-1e-400` → `-0.0`; an actual zero
+    /// `BigDecimal` is `+0.0`). Consequence: the conversion is not
+    /// invertible at the edges — `fromFloat` refuses the `inf` it produces.
+    /// Only allocation can fail.
+    pub fn toFloat(self: BigDecimal, allocator: Allocator) Allocator.Error!f64 {
+        if (self.isZero()) return 0.0;
+        const digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
+        defer allocator.free(digits);
+        const neg = digits[0] == '-';
+        // Decimal exponent of the leading digit: value ∈ [10^adj, 10^(adj+1)).
+        const adj: i64 = @as(i64, @intCast(digits.len - @as(usize, @intFromBool(neg)))) - 1 + self.exponent;
+        // f64 max ≈ 1.8e308 and half the smallest subnormal ≈ 2.5e-324, so
+        // these cut-offs are safely outside the rounding window.
+        if (adj > 310) return if (neg) -std.math.inf(f64) else std.math.inf(f64);
+        if (adj < -326) return std.math.copysign(@as(f64, 0.0), if (neg) -1.0 else 1.0);
+        const text = try std.fmt.allocPrint(allocator, "{s}e{d}", .{ digits, self.exponent });
+        defer allocator.free(text);
+        // Well-formed by construction: optional '-', decimal digits, 'e', integer.
+        return std.fmt.parseFloat(f64, text) catch unreachable;
+    }
+
+    // -----------------------------------------------------------------
     // Accessors — no arithmetic, no rounding decision.
     // -----------------------------------------------------------------
 
@@ -848,6 +970,62 @@ pub const BigDecimal = struct {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// A finite `f64` as sign × `m` × 2^`e`, `m` odd (or 0 with `e == 0`).
+/// Pure bit inspection — no floating-point arithmetic. Shared with root.zig's
+/// `Decimal.fromFloat`; not part of the public API (root.zig does not
+/// re-export it).
+pub const F64Binary = struct { neg: bool, m: u64, e: i32 };
+
+pub fn f64Binary(x: f64) error{NotFinite}!F64Binary {
+    const bits: u64 = @bitCast(x);
+    const neg = (bits >> 63) != 0;
+    const exp_bits: u32 = @intCast((bits >> 52) & 0x7ff);
+    const frac: u64 = bits & ((@as(u64, 1) << 52) - 1);
+    if (exp_bits == 0x7ff) return error.NotFinite; // NaN or ±Inf
+    var m: u64 = undefined;
+    var e: i32 = undefined;
+    if (exp_bits == 0) {
+        m = frac; // subnormal (or zero): frac × 2^-1074
+        e = -1074;
+    } else {
+        m = frac | (@as(u64, 1) << 52); // normal: (2^52 + frac) × 2^(exp - 1075)
+        e = @as(i32, @intCast(exp_bits)) - 1075;
+    }
+    if (m == 0) return .{ .neg = neg, .m = 0, .e = 0 };
+    const tz: u6 = @intCast(@ctz(m));
+    return .{ .neg = neg, .m = m >> tz, .e = e + @as(i32, tz) };
+}
+
+/// A finite `f64` as sign × `digits` × 10^`exp10`, `digits` the shortest
+/// decimal significand that round-trips (what Zig's `{d}`/`{e}` print;
+/// ≤ 17 digits, no trailing zeros except for the value 0). Shared with
+/// root.zig; not re-exported.
+pub const F64Decimal = struct { neg: bool, digits: u64, exp10: i32 };
+
+pub fn f64Shortest(x: f64) error{NotFinite}!F64Decimal {
+    if (!std.math.isFinite(x)) return error.NotFinite;
+    // Scientific, full precision (no `precision` option) = shortest
+    // round-trip: "-1.5e0", "1e-1", "5e-324", "1.7976931348623157e308".
+    var buf: [std.fmt.float.min_buffer_size]u8 = undefined;
+    const text = std.fmt.float.render(&buf, x, .{ .mode = .scientific }) catch unreachable; // 53 bytes always suffice
+    var i: usize = 0;
+    const neg = text[0] == '-';
+    if (neg) i += 1;
+    var digits: u64 = 0;
+    var frac_digits: i32 = 0;
+    var seen_dot = false;
+    while (text[i] != 'e') : (i += 1) {
+        if (text[i] == '.') {
+            seen_dot = true;
+            continue;
+        }
+        digits = digits * 10 + (text[i] - '0');
+        if (seen_dot) frac_digits += 1;
+    }
+    const exp = std.fmt.parseInt(i32, text[i + 1 ..], 10) catch unreachable; // "e" + optional '-' + digits
+    return .{ .neg = neg, .digits = digits, .exp10 = if (digits == 0) 0 else exp - frac_digits };
+}
 
 /// Exact: multiply `coeff` by `10^shift`. This is the "gain precision"
 /// direction (used by `add`/`sub` alignment and `rescale`'s widening
@@ -1752,6 +1930,257 @@ test "decTest: power.decTest (integer exponents)" {
         };
     }
     try testing.expectEqual(@as(usize, 130), n);
+}
+
+// ---------------------------------------------------------------------------
+// Float bridge — every expected value below comes from an EXTERNAL oracle:
+// Python 3's `decimal` module (exact `Decimal(float)` construction, `quantize`
+// with each ROUND_* mode) and `float(Decimal(str))` / `float(str)` (correctly
+// rounded, ties to even). The Python expression is quoted at each check; the
+// modes are always listed in `RoundingMode` order:
+//   [HALF_EVEN, HALF_UP, HALF_DOWN, UP, DOWN, CEILING, FLOOR].
+// ---------------------------------------------------------------------------
+
+const float_modes = [_]RoundingMode{ .half_even, .half_up, .half_down, .up, .down, .ceiling, .floor };
+
+fn expectFromFloat(x: f64, new_scale: i32, want: [7][]const u8) !void {
+    for (float_modes, want) |m, w| {
+        var d = try BigDecimal.fromFloat(talloc, x, new_scale, m);
+        defer d.deinit();
+        expectStr(d, w) catch |err| {
+            std.debug.print("fromFloat({d}, {d}, .{s}) expected {s}\n", .{ x, new_scale, @tagName(m), w });
+            return err;
+        };
+    }
+}
+
+fn expectShortestRescaled(x: f64, new_scale: i32, want: [7][]const u8) !void {
+    for (float_modes, want) |m, w| {
+        var s = try BigDecimal.fromFloatShortest(talloc, x);
+        defer s.deinit();
+        var d = try BigDecimal.rescale(talloc, s, -new_scale, m);
+        defer d.deinit();
+        try expectStr(d, w);
+    }
+}
+
+fn expectBits(want: f64, got: f64) !void {
+    try testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(got)));
+}
+
+fn toF(s: []const u8) !f64 {
+    var d = try BigDecimal.parse(talloc, s);
+    defer d.deinit();
+    return d.toFloat(talloc);
+}
+
+// float(2**1024 - 2**971) == Decimal(1.7976931348623157e308), the largest finite f64.
+const f64_max_digits =
+    "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766" ++
+    "878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328" ++
+    "944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881" ++
+    "250404026184124858368";
+// Decimal(5e-324) — the smallest subnormal, 751 significant digits.
+const f64_min_subnormal_digits =
+    "0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+    "000000000000000000000000000000000000049406564584124654417656879286822137236505980261432476442558" ++
+    "568250067550727020875186529983636163599237979656469544571773092665671035593979639877479601078187" ++
+    "812630071319031140452784581716784898210368871863605699873072305000638740915356498438731247339727" ++
+    "316961514003171538539807412623856559117102665855668676818703956031062493194527159149245532930545" ++
+    "654440112748012970999954193198940908041656332452475714786901472678015935523861155013480352649347" ++
+    "201937902681071074917033322268447533357208324319360923828934583680601060115061698097530783422773" ++
+    "183292479049825247307763759272478746560847782037344696995336470179726777175851256605511991315048" ++
+    "911014510378627381672509558373897335989936648099411642057026370902792427675445652290875386825064" ++
+    "19718265533447265625";
+// 2**1024 - 2**970: exactly half an ulp above the largest finite f64 — the
+// round-half-even tie that goes UP to 2**1024, i.e. float(...) == inf.
+const f64_overflow_tie_digits =
+    "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587" ++
+    "207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711" ++
+    "531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093" ++
+    "042880177904174497792";
+
+test "float bridge: fromFloatExact is the exact binary value (Python Decimal(float))" {
+    // Decimal(0.1)
+    var a = try BigDecimal.fromFloatExact(talloc, 0.1);
+    defer a.deinit();
+    try expectStr(a, "0.1000000000000000055511151231257827021181583404541015625");
+    // Decimal(0.5) — the exponent is minimal (odd significand): coeff 5, exp -1.
+    var h = try BigDecimal.fromFloatExact(talloc, 0.5);
+    defer h.deinit();
+    try testing.expectEqual(@as(i32, -1), h.exponent);
+    try expectStr(h, "0.5");
+    // Decimal(-1.5), Decimal(3.0), Decimal(2.675)
+    var n = try BigDecimal.fromFloatExact(talloc, -1.5);
+    defer n.deinit();
+    try expectStr(n, "-1.5");
+    var i = try BigDecimal.fromFloatExact(talloc, 3.0);
+    defer i.deinit();
+    try expectStr(i, "3");
+    var t = try BigDecimal.fromFloatExact(talloc, 2.675);
+    defer t.deinit();
+    try expectStr(t, "2.67499999999999982236431605997495353221893310546875");
+    // Decimal(1e22) — an integer with trailing zeros stays exact at exponent >= 0.
+    var e22 = try BigDecimal.fromFloatExact(talloc, 1e22);
+    defer e22.deinit();
+    try expectStr(e22, "10000000000000000000000");
+    // Decimal(0.0) and Decimal(-0.0) are both zero here (no signed zero surfaced).
+    var z = try BigDecimal.fromFloatExact(talloc, -@as(f64, 0.0));
+    defer z.deinit();
+    try testing.expect(z.isZero());
+}
+
+test "float bridge: extremes are exact (Decimal(5e-324), Decimal(1.7976931348623157e308))" {
+    var lo = try BigDecimal.fromFloatExact(talloc, 5e-324);
+    defer lo.deinit();
+    try testing.expectEqual(@as(i32, -1074), lo.exponent);
+    try expectStr(lo, f64_min_subnormal_digits);
+    var hi = try BigDecimal.fromFloatExact(talloc, 1.7976931348623157e308);
+    defer hi.deinit();
+    try expectStr(hi, f64_max_digits);
+    var neg = try BigDecimal.fromFloatExact(talloc, -1.7976931348623157e308);
+    defer neg.deinit();
+    const s = try neg.toStringAlloc(talloc);
+    defer talloc.free(s);
+    try testing.expectEqualStrings("-", s[0..1]);
+    try testing.expectEqualStrings(f64_max_digits, s[1..]);
+}
+
+test "float bridge: fromFloat rounds the exact value once, with the given mode" {
+    // [str(Decimal(0.1).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(0.1, 2, .{ "0.10", "0.10", "0.10", "0.11", "0.10", "0.11", "0.10" });
+    // Decimal(0.125) is an exact tie at 2 places:
+    // [str(Decimal(0.125).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(0.125, 2, .{ "0.12", "0.13", "0.12", "0.13", "0.12", "0.13", "0.12" });
+    // [str(Decimal(-0.125).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(-0.125, 2, .{ "-0.12", "-0.13", "-0.12", "-0.13", "-0.12", "-0.12", "-0.13" });
+    // The classic trap: 2.675 is stored BELOW the tie (2.67499999999999982...),
+    // so half-up and half-even both give 2.67.
+    // [str(Decimal(2.675).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(2.675, 2, .{ "2.67", "2.67", "2.67", "2.68", "2.67", "2.68", "2.67" });
+    // [str(Decimal(-2.675).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(-2.675, 2, .{ "-2.67", "-2.67", "-2.67", "-2.68", "-2.67", "-2.67", "-2.68" });
+    // Widening is exact: Decimal(0.5).quantize(Decimal('0.001')) -> 0.500
+    try expectFromFloat(0.5, 3, .{ "0.500", "0.500", "0.500", "0.500", "0.500", "0.500", "0.500" });
+    // Negative scale (round to hundreds): Decimal(1234.5).quantize(Decimal('1E+2')) -> 1.2E+3
+    try expectFromFloat(1234.5, -2, .{ "1200", "1200", "1200", "1300", "1200", "1300", "1200" });
+}
+
+test "float bridge: fromFloatShortest is what the user typed (Python repr / Decimal(repr(x)))" {
+    // repr(0.1) == '0.1'
+    var a = try BigDecimal.fromFloatShortest(talloc, 0.1);
+    defer a.deinit();
+    try expectStr(a, "0.1");
+    try testing.expectEqual(@as(i32, -1), a.exponent);
+    // repr(-2.675) == '-2.675'
+    var b = try BigDecimal.fromFloatShortest(talloc, -2.675);
+    defer b.deinit();
+    try expectStr(b, "-2.675");
+    // repr(5e-324) == '5e-324', repr(1.7976931348623157e308) == '1.7976931348623157e+308'
+    var lo = try BigDecimal.fromFloatShortest(talloc, 5e-324);
+    defer lo.deinit();
+    try testing.expectEqual(@as(i32, -324), lo.exponent);
+    try testing.expectEqual(@as(u64, 5), try lo.coeff.toConst().toInt(u64));
+    var hi = try BigDecimal.fromFloatShortest(talloc, 1.7976931348623157e308);
+    defer hi.deinit();
+    try testing.expectEqual(@as(i32, 292), hi.exponent);
+    try testing.expectEqual(@as(u64, 17976931348623157), try hi.coeff.toConst().toInt(u64));
+    // repr(1e22) == '1e+22'; repr(123456789012345678.0) == '1.2345678901234568e+17'
+    var e22 = try BigDecimal.fromFloatShortest(talloc, 1e22);
+    defer e22.deinit();
+    try expectStr(e22, "10000000000000000000000");
+    var big17 = try BigDecimal.fromFloatShortest(talloc, 123456789012345678.0);
+    defer big17.deinit();
+    try expectStr(big17, "123456789012345680");
+    var z = try BigDecimal.fromFloatShortest(talloc, 0.0);
+    defer z.deinit();
+    try testing.expect(z.isZero());
+    // The typed 2.675 IS a tie, unlike the binary value:
+    // [str(Decimal(repr(2.675)).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectShortestRescaled(2.675, 2, .{ "2.68", "2.68", "2.67", "2.68", "2.67", "2.68", "2.67" });
+}
+
+test "float bridge: NaN and +-Inf are refused with an error, never 0 or a trap" {
+    const bad = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
+    for (bad) |x| {
+        try testing.expectError(error.NotFinite, BigDecimal.fromFloat(talloc, x, 2, .half_even));
+        try testing.expectError(error.NotFinite, BigDecimal.fromFloatExact(talloc, x));
+        try testing.expectError(error.NotFinite, BigDecimal.fromFloatShortest(talloc, x));
+    }
+}
+
+test "float bridge: fromFloat scale range is a typed error" {
+    try testing.expectError(error.Overflow, BigDecimal.fromFloat(talloc, 0.1, std.math.minInt(i32), .half_even));
+    try testing.expectError(error.Overflow, BigDecimal.fromFloat(talloc, 0.1, std.math.maxInt(i32), .half_even));
+}
+
+test "float bridge: toFloat is the correctly rounded nearest f64 (Python float(Decimal(s)))" {
+    // float(Decimal('0.1')) -> 0.1 ; float(Decimal('2.5')) -> 2.5
+    try expectBits(0.1, try toF("0.1"));
+    try expectBits(2.5, try toF("2.5"));
+    try expectBits(-2.5, try toF("-2.5"));
+    // float(Decimal('123456789.123456789012')) -> 123456789.12345679
+    try expectBits(123456789.12345679, try toF("123456789.123456789012"));
+    // Exactly half-way between two doubles: ties to EVEN.
+    // float(Decimal('9007199254740993')) -> 9007199254740992.0  (down to even)
+    try expectBits(9007199254740992.0, try toF("9007199254740993"));
+    // float(Decimal('9007199254740995')) -> 9007199254740996.0  (up to even)
+    try expectBits(9007199254740996.0, try toF("9007199254740995"));
+    // Subnormals: float(Decimal('1e-323')) -> 1e-323 ; float(Decimal('4.9e-324')) -> 5e-324
+    try expectBits(1e-323, try toF("1e-323"));
+    try expectBits(5e-324, try toF("4.9e-324"));
+    // Below / just above half of the smallest subnormal (2.4703282292062327208e-324 is the tie):
+    // float(Decimal('2.4703282292062327e-324')) -> 0.0 ; float(Decimal('2.4703282292062328e-324')) -> 5e-324
+    try expectBits(0.0, try toF("2.4703282292062327e-324"));
+    try expectBits(5e-324, try toF("2.4703282292062328e-324"));
+    // The exact 751-digit expansion of 5e-324 converts back to it (long-input path).
+    try expectBits(5e-324, try toF(f64_min_subnormal_digits));
+    // Largest finite double: its exact digits, and a value that still rounds down to it.
+    // float(Decimal('1.797693134862315807e308')) -> 1.7976931348623157e+308
+    try expectBits(1.7976931348623157e308, try toF(f64_max_digits));
+    try expectBits(1.7976931348623157e308, try toF("1.797693134862315807e308"));
+}
+
+test "float bridge: toFloat out of range is +-inf / signed zero, not an error" {
+    // Decision: a total function, like IEEE conversion and like Python's
+    // float(Decimal): float(Decimal('1e400')) -> inf ; float(Decimal('-1e400')) -> -inf
+    // float(Decimal('1e-400')) -> 0.0 ; float(Decimal('-1e-400')) -> -0.0
+    try expectBits(std.math.inf(f64), try toF("1e400"));
+    try expectBits(-std.math.inf(f64), try toF("-1e400"));
+    try expectBits(0.0, try toF("1e-400"));
+    try expectBits(-@as(f64, 0.0), try toF("-1e-400"));
+    // float(str(2**1024 - 2**970)) -> inf : the tie above the largest double rounds to even = 2**1024.
+    try expectBits(std.math.inf(f64), try toF(f64_overflow_tie_digits));
+    // Hostile exponents never build a huge string.
+    try expectBits(std.math.inf(f64), try toF("1e2000000000"));
+    try expectBits(0.0, try toF("1e-2000000000"));
+    // A zero BigDecimal is +0.0 whatever its exponent.
+    try expectBits(0.0, try toF("0"));
+    try expectBits(0.0, try toF("0e5"));
+}
+
+test "float bridge: toFloat(fromFloatShortest(x)) == x and toFloat(fromFloatExact(x)) == x over random bit patterns" {
+    var prng = std.Random.DefaultPrng.init(0xF10A7_B21D6E);
+    const rand = prng.random();
+    const fixed = [_]f64{ 0.1, 2.675, 5e-324, -5e-324, 1.7976931348623157e308, 2.2250738585072014e-308, 2.225073858507201e-308, 1.0, 1e22, 123456789012345678.0, 0.0 };
+    var checked: usize = 0;
+    var i: usize = 0;
+    while (i < 3000 + fixed.len) : (i += 1) {
+        const x: f64 = if (i < fixed.len) fixed[i] else @bitCast(rand.int(u64));
+        if (!std.math.isFinite(x)) continue;
+        var s = try BigDecimal.fromFloatShortest(talloc, x);
+        defer s.deinit();
+        try testing.expect(x == try s.toFloat(talloc));
+        var e = try BigDecimal.fromFloatExact(talloc, x);
+        defer e.deinit();
+        try testing.expect(x == try e.toFloat(talloc));
+        checked += 1;
+    }
+    // Random u64 patterns are non-finite only when the exponent field is all
+    // ones (1 in 2048): the sample is essentially full.
+    try testing.expect(checked > 2900);
 }
 
 // ── fuzz: arbitrary-precision decimal string parse, never panics ───────────

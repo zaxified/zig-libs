@@ -3,7 +3,8 @@
 Exact base-10 **fixed-point decimal** for money and ETL math. Values are an
 `i128` scaled by `10^12` (12 fractional digits) — like a database
 `DECIMAL(38,12)`. `0.1 + 0.2 == 0.3`, exactly; the whole parse → arithmetic →
-format path is pure integer (no `f64`/`f128` anywhere).
+format path is pure integer (no `f64`/`f128` anywhere except the explicit
+[float bridge](#float-bridge), which no arithmetic path calls).
 
 - Pure-integer core (no `f80`), proven on 40M-row
   ETL runs.
@@ -74,6 +75,11 @@ fn isZero(self) bool;
 // Bridge to/from the arbitrary-precision companion (see below).
 fn toBigDecimal(self, allocator) !BigDecimal;                    // exact, total
 fn fromBigDecimal(allocator, b: BigDecimal, mode) FromBigError!Decimal;
+
+// Float bridge — the only place an f64 appears (see "Float bridge").
+fn fromFloat(x: f64, scale: u32, mode) error{ NotFinite, Overflow }!Decimal;
+fn fromFloatShortest(x: f64, scale: u32, mode) error{ NotFinite, Overflow }!Decimal;
+fn toFloat(self) f64;                                            // infallible
 ```
 
 ## Failure-path design
@@ -143,6 +149,39 @@ defer wide.deinit();                     // exact and total: "1.500000000000"
 // truncated), and a magnitude past ±1.7e26 is error.Overflow.
 const narrow = try Decimal.fromBigDecimal(allocator, wide, .half_even);
 ```
+
+## Float bridge
+
+Two entry points in, one out, on both types — and nothing else in the module touches an `f64`
+(no arithmetic, parse, format or rounding path calls them; a pipeline that never calls them is
+float-free, and even inside them no floating-point arithmetic happens):
+
+```zig
+// exact: an f64 is m·2^e, a terminating decimal — Python's Decimal(2.675)
+const a = try Decimal.fromFloat(2.675, 2, .half_up);          // 2.67 (the binary value is below the tie)
+// "what the user typed": the shortest round-trip digits (Zig's {d}, Python's repr)
+const b = try Decimal.fromFloatShortest(2.675, 2, .half_up);  // 2.68
+const f: f64 = b.toFloat();                                   // nearest double, ties to even
+
+// BigDecimal: allocator first, `scale` is i32 (negative rounds to tens/hundreds).
+var e = try BigDecimal.fromFloatExact(allocator, 0.1);        // 0.1000000000000000055511151231257827…
+defer e.deinit();
+var r = try BigDecimal.fromFloat(allocator, 0.1, 2, .half_even);   // 0.10
+defer r.deinit();
+var s = try BigDecimal.fromFloatShortest(allocator, 0.1);     // 0.1
+defer s.deinit();
+const g: f64 = try s.toFloat(allocator);                      // only allocation can fail
+```
+
+- `fromFloat*` refuse NaN and ±Inf with `error.NotFinite` (never a trap, never 0). `fromFloat`
+  converts the binary value exactly and rounds **once** with the explicit `RoundingMode`;
+  `Decimal` results beyond ±1.7e26 are `error.Overflow`, never a wrap. `Decimal`'s `scale` above 12
+  is clamped to 12; negative scales are `BigDecimal`-only.
+- `toFloat` is correctly rounded (ties to even, subnormals included). Out of range is **not** an
+  error: beyond the largest finite `f64` it is `±inf`, below half the smallest subnormal a signed
+  zero — like Python's `float(Decimal('1e400'))` and IEEE conversion. `Decimal.toFloat` can hit
+  neither edge.
+- Expected values in the tests come from Python's `decimal` module, quoted beside each check.
 
 ## Verify
 

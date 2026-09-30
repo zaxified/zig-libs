@@ -28,10 +28,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [AS400JPLPC/zig_decimal](https://github.com/AS400JPLPC/zig_decimal) | Zig | MIT | 3 | pushed 2025-12-21 | README: "with mpdecimal as a backdrop" — wraps or follows the C library *(inferred which)*; targets a Zig 0.15 nightly. |
 | Zig `std.math.big.int` | Zig | MIT | — | Zig 0.16.0 | Integers only (no decimal type in `lib/std/math/big/`); this module's `BigDecimal` is built on it. |
 
-**Where we are ahead:** against every Zig entry: the only pure-Zig decimal with **both** a fixed-scale money type (i128, 12 digits, i256 intermediates, typed `Overflow`, 7 rounding modes with exact half-way detection) **and** an arbitrary-precision `BigDecimal` replayed against the IBM decTest vectors (remainder 279, min/max 105 each, square-root 3268, power 130 cases, plus divide/rounding/quantize subsets); `sqrt` is correctly rounded, not iterated. **Where we are behind:** no context precision (`BigDecimal.div` needs a caller scale), no `Infinity`/`NaN`/signed zero or condition flags, no `exp`/`ln`/`log10`/non-integer `power`, no scientific-notation output, no float conversion in either direction — the first three and the notation are recorded in the SPEC as deliberately not built; the float bridge is the open item (→ Backlog).
+**Where we are ahead:** against every Zig entry: the only pure-Zig decimal with **both** a fixed-scale money type (i128, 12 digits, i256 intermediates, typed `Overflow`, 7 rounding modes with exact half-way detection) **and** an arbitrary-precision `BigDecimal` replayed against the IBM decTest vectors (remainder 279, min/max 105 each, square-root 3268, power 130 cases, plus divide/rounding/quantize subsets); `sqrt` is correctly rounded, not iterated. **Where we are behind:** no context precision (`BigDecimal.div` needs a caller scale), no `Infinity`/`NaN`/signed zero or condition flags, no `exp`/`ln`/`log10`/non-integer `power`, no scientific-notation output — recorded in the SPEC as deliberately not built. The float bridge (`fromFloat`/`fromFloatShortest`/`toFloat` on both types, exact and correctly rounded, at the entry points only) closed 2026-09-30 (→ Design & invariants).
 
 ## Design & invariants
-Pure integer, no floats, never UB: `i128` scaled by `10^12` (12 fractional digits), range ±1.7e26
+Pure integer, no float *arithmetic*, never UB (the one float boundary is the bridge below): `i128` scaled by `10^12` (12 fractional digits), range ±1.7e26
 at step `1e-12`. `+ −` are exact; `× ÷` widen to **i256 intermediates** so large-operand products
 cannot overflow before rescale. Any out-of-range result is a typed `error.Overflow`; `÷0` is
 `error.DivisionByZero`; no Inf/NaN, no silent wrap. Two rounding surfaces: classic ops
@@ -43,13 +43,49 @@ the value unchanged at the single unrepresentable i128-extreme case; `rescale`/`
 `divRound` error on overflow instead. Allocation-free and reentrant: `toString` writes into a
 caller buffer, no shared state. Modeled after Java `BigDecimal`/IBM GDA/Python `decimal`; see NOTICE.
 
+**Float bridge (2026-09-30).** `Decimal` and `BigDecimal` each have `fromFloat`, `fromFloatShortest`
+and `toFloat`; `BigDecimal` additionally has `fromFloatExact` (no scale, no mode — Python's
+`Decimal.from_float`). The rules:
+- `fromFloat(x, scale, mode)` refuses NaN and ±Inf with `error.NotFinite` (never a trap, never 0),
+  converts the binary value **exactly** (an `f64` is `m × 2^e`; for `e < 0` that is `m × 5^-e` at
+  exponent `e` — `0.1` is the 55-digit `0.1000000000000000055…`) and **then rounds once** with the
+  explicit `RoundingMode`. So `fromFloat(2.675, 2, .half_up)` is `2.67` (the binary value is below
+  the tie), as in Python. `Decimal`: out of range → `error.Overflow`, never a wrap; `scale > 12` is
+  clamped to 12, negative scales are not offered (round the result with `rescale`); allocation-free
+  (i256 arithmetic, with a below-half shortcut for values under 2^-200 and an `Overflow` shortcut
+  above 2^100). `BigDecimal`: `scale` is `i32` (negative rounds to tens/hundreds), routed through
+  the ordinary `rescale`, so the digit-shift ceiling `max_align_shift` applies.
+- `fromFloatShortest` starts from the shortest round-trip decimal (what Zig's `{d}`/`{e}` print,
+  Python's `repr`) — "what the user typed": `fromFloatShortest(2.675, 2, .half_up)` is `2.68`.
+  `BigDecimal.fromFloatShortest(allocator, x)` takes no scale (≤ 17 digits, nothing to round).
+- `toFloat` returns the correctly rounded nearest `f64`, ties to even, subnormals included.
+  Implementation: exact digits `<coeff>e<exponent>` into `std.fmt.parseFloat(f64, …)`, which is
+  correctly rounded for any digit count. **Out of range is not an error**: beyond the largest
+  finite `f64` (or at the tie just above it) → `±inf`; below half the smallest subnormal → a signed
+  zero (`-1e-400` → `-0.0`); a zero `BigDecimal` → `+0.0`. Total, like IEEE conversion and Python's
+  `float(Decimal('1e400'))` (→ `inf`, verified). `Decimal.toFloat` is infallible and can hit
+  neither edge (range ±1.7e26, smallest step 1e-12); `BigDecimal.toFloat` needs an allocator only.
+  The edge is not invertible: `fromFloat` refuses the `inf` that `toFloat` can produce.
+- **Exact boundary of the no-float guarantee.** Floats appear in exactly these signatures — the
+  `f64` parameter of `fromFloat*` and the `f64` result of `toFloat` — and nowhere else. No
+  arithmetic, parse, format, rounding or comparison path calls them, and even inside them there is
+  no floating-point *arithmetic*: the `f64` is bit-inspected on the way in (`f64Binary`) or its
+  shortest digits read from `std.fmt.float.render` (`f64Shortest`), and on the way out only
+  `std.fmt.parseFloat` produces the float. A consumer that wants a float-free pipeline (bxp) keeps
+  it by not calling the three entry points. Checked with `rg -n 'fromFloat|toFloat' src` (no hit
+  outside the definitions and tests).
+- Tests: expected values come from Python's `decimal` (`Decimal(0.1)`, `.quantize` in all seven
+  modes, `Decimal(5e-324)`, `Decimal(1.7976931348623157e308)`, `float(Decimal(…))`, `repr`), quoted
+  beside each check, plus a seeded random-bit-pattern round trip `toFloat(fromFloatShortest(x)) ==
+  x` (and the exact variant) for `BigDecimal`.
+
 ## Threat model / out of scope
 Not security-sensitive — the contract is numerical correctness. The i256 scaling multiply and the
 parse accumulator are overflow-checked so hostile input (huge mantissa × exponent) yields a clean
 error, never a trap. Out of scope for `Decimal` specifically: arbitrary/unbounded precision (scale
 fixed at 12 — see `BigDecimal` below for that), locale/grouping-aware parsing (caller strips
-separators), currency semantics. Float interchange is planned only as an explicit boundary
-bridge (*Backlog*, float bridge) — never inside an arithmetic path.
+separators), currency semantics. Float interchange exists only as the explicit boundary bridge (see
+*Design & invariants*, "Float bridge") — never inside an arithmetic path.
 
 ## BigDecimal — arbitrary precision (big.zig)
 
@@ -188,17 +224,14 @@ None open. The rounding core (`roundedDivMag`) is implemented and KAT-covered, a
 closed. Deliberately not built: GDA's general `power` with non-integer exponents (needs `exp`/`ln`
 on bignums — a separate transcendental-function project), a GDA context/flag register, and
 scientific-notation output.
-- **Float bridge** *(survey 2026-09-30; decided 2026-09-30 — build it, for parity with the
-  competition)*: `Decimal.fromFloat` and `Decimal.toFloat` (and the `BigDecimal` pair), as
-  Python's `Decimal.from_float`/`float(d)` and rust_decimal offer. Rules: `fromFloat` refuses NaN
-  and ±Inf with an error (never a trap, never a silent 0), converts the binary value **exactly** to
-  the scale and then rounds with an explicit rounding mode (Python's `from_float` is exact too;
-  the shortest-round-trip reading is a second, named entry point for "what the user typed");
-  `toFloat` returns the correctly rounded nearest `f64`. The bridge lives only at these entry
-  points: no arithmetic path calls them, so the module's no-float guarantee holds for every
-  computation, and a consumer that wants a float-free pipeline — bxp, which removed its f64
-  round-trips after `@intFromFloat` defects — keeps it by not calling them. Effort: small. Fits
-  CONVENTIONS §2.
+- **Float bridge** — **DONE 2026-09-30** *(survey 2026-09-30; decided 2026-09-30 — build it, for
+  parity with the competition)*: `Decimal.fromFloat`/`fromFloatShortest`/`toFloat` and the
+  `BigDecimal` set (plus `fromFloatExact`), as Python's `Decimal.from_float`/`float(d)` and
+  rust_decimal offer. Rules as decided: `fromFloat` refuses NaN and ±Inf with an error, converts
+  the binary value exactly and then rounds with an explicit mode; the shortest-round-trip reading is
+  the second, named entry point; `toFloat` is the correctly rounded nearest `f64`; the bridge lives
+  only at these entry points. Design, out-of-range choice (`±inf`) and the exact boundary of the
+  no-float guarantee: *Design & invariants*, "Float bridge".
 
 ## Status
 `extract · any · util · reentrant` · deps: none (std only) — canonical source is `pub const meta` in

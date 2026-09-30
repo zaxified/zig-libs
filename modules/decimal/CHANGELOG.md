@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — Float bridge (parity with Python `decimal`/rust_decimal): `Decimal.fromFloat`,
+  `Decimal.fromFloatShortest`, `Decimal.toFloat` and `BigDecimal.fromFloat`, `fromFloatExact`,
+  `fromFloatShortest`, `toFloat`. `fromFloat` refuses NaN/±Inf with `error.NotFinite`, converts the
+  binary value **exactly** and rounds once with the caller's `RoundingMode` (`Decimal`: out of range
+  is `error.Overflow`, never a wrap; `2.675` at 2 places half-up is `2.67`, as in Python);
+  `fromFloatShortest` starts from the shortest round-trip digits instead (`2.675` → `2.68`);
+  `toFloat` is the correctly rounded nearest `f64`, ties to even, and out of range is `±inf` / a
+  signed zero rather than an error (Python's `float(Decimal('1e400'))` is `inf` too). The bridge
+  lives only at these entry points — no arithmetic path calls it and no floating-point arithmetic
+  runs inside it. Tests take their expected values from Python's `decimal` (quoted in the test
+  comments) plus a seeded random-bit-pattern round trip for `BigDecimal`. Additive, no behaviour
+  change to existing functions.
 - **2026-09-08** — Test-only, no production change: both `fuzzParse` harnesses claim in a
   comment that their alphabet-substitution loop is inert on a corpus replay, and both
   corpus guards left that loop out — so the claim was unverified and the guard was

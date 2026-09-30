@@ -4,7 +4,10 @@
 //! Values are stored as an `i128` scaled by a constant `10^12` (12 fractional
 //! digits), like a database `DECIMAL(38,12)`. `0.1 + 0.2` is exactly `0.3` and
 //! `0.02 + 0.08` is exactly `0.10` — no binary-float noise: parse, arithmetic
-//! and format are pure integer paths (no `f64`/`f128` anywhere).
+//! and format are pure integer paths (no `f64`/`f128` anywhere). The only
+//! place a float appears is the explicit bridge `fromFloat`/`fromFloatShortest`/
+//! `toFloat` — no arithmetic path calls it, and it does no float arithmetic
+//! either (bit inspection in, `std.fmt.parseFloat` out).
 //!
 //! Range (i128 @ 1e12):
 //!   max  +170141183460469231731687303.715884105727
@@ -39,11 +42,12 @@
 //! overflow-checked (div quotient + parse accumulator).
 
 const std = @import("std");
+const big_impl = @import("big.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale.",
+    .doc = "Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -64,7 +68,7 @@ pub const RoundingMode = @import("rounding_mode.zig").RoundingMode;
 /// 10^exponent). Rounding core complete and KAT-covered against the IBM/
 /// Mike Cowlishaw decTest suite — see big.zig's module doc for the full
 /// status writeup (no open backlog).
-pub const BigDecimal = @import("big.zig").BigDecimal;
+pub const BigDecimal = big_impl.BigDecimal;
 
 pub const Decimal = struct {
     raw: i128, // value × 10^scale
@@ -373,6 +377,109 @@ pub const Decimal = struct {
         var r = try BigDecimal.rescale(allocator, b, target, mode);
         defer r.deinit();
         return .{ .raw = r.coeff.toConst().toInt(i128) catch return error.Overflow };
+    }
+
+    // -----------------------------------------------------------------
+    // Float bridge — the ONLY place an `f64` meets this type; no arithmetic
+    // path (`add`/`sub`/`mul`/`div`/`round`/`rescale`/`divRound`/`parse`/
+    // `toString`) calls any of it, so the no-float guarantee holds for every
+    // computation and a float-free pipeline stays float-free by not calling
+    // these entry points. Even here no floating-point arithmetic happens: an
+    // `f64` is bit-inspected on the way in and handed to
+    // `std.fmt.parseFloat` on the way out.
+    // -----------------------------------------------------------------
+
+    /// `NotFinite` = NaN or ±Inf (refused — never a trap, never a silent 0).
+    /// `Overflow` = the rounded result is outside the ≈ ±1.7e26 range.
+    pub const FromFloatError = error{ NotFinite, Overflow };
+
+    /// Convert `x` **exactly** (an `f64` is `m × 2^e`, a terminating decimal)
+    /// and round once, with the caller's explicit `mode`, to `new_scale`
+    /// fractional digits — Python's `Decimal.from_float(x).quantize(…)`.
+    /// `new_scale` above 12 is clamped to 12 (the representation's precision,
+    /// as in `divRound`); negative scales are not offered — round the result
+    /// with `rescale`/`round` instead (a second rounding step, so pass
+    /// scale 12 first only if that double rounding is acceptable).
+    ///
+    /// The exact value is what the binary number *is*, not what was typed:
+    /// `2.675` is stored as `2.67499999999999982…`, below the tie, so
+    /// `fromFloat(2.675, 2, .half_up)` is `2.67` (Python agrees). Use
+    /// `fromFloatShortest` for the typed reading. A magnitude beyond the
+    /// range is `error.Overflow` (never a wrap); a value smaller than half
+    /// an ulp rounds to 0 or ±1e-12 by `mode`, exactly like `fromBigDecimal`.
+    /// `-0.0` gives zero. Allocation-free.
+    pub fn fromFloat(x: f64, new_scale: u32, mode: RoundingMode) FromFloatError!Decimal {
+        const p = try big_impl.f64Binary(x);
+        if (p.m == 0) return Decimal.zero;
+        const s: u32 = @min(new_scale, scale);
+        // |x| = m × 2^e; the quotient at the rounding place is m·2^e·10^s.
+        var q: i256 = undefined;
+        if (p.e >= 0) {
+            // m ≥ 1, so 2^e > 1.3e30 beyond e = 100 — out of range at any scale.
+            if (p.e > 100) return error.Overflow;
+            q = (@as(i256, p.m) << @intCast(p.e)) * pow10_256(s); // ≤ 2^153 · 10^12: fits i256
+        } else {
+            const k: u32 = @intCast(-p.e);
+            // 2^200 ≫ 2·m·10^s (< 2^94): the quotient is a fraction strictly
+            // below one half, so only the away-from-zero modes give 1.
+            q = if (k > 200)
+                @intFromBool(roundsAwayWhenBelowHalf(p.neg, mode))
+            else
+                divRoundMag(@as(i256, p.m) * pow10_256(s), @as(i256, 1) << @intCast(k), p.neg, mode);
+        }
+        return fromRoundedMagnitude(q, p.neg, scale - s);
+    }
+
+    /// Like `fromFloat`, but starting from the **shortest decimal that
+    /// round-trips** to `x` — what Zig's `{d}`/`{e}` print and Python's
+    /// `repr(x)` shows, i.e. "what the user typed": `fromFloatShortest(2.675,
+    /// 2, .half_up)` is `2.68` (the digits `2.675` are an exact tie). Rounds
+    /// once, with `mode`, to `new_scale` fractional digits (same clamp and
+    /// error set as `fromFloat`). Allocation-free.
+    pub fn fromFloatShortest(x: f64, new_scale: u32, mode: RoundingMode) FromFloatError!Decimal {
+        const p = try big_impl.f64Shortest(x);
+        if (p.digits == 0) return Decimal.zero;
+        const s: u32 = @min(new_scale, scale);
+        // |x| = digits × 10^exp10; at the rounding place: digits × 10^k.
+        const k: i64 = @as(i64, p.exp10) + s;
+        var q: i256 = undefined;
+        if (k >= 0) {
+            // Integral at this scale — no rounding. digits ≥ 1, so 10^39 is out of range.
+            if (k > 38) return error.Overflow;
+            q = @as(i256, p.digits) * pow10_256(@intCast(k)); // < 10^17 · 10^38
+        } else if (-k > 40) {
+            // digits < 10^17 ≪ 10^40/2: strictly below one half.
+            q = @intFromBool(roundsAwayWhenBelowHalf(p.neg, mode));
+        } else {
+            q = divRoundMag(p.digits, pow10_256(@intCast(-k)), p.neg, mode);
+        }
+        return fromRoundedMagnitude(q, p.neg, scale - s);
+    }
+
+    /// `q` (a non-negative magnitude at scale `12 - back`) → the signed raw
+    /// value, range-checked: `error.Overflow` past i128, never a wrap.
+    fn fromRoundedMagnitude(q: i256, negative: bool, back: u32) FromFloatError!Decimal {
+        if (q == 0) return Decimal.zero;
+        const scaled = q * pow10_256(back); // q < 2^194 and back ≤ 12: fits i256
+        const signed: i256 = if (negative) -scaled else scaled;
+        if (signed > std.math.maxInt(i128) or signed < std.math.minInt(i128)) return error.Overflow;
+        return .{ .raw = @intCast(signed) };
+    }
+
+    /// The nearest `f64`, **correctly rounded, ties to even** (IEEE 754
+    /// roundTiesToEven) — Python's `float(Decimal)`. Formats the canonical
+    /// string (`toString`) and hands it to `std.fmt.parseFloat(f64, …)`, which
+    /// is correctly rounded; no floating-point arithmetic is done here.
+    /// Infallible: the ≈ ±1.7e26 range is far inside `f64`'s, and the
+    /// smallest nonzero magnitude 1e-12 is a normal number, so neither
+    /// overflow nor underflow can occur. Note the result is the nearest
+    /// double, not the decimal value: `toFloat(0.1)` is the binary number
+    /// `0.1000000000000000055…`, and `fromFloatShortest(toFloat(d), 12, …)`
+    /// recovers `d` only while `d` has ≤ 15 significant digits.
+    pub fn toFloat(self: Decimal) f64 {
+        var buf: [str_buf_len]u8 = undefined;
+        // Well-formed by construction: optional '-', digits, optional '.digits'.
+        return std.fmt.parseFloat(f64, self.toString(&buf)) catch unreachable;
     }
 
     pub fn order(a: Decimal, b: Decimal) std.math.Order {
@@ -1255,4 +1362,178 @@ test "corpus: every literal reaches Decimal.parse, and the counts are pinned" {
     // value here would mean a quarter of the corpus's own literals were being
     // rewritten into something else before the parser saw them.
     try testing.expectEqual(@as(usize, 0), substituted);
+}
+
+// ---------------------------------------------------------------------------
+// Float bridge — expected values from an EXTERNAL oracle: Python 3's `decimal`
+// (`Decimal(float)` is the exact binary value; `quantize` takes each ROUND_*
+// mode) and `float(Decimal(str))` (correctly rounded, ties to even). Modes are
+// always listed in `RoundingMode` order:
+//   [HALF_EVEN, HALF_UP, HALF_DOWN, UP, DOWN, CEILING, FLOOR].
+// ---------------------------------------------------------------------------
+
+const float_modes = [_]RoundingMode{ .half_even, .half_up, .half_down, .up, .down, .ceiling, .floor };
+
+fn expectFromFloat(x: f64, new_scale: u32, want: [7][]const u8) !void {
+    for (float_modes, want) |m, w| {
+        const d = Decimal.fromFloat(x, new_scale, m) catch |err| {
+            std.debug.print("fromFloat({d}, {d}, .{s}) failed: {s}\n", .{ x, new_scale, @tagName(m), @errorName(err) });
+            return err;
+        };
+        try expectStr(d, w);
+    }
+}
+
+fn expectFromFloatShortest(x: f64, new_scale: u32, want: [7][]const u8) !void {
+    for (float_modes, want) |m, w| {
+        try expectStr(try Decimal.fromFloatShortest(x, new_scale, m), w);
+    }
+}
+
+fn expectBits(want: f64, got: f64) !void {
+    try testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(got)));
+}
+
+test "float bridge: fromFloat converts the exact binary value (Python Decimal(float).quantize)" {
+    // Decimal(0.1).quantize(Decimal('1E-12')) -> 0.100000000000  (canonical: 0.1)
+    try expectStr(try Decimal.fromFloat(0.1, 12, .half_even), "0.1");
+    // [str(Decimal(0.1).quantize(Decimal('0.01'), m)) for m in modes]
+    //   -> 0.10 0.10 0.10 0.11 0.10 0.11 0.10   (canonical: trailing zero trimmed)
+    try expectFromFloat(0.1, 2, .{ "0.1", "0.1", "0.1", "0.11", "0.1", "0.11", "0.1" });
+    // Decimal(0.125) is an exact tie at 2 places:
+    // [str(Decimal(0.125).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(0.125, 2, .{ "0.12", "0.13", "0.12", "0.13", "0.12", "0.13", "0.12" });
+    // [str(Decimal(-0.125).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(-0.125, 2, .{ "-0.12", "-0.13", "-0.12", "-0.13", "-0.12", "-0.12", "-0.13" });
+    // The classic trap: Decimal(2.675) = 2.67499999999999982236431605997495353221893310546875
+    // is BELOW the tie, so half-up and half-even both give 2.67.
+    // [str(Decimal(2.675).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(2.675, 2, .{ "2.67", "2.67", "2.67", "2.68", "2.67", "2.68", "2.67" });
+    // [str(Decimal(-2.675).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloat(-2.675, 2, .{ "-2.67", "-2.67", "-2.67", "-2.68", "-2.67", "-2.67", "-2.68" });
+    // Decimal(-2.5).quantize(Decimal('1'), ROUND_HALF_EVEN) -> -2 ; Decimal(2.5) ROUND_HALF_UP -> 3
+    try expectStr(try Decimal.fromFloat(-2.5, 0, .half_even), "-2");
+    try expectStr(try Decimal.fromFloat(2.5, 0, .half_up), "3");
+    try expectStr(try Decimal.fromFloat(3.5, 0, .half_even), "4");
+    // Decimal(0.30000000000000004).quantize(Decimal('1E-12')) -> 0.300000000000 ;
+    // Decimal(1/3).quantize(Decimal('1E-12')) -> 0.333333333333
+    try expectStr(try Decimal.fromFloat(0.30000000000000004, 12, .half_even), "0.3");
+    try expectStr(try Decimal.fromFloat(1.0 / 3.0, 12, .half_even), "0.333333333333");
+    // A scale above 12 is the type's precision (clamped), like divRound.
+    try expectStr(try Decimal.fromFloat(1.0 / 3.0, 40, .half_even), "0.333333333333");
+    // Integral values: Decimal(123456789012345678.0) == 123456789012345680 exactly.
+    try expectStr(try Decimal.fromFloat(123456789012345678.0, 12, .half_even), "123456789012345680");
+    // -0.0 is zero.
+    try testing.expect((try Decimal.fromFloat(-@as(f64, 0.0), 12, .half_even)).isZero());
+}
+
+test "float bridge: fromFloat tiny values round by mode, never to a wrong nonzero" {
+    // [str(Decimal(5e-324).quantize(Decimal('1E-12'), m)) for m in modes]
+    //   -> 0 0 0 1E-12 0 1E-12 0
+    const tiny = [7][]const u8{ "0", "0", "0", "0.000000000001", "0", "0.000000000001", "0" };
+    try expectFromFloat(5e-324, 12, tiny);
+    // [str(Decimal(-5e-324).quantize(Decimal('1E-12'), m)) for m in modes]
+    //   -> -0 -0 -0 -1E-12 -0 -0 -1E-12   (this type has no negative zero)
+    try expectFromFloat(-5e-324, 12, .{ "0", "0", "0", "-0.000000000001", "0", "0", "-0.000000000001" });
+    // Decimal(1e-300).quantize(Decimal('1E-12'), ROUND_UP) -> 1E-12
+    try expectStr(try Decimal.fromFloat(1e-300, 12, .up), "0.000000000001");
+    try expectStr(try Decimal.fromFloat(1e-300, 12, .half_up), "0");
+}
+
+test "float bridge: fromFloat range — exact near the ceiling, Overflow past it, never a wrap" {
+    // Decimal(1e26) == 100000000000000004764729344 (1e26 as an f64 is slightly above 1e26)
+    try expectStr(try Decimal.fromFloat(1e26, 12, .half_even), "100000000000000004764729344");
+    // Decimal(1.7e26) == 170000000000000013254000640
+    try expectStr(try Decimal.fromFloat(1.7e26, 0, .half_even), "170000000000000013254000640");
+    // Decimal(1.7014118346046923e26) == 170141183460469228309577728, the largest f64 <= this
+    // type's maximum 170141183460469231731687303.715884105727 (Python: <= holds).
+    const top: f64 = 1.7014118346046923e26;
+    try expectStr(try Decimal.fromFloat(top, 12, .half_even), "170141183460469228309577728");
+    try expectStr(try Decimal.fromFloat(-top, 12, .half_even), "-170141183460469228309577728");
+    // The next double up is 170141183460469262669316096 > maximum.
+    const above = std.math.nextAfter(f64, top, std.math.inf(f64));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(above, 12, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(-above, 12, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(1.8e26, 12, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(1e27, 0, .down));
+    // 1e30 fails the final range check; the largest f64 (e = 971) takes the e > 100 shortcut.
+    try testing.expectError(error.Overflow, Decimal.fromFloat(1e30, 12, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(1.7976931348623157e308, 0, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(-1.7976931348623157e308, 12, .floor));
+}
+
+test "float bridge: NaN and +-Inf are refused with an error, never 0 or a trap" {
+    const bad = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
+    for (bad) |x| {
+        try testing.expectError(error.NotFinite, Decimal.fromFloat(x, 12, .half_even));
+        try testing.expectError(error.NotFinite, Decimal.fromFloatShortest(x, 12, .half_even));
+    }
+}
+
+test "float bridge: fromFloatShortest reads what the user typed (Python repr / Decimal(repr(x)))" {
+    // repr(0.1) == '0.1'
+    try expectStr(try Decimal.fromFloatShortest(0.1, 12, .half_even), "0.1");
+    // repr(2.675) == '2.675' — an exact tie in decimal, unlike the binary value:
+    // [str(Decimal(repr(2.675)).quantize(Decimal('0.01'), m)) for m in modes]
+    try expectFromFloatShortest(2.675, 2, .{ "2.68", "2.68", "2.67", "2.68", "2.67", "2.68", "2.67" });
+    // repr(-2.675) mirrored: half_even -2.68, half_down -2.67, ceiling -2.67, floor -2.68
+    try expectFromFloatShortest(-2.675, 2, .{ "-2.68", "-2.68", "-2.67", "-2.68", "-2.67", "-2.67", "-2.68" });
+    // repr(1e22) == '1e+22' ; repr(123456789012345678.0) == '1.2345678901234568e+17'
+    try expectStr(try Decimal.fromFloatShortest(1e22, 12, .half_even), "10000000000000000000000");
+    try expectStr(try Decimal.fromFloatShortest(123456789012345678.0, 12, .half_even), "123456789012345680");
+    // repr(0.30000000000000004) == '0.30000000000000004' -> 12 places 0.3
+    try expectStr(try Decimal.fromFloatShortest(0.30000000000000004, 12, .half_even), "0.3");
+    // repr(5e-324) == '5e-324': tiny, mode-dependent as for fromFloat.
+    try expectStr(try Decimal.fromFloatShortest(5e-324, 12, .half_even), "0");
+    try expectStr(try Decimal.fromFloatShortest(5e-324, 12, .up), "0.000000000001");
+    try expectStr(try Decimal.fromFloatShortest(-5e-324, 12, .floor), "-0.000000000001");
+    // Range: repr(1.7976931348623157e308) is far outside; repr(1e26) == '1e+26' is inside (unlike its binary value).
+    try testing.expectError(error.Overflow, Decimal.fromFloatShortest(1.7976931348623157e308, 12, .half_even));
+    try expectStr(try Decimal.fromFloatShortest(1e26, 12, .half_even), "100000000000000000000000000");
+    try testing.expectError(error.Overflow, Decimal.fromFloatShortest(1.8e26, 12, .half_even));
+    try expectStr(try Decimal.fromFloatShortest(-0.0, 12, .half_even), "0");
+}
+
+test "float bridge: toFloat is the correctly rounded nearest f64 (Python float(Decimal(s)))" {
+    // float(Decimal('0.1')) -> 0.1 ; float(Decimal('2.5')) -> 2.5 ; float(Decimal('0.3')) -> 0.3
+    try expectBits(0.1, dec("0.1").toFloat());
+    try expectBits(2.5, dec("2.5").toFloat());
+    try expectBits(-2.5, dec("-2.5").toFloat());
+    try expectBits(0.3, dec("0.3").toFloat());
+    try expectBits(0.0, Decimal.zero.toFloat());
+    // float(Decimal('123456789.123456789012')) -> 123456789.12345679
+    try expectBits(123456789.12345679, dec("123456789.123456789012").toFloat());
+    // float(Decimal('1E-12')) -> 1e-12
+    try expectBits(1e-12, dec("0.000000000001").toFloat());
+    // float(Decimal('170141183460469231731687303.715884105727')) -> 1.7014118346046923e+26 (and the minimum, negated)
+    const max: Decimal = .{ .raw = std.math.maxInt(i128) };
+    const min: Decimal = .{ .raw = std.math.minInt(i128) };
+    try expectBits(1.7014118346046923e26, max.toFloat());
+    try expectBits(-1.7014118346046923e26, min.toFloat());
+    // float(Decimal('1234567890123456789012345678901234567890e-30')) -> 1234567890.1234567
+    try expectBits(1234567890.1234567, dec("1234567890.123456789012").toFloat());
+    // A halfway case: float(Decimal('9007199254740993')) -> 9007199254740992.0 (ties to even)
+    try expectBits(9007199254740992.0, dec("9007199254740993").toFloat());
+    // float(Decimal('9007199254740995')) -> 9007199254740996.0
+    try expectBits(9007199254740996.0, dec("9007199254740995").toFloat());
+}
+
+test "float bridge: toFloat(fromFloatShortest(x)) == x for typed decimals with <= 12 places" {
+    // Not a general identity for Decimal (12 places, range) — it holds for
+    // values this type can hold verbatim; the exhaustive random-bit-pattern
+    // round trip lives in big.zig for BigDecimal.
+    var prng = std.Random.DefaultPrng.init(0xDEC1_F10A7);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        // A "typed" value: an integer of up to 15 digits over 10^k, k in 0..12.
+        const digits = rand.intRangeAtMost(u64, 0, 999_999_999_999_999);
+        const k = rand.intRangeAtMost(u32, 0, 12);
+        var buf: [40]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{d}e-{d}", .{ digits, k });
+        const x = try std.fmt.parseFloat(f64, text);
+        const d = try Decimal.fromFloatShortest(x, 12, .half_even);
+        try expectBits(x, d.toFloat());
+        try testing.expect(d.eql(try Decimal.parse(text)));
+    }
 }
