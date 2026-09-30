@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — LAN (broadcast) circuits (survey backlog, A9 part 2). `Topology.lans`
+  (`Lan`, `LanMember`): a LAN is a full mesh of netsim links; `isis-dis` elects the
+  DIS per member view (`setLanPriorityAt`, a crashed member declared dead after
+  `Options.lan_hold_time`), the DIS originates/purges the pseudonode LSP, members list the
+  pseudonode; SRM cleared on LAN transmission, CSNP only from the DIS, PSNP request built
+  harness-side (siblings lack a broadcast mode — SPEC §12). `MEASURED:` lossy LAN 16/16
+  with CSNPs vs 0/16 without. `isis-spf` gained LAN transit the same day, so the LAN routes are asserted, not pinned as a gap.
+  `SPEC.md` §12. `scripts/modtest isis-sim`: 38/38.
 - **2026-09-30** — Lossy medium measured and LSP aging/refresh/purge in the run
   (survey backlog). `Options.link_overrides` (per-link `LinkConfig`), `Options.aging`
   (`Lsdb.tick` on a per-node timer, own-LSP refresh at age 900 of MaxAge 1200,

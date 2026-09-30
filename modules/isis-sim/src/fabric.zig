@@ -27,8 +27,8 @@
 //!     mark that circuit down, then re-originate this node's LSP without the
 //!     lost neighbour at a bumped sequence number, and flood.
 //!   - **check** — the safety invariants checked after every event: (1) no
-//!     node's LSDB ever holds more than `node_count` distinct LSP-IDs (a
-//!     runaway/corruption tripwire; correct flooding stores exactly one LSP per
+//!     node's LSDB ever holds more than `node_count` distinct LSP-IDs (plus one
+//!     pseudonode LSP per LAN member; a runaway/corruption tripwire; correct flooding stores exactly one LSP per
 //!     originator), and (2) no node's stored sequence number for an originator
 //!     ever decreases, and no LSP it already holds ever disappears — unless aging
 //!     is on (`Options.aging`) and the LSP was a purge first. Both have a permanent positive control in the tests,
@@ -48,7 +48,8 @@
 //! ## Node ↔ system-id mapping
 //! netsim `NodeId` *n* maps to the 6-octet IS-IS system-id `00:00:00:00:HH:LL`
 //! of `n + 1` (deterministic, dense, never all-zero). One LSP per node
-//! (LSP-number 0, no pseudonodes — P2P only).
+//! (LSP-number 0), plus the pseudonode LSP of every LAN the node is the DIS of
+//! (`Topology.lans`: DIS election, pseudonode LSPs, CSNP/PSNP repair; SPEC §12).
 //!
 //! ## Convergence, quiescence, and termination
 //! `runToConvergence` drives `netsim.replay` under a hard step cap (`until` time
@@ -70,6 +71,7 @@ const isis = @import("isis");
 const isis_lsdb = @import("isis-lsdb");
 const isis_flood = @import("isis-flood");
 const isis_spf = @import("isis-spf");
+const isis_dis = @import("isis-dis");
 
 const NodeId = netsim.NodeId;
 const Time = netsim.Time;
@@ -103,10 +105,40 @@ pub const Edge = struct {
     metric: u24 = 10,
 };
 
-/// A small P2P fabric: how many nodes, and the weighted adjacency list.
+/// The most routers one LAN segment may have (a comptime bound on the per-node
+/// view arrays; real LANs are larger, the harness needs a handful).
+pub const max_lan_members = 8;
+
+/// One router attached to a LAN.
+pub const LanMember = struct {
+    node: NodeId,
+    /// The LAN priority this router advertises (DIS election, ISO 10589 §8.4.5).
+    priority: u7 = 64,
+    /// The router's MAC on the LAN — the election's tie-break. Default: a
+    /// locally administered address derived from the node number, so a higher
+    /// node number wins a priority tie.
+    snpa: ?[6]u8 = null,
+};
+
+/// A broadcast segment: a set of routers that see each other's frames. See
+/// SPEC §12 for how it is modelled on `netsim`'s point-to-point links.
+pub const Lan = struct {
+    members: []const LanMember,
+    /// The metric every member advertises toward the pseudonode (the
+    /// pseudonode's own arcs back cost 0).
+    metric: u24 = 10,
+    /// The medium between every pair of members; `null` = `Options.link`.
+    /// Individual member pairs are overridden through `Options.link_overrides`.
+    link: ?netsim.LinkConfig = null,
+};
+
+/// A small fabric: how many nodes, the weighted point-to-point adjacency list,
+/// and (optionally) LAN segments. A pair of nodes may be connected by at most
+/// one of {an edge, one LAN} — asserted at `init`.
 pub const Topology = struct {
     node_count: u32,
     edges: []const Edge,
+    lans: []const Lan = &.{},
 };
 
 /// The result of `runToConvergence`. F5: this used to collapse three distinct
@@ -160,6 +192,9 @@ const timer_age: u64 = 2;
 /// Failure-reaction timer ids start here (distinct from `timer_poll`); the
 /// failure index is added on.
 const fail_timer_base: u64 = 1 << 32;
+/// LAN-event timer ids (a member's priority change, a member declared dead)
+/// start here; the index into `Fabric.lan_run` is added on.
+const lan_timer_base: u64 = 1 << 40;
 
 // ── per-node state ───────────────────────────────────────────────────────────
 
@@ -169,18 +204,78 @@ const Neighbour = struct {
     metric: u24,
 };
 
+/// One node's attachment to one LAN: its view of the segment and its DIS state.
+/// The LAN circuit's `iface` follows the point-to-point ones.
+const LanCircuit = struct {
+    /// Index into `Fabric.lans`; the pseudonode id is `lan + 1`.
+    lan: u16,
+    iface: u8,
+    /// This node's slot among the LAN's members.
+    slot: u8,
+    /// This node's view of which members are alive and of their priorities. There
+    /// is no hello exchange (SPEC §8), so the view changes only through the
+    /// scheduled LAN events.
+    alive: [max_lan_members]bool,
+    prio: [max_lan_members]u7,
+    election: isis_dis.Election,
+    /// Whether this node is the DIS in its own view, and the DIS's slot.
+    is_dis: bool = false,
+    dis_slot: u8 = 0,
+    /// This node currently originates the LAN's pseudonode LSP.
+    pn_live: bool = false,
+    /// Sequence number of the pseudonode LSP (kept across a resignation, so a
+    /// later re-election lands above the purge it left behind).
+    pn_seq: u32 = 0,
+};
+
 const NodeState = struct {
     system_id: SystemId,
-    /// One entry per circuit; the circuit index is the array index and is the
-    /// `iface` used throughout the isis stack.
+    /// One entry per point-to-point circuit; the circuit index is the array
+    /// index and is the `iface` used throughout the isis stack.
     neighbours: []Neighbour,
-    /// Per-circuit "this link has failed" flag, mutated during a run by the
-    /// failure-reaction timer. Reset to all-false each drive.
+    /// One entry per LAN this node is on; its `iface` is `neighbours.len + k`.
+    lan_circuits: []LanCircuit,
+    /// Per-circuit (P2P and LAN) "this link has failed" flag, mutated during a
+    /// run by the failure-reaction timer. Reset to all-false each drive. A LAN
+    /// circuit never fails.
     link_failed: []bool,
     lsdb: isis_lsdb.Lsdb,
     sched: isis_flood.Scheduler,
     /// Sequence number of this node's own LSP; bumped on each (re-)origination.
     seq: u32,
+
+    fn ifaceCount(ns: *const NodeState) usize {
+        return ns.neighbours.len + ns.lan_circuits.len;
+    }
+
+    fn lanByIface(ns: *NodeState, iface: u8) ?*LanCircuit {
+        if (iface < ns.neighbours.len) return null;
+        return &ns.lan_circuits[iface - ns.neighbours.len];
+    }
+};
+
+/// One LAN's static description with the defaults resolved.
+const LanState = struct {
+    members: [max_lan_members]LanMember,
+    count: u8,
+    metric: u24,
+    link: ?netsim.LinkConfig,
+
+    fn slotOf(l: *const LanState, node: NodeId) ?u8 {
+        for (l.members[0..l.count], 0..) |m, i| {
+            if (m.node == node) return @intCast(i);
+        }
+        return null;
+    }
+};
+
+/// A scheduled change on one LAN, seen by every member at `time`.
+const LanEvent = struct {
+    time: Time,
+    lan: u16,
+    /// The member (slot) concerned.
+    slot: u8,
+    kind: union(enum) { priority: u7, down },
 };
 
 const Failure = struct { time: Time, a: NodeId, b: NodeId };
@@ -226,6 +321,13 @@ pub const Options = struct {
     /// is the original harness: lifetimes stamped high and never `tick`ed, so
     /// nothing ages.
     aging: ?Aging = null,
+    /// How long after a LAN member crashes its peers declare it dead — the
+    /// hello holding time the harness does not simulate (SPEC §12). Only used
+    /// for a `Fabric.crash` of a LAN member.
+    lan_hold_time: Time = 30,
+    /// `false` is the negative control of the LAN path: the DIS never transmits a
+    /// CSNP on a LAN circuit, so a database summary can no longer repair loss.
+    lan_csnp: bool = true,
 };
 
 /// One link's medium, replacing `Options.link` for the undirected edge `a`-`b`.
@@ -369,6 +471,25 @@ pub const Fabric = struct {
     /// own and no test would have noticed it doing nothing.
     ignore_snp: bool = false,
 
+    /// The LAN segments (SPEC §12), resolved from `Topology.lans`.
+    lans: []LanState,
+    /// Extra per-LAN capacity every LSDB is given for pseudonode LSPs (one per
+    /// potential DIS — an old one may still be held next to its successor).
+    lsdb_capacity: u32,
+    /// LAN events registered by the caller (`setLanPriorityAt`).
+    lan_events: std.ArrayListUnmanaged(LanEvent) = .empty,
+    /// The events of the current run: the caller's plus, for a crashed LAN
+    /// member, the "declared dead" event `lan_hold_time` after the crash.
+    lan_run: std.ArrayListUnmanaged(LanEvent) = .empty,
+    /// Whether a run's `check` has to consider more than `nodes.len` LSPs: the
+    /// bound on one LSDB's size (`nodes.len` + every possible pseudonode LSP).
+    count_bound: usize,
+    /// `check`'s per-(node, LAN, DIS-node) sequence high-water mark and
+    /// last-was-a-purge flag for pseudonode LSPs, `nodes × lans × nodes` entries.
+    seen_pn_seq: []u32,
+    seen_pn_purge: []bool,
+    /// The LAN circuits of the last `runToConvergence` that were DIS at the end
+    /// are read through `disOf`/`isDis`.
     pub fn init(gpa: Allocator, topo: Topology, seed: u64) Allocator.Error!Fabric {
         return initWithOptions(gpa, topo, seed, .{});
     }
@@ -388,6 +509,7 @@ pub const Fabric = struct {
             ns.lsdb.deinit();
             ns.sched.deinit();
             gpa.free(ns.neighbours);
+            gpa.free(ns.lan_circuits);
             gpa.free(ns.link_failed);
         };
 
@@ -400,8 +522,59 @@ pub const Fabric = struct {
             for (topo.edges) |e| {
                 if ((e.a == o.a and e.b == o.b) or (e.a == o.b and e.b == o.a)) found = true;
             }
+            for (topo.lans) |l| {
+                var ina = false;
+                var inb = false;
+                for (l.members) |m| {
+                    if (m.node == o.a) ina = true;
+                    if (m.node == o.b) inb = true;
+                }
+                if (ina and inb and o.a != o.b) found = true;
+            }
             std.debug.assert(found);
         }
+
+        // LAN segments: resolved copies, and the structural assertions (a pair of
+        // nodes shares at most one segment, and is not also joined by an edge —
+        // the receiver could not tell which circuit a frame belongs to).
+        std.debug.assert(topo.lans.len < 255);
+        const lans = try gpa.alloc(LanState, topo.lans.len);
+        errdefer gpa.free(lans);
+        var total_members: usize = 0;
+        for (topo.lans, lans) |l, *ls| {
+            std.debug.assert(l.members.len >= 1 and l.members.len <= max_lan_members);
+            ls.* = .{ .members = undefined, .count = @intCast(l.members.len), .metric = l.metric, .link = l.link };
+            for (l.members, 0..) |m, i| {
+                std.debug.assert(m.node < topo.node_count);
+                for (l.members[0..i]) |o| std.debug.assert(o.node != m.node);
+                var mm = m;
+                if (mm.snpa == null) {
+                    const v: u16 = @intCast(m.node + 1);
+                    mm.snpa = .{ 0x02, 0, 0, 0, @intCast(v >> 8), @intCast(v & 0xFF) };
+                }
+                ls.members[i] = mm;
+            }
+            total_members += l.members.len;
+        }
+        for (topo.lans, 0..) |l, li| {
+            for (l.members, 0..) |m, i| {
+                for (l.members[i + 1 ..]) |o| {
+                    for (topo.edges) |e| {
+                        std.debug.assert(!((e.a == m.node and e.b == o.node) or (e.a == o.node and e.b == m.node)));
+                    }
+                    for (topo.lans[li + 1 ..]) |l2| {
+                        var ina = false;
+                        var inb = false;
+                        for (l2.members) |m2| {
+                            if (m2.node == m.node) ina = true;
+                            if (m2.node == o.node) inb = true;
+                        }
+                        std.debug.assert(!(ina and inb));
+                    }
+                }
+            }
+        }
+        const lsdb_capacity: u32 = topo.node_count + 8 + @as(u32, @intCast(total_members));
 
         for (nodes, 0..) |*ns, i| {
             const node: NodeId = @intCast(i);
@@ -409,7 +582,13 @@ pub const Fabric = struct {
             for (topo.edges) |e| {
                 if (e.a == node or e.b == node) degree += 1;
             }
-            std.debug.assert(degree <= isis_lsdb.max_interfaces);
+            var lan_count: usize = 0;
+            for (topo.lans) |l| {
+                for (l.members) |m| {
+                    if (m.node == node) lan_count += 1;
+                }
+            }
+            std.debug.assert(degree + lan_count <= isis_lsdb.max_interfaces);
 
             const neighbours = try gpa.alloc(Neighbour, degree);
             errdefer gpa.free(neighbours);
@@ -424,7 +603,29 @@ pub const Fabric = struct {
                 }
             }
 
-            const link_failed = try gpa.alloc(bool, degree);
+            const lan_circuits = try gpa.alloc(LanCircuit, lan_count);
+            errdefer gpa.free(lan_circuits);
+            var lk: usize = 0;
+            for (lans, 0..) |*ls, li| {
+                const slot = ls.slotOf(node) orelse continue;
+                var c: LanCircuit = .{
+                    .lan = @intCast(li),
+                    .iface = @intCast(degree + lk),
+                    .slot = slot,
+                    .alive = @splat(false),
+                    .prio = @splat(0),
+                    .election = undefined,
+                };
+                for (ls.members[0..ls.count], 0..) |m, mi| {
+                    c.alive[mi] = true;
+                    c.prio[mi] = m.priority;
+                }
+                c.election = isis_dis.Election.init(candidateOf(ls, slot, @intCast(li), c.prio[slot]));
+                lan_circuits[lk] = c;
+                lk += 1;
+            }
+
+            const link_failed = try gpa.alloc(bool, degree + lan_count);
             errdefer gpa.free(link_failed);
             @memset(link_failed, false);
 
@@ -432,11 +633,13 @@ pub const Fabric = struct {
             ns.* = .{
                 .system_id = sys,
                 .neighbours = neighbours,
+                .lan_circuits = lan_circuits,
                 .link_failed = link_failed,
-                .lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(sys, degree, topo.node_count, opts)),
+                .lsdb = undefined,
                 .sched = isis_flood.Scheduler.init(gpa, schedConfig(sys, opts)),
                 .seq = 0,
             };
+            ns.lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(ns, lsdb_capacity, opts));
             initialized += 1;
         }
 
@@ -446,7 +649,14 @@ pub const Fabric = struct {
         errdefer gpa.free(seen_seq);
         @memset(seen_seq, 0);
         const seen_purge = try gpa.alloc(bool, topo.node_count * topo.node_count);
+        errdefer gpa.free(seen_purge);
         @memset(seen_purge, false);
+        const pn_slots = topo.node_count * topo.node_count * topo.lans.len;
+        const seen_pn_seq = try gpa.alloc(u32, pn_slots);
+        errdefer gpa.free(seen_pn_seq);
+        @memset(seen_pn_seq, 0);
+        const seen_pn_purge = try gpa.alloc(bool, pn_slots);
+        @memset(seen_pn_purge, false);
 
         return .{
             .gpa = gpa,
@@ -455,6 +665,11 @@ pub const Fabric = struct {
             .opts = opts,
             .seen_seq = seen_seq,
             .seen_purge = seen_purge,
+            .lans = lans,
+            .lsdb_capacity = lsdb_capacity,
+            .count_bound = topo.node_count + total_members,
+            .seen_pn_seq = seen_pn_seq,
+            .seen_pn_purge = seen_pn_purge,
         };
     }
 
@@ -463,10 +678,16 @@ pub const Fabric = struct {
             ns.lsdb.deinit();
             ns.sched.deinit();
             self.gpa.free(ns.neighbours);
+            self.gpa.free(ns.lan_circuits);
             self.gpa.free(ns.link_failed);
         }
         self.gpa.free(self.seen_seq);
         self.gpa.free(self.seen_purge);
+        self.gpa.free(self.seen_pn_seq);
+        self.gpa.free(self.seen_pn_purge);
+        self.gpa.free(self.lans);
+        self.lan_events.deinit(self.gpa);
+        self.lan_run.deinit(self.gpa);
         self.gpa.free(self.nodes);
         self.last_log.deinit(self.gpa);
         self.failures.deinit(self.gpa);
@@ -474,12 +695,29 @@ pub const Fabric = struct {
         self.* = undefined;
     }
 
-    fn lsdbConfig(sys: SystemId, degree: usize, node_count: u32, opts: Options) isis_lsdb.Config {
+    /// The candidate a LAN member presents to the election. The pseudonode id is
+    /// the same static value (`lan + 1`) for everyone — in the real protocol a
+    /// neighbour's is read from its hello; the harness has no hellos.
+    fn candidateOf(ls: *const LanState, slot: u8, lan: u16, prio: u7) isis_dis.Candidate {
+        const m = ls.members[slot];
+        return .{
+            .system_id = systemIdForNode(m.node),
+            .priority = prio,
+            .snpa = m.snpa.?,
+            .pseudonode_id = @intCast(lan + 1),
+        };
+    }
+
+    fn lsdbConfig(ns: *const NodeState, capacity: u32, opts: Options) isis_lsdb.Config {
+        var bcast = isis_lsdb.InterfaceSet.initEmpty();
+        for (ns.lan_circuits) |c| bcast.set(c.iface);
         var cfg: isis_lsdb.Config = .{
-            .local_system_id = sys,
-            .interface_count = @intCast(degree),
-            // One LSP per originator + slack; bounds the store, never hit here.
-            .capacity = node_count + 8,
+            .local_system_id = ns.system_id,
+            .interface_count = @intCast(ns.ifaceCount()),
+            // One LSP per originator + slack (+ pseudonode LSPs); bounds the
+            // store, never hit here.
+            .capacity = capacity,
+            .broadcast_interfaces = bcast,
         };
         if (opts.aging) |a| {
             cfg.zero_age_lifetime = a.zero_age_lifetime;
@@ -510,6 +748,14 @@ pub const Fabric = struct {
         try self.failures.append(self.gpa, .{ .time = time, .a = a, .b = b });
     }
 
+    /// Schedule `node` (a member of `lan`) to start advertising `priority` at
+    /// `time`; every member re-elects at that time, so a higher priority preempts
+    /// the DIS immediately (ISO 10589 §8.4.5).
+    pub fn setLanPriorityAt(self: *Fabric, lan: u16, node: NodeId, priority: u7, time: Time) Allocator.Error!void {
+        const slot = self.lans[lan].slotOf(node).?;
+        try self.lan_events.append(self.gpa, .{ .time = time, .lan = lan, .slot = slot, .kind = .{ .priority = priority } });
+    }
+
     // ── the netsim Protocol vtable ───────────────────────────────────────────
 
     fn protocol(self: *Fabric) netsim.Protocol {
@@ -532,29 +778,60 @@ pub const Fabric = struct {
     /// re-`init`s allocate nothing.
     fn reset(ctx: *anyopaque) void {
         const self = cast(ctx);
-        for (self.nodes, 0..) |*ns, i| {
-            const node_count: u32 = @intCast(self.nodes.len);
+        for (self.nodes) |*ns| {
             ns.lsdb.deinit();
-            ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, node_count, self.opts));
+            ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns, self.lsdb_capacity, self.opts));
             ns.sched.deinit();
             ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
             ns.seq = 0;
             @memset(ns.link_failed, false);
-            _ = i;
+            for (ns.lan_circuits) |*c| self.resetLanCircuit(c);
         }
         // Per-run invariant state (netsim calls `reset` at the top of every
         // drive, so this is the run's baseline).
         @memset(self.seen_seq, 0);
         @memset(self.seen_purge, false);
+        @memset(self.seen_pn_seq, 0);
+        @memset(self.seen_pn_purge, false);
         self.violation = null;
         self.wipe_done = false;
         self.stats = .{};
     }
 
+    /// Back to the t=0 LAN view: everyone alive at its configured priority, no
+    /// DIS elected yet, no pseudonode LSP originated.
+    fn resetLanCircuit(self: *Fabric, c: *LanCircuit) void {
+        const ls = &self.lans[c.lan];
+        for (ls.members[0..ls.count], 0..) |m, i| {
+            c.alive[i] = true;
+            c.prio[i] = m.priority;
+        }
+        c.election = isis_dis.Election.init(candidateOf(ls, c.slot, c.lan, c.prio[c.slot]));
+        c.is_dis = false;
+        c.dis_slot = 0;
+        c.pn_live = false;
+        c.pn_seq = 0;
+    }
+
     fn onStart(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId) anyerror!void {
         const self = cast(ctx);
         const now = sim.timeNow();
+        // Initial DIS election on every LAN circuit (and the pseudonode LSP of
+        // the ones this node wins), before the node's own LSP names the DIS.
+        for (self.nodes[node].lan_circuits) |*c| {
+            _ = self.runElection(c, now);
+            if (c.is_dis) {
+                c.pn_live = true;
+                try self.originatePseudonode(node, c, now);
+            }
+        }
         try self.originate(node, now);
+        for (self.lan_run.items, 0..) |ev, k| {
+            if (ev.time > self.horizon) continue;
+            for (self.nodes[node].lan_circuits) |c| {
+                if (c.lan == ev.lan) try sim.setTimer(node, ev.time, lan_timer_base + k);
+            }
+        }
         try sim.setTimer(node, poll_delay, timer_poll);
         if (self.opts.aging) |a| {
             if (a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
@@ -584,7 +861,7 @@ pub const Fabric = struct {
         const ns = &self.nodes[node];
         const n = self.nodes.len;
         ns.lsdb.deinit();
-        ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(n), self.opts));
+        ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns, self.lsdb_capacity, self.opts));
         ns.sched.deinit();
         ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
         // `check`'s monotonicity invariant is "no stored sequence goes backwards
@@ -593,13 +870,22 @@ pub const Fabric = struct {
         // node's own future, stay under the invariant.
         @memset(self.seen_seq[node * n ..][0..n], 0);
         @memset(self.seen_purge[node * n ..][0..n], false);
+        const lc = self.lans.len;
+        @memset(self.seen_pn_seq[node * lc * n ..][0 .. lc * n], 0);
+        @memset(self.seen_pn_purge[node * lc * n ..][0 .. lc * n], false);
         try self.originate(node, now);
+        // A DIS re-asserts its pseudonode LSP too (the sequence number lives in
+        // the circuit state, which the restart does not clear — SPEC §12).
+        for (ns.lan_circuits) |*c| {
+            if (c.pn_live) try self.originatePseudonode(node, c, now);
+        }
     }
 
     fn onMessage(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const self = cast(ctx);
         const ns = &self.nodes[node];
         const iface = self.ifaceOf(node, from) orelse return; // not a known neighbour
+        const lan = ns.lanByIface(iface);
         const now = sim.timeNow();
 
         const pdu = isis.decode(payload) catch return; // hostile/short bytes: ignore
@@ -607,6 +893,22 @@ pub const Fabric = struct {
             .lsp => {
                 const r = try ns.lsdb.insert(payload, iface, now);
                 if (r.stored) self.stats.last_change = now;
+                // A challenge to a pseudonode LSP this node originates (§7.3.16.1).
+                if (r.self_challenge) |ch| {
+                    if (r.lsp_id[6] != 0) {
+                        if (self.opts.aging) |a| {
+                            if (a.refresh) {
+                                for (ns.lan_circuits) |*c| {
+                                    if (c.pn_live and r.lsp_id[6] == c.lan + 1) {
+                                        c.pn_seq = @max(c.pn_seq, ch);
+                                        try self.originatePseudonode(node, c, now);
+                                    }
+                                }
+                            }
+                        }
+                        return try self.armPoll(sim, node);
+                    }
+                }
                 // ISO 10589 §7.3.16.1: a neighbour holds a NEWER copy of (or a
                 // purge for) OUR LSP. It was refused and flagged; the owner
                 // re-originates above the challenger so the fabric re-learns it.
@@ -623,10 +925,21 @@ pub const Fabric = struct {
             // it, leaving flooding as the only mechanism in the fabric.
             .csnp => |c| {
                 if (self.ignore_snp) return;
+                // On a LAN only the DIS's summary counts (§7.3.15.2); anyone
+                // else's is not part of the protocol here.
+                if (lan) |lc| {
+                    if (lc.is_dis or self.lans[lc.lan].members[lc.dis_slot].node != from) return;
+                }
                 ns.lsdb.reconcileCsnp(c, iface, now);
+                if (lan) |lc| try self.requestFromCsnp(sim, node, lc, c, now);
             },
             .psnp => |p| {
                 if (self.ignore_snp) return;
+                // On a LAN a PSNP is a request / ack to the DIS; other members
+                // hear it (it is multicast) and ignore it.
+                if (lan) |lc| {
+                    if (!lc.is_dis) return;
+                }
                 ns.lsdb.reconcilePsnp(p, iface, now);
             },
             else => return,
@@ -640,13 +953,14 @@ pub const Fabric = struct {
             if (!self.wipe_done and node == wn and ns.lsdb.count() >= 2) {
                 self.wipe_done = true;
                 ns.lsdb.deinit();
-                ns.lsdb = isis_lsdb.Lsdb.init(
-                    self.gpa,
-                    lsdbConfig(ns.system_id, ns.neighbours.len, @intCast(self.nodes.len), self.opts),
-                );
+                ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns, self.lsdb_capacity, self.opts));
             }
         }
 
+        try self.armPoll(sim, node);
+    }
+
+    fn armPoll(self: *Fabric, sim: *netsim.Sim, node: NodeId) anyerror!void {
         // Positive control: skipping this arm leaves SRM/SSN undrained forever.
         if (self.broken_no_drain) return;
         try sim.setTimer(node, poll_delay, timer_poll);
@@ -656,7 +970,9 @@ pub const Fabric = struct {
         const self = cast(ctx);
         const now = sim.timeNow();
 
-        if (timer_id == timer_restart) {
+        if (timer_id >= lan_timer_base) {
+            try self.onLanEvent(node, self.lan_run.items[@intCast(timer_id - lan_timer_base)], now);
+        } else if (timer_id == timer_restart) {
             try self.coldRestart(node, now);
         } else if (timer_id == timer_age) {
             try self.ageNode(sim, node, now);
@@ -700,7 +1016,116 @@ pub const Fabric = struct {
             try self.originate(node, now);
             self.stats.refreshes += 1;
         }
+        // The pseudonode LSPs this node originates age and refresh like its own.
+        if (a.refresh) {
+            for (ns.lan_circuits) |*c| {
+                if (!c.pn_live) continue;
+                const id = self.pseudonodeId(node, c.lan);
+                if (ns.lsdb.refreshPending(id)) {
+                    if (ns.lsdb.get(id, now)) |v| c.pn_seq = @max(c.pn_seq, v.challenge_sequence);
+                    try self.originatePseudonode(node, c, now);
+                    self.stats.refreshes += 1;
+                }
+            }
+        }
         if (now + a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
+    }
+
+    // ── LAN: DIS election, pseudonode LSP, LAN events ────────────────────────
+
+    /// The LSP-ID of the pseudonode LSP that `dis_node` originates for `lan`.
+    fn pseudonodeId(self: *const Fabric, dis_node: NodeId, lan: u16) isis_lsdb.LspId {
+        _ = self;
+        const sys = systemIdForNode(dis_node);
+        return .{ sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], @intCast(lan + 1), 0 };
+    }
+
+    /// Recompute the DIS of one LAN circuit over this node's view of the segment
+    /// (`isis-dis`). Returns whether the elected DIS changed.
+    fn runElection(self: *Fabric, c: *LanCircuit, now: Time) bool {
+        const ls = &self.lans[c.lan];
+        var cands: [max_lan_members]isis_dis.Candidate = undefined;
+        var n: usize = 0;
+        for (ls.members[0..ls.count], 0..) |_, i| {
+            if (i == c.slot or !c.alive[i]) continue;
+            cands[n] = candidateOf(ls, @intCast(i), c.lan, c.prio[i]);
+            n += 1;
+        }
+        c.election.local.priority = c.prio[c.slot];
+        const eff = c.election.recompute(cands[0..n], now);
+        c.is_dis = eff.result.is_local_dis;
+        for (ls.members[0..ls.count], 0..) |m, i| {
+            if (std.mem.eql(u8, &systemIdForNode(m.node), &eff.result.dis_system_id)) c.dis_slot = @intCast(i);
+        }
+        return eff.change != null;
+    }
+
+    /// One scheduled LAN event, as seen by `node` (a member of that LAN): update
+    /// the view, re-elect, and act on the outcome — resign (purge the pseudonode
+    /// LSP), become DIS (originate it), and re-originate the node's own LSP when
+    /// the DIS it names changed.
+    fn onLanEvent(self: *Fabric, node: NodeId, ev: LanEvent, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        for (ns.lan_circuits) |*c| {
+            if (c.lan != ev.lan) continue;
+            var membership_changed = false;
+            switch (ev.kind) {
+                .priority => |p| c.prio[ev.slot] = p,
+                .down => {
+                    membership_changed = c.alive[ev.slot];
+                    c.alive[ev.slot] = false;
+                },
+            }
+            const changed = self.runElection(c, now);
+            if (c.pn_live and !c.is_dis) {
+                c.pn_live = false;
+                try self.purgePseudonode(node, c, now);
+            } else if (c.is_dis and !c.pn_live) {
+                c.pn_live = true;
+                try self.originatePseudonode(node, c, now);
+            } else if (c.is_dis and membership_changed) {
+                try self.originatePseudonode(node, c, now);
+            }
+            if (changed) try self.originate(node, now);
+        }
+    }
+
+    /// (Re-)originate the pseudonode LSP of `c`'s LAN: every member this node
+    /// believes alive (itself included) at metric 0, ISO 10589 §7.2.5.
+    fn originatePseudonode(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        const ls = &self.lans[c.lan];
+        c.pn_seq += 1;
+        self.stats.last_change = now;
+        var buf: [1024]u8 = undefined;
+        var b = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = self.stampedLifetime(),
+            .lsp_id = self.pseudonodeId(node, c.lan),
+            .sequence_number = c.pn_seq,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        for (ls.members[0..ls.count], 0..) |m, i| {
+            if (!c.alive[i]) continue;
+            try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(systemIdForNode(m.node)), 0, &.{});
+        }
+        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
+    }
+
+    /// A resigning DIS purges the pseudonode LSP it had been originating
+    /// (§7.3.16.4: header-only, zero Remaining Lifetime, a higher sequence number)
+    /// and floods the purge.
+    fn purgePseudonode(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        c.pn_seq += 1;
+        self.stats.last_change = now;
+        var buf: [64]u8 = undefined;
+        var b = try isis.pdu.LspBuilder.init(&buf, .{
+            .remaining_lifetime = 0,
+            .lsp_id = self.pseudonodeId(node, c.lan),
+            .sequence_number = c.pn_seq,
+            .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+        });
+        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
     }
 
     /// Record and raise a safety-invariant violation. `check` never overwrites
@@ -726,7 +1151,7 @@ pub const Fabric = struct {
         for (self.nodes, 0..) |*ns, node| {
             // (1) Correct flooding stores exactly one LSP per originator;
             // anything beyond the node count is a runaway/corruption bug.
-            if (ns.lsdb.count() > n) return self.violate(error.LsdbOverflow);
+            if (ns.lsdb.count() > self.count_bound) return self.violate(error.LsdbOverflow);
 
             // (2) A stored sequence number never goes backwards, and an LSP a
             // node already holds never disappears (this harness never ticks
@@ -749,6 +1174,23 @@ pub const Fabric = struct {
                 }
                 slot.* = cur;
                 purged.* = if (view) |v| v.is_purge else false;
+            }
+
+            // (3) The same two rules for every pseudonode LSP any node could
+            // originate on any LAN.
+            for (0..self.lans.len) |lan| {
+                origin = 0;
+                while (origin < n) : (origin += 1) {
+                    const id = self.pseudonodeId(@intCast(origin), @intCast(lan));
+                    const view = ns.lsdb.get(id, 0);
+                    const cur: u32 = if (view) |v| v.sequence_number else 0;
+                    const at = (node * self.lans.len + lan) * n + origin;
+                    if (cur < self.seen_pn_seq[at]) {
+                        if (self.opts.aging == null or cur != 0 or !self.seen_pn_purge[at]) return self.violate(error.SequenceRegression);
+                    }
+                    self.seen_pn_seq[at] = cur;
+                    self.seen_pn_purge[at] = if (view) |v| v.is_purge else false;
+                }
             }
         }
     }
@@ -774,6 +1216,14 @@ pub const Fabric = struct {
             if (ns.link_failed[iface]) continue;
             const nbr_sys = self.nodes[nb.node].system_id;
             try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(nbr_sys), nb.metric, &.{});
+        }
+        // On a LAN a router lists the LAN's pseudonode (DIS system-id ++ circuit
+        // id) instead of every other member (ISO 10589 §7.2.5).
+        for (ns.lan_circuits) |c| {
+            const dis = systemIdForNode(self.lans[c.lan].members[c.dis_slot].node);
+            var id7 = neighbourId7(dis);
+            id7[6] = @intCast(c.lan + 1);
+            try isis.tlvs.addExtendedIsReach(&b.tlvs, id7, self.lans[c.lan].metric, &.{});
         }
         // ISO 10589 §7.3.11: the *source* IS computes the LSP Checksum when the
         // LSP is generated. This is that source, so it stamps — and it must, or
@@ -818,6 +1268,10 @@ pub const Fabric = struct {
         const r = ns.sched.poll(now, up, &ns.lsdb, &out, &scratch);
 
         for (r.effects) |e| {
+            if (ns.lanByIface(e.iface)) |c| {
+                try self.sendOnLan(sim, node, c, e);
+                continue;
+            }
             switch (e.kind) {
                 .lsp => self.stats.lsp_tx += 1,
                 .psnp, .csnp => self.stats.snp_tx += 1,
@@ -844,9 +1298,99 @@ pub const Fabric = struct {
         }
     }
 
+    /// Transmit one flooding effect on a LAN circuit: a frame on a broadcast
+    /// segment reaches every member, so it is sent to each one this node believes
+    /// alive (each copy is impaired by its own member-pair link).
+    ///
+    /// `isis-flood` has no broadcast mode (SPEC §12, the gap): it treats the LAN
+    /// circuit as point-to-point, so the two broadcast rules are applied here —
+    /// (1) an LSP sent on a LAN is not retransmitted until acknowledged: SRM is
+    /// cleared on transmission (ISO 10589 §7.3.15.1), the DIS's CSNP repairs
+    /// whatever was lost; (2) only the DIS transmits CSNPs, and the DIS transmits
+    /// no PSNP.
+    fn sendOnLan(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, e: isis_flood.Effect) anyerror!void {
+        const ns = &self.nodes[node];
+        switch (e.kind) {
+            .lsp => {},
+            .csnp => if (!c.is_dis or !self.opts.lan_csnp) return,
+            .psnp => if (c.is_dis) return,
+        }
+        const ls = &self.lans[c.lan];
+        for (ls.members[0..ls.count], 0..) |m, i| {
+            if (i == c.slot or !c.alive[i]) continue;
+            switch (e.kind) {
+                .lsp => self.stats.lsp_tx += 1,
+                .psnp, .csnp => self.stats.snp_tx += 1,
+            }
+            try sim.send(node, m.node, e.bytes);
+        }
+        if (e.kind == .lsp) {
+            const lsp = isis.Lsp.decode(e.bytes) catch return;
+            ns.lsdb.clearSrm(lsp.lsp_id, e.iface);
+        }
+    }
+
+    /// The request half of ISO 10589 §7.3.15.2 for a CSNP received on a LAN: an LSP
+    /// the DIS lists at a newer sequence number than ours (or that we lack) is
+    /// asked for with a PSNP.
+    ///
+    /// Harness-side workaround for a gap in `isis-lsdb`: its CSNP reconcile marks
+    /// the missing/newer entries for a request through `setSsnIfP2p`, i.e. only on
+    /// point-to-point circuits, so on a broadcast circuit no PSNP request is ever
+    /// produced and a member that lost an LSP never asks for it (the completeness
+    /// half — the DIS lacks something the member has — does work, it sets SRM).
+    /// The PSNP is built here from the CSNP's entries with `isis-flood`'s PSNP
+    /// builder; the DIS answers it through the ordinary `reconcilePsnp`.
+    fn requestFromCsnp(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, csnp: isis.Csnp, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        var want: [isis_flood.snp.max_entries_per_pdu]isis.tlvs.LspEntry = undefined;
+        var n: usize = 0;
+        var tlv_it = isis.tlv.TlvIterator.init(csnp.tlv_bytes);
+        while (tlv_it.next() catch return) |t| {
+            if (t.code != isis.tlvs.code.lsp_entries) continue;
+            var ei = isis.tlvs.LspEntryIterator.init(t.value);
+            while (ei.next() catch return) |entry| {
+                const have = ns.lsdb.get(entry.lsp_id, now);
+                var ours: isis.tlvs.LspEntry = .{ .remaining_lifetime = 0, .lsp_id = entry.lsp_id, .sequence_number = 0, .checksum = 0 };
+                if (have) |v| {
+                    if (!v.is_request) {
+                        if (v.sequence_number >= entry.sequence_number) continue;
+                        ours = .{ .remaining_lifetime = v.remaining_lifetime, .lsp_id = entry.lsp_id, .sequence_number = v.sequence_number, .checksum = v.checksum };
+                    }
+                }
+                want[n] = ours;
+                n += 1;
+                if (n == want.len) {
+                    try self.sendPsnpOnLan(sim, node, c, want[0..n]);
+                    n = 0;
+                }
+            }
+        }
+        if (n > 0) try self.sendPsnpOnLan(sim, node, c, want[0..n]);
+    }
+
+    fn sendPsnpOnLan(self: *Fabric, sim: *netsim.Sim, node: NodeId, c: *LanCircuit, entries: []const isis.tlvs.LspEntry) anyerror!void {
+        var scratch: [512]u8 = undefined;
+        var src: [7]u8 = undefined;
+        src[0..6].* = self.nodes[node].system_id;
+        src[6] = 0;
+        const bytes = try isis_flood.snp.buildPsnp(&scratch, src, false, entries);
+        const ls = &self.lans[c.lan];
+        for (ls.members[0..ls.count], 0..) |m, i| {
+            if (i == c.slot or !c.alive[i]) continue;
+            self.stats.snp_tx += 1;
+            try sim.send(node, m.node, bytes);
+        }
+    }
+
+    /// The circuit a frame from `neighbour` arrives on: the point-to-point circuit
+    /// to it, else the LAN circuit both nodes are attached to.
     fn ifaceOf(self: *const Fabric, node: NodeId, neighbour: NodeId) ?u8 {
         for (self.nodes[node].neighbours, 0..) |nb, i| {
             if (nb.node == neighbour) return @intCast(i);
+        }
+        for (self.nodes[node].lan_circuits) |c| {
+            if (self.lans[c.lan].slotOf(neighbour) != null) return c.iface;
         }
         return null;
     }
@@ -893,6 +1437,16 @@ pub const Fabric = struct {
             // ceiling bounds memory even against a non-terminating bug.
             .max_events_cap = self.opts.max_events_cap,
         };
+
+        self.lan_run.clearRetainingCapacity();
+        try self.lan_run.appendSlice(self.gpa, self.lan_events.items);
+        if (self.crash) |c| {
+            // The crashed router's LAN peers notice after the hello holding time.
+            for (self.lans, 0..) |ls, li| {
+                const slot = ls.slotOf(c.node) orelse continue;
+                try self.lan_run.append(self.gpa, .{ .time = c.time + self.opts.lan_hold_time, .lan = @intCast(li), .slot = slot, .kind = .down });
+            }
+        }
 
         g_active_fabric = self;
         defer g_active_fabric = null;
@@ -965,7 +1519,7 @@ pub const Fabric = struct {
         srm.setIntersection(up);
         if (srm.count() != 0) return false;
         var iface: u8 = 0;
-        while (iface < ns.neighbours.len) : (iface += 1) {
+        while (iface < ns.ifaceCount()) : (iface += 1) {
             if (!up.isSet(iface)) continue;
             var it = ns.lsdb.ssnIterator(iface);
             if (it.next() != null) return false;
@@ -986,31 +1540,40 @@ pub const Fabric = struct {
     /// node 0 over all originators; a partitioned fabric will NOT agree (use the
     /// SPF-reachability accessors there instead).
     pub fn lsdbsAgree(self: *const Fabric) bool {
-        const now: Time = 0;
         // A crashed node's frozen database is not part of the fabric any more.
         var first: NodeId = 0;
         while (first < self.nodes.len and self.isDead(first)) first += 1;
         if (first == self.nodes.len) return true;
         var origin: NodeId = 0;
         while (origin < self.nodes.len) : (origin += 1) {
-            const id = lspIdOf(systemIdForNode(origin), 0);
-            const ref = self.nodes[first].lsdb.get(id, now);
-            var node: NodeId = first + 1;
-            while (node < self.nodes.len) : (node += 1) {
-                if (self.isDead(node)) continue;
-                const got = self.nodes[node].lsdb.get(id, now);
-                if ((ref == null) != (got == null)) return false;
-                if (ref) |rv| {
-                    if (rv.sequence_number != got.?.sequence_number) return false;
-                    // F4: sequence-number parity alone lets two nodes "agree"
-                    // while holding different LSP bodies for the same
-                    // originator/sequence — exactly what a mis-ordered or
-                    // partially-applied update looks like. `originate` now
-                    // stamps a real ISO 10589 §7.3.11 checksum (no longer
-                    // `checksum = 0`), so the stored bytes are a real,
-                    // content-sensitive oracle: compare them in full.
-                    if (!std.mem.eql(u8, rv.bytes, got.?.bytes)) return false;
-                }
+            if (!self.agreeOn(first, lspIdOf(systemIdForNode(origin), 0))) return false;
+            // ... and on every pseudonode LSP a node could have originated.
+            for (0..self.lans.len) |lan| {
+                if (!self.agreeOn(first, self.pseudonodeId(origin, @intCast(lan)))) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether every live node holds the same copy of `id` as node `first`.
+    fn agreeOn(self: *const Fabric, first: NodeId, id: isis_lsdb.LspId) bool {
+        const now: Time = 0;
+        const ref = self.nodes[first].lsdb.get(id, now);
+        var node: NodeId = first + 1;
+        while (node < self.nodes.len) : (node += 1) {
+            if (self.isDead(node)) continue;
+            const got = self.nodes[node].lsdb.get(id, now);
+            if ((ref == null) != (got == null)) return false;
+            if (ref) |rv| {
+                if (rv.sequence_number != got.?.sequence_number) return false;
+                // F4: sequence-number parity alone lets two nodes "agree"
+                // while holding different LSP bodies for the same
+                // originator/sequence — exactly what a mis-ordered or
+                // partially-applied update looks like. `originate` now
+                // stamps a real ISO 10589 §7.3.11 checksum (no longer
+                // `checksum = 0`), so the stored bytes are a real,
+                // content-sensitive oracle: compare them in full.
+                if (!std.mem.eql(u8, rv.bytes, got.?.bytes)) return false;
             }
         }
         return true;
@@ -1041,6 +1604,58 @@ pub const Fabric = struct {
     /// run, or null when it holds none.
     pub fn remainingLifetime(self: *const Fabric, node: NodeId, origin: NodeId) ?u16 {
         return self.nodes[node].lsdb.remainingLifetime(lspIdOf(systemIdForNode(origin), 0), self.readTime());
+    }
+
+    // ── LAN inspection ───────────────────────────────────────────────────────
+
+    /// The router `node` currently regards as the DIS of `lan`, or null when
+    /// `node` is not on that LAN.
+    pub fn disOf(self: *const Fabric, node: NodeId, lan: u16) ?NodeId {
+        for (self.nodes[node].lan_circuits) |c| {
+            if (c.lan == lan) return self.lans[lan].members[c.dis_slot].node;
+        }
+        return null;
+    }
+
+    /// Whether `node` is (in its own view) the DIS of `lan`.
+    pub fn isDis(self: *const Fabric, node: NodeId, lan: u16) bool {
+        for (self.nodes[node].lan_circuits) |c| {
+            if (c.lan == lan) return c.is_dis;
+        }
+        return false;
+    }
+
+    /// The stored sequence number `node` holds for the pseudonode LSP that
+    /// `dis` originates for `lan`, or null if it holds none.
+    pub fn pseudonodeSequence(self: *const Fabric, node: NodeId, lan: u16, dis: NodeId) ?u32 {
+        const v = self.nodes[node].lsdb.get(self.pseudonodeId(dis, lan), 0) orelse return null;
+        return v.sequence_number;
+    }
+
+    /// Whether `node` holds that pseudonode LSP as a purge.
+    pub fn holdsPseudonodePurge(self: *const Fabric, node: NodeId, lan: u16, dis: NodeId) bool {
+        const v = self.nodes[node].lsdb.get(self.pseudonodeId(dis, lan), 0) orelse return false;
+        return v.is_purge;
+    }
+
+    /// The members (node ids) that pseudonode LSP lists in `node`'s database,
+    /// written into `out`; the count, or null if `node` holds no live copy.
+    pub fn pseudonodeMembers(self: *const Fabric, node: NodeId, lan: u16, dis: NodeId, out: []NodeId) ?usize {
+        const v = self.nodes[node].lsdb.get(self.pseudonodeId(dis, lan), self.readTime()) orelse return null;
+        if (v.is_purge) return null;
+        const lsp = isis.Lsp.decode(v.bytes) catch return null;
+        var n: usize = 0;
+        var tlv_it = lsp.tlvIterator();
+        while (tlv_it.next() catch return null) |t| {
+            if (t.code != isis.tlvs.code.extended_is_reachability) continue;
+            var eit = isis.tlvs.ExtIsReachIterator.init(t.value);
+            while (eit.next() catch return null) |e| {
+                if (n == out.len) return n;
+                out[n] = @as(u32, e.neighbour_id[4]) * 256 + e.neighbour_id[5] - 1;
+                n += 1;
+            }
+        }
+        return n;
     }
 
     /// The current sequence number of `node`'s own LSP (how many times it has
@@ -1092,6 +1707,19 @@ fn buildScenario(sim: *netsim.Sim) anyerror!void {
                     if ((o.a == a and o.b == nb.node) or (o.b == a and o.a == nb.node)) cfg = o.link;
                 }
                 try sim.addBiLink(@intCast(a), nb.node, cfg);
+            }
+        }
+    }
+    // A LAN is modelled as a full mesh of member-to-member links (SPEC §12), so a
+    // frame reaches every member and each copy is impaired on its own link.
+    for (fab.lans) |ls| {
+        for (ls.members[0..ls.count], 0..) |ma, mi| {
+            for (ls.members[mi + 1 .. ls.count]) |mb| {
+                var cfg = ls.link orelse fab.opts.link;
+                for (fab.opts.link_overrides) |o| {
+                    if ((o.a == ma.node and o.b == mb.node) or (o.b == ma.node and o.a == mb.node)) cfg = o.link;
+                }
+                try sim.addBiLink(ma.node, mb.node, cfg);
             }
         }
     }
@@ -2085,4 +2713,272 @@ test "TEETH: a live LSP vanishing during an aging run is still a violation" {
     fab.broken_wipe_node = 2;
     try testing.expectEqual(Outcome.safety_violated, try fab.runToConvergence(2_000));
     try testing.expectEqual(@as(?anyerror, error.SequenceRegression), fab.violation);
+}
+
+// ── LAN (broadcast) circuits ─────────────────────────────────────────────────
+//
+// SPEC §12. One LAN of four routers (nodes 0..3) with a point-to-point tail
+// 0 — 4 — 5 hanging off member 0. The default SNPAs order the members by node
+// number, so with equal priorities node 3 is the DIS.
+
+const lan_members = [_]LanMember{ .{ .node = 0 }, .{ .node = 1 }, .{ .node = 2 }, .{ .node = 3 } };
+const lan_segments = [_]Lan{.{ .members = &lan_members, .metric = 10 }};
+const lan_tail = [_]Edge{
+    .{ .a = 0, .b = 4, .metric = 10 },
+    .{ .a = 4, .b = 5, .metric = 10 },
+};
+const lan_topo = Topology{ .node_count = 6, .edges = &lan_tail, .lans = &lan_segments };
+
+/// An LSP's #22 neighbour ids as `holder` stores them for `origin`'s own LSP.
+fn neighbourIdsOf(fab: *const Fabric, holder: NodeId, origin: NodeId, out: *[8][7]u8) !usize {
+    const v = fab.nodes[holder].lsdb.get(lspIdOf(systemIdForNode(origin), 0), 0) orelse return error.NotHeld;
+    const lsp = try isis.Lsp.decode(v.bytes);
+    var n: usize = 0;
+    var tlv_it = lsp.tlvIterator();
+    while (try tlv_it.next()) |t| {
+        if (t.code != isis.tlvs.code.extended_is_reachability) continue;
+        var eit = isis.tlvs.ExtIsReachIterator.init(t.value);
+        while (try eit.next()) |e| {
+            out[n] = e.neighbour_id;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+test "LAN: 4 routers + a P2P tail converge; the DIS originates the pseudonode; members list it, not each other" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 0x1A4);
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect(fab.lsdbsAgree());
+
+    // Everyone on the LAN elected node 3 (equal priority, highest SNPA); the
+    // tail nodes are not on it.
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        try testing.expectEqual(@as(?NodeId, 3), fab.disOf(node, 0));
+        try testing.expectEqual(node == 3, fab.isDis(node, 0));
+    }
+    try testing.expectEqual(@as(?NodeId, null), fab.disOf(4, 0));
+
+    // Every node — LAN or tail — holds the pseudonode LSP at sequence 1 and all
+    // six router LSPs; nobody holds a pseudonode LSP of any other DIS.
+    node = 0;
+    while (node < 6) : (node += 1) {
+        try testing.expectEqual(@as(?u32, 1), fab.pseudonodeSequence(node, 0, 3));
+        try testing.expectEqual(@as(?u32, null), fab.pseudonodeSequence(node, 0, 2));
+        var origin: NodeId = 0;
+        while (origin < 6) : (origin += 1) try testing.expect(fab.storedSequence(node, origin) != null);
+    }
+
+    // The pseudonode LSP lists the four members.
+    var members: [8]NodeId = undefined;
+    try testing.expectEqual(@as(?usize, 4), fab.pseudonodeMembers(5, 0, 3, &members));
+    try testing.expectEqualSlices(NodeId, &.{ 0, 1, 2, 3 }, members[0..4]);
+
+    // A LAN-only member lists exactly one neighbour — the pseudonode (DIS
+    // system-id ++ circuit id 1), metric-carrying entry, NOT the other three.
+    var ids: [8][7]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try neighbourIdsOf(&fab, 5, 1, &ids));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 4, 1 }, &ids[0]);
+    // The member with the tail lists the pseudonode and its P2P neighbour.
+    try testing.expectEqual(@as(usize, 2), try neighbourIdsOf(&fab, 5, 0, &ids));
+
+    // Quiescent, and nothing was lost: the LAN needed no repair.
+    try testing.expect(fab.allQuiescent());
+    try testing.expectEqual(@as(u64, 0), fab.stats.net_dropped);
+}
+
+test "LAN: SPF routes through the pseudonode and composes with the P2P tail" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 0x1A5);
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+
+    // The point-to-point part: the tail reaches the LAN member it hangs off.
+    try testing.expectEqual(systemIdForNode(4), (try fab.reaches(testing.allocator, 5, 4)).?);
+    try testing.expectEqual(systemIdForNode(4), (try fab.reaches(testing.allocator, 0, 5)).?);
+    var t5 = try fab.routes(testing.allocator, 5);
+    defer t5.deinit();
+    try testing.expectEqual(@as(u64, 20), t5.lookup(systemIdForNode(0)).?.metric);
+
+    // LAN transit (isis-spf, since 2026-09-30): members reach each other in
+    // one LAN hop at their own metric toward the pseudonode (10), and the tail
+    // reaches the far members through member 0: 5 → 4 → 0 → 3 = 30. Until
+    // isis-spf gained pseudonode transit this test pinned the opposite (the
+    // LAN members were unreachable from one another).
+    try testing.expectEqual(systemIdForNode(2), (try fab.reaches(testing.allocator, 1, 2)).?);
+    var t1 = try fab.routes(testing.allocator, 1);
+    defer t1.deinit();
+    try testing.expectEqual(@as(u64, 10), t1.lookup(systemIdForNode(2)).?.metric);
+    try testing.expectEqual(systemIdForNode(4), (try fab.reaches(testing.allocator, 5, 3)).?);
+    try testing.expectEqual(@as(u64, 30), t5.lookup(systemIdForNode(3)).?.metric);
+    try testing.expectEqual(systemIdForNode(0), (try fab.reaches(testing.allocator, 3, 5)).?);
+    // The pseudonode is never a destination.
+    try testing.expectEqual(@as(usize, 6), t5.routes.len);
+}
+
+const lan_failover_step: Time = 20_000;
+
+test "LAN: DIS preemption — a raised priority takes the DIS, the old pseudonode LSP is purged, the new one floods" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 0xFA11);
+    defer fab.deinit();
+    // Node 1 raises its priority at t=5000: every member re-elects at once
+    // (ISO 10589 §8.4.5: immediate preemption, no hold-down).
+    try fab.setLanPriorityAt(0, 1, 100, 5_000);
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lan_failover_step));
+    try testing.expect(fab.lsdbsAgree());
+
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        try testing.expectEqual(@as(?NodeId, 1), fab.disOf(node, 0));
+    }
+    // The old DIS resigned: its pseudonode LSP is a purge (sequence 2) at EVERY
+    // node, the new DIS's LSP is live (sequence 1) and lists all four members.
+    node = 0;
+    while (node < 6) : (node += 1) {
+        try testing.expectEqual(@as(?u32, 2), fab.pseudonodeSequence(node, 0, 3));
+        try testing.expect(fab.holdsPseudonodePurge(node, 0, 3));
+        try testing.expectEqual(@as(?u32, 1), fab.pseudonodeSequence(node, 0, 1));
+        try testing.expect(!fab.holdsPseudonodePurge(node, 0, 1));
+    }
+    var members: [8]NodeId = undefined;
+    try testing.expectEqual(@as(?usize, 4), fab.pseudonodeMembers(5, 0, 1, &members));
+    // Every member re-originated once, naming the new pseudonode.
+    var ids: [8][7]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try neighbourIdsOf(&fab, 5, 2, &ids));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 2, 1 }, &ids[0]);
+    try testing.expectEqual(@as(u32, 2), fab.selfSequence(2));
+    // The tail node never re-originated: it is not on the LAN.
+    try testing.expectEqual(@as(u32, 1), fab.selfSequence(5));
+}
+
+test "LAN: DIS crash — peers declare it dead, elect the next, the dead pseudonode LSP ages out" {
+    var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 0xDEAD, .{ .aging = .{} });
+    defer fab.deinit();
+    // The DIS (node 3) dies at t=1000, after its refresh at 900. Nobody is told;
+    // its peers notice `lan_hold_time` (30) later.
+    fab.crash = .{ .node = 3, .time = 1_000 };
+
+    // Just after detection: node 2 (next-highest SNPA) is DIS in every survivor's
+    // view and its pseudonode LSP lists the three survivors; the dead DIS's
+    // pseudonode LSP is still held live (it can only age out).
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(1_500));
+    var node: NodeId = 0;
+    while (node < 3) : (node += 1) try testing.expectEqual(@as(?NodeId, 2), fab.disOf(node, 0));
+    var members: [8]NodeId = undefined;
+    try testing.expectEqual(@as(?usize, 3), fab.pseudonodeMembers(5, 0, 2, &members));
+    try testing.expectEqualSlices(NodeId, &.{ 0, 1, 2 }, members[0..3]);
+    try testing.expect(fab.pseudonodeSequence(0, 0, 3) != null);
+    try testing.expect(!fab.holdsPseudonodePurge(0, 0, 3));
+
+    // Long after: the dead DIS's pseudonode LSP and router LSP were purged and
+    // removed everywhere alive, the survivors agree, and the new DIS keeps
+    // refreshing its own pseudonode LSP.
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(4_000));
+    try testing.expect(fab.lsdbsAgree());
+    for ([_]NodeId{ 0, 1, 2, 4, 5 }) |n| {
+        try testing.expectEqual(@as(?u32, null), fab.pseudonodeSequence(n, 0, 3));
+        try testing.expect(!fab.holds(n, 3));
+        try testing.expect(fab.pseudonodeSequence(n, 0, 2).? > 1);
+    }
+    try testing.expect(fab.stats.purges_removed > 0);
+}
+
+const LanRun = struct { agree: usize, converged: usize, dropped: u64, snp_tx: u64, last_change_sum: Time };
+
+fn runLossyLan(seeds: u64, loss: u16, lan_csnp: bool) !LanRun {
+    var r: LanRun = .{ .agree = 0, .converged = 0, .dropped = 0, .snp_tx = 0, .last_change_sum = 0 };
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, seed, .{
+            .link = .{ .latency = link_latency, .loss_permille = loss },
+            .retransmit_interval = 40,
+            .csnp_interval = 20,
+            .lan_csnp = lan_csnp,
+        });
+        defer fab.deinit();
+        const out = try fab.runToConvergence(2_000);
+        if (out == .converged) r.converged += 1;
+        if (fab.lsdbsAgree()) r.agree += 1;
+        r.dropped += fab.stats.net_dropped;
+        r.snp_tx += fab.stats.snp_tx;
+        r.last_change_sum += fab.stats.last_change;
+    }
+    return r;
+}
+
+test "MEASURED: a lossy LAN converges through the DIS's CSNPs; without them it stays behind" {
+    // 48 LAN runs take ~47 s in Debug and well under a second optimized; the
+    // Debug lane keeps 4 seeds, which still show every property below (the
+    // CSNP-off control agreed on 0 of 16).
+    const seeds: usize = if (@import("builtin").mode == .Debug) 4 else 16;
+    // Lossless control: nothing dropped, every seed agrees.
+    const clean = try runLossyLan(seeds, 0, true);
+    try testing.expectEqual(@as(u64, 0), clean.dropped);
+    try testing.expectEqual(@as(usize, seeds), clean.agree);
+
+    // 20 % loss, CSNPs on: loss really happened, and every seed still converges
+    // and agrees — on the LAN an LSP is sent once (SRM is cleared on
+    // transmission), so only the CSNP/PSNP exchange can have repaired it.
+    const with = try runLossyLan(seeds, 200, true);
+    try testing.expect(with.dropped > 0);
+    try testing.expectEqual(@as(usize, seeds), with.converged);
+    try testing.expectEqual(@as(usize, seeds), with.agree);
+    // ... and it took longer than the clean run.
+    try testing.expect(with.last_change_sum > clean.last_change_sum);
+
+    // NEGATIVE CONTROL: the identical runs with the DIS's CSNPs switched off.
+    // Loss is the same, so lost LSPs are simply never repaired: some LSDB stays
+    // behind. If the LAN path passed by accident (e.g. through the P2P
+    // retransmission of the tail), this would agree everywhere.
+    const without = try runLossyLan(seeds, 200, false);
+    try testing.expect(without.dropped > 0);
+    try testing.expect(without.agree < seeds);
+    try testing.expect(with.agree > without.agree);
+}
+
+test "LAN: a per-member-pair override impairs exactly that pair; the other pairs stay clean" {
+    var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 0x0FF, .{
+        .link_overrides = &.{.{ .a = 1, .b = 2, .link = .{ .latency = link_latency, .loss_permille = 500 } }},
+        .csnp_interval = 20,
+        .retransmit_interval = 40,
+    });
+    defer fab.deinit();
+    _ = try fab.runToConvergence(2_000);
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expect(fab.dropsBetween(1, 2) + fab.dropsBetween(2, 1) > 0);
+    try testing.expectEqual(@as(u64, 0), fab.dropsBetween(0, 1) + fab.dropsBetween(1, 0));
+    try testing.expectEqual(@as(u64, 0), fab.dropsBetween(2, 3) + fab.dropsBetween(3, 2));
+}
+
+test "determinism: a LAN run with a preemption replays byte-for-byte and a re-run matches" {
+    const Build = struct {
+        fn make(gpa: Allocator) !Fabric {
+            var fab = try Fabric.initWithOptions(gpa, lan_topo, 0xBEEF, .{
+                .link = .{ .latency = link_latency, .loss_permille = 100 },
+                .retransmit_interval = 40,
+                .csnp_interval = 20,
+            });
+            errdefer fab.deinit();
+            try fab.setLanPriorityAt(0, 0, 90, 600);
+            return fab;
+        }
+    };
+    var f1 = try Build.make(testing.allocator);
+    defer f1.deinit();
+    var f2 = try Build.make(testing.allocator);
+    defer f2.deinit();
+    _ = try f1.runToConvergence(2_000);
+    _ = try f2.runToConvergence(2_000);
+    try testing.expect(std.meta.eql(f1.stats, f2.stats));
+    try testing.expect(f1.last_log.eql(&f2.last_log));
+    try testing.expectEqual(@as(?NodeId, 0), f1.disOf(2, 0));
+
+    // Reset restores t=0 (elections, views, pseudonode sequence): the same Fabric
+    // driven again reproduces its first run.
+    const first = f1.stats;
+    _ = try f1.runToConvergence(2_000);
+    try testing.expect(std.meta.eql(first, f1.stats));
+    try testing.expect(f1.last_log.eql(&f2.last_log));
+    try testing.expectEqual(@as(?u32, 1), f1.pseudonodeSequence(2, 0, 0));
 }

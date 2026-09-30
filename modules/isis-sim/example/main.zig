@@ -110,4 +110,29 @@ pub fn main() !void {
     if (aging.holds(0, 2) or aging.stats.purges_removed == 0) return error.DeadLspNotAged;
     if ((try aging.reaches(gpa, 0, 2)) != null) return error.DeadNodeStillRouted;
     if ((try aging.reaches(gpa, 0, 1)) == null) return error.SurvivorUnreachable;
+
+    // ── a LAN with a DIS ────────────────────────────────────────────────────
+    // Routers 0..3 share a LAN (router 3 has the highest SNPA, so it is the DIS
+    // and originates the pseudonode LSP); a P2P tail 0-4-5 hangs off router 0.
+    // 20% loss on every link: an LSP is sent once on a LAN, so only the DIS's
+    // periodic CSNP (and the members' PSNP requests) can repair it. Router 1
+    // then raises its priority and preempts the DIS.
+    const members = [_]isis_sim.LanMember{ .{ .node = 0 }, .{ .node = 1 }, .{ .node = 2 }, .{ .node = 3 } };
+    const lans = [_]isis_sim.Lan{.{ .members = &members }};
+    const tail = [_]isis_sim.Edge{ .{ .a = 0, .b = 4, .metric = 10 }, .{ .a = 4, .b = 5, .metric = 10 } };
+    var lan = try isis_sim.Fabric.initWithOptions(gpa, .{ .node_count = 6, .edges = &tail, .lans = &lans }, 5, .{
+        .link = .{ .latency = 2, .loss_permille = 200 },
+        .retransmit_interval = 40,
+        .csnp_interval = 20,
+    });
+    defer lan.deinit();
+    try lan.setLanPriorityAt(0, 1, 100, 1_000);
+    if (try lan.runToConvergence(3_000) != .converged) return error.LanNotConverged;
+    if (!lan.lsdbsAgree()) return error.LsdbsDisagree;
+    std.debug.print("lan: DIS is node {?d}, {d} messages dropped, old pseudonode LSP purged: {}\n", .{
+        lan.disOf(2, 0), lan.stats.net_dropped, lan.holdsPseudonodePurge(5, 0, 3),
+    });
+    if (lan.disOf(2, 0) != 1 or !lan.isDis(1, 0)) return error.WrongDis;
+    if (!lan.holdsPseudonodePurge(5, 0, 3)) return error.OldPseudonodeNotPurged;
+    if (lan.stats.net_dropped == 0) return error.LossWasIgnored;
 }

@@ -25,6 +25,9 @@
 //!     fabric-wide, `link_overrides` per link: loss / duplication / reordering /
 //!     jitter) and/or turn on LSP aging (`Options.aging`: `Lsdb.tick` driven from
 //!     the sim clock, own-LSP refresh, MaxAge purge). `Fabric.crash` stops a node.
+//!   - `Topology.lans` (`Lan`, `LanMember`) — LAN segments: DIS election (`isis-dis`),
+//!     pseudonode LSPs, CSNP/PSNP repair; `setLanPriorityAt`, `disOf`, `isDis`,
+//!     `pseudonodeSequence`, `pseudonodeMembers`, `holdsPseudonodePurge` (SPEC §12).
 //!   - `lsdbsAgree`, `routes`, `reaches`, `selfSequence`, `systemIdOf`, `stats`,
 //!     `holds`, `holdsPurge`, `remainingLifetime`, `dropsBetween` — inspect the
 //!     converged state and what the run cost.
@@ -44,7 +47,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .single_owner,
     .model_after = "netsim Protocol harness driving the isis-lsdb/flood/spf stack",
-    .deps = .{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" },
+    .deps = .{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf", "isis-dis" },
 };
 
 const fabric = @import("fabric.zig");
@@ -53,6 +56,9 @@ const fabric = @import("fabric.zig");
 pub const Fabric = fabric.Fabric;
 pub const Topology = fabric.Topology;
 pub const Edge = fabric.Edge;
+pub const Lan = fabric.Lan;
+pub const LanMember = fabric.LanMember;
+pub const max_lan_members = fabric.max_lan_members;
 pub const Outcome = fabric.Outcome;
 pub const Options = fabric.Options;
 pub const LinkOverride = fabric.LinkOverride;

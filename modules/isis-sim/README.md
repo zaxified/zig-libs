@@ -14,10 +14,11 @@ Status: **integration harness** — flooding + LSDB convergence, SPF route
 consistency, one mid-run link-fail **reconvergence**, **partition** detection, a
 **lossy medium** (loss/duplication/reordering/jitter, per link or fabric-wide,
 with the convergence cost measured) and **LSP aging, refresh and purge** (a dead
-originator's LSP ages out and SPF drops it), on a small (≤ 6-node)
-**static-adjacency P2P** fabric. Deliberately deferred: the adjacency FSM
-(`isis-adj`), restart of a crashed node, LAN pseudonodes, the SPB data-plane,
-scale/perf, and topology fuzzing — see `SPEC.md`.
+originator's LSP ages out and SPF drops it) and **LAN (broadcast) circuits** (DIS
+election via `isis-dis`, pseudonode LSPs, CSNP/PSNP repair over a lossy LAN), on a
+small (≤ 6-node) **static-adjacency** fabric. Deliberately deferred: the adjacency
+FSM (`isis-adj`), restart of a crashed node, LAN hellos, the SPB data-plane, scale/perf,
+and topology fuzzing — see `SPEC.md`.
 
 Model after: **`netsim`'s `Protocol` seam** (the VOPR-style discrete-event
 network simulator) driving the **ISO/IEC 10589** IS-IS control plane already
@@ -32,8 +33,8 @@ one layer this capstone omits). Each node's netsim links are its IS-IS circuits;
 the circuit index is the `iface` the whole isis stack keys SRM/SSN/`up` on.
 
 netsim node *n* maps deterministically to the 6-octet system-id of `n + 1`
-(`00:00:00:00:HH:LL`), and each node originates exactly **one** LSP (LSP-number
-0, no pseudonodes).
+(`00:00:00:00:HH:LL`), and each node originates one LSP (LSP-number 0) — plus the
+pseudonode LSP of every LAN it is the DIS of.
 
 ## How the isis stack plugs into netsim's Protocol vtable
 
@@ -42,7 +43,7 @@ netsim node *n* maps deterministically to the 6-octet system-id of `n + 1`
 | **onStart(node)** | Originate the node's own LSP — one Extended IS Reachability (#22) entry per currently-up neighbour, sequence 1 — and `lsdb.insert` it self-originated (`arrival_iface = null` → SRM on every circuit). Arm the first flooding poll; pre-arm one timer per scheduled link failure this node terminates. |
 | **onMessage(node, from, payload)** | `isis.decode` the PDU: an **LSP** → `lsdb.insert(bytes, arrival_iface, now)` (sets SRM to flood onward + SSN to ack); a **CSNP/PSNP** → `lsdb.reconcileCsnp`/`reconcilePsnp`. Then arm a flooding poll so the next `poll` drains the freshly-set flags. |
 | **onTimer(node, id)** | id 2 = *age now* (`Options.aging`): `Lsdb.tick(now)`, then re-originate this node's own LSP if it is due for refresh. id 0 = *poll now*: `isis-flood.poll(now, up, lsdb, …)`, `sim.send` every effect (LSP/PSNP/CSNP) to the neighbour on its circuit, re-arm while flooding work remains. id ≥ `fail_base` = *a link you terminate just failed*: mark that circuit down, then **re-originate** this node's LSP without the lost neighbour at a bumped sequence number, and flood. |
-| **check** | A safety invariant run after every event: no node's LSDB ever holds more than `node_count` distinct LSP-IDs (a runaway/corruption tripwire). |
+| **check** | Safety invariants run after every event: no node's LSDB holds more than `node_count` (+ pseudonode) LSP-IDs (a runaway/corruption tripwire), and no stored sequence goes backwards / no live LSP vanishes (router and pseudonode LSPs). |
 
 ## The three proofs
 
@@ -85,6 +86,31 @@ LSPs sent 192 → 363, drops 0 → 209 (SPEC §10). With aging, a steady state o
 node's LSP is purged everywhere at ~MaxAge, removed after ZeroAgeLifetime, and
 dropped from SPF; with refresh disabled every foreign LSP is purged (negative
 control) — SPEC §11.
+
+## LAN circuits
+
+```zig
+// LAN of nodes 0..3 (node 3 has the highest SNPA, so it is the DIS), a P2P tail 0-4-5.
+const members = [_]sim.LanMember{ .{ .node = 0 }, .{ .node = 1 }, .{ .node = 2 }, .{ .node = 3 } };
+const lans = [_]sim.Lan{.{ .members = &members }};
+var fab = try sim.Fabric.initWithOptions(gpa, .{ .node_count = 6, .edges = &tail, .lans = &lans }, seed, .{
+    .link = .{ .latency = 2, .loss_permille = 200 },
+    .retransmit_interval = 40,
+    .csnp_interval = 20, // the DIS's periodic CSNP is what repairs LAN loss
+});
+try fab.setLanPriorityAt(0, 1, 100, 5_000); // node 1 preempts the DIS at t=5000
+```
+
+A LAN is a full mesh of `netsim` links, so a frame reaches every member and each copy
+is impaired on its own link. `isis-dis` elects the DIS; the DIS originates the
+pseudonode LSP (members at metric 0), each member's own LSP lists the pseudonode
+instead of the others; a resigning DIS purges its pseudonode LSP. On a LAN an LSP is
+sent once (SRM cleared on transmission) and only the DIS's CSNP plus the members'
+PSNP requests repair loss: 16/16 lossy seeds agree with CSNPs, 0/16 without
+(`Options.lan_csnp = false`, the negative control). `fab.disOf`, `isDis`,
+`pseudonodeSequence`, `pseudonodeMembers`, `holdsPseudonodePurge` inspect the result.
+Two harness-side workarounds for sibling gaps and one open gap (`isis-spf` does not
+route through the pseudonode) are recorded in SPEC §12.
 
 ## Termination & quiescence
 

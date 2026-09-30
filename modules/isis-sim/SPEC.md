@@ -28,12 +28,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) interop suite | Go | Apache-2.0 — README only | 0 | v0.9.0 (2026-09-25) | "Continuous interop against FRR" (README) — tests a real daemon against a real peer, not a model. |
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` tests | Rust | MIT | 541 | v0.9.0 | Packet-level and northbound conformance tests; no in-process multi-node simulator found *(inferred from the source listing)*. |
 
-**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, point-to-point only, no adjacency FSM (a netsim link *is* the adjacency — so a dead node is found only by its LSP aging out, never by a hold timer), no LAN/DIS, no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10) and LSP aging, refresh and purge (SPEC §11) are in the run; what is still missing there is the *interaction* with a real adjacency layer. It proves the composition works; it is not a lab a user configures.
+**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer, and SPF routing *through* a pseudonode (`isis-spf` skips pseudonodes, so LAN members are not routed to each other — SPEC §12, Backlog). It proves the composition works; it is not a lab a user configures.
 
 ## 1. What this module is
 
-An **integration harness**, not a new protocol. It stands up a small point-to-point
-IS-IS fabric and drives the already-verified sibling stack — `isis` (codec),
+An **integration harness**, not a new protocol. It stands up a small IS-IS fabric of
+point-to-point circuits and (§12) LAN segments and drives the already-verified sibling stack — `isis` (codec),
 `isis-lsdb` (database + SRM/SSN flags), `isis-flood` (transmit scheduler),
 `isis-spf` (decision process) — on **every** node over the `netsim` discrete-event
 engine, then asserts the fabric converges, reconverges after a link failure, and
@@ -49,13 +49,15 @@ per netsim `NodeId`:
 
 - `system_id` — `00:00:00:00:HH:LL` of `node + 1` (deterministic, dense, never
   the all-zero id).
-- `neighbours` — one entry per circuit `{ neighbour NodeId, metric }`; the array
-  index **is** the IS-IS `iface` used by the whole stack. Built once from the
-  topology's undirected edge list.
+- `neighbours` — one entry per point-to-point circuit `{ neighbour NodeId, metric }`;
+  the array index **is** the IS-IS `iface` used by the whole stack. Built once from
+  the topology's undirected edge list. `lan_circuits` — one per LAN the node is on
+  (§12), with `iface = neighbours.len + k`.
 - `link_failed` — a per-circuit boolean, mutated during a run by the
   failure-reaction timer, reset to all-false at the start of every drive.
 - `lsdb` — an `isis-lsdb.Lsdb` with `interface_count = degree`, capacity
-  `node_count + 8` (P2P: no broadcast interfaces).
+  `node_count + 8` (+ one slot per LAN member for pseudonode LSPs); the LAN circuits
+  are its `broadcast_interfaces` (§12).
 - `sched` — an `isis-flood.Scheduler`.
 - `seq` — the node's own LSP sequence number, bumped on each (re-)origination.
 
@@ -218,7 +220,10 @@ always working regardless, this test would stop failing.
   refresh, MaxAge purge, ZeroAgeLifetime removal. Not modelled: a node that
   *purges its own* LSP on purpose (graceful shutdown), sequence-number
   exhaustion, and Remaining-Lifetime decrement in transit.
-- **LAN / pseudonodes.** P2P circuits only; no DIS, no pseudonode LSPs.
+- **LAN / pseudonodes.** In scope since §12 (DIS election, pseudonode LSP, CSNP/PSNP). Not
+  modelled: LAN hellos (membership is static, changed only by scheduled events), a
+  restarting DIS, multi-level DIS, LAN and P2P between the same node pair. SPF routing
+  *through* the pseudonode is missing in `isis-spf`, not here.
 - **SPB data-plane.** Control-plane convergence only; no `l2forward`/PBB
   forwarding.
 - **Scale / performance.** Fabrics are ≤ 6 nodes with a fixed set of golden
@@ -344,12 +349,109 @@ expiry re-advertising it) is not exercised; the tick alignment of the nodes
 (all copies expire within one 10-tick window, far inside ZeroAgeLifetime) is
 what keeps that race closed here.
 
+## 12. LAN (broadcast) circuits
+
+`Topology.lans` describes broadcast segments: per LAN a list of `LanMember`
+(`node`, DIS `priority`, `snpa`, default derived from the node number), the
+metric every member advertises toward the pseudonode and an optional medium.
+A node keeps one `LanCircuit` per LAN; its `iface` follows the P2P circuits and
+is registered as a `broadcast_interface` of the node's `isis-lsdb`. A pair of
+nodes may share at most one LAN and no P2P edge (asserted at `init`: the receiver
+could not tell the circuits apart).
+
+**Model choice: a full mesh of member-to-member `netsim` links.** `netsim` has
+only point-to-point links; the alternative, a hub node that replicates frames,
+would put a fake router into the fabric (its own queue, its own failure mode, one
+impairment per hop instead of per member). With the mesh, a frame on the LAN is
+`sim.send` to every member the sender believes alive, every copy is impaired on
+its own link (`Options.link`, `Lan.link`, and `Options.link_overrides` naming a
+member pair — so one lossy pair is expressible), and `netsim` needs no change.
+Cost: N-1 sends per frame, fine for `max_lan_members` = 8.
+
+**DIS election.** `isis-dis` (`elect` through `Election.recompute`): highest
+priority, ties by highest SNPA, immediate preemption. Each member elects over ITS
+view of the LAN (who is alive, at which priority). There are no LAN hellos (§8),
+so the view changes only through scheduled events, delivered to every member at
+the same tick: `setLanPriorityAt(lan, node, prio, time)`, and for a crashed
+member (`Fabric.crash`) a "declared dead" event `Options.lan_hold_time` (30
+ticks, the hello holding time the harness does not simulate) after the crash.
+On an election result: the member that becomes DIS originates the pseudonode
+LSP; the one that resigns purges it (§7.3.16.4: header only, zero lifetime,
+higher sequence) and floods the purge; a change of DIS re-originates every
+member's own LSP; a DIS that loses a member re-originates its pseudonode LSP.
+
+**LSPs (ISO 10589 §7.2.5).** The pseudonode LSP has LSP-ID `dis system-id ‖
+circuit-id (lan + 1) ‖ 0`, lists every live member (#22, metric 0) and ages,
+refreshes and is protected by `check` like a router LSP (the same two rules,
+per pseudonode LSP). A member's own LSP lists the LAN's pseudonode
+(`dis ‖ lan + 1`, metric `Lan.metric`) instead of the other members. `lsdbsAgree`
+compares pseudonode LSPs too.
+
+**Flooding on the LAN.** Real, from the siblings: `isis-lsdb` does not queue an
+SSN for an LSP received on a broadcast circuit and does not re-flood it back on
+it; `isis-flood` emits the LSP/PSNP/CSNP effects. Harness-side, because
+`isis-flood` has no broadcast mode (Backlog):
+- an LSP sent on a LAN circuit has its SRM **cleared on transmission**
+  (§7.3.15.1: no per-neighbour ack on broadcast) — `isis-flood` would retransmit
+  it forever, since no PSNP ever acks it;
+- only the **DIS** transmits CSNPs (`isis-flood` emits them on every circuit) and
+  members act only on the DIS's; only the DIS processes PSNPs, and the DIS
+  transmits none. `Options.lan_csnp = false` is the negative control;
+- **the request half of CSNP processing**: `isis-lsdb`'s CSNP reconcile requests a
+  missing/newer LSP through `setSsnIfP2p`, i.e. only on a P2P circuit, so a member
+  that lost an LSP never asks for it on a LAN. The harness builds that PSNP itself
+  (`requestFromCsnp`, `isis-flood`'s `snp.buildPsnp`) from the DIS's CSNP; the
+  DIS answers it with the ordinary `reconcilePsnp`. The completeness half (the
+  DIS lacks what a member holds → SRM on the LAN) works in `isis-lsdb`.
+
+**Measured** (`fabric.zig`, `MEASURED: a lossy LAN converges …`; 6 nodes: LAN of 4
+plus a 2-node P2P tail, seeds 1..16, retransmit 40, CSNP 20, horizon 2000):
+
+| medium | CSNPs | converged | LSDBs agree | drops | last LSDB change (mean) |
+|--|--|--:|--:|--:|--:|
+| lossless | on | 16/16 | 16/16 | 0 | 9 |
+| 20 % loss | on | 16/16 | 16/16 | 2485 | 78 |
+| 20 % loss | **off** (negative control) | 16/16 | **0/16** | 1448 | — |
+
+"Converged" is quiescence (nothing left to flood), which the CSNP-less runs reach
+too — they simply stop with holes; agreement is the real verdict. On the LAN an
+LSP is sent once, so nothing but the CSNP/PSNP exchange repairs a loss; the P2P
+tail's retransmission cannot help a LAN member.
+
+**Scenarios.** (a) LAN of 4 + tail: every node elects node 3, every LSDB holds the
+pseudonode LSP at sequence 1 with the four members, a LAN-only member's LSP lists
+exactly the pseudonode. (b) Preemption at t = 5000: the new DIS wins everywhere,
+the old pseudonode LSP is a purge at every node, the new one is live, each member
+re-originated once, the tail node did not. DIS crash with aging: after detection
+the next-highest SNPA is DIS in every survivor and lists the three survivors; the
+dead DIS's pseudonode and router LSPs age out and are removed within 4000 ticks.
+(c)/(d) above. A per-pair override drops on exactly that pair; a LAN run with a
+preemption replays byte-for-byte and a re-run of the same `Fabric` reproduces it.
+
+**SPF through the pseudonode.** `isis-spf` gained LAN transit on 2026-09-30
+(its `addLanArcs`: members listed by the pseudonode and listing it back reach
+each other at their own metric). The LAN test asserts it: member 1 reaches
+member 2 in one LAN hop at 10, the tail node reaches member 3 through 4 and 0 at
+30, and the pseudonode never appears as a destination. The first revision of
+this section pinned the opposite as a GAP, which is how the sibling's gap was
+found.
+
+**Modelled vs real.** No LAN hellos / adjacency states; the election view is
+schedule driven and all members react on the same tick (real: within one hello
+interval, so a transient double DIS is possible and not exercised); the
+pseudonode id is `lan + 1` for everyone; a new DIS gets no immediate CSNP (the
+periodic cadence of `isis-flood` covers it); a cold restart of a DIS re-asserts
+its pseudonode LSP from its old sequence counter; L1 only; one LSP fragment per
+pseudonode. A frame to a crashed member is counted in `net_dropped` like any drop.
+
 ## Backlog / deferred
 
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
 - **Wire `isis-adj` into the fabric** (real hello exchange, hold-timer failure detection instead of the scheduled re-origination shim) (survey 2026-09-30). Why: removes the biggest caveat of the harness (SPEC §3) and exercises the adjacency layer under loss. Effort: ~2–3 days. Fits §2: yes.
 - **Arbitrary topology and fault-schedule input, larger fabrics** (survey 2026-09-30; the *lossy medium* part of this item is done, §10). Why: a user cannot describe their own fabric today; `netsim` already offers `run`/`shrink`. Effort: ~2 days. Fits §2: yes.
+- ~~**`isis-spf`: route through LAN pseudonodes**~~ — done 2026-09-30 in `isis-spf`; §12 asserts the routes.
+- **`isis-flood`: broadcast-circuit mode** (SRM cleared on transmit, CSNP only from the DIS, PSNP only from non-DIS) and **`isis-lsdb`: SSN request on a broadcast circuit from a CSNP** — both are done harness-side in §12 and belong in the siblings (2026-09-30, A9). Fits §2: yes.
 - ~~Aging, purge and refresh in the run~~ — done 2026-09-30, §11. What is left of it: graceful self-purge, restart of a crashed node, sequence exhaustion.
 
 ## Anchoring

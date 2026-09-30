@@ -192,7 +192,7 @@ const module_list = [_]Module{
     .{ .name = "isis-lsdb", .libs = &.{"net"}, .deps = &.{"isis"}, .test_deps = &.{"testkit"} },
     .{ .name = "isis-flood", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb" } },
     .{ .name = "isis-spf", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb", "spf-ect" }, .test_deps = &.{"testkit"} },
-    .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" } },
+    .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf", "isis-dis" } },
     .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .test_deps = &.{"testkit"} },
     .{ .name = "netsim", .libs = &.{"net"} },
