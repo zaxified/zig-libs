@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — `Pattern.matcher` (new `Matcher`): a string `pattern` checked by a caller-supplied
+  function (a regex from any library, or a hand-written test) with the expression's source text carried
+  for the exported JSON Schema (`"pattern": source`) and the `string_pattern_mismatch` message. ⚠ An
+  exhaustive `switch` over `Pattern` needs the new arm.
+
 - **2026-09-28** — **New: `parseQueryLeaky(T, arena, query, limits)`** — the typed query style: a
   query string decoded into struct `T`, validated against `rulesFor(T)` plus `T.validate_rules`
   (a declared rule may name a parameter `T` does not decode; it is checked all the same), with

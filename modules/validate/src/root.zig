@@ -60,9 +60,11 @@
 //! middleware and the handler must preserve `ctx.data` (the router's
 //! cooperative-scratch convention) or the getters return null.
 //!
-//! TODO(regex): `pattern` is deliberately literal/prefix/suffix/charset only —
-//! a regex engine is a future ADOPT dependency; when it lands, add
-//! `.regex: []const u8` to `Pattern` and map it to `string_pattern_mismatch`.
+//! Regex `pattern`: the repo has no regex engine, so `Pattern.matcher` takes
+//! the caller's (any `fn (ctx, string) bool` — a regex library, a hand-written
+//! check) together with the expression's source text, which this module never
+//! interprets: it is what the exported JSON Schema's `pattern` says and what
+//! the error message quotes (decision 2026-09-30).
 
 const std = @import("std");
 const router = @import("router");
@@ -108,7 +110,8 @@ const Value = std.json.Value;
 /// someone is relying on it. Audit 2026-09-02.
 pub const Kind = enum { string, int, float, bool, array, object, any };
 
-/// Simple string pattern — deliberately not regex (see the module TODO).
+/// String pattern: four built-in shapes, or a caller-supplied matcher (see
+/// the module doc on regex).
 pub const Pattern = union(enum) {
     /// Exact match.
     literal: []const u8,
@@ -118,6 +121,22 @@ pub const Pattern = union(enum) {
     suffix: []const u8,
     /// Every byte must be in this set (e.g. "0123456789abcdef-").
     charset: []const u8,
+    /// The caller's matcher, typically a regex from a library of their
+    /// choosing. `source` is carried for the exported JSON Schema
+    /// (`"pattern": source`) and the error message only; whether `source`
+    /// and `matchFn` agree is the caller's responsibility.
+    matcher: Matcher,
+};
+
+/// A caller-supplied string test for `Pattern.matcher`.
+pub const Matcher = struct {
+    /// The expression as JSON Schema would state it (ECMA-262 regex syntax
+    /// by that spec's convention).
+    source: []const u8,
+    /// Opaque state threaded to `matchFn` (a compiled regex, say).
+    ctx: ?*const anyopaque = null,
+    /// True when the whole string satisfies the pattern.
+    matchFn: *const fn (ctx: ?*const anyopaque, s: []const u8) bool,
 };
 
 /// String format assertions — the JSON Schema 2020-12 `format` vocabulary
@@ -839,6 +858,9 @@ fn checkPattern(b: *Builder, path: []const u8, s: []const u8, p: Pattern) Alloca
                 break;
             }
         },
+        // pydantic's wording for its own regex `pattern`.
+        .matcher => |m| if (!m.matchFn(m.ctx, s))
+            try b.appendf(path, "string_pattern_mismatch", "String should match pattern '{s}'", .{m.source}),
     }
 }
 
@@ -2570,6 +2592,10 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
             try s.objectField("pattern");
             try writeRegex(s, "^[", set, "]*$", true);
         },
+        .matcher => |m| {
+            try s.objectField("pattern");
+            try s.write(m.source);
+        },
     };
     if (r.format) |f| {
         try s.objectField("format");
@@ -3098,6 +3124,47 @@ test "one_of → enum code with the allowed list in the message" {
     var good = try validateJson(testing.allocator, "{\"color\":\"green\"}", &schema);
     defer good.deinit();
     try testing.expect(good.ok());
+}
+
+fn isUpperHex(_: ?*const anyopaque, s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!(std.ascii.isDigit(c) or (c >= 'A' and c <= 'F'))) return false;
+    return true;
+}
+
+fn hasPrefixCtx(ctx: ?*const anyopaque, s: []const u8) bool {
+    const prefix: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    return std.mem.startsWith(u8, s, prefix.*);
+}
+
+test "pattern: a caller-supplied matcher (regex stand-in) → string_pattern_mismatch, source in message and schema" {
+    const prefix: []const u8 = "sk_";
+    const schema = [_]Rule{
+        .{ .field = "id", .kind = .string, .pattern = .{ .matcher = .{ .source = "^[0-9A-F]+$", .matchFn = &isUpperHex } } },
+        .{ .field = "key", .kind = .string, .pattern = .{ .matcher = .{ .source = "^sk_", .ctx = @ptrCast(&prefix), .matchFn = &hasPrefixCtx } } },
+    };
+    var good = try validateJson(testing.allocator, "{\"id\":\"BEEF01\",\"key\":\"sk_live\"}", &schema);
+    defer good.deinit();
+    try testing.expect(good.ok());
+
+    var bad = try validateJson(testing.allocator, "{\"id\":\"beef\",\"key\":\"pk_live\"}", &schema);
+    defer bad.deinit();
+    try testing.expectEqual(@as(usize, 2), bad.errors.len);
+    try expectError(&bad, "id", "string_pattern_mismatch");
+    try expectError(&bad, "key", "string_pattern_mismatch");
+    try testing.expect(std.mem.indexOf(u8, bad.errors[0].message, "^[0-9A-F]+$") != null);
+
+    // A non-string never reaches the matcher (the kind check reports it).
+    var wrong = try validateJson(testing.allocator, "{\"id\":5,\"key\":\"sk_\"}", &schema);
+    defer wrong.deinit();
+    try testing.expectEqual(@as(usize, 1), wrong.errors.len);
+
+    // The exported JSON Schema states the source verbatim as `pattern`.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonSchema(&schema, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"pattern\":\"^[0-9A-F]+$\"") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"pattern\":\"^sk_\"") != null);
 }
 
 test "pattern: literal / prefix / suffix / charset → string_pattern_mismatch" {

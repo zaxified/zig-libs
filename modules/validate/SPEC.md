@@ -136,7 +136,7 @@ for a body the decoder rejects mid-way (so the invalid path still reports every 
 
 - **Cross-field rules** *(survey 2026-09-30)* — declarative `eq_field` / `required_if`-style rules (confirm-password, end-after-start). Why: go-playground's most-cited feature beyond single-field checks; today only a `custom` predicate on the parent object can express it. Effort: small-medium (a rule kind that takes a sibling name). Fits §2.
 - **Top-level array bodies** *(survey 2026-09-30)* — describe and validate a JSON array root (batch endpoints). Effort: small-medium. Fits §2. (Also named in *Threat model / out of scope*.)
-- **Regex `pattern`** *(survey 2026-09-30)* — already recorded above as an ADOPT dependency; the survey confirms it is the gap a go-playground/pydantic user hits first. Fits §2 only through a pure-Zig regex the repo does not have; the catalog says adopt `mnemnion/mvzr`. Kept as an open question for the coordinator (a `Rule.pattern` variant taking a caller-supplied matcher function would need no dependency).
+- ~~**Regex `pattern`**~~ *(survey 2026-09-30)* — **DONE 2026-09-30 (user decision) as `Pattern.matcher`**: the caller supplies the matcher (`fn (ctx, string) bool`, e.g. a regex library of their choosing) plus the expression source, which this module only exports (`"pattern"` in `writeJsonSchema`) and quotes in the error; still no regex engine in the repo, and no ADOPT dependency taken.
 - **More formats** *(survey 2026-09-30)* — `uuid` version/variant checks (the SPEC notes it checks shape only), `url` scheme restrictions (`http_url`), base64/hex, phone-number-like shapes. Effort: small per format; each anchored on the JSON-Schema-Test-Suite where a vector exists. Fits §2.
 
 ## Status
