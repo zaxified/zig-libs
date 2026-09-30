@@ -56,6 +56,9 @@
 //!   (see that file's module doc comment for exactly how).
 //! - `housekeeping.zig` -- `ping`/`pong`, `addr`/`getaddr`, `reject`
 //!   (flagged deprecated -- see that file's module doc comment).
+//! - `relay.zig` -- the feature/relay-policy messages around the
+//!   handshake: `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool`
+//!   (no payload), `feefilter`, `sendcmpct`.
 
 const std = @import("std");
 
@@ -83,6 +86,7 @@ pub const block_header = @import("block_header.zig");
 pub const inventory = @import("inventory.zig");
 pub const block = @import("block.zig");
 pub const housekeeping = @import("housekeeping.zig");
+pub const relay = @import("relay.zig");
 
 // ── re-exports: envelope ─────────────────────────────────────────────────
 
@@ -183,6 +187,16 @@ pub const Reject = housekeeping.Reject;
 pub const decodeReject = housekeeping.decodeReject;
 pub const serializeReject = housekeeping.serializeReject;
 
+// ── re-exports: relay ─────────────────────────────────────────────────────
+
+pub const FeeFilter = relay.FeeFilter;
+pub const decodeFeeFilter = relay.decodeFeeFilter;
+pub const serializeFeeFilter = relay.serializeFeeFilter;
+pub const SendCmpct = relay.SendCmpct;
+pub const decodeSendCmpct = relay.decodeSendCmpct;
+pub const serializeSendCmpct = relay.serializeSendCmpct;
+pub const expectEmpty = relay.expectEmpty;
+
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s
@@ -197,6 +211,7 @@ test {
     _ = inventory;
     _ = block;
     _ = housekeeping;
+    _ = relay;
 }
 
 test "meta.deps names bitcointx" {

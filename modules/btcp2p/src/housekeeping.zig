@@ -22,8 +22,9 @@
 //!   bandwidth concerns BIP61 itself documents. No mainline peer on the
 //!   network today sends this message; a caller of this module should
 //!   not expect one back.
-//! - **`mempool`**, **`sendheaders`**, **`feefilter`**, **`sendcmpct`**/
-//!   `cmpctblock`/`getblocktxn`/`blocktxn` (BIP152 compact blocks),
+//! - **`mempool`**, **`sendheaders`**, **`feefilter`**, **`sendcmpct`**
+//!   live in `relay.zig` since 2026-09-30; `cmpctblock`/`getblocktxn`/
+//!   `blocktxn` (the rest of BIP152 compact blocks),
 //!   `filterload`/`filteradd`/`filterclear`/`merkleblock` (BIP37 bloom
 //!   filters), and `checkorder`/`submitorder`/`reply` (IP Transactions,
 //!   "deprecated... no longer used" per the wiki itself) are all out of

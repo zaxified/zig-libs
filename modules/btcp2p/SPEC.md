@@ -225,7 +225,7 @@ canonical source is `pub const meta` in src/root.zig.
 
 ## Backlog / deferred
 
-- **Modern handshake/relay messages: `sendheaders`, `wtxidrelay`, `sendaddrv2`, `feefilter`, `sendcmpct`, `mempool`** (survey 2026-09-30) — every current Core peer sends these at connect; the SPEC calls them "not in the task's requested message set" (a reason of scope, not of principle). Effort S total (bare commands + fixed-width fields). Fits §2.
+- ~~**Modern handshake/relay messages: `sendheaders`, `wtxidrelay`, `sendaddrv2`, `feefilter`, `sendcmpct`, `mempool`**~~ — **DONE 2026-09-30** (`relay.zig`; user decision): payload-less ones via `expectEmpty` (strict: a byte is refused), `feefilter` with Core's money range, `sendcmpct` with Bitcoin `bool` semantics; the four empty messages' wire bytes pinned (checksum `5df6e0e2` of the empty payload). Was: (survey 2026-09-30) — every current Core peer sends these at connect; the SPEC calls them "not in the task's requested message set" (a reason of scope, not of principle). Effort S total (bare commands + fixed-width fields). Fits §2.
 - **`addrv2` (BIP155)** (survey 2026-09-30) — peers that speak it stop sending legacy `addr` for Tor/I2P/CJDNS. Effort M. Fits §2.
 - **BIP152 compact blocks and BIP157/158 client filter messages** (survey 2026-09-30) — the only efficient block relay and the light-client protocol; btcd and rust-bitcoin have them. Effort M–L. Fits §2.
 - **BIP324 v2 encrypted transport** (survey 2026-09-30) — Core's default outbound transport; needs ElligatorSwift (secp256k1) + ChaCha20-Poly1305 (`std` has the AEAD). Effort L; a separate `bip324` module is the likelier home. Fits §2.

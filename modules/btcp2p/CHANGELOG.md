@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — New `relay` messages every current Core peer sends around the handshake:
+  `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool` (names in `relay.command`, payload checked by
+  `expectEmpty`), `feefilter` (`decodeFeeFilter`/`serializeFeeFilter`, fee rate within `MAX_MONEY`) and
+  `sendcmpct` (`decodeSendCmpct`/`serializeSendCmpct`). Ordering rules (e.g. `wtxidrelay` before `verack`)
+  are documented and stay the caller's. `addrv2` and the compact-block messages themselves remain backlog.
+
 - **2026-09-14** — **BREAKING (error set widened):** `serializeBlock` returns
   `bitcointx.SerializeError` instead of `Allocator.Error`, following `bitcointx` audit M3: a
   hand-built `Block.txns` entry declaring `has_witness` without one witness stack per input is now
