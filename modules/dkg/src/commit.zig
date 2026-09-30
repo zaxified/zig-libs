@@ -31,6 +31,40 @@ pub fn scalarFromIndex(index: u32) Scalar {
     return Scalar.fromBytes(buf, .big) catch unreachable;
 }
 
+/// A uniformly-distributed-enough scalar from caller-supplied randomness
+/// (48 bytes reduced mod the group order, so the bias is ~2^-128). The
+/// intermediate buffer is wiped. Draw order matters for reproducibility: the
+/// lockstep driver and the per-participant API both draw with THIS shape.
+pub fn randomScalar(random: std.Random) Scalar {
+    var buf: [48]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    random.bytes(&buf);
+    return Scalar.fromBytes48(buf, .big);
+}
+
+/// Lagrange coefficient at zero, `λ_i = Π_{j∈ids, j≠i} j / (j − i)`, so that
+/// `F(0) = Σ_{i∈ids} λ_i F(i)` for any polynomial of degree `< ids.len`.
+/// `ids` must be distinct and non-zero (callers validate; a duplicate would
+/// invert zero) and must contain `i`.
+pub fn lagrangeAtZero(ids: []const u32, i: u32) Scalar {
+    const xi = scalarFromIndex(i);
+    var num = Scalar.one;
+    var den = Scalar.one;
+    for (ids) |j| {
+        if (j == i) continue;
+        const xj = scalarFromIndex(j);
+        num = num.mul(xj);
+        den = den.mul(xj.sub(xi));
+    }
+    return num.mul(den.invert());
+}
+
+/// `k · e` for a public element and a scalar.
+pub fn scaleElement(e: Element, k: Scalar) CommitError!Element {
+    const p = (try e.point()).mul(k.toBytes(.big), .big) catch return error.IdentityElement;
+    return Element.fromPoint(p);
+}
+
 /// `f(x) = coeffs[0] + coeffs[1]·x + … + coeffs[t-1]·x^{t-1}` via Horner
 /// (constant term `coeffs[0]` added last). `coeffs` and the output are
 /// SECRET; every op goes through `Scalar`'s constant-time arithmetic.

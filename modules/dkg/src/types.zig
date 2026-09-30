@@ -131,6 +131,36 @@ pub const ShareMsg = struct {
     }
 };
 
+/// Resharing point-to-point (and, on complaint, broadcast): old party
+/// `dealer` hands new party `receiver` its evaluation `g_dealer(receiver)` of
+/// the resharing polynomial. Unlike `ShareMsg` there is no blinding value:
+/// resharing uses plain Feldman VSS, the secret being dealt is fixed (an old
+/// share), so there is no key bias to prevent.
+pub const ScalarShareMsg = struct {
+    dealer: u32,
+    receiver: u32,
+    s: Scalar,
+
+    pub const encoded_length = 8 + Ns;
+
+    pub fn toBytes(self: ScalarShareMsg) [encoded_length]u8 {
+        var out: [encoded_length]u8 = undefined;
+        std.mem.writeInt(u32, out[0..4], self.dealer, .big);
+        std.mem.writeInt(u32, out[4..8], self.receiver, .big);
+        @memcpy(out[8..][0..Ns], &self.s.toBytes(.big));
+        return out;
+    }
+
+    pub fn fromBytes(bytes: [encoded_length]u8) CodecError!ScalarShareMsg {
+        const s = Scalar.fromBytes(bytes[8..][0..Ns].*, .big) catch return error.InvalidEncoding;
+        return .{
+            .dealer = std.mem.readInt(u32, bytes[0..4], .big),
+            .receiver = std.mem.readInt(u32, bytes[4..8], .big),
+            .s = s,
+        };
+    }
+};
+
 /// Round 2 broadcast: `complainant` asserts that dealer `accused`'s
 /// round-1 share failed the Pedersen verification equation. The presence
 /// of a complaint does not by itself disqualify — `computeQual` weighs

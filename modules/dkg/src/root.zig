@@ -14,11 +14,19 @@
 //! the frost-dedup verdict (frost has NO DKG — trusted dealer only — so
 //! this is genuinely new work, not an adaptation).
 //!
-//! **Scope (Phase 1): the secret-key DKG only.** Output is per-party ECDSA
+//! **Scope: the secret-key DKG and resharing.** Output is per-party ECDSA
 //! key material (`DkgShareOutput`) directly consumable by the existing
-//! `threshold_ecdsa` signing via `assembleKeyShares`. CGGMP21 signing-phase
-//! identifiable-abort, proactive refresh, and aux-parameter DKG are LATER
-//! increments (SPEC "Out of scope").
+//! `threshold_ecdsa` signing via `assembleKeyShares`. Two ways to run it:
+//!
+//!   * `Participant` — one party as its own sans-I/O state machine (bytes in,
+//!     bytes out), the shape a real deployment needs;
+//!   * `Dkg.run` — all parties in lockstep inside one process, the test driver
+//!     (the two produce byte-identical outputs for the same randomness).
+//!
+//! `ReshareDealer` / `ReshareReceiver` move a finished key to a new committee
+//! (new `n'`, `t'`, or the same one for proactive refresh) keeping the public
+//! key. CGGMP21 signing-phase identifiable-abort and aux-parameter DKG are
+//! LATER increments (SPEC "Out of scope").
 //!
 //! **Status — COMPLETE.** The five irreducible GJKR functions in
 //! `core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
@@ -61,7 +69,28 @@ pub const DkgShareOutput = types.DkgShareOutput;
 pub const Scalar = types.Scalar;
 pub const Element = types.Element;
 
+pub const ScalarShareMsg = types.ScalarShareMsg;
+
 pub const commit = @import("commit.zig");
+
+/// Frame kinds, routing targets and the typed errors of the per-participant
+/// state machines.
+pub const wire = @import("wire.zig");
+pub const Outgoing = wire.Outgoing;
+pub const Target = wire.Target;
+pub const MessageError = wire.MessageError;
+pub const freeOutgoing = wire.freeOutgoing;
+
+const participant = @import("participant.zig");
+pub const Participant = participant.Participant;
+pub const Phase = participant.Phase;
+
+const reshare = @import("reshare.zig");
+pub const ReshareConfig = reshare.ReshareConfig;
+pub const ReshareDealer = reshare.ReshareDealer;
+pub const ReshareReceiver = reshare.ReshareReceiver;
+pub const ReshareReceiverPhase = reshare.ReceiverPhase;
+pub const ReshareDealerPhase = reshare.DealerPhase;
 
 const core = @import("core.zig");
 pub const verifyPedersenShare = core.verifyPedersenShare;
@@ -210,6 +239,73 @@ test "END-TO-END ANCHOR: DKG shares -> threshold sign -> std ECDSA verify under 
     try sig.verify(message, pk); // the decisive assertion: DKG key is real + std-usable
 }
 
+test "END-TO-END (per-participant): DKG over frames -> sign -> refresh -> sign again under the SAME Q — GATED on core" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const tn = @import("testnet.zig");
+    var prng = std.Random.DefaultPrng.init(0xA9C_0E2F);
+    const random = prng.random();
+    const cfg: Config = .{ .t = 2, .n = 3 };
+
+    // 1. Each party its own state machine; the harness only moves bytes.
+    var net = try tn.TestNet.init(allocator, cfg, random);
+    defer net.deinit();
+    try net.run();
+    try testing.expectEqual(@as(usize, 0), net.refused);
+    const outs = try net.outputs();
+    defer tn.freeOutputs(allocator, outs);
+    try testing.expect(checks.allSameQ(outs));
+
+    // 2. Per-party Paillier + aux material (independent of the shares, so it
+    //    survives a refresh untouched).
+    const paillier_keys = try allocator.alloc(paillier.KeyPair, cfg.n);
+    defer allocator.free(paillier_keys);
+    const aux_params = try allocator.alloc(tecdsa.AuxParams, cfg.n);
+    defer allocator.free(aux_params);
+    for (0..cfg.n) |i| {
+        paillier_keys[i] = try paillier.generate(random, 2048);
+        aux_params[i] = try testAuxParams(random);
+    }
+    const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+    const pk = try ecdsa.PublicKey.fromSec1(&outs[0].group_public_key.toBytes());
+
+    const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params);
+    defer {
+        allocator.free(key_shares[0].public_keys.entries);
+        allocator.free(key_shares);
+    }
+    const sig = try tecdsa.signing.signWithShares(allocator, key_shares[0..2], "dkg per-participant anchor", random);
+    try sig.verify("dkg per-participant anchor", pk);
+
+    // 3. Proactive refresh: all three old parties reshare to the same committee.
+    var xs: [3]Element = undefined;
+    for (outs, &xs) |o, *x| x.* = o.verifying_share;
+    const rc: reshare.ReshareConfig = .{
+        .old = cfg,
+        .new = cfg,
+        .dealers = &.{ 1, 2, 3 },
+        .group_public_key = outs[0].group_public_key,
+        .old_verifying_shares = &xs,
+    };
+    var rig = try reshare.Rig.init(allocator, rc, outs, random);
+    defer rig.deinit();
+    try rig.run();
+    const fresh = try rig.outputs();
+    defer allocator.free(fresh);
+    try testing.expectEqualSlices(u8, &outs[0].group_public_key.toBytes(), &fresh[0].group_public_key.toBytes());
+    try testing.expect(!std.mem.eql(u8, &outs[0].secret_share.toBytes(.big), &fresh[0].secret_share.toBytes(.big)));
+
+    // 4. The refreshed shares sign under the unchanged key.
+    const key_shares2 = try assembleKeyShares(allocator, fresh, cfg.t, paillier_keys, aux_params);
+    defer {
+        allocator.free(key_shares2[0].public_keys.entries);
+        allocator.free(key_shares2);
+    }
+    const sig2 = try tecdsa.signing.signWithShares(allocator, key_shares2[1..3], "dkg refreshed shares", random);
+    try sig2.verify("dkg refreshed shares", pk);
+}
+
 // ── dark-tests aggregator (CONVENTIONS §6.3) ─────────────────────────────
 
 test {
@@ -218,4 +314,7 @@ test {
     _ = core;
     _ = checks;
     _ = protocol;
+    _ = wire;
+    _ = participant;
+    _ = reshare;
 }

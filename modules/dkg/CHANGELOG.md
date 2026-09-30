@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Per-participant API and resharing** (maturity task A12; scope `poc` -> `mvp`).
+  New `Participant` (`participant.zig`): one GJKR party as a sans-I/O state machine (`start` /
+  `handle(from, bytes)` / `advance` / `takeOutgoing`) with typed wire frames (`wire.zig`), full parsing
+  validation (lengths, points on the curve, canonical scalars, ids in range) and typed refusals for a wrong
+  round, an unknown/mismatched/duplicate sender and anything after completion. Complaints, defenses and QUAL
+  are driven by messages (`core.computeQual`). The same seed gives byte-identical outputs to the lockstep
+  `Dkg.run` (tested for n in 2,3,5,7). New `ReshareDealer` / `ReshareReceiver` (`reshare.zig`): proactive
+  refresh or redistribution to a new `(n', t')` committee keeping the group public key (Desmedt-Jajodia
+  1997 / Wong-Wang-Wing 2002 with Feldman commitments). `commit.zig` gains `randomScalar`, `lagrangeAtZero`,
+  `scaleElement`; `types.zig` gains `ScalarShareMsg`. Independent check: `tools/gjkr_oracle.py` (plain-integer
+  secp256k1, from the GJKR paper) recomputes every public value of a recorded transcript and a resharing; the
+  committed `src/transcript_vectors.zig` is replayed by two Zig tests. Parser fuzz harnesses for both roles.
+  Not done: GJKR's public-reconstruction branch (a QUAL dealer failing the Feldman check still aborts, now
+  with `culprit()` set), distributed aux generation.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **coeffs 98 / combine 5**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. No constant-time claim exists in `SPEC.md` or `README.md`; none was added — this is evidence looking for a sentence to attach to. ⭐ `combineKeyShare`'s own summation over the accepted shares measures **zero**, which is the concrete answer to the question this was built for. ⚠⚠ **45% of `coeffs`' 98 contexts are an over-taint artifact of simulating every party in one process**: `evalCommitmentAt` and `deriveGroupPublicKey` re-decode commitments that this process built moments earlier from tainted coefficients, whereas in the real protocol those bytes arrive over the wire at a party that never held the secret. That limit applies to every multi-party harness in this campaign and none of their numbers were adjusted for it. ⭐ The author also self-corrected before reporting: a first version tainted a whole `[3]?Scalar` and three of eight contexts turned out to be the OPTIONAL'S PRESENCE DISCRIMINANT, not the payload; narrowing the taint took it 8→5. Taint the payload, not the wrapper.
 
 - **2026-09-07** — Test-only, no production change: both broadcast fuzz targets replayed a

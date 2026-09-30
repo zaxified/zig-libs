@@ -138,6 +138,54 @@ pub fn main() !void {
     // WHICH dealer was disqualified — only that what came out is consistent.
     std.debug.print("a dealer that cheated and could not defend itself did not break the key\n", .{});
 
+    // ── the same protocol, one state machine per node ────────────────────
+    // `Dkg.run` is a test driver: it holds every node's secrets in one process.
+    // A real deployment gives each node a `Participant`; the only thing that
+    // crosses between them is bytes. The loop below is the transport: it
+    // delivers what each node queued and then closes the round. A network would
+    // put sockets (and reliable broadcast, and encryption for the `.party`
+    // frames) where the inner loops are.
+    var node_prng: std.Random.DefaultPrng = .init(reproducible_seed +% 2);
+    var nodes: [3]dkg.Participant = undefined;
+    for (&nodes, 0..) |*node, i| {
+        node.* = try dkg.Participant.init(gpa, config, @intCast(i + 1), node_prng.random());
+    }
+    defer for (&nodes) |*node| node.deinit();
+    for (&nodes) |*node| try node.start();
+    for (0..4) |_| {
+        for (&nodes) |*sender| {
+            const queued = try sender.takeOutgoing();
+            defer dkg.freeOutgoing(gpa, queued);
+            for (queued) |frame| {
+                for (&nodes) |*receiver| {
+                    const wanted = switch (frame.to) {
+                        .broadcast => receiver.id() != sender.id(),
+                        .party => |j| receiver.id() == j,
+                    };
+                    if (wanted) try receiver.handle(sender.id(), frame.bytes);
+                }
+            }
+        }
+        for (&nodes) |*node| try node.advance();
+    }
+    var node_outputs: [3]dkg.DkgShareOutput = undefined;
+    for (&nodes, &node_outputs) |*node, *out| out.* = node.output() orelse return error.NodeDidNotFinish;
+    defer for (&node_outputs) |*o| o.deinit();
+    if (!dkg.checks.allSameQ(&node_outputs)) return error.NodesDisagreeOnGroupKey;
+    if (!try dkg.checks.reconstructsToQ(gpa, node_outputs[1..3])) return error.SharesDoNotReconstructGroupKey;
+    // A node refuses what it should not accept: a frame for the wrong round
+    // is an error value, not a corrupted run.
+    if (nodes[0].handle(2, &.{@intFromEnum(dkg.wire.Kind.complaint)})) |_| {
+        return error.FinishedNodeAcceptedAFrame;
+    } else |err| switch (err) {
+        error.Finished => {},
+        else => return err,
+    }
+    const node_key = node_outputs[0].group_public_key.toBytes();
+    std.debug.print("3 independent state machines agreed on group key {s}\n", .{
+        std.fmt.bytesToHex(node_key[0..8].*, .lower),
+    });
+
     // ── the other rejection: a policy that cannot be satisfied ───────────
     // A misconfigured deployment asking for 4-of-3 must be told so, not left
     // to discover it when the fourth signer never appears.
