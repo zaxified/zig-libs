@@ -70,6 +70,20 @@ itself produce a zip-slip archive. Not self-referential (unlike `Archive`/`Entry
 ZIP fields, else `Error.ZipWriteTooLarge` before anything corrupt is written — zip64 *writing* stays in
 the backlog (below); zip64 *reading* is fully supported (see next paragraph).
 
+Modification time and mode (2026-09-30). Write: `AddEntryOptions.mtime` (Unix seconds, UTC) fills the
+DOS date/time fields — clamped to 1980-01-01..2107-12-31 23:59:58, rounded DOWN to an even second
+(Info-ZIP rounds up; either is within the format's 2 s resolution) — and, when it fits an `i32`, a 9-byte
+Info-ZIP `UT` extra record (flags=1, mtime) in both the local and the central header. `mode` sets host 3
+(Unix) in `version made by` and `(S_IFREG | mode & 0o7777) << 16` as external attributes. Without
+`mtime`, the DOS fields are 1980-01-01 00:00:00 (`DosDateTime.min`): a zero date — what the writer wrote
+until then — is not a date (month 0), unzip tools list it as garbage, and a fixed valid value keeps
+archives reproducible. Read: `Archive.init` now reads each full central-directory header (it used to
+skip to the name), so `Entry.mtime` prefers the central `UT` record (a real UTC instant) over the DOS
+fields (zoneless; read as UTC — Info-ZIP writes LOCAL time there, which only the `UT` record corrects),
+and is null when neither is valid; `Entry.mode` is set only for a Unix host. The extra-field walk is
+advisory and bounded by `extra_len`: a record whose length runs past the field ends the walk without a
+time, never an error.
+
 zip64 (archives/entries beyond the classic 32-bit fields — > 4 GiB, or > 65535 central-directory
 records): supported for **reading**. `std.zip.Iterator` (Zig 0.16 std) itself parses the zip64 EOCD +
 zip64 EOCD locator and each entry's zip64 extra field (`ExtraHeader.zip64_info`) before this module's
@@ -141,10 +155,9 @@ unneeded addition); compression methods beyond Store/Deflate (bzip2, LZMA, …) 
 two methods ordinary zip tools and Excel emit, no observed producer needs the rest. (README "Deferred
 (not built)".)
 
-- **Entry modification time (and permissions) on read and write** *(survey 2026-09-30)*: `Entry` has no
-  timestamp or mode, and `ArchiveWriter` writes `last_modification_time/date = 0`
-  (`src/root.zig:513,551`), so archives list a nonsense date in every unzip tool; Go's
-  `archive/zip` and zip2 carry both. Effort S–M (DOS date/time codec, optional extra fields). Fits §2.
+- ~~**Entry modification time (and permissions) on read and write**~~ *(survey 2026-09-30)* — **DONE
+  2026-09-30** (see "Design & invariants"). Not done: the NTFS (0x000a) timestamp record, atime/ctime,
+  and `ux`/`Ux` uid/gid — nothing asked.
 - **zip64 writing** *(survey 2026-09-30)*: already deferred above; Go and zip2 write it. Matters at
   > 4 GiB or > 65535 entries. Effort M. Fits §2.
 - **Data-descriptor streaming writes** *(survey 2026-09-30)*: `addEntry` needs the whole payload up

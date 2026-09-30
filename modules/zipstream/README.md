@@ -82,6 +82,24 @@ try zw.finish();
 // aw.writer.buffered() now holds a complete, valid ZIP archive.
 ```
 
+Modification time and Unix mode per entry:
+
+```zig
+try zw.addEntry("bin/run.sh", script, .{
+    .mtime = 1727700007, // Unix seconds, UTC
+    .mode = 0o755,       // unzip restores it
+});
+```
+
+`mtime` goes into the DOS date/time fields (clamped to 1980..2107, even
+seconds) and, for a time that fits a signed 32-bit value, into an Info-ZIP
+extended-timestamp (`UT`) extra field carrying the exact UTC instant. Without
+`mtime` the entry gets 1980-01-01 00:00:00 — fixed, so the output stays
+reproducible. `mode` marks the entry as made on Unix with `S_IFREG | mode` in
+its external attributes. On read, `Entry.mtime` (the `UT` time if present,
+else the DOS fields read as UTC; null for an invalid DOS date) and
+`Entry.mode` (Unix hosts only) report the same.
+
 `ArchiveWriter` is not self-referential (unlike `Archive`/`EntryReader`) — it
 may be moved freely. Entry names are gated through `isSafeEntryName` on the
 way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at

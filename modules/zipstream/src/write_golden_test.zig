@@ -33,6 +33,14 @@
 //!      both byte-exact against the known plaintext (verified via `md5sum`
 //!      against the plaintext computed independently in the shell).
 //!
+//! Recaptured 2026-09-30 when `ArchiveWriter` stopped writing a zero DOS
+//! date (an invalid date every unzip tool listed as garbage) and started
+//! writing 1980-01-01 00:00:00 when no `mtime` is given: the new file differs
+//! from the old one in exactly the four date bytes (`cmp -l`: offsets 12,
+//! 101, 205, 261 went 0x00 → 0x21), everything else byte-identical. Re-checked
+//! the same way: `unzip -t` clean, `zipinfo` lists both entries as
+//! "80-Jan-01 00:00", and every offset/size/CRC below is unchanged.
+//!
 //! `testdata/write_golden.zip` is a genuinely valid, independently
 //! inspectable ZIP archive — `unzip -l`/`zipinfo -v`/`unzip -p` on it with
 //! any real ZIP implementation reproduces the facts above. Nothing here is

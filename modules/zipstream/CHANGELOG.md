@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Entry modification time and Unix mode, write and read.** `AddEntryOptions.mtime`
+  (Unix seconds → DOS fields + Info-ZIP `UT` extra field) and `.mode` (host Unix + `S_IFREG|mode`
+  attributes); `Entry.mtime` / `Entry.mode` on read (`UT` preferred over the DOS fields); new
+  `DosDateTime` (`fromUnix`, `toUnix`, `min`, `max`). ⚠ **Output bytes change:** without `mtime` the
+  writer now stores 1980-01-01 00:00:00 instead of a zero date (which is not a valid date — every unzip
+  tool showed garbage). Anything that pinned `ArchiveWriter` output byte-for-byte differs in four bytes
+  per entry; the module's own golden was recaptured and re-verified with `unzip -t`/`zipinfo`. New
+  anchors: a writer archive with `mtime`/`mode` checked by zipinfo and Python `zipfile`, and two
+  Info-ZIP-made archives (DOS-only, and `UT` + `ux`) read back by this module (`src/mtime_test.zig`).
+
 - **2026-09-07** — Fuzz reach: `fuzzArchiveInit`'s fuzzed half never ran. It opened
   `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`, which
   returns the range MINIMUM once `bytes` has eaten the input, so the length was 0 — and

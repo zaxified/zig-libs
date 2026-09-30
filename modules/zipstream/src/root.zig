@@ -107,7 +107,108 @@ pub const Entry = struct {
     /// authoritative, written after all data). Verified automatically by
     /// `EntryReader` at end-of-stream — see its doc comment.
     crc32: u32,
+    /// Last modification time, Unix seconds (UTC). Taken from the Info-ZIP
+    /// extended-timestamp extra field (`UT`, 0x5455) when the central
+    /// directory carries one — that is a real UTC instant — else from the
+    /// DOS date/time fields, which carry no zone and are read as UTC. Null
+    /// when neither holds a valid time (a DOS date of 0, as some writers
+    /// emit).
+    mtime: ?i64 = null,
+    /// Unix permission bits (`0o7777` mask) when the entry was made on a Unix
+    /// host (`version made by` host 3) and carries them in the high half of
+    /// its external attributes; null otherwise.
+    mode: ?u16 = null,
 };
+
+/// A DOS date/time pair as ZIP headers store it (APPNOTE 4.4.6): `time` =
+/// hour<<11 | minute<<5 | second/2, `date` = (year-1980)<<9 | month<<5 | day.
+pub const DosDateTime = struct {
+    time: u16,
+    date: u16,
+
+    /// 1980-01-01 00:00:00, the earliest DOS time — what `ArchiveWriter`
+    /// writes when no `mtime` is given. (A zero date, which it wrote before
+    /// 2026-09-30, is not a valid date: unzip tools list it as garbage.)
+    pub const min: DosDateTime = .{ .time = 0, .date = (1 << 5) | 1 };
+    /// 2107-12-31 23:59:58, the latest.
+    pub const max: DosDateTime = .{ .time = (23 << 11) | (59 << 5) | 29, .date = (127 << 9) | (12 << 5) | 31 };
+
+    /// The DOS fields for a Unix time, in UTC. Clamped to the representable
+    /// range (1980..2107) and rounded down to an even second.
+    pub fn fromUnix(secs: i64) DosDateTime {
+        const lo: i64 = 315532800; // 1980-01-01T00:00:00Z
+        const hi: i64 = 4354819198; // 2107-12-31T23:59:58Z
+        if (secs <= lo) return min;
+        if (secs >= hi) return max;
+        const days = @divFloor(secs, 86400);
+        const sod: u32 = @intCast(secs - days * 86400);
+        const c = civilFromDays(days);
+        return .{
+            .time = @intCast((sod / 3600) << 11 | ((sod / 60) % 60) << 5 | (sod % 60) / 2),
+            .date = @intCast(@as(u32, @intCast(c.year - 1980)) << 9 | @as(u32, c.month) << 5 | c.day),
+        };
+    }
+
+    /// The Unix time (UTC) these fields name, or null when they are not a
+    /// valid date and time (month 0, day 31 of April, hour 24, …).
+    pub fn toUnix(self: DosDateTime) ?i64 {
+        const year: i32 = 1980 + @as(i32, self.date >> 9);
+        const month: u8 = @intCast((self.date >> 5) & 0xf);
+        const day: u8 = @intCast(self.date & 0x1f);
+        const hour: u32 = self.time >> 11;
+        const minute: u32 = (self.time >> 5) & 0x3f;
+        const second: u32 = (self.time & 0x1f) * 2;
+        if (month < 1 or month > 12 or day < 1) return null;
+        if (day > daysInMonth(year, month)) return null;
+        if (hour > 23 or minute > 59 or second > 59) return null;
+        return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+    }
+};
+
+fn isLeap(y: i32) bool {
+    return @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
+}
+
+fn daysInMonth(y: i32, m: u8) u8 {
+    return switch (m) {
+        2 => if (isLeap(y)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (H. Hinnant's
+/// `days_from_civil`).
+fn daysFromCivil(y_in: i32, m: u8, d: u8) i64 {
+    const y: i64 = if (m <= 2) y_in - 1 else y_in;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (m > 2) m - 3 else m + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// The inverse of `daysFromCivil` (Hinnant's `civil_from_days`).
+fn civilFromDays(z_in: i64) struct { year: i32, month: u8, day: u8 } {
+    const z = z_in + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
+    return .{ .year = @intCast(y), .month = m, .day = d };
+}
+
+/// Info-ZIP extended timestamp extra field id ("UT").
+const extra_id_ut: u16 = 0x5455;
+/// `version made by` host byte for Unix (APPNOTE 4.4.2).
+const host_unix: u16 = 3;
+/// `S_IFREG`, the regular-file type bits Info-ZIP puts above the permissions.
+const unix_regular_file: u32 = 0o100000;
 
 /// A central-directory-parsed ZIP archive. Borrows an already-open `File` (does
 /// not close it); owns the reader buffer, the entry list and the entries' name
@@ -176,14 +277,23 @@ pub const Archive = struct {
             }
             if (e.filename_len > name_buf.len) return Error.ZipNameTooLong;
 
-            // Read the filename out of the central-directory header.
-            try self.file_reader.seekTo(e.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            // Read the central-directory header (for the host, the external
+            // attributes and the extra-field length `std.zip.Iterator.Entry`
+            // does not carry), then the filename after it.
+            try self.file_reader.seekTo(e.header_zip_offset);
+            const cdh = self.file_reader.interface.takeStruct(std.zip.CentralDirectoryFileHeader, .little) catch
+                return Error.ZipBadCentralDirectory;
             const raw = name_buf[0..e.filename_len];
             try self.file_reader.interface.readSliceAll(raw);
             std.mem.replaceScalar(u8, raw, '\\', '/'); // some writers emit Windows paths
 
             // Directory entries carry no content.
             if (raw.len == 0 or raw[raw.len - 1] == '/') continue;
+
+            // The extra field follows the name directly.
+            const ut_mtime = try readUtMtime(&self.file_reader.interface, cdh.extra_len);
+            const dos: DosDateTime = .{ .time = e.last_modification_time, .date = e.last_modification_date };
+            const perm: u32 = cdh.external_file_attributes >> 16;
 
             try self.entries.append(self.alloc, .{
                 .name = try name_alloc.dupe(u8, raw),
@@ -192,6 +302,8 @@ pub const Archive = struct {
                 .uncompressed_size = e.uncompressed_size,
                 .file_offset = e.file_offset,
                 .crc32 = e.crc32,
+                .mtime = ut_mtime orelse dos.toUnix(),
+                .mode = if (cdh.version_made_by >> 8 == host_unix and perm != 0) @intCast(perm & 0o7777) else null,
             });
         }
     }
@@ -219,6 +331,37 @@ pub const Archive = struct {
         return null;
     }
 };
+
+/// Walk a central-directory extra field of `extra_len` bytes and return the
+/// modification time of an Info-ZIP extended-timestamp record (`UT`), if one
+/// carries it. The central-directory form holds at most the mtime: a flags
+/// byte, then — when bit 0 is set — a signed 32-bit Unix time. Malformed
+/// records (a length running past the field) end the walk without a time,
+/// never an error: the extra field is advisory.
+fn readUtMtime(r: *std.Io.Reader, extra_len: u16) !?i64 {
+    var left: usize = extra_len;
+    var found: ?i64 = null;
+    while (left >= 4) {
+        const id = try r.takeInt(u16, .little);
+        const len = try r.takeInt(u16, .little);
+        left -= 4;
+        if (len > left) {
+            try r.discardAll(left);
+            return found;
+        }
+        if (id == extra_id_ut and len >= 5 and found == null) {
+            const flags = try r.takeByte();
+            const t = try r.takeInt(i32, .little);
+            if (flags & 1 != 0) found = t;
+            try r.discardAll(len - 5);
+        } else {
+            try r.discardAll(len);
+        }
+        left -= len;
+    }
+    try r.discardAll(left);
+    return found;
+}
 
 /// Zip-slip guard for an extraction contract. `zipstream` is a streaming
 /// *reader*: it surfaces each member's stored `name` verbatim (backslashes
@@ -399,6 +542,19 @@ pub const AddEntryOptions = struct {
     /// Deflate speed/ratio trade-off (`std.compress.flate.Compress.Options`);
     /// ignored for `.store`.
     level: std.compress.flate.Compress.Options = .default,
+    /// Last modification time, Unix seconds (UTC). Written into the DOS
+    /// date/time fields (clamped to 1980..2107, even seconds) and, when it
+    /// fits a signed 32-bit time, into an Info-ZIP extended-timestamp extra
+    /// field (`UT`) in both headers — the exact UTC instant, which unzip,
+    /// zipinfo and Go's `archive/zip` prefer over the zoneless DOS fields.
+    /// Null writes the earliest DOS time, 1980-01-01 00:00:00, and no extra
+    /// field: a fixed, valid date, so archives stay reproducible.
+    mtime: ?i64 = null,
+    /// Unix permission bits (e.g. `0o644`). When set, the entry is marked as
+    /// made on a Unix host and carries `S_IFREG | mode` in the high half of
+    /// its external attributes, as Info-ZIP `zip` writes it; unzip restores
+    /// the mode on extraction. Null leaves host 0 (MS-DOS) and no attributes.
+    mode: ?u16 = null,
 };
 
 /// Streaming ZIP archive writer: `addEntry` one member at a time, then
@@ -445,7 +601,24 @@ pub const ArchiveWriter = struct {
         compressed_size: u32,
         uncompressed_size: u32,
         local_header_offset: u32,
+        dos: DosDateTime,
+        /// The `UT` mtime, when one is written.
+        ut: ?i32,
+        mode: ?u16,
     };
+
+    /// Size of one `UT` extra record carrying just the mtime (4-byte header +
+    /// flags byte + 4-byte time); the same in the local and central headers.
+    const ut_extra_len = 9;
+
+    fn writeUtExtra(w: *std.Io.Writer, t: i32) std.Io.Writer.Error!void {
+        var rec: [ut_extra_len]u8 = undefined;
+        std.mem.writeInt(u16, rec[0..2], extra_id_ut, .little);
+        std.mem.writeInt(u16, rec[2..4], 5, .little);
+        rec[4] = 1; // bit 0: mtime present
+        std.mem.writeInt(i32, rec[5..9], t, .little);
+        try w.writeAll(&rec);
+    }
 
     /// `out` is the caller-owned destination writer (e.g. a file's buffered
     /// writer, or `std.Io.Writer.Allocating` for an in-memory archive).
@@ -504,24 +677,29 @@ pub const ArchiveWriter = struct {
         };
         if (payload.len > std.math.maxInt(u32)) return Error.ZipWriteTooLarge;
 
+        const dos: DosDateTime = if (options.mtime) |t| .fromUnix(t) else .min;
+        const ut: ?i32 = if (options.mtime) |t| std.math.cast(i32, t) else null;
+        const extra_len: u16 = if (ut != null) ut_extra_len else 0;
+
         const local_header_offset = self.offset;
         const lfh: std.zip.LocalFileHeader = .{
             .signature = std.zip.local_file_header_sig,
             .version_needed_to_extract = 20,
             .flags = @bitCast(@as(u16, 0)),
             .compression_method = method,
-            .last_modification_time = 0,
-            .last_modification_date = 0,
+            .last_modification_time = dos.time,
+            .last_modification_date = dos.date,
             .crc32 = crc,
             .compressed_size = @intCast(payload.len),
             .uncompressed_size = @intCast(data.len),
             .filename_len = @intCast(name.len),
-            .extra_len = 0,
+            .extra_len = extra_len,
         };
         try writeHeaderLE(std.zip.LocalFileHeader, self.out, lfh);
         try self.out.writeAll(name);
+        if (ut) |t| try writeUtExtra(self.out, t);
         try self.out.writeAll(payload);
-        self.offset += @sizeOf(std.zip.LocalFileHeader) + name.len + payload.len;
+        self.offset += @sizeOf(std.zip.LocalFileHeader) + name.len + extra_len + payload.len;
 
         try self.entries.append(self.alloc, .{
             .name = try self.name_arena.allocator().dupe(u8, name),
@@ -530,6 +708,9 @@ pub const ArchiveWriter = struct {
             .compressed_size = @intCast(payload.len),
             .uncompressed_size = @intCast(data.len),
             .local_header_offset = @intCast(local_header_offset),
+            .dos = dos,
+            .ut = ut,
+            .mode = options.mode,
         });
     }
 
@@ -542,28 +723,32 @@ pub const ArchiveWriter = struct {
 
         const cd_offset = self.offset;
         for (self.entries.items) |e| {
+            const extra_len: u16 = if (e.ut != null) ut_extra_len else 0;
             const cdh: std.zip.CentralDirectoryFileHeader = .{
                 .signature = std.zip.central_file_header_sig,
-                .version_made_by = 20,
+                // Host in the high byte: 0 = MS-DOS (no attributes), 3 = Unix
+                // (the high half of the external attributes is `st_mode`).
+                .version_made_by = if (e.mode != null) (host_unix << 8) | 20 else 20,
                 .version_needed_to_extract = 20,
                 .flags = @bitCast(@as(u16, 0)),
                 .compression_method = e.method,
-                .last_modification_time = 0,
-                .last_modification_date = 0,
+                .last_modification_time = e.dos.time,
+                .last_modification_date = e.dos.date,
                 .crc32 = e.crc32,
                 .compressed_size = e.compressed_size,
                 .uncompressed_size = e.uncompressed_size,
                 .filename_len = @intCast(e.name.len),
-                .extra_len = 0,
+                .extra_len = extra_len,
                 .comment_len = 0,
                 .disk_number = 0,
                 .internal_file_attributes = 0,
-                .external_file_attributes = 0,
+                .external_file_attributes = if (e.mode) |m| (unix_regular_file | (m & 0o7777)) << 16 else 0,
                 .local_file_header_offset = e.local_header_offset,
             };
             try writeHeaderLE(std.zip.CentralDirectoryFileHeader, self.out, cdh);
             try self.out.writeAll(e.name);
-            self.offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + e.name.len;
+            if (e.ut) |t| try writeUtExtra(self.out, t);
+            self.offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + e.name.len + extra_len;
         }
         const cd_size = self.offset - cd_offset;
         if (cd_offset > std.math.maxInt(u32) or cd_size > std.math.maxInt(u32))
@@ -1649,4 +1834,5 @@ fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("write_golden_test.zig");
     _ = @import("xlsx_fixture_test.zig");
+    _ = @import("mtime_test.zig");
 }
