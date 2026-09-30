@@ -277,6 +277,12 @@ above) — no longer listed as a gap.
   re-measured since. Shape: compute one 64-bit hash at the entry point and pass it down
   (adapted map context, both sketch indices derived from it, the shard from its high bits).
   Effort: small-medium, no API change. Secondary (the store's commit dominates a PUT).
+  **Re-measured 2026-09-30, not worth doing now:** qap `wdur` (kv-store, shield smoke, `perf
+  record`): every `ramcache` symbol together is 4.7 % of server CPU, explicit `Wyhash.hash`
+  0.3 %; the server is 85 % kernel (fsync). Hashing once saves ~1 % CPU, below the lane's
+  noise floor. On a hit the sketch's first Wyhash (seed 0) equals the map's own
+  `StringContext` hash, so the cheapest slice is hit path 3 -> 1 hashes. Reopen when a
+  consumer shows ramcache hot.
 
 ## Status
 

@@ -455,6 +455,12 @@ pending a native std TLS server.
   inline array -- an API change to every `ResponseWriter` constructor, for one page. ⚠ Moving the
   WHOLE writer into the pool slab was tried and lost (see `PooledBuffers.slabSize`). Effort: small-
   medium. Deferred: small gain.
+  **Re-assessed 2026-09-30, likely zero net:** the page does not vanish, it moves. In a pool slab
+  (`PooledBuffers`) it is paid per in-flight request, and at saturation in-flight ~= connections
+  (the `slabSize` note: +14 KiB slab cost +18 KiB/conn), so -1 stack page +1 slab page (the copy
+  region's first page is always touched). Per-connection `StreamBuffers` storage is worse: that
+  page stays resident while the connection idles. A real win needs storage whose page is touched
+  anyway (e.g. bump-allocating from a buffer the request already dirtied); none is obvious.
 
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,
