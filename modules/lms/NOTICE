@@ -1,0 +1,25 @@
+lms — third-party attribution
+=============================
+
+Provenance
+----------
+
+Clean-room implementation from RFC 8554 ("Leighton-Micali Hash-Based
+Signatures", IRTF/CFRG, April 2019), a public specification: LM-OTS (§4),
+LMS (§5), HSS (§6), the wire formats of §3.3 and the pseudorandom key
+generation of Appendix A were implemented from the RFC text alone. No
+implementation of LMS/HSS was read, run or ported (not cisco/hash-sigs, not
+pyhsslms, not Bouncy Castle, not any other). Uses only the Zig standard
+library (`std.crypto.hash.sha2.Sha256`).
+
+Attribution (a condition, as for every RFC quotation in this repository)
+------------------------------------------------------------------------
+
+`src/kat_vectors.zig` reproduces, unaltered, the known-answer data of
+RFC 8554 Appendix F (Test Cases 1 and 2: public keys, messages, HSS
+signatures, and the Test Case 2 SEED and I values). It is IETF material,
+reproduced under the IETF Trust's Legal Provisions (TLP 5.0 §3.c.iii) with
+this attribution: "RFC 8554, Appendix F, Copyright (c) 2019 IETF Trust and the
+persons identified as the authors of the RFC (D. McGrew, M. Curcio,
+S. Fluhrer)". Redistributing this module, alone or as part of zig-libs,
+keeps this file with it. No other third-party material is present.

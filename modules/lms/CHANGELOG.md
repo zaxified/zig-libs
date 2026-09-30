@@ -1,0 +1,18 @@
+# lms — changelog
+
+Newest first. See the root [`CHANGELOG.md`](../../CHANGELOG.md) for which
+release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
+
+## Unreleased
+
+- **2026-09-30** — New module: LMS and HSS (RFC 8554), the stateful hash-based
+  signature scheme of NIST SP 800-208 and CNSA 2.0. SHA-256, n = 32 sets:
+  LMS H5 / H10 / H15 / H20 / H25 and LM-OTS W1 / W2 / W4 / W8, any mix per HSS
+  level, HSS with L = 1..8. Verification (`hssVerify`, `lmsVerify`, allocation
+  free, `false` on every malformed input, every length and typecode checked
+  before it indexes), key generation from a caller-supplied `(SEED, I)` per
+  Appendix A, and stateful signing (`SecretKey`, `LmsSecretKey`, the hardened
+  `SigningKey` with a durable-position hook and a copy guard). Verified against
+  RFC 8554 Appendix F: both HSS signatures verify, and Test Case 2's two public
+  keys and both LMS signatures are reproduced byte for byte from the RFC's SEED,
+  I and randomizer. Maturity task B4.
