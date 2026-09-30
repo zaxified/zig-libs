@@ -269,6 +269,14 @@ above) — no longer listed as a gap.
 - **`getOrLoad` with single-flight** *(survey 2026-09-30)* — Caffeine, moka and otter all offer loading caches; it stops a cache stampede on a cold key and is what most callers write by hand. Effort: medium for `Sharded` (per-key in-flight table, waiters), awkward for the single-owner `Cache`. Fits CONVENTIONS §2.
 - **Time-to-idle (expire after last access)** *(survey 2026-09-30)* — session-like caches want it; today only write-time TTL exists. Effort: small (second deadline refreshed on hit, feeds the existing expiry heap). Fits §2.
 - **Adaptive admission window** *(survey 2026-09-30)* — Caffeine tunes the window/main split by hit-rate climbing, which helps recency-skewed workloads; fixed split is measurably worse there. Effort: medium plus benchmarks. Fits §2. Low priority.
+- **Hash the key once per operation** *(qap perf audit 2026-09-21, re-read 2026-09-30)* — a miss
+  (`pin` -> `reserve` -> fill) hashes the key many times: the map lookup, the frequency sketch's
+  two Wyhashes, `getOrPut`, the admission comparison (candidate and victim), the victim's
+  `fetchRemove`, and in `Sharded` the shard hash. Profiled under qap's durable store 09-21:
+  ~30 k instructions per miss inside ramcache, 30 % of it Wyhash, ~11 key hashes -- not
+  re-measured since. Shape: compute one 64-bit hash at the entry point and pass it down
+  (adapted map context, both sketch indices derived from it, the shard from its high bits).
+  Effort: small-medium, no API change. Secondary (the store's commit dominates a PUT).
 
 ## Status
 
