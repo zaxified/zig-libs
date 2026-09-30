@@ -548,7 +548,9 @@ test "LIVE drvinfo and driverStats agree with ethtool -i / -S" {
         // ── -i ──
         info: {
             const d = drvinfo(ifname) catch |e| switch (e) {
-                error.NotSupported, error.PermissionDenied => break :info,
+                // NoSuchDevice: `/sys/class/net` is the mount's namespace, not
+                // necessarily ours (CI runs this under `unshare -rn`).
+                error.NotSupported, error.PermissionDenied, error.NoSuchDevice => break :info,
                 else => return e,
             };
             const text = runEthtool(gpa, &.{"-i"}, ifname) catch |e| switch (e) {
@@ -572,7 +574,7 @@ test "LIVE drvinfo and driverStats agree with ethtool -i / -S" {
             };
             defer gpa.free(before_text);
             var st = driverStats(gpa, ifname) catch |e| switch (e) {
-                error.NotSupported, error.PermissionDenied => break :stats,
+                error.NotSupported, error.PermissionDenied, error.NoSuchDevice => break :stats,
                 else => return e,
             };
             defer st.deinit(gpa);

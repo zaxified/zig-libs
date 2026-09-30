@@ -53,26 +53,17 @@ pub fn main() !void {
         obj.get("tags").?.array.items.len,
     });
 
-    // The json5.org spec also documents hex numeric literals (`0x1A`) as a
-    // valid JSON5 number. This module's README lists that as a documented
-    // gap: the preprocessor never touches numeric-literal bytes, so a hex
-    // literal passes through unrewritten and standard JSON — what
-    // `preprocess`'s output must satisfy — has no hex-literal production.
-    // `preprocess` itself does not fail (it only rewrites comments/keys/
-    // commas/quotes); the spec gap only becomes visible one layer down, at
-    // `std.json`, which is exactly the case an outside caller would hit.
-    const hex_src = "{ code: 0x1A }";
-    const hex_out = try json5.preprocess(gpa, hex_src);
-    defer gpa.free(hex_out);
-    if (std.json.parseFromSlice(std.json.Value, gpa, hex_out, .{})) |_| {
-        unreachable; // would mean std.json started accepting hex numbers
-    } else |err| switch (err) {
-        error.SyntaxError => std.debug.print(
-            "hex literal (documented gap): preprocess() passes \"0x1A\" through unrewritten, std.json.SyntaxError downstream (expected)\n",
-            .{},
-        ),
-        else => return err,
-    }
+    // JSON5 numbers standard JSON lacks (hex, a leading `+`, a bare leading
+    // or trailing `.`) are rewritten into decimal JSON numbers, so std.json
+    // reads them as values instead of stopping at a SyntaxError.
+    const num_src = "{ code: 0x1A, gain: +.5 }";
+    const num_out = try json5.preprocess(gpa, num_src);
+    defer gpa.free(num_out);
+    var nums = try std.json.parseFromSlice(std.json.Value, gpa, num_out, .{});
+    defer nums.deinit();
+    must(nums.value.object.get("code").?.integer == 26, @src());
+    must(nums.value.object.get("gain").?.float == 0.5, @src());
+    std.debug.print("JSON5 numbers: {s} -> {s}\n", .{ num_src, num_out });
 
     // preprocessAnnotated: the GUI/editor entry point. Fed a document with a
     // missing colon (`bad value` has no `:`), it recovers instead of
