@@ -712,6 +712,11 @@ test "positive control: mis-placing the I-SID bits breaks the exact-byte DA" {
     try testing.expect(!std.mem.eql(u8, &wrong, &groupDa(0x12345, 0xABCDEF)));
 }
 
+test {
+    // RFC 6329 §5 worked example (Figures 2-4) — external oracle.
+    _ = @import("rfc6329_example_test.zig");
+}
+
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);

@@ -813,6 +813,11 @@ test "member-pruning walk is O(nodes), not O(members x depth): the has_member sh
     try testing.expect(steps <= chain_len + members.len);
 }
 
+test {
+    // RFC 6329 §5/§6 worked examples (Figures 2-7) — external oracle.
+    _ = @import("rfc6329_example_test.zig");
+}
+
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);
