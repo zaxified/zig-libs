@@ -11,7 +11,7 @@ adds only the blind-signature-specific layer on top.
 **Status: complete.** All four RFC 9474 §4 operations (`blind`,
 `blindSign`, `finalize`, `verify`) plus `pssEncode` (EMSA-PSS-ENCODE) and
 `prepareIdentity`/`prepareRandomize` are implemented and validated
-byte-exact against RFC 9474 Appendix A.1 and A.4 — including `blind`
+byte-exact against all four RFC 9474 Appendix A variants (A.1–A.4) — including `blind`
 itself, via the deterministic `blindWithFactor` seam fed the RFC's own
 fixed blinding factor. `blindSign` implements RFC 9474 §7.2's RECOMMENDED
 private-op blinding on top of the mandatory fail-closed self-check — see
@@ -102,8 +102,8 @@ zig build test-blindrsa -Doptimize=ReleaseFast
 zig fmt --check modules/blindrsa/
 ```
 
-Every stage is validated byte-exact against RFC 9474 Appendix A.1's and
-A.4's published values (`encoded_msg`, `blinded_msg`, `inv`, `blind_sig`,
+Every stage is validated byte-exact against RFC 9474 Appendix A.1–A.4's
+published values (`encoded_msg`, `blinded_msg`, `inv`, `blind_sig`,
 `sig`), including fail-closed reject tests (tampered signature/blind_sig,
 wrong message, wrong salt length, mismatched `Context`, out-of-range
 inputs, non-invertible blinding factors), plus full random-path

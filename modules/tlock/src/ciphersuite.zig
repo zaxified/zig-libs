@@ -14,8 +14,13 @@
 //!
 //! ## Source / provenance
 //!
-//! Every constant and construction below is transcribed from drand's
-//! ACTUAL production Go source, fetched 2026-07-16 (see `NOTICE`):
+//! Every constant below is an interoperability fact taken from drand's
+//! production deployment, and every construction follows the published
+//! Boneh–Franklin FullIdent scheme in the byte layout drand's network uses —
+//! derived from the scheme and verified against a drand-produced ciphertext and
+//! live beacons, not transcribed from any source file (see `NOTICE`; an
+//! isolated provenance review on 2026-09-30 found no structural match). Where
+//! each fact was confirmed:
 //!
 //! - DSTs: `github.com/drand/drand/v2/crypto` `schemes.go`,
 //!   `NewPedersenBLSUnchainedG1` (the `SigsOnG1ID` /
@@ -195,8 +200,9 @@ pub fn h2(comptime len: usize, gt: Fp12) [len]u8 {
 /// a canonical `Fr` scalar by repeatedly hashing
 /// `(LE16(i) || buffer)` for `i = 1, 2, ...` and masking off the
 /// (single, for BLS12-381's 255-bit `r`) top bit that would otherwise
-/// let the 256-bit hash output exceed the field. Source: `drand/kyber`
-/// `encrypt/ibe/ibe.go`'s `h3` — transcribed byte-for-byte:
+/// let the 256-bit hash output exceed the field. This is the byte format drand's
+/// network uses for `H3` (every step below is observable on the wire and pinned by
+/// the interop vector in `kat_test.zig`):
 ///
 /// ```
 /// buffer = SHA-256("IBE-H3" || sigma || msg)

@@ -9,7 +9,7 @@
 //! (implemented — this flag is `true`; they began life as
 //! `@panic("TODO(fable/core): ...")` stubs) — see `tlock.zig`'s own
 //! module doc comment and each function's doc comment for the exact
-//! construction the Fable pass transcribed.
+//! construction the core implements.
 //!
 //! Everything ELSE in this module — `ciphersuite.zig`'s `beaconId`/
 //! `h1`/`h2`/`h3`/`h4`/`randomSigma`, and `tlock.zig`'s `Ciphertext`

@@ -18,8 +18,9 @@
 //! struct + byte codec, AND the two cryptographic cores `encrypt`/
 //! `decrypt` (the BF-IBE FullIdent assembly + Fiat-Shamir-Okamoto CCA
 //! consistency check + a module-local constant-time `fp12Pow`) are all
-//! implemented (`gate.core_implemented = true`) — transcribed from
-//! drand's actual production Go source (`drand/drand`'s
+//! implemented (`gate.core_implemented = true`) — derived from the
+//! published scheme in the byte layout of drand's production deployment
+//! (design references read: `drand/drand`'s
 //! `crypto/schemes.go`, `drand/kyber`'s `encrypt/ibe/ibe.go`,
 //! `drand/tlock`'s `tlock.go` — see `NOTICE`) and byte-exact-verified
 //! IN BOTH DIRECTIONS against a genuine ciphertext produced by drand's

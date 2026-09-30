@@ -34,7 +34,8 @@ implementation WAS consulted as a design reference (below).
    re-implementation of EMSA-PSS-ENCODE that reproduces the RFC's
    published `encoded_msg` byte-for-byte for both Appendix A.1 and A.4).
 2. **jedisct1/zig-blind-rsa-signatures** (`jedisct1/rust-blind-rsa-signatures`'s
-   Zig sibling port, MIT license —
+   Zig sibling port, **Apache-2.0** — its `LICENSE` file, unchanged since the
+   initial import in 2021; this line said MIT until 2026-09-30 —
    https://github.com/jedisct1/zig-blind-rsa-signatures). Consulted as a
    DESIGN REFERENCE ONLY (CONVENTIONS.md §5): its public API shape
    (separating a client-held blinding-context type from the raw

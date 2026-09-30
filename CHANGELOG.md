@@ -44,6 +44,12 @@ directory.
   defect, fixed the same day (`tar` discarded pax headers, see its CHANGELOG), a W3C
   conformance test left disabled after its feature landed (`tracecontext`), and stale prose in
   a dozen SPECs/READMEs, corrected.
+  **Rounds A–D, same day:** the 151 modules without a downstream consumer, so **all 238 are
+  surveyed** and no grade is provisional: 15 `parity`, 102 `core`, 113 `mvp`, 8 `poc`; grades
+  7× 1, 103× 2, 114× 3, 14× 4. Decisions recorded on the way (tz, json5, encoding, decimal,
+  csvstream, mcp's 2026-07-28 plan, rsa/jwe PKCS#1 v1.5). Licence facts corrected in two
+  NOTICEs (`tlock`: `drand/kyber` is MPL-2.0, and an isolated provenance review found no
+  structural match; `blindrsa`: its Zig design reference is Apache-2.0, not MIT).
 
 - **New `example-apps/`:** standalone applications built on zig-libs, each its
   own project with its own `build.zig`/`build.zig.zon` and a dependency pinned

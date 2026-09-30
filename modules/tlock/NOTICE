@@ -19,7 +19,8 @@ source, fetched 2026-07-16:
   confirmed live against `https://api.drand.sh/v2/beacons/quicknet/info`).
   Supplies: `dst_g1`/`dst_g2` (RFC 9380 DSTs), `beaconId`'s
   `SHA-256(BigEndian(round))` digest construction.
-- `github.com/drand/kyber` (Apache-2.0/MIT dual), `encrypt/ibe/ibe.go`.
+- `github.com/drand/kyber` (**MPL-2.0 or later** — its `LICENSE`: "(c) by DEDIS/EPFL 2017 under the
+  MPL v2 or later version"; corrected 2026-09-30, this line used to say Apache-2.0/MIT), `encrypt/ibe/ibe.go`.
   Supplies: the `H1`/`H2`/`H3`/`H4` constructions
   (`h2_tag`/`h3_tag`/`h4_tag` = `"IBE-H2"`/`"IBE-H3"`/`"IBE-H4"`
   verbatim), `EncryptCCAonG2`/`DecryptCCAonG2`'s exact 6-step
@@ -35,7 +36,7 @@ source, fetched 2026-07-16:
   through `EncryptCCAonG2`/`DecryptCCAonG2` despite the `SigsOnG1ID`
   scheme name (see `ciphersuite.zig`'s module doc comment, "Variant
   confirmation" section).
-- `github.com/drand/kyber-bls12381` (Apache-2.0/MIT dual),
+- `github.com/drand/kyber-bls12381` (MIT — its `LICENSE`; corrected 2026-09-30 from "Apache-2.0/MIT dual"),
   `kyber_g1.go`/`kyber_g2.go`/`kyber_gt.go`/`kyber_scalar.go`. Read to
   confirm: point serialization is compressed (matches
   `bls12_381.g1`/`g2`'s own `toBytesCompressed` convention); the `Gt`
@@ -53,9 +54,19 @@ No source code from any of the above was copied into this module —
 every construction was independently re-expressed in Zig from reading
 the reference Go source, per `CONVENTIONS.md`'s "design reference"
 category (prime directive 1: "model after a proven implementation in
-another language"). All four repositories are Apache-2.0 or dual
-Apache-2.0/MIT licensed; no GPL/LGPL/AGPL source was consulted or
-copied anywhere in this module.
+another language"). Licences, as their `LICENSE` files state them (re-checked
+2026-09-30): `drand/drand` and `drand/tlock` dual Apache-2.0/MIT,
+`drand/kyber-bls12381` MIT, and `drand/kyber` **MPL-2.0** — a file-level
+copyleft, so its source WAS read for this module (the claim above that all four
+were Apache/MIT was wrong). MPL obligations attach only to copied Covered
+Software; whether anything of `ibe.go` was carried over beyond the published
+BF-IBE FullIdent construction was checked by an isolated provenance review on
+2026-09-30. A reviewer read `ibe.go` and this module side by side and returned
+verdicts only: of 14 regions, 10 INDEPENDENT (paper or interop facts), 4
+BEHAVIOUR-ONLY (`h2`, `h3`, `h4`, the wire codec: shapes forced by the wire
+format), 0 STRUCTURAL MATCH. Nothing needed re-deriving. Comments that said
+"transcribed byte-for-byte" were reworded the same day, because they claimed a
+copy the code does not contain. No GPL/LGPL/AGPL source was consulted.
 
 LICENSE ELECTION — MIT, not Apache-2.0. The dual-licensed upstreams above offer
 Apache-2.0 OR MIT, and which applies is the recipient's choice; this repository

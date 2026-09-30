@@ -47,7 +47,7 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
   `channelUpdateDigest`.
 
 Deliberately deferred (SPEC.md has the full rationale): BOLT#11 invoices / BOLT#12 offers
-(bech32-based — a future `lninvoice` module), signature verification (caller's secp256k1 — see
+(bech32-based — the sibling `lninvoice` module), signature verification (caller's secp256k1 — see
 "Use" below), onion routing (the sibling `sphinx` module), several BOLT#2/#7 messages outside this
 module's required set (Interactive Transaction Construction, Channel Establishment v2, Splicing,
 Quiescence, `announcement_signatures`, ...), and per-field TLV-extension value semantics beyond the

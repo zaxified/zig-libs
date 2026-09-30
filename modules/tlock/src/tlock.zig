@@ -323,7 +323,7 @@ pub const DecryptError = error{
 
 /// **FABLE CORE — REAL.** BF-IBE FullIdent encryption (Boneh-Franklin
 /// §4.2), quicknet variant. See this file's module doc comment for the
-/// full 10-step construction this function transcribes
+/// full 10-step construction this function implements
 /// (`id -> Qid -> Gid -> r -> U -> gid_r -> V -> W`). Byte-exact
 /// interop with drand's Go implementation is pinned by `kat_test.zig`'s
 /// interop vector (re-encrypting with the vector's recovered
@@ -377,7 +377,7 @@ pub fn encrypt(p_pub: g2.Affine, round: u64, message: [block_bytes]u8, sigma: [b
 
 /// **FABLE CORE — REAL.** BF-IBE FullIdent decryption + the
 /// Fiat-Shamir-Okamoto consistency check. See this file's module doc
-/// comment for the full construction this function transcribes
+/// comment for the full construction this function implements
 /// (`gid_r -> sigma -> message -> recompute r -> check U`). Byte-exact
 /// interop with drand's Go implementation is pinned by `kat_test.zig`'s
 /// interop vector (decrypting a genuine Go-`tle`-produced ciphertext
@@ -420,7 +420,7 @@ pub fn decrypt(round_signature: g1.Affine, ct: Ciphertext) DecryptError![block_b
     // Step 4: FO/CCA consistency — recompute r' = H3(sigma, message)
     // and reject unless U == r' * G2_generator. Compare via the
     // canonical compressed encoding (unique for every point incl.
-    // infinity), matching drand/kyber's `rP.Equal(c.U)`. The check's
+    // infinity), as interop with drand requires. The check's
     // outcome (accept/reject) is public, so a non-constant-time byte
     // compare is fine here; what must NOT happen is returning a
     // partially-decrypted message on mismatch. `r_check` is pure scratch

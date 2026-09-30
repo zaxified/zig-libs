@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! blindrsa KAT + property tests, driven by `kat_vectors.zig`'s RFC 9474
-//! Appendix A.1/A.4 values.
+//! Appendix A.1–A.4 values (A.2/A.3 in the B14 block below).
 //!
 //! Layout: `pssEncode` and `verify` byte-exact KATs first, then the
 //! crypto core — `blindWithFactor` (fed the RFC's own fixed blinding
