@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **BEHAVIOURAL, not breaking:** the reader honours pax extended headers
+  ('x'). `path`, `linkpath` and `size` now override the ustar fields, as Python's tarfile
+  (PAX_FORMAT is its default since 3.8), Go's archive/tar and bsdtar intend for a name over
+  100 bytes or a file over 8 GiB. Before, the header was discarded: such an entry came back
+  under its truncated ustar name, and a pax `size` (0 in the ustar field) desynchronised the
+  stream. A malformed pax header (a record whose length, newline, `=` or digits do not add up,
+  a NUL in a path, a payload over the new `max_pax_len` of 1 MiB) is now `error.BadHeader`
+  where it used to be skipped. Global pax headers ('g') are still skipped. Found by the
+  2026-09-30 competitive survey; anchored against GNU tar `--format=pax`.
 - **2026-09-10** — A1 fix (P1, no in-repo consumer): **base-256 `size` field
   ignored 3 of its 11 magnitude bytes.** `sizeField` only read `field[4..12]`
   (the low 64 bits); a crafted header whose magnitude set any of `field[1..4]`

@@ -143,8 +143,8 @@ in the tests); trim first if your source pads fields.
 
 RFC 4180 quoting: a field wrapped in `quote` may contain the delimiter; a
 doubled `""` inside a quoted field is one literal quote. **Deviation:** a `\n`
-*always* ends a record — quoted fields may NOT span physical lines (à la Go
-`encoding/csv` LazyQuotes). A stray/unbalanced quote is therefore a one-line
+*always* ends a record — quoted fields may NOT span physical lines
+(unlike Go's `encoding/csv`, which lets a quoted field span lines — its `LazyQuotes` only tolerates stray quotes). A stray/unbalanced quote is therefore a one-line
 problem (flagged by `LineSlice.unbalanced_quote`) instead of swallowing the rest
 of the file — which is also what makes every `\n` a safe chunk boundary for
 bounded-memory streaming. Quoting still protects the *delimiter* within a line.

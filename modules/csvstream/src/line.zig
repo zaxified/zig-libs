@@ -244,8 +244,9 @@ pub const LineSlice = struct {
 /// A '\n' ALWAYS terminates the record — quoted fields may NOT span physical
 /// lines (deliberately NOT RFC 4180 §2 rule 6). This makes a single
 /// stray/unbalanced quote a one-line problem instead of letting it swallow
-/// every following row up to the next quote ("lazy quotes" semantics, à la Go
-/// `encoding/csv` LazyQuotes). When a record ends with an open quote,
+/// every following row up to the next quote. (Go's `encoding/csv` LazyQuotes
+/// tolerates the stray quote too, but still lets a quoted field span lines;
+/// the one-line rule is this module's own.) When a record ends with an open quote,
 /// `LineSlice.unbalanced_quote` is set so the caller can warn. Quoting still
 /// protects the *delimiter* within a line (e.g. `"a,b"` is one field) — only
 /// the newline is no longer protected. This also means every '\n' is a safe

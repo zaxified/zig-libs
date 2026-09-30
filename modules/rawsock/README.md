@@ -8,7 +8,7 @@ mode, and cook-inject frames on a named interface. No libpcap, no libc.
 
 - The initial receive-only core
   (`openPacketCapture` / `ifNameOf`) was inlined and minimal; send, BPF
-  filtering, promiscuous mode, interface enumeration and the typed
+  filtering, promiscuous mode, interface lookup by name/index and the typed
   frame/`sockaddr_ll` decode are new construction.
 - **Model after:** libpcap's AF_PACKET path; wire semantics from `packet(7)`
   and the BPF UAPI (`<linux/filter.h>` / `<linux/if_packet.h>`).
@@ -28,7 +28,7 @@ mode, and cook-inject frames on a named interface. No libpcap, no libc.
 Provenance: original work of the zig-libs authors (MIT), starting from a
 minimal receive-only ~25-LOC core (`openPacketCapture` + `ifNameOf`). The
 send path, `SO_ATTACH_FILTER` filtering, `PACKET_ADD_MEMBERSHIP` promiscuous
-mode, interface enumeration, the `EtherType`/`pkt`/`bpf` enums and the typed
+mode, interface lookup by name/index, the `EtherType`/`pkt`/`bpf` enums and the typed
 `Frame` / `LinkAddr` / `EthHeader` decode are new. Wire layout clean-room from
 `packet(7)`, `<linux/if_packet.h>`, `<linux/filter.h>` and the IEEE 802.3 / ARP
 formats. Linux-only by design; kernel struct sizes are asserted in tests.

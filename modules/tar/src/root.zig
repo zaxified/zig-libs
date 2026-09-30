@@ -11,8 +11,12 @@
 //!  - `Reader` (portable): streaming ustar/GNU parser. Supported subset
 //!    (covers busybox + GNU `tar`): regular files, directories, symlinks,
 //!    hard links, the GNU long-name ('L') / long-link ('K') extensions, the
-//!    ustar `prefix` field, and GNU/star base-256 size fields. pax ('x'/'g')
-//!    records are skipped (payload discarded), never fatal; unknown typeflags
+//!    ustar `prefix` field, GNU/star base-256 size fields, and pax extended
+//!    headers ('x'): `path`, `linkpath` and `size` override the ustar fields
+//!    (what Python's tarfile, Go's archive/tar and bsdtar write for a long
+//!    name or a file over 8 GiB), other pax records are parsed past; a
+//!    malformed pax header is `error.BadHeader`. Global pax headers ('g') are
+//!    skipped: a global `path`/`size` has no per-entry meaning. Unknown typeflags
 //!    surface as `.other` so the caller decides. Every header is checksum-
 //!    verified and bounds-checked — truncated/garbage input yields an error,
 //!    never a panic. Bounded memory: only names are buffered (64 KiB cap),
@@ -144,6 +148,11 @@ pub const OwnedEntry = struct {
 const gnu_longlink_name = "././@LongLink";
 /// Largest accepted GNU 'L'/'K' payload — sanity cap against hostile input.
 pub const max_name_len = 64 * 1024;
+/// Largest accepted pax extended header ('x') payload. Larger than
+/// `max_name_len` because a pax header also carries records this reader does
+/// not use (xattrs, ACLs, high-resolution times), which it must still parse
+/// past; a header over the cap is refused, not truncated.
+pub const max_pax_len = 1024 * 1024;
 
 // ── Reader ──────────────────────────────────────────────────────────────────
 
@@ -151,7 +160,8 @@ pub const ReadError = error{
     /// The stream ended inside a header or declared content, or a header
     /// block was short.
     TruncatedArchive,
-    /// Checksum mismatch / unparseable checksum field / bad 'L'-'K' size.
+    /// Checksum mismatch / unparseable checksum field / bad 'L'-'K' size /
+    /// a malformed or oversized pax extended header.
     BadHeader,
 } || Allocator.Error || error{ReadFailed};
 
@@ -170,6 +180,13 @@ pub const Reader = struct {
     /// real entry.
     pending_path: ?[]u8 = null,
     pending_link: ?[]u8 = null,
+    /// `path`, `linkpath` and `size` from a pax extended header ('x') for the
+    /// next real entry. They win over GNU 'L'/'K' and over the ustar fields:
+    /// the header's own fields are only the fallback a pax-unaware reader
+    /// sees (a truncated name, a size of 0 for a file over 8 GiB).
+    pax_path: ?[]u8 = null,
+    pax_link: ?[]u8 = null,
+    pax_size: ?u64 = null,
     /// Unconsumed content bytes of the current entry + its block padding.
     remaining: u64 = 0,
     pad: u64 = 0,
@@ -184,6 +201,8 @@ pub const Reader = struct {
         self.gpa.free(self.link_buf);
         if (self.pending_path) |p| self.gpa.free(p);
         if (self.pending_link) |p| self.gpa.free(p);
+        if (self.pax_path) |p| self.gpa.free(p);
+        if (self.pax_link) |p| self.gpa.free(p);
         self.* = undefined;
     }
 
@@ -228,27 +247,51 @@ pub const Reader = struct {
                     try self.readGnuLong(&self.pending_link, h.size);
                     continue;
                 },
-                'x', 'g' => { // pax extended header — skip payload, not fatal
+                'x' => { // pax extended header for the next entry
+                    try self.readPax(h.size);
+                    continue;
+                },
+                'g' => { // pax GLOBAL header: skipped, see the module doc
                     try self.discard(h.size + content_pad);
                     continue;
                 },
                 else => {},
             }
 
-            // Materialize the path: a pending GNU 'L' wins over prefix+name.
-            const new_path: []u8 = if (self.pending_path) |p| take: {
+            // Materialize the path: pax `path` wins over a pending GNU 'L',
+            // which wins over prefix+name.
+            const new_path: []u8 = if (self.pax_path) |p| take: {
+                self.pax_path = null;
+                break :take p;
+            } else if (self.pending_path) |p| take: {
                 self.pending_path = null;
                 break :take p;
             } else try joinName(self.gpa, h.prefix, h.name);
             self.gpa.free(self.path_buf);
             self.path_buf = new_path;
 
-            const new_link: []u8 = if (self.pending_link) |p| take: {
+            const new_link: []u8 = if (self.pax_link) |p| take: {
+                self.pax_link = null;
+                break :take p;
+            } else if (self.pending_link) |p| take: {
                 self.pending_link = null;
                 break :take p;
             } else try self.gpa.dupe(u8, h.linkname);
             self.gpa.free(self.link_buf);
             self.link_buf = new_link;
+            // A GNU record the pax one overrode is consumed with it, so it
+            // cannot leak onto the entry after this one.
+            if (self.pending_path) |p| self.gpa.free(p);
+            if (self.pending_link) |p| self.gpa.free(p);
+            self.pending_path = null;
+            self.pending_link = null;
+
+            // pax `size` replaces the header's: past 8 GiB the ustar field
+            // cannot hold it, and a reader that used the header's value would
+            // desynchronise from the stream.
+            const size: u64 = if (self.pax_size) |ps| ps else h.size;
+            self.pax_size = null;
+            if (size > std.math.maxInt(u64) - block_size) return error.BadHeader;
 
             const kind: Kind = switch (h.typeflag) {
                 0, '0', '7' => .file, // '7' = contiguous, treated as regular
@@ -279,8 +322,8 @@ pub const Reader = struct {
                 '1', '2', '3', '4', '5', '6' => false,
                 else => true,
             };
-            self.remaining = if (carries_content) h.size else 0;
-            self.pad = if (carries_content) content_pad else 0;
+            self.remaining = if (carries_content) size else 0;
+            self.pad = if (carries_content) padding(size) else 0;
 
             return .{
                 .path = std.mem.sliceTo(self.path_buf, 0),
@@ -291,7 +334,7 @@ pub const Reader = struct {
                 .mtime = h.mtime,
                 // Reported as the content actually present, not as the header
                 // claims — matching what GNU tar reports for these types.
-                .size = if (carries_content) h.size else 0,
+                .size = if (carries_content) size else 0,
                 .link_target = std.mem.sliceTo(self.link_buf, 0),
                 .typeflag = h.typeflag,
             };
@@ -321,6 +364,62 @@ pub const Reader = struct {
         try self.discard(padding(size));
         if (slot.*) |old| self.gpa.free(old);
         slot.* = buf; // NUL-trimmed when materialized into an Entry
+    }
+
+    /// Read a pax extended header ('x') and keep the records this reader
+    /// honours: `path`, `linkpath`, `size`. Every record is checked for shape
+    /// — `<len> <key>=<value>\n`, `len` counting the whole record — and a
+    /// malformed one refuses the archive rather than being skipped: a record
+    /// a reader cannot delimit is one it cannot know it has not misread.
+    /// An empty value deletes the keyword (POSIX), i.e. falls back to the
+    /// header field.
+    fn readPax(self: *Reader, size: u64) ReadError!void {
+        if (size > max_pax_len) return error.BadHeader;
+        const buf = try self.gpa.alloc(u8, @intCast(size));
+        defer self.gpa.free(buf);
+        self.src.readSliceAll(buf) catch |e| switch (e) {
+            error.EndOfStream => return error.TruncatedArchive,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        try self.discard(padding(size));
+
+        var rest: []const u8 = buf;
+        while (rest.len > 0) {
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadHeader;
+            if (sp == 0) return error.BadHeader;
+            for (rest[0..sp]) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+            const len = std.fmt.parseInt(usize, rest[0..sp], 10) catch return error.BadHeader;
+            if (len <= sp + 1 or len > rest.len or rest[len - 1] != '\n') return error.BadHeader;
+            const kv = rest[sp + 1 .. len - 1];
+            rest = rest[len..];
+            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return error.BadHeader;
+            const key = kv[0..eq];
+            const value = kv[eq + 1 ..];
+            if (std.mem.eql(u8, key, "path")) {
+                try self.setPaxString(&self.pax_path, value);
+            } else if (std.mem.eql(u8, key, "linkpath")) {
+                try self.setPaxString(&self.pax_link, value);
+            } else if (std.mem.eql(u8, key, "size")) {
+                if (value.len == 0) {
+                    self.pax_size = null;
+                    continue;
+                }
+                for (value) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+                self.pax_size = std.fmt.parseInt(u64, value, 10) catch return error.BadHeader;
+            }
+        }
+    }
+
+    fn setPaxString(self: *Reader, slot: *?[]u8, value: []const u8) ReadError!void {
+        // An embedded NUL would silently cut the name where `Entry.path` is
+        // materialized (`sliceTo(0)`), so the entry would be reported under a
+        // different name than the archive states.
+        if (std.mem.indexOfScalar(u8, value, 0) != null) return error.BadHeader;
+        if (value.len > max_name_len) return error.BadHeader;
+        if (slot.*) |old| self.gpa.free(old);
+        slot.* = null;
+        if (value.len == 0) return;
+        slot.* = try self.gpa.dupe(u8, value);
     }
 
     fn discard(self: *Reader, n: u64) ReadError!void {
@@ -1223,37 +1322,211 @@ test "garbage block -> error.BadHeader, no panic" {
     try testing.expectError(error.BadHeader, tr.next());
 }
 
-test "pax extended header ('x') is skipped, not fatal, including its padding" {
-    var buf: [6 * block_size]u8 = undefined;
-    var dst: std.Io.Writer = .fixed(&buf);
+/// One pax record, `<len> <key>=<value>\n`, where `len` counts the whole
+/// record including its own digits.
+fn paxRecord(buf: []u8, key: []const u8, value: []const u8) []const u8 {
+    const body = key.len + 1 + value.len + 1; // key=value\n
+    var len: usize = body + 2; // one digit + the space
+    while (std.fmt.count("{d}", .{len}) + 1 + body != len) len += 1;
+    return std.fmt.bufPrint(buf, "{d} {s}={s}\n", .{ len, key, value }) catch unreachable;
+}
 
-    // pax extended-attributes header ('x'): 30-byte payload, NOT a multiple
-    // of 512 — the reader must skip the payload AND its block padding
-    // (content_pad), or it desyncs on the real header that follows.
+/// An archive of one pax 'x' header carrying `payload`, then `entry_block`
+/// and `content`, then the trailer.
+fn paxArchive(dst: *std.Io.Writer, payload: []const u8, entry_block: *const [block_size]u8, content: []const u8) !void {
     var pax_block: [block_size]u8 = undefined;
-    emitHeader(&pax_block, "PaxHeaders/real.txt", "", 0, 0, 0, 30, 0, 'x');
+    emitHeader(&pax_block, "PaxHeaders/entry", "", 0, 0, 0, payload.len, 0, 'x');
     try dst.writeAll(&pax_block);
-    try dst.writeAll("30 path=some.attr=value\n" ++ "\x00\x00\x00\x00\x00\x00"); // 30 bytes
-    try writeZeros(&dst, padding(30));
+    try dst.writeAll(payload);
+    try writeZeros(dst, padding(payload.len));
+    try dst.writeAll(entry_block);
+    try dst.writeAll(content);
+    try writeZeros(dst, padding(content.len));
+    try writeZeros(dst, 2 * block_size); // trailer
+}
 
-    // The real entry the pax header was describing.
+test "record helper: the length prefix counts itself" {
+    var b: [128]u8 = undefined;
+    try testing.expectEqualStrings("8 a=bcd\n", paxRecord(&b, "a", "bcd"));
+    try testing.expectEqualStrings("12 path=abc\n", paxRecord(&b, "path", "abc"));
+    try testing.expectEqualStrings("99 k=" ++ "v" ** 93 ++ "\n", paxRecord(&b, "k", "v" ** 93));
+    // One byte more and the prefix needs a third digit, which is one more byte again.
+    try testing.expectEqualStrings("101 k=" ++ "v" ** 94 ++ "\n", paxRecord(&b, "k", "v" ** 94));
+}
+
+test "pax 'x' path overrides the header name; unused records are parsed past, padding skipped" {
+    // What Python's tarfile (PAX_FORMAT, its default since 3.8), Go's
+    // archive/tar and bsdtar write for a name over 100 bytes: a pax `path`,
+    // and a TRUNCATED name in the ustar field. Before 2026-09-30 this reader
+    // discarded the pax header and reported the truncated name.
+    const long = "dir/" ** 30 ++ "file.txt"; // 128 bytes
+    var rb: [3][256]u8 = undefined;
+    const payload = try std.mem.concat(testing.allocator, u8, &.{
+        paxRecord(&rb[0], "mtime", "1600000000.123456789"),
+        paxRecord(&rb[1], "path", long),
+        paxRecord(&rb[2], "SCHILY.xattr.user.k", "v"),
+    });
+    defer testing.allocator.free(payload);
+
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
     var real_block: [block_size]u8 = undefined;
-    emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 5, 0, '0');
-    try dst.writeAll(&real_block);
-    try dst.writeAll("hello");
-    try writeZeros(&dst, padding(5));
-    try writeZeros(&dst, 2 * block_size); // trailer
+    emitHeader(&real_block, long[0..99], "", 0o644, 0, 0, 5, 0, '0');
+    try paxArchive(&dst, payload, &real_block, "hello");
 
     var src: std.Io.Reader = .fixed(dst.buffered());
     var tr = Reader.init(testing.allocator, &src);
     defer tr.deinit();
-
     const e = (try tr.next()).?;
-    try testing.expectEqualStrings("real.txt", e.path);
+    try testing.expectEqualStrings(long, e.path);
     try testing.expectEqual(@as(u64, 5), e.size);
     var content: [8]u8 = undefined;
     const n = try tr.read(&content);
     try testing.expectEqualStrings("hello", content[0..n]);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "pax 'x' size overrides the header size (the >8 GiB case), so the stream stays in sync" {
+    // A pax-writing tar stores size 0 in the ustar field when the real size
+    // does not fit it. Reading the header's 0 would treat the content as the
+    // next header. Size 5 stands in for the large case here.
+    var rb: [64]u8 = undefined;
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var real_block: [block_size]u8 = undefined;
+    emitHeader(&real_block, "big.bin", "", 0o644, 0, 0, 0, 0, '0');
+    try paxArchive(&dst, paxRecord(&rb, "size", "5"), &real_block, "hello");
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    const e = (try tr.next()).?;
+    try testing.expectEqual(@as(u64, 5), e.size);
+    var content: [8]u8 = undefined;
+    const n = try tr.read(&content);
+    try testing.expectEqualStrings("hello", content[0..n]);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "pax 'x' linkpath overrides the header link target" {
+    const target = "../" ** 40 ++ "target"; // 126 bytes
+    var rb: [256]u8 = undefined;
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var link_block: [block_size]u8 = undefined;
+    emitHeader(&link_block, "link", target[0..99], 0o777, 0, 0, 0, 0, '2');
+    try paxArchive(&dst, paxRecord(&rb, "linkpath", target), &link_block, "");
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    const e = (try tr.next()).?;
+    try testing.expectEqual(Kind.symlink, e.kind);
+    try testing.expectEqualStrings(target, e.link_target);
+}
+
+test "pax path wins over a GNU 'L' record, and neither leaks onto the next entry" {
+    var buf: [12 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    // GNU 'L' first ...
+    const gnu_name = "from-gnu-L";
+    emitHeader(&block, gnu_longlink_name, "", 0, 0, 0, gnu_name.len + 1, 0, 'L');
+    try dst.writeAll(&block);
+    try dst.writeAll(gnu_name ++ "\x00");
+    try writeZeros(&dst, padding(gnu_name.len + 1));
+    // ... then pax 'x', then the entry: pax is the later, richer record.
+    var rb: [64]u8 = undefined;
+    const rec = paxRecord(&rb, "path", "from-pax");
+    emitHeader(&block, "PaxHeaders/x", "", 0, 0, 0, rec.len, 0, 'x');
+    try dst.writeAll(&block);
+    try dst.writeAll(rec);
+    try writeZeros(&dst, padding(rec.len));
+    emitHeader(&block, "from-header", "", 0o644, 0, 0, 0, 0, '0');
+    try dst.writeAll(&block);
+    emitHeader(&block, "second", "", 0o644, 0, 0, 0, 0, '0');
+    try dst.writeAll(&block);
+    try writeZeros(&dst, 2 * block_size);
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqualStrings("from-pax", (try tr.next()).?.path);
+    try testing.expectEqualStrings("second", (try tr.next()).?.path);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "pax 'x': an empty value deletes the keyword, falling back to the header field" {
+    var rb: [64]u8 = undefined;
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var real_block: [block_size]u8 = undefined;
+    emitHeader(&real_block, "header-name", "", 0o644, 0, 0, 0, 0, '0');
+    try paxArchive(&dst, paxRecord(&rb, "path", ""), &real_block, "");
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqualStrings("header-name", (try tr.next()).?.path);
+}
+
+test "pax 'x': a malformed or hostile header -> error.BadHeader, never a misread" {
+    const cases = [_][]const u8{
+        "30 path=some.attr=value\n" ++ "\x00" ** 6, // length says 30, the record is 24
+        "11 path=abc", // right length, but no newline
+        "x2 path=abc\n", // non-digit length
+        " path=abcde\n", // no length
+        "11 pathabc\n", // no '='
+        "13 path=a\x00bc\n", // NUL inside a path
+        "11 size=1x\n", // non-digit size
+        "29 size=99999999999999999999\n", // size overflows u64
+        "999 path=abc\n", // length past the end of the payload
+    };
+    for (cases) |payload| {
+        var buf: [8 * block_size]u8 = undefined;
+        var dst: std.Io.Writer = .fixed(&buf);
+        var real_block: [block_size]u8 = undefined;
+        emitHeader(&real_block, "real.txt", "", 0o644, 0, 0, 0, 0, '0');
+        try paxArchive(&dst, payload, &real_block, "");
+        var src: std.Io.Reader = .fixed(dst.buffered());
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+        testing.expectError(error.BadHeader, tr.next()) catch |err| {
+            std.debug.print("pax payload not refused: {any}\n", .{payload});
+            return err;
+        };
+    }
+
+    // An 'x' header over max_pax_len is refused before anything is read.
+    var buf: [2 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "PaxHeaders/huge", "", 0, 0, 0, max_pax_len + 1, 0, 'x');
+    try dst.writeAll(&block);
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
+}
+
+test "pax global header ('g') is still skipped, including its padding" {
+    var rb: [64]u8 = undefined;
+    const rec = paxRecord(&rb, "comment", "made by someone");
+    var buf: [8 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "pax_global_header", "", 0, 0, 0, rec.len, 0, 'g');
+    try dst.writeAll(&block);
+    try dst.writeAll(rec);
+    try writeZeros(&dst, padding(rec.len));
+    emitHeader(&block, "real.txt", "", 0o644, 0, 0, 0, 0, '0');
+    try dst.writeAll(&block);
+    try writeZeros(&dst, 2 * block_size);
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqualStrings("real.txt", (try tr.next()).?.path);
     try testing.expectEqual(@as(?Entry, null), try tr.next());
 }
 
@@ -1779,6 +2052,45 @@ fn fuzzReader(_: void, smith: *std.testing.Smith) !void {
             if (n == 0) break;
         }
     }
+}
+
+test "GNU tar --format=pax: a long name arrives through the pax 'x' header (external anchor)" {
+    // The same archive shape Python's tarfile and Go's archive/tar write by
+    // default for a long name. Before 2026-09-30 this reader reported the
+    // truncated ustar name instead.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const probe = systemTar(gpa, io, tmp.dir, &.{ "tar", "--version" }) catch return error.SkipZigTest;
+    const probe_res = probe orelse return error.SkipZigTest;
+    gpa.free(probe_res.stdout);
+    gpa.free(probe_res.stderr);
+
+    const long_dir = "pax-" ** 30; // 120 bytes, no slash: one path component
+    const long_path = long_dir ++ "/f.txt";
+    try tmp.dir.createDirPath(io, long_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = long_path, .data = "pax content\n" });
+    const res = (try systemTar(gpa, io, tmp.dir, &.{
+        "tar", "--format=pax", "--mtime=@1600000000", "-cf", "pax.tar", long_path,
+    })).?;
+    gpa.free(res.stdout);
+    gpa.free(res.stderr);
+
+    var f = try tmp.dir.openFile(io, "pax.tar", .{});
+    defer f.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var fr = f.reader(io, &rbuf);
+    var tr = Reader.init(gpa, &fr.interface);
+    defer tr.deinit();
+    const e = (try tr.next()).?;
+    try testing.expectEqualStrings(long_path, e.path);
+    try testing.expectEqual(@as(u64, 12), e.size);
+    var content: [32]u8 = undefined;
+    const n = try tr.read(&content);
+    try testing.expectEqualStrings("pax content\n", content[0..n]);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
 }
 
 test "GNU tar extracts + lists our archive (external cross-check)" {

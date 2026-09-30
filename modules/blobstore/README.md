@@ -92,11 +92,11 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
 - **Crash safety.** Every write lands in a hidden temp and is made visible by a
   single `rename(2)`, so a crash mid-write leaves only a temp (garbage, never
   referenced) and a live blob is never torn or partial. **`fsync` is narrower
-  than the rename discipline and this bullet used to conflate them:** only
-  `put` fsyncs its temp before committing. `putNamed` and the raw `commit`
-  path rename an unsynced temp, so a power loss can leave a correctly-shaped
-  store missing the last named write — atomic, not durable. `put` is the
-  durable one.
+  than the rename discipline and this bullet used to conflate them:** since
+  2026-09-03 every rename goes through `renameDurable` — the temp is `fsync`ed
+  before the rename and the directory after it — so `put`, `putNamed`, the raw
+  `commit`, `casCommit` and the `.rc` sidecars are all durable once they return,
+  not just atomic.
 - **Dedup.** `put` hashes while streaming (single pass, bounded memory) and
   `casCommit` skips the rename if the content already exists — one copy on disk
   regardless of how many times it is put.

@@ -39,6 +39,11 @@ directory.
   each SPEC gained a `## Compared with` table (link, language, licence, stars, activity) and
   `(survey 2026-09-30)` backlog items. Verdicts: 20 `core`, 5 `mvp` (abuseguard, acme, brotli,
   kv, sessions). A surveyed Scope now requires that section (`check-catalog-table`).
+  **Wave 2, same day:** the other 61 modules used downstream, so all 87 are surveyed:
+  6 `parity`, 48 `core`, 33 `mvp`; grades 2× 1, 49× 2, 36× 3. The surveys also turned up one
+  defect, fixed the same day (`tar` discarded pax headers, see its CHANGELOG), a W3C
+  conformance test left disabled after its feature landed (`tracecontext`), and stale prose in
+  a dozen SPECs/READMEs, corrected.
 
 - **New `example-apps/`:** standalone applications built on zig-libs, each its
   own project with its own `build.zig`/`build.zig.zon` and a dependency pinned
