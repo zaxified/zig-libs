@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.Certificate` | Zig | MIT | — | Zig 0.16.0 | Parse, hostname check, one signature link at a time, `Bundle` root store; no basicConstraints/keyUsage/pathLen/nameConstraints enforcement (ziglang/zig #35877), no RSA-PSS certificates, no ML-DSA/SLH-DSA, unchecked DER reader (this module's `safe.zig` documents the out-of-bounds). |
 | [RustCrypto/formats](https://github.com/RustCrypto/formats) (`x509-cert`) | Rust | Apache-2.0 OR MIT (API field empty; source not read) | 339 | push 2026-09-28 | Certificate/CRL/CSR parse and build types; no path validation *(inferred)*. |
 
-**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints, EKU chaining), RSA-PSS certificates, and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds; chains checked against OpenSSL 3.5 for each algorithm. Post-quantum certificate chains are not something Go `crypto/x509` or rustls-webpki verify as far as the survey could tell *(inferred)*. **Where we are behind:** revocation is not wired into `verifyChain` (CRLs are checked per certificate with `crl.checkRevocation`; delta and indirect CRLs are refused; OCSP is the sibling `ocsp` module), certificate-policy processing, rfc822Name/URI name constraints (fail closed), no certificate/CSR/CRL construction API beyond the test helper `rsa.selfSignedCert`, no own hostname matching (std's).
+**Where we are ahead:** of Zig `std`, a complete RFC 5280 §6 path validator (backtracking path building, pathLen with the self-issued exception, name constraints, EKU chaining), RSA-PSS certificates, and post-quantum ML-DSA (RFC 9881) and SLH-DSA chains; `safe.zig` closes the std DER out-of-bounds; chains checked against OpenSSL 3.5 for each algorithm. Post-quantum certificate chains are not something Go `crypto/x509` or rustls-webpki verify as far as the survey could tell *(inferred)*. **Where we are behind:** revocation is CRL-only (delta and indirect CRLs are refused; OCSP is the sibling `ocsp` module and not wired into the path), certificate-policy processing, rfc822Name/URI name constraints (fail closed), no certificate/CSR/CRL construction API beyond the test helper `rsa.selfSignedCert`, no own hostname matching (std's).
 
 ## Design & invariants
 
@@ -71,9 +71,9 @@ which of the above it covers. See `src/root.zig`'s module doc comment for
 the full `std.crypto.Certificate` recon this design decision (build on std,
 don't reparse/reverify) is based on.
 
-**Explicitly out of scope, not silently skipped:** revocation checking
-(CRL/OCSP, RFC 5280 §6.3 — a separate online/offline data-fetching concern)
-and certificate policy processing (§6.1.5's explicit-policy/policy-mapping
+**Explicitly out of scope, not silently skipped:** OCSP in the path
+(RFC 6960 — a separate online data-fetching concern; CRL checking is opt-in via
+`Options.revocation`, § "CRL") and certificate policy processing (§6.1.5's explicit-policy/policy-mapping
 state machine — most TLS/mTLS/OPC-UA deployments don't rely on policy OIDs).
 A consumer needing either must add it explicitly; `verifyChain` must never
 be mistaken for covering them.
@@ -342,7 +342,7 @@ against both a real generated fixture (CA vs. leaf, via
   just the first found.
 
 Remaining, NOT addressed by this module (see "Explicitly out of scope"
-above and README.md): CRL/OCSP revocation, certificate-policy processing,
+above and README.md): OCSP revocation, certificate-policy processing,
 and name-constraint bypass via Unicode/punycode confusables in `dNSName` or
 IPv4-mapped IPv6 in `iPAddress` (this module does exact-bytes/CIDR matching
 only, no normalization).
@@ -373,7 +373,7 @@ plus the union test suite described under "the shared certificate-DER safety
 guard" above (`zig build test-x509`, green in Debug and ReleaseFast).
 
 Not implemented, and not silently skipped (see "Explicitly out of scope"
-above): CRL/OCSP revocation checking, certificate-policy processing
+above): OCSP revocation checking, certificate-policy processing
 (§6.1.5), and name-constraint matching for `GeneralName` types other than
 `dNSName`/`directoryName`/`iPAddress`. A constraint on `rfc822Name`,
 `uniformResourceIdentifier`, etc. is parsed but never matched against, and
@@ -412,6 +412,28 @@ that name type, i.e. a false reject, never a bypass.
   (`IndirectCrlUnsupported`): a CRL that covers only part of the ground cannot prove "good".
 - **`certificateHold`** is reported as revoked with its reason; the caller decides whether a
   hold rejects.
+- **Wired into `verifyChain` (2026-09-30, opt-in `Options.revocation: ?Revocation`).** The
+  check is per link inside `acceptCandidate`, right after `verifyLink` + `checkIsCaSigner`:
+  the link's subject certificate is checked with its issuer certificate as the CRL issuer.
+  A revoked intermediate therefore fails that candidate and the existing backtracking tries
+  another same-subject candidate (cross-signed / re-issued CA); with a single candidate the
+  specific `CertificateRevoked` / `RevocationStatusUnknown` reaches the caller, with several
+  all failing it is `NoTrustedPath`, as for any other per-link failure. Trust anchors are never
+  checked (RFC 5280 §6.1: trusted inputs; a chain that carries its anchor still works).
+  `scope = .full_chain` (default) checks every non-anchor certificate, `.leaf_only` only the
+  leaf's link. Verdict for one certificate: every CRL in `crls` is tried; `.revoked` from any
+  one is `CertificateRevoked` (`certificateHold` included — the chain API has no "hold is
+  fine" mode; use `crl.checkRevocation` for that); else any `.good` is a verdict; a CRL that is
+  not about the certificate (`CrlIssuerMismatch`, `CrlKeyIdentifierMismatch`,
+  `CrlScopeMismatch`) or cannot vouch for it (expired, not yet valid, bad signature,
+  malformed, delta / indirect / reason-limited, no `cRLSign`, …) is skipped — a broken CRL
+  never yields "good". No verdict at all: `unknown = .reject` (default, fail closed) gives
+  `RevocationStatusUnknown`, `.allow` accepts. `revocation = null` (default) is the old
+  behaviour, byte for byte. The new errors are in `chain.VerifyChainError` (and so,
+  formally, in `crl.CheckError`, which includes that set; `crl.checkRevocation` never returns them). Tests: `chain_crl_test.zig`; three-level
+  fixtures `data/crl/chain_*` from `tools/gen_crl_chain_fixtures.py` (oracle: `openssl verify
+  -crl_check_all` / `-crl_check`, 10 cases; OpenSSL does not backtrack, so those cases are
+  asked one intermediate at a time).
 - **Oracle:** `tools/gen_crl_fixtures.py` builds the fixtures with Python `cryptography` and
   OpenSSL 3.5 (ML-DSA-44), and aborts unless `openssl verify -crl_check` gives the same
   good / revoked / out-of-scope verdict as the Zig tests expect (16 cases). Mutation run
@@ -422,9 +444,9 @@ that name type, i.e. a false reject, never a bypass.
 ## Backlog / deferred
 
 - **CRL parsing and revocation check** — **DONE 2026-09-30 as `x509.crl`** (see § "CRL"), per
-  certificate. Still open: wiring it into `verifyChain` (an `Options` list of CRLs and a policy
-  for "no CRL for this certificate"), delta CRLs (§5.2.4), indirect CRLs. The original entry
-  follows.
+  certificate; **the `verifyChain` wiring (`Options.revocation`: a CRL list, scope, and a policy
+  for "no CRL for this certificate") DONE 2026-09-30**. Still open: delta CRLs (§5.2.4),
+  indirect CRLs. The original entry follows.
 - *(original)* **CRL parsing and revocation check in `verifyChain`** (survey 2026-09-30). rustls-webpki, Go (caller-side) and OpenSSL all offer it; here revocation is out of scope and `ocsp`/`ocspcache` are not wired into the path. A user with a private CA or mTLS deployment that relies on CRLs cannot use this module alone. Effort: medium (CRL DER, issuer/scope matching, signature, freshness). Fits §2. Overlaps the "explicitly out of scope" note above, which names it a separate data-fetching concern; the parse-and-check half is pure.
 - **rfc822Name / URI / otherName name-constraint matching** (survey 2026-09-30). Go and OpenSSL match them; here both sides fail closed, so an S/MIME or SPIFFE-URI CA with such constraints yields a false reject. Effort: small-medium. Fits §2.
 - **Certificate-policy processing (§6.1.5)** (survey 2026-09-30). OpenSSL has it, Go has opt-in support *(inferred)*; rarely used for TLS. Effort: large. Fits §2; low priority.

@@ -25,9 +25,14 @@
 //! this repo's `slhdsa`. Which OIDs this module recognises is
 //! `algorithm.zig`, not std.
 //!
-//! **Out of scope, by design, not silently skipped:** CRL/OCSP revocation
-//! checking (RFC 5280 §6.3 — a separate online/offline data-fetching
-//! concern) and certificate policy processing (§6.1.5's explicit-policy /
+//! **Revocation (opt-in).** With `Options.revocation` set, every link the path
+//! builder accepts is also checked against the caller-supplied CRLs
+//! (`crl.checkRevocation`, RFC 5280 §6.3; see `Revocation`). Fetching stays the
+//! caller's; OCSP is the sibling `ocsp` module and is not wired in here.
+//!
+//! **Out of scope, by design, not silently skipped:** OCSP in the path
+//! (a separate online data-fetching concern) and certificate policy
+//! processing (§6.1.5's explicit-policy /
 //! policy-mapping state machine — most TLS/mTLS/OPC-UA deployments don't
 //! rely on policy OIDs). A consumer needing either must add it explicitly.
 //! `rfc822Name`/`uniformResourceIdentifier`/other `GeneralName` types are
@@ -48,6 +53,7 @@ const der = Certificate.der;
 const extensions = @import("extensions.zig");
 const algorithm = @import("algorithm.zig");
 const rsa = @import("rsa");
+const crl = @import("crl.zig");
 
 /// One certificate's DER bytes. A bare `[]const u8` alias rather than a
 /// wrapper struct: every std/rsa API in this collection that touches a
@@ -75,6 +81,40 @@ pub const Options = struct {
     /// also enforced separately). Guards against a pathological/malicious
     /// long chain before path building even starts.
     max_intermediates: u32 = 8,
+    /// CRL revocation checking (RFC 5280 §6.3) of the certificates on the
+    /// path. `null` (the default) checks nothing — revocation is opt-in and the
+    /// call behaves exactly as it did before this field existed.
+    revocation: ?Revocation = null,
+};
+
+/// Revocation policy for `verifyChain` (`Options.revocation`). Every link the
+/// path builder accepts is checked per certificate against `crls`, with the
+/// link's issuer certificate as the CRL issuer — so a revoked intermediate
+/// fails that candidate and `buildPath` backtracks to another same-subject
+/// candidate (cross-signed or re-issued CA), exactly as it does for a bad
+/// signature. Trust anchors are never checked: they are trusted inputs (RFC
+/// 5280 §6.1). The per-certificate rules:
+///
+/// - a `.revoked` verdict from ANY CRL rejects (`error.CertificateRevoked`);
+///   `certificateHold` counts as revoked — the chain API has no "suspended
+///   is fine" mode, a caller wanting that uses `crl.checkRevocation` itself;
+/// - otherwise one `.good` from any CRL is a verdict of "not revoked";
+/// - a CRL that is not about this certificate (other issuer name or key,
+///   other scope) is skipped, and so is one that cannot vouch for it (expired,
+///   not yet valid, bad signature, malformed, delta / indirect / reason-limited,
+///   issuer without `cRLSign`, …): it yields no verdict, never `.good`;
+/// - no verdict at all is `unknown`.
+pub const Revocation = struct {
+    /// DER CRLs supplied by the caller (this module fetches nothing).
+    crls: []const []const u8,
+    /// Which certificates of the path must have a verdict: only the leaf, or
+    /// every non-anchor certificate.
+    scope: enum { leaf_only, full_chain } = .full_chain,
+    /// What "no CRL gives a verdict for a certificate in scope" means: reject
+    /// (`error.RevocationStatusUnknown`, fail closed) or accept.
+    unknown: enum { reject, allow } = .reject,
+    /// Passed through to `crl.Options.max_age_sec` (CRLs without nextUpdate).
+    max_age_sec: ?i64 = null,
 };
 
 pub const VerifiedChain = struct {
@@ -135,6 +175,14 @@ pub const VerifyChainError = error{
     /// mask generation function, or `trailerField != 1` is rejected here
     /// rather than silently misverified).
     UnsupportedPssParams,
+    /// A certificate in the path is listed as revoked (or on hold) in one of
+    /// `Options.revocation.crls` (RFC 5280 §6.3.3).
+    CertificateRevoked,
+    /// `Options.revocation.unknown == .reject` and no CRL in `crls` gave a
+    /// verdict (good or revoked) for a certificate in scope. (`crl.CheckError`
+    /// includes this whole set, but `crl.checkRevocation` never returns
+    /// either of these two.)
+    RevocationStatusUnknown,
 } ||
     std.mem.Allocator.Error ||
     Certificate.ParseError ||
@@ -171,6 +219,11 @@ pub const VerifyChainError = error{
 /// verified like any other, `VerifiedChain.leaf` is `null`, and the hostname
 /// check runs against `hostNameView` — this module's own walk of the two name
 /// fields `verifyHostName` reads — so it is neither skipped nor weakened.
+///
+/// With `opts.revocation` set, revocation is checked inside `buildPath`, per
+/// link, right after that link's signature and CA checks (see `Revocation`);
+/// failures are `error.CertificateRevoked` / `error.RevocationStatusUnknown`
+/// (or `NoTrustedPath` when several same-subject candidates all failed).
 pub fn verifyChain(
     gpa: std.mem.Allocator,
     chain: []const CertDer,
@@ -399,6 +452,9 @@ fn acceptCandidate(
 ) VerifyChainError!void {
     try verifyLink(cur_der, cand.der, opts.now_sec);
     try checkIsCaSigner(cand.der);
+    if (opts.revocation) |rev| {
+        if (rev.scope == .full_chain or depth == 0) try checkRevocation(rev, opts.now_sec, trust_anchors, cur_der, cand.der);
+    }
 
     if (cand.chain_index) |ci| used_chain[ci] = true;
     errdefer if (cand.chain_index) |ci| {
@@ -415,6 +471,40 @@ fn acceptCandidate(
 
     const next_shape = try parseShape(.{ .buffer = cand.der, .index = 0 });
     try findIssuerAndVerify(gpa, chain, trust_anchors, opts, cand.der, next_shape, used_chain, next_depth, path);
+}
+
+/// One certificate's revocation verdict under `rev` (rules on `Revocation`):
+/// every CRL is consulted, any `.revoked` wins over any `.good`. `issuer_der`
+/// is the CRL issuer certificate (the certificate's path issuer). A
+/// certificate that is itself a trust anchor is trusted input and is not
+/// checked (this also keeps a chain that carries its anchor working).
+fn checkRevocation(
+    rev: Revocation,
+    now_sec: i64,
+    trust_anchors: []const CertDer,
+    cert_der: CertDer,
+    issuer_der: CertDer,
+) VerifyChainError!void {
+    for (trust_anchors) |a| if (std.mem.eql(u8, a, cert_der)) return;
+    var have_good = false;
+    for (rev.crls) |crl_der| {
+        const st = crl.checkRevocation(crl_der, cert_der, issuer_der, .{
+            .now_sec = now_sec,
+            .max_age_sec = rev.max_age_sec,
+        }) catch |err| switch (err) {
+            // Not a property of the CRL: propagate. (`checkRevocation` does not
+            // allocate; the variant is in the set only through `VerifyChainError`.)
+            error.OutOfMemory => return error.OutOfMemory,
+            // Not about this certificate, or unable to vouch for it: no verdict
+            // from this CRL (the other CRLs may still give one).
+            else => continue,
+        };
+        switch (st) {
+            .revoked => return error.CertificateRevoked,
+            .good => have_good = true,
+        }
+    }
+    if (!have_good and rev.unknown == .reject) return error.RevocationStatusUnknown;
 }
 
 /// Verifies that `cand_der` is a certificate authority eligible to sign

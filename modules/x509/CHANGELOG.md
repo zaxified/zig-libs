@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — CRL checking wired into `chain.verifyChain`: opt-in `Options.revocation`
+  (`chain.Revocation`: `crls`, `scope` `.full_chain`/`.leaf_only`, `unknown` `.reject`/`.allow`,
+  `max_age_sec`). Checked per link after the signature and CA checks, so a revoked intermediate
+  makes path building backtrack to another same-subject candidate; any `.revoked` (holds
+  included) is the new `error.CertificateRevoked`, no verdict is `error.RevocationStatusUnknown`
+  under `.reject`; trust anchors are not checked. `null` (default) changes nothing. Three-level
+  fixtures `data/crl/chain_*` (`tools/gen_crl_chain_fixtures.py`, confirmed by
+  `openssl verify -crl_check_all` / `-crl_check`) and `chain_crl_test.zig`.
+
 - **2026-09-30** — CRL revocation checking (maturity task B2): new `x509.crl` with `parse` and
   `checkRevocation(crl_der, cert_der, issuer_der, .{ .now_sec })` → `.good` /
   `.revoked{time, reason, invalidity}`. Checks structure, algorithm agreement, issuer names,

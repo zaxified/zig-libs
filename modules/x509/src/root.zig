@@ -213,4 +213,5 @@ test {
     _ = safe;
     _ = crl;
     _ = @import("crl_test.zig");
+    _ = @import("chain_crl_test.zig");
 }
