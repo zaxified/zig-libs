@@ -56,6 +56,11 @@ switch (out.term) {
 }
 // out.stdout / out.stderr owned by caller; out.truncated_stdout / _stderr.
 
+// Redirection (StdioMode: .close .inherit .pipe .ignore .file .stdout):
+var merged = try procrun.run(gpa, io, .{ .argv = &.{ "sh", "-c", "echo a; echo b >&2" }, .stderr = .stdout }, ""); // one pipe: order kept, merged.stderr empty
+var quiet = try procrun.run(gpa, io, .{ .argv = &.{"make"}, .stdout = .ignore, .stderr = .ignore }, ""); // /dev/null
+var to_log = try procrun.run(gpa, io, .{ .argv = &.{"make"}, .stdout = .{ .file = log_file }, .stderr = .stdout }, ""); // caller-owned File, never closed by procrun
+
 // Feed a large stdin body without deadlock:
 var piped = try procrun.run(gpa, io, .{ .argv = &.{"cat"}, .stdin = .pipe }, big_body);
 defer piped.deinit(gpa);
@@ -169,6 +174,10 @@ types; see `SPEC.md`).
 
 Done since v1:
 
+- **Stdio redirection.** `StdioMode` gains `.ignore` (`/dev/null`), `.file`
+  (caller-owned `std.Io.File`) and, for `Spec.stderr`, `.stdout` (Python's
+  `stderr=STDOUT`: one shared pipe, write order preserved). `pass_fds` is not
+  possible race-free over `std.process.spawn` (see `SPEC.md` Backlog).
 - **Graceful cancellation.** `Spec.cancel_grace_ns` (blocking runs: `Cancel`
   and the `runTimeout` deadline) and `Handle.terminate`/`terminateGroup`
   (streaming): SIGTERM, wait up to the grace, then SIGKILL. `Output.timed_out`

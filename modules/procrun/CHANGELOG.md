@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **Stdio redirection.** `StdioMode` is now a tagged union with `.ignore`
+  (`/dev/null`; stdin reads EOF at once), `.file: std.Io.File` (caller-owned, never closed by
+  procrun) and, for `Spec.stderr` only, `.stdout` (Python's `stderr=STDOUT`): fd 2 becomes the same
+  pipe as fd 1, so the two streams keep the child's write order; works with `run`, `runTimeout`,
+  `Cancel`, streaming and line framing; `Output.stderr` stays empty. Impossible combinations
+  return the new `error.InvalidStdio`. Source-compatible for the existing `.close`/`.inherit`/
+  `.pipe` literals. `pass_fds` investigated and NOT implemented: `std.process.spawn` cannot do it
+  race-free (SPEC Backlog).
+
 - **2026-09-29** — Fix (Linux): `runTimeout` / `run` with `Spec.cancel` no longer wait without a
   deadline for a child that closes its stdout and stderr and keeps running. The killer used to
   stop at the pipes' EOF; now the run waits for the exit itself (not reaping, so a late signal

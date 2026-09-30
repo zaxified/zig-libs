@@ -58,14 +58,36 @@ pub const default_stream_permits: usize = 32;
 pub const default_max_line_bytes: usize = 1024 * 1024;
 
 /// How a child's standard stream is wired.
-pub const StdioMode = enum {
+pub const StdioMode = union(enum) {
     /// Spawn the child with the stream closed (advanced; child may hit EBADF).
+    /// Prefer `.ignore`: a child that writes to a closed fd 1 gets EBADF, and
+    /// one that opens a file meanwhile receives that file AS fd 1.
     close,
     /// Share the parent's stream.
     inherit,
     /// Create a pipe. For stdout/stderr this enables capture; for stdin it
     /// enables writing `stdin_body`.
     pipe,
+    /// Connect the stream to the null device (`/dev/null`; `NUL` on Windows):
+    /// reads from stdin see EOF at once, writes to stdout/stderr are
+    /// discarded. Python's `subprocess.DEVNULL`, Go's `nil` `Cmd.Stdout`.
+    ignore,
+    /// Connect the stream to a caller-owned open file (Python's file-object
+    /// `stdout=`), e.g. a log file the child appends to. The child gets its
+    /// own duplicate; procrun never closes or otherwise touches `file`, so
+    /// the caller keeps it open across the spawn and closes it afterwards. The
+    /// stream is not captured (`Output.stdout` stays empty). Open the file
+    /// for the direction it is used in (write for stdout/stderr).
+    file: std.Io.File,
+    /// `Spec.stderr` only (Python's `stderr=STDOUT`, Go's `Stderr = Stdout`):
+    /// the child's fd 2 is the SAME open file as its fd 1, so the two streams
+    /// interleave exactly as the child wrote them. With `stdout = .pipe` both
+    /// share one pipe and everything arrives in `Output.stdout` (or the
+    /// streaming stdout callback); `Output.stderr` stays empty. With
+    /// `stdout = .inherit`/`.ignore`/`.file` stderr simply goes where stdout
+    /// goes. `.stdout` on stdin or stdout, or with `stdout = .close`, is
+    /// `error.InvalidStdio`.
+    stdout,
 };
 
 /// How the child's environment is derived.
@@ -548,6 +570,10 @@ fn toStdIo(m: StdioMode) std.process.SpawnOptions.StdIo {
         .close => .close,
         .inherit => .inherit,
         .pipe => .pipe,
+        .ignore => .ignore,
+        .file => |f| .{ .file = f },
+        // Resolved by `spawnChild` (needs the stdout wiring); never reached.
+        .stdout => unreachable,
     };
 }
 
@@ -589,18 +615,45 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
         break :blk rlimit_wrap.?.argv;
     };
 
+    // stdio wiring. `stderr = .stdout` makes fd 2 the same open file as fd 1:
+    // with a captured stdout we create ONE pipe here and hand its write end to
+    // std as `.file` for both streams (std dup2s it onto 1 and 2, so the
+    // kernel sees a single pipe and the write order is preserved). The pipe is
+    // O_CLOEXEC, so no concurrently spawned sibling inherits it; the parent's
+    // copy of the write end is closed right after the spawn (EOF must arrive
+    // when the child tree is gone) and the read end becomes `Child.stdout`.
+    if (spec.stdin == .stdout or spec.stdout == .stdout) return error.InvalidStdio;
+    const merge = spec.stderr == .stdout;
+    if (merge and spec.stdout == .close) return error.InvalidStdio;
+    var out_io = toStdIo(spec.stdout);
+    var err_io = if (merge) out_io else toStdIo(spec.stderr);
+    var merge_read: ?std.Io.File = null;
+    var merge_write: ?std.Io.File = null;
+    errdefer if (merge_read) |f| f.close(io);
+    defer if (merge_write) |f| f.close(io);
+    if (merge and spec.stdout == .pipe) {
+        if (builtin.os.tag == .windows) return error.OperationUnsupported;
+        const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        merge_read = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+        merge_write = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+        out_io = .{ .file = merge_write.? };
+        err_io = out_io;
+    }
+
     // fd-hygiene note: any parent fd NOT marked FD_CLOEXEC is inherited by
     // the child across this spawn — `Spec` only controls stdin/stdout/stderr
     // (`StdioMode`), it does not close arbitrary other open fds. Callers that
     // hold sensitive fds open (sockets, secret-bearing files, …) must set
     // FD_CLOEXEC on them themselves if the child must not inherit them.
-    return std.process.spawn(io, .{
+    // pass_fds is deliberately absent: std's fork path only wires fds 0-2,
+    // so it cannot be done race-free (SPEC § Backlog).
+    var child = try std.process.spawn(io, .{
         .argv = effective_argv,
         .cwd = cwd,
         .environ_map = env_ptr,
         .stdin = toStdIo(spec.stdin),
-        .stdout = toStdIo(spec.stdout),
-        .stderr = toStdIo(spec.stderr),
+        .stdout = out_io,
+        .stderr = err_io,
         .create_no_window = true,
         // `pgid` is `?posix.pid_t` — an integer on POSIX, but a HANDLE
         // (`?*anyopaque`) on Windows, where the POSIX "0 = lead your own
@@ -609,6 +662,11 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
         // keep that promise rather than failing to build there.
         .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
     });
+    if (merge_read) |f| {
+        child.stdout = f;
+        merge_read = null; // ownership moved to the Child
+    }
+    return child;
 }
 
 const RlimitWrap = struct {
@@ -2178,6 +2236,249 @@ test "spawnStreaming: separates streams and reports exit 3" {
     try testing.expectEqual(@as(u8, 3), term.exited);
     try testing.expectEqualStrings("out\n", sink.out.items);
     try testing.expectEqualStrings("err\n", sink.err.items);
+}
+
+// ── stdio redirection: .ignore, .file, stderr = .stdout ─────────────────────
+
+test "stderr = .stdout: one pipe, the child's write order is preserved" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Separate pipes cannot be interleaved back into this order; a single
+    // shared pipe has it by construction. Each printf is its own write(2).
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "printf a; printf b >&2; printf c; printf d >&2; printf e" },
+        .stderr = .stdout,
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("abcde", out.stdout);
+    try testing.expectEqualStrings("", out.stderr);
+}
+
+test "stderr = .stdout: works under runTimeout (deadline kill keeps the merged prefix)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo out; echo err >&2; exec sleep 30" },
+        .stderr = .stdout,
+    }, "", 300 * std.time.ns_per_ms);
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.timed_out);
+    try testing.expectEqualStrings("out\nerr\n", out.stdout);
+    try testing.expectEqualStrings("", out.stderr);
+}
+
+test "stderr = .stdout: works with a Cancel token" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    const t = try std.Thread.spawn(.{}, requestAfter, .{ &cancel, io, 200 });
+    defer t.join();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo out; echo err >&2; exec sleep 30" },
+        .stderr = .stdout,
+        .cancel = &cancel,
+    }, "");
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.canceled);
+    try testing.expectEqualStrings("out\nerr\n", out.stdout);
+    try testing.expectEqualStrings("", out.stderr);
+}
+
+test "stderr = .stdout: streaming delivers both streams through the stdout callback in order" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Sink = struct {
+        out: std.ArrayList(u8) = .empty,
+        err: std.ArrayList(u8) = .empty,
+        gpa: std.mem.Allocator,
+        h: ?Handle = null,
+        fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(cx.?));
+            s.out.appendSlice(s.gpa, chunk) catch {};
+            if (s.h) |h| h.ack();
+        }
+        fn onErr(cx: ?*anyopaque, chunk: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(cx.?));
+            s.err.appendSlice(s.gpa, chunk) catch {};
+        }
+    };
+    var sink = Sink{ .gpa = testing.allocator };
+    defer sink.out.deinit(testing.allocator);
+    defer sink.err.deinit(testing.allocator);
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "printf a; printf b >&2; printf c; exit 4" },
+        .stderr = .stdout,
+    }, .{ .ctx = &sink, .on_stdout = Sink.onOut, .on_stderr = Sink.onErr });
+    sink.h = h;
+
+    const term = h.wait();
+    try testing.expectEqual(@as(u8, 4), term.exited);
+    try testing.expectEqualStrings("abc", sink.out.items);
+    try testing.expectEqualStrings("", sink.err.items);
+}
+
+test "stderr = .stdout: NDJSON line framing sees stderr lines on the same stream" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = LineLog{ .gpa = testing.allocator };
+    defer log.deinit();
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo one; echo two >&2; echo three" },
+        .stderr = .stdout,
+    }, .{ .ctx = &log, .on_stdout_line = LineLog.onLine });
+    log.h = h;
+    _ = h.wait();
+
+    try expectLines(&log, &.{ "one", "two", "three" });
+}
+
+test "stderr = .stdout follows stdout to .ignore (nothing captured, exit 0)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo out; echo err >&2" },
+        .stdout = .ignore,
+        .stderr = .stdout,
+    }, "");
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("", out.stdout);
+    try testing.expectEqualStrings("", out.stderr);
+}
+
+test "stderr = .stdout is rejected where it has no meaning" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try testing.expectError(error.InvalidStdio, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .stdout = .close,
+        .stderr = .stdout,
+    }, ""));
+    try testing.expectError(error.InvalidStdio, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .stdout = .stdout,
+    }, ""));
+    try testing.expectError(error.InvalidStdio, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .stdin = .stdout,
+    }, ""));
+}
+
+test ".ignore: stdout is discarded however much the child writes; stdin reads EOF at once" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 2 MiB is far past a pipe buffer: a pipe nobody drains would block the
+    // child forever, /dev/null never does.
+    var w = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "head -c 2097152 /dev/zero; head -c 1000 /dev/zero >&2" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }, "");
+    defer w.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), w.term.exited);
+    try testing.expectEqualStrings("", w.stdout);
+    try testing.expectEqualStrings("", w.stderr);
+
+    // `cat` on a null stdin sees EOF immediately and exits 0. With the
+    // default `.close` it would hit EBADF instead (exit 1).
+    var r = try runTimeout(testing.allocator, io, .{
+        .argv = &.{"cat"},
+        .stdin = .ignore,
+    }, "", 5 * std.time.ns_per_s);
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.timed_out);
+    try testing.expectEqual(@as(u8, 0), r.term.exited);
+    try testing.expectEqualStrings("", r.stdout);
+}
+
+test ".file: the child writes into a caller-owned file that stays open and usable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(io, "log.txt", .{});
+    defer f.close(io);
+
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo out; echo err >&2; echo out2" },
+        .stdout = .{ .file = f },
+        .stderr = .stdout, // same open file: ordering as written
+    }, "");
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("", out.stdout); // nothing captured
+    try testing.expectEqualStrings("", out.stderr);
+
+    // procrun did not close `f`: the caller can still write through it (it
+    // shares the child's offset, so this lands after the child's bytes).
+    try f.writeStreamingAll(io, "tail\n");
+
+    const got = try tmp.dir.readFileAlloc(io, "log.txt", testing.allocator, .limited(4096));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("out\nerr\nout2\ntail\n", got);
+}
+
+test ".file as stdin feeds the child from a caller-owned file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.txt", .data = "from a file\n" });
+    const f = try tmp.dir.openFile(io, "in.txt", .{});
+    defer f.close(io);
+
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{"cat"},
+        .stdin = .{ .file = f },
+    }, "");
+    defer out.deinit(testing.allocator);
+    try testing.expectEqualStrings("from a file\n", out.stdout);
 }
 
 test "spawnStreaming: cancel terminates a long sleep promptly" {
