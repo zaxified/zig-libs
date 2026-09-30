@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **The 2026-07-28 stateless transport** (plan M5 in `mcp`'s SPEC), next to the
+  session-era one, decided per POST by the body's `_meta` protocol version (new `src/modern.zig`).
+  Modern requests need no session and get none; `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`
+  (Base64 sentinel decoded) and `Mcp-Param-*` (`x-mcp-header`) must agree with the body, else 400 +
+  `HeaderMismatch` -32020; -32022/-32021 answers are 400, -32601 is 404; under SSE a lone answer is
+  sent as `application/json`; a closed stream is cancellation, not an error. `subscriptions/listen`
+  and multi round-trip requests come from `mcp`. Session-era behaviour unchanged (all earlier tests
+  and oracle replays pass as they were); the catalog line and `meta.model_after` now name both
+  revisions.
+
 - **2026-09-07** — **Test-only: all twelve real JSON-RPC bodies in the fuzz
   corpus reached the pre-parse scanners as the EMPTY body**, including the
   `initialize` request the scanners exist to recognise. `buildJsonRpcish`

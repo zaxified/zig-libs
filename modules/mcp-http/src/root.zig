@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-//! mcp-http — the MCP **Streamable HTTP** transport (2025-06-18 revision) as a
-//! `router` middleware, so a `mcp.Server` (JSON-RPC 2.0 tools / resources /
-//! prompts) is reachable remotely over HTTP instead of only over stdio.
+//! mcp-http — the MCP **Streamable HTTP** transport as a `router` middleware,
+//! so a `mcp.Server` (JSON-RPC 2.0 tools / resources / prompts) is reachable
+//! remotely over HTTP instead of only over stdio. Two revisions, decided per
+//! POST like the server itself decides: the session-era transport
+//! (2025-06-18 / 2025-11-25, described below) and the stateless one of
+//! 2026-07-28 (`modern.zig`: no session, the request-metadata headers checked
+//! against the body, `HeaderMismatch` -32020 as 400, the spec's 400/404
+//! statuses, multi round-trip requests instead of server→client requests,
+//! `subscriptions/listen`).
 //!
 //! A single endpoint (`/mcp` by default) where the client **POST**s one
 //! JSON-RPC message. The response is delivered one of two ways:
@@ -98,11 +104,12 @@ const std = @import("std");
 const router = @import("router");
 const http = @import("http");
 const mcp = @import("mcp");
+const modern = @import("modern.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "MCP Streamable HTTP transport (2025-06-18) — `POST /mcp` with JSON or live SSE, resumable sessions, Origin (DNS-rebind) guard.",
+    .doc = "MCP Streamable HTTP transport (2026-07-28 stateless + 2025-06-18 sessions) — `POST /mcp` with JSON or live SSE, header/body validation, Origin (DNS-rebind) guard.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -113,7 +120,7 @@ pub const meta = .{
     // Reentrant except the shared mcp.Server — inject Lock under a threaded
     // http.Server (documented).
     .concurrency = .reentrant,
-    .model_after = "MCP Streamable HTTP transport (2025-06-18); mcp_dart behavioral reference",
+    .model_after = "MCP Streamable HTTP transport (2026-07-28 and 2025-06-18); python-sdk captured session as oracle",
     .deps = .{ "router", "http", "mcp" },
 };
 
@@ -730,6 +737,32 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     };
     defer t.gpa.free(body);
 
+    // Spec 2026-07-28: a request whose body carries the `_meta` protocol
+    // version is served statelessly, whatever sessions are configured — no
+    // session is required, none is minted, `Mcp-Session-Id` is ignored — once
+    // its request-metadata headers agree with its body (see `modern.zig`).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+        defer arena_state.deinit();
+        var hv: HeaderView = .{ .req = ctx.req };
+        t.lock.acquire();
+        const verdict = modern.classify(arena_state.allocator(), hv.headers(), body, t.server);
+        t.lock.release();
+        switch (try verdict) {
+            .legacy => {},
+            .mismatch => |line| {
+                ctx.res.setStatus(400);
+                try ctx.res.setHeader("Content-Type", "application/json");
+                try ctx.res.writeAll(line);
+                return;
+            },
+            .modern => {
+                if (t.stream == .auto and acceptsSse(ctx.req)) return modernStreamResponse(t, ctx, body);
+                return modernJsonResponse(t, ctx, body);
+            },
+        }
+    }
+
     // Session handling (only when a registry is configured). The client gets a
     // session id at `initialize` and must present it on every later request.
     // `sid`/`peer` identify the session for the rest of the request: `peer` is
@@ -857,6 +890,102 @@ fn streamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8, peer:
     // the terminating chunk), which is the server-closes-after-response contract.
 }
 
+/// `modern.Headers` over an `http` request.
+const HeaderView = struct {
+    req: *const http.Server.Request,
+
+    fn headers(self: *const HeaderView) modern.Headers {
+        return .{ .ctx = self, .getFn = get, .countFn = count };
+    }
+    fn get(ctx: *const anyopaque, name: []const u8) ?[]const u8 {
+        const self: *const HeaderView = @ptrCast(@alignCast(ctx));
+        return self.req.header(name);
+    }
+    fn count(ctx: *const anyopaque, name: []const u8) usize {
+        const self: *const HeaderView = @ptrCast(@alignCast(ctx));
+        var it = self.req.iterateHeaders();
+        var n: usize = 0;
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) n += 1;
+        }
+        return n;
+    }
+};
+
+/// A 2026-07-28 request, `application/json`: the last line the server wrote
+/// is the body, with the status its JSON-RPC answer maps to
+/// (`modern.statusFor`). Anything written before it (progress) has nowhere
+/// to go — that revision has no `GET` stream — and is dropped, as it is on a
+/// stateless session-era endpoint. Nothing written: a notification, 202.
+fn modernJsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    var out: std.Io.Writer.Allocating = .init(t.gpa);
+    defer out.deinit();
+    t.lock.acquire();
+    const rc = t.server.handleMessageFrom(body, &out.writer, 0);
+    t.lock.release();
+    rc catch return error.OutOfMemory; // see `jsonResponse`
+
+    const resp = lastLine(out.written());
+    if (resp.len == 0) {
+        ctx.res.setStatus(202);
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+    defer arena_state.deinit();
+    ctx.res.setStatus(modern.statusFor(arena_state.allocator(), resp));
+    try ctx.res.setHeader("Content-Type", "application/json");
+    try ctx.res.writeAll(resp);
+}
+
+fn lastLine(written: []const u8) []const u8 {
+    var resp: []const u8 = "";
+    var it = std.mem.splitScalar(u8, written, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len != 0) resp = line;
+    }
+    return resp;
+}
+
+/// A 2026-07-28 request whose client accepts SSE. The stream opens with the
+/// first **notification** the server writes (progress, a listen
+/// acknowledgment), so it carries them live, and ends with the response. A
+/// request answered by its response alone — every refusal among them — goes
+/// out as `application/json` with its mapped status instead: an SSE stream
+/// is committed to 200, and the spec's 400/404 answers must be visible to a
+/// client that decides its era fallback from the status.
+///
+/// Closing the stream is the client's cancellation (streamable-http.mdx
+/// "Cancellation"): once a write fails nothing more is sent, the failure is
+/// not an error of this request, and the handler runs out its course (no
+/// cancellation seam reaches a running `mcp` handler yet).
+fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    var adapter = SseAdapter.init(t.gpa, ctx.res, &buf);
+    adapter.hold_lone_response = true;
+    defer adapter.deinit();
+
+    t.lock.acquire();
+    const rc = t.server.handleMessageFrom(body, &adapter.writer, 0);
+    t.lock.release();
+    adapter.writer.flush() catch {};
+    adapter.finish();
+    rc catch |err| switch (err) {
+        error.WriteFailed => if (!adapter.started) return err, // cancelled: see above
+        else => return err,
+    };
+
+    if (adapter.held) |line| {
+        var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+        defer arena_state.deinit();
+        ctx.res.setStatus(modern.statusFor(arena_state.allocator(), line));
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.writeAll(line);
+        return;
+    }
+    if (!adapter.started) ctx.res.setStatus(202);
+}
+
 /// A `std.Io.Writer` that turns the server's newline-delimited JSON-RPC output
 /// into SSE `data:` events on `rw`. Each complete line (the server writes one
 /// JSON object per line, flushing after each) is emitted as its own event and
@@ -869,6 +998,12 @@ const SseAdapter = struct {
     es: http.sse.EventStream = undefined,
     started: bool = false,
     writer: std.Io.Writer,
+    /// 2026-07-28 only: keep a *response* that would be the stream's first
+    /// event back instead (in `held`), so the caller can send it as
+    /// `application/json` with its own status. A notification opens the
+    /// stream as usual.
+    hold_lone_response: bool = false,
+    held: ?[]u8 = null,
 
     fn init(gpa: std.mem.Allocator, rw: *http.Server.ResponseWriter, buffer: []u8) SseAdapter {
         return .{
@@ -880,6 +1015,7 @@ const SseAdapter = struct {
 
     fn deinit(self: *SseAdapter) void {
         self.pending.deinit(self.gpa);
+        if (self.held) |h| self.gpa.free(h);
     }
 
     fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -911,11 +1047,33 @@ const SseAdapter = struct {
     fn emitLine(self: *SseAdapter, line: []const u8) std.Io.Writer.Error!void {
         const trimmed = std.mem.trimEnd(u8, line, "\r"); // tolerate CRLF
         if (trimmed.len == 0) return; // never seen from mcp, but skip blanks
-        if (!self.started) {
-            self.es = http.sse.EventStream.start(self.rw) catch return error.WriteFailed;
-            self.started = true;
+        if (self.hold_lone_response and !self.started) {
+            if (self.held == null and isResponse(self.gpa, trimmed)) {
+                self.held = self.gpa.dupe(u8, trimmed) catch return error.WriteFailed;
+                return;
+            }
+            // More follows a held line (never from `mcp`, whose response is
+            // its last line): it was not alone after all — stream both.
+            if (self.held) |h| {
+                self.held = null;
+                defer self.gpa.free(h);
+                try self.startStream();
+                self.es.send(.{ .data = h }) catch return error.WriteFailed;
+            }
         }
+        if (!self.started) try self.startStream();
         self.es.send(.{ .data = trimmed }) catch return error.WriteFailed;
+    }
+
+    fn startStream(self: *SseAdapter) std.Io.Writer.Error!void {
+        self.es = http.sse.EventStream.start(self.rw) catch return error.WriteFailed;
+        self.started = true;
+    }
+
+    fn isResponse(gpa: std.mem.Allocator, line: []const u8) bool {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        return modern.isResponseLine(arena_state.allocator(), line);
     }
 
     /// Flush a trailing line with no final newline (defensive — mcp always ends
@@ -2445,4 +2603,228 @@ test "close() actually ends the session it marks" {
     const after = runWire(&r, getWithSession(&rbuf, sid, null), &out3);
     try testing.expect(std.mem.startsWith(u8, after, "HTTP/1.1 404"));
     try testing.expect(!sessions.exists(sid));
+}
+
+// ── spec 2026-07-28: the stateless transport (see modern.zig) ───────────────
+
+test {
+    _ = modern;
+}
+
+/// A POST with arbitrary extra header lines (each ending `\r\n`).
+fn postHeaders(comptime headers: []const u8, comptime json: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ headers, json.len, json },
+    );
+}
+
+const modern_meta =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ExampleClient","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}
+;
+const modern_call_headers = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: echo\r\n";
+const modern_call_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"x\":1}," ++ modern_meta ++ "}}";
+
+test "2026-07-28: a modern tools/call is served statelessly — even with sessions configured, no session needed or minted" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    // A stale session id rides along: ignored, not 404.
+    const got = runWire(&r, postHeaders(modern_call_headers ++ "Mcp-Session-Id: stale\r\n", modern_call_body), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
+    try testing.expect(headerValue(got, "mcp-session-id") == null);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"id\":1") != null);
+    // Nothing was recorded against any peer.
+    try testing.expectEqual(@as(usize, 0), server.peers.items.len);
+}
+
+test "2026-07-28: header problems are 400 HeaderMismatch before the server runs" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    const cases = [_][]const u8{
+        postHeaders("", modern_call_body), // no headers at all
+        postHeaders("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n", modern_call_body), // no Mcp-Name
+        postHeaders("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: other\r\n", modern_call_body),
+        postHeaders(modern_call_headers ++ "Mcp-Name: echo\r\n", modern_call_body), // duplicated
+        // A modern header on a session-era body.
+        postHeaders("MCP-Protocol-Version: 2026-07-28\r\n", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"),
+    };
+    for (cases) |req| {
+        var buf: [8192]u8 = undefined;
+        const got = runWire(&r, req, &buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+        try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
+        try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"code\":-32020") != null);
+    }
+}
+
+test "2026-07-28: an unsupported revision is 400, an unknown method 404, an ordinary JSON-RPC error 200" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    const future = runWire(&r, postHeaders("MCP-Protocol-Version: 2099-01-01\r\nMcp-Method: tools/list\r\n",
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ), &buf);
+    try testing.expect(std.mem.startsWith(u8, future, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, bodyOf(future), "\"code\":-32022") != null);
+
+    // `ping` was removed in 2026-07-28: -32601, and the transport says 404 —
+    // also when the client accepts SSE (a lone response is never a stream).
+    var buf2: [8192]u8 = undefined;
+    const ping = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: ping\r\n", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"params\":{" ++ modern_meta ++ "}}"), &buf2);
+    try testing.expect(std.mem.startsWith(u8, ping, "HTTP/1.1 404"));
+    try testing.expectEqualStrings("application/json", headerValue(ping, "content-type").?);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(ping), "\"code\":-32601") != null);
+
+    var buf3: [8192]u8 = undefined;
+    const unknown_tool = runWire(&r, postHeaders("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: nope\r\n", "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"," ++ modern_meta ++ "}}"), &buf3);
+    try testing.expect(std.mem.startsWith(u8, unknown_tool, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, bodyOf(unknown_tool), "\"code\":-32602") != null);
+}
+
+test "2026-07-28 SSE: progress streams live then the result; a lone result stays application/json" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: work\r\n", "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"work\",\"arguments\":{},\"_meta\":{\"progressToken\":\"p1\",\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}"), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("text/event-stream", headerValue(got, "content-type").?);
+    try testing.expectEqualStrings("no", headerValue(got, "x-accel-buffering").?);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "notifications/progress"));
+    try testing.expect(std.mem.indexOf(u8, got, "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"resultType\":\"complete\"") != null);
+
+    var buf2: [8192]u8 = undefined;
+    const lone = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\n" ++ modern_call_headers, modern_call_body), &buf2);
+    try testing.expect(std.mem.startsWith(u8, lone, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("application/json", headerValue(lone, "content-type").?);
+    try testing.expect(std.mem.startsWith(u8, bodyOf(lone), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\""));
+}
+
+test "2026-07-28 SSE: subscriptions/listen is the acknowledgment then the graceful close, as one stream" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-1\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":true}}}"), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("text/event-stream", headerValue(got, "content-type").?);
+    const ack = std.mem.indexOf(u8, got, "notifications/subscriptions/acknowledged").?;
+    const done = std.mem.indexOf(u8, got, "\"id\":\"listen-1\",\"result\"").?;
+    try testing.expect(ack < done);
+}
+
+fn askingTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    if (call.input.elicitation("branch")) |r| {
+        call.print("deploying {s}", .{r.content.?.object.get("branch").?.string});
+        return false;
+    }
+    call.input.ask("branch", .{ .elicitation = .{ .form = .{
+        .message = "Which branch?",
+        .requested_schema = "{\"type\":\"object\",\"properties\":{\"branch\":{\"type\":\"string\"}}}",
+    } } }) catch return call.fail("cannot ask");
+    return false;
+}
+
+test "2026-07-28: a multi round-trip tool over HTTP — InputRequiredResult, then the retry completes" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "deploy", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = askingTool });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    const hdrs = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: deploy\r\n";
+    const meta_elicit =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}
+    ;
+    var buf: [8192]u8 = undefined;
+    const first = runWire(&r, postHeaders(hdrs, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"deploy\"," ++ meta_elicit ++ "}}"), &buf);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "\"branch\":{\"method\":\"elicitation/create\"") != null);
+
+    var buf2: [8192]u8 = undefined;
+    const second = runWire(&r, postHeaders(hdrs, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"deploy\"," ++ meta_elicit ++
+        ",\"inputResponses\":{\"branch\":{\"action\":\"accept\",\"content\":{\"branch\":\"main\"}}}}}"), &buf2);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "deploying main") != null);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "\"resultType\":\"complete\"") != null);
+}
+
+test "2026-07-28: Mcp-Param headers are checked against the tool's x-mcp-header schema over HTTP" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{
+        .name = "execute_sql",
+        .description = "Execute SQL on Google Cloud Spanner",
+        .input_schema =
+        \\{"type":"object","properties":{"region":{"type":"string","description":"The region to execute the query in","x-mcp-header":"Region"},"query":{"type":"string","description":"The SQL query to execute"}},"required":["region","query"]}
+        ,
+        .handler = echoTool,
+    });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    // streamable-http.mdx "Resulting HTTP request", body compacted.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{" ++ modern_meta ++ ",\"name\":\"execute_sql\",\"arguments\":{\"region\":\"us-west1\",\"query\":\"SELECT * FROM users\"}}}";
+    const base = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: execute_sql\r\n";
+    var buf: [8192]u8 = undefined;
+    const ok = runWire(&r, postHeaders(base ++ "Mcp-Param-Region: us-west1\r\n", body), &buf);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    var buf2: [8192]u8 = undefined;
+    const missing = runWire(&r, postHeaders(base, body), &buf2);
+    try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, bodyOf(missing), "Mcp-Param-Region") != null);
+}
+
+test "the session era is untouched: an initialize-era POST under a session-revision header keeps its old reply" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postHeaders("MCP-Protocol-Version: 2025-11-25\r\n", list_body), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "resultType") == null);
+    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"name\":\"echo\"") != null);
 }

@@ -1,8 +1,10 @@
 # mcp-http
 
-The MCP **Streamable HTTP** transport (2025-06-18 revision) as a `router`
-middleware, so a `mcp.Server` (JSON-RPC 2.0 tools / resources / prompts) is
-reachable remotely over HTTP instead of only over stdio.
+The MCP **Streamable HTTP** transport as a `router` middleware, so a
+`mcp.Server` (JSON-RPC 2.0 tools / resources / prompts) is reachable remotely
+over HTTP instead of only over stdio. It speaks both the **2026-07-28**
+stateless transport and the session-era one (2025-06-18 / 2025-11-25),
+decided per POST — see [Spec 2026-07-28](#spec-2026-07-28-stateless).
 
 The request/response half: a single endpoint (`/mcp` by default) where the
 client **POST**s one JSON-RPC message and gets back either the response
@@ -141,3 +143,28 @@ What this transport adds:
   works as before; on a multi-client endpoint that flag is a data leak between
   clients and the transport cannot tell the two situations apart, which is why
   it is an explicit opt-in.
+
+## Spec 2026-07-28 (stateless)
+
+A POST whose body carries `params._meta["io.modelcontextprotocol/protocolVersion"]`
+is served by the 2026-07-28 rules, with no configuration and next to any
+session-era clients on the same endpoint:
+
+- **No session.** None is required or minted; `Mcp-Session-Id` is ignored.
+- **Headers must mirror the body**: `MCP-Protocol-Version`, `Mcp-Method`,
+  `Mcp-Name` (on `tools/call` / `prompts/get` / `resources/read`, Base64
+  sentinel `=?base64?…?=` decoded), and `Mcp-Param-{Name}` for each tool
+  argument marked `x-mcp-header` in the tool's `inputSchema`. Missing,
+  duplicated, malformed or disagreeing → **400** with a `HeaderMismatch`
+  (-32020) JSON-RPC error; `mcp` never sees the request.
+- **Statuses**: unsupported revision (-32022) and missing client capability
+  (-32021) → 400, unknown method → 404, anything else 200.
+- **SSE** only when the server has something to stream before the answer
+  (progress, the `subscriptions/listen` acknowledgment); a lone answer goes out
+  as `application/json`, so its status is visible. Closing the stream is the
+  client's cancellation.
+- **Sampling / elicitation** travel as multi round-trip requests
+  (`InputRequiredResult`, then the client's retry) — nothing to correlate, no
+  session, no `stateless_responses` question. See `mcp`'s README.
+- **`subscriptions/listen`** is acknowledged with an empty filter and closed at
+  once: `mcp` emits no change notifications yet.
