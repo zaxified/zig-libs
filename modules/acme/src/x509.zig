@@ -109,6 +109,12 @@ pub fn isValidDomain(name: []const u8) bool {
     return true;
 }
 
+/// A wildcard dNSName, `*.` followed by a valid LDH name (RFC 8555 §7.1.3:
+/// the asterisk is the whole leftmost label). Only DNS-01 can validate one.
+pub fn isValidWildcardDomain(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "*.") and isValidDomain(name[2..]);
+}
+
 // ── PKCS#10 CSR ─────────────────────────────────────────────────────────────
 
 pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFailed };
@@ -116,11 +122,12 @@ pub const CsrError = error{ OutOfMemory, ValueTooLarge, InvalidDomain, SigningFa
 /// Build a DER-encoded PKCS#10 CSR for `domains`, signed with `key_pair`
 /// (ES256). Structure: version 0, empty subject, P-256 SPKI, one
 /// extensionRequest attribute carrying subjectAltName = dNSName list.
-/// Caller owns the returned bytes.
+/// A wildcard (`*.example.org`) is a valid dNSName here; whether it can be
+/// validated is the order flow's business. Caller owns the returned bytes.
 pub fn csrDer(gpa: Allocator, key_pair: Es256.KeyPair, domains: []const []const u8) CsrError![]u8 {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
-        if (!isValidDomain(name)) return error.InvalidDomain;
+        if (!isValidDomain(name) and !isValidWildcardDomain(name)) return error.InvalidDomain;
     }
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -744,19 +751,34 @@ test "CSR: any tampered byte breaks the signature (or the structure)" {
 test "CSR: domain validation" {
     const kp = testKeyPair(44);
     const cases = [_][]const u8{
-        "",              ".",            "example..com", "-bad.example", "bad-.example",
-        "*.example.com", "exa mple.com",
+        "",                ".",               "example..com", "-bad.example",   "bad-.example",
+        "exa mple.com",
         "chybí.diakritika",
         "x" ** 254,
+            // A wildcard is only the whole leftmost label (RFC 8555 §7.1.3).
+               "*",               "*.",           "**.example.com", "*example.com",
+        "a.*.example.com", "*.*.example.com",
     };
     for (cases) |bad| {
         try testing.expectError(error.InvalidDomain, csrDer(testing.allocator, kp, &.{bad}));
         try testing.expect(!isValidDomain(bad));
+        try testing.expect(!isValidWildcardDomain(bad));
     }
     try testing.expectError(error.InvalidDomain, csrDer(testing.allocator, kp, &.{}));
     try testing.expect(isValidDomain("a.example"));
     try testing.expect(isValidDomain("xn--hkyrky-ptac70bc.example"));
     try testing.expect(isValidDomain("127.0.0.1")); // IP-shaped names pass the LDH check (mock/test use)
+
+    // A wildcard is a valid dNSName for the CSR (since 2026-09-30, with
+    // DNS-01); it is still not a plain LDH name.
+    try testing.expect(isValidWildcardDomain("*.example.com"));
+    try testing.expect(!isValidDomain("*.example.com"));
+    const der = try csrDer(testing.allocator, kp, &.{ "*.example.com", "example.com" });
+    defer testing.allocator.free(der);
+    var parsed = try parseCsr(testing.allocator, der);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.sans.len);
+    try testing.expectEqualStrings("*.example.com", parsed.sans[0]);
 }
 
 /// Navigate a self-signed cert and verify its ECDSA signature over the exact

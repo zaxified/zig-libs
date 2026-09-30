@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The ACME v2 (RFC 8555) client: directory discovery, nonce management,
-//! account registration, order → authorization → HTTP-01 challenge →
+//! account registration, order → authorization → HTTP-01 / TLS-ALPN-01 /
+//! DNS-01 challenge →
 //! finalize (CSR) → certificate download. Modeled on
 //! `golang.org/x/crypto/acme` (design only — clean-room from RFC 8555).
 //!
@@ -65,9 +66,40 @@ problem_len: usize,
 /// `http_01` serves the key authorization over port 80 (via
 /// `challengeResponder`); `tls_alpn_01` (RFC 8737) serves a validation
 /// certificate over TLS under ALPN `acme-tls/1` (via `tlsAlpnResponder`, whose
-/// store the caller's TLS listener must consult). Both use the same account,
-/// order, notify and poll machinery — only the proof differs.
-pub const ChallengeType = enum { http_01, tls_alpn_01 };
+/// store the caller's TLS listener must consult); `dns_01` (RFC 8555 §8.4)
+/// publishes a TXT record through `Options.dns_publisher` — the only one that
+/// needs no port reachable from the CA, and the only one that can validate a
+/// wildcard. All share the account, order, notify and poll machinery — only
+/// the proof differs.
+pub const ChallengeType = enum { http_01, tls_alpn_01, dns_01 };
+
+/// How the order flow publishes a DNS-01 TXT record. Publishing is the one
+/// part of DNS-01 that depends on the DNS provider (a provider's API, an RFC
+/// 2136 update, a zone file a local server reloads), so it is the caller's;
+/// the library computes the name and value and drives the rest.
+pub const DnsPublisher = struct {
+    ctx: ?*anyopaque = null,
+    /// Publish TXT `value` at `name` (`_acme-challenge.<domain>`, no trailing
+    /// dot) and return only once the CA's resolvers can see it: waiting out
+    /// propagation is part of the job, because the CA is told to validate the
+    /// moment this returns. Return false to abort the authorization
+    /// (`error.DnsPublishFailed`). **Add** the value, do not replace the
+    /// record set: a wildcard and its base domain validate at the same name.
+    present: *const fn (ctx: ?*anyopaque, name: []const u8, value: []const u8) bool,
+    /// Remove exactly that value again. Called once for every `present` that
+    /// returned true, whatever the authorization's outcome.
+    cleanup: *const fn (ctx: ?*anyopaque, name: []const u8, value: []const u8) void,
+};
+
+/// The DNS-01 record name for `domain`: `_acme-challenge.<domain>` (RFC 8555
+/// §8.4). For a wildcard order the authorization's identifier is already the
+/// base name, so this is never given a `*.`.
+pub fn dns01RecordName(buf: *[dns01_max_name_len]u8, domain: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ dns01_label, domain }) catch unreachable; // domain <= 253
+}
+
+pub const dns01_label = "_acme-challenge.";
+pub const dns01_max_name_len = dns01_label.len + 253;
 
 pub const Options = struct {
     /// ACME directory URL. **Defaults to Let's Encrypt STAGING** (untrusted
@@ -76,8 +108,12 @@ pub const Options = struct {
     directory_url: []const u8 = letsencrypt_staging,
     /// Challenge type the order flow uses (default HTTP-01). Selecting
     /// `tls_alpn_01` requires the caller to have wired `tlsAlpnResponder()`
-    /// into a TLS listener serving ALPN `acme-tls/1` for the ordered domains.
+    /// into a TLS listener serving ALPN `acme-tls/1` for the ordered domains;
+    /// `dns_01` requires `dns_publisher`.
     challenge_type: ChallengeType = .http_01,
+    /// Publishes DNS-01 TXT records. Required for `challenge_type = .dns_01`
+    /// (`obtain` refuses with `error.DnsPublisherMissing` otherwise).
+    dns_publisher: ?DnsPublisher = null,
     /// Optional account contact URLs, e.g. "mailto:admin@example.org".
     contact: []const []const u8 = &.{},
     /// RFC 8555 §7.3: account creation asserts agreement with the CA's
@@ -103,16 +139,22 @@ pub const Error = error{
     MalformedResponse,
     /// The CA refused with a problem document — `lastProblem` has details.
     AcmeProblem,
-    /// An authorization ended in an error state (or offered no HTTP-01).
+    /// An authorization ended in an error state (or offered no challenge of
+    /// the configured type).
     AuthorizationFailed,
+    /// `Options.dns_publisher.present` returned false.
+    DnsPublishFailed,
+    /// `challenge_type = .dns_01` without an `Options.dns_publisher`.
+    DnsPublisherMissing,
     /// The order ended `invalid`.
     OrderFailed,
     /// A status poll exceeded `Options.max_polls`.
     PollTimeout,
     /// Key generation / JWS / CSR signing failed (astronomically rare).
     SigningFailed,
-    /// A requested identifier is not a valid LDH hostname (wildcards need
-    /// dns-01, which this module does not implement).
+    /// A requested identifier is not a valid LDH hostname, or is a wildcard
+    /// (`*.example.org`) while `challenge_type` is not `dns_01` — no other
+    /// challenge can validate one (RFC 8555 §7.1.3, and CA policy).
     InvalidDomain,
     /// A `kid`-signed request was attempted before registration.
     NotRegistered,
@@ -268,15 +310,21 @@ pub const Certificate = struct {
 };
 
 /// Run the whole RFC 8555 issuance for `domains` (dNSName identifiers):
-/// newOrder → HTTP-01 authorizations (served via `challengeResponder`) →
-/// finalize with a fresh P-256 CSR → download the chain. Registers the
-/// account on first use. The challenge responder must already be reachable
-/// through the domains' port 80 before calling this.
+/// newOrder → one authorization per identifier, solved with
+/// `Options.challenge_type` → finalize with a fresh P-256 CSR → download the
+/// chain. Registers the account on first use. The proof channel must be
+/// ready before calling this: the HTTP-01 responder reachable on port 80, the
+/// TLS-ALPN-01 store wired into a listener on 443, or the DNS-01 publisher
+/// set. A wildcard (`*.example.org`) is accepted with `dns_01` only.
 pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
     if (domains.len == 0) return error.InvalidDomain;
     for (domains) |name| {
-        if (!x509.isValidDomain(name)) return error.InvalidDomain;
+        if (x509.isValidDomain(name)) continue;
+        if (c.options.challenge_type == .dns_01 and x509.isValidWildcardDomain(name)) continue;
+        return error.InvalidDomain;
     }
+    if (c.options.challenge_type == .dns_01 and c.options.dns_publisher == null)
+        return error.DnsPublisherMissing;
     try c.register();
 
     var arena = std.heap.ArenaAllocator.init(c.gpa);
@@ -424,6 +472,27 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
             defer c.tls_alpn.remove(authz.identifier);
             try c.notifyAndPoll(a, challenge.url, authz_url);
         },
+        .dns_01 => {
+            const challenge = authz.dns01 orelse {
+                c.note("authorization offers no dns-01 challenge");
+                return error.AuthorizationFailed;
+            };
+            // The identifier is the base name even for a wildcard order
+            // (§7.1.4: `wildcard: true` rides beside it); a CA that sends
+            // anything else is not following the RFC.
+            if (!x509.isValidDomain(authz.identifier)) return error.MalformedResponse;
+            const value = jws.dns01TxtValue(challenge.token, c.account_key.public_key) catch
+                return error.MalformedResponse; // CA sent a non-token
+            var name_buf: [dns01_max_name_len]u8 = undefined;
+            const name = dns01RecordName(&name_buf, authz.identifier);
+            const publisher = c.options.dns_publisher orelse return error.DnsPublisherMissing;
+            if (!publisher.present(publisher.ctx, name, &value)) {
+                c.note("DNS-01 TXT record was not published");
+                return error.DnsPublishFailed;
+            }
+            defer publisher.cleanup(publisher.ctx, name, &value);
+            try c.notifyAndPoll(a, challenge.url, authz_url);
+        },
     }
 }
 
@@ -559,8 +628,11 @@ const AuthzInfo = struct {
     /// The authorization's dNS identifier value (the domain) — the SAN and
     /// SNI key for the TLS-ALPN-01 validation certificate.
     identifier: []const u8,
+    /// §7.1.4: the authorization is for `*.<identifier>`.
+    wildcard: bool,
     http01: ?ChallengeInfo,
     tls_alpn01: ?ChallengeInfo,
+    dns01: ?ChallengeInfo,
 };
 
 const ChallengeInfo = struct {
@@ -572,6 +644,7 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
     const AuthzJson = struct {
         status: []const u8 = "",
         identifier: IdentifierJson = .{},
+        wildcard: bool = false,
         challenges: []const ChallengeJson = &.{},
 
         const IdentifierJson = struct {
@@ -593,18 +666,23 @@ fn parseAuthz(a: Allocator, body: []const u8) Error!AuthzInfo {
     };
     var http01: ?ChallengeInfo = null;
     var tls_alpn01: ?ChallengeInfo = null;
+    var dns01: ?ChallengeInfo = null;
     for (parsed.challenges) |ch| {
         if (http01 == null and std.mem.eql(u8, ch.type, "http-01")) {
             http01 = .{ .url = ch.url, .token = ch.token };
         } else if (tls_alpn01 == null and std.mem.eql(u8, ch.type, "tls-alpn-01")) {
             tls_alpn01 = .{ .url = ch.url, .token = ch.token };
+        } else if (dns01 == null and std.mem.eql(u8, ch.type, "dns-01")) {
+            dns01 = .{ .url = ch.url, .token = ch.token };
         }
     }
     return .{
         .status = statusFromString(parsed.status),
         .identifier = parsed.identifier.value,
+        .wildcard = parsed.wildcard,
         .http01 = http01,
         .tls_alpn01 = tls_alpn01,
+        .dns01 = dns01,
     };
 }
 
@@ -1430,6 +1508,13 @@ const MockCa = struct {
     csr_ok: bool = false,
     finalized: bool = false,
     served_processing: bool = false,
+    /// Which challenge the mock offers and validates.
+    mode: ChallengeType = .http_01,
+    /// The one identifier the order carries (`*.` = a wildcard order).
+    order_domain: []const u8 = domain,
+    /// DNS-01: the "DNS" the mock resolves — the zone the client's publisher
+    /// writes into.
+    zone: ?*TestZone = null,
     fail_count: u32 = 0,
     fail_note_buf: [256]u8 = undefined,
     fail_note_len: usize = 0,
@@ -1569,7 +1654,7 @@ const MockCa = struct {
         w.print(
             \\{{"status":"{s}","identifiers":[{{"type":"dns","value":"{s}"}}],
             \\ "authorizations":["{s}"],"finalize":"{s}"
-        , .{ status, domain, m.authz_url, m.finalize_url }) catch unreachable;
+        , .{ status, m.order_domain, m.authz_url, m.finalize_url }) catch unreachable;
         if (with_cert) w.print(",\"certificate\":\"{s}\"", .{m.cert_url}) catch unreachable;
         w.writeAll("}") catch unreachable;
         return w.buffered();
@@ -1655,7 +1740,7 @@ fn mcNewOrder(ctx: *router.Ctx) anyerror!void {
     defer payload.deinit();
     if (payload.value.identifiers.len != 1 or
         !std.mem.eql(u8, payload.value.identifiers[0].type, "dns") or
-        !std.mem.eql(u8, payload.value.identifiers[0].value, MockCa.domain))
+        !std.mem.eql(u8, payload.value.identifiers[0].value, m.order_domain))
         m.fail("newOrder identifiers wrong");
 
     var buf: [1024]u8 = undefined;
@@ -1676,6 +1761,28 @@ fn mcAuthz(ctx: *router.Ctx) anyerror!void {
 
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
+    if (m.mode == .dns_01) {
+        // §7.1.4: a wildcard order's authorization names the base domain and
+        // says `wildcard: true`; the CA offers dns-01 only. An http-01 decoy
+        // rides along to prove the client picks by type.
+        const wildcard = std.mem.startsWith(u8, m.order_domain, "*.");
+        const base = if (wildcard) m.order_domain[2..] else m.order_domain;
+        try w.print(
+            \\{{"status":"{s}","identifier":{{"type":"dns","value":"{s}"}},"wildcard":{},
+            \\ "challenges":[
+            \\  {{"type":"http-01","url":"{s}-nope","token":"never-this-one"}},
+            \\  {{"type":"dns-01","url":"{s}","token":"{s}","status":"{s}"}}]}}
+        , .{
+            if (valid) "valid" else @as([]const u8, "pending"),
+            base,
+            wildcard,
+            m.challenge_url,
+            m.challenge_url,
+            MockCa.token,
+            if (valid) "valid" else @as([]const u8, "pending"),
+        });
+        return m.respondJson(ctx, 200, w.buffered());
+    }
     // A dns-01 decoy first — the client must pick the http-01 entry.
     try w.print(
         \\{{"status":"{s}","identifier":{{"type":"dns","value":"{s}"}},
@@ -1698,6 +1805,8 @@ fn mcChallenge(ctx: *router.Ctx) anyerror!void {
     var v = m.readVerified(ctx, m.challenge_url, .kid) catch return mcRejected(ctx);
     defer v.deinit();
     if (!std.mem.eql(u8, v.payload, "{}")) m.fail("challenge trigger payload must be {}");
+
+    if (m.mode == .dns_01) return mcChallengeDns(m, ctx);
 
     // Validate like a real CA: fetch the key authorization from the
     // client's responder over HTTP and compare against the account key's
@@ -1743,6 +1852,91 @@ fn mcChallenge(ctx: *router.Ctx) anyerror!void {
     });
     try m.respondJson(ctx, 200, w.buffered());
 }
+
+/// DNS-01 validation, as a CA does it: resolve the TXT record at
+/// `_acme-challenge.<base domain>` and compare it with the value the account
+/// key implies (RFC 8555 §8.4). The "resolver" is the test zone.
+fn mcChallengeDns(m: *MockCa, ctx: *router.Ctx) anyerror!void {
+    const zone = m.zone orelse {
+        m.fail("dns-01 mock without a zone");
+        return mcRejected(ctx);
+    };
+    const base = if (std.mem.startsWith(u8, m.order_domain, "*.")) m.order_domain[2..] else m.order_domain;
+    var name_buf: [dns01_max_name_len]u8 = undefined;
+    const want_name = dns01RecordName(&name_buf, base);
+    const want_value = jws.dns01TxtValue(MockCa.token, m.account_key.?) catch unreachable;
+    var got_value: [jws.dns01_txt_len]u8 = undefined;
+    if (!zone.lookup(want_name, &got_value)) {
+        m.fail("no TXT record at the challenge name");
+        return mcRejected(ctx);
+    }
+    if (!std.mem.eql(u8, &got_value, &want_value)) {
+        m.fail("TXT record value mismatch");
+        return mcRejected(ctx);
+    }
+
+    lockSpin(&m.lock);
+    m.challenge_ok = true;
+    m.lock.unlock();
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.print("{{\"type\":\"dns-01\",\"url\":\"{s}\",\"token\":\"{s}\",\"status\":\"processing\"}}", .{
+        m.challenge_url, MockCa.token,
+    });
+    try m.respondJson(ctx, 200, w.buffered());
+}
+
+/// A one-record DNS zone standing in for the caller's DNS provider: the
+/// client's `DnsPublisher` writes into it, the mock CA resolves from it.
+const TestZone = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    name_buf: [dns01_max_name_len]u8 = undefined,
+    name_len: usize = 0,
+    value: [jws.dns01_txt_len]u8 = undefined,
+    live: bool = false,
+    presents: u32 = 0,
+    cleanups: u32 = 0,
+    /// Make `present` report failure (the provider refused).
+    refuse: bool = false,
+    bad_cleanup: bool = false,
+
+    fn publisher(z: *TestZone) DnsPublisher {
+        return .{ .ctx = z, .present = present, .cleanup = cleanup };
+    }
+
+    fn present(ctx: ?*anyopaque, name: []const u8, value: []const u8) bool {
+        const z: *TestZone = @ptrCast(@alignCast(ctx.?));
+        lockSpin(&z.lock);
+        defer z.lock.unlock();
+        z.presents += 1;
+        if (z.refuse or value.len != z.value.len or name.len > z.name_buf.len) return false;
+        @memcpy(z.name_buf[0..name.len], name);
+        z.name_len = name.len;
+        @memcpy(&z.value, value);
+        z.live = true;
+        return true;
+    }
+
+    fn cleanup(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+        const z: *TestZone = @ptrCast(@alignCast(ctx.?));
+        lockSpin(&z.lock);
+        defer z.lock.unlock();
+        z.cleanups += 1;
+        // Cleanup must name exactly the record it published.
+        if (!z.live or !std.mem.eql(u8, name, z.name_buf[0..z.name_len]) or !std.mem.eql(u8, value, &z.value))
+            z.bad_cleanup = true;
+        z.live = false;
+    }
+
+    fn lookup(z: *TestZone, name: []const u8, out: *[jws.dns01_txt_len]u8) bool {
+        lockSpin(&z.lock);
+        defer z.lock.unlock();
+        if (!z.live or !std.mem.eql(u8, name, z.name_buf[0..z.name_len])) return false;
+        out.* = z.value;
+        return true;
+    }
+};
 
 fn mcOrder(ctx: *router.Ctx) anyerror!void {
     const m = MockCa.of(ctx);
@@ -1798,7 +1992,7 @@ fn mcFinalize(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     };
     defer parsed.deinit();
-    const sans_ok = parsed.sans.len == 1 and std.mem.eql(u8, parsed.sans[0], MockCa.domain);
+    const sans_ok = parsed.sans.len == 1 and std.mem.eql(u8, parsed.sans[0], m.order_domain);
     if (!sans_ok) m.fail("csr SAN set mismatch");
     const fresh_key = !std.mem.eql(
         u8,
@@ -1937,4 +2131,130 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     const nonces_before = mock.nonces_issued;
     try client.register();
     try testing.expectEqual(nonces_before, mock.nonces_issued);
+}
+
+test "integration: a wildcard certificate over DNS-01 against the mock CA" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var zone: TestZone = .{};
+    var mock: MockCa = .{
+        .gpa = testing.allocator,
+        .io = io,
+        .mode = .dns_01,
+        .order_domain = "*." ++ MockCa.domain,
+        .zone = &zone,
+        .badnonce_left = 0,
+    };
+
+    var ca_router = router.Router.init(testing.allocator);
+    defer ca_router.deinit();
+    ca_router.state = &mock;
+    try ca_router.get("/dir", mcDirectory);
+    try ca_router.head("/new-nonce", mcNewNonce);
+    try ca_router.get("/new-nonce", mcNewNonce);
+    try ca_router.post("/new-acct", mcNewAccount);
+    try ca_router.post("/new-order", mcNewOrder);
+    try ca_router.post("/authz/1", mcAuthz);
+    try ca_router.post("/chall/1", mcChallenge);
+    try ca_router.post("/order/1", mcOrder);
+    try ca_router.post("/finalize/1", mcFinalize);
+    try ca_router.post("/cert/1", mcCert);
+
+    var ca_server = http.Server.init(io, testing.allocator, .{
+        .handler = ca_router.handler(),
+        .context = &ca_router,
+    });
+    defer ca_server.deinit();
+    ca_server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const ca_port = ca_server.boundAddress().getPort();
+    // DNS-01 needs no challenge server; the URL is unused.
+    try mock.setUrls(ca_port, ca_port);
+    defer mock.deinitUrls();
+
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    const account_key = try jws.Es256.KeyPair.generateDeterministic(@splat(12));
+
+    var client = Client.init(io, testing.allocator, &transport, account_key, .{
+        .directory_url = mock.dir_url,
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+        .poll_interval_ms = 10,
+        .max_polls = 50,
+    });
+    defer client.deinit();
+
+    const ca_thread = try std.Thread.spawn(.{}, serveWrap, .{&ca_server});
+    defer ca_thread.join();
+    defer ca_server.shutdown();
+
+    var cert = try client.obtain(&.{"*." ++ MockCa.domain});
+    defer cert.deinit(testing.allocator);
+
+    if (mock.fail_count != 0)
+        std.debug.print("mock CA recorded failures: {d} — first: {s}\n", .{ mock.fail_count, mock.failNote() });
+    try testing.expectEqual(@as(u32, 0), mock.fail_count);
+    try testing.expect(mock.challenge_ok); // the CA resolved the right TXT value
+    try testing.expect(mock.csr_ok); // the CSR's SAN is the wildcard
+    // Published once at the base name, removed once, exactly that record.
+    try testing.expectEqual(@as(u32, 1), zone.presents);
+    try testing.expectEqual(@as(u32, 1), zone.cleanups);
+    try testing.expect(!zone.live and !zone.bad_cleanup);
+    try testing.expectEqualStrings("_acme-challenge." ++ MockCa.domain, zone.name_buf[0..zone.name_len]);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, cert.chain_pem);
+}
+
+test "DNS-01 preconditions: wildcard needs dns_01, dns_01 needs a publisher, a refused publish aborts" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    const account_key = try jws.Es256.KeyPair.generateDeterministic(@splat(13));
+
+    // Refused before any network I/O: the directory URL is never contacted.
+    {
+        var c = Client.init(io, testing.allocator, &transport, account_key, .{ .directory_url = "http://127.0.0.1:1/dir" });
+        defer c.deinit();
+        try testing.expectError(error.InvalidDomain, c.obtain(&.{"*.example.org"}));
+    }
+    {
+        var c = Client.init(io, testing.allocator, &transport, account_key, .{
+            .directory_url = "http://127.0.0.1:1/dir",
+            .challenge_type = .dns_01,
+        });
+        defer c.deinit();
+        try testing.expectError(error.DnsPublisherMissing, c.obtain(&.{"*.example.org"}));
+        // Malformed wildcards stay malformed under dns_01 too.
+        var zone: TestZone = .{};
+        c.options.dns_publisher = zone.publisher();
+        try testing.expectError(error.InvalidDomain, c.obtain(&.{"a.*.example.org"}));
+        try testing.expectError(error.InvalidDomain, c.obtain(&.{"*"}));
+    }
+
+    var buf: [dns01_max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("_acme-challenge.example.org", dns01RecordName(&buf, "example.org"));
+    try testing.expectEqualStrings("_acme-challenge." ++ "x" ** 253, dns01RecordName(&buf, "x" ** 253));
+}
+
+test "parseAuthz: selects dns-01 and reads the wildcard flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const authz = try parseAuthz(a,
+        \\{"status":"pending","identifier":{"type":"dns","value":"example.org"},"wildcard":true,
+        \\ "challenges":[{"type":"dns-01","url":"https://ca/ch/9","token":"tok9"}]}
+    );
+    try testing.expect(authz.wildcard);
+    try testing.expectEqualStrings("example.org", authz.identifier);
+    try testing.expectEqualStrings("https://ca/ch/9", authz.dns01.?.url);
+    try testing.expectEqualStrings("tok9", authz.dns01.?.token);
+    try testing.expect(authz.http01 == null);
+    const plain = try parseAuthz(a, "{\"status\":\"pending\",\"challenges\":[]}");
+    try testing.expect(!plain.wildcard and plain.dns01 == null);
 }

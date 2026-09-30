@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-30** — **DNS-01 challenge and wildcard certificates.** `ChallengeType.dns_01`,
+  `Options.dns_publisher` (`DnsPublisher`: `present`/`cleanup` callbacks — provider code stays the
+  caller's), `jws.dns01TxtValue`, `Client.dns01RecordName`, `x509.isValidWildcardDomain`. `obtain`
+  accepts `*.name` with `dns_01` only; `csrDer` now accepts a wildcard dNSName. New errors
+  `DnsPublishFailed`, `DnsPublisherMissing` (⚠ an exhaustive `switch` over `Client.Error` or
+  `ChallengeType` needs the new arms). Mock-CA integration test for a wildcard order over DNS-01; TXT
+  value KAT against openssl and Python.
+
 - **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input; each now
   has a corpus and a measured reach guard.**
 

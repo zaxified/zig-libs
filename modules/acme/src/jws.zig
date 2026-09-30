@@ -187,6 +187,24 @@ pub fn acmeIdentifier(
     return acmeIdentifierFromKeyAuthorization(ka);
 }
 
+// ── RFC 8555 §8.4 DNS-01 TXT record value ───────────────────────────────────
+
+/// Length of a DNS-01 TXT record value: base64url of a SHA-256 digest.
+pub const dns01_txt_len = base64UrlLen(Sha256.digest_length); // 43
+
+/// The DNS-01 TXT record value for `token` under `public_key` (RFC 8555 §8.4):
+/// `base64url(SHA-256(keyAuthorization))`, unpadded. The digest is the one
+/// TLS-ALPN-01 embeds raw in its certificate; DNS-01 publishes it as text.
+pub fn dns01TxtValue(
+    token: []const u8,
+    public_key: Es256.PublicKey,
+) KeyAuthorizationError![dns01_txt_len]u8 {
+    const digest = try acmeIdentifier(token, public_key);
+    var out: [dns01_txt_len]u8 = undefined;
+    _ = b64.Encoder.encode(&out, &digest);
+    return out;
+}
+
 // ── flattened-JSON JWS signing ──────────────────────────────────────────────
 
 /// The ACME protected header (RFC 8555 §6.2): `alg` is always ES256; `kid`
@@ -533,6 +551,18 @@ test "acmeIdentifier (RFC 8737 §3): SHA-256 of the key authorization" {
 
     // A non-token is rejected the same way keyAuthorization rejects it.
     try testing.expectError(error.InvalidToken, acmeIdentifier("a/b", kp.public_key));
+}
+
+test "dns01TxtValue (RFC 8555 §8.4): base64url of SHA-256 of the key authorization" {
+    const kp = try rfc7515KeyPair();
+    // Oracle, two independent tools over the key authorization pinned above
+    // ("DGyRejmCefe7v4NfDGDKfA.oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"):
+    //   printf '%s' '<key-auth>' | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '='
+    //   python3: base64.urlsafe_b64encode(<the acmeIdentifier bytes above>).rstrip(b'=')
+    // Both give the value below (2026-09-30).
+    const txt = try dns01TxtValue("DGyRejmCefe7v4NfDGDKfA", kp.public_key);
+    try testing.expectEqualStrings("VIhlObU14SszuGiJjYEkSCWza9-X-UFUuzGh1QsiYcU", &txt);
+    try testing.expectError(error.InvalidToken, dns01TxtValue("a/b", kp.public_key));
 }
 
 test "ES256 known-answer: the RFC 7515 A.3 signature verifies (and tampering fails)" {

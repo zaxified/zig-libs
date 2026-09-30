@@ -1,7 +1,8 @@
 # acme
 
 ACME v2 (RFC 8555) client: automated certificate issuance + renewal with the
-**HTTP-01** and **TLS-ALPN-01** (RFC 8737) challenges (Let's Encrypt et al.) —
+**HTTP-01**, **TLS-ALPN-01** (RFC 8737) and **DNS-01** challenges, wildcard
+certificates included (Let's Encrypt et al.) —
 directory discovery, nonce management, ES256 account (JWS), order →
 authorization → challenge → CSR finalize → PEM chain download, plus the
 renewal predicate.
@@ -75,9 +76,49 @@ if (acme.needsRenewal(cert.chain_pem, now_unix, 30)) {
 }
 ```
 
-Scope notes: HTTP-01 and TLS-ALPN-01; DNS-01 is not implemented yet (a backlog gap),
-therefore no wildcard certificates; P-256/ES256 keys only (account and certificate);
-key/cert PEM I/O covers RFC 5915 `EC PRIVATE KEY` (no PKCS#8).
+Scope notes: HTTP-01, TLS-ALPN-01 and DNS-01 (wildcards with DNS-01 only);
+P-256/ES256 keys only (account and certificate); key/cert PEM I/O covers RFC 5915
+`EC PRIVATE KEY` (no PKCS#8); no external account binding, revocation or ARI yet.
+
+## DNS-01 (RFC 8555 §8.4) and wildcard certificates
+
+For a host with no port the CA can reach, or for a wildcard, select
+`.challenge_type = .dns_01` and hand the client a publisher for your DNS
+provider. The library computes the record and drives the order; publishing is
+yours, because it is the provider-specific part:
+
+```zig
+const Zone = struct {
+    // your provider's API client, an RFC 2136 updater, a zone file, ...
+    fn present(ctx: ?*anyopaque, name: []const u8, value: []const u8) bool {
+        // add TXT `value` at `name` ("_acme-challenge.example.org"), then
+        // wait until the CA's resolvers can see it; false aborts
+        _ = .{ ctx, name, value };
+        return true;
+    }
+    fn cleanup(ctx: ?*anyopaque, name: []const u8, value: []const u8) void {
+        _ = .{ ctx, name, value }; // remove exactly that value
+    }
+};
+var client = acme.Client.init(io, gpa, &http_client, account_key, .{
+    .challenge_type = .dns_01,
+    .dns_publisher = .{ .present = Zone.present, .cleanup = Zone.cleanup },
+});
+var cert = try client.obtain(&.{ "*.example.org", "example.org" });
+```
+
+- The value is `base64url(SHA-256(keyAuthorization))`
+  (`acme.jws.dns01TxtValue`), the name `_acme-challenge.<domain>`
+  (`acme.Client.dns01RecordName`). A wildcard's authorization names the base
+  domain, so `*.example.org` and `example.org` validate at the **same name**:
+  `present` must add a value, not replace the record set.
+- `present` returns only once the record is visible — the CA is told to
+  validate the moment it returns. Waiting out propagation is the publisher's.
+- `cleanup` runs once for every successful `present`, whatever the outcome.
+- A wildcard with any other challenge type is `error.InvalidDomain` (only
+  DNS-01 can validate one); `.dns_01` without a publisher is
+  `error.DnsPublisherMissing`; `present` returning false is
+  `error.DnsPublishFailed`.
 
 ## TLS-ALPN-01 (RFC 8737)
 
