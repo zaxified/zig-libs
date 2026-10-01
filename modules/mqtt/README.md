@@ -1,14 +1,15 @@
 # mqtt
 
-Pure-Zig **MQTT 3.1.1 client + broker**: control-packet codec, a client state
-machine and a server (broker). Pairs with `modbus` for the IoT / industrial
+Pure-Zig **MQTT 3.1.1 and 5.0 client + broker**: control-packet codec, a client
+state machine and a server (broker) — one broker serves both versions at once,
+each connection in the version of its CONNECT. Pairs with `modbus` for the IoT / industrial
 (SCADA-sim) work: a typed, allocation-free wire codec plus a
 transport-agnostic client and a broker, all fully offline-testable.
 
 - No mature pure-Zig MQTT library exists.
 - **Platform:** any (codec + client are pure computation; only the optional
   `TcpTransport` adapter touches `std.Io.net`).
-- **Model after:** MQTT 3.1.1 (OASIS) / mosquitto+paho behavior.
+- **Model after:** MQTT 3.1.1 and 5.0 (OASIS) / mosquitto+paho behavior.
 - **Scope:**
   - **Codec** (`packet`): encode + decode for all 14 control-packet types —
     CONNECT (clean session, keep-alive, will topic/message/QoS/retain,
@@ -21,6 +22,17 @@ transport-agnostic client and a broker, all fully offline-testable.
     UTF-8 strings validated (U+0000 and bad UTF-8 rejected). Decode is
     zero-copy and stream-friendly: `null` means "need more bytes";
     malformed/hostile bytes return typed errors, never a panic.
+    **5.0:** the version is a parameter — `decodePacket(bytes, version)`,
+    `encodePacket(buf, version, packet)`, `packetWireLen` — and one `Packet`
+    type serves both; the 5.0 parts default to what 3.1.1 means, and a 3.1.1
+    packet that sets one is `error.UnsupportedInVersion`. AUTH; all 27
+    properties, validated per packet type (a misplaced identifier is
+    `MalformedPacket`, a repeat or forbidden value `ProtocolViolation`;
+    `reasonForDecodeError` gives the 0x81/0x82 to answer with); reason codes
+    checked per packet both ways; the short forms of acks, DISCONNECT and AUTH.
+    User Properties and Subscription Identifiers decode in place and re-encode
+    verbatim, in order — how a server forwards them. `decode` and the
+    `encode<Type>` functions are the 3.1.1 forms.
   - **Topics** (`topic`): `matches(filter, topic)` with the `+`
     single-level and trailing-`#` multi-level wildcard rules and the
     `$`-topic exclusion for leading wildcards; `validateName` /
@@ -36,6 +48,17 @@ transport-agnostic client and a broker, all fully offline-testable.
     `publishDup` retransmits an unacked QoS > 0 publish with the DUP flag.
     Retained-session replay (buffering payloads) is deliberately the
     caller's job.
+    **5.0** (`Connect.version = .v5`): `connect` announces what the client can
+    hold (Receive Maximum = `max_in_flight`, Maximum Packet Size = the receive
+    buffer, Topic Alias Maximum = the alias slots) unless told; every publish
+    is held to the server's CONNACK (`serverLimits()`: Maximum QoS, Retain
+    Available, Receive Maximum as the send quota, Maximum Packet Size, Topic
+    Alias Maximum; Server Keep Alive replaces the keep-alive); inbound Topic
+    Aliases resolve through caller slots (`Buffers.topic_aliases`); messages
+    carry their `properties`; `PublishOptions.properties`, `subscribeWith`,
+    `unsubscribeWith`, `disconnectWith`; events carry reason codes (`puback` /
+    `pubcomp` are `packet.Ack`), a server's DISCONNECT is `.disconnect`, and
+    extended authentication is caller-driven (`.auth` events, `auth`).
   - **Broker** (`Broker`): the server side, and the mirror image of `Client`
     — the broker owns the shared state (the connection set, the subscription
     registry and the retained store) and each `Connection` is a reversed
@@ -75,15 +98,36 @@ transport-agnostic client and a broker, all fully offline-testable.
     only along a published topic's path, not an O(total-subscriptions) scan;
     exact-string UNSUBSCRIBE); PUBLISH fan-out at min(publisher QoS, granted
     QoS), one copy per connection at the highest granted QoS among overlapping
-    filters; QoS 0 fire-and-forget and QoS 1 (inbound → immediate PUBACK;
+    filters; QoS 0 fire-and-forget, QoS 1 (inbound → immediate PUBACK;
     outbound → an id allocated in the *subscriber's* id space, tracked pending
-    until its PUBACK); a retained store (empty payload clears; matching retained
+    until its PUBACK) and QoS 2 both ways (inbound PUBRECed and routed once, the
+    id kept until its PUBREL — in the session for a persistent client, so a
+    resend after a reconnect is not routed twice; outbound PUBREC → PUBREL →
+    PUBCOMP, a resumed session resending a PUBRECed message as PUBREL);
+    `Config.maximum_qos` caps all of it; a retained store (empty payload clears; matching retained
     delivered right after a new SUBACK). Concurrency: the shared registry's
     spinlock is never held across a socket write — a PUBLISH snapshots its
     matching subscribers under the lock, then delivers off it under each
     connection's own `tx_lock`, reference-counting targets so a mid-fan-out
     disconnect never writes to freed memory, and containing any per-subscriber
     delivery failure to that subscriber (never the publisher).
+
+    **MQTT 5.0** in the broker, per connection: CONNACK announces Receive
+    Maximum, Maximum Packet Size, Topic Alias Maximum (`Config.topic_alias_maximum`),
+    Maximum QoS, an assigned client id, a lowered Session Expiry; refusals and acks
+    carry 5.0 reason codes (PUBACK 0x10 without subscribers, 0x87 when the ACL
+    denies; SUBACK 0x8F/0x87/0x97; UNSUBACK 0x11; 0x92 for unknown ids); a failing
+    5.0 connection is told why with a DISCONNECT (0x81, 0x82, 0x93, 0x94, 0x9B;
+    0x8E on take-over). Session Expiry with Clean Start; Message Expiry counted
+    down through the retained store and session queues (`messagesExpired()`); the
+    forwardable properties carried unaltered; inbound Topic Aliases; the client's
+    Receive Maximum and Maximum Packet Size honoured (`oversizeDrops()`); No Local,
+    Retain As Published, Retain Handling; Subscription Identifiers; **Shared
+    Subscriptions** `$share/{group}/{filter}` (round-robin, connected members first
+    — for 3.1.1 clients too); Will properties and Will Delay (`publishDueWills(now)`,
+    run once a second by `TcpServer` with `expireSessions`). `Broker.publishWith`
+    takes properties and a Message Expiry. Extended authentication is not
+    implemented: a CONNECT naming a method gets 0x8C.
 
     **Will / LWT** (3.1.2.5, 3.14.4): the will registered at CONNECT is kept
     (owned copies — the decoded slices point into the receive buffer), published
@@ -131,12 +175,11 @@ transport-agnostic client and a broker, all fully offline-testable.
     keeps the message alive instead of acknowledging one it lost. Null by
     default = accept everything.
 
-    **Deliberately deferred (documented, not built):** QoS 2
-    (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
-    down), sessions persisted by the broker itself, DUP retransmit
-    to a clean-session subscriber, MQTT 5.0, and TLS (terminate in
-    front and hand `TcpServer` plaintext, or drive the socket-free core over a
-    TLS stream).
+    **Deliberately deferred (documented, not built):** sessions persisted by
+    the broker itself, DUP retransmit to a clean-session subscriber, 5.0
+    extended authentication in the broker, outbound Topic Aliases from the
+    broker, `$SYS` topics, bridging, and TLS (terminate in front and hand
+    `TcpServer` plaintext, or drive the socket-free core over a TLS stream).
 
 ```zig
 const mqtt = @import("mqtt");
@@ -150,6 +193,13 @@ var client = mqtt.Client.init(tt.transport(), .{ .rx = &rx, .tx = &tx });
 try client.connect(now(), .{ .client_id = "sensor-1", .keep_alive_s = 30 });
 _ = try client.subscribe(now(), &.{.{ .filter = "plant/+/state" }});
 _ = try client.publish(now(), "plant/1/cmd", "on", .{ .qos = .at_least_once });
+
+// 5.0: the same client, `.version = .v5` in `connect`, and properties where
+// they are wanted:
+//   try client.connect(now(), .{ .client_id = "sensor-1", .version = .v5,
+//       .properties = .{ .session_expiry_interval = 3600 } });
+//   _ = try client.publish(now(), "plant/1/cmd", "on", .{ .qos = .exactly_once,
+//       .properties = .{ .response_topic = "plant/1/ack", .message_expiry_interval = 60 } });
 
 // pump loop: read → feed → poll → tick
 const n = try tt.readSome(&net_buf);
@@ -196,8 +246,17 @@ count that drains cleanly to zero (no take-over zombie). It is socket-gated
 `-fsanitize-thread` is a no-op (no `__tsan_*` instrumentation is linked), so the
 race detection is the real-thread run under Debug and `-Doptimize=ReleaseFast`,
 repeated many times, cross-checked with a valgrind `memcheck` pass (no errors).
+Since 2026-10-01 half its workers speak 5.0 — QoS 2, Subscription Identifiers, a
+Shared Subscription, Session Expiry, delayed Wills, take-overs telling 0x8E.
 
-Provenance: clean-room from the OASIS MQTT Version 3.1.1 specification
-(an open, royalty-free standard); mosquitto (EPL-2.0 or EDL-1.0) and Eclipse
+**External anchor for 5.0** (`tools/interop.zig`, `zig build interop-mqtt`): our
+`Client` against a real Eclipse Mosquitto 2.1.2 and real paho-mqtt 2.1.0 clients
+against our `Broker`, every step checked against what the peer did or reported;
+the bytes are frozen in `src/testdata/v5_transcript.txt` and replayed by
+`src/v5_replay.zig` with no peer — our packets re-encode to what mosquitto
+accepted, and paho's recorded chunks reproduce everything paho received.
+
+Provenance: clean-room from the OASIS MQTT Version 3.1.1 and Version 5.0
+specifications (open, royalty-free standards); mosquitto (EPL-2.0 or EDL-1.0) and Eclipse
 Paho (EPL-2.0 or EDL-1.0) are cited as behavior design references only, no
-source was consulted or copied. DATA: `src/external_goldens.zig` holds MQTT 3.1.1 wire bytes captured once from real, independent implementations acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no mosquitto or Paho test corpus is reproduced.
+source was consulted or copied. DATA: `src/external_goldens.zig` holds MQTT 3.1.1 wire bytes captured once from real, independent implementations acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no mosquitto or Paho test corpus is reproduced. DATA: `src/testdata/v5_transcript.txt` holds MQTT 5.0 wire bytes exchanged live with Eclipse Mosquitto 2.1.2 and paho-mqtt 2.1.0 acting as our peers (black boxes, `tools/interop.zig`), frozen offline — observed behaviour, exempt per root `NOTICE` §0.

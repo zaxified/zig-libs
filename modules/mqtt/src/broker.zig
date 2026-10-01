@@ -3838,7 +3838,14 @@ test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     defer srv.deinit();
     var serving = try io.concurrent(serveTask, .{&srv});
 
-    const stream = try srv.boundAddress().connect(io, .{ .mode = .stream });
+    // A sandbox can bind 127.0.0.1 without a working loopback (`unshare -n`):
+    // stop the server before skipping — `srv.deinit` under a running `serve`
+    // is a use after free.
+    const stream = srv.boundAddress().connect(io, .{ .mode = .stream }) catch {
+        srv.shutdown();
+        serving.await(io);
+        return error.SkipZigTest;
+    };
     var buf: [64]u8 = undefined;
     var wbuf: [64]u8 = undefined;
     var w = stream.writer(io, &wbuf);
@@ -5859,6 +5866,9 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
     // A bind/listen failure = no loopback in this sandbox → skip, don't fail.
     server.bind("127.0.0.1", 0) catch return error.SkipZigTest;
     const addr = server.boundAddress();
+    // Bound is not reachable: a network namespace without loopback binds and
+    // then refuses every connect. Probe before the storm, skip if so.
+    if (addr.connect(io, .{ .mode = .stream })) |probe_stream| probe_stream.close(io) else |_| return error.SkipZigTest;
 
     const server_thread = std.Thread.spawn(.{}, stressServeThread, .{&server}) catch
         return error.SkipZigTest;

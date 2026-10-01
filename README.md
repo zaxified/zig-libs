@@ -427,7 +427,7 @@ way to recognise it.
 | [`loopfree-reconv`](modules/loopfree-reconv/README.md) | 3 | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop); netsim-verified under fuzzing | any | netsim, spf-ect |
 | [`loopix`](modules/loopix/README.md) | 4 | Loopix mixnet (Piotrowska et al. — Nym's design) — Poisson mix + cover traffic over `sphinx`, model-checked in netsim against a global-passive-adversary anonymity invariant | any | netsim, sphinx |
 | [`modbus`](modules/modbus/README.md) | 2 | Modbus TCP (MBAP) + RTU (CRC-16) codec, master client **and slave server** — core function codes, diagnostics, exceptions, transport-agnostic seam | any | — |
-| [`mqtt`](modules/mqtt/README.md) | 3 | MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam | any | — |
+| [`mqtt`](modules/mqtt/README.md) | 2 | MQTT 3.1.1 + 5.0 client and broker — all control packets incl. AUTH and properties, QoS 0/1/2 both ways, sessions with expiry, shared subscriptions, transport-agnostic seam | any | — |
 | [`netaddr`](modules/netaddr/README.md) | 2 | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix) | any | — |
 | [`netconf`](modules/netconf/README.md) | 2 | NETCONF client (RFC 6241) over SSH — RFC 6242 framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies | any | ssh, xml |
 | [`netlink`](modules/netlink/README.md) | 3 | rtnetlink read **and** write — dumps (links/addresses/routes/neighbors) and RTM_NEW*/DEL* writes; byte-exact vs iproute2 goldens + netns round-trip | **linux** | — |

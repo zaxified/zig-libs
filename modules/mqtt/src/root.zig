@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-//! mqtt — pure-Zig MQTT 3.1.1 client: control-packet codec + client state
-//! machine. Pairs with `modbus` for the IoT / industrial (SCADA-sim) work.
+//! mqtt — pure-Zig MQTT 3.1.1 and 5.0: control-packet codec, client state
+//! machine and broker. Pairs with `modbus` for the IoT / industrial
+//! (SCADA-sim) work. 5.0 (properties, reason codes, AUTH, session and message
+//! expiry, topic aliases, subscription options, shared subscriptions) is per
+//! connection — the CONNECT's version — in the codec, the client and the
+//! broker alike; see SPEC.md "MQTT 5.0".
 //!
 //! Three layers, all allocation-free:
 //!
@@ -28,7 +32,7 @@
 //!   handles keep-alive PINGREQ and ping timeouts. `TcpTransport` is an
 //!   optional `std.Io.net` adapter — tests never dial.
 //!
-//! Provenance: clean-room from the OASIS MQTT 3.1.1 specification;
+//! Provenance: clean-room from the OASIS MQTT 3.1.1 and 5.0 specifications;
 //! mosquitto/Paho referenced for behavior only, no source consulted or
 //! copied.
 
@@ -37,7 +41,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "MQTT 3.1.1 client — all 14 control packets, QoS 0/1/2 state machine, topic-filter wildcards, transport-agnostic seam",
+    .doc = "MQTT 3.1.1 + 5.0 client and broker — all control packets incl. AUTH and properties, QoS 0/1/2 both ways, sessions with expiry, shared subscriptions, transport-agnostic seam",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -57,7 +61,7 @@ pub const meta = .{
     .platform = .any, // codec + client are portable; TcpTransport uses std.Io.net
     .role = .client, // client + reusable wire codec
     .concurrency = .single_owner, // one owner drives feed/poll/tick
-    .model_after = "MQTT 3.1.1 (OASIS) / mosquitto+paho behavior",
+    .model_after = "MQTT 3.1.1 + 5.0 (OASIS) / mosquitto+paho behavior",
     .deps = .{}, // std only
 };
 
@@ -82,8 +86,8 @@ pub const max_in_flight = client_mod.max_in_flight;
 pub const AliasSlot = client_mod.AliasSlot;
 pub const ServerLimits = client_mod.ServerLimits;
 
-/// MQTT 3.1.1 broker (server): connection registry + subscription fan-out +
-/// retained store, QoS 0/1/2, clean and persistent sessions. Caller-driven and socket-free like
+/// MQTT 3.1.1 + 5.0 broker (server): connection registry + subscription
+/// fan-out + retained store, QoS 0/1/2, clean and persistent sessions. Caller-driven and socket-free like
 /// `Client` (reversed direction); `broker.TcpServer` is an optional accept
 /// loop over `std.Io.net`. See `broker.zig` for scope + deferred features.
 pub const broker = @import("broker.zig");

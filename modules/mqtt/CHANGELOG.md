@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Docs: SPEC/README describe QoS 2 in the broker and MQTT 5.0 in all three
+  layers; scope raised mvp → core (grade 3 → 2). Tests: the `TcpServer` loopback test and the
+  stress pass skip cleanly where 127.0.0.1 binds but does not connect (`unshare -n`); the
+  first used to return with `serve` still running and crash in `srv.deinit`.
 - **2026-10-01** — Tests: the stress pass now races 5.0 connections beside 3.1.1 ones —
   QoS 2 both ways, Subscription Identifiers, a Shared Subscription, Session Expiry, Wills
   with a one-second delay, take-overs telling 0x8E — and checks every Shared Subscription
