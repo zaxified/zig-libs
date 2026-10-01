@@ -380,9 +380,9 @@ test "shrink keeps only subsets that reproduce the same error, not just any erro
     // The lost acknowledgement alone gives CountedTwice; the clock jump alone
     // gives a different error, which must not count as reproducing it.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    const events = try arena.allocator().dupe(netsim.FaultEvent, &.{
-        .{ .time = 0, .kind = .{ .drop_once = .{ .a = 1, .b = 0 } } },
-        .{ .time = 0, .kind = .{ .clock_jump = .{ .node = 0, .delta = 5 } } },
+    const events = try arena.allocator().dupe(search.TraceEvent, &.{
+        .{ .time = 0, .kind = .{ .net = .{ .drop_once = .{ .a = 1, .b = 0 } } } },
+        .{ .time = 0, .kind = .{ .net = .{ .clock_jump = .{ .node = 0, .delta = 5 } } } },
     });
     var failing: search.Failing = .{
         .case = case,
@@ -396,5 +396,5 @@ test "shrink keeps only subsets that reproduce the same error, not just any erro
     var small = try search.shrink(testing.allocator, &failing);
     defer small.deinit();
     try testing.expectEqual(@as(usize, 1), small.after);
-    try testing.expect(small.trace.events[0].kind == .drop_once);
+    try testing.expect(small.trace.events[0].kind.net == .drop_once);
 }

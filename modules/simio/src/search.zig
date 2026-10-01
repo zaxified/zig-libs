@@ -10,7 +10,9 @@
 //!
 //! Schedule times are in ticks of `FaultConfig.tick_ns` (1 ms by default):
 //! netsim's generator draws delay spikes and clock jumps in small tick counts,
-//! which read as milliseconds here.
+//! which read as milliseconds here. A schedule is netsim's network and host
+//! faults plus, when `FaultConfig.disk.max_events > 0`, disk faults (one-shot
+//! I/O errors and bit rot) drawn from an independent stream of the same seed.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -48,6 +50,56 @@ pub const FaultConfig = struct {
     /// netsim's generator settings; `horizon` is in ticks.
     schedule: netsim.FaultConfig = .{ .horizon = 30_000 },
     tick_ns: u64 = std.time.ns_per_ms,
+    /// Disk faults, drawn over the same horizon; off by default.
+    disk: struct {
+        max_events: usize = 0,
+        io_errors: bool = true,
+        bit_rot: bool = true,
+    } = .{},
+};
+
+pub const DiskFault = union(enum) {
+    /// The next read, write or sync on the host's disk fails.
+    io_error: struct { host: u32, op: @FieldType(@FieldType(sched.Fault, "disk_error"), "op") },
+    bit_rot: struct { host: u32 },
+};
+
+pub const TraceEvent = struct {
+    /// In ticks of `FaultConfig.tick_ns`.
+    time: u64,
+    kind: union(enum) {
+        net: netsim.FaultKind,
+        disk: DiskFault,
+    },
+};
+
+/// A concrete, replayable fault schedule. Owns its memory.
+pub const Trace = struct {
+    arena: std.heap.ArenaAllocator,
+    events: []TraceEvent,
+
+    pub fn deinit(t: *Trace) void {
+        t.arena.deinit();
+    }
+
+    /// Deep copy of `events[kept]` (partition cuts included).
+    pub fn subset(gpa: Allocator, events: []const TraceEvent, kept: []const usize) Allocator.Error!Trace {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const out = try a.alloc(TraceEvent, kept.len);
+        for (kept, 0..) |idx, i| {
+            out[i] = events[idx];
+            switch (out[i].kind) {
+                .net => |k| switch (k) {
+                    .partition => |p| out[i].kind = .{ .net = .{ .partition = .{ .id = p.id, .cut = try a.dupe(netsim.NodeId, p.cut) } } },
+                    else => {},
+                },
+                .disk => {},
+            }
+        }
+        return .{ .arena = arena, .events = out };
+    }
 };
 
 pub const Violation = struct {
@@ -67,7 +119,7 @@ pub const CaseResult = struct {
 
 pub const Generated = struct {
     result: CaseResult,
-    trace: netsim.FaultTrace,
+    trace: Trace,
 
     pub fn deinit(g: *Generated) void {
         g.trace.deinit();
@@ -76,7 +128,7 @@ pub const Generated = struct {
 
 /// One run under a fault schedule drawn for `case.seed`.
 pub fn run(gpa: Allocator, case: Case, cfg: FaultConfig) anyerror!Generated {
-    var trace: ?netsim.FaultTrace = null;
+    var trace: ?Trace = null;
     errdefer if (trace) |*t| t.deinit();
     const result = try execute(gpa, case, .{ .generate = .{ .cfg = cfg, .out = &trace } });
     return .{ .result = result, .trace = trace.? };
@@ -84,13 +136,13 @@ pub fn run(gpa: Allocator, case: Case, cfg: FaultConfig) anyerror!Generated {
 
 /// Re-runs `case` under exactly `events` (from `run`, `findFailing` or
 /// `shrink`). Deterministic: the same events give the same result.
-pub fn replay(gpa: Allocator, case: Case, events: []const netsim.FaultEvent, tick_ns: u64) anyerror!CaseResult {
+pub fn replay(gpa: Allocator, case: Case, events: []const TraceEvent, tick_ns: u64) anyerror!CaseResult {
     return execute(gpa, case, .{ .given = .{ .events = events, .tick_ns = tick_ns } });
 }
 
 const Mode = union(enum) {
-    generate: struct { cfg: FaultConfig, out: *?netsim.FaultTrace },
-    given: struct { events: []const netsim.FaultEvent, tick_ns: u64 },
+    generate: struct { cfg: FaultConfig, out: *?Trace },
+    given: struct { events: []const TraceEvent, tick_ns: u64 },
 };
 
 fn execute(gpa: Allocator, case: Case, mode: Mode) anyerror!CaseResult {
@@ -104,14 +156,8 @@ fn execute(gpa: Allocator, case: Case, mode: Mode) anyerror!CaseResult {
 
     switch (mode) {
         .generate => |g| {
-            const links = try topology(gpa, &sim);
-            defer gpa.free(links);
-            const trace = try netsim.generateFaultTrace(gpa, case.seed, .{
-                .node_count = sim.hosts.items.len,
-                .links = links,
-            }, g.cfg.schedule);
-            g.out.* = trace;
-            try schedule(&sim, trace.events, g.cfg.tick_ns);
+            g.out.* = try generate(gpa, case.seed, &sim, g.cfg);
+            try schedule(&sim, g.out.*.?.events, g.cfg.tick_ns);
         },
         .given => |g| try schedule(&sim, g.events, g.tick_ns),
     }
@@ -139,6 +185,55 @@ fn execute(gpa: Allocator, case: Case, mode: Mode) anyerror!CaseResult {
     return result;
 }
 
+const disk_salt: u64 = 0xd15c_fa17_5eed_0001;
+
+/// netsim's schedule over this world's topology, plus disk faults.
+fn generate(gpa: Allocator, seed: u64, sim: *Sim, cfg: FaultConfig) anyerror!Trace {
+    const links = try topology(gpa, sim);
+    defer gpa.free(links);
+    const hosts = sim.hosts.items.len;
+    var net_trace = try netsim.generateFaultTrace(gpa, seed, .{ .node_count = hosts, .links = links }, cfg.schedule);
+    defer net_trace.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var list: std.ArrayList(TraceEvent) = .empty;
+    for (net_trace.events) |ev| {
+        var kind = ev.kind;
+        switch (kind) {
+            .partition => |p| kind = .{ .partition = .{ .id = p.id, .cut = try a.dupe(netsim.NodeId, p.cut) } },
+            else => {},
+        }
+        try list.append(a, .{ .time = ev.time, .kind = .{ .net = kind } });
+    }
+    const d = cfg.disk;
+    if (d.max_events > 0 and hosts > 0 and (d.io_errors or d.bit_rot)) {
+        var prng = netsim.Prng.init(seed ^ disk_salt);
+        const n = prng.below(d.max_events + 1);
+        for (0..n) |_| {
+            const t = prng.belowWide(@max(cfg.schedule.horizon, 1));
+            const host: u32 = @intCast(prng.below(hosts));
+            const rot = if (d.io_errors and d.bit_rot) prng.chance(1, 4) else d.bit_rot;
+            const fault: DiskFault = if (rot) .{ .bit_rot = .{ .host = host } } else .{ .io_error = .{
+                .host = host,
+                .op = switch (prng.below(3)) {
+                    0 => .read,
+                    1 => .write,
+                    else => .sync,
+                },
+            } };
+            try list.append(a, .{ .time = t, .kind = .{ .disk = fault } });
+        }
+        std.sort.insertion(TraceEvent, list.items, {}, struct {
+            fn less(_: void, x: TraceEvent, y: TraceEvent) bool {
+                return x.time < y.time;
+            }
+        }.less);
+    }
+    return .{ .arena = arena, .events = list.items };
+}
+
 /// Every link, both directions, for the schedule generator.
 fn topology(gpa: Allocator, sim: *Sim) Allocator.Error![]netsim.Link {
     const edges = sim.net.edges.items;
@@ -150,10 +245,20 @@ fn topology(gpa: Allocator, sim: *Sim) Allocator.Error![]netsim.Link {
     return links;
 }
 
-fn schedule(sim: *Sim, events: []const netsim.FaultEvent, tick_ns: u64) Allocator.Error!void {
+fn schedule(sim: *Sim, events: []const TraceEvent, tick_ns: u64) Allocator.Error!void {
     for (events) |ev| {
         const at = ev.time *| tick_ns;
-        const fault: sched.Fault = switch (ev.kind) {
+        const net_kind = switch (ev.kind) {
+            .net => |k| k,
+            .disk => |d| {
+                try sim.scheduleFault(at, switch (d) {
+                    .io_error => |e| .{ .disk_error = .{ .host = e.host, .op = e.op } },
+                    .bit_rot => |r| .{ .bit_rot = r.host },
+                });
+                continue;
+            },
+        };
+        const fault: sched.Fault = switch (net_kind) {
             .link_down => |l| .{ .link_down = .{ .from = l.a, .to = l.b } },
             .link_up => |l| .{ .link_up = .{ .from = l.a, .to = l.b } },
             .partition => |p| .{ .partition = .{ .id = p.id, .cut = p.cut } },
@@ -172,7 +277,7 @@ fn schedule(sim: *Sim, events: []const netsim.FaultEvent, tick_ns: u64) Allocato
 pub const Failing = struct {
     /// The case with the failing seed filled in.
     case: Case,
-    trace: netsim.FaultTrace,
+    trace: Trace,
     violation: Violation,
     tick_ns: u64,
 
@@ -197,7 +302,7 @@ pub fn findFailing(gpa: Allocator, template: Case, cfg: FaultConfig, start: u64,
 }
 
 pub const ShrinkResult = struct {
-    trace: netsim.FaultTrace,
+    trace: Trace,
     before: usize,
     after: usize,
 
@@ -214,7 +319,7 @@ pub fn shrink(gpa: Allocator, failing: *const Failing) Allocator.Error!ShrinkRes
     const kept = try netsim.ddmin(gpa, events.len, &ctx);
     defer gpa.free(kept);
     return .{
-        .trace = try netsim.cloneTraceSubset(gpa, events, kept),
+        .trace = try Trace.subset(gpa, events, kept),
         .before = events.len,
         .after = kept.len,
     };
@@ -225,7 +330,7 @@ const ShrinkCtx = struct {
     failing: *const Failing,
 
     pub fn keeps(c: *ShrinkCtx, subset: []const usize) Allocator.Error!bool {
-        const sub = try c.gpa.alloc(netsim.FaultEvent, subset.len);
+        const sub = try c.gpa.alloc(TraceEvent, subset.len);
         defer c.gpa.free(sub);
         for (subset, 0..) |idx, i| sub[i] = c.failing.trace.events[idx];
         const r = replay(c.gpa, c.failing.case, sub, c.failing.tick_ns) catch return false;

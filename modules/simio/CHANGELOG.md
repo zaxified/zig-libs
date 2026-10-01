@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — M4, the disk: `std.Io.Dir`/`File` on a per-host file
+  system with a crash-consistency model (unsynced data survives per sector;
+  names are journaled and durable on a directory sync, or any sync with
+  `FsOptions.durability = .journal`), one-shot I/O errors, bit rot and a disk
+  capacity (`Fault.disk_error`, `Fault.bit_rot`, `HostOptions.disk_bytes`),
+  flock-style locks, captured stdout/stderr, and `Host.putFile`/`readFile`/
+  `console`. The search draws disk faults (`FaultConfig.disk`) and now uses
+  its own `Trace`/`TraceEvent` (network faults from netsim inside), so
+  `Failing.trace` and `replay` take simio's type.
 - **2026-10-01** — Mutation run (46 schemata, 42 killed, 4 equivalent — see
   SPEC.md): nine new tests, and `Host.liveAllocations()` to observe what a
   crash releases.

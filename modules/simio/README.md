@@ -7,11 +7,11 @@ virtual, and every choice the simulator makes is drawn from one seed. A run is
 a pure function of its seed, so a failure found on seed 1234 is reproduced by
 running seed 1234 again.
 
-- **Status:** M3 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
+- **Status:** M4 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
   (tasks, groups, cancelation, futex, clocks, sleep, timeouts, seeded
   randomness), the network (streams, datagrams, ICMP echo over routed, faulty
-  links), host crash/restart and fault search with shrinking. The file system
-  with storage faults and the in-repo pilots are next.
+  links), host crash/restart, a file system with a crash-consistency model and
+  disk faults, and fault search with shrinking. The in-repo pilots are next.
 - **Platform:** Linux on x86_64, aarch64 or riscv64 (`std.Io.fiber`).
 - **Deps:** `netsim` (its seeded PRNG; its fault vocabulary from M3).
 - **Model after:** tokio-rs/turmoil, madsim, FoundationDB's simulation testing.
@@ -107,6 +107,17 @@ if (try simio.findFailing(gpa, case, .{}, 0, 500)) |*failing| {
   sockets vanish, memory from `host.allocator()` is released. `restart`
   re-runs the `spawnBoot` tasks.
 - `checkDeterminism` runs a seed twice and fails if the runs differ.
+
+### The disk
+
+Each host has its own file system behind `std.Io.Dir.cwd()` and absolute
+paths. What a crash leaves is decided per seed, the way a real disk would:
+data written since the last `File.sync` may be lost, kept or torn per 512-byte
+sector, and a created, deleted or renamed name is only durable once its
+directory is synced (sync a directory through `File{ .handle = dir.handle }`).
+`FaultConfig.disk` adds one-shot I/O errors and bit rot to the search;
+`HostOptions.disk_bytes` caps the disk. `Host.putFile`/`readFile` seed and
+inspect a disk from the test; `Host.console()` is what the host printed.
 
 Operations simio does not simulate yet behave as in `std.Io.failing` (an
 error, never a fake success).

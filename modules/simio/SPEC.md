@@ -32,8 +32,8 @@ check, seeded preemption at yield points, a `.deadlock` outcome that names how m
 tasks can never wake; routed multi-hop paths with directed per-link faults, ICMP
 echo, and seeded short stream reads that surface framing bugs *(peers' READMEs
 mention none of these — inferred)*.
-**Where we are behind:** no file system or storage faults (M4; marionette and turmoil
-have them), no Unix sockets, no in-repo consumer yet (M5).
+**Where we are behind:** no Unix sockets, no symlinks or hard links, no memory maps,
+no in-repo consumer yet (M5).
 
 ## Why this module exists
 
@@ -116,11 +116,12 @@ consumer's to remove.
   reorder, truncation and corruption (new `FaultKind.corrupt`, netsim backlog item).
 - **Storage model** (turmoil-fs / ALICE style). Writes land in a volatile layer;
   `File.sync` makes the file's data durable; a new or renamed directory entry is
-  durable only after the parent directory is synced (strict mode, default) — Linux
-  ext4 semantics, the ones real crash bugs hide behind. On crash the volatile layer is
-  resolved per seed: dropped, kept, torn at sector granularity, or partly reordered.
-  Injectable faults: `error.InputOutput` on read/write/sync, `error.NoSpaceLeft`,
-  silent bit rot on read.
+  durable only after the parent directory is synced (`.strict`, default — POSIX's
+  minimum), or after any sync (`.journal`, ext4-like). On a crash each unsynced write
+  survives sector by sector at random (dropped, kept, torn, reordered), and a random
+  prefix of the name journal survives in whole operations (a rename is never half
+  done). Injectable faults: `error.InputOutput` on the next read/write/sync,
+  `error.NoSpaceLeft` past `HostOptions.disk_bytes`, silent bit rot at rest.
 - **Faults and search.** Fault events extend netsim's (`link down/up`, partitions,
   drop/duplicate/delay spike, crash/restart, clock jump) with `corrupt` and the
   storage kinds. `run`/`replay`/`findFailing`/shrink keep netsim's contract: an
@@ -154,8 +155,17 @@ consumer's to remove.
    before the next task step; the fingerprint includes virtual time. Proof: the
    classic exactly-once-over-UDP bug (no dedup) is found, shrunk to 1–2 faults and
    replayed; the deduplicating server survives the same search.
-4. **M4 — file system + storage faults.** In-memory tree, durability model, crash
-   resolution, fault injection.
+4. **M4 — file system + storage faults** ✅ 2026-10-01. Per-host tree behind
+   `std.Io.Dir`/`File` (create/open/read/write positional and streaming, stat, length,
+   set length, sync, rename/renamePreserve, delete, iteration, `createFileAtomic`,
+   realpath, flock-style locks, captured stdout/stderr); durability: file data as of
+   the last sync plus unsynced writes that survive per sector on a crash; names
+   journaled and durable on a directory sync (`.strict`) or any sync (`.journal`), a
+   crash keeping a prefix of the journal in whole operations; faults: one-shot I/O
+   errors, bit rot, disk capacity. The search draws disk faults too (`FaultConfig.disk`;
+   simio's own `Trace` type, netsim's network faults inside it). Proof: the search
+   finds the torn file of a rename without fsync and silent corruption read without a
+   checksum; the careful variants survive. `Host.putFile`/`readFile`/`console`.
 5. **M5 — pilots** (each with a deliberately broken variant that must trip):
    - `mqtt` broker + 3 clients under partitions: QoS 1 at-least-once delivery.
    - `dns` `Resolver`: retry/timeout behaviour under loss.

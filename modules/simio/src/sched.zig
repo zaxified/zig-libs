@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const netsim = @import("netsim");
 const stack_mod = @import("stack.zig");
 const net_mod = @import("net.zig");
+const fs_mod = @import("fs.zig");
 
 const Io = std.Io;
 const Alignment = std.mem.Alignment;
@@ -54,6 +55,8 @@ pub const Options = struct {
     epoch_ns: i96 = 1_767_225_600 * std.time.ns_per_s,
     /// The simulated network's behaviour (streams, timeouts, short reads).
     net: net_mod.NetOptions = .{},
+    /// The simulated file systems' durability model.
+    fs: fs_mod.FsOptions = .{},
 };
 
 pub const HostOptions = struct {
@@ -63,6 +66,8 @@ pub const HostOptions = struct {
     ip4: ?[4]u8 = null,
     /// IPv6 address. Default: fd00:: + host index + 1.
     ip6: ?[16]u8 = null,
+    /// Disk capacity; writes past it fail with `error.NoSpaceLeft`.
+    disk_bytes: ?u64 = null,
 };
 
 pub const Outcome = enum {
@@ -105,6 +110,11 @@ pub const Fault = union(enum) {
     drop_once: struct { from: u32, to: u32 },
     dup_once: struct { from: u32, to: u32 },
     delay_once: struct { from: u32, to: u32, extra_ns: u64 },
+    /// The next read, write or sync on the host's disk fails with
+    /// `error.InputOutput`.
+    disk_error: struct { host: u32, op: enum { read, write, sync } },
+    /// One bit of one stored file flips, silently.
+    bit_rot: u32,
 };
 
 const State = enum { ready, running, blocked, done };
@@ -219,6 +229,8 @@ pub const Host = struct {
     /// What the host's code allocated through `allocator()` and has not
     /// freed: a crash releases it, as a power cut releases RAM.
     live_allocs: std.AutoHashMapUnmanaged(usize, Alloc) = .empty,
+    /// The host's disk (see `fs.zig` for what survives a crash).
+    fs: fs_mod.Fs = undefined,
     handles: std.AutoHashMapUnmanaged(Io.net.Socket.Handle, *net_mod.Sock) = .empty,
     next_handle: Io.net.Socket.Handle = 3,
     next_port: u16 = 49152,
@@ -238,6 +250,22 @@ pub const Host = struct {
 
     pub fn io(h: *Host) Io {
         return .{ .userdata = h, .vtable = &@import("vtable.zig").vtable };
+    }
+
+    /// Puts a file on the host's disk before (or between) runs, durable at
+    /// once: configuration, fixtures, a pre-existing database.
+    pub fn putFile(h: *Host, path: []const u8, data: []const u8) !void {
+        return h.fs.put(path, data);
+    }
+
+    /// The current contents of a file on the host's disk, or null.
+    pub fn readFile(h: *Host, path: []const u8) ?[]const u8 {
+        return h.fs.get(path);
+    }
+
+    /// What the host's code wrote to stdout and stderr (the first 64 KiB).
+    pub fn console(h: *const Host) []const u8 {
+        return h.fs.console.items;
     }
 
     /// This host's memory. Use it for everything the host's code allocates
@@ -436,6 +464,7 @@ pub const Sim = struct {
         sim.net.deinit();
         for (sim.hosts.items) |h| {
             h.handles.deinit(sim.gpa);
+            h.fs.deinit();
             h.releaseAll();
             h.live_allocs.deinit(sim.gpa);
             for (h.boots.items) |b| sim.gpa.rawFree(b.context, b.context_align, @returnAddress());
@@ -467,6 +496,8 @@ pub const Sim = struct {
             .prng = .init(sim.opts.seed ^ (0x9e3779b97f4a7c15 *% (@as(u64, id) + 1))),
             .clock_skew_ns = opts.clock_skew_ns,
         };
+        try h.fs.init(h, sim.opts.seed ^ (0xd15c_0000 +% @as(u64, id)), opts.disk_bytes);
+        errdefer h.fs.deinit();
         try sim.hosts.append(sim.gpa, h);
         return h;
     }
@@ -557,6 +588,7 @@ pub const Sim = struct {
             sim.gpa.destroy(g);
         }
         sim.net.crashHost(h);
+        h.fs.crash();
         h.releaseAll();
     }
 
@@ -741,6 +773,12 @@ pub const Sim = struct {
             .drop_once => |l| sim.net.armDrop(l.from, l.to),
             .dup_once => |l| sim.net.armDup(l.from, l.to),
             .delay_once => |l| sim.net.armDelay(l.from, l.to, l.extra_ns),
+            .disk_error => |d| if (d.host < hosts.len) switch (d.op) {
+                .read => hosts[d.host].fs.fail_read += 1,
+                .write => hosts[d.host].fs.fail_write += 1,
+                .sync => hosts[d.host].fs.fail_sync += 1,
+            },
+            .bit_rot => |i| if (i < hosts.len) hosts[i].fs.bitRot(),
         }
     }
 
