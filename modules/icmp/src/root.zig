@@ -11,6 +11,10 @@
 //!  * `Socket` — non-blocking Linux ICMP sockets: unprivileged SOCK_DGRAM
 //!    first (net.ipv4.ping_group_range), SOCK_RAW fallback (CAP_NET_RAW);
 //!    sendmmsg/recvmmsg batching, kernel receive timestamps, TTL/TOS.
+//!  * `IoSocket` — the same ping socket over `std.Io.net`, for a `Pinger`
+//!    with `Config.io`: every send, receive, wait and clock read through the
+//!    `Io` (a deterministic simulator, an evented `Io`), without the raw
+//!    path's extras.
 //!  * `Pinger` — a paced multi-target scheduler as a library, following
 //!    fping's main-loop design: global send pacing,
 //!    in-flight cap, per-subnet spacing, retries with timeout backoff, and
@@ -61,6 +65,8 @@ pub const echo = @import("echo.zig");
 
 /// Non-blocking ICMP socket (unprivileged DGRAM with RAW fallback).
 pub const Socket = @import("Socket.zig");
+/// The ping socket over `std.Io.net` (`Pinger` with `Config.io`).
+pub const IoSocket = @import("IoSocket.zig");
 
 const pinger = @import("pinger.zig");
 

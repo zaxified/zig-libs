@@ -34,6 +34,7 @@ const seqmap = @import("seqmap");
 const echo = @import("echo.zig");
 const SeqMap = seqmap.SeqMap;
 const Socket = @import("Socket.zig");
+const IoSocket = @import("IoSocket.zig");
 
 pub const TargetId = u32;
 
@@ -133,6 +134,14 @@ pub const Config = struct {
     source4: ?Addr = null,
     /// Source address for IPv6 probes (fping -S).
     source6: ?Addr = null,
+    /// Run over `std.Io` instead of raw syscalls: ping sockets from
+    /// `std.Io.net` (`IoSocket`), clocks and waits from the `Io`. What a
+    /// deterministic `Io` (a simulator) or an evented one needs. That path
+    /// has no RAW sockets, kernel receive timestamps, TTL/TOS, error queue
+    /// or interface binding: `ttl`, `tos`, `dont_fragment`, `fwmark`,
+    /// `iface`, `oiface` and `socket_mode = .raw` are refused with
+    /// `error.NeedsRawSockets`; `recv_buf_size` is ignored.
+    io: ?std.Io = null,
 };
 
 /// Reply details delivered with a successful probe.
@@ -253,6 +262,13 @@ pub const Addr = union(echo.Family) {
         return @as(echo.Family, self);
     }
 
+    fn ioAddress(self: *const Addr) std.Io.net.IpAddress {
+        return switch (self.*) {
+            .v4 => |sa| IoSocket.ipOf(sa),
+            .v6 => |sa| IoSocket.ipOf(sa),
+        };
+    }
+
     fn sockaddrPtr(self: *const Addr) *const linux.sockaddr {
         return switch (self.*) {
             .v4 => |*sa| @ptrCast(sa),
@@ -352,7 +368,68 @@ pub const RunError = error{
     /// caller-controlled-length guard in this module is: an assert is the
     /// one guard that disappears in the build mode that ships.
     TooManyPackets,
+    /// `Config.io` is set together with an option only raw-syscall sockets
+    /// implement (see `Config.io`).
+    NeedsRawSockets,
+    /// `run` with `Config.io` was canceled.
+    Canceled,
 } || Socket.OpenError;
+
+/// One family's socket: raw syscalls (`Socket`), or `std.Io.net`
+/// (`IoSocket`, with `Config.io`).
+const Sock = union(enum) {
+    os: Socket,
+    io: IoSocket,
+
+    fn kind(s: *const Sock) Socket.Kind {
+        return switch (s.*) {
+            .os => |*o| o.kind,
+            .io => .dgram,
+        };
+    }
+
+    fn ident(s: *const Sock) u16 {
+        return switch (s.*) {
+            .os => |*o| o.ident,
+            .io => |*o| o.ident,
+        };
+    }
+
+    fn close(s: *Sock) void {
+        switch (s.*) {
+            .os => |*o| o.close(),
+            .io => |*o| o.close(),
+        }
+    }
+
+    fn sendTo(s: *const Sock, addr: *const Addr, packet: []const u8) Socket.SendError!void {
+        return switch (s.*) {
+            .os => |*o| o.sendTo(addr.sockaddrPtr(), addr.sockaddrLen(), packet),
+            .io => |*o| o.sendTo(addr.ioAddress(), packet),
+        };
+    }
+
+    /// How many of `packets` went out in one batch; the caller sends the
+    /// rest one by one. The `Io` path has no batch send: 0.
+    fn sendMany(s: *const Sock, addrs: []const *const Addr, packets: []const []const u8) error{TooManyPackets}!usize {
+        switch (s.*) {
+            .os => |*o| {
+                if (addrs.len > Socket.batch_max) return error.TooManyPackets;
+                var sa: [Socket.batch_max]*const linux.sockaddr = undefined;
+                for (addrs, 0..) |a, i| sa[i] = a.sockaddrPtr();
+                return o.sendMany(sa[0..addrs.len], addrs[0].sockaddrLen(), packets);
+            },
+            .io => return 0,
+        }
+    }
+
+    fn recvBatch(s: *const Sock, b: *Socket.RecvBatch) error{SlabTooSmall}![]const Socket.RecvInfo {
+        return switch (s.*) {
+            .os => |*o| o.recvBatch(b),
+            .io => |*o| o.recvBatch(b),
+        };
+    }
+};
 
 pub const Pinger = struct {
     gpa: std.mem.Allocator,
@@ -361,8 +438,8 @@ pub const Pinger = struct {
     ping_q: EventQueue = .{ .items = &.{}, .cap = 0, .context = {} },
     timeout_q: EventQueue = .{ .items = &.{}, .cap = 0, .context = {} },
     seqmap: SeqMap,
-    sock4: ?Socket = null,
-    sock6: ?Socket = null,
+    sock4: ?Sock = null,
+    sock6: ?Sock = null,
     /// Monotonic time of the last transmitted packet; 0 = nothing sent yet
     /// (CLOCK_MONOTONIC is always far past any pacing interval at startup).
     last_send_ns: i64 = 0,
@@ -398,7 +475,11 @@ pub const Pinger = struct {
         errdefer gpa.free(recv_slab);
 
         // Jitter only needs decorrelation, not cryptographic randomness.
-        const seed: u64 = @bitCast(monoNow() ^ (@as(i64, linux.getpid()) << 32));
+        const seed: u64 = if (cfg.io) |io| s: {
+            var b: [8]u8 = undefined;
+            io.random(&b);
+            break :s std.mem.readInt(u64, &b, .little);
+        } else @bitCast(monoNow() ^ (@as(i64, linux.getpid()) << 32));
 
         return .{
             .gpa = gpa,
@@ -409,6 +490,21 @@ pub const Pinger = struct {
             .pkt_len = pkt_len,
             .recv_batch = .{ .slab = recv_slab, .slot_size = recv_slot },
         };
+    }
+
+    /// Monotonic now, ns: the `Io`'s `.awake` clock with `Config.io`.
+    fn nowMono(self: *const Pinger) i64 {
+        if (self.cfg.io) |io| return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        return monoNow();
+    }
+
+    fn nowReal(self: *const Pinger) i64 {
+        if (self.cfg.io) |io| return @intCast(std.Io.Timestamp.now(io, .real).nanoseconds);
+        return realNow();
+    }
+
+    fn nowOriginateMs(self: *const Pinger) u32 {
+        return originateMsAt(self.nowReal());
     }
 
     pub fn deinit(self: *Pinger) void {
@@ -463,6 +559,7 @@ pub const Pinger = struct {
     }
 
     fn ensureSockets(self: *Pinger) RunError!void {
+        if (self.cfg.io) |io| return self.ensureIoSockets(io);
         var need4 = false;
         var need6 = false;
         for (self.targets.items) |*t| switch (t.addr) {
@@ -485,16 +582,37 @@ pub const Pinger = struct {
         if (need4 and self.sock4 == null) {
             var opts = base;
             if (self.cfg.source4) |src| opts.source = .{ .v4 = src.v4 };
-            self.sock4 = try Socket.open(.v4, self.cfg.socket_mode, opts);
+            // Opened into a local first: `self.sock4 = .{ .os = try … }`
+            // writes the tag through the result location before `try` can
+            // fail, leaving a "socket" whose fd `deinit` then closes.
+            const sock = try Socket.open(.v4, self.cfg.socket_mode, opts);
+            self.sock4 = .{ .os = sock };
         }
         if (need6 and self.sock6 == null) {
             var opts = base;
             if (self.cfg.source6) |src| opts.source = .{ .v6 = src.v6 };
-            self.sock6 = try Socket.open(.v6, self.cfg.socket_mode, opts);
+            const sock = try Socket.open(.v6, self.cfg.socket_mode, opts);
+            self.sock6 = .{ .os = sock };
         }
     }
 
-    fn socketFor(self: *Pinger, fam: echo.Family) *Socket {
+    fn ensureIoSockets(self: *Pinger, io: std.Io) RunError!void {
+        const c = &self.cfg;
+        if (c.ttl != null or c.tos != null or c.dont_fragment or c.fwmark != null or
+            c.iface != null or c.oiface != null or c.socket_mode == .raw) return error.NeedsRawSockets;
+        for (self.targets.items) |*t| switch (t.addr) {
+            .v4 => if (self.sock4 == null) {
+                const sock = try IoSocket.open(io, .v4, if (c.source4) |a| a.ioAddress() else null);
+                self.sock4 = .{ .io = sock };
+            },
+            .v6 => if (self.sock6 == null) {
+                const sock = try IoSocket.open(io, .v6, if (c.source6) |a| a.ioAddress() else null);
+                self.sock6 = .{ .io = sock };
+            },
+        };
+    }
+
+    fn socketFor(self: *Pinger, fam: echo.Family) *Sock {
         return switch (fam) {
             .v4 => &self.sock4.?,
             .v6 => &self.sock6.?,
@@ -533,7 +651,7 @@ pub const Pinger = struct {
             t.done = false;
         }
 
-        const start = monoNow();
+        const start = self.nowMono();
         const rng = self.prng.random();
         for (self.targets.items, 0..) |_, idx| {
             const jitter: i64 = if (self.cfg.jitter_ns > 0)
@@ -557,7 +675,7 @@ pub const Pinger = struct {
     /// null when the round is complete (or stop() was called).
     pub fn step(self: *Pinger) RunError!?i64 {
         if (self.stop_requested.load(.monotonic)) return null;
-        var now = monoNow();
+        var now = self.nowMono();
 
         // Timeout events never need to wait on pacing; drain due ones first.
         // Events whose probe was already answered are purged lazily
@@ -586,7 +704,7 @@ pub const Pinger = struct {
         // buckets allow it; consecutive due sends (only possible with a
         // zero interval) go out as one sendmmsg batch.
         try self.dispatchDue();
-        now = monoNow();
+        now = self.nowMono();
 
         try self.drainReplies();
 
@@ -603,14 +721,16 @@ pub const Pinger = struct {
     /// calls (POLLIN; at most one per address family).
     pub fn pollFds(self: *const Pinger, buf: *[2]linux.pollfd) []linux.pollfd {
         var n: usize = 0;
-        if (self.sock4) |s| {
-            buf[n] = .{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 };
+        // `Config.io` sockets have no descriptor to poll: drive those with
+        // `run`, which waits through the `Io`.
+        if (self.sock4) |s| if (s == .os) {
+            buf[n] = .{ .fd = s.os.fd, .events = linux.POLL.IN, .revents = 0 };
             n += 1;
-        }
-        if (self.sock6) |s| {
-            buf[n] = .{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 };
+        };
+        if (self.sock6) |s| if (s == .os) {
+            buf[n] = .{ .fd = s.os.fd, .events = linux.POLL.IN, .revents = 0 };
             n += 1;
-        }
+        };
         return buf[0..n];
     }
 
@@ -619,7 +739,54 @@ pub const Pinger = struct {
     pub fn run(self: *Pinger) RunError!void {
         try self.prepare();
         while (try self.step()) |deadline| {
-            self.waitReadable(deadline - monoNow());
+            if (self.cfg.io) |io| try self.waitIo(io, deadline) else self.waitReadable(deadline - self.nowMono());
+        }
+    }
+
+    /// `run`'s wait with `Config.io`: until a reply arrives on either socket
+    /// or `deadline` (the `Io`'s `.awake` clock) passes. A reply that arrives
+    /// is handled at once; `step` drains whatever followed it.
+    fn waitIo(self: *Pinger, io: std.Io, deadline: i64) RunError!void {
+        var storage: [2]std.Io.Operation.Storage = undefined;
+        var batch: std.Io.Batch = .init(&storage);
+        var msgs: [2]std.Io.net.IncomingMessage = .{ .init, .init };
+        const fams = [2]echo.Family{ .v4, .v6 };
+        var any = false;
+        for (fams, 0..) |fam, i| {
+            const sock = (switch (fam) {
+                .v4 => self.sock4,
+                .v6 => self.sock6,
+            }) orelse continue;
+            const slot = self.recv_batch.slab[i * self.recv_batch.slot_size ..][0..self.recv_batch.slot_size];
+            batch.addAt(@intCast(i), .{ .net_receive = .{
+                .socket_handle = sock.io.socket.handle,
+                .message_buffer = msgs[i..][0..1],
+                .data_buffer = slot,
+                .flags = .{},
+            } });
+            any = true;
+        }
+        const until: std.Io.Clock.Timestamp = .{ .raw = .{ .nanoseconds = deadline }, .clock = .awake };
+        if (!any) return until.wait(io) catch error.Canceled;
+        batch.awaitConcurrent(io, .{ .deadline = until }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => {
+                batch.cancel(io);
+                return error.Canceled;
+            },
+            // No concurrency to wait on both: sleep out the deadline; the
+            // replies wait in the sockets for the next `step`.
+            error.ConcurrencyUnavailable => {
+                batch.cancel(io);
+                return until.wait(io) catch error.Canceled;
+            },
+        };
+        batch.cancel(io); // the socket that did not answer
+        const now = self.nowMono();
+        while (batch.next()) |c| {
+            const err, const count = c.result.net_receive;
+            if (err != null or count == 0) continue;
+            self.handleReply(fams[c.index], IoSocket.infoOf(msgs[c.index]), now);
         }
     }
 
@@ -628,7 +795,7 @@ pub const Pinger = struct {
     /// batches only form when interval_ns == 0 — then consecutive due
     /// sends to the same address family share one sendmmsg syscall.
     fn dispatchDue(self: *Pinger) RunError!void {
-        var now = monoNow();
+        var now = self.nowMono();
         while (true) {
             // Collect a same-family batch of events allowed to send now.
             var events: [Socket.batch_max]Event = undefined;
@@ -661,16 +828,15 @@ pub const Pinger = struct {
             if (n == 0) return;
 
             const sock = self.socketFor(family);
-            const t0 = &self.targets.items[events[0].target];
             var accepted: usize = 0;
             if (n > 1) {
-                var addrs: [Socket.batch_max]*const linux.sockaddr = undefined;
+                var addrs: [Socket.batch_max]*const Addr = undefined;
                 var packets: [Socket.batch_max][]const u8 = undefined;
                 for (events[0..n], 0..) |ev, i| {
-                    addrs[i] = self.targets.items[ev.target].addr.sockaddrPtr();
+                    addrs[i] = &self.targets.items[ev.target].addr;
                     packets[i] = self.sendSlot(i);
                 }
-                accepted = try sock.sendMany(addrs[0..n], t0.addr.sockaddrLen(), packets[0..n]);
+                accepted = try sock.sendMany(addrs[0..n], packets[0..n]);
             }
             for (events[0..n], seqs[0..n], 0..) |ev, seq, i| {
                 if (i < accepted) {
@@ -680,13 +846,13 @@ pub const Pinger = struct {
                 // Single send, or the remainder of a short sendmmsg batch
                 // (retried individually for an accurate per-packet errno).
                 const t = &self.targets.items[ev.target];
-                if (sock.sendTo(t.addr.sockaddrPtr(), t.addr.sockaddrLen(), self.sendSlot(i))) {
+                if (sock.sendTo(&t.addr, self.sendSlot(i))) {
                     try self.commitProbe(ev, seq, now);
                 } else |err| {
                     self.failProbe(ev, seq, err);
                 }
             }
-            now = monoNow();
+            now = self.nowMono();
         }
     }
 
@@ -735,7 +901,7 @@ pub const Pinger = struct {
             // `init` sizes `pkt_len` to exactly `timestamp_msg_len` on this
             // branch, so the slice is the whole buffer; the reslice is what
             // hands the writer the fixed-size type it now asks for.
-            echo.writeTimestampRequest(buf[0..echo.timestamp_msg_len], sock.ident, seq, originateMs());
+            echo.writeTimestampRequest(buf[0..echo.timestamp_msg_len], sock.ident(), seq, self.nowOriginateMs());
         } else {
             if (self.cfg.random_payload)
                 self.prng.random().bytes(buf[echo.echo_header_len..]);
@@ -744,7 +910,7 @@ pub const Pinger = struct {
             // than swallowed anyway: the point of the writer returning an
             // error instead of asserting is that no caller decides the check
             // is unnecessary and puts the fail-open guard back.
-            echo.writeEchoRequest(t.addr.family(), buf, sock.ident, seq) catch
+            echo.writeEchoRequest(t.addr.family(), buf, sock.ident(), seq) catch
                 return error.SendBufferTooSmall;
         }
 
@@ -829,14 +995,14 @@ pub const Pinger = struct {
     fn handleReply(self: *Pinger, fam: echo.Family, info: Socket.RecvInfo, recv_mono_ns: i64) void {
         const sock = self.socketFor(fam);
         const parsed = switch (fam) {
-            .v4 => echo.parseV4(info.packet, sock.kind == .raw),
+            .v4 => echo.parseV4(info.packet, sock.kind() == .raw),
             .v6 => echo.parseV6(info.packet),
         };
         switch (parsed) {
             .echo_reply => |r| {
                 // RAW sockets see every echo reply on the host; DGRAM sockets
                 // are already filtered by the kernel.
-                if (sock.kind == .raw and r.ident != sock.ident) return;
+                if (sock.kind() == .raw and r.ident != sock.ident()) return;
                 const entry = self.seqmap.fetchPtr(r.seq) orelse return;
                 const t = &self.targets.items[entry.target];
                 if (t.addr.family() != fam) return;
@@ -850,7 +1016,7 @@ pub const Pinger = struct {
                 // Report the ICMP message length; RAW v4 sockets deliver the
                 // IP header too, so strip its length.
                 var icmp_len = info.packet.len;
-                if (fam == .v4 and sock.kind == .raw and info.packet.len >= 20)
+                if (fam == .v4 and sock.kind() == .raw and info.packet.len >= 20)
                     icmp_len -= @as(usize, info.packet[0] & 0x0f) * 4;
                 const reply_info: ReplyInfo = .{
                     .rtt_ns = rtt,
@@ -882,7 +1048,7 @@ pub const Pinger = struct {
                 if (self.cfg.mode == .alive) t.done = true else self.checkDone(t);
             },
             .icmp_error => |e| {
-                if (e.orig_ident != sock.ident) return;
+                if (e.orig_ident != sock.ident()) return;
                 const entry = self.seqmap.fetch(e.orig_seq) orelse return;
                 const t = &self.targets.items[entry.target];
                 // A1 F2: `check_source` used to sit only in the `.echo_reply`
@@ -955,8 +1121,8 @@ pub const Pinger = struct {
     fn drainReplies(self: *Pinger) RunError!void {
         // One realtime/monotonic pair converts kernel receive timestamps
         // (CLOCK_REALTIME) to the engine's monotonic clock.
-        const mono_now = monoNow();
-        const real_now = realNow();
+        const mono_now = self.nowMono();
+        const real_now = self.nowReal();
 
         inline for (.{ .v4, .v6 }) |fam| {
             const maybe_sock = switch (@as(echo.Family, fam)) {
@@ -983,7 +1149,7 @@ pub const Pinger = struct {
                     // return control anyway (see doc comment above).
                     if (infos.len < Socket.batch_max or batches >= max_batches_per_drain) break;
                 }
-                self.drainErrQueue(fam, sock);
+                if (sock.* == .os) self.drainErrQueue(fam, &sock.os);
             }
         }
     }
@@ -1083,13 +1249,11 @@ fn realNow() i64 {
     return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
-/// Milliseconds since midnight UT, as required by RFC 792 timestamps.
-fn originateMs() u32 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
-    const ms_in_day = @mod(ts.sec, std.time.s_per_day) * std.time.ms_per_s +
-        @divTrunc(ts.nsec, std.time.ns_per_ms);
-    return @intCast(ms_in_day);
+/// Milliseconds since midnight UT, as required by RFC 792 timestamps, at
+/// `real_ns` (CLOCK_REALTIME).
+fn originateMsAt(real_ns: i64) u32 {
+    const ms = @divFloor(real_ns, std.time.ns_per_ms);
+    return @intCast(@mod(ms, std.time.s_per_day * std.time.ms_per_s));
 }
 
 // ── tests: offline ──────────────────────────────────────────────────────────
@@ -1330,7 +1494,7 @@ test "A1 F2: check_source now validates the quoted destination inside an ICMP er
     const id = try p.addTarget("10.9.9.77");
     // .dgram: no raw IP header to strip, so `pkt` below is the ICMP message
     // as-is (recvmsg on a DGRAM ping socket never sees the IP header).
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
 
     const seq = try p.seqmap.add(id, 0, monoNow());
 
@@ -1375,7 +1539,7 @@ test "A1 F2: check_source now validates the quoted destination inside an ICMP er
 // depend on them.
 
 test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, not part of it" {
-    // `if (sock.kind == .raw and r.ident != sock.ident) return;` -- m2
+    // `if (sock.kind() == .raw and r.ident != sock.ident()) return;` -- m2
     // deletes it outright, m3 weakens it to the high byte only, m31 to a
     // single bit. A single test that flips every bit position one at a time
     // (all other bits matching) catches all three: whichever subset of bits
@@ -1389,7 +1553,7 @@ test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, n
     var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1");
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .raw, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .raw, .ident = 0x1234 } };
     p.targets.items[id].pending = 1;
     p.inflight = 1;
     const seq = try p.seqmap.add(id, 0, monoNow());
@@ -1402,7 +1566,7 @@ test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, n
 
     var bit: u4 = 0;
     while (true) : (bit += 1) {
-        const wrong_ident = p.sock4.?.ident ^ (@as(u16, 1) << bit);
+        const wrong_ident = p.sock4.?.os.ident ^ (@as(u16, 1) << bit);
         std.mem.writeInt(u16, icmp[4..6], wrong_ident, .big);
         icmp[2] = 0;
         icmp[3] = 0;
@@ -1413,7 +1577,7 @@ test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, n
     try std.testing.expectEqual(@as(u32, 0), p.stats(id).recv);
 
     // Positive control: the correct ident resolves the probe.
-    std.mem.writeInt(u16, icmp[4..6], p.sock4.?.ident, .big);
+    std.mem.writeInt(u16, icmp[4..6], p.sock4.?.os.ident, .big);
     icmp[2] = 0;
     icmp[3] = 0;
     std.mem.writeInt(u16, icmp[2..4], echo.checksum(icmp), .big);
@@ -1422,12 +1586,12 @@ test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, n
 }
 
 test "A1 F12 m4/m32: an ICMP error's orig_ident check compares the WHOLE 16 bits, not part of it" {
-    // `if (e.orig_ident != sock.ident) return;` -- same bit-flip technique
+    // `if (e.orig_ident != sock.ident()) return;` -- same bit-flip technique
     // as m2/m3/m31 above, applied to the ICMP-error correlation path.
     var p = try Pinger.init(std.testing.allocator, .{});
     defer p.deinit();
     const id = try p.addTarget("10.9.9.77");
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
     const seq = try p.seqmap.add(id, 0, monoNow());
 
     var pkt: [echo.echo_header_len + 20 + echo.echo_header_len]u8 = @splat(0);
@@ -1444,7 +1608,7 @@ test "A1 F12 m4/m32: an ICMP error's orig_ident check compares the WHOLE 16 bits
 
     var bit: u4 = 0;
     while (true) : (bit += 1) {
-        const wrong_ident = p.sock4.?.ident ^ (@as(u16, 1) << bit);
+        const wrong_ident = p.sock4.?.os.ident ^ (@as(u16, 1) << bit);
         std.mem.writeInt(u16, orig[4..6], wrong_ident, .big);
         pkt[2] = 0;
         pkt[3] = 0;
@@ -1455,7 +1619,7 @@ test "A1 F12 m4/m32: an ICMP error's orig_ident check compares the WHOLE 16 bits
     try std.testing.expectEqual(@as(u32, 0), p.stats(id).icmp_errors);
 
     // Positive control: the correct ident counts the error.
-    std.mem.writeInt(u16, orig[4..6], p.sock4.?.ident, .big);
+    std.mem.writeInt(u16, orig[4..6], p.sock4.?.os.ident, .big);
     pkt[2] = 0;
     pkt[3] = 0;
     std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
@@ -1473,7 +1637,7 @@ test "A1 F12 m5: a reply arriving on the wrong address family's socket does not 
     var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1"); // a v4 target
-    p.sock6 = .{ .fd = -1, .family = .v6, .kind = .dgram, .ident = 0x1234 };
+    p.sock6 = .{ .os = .{ .fd = -1, .family = .v6, .kind = .dgram, .ident = 0x1234 } };
     p.targets.items[id].pending = 1;
     p.inflight = 1;
     const seq = try p.seqmap.add(id, 0, monoNow());
@@ -1486,7 +1650,7 @@ test "A1 F12 m5: a reply arriving on the wrong address family's socket does not 
     try std.testing.expectEqual(@as(u32, 0), p.stats(id).recv);
 
     // Positive control: the SAME seq, delivered on the matching (v4) family.
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
     var pkt4: [echo.echo_header_len]u8 = @splat(0);
     pkt4[0] = echo.v4.echo_reply;
     std.mem.writeInt(u16, pkt4[4..6], 0x1234, .big);
@@ -1504,7 +1668,7 @@ test "A1 F12 m6: check_source, when enabled, is actually enforced on echo replie
     var p = try Pinger.init(std.testing.allocator, .{ .check_source = true });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1");
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
     p.targets.items[id].pending = 1;
     p.inflight = 1;
     const seq = try p.seqmap.add(id, 0, monoNow());
@@ -1543,7 +1707,7 @@ test "A1 F12 m17: a second reply to an already-answered probe counts as a duplic
     var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1");
-    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
     p.targets.items[id].pending = 1;
     p.inflight = 1;
     const seq = try p.seqmap.add(id, 0, monoNow());
@@ -1742,7 +1906,7 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
     // This test is specifically about the DGRAM path (A1 F5's "always 0"
     // claim does not apply to RAW, which already saw ICMP errors before
     // this fix). Environments where .auto fell back to RAW skip it.
-    if (sock4.kind != .dgram) return error.SkipZigTest;
+    if (sock4.kind() != .dgram) return error.SkipZigTest;
 
     var injector = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
         error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
@@ -1773,7 +1937,7 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
     @memcpy(pkt[8 + 16 ..][0..4], &target_bytes); // quoted destination
     const orig = pkt[8 + 20 ..];
     orig[0] = echo.v4.echo_request;
-    std.mem.writeInt(u16, orig[4..6], sock4.ident, .big);
+    std.mem.writeInt(u16, orig[4..6], sock4.ident(), .big);
     std.mem.writeInt(u16, orig[6..8], seq, .big);
     std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
 
@@ -1813,10 +1977,15 @@ const Capture = struct {
 };
 
 fn pingLoopback(target: []const u8) !void {
+    return pingLoopbackVia(target, null);
+}
+
+fn pingLoopbackVia(target: []const u8, io: ?std.Io) !void {
     var p = try Pinger.init(std.testing.allocator, .{
         .retries = 0,
         .timeout_ns = 2 * std.time.ns_per_s,
         .interval_ns = 0,
+        .io = io,
     });
     defer p.deinit();
     const id = try p.addTarget(target);
@@ -1849,6 +2018,23 @@ test "integration: ping 127.0.0.1 replies with a plausible RTT" {
 
 test "integration: ping ::1 replies with a plausible RTT" {
     try pingLoopback("::1");
+}
+
+test "integration: over std.Io (Config.io), ping 127.0.0.1 and ::1" {
+    // The path a simulator or an evented `Io` takes: ping sockets from
+    // `std.Io.net`, clocks and waits from the `Io` (simio pilot).
+    try pingLoopbackVia("127.0.0.1", std.testing.io);
+    pingLoopbackVia("::1", std.testing.io) catch |e| switch (e) {
+        error.SkipZigTest => {}, // IPv6 unavailable here; v4 above ran
+        else => return e,
+    };
+}
+
+test "Config.io refuses options only raw-syscall sockets implement" {
+    var p = try Pinger.init(std.testing.allocator, .{ .io = std.testing.io, .ttl = 5 });
+    defer p.deinit();
+    _ = try p.addTarget("127.0.0.1");
+    try std.testing.expectError(error.NeedsRawSockets, p.prepare());
 }
 
 test "integration: embed API prepare/step/pollFds round against loopback" {

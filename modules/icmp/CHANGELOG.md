@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `Config.io`: `Pinger` over `std.Io` instead of raw syscalls — ping sockets
+  from `std.Io.net` (`IoSocket`), clocks and waits from the `Io`, so a deterministic `Io` (simio)
+  or an evented one can run it. Narrower than the raw path: no RAW sockets, kernel receive
+  timestamps, TTL/TOS, error queue or interface binding (those options give
+  `error.NeedsRawSockets`); a source address works. The raw path is unchanged.
 - **2026-09-11** — **A1 fix campaign round 2: six findings closed. BEHAVIOURAL
   and API changes — see below.**
 
