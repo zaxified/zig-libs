@@ -37,6 +37,12 @@ const Report = struct {
     /// Directory entries afterwards, sorted, joined by '/'.
     names: [128]u8 = undefined,
     names_len: usize = 0,
+    /// Links: what each observation gave, as one comparable line.
+    links: [512]u8 = undefined,
+    links_len: usize = 0,
+    /// The file after a write through a memory map, and what the map read.
+    mapped: [64]u8 = undefined,
+    mapped_len: usize = 0,
     done: bool = false,
 
     fn eql(a: *const Report, b: *const Report) bool {
@@ -46,6 +52,8 @@ const Report = struct {
             std.mem.eql(u8, a.unix[0..a.unix_len], b.unix[0..b.unix_len]) and
             std.mem.eql(u8, a.file[0..a.file_len], b.file[0..b.file_len]) and
             std.mem.eql(u8, a.names[0..a.names_len], b.names[0..b.names_len]) and
+            std.mem.eql(u8, a.links[0..a.links_len], b.links[0..b.links_len]) and
+            std.mem.eql(u8, a.mapped[0..a.mapped_len], b.mapped[0..b.mapped_len]) and
             a.done and b.done;
     }
 };
@@ -208,7 +216,71 @@ fn program(io: Io, dir: Dir, report: *Report) !void {
         }
         report.names_len = w.end;
     }
+    try links(io, dir, report);
+    try mapped(io, dir, report);
     report.done = true;
+}
+
+/// A memory map: read a file through it, change it, write it back.
+fn mapped(io: Io, dir: Dir, report: *Report) !void {
+    try dir.writeFile(io, .{ .sub_path = "mapped.bin", .data = "0123456789" });
+    const f = try dir.openFile(io, "mapped.bin", .{ .mode = .read_write });
+    defer f.close(io);
+    var mm = try Io.File.MemoryMap.create(io, f, .{ .len = 10 });
+    defer mm.destroy(io);
+    var w: Io.Writer = .fixed(&report.mapped);
+    try w.print("{s}|", .{mm.memory[0..10]});
+    @memcpy(mm.memory[2..5], "abc");
+    try mm.write(io);
+    var buf: [16]u8 = undefined;
+    try w.print("{s}", .{try dir.readFile(io, "mapped.bin", &buf)});
+    report.mapped_len = w.end;
+}
+
+/// Symbolic and hard links, observed through every call that treats them
+/// differently, written as one line per observation.
+fn links(io: Io, dir: Dir, report: *Report) !void {
+    var w: Io.Writer = .fixed(&report.links);
+    defer report.links_len = w.end;
+    try dir.createDirPath(io, "real/sub");
+    try dir.writeFile(io, .{ .sub_path = "real/sub/data.txt", .data = "linked data" });
+    try dir.symLink(io, "real/sub", "dirlink", .{ .is_directory = true });
+    try dir.symLink(io, "sub/data.txt", "real/filelink", .{});
+    try dir.symLink(io, "nowhere", "dangling", .{});
+    try dir.symLink(io, "loop2", "loop1", .{});
+    try dir.symLink(io, "loop1", "loop2", .{});
+
+    var buf: [64]u8 = undefined;
+    // Through a link in the middle of a path, and at its end.
+    try w.print("via-dir={s}\n", .{try dir.readFile(io, "dirlink/data.txt", &buf)});
+    try w.print("via-file={s}\n", .{try dir.readFile(io, "real/filelink", &buf)});
+    try w.print("readlink={s}\n", .{buf[0..try dir.readLink(io, "real/filelink", &buf)]});
+    // stat follows, lstat does not.
+    const st = try dir.statFile(io, "real/filelink", .{});
+    const lst = try dir.statFile(io, "real/filelink", .{ .follow_symlinks = false });
+    try w.print("stat={t} size={d} lstat={t} size={d}\n", .{ st.kind, st.size, lst.kind, lst.size });
+    // A dangling link and a loop.
+    if (dir.readFile(io, "dangling", &buf)) |_| try w.writeAll("dangling=read\n") else |err| try w.print("dangling={t}\n", .{err});
+    if (dir.readFile(io, "loop1", &buf)) |_| try w.writeAll("loop=read\n") else |err| try w.print("loop={t}\n", .{err});
+    // A realpath resolves the links (relative to the directory).
+    var root: [256]u8 = undefined;
+    const root_len = try dir.realPath(io, &root);
+    var full: [256]u8 = undefined;
+    const full_len = try dir.realPathFile(io, "dirlink/data.txt", &full);
+    try w.print("realpath={s}\n", .{std.mem.trimStart(u8, full[root_len..full_len], "/")});
+    // Deleting the link leaves the target.
+    try dir.deleteFile(io, "real/filelink");
+    try w.print("after-unlink={s}\n", .{try dir.readFile(io, "real/sub/data.txt", &buf)});
+    // A hard link is the same file under two names.
+    try dir.hardLink("real/sub/data.txt", dir, "hard.txt", io, .{});
+    const hs = try dir.statFile(io, "hard.txt", .{});
+    try dir.deleteFile(io, "real/sub/data.txt");
+    try w.print("hard nlink={d} survives={s}\n", .{ hs.nlink, try dir.readFile(io, "hard.txt", &buf) });
+    // Permissions and timestamps set and read back.
+    try dir.setFilePermissions(io, "hard.txt", .fromMode(0o600), .{});
+    try dir.setTimestamps(io, "hard.txt", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 1_000_000_000_000_000_000 } } });
+    const ms = try dir.statFile(io, "hard.txt", .{});
+    try w.print("mode={o} mtime={d}\n", .{ ms.permissions.toMode() & 0o777, ms.mtime.nanoseconds });
 }
 
 fn writeMessages(io: Io, stream: net.Stream) !void {
@@ -261,6 +333,22 @@ test "differential oracle: one std.Io program gives the same results on Threaded
     try testing.expectEqualStrings("fresh contents, 25 bytes", real.file[0..real.file_len]);
     try testing.expectEqualStrings("old.txt", real.names[0..real.names_len]);
     try testing.expectEqualStrings("UNIX PATH", real.unix[0..real.unix_len]);
+    try testing.expectEqualStrings(
+        \\via-dir=linked data
+        \\via-file=linked data
+        \\readlink=sub/data.txt
+        \\stat=file size=11 lstat=sym_link size=12
+        \\dangling=FileNotFound
+        \\loop=SymLinkLoop
+        \\realpath=real/sub/data.txt
+        \\after-unlink=linked data
+        \\hard nlink=2 survives=linked data
+        \\mode=600 mtime=1000000000000000000
+        \\
+    , real.links[0..real.links_len]);
+    try testing.expectEqualStrings(real.links[0..real.links_len], simulated.links[0..simulated.links_len]);
+    try testing.expectEqualStrings("0123456789|01abc56789", real.mapped[0..real.mapped_len]);
+    try testing.expectEqualStrings(real.mapped[0..real.mapped_len], simulated.mapped[0..simulated.mapped_len]);
     try testing.expectEqual(real.stream_bytes, simulated.stream_bytes);
     try testing.expectEqual(real.stream, simulated.stream);
     try testing.expectEqual(real.dgrams, simulated.dgrams);

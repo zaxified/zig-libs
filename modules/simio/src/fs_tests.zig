@@ -606,3 +606,50 @@ fn rawSyscallOnHandle(io: Io) !void {
     const rc = std.os.linux.fdatasync(f.handle);
     try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(rc));
 }
+
+// ── links across a crash ───────────────────────────────────────────────────
+
+fn makeLinks(io: Io, sync_dir: bool) !void {
+    const cwd = Dir.cwd();
+    try cwd.symLink(io, "data", "soft", .{});
+    try cwd.hardLink("data", cwd, "hard", io, .{});
+    if (sync_dir) {
+        const d = try cwd.openDir(io, ".", .{});
+        defer d.close(io);
+        const as_file: File = .{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+        try as_file.sync(io);
+    }
+}
+
+/// After a crash: 0 = no link survived, 1 = the soft one, 2 = the hard one, 3 = both.
+fn linksAfterCrash(seed: u64, sync_dir: bool) !u2 {
+    var sim: Sim = undefined;
+    newSim(&sim, seed);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.putFile("data", "payload");
+    try h.spawn(makeLinks, .{ h.io(), sync_dir });
+    _ = sim.run();
+    sim.crash(h);
+    sim.restart(h);
+    var survived: u2 = 0;
+    if (h.readFile("soft")) |d| {
+        try testing.expectEqualStrings("payload", d);
+        survived |= 1;
+    }
+    if (h.readFile("hard")) |d| {
+        try testing.expectEqualStrings("payload", d);
+        survived |= 2;
+    }
+    return survived;
+}
+
+test "links are names: durable after a directory sync, at the crash's mercy before it" {
+    for (0..10) |seed| try testing.expectEqual(@as(u2, 3), try linksAfterCrash(seed, true));
+    var seen: [4]bool = @splat(false);
+    for (0..40) |seed| seen[try linksAfterCrash(seed, false)] = true;
+    // A crash keeps a prefix of the name journal: nothing, the first link,
+    // or both — never the second without the first.
+    try testing.expect(seen[0] and seen[1] and seen[3]);
+    try testing.expect(!seen[2]);
+}

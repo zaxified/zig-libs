@@ -26,8 +26,12 @@
 //! (`Fault.bit_rot`), and a capacity per host (`HostOptions.disk_bytes`) past
 //! which writes fail with `error.NoSpaceLeft`.
 //!
-//! Not modelled: symlinks, hard links, permissions enforcement (they are
-//! stored and reported), memory maps. Nodes are freed with the simulation.
+//! Symbolic links are followed in every component (at most 40, then
+//! `SymLinkLoop`) and in the last one where POSIX does (`stat`, `open`,
+//! `realpath`), not where it does not (`lstat`, `unlink`, `rename`,
+//! `readlink`); a link and a hard link are names, journaled like any other.
+//! Permissions, owners and timestamps are stored and reported, not enforced.
+//! Nodes are freed with the simulation.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -69,8 +73,8 @@ const MetaOp = struct {
 
 pub const Node = struct {
     ino: u64,
-    kind: enum { file, dir },
-    // files
+    kind: enum { file, dir, symlink },
+    // files; a symlink's target
     data: std.ArrayList(u8) = .empty,
     synced: std.ArrayList(u8) = .empty,
     pending: std.ArrayList(DataOp) = .empty,
@@ -80,6 +84,8 @@ pub const Node = struct {
     parent: ?*Node = null,
     nlink: u32 = 0,
     perm: File.Permissions,
+    uid: File.Uid = 0,
+    gid: File.Gid = 0,
     mtime: i96 = 0,
     ctime: i96 = 0,
     atime: i96 = 0,
@@ -206,13 +212,35 @@ pub const Fs = struct {
         node: ?*Node,
     };
 
-    fn resolve(fs: *Fs, dir: Dir, path: []const u8) error{ FileNotFound, NotDir, BadPathName }!Resolved {
+    /// Symbolic links followed in one resolution before `SymLinkLoop`
+    /// (Linux's MAXSYMLINKS).
+    const max_hops = 40;
+
+    const ResolveError = error{ FileNotFound, NotDir, BadPathName, SymLinkLoop };
+
+    /// Resolves `path`, following symbolic links in every component but the
+    /// last (the `lstat` view: the result may itself be a link).
+    fn resolve(fs: *Fs, dir: Dir, path: []const u8) ResolveError!Resolved {
+        var hops: u8 = 0;
+        return fs.resolveAt(try fs.dirNode(dir, path), path, &hops);
+    }
+
+    /// `resolve`, then through the last component too while it is a link
+    /// (the `stat`/`open` view). A dangling link resolves to its target's
+    /// absent name, so creating through it creates the target.
+    fn resolveFollow(fs: *Fs, dir: Dir, path: []const u8) ResolveError!Resolved {
+        var hops: u8 = 0;
+        const r = try fs.resolveAt(try fs.dirNode(dir, path), path, &hops);
+        return fs.followAt(r, &hops);
+    }
+
+    fn resolveAt(fs: *Fs, start: *Node, path: []const u8, hops: *u8) ResolveError!Resolved {
         if (path.len == 0) return error.BadPathName;
-        var cur = try fs.dirNode(dir, path);
+        var cur = if (path[0] == '/') fs.root else start;
         var it = std.mem.tokenizeScalar(u8, path, '/');
         var last: ?[]const u8 = null;
         while (it.next()) |comp| {
-            if (last) |prev| cur = try step(cur, prev);
+            if (last) |prev| cur = try fs.step(cur, prev, hops);
             last = comp;
         }
         const name = last orelse return .{ .parent = null, .name = "", .node = cur }; // "/"
@@ -221,10 +249,23 @@ pub const Fs = struct {
         return .{ .parent = cur, .name = name, .node = cur.entries.get(name) };
     }
 
-    fn step(cur: *Node, comp: []const u8) error{ FileNotFound, NotDir }!*Node {
+    fn followAt(fs: *Fs, resolved: Resolved, hops: *u8) ResolveError!Resolved {
+        var r = resolved;
+        while (r.node) |n| {
+            if (n.kind != .symlink) break;
+            hops.* += 1;
+            if (hops.* > max_hops) return error.SymLinkLoop;
+            r = try fs.resolveAt(r.parent orelse fs.root, n.data.items, hops);
+        }
+        return r;
+    }
+
+    fn step(fs: *Fs, cur: *Node, comp: []const u8, hops: *u8) ResolveError!*Node {
         if (std.mem.eql(u8, comp, ".")) return cur;
         if (std.mem.eql(u8, comp, "..")) return cur.parent orelse cur;
-        const next = cur.entries.get(comp) orelse return error.FileNotFound;
+        const entry = cur.entries.get(comp) orelse return error.FileNotFound;
+        const next = (try fs.followAt(.{ .parent = cur, .name = comp, .node = entry }, hops)).node orelse
+            return error.FileNotFound;
         if (next.kind != .dir) return error.NotDir;
         return next;
     }
@@ -436,7 +477,7 @@ pub const Fs = struct {
 
     /// The current contents of `path`, or null.
     pub fn get(fs: *Fs, path: []const u8) ?[]const u8 {
-        const r = fs.resolve(.{ .handle = cwd_handle }, path) catch return null;
+        const r = fs.resolveFollow(.{ .handle = cwd_handle }, path) catch return null;
         const n = r.node orelse return null;
         if (n.kind != .file) return null;
         return n.data.items;
@@ -453,13 +494,21 @@ pub const Fs = struct {
         return .{
             .inode = n.ino,
             .nlink = n.nlink,
-            .size = if (n.kind == .file) n.data.items.len else 0,
+            .size = if (n.kind == .dir) 0 else n.data.items.len,
             .permissions = n.perm,
-            .kind = if (n.kind == .file) .file else .directory,
+            .kind = kindOf(n),
             .atime = .{ .nanoseconds = n.atime },
             .mtime = .{ .nanoseconds = n.mtime },
             .ctime = .{ .nanoseconds = n.ctime },
             .block_size = 4096,
+        };
+    }
+
+    fn kindOf(n: *const Node) File.Kind {
+        return switch (n.kind) {
+            .file => .file,
+            .dir => .directory,
+            .symlink => .sym_link,
         };
     }
 
@@ -485,9 +534,14 @@ pub const Fs = struct {
                 cur = cur.parent orelse cur;
                 continue;
             }
-            if (cur.entries.get(comp)) |n| {
-                if (n.kind != .dir) return error.NotDir;
-                cur = n;
+            if (cur.entries.get(comp) != null) {
+                var hops: u8 = 0;
+                cur = fs.step(cur, comp, &hops) catch |err| return switch (err) {
+                    error.FileNotFound => error.FileNotFound,
+                    error.NotDir => error.NotDir,
+                    error.SymLinkLoop => error.SymLinkLoop,
+                    error.BadPathName => error.BadPathName,
+                };
             } else {
                 const d = fs.newNode(.dir) catch return error.SystemResources;
                 d.perm = perm;
@@ -500,9 +554,8 @@ pub const Fs = struct {
     }
 
     pub fn openDir(fs: *Fs, dir: Dir, path: []const u8, options: Dir.OpenOptions) Dir.OpenError!Dir {
-        _ = options;
         try fs.cancelPoint();
-        const r = try fs.resolve(dir, path);
+        const r = if (options.follow_symlinks) try fs.resolveFollow(dir, path) else try fs.resolve(dir, path);
         const n = r.node orelse return error.FileNotFound;
         if (n.kind != .dir) return error.NotDir;
         const handle = fs.newHandle(.{ .node = n, .read = true, .write = false }) catch return error.SystemResources;
@@ -523,15 +576,15 @@ pub const Fs = struct {
         return statOf(n);
     }
 
-    pub fn statFile(fs: *Fs, dir: Dir, path: []const u8) Dir.StatFileError!File.Stat {
+    pub fn statFile(fs: *Fs, dir: Dir, path: []const u8, follow: bool) Dir.StatFileError!File.Stat {
         try fs.cancelPoint();
-        const r = try fs.resolve(dir, path);
+        const r = if (follow) try fs.resolveFollow(dir, path) else try fs.resolve(dir, path);
         return statOf(r.node orelse return error.FileNotFound);
     }
 
     pub fn access(fs: *Fs, dir: Dir, path: []const u8) Dir.AccessError!void {
         try fs.cancelPoint();
-        const r = fs.resolve(dir, path) catch |err| switch (err) {
+        const r = fs.resolveFollow(dir, path) catch |err| switch (err) {
             error.NotDir => return error.FileNotFound,
             else => |e| return e,
         };
@@ -540,7 +593,7 @@ pub const Fs = struct {
 
     pub fn createFile(fs: *Fs, dir: Dir, path: []const u8, options: Dir.CreateFileOptions) File.OpenError!File {
         try fs.cancelPoint();
-        const r = try fs.resolve(dir, path);
+        const r = try fs.resolveFollow(dir, path);
         var node = r.node;
         if (node) |n| {
             if (options.exclusive) return error.PathAlreadyExists;
@@ -567,8 +620,9 @@ pub const Fs = struct {
 
     pub fn openFile(fs: *Fs, dir: Dir, path: []const u8, options: Dir.OpenFileOptions) File.OpenError!File {
         try fs.cancelPoint();
-        const r = try fs.resolve(dir, path);
+        const r = if (options.follow_symlinks) try fs.resolveFollow(dir, path) else try fs.resolve(dir, path);
         const n = r.node orelse return error.FileNotFound;
+        if (n.kind == .symlink) return error.SymLinkLoop; // O_NOFOLLOW on a link: ELOOP
         if (n.kind == .dir and (!options.allow_directory or options.isWrite())) return error.IsDir;
         const handle = fs.newHandle(.{ .node = n, .read = options.isRead(), .write = options.isWrite() }) catch return error.SystemResources;
         const file: File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
@@ -635,7 +689,7 @@ pub const Fs = struct {
         if (n.kind == .dir) return error.IsDir;
         const parent = r.parent orelse return error.IsDir;
         fs.setEntry(parent, r.name, null, fs.newGroup()) catch return error.SystemResources;
-        if (n.nlink == 0) fs.used_bytes -|= n.data.items.len;
+        if (n.nlink == 0 and n.kind == .file) fs.used_bytes -|= n.data.items.len;
     }
 
     pub fn deleteDir(fs: *Fs, dir: Dir, path: []const u8) Dir.DeleteDirError!void {
@@ -692,7 +746,7 @@ pub const Fs = struct {
             const child = n.entries.values()[reader.index];
             out[count] = .{
                 .name = n.entries.keys()[reader.index],
-                .kind = if (child.kind == .file) .file else .directory,
+                .kind = kindOf(child),
                 .inode = child.ino,
             };
             count += 1;
@@ -705,10 +759,10 @@ pub const Fs = struct {
         var n = fs.dirNode(dir, sub orelse "") catch return error.FileNotFound;
         var tail: []const u8 = "";
         if (sub) |p| {
-            const r = fs.resolve(dir, p) catch return error.FileNotFound;
+            const r = fs.resolveFollow(dir, p) catch return error.FileNotFound;
             const target = r.node orelse return error.FileNotFound;
             if (target.kind == .dir) n = target else {
-                n = r.parent.?;
+                n = r.parent orelse return error.FileNotFound;
                 tail = r.name;
             }
         }
@@ -732,6 +786,114 @@ pub const Fs = struct {
         }
         if (tail.len > 0) w.print("/{s}", .{tail}) catch return error.NameTooLong;
         return w.end;
+    }
+
+    pub fn symLink(fs: *Fs, dir: Dir, target: []const u8, link_path: []const u8) Dir.SymLinkError!void {
+        try fs.cancelPoint();
+        if (target.len == 0) return error.FileNotFound;
+        const r = try fs.resolve(dir, link_path);
+        if (r.node != null) return error.PathAlreadyExists;
+        const parent = r.parent orelse return error.PathAlreadyExists;
+        const n = fs.newNode(.symlink) catch return error.SystemResources;
+        n.perm = .default_file;
+        n.data.appendSlice(fs.alloc(), target) catch return error.SystemResources;
+        fs.setEntry(parent, r.name, n, fs.newGroup()) catch return error.SystemResources;
+    }
+
+    pub fn readLink(fs: *Fs, dir: Dir, path: []const u8, buf: []u8) Dir.ReadLinkError!usize {
+        try fs.cancelPoint();
+        const r = try fs.resolve(dir, path);
+        const n = r.node orelse return error.FileNotFound;
+        if (n.kind != .symlink) return error.NotLink;
+        const k = @min(buf.len, n.data.items.len);
+        @memcpy(buf[0..k], n.data.items[0..k]);
+        return k;
+    }
+
+    /// A second name for an existing file (never a directory, as on Linux).
+    pub fn hardLink(fs: *Fs, old_dir: Dir, old_path: []const u8, new_dir: Dir, new_path: []const u8, follow: bool) Dir.HardLinkError!void {
+        try fs.cancelPoint();
+        const from = if (follow) try fs.resolveFollow(old_dir, old_path) else try fs.resolve(old_dir, old_path);
+        const n = from.node orelse return error.FileNotFound;
+        return fs.linkNode(n, new_dir, new_path);
+    }
+
+    pub fn fileHardLink(fs: *Fs, file: File, new_dir: Dir, new_path: []const u8) File.HardLinkError!void {
+        try fs.cancelPoint();
+        const of = fs.fileOf(file) orelse return error.FileNotFound;
+        return fs.linkNode(of.node, new_dir, new_path);
+    }
+
+    fn linkNode(fs: *Fs, n: *Node, new_dir: Dir, new_path: []const u8) File.HardLinkError!void {
+        if (n.kind == .dir) return error.PermissionDenied;
+        if (n.nlink == 0) return error.FileNotFound;
+        const to = try fs.resolve(new_dir, new_path);
+        if (to.node != null) return error.PathAlreadyExists;
+        const parent = to.parent orelse return error.PathAlreadyExists;
+        fs.setEntry(parent, to.name, n, fs.newGroup()) catch return error.SystemResources;
+        n.ctime = fs.now();
+    }
+
+    /// The node a `(dir, path)` metadata call targets.
+    fn metaNode(fs: *Fs, dir: Dir, path: ?[]const u8, follow: bool) ResolveError!*Node {
+        const p = path orelse return fs.dirNode(dir, "");
+        const r = if (follow) try fs.resolveFollow(dir, p) else try fs.resolve(dir, p);
+        return r.node orelse error.FileNotFound;
+    }
+
+    pub fn setPermissions(fs: *Fs, n: *Node, perm: File.Permissions) void {
+        n.perm = perm;
+        n.ctime = fs.now();
+    }
+
+    pub fn setOwner(fs: *Fs, n: *Node, uid: ?File.Uid, gid: ?File.Gid) void {
+        if (uid) |u| n.uid = u;
+        if (gid) |g| n.gid = g;
+        n.ctime = fs.now();
+    }
+
+    pub fn setTimestamps(fs: *Fs, n: *Node, atime: File.SetTimestamp, mtime: File.SetTimestamp) void {
+        const t = fs.now();
+        switch (atime) {
+            .unchanged => {},
+            .now => n.atime = t,
+            .new => |ts| n.atime = ts.nanoseconds,
+        }
+        switch (mtime) {
+            .unchanged => {},
+            .now => n.mtime = t,
+            .new => |ts| n.mtime = ts.nanoseconds,
+        }
+        n.ctime = t;
+    }
+
+    pub fn nodeAt(fs: *Fs, dir: Dir, path: ?[]const u8, follow: bool) ResolveError!*Node {
+        return fs.metaNode(dir, path, follow);
+    }
+
+    pub fn nodeOfFile(fs: *Fs, file: File) ?*Node {
+        const of = fs.fileOf(file) orelse return null;
+        return of.node;
+    }
+
+    /// The path of an open file: its directory's path and the first name
+    /// under which that directory holds it (a hard-linked file has several).
+    pub fn fileRealPath(fs: *Fs, file: File, out: []u8) File.RealPathError!usize {
+        const of = fs.fileOf(file) orelse return error.FileNotFound;
+        const n = of.node;
+        if (n.kind == .dir) return fs.realPath(.{ .handle = file.handle }, null, out);
+        for (fs.nodes.items) |d| {
+            if (d.kind != .dir) continue;
+            const idx = std.mem.indexOfScalar(*Node, d.entries.values(), n) orelse continue;
+            const name = d.entries.keys()[idx];
+            const handle = fs.newHandle(.{ .node = d, .read = true, .write = false }) catch return error.SystemResources;
+            defer _ = fs.open.remove(handle);
+            const len = try fs.realPath(.{ .handle = handle }, null, out);
+            var w: std.Io.Writer = .fixed(out[len..]);
+            if (len == 1) w.writeAll(name) catch return error.NameTooLong else w.print("/{s}", .{name}) catch return error.NameTooLong;
+            return len + w.end;
+        }
+        return error.FileNotFound; // unlinked
     }
 
     // files
@@ -883,6 +1045,7 @@ pub const Fs = struct {
                 if (fs.host.sim.opts.fs.durability == .journal) fs.commit(null);
             },
             .dir => fs.commit(if (fs.host.sim.opts.fs.durability == .journal) null else n),
+            .symlink => {}, // a link's target is durable with its name
         }
     }
 

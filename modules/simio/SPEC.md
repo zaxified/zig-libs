@@ -32,8 +32,8 @@ check, seeded preemption at yield points (every network and disk call), a `.dead
 tasks can never wake; routed multi-hop paths with directed per-link faults, ICMP
 echo, and seeded short stream reads that surface framing bugs *(peers' READMEs
 mention none of these — inferred)*.
-**Where we are behind:** no symlinks or hard links, no memory maps, no in-repo
-consumer outside its own pilots yet.
+**Where we are behind:** no processes (madsim/turmoil do not have them either),
+no in-repo consumer outside its own pilots yet.
 
 ## Why this module exists
 
@@ -77,11 +77,13 @@ platform-free); file system and storage faults **in scope from the start**.
   real network to ask.
 - File system: per-host in-memory tree behind `Dir`/`File` (create, open, read,
   write, positional I/O, stat, length, set length, sync, rename, delete, dir
-  iteration, atomic create, locks), with a durability model (below).
+  iteration, atomic create, locks, symbolic and hard links, realpath, permissions,
+  owners and timestamps stored and reported, memory maps as the "file operations"
+  mapping `File.MemoryMap` allows), with a durability model (below).
 - `lockStderr`/`unlockStderr` (so `std.debug.print` works), `crashHandler`.
 
 **Out (the operation behaves exactly as in `std.Io.failing` — an error such as
-`error.NetworkDown` or `error.OperationUnsupported`, never a fabricated success):** processes (`processSpawn*`, `childWait`, `processReplace*`), memory maps,
+`error.NetworkDown` or `error.OperationUnsupported`, never a fabricated success):** processes (`processSpawn*`, `childWait`, `processReplace*`),
 DNS on the wire (a module's own resolver, like `dns`, runs against simulated name
 servers instead), `socketpair` (see above), Unix datagram sockets (std 0.16 has
 none), terminals beyond stderr, preemptive
@@ -383,4 +385,5 @@ of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
 
-- Memory maps over the simulated file system.
+Nothing open: every in-scope `std.Io` entry is implemented (2026-10-01).
+

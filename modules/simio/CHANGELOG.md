@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — The file system gains symbolic links (followed as POSIX does,
+  `SymLinkLoop` past 40), hard links, `File.realPath`, permissions/owners/timestamps
+  (stored and reported) and memory maps (the copy-and-sync mapping
+  `File.MemoryMap` allows). The differential oracle checks links, metadata and a
+  memory map against the real kernel.
 - **2026-10-01** — Unix-domain stream sockets (`UnixAddress.listen`/`connect`, by
   path or abstract name, per host). `socketpair` stays refused, matching std 0.16
   on Linux (an IP family, EOPNOTSUPP) — found by the differential oracle, which now

@@ -52,6 +52,24 @@ pub const vtable: Io.VTable = blk: {
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
     vt.netLookup = netLookup;
+    vt.fileMemoryMapCreate = fileMemoryMapCreate;
+    vt.fileMemoryMapDestroy = fileMemoryMapDestroy;
+    vt.fileMemoryMapSetLength = fileMemoryMapSetLength;
+    vt.fileMemoryMapRead = fileMemoryMapRead;
+    vt.fileMemoryMapWrite = fileMemoryMapWrite;
+    vt.dirSymLink = dirSymLink;
+    vt.dirReadLink = dirReadLink;
+    vt.dirHardLink = dirHardLink;
+    vt.fileHardLink = fileHardLink;
+    vt.fileRealPath = fileRealPath;
+    vt.dirSetPermissions = dirSetPermissions;
+    vt.dirSetFilePermissions = dirSetFilePermissions;
+    vt.fileSetPermissions = fileSetPermissions;
+    vt.dirSetOwner = dirSetOwner;
+    vt.dirSetFileOwner = dirSetFileOwner;
+    vt.fileSetOwner = fileSetOwner;
+    vt.dirSetTimestamps = dirSetTimestamps;
+    vt.fileSetTimestamps = fileSetTimestamps;
     vt.netListenUnix = netListenUnix;
     vt.netConnectUnix = netConnectUnix;
     vt.dirCreateDir = dirCreateDir;
@@ -395,8 +413,7 @@ fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
 }
 
 fn dirStatFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.StatFileOptions) Dir.StatFileError!File.Stat {
-    _ = options;
-    return fsOf(userdata).statFile(dir, sub_path);
+    return fsOf(userdata).statFile(dir, sub_path, options.follow_symlinks);
 }
 
 fn dirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.AccessOptions) Dir.AccessError!void {
@@ -580,4 +597,133 @@ fn netListenUnix(userdata: ?*anyopaque, address: *const net.UnixAddress, options
 fn netConnectUnix(userdata: ?*anyopaque, address: *const net.UnixAddress) net.UnixAddress.ConnectError!net.Socket.Handle {
     const h = hostOf(userdata);
     return h.sim.net.connectUnix(h, address);
+}
+
+// ── links and metadata ─────────────────────────────────────────────────────
+
+fn dirSymLink(userdata: ?*anyopaque, dir: Dir, target_path: []const u8, sym_link_path: []const u8, flags: Dir.SymLinkFlags) Dir.SymLinkError!void {
+    _ = flags;
+    return fsOf(userdata).symLink(dir, target_path, sym_link_path);
+}
+
+fn dirReadLink(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, buffer: []u8) Dir.ReadLinkError!usize {
+    return fsOf(userdata).readLink(dir, sub_path, buffer);
+}
+
+fn dirHardLink(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8, options: Dir.HardLinkOptions) Dir.HardLinkError!void {
+    return fsOf(userdata).hardLink(old_dir, old_sub_path, new_dir, new_sub_path, options.follow_symlinks);
+}
+
+fn fileHardLink(userdata: ?*anyopaque, file: File, new_dir: Dir, new_sub_path: []const u8, options: File.HardLinkOptions) File.HardLinkError!void {
+    _ = options;
+    return fsOf(userdata).fileHardLink(file, new_dir, new_sub_path);
+}
+
+fn fileRealPath(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPathError!usize {
+    return fsOf(userdata).fileRealPath(file, out_buffer);
+}
+
+fn dirSetPermissions(userdata: ?*anyopaque, dir: Dir, permissions: Dir.Permissions) Dir.SetPermissionsError!void {
+    const fs = fsOf(userdata);
+    fs.setPermissions(fs.nodeAt(dir, null, true) catch return error.FileNotFound, permissions);
+}
+
+fn dirSetFilePermissions(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: File.Permissions, options: Dir.SetFilePermissionsOptions) Dir.SetFilePermissionsError!void {
+    const fs = fsOf(userdata);
+    fs.setPermissions(fs.nodeAt(dir, sub_path, options.follow_symlinks) catch |err| return switch (err) {
+        error.NotDir => error.FileNotFound,
+        else => |e| e,
+    }, permissions);
+}
+
+fn fileSetPermissions(userdata: ?*anyopaque, file: File, permissions: File.Permissions) File.SetPermissionsError!void {
+    const fs = fsOf(userdata);
+    fs.setPermissions(fs.nodeOfFile(file) orelse return error.AccessDenied, permissions);
+}
+
+fn dirSetOwner(userdata: ?*anyopaque, dir: Dir, uid: ?File.Uid, gid: ?File.Gid) Dir.SetOwnerError!void {
+    const fs = fsOf(userdata);
+    fs.setOwner(fs.nodeAt(dir, null, true) catch return error.AccessDenied, uid, gid);
+}
+
+fn dirSetFileOwner(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, uid: ?File.Uid, gid: ?File.Gid, options: Dir.SetFileOwnerOptions) Dir.SetFileOwnerError!void {
+    const fs = fsOf(userdata);
+    // `Dir.SetFileOwnerError` has no tag for a missing path.
+    fs.setOwner(fs.nodeAt(dir, sub_path, options.follow_symlinks) catch |err| return switch (err) {
+        error.BadPathName => error.BadPathName,
+        else => error.AccessDenied,
+    }, uid, gid);
+}
+
+fn fileSetOwner(userdata: ?*anyopaque, file: File, uid: ?File.Uid, gid: ?File.Gid) File.SetOwnerError!void {
+    const fs = fsOf(userdata);
+    fs.setOwner(fs.nodeOfFile(file) orelse return error.AccessDenied, uid, gid);
+}
+
+fn dirSetTimestamps(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.SetTimestampsOptions) Dir.SetTimestampsError!void {
+    const fs = fsOf(userdata);
+    // `Dir.SetTimestampsError` has no tag for a missing path either.
+    fs.setTimestamps(fs.nodeAt(dir, sub_path, options.follow_symlinks) catch |err| return switch (err) {
+        error.BadPathName => error.BadPathName,
+        else => error.AccessDenied,
+    }, options.access_timestamp, options.modify_timestamp);
+}
+
+fn fileSetTimestamps(userdata: ?*anyopaque, file: File, options: File.SetTimestampsOptions) File.SetTimestampsError!void {
+    const fs = fsOf(userdata);
+    fs.setTimestamps(fs.nodeOfFile(file) orelse return error.AccessDenied, options.access_timestamp, options.modify_timestamp);
+}
+
+// ── memory maps ────────────────────────────────────────────────────────────
+//
+// The "file operations" mapping `File.MemoryMap` allows: memory is a copy of
+// the file that `read` refreshes and `write` puts back, so every byte goes
+// through the simulated disk (faults, the crash model). The copy comes from
+// the host's allocator, which a crash releases with the host.
+
+const page = std.heap.page_size_min;
+
+fn fileMemoryMapCreate(userdata: ?*anyopaque, file: File, options: File.MemoryMap.CreateOptions) File.MemoryMap.CreateError!File.MemoryMap {
+    const h = hostOf(userdata);
+    const node = h.fs.nodeOfFile(file) orelse return error.AccessDenied;
+    if (node.kind != .file) return error.AccessDenied;
+    const memory = try h.allocator().alignedAlloc(u8, .fromByteUnits(page), options.len);
+    @memset(memory, 0);
+    var mm: File.MemoryMap = .{ .file = file, .offset = options.offset, .memory = memory, .section = {} };
+    fileMemoryMapRead(userdata, &mm) catch |err| {
+        h.allocator().free(memory);
+        return err;
+    };
+    return mm;
+}
+
+fn fileMemoryMapDestroy(userdata: ?*anyopaque, mm: *File.MemoryMap) void {
+    hostOf(userdata).allocator().free(mm.memory);
+    mm.* = undefined;
+}
+
+fn fileMemoryMapSetLength(userdata: ?*anyopaque, mm: *File.MemoryMap, len: usize) File.MemoryMap.SetLengthError!void {
+    _ = userdata;
+    _ = mm;
+    _ = len;
+    return error.OperationUnsupported; // the documented answer: destroy and create
+}
+
+fn fileMemoryMapRead(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
+    const fs = fsOf(userdata);
+    var done: usize = 0;
+    while (done < mm.memory.len) {
+        const n = try fs.readAt(mm.file, &.{mm.memory[done..]}, mm.offset + done);
+        if (n == 0) break;
+        done += n;
+    }
+    @memset(mm.memory[done..], 0); // past the file's end
+}
+
+fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
+    const fs = fsOf(userdata);
+    var done: usize = 0;
+    while (done < mm.memory.len) {
+        done += try fs.writeAtFile(mm.file, "", &.{mm.memory[done..]}, 1, mm.offset + done);
+    }
 }
