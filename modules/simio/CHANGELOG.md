@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — ssh pilot: the real client and server over simulated TCP
+  through crashes and seeded packet faults; a single-attempt client is caught
+  losing the result. It needed `ssh` to draw entropy through `std.Io`.
+- **2026-10-01** — Fix: a group none of whose tasks were alive any more (its
+  owner discarded without unwinding) leaked its state at `deinit` and at a crash;
+  group states are now tracked in a registry.
 - **2026-10-01** — Simulated socket and file handles start at 2^30: code that
   bypasses `std.Io` with a raw syscall on one gets `EBADF` instead of
   operating on a real descriptor of the test process.

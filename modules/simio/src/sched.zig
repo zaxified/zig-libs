@@ -183,6 +183,8 @@ pub const Fiber = struct {
 };
 
 const GroupState = struct {
+    /// The host whose tasks the group runs; a crash takes the group with it.
+    host: *Host,
     members: std.ArrayList(*Fiber) = .empty,
     awaiter: ?*Fiber = null,
     /// `groupCancel` ran, or the awaiter was canceled: members added later
@@ -424,6 +426,9 @@ pub const Sim = struct {
     /// deadlock or the step limit left behind. Invariant: `ready` has
     /// capacity for all of them, so waking a task never allocates.
     fibers: std.AutoArrayHashMapUnmanaged(*Fiber, void) = .empty,
+    /// Every group with state, so state a discarded task left behind (a
+    /// group nobody awaits any more) is freed with its host or the sim.
+    groups: std.AutoArrayHashMapUnmanaged(*GroupState, void) = .empty,
     invariant: ?struct { check: *const fn (sim: *Sim, ctx: ?*anyopaque) anyerror!void, ctx: ?*anyopaque } = null,
     owner: std.Thread.Id,
 
@@ -444,22 +449,13 @@ pub const Sim = struct {
         // Tasks still alive (deadlocked, or cut off by the step limit) and
         // futures nobody awaited are discarded without unwinding — their
         // stacks are simply unmapped. Their groups go with them.
-        const gpa = sim.gpa; // `sim` is undefined by the time the defer runs
-        var groups: std.AutoArrayHashMapUnmanaged(*GroupState, void) = .empty;
-        defer groups.deinit(gpa);
-        for (sim.hosts.items) |h| if (h.root_group.token.raw) |token| {
-            groups.put(sim.gpa, @ptrCast(@alignCast(token)), {}) catch {};
-        };
-        while (sim.fibers.count() > 0) {
-            const f = sim.fibers.keys()[sim.fibers.count() - 1];
-            if (f.group) |g| groups.put(sim.gpa, g, {}) catch {};
-            sim.destroyFiber(f);
-        }
+        while (sim.fibers.count() > 0) sim.destroyFiber(sim.fibers.keys()[sim.fibers.count() - 1]);
         sim.fibers.deinit(sim.gpa);
-        for (groups.keys()) |g| {
+        for (sim.groups.keys()) |g| {
             g.members.deinit(sim.gpa);
             sim.gpa.destroy(g);
         }
+        sim.groups.deinit(sim.gpa);
         while (sim.events.pop()) |e| switch (e.kind) {
             .wake, .fault => {},
             .net => |ev| sim.net.dropEvent(ev),
@@ -574,20 +570,20 @@ pub const Sim = struct {
         }
         // Their groups go with them (the root group's state, and any group
         // one of them created).
-        var groups: std.AutoArrayHashMapUnmanaged(*GroupState, void) = .empty;
-        defer groups.deinit(sim.gpa);
-        if (h.root_group.token.raw) |token| groups.put(sim.gpa, @ptrCast(@alignCast(token)), {}) catch {};
         h.root_group = .init;
         i = sim.fibers.count();
         while (i > 0) {
             i -= 1;
             const f = sim.fibers.keys()[i];
             if (f.host != h) continue;
-            if (f.group) |g| groups.put(sim.gpa, g, {}) catch {};
-            if (f.wait == .group) groups.put(sim.gpa, f.wait.group, {}) catch {};
             sim.destroyFiber(f); // wake events still naming it are now stale
         }
-        for (groups.keys()) |g| {
+        i = sim.groups.count();
+        while (i > 0) {
+            i -= 1;
+            const g = sim.groups.keys()[i];
+            if (g.host != h) continue;
+            sim.groups.swapRemoveAt(i);
             g.members.deinit(sim.gpa);
             sim.gpa.destroy(g);
         }
@@ -1027,16 +1023,20 @@ pub const Sim = struct {
 
     // ── groups ──────────────────────────────────────────────────────────────
 
-    fn groupState(sim: *Sim, group: *Io.Group) Allocator.Error!*GroupState {
+    fn groupState(sim: *Sim, host: *Host, group: *Io.Group) Allocator.Error!*GroupState {
         if (group.token.raw) |token| return @ptrCast(@alignCast(token));
+        try sim.groups.ensureUnusedCapacity(sim.gpa, 1);
         const g = try sim.gpa.create(GroupState);
-        g.* = .{};
+        g.* = .{ .host = host };
+        sim.groups.putAssumeCapacity(g, {});
         group.token.raw = g;
         return g;
     }
 
     fn releaseGroup(sim: *Sim, group: *Io.Group, g: *GroupState) void {
         assert(g.members.items.len == 0);
+        const registered = sim.groups.swapRemove(g);
+        assert(registered);
         g.members.deinit(sim.gpa);
         sim.gpa.destroy(g);
         group.token.raw = null;
@@ -1051,7 +1051,7 @@ pub const Sim = struct {
         context_align: Alignment,
         start: *const fn (context: *const anyopaque) void,
     ) error{OutOfMemory}!*Fiber {
-        const g = try sim.groupState(group);
+        const g = try sim.groupState(host, group);
         try g.members.ensureUnusedCapacity(sim.gpa, 1);
         const f = try sim.createFiber(host, .{ .group = start }, context, context_align, 0, .@"1");
         f.group = g;

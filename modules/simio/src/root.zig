@@ -75,4 +75,5 @@ test {
     _ = @import("pilots/sntp.zig");
     _ = @import("pilots/dns.zig");
     _ = @import("pilots/mqtt.zig");
+    _ = @import("pilots/ssh.zig");
 }

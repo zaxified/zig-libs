@@ -269,6 +269,18 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   clean-session-after-restart variant is caught losing messages. Needed `TcpServer`
   to stop polling the raw socket and reading `clock_gettime` (now a watchdog task per
   connection and `Io` time).
+- **ssh** (2026-10-01): the real client and server over simulated TCP — key
+  exchange, publickey userauth, one `exec` through a 4 KiB window — with a server
+  crash mid-session, 20 seeds of loss/duplication/partitions/crashes of either
+  side, and a client that gives up after one broken connection caught losing the
+  result. **Found a defect** in the readiness check: ephemeral keys, KEXINIT
+  cookies and padding came from getrandom(2) behind `std.Io`, so the same seed gave
+  a different session. Fixed in `ssh` (`transport.Entropy`, `Transport.entropy =
+  .{ .io = io }`); the pilot asserts an identical exchange hash across runs, for
+  ed25519 and for ECDSA host keys (whose signature length depends on the hash).
+  Also found a simio leak: a group none of whose tasks were alive any more (its
+  owner discarded without unwinding) was freed neither by `deinit` nor by a crash;
+  simio now keeps a registry of group states.
 
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
@@ -286,12 +298,16 @@ some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simul
   variant without them, or std-level preallocate/datasync.
 - **icmp**: raw `std.os.linux` socket syscalls throughout; needs a `std.Io`-based
   backend (`bind` with `.dgram` + `protocol = .icmp`) before a pilot.
-- **ssh**: reached through `std.Io` streams; not yet checked for clock reads.
 
 Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` instead
 of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
+
+- `checkDeterminism` compares a fingerprint of scheduling and virtual time, not of
+  the data: entropy drawn outside `std.Io` that changes bytes but not sizes passes
+  it (the ssh pilot compares exchange hashes itself). A `Case.digest` hook folding
+  application state into the comparison would make that check generic.
 
 - Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
 - A simulated resolver for `netLookup` (hosts by name).

@@ -300,6 +300,31 @@ test "group cancel stops the members still sleeping" {
     try testing.expectEqual(@as(u64, 25 * ns_per_s), r.now_ns);
 }
 
+/// Starts a group whose members finish at once, then outlives them without
+/// ever awaiting it: the group's state is then held by no task at all.
+fn groupNeverAwaited(io: Io, done: *u32) !void {
+    var g: Io.Group = .init;
+    for (0..3) |_| g.async(io, member, .{ io, done, 0 });
+    try io.sleep(.fromSeconds(3600), .awake);
+    g.cancel(io);
+}
+
+test "a group left behind by a discarded task is freed by deinit and by a crash" {
+    // ssh pilot finding: neither path found a group none of whose tasks were
+    // still alive, and `testing.allocator` reported its state as leaked.
+    for ([_]bool{ false, true }) |crash| {
+        var sim: Sim = undefined;
+        newSim(&sim, 31);
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        var done: u32 = 0;
+        try h.spawn(groupNeverAwaited, .{ h.io(), &done });
+        if (crash) try sim.scheduleFault(ns_per_s, .{ .crash = h.id });
+        _ = sim.runFor(2 * ns_per_s);
+        try testing.expectEqual(@as(u32, 3), done);
+    }
+}
+
 fn awaitGroupThenReport(io: Io, done: *u32, result: *?anyerror) void {
     var g: Io.Group = .init;
     for (1..4) |i| g.async(io, member, .{ io, done, i * 10 });
