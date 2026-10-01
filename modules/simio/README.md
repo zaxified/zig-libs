@@ -7,12 +7,13 @@ virtual, and every choice the simulator makes is drawn from one seed. A run is
 a pure function of its seed, so a failure found on seed 1234 is reproduced by
 running seed 1234 again.
 
-- **Status:** M1 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler —
-  tasks, groups, cancelation, futex (`Io.Mutex`, `Io.Condition`), clocks,
-  sleep, timeouts, seeded randomness. The simulated network, file system and
-  fault search (on [`netsim`](../netsim)) are next.
+- **Status:** M2 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
+  (tasks, groups, cancelation, futex, clocks, sleep, timeouts, seeded
+  randomness) and the network (streams, datagrams, ICMP echo over routed,
+  faulty links). Fault schedules with replay/shrink, the file system and the
+  pilots are next.
 - **Platform:** Linux on x86_64, aarch64 or riscv64 (`std.Io.fiber`).
-- **Deps:** `netsim` (its seeded PRNG today; its network model from M2).
+- **Deps:** `netsim` (its seeded PRNG; its fault vocabulary from M3).
 - **Model after:** tokio-rs/turmoil, madsim, FoundationDB's simulation testing.
 
 ## Use
@@ -52,6 +53,25 @@ test "my protocol under 200 schedules" {
   wall-clock read, a thread, an address-keyed map outside `std.Io`).
 - `Options.schedule = .fifo` with no preemption is the "obvious" order;
   `.random` (default) plus `preempt_permille` explores interleavings.
+
+### The network
+
+```zig
+const a = try sim.addHost(.{});            // 10.0.0.1
+const b = try sim.addHost(.{});            // 10.0.0.2
+try sim.link(a, b, .{ .latency_ns = 5 * std.time.ns_per_ms, .loss_permille = 20 });
+try b.spawn(server, .{ b.io() });          // listen/accept as usual
+try a.spawn(client, .{ a.io() });          // connect to 10.0.0.2
+_ = sim.runFor(10 * std.time.ns_per_s);    // servers never finish: run a while
+try sim.setLinkUp(a, b, false);            // partition, then run on
+```
+
+- Streams behave like TCP as an application sees it: refused, reset, timeouts,
+  a flow-control window, end of stream on the peer's close — and reads that
+  are sometimes short, on purpose.
+- Datagrams can be lost, duplicated, reordered or have a bit flipped, per
+  link. `bind` with `protocol = .icmp` gives a ping socket the target answers.
+- Hosts with several links route over the shortest path that is up.
 
 Operations simio does not simulate yet behave as in `std.Io.failing` (an
 error, never a fake success).

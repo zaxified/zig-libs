@@ -6,8 +6,9 @@
 //! is a fiber on one OS thread, time is virtual, and every choice the
 //! simulator makes is drawn from one seed, so a run is a pure function of that
 //! seed and replays exactly. The network, the file system and fault injection
-//! build on `netsim` (see SPEC.md for the milestones; this is M1, the
-//! scheduler: tasks, groups, cancelation, futex, clocks, sleep, randomness).
+//! build on `netsim` (see SPEC.md for the milestones; M1 is the scheduler —
+//! tasks, groups, cancelation, futex, clocks, sleep, randomness — and M2 the
+//! network: streams, datagrams and ICMP echo over routed, faulty links).
 //!
 //! ```zig
 //! var sim: simio.Sim = undefined;
@@ -22,7 +23,7 @@ const std = @import("std");
 const sched = @import("sched.zig");
 
 pub const meta = .{
-    .doc = "Deterministic std.Io for simulation testing — fibers on one thread, virtual time, seeded scheduling; real std.Io code runs unchanged (network/FS on netsim in progress)",
+    .doc = "Deterministic std.Io for simulation testing — real std.Io code runs unchanged on fibers in virtual time, over simulated streams, datagrams and ICMP on routed faulty links; seeded and replayable",
     .platform_note = "linux (x86_64, aarch64, riscv64: std.Io.fiber)",
     .targets = .{.linux64},
     .platform = .linux,
@@ -38,10 +39,14 @@ pub const Options = sched.Options;
 pub const HostOptions = sched.HostOptions;
 pub const Outcome = sched.Outcome;
 pub const RunResult = sched.RunResult;
+pub const LinkConfig = @import("net.zig").LinkConfig;
+pub const NetOptions = @import("net.zig").NetOptions;
 
 test {
     _ = @import("stack.zig");
     _ = @import("sched.zig");
     _ = @import("vtable.zig");
+    _ = @import("net.zig");
     _ = @import("tests.zig");
+    _ = @import("net_tests.zig");
 }

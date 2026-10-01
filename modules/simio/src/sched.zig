@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const netsim = @import("netsim");
 const stack_mod = @import("stack.zig");
+const net_mod = @import("net.zig");
 
 const Io = std.Io;
 const Alignment = std.mem.Alignment;
@@ -51,11 +52,17 @@ pub const Options = struct {
     /// Wall-clock time of simulated instant 0, nanoseconds since the Unix
     /// epoch. Default: 2026-01-01T00:00:00Z.
     epoch_ns: i96 = 1_767_225_600 * std.time.ns_per_s,
+    /// The simulated network's behaviour (streams, timeouts, short reads).
+    net: net_mod.NetOptions = .{},
 };
 
 pub const HostOptions = struct {
     /// Offset of this host's real-time clock from the simulation's, ns.
     clock_skew_ns: i64 = 0,
+    /// IPv4 address. Default: 10.0.0.0 + host index + 1.
+    ip4: ?[4]u8 = null,
+    /// IPv6 address. Default: fd00:: + host index + 1.
+    ip6: ?[16]u8 = null,
 };
 
 pub const Outcome = enum {
@@ -66,6 +73,8 @@ pub const Outcome = enum {
     deadlock,
     /// `Options.max_steps` scheduling decisions were made.
     step_limit,
+    /// `runFor`'s duration elapsed; call `run`/`runFor` again to continue.
+    time_limit,
 };
 
 pub const RunResult = struct {
@@ -80,14 +89,18 @@ pub const RunResult = struct {
 
 const State = enum { ready, running, blocked, done };
 
-const WakeReason = enum { normal, timeout, canceled };
+pub const WakeReason = enum { normal, timeout, canceled };
 
-const Wait = union(enum) {
+pub const Wait = union(enum) {
     none,
     futex: *const u32,
     sleep,
     await_future,
     group: *GroupState,
+    /// Waiting for a socket's state to change.
+    sock: *net_mod.Sock,
+    /// Waiting for any socket of an `Io.Batch` (registered on each).
+    batch,
 };
 
 const Task = union(enum) {
@@ -95,7 +108,7 @@ const Task = union(enum) {
     group: *const fn (context: *const anyopaque) void,
 };
 
-const Fiber = struct {
+pub const Fiber = struct {
     context: fiber.Context,
     sim: *Sim,
     host: *Host,
@@ -131,6 +144,12 @@ const Fiber = struct {
         assert(f.cancelPending());
         f.cancel_acked = true;
     }
+
+    /// Records that `error.Canceled` is being returned for the pending
+    /// request (after a wait ended with `.canceled`).
+    pub fn acknowledgeCancel(f: *Fiber) void {
+        f.acknowledge();
+    }
 };
 
 const GroupState = struct {
@@ -143,15 +162,25 @@ const GroupState = struct {
     awaiter_canceled: bool = false,
 };
 
-const Timer = struct {
+const Event = struct {
     at: u64,
     seq: u64,
-    fiber: *Fiber,
-    gen: u64,
+    kind: union(enum) {
+        /// End a task's wait with `.timeout`, unless that wait already ended.
+        wake: struct { fiber: *Fiber, gen: u64 },
+        net: net_mod.Event,
+    },
 
-    fn order(_: void, a: Timer, b: Timer) std.math.Order {
+    fn order(_: void, a: Event, b: Event) std.math.Order {
         if (a.at != b.at) return std.math.order(a.at, b.at);
         return std.math.order(a.seq, b.seq);
+    }
+
+    fn stale(e: Event) bool {
+        return switch (e.kind) {
+            .wake => |w| w.gen != w.fiber.wait_gen or w.fiber.state != .blocked,
+            .net => false,
+        };
     }
 };
 
@@ -161,6 +190,13 @@ pub const Host = struct {
     id: u32,
     prng: Prng,
     clock_skew_ns: i64,
+    ip4: [4]u8,
+    ip6: [16]u8,
+    /// False while the host is crashed (M3); a down host is unreachable.
+    up: bool = true,
+    handles: std.AutoHashMapUnmanaged(Io.net.Socket.Handle, *net_mod.Sock) = .empty,
+    next_handle: Io.net.Socket.Handle = 3,
+    next_port: u16 = 49152,
     root_group: Io.Group = .init,
     /// The first error a root task (`spawn`) returned, if any.
     failure: ?anyerror = null,
@@ -225,7 +261,8 @@ pub const Sim = struct {
     sched_context: fiber.Context = undefined,
     current: ?*Fiber = null,
     ready: std.ArrayList(*Fiber) = .empty,
-    timers: std.PriorityQueue(Timer, void, Timer.order) = .empty,
+    events: std.PriorityQueue(Event, void, Event.order) = .empty,
+    net: net_mod.Net,
     futex_waiters: std.ArrayList(*Fiber) = .empty,
     hosts: std.ArrayList(*Host) = .empty,
     free_stacks: std.ArrayList(stack_mod.Stack) = .empty,
@@ -241,8 +278,10 @@ pub const Sim = struct {
             .gpa = gpa,
             .opts = opts,
             .prng = .init(opts.seed),
+            .net = undefined,
             .owner = std.Thread.getCurrentId(),
         };
+        sim.net = .init(sim, opts.seed);
     }
 
     pub fn deinit(sim: *Sim) void {
@@ -266,10 +305,18 @@ pub const Sim = struct {
             g.members.deinit(sim.gpa);
             sim.gpa.destroy(g);
         }
-        for (sim.hosts.items) |h| sim.gpa.destroy(h);
+        while (sim.events.pop()) |e| switch (e.kind) {
+            .wake => {},
+            .net => |ev| sim.net.dropEvent(ev),
+        };
+        sim.events.deinit(sim.gpa);
+        sim.net.deinit();
+        for (sim.hosts.items) |h| {
+            h.handles.deinit(sim.gpa);
+            sim.gpa.destroy(h);
+        }
         sim.hosts.deinit(sim.gpa);
         sim.ready.deinit(sim.gpa);
-        sim.timers.deinit(sim.gpa);
         sim.futex_waiters.deinit(sim.gpa);
         for (sim.free_stacks.items) |s| stack_mod.unmap(s);
         sim.free_stacks.deinit(sim.gpa);
@@ -280,9 +327,14 @@ pub const Sim = struct {
         const h = try sim.gpa.create(Host);
         errdefer sim.gpa.destroy(h);
         const id: u32 = @intCast(sim.hosts.items.len);
+        const n: u32 = id + 1;
+        var ip6: [16]u8 = .{ 0xfd, 0 } ++ .{0} ** 14;
+        std.mem.writeInt(u32, ip6[12..16], n, .big);
         h.* = .{
             .sim = sim,
             .id = id,
+            .ip4 = opts.ip4 orelse .{ 10, @truncate(n >> 16), @truncate(n >> 8), @truncate(n) },
+            .ip6 = opts.ip6 orelse ip6,
             // An independent stream per host, so adding a host does not
             // perturb the draws another host's code sees.
             .prng = .init(sim.opts.seed ^ (0x9e3779b97f4a7c15 *% (@as(u64, id) + 1))),
@@ -299,16 +351,46 @@ pub const Sim = struct {
         return sim.fingerprint_state;
     }
 
+    /// Connects two hosts with a bidirectional link (or reconfigures and
+    /// raises an existing one).
+    pub fn link(sim: *Sim, a: *Host, b: *Host, cfg: net_mod.LinkConfig) Allocator.Error!void {
+        return sim.net.link(a.id, b.id, cfg);
+    }
+
+    /// Links every pair of hosts added so far.
+    pub fn linkAll(sim: *Sim, cfg: net_mod.LinkConfig) Allocator.Error!void {
+        for (sim.hosts.items, 0..) |a, i| for (sim.hosts.items[i + 1 ..]) |b| try sim.link(a, b, cfg);
+    }
+
+    /// Takes a link down or brings it back up. Packets already in flight on
+    /// a path that breaks are lost; streams retransmit until it heals.
+    pub fn setLinkUp(sim: *Sim, a: *Host, b: *Host, up: bool) error{NoSuchLink}!void {
+        return sim.net.setLinkUp(a.id, b.id, up);
+    }
+
     /// Runs until nothing can make progress (or the step limit). Callable
     /// again after spawning more tasks.
     pub fn run(sim: *Sim) RunResult {
+        return sim.runUntil(null);
+    }
+
+    /// Runs for at most `duration_ns` of virtual time; returns `.time_limit`
+    /// when that time is reached with work still pending.
+    pub fn runFor(sim: *Sim, duration_ns: u64) RunResult {
+        return sim.runUntil(sim.now +| duration_ns);
+    }
+
+    fn runUntil(sim: *Sim, limit: ?u64) RunResult {
         sim.assertOwner();
         assert(sim.current == null);
         while (true) {
             if (sim.steps >= sim.opts.max_steps) return sim.runResult(.step_limit);
             if (sim.ready.items.len == 0) {
-                if (!sim.fireTimers()) break;
-                continue;
+                switch (sim.fireEvents(limit)) {
+                    .fired => continue,
+                    .idle => break,
+                    .limit => return sim.runResult(.time_limit),
+                }
             }
             const idx = switch (sim.opts.schedule) {
                 .fifo => 0,
@@ -341,31 +423,50 @@ pub const Sim = struct {
         if (std.debug.runtime_safety) assert(std.Thread.getCurrentId() == sim.owner);
     }
 
-    // ── timers ──────────────────────────────────────────────────────────────
+    // ── events ──────────────────────────────────────────────────────────────
 
-    /// Advances virtual time to the earliest live timer and fires every timer
-    /// due by then. Returns false when no timer is pending.
-    fn fireTimers(sim: *Sim) bool {
-        while (sim.timers.peek()) |t| {
-            if (t.gen != t.fiber.wait_gen or t.fiber.state != .blocked) {
-                _ = sim.timers.pop(); // stale: that wait already ended
+    /// Advances virtual time to the earliest live event and fires every
+    /// event due by then (including ones those events schedule for the same
+    /// instant).
+    fn fireEvents(sim: *Sim, limit: ?u64) enum { fired, idle, limit } {
+        while (sim.events.peek()) |e| {
+            if (e.stale()) {
+                _ = sim.events.pop(); // that wait already ended
                 continue;
             }
-            if (t.at > sim.now) sim.now = t.at;
+            if (limit) |l| if (e.at > l) {
+                sim.now = @max(sim.now, l);
+                return .limit;
+            };
+            if (e.at > sim.now) sim.now = e.at;
             break;
-        } else return false;
-        while (sim.timers.peek()) |t| {
-            if (t.at > sim.now) break;
-            _ = sim.timers.pop();
-            if (t.gen != t.fiber.wait_gen or t.fiber.state != .blocked) continue;
-            sim.wake(t.fiber, .timeout);
+        } else {
+            if (limit) |l| sim.now = @max(sim.now, l);
+            return .idle;
         }
-        return true;
+        while (sim.events.peek()) |e| {
+            if (e.at > sim.now) break;
+            _ = sim.events.pop();
+            switch (e.kind) {
+                .wake => |w| if (!e.stale()) sim.wake(w.fiber, .timeout),
+                .net => |ev| {
+                    sim.mix(e.seq);
+                    sim.net.fire(ev);
+                },
+            }
+        }
+        return .fired;
     }
 
     fn armTimer(sim: *Sim, f: *Fiber, at: u64) Allocator.Error!void {
         sim.seq += 1;
-        try sim.timers.push(sim.gpa, .{ .at = at, .seq = sim.seq, .fiber = f, .gen = f.wait_gen });
+        try sim.events.push(sim.gpa, .{ .at = at, .seq = sim.seq, .kind = .{ .wake = .{ .fiber = f, .gen = f.wait_gen } } });
+    }
+
+    /// Queues a network event (internal, for `net.zig`).
+    pub fn scheduleNet(sim: *Sim, at: u64, ev: net_mod.Event) Allocator.Error!void {
+        sim.seq += 1;
+        try sim.events.push(sim.gpa, .{ .at = at, .seq = sim.seq, .kind = .{ .net = ev } });
     }
 
     // ── fibers ──────────────────────────────────────────────────────────────
@@ -506,7 +607,8 @@ pub const Sim = struct {
             @panic("simio: std.Io used outside a simulated task (call it from a task started by Host.spawn)");
     }
 
-    fn wake(sim: *Sim, f: *Fiber, reason: WakeReason) void {
+    /// Ends a task's wait (internal, for `net.zig`).
+    pub fn wake(sim: *Sim, f: *Fiber, reason: WakeReason) void {
         assert(f.state == .blocked);
         switch (f.wait) {
             .futex => {
@@ -515,6 +617,11 @@ pub const Sim = struct {
                     break;
                 };
             },
+            .sock => |s| for (s.waiters.items, 0..) |w, i| if (w == f) {
+                _ = s.waiters.orderedRemove(i);
+                break;
+            },
+            .batch => sim.net.unwaitAll(f.host, f),
             else => {},
         }
         f.wait = .none;
@@ -526,8 +633,8 @@ pub const Sim = struct {
     }
 
     /// Parks the running task until something wakes it. Only arming a timer
-    /// can fail; the wake itself never allocates.
-    fn block(sim: *Sim, f: *Fiber, wait: Wait, cancelable: bool, deadline: ?u64) Allocator.Error!WakeReason {
+    /// can fail; the wake itself never allocates. (Internal, for `net.zig`.)
+    pub fn block(sim: *Sim, f: *Fiber, wait: Wait, cancelable: bool, deadline: ?u64) Allocator.Error!WakeReason {
         assert(f == sim.current);
         if (deadline) |at| try sim.armTimer(f, at);
         f.state = .blocked;
@@ -549,8 +656,17 @@ pub const Sim = struct {
         assert(f.state == .running);
     }
 
+    /// A cancelation point (internal, for `net.zig`).
+    pub fn cancelPoint(sim: *Sim, f: *Fiber) error{Canceled}!void {
+        _ = sim;
+        if (f.cancelPending()) {
+            f.acknowledge();
+            return error.Canceled;
+        }
+    }
+
     /// Converts a `Timeout` on host `h` into an absolute virtual deadline.
-    fn deadlineOf(sim: *const Sim, h: *const Host, timeout: Io.Timeout) ?u64 {
+    pub fn deadlineOf(sim: *const Sim, h: *const Host, timeout: Io.Timeout) ?u64 {
         const delta: i96 = switch (timeout) {
             .none => return null,
             .duration => |d| d.raw.nanoseconds,
@@ -567,7 +683,7 @@ pub const Sim = struct {
         f.cancel_requested = true;
         if (f.state != .blocked or !f.cancelable or f.protection != .unblocked) return;
         switch (f.wait) {
-            .futex, .sleep => sim.wake(f, .canceled),
+            .futex, .sleep, .sock, .batch => sim.wake(f, .canceled),
             .group => |g| {
                 // The awaiter keeps waiting; the request propagates to the
                 // members and surfaces when the group is done.

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — M2, the network: hosts get IPv4/IPv6 addresses, `Sim.link`/
+  `linkAll`/`setLinkUp` build a topology routed over shortest paths, and
+  `std.Io.net` works on it — TCP-like streams (handshake with SYN retry,
+  refused/reset/timeout, in-order delivery with loss as retransmission delay,
+  partitions with backoff and a user timeout, flow-control window, FIN/RST on
+  close, `shutdown`, seeded short reads), UDP-like datagrams (loss,
+  duplication, reorder, one-bit corruption), ICMP echo answered by the target
+  host, and `operate`/`Batch` so `Socket.receiveTimeout` works. `Sim.runFor`
+  runs for a span of virtual time (new `Outcome.time_limit`).
 - **2026-10-01** — New module: a deterministic `std.Io` for simulation
   testing, so code written against `std.Io` runs unchanged on simulated hosts
   as a pure function of a seed. This first cut (SPEC milestone M1) is the

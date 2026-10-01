@@ -26,11 +26,13 @@ competitor source was read.
 | [cozis/Zigmulator](https://github.com/cozis/Zigmulator) | Zig | none stated | 4 | push 2026-06-20 | Experimental DST framework for Zig 0.16 running Zig programs with injected I/O faults (its README). |
 | [shadow/shadow](https://github.com/shadow/shadow) | Rust | BSD-style | 1.7k | v3.3.0 (2025-10-16) | Runs unmodified Linux binaries in a simulated network, deterministic and replayable (its README). |
 
-**Where we are ahead:** nothing yet beyond what the scheduler itself gives: a schedule
-fingerprint per run, seeded preemption at yield points, and a `.deadlock` outcome that
-names how many tasks can never wake. **Where we are behind:** everything past M1 — no
-network, no file system, no fault injection, no replay/shrink (the SPEC milestones
-M2–M5; marionette and turmoil have all of it).
+**Where we are ahead:** a schedule fingerprint per run, seeded preemption at yield
+points, a `.deadlock` outcome that names how many tasks can never wake; routed
+multi-hop paths with per-link faults, ICMP echo, and seeded short stream reads that
+surface framing bugs *(peers' READMEs mention none of these three — inferred)*.
+**Where we are behind:** no file system or storage faults, no scheduled fault
+injection, no replay/shrink of a fault trace (milestones M3–M5; marionette and
+turmoil have them), no Unix sockets.
 
 ## Why this module exists
 
@@ -132,8 +134,14 @@ consumer's to remove.
    cancel + cancel protection, groups. Tests: `Io.Mutex`/`Condition`/`Group`
    programs; same seed ⇒ same trace; different seeds explore different interleavings
    (a planted ordering bug is found within a bounded seed range).
-2. **M2 — network.** Hosts with IPs, TCP-like streams and UDP-like datagrams over
-   netsim links, ICMP echo, fragmentation, corruption, resets.
+2. **M2 — network** ✅ 2026-10-01. Hosts with IPs (10.0.0.n / fd00::n by default),
+   links (`Sim.link`/`linkAll`/`setLinkUp`), routed shortest paths, TCP-like streams
+   (handshake, SYN retry, RST/refused, FIFO pipes with RTO delay on loss, partition
+   backoff and user timeout, flow-control window, FIN/RST on close, shutdown, seeded
+   short reads), UDP-like datagrams (loss, duplication, reorder, one-bit corruption,
+   receive buffer), ICMP echo answered by the target's stack (ping-socket semantics),
+   `operate`/`Batch` for `receiveTimeout`, `Sim.runFor`. Corruption is a per-link
+   rate here; as a scheduled one-shot fault it comes with M3's fault vocabulary.
 3. **M3 — lifecycle and search.** Crash/restart, invariants after every event,
    `run`/`replay`/`findFailing`/shrink, the determinism self-check.
 4. **M4 — file system + storage faults.** In-memory tree, durability model, crash
