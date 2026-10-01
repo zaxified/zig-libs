@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Mutation run (46 schemata, 42 killed, 4 equivalent — see
+  SPEC.md): nine new tests, and `Host.liveAllocations()` to observe what a
+  crash releases.
 - **2026-10-01** — M3, crashes and fault search: `Sim.crash`/`restart` with
   `Host.spawnBoot` and `Host.allocator()` (a crash stops tasks without
   unwinding, drops their sockets silently and releases their memory),

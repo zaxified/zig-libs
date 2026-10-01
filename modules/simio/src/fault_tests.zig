@@ -327,3 +327,74 @@ test "checkDeterminism catches code that depends on state outside the simulation
     const case: search.Case = .{ .options = .{ .seed = 0, .stack_size = 256 * 1024 }, .setup = leakySetup };
     try testing.expectError(error.Nondeterministic, search.checkDeterminism(testing.allocator, case, .{}));
 }
+
+// ── contract details found by the mutation run ─────────────────────────────
+
+fn holdMemory(io: Io, gpa: std.mem.Allocator) !void {
+    _ = try gpa.alloc(u8, 100);
+    _ = try gpa.alloc(u8, 200);
+    try io.sleep(.fromSeconds(100), .awake);
+}
+
+test "a crash releases the host's live allocations at once" {
+    var sim: Sim = undefined;
+    newSim(&sim, 41);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.spawn(holdMemory, .{ h.io(), h.allocator() });
+    _ = sim.runFor(ns_per_s);
+    try testing.expectEqual(@as(usize, 2), h.liveAllocations());
+    sim.crash(h);
+    try testing.expectEqual(@as(usize, 0), h.liveAllocations());
+}
+
+fn failingTask(io: Io) !void {
+    try io.sleep(.fromMilliseconds(5), .awake);
+    return error.ServerGaveUp;
+}
+
+fn failingSetup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
+    _ = ctx;
+    _ = try sim.addHost(.{});
+    const h = try sim.addHost(.{});
+    try h.spawn(failingTask, .{h.io()});
+}
+
+test "a root task's error is a violation naming its host" {
+    const case: search.Case = .{ .options = .{ .seed = 0, .stack_size = 256 * 1024 }, .setup = failingSetup };
+    const r = try search.replay(testing.allocator, case, &.{}, ns_per_ms);
+    const v = r.violation orelse return error.NoViolation;
+    try testing.expectEqual(@as(anyerror, error.ServerGaveUp), v.err);
+    try testing.expectEqual(@as(?u32, 1), v.host);
+}
+
+fn ledgerOrClockInvariant(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
+    if (sim.hosts.items[0].clock_skew_ns != 0) return error.ClockJumped;
+    return ledgerInvariant(sim, ctx);
+}
+
+test "shrink keeps only subsets that reproduce the same error, not just any error" {
+    var ledger: Ledger = .{ .dedup = false };
+    var case = ledgerCase(&ledger);
+    case.invariant = ledgerOrClockInvariant;
+    // The lost acknowledgement alone gives CountedTwice; the clock jump alone
+    // gives a different error, which must not count as reproducing it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const events = try arena.allocator().dupe(netsim.FaultEvent, &.{
+        .{ .time = 0, .kind = .{ .drop_once = .{ .a = 1, .b = 0 } } },
+        .{ .time = 0, .kind = .{ .clock_jump = .{ .node = 0, .delta = 5 } } },
+    });
+    var failing: search.Failing = .{
+        .case = case,
+        .trace = .{ .arena = arena, .events = events },
+        .violation = .{ .err = error.CountedTwice, .at_ns = 0 },
+        .tick_ns = ns_per_ms,
+    };
+    defer failing.deinit();
+    const only_drop = try search.replay(testing.allocator, case, events[0..1], ns_per_ms);
+    try testing.expectEqual(@as(anyerror, error.CountedTwice), only_drop.violation.?.err);
+    var small = try search.shrink(testing.allocator, &failing);
+    defer small.deinit();
+    try testing.expectEqual(@as(usize, 1), small.after);
+    try testing.expect(small.trace.events[0].kind == .drop_once);
+}

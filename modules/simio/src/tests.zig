@@ -464,3 +464,72 @@ test "randomness is seeded per host: reproducible, and distinct between hosts" {
         }
     }
 }
+
+// ── contract details found by the mutation run ─────────────────────────────
+
+fn waitStale(io: Io, word: *const u32, returned_at: *u64, sim: *Sim) !void {
+    // The value is already 1: a wait expecting 0 must return at once
+    // instead of blocking (a lost wakeup otherwise).
+    try io.futexWait(u32, word, 0);
+    returned_at.* = sim.now;
+}
+
+test "a futex wait whose expected value is already stale returns immediately" {
+    var sim: Sim = undefined;
+    newSim(&sim, 21);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    const word: u32 = 1;
+    var at: u64 = std.math.maxInt(u64);
+    try h.spawn(waitStale, .{ h.io(), &word, &at, &sim });
+    try testing.expectEqual(sched.Outcome.quiescent, sim.run().outcome);
+    try testing.expectEqual(@as(u64, 0), at);
+}
+
+fn wakeEarlyThenSleep(io: Io, word: *const u32, slept_until: *u64, sim: *Sim) !void {
+    // Woken at 1 s, long before its 5 s timeout ...
+    try io.futexWaitTimeout(u32, word, 0, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // ... so that timeout must not cut this later sleep short at 5 s.
+    try io.sleep(.fromSeconds(10), .awake);
+    slept_until.* = sim.now;
+}
+
+fn wakeAfter(io: Io, word: *u32) !void {
+    try io.sleep(.fromSeconds(1), .awake);
+    word.* = 1;
+    io.futexWake(u32, word, 1);
+}
+
+test "a timeout armed for an earlier wait does not end a later one" {
+    var sim: Sim = undefined;
+    newSim(&sim, 22);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var word: u32 = 0;
+    var until: u64 = 0;
+    try h.spawn(wakeEarlyThenSleep, .{ h.io(), &word, &until, &sim });
+    try h.spawn(wakeAfter, .{ h.io(), &word });
+    try testing.expectEqual(sched.Outcome.quiescent, sim.run().outcome);
+    try testing.expectEqual(@as(u64, 11 * ns_per_s), until);
+}
+
+fn recordStart(order: *std.ArrayList(u8), id: u8) void {
+    order.appendAssumeCapacity(id);
+}
+
+test "with preemption off, the seed alone still varies the order tasks start in" {
+    var orders: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    defer orders.deinit(testing.allocator);
+    for (0..20) |seed| {
+        var sim: Sim = undefined;
+        sim.init(testing.allocator, .{ .seed = seed, .preempt_permille = 0, .stack_size = 256 * 1024 });
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        var buf: [4]u8 = undefined;
+        var order: std.ArrayList(u8) = .initBuffer(&buf);
+        for (0..4) |i| try h.spawn(recordStart, .{ &order, @as(u8, @intCast(i)) });
+        _ = sim.run();
+        try orders.put(testing.allocator, std.mem.readInt(u32, &buf, .little), {});
+    }
+    try testing.expect(orders.count() > 5);
+}

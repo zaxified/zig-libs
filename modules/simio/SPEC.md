@@ -6,7 +6,7 @@
 
 **Scope:** poc — tokio-rs/turmoil 0.7, sb2bg/marionette 0.7.2 (surveyed 2026-10-01)
 
-**Audit:** review none · mutation none
+**Audit:** review none · mutation 2026-10-01
 
 **Known defects:** none recorded
 
@@ -184,6 +184,28 @@ axp can pull it back from the module later"):
   wall-clock sleeps. That is axp's session's work (zig-libs is a pinned upstream there).
 - `fleetsim` (zig-libs): in-process device responders on netsim — the synthetic-device
   half of axp-sim's job, already here; complementary, not a substitute for simio.
+
+## Mutation run (2026-10-01)
+
+46 mutant schemata over `sched.zig`, `net.zig` and `search.zig`, one ReleaseSafe
+build, every mutant under a 20 s cap. First pass: 33 killed (4 of them as hangs),
+13 survived. Nine survivors were holes and got tests: a futex wait whose expected
+value is stale must return at once; a timeout armed for an earlier wait must not end
+a later one; with preemption off the seed alone must still vary the start order; a
+crash must release live host allocations at once (`Host.liveAllocations`); stream
+reads must sometimes be short; an oversized datagram is truncated and flagged; the
+UDP receive buffer drops the overflow; a root task's error is a violation naming its
+host; `shrink` keeps only subsets reproducing the *same* error. Second pass: 42/46
+killed. The four survivors are equivalent:
+
+- `futexWake` waking more than `max_waiters`: a spurious wakeup, which the futex
+  contract allows (`Io.Mutex`/`Condition` re-check).
+- No virtual time in the per-step fingerprint mix: every change of time reaches a
+  task through a wake, and wakes mix the time.
+- Arrival not checking that the receiver is up: a down host has no sockets, and
+  anything it would answer is refused by `transit` (a down host cannot send).
+- No `max(at, last_at)` when queueing a segment: a pipe delivers only from its head,
+  so order holds regardless; the `max` keeps timing realistic, not order.
 
 ## Anchoring
 

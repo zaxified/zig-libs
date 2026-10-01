@@ -285,6 +285,11 @@ pub const Host = struct {
         h.sim.gpa.rawFree(memory, alignment, ret);
     }
 
+    /// Allocations made through `allocator()` and not yet freed.
+    pub fn liveAllocations(h: *const Host) usize {
+        return h.live_allocs.count();
+    }
+
     fn releaseAll(h: *Host) void {
         var it = h.live_allocs.iterator();
         while (it.next()) |e| {

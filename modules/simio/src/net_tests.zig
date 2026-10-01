@@ -546,3 +546,108 @@ test "packets take the shortest path over the links that are up" {
     try testing.expectEqual(@as(?u64, 50 * ns_per_ms), try routeLatency(chainPlusSlowDirect));
     try testing.expectEqual(@as(?u64, 15 * ns_per_ms), try routeLatency(chainPlusFastDirect));
 }
+
+// ── contract details found by the mutation run ─────────────────────────────
+
+fn bulkSender(io: Io, port: u16) !void {
+    var server = try net.IpAddress.listen(&.{ .ip4 = .unspecified(port) }, io, .{});
+    defer server.deinit(io);
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var wbuf: [64]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    const block: [32 * 1024]u8 = @splat(0xab);
+    try w.interface.writeAll(&block);
+    try w.interface.flush();
+}
+
+const Reads = struct { short: u32 = 0, full: u32 = 0, total: usize = 0 };
+
+fn rawReader(io: Io, to: net.IpAddress, out: *Reads) !void {
+    const stream = try to.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    // Let everything arrive, then read in 2 KB requests straight from the
+    // vtable: whatever is buffered could fill each one.
+    try io.sleep(.fromSeconds(1), .awake);
+    var buf: [2048]u8 = undefined;
+    var bufs: [1][]u8 = .{&buf};
+    while (out.total < 32 * 1024) {
+        const left = 32 * 1024 - out.total;
+        bufs[0] = buf[0..@min(buf.len, left)];
+        const n = try io.vtable.netRead(io.userdata, stream.socket.handle, &bufs);
+        if (n == 0) break;
+        if (n < bufs[0].len) out.short += 1 else out.full += 1;
+        out.total += n;
+    }
+}
+
+test "stream reads are sometimes short even with everything buffered" {
+    var sim: Sim = undefined;
+    newSim(&sim, 31);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    var reads: Reads = .{};
+    try b.spawn(bulkSender, .{ b.io(), 80 });
+    try a.spawn(rawReader, .{ a.io(), addr4(b, 80), &reads });
+    _ = sim.run();
+    try testing.expectEqual(@as(usize, 32 * 1024), reads.total);
+    try testing.expect(reads.short > 0);
+    try testing.expect(reads.full > 0);
+}
+
+const TruncLog = struct { len: usize = 0, trunc: bool = false, from_ok: bool = false };
+
+fn smallReceiver(io: Io, port: u16, out: *TruncLog) !void {
+    const sock = try net.IpAddress.bind(&.{ .ip4 = .unspecified(port) }, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var buf: [10]u8 = undefined;
+    const msg = try sock.receive(io, &buf);
+    out.len = msg.data.len;
+    out.trunc = msg.flags.trunc;
+}
+
+test "a datagram larger than the buffer is truncated and flagged" {
+    var sim: Sim = undefined;
+    newSim(&sim, 32);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    var log: TruncLog = .{};
+    try b.spawn(smallReceiver, .{ b.io(), 9, &log });
+    try a.spawn(udpBurst, .{ a.io(), addr4(b, 9), "0123456789abcdefghij", 1 });
+    _ = sim.run();
+    try testing.expectEqual(@as(usize, 10), log.len);
+    try testing.expect(log.trunc);
+}
+
+fn lateReader(io: Io, port: u16, got: *usize) !void {
+    const sock = try net.IpAddress.bind(&.{ .ip4 = .unspecified(port) }, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    try io.sleep(.fromSeconds(2), .awake); // everything queues meanwhile
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        _ = sock.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => return,
+            else => return err,
+        };
+        got.* += 1;
+    }
+}
+
+test "datagrams beyond the receive buffer are dropped" {
+    var sim: Sim = undefined;
+    sim.init(testing.allocator, .{ .seed = 33, .stack_size = 512 * 1024, .net = .{ .udp_rcvbuf = 16 * 1024 } });
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    var got: usize = 0;
+    const kb: [1024]u8 = @splat(1);
+    try b.spawn(lateReader, .{ b.io(), 9, &got });
+    try a.spawn(udpBurst, .{ a.io(), addr4(b, 9), &kb, 100 });
+    _ = sim.run();
+    try testing.expectEqual(@as(usize, 16), got);
+}
