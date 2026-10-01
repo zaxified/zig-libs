@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — icmp pilot, on the module's new `std.Io` path: exact RTTs, dead
+  targets, and no misattributed reply across seeds of rough links and partitions.
 - **2026-10-01** — http Server pilot (after its timeouts moved onto `std.Io`): the
   real server with the real client, and timeouts checked to the tick against
   stalling, dribbling and non-reading clients.

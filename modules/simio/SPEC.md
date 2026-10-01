@@ -308,6 +308,15 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   stops reading after the write timeout; with the timeouts off, a stalled client
   holds its connection for the whole run, and the check sees it.
 
+- **icmp** (2026-10-01): the module ran on raw syscalls only; it gained a `std.Io`
+  path (`Config.io`, `IoSocket`: ping sockets from `std.Io.net`, clocks and waits
+  through the `Io`) and is piloted on it. Reachable targets come out alive with an
+  RTT of exactly the path's round trip, a partitioned one dead after its retries;
+  over 30 seeds of rough links (loss, duplication, 300 ms reordering, corruption)
+  and partitions no reply is ever credited with an RTT shorter than the path (what a
+  reply matched to the wrong probe would show), and duplicates count as duplicates.
+  A timeout below the round trip is caught reporting live hosts dead.
+
 **Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
 (or spin-wait) could be held across a call that suspends under an `Io` running several
 tasks on one thread. Fixed — the lock waits through the `Io` when one is known: `kv`
@@ -325,8 +334,6 @@ some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simul
 
 - **kv** `FsStorage`: `allocate` and `syncData` still call `fallocate`/`fdatasync`
   directly (std.Io has neither) and get `EBADF` under simio; `Db` never calls them.
-- **icmp**: raw `std.os.linux` socket syscalls throughout; needs a `std.Io`-based
-  backend (`bind` with `.dgram` + `protocol = .icmp`) before a pilot.
 
 Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` instead
 of touching one of the test process's own descriptors.
