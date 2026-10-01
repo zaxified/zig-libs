@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `AccessLog.Options.io`: with it, a call waiting for the flusher parks on the
+  `Io`'s futex instead of spinning. Required when the `Io` runs several tasks on one thread
+  (`std.Io.Evented`, a simulator): a spinning waiter starved a flusher suspended in `writer`
+  forever. Without it, behaviour is unchanged. Found by the spinlock audit that followed the
+  simio kv pilot.
 - **2026-09-28** — `AccessEntry.bytes` is now known for streamed bodies (chunked, compressed,
   until-close) via `http`'s `ResponseWriter.bodyBytesSent`; it was null for them.
 

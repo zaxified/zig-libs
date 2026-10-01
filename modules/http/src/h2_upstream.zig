@@ -31,8 +31,8 @@
 //!
 //! An `h2_client.Session` is **single-owner and blocking**: `awaitResponse`
 //! pumps the socket, mutating shared demux state, so exactly one task may
-//! touch a session at a time. Each shared session therefore carries a mutex
-//! that serializes ALL of its I/O (both the brief `begin` send and the
+//! touch a session at a time. Each shared session therefore carries an
+//! `std.Io.Mutex` that serializes ALL of its I/O (both the brief `begin` send and the
 //! blocking `complete` await). Consequences:
 //! - Requests genuinely **multiplex on the wire**: nothing here checks a
 //!   connection out exclusively, and any streams already sent keep running
@@ -143,7 +143,11 @@ pub const Options = struct {
 /// (single-owner engine); `refs`/`retired` are guarded by the pool mutex.
 const Shared = struct {
     hs: *Client.H2Session,
-    mutex: std.atomic.Mutex = .unlocked,
+    /// Held across the session's socket I/O: an `std.Io.Mutex`, so a task
+    /// waiting for it yields to the `Io` (a spinning or thread-yielding
+    /// waiter starves a holder suspended in the socket when the `Io` runs
+    /// several tasks on one thread).
+    mutex: std.Io.Mutex = .init,
     /// Entry's own ref (+1) plus one per in-flight `Call`.
     refs: usize,
     /// Marked dead: the entry has dropped its ref and re-dials next time;
@@ -159,7 +163,8 @@ const Entry = struct {
     port: u16,
     secure: bool,
     current: ?*Shared = null,
-    dial_mutex: std.atomic.Mutex = .unlocked,
+    /// Held across a dial (a network connect): an `std.Io.Mutex`, as above.
+    dial_mutex: std.Io.Mutex = .init,
 
     /// Widest backend host an entry can hold, inline. A DNS name is at most
     /// 253 octets (RFC 1035 §2.3.4's 255-octet wire form minus the length
@@ -215,6 +220,11 @@ pub const Pool = struct {
         p.* = undefined;
     }
 
+    /// The `Io` every session of this pool does its I/O in (the `Client`'s).
+    fn io(p: *const Pool) std.Io {
+        return p.options.client.io;
+    }
+
     /// Total upstream dials over the pool's life (diagnostics/tests).
     pub fn dialCount(p: *const Pool) usize {
         return p.dials.load(.monotonic);
@@ -266,12 +276,13 @@ pub const Pool = struct {
     /// `Response.deinit(pool.gpa)`).
     pub fn complete(p: *Pool, call: Call) Error!h2_client.Response {
         const shared = call.shared;
-        lockBlocking(&shared.mutex);
+        const pio = p.io();
+        shared.mutex.lockUncancelable(pio);
         const res = shared.hs.awaitResponse(call.sid);
         // A connection-scoped death (or a latched GOAWAY) retires the session
         // so the next request re-dials; a lone stream reset does not.
         const broken = shared.hs.session.broken != null or shared.hs.session.goaway != null;
-        shared.mutex.unlock();
+        shared.mutex.unlock(pio);
 
         if (res) |r| {
             if (broken) p.retire(call.entry, shared);
@@ -294,9 +305,9 @@ pub const Pool = struct {
 
     /// Send HEADERS (+ body) for `parts` on `shared` under its I/O lock.
     fn send(p: *Pool, shared: *Shared, parts: RequestParts) Error!u31 {
-        _ = p;
-        lockBlocking(&shared.mutex);
-        defer shared.mutex.unlock();
+        const pio = p.io();
+        shared.mutex.lockUncancelable(pio);
+        defer shared.mutex.unlock(pio);
         return shared.hs.request(parts.method, parts.path, .{
             .scheme = parts.scheme,
             .authority = parts.authority,
@@ -361,8 +372,8 @@ pub const Pool = struct {
 
         // Cold/retired: dial under the per-entry dial lock (other backends
         // and the global pool lock stay free during the connect).
-        lockBlocking(&entry.dial_mutex);
-        defer entry.dial_mutex.unlock();
+        entry.dial_mutex.lockUncancelable(p.io());
+        defer entry.dial_mutex.unlock(p.io());
 
         // Re-check: someone may have dialed while we waited for the lock.
         {
@@ -454,15 +465,6 @@ fn isDeadSession(err: anyerror) bool {
 /// `Client`'s idle pool.
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
-}
-
-/// Lock that may be held across **blocking I/O** (a session's `awaitResponse`
-/// pump, or a cold-backend dial): yield the scheduler while contended so a
-/// waiter never starves the lock holder on a busy core (the plain spin above
-/// is only safe for the microsecond bookkeeping sections). Falls back to a
-/// spin hint if `yield` is unavailable.
-fn lockBlocking(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

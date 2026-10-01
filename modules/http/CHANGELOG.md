@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Fix: `h2_upstream.Pool` waits on its session and dial locks through the
+  `Io`.** They are held across socket I/O (`awaitResponse`, a send, a dial) and were
+  thread-yielding spinlocks: under an `Io` that runs several tasks on one thread a waiter never
+  let the suspended holder run again. They are now `std.Io.Mutex` (the pool's `Client` always has
+  an `Io`). Found by the spinlock audit that followed the simio kv pilot.
 - **2026-10-01** — **Server timeouts are enforced through `std.Io`, not `poll(2)`.** The
   read/write stall timeouts and the request/connection deadlines used to `poll` the raw socket
   and read `clock_gettime` before every refill and write: invisible to any `Io` but the OS one

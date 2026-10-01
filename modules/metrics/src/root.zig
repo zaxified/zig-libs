@@ -1104,6 +1104,12 @@ pub const AccessLog = struct {
         /// tasks never interleave lines. Disable only if the caller serializes
         /// writes to `writer` itself.
         synchronized: bool = true,
+        /// The `std.Io` that `writer` blocks in, if any. A call whose line
+        /// does not fit while another call is writing a batch waits for it;
+        /// with an `Io` it parks on a futex instead of spinning, which is
+        /// required when the `Io` runs several tasks on one thread (a
+        /// spinning waiter would starve a flusher suspended in `writer`).
+        io: ?std.Io = null,
     };
 
     pub fn init(writer: *std.Io.Writer, options: Options) AccessLog {
@@ -1164,7 +1170,7 @@ pub const AccessLog = struct {
             waiting = true;
             const seen = self.progress.load(.monotonic);
             self.lock.unlock();
-            waitForProgress(&self.progress, seen);
+            self.waitForProgress(seen);
             lockSpin(&self.lock);
         }
     }
@@ -1188,7 +1194,7 @@ pub const AccessLog = struct {
         const len = self.pending_len;
         self.pending_idx ^= 1;
         self.pending_len = 0;
-        _ = self.progress.fetchAdd(1, .monotonic);
+        self.bumpProgress();
         self.lock.unlock();
         self.writer.writeAll(self.pending[idx][0..len]) catch {};
         self.writer.flush() catch {};
@@ -1203,15 +1209,27 @@ pub const AccessLog = struct {
     fn finishFlushing(self: *AccessLog) void {
         while (self.pending_len != 0 and self.waiters == 0) self.writeBatch();
         self.flushing = false;
-        _ = self.progress.fetchAdd(1, .monotonic);
+        self.bumpProgress();
         self.lock.unlock();
     }
 
-    /// Wait, lock released, until `progress` differs from `seen`. A bounded
-    /// spin, then yields, as in `lockSpin`: with more waiters than cores the
-    /// flusher needs the core. No ordering is needed — the waiter re-reads
-    /// everything under `lock` afterwards; this only decides when to try.
-    fn waitForProgress(progress: *const std.atomic.Value(u32), seen: u32) void {
+    /// Lock held: tell waiters their answer may have changed.
+    fn bumpProgress(self: *AccessLog) void {
+        _ = self.progress.fetchAdd(1, .monotonic);
+        if (self.options.io) |io| io.futexWake(u32, &self.progress.raw, std.math.maxInt(u32));
+    }
+
+    /// Wait, lock released, until `progress` differs from `seen`. With an
+    /// `Io`, parked on its futex. Without, a bounded spin, then yields, as in
+    /// `lockSpin`: with more waiters than cores the flusher needs the core.
+    /// No ordering is needed — the waiter re-reads everything under `lock`
+    /// afterwards; this only decides when to try.
+    fn waitForProgress(self: *AccessLog, seen: u32) void {
+        const progress = &self.progress;
+        if (self.options.io) |io| {
+            while (progress.load(.monotonic) == seen) io.futexWaitUncancelable(u32, &progress.raw, seen);
+            return;
+        }
         var spins: u32 = 0;
         while (progress.load(.monotonic) == seen) {
             if (spins < spin_before_yield) {
@@ -3112,7 +3130,11 @@ test "AccessLog F4: threads x lines into a real file -- every line whole, exactl
     };
     const Line = struct { method: []const u8, path: []const u8, status: u16, duration_ns: u64, bytes: u64 };
 
-    for (0..rounds) |_| {
+    // Without an `Io` the waiters spin on OS threads; with one (spinlock
+    // audit after the simio kv pilot) they park on its futex, and the
+    // callers are tasks of that `Io`.
+    for (0..rounds * 2) |round| {
+        const with_io = round % 2 == 1;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const file = try tmp.dir.createFile(io, "f4.log", .{});
@@ -3120,11 +3142,17 @@ test "AccessLog F4: threads x lines into a real file -- every line whole, exactl
         // two callers inside the writer at once show up as torn bytes.
         var wbuf: [256]u8 = undefined;
         var fw = file.writer(io, &wbuf);
-        var access = AccessLog.init(&fw.interface, .{});
+        var access = AccessLog.init(&fw.interface, .{ .io = if (with_io) io else null });
 
-        var pool: [threads]std.Thread = undefined;
-        for (&pool, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &access, id });
-        for (pool) |t| t.join();
+        if (with_io) {
+            var tasks: [threads]std.Io.Future(void) = undefined;
+            for (&tasks, 0..) |*t, id| t.* = try io.concurrent(Worker.run, .{ &access, id });
+            for (&tasks) |*t| t.await(io);
+        } else {
+            var pool: [threads]std.Thread = undefined;
+            for (&pool, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &access, id });
+            for (pool) |t| t.join();
+        }
         try f4AssertIdle(&access);
         file.close(io);
 
