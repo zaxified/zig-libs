@@ -1215,3 +1215,44 @@ test "fuzz: ReshareReceiver.handle never panics, in any round" {
     }
     try std.testing.fuzz({}, fuzzReceiverHandle, .{ .corpus = seeds.items });
 }
+
+fn badShare1toBoth(from: u32, to: u32, bytes: []u8) Action {
+    if (from == 1 and to <= 2 and bytes[0] == @intFromEnum(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    return .deliver;
+}
+
+test "t' complaints: the dealer does not defend, and receivers exclude it even if it does" {
+    // Both sides of one rule: `t'` public openings would reveal the dealer's
+    // share, so at `t'` complaints it refuses, and receivers exclude a dealer
+    // with `t'` complaints however they were answered.
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const new_cfg: Config = .{ .t = 2, .n = 4 };
+    const old = try oldCommittee(allocator, old_cfg, 0xD16_3011);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const rc = configFor(old, old_cfg, new_cfg, &.{ 1, 2, 3 }, &xs);
+
+    for ([_]bool{ false, true }) |defend_anyway| {
+        var prng = std.Random.DefaultPrng.init(0xD16_3012);
+        var rig = try Rig.init(allocator, rc, old, prng.random());
+        defer rig.deinit();
+        rig.filter = badShare1toBoth; // receivers 1 and 2 complain: t' = 2
+        for (rig.dealers) |*d| try d.start();
+        try rig.dealersToReceivers();
+        for (rig.receivers) |*r| try r.advance();
+        try rig.receiversToAll();
+        for (rig.receivers) |*r| try r.advance();
+        for (rig.dealers) |*d| try d.advance();
+        // Dealer 1 queued no defense.
+        try testing.expectEqual(@as(usize, 0), rig.dealers[0].outbox.items.len);
+        if (defend_anyway) {
+            // A dealer that opens both shares regardless (correctly).
+            rig.filter = null;
+            for (rig.dealers[0].complainers.items) |c| try rig.dealers[0].pushShare(.broadcast, .reshare_defense, c);
+        }
+        try rig.dealersToReceivers();
+        for (rig.receivers) |*r| try r.advance();
+        for (rig.receivers) |*r| try testing.expectEqualSlices(u32, &.{ 2, 3 }, r.usedDealers().?);
+    }
+}

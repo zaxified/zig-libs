@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-01 · mutation none
+**Audit:** review 2026-10-01 · mutation 2026-10-01
 
 **Known defects:** none recorded
 
@@ -274,7 +274,18 @@ complain, since `t'` public openings would reveal its share.
   `Participant`/`ReshareDealer` (explicit coefficients) and assert equality of every frame's
   commitments and shares, every `x_j`, `X_j`, `Q`, `F'`, and the Lagrange coefficients.
 - **Parser fuzz.** `Participant.handle` and `ReshareReceiver.handle` are fuzzed in every round
-  against a deterministic world; the corpus is real frames captured per round.
+  against a deterministic world; the corpus is real frames captured per round. The DKG world
+  has a defended bad share and a dealer with bent Feldman commitments, so it passes through
+  the Feldman-complaint and reveal rounds too.
+- **Mutation run 2026-10-01** (schemata, ReleaseSafe, 31 mutants over the recovery branch,
+  the frame handlers, `advance`'s abort-on-error, `interpolate`, the honest-majority check,
+  `core`'s share verification and rule (b), and resharing's exclusion/`B_0`/`Q` checks): 29
+  killed. The first pass left six; four tests were added (a Feldman complaint about a
+  dealer outside QUAL — without the check it would crash the reveal round —, an allocation
+  failure inside `advance`, and both sides of resharing's `t'`-complaints rule, each of which
+  hid the other). Two are equivalent: the check that our own share lies on a reconstructed
+  polynomial, and resharing's `x'_j·G == Σ F'_k j^k`; both follow from shares verified
+  against the commitments (binding, linearity) and stay as assertions.
 
 ## Why a synchronous round-driver, not `netsim`
 
@@ -320,7 +331,6 @@ here.
 ## Backlog / deferred
 
 - ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
-- **Mutation run of the per-participant layer and the recovery branch** (review 2026-10-01 was by reading and directed tests only).
 - **Role-tagged sender for `ReshareReceiver`** (review 2026-10-01, F7): `handle` takes one `from` that is an OLD id for three kinds and a NEW id for `reshare_complaint`, and the kind octet comes from the frame. A transport that authenticates one id space for both committees would let new party `j` send a broadcast as old dealer `j` (its `B_0 = X_j` is public), win first-wins, and get the honest dealer excluded. Documented as the caller's routing contract today; a `from: struct { role, id }` would make it unforgeable. Effort: small.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.

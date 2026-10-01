@@ -1047,6 +1047,121 @@ test "a QUAL dealer that withholds its Feldman commitments is reconstructed, not
     try expectSameOutputs(clean, outs);
 }
 
+fn dropFeldmanOf3(from: u32, _: u32, bytes: []u8) Action {
+    return if (from == 3 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) .drop else .deliver;
+}
+
+test "reveals that do not verify, or come twice, are refused; too few verified shares abort the party" {
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 3 };
+    var prng = std.Random.DefaultPrng.init(53);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    net.filter = dropFeldmanOf3;
+    try net.startAll();
+    for (0..5) |_| {
+        try net.deliverAll();
+        try net.advanceAll();
+    }
+    const p1 = &net.parties[0];
+    const p2 = &net.parties[1];
+    try testing.expectEqual(Phase.reveals, p1.phase());
+    try testing.expectEqual(Phase.reveals, p2.phase());
+    try testing.expect(!p1.allReceived()); // only its own share of dealer 3 so far
+
+    // Party 2's reveal of dealer 3, first with a share that is not the
+    // committed one, then the real one, then again.
+    var m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.accepted[2].?.add(Scalar.one), .s_prime = p2.accepted_sp[2].? };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @intFromEnum(wire.Kind.reveal);
+    @memcpy(fr[1..], &m.toBytes());
+    try testing.expectError(error.Unverified, p1.handle(2, &fr));
+    try testing.expectError(error.SenderMismatch, p1.handle(3, &fr));
+    // A reveal of a dealer nobody exposed.
+    var other = m;
+    other.dealer = 1;
+    @memcpy(fr[1..], &other.toBytes());
+    try testing.expectError(error.Unsolicited, p1.handle(2, &fr));
+    m.s = p2.accepted[2].?;
+    @memcpy(fr[1..], &m.toBytes());
+    try p1.handle(2, &fr);
+    try testing.expectError(error.DuplicateMessage, p1.handle(2, &fr));
+    try testing.expect(p1.allReceived());
+    try p1.advance();
+    try testing.expectEqual(Phase.done, p1.phase());
+
+    // Party 2 never hears party 1's reveal: one share of a 2-of-3 polynomial
+    // is not enough. It aborts naming dealer 3, and stays aborted.
+    for (p1.outbox.items) |o| o.deinit(allocator);
+    p1.outbox.clearRetainingCapacity();
+    try testing.expectError(error.ReconstructionFailed, p2.advance());
+    try testing.expectEqual(Phase.aborted, p2.phase());
+    try testing.expectEqual(@as(?u32, 3), p2.culprit());
+    try testing.expectError(error.Aborted, p2.advance());
+    try testing.expect(p2.output() == null);
+}
+
+test "a reconstructed coefficient of zero is the identity, summed as such" {
+    // Only a cheating dealer has one (an honest `start` cannot even commit
+    // to it), and it must not turn into an abort it could use as a veto.
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(59);
+    var p = try Participant.init(allocator, .{ .t = 2, .n = 3 }, 1, prng.random());
+    defer p.deinit();
+    var coeffs = [_]Scalar{ commit.scalarFromIndex(5), Scalar.zero };
+    p.recovered[1] = &coeffs;
+    try testing.expect((try p.dealerCommitment(1, 1)) == null);
+    try testing.expect((try p.dealerCommitment(1, 0)) != null);
+}
+
+test "a Feldman complaint about a dealer outside QUAL is refused (it would have no share to reveal)" {
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 4 };
+    var prng = std.Random.DefaultPrng.init(61);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    net.filter = tamperShareAndDropDefense; // dealer 3 cheats party 1 and stays silent
+    try net.startAll();
+    for (0..4) |_| {
+        try net.deliverAll();
+        try net.advanceAll();
+    }
+    const p1 = &net.parties[0];
+    const p2 = &net.parties[1];
+    try testing.expectEqual(Phase.feldman_complaints, p1.phase());
+    try testing.expect(!p1.qual().?[2]);
+    // Party 2 holds a share of dealer 3 that verifies against its Pedersen
+    // commitments (the cheat was only toward party 1), and dealer 3 never
+    // sent Feldman commitments (it was disqualified): as a complaint this
+    // would look valid, but dealer 3 is not in QUAL.
+    const m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.wire_s[2].?, .s_prime = p2.wire_sp[2].? };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @intFromEnum(wire.Kind.feldman_complaint);
+    @memcpy(fr[1..], &m.toBytes());
+    try testing.expectError(error.Unsolicited, p1.handle(2, &fr));
+    try net.finish();
+    try testing.expectEqual(Phase.done, p1.phase());
+}
+
+test "an allocation failure inside advance leaves the party aborted, never half-advanced" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var prng = std.Random.DefaultPrng.init(67);
+    var p = try Participant.init(allocator, .{ .t = 1, .n = 2 }, 1, prng.random());
+    defer p.deinit();
+    try p.start();
+    wire.freeOutgoing(allocator, try p.takeOutgoing());
+    try p.advance(); // party 2 never spoke: absent
+    try p.advance(); // no complaints
+    try testing.expectEqual(Phase.defenses, p.phase());
+    // The next transition queues our Feldman broadcast: make that fail.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, p.advance());
+    try testing.expectEqual(Phase.aborted, p.phase());
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectError(error.Aborted, p.advance());
+}
+
 /// For the next test: dealer 5's Feldman vector, bent to agree with its true
 /// shares at parties 1 and 2 only (set before the run).
 var bent_feldman: [1 + 8 + 3 * Ne]u8 = undefined;

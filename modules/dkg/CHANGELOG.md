@@ -21,7 +21,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   dealer can fit Feldman commitments with a free constant term and choose `Q` undetected.
   Any error from `advance` now leaves the party `.aborted` (a half-done transition was
   retriable and queued frames twice), the `x_j` summands and decoded share messages are wiped.
-  The oracle transcript is regenerated as 3-of-5 (was 3-of-4).
+  The oracle transcript is regenerated as 3-of-5 (was 3-of-4). Mutation run: 29 of 31
+  killed, 2 equivalent; tests added for a Feldman complaint about a non-QUAL dealer, an
+  allocation failure inside `advance`, and both sides of resharing's `t'`-complaints rule.
 - **2026-09-30** — **Per-participant API and resharing** (maturity task A12; scope `poc` -> `mvp`).
   New `Participant` (`participant.zig`): one GJKR party as a sans-I/O state machine (`start` /
   `handle(from, bytes)` / `advance` / `takeOutgoing`) with typed wire frames (`wire.zig`), full parsing
