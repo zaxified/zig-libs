@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `Prng` (the seeded splitmix64 generator) is now exported
+  from the root, for `simio`, which builds on netsim. Additive; nothing else
+  changes.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the audit F10 regression
   test now counts log entries actually stored instead of timing `replay`
   (a wall-clock `<=` guard that turned out not to reliably catch the audited

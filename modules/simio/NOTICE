@@ -1,0 +1,40 @@
+simio — third-party attribution
+
+`src/sched.zig`, functions `entry` and `initialContext`: the naked fiber entry
+trampoline (its three per-architecture instruction sequences) and the initial
+stack-pointer layout it relies on (x86_64 `rsp = slot - 8`, aarch64/riscv64
+`sp = slot`) are taken from the Zig standard library's `lib/std/Io/Uring.zig`
+from Zig 0.16.0 (sha256
+960efaa8fefd4e146929acfb45018db9f4bfd0ad331560e8e7bb0304889aec1b),
+`AsyncClosure.entry` and `concurrent`, SOURCE, adapted: the trampoline hands
+`fiberMain` a slot holding a `*Fiber` instead of an `AsyncClosure`. Nothing
+else in this module is copied; the scheduler, wait bookkeeping, groups,
+cancelation and time model are this collection's own. Zig's license follows
+and must travel with those lines.
+
+The MIT License (Expat)
+
+Copyright (c) Zig contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Design references only (studied for behaviour, nothing copied): tokio-rs/turmoil
+(MIT), madsim-rs/madsim (Apache-2.0), sb2bg/marionette (MIT; README only),
+FoundationDB's and TigerBeetle's simulation-testing methodology, ALICE (Pillai
+et al., OSDI 2014) for the crash-consistency model.

@@ -58,6 +58,10 @@ pub const meta = .{
 
 // ── public API ───────────────────────────────────────────────────────────────
 
+/// The seeded splitmix64 generator netsim draws from, exported for the
+/// simulators built on it (`simio`) so one seed drives one kind of stream.
+pub const Prng = @import("prng.zig").Prng;
+
 pub const NodeId = types.NodeId;
 pub const Time = types.Time;
 
