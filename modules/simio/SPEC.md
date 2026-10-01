@@ -6,7 +6,7 @@
 
 **Scope:** poc — tokio-rs/turmoil 0.7, sb2bg/marionette 0.7.2 (surveyed 2026-10-01)
 
-**Audit:** review none · mutation 2026-10-01
+**Audit:** review 2026-10-01 · mutation 2026-10-01
 
 **Known defects:** none recorded
 
@@ -262,6 +262,41 @@ opening a link without following it), and in simio (a file's realpath in `/`, a 
 per host for Unix sockets, leaked bytes on a stream and on a disk). Second pass:
 29/30 killed. The survivor is equivalent: dropping the counter bump in
 `Watchdog.enter` changes nothing, as `leave` bumps it on every switch too.
+
+## Review (2026-10-01)
+
+An independent read of the whole module against the `std.Io` doc comments, before
+the first push. Confirmed by a failing test first, then fixed (tests in
+`fs_tests.zig`, `net_tests.zig`, and the differential oracle where the real kernel
+can say what is right):
+
+- `File.stdout().writer()`/`stdin().reader()` (positional by default) failed:
+  positional I/O on stdio answered `AccessDenied`, not the `Unseekable` that makes
+  std fall back to streaming.
+- `Io.lockStderr`/`unlockStderr`/`File.enableAnsiEscapeCodes` were `unreachable`:
+  now a per-host lock over the host's stderr writer (into `console`), and
+  `NotTerminalDevice`.
+- A stream over a link losing everything retransmitted forever on the scheduler's
+  stack; now the connection times out at the user timeout.
+- A `Batch` with two receives on one socket registered the task twice: a double
+  wake (an assertion), then a stale wake cutting a later sleep short.
+- `MSG_PEEK` consumed the datagram (oracle).
+- Data already received was lost behind a later reset; it is now read first.
+- A connection to a loopback address came from the host's LAN address (oracle: the
+  peer is 127.0.0.1).
+- Deleting entries while listing a directory skipped every second one; a listing
+  now works from a snapshot (oracle: six listed, none left).
+- `SO_REUSEADDR` was ignored; Linux's rule (both sockets must set it, a listener
+  always conflicts) now applies (oracle).
+- A SYN delayed past its retry opened a ghost connection after the real one closed.
+- A corrupted ICMPv4 echo request was answered with a fresh checksum; it is dropped.
+- Smaller: a second `Batch` await with undrained completions blocked; a failing
+  `createFileAtomic` leaked its parent handle; a lock wait read a stale wake reason
+  after an allocation failure; two out-of-memory paths could free twice.
+
+Not changed: file locks wait by polling (a lock never released ends as
+`.step_limit`, not `.deadlock`), and MSG_TRUNC is not reported on request (an
+oversized datagram is still truncated and flagged).
 
 ## Anchoring
 

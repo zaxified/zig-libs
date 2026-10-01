@@ -40,6 +40,9 @@ const Report = struct {
     /// Links: what each observation gave, as one comparable line.
     links: [512]u8 = undefined,
     links_len: usize = 0,
+    /// Review findings: a peek, a loopback peer, delete-while-iterating.
+    review: [128]u8 = undefined,
+    review_len: usize = 0,
     /// The file after a write through a memory map, and what the map read.
     mapped: [64]u8 = undefined,
     mapped_len: usize = 0,
@@ -54,6 +57,7 @@ const Report = struct {
             std.mem.eql(u8, a.names[0..a.names_len], b.names[0..b.names_len]) and
             std.mem.eql(u8, a.links[0..a.links_len], b.links[0..b.links_len]) and
             std.mem.eql(u8, a.mapped[0..a.mapped_len], b.mapped[0..b.mapped_len]) and
+            std.mem.eql(u8, a.review[0..a.review_len], b.review[0..b.review_len]) and
             a.done and b.done;
     }
 };
@@ -218,7 +222,92 @@ fn program(io: Io, dir: Dir, report: *Report) !void {
     }
     try links(io, dir, report);
     try mapped(io, dir, report);
+    try reviewed(io, dir, report);
     report.done = true;
+}
+
+fn acceptKeep(io: Io, l: *net.Server, out: *net.IpAddress) !net.Stream {
+    const s = try l.accept(io);
+    out.* = s.socket.address;
+    return s;
+}
+
+fn acceptPeer(io: Io, l: *net.Server, out: *net.IpAddress) !void {
+    const s = try l.accept(io);
+    out.* = s.socket.address;
+    s.close(io);
+}
+
+/// What an independent review of simio found, checked here against the
+/// real kernel.
+fn reviewed(io: Io, dir: Dir, report: *Report) !void {
+    var w: Io.Writer = .fixed(&report.review);
+    defer report.review_len = w.end;
+    const lo: net.IpAddress = .{ .ip4 = .loopback(0) };
+
+    // A peeked datagram is still there for the next receive.
+    {
+        const sock = try lo.bind(io, .{ .mode = .dgram });
+        defer sock.close(io);
+        try sock.send(io, &sock.address, "peeked");
+        var msgs: [1]net.IncomingMessage = .{.init};
+        var buf: [16]u8 = undefined;
+        const err, const n = sock.receiveManyTimeout(io, &msgs, &buf, .{ .peek = true }, .none);
+        if (err) |e| return e;
+        try w.print("peek={d}:{s} ", .{ n, msgs[0].data });
+        const again = try sock.receive(io, &buf);
+        try w.print("then={s}\n", .{again.data});
+    }
+
+    // A connection to a loopback address comes from a loopback address.
+    {
+        var l = try lo.listen(io, .{});
+        defer l.deinit(io);
+        var peer: net.IpAddress = undefined;
+        var acc = io.async(acceptPeer, .{ io, &l, &peer });
+        const c = try l.socket.address.connect(io, .{ .mode = .stream });
+        c.close(io);
+        try acc.await(io);
+        try w.print("peer-first-octet={d}\n", .{peer.ip4.bytes[0]});
+    }
+
+    // Listening again on a port a connection still uses: only when the old
+    // listener and the new one both set SO_REUSEADDR.
+    for ([_]bool{ true, false }) |second_reuse| {
+        var l = try lo.listen(io, .{ .reuse_address = true });
+        var peer: net.IpAddress = undefined;
+        var acc = io.async(acceptKeep, .{ io, &l, &peer });
+        const c = try l.socket.address.connect(io, .{ .mode = .stream });
+        defer c.close(io);
+        const accepted = try acc.await(io);
+        defer accepted.close(io);
+        const port = l.socket.address.getPort();
+        l.deinit(io);
+        const again: net.IpAddress = .{ .ip4 = .loopback(port) };
+        if (again.listen(io, .{ .reuse_address = second_reuse })) |l2| {
+            var l3 = l2;
+            l3.deinit(io);
+            try w.print("relisten(reuse={}) ok\n", .{second_reuse});
+        } else |err| try w.print("relisten(reuse={}) {t}\n", .{ second_reuse, err });
+    }
+
+    // Deleting each entry as it is listed leaves nothing behind.
+    {
+        try dir.createDirPath(io, "many");
+        const many = try dir.openDir(io, "many", .{ .iterate = true });
+        defer many.close(io);
+        for ("abcdef") |c| try many.writeFile(io, .{ .sub_path = &.{c}, .data = "x" });
+        var it = many.iterate();
+        var listed: usize = 0;
+        while (try it.next(io)) |e| {
+            listed += 1;
+            try many.deleteFile(io, e.name);
+        }
+        var left: usize = 0;
+        var it2 = many.iterate();
+        while (try it2.next(io)) |_| left += 1;
+        try w.print("listed={d} left={d}\n", .{ listed, left });
+    }
 }
 
 /// A memory map: read a file through it, change it, write it back.
@@ -362,6 +451,8 @@ test "differential oracle: one std.Io program gives the same results on Threaded
     , real.links[0..real.links_len]);
     try testing.expectEqualStrings(real.links[0..real.links_len], simulated.links[0..simulated.links_len]);
     try testing.expectEqualStrings("0123456789|01abc56789", real.mapped[0..real.mapped_len]);
+    try testing.expectEqualStrings("peek=1:peeked then=peeked\npeer-first-octet=127\nrelisten(reuse=true) ok\nrelisten(reuse=false) AddressInUse\nlisted=6 left=0\n", real.review[0..real.review_len]);
+    try testing.expectEqualStrings(real.review[0..real.review_len], simulated.review[0..simulated.review_len]);
     try testing.expectEqualStrings(real.mapped[0..real.mapped_len], simulated.mapped[0..simulated.mapped_len]);
     try testing.expectEqual(real.stream_bytes, simulated.stream_bytes);
     try testing.expectEqual(real.stream, simulated.stream);

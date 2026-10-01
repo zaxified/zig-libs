@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Review fixes** (see SPEC.md § Review): stdio answers
+  `Unseekable` to positional I/O (default stdout writer and stdin reader work),
+  `Io.lockStderr` works, total-loss links time out instead of looping, `MSG_PEEK`,
+  loopback source addresses, `SO_REUSEADDR`, directory listings stable under
+  deletion, data before a reset, no ghost connection from a late SYN, corrupted
+  ICMP requests dropped, and several error-path fixes.
 - **2026-10-01** — Mutation run over the completion features (30 schemata, 29
   killed, 1 equivalent — see SPEC.md); ten new tests.
 - **2026-10-01** — staticfiles pilot: path-traversal safety of the real handler

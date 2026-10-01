@@ -52,6 +52,10 @@ pub const vtable: Io.VTable = blk: {
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
     vt.netLookup = netLookup;
+    vt.lockStderr = lockStderr;
+    vt.tryLockStderr = tryLockStderr;
+    vt.unlockStderr = unlockStderr;
+    vt.fileEnableAnsiEscapeCodes = fileEnableAnsiEscapeCodes;
     vt.fileMemoryMapCreate = fileMemoryMapCreate;
     vt.fileMemoryMapDestroy = fileMemoryMapDestroy;
     vt.fileMemoryMapSetLength = fileMemoryMapSetLength;
@@ -303,6 +307,9 @@ fn batchWait(h: *Host, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConc
     const deadline = sim.deadlineOf(h, timeout);
     while (true) {
         if (completeReady(h, batch)) return;
+        // Completions not yet taken with `next` count: awaiting again
+        // without draining them returns at once, as `Io.Threaded` does.
+        if (batch.completed.head != .none) return;
         if (batch.submitted.head == .none) return;
         const reason = sim.net.waitBatch(h, me, batch, deadline) catch return error.ConcurrencyUnavailable;
         switch (reason) {
@@ -480,11 +487,17 @@ fn fileClose(userdata: ?*anyopaque, files: []const File) void {
     fsOf(userdata).closeFiles(files);
 }
 
+// stdin/stdout/stderr are pipes or a terminal: positional I/O on them is
+// `Unseekable`, which is what makes `File.Reader`/`File.Writer` (positional
+// by default) fall back to streaming.
+
 fn fileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
+    if (file.handle <= 2) return error.Unseekable;
     return fsOf(userdata).writeAtFile(file, header, data, splat, offset);
 }
 
 fn fileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
+    if (file.handle <= 2) return error.Unseekable;
     return fsOf(userdata).readAt(file, data, offset);
 }
 
@@ -726,4 +739,39 @@ fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePosi
     while (done < mm.memory.len) {
         done += try fs.writeAtFile(mm.file, "", &.{mm.memory[done..]}, 1, mm.offset + done);
     }
+}
+
+// ── stderr ─────────────────────────────────────────────────────────────────
+//
+// `Io.lockStderr` hands out the host's own stderr writer under a lock its
+// tasks take turns on; what they write lands in `Host.console`. A simulated
+// host has no terminal: no colour, and no ANSI escape codes to enable.
+
+fn lockedStderr(h: *Host, mode: ?Io.Terminal.Mode) Io.LockedStderr {
+    h.stderr_writer = Io.File.stderr().writerStreaming(h.io(), &h.stderr_buf);
+    return .{ .file_writer = &h.stderr_writer, .terminal_mode = mode orelse .no_color };
+}
+
+fn lockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    const h = hostOf(userdata);
+    try h.stderr_mutex.lock(h.io());
+    return lockedStderr(h, mode);
+}
+
+fn tryLockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
+    const h = hostOf(userdata);
+    if (!h.stderr_mutex.tryLock()) return null;
+    return lockedStderr(h, mode);
+}
+
+fn unlockStderr(userdata: ?*anyopaque) void {
+    const h = hostOf(userdata);
+    h.stderr_writer.interface.flush() catch {};
+    h.stderr_mutex.unlock(h.io());
+}
+
+fn fileEnableAnsiEscapeCodes(userdata: ?*anyopaque, file: File) File.EnableAnsiEscapeCodesError!void {
+    _ = userdata;
+    _ = file;
+    return error.NotTerminalDevice;
 }

@@ -672,3 +672,52 @@ test "File.realPath of a file in the root directory" {
     _ = sim.run();
     try testing.expectEqualStrings("/top.txt", out[0..len]);
 }
+
+// ── review findings (2026-10-01) ───────────────────────────────────────────
+
+fn defaultStdio(io: Io, got_eof: *bool) !void {
+    // `writer`/`reader` start positional; stdio must answer `Unseekable` so
+    // they fall back to streaming, as on a pipe or a terminal.
+    var buf: [16]u8 = undefined;
+    var w = File.stdout().writer(io, &buf);
+    try w.interface.writeAll("through the default writer\n");
+    try w.interface.flush();
+    var rbuf: [8]u8 = undefined;
+    var r = File.stdin().reader(io, &rbuf);
+    if (r.interface.takeByte()) |_| {} else |err| got_eof.* = err == error.EndOfStream;
+}
+
+test "the default stdout writer and stdin reader work (stdio is unseekable)" {
+    var sim: Sim = undefined;
+    newSim(&sim, 48);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var eof = false;
+    try h.spawn(defaultStdio, .{ h.io(), &eof });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+    try testing.expectEqualStrings("through the default writer\n", h.console());
+    try testing.expect(eof);
+}
+
+fn viaLockStderr(io: Io, tag: u8) !void {
+    const locked = try io.lockStderr(&.{}, null);
+    defer io.unlockStderr();
+    // Held across a yield: the other task must wait its turn.
+    try locked.file_writer.interface.print("[{c}", .{tag});
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try locked.file_writer.interface.print("{c}]", .{tag});
+}
+
+test "Io.lockStderr gives the tasks of a host turns on its console" {
+    var sim: Sim = undefined;
+    newSim(&sim, 52);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.spawn(viaLockStderr, .{ h.io(), 'a' });
+    try h.spawn(viaLockStderr, .{ h.io(), 'b' });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+    const out = h.console();
+    try testing.expect(std.mem.eql(u8, out, "[aa][bb]") or std.mem.eql(u8, out, "[bb][aa]"));
+}

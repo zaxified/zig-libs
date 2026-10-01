@@ -258,6 +258,11 @@ pub const Host = struct {
     failure: ?anyerror = null,
     /// How many root tasks returned an error.
     failures: usize = 0,
+    /// `Io.lockStderr`: the host's stderr writer and the lock its tasks
+    /// take turns on (the writer feeds `console`).
+    stderr_mutex: Io.Mutex = .init,
+    stderr_buf: [256]u8 = undefined,
+    stderr_writer: Io.File.Writer = undefined,
 
     const Boot = struct {
         start: *const fn (context: *const anyopaque) void,
@@ -598,6 +603,7 @@ pub const Sim = struct {
         if (!h.up) return;
         h.up = false;
         h.crashes += 1;
+        h.stderr_mutex = .init; // a holder that died does not keep it
         sim.mix(0xc4a5_0000 + @as(u64, h.id));
 
         // Detach the host's tasks from everything that could wake them.

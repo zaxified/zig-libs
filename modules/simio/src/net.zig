@@ -129,6 +129,9 @@ const Seg = struct {
     kind: enum { data, fin, rst, window },
     data: []u8 = &.{},
     n: usize = 0,
+    /// Every retransmission was lost until the user timeout: the
+    /// connection dies when this segment's time comes.
+    doomed: bool = false,
 };
 
 /// One direction of a stream connection. Owned by `Net`; outlives the
@@ -188,6 +191,8 @@ pub const Sock = struct {
     syn_key: ?u64 = null,
     /// A Unix-socket listener: its key in `Net.unix`.
     unix_key: ?[]const u8 = null,
+    /// SO_REUSEADDR: set on a listener, inherited by what it accepts.
+    reuse: bool = false,
 
     fn removeWaiter(s: *Sock, f: *Fiber) void {
         for (s.waiters.items, 0..) |w, i| if (w == f) {
@@ -425,9 +430,16 @@ pub const Net = struct {
         var it = n.socks.valueIterator();
         while (it.next()) |s| if (s.*.host == h) {
             doomed.append(n.sim.gpa, s.*) catch {
-                // No memory for the list: destroy in place, then rescan.
-                s.*.waiters.clearRetainingCapacity();
-                n.destroySock(s.*);
+                // No memory for the list: destroy what it holds and this one
+                // in place, then rescan — never one socket twice.
+                const cur = s.*;
+                for (doomed.items) |d| {
+                    d.waiters.clearRetainingCapacity();
+                    n.destroySock(d);
+                }
+                doomed.clearRetainingCapacity();
+                cur.waiters.clearRetainingCapacity();
+                n.destroySock(cur);
                 it = n.socks.valueIterator();
             };
         };
@@ -465,13 +477,16 @@ pub const Net = struct {
         return n.next_sid;
     }
 
-    fn portTaken(h: *Host, kind: @FieldType(Sock, "kind"), port: u16) bool {
+    /// Linux's rule for a stream port: a listener always holds it; another
+    /// socket bound to it (a connection accepted there) holds it unless both
+    /// it and the newcomer set SO_REUSEADDR.
+    fn portTaken(h: *Host, kind: @FieldType(Sock, "kind"), port: u16, reuse: bool) bool {
         var it = h.handles.valueIterator();
         while (it.next()) |s| {
             const same = switch (kind) {
                 .udp => s.*.kind == .udp,
                 .icmp => s.*.kind == .icmp,
-                .listener, .stream => s.*.kind == .listener or s.*.kind == .stream,
+                .listener, .stream => s.*.kind == .listener or (s.*.kind == .stream and !(reuse and s.*.reuse)),
             };
             if (same and s.*.local.getPort() == port) return true;
         }
@@ -482,7 +497,7 @@ pub const Net = struct {
         for (0..16384) |_| {
             const p = h.next_port;
             h.next_port = if (p == 65535) 49152 else p + 1;
-            if (!portTaken(h, kind, p)) return p;
+            if (!portTaken(h, kind, p, false)) return p;
         }
         return null;
     }
@@ -499,6 +514,17 @@ pub const Net = struct {
     fn sourceOf(s: *const Sock) net.IpAddress {
         if (isUnspecified(s.local)) return ownAddress(s.host, s.local, s.local.getPort());
         return s.local;
+    }
+
+    /// The local address a socket of `h` uses to reach `dest`: a loopback
+    /// destination is reached from the loopback address, as on Linux, so the
+    /// peer sees 127.0.0.1 (or ::1), not the host's LAN address.
+    fn localFor(h: *Host, dest: net.IpAddress, port: u16) net.IpAddress {
+        if (isLoopback(dest)) return switch (dest) {
+            .ip4 => .{ .ip4 = .loopback(port) },
+            .ip6 => .{ .ip6 = .loopback(port) },
+        };
+        return ownAddress(h, dest, port);
     }
 
     fn newSock(n: *Net, h: *Host, kind: @FieldType(Sock, "kind"), local: net.IpAddress) Allocator.Error!*Sock {
@@ -530,7 +556,12 @@ pub const Net = struct {
         n.notify(s);
         if (s.handle >= 0) _ = s.host.handles.remove(s.handle);
         _ = n.socks.remove(s.sid);
-        if (s.syn_key) |k| _ = n.syn_seen.remove(k);
+        // Kept as a tombstone (sid 0 is never a socket): a duplicate of the
+        // client's SYN that arrives late, after this connection is gone, is
+        // dropped instead of opening a second, ghost connection.
+        if (s.syn_key) |k| if (n.syn_seen.getPtr(k)) |v| {
+            v.* = 0;
+        };
         if (s.unix_key) |k| {
             _ = n.unix.remove(k);
             n.sim.gpa.free(k);
@@ -644,6 +675,10 @@ pub const Net = struct {
     fn arriveIcmp(n: *Net, p: *Packet) void {
         if (p.data.len < 8) return;
         const v6 = p.dst == .ip6;
+        // A stack drops an ICMPv4 message whose checksum does not verify (a
+        // bit flipped on the way); ICMPv6's covers a pseudo-header simio
+        // does not build, so it is not checked.
+        if (!v6 and !icmp4ChecksumOk(p.data)) return;
         const request: u8 = if (v6) 128 else 8;
         const reply: u8 = if (v6) 129 else 0;
         if (p.data[0] == request) {
@@ -713,6 +748,7 @@ pub const Net = struct {
             .peer_sid = p.from_sid,
             .tx = pipe,
             .syn_key = p.from_sid,
+            .reuse = listener.reuse,
         };
         n.syn_seen.putAssumeCapacity(p.from_sid, c.sid);
         listener.accept_q.appendAssumeCapacity(c);
@@ -765,8 +801,14 @@ pub const Net = struct {
             var t = first;
             var rto = o.tcp_rto_min_ns;
             // A lost segment arrives one retransmission timeout later, then
-            // the next copy takes its own chances.
+            // the next copy takes its own chances — until the user timeout,
+            // past which the connection is dead (a link that loses everything
+            // would otherwise retransmit forever).
             while (t.lost) {
+                if (at - n.sim.now >= o.tcp_user_timeout_ns) {
+                    seg.doomed = true;
+                    break;
+                }
                 at += rto;
                 rto = @min(rto * 2, o.tcp_rto_max_ns);
                 t = n.transit(p.from_host, p.to_host) orelse break;
@@ -775,6 +817,9 @@ pub const Net = struct {
         seg.at = @max(at, p.last_at);
         p.last_at = seg.at;
         try p.segs.append(n.sim.gpa, seg);
+        // A segment that could not be scheduled is not queued: the caller
+        // still owns its bytes.
+        errdefer _ = p.segs.pop();
         if (!p.scheduled) {
             try n.sim.scheduleNet(@max(p.segs.items[p.head].at, n.sim.now), .{ .pipe = p });
             p.scheduled = true;
@@ -786,13 +831,14 @@ pub const Net = struct {
         const o = n.sim.opts.net;
         p.scheduled = false;
         if (p.head >= p.segs.items.len) return n.maybeFreePipe(p);
-        if (!n.reachable(p.from_host, p.to_host)) {
+        const doomed = p.segs.items[p.head].doomed;
+        if (doomed or !n.reachable(p.from_host, p.to_host)) {
             const since = p.failing_since orelse blk: {
                 p.failing_since = n.sim.now;
                 p.backoff = o.tcp_rto_min_ns;
                 break :blk n.sim.now;
             };
-            if (n.sim.now - since >= o.tcp_user_timeout_ns) {
+            if (doomed or n.sim.now - since >= o.tcp_user_timeout_ns) {
                 if (n.socks.get(p.from_sid)) |sender| {
                     sender.err = .timeout;
                     n.notify(sender);
@@ -850,9 +896,10 @@ pub const Net = struct {
         var local = address.*;
         if (local.getPort() == 0) {
             local.setPort(ephemeralPort(h, .listener) orelse return error.AddressInUse);
-        } else if (portTaken(h, .listener, local.getPort())) return error.AddressInUse;
+        } else if (portTaken(h, .listener, local.getPort(), options.reuse_address)) return error.AddressInUse;
         const s = n.newSock(h, .listener, local) catch return error.SystemResources;
         s.backlog = @max(options.kernel_backlog, 1);
+        s.reuse = options.reuse_address;
         _ = n.giveHandle(s) catch {
             n.destroySock(s);
             return error.SystemResources;
@@ -871,7 +918,7 @@ pub const Net = struct {
         var local = address.*;
         if (local.getPort() == 0) {
             local.setPort(ephemeralPort(h, kind) orelse return error.AddressInUse);
-        } else if (portTaken(h, kind, local.getPort())) return error.AddressInUse;
+        } else if (portTaken(h, kind, local.getPort(), false)) return error.AddressInUse;
         const s = n.newSock(h, kind, local) catch return error.SystemResources;
         _ = n.giveHandle(s) catch {
             n.destroySock(s);
@@ -885,9 +932,8 @@ pub const Net = struct {
         const me = sim.running();
         try sim.cancelPoint(me);
         const dst = n.hostOf(h, address.*) orelse return error.NetworkUnreachable;
-        const family: net.IpAddress.Family = address.*;
         if (options.mode == .dgram) {
-            const local = ownAddress(h, family, ephemeralPort(h, .udp) orelse return error.AddressUnavailable);
+            const local = localFor(h, address.*, ephemeralPort(h, .udp) orelse return error.AddressUnavailable);
             const s = n.newSock(h, .udp, local) catch return error.SystemResources;
             s.peer = address.*;
             _ = n.giveHandle(s) catch {
@@ -897,7 +943,7 @@ pub const Net = struct {
             return .{ .handle = s.handle, .address = local };
         }
         if (options.mode != .stream) return error.SocketModeUnsupported;
-        const local = ownAddress(h, family, ephemeralPort(h, .stream) orelse return error.AddressUnavailable);
+        const local = localFor(h, address.*, ephemeralPort(h, .stream) orelse return error.AddressUnavailable);
         const s = n.newSock(h, .stream, local) catch return error.SystemResources;
         const handle = n.giveHandle(s) catch {
             n.destroySock(s);
@@ -1011,11 +1057,13 @@ pub const Net = struct {
         while (true) {
             const s = h.handles.get(handle) orelse return error.SocketUnconnected;
             if (s.kind != .stream) return error.SocketUnconnected;
-            if (s.err) |e| return switch (e) {
+            const avail = s.buffered();
+            // Bytes already received come first; the error after them, as
+            // Linux reports a pending socket error only once the queue is read.
+            if (s.err) |e| if (avail == 0 or s.rx_shut) return switch (e) {
                 .reset, .refused => error.ConnectionResetByPeer,
                 .timeout => error.Timeout,
             };
-            const avail = s.buffered();
             if (avail > 0 and !s.rx_shut) {
                 var cap: usize = 0;
                 for (data) |d| cap += d.len;
@@ -1169,7 +1217,7 @@ pub const Net = struct {
             .kind = if (s.kind == .icmp) .icmp else .udp,
             .src_host = h.id,
             .dst_host = dst.id,
-            .src = sourceOf(s),
+            .src = if (isUnspecified(s.local) and isLoopback(dest)) localFor(h, dest, s.local.getPort()) else sourceOf(s),
             .dst = if (s.kind == .icmp) withPort(dest, 0) else dest,
             .data = data,
         };
@@ -1185,11 +1233,17 @@ pub const Net = struct {
         if (s.dgrams.items.len == 0) return null;
         var count: usize = 0;
         var used: usize = 0;
-        for (op.message_buffer) |*msg| {
-            if (s.dgrams.items.len == 0 or used == op.data_buffer.len) break;
-            const d = s.dgrams.orderedRemove(0);
-            defer gpa.free(d.data);
-            s.dgram_bytes -= d.data.len;
+        for (op.message_buffer, 0..) |*msg, i| {
+            // MSG_PEEK leaves the queue as it is: the next receive gets the
+            // same datagrams again.
+            if (op.flags.peek) {
+                if (i == s.dgrams.items.len or used == op.data_buffer.len) break;
+            } else if (s.dgrams.items.len == 0 or used == op.data_buffer.len) break;
+            const d = if (op.flags.peek) s.dgrams.items[i] else s.dgrams.orderedRemove(0);
+            defer if (!op.flags.peek) {
+                gpa.free(d.data);
+                s.dgram_bytes -= d.data.len;
+            };
             const room = op.data_buffer[used..];
             const k = @min(room.len, d.data.len);
             @memcpy(room[0..k], d.data[0..k]);
@@ -1234,7 +1288,11 @@ pub const Net = struct {
         while (idx != .none) {
             const st = &batch.storage[idx.toIndex()].submission;
             switch (st.operation) {
-                .net_receive => |op| if (h.handles.get(op.socket_handle)) |s| try s.waiters.append(n.sim.gpa, me),
+                // Once per socket, however many operations name it: a wake
+                // takes one registration off.
+                .net_receive => |op| if (h.handles.get(op.socket_handle)) |s| {
+                    if (std.mem.indexOfScalar(*Fiber, s.waiters.items, me) == null) try s.waiters.append(n.sim.gpa, me);
+                },
                 else => {},
             }
             idx = st.node.next;
@@ -1324,6 +1382,13 @@ fn withPort(a: net.IpAddress, port: u16) net.IpAddress {
 /// then a loopback stream, with the same close, reset and short-read rules.
 pub const unix_ip: [16]u8 = .{ 0xfd, 0x75, 0x6e, 0x69, 0x78, 0x00 } ++ .{0} ** 9 ++ .{1};
 
+fn isLoopback(a: net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |v4| v4.bytes[0] == 127,
+        .ip6 => |v6| isLoopback6(v6.bytes) or if (mapped4(v6.bytes)) |b4| b4[0] == 127 else false,
+    };
+}
+
 fn isLoopback6(b: [16]u8) bool {
     return std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1;
 }
@@ -1334,6 +1399,15 @@ fn mapped4(b: [16]u8) ?[4]u8 {
 }
 
 /// RFC 1071 checksum over an ICMPv4 message, written into bytes 2..4.
+fn icmp4ChecksumOk(msg: []const u8) bool {
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < msg.len) : (i += 2) sum += std.mem.readInt(u16, msg[i..][0..2], .big);
+    if (i < msg.len) sum += @as(u32, msg[i]) << 8;
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return sum == 0xffff;
+}
+
 fn setIcmp4Checksum(msg: []u8) void {
     msg[2] = 0;
     msg[3] = 0;

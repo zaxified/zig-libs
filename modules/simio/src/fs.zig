@@ -104,6 +104,17 @@ const OpenFile = struct {
     write: bool,
     pos: u64 = 0,
     lock: File.Lock = .none,
+    /// A directory being listed: the names as the listing started, so
+    /// entries removed meanwhile do not shift the ones not yet returned
+    /// (POSIX: an entry present for the whole listing is returned once).
+    listing: ?[][]u8 = null,
+
+    fn freeListing(of: *OpenFile, g: Allocator) void {
+        const names = of.listing orelse return;
+        for (names) |nm| g.free(nm);
+        g.free(names);
+        of.listing = null;
+    }
 };
 
 pub const Fs = struct {
@@ -122,6 +133,8 @@ pub const Fs = struct {
     fail_sync: u32 = 0,
     /// What the host's code wrote to stdout/stderr (bounded).
     console: std.ArrayList(u8) = .empty,
+    /// The listing of `Dir.cwd()` in progress (see `OpenFile.listing`).
+    cwd_listing: ?[][]u8 = null,
 
     pub fn init(fs: *Fs, h: *Host, seed: u64, capacity: ?u64) Allocator.Error!void {
         fs.* = .{ .host = h, .root = undefined, .prng = .init(seed ^ 0x66735f73696d2121), .capacity = capacity };
@@ -142,10 +155,13 @@ pub const Fs = struct {
             gpa.destroy(n);
         }
         fs.nodes.deinit(gpa);
+        var oi = fs.open.valueIterator();
+        while (oi.next()) |of| of.freeListing(gpa);
         fs.open.deinit(gpa);
         for (fs.journal.items) |op| gpa.free(op.name);
         fs.journal.deinit(gpa);
         fs.console.deinit(gpa);
+        freeNames(gpa, &fs.cwd_listing);
     }
 
     fn alloc(fs: *const Fs) Allocator {
@@ -336,7 +352,10 @@ pub const Fs = struct {
     /// current tree. Open handles are gone (the host's tasks are).
     pub fn crash(fs: *Fs) void {
         const g = fs.alloc();
+        var oi = fs.open.valueIterator();
+        while (oi.next()) |of| of.freeListing(g);
         fs.open.clearRetainingCapacity();
+        freeNames(g, &fs.cwd_listing);
         // A prefix of the journal, whole groups at a time, made it.
         var groups: u64 = 0;
         var last: u64 = 0;
@@ -568,7 +587,10 @@ pub const Fs = struct {
     }
 
     pub fn closeDirs(fs: *Fs, dirs: []const Dir) void {
-        for (dirs) |d| _ = fs.open.remove(d.handle);
+        for (dirs) |d| if (fs.open.fetchRemove(d.handle)) |kv| {
+            var of = kv.value;
+            of.freeListing(fs.alloc());
+        };
     }
 
     pub fn statDir(fs: *Fs, dir: Dir) File.StatError!File.Stat {
@@ -650,6 +672,9 @@ pub const Fs = struct {
                 else => error.FileNotFound,
             };
         } else dir;
+        // The parent opened above is the Atomic's to close; until it exists,
+        // a failure here must close it.
+        errdefer if (dirname != null) fs.closeDirs(&.{parent});
         const hex = fs.prng.next();
         const tmp = std.fmt.hex(hex);
         const file = fs.createFile(parent, &tmp, .{ .read = true, .exclusive = true, .permissions = options.permissions }) catch |err| return switch (err) {
@@ -735,24 +760,51 @@ pub const Fs = struct {
 
     pub fn read(fs: *Fs, reader: *Dir.Reader, out: []Dir.Entry) Dir.Reader.Error!usize {
         try fs.cancelPoint();
+        const g = fs.alloc();
         const n = fs.dirNode(reader.dir, "") catch return error.AccessDenied;
+        const listing: *?[][]u8 = if (fs.openOf(reader.dir.handle)) |of| &of.listing else &fs.cwd_listing;
         if (reader.state == .reset) {
             reader.index = 0;
             reader.state = .reading;
+            freeNames(g, listing);
+            const names = g.alloc([]u8, n.entries.count()) catch return error.SystemResources;
+            var made: usize = 0;
+            errdefer {
+                for (names[0..made]) |nm| g.free(nm);
+                g.free(names);
+            }
+            for (n.entries.keys()) |k| {
+                names[made] = g.dupe(u8, k) catch return error.SystemResources;
+                made += 1;
+            }
+            listing.* = names;
         }
         if (reader.state == .finished) return 0;
+        const names = listing.* orelse return 0;
         var count: usize = 0;
-        while (count < out.len and reader.index < n.entries.count()) : (reader.index += 1) {
-            const child = n.entries.values()[reader.index];
+        while (count < out.len and reader.index < names.len) : (reader.index += 1) {
+            // Gone since the listing started: skipped, as a removed entry is.
+            const idx = n.entries.getIndex(names[reader.index]) orelse continue;
+            const child = n.entries.values()[idx];
             out[count] = .{
-                .name = n.entries.keys()[reader.index],
+                .name = n.entries.keys()[idx],
                 .kind = kindOf(child),
                 .inode = child.ino,
             };
             count += 1;
         }
-        if (reader.index >= n.entries.count()) reader.state = .finished;
+        if (reader.index >= names.len) {
+            reader.state = .finished;
+            freeNames(g, listing);
+        }
         return count;
+    }
+
+    fn freeNames(g: Allocator, listing: *?[][]u8) void {
+        const names = listing.* orelse return;
+        for (names) |nm| g.free(nm);
+        g.free(names);
+        listing.* = null;
     }
 
     pub fn realPath(fs: *Fs, dir: Dir, sub: ?[]const u8, out: []u8) File.RealPathError!usize {
@@ -1126,8 +1178,8 @@ pub const Fs = struct {
             const sim = fs.host.sim;
             const me = sim.running();
             try sim.cancelPoint(me);
-            _ = sim.block(me, .sleep, true, sim.now + std.time.ns_per_ms) catch {};
-            if (me.wake_reason == .canceled) {
+            const reason = sim.block(me, .sleep, true, sim.now + std.time.ns_per_ms) catch .normal;
+            if (reason == .canceled) {
                 me.acknowledgeCancel();
                 return error.Canceled;
             }

@@ -858,3 +858,180 @@ test "socketpair is refused, as std 0.16 on Linux refuses it" {
     _ = sim.run();
     try testing.expect(err != null);
 }
+
+// ── review findings (2026-10-01) ───────────────────────────────────────────
+
+fn blackHoleClient(io: Io, to: net.IpAddress, out: *?anyerror) !void {
+    const s = try to.connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    try io.sleep(.fromMilliseconds(100), .awake); // the test turns the link into a black hole
+    var wbuf: [8]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    w.interface.writeAll("lost") catch {};
+    w.interface.flush() catch {};
+    var rbuf: [8]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    if (r.interface.takeByte()) |_| {} else |_| out.* = r.err orelse error.EndOfStream;
+}
+
+fn silentServer(io: Io) !void {
+    var l = try net.IpAddress.listen(&.{ .ip4 = .unspecified(7) }, io, .{});
+    defer l.deinit(io);
+    const s = try l.accept(io);
+    defer s.close(io);
+    try io.sleep(.fromSeconds(3600), .awake);
+}
+
+test "a stream over a link that loses everything times out instead of looping" {
+    var sim: Sim = undefined;
+    newSim(&sim, 49);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    try b.spawn(silentServer, .{b.io()});
+    var err: ?anyerror = null;
+    try a.spawn(blackHoleClient, .{ a.io(), addr4(b, 7), &err });
+    _ = sim.runFor(50 * std.time.ns_per_ms);
+    try sim.link(a, b, .{ .loss_permille = 1000 });
+    _ = sim.runFor(2000 * std.time.ns_per_s);
+    try testing.expectEqual(@as(?anyerror, error.Timeout), err);
+}
+
+fn twoReceivesOneSocket(io: Io, ok: *bool) !void {
+    const sock = try net.IpAddress.bind(&.{ .ip4 = .unspecified(5) }, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    var msgs: [2]net.IncomingMessage = .{ .init, .init };
+    var bufs: [2][16]u8 = undefined;
+    for (0..2) |i| batch.addAt(@intCast(i), .{ .net_receive = .{
+        .socket_handle = sock.handle,
+        .message_buffer = msgs[i..][0..1],
+        .data_buffer = &bufs[i],
+        .flags = .{},
+    } });
+    try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    batch.cancel(io);
+    while (batch.next()) |_| {}
+    // A wait after the batch must not be cut short by a stale registration.
+    const t0 = Io.Timestamp.now(io, .awake);
+    try io.sleep(.fromMilliseconds(500), .awake);
+    ok.* = t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds >= 500 * std.time.ns_per_ms;
+}
+
+fn sendTwice(io: Io, to: net.IpAddress) !void {
+    const s = try net.IpAddress.bind(&.{ .ip4 = .unspecified(0) }, io, .{ .mode = .dgram });
+    defer s.close(io);
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try s.send(io, &to, "one");
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try s.send(io, &to, "two");
+}
+
+test "a batch with two receives on one socket is woken once, and leaves no stale wait behind" {
+    var sim: Sim = undefined;
+    newSim(&sim, 50);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    var ok = false;
+    try a.spawn(twoReceivesOneSocket, .{ a.io(), &ok });
+    try b.spawn(sendTwice, .{ b.io(), addr4(a, 5) });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, null), a.failure);
+    try testing.expect(ok);
+}
+
+fn writeThenClose(io: Io) !void {
+    var l = try net.IpAddress.listen(&.{ .ip4 = .unspecified(8) }, io, .{});
+    defer l.deinit(io);
+    const s = try l.accept(io);
+    var wbuf: [8]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    try w.interface.writeAll("answer");
+    try w.interface.flush();
+    s.close(io);
+}
+
+fn readAfterPeerGone(io: Io, to: net.IpAddress, got: *[6]u8, ok: *bool) !void {
+    const s = try to.connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    try io.sleep(.fromMilliseconds(50), .awake); // the answer and the FIN are here
+    try s.shutdown(io, .send); // our FIN reaches a closed socket: it answers RST
+    try io.sleep(.fromMilliseconds(50), .awake);
+    var rbuf: [8]u8 = undefined;
+    var r = s.reader(io, &rbuf);
+    try r.interface.readSliceAll(got);
+    ok.* = true;
+}
+
+test "data already received is read before a later reset is reported" {
+    var sim: Sim = undefined;
+    newSim(&sim, 51);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    try b.spawn(writeThenClose, .{b.io()});
+    var got: [6]u8 = undefined;
+    var ok = false;
+    try a.spawn(readAfterPeerGone, .{ a.io(), addr4(b, 8), &got, &ok });
+    _ = sim.run();
+    try testing.expect(ok);
+    try testing.expectEqualStrings("answer", &got);
+}
+
+fn pingOnce(io: Io, to: [4]u8, out: *?anyerror) !void {
+    const sock = try net.IpAddress.bind(&.{ .ip4 = .unspecified(0) }, io, .{ .mode = .dgram, .protocol = .icmp });
+    defer sock.close(io);
+    var req: [8]u8 = .{ 8, 0, 0, 0, 0, 0, 0, 1 };
+    try sock.send(io, &.{ .ip4 = .{ .bytes = to, .port = 0 } }, &req);
+    var buf: [64]u8 = undefined;
+    if (sock.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } })) |_| {} else |err| out.* = err;
+}
+
+test "a corrupted ICMP echo request is dropped, not answered" {
+    var sim: Sim = undefined;
+    newSim(&sim, 53);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{ .corrupt_permille = 1000 });
+    var err: ?anyerror = null;
+    try a.spawn(pingOnce, .{ a.io(), b.ip4, &err });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, error.Timeout), err);
+}
+
+fn countAccepts(io: Io, n: *u32) !void {
+    var l = try net.IpAddress.listen(&.{ .ip4 = .unspecified(9) }, io, .{});
+    defer l.deinit(io);
+    while (true) {
+        const s = try l.accept(io);
+        n.* += 1;
+        s.close(io);
+    }
+}
+
+fn connectAndLeave(io: Io, to: net.IpAddress) !void {
+    const s = try to.connect(io, .{ .mode = .stream });
+    s.close(io);
+}
+
+test "a SYN delayed past its retry does not open a second, ghost connection" {
+    var sim: Sim = undefined;
+    newSim(&sim, 54);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    var accepted: u32 = 0;
+    try b.spawn(countAccepts, .{ b.io(), &accepted });
+    // The client's first SYN takes 3 s; its 1 s retry connects meanwhile.
+    try sim.scheduleFault(0, .{ .delay_once = .{ .from = a.id, .to = b.id, .extra_ns = 3 * std.time.ns_per_s } });
+    try a.spawn(connectAndLeave, .{ a.io(), addr4(b, 9) });
+    _ = sim.runFor(10 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u32, 1), accepted);
+}
