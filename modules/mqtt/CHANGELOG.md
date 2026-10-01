@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Broker: QoS 2, both ways.** An inbound QoS 2 PUBLISH is PUBRECed and
+  routed once; its id is remembered until the PUBREL, so a resend (DUP, or after a
+  reconnect — persistent sessions keep the ids) is answered and not routed twice, and
+  PUBREL always gets its PUBCOMP. Outbound QoS 2 waits for PUBREC, sends PUBREL, frees
+  the id on PUBCOMP; a resumed session resends a PUBRECed message as PUBREL, never the
+  PUBLISH (4.3.3-6), and queues QoS 2 while away. More than `max_in_flight` unreleased
+  inbound ids is a violation. New `Config.maximum_qos` (default `.exactly_once`) caps
+  grants, inbound QoS, `Broker.publish` and `restoreSession`; `.at_least_once` restores
+  the old behaviour. ⚠ A SUBSCRIBE asking for QoS 2 is now granted QoS 2 (was 1), and
+  an inbound QoS 2 PUBLISH no longer closes the connection.
 - **2026-10-01** — **Codec: MQTT 5.0.** `packet` encodes and decodes every 5.0 packet,
   AUTH included, with properties (all 27 of Table 2-4, validated per packet type:
   a misplaced identifier is `MalformedPacket`, a repeat or forbidden value

@@ -47,10 +47,10 @@
 //!      client implements all three; `amqtt` grants QoS 2), PINGREQ,
 //!      DISCONNECT — over a real socket, both directions logged.
 //!   7/8/9. **real `paho` ↔ this module's `Broker`**: CONNECT, SUBSCRIBE at
-//!      QoS 0/1, PUBLISH at QoS 0/1 (this module's broker caps grants at
-//!      QoS 1 — spec-legal, SPEC.md documents it), a retain-before-subscribe
-//!      session, and the documented "inbound QoS 2 tears the connection
-//!      down" behavior against a real client.
+//!      QoS 0/1, PUBLISH at QoS 0/1 (the broker capped grants at QoS 1 when
+//!      these were captured), a retain-before-subscribe session, and a real
+//!      client's inbound QoS 2 PUBLISH — torn down then, PUBRECed now (the
+//!      test asserts both, the old answer under `maximum_qos = 1`).
 //!
 //! Every byte constant below is asserted two ways where this module produced
 //! it live: (a) driving the real *decoder* on the real peer's bytes recovers
@@ -229,9 +229,10 @@ const paho_vs_zig_broker_retained = struct {
     pub const c2s_puback_delivery: []const u8 = &[_]u8{ 0x40, 0x02, 0x00, 0x01 };
 };
 
-/// Real `paho` ↔ this module's real `Broker`: an inbound QoS 2 PUBLISH from
-/// a genuine client is the documented protocol violation that tears the
-/// connection down.
+/// Real `paho` ↔ this module's real `Broker`: an inbound QoS 2 PUBLISH from a
+/// genuine client. Captured when the broker still refused QoS 2 (a protocol
+/// violation that tore the connection down); it now answers PUBREC, and only
+/// a broker capped at `maximum_qos = .at_least_once` keeps the old answer.
 const paho_vs_zig_broker_qos2 = struct {
     pub const c2s_connect: []const u8 = &[_]u8{ 0x10, 0x1c, 0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x1e, 0x00, 0x10, 0x70, 0x61, 0x68, 0x6f, 0x2d, 0x71, 0x6f, 0x73, 0x32, 0x2d, 0x76, 0x73, 0x2d, 0x7a, 0x69, 0x67 };
     pub const s2c_connack: []const u8 = &[_]u8{ 0x20, 0x02, 0x00, 0x00 };
@@ -605,24 +606,33 @@ test "external: our Broker delivers a real client's retained message after SUBAC
     try testing.expect(delivery_pkt.publish.retain);
 }
 
-// ── 7. this module's Broker, live, against real paho: QoS 2 rejection ──────
+// ── 7. this module's Broker, live, against real paho: QoS 2 ────────────────
 
-test "external: our Broker tears down on a real client's inbound QoS 2 PUBLISH" {
+test "external: a real client's inbound QoS 2 PUBLISH gets its PUBREC (or, capped at QoS 1, the old teardown)" {
     var alloc_state = std.heap.DebugAllocator(.{}).init;
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
 
-    var b = broker_mod.Broker.init(alloc, .{});
-    defer b.deinit();
-    var tt = BrokerTestTransport{};
-    const conn = try b.accept(tt.transport());
-    defer b.remove(conn);
+    // Captured when the broker still refused QoS 2; the input bytes are the
+    // real client's either way, only the answer they now get changed.
+    inline for (.{ packet.QoS.exactly_once, packet.QoS.at_least_once }) |cap| {
+        var b = broker_mod.Broker.init(alloc, .{ .maximum_qos = cap });
+        defer b.deinit();
+        var tt = BrokerTestTransport{};
+        const conn = try b.accept(tt.transport());
+        defer b.remove(conn);
 
-    try b.feed(conn, paho_vs_zig_broker_qos2.c2s_connect);
-    _ = try b.process(conn, 0);
-    try testing.expectEqualSlices(u8, paho_vs_zig_broker_qos2.s2c_connack, tt.sent());
-    tt.reset();
+        try b.feed(conn, paho_vs_zig_broker_qos2.c2s_connect);
+        _ = try b.process(conn, 0);
+        try testing.expectEqualSlices(u8, paho_vs_zig_broker_qos2.s2c_connack, tt.sent());
+        tt.reset();
 
-    try b.feed(conn, paho_vs_zig_broker_qos2.c2s_publish_qos2);
-    try testing.expectError(error.ProtocolViolation, b.process(conn, 0));
+        try b.feed(conn, paho_vs_zig_broker_qos2.c2s_publish_qos2);
+        if (cap == .exactly_once) {
+            try testing.expectEqual(broker_mod.Disposition.keep, try b.process(conn, 0));
+            try testing.expectEqualSlices(u8, &.{ 0x50, 0x02, 0x00, 0x01 }, tt.sent()); // PUBREC id 1
+        } else {
+            try testing.expectError(error.ProtocolViolation, b.process(conn, 0));
+        }
+    }
 }

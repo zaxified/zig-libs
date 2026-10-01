@@ -80,7 +80,7 @@ pub const ConnectionState = client_mod.ConnectionState;
 pub const max_in_flight = client_mod.max_in_flight;
 
 /// MQTT 3.1.1 broker (server): connection registry + subscription fan-out +
-/// retained store, QoS 0/1, clean session. Caller-driven and socket-free like
+/// retained store, QoS 0/1/2, clean and persistent sessions. Caller-driven and socket-free like
 /// `Client` (reversed direction); `broker.TcpServer` is an optional accept
 /// loop over `std.Io.net`. See `broker.zig` for scope + deferred features.
 pub const broker = @import("broker.zig");

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! MQTT 3.1.1 broker (server) — QoS 0 + 1, clean and persistent sessions, no TLS.
+//! MQTT 3.1.1 broker (server) — QoS 0, 1 and 2, clean and persistent sessions, no TLS.
 //!
 //! The mirror image of `client.zig`. Where the client drives one connection
 //! *to* a broker, the `Broker` here owns the shared server-side state — the
@@ -53,8 +53,13 @@
 //! and resource caps (max_connections / max_subscriptions_total /
 //! max_subscriptions_per_conn / max_retained / connect_timeout_ms).
 //!
-//! Deliberately deferred (documented, not built): QoS 2 (an inbound QoS 2
-//! PUBLISH is a protocol violation that tears the connection down), sessions
+//! QoS 2 (spec 4.3.3) both ways since 2026-10-01: an inbound one is PUBRECed
+//! and routed once, its id remembered until the PUBREL (in the session for a
+//! persistent client, so a resend after a reconnect is not routed twice); an
+//! outbound one waits for PUBREC, then PUBCOMP, and a resumed session resends
+//! the PUBREL rather than the message. `Config.maximum_qos` caps it.
+//!
+//! Deliberately deferred (documented, not built): sessions
 //! that survive a restart of the broker itself (they live in memory), DUP
 //! retransmit to a clean-session subscriber, MQTT 5.0, and TLS (terminate it in front and hand
 //! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
@@ -235,12 +240,21 @@ pub const Connection = struct {
     /// connection — the keep-alive reference point.
     last_packet_ms: i64 = 0,
 
-    // Outbound QoS 1 delivery to this subscriber: ids allocated in *this*
-    // connection's space, pending until the client's PUBACK. Guarded by
-    // `tx_lock`.
+    // Outbound QoS 1/2 delivery to this subscriber: ids allocated in *this*
+    // connection's space, pending until the client's PUBACK (QoS 1) or
+    // PUBREC then PUBCOMP (QoS 2). Guarded by `tx_lock`. A persistent
+    // session keeps its own (`Session.inflight`) instead.
     next_packet_id: u16 = 1,
-    pending: [max_in_flight]u16 = undefined,
+    pending: [max_in_flight]Outbound = undefined,
     pending_len: usize = 0,
+
+    /// Inbound QoS 2 ids this client has published and the broker has
+    /// PUBRECed, until its PUBREL (spec 4.3.3): a PUBLISH that repeats one
+    /// is the same message again and is not routed twice. Owner thread only.
+    /// A persistent session keeps them in `Session.inbound_qos2` instead,
+    /// because a client that reconnects may resend either packet.
+    inbound_qos2: [max_in_flight]u16 = undefined,
+    inbound_len: usize = 0,
 
     /// This connection's own subscription filters (owned strings). Gives the
     /// per-connection subscription count and the list to drop on teardown;
@@ -353,16 +367,16 @@ pub const Connection = struct {
     }
 
     /// Allocate the next free nonzero outbound packet id (wraps 65535 → 1,
-    /// skips ids still in flight); null when the pool is exhausted. Caller
-    /// holds `tx_lock`.
-    fn allocPacketId(c: *Connection) ?u16 {
+    /// skips ids still in flight), waiting in `phase`; null when the pool is
+    /// exhausted. Caller holds `tx_lock`.
+    fn allocPacketId(c: *Connection, phase: Outbound.Phase) ?u16 {
         if (c.pending_len >= c.pending.len) return null;
         var attempts: u32 = 0;
         while (attempts < std.math.maxInt(u16)) : (attempts += 1) {
             const id = c.next_packet_id;
             c.next_packet_id = if (c.next_packet_id == std.math.maxInt(u16)) 1 else c.next_packet_id + 1;
-            if (std.mem.indexOfScalar(u16, c.pending[0..c.pending_len], id) == null) {
-                c.pending[c.pending_len] = id;
+            if (c.pendingIndex(id) == null) {
+                c.pending[c.pending_len] = .{ .id = id, .phase = phase };
                 c.pending_len += 1;
                 return id;
             }
@@ -370,25 +384,66 @@ pub const Connection = struct {
         return null;
     }
 
+    fn pendingIndex(c: *const Connection, id: u16) ?usize {
+        for (c.pending[0..c.pending_len], 0..) |o, i| if (o.id == id) return i;
+        return null;
+    }
+
+    /// The phase outbound `id` waits in, or null when it is not pending.
+    fn pendingPhase(c: *const Connection, id: u16) ?Outbound.Phase {
+        const i = c.pendingIndex(id) orelse return null;
+        return c.pending[i].phase;
+    }
+
     fn removePending(c: *Connection, id: u16) void {
-        if (std.mem.indexOfScalar(u16, c.pending[0..c.pending_len], id)) |i| {
+        if (c.pendingIndex(id)) |i| {
             c.pending_len -= 1;
             c.pending[i] = c.pending[c.pending_len];
         }
     }
+
+    fn hasInbound(c: *const Connection, id: u16) bool {
+        return std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) != null;
+    }
+
+    fn removeInbound(c: *Connection, id: u16) bool {
+        const i = std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) orelse return false;
+        c.inbound_len -= 1;
+        c.inbound_qos2[i] = c.inbound_qos2[c.inbound_len];
+        return true;
+    }
+};
+
+/// One outbound QoS 1/2 delivery waiting for the client.
+const Outbound = struct {
+    id: u16,
+    phase: Phase,
+
+    const Phase = enum {
+        /// QoS 1: PUBLISH sent, PUBACK next.
+        puback,
+        /// QoS 2: PUBLISH sent, PUBREC next.
+        pubrec,
+        /// QoS 2: PUBREL sent, PUBCOMP next.
+        pubcomp,
+    };
 };
 
 // ── persistent sessions (spec 3.1.2.4) ──────────────────────────────────────
 
-/// One QoS 1 message held for a persistent session: queued while it waits for
-/// a delivery window, then in flight until its PUBACK. Topic and payload share
-/// one owned allocation.
+/// One QoS 1 or 2 message held for a persistent session: queued while it
+/// waits for a delivery window, then in flight until its PUBACK (QoS 1) or
+/// PUBCOMP (QoS 2). Topic and payload share one owned allocation.
 const Message = struct {
     bytes: []u8,
     topic_len: usize,
     retain: bool,
+    qos: QoS = .at_least_once,
     /// Packet id in the session's id space; 0 while queued.
     id: u16 = 0,
+    /// QoS 2: the client's PUBREC arrived and PUBREL went out, so a resume
+    /// resends the PUBREL, never the PUBLISH (spec 4.3.3-6, 4.4).
+    released: bool = false,
 
     fn topicName(m: Message) []const u8 {
         return m.bytes[0..m.topic_len];
@@ -450,6 +505,10 @@ pub const Session = struct {
     /// so moving a message into flight cannot fail.
     inflight: std.ArrayListUnmanaged(Message) = .empty,
     next_packet_id: u16 = 1,
+    /// Inbound QoS 2 ids PUBRECed and not yet PUBRELed — session state
+    /// (spec 4.1), so a client that reconnects and resends the PUBLISH does
+    /// not have it routed twice. At most `max_in_flight`, capacity reserved.
+    inbound_qos2: std.ArrayListUnmanaged(u16) = .empty,
     /// Messages this session lost to its queue limits (or to memory) — the
     /// per-session share of `Broker.queueDrops`.
     drops: u64 = 0,
@@ -883,12 +942,20 @@ pub const Config = struct {
     /// payload size, and `max_retained` never did either. 16 MiB.
     max_retained_bytes: usize = 16 << 20,
 
+    /// The highest QoS the broker takes and grants. A SUBSCRIBE asking for
+    /// more is granted this; a PUBLISH above it is a protocol violation that
+    /// closes the connection (3.1.1 has no way to say "not supported"
+    /// otherwise; 5.0 announces the limit in CONNACK and answers a breach
+    /// with DISCONNECT 0x9B). `Broker.publish` and `restoreSession` are held
+    /// to it too. Default: everything MQTT has.
+    maximum_qos: QoS = .exactly_once,
+
     /// Hard cap on persistent sessions (CONNECT with clean session 0), online
     /// or not. A new one past this is refused with CONNACK
     /// `server_unavailable`; resuming an existing one always succeeds.
     max_sessions: usize = 1024,
-    /// Per session: QoS 1 messages kept waiting while the client is away or
-    /// its delivery window (`max_in_flight`) is full. A message past either
+    /// Per session: QoS 1 and 2 messages kept waiting while the client is
+    /// away or its delivery window (`max_in_flight`) is full. A message past either
     /// bound is dropped for that session and counted in `queueDrops`.
     /// mosquitto's default is the same 1000 messages.
     max_queued_messages: usize = 1000,
@@ -1055,8 +1122,9 @@ pub const Broker = struct {
     retained_refusals: std.atomic.Value(usize) = .init(0),
     /// Bytes (topic + payload) held by `retained`. Guarded by `mutex`.
     retained_bytes: usize = 0,
-    /// Count of QoS 1 messages dropped because a subscriber's in-flight pool
-    /// was full — i.e. that subscriber has stopped answering PUBACKs.
+    /// Count of QoS 1/2 messages dropped because a clean-session subscriber's
+    /// in-flight pool was full — i.e. it has stopped answering PUBACKs (or
+    /// PUBRECs and PUBCOMPs).
     qos1_drops: std.atomic.Value(usize) = .init(0),
     /// Count of Wills that could not be delivered. The teardown path has no
     /// caller to return an error to, so the failure is counted instead of
@@ -1129,9 +1197,9 @@ pub const Broker = struct {
         return b.retained_bytes;
     }
 
-    /// How many QoS 1 deliveries have been dropped for a subscriber whose
-    /// in-flight pool was full. Non-zero means a subscriber has stopped
-    /// answering PUBACKs and is silently losing messages.
+    /// How many QoS 1/2 deliveries have been dropped for a clean-session
+    /// subscriber whose in-flight pool was full. Non-zero means a subscriber
+    /// has stopped acknowledging and is silently losing messages.
     pub fn qos1Drops(b: *const Broker) u64 {
         return b.qos1_drops.load(.monotonic);
     }
@@ -1244,7 +1312,8 @@ pub const Broker = struct {
         /// A username longer than `max_username`.
         InvalidUsername,
         /// A filter that is not one (4.7), one nested past the broker's
-        /// limit, or a QoS above 1 — nothing a SUBSCRIBE could have granted.
+        /// limit, or a QoS above `Config.maximum_qos` — nothing a SUBSCRIBE
+        /// could have granted.
         InvalidSubscription,
         /// `max_subscriptions_per_conn` or `max_subscriptions_total`.
         TooManySubscriptions,
@@ -1277,7 +1346,7 @@ pub const Broker = struct {
         if (username) |u| if (u.len > max_username) return error.InvalidUsername;
         if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
         for (subs) |sub| {
-            if (@intFromEnum(sub.qos) > 1) return error.InvalidSubscription;
+            if (@intFromEnum(sub.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidSubscription;
             topic.validateFilter(sub.filter) catch return error.InvalidSubscription;
             if (std.mem.count(u8, sub.filter, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
         }
@@ -1494,10 +1563,8 @@ pub const Broker = struct {
     ///
     /// `topic_name` is validated as a publish topic (4.7.1: no wildcards, no
     /// U+0000, non-empty) — the same rule an inbound PUBLISH is held to, so a
-    /// server cannot put on the wire what it would reject off it. QoS 2 is
-    /// refused for the same reason the inbound path refuses it: the broker's
-    /// exactly-once machinery is deferred, and pretending otherwise would
-    /// silently downgrade a delivery the caller asked to be exactly-once.
+    /// server cannot put on the wire what it would reject off it. A QoS above
+    /// `Config.maximum_qos` is refused for the same reason.
     ///
     /// ⚠ The parameter is `topic_name`, not `topic`, only because `topic` is
     /// this file's name for the topic module.
@@ -1508,7 +1575,7 @@ pub const Broker = struct {
         qos: QoS,
         retain: bool,
     ) Error!void {
-        if (qos == .exactly_once) return error.ProtocolViolation;
+        if (@intFromEnum(qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
         topic.validateName(topic_name) catch return error.ProtocolViolation;
 
         // A1 mqtt M1. Every subscriber's `tx_buf` is sized from
@@ -1619,14 +1686,19 @@ pub const Broker = struct {
                     return .keep;
                 },
                 .puback => |ack| {
-                    conn.tx_lock.lock();
-                    defer conn.tx_lock.unlock();
-                    if (conn.session) |x| {
-                        // A freed window slot is the cue to send the next
-                        // queued message — nothing else would.
-                        ackInflight(b.allocator, x, conn, ack.packet_id);
-                        try b.pumpLocked(conn, x);
-                    } else conn.removePending(ack.packet_id);
+                    try b.handleOutboundDone(conn, ack.packet_id, .puback);
+                    return .keep;
+                },
+                .pubrec => |ack| {
+                    try b.handlePubrec(conn, ack);
+                    return .keep;
+                },
+                .pubcomp => |ack| {
+                    try b.handleOutboundDone(conn, ack.packet_id, .pubcomp);
+                    return .keep;
+                },
+                .pubrel => |ack| {
+                    try b.handlePubrel(conn, ack.packet_id);
                     return .keep;
                 },
                 .pingreq => {
@@ -1649,8 +1721,7 @@ pub const Broker = struct {
                     b.mutex.unlock();
                     return .close;
                 },
-                // QoS 2 (PUBREC/PUBREL/PUBCOMP) is deferred; anything a client
-                // must not send to a server is a violation.
+                // Anything a client must not send to a server is a violation.
                 else => return error.ProtocolViolation,
             },
         }
@@ -1850,6 +1921,8 @@ pub const Broker = struct {
         x.setOwner(owner);
         try x.inflight.ensureTotalCapacity(b.allocator, max_in_flight);
         errdefer x.inflight.deinit(b.allocator);
+        try x.inbound_qos2.ensureTotalCapacity(b.allocator, max_in_flight);
+        errdefer x.inbound_qos2.deinit(b.allocator);
         try b.sessions.append(b.allocator, x);
         return x;
     }
@@ -1903,13 +1976,14 @@ pub const Broker = struct {
         x.queue.deinit(b.allocator);
         for (x.inflight.items) |m| b.allocator.free(m.bytes);
         x.inflight.deinit(b.allocator);
+        x.inbound_qos2.deinit(b.allocator);
         b.allocator.destroy(x);
     }
 
-    /// Queue one QoS 1 message for `x`, or count it dropped. Caller holds
+    /// Queue one QoS 1/2 message for `x`, or count it dropped. Caller holds
     /// `x.lock`. Never fails: a session that cannot take a message must not
     /// fail the publish that produced it.
-    fn enqueueLocked(b: *Broker, x: *Session, topic_name: []const u8, payload: []const u8, retain: bool) void {
+    fn enqueueLocked(b: *Broker, x: *Session, topic_name: []const u8, payload: []const u8, retain: bool, qos: QoS) void {
         const len = topic_name.len + payload.len;
         if (x.queuedLen() >= b.config.max_queued_messages or
             x.queued_bytes + len > b.config.max_queued_bytes)
@@ -1923,7 +1997,7 @@ pub const Broker = struct {
         };
         @memcpy(bytes[0..topic_name.len], topic_name);
         @memcpy(bytes[topic_name.len..], payload);
-        x.queue.append(b.allocator, .{ .bytes = bytes, .topic_len = topic_name.len, .retain = retain }) catch {
+        x.queue.append(b.allocator, .{ .bytes = bytes, .topic_len = topic_name.len, .retain = retain, .qos = qos }) catch {
             b.allocator.free(bytes);
             b.countDrop(x);
             return;
@@ -1956,7 +2030,7 @@ pub const Broker = struct {
                 bytes = packet.encodePublish(conn.tx_buf, .{
                     .topic = m.topicName(),
                     .payload = m.payload(),
-                    .qos = .at_least_once,
+                    .qos = m.qos,
                     .retain = m.retain,
                     .packet_id = m.id,
                 }) catch {
@@ -1970,9 +2044,11 @@ pub const Broker = struct {
         }
     }
 
-    /// Write every in-flight message of `x` again, with DUP. Caller holds
+    /// Write every in-flight message of `x` again, with DUP — or, for a QoS 2
+    /// one whose PUBREC already came, its PUBREL (4.4: "resend any
+    /// unacknowledged PUBLISH and PUBREL packets"). Caller holds
     /// `conn.tx_lock`, which is also what keeps the in-flight list from
-    /// changing under the loop: only a PUBACK on `conn` removes from it, and
+    /// changing under the loop: only an ack on `conn` removes from it, and
     /// only a pump holding this same lock adds to it.
     fn resendLocked(b: *Broker, conn: *Connection, x: *Session) Error!void {
         _ = b;
@@ -1984,14 +2060,17 @@ pub const Broker = struct {
                 defer x.lock.unlock();
                 if (x.conn != conn or i >= x.inflight.items.len) return;
                 const m = x.inflight.items[i];
-                bytes = try packet.encodePublish(conn.tx_buf, .{
-                    .topic = m.topicName(),
-                    .payload = m.payload(),
-                    .qos = .at_least_once,
-                    .retain = m.retain,
-                    .dup = true,
-                    .packet_id = m.id,
-                });
+                bytes = if (m.released)
+                    try packet.encodePubrel(conn.tx_buf, m.id)
+                else
+                    try packet.encodePublish(conn.tx_buf, .{
+                        .topic = m.topicName(),
+                        .payload = m.payload(),
+                        .qos = m.qos,
+                        .retain = m.retain,
+                        .dup = true,
+                        .packet_id = m.id,
+                    });
             }
             try conn.write(bytes);
         }
@@ -2080,7 +2159,7 @@ pub const Broker = struct {
                 var ok = false;
                 if (!live) {} else if (topic.validateFilter(req.filter)) |_| {
                     if (b.aclAllows(conn, req.filter, .subscribe, false)) {
-                        granted = minQos(req.qos, .at_least_once); // support up to QoS 1
+                        granted = minQos(req.qos, b.config.maximum_qos);
                         if (try b.registerSubscription(conn, req.filter, granted)) {
                             code = @intFromEnum(granted);
                             ok = true;
@@ -2134,11 +2213,11 @@ pub const Broker = struct {
         var sbuf: [4 + max_filters_per_subscribe]u8 = undefined;
         try conn.write(try packet.encodeSuback(&sbuf, s.packet_id, codes[0..n]));
         for (retsnap.items) |r| {
-            if (conn.session) |x| if (r.qos == .at_least_once) {
-                // A persistent session's QoS 1 goes through its queue, so the
-                // id is the session's and survives a reconnect.
+            if (conn.session) |x| if (r.qos != .at_most_once) {
+                // A persistent session's QoS 1/2 goes through its queue, so
+                // the id is the session's and survives a reconnect.
                 x.lock.lock();
-                b.enqueueLocked(x, r.topic, r.payload, true);
+                b.enqueueLocked(x, r.topic, r.payload, true, r.qos);
                 x.lock.unlock();
                 continue;
             };
@@ -2234,8 +2313,22 @@ pub const Broker = struct {
     }
 
     fn handlePublish(b: *Broker, conn: *Connection, pub_pkt: packet.Publish) Error!Disposition {
-        // QoS 2 inbound is deferred: refuse and tear the connection down.
-        if (pub_pkt.qos == .exactly_once) return error.ProtocolViolation;
+        if (@intFromEnum(pub_pkt.qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
+
+        if (pub_pkt.qos == .exactly_once) {
+            // An id this client already has a PUBREC for is the same message
+            // again — it never saw the PUBREC, or reconnected and resent
+            // (spec 4.3.3): answer it again and route nothing, so exactly
+            // once stays exactly once. Not even the tap sees it a second time.
+            if (b.inboundKnown(conn, pub_pkt.packet_id)) {
+                var buf: [4]u8 = undefined;
+                try conn.lockedWrite(try packet.encodePubrec(&buf, pub_pkt.packet_id));
+                return .keep;
+            }
+            // More unreleased QoS 2 messages than the window: the client is
+            // not sending PUBRELs, and an unbounded set is the alternative.
+            if (!b.inboundRoom(conn)) return error.ProtocolViolation;
+        }
 
         // ACL (FIX D): a denied PUBLISH is silently dropped — not retained, not
         // fanned out — but still PUBACKed so the publisher stays well-behaved.
@@ -2258,12 +2351,111 @@ pub const Broker = struct {
             try b.fanout(pub_pkt);
         }
 
-        // Acknowledge an inbound QoS 1 publish (QoS 0: nothing).
-        if (pub_pkt.qos == .at_least_once) {
-            var buf: [4]u8 = undefined;
-            try conn.lockedWrite(try packet.encodePuback(&buf, pub_pkt.packet_id));
+        // Acknowledge: QoS 1 PUBACK; QoS 2 PUBREC, the id remembered until
+        // the PUBREL — recorded only now, after routing, so a fan-out that
+        // failed leaves a resend free to be routed (QoS 0: nothing).
+        var buf: [4]u8 = undefined;
+        switch (pub_pkt.qos) {
+            .at_most_once => {},
+            .at_least_once => try conn.lockedWrite(try packet.encodePuback(&buf, pub_pkt.packet_id)),
+            .exactly_once => {
+                b.recordInbound(conn, pub_pkt.packet_id);
+                try conn.lockedWrite(try packet.encodePubrec(&buf, pub_pkt.packet_id));
+            },
         }
         return .keep;
+    }
+
+    // ── QoS 2 (spec 4.3.3) ───────────────────────────────────────────────────
+
+    /// Whether inbound QoS 2 `id` is between PUBREC and PUBREL.
+    fn inboundKnown(b: *Broker, conn: *Connection, id: u16) bool {
+        _ = b;
+        const x = conn.session orelse return conn.hasInbound(id);
+        x.lock.lock();
+        defer x.lock.unlock();
+        return std.mem.indexOfScalar(u16, x.inbound_qos2.items, id) != null;
+    }
+
+    fn inboundRoom(b: *Broker, conn: *Connection) bool {
+        _ = b;
+        const x = conn.session orelse return conn.inbound_len < conn.inbound_qos2.len;
+        x.lock.lock();
+        defer x.lock.unlock();
+        return x.inbound_qos2.items.len < max_in_flight;
+    }
+
+    /// Caller checked `inboundRoom` (capacity is reserved, so no failure).
+    fn recordInbound(b: *Broker, conn: *Connection, id: u16) void {
+        _ = b;
+        const x = conn.session orelse {
+            if (conn.inbound_len >= conn.inbound_qos2.len) return;
+            conn.inbound_qos2[conn.inbound_len] = id;
+            conn.inbound_len += 1;
+            return;
+        };
+        x.lock.lock();
+        defer x.lock.unlock();
+        if (x.inbound_qos2.items.len < max_in_flight) x.inbound_qos2.appendAssumeCapacity(id);
+    }
+
+    /// PUBREL from the client: inbound `id` is released. The id is forgotten
+    /// (a PUBLISH reusing it is a new message, 4.3.3-12) and PUBCOMP answers
+    /// whether or not it was known (4.3.3-11) — a client resuming a session
+    /// resends PUBRELs the broker may have answered already.
+    fn handlePubrel(b: *Broker, conn: *Connection, id: u16) Error!void {
+        _ = b;
+        if (conn.session) |x| {
+            x.lock.lock();
+            if (std.mem.indexOfScalar(u16, x.inbound_qos2.items, id)) |i| _ = x.inbound_qos2.swapRemove(i);
+            x.lock.unlock();
+        } else _ = conn.removeInbound(id);
+        var buf: [4]u8 = undefined;
+        try conn.lockedWrite(try packet.encodePubcomp(&buf, id));
+    }
+
+    /// PUBREC from the client for an outbound QoS 2 delivery: PUBREL goes
+    /// out and PUBCOMP is awaited (4.3.3). From here on a resume resends the
+    /// PUBREL, never the message (4.3.3-6). One for an id not pending gets a
+    /// PUBREL all the same: the client is waiting for it whatever the broker
+    /// lost. A 5.0 PUBREC with a failure code ends the delivery instead — no
+    /// PUBREL (4.4.0-2); 3.1.1 has no such code.
+    fn handlePubrec(b: *Broker, conn: *Connection, ack: packet.Ack) Error!void {
+        const id = ack.packet_id;
+        conn.tx_lock.lock();
+        defer conn.tx_lock.unlock();
+        if (ack.reason_code.isError()) {
+            if (conn.session) |x| {
+                ackInflight(b.allocator, x, conn, id, .pubrec);
+                try b.pumpLocked(conn, x);
+            } else if (conn.pendingPhase(id) == .pubrec) conn.removePending(id);
+            return;
+        }
+        if (conn.session) |x| {
+            x.lock.lock();
+            if (x.conn == conn) for (x.inflight.items) |*m| {
+                if (m.id == id and m.qos == .exactly_once) m.released = true;
+            };
+            x.lock.unlock();
+        } else if (conn.pendingIndex(id)) |i| {
+            if (conn.pending[i].phase == .pubrec) conn.pending[i].phase = .pubcomp;
+        }
+        var buf: [4]u8 = undefined;
+        try conn.write(try packet.encodePubrel(&buf, id));
+    }
+
+    /// PUBACK (QoS 1) or PUBCOMP (QoS 2): outbound `id` is delivered. One for
+    /// an id not waiting in that phase is ignored — a duplicate after a
+    /// resume, or a stray.
+    fn handleOutboundDone(b: *Broker, conn: *Connection, id: u16, phase: Outbound.Phase) Error!void {
+        conn.tx_lock.lock();
+        defer conn.tx_lock.unlock();
+        if (conn.session) |x| {
+            // A freed window slot is the cue to send the next queued
+            // message — nothing else would.
+            ackInflight(b.allocator, x, conn, id, phase);
+            try b.pumpLocked(conn, x);
+        } else if (conn.pendingPhase(id) == phase) conn.removePending(id);
     }
 
     /// Retained-store update + PUBLISH fan-out. The global lock is held only to
@@ -2311,7 +2503,7 @@ pub const Broker = struct {
                 } else try owners.append(b.allocator, ref);
             }
 
-            // A persistent session takes its QoS 1 copy into its queue here,
+            // A persistent session takes its QoS 1/2 copy into its queue here,
             // under the lock, whether or not a connection is there to send it:
             // what is queued cannot be lost to a disconnect that lands between
             // this snapshot and the write. QoS 0 reaches it only while online
@@ -2324,13 +2516,13 @@ pub const Broker = struct {
                     .session => |x| {
                         x.lock.lock();
                         defer x.lock.unlock();
-                        if (q == .at_least_once) b.enqueueLocked(x, pub_pkt.topic, pub_pkt.payload, false);
+                        if (q != .at_most_once) b.enqueueLocked(x, pub_pkt.topic, pub_pkt.payload, false, q);
                         const c = x.conn orelse continue;
                         if (c.state != .connected) continue;
                         targets.appendAssumeCapacity(.{
                             .conn = c,
                             .qos = q,
-                            .session = if (q == .at_least_once) x else null,
+                            .session = if (q != .at_most_once) x else null,
                         });
                     },
                 }
@@ -2392,29 +2584,27 @@ pub const Broker = struct {
     }
 
     /// Send one PUBLISH to a subscriber at `qos`. Caller holds `sub_conn`'s
-    /// `tx_lock` (guards `tx_buf` + the packet-id pool). For QoS 1 a packet id
-    /// is allocated in the subscriber's id space and tracked pending until its
-    /// PUBACK; if that pool is exhausted the message is dropped for this
-    /// subscriber. The QoS 0 → QoS 1 re-encode cannot overflow `tx_buf`
+    /// `tx_lock` (guards `tx_buf` + the packet-id pool). For QoS 1/2 a packet
+    /// id is allocated in the subscriber's id space and tracked pending until
+    /// its PUBACK, or PUBREC then PUBCOMP; if that pool is exhausted the
+    /// message is dropped for this subscriber. The QoS 0 → QoS 1 re-encode cannot overflow `tx_buf`
     /// (sized with `tx_headroom`, FIX B).
     fn deliverLocked(b: *Broker, sub_conn: *Connection, topic_name: []const u8, payload: []const u8, qos: QoS, retain: bool) Error!void {
-        var out_qos = qos;
         var id: u16 = 0;
-        if (qos == .at_least_once) {
+        if (qos != .at_most_once) {
             // Pool full: this subscriber is not answering PUBACKs, so drop
             // for it alone rather than stalling the fan-out. Counted, because
             // a silent drop with no signal is indistinguishable from a
             // delivery the subscriber simply never acted on.
-            id = sub_conn.allocPacketId() orelse {
+            id = sub_conn.allocPacketId(if (qos == .exactly_once) .pubrec else .puback) orelse {
                 _ = b.qos1_drops.fetchAdd(1, .monotonic);
                 return;
             };
-            out_qos = .at_least_once;
         }
         const bytes = try packet.encodePublish(sub_conn.tx_buf, .{
             .topic = topic_name,
             .payload = payload,
-            .qos = out_qos,
+            .qos = qos,
             .retain = retain,
             .packet_id = id,
         });
@@ -2494,14 +2684,21 @@ pub const Broker = struct {
     }
 };
 
-/// Free the in-flight message `id` of `x` on its PUBACK — only when `conn` is
-/// still the session's connection. Takes `x.lock`.
-fn ackInflight(alloc: std.mem.Allocator, x: *Session, conn: *Connection, id: u16) void {
+/// Free the in-flight message `id` of `x` once the client has it: PUBACK for
+/// QoS 1, PUBCOMP for a released QoS 2, or a failure-coded PUBREC for an
+/// unreleased one (`phase` names which arrived). Only while `conn` is still
+/// the session's connection. Takes `x.lock`.
+fn ackInflight(alloc: std.mem.Allocator, x: *Session, conn: *Connection, id: u16, phase: Outbound.Phase) void {
     x.lock.lock();
     defer x.lock.unlock();
     if (x.conn != conn) return;
     for (x.inflight.items, 0..) |m, i| {
-        if (m.id == id) {
+        const matches = switch (phase) {
+            .puback => m.qos == .at_least_once,
+            .pubrec => m.qos == .exactly_once and !m.released,
+            .pubcomp => m.qos == .exactly_once and m.released,
+        };
+        if (m.id == id and matches) {
             alloc.free(m.bytes);
             // Ordered: a resume resends in the order they were first sent.
             _ = x.inflight.orderedRemove(i);
@@ -3219,20 +3416,120 @@ test "empty client-id is accepted and assigned a generated id" {
     try testing.expect(std.mem.startsWith(u8, conn.clientId(), "auto-"));
 }
 
-test "inbound QoS2 publish is refused (deferred feature), never a panic" {
+fn feedAck(b: *Broker, conn: *Connection, comptime kind: packet.PacketType, id: u16) !void {
+    var buf: [4]u8 = undefined;
+    const bytes = switch (kind) {
+        .puback => try packet.encodePuback(&buf, id),
+        .pubrec => try packet.encodePubrec(&buf, id),
+        .pubrel => try packet.encodePubrel(&buf, id),
+        .pubcomp => try packet.encodePubcomp(&buf, id),
+        else => unreachable,
+    };
+    try b.feed(conn, bytes);
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 7));
+}
+
+test "inbound QoS 2: PUBREC, a resent PUBLISH is not routed twice, PUBREL frees the id" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ta = TestTransport{};
+    var tb = TestTransport{};
+    const a = try connectClient(&b, &ta, "A", 60, 0);
+    const bconn = try connectClient(&b, &tb, "B", 60, 0);
+    try feedSubscribe(&b, bconn, 1, &.{.{ .filter = "a/b", .qos = .exactly_once }});
+    try testing.expectEqualSlices(u8, &.{2}, (try tb.next()).?.suback.codes); // QoS 2 granted
+
+    const q2 = packet.Publish{ .topic = "a/b", .payload = "once", .qos = .exactly_once, .packet_id = 3 };
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, a, q2));
+    try testing.expectEqual(@as(u16, 3), (try ta.next()).?.pubrec.packet_id);
+    const got = (try tb.next()).?.publish;
+    try testing.expectEqual(packet.QoS.exactly_once, got.qos);
+    try testing.expectEqualStrings("once", got.payload);
+
+    // The publisher never saw the PUBREC and sends again, DUP set: answered,
+    // not routed.
+    var again = q2;
+    again.dup = true;
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, a, again));
+    try testing.expectEqual(@as(u16, 3), (try ta.next()).?.pubrec.packet_id);
+    try testing.expectEqual(@as(?packet.Packet, null), try tb.next());
+
+    // PUBREL → PUBCOMP, and the id is free: the same id now carries a NEW message.
+    try feedAck(&b, a, .pubrel, 3);
+    try testing.expectEqual(@as(u16, 3), (try ta.next()).?.pubcomp.packet_id);
+    try testing.expectEqual(@as(usize, 0), a.inbound_len);
+    _ = try feedPublish(&b, a, .{ .topic = "a/b", .payload = "twice", .qos = .exactly_once, .packet_id = 3 });
+    try testing.expect((try ta.next()).? == .pubrec);
+    try testing.expectEqualStrings("twice", (try tb.next()).?.publish.payload);
+
+    // A PUBREL for an id never seen is still answered (4.3.3-11).
+    try feedAck(&b, a, .pubrel, 99);
+    try testing.expectEqual(@as(u16, 99), (try ta.next()).?.pubcomp.packet_id);
+}
+
+test "outbound QoS 2: PUBREC brings PUBREL, only PUBCOMP frees the id, a stray PUBREC still gets its PUBREL" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tb = TestTransport{};
+    const bconn = try connectClient(&b, &tb, "B", 60, 0);
+    try feedSubscribe(&b, bconn, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try tb.next()).?; // SUBACK
+    try b.publish("t", "x", .exactly_once, false);
+    const id = (try tb.next()).?.publish.packet_id;
+    try testing.expectEqual(Outbound.Phase.pubrec, bconn.pendingPhase(id).?);
+
+    try feedAck(&b, bconn, .puback, id); // wrong ack for QoS 2: ignored
+    try testing.expectEqual(Outbound.Phase.pubrec, bconn.pendingPhase(id).?);
+    try feedAck(&b, bconn, .pubrec, id);
+    try testing.expectEqual(id, (try tb.next()).?.pubrel.packet_id);
+    try testing.expectEqual(Outbound.Phase.pubcomp, bconn.pendingPhase(id).?);
+    try feedAck(&b, bconn, .pubcomp, id);
+    try testing.expectEqual(@as(usize, 0), bconn.pending_len);
+
+    try feedAck(&b, bconn, .pubrec, 99);
+    try testing.expectEqual(@as(u16, 99), (try tb.next()).?.pubrel.packet_id);
+}
+
+test "QoS 2 meets the grant: delivery is min(published, granted) both ways (3.8.4-8)" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const s1 = try connectClient(&b, &t1, "S1", 60, 0);
+    const s2 = try connectClient(&b, &t2, "S2", 60, 0);
+    try feedSubscribe(&b, s1, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    try feedSubscribe(&b, s2, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try t1.next()).?;
+    _ = (try t2.next()).?;
+    try b.publish("t", "two", .exactly_once, false);
+    try testing.expectEqual(packet.QoS.at_least_once, (try t1.next()).?.publish.qos);
+    try testing.expectEqual(packet.QoS.exactly_once, (try t2.next()).?.publish.qos);
+    try b.publish("t", "one", .at_least_once, false);
+    try testing.expectEqual(packet.QoS.at_least_once, (try t1.next()).?.publish.qos);
+    try testing.expectEqual(packet.QoS.at_least_once, (try t2.next()).?.publish.qos);
+}
+
+test "maximum_qos = 1: grants are capped, an inbound QoS 2 closes the connection, the server cannot publish one" {
+    var b = Broker.init(testing.allocator, .{ .maximum_qos = .at_least_once });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try connectClient(&b, &tt, "A", 60, 0);
+    try feedSubscribe(&b, conn, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    try testing.expectEqualSlices(u8, &.{1}, (try tt.next()).?.suback.codes);
+    try testing.expectError(error.ProtocolViolation, b.publish("t", "x", .exactly_once, false));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("r", null, &.{.{ .filter = "t", .qos = .exactly_once }}, 0));
+    try testing.expectError(error.ProtocolViolation, feedPublish(&b, conn, .{ .topic = "t", .qos = .exactly_once, .packet_id = 1 }));
+}
+
+test "inbound QoS 2 window: more unreleased messages than max_in_flight is a violation" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
     var tt = TestTransport{};
     const conn = try connectClient(&b, &tt, "A", 60, 0);
-    var buf: [64]u8 = undefined;
-    const bytes = try packet.encodePublish(&buf, .{
-        .topic = "a/b",
-        .payload = "x",
-        .qos = .exactly_once,
-        .packet_id = 3,
-    });
-    try b.feed(conn, bytes);
-    try testing.expectError(error.ProtocolViolation, b.process(conn, 1));
+    for (1..max_in_flight + 1) |i| {
+        try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{ .topic = "t", .qos = .exactly_once, .packet_id = @intCast(i) }));
+    }
+    try testing.expectError(error.ProtocolViolation, feedPublish(&b, conn, .{ .topic = "t", .qos = .exactly_once, .packet_id = max_in_flight + 1 }));
 }
 
 test "hostile bytes from a client: typed errors, never a panic" {
@@ -3669,7 +3966,7 @@ test "a restored session queues from the start, and its client resumes it" {
 }
 
 test "restoreSession refuses what a SUBSCRIBE could not have granted, and leaves nothing" {
-    var b = Broker.init(testing.allocator, .{ .max_sessions = 1, .max_subscriptions_per_conn = 2 });
+    var b = Broker.init(testing.allocator, .{ .max_sessions = 1, .max_subscriptions_per_conn = 2, .maximum_qos = .at_least_once });
     defer b.deinit();
     const ok: []const Broker.SessionSub = &.{.{ .filter = "a", .qos = .at_least_once }};
     try testing.expectError(error.InvalidClientId, b.restoreSession("", null, ok, 0));
@@ -3818,6 +4115,90 @@ test "deinit frees online and offline sessions with messages queued and in fligh
     b.remove(off.conn);
     try b.publish("a", "x", .at_least_once, false); // in flight for one, queued for the other
     b.deinit(); // testing.allocator fails the test on any leak
+}
+
+test "a persistent session resumes QoS 2: the unacknowledged PUBLISH again with DUP, a PUBRECed one as PUBREL" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "q2", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try t1.next()).?; // SUBACK
+    try b.publish("t", "first", .exactly_once, false);
+    try b.publish("t", "second", .exactly_once, false);
+    const id1 = (try t1.next()).?.publish.packet_id;
+    const id2 = (try t1.next()).?.publish.packet_id;
+    try feedAck(&b, s1.conn, .pubrec, id1);
+    try testing.expectEqual(id1, (try t1.next()).?.pubrel.packet_id);
+    b.remove(s1.conn); // dies before PUBCOMP 1 and before PUBREC 2
+
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "q2", false, 10);
+    try testing.expect(s2.present);
+    // In the order first sent: the PUBREL for the first (never its PUBLISH
+    // again, 4.3.3-6), the second PUBLISH with DUP and its original id.
+    try testing.expectEqual(id1, (try t2.next()).?.pubrel.packet_id);
+    const re = (try t2.next()).?.publish;
+    try testing.expect(re.dup);
+    try testing.expectEqual(id2, re.packet_id);
+    try testing.expectEqual(packet.QoS.exactly_once, re.qos);
+    try testing.expectEqualStrings("second", re.payload);
+
+    try feedAck(&b, s2.conn, .pubcomp, id1);
+    try feedAck(&b, s2.conn, .pubrec, id2);
+    try testing.expectEqual(id2, (try t2.next()).?.pubrel.packet_id);
+    try feedAck(&b, s2.conn, .pubcomp, id2);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const st = try b.sessionStates(arena.allocator());
+    try testing.expectEqual(@as(usize, 0), st[0].inflight);
+    try testing.expectEqual(@as(usize, 0), st[0].queued);
+}
+
+test "a persistent session queues QoS 2 while away and delivers it at QoS 2" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "q2away", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try t1.next()).?;
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+    try b.publish("t", "while away", .exactly_once, false);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("q2away"));
+
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "q2away", false, 10);
+    try testing.expect(s2.present);
+    const m = (try t2.next()).?.publish;
+    try testing.expectEqual(packet.QoS.exactly_once, m.qos);
+    try testing.expect(!m.dup);
+    try testing.expectEqualStrings("while away", m.payload);
+}
+
+test "a persistent session keeps inbound QoS 2 ids across a reconnect: the resent PUBLISH is not routed twice" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const sub = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "t" }});
+    _ = (try ts.next()).?;
+
+    var t1 = TestTransport{};
+    const p1 = try connectSession(&b, &t1, "pub", false, 0);
+    _ = try feedPublish(&b, p1.conn, .{ .topic = "t", .payload = "m", .qos = .exactly_once, .packet_id = 5 });
+    try testing.expect((try t1.next()).? == .pubrec);
+    try testing.expectEqualStrings("m", (try ts.next()).?.publish.payload);
+    b.remove(p1.conn); // the PUBREC was lost with the connection
+
+    var t2 = TestTransport{};
+    const p2 = try connectSession(&b, &t2, "pub", false, 10);
+    try testing.expect(p2.present);
+    _ = try feedPublish(&b, p2.conn, .{ .topic = "t", .payload = "m", .qos = .exactly_once, .packet_id = 5, .dup = true });
+    try testing.expectEqual(@as(u16, 5), (try t2.next()).?.pubrec.packet_id);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next()); // not routed again
+    try feedAck(&b, p2.conn, .pubrel, 5);
+    try testing.expectEqual(@as(u16, 5), (try t2.next()).?.pubcomp.packet_id);
 }
 
 fn expectDelivered(t: *TestTransport, expect_topic: []const u8) !void {
@@ -5200,10 +5581,12 @@ test "the server is held to the same topic rules as its clients" {
     try testing.expectError(error.ProtocolViolation, b.publish("", "x", .at_most_once, false));
     try testing.expectError(error.ProtocolViolation, b.publish("a/\x00/b", "x", .at_most_once, false));
 
-    // QoS 2 is refused rather than quietly downgraded: the broker's
-    // exactly-once machinery is deferred, and a silent downgrade would be a
-    // delivery guarantee the caller thinks it has.
-    try testing.expectError(error.ProtocolViolation, b.publish("sn/1/clock/conf", "x", .exactly_once, false));
+    // A QoS above `maximum_qos` is refused rather than quietly downgraded:
+    // a silent downgrade would be a delivery guarantee the caller thinks it
+    // has. (The default takes QoS 2, see the QoS 2 tests.)
+    var capped = Broker.init(testing.allocator, .{ .maximum_qos = .at_least_once });
+    defer capped.deinit();
+    try testing.expectError(error.ProtocolViolation, capped.publish("sn/1/clock/conf", "x", .exactly_once, false));
 }
 
 test "the tap does not observe the server's own publishes" {
