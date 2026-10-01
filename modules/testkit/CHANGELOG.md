@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **New `loopbackSkip`, `loopbackGuaranteed`, `netns_env`.** The give-up for a test
+  that cannot get a loopback socket: `error.SkipZigTest` as before, unless `ZIGLIBS_NETNS` is set
+  (by `scripts/lib/netns-run`, which brings `lo` up and checks it), where it is
+  `error.LoopbackUnavailable` — a test failure. About 25 modules spelled the skip by hand, and a
+  skip reports PASS with a summary line that looks identical. Additive.
 - **2026-09-28** — **New `fuzz.driver`: the deterministic fuzz driver.** `fuzz.driver.run(harness,
   .{ .prefix, .name })` runs a harness generic over its source of choices over seeded inputs in the
   ordinary test binary — a watchdog per input (`HANG <name> seed=N`, exit 124), `FAIL <name>

@@ -49,6 +49,7 @@ place to put things a test might one day want.
 | `verboseSkip` / `skip` | 42 byte-identical copies across 26 modules |
 | `hex.bytes` | 18 byte-identical copies across 8 modules |
 | `expectHex` / `expectBytes` | every `goldens.zig` spelled it differently |
+| `loopbackSkip` | the hand-written "loopback bind failed, skipping" give-up in ~25 modules (2026-10-01) |
 | `fuzz.driver.run` / `fuzz.Rng` / `fuzz.driver.hit` | the deterministic fuzz driver, copied by hand into seglog and zstd (2026-09-27) before qap needed it a third time |
 
 The golden comparison is the one piece that is *better* than what it replaced,
@@ -69,6 +70,12 @@ const testkit = @import("testkit");
 // Skips. Returns the error, so `return` cannot fall through to the
 // assertions it was meant to skip.
 if (!haveCapability()) return testkit.skip("needs CAP_BPF (uid {d})", .{uid});
+
+// A test that cannot get a loopback socket. A skip anywhere else; a FAILURE
+// under scripts/lib/netns-run (ZIGLIBS_NETNS=1), where loopback is guaranteed
+// and a skip would be a green run that did nothing.
+const listener = addr.listen(io, .{}) catch |err|
+    return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
 
 // Hex, in the three shapes the repo uses.
 const key = comptime testkit.hex.bytes(32, "000102...");   // KAT vectors

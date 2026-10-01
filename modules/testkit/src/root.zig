@@ -14,6 +14,9 @@
 //!     differently and which is the one piece here that is *better* than what
 //!     it replaces (see its doc comment).
 //!
+//!   - `loopbackSkip` — the "loopback bind failed, skipping" give-up ~25
+//!     modules spelled by hand, made a failure under `scripts/lib/netns-run`.
+//!
 //! Deliberately NOT here: netns setup and privileged-capability probing. Those
 //! read genuinely differently per module (`tc` wants a fresh netns with `lo`
 //! at ifindex 1; `ebpf` wants CAP_BPF in the *initial* user namespace, where
@@ -129,6 +132,60 @@ pub fn skip(comptime fmt: []const u8, args: anytype) error{SkipZigTest} {
         std.debug.print("\nSKIPPED: " ++ fmt ++ "\n", args);
     }
     return error.SkipZigTest;
+}
+
+/// Set (to anything non-empty but `0`) by `scripts/lib/netns-run`, which runs a
+/// test binary in a private network namespace after bringing its `lo` up and
+/// checking that it is.
+///
+/// ⚠ Like `verbose_skip_env`, the NAME is pinned by no test here; it is held by
+/// `scripts/lib/netns-run` using the same spelling, so grep before renaming.
+pub const netns_env = "ZIGLIBS_NETNS";
+
+/// Whether the environment promises a working loopback (see `netns_env`).
+pub fn loopbackGuaranteed() bool {
+    return loopbackPromised(getEnv(netns_env));
+}
+
+/// The decision, split out from the environment read so it can be tested.
+/// Unlike `verboseEnabled`, `0` means off: this one turns skips into failures,
+/// so a way to say "no" explicitly is worth having.
+pub fn loopbackPromised(raw: ?[]const u8) bool {
+    const v = raw orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
+/// Give up on a test that needs a loopback socket and could not get one.
+///
+/// Anywhere else this is `skip`: a sandbox with no usable loopback should not
+/// fail a build. Under `netns-run` loopback is guaranteed, so the same failure
+/// is a broken test or a broken namespace, and it is reported as
+/// `error.LoopbackUnavailable` — a skip there would be a test reporting success
+/// for a run in which it did nothing, with a summary line that looks identical.
+/// Use it only where the cause is loopback itself (a bind, listen, connect or
+/// accept on 127.0.0.1 / ::1), never for a missing peer or privilege.
+pub fn loopbackSkip(comptime fmt: []const u8, args: anytype) error{ SkipZigTest, LoopbackUnavailable } {
+    if (loopbackGuaranteed()) {
+        std.debug.print("\n" ++ netns_env ++ " is set (loopback guaranteed) but: " ++ fmt ++ "\n", args);
+        return error.LoopbackUnavailable;
+    }
+    return skip(fmt, args);
+}
+
+test "loopbackPromised: unset, empty and 0 are off; anything else is on" {
+    try std.testing.expect(!loopbackPromised(null));
+    try std.testing.expect(!loopbackPromised(""));
+    try std.testing.expect(!loopbackPromised("0"));
+    try std.testing.expect(loopbackPromised("1"));
+    try std.testing.expect(loopbackPromised("yes"));
+}
+
+test "loopbackSkip skips when loopback is not guaranteed" {
+    // The other branch prints, and stderr on a green step reads as a failure to
+    // the gate; it is proved by running the loopback modules under netns-run
+    // with `lo` left down, where every such test must FAIL.
+    if (loopbackGuaranteed()) return;
+    try std.testing.expectEqual(error.SkipZigTest, loopbackSkip("bind failed ({s})", .{"test"}));
 }
 
 test "skip always returns SkipZigTest" {
