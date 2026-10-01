@@ -928,7 +928,7 @@ test "sessionId borrows from the transport (regression: not a dead stack copy)" 
 fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(out);
     var cipher: transport.CipherState = .none;
-    for (payloads) |p| try transport.writePacket(&w, &cipher, p);
+    for (payloads) |p| try transport.writePacket(&w, &cipher, .os, p);
     return w.buffered();
 }
 

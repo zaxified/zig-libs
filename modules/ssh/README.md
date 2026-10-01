@@ -46,8 +46,8 @@ no skips.
   RFC 8308 (extension negotiation, `server-sig-algs`).
   Design reference: ringtailsoftware/misshod (MIT) for architecture *shape*
   only — no source copied.
-- **Platform:** linux — the transport's `fillRandom` is a raw `getrandom(2)`
-  loop on the Binary-Packet-Protocol write path, so a non-Linux target fails to
+- **Platform:** linux — the transport's default entropy source
+  (`transport.Entropy.os`) is a raw `getrandom(2)` loop on the Binary-Packet-Protocol write path, so a non-Linux target fails to
   compile, it does not silently degrade. **Role:** both (client + server). **Concurrency:**
   single_owner — one `Transport` instance owns one connection's
   sequence-number/cipher state; no shared/global state.

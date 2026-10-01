@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **BREAKING (low-level API only).** Entropy can come from
+  `std.Io`: `transport.Entropy` (`.os` = getrandom(2), the default; `.io` =
+  `Io.randomSecure`) and `Transport.entropy`. Ephemeral keys, KEXINIT cookies and
+  packet padding were drawn from getrandom(2) behind `std.Io`, so a deterministic
+  `Io` (simio) could not reproduce a session from its seed. `writePacket`,
+  `curve25519Kex`, `dhGroupKex`, `mlkem768x25519Kex` and the three `*KexServer`
+  functions take an `entropy` argument after `cipher`; `connect`, `accept`,
+  `Transport` and everything above them are unchanged.
 - **2026-09-10** — **ADDITIVE, not breaking (two findings).**
   - `ServeConfig` gained `subsystem_names: []const []const u8 = &.{}` (`connection.zig`).
     Before this, once `subsystem` was set at all, ANY subsystem name got

@@ -60,9 +60,9 @@ pub const meta = .{
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "linux",
-    // `transport.zig`/`server.zig` `fillRandom` is a raw `getrandom(2)` loop
-    // that `@compileError`s on any non-Linux target, and it is on the core
-    // Binary-Packet-Protocol write path — so the whole module is Linux-only,
+    // `transport.Entropy.os` (the default entropy source) is a raw
+    // `getrandom(2)` loop that `@compileError`s on any non-Linux target, and
+    // it is on the core Binary-Packet-Protocol write path — so the whole module is Linux-only,
     // not just an optional corner. (One of CONVENTIONS §2's two deliberate
     // hand-rolled-entropy exceptions, alongside `bulletproofs`.)
     .targets = .{.linux64},

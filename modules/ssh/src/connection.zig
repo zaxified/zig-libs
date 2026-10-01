@@ -2006,7 +2006,7 @@ test "live interop: real OpenSSH ssh client → our server — RSA user key (RFC
 fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(out);
     var cipher: transport.CipherState = .none;
-    for (payloads) |p| try transport.writePacket(&w, &cipher, p);
+    for (payloads) |p| try transport.writePacket(&w, &cipher, .os, p);
     return w.buffered();
 }
 

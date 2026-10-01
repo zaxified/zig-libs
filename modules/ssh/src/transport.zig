@@ -311,10 +311,26 @@ pub fn encodeServerSigAlgs(w: *std.Io.Writer, algorithms: []const []const u8) Tr
 
 // ── entropy ────────────────────────────────────────────────────────────────
 
-/// Fill `buf` with cryptographically secure random bytes from the OS. Never a
-/// user-space PRNG — key material and the KEXINIT cookie depend on real
-/// entropy. Panics (does not silently degrade) if the OS entropy source is
-/// unavailable, matching how the rest of this repo treats a CSPRNG failure.
+/// Where key material, KEXINIT cookies and packet padding come from. Never a
+/// user-space PRNG of this module's own — key material depends on real
+/// entropy. Panics (does not silently degrade) if the source is unavailable,
+/// matching how the rest of this repo treats a CSPRNG failure.
+pub const Entropy = union(enum) {
+    /// getrandom(2), directly. The default, so a transport needs no `std.Io`.
+    os,
+    /// `Io.randomSecure`. A deterministic `Io` (a simulator) then reproduces
+    /// a whole session from its seed, key exchange included; with
+    /// `std.Io.Threaded` it is the same getrandom(2).
+    io: std.Io,
+
+    pub fn fill(self: Entropy, buf: []u8) void {
+        switch (self) {
+            .os => fillRandom(buf),
+            .io => |io| io.randomSecure(buf) catch @panic("entropy unavailable"),
+        }
+    }
+};
+
 fn fillRandom(buf: []u8) void {
     if (builtin.os.tag != .linux)
         @compileError("fillRandom: only the Linux getrandom(2) entropy path is wired up in part 1");
@@ -733,7 +749,7 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
 /// Write one binary packet (RFC 4253 §6.1) carrying `payload` to `w` under
 /// `cipher`'s state (computing padding, encrypting, appending the MAC as
 /// needed), then flush. Advances the sequence number.
-pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8) TransportError!void {
+pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, payload: []const u8) TransportError!void {
     var buf: [8192]u8 = undefined;
     switch (cipher.*) {
         .none => {
@@ -746,7 +762,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             std.mem.writeInt(u32, buf[0..4], pkt_len, .big);
             buf[4] = @intCast(padlen);
             @memcpy(buf[5 .. 5 + payload.len], payload);
-            fillRandom(buf[5 + payload.len .. total]);
+            entropy.fill(buf[5 + payload.len .. total]);
             try w.writeAll(buf[0..total]);
             try w.flush();
         },
@@ -763,7 +779,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             ChaCha.xor(buf[0..4], &lenbytes, 0, st.key_header, nonce);
             buf[4] = @intCast(padlen);
             @memcpy(buf[5 .. 5 + payload.len], payload);
-            fillRandom(buf[5 + payload.len .. 4 + pkt_len]);
+            entropy.fill(buf[5 + payload.len .. 4 + pkt_len]);
             ChaCha.xor(buf[4 .. 4 + pkt_len], buf[4 .. 4 + pkt_len], 1, st.key_main, nonce);
             var polykey: [32]u8 = undefined;
             ChaCha.stream(&polykey, 0, st.key_main, nonce);
@@ -784,7 +800,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             std.mem.writeInt(u32, buf[0..4], pkt_len, .big);
             buf[4] = @intCast(padlen);
             @memcpy(buf[5 .. 5 + payload.len], payload);
-            fillRandom(buf[5 + payload.len .. total_pt]);
+            entropy.fill(buf[5 + payload.len .. total_pt]);
             var mac: [32]u8 = undefined;
             var hm = Hmac.init(&st.mac_key);
             var seqb: [4]u8 = undefined;
@@ -812,7 +828,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             std.mem.writeInt(u32, buf[0..4], pkt_len, .big); // AAD, cleartext
             buf[4] = @intCast(padlen);
             @memcpy(buf[5 .. 5 + payload.len], payload);
-            fillRandom(buf[5 + payload.len .. 4 + pkt_len]);
+            entropy.fill(buf[5 + payload.len .. 4 + pkt_len]);
             var nonce: [12]u8 = undefined;
             @memcpy(nonce[0..4], &st.fixed_iv);
             std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
@@ -1239,6 +1255,7 @@ pub fn curve25519Kex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *CipherState,
+    entropy: Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -1247,7 +1264,7 @@ pub fn curve25519Kex(
     negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     var seed: [32]u8 = undefined;
-    fillRandom(&seed);
+    entropy.fill(&seed);
     defer std.crypto.secureZero(u8, &seed);
     const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KexFailed;
     const q_c = kp.public_key;
@@ -1257,7 +1274,7 @@ pub fn curve25519Kex(
     var iw: std.Io.Writer = .fixed(&ibuf);
     iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
     messages.writeString(&iw, &q_c) catch return error.KexFailed;
-    try writePacket(w, cipher, iw.buffered());
+    try writePacket(w, cipher, entropy, iw.buffered());
 
     // SSH_MSG_KEX_ECDH_REPLY.
     var buf: [16384]u8 = undefined;
@@ -1461,6 +1478,7 @@ pub fn dhGroupKex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *CipherState,
+    entropy: Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -1478,7 +1496,7 @@ pub fn dhGroupKex(
     var x: [group16_prime.len]u8 = undefined;
     const xb = x[0..group.prime.len];
     defer std.crypto.secureZero(u8, &x);
-    fillRandom(xb);
+    entropy.fill(xb);
     xb[0] &= 0x7f; // keep x < p (top bit clear is sufficient for these primes)
     xb[xb.len - 1] |= 1; // ensure nonzero
 
@@ -1491,7 +1509,7 @@ pub fn dhGroupKex(
     var iw: std.Io.Writer = .fixed(&ibuf);
     iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
     messages.writeMpint(&iw, e) catch return error.KexFailed;
-    try writePacket(w, cipher, iw.buffered());
+    try writePacket(w, cipher, entropy, iw.buffered());
 
     // SSH_MSG_KEXDH_REPLY: byte || string K_S || mpint f || string sig.
     var buf: [16384]u8 = undefined;
@@ -1596,6 +1614,7 @@ pub fn mlkem768x25519Kex(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *CipherState,
+    entropy: Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -1605,13 +1624,13 @@ pub fn mlkem768x25519Kex(
 ) TransportError!KexResult {
     // X25519 ephemeral.
     var x_seed: [32]u8 = undefined;
-    fillRandom(&x_seed);
+    entropy.fill(&x_seed);
     defer std.crypto.secureZero(u8, &x_seed);
     const x_kp = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KexFailed;
 
     // ML-KEM-768 keypair (we are the decapsulator; we send the encaps key).
     var kem_seed: [MLKem768.seed_length]u8 = undefined;
-    fillRandom(&kem_seed);
+    entropy.fill(&kem_seed);
     defer std.crypto.secureZero(u8, &kem_seed);
     const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed) catch return error.KexFailed;
     const kem_pub = kem_kp.public_key.toBytes();
@@ -1626,7 +1645,7 @@ pub fn mlkem768x25519Kex(
     var iw: std.Io.Writer = .fixed(&ibuf);
     iw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) catch return error.KexFailed;
     messages.writeString(&iw, &cinit) catch return error.KexFailed;
-    try writePacket(w, cipher, iw.buffered());
+    try writePacket(w, cipher, entropy, iw.buffered());
 
     // SSH_MSG_KEX_ECDH_REPLY: byte || string K_S || string S || string sig.
     var buf: [16384]u8 = undefined;
@@ -1918,6 +1937,10 @@ pub const Transport = struct {
     writer: *std.Io.Writer,
     read_cipher: CipherState = .none,
     write_cipher: CipherState = .none,
+    /// Key material, KEXINIT cookies and padding. Set it to `.{ .io = io }`
+    /// before the handshake when the connection runs under a deterministic
+    /// `std.Io`, so the same seed gives the same session.
+    entropy: Entropy = .os,
     /// Fixed for the connection's lifetime once the first KEX completes (the
     /// exchange hash `H`; up to 64 bytes for a SHA-512 first KEX).
     session_id: ?SessionId = null,
@@ -1969,7 +1992,7 @@ pub const Transport = struct {
 
         // Build + send our KEXINIT (payload kept as I_C).
         var cookie: [16]u8 = undefined;
-        fillRandom(&cookie);
+        t.entropy.fill(&cookie);
         const empty: []const []const u8 = &.{};
         // RFC 8308 §2.1: append `ext-info-c` so the server may send us
         // SSH_MSG_EXT_INFO. `requestService` and `userauth.awaitAuthReply`
@@ -2000,7 +2023,7 @@ pub const Transport = struct {
         var none_r: CipherState = .none;
         var none_w: CipherState = .none;
 
-        try writePacket(t.writer, &none_w, i_c); // client KEXINIT (seq 0)
+        try writePacket(t.writer, &none_w, t.entropy, i_c); // client KEXINIT (seq 0)
 
         const spkt = try readPacket(t.reader, &none_r, scratch); // server KEXINIT (seq 0)
         if (msgType(spkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXINIT)) return error.ProtocolError;
@@ -2038,18 +2061,18 @@ pub const Transport = struct {
         // only ever returns a name from `kex_algorithms`; every one of those
         // dispatches to a working implementation here.
         var kex_result = if (isMlkemKex(neg.kex))
-            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.host_key)
+            try mlkem768x25519Kex(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
         else if (isCurve25519Kex(neg.kex))
-            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.host_key)
+            try curve25519Kex(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, policy, neg.host_key)
         else
-            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
+            try dhGroupKex(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
         defer kex_result.zeroize();
 
         if (t.session_id == null) t.session_id = SessionId.from(kex_result.hash());
         const sid = t.session_id.?.slice();
 
         // NEWKEYS both ways (still plaintext: seq 2 each direction).
-        try writePacket(t.writer, &none_w, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+        try writePacket(t.writer, &none_w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
         const nk = try readPacket(t.reader, &none_r, scratch);
         if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
 
@@ -2062,7 +2085,7 @@ pub const Transport = struct {
     /// Send an already-serialized SSH_MSG_* payload as one binary packet
     /// through `write_cipher`.
     pub fn sendPacket(t: *Transport, payload: []const u8) TransportError!void {
-        return writePacket(t.writer, &t.write_cipher, payload);
+        return writePacket(t.writer, &t.write_cipher, t.entropy, payload);
     }
 
     /// Receive one binary packet through `read_cipher` into `buf`.
@@ -2643,7 +2666,7 @@ test "packet codec round-trip: none" {
     var w: std.Io.Writer = .fixed(&out);
     var wc: CipherState = .none;
     const payload = "hello ssh binary packet protocol";
-    try writePacket(&w, &wc, payload);
+    try writePacket(&w, &wc, .os, payload);
 
     var r: std.Io.Reader = .fixed(w.buffered());
     var rc: CipherState = .none;
@@ -2692,7 +2715,7 @@ const PacketCorpus = struct {
     fn framed(out: []u8, payload: []const u8) []const u8 {
         var w: std.Io.Writer = .fixed(out);
         var cipher: CipherState = .none;
-        writePacket(&w, &cipher, payload) catch unreachable;
+        writePacket(&w, &cipher, .os, payload) catch unreachable;
         return w.buffered();
     }
 
@@ -2778,7 +2801,7 @@ test "packet codec round-trip: chacha20-poly1305@openssh (fixed keys)" {
     var out: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
     const payload = "chacha20-poly1305 packet";
-    try writePacket(&w, &wc, payload);
+    try writePacket(&w, &wc, .os, payload);
     const wire = w.buffered();
     // The 4-byte length field must be encrypted (not the plaintext length).
     try t.expect(std.mem.readInt(u32, wire[0..4], .big) != @as(u32, payload.len + 1));
@@ -2798,7 +2821,7 @@ test "chacha20-poly1305@openssh detects tampering" {
     var wc: CipherState = .{ .chacha20_poly1305 = .{ .key_main = km, .key_header = kh, .sequence_number = 0 } };
     var out: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
-    try writePacket(&w, &wc, "authenticated");
+    try writePacket(&w, &wc, .os, "authenticated");
     const wire = w.buffered();
     var tampered: [256]u8 = undefined;
     @memcpy(tampered[0..wire.len], wire);
@@ -2821,8 +2844,8 @@ test "packet codec round-trip: aes256-ctr + hmac-sha2-256 (fixed keys, multi-pac
     var out: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
     // Two packets exercise the running CTR counter across packet boundaries.
-    try writePacket(&w, &wc, "first aes packet payload");
-    try writePacket(&w, &wc, "second aes packet, different length!!");
+    try writePacket(&w, &wc, .os, "first aes packet payload");
+    try writePacket(&w, &wc, .os, "second aes packet, different length!!");
 
     var r: std.Io.Reader = .fixed(w.buffered());
     var rbuf: [512]u8 = undefined;
@@ -2842,7 +2865,7 @@ test "aes256-ctr detects MAC tampering" {
     var wc: CipherState = .{ .aes256_ctr_hmac_sha256 = .{ .enc_key = ek, .enc_iv = iv, .mac_key = mk, .sequence_number = 0 } };
     var out: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
-    try writePacket(&w, &wc, "aes integrity");
+    try writePacket(&w, &wc, .os, "aes integrity");
     const wire = w.buffered();
     var tampered: [256]u8 = undefined;
     @memcpy(tampered[0..wire.len], wire);
@@ -2928,7 +2951,7 @@ fn fakeKexdhReply(f_mag: []const u8, out: []u8) ![]const u8 {
 
     var none: CipherState = .none;
     var w: std.Io.Writer = .fixed(out);
-    try writePacket(&w, &none, pw.buffered());
+    try writePacket(&w, &none, .os, pw.buffered());
     return w.buffered();
 }
 
@@ -2947,7 +2970,7 @@ fn fakeKexEcdhReply(q_s: []const u8, out: []u8) ![]const u8 {
 
     var none: CipherState = .none;
     var w: std.Io.Writer = .fixed(out);
-    try writePacket(&w, &none, pw.buffered());
+    try writePacket(&w, &none, .os, pw.buffered());
     return w.buffered();
 }
 
@@ -2971,8 +2994,53 @@ test "curve25519Kex (client): rejects a KEX_ECDH_REPLY carrying the identity poi
 
     try std.testing.expectError(
         error.KexFailed,
-        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+        curve25519Kex(&r, &w, &none, .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
     );
+}
+
+/// An `Io` whose secure random source is a constant: what this module draws
+/// from it is then recognisable on the wire.
+fn constantEntropyIo(vt: *std.Io.VTable) std.Io {
+    vt.* = std.Io.failing.vtable.*;
+    vt.randomSecure = struct {
+        fn f(_: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+            @memset(buf, 0x5a);
+        }
+    }.f;
+    return .{ .userdata = null, .vtable = vt };
+}
+
+test "Entropy.io: the KEXINIT cookie, the padding and the ephemeral key come from the Io" {
+    // simio pilot finding: these were drawn from getrandom(2) behind
+    // `std.Io`'s back, so a deterministic `Io` could not replay a session.
+    var vt: std.Io.VTable = undefined;
+    const entropy: Entropy = .{ .io = constantEntropyIo(&vt) };
+
+    // KEXINIT: our version line, then the packet; the peer then goes away.
+    var r: std.Io.Reader = .fixed("SSH-2.0-peer\r\n");
+    var out: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var tr = Transport.init(&r, &w);
+    tr.entropy = entropy;
+    if (tr.clientHandshake(std.testing.allocator, unreachable_policy)) |_| return error.TestUnexpectedResult else |_| {}
+    const written = w.buffered();
+    const pkt = written[std.mem.indexOf(u8, written, "\r\n").? + 2 ..];
+    const pkt_len = std.mem.readInt(u32, pkt[0..4], .big);
+    const padlen = pkt[4];
+    const payload = pkt[5 .. 4 + pkt_len - padlen];
+    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_KEXINIT), payload[0]);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x5a)), payload[1..17]);
+    for (pkt[4 + pkt_len - padlen .. 4 + pkt_len]) |b| try std.testing.expectEqual(@as(u8, 0x5a), b);
+
+    // ECDH_INIT carries the public half of a key seeded from the same source.
+    var empty: std.Io.Reader = .fixed("");
+    w = .fixed(&out);
+    var none: CipherState = .none;
+    if (curve25519Kex(&empty, &w, &none, entropy, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519")) |_|
+        return error.TestUnexpectedResult
+    else |_| {}
+    const kp = try X25519.KeyPair.generateDeterministic(@splat(0x5a));
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), &kp.public_key) != null);
 }
 
 /// A policy that refuses everything, and records what it was shown so the
@@ -3035,7 +3103,7 @@ fn fakeUnverifiableReply(
     try messages.writeString(&pw, sw.buffered());
     var none_w: CipherState = .none;
     var w0: std.Io.Writer = .fixed(reply_buf);
-    try writePacket(&w0, &none_w, pw.buffered());
+    try writePacket(&w0, &none_w, .os, pw.buffered());
     return w0.buffered();
 }
 
@@ -3049,7 +3117,7 @@ fn kexWith(key_type: []const u8, sig_algo: []const u8, negotiated: []const u8, p
     var out_scratch: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out_scratch);
     var none: CipherState = .none;
-    _ = try curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", policy, negotiated);
+    _ = try curve25519Kex(&r, &w, &none, .os, "I_C", "I_S", "V_C", "V_S", policy, negotiated);
 }
 
 /// The reply/negotiation pair used by the rejection tests. Both name an
@@ -3221,7 +3289,7 @@ test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachable_policy, kex_name, "ssh-ed25519"),
+            dhGroupKex(&r, &w, &none, .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, kex_name, "ssh-ed25519"),
         );
     }
 }
@@ -3237,8 +3305,8 @@ test "packet codec round-trip: aes256-gcm@openssh (counter increments per packet
     var w: std.Io.Writer = .fixed(&out);
     // Two packets: the 8-byte invocation counter must advance by 1 each,
     // independent of the SSH sequence number.
-    try writePacket(&w, &wc, "first gcm packet");
-    try writePacket(&w, &wc, "second gcm packet, different length!!");
+    try writePacket(&w, &wc, .os, "first gcm packet");
+    try writePacket(&w, &wc, .os, "second gcm packet, different length!!");
     try t.expectEqual(@as(u64, 7), wc.aes_gcm.invocation_counter);
     const wire = w.buffered();
     // The 4-byte length field is AAD, NOT encrypted: it equals pkt_len (a
@@ -3264,7 +3332,7 @@ test "packet codec round-trip: aes128-gcm@openssh + GCM tag detects tampering" {
     var wc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
     var out: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
-    try writePacket(&w, &wc, "aes128-gcm authenticated payload");
+    try writePacket(&w, &wc, .os, "aes128-gcm authenticated payload");
     const wire = w.buffered();
 
     var rc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
@@ -3725,9 +3793,9 @@ test "the packet ceiling stops chacha20-poly1305 before its nonce can repeat" {
         .key_header = @splat(9),
         .sequence_number = max_packets_per_direction - 1,
     } };
-    try writePacket(&w, &wc, "still fine");
+    try writePacket(&w, &wc, .os, "still fine");
     try t.expectEqual(max_packets_per_direction, wc.chacha20_poly1305.sequence_number);
-    try t.expectError(error.SequenceNumberExhausted, writePacket(&w, &wc, "one too many"));
+    try t.expectError(error.SequenceNumberExhausted, writePacket(&w, &wc, .os, "one too many"));
     try t.expectEqual(max_packets_per_direction, wc.chacha20_poly1305.sequence_number);
 }
 
@@ -3782,7 +3850,7 @@ test "readPacket enforces RFC 4253 §6's four-byte padding minimum" {
         var out: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out);
         var wc: CipherState = .none;
-        try writePacket(&w, &wc, "payload");
+        try writePacket(&w, &wc, .os, "payload");
         var r: std.Io.Reader = .fixed(w.buffered());
         var rc: CipherState = .none;
         const pkt = try readPacket(&r, &rc, &rbuf);

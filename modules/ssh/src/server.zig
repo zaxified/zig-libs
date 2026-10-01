@@ -13,9 +13,9 @@
 //! (instead of the client's host-key signature *verification*), plus loading
 //! host private keys from OpenSSH `PROTOCOL.key` files.
 //!
-//! A few small private helpers of `transport.zig` (`fillRandom`,
-//! `hashString`/`encodeMpint`, the per-letter `deriveKeyBytes` and the
-//! cipher-install `buildCipher`, `pickFirst`) are not `pub` there and
+//! A few small private helpers of `transport.zig` (`hashString`/
+//! `encodeMpint`, the per-letter `deriveKeyBytes` and the cipher-install
+//! `buildCipher`, `pickFirst`) are not `pub` there and
 //! `transport.zig` is off-limits to this pass, so byte-identical local
 //! mirrors live here — each is marked "mirrors transport.zig".
 //!
@@ -46,28 +46,6 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
 const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
-
-// ── entropy (mirrors transport.zig's private fillRandom) ────────────────────
-
-/// Fill `buf` with cryptographically secure random bytes from the OS
-/// (getrandom(2)). Never a user-space PRNG — the server's ephemeral X25519
-/// key and KEXINIT cookie depend on real entropy. Panics (does not silently
-/// degrade) if the OS entropy source is unavailable, matching
-/// `transport.zig`'s client-side policy (whose `fillRandom` is private).
-fn fillRandom(buf: []u8) void {
-    if (builtin.os.tag != .linux)
-        @compileError("fillRandom: only the Linux getrandom(2) entropy path is wired up");
-    var off: usize = 0;
-    while (off < buf.len) {
-        const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
-            @panic("getrandom failed");
-        }
-        off += @intCast(signed);
-    }
-}
 
 // ── small wire/hash helpers (mirror transport.zig privates) ─────────────────
 
@@ -526,8 +504,8 @@ pub const ServerConfig = struct {
 
 /// Run the server side of curve25519-sha256 key exchange (RFC 8731): receive
 /// SSH_MSG_KEX_ECDH_INIT (`Q_C`, the client's ephemeral public value),
-/// generate our own ephemeral keypair (`Q_S`, seeded from getrandom(2) via
-/// `fillRandom`), compute the shared secret `K` and exchange hash `H`
+/// generate our own ephemeral keypair (`Q_S`, seeded from `entropy`),
+/// compute the shared secret `K` and exchange hash `H`
 /// (identical SHA-256 formula/field order to `transport.zig`'s
 /// `curve25519Kex`: `H = SHA256(V_C || V_S || I_C || I_S || K_S || Q_C ||
 /// Q_S || K)` with every field `string`-framed except `K`, which is an
@@ -544,6 +522,7 @@ pub fn curve25519KexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *transport.CipherState,
+    entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -563,7 +542,7 @@ pub fn curve25519KexServer(
 
     // Our ephemeral X25519 keypair (seed from the OS CSPRNG, zeroed after).
     var seed: [32]u8 = undefined;
-    fillRandom(&seed);
+    entropy.fill(&seed);
     defer std.crypto.secureZero(u8, &seed);
     const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.KexFailed;
     const q_s = kp.public_key;
@@ -603,7 +582,7 @@ pub fn curve25519KexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &q_s);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, ow.buffered());
+    try transport.writePacket(w, cipher, entropy, ow.buffered());
 
     // Legacy path: `k_enc_len == 0` makes `buildCipher` mpint-encode the raw
     // shared secret (byte-identical to the pre-widening result).
@@ -632,6 +611,7 @@ pub fn dhGroupKexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *transport.CipherState,
+    entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -657,7 +637,7 @@ pub fn dhGroupKexServer(
     var y: [transport.dh_max_prime_len]u8 = undefined;
     const yb = y[0..group.prime.len];
     defer std.crypto.secureZero(u8, &y);
-    fillRandom(yb);
+    entropy.fill(yb);
     yb[0] &= 0x7f;
     yb[yb.len - 1] |= 1;
 
@@ -711,7 +691,7 @@ pub fn dhGroupKexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeMpint(&ow, f);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, ow.buffered());
+    try transport.writePacket(w, cipher, entropy, ow.buffered());
 
     return res;
 }
@@ -727,6 +707,7 @@ pub fn mlkem768x25519KexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     cipher: *transport.CipherState,
+    entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
     client_id: []const u8,
@@ -747,7 +728,7 @@ pub fn mlkem768x25519KexServer(
     @memcpy(&kem_pk_bytes, cinit[0..transport.mlkem_pk_len]);
     const kem_pk = MLKem768.PublicKey.fromBytes(&kem_pk_bytes) catch return error.KexFailed;
     var kem_seed: [MLKem768.encaps_seed_length]u8 = undefined;
-    fillRandom(&kem_seed);
+    entropy.fill(&kem_seed);
     defer std.crypto.secureZero(u8, &kem_seed);
     const enc = kem_pk.encapsDeterministic(&kem_seed);
     var kem_shared = enc.shared_secret;
@@ -757,7 +738,7 @@ pub fn mlkem768x25519KexServer(
     var x_client: [32]u8 = undefined;
     @memcpy(&x_client, cinit[transport.mlkem_pk_len..transport.mlkem_cinit_len]);
     var x_seed: [32]u8 = undefined;
-    fillRandom(&x_seed);
+    entropy.fill(&x_seed);
     defer std.crypto.secureZero(u8, &x_seed);
     const x_kp = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KexFailed;
     var x_shared = X25519.scalarmult(x_kp.secret_key, x_client) catch return error.KexFailed;
@@ -798,7 +779,7 @@ pub fn mlkem768x25519KexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &sreply);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, ow.buffered());
+    try transport.writePacket(w, cipher, entropy, ow.buffered());
 
     return res;
 }
@@ -966,7 +947,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     for (config.host_keys, hk_names) |hk, *name| name.* = hk.algorithmName();
 
     var cookie: [16]u8 = undefined;
-    fillRandom(&cookie);
+    t.entropy.fill(&cookie);
     const empty: []const []const u8 = &.{};
     // RFC 8308 §2.1: append `ext-info-s`, the server's half of the indicator
     // pair. §2.2 makes this a promise to process a client's SSH_MSG_EXT_INFO,
@@ -1000,7 +981,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     var sent: u32 = 0;
     var rcvd: u32 = 0;
 
-    try transport.writePacket(t.writer, &none_w, i_s); // our KEXINIT
+    try transport.writePacket(t.writer, &none_w, t.entropy, i_s); // our KEXINIT
     sent += 1;
 
     const cpkt = try transport.readPacket(t.reader, &none_r, scratch); // client KEXINIT
@@ -1091,11 +1072,11 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     // `kex_name` only ever comes from `transport.kex_algorithms`; every one of
     // those dispatches to a working responder implementation here.
     var kex_result = if (transport.isMlkemKex(kex_name))
-        try mlkem768x25519KexServer(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, hk, gpa)
+        try mlkem768x25519KexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else if (isCurve25519Kex(kex_name))
-        try curve25519KexServer(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, hk, gpa)
+        try curve25519KexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else
-        try dhGroupKexServer(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
+        try dhGroupKexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
     defer kex_result.zeroize();
     rcvd += 1;
     sent += 1;
@@ -1104,7 +1085,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     const sid = t.session_id.?.slice();
 
     // 5. NEWKEYS both ways (still plaintext).
-    try transport.writePacket(t.writer, &none_w, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    try transport.writePacket(t.writer, &none_w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
     sent += 1;
     const nk = try transport.readPacket(t.reader, &none_r, scratch);
     rcvd += 1;
@@ -1179,6 +1160,11 @@ pub fn accept(
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+fn testFillRandom(buf: []u8) void {
+    const os: transport.Entropy = .os;
+    os.fill(buf);
+}
 
 test "HostKey type compiles" {
     const t = std.testing;
@@ -1506,7 +1492,7 @@ fn listenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
     var tries: usize = 0;
     while (tries < 32) : (tries += 1) {
         var pb: [2]u8 = undefined;
-        fillRandom(&pb);
+        testFillRandom(&pb);
         const port: u16 = 20000 + (std.mem.readInt(u16, &pb, .big) % 20000);
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
         const server = addr.listen(io, .{ .reuse_address = true }) catch continue;
@@ -1789,7 +1775,7 @@ const DirectKexClient = struct {
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .none;
-        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
+        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());
@@ -1822,7 +1808,7 @@ fn directDhConsistency(kex_name: []const u8) !void {
 
     const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
     var none: transport.CipherState = .none;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1883,7 +1869,7 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
     const hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
     try std.testing.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
     var none: transport.CipherState = .none;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1902,7 +1888,7 @@ fn fakeKexdhInit(e_mag: []const u8, out: []u8) ![]const u8 {
 
     var none: transport.CipherState = .none;
     var w: std.Io.Writer = .fixed(out);
-    try transport.writePacket(&w, &none, pw.buffered());
+    try transport.writePacket(&w, &none, .os, pw.buffered());
     return w.buffered();
 }
 
@@ -1923,7 +1909,7 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKexServer(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
+            dhGroupKexServer(&r, &w, &none, .os, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
         );
     }
 }
@@ -2029,7 +2015,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
 
     // 3. Spoofed server KEXINIT: wrong guess, as described above.
     var cookie: [16]u8 = undefined;
-    fillRandom(&cookie);
+    testFillRandom(&cookie);
     const empty: []const []const u8 = &.{};
     const wrong_guess_kex = [_][]const u8{ "diffie-hellman-group16-sha512", "diffie-hellman-group14-sha256" };
     const host_key_names = [_][]const u8{"ssh-ed25519"};
@@ -2053,7 +2039,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     try spoofed_kex.encode(&isw);
     const i_s = try gpa.dupe(u8, isw.buffered());
     defer gpa.free(i_s);
-    try transport.writePacket(&sw.interface, &none_w, i_s);
+    try transport.writePacket(&sw.interface, &none_w, .os, i_s);
 
     // 4. The "guessed" first KEX packet — under the WRONG algorithm, so a
     // spec-correct client discards it sight unseen. Anything left unconsumed
@@ -2062,17 +2048,17 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     var jw: std.Io.Writer = .fixed(&junk_buf);
     try jw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE));
     try messages.writeString(&jw, "x");
-    try transport.writePacket(&sw.interface, &none_w, jw.buffered());
+    try transport.writePacket(&sw.interface, &none_w, .os, jw.buffered());
 
     // 5. The REAL KEX, honestly, under group14 — the algorithm the client
     // actually negotiates. Proves the discard ate exactly one packet, not
     // zero and not two.
     const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none_w, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none_w, .os, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
     defer res.zeroize();
 
     // 6. NEWKEYS both ways.
-    try transport.writePacket(&sw.interface, &none_w, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    try transport.writePacket(&sw.interface, &none_w, .os, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
     const nk = try transport.readPacket(&sr.interface, &none_r, &scratch);
     try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS), msgType(nk));
 
@@ -2121,7 +2107,7 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
 
     // Throwaway temp dir (same pattern as transport.zig's sshd interop test).
     var rnd: [8]u8 = undefined;
-    fillRandom(&rnd);
+    testFillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
     const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_srv_test_{s}", .{&hex});
     defer gpa.free(dir_path);
