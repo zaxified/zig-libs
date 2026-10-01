@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Tests: the stress pass now races 5.0 connections beside 3.1.1 ones —
+  QoS 2 both ways, Subscription Identifiers, a Shared Subscription, Session Expiry, Wills
+  with a one-second delay, take-overs telling 0x8E — and checks every Shared Subscription
+  member left is a session's (1× Debug, 10× ReleaseSafe, 40× ReleaseFast, clean).
+  Mutation pass over the new 3.1.1 QoS 2 and 5.0 guards (48 mutants, one schemata build):
+  three survivors became tests — a Topic Alias of 0 on decode, an inbound alias above the
+  maximum the client announced (with more slots than announced), a PUBCOMP that must not
+  free a QoS 1 or unreleased QoS 2 message of a session. And the `TcpServer` loopback test
+  no longer waits 45 s for its own client's keep-alive to lapse (it closed the client
+  after awaiting the server) — the module's tests take 4 s, not 49.
 - **2026-10-01** — **External anchor for MQTT 5.0** (`tools/interop.zig`, `zig build
   interop-mqtt [-- --capture]`): this module's `Client` against a real Eclipse Mosquitto
   2.1.2 (rootless podman) and real paho-mqtt 2.1.0 clients (`tools/paho_v5.py`) against

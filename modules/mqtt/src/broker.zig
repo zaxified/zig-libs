@@ -3839,7 +3839,6 @@ test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     var serving = try io.concurrent(serveTask, .{&srv});
 
     const stream = try srv.boundAddress().connect(io, .{ .mode = .stream });
-    defer stream.close(io);
     var buf: [64]u8 = undefined;
     var wbuf: [64]u8 = undefined;
     var w = stream.writer(io, &wbuf);
@@ -3851,6 +3850,11 @@ test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     try testing.expectEqual(@as(u8, 0x20), ack[0]); // CONNACK
     try testing.expectEqual(@as(u8, 0), ack[3]); // accepted
 
+    // ⛔ The client goes BEFORE the server: `serve` awaits its connection
+    // tasks, and this one sat in its read until the watchdog's 1.5 x 30 s
+    // keep-alive deadline — 45 s of every run of this module's tests, unseen
+    // because the stress test was blamed for the time.
+    stream.close(io);
     srv.shutdown();
     serving.await(io);
 }
@@ -5054,6 +5058,29 @@ test "a persistent session resumes QoS 2: the unacknowledged PUBLISH again with 
     try testing.expectEqual(@as(usize, 0), st[0].queued);
 }
 
+test "a session's in-flight message is freed only by its own ack: PUBCOMP never frees a QoS 1 or an unreleased QoS 2" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "acks", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "t", .qos = .exactly_once }});
+    _ = (try t1.next()).?;
+    try b.publish("t", "one", .at_least_once, false);
+    try b.publish("t", "two", .exactly_once, false);
+    const q1 = (try t1.next()).?.publish.packet_id;
+    const q2 = (try t1.next()).?.publish.packet_id;
+    try feedAck(&b, s1.conn, .pubcomp, q1); // wrong ack for QoS 1
+    try feedAck(&b, s1.conn, .pubcomp, q2); // QoS 2 before its PUBREC
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 2), (try b.sessionStates(arena.allocator()))[0].inflight);
+    try feedAck(&b, s1.conn, .puback, q1);
+    try feedAck(&b, s1.conn, .pubrec, q2);
+    _ = (try t1.next()).?; // PUBREL
+    try feedAck(&b, s1.conn, .pubcomp, q2);
+    try testing.expectEqual(@as(usize, 0), (try b.sessionStates(arena.allocator()))[0].inflight);
+}
+
 test "a persistent session queues QoS 2 while away and delivers it at QoS 2" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
@@ -5494,6 +5521,11 @@ const StressClient = struct {
     stream: std.Io.net.Stream,
     rx: [16 * 1024]u8 = undefined,
     rx_len: usize = 0,
+    /// The version every packet goes out and is read in (5.0 for half the
+    /// workers, so both kinds of connection race the same broker).
+    version: packet.Version = .v3_1_1,
+    /// 5.0: a Will with a one-second Will Delay, from `sendConnectClean`.
+    will_id: ?usize = null,
 
     fn dial(io: std.Io, addr: std.Io.net.IpAddress) !StressClient {
         const stream = try addr.connect(io, .{ .mode = .stream });
@@ -5514,25 +5546,62 @@ const StressClient = struct {
     fn sendConnect(c: *StressClient, client_id: []const u8) !void {
         return c.sendConnectClean(client_id, true);
     }
+    /// 3.1.1 Clean Session; for 5.0 the same intent: Clean Start, and a
+    /// Session Expiry Interval of 60 s when the session is to be kept.
     fn sendConnectClean(c: *StressClient, client_id: []const u8, clean: bool) !void {
         var buf: [320]u8 = undefined;
-        try c.writeAll(try packet.encodeConnect(&buf, .{ .client_id = client_id, .clean_session = clean, .keep_alive_s = 0 }));
+        var wbuf: [24]u8 = undefined;
+        const v5 = c.version == .v5;
+        const will: ?packet.Will = if (v5) if (c.will_id) |w| .{
+            .topic = std.fmt.bufPrint(&wbuf, "will/{d}", .{w}) catch unreachable,
+            .message = "gone",
+            .properties = .{ .will_delay_interval = 1 },
+        } else null else null;
+        try c.writeAll(try packet.encodeConnect(&buf, .{
+            .client_id = client_id,
+            .clean_session = clean,
+            .keep_alive_s = 0,
+            .version = c.version,
+            .will = will,
+            .properties = if (v5 and !clean) .{ .session_expiry_interval = 60 } else .{},
+        }));
     }
     fn sendSubscribe(c: *StressClient, pid: u16, filters: []const packet.Subscription) !void {
+        return c.sendSubscribeWith(pid, filters, .{});
+    }
+    fn sendSubscribeWith(c: *StressClient, pid: u16, filters: []const packet.Subscription, props: packet.Properties) !void {
         var buf: [512]u8 = undefined;
-        try c.writeAll(try packet.encodeSubscribe(&buf, pid, filters));
+        try c.writeAll(try packet.encodePacket(&buf, c.version, .{ .subscribe = .{ .packet_id = pid, .filters = filters, .properties = props } }));
     }
     fn sendUnsubscribe(c: *StressClient, pid: u16, filters: []const []const u8) !void {
         var buf: [512]u8 = undefined;
-        try c.writeAll(try packet.encodeUnsubscribe(&buf, pid, filters));
+        try c.writeAll(try packet.encodePacket(&buf, c.version, .{ .unsubscribe = .{ .packet_id = pid, .filters = filters } }));
     }
     fn sendPublish(c: *StressClient, p: packet.Publish) !void {
         var buf: [1024]u8 = undefined;
-        try c.writeAll(try packet.encodePublish(&buf, p));
+        try c.writeAll(try packet.encodePacket(&buf, c.version, .{ .publish = p }));
     }
     fn sendDisconnect(c: *StressClient) !void {
         var buf: [4]u8 = undefined;
         try c.writeAll(try packet.encodeDisconnect(&buf));
+    }
+
+    /// Answer what the broker's packet asks of a client: PUBACK a QoS 1
+    /// delivery, PUBREC a QoS 2 one, PUBCOMP its PUBREL, PUBREL a PUBREC for
+    /// one of our own QoS 2 publishes.
+    fn answer(c: *StressClient, p: packet.Packet) !void {
+        var ab: [8]u8 = undefined;
+        const reply: ?packet.Packet = switch (p) {
+            .publish => |pb| switch (pb.qos) {
+                .at_most_once => null,
+                .at_least_once => .{ .puback = .{ .packet_id = pb.packet_id } },
+                .exactly_once => .{ .pubrec = .{ .packet_id = pb.packet_id } },
+            },
+            .pubrel => |a| .{ .pubcomp = .{ .packet_id = a.packet_id } },
+            .pubrec => |a| .{ .pubrel = .{ .packet_id = a.packet_id } },
+            else => null,
+        };
+        if (reply) |r| try c.writeAll(try packet.encodePacket(&ab, c.version, r));
     }
 
     fn pollReadable(c: *StressClient, timeout_ms: i32) bool {
@@ -5553,23 +5622,14 @@ const StressClient = struct {
 
         var consumed: usize = 0;
         while (true) {
-            const dec = (packet.decode(c.rx[consumed..c.rx_len]) catch {
+            const dec = (packet.decodePacket(c.rx[consumed..c.rx_len], c.version) catch {
                 _ = ctl.torn_packets.fetchAdd(1, .monotonic);
                 c.rx_len = 0;
                 return true;
             }) orelse break;
             consumed += dec.consumed;
-            switch (dec.packet) {
-                .publish => |pb| {
-                    _ = ctl.delivered.fetchAdd(1, .monotonic);
-                    if (pb.qos == .at_least_once) {
-                        var ab: [4]u8 = undefined;
-                        const bytes = packet.encodePuback(&ab, pb.packet_id) catch return true;
-                        c.writeAll(bytes) catch return false;
-                    }
-                },
-                else => {},
-            }
+            if (dec.packet == .publish) _ = ctl.delivered.fetchAdd(1, .monotonic);
+            c.answer(dec.packet) catch return false;
         }
         const rem = c.rx_len - consumed;
         if (consumed > 0 and rem > 0) std.mem.copyForwards(u8, c.rx[0..rem], c.rx[consumed..c.rx_len]);
@@ -5590,18 +5650,13 @@ const StressClient = struct {
             var consumed: usize = 0;
             var hit = false;
             while (true) {
-                const dec = (packet.decode(c.rx[consumed..c.rx_len]) catch {
+                const dec = (packet.decodePacket(c.rx[consumed..c.rx_len], c.version) catch {
                     _ = ctl.torn_packets.fetchAdd(1, .monotonic);
                     c.rx_len = 0;
                     return false;
                 }) orelse break;
                 consumed += dec.consumed;
-                if (dec.packet == .publish and dec.packet.publish.qos == .at_least_once) {
-                    var ab: [4]u8 = undefined;
-                    if (packet.encodePuback(&ab, dec.packet.publish.packet_id)) |bytes| {
-                        c.writeAll(bytes) catch {};
-                    } else |_| {}
-                }
+                c.answer(dec.packet) catch {};
                 if (std.meta.activeTag(dec.packet) == want) hit = true;
             }
             const rem = c.rx_len - consumed;
@@ -5637,6 +5692,16 @@ fn stressWatchdog(ctl: *StressCtl) void {
 fn stressSubscribe(c: *StressClient, id: usize) !void {
     var pbuf: [24]u8 = undefined;
     const priv = try std.fmt.bufPrint(&pbuf, "w/{d}/#", .{id});
+    if (c.version == .v5) {
+        // 5.0: QoS 2, a Subscription Identifier on every copy, and a Shared
+        // Subscription racing its members' connects, take-overs and closes.
+        return c.sendSubscribeWith(1, &.{
+            .{ .filter = "hot/#", .qos = .exactly_once },
+            .{ .filter = "hot/+", .qos = .at_most_once },
+            .{ .filter = "$share/g/hot/+", .qos = .exactly_once },
+            .{ .filter = priv, .qos = .at_least_once },
+        }, .{ .subscription_ids = .{ .items = &.{@intCast(id + 1)} } });
+    }
     try c.sendSubscribe(1, &.{
         .{ .filter = "hot/#", .qos = .at_least_once },
         .{ .filter = "hot/+", .qos = .at_most_once },
@@ -5666,6 +5731,11 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
             stressNapMs(1);
             continue;
         };
+        // Odd workers speak 5.0; their abrupt closers leave a delayed Will.
+        if (id % 2 == 1) {
+            c.version = .v5;
+            if (role == 1) c.will_id = id;
+        }
 
         // Any failure past here is EXPECTED under the storm (the broker may have
         // shut our socket on take-over or on a contained delivery failure) — we
@@ -5690,7 +5760,8 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
                         const hot = std.fmt.bufPrint(&tbuf, "hot/{d}", .{k % 4}) catch unreachable;
                         pid +%= 1;
                         if (pid == 0) pid = 1;
-                        c.sendPublish(.{ .topic = hot, .payload = "payload-xyz", .qos = if (k % 2 == 0) .at_most_once else .at_least_once, .packet_id = pid }) catch break :blk;
+                        const q: QoS = if (k % 2 == 0) .at_most_once else if (c.version == .v5 and k % 3 == 1) .exactly_once else .at_least_once;
+                        c.sendPublish(.{ .topic = hot, .payload = "payload-xyz", .qos = q, .packet_id = pid }) catch break :blk;
                         var wbuf: [24]u8 = undefined;
                         const priv = std.fmt.bufPrint(&wbuf, "w/{d}/x", .{id}) catch unreachable;
                         c.sendPublish(.{ .topic = priv, .payload = "p", .qos = .at_most_once }) catch break :blk;
@@ -5891,6 +5962,20 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
         try testing.expect(x.inflight.items.len <= max_in_flight);
     }
     try testing.expect(broker.sessions.items.len > 0); // the persistent half ran
+    // Every Shared Subscription member left is a session's; a connection's
+    // would point at freed memory.
+    var shared_members: usize = 0;
+    for (broker.shared.items) |g| {
+        for (g.members.items) |m| try testing.expect(m.owner == .session);
+        shared_members += g.members.items.len;
+    }
+    var shared_filters: usize = 0;
+    for (broker.sessions.items) |x| {
+        for (x.subs.items) |f| if (std.mem.startsWith(u8, f, "$share/")) {
+            shared_filters += 1;
+        };
+    }
+    try testing.expectEqual(shared_filters, shared_members);
     try testing.expectEqual(session_subs, broker.subscriptionCount()); // no leak / no wrap-to-huge
     try testing.expectEqual(@as(usize, 0), broker.retained.items.len);
     try testing.expectEqual(@as(usize, 0), ctl.torn_packets.load(.monotonic)); // never a corrupt packet

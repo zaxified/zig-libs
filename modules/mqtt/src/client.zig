@@ -1424,6 +1424,21 @@ test "v5 inbound Topic Aliases: set, reused with an empty topic, and every inval
     try testing.expectError(error.TopicAliasInvalid, c.poll(3));
 }
 
+test "v5 inbound Topic Alias above the maximum the client announced is refused, slots or not" {
+    var tt = TestTransport{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var slots: [4]AliasSlot = .{ .{}, .{}, .{}, .{} };
+    var c = Client.init(tt.transport(), .{ .rx = &rx, .tx = &tx, .topic_aliases = &slots });
+    try c.connect(0, .{ .client_id = "x", .version = .v5, .properties = .{ .topic_alias_maximum = 2 } });
+    try feed5(&c, .{ .connack = .{ .session_present = false } });
+    _ = (try c.poll(0)).?;
+    try feed5(&c, .{ .publish = .{ .topic = "t", .properties = .{ .topic_alias = 2 } } });
+    try testing.expectEqualStrings("t", (try c.poll(1)).?.message.topic);
+    try feed5(&c, .{ .publish = .{ .topic = "t", .properties = .{ .topic_alias = 3 } } }); // a slot exists, the promise does not
+    try testing.expectError(error.TopicAliasInvalid, c.poll(1));
+}
+
 test "v5 messages carry their properties; acks carry reason codes" {
     var tt = TestTransport{};
     var rx: [256]u8 = undefined;

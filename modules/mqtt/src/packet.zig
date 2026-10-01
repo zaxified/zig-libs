@@ -2782,6 +2782,7 @@ test "v5 properties: wrong packet is Malformed, a repeat or a forbidden value is
     try testing.expectError(error.ProtocolViolation, decodePacket(&hex("200700000416000141"), .v5)); // Data without Method
     try testing.expectError(error.ProtocolViolation, decodePacket(&hex("30060001740201" ++ "02"), .v5)); // Payload Format 2
     try testing.expectError(error.ProtocolViolation, decodePacket(&hex("3009000174040800012378"), .v5)); // wildcard Response Topic
+    try testing.expectError(error.ProtocolViolation, decodePacket(&hex("30080001740323000078"), .v5)); // Topic Alias 0 (3.3.2-8)
     try testing.expectError(error.InvalidUtf8, decodePacket(&hex("20080000051f0002fffe"), .v5)); // Reason String not UTF-8
 
     // Encoding holds the sender to the same table.
