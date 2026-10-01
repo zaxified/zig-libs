@@ -109,7 +109,7 @@ pub const meta = .{
     .platform = .linux, // prove()'s internal getrandom(2) blinding is Linux-only (see Caveats); verify/codec paths are portable
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
-    .model_after = "Bünz/Bootle/Boneh/Poelstra/Wuille/Maxwell, \"Bulletproofs: Short Proofs for Confidential Transactions and More\", IEEE S&P 2018 (eprint 2017/1066), §3 (Inner-Product Argument) + §4.1/§4.2 (range proof); wire-compatible with dalek-cryptography/bulletproofs 4.0 (Rust): Merlin transcript, dalek generators and byte layout (see NOTICE, interop_test.zig); std.crypto.ecc.Ristretto255 supplies the group",
+    .model_after = "Bünz/Bootle/Boneh/Poelstra/Wuille/Maxwell, \"Bulletproofs: Short Proofs for Confidential Transactions and More\", IEEE S&P 2018 (eprint 2017/1066), §3 (Inner-Product Argument) + §4.1/§4.2 (range proof) + §4.3 (aggregated range proofs); wire-compatible with dalek-cryptography/bulletproofs 4.0 (Rust): Merlin transcript, dalek generators and byte layout (see NOTICE, interop_test.zig); std.crypto.ecc.Ristretto255 supplies the group",
     .deps = .{"ct25519"}, // the constant-time secret-scalar ladder behind scalarvec.mulCt
 };
 
@@ -145,6 +145,13 @@ pub const deltaYZ = rangeproof_mod.deltaYZ;
 pub const prove = rangeproof_mod.prove;
 /// FABLE CORE (implemented) — see `rangeproof.zig`.
 pub const verify = rangeproof_mod.verify;
+/// Aggregated proofs (paper §4.3): `m` values, a power of two, in one
+/// proof over `Generators.initParties(n, >= m)`.
+pub const proveMultiple = rangeproof_mod.proveMultiple;
+pub const verifyMultiple = rangeproof_mod.verifyMultiple;
+pub const ProveMultipleError = rangeproof_mod.ProveMultipleError;
+/// The aggregated `delta(y,z)`; `m = 1` is `deltaYZ`.
+pub const deltaYZMultiple = rangeproof_mod.deltaYZMultiple;
 /// The label to start a fresh `Transcript` with for `prove`/`verify`
 /// (`rangeproof.zig`'s `transcript_domain`).
 pub const rangeproof_domain = rangeproof_mod.transcript_domain;
@@ -162,6 +169,7 @@ pub const Ristretto255 = std.crypto.ecc.Ristretto255;
 // files are imported explicitly below since nothing else references them.
 
 const kat_test = @import("kat_test.zig");
+const aggregate_test = @import("aggregate_test.zig");
 const interop_test = @import("interop_test.zig");
 const stackprobe_test = @import("stackprobe_test.zig");
 const verify_b8_diff_test = @import("verify_b8_diff_test.zig");
@@ -169,6 +177,7 @@ const verify_b8_diff_test = @import("verify_b8_diff_test.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = kat_test;
+    _ = aggregate_test;
     _ = interop_test;
     _ = stackprobe_test;
     _ = verify_b8_diff_test;

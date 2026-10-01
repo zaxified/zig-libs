@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — Aggregated range proofs (paper §4.3): `proveMultiple`/
+  `verifyMultiple` put `m` values (a power of two) in one proof of
+  `log2(n*m)` IPA rounds, wire-compatible with dalek's `prove_multiple`/
+  `verify_multiple`; `Generators.initParties(n, parties)` derives dalek's
+  per-party generator chains (party 0 is `init(n)`'s set, so existing
+  callers and proofs are unchanged); new `deltaYZMultiple`,
+  `appendDomainSepMultiple`, `verifyMultipleTraced`, `ProveMultipleError`
+  (`InvalidAggregation`). `Generators` gained a `parties` field (default 1).
+  `prove`/`verify` are now the `m = 1` case of the same body; their output
+  and verdicts are unchanged (`verify_b8_diff_test.zig` still byte-exact,
+  dalek's single proofs still verify). Anchored both ways: 6 dalek
+  aggregated proofs verified here, 5 of ours accepted by dalek. Scope mvp ->
+  core.
 - **2026-09-30** — ⚠ **Breaking (wire format): now wire-compatible with
   dalek-cryptography/bulletproofs 4.0.** The Fiat-Shamir transcript is Merlin
   v1.0 (`Transcript` gains `appendMessage`, `challengeBytes`,

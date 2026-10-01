@@ -15,10 +15,12 @@
 //! term), and `prove`'s `error.ValueOutOfRange` construction-time guard —
 //! is REAL, not stubbed.
 //!
-//! **Scope: single-value range proofs only** (Bulletproofs' `m = 1`
-//! aggregation case). §4.3's aggregated multi-value range-proof extension
-//! (proving several `V_j`s in one proof, `m > 1`) is explicitly OUT of
-//! scope for this scaffold — see SPEC.md.
+//! **Single and aggregated proofs.** `prove`/`verify` cover one value;
+//! `proveMultiple`/`verifyMultiple` cover `m` values (a power of two) in
+//! one proof whose size grows with `log2(n*m)` (paper §4.3). The single
+//! case IS the aggregated one with `m = 1` — one body, so the two cannot
+//! drift. The steps below are written for `m = 1`; "Aggregation" after
+//! them lists what changes for `m > 1`.
 //!
 //! ## Protocol (§4.1, single-value case)
 //!
@@ -141,6 +143,26 @@
 //! `proof.ipa.l_vec.len` — not matching `gens.n`'s `log2`) — a correct
 //! FINAL implementation never panics on adversarial input.
 //!
+//! ## Aggregation (§4.3, `m` values)
+//!
+//! Vectors are `n*m` long; value `j` owns positions `j*n .. (j+1)*n` and
+//! the generators of party `j` (`Generators.initParties`). Changes against
+//! the steps above, in dalek's order and labels:
+//!
+//! - step 4 binds `m` in the domain separator and appends every `V_j`, in
+//!   order, before `A`;
+//! - `r(x)`'s constant term at position `j*n + i` uses `z^{2+j} * 2^i`
+//!   instead of `z^2 * 2^i` (`y` powers run over all `n*m` positions);
+//! - `tau_x = tau2*x^2 + tau1*x + sum_j z^{2+j} * gamma_j`;
+//! - the verifier's `t_hat` relation has `sum_j z^{2+j} * V_j` in place of
+//!   `z^2 * V`, `delta` sums `y` over `n*m` positions and subtracts
+//!   `z^3 * (2^n - 1) * sum_j z^j`, and `P`'s `H_i` coefficient uses the
+//!   same `z^{2+j} * 2^i`.
+//!
+//! One prover holds every witness (dalek's dealer and parties collapsed
+//! into one call). Splitting the prover across parties that do not trust
+//! each other is dalek's MPC API and is not offered here.
+//!
 //! Provenance: Bünz, Bootle, Boneh, Poelstra, Wuille, Maxwell,
 //! "Bulletproofs: Short Proofs for Confidential Transactions and More",
 //! IEEE S&P 2018 (eprint.iacr.org/2017/1066), §4.1/§4.2.
@@ -155,7 +177,8 @@
 //! paper's. A proof made here verifies under dalek's
 //! `RangeProof::verify_single` and the reverse, given the same transcript
 //! label and `n` in {8, 16, 32, 64} (dalek refuses other widths) —
-//! `interop_test.zig` asserts both directions. See NOTICE.
+//! `interop_test.zig` asserts both directions, for single proofs
+//! (`verify_single`) and aggregated ones (`verify_multiple`). See NOTICE.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -175,12 +198,18 @@ const InnerProductProof = ipa.InnerProductProof;
 /// sub-step — see the module doc comment's step 9).
 pub const transcript_domain = "bulletproofs/range-proof/v1";
 
-/// dalek's `rangeproof_domain_sep(n, m)` with `m = 1` (single-value proofs
-/// only). Both `prove` and `verify` call it first, before `V`.
+/// dalek's `rangeproof_domain_sep(n, m)` with `m = 1` (a single-value
+/// proof). Both `prove` and `verify` call it first, before `V`.
 pub fn appendDomainSep(transcript: *Transcript, n: usize) void {
+    appendDomainSepMultiple(transcript, n, 1);
+}
+
+/// dalek's `rangeproof_domain_sep(n, m)`: an aggregated proof over `m`
+/// values binds `m` before the first `V_j`.
+pub fn appendDomainSepMultiple(transcript: *Transcript, n: usize, m: usize) void {
     transcript.appendMessage("dom-sep", "rangeproof v1");
     transcript.appendU64("n", n);
-    transcript.appendU64("m", 1);
+    transcript.appendU64("m", m);
 }
 
 /// `v*gens.g + gamma*gens.h` — Bulletproofs' Pedersen VALUE commitment
@@ -259,8 +288,8 @@ pub var test_randoms: [if (builtin.is_test) 512 else 0][32]u8 = undefined;
 pub var test_random_count: usize = 0;
 
 /// `delta(y,z)` — Bulletproofs §4.1's verifier-side scalar correction
-/// term (paper eq. (39), single-value `m=1` case — this scaffold's
-/// scope, see SPEC.md):
+/// term (paper eq. (39), single-value case; `deltaYZMultiple` is the
+/// aggregated one):
 ///
 /// ```text
 /// delta(y,z) = (z - z^2) * sum_{i=0}^{n-1} y^i  -  z^3 * (2^n - 1)
@@ -273,10 +302,33 @@ pub var test_random_count: usize = 0;
 /// multiplication rather than `scalarvec.powers`), to avoid the test
 /// simply re-deriving the implementation.
 pub fn deltaYZ(allocator: std.mem.Allocator, y: [32]u8, z: [32]u8, n: usize) std.mem.Allocator.Error![32]u8 {
-    const y_pows = try scalarvec.powers(allocator, y, n);
+    return deltaYZMultiple(allocator, y, z, n, 1);
+}
+
+/// `delta(y,z)` for an aggregated proof over `m` values (paper §4.3, dalek's
+/// `delta(n, m, y, z)`):
+///
+/// ```text
+/// delta(y,z) = (z - z^2) * sum_{i=0}^{n*m-1} y^i
+///              - z^3 * (2^n - 1) * sum_{j=0}^{m-1} z^j
+/// ```
+///
+/// `m = 1` is `deltaYZ`.
+pub fn deltaYZMultiple(allocator: std.mem.Allocator, y: [32]u8, z: [32]u8, n: usize, m: usize) std.mem.Allocator.Error![32]u8 {
+    const nm = std.math.mul(usize, n, m) catch return error.OutOfMemory;
+    const y_pows = try scalarvec.powers(allocator, y, nm);
     defer allocator.free(y_pows);
     var sum_y = scalarvec.zero;
     for (y_pows) |yp| sum_y = scalar.add(sum_y, yp);
+
+    var sum_z = scalarvec.zero;
+    {
+        var z_pow = scalarvec.one;
+        for (0..m) |_| {
+            sum_z = scalar.add(sum_z, z_pow);
+            z_pow = scalar.mul(z_pow, z);
+        }
+    }
 
     // 2^n - 1 via repeated doubling — exact (no modular wraparound) for
     // any n a real range proof would use (n <= a few hundred keeps
@@ -291,7 +343,7 @@ pub fn deltaYZ(allocator: std.mem.Allocator, y: [32]u8, z: [32]u8, n: usize) std
     const z_minus_z2 = scalar.sub(z, z2);
 
     const term1 = scalar.mul(z_minus_z2, sum_y);
-    const term2 = scalar.mul(z3, sum_2n);
+    const term2 = scalar.mul(scalar.mul(z3, sum_2n), sum_z);
     return scalar.sub(term1, term2);
 }
 
@@ -406,7 +458,37 @@ pub fn prove(
     v: *const u64,
     gamma: [32]u8,
 ) ProveError!RangeProof {
-    const result = proveInner(allocator, gens, transcript, v, gamma);
+    const result = proveInner(allocator, gens, transcript, v[0..1], @as(*const [1][32]u8, &gamma));
+    burnStack();
+    return result catch |err| switch (err) {
+        error.ValueOutOfRange => return error.ValueOutOfRange,
+        error.OutOfMemory => return error.OutOfMemory,
+        // One value, and every Generators set holds at least one party.
+        error.InvalidAggregation => unreachable,
+    };
+}
+
+pub const ProveMultipleError = ProveError || error{
+    /// `values` is empty or not a power of two long, `gammas` is not as
+    /// long as `values`, or `gens` was built for fewer parties
+    /// (`Generators.initParties`) than there are values.
+    InvalidAggregation,
+};
+
+/// An aggregated range proof (paper §4.3): every `values[j]` is in
+/// `[0, 2^gens.n)`, against `V_j = commit(gens, values[j], gammas[j])`,
+/// in one proof — dalek's `RangeProof::prove_multiple`. The verifier needs
+/// the commitments in the same order (`verifyMultiple`). `values` is read
+/// in place, never copied by value (see `prove`'s note on audit finding
+/// B12); the stack is zeroed before returning, as in `prove`.
+pub fn proveMultiple(
+    allocator: std.mem.Allocator,
+    gens: Generators,
+    transcript: *Transcript,
+    values: []const u64,
+    gammas: []const [32]u8,
+) ProveMultipleError!RangeProof {
+    const result = proveInner(allocator, gens, transcript, values, gammas);
     burnStack();
     return result;
 }
@@ -439,38 +521,49 @@ noinline fn burnStack() void {
     std.crypto.secureZero(u8, &buf);
 }
 
-/// Steps 1-10 of `prove`. `noinline` is a guard, not a measured necessity:
-/// dropping it left the probe green (the compiler does not inline a function
-/// this large today).
+/// Steps 1-10 of `prove`, for `m = values.len` values ("Aggregation" in the
+/// module doc comment; `m = 1` is the single-value proof). `noinline` is a
+/// guard, not a measured necessity: dropping it left the probe green (the
+/// compiler does not inline a function this large today).
 noinline fn proveInner(
     allocator: std.mem.Allocator,
     gens: Generators,
     transcript: *Transcript,
-    v: *const u64,
-    gamma: [32]u8,
-) ProveError!RangeProof {
+    values: []const u64,
+    gammas: []const [32]u8,
+) ProveMultipleError!RangeProof {
+    const m = values.len;
+    if (m == 0 or !std.math.isPowerOfTwo(m) or gammas.len != m or m > gens.parties)
+        return error.InvalidAggregation;
     if (gens.n < 64) {
+        // One branch for the whole batch, not one per value: an early
+        // return would time WHICH value was out of range.
         const limit = @as(u64, 1) << @intCast(gens.n);
-        if (v.* >= limit) return error.ValueOutOfRange;
+        var out_of_range: u1 = 0;
+        for (values) |v| out_of_range |= @intFromBool(v >= limit);
+        if (out_of_range != 0) return error.ValueOutOfRange;
     }
 
-    // Read the secret witness through the pointer exactly once, into a
-    // local this function owns and can clean up. Repeatedly dereferencing
-    // `v.*` across the 64-iteration bit-decomposition loop below gave the
-    // optimizer room to spill the value to its own uncontrolled stack slot
-    // (measured: `stackprobe_test.zig`'s B12 probe still found 1 copy with
-    // `v` taken by pointer but dereferenced in the loop) -- reading it once
-    // here and `secureZero`ing this copy closes that, the same pattern
-    // already used below for every other witness-derived scratch buffer.
-    var v_val: u64 = v.*;
+    // Each secret witness is read through the slice exactly once, into
+    // this local, which is cleaned up. Repeatedly dereferencing the caller's
+    // value across the bit-decomposition loop gave the optimizer room to
+    // spill it to its own uncontrolled stack slot (measured:
+    // `stackprobe_test.zig`'s B12 probe found 1 copy with `v` taken by
+    // pointer but dereferenced in the loop).
+    var v_val: u64 = 0;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&v_val));
 
     const n = gens.n;
-    // The IPA reduction needs a nonzero power-of-two n. A Generators set
-    // is caller-constructed (non-adversarial) input, so this is a contract
-    // assertion, not an error variant (mirrors proveIpa's own unreachable
-    // below).
+    // The IPA reduction needs a nonzero power-of-two length. A Generators
+    // set is caller-constructed (non-adversarial) input, so this is a
+    // contract assertion, not an error variant (mirrors proveIpa's own
+    // unreachable below). `m` is a power of two (checked above), so `n*m`
+    // is one too.
     std.debug.assert(n != 0 and std.math.isPowerOfTwo(n));
+    const nm = n * m;
+    std.debug.assert(gens.g_vec.len >= nm and gens.h_vec.len >= nm);
+    const g_vec = gens.g_vec[0..nm];
+    const h_vec = gens.h_vec[0..nm];
 
     // Every internal vector lives in one arena (freed on all paths); the
     // witness-bearing ones get a best-effort secureZero before the arena
@@ -480,31 +573,35 @@ noinline fn proveInner(
     defer arena_state.deinit();
     const scratch = arena_state.allocator();
 
-    // 1. Bit decomposition, LSB-first: <a_L, [2^0,...,2^{n-1}]> == v.
-    //    a_R = a_L - 1^n elementwise. Branchless bit extract (v is
-    //    secret); bit positions >= 64 are structurally zero (u64 witness).
-    const a_l = try scratch.alloc([32]u8, n);
+    // 1. Bit decomposition, LSB-first per value: <a_L[j*n..], [2^0,...,
+    //    2^{n-1}]> == values[j]. a_R = a_L - 1^{nm} elementwise. Branchless
+    //    bit extract (the values are secret); bit positions >= 64 are
+    //    structurally zero (u64 witness).
+    const a_l = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(a_l));
-    const a_r = try scratch.alloc([32]u8, n);
+    const a_r = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(a_r));
-    for (a_l, a_r, 0..) |*al, *ar, i| {
-        const bit: u8 = if (i < 64) @truncate((v_val >> @intCast(i)) & 1) else 0;
-        al.* = scalarvec.zero;
-        al.*[0] = bit;
-        ar.* = scalar.sub(al.*, scalarvec.one);
+    for (0..m) |j| {
+        v_val = values[j];
+        for (a_l[j * n ..][0..n], a_r[j * n ..][0..n], 0..) |*al, *ar, i| {
+            const bit: u8 = if (i < 64) @truncate((v_val >> @intCast(i)) & 1) else 0;
+            al.* = scalarvec.zero;
+            al.*[0] = bit;
+            ar.* = scalar.sub(al.*, scalarvec.one);
+        }
     }
 
-    // 2. A = alpha*H + <a_L, G_vec> + <a_R, H_vec>. All lengths are n by
+    // 2. A = alpha*H + <a_L, G_vec> + <a_R, H_vec>. All lengths are nm by
     //    construction — LengthMismatch is unreachable throughout.
     const alpha = randomScalar();
     const a_commit = mulOrIdentity(gens.h, alpha)
-        .add(scalarvec.multiScalarMul(a_l, gens.g_vec) catch unreachable)
-        .add(scalarvec.multiScalarMul(a_r, gens.h_vec) catch unreachable);
+        .add(scalarvec.multiScalarMul(a_l, g_vec) catch unreachable)
+        .add(scalarvec.multiScalarMul(a_r, h_vec) catch unreachable);
 
     // 3. S = rho*H + <s_L, G_vec> + <s_R, H_vec>, s_L/s_R fresh random.
-    const s_l = try scratch.alloc([32]u8, n);
+    const s_l = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(s_l));
-    const s_r = try scratch.alloc([32]u8, n);
+    const s_r = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(s_r));
     for (s_l, s_r) |*sl, *sr| {
         sl.* = randomScalar();
@@ -512,10 +609,10 @@ noinline fn proveInner(
     }
     const rho = randomScalar();
     const s_commit = mulOrIdentity(gens.h, rho)
-        .add(scalarvec.multiScalarMul(s_l, gens.g_vec) catch unreachable)
-        .add(scalarvec.multiScalarMul(s_r, gens.h_vec) catch unreachable);
+        .add(scalarvec.multiScalarMul(s_l, g_vec) catch unreachable)
+        .add(scalarvec.multiScalarMul(s_r, h_vec) catch unreachable);
 
-    // 4. Bind n (audit finding B10: the bit-width was documented as an
+    // 4. Bind n and m (audit finding B10: the bit-width was documented as an
     //    `appendU64` use case but never actually bound -- `transcript.zig`'s
     //    doc comment named it as an example and nothing called it; adding
     //    this wires the doc comment's own claim into the real protocol as
@@ -523,50 +620,62 @@ noinline fn proveInner(
     //    is already checked structurally in `verify`, and the generator set
     //    is a deterministic function of `n`), but the module has no
     //    consumer in this repo, so no proof anywhere depends on the exact
-    //    challenge derivation this changes. Then bind V (recomputed from
-    //    the witness — the same point the verifier is handed), then A/S;
+    //    challenge derivation this changes. Then bind every V_j (recomputed
+    //    from the witness — the points the verifier is handed), then A/S;
     //    draw y, z.
-    appendDomainSep(transcript, n);
+    appendDomainSepMultiple(transcript, n, m);
     var v_bytes = scalarvec.zero;
     defer std.crypto.secureZero(u8, &v_bytes);
-    std.mem.writeInt(u64, v_bytes[0..8], v_val, .little);
-    const v_point = commit(gens, v_bytes, gamma);
-    transcript.appendPoint("V", v_point);
+    for (0..m) |j| {
+        v_val = values[j];
+        std.mem.writeInt(u64, v_bytes[0..8], v_val, .little);
+        transcript.appendPoint("V", commit(gens, v_bytes, gammas[j]));
+    }
     transcript.appendPoint("A", a_commit);
     transcript.appendPoint("S", s_commit);
     const y = transcript.challengeScalar("y");
     const z = transcript.challengeScalar("z");
 
-    // 5. l(X) = l0 + l1*X, r(X) = r0 + r1*X (paper eq. (63)-(64)):
-    //      l0 = a_L - z*1^n                       l1 = s_L
-    //      r0 = y^n . (a_R + z*1^n) + z^2*2^n     r1 = y^n . s_R
-    const y_pows = try scalarvec.powers(scratch, y, n);
+    // 5. l(X) = l0 + l1*X, r(X) = r0 + r1*X (paper eq. (63)-(64); §4.3 for
+    //    the per-value z power), at position k = j*n + i:
+    //      l0 = a_L - z*1                                 l1 = s_L
+    //      r0 = y^k * (a_R + z) + z^{2+j} * 2^i           r1 = y^k * s_R
+    const y_pows = try scalarvec.powers(scratch, y, nm);
     const two_pows = try scalarvec.powers(scratch, scalarvec.two, n);
     const z2 = scalar.mul(z, z);
+    // zz[j] = z^{2+j}, the weight of value j's statement.
+    const zz = try scratch.alloc([32]u8, m);
+    {
+        var acc = z2;
+        for (zz) |*o| {
+            o.* = acc;
+            acc = scalar.mul(acc, z);
+        }
+    }
 
-    const l0 = try scratch.alloc([32]u8, n);
+    const l0 = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(l0));
     for (l0, a_l) |*o, al| o.* = scalar.sub(al, z);
     const l1 = s_l;
-    const r0 = try scratch.alloc([32]u8, n);
+    const r0 = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(r0));
-    for (r0, a_r, y_pows, two_pows) |*o, ar, yp, tp|
-        o.* = scalar.mulAdd(z2, tp, scalar.mul(yp, scalar.add(ar, z)));
-    const r1 = try scratch.alloc([32]u8, n);
+    for (r0, a_r, y_pows, 0..) |*o, ar, yp, k|
+        o.* = scalar.mulAdd(zz[k / n], two_pows[k % n], scalar.mul(yp, scalar.add(ar, z)));
+    const r1 = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(r1));
     scalarvec.hadamard(r1, y_pows, s_r) catch unreachable;
 
     //    t(X) = <l(X), r(X)> = t0 + t1*X + t2*X^2 — closed forms (paper
     //    eq. (61)); t0 itself is never sent (the verifier reconstructs it
-    //    from V/z/deltaYZ).
+    //    from the V_j/z/deltaYZMultiple).
     const t1_scalar = scalar.add(
         scalarvec.innerProduct(l0, r1) catch unreachable,
         scalarvec.innerProduct(l1, r0) catch unreachable,
     );
     const t2_scalar = scalarvec.innerProduct(l1, r1) catch unreachable;
 
-    // 6.-7. T1/T2 under the SAME g/h base points V was committed under;
-    //    bind them; draw x.
+    // 6.-7. T1/T2 under the SAME g/h base points the V_j were committed
+    //    under; bind them; draw x.
     const tau1 = randomScalar();
     const tau2 = randomScalar();
     const t1_commit = mulOrIdentity(gens.g, t1_scalar).add(mulOrIdentity(gens.h, tau1));
@@ -577,10 +686,10 @@ noinline fn proveInner(
     const x2 = scalar.mul(x, x);
 
     // 8. Evaluate l(x)/r(x) + the response scalars.
-    const l_x = try scratch.alloc([32]u8, n);
+    const l_x = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(l_x));
     for (l_x, l0, l1) |*o, c0, c1| o.* = scalar.mulAdd(c1, x, c0);
-    const r_x = try scratch.alloc([32]u8, n);
+    const r_x = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(r_x));
     for (r_x, r0, r1) |*o, c0, c1| o.* = scalar.mulAdd(c1, x, c0);
     const t_hat = scalarvec.innerProduct(l_x, r_x) catch unreachable;
@@ -593,11 +702,16 @@ noinline fn proveInner(
         std.debug.assert(std.mem.eql(u8, &t_hat, &want));
     }
 
-    const tau_x = scalar.add(scalar.mulAdd(tau2, x2, scalar.mul(tau1, x)), scalar.mul(z2, gamma));
+    // sum_j z^{2+j} * gamma_j — for m = 1 exactly the single proof's
+    // z^2 * gamma.
+    var zg = scalar.mul(zz[0], gammas[0]);
+    defer std.crypto.secureZero(u8, &zg);
+    for (zz[1..], gammas[1..]) |w_j, g_j| zg = scalar.mulAdd(w_j, g_j, zg);
+    const tau_x = scalar.add(scalar.mulAdd(tau2, x2, scalar.mul(tau1, x)), zg);
     const mu = scalar.mulAdd(rho, x, alpha);
 
     // 9. Bind the response scalars, derive w -> Q = w*G (binding the IPA
-    //    to THIS proof instance), rescale H'_i = y^{-i}*H_i, run the IPA
+    //    to THIS proof instance), rescale H'_k = y^{-k}*H_k, run the IPA
     //    on (l(x), r(x)) over the SAME continuing transcript.
     transcript.appendScalar("t_x", t_hat);
     transcript.appendScalar("t_x_blinding", tau_x);
@@ -606,18 +720,18 @@ noinline fn proveInner(
     const q = mulOrIdentity(gens.g, w);
 
     const y_inv = invertScalar(y);
-    const h_prime = try scratch.alloc(Ristretto255, n);
+    const h_prime = try scratch.alloc(Ristretto255, nm);
     {
         var y_inv_pow = scalarvec.one;
-        for (h_prime, gens.h_vec) |*o, hp| {
+        for (h_prime, h_vec) |*o, hp| {
             o.* = mulOrIdentity(hp, y_inv_pow);
             y_inv_pow = scalar.mul(y_inv_pow, y_inv);
         }
     }
 
-    const ipa_proof = ipa.proveIpa(allocator, transcript, gens.g_vec, h_prime, q, l_x, r_x) catch |err| switch (err) {
+    const ipa_proof = ipa.proveIpa(allocator, transcript, g_vec, h_prime, q, l_x, r_x) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // All vector lengths are n by construction, and n's nonzero
+        // All vector lengths are nm by construction, and nm's nonzero
         // power-of-two-ness was asserted at the top.
         error.LengthMismatch, error.NotPowerOfTwo => unreachable,
     };
@@ -648,6 +762,20 @@ pub fn verify(
     return verifyTraced(gens, transcript, v, proof, null);
 }
 
+/// Verifies an aggregated proof (`proveMultiple`) for `commitments`, in the
+/// order the prover bound them — dalek's `RangeProof::verify_multiple`.
+/// `commitments.len` is the proof's `m`: a power of two, at most
+/// `gens.parties`. Fail-closed like `verify`. The identity is accepted as a
+/// commitment (value 0, blinding 0), as dalek does.
+pub fn verifyMultiple(
+    gens: Generators,
+    transcript: *Transcript,
+    commitments: []const Ristretto255,
+    proof: RangeProof,
+) bool {
+    return verifyMultipleTraced(gens, transcript, commitments, proof, null);
+}
+
 /// What `verify` computed on its way to a verdict, recorded only when a
 /// caller asks for it. It exists for `verify_b8_diff_test.zig`, which holds
 /// the pre-B8 verifier as a reference and requires the points below to be
@@ -673,20 +801,40 @@ pub fn verifyTraced(
     proof: RangeProof,
     trace: ?*VerifyTrace,
 ) bool {
+    return verifyMultipleTraced(gens, transcript, &[_]Ristretto255{v}, proof, trace);
+}
+
+/// The body of `verify` and `verifyMultiple`; `m = commitments.len`.
+pub fn verifyMultipleTraced(
+    gens: Generators,
+    transcript: *Transcript,
+    commitments: []const Ristretto255,
+    proof: RangeProof,
+    trace: ?*VerifyTrace,
+) bool {
     const n = gens.n;
+    const m = commitments.len;
     if (n == 0 or !std.math.isPowerOfTwo(n)) return false;
-    if (gens.g_vec.len != n or gens.h_vec.len != n) return false;
-    const rounds: usize = std.math.log2_int(usize, n);
-    // Structural check: the proof's implied n (from its IPA round count)
-    // must match this generator set — rejects, among other things, an
-    // n=8 proof replayed against an n=16 Generators set.
+    if (m == 0 or !std.math.isPowerOfTwo(m) or m > gens.parties) return false;
+    const gens_len = std.math.mul(usize, n, gens.parties) catch return false;
+    if (gens.g_vec.len != gens_len or gens.h_vec.len != gens_len) return false;
+    // n and m are powers of two and n*m <= n*parties fits, so nm is a
+    // power of two too.
+    const nm = n * m;
+    const g_vec = gens.g_vec[0..nm];
+    const h_vec = gens.h_vec[0..nm];
+    const rounds: usize = std.math.log2_int(usize, nm);
+    // Structural check: the proof's implied n*m (from its IPA round count)
+    // must match this generator set and commitment count — rejects, among
+    // other things, an n=8 proof replayed against an n=16 Generators set,
+    // and an m=2 proof checked against one commitment.
     //
     // ⭐ Audit finding B14: `ipa.verifyIpa` (called below, at the end of
     // this function) performs THIS EXACT check again on its own `rounds`
-    // parameter (derived from `g_vec.len`, which here is always `n`) against
-    // `proof.l_vec.len`/`proof.r_vec.len`. That duplication is deliberate
-    // defense-in-depth, not dead code left over from a refactor — `verifyIpa`
-    // is also called standalone (see `root.zig`'s re-export and
+    // parameter (derived from `g_vec.len`, which here is always `nm`)
+    // against `proof.l_vec.len`/`proof.r_vec.len`. That duplication is
+    // deliberate defense-in-depth, not dead code left over from a refactor —
+    // `verifyIpa` is also called standalone (see `root.zig`'s re-export and
     // `kat_test.zig`'s "IPA standalone" test), so it cannot drop its own
     // copy without leaving THAT caller unchecked. A mutation that deletes
     // the check here survives (`verifyIpa`'s copy still catches it) — that
@@ -701,12 +849,12 @@ pub fn verifyTraced(
     const scratch = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
     // Replay step 4's transcript ops from the proof's own fields (and the
-    // public V) to recover the prover's y, z, x. `n` first (audit finding
-    // B10) — must mirror `prove`'s call exactly, same argument, same
+    // public V_j) to recover the prover's y, z, x. `n` and `m` first (audit
+    // finding B10) — must mirror `prove`'s call exactly, same argument, same
     // position, or completeness breaks immediately (see the regression test
     // in this file's test block).
-    appendDomainSep(transcript, n);
-    transcript.appendPoint("V", v);
+    appendDomainSepMultiple(transcript, n, m);
+    for (commitments) |v| transcript.appendPoint("V", v);
     // dalek's verifier refuses an identity A/S/T_1/T_2 before binding it.
     transcript.validateAndAppendPoint("A", proof.a) catch return false;
     transcript.validateAndAppendPoint("S", proof.s) catch return false;
@@ -718,11 +866,24 @@ pub fn verifyTraced(
     const z2 = scalar.mul(z, z);
     const x2 = scalar.mul(x, x);
 
-    // Check 1 — the t_hat relation (paper eq. (72)):
-    //   t_hat*G + tau_x*H == z^2*V + delta(y,z)*G + x*T1 + x^2*T2.
-    const delta = deltaYZ(scratch, y, z, n) catch return false;
+    // zz[j] = z^{2+j}, the weight of value j's statement.
+    const zz = scratch.alloc([32]u8, m) catch return false;
+    defer scratch.free(zz);
+    {
+        var acc = z2;
+        for (zz) |*o| {
+            o.* = acc;
+            acc = scalar.mul(acc, z);
+        }
+    }
+
+    // Check 1 — the t_hat relation (paper eq. (72), §4.3 for m > 1):
+    //   t_hat*G + tau_x*H == sum_j z^{2+j}*V_j + delta(y,z)*G + x*T1 + x^2*T2.
+    const delta = deltaYZMultiple(scratch, y, z, n, m) catch return false;
     const lhs = mulOrIdentity(gens.g, proof.t_hat).add(mulOrIdentity(gens.h, proof.tau_x));
-    const rhs = mulOrIdentity(v, z2)
+    var v_sum = scalarvec.identity_point;
+    for (commitments, zz) |v, w_j| v_sum = v_sum.add(mulOrIdentity(v, w_j));
+    const rhs = v_sum
         .add(mulOrIdentity(gens.g, delta))
         .add(mulOrIdentity(proof.t1, x))
         .add(mulOrIdentity(proof.t2, x2));
@@ -735,30 +896,31 @@ pub fn verifyTraced(
     const w = transcript.challengeScalar("w");
     const q = mulOrIdentity(gens.g, w);
 
-    // Check 2 — the IPA, over the rescaled generators h'_i = y^{-i}*H_i and
+    // Check 2 — the IPA, over the rescaled generators h'_k = y^{-k}*H_k and
     // the IPA statement point (paper eq. (66)-(67), completed with the -mu*H
     // blinding removal and the +t_hat*Q inner-product binding so it
-    // matches proveIpa's `P = <l,G> + <r,H'> + <l,r>*Q` form exactly):
+    // matches proveIpa's `P = <l,G> + <r,H'> + <l,r>*Q` form exactly), with
+    // k = j*n + i:
     //   P = A + x*S - z*<1,G> - mu*H
-    //       + sum_i (z*y^i + z^2*2^i)*h'_i + t_hat*Q
+    //       + sum_k (z*y^k + z^{2+j}*2^i)*h'_k + t_hat*Q
     //
     // ⭐ Audit finding B8: h' is NEVER materialised. Building it cost n
     // constant-time ladders — 63 % of verify at n=64 — over data with no
-    // secret in it. Both places h' enters are MSMs, so y^{-i} moves into the
-    // coefficient instead: ((z*y^i + z^2*2^i) * y^{-i}) * H_i here, and
+    // secret in it. Both places h' enters are MSMs, so y^{-k} moves into the
+    // coefficient instead: ((z*y^k + z^{2+j}*2^i) * y^{-k}) * H_k here, and
     // `ipa.equationSides`'s `h_scale` there. That is the identity
     // (c*s)*H == c*(s*H), exact in a prime-order group for every scalar —
     // including y == 0 (`invert(0) == 0`), which is why the coefficient is
-    // the old one times y^{-i} rather than the "simplified"
-    // z + z^2*2^i*y^{-i}: that form is NOT equal to it when y == 0.
+    // the old one times y^{-k} rather than the "simplified"
+    // z + z^{2+j}*2^i*y^{-k}: that form is NOT equal to it when y == 0.
     // `verify_b8_diff_test.zig` pins P and both IPA equation sides
-    // byte-for-byte against the pre-B8 verifier kept there.
+    // byte-for-byte against the pre-B8 verifier kept there (m = 1).
     const y_inv = invertScalar(y);
-    // y_inv_pows[i] = y^{-i}: the implicit scale of h'_i, handed to the IPA.
-    const y_inv_pows = scratch.alloc([32]u8, n) catch return false;
+    // y_inv_pows[k] = y^{-k}: the implicit scale of h'_k, handed to the IPA.
+    const y_inv_pows = scratch.alloc([32]u8, nm) catch return false;
     defer scratch.free(y_inv_pows);
-    // Per-index coefficients of H_i in the h_term MSM below.
-    const h_scalars = scratch.alloc([32]u8, n) catch return false;
+    // Per-index coefficients of H_k in the h_term MSM below.
+    const h_scalars = scratch.alloc([32]u8, nm) catch return false;
     defer scratch.free(h_scalars);
 
     var sum_g = scalarvec.identity_point;
@@ -766,9 +928,11 @@ pub fn verifyTraced(
         var y_inv_pow = scalarvec.one;
         var y_pow = scalarvec.one;
         var two_pow = scalarvec.one;
-        for (y_inv_pows, h_scalars, gens.g_vec) |*s_out, *c_out, gp| {
+        for (y_inv_pows, h_scalars, g_vec, 0..) |*s_out, *c_out, gp, k| {
+            // 2^i restarts at every value's block.
+            if (k % n == 0) two_pow = scalarvec.one;
             s_out.* = y_inv_pow;
-            const c = scalar.mulAdd(z2, two_pow, scalar.mul(z, y_pow));
+            const c = scalar.mulAdd(zz[k / n], two_pow, scalar.mul(z, y_pow));
             c_out.* = scalar.mul(c, y_inv_pow);
             // sum_g accumulates the all-ones combination of the g generators
             // (a plain point sum, not a weighted MSM), so it stays a fold.
@@ -778,10 +942,10 @@ pub fn verifyTraced(
             two_pow = scalar.add(two_pow, two_pow);
         }
     }
-    // h_term = sum_i ((z*y^i + z^2*2^i) * y^{-i}) * H_i — over PUBLIC verifier
-    // data (challenges + public generators), so the vartime Pippenger MSM
-    // applies.
-    const h_term = scalarvec.multiScalarMulVartime(h_scalars, gens.h_vec) catch return false;
+    // h_term = sum_k ((z*y^k + z^{2+j}*2^i) * y^{-k}) * H_k — over PUBLIC
+    // verifier data (challenges + public generators), so the vartime
+    // Pippenger MSM applies.
+    const h_term = scalarvec.multiScalarMulVartime(h_scalars, h_vec) catch return false;
 
     const p = proof.a
         .add(mulOrIdentity(proof.s, x))
@@ -790,7 +954,7 @@ pub fn verifyTraced(
         .add(h_term)
         .add(mulOrIdentity(q, proof.t_hat));
 
-    const sides = ipa.equationSides(transcript, gens.g_vec, gens.h_vec, y_inv_pows, q, p, proof.ipa) orelse return false;
+    const sides = ipa.equationSides(transcript, g_vec, h_vec, y_inv_pows, q, p, proof.ipa) orelse return false;
     if (trace) |t| {
         t.reached_ipa = true;
         t.p = p.toBytes();

@@ -7,6 +7,8 @@ and More", IEEE S&P 2018) over Ristretto255
 in `[0, 2^n)` (`n` typically 64) without revealing `v`, in a proof whose
 size is **logarithmic** in `n` — the construction behind Confidential
 Transactions, Monero-style range proofs, and many zk-rollup circuits.
+Several values can share one **aggregated** proof (paper §4.3), whose size
+grows with `log2(n*m)` for `m` values.
 
 **Status: complete.** The generator derivation, the Pedersen commitment,
 the Merlin Fiat-Shamir transcript, both proof structs' byte
@@ -22,14 +24,15 @@ design and the verification methodology.
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
-| `generators.zig` | **REAL.** `Generators` — deterministic NUMS generator derivation (`g`, `h`, `g_vec`, `h_vec`) |
+| `generators.zig` | **REAL.** `Generators` — deterministic NUMS generator derivation (`g`, `h`, `g_vec`, `h_vec`); `initParties` for aggregated proofs |
 | `transcript.zig` | **REAL.** `Transcript` — Merlin v1.0 (STROBE-128) Fiat-Shamir transcript, byte-compatible with the `merlin` crate |
 | `scalarvec.zig` | **REAL.** Scalar/vector arithmetic (`innerProduct`, `hadamard`, `addVec`/`subVec`/`scaleVec`, `powers`) + `multiScalarMul` over Ristretto255 |
 | `ipa.zig` | **FABLE CORE (implemented):** `proveIpa`/`verifyIpa`. `InnerProductProof`'s struct + byte codec are REAL |
-| `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`. `commit`, `deltaYZ`, and `RangeProof`'s struct + byte codec are REAL |
+| `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`, aggregated `proveMultiple`/`verifyMultiple`. `commit`, `deltaYZ`/`deltaYZMultiple`, and `RangeProof`'s struct + byte codec are REAL |
 | `gate.zig` | The single switch (`core_implemented`) gating the two cores' tests |
 | `kat_test.zig` | The property/soundness KAT harness (completeness + soundness scenarios) |
-| `interop_test.zig` | The external anchor: merlin transcripts and dalek range proofs in both directions (`interop_vectors.zig`, from `tools/dalek/`) |
+| `aggregate_test.zig` | Aggregated proofs: completeness for m = 1..8, malformed batches, reordered/swapped/dropped commitments |
+| `interop_test.zig` | The external anchor: merlin transcripts and dalek range proofs, single and aggregated, in both directions (`interop_vectors.zig`, from `tools/dalek/`) |
 
 ## Import
 
@@ -58,6 +61,31 @@ const ok = bulletproofs.verify(gens, &verify_transcript, commitment, proof); // 
 `prove` rejects an out-of-range `v` (`error.ValueOutOfRange`) at
 construction time, before any commitment is built.
 
+Aggregated: `m` values (a power of two) in one proof, over generators for at
+least `m` parties. The verifier takes the commitments in the prover's order.
+
+```zig
+const gens = try bulletproofs.Generators.initParties(allocator, 64, 4); // up to 4 values
+defer gens.deinit(allocator);
+
+const values = [_]u64{ 10, 20, 30, 40 };
+const gammas: [4][32]u8 = ...; // one blinding per value
+// commitments[j] = bulletproofs.commit(gens, values[j] as scalar bytes, gammas[j])
+
+var pt = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
+const proof = try bulletproofs.proveMultiple(allocator, gens, &pt, &values, &gammas);
+defer proof.deinit(allocator);
+
+var vt = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
+const ok = bulletproofs.verifyMultiple(gens, &vt, &commitments, proof); // true
+```
+
+`proveMultiple` refuses an empty batch, a length that is not a power of
+two, mismatched `gammas`, or more values than `gens` has parties
+(`error.InvalidAggregation`), and any value out of range
+(`error.ValueOutOfRange`). One caller holds every witness; dalek's
+multi-party dealer/party protocol is not offered.
+
 ## Caveats
 
 - **Proving is Linux-only** (`meta.platform = .linux`). `prove` draws its
@@ -73,8 +101,9 @@ construction time, before any commitment is built.
   unconditionally, including zero, and `src/ctgrind_harness.zig` measures
   **0 in-file contexts** with `v` and `gamma` tainted through `prove`. ⚠ The
   blinding `prove` draws internally is outside that measurement. See SPEC.md.
-- **Single-value proofs only**, `n` a power of two; dalek interoperates
-  for `n` in {8, 16, 32, 64} (it refuses other widths).
+- `n` and `m` are powers of two; dalek interoperates for `n` in {8, 16,
+  32, 64} (it refuses other widths). No batch verification of several
+  independent proofs yet.
 
 ## Wire compatibility — dalek-cryptography/bulletproofs 4.0
 
@@ -82,7 +111,9 @@ Since 2026-09-30 the transcript (Merlin), the generators and the byte
 layout are dalek's, so proofs cross in both directions: a dalek
 `RangeProof::to_bytes()` decodes with `RangeProof.fromBytesAlloc` and
 verifies with `verify`, and a proof from `prove` verifies under dalek's
-`verify_single`. Both sides must start the transcript with the same label
+`verify_single`; the same holds for aggregated proofs (`proveMultiple` ↔
+dalek's `prove_multiple`/`verify_multiple`, generators of party `j` from
+chain `'G'/'H' || LE32(j)`). Both sides must start the transcript with the same label
 (dalek leaves it to the application; this module's default is
 `rangeproof_domain`). `interop_test.zig` asserts both directions against
 vectors the crates produced (`tools/dalek/`). Proofs made before that date

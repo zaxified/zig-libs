@@ -14,9 +14,16 @@
 //! - here -> dalek: `zig_proofs_dalek_accepted` were made by `prove` and
 //!   accepted by dalek's `verify_single` when the file was generated (the
 //!   tool aborts otherwise). They are re-checked here only as regression.
+//! - Aggregated (paper §4.3): `dalek_multi_proofs` came from dalek's
+//!   `prove_multiple` and must verify under `verifyMultiple`;
+//!   `zig_multi_proofs_dalek_accepted` came from `proveMultiple` and were
+//!   accepted by dalek's `verify_multiple`. This pins what the property
+//!   tests cannot: the per-party generator chains, the `z^{2+j}` weights and
+//!   the order of `V_j` in the transcript.
 //! - Controls: another label, another width, a flipped byte, a swapped
 //!   commitment — each must be rejected, so acceptance above is not a
-//!   verifier that says yes to everything.
+//!   verifier that says yes to everything; for aggregated proofs also
+//!   reordered commitments and a dropped one.
 
 const std = @import("std");
 const bp = @import("root.zig");
@@ -126,6 +133,81 @@ test "controls: another label, width, commitment or a flipped byte is rejected" 
             defer talloc.free(work);
             work[off + 1] ^= 0x01;
             try std.testing.expect(!try verifyWith(vectors.label, c.n, v, work));
+        }
+    }
+}
+
+/// Verifies `bytes` as an aggregated proof for the commitments `vs` (hex)
+/// under a fresh transcript `label` and generators for `n` bits and
+/// `vs.len` parties.
+fn verifyMultiWith(label: []const u8, n: usize, vs: []const Ristretto255, bytes: []const u8) !bool {
+    const gens = try bp.Generators.initParties(talloc, n, @max(vs.len, 1));
+    defer gens.deinit(talloc);
+    const proof = bp.RangeProof.fromBytesAlloc(talloc, bytes) catch return false;
+    defer proof.deinit(talloc);
+    var t = bp.Transcript.init(label);
+    return bp.verifyMultiple(gens, &t, vs, proof);
+}
+
+fn pointsAlloc(hexes: []const []const u8) ![]Ristretto255 {
+    const out = try talloc.alloc(Ristretto255, hexes.len);
+    errdefer talloc.free(out);
+    for (out, hexes) |*p, h| p.* = try point(h);
+    return out;
+}
+
+test "dalek -> here: every dalek aggregated proof verifies and re-encodes byte-exact" {
+    try std.testing.expect(vectors.dalek_multi_proofs.len >= 6);
+    var ms = std.bit_set.IntegerBitSet(9).initEmpty();
+    for (vectors.dalek_multi_proofs) |c| {
+        const vs = try pointsAlloc(c.vs);
+        defer talloc.free(vs);
+        const bytes = try hexAlloc(c.proof);
+        defer talloc.free(bytes);
+        try std.testing.expect(try verifyMultiWith(vectors.label, c.n, vs, bytes));
+
+        const proof = try bp.RangeProof.fromBytesAlloc(talloc, bytes);
+        defer proof.deinit(talloc);
+        const again = try proof.toBytesAlloc(talloc);
+        defer talloc.free(again);
+        try std.testing.expectEqualSlices(u8, bytes, again);
+        ms.set(vs.len);
+    }
+    for ([_]usize{ 2, 4, 8 }) |m| try std.testing.expect(ms.isSet(m));
+}
+
+test "here -> dalek: the aggregated proofs dalek accepted still verify here" {
+    try std.testing.expect(vectors.zig_multi_proofs_dalek_accepted.len >= 5);
+    for (vectors.zig_multi_proofs_dalek_accepted) |c| {
+        const vs = try pointsAlloc(c.vs);
+        defer talloc.free(vs);
+        const bytes = try hexAlloc(c.proof);
+        defer talloc.free(bytes);
+        try std.testing.expect(try verifyMultiWith(vectors.label, c.n, vs, bytes));
+    }
+}
+
+test "controls (aggregated): label, order, a dropped commitment, a flipped byte" {
+    for (vectors.dalek_multi_proofs) |c| {
+        const vs = try pointsAlloc(c.vs);
+        defer talloc.free(vs);
+        const bytes = try hexAlloc(c.proof);
+        defer talloc.free(bytes);
+
+        try std.testing.expect(!try verifyMultiWith("doctest example", c.n, vs, bytes));
+        // The first two commitments swapped.
+        std.mem.swap(Ristretto255, &vs[0], &vs[1]);
+        try std.testing.expect(!try verifyMultiWith(vectors.label, c.n, vs, bytes));
+        std.mem.swap(Ristretto255, &vs[0], &vs[1]);
+        // Half the commitments: another m, so another round count.
+        try std.testing.expect(!try verifyMultiWith(vectors.label, c.n, vs[0 .. vs.len / 2], bytes));
+        // One flipped bit in each 32-byte element.
+        var off: usize = 0;
+        while (off < bytes.len) : (off += 32) {
+            const work = try talloc.dupe(u8, bytes);
+            defer talloc.free(work);
+            work[off + 1] ^= 0x01;
+            try std.testing.expect(!try verifyMultiWith(vectors.label, c.n, vs, work));
         }
     }
 }

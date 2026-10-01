@@ -14,6 +14,11 @@
 //      one `<n> <label hex> <V hex> <proof hex>` per line), each VERIFIED BY
 //      DALEK here; the tool aborts if dalek rejects one. They are re-emitted
 //      so the Zig test holds them too.
+//   E. Aggregated range proofs made by dalek (`prove_multiple_with_rng`,
+//      same seeded RNG), each verified by dalek first.
+//   F. Aggregated range proofs made by zig-libs: stdin lines whose V field
+//      holds several commitments joined by `,`, each verified by dalek's
+//      `verify_multiple` (abort on a rejection), re-emitted.
 //
 // Usage: see ../README.md.
 
@@ -128,7 +133,9 @@ fn main() {
     out.push_str(&format!("/// `PedersenGens::default().B_blinding`.\npub const pedersen_b_blinding = \"{}\";\n\n", hex::encode(pc_gens.B_blinding.compress().as_bytes())));
 
     // C. dalek proofs.
-    let bp_gens = BulletproofGens::new(64, 1);
+    // Party capacity 8 for E/F; party 0 (all a single proof uses) is the same
+    // as with capacity 1, so C does not change.
+    let bp_gens = BulletproofGens::new(64, 8);
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     out.push_str(&format!("/// The Merlin label both directions use (`Transcript::new`).\npub const label = {};\n\n", zstr(LABEL)));
     out.push_str("pub const Proof = struct { n: usize, v: []const u8, proof: []const u8 };\n\n");
@@ -161,9 +168,10 @@ fn main() {
     }
     out.push_str("};\n\n");
 
-    // D. zig-libs proofs, verified by dalek.
+    // D. zig-libs proofs, verified by dalek; aggregated lines kept for F.
     out.push_str("/// Made by this module (`tools/dalek/zig_proofs.txt`), each ACCEPTED by dalek's `verify_single` when this file was generated.\npub const zig_proofs_dalek_accepted = [_]Proof{\n");
     let mut count_d = 0;
+    let mut multi_lines: Vec<String> = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let line = line.expect("stdin");
         let line = line.trim();
@@ -172,6 +180,10 @@ fn main() {
         }
         let f: Vec<&str> = line.split(' ').collect();
         assert_eq!(f.len(), 4, "bad line: {line}");
+        if f[2].contains(',') {
+            multi_lines.push(line.to_string());
+            continue;
+        }
         let n: usize = f[0].parse().expect("n");
         assert_eq!(hex::decode(f[1]).expect("label hex"), LABEL, "label");
         let v_bytes = hex::decode(f[2]).expect("V hex");
@@ -185,7 +197,63 @@ fn main() {
         out.push_str(&format!("    .{{ .n = {}, .v = \"{}\", .proof = \"{}\" }},\n", n, f[2], f[3]));
         count_d += 1;
     }
+    out.push_str("};\n\n");
+
+    // E. dalek aggregated proofs.
+    out.push_str("pub const MultiProof = struct { n: usize, vs: []const []const u8, proof: []const u8 };\n\n");
+    out.push_str("/// Made by dalek's `RangeProof::prove_multiple_with_rng`, accepted by its `verify_multiple`.\npub const dalek_multi_proofs = [_]MultiProof{\n");
+    let mut count_e = 0;
+    for &(n, values) in &[
+        (8usize, &[0u64, 255][..]),
+        (8, &[1, 2, 3, 4][..]),
+        (16, &[0, 1, 2, 65535, 4096, 77, 30000, 65534][..]),
+        (32, &[u32::MAX as u64, 12345][..]),
+        (64, &[u64::MAX, 0][..]),
+        (64, &[0x0123_4567_89ab_cdef, 1, u64::MAX - 1, 1 << 63][..]),
+    ] {
+        let blindings: Vec<Scalar> = values.iter().map(|_| Scalar::random(&mut rng)).collect();
+        let mut pt = Transcript::new(LABEL);
+        let (proof, commitments) =
+            RangeProof::prove_multiple_with_rng(&bp_gens, &pc_gens, &mut pt, values, &blindings, n, &mut rng)
+                .expect("dalek prove_multiple");
+        let mut vt = Transcript::new(LABEL);
+        proof
+            .verify_multiple_with_rng(&bp_gens, &pc_gens, &mut vt, &commitments, n, &mut rng)
+            .expect("dalek verifies its own aggregated proof");
+        let vs: Vec<String> = commitments.iter().map(|c| format!("\"{}\"", hex::encode(c.as_bytes()))).collect();
+        out.push_str(&format!(
+            "    .{{ .n = {}, .vs = &.{{ {} }}, .proof = \"{}\" }},\n",
+            n,
+            vs.join(", "),
+            hex::encode(proof.to_bytes())
+        ));
+        count_e += 1;
+    }
+    out.push_str("};\n\n");
+
+    // F. zig-libs aggregated proofs, verified by dalek.
+    out.push_str("/// Made by this module (`tools/dalek/zig_proofs.txt`, lines with several commitments), each ACCEPTED by dalek's `verify_multiple` when this file was generated.\npub const zig_multi_proofs_dalek_accepted = [_]MultiProof{\n");
+    let mut count_f = 0;
+    for line in &multi_lines {
+        let f: Vec<&str> = line.split(' ').collect();
+        let n: usize = f[0].parse().expect("n");
+        assert_eq!(hex::decode(f[1]).expect("label hex"), LABEL, "label");
+        let commitments: Vec<CompressedRistretto> = f[2]
+            .split(',')
+            .map(|h| CompressedRistretto::from_slice(&hex::decode(h).expect("V hex")))
+            .collect();
+        let proof_bytes = hex::decode(f[3]).expect("proof hex");
+        let proof = RangeProof::from_bytes(&proof_bytes).expect("dalek parses the zig-libs aggregated proof");
+        let mut vt = Transcript::new(LABEL);
+        proof
+            .verify_multiple_with_rng(&bp_gens, &pc_gens, &mut vt, &commitments, n, &mut rng)
+            .unwrap_or_else(|e| panic!("dalek REJECTS a zig-libs aggregated proof (n={n}, m={}): {e:?}", commitments.len()));
+        let vs: Vec<String> = f[2].split(',').map(|h| format!("\"{h}\"")).collect();
+        out.push_str(&format!("    .{{ .n = {}, .vs = &.{{ {} }}, .proof = \"{}\" }},\n", n, vs.join(", "), f[3]));
+        count_f += 1;
+    }
     out.push_str("};\n");
+    assert!(count_e > 0 && count_f > 0, "empty aggregated corpus");
     assert!(count_c > 0 && count_d > 0, "empty corpus");
     print!("{out}");
 }

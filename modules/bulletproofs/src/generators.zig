@@ -36,8 +36,14 @@
 //! dalek's `RistrettoPoint::from_uniform_bytes`. Until 2026-09-30 the points
 //! came from a module-defined SHA-512 construction; they were moved to
 //! dalek's so that proofs interoperate (`interop_test.zig` pins them against
-//! values printed by the crate itself). Only party 0 exists here because
-//! only single-value proofs do (SPEC.md "Out of scope").
+//! values printed by the crate itself).
+//!
+//! An aggregated proof over `m` values (`rangeproof.proveMultiple`) gives
+//! value `j` its own pair of chains, `'G' || LE32(j)` and `'H' || LE32(j)`
+//! (dalek's `BulletproofGens` party `j`), and concatenates them party by
+//! party: `g_vec[j*n + i]` is party `j`'s `i`-th generator (dalek's
+//! `BulletproofGens::G(n, m)` order). `Generators.initParties` builds that;
+//! `init` is its one-party case.
 
 const std = @import("std");
 const Ristretto255 = std.crypto.ecc.Ristretto255;
@@ -81,14 +87,20 @@ fn blindingBase() Ristretto255 {
 /// The full generator set an `n`-bit range proof needs: two base points
 /// `g`/`h` (the value commitment `V = v*g + gamma*h`, and the range
 /// proof's own `T1`/`T2` commitments — see `rangeproof.zig`) plus
-/// length-`n` vectors `g_vec`/`h_vec` (the vector Pedersen commitments `A`/
-/// `S`, and the Inner-Product Argument's own generators, see `ipa.zig`).
+/// length-`n * parties` vectors `g_vec`/`h_vec` (the vector Pedersen
+/// commitments `A`/`S`, and the Inner-Product Argument's own generators, see
+/// `ipa.zig`), party-major (module doc comment).
 pub const Generators = struct {
     g: Ristretto255,
     h: Ristretto255,
     g_vec: []Ristretto255,
     h_vec: []Ristretto255,
+    /// Bits per value.
     n: usize,
+    /// How many values one aggregated proof over this set may carry
+    /// (dalek's `party_capacity`). A proof over `m <= parties` values uses
+    /// the first `n * m` entries of each vector.
+    parties: usize = 1,
 
     /// Derives a fresh `n`-wide generator set. `g_vec`/`h_vec` are
     /// allocated via `allocator` (freed by `deinit`). Every point is
@@ -99,20 +111,33 @@ pub const Generators = struct {
     /// the entire point of a NUMS construction: neither party need
     /// transmit or trust the other's copy.
     pub fn init(allocator: std.mem.Allocator, n: usize) std.mem.Allocator.Error!Generators {
-        const g_vec = try allocator.alloc(Ristretto255, n);
+        return initParties(allocator, n, 1);
+    }
+
+    /// `init` for aggregated proofs of up to `parties` values: party `j`'s
+    /// `n` generators come from its own chains and sit at `j*n ..
+    /// (j+1)*n`. Party 0 is exactly `init(n)`'s set, so a single-value
+    /// proof verifies over either.
+    pub fn initParties(allocator: std.mem.Allocator, n: usize, parties: usize) std.mem.Allocator.Error!Generators {
+        const len = std.math.mul(usize, n, parties) catch return error.OutOfMemory;
+        const g_vec = try allocator.alloc(Ristretto255, len);
         errdefer allocator.free(g_vec);
-        const h_vec = try allocator.alloc(Ristretto255, n);
+        const h_vec = try allocator.alloc(Ristretto255, len);
         errdefer allocator.free(h_vec);
-        var g_chain = GeneratorsChain.init(&chainLabel('G', 0));
-        for (g_vec) |*p| p.* = g_chain.next();
-        var h_chain = GeneratorsChain.init(&chainLabel('H', 0));
-        for (h_vec) |*p| p.* = h_chain.next();
+        for (0..parties) |j| {
+            const party: u32 = std.math.cast(u32, j) orelse return error.OutOfMemory;
+            var g_chain = GeneratorsChain.init(&chainLabel('G', party));
+            for (g_vec[j * n ..][0..n]) |*p| p.* = g_chain.next();
+            var h_chain = GeneratorsChain.init(&chainLabel('H', party));
+            for (h_vec[j * n ..][0..n]) |*p| p.* = h_chain.next();
+        }
         return .{
             .g = Ristretto255.basePoint,
             .h = blindingBase(),
             .g_vec = g_vec,
             .h_vec = h_vec,
             .n = n,
+            .parties = parties,
         };
     }
 
@@ -180,6 +205,32 @@ test "different n values still agree on the shared prefix" {
 // B7 (A1 audit) asked for a value-level KAT here, because every test above
 // only checks relations. The values are now dalek's and are pinned against
 // the crate's own output in `interop_test.zig`.
+
+test "initParties: party 0 is init's set, each further party its own chain" {
+    const one = try Generators.init(std.testing.allocator, 8);
+    defer one.deinit(std.testing.allocator);
+    const four = try Generators.initParties(std.testing.allocator, 8, 4);
+    defer four.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 32), four.g_vec.len);
+    try std.testing.expectEqual(@as(usize, 32), four.h_vec.len);
+    for (one.g_vec, four.g_vec[0..8]) |a, b| try std.testing.expect(a.equivalent(b));
+    for (one.h_vec, four.h_vec[0..8]) |a, b| try std.testing.expect(a.equivalent(b));
+
+    // Party 2's first G is the first point of chain 'G' || LE32(2), derived
+    // here by hand rather than through `initParties`.
+    var xof = Shake256.init(.{});
+    xof.update("GeneratorsChain");
+    xof.update(&[_]u8{ 'G', 2, 0, 0, 0 });
+    var wide: [64]u8 = undefined;
+    xof.squeeze(&wide);
+    try std.testing.expect(Ristretto255.fromUniform(wide).equivalent(four.g_vec[16]));
+
+    // No point repeats across parties.
+    for (four.g_vec, 0..) |a, i| {
+        for (four.g_vec[i + 1 ..]) |b| try std.testing.expect(!a.equivalent(b));
+        for (four.h_vec) |b| try std.testing.expect(!a.equivalent(b));
+    }
+}
 
 test "n = 0 gives empty vectors without error" {
     const gens = try Generators.init(std.testing.allocator, 0);

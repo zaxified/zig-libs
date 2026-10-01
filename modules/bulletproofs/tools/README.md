@@ -4,8 +4,8 @@ Recipes for committed data (`CONVENTIONS.md` §9): run by hand, never by a test.
 
 | file | produces | needs |
 |---|---|---|
-| `dalek/emit_zig_proofs.zig` | `dalek/zig_proofs.txt` — 16 range proofs made by this module's `prove` (n = 8/16/32/64), one `<n> <label hex> <V hex> <proof hex>` per line. Random on every run (the prover blinds from getrandom), so the committed file is one run. | Zig |
-| `dalek/` (Cargo project) | `src/interop_vectors.zig` — merlin challenges, dalek's Pedersen bases, 14 dalek range proofs (ChaCha20-seeded), and the proofs from `zig_proofs.txt` after dalek's `verify_single` ACCEPTED each (the tool panics on a rejection) | Rust; `bulletproofs` 4.0.0 and `merlin` 3.0.0 (dalek-cryptography, MIT), fetched by cargo, pinned in `Cargo.lock` |
+| `dalek/emit_zig_proofs.zig` | `dalek/zig_proofs.txt` — 16 range proofs made by this module's `prove` (n = 8/16/32/64), one `<n> <label hex> <V hex> <proof hex>` per line, then 5 aggregated ones from `proveMultiple` (m = 2/4/8) with the commitments joined by `,` in the V field. Random on every run (the prover blinds from getrandom), so the committed file is one run. | Zig |
+| `dalek/` (Cargo project) | `src/interop_vectors.zig` — merlin challenges, dalek's Pedersen bases, 14 dalek range proofs and 6 dalek aggregated proofs (ChaCha20-seeded), and the proofs from `zig_proofs.txt` after dalek's `verify_single` / `verify_multiple` ACCEPTED each (the tool panics on a rejection) | Rust; `bulletproofs` 4.0.0 and `merlin` 3.0.0 (dalek-cryptography, MIT), fetched by cargo, pinned in `Cargo.lock` |
 
 From the module directory (`modules/bulletproofs`), through `hw run` as every build here:
 

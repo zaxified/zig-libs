@@ -472,8 +472,13 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=313	e932a70c2bfffc2e	0d9a7f3232367fc7
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
 # still be printed -- so "the harness never called the module" is still caught.
-bulletproofs	ReleaseFast	rangeproof	1	0	3e0167b9b68ce90f	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	dd382e4324993825	2368a5d0e07e2233
+# Re-pinned 2026-10-02 (aggregated proofs): both rows' source digests, and the
+# ipa row's output, had been stale since cc1e4c90 (2026-09-30, dalek's
+# generators and Merlin transcript), which changes what `proveIpa` folds over.
+# Counts re-measured unchanged: rangeproof 8 total / 0 in-file, ipa 4 / 0,
+# controls and traps 0.
+bulletproofs	ReleaseFast	rangeproof	1	0	54131e7ee7400689	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	4f6a76f2fa741bf6	2ade41bb2f418497
 paillier	ReleaseFast	crt	1	<=331	158deee694942af9	ca16fc01b4ebb44c
 paillier	ReleaseFast	noncrt	1	<=141	158deee694942af9	ca16fc01b4ebb44c
 paillier	ReleaseFast	mul	1	<=12	158deee694942af9	b2221403ad3dad41
