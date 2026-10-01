@@ -299,18 +299,20 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   wrong body. A caller that does not bound its own body reads (the client documents
   that it does not) is caught waiting forever on a server stalled mid-body. No
   defect found.
+- **http Server** (2026-10-01): its stall timeouts and deadlines polled the raw
+  socket and read `clock_gettime`, so under simio it ran with none; rewritten in
+  `http` to arm deadlines that one reaper task per `serve` enforces through
+  `std.Io`. Piloted with the real server and client together (one pooled
+  connection; 20 fault seeds), and with misbehaving clients: a stall mid-head is
+  dropped at 1000–1100 ms, a dribble at the 3000 ms request deadline, a client that
+  stops reading after the write timeout; with the timeouts off, a stalled client
+  holds its connection for the whole run, and the check sees it.
 
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
 some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simulated
 `Io` and gets fixed when its pilot reaches it. What the remaining pilots need first:
 
-- **http** `Server` (the client is piloted): its read/write stall timeouts and request/connection deadlines
-  are `std.posix.poll` on the raw socket plus `clock_gettime(.MONOTONIC)`. Under
-  simio the poll sees an invalid descriptor (POLLNVAL = "ready"), so the server runs
-  but without those timeouts; `serveMulti` uses OS threads and CPU pinning. Making
-  the timeouts `Io`-based (the mqtt watchdog shape, or deadline-bounded reads) is a
-  change to a performance-sensitive server and wants its own decision.
 - **kv** `FsStorage`: `allocate` and `syncData` still call `fallocate`/`fdatasync`
   directly (std.Io has neither) and get `EBADF` under simio; `Db` never calls them.
 - **icmp**: raw `std.os.linux` socket syscalls throughout; needs a `std.Io`-based

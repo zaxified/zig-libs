@@ -3,8 +3,10 @@
 //! Pilot: the `http` client (unchanged: pooling, the stale-connection retry,
 //! `connect_timeout_ms`/`total_timeout_ms` enforced by canceling a concurrent
 //! task) against a small HTTP/1.1 server written here, over simulated TCP.
-//! The server is this file's own rather than `http.Server`, whose stall
-//! timeouts still poll the raw socket (see SPEC § Pilots).
+//! The first half uses a server written here, so a fault in the client is
+//! not masked by one in the server; the second half pilots `http.Server`
+//! itself, whose timeouts are enforced through `std.Io` (they polled the
+//! raw socket before this pilot asked for them).
 //!
 //! The property: every response the client hands back as complete carries
 //! exactly the body the server sent. Reading a body is deliberately not
@@ -170,14 +172,22 @@ fn fetchOne(io: Io, client: *http.Client, gpa: std.mem.Allocator, f: *Fetcher) !
 
 // ── the world ──────────────────────────────────────────────────────────────
 
-const World = struct { server: Server = .{}, fetcher: Fetcher = .{} };
+const World = struct {
+    server: Server = .{},
+    fetcher: Fetcher = .{},
+    /// Serve with `http.Server` instead of the pilot's own server.
+    real_server: bool = false,
+};
 
 fn setup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
     const w: *World = @ptrCast(@alignCast(ctx.?));
     const s = try sim.addHost(.{}); // node 0
     const c = try sim.addHost(.{}); // node 1
     try sim.link(s, c, .{ .latency_ns = 15 * ns_per_ms, .jitter_ns = 5 * ns_per_ms });
-    try s.spawnBoot(serverMain, .{ s.io(), &w.server });
+    if (w.real_server)
+        try s.spawnBoot(realServerMain, .{ s.io(), s.allocator(), real_options })
+    else
+        try s.spawnBoot(serverMain, .{ s.io(), &w.server });
     w.fetcher.server_ip = s.ip4;
     try c.spawnBoot(fetcher, .{ c.io(), c.allocator(), &w.fetcher });
 }
@@ -199,6 +209,7 @@ fn reset(ctx: ?*anyopaque) void {
     w.* = .{
         .server = .{ .one_shot = w.server.one_shot, .stall_once = w.server.stall_once },
         .fetcher = .{ .unbounded = w.fetcher.unbounded },
+        .real_server = w.real_server,
     };
 }
 
@@ -304,4 +315,165 @@ test "pilot http: every completed body is exact across seeds of loss, partitions
         std.debug.print("seed {d}: {t} at {d} ms\n", .{ failing.case.seed, failing.violation.err, failing.violation.at_ns / ns_per_ms });
         return error.TestUnexpectedResult;
     }
+}
+
+// ── http.Server ────────────────────────────────────────────────────────────
+
+fn dataHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/big")) {
+        const chunk: [16 * 1024]u8 = @splat('b');
+        for (0..256) |_| try rw.writeAll(&chunk);
+        return;
+    }
+    if (!std.mem.startsWith(u8, req.path, "/data/")) return rw.setStatus(404);
+    const n = try std.fmt.parseInt(u32, req.path[6..], 10);
+    var body: [body_len]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = bodyByte(n, i);
+    try rw.writeAll(&body);
+}
+
+const real_options: http.Server.Options = .{
+    .handler = dataHandler,
+    .addr = "0.0.0.0",
+    .port = 80,
+    .tcp_nodelay = false, // a raw setsockopt: EBADF on a simulated handle
+    .read_timeout_ms = 1000,
+    .request_timeout_ms = 3000,
+    .write_timeout_ms = 1000,
+};
+
+fn realServerMain(io: Io, gpa: std.mem.Allocator, options: http.Server.Options) !void {
+    var srv = http.Server.init(io, gpa, options);
+    defer srv.deinit();
+    try srv.bind();
+    try srv.serve();
+}
+
+test "pilot http: http.Server and http.Client, twenty fetches over one connection" {
+    var w: World = .{ .real_server = true };
+    const r = try search.replay(testing.allocator, case(&w), &.{}, ns_per_ms);
+    try testing.expectEqual(@as(?search.Violation, null), r.violation);
+    try testing.expectEqual(@as(usize, 1), w.fetcher.dials);
+}
+
+test "pilot http: http.Server and http.Client across seeds of loss, partitions and crashes" {
+    var w: World = .{ .real_server = true };
+    const faults: search.FaultConfig = .{
+        .schedule = .{
+            .max_events = 6,
+            .horizon = 5000,
+            .repair_permille = 1000,
+            .enable_clock_jump = false,
+        },
+    };
+    if (try search.findFailing(testing.allocator, case(&w), faults, 0, 20)) |*failing| {
+        defer @constCast(failing).deinit();
+        std.debug.print("seed {d}: {t} at {d} ms\n", .{ failing.case.seed, failing.violation.err, failing.violation.at_ns / ns_per_ms });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// A misbehaving client: sends `sent` (one byte per `gap_ms` when it is
+/// nonzero), never reads unless asked to, and records when the server hung up.
+const Rude = struct {
+    request: []const u8,
+    gap_ms: u32 = 0,
+    /// Wait for the server to close (a read that sees the end of stream).
+    expect_close: bool = true,
+    closed_at_ms: ?i64 = null,
+};
+
+fn rudeClient(io: Io, port: u16, rude: *Rude) !void {
+    const start = Io.Timestamp.now(io, .awake);
+    const addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    // The hang-up is timed by a reader of its own, from the start: a writer
+    // between two dribbled bytes would notice it a gap or two late.
+    var watcher = if (rude.expect_close) io.async(awaitClose, .{ io, stream, start, rude }) else null;
+    defer if (watcher) |*f| f.cancel(io);
+    var wbuf: [64]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    if (rude.gap_ms == 0) {
+        try sw.interface.writeAll(rude.request);
+        try sw.interface.flush();
+    } else for (rude.request) |c| {
+        if (rude.closed_at_ms != null) break;
+        sw.interface.writeByte(c) catch break;
+        sw.interface.flush() catch break;
+        io.sleep(.fromMilliseconds(rude.gap_ms), .awake) catch break;
+    }
+    if (watcher) |*f| f.await(io) else try io.sleep(.fromSeconds(3600), .awake);
+    watcher = null;
+}
+
+fn awaitClose(io: Io, stream: net.Stream, start: Io.Timestamp, rude: *Rude) void {
+    var rbuf: [64]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    // Discards whatever arrives until the end of stream.
+    _ = sr.interface.discardRemaining() catch |err| switch (err) {
+        error.ReadFailed => if (sr.err) |e| if (e == error.Canceled) return,
+    };
+    rude.closed_at_ms = @intCast(@divFloor(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds, ns_per_ms));
+}
+
+const RudeRun = struct { closed_at_ms: ?i64, active_at_end: usize };
+
+fn runRude(rude: *Rude, options: http.Server.Options) !RudeRun {
+    var sim: Sim = undefined;
+    sim.init(testing.allocator, .{ .seed = 3, .stack_size = 1024 * 1024 });
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var opts = options;
+    opts.port = 8080;
+    var srv = http.Server.init(h.io(), h.allocator(), opts);
+    try h.spawn(serveForever, .{&srv});
+    try h.spawn(rudeClientLate, .{ h.io(), rude });
+    _ = sim.runFor(60 * ns_per_s);
+    const active = srv.activeConnections();
+    return .{ .closed_at_ms = rude.closed_at_ms, .active_at_end = active };
+}
+
+fn serveForever(srv: *http.Server) !void {
+    try srv.bind();
+    try srv.serve();
+}
+
+fn rudeClientLate(io: Io, rude: *Rude) !void {
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try rudeClient(io, 8080, rude);
+}
+
+test "pilot http: http.Server drops a client that stalls mid-head after read_timeout_ms" {
+    var rude: Rude = .{ .request = "GET /hel" };
+    const r = try runRude(&rude, real_options);
+    // 1000 ms of stall, plus at most one reaper tick (100 ms).
+    const at = r.closed_at_ms orelse return error.NeverClosed;
+    try testing.expect(at >= 1000 and at <= 1100);
+}
+
+test "pilot http: http.Server bounds a dribbling client by request_timeout_ms" {
+    // One byte every 200 ms never trips the 1000 ms stall timeout; the
+    // 3000 ms whole-request deadline must.
+    var rude: Rude = .{ .request = "GET /data/1 HTTP/1.1\r\nHost: x\r\nX-Slow: " ++ "a" ** 40, .gap_ms = 200 };
+    const r = try runRude(&rude, real_options);
+    const at = r.closed_at_ms orelse return error.NeverClosed;
+    try testing.expect(at >= 3000 and at <= 3100);
+}
+
+test "pilot http: http.Server drops a client that stops reading after write_timeout_ms" {
+    var rude: Rude = .{ .request = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n", .expect_close = false };
+    const r = try runRude(&rude, real_options);
+    try testing.expectEqual(@as(usize, 0), r.active_at_end);
+}
+
+test "pilot http: with the timeouts off a stalled client holds its connection forever, and the check sees it" {
+    var opts = real_options;
+    opts.read_timeout_ms = 0;
+    opts.request_timeout_ms = 0;
+    opts.write_timeout_ms = 0;
+    var rude: Rude = .{ .request = "GET /hel" };
+    const r = try runRude(&rude, opts);
+    try testing.expectEqual(@as(?i64, null), r.closed_at_ms);
+    try testing.expectEqual(@as(usize, 1), r.active_at_end);
 }

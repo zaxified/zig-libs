@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — http Server pilot (after its timeouts moved onto `std.Io`): the
+  real server with the real client, and timeouts checked to the tick against
+  stalling, dribbling and non-reading clients.
 - **2026-10-01** — http client pilot: pooling, the stale-connection retry and
   both timeouts against a pilot-local server; no defect found.
 - **2026-10-01** — Every file system call is now a preemption point, as a
