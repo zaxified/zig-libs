@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **BEHAVIOURAL:** `lookupIp` no longer reports an outage as
+  "no addresses". When no address was found and a query failed (timeout,
+  network failure, malformed or spoofed answer), it returns that error
+  instead of an empty slice — Go's behaviour, which this resolver models. An
+  empty slice now means the servers answered and the name has no addresses;
+  one family failing while the other answers is still tolerated. Found by
+  `simio`'s dns pilot (server crashed → `lookupIp` returned `{}`).
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `tcpExchange` cancel test
   canceled after a fixed 100 ms sleep. On a loaded machine that could land in the connect instead,
   and the test then passed by a different `Canceled` arm. It now cancels once the transport is

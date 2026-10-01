@@ -195,8 +195,11 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
 /// All IPv4 + IPv6 addresses for `name`: IP literals pass through, /etc/hosts
 /// is consulted first (when enabled), then A and AAAA queries per search-list
 /// candidate. On Linux the result is ordered by RFC 6724 destination rules
-/// (netaddr) like getaddrinfo. Returns an empty slice when nothing resolves;
-/// caller frees with `gpa.free`.
+/// (netaddr) like getaddrinfo. Returns an empty slice when the servers
+/// answered but nothing resolves (NXDOMAIN, no records). When no address was
+/// found and a query failed (timeout, network, malformed answer), returns the
+/// last such error, as Go does — an outage is not "no such host". One family
+/// failing while the other answers is tolerated. Caller frees with `gpa.free`.
 pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
     var list: std.ArrayList(netaddr.Ip) = .empty;
     errdefer list.deinit(r.gpa);
@@ -228,11 +231,17 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
 
     var candidate_buf: [message.max_name_text_len]u8 = undefined;
     var it = config.NameIterator.init(name, search, ndots);
+    var last_err: ?Error = null;
     while (it.next(&candidate_buf)) |candidate| {
         for ([_]message.Type{ .a, .aaaa }) |ty| {
             var msg = r.query(candidate, ty) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
-                else => continue, // tolerate one family failing (Go aggregates too)
+                else => {
+                    // Tolerate one family failing (Go aggregates too), but
+                    // remember why: with no address at all it is the answer.
+                    last_err = err;
+                    continue;
+                },
             };
             defer msg.deinit();
             try collectAddresses(r.gpa, &list, &msg, candidate);
@@ -240,6 +249,10 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
         if (list.items.len > 0) break; // first useful candidate wins
     }
 
+    // Found by simio's dns pilot (2026-10-01): with the server down, both
+    // queries timed out and this returned an empty list — indistinguishable
+    // from a name that has no addresses.
+    if (list.items.len == 0) if (last_err) |err| return err;
     sortIps(list.items);
     return list.toOwnedSlice(r.gpa);
 }
@@ -1408,6 +1421,28 @@ fn bindUdpStub(io: std.Io, script: UdpStub.Script) !UdpStub {
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     const sock = try addr.bind(io, .{ .mode = .dgram });
     return .{ .io = io, .sock = sock, .script = script };
+}
+
+test "lookupIp: a server that never answers is a Timeout, not an empty list (simio pilot finding)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Bound but silent: every query times out.
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const silent = addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    defer silent.close(io);
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = silent.address.getPort(),
+        .timeout_ms = 30,
+        .attempts = 1,
+        .use_hosts = false,
+        .use_search = false,
+    });
+    defer r.deinit();
+    try testing.expectError(error.Timeout, r.lookupIp("silent.test."));
 }
 
 test "lookupIp: an answer record the question never asked about is ignored (bailiwick), end to end over loopback" {
