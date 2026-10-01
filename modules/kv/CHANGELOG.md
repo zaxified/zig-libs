@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `kv.Lock` (the `Db`'s lock: `std.Io.Mutex` when the storage has an `Io`,
+  else a spinlock) is public, for wrappers that hold their own lock across `Db` calls
+  (`sessions.KvStore`): `.{ .io = db.store.io }`.
 - **2026-10-01** — **Fix: `Db` no longer spins on its lock under a fiber/evented `Io`.**
   A task suspended in `sync` while holding the spinlock was starved forever by a second task
   of the same thread spinning on it (found by the simio kv pilot). `Storage` gained

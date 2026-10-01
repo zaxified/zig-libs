@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Fix: `KvStore` no longer spins on its lock under a fiber/evented `Io`.**
+  It held an io-less spinlock across `kv` writes (an fsync each); a second task of the same
+  thread spun on it forever while the holder was suspended in the fsync. It now uses `kv.Lock`
+  (`std.Io.Mutex` when the `Db`'s storage has an `Io`). Found by the zig-libs spinlock audit
+  that followed the simio kv pilot.
 - **2026-09-30** — `KvStore`: a persistent `Store` over a caller-owned `kv.Db`, so sessions
   survive a restart (maturity task C8). Records under `prefix ++ id` (default `"session:"`),
   generation-framed like `RamcacheStore`, CAS under its own lock, `kv` expiry refreshed by

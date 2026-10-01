@@ -97,17 +97,19 @@ pub const CrashMode = @import("sim.zig").CrashMode;
 /// `Db`'s lock: `std.Io.Mutex` when the storage has an `Io` (see
 /// `Storage.io`), else a spinlock (std SmpAllocator pattern; Zig 0.16 std has
 /// no io-less blocking mutex) — see the module doc for the fsync-hold caveat.
-const Lock = struct {
+/// Public for wrappers that hold their own lock across `Db` calls
+/// (`sessions.KvStore`): `.{ .io = db.store.io }` gives them the same choice.
+pub const Lock = struct {
     io: ?std.Io,
     spin: std.atomic.Mutex = .unlocked,
     mutex: std.Io.Mutex = .init,
 
-    fn acquire(l: *Lock) void {
+    pub fn acquire(l: *Lock) void {
         if (l.io) |io| return l.mutex.lockUncancelable(io);
         while (!l.spin.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn release(l: *Lock) void {
+    pub fn release(l: *Lock) void {
         if (l.io) |io| l.mutex.unlock(io) else l.spin.unlock();
     }
 };

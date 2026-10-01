@@ -366,7 +366,10 @@ pub const KvStore = struct {
     prefix_buf: [max_prefix_len]u8 = undefined,
     prefix_len: usize = 0,
     ttl_ms: u64,
-    lock: std.atomic.Mutex = .unlocked,
+    /// Held across `Db` writes (an `fsync` each): an `std.Io.Mutex` when the
+    /// `Db`'s storage has an `Io`, so a waiting task yields instead of
+    /// spinning (see `kv.Lock`).
+    lock: kv.Lock,
     failed: std.atomic.Value(bool) = .init(false),
 
     pub const max_prefix_len = 64;
@@ -382,7 +385,7 @@ pub const KvStore = struct {
 
     pub fn init(db: *kv.Db, options: Config) error{PrefixTooLong}!KvStore {
         if (options.prefix.len > max_prefix_len) return error.PrefixTooLong;
-        var self: KvStore = .{ .db = db, .ttl_ms = options.ttl_ms, .prefix_len = options.prefix.len };
+        var self: KvStore = .{ .db = db, .ttl_ms = options.ttl_ms, .prefix_len = options.prefix.len, .lock = .{ .io = db.store.io } };
         @memcpy(self.prefix_buf[0..options.prefix.len], options.prefix);
         return self;
     }
@@ -425,8 +428,8 @@ pub const KvStore = struct {
         var kbuf: KeyBuf = undefined;
         const k = self.key(&kbuf, id) orelse return null;
         var vbuf: ValueBuf = undefined;
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.hasFailed()) return null;
         const v = self.read(&vbuf, k) orelse return null;
         return .{
@@ -441,8 +444,8 @@ pub const KvStore = struct {
         const k = self.key(&kbuf, id) orelse return null;
         var vbuf: ValueBuf = undefined;
         if (record.len > vbuf.len - gen_prefix_len) return null; // never in practice
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.hasFailed()) return null;
         // The compare of the CAS — atomic with the write below under the lock.
         const current: Generation = if (self.read(&vbuf, k)) |v| std.mem.readInt(u64, v[0..gen_prefix_len], .little) else 0;
@@ -463,8 +466,8 @@ pub const KvStore = struct {
         const self: *KvStore = @ptrCast(@alignCast(ptr));
         var kbuf: KeyBuf = undefined;
         const k = self.key(&kbuf, id) orelse return;
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         self.db.delete(k) catch self.failed.store(true, .release);
     }
 };
@@ -2186,4 +2189,24 @@ test "Manager.init rejects an out-of-range id_bytes in every build mode" {
     // Both ends of the accepted range still construct.
     _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = min_id_bytes });
     _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = max_id_bytes });
+}
+
+test "KvStore waits on its lock through the Db's Io when the storage has one" {
+    // simio pilot finding (kv): a spinlock held across an fsync starves a
+    // task suspended inside it under an `Io` that runs several tasks on one
+    // thread. Over `FsStorage` the store's lock is an `std.Io.Mutex`.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = kv.FsStorage.init(testing.io, tmp.dir);
+    var db = try kv.Db.open(testing.allocator, fs_store.storage(), "s", .{});
+    defer db.close();
+    const over_fs = try KvStore.init(&db, .{});
+    try testing.expect(over_fs.lock.io != null);
+
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db2 = try kv.Db.open(testing.allocator, sim.storage(), "s", .{});
+    defer db2.close();
+    const over_sim = try KvStore.init(&db2, .{});
+    try testing.expect(over_sim.lock.io == null);
 }
