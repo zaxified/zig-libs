@@ -186,15 +186,18 @@ const SpinLock = struct {
 // ── reference sink: kvtree ──────────────────────────────────────────────────
 
 /// The reference durable sink over a `kvtree.Db` (the caller owns the `Db` and
-/// its storage). Serializes all sink ops with a spinlock, since `kvtree` is
+/// its storage). Serializes all sink ops with `kvtree.Lock`, since `kvtree` is
 /// single-writer and the coordinator flushes concurrently.
 pub const KvtreeSink = struct {
     db: *kvtree.Db,
     gpa: Allocator,
-    lock: SpinLock = .{},
+    /// Held across `kvtree` writes (page writes and an fsync): an
+    /// `std.Io.Mutex` when the `Db`'s storage has an `Io`, so a flush task
+    /// waiting for it yields instead of spinning.
+    lock: kvtree.Lock,
 
     pub fn init(gpa: Allocator, db: *kvtree.Db) KvtreeSink {
-        return .{ .db = db, .gpa = gpa };
+        return .{ .db = db, .gpa = gpa, .lock = .{ .io = db.io() } };
     }
 
     pub fn sink(self: *KvtreeSink) Sink {
@@ -208,20 +211,20 @@ pub const KvtreeSink = struct {
     }
     fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
         const self = cast(ptr);
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         try self.db.put(key, value);
     }
     fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
         const self = cast(ptr);
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         try self.db.del(key);
     }
     fn vRead(ptr: *anyopaque, gpa: Allocator, key: []const u8) anyerror!?[]u8 {
         const self = cast(ptr);
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         return self.db.get(gpa, key);
     }
 };
@@ -1509,6 +1512,8 @@ test "kvtree reference sink: put → flush lands in a real durable kvtree, survi
         var sink_fs = FsStorage.init(io, tmp.dir);
         var sink_db = try kvtree.Db.open(testing.allocator, sink_fs.storage(), "sink.kvt", .{});
         var ksink = KvtreeSink.init(testing.allocator, &sink_db);
+        // Over `FsStorage` the sink waits on its lock through the `Io`.
+        try testing.expect(ksink.lock.io != null);
 
         var c = try Coordinator.init(testing.allocator, .{
             .io = io,

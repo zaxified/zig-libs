@@ -75,6 +75,9 @@ pub const fable_core_implemented = gate.fable_core_implemented;
 pub const Storage = kv.Storage;
 pub const FsStorage = kv.FsStorage;
 pub const SimStorage = kv.SimStorage;
+/// `kv`'s Io-aware lock, for a caller that serializes its own access to a
+/// single-writer `Db` across tasks: `.{ .io = db.io() }`.
+pub const Lock = kv.Lock;
 
 pub const OpenError = kv.Storage.Error || core.RecoverError || error{
     Corrupt,
@@ -228,6 +231,12 @@ pub const Db = struct {
             .shrink_min_pages = options.shrink_min_pages,
             .commit_scratch = .init(gpa),
         };
+    }
+
+    /// The `std.Io` the storage's calls block in, if it has one (`FsStorage`
+    /// does) — what a caller's `Lock` around this `Db` should wait through.
+    pub fn io(self: *const Db) ?std.Io {
+        return self.pager.store.io;
     }
 
     pub fn close(self: *Db) void {

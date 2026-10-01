@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `kvtree.Lock` (re-export of `kv.Lock`) and `Db.io()`: a caller that
+  serializes its own access to a `Db` across tasks can wait through the storage's `Io` instead
+  of spinning (`writebehind.KvtreeSink` does).
 - **2026-09-30** — **A commit's scratch arena is kept across commits.** `core.commit` built a
   fresh `ArenaAllocator` over the `Db`'s allocator per commit and freed it; once the scratch
   outgrew the allocator's size classes every chunk was an `mmap`/`munmap` pair and its pages
