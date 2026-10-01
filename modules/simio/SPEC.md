@@ -245,9 +245,12 @@ Second pass: 27/27 killed.
 **Anchor grade:** class C · oracle n/a
 
 Class C (internal infrastructure; correctness is the `std.Io` contract and
-determinism) plus, from M2, a **differential oracle**: the same test
-program run on `std.Io.Threaded` over loopback and on simio with no faults must reach
-the same result. The fiber machinery is checked against `std.Io`'s own contract
+determinism) plus a **differential oracle** (`src/oracle_tests.zig`): one program
+written against `std.Io` only — a stream echoed through small buffers, datagram
+request/response, a bounded receive that times out, a canceled accept, a file
+written, synced, renamed over another and listed — runs on `std.Io.Threaded` over the
+real loopback and file system and on simio, and every observable result must match
+(and match the expected values, so agreement is never two empty reports). The fiber machinery is checked against `std.Io`'s own contract
 (the vtable doc comments) rather than any other implementation.
 
 ## Provenance

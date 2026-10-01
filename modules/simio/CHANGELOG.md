@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — The differential oracle: one `std.Io` program on
+  `std.Io.Threaded` (real loopback and disk) and on simio must report the same
+  results (`src/oracle_tests.zig`).
 - **2026-10-01** — Host names: `HostOptions.name`, resolved by `netLookup`
   (`HostName.lookup`/`connect`) together with IP literals and `localhost`;
   `Sim.hostByName`. Code that dials by name now runs unchanged.

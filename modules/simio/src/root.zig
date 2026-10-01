@@ -72,6 +72,7 @@ test {
     _ = @import("search.zig");
     _ = @import("fault_tests.zig");
     _ = @import("fs_tests.zig");
+    _ = @import("oracle_tests.zig");
     _ = @import("pilots/sntp.zig");
     _ = @import("pilots/dns.zig");
     _ = @import("pilots/mqtt.zig");
