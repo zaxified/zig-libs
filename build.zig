@@ -196,7 +196,7 @@ const module_list = [_]Module{
     .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .test_deps = &.{"testkit"} },
     .{ .name = "netsim", .libs = &.{"net"} },
-    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{ "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "icmp" } },
+    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{ "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "icmp", "modbus", "whois", "stun", "ocspcache" } },
     .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
     .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },

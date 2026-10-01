@@ -80,4 +80,5 @@ test {
     _ = @import("pilots/kv.zig");
     _ = @import("pilots/http.zig");
     _ = @import("pilots/icmp.zig");
+    _ = @import("pilots/timeouts.zig");
 }

@@ -179,7 +179,7 @@ consumer's to remove.
    simio's own `Trace` type, netsim's network faults inside it). Proof: the search
    finds the torn file of a rename without fsync and silent corruption read without a
    checksum; the careful variants survive. `Host.putFile`/`readFile`/`console`.
-5. **M5 — pilots** (each with a deliberately broken variant that must trip):
+5. **M5 — pilots** ✅ 2026-10-01 (each with a deliberately broken variant that must trip):
    - `mqtt` broker + 3 clients under partitions: QoS 1 at-least-once delivery.
    - `dns` `Resolver`: retry/timeout behaviour under loss.
    - `http` client/server.
@@ -188,7 +188,8 @@ consumer's to remove.
      `std.os.linux` syscalls today, outside any `Io`) — a change in `icmp`.
    - `ssh`: handshake + channel under fragmentation and resets.
    - `kv`: its real file code under the storage crash model.
-   - Move a set of today's loopback tests (real sockets on `Io.Threaded`) onto simio.
+   - Move a set of today's loopback tests (real sockets on `Io.Threaded`) onto simio —
+     done as *their timing* moving, not the tests (see § Pilots, "timeouts").
 
 ## Prior art in our own projects
 
@@ -267,7 +268,7 @@ Pilots live in `src/pilots/` with the piloted module as a `test_dep`, not in the
 piloted module: most of them also target 32-bit Linux, where `std.Io.fiber` does
 not exist, and a `test_dep` on simio would break their portability. CI still reruns
 a pilot when its module changes (test-only imports are part of the module graph).
-Moving a module's own loopback tests onto simio is a separate, later step.
+Modules keep their own loopback tests (below, "timeouts").
 
 - **sntp** (2026-10-01): offset and delay exact to the nanosecond on a symmetric
   path, half the asymmetry on an asymmetric one, a server clock jump, an origin
@@ -332,6 +333,22 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   and partitions no reply is ever credited with an RTT shorter than the path (what a
   reply matched to the wrong probe would show), and duplicates count as duplicates.
   A timeout below the round trip is caught reporting live hosts dead.
+
+- **timeouts** (2026-10-01) — the "move loopback tests" item. A survey of every
+  loopback test that depends on wall-clock timing found the Io-only ones in `dns`,
+  `http`, `modbus`, `whois`, `stun`, `ocspcache`, `llmclient`, `snmp`, `bacnet`; the
+  rest (`fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm`, `opcua`) poll or sleep
+  with raw syscalls and are out of simio's reach until they go through `std.Io`.
+  The loopback tests stay in their modules: they are the real-kernel half, already
+  hardened against load (read cues instead of sleeps, upper bounds of seconds), and
+  CONVENTIONS forbids moving a test out of reach. What moved is what they cannot
+  say — *when*: `pilots/timeouts.zig` checks `modbus` (a silent peer ends at exactly
+  80 ms; with no timeout the caller's cancel lands at exactly 300 ms), `whois` (a
+  slow peer abandoned at 80 ms, not at its 900 ms reply; dialed by host name),
+  `stun.query` (a dark server at exactly 150 ms, an answer after one round trip) and
+  `ocspcache`'s fetch (no body: ends 200 ms after the head). `dns` and `http` had
+  their timing moved in their own pilots above. `llmclient`, `snmp`, `bacnet`: not
+  yet.
 
 **Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
 (or spin-wait) could be held across a call that suspends under an `Io` running several
