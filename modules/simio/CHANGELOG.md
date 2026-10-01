@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Simulated socket and file handles start at 2^30: code that
+  bypasses `std.Io` with a raw syscall on one gets `EBADF` instead of
+  operating on a real descriptor of the test process.
 - **2026-10-01** — mqtt pilot: the real broker server and client under
   partitions, a subscriber crash and seeded packet faults; QoS 1
   at-least-once holds, a clean-session subscriber is caught losing messages.

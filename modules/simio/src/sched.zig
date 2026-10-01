@@ -232,7 +232,11 @@ pub const Host = struct {
     /// The host's disk (see `fs.zig` for what survives a crash).
     fs: fs_mod.Fs = undefined,
     handles: std.AutoHashMapUnmanaged(Io.net.Socket.Handle, *net_mod.Sock) = .empty,
-    next_handle: Io.net.Socket.Handle = 3,
+    /// Handles start far above any descriptor the real process can hold
+    /// (`RLIMIT_NOFILE` is orders of magnitude smaller): code that bypasses
+    /// `std.Io` with a raw syscall on a simulated handle gets `EBADF`
+    /// instead of touching one of the test process's own files or pipes.
+    next_handle: Io.net.Socket.Handle = 1 << 30,
     next_port: u16 = 49152,
     root_group: Io.Group = .init,
     /// The first error a root task (`spawn`) returned, if any.

@@ -586,3 +586,23 @@ test "an unsynced truncation may or may not survive a crash; a synced one does" 
     }
     try testing.expect(lengths[0] > 0 and lengths[1] > 0);
 }
+
+test "simulated handles cannot alias a real descriptor of the test process" {
+    var sim: Sim = undefined;
+    newSim(&sim, 10);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.putFile("x", "y");
+    try h.spawn(rawSyscallOnHandle, .{h.io()});
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+}
+
+fn rawSyscallOnHandle(io: Io) !void {
+    var f = try Dir.cwd().openFile(io, "x", .{});
+    defer f.close(io);
+    // What code that bypasses std.Io would do (kv's fdatasync, for one): a
+    // raw syscall on the handle.
+    const rc = std.os.linux.fdatasync(f.handle);
+    try testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(rc));
+}

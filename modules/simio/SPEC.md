@@ -272,8 +272,24 @@ Moving a module's own loopback tests onto simio is a separate, later step.
 
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
-some in runtime paths (`sntp` was one). Each is invisible to a simulated `Io` and
-gets fixed when its pilot reaches it.
+some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simulated
+`Io` and gets fixed when its pilot reaches it. What the remaining pilots need first:
+
+- **http** `Server`: its read/write stall timeouts and request/connection deadlines
+  are `std.posix.poll` on the raw socket plus `clock_gettime(.MONOTONIC)`. Under
+  simio the poll sees an invalid descriptor (POLLNVAL = "ready"), so the server runs
+  but without those timeouts; `serveMulti` uses OS threads and CPU pinning. Making
+  the timeouts `Io`-based (the mqtt watchdog shape, or deadline-bounded reads) is a
+  change to a performance-sensitive server and wants its own decision.
+- **kv** `FsStorage`: `allocate` and `syncData` call `fallocate`/`fdatasync` directly
+  (std.Io has neither). Under simio they get `EBADF`; the pilot needs a storage
+  variant without them, or std-level preallocate/datasync.
+- **icmp**: raw `std.os.linux` socket syscalls throughout; needs a `std.Io`-based
+  backend (`bind` with `.dgram` + `protocol = .icmp`) before a pilot.
+- **ssh**: reached through `std.Io` streams; not yet checked for clock reads.
+
+Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` instead
+of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
 
