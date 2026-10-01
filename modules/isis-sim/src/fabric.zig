@@ -2416,17 +2416,14 @@ fn sweepLine(link: netsim.LinkConfig, overrides: []const LinkOverride, seeds: u6
 
 test "MEASURED: convergence time and LSP retransmissions grow with the loss rate" {
     const seeds: u64 = 16;
+    // Measured 2026-10-01 (Debug, 16 seeds; permille: drops / lsp_tx /
+    // last_change mean / max): 0: 0/192/9/9 · 50: 32/220/35/86 ·
+    // 100: 91/269/67/129 · 200: 167/338/84/129 · 300: 209/363/92/129.
+    // Not printed: the test lanes treat any stderr on a passing run as a FAIL.
     const rates = [_]u16{ 0, 50, 100, 200, 300 };
     var pts: [rates.len]Sweep = undefined;
     for (rates, 0..) |permille, i| {
         pts[i] = try sweepLine(.{ .latency = link_latency, .loss_permille = permille }, &.{}, seeds);
-        std.debug.print(
-            "MEASURED loss={d}%o: converged {d}/{d} agree {d}/{d} drops {d} lsp_tx {d} last_change mean {d} max {d}\n",
-            .{
-                permille,      pts[i].converged,          seeds,             pts[i].agreed, seeds, pts[i].drops,
-                pts[i].lsp_tx, pts[i].change_sum / seeds, pts[i].change_max,
-            },
-        );
     }
 
     // Flooding converges at every rate, on every seed — the claim under test.

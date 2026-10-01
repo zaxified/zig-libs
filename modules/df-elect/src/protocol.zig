@@ -888,10 +888,14 @@ test "real: fuzzed partitions, cuts, crashes, clock jumps — split-horizon neve
             }
             try testing.expectEqual(@as(u64, 0), df.malformed_dropped);
         }
-        std.debug.print("MEASURED df-elect {s}: {} runs, {} duplicates, worst duplicate {} ticks after a heal (bound {}), worst zero-DF {} ticks (bound {})\n", .{
-            @tagName(alg),                     stats.runs,       stats.duplicates,               stats.worst_dup_delay,
-            checks.maxDuplicateWindow(df.cfg), stats.worst_zero, checks.maxZeroDfWindow(df.cfg),
-        });
+        // Measured 2026-10-01 (Debug, 120 seeds, every algorithm): 46-48
+        // duplicates, worst 48 ticks after a heal (bound 100), worst zero-DF
+        // 338 ticks (bound 420). Not printed: the test lanes treat any stderr
+        // on a passing run as a FAIL. The bounds are asserted per run above;
+        // these keep the sweep honest: the heal race really happens.
+        try testing.expect(stats.duplicates > 0);
+        try testing.expect(stats.worst_dup_delay <= checks.maxDuplicateWindow(df.cfg));
+        try testing.expect(stats.worst_zero > 0);
     }
 }
 
