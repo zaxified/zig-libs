@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Codec: MQTT 5.0.** `packet` encodes and decodes every 5.0 packet,
+  AUTH included, with properties (all 27 of Table 2-4, validated per packet type:
+  a misplaced identifier is `MalformedPacket`, a repeat or forbidden value
+  `ProtocolViolation`, so a peer can answer 0x81/0x82 via `reasonForDecodeError`) and
+  reason codes (checked per packet both ways, Table 2-6). The version is a parameter:
+  `decodePacket(bytes, version)`, `encodePacket(buf, version, packet)`,
+  `packetWireLen`; under `.v5` a CONNECT of either level decodes and reports
+  `Connect.version`. User Properties and Subscription Identifiers decode in place and
+  re-encode verbatim, in order (a server forwards them without copying). 5.0 short
+  forms of acks, DISCONNECT and AUTH both ways. `decode` and the `encode<Type>`
+  functions stay the 3.1.1 forms; a 3.1.1 packet that sets a 5.0-only field is
+  `error.UnsupportedInVersion`. The CONNECT KAT is the spec's own Figure 3-6.
+  ⚠ **Breaking:** in a decoded `Packet`, `puback`/`pubrec`/`pubrel`/`pubcomp` are now
+  `Ack` (`.packet_id`, `.reason_code`, `.properties`), `unsuback` is `Unsuback`,
+  `disconnect` is `Disconnect`, and the union has a new `auth` arm (exhaustive switches
+  need it); `PacketType.auth = 15`. Migrate `.puback => |id|` to `|a| a.packet_id`.
+  `encodePublish` now refuses an empty topic (`error.InvalidTopic`) instead of
+  producing a packet every decoder rejects. `Client` events are unchanged so far.
 - **2026-10-01** — **Fix: the broker builds for 32-bit targets again.** The `TcpServer`
   watchdog (entry below) shared the last packet's time as a `std.atomic.Value(i64)`, which
   does not compile where there is no 64-bit atomic (`.linux32`, mips32); it now shares its

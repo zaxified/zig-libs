@@ -1618,15 +1618,15 @@ pub const Broker = struct {
                     try b.handleUnsubscribe(conn, u);
                     return .keep;
                 },
-                .puback => |id| {
+                .puback => |ack| {
                     conn.tx_lock.lock();
                     defer conn.tx_lock.unlock();
                     if (conn.session) |x| {
                         // A freed window slot is the cue to send the next
                         // queued message — nothing else would.
-                        ackInflight(b.allocator, x, conn, id);
+                        ackInflight(b.allocator, x, conn, ack.packet_id);
                         try b.pumpLocked(conn, x);
-                    } else conn.removePending(id);
+                    } else conn.removePending(ack.packet_id);
                     return .keep;
                 },
                 .pingreq => {
@@ -3113,7 +3113,7 @@ test "QoS1 publish from A → PUBACK to A + broker-assigned-id PUBLISH to QoS1 s
     _ = try feedPublish(&b, a, .{ .topic = "a/b", .payload = "hi", .qos = .at_least_once, .packet_id = 42 });
 
     const ack = (try ta.next()).?;
-    try testing.expectEqual(@as(u16, 42), ack.puback);
+    try testing.expectEqual(@as(u16, 42), ack.puback.packet_id);
 
     const delivered = (try tb.next()).?;
     try testing.expectEqual(packet.QoS.at_least_once, delivered.publish.qos);
@@ -3142,7 +3142,7 @@ test "unsubscribe removes by exact filter string" {
     try b.feed(bconn, try packet.encodeUnsubscribe(&buf, 2, &.{"sport/#"}));
     try testing.expectEqual(Disposition.keep, try b.process(bconn, 1));
     const unsuback = (try tb.next()).?;
-    try testing.expectEqual(@as(u16, 2), unsuback.unsuback);
+    try testing.expectEqual(@as(u16, 2), unsuback.unsuback.packet_id);
     try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
 
     _ = try feedPublish(&b, a, .{ .topic = "sport/tennis", .payload = "x" });
@@ -3951,7 +3951,7 @@ test "FIX B: a subscriber whose write fails is dropped; publisher + peers surviv
     const disp = try feedPublish(&b, p, .{ .topic = "t/x", .payload = "hi", .qos = .at_least_once, .packet_id = 7 });
     try testing.expectEqual(Disposition.keep, disp);
     const ack = (try tp.next()).?;
-    try testing.expectEqual(@as(u16, 7), ack.puback); // publisher unaffected
+    try testing.expectEqual(@as(u16, 7), ack.puback.packet_id); // publisher unaffected
     try expectDelivered(&tgood, "t/x"); // healthy peer still delivered
     try testing.expectEqual(Connection.State.disconnected, bad.state); // offender dropped
     try testing.expect(tbad.closed); // and signaled for reaping
@@ -3983,7 +3983,7 @@ test "FIX B: a max-size QoS1 publish re-encoded for a QoS1 subscriber does not o
     try testing.expectEqual(Disposition.keep, try b.process(p, 1)); // publisher survives
 
     const ack = (try tp.next()).?;
-    try testing.expectEqual(@as(u16, 3), ack.puback); // publisher PUBACKed, unaffected
+    try testing.expectEqual(@as(u16, 3), ack.puback.packet_id); // publisher PUBACKed, unaffected
     const delivered = (try ts.next()).?;
     try testing.expectEqual(packet.QoS.at_least_once, delivered.publish.qos); // re-encoded, no overflow
     try testing.expectEqual(@as(u16, 1), delivered.publish.packet_id); // fresh subscriber-space id
@@ -4123,7 +4123,7 @@ test "FIX D: credential auth allow threads the username; ACL gates pub + sub" {
     const d1 = try feedPublish(&b, pconn, .{ .topic = "secret/x", .payload = "no", .qos = .at_least_once, .packet_id = 9 });
     try testing.expectEqual(Disposition.keep, d1);
     const ack = (try tp.next()).?;
-    try testing.expectEqual(@as(u16, 9), ack.puback);
+    try testing.expectEqual(@as(u16, 9), ack.puback.packet_id);
     // Publish to an allowed topic → delivered.
     _ = try feedPublish(&b, pconn, .{ .topic = "ok/y", .payload = "yes" });
     try expectDelivered(&ts, "ok/y");
@@ -4712,7 +4712,7 @@ test "publish tap does not observe what the ACL refused" {
     try testing.expectEqual(@as(usize, 0), rec.calls);
     const ack = (try tt.next()).?;
     try testing.expect(ack == .puback);
-    try testing.expectEqual(@as(u16, 9), ack.puback);
+    try testing.expectEqual(@as(u16, 9), ack.puback.packet_id);
 
     b.remove(conn);
 }
@@ -4796,7 +4796,7 @@ test "an accepted publish is taken exactly as without a tap" {
     try testing.expectEqual(@as(u64, 0), b.tapRefusals());
     const ack = (try tt.next()).?;
     try testing.expect(ack == .puback);
-    try testing.expectEqual(@as(u16, 7), ack.puback);
+    try testing.expectEqual(@as(u16, 7), ack.puback.packet_id);
     const got = (try sub_tt.next()).?;
     try testing.expectEqualStrings("taken", got.publish.payload);
 
@@ -4896,7 +4896,7 @@ test "a consumed publish is acknowledged but neither fanned out nor retained" {
     try testing.expectEqual(@as(u64, 0), b.tapRefusals());
     const ack = (try tt.next()).?;
     try testing.expect(ack == .puback);
-    try testing.expectEqual(@as(u16, 7), ack.puback);
+    try testing.expectEqual(@as(u16, 7), ack.puback.packet_id);
     // The subscriber whose filter matches heard nothing.
     try testing.expectEqual(sub_len, sub_tt.len);
 
@@ -4966,7 +4966,7 @@ test "ACL: a retained publish can be denied where a plain one is allowed" {
         .packet_id = 3,
         .retain = true,
     }));
-    try testing.expectEqual(@as(u16, 3), (try tt.next()).?.puback);
+    try testing.expectEqual(@as(u16, 3), (try tt.next()).?.puback.packet_id);
     try testing.expectEqual(sub_len, sub_tt.len);
 
     // The same publish without RETAIN: allowed and delivered.
@@ -4976,7 +4976,7 @@ test "ACL: a retained publish can be denied where a plain one is allowed" {
         .qos = .at_least_once,
         .packet_id = 4,
     }));
-    try testing.expectEqual(@as(u16, 4), (try tt.next()).?.puback);
+    try testing.expectEqual(@as(u16, 4), (try tt.next()).?.puback.packet_id);
     try testing.expectEqualStrings("now", (try sub_tt.next()).?.publish.payload);
     try testing.expectEqual(@as(usize, 2), acl.publishes);
 

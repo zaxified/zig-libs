@@ -363,7 +363,7 @@ test "external: paho <-> amqtt full session decodes to the expected semantics" {
         try testing.expectEqual(packet.QoS.at_least_once, p.qos);
         try testing.expectEqual(@as(u16, 5), p.packet_id);
         const puback = (try packet.decode(paho_amqtt.puback_q1)).?;
-        try testing.expectEqual(@as(u16, 5), puback.packet.puback);
+        try testing.expectEqual(@as(u16, 5), puback.packet.puback.packet_id);
     }
     {
         const dec = (try packet.decode(paho_amqtt.pub_q2)).?;
@@ -372,9 +372,9 @@ test "external: paho <-> amqtt full session decodes to the expected semantics" {
         try testing.expectEqualStrings("q2-payload", p.payload);
         try testing.expectEqual(packet.QoS.exactly_once, p.qos);
         try testing.expectEqual(@as(u16, 6), p.packet_id);
-        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubrec)).?.packet.pubrec);
-        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubrel)).?.packet.pubrel);
-        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubcomp)).?.packet.pubcomp);
+        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubrec)).?.packet.pubrec.packet_id);
+        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubrel)).?.packet.pubrel.packet_id);
+        try testing.expectEqual(@as(u16, 6), (try packet.decode(paho_amqtt.pubcomp)).?.packet.pubcomp.packet_id);
     }
     try testing.expect((try packet.decode(paho_amqtt.pingreq)).?.packet == .pingreq);
     try testing.expect((try packet.decode(paho_amqtt.pingresp)).?.packet == .pingresp);
@@ -550,7 +550,7 @@ test "external: our Broker's real bytes against real paho reproduce exactly (inc
     try testing.expect(first == .publish);
     try testing.expect(!first.publish.retain);
     const second = (try tt.next()).?; // broker's own PUBACK for the inbound publish
-    try testing.expectEqual(@as(u16, 4), second.puback);
+    try testing.expectEqual(@as(u16, 4), second.puback.packet_id);
     try testing.expectEqualSlices(u8, paho_vs_zig_broker.s2c_pub_q1_echo_noretain, tt.written[0 .. tt.read_off - 4]);
     try testing.expectEqualSlices(u8, paho_vs_zig_broker.s2c_puback_inbound, tt.written[tt.read_off - 4 .. tt.read_off]);
     tt.reset();

@@ -361,7 +361,7 @@ pub const Client = struct {
         switch (p) {
             .connack => unreachable,
             // A 3.1.1 server never sends these to a client.
-            .connect, .subscribe, .unsubscribe, .pingreq, .disconnect => {
+            .connect, .subscribe, .unsubscribe, .pingreq, .disconnect, .auth => {
                 return error.ProtocolViolation;
             },
             .publish => |incoming| {
@@ -387,23 +387,27 @@ pub const Client = struct {
                     },
                 }
             },
-            .puback => |id| {
+            .puback => |ack| {
+                const id = ack.packet_id;
                 if (c.pendingKind(id) != .publish_qos1) return error.ProtocolViolation;
                 c.removePending(id);
                 return .{ .puback = id };
             },
-            .pubrec => |id| {
+            .pubrec => |ack| {
+                const id = ack.packet_id;
                 if (c.pendingKind(id) != .publish_await_pubrec) return error.ProtocolViolation;
                 c.setPendingKind(id, .publish_await_pubcomp);
                 try c.send(now, try packet.encodePubrel(c.tx_buf, id));
                 return null;
             },
-            .pubcomp => |id| {
+            .pubcomp => |ack| {
+                const id = ack.packet_id;
                 if (c.pendingKind(id) != .publish_await_pubcomp) return error.ProtocolViolation;
                 c.removePending(id);
                 return .{ .pubcomp = id };
             },
-            .pubrel => |id| {
+            .pubrel => |ack| {
+                const id = ack.packet_id;
                 // Always answer PUBREL with PUBCOMP (spec 4.3.3), even for
                 // an id we no longer remember.
                 c.removeInbound(id);
@@ -415,7 +419,8 @@ pub const Client = struct {
                 c.removePending(sa.packet_id);
                 return .{ .suback = sa };
             },
-            .unsuback => |id| {
+            .unsuback => |ua| {
+                const id = ua.packet_id;
                 if (c.pendingKind(id) != .unsubscribe) return error.ProtocolViolation;
                 c.removePending(id);
                 return .{ .unsuback = id };
