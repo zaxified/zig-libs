@@ -2629,29 +2629,37 @@ fn nowMs(io: std.Io) i64 {
 
 /// Enforces one connection's timeouts from its own task: CONNECT must arrive
 /// within `connect_timeout_ms`, then a packet within 1.5 × keep-alive (spec
-/// 3.1.2.10). The connection's task publishes what it learns through
-/// atomics, so the two never share the `Connection` itself.
+/// 3.1.2.10). The connection's task publishes what it learns under `lock`,
+/// so the two never share the `Connection` itself.
 const Watchdog = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     config: Config,
     start_ms: i64,
-    connected: std.atomic.Value(bool) = .init(false),
-    keep_alive_s: std.atomic.Value(u16) = .init(0),
-    last_packet_ms: std.atomic.Value(i64) = .init(0),
+    // ⛔ A lock, not atomics: `last_packet_ms` is an `i64`, and a 32-bit
+    // target (`check-portable`'s `.linux32`, which this module declares) has
+    // no 64-bit atomic load/store -- `std.atomic.Value(i64)` does not compile
+    // there. The section is a few plain stores, no I/O inside.
+    lock: std.Io.Mutex = .init,
+    connected: bool = false,
+    keep_alive_s: u16 = 0,
+    last_packet_ms: i64 = 0,
 
     fn observe(w: *Watchdog, conn: *const Connection) void {
-        w.keep_alive_s.store(conn.keep_alive_s, .release);
-        w.last_packet_ms.store(conn.last_packet_ms, .release);
-        if (conn.state != .awaiting_connect) w.connected.store(true, .release);
+        w.lock.lockUncancelable(w.io);
+        defer w.lock.unlock(w.io);
+        w.keep_alive_s = conn.keep_alive_s;
+        w.last_packet_ms = conn.last_packet_ms;
+        if (conn.state != .awaiting_connect) w.connected = true;
     }
 
     /// The instant after which the connection is dead; null = never.
-    fn deadline(w: *const Watchdog) ?i64 {
-        if (!w.connected.load(.acquire)) return w.start_ms + @as(i64, w.config.connect_timeout_ms);
-        const ka = w.keep_alive_s.load(.acquire);
-        if (ka == 0) return null;
-        return w.last_packet_ms.load(.acquire) + @as(i64, ka) * 1500;
+    fn deadline(w: *Watchdog) ?i64 {
+        w.lock.lockUncancelable(w.io);
+        defer w.lock.unlock(w.io);
+        if (!w.connected) return w.start_ms + @as(i64, w.config.connect_timeout_ms);
+        if (w.keep_alive_s == 0) return null;
+        return w.last_packet_ms + @as(i64, w.keep_alive_s) * 1500;
     }
 
     fn run(w: *Watchdog) std.Io.Cancelable!void {
@@ -2757,10 +2765,10 @@ test "the watchdog's deadlines: CONNECT timeout up to maxInt(u32) ms, then 1.5 x
     // in the future.
     var w: Watchdog = .{ .io = undefined, .stream = undefined, .config = .{ .connect_timeout_ms = std.math.maxInt(u32) }, .start_ms = 1000 };
     try testing.expectEqual(@as(?i64, 1000 + @as(i64, std.math.maxInt(u32))), w.deadline());
-    w.connected.store(true, .release);
+    w.connected = true;
     try testing.expectEqual(@as(?i64, null), w.deadline()); // keep-alive 0: no deadline
-    w.keep_alive_s.store(10, .release);
-    w.last_packet_ms.store(5000, .release);
+    w.keep_alive_s = 10;
+    w.last_packet_ms = 5000;
     try testing.expectEqual(@as(?i64, 5000 + 15_000), w.deadline());
 }
 

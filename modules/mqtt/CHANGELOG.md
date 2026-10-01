@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Fix: the broker builds for 32-bit targets again.** The `TcpServer`
+  watchdog (entry below) shared the last packet's time as a `std.atomic.Value(i64)`, which
+  does not compile where there is no 64-bit atomic (`.linux32`, mips32); it now shares its
+  state under an `std.Io.Mutex`. Same timeouts. Caught by CI's `check-portable`.
 - **2026-10-01** — **Fix: the broker no longer spins on a connection's `tx_lock` under a
   fiber/evented `Io`.** `tx_lock` is held across transport writes; with several tasks on one
   thread a spinning waiter starved a writer suspended in its socket forever, and `remove`
