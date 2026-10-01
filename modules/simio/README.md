@@ -7,11 +7,11 @@ virtual, and every choice the simulator makes is drawn from one seed. A run is
 a pure function of its seed, so a failure found on seed 1234 is reproduced by
 running seed 1234 again.
 
-- **Status:** M2 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
+- **Status:** M3 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
   (tasks, groups, cancelation, futex, clocks, sleep, timeouts, seeded
-  randomness) and the network (streams, datagrams, ICMP echo over routed,
-  faulty links). Fault schedules with replay/shrink, the file system and the
-  pilots are next.
+  randomness), the network (streams, datagrams, ICMP echo over routed, faulty
+  links), host crash/restart and fault search with shrinking. The file system
+  with storage faults and the in-repo pilots are next.
 - **Platform:** Linux on x86_64, aarch64 or riscv64 (`std.Io.fiber`).
 - **Deps:** `netsim` (its seeded PRNG; its fault vocabulary from M3).
 - **Model after:** tokio-rs/turmoil, madsim, FoundationDB's simulation testing.
@@ -72,6 +72,41 @@ try sim.setLinkUp(a, b, false);            // partition, then run on
 - Datagrams can be lost, duplicated, reordered or have a bit flipped, per
   link. `bind` with `protocol = .icmp` gives a ping socket the target answers.
 - Hosts with several links route over the shortest path that is up.
+
+### Crashes, faults and search
+
+```zig
+fn setup(sim: *simio.Sim, ctx: ?*anyopaque) anyerror!void {
+    const state: *State = @ptrCast(@alignCast(ctx.?));
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{ .latency_ns = 20 * std.time.ns_per_ms });
+    try b.spawnBoot(server, .{ b.io(), state });   // restarted after a crash
+    try a.spawn(client, .{ a.io(), state });
+}
+
+fn invariant(sim: *simio.Sim, ctx: ?*anyopaque) anyerror!void {
+    const state: *State = @ptrCast(@alignCast(ctx.?));
+    if (state.applied > 1) return error.AppliedTwice;   // checked after every step
+}
+
+const case: simio.Case = .{ .setup = setup, .invariant = invariant, .reset = resetState, .ctx = &state };
+if (try simio.findFailing(gpa, case, .{}, 0, 500)) |*failing| {
+    defer failing.deinit();
+    var small = try simio.shrink(gpa, failing);   // fewest faults, same error
+    defer small.deinit();
+    _ = try simio.replay(gpa, failing.case, small.trace.events, failing.tick_ns);
+}
+```
+
+- `findFailing` draws a fault schedule per seed (netsim's generator: link and
+  one-way failures, partitions, crashes and restarts, clock jumps, one-shot
+  drops/duplicates/delays) and returns the first violation; `shrink` keeps the
+  faults that matter; `replay` re-runs any concrete schedule.
+- `Sim.crash(host)` is a power cut: tasks stop without running `defer`,
+  sockets vanish, memory from `host.allocator()` is released. `restart`
+  re-runs the `spawnBoot` tasks.
+- `checkDeterminism` runs a seed twice and fails if the runs differ.
 
 Operations simio does not simulate yet behave as in `std.Io.failing` (an
 error, never a fake success).

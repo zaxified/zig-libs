@@ -75,6 +75,9 @@ pub const Outcome = enum {
     step_limit,
     /// `runFor`'s duration elapsed; call `run`/`runFor` again to continue.
     time_limit,
+    /// The invariant hook (`setInvariant`) returned an error; see
+    /// `RunResult.violation`.
+    violated,
 };
 
 pub const RunResult = struct {
@@ -85,6 +88,23 @@ pub const RunResult = struct {
     blocked: usize,
     /// Virtual time at return, ns since simulated instant 0.
     now_ns: u64,
+    /// `.violated` only: what the invariant hook returned.
+    violation: ?anyerror = null,
+};
+
+/// A fault applied to a running simulation, in simio's units (ns). The
+/// search layer translates `netsim.FaultKind` schedules into these.
+pub const Fault = union(enum) {
+    link_down: struct { from: u32, to: u32 },
+    link_up: struct { from: u32, to: u32 },
+    partition: struct { id: u32, cut: []const u32 },
+    heal: u32,
+    crash: u32,
+    restart: u32,
+    clock_jump: struct { host: u32, delta_ns: i64 },
+    drop_once: struct { from: u32, to: u32 },
+    dup_once: struct { from: u32, to: u32 },
+    delay_once: struct { from: u32, to: u32, extra_ns: u64 },
 };
 
 const State = enum { ready, running, blocked, done };
@@ -166,21 +186,17 @@ const Event = struct {
     at: u64,
     seq: u64,
     kind: union(enum) {
-        /// End a task's wait with `.timeout`, unless that wait already ended.
-        wake: struct { fiber: *Fiber, gen: u64 },
+        /// End a task's wait with `.timeout`, unless that wait already ended
+        /// (or the task is gone: its host crashed). `id` guards against a
+        /// new fiber reusing the address.
+        wake: struct { fiber: *Fiber, id: u64, gen: u64 },
         net: net_mod.Event,
+        fault: Fault,
     },
 
     fn order(_: void, a: Event, b: Event) std.math.Order {
         if (a.at != b.at) return std.math.order(a.at, b.at);
         return std.math.order(a.seq, b.seq);
-    }
-
-    fn stale(e: Event) bool {
-        return switch (e.kind) {
-            .wake => |w| w.gen != w.fiber.wait_gen or w.fiber.state != .blocked,
-            .net => false,
-        };
     }
 };
 
@@ -192,8 +208,17 @@ pub const Host = struct {
     clock_skew_ns: i64,
     ip4: [4]u8,
     ip6: [16]u8,
-    /// False while the host is crashed (M3); a down host is unreachable.
+    /// False while the host is crashed; a down host is unreachable.
     up: bool = true,
+    /// Virtual time of the last (re)boot; monotonic clocks count from here.
+    boot_ns: u64 = 0,
+    /// How many times the host has crashed.
+    crashes: u32 = 0,
+    /// Tasks started again on every restart (`spawnBoot`).
+    boots: std.ArrayList(Boot) = .empty,
+    /// What the host's code allocated through `allocator()` and has not
+    /// freed: a crash releases it, as a power cut releases RAM.
+    live_allocs: std.AutoHashMapUnmanaged(usize, Alloc) = .empty,
     handles: std.AutoHashMapUnmanaged(Io.net.Socket.Handle, *net_mod.Sock) = .empty,
     next_handle: Io.net.Socket.Handle = 3,
     next_port: u16 = 49152,
@@ -203,20 +228,99 @@ pub const Host = struct {
     /// How many root tasks returned an error.
     failures: usize = 0,
 
+    const Boot = struct {
+        start: *const fn (context: *const anyopaque) void,
+        context: []u8,
+        context_align: Alignment,
+    };
+
+    const Alloc = struct { len: usize, alignment: Alignment };
+
     pub fn io(h: *Host) Io {
         return .{ .userdata = h, .vtable = &@import("vtable.zig").vtable };
     }
 
-    /// Starts `function(args...)` as a root task of this host. An error it
-    /// returns is recorded in `failure`/`failures` rather than discarded.
-    pub fn spawn(
+    /// This host's memory. Use it for everything the host's code allocates
+    /// when the host may crash: a crash frees whatever is still live, so a
+    /// crash is not reported as a leak, and nothing survives it by accident.
+    pub fn allocator(h: *Host) Allocator {
+        return .{ .ptr = h, .vtable = &host_alloc_vtable };
+    }
+
+    const host_alloc_vtable: Allocator.VTable = .{
+        .alloc = hostAlloc,
+        .resize = hostResize,
+        .remap = hostRemap,
+        .free = hostFree,
+    };
+
+    fn hostAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret: usize) ?[*]u8 {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        const gpa = h.sim.gpa;
+        h.live_allocs.ensureUnusedCapacity(gpa, 1) catch return null;
+        const p = gpa.rawAlloc(len, alignment, ret) orelse return null;
+        h.live_allocs.putAssumeCapacity(@intFromPtr(p), .{ .len = len, .alignment = alignment });
+        return p;
+    }
+
+    fn hostResize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret: usize) bool {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        if (!h.sim.gpa.rawResize(memory, alignment, new_len, ret)) return false;
+        h.live_allocs.getPtr(@intFromPtr(memory.ptr)).?.len = new_len;
+        return true;
+    }
+
+    fn hostRemap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        h.live_allocs.ensureUnusedCapacity(h.sim.gpa, 1) catch return null;
+        const p = h.sim.gpa.rawRemap(memory, alignment, new_len, ret) orelse return null;
+        _ = h.live_allocs.remove(@intFromPtr(memory.ptr));
+        h.live_allocs.putAssumeCapacity(@intFromPtr(p), .{ .len = new_len, .alignment = alignment });
+        return p;
+    }
+
+    fn hostFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret: usize) void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        _ = h.live_allocs.remove(@intFromPtr(memory.ptr));
+        h.sim.gpa.rawFree(memory, alignment, ret);
+    }
+
+    fn releaseAll(h: *Host) void {
+        var it = h.live_allocs.iterator();
+        while (it.next()) |e| {
+            const ptr: [*]u8 = @ptrFromInt(e.key_ptr.*);
+            h.sim.gpa.rawFree(ptr[0..e.value_ptr.len], e.value_ptr.alignment, @returnAddress());
+        }
+        h.live_allocs.clearRetainingCapacity();
+    }
+
+    /// Like `spawn`, and the task is started again every time the host
+    /// restarts after a crash — the host's "main". `args` are copied and
+    /// reused as they are: they must stay valid across crashes (test-owned
+    /// state, or durable state that lives outside the host's memory).
+    pub fn spawnBoot(
         h: *Host,
         comptime function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
     ) error{OutOfMemory}!void {
         const Args = @TypeOf(args);
         const Ctx = struct { host: *Host, args: Args };
-        const Erased = struct {
+        const ctx: Ctx = .{ .host = h, .args = args };
+        const gpa = h.sim.gpa;
+        try h.boots.ensureUnusedCapacity(gpa, 1);
+        const mem = gpa.rawAlloc(@sizeOf(Ctx), .of(Ctx), @returnAddress()) orelse return error.OutOfMemory;
+        @memcpy(mem[0..@sizeOf(Ctx)], std.mem.asBytes(&ctx));
+        h.boots.appendAssumeCapacity(.{
+            .start = Erased(function, Args).start,
+            .context = mem[0..@sizeOf(Ctx)],
+            .context_align = .of(Ctx),
+        });
+        if (h.up) _ = try h.sim.spawnGroupTask(h, &h.root_group, mem[0..@sizeOf(Ctx)], .of(Ctx), Erased(function, Args).start);
+    }
+
+    fn Erased(comptime function: anytype, comptime Args: type) type {
+        const Ctx = struct { host: *Host, args: Args };
+        return struct {
             fn start(context: *const anyopaque) void {
                 const c: *const Ctx = @ptrCast(@alignCast(context));
                 const R = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
@@ -230,8 +334,20 @@ pub const Host = struct {
                 }
             }
         };
+    }
+
+    /// Starts `function(args...)` as a root task of this host. An error it
+    /// returns is recorded in `failure`/`failures` rather than discarded.
+    pub fn spawn(
+        h: *Host,
+        comptime function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) error{OutOfMemory}!void {
+        const Args = @TypeOf(args);
+        const Ctx = struct { host: *Host, args: Args };
         const ctx: Ctx = .{ .host = h, .args = args };
-        _ = try h.sim.spawnGroupTask(h, &h.root_group, std.mem.asBytes(&ctx), .of(Ctx), Erased.start);
+        if (!h.up) return; // a crashed host runs nothing
+        _ = try h.sim.spawnGroupTask(h, &h.root_group, std.mem.asBytes(&ctx), .of(Ctx), Erased(function, Args).start);
     }
 
     /// Virtual reading of `clock` on this host, ns.
@@ -241,7 +357,7 @@ pub const Host = struct {
             .real => h.sim.opts.epoch_ns + t + h.clock_skew_ns,
             // Monotonic clocks count from host boot; start at 1 s so a zero
             // reading never looks like "unset".
-            .awake, .boot, .cpu_process, .cpu_thread => std.time.ns_per_s + t,
+            .awake, .boot, .cpu_process, .cpu_thread => std.time.ns_per_s + t - h.boot_ns,
         };
     }
 };
@@ -255,6 +371,7 @@ pub const Sim = struct {
     seq: u64 = 0,
     next_fiber_id: u64 = 1,
     steps: u64 = 0,
+    next_partition: u32 = 1 << 31,
     fingerprint_state: u64 = 0,
     live: usize = 0,
 
@@ -270,6 +387,7 @@ pub const Sim = struct {
     /// deadlock or the step limit left behind. Invariant: `ready` has
     /// capacity for all of them, so waking a task never allocates.
     fibers: std.AutoArrayHashMapUnmanaged(*Fiber, void) = .empty,
+    invariant: ?struct { check: *const fn (sim: *Sim, ctx: ?*anyopaque) anyerror!void, ctx: ?*anyopaque } = null,
     owner: std.Thread.Id,
 
     /// Initializes in place: hosts and tasks keep pointers to the `Sim`.
@@ -306,13 +424,17 @@ pub const Sim = struct {
             sim.gpa.destroy(g);
         }
         while (sim.events.pop()) |e| switch (e.kind) {
-            .wake => {},
+            .wake, .fault => {},
             .net => |ev| sim.net.dropEvent(ev),
         };
         sim.events.deinit(sim.gpa);
         sim.net.deinit();
         for (sim.hosts.items) |h| {
             h.handles.deinit(sim.gpa);
+            h.releaseAll();
+            h.live_allocs.deinit(sim.gpa);
+            for (h.boots.items) |b| sim.gpa.rawFree(b.context, b.context_align, @returnAddress());
+            h.boots.deinit(sim.gpa);
             sim.gpa.destroy(h);
         }
         sim.hosts.deinit(sim.gpa);
@@ -368,6 +490,83 @@ pub const Sim = struct {
         return sim.net.setLinkUp(a.id, b.id, up);
     }
 
+    /// One direction only: `from → to` stops carrying traffic while
+    /// `to → from` still works.
+    pub fn setLinkDirUp(sim: *Sim, from: *Host, to: *Host, up: bool) error{NoSuchLink}!void {
+        return sim.net.setDirUp(from.id, to.id, up);
+    }
+
+    /// Splits the network: hosts in `cut` cannot reach the others until
+    /// `heal` with the returned id.
+    pub fn partition(sim: *Sim, cut: []const *Host) Allocator.Error!u32 {
+        var ids: [256]u32 = undefined;
+        assert(cut.len <= ids.len);
+        for (cut, 0..) |h, i| ids[i] = h.id;
+        sim.next_partition += 1;
+        try sim.net.partition(sim.next_partition, ids[0..cut.len]);
+        return sim.next_partition;
+    }
+
+    pub fn heal(sim: *Sim, id: u32) void {
+        sim.net.heal(id);
+    }
+
+    /// Power cut: every task of `h` stops where it is (no unwinding, no
+    /// `defer`), its sockets vanish without a FIN or a reset, memory from
+    /// `h.allocator()` is released, and the host is unreachable until
+    /// `restart`. Call it from the test between runs, from a fault schedule,
+    /// or from a task of another host.
+    pub fn crash(sim: *Sim, h: *Host) void {
+        if (sim.current) |me| if (me.host == h) @panic("simio: a host cannot crash itself from one of its own tasks");
+        if (!h.up) return;
+        h.up = false;
+        h.crashes += 1;
+        sim.mix(0xc4a5_0000 + @as(u64, h.id));
+
+        // Detach the host's tasks from everything that could wake them.
+        var i: usize = 0;
+        while (i < sim.ready.items.len) {
+            if (sim.ready.items[i].host == h) _ = sim.ready.orderedRemove(i) else i += 1;
+        }
+        i = 0;
+        while (i < sim.futex_waiters.items.len) {
+            if (sim.futex_waiters.items[i].host == h) _ = sim.futex_waiters.orderedRemove(i) else i += 1;
+        }
+        // Their groups go with them (the root group's state, and any group
+        // one of them created).
+        var groups: std.AutoArrayHashMapUnmanaged(*GroupState, void) = .empty;
+        defer groups.deinit(sim.gpa);
+        if (h.root_group.token.raw) |token| groups.put(sim.gpa, @ptrCast(@alignCast(token)), {}) catch {};
+        h.root_group = .init;
+        i = sim.fibers.count();
+        while (i > 0) {
+            i -= 1;
+            const f = sim.fibers.keys()[i];
+            if (f.host != h) continue;
+            if (f.group) |g| groups.put(sim.gpa, g, {}) catch {};
+            if (f.wait == .group) groups.put(sim.gpa, f.wait.group, {}) catch {};
+            sim.destroyFiber(f); // wake events still naming it are now stale
+        }
+        for (groups.keys()) |g| {
+            g.members.deinit(sim.gpa);
+            sim.gpa.destroy(g);
+        }
+        sim.net.crashHost(h);
+        h.releaseAll();
+    }
+
+    /// Powers a crashed host back on: monotonic clocks restart from zero
+    /// and every `spawnBoot` task starts again.
+    pub fn restart(sim: *Sim, h: *Host) void {
+        if (h.up) return;
+        h.up = true;
+        h.boot_ns = sim.now;
+        sim.mix(0x7e57_0000 + @as(u64, h.id));
+        for (h.boots.items) |b| {
+            _ = sim.spawnGroupTask(h, &h.root_group, b.context, b.context_align, b.start) catch {};
+        }
+    }
+
     /// Runs until nothing can make progress (or the step limit). Callable
     /// again after spawning more tasks.
     pub fn run(sim: *Sim) RunResult {
@@ -385,24 +584,40 @@ pub const Sim = struct {
         assert(sim.current == null);
         while (true) {
             if (sim.steps >= sim.opts.max_steps) return sim.runResult(.step_limit);
-            if (sim.ready.items.len == 0) {
+            // Events due now (a fault scheduled for this instant, a timer
+            // that just expired) happen before the next task step.
+            const due = sim.fireDue();
+            if (sim.ready.items.len == 0 and !due) {
                 switch (sim.fireEvents(limit)) {
-                    .fired => continue,
+                    .fired => {},
                     .idle => break,
                     .limit => return sim.runResult(.time_limit),
                 }
+            } else if (sim.ready.items.len > 0) {
+                const idx = switch (sim.opts.schedule) {
+                    .fifo => 0,
+                    .random => sim.prng.below(sim.ready.items.len),
+                };
+                const f = sim.ready.orderedRemove(idx);
+                sim.steps += 1;
+                sim.mix(f.id ^ (sim.now *% 0x9e3779b97f4a7c15));
+                sim.switchTo(f);
+                if (f.state == .done and f.task == .group) sim.destroyFiber(f);
             }
-            const idx = switch (sim.opts.schedule) {
-                .fifo => 0,
-                .random => sim.prng.below(sim.ready.items.len),
+            if (sim.invariant) |inv| inv.check(sim, inv.ctx) catch |err| {
+                var r = sim.runResult(.violated);
+                r.violation = err;
+                return r;
             };
-            const f = sim.ready.orderedRemove(idx);
-            sim.steps += 1;
-            sim.mix(f.id);
-            sim.switchTo(f);
-            if (f.state == .done and f.task == .group) sim.destroyFiber(f);
         }
         return sim.runResult(if (sim.live == 0) .quiescent else .deadlock);
+    }
+
+    /// Checked after every task step and every batch of events; an error
+    /// stops the run with `.violated`. Runs on the scheduler, not in a task:
+    /// it may read shared state, it must not call `std.Io`.
+    pub fn setInvariant(sim: *Sim, check: *const fn (sim: *Sim, ctx: ?*anyopaque) anyerror!void, ctx: ?*anyopaque) void {
+        sim.invariant = .{ .check = check, .ctx = ctx };
     }
 
     fn runResult(sim: *const Sim, outcome: Outcome) RunResult {
@@ -430,7 +645,7 @@ pub const Sim = struct {
     /// instant).
     fn fireEvents(sim: *Sim, limit: ?u64) enum { fired, idle, limit } {
         while (sim.events.peek()) |e| {
-            if (e.stale()) {
+            if (sim.staleEvent(e)) {
                 _ = sim.events.pop(); // that wait already ended
                 continue;
             }
@@ -448,19 +663,80 @@ pub const Sim = struct {
             if (e.at > sim.now) break;
             _ = sim.events.pop();
             switch (e.kind) {
-                .wake => |w| if (!e.stale()) sim.wake(w.fiber, .timeout),
+                .wake => |w| if (!sim.staleEvent(e)) sim.wake(w.fiber, .timeout),
                 .net => |ev| {
                     sim.mix(e.seq);
                     sim.net.fire(ev);
+                },
+                .fault => |f| {
+                    sim.mix(e.seq);
+                    sim.applyFault(f);
                 },
             }
         }
         return .fired;
     }
 
+    /// Fires the events due at the current instant without advancing time.
+    fn fireDue(sim: *Sim) bool {
+        var fired = false;
+        while (sim.events.peek()) |e| {
+            if (e.at > sim.now) break;
+            _ = sim.events.pop();
+            if (sim.staleEvent(e)) continue;
+            fired = true;
+            switch (e.kind) {
+                .wake => |w| sim.wake(w.fiber, .timeout),
+                .net => |ev| {
+                    sim.mix(e.seq);
+                    sim.net.fire(ev);
+                },
+                .fault => |f| {
+                    sim.mix(e.seq);
+                    sim.applyFault(f);
+                },
+            }
+        }
+        return fired;
+    }
+
     fn armTimer(sim: *Sim, f: *Fiber, at: u64) Allocator.Error!void {
         sim.seq += 1;
-        try sim.events.push(sim.gpa, .{ .at = at, .seq = sim.seq, .kind = .{ .wake = .{ .fiber = f, .gen = f.wait_gen } } });
+        try sim.events.push(sim.gpa, .{ .at = at, .seq = sim.seq, .kind = .{ .wake = .{ .fiber = f, .id = f.id, .gen = f.wait_gen } } });
+    }
+
+    fn staleEvent(sim: *const Sim, e: Event) bool {
+        return switch (e.kind) {
+            .wake => |w| !sim.fibers.contains(w.fiber) or w.fiber.id != w.id or
+                w.gen != w.fiber.wait_gen or w.fiber.state != .blocked,
+            .net, .fault => false,
+        };
+    }
+
+    /// Schedules `fault` at virtual time `at_ns`.
+    pub fn scheduleFault(sim: *Sim, at_ns: u64, fault: Fault) Allocator.Error!void {
+        sim.seq += 1;
+        try sim.events.push(sim.gpa, .{ .at = at_ns, .seq = sim.seq, .kind = .{ .fault = fault } });
+    }
+
+    /// Applies a fault now. Targets that do not exist are ignored, so a
+    /// shrunk schedule stays well-formed.
+    pub fn applyFault(sim: *Sim, fault: Fault) void {
+        const hosts = sim.hosts.items;
+        switch (fault) {
+            .link_down => |l| sim.net.setDirUp(l.from, l.to, false) catch {},
+            .link_up => |l| sim.net.setDirUp(l.from, l.to, true) catch {},
+            .partition => |p| sim.net.partition(p.id, p.cut) catch {},
+            .heal => |id| sim.net.heal(id),
+            .crash => |i| if (i < hosts.len) sim.crash(hosts[i]),
+            .restart => |i| if (i < hosts.len) sim.restart(hosts[i]),
+            .clock_jump => |j| if (j.host < hosts.len) {
+                hosts[j.host].clock_skew_ns += j.delta_ns;
+            },
+            .drop_once => |l| sim.net.armDrop(l.from, l.to),
+            .dup_once => |l| sim.net.armDup(l.from, l.to),
+            .delay_once => |l| sim.net.armDelay(l.from, l.to, l.extra_ns),
+        }
     }
 
     /// Queues a network event (internal, for `net.zig`).
@@ -628,7 +904,7 @@ pub const Sim = struct {
         f.wait_gen += 1;
         f.wake_reason = reason;
         f.state = .ready;
-        sim.mix(f.id ^ (@as(u64, @intFromEnum(reason)) << 60));
+        sim.mix(f.id ^ (@as(u64, @intFromEnum(reason)) << 60) ^ (sim.now *% 0xbf58476d1ce4e5b9));
         sim.ready.appendAssumeCapacity(f); // capacity invariant: see `fibers`
     }
 

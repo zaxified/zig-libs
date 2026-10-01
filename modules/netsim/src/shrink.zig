@@ -108,7 +108,11 @@ const Ctx = struct {
 };
 
 /// Classic Zeller ddmin (complement-removal) over `n` element indices.
-fn ddmin(gpa: Allocator, n: usize, ctx: *Ctx) Allocator.Error![]usize {
+/// `ctx.keeps(subset: []const usize) Allocator.Error!bool` is the oracle: does
+/// the subset (indices in increasing order) still reproduce the failure?
+/// Returns the kept indices (caller frees). Exported for simulators that
+/// replay their own traces (`simio`).
+pub fn ddmin(gpa: Allocator, n: usize, ctx: anytype) Allocator.Error![]usize {
     // audit F6: the loop below never considers the EMPTY subset — it floors
     // at `current.len == 1` because its only exit test is `current.len >= 2`.
     // For a protocol that's broken regardless of any fault (the checker
@@ -163,7 +167,7 @@ fn ddmin(gpa: Allocator, n: usize, ctx: *Ctx) Allocator.Error![]usize {
 
 /// Deep-copy the kept events (including partition cut slices) into a fresh,
 /// self-owned trace.
-fn cloneSubset(gpa: Allocator, events: []const fault.FaultEvent, kept: []const usize) Allocator.Error!fault.FaultTrace {
+pub fn cloneSubset(gpa: Allocator, events: []const fault.FaultEvent, kept: []const usize) Allocator.Error!fault.FaultTrace {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();

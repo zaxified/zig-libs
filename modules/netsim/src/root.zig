@@ -96,6 +96,11 @@ pub const Failing = shrink_mod.Failing;
 pub const ShrinkResult = shrink_mod.ShrinkResult;
 pub const findFailing = shrink_mod.findFailing;
 pub const shrinkTrace = shrink_mod.shrink;
+/// The ddmin core `shrinkTrace` uses, for simulators with their own replay
+/// (`simio`): `ctx.keeps(indices) Allocator.Error!bool` is the oracle.
+pub const ddmin = shrink_mod.ddmin;
+/// Deep copy of `events[kept]` into a self-owned `FaultTrace`.
+pub const cloneTraceSubset = shrink_mod.cloneSubset;
 
 // ── toy protocols (used by the tests below; illustrate the plug-in shape) ────
 //

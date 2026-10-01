@@ -26,13 +26,14 @@ competitor source was read.
 | [cozis/Zigmulator](https://github.com/cozis/Zigmulator) | Zig | none stated | 4 | push 2026-06-20 | Experimental DST framework for Zig 0.16 running Zig programs with injected I/O faults (its README). |
 | [shadow/shadow](https://github.com/shadow/shadow) | Rust | BSD-style | 1.7k | v3.3.0 (2025-10-16) | Runs unmodified Linux binaries in a simulated network, deterministic and replayable (its README). |
 
-**Where we are ahead:** a schedule fingerprint per run, seeded preemption at yield
-points, a `.deadlock` outcome that names how many tasks can never wake; routed
-multi-hop paths with per-link faults, ICMP echo, and seeded short stream reads that
-surface framing bugs *(peers' READMEs mention none of these three — inferred)*.
-**Where we are behind:** no file system or storage faults, no scheduled fault
-injection, no replay/shrink of a fault trace (milestones M3–M5; marionette and
-turmoil have them), no Unix sockets.
+**Where we are ahead:** a delta-debugging shrinker over the fault schedule (the
+peers' READMEs mention none *(inferred)*), a schedule fingerprint with a determinism
+check, seeded preemption at yield points, a `.deadlock` outcome that names how many
+tasks can never wake; routed multi-hop paths with directed per-link faults, ICMP
+echo, and seeded short stream reads that surface framing bugs *(peers' READMEs
+mention none of these — inferred)*.
+**Where we are behind:** no file system or storage faults (M4; marionette and turmoil
+have them), no Unix sockets, no in-repo consumer yet (M5).
 
 ## Why this module exists
 
@@ -142,8 +143,17 @@ consumer's to remove.
    receive buffer), ICMP echo answered by the target's stack (ping-socket semantics),
    `operate`/`Batch` for `receiveTimeout`, `Sim.runFor`. Corruption is a per-link
    rate here; as a scheduled one-shot fault it comes with M3's fault vocabulary.
-3. **M3 — lifecycle and search.** Crash/restart, invariants after every event,
-   `run`/`replay`/`findFailing`/shrink, the determinism self-check.
+3. **M3 — lifecycle and search** ✅ 2026-10-01. `Sim.crash`/`restart` (tasks stop
+   without unwinding; sockets vanish without FIN/RST; `Host.allocator()` memory is
+   released; `spawnBoot` tasks start again; monotonic clocks restart), directed link
+   failures (`setLinkDirUp`), partitions (`partition`/`heal`), one-shot faults
+   (`Fault`, `scheduleFault`), an invariant hook after every step (`setInvariant`,
+   `Outcome.violated`), and the search layer: `Case`, `run` (netsim's schedule
+   generator, ticks = 1 ms), `replay`, `findFailing`, `shrink` (netsim's ddmin, now
+   generic and exported), `checkDeterminism`. Events due at the current instant fire
+   before the next task step; the fingerprint includes virtual time. Proof: the
+   classic exactly-once-over-UDP bug (no dedup) is found, shrunk to 1–2 faults and
+   replayed; the deduplicating server survives the same search.
 4. **M4 — file system + storage faults.** In-memory tree, durability model, crash
    resolution, fault injection.
 5. **M5 — pilots** (each with a deliberately broken variant that must trip):

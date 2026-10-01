@@ -80,7 +80,31 @@ pub const NetOptions = struct {
     udp_rcvbuf: usize = 256 * 1024,
 };
 
-const Edge = struct { a: u32, b: u32, cfg: LinkConfig, up: bool = true };
+/// One direction of a link: whether it carries traffic, and the one-shot
+/// faults armed on it (from a fault schedule).
+const Dir = struct { up: bool = true, drop: u32 = 0, dup: u32 = 0, delay_ns: u64 = 0 };
+
+/// A link; `dir[0]` is a → b, `dir[1]` is b → a.
+const Edge = struct {
+    a: u32,
+    b: u32,
+    cfg: LinkConfig,
+    dir: [2]Dir = .{ .{}, .{} },
+
+    fn from(e: *const Edge, u: u32) ?u1 {
+        if (e.a == u) return 0;
+        if (e.b == u) return 1;
+        return null;
+    }
+
+    fn other(e: *const Edge, d: u1) u32 {
+        return if (d == 0) e.b else e.a;
+    }
+};
+
+const Hop = struct { edge: u32, dir: u1 };
+
+const Partition = struct { id: u32, cut: []u32 };
 
 /// What the scheduler's event queue carries for the network.
 pub const Event = union(enum) {
@@ -179,15 +203,16 @@ pub const Net = struct {
     sim: *Sim,
     prng: Prng,
     edges: std.ArrayList(Edge) = .empty,
+    partitions: std.ArrayList(Partition) = .empty,
     socks: std.AutoHashMapUnmanaged(u64, *Sock) = .empty,
     pipes: std.AutoArrayHashMapUnmanaged(*Pipe, void) = .empty,
     syn_seen: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     next_sid: u64 = 1,
     // Dijkstra scratch, reused.
     dist: std.ArrayList(u64) = .empty,
-    via: std.ArrayList(u32) = .empty,
+    via: std.ArrayList(Hop) = .empty,
     done: std.ArrayList(bool) = .empty,
-    path: std.ArrayList(u32) = .empty,
+    path: std.ArrayList(Hop) = .empty,
 
     pub fn init(sim: *Sim, seed: u64) Net {
         return .{ .sim = sim, .prng = .init(seed ^ 0x6e65745f73696d21) };
@@ -202,6 +227,8 @@ pub const Net = struct {
         n.pipes.deinit(gpa);
         n.syn_seen.deinit(gpa);
         n.edges.deinit(gpa);
+        for (n.partitions.items) |p| gpa.free(p.cut);
+        n.partitions.deinit(gpa);
         n.dist.deinit(gpa);
         n.via.deinit(gpa);
         n.done.deinit(gpa);
@@ -218,26 +245,87 @@ pub const Net = struct {
 
     // ── topology ────────────────────────────────────────────────────────────
 
+    fn findEdge(n: *Net, a: u32, b: u32) ?*Edge {
+        for (n.edges.items) |*e| if ((e.a == a and e.b == b) or (e.a == b and e.b == a)) return e;
+        return null;
+    }
+
+    /// The direction `from → to` of an existing link.
+    fn dirOf(n: *Net, from: u32, to: u32) ?*Dir {
+        const e = n.findEdge(from, to) orelse return null;
+        return &e.dir[e.from(from).?];
+    }
+
     pub fn link(n: *Net, a: u32, b: u32, cfg: LinkConfig) Allocator.Error!void {
-        for (n.edges.items) |*e| if ((e.a == a and e.b == b) or (e.a == b and e.b == a)) {
+        if (n.findEdge(a, b)) |e| {
             e.cfg = cfg;
-            e.up = true;
+            e.dir = .{ .{}, .{} };
             return;
-        };
+        }
         try n.edges.append(n.sim.gpa, .{ .a = a, .b = b, .cfg = cfg });
     }
 
     pub fn setLinkUp(n: *Net, a: u32, b: u32, up: bool) error{NoSuchLink}!void {
-        for (n.edges.items) |*e| if ((e.a == a and e.b == b) or (e.a == b and e.b == a)) {
-            e.up = up;
-            return;
-        };
-        return error.NoSuchLink;
+        const e = n.findEdge(a, b) orelse return error.NoSuchLink;
+        e.dir[0].up = up;
+        e.dir[1].up = up;
     }
 
-    /// Shortest path from `src` to `dst` over links that are up, as edge
-    /// indices from `dst` back to `src`; null when unreachable.
-    fn route(n: *Net, src: u32, dst: u32) ?[]const u32 {
+    /// One direction only: `from → to` stops (or resumes) carrying traffic
+    /// while the reverse keeps working — a one-way failure.
+    pub fn setDirUp(n: *Net, from: u32, to: u32, up: bool) error{NoSuchLink}!void {
+        const d = n.dirOf(from, to) orelse return error.NoSuchLink;
+        d.up = up;
+    }
+
+    /// Hosts in `cut` can no longer reach hosts outside it (and the other
+    /// way round) until `heal(id)`.
+    pub fn partition(n: *Net, id: u32, cut: []const u32) Allocator.Error!void {
+        const gpa = n.sim.gpa;
+        try n.partitions.ensureUnusedCapacity(gpa, 1);
+        n.partitions.appendAssumeCapacity(.{ .id = id, .cut = try gpa.dupe(u32, cut) });
+    }
+
+    pub fn heal(n: *Net, id: u32) void {
+        var i: usize = 0;
+        while (i < n.partitions.items.len) {
+            if (n.partitions.items[i].id == id) {
+                n.sim.gpa.free(n.partitions.items[i].cut);
+                _ = n.partitions.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// One-shot faults on the next packet crossing `from → to`: lost,
+    /// duplicated (datagrams; a stream sees nothing), or held back.
+    pub fn armDrop(n: *Net, from: u32, to: u32) void {
+        const d = n.dirOf(from, to) orelse return;
+        d.drop += 1;
+    }
+
+    pub fn armDup(n: *Net, from: u32, to: u32) void {
+        const d = n.dirOf(from, to) orelse return;
+        d.dup += 1;
+    }
+
+    pub fn armDelay(n: *Net, from: u32, to: u32, delay_ns: u64) void {
+        const d = n.dirOf(from, to) orelse return;
+        d.delay_ns += delay_ns;
+    }
+
+    fn inCut(cut: []const u32, h: u32) bool {
+        return std.mem.indexOfScalar(u32, cut, h) != null;
+    }
+
+    fn partitioned(n: *const Net, u: u32, v: u32) bool {
+        for (n.partitions.items) |p| if (inCut(p.cut, u) != inCut(p.cut, v)) return true;
+        return false;
+    }
+
+    /// Shortest path from `src` to `dst` over link directions that are up,
+    /// not cut by a partition and not through a down host, as hops from
+    /// `dst` back to `src`; null when unreachable.
+    fn route(n: *Net, src: u32, dst: u32) ?[]const Hop {
         const gpa = n.sim.gpa;
         const count = n.sim.hosts.items.len;
         n.dist.resize(gpa, count) catch return null;
@@ -255,14 +343,15 @@ pub const Net = struct {
             const u = best orelse break;
             if (u == dst) break;
             n.done.items[u] = true;
-            for (n.edges.items, 0..) |e, ei| {
-                if (!e.up) continue;
-                const v = if (e.a == u) e.b else if (e.b == u) e.a else continue;
-                if (n.done.items[v] or !n.sim.hosts.items[v].up) continue;
+            for (n.edges.items, 0..) |*e, ei| {
+                const d = e.from(u) orelse continue;
+                if (!e.dir[d].up) continue;
+                const v = e.other(d);
+                if (n.done.items[v] or !n.sim.hosts.items[v].up or n.partitioned(u, v)) continue;
                 const nd = n.dist.items[u] + e.cfg.latency_ns + 1;
                 if (nd < n.dist.items[v]) {
                     n.dist.items[v] = nd;
-                    n.via.items[v] = @intCast(ei);
+                    n.via.items[v] = .{ .edge = @intCast(ei), .dir = d };
                 }
             }
         }
@@ -270,25 +359,38 @@ pub const Net = struct {
         n.path.clearRetainingCapacity();
         var at = dst;
         while (at != src) {
-            const ei = n.via.items[at];
-            n.path.append(gpa, ei) catch return null;
-            const e = n.edges.items[ei];
-            at = if (e.a == at) e.b else e.a;
+            const hop = n.via.items[at];
+            n.path.append(gpa, hop) catch return null;
+            const e = n.edges.items[hop.edge];
+            at = if (hop.dir == 0) e.a else e.b;
         }
         return n.path.items;
     }
 
     const Transit = struct { delay: u64, lost: bool, dup: bool, corrupt: bool };
 
-    /// Draws one packet's fate on the current path; null when unreachable.
+    /// Draws one packet's fate on the current path (consuming one-shot
+    /// faults armed on it); null when unreachable.
     fn transit(n: *Net, src: u32, dst: u32) ?Transit {
         const hosts = n.sim.hosts.items;
         if (!hosts[src].up or !hosts[dst].up) return null;
         if (src == dst) return .{ .delay = n.sim.opts.net.loopback_latency_ns, .lost = false, .dup = false, .corrupt = false };
         const path = n.route(src, dst) orelse return null;
         var t: Transit = .{ .delay = 0, .lost = false, .dup = false, .corrupt = false };
-        for (path) |ei| {
-            const c = n.edges.items[ei].cfg;
+        for (path) |hop| {
+            const e = &n.edges.items[hop.edge];
+            const d = &e.dir[hop.dir];
+            if (d.drop > 0) {
+                d.drop -= 1;
+                t.lost = true;
+            }
+            if (d.dup > 0) {
+                d.dup -= 1;
+                t.dup = true;
+            }
+            t.delay += d.delay_ns;
+            d.delay_ns = 0;
+            const c = e.cfg;
             t.delay += c.latency_ns + n.prng.belowWide(c.jitter_ns +| 1);
             if (n.prng.permille(c.loss_permille)) t.lost = true;
             if (n.prng.permille(c.dup_permille)) t.dup = true;
@@ -298,10 +400,34 @@ pub const Net = struct {
         return t;
     }
 
+    /// Can a packet already on its way from `src` still arrive at `dst`? The
+    /// sender may have crashed since; the receiver must be up and the path
+    /// open.
     fn reachable(n: *Net, src: u32, dst: u32) bool {
-        const hosts = n.sim.hosts.items;
-        if (!hosts[src].up or !hosts[dst].up) return false;
+        if (!n.sim.hosts.items[dst].up) return false;
         return src == dst or n.route(src, dst) != null;
+    }
+
+    /// A crash: every socket of `h` vanishes without a FIN or a reset.
+    /// Segments it already sent are still on the wire and arrive; what peers
+    /// send to it later meets a dead host (and, after a restart, a reset).
+    /// Waiters must already be detached (the host's tasks are gone).
+    pub fn crashHost(n: *Net, h: *Host) void {
+        var doomed: std.ArrayList(*Sock) = .empty;
+        defer doomed.deinit(n.sim.gpa);
+        var it = n.socks.valueIterator();
+        while (it.next()) |s| if (s.*.host == h) {
+            doomed.append(n.sim.gpa, s.*) catch {
+                // No memory for the list: destroy in place, then rescan.
+                s.*.waiters.clearRetainingCapacity();
+                n.destroySock(s.*);
+                it = n.socks.valueIterator();
+            };
+        };
+        for (doomed.items) |s| {
+            s.waiters.clearRetainingCapacity();
+            n.destroySock(s);
+        }
     }
 
     // ── addresses and ports ─────────────────────────────────────────────────

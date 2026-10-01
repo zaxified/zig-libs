@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — M3, crashes and fault search: `Sim.crash`/`restart` with
+  `Host.spawnBoot` and `Host.allocator()` (a crash stops tasks without
+  unwinding, drops their sockets silently and releases their memory),
+  `setLinkDirUp` (one-way failures), `partition`/`heal`, one-shot `Fault`s via
+  `scheduleFault`, `setInvariant` (new `Outcome.violated`), and `Case` with
+  `run`/`replay`/`findFailing`/`shrink`/`checkDeterminism` over netsim's fault
+  schedules. Events due now fire before the next task step, and the
+  fingerprint now covers virtual time (fingerprints from M2 differ).
 - **2026-10-01** — M2, the network: hosts get IPv4/IPv6 addresses, `Sim.link`/
   `linkAll`/`setLinkUp` build a topology routed over shortest paths, and
   `std.Io.net` works on it — TCP-like streams (handshake with SYN retry,
