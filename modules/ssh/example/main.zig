@@ -56,7 +56,9 @@ pub fn main() !void {
     var wire_buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&wire_buf);
     var write_cipher: transport.CipherState = .none;
-    try transport.writePacket(&w, &write_cipher, pw.buffered());
+    // `.os`: padding from getrandom(2); a deterministic `Io` would pass
+    // `.{ .io = io }` instead (see `transport.Entropy`).
+    try transport.writePacket(&w, &write_cipher, .os, pw.buffered());
 
     // "Receive" it back out of the same bytes, the way a peer would off a
     // real socket.
@@ -90,7 +92,7 @@ pub fn main() !void {
     var ext_wire_buf: [512]u8 = undefined;
     var eww: std.Io.Writer = .fixed(&ext_wire_buf);
     var ext_write_cipher: transport.CipherState = .none;
-    try transport.writePacket(&eww, &ext_write_cipher, ext_payload);
+    try transport.writePacket(&eww, &ext_write_cipher, .os, ext_payload);
 
     var er: std.Io.Reader = .fixed(eww.buffered());
     var ext_read_cipher: transport.CipherState = .none;
