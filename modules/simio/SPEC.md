@@ -217,6 +217,16 @@ killed. The four survivors are equivalent:
 - No `max(at, last_at)` when queueing a segment: a pipe delivers only from its head,
   so order holds regardless; the `max` keeps timing realistic, not order.
 
+### File system (2026-10-01, after M4)
+
+27 schemata over `fs.zig` and the disk-fault part of `search.zig`. First pass: 18
+killed (2 as hangs), 9 survived, all holes, now tested: a synced overwrite never
+comes back as an older write; strict durability ignores the sync of an unrelated
+directory; a crash never splits a rename; `createFile` truncates by default; bit rot
+survives a crash; a shared lock keeps an exclusive one out; `..` walks up; a directory
+cannot move into its own subtree; an unsynced truncation may or may not survive.
+Second pass: 27/27 killed.
+
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a

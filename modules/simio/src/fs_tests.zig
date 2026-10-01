@@ -48,6 +48,22 @@ fn basics(io: Io) !void {
     try f.setLength(io, 5);
     try testing.expectEqual(@as(u64, 5), try f.length(io));
     f.close(io);
+    // Creating an existing file truncates it by default.
+    {
+        var again = try cwd.createFile(io, "data/a.txt", .{});
+        defer again.close(io);
+        try testing.expectEqual(@as(u64, 0), try again.length(io));
+        try again.writePositionalAll(io, "HELLO", 0);
+    }
+    // ".." walks up.
+    {
+        var up = try cwd.createFile(io, "data/logs/../up.txt", .{});
+        up.close(io);
+        try cwd.access(io, "data/up.txt", .{});
+        try cwd.deleteFile(io, "data/up.txt");
+    }
+    // A directory cannot move into its own subtree.
+    try testing.expectError(error.FileBusy, cwd.rename("data", cwd, "data/logs/data", io));
 
     try testing.expectError(error.PathAlreadyExists, cwd.createFile(io, "data/a.txt", .{ .exclusive = true }));
     try testing.expectError(error.FileNotFound, cwd.openFile(io, "data/missing", .{}));
@@ -239,6 +255,12 @@ test "bit rot flips exactly one bit of a stored file" {
     var bits: u32 = 0;
     for (rotten, original) |x, y| bits += @popCount(x ^ y);
     try testing.expectEqual(@as(u32, 1), bits);
+    // The flip is on the disk, not in a cache: it survives a crash.
+    sim.crash(h);
+    sim.restart(h);
+    bits = 0;
+    for (h.readFile("docs/fox.txt").?, original) |x, y| bits += @popCount(x ^ y);
+    try testing.expectEqual(@as(u32, 1), bits);
 }
 
 fn locks(io: Io) !void {
@@ -250,6 +272,10 @@ fn locks(io: Io) !void {
     try testing.expect(!try b.tryLock(io, .shared));
     a.close(io); // closing releases the lock
     try testing.expect(try b.tryLock(io, .shared));
+    // A shared lock keeps an exclusive one out.
+    var c = try cwd.openFile(io, "lock", .{});
+    defer c.close(io);
+    try testing.expect(!try c.tryLock(io, .exclusive));
 }
 
 test "file locks exclude each other and are released on close" {
@@ -453,4 +479,110 @@ test "search with disk faults finds silent corruption; a checksum catches it" {
 
     var checked: Reading = .{ .checksum = true };
     try testing.expect(try search.findFailing(testing.allocator, readerCase(&checked), rot_faults, 0, 100) == null);
+}
+
+// ── crash-model details found by the mutation run ──────────────────────────
+
+fn overwriteTwiceSynced(io: Io) !void {
+    var f = try Dir.cwd().openFile(io, "page", .{ .mode = .read_write });
+    defer f.close(io);
+    try f.writePositionalAll(io, &([_]u8{0x11} ** 512), 0);
+    try f.sync(io);
+    try f.writePositionalAll(io, &([_]u8{0x22} ** 512), 0);
+    try f.sync(io);
+}
+
+test "a synced overwrite is final: a crash never brings an older write back" {
+    for (0..30) |seed| {
+        var sim: Sim = undefined;
+        newSim(&sim, seed);
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        try h.putFile("page", &([_]u8{0} ** 512));
+        try h.spawn(overwriteTwiceSynced, .{h.io()});
+        _ = sim.run();
+        sim.crash(h);
+        for (h.readFile("page").?) |b| try testing.expectEqual(@as(u8, 0x22), b);
+    }
+}
+
+fn createThenSyncOtherDir(io: Io) !void {
+    const cwd = Dir.cwd();
+    var f = try cwd.createFile(io, "a/f", .{});
+    try f.sync(io);
+    f.close(io);
+    const other = try cwd.openDir(io, "b", .{});
+    defer other.close(io);
+    try (File{ .handle = other.handle, .flags = .{ .nonblocking = false } }).sync(io);
+}
+
+test "strict durability: syncing another directory does not make a name durable" {
+    var lost: usize = 0;
+    for (0..30) |seed| {
+        var sim: Sim = undefined;
+        newSim(&sim, seed);
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        try h.putFile("a/.keep", "");
+        try h.putFile("b/.keep", "");
+        try h.spawn(createThenSyncOtherDir, .{h.io()});
+        _ = sim.run();
+        sim.crash(h);
+        if (h.readFile("a/f") == null) lost += 1;
+    }
+    try testing.expect(lost > 0);
+}
+
+fn renameOnly(io: Io) !void {
+    try Dir.cwd().rename("old", Dir.cwd(), "new", io);
+}
+
+test "a crash never splits a rename: exactly one of the two names exists" {
+    var outcomes: [2]usize = @splat(0);
+    for (0..30) |seed| {
+        var sim: Sim = undefined;
+        newSim(&sim, seed);
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        try h.putFile("old", "payload");
+        try h.spawn(renameOnly, .{h.io()});
+        _ = sim.run();
+        sim.crash(h);
+        const old = h.readFile("old") != null;
+        const new = h.readFile("new") != null;
+        try testing.expect(old != new);
+        outcomes[@intFromBool(new)] += 1;
+    }
+    try testing.expect(outcomes[0] > 0 and outcomes[1] > 0);
+}
+
+fn shrinkFile(io: Io, sync: bool) !void {
+    var f = try Dir.cwd().openFile(io, "big", .{ .mode = .read_write });
+    defer f.close(io);
+    try f.setLength(io, 10);
+    if (sync) try f.sync(io);
+}
+
+test "an unsynced truncation may or may not survive a crash; a synced one does" {
+    var lengths: [2]usize = @splat(0);
+    for (0..30) |seed| {
+        for ([_]bool{ false, true }) |sync| {
+            var sim: Sim = undefined;
+            newSim(&sim, seed);
+            defer sim.deinit();
+            const h = try sim.addHost(.{});
+            try h.putFile("big", &([_]u8{7} ** 1000));
+            try h.spawn(shrinkFile, .{ h.io(), sync });
+            _ = sim.run();
+            sim.crash(h);
+            const len = h.readFile("big").?.len;
+            if (sync) {
+                try testing.expectEqual(@as(usize, 10), len);
+            } else {
+                try testing.expect(len == 10 or len == 1000);
+                lengths[@intFromBool(len == 10)] += 1;
+            }
+        }
+    }
+    try testing.expect(lengths[0] > 0 and lengths[1] > 0);
 }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Mutation run over the file system (27 schemata, all
+  killed after nine new tests — see SPEC.md).
 - **2026-10-01** — M4, the disk: `std.Io.Dir`/`File` on a per-host file
   system with a crash-consistency model (unsynced data survives per sector;
   names are journaled and durable on a directory sync, or any sync with
