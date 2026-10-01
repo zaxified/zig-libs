@@ -362,6 +362,16 @@ Modules keep their own loopback tests (below, "timeouts").
   to have no timing left to move: their cancel tests already wait for the request
   to arrive instead of sleeping.
 
+- **staticfiles** (2026-10-01, after the file system gained links): the real
+  `staticfiles.Handler` behind `http.Server`, fetched by `http.Client` by host name,
+  over a root holding a link inside it, a link out to a secret and a link to an
+  ancestor directory. No response carries a byte from outside the root — by default
+  every link is refused (403), with `follow_symlinks` the inside one is served and the
+  escaping ones still refused, `..` and `%2e%2e` never get out. A handler that only
+  sanitizes the path text and then opens it is caught leaking the secret. No defect
+  found. (`resolve_beneath` is ignored by simio exactly as `std.Io.Threaded` ignores
+  it on Linux, where `O_RESOLVE_BENEATH` does not exist.)
+
 **Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
 (or spin-wait) could be held across a call that suspends under an `Io` running several
 tasks on one thread. Fixed — the lock waits through the `Io` when one is known: `kv`

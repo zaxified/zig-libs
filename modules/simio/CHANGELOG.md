@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — staticfiles pilot: path-traversal safety of the real handler
+  over symbolic links on the simulated disk; a text-only handler is caught leaking.
 - **2026-10-01** — The file system gains symbolic links (followed as POSIX does,
   `SymLinkLoop` past 40), hard links, `File.realPath`, permissions/owners/timestamps
   (stored and reported) and memory maps (the copy-and-sync mapping
