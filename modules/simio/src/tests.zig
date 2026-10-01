@@ -558,3 +558,47 @@ test "with preemption off, the seed alone still varies the order tasks start in"
     }
     try testing.expect(orders.count() > 5);
 }
+
+// ── the watchdog ───────────────────────────────────────────────────────────
+
+fn spinUntilWatchdog(sim: *Sim) void {
+    // Never calls `std.Io`: only the watchdog thread can notice this task.
+    while (!sim.watchdogFired()) std.atomic.spinLoopHint();
+}
+
+fn spinner(io: Io, sim: *Sim) void {
+    _ = io;
+    spinUntilWatchdog(sim);
+}
+
+test "the watchdog notices a task that spins without calling std.Io" {
+    var sim: Sim = undefined;
+    sim.init(testing.allocator, .{
+        .seed = 1,
+        .stack_size = 256 * 1024,
+        .watchdog_ms = 100,
+        .watchdog_action = .flag,
+    });
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.spawn(spinner, .{ h.io(), &sim });
+    const r = sim.run();
+    try testing.expect(sim.watchdogFired());
+    try testing.expectEqual(sched.Outcome.quiescent, r.outcome);
+}
+
+test "the watchdog stays quiet while tasks keep switching" {
+    var sim: Sim = undefined;
+    sim.init(testing.allocator, .{
+        .seed = 2,
+        .stack_size = 256 * 1024,
+        .watchdog_ms = 100,
+        .watchdog_action = .flag,
+    });
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var done: u32 = 0;
+    try h.spawn(groupAwaitAll, .{ h.io(), &done });
+    _ = sim.run();
+    try testing.expect(!sim.watchdogFired());
+}

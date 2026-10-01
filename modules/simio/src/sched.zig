@@ -23,6 +23,7 @@ const netsim = @import("netsim");
 const stack_mod = @import("stack.zig");
 const net_mod = @import("net.zig");
 const fs_mod = @import("fs.zig");
+const watchdog_mod = @import("watchdog.zig");
 
 const Io = std.Io;
 const Alignment = std.mem.Alignment;
@@ -57,6 +58,12 @@ pub const Options = struct {
     net: net_mod.NetOptions = .{},
     /// The simulated file systems' durability model.
     fs: fs_mod.FsOptions = .{},
+    /// Wall-clock time a run may go without switching tasks before the
+    /// watchdog names the stuck task and aborts (a task spinning without
+    /// calling `std.Io` can never be interrupted from inside). 0 = off.
+    watchdog_ms: u32 = 60_000,
+    /// What the watchdog does when it fires (`.flag` is for tests).
+    watchdog_action: watchdog_mod.Action = .abort,
 };
 
 pub const HostOptions = struct {
@@ -412,6 +419,7 @@ pub const Sim = struct {
     steps: u64 = 0,
     next_partition: u32 = 1 << 31,
     fingerprint_state: u64 = 0,
+    watchdog: watchdog_mod.Watchdog,
     /// Every byte a host put on the wire or on its disk, hashed in order.
     data_hash: std.hash.Wyhash = .init(0),
     live: usize = 0,
@@ -442,6 +450,10 @@ pub const Sim = struct {
             .prng = .init(opts.seed),
             .net = undefined,
             .owner = std.Thread.getCurrentId(),
+            .watchdog = .{
+                .limit_ns = @as(u64, opts.watchdog_ms) * std.time.ns_per_ms,
+                .action = opts.watchdog_action,
+            },
         };
         sim.net = .init(sim, opts.seed);
     }
@@ -637,6 +649,8 @@ pub const Sim = struct {
     fn runUntil(sim: *Sim, limit: ?u64) RunResult {
         sim.assertOwner();
         assert(sim.current == null);
+        sim.watchdog.start();
+        defer sim.watchdog.finish();
         while (true) {
             if (sim.steps >= sim.opts.max_steps) return sim.runResult(.step_limit);
             // Events due now (a fault scheduled for this instant, a timer
@@ -928,9 +942,16 @@ pub const Sim = struct {
         assert(f.state == .ready);
         f.state = .running;
         sim.current = f;
+        sim.watchdog.enter(f.id, f.host.id, sim.now);
         const sw: fiber.Switch = .{ .old = &sim.sched_context, .new = &f.context };
         _ = fiber.contextSwitch(&sw);
+        sim.watchdog.leave();
         sim.current = null;
+    }
+
+    /// The watchdog fired (with `Options.watchdog_action = .flag`).
+    pub fn watchdogFired(sim: *const Sim) bool {
+        return sim.watchdog.fired.load(.acquire);
     }
 
     fn toScheduler(sim: *Sim, f: *Fiber) void {

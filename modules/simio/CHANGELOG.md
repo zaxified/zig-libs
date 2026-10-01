@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — A watchdog (`Options.watchdog_ms`, default 60 s of wall time): a
+  task that spins without calling `std.Io` is named (task, host, virtual time) and
+  the process aborts, instead of the run hanging silently. `.flag` action and
+  `Sim.watchdogFired` for tests.
 - **2026-10-01** — `checkDeterminism` also compares a data fingerprint
   (`Sim.dataFingerprint`: every byte sent and written, per host, in order) and an
   optional `Case.digest`, failing with `NondeterministicData` /

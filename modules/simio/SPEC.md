@@ -97,6 +97,12 @@ consumer's to remove.
   seed twice and compares all three, so nondeterminism in the code under test is
   *reported* — and which kind (`Nondeterministic`, `NondeterministicData`,
   `NondeterministicState`) — not silently tolerated.
+- **Watchdog.** A task that spins without calling `std.Io` can never be interrupted
+  from inside the simulation. A second OS thread watches atomics the scheduler bumps
+  on every switch; after `Options.watchdog_ms` (60 s) of wall time without one it
+  prints the stuck task, its host and the virtual time, and aborts — a named failure
+  instead of a silent hang. It costs one thread spawn per run (~10 % of simio's own
+  suite, which is thousands of short runs); `watchdog_ms = 0` turns it off.
 - **Fiber stacks** are `mmap`ed with a `PROT_NONE` guard page below them (virtual
   size configurable, committed lazily), so a stack overflow faults instead of
   corrupting a neighbour. Stacks are never allocated from the caller's allocator.
@@ -343,10 +349,6 @@ Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` inst
 of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
-
-- A task that spins without calling `std.Io` never returns to the scheduler, so the
-  run hangs instead of ending as `.step_limit`. Catching it needs a watchdog outside
-  the fiber (a timer signal on the test thread), not a scheduler change.
 
 - Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
 - A simulated resolver for `netLookup` (hosts by name).
