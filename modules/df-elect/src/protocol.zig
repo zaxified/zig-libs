@@ -169,6 +169,9 @@ pub const DfElect = struct {
     /// last_view[node*node_count + member] = the `Hello.view` `member` last
     /// advertised to `node` (meaningful while `last_seen` says alive).
     last_view: []u32,
+    /// last_heard[node] = `node`'s local time when it last accepted a fresh
+    /// Hello from ANY other fabric node; `null` = never since its start.
+    last_heard: []?Time,
     /// roles[node*MAX_TAGS + i] = `node`'s standing for its segment's
     /// `tags[i]`.
     roles: []election.Role,
@@ -180,6 +183,8 @@ pub const DfElect = struct {
 
     delivery: checks.DeliveryChecker = .{},
     transitions: std.ArrayList(checks.DfTransition) = .empty,
+    /// Every BUM frame put on the fabric, for `checks.firstUnexplainedLoss`.
+    originated: std.ArrayList(checks.Origination) = .empty,
 
     /// Frames dropped because they did not decode, or because `origin`/`seq`
     /// fell outside what this node's dedup state can represent. Every frame
@@ -208,6 +213,8 @@ pub const DfElect = struct {
         errdefer gpa.free(last_seen);
         const last_view = try gpa.alloc(u32, node_count * node_count);
         errdefer gpa.free(last_view);
+        const last_heard = try gpa.alloc(?Time, node_count);
+        errdefer gpa.free(last_heard);
         const roles = try gpa.alloc(election.Role, node_count * MAX_TAGS);
         errdefer gpa.free(roles);
         const hello_seq = try gpa.alloc(u32, node_count);
@@ -225,6 +232,7 @@ pub const DfElect = struct {
             .bum_seen = bum_seen,
             .last_seen = last_seen,
             .last_view = last_view,
+            .last_heard = last_heard,
             .roles = roles,
             .hello_seq = hello_seq,
             .bum_seq = bum_seq,
@@ -240,6 +248,7 @@ pub const DfElect = struct {
         gpa.free(self.bum_seen);
         gpa.free(self.last_seen);
         gpa.free(self.last_view);
+        gpa.free(self.last_heard);
         gpa.free(self.roles);
         gpa.free(self.hello_seq);
         gpa.free(self.bum_seq);
@@ -247,6 +256,7 @@ pub const DfElect = struct {
         gpa.free(self.tag_cursor);
         self.delivery.deinit(gpa);
         self.transitions.deinit(gpa);
+        self.originated.deinit(gpa);
         self.* = undefined;
     }
 
@@ -255,6 +265,7 @@ pub const DfElect = struct {
         @memset(self.bum_seen, 0);
         @memset(self.last_seen, null);
         @memset(self.last_view, 0);
+        @memset(self.last_heard, null);
         @memset(self.roles, .{});
         @memset(self.hello_seq, 0);
         @memset(self.bum_seq, 0);
@@ -282,16 +293,20 @@ pub const DfElect = struct {
         self.clearState();
         self.delivery.reset();
         self.transitions.clearRetainingCapacity();
+        self.originated.clearRetainingCapacity();
         self.malformed_dropped = 0;
     }
 
     /// Start or RESTART: a restarted member comes back with an empty view and
     /// no role (RFC 7432 §8.5 step 2: a PE starts blocked and waits), so any
-    /// role it held before the crash is logged as given up now.
+    /// role it held before the crash is logged as given up now. Every node,
+    /// member or not, floods Hellos.
     fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
         const self = cast(ctx);
         self.epoch[node] += 1;
         const e = self.epoch[node];
+        self.last_heard[node] = null;
+        try sim.setTimer(node, self.cfg.hello_period, timerId(HELLO_TIMER, e));
         if (segmentIndexOf(node)) |si| {
             const seg = segments[si];
             for (seg.tags, 0..) |tag, ti| {
@@ -301,7 +316,6 @@ pub const DfElect = struct {
             }
             @memset(self.last_seen[node * self.node_count ..][0..self.node_count], null);
             @memset(self.last_view[node * self.node_count ..][0..self.node_count], 0);
-            try sim.setTimer(node, self.cfg.hello_period, timerId(HELLO_TIMER, e));
             if (seg.members[0].node == node) try sim.setTimer(node, self.cfg.bum_period, timerId(BUM_CE_TIMER, e));
         }
         if (node == NETWORK_ORIGIN) try sim.setTimer(node, self.cfg.bum_period, timerId(BUM_NET_TIMER, e));
@@ -312,9 +326,11 @@ pub const DfElect = struct {
         const e = self.epoch[node];
         if (timer_id >> 8 != e) return; // armed before a restart
         switch (timer_id & 0xff) {
-            HELLO_TIMER => if (segmentIndexOf(node)) |si| {
+            HELLO_TIMER => {
+                const si = segmentIndexOf(node);
                 try self.originateHello(sim, node, si);
-                self.refreshRoles(sim, node, si); // staleness is only noticed on a tick
+                // Staleness and isolation are only noticed on a tick.
+                if (si) |i| self.refreshRoles(sim, node, i);
                 try sim.setTimer(node, self.cfg.hello_period, timerId(HELLO_TIMER, e));
             },
             BUM_CE_TIMER => if (segmentIndexOf(node)) |si| {
@@ -360,12 +376,12 @@ pub const DfElect = struct {
         }
     }
 
-    fn originateHello(self: *DfElect, sim: *Sim, node: NodeId, si: usize) anyerror!void {
-        const seg = segments[si];
+    fn originateHello(self: *DfElect, sim: *Sim, node: NodeId, si: ?usize) anyerror!void {
         self.hello_seq[node] += 1;
         var buf: [types.Hello.wire_len]u8 = undefined;
-        const view = self.viewOf(sim, node, si);
-        (types.Hello{ .origin = node, .seq = self.hello_seq[node], .segment = seg.id, .view = view }).encode(&buf);
+        const segment = if (si) |i| segments[i].id else types.no_segment;
+        const view = if (si) |i| self.viewOf(sim, node, i) else 0;
+        (types.Hello{ .origin = node, .seq = self.hello_seq[node], .segment = segment, .view = view }).encode(&buf);
         self.hello_last_seq[node * self.node_count + node] = self.hello_seq[node];
         try floodFrom(sim, node, &buf, null);
     }
@@ -374,8 +390,10 @@ pub const DfElect = struct {
         self.bum_seq[node] += 1;
         std.debug.assert(self.bum_seq[node] < 64); // see `bum_seen`
         var buf: [types.BumFrame.wire_len]u8 = undefined;
-        (types.BumFrame{ .origin = node, .seq = self.bum_seq[node], .ingress_segment = ingress_segment, .tag = tag }).encode(&buf);
+        const frame = types.BumFrame{ .origin = node, .seq = self.bum_seq[node], .ingress_segment = ingress_segment, .tag = tag };
+        frame.encode(&buf);
         self.bum_seen[node * self.node_count + node] |= @as(u64, 1) << @intCast(self.bum_seq[node]);
+        try self.originated.append(self.gpa, .{ .time = sim.timeNow(), .origin = node, .frame_id = frame.id(), .tag = tag, .ingress_segment = ingress_segment });
         try floodFrom(sim, node, &buf, null);
     }
 
@@ -394,6 +412,7 @@ pub const DfElect = struct {
         const idx = node * self.node_count + h.origin;
         if (h.seq <= self.hello_last_seq[idx]) return; // stale or duplicate
         self.hello_last_seq[idx] = h.seq;
+        if (h.origin != node) self.last_heard[node] = localTime(sim, node);
 
         if (segmentIndexOf(node)) |si| {
             const seg = segments[si];
@@ -435,20 +454,36 @@ pub const DfElect = struct {
         try floodFrom(sim, node, payload, from);
     }
 
-    /// Is `member` alive in `node`'s view (itself always is)?
-    fn sees(self: *const DfElect, now: Time, node: NodeId, member: NodeId) bool {
-        if (member == node) return true;
-        const seen = self.last_seen[node * self.node_count + member] orelse return false;
-        return now -| seen <= self.cfg.stale_after;
+    /// Is peer `member` (whose bit in a view is `bit`) alive in `node`'s
+    /// view: a fresh Hello from it, and that Hello does not declare it
+    /// isolated (its own bit set).
+    fn sees(self: *const DfElect, now: Time, node: NodeId, member: NodeId, bit: u32) bool {
+        const idx = node * self.node_count + member;
+        const seen = self.last_seen[idx] orelse return false;
+        if (now -| seen > self.cfg.stale_after) return false;
+        return self.last_view[idx] & bit != 0;
+    }
+
+    /// Core isolation: `node` has heard no fabric node for `stale_after`
+    /// (or not yet since it started). Such a member most likely receives no
+    /// frame either, so it must neither hold a role nor be deferred to — the
+    /// rule FRRouting applies as EVPN-MH "core isolation" (access ports go
+    /// protodown once every uplink is gone).
+    fn isolated(self: *const DfElect, now: Time, node: NodeId) bool {
+        const heard = self.last_heard[node] orelse return true;
+        return now -| heard > self.cfg.stale_after;
     }
 
     /// `node`'s current view of its segment as a member bitmask (the value
-    /// its Hellos advertise).
+    /// its Hellos advertise): itself and the peers it `sees`, or 0 — without
+    /// even its own bit — while it is `isolated`.
     fn viewOf(self: *const DfElect, sim: *const Sim, node: NodeId, si: usize) u32 {
         const now = localTime(sim, node);
+        if (self.isolated(now, node)) return 0;
         var mask: u32 = 0;
         for (segments[si].members, 0..) |m, i| {
-            if (self.sees(now, node, m.node)) mask |= @as(u32, 1) << @intCast(i);
+            const bit = @as(u32, 1) << @intCast(i);
+            if (m.node == node or self.sees(now, node, m.node, bit)) mask |= bit;
         }
         return mask;
     }
@@ -456,7 +491,8 @@ pub const DfElect = struct {
     /// Re-run the election for every tag of `node`'s segment.
     ///
     /// `node` is NAMED for a tag when the DF function over its own view picks
-    /// it AND the view each peer it sees last advertised picks it too. The
+    /// it AND the view each peer it sees last advertised picks it too. An
+    /// isolated node's view is empty, so it is named for nothing. The
     /// second half is what makes a one-way failure safe: a member whose
     /// outbound path died still hears its peers, but they no longer see it
     /// and carve its tags among themselves; their advertised views say so,
@@ -724,6 +760,27 @@ fn expectSettled(df: *const DfElect, algorithm: types.Algorithm) !void {
     };
 }
 
+/// The first frame a segment should have received and did not
+/// (`checks.firstUnexplainedLoss` with this module's windows).
+fn firstLoss(df: *const DfElect, case: netsim.Case, links: []const netsim.Link, trace: []const netsim.FaultEvent) !?checks.Loss {
+    return checks.firstUnexplainedLoss(testing.allocator, df.originated.items, &df.delivery, &segments, trace, links, NODE_N, checks.maxZeroDfWindow(df.cfg), checks.maxDuplicateWindow(df.cfg), case.until);
+}
+
+fn worstZeroDf(df: *const DfElect, case: netsim.Case, trace: []const netsim.FaultEvent) !Time {
+    const topo = try netsim.snapshotTopo(testing.allocator, case);
+    defer testing.allocator.free(topo.links);
+    return (try checks.worstZeroDfWindow(testing.allocator, df.transitions.items, &segments, trace, topo.links, NODE_N, case.until)).len;
+}
+
+fn expectNoLoss(df: *const DfElect, case: netsim.Case, trace: []const netsim.FaultEvent) !void {
+    const topo = try netsim.snapshotTopo(testing.allocator, case);
+    defer testing.allocator.free(topo.links);
+    if (try firstLoss(df, case, topo.links, trace)) |l| {
+        std.debug.print("lost: frame {x} tag {} for segment {} sent at t={}\n", .{ l.frame_id, l.tag, l.segment, l.time });
+        return error.UnexplainedLoss;
+    }
+}
+
 test "real: fault-free — no duplicate at all, settles on the RFC assignment, startup zero-DF within the bound" {
     const gpa = testing.allocator;
     for (algorithms) |alg| {
@@ -734,10 +791,11 @@ test "real: fault-free — no duplicate at all, settles on the RFC assignment, s
         const r = try netsim.replay(gpa, case, &.{}, null);
         try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
         try expectSettled(&df, alg);
-        const worst = (try checks.worstZeroDfWindow(gpa, df.transitions.items, &segments, &.{}, NODE_N, UNTIL)).len;
+        const worst = try worstZeroDf(&df, case, &.{});
         try testing.expect(worst > 0); // startup is a real window: df_wait is observed
         try testing.expect(worst <= checks.maxZeroDfWindow(df.cfg));
         try testing.expect(df.delivery.delivered.count() > 0);
+        try expectNoLoss(&df, case, &.{});
     }
 }
 
@@ -785,8 +843,9 @@ test "real: failover — the DF of a tag crashes, a survivor takes over within t
             if (t.segment == SEG_A.id and t.tag == 10 and t.is_df and t.node != victim and t.time > 400 and t.time < 1000) took_over = true;
         }
         try testing.expect(took_over);
-        const worst = (try checks.worstZeroDfWindow(gpa, df.transitions.items, &segments, &trace, NODE_N, UNTIL)).len;
+        const worst = try worstZeroDf(&df, case, &trace);
         try testing.expect(worst <= checks.maxZeroDfWindow(df.cfg));
+        try expectNoLoss(&df, case, &trace);
         try expectSettled(&df, alg);
     }
 }
@@ -806,7 +865,7 @@ test "real: partition and heal — each side serves its own members, duplicates 
         const r = try netsim.replay(gpa, case, &trace, null);
         try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
         try testing.expectEqual(@as(?checks.Duplicate, null), checks.firstUnexplainedDuplicate(df.delivery.duplicates.items, &trace, checks.maxDuplicateWindow(df.cfg)));
-        const worst = (try checks.worstZeroDfWindow(gpa, df.transitions.items, &segments, &trace, NODE_N, UNTIL)).len;
+        const worst = try worstZeroDf(&df, case, &trace);
         try testing.expect(worst <= checks.maxZeroDfWindow(df.cfg));
         // During the partition node 3 carved every tag for itself.
         var isolated_took_all = true;
@@ -818,7 +877,79 @@ test "real: partition and heal — each side serves its own members, duplicates 
             if (!held) isolated_took_all = false;
         }
         try testing.expect(isolated_took_all);
+        try expectNoLoss(&df, case, &trace);
         try expectSettled(&df, alg);
+    }
+}
+
+test "real: a member cut off INBOUND (it hears nothing) gives its roles up and the segment keeps receiving" {
+    // Found by review 2026-10-01: with only the view consensus, member 4 kept
+    // every role of segment A (its view held only itself, and the peers that
+    // still heard it deferred to that view) while it received no frame at all
+    // — every network-side frame for segment A was lost for good, and the
+    // zero-DF check, which counts role holders, saw nothing wrong.
+    const gpa = testing.allocator;
+    const cuts = [_]netsim.Link{ .{ .a = CORE1, .b = 4 }, .{ .a = CORE2, .b = 7 } };
+    for (cuts) |cut| for (algorithms) |alg| {
+        const trace = [_]netsim.FaultEvent{.{ .time = 200, .kind = .{ .link_down = cut } }};
+        var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg });
+        defer df.deinit(gpa);
+        const case = netsim.Case{ .seed = 5, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        try expectNoLoss(&df, case, &trace);
+        try testing.expectEqual(@as(?checks.Duplicate, null), checks.firstUnexplainedDuplicate(df.delivery.duplicates.items, &trace, checks.maxDuplicateWindow(df.cfg)));
+        const worst = try worstZeroDf(&df, case, &trace);
+        try testing.expect(worst <= checks.maxZeroDfWindow(df.cfg));
+        // The deaf member ends with no role.
+        for (segments) |seg| if (seg.indexOf(cut.b) != null) for (seg.tags) |tag| {
+            var buf: [types.max_members]NodeId = undefined;
+            for (df.holders(seg, tag, &buf)) |h| try testing.expect(h != cut.b);
+        };
+    };
+}
+
+test "real: a member cut off OUTBOUND (nobody hears it) yields to the peers' carving, no duplicates" {
+    const gpa = testing.allocator;
+    const cuts = [_]netsim.Link{ .{ .a = 4, .b = CORE1 }, .{ .a = 7, .b = CORE2 } };
+    for (cuts) |cut| for (algorithms) |alg| {
+        const trace = [_]netsim.FaultEvent{.{ .time = 200, .kind = .{ .link_down = cut } }};
+        var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg });
+        defer df.deinit(gpa);
+        df.delivery.duplicates_fatal = true;
+        const case = netsim.Case{ .seed = 5, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        try expectNoLoss(&df, case, &trace);
+        const worst = try worstZeroDf(&df, case, &trace);
+        try testing.expect(worst <= checks.maxZeroDfWindow(df.cfg));
+    };
+}
+
+test "known limit: a one-way failure deeper in the core can still black-hole a segment" {
+    // core1 stops hearing core0 and core2 but they still hear it. Member 4
+    // (behind core1) hears core1, so it is not isolated; it hears no peer, so
+    // it claims every tag of segment A and receives no frame from core0.
+    // Members 3 and 5 still hear 4, whose view declares only itself, and the
+    // consensus makes them defer to it. Telling this from the outbound case
+    // (where deferring is right) needs the directed fabric graph, which a
+    // Hello flood carrying segment views alone does not give (SPEC Backlog).
+    // This test pins the limit; it flips the day that is built.
+    const gpa = testing.allocator;
+    for (algorithms) |alg| {
+        const trace = [_]netsim.FaultEvent{
+            .{ .time = 200, .kind = .{ .link_down = .{ .a = CORE0, .b = CORE1 } } },
+            .{ .time = 200, .kind = .{ .link_down = .{ .a = CORE2, .b = CORE1 } } },
+        };
+        var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg });
+        defer df.deinit(gpa);
+        const case = netsim.Case{ .seed = 5, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+        _ = try netsim.replay(gpa, case, &trace, null);
+        const topo = try netsim.snapshotTopo(gpa, case);
+        defer gpa.free(topo.links);
+        const lost = (try firstLoss(&df, case, topo.links, &trace)).?;
+        try testing.expectEqual(SEG_A.id, lost.segment);
+        try testing.expectEqual(@as(usize, 0), df.delivery.duplicates.items.len);
     }
 }
 
@@ -858,6 +989,8 @@ test "real: fuzzed partitions, cuts, crashes, clock jumps — split-horizon neve
         var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg });
         defer df.deinit(gpa);
         const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+        const topo = try netsim.snapshotTopo(gpa, template);
+        defer gpa.free(topo.links);
         var stats: SweepStats = .{};
         var seed: u64 = 1;
         while (seed <= seeds) : (seed += 1) {
@@ -879,19 +1012,25 @@ test "real: fuzzed partitions, cuts, crashes, clock jumps — split-horizon neve
             }
             for (df.delivery.duplicates.items) |d| stats.worst_dup_delay = @max(stats.worst_dup_delay, dupDelay(d, trace));
             stats.duplicates += df.delivery.duplicates.items.len;
-            const zw = try checks.worstZeroDfWindow(gpa, df.transitions.items, &segments, trace, NODE_N, case.until);
+            const zw = try checks.worstZeroDfWindow(gpa, df.transitions.items, &segments, trace, topo.links, NODE_N, case.until);
             stats.worst_zero = @max(stats.worst_zero, zw.len);
             if (zw.len > checks.maxZeroDfWindow(df.cfg)) {
                 std.debug.print("df-elect {s}: seed {} zero-DF window {} (seg {} tag {} from t={}) > bound {}\n", .{ @tagName(alg), seed, zw.len, zw.segment, zw.tag, zw.start, checks.maxZeroDfWindow(df.cfg) });
                 dumpReproducer(trace, df.transitions.items, zw.segment, zw.tag);
                 return error.ZeroDfWindowExceeded;
             }
+            if (try firstLoss(&df, case, topo.links, trace)) |l| {
+                std.debug.print("df-elect {s}: seed {} lost frame {x} (tag {}) for segment {} sent at t={}\n", .{ @tagName(alg), seed, l.frame_id, l.tag, l.segment, l.time });
+                dumpReproducer(trace, df.transitions.items, l.segment, l.tag);
+                return error.UnexplainedLoss;
+            }
             try testing.expectEqual(@as(u64, 0), df.malformed_dropped);
         }
-        // Measured 2026-10-01 (Debug, 120 seeds, every algorithm): 46-48
-        // duplicates, worst 48 ticks after a heal (bound 100), worst zero-DF
-        // 338 ticks (bound 420). Not printed: the test lanes treat any stderr
-        // on a passing run as a FAIL. The bounds are asserted per run above;
+        // Measured 2026-10-01 with core isolation, per algorithm: Debug (120
+        // seeds) 7 duplicates, worst 44 ticks after a heal (bound 100), worst
+        // zero-DF 362-363 ticks (bound 470); ReleaseSafe (400 seeds) 23-24
+        // duplicates, worst 44, worst zero-DF 390-409. Not printed: the test
+        // lanes treat any stderr on a passing run as a FAIL. The bounds are asserted per run above;
         // these keep the sweep honest: the heal race really happens.
         try testing.expect(stats.duplicates > 0);
         try testing.expect(stats.worst_dup_delay <= checks.maxDuplicateWindow(df.cfg));

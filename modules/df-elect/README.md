@@ -11,8 +11,10 @@ Highest Random Weight (`hrw`) or preference-based election (`preference`, what
 FRRouting runs); it gives a role up at once and takes one only after
 `df_wait`. Model-checked in `netsim` under partitions, one-way link cuts,
 crashes, restarts and clock jumps: split-horizon never fails, a duplicate
-happens only in the heal race right after connectivity returns, and a dead DF
-is replaced within a bounded window.
+happens only in the heal race right after connectivity returns, a dead or
+deaf DF is replaced within a bounded window, and no frame a reachable member
+could have delivered is lost outside such a window (one known limit: a
+one-way failure deeper in the core, SPEC "Known limit").
 
 ```zig
 const dfe = @import("df-elect");
@@ -41,15 +43,19 @@ if (role.is_df and dfe.allowForward(frame.ingress_segment, segment.id)) deliver(
 - `EdgeSegment` (id, ESI, address-sorted `members`, `tags`; `validate`),
   `Member`, `Tag`, `Algorithm`, `ElectConfig` (`hello_period`, `stale_after`,
   `df_wait`, `algorithm`).
-- `Hello` (origin, seq, segment, `view` = the members the origin sees) /
-  `BumFrame` (origin, seq, ingress segment, tag) / `no_ingress` — the two
-  17-octet wire messages; both decoders fail closed.
+- `Hello` (origin, seq, segment or `no_segment`, `view` = the members the
+  origin sees; empty = it declares itself isolated) / `BumFrame` (origin,
+  seq, ingress segment, tag) / `no_ingress` — the two 17-octet wire
+  messages; both decoders fail closed.
 - `DfElect` — the `netsim.Protocol` that runs it all over a Hello flood. A
   member is named DF only when its own view AND every live peer's advertised
   view name it, which makes a one-way failure safe (the member nobody hears
-  yields). `BrokenAlwaysDf` — the positive control.
+  yields); a member that hears no fabric node at all is isolated and holds
+  nothing (EVPN-MH core isolation). Every node floods Hellos.
+  `BrokenAlwaysDf` — the positive control.
 - `DeliveryChecker`, `firstUnexplainedDuplicate` / `maxDuplicateWindow`,
-  `worstZeroDfWindow` / `maxZeroDfWindow` — the invariant machinery.
+  `worstZeroDfWindow` / `maxZeroDfWindow`, `firstUnexplainedLoss` — the
+  invariant machinery.
 
 - **Role:** util. **Platform:** any. **Deps:** `netsim`. **Concurrency:**
   single-owner — `DfElect` holds per-run state; the DF functions and

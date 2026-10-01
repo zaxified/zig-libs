@@ -153,11 +153,17 @@ pub fn tagOf(payload: []const u8) DecodeError!MsgTag {
 pub const Hello = struct {
     origin: NodeId,
     seq: u32,
+    /// The segment `origin` is a member of, or `no_segment` for a fabric
+    /// node that belongs to none (it floods Hellos too, as every router of a
+    /// link-state fabric does; that is what lets a member tell "my peers are
+    /// gone" from "I hear nothing at all").
     segment: SegmentId,
     /// The members `origin` currently sees on `segment`, itself included:
     /// bit i = `EdgeSegment.members[i]`. Receivers use it to notice that a
     /// peer does NOT see them (a one-way failure) and yield — see
-    /// `protocol.DfElect.refreshRoles`.
+    /// `protocol.DfElect.refreshRoles`. A view WITHOUT the sender's own bit
+    /// declares it isolated (it hears no fabric node): receivers stop
+    /// counting it as a member until it advertises itself again.
     view: u32,
 
     pub const wire_len = 17;
@@ -188,6 +194,9 @@ pub const Hello = struct {
         };
     }
 };
+
+/// `Hello.segment` of a fabric node that is a member of no segment.
+pub const no_segment: SegmentId = 0xFFFF_FFFF;
 
 /// Sentinel `ingress_segment` meaning "this frame did not ingress from any
 /// customer segment" (network/WAN-side traffic, the common BUM case).

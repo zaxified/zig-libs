@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Core isolation; lost frames are now checked.** Review
+  found a black hole the checks could not see: a member whose inbound link
+  died heard nobody, so it named itself DF for every tag, and its peers (which
+  still heard it) deferred to that view — the segment received no frame for
+  as long as the cut lasted (16 of 16 lost in a directed test; the sweep had
+  drawn it, seed 66, and passed). Now every fabric node floods Hellos
+  (non-members with `no_segment`), and a member that has heard none for
+  `stale_after` is isolated: its view is empty, it holds nothing, and its
+  peers stop counting it. New post-run `firstUnexplainedLoss` (`Origination`,
+  `Loss`) checks traffic rather than roles; `worstZeroDfWindow` takes the
+  links and counts only members some live node reaches. ⚠ `maxZeroDfWindow`
+  grows by one `hello_period` (420 → 470: the isolation path), and
+  `worstZeroDfWindow` gains a `links` parameter. Known limit, pinned by a
+  test: a one-way failure deeper in the core can still black-hole a segment
+  (SPEC Backlog: directed fabric graph). Sweep measurements moved off stderr.
 - **2026-09-30** — ⚠ **Breaking: N-member segments, RFC DF algorithms and
   failover.** `EdgeSegment` is now `{ id, esi, members: []Member{node, addr},
   tags }` (members sorted by address, `validate`); the DF is per

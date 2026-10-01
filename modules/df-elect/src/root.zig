@@ -48,6 +48,7 @@ pub const BumFrame = types.BumFrame;
 /// Both wire decoders fail closed — see `types.zig`'s module doc.
 pub const DecodeError = types.DecodeError;
 pub const no_ingress = types.no_ingress;
+pub const no_segment = types.no_segment;
 
 const election = @import("election.zig");
 pub const designatedForwarder = election.designatedForwarder;
@@ -67,6 +68,9 @@ pub const maxDuplicateWindow = checks.maxDuplicateWindow;
 pub const maxZeroDfWindow = checks.maxZeroDfWindow;
 pub const firstUnexplainedDuplicate = checks.firstUnexplainedDuplicate;
 pub const worstZeroDfWindow = checks.worstZeroDfWindow;
+pub const Origination = checks.Origination;
+pub const Loss = checks.Loss;
+pub const firstUnexplainedLoss = checks.firstUnexplainedLoss;
 
 const protocol = @import("protocol.zig");
 pub const DfElect = protocol.DfElect;
