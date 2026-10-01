@@ -308,6 +308,16 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   stops reading after the write timeout; with the timeouts off, a stalled client
   holds its connection for the whole run, and the check sees it.
 
+**Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
+(or spin-wait) could be held across a call that suspends under an `Io` running several
+tasks on one thread. Fixed — the lock waits through the `Io` when one is known: `kv`
+(`Db`, `Storage.io`), `sessions` (`KvStore`), `writebehind` (`KvtreeSink`, via
+`kvtree.Lock`/`Db.io()`), `mqtt` (`tx_lock` and teardown, `Transport.io`), `http`
+(`h2_upstream` session/dial locks), `metrics` (`AccessLog` waiters, `Options.io`),
+`xmss`/`lms` (`Persist.io`). Documented: `ramcache` (callbacks must not suspend).
+By contract already: `h2_server` (without `Dispatcher.io` its tasks must be OS
+threads). The other ~15 spinlock modules guard memory only.
+
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
 some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simulated
