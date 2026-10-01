@@ -292,13 +292,21 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   the same thread calls into the store — recorded in kv's SPEC backlog as a decision
   (it is the "repo-standard" io-less lock); no test here until it is fixed, since a
   spinning task never returns to the scheduler.
+- **http client** (2026-10-01): `Client` (pooling, the stale-connection retry, both
+  timeouts) against a small HTTP/1.1 server in the pilot. Twenty fetches over one
+  pooled connection; a server that closes behind a keep-alive costs a transparent
+  redial each time; `total_timeout_ms` and `connect_timeout_ms` fire at exactly 3000
+  and 2000 ms of virtual time; 20 seeds of loss/partitions/crashes never hand back a
+  wrong body. A caller that does not bound its own body reads (the client documents
+  that it does not) is caught waiting forever on a server stalled mid-body. No
+  defect found.
 
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
 some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simulated
 `Io` and gets fixed when its pilot reaches it. What the remaining pilots need first:
 
-- **http** `Server`: its read/write stall timeouts and request/connection deadlines
+- **http** `Server` (the client is piloted): its read/write stall timeouts and request/connection deadlines
   are `std.posix.poll` on the raw socket plus `clock_gettime(.MONOTONIC)`. Under
   simio the poll sees an invalid descriptor (POLLNVAL = "ready"), so the server runs
   but without those timeouts; `serveMulti` uses OS threads and CPU pinning. Making

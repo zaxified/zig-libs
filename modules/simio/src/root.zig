@@ -77,4 +77,5 @@ test {
     _ = @import("pilots/mqtt.zig");
     _ = @import("pilots/ssh.zig");
     _ = @import("pilots/kv.zig");
+    _ = @import("pilots/http.zig");
 }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — http client pilot: pooling, the stale-connection retry and
+  both timeouts against a pilot-local server; no defect found.
 - **2026-10-01** — Every file system call is now a preemption point, as a
   blocking disk call is. kv pilot: `Db` over the real `FsStorage` through
   crashes, I/O errors and bit rot; a store that skips `sync` is caught losing
