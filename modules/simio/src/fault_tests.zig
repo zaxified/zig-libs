@@ -353,6 +353,53 @@ test "checkDeterminism catches bytes drawn outside the simulation even when timi
     try testing.expectError(error.NondeterministicData, search.checkDeterminism(testing.allocator, case, .{}));
 }
 
+/// The same leak as `leakyBytesSetup`, through a stream and through a file.
+fn leakyStreamAndFileSetup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
+    const which: *const u8 = @ptrCast(ctx.?);
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    outside_byte +%= 1;
+    if (which.* == 's') {
+        try b.spawn(sinkStream, .{b.io()});
+        try a.spawn(streamByte, .{ a.io(), b.ip4, outside_byte });
+    } else try a.spawn(fileByte, .{ a.io(), outside_byte });
+}
+
+fn sinkStream(io: Io) !void {
+    var l = try net.IpAddress.listen(&.{ .ip4 = .unspecified(9) }, io, .{});
+    defer l.deinit(io);
+    const s = try l.accept(io);
+    defer s.close(io);
+    var buf: [8]u8 = undefined;
+    var r = s.reader(io, &buf);
+    _ = r.interface.discardRemaining() catch {};
+}
+
+fn streamByte(io: Io, to: [4]u8, byte: u8) !void {
+    const s = try net.IpAddress.connect(&.{ .ip4 = .{ .bytes = to, .port = 9 } }, io, .{ .mode = .stream });
+    defer s.close(io);
+    var wbuf: [4]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    try w.interface.writeByte(byte);
+    try w.interface.flush();
+}
+
+fn fileByte(io: Io, byte: u8) !void {
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = "b", .data = &.{byte} });
+}
+
+test "checkDeterminism sees bytes drawn outside the simulation on a stream and on a disk too" {
+    for ("sf") |which| {
+        const case: search.Case = .{
+            .options = .{ .seed = 0, .stack_size = 256 * 1024 },
+            .setup = leakyStreamAndFileSetup,
+            .ctx = @constCast(&which),
+        };
+        try testing.expectError(error.NondeterministicData, search.checkDeterminism(testing.allocator, case, .{}));
+    }
+}
+
 var outside_count: u64 = 0;
 
 fn quietSetup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {

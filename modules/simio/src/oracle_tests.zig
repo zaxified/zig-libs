@@ -262,6 +262,15 @@ fn links(io: Io, dir: Dir, report: *Report) !void {
     // A dangling link and a loop.
     if (dir.readFile(io, "dangling", &buf)) |_| try w.writeAll("dangling=read\n") else |err| try w.print("dangling={t}\n", .{err});
     if (dir.readFile(io, "loop1", &buf)) |_| try w.writeAll("loop=read\n") else |err| try w.print("loop={t}\n", .{err});
+    // Names already taken, the wrong kind of thing, a link not followed.
+    if (dir.symLink(io, "x", "dangling", .{})) |_| try w.writeAll("symlink-taken=ok\n") else |err| try w.print("symlink-taken={t}\n", .{err});
+    if (dir.readLink(io, "real/sub/data.txt", &buf)) |_| try w.writeAll("readlink-file=ok\n") else |err| try w.print("readlink-file={t}\n", .{err});
+    if (dir.hardLink("real", dir, "dirhard", io, .{})) |_| try w.writeAll("hardlink-dir=ok\n") else |err| try w.print("hardlink-dir={t}\n", .{err});
+    if (dir.hardLink("real/sub/data.txt", dir, "dangling", io, .{})) |_| try w.writeAll("hardlink-taken=ok\n") else |err| try w.print("hardlink-taken={t}\n", .{err});
+    if (dir.openFile(io, "dangling", .{ .follow_symlinks = false })) |f| {
+        f.close(io);
+        try w.writeAll("nofollow=opened\n");
+    } else |err| try w.print("nofollow={t}\n", .{err});
     // A realpath resolves the links (relative to the directory).
     var root: [256]u8 = undefined;
     const root_len = try dir.realPath(io, &root);
@@ -340,6 +349,11 @@ test "differential oracle: one std.Io program gives the same results on Threaded
         \\stat=file size=11 lstat=sym_link size=12
         \\dangling=FileNotFound
         \\loop=SymLinkLoop
+        \\symlink-taken=PathAlreadyExists
+        \\readlink-file=NotLink
+        \\hardlink-dir=PermissionDenied
+        \\hardlink-taken=PathAlreadyExists
+        \\nofollow=SymLinkLoop
         \\realpath=real/sub/data.txt
         \\after-unlink=linked data
         \\hard nlink=2 survives=linked data

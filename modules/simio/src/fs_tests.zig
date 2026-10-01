@@ -653,3 +653,22 @@ test "links are names: durable after a directory sync, at the crash's mercy befo
     try testing.expect(seen[0] and seen[1] and seen[3]);
     try testing.expect(!seen[2]);
 }
+
+fn realPathOfRootFile(io: Io, out: *[64]u8, len: *usize) !void {
+    try Dir.cwd().writeFile(io, .{ .sub_path = "/top.txt", .data = "x" });
+    const f = try Dir.cwd().openFile(io, "/top.txt", .{});
+    defer f.close(io);
+    len.* = try f.realPath(io, out);
+}
+
+test "File.realPath of a file in the root directory" {
+    var sim: Sim = undefined;
+    newSim(&sim, 47);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    try h.spawn(realPathOfRootFile, .{ h.io(), &out, &len });
+    _ = sim.run();
+    try testing.expectEqualStrings("/top.txt", out[0..len]);
+}

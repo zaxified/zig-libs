@@ -823,6 +823,10 @@ test "a Unix socket path belongs to its host; a crash takes it away" {
     try b.spawn(unixPathsAreHostLocal, .{ b.io(), &other });
     _ = sim.runFor(std.time.ns_per_ms);
     try testing.expectEqual(@as(?anyerror, error.FileNotFound), other);
+    // The same path on another host is another socket: it can be taken too.
+    try b.spawn(unixEcho, .{ b.io(), "/run/app.sock" });
+    _ = sim.runFor(std.time.ns_per_ms);
+    try testing.expectEqual(@as(?anyerror, null), b.failure);
 
     sim.crash(a);
     sim.restart(a);

@@ -251,6 +251,18 @@ survives a crash; a shared lock keeps an exclusive one out; `..` walks up; a dir
 cannot move into its own subtree; an unsynced truncation may or may not survive.
 Second pass: 27/27 killed.
 
+### Completion features (2026-10-01, before the first push)
+
+30 schemata over what came after M5: symbolic and hard links, metadata, memory maps,
+Unix sockets, names, the data fingerprint and `Case.digest`, the watchdog. First
+pass: 19 killed (one as a hang), 11 survived; ten were holes, now tested — through
+the differential oracle where the real kernel can confirm the answer (a link over a
+taken name, `readlink` of a file, a hard link to a directory or over a taken name,
+opening a link without following it), and in simio (a file's realpath in `/`, a path
+per host for Unix sockets, leaked bytes on a stream and on a disk). Second pass:
+29/30 killed. The survivor is equivalent: dropping the counter bump in
+`Watchdog.enter` changes nothing, as `leave` bumps it on every switch too.
+
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a
