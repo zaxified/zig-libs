@@ -236,6 +236,18 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
 
 ## Backlog / deferred
 
+- **OPEN (2026-10-01, simio kv pilot): the spinlock deadlocks under a fiber/evented `Io`.**
+  `Db` holds its `std.atomic.Mutex` across `Storage` calls (`writeAll`, `sync`). Under an `Io`
+  that runs several tasks on one OS thread (`std.Io.Evented`, simio), a task that suspends
+  inside one of those calls hands the thread to the next task; if that task calls into the same
+  `Db`, `lockSpin` spins without ever reaching an `Io` call, and the holder never runs again.
+  Reproduced under simio (disk calls are preemption points there): two tasks of one host doing
+  `put` on one `Db` spin forever on the first seed; one task finishes 20 seeds in 75 ms. Under
+  `std.Io.Threaded` the same code only burns CPU for the length of an fsync. Fix options, a
+  decision: `std.Io.Mutex` when the store has an `Io` (`FsStorage` does; `SimStorage` does
+  not), or a documented "one task per `Db`" rule. Same question for every module whose
+  io-less lock is held across an `Io` call (the "repo-standard" spinlock is in ~25 modules;
+  most guard memory only and are unaffected).
 - **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (ecosystem-scanned): multi-week+
   build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with zero current consumers demanding
   scans/txn. When greenlit: steal-patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC
