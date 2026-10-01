@@ -12,9 +12,10 @@
 //! Epoch model: NTP timestamps are 64-bit fixed-point seconds since the NTP
 //! epoch 1900-01-01 (high 32 bits = seconds, low 32 bits = 1/2^32-second
 //! fraction), big-endian on the wire. Unix time is `NTP − 2208988800 s`.
-//! std's `std.time` timestamp helpers were removed in 0.16, so the local
-//! send/receive instants come from `std.posix.system.clock_gettime(.REALTIME)`
-//! (libc-free — the repo's pure-Zig invariant).
+//! `query` reads its local send/receive instants from the `std.Io` it is
+//! given (`Io.Timestamp.now(io, .real)`), so the same code runs against a
+//! simulated clock (`simio`); `nowUnixNanos` remains for callers without an
+//! `Io` (libc-free `clock_gettime(.REALTIME)`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -485,6 +486,11 @@ pub fn nowUnixNanos() ClockError!i128 {
     }
 }
 
+/// The wall clock as `io` sees it, as an NTP `Timestamp`.
+fn ioTimestamp(io: std.Io) Timestamp {
+    return Timestamp.fromUnixNanos(std.Io.Timestamp.now(io, .real).nanoseconds);
+}
+
 /// Current instant as an NTP `Timestamp`.
 pub fn nowTimestamp() ClockError!Timestamp {
     return Timestamp.fromUnixNanos(try nowUnixNanos());
@@ -549,8 +555,10 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
     defer sock.close(io);
 
     // T1: the real send instant — used for the offset/delay math in
-    // `validateReply`, nowhere else.
-    const t1 = try nowTimestamp();
+    // `validateReply`, nowhere else. Read through `io`, the same clock the
+    // receive deadline below uses (it used to be a direct `clock_gettime`,
+    // which a simulated `Io` cannot see).
+    const t1 = ioTimestamp(io);
 
     // The wire origin nonce (audit finding F4): a client Transmit Timestamp
     // built only from a wall-clock read is only as unpredictable as the
@@ -597,7 +605,7 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
             error.Canceled => return error.Canceled,
             else => return error.NetworkFailed,
         };
-        const t4 = try nowTimestamp(); // T4: local receive instant.
+        const t4 = ioTimestamp(io); // T4: local receive instant.
         const result = processReply(incoming.data, incoming.flags.trunc, incoming.from, dest, origin_nonce, t1, t4, kiss_out) orelse continue;
         return result;
     }
