@@ -2562,34 +2562,84 @@ pub const TcpServer = struct {
         // `sock` (this stack frame) outlives every concurrent writer to it.
         defer s.broker.remove(conn);
 
+        // Timeouts (CONNECT never sent, keep-alive lapsed) are enforced by a
+        // watchdog task that shuts the stream down, which wakes the read
+        // below. The read itself is a plain `std.Io` read: a cancellation
+        // point under any `Io`, with no `poll(2)` on the raw handle and no
+        // clock read outside `Io` — so the server also runs under a
+        // simulated `Io` (simio's mqtt pilot). It used to poll the socket
+        // with a timeout and read the wall clock through `clock_gettime`.
+        var watch: Watchdog = .{ .io = s.io, .stream = stream, .config = s.broker.config, .start_ms = nowMs(s.io) };
+        // No unit of concurrency for the watchdog: refuse the connection
+        // rather than serve it without its timeouts (same rule as `serve`).
+        var watch_task = s.io.concurrent(Watchdog.run, .{&watch}) catch return;
+        defer watch_task.cancel(s.io) catch {};
+
         var read_buf: [4096]u8 = undefined;
         while (true) {
-            // `null` = this thread was canceled while waiting (broker/server
-            // shutdown): reap the connection exactly like any other exit path
-            // here, same as a real transport failure would.
-            const readable = waitReadable(s.io, stream.socket.handle, connTimeoutMs(s.broker.config, conn)) orelse return;
-            if (!readable) {
-                // Pre-CONNECT: keep_alive_s is still 0 (unset) — bound the wait
-                // by connect_timeout_ms so a client that never sends CONNECT
-                // can't pin this slot/thread forever.
-                if (conn.state == .awaiting_connect) return;
-                if (s.broker.keepAliveExpired(conn, milliTimestamp())) return;
-                continue;
-            }
-            // Take-over (FIX C) or a contained delivery failure (FIX B) shuts
-            // this socket down and flips the connection to .disconnected; the
-            // read then returns EndOfStream/ReadFailed and we reap promptly.
-            // Routed through `std.Io.net.Stream.Reader` (not a raw
-            // `std.posix.read`) so a cancel arriving mid-read can actually
-            // interrupt it — a raw read restarts on the signal `Future.cancel`
-            // sends (EINTR) exactly like the `waitReadable` poll below.
+            // Take-over (FIX C), a contained delivery failure (FIX B) or the
+            // watchdog shuts this socket down; the read then returns
+            // EndOfStream/ReadFailed and we reap promptly. A cancel (server
+            // shutdown) ends the read the same way.
             var sr = stream.reader(s.io, &read_buf);
             sr.interface.fillMore() catch return;
             const n = sr.interface.bufferedLen();
+            const now = nowMs(s.io);
             s.broker.feed(conn, read_buf[0..n]) catch return;
-            const disp = s.broker.process(conn, milliTimestamp()) catch return;
+            const disp = s.broker.process(conn, now) catch return;
+            watch.observe(conn);
             if (disp == .close) return;
-            if (s.broker.keepAliveExpired(conn, milliTimestamp())) return;
+            if (s.broker.keepAliveExpired(conn, now)) return;
+        }
+    }
+};
+
+/// Wall-clock milliseconds through `io` — the clock `Broker.process` and
+/// `keepAliveExpired` take as `now`.
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
+
+/// Enforces one connection's timeouts from its own task: CONNECT must arrive
+/// within `connect_timeout_ms`, then a packet within 1.5 × keep-alive (spec
+/// 3.1.2.10). The connection's task publishes what it learns through
+/// atomics, so the two never share the `Connection` itself.
+const Watchdog = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    config: Config,
+    start_ms: i64,
+    connected: std.atomic.Value(bool) = .init(false),
+    keep_alive_s: std.atomic.Value(u16) = .init(0),
+    last_packet_ms: std.atomic.Value(i64) = .init(0),
+
+    fn observe(w: *Watchdog, conn: *const Connection) void {
+        w.keep_alive_s.store(conn.keep_alive_s, .release);
+        w.last_packet_ms.store(conn.last_packet_ms, .release);
+        if (conn.state != .awaiting_connect) w.connected.store(true, .release);
+    }
+
+    /// The instant after which the connection is dead; null = never.
+    fn deadline(w: *const Watchdog) ?i64 {
+        if (!w.connected.load(.acquire)) return w.start_ms + @as(i64, w.config.connect_timeout_ms);
+        const ka = w.keep_alive_s.load(.acquire);
+        if (ka == 0) return null;
+        return w.last_packet_ms.load(.acquire) + @as(i64, ka) * 1500;
+    }
+
+    fn run(w: *Watchdog) std.Io.Cancelable!void {
+        while (true) {
+            const now = nowMs(w.io);
+            const d = w.deadline() orelse {
+                // No keep-alive: nothing to enforce until something changes.
+                try w.io.sleep(.fromSeconds(1), .awake);
+                continue;
+            };
+            if (now > d) {
+                w.stream.shutdown(w.io, .both) catch {};
+                return;
+            }
+            try w.io.sleep(.fromMilliseconds(d - now + 1), .awake);
         }
     }
 };
@@ -2627,46 +2677,8 @@ const SocketTransport = struct {
     }
 };
 
-/// Poll a socket for readability, bounded by `timeout_ms` (-1 = indefinitely).
-/// Returns true if data is ready, false on timeout, `null` if this thread was
-/// canceled through `std.Io` while waiting. A poll failure (other than a
-/// cancel) is reported as "ready" so the blocking read surfaces the real
-/// error.
-///
-/// `std.posix.poll` is **not** a registered `std.Io` operation: it restarts
-/// itself on `EINTR`, so the signal `Future.cancel` sends is swallowed and
-/// the wait would otherwise run to its full timeout — indefinitely, for an
-/// idle keep-alive connection (`timeout_ms == -1`). `io.checkCancel` is
-/// checked explicitly after the wait ends, on both the "timed out" and the
-/// "poll itself failed" paths, so a cancel is never mistaken for either.
-fn waitReadable(io: std.Io, handle: std.Io.net.Socket.Handle, timeout_ms: i32) ?bool {
-    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    const ready = std.posix.poll(&fds, timeout_ms) catch {
-        io.checkCancel() catch return null;
-        return true;
-    };
-    if (ready != 0) return true;
-    io.checkCancel() catch return null;
-    return false;
-}
-
-/// The poll timeout (ms) for one iteration of `connMain`'s read loop.
-fn connTimeoutMs(config: Config, conn: *const Connection) i32 {
-    // Clamped, not `@intCast`: `connect_timeout_ms` is a `u32`, and any legal
-    // value above `maxInt(i32)` (~24.8 days) panicked in Debug and, in
-    // ReleaseFast, wrapped NEGATIVE — which `poll(2)` reads as "block
-    // indefinitely". A connection that opens a socket and never sends CONNECT
-    // would then pin its handler thread and its `max_connections` slot
-    // forever, which is exactly what this timeout exists to prevent.
-    if (conn.state == .awaiting_connect) {
-        return @intCast(@min(config.connect_timeout_ms, @as(u32, std.math.maxInt(i32))));
-    }
-    if (conn.keep_alive_s == 0) return -1;
-    return @intCast(@as(u32, conn.keep_alive_s) * 1500);
-}
-
-/// Wall-clock milliseconds (std.time.milliTimestamp was removed in 0.16).
-/// libc-free via std.posix.system.clock_gettime (the repo's pure-Zig invariant).
+/// Wall-clock milliseconds for the loopback stress tests below, which pace
+/// real threads (the server itself reads time through `Io`: `nowMs`).
 fn milliTimestamp() i64 {
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.REALTIME, &ts);
@@ -2677,59 +2689,52 @@ fn milliTimestamp() i64 {
 
 const testing = std.testing;
 
-// ── cancellation ─────────────────────────────────────────────────────────
-//
-// `waitReadable` backs `TcpServer.connMain`'s per-connection read loop. Its
-// `std.posix.poll` is not a registered `std.Io` operation, so the signal
-// `Future.cancel` would otherwise rely on is never even sent to a thread
-// parked in it — the exact non-obvious defect this whole cancellation effort
-// exists to close. Without the explicit `io.checkCancel` inside
-// `waitReadable`, a canceled connection handler thread would sit through the
-// *entire* poll timeout before ever reacting — indefinitely, for an idle
-// keep-alive connection (`timeout_ms == -1` in production).
-//
-// The cancel therefore only becomes visible once the poll's own timeout
-// elapses (there is nothing here that interrupts it early) — keep the
-// configured timeout small, as enip's equivalent test does, or this slows
-// the module suite down.
+// ── TcpServer over real sockets ────────────────────────────────────────────
 
-fn acceptOne(server: *std.Io.net.Server, io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
-    return server.accept(io);
+fn serveTask(srv: *TcpServer) void {
+    srv.serve() catch {};
 }
 
-/// The blocking call under test, on its own thread so it can be canceled.
-fn waitReadableOnce(io: std.Io, handle: std.Io.net.Socket.Handle, timeout_ms: i32) ?bool {
-    return waitReadable(io, handle, timeout_ms);
-}
-
-test "a cancel during waitReadable's poll surfaces as null, not a timeout" {
+test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Port 0: an ephemeral port cannot collide with a parallel test run.
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
-    };
-    defer server.deinit(io);
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var srv = TcpServer.init(io, &b);
+    srv.bind("127.0.0.1", 0) catch return error.SkipZigTest; // no loopback here
+    defer srv.deinit();
+    var serving = try io.concurrent(serveTask, .{&srv});
 
-    var accept_fut = try io.concurrent(acceptOne, .{ &server, io });
-    var client_stream = std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream }) catch |err| {
-        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
-    };
-    defer client_stream.close(io);
-    var peer = try accept_fut.await(io);
-    defer peer.close(io);
+    const stream = try srv.boundAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var buf: [64]u8 = undefined;
+    var wbuf: [64]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(try packet.encodeConnect(&buf, .{ .client_id = "loop", .keep_alive_s = 30 }));
+    try w.interface.flush();
+    var rbuf: [64]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const ack = try r.interface.takeArray(4);
+    try testing.expectEqual(@as(u8, 0x20), ack[0]); // CONNACK
+    try testing.expectEqual(@as(u8, 0), ack[3]); // accepted
 
-    // Nobody ever writes: the poll is genuinely parked for its whole timeout.
-    var fut = try io.concurrent(waitReadableOnce, .{ io, client_stream.socket.handle, @as(i32, 600) });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    const result = fut.cancel(io);
-    try testing.expectEqual(@as(?bool, null), result);
+    srv.shutdown();
+    serving.await(io);
+}
+
+test "the watchdog's deadlines: CONNECT timeout up to maxInt(u32) ms, then 1.5 x keep-alive (re-audit F3)" {
+    // F3 was a `u32` timeout wrapping negative on its way into poll(2); the
+    // watchdog adds it to an i64 instead, so every legal value is a deadline
+    // in the future.
+    var w: Watchdog = .{ .io = undefined, .stream = undefined, .config = .{ .connect_timeout_ms = std.math.maxInt(u32) }, .start_ms = 1000 };
+    try testing.expectEqual(@as(?i64, 1000 + @as(i64, std.math.maxInt(u32))), w.deadline());
+    w.connected.store(true, .release);
+    try testing.expectEqual(@as(?i64, null), w.deadline()); // keep-alive 0: no deadline
+    w.keep_alive_s.store(10, .release);
+    w.last_packet_ms.store(5000, .release);
+    try testing.expectEqual(@as(?i64, 5000 + 15_000), w.deadline());
 }
 
 /// Scripted fake client side of the seam: captures everything the broker writes
@@ -2942,26 +2947,6 @@ test "the retained walk is bounded even for a single filter (re-audit F1)" {
     // Each entry is ~6 topic + 10 payload bytes, so 40 bytes admits 2.
     try testing.expect(ts2.packets - before2 < 6);
     try testing.expectEqual(@as(u64, 1), b2.retainedTruncations());
-}
-
-test "connTimeoutMs clamps rather than wrapping negative (re-audit F3)" {
-    // `connect_timeout_ms` is a `u32`. Above `maxInt(i32)` — ~24.8 days, a
-    // legal value — the `@intCast` panicked in Debug and wrapped NEGATIVE in
-    // ReleaseFast, which `poll(2)` reads as "block indefinitely". The
-    // connection that opens a socket and never sends CONNECT would then pin
-    // its handler thread and its `max_connections` slot forever: exactly the
-    // wedge this timeout exists to prevent.
-    var b = Broker.init(testing.allocator, .{});
-    defer b.deinit();
-    var tt = TestTransport{};
-    const conn = try b.accept(tt.transport());
-    try testing.expectEqual(Connection.State.awaiting_connect, conn.state);
-    for ([_]u32{ 0, 1, 30_000, std.math.maxInt(i32), std.math.maxInt(i32) + 1, std.math.maxInt(u32) }) |ms| {
-        const got = connTimeoutMs(.{ .connect_timeout_ms = ms }, conn);
-        try testing.expect(got >= 0);
-    }
-    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), connTimeoutMs(.{ .connect_timeout_ms = std.math.maxInt(u32) }, conn));
-    try testing.expectEqual(@as(i32, 30_000), connTimeoutMs(.{ .connect_timeout_ms = 30_000 }, conn));
 }
 
 test "connect A + B → both receive an accepted CONNACK" {
@@ -4087,11 +4072,6 @@ test "FIX D: credential auth allow threads the username; ACL gates pub + sub" {
     try expectDelivered(&ts, "ok/y");
     // The denied publish never reached the subscriber (only ok/y did).
     try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
-}
-
-test "TcpServer compiles (never bound or dialed in tests)" {
-    if (true) return error.SkipZigTest;
-    std.testing.refAllDecls(TcpServer);
 }
 
 // ── multi-threaded stress / race pass (real loopback sockets) ────────────────

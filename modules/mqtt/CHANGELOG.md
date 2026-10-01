@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `TcpServer` runs on `std.Io` alone: the per-connection
+  read loop no longer polls the raw socket (`std.posix.poll`) or reads the
+  wall clock with `clock_gettime`. Connection timeouts (CONNECT, 1.5 ×
+  keep-alive) are enforced by a watchdog task per connection that shuts the
+  stream down; the read is a plain `Io` read; `now` comes from
+  `Io.Timestamp.now(io, .real)`. Same timeouts, one extra task per
+  connection, and the server now works under a simulated `Io` (simio's mqtt
+  pilot). `waitReadable`, `connTimeoutMs` and their tests are gone with the
+  poll (re-audit F3's overflow cannot occur: the timeout is added to an
+  `i64`, tested on the watchdog). `TcpServer` gets its first real test, over
+  loopback.
 - **2026-09-29** — Broker: `Config.tap_wills` (off by default) hands a Will to the publish tap
   (`onPublishFn`) when an ungraceful end publishes it, so a recorder or bridge built on the tap
   no longer loses Wills; the verdict is honoured (`.consume`/`.refuse` keep it from subscribers
