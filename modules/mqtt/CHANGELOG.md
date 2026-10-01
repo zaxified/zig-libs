@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Independent review of the QoS 2 + 5.0 broker**, fixes with tests: two
+  same-id 5.0 CONNECTs could deadlock (a take-over superseded a connection still inside its
+  CONNECT; its DISCONNECT 0x8E blocked on the other `tx_lock`) — only connected ones are
+  superseded, the 0x8E goes via `tryLock` before the close; **an offline session's expiry now
+  counts from the close, not the last packet** (also 3.1.1 + `session_expiry_ms`: an idle
+  keep-alive-0 client lost its session at the next sweep — ⚠ behaviour change, sessions live
+  longer); only DISCONNECT 0x00 discards the Will; a resume paces its resends within the new
+  connection's Receive Maximum / Maximum Packet Size; `deinit` no longer leaks a discarded session
+  a connection still holds; expired retained and queued messages are swept by `expireSessions`;
+  a PUBREC for a QoS 1 id gets 0x92. See SPEC "Review 2026-10-01".
 - **2026-10-01** — Docs: SPEC/README describe QoS 2 in the broker and MQTT 5.0 in all three
   layers; scope raised mvp → core (grade 3 → 2). Tests: the `TcpServer` loopback test and the
   stress pass skip cleanly where 127.0.0.1 binds but does not connect (`unshare -n`); the

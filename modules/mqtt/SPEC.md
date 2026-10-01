@@ -6,7 +6,7 @@
 
 **Scope:** core — Eclipse Mosquitto 2.x broker + client libraries: MQTT 3.1.1 and 5.0, QoS 0–2 both ways, sessions with expiry, shared subscriptions, properties end to end; broker extended auth, `$SYS`, bridging and persistence absent (surveyed 2026-09-30; raised from mvp 2026-10-01 with MQTT 5.0 and broker QoS 2)
 
-**Audit:** review 2026-09-16 · mutation 2026-10-01
+**Audit:** review 2026-10-01 · mutation 2026-10-01
 
 **Known defects:** none recorded
 
@@ -283,6 +283,28 @@ is written after `Broker.mutex` is released (`Superseded`, a reference held, the
 `tellSuperseded`) — never a write under the registry lock. *Not implemented:* extended
 authentication (a CONNECT naming a method gets 0x8C), outbound topic aliases, Response
 Information, Reason Strings from the broker.
+
+## Review 2026-10-01 (independent, of the QoS 2 + 5.0 broker work)
+A read-only adversarial review (Sonnet, coordinator-verified) reported 12 findings; each was
+checked against the code. **Fixed, each with a test** ("review F<n>: …") and a mutant that
+reverts the fix (55/55 killed): **F1** `takeover` superseded a connection still inside its own
+CONNECT (whose state was then set back to `.connected`); with the take-over's DISCONNECT taking
+the other connection's `tx_lock` while holding its own, two same-id 5.0 CONNECTs could deadlock —
+now only `.connected` connections are superseded, a CONNECT closed meanwhile aborts, and (F2) the
+0x8E goes only through `tryLock` before the socket is closed, so a writer blocked on a dead peer
+never stalls the new connection. **F3** an offline session's expiry counted from the connection's
+last packet, not its close — an idle keep-alive-0 client lost its session at the next sweep; also
+3.1.1 with `session_expiry_ms` (pre-existing, production path). **F5** only DISCONNECT 0x00
+discards the Will (5.0 3.14.4-3). **F6** a resume resent every in-flight message regardless of the
+new connection's Receive Maximum / Maximum Packet Size — now `resend` marks them and `pumpLocked`
+paces them. **F7** `deinit` leaked a discarded session still held by a connection (pre-existing).
+**F8** expired retained/queued messages lingered against the caps — swept in `expireSessions`.
+**F9a** a Will survived an OOM in `createSession`. **F11** a PUBREC for a QoS 1 id got a success
+PUBREL on the clean path. **Not changed:** F4 (No Local on `$share/` is refused by the codec at
+decode, 3.8.3-4 — the review had not read that part); F10 (3.2.2-19/20 bound Reason String and
+User Property, which the broker never sends in CONNACK); F9b (the two refusal CONNACKs written
+with `Broker.mutex` held go to the new connection's own fresh socket; pre-existing, kept); F12
+documented on `Config.topic_alias_maximum`.
 
 ## Verification
 **External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the

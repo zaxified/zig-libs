@@ -228,6 +228,11 @@ const TxLock = struct {
     pub fn unlock(l: *TxLock) void {
         if (l.io) |io| l.mutex.unlock(io) else l.spin.unlock();
     }
+
+    pub fn tryLock(l: *TxLock) bool {
+        if (l.io != null) return l.mutex.tryLock();
+        return !l.spin.locked.swap(true, .acquire);
+    }
 };
 
 // ── per-connection state ────────────────────────────────────────────────────
@@ -489,6 +494,10 @@ const Message = struct {
     /// QoS 2: the client's PUBREC arrived and PUBREL went out, so a resume
     /// resends the PUBREL, never the PUBLISH (spec 4.3.3-6, 4.4).
     released: bool = false,
+    /// In flight but not yet sent on the session's current connection: a
+    /// resume marks every in-flight message so, and `pumpLocked` resends them
+    /// in order as the client's Receive Maximum allows.
+    resend: bool = false,
 
     fn ids(m: Message) []const u32 {
         return std.mem.bytesAsSlice(u32, m.bytes[0 .. m.ids_len * 4]);
@@ -1093,8 +1102,10 @@ pub const Config = struct {
     max_queued_messages: usize = 1000,
     /// Per session: the bytes (topic + payload) those messages may hold.
     max_queued_bytes: usize = 1 << 20,
-    /// How long an offline session is kept, measured from its connection's
-    /// last packet, when the caller runs `expireSessions`. 0 = for ever,
+    /// How long an offline session is kept, measured from when its connection
+    /// closed (the latest time the broker had been given then: a packet's
+    /// `now`, an `expireSessions` or `publishDueWills` call), when the caller
+    /// runs `expireSessions`. 0 = for ever,
     /// which is what MQTT 3.1.1 itself specifies; the broker never expires a
     /// session on its own, having no clock.
     session_expiry_ms: u64 = 0,
@@ -1197,7 +1208,9 @@ pub const Config = struct {
 
     /// 5.0: Topic Aliases a client may use toward the broker (announced in
     /// CONNACK as Topic Alias Maximum). Each costs one owned topic copy per
-    /// connection while set. 0 = none.
+    /// connection while set — up to this many topics of up to
+    /// `max_packet_size` bytes each, per connection, in no other cap; the
+    /// table itself is 16 bytes a slot, made at the first alias. 0 = none.
     topic_alias_maximum: u16 = 16,
 };
 
@@ -1335,6 +1348,9 @@ pub const Broker = struct {
         // Sessions are freed below, whatever their reference count says, so a
         // connection must not release its reference on the way out.
         for (b.connections.items) |conn| {
+            // A session already discarded (no longer in `sessions`) is freed
+            // only by its last reference — possibly this one (review F7).
+            if (conn.session) |x| if (!x.registered) b.releaseSession(x);
             conn.session = null;
             b.freeConnection(conn);
         }
@@ -1673,6 +1689,7 @@ pub const Broker = struct {
             b.mutex.lock();
             defer b.mutex.unlock();
             b.now_hint = @max(b.now_hint, now);
+            b.sweepExpiredLocked(now);
             var i: usize = 0;
             while (i < b.sessions.items.len) {
                 const x = b.sessions.items[i];
@@ -2191,12 +2208,13 @@ pub const Broker = struct {
                         }
                         conn.session_expiry_s = b.cappedExpiry(sei);
                     }
-                    // A DISCONNECT is the client saying this was deliberate, so
-                    // the Will is discarded and never published (spec 3.14.4) —
-                    // unless a 5.0 client asks for it anyway (reason 0x04).
+                    // A normal DISCONNECT is the client saying this was
+                    // deliberate, so the Will is discarded and never published
+                    // (spec 3.14.4; 5.0 3.14.4-3: reason 0x00 only — 0x04 asks
+                    // for the Will, and any failure code is not a normal end).
                     // Dropping it here is also what makes "a will is still set"
                     // the test `remove` uses for an ungraceful end.
-                    if (d.reason_code != .disconnect_with_will_message) b.dropWill(conn);
+                    if (d.reason_code == packet.ReasonCode.normal_disconnection) b.dropWill(conn);
                     // Clean session: routing state is dropped on disconnect.
                     // A persistent one keeps it and goes offline.
                     b.mutex.lock();
@@ -2343,6 +2361,12 @@ pub const Broker = struct {
             b.mutex.lock();
             defer b.mutex.unlock();
             b.now_hint = @max(b.now_hint, now);
+            // Closed while it authenticated (a contained delivery failure, a
+            // shutdown): nothing to establish.
+            if (conn.state == .disconnected) {
+                b.dropWill(conn);
+                return .close;
+            }
             const existing = b.findSession(conn.clientId());
             // ⛔ A client id is not an identity (egw audit S1 R3): another
             // account that knows it would otherwise resume the session —
@@ -2367,7 +2391,10 @@ pub const Broker = struct {
             }
             // Allocated before the take-over, so running out of memory here
             // leaves the earlier connection alone.
-            const fresh: ?*Session = if (create) try b.createSession(conn.clientId(), conn.usernameOpt()) else null;
+            const fresh: ?*Session = if (create) b.createSession(conn.clientId(), conn.usernameOpt()) catch |e| {
+                b.dropWill(conn); // never connected: no Will (review F9)
+                return e;
+            } else null;
             b.takeover(conn, &owed);
             if (existing) |x| {
                 if (resuming) {
@@ -2479,7 +2506,13 @@ pub const Broker = struct {
             defer x.lock.unlock();
             if (x.conn != conn) return; // taken over: the session lives on elsewhere
             x.conn = null;
-            x.offline_since_ms = conn.last_packet_ms;
+            // From the close, not the last packet (5.0 3.1.2-23: kept for the
+            // interval AFTER the connection closes): an idle keep-alive-0
+            // connection that drops would otherwise lose its session at the
+            // next sweep (review 2026-10-01 F3). The broker reads no clock;
+            // `now_hint` is the latest time it was given — `TcpServer`'s
+            // upkeep moves it every second.
+            x.offline_since_ms = @max(conn.last_packet_ms, b.now_hint);
         }
         if (conn.version == .v5) {
             // 5.0: the session lasts its Session Expiry Interval past the
@@ -2487,6 +2520,41 @@ pub const Broker = struct {
             x.expiry_s = conn.session_expiry_s;
             if (conn.session_expiry_s == 0) b.discardSession(x);
         } else x.expiry_s = null;
+    }
+
+    /// Delete retained and queued messages whose 5.0 Message Expiry ran out
+    /// (3.3.2-5): left in place they would hold `max_retained` /
+    /// `max_retained_store_bytes` and the session queue bounds against live
+    /// messages until something read past them (review 2026-10-01 F8).
+    /// Caller holds `mutex`.
+    fn sweepExpiredLocked(b: *Broker, now: i64) void {
+        var i: usize = 0;
+        while (i < b.retained.items.len) {
+            const r = b.retained.items[i];
+            if (r.expires_at) |at| if (at <= now) {
+                b.clearRetained(r.topic); // swap-removes index i
+                _ = b.messages_expired.fetchAdd(1, .monotonic);
+                continue;
+            };
+            i += 1;
+        }
+        for (b.sessions.items) |x| {
+            x.lock.lock();
+            defer x.lock.unlock();
+            const live = x.queue.items[x.queue_head..];
+            var kept: usize = 0;
+            for (live) |m| {
+                if (m.expires_at) |at| if (at <= now) {
+                    x.queued_bytes -= m.bytes.len;
+                    b.allocator.free(m.bytes);
+                    _ = b.messages_expired.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                x.queue.items[x.queue_head + kept] = m;
+                kept += 1;
+            }
+            x.queue.items.len = x.queue_head + kept;
+        }
     }
 
     /// A 5.0 Session Expiry Interval held to `Config.session_expiry_ms` when
@@ -2575,8 +2643,15 @@ pub const Broker = struct {
         _ = b.queue_drops.fetchAdd(1, .monotonic);
     }
 
+    /// Send what the session owes this connection, while `conn` is the
+    /// session's connection and the client's window has room: first in-flight
+    /// messages a resume marked for resending (oldest first, 4.6.0-1; with DUP
+    /// and their original ids, or as PUBREL once released), then queued ones,
+    /// which move into flight. Caller holds `conn.tx_lock`. A failed write
+    /// leaves its message in flight, so it goes again on the next resume.
     fn pumpLocked(b: *Broker, conn: *Connection, x: *Session, now: i64) Error!void {
-        // 5.0: never more unacknowledged than the client takes (3.3.4-9).
+        // 5.0: never more unacknowledged than the client takes (3.3.4-9) —
+        // counting only what is on THIS connection's wire.
         const window = @min(max_in_flight, conn.client_receive_maximum);
         while (true) {
             var bytes: []const u8 = undefined;
@@ -2584,55 +2659,79 @@ pub const Broker = struct {
                 x.lock.lock();
                 defer x.lock.unlock();
                 if (x.conn != conn or conn.state != .connected) return;
-                if (x.inflight.items.len >= window) return;
-                var m = x.popQueue() orelse return;
-                // Waited past its Message Expiry: deleted, not sent (3.3.2-5).
-                const expiry = remainingExpiry(m.expires_at, now) orelse {
-                    b.allocator.free(m.bytes);
-                    _ = b.messages_expired.fetchAdd(1, .monotonic);
-                    continue;
-                };
-                m.id = x.allocId();
-                // Cannot fail for size in 3.1.1: every message was held to
-                // `max_packet_size` when it arrived, and `tx_buf` has
-                // `tx_headroom` for the id. Under 5.0 the client's own limit
-                // can refuse it; it is dropped then, as if delivered.
-                const p = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, false, m.id, m.ids(), expiry);
-                if (!b.fits(conn, p)) {
-                    b.allocator.free(m.bytes);
-                    continue;
+                var on_wire: usize = 0;
+                var next_resend: ?usize = null;
+                for (x.inflight.items, 0..) |m, i| {
+                    if (!m.resend) on_wire += 1 else if (next_resend == null) next_resend = i;
                 }
-                bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
-                    b.allocator.free(m.bytes);
-                    b.countDrop(x);
-                    continue;
-                };
-                x.inflight.appendAssumeCapacity(m);
+                if (on_wire >= window) return;
+                if (next_resend) |i| {
+                    const m = &x.inflight.items[i];
+                    m.resend = false;
+                    if (m.released) {
+                        bytes = try packet.encodePacket(conn.tx_buf, conn.version, .{ .pubrel = .{ .packet_id = m.id } });
+                    } else {
+                        // Expiry is not applied once a PUBLISH has gone
+                        // (4.3.3-7): a resend carries at least one second.
+                        const expiry: ?u32 = if (m.expires_at) |at| secondsLeft(at, now, 1) else null;
+                        const p = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, true, m.id, m.ids(), expiry);
+                        // Too large for the client that came back: discarded
+                        // as if delivered (3.1.2-25, review F6).
+                        if (!b.fits(conn, p)) {
+                            b.allocator.free(x.inflight.orderedRemove(i).bytes);
+                            continue;
+                        }
+                        bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+                            b.allocator.free(x.inflight.orderedRemove(i).bytes);
+                            b.countDrop(x);
+                            continue;
+                        };
+                    }
+                } else {
+                    if (x.inflight.items.len >= max_in_flight) return;
+                    var m = x.popQueue() orelse return;
+                    // Waited past its Message Expiry: deleted, not sent (3.3.2-5).
+                    const expiry = remainingExpiry(m.expires_at, now) orelse {
+                        b.allocator.free(m.bytes);
+                        _ = b.messages_expired.fetchAdd(1, .monotonic);
+                        continue;
+                    };
+                    m.id = x.allocId();
+                    // Cannot fail for size in 3.1.1: every message was held to
+                    // `max_packet_size` when it arrived, and `tx_buf` has
+                    // `tx_headroom` for the id. Under 5.0 the client's own limit
+                    // can refuse it; it is dropped then, as if delivered.
+                    const p = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, false, m.id, m.ids(), expiry);
+                    if (!b.fits(conn, p)) {
+                        b.allocator.free(m.bytes);
+                        continue;
+                    }
+                    bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+                        b.allocator.free(m.bytes);
+                        b.countDrop(x);
+                        continue;
+                    };
+                    x.inflight.appendAssumeCapacity(m);
+                }
             }
             try conn.write(bytes);
         }
     }
 
+    /// A resume (spec 4.4): every in-flight message of `x` is owed again —
+    /// unacknowledged PUBLISHes with DUP, released QoS 2 ones as PUBREL — and
+    /// `pumpLocked` sends them, oldest first, within the NEW connection's
+    /// Receive Maximum and Maximum Packet Size (review 2026-10-01 F6: they
+    /// used to go all at once, whatever the client announced). Caller holds
+    /// `conn.tx_lock`.
     fn resendLocked(b: *Broker, conn: *Connection, x: *Session, now: i64) Error!void {
-        _ = b;
-        var i: usize = 0;
-        while (true) : (i += 1) {
-            var bytes: []const u8 = undefined;
-            {
-                x.lock.lock();
-                defer x.lock.unlock();
-                if (x.conn != conn or i >= x.inflight.items.len) return;
-                const m = x.inflight.items[i];
-                // Expiry is not applied once a PUBLISH has gone (4.3.3-7): a
-                // resend carries at least one second of it.
-                const expiry: ?u32 = if (m.expires_at) |at| secondsLeft(at, now, 1) else null;
-                bytes = if (m.released)
-                    try packet.encodePacket(conn.tx_buf, conn.version, .{ .pubrel = .{ .packet_id = m.id } })
-                else
-                    try packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, true, m.id, m.ids(), expiry) });
-            }
-            try conn.write(bytes);
+        {
+            x.lock.lock();
+            defer x.lock.unlock();
+            if (x.conn != conn) return;
+            for (x.inflight.items) |*m| m.resend = true;
         }
+        try b.pumpLocked(conn, x, now);
     }
 
     /// Caller holds `mutex`. Supersede any live connection sharing the new
@@ -2665,7 +2764,12 @@ pub const Broker = struct {
         const id = newconn.clientId();
         for (b.connections.items) |other| {
             if (other == newconn) continue;
-            if (other.state == .disconnected) continue;
+            // Only an established connection holds the id (as in
+            // `claimedByAnother`): one still inside its own CONNECT has not
+            // claimed it, and superseding it raced that CONNECT — its state
+            // was set back to `.connected` afterwards and the two could each
+            // supersede the other (review 2026-10-01 F1).
+            if (other.state != .connected) continue;
             if (std.mem.eql(u8, other.clientId(), id)) {
                 b.dropSubscriptions(other);
                 other.state = .disconnected;
@@ -2684,10 +2788,21 @@ pub const Broker = struct {
         }
     }
 
+    /// Best effort: the DISCONNECT goes only when the connection's `tx_lock`
+    /// is free right now. A writer holding it may be blocked on the very dead
+    /// peer this take-over is about; waiting for it would stall the new
+    /// connection, and the close below is what wakes that writer (FIX C,
+    /// review 2026-10-01 F2).
     fn tellSuperseded(b: *Broker, owed: *const Superseded) void {
         _ = b;
         for (owed.conns[0..owed.n]) |other| {
-            writeDisconnect(other, .session_taken_over);
+            if (other.tx_lock.tryLock()) {
+                defer other.tx_lock.unlock();
+                var buf: [4]u8 = undefined;
+                if (packet.encodePacket(&buf, .v5, .{ .disconnect = .{ .reason_code = .session_taken_over } })) |bytes| {
+                    other.write(bytes) catch {};
+                } else |_| {}
+            }
             other.transport.close(); // FIX C, as in `takeover`
             _ = other.refs.fetchSub(1, .release);
         }
@@ -3155,8 +3270,11 @@ pub const Broker = struct {
             };
             x.lock.unlock();
         } else if (conn.pendingIndex(id)) |i| {
-            if (conn.pending[i].phase == .pubrec) conn.pending[i].phase = .pubcomp;
-            known = true;
+            // A QoS 1 id is not a QoS 2 delivery (review F11).
+            if (conn.pending[i].phase != .puback) {
+                conn.pending[i].phase = .pubcomp;
+                known = true;
+            }
         }
         var buf: [8]u8 = undefined;
         const reason: packet.ReasonCode = if (known or conn.version != .v5) .success else .packet_identifier_not_found;
@@ -7081,19 +7199,19 @@ test "v5 sessions: Session Expiry keeps one, Clean Start 0 resumes it, expiry 0 
 
     // Back with expiry 0: resumed — and over when this connection is.
     var t2 = TestTransport{};
-    const s2 = try connect5(&b, &t2, .{ .client_id = "s", .clean_session = false }, 1000);
+    const s2 = try connect5(&b, &t2, .{ .client_id = "s", .clean_session = false }, 60_000);
     try testing.expect(s2.connack.session_present);
     try testing.expectEqualStrings("kept", (try next5(&t2)).?.publish.payload);
-    _ = try send5(&b, s2.conn, .{ .disconnect = .{} }, 1001);
+    _ = try send5(&b, s2.conn, .{ .disconnect = .{} }, 60_001);
     b.remove(s2.conn);
     try testing.expectEqual(@as(usize, 0), b.sessionCount());
 
     // A session expires on its own interval, not the config's.
     var t3 = TestTransport{};
-    const s3 = try connect5(&b, &t3, .{ .client_id = "e", .properties = .{ .session_expiry_interval = 10 } }, 0);
-    b.remove(s3.conn);
-    try testing.expectEqual(@as(usize, 0), b.expireSessions(9_999));
-    try testing.expectEqual(@as(usize, 1), b.expireSessions(10_000));
+    const s3 = try connect5(&b, &t3, .{ .client_id = "e", .properties = .{ .session_expiry_interval = 10 } }, 61_000);
+    b.remove(s3.conn); // offline since 61 000: the close, the latest time given
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(70_999));
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(71_000));
 
     // Clean Start 1 discards what there was, even when it keeps a new one.
     var t4 = TestTransport{};
@@ -7417,9 +7535,9 @@ test "v5 Will: properties forwarded, Will Delay honoured, cancelled by a return,
     var t4 = TestTransport{};
     var short = will;
     short.properties.will_delay_interval = 60;
-    const w4 = try connect5(&b, &t4, .{ .client_id = "x", .will = short, .properties = .{ .session_expiry_interval = 2 } }, 0);
+    const w4 = try connect5(&b, &t4, .{ .client_id = "x", .will = short, .properties = .{ .session_expiry_interval = 2 } }, 30_000);
     b.remove(w4.conn);
-    try testing.expectEqual(@as(usize, 1), b.expireSessions(2_000));
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(32_000));
     try testing.expect((try next5(&ts)).? == .publish);
 
     // DISCONNECT 0x04: a deliberate end that still wants its Will.
@@ -7495,4 +7613,143 @@ test "v5 UNSUBACK: Success, or No subscription existed, per filter" {
     _ = (try next5(&tt)).?;
     _ = try send5(&b, c.conn, .{ .unsubscribe = .{ .packet_id = 2, .filters = &.{ "a", "b" } } }, 0);
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x11 }, (try next5(&tt)).?.unsuback.codes);
+}
+
+// ── review 2026-10-01: one test per confirmed finding ───────────────────────
+
+const ReentrantAuth = struct {
+    b: *Broker,
+    other: *Connection,
+    other_connect: []const u8,
+    fired: bool = false,
+
+    /// While the first CONNECT authenticates, a second one with the same
+    /// client id is processed to completion — the interleaving F1 needed.
+    fn auth(ctx: ?*anyopaque, req: AuthRequest) AuthDecision {
+        const self: *ReentrantAuth = @ptrCast(@alignCast(ctx.?));
+        if (!self.fired and std.mem.eql(u8, req.client_id, "dup")) {
+            self.fired = true;
+            self.b.feed(self.other, self.other_connect) catch {};
+            _ = self.b.process(self.other, 2) catch {};
+        }
+        return .allow;
+    }
+};
+
+test "review F1: a CONNECT still authenticating is not superseded; the later-finishing one takes over cleanly" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tb = TestTransport{};
+    var tc = TestTransport{};
+    const first = try b.accept(tb.transport());
+    const second = try b.accept(tc.transport());
+    var cbuf: [64]u8 = undefined;
+    const c_bytes = try packet.encodeConnect(&cbuf, .{ .client_id = "dup", .version = .v5 });
+    var ra = ReentrantAuth{ .b = &b, .other = second, .other_connect = c_bytes };
+    b.config.authenticateFn = ReentrantAuth.auth;
+    b.config.auth_ctx = &ra;
+    var bbuf: [64]u8 = undefined;
+    try b.feed(first, try packet.encodeConnect(&bbuf, .{ .client_id = "dup", .version = .v5 }));
+    try testing.expectEqual(Disposition.keep, try b.process(first, 1));
+    // The first connection got its CONNACK, and nothing before it (3.14.0-1).
+    try testing.expect((try next5(&tb)).? == .connack);
+    try testing.expectEqual(Connection.State.connected, first.state);
+    // The second finished first, and was superseded when the first did.
+    try testing.expect((try next5(&tc)).? == .connack);
+    try testing.expectEqual(packet.ReasonCode.session_taken_over, (try next5(&tc)).?.disconnect.reason_code);
+    try testing.expectEqual(Connection.State.disconnected, second.state);
+}
+
+test "review F3: session expiry counts from the close, not from the last packet" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "idle", .properties = .{ .session_expiry_interval = 60 } }, 0);
+    // Keep-alive 0, idle ten minutes (the upkeep moves the broker's clock),
+    // then the link drops.
+    _ = b.publishDueWills(600_000);
+    b.remove(c.conn);
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(659_999));
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(660_000));
+}
+
+test "review F5: only a normal DISCONNECT discards the Will; a failure code publishes it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "will" }});
+    _ = (try ts.next()).?;
+    var tw = TestTransport{};
+    const w = try connect5(&b, &tw, .{ .client_id = "w", .will = .{ .topic = "will", .message = "bye" } }, 0);
+    _ = try send5(&b, w.conn, .{ .disconnect = .{ .reason_code = .unspecified_error } }, 1);
+    b.remove(w.conn);
+    try testing.expectEqualStrings("bye", (try ts.next()).?.publish.payload);
+}
+
+test "review F6: a resume resends within the new connection's Receive Maximum, the rest as acks free it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connect5(&b, &t1, .{ .client_id = "r", .properties = .{ .session_expiry_interval = 60 } }, 0);
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&t1)).?;
+    for ([_][]const u8{ "1", "2", "3" }) |m| try b.publish("t", m, .at_least_once, false);
+    var ids: [3]u16 = undefined;
+    for (&ids) |*id| id.* = (try next5(&t1)).?.publish.packet_id;
+    b.remove(s1.conn); // none acknowledged
+
+    var t2 = TestTransport{};
+    const s2 = try connect5(&b, &t2, .{ .client_id = "r", .clean_session = false, .properties = .{ .session_expiry_interval = 60, .receive_maximum = 1 } }, 1);
+    try testing.expect(s2.connack.session_present);
+    const first = (try next5(&t2)).?.publish;
+    try testing.expect(first.dup);
+    try testing.expectEqual(ids[0], first.packet_id);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t2)); // the window is 1
+    _ = try send5(&b, s2.conn, .{ .puback = .{ .packet_id = ids[0] } }, 2);
+    const second = (try next5(&t2)).?.publish;
+    try testing.expect(second.dup);
+    try testing.expectEqual(ids[1], second.packet_id);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t2));
+}
+
+test "review F7: deinit frees a discarded session a connection still holds" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit(); // testing.allocator reports the leak if not
+    var t1 = TestTransport{};
+    _ = try connectSession(&b, &t1, "k", false, 0);
+    var t2 = TestTransport{};
+    _ = try connectClient(&b, &t2, "k", 60, 1); // clean take-over: the session is discarded
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+}
+
+test "review F8: expired retained and queued messages are swept, not left holding the caps" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tq = TestTransport{};
+    const q = try connect5(&b, &tq, .{ .client_id = "q", .properties = .{ .session_expiry_interval = 600 } }, 0);
+    _ = try send5(&b, q.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    b.remove(q.conn);
+    try b.publishWith("t", "short", .{ .qos = .at_least_once, .retain = true, .message_expiry_s = 5, .now = 0 });
+    try testing.expectEqual(@as(usize, 1), b.retained.items.len);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("q"));
+    _ = b.expireSessions(5_000);
+    try testing.expectEqual(@as(usize, 0), b.retained.items.len);
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("q"));
+    try testing.expectEqual(@as(u64, 2), b.messagesExpired());
+    try testing.expectEqual(@as(usize, 0), b.retainedBytes());
+}
+
+test "review F11: a PUBREC for a QoS 1 id is an unknown QoS 2 id (0x92), and changes nothing" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "c" }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&tt)).?;
+    try b.publish("t", "x", .at_least_once, false);
+    const id = (try next5(&tt)).?.publish.packet_id;
+    _ = try send5(&b, c.conn, .{ .pubrec = .{ .packet_id = id } }, 1);
+    try testing.expectEqual(packet.ReasonCode.packet_identifier_not_found, (try next5(&tt)).?.pubrel.reason_code);
+    try testing.expectEqual(Outbound.Phase.puback, c.conn.pendingPhase(id).?);
 }
