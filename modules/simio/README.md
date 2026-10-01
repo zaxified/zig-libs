@@ -7,11 +7,15 @@ virtual, and every choice the simulator makes is drawn from one seed. A run is
 a pure function of its seed, so a failure found on seed 1234 is reproduced by
 running seed 1234 again.
 
-- **Status:** M4 of five (see [SPEC.md](SPEC.md) § Milestones): the scheduler
-  (tasks, groups, cancelation, futex, clocks, sleep, timeouts, seeded
-  randomness), the network (streams, datagrams, ICMP echo over routed, faulty
-  links), host crash/restart, a file system with a crash-consistency model and
-  disk faults, and fault search with shrinking. The in-repo pilots are next.
+- **Status:** all five milestones done (see [SPEC.md](SPEC.md) § Milestones):
+  the scheduler (tasks, groups, cancelation, futex, clocks, sleep, timeouts,
+  seeded randomness), the network (streams, datagrams, ICMP echo, Unix-domain
+  streams and host names over routed, faulty links), host crash/restart, a file
+  system with a crash-consistency model, links, metadata, memory maps and disk
+  faults, fault search with shrinking, and pilots against real modules — `sntp`,
+  `dns`, `mqtt`, `ssh`, `kv`, `http` (client and server), `icmp`, `staticfiles`
+  and the timeouts of `modbus`/`whois`/`stun`/`ocspcache`/`llmclient` — which
+  found and fixed defects in six of them.
 - **Platform:** Linux on x86_64, aarch64 or riscv64 (`std.Io.fiber`).
 - **Deps:** `netsim` (its seeded PRNG; its fault vocabulary from M3).
 - **Model after:** tokio-rs/turmoil, madsim, FoundationDB's simulation testing.
@@ -48,9 +52,13 @@ test "my protocol under 200 schedules" {
   how many) or `.step_limit`.
 - `Host.spawn` starts a root task; an error it returns lands in
   `host.failure`/`host.failures` instead of vanishing.
-- `Sim.fingerprint()` digests every scheduling decision. Run a seed twice and
-  compare: a difference means the code under test is nondeterministic (a
-  wall-clock read, a thread, an address-keyed map outside `std.Io`).
+- `Sim.fingerprint()` digests every scheduling decision, `Sim.dataFingerprint()`
+  every byte sent and written. Run a seed twice and compare: a difference means
+  the code under test is nondeterministic (a wall-clock read, a thread, entropy
+  or an address-keyed map outside `std.Io`).
+- A task that spins without ever calling `std.Io` cannot be interrupted from
+  inside; after `Options.watchdog_ms` (60 s) of wall time the watchdog names it
+  and aborts instead of letting the run hang.
 - `Options.schedule = .fifo` with no preemption is the "obvious" order;
   `.random` (default) plus `preempt_permille` explores interleavings.
 
@@ -72,6 +80,10 @@ try sim.setLinkUp(a, b, false);            // partition, then run on
 - Datagrams can be lost, duplicated, reordered or have a bit flipped, per
   link. `bind` with `protocol = .icmp` gives a ping socket the target answers.
 - Hosts with several links route over the shortest path that is up.
+- `addHost(.{ .name = "db" })` makes `HostName.lookup`/`connect` find the host by
+  name (`localhost` and IP literals work too; nothing else exists).
+- `UnixAddress.listen`/`connect` work by path, per host; `socketpair` is refused,
+  as std 0.16 on Linux refuses it.
 
 ### Crashes, faults and search
 
@@ -118,6 +130,9 @@ directory is synced (sync a directory through `File{ .handle = dir.handle }`).
 `FaultConfig.disk` adds one-shot I/O errors and bit rot to the search;
 `HostOptions.disk_bytes` caps the disk. `Host.putFile`/`readFile` seed and
 inspect a disk from the test; `Host.console()` is what the host printed.
+Symbolic links are followed as POSIX does (`SymLinkLoop` past 40), hard links,
+realpath, permissions, owners and timestamps work, and `File.MemoryMap` is the
+copy-and-sync mapping its contract allows.
 
 Operations simio does not simulate yet behave as in `std.Io.failing` (an
 error, never a fake success).
@@ -131,7 +146,9 @@ scripts/modtest simio
 The suite checks the `std.Io` contract (cancelation delivered once, protection,
 `recancel`, groups, timeouts against skewed clocks) and the property the module
 exists for: one seed replays one schedule, different seeds find a planted lost
-update that a mutex then prevents.
+update that a mutex then prevents. A differential oracle runs one `std.Io`
+program on `std.Io.Threaded` (the real loopback and disk) and on simio and
+requires the same results. The pilots in `src/pilots/` run real modules.
 
 Provenance: original work of the zig-libs authors (MIT), except the fiber entry
 trampoline and initial stack layout, taken from Zig's `std/Io/Uring.zig` (MIT) —
