@@ -651,3 +651,95 @@ test "datagrams beyond the receive buffer are dropped" {
     _ = sim.run();
     try testing.expectEqual(@as(usize, 16), got);
 }
+
+// ── names ──────────────────────────────────────────────────────────────────
+
+const Lookup = struct {
+    addrs: [4]net.IpAddress = undefined,
+    n: usize = 0,
+    canonical: [64]u8 = undefined,
+    canonical_len: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn lookupName(io: Io, name: []const u8, family: ?net.IpAddress.Family, out: *Lookup) void {
+    var buf: [8]net.HostName.LookupResult = undefined;
+    var q: Io.Queue(net.HostName.LookupResult) = .init(&buf);
+    var canon: [net.HostName.max_len]u8 = undefined;
+    const hn = net.HostName.init(name) catch |e| {
+        out.err = e;
+        return;
+    };
+    hn.lookup(io, &q, .{ .port = 80, .family = family, .canonical_name_buffer = &canon }) catch |e| {
+        out.err = e;
+        return;
+    };
+    while (q.getOneUncancelable(io)) |r| switch (r) {
+        .address => |a| {
+            out.addrs[out.n] = a;
+            out.n += 1;
+        },
+        .canonical_name => |c| {
+            @memcpy(out.canonical[0..c.bytes.len], c.bytes);
+            out.canonical_len = c.bytes.len;
+        },
+    } else |_| {}
+}
+
+test "a host name resolves to that host's addresses, IPv4 first; unknown names do not exist" {
+    var sim: Sim = undefined;
+    newSim(&sim, 41);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const db = try sim.addHost(.{ .name = "db.internal" });
+    var both: Lookup = .{};
+    var v6: Lookup = .{};
+    var local: Lookup = .{};
+    var missing: Lookup = .{};
+    try a.spawn(lookupName, .{ a.io(), "DB.internal.", null, &both });
+    try a.spawn(lookupName, .{ a.io(), "db.internal", .ip6, &v6 });
+    try a.spawn(lookupName, .{ a.io(), "localhost", .ip4, &local });
+    try a.spawn(lookupName, .{ a.io(), "nowhere.example", null, &missing });
+    _ = sim.run();
+
+    try testing.expectEqual(@as(usize, 2), both.n);
+    try testing.expectEqual(addr4(db, 80), both.addrs[0]);
+    try testing.expectEqualSlices(u8, &db.ip6, &both.addrs[1].ip6.bytes);
+    try testing.expectEqualStrings("DB.internal.", both.canonical[0..both.canonical_len]);
+    try testing.expectEqual(@as(usize, 1), v6.n);
+    try testing.expectEqualSlices(u8, &db.ip6, &v6.addrs[0].ip6.bytes);
+    try testing.expectEqual(@as(usize, 1), local.n);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, local.addrs[0].ip4.bytes);
+    try testing.expectEqual(@as(?anyerror, error.UnknownHostName), missing.err);
+}
+
+fn connectByName(io: Io, out: *EchoResult) !void {
+    const hn = try net.HostName.init("echo");
+    const stream = try hn.connect(io, 7, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [16]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("ping");
+    try w.interface.flush();
+    try stream.shutdown(io, .send);
+    var rbuf: [16]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var got: [4]u8 = undefined;
+    try r.interface.readSliceAll(&got);
+    out.ok = std.mem.eql(u8, &got, "ping");
+}
+
+test "HostName.connect reaches a host by its name" {
+    var sim: Sim = undefined;
+    newSim(&sim, 42);
+    defer sim.deinit();
+    const s = try sim.addHost(.{ .name = "echo" });
+    const c = try sim.addHost(.{});
+    try sim.link(s, c, .{});
+    try s.spawn(echoServer, .{ s.io(), 7 });
+    var out: EchoResult = .{};
+    try c.spawn(connectByName, .{ c.io(), &out });
+    const r = sim.run();
+    try testing.expectEqual(sched.Outcome.quiescent, r.outcome);
+    try testing.expect(out.ok);
+}

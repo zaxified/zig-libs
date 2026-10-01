@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Host names: `HostOptions.name`, resolved by `netLookup`
+  (`HostName.lookup`/`connect`) together with IP literals and `localhost`;
+  `Sim.hostByName`. Code that dials by name now runs unchanged.
 - **2026-10-01** — A watchdog (`Options.watchdog_ms`, default 60 s of wall time): a
   task that spins without calling `std.Io` is named (task, host, virtual time) and
   the process aborts, instead of the run hanging silently. `.flag` action and

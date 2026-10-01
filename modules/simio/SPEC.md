@@ -65,6 +65,9 @@ platform-free); file system and storage faults **in scope from the start**.
   `netReceive` (via `operate`), `netRead`, `netWrite`, `netClose`, `netShutdown`;
   TCP-like streams and UDP-like datagrams; unprivileged ICMP datagram sockets
   (`.dgram` + `protocol = .icmp`) answered by the simulated host stack.
+- Names: `netLookup` resolves `HostOptions.name` (case-insensitive), IP literals
+  and `localhost`; IPv4 first. An unknown name is `UnknownHostName` — there is no
+  real network to ask.
 - File system: per-host in-memory tree behind `Dir`/`File` (create, open, read,
   write, positional I/O, stat, length, set length, sync, rename, delete, dir
   iteration, atomic create, locks), with a durability model (below).
@@ -72,8 +75,8 @@ platform-free); file system and storage faults **in scope from the start**.
 
 **Out (the operation behaves exactly as in `std.Io.failing` — an error such as
 `error.NetworkDown` or `error.OperationUnsupported`, never a fabricated success):** processes (`processSpawn*`, `childWait`, `processReplace*`), memory maps,
-DNS by name (`netLookup` — hosts are addressed by IP; a simulated resolver is a pilot
-concern, not the Io's), Unix sockets (backlog), terminals beyond stderr, preemptive
+DNS on the wire (a module's own resolver, like `dns`, runs against simulated name
+servers instead), Unix sockets (backlog), terminals beyond stderr, preemptive
 threads, the CPU memory model. Code that bypasses `std.Io` (raw `std.os.linux`
 syscalls, `std.Thread`, globals keyed by address) is outside simulation and is the
 consumer's to remove.
@@ -351,5 +354,4 @@ of touching one of the test process's own descriptors.
 ## Backlog / deferred
 
 - Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
-- A simulated resolver for `netLookup` (hosts by name).
 - Memory maps over the simulated file system.

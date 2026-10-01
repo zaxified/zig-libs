@@ -51,6 +51,7 @@ pub const vtable: Io.VTable = blk: {
     vt.netWrite = netWrite;
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
+    vt.netLookup = netLookup;
     vt.dirCreateDir = dirCreateDir;
     vt.dirCreateDirPath = dirCreateDirPath;
     vt.dirCreateDirPathOpen = dirCreateDirPathOpen;
@@ -511,4 +512,60 @@ fn fileUnlock(userdata: ?*anyopaque, file: File) void {
 
 fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
     fsOf(userdata).downgrade(file);
+}
+
+/// Names resolve against the simulation's hosts (`HostOptions.name`), plus
+/// IP literals and `localhost` (this host's loopback addresses). Nothing
+/// else exists: an unknown name is `UnknownHostName`, never a query on the
+/// real network.
+fn netLookup(
+    userdata: ?*anyopaque,
+    host_name: net.HostName,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) net.HostName.LookupError!void {
+    const h = hostOf(userdata);
+    const io = h.io();
+    defer resolved.close(io);
+    netLookupInner(h, io, host_name.bytes, resolved, options) catch |err| switch (err) {
+        error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
+        else => |e| return e,
+    };
+}
+
+fn netLookupInner(
+    h: *Host,
+    io: Io,
+    name: []const u8,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    try h.sim.cancelPoint(h.sim.running());
+    var addrs: [2]net.IpAddress = undefined;
+    var n: usize = 0;
+    if (net.IpAddress.parse(name, options.port)) |addr| {
+        addrs[0] = addr;
+        n = 1;
+    } else |_| {
+        const v4: [4]u8, const v6: [16]u8 = if (std.ascii.eqlIgnoreCase(name, "localhost") or std.ascii.eqlIgnoreCase(name, "localhost."))
+            .{ .{ 127, 0, 0, 1 }, .{0} ** 15 ++ .{1} }
+        else if (h.sim.hostByName(name)) |target|
+            .{ target.ip4, target.ip6 }
+        else
+            return error.UnknownHostName;
+        addrs[0] = .{ .ip4 = .{ .bytes = v4, .port = options.port } };
+        addrs[1] = .{ .ip6 = .{ .bytes = v6, .port = options.port } };
+        n = 2;
+    }
+    var any = false;
+    for (addrs[0..n]) |addr| {
+        if (options.family) |fam| if (fam != @as(net.IpAddress.Family, addr)) continue;
+        try resolved.putOne(io, .{ .address = addr });
+        any = true;
+    }
+    if (!any) return error.UnknownHostName;
+    if (options.canonical_name_buffer) |buf| {
+        @memcpy(buf[0..name.len], name);
+        try resolved.putOne(io, .{ .canonical_name = .{ .bytes = buf[0..name.len] } });
+    }
 }

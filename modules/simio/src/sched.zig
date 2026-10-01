@@ -75,6 +75,10 @@ pub const HostOptions = struct {
     ip6: ?[16]u8 = null,
     /// Disk capacity; writes past it fail with `error.NoSpaceLeft`.
     disk_bytes: ?u64 = null,
+    /// The name other hosts resolve to this host's addresses
+    /// (`std.Io.net.HostName.lookup`/`connect`); case-insensitive, at most
+    /// 253 bytes. Null: reachable by address only.
+    name: ?[]const u8 = null,
 };
 
 pub const Outcome = enum {
@@ -248,6 +252,8 @@ pub const Host = struct {
     next_handle: Io.net.Socket.Handle = 1 << 30,
     next_port: u16 = 49152,
     root_group: Io.Group = .init,
+    name_buf: [253]u8 = undefined,
+    name_len: u8 = 0,
     /// The first error a root task (`spawn`) returned, if any.
     failure: ?anyerror = null,
     /// How many root tasks returned an error.
@@ -494,6 +500,7 @@ pub const Sim = struct {
     }
 
     pub fn addHost(sim: *Sim, opts: HostOptions) Allocator.Error!*Host {
+        if (opts.name) |name| assert(name.len <= 253);
         const h = try sim.gpa.create(Host);
         errdefer sim.gpa.destroy(h);
         const id: u32 = @intCast(sim.hosts.items.len);
@@ -510,6 +517,10 @@ pub const Sim = struct {
             .prng = .init(sim.opts.seed ^ (0x9e3779b97f4a7c15 *% (@as(u64, id) + 1))),
             .clock_skew_ns = opts.clock_skew_ns,
         };
+        if (opts.name) |name| {
+            @memcpy(h.name_buf[0..name.len], name);
+            h.name_len = @intCast(name.len);
+        }
         try h.fs.init(h, sim.opts.seed ^ (0xd15c_0000 +% @as(u64, id)), opts.disk_bytes);
         errdefer h.fs.deinit();
         try sim.hosts.append(sim.gpa, h);
@@ -620,6 +631,16 @@ pub const Sim = struct {
         sim.net.crashHost(h);
         h.fs.crash();
         h.releaseAll();
+    }
+
+    /// The host named `name` (`HostOptions.name`, case-insensitive, a
+    /// trailing dot ignored), or null.
+    pub fn hostByName(sim: *const Sim, name: []const u8) ?*Host {
+        const bare = if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
+        for (sim.hosts.items) |h| {
+            if (h.name_len != 0 and std.ascii.eqlIgnoreCase(h.name_buf[0..h.name_len], bare)) return h;
+        }
+        return null;
     }
 
     /// Powers a crashed host back on: monotonic clocks restart from zero
