@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — First pilots (`src/pilots/`, piloted modules as
+  `test_deps`): `sntp` (needed `query` to read time through `std.Io`) and
+  `dns` (found `lookupIp` reporting an outage as "no addresses"; fixed there).
 - **2026-10-01** — Mutation run over the file system (27 schemata, all
   killed after nine new tests — see SPEC.md).
 - **2026-10-01** — M4, the disk: `std.Io.Dir`/`File` on a per-host file

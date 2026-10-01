@@ -245,6 +245,29 @@ ALICE (OSDI 2014) for the crash-consistency model. The fiber layout follows the
 pattern of Zig's own `std/Io/Uring.zig` (MIT, read as reference) and uses
 `std.Io.fiber` directly.
 
+## Pilots (M5)
+
+Pilots live in `src/pilots/` with the piloted module as a `test_dep`, not in the
+piloted module: most of them also target 32-bit Linux, where `std.Io.fiber` does
+not exist, and a `test_dep` on simio would break their portability. CI still reruns
+a pilot when its module changes (test-only imports are part of the module graph).
+Moving a module's own loopback tests onto simio is a separate, later step.
+
+- **sntp** (2026-10-01): offset and delay exact to the nanosecond on a symmetric
+  path, half the asymmetry on an asymmetric one, a server clock jump, an origin
+  mismatch refused, a lost reply timing out. Needed one fix in `sntp`: `query` read
+  T1/T4 with a direct `clock_gettime`, outside `std.Io`; now `Io.Timestamp.now`.
+- **dns** (2026-10-01): `Resolver` reads `/etc/resolv.conf` from the simulated disk,
+  retries through 25% loss, falls back to TCP on a truncated answer, ignores forged
+  transaction ids. **Found a defect:** `lookupIp` turned every failed query into an
+  empty result, so a dead server read as "no addresses"; fixed in `dns` (Go's
+  behaviour: no address + a failed query = that error), with a regression test there.
+
+**Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
+`RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
+some in runtime paths (`sntp` was one). Each is invisible to a simulated `Io` and
+gets fixed when its pilot reaches it.
+
 ## Backlog / deferred
 
 - Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
