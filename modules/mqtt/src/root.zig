@@ -69,6 +69,7 @@ pub const topic = @import("topic.zig");
 
 const client_mod = @import("client.zig");
 const external_goldens = @import("external_goldens.zig");
+const v5_replay = @import("v5_replay.zig");
 
 pub const Client = client_mod.Client;
 pub const Transport = client_mod.Transport;
@@ -78,6 +79,8 @@ pub const Event = client_mod.Event;
 pub const Message = client_mod.Message;
 pub const ConnectionState = client_mod.ConnectionState;
 pub const max_in_flight = client_mod.max_in_flight;
+pub const AliasSlot = client_mod.AliasSlot;
+pub const ServerLimits = client_mod.ServerLimits;
 
 /// MQTT 3.1.1 broker (server): connection registry + subscription fan-out +
 /// retained store, QoS 0/1/2, clean and persistent sessions. Caller-driven and socket-free like
@@ -100,6 +103,9 @@ pub const Operation = broker.Operation;
 pub const PublishVerdict = broker.PublishVerdict;
 
 // Convenience re-exports of the codec types used at the client surface.
+pub const Version = packet.Version;
+pub const ReasonCode = packet.ReasonCode;
+pub const Properties = packet.Properties;
 pub const QoS = packet.QoS;
 pub const ConnectOptions = packet.Connect;
 pub const Will = packet.Will;
@@ -115,4 +121,5 @@ test {
     _ = client_mod;
     _ = broker;
     _ = external_goldens;
+    _ = v5_replay;
 }

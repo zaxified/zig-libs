@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **External anchor for MQTT 5.0** (`tools/interop.zig`, `zig build
+  interop-mqtt [-- --capture]`): this module's `Client` against a real Eclipse Mosquitto
+  2.1.2 (rootless podman) and real paho-mqtt 2.1.0 clients (`tools/paho_v5.py`) against
+  this module's `Broker`, every step checked against what the peer did or reported —
+  properties forwarded unaltered both ways, reason codes, Subscription Identifiers,
+  topic aliases (mosquitto aliases its deliveries to us; resolved), shared
+  subscriptions, No Local, Retain As Published / Handling, Wills with properties,
+  session resume, take-over 0x8E, UNSUBACK codes. The bytes are frozen in
+  `src/testdata/v5_transcript.txt` and replayed by `src/v5_replay.zig` with no peer:
+  our packets must re-encode to what mosquitto accepted, and paho's recorded chunks
+  must reproduce, byte for byte, everything paho received. Found by it: a decoded
+  SUBSCRIBE/UNSUBSCRIBE could not be re-encoded (the encoder read only `filters`) —
+  fixed, the encoder walks `iterator()`.
 - **2026-10-01** — **Broker: MQTT 5.0**, per connection, beside 3.1.1 clients (each gets
   every message in its own version). CONNACK announces Receive Maximum, Maximum Packet
   Size, Topic Alias Maximum, Maximum QoS, an assigned client id and a lowered Session

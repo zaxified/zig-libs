@@ -1217,11 +1217,15 @@ fn writeBody(cur: *Cursor, version: Version, p: Packet) EncodeError!void {
         .pubrel => |a| try writeAck(cur, v5, a, .pubrel),
         .pubcomp => |a| try writeAck(cur, v5, a, .pubcomp),
         .subscribe => |s| {
+            // `iterator` walks `filters`, or a decoded packet's `payload` — so
+            // a decoded SUBSCRIBE re-encodes (a bridge forwarding one).
             if (s.packet_id == 0) return error.InvalidPacketId;
-            if (s.filters.len == 0) return error.EmptyTopicList;
+            var probe = s.iterator();
+            if (probe.next() == null) return error.EmptyTopicList;
             try cur.u16be(s.packet_id);
             if (v5) try writeProperties(cur, s.properties, .subscribe) else if (!s.properties.isEmpty()) return error.UnsupportedInVersion;
-            for (s.filters) |f| {
+            var it = s.iterator();
+            while (it.next()) |f| {
                 if (!v5 and f.hasOptions()) return error.UnsupportedInVersion;
                 try cur.utf8String(f.filter);
                 try cur.byte(f.optionsByte());
@@ -1240,10 +1244,12 @@ fn writeBody(cur: *Cursor, version: Version, p: Packet) EncodeError!void {
         },
         .unsubscribe => |u| {
             if (u.packet_id == 0) return error.InvalidPacketId;
-            if (u.filters.len == 0) return error.EmptyTopicList;
+            var probe = u.iterator();
+            if (probe.next() == null) return error.EmptyTopicList;
             try cur.u16be(u.packet_id);
             if (v5) try writeProperties(cur, u.properties, .unsubscribe) else if (!u.properties.isEmpty()) return error.UnsupportedInVersion;
-            for (u.filters) |f| try cur.utf8String(f);
+            var it = u.iterator();
+            while (it.next()) |f| try cur.utf8String(f);
         },
         .unsuback => |u| {
             if (u.packet_id == 0) return error.InvalidPacketId;
@@ -2722,6 +2728,23 @@ test "v5 SUBSCRIBE: subscription options on the wire and every refusal" {
         .properties = .{ .subscription_ids = .{ .items = &.{ 1, 2 } } },
     } }));
     try testing.expectError(error.UnsupportedInVersion, encodePacket(&buf, .v3_1_1, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "a", .no_local = true }} } }));
+}
+
+test "a decoded SUBSCRIBE / UNSUBSCRIBE re-encodes to the same bytes, in both versions" {
+    var buf: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+    inline for (.{ Version.v3_1_1, Version.v5 }) |v| {
+        const opts: []const Subscription = if (v == .v5)
+            &.{ .{ .filter = "a/#", .qos = .exactly_once, .no_local = true }, .{ .filter = "b", .retain_handling = .never } }
+        else
+            &.{ .{ .filter = "a/#", .qos = .exactly_once }, .{ .filter = "b" } };
+        const sub = try encodePacket(&buf, v, .{ .subscribe = .{ .packet_id = 3, .filters = opts } });
+        const ds = (try decodePacket(sub, v)).?.packet;
+        try testing.expectEqualSlices(u8, sub, try encodePacket(&out, v, ds));
+        const uns = try encodePacket(&buf, v, .{ .unsubscribe = .{ .packet_id = 4, .filters = &.{ "a/#", "b" } } });
+        const du = (try decodePacket(uns, v)).?.packet;
+        try testing.expectEqualSlices(u8, uns, try encodePacket(&out, v, du));
+    }
 }
 
 test "v5 SUBACK and UNSUBACK: reason codes per filter" {
