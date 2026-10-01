@@ -475,7 +475,7 @@ test "external: our Client's real bytes against real amqtt reproduce exactly" {
     tt.reset();
     try c.feed(zig_client_vs_amqtt.s2c_puback_q1);
     const puback_ev = (try c.poll(0)).?;
-    try testing.expectEqual(id1, puback_ev.puback);
+    try testing.expectEqual(id1, puback_ev.puback.packet_id);
     try c.feed(zig_client_vs_amqtt.s2c_pub_q1_echo);
     const q1_msg_ev = (try c.poll(0)).?;
     try testing.expectEqualStrings("q1-from-zig", q1_msg_ev.message.payload);
@@ -491,7 +491,7 @@ test "external: our Client's real bytes against real amqtt reproduce exactly" {
     tt.reset();
     try c.feed(zig_client_vs_amqtt.s2c_pubcomp);
     const pubcomp_ev = (try c.poll(0)).?;
-    try testing.expectEqual(id2, pubcomp_ev.pubcomp);
+    try testing.expectEqual(id2, pubcomp_ev.pubcomp.packet_id);
     try c.feed(zig_client_vs_amqtt.s2c_pub_q2_echo);
     const q2_msg_ev = (try c.poll(0)).?;
     try testing.expectEqualStrings("q2-from-zig", q2_msg_ev.message.payload);

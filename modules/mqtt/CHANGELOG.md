@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Client: MQTT 5.0** (`Connect.version = .v5`). `connect` announces what
+  the client can hold when the caller does not (Receive Maximum = `max_in_flight`, Maximum
+  Packet Size = the receive buffer, Topic Alias Maximum = the alias slots) and refuses
+  to promise more. The CONNACK's limits are kept (`serverLimits`): Maximum QoS, Retain
+  Available, Receive Maximum as the 4.9 send quota (`error.ReceiveMaximumReached`),
+  Maximum Packet Size, Topic Alias Maximum, Server Keep Alive. Inbound Topic Aliases
+  resolve through caller slots (`Buffers.topic_aliases`, `AliasSlot`); messages carry
+  their `properties`; `PublishOptions.properties`, `subscribeWith`, `unsubscribeWith`,
+  `disconnectWith`, `auth`; new events `disconnect` (server's DISCONNECT) and `auth`
+  (extended authentication). A refusing PUBREC ends the QoS 2 handshake as `pubcomp`.
+  ⚠ **Breaking:** `Event.puback`/`pubcomp` are `packet.Ack` and `Event.unsuback` is
+  `packet.Unsuback` (were `u16`): `.puback => |id|` becomes `|a| a.packet_id`; `Event`
+  has two new arms.
 - **2026-10-01** — **Broker: QoS 2, both ways.** An inbound QoS 2 PUBLISH is PUBRECed and
   routed once; its id is remembered until the PUBREL, so a resend (DUP, or after a
   reconnect — persistent sessions keep the ids) is answered and not routed twice, and

@@ -114,7 +114,7 @@ fn pubReader(io: Io, t: *mqtt.TcpTransport, c: *mqtt.Client, st: *State, sent: *
         }
         try c.feed(buf[0..n]);
         while (try c.poll(nowMs(io))) |ev| switch (ev) {
-            .puback => |id| for (sent, 0..) |s, i| if (s == id) {
+            .puback => |ack| for (sent, 0..) |s, i| if (s == ack.packet_id) {
                 st.acked[i] = true;
             },
             else => {},

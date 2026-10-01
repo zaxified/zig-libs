@@ -91,7 +91,7 @@ pub fn main() !void {
     const puback_bytes = wire.sent.items[sent_before..];
     const decoded = (try mqtt.packet.decode(puback_bytes)) orelse return error.NoPuback;
     switch (decoded.packet) {
-        .puback => |id| std.debug.print("client auto-acked PUBACK id={d}\n", .{id}),
+        .puback => |ack| std.debug.print("client auto-acked PUBACK id={d}\n", .{ack.packet_id}),
         else => return error.UnexpectedAutoAck,
     }
 }
