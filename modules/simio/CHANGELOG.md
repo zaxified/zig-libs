@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Every file system call is now a preemption point, as a
+  blocking disk call is. kv pilot: `Db` over the real `FsStorage` through
+  crashes, I/O errors and bit rot; a store that skips `sync` is caught losing
+  acknowledged writes.
 - **2026-10-01** — ssh pilot: the real client and server over simulated TCP
   through crashes and seeded packet faults; a single-attempt client is caught
   losing the result. It needed `ssh` to draw entropy through `std.Io`.

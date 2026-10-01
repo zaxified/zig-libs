@@ -28,7 +28,7 @@ competitor source was read.
 
 **Where we are ahead:** a delta-debugging shrinker over the fault schedule (the
 peers' READMEs mention none *(inferred)*), a schedule fingerprint with a determinism
-check, seeded preemption at yield points, a `.deadlock` outcome that names how many
+check, seeded preemption at yield points (every network and disk call), a `.deadlock` outcome that names how many
 tasks can never wake; routed multi-hop paths with directed per-link faults, ICMP
 echo, and seeded short stream reads that surface framing bugs *(peers' READMEs
 mention none of these — inferred)*.
@@ -281,6 +281,17 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   Also found a simio leak: a group none of whose tasks were alive any more (its
   owner discarded without unwinding) was freed neither by `deinit` nor by a crash;
   simio now keeps a registry of group states.
+- **kv** (2026-10-01): `Db` over the real `FsStorage` on simio's disk; 300 puts,
+  deletes and compactions per run, checked after every reopen against what was
+  acknowledged. Holds through 40 seeds of crashes plus I/O errors, and under bit rot
+  never serves a value that was not written; a store whose `sync` does nothing is
+  caught losing acknowledged writes. `allocate`/`syncData` turned out to be unused by
+  `Db`, so the raw `fallocate`/`fdatasync` were never reached. **Found a defect** once
+  disk calls became preemption points (they were instantaneous before, which no real
+  disk is): `Db`'s spinlock, held across `sync`, spins forever when a second task of
+  the same thread calls into the store — recorded in kv's SPEC backlog as a decision
+  (it is the "repo-standard" io-less lock); no test here until it is fixed, since a
+  spinning task never returns to the scheduler.
 
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
@@ -293,9 +304,8 @@ some in runtime paths (`sntp` and `mqtt` were two). Each is invisible to a simul
   but without those timeouts; `serveMulti` uses OS threads and CPU pinning. Making
   the timeouts `Io`-based (the mqtt watchdog shape, or deadline-bounded reads) is a
   change to a performance-sensitive server and wants its own decision.
-- **kv** `FsStorage`: `allocate` and `syncData` call `fallocate`/`fdatasync` directly
-  (std.Io has neither). Under simio they get `EBADF`; the pilot needs a storage
-  variant without them, or std-level preallocate/datasync.
+- **kv** `FsStorage`: `allocate` and `syncData` still call `fallocate`/`fdatasync`
+  directly (std.Io has neither) and get `EBADF` under simio; `Db` never calls them.
 - **icmp**: raw `std.os.linux` socket syscalls throughout; needs a `std.Io`-based
   backend (`bind` with `.dgram` + `protocol = .icmp`) before a pilot.
 
@@ -303,6 +313,10 @@ Simulated handles start at 2^30, so a raw syscall on one fails with `EBADF` inst
 of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
+
+- A task that spins without calling `std.Io` never returns to the scheduler, so the
+  run hangs instead of ending as `.step_limit`. Catching it needs a watchdog outside
+  the fiber (a timer signal on the test thread), not a scheduler change.
 
 - `checkDeterminism` compares a fingerprint of scheduling and virtual time, not of
   the data: entropy drawn outside `std.Io` that changes bytes but not sizes passes

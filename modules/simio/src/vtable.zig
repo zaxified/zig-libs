@@ -363,8 +363,12 @@ fn netShutdown(userdata: ?*anyopaque, handle: net.Socket.Handle, how: net.Shutdo
 
 // ── file system ───────────────────────────────────────────────────────────
 
+/// Every file system entry is a preemption point, as a blocking disk call
+/// is: another task may run while this one waits for the disk.
 fn fsOf(userdata: ?*anyopaque) *@import("fs.zig").Fs {
-    return &hostOf(userdata).fs;
+    const h = hostOf(userdata);
+    if (h.sim.current) |me| h.sim.maybeYield(me);
+    return &h.fs;
 }
 
 fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
