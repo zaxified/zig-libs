@@ -552,7 +552,11 @@ fn decodeProperties(r: *BodyReader, ctx: PropertyContext) DecodeError!Properties
     if (r.rest.len < len) return error.MalformedPacket;
     const block = r.rest[0..len];
     r.rest = r.rest[len..];
+    return decodeBlock(block, ctx);
+}
 
+/// Validate the entries of one property block and read them into `Properties`.
+fn decodeBlock(block: []const u8, ctx: PropertyContext) DecodeError!Properties {
     var p = Properties{ .user_properties = .{ .raw = block }, .subscription_ids = .{ .raw = block } };
     var seen: u64 = 0;
     var br = BodyReader{ .rest = block };
@@ -617,6 +621,30 @@ fn decodeProperties(r: *BodyReader, ctx: PropertyContext) DecodeError!Properties
     // Authentication Data without an Authentication Method (3.1.2.11.10).
     if (p.authentication_data != null and p.authentication_method == null) return error.ProtocolViolation;
     return p;
+}
+
+/// The bytes `encodePropertyEntries` would write for `p` in `ctx`.
+pub fn propertyEntriesLen(p: Properties, ctx: PropertyContext) EncodeError!usize {
+    var counter = Cursor{ .buf = &.{}, .counting = true };
+    try writePropertyEntries(&counter, p, ctx);
+    return counter.pos;
+}
+
+/// Encode `p`'s entries for `ctx` without the Property Length in front — a
+/// block `decodePropertyEntries` reads back. For keeping properties outside a
+/// packet: a server storing a message's properties with it to forward later.
+pub fn encodePropertyEntries(buf: []u8, p: Properties, ctx: PropertyContext) EncodeError![]const u8 {
+    var cur = Cursor{ .buf = buf };
+    try writePropertyEntries(&cur, p, ctx);
+    return cur.done();
+}
+
+/// Decode and validate a block of property entries (no Property Length in
+/// front), as `encodePropertyEntries` writes it. Slices point into `block`.
+pub fn decodePropertyEntries(block: []const u8, ctx: PropertyContext) DecodeError!Properties {
+    // The one validating decoder: what is stored is held to exactly what
+    // arrives on the wire.
+    return decodeBlock(block, ctx);
 }
 
 /// Write one property block: its length, then the entries.

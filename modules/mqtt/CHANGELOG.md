@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Broker: MQTT 5.0**, per connection, beside 3.1.1 clients (each gets
+  every message in its own version). CONNACK announces Receive Maximum, Maximum Packet
+  Size, Topic Alias Maximum, Maximum QoS, an assigned client id and a lowered Session
+  Expiry; refusals and acks carry 5.0 reason codes (PUBACK/PUBREC 0x10 without
+  subscribers and 0x87 when the ACL denies, SUBACK 0x8F/0x87/0x97, UNSUBACK 0x11,
+  0x92 for unknown ids); a failing 5.0 connection gets a DISCONNECT naming why (0x81,
+  0x82, 0x93, 0x94, 0x9B, 0x8E on take-over). Session Expiry with Clean Start
+  (`Config.session_expiry_ms` caps it; a DISCONNECT may shorten it, never revive it);
+  Message Expiry counted down through the retained store and session queues
+  (`messagesExpired`); forwardable properties carried unaltered, user properties in
+  order; inbound Topic Aliases (`Config.topic_alias_maximum`, default 16); the client's
+  Receive Maximum and Maximum Packet Size honoured (`oversizeDrops`); No Local, Retain As
+  Published, Retain Handling; Subscription Identifiers (one copy carries all); Shared
+  Subscriptions `$share/{group}/{filter}` round-robin, connected members first, for
+  3.1.1 clients too; Will properties and Will Delay (`publishDueWills(now)`; `TcpServer`
+  now runs `expireSessions` and `publishDueWills` once a second); DISCONNECT 0x04 keeps
+  the Will. New `Broker.publishWith` (properties, Message Expiry). Extended
+  authentication is not implemented (a CONNECT naming a method gets 0x8C).
+  ⚠ `tx_headroom` 16 → 64; `AuthRequest` gained `version` and `properties`;
+  `SessionState.expiry_interval_s` is reported but `restoreSession` does not take it
+  back yet.
 - **2026-10-01** — **Client: MQTT 5.0** (`Connect.version = .v5`). `connect` announces what
   the client can hold when the caller does not (Receive Maximum = `max_in_flight`, Maximum
   Packet Size = the receive buffer, Topic Alias Maximum = the alias slots) and refuses

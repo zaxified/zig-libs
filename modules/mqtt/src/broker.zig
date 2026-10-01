@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! MQTT 3.1.1 broker (server) — QoS 0, 1 and 2, clean and persistent sessions, no TLS.
+//! MQTT 3.1.1 and 5.0 broker (server) — QoS 0, 1 and 2, clean and persistent sessions, no TLS.
 //!
 //! The mirror image of `client.zig`. Where the client drives one connection
 //! *to* a broker, the `Broker` here owns the shared server-side state — the
@@ -59,9 +59,21 @@
 //! outbound one waits for PUBREC, then PUBCOMP, and a resumed session resends
 //! the PUBREL rather than the message. `Config.maximum_qos` caps it.
 //!
+//! MQTT 5.0 since 2026-10-01, per connection (the CONNECT's level decides):
+//! reason codes on every ack and refusal, a DISCONNECT that says why the
+//! broker ends a connection, Session Expiry with Clean Start, Message Expiry
+//! counted down through the retained store and session queues, the
+//! forwardable properties carried unaltered, inbound Topic Aliases, Receive
+//! Maximum and Maximum Packet Size both ways, the subscription options (No
+//! Local, Retain As Published, Retain Handling), Subscription Identifiers,
+//! Shared Subscriptions (`$share/`, for 3.1.1 clients too), Will properties
+//! and Will Delay. 3.1.1 and 5.0 clients share one broker; each gets every
+//! message in its own version. Extended authentication (AUTH) is not
+//! implemented: a CONNECT naming a method is refused with 0x8C.
+//!
 //! Deliberately deferred (documented, not built): sessions
 //! that survive a restart of the broker itself (they live in memory), DUP
-//! retransmit to a clean-session subscriber, MQTT 5.0, and TLS (terminate it in front and hand
+//! retransmit to a clean-session subscriber, extended authentication, and TLS (terminate it in front and hand
 //! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
 //! yourself). ⭐ Will / LWT was on this list until 2026-09-11 and is now built
 //! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates
@@ -98,7 +110,13 @@ pub const max_filters_per_subscribe = 64;
 /// `max_packet_size` so a QoS 0 → QoS 1 re-encode for a subscriber (packet id
 /// + a possible remaining-length varint growth) can never overflow the buffer
 /// — the delivery failure that FIX B contains cannot arise from sizing at all.
-pub const tx_headroom = 16;
+/// 5.0 adds what a delivery carries that the inbound PUBLISH did not: a
+/// Message Expiry Interval (5 bytes) and Subscription Identifiers (up to 5
+/// each). A delivery that still does not fit — a near-maximum message
+/// matching many identified subscriptions — is dropped for that subscriber
+/// and counted (`oversizeDrops`), as 3.1.2-25 has it for the client's own
+/// Maximum Packet Size; it is never a delivery failure.
+pub const tx_headroom = 64;
 
 /// Cap on the number of `/`-levels in a subscription filter. Bounds the trie
 /// height (hence the fan-out match recursion depth) against a pathological
@@ -270,6 +288,26 @@ pub const Connection = struct {
     will_payload: ?[]u8 = null,
     will_qos: QoS = .at_most_once,
     will_retain: bool = false,
+    /// 5.0: the Will's forwardable properties, as property entries (owned),
+    /// its Message Expiry Interval and its Will Delay Interval (3.1.3.2).
+    will_props: ?[]u8 = null,
+    will_expiry_s: ?u32 = null,
+    will_delay_s: u32 = 0,
+
+    /// The protocol version of the CONNECT (3.1.1 until one arrives).
+    version: packet.Version = .v3_1_1,
+    /// 5.0 limits the client announced in its CONNECT: QoS 1/2 deliveries it
+    /// takes unacknowledged (4.9), the largest packet it takes (3.1.2-24).
+    client_receive_maximum: u16 = std.math.maxInt(u16),
+    client_max_packet: u32 = std.math.maxInt(u32),
+    /// 5.0 Session Expiry Interval in force (CONNECT, then DISCONNECT).
+    session_expiry_s: u32 = 0,
+    /// 5.0 inbound Topic Aliases (owned topics), `Config.topic_alias_maximum`
+    /// long once the first is set; never carried to another connection.
+    aliases: []?[]u8 = &.{},
+    /// 5.0: why the broker is ending the connection, for the DISCONNECT
+    /// `process` sends when a handler fails with a violation.
+    close_reason: ?packet.ReasonCode = null,
 
     /// Fan-out liveness (FIX A). Incremented under `Broker.mutex` by a fan-out
     /// reader that is about to write to this connection, decremented lock-free
@@ -433,10 +471,17 @@ const Outbound = struct {
 
 /// One QoS 1 or 2 message held for a persistent session: queued while it
 /// waits for a delivery window, then in flight until its PUBACK (QoS 1) or
-/// PUBCOMP (QoS 2). Topic and payload share one owned allocation.
+/// PUBCOMP (QoS 2). 5.0 Subscription Identifiers (u32, native order — first,
+/// so they are aligned), topic, payload and 5.0 forwardable properties (as
+/// property entries) share one owned allocation, in that order.
 const Message = struct {
-    bytes: []u8,
+    bytes: []align(4) u8,
     topic_len: usize,
+    payload_len: usize = 0,
+    props_len: usize = 0,
+    ids_len: usize = 0,
+    /// Caller clock (ms) past which it is not sent (5.0 Message Expiry).
+    expires_at: ?i64 = null,
     retain: bool,
     qos: QoS = .at_least_once,
     /// Packet id in the session's id space; 0 while queued.
@@ -445,12 +490,27 @@ const Message = struct {
     /// resends the PUBREL, never the PUBLISH (spec 4.3.3-6, 4.4).
     released: bool = false,
 
+    fn ids(m: Message) []const u32 {
+        return std.mem.bytesAsSlice(u32, m.bytes[0 .. m.ids_len * 4]);
+    }
+
     fn topicName(m: Message) []const u8 {
-        return m.bytes[0..m.topic_len];
+        return m.bytes[m.ids_len * 4 ..][0..m.topic_len];
     }
 
     fn payload(m: Message) []const u8 {
-        return m.bytes[m.topic_len..];
+        return m.bytes[m.ids_len * 4 + m.topic_len ..][0..m.payload_len];
+    }
+
+    fn props(m: Message) []const u8 {
+        return m.bytes[m.ids_len * 4 + m.topic_len + m.payload_len ..][0..m.props_len];
+    }
+
+    fn outgoing(m: Message) Outgoing {
+        // Validated when it was stored; a block that does not decode cannot
+        // occur, and would only lose the properties.
+        const p = packet.decodePropertyEntries(m.props(), .publish) catch packet.Properties{};
+        return .{ .topic = m.topicName(), .payload = m.payload(), .props = p, .expires_at = m.expires_at, .retain = m.retain };
     }
 };
 
@@ -512,6 +572,10 @@ pub const Session = struct {
     /// Messages this session lost to its queue limits (or to memory) — the
     /// per-session share of `Broker.queueDrops`.
     drops: u64 = 0,
+    /// 5.0 Session Expiry Interval, seconds (0xFFFFFFFF = never); null for a
+    /// 3.1.1 session, which `Config.session_expiry_ms` alone governs.
+    /// Guarded by `Broker.mutex`.
+    expiry_s: ?u32 = null,
 
     pub fn clientId(s: *const Session) []const u8 {
         return s.client_id_buf[0..s.client_id_len];
@@ -591,7 +655,62 @@ const Owner = union(enum) {
 
 /// A subscriber reference stored in the trie (the filter string is implicit in
 /// the path and owned by the connection or session).
-const SubRef = struct { owner: Owner, qos: QoS };
+const SubRef = struct {
+    owner: Owner,
+    qos: QoS,
+    /// 5.0 subscription options (3.8.3.1); 3.1.1 subscriptions keep the
+    /// defaults, which are what 3.1.1 means.
+    no_local: bool = false,
+    retain_as_published: bool = false,
+    /// 5.0 Subscription Identifier, 0 = none.
+    sub_id: u32 = 0,
+};
+
+/// One Shared Subscription (5.0 spec 4.8.2), `$share/{ShareName}/{filter}`:
+/// each matching message goes to ONE member, round-robin, a member that can
+/// take it now first. Kept beside the trie, not in it, matched with
+/// `topic.matches` per publish — shared groups are few, and their member
+/// lists are what the trie would otherwise have to duplicate per level.
+const Shared = struct {
+    /// The filter as subscribed, `$share/...` (owned) — what an owner's filter
+    /// list holds and what UNSUBSCRIBE names.
+    full: []u8,
+    /// `{filter}`: the part matched against topics (a slice of `full`).
+    filter: []const u8,
+    members: std.ArrayListUnmanaged(SubRef) = .empty,
+    /// Where the round-robin looks first next time.
+    next: usize = 0,
+};
+
+/// The `{filter}` of a Shared Subscription filter, or null when `f` is an
+/// ordinary one; `error.Invalid` when it starts `$share/` but is not one
+/// (4.8.2-1/2: a ShareName of one or more characters without `/`, `+`, `#`,
+/// then `/` and a valid filter).
+fn splitShared(f: []const u8) error{Invalid}!?[]const u8 {
+    const prefix = "$share/";
+    if (!std.mem.startsWith(u8, f, prefix)) return null;
+    const rest = f[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.Invalid;
+    const name = rest[0..slash];
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "+#") != null) return error.Invalid;
+    const inner = rest[slash + 1 ..];
+    topic.validateFilter(inner) catch return error.Invalid;
+    return inner;
+}
+
+/// A 5.0 Will waiting out its Will Delay Interval (3.1.3.2) after its
+/// connection ended: published by `Broker.publishDueWills` once due, or when
+/// its session ends first; dropped if the client connects again before.
+const DelayedWill = struct {
+    client_id: []u8,
+    topic: []const u8,
+    payload: []const u8,
+    props: []const u8,
+    qos: QoS,
+    retain: bool,
+    expiry_s: ?u32,
+    due_ms: i64,
+};
 
 const Node = struct {
     children: std.StringHashMapUnmanaged(*Node) = .empty,
@@ -627,13 +746,13 @@ const Index = struct {
         if (!is_root) alloc.destroy(node);
     }
 
-    /// Register `(owner, qos)` under `filter`. Creates trie nodes as needed.
-    fn add(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, owner: Owner, qos: QoS) Error!void {
+    /// Register `ref` under `filter`. Creates trie nodes as needed.
+    fn add(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, ref: SubRef) Error!void {
         var node = &idx.root;
         var it = std.mem.splitScalar(u8, filter, '/');
         while (it.next()) |level| {
             if (std.mem.eql(u8, level, "#")) {
-                try node.hash_subs.append(alloc, .{ .owner = owner, .qos = qos });
+                try node.hash_subs.append(alloc, ref);
                 return;
             }
             if (std.mem.eql(u8, level, "+")) {
@@ -655,26 +774,27 @@ const Index = struct {
                 node = child;
             }
         }
-        try node.subs.append(alloc, .{ .owner = owner, .qos = qos });
+        try node.subs.append(alloc, ref);
     }
 
-    /// Update the granted QoS of an existing `(owner, filter)` (re-subscribe).
-    fn updateQos(idx: *Index, filter: []const u8, owner: Owner, qos: QoS) void {
+    /// Replace an existing `(ref.owner, filter)` subscription — its granted
+    /// QoS and options (re-subscribe, 3.8.4-3).
+    fn update(idx: *Index, filter: []const u8, ref: SubRef) void {
         var node = &idx.root;
         var it = std.mem.splitScalar(u8, filter, '/');
         while (it.next()) |level| {
-            if (std.mem.eql(u8, level, "#")) return setQosIn(&node.hash_subs, owner, qos);
+            if (std.mem.eql(u8, level, "#")) return setRefIn(&node.hash_subs, ref);
             if (std.mem.eql(u8, level, "+")) {
                 node = node.plus orelse return;
             } else {
                 node = node.children.get(level) orelse return;
             }
         }
-        setQosIn(&node.subs, owner, qos);
+        setRefIn(&node.subs, ref);
     }
 
-    /// The granted QoS of `(owner, filter)`, or null when it is not there.
-    fn qosOf(idx: *Index, filter: []const u8, owner: Owner) ?QoS {
+    /// The subscription `(owner, filter)`, or null when it is not there.
+    fn refOf(idx: *Index, filter: []const u8, owner: Owner) ?SubRef {
         var node = &idx.root;
         var it = std.mem.splitScalar(u8, filter, '/');
         const list = while (it.next()) |level| {
@@ -685,14 +805,14 @@ const Index = struct {
                 node = node.children.get(level) orelse return null;
             }
         } else &node.subs;
-        for (list.items) |r| if (r.owner.eql(owner)) return r.qos;
+        for (list.items) |r| if (r.owner.eql(owner)) return r;
         return null;
     }
 
-    fn setQosIn(list: *std.ArrayListUnmanaged(SubRef), owner: Owner, qos: QoS) void {
+    fn setRefIn(list: *std.ArrayListUnmanaged(SubRef), ref: SubRef) void {
         for (list.items) |*r| {
-            if (r.owner.eql(owner)) {
-                r.qos = qos;
+            if (r.owner.eql(ref.owner)) {
+                r.* = ref;
                 return;
             }
         }
@@ -825,6 +945,14 @@ const Retained = struct {
     topic: []u8,
     payload: []u8,
     qos: QoS,
+    /// 5.0 forwardable properties as property entries (owned, maybe empty).
+    props: []u8 = &.{},
+    /// Caller clock (ms) past which it is gone (5.0 Message Expiry).
+    expires_at: ?i64 = null,
+
+    fn bytes(r: Retained) usize {
+        return r.topic.len + r.payload.len + r.props.len;
+    }
 };
 
 // ── authentication / ACL hooks (FIX D) ──────────────────────────────────────
@@ -850,6 +978,10 @@ pub const AuthRequest = struct {
     /// the connection (see `Config.authorizeFn`). Defaulted so a request
     /// built by hand still compiles.
     will: ?WillInfo = null,
+    /// The CONNECT's protocol version, and its 5.0 properties (User
+    /// Properties among them; slices valid only for the call).
+    version: packet.Version = .v3_1_1,
+    properties: packet.Properties = .{},
 };
 
 /// What `AuthRequest.will` says about a CONNECT's Will.
@@ -1062,6 +1194,11 @@ pub const Config = struct {
     /// and fan-out; `.consume` — neither; `.refuse` — neither, counted in
     /// `tapRefusals`. There is no publisher left to resend a refused Will.
     tap_wills: bool = false,
+
+    /// 5.0: Topic Aliases a client may use toward the broker (announced in
+    /// CONNACK as Topic Alias Maximum). Each costs one owned topic copy per
+    /// connection while set. 0 = none.
+    topic_alias_maximum: u16 = 16,
 };
 
 /// What `Config.onPublishFn` decides about one PUBLISH.
@@ -1077,13 +1214,45 @@ pub const PublishVerdict = enum {
 /// One retained message snapshotted (owned dups) under the global lock for
 /// delivery to a fresh subscriber after its SUBACK — so the delivery writes
 /// happen off the lock like every other fan-out.
-const RetSnap = struct { topic: []u8, payload: []u8, qos: QoS };
+const RetSnap = struct {
+    topic: []u8,
+    payload: []u8,
+    props: []u8,
+    qos: QoS,
+    expires_at: ?i64,
+    /// The Subscription Identifier of the filter that pulled it, 0 = none.
+    sub_id: u32,
+};
+
+/// One application message on its way through the broker: what a fan-out,
+/// the retained store and a session queue hand to `deliverLocked`. `props`
+/// are only its 5.0 forwardable properties (`forwardable`: Payload Format,
+/// Content Type, Response Topic, Correlation Data, User Properties — never a
+/// Topic Alias, never Subscription Identifiers, which are per subscriber);
+/// `expires_at` is when its Message Expiry runs out.
+const Outgoing = struct {
+    topic: []const u8,
+    payload: []const u8,
+    props: packet.Properties = .{},
+    expires_at: ?i64 = null,
+    retain: bool = false,
+    /// The publishing client's id, for No Local (3.8.3.1); null = the server.
+    origin: ?[]const u8 = null,
+};
 
 /// One fan-out target: a connection to write to at `qos` (already the
 /// minimum of the publisher's QoS and the highest grant among its filters), or
 /// — with `session` set — a persistent session's connection to pump, the
 /// message having been queued for it under the registry lock.
-const Target = struct { conn: *Connection, qos: QoS, session: ?*Session = null };
+const Target = struct {
+    conn: *Connection,
+    qos: QoS,
+    session: ?*Session = null,
+    /// The RETAIN flag this subscriber gets (Retain As Published).
+    retain: bool = false,
+    /// Its matching Subscription Identifiers (5.0), into the fan-out's list.
+    ids: []const u32 = &.{},
+};
 
 /// The shared server-side state. Offline-testable: `accept` registers a
 /// `Transport`, `feed` + `process` drive a connection, `remove` tears it down —
@@ -1140,6 +1309,22 @@ pub const Broker = struct {
 
     /// Persistent sessions, online and offline. Guarded by `mutex`.
     sessions: std.ArrayList(*Session) = .empty,
+    /// Shared Subscriptions (`$share/{group}/{filter}`, 5.0 4.8.2, honoured
+    /// for 3.1.1 clients too). Guarded by `mutex`.
+    shared: std.ArrayList(*Shared) = .empty,
+    /// 5.0 Wills waiting out their Will Delay Interval. Guarded by `mutex`.
+    delayed_wills: std.ArrayList(DelayedWill) = .empty,
+    /// The latest caller time (ms) the broker has been given, for paths that
+    /// take none (`publish`) when a stored message's Message Expiry must be
+    /// measured. Guarded by `mutex`.
+    now_hint: i64 = 0,
+    /// Count of stored messages (retained, queued) dropped because their 5.0
+    /// Message Expiry Interval ran out before delivery (3.3.2-5).
+    messages_expired: std.atomic.Value(usize) = .init(0),
+    /// Count of deliveries dropped for one subscriber because the PUBLISH it
+    /// would get exceeded its 5.0 Maximum Packet Size or `tx_buf`
+    /// (3.1.2-25, `tx_headroom`).
+    oversize_drops: std.atomic.Value(usize) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -1157,9 +1342,20 @@ pub const Broker = struct {
         for (b.sessions.items) |x| b.freeSession(x);
         b.sessions.deinit(b.allocator);
         b.index.deinit(b.allocator);
+        // Members point at sessions and connections freed above; the groups
+        // are only their own strings and lists.
+        for (b.shared.items) |g| {
+            g.members.deinit(b.allocator);
+            b.allocator.free(g.full);
+            b.allocator.destroy(g);
+        }
+        b.shared.deinit(b.allocator);
+        for (b.delayed_wills.items) |w| b.freeDelayedWill(w);
+        b.delayed_wills.deinit(b.allocator);
         for (b.retained.items) |r| {
             b.allocator.free(r.topic);
             b.allocator.free(r.payload);
+            b.allocator.free(r.props);
         }
         b.retained.deinit(b.allocator);
         b.* = undefined;
@@ -1222,6 +1418,17 @@ pub const Broker = struct {
         return b.queue_drops.load(.monotonic);
     }
 
+    /// Stored messages (retained, queued) dropped because their 5.0 Message
+    /// Expiry ran out before delivery.
+    pub fn messagesExpired(b: *const Broker) u64 {
+        return b.messages_expired.load(.monotonic);
+    }
+
+    /// Deliveries dropped for a subscriber they were too large for.
+    pub fn oversizeDrops(b: *const Broker) u64 {
+        return b.oversize_drops.load(.monotonic);
+    }
+
     /// Persistent sessions held, online and offline.
     pub fn sessionCount(b: *Broker) usize {
         b.mutex.lock();
@@ -1264,6 +1471,10 @@ pub const Broker = struct {
         /// Messages the session has lost to its queue limits, ever.
         drops: u64,
         subs: []SessionSub,
+        /// 5.0 Session Expiry Interval in force (seconds, 0xFFFFFFFF never);
+        /// null for a 3.1.1 session. Reported only: `restoreSession` brings a
+        /// session back under `Config.session_expiry_ms` (backlog).
+        expiry_interval_s: ?u32 = null,
     };
 
     /// Every persistent session, copied into `arena` (the caller frees it
@@ -1284,7 +1495,7 @@ pub const Broker = struct {
             const subs = try arena.alloc(SessionSub, x.subs.items.len);
             for (x.subs.items, subs) |f, *d| d.* = .{
                 .filter = try arena.dupe(u8, f),
-                .qos = b.index.qosOf(f, .{ .session = x }) orelse .at_most_once,
+                .qos = if (b.indexRef(f, .{ .session = x })) |r| r.qos else .at_most_once,
             };
             x.lock.lock();
             defer x.lock.unlock();
@@ -1297,6 +1508,7 @@ pub const Broker = struct {
                 .inflight = x.inflight.items.len,
                 .drops = x.drops,
                 .subs = subs,
+                .expiry_interval_s = x.expiry_s,
             };
         }
         return out;
@@ -1348,7 +1560,8 @@ pub const Broker = struct {
         for (subs) |sub| {
             if (@intFromEnum(sub.qos) > @intFromEnum(b.config.maximum_qos)) return error.InvalidSubscription;
             topic.validateFilter(sub.filter) catch return error.InvalidSubscription;
-            if (std.mem.count(u8, sub.filter, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
+            const inner = (splitShared(sub.filter) catch return error.InvalidSubscription) orelse sub.filter;
+            if (std.mem.count(u8, inner, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
         }
         b.mutex.lock();
         defer b.mutex.unlock();
@@ -1359,7 +1572,7 @@ pub const Broker = struct {
         x.offline_since_ms = offline_since_ms;
         for (subs) |sub| {
             if (b.hasSessionSub(x, sub.filter)) {
-                b.index.updateQos(sub.filter, .{ .session = x }, sub.qos);
+                b.indexUpdate(sub.filter, .{ .owner = .{ .session = x }, .qos = sub.qos });
                 continue;
             }
             b.addSessionSub(x, sub.filter, sub.qos) catch {
@@ -1382,8 +1595,68 @@ pub const Broker = struct {
         errdefer b.allocator.free(owned);
         try x.subs.append(b.allocator, owned);
         errdefer x.subs.items.len -= 1;
-        b.index.add(b.allocator, filter, .{ .session = x }, qos) catch return error.OutOfMemory;
+        b.indexAdd(filter, .{ .owner = .{ .session = x }, .qos = qos }) catch return error.OutOfMemory;
         b.subscriptions_total += 1;
+    }
+
+    // ── the subscription index, Shared Subscriptions included ───────────────
+    // Every path that adds, replaces, removes or reads one subscription goes
+    // through these four, so a `$share/...` filter reaches its group and an
+    // ordinary one the trie, whoever the caller. Filters here are validated.
+    // Caller holds `mutex`.
+
+    fn findShared(b: *Broker, full: []const u8) ?usize {
+        for (b.shared.items, 0..) |g, i| if (std.mem.eql(u8, g.full, full)) return i;
+        return null;
+    }
+
+    fn indexAdd(b: *Broker, filter: []const u8, ref: SubRef) Error!void {
+        const inner = (splitShared(filter) catch unreachable) orelse return b.index.add(b.allocator, filter, ref);
+        const g = if (b.findShared(filter)) |i| b.shared.items[i] else blk: {
+            const g = try b.allocator.create(Shared);
+            errdefer b.allocator.destroy(g);
+            const full = try b.allocator.dupe(u8, filter);
+            errdefer b.allocator.free(full);
+            g.* = .{ .full = full, .filter = full[full.len - inner.len ..] };
+            try b.shared.append(b.allocator, g);
+            break :blk g;
+        };
+        g.members.append(b.allocator, ref) catch |e| {
+            if (g.members.items.len == 0) b.dropShared(g);
+            return e;
+        };
+    }
+
+    fn indexUpdate(b: *Broker, filter: []const u8, ref: SubRef) void {
+        if ((splitShared(filter) catch unreachable) == null) return b.index.update(filter, ref);
+        const i = b.findShared(filter) orelse return;
+        for (b.shared.items[i].members.items) |*m| if (m.owner.eql(ref.owner)) {
+            m.* = ref;
+        };
+    }
+
+    fn indexRemove(b: *Broker, filter: []const u8, owner: Owner) void {
+        if ((splitShared(filter) catch unreachable) == null) return b.index.removeFilter(b.allocator, filter, owner);
+        const i = b.findShared(filter) orelse return;
+        const g = b.shared.items[i];
+        Index.removeRefFrom(&g.members, owner);
+        if (g.next >= g.members.items.len) g.next = 0;
+        // A Shared Subscription lasts while it has a member (4.8.2).
+        if (g.members.items.len == 0) b.dropShared(g);
+    }
+
+    fn indexRef(b: *Broker, filter: []const u8, owner: Owner) ?SubRef {
+        if ((splitShared(filter) catch unreachable) == null) return b.index.refOf(filter, owner);
+        const i = b.findShared(filter) orelse return null;
+        for (b.shared.items[i].members.items) |m| if (m.owner.eql(owner)) return m;
+        return null;
+    }
+
+    fn dropShared(b: *Broker, g: *Shared) void {
+        if (std.mem.indexOfScalar(*Shared, b.shared.items, g)) |i| _ = b.shared.swapRemove(i);
+        g.members.deinit(b.allocator);
+        b.allocator.free(g.full);
+        b.allocator.destroy(g);
     }
 
     /// Discard every offline session whose connection's last packet is at
@@ -1391,23 +1664,36 @@ pub const Broker = struct {
     /// one `process` is given). Returns how many went. A no-op while
     /// `session_expiry_ms` is 0.
     pub fn expireSessions(b: *Broker, now: i64) usize {
-        const ttl = b.config.session_expiry_ms;
-        if (ttl == 0) return 0;
-        b.mutex.lock();
-        defer b.mutex.unlock();
+        // A session that ends takes its delayed Will with it — published now
+        // (3.1.2-8: "or the Session ends"), after the lock.
+        var wills: std.ArrayListUnmanaged(DelayedWill) = .empty;
+        defer wills.deinit(b.allocator);
         var gone: usize = 0;
-        var i: usize = 0;
-        while (i < b.sessions.items.len) {
-            const x = b.sessions.items[i];
-            x.lock.lock();
-            const offline = x.conn == null;
-            x.lock.unlock();
-            if (offline and now - x.offline_since_ms >= @as(i64, @intCast(@min(ttl, std.math.maxInt(i64))))) {
-                b.discardSession(x); // swap-removes index i
-                gone += 1;
-                continue;
+        {
+            b.mutex.lock();
+            defer b.mutex.unlock();
+            b.now_hint = @max(b.now_hint, now);
+            var i: usize = 0;
+            while (i < b.sessions.items.len) {
+                const x = b.sessions.items[i];
+                x.lock.lock();
+                const offline = x.conn == null;
+                x.lock.unlock();
+                const ttl_ms: ?u64 = if (x.expiry_s) |e|
+                    (if (e == std.math.maxInt(u32)) null else @as(u64, e) * 1000)
+                else if (b.config.session_expiry_ms == 0) null else b.config.session_expiry_ms;
+                if (offline) if (ttl_ms) |ttl| if (now - x.offline_since_ms >= @as(i64, @intCast(@min(ttl, std.math.maxInt(i64))))) {
+                    if (b.takeDelayedWill(x.clientId())) |w| wills.append(b.allocator, w) catch b.freeDelayedWill(w);
+                    b.discardSession(x); // swap-removes index i
+                    gone += 1;
+                    continue;
+                };
+                i += 1;
             }
-            i += 1;
+        }
+        for (wills.items) |w| {
+            b.publishWillParts(.{ .topic = w.topic, .payload = w.payload, .props = w.props, .qos = w.qos, .retain = w.retain, .expiry_s = w.expiry_s }, now);
+            b.freeDelayedWill(w);
         }
         return gone;
     }
@@ -1478,6 +1764,7 @@ pub const Broker = struct {
 
     fn freeConnection(b: *Broker, conn: *Connection) void {
         b.dropWill(conn);
+        b.freeAliases(conn);
         if (conn.session) |x| b.releaseSession(x);
         for (conn.subs.items) |f| b.allocator.free(f);
         conn.subs.deinit(b.allocator);
@@ -1491,30 +1778,74 @@ pub const Broker = struct {
     fn dropWill(b: *Broker, conn: *Connection) void {
         if (conn.will_topic) |t| b.allocator.free(t);
         if (conn.will_payload) |p| b.allocator.free(p);
+        if (conn.will_props) |p| b.allocator.free(p);
         conn.will_topic = null;
         conn.will_payload = null;
+        conn.will_props = null;
     }
 
-    /// Publish the Will, once, and forget it. A failure is contained and
-    /// counted rather than propagated: this runs on a teardown path that has no
-    /// one to report to, and a connection must be freed whether or not its last
-    /// message reached anybody.
+    fn freeAliases(b: *Broker, conn: *Connection) void {
+        for (conn.aliases) |a| if (a) |t| b.allocator.free(t);
+        b.allocator.free(conn.aliases);
+        conn.aliases = &.{};
+    }
+
+    /// Publish the Will, once, and forget it — or, under 5.0 with a Will
+    /// Delay Interval and a session that outlives the connection, park it in
+    /// `delayed_wills` for `publishDueWills` (3.1.3.2): a client that connects
+    /// again in time cancels it, and a session that ends first publishes it.
+    /// A failure is contained and counted rather than propagated: this runs on
+    /// a teardown path that has no one to report to, and a connection must be
+    /// freed whether or not its last message reached anybody.
     fn publishWill(b: *Broker, conn: *Connection) void {
         const wt = conn.will_topic orelse return;
         // Topic and payload are set together in `handleConnect`, but the two
         // fields are separately optional, so the payload is unwrapped rather
         // than assumed — an empty will message is legal (spec 3.1.3.3).
-        const wp = conn.will_payload;
+        const wp = conn.will_payload orelse &.{};
+        const wprops = conn.will_props orelse &.{};
         // Detach first: `fanout` must not be able to see a will that is already
         // being delivered, and the free below must not race the delivery.
         conn.will_topic = null;
         conn.will_payload = null;
-        defer {
+        conn.will_props = null;
+        var parked = false;
+        defer if (!parked) {
             b.allocator.free(wt);
-            if (wp) |p| b.allocator.free(p);
+            b.allocator.free(wp);
+            b.allocator.free(wprops);
+        };
+        var now: i64 = undefined;
+        {
+            b.mutex.lock();
+            defer b.mutex.unlock();
+            now = @max(b.now_hint, conn.last_packet_ms);
+            if (conn.will_delay_s > 0) if (conn.session) |x| {
+                // Taken over: the client is back already, so no Will at all.
+                if (b.liveConnectionFor(conn.clientId(), conn)) return;
+                // Delayed only while the session is still there to end later.
+                if (x.registered) {
+                    parked = b.parkWill(conn, wt, wp, wprops, now) catch false;
+                    if (parked) return;
+                }
+            };
         }
+        b.publishWillParts(.{ .topic = wt, .payload = wp, .props = wprops, .qos = conn.will_qos, .retain = conn.will_retain, .expiry_s = conn.will_expiry_s }, now);
+    }
+
+    const WillParts = struct {
+        topic: []const u8,
+        payload: []const u8,
+        props: []const u8,
+        qos: QoS,
+        retain: bool,
+        expiry_s: ?u32,
+    };
+
+    /// The publish half of a Will, immediate or delayed: tap, then fan-out.
+    fn publishWillParts(b: *Broker, w: WillParts, now: i64) void {
         if (b.config.tap_wills) if (b.config.onPublishFn) |tap| {
-            switch (tap(b.config.publish_ctx, wt, if (wp) |p| p else &.{}, conn.will_qos, conn.will_retain)) {
+            switch (tap(b.config.publish_ctx, w.topic, w.payload, w.qos, w.retain)) {
                 .accept => {},
                 .refuse => {
                     _ = b.tap_refusals.fetchAdd(1, .monotonic);
@@ -1523,14 +1854,103 @@ pub const Broker = struct {
                 .consume => return,
             }
         };
-        b.fanout(.{
-            .topic = wt,
-            .payload = if (wp) |p| p else &.{},
-            .qos = conn.will_qos,
-            .retain = conn.will_retain,
-        }) catch {
+        _ = b.fanout(.{
+            .topic = w.topic,
+            .payload = w.payload,
+            .props = packet.decodePropertyEntries(w.props, .publish) catch .{},
+            .retain = w.retain,
+            .expires_at = if (w.expiry_s) |e| now + @as(i64, e) * 1000 else null,
+        }, w.qos, now) catch {
             _ = b.will_failures.fetchAdd(1, .monotonic);
         };
+    }
+
+    /// Whether a connection other than `except` holds `client_id` and is
+    /// connected. Caller holds `mutex`.
+    fn liveConnectionFor(b: *Broker, client_id: []const u8, except: *Connection) bool {
+        for (b.connections.items) |c| {
+            if (c != except and c.state == .connected and std.mem.eql(u8, c.clientId(), client_id)) return true;
+        }
+        return false;
+    }
+
+    /// Move a Will into `delayed_wills`, taking ownership of its buffers.
+    /// Caller holds `mutex`.
+    fn parkWill(b: *Broker, conn: *Connection, wt: []const u8, wp: []const u8, wprops: []const u8, now: i64) error{OutOfMemory}!bool {
+        const id = try b.allocator.dupe(u8, conn.clientId());
+        errdefer b.allocator.free(id);
+        try b.delayed_wills.append(b.allocator, .{
+            .client_id = id,
+            .topic = wt,
+            .payload = wp,
+            .props = wprops,
+            .qos = conn.will_qos,
+            .retain = conn.will_retain,
+            .expiry_s = conn.will_expiry_s,
+            .due_ms = now + @as(i64, conn.will_delay_s) * 1000,
+        });
+        return true;
+    }
+
+    fn freeDelayedWill(b: *Broker, w: DelayedWill) void {
+        b.allocator.free(w.client_id);
+        b.allocator.free(w.topic);
+        b.allocator.free(w.payload);
+        b.allocator.free(w.props);
+    }
+
+    /// Take the delayed Will of `client_id` out of the list, if there is one.
+    /// Caller holds `mutex`.
+    fn takeDelayedWill(b: *Broker, client_id: []const u8) ?DelayedWill {
+        for (b.delayed_wills.items, 0..) |w, i| {
+            if (std.mem.eql(u8, w.client_id, client_id)) return b.delayed_wills.swapRemove(i);
+        }
+        return null;
+    }
+
+    /// Publish every 5.0 Will whose Will Delay Interval has run out by `now`
+    /// (the caller's clock, as given to `process`). Returns how many went.
+    /// `TcpServer` calls it once a second; a server driving the core itself
+    /// calls it as often as it wants Wills on time — they are never early.
+    pub fn publishDueWills(b: *Broker, now: i64) usize {
+        var due: std.ArrayListUnmanaged(DelayedWill) = .empty;
+        defer due.deinit(b.allocator);
+        {
+            b.mutex.lock();
+            defer b.mutex.unlock();
+            b.now_hint = @max(b.now_hint, now);
+            var i: usize = 0;
+            while (i < b.delayed_wills.items.len) {
+                const w = b.delayed_wills.items[i];
+                if (w.due_ms <= now) {
+                    due.append(b.allocator, w) catch break; // the rest next time
+                    _ = b.delayed_wills.swapRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        for (due.items) |w| {
+            b.publishWillParts(.{ .topic = w.topic, .payload = w.payload, .props = w.props, .qos = w.qos, .retain = w.retain, .expiry_s = w.expiry_s }, now);
+            b.freeDelayedWill(w);
+        }
+        return due.items.len;
+    }
+
+    /// A 5.0 DISCONNECT from the server, saying why (3.14, 4.13) — under
+    /// 3.1.1, which has none, nothing. Takes `tx_lock`; a failed write is
+    /// ignored, the connection is going anyway.
+    fn sendDisconnect(b: *Broker, conn: *Connection, reason: packet.ReasonCode) void {
+        _ = b;
+        if (conn.state != .connected) return;
+        writeDisconnect(conn, reason);
+    }
+
+    fn writeDisconnect(conn: *Connection, reason: packet.ReasonCode) void {
+        if (conn.version != .v5) return;
+        var buf: [4]u8 = undefined;
+        const bytes = packet.encodePacket(&buf, .v5, .{ .disconnect = .{ .reason_code = reason } }) catch return;
+        conn.lockedWrite(bytes) catch {};
     }
 
     /// Publish from the server itself, with no client behind it.
@@ -1575,8 +1995,30 @@ pub const Broker = struct {
         qos: QoS,
         retain: bool,
     ) Error!void {
-        if (@intFromEnum(qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
+        return b.publishWith(topic_name, payload, .{ .qos = qos, .retain = retain });
+    }
+
+    pub const PublishOptions = struct {
+        qos: QoS = .at_most_once,
+        retain: bool = false,
+        /// 5.0 properties to forward (only the forwardable ones are kept:
+        /// Payload Format, Content Type, Response Topic, Correlation Data,
+        /// User Properties) — 3.1.1 subscribers get none of them.
+        properties: packet.Properties = .{},
+        /// Message Expiry, seconds from `now`.
+        message_expiry_s: ?u32 = null,
+        /// The caller clock (ms) the expiry counts from; null = the latest
+        /// time the broker has been given.
+        now: ?i64 = null,
+    };
+
+    /// `publish` with 5.0 properties and a Message Expiry. Held to
+    /// `max_packet_size` in its largest form, the 5.0 PUBLISH a subscriber
+    /// would get.
+    pub fn publishWith(b: *Broker, topic_name: []const u8, payload: []const u8, o: PublishOptions) Error!void {
+        if (@intFromEnum(o.qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
         topic.validateName(topic_name) catch return error.ProtocolViolation;
+        const fwd = forwardable(o.properties);
 
         // A1 mqtt M1. Every subscriber's `tx_buf` is sized from
         // `max_packet_size`, and an INBOUND publish can never exceed it
@@ -1591,24 +2033,36 @@ pub const Broker = struct {
         //
         // So the sender is held to the receiver's limit, which is exactly what
         // this function's doc comment already claims about topics: a server
-        // cannot put on the wire what it would reject off it.
-        // `publishWireLen` sizes the packet-id field from `qos` alone — the id
-        // VALUE never affects the size — and delivery is at `min(qos, granted)`,
-        // never above `qos`, so a subscriber's copy can never be larger than
-        // what this measures.
-        const wire = packet.publishWireLen(.{
+        // cannot put on the wire what it would reject off it. The id VALUE
+        // never affects the size, and delivery is at `min(qos, granted)`, never
+        // above `qos`, so a subscriber's copy can never be larger than what this
+        // measures (5.0 Subscription Identifiers aside, see `tx_headroom`).
+        // Measured in the smallest form a client could have sent it in:
+        // 3.1.1 when there is nothing only 5.0 can carry.
+        var sized = fwd;
+        sized.message_expiry_interval = o.message_expiry_s;
+        const form: packet.Version = if (sized.isEmpty()) .v3_1_1 else .v5;
+        const wire = packet.packetWireLen(form, .{ .publish = .{
             .topic = topic_name,
             .payload = payload,
-            .qos = qos,
-        }) catch return error.PayloadTooLarge;
+            .qos = o.qos,
+            .packet_id = 1,
+            .properties = sized,
+        } }) catch return error.PayloadTooLarge;
         if (wire > b.config.max_packet_size) return error.PayloadTooLarge;
 
-        try b.fanout(.{
+        const now = o.now orelse blk: {
+            b.mutex.lock();
+            defer b.mutex.unlock();
+            break :blk b.now_hint;
+        };
+        _ = try b.fanout(.{
             .topic = topic_name,
             .payload = payload,
-            .qos = qos,
-            .retain = retain,
-        });
+            .props = fwd,
+            .retain = o.retain,
+            .expires_at = if (o.message_expiry_s) |e| now + @as(i64, e) * 1000 else null,
+        }, o.qos, now);
     }
 
     /// Buffer bytes received from this connection's client (any framing).
@@ -1648,11 +2102,32 @@ pub const Broker = struct {
     pub fn process(b: *Broker, conn: *Connection, now: i64) Error!Disposition {
         while (true) {
             conn.compact();
-            const dec = (try packet.decode(conn.rx_buf[0..conn.rx_len])) orelse return .keep;
+            // Until the CONNECT, the version is unknown: `.v5` decodes a
+            // CONNECT of either level and says which. Any other first packet
+            // is read as 3.1.1, to be refused as before (spec 3.1).
+            const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @intFromEnum(packet.PacketType.connect);
+            const version: packet.Version = if (conn.state != .awaiting_connect) conn.version else if (first_is_connect) .v5 else .v3_1_1;
+            const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| return b.fail(conn, e)) orelse return .keep;
             conn.rx_consumed = dec.consumed;
             conn.last_packet_ms = now;
-            if (try b.handle(conn, dec.packet, now) == .close) return .close;
+            const disp = b.handle(conn, dec.packet, now) catch |e| return b.fail(conn, e);
+            if (disp == .close) return .close;
         }
+    }
+
+    /// A failed `process`: a 5.0 client is first told why with a DISCONNECT
+    /// (4.13) — the reason a handler recorded, else the class of the decode
+    /// error; transport trouble and cancellation tell it nothing. The error
+    /// goes to the caller exactly as before.
+    fn fail(b: *Broker, conn: *Connection, err: Error) Error {
+        const reason: ?packet.ReasonCode = conn.close_reason orelse switch (err) {
+            error.ProtocolViolation, error.UnsupportedProtocol => .protocol_error,
+            error.MalformedPacket, error.InvalidUtf8, error.InvalidFlags, error.InvalidQos, error.MalformedRemainingLength, error.UnknownPacketType => .malformed_packet,
+            error.TooManySubscriptions => .quota_exceeded,
+            else => null,
+        };
+        if (reason) |r| b.sendDisconnect(conn, r);
+        return err;
     }
 
     /// True when the keep-alive deadline (1.5 × the client's keep-alive) has
@@ -1676,9 +2151,9 @@ pub const Broker = struct {
             .disconnected => return .close,
             .connected => switch (p) {
                 .connect => return error.ProtocolViolation, // second CONNECT (spec 3.1-2)
-                .publish => |pub_pkt| return b.handlePublish(conn, pub_pkt),
+                .publish => |pub_pkt| return b.handlePublish(conn, pub_pkt, now),
                 .subscribe => |s| {
-                    try b.handleSubscribe(conn, s);
+                    try b.handleSubscribe(conn, s, now);
                     return .keep;
                 },
                 .unsubscribe => |u| {
@@ -1686,15 +2161,15 @@ pub const Broker = struct {
                     return .keep;
                 },
                 .puback => |ack| {
-                    try b.handleOutboundDone(conn, ack.packet_id, .puback);
+                    try b.handleOutboundDone(conn, ack.packet_id, .puback, now);
                     return .keep;
                 },
                 .pubrec => |ack| {
-                    try b.handlePubrec(conn, ack);
+                    try b.handlePubrec(conn, ack, now);
                     return .keep;
                 },
                 .pubcomp => |ack| {
-                    try b.handleOutboundDone(conn, ack.packet_id, .pubcomp);
+                    try b.handleOutboundDone(conn, ack.packet_id, .pubcomp, now);
                     return .keep;
                 },
                 .pubrel => |ack| {
@@ -1706,12 +2181,22 @@ pub const Broker = struct {
                     try conn.lockedWrite(try packet.encodePingresp(&buf));
                     return .keep;
                 },
-                .disconnect => {
+                .disconnect => |d| {
+                    if (d.properties.session_expiry_interval) |sei| {
+                        // 3.14.2.2.2: a session the CONNECT let end with the
+                        // connection cannot be kept alive by the DISCONNECT.
+                        if (conn.session_expiry_s == 0 and sei != 0) {
+                            conn.close_reason = .protocol_error;
+                            return error.ProtocolViolation;
+                        }
+                        conn.session_expiry_s = b.cappedExpiry(sei);
+                    }
                     // A DISCONNECT is the client saying this was deliberate, so
-                    // the Will is discarded and never published (spec 3.14.4).
+                    // the Will is discarded and never published (spec 3.14.4) —
+                    // unless a 5.0 client asks for it anyway (reason 0x04).
                     // Dropping it here is also what makes "a will is still set"
                     // the test `remove` uses for an ungraceful end.
-                    b.dropWill(conn);
+                    if (d.reason_code != .disconnect_with_will_message) b.dropWill(conn);
                     // Clean session: routing state is dropped on disconnect.
                     // A persistent one keeps it and goes offline.
                     b.mutex.lock();
@@ -1728,8 +2213,12 @@ pub const Broker = struct {
     }
 
     fn handleConnect(b: *Broker, conn: *Connection, c: packet.Connect, now: i64) Error!Disposition {
-        // The codec already validated the protocol name/level and rejected an
-        // empty client-id without clean session. Assign or generate the id.
+        conn.version = c.version;
+        const v5 = c.version == .v5;
+        // The codec already validated the protocol name/level and (3.1.1)
+        // rejected an empty client-id without clean session. Assign or
+        // generate the id — 5.0 says which in CONNACK (3.1.3-7).
+        var assigned = false;
         if (c.client_id.len == 0) {
             var idbuf: [max_client_id]u8 = undefined;
             b.mutex.lock();
@@ -1737,14 +2226,17 @@ pub const Broker = struct {
             b.next_auto_id += 1;
             b.mutex.unlock();
             conn.setClientId(gen) catch unreachable;
+            assigned = true;
         } else conn.setClientId(c.client_id) catch {
-            var cbuf: [4]u8 = undefined;
-            try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
-                .session_present = false,
-                .return_code = .identifier_rejected,
-            }));
-            return .close;
+            return b.refuseConnect(conn, .identifier_rejected, .client_identifier_not_valid);
         };
+
+        // 5.0 extended authentication (4.12): no method is implemented here,
+        // so a CONNECT naming one is refused with 0x8C (4.12.0-1) rather than
+        // admitted as if it had not asked.
+        if (v5 and c.properties.authentication_method != null) {
+            return b.refuseConnect(conn, .not_authorized, .bad_authentication_method);
+        }
 
         // Thread the identity onto the connection so the ACL hook can see it.
         // A username too long to retain must not silently become "no
@@ -1754,12 +2246,7 @@ pub const Broker = struct {
         // oversized client id above.
         if (c.username) |uname| {
             if (uname.len > conn.username_buf.len) {
-                var cbuf: [4]u8 = undefined;
-                try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
-                    .session_present = false,
-                    .return_code = .bad_username_or_password,
-                }));
-                return .close;
+                return b.refuseConnect(conn, .bad_username_or_password, .bad_user_name_or_password);
             }
             @memcpy(conn.username_buf[0..uname.len], uname);
             conn.username_len = uname.len;
@@ -1779,20 +2266,15 @@ pub const Broker = struct {
                     .retain = w.retain,
                     .payload_len = w.message.len,
                 } else null,
+                .version = c.version,
+                .properties = c.properties,
             });
             const rc: ?packet.ConnectReturnCode = switch (decision) {
                 .allow => null,
                 .deny_not_authorized => .not_authorized,
                 .deny_bad_credentials => .bad_username_or_password,
             };
-            if (rc) |code| {
-                var cbuf: [4]u8 = undefined;
-                try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
-                    .session_present = false,
-                    .return_code = code,
-                }));
-                return .close;
-            }
+            if (rc) |code| return b.refuseConnect(conn, code, packet.reasonFromReturnCode(code));
         }
 
         // Will (spec 3.1.2.5–3.1.3.3), taken AFTER authentication so a refused
@@ -1811,21 +2293,33 @@ pub const Broker = struct {
             // The Will is published for this client later, so it needs the
             // right to publish there now (see `Config.authorizeFn`).
             if (!b.aclAllows(conn, w.topic, .publish, w.retain)) {
-                var cbuf: [4]u8 = undefined;
-                try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
-                    .session_present = false,
-                    .return_code = .not_authorized,
-                }));
-                return .close;
+                return b.refuseConnect(conn, .not_authorized, .not_authorized);
+            }
+            if (v5 and @intFromEnum(w.qos) > @intFromEnum(b.config.maximum_qos)) {
+                return b.refuseConnect(conn, .not_authorized, .qos_not_supported); // 3.2.2-12
             }
             const wt = try b.allocator.dupe(u8, w.topic);
             errdefer b.allocator.free(wt);
             const wp = try b.allocator.dupe(u8, w.message);
+            errdefer b.allocator.free(wp);
+            const wprops = try b.ownedForward(w.properties);
             conn.will_topic = wt;
             conn.will_payload = wp;
+            conn.will_props = wprops;
             conn.will_qos = w.qos;
             conn.will_retain = w.retain;
+            conn.will_expiry_s = w.properties.message_expiry_interval;
+            conn.will_delay_s = w.properties.will_delay_interval orelse 0;
         }
+
+        // The session this CONNECT asks for. 3.1.1: Clean Session 0 keeps one
+        // across connections. 5.0 (3.1.2.4, 3.1.2.11.2): Clean Start says
+        // whether to resume one that exists, and a Session Expiry Interval
+        // above 0 keeps one past the connection — held to
+        // `Config.session_expiry_ms`, announced in CONNACK when lowered.
+        const requested_sei: u32 = if (v5) c.properties.session_expiry_interval orelse 0 else 0;
+        const sei = b.cappedExpiry(requested_sei);
+        const keep = if (v5) sei > 0 else !c.clean_session;
 
         // ⛔ `tx_lock` is taken BEFORE a session is attached and held until the
         // CONNACK and every resent message are written: from the moment
@@ -1836,16 +2330,19 @@ pub const Broker = struct {
 
         // Session take-over: a live connection with the same client-id is
         // disconnected (spec 3.1.4-2), its routing state dropped and — FIX C —
-        // its socket shut down so its owner thread wakes and reaps it.
+        // its socket shut down so its owner thread wakes and reaps it; a 5.0
+        // one is told first (DISCONNECT 0x8E, `tellSuperseded`).
         //
-        // Then the session (spec 3.1.2.4). Clean session 1 discards any the
-        // client left behind (3.1.2-6). Clean session 0 resumes it — its
-        // subscriptions, what was queued for it and what was never
-        // acknowledged — or starts one.
+        // Then the session (spec 3.1.2.4). Clean session/start 1 discards any
+        // the client left behind (3.1.2-6, 5.0 3.1.2-4). Clean 0 resumes it —
+        // its subscriptions, what was queued for it and what was never
+        // acknowledged — or starts one when one is to be kept.
         var resumed: ?*Session = null;
+        var owed: Superseded = .{};
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            b.now_hint = @max(b.now_hint, now);
             const existing = b.findSession(conn.clientId());
             // ⛔ A client id is not an identity (egw audit S1 R3): another
             // account that knows it would otherwise resume the session —
@@ -1854,51 +2351,88 @@ pub const Broker = struct {
             // with clean session 1. Refused before anything changes hands.
             if (b.claimedByAnother(conn, existing)) {
                 b.dropWill(conn);
-                var cbuf: [4]u8 = undefined;
-                try conn.write(try packet.encodeConnack(&cbuf, .{
-                    .session_present = false,
-                    .return_code = .not_authorized,
-                }));
+                var cbuf: [8]u8 = undefined;
+                try conn.write(try connackRefusal(&cbuf, conn.version, .not_authorized, .not_authorized));
                 return .close;
             }
-            if (!c.clean_session and existing == null and b.sessions.items.len >= b.config.max_sessions) {
+            const resuming = !c.clean_session and existing != null;
+            const create = !resuming and keep;
+            if (create and existing == null and b.sessions.items.len >= b.config.max_sessions) {
                 // Refused before anything changed hands, so a live session
                 // under this id — there is none — is not disturbed either.
                 b.dropWill(conn);
-                var cbuf: [4]u8 = undefined;
-                try conn.write(try packet.encodeConnack(&cbuf, .{
-                    .session_present = false,
-                    .return_code = .server_unavailable,
-                }));
+                var cbuf: [8]u8 = undefined;
+                try conn.write(try connackRefusal(&cbuf, conn.version, .server_unavailable, .quota_exceeded));
                 return .close;
             }
             // Allocated before the take-over, so running out of memory here
             // leaves the earlier connection alone.
-            const fresh: ?*Session = if (!c.clean_session and existing == null) try b.createSession(conn.clientId(), conn.usernameOpt()) else null;
-            b.takeover(conn);
+            const fresh: ?*Session = if (create) try b.createSession(conn.clientId(), conn.usernameOpt()) else null;
+            b.takeover(conn, &owed);
             if (existing) |x| {
-                if (c.clean_session) b.discardSession(x) else {
+                if (resuming) {
                     attach(x, conn);
                     resumed = x;
-                }
-            } else if (fresh) |x| attach(x, conn);
+                } else b.discardSession(x);
+            }
+            if (fresh) |x| attach(x, conn);
+            // Back before its Will Delay ran out: no Will (3.1.3-9).
+            if (b.takeDelayedWill(conn.clientId())) |w| b.freeDelayedWill(w);
             conn.keep_alive_s = c.keep_alive_s;
             conn.last_packet_ms = now;
+            conn.session_expiry_s = sei;
+            if (v5) {
+                conn.client_receive_maximum = c.properties.receive_maximum orelse std.math.maxInt(u16);
+                conn.client_max_packet = c.properties.maximum_packet_size orelse std.math.maxInt(u32);
+            }
             conn.state = .connected;
         }
+        b.tellSuperseded(&owed);
 
-        var cbuf: [4]u8 = undefined;
-        try conn.write(try packet.encodeConnack(&cbuf, .{
+        var cbuf: [64 + max_client_id]u8 = undefined;
+        try conn.write(try packet.encodePacket(&cbuf, conn.version, .{ .connack = .{
             .session_present = resumed != null,
-            .return_code = .accepted,
-        }));
+            .properties = if (v5) b.connackProperties(conn, assigned, if (sei != requested_sei) sei else null) else .{},
+        } }));
         if (resumed) |x| {
             // Spec 4.4: unacknowledged PUBLISHes go again, with their
             // original ids and DUP set, before anything new.
-            try b.resendLocked(conn, x);
-            try b.pumpLocked(conn, x);
+            try b.resendLocked(conn, x, now);
+            try b.pumpLocked(conn, x, now);
         }
         return .keep;
+    }
+
+    /// What a 5.0 CONNACK tells the client about this broker (3.2.2.3).
+    fn connackProperties(b: *const Broker, conn: *const Connection, assigned: bool, lowered_sei: ?u32) packet.Properties {
+        return .{
+            .session_expiry_interval = lowered_sei,
+            // The inbound QoS 2 window (QoS 1 is acknowledged at once).
+            .receive_maximum = max_in_flight,
+            .maximum_qos = if (b.config.maximum_qos == .exactly_once) null else b.config.maximum_qos,
+            // The receive buffer: no larger packet can be taken.
+            .maximum_packet_size = @intCast(@min(b.config.max_packet_size, std.math.maxInt(u32))),
+            .assigned_client_identifier = if (assigned) conn.clientId() else null,
+            .topic_alias_maximum = if (b.config.topic_alias_maximum > 0) b.config.topic_alias_maximum else null,
+        };
+    }
+
+    /// Refuse a CONNECT: the CONNACK in the client's version, then close.
+    fn refuseConnect(b: *Broker, conn: *Connection, rc3: packet.ConnectReturnCode, rc5: packet.ReasonCode) Error!Disposition {
+        _ = b;
+        var cbuf: [8]u8 = undefined;
+        try conn.lockedWrite(try connackRefusal(&cbuf, conn.version, rc3, rc5));
+        return .close;
+    }
+
+    /// The forwardable properties of a message (`forwardable`) as owned
+    /// property entries — how a Will, a retained message and a queued one
+    /// keep them.
+    fn ownedForward(b: *Broker, p: packet.Properties) Error![]u8 {
+        const fwd = forwardable(p);
+        const buf = try b.allocator.alloc(u8, try packet.propertyEntriesLen(fwd, .publish));
+        _ = packet.encodePropertyEntries(buf, fwd, .publish) catch unreachable;
+        return buf;
     }
 
     // ── persistent sessions ──────────────────────────────────────────────────
@@ -1939,13 +2473,30 @@ pub const Broker = struct {
     /// Take `conn`'s session offline, if it is still the one delivering.
     /// Caller holds `mutex`.
     fn park(b: *Broker, conn: *Connection) void {
-        _ = b;
         const x = conn.session orelse return;
-        x.lock.lock();
-        defer x.lock.unlock();
-        if (x.conn != conn) return; // taken over: the session lives on elsewhere
-        x.conn = null;
-        x.offline_since_ms = conn.last_packet_ms;
+        {
+            x.lock.lock();
+            defer x.lock.unlock();
+            if (x.conn != conn) return; // taken over: the session lives on elsewhere
+            x.conn = null;
+            x.offline_since_ms = conn.last_packet_ms;
+        }
+        if (conn.version == .v5) {
+            // 5.0: the session lasts its Session Expiry Interval past the
+            // connection — and not at all when that is 0 (3.1.2.11.2).
+            x.expiry_s = conn.session_expiry_s;
+            if (conn.session_expiry_s == 0) b.discardSession(x);
+        } else x.expiry_s = null;
+    }
+
+    /// A 5.0 Session Expiry Interval held to `Config.session_expiry_ms` when
+    /// that is set (the broker may keep a session for less than asked; it
+    /// says so in CONNACK).
+    fn cappedExpiry(b: *const Broker, requested_s: u32) u32 {
+        const cap_ms = b.config.session_expiry_ms;
+        if (cap_ms == 0) return requested_s;
+        const cap_s: u32 = @intCast(@min(std.math.divCeil(u64, cap_ms, 1000) catch unreachable, std.math.maxInt(u32) - 1));
+        return @min(requested_s, cap_s);
     }
 
     /// Drop a session from the registry and the index; it is freed when its
@@ -1953,7 +2504,7 @@ pub const Broker = struct {
     fn discardSession(b: *Broker, x: *Session) void {
         if (std.mem.indexOfScalar(*Session, b.sessions.items, x)) |i| _ = b.sessions.swapRemove(i);
         for (x.subs.items) |f| {
-            b.index.removeFilter(b.allocator, f, .{ .session = x });
+            b.indexRemove(f, .{ .session = x });
             b.allocator.free(f);
             b.subscriptions_total -= 1;
         }
@@ -1980,24 +2531,37 @@ pub const Broker = struct {
         b.allocator.destroy(x);
     }
 
-    /// Queue one QoS 1/2 message for `x`, or count it dropped. Caller holds
-    /// `x.lock`. Never fails: a session that cannot take a message must not
-    /// fail the publish that produced it.
-    fn enqueueLocked(b: *Broker, x: *Session, topic_name: []const u8, payload: []const u8, retain: bool, qos: QoS) void {
-        const len = topic_name.len + payload.len;
+    /// Queue one QoS 1/2 message for `x`, or count it dropped. `props` are
+    /// `msg.props` already as stored entries (the caller makes them once per
+    /// fan-out). Caller holds `x.lock`. Never fails: a session that cannot
+    /// take a message must not fail the publish that produced it.
+    fn enqueueLocked(b: *Broker, x: *Session, msg: Outgoing, qos: QoS, ids: []const u32, props: []const u8) void {
+        const len = msg.topic.len + msg.payload.len + props.len + ids.len * 4;
         if (x.queuedLen() >= b.config.max_queued_messages or
             x.queued_bytes + len > b.config.max_queued_bytes)
         {
             b.countDrop(x);
             return;
         }
-        const bytes = b.allocator.alloc(u8, len) catch {
+        const bytes = b.allocator.alignedAlloc(u8, .@"4", len) catch {
             b.countDrop(x);
             return;
         };
-        @memcpy(bytes[0..topic_name.len], topic_name);
-        @memcpy(bytes[topic_name.len..], payload);
-        x.queue.append(b.allocator, .{ .bytes = bytes, .topic_len = topic_name.len, .retain = retain, .qos = qos }) catch {
+        var at: usize = 0;
+        for ([_][]const u8{ std.mem.sliceAsBytes(ids), msg.topic, msg.payload, props }) |part| {
+            @memcpy(bytes[at..][0..part.len], part);
+            at += part.len;
+        }
+        x.queue.append(b.allocator, .{
+            .bytes = bytes,
+            .topic_len = msg.topic.len,
+            .payload_len = msg.payload.len,
+            .props_len = props.len,
+            .ids_len = ids.len,
+            .expires_at = msg.expires_at,
+            .retain = msg.retain,
+            .qos = qos,
+        }) catch {
             b.allocator.free(bytes);
             b.countDrop(x);
             return;
@@ -2011,29 +2575,34 @@ pub const Broker = struct {
         _ = b.queue_drops.fetchAdd(1, .monotonic);
     }
 
-    /// Move queued messages into flight and write them, while `conn` is the
-    /// session's connection and the window has room. Caller holds
-    /// `conn.tx_lock`. A failed write leaves its message in flight, so it
-    /// goes again, with DUP, when the client resumes the session.
-    fn pumpLocked(b: *Broker, conn: *Connection, x: *Session) Error!void {
+    fn pumpLocked(b: *Broker, conn: *Connection, x: *Session, now: i64) Error!void {
+        // 5.0: never more unacknowledged than the client takes (3.3.4-9).
+        const window = @min(max_in_flight, conn.client_receive_maximum);
         while (true) {
             var bytes: []const u8 = undefined;
             {
                 x.lock.lock();
                 defer x.lock.unlock();
                 if (x.conn != conn or conn.state != .connected) return;
-                if (x.inflight.items.len >= max_in_flight) return;
+                if (x.inflight.items.len >= window) return;
                 var m = x.popQueue() orelse return;
+                // Waited past its Message Expiry: deleted, not sent (3.3.2-5).
+                const expiry = remainingExpiry(m.expires_at, now) orelse {
+                    b.allocator.free(m.bytes);
+                    _ = b.messages_expired.fetchAdd(1, .monotonic);
+                    continue;
+                };
                 m.id = x.allocId();
-                // Cannot fail: every message was held to `max_packet_size`
-                // when it arrived, and `tx_buf` has `tx_headroom` for the id.
-                bytes = packet.encodePublish(conn.tx_buf, .{
-                    .topic = m.topicName(),
-                    .payload = m.payload(),
-                    .qos = m.qos,
-                    .retain = m.retain,
-                    .packet_id = m.id,
-                }) catch {
+                // Cannot fail for size in 3.1.1: every message was held to
+                // `max_packet_size` when it arrived, and `tx_buf` has
+                // `tx_headroom` for the id. Under 5.0 the client's own limit
+                // can refuse it; it is dropped then, as if delivered.
+                const p = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, false, m.id, m.ids(), expiry);
+                if (!b.fits(conn, p)) {
+                    b.allocator.free(m.bytes);
+                    continue;
+                }
+                bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
                     b.allocator.free(m.bytes);
                     b.countDrop(x);
                     continue;
@@ -2044,13 +2613,7 @@ pub const Broker = struct {
         }
     }
 
-    /// Write every in-flight message of `x` again, with DUP — or, for a QoS 2
-    /// one whose PUBREC already came, its PUBREL (4.4: "resend any
-    /// unacknowledged PUBLISH and PUBREL packets"). Caller holds
-    /// `conn.tx_lock`, which is also what keeps the in-flight list from
-    /// changing under the loop: only an ack on `conn` removes from it, and
-    /// only a pump holding this same lock adds to it.
-    fn resendLocked(b: *Broker, conn: *Connection, x: *Session) Error!void {
+    fn resendLocked(b: *Broker, conn: *Connection, x: *Session, now: i64) Error!void {
         _ = b;
         var i: usize = 0;
         while (true) : (i += 1) {
@@ -2060,17 +2623,13 @@ pub const Broker = struct {
                 defer x.lock.unlock();
                 if (x.conn != conn or i >= x.inflight.items.len) return;
                 const m = x.inflight.items[i];
+                // Expiry is not applied once a PUBLISH has gone (4.3.3-7): a
+                // resend carries at least one second of it.
+                const expiry: ?u32 = if (m.expires_at) |at| secondsLeft(at, now, 1) else null;
                 bytes = if (m.released)
-                    try packet.encodePubrel(conn.tx_buf, m.id)
+                    try packet.encodePacket(conn.tx_buf, conn.version, .{ .pubrel = .{ .packet_id = m.id } })
                 else
-                    try packet.encodePublish(conn.tx_buf, .{
-                        .topic = m.topicName(),
-                        .payload = m.payload(),
-                        .qos = m.qos,
-                        .retain = m.retain,
-                        .dup = true,
-                        .packet_id = m.id,
-                    });
+                    try packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = deliveryPacket(conn, m.outgoing(), m.qos, m.retain, true, m.id, m.ids(), expiry) });
             }
             try conn.write(bytes);
         }
@@ -2094,7 +2653,15 @@ pub const Broker = struct {
         return false;
     }
 
-    fn takeover(b: *Broker, newconn: *Connection) void {
+    /// Connections a take-over superseded that speak 5.0 and are owed a
+    /// DISCONNECT 0x8E (3.1.4-3), each referenced; told and closed by
+    /// `tellSuperseded` once `mutex` is released — never a write under it.
+    const Superseded = struct {
+        conns: [4]*Connection = undefined,
+        n: usize = 0,
+    };
+
+    fn takeover(b: *Broker, newconn: *Connection, owed: *Superseded) void {
         const id = newconn.clientId();
         for (b.connections.items) |other| {
             if (other == newconn) continue;
@@ -2102,6 +2669,13 @@ pub const Broker = struct {
             if (std.mem.eql(u8, other.clientId(), id)) {
                 b.dropSubscriptions(other);
                 other.state = .disconnected;
+                if (other.version == .v5 and owed.n < owed.conns.len) {
+                    // A reference keeps it alive until it has been told.
+                    _ = other.refs.fetchAdd(1, .acquire);
+                    owed.conns[owed.n] = other;
+                    owed.n += 1;
+                    continue;
+                }
                 // FIX C: wake its (possibly keep_alive_0, forever-blocked) read
                 // loop. We do NOT free it here — its own owner thread frees it
                 // via `remove`; that path drains references safely.
@@ -2110,7 +2684,16 @@ pub const Broker = struct {
         }
     }
 
-    fn handleSubscribe(b: *Broker, conn: *Connection, s: packet.Subscribe) Error!void {
+    fn tellSuperseded(b: *Broker, owed: *const Superseded) void {
+        _ = b;
+        for (owed.conns[0..owed.n]) |other| {
+            writeDisconnect(other, .session_taken_over);
+            other.transport.close(); // FIX C, as in `takeover`
+            _ = other.refs.fetchSub(1, .release);
+        }
+    }
+
+    fn handleSubscribe(b: *Broker, conn: *Connection, s: packet.Subscribe, now: i64) Error!void {
         // Validate the filter count BEFORE registering anything (a >max
         // SUBSCRIBE is rejected as a whole, never partial-registered).
         var count: usize = 0;
@@ -2119,6 +2702,10 @@ pub const Broker = struct {
             count += 1;
             if (count > max_filters_per_subscribe) return error.TooManySubscriptions;
         }
+        const v5 = conn.version == .v5;
+        // 5.0: the packet's Subscription Identifier names every filter in it
+        // (3.8.2.1.2); it comes back on each message they deliver.
+        const sub_id: u32 = if (v5) s.properties.subscription_ids.first() orelse 0 else 0;
 
         var codes: [max_filters_per_subscribe]u8 = undefined;
         var n: usize = 0;
@@ -2130,6 +2717,7 @@ pub const Broker = struct {
             for (retsnap.items) |r| {
                 b.allocator.free(r.topic);
                 b.allocator.free(r.payload);
+                b.allocator.free(r.props);
             }
             retsnap.deinit(b.allocator);
         }
@@ -2137,6 +2725,7 @@ pub const Broker = struct {
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            b.now_hint = @max(b.now_hint, now);
             // Filters already walked in THIS packet. A duplicate filter is a
             // legal QoS update (§3.8.4-3) and still gets its SUBACK code, but
             // re-sending the retained set for it is pure amplification.
@@ -2154,32 +2743,49 @@ pub const Broker = struct {
             const live = b.ownsRouting(conn);
             var it = s.iterator();
             while (it.next()) |req| {
-                var code: u8 = packet.suback_failure;
+                // 3.1.1 has one failure code; 5.0 says which failure.
+                var code: packet.ReasonCode = .unspecified_error;
                 var granted: QoS = .at_most_once;
-                var ok = false;
-                if (!live) {} else if (topic.validateFilter(req.filter)) |_| {
-                    if (b.aclAllows(conn, req.filter, .subscribe, false)) {
-                        granted = minQos(req.qos, b.config.maximum_qos);
-                        if (try b.registerSubscription(conn, req.filter, granted)) {
-                            code = @intFromEnum(granted);
-                            ok = true;
-                        }
-                        // else: over a cap → per-filter 0x80 (code unchanged).
+                var reg: Registered = .refused;
+                var shared = false;
+                if (!live) {} else if (topic.validateFilter(req.filter)) |_| filter: {
+                    // A Shared Subscription is matched — and so authorized —
+                    // by its `{filter}` part, the topics it actually reads.
+                    const inner = (splitShared(req.filter) catch {
+                        code = .topic_filter_invalid;
+                        break :filter;
+                    }) orelse req.filter;
+                    shared = inner.len != req.filter.len;
+                    if (!b.aclAllows(conn, inner, .subscribe, false)) {
+                        code = .not_authorized;
+                        break :filter;
                     }
-                    // else: ACL denied this filter → per-filter 0x80.
-                } else |_| {}
-                codes[n] = code;
+                    granted = minQos(req.qos, b.config.maximum_qos);
+                    reg = try b.registerSubscription(conn, req.filter, req, granted, sub_id);
+                    code = if (reg == .refused) .quota_exceeded else packet.ReasonCode.granted(granted);
+                } else |_| {
+                    code = .topic_filter_invalid;
+                }
+                codes[n] = if (v5) @intFromEnum(code) else if (reg == .refused) packet.suback_failure else @intFromEnum(granted);
                 n += 1;
-                if (ok and !alreadyWalked(walked[0..walked_n], req.filter)) {
+                // Retained messages at subscribe (3.3.1.3), as 5.0's Retain
+                // Handling allows — and never for a Shared Subscription (4.8.2).
+                const send_retained = reg != .refused and !shared and switch (req.retain_handling) {
+                    .send_on_subscribe => true,
+                    .send_if_new => reg == .added,
+                    .never => false,
+                };
+                if (send_retained and !alreadyWalked(walked[0..walked_n], req.filter)) {
                     walked[walked_n] = req.filter;
                     walked_n += 1;
                     for (b.retained.items) |r| {
                         if (!topic.matches(req.filter, r.topic)) continue;
+                        if (r.expires_at) |at| if (at <= now) continue; // gone (3.3.2-5)
                         // The envelope is checked BEFORE the dup, so a
                         // truncated walk costs nothing rather than one more
                         // copy of the largest payload in the store.
                         if (retsnap.items.len >= b.config.max_retained_deliveries or
-                            snap_bytes + r.topic.len + r.payload.len > b.config.max_retained_bytes)
+                            snap_bytes + r.bytes() > b.config.max_retained_bytes)
                         {
                             truncated = true;
                             break;
@@ -2189,16 +2795,25 @@ pub const Broker = struct {
                             b.allocator.free(t);
                             return e;
                         };
-                        retsnap.append(b.allocator, .{
-                            .topic = t,
-                            .payload = pl,
-                            .qos = minQos(r.qos, granted),
-                        }) catch |e| {
+                        const pr = b.allocator.dupe(u8, r.props) catch |e| {
                             b.allocator.free(t);
                             b.allocator.free(pl);
                             return e;
                         };
-                        snap_bytes += r.topic.len + r.payload.len;
+                        retsnap.append(b.allocator, .{
+                            .topic = t,
+                            .payload = pl,
+                            .props = pr,
+                            .qos = minQos(r.qos, granted),
+                            .expires_at = r.expires_at,
+                            .sub_id = sub_id,
+                        }) catch |e| {
+                            b.allocator.free(t);
+                            b.allocator.free(pl);
+                            b.allocator.free(pr);
+                            return e;
+                        };
+                        snap_bytes += r.bytes();
                     }
                 }
             }
@@ -2210,20 +2825,28 @@ pub const Broker = struct {
         // (spec 3.3.1.3) — both under this connection's tx_lock.
         conn.tx_lock.lock();
         defer conn.tx_lock.unlock();
-        var sbuf: [4 + max_filters_per_subscribe]u8 = undefined;
-        try conn.write(try packet.encodeSuback(&sbuf, s.packet_id, codes[0..n]));
+        var sbuf: [8 + max_filters_per_subscribe]u8 = undefined;
+        try conn.write(try packet.encodePacket(&sbuf, conn.version, .{ .suback = .{ .packet_id = s.packet_id, .codes = codes[0..n] } }));
         for (retsnap.items) |r| {
+            const ids: []const u32 = if (r.sub_id != 0) &.{r.sub_id} else &.{};
+            const msg = Outgoing{
+                .topic = r.topic,
+                .payload = r.payload,
+                .props = packet.decodePropertyEntries(r.props, .publish) catch .{},
+                .expires_at = r.expires_at,
+                .retain = true,
+            };
             if (conn.session) |x| if (r.qos != .at_most_once) {
                 // A persistent session's QoS 1/2 goes through its queue, so
                 // the id is the session's and survives a reconnect.
                 x.lock.lock();
-                b.enqueueLocked(x, r.topic, r.payload, true, r.qos);
+                b.enqueueLocked(x, msg, r.qos, ids, r.props);
                 x.lock.unlock();
                 continue;
             };
-            try b.deliverLocked(conn, r.topic, r.payload, r.qos, true);
+            try b.deliverLocked(conn, msg, r.qos, true, ids, now);
         }
-        if (conn.session) |x| try b.pumpLocked(conn, x);
+        if (conn.session) |x| try b.pumpLocked(conn, x, now);
     }
 
     /// Whether `conn` may still change its subscriptions: it has not been
@@ -2253,38 +2876,53 @@ pub const Broker = struct {
         return false;
     }
 
-    /// Add (or, for an exact re-subscribe, update the QoS of) a subscription.
-    /// Returns `false` (no mutation) when a cap would be exceeded by a
-    /// genuinely new filter, or the filter is too deeply nested — the caller
-    /// reports that as a per-filter SUBACK 0x80. Caller holds `mutex`.
-    fn registerSubscription(b: *Broker, conn: *Connection, filter: []const u8, qos: QoS) Error!bool {
-        const owner = ownerOf(conn);
+    const Registered = enum { added, replaced, refused };
+
+    /// Add (or, for an exact re-subscribe, replace — QoS and options, spec
+    /// 3.8.4-3) a subscription. `.refused` (no mutation) when a cap would be
+    /// exceeded by a genuinely new filter, or the filter is too deeply nested —
+    /// the caller reports that per filter in its SUBACK. `.added` tells Retain
+    /// Handling 1 the subscription is new. Caller holds `mutex`; `filter` is
+    /// validated, Shared ones included.
+    fn registerSubscription(b: *Broker, conn: *Connection, filter: []const u8, sub: packet.Subscription, granted: QoS, sub_id: u32) Error!Registered {
+        const ref = SubRef{
+            .owner = ownerOf(conn),
+            .qos = granted,
+            .no_local = sub.no_local,
+            .retain_as_published = sub.retain_as_published,
+            .sub_id = sub_id,
+        };
         const subs = subsOf(conn);
         for (subs.items) |f| {
             if (std.mem.eql(u8, f, filter)) {
-                b.index.updateQos(filter, owner, qos); // re-subscribe (spec 3.8.4-3)
-                return true;
+                b.indexUpdate(filter, ref);
+                return .replaced;
             }
         }
-        if (b.subscriptions_total >= b.config.max_subscriptions_total) return false;
-        if (subs.items.len >= b.config.max_subscriptions_per_conn) return false;
+        if (b.subscriptions_total >= b.config.max_subscriptions_total) return .refused;
+        if (subs.items.len >= b.config.max_subscriptions_per_conn) return .refused;
+        const inner = (splitShared(filter) catch unreachable) orelse filter;
         var level_count: usize = 0;
-        var lv = std.mem.splitScalar(u8, filter, '/');
+        var lv = std.mem.splitScalar(u8, inner, '/');
         while (lv.next()) |_| {
             level_count += 1;
-            if (level_count > max_filter_levels) return false;
+            if (level_count > max_filter_levels) return .refused;
         }
 
         const owned = try b.allocator.dupe(u8, filter);
         errdefer b.allocator.free(owned);
         try subs.append(b.allocator, owned);
         errdefer subs.items.len -= 1; // undo the append on a later failure
-        try b.index.add(b.allocator, filter, owner, qos);
+        try b.indexAdd(filter, ref);
         b.subscriptions_total += 1;
-        return true;
+        return .added;
     }
 
     fn handleUnsubscribe(b: *Broker, conn: *Connection, u: packet.Unsubscribe) Error!void {
+        // 5.0: one reason code per filter — Success, or No subscription
+        // existed (3.11.3). 3.1.1's UNSUBACK carries none.
+        var codes: [max_filters_per_subscribe]u8 = undefined;
+        var n: usize = 0;
         {
             b.mutex.lock();
             defer b.mutex.unlock();
@@ -2292,28 +2930,50 @@ pub const Broker = struct {
             const subs = subsOf(conn);
             // Same reason as in `handleSubscribe`: a superseded connection
             // must not edit a session that is no longer its own.
+            const live = b.ownsRouting(conn);
             var it = u.iterator();
-            if (!b.ownsRouting(conn)) it.rest = &.{};
             while (it.next()) |filter| {
+                var removed = false;
                 var i: usize = 0;
-                while (i < subs.items.len) {
+                while (live and i < subs.items.len) {
                     if (std.mem.eql(u8, subs.items[i], filter)) {
-                        b.index.removeFilter(b.allocator, filter, owner);
+                        b.indexRemove(filter, owner);
                         b.allocator.free(subs.items[i]);
                         _ = subs.swapRemove(i);
                         b.subscriptions_total -= 1;
+                        removed = true;
                         continue; // a filter appears once per conn; scan on defensively
                     }
                     i += 1;
                 }
+                if (n < codes.len) {
+                    codes[n] = @intFromEnum(if (removed) packet.ReasonCode.success else .no_subscription_existed);
+                    n += 1;
+                } else if (conn.version == .v5) return error.TooManySubscriptions;
             }
         }
-        var ubuf: [4]u8 = undefined;
-        try conn.lockedWrite(try packet.encodeUnsuback(&ubuf, u.packet_id));
+        var ubuf: [8 + max_filters_per_subscribe]u8 = undefined;
+        try conn.lockedWrite(try packet.encodePacket(&ubuf, conn.version, .{ .unsuback = .{
+            .packet_id = u.packet_id,
+            .codes = if (conn.version == .v5) codes[0..n] else &.{},
+        } }));
     }
 
-    fn handlePublish(b: *Broker, conn: *Connection, pub_pkt: packet.Publish) Error!Disposition {
-        if (@intFromEnum(pub_pkt.qos) > @intFromEnum(b.config.maximum_qos)) return error.ProtocolViolation;
+    fn handlePublish(b: *Broker, conn: *Connection, pub_pkt: packet.Publish, now: i64) Error!Disposition {
+        const v5 = conn.version == .v5;
+        if (@intFromEnum(pub_pkt.qos) > @intFromEnum(b.config.maximum_qos)) {
+            conn.close_reason = .qos_not_supported; // 3.2.2-12
+            return error.ProtocolViolation;
+        }
+        var topic_name = pub_pkt.topic;
+        if (v5) {
+            // A client never sends a Subscription Identifier (3.3.4-6).
+            if (!pub_pkt.properties.subscription_ids.isEmpty()) {
+                conn.close_reason = .protocol_error;
+                return error.ProtocolViolation;
+            }
+            if (pub_pkt.properties.topic_alias) |alias| topic_name = try b.resolveAlias(conn, alias, pub_pkt.topic);
+        }
 
         if (pub_pkt.qos == .exactly_once) {
             // An id this client already has a PUBREC for is the same message
@@ -2321,25 +2981,30 @@ pub const Broker = struct {
             // (spec 4.3.3): answer it again and route nothing, so exactly
             // once stays exactly once. Not even the tap sees it a second time.
             if (b.inboundKnown(conn, pub_pkt.packet_id)) {
-                var buf: [4]u8 = undefined;
-                try conn.lockedWrite(try packet.encodePubrec(&buf, pub_pkt.packet_id));
+                try b.writeAck(conn, .pubrec, pub_pkt.packet_id, .success);
                 return .keep;
             }
             // More unreleased QoS 2 messages than the window: the client is
             // not sending PUBRELs, and an unbounded set is the alternative.
-            if (!b.inboundRoom(conn)) return error.ProtocolViolation;
+            if (!b.inboundRoom(conn)) {
+                conn.close_reason = .receive_maximum_exceeded; // 3.3.4-7
+                return error.ProtocolViolation;
+            }
         }
 
+        // 5.0 tells the publisher what became of it (3.4.2.1); 3.1.1 cannot.
+        var reason: packet.ReasonCode = .success;
         // ACL (FIX D): a denied PUBLISH is silently dropped — not retained, not
-        // fanned out — but still PUBACKed so the publisher stays well-behaved.
-        if (b.aclAllows(conn, pub_pkt.topic, .publish, pub_pkt.retain)) routed: {
+        // fanned out — but still acknowledged so the publisher stays
+        // well-behaved (under 5.0 with 0x87 Not authorized).
+        if (b.aclAllows(conn, topic_name, .publish, pub_pkt.retain)) routed: {
             // Tap before delivery: what the broker took is a fact even if
             // fan-out then fails, and `fanout` can return an error. A refusal
             // must come before `fanout` (which also writes the retained store)
             // and before the PUBACK below — acknowledging a message the tap
             // could not take is exactly what the verdict exists to prevent.
             if (b.config.onPublishFn) |tap| {
-                switch (tap(b.config.publish_ctx, pub_pkt.topic, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain)) {
+                switch (tap(b.config.publish_ctx, topic_name, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain)) {
                     .accept => {},
                     .refuse => {
                         _ = b.tap_refusals.fetchAdd(1, .monotonic);
@@ -2348,22 +3013,66 @@ pub const Broker = struct {
                     .consume => break :routed,
                 }
             }
-            try b.fanout(pub_pkt);
-        }
+            const matched = try b.fanout(.{
+                .topic = topic_name,
+                .payload = pub_pkt.payload,
+                .props = forwardable(pub_pkt.properties),
+                .retain = pub_pkt.retain,
+                .expires_at = if (pub_pkt.properties.message_expiry_interval) |e| now + @as(i64, e) * 1000 else null,
+                .origin = conn.clientId(),
+            }, pub_pkt.qos, now);
+            if (matched == 0) reason = .no_matching_subscribers;
+        } else reason = .not_authorized;
 
         // Acknowledge: QoS 1 PUBACK; QoS 2 PUBREC, the id remembered until
         // the PUBREL — recorded only now, after routing, so a fan-out that
-        // failed leaves a resend free to be routed (QoS 0: nothing).
-        var buf: [4]u8 = undefined;
+        // failed leaves a resend free to be routed; and not at all after a
+        // refusing 5.0 PUBREC, whose id is free at once (4.3.3-9). QoS 0:
+        // nothing.
         switch (pub_pkt.qos) {
             .at_most_once => {},
-            .at_least_once => try conn.lockedWrite(try packet.encodePuback(&buf, pub_pkt.packet_id)),
+            .at_least_once => try b.writeAck(conn, .puback, pub_pkt.packet_id, reason),
             .exactly_once => {
-                b.recordInbound(conn, pub_pkt.packet_id);
-                try conn.lockedWrite(try packet.encodePubrec(&buf, pub_pkt.packet_id));
+                if (!(v5 and reason.isError())) b.recordInbound(conn, pub_pkt.packet_id);
+                try b.writeAck(conn, .pubrec, pub_pkt.packet_id, reason);
             },
         }
         return .keep;
+    }
+
+    /// One PUBACK/PUBREC/PUBREL/PUBCOMP in the connection's version; the
+    /// reason code only goes out under 5.0.
+    fn writeAck(b: *Broker, conn: *Connection, comptime kind: packet.PacketType, id: u16, reason: packet.ReasonCode) Error!void {
+        _ = b;
+        var buf: [8]u8 = undefined;
+        const ack = packet.Ack{ .packet_id = id, .reason_code = if (conn.version == .v5) reason else .success };
+        try conn.lockedWrite(try packet.encodePacket(&buf, conn.version, @unionInit(packet.Packet, @tagName(kind), ack)));
+    }
+
+    /// The topic a 5.0 PUBLISH with a Topic Alias names (3.3.2.3.4): its own,
+    /// recorded under the alias, or the one the alias was set to. An alias
+    /// above `Config.topic_alias_maximum` is 0x94; an empty topic on an alias
+    /// never set is a Protocol Error. Owner thread only.
+    fn resolveAlias(b: *Broker, conn: *Connection, alias: u16, topic_name: []const u8) Error![]const u8 {
+        if (alias > b.config.topic_alias_maximum) {
+            conn.close_reason = .topic_alias_invalid; // 3.3.2-12
+            return error.ProtocolViolation;
+        }
+        if (conn.aliases.len == 0) {
+            conn.aliases = try b.allocator.alloc(?[]u8, b.config.topic_alias_maximum);
+            @memset(conn.aliases, null);
+        }
+        const slot = &conn.aliases[alias - 1];
+        if (topic_name.len == 0) {
+            return slot.* orelse {
+                conn.close_reason = .protocol_error;
+                return error.ProtocolViolation;
+            };
+        }
+        const owned = try b.allocator.dupe(u8, topic_name);
+        if (slot.*) |old| b.allocator.free(old);
+        slot.* = owned;
+        return topic_name;
     }
 
     // ── QoS 2 (spec 4.3.3) ───────────────────────────────────────────────────
@@ -2402,81 +3111,96 @@ pub const Broker = struct {
     /// PUBREL from the client: inbound `id` is released. The id is forgotten
     /// (a PUBLISH reusing it is a new message, 4.3.3-12) and PUBCOMP answers
     /// whether or not it was known (4.3.3-11) — a client resuming a session
-    /// resends PUBRELs the broker may have answered already.
+    /// resends PUBRELs the broker may have answered already; 5.0 says so with
+    /// 0x92 Packet Identifier not found.
     fn handlePubrel(b: *Broker, conn: *Connection, id: u16) Error!void {
-        _ = b;
+        var known = false;
         if (conn.session) |x| {
             x.lock.lock();
-            if (std.mem.indexOfScalar(u16, x.inbound_qos2.items, id)) |i| _ = x.inbound_qos2.swapRemove(i);
+            if (std.mem.indexOfScalar(u16, x.inbound_qos2.items, id)) |i| {
+                _ = x.inbound_qos2.swapRemove(i);
+                known = true;
+            }
             x.lock.unlock();
-        } else _ = conn.removeInbound(id);
-        var buf: [4]u8 = undefined;
-        try conn.lockedWrite(try packet.encodePubcomp(&buf, id));
+        } else known = conn.removeInbound(id);
+        try b.writeAck(conn, .pubcomp, id, if (known) .success else .packet_identifier_not_found);
     }
 
     /// PUBREC from the client for an outbound QoS 2 delivery: PUBREL goes
     /// out and PUBCOMP is awaited (4.3.3). From here on a resume resends the
     /// PUBREL, never the message (4.3.3-6). One for an id not pending gets a
-    /// PUBREL all the same: the client is waiting for it whatever the broker
-    /// lost. A 5.0 PUBREC with a failure code ends the delivery instead — no
-    /// PUBREL (4.4.0-2); 3.1.1 has no such code.
-    fn handlePubrec(b: *Broker, conn: *Connection, ack: packet.Ack) Error!void {
+    /// PUBREL all the same — the client is waiting for it whatever the broker
+    /// lost — under 5.0 with 0x92 Packet Identifier not found. A 5.0 PUBREC
+    /// with a failure code ends the delivery instead — no PUBREL (4.4.0-2);
+    /// 3.1.1 has no such code.
+    fn handlePubrec(b: *Broker, conn: *Connection, ack: packet.Ack, now: i64) Error!void {
         const id = ack.packet_id;
         conn.tx_lock.lock();
         defer conn.tx_lock.unlock();
         if (ack.reason_code.isError()) {
             if (conn.session) |x| {
                 ackInflight(b.allocator, x, conn, id, .pubrec);
-                try b.pumpLocked(conn, x);
+                try b.pumpLocked(conn, x, now);
             } else if (conn.pendingPhase(id) == .pubrec) conn.removePending(id);
             return;
         }
+        var known = false;
         if (conn.session) |x| {
             x.lock.lock();
             if (x.conn == conn) for (x.inflight.items) |*m| {
-                if (m.id == id and m.qos == .exactly_once) m.released = true;
+                if (m.id == id and m.qos == .exactly_once) {
+                    m.released = true;
+                    known = true;
+                }
             };
             x.lock.unlock();
         } else if (conn.pendingIndex(id)) |i| {
             if (conn.pending[i].phase == .pubrec) conn.pending[i].phase = .pubcomp;
+            known = true;
         }
-        var buf: [4]u8 = undefined;
-        try conn.write(try packet.encodePubrel(&buf, id));
+        var buf: [8]u8 = undefined;
+        const reason: packet.ReasonCode = if (known or conn.version != .v5) .success else .packet_identifier_not_found;
+        try conn.write(try packet.encodePacket(&buf, conn.version, .{ .pubrel = .{ .packet_id = id, .reason_code = reason } }));
     }
 
     /// PUBACK (QoS 1) or PUBCOMP (QoS 2): outbound `id` is delivered. One for
     /// an id not waiting in that phase is ignored — a duplicate after a
-    /// resume, or a stray.
-    fn handleOutboundDone(b: *Broker, conn: *Connection, id: u16, phase: Outbound.Phase) Error!void {
+    /// resume, or a stray. A 5.0 PUBACK with a failure code ends the delivery
+    /// the same way (4.4.0-2: never resent).
+    fn handleOutboundDone(b: *Broker, conn: *Connection, id: u16, phase: Outbound.Phase, now: i64) Error!void {
         conn.tx_lock.lock();
         defer conn.tx_lock.unlock();
         if (conn.session) |x| {
             // A freed window slot is the cue to send the next queued
             // message — nothing else would.
             ackInflight(b.allocator, x, conn, id, phase);
-            try b.pumpLocked(conn, x);
+            try b.pumpLocked(conn, x, now);
         } else if (conn.pendingPhase(id) == phase) conn.removePending(id);
     }
 
-    /// Retained-store update + PUBLISH fan-out. The global lock is held only to
-    /// mutate the retained store and snapshot the matching (conn, granted-QoS)
-    /// targets from the index (FIX A); it is released before any socket write.
-    /// A per-subscriber delivery failure is contained to that subscriber and
-    /// never propagates to the publisher (FIX B).
-    fn fanout(b: *Broker, pub_pkt: packet.Publish) Error!void {
+    fn fanout(b: *Broker, msg: Outgoing, qos: QoS, now: i64) Error!usize {
         var targets: std.ArrayListUnmanaged(Target) = .empty;
         defer targets.deinit(b.allocator);
+        // The Subscription Identifiers of every target, each target's a run.
+        var ids: std.ArrayListUnmanaged(u32) = .empty;
+        defer ids.deinit(b.allocator);
+        // The forwardable properties as stored entries, made once for every
+        // session that queues the message.
+        var stored_props: []u8 = &.{};
+        defer b.allocator.free(stored_props);
+        var matched: usize = 0;
 
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            b.now_hint = @max(b.now_hint, now);
 
             // Retained store (spec 3.3.1.3): empty payload clears, else set.
-            if (pub_pkt.retain) {
-                if (pub_pkt.payload.len == 0) {
-                    b.clearRetained(pub_pkt.topic);
+            if (msg.retain) {
+                if (msg.payload.len == 0) {
+                    b.clearRetained(msg.topic);
                 } else {
-                    try b.storeRetained(pub_pkt.topic, pub_pkt.payload, pub_pkt.qos);
+                    try b.storeRetained(msg, qos);
                 }
             }
 
@@ -2486,21 +3210,52 @@ pub const Broker = struct {
             // publish can gather at most `max_fanout_matches` matches, so a
             // pathological wildcard/overlap set can't amplify one publish into
             // unbounded work. A truncated walk is surfaced via the counter.
-            const capped = try b.index.collect(b.allocator, pub_pkt.topic, &matches, b.config.max_fanout_matches);
+            var capped = try b.index.collect(b.allocator, msg.topic, &matches, b.config.max_fanout_matches);
+            // One member of each matching Shared Subscription (4.8.2).
+            for (b.shared.items) |g| {
+                if (!topic.matches(g.filter, msg.topic)) continue;
+                if (matches.items.len >= b.config.max_fanout_matches) {
+                    capped = true;
+                    break;
+                }
+                if (pickShared(g)) |m| try matches.append(b.allocator, m);
+            }
             if (capped) _ = b.fanout_truncations.fetchAdd(1, .monotonic);
 
             // Collapse to one entry per owner at its highest granted QoS
-            // (overlapping filters → a single copy, spec behavior).
+            // (overlapping filters → a single copy, spec behavior), its RETAIN
+            // flag kept if any of its subscriptions keeps it (5.0 Retain As
+            // Published). A No Local subscription never takes the publisher's
+            // own message (3.8.3-3).
             var owners: std.ArrayListUnmanaged(SubRef) = .empty;
             defer owners.deinit(b.allocator);
             for (matches.items) |ref| {
                 if (ref.owner == .conn and ref.owner.conn.state != .connected) continue;
+                if (ref.no_local) if (msg.origin) |o| if (std.mem.eql(u8, ownerClientId(ref.owner), o)) continue;
                 for (owners.items) |*o| {
                     if (o.owner.eql(ref.owner)) {
                         o.qos = maxQos(o.qos, ref.qos);
+                        o.retain_as_published = o.retain_as_published or ref.retain_as_published;
                         break;
                     }
                 } else try owners.append(b.allocator, ref);
+            }
+            matched = owners.items.len;
+
+            // Each owner's Subscription Identifiers: one copy carries them all
+            // (3.3.4-4). Gathered per owner into one list, a run per target.
+            const spans = try b.allocator.alloc([2]usize, owners.items.len);
+            defer b.allocator.free(spans);
+            for (owners.items, spans) |o, *span| {
+                span[0] = ids.items.len;
+                for (matches.items) |ref| {
+                    if (ref.sub_id != 0 and ref.owner.eql(o.owner) and
+                        std.mem.indexOfScalar(u32, ids.items[span[0]..], ref.sub_id) == null)
+                    {
+                        try ids.append(b.allocator, ref.sub_id);
+                    }
+                }
+                span[1] = ids.items.len;
             }
 
             // A persistent session takes its QoS 1/2 copy into its queue here,
@@ -2509,20 +3264,33 @@ pub const Broker = struct {
             // this snapshot and the write. QoS 0 reaches it only while online
             // (spec 3.1.2.4 keeps QoS 0 optional; this broker does not).
             try targets.ensureTotalCapacity(b.allocator, owners.items.len);
-            for (owners.items) |o| {
-                const q = minQos(pub_pkt.qos, o.qos);
+            for (owners.items, spans) |o, span| {
+                const q = minQos(qos, o.qos);
+                const retain = msg.retain and o.retain_as_published;
+                const run = ids.items[span[0]..span[1]];
                 switch (o.owner) {
-                    .conn => |c| targets.appendAssumeCapacity(.{ .conn = c, .qos = q }),
+                    .conn => |c| targets.appendAssumeCapacity(.{ .conn = c, .qos = q, .retain = retain, .ids = run }),
                     .session => |x| {
+                        if (q != .at_most_once and stored_props.len == 0) {
+                            const len = try packet.propertyEntriesLen(msg.props, .publish);
+                            if (len > 0) {
+                                stored_props = try b.allocator.alloc(u8, len);
+                                _ = packet.encodePropertyEntries(stored_props, msg.props, .publish) catch unreachable;
+                            }
+                        }
                         x.lock.lock();
                         defer x.lock.unlock();
-                        if (q != .at_most_once) b.enqueueLocked(x, pub_pkt.topic, pub_pkt.payload, false, q);
+                        var queued = msg;
+                        queued.retain = retain;
+                        if (q != .at_most_once) b.enqueueLocked(x, queued, q, run, stored_props);
                         const c = x.conn orelse continue;
                         if (c.state != .connected) continue;
                         targets.appendAssumeCapacity(.{
                             .conn = c,
                             .qos = q,
                             .session = if (q != .at_most_once) x else null,
+                            .retain = retain,
+                            .ids = run,
                         });
                     },
                 }
@@ -2555,9 +3323,9 @@ pub const Broker = struct {
                 t.conn.tx_lock.lock();
                 defer t.conn.tx_lock.unlock();
                 const sent = if (t.session) |x|
-                    b.pumpLocked(t.conn, x)
+                    b.pumpLocked(t.conn, x, now)
                 else if (t.conn.state == .connected)
-                    b.deliverLocked(t.conn, pub_pkt.topic, pub_pkt.payload, t.qos, false)
+                    b.deliverLocked(t.conn, msg, t.qos, t.retain, t.ids, now)
                 else {};
                 sent catch |e| {
                     if (e == error.Canceled) return e;
@@ -2566,6 +3334,45 @@ pub const Broker = struct {
             }
             if (failed) disconnectPeer(t.conn);
         }
+        return matched;
+    }
+
+    /// The member of a Shared Subscription the next message goes to:
+    /// round-robin from `next`, first among members that can take it now
+    /// (connected), else a persistent session that queues it. Caller holds
+    /// `mutex`.
+    fn pickShared(g: *Shared) ?SubRef {
+        const n = g.members.items.len;
+        for (0..2) |pass| {
+            for (0..n) |k| {
+                const i = (g.next + k) % n;
+                const m = g.members.items[i];
+                const ok = if (pass == 0) canTakeNow(m.owner) else m.owner == .session;
+                if (ok) {
+                    g.next = (i + 1) % n;
+                    return m;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn canTakeNow(o: Owner) bool {
+        return switch (o) {
+            .conn => |c| c.state == .connected,
+            .session => |x| blk: {
+                x.lock.lock();
+                defer x.lock.unlock();
+                break :blk if (x.conn) |c| c.state == .connected else false;
+            },
+        };
+    }
+
+    fn ownerClientId(o: Owner) []const u8 {
+        return switch (o) {
+            .conn => |c| c.clientId(),
+            .session => |x| x.clientId(),
+        };
     }
 
     fn releaseTargets(b: *Broker, targets: []const Target) void {
@@ -2583,32 +3390,47 @@ pub const Broker = struct {
         conn.transport.close();
     }
 
-    /// Send one PUBLISH to a subscriber at `qos`. Caller holds `sub_conn`'s
-    /// `tx_lock` (guards `tx_buf` + the packet-id pool). For QoS 1/2 a packet
-    /// id is allocated in the subscriber's id space and tracked pending until
-    /// its PUBACK, or PUBREC then PUBCOMP; if that pool is exhausted the
-    /// message is dropped for this subscriber. The QoS 0 → QoS 1 re-encode cannot overflow `tx_buf`
-    /// (sized with `tx_headroom`, FIX B).
-    fn deliverLocked(b: *Broker, sub_conn: *Connection, topic_name: []const u8, payload: []const u8, qos: QoS, retain: bool) Error!void {
-        var id: u16 = 0;
+    /// Send one PUBLISH to a subscriber at `qos`, in its version. Caller
+    /// holds `sub_conn`'s `tx_lock` (guards `tx_buf` + the packet-id pool).
+    /// For QoS 1/2 a packet id is allocated in the subscriber's id space and
+    /// tracked pending until its PUBACK, or PUBREC then PUBCOMP; if that pool
+    /// is exhausted — or, under 5.0, the client's Receive Maximum is reached
+    /// (3.3.4-9) — the message is dropped for this subscriber. Dropped too,
+    /// and counted, without being a delivery failure: one whose Message
+    /// Expiry ran out (3.3.2-5), one too large for the client's Maximum
+    /// Packet Size or for `tx_buf` (3.1.2-25, `tx_headroom`).
+    fn deliverLocked(b: *Broker, sub_conn: *Connection, msg: Outgoing, qos: QoS, retain: bool, ids: []const u32, now: i64) Error!void {
+        const expiry = remainingExpiry(msg.expires_at, now) orelse {
+            _ = b.messages_expired.fetchAdd(1, .monotonic);
+            return;
+        };
+        var p = deliveryPacket(sub_conn, msg, qos, retain, false, 1, ids, expiry);
+        if (!b.fits(sub_conn, p)) return;
         if (qos != .at_most_once) {
-            // Pool full: this subscriber is not answering PUBACKs, so drop
-            // for it alone rather than stalling the fan-out. Counted, because
-            // a silent drop with no signal is indistinguishable from a
-            // delivery the subscriber simply never acted on.
-            id = sub_conn.allocPacketId(if (qos == .exactly_once) .pubrec else .puback) orelse {
+            // Pool full: this subscriber is not acknowledging, so drop for it
+            // alone rather than stalling the fan-out. Counted, because a
+            // silent drop with no signal is indistinguishable from a delivery
+            // the subscriber simply never acted on.
+            const id = if (sub_conn.pending_len >= sub_conn.client_receive_maximum)
+                null
+            else
+                sub_conn.allocPacketId(if (qos == .exactly_once) .pubrec else .puback);
+            p.packet_id = id orelse {
                 _ = b.qos1_drops.fetchAdd(1, .monotonic);
                 return;
             };
         }
-        const bytes = try packet.encodePublish(sub_conn.tx_buf, .{
-            .topic = topic_name,
-            .payload = payload,
-            .qos = qos,
-            .retain = retain,
-            .packet_id = id,
-        });
+        const bytes = try packet.encodePacket(sub_conn.tx_buf, sub_conn.version, .{ .publish = p });
         try sub_conn.write(bytes);
+    }
+
+    /// Whether `p` fits what `conn` takes and its `tx_buf`; counts a drop
+    /// when it does not.
+    fn fits(b: *Broker, conn: *const Connection, p: packet.Publish) bool {
+        const wire = packet.packetWireLen(conn.version, .{ .publish = p }) catch 0;
+        if (wire != 0 and wire <= conn.tx_buf.len and wire <= conn.client_max_packet) return true;
+        _ = b.oversize_drops.fetchAdd(1, .monotonic);
+        return false;
     }
 
     fn aclAllows(b: *Broker, conn: *Connection, topic_name: []const u8, op: Operation, retain: bool) bool {
@@ -2622,49 +3444,55 @@ pub const Broker = struct {
         });
     }
 
-    /// Store (or update) one retained topic. Caller holds `mutex`. Past
-    /// `Config.max_retained` a genuinely new topic is refused (the live fan-out
-    /// still happens; only the retained copy is dropped).
-    /// Past `Config.max_retained_store_bytes` a new topic is refused and an
-    /// update that would cross it drops the old value (see there).
-    fn storeRetained(b: *Broker, topic_name: []const u8, payload: []const u8, qos: QoS) Error!void {
+    fn storeRetained(b: *Broker, msg: Outgoing, qos: QoS) Error!void {
         const cap = b.config.max_retained_store_bytes;
+        const props_len = try packet.propertyEntriesLen(msg.props, .publish);
         for (b.retained.items) |*r| {
-            if (std.mem.eql(u8, r.topic, topic_name)) {
-                if (b.retained_bytes - r.payload.len + payload.len > cap) {
+            if (std.mem.eql(u8, r.topic, msg.topic)) {
+                const old = r.payload.len + r.props.len;
+                if (b.retained_bytes - old + msg.payload.len + props_len > cap) {
                     _ = b.retained_refusals.fetchAdd(1, .monotonic);
-                    b.clearRetained(topic_name);
+                    b.clearRetained(msg.topic);
                     return;
                 }
-                const new_payload = try b.allocator.dupe(u8, payload);
-                b.retained_bytes = b.retained_bytes - r.payload.len + payload.len;
+                const new_payload = try b.allocator.dupe(u8, msg.payload);
+                errdefer b.allocator.free(new_payload);
+                const new_props = try b.ownedForward(msg.props);
+                b.retained_bytes = b.retained_bytes - old + new_payload.len + new_props.len;
                 b.allocator.free(r.payload);
+                b.allocator.free(r.props);
                 r.payload = new_payload;
+                r.props = new_props;
                 r.qos = qos;
+                r.expires_at = msg.expires_at;
                 return;
             }
         }
         // cap: refuse new topic
         if (b.retained.items.len >= b.config.max_retained or
-            b.retained_bytes + topic_name.len + payload.len > cap)
+            b.retained_bytes + msg.topic.len + msg.payload.len + props_len > cap)
         {
             _ = b.retained_refusals.fetchAdd(1, .monotonic);
             return;
         }
-        const owned_topic = try b.allocator.dupe(u8, topic_name);
+        const owned_topic = try b.allocator.dupe(u8, msg.topic);
         errdefer b.allocator.free(owned_topic);
-        const owned_payload = try b.allocator.dupe(u8, payload);
+        const owned_payload = try b.allocator.dupe(u8, msg.payload);
         errdefer b.allocator.free(owned_payload);
-        try b.retained.append(b.allocator, .{ .topic = owned_topic, .payload = owned_payload, .qos = qos });
-        b.retained_bytes += topic_name.len + payload.len;
+        const owned_props = try b.ownedForward(msg.props);
+        errdefer b.allocator.free(owned_props);
+        const r = Retained{ .topic = owned_topic, .payload = owned_payload, .qos = qos, .props = owned_props, .expires_at = msg.expires_at };
+        try b.retained.append(b.allocator, r);
+        b.retained_bytes += r.bytes();
     }
 
     fn clearRetained(b: *Broker, topic_name: []const u8) void {
         for (b.retained.items, 0..) |r, i| {
             if (std.mem.eql(u8, r.topic, topic_name)) {
-                b.retained_bytes -= r.topic.len + r.payload.len;
+                b.retained_bytes -= r.bytes();
                 b.allocator.free(r.topic);
                 b.allocator.free(r.payload);
+                b.allocator.free(r.props);
                 _ = b.retained.swapRemove(i);
                 return;
             }
@@ -2676,7 +3504,7 @@ pub const Broker = struct {
     /// session's.
     fn dropSubscriptions(b: *Broker, conn: *Connection) void {
         for (conn.subs.items) |f| {
-            b.index.removeFilter(b.allocator, f, .{ .conn = conn });
+            b.indexRemove(f, .{ .conn = conn });
             b.allocator.free(f);
             b.subscriptions_total -= 1;
         }
@@ -2705,6 +3533,63 @@ fn ackInflight(alloc: std.mem.Allocator, x: *Session, conn: *Connection, id: u16
             return;
         }
     }
+}
+
+/// Seconds of a Message Expiry left at `now`, rounded up and at least `floor`.
+fn secondsLeft(at: i64, now: i64, floor: i64) u32 {
+    const left = @divFloor(at - now + 999, 1000);
+    return @intCast(std.math.clamp(left, floor, std.math.maxInt(u32)));
+}
+
+/// What a stored or live message's Message Expiry leaves at `now`: null when
+/// it ran out (the message is deleted, not sent: 3.3.2-5); else the seconds
+/// to send on (3.3.2-6), or no expiry at all.
+fn remainingExpiry(expires_at: ?i64, now: i64) ??u32 {
+    const at = expires_at orelse return @as(?u32, null);
+    if (at <= now) return null;
+    return secondsLeft(at, now, 1);
+}
+
+/// The PUBLISH `conn` gets for `msg`: in its version, and under 5.0 with the
+/// forwardable properties, the Message Expiry left and its Subscription
+/// Identifiers.
+fn deliveryPacket(conn: *const Connection, msg: Outgoing, qos: QoS, retain: bool, dup: bool, id: u16, ids: []const u32, expiry: ?u32) packet.Publish {
+    var props: packet.Properties = .{};
+    if (conn.version == .v5) {
+        props = msg.props;
+        props.message_expiry_interval = expiry;
+        props.subscription_ids = .{ .items = ids };
+    }
+    return .{
+        .topic = msg.topic,
+        .payload = msg.payload,
+        .qos = qos,
+        .retain = retain,
+        .dup = dup and qos != .at_most_once,
+        .packet_id = if (qos == .at_most_once) 0 else id,
+        .properties = props,
+    };
+}
+
+/// A refusing CONNACK in the client's version: 3.1.1's return code, or the
+/// 5.0 reason code (session present 0 either way, 3.2.2-6).
+fn connackRefusal(buf: []u8, version: packet.Version, rc3: packet.ConnectReturnCode, rc5: packet.ReasonCode) packet.EncodeError![]const u8 {
+    return packet.encodePacket(buf, version, .{ .connack = .{ .session_present = false, .return_code = rc3, .reason_code = rc5 } });
+}
+
+/// The properties a server forwards unaltered with an Application Message
+/// (5.0 3.3.2-4/15/16/17/20): Payload Format, Content Type, Response Topic,
+/// Correlation Data, User Properties. Never a Topic Alias (per connection) or
+/// Subscription Identifiers (per subscriber); Message Expiry goes separately,
+/// counted down.
+fn forwardable(p: packet.Properties) packet.Properties {
+    return .{
+        .payload_format = p.payload_format,
+        .content_type = p.content_type,
+        .response_topic = p.response_topic,
+        .correlation_data = p.correlation_data,
+        .user_properties = p.user_properties,
+    };
 }
 
 fn minQos(a: QoS, b: QoS) QoS {
@@ -2761,6 +3646,11 @@ pub const TcpServer = struct {
 
     pub fn serve(s: *TcpServer) !void {
         defer s.group.await(s.io) catch {};
+        // The broker reads no clock; this task is its upkeep against one:
+        // offline sessions past their expiry go, 5.0 Wills whose delay ran out
+        // are published. Without a task for it the server runs, without them.
+        var upkeep = try s.io.concurrent(maintain, .{s});
+        defer upkeep.cancel(s.io) catch {};
         const listener = &s.listener.?;
         while (true) {
             const stream = listener.accept(s.io) catch |err| switch (err) {
@@ -2775,6 +3665,15 @@ pub const TcpServer = struct {
                 stream.close(s.io);
                 continue;
             };
+        }
+    }
+
+    fn maintain(s: *TcpServer) std.Io.Cancelable!void {
+        while (true) {
+            try s.io.sleep(.fromSeconds(1), .awake);
+            const now = nowMs(s.io);
+            _ = s.broker.expireSessions(now);
+            _ = s.broker.publishDueWills(now);
         }
     }
 
@@ -6009,4 +6908,496 @@ test "A1 M1: the bound follows QoS — a QoS1 server publish is two bytes tighte
     try testing.expectEqual(Connection.State.connected, s.state);
 
     b.remove(s);
+}
+
+// ── MQTT 5.0 ────────────────────────────────────────────────────────────────
+
+fn next5(t: *TestTransport) !?packet.Packet {
+    if (t.read_off >= t.len) return null;
+    const dec = (try packet.decodePacket(t.written[t.read_off..t.len], .v5)) orelse return null;
+    t.read_off += dec.consumed;
+    return dec.packet;
+}
+
+const Connected5 = struct { conn: *Connection, connack: packet.Connack };
+
+/// A 5.0 CONNECT through the broker; returns the connection and its CONNACK
+/// (whatever it says).
+fn connect5(b: *Broker, tt: *TestTransport, c: packet.Connect, now: i64) !Connected5 {
+    const conn = try b.accept(tt.transport());
+    var buf: [512]u8 = undefined;
+    var cc = c;
+    cc.version = .v5;
+    try b.feed(conn, try packet.encodeConnect(&buf, cc));
+    _ = try b.process(conn, now);
+    const p = (try next5(tt)).?;
+    return .{ .conn = conn, .connack = p.connack };
+}
+
+fn send5(b: *Broker, conn: *Connection, p: packet.Packet, now: i64) !Disposition {
+    var buf: [512]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, p));
+    return b.process(conn, now);
+}
+
+test "v5 CONNACK: the broker's limits, an assigned id, a Session Expiry it lowered" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 30_000, .maximum_qos = .at_least_once });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "", .properties = .{ .session_expiry_interval = 3600 } }, 0);
+    try testing.expectEqual(packet.ReasonCode.success, c.connack.reason_code);
+    const p = c.connack.properties;
+    try testing.expectEqual(@as(?u16, max_in_flight), p.receive_maximum);
+    try testing.expectEqual(@as(?u32, 8192), p.maximum_packet_size);
+    try testing.expectEqual(@as(?u16, 16), p.topic_alias_maximum);
+    try testing.expectEqual(@as(?packet.QoS, .at_least_once), p.maximum_qos);
+    try testing.expectEqualStrings(c.conn.clientId(), p.assigned_client_identifier.?);
+    try testing.expect(std.mem.startsWith(u8, c.conn.clientId(), "auto-"));
+    try testing.expectEqual(@as(?u32, 30), p.session_expiry_interval); // 3600 asked, 30 kept
+}
+
+test "v5 refusals carry 5.0 reason codes" {
+    var b = Broker.init(testing.allocator, .{ .authenticateFn = credAuth });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const bad = try connect5(&b, &t1, .{ .client_id = "x", .username = "alice", .password = "wrong" }, 0);
+    try testing.expectEqual(packet.ReasonCode.bad_user_name_or_password, bad.connack.reason_code);
+    try testing.expect(!bad.connack.session_present);
+    var t2 = TestTransport{};
+    const m = try connect5(&b, &t2, .{ .client_id = "x", .username = "alice", .password = "secret", .properties = .{ .authentication_method = "SCRAM-SHA-1" } }, 0);
+    try testing.expectEqual(packet.ReasonCode.bad_authentication_method, m.connack.reason_code); // no extended auth here (4.12.0-1)
+    var t3 = TestTransport{};
+    const long = try connect5(&b, &t3, .{ .client_id = "c" ** (max_client_id + 1) }, 0);
+    try testing.expectEqual(packet.ReasonCode.client_identifier_not_valid, long.connack.reason_code);
+}
+
+test "v5 sessions: Session Expiry keeps one, Clean Start 0 resumes it, expiry 0 ends it with the connection" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connect5(&b, &t1, .{ .client_id = "s", .clean_session = false, .properties = .{ .session_expiry_interval = 60 } }, 0);
+    try testing.expect(!s1.connack.session_present);
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&t1)).?;
+    b.remove(s1.conn); // no DISCONNECT: the session stays, 60 s
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+    try b.publish("t", "kept", .at_least_once, false);
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(59_999));
+
+    // Back with expiry 0: resumed — and over when this connection is.
+    var t2 = TestTransport{};
+    const s2 = try connect5(&b, &t2, .{ .client_id = "s", .clean_session = false }, 1000);
+    try testing.expect(s2.connack.session_present);
+    try testing.expectEqualStrings("kept", (try next5(&t2)).?.publish.payload);
+    _ = try send5(&b, s2.conn, .{ .disconnect = .{} }, 1001);
+    b.remove(s2.conn);
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+
+    // A session expires on its own interval, not the config's.
+    var t3 = TestTransport{};
+    const s3 = try connect5(&b, &t3, .{ .client_id = "e", .properties = .{ .session_expiry_interval = 10 } }, 0);
+    b.remove(s3.conn);
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(9_999));
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(10_000));
+
+    // Clean Start 1 discards what there was, even when it keeps a new one.
+    var t4 = TestTransport{};
+    const s4 = try connect5(&b, &t4, .{ .client_id = "c", .properties = .{ .session_expiry_interval = 60 } }, 0);
+    _ = try send5(&b, s4.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "c" }} } }, 0);
+    b.remove(s4.conn);
+    var t5 = TestTransport{};
+    const s5 = try connect5(&b, &t5, .{ .client_id = "c", .clean_session = true, .properties = .{ .session_expiry_interval = 60 } }, 1);
+    try testing.expect(!s5.connack.session_present);
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
+    b.remove(s5.conn);
+}
+
+test "v5 DISCONNECT: a Session Expiry may shorten, never revive a session that was to end" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const a = try connect5(&b, &t1, .{ .client_id = "a" }, 0);
+    try testing.expectError(error.ProtocolViolation, send5(&b, a.conn, .{ .disconnect = .{ .properties = .{ .session_expiry_interval = 30 } } }, 1));
+    try testing.expectEqual(packet.ReasonCode.protocol_error, (try next5(&t1)).?.disconnect.reason_code);
+    b.remove(a.conn);
+
+    var t2 = TestTransport{};
+    const k = try connect5(&b, &t2, .{ .client_id = "k", .properties = .{ .session_expiry_interval = 60 } }, 0);
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+    try testing.expectEqual(Disposition.close, try send5(&b, k.conn, .{ .disconnect = .{ .properties = .{ .session_expiry_interval = 0 } } }, 1));
+    b.remove(k.conn);
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+}
+
+test "v5 acks say what happened: 0x10 no subscribers, 0x87 not authorized; a refused QoS 2 id is free at once" {
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = secretDenyAcl });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "p" }, 0);
+    _ = try send5(&b, c.conn, .{ .publish = .{ .topic = "nobody", .qos = .at_least_once, .packet_id = 1 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.no_matching_subscribers, (try next5(&tt)).?.puback.reason_code);
+    _ = try send5(&b, c.conn, .{ .publish = .{ .topic = "secret/x", .qos = .at_least_once, .packet_id = 2 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&tt)).?.puback.reason_code);
+    _ = try send5(&b, c.conn, .{ .publish = .{ .topic = "secret/x", .qos = .exactly_once, .packet_id = 3 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.not_authorized, (try next5(&tt)).?.pubrec.reason_code);
+    try testing.expectEqual(@as(usize, 0), c.conn.inbound_len); // 4.3.3-9
+    // PUBREL / PUBREC for ids the broker does not have: 0x92.
+    _ = try send5(&b, c.conn, .{ .pubrel = .{ .packet_id = 3 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.packet_identifier_not_found, (try next5(&tt)).?.pubcomp.reason_code);
+    _ = try send5(&b, c.conn, .{ .pubrec = .{ .packet_id = 44 } }, 1);
+    try testing.expectEqual(packet.ReasonCode.packet_identifier_not_found, (try next5(&tt)).?.pubrel.reason_code);
+}
+
+test "v5 Topic Alias inbound: set, used, and every misuse a DISCONNECT with its reason" {
+    var b = Broker.init(testing.allocator, .{ .topic_alias_maximum = 2 });
+    defer b.deinit();
+    var ts = TestTransport{};
+    const sub = try connectClient(&b, &ts, "S", 60, 0); // 3.1.1 subscriber
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "a/#" }});
+    _ = (try ts.next()).?;
+    var tp = TestTransport{};
+    const p = try connect5(&b, &tp, .{ .client_id = "P" }, 0);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "a/b", .payload = "1", .properties = .{ .topic_alias = 1 } } }, 1);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "", .payload = "2", .properties = .{ .topic_alias = 1 } } }, 1);
+    try testing.expectEqualStrings("a/b", (try ts.next()).?.publish.topic);
+    const second = (try ts.next()).?.publish;
+    try testing.expectEqualStrings("a/b", second.topic);
+    try testing.expectEqualStrings("2", second.payload);
+
+    try testing.expectError(error.ProtocolViolation, send5(&b, p.conn, .{ .publish = .{ .topic = "", .properties = .{ .topic_alias = 2 } } }, 1));
+    try testing.expectEqual(packet.ReasonCode.protocol_error, (try next5(&tp)).?.disconnect.reason_code);
+    b.remove(p.conn);
+
+    var tq = TestTransport{};
+    const q = try connect5(&b, &tq, .{ .client_id = "Q" }, 0);
+    try testing.expectError(error.ProtocolViolation, send5(&b, q.conn, .{ .publish = .{ .topic = "a/c", .properties = .{ .topic_alias = 3 } } }, 1));
+    try testing.expectEqual(packet.ReasonCode.topic_alias_invalid, (try next5(&tq)).?.disconnect.reason_code);
+    b.remove(q.conn);
+}
+
+test "v5 forwarding: a 5.0 subscriber gets the properties unaltered, a 3.1.1 one none; no alias goes on" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t5 = TestTransport{};
+    const s5 = try connect5(&b, &t5, .{ .client_id = "S5" }, 0);
+    _ = try send5(&b, s5.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "r/#" }} } }, 0);
+    _ = (try next5(&t5)).?;
+    var t3 = TestTransport{};
+    const s3 = try connectClient(&b, &t3, "S3", 60, 0);
+    try feedSubscribe(&b, s3, 1, &.{.{ .filter = "r/#" }});
+    _ = (try t3.next()).?;
+
+    var tp = TestTransport{};
+    const p = try connect5(&b, &tp, .{ .client_id = "P" }, 0);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "r/1", .payload = "{}", .properties = .{
+        .payload_format = .utf8,
+        .content_type = "application/json",
+        .response_topic = "r/reply",
+        .correlation_data = "42",
+        .message_expiry_interval = 60,
+        .topic_alias = 1,
+        .user_properties = .{ .items = &.{ .{ .name = "a", .value = "1" }, .{ .name = "b", .value = "2" } } },
+    } } }, 5);
+    const got = (try next5(&t5)).?.publish.properties;
+    try testing.expectEqual(@as(?packet.PayloadFormat, .utf8), got.payload_format);
+    try testing.expectEqualStrings("application/json", got.content_type.?);
+    try testing.expectEqualStrings("r/reply", got.response_topic.?);
+    try testing.expectEqualStrings("42", got.correlation_data.?);
+    try testing.expectEqual(@as(?u32, 60), got.message_expiry_interval);
+    try testing.expectEqual(@as(?u16, null), got.topic_alias);
+    var it = got.user_properties.iterator();
+    try testing.expectEqualStrings("a", it.next().?.name);
+    try testing.expectEqualStrings("b", it.next().?.name);
+    const plain = (try t3.next()).?.publish;
+    try testing.expectEqualStrings("r/1", plain.topic);
+    try testing.expectEqualStrings("{}", plain.payload);
+}
+
+test "v5 Message Expiry: retained and queued copies count down and are dropped once it runs out" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tp = TestTransport{};
+    const p = try connect5(&b, &tp, .{ .client_id = "P" }, 0);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "ret", .payload = "r", .retain = true, .properties = .{ .message_expiry_interval = 10 } } }, 1000);
+
+    var t1 = TestTransport{};
+    const s1 = try connect5(&b, &t1, .{ .client_id = "S1" }, 6000);
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "ret" }} } }, 6000);
+    _ = (try next5(&t1)).?; // SUBACK
+    const r = (try next5(&t1)).?.publish;
+    try testing.expect(r.retain);
+    try testing.expectEqual(@as(?u32, 5), r.properties.message_expiry_interval); // 10 s less the 5 waited
+    var t2 = TestTransport{};
+    const s2 = try connect5(&b, &t2, .{ .client_id = "S2" }, 11_001);
+    _ = try send5(&b, s2.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "ret" }} } }, 11_001);
+    _ = (try next5(&t2)).?; // SUBACK
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t2)); // gone
+
+    // Queued for an offline session past its expiry: deleted, not sent.
+    var tq = TestTransport{};
+    const q = try connect5(&b, &tq, .{ .client_id = "Q", .properties = .{ .session_expiry_interval = 600 } }, 0);
+    _ = try send5(&b, q.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "q", .qos = .at_least_once }} } }, 0);
+    b.remove(q.conn);
+    _ = try send5(&b, p.conn, .{ .publish = .{ .topic = "q", .payload = "late", .qos = .at_least_once, .packet_id = 9, .properties = .{ .message_expiry_interval = 5 } } }, 20_000);
+    var tq2 = TestTransport{};
+    const q2 = try connect5(&b, &tq2, .{ .client_id = "Q", .clean_session = false, .properties = .{ .session_expiry_interval = 600 } }, 26_000);
+    try testing.expect(q2.connack.session_present);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tq2));
+    try testing.expectEqual(@as(u64, 1), b.messagesExpired());
+}
+
+test "v5 subscription options: No Local, Retain As Published, Retain Handling" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ta = TestTransport{};
+    const a = try connect5(&b, &ta, .{ .client_id = "A" }, 0);
+    _ = try send5(&b, a.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .no_local = true }} } }, 0);
+    _ = (try next5(&ta)).?;
+    var tb = TestTransport{};
+    const bc = try connect5(&b, &tb, .{ .client_id = "B" }, 0);
+    _ = try send5(&b, bc.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .retain_as_published = true }} } }, 0);
+    _ = (try next5(&tb)).?;
+    _ = try send5(&b, a.conn, .{ .publish = .{ .topic = "t", .payload = "mine", .retain = true } }, 1);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&ta)); // its own message, No Local
+    const live = (try next5(&tb)).?.publish;
+    try testing.expect(live.retain); // kept, Retain As Published
+
+    // Retain Handling against the retained "mine" now in the store.
+    var tc = TestTransport{};
+    const c = try connect5(&b, &tc, .{ .client_id = "C" }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .retain_handling = .never }} } }, 2);
+    _ = (try next5(&tc)).?;
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 2, .filters = &.{.{ .filter = "t/#", .retain_handling = .send_if_new }} } }, 2);
+    _ = (try next5(&tc)).?;
+    try testing.expect((try next5(&tc)).?.publish.retain); // new subscription: sent
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 3, .filters = &.{.{ .filter = "t/#", .retain_handling = .send_if_new }} } }, 2);
+    _ = (try next5(&tc)).?;
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc)); // existed: not again
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 4, .filters = &.{.{ .filter = "t/#" }} } }, 2);
+    _ = (try next5(&tc)).?;
+    try testing.expect((try next5(&tc)).? == .publish); // Retain Handling 0: always
+}
+
+test "v5 Subscription Identifiers: the one copy carries every matching subscription's id" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "C" }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "a/+" }}, .properties = .{ .subscription_ids = .{ .items = &.{1} } } } }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 2, .filters = &.{.{ .filter = "a/#" }}, .properties = .{ .subscription_ids = .{ .items = &.{2} } } } }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 3, .filters = &.{.{ .filter = "a/b" }} } }, 0);
+    for (0..3) |_| _ = (try next5(&tt)).?;
+    try b.publish("a/b", "x", .at_most_once, true);
+    const got = (try next5(&tt)).?.publish;
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tt)); // one copy
+    var ids = got.properties.subscription_ids.iterator();
+    var seen = [2]bool{ false, false };
+    while (ids.next()) |id| seen[id - 1] = true;
+    try testing.expect(seen[0] and seen[1]);
+    try testing.expectEqual(@as(usize, 2), got.properties.subscription_ids.count());
+    // A retained message delivered at subscribe carries that subscription's id.
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 4, .filters = &.{.{ .filter = "a/b" }}, .properties = .{ .subscription_ids = .{ .items = &.{9} } } } }, 0);
+    _ = (try next5(&tt)).?;
+    try testing.expectEqual(@as(?u32, 9), (try next5(&tt)).?.publish.properties.subscription_ids.first());
+}
+
+test "shared subscriptions: one member per message, round-robin, connected members first, no retained" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try b.publish("job/1", "old", .at_most_once, true); // retained: never sent to a shared subscriber
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    var tn = TestTransport{};
+    const s1 = try connect5(&b, &t1, .{ .client_id = "W1" }, 0);
+    const s2 = try connectClient(&b, &t2, "W2", 60, 0); // 3.1.1 members work too
+    const n = try connectClient(&b, &tn, "N", 60, 0); // an ordinary subscriber beside them
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "$share/g/job/+" }} } }, 0);
+    try feedSubscribe(&b, s2, 1, &.{.{ .filter = "$share/g/job/+" }});
+    try feedSubscribe(&b, n, 1, &.{.{ .filter = "job/+" }});
+    try testing.expect((try next5(&t1)).? == .suback);
+    try testing.expect((try t2.next()).? == .suback);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t1));
+    try testing.expectEqual(@as(?packet.Packet, null), try t2.next());
+    _ = (try tn.next()).?; // SUBACK
+    _ = (try tn.next()).?; // its retained copy
+
+    for (0..4) |_| try b.publish("job/1", "w", .at_most_once, false);
+    var got1: usize = 0;
+    var got2: usize = 0;
+    while (try next5(&t1)) |_| got1 += 1;
+    while (try t2.next()) |_| got2 += 1;
+    try testing.expectEqual(@as(usize, 2), got1);
+    try testing.expectEqual(@as(usize, 2), got2);
+    var all: usize = 0;
+    while (try tn.next()) |_| all += 1;
+    try testing.expectEqual(@as(usize, 4), all); // the ordinary subscriber gets every one
+
+    // One member leaves: the other takes everything; the group outlives it.
+    var ubuf: [64]u8 = undefined;
+    try b.feed(s2, try packet.encodeUnsubscribe(&ubuf, 2, &.{"$share/g/job/+"}));
+    _ = try b.process(s2, 1);
+    _ = (try t2.next()).?;
+    for (0..3) |_| try b.publish("job/2", "w", .at_most_once, false);
+    got1 = 0;
+    while (try next5(&t1)) |_| got1 += 1;
+    try testing.expectEqual(@as(usize, 3), got1);
+    try testing.expectEqual(@as(?packet.Packet, null), try t2.next());
+
+    // A malformed one is refused per filter: 0x8F in 5.0, 0x80 in 3.1.1.
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{ .packet_id = 3, .filters = &.{.{ .filter = "$share//job" }} } }, 0);
+    try testing.expectEqualSlices(u8, &.{0x8F}, (try next5(&t1)).?.suback.codes);
+    try feedSubscribe(&b, s2, 3, &.{.{ .filter = "$share/g+/job" }});
+    try testing.expectEqualSlices(u8, &.{0x80}, (try t2.next()).?.suback.codes);
+}
+
+test "shared subscriptions: an offline session member queues only when no member is connected" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tq = TestTransport{};
+    const q = try connect5(&b, &tq, .{ .client_id = "Q", .properties = .{ .session_expiry_interval = 600 } }, 0);
+    _ = try send5(&b, q.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "$share/g/t", .qos = .at_least_once }} } }, 0);
+    b.remove(q.conn);
+    var to = TestTransport{};
+    const o = try connect5(&b, &to, .{ .client_id = "O" }, 0);
+    _ = try send5(&b, o.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "$share/g/t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&to)).?;
+    try b.publish("t", "1", .at_least_once, false);
+    try b.publish("t", "2", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("Q"));
+    b.remove(o.conn);
+    try b.publish("t", "3", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("Q"));
+}
+
+test "v5 take-over: the superseded 5.0 connection is told, DISCONNECT 0x8E" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const first = try connect5(&b, &t1, .{ .client_id = "same" }, 0);
+    var t2 = TestTransport{};
+    _ = try connect5(&b, &t2, .{ .client_id = "same" }, 1);
+    try testing.expectEqual(packet.ReasonCode.session_taken_over, (try next5(&t1)).?.disconnect.reason_code);
+    try testing.expect(t1.closed);
+    try testing.expectEqual(Connection.State.disconnected, first.conn.state);
+}
+
+test "v5 Will: properties forwarded, Will Delay honoured, cancelled by a return, cut short by the session's end" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connect5(&b, &ts, .{ .client_id = "S" }, 0);
+    _ = try send5(&b, s.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "will/#" }} } }, 0);
+    _ = (try next5(&ts)).?;
+    const will = packet.Will{ .topic = "will/w", .message = "gone", .properties = .{
+        .will_delay_interval = 5,
+        .content_type = "text/plain",
+        .user_properties = .{ .items = &.{.{ .name = "why", .value = "lost" }} },
+    } };
+
+    // Delayed: nothing until the delay has run out.
+    var t1 = TestTransport{};
+    const w1 = try connect5(&b, &t1, .{ .client_id = "w", .will = will, .properties = .{ .session_expiry_interval = 600 } }, 0);
+    b.remove(w1.conn);
+    try testing.expectEqual(@as(usize, 0), b.publishDueWills(4_999));
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&ts));
+    try testing.expectEqual(@as(usize, 1), b.publishDueWills(5_000));
+    const got = (try next5(&ts)).?.publish;
+    try testing.expectEqualStrings("gone", got.payload);
+    try testing.expectEqualStrings("text/plain", got.properties.content_type.?);
+    try testing.expectEqual(@as(usize, 1), got.properties.user_properties.count());
+
+    // Back in time: no Will at all (3.1.3-9).
+    var t2 = TestTransport{};
+    const w2 = try connect5(&b, &t2, .{ .client_id = "w", .clean_session = false, .will = will, .properties = .{ .session_expiry_interval = 600 } }, 10_000);
+    b.remove(w2.conn);
+    var t3 = TestTransport{};
+    const w3 = try connect5(&b, &t3, .{ .client_id = "w", .clean_session = false, .properties = .{ .session_expiry_interval = 600 } }, 12_000);
+    try testing.expectEqual(@as(usize, 0), b.publishDueWills(20_000));
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&ts));
+    _ = try send5(&b, w3.conn, .{ .disconnect = .{} }, 20_001);
+    b.remove(w3.conn);
+
+    // The session ends before the delay: the Will goes with it.
+    var t4 = TestTransport{};
+    var short = will;
+    short.properties.will_delay_interval = 60;
+    const w4 = try connect5(&b, &t4, .{ .client_id = "x", .will = short, .properties = .{ .session_expiry_interval = 2 } }, 0);
+    b.remove(w4.conn);
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(2_000));
+    try testing.expect((try next5(&ts)).? == .publish);
+
+    // DISCONNECT 0x04: a deliberate end that still wants its Will.
+    var t5 = TestTransport{};
+    const w5 = try connect5(&b, &t5, .{ .client_id = "y", .will = .{ .topic = "will/y", .message = "bye" } }, 0);
+    _ = try send5(&b, w5.conn, .{ .disconnect = .{ .reason_code = .disconnect_with_will_message } }, 1);
+    b.remove(w5.conn);
+    try testing.expectEqualStrings("bye", (try next5(&ts)).?.publish.payload);
+}
+
+test "v5 the client's limits: Receive Maximum holds back, Maximum Packet Size drops" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tc = TestTransport{};
+    const c = try connect5(&b, &tc, .{ .client_id = "C", .properties = .{ .receive_maximum = 1, .maximum_packet_size = 40 } }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&tc)).?;
+    try b.publish("t", "1", .at_least_once, false);
+    try b.publish("t", "2", .at_least_once, false); // a second unacknowledged: not sent (clean session drops it)
+    try testing.expect((try next5(&tc)).? == .publish);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
+    try testing.expectEqual(@as(u64, 1), b.qos1Drops());
+    try b.publish("t", "x" ** 50, .at_most_once, false); // larger than the client takes
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
+    try testing.expectEqual(@as(u64, 1), b.oversizeDrops());
+
+    // A persistent session waits instead: the second goes on the first's PUBACK.
+    var tq = TestTransport{};
+    const q = try connect5(&b, &tq, .{ .client_id = "Q", .properties = .{ .receive_maximum = 1, .session_expiry_interval = 60 } }, 0);
+    _ = try send5(&b, q.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "u", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&tq)).?;
+    try b.publish("u", "1", .at_least_once, false);
+    try b.publish("u", "2", .at_least_once, false);
+    const first = (try next5(&tq)).?.publish;
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tq));
+    _ = try send5(&b, q.conn, .{ .puback = .{ .packet_id = first.packet_id } }, 1);
+    try testing.expectEqualStrings("2", (try next5(&tq)).?.publish.payload);
+}
+
+test "v5 violations end with a DISCONNECT naming them" {
+    var b = Broker.init(testing.allocator, .{ .maximum_qos = .at_least_once });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const a = try connect5(&b, &t1, .{ .client_id = "a" }, 0);
+    try testing.expectError(error.ProtocolViolation, send5(&b, a.conn, .{ .publish = .{ .topic = "t", .qos = .exactly_once, .packet_id = 1 } }, 1));
+    try testing.expectEqual(packet.ReasonCode.qos_not_supported, (try next5(&t1)).?.disconnect.reason_code);
+    var t2 = TestTransport{};
+    const c = try connect5(&b, &t2, .{ .client_id = "c" }, 0);
+    try testing.expectError(error.ProtocolViolation, send5(&b, c.conn, .{ .publish = .{ .topic = "t", .properties = .{ .subscription_ids = .{ .items = &.{1} } } } }, 1));
+    try testing.expectEqual(packet.ReasonCode.protocol_error, (try next5(&t2)).?.disconnect.reason_code);
+    var t3 = TestTransport{};
+    const d = try connect5(&b, &t3, .{ .client_id = "d" }, 0);
+    try b.feed(d.conn, &.{ 0x30, 0x03, 0x00, 0x01, 0xFF }); // topic not UTF-8
+    try testing.expectError(error.InvalidUtf8, b.process(d.conn, 1));
+    try testing.expectEqual(packet.ReasonCode.malformed_packet, (try next5(&t3)).?.disconnect.reason_code);
+
+    var b2 = Broker.init(testing.allocator, .{});
+    defer b2.deinit();
+    var t4 = TestTransport{};
+    const e = try connect5(&b2, &t4, .{ .client_id = "e" }, 0);
+    for (1..max_in_flight + 1) |i| _ = try send5(&b2, e.conn, .{ .publish = .{ .topic = "t", .qos = .exactly_once, .packet_id = @intCast(i) } }, 1);
+    t4.read_off = t4.len;
+    try testing.expectError(error.ProtocolViolation, send5(&b2, e.conn, .{ .publish = .{ .topic = "t", .qos = .exactly_once, .packet_id = max_in_flight + 1 } }, 1));
+    try testing.expectEqual(packet.ReasonCode.receive_maximum_exceeded, (try next5(&t4)).?.disconnect.reason_code);
+}
+
+test "v5 UNSUBACK: Success, or No subscription existed, per filter" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt = TestTransport{};
+    const c = try connect5(&b, &tt, .{ .client_id = "C" }, 0);
+    _ = try send5(&b, c.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = "a" }} } }, 0);
+    _ = (try next5(&tt)).?;
+    _ = try send5(&b, c.conn, .{ .unsubscribe = .{ .packet_id = 2, .filters = &.{ "a", "b" } } }, 0);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x11 }, (try next5(&tt)).?.unsuback.codes);
 }
