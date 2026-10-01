@@ -1052,9 +1052,20 @@ if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
         if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
         printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
     }
+    # Modules named on the command line limit the re-pin to their rows; every
+    # other row keeps its digest. ⛔ Until 2026-10-02 the names were ignored
+    # here: `--update-digests bulletproofs` rewrote the digests of five other
+    # modules whose contexts nobody had re-read -- exactly the act this verb
+    # exists to make deliberate.
+    declare -A UPDATE_ONLY=()
+    for m in "${MODULES[@]}"; do UPDATE_ONLY["$m"]=1; done
     tmp="$(mktemp)"
     while IFS= read -r ln; do
         if [[ "$ln" =~ ^# || -z "$ln" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
+        if (( ${#UPDATE_ONLY[@]} )); then
+            IFS=$'\t' read -r m _ <<<"$ln"
+            if [[ -z "${UPDATE_ONLY[$m]:-}" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
+        fi
         # ⛔ THE SEVENTH COLUMN IS CARRIED THROUGH, and it was not until
         # 2026-09-08. This rewriter was written when the row had six fields;
         # the output pin was added the same day and this loop was not updated,

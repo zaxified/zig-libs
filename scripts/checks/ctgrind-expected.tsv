@@ -435,8 +435,11 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # were disassembled one by one); the direction and the disassembly/`--stacks`
 # evidence above are what this pin rests on, not the exact arithmetic on this
 # row.
-threshold_ecdsa	ReleaseFast	share	1	<=267	e932a70c2bfffc2e	4a6777ac538b5e90
-threshold_ecdsa	ReleaseFast	nonce	1	<=378	e932a70c2bfffc2e	31f7e323b84fd8a7
+# Source pin moved 2026-10-02 (305ea2d4 removed the panicking
+# `identifyAbortCulprit` stub, off every measured path): share 267, nonce 378,
+# betaprime 313 in-file, each exactly at its bound, controls and traps 0.
+threshold_ecdsa	ReleaseFast	share	1	<=267	82a170458c38d1c5	4a6777ac538b5e90
+threshold_ecdsa	ReleaseFast	nonce	1	<=378	82a170458c38d1c5	31f7e323b84fd8a7
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -467,7 +470,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=378	e932a70c2bfffc2e	31f7e323b84fd8a7
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=313	e932a70c2bfffc2e	0d9a7f3232367fc7
+threshold_ecdsa	ReleaseFast	betaprime	1	<=313	82a170458c38d1c5	0d9a7f3232367fc7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
@@ -498,8 +501,10 @@ paillier	ReleaseFast	addm	1	<=10	158deee694942af9	526f0de009c0cbfb
 # `abab..` for ibe), so this is NOT the "the harness stopped reaching the
 # module" failure the seventh column exists to catch. `ibe extract` and `ibe
 # fp12pow` were green throughout and are left untouched.
-tlock	ReleaseFast	fp12pow	1	2	4ddb26ab436730a6	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	3	4ddb26ab436730a6	3a939f7ff5b39d03
+# Source pin moved 2026-10-02 (b9d999db changed doc comments only): --stacks
+# reads the same lines, tlock.zig:358,361 and 406,430,432.
+tlock	ReleaseFast	fp12pow	1	2	239bb8a3869c817d	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	3	239bb8a3869c817d	3a939f7ff5b39d03
 ibe	ReleaseFast	extract	1	3	35d0138e95b4dcf1	686f0732e74c5ef7
 ibe	ReleaseFast	decrypt	1	7	99a9b799453f052c	fb52b6c55cc51706
 ibe	ReleaseFast	fp12pow	1	2	35d0138e95b4dcf1	d2e187260f9f18a2
@@ -513,7 +518,10 @@ musig2	ReleaseFast	sign	1	<=101	a4d62ba84a4d5c2f	2a2f275cd0c5c7c5
 # (root.zig:138/168/169, common.zig:75), comb `rejectIdentity` x2
 # (group.zig:399), the public key's Y parity (bip340 root.zig:200), and
 # canonicality on taproot's own root.zig:274/281.
-taproot	ReleaseFast	secret	1	9	9a99856cbd266475	966e0c7b70c18936
+# Source pin moved 2026-10-02 after the BIP341 script trees (7a956ff7): --stacks
+# reads the same nine, at shifted lines -- group.zig:400 x2, taproot
+# root.zig:279/286 (the same two `Scalar.fromBytes` canonicality checks).
+taproot	ReleaseFast	secret	1	9	1e68bd3f054cd455	966e0c7b70c18936
 adaptor	ReleaseFast	presign	1	<=90	7058862601b5b396	d3d7ee2d921fc316
 adaptor	ReleaseFast	adapt	1	2	7058862601b5b396	6e42ff967657d98e
 adaptor	ReleaseFast	extract	1	3	7058862601b5b396	76dc1be38fd7746f
@@ -566,8 +574,17 @@ tfhe	ReleaseFast	keygen	1	0	476357ebc239682e	faee3ac1f09c123f
 tfhe	ReleaseFast	encrypt	1	0	476357ebc239682e	aca01c505d98bd94
 tfhe	ReleaseFast	decrypt	1	<=10	ff62a60d16b52a66	b6d58329e7c93b2f
 tfhe	ReleaseFast	bootstrap	1	<=186	c546ed4f83700e54	4e39213562dbdc80
-dkg	ReleaseFast	coeffs	1	<=98	3f546b9ec9ff000d	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	0	9d983ff8e2433712	6407896882d3491c
+# dkg -- the module makes no constant-time claim (see its ctgrind_harness.zig);
+# these rows are measurements, kept so a change in them is seen. Re-measured
+# 2026-10-02 after the participant layer and GJKR step 4 (ba92d6fc, a528d9fa):
+# coeffs 98 -> 92 in-file, combine 0. The 92 are the classes the harness
+# names: `deal`'s 48-byte reductions (randomScalar, protocol.zig:85), the
+# Pedersen/Feldman commitment and share-check multiplications (commit.zig:118-
+# 178), SEC1 decoding of secret-derived commitments (root.zig:222/223) and
+# the final `basePoint.mul` (protocol.zig:237). Bound tightened to the
+# measurement. The `Participant` state machine is not measured by this harness.
+dkg	ReleaseFast	coeffs	1	<=92	f4f220f391c8ab28	ace23d0e40b2c8f5
+dkg	ReleaseFast	combine	1	0	c1f0e4700ec89dc2	6407896882d3491c
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
 # functions END in `if (invalid != 0) return error.InvalidPadding` and return
@@ -672,6 +689,9 @@ bip32	ReleaseFast	mnemonic	1	3	008c60b09bb381e3	d42db8cf9cdc2200
 # `mem.eql` does NOT move the count: LLVM compiles a fixed 16-byte `mem.eql`
 # to one vector compare and one branch -- the same single context.)
 # The three out_sha are equal on purpose: the three paths compute the same tags.
-aesgcm	ReleaseFast	ctx	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad
-aesgcm	ReleaseFast	stateless	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad
-aesgcm	ReleaseFast	generic	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad
+# Source pin moved 2026-10-02 (d30dce13: `x86_asm` also off for the self-hosted
+# backend on a baseline CPU; the ReleaseFast/LLVM build is unchanged): --stacks
+# reads the same one line, root.zig:793 (NiKey.open) and :266 (Generic.open).
+aesgcm	ReleaseFast	ctx	1	4	8f53d52e916f2339	beb9b7dd29864dad
+aesgcm	ReleaseFast	stateless	1	4	8f53d52e916f2339	beb9b7dd29864dad
+aesgcm	ReleaseFast	generic	1	4	8f53d52e916f2339	beb9b7dd29864dad
