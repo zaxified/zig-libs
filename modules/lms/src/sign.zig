@@ -282,6 +282,12 @@ pub const Persist = struct {
     /// Called with the position that must be on stable storage before the
     /// signature at the *previous* position is released.
     write: *const fn (ctx: *anyopaque, next: Position) anyerror!void,
+    /// The `std.Io` that `write` blocks in, if any. `SigningKey.sign` holds
+    /// its guard across `write`; with an `Io` a second signer parks on an
+    /// `std.Io.Mutex` instead of spinning, which is required when the `Io`
+    /// runs several tasks on one thread (a spinning signer would starve one
+    /// suspended in `write` forever).
+    io: ?std.Io = null,
 };
 
 pub const HssError = SignError || Allocator.Error || error{
@@ -475,6 +481,8 @@ pub const SigningKey = struct {
     sk: SecretKey,
     home: *const SigningKey,
     busy: std.atomic.Value(bool),
+    /// The guard when `persist.io` is set (see `Persist.io`).
+    io_mu: std.Io.Mutex = .init,
     persist: ?Persist,
 
     pub const Error = HssError || error{
@@ -498,6 +506,11 @@ pub const SigningKey = struct {
 
     pub fn sign(self: *SigningKey, msg: []const u8, out: []u8) Error![]u8 {
         if (self.home != self) return error.KeyHandleCopied;
+        if (self.persist) |p| if (p.io) |io| {
+            self.io_mu.lockUncancelable(io);
+            defer self.io_mu.unlock(io);
+            return self.sk.signPersisting(msg, out, self.persist);
+        };
         while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }

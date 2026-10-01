@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `SigningKey.Persist.io`: the `Io` the persist hook blocks in. With it, `SigningKey.sign`
+  guards with an `std.Io.Mutex`, so a second signer parks instead of spinning on one suspended
+  in the hook — required when the `Io` runs several tasks on one thread. Without it, unchanged.
+  Found by the spinlock audit that followed the simio kv pilot.
 - **2026-09-15** — A1 F3. Security fix, no API change: WOTS+ chain values
   survived on the dead stack after `keyGen` and `sign` — measured at
   ReleaseFast, `keyGen` left 49, `sign` 47 per call at leaf 0 and 49 after a

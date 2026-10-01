@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** `Sharded`'s `on_evict`/`drainDirty` contract
+  now states that a callback must not suspend in a `std.Io` when tasks of one thread share the
+  cache (the shard lock does not wait through the `Io`). Documentation only.
 - **2026-09-29** — Fixed: a reservation (`reserve`, before `commit`) was a HIT for `get`
   and lendable by `pin` with its uninitialized bytes, and `drainDirty` handed them to a
   flusher (a reservation is dirty from birth). Harmless while the producer fills before

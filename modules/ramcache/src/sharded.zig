@@ -164,6 +164,12 @@
 //!     failure mode is a deadlock, which is why it is repeated in bold.)
 //!   * must stay cheap: it runs inside a critical section shared by every key
 //!     that hashes to that shard.
+//!   * **must not suspend in a `std.Io`** (file or socket I/O, a sleep) when
+//!     the cache is shared by tasks of an `Io` that runs several of them on
+//!     one thread (`std.Io.Evented`, a simulator): the shard lock waits by
+//!     spinning and thread-yielding, never through the `Io`, so a waiter on
+//!     the same thread would never let the suspended holder resume. The same
+//!     holds for the `drainDirty` callback.
 //!
 //! Its `key`/`value` slices are valid only for the duration of the call —
 //! unchanged from `Cache`, and for the same reason.

@@ -534,6 +534,8 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             /// critical section is one XMSS signature, and the contended case
             /// is a caller doing something they were told not to.
             busy: std.atomic.Value(bool),
+            /// The guard when `persist.io` is set (see `Persist.io`).
+            io_mu: std.Io.Mutex = .init,
             persist: ?Persist,
 
             /// Durable-index hook. `write` is called with the index that must
@@ -542,6 +544,12 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             pub const Persist = struct {
                 ctx: *anyopaque,
                 write: *const fn (ctx: *anyopaque, next_idx: u32) anyerror!void,
+                /// The `std.Io` that `write` blocks in, if any. `sign` holds
+                /// its guard across `write`; with an `Io` a second signer
+                /// parks on an `std.Io.Mutex` instead of spinning, which is
+                /// required when the `Io` runs several tasks on one thread
+                /// (a spinning signer would starve one suspended in `write`).
+                io: ?std.Io = null,
             };
 
             pub const Error = error{
@@ -574,11 +582,20 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
 
             pub fn sign(self: *SigningKey, out: *[signature_length]u8, msg: []const u8) Error!void {
                 if (self.home != self) return error.KeyHandleCopied;
+                if (self.persist) |p| if (p.io) |io| {
+                    self.io_mu.lockUncancelable(io);
+                    defer self.io_mu.unlock(io);
+                    return self.signGuarded(out, msg);
+                };
                 while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
                     std.atomic.spinLoopHint();
                 }
                 defer self.busy.store(false, .release);
+                return self.signGuarded(out, msg);
+            }
 
+            /// `sign` with its guard held.
+            fn signGuarded(self: *SigningKey, out: *[signature_length]u8, msg: []const u8) Error!void {
                 // Check exhaustion BEFORE persisting: a rejected sign must not
                 // move the durable index either.
                 if (self.sk.idx >= max_signatures) return error.KeyExhausted;
@@ -1248,6 +1265,41 @@ test "SigningKey: concurrent signing on one shared handle never repeats a leaf" 
         };
     }
     try std.testing.expectEqual(@as(u32, TestX.max_signatures), handle.index());
+}
+
+test "SigningKey: with Persist.io, signers wait through the Io and still never repeat a leaf" {
+    // Spinlock audit after the simio kv pilot: the guard is held across the
+    // persist hook, which writes to storage. With `Persist.io` a waiting
+    // signer parks on the `Io` instead of spinning on a holder suspended in
+    // that write. Here the hook really yields (an `Io` sleep) while held.
+    const kp = testKeyPair();
+    const io = std.testing.io;
+    const Slow = struct {
+        io: std.Io,
+        fn write(ctx: *anyopaque, _: u32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.io.sleep(.fromMicroseconds(50), .awake);
+        }
+    };
+    var slow: Slow = .{ .io = io };
+    var handle: TestX.SigningKey = undefined;
+    TestX.SigningKey.init(&handle, kp.sk, .{ .ctx = &slow, .write = Slow.write, .io = io });
+
+    const Worker = struct {
+        fn run(hk: *TestX.SigningKey, seen: *[TestX.max_signatures]std.atomic.Value(u32)) void {
+            var sig: [TestX.signature_length]u8 = undefined;
+            while (true) {
+                hk.sign(&sig, "concurrent") catch return; // KeyExhausted ends it
+                _ = seen[std.mem.readInt(u32, sig[0..4], .big)].fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var seen: [TestX.max_signatures]std.atomic.Value(u32) = undefined;
+    for (&seen) |*x| x.* = .init(0);
+    var tasks: [4]std.Io.Future(void) = undefined;
+    for (&tasks) |*t| t.* = try io.concurrent(Worker.run, .{ &handle, &seen });
+    for (&tasks) |*t| t.await(io);
+    for (&seen) |*x| try std.testing.expectEqual(@as(u32, 1), x.load(.monotonic));
 }
 
 test "a key restored at index 0 resyncs instead of signing an all-zero auth path (re-audit F1)" {

@@ -260,6 +260,11 @@ reported as a miss; per-shard caps not divided.
 
 ## Backlog / deferred
 
+- `Sharded.Options.io` (2026-10-01, spinlock audit after the simio kv pilot): the shard lock is
+  held across `on_evict` and the `drainDirty` callback and waits by spinning/thread-yielding, so a
+  callback that suspends in an `Io` running several tasks on one thread would hang a waiter.
+  Documented as "must not suspend"; no in-tree callback does. When one needs to, an optional `io`
+  would make the shard lock an `std.Io.Mutex` (the `kv.Lock` shape).
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/cache.zig` (thread-safe LRU with TTL and ref-counted entries) has no wire format, so it is not a byte oracle. Use it as a behavioural and benchmark reference: the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 None beyond what's already covered above. Persistence itself and keyed-hash hardening remain

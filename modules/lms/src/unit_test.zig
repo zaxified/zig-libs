@@ -328,6 +328,41 @@ test "SigningKey: the next position is persisted before signing; a failed write 
     try std.testing.expectEqual(calls, log.calls);
 }
 
+test "SigningKey: with Persist.io, concurrent signers wait through the Io" {
+    // Spinlock audit after the simio kv pilot: the guard is held across the
+    // persist hook; with `Persist.io` a waiting signer parks on the `Io`
+    // instead of spinning on a holder suspended in the hook.
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
+    const io = std.testing.io;
+    const Slow = struct {
+        io: std.Io,
+        calls: std.atomic.Value(u32) = .init(0),
+        fn write(ctx: *anyopaque, _: lms.Position) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            try self.io.sleep(.fromMicroseconds(50), .awake);
+        }
+    };
+    var slow: Slow = .{ .io = io };
+    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(4), idOf(4), null);
+    var handle: lms.SigningKey = undefined;
+    lms.SigningKey.init(&handle, sk, .{ .ctx = &slow, .write = Slow.write, .io = io });
+    defer handle.deinit();
+
+    const Worker = struct {
+        fn run(hk: *lms.SigningKey) void {
+            const buf = gpa.alloc(u8, hk.sk.signatureLength()) catch return;
+            defer gpa.free(buf);
+            for (0..4) |_| _ = hk.sign("concurrent", buf) catch return;
+        }
+    };
+    var tasks: [4]std.Io.Future(void) = undefined;
+    for (&tasks) |*t| t.* = try io.concurrent(Worker.run, .{&handle});
+    for (&tasks) |*t| t.await(io);
+    try std.testing.expectEqual(@as(u32, 16), slow.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 16), handle.position().q[0]);
+}
+
 test "SigningKey: a copied handle refuses to sign" {
     const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
     const sk = try lms.SecretKey.init(gpa, &levels, seedOf(3), idOf(3), null);
