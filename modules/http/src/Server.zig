@@ -87,6 +87,7 @@
 //! this — they remain the cleartext path.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
@@ -743,8 +744,7 @@ test "bind: ListenFailed carries the underlying AddressInUse error name" {
     var first = init(io, testing.allocator, .{ .handler = testHandler });
     defer first.deinit();
     first.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     try testing.expectEqual(@as(?[]const u8, null), first.bindErrorName());
     const held_port = first.boundAddress().getPort();
@@ -6353,8 +6353,7 @@ test "integration: Phase-1 client drives the server over loopback" {
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -6417,8 +6416,7 @@ test "integration: multicore accept engine (SO_REUSEPORT) serves across N listen
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("multicore bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("multicore bind failed ({t})", .{err});
     };
     // All N listeners bound the same resolved port (SO_REUSEPORT group).
     try testing.expectEqual(@as(usize, n_listeners - 1), server.aux_listeners.len);
@@ -6458,8 +6456,7 @@ test "integration: keep-alive — two requests on one TCP connection" {
     var server = init(io, testing.allocator, .{ .handler = testHandler, .context = &hits });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -6467,8 +6464,7 @@ test "integration: keep-alive — two requests on one TCP connection" {
 
     const addr = server.boundAddress();
     const stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -6508,16 +6504,14 @@ test "integration: Server.Options defaults emit Server and Date on the wire" {
     var server = init(io, testing.allocator, .{ .handler = testHandler });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -6554,16 +6548,14 @@ test "integration: Server.Options suppression agrees byte-for-byte with StreamOp
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -6591,16 +6583,14 @@ test "integration: stalled client is dropped after the read timeout" {
     var server = init(io, testing.allocator, .{ .handler = testHandler, .read_timeout_ms = 150 });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [256]u8 = undefined;
@@ -6636,16 +6626,14 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [256]u8 = undefined;
@@ -6701,16 +6689,14 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [256]u8 = undefined;
@@ -6789,16 +6775,14 @@ test "integration: handler sees the loopback peer + rising request index; on_con
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -6845,8 +6829,7 @@ test "integration: on_connect rejecting the peer refuses the connection" {
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -6855,8 +6838,7 @@ test "integration: on_connect rejecting the peer refuses the connection" {
     // The TCP handshake completes (kernel backlog), then the server closes
     // without writing a byte: the first read fails.
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [64]u8 = undefined;
@@ -6878,8 +6860,7 @@ test "integration: activeConnections reflects an in-flight request" {
     var server = init(io, testing.allocator, .{ .handler = testHandler });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -6888,8 +6869,7 @@ test "integration: activeConnections reflects an in-flight request" {
     try testing.expectEqual(@as(usize, 0), server.activeConnections());
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -6929,8 +6909,7 @@ test "integration: negotiated gzip compression over loopback" {
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -7019,8 +6998,7 @@ fn acceptOne(server: *net.Server, io: std.Io) net.Server.AcceptError!net.Stream 
 fn cancelListener(io: std.Io) !net.Server {
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     return addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
 }
 
@@ -7036,8 +7014,7 @@ const SilentPeer = struct {
         var accept_fut = try io.concurrent(acceptOne, .{ server, io });
         const conn = server.socket.address.connect(io, .{ .mode = .stream }) catch |err| {
             if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         return .{ .conn = conn, .peer = try accept_fut.await(io) };
     }
@@ -7255,16 +7232,14 @@ test "integration: a client that stops reading is dropped after the write timeou
     var server = init(io, testing.allocator, .{ .handler = bigHandler, .write_timeout_ms = 150 });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     const small = std.mem.toBytes(@as(c_int, 2048));
@@ -7636,8 +7611,7 @@ test "integration: a connection dropped before serving still reports .new/.close
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -7654,8 +7628,7 @@ test "integration: a connection dropped before serving still reports .new/.close
         // the early return, and that needs a peer that RESETS. `SO_LINGER`
         // with a zero timeout is what turns `close()` into an RST.
         const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         const Linger = extern struct { onoff: i32, timeout: i32 };
         const l: Linger = .{ .onoff = 1, .timeout = 0 };

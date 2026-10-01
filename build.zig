@@ -115,13 +115,29 @@ const Module = struct {
     /// see, this changes only what runs beside it. Marking a module must not
     /// re-test it. Published as `module-graph` column 8.
     timing: bool = false,
+    /// The tests talk to 127.0.0.1 / ::1, and `scripts/test.sh` runs them under
+    /// `scripts/lib/netns-run`: a private network namespace with its own `lo`,
+    /// as the calling user, with `ZIGLIBS_NETNS=1` so a loopback that does not
+    /// work FAILS instead of skipping (`testkit.loopbackSkip`). On the host the
+    /// same loopback is subject to the host's conntrack, firewall and port
+    /// space (2026-10-01). Optional isolation for this repo's own lanes only:
+    /// `zig build test-<name>` itself never needs a namespace, so a consumer
+    /// runs the tests on plain loopback, as before.
+    ///
+    /// The rule for setting it is measured, not guessed: the module's test
+    /// binary changes outcome when run under `netns-run` with `lo` left DOWN.
+    /// A `live` module is not marked -- its peer (a podman container, a
+    /// system ssh) does not run inside the namespace, and it runs serially on
+    /// the host anyway. In the fingerprint, like `netns`: it changes what a
+    /// test can see. Published as `module-graph` column 9.
+    loopback: bool = false,
 };
 
 const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
     .{ .name = "testkit", .libs = &.{"os"} },
     .{ .name = "fastmem", .libs = &.{"os"} },
-    .{ .name = "netaddr", .libs = &.{ "net", "web" } },
+    .{ .name = "netaddr", .libs = &.{ "net", "web" }, .test_deps = &.{"testkit"}, .loopback = true },
     // `workerpool` is a TEST-only dep: `h2_server.Options.dispatcher` is an
     // injectable seam (a function pointer + a context pointer), so the
     // published `http` module implements no pool at all — deliberately, since
@@ -130,25 +146,25 @@ const module_list = [_]Module{
     // wire a real `workerpool.WorkerPool` into that seam because the five
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
-    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32" }, .test_deps = &.{ "testkit", "workerpool" } },
+    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32" }, .test_deps = &.{ "testkit", "workerpool" }, .loopback = true },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .test_deps = &.{"testkit"} },
+    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" } },
-    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true },
-    .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
-    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" } },
-    .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").
-    .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
-    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"} },
-    .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "linkheader", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
@@ -157,9 +173,9 @@ const module_list = [_]Module{
     .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
-    .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
+    .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
@@ -167,7 +183,7 @@ const module_list = [_]Module{
     .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "decimal", .libs = &.{ "storage", "format" }, .test_deps = &.{"testkit"} },
     .{ .name = "seqmap", .libs = &.{"net"} },
-    .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" }, .test_deps = &.{"testkit"}, .timing = true },
+    .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "mcp", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" }, .test_deps = &.{"testkit"} },
     .{ .name = "coap", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
@@ -196,7 +212,7 @@ const module_list = [_]Module{
     .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .test_deps = &.{"testkit"} },
     .{ .name = "netsim", .libs = &.{"net"} },
-    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{ "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "icmp", "modbus", "whois", "stun", "ocspcache", "llmclient", "staticfiles" } },
+    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{ "testkit", "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "icmp", "modbus", "whois", "stun", "ocspcache", "llmclient", "staticfiles" }, .loopback = true },
     .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
     .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
@@ -223,28 +239,28 @@ const module_list = [_]Module{
     .{ .name = "timelock_envelope", .libs = &.{"crypto"}, .deps = &.{ "tlock", "hqc", "chachapoly", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "drand", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "tlock" }, .test_deps = &.{"testkit"} },
     .{ .name = "tcplan", .libs = &.{"net"}, .deps = &.{"tc"} },
-    .{ .name = "modbus", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"} },
+    .{ .name = "modbus", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .timing = true },
     .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .live = true },
-    .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"} },
+    .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .test_deps = &.{ "testkit", "iec61850" } },
-    .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
-    .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .timing = true },
+    .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "uci", .libs = &.{"os"}, .test_deps = &.{"testkit"}, .timing = true },
-    .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true, .timing = true },
     .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" } },
-    .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
-    .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" } },
+    .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" } },
-    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256" }, .test_deps = &.{"testkit"} },
+    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" }, .test_deps = &.{"testkit"} },
@@ -253,7 +269,7 @@ const module_list = [_]Module{
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{"testkit"} },
     .{ .name = "aeskw", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .test_deps = &.{"testkit"} },
-    .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .test_deps = &.{"testkit"} },
+    .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "diskfree", .libs = &.{"os"} },
@@ -289,25 +305,25 @@ const module_list = [_]Module{
     .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy", "kv" }, .test_deps = &.{"testkit"} },
     .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{"kv"} },
     .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"} },
-    .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true },
+    .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "encoding", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "base32", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "syslog", .libs = &.{"net"}, .deps = &.{"datefmt"} },
     .{ .name = "sntp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .test_deps = &.{"testkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true },
+    .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" }, .test_deps = &.{"testkit"} },
     .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .test_deps = &.{"testkit"} },
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
-    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{"x509"}, .test_deps = &.{"testkit"} }, // x509: RFC 5280 chain verification + DER guard
+    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{"x509"}, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },
@@ -1778,6 +1794,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         h.update(if (m.heavy) "\x00heavy" else "\x00light");
         h.update(if (m.live) "\x00live" else "\x00-");
         h.update(if (m.netns) "\x00netns" else "\x00-");
+        h.update(if (m.loopback) "\x00loopback" else "\x00-");
         for (m.deps) |d| {
             h.update("\x00d:");
             h.update(d);
@@ -2127,7 +2144,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
         // copies of these two module sets. `live` is declared in `module_list`;
         // `ct` is derived from the tree (the harness file is its own
         // declaration). Both were duplicated into scripts/ before this.
-        try w.print("\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+        try w.print("\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
             if (m.live) "live" else "-",
             if (blk: {
                 for (harnesses) |h| {
@@ -2141,6 +2158,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
             m.libs[0],
             if (m.netns) "netns" else "-",
             if (m.timing) "timing" else "-",
+            if (m.loopback) "loopback" else "-",
         });
     }
 

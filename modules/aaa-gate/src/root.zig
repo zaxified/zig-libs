@@ -115,6 +115,7 @@
 //! stable address (the middleware's `state` points at it).
 
 const std = @import("std");
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
@@ -2407,8 +2408,7 @@ test "integration: protected route over loopback — 401 / valid Bearer 200 with
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

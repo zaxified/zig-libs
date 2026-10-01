@@ -89,6 +89,7 @@
 //! than a bolt-on.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const netaddr = @import("netaddr");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
@@ -2546,8 +2547,7 @@ fn h2LoopbackServer(io: std.Io) !*Server {
     server.bind() catch |err| {
         server.deinit();
         testing.allocator.destroy(server);
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     return server;
 }
@@ -2569,8 +2569,7 @@ test "h2c dogfood: GET, POST and multiplexed requests on one connection (loopbac
     var client = Client.init(io, gpa, .{});
     defer client.deinit();
     const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer hs.close();
 
@@ -2632,8 +2631,7 @@ test "h2c dogfood: a client-wide `user_agent` reaches HTTP/2, and a per-request 
     var client = Client.init(io, gpa, .{ .user_agent = "ua-dogfood/9.9" });
     defer client.deinit();
     const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer hs.close();
 
@@ -2680,8 +2678,7 @@ test "h2c dogfood: large response streams past the initial window (flow control,
     var client = Client.init(io, gpa, .{});
     defer client.deinit();
     const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer hs.close();
 
@@ -2722,8 +2719,7 @@ test "h2c dogfood: the same body read INCREMENTALLY over a real socket (loopback
     var client = Client.init(io, gpa, .{});
     defer client.deinit();
     const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer hs.close();
 
@@ -2983,8 +2979,7 @@ test "dialConn: TLS key material fails CLOSED when randomSecure has no entropy" 
     // Debug, ReleaseSafe and ReleaseFast alike.
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(real_io, .{}) catch |err| {
-        std.debug.print("no-entropy listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("no-entropy listen failed ({t})", .{err});
     };
     defer listener.deinit(real_io);
     const port = listener.socket.address.getPort();
@@ -3113,8 +3108,7 @@ test "readAllAlloc: a canceled body read surfaces Canceled, not ReadFailed" {
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("readAllAlloc cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("readAllAlloc cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -3154,8 +3148,7 @@ test "getToFile: a canceled body read surfaces Canceled, not ReadFailed" {
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("getToFile cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("getToFile cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -3236,8 +3229,7 @@ test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("putFile cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("putFile cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -3364,8 +3356,7 @@ test "putFile + putFilePlain: a cancel inside the local file read surfaces Cance
 
         const addr = try net.IpAddress.parse("127.0.0.1", 0);
         var listener = addr.listen(real_io, .{}) catch |err| {
-            std.debug.print("file-read cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("file-read cancel test listen failed ({t})", .{err});
         };
         defer listener.deinit(real_io);
         const port = listener.socket.address.getPort();
@@ -3493,8 +3484,7 @@ test "getToFile: a cancel inside creating, writing or flushing the local file su
 
         const addr = try net.IpAddress.parse("127.0.0.1", 0);
         var listener = addr.listen(real_io, .{}) catch |err| {
-            std.debug.print("local file cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("local file cancel test listen failed ({t})", .{err});
         };
         defer listener.deinit(real_io);
         const port = listener.socket.address.getPort();
@@ -3547,8 +3537,7 @@ test "request: a canceled request-head write surfaces Canceled, not WriteFailed"
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("request head-write cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("request head-write cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -3607,8 +3596,7 @@ test "requestStreaming: a canceled request-head write surfaces Canceled, not Wri
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("requestStreaming head-write cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("requestStreaming head-write cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -3953,48 +3941,6 @@ test "timeout: an Io with no concurrency to give degrades to unbounded, not to b
     try testing.expectEqualStrings("ok", body);
 }
 
-test "live: GET https://example.com round-trip" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var client = Client.init(io, testing.allocator, .{
-        .connect_timeout_ms = 4000,
-        .total_timeout_ms = 15000,
-    });
-    defer client.deinit();
-
-    const body = client.getAlloc(testing.allocator, "https://example.com/", 1 << 20) catch |err| {
-        std.debug.print("live network test skipped: {s}\n", .{@errorName(err)});
-        return error.SkipZigTest;
-    };
-    defer testing.allocator.free(body);
-    try testing.expect(body.len > 0);
-    try testing.expect(std.mem.indexOf(u8, body, "Example") != null);
-}
-
-test "live: redirect follow (http → https)" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var client = Client.init(io, testing.allocator, .{
-        .connect_timeout_ms = 4000,
-        .total_timeout_ms = 15000,
-    });
-    defer client.deinit();
-
-    // www.example.com used to 3xx; if the world changed, accept any 2xx/3xx
-    // completion — this test is about the transport, the redirect state
-    // machine is unit-tested offline.
-    var res = client.request(.get, "http://example.com/", .{}) catch |err| {
-        std.debug.print("live network test skipped: {s}\n", .{@errorName(err)});
-        return error.SkipZigTest;
-    };
-    defer res.deinit();
-    try testing.expect(res.status >= 200 and res.status < 400);
-}
-
 // ── tests (plaintext-only client: requestPlain / requestStreamingPlain / putFilePlain) ──
 
 // What this test guarantees and what it does not: it proves requestPlain/
@@ -4100,8 +4046,7 @@ test "requestPlain: a redirect to https:// fails closed instead of silently upgr
     server.* = Server.init(io, testing.allocator, .{ .handler = plainRedirectToHttpsHandler });
     server.bind() catch |err| {
         server.deinit();
-        std.debug.print("plaintext redirect test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("plaintext redirect test loopback bind failed ({t})", .{err});
     };
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
@@ -4172,8 +4117,7 @@ test "request/requestPlain: redirect_filter gates the destination before any dia
     server.* = Server.init(io, testing.allocator, .{ .handler = redirectToPortOneHandler });
     server.bind() catch |err| {
         server.deinit();
-        std.debug.print("redirect_filter test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("redirect_filter test loopback bind failed ({t})", .{err});
     };
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
@@ -4345,8 +4289,7 @@ test "requestPlain: pool: stale-conn retry whose redial ALSO fails does not doub
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("requestPlain stale-conn redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("requestPlain stale-conn redial-fail test listen failed ({t})", .{err});
     };
 
     const port = listener.socket.address.getPort();
@@ -4387,8 +4330,7 @@ test "requestStreamingPlain: pool: stale-conn retry whose redial ALSO fails does
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("requestStreamingPlain redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("requestStreamingPlain redial-fail test listen failed ({t})", .{err});
     };
 
     const port = listener.socket.address.getPort();
@@ -4465,8 +4407,7 @@ fn poolTestLoopback(io: std.Io, max_requests_per_conn: u32) !*Server {
     server.bind() catch |err| {
         server.deinit();
         testing.allocator.destroy(server);
-        std.debug.print("pool test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("pool test loopback bind failed ({t})", .{err});
     };
     return server;
 }
@@ -4671,8 +4612,7 @@ test "pool: a stale reused connection (peer already closed it) is retried once t
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("stale-conn test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("stale-conn test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -4771,8 +4711,7 @@ test "pool: stale-conn retry whose redial ALSO fails does not double-free conn" 
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("stale-conn redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("stale-conn redial-fail test listen failed ({t})", .{err});
     };
 
     const port = listener.socket.address.getPort();
@@ -4810,8 +4749,7 @@ test "pool: requestStreaming's stale-conn retry whose redial ALSO fails does not
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("requestStreaming redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("requestStreaming redial-fail test listen failed ({t})", .{err});
     };
 
     const port = listener.socket.address.getPort();
@@ -4852,8 +4790,7 @@ test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {
     // this bookkeeping-only test.
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("pool cap test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("pool cap test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -4897,8 +4834,7 @@ test "pool: idle_timeout_ms reaping via sweep" {
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("pool sweep test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("pool sweep test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -4926,8 +4862,7 @@ test "pool: concurrent acquire/release from many threads is leak-free and race-f
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("pool concurrency test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("pool concurrency test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -5034,7 +4969,7 @@ test "inline_blocking: resolving and connecting a host name starts no task on th
     const io = TaskCountingIo.wrap(&threaded, &vtable);
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
-    var listener = addr.listen(io, .{}) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
     var url_buf: [64]u8 = undefined;

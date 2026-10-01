@@ -12,6 +12,7 @@
 //! `http.Client.Response.reader()` already decodes.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("http");
 const types = @import("types.zig");
 const response = @import("response.zig");
@@ -640,8 +641,7 @@ test "Client.create: a canceled body read surfaces error.Canceled, not error.Htt
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("llmclient cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("llmclient cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -691,8 +691,7 @@ test "EventIterator.next: a canceled body read surfaces error.Canceled, not erro
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("llmclient stream cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("llmclient stream cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -880,7 +879,7 @@ const Loopback = struct {
         errdefer self.threaded.deinit();
         const io = self.threaded.io();
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = addr.listen(io, .{}) catch return error.SkipZigTest;
+        self.listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
         errdefer self.listener.deinit(io);
         self.peer = .{ .io = io, .listener = &self.listener, .scripts = scripts };
         self.thread = try std.Thread.spawn(.{}, FakePeer.run, .{&self.peer});

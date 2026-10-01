@@ -42,6 +42,7 @@
 //! copied.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const packet = @import("packet.zig");
 const topic_rules = @import("topic.zig");
 
@@ -1287,16 +1288,14 @@ test "a canceled readSome surfaces Canceled, not TransportFailed" {
     // Port 0: an ephemeral port cannot collide with a parallel test run.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
     defer server.deinit(io);
 
     var accept_fut = try io.concurrent(acceptOne, .{ &server, io });
     var t = TcpTransport.connect(io, server.socket.address) catch |err| {
         if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer t.close();
     var peer = try accept_fut.await(io);

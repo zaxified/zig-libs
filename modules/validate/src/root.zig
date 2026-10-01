@@ -67,6 +67,7 @@
 //! the error message quotes (decision 2026-09-30).
 
 const std = @import("std");
+const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 const netaddr = @import("netaddr");
@@ -5115,8 +5116,7 @@ test "integration: 400 on invalid body/query over a real socket; valid body reac
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

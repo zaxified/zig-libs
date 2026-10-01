@@ -68,6 +68,7 @@
 //! dispatch (null in the 404/405 fallbacks).
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("http");
 
 pub const meta = .{
@@ -2777,8 +2778,7 @@ test "integration: router behind http.Server, driven by http.Client" {
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

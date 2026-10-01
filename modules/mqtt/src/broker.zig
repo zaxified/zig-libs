@@ -83,6 +83,7 @@
 //! mosquitto/Paho referenced for behavior only, no source consulted or copied.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const packet = @import("packet.zig");
 const topic = @import("topic.zig");
 
@@ -3952,17 +3953,17 @@ test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
     var srv = TcpServer.init(io, &b);
-    srv.bind("127.0.0.1", 0) catch return error.SkipZigTest; // no loopback here
+    srv.bind("127.0.0.1", 0) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     defer srv.deinit();
     var serving = try io.concurrent(serveTask, .{&srv});
 
     // A sandbox can bind 127.0.0.1 without a working loopback (`unshare -n`):
     // stop the server before skipping — `srv.deinit` under a running `serve`
     // is a use after free.
-    const stream = srv.boundAddress().connect(io, .{ .mode = .stream }) catch {
+    const stream = srv.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
         srv.shutdown();
         serving.await(io);
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     var buf: [64]u8 = undefined;
     var wbuf: [64]u8 = undefined;
@@ -5982,11 +5983,11 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
     var server = TcpServer.init(io, &broker);
     defer server.deinit();
     // A bind/listen failure = no loopback in this sandbox → skip, don't fail.
-    server.bind("127.0.0.1", 0) catch return error.SkipZigTest;
+    server.bind("127.0.0.1", 0) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     const addr = server.boundAddress();
     // Bound is not reachable: a network namespace without loopback binds and
     // then refuses every connect. Probe before the storm, skip if so.
-    if (addr.connect(io, .{ .mode = .stream })) |probe_stream| probe_stream.close(io) else |_| return error.SkipZigTest;
+    if (addr.connect(io, .{ .mode = .stream })) |probe_stream| probe_stream.close(io) else |err| return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
 
     const server_thread = std.Thread.spawn(.{}, stressServeThread, .{&server}) catch
         return error.SkipZigTest;

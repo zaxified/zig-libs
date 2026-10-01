@@ -11,6 +11,7 @@
 //! module knowing.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const tpkt = @import("tpkt.zig");
 
 pub const TransportError = error{
@@ -345,8 +346,7 @@ const SilentPeer = struct {
         var accept_fut = try io.concurrent(acceptOne, .{ server, io });
         const tt = TcpTransport.connect(io, server.socket.address) catch |err| {
             if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-            std.debug.print("loopback connect failed ({t}), skipping\n", .{err});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         return .{ .tt = tt, .peer = try accept_fut.await(io) };
     }
@@ -361,8 +361,7 @@ fn silentListener(io: std.Io) !std.Io.net.Server {
     // Port 0: an ephemeral port cannot collide with a parallel test run.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     return addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({t}), skipping\n", .{err});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
 }
 

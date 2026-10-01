@@ -81,6 +81,7 @@
 //!   bounded regardless.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("http");
 const netaddr = @import("netaddr");
 const router = @import("router");
@@ -1632,8 +1633,7 @@ test "integration: per-IP cap, ban, greylist expiry and record-driven auto-ban a
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -1642,8 +1642,7 @@ test "integration: per-IP cap, ban, greylist expiry and record-driven auto-ban a
 
     // Connection 1 — keep-alive, held open for the whole test.
     const c1 = addr.connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     var c1_open = true;
     defer if (c1_open) c1.close(io);
@@ -1747,8 +1746,7 @@ test "integration: middleware auto-strike on real 404s escalates to accept-time 
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
@@ -1758,8 +1756,7 @@ test "integration: middleware auto-strike on real 404s escalates to accept-time 
     // Probe reachability once (skip like the sibling tests if loopback is off).
     {
         const probe = addr.connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         probe.close(io);
     }

@@ -442,5 +442,15 @@ of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
 
-Nothing open: every in-scope `std.Io` entry is implemented (2026-10-01).
+Every in-scope `std.Io` entry is implemented (2026-10-01). Open, in OTHER modules:
+
+- **Six modules out of simio's reach** (user, 2026-10-01: shift loopback tests toward
+  simulation, so a consumer never needs a namespace or the host's network rules):
+  `fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm` and `opcua` poll or sleep with
+  raw syscalls (`poll`, `clock_gettime`, `nanosleep`) instead of `std.Io`, so their
+  timing cannot be simulated (§ Pilots, "timeouts"). Each needs its socket waits and
+  clocks moved behind the `Io` it is given — the same change `sntp`, `mqtt` and the
+  `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
+  loopback tests stay as the real-kernel half; this repo's lanes run them under
+  `scripts/lib/netns-run`.
 

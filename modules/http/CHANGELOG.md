@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **The two `live:` tests left `test-http` for `tools/live.zig` (`zig build
+  live-http`).** A GET of https://example.com and a plaintext request that may redirect. Without a
+  route to the internet both timed out and SKIPPED, so `test-http` was green while doing less —
+  measured in a private network namespace, where they were the only difference in 631 tests.
+  `check-interop` compiles the program; no lane runs it (`CONVENTIONS.md` §9, as `dns` did on
+  2026-09-09).
 - **2026-10-01** — **Fix: `h2_upstream.Pool` waits on its session and dial locks through the
   `Io`.** They are held across socket I/O (`awaitResponse`, a send, a dial) and were
   thread-yielding spinlocks: under an `Io` that runs several tasks on one thread a waiter never

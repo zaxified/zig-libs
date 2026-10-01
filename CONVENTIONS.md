@@ -532,6 +532,12 @@ the distinctions that make the skips correct.
   for h2 / RFC known-answer test vectors where the spec publishes them.
 - **Syscall/netlink/raw** (`netlink`, `rawsock`, `wireguard`): a network namespace
   (`unshare -rn`).
+- **Loopback sockets** (`http`, `mqtt`, `iec104`, … — `.loopback` in `build.zig`): this
+  repo's lanes run them under `scripts/lib/netns-run`, a private namespace as the calling
+  user, so the host's conntrack, firewall and ports are not part of the test (2026-10-01).
+  A test that cannot get a loopback socket gives up with `testkit.loopbackSkip`, which
+  fails there instead of skipping. Nothing in a module may NEED the namespace:
+  `zig build test-<name>` stays runnable on plain loopback by anyone, without privileges.
 - **Pure logic** (`decimal`, `datefmt`, `ramcache`, `finstats`): unit tests +
   property/round-trip.
 - **Clients** (`dns`, `whois`, `rdap`, `http` client): a live round-trip against a real

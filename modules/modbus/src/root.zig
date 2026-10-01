@@ -40,6 +40,7 @@
 //! application-protocol spec.
 
 const std = @import("std");
+const testkit = @import("testkit");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -930,16 +931,14 @@ test "a canceled exchange read surfaces Canceled, not TransportFailed" {
     // Port 0: an ephemeral port cannot collide with a parallel test run.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
     defer srv.deinit(io);
 
     var accept_fut = try io.concurrent(acceptOne, .{ &srv, io });
     var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
         if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer t.close();
     var peer = try accept_fut.await(io);
@@ -992,8 +991,7 @@ test "TcpTransport: timeout_ms bounds a silent peer (audit E1)" {
     // Port 0: an ephemeral port cannot collide with a parallel test run.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
     defer srv.deinit(io);
 
@@ -1002,8 +1000,7 @@ test "TcpTransport: timeout_ms bounds a silent peer (audit E1)" {
     defer peer_thread.join();
 
     var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer t.close();
     t.timeout_ms = 80;
@@ -1028,16 +1025,14 @@ test "TcpTransport: timeout_ms = null (default) preserves today's unbounded beha
 
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
     defer srv.deinit(io);
 
     var accept_fut = try io.concurrent(acceptOne, .{ &srv, io });
     var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
         if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer t.close();
     try testing.expectEqual(@as(?u32, null), t.timeout_ms); // left at default

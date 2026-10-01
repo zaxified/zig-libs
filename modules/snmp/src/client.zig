@@ -6,6 +6,7 @@
 //! real adapter over `std.Io.net` (SNMP is UDP/161); tests never send.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const ber = @import("ber.zig");
 const oid_mod = @import("oid.zig");
 const message = @import("message.zig");
@@ -554,8 +555,7 @@ test "UdpTransport: a canceled receive surfaces error.Canceled, not error.Transp
 
     const peer_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var peer_socket = peer_addr.bind(io, .{ .mode = .dgram }) catch |err| {
-        std.debug.print("snmp cancel test bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("snmp cancel test bind failed ({t})", .{err});
     };
     defer peer_socket.close(io);
     const peer_port = peer_socket.address.getPort();

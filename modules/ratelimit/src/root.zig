@@ -55,6 +55,7 @@
 //! is handed a scratch buffer for exactly this — see `KeyFn`.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
@@ -1182,8 +1183,7 @@ test "integration: limited route over loopback — 200s, 429 + Retry-After, key 
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

@@ -54,6 +54,7 @@
 //!   registration wins per method — duplicate JSON keys are never emitted.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 
@@ -2132,8 +2133,7 @@ test "integration: GET /openapi.json over a real socket returns the documented r
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

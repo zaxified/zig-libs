@@ -220,8 +220,7 @@ fn startServer(io: std.Io, gpa: std.mem.Allocator, l: *LiveServer, enable_h2c: b
     });
     l.server.bind() catch |err| {
         l.server.deinit();
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     var w: Writer = .fixed(&l.url_buf);
     try w.print("http://127.0.0.1:{d}", .{l.server.boundAddress().getPort()});

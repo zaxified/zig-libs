@@ -184,6 +184,7 @@
 //! copied.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
@@ -3755,8 +3756,7 @@ test "h2c integration: Server forwards max_decompressed_request_bytes to h2c" {
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -4845,8 +4845,7 @@ fn serveWrap(s: *Server) void {
 
 fn bindOrSkip(server: *Server) !void {
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
 }
 
@@ -5001,16 +5000,14 @@ test "detach integration: a peer reset is reported through takeClosed" {
 
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
     var listener = addr.listen(io, .{ .mode = .stream, .reuse_address = true }) catch |err| {
-        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const thread = try std.Thread.spawn(.{}, T.serveConn, .{ &listener, io });
     defer thread.join();
 
     const stream = listener.socket.address.connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -5059,8 +5056,7 @@ test "h2c integration: the same handler serves HTTP/1.1 and HTTP/2 over loopback
     var h1_body: []const u8 = undefined;
     { // HTTP/1.1 — detection must fall through untouched.
         const stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         defer stream.close(io);
         var rbuf: [4096]u8 = undefined;
@@ -5084,8 +5080,7 @@ test "h2c integration: the same handler serves HTTP/1.1 and HTTP/2 over loopback
 
     { // HTTP/2 via prior knowledge on a fresh connection — same handler.
         const stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         defer stream.close(io);
         var rbuf: [8192]u8 = undefined;
@@ -5138,8 +5133,7 @@ test "h2c integration: response body honors the client's flow-control window" {
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -5205,8 +5199,7 @@ test "h2c integration: a stingy window splits a directly written body, and every
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [16384]u8 = undefined;
@@ -5263,8 +5256,7 @@ test "h2c integration: large POST body streams past the 64 KiB initial window" {
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [16384]u8 = undefined;
@@ -5327,8 +5319,7 @@ test "h2c integration: request and response stream on ONE stream at the same tim
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -5398,8 +5389,7 @@ test "h2c integration: a streaming upload past the initial window, read as it la
     defer server.shutdown();
 
     const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [16384]u8 = undefined;
@@ -5461,8 +5451,7 @@ test "h2c integration: detection — near-miss preface and disabled h2c take the
         defer thread.join();
         defer server.shutdown();
         const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         defer stream.close(io);
         var rbuf: [1024]u8 = undefined;
@@ -5486,8 +5475,7 @@ test "h2c integration: detection — near-miss preface and disabled h2c take the
         defer thread.join();
         defer server.shutdown();
         const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
         };
         defer stream.close(io);
         var rbuf: [1024]u8 = undefined;

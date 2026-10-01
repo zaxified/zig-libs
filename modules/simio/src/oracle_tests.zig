@@ -9,6 +9,7 @@
 //! one real code runs on.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const sched = @import("sched.zig");
 
 const Io = std.Io;
@@ -411,7 +412,7 @@ fn onThreaded(report: *Report) !void {
     defer tmp.cleanup();
     program(testing.io, tmp.dir, report) catch |err| switch (err) {
         // A sandbox without a loopback interface.
-        error.NetworkDown, error.AddressUnavailable => return error.SkipZigTest,
+        error.NetworkDown, error.AddressUnavailable => return testkit.loopbackSkip("loopback unavailable ({t})", .{err}),
         else => return err,
     };
 }

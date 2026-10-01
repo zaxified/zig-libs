@@ -54,6 +54,7 @@
 //! `http`, and `x509` modules. See SPEC.md / README.md.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const ocsp = @import("ocsp");
 const http = @import("http");
 const x509 = @import("x509");
@@ -1143,11 +1144,11 @@ test "httpFetch does NOT follow a responder's redirect (the responder does not c
     const io = threaded.io();
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var internal = addr.listen(io, .{}) catch return error.SkipZigTest;
+    var internal = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     defer internal.deinit(io);
     const internal_port = internal.socket.address.getPort();
 
-    var responder = addr.listen(io, .{}) catch return error.SkipZigTest;
+    var responder = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     defer responder.deinit(io);
     const responder_port = responder.socket.address.getPort();
 
@@ -1206,8 +1207,7 @@ test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("ocspcache cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("ocspcache cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1241,8 +1241,7 @@ test "httpFetch: a canceled body wait surfaces error.Canceled, not error.Transpo
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("ocspcache cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("ocspcache cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1281,8 +1280,7 @@ test "httpFetch: body_timeout_ms self-terminates against a responder that sends 
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("ocspcache timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("ocspcache timeout test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1320,8 +1318,7 @@ test "httpFetch: body_timeout_ms does not fire on a responder that answers promp
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("ocspcache timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("ocspcache timeout test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();

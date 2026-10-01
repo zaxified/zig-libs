@@ -375,8 +375,20 @@ else
     # flat 3.2 MB RSS for 53 minutes -- an infinite loop, which no memory cap
     # and no byte budget can see, because it neither allocates nor prints.
     # A lane that hits this is a finding, and the exit code says so (124).
+    #
+    # A `.loopback` module (build.zig `module_list`) runs the way its lane does:
+    # in a private network namespace, `scripts/lib/netns-run`, so a fix is not
+    # proved against the host's conntrack and firewall and then run elsewhere.
+    netns_run=()
+    if grep -Eq "\.name = \"$module\".*\.loopback = true" "$REPO_ROOT/build.zig"; then
+        if "$SCRIPT_DIR/lib/netns-run" --probe >/dev/null 2>&1; then
+            netns_run=("$SCRIPT_DIR/lib/netns-run")
+        else
+            echo "note: scripts/lib/netns-run unavailable -- $module runs on the host's loopback" >&2
+        fi
+    fi
     timeout "$timeout_spec" \
-        zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
+        ${netns_run[@]+"${netns_run[@]}"} zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 fi
 # pipefail makes this the BUILD's status, not `head`'s -- a truncated log must

@@ -40,11 +40,43 @@ _ZL_LIVE_CACHE="$(awk -F'\t' '$4=="live"{printf "%s ", $1}' <<< "$_zl_graph_out"
 # rewritten to count instead -- so it is not refused.
 TIMING_MODULES="$(awk -F'\t' '$8=="timing"{printf "%s ", $1}' <<< "$_zl_graph_out")"
 TIMING_MODULES="${TIMING_MODULES% }"
+# Column 9: modules whose tests talk over loopback and run under
+# `scripts/lib/netns-run` (`.loopback` in build.zig). An empty set is legitimate
+# too: the wrapper is isolation for this repo's lanes, not something a test needs.
+LOOPBACK_MODULES="$(awk -F'\t' '$9=="loopback"{printf "%s ", $1}' <<< "$_zl_graph_out")"
+LOOPBACK_MODULES="${LOOPBACK_MODULES% }"
 unset _zl_graph_out
 if [[ -z "$NETNS_MODULES" ]]; then
     echo "test-lib.sh: module-graph reported no netns modules -- refusing to run them unwrapped on a guess" >&2
     exit 1
 fi
+
+# ── loopback modules in a private network namespace ─────────────────────────
+#
+# `NETNS_RUN CMD...` wraps CMD for the `.loopback` modules. `netns_run_prefix`
+# fills the array NETNS_RUN: the wrapper when this host can run it; empty
+# (run on the host, as before 2026-10-01) with a note when it cannot; and on CI,
+# where `ci-environment.sh` enables user namespaces, it returns 1 -- a lane that
+# silently loses the isolation it was configured for is a lane nobody can read.
+NETNS_RUN_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netns-run"
+_ZL_NETNS_RUN_OK=""
+netns_run_prefix() {
+    if [[ -z "$_ZL_NETNS_RUN_OK" ]]; then
+        if "$NETNS_RUN_BIN" --probe >/dev/null 2>&1; then _ZL_NETNS_RUN_OK=yes; else _ZL_NETNS_RUN_OK=no; fi
+    fi
+    if [[ "$_ZL_NETNS_RUN_OK" == yes ]]; then
+        NETNS_RUN=("$NETNS_RUN_BIN")
+        return 0
+    fi
+    NETNS_RUN=()
+    if [[ "${GITHUB_ACTIONS:-}" == true || "${CI:-}" == true ]]; then
+        echo "error: scripts/lib/netns-run cannot run here, and on CI it must: the loopback modules would test against the runner's own conntrack and firewall." >&2
+        "$NETNS_RUN_BIN" --probe >&2 || true
+        return 1
+    fi
+    echo "note: scripts/lib/netns-run unavailable (no unprivileged user namespaces) -- loopback modules run on the host's loopback, as before 2026-10-01" >&2
+    return 0
+}
 
 # ⭐ MODULES WHOSE TESTS HOLD A CONVERSATION WITH A REAL THIRD-PARTY PEER, and
 # which therefore run SERIALLY, in their own step, after everything else.

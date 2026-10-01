@@ -1593,8 +1593,7 @@ test "TcpTransport: a canceled read surfaces error.Canceled, not error.Transport
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("whois cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("whois cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1634,8 +1633,7 @@ test "TcpTransport: default deny_special_use refuses a loopback address end-to-e
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("whois SpecialUseAddress test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("whois SpecialUseAddress test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1684,8 +1682,7 @@ test "TcpTransport: timeout_ms bounds a slow-but-live peer (audit F4)" {
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("whois timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("whois timeout test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -1717,8 +1714,7 @@ test "TcpTransport: timeout_ms = null (default) preserves today's unbounded beha
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("whois no-timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("whois no-timeout test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();

@@ -63,6 +63,7 @@
 //! middleware's `state` points at it).
 
 const std = @import("std");
+const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 
@@ -1513,8 +1514,7 @@ test "integration: preflight 204 (handler not invoked), allowed GET gets Allow-O
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Run a command in a private network namespace, as the calling user.
+#
+#     scripts/lib/netns-run CMD [ARGS...]
+#     scripts/lib/netns-run --probe        # exit 0 if this host can do it
+#
+# For the `.loopback` modules (build.zig `module_list`): their tests talk to
+# 127.0.0.1 / ::1, and on the host that loopback is subject to the host's own
+# rules -- nf_conntrack tracks it (a full table drops SYNs machine-wide), ufw
+# and Docker rules apply, ports collide with services and with other runs. A
+# fresh namespace has its own `lo`, its own conntrack table with no rules that
+# would ever fill it, and nothing else. Measured 2026-10-01: 2,000 loopback
+# connections leave `nf_conntrack_count` at 0 inside it.
+#
+# Two user namespaces, on purpose:
+#   1. The outer one (`unshare -rn`) is uid 0 over the new netns only. It brings
+#      `lo` up -- a fresh netns starts with it DOWN -- checks that it is, and
+#      allows unprivileged ICMP sockets for the caller's gid (a fresh netns
+#      starts with `ping_group_range` = `65534 65534`, i.e. nobody).
+#   2. The inner one maps the caller's uid/gid back, so CMD has exactly the
+#      privileges it has on the host: no CAP_NET_RAW, no port below 1024,
+#      geteuid() != 0, files owned by the caller. A plain `unshare -rn` would
+#      run the tests as root with every capability and send them down
+#      privileged paths they never take elsewhere.
+#
+# CMD sees ZIGLIBS_NETNS=1 (`testkit.netns_env`): loopback is guaranteed, so a
+# test that cannot bind it FAILS (`testkit.loopbackSkip`) instead of skipping.
+#
+# What a namespace changes besides that, measured against the host the same day
+# by running every `.loopback` test binary both ways (all identical): no route
+# off the machine (a connect to a TEST-NET address is an immediate
+# ENETUNREACH, not a timeout; no test depends on either), no DNS beyond
+# /etc/hosts, no supplementary groups, no rootless podman.
+#
+# Needs unprivileged user namespaces (Ubuntu restricts them through AppArmor;
+# `scripts/lib/ci-environment.sh` lifts that on CI). Exit 96 = not available here.
+set -euo pipefail
+
+if ! command -v unshare >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
+    echo "netns-run: needs unshare (util-linux) and ip (iproute2)" >&2
+    exit 96
+fi
+
+uid=$(id -u)
+gid=$(id -g)
+
+if [[ "${1:-}" == "--probe" ]]; then
+    set -- true
+fi
+if [[ $# -eq 0 ]]; then
+    echo "usage: netns-run CMD [ARGS...] | netns-run --probe" >&2
+    exit 2
+fi
+
+if ! unshare --user --map-root-user --net -- \
+    unshare --user --map-user="$uid" --map-group="$gid" -- true >/dev/null 2>&1; then
+    echo "netns-run: unprivileged user + network namespaces are not available here" >&2
+    exit 96
+fi
+
+exec unshare --user --map-root-user --net -- /bin/sh -c '
+    set -e
+    ip link set lo up
+    ip -o link show lo | grep -q "LOWER_UP" || { echo "netns-run: lo did not come up" >&2; exit 97; }
+    echo "0 0" > /proc/sys/net/ipv4/ping_group_range
+    uid=$1; gid=$2; shift 2
+    exec unshare --user --map-user="$uid" --map-group="$gid" -- env ZIGLIBS_NETNS=1 "$@"
+' netns-run "$uid" "$gid" "$@"

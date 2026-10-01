@@ -409,25 +409,28 @@ stamps_narrow() {
 #
 # The driver is in no fingerprint, so a driver edit makes no module unproven;
 # what has to be shown instead is that the driver still works. So: every check,
-# and one plain plus one netns module end to end -- the two classes
-# `run_modules` distinguishes -- picked from this lane's modules. `changed`
+# and one plain, one netns and one loopback module end to end -- the classes
+# `run_modules` wraps differently -- picked from this lane's modules. `changed`
 # then runs the unproven modules as it always does.
 harness_smoke() {
-    local plain="" netns="" n
+    local plain="" netns="" loop="" n
     for n in $(lane_modules); do
         case " $NETNS_MODULES " in
-            *" $n "*) [[ -z "$netns" ]] && netns="$n" ;;
+            *" $n "*) [[ -z "$netns" ]] && netns="$n"; continue ;;
+        esac
+        case " $LOOPBACK_MODULES " in
+            *" $n "*) [[ -z "$loop" ]] && loop="$n" ;;
             *) [[ -z "$plain" ]] && plain="$n" ;;
         esac
-        [[ -n "$plain" && -n "$netns" ]] && break
+        [[ -n "$plain" && -n "$netns" && -n "$loop" ]] && break
     done
 
     echo "changed: the harness or a CI lane definition changed -- running every check and"
-    local smoke="$plain${netns:+, $netns}"
+    local smoke="$plain${netns:+, $netns}${loop:+, $loop}"
     echo "  a smoke set ($smoke) that exercises the driver end to end; the modules"
     echo "  with no green stamp follow."
     phase_all_checks
-    run_modules "$plain $netns"
+    run_modules "$plain $netns $loop"
 }
 
 _HAVE_UNSHARE=""
@@ -448,11 +451,11 @@ have_unshare() {
 # containing spaces stays one argument.
 EXTRA_ZIG_ARGS=()
 
-# run_modules "mod1 mod2 ..." — partitions the set into NETNS_MODULES vs the
-# rest and invokes each partition as ONE `zig build test-a test-b ...`
-# command (not a loop of 1-module invocations!) so zig's own step
-# parallelism is preserved; only the netns partition is wrapped in
-# `unshare -rn`, and only when it's actually available.
+# run_modules "mod1 mod2 ..." — partitions the set into NETNS_MODULES,
+# LOOPBACK_MODULES and the rest and invokes each partition as ONE `zig build
+# test-a test-b ...` command (not a loop of 1-module invocations!) so zig's own
+# step parallelism is preserved; the netns partition is wrapped in `unshare -rn`
+# when it's available, the loopback partition in `scripts/lib/netns-run`.
 #
 # `--summary all` is passed unconditionally and the output is kept, because the
 # dark-test check below reads it. See `dark_check`.
@@ -511,7 +514,7 @@ run_modules() {
     [[ -z "${mods// /}" ]] && return 0
     CAP_MODS="$mods" capability_check
 
-    local -a rest=() netns=() live=() timing=()
+    local -a rest=() netns=() live=() timing=() loopback=()
     local m
     for m in $mods; do
         # Timing first: `tc` is both, and serial wins -- it is wrapped in its
@@ -523,7 +526,10 @@ run_modules() {
             *" $m "*) netns+=("$m"); continue ;;
         esac
         case " $(live_modules) " in
-            *" $m "*) live+=("$m") ;;
+            *" $m "*) live+=("$m"); continue ;;
+        esac
+        case " $LOOPBACK_MODULES " in
+            *" $m "*) loopback+=("$m") ;;
             *) rest+=("$m") ;;
         esac
     done
@@ -534,6 +540,19 @@ run_modules() {
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
         step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+    fi
+
+    # Loopback modules in their own namespace, as the calling user, with
+    # ZIGLIBS_NETNS=1 so a loopback that does not work fails instead of
+    # skipping (`.loopback` in build.zig, scripts/lib/netns-run).
+    if [[ ${#loopback[@]} -gt 0 ]]; then
+        local -a targets=()
+        for m in "${loopback[@]}"; do targets+=("test-$m"); done
+        if netns_run_prefix; then
+            step "loopback build+test (${#loopback[@]} modules${NETNS_RUN[*]:+, netns-run})" "${NETNS_RUN[@]}" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+        else
+            step "loopback build+test (${#loopback[@]} modules): netns-run unavailable on CI" "$NETNS_RUN_BIN" --probe
+        fi
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
@@ -605,7 +624,18 @@ run_modules() {
                     fi
                     ;;
                 *)
-                    step "timing (serial): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                    case " $LOOPBACK_MODULES " in
+                        *" $m "*)
+                            if netns_run_prefix; then
+                                step "timing (serial${NETNS_RUN[*]:+, netns-run}): $m" "${NETNS_RUN[@]}" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                            else
+                                step "timing (serial): $m: netns-run unavailable on CI" "$NETNS_RUN_BIN" --probe
+                            fi
+                            ;;
+                        *)
+                            step "timing (serial): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                            ;;
+                    esac
                     ;;
             esac
         done
@@ -2132,7 +2162,18 @@ cmd_time() {
                 fi
                 ;;
             *)
-                zig build "test-$name" >"$out" 2>&1 || rc=$?
+                case " $LOOPBACK_MODULES " in
+                    *" $name "*)
+                        if netns_run_prefix 2>/dev/null; then
+                            "${NETNS_RUN[@]}" zig build "test-$name" >"$out" 2>&1 || rc=$?
+                        else
+                            "$NETNS_RUN_BIN" --probe >"$out" 2>&1 || rc=$?
+                        fi
+                        ;;
+                    *)
+                        zig build "test-$name" >"$out" 2>&1 || rc=$?
+                        ;;
+                esac
                 ;;
         esac
         t1=$(_now)

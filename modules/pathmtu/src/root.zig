@@ -100,6 +100,7 @@
 //! Linux `tracepath(8)` — behavior only, no source consulted.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const linux = std.os.linux;
 const icmp = @import("icmp");
 const echo = icmp.echo;
@@ -1477,7 +1478,7 @@ test "live: query() against loopback, unprivileged (no CAP_NET_RAW needed)" {
     // free. Measured at the first audit (2026-09-04), mutation S01. The same
     // shape SPEC records having fixed elsewhere, and `diskusage` carried in
     // its `detect()` skip.
-    if (!udpSocketsWork()) return error.SkipZigTest;
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
 
     const dest = netaddr.parseIp("127.0.0.1").?;
     const r = try query(dest, .{});
@@ -1486,7 +1487,7 @@ test "live: query() against loopback, unprivileged (no CAP_NET_RAW needed)" {
 }
 
 test "live: LiveProber.attempt returns send_failed, not no_reply, when every send fails (A1 F4)" {
-    if (!udpSocketsWork()) return error.SkipZigTest;
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
 
     var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch |err| switch (err) {
         error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
@@ -1518,7 +1519,7 @@ test "live: LiveProber.attempt returns send_failed, not no_reply, when every sen
 }
 
 test "live: query() with Options.iface sets cache_is_exception (A1 F6)" {
-    if (!udpSocketsWork()) return error.SkipZigTest;
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
 
     // Loopback carries no PMTU exception -- nothing on `lo` ever fragments --
     // so `IP_MTU` reads back exactly the interface's own MTU, and F6's field
@@ -1534,7 +1535,7 @@ test "live: query() with Options.iface sets cache_is_exception (A1 F6)" {
 }
 
 test "query: cache_is_exception stays null without Options.iface (nothing to compare against)" {
-    if (!udpSocketsWork()) return error.SkipZigTest;
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
     const dest = netaddr.parseIp("127.0.0.1").?;
     const r = try query(dest, .{});
     try testing.expectEqual(@as(?bool, null), r.cache_is_exception);

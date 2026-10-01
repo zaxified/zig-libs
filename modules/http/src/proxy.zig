@@ -99,6 +99,7 @@
 //! server already requires that for its per-connection slabs).
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
@@ -735,8 +736,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     var origin = Server.init(io, testing.allocator, .{ .handler = originHandler });
     defer origin.deinit();
     origin.bind() catch |err| {
-        std.debug.print("origin bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("origin bind failed ({t})", .{err});
     };
     const origin_thread = try std.Thread.spawn(.{}, serveWrap, .{&origin});
     defer origin_thread.join();
@@ -758,8 +758,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     });
     defer proxy.deinit();
     proxy.bind() catch |err| {
-        std.debug.print("proxy bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("proxy bind failed ({t})", .{err});
     };
     const proxy_thread = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer proxy_thread.join();
@@ -828,7 +827,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
             .context = &dead_ph,
         });
         defer dead_proxy.deinit();
-        dead_proxy.bind() catch return error.SkipZigTest;
+        dead_proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
         const dt = try std.Thread.spawn(.{}, serveWrap, .{&dead_proxy});
         defer dt.join();
         defer dead_proxy.shutdown();
@@ -945,8 +944,7 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("fat-header origin listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("fat-header origin listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const origin_port = listener.socket.address.getPort();
@@ -977,7 +975,7 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
     });
     var proxy = Server.init(io, testing.allocator, .{ .handler = ProxyHandler.handler, .context = &ph });
     defer proxy.deinit();
-    proxy.bind() catch return error.SkipZigTest;
+    proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     const proxy_thread = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer proxy_thread.join();
     defer proxy.shutdown();
@@ -1050,8 +1048,7 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
     var backend = Server.init(io, gpa, .{ .handler = originHandler, .enable_h2c = true });
     defer backend.deinit();
     backend.bind() catch |err| {
-        std.debug.print("h2 backend bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("h2 backend bind failed ({t})", .{err});
     };
     const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
     defer bt.join();
@@ -1071,8 +1068,7 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
     var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
     defer proxy.deinit();
     proxy.bind() catch |err| {
-        std.debug.print("proxy bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("proxy bind failed ({t})", .{err});
     };
     const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer pt.join();
@@ -1170,8 +1166,7 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     var backend = Server.init(io, gpa, .{ .handler = fatH2OriginHandler, .enable_h2c = true });
     defer backend.deinit();
     backend.bind() catch |err| {
-        std.debug.print("h2 fat backend bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("h2 fat backend bind failed ({t})", .{err});
     };
     const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
     defer bt.join();
@@ -1189,7 +1184,7 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     });
     var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
     defer proxy.deinit();
-    proxy.bind() catch return error.SkipZigTest;
+    proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer pt.join();
     defer proxy.shutdown();
@@ -1336,8 +1331,7 @@ test "integration: an h2c :path/:authority carrying CR/LF or SP never becomes a 
 
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("raw backend listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("raw backend listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     // Exactly ONE backend connection is expected: the control request. If a
@@ -1361,18 +1355,16 @@ test "integration: an h2c :path/:authority carrying CR/LF or SP never becomes a 
     });
     defer proxy.deinit();
     proxy.bind() catch |err| {
-        std.debug.print("proxy bind failed ({s}), skipping\n", .{@errorName(err)});
         bt.join();
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("proxy bind failed ({t})", .{err});
     };
     const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer pt.join();
     defer proxy.shutdown();
 
     const stream = proxy.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
-        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
         bt.join();
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
     };
     defer stream.close(io);
     var rbuf: [8192]u8 = undefined;
@@ -1449,7 +1441,7 @@ test "integration: h2c backend unreachable → 502 Bad Gateway" {
     });
     var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
     defer proxy.deinit();
-    proxy.bind() catch return error.SkipZigTest;
+    proxy.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
     defer pt.join();
     defer proxy.shutdown();

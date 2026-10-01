@@ -72,6 +72,7 @@
 //! so a retire never strands a stream mid-collection.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("root.zig");
 const Client = @import("Client.zig");
 const h2_client = @import("h2_client.zig");
@@ -504,8 +505,7 @@ fn h2Backend(io: std.Io) !*Server {
     s.bind() catch |err| {
         s.deinit();
         testing.allocator.destroy(s);
-        std.debug.print("h2 backend bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("h2 backend bind failed ({t})", .{err});
     };
     return s;
 }
@@ -582,8 +582,7 @@ test "h2_upstream: multiplex two proxied streams over one upstream connection" {
         .authority = "backend",
         .body = "stream-A-body",
     }) catch |err| {
-        std.debug.print("begin A failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback h2c begin A failed ({t})", .{err});
     };
     const call_b = try pool.begin(be, .{
         .method = .post,
@@ -634,8 +633,7 @@ test "h2_upstream: many sequential roundtrips reuse the one connection" {
             .path = "/hello",
             .authority = "backend",
         }) catch |err| {
-            std.debug.print("roundtrip failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback h2c roundtrip failed ({t})", .{err});
         };
         defer res.deinit(gpa);
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -676,8 +674,7 @@ test "h2_upstream: large body proxied through (flow control / WINDOW_UPDATE)" {
         .authority = "backend",
         .body = payload,
     }) catch |err| {
-        std.debug.print("large-body roundtrip failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback h2c large-body roundtrip failed ({t})", .{err});
     };
     defer res.deinit(gpa);
     try testing.expectEqual(@as(u16, 200), res.status);
@@ -713,8 +710,7 @@ test "h2_upstream: buffer pool backs dialed sessions and is reused across dials"
         var pool = Pool.init(gpa, .{ .client = &client });
         defer pool.deinit();
         var res = pool.roundtrip(be, .{ .method = .get, .path = "/hello", .authority = "b" }) catch |err| {
-            std.debug.print("dial failed ({s}), skipping\n", .{@errorName(err)});
-            return error.SkipZigTest;
+            return testkit.loopbackSkip("loopback h2c dial failed ({t})", .{err});
         };
         res.deinit(gpa);
     }

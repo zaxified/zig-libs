@@ -29,6 +29,7 @@
 //! thread at a time — they share the account state machine.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("http");
 const router = @import("router");
 const jws = @import("jws.zig");
@@ -2054,8 +2055,7 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     });
     defer ca_server.deinit();
     ca_server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
 
     // ── the real ACME client under test ──
@@ -2086,8 +2086,7 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     });
     defer challenge_server.deinit();
     challenge_server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
 
     try mock.setUrls(
@@ -2168,8 +2167,7 @@ test "integration: a wildcard certificate over DNS-01 against the mock CA" {
     });
     defer ca_server.deinit();
     ca_server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const ca_port = ca_server.boundAddress().getPort();
     // DNS-01 needs no challenge server; the URL is unused.

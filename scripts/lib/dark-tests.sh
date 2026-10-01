@@ -157,13 +157,16 @@ if [[ -z "$summary_file" ]]; then
     # third-party peer and can fail under contention, and a module whose tests
     # FAILED prints no count line either — which this check would then report as
     # a phantom dark test. Serial, same as the gate.
-    plain=(); netns=(); live=()
+    plain=(); netns=(); live=(); loopback=()
     for m in "${mods[@]}"; do
         case " $NETNS_MODULES " in
             *" $m "*) netns+=("test-$m"); continue ;;
         esac
         case " $(live_modules) " in
-            *" $m "*) live+=("test-$m") ;;
+            *" $m "*) live+=("test-$m"); continue ;;
+        esac
+        case " $LOOPBACK_MODULES " in
+            *" $m "*) loopback+=("test-$m") ;;
             *) plain+=("test-$m") ;;
         esac
     done
@@ -172,6 +175,10 @@ if [[ -z "$summary_file" ]]; then
     trap 'rm -f "$summary_file"' EXIT
     if [[ ${#plain[@]} -gt 0 ]]; then
         "$SCRIPT_DIR/capped" zig build "${plain[@]}" --summary all >>"$summary_file" 2>&1
+    fi
+    if [[ ${#loopback[@]} -gt 0 ]]; then
+        netns_run_prefix || exit 1
+        "$SCRIPT_DIR/capped" "${NETNS_RUN[@]}" zig build "${loopback[@]}" --summary all >>"$summary_file" 2>&1
     fi
     if [[ ${#netns[@]} -gt 0 ]]; then
         if command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; then

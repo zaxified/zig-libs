@@ -33,6 +33,7 @@
 //! or copied.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const http = @import("http");
 const netaddr = @import("netaddr");
 
@@ -2326,8 +2327,7 @@ test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not err
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("rdap fetch cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("rdap fetch cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
@@ -2397,7 +2397,7 @@ test "HttpFetcher: every redirect Location is gated, and the chain is bounded (r
     const io = threaded.io();
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = addr.listen(io, .{}) catch return error.SkipZigTest;
+    var server = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     var open = true;
     defer if (open) server.deinit(io);
     const port = server.socket.address.getPort();

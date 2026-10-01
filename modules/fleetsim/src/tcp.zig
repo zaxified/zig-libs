@@ -768,7 +768,8 @@ const modbus = @import("modbus");
 /// for the third-party live tests (`FLEETSIM_EXPECT_LIVE`), and it stops at
 /// that file. `FLEETSIM_EXPECT_TCP=1` is the sibling for this one: set it
 /// where loopback is expected to work, and a skip becomes a failure that
-/// names itself.
+/// names itself. `ZIGLIBS_NETNS` (see `testkit.loopbackGuaranteed`) does the
+/// same without the variable: inside `netns-run` loopback is guaranteed.
 fn expectTcp() bool {
     const v = testkit.getEnv("FLEETSIM_EXPECT_TCP") orelse return false;
     return v.len > 0 and !std.mem.eql(u8, v, "0");
@@ -776,7 +777,7 @@ fn expectTcp() bool {
 
 /// The gate every loopback-dependent test in this file gives up through.
 fn socketSkip(what: []const u8) anyerror {
-    if (expectTcp()) {
+    if (expectTcp() or testkit.loopbackGuaranteed()) {
         std.debug.print("FLEETSIM_EXPECT_TCP is set but {s}\n", .{what});
         return error.TcpTestDidNotRun;
     }

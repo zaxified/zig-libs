@@ -29,6 +29,7 @@
 //! server slips into the answer section is ignored, not returned.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 const http = @import("http");
@@ -1242,7 +1243,7 @@ test "query: Options left at default honors resolv.conf's tightened timeout/atte
     // trigger and short-circuit this test before the timeout logic ever
     // ran), no background thread needed, just a real bind.
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
-    const sock = addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    const sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     defer sock.close(io);
     const port = sock.address.ip4.port;
 
@@ -1430,7 +1431,7 @@ test "lookupIp: a server that never answers is a Timeout, not an empty list (sim
 
     // Bound but silent: every query times out.
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
-    const silent = addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    const silent = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     defer silent.close(io);
 
     var r = Resolver.init(io, testing.allocator, .{
@@ -1450,7 +1451,7 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     defer threaded.deinit();
     const io = threaded.io();
 
-    var stub = bindUdpStub(io, .off_bailiwick_plus_honest) catch return error.SkipZigTest;
+    var stub = bindUdpStub(io, .off_bailiwick_plus_honest) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     defer stub.sock.close(io);
     var stub_fut = try io.concurrent(UdpStub.run, .{&stub});
     defer stub_fut.await(io);
@@ -1505,7 +1506,7 @@ test "tcpExchange: a server that accepts and never answers is bounded by timeout
     const io = threaded.io();
 
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
-    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}) };
     defer silent.server.socket.close(io);
     var fut = try io.concurrent(SilentTcp.run, .{&silent});
     defer {
@@ -1538,11 +1539,11 @@ test "query: the TC-bit path into a silent TCP server is bounded too (default tr
 
     // TCP first on an ephemeral port, then UDP on the SAME port number.
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
-    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}) };
     defer silent.server.socket.close(io);
     const port = silent.server.socket.address.ip4.port;
     const udp_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
-    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     var stub: UdpStub = .{ .io = io, .sock = udp_sock, .script = .truncated };
     defer stub.sock.close(io);
 
@@ -1594,11 +1595,11 @@ test "query: a UDP reply the kernel truncated falls back to TCP even without TC 
     // dialing TCP -- this test's oracle is that it reaches the (silent) TCP
     // server at all, the same way the TC-bit sibling proves it.
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
-    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}) };
     defer silent.server.socket.close(io);
     const port = silent.server.socket.address.ip4.port;
     const udp_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
-    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     var stub: UdpStub = .{ .io = io, .sock = udp_sock, .script = .oversized_no_tc };
     defer stub.sock.close(io);
 

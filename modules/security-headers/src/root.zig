@@ -90,6 +90,7 @@
 //! then on with none of this module's headers on that 500 either.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 
@@ -896,8 +897,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
     });
     defer server.deinit();
     server.bind() catch |err| {
-        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     };
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();

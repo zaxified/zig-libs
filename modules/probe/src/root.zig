@@ -1235,7 +1235,7 @@ test "live: probe a self-bound TCP listener → up" {
     const io = threaded.io();
 
     var addr = net.IpAddress.parse("127.0.0.1", 0) catch return error.SkipZigTest;
-    var server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest;
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
     defer server.socket.close(io);
     const bound = server.socket.address;
     const port = bound.ip4.port;

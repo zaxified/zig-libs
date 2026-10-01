@@ -188,6 +188,7 @@
 //! - Malformed input returns typed errors; it never panics.
 
 const std = @import("std");
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const http = @import("http");
 const router = @import("router");
@@ -6718,8 +6719,7 @@ test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not err
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = addr.listen(io, .{}) catch |err| {
-        std.debug.print("jwt fetch cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
-        return error.SkipZigTest;
+        return testkit.loopbackSkip("jwt fetch cancel test listen failed ({t})", .{err});
     };
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
