@@ -1110,3 +1110,56 @@ test "a Hello naming another segment does not make its origin a member" {
     try feedFrames(&df, &.{&buf});
     try testing.expectEqual(@as(?Time, null), df.last_seen[3 * NODE_N + 6]);
 }
+
+// ── found by the 2026-10-01 mutation run: guards no test had pinned ─────────
+
+test "a timer armed before a crash does not double the Hello chain after the restart" {
+    // Member 3's Hello timer is due at t=150; it crashes at 120 and restarts
+    // at 130 (new chain: 180, 230, …). The old timer still comes due at 150,
+    // after the restart; without the start-epoch check it would run a second
+    // chain beside the new one.
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 120, .kind = .{ .crash_node = .{ .node = 3 } } },
+        .{ .time = 130, .kind = .{ .restart_node = .{ .node = 3 } } },
+    };
+    const case = netsim.Case{ .seed = 1, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+    _ = try netsim.replay(gpa, case, &trace, null);
+    // Two Hellos before the crash (50, 100), then one per period from 180.
+    const one_chain: u32 = 2 + (UNTIL - 180) / DEFAULT_CFG.hello_period + 1;
+    try testing.expectEqual(one_chain, df.hello_seq[3]);
+}
+
+test "a Hello's view bits past the member list are dropped" {
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+    var buf: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = 4, .seq = 1, .segment = SEG_A.id, .view = 0xFFFF_FFFF }).encode(&buf);
+    try feedFrames(&df, &.{&buf});
+    try testing.expectEqual(@as(u32, 0b111), df.last_view[3 * NODE_N + 4]);
+}
+
+test "a member's Hello that names another segment, or none, does not count as its peer's" {
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+    var other: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = 4, .seq = 1, .segment = SEG_B.id, .view = 0b111 }).encode(&other);
+    var none: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = 5, .seq = 1, .segment = types.no_segment, .view = 0b111 }).encode(&none);
+    try feedFrames(&df, &.{ &other, &none });
+    try testing.expectEqual(@as(?Time, null), df.last_seen[3 * NODE_N + 4]);
+    try testing.expectEqual(@as(?Time, null), df.last_seen[3 * NODE_N + 5]);
+    // Both still prove the fabric is audible.
+    try testing.expect(df.last_heard[3] != null);
+}
+
+test "the config check refuses df_wait == hello_period, the edge the wait must clear" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidConfig, DfElect.init(gpa, NODE_N, .{ .hello_period = 50, .df_wait = 50 }));
+    var ok = try DfElect.init(gpa, NODE_N, .{ .hello_period = 50, .df_wait = 51 });
+    ok.deinit(gpa);
+}

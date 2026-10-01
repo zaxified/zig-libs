@@ -20,6 +20,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `worstZeroDfWindow` gains a `links` parameter. Known limit, pinned by a
   test: a one-way failure deeper in the core can still black-hole a segment
   (SPEC Backlog: directed fabric graph). Sweep measurements moved off stderr.
+  Mutation run: 33 of 37 killed, 4 equivalent; four tests added for guards
+  nothing had pinned (timer start epoch, view mask, foreign-segment Hello,
+  the `df_wait == hello_period` edge).
 - **2026-09-30** — ⚠ **Breaking: N-member segments, RFC DF algorithms and
   failover.** `EdgeSegment` is now `{ id, esi, members: []Member{node, addr},
   tags }` (members sorted by address, `validate`); the DF is per
