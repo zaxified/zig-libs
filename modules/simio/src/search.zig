@@ -6,7 +6,8 @@
 //! it with an invariant checked after every step; `findFailing` sweeps seeds;
 //! `shrink` delta-debugs the schedule (netsim's ddmin) down to the faults that
 //! still reproduce the same error; `replay` re-runs a concrete schedule; and
-//! `checkDeterminism` runs a seed twice and compares the fingerprints.
+//! `checkDeterminism` runs a seed twice and compares the schedule fingerprint,
+//! the data fingerprint (every byte sent and written) and `Case.digest`.
 //!
 //! Schedule times are in ticks of `FaultConfig.tick_ns` (1 ms by default):
 //! netsim's generator draws delay spikes and clock jumps in small tick counts,
@@ -44,6 +45,11 @@ pub const Case = struct {
     duration_ns: u64 = 60 * std.time.ns_per_s,
     /// A root task that returns an error is a violation.
     task_errors_fail: bool = true,
+    /// Digest of the application's own state after a run (on the scheduler:
+    /// read state, do not call `std.Io`), folded into `checkDeterminism`.
+    /// Simio already compares every byte sent and written; this is for state
+    /// that never leaves a host.
+    digest: ?*const fn (sim: *Sim, ctx: ?*anyopaque) u64 = null,
 };
 
 pub const FaultConfig = struct {
@@ -113,6 +119,10 @@ pub const CaseResult = struct {
     outcome: sched.Outcome,
     violation: ?Violation,
     fingerprint: u64,
+    /// `Sim.dataFingerprint` at the end of the run.
+    data_fingerprint: u64,
+    /// `Case.digest` at the end of the run, 0 without one.
+    digest: u64 = 0,
     steps: u64,
     now_ns: u64,
 };
@@ -168,6 +178,8 @@ fn execute(gpa: Allocator, case: Case, mode: Mode) anyerror!CaseResult {
         .outcome = r.outcome,
         .violation = null,
         .fingerprint = sim.fingerprint(),
+        .data_fingerprint = sim.dataFingerprint(),
+        .digest = if (case.digest) |d| d(&sim, case.ctx) else 0,
         .steps = r.steps,
         .now_ns = r.now_ns,
     };
@@ -339,7 +351,14 @@ const ShrinkCtx = struct {
     }
 };
 
-pub const DeterminismError = error{Nondeterministic};
+pub const DeterminismError = error{
+    /// The runs scheduled or timed differently.
+    Nondeterministic,
+    /// Same schedule and timing, different bytes sent or written.
+    NondeterministicData,
+    /// Same bytes, different `Case.digest`.
+    NondeterministicState,
+};
 
 /// Runs `case` twice under the same drawn schedule and fails when the two
 /// runs diverge — the code under test reads something simio does not
@@ -350,4 +369,6 @@ pub fn checkDeterminism(gpa: Allocator, case: Case, cfg: FaultConfig) anyerror!v
     const second = try replay(gpa, case, first.trace.events, cfg.tick_ns);
     if (first.result.fingerprint != second.fingerprint or first.result.now_ns != second.now_ns or
         first.result.outcome != second.outcome) return error.Nondeterministic;
+    if (first.result.data_fingerprint != second.data_fingerprint) return error.NondeterministicData;
+    if (first.result.digest != second.digest) return error.NondeterministicState;
 }

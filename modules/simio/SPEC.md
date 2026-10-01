@@ -91,8 +91,12 @@ consumer's to remove.
   which ready fiber runs next, latency/jitter, loss, read fragmentation, fault
   timing — is drawn from one seeded PRNG in a fixed order. Virtual time advances only
   when no fiber is ready, by jumping to the next event. A run produces a trace
-  fingerprint; the self-check runs a seed twice and compares fingerprints, so
-  nondeterminism in the code under test is *reported*, not silently tolerated.
+  fingerprint (every scheduling decision and wake, with virtual time) and a data
+  fingerprint (every byte sent and written to a disk, per host, in order), plus an
+  optional `Case.digest` of state that never leaves a host; the self-check runs a
+  seed twice and compares all three, so nondeterminism in the code under test is
+  *reported* — and which kind (`Nondeterministic`, `NondeterministicData`,
+  `NondeterministicState`) — not silently tolerated.
 - **Fiber stacks** are `mmap`ed with a `PROT_NONE` guard page below them (virtual
   size configurable, committed lazily), so a stack overflow faults instead of
   corrupting a neighbour. Stacks are never allocated from the caller's allocator.
@@ -343,11 +347,6 @@ of touching one of the test process's own descriptors.
 - A task that spins without calling `std.Io` never returns to the scheduler, so the
   run hangs instead of ending as `.step_limit`. Catching it needs a watchdog outside
   the fiber (a timer signal on the test thread), not a scheduler change.
-
-- `checkDeterminism` compares a fingerprint of scheduling and virtual time, not of
-  the data: entropy drawn outside `std.Io` that changes bytes but not sizes passes
-  it (the ssh pilot compares exchange hashes itself). A `Case.digest` hook folding
-  application state into the comparison would make that check generic.
 
 - Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
 - A simulated resolver for `netLookup` (hosts by name).

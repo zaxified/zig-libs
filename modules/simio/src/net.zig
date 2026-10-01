@@ -1019,6 +1019,7 @@ pub const Net = struct {
                     const chunk = n.sim.gpa.alloc(u8, k) catch
                         return if (amount == left) error.SystemResources else amount - left;
                     cursor.copy(chunk);
+                    n.sim.mixData(h, chunk);
                     n.pushSeg(s.tx.?, .{ .at = 0, .kind = .data, .data = chunk }) catch {
                         n.sim.gpa.free(chunk);
                         return if (amount == left) error.SystemResources else amount - left;
@@ -1101,6 +1102,7 @@ pub const Net = struct {
         const dst = n.hostOf(h, dest) orelse return error.NetworkUnreachable;
         const data = gpa.dupe(u8, m.data_ptr[0..m.data_len]) catch return error.SystemResources;
         errdefer gpa.free(data);
+        n.sim.mixData(h, data);
         if (s.kind == .icmp) {
             const request: u8 = if (dest == .ip6) 128 else 8;
             if (data.len < 8 or data[0] != request) return error.Unexpected; // Linux: EINVAL

@@ -832,6 +832,7 @@ pub const Fs = struct {
                 o += k;
             }
         }
+        fs.host.sim.mixData(fs.host, bytes);
         const old_len = n.data.items.len;
         writeAt(g, &n.data, offset, bytes) catch {
             g.free(bytes);

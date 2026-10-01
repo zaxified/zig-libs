@@ -43,6 +43,8 @@ const State = struct {
     ecdsa: bool = false,
     /// The broken variant: the client gives up after its first attempt.
     single_attempt: bool = false,
+    /// The defect this pilot found: entropy from getrandom(2), not the `Io`.
+    os_entropy: bool = false,
     /// Exchange hash of the client's last completed handshake.
     session_id: [64]u8 = @splat(0),
     session_id_len: usize = 0,
@@ -113,7 +115,7 @@ fn serveConnInner(io: Io, gpa: std.mem.Allocator, stream: net.Stream, st: *State
         .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(@splat(0x33)) };
     const keys = [_]ssh.server.HostKey{host_key};
     var t = ssh.transport.Transport.init(&sr.interface, &sw.interface);
-    t.entropy = .{ .io = io };
+    t.entropy = if (st.os_entropy) .os else .{ .io = io };
     try ssh.server.serverHandshake(&t, gpa, .{ .host_keys = &keys });
 
     const blob = try userKey().publicBlob(gpa);
@@ -160,7 +162,7 @@ fn clientAttempt(io: Io, gpa: std.mem.Allocator, server: net.IpAddress, st: *Sta
     var sw = stream.writer(io, &wbuf);
 
     var t = ssh.transport.Transport.init(&sr.interface, &sw.interface);
-    t.entropy = .{ .io = io };
+    t.entropy = if (st.os_entropy) .os else .{ .io = io };
     try t.clientHandshake(gpa, accept_any);
     const sid = t.session_id.?.slice();
     @memcpy(st.session_id[0..sid.len], sid);
@@ -200,7 +202,7 @@ fn final(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
 
 fn reset(ctx: ?*anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ctx.?));
-    st.* = .{ .ecdsa = st.ecdsa, .single_attempt = st.single_attempt };
+    st.* = .{ .ecdsa = st.ecdsa, .single_attempt = st.single_attempt, .os_entropy = st.os_entropy };
 }
 
 fn case(st: *State) search.Case {
@@ -274,4 +276,15 @@ test "pilot ssh: the session survives loss, duplication, partitions and crashes 
         std.debug.print("seed {d}: {t} at {d} ms\n", .{ failing.case.seed, failing.violation.err, failing.violation.at_ns / ns_per_ms });
         return error.TestUnexpectedResult;
     }
+}
+
+test "pilot ssh: the generic determinism check catches entropy drawn outside the Io" {
+    // The bytes differ, the schedule does not: only the data fingerprint
+    // sees it.
+    var bad: State = .{ .os_entropy = true };
+    try testing.expectError(error.NondeterministicData, search.checkDeterminism(testing.allocator, case(&bad), .{
+        .schedule = .{ .max_events = 0, .horizon = 1000 },
+    }));
+    var good: State = .{};
+    try search.checkDeterminism(testing.allocator, case(&good), .{ .schedule = .{ .max_events = 0, .horizon = 1000 } });
 }

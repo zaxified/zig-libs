@@ -328,6 +328,54 @@ test "checkDeterminism catches code that depends on state outside the simulation
     try testing.expectError(error.Nondeterministic, search.checkDeterminism(testing.allocator, case, .{}));
 }
 
+var outside_byte: u8 = 0;
+
+/// Sends one datagram whose content (not its size, not its timing) comes
+/// from outside the simulation — entropy behind the `Io`'s back.
+fn leakyBytesSetup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
+    _ = ctx;
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    outside_byte +%= 1;
+    try a.spawn(sendByte, .{ a.io(), b.ip4, outside_byte });
+}
+
+fn sendByte(io: Io, to: [4]u8, byte: u8) !void {
+    const sock = try net.IpAddress.bind(&.{ .ip4 = .unspecified(0) }, io, .{ .mode = .dgram });
+    defer sock.close(io);
+    try sock.send(io, &.{ .ip4 = .{ .bytes = to, .port = 9 } }, &.{byte});
+}
+
+test "checkDeterminism catches bytes drawn outside the simulation even when timing matches" {
+    // ssh pilot finding: the schedule fingerprint alone passed this.
+    const case: search.Case = .{ .options = .{ .seed = 0, .stack_size = 256 * 1024 }, .setup = leakyBytesSetup };
+    try testing.expectError(error.NondeterministicData, search.checkDeterminism(testing.allocator, case, .{}));
+}
+
+var outside_count: u64 = 0;
+
+fn quietSetup(sim: *Sim, ctx: ?*anyopaque) anyerror!void {
+    _ = ctx;
+    _ = try sim.addHost(.{});
+    outside_count += 1;
+}
+
+fn quietDigest(sim: *Sim, ctx: ?*anyopaque) u64 {
+    _ = sim;
+    _ = ctx;
+    return outside_count;
+}
+
+test "Case.digest catches state that never leaves a host" {
+    const case: search.Case = .{
+        .options = .{ .seed = 0, .stack_size = 256 * 1024 },
+        .setup = quietSetup,
+        .digest = quietDigest,
+    };
+    try testing.expectError(error.NondeterministicState, search.checkDeterminism(testing.allocator, case, .{}));
+}
+
 // ── contract details found by the mutation run ─────────────────────────────
 
 fn holdMemory(io: Io, gpa: std.mem.Allocator) !void {

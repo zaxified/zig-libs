@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — `checkDeterminism` also compares a data fingerprint
+  (`Sim.dataFingerprint`: every byte sent and written, per host, in order) and an
+  optional `Case.digest`, failing with `NondeterministicData` /
+  `NondeterministicState`. The schedule fingerprint alone missed entropy drawn
+  outside `std.Io` that changes bytes but not timing — the ssh pilot's defect, which
+  the generic check now catches by itself. `CaseResult` gains `data_fingerprint`
+  and `digest`.
 - **2026-10-01** — icmp pilot, on the module's new `std.Io` path: exact RTTs, dead
   targets, and no misattributed reply across seeds of rough links and partitions.
 - **2026-10-01** — http Server pilot (after its timeouts moved onto `std.Io`): the

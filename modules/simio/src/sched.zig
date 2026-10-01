@@ -412,6 +412,8 @@ pub const Sim = struct {
     steps: u64 = 0,
     next_partition: u32 = 1 << 31,
     fingerprint_state: u64 = 0,
+    /// Every byte a host put on the wire or on its disk, hashed in order.
+    data_hash: std.hash.Wyhash = .init(0),
     live: usize = 0,
 
     sched_context: fiber.Context = undefined,
@@ -507,6 +509,22 @@ pub const Sim = struct {
     /// under test is nondeterministic.
     pub fn fingerprint(sim: *const Sim) u64 {
         return sim.fingerprint_state;
+    }
+
+    /// A digest of every byte sent (stream writes, datagrams) and written to
+    /// a disk so far, in order. Code that draws something outside `std.Io`
+    /// which changes bytes but not sizes or timing (entropy behind the `Io`'s
+    /// back, an address, a wall-clock stamp) leaves `fingerprint` equal and
+    /// this one different.
+    pub fn dataFingerprint(sim: *const Sim) u64 {
+        var h = sim.data_hash;
+        return h.final();
+    }
+
+    /// Mixes bytes a host emitted into `dataFingerprint` (internal).
+    pub fn mixData(sim: *Sim, host: *const Host, bytes: []const u8) void {
+        sim.data_hash.update(std.mem.asBytes(&host.id));
+        sim.data_hash.update(bytes);
     }
 
     /// Connects two hosts with a bidirectional link (or reconfigures and
