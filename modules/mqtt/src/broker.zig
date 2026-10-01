@@ -119,6 +119,12 @@ pub const Transport = struct {
     /// Optional: shut the underlying socket down so a blocked read wakes and
     /// the owner thread reaps the connection. Null = no-op (offline core).
     closeFn: ?*const fn (ctx: *anyopaque) void = null,
+    /// The `std.Io` that `writeFn` blocks in, if any (`TcpServer`'s socket
+    /// transport sets it). The connection's `tx_lock`, held across writes,
+    /// then waits through it: under an `Io` that runs several tasks on one
+    /// thread a spinning waiter would starve a writer suspended in the
+    /// socket forever. Null: the io-less spinlock.
+    io: ?std.Io = null,
 
     pub fn write(t: Transport, bytes: []const u8) TransportError!void {
         return t.writeFn(t.ctx, bytes);
@@ -184,6 +190,23 @@ const Mutex = struct {
     }
 };
 
+/// `Connection.tx_lock`: held across transport writes, so it waits through
+/// the transport's `Io` when there is one (see `Transport.io`).
+const TxLock = struct {
+    io: ?std.Io = null,
+    spin: Mutex = .{},
+    mutex: std.Io.Mutex = .init,
+
+    pub fn lock(l: *TxLock) void {
+        if (l.io) |io| return l.mutex.lockUncancelable(io);
+        l.spin.lock();
+    }
+
+    pub fn unlock(l: *TxLock) void {
+        if (l.io) |io| l.mutex.unlock(io) else l.spin.unlock();
+    }
+};
+
 // ── per-connection state ────────────────────────────────────────────────────
 
 /// One client connection on the broker side. Owns its receive buffer (stream
@@ -199,7 +222,7 @@ pub const Connection = struct {
     tx_buf: []u8,
     /// Guards `tx_buf`, `pending`, and serializes socket writes to this
     /// connection (owner-thread responses + concurrent fan-out deliveries).
-    tx_lock: Mutex = .{},
+    tx_lock: TxLock = .{},
 
     state: State = .awaiting_connect,
     client_id_buf: [max_client_id]u8 = undefined,
@@ -1335,7 +1358,7 @@ pub const Broker = struct {
         // FIX B: extra headroom so a QoS 0 → QoS 1 re-encode can never overflow.
         const tx = try b.allocator.alloc(u8, b.config.max_packet_size + tx_headroom);
         errdefer b.allocator.free(tx);
-        conn.* = .{ .transport = transport, .rx_buf = rx, .tx_buf = tx };
+        conn.* = .{ .transport = transport, .rx_buf = rx, .tx_buf = tx, .tx_lock = .{ .io = transport.io } };
         try b.connections.append(b.allocator, conn);
         return conn;
     }
@@ -1376,7 +1399,11 @@ pub const Broker = struct {
         // fan-out reference can be taken. Drain the outstanding ones before we
         // free the connection's memory — a concurrent PUBLISH mid-write must
         // never land on freed `tx_buf` / socket ctx.
-        while (conn.refs.load(.acquire) != 0) std.atomic.spinLoopHint();
+        // A writer holding a reference may be suspended in its socket write:
+        // under an `Io` that runs several tasks on one thread, wait through it.
+        while (conn.refs.load(.acquire) != 0) {
+            if (conn.transport.io) |io| io.sleep(.fromMilliseconds(1), .awake) catch {} else std.atomic.spinLoopHint();
+        }
         b.freeConnection(conn);
     }
 
@@ -2650,7 +2677,7 @@ const SocketTransport = struct {
     stream: std.Io.net.Stream,
 
     fn transport(t: *SocketTransport) Transport {
-        return .{ .ctx = t, .writeFn = writeFn, .closeFn = closeFn };
+        return .{ .ctx = t, .writeFn = writeFn, .closeFn = closeFn, .io = t.io };
     }
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
@@ -2821,6 +2848,28 @@ const CountingTransport = struct {
     }
     fn closeFn(_: *anyopaque) void {}
 };
+
+test "a connection's tx_lock waits through its transport's Io when it has one" {
+    // Spinlock audit after the simio kv pilot: `tx_lock` is held across
+    // transport writes, so under an `Io` that runs several tasks on one
+    // thread a spinning waiter would starve a writer suspended in its socket.
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var plain = TestTransport{};
+    const c1 = try b.accept(plain.transport());
+    defer b.remove(c1);
+    try testing.expect(c1.tx_lock.io == null);
+    var with_io = TestTransport{};
+    var t = with_io.transport();
+    t.io = testing.io;
+    const c2 = try b.accept(t);
+    defer b.remove(c2);
+    try testing.expect(c2.tx_lock.io != null);
+    // Both paths serialize a write.
+    try c1.lockedWrite("x");
+    try c2.lockedWrite("y");
+    try testing.expectEqualStrings("y", with_io.written[0..with_io.len]);
+}
 
 test "one SUBSCRIBE walks the retained store ONCE, not once per duplicate filter (re-audit F1)" {
     // §3.8.4 requires re-sending retained messages on a subscribe, and

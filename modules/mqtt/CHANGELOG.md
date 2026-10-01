@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Fix: the broker no longer spins on a connection's `tx_lock` under a
+  fiber/evented `Io`.** `tx_lock` is held across transport writes; with several tasks on one
+  thread a spinning waiter starved a writer suspended in its socket forever, and `remove`
+  spun the same way waiting for fan-out references. `Transport` gained `io: ?std.Io = null`
+  (set by `TcpServer`'s socket transport); with it, `tx_lock` is an `std.Io.Mutex` and `remove`
+  waits through the `Io`. Transports without an `Io` (egw-hub's, the offline tests) behave as
+  before. Found by the spinlock audit that followed the simio kv pilot.
 - **2026-10-01** — `TcpServer` runs on `std.Io` alone: the per-connection
   read loop no longer polls the raw socket (`std.posix.poll`) or reads the
   wall clock with `clock_gettime`. Connection timeouts (CONNECT, 1.5 ×
