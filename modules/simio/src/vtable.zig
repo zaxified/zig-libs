@@ -52,6 +52,8 @@ pub const vtable: Io.VTable = blk: {
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
     vt.netLookup = netLookup;
+    vt.netListenUnix = netListenUnix;
+    vt.netConnectUnix = netConnectUnix;
     vt.dirCreateDir = dirCreateDir;
     vt.dirCreateDirPath = dirCreateDirPath;
     vt.dirCreateDirPathOpen = dirCreateDirPathOpen;
@@ -568,4 +570,14 @@ fn netLookupInner(
         @memcpy(buf[0..name.len], name);
         try resolved.putOne(io, .{ .canonical_name = .{ .bytes = buf[0..name.len] } });
     }
+}
+
+fn netListenUnix(userdata: ?*anyopaque, address: *const net.UnixAddress, options: net.UnixAddress.ListenOptions) net.UnixAddress.ListenError!net.Socket.Handle {
+    const h = hostOf(userdata);
+    return h.sim.net.listenUnix(h, address, options);
+}
+
+fn netConnectUnix(userdata: ?*anyopaque, address: *const net.UnixAddress) net.UnixAddress.ConnectError!net.Socket.Handle {
+    const h = hostOf(userdata);
+    return h.sim.net.connectUnix(h, address);
 }

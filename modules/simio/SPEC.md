@@ -32,8 +32,8 @@ check, seeded preemption at yield points (every network and disk call), a `.dead
 tasks can never wake; routed multi-hop paths with directed per-link faults, ICMP
 echo, and seeded short stream reads that surface framing bugs *(peers' READMEs
 mention none of these — inferred)*.
-**Where we are behind:** no Unix sockets, no symlinks or hard links, no memory maps,
-no in-repo consumer yet (M5).
+**Where we are behind:** no symlinks or hard links, no memory maps, no in-repo
+consumer outside its own pilots yet.
 
 ## Why this module exists
 
@@ -65,6 +65,13 @@ platform-free); file system and storage faults **in scope from the start**.
   `netReceive` (via `operate`), `netRead`, `netWrite`, `netClose`, `netShutdown`;
   TCP-like streams and UDP-like datagrams; unprivileged ICMP datagram sockets
   (`.dgram` + `protocol = .icmp`) answered by the simulated host stack.
+- Unix-domain streams: `netListenUnix`/`netConnectUnix` by path (abstract names too),
+  per host; a path is taken while its listener lives (`AddressInUse`), a missing
+  one is `FileNotFound`, a crash removes the host's paths. Under the hood a Unix
+  stream is a loopback stream on an address private to the host (`unix_ip`).
+  `socketpair` stays refused: std 0.16's `CreatePairOptions` names an *IP* family
+  and Linux answers `socketpair(AF_INET)` with EOPNOTSUPP — the differential oracle
+  caught simio offering a pair the real `Io` cannot make.
 - Names: `netLookup` resolves `HostOptions.name` (case-insensitive), IP literals
   and `localhost`; IPv4 first. An unknown name is `UnknownHostName` — there is no
   real network to ask.
@@ -76,7 +83,8 @@ platform-free); file system and storage faults **in scope from the start**.
 **Out (the operation behaves exactly as in `std.Io.failing` — an error such as
 `error.NetworkDown` or `error.OperationUnsupported`, never a fabricated success):** processes (`processSpawn*`, `childWait`, `processReplace*`), memory maps,
 DNS on the wire (a module's own resolver, like `dns`, runs against simulated name
-servers instead), Unix sockets (backlog), terminals beyond stderr, preemptive
+servers instead), `socketpair` (see above), Unix datagram sockets (std 0.16 has
+none), terminals beyond stderr, preemptive
 threads, the CPU memory model. Code that bypasses `std.Io` (raw `std.os.linux`
 syscalls, `std.Thread`, globals keyed by address) is outside simulation and is the
 consumer's to remove.
@@ -375,5 +383,4 @@ of touching one of the test process's own descriptors.
 
 ## Backlog / deferred
 
-- Unix sockets (`netListenUnix`, `netConnectUnix`, `netSocketCreatePair`).
 - Memory maps over the simulated file system.

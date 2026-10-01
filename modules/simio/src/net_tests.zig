@@ -743,3 +743,114 @@ test "HostName.connect reaches a host by its name" {
     try testing.expectEqual(sched.Outcome.quiescent, r.outcome);
     try testing.expect(out.ok);
 }
+
+// ── Unix-domain sockets ────────────────────────────────────────────────────
+
+fn unixEcho(io: Io, path: []const u8) !void {
+    const ua = try net.UnixAddress.init(path);
+    var server = try ua.listen(io, .{});
+    defer server.deinit(io);
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var rbuf: [64]u8 = undefined;
+    var wbuf: [64]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    _ = r.interface.streamRemaining(&w.interface) catch {};
+    try w.interface.flush();
+}
+
+const UnixRun = struct {
+    echoed: bool = false,
+    second_listen: ?anyerror = null,
+    missing: ?anyerror = null,
+};
+
+fn unixClient(io: Io, path: []const u8, out: *UnixRun) !void {
+    try io.sleep(.fromMilliseconds(1), .awake); // the server is listening by now
+    const ua = try net.UnixAddress.init(path);
+    if (ua.listen(io, .{})) |s| {
+        var srv = s;
+        srv.deinit(io);
+    } else |err| out.second_listen = err;
+    const missing = try net.UnixAddress.init("/run/nobody.sock");
+    if (missing.connect(io)) |s| s.close(io) else |err| out.missing = err;
+
+    const stream = try ua.connect(io);
+    defer stream.close(io);
+    var wbuf: [16]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("over a path");
+    try w.interface.flush();
+    try stream.shutdown(io, .send);
+    var rbuf: [16]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var got: [11]u8 = undefined;
+    try r.interface.readSliceAll(&got);
+    out.echoed = std.mem.eql(u8, &got, "over a path");
+}
+
+test "Unix-domain stream sockets: listen on a path, connect, echo; a taken path and a missing one" {
+    var sim: Sim = undefined;
+    newSim(&sim, 43);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var out: UnixRun = .{};
+    try h.spawn(unixEcho, .{ h.io(), "/run/app.sock" });
+    try h.spawn(unixClient, .{ h.io(), "/run/app.sock", &out });
+    const r = sim.run();
+    try testing.expectEqual(sched.Outcome.quiescent, r.outcome);
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+    try testing.expect(out.echoed);
+    try testing.expectEqual(@as(?anyerror, error.AddressInUse), out.second_listen);
+    try testing.expectEqual(@as(?anyerror, error.FileNotFound), out.missing);
+}
+
+fn unixPathsAreHostLocal(io: Io, out: *?anyerror) void {
+    const ua = net.UnixAddress.init("/run/app.sock") catch unreachable;
+    if (ua.connect(io)) |s| s.close(io) else |err| out.* = err;
+}
+
+test "a Unix socket path belongs to its host; a crash takes it away" {
+    var sim: Sim = undefined;
+    newSim(&sim, 44);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try a.spawn(unixEcho, .{ a.io(), "/run/app.sock" });
+    _ = sim.runFor(std.time.ns_per_ms);
+    var other: ?anyerror = null;
+    try b.spawn(unixPathsAreHostLocal, .{ b.io(), &other });
+    _ = sim.runFor(std.time.ns_per_ms);
+    try testing.expectEqual(@as(?anyerror, error.FileNotFound), other);
+
+    sim.crash(a);
+    sim.restart(a);
+    var after: ?anyerror = null;
+    try a.spawn(unixPathsAreHostLocal, .{ a.io(), &after });
+    _ = sim.runFor(std.time.ns_per_ms);
+    try testing.expectEqual(@as(?anyerror, error.FileNotFound), after);
+}
+
+fn tryPair(io: Io, out: *?anyerror) void {
+    if (net.Socket.createPair(io, .{})) |p| {
+        p[0].close(io);
+        p[1].close(io);
+    } else |err| out.* = err;
+}
+
+test "socketpair is refused, as std 0.16 on Linux refuses it" {
+    // `CreatePairOptions.family` is an IP family: `std.Io.Threaded` calls
+    // socketpair(AF_INET) and Linux answers EOPNOTSUPP (found by the
+    // differential oracle while simio still offered a pair). Not in the
+    // oracle itself: Threaded reports that errno with a stack trace on
+    // stderr, which the test lanes count as a failure.
+    var sim: Sim = undefined;
+    newSim(&sim, 45);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    var err: ?anyerror = null;
+    try h.spawn(tryPair, .{ h.io(), &err });
+    _ = sim.run();
+    try testing.expect(err != null);
+}

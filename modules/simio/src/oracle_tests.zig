@@ -28,6 +28,9 @@ const Report = struct {
     silent_receive: ?anyerror = null,
     /// What a canceled accept ended with.
     canceled_accept: ?anyerror = null,
+    /// Echoed over a Unix-domain stream, and over a socketpair.
+    unix: [16]u8 = undefined,
+    unix_len: usize = 0,
     /// The file's content after write, sync, rename and reopen.
     file: [64]u8 = undefined,
     file_len: usize = 0,
@@ -40,6 +43,7 @@ const Report = struct {
         return a.stream == b.stream and a.stream_bytes == b.stream_bytes and
             a.dgram == b.dgram and a.dgrams == b.dgrams and
             a.silent_receive == b.silent_receive and a.canceled_accept == b.canceled_accept and
+            std.mem.eql(u8, a.unix[0..a.unix_len], b.unix[0..b.unix_len]) and
             std.mem.eql(u8, a.file[0..a.file_len], b.file[0..b.file_len]) and
             std.mem.eql(u8, a.names[0..a.names_len], b.names[0..b.names_len]) and
             a.done and b.done;
@@ -140,6 +144,30 @@ fn program(io: Io, dir: Dir, report: *Report) !void {
         if (waiting.cancel(io)) |_| {} else |err| report.canceled_accept = err;
     }
 
+    // A Unix-domain stream in the abstract namespace (no file to clean up),
+    // named at random so parallel runs on the real kernel never collide.
+    {
+        var rnd: [8]u8 = undefined;
+        io.random(&rnd);
+        var pb: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "\x00simio-oracle-{x}", .{std.mem.readInt(u64, &rnd, .little)}) catch unreachable;
+        const ua = try net.UnixAddress.init(path);
+        var l = try ua.listen(io, .{});
+        defer l.deinit(io);
+        var echo = io.async(upperServer, .{ io, &l });
+        const c = try ua.connect(io);
+        defer c.close(io);
+        var wbuf: [8]u8 = undefined;
+        var w = c.writer(io, &wbuf);
+        try w.interface.writeAll("unix path");
+        try w.interface.flush();
+        try c.shutdown(io, .send);
+        var rbuf: [8]u8 = undefined;
+        var r = c.reader(io, &rbuf);
+        report.unix_len = try r.interface.readSliceShort(&report.unix);
+        try echo.await(io);
+    }
+
     // Files: write, sync, rename over an existing name, sync the directory,
     // read back, list.
     {
@@ -232,6 +260,7 @@ test "differential oracle: one std.Io program gives the same results on Threaded
     try testing.expectEqual(@as(?anyerror, error.Canceled), real.canceled_accept);
     try testing.expectEqualStrings("fresh contents, 25 bytes", real.file[0..real.file_len]);
     try testing.expectEqualStrings("old.txt", real.names[0..real.names_len]);
+    try testing.expectEqualStrings("UNIX PATH", real.unix[0..real.unix_len]);
     try testing.expectEqual(real.stream_bytes, simulated.stream_bytes);
     try testing.expectEqual(real.stream, simulated.stream);
     try testing.expectEqual(real.dgrams, simulated.dgrams);

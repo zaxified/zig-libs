@@ -186,6 +186,8 @@ pub const Sock = struct {
     syn_deadline: u64 = 0,
     /// Server side: the client socket id this connection answered.
     syn_key: ?u64 = null,
+    /// A Unix-socket listener: its key in `Net.unix`.
+    unix_key: ?[]const u8 = null,
 
     fn removeWaiter(s: *Sock, f: *Fiber) void {
         for (s.waiters.items, 0..) |w, i| if (w == f) {
@@ -207,6 +209,8 @@ pub const Net = struct {
     socks: std.AutoHashMapUnmanaged(u64, *Sock) = .empty,
     pipes: std.AutoArrayHashMapUnmanaged(*Pipe, void) = .empty,
     syn_seen: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Unix socket paths: "<host id>/<path>" → the listener's sid.
+    unix: std.StringHashMapUnmanaged(u64) = .empty,
     next_sid: u64 = 1,
     // Dijkstra scratch, reused.
     dist: std.ArrayList(u64) = .empty,
@@ -226,6 +230,9 @@ pub const Net = struct {
         for (n.pipes.keys()) |p| freePipe(gpa, p);
         n.pipes.deinit(gpa);
         n.syn_seen.deinit(gpa);
+        var ui = n.unix.keyIterator();
+        while (ui.next()) |k| gpa.free(k.*);
+        n.unix.deinit(gpa);
         n.edges.deinit(gpa);
         for (n.partitions.items) |p| gpa.free(p.cut);
         n.partitions.deinit(gpa);
@@ -441,6 +448,7 @@ pub const Net = struct {
             },
             .ip6 => |v6| {
                 if (isLoopback6(v6.bytes) or std.mem.allEqual(u8, &v6.bytes, 0)) return from;
+                if (std.mem.eql(u8, &v6.bytes, &unix_ip)) return from;
                 if (mapped4(v6.bytes)) |b4| {
                     if (b4[0] == 127) return from;
                     for (n.sim.hosts.items) |h| if (std.mem.eql(u8, &h.ip4, &b4)) return h;
@@ -523,6 +531,10 @@ pub const Net = struct {
         if (s.handle >= 0) _ = s.host.handles.remove(s.handle);
         _ = n.socks.remove(s.sid);
         if (s.syn_key) |k| _ = n.syn_seen.remove(k);
+        if (s.unix_key) |k| {
+            _ = n.unix.remove(k);
+            n.sim.gpa.free(k);
+        }
         if (s.tx) |p| {
             p.sender_open = false;
             n.maybeFreePipe(p);
@@ -927,6 +939,48 @@ pub const Net = struct {
         }
     }
 
+    fn unixKey(buf: []u8, h: *const Host, path: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{d}/{s}", .{ h.id, path }) catch unreachable;
+    }
+
+    pub fn listenUnix(n: *Net, h: *Host, address: *const net.UnixAddress, options: net.UnixAddress.ListenOptions) net.UnixAddress.ListenError!Handle {
+        const gpa = n.sim.gpa;
+        var kb: [16 + net.UnixAddress.max_len]u8 = undefined;
+        const key = unixKey(&kb, h, address.path);
+        if (n.unix.contains(key)) return error.AddressInUse;
+        const owned = gpa.dupe(u8, key) catch return error.SystemResources;
+        n.unix.ensureUnusedCapacity(gpa, 1) catch {
+            gpa.free(owned);
+            return error.SystemResources;
+        };
+        const sock = n.listen(h, &.{ .ip6 = .{ .bytes = unix_ip, .port = 0 } }, .{ .kernel_backlog = options.kernel_backlog }) catch |err| {
+            gpa.free(owned);
+            return switch (err) {
+                error.AddressInUse => error.AddressInUse,
+                error.SystemResources => error.SystemResources,
+                else => error.Unexpected,
+            };
+        };
+        const s = h.handles.get(sock.handle).?;
+        s.unix_key = owned;
+        n.unix.putAssumeCapacity(owned, s.sid);
+        return sock.handle;
+    }
+
+    pub fn connectUnix(n: *Net, h: *Host, address: *const net.UnixAddress) net.UnixAddress.ConnectError!Handle {
+        var kb: [16 + net.UnixAddress.max_len]u8 = undefined;
+        const sid = n.unix.get(unixKey(&kb, h, address.path)) orelse return error.FileNotFound;
+        const listener = n.socks.get(sid) orelse return error.FileNotFound;
+        const sock = n.connect(h, &listener.local, .{ .mode = .stream }) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            error.SystemResources => error.SystemResources,
+            // The path exists but nobody accepts on it any more.
+            error.ConnectionRefused, error.ConnectionResetByPeer => error.FileNotFound,
+            else => error.Unexpected,
+        };
+        return sock.handle;
+    }
+
     pub fn accept(n: *Net, h: *Host, handle: Handle) net.Server.AcceptError!net.Socket {
         const me = n.sim.running();
         try n.sim.cancelPoint(me);
@@ -1264,6 +1318,11 @@ fn withPort(a: net.IpAddress, port: u16) net.IpAddress {
     r.setPort(port);
     return r;
 }
+
+/// Where Unix-domain sockets live: an address private to each host (every
+/// host routes it to itself), with one port per bound path. A Unix stream is
+/// then a loopback stream, with the same close, reset and short-read rules.
+pub const unix_ip: [16]u8 = .{ 0xfd, 0x75, 0x6e, 0x69, 0x78, 0x00 } ++ .{0} ** 9 ++ .{1};
 
 fn isLoopback6(b: [16]u8) bool {
     return std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1;

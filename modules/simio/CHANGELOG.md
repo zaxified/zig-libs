@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — Unix-domain stream sockets (`UnixAddress.listen`/`connect`, by
+  path or abstract name, per host). `socketpair` stays refused, matching std 0.16
+  on Linux (an IP family, EOPNOTSUPP) — found by the differential oracle, which now
+  also checks a Unix stream.
 - **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** the timeouts pilot also checks
   `llmclient`'s body deadline (test-only).
 - **2026-10-01** — `pilots/timeouts.zig`: the request timeouts of `modbus`,
