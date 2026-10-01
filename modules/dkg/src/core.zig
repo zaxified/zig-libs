@@ -82,10 +82,10 @@ pub fn verifyPedersenShare(
 ///
 /// Run ONLY for dealers already in QUAL, and ONLY after QUAL is fixed. A
 /// `false` here (for a dealer whose Pedersen check passed in Round 2) is
-/// the trigger for GJKR's public reconstruction of that dealer's `a_i0`
-/// (scoped OUT of Phase 1 — see SPEC "Out of scope"); Phase 1 treats a
-/// QUAL dealer failing the Feldman check as a hard protocol error. Must
-/// never `@panic` on adversarial input.
+/// the trigger for GJKR's public reconstruction of that dealer's
+/// polynomial (`participant.zig`; the lockstep driver never sees it, its
+/// dealers' Feldman commitments are always honest). Must never `@panic` on
+/// adversarial input.
 pub fn verifyFeldmanShare(
     commitments: []const Element,
     receiver: u32,

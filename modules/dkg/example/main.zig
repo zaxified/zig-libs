@@ -152,7 +152,12 @@ pub fn main() !void {
     }
     defer for (&nodes) |*node| node.deinit();
     for (&nodes) |*node| try node.start();
-    for (0..4) |_| {
+    // Five rounds when every dealer behaves, six when one has to be
+    // reconstructed in public; a node that is done stops advancing.
+    rounds: for (0..6) |_| {
+        for (&nodes) |*node| {
+            if (node.phase() != .done) break;
+        } else break :rounds;
         for (&nodes) |*sender| {
             const queued = try sender.takeOutgoing();
             defer dkg.freeOutgoing(gpa, queued);
@@ -166,7 +171,7 @@ pub fn main() !void {
                 }
             }
         }
-        for (&nodes) |*node| try node.advance();
+        for (&nodes) |*node| if (node.phase() != .done) try node.advance();
     }
     var node_outputs: [3]dkg.DkgShareOutput = undefined;
     for (&nodes, &node_outputs) |*node, *out| out.* = node.output() orelse return error.NodeDidNotFinish;

@@ -42,6 +42,8 @@ pub const DkgShareOutput = types.DkgShareOutput;
 
 pub const DriverError = error{
     InvalidConfig,
+    /// `n < 2t - 1`: see `Config.honestMajority`.
+    NoHonestMajority,
     ProtocolError,
 } || core.Error || std.mem.Allocator.Error;
 
@@ -159,6 +161,7 @@ pub const Dkg = struct {
         random: std.Random,
     ) DriverError![]DkgShareOutput {
         if (!cfg.valid()) return error.InvalidConfig;
+        if (!cfg.honestMajority()) return error.NoHonestMajority;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();

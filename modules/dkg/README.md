@@ -72,10 +72,16 @@ var mine = p.output().?; // DkgShareOutput
 defer mine.deinit();
 ```
 
-`advance` errors name what went wrong; after `FeldmanCheckFailed`/`MissingFeldman` (or a
-`Phase.aborted`), `p.culprit()` is the dealer id. A refused frame never changes state, so a
-garbage frame cannot derail a run — but a peer that stays silent is treated as absent
-(round 1) or as having failed its duty (Feldman round) at the deadline.
+Run rounds until `p.phase()` is `.done`: five when every dealer behaves, six when a dealer
+had to be reconstructed. A QUAL dealer whose Feldman commitments fail some party's share, or
+never arrive, does not stop the run: the complaint opens the share so every party checks it,
+everybody reveals its share of that dealer, and its polynomial is rebuilt in public (GJKR
+Fig. 2 step 4) — so it can neither split the honest parties nor veto a `Q` it dislikes.
+`advance` errors name what went wrong (`ReconstructionFailed`: `p.culprit()` is the dealer
+id); any error leaves the party `.aborted`. A refused frame never changes state, so a garbage
+frame cannot derail a run — but a peer that stays silent is treated as absent (round 1).
+`Participant.init` and `Dkg.run` refuse `n < 2t − 1` (`NoHonestMajority`): GJKR's
+guarantees need the `t − 1` parties it tolerates to be a minority.
 
 Resharing to a new committee (or the same one, as a proactive refresh):
 
@@ -117,7 +123,7 @@ const key_shares = try dkg.assembleKeyShares(allocator, outs, 2, paillier_keys, 
 
 ## Independent check
 
-`tools/gjkr_oracle.py` recomputes every public value of a recorded transcript (4 parties,
+`tools/gjkr_oracle.py` recomputes every public value of a recorded transcript (5 parties,
 `t = 3`, and a resharing to `n' = 3`, `t' = 2`, all secret coefficients revealed) with plain
 integers over secp256k1, written from the GJKR paper. `python3 tools/gjkr_oracle.py --check`
 verifies the committed `src/transcript_vectors.zig`; two Zig tests replay it through the

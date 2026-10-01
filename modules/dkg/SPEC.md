@@ -6,13 +6,16 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-10-01 · mutation none
 
 **Known defects:** none recorded
 
-⚠ The 2026-09-09 review predates the per-participant layer (`participant.zig`, `wire.zig`,
-`reshare.zig`, 2026-09-30) — the code that parses frames from the network. That layer has typed
-refusals, fuzz harnesses and a coordinator read-through of its parsers, but no audit yet.
+The 2026-10-01 review covered the per-participant layer (`participant.zig`, `wire.zig`,
+`reshare.zig`, 2026-09-30) — the code that parses frames from the network. It found that a
+cheating QUAL dealer could leave some honest parties `.done` with a key nobody can sign for
+while the others aborted, and could veto a `Q` by withholding its Feldman commitments; and
+that configurations with `n < 2t − 1` gave one dealer `Q` outright. Both are fixed (GJKR
+step 4; `NoHonestMajority`).
 
 **Downstream consumer:** no
 
@@ -31,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Pedersen/Gennaro DKG among many primitives; no longer maintained. |
 | Zig ecosystem (GitHub search "distributed key generation", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term and no echo-broadcast helper (the caller must supply reliable broadcast, as GJKR assumes); a QUAL dealer failing the Feldman check is a hard abort rather than GJKR's public reconstruction; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is still generated locally per party with no correctness proof exchanged inside the DKG; no persistence format for an in-flight run (a party that restarts mid-protocol starts over); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
+**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term and no echo-broadcast helper (the caller must supply reliable broadcast, as GJKR assumes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is still generated locally per party with no correctness proof exchanged inside the DKG; no persistence format for an in-flight run (a party that restarts mid-protocol starts over); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
 
 ## Goal
 
@@ -148,27 +151,55 @@ that arrives (`from` is the transport-authenticated sender id), closes a round w
 | `.shares` | `pedersen_broadcast` (C_i), `share` (s_ij, s'_ij) | verifies every share; broadcasts a `complaint` per failure; a peer with no broadcast is *absent* = disqualified |
 | `.complaints` | `complaint` | a dealer complained about broadcasts a `defense` (opens the share) |
 | `.defenses` | `defense` | `core.computeQual` from complaints + defenses ONLY; QUAL dealers broadcast Feldman commitments |
-| `.feldman` | `feldman_broadcast` (A_i) | checks every accepted share against A_i; derives Q, x_j |
+| `.feldman` | `feldman_broadcast` (A_i) | checks every accepted share against A_i; broadcasts a `feldman_complaint` (the share opened) per failure; a QUAL dealer with no broadcast is *exposed* |
+| `.feldman_complaints` | `feldman_complaint` | a complaint that verifies against the dealer's Pedersen commitments and NOT its Feldman ones exposes it; none exposed → derive Q, x_j (`.done`); else broadcast a `reveal` of our share of each exposed dealer |
+| `.reveals` | `reveal` | keeps each revealed share that verifies against the dealer's Pedersen commitments; rebuilds each exposed dealer's polynomial from `t` of them; derives Q, x_j |
 
 Frames are `kind(1) || body`; bodies reuse `types.zig`. Parsing validates the length
 before any allocation, ids against `1..n`, scalars canonical (< n), points on the curve and
 not infinity, the commitment count against `t`, and the id inside the body against the
 authenticated sender. A refused frame changes nothing (`wire.MessageError`: `Malformed`,
 `UnknownKind`, `UnknownSender`, `SenderMismatch`, `WrongRecipient`, `WrongRound`,
-`DuplicateMessage`, `Unsolicited`, `Finished`, `Aborted`) — never a panic. A frame for a
+`DuplicateMessage`, `Unsolicited`, `Unverified`, `Finished`, `Aborted`) — never a panic. A frame for a
 later round is `WrongRound`; a network with skew buffers and redelivers it.
 
 Assumed of the transport (as GJKR assumes a synchronous reliable-broadcast channel): every
 receiver of a broadcast gets identical bytes, `share` frames are confidential, `from` is
-authenticated. The complaint and defense rounds end by deadline (silence is the honest case),
-so `allReceived()` is meaningful only for `.shares` and `.feldman`.
+authenticated. The complaint, defense and Feldman-complaint rounds end by deadline (silence is
+the honest case), so `allReceived()` is meaningful only for `.shares`, `.feldman` and
+`.reveals` (there: `t` verified shares of every exposed dealer are in).
+
+**Honest majority.** GJKR tolerates `t − 1` corrupted parties only while `n ≥ 2t − 1`: then
+at least `t` honest parties check each dealer's Feldman commitments and can rebuild a cheating
+dealer's polynomial. Below that, `t − 1` honest checks leave the constant term free — a dealer
+fits commitments through the honest parties' points with an `A_0` chosen after seeing the
+others', so it picks `Q`, and every check passes. `Participant.init` and `Dkg.run` refuse it
+(`NoHonestMajority`, `Config.honestMajority`). Resharing does not need it: its dealt secrets
+are pinned by the old verifying shares.
+
+**Why a cheating QUAL dealer cannot split or veto the run (GJKR Fig. 2 step 4).** Each party
+checks the shares it received against the Feldman commitments; a mismatch is a public
+complaint that OPENS the share `(s, s')`, so every party verifies it itself: it must match the
+dealer's Pedersen commitments (it is the committed share) and not the Feldman ones. With
+reliable broadcast every honest party therefore exposes the same dealers — those with a valid
+complaint or no Feldman broadcast at all — reveals its own shares of them, and rebuilds their
+polynomials from `t` Pedersen-verified shares. By Pedersen binding those are the polynomials
+the dealers committed to before QUAL was fixed, so the key is the one a clean run gives. Until
+2026-10-01 a mismatch was a local abort: a dealer whose commitments agreed with fewer than `t`
+honest shares left those parties `.done` with a `Q` nobody can sign for while the rest aborted
+(neither half knowing), and withholding the commitments aborted the run — a veto a rushing
+dealer could use, after seeing the others' `A_i0`, to redraw `Q` on a restart. A reconstructed
+coefficient of zero contributes the identity, which cannot travel as an `Element`; it is
+summed as such rather than refused.
 
 Randomness is caller-supplied and drawn once in `init`, in the same order as the lockstep
 driver, so the same seed gives byte-identical outputs from `Dkg.run` and from `Participant`s
 (tested). `initWithPolynomials` takes explicit coefficients (tests, recorded transcripts).
-Every secret is wiped by `deinit` (`std.crypto.secureZero`). Deviations from Fig. 2: the
-Feldman-check failure of a QUAL dealer aborts (see Backlog); a dealer who is complained
-about defends *all* its complainants in one round.
+Every secret is wiped by `deinit` (`std.crypto.secureZero`), and transient copies (the
+summands of `x_j`, decoded share messages) where they are made. Any error from `advance`
+leaves the party `.aborted`: a half-done round transition is never retried, so no frame is
+queued twice. Deviation from Fig. 2: a dealer who is complained about defends *all* its
+complainants in one round.
 
 ## Resharing (`reshare.zig`)
 
@@ -219,14 +250,18 @@ complain, since `t'` public openings would reveal its share.
   subset still reconstructs — proving the checker discriminates, not blanket-
   fails, before the core exists.
 
-- **Per-participant equivalence.** For n in {2,3,5,7} and several t, `Participant`s driven over
+- **Per-participant equivalence.** For n in 2..7 and every t with `n ≥ 2t − 1`, `Participant`s driven over
   an in-memory router produce byte-identical `DkgShareOutput`s to `Dkg.run` for the same seed;
   the joint Feldman commitments re-derive every `X_j`.
 - **Adversarial, at the message level.** A tampered share (defended -> same key as the clean
   run; undefended -> QUAL excludes the dealer), a silent dealer, a crashed party, more than `t`
-  defended complaints, a wrong/missing Feldman broadcast (abort with `culprit()`), and the
-  refusals: malformed lengths/points/scalars, lying commitment counts, wrong sender, wrong
-  recipient, replay, wrong round, unsolicited defense, after finish.
+  defended complaints; a wrong or a withheld Feldman broadcast (the dealer is exposed and
+  rebuilt: byte-identical outputs to the clean run); the review's split attack (`n=5,t=3`,
+  Feldman commitments bent through parties 1 and 2 only: all five finish with the clean key);
+  refused Feldman complaints (about an honest dealer, with a share that is not the committed
+  one); `NoHonestMajority` for `n < 2t − 1`; and the refusals: malformed
+  lengths/points/scalars, lying commitment counts, wrong sender, wrong recipient, replay, wrong
+  round, unsolicited defense, after finish.
 - **Resharing.** `n=3,t=2 -> n'=5,t'=3` keeps `Q`; every 3-subset of the new shares
   reconstructs the same secret; below `t'` and old+new mixes do not; refresh changes every
   share; bad dealers are defended/excluded; `InsufficientDealers`, `CommitmentMismatch`,
@@ -234,7 +269,7 @@ complain, since `t'` public openings would reveal its share.
 - **Signing.** DKG over frames -> `threshold_ecdsa.signWithShares` -> refresh -> sign again
   under the same `Q`, both verified by `std` ECDSA.
 - **Independent recomputation.** `tools/gjkr_oracle.py` (plain Python integers, written from
-  the paper) generates and re-checks `src/transcript_vectors.zig`: 4 parties `t=3` with every
+  the paper) generates and re-checks `src/transcript_vectors.zig`: 5 parties `t=3` with every
   secret coefficient revealed, and a `t'=2`, `n'=3` resharing. Two Zig tests replay it through
   `Participant`/`ReshareDealer` (explicit coefficients) and assert equality of every frame's
   commitments and shares, every `x_j`, `X_j`, `Q`, `F'`, and the Lagrange coefficients.
@@ -284,7 +319,9 @@ here.
 
 ## Backlog / deferred
 
-- **GJKR recovery branch: public reconstruction of a dealer that fails the Feldman check** (survey 2026-09-30): a QUAL dealer whose Feldman commitments fail the share check, or never arrive, aborts the whole run (`culprit()` names it) instead of the honest parties reconstructing its polynomial from `t` shares (GJKR Fig. 2 step 4). Effort: medium (one more round of share reveals + a public Lagrange). Fits §2.
+- ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
+- **Mutation run of the per-participant layer and the recovery branch** (review 2026-10-01 was by reading and directed tests only).
+- **Role-tagged sender for `ReshareReceiver`** (review 2026-10-01, F7): `handle` takes one `from` that is an OLD id for three kinds and a NEW id for `reshare_complaint`, and the kind octet comes from the frame. A transport that authenticates one id space for both committees would let new party `j` send a broadcast as old dealer `j` (its `B_0 = X_j` is public), win first-wins, and get the honest dealer excluded. Documented as the caller's routing contract today; a `from: struct { role, id }` would make it unforgeable. Effort: small.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - **Distributed aux-parameter generation with correctness proofs (Paillier + ring-Pedersen, `Πprm`/`Πmod` from `threshold_ecdsa.aux_proofs`)** (survey 2026-09-30): CGGMP keygen exchanges these inside the protocol; here each party generates them alone and `assembleKeyShares` attaches them without checking peers' proofs. Effort: medium (proofs exist in `threshold_ecdsa`). Fits §2.

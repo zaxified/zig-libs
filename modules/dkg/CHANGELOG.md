@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — ⚠ **Breaking: GJKR step 4 (public reconstruction) and an honest-majority
+  check** (review of the 2026-09-30 per-participant layer). A QUAL dealer whose Feldman
+  commitments failed a party's share used to make that party abort alone: a dealer bending its
+  commitments through fewer than `t` honest shares left those parties `.done` with a key nobody
+  can sign for while the others aborted, and withholding the commitments vetoed the run (a
+  rushing dealer could redraw `Q` on a restart). Now the failure is a public
+  `feldman_complaint` that opens the share (every party verifies it: Pedersen yes, Feldman no),
+  every party `reveal`s its share of each exposed dealer, and the polynomial is rebuilt from
+  `t` verified shares — the outputs equal a clean run. New `Phase.feldman_complaints` /
+  `.reveals`, `wire.Kind.feldman_complaint` (6) / `.reveal` (7), `MessageError.Unverified`,
+  `AdvanceError.ReconstructionFailed`, `Participant.exposedDealers()`; `MissingFeldman` and
+  `FeldmanCheckFailed` are gone. A clean run takes five rounds (was four). `Participant.init`
+  and `Dkg.run` refuse `n < 2t − 1` (`NoHonestMajority`, `Config.honestMajority`): below it one
+  dealer can fit Feldman commitments with a free constant term and choose `Q` undetected.
+  Any error from `advance` now leaves the party `.aborted` (a half-done transition was
+  retriable and queued frames twice), the `x_j` summands and decoded share messages are wiped.
+  The oracle transcript is regenerated as 3-of-5 (was 3-of-4).
 - **2026-09-30** — **Per-participant API and resharing** (maturity task A12; scope `poc` -> `mvp`).
   New `Participant` (`participant.zig`): one GJKR party as a sans-I/O state machine (`start` /
   `handle(from, bytes)` / `advance` / `takeOutgoing`) with typed wire frames (`wire.zig`), full parsing

@@ -19,6 +19,15 @@ pub const Kind = enum(u8) {
     complaint = 3,
     defense = 4,
     feldman_broadcast = 5,
+    /// GJKR Fig. 2 step 4(b): a QUAL dealer's Feldman commitments do not
+    /// match a share that verifies against its Pedersen commitments. The
+    /// body is a `ShareMsg` (dealer = accused, receiver = complainant) that
+    /// opens the share, so every party can check the complaint itself.
+    feldman_complaint = 6,
+    /// GJKR Fig. 2 step 4(c): a party's Pedersen-verified share of an
+    /// exposed dealer's polynomial, broadcast so everyone can reconstruct it.
+    /// Body: `ShareMsg` (dealer = exposed dealer, receiver = the holder).
+    reveal = 7,
     // resharing (`reshare.zig`)
     reshare_broadcast = 16,
     reshare_share = 17,
@@ -85,6 +94,10 @@ pub const MessageError = error{
     /// Well-formed but refers to something that does not exist: a defense
     /// nobody complained about, a Feldman broadcast from a disqualified dealer.
     Unsolicited,
+    /// Opens a share that does not verify against the dealer's public
+    /// commitments: a Feldman complaint about a dealer whose commitments are
+    /// fine, or a revealed share that is not the committed one.
+    Unverified,
     /// The run is complete; no message is accepted any more.
     Finished,
     /// The run was aborted (see `culprit`); no message is accepted.

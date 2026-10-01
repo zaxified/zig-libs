@@ -92,17 +92,45 @@ pub const TestNet = struct {
         for (self.parties) |*p| if (!self.isCrashed(p.me)) try p.start();
     }
 
+    /// Advance every live party that is still running (a party that saw no
+    /// dealer exposed finishes a round before the ones that reconstruct).
     pub fn advanceAll(self: *TestNet) !void {
-        for (self.parties) |*p| if (!self.isCrashed(p.me)) try p.advance();
+        for (self.parties) |*p| {
+            if (self.isCrashed(p.me)) continue;
+            switch (p.phase()) {
+                .done, .aborted => continue,
+                else => try p.advance(),
+            }
+        }
     }
 
-    /// The whole run: start, then four (deliver, advance) rounds.
+    /// The whole run: start, then (deliver, advance) rounds until every live
+    /// party is done or aborted — five for a clean run, six when a dealer's
+    /// polynomial is reconstructed.
     pub fn run(self: *TestNet) !void {
         try self.startAll();
-        for (0..4) |_| {
+        try self.finish();
+    }
+
+    /// Keep delivering and advancing until every live party is done or
+    /// aborted (for a test that drove the first rounds by hand).
+    pub fn finish(self: *TestNet) !void {
+        for (0..6) |_| {
+            if (self.settled()) return;
             try self.deliverAll();
             try self.advanceAll();
         }
+    }
+
+    fn settled(self: *const TestNet) bool {
+        for (self.parties) |*p| {
+            if (self.isCrashed(p.me)) continue;
+            switch (p.phase()) {
+                .done, .aborted => {},
+                else => return false,
+            }
+        }
+        return true;
     }
 
     /// Outputs of the live parties, in id order (caller frees the slice and

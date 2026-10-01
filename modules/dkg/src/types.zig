@@ -26,6 +26,18 @@ pub const Config = struct {
     pub fn valid(self: Config) bool {
         return self.t >= 1 and self.t <= self.n and self.n >= 1;
     }
+
+    /// GJKR tolerates `t - 1` corrupted parties only while they are a
+    /// minority, `n >= 2t - 1`: then at least `t` honest parties check every
+    /// dealer's Feldman commitments and can reconstruct a cheating dealer's
+    /// polynomial. Below that a single dealer can fit commitments through
+    /// the honest parties' points with a constant term of its choosing — `Q`
+    /// is then chosen by the adversary and nobody can tell. The DKG refuses
+    /// such configurations (`NoHonestMajority`); resharing does not need it
+    /// (the dealt secrets are pinned by the old verifying shares).
+    pub fn honestMajority(self: Config) bool {
+        return @as(u64, self.n) + 1 >= 2 * @as(u64, self.t);
+    }
 };
 
 pub const CodecError = error{InvalidEncoding} || tecdsa.ElementError;

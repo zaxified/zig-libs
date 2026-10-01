@@ -30,19 +30,34 @@
 //! advance()  -> QUAL is fixed from complaints + defenses ONLY (core.computeQual);
 //!               each QUAL dealer broadcasts its Feldman commitments
 //! .feldman     collect Feldman commitments
-//! advance()  -> verify every accepted share against them, derive Q and x_j
+//! advance()  -> check every accepted share against them; broadcast a
+//!               `feldman_complaint` (opening the share) per failure
+//! .feldman_complaints  collect Feldman complaints
+//! advance()  -> a QUAL dealer with a valid complaint or no Feldman broadcast
+//!               is EXPOSED; with none exposed, derive Q and x_j (.done);
+//!               else broadcast a `reveal` of our share of each exposed dealer
+//! .reveals     collect reveals
+//! advance()  -> reconstruct each exposed dealer's polynomial from `t` verified
+//!               shares, then derive Q and x_j
 //! .done        `output()` is this party's `DkgShareOutput`
 //! ```
 //!
-//! The complaint and defense rounds cannot say "everyone spoke" (silence is the
-//! honest case), so they end by deadline; `allReceived` reports completeness
-//! for the two rounds where it is knowable.
+//! The complaint, defense and Feldman-complaint rounds cannot say "everyone
+//! spoke" (silence is the honest case), so they end by deadline;
+//! `allReceived` reports completeness for the rounds where it is knowable.
 //!
-//! **What aborts.** A QUAL dealer whose Feldman commitments are missing or fail
-//! the share check makes `advance` return `FeldmanCheckFailed`/`MissingFeldman`
-//! with `culprit()` set, and the run is dead — the same hard error the lockstep
-//! driver has. GJKR's recovery branch (reconstructing that dealer's polynomial
-//! from the honest shares) is not implemented (SPEC Backlog).
+//! **A cheating QUAL dealer cannot stop the run** (GJKR Fig. 2 step 4). A
+//! complaint opens the disputed share, so every party checks it itself: it
+//! must verify against the dealer's Pedersen commitments and fail its Feldman
+//! ones. Given reliable broadcast, every honest party therefore exposes the
+//! same dealers, reveals its shares of them, and reconstructs the same
+//! polynomials — the ones the dealers committed to before QUAL was fixed. So
+//! withholding or bending the Feldman commitments neither splits the honest
+//! parties (some done, some aborted) nor lets a rushing dealer veto a `Q` it
+//! dislikes. This needs `n >= 2t - 1` (`Config.honestMajority`), which `init`
+//! enforces. What still aborts: fewer than `t` verified shares of an exposed
+//! dealer (impossible with an honest majority) and internal failures; any
+//! error from `advance` leaves the party `.aborted`.
 //!
 //! **Randomness** is caller-supplied and drawn once, in `init`, in the same
 //! order as the lockstep driver (`a_0..a_{t-1}`, then `b_0..b_{t-1}`), so the
@@ -67,9 +82,14 @@ pub const MessageError = wire.MessageError;
 const Ne = types.Ne;
 const Ns = types.Ns;
 
-pub const Phase = enum { new, shares, complaints, defenses, feldman, done, aborted };
+pub const Phase = enum { new, shares, complaints, defenses, feldman, feldman_complaints, reveals, done, aborted };
 
-pub const InitError = error{ InvalidConfig, InvalidIndex } || std.mem.Allocator.Error;
+pub const InitError = error{
+    InvalidConfig,
+    InvalidIndex,
+    /// `n < 2t - 1`: see `Config.honestMajority`.
+    NoHonestMajority,
+} || std.mem.Allocator.Error;
 pub const StartError = error{WrongRound} || commit.CommitError || std.mem.Allocator.Error;
 pub const AdvanceError = error{
     /// `advance` before `start`.
@@ -78,11 +98,12 @@ pub const AdvanceError = error{
     Finished,
     /// The run was aborted earlier.
     Aborted,
-    /// A QUAL dealer never delivered its Feldman commitments.
-    MissingFeldman,
-    /// A QUAL dealer's Feldman commitments do not match the share it dealt us.
-    FeldmanCheckFailed,
-    /// Internal invariant broken (a QUAL dealer with no accepted share).
+    /// Fewer than `t` verified shares of an exposed dealer were revealed, so
+    /// its polynomial cannot be reconstructed (`culprit()` names it). Cannot
+    /// happen while at least `t` parties are honest.
+    ReconstructionFailed,
+    /// Internal invariant broken (a QUAL dealer with no accepted share, a
+    /// reconstruction that misses our own verified share).
     Inconsistent,
 } || core.Error || std.mem.Allocator.Error;
 
@@ -104,8 +125,18 @@ pub const Participant = struct {
     wire_s: []?Scalar,
     wire_sp: []?Scalar,
     accepted: []?Scalar,
+    /// The blinding half `s'` of each accepted share: a Feldman complaint
+    /// and a reveal open the pair, so that the receivers can check it.
+    accepted_sp: []?Scalar,
     present: []bool,
     qualified: []bool,
+
+    // GJKR step 4: QUAL dealers whose Feldman commitments failed or never
+    // came, the shares revealed of them (`revealed[(d - 1) * n + holder - 1]`),
+    // and their reconstructed polynomials (public once reconstructed).
+    exposed: []bool,
+    revealed: []?Scalar,
+    recovered: []?[]Scalar,
 
     // Complaints (ours and received) with parallel defense bookkeeping.
     complaints: std.ArrayList(Complaint) = .empty,
@@ -121,6 +152,7 @@ pub const Participant = struct {
     /// from `random`.
     pub fn init(allocator: std.mem.Allocator, cfg: Config, index: u32, random: std.Random) InitError!Participant {
         if (!cfg.valid()) return error.InvalidConfig;
+        if (!cfg.honestMajority()) return error.NoHonestMajority;
         const t: usize = cfg.t;
         const a = try allocator.alloc(Scalar, t);
         defer {
@@ -149,6 +181,7 @@ pub const Participant = struct {
         b_in: []const Scalar,
     ) InitError!Participant {
         if (!cfg.valid()) return error.InvalidConfig;
+        if (!cfg.honestMajority()) return error.NoHonestMajority;
         if (index < 1 or index > cfg.n) return error.InvalidIndex;
         if (a_in.len != cfg.t or b_in.len != cfg.t) return error.InvalidConfig;
         const n: usize = cfg.n;
@@ -173,10 +206,18 @@ pub const Participant = struct {
         @memset(wire_sp, null);
         const accepted = try aa.alloc(?Scalar, n);
         @memset(accepted, null);
+        const accepted_sp = try aa.alloc(?Scalar, n);
+        @memset(accepted_sp, null);
         const present = try aa.alloc(bool, n);
         @memset(present, false);
         const qualified = try aa.alloc(bool, n);
         @memset(qualified, false);
+        const exposed = try aa.alloc(bool, n);
+        @memset(exposed, false);
+        const revealed = try aa.alloc(?Scalar, n * n);
+        @memset(revealed, null);
+        const recovered = try aa.alloc(?[]Scalar, n);
+        @memset(recovered, null);
 
         return .{
             .allocator = allocator,
@@ -191,8 +232,12 @@ pub const Participant = struct {
             .wire_s = wire_s,
             .wire_sp = wire_sp,
             .accepted = accepted,
+            .accepted_sp = accepted_sp,
             .present = present,
             .qualified = qualified,
+            .exposed = exposed,
+            .revealed = revealed,
+            .recovered = recovered,
         };
     }
 
@@ -206,6 +251,7 @@ pub const Participant = struct {
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.wire_s));
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.wire_sp));
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.accepted));
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.accepted_sp));
         if (self.result) |*r| r.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -232,7 +278,16 @@ pub const Participant = struct {
     /// `.feldman` phase on).
     pub fn qual(self: *const Participant) ?[]const bool {
         return switch (self.phase_) {
-            .feldman, .done => self.qualified,
+            .feldman, .feldman_complaints, .reveals, .done => self.qualified,
+            else => null,
+        };
+    }
+
+    /// The QUAL dealers whose polynomial was reconstructed in public, as an
+    /// `exposed[id - 1]` slice, once that is decided (from `.reveals` on).
+    pub fn exposedDealers(self: *const Participant) ?[]const bool {
+        return switch (self.phase_) {
+            .reveals, .done => self.exposed,
             else => null,
         };
     }
@@ -249,9 +304,10 @@ pub const Participant = struct {
         return self.group_commitments;
     }
 
-    /// True when every message this phase waits for has arrived. Only knowable
-    /// in `.shares` and `.feldman`; the complaint and defense rounds end by
-    /// deadline, so this is always false there.
+    /// True when every message this phase waits for has arrived. Knowable in
+    /// `.shares` and `.feldman`, and in `.reveals`, where it means "`t`
+    /// verified shares of every exposed dealer are in"; the complaint, defense
+    /// and Feldman-complaint rounds end by deadline, so it is false there.
     pub fn allReceived(self: *const Participant) bool {
         const n: u32 = self.cfg.n;
         switch (self.phase_) {
@@ -268,6 +324,12 @@ pub const Participant = struct {
                 while (d <= n) : (d += 1) {
                     if (d == self.me or !self.qualified[d - 1]) continue;
                     if (self.fel[d - 1] == null) return false;
+                }
+                return true;
+            },
+            .reveals => {
+                for (0..self.cfg.n) |d| {
+                    if (self.exposed[d] and self.revealedCount(d) < self.cfg.t) return false;
                 }
                 return true;
             },
@@ -311,6 +373,8 @@ pub const Participant = struct {
                 .s = commit.evalPoly(self.a, x),
                 .s_prime = commit.evalPoly(self.b, x),
             };
+            var sm_wipe = sm;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&sm_wipe));
             var bytes = sm.toBytes();
             defer std.crypto.secureZero(u8, &bytes);
             try self.push(.{ .party = j }, .share, &bytes);
@@ -351,22 +415,39 @@ pub const Participant = struct {
                 try self.expect(.feldman);
                 return self.onFeldman(from, body);
             },
+            .feldman_complaint => {
+                try self.expect(.feldman_complaints);
+                return self.onFeldmanComplaint(from, body);
+            },
+            .reveal => {
+                try self.expect(.reveals);
+                return self.onReveal(from, body);
+            },
             .reshare_broadcast, .reshare_share, .reshare_complaint, .reshare_defense => return error.UnknownKind,
         }
     }
 
     /// Close the current round (all expected frames are in, or the deadline
     /// passed) and move to the next; queues that round's outgoing frames.
+    /// Any error from a round transition leaves the party `.aborted`: a
+    /// half-done transition (say, an allocation failure midway) is never
+    /// retried, so it cannot queue a frame twice.
     pub fn advance(self: *Participant) AdvanceError!void {
-        switch (self.phase_) {
+        const r = switch (self.phase_) {
             .new => return error.WrongRound,
-            .shares => return self.advanceShares(),
-            .complaints => return self.advanceComplaints(),
-            .defenses => return self.advanceDefenses(),
-            .feldman => return self.advanceFeldman(),
+            .shares => self.advanceShares(),
+            .complaints => self.advanceComplaints(),
+            .defenses => self.advanceDefenses(),
+            .feldman => self.advanceFeldman(),
+            .feldman_complaints => self.advanceFeldmanComplaints(),
+            .reveals => self.advanceReveals(),
             .done => return error.Finished,
             .aborted => return error.Aborted,
-        }
+        };
+        r catch |e| {
+            self.phase_ = .aborted;
+            return e;
+        };
     }
 
     // ── message handlers ─────────────────────────────────────────────────
@@ -401,7 +482,8 @@ pub const Participant = struct {
         if (readId(body, 0) != from) return error.SenderMismatch;
         if (readId(body, 4) != self.me) return error.WrongRecipient;
         if (self.wire_s[from - 1] != null) return error.DuplicateMessage;
-        const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
+        var m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
         self.wire_s[from - 1] = m.s;
         self.wire_sp[from - 1] = m.s_prime;
     }
@@ -443,13 +525,60 @@ pub const Participant = struct {
         self.defense_valid.items[k] = ok;
         // A defense opens the disputed share in public: if it was ours, that
         // opening replaces the bad wire share.
-        if (ok and complainant == self.me) self.accepted[from - 1] = m.s;
+        if (ok and complainant == self.me) {
+            self.accepted[from - 1] = m.s;
+            self.accepted_sp[from - 1] = m.s_prime;
+        }
     }
 
     fn onFeldman(self: *Participant, from: u32, body: []const u8) MessageError!void {
         if (!self.qualified[from - 1]) return error.Unsolicited;
         if (self.fel[from - 1] != null) return error.DuplicateMessage;
         self.fel[from - 1] = try self.parseCommitments(from, body);
+    }
+
+    /// A Feldman complaint opens the complainant's share of the accused
+    /// dealer. It is valid when that share verifies against the dealer's
+    /// Pedersen commitments (so it is the committed share) and not against
+    /// its Feldman ones, or those never came; then the dealer is exposed.
+    /// Every party checks this itself, so nobody can expose an honest dealer.
+    fn onFeldmanComplaint(self: *Participant, from: u32, body: []const u8) MessageError!void {
+        if (body.len != types.ShareMsg.encoded_length) return error.Malformed;
+        if (readId(body, 4) != from) return error.SenderMismatch;
+        const accused = readId(body, 0);
+        if (accused < 1 or accused > self.cfg.n or accused == from) return error.Malformed;
+        if (!self.qualified[accused - 1]) return error.Unsolicited;
+        const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
+        const ped = self.ped[accused - 1] orelse return error.Unsolicited;
+        if (!core.verifyPedersenShare(ped, from, m.s, m.s_prime, self.h)) return error.Unverified;
+        if (self.fel[accused - 1]) |fel| {
+            if (core.verifyFeldmanShare(fel, from, m.s)) return error.Unverified;
+        }
+        self.exposed[accused - 1] = true;
+    }
+
+    /// A reveal: the sender's share of an exposed dealer, kept only if it is
+    /// the committed one.
+    fn onReveal(self: *Participant, from: u32, body: []const u8) MessageError!void {
+        if (body.len != types.ShareMsg.encoded_length) return error.Malformed;
+        if (readId(body, 4) != from) return error.SenderMismatch;
+        const dealer = readId(body, 0);
+        if (dealer < 1 or dealer > self.cfg.n) return error.Malformed;
+        if (!self.exposed[dealer - 1]) return error.Unsolicited;
+        const slot = &self.revealed[(dealer - 1) * @as(usize, self.cfg.n) + (from - 1)];
+        if (slot.* != null) return error.DuplicateMessage;
+        const m = types.ShareMsg.fromBytes(body[0..types.ShareMsg.encoded_length].*) catch return error.Malformed;
+        if (!core.verifyPedersenShare(self.ped[dealer - 1].?, from, m.s, m.s_prime, self.h)) return error.Unverified;
+        slot.* = m.s;
+    }
+
+    fn revealedCount(self: *const Participant, d: usize) usize {
+        const n: usize = self.cfg.n;
+        var k: usize = 0;
+        for (self.revealed[d * n ..][0..n]) |r| {
+            if (r != null) k += 1;
+        }
+        return k;
     }
 
     // ── round transitions ────────────────────────────────────────────────
@@ -476,6 +605,7 @@ pub const Participant = struct {
                 false;
             if (ok) {
                 self.accepted[di] = self.wire_s[di];
+                self.accepted_sp[di] = self.wire_sp[di];
             } else {
                 const c: Complaint = .{ .complainant = self.me, .accused = d };
                 try self.addComplaint(c);
@@ -531,43 +661,135 @@ pub const Participant = struct {
         self.phase_ = .feldman;
     }
 
+    /// Extraction check (GJKR step 4(b)): every QUAL dealer's accepted share
+    /// against its Feldman commitments. A dealer whose broadcast never came is
+    /// exposed outright (reliable broadcast: everybody saw it missing); one
+    /// whose commitments fail our share gets a public complaint that opens
+    /// the share.
     fn advanceFeldman(self: *Participant) AdvanceError!void {
-        const n: usize = self.cfg.n;
-        const aa = self.arena.allocator();
-        // Extraction check: every QUAL dealer's accepted share against its
-        // Feldman commitments.
-        for (0..n) |d| {
-            if (!self.qualified[d]) continue;
-            const did: u32 = @intCast(d + 1);
-            const fel = self.fel[d] orelse return self.abort(did, error.MissingFeldman);
-            if (!core.verifyFeldmanShare(fel, self.me, self.accepted[d].?)) {
-                return self.abort(did, error.FeldmanCheckFailed);
-            }
+        for (0..self.cfg.n) |d| {
+            if (!self.qualified[d] or d == self.me - 1) continue;
+            const fel = self.fel[d] orelse {
+                self.exposed[d] = true;
+                continue;
+            };
+            const s = self.accepted[d] orelse return self.abort(@intCast(d + 1), error.Inconsistent);
+            if (core.verifyFeldmanShare(fel, self.me, s)) continue;
+            self.exposed[d] = true;
+            var sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = s, .s_prime = self.accepted_sp[d].? };
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&sm));
+            var bytes = sm.toBytes();
+            defer std.crypto.secureZero(u8, &bytes);
+            try self.push(.broadcast, .feldman_complaint, &bytes);
         }
+        self.phase_ = .feldman_complaints;
+    }
 
-        const filler = self.fel[self.me - 1].?[0];
-        const a0 = try aa.alloc(Element, n);
-        const received = try aa.alloc(?Scalar, n);
+    /// GJKR step 4(c), first half: if any dealer is exposed, reveal our
+    /// share of it so that everybody can reconstruct its polynomial.
+    fn advanceFeldmanComplaints(self: *Participant) AdvanceError!void {
+        const n: usize = self.cfg.n;
+        var any = false;
+        for (0..n) |d| any = any or self.exposed[d];
+        if (!any) return self.finish();
+        // An honest dealer's commitments are consistent, so no valid
+        // complaint can name us; if one did, our own state is broken.
+        if (self.exposed[self.me - 1]) return self.abort(self.me, error.Inconsistent);
         for (0..n) |d| {
-            a0[d] = if (self.qualified[d]) self.fel[d].?[0] else filler;
-            received[d] = if (self.qualified[d]) self.accepted[d] else null;
+            if (!self.exposed[d]) continue;
+            const s = self.accepted[d].?;
+            self.revealed[d * n + (self.me - 1)] = s;
+            const sm: types.ShareMsg = .{ .dealer = @intCast(d + 1), .receiver = self.me, .s = s, .s_prime = self.accepted_sp[d].? };
+            const bytes = sm.toBytes();
+            try self.push(.broadcast, .reveal, &bytes);
         }
-        const q = try core.deriveGroupPublicKey(self.qualified, a0);
+        self.phase_ = .reveals;
+    }
+
+    /// GJKR step 4(c), second half: each exposed dealer's polynomial from `t`
+    /// revealed shares. Every revealed share passed the Pedersen check, so it
+    /// lies on the polynomial the dealer committed to before QUAL was fixed
+    /// (binding), whichever `t` are used.
+    fn advanceReveals(self: *Participant) AdvanceError!void {
+        const n: usize = self.cfg.n;
+        const t: usize = self.cfg.t;
+        const aa = self.arena.allocator();
+        for (0..n) |d| {
+            if (!self.exposed[d]) continue;
+            const xs = try aa.alloc(u32, t);
+            const ys = try aa.alloc(Scalar, t);
+            var k: usize = 0;
+            for (self.revealed[d * n ..][0..n], 0..) |r, holder| {
+                if (k == t) break;
+                const s = r orelse continue;
+                xs[k] = @intCast(holder + 1);
+                ys[k] = s;
+                k += 1;
+            }
+            if (k < t) return self.abort(@intCast(d + 1), error.ReconstructionFailed);
+            const coeffs = try interpolate(aa, xs, ys);
+            if (!commit.evalPoly(coeffs, commit.scalarFromIndex(self.me)).equivalent(self.accepted[d].?)) {
+                return self.abort(@intCast(d + 1), error.Inconsistent);
+            }
+            self.recovered[d] = coeffs;
+        }
+        return self.finish();
+    }
+
+    /// `A_dk` of QUAL dealer `d` as a point, or null for the identity (a
+    /// reconstructed coefficient of zero — a cheating dealer may pick one,
+    /// and the identity cannot travel as an `Element`).
+    fn dealerCommitment(self: *const Participant, d: usize, k: usize) AdvanceError!?commit.Secp256k1 {
+        if (self.recovered[d]) |coeffs| {
+            if (coeffs[k].isZero()) return null;
+            return commit.Secp256k1.basePoint.mul(coeffs[k].toBytes(.big), .big) catch return error.IdentityElement;
+        }
+        return try self.fel[d].?[k].point();
+    }
+
+    /// Q, x_j and `F_k = Σ_{i∈QUAL} A_ik`, over the broadcast commitments
+    /// and, for exposed dealers, the reconstructed ones.
+    fn finish(self: *Participant) AdvanceError!void {
+        const n: usize = self.cfg.n;
+        const t: usize = self.cfg.t;
+        const aa = self.arena.allocator();
+
+        // `core.deriveGroupPublicKey` sums `A_i0` over a mask; a dealer whose
+        // reconstructed constant term is zero contributes the identity, so it
+        // leaves the mask (Q is unchanged by it).
+        const q_mask = try aa.alloc(bool, n);
+        const a0 = try aa.alloc(Element, n);
+        var filler: ?Element = null;
+        for (0..n) |d| {
+            q_mask[d] = false;
+            if (!self.qualified[d]) continue;
+            const p = try self.dealerCommitment(d, 0) orelse continue;
+            a0[d] = try Element.fromPoint(p);
+            q_mask[d] = true;
+            filler = filler orelse a0[d];
+        }
+        const fill = filler orelse return error.IdentityElement;
+        for (0..n) |d| {
+            if (!q_mask[d]) a0[d] = fill;
+        }
+        const q = try core.deriveGroupPublicKey(q_mask, a0);
+
+        const received = try aa.alloc(?Scalar, n);
+        defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(received));
+        for (0..n) |d| received[d] = if (self.qualified[d]) self.accepted[d] else null;
         var x_j = try core.combineKeyShare(self.qualified, received);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&x_j));
         const xg = commit.Secp256k1.basePoint.mul(x_j.toBytes(.big), .big) catch return error.IdentityElement;
 
-        // F_k = Σ_{i∈QUAL} A_ik.
-        const t: usize = self.cfg.t;
         const fk = try aa.alloc(Element, t);
         for (0..t) |k| {
             var acc: ?commit.Secp256k1 = null;
             for (0..n) |d| {
                 if (!self.qualified[d]) continue;
-                const p = try self.fel[d].?[k].point();
+                const p = try self.dealerCommitment(d, k) orelse continue;
                 acc = if (acc) |cur| cur.add(p) else p;
             }
-            fk[k] = try Element.fromPoint(acc.?);
+            fk[k] = try Element.fromPoint(acc orelse return error.IdentityElement);
         }
         self.group_commitments = fk;
         self.result = .{
@@ -580,6 +802,39 @@ pub const Participant = struct {
     }
 };
 
+/// The coefficients of the polynomial of degree `< xs.len` through the
+/// points `(xs[i], ys[i])`: Lagrange's formula expanded into coefficient form,
+/// `Σ_i y_i · Π_{m≠i} (X − x_m) / (x_i − x_m)`. `xs` must be distinct and
+/// non-zero (party ids). Used on PUBLIC values only (the shares of an exposed
+/// dealer, already broadcast), so it need not be constant-time.
+fn interpolate(allocator: std.mem.Allocator, xs: []const u32, ys: []const Scalar) std.mem.Allocator.Error![]Scalar {
+    const t = xs.len;
+    const out = try allocator.alloc(Scalar, t);
+    @memset(out, Scalar.zero);
+    const basis = try allocator.alloc(Scalar, t);
+    defer allocator.free(basis);
+    for (0..t) |i| {
+        // basis = Π_{m≠i} (X − x_m), one factor at a time.
+        @memset(basis, Scalar.zero);
+        basis[0] = Scalar.one;
+        var deg: usize = 0;
+        var den = Scalar.one;
+        const xi = commit.scalarFromIndex(xs[i]);
+        for (0..t) |m| {
+            if (m == i) continue;
+            const xm = commit.scalarFromIndex(xs[m]);
+            var k = deg + 1;
+            while (k > 0) : (k -= 1) basis[k] = basis[k - 1].sub(xm.mul(basis[k]));
+            basis[0] = Scalar.zero.sub(xm.mul(basis[0]));
+            deg += 1;
+            den = den.mul(xi.sub(xm));
+        }
+        const scale = ys[i].mul(den.invert());
+        for (0..t) |k| out[k] = out[k].add(basis[k].mul(scale));
+    }
+    return out;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -590,16 +845,15 @@ const TestNet = tn.TestNet;
 const Action = tn.Action;
 const freeOutputs = tn.freeOutputs;
 
-test "per-participant run reproduces the lockstep driver for the same randomness (n in 2,3,5,7)" {
+test "per-participant run reproduces the lockstep driver for the same randomness (n in 2..7)" {
     const allocator = testing.allocator;
     const cases = [_]Config{
         .{ .t = 1, .n = 2 },
-        .{ .t = 2, .n = 2 },
         .{ .t = 2, .n = 3 },
-        .{ .t = 3, .n = 3 },
+        .{ .t = 2, .n = 4 },
         .{ .t = 2, .n = 5 },
         .{ .t = 3, .n = 5 },
-        .{ .t = 5, .n = 5 },
+        .{ .t = 3, .n = 6 },
         .{ .t = 3, .n = 7 },
         .{ .t = 4, .n = 7 },
     };
@@ -713,42 +967,62 @@ test "a crashed party (never broadcasts) is treated as absent and excluded" {
     try testing.expect(try checks.reconstructsToQ(allocator, outs[0..2]));
 }
 
-fn tamperFeldman2to1(from: u32, to: u32, bytes: []u8) Action {
-    if (from == 2 and to == 1 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) {
-        // Replace commitment 1 by commitment 0: a valid point, the wrong one.
+/// Dealer 2's Feldman broadcast with commitment 1 replaced by commitment 0:
+/// valid points, the wrong ones, and the SAME bytes for every receiver (the
+/// reliable broadcast GJKR assumes; a cheating dealer cannot do better).
+fn tamperFeldmanOf2(from: u32, _: u32, bytes: []u8) Action {
+    if (from == 2 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) {
         @memcpy(bytes[1 + 8 + Ne ..][0..Ne], bytes[1 + 8 ..][0..Ne]);
     }
     return .deliver;
 }
 
-test "a QUAL dealer whose Feldman commitments do not match its share aborts the run, naming it" {
+/// Outputs of a clean run for `cfg` and `seed` (caller frees).
+fn cleanOutputs(allocator: std.mem.Allocator, cfg: Config, seed: u64) ![]DkgShareOutput {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    try net.run();
+    return net.outputs();
+}
+
+fn expectSameOutputs(want: []const DkgShareOutput, got: []const DkgShareOutput) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualSlices(u8, &w.toBytes(), &g.toBytes());
+}
+
+test "a QUAL dealer whose Feldman commitments are wrong is exposed and reconstructed: same key as a clean run" {
     const allocator = testing.allocator;
     const cfg: Config = .{ .t = 2, .n = 3 };
+    const clean = try cleanOutputs(allocator, cfg, 17);
+    defer freeOutputs(allocator, clean);
+
     var prng = std.Random.DefaultPrng.init(17);
     var net = try TestNet.init(allocator, cfg, prng.random());
     defer net.deinit();
-    net.filter = tamperFeldman2to1;
-    try net.startAll();
-    for (0..3) |_| {
-        try net.deliverAll();
-        try net.advanceAll();
+    net.filter = tamperFeldmanOf2;
+    try net.run();
+    for (net.parties) |*p| try testing.expectEqual(Phase.done, p.phase());
+    const outs = try net.outputs();
+    defer freeOutputs(allocator, outs);
+    // The reconstructed polynomial is the one dealer 2 committed to.
+    try expectSameOutputs(clean, outs);
+    for ([_]usize{ 0, 2 }) |i| {
+        const ex = net.parties[i].exposedDealers().?;
+        try testing.expect(!ex[0] and ex[1] and !ex[2]);
     }
-    try net.deliverAll();
-    try testing.expectError(error.FeldmanCheckFailed, net.parties[0].advance());
-    try testing.expectEqual(@as(?u32, 2), net.parties[0].culprit());
-    try testing.expectEqual(Phase.aborted, net.parties[0].phase());
-    try testing.expectError(error.Aborted, net.parties[0].handle(2, &.{@intFromEnum(wire.Kind.complaint)}));
-    try testing.expectError(error.Aborted, net.parties[0].advance());
-    // The other parties were not lied to and finish.
-    try net.parties[1].advance();
-    try net.parties[2].advance();
-    try testing.expectEqual(Phase.done, net.parties[1].phase());
-    try testing.expect(net.parties[0].output() == null);
+    try testing.expect(try checks.reconstructsToQ(allocator, outs[0..2]));
 }
 
-test "a QUAL dealer that never sends its Feldman commitments aborts the run (MissingFeldman)" {
+test "a QUAL dealer that withholds its Feldman commitments is reconstructed, not a veto" {
+    // GJKR's point: a rushing dealer that dislikes the Q it sees coming
+    // cannot stop the run by staying silent — before, MissingFeldman aborted
+    // it and a restart gave the dealer a fresh draw.
     const allocator = testing.allocator;
     const cfg: Config = .{ .t = 2, .n = 3 };
+    const clean = try cleanOutputs(allocator, cfg, 19);
+    defer freeOutputs(allocator, clean);
+
     var prng = std.Random.DefaultPrng.init(19);
     var net = try TestNet.init(allocator, cfg, prng.random());
     defer net.deinit();
@@ -758,14 +1032,125 @@ test "a QUAL dealer that never sends its Feldman commitments aborts the run (Mis
         }
     }.f;
     try net.startAll();
-    for (0..3) |_| {
+    for (0..5) |_| {
         try net.deliverAll();
         try net.advanceAll();
     }
+    // Parties 1 and 2 exposed the silent dealer and reveal; dealer 3 itself
+    // saw nothing missing and is done.
+    try testing.expectEqual(Phase.reveals, net.parties[0].phase());
+    try testing.expectEqual(Phase.done, net.parties[2].phase());
+    try net.finish();
+    for (net.parties) |*p| try testing.expectEqual(Phase.done, p.phase());
+    const outs = try net.outputs();
+    defer freeOutputs(allocator, outs);
+    try expectSameOutputs(clean, outs);
+}
+
+/// For the next test: dealer 5's Feldman vector, bent to agree with its true
+/// shares at parties 1 and 2 only (set before the run).
+var bent_feldman: [1 + 8 + 3 * Ne]u8 = undefined;
+
+test "a dealer cannot make some honest parties finish with a wrong key while the others abort (review F1)" {
+    // n = 5, t = 3. Dealer 5 broadcasts — identically to everyone — Feldman
+    // commitments of a polynomial g with g(1) = f(1), g(2) = f(2) but a
+    // constant term of its choosing. Parties 1 and 2 see their shares check
+    // out; 3 and 4 do not. With a local abort, 1 and 2 finished with a Q
+    // nobody can sign for while 3 and 4 aborted, and neither half knew. Now 3
+    // and 4 complain in public, everybody exposes dealer 5, and the run ends
+    // with the key dealer 5 committed to.
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 3, .n = 5 };
+    const clean = try cleanOutputs(allocator, cfg, 41);
+    defer freeOutputs(allocator, clean);
+
+    var prng = std.Random.DefaultPrng.init(41);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    {
+        const f = net.parties[4].a;
+        const xs = [_]u32{ 0, 1, 2 };
+        const ys = [_]Scalar{ commit.scalarFromIndex(7777), commit.evalPoly(f, commit.scalarFromIndex(1)), commit.evalPoly(f, commit.scalarFromIndex(2)) };
+        const g = try interpolate(allocator, &xs, &ys);
+        defer allocator.free(g);
+        const vec = try commit.feldmanCommitVector(allocator, g);
+        defer allocator.free(vec);
+        const body = try (types.FeldmanBroadcast{ .dealer = 5, .commitments = vec }).toBytesAlloc(allocator);
+        defer allocator.free(body);
+        bent_feldman[0] = @intFromEnum(wire.Kind.feldman_broadcast);
+        @memcpy(bent_feldman[1..], body);
+    }
+    net.filter = struct {
+        fn f(from: u32, _: u32, bytes: []u8) Action {
+            if (from == 5 and bytes[0] == @intFromEnum(wire.Kind.feldman_broadcast)) @memcpy(bytes, &bent_feldman);
+            return .deliver;
+        }
+    }.f;
+    try net.run();
+    for (net.parties) |*p| try testing.expectEqual(Phase.done, p.phase());
+    const outs = try net.outputs();
+    defer freeOutputs(allocator, outs);
+    try expectSameOutputs(clean, outs);
+    // Parties 1 and 2 were satisfied themselves and exposed dealer 5 on the
+    // others' complaints.
+    for (net.parties[0..4]) |*p| try testing.expect(p.exposedDealers().?[4]);
+}
+
+test "Feldman complaints and reveals that do not verify are refused" {
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 3 };
+    var prng = std.Random.DefaultPrng.init(43);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    try net.startAll();
+    for (0..4) |_| {
+        try net.deliverAll();
+        try net.advanceAll();
+    }
+    const p1 = &net.parties[0];
+    const p2 = &net.parties[1];
+    try testing.expectEqual(Phase.feldman_complaints, p1.phase());
+
+    // Party 2 "complains" about honest dealer 3 with its true share: the
+    // Feldman check passes, so the complaint is refused and exposes nobody.
+    var m: types.ShareMsg = .{ .dealer = 3, .receiver = 2, .s = p2.accepted[2].?, .s_prime = p2.accepted_sp[2].? };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @intFromEnum(wire.Kind.feldman_complaint);
+    @memcpy(fr[1..], &m.toBytes());
+    try testing.expectError(error.Unverified, p1.handle(2, &fr));
+    // ... and with a share that is not the committed one: Pedersen fails.
+    m.s = m.s.add(Scalar.one);
+    @memcpy(fr[1..], &m.toBytes());
+    try testing.expectError(error.Unverified, p1.handle(2, &fr));
+    // Framing: a complainant that is not the sender, self-accusation, an
+    // accused outside the run.
+    try testing.expectError(error.SenderMismatch, p1.handle(3, &fr));
+    std.mem.writeInt(u32, fr[1..][0..4], 2, .big);
+    try testing.expectError(error.Malformed, p1.handle(2, &fr));
+    std.mem.writeInt(u32, fr[1..][0..4], 9, .big);
+    try testing.expectError(error.Malformed, p1.handle(2, &fr));
+    try testing.expectError(error.Malformed, p1.handle(2, fr[0 .. fr.len - 1]));
+    // A reveal belongs to the next round.
+    fr[0] = @intFromEnum(wire.Kind.reveal);
+    try testing.expectError(error.WrongRound, p1.handle(2, &fr));
+
+    // Nobody was exposed: the run finishes without a reveal round.
     try net.deliverAll();
-    try testing.expect(!net.parties[0].allReceived());
-    try testing.expectError(error.MissingFeldman, net.parties[0].advance());
-    try testing.expectEqual(@as(?u32, 3), net.parties[0].culprit());
+    try net.advanceAll();
+    for (net.parties) |*p| try testing.expectEqual(Phase.done, p.phase());
+}
+
+test "the DKG refuses n < 2t - 1: without an honest majority one dealer could choose Q" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(47);
+    for ([_]Config{ .{ .t = 2, .n = 2 }, .{ .t = 3, .n = 4 }, .{ .t = 5, .n = 5 }, .{ .t = 4, .n = 6 } }) |cfg| {
+        try testing.expect(!cfg.honestMajority());
+        try testing.expectError(error.NoHonestMajority, Participant.init(allocator, cfg, 1, prng.random()));
+        try testing.expectError(error.NoHonestMajority, protocol.Dkg.run(allocator, cfg, .{}, prng.random()));
+    }
+    for ([_]Config{ .{ .t = 1, .n = 1 }, .{ .t = 2, .n = 3 }, .{ .t = 3, .n = 5 }, .{ .t = 4, .n = 7 } }) |cfg| {
+        try testing.expect(cfg.honestMajority());
+    }
 }
 
 /// Two parties of a 2-of-3 run, driven by hand to the point where party 1 holds
@@ -1000,6 +1385,10 @@ test "replaying the recorded transcript (secrets revealed) reproduces the oracle
     }
     try net.deliverAll();
     try net.advanceAll();
+    // The Feldman-complaint round: nothing to complain about.
+    for (parties) |*p| try testing.expectEqual(@as(usize, 0), p.outbox.items.len);
+    try net.deliverAll();
+    try net.advanceAll();
     try testing.expectEqual(@as(usize, 0), net.refused);
 
     for (parties, tr.outputs) |*p, o| {
@@ -1019,12 +1408,22 @@ fn tamperShare2to3(from: u32, to: u32, bytes: []u8) Action {
 }
 
 /// A 3-party 2-of-3 run, party 2's share to party 3 corrupted (so a complaint
-/// and a defense exist), brought to phase `steps` (0 = just started, 4 = done).
+/// and a defense exist) and its Feldman commitments bent (so it is exposed and
+/// rebuilt), brought to phase `steps` (0 = just started, 5 = party 1 in
+/// `.reveals`, 6 = done).
 fn buildFuzzNet(allocator: std.mem.Allocator, steps: usize) !TestNet {
     var prng = std.Random.DefaultPrng.init(0xF033);
     var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
     errdefer net.deinit();
-    net.filter = tamperShare2to3;
+    // A defended bad share AND bent Feldman commitments from dealer 2, so the
+    // world passes through every round, the reveal round included (party 1
+    // is in `.reveals` after five steps).
+    net.filter = struct {
+        fn f(from: u32, to: u32, bytes: []u8) Action {
+            _ = tamperShare2to3(from, to, bytes);
+            return tamperFeldmanOf2(from, to, bytes);
+        }
+    }.f;
     try net.startAll();
     for (0..steps) |_| {
         try net.deliverAll();
@@ -1038,7 +1437,7 @@ fn fuzzParticipantHandle(_: void, smith: *std.testing.Smith) !void {
     // ⚠ `slice` first, ranged draws after: see modules/testkit/src/fuzz.zig.
     const len: usize = smith.slice(&buf);
     const from: u32 = @intCast(smith.value(u64) % 5);
-    const steps: usize = @intCast(smith.value(u64) % 5);
+    const steps: usize = @intCast(smith.value(u64) % 7);
     var net = try buildFuzzNet(testing.allocator, steps);
     defer net.deinit();
     net.parties[0].handle(from, buf[0..len]) catch {};
@@ -1060,9 +1459,12 @@ test "fuzz: Participant.handle never panics, in any round" {
     const aa = arena.allocator();
     var seeds: std.ArrayList([]const u8) = .empty;
     // Real frames, captured per round from the same deterministic run.
-    for (0..5) |steps| {
+    for (0..7) |steps| {
         var net = try buildFuzzNet(testing.allocator, steps);
         defer net.deinit();
+        // The world really reaches the reveal round and finishes.
+        if (steps == 5) try testing.expectEqual(Phase.reveals, net.parties[0].phase());
+        if (steps == 6) try testing.expectEqual(Phase.done, net.parties[0].phase());
         for (net.parties[1..]) |*p| for (p.outbox.items) |m| {
             switch (m.to) {
                 .party => |j| if (j != 1) continue,
