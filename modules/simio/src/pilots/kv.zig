@@ -247,3 +247,42 @@ test "pilot kv: under bit rot nothing is served that was never written" {
         return error.TestUnexpectedResult;
     }
 }
+
+fn sharedWriter(io: Io, db: *kv.Db, prefix: u8, done: *u32) Io.Cancelable!void {
+    for (0..50) |i| {
+        var key: [8]u8 = undefined;
+        const k = std.fmt.bufPrint(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
+        var vb: [64]u8 = undefined;
+        db.put(k, valueOf(@intCast(i + 1), &vb)) catch return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    done.* += 1;
+}
+
+fn twoWriters(io: Io, gpa: std.mem.Allocator, done: *u32) !void {
+    var fs_store = kv.FsStorage.init(io, Io.Dir.cwd());
+    var db = try kv.Db.open(gpa, fs_store.storage(), "db", .{});
+    defer db.close();
+    var g: Io.Group = .init;
+    g.async(io, sharedWriter, .{ io, &db, 'a', done });
+    g.async(io, sharedWriter, .{ io, &db, 'b', done });
+    try g.await(io);
+    if (db.count() != 100) return error.WrongCount;
+}
+
+test "pilot kv: two tasks of one thread share a Db without starving each other" {
+    // Before kv waited on its lock through the `Io`, the second task spun
+    // forever while the first was suspended in `sync` holding the lock.
+    for (0..20) |seed| {
+        var sim: Sim = undefined;
+        sim.init(testing.allocator, .{ .seed = seed, .stack_size = 512 * 1024 });
+        defer sim.deinit();
+        const h = try sim.addHost(.{});
+        var done: u32 = 0;
+        try h.spawn(twoWriters, .{ h.io(), h.allocator(), &done });
+        const r = sim.runFor(10 * ns_per_s);
+        try testing.expectEqual(sched.Outcome.quiescent, r.outcome);
+        try testing.expectEqual(@as(?anyerror, null), h.failure);
+        try testing.expectEqual(@as(u32, 2), done);
+    }
+}

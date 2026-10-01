@@ -30,11 +30,15 @@
 //! record — v0 trades that (rare, media-level) case for a simple, provable
 //! invariant: **everything reachable after `open` is CRC-valid**.
 //!
-//! **Concurrency (v0):** internally synchronized with one coarse spinlock
-//! (`std.atomic.Mutex` + `spinLoopHint`, the repo-standard io-less lock) —
+//! **Concurrency (v0):** internally synchronized with one coarse lock —
 //! single writer, and reads see a consistent keydir because they take the
-//! same lock. Honest caveat: a writer holds the lock across `fsync`, so a
-//! concurrent thread spin-waits for the duration of a disk flush; this is
+//! same lock. Over a storage with an `Io` (`FsStorage`) it is a
+//! `std.Io.Mutex`, so a waiting task yields to the `Io` (required under an
+//! `Io` that runs several tasks on one thread: a spinning waiter would starve
+//! a holder suspended in `fsync` forever); over an io-less storage it is a
+//! spinlock (`std.atomic.Mutex` + `spinLoopHint`). Honest caveat: a writer
+//! holds the lock across `fsync`, so a concurrent caller waits for the
+//! duration of a disk flush (with the spinlock: spins through it); this is
 //! fine for the intended embedded/low-contention use, and lockless MVCC
 //! readers are an explicitly noted future phase.
 //!
@@ -90,11 +94,23 @@ pub const meta = .{
 pub const SimStorage = @import("sim.zig").SimStorage;
 pub const CrashMode = @import("sim.zig").CrashMode;
 
-/// Spinlock acquire (std SmpAllocator pattern; Zig 0.16 std has no io-less
-/// blocking mutex) — see the module doc for the fsync-hold caveat.
-fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
-}
+/// `Db`'s lock: `std.Io.Mutex` when the storage has an `Io` (see
+/// `Storage.io`), else a spinlock (std SmpAllocator pattern; Zig 0.16 std has
+/// no io-less blocking mutex) — see the module doc for the fsync-hold caveat.
+const Lock = struct {
+    io: ?std.Io,
+    spin: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
+
+    fn acquire(l: *Lock) void {
+        if (l.io) |io| return l.mutex.lockUncancelable(io);
+        while (!l.spin.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn release(l: *Lock) void {
+        if (l.io) |io| l.mutex.unlock(io) else l.spin.unlock();
+    }
+};
 
 // ── on-disk format ───────────────────────────────────────────────────────────
 //
@@ -202,6 +218,13 @@ fn realtimeNowMs(_: ?*anyopaque) i64 {
 pub const Storage = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
+    /// The `std.Io` this backend's calls block in, if it has one
+    /// (`FsStorage` does). A `Db` over it then waits for its lock through
+    /// that `Io` (`std.Io.Mutex`) instead of spinning: under an `Io` that runs
+    /// several tasks on one thread (`std.Io.Evented`, a simulator), a task
+    /// suspended in `sync` while holding the lock would otherwise never run
+    /// again while another task spins on it. Null: the io-less spinlock.
+    io: ?std.Io = null,
 
     /// Backend-scoped open-file token (an index, not an OS fd).
     pub const Handle = u32;
@@ -596,7 +619,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         }
 
         pub fn storage(self: *Self) Storage {
-            return .{ .ctx = self, .vtable = &vtable };
+            return .{ .ctx = self, .vtable = &vtable, .io = self.io };
         }
 
         const vtable = Storage.VTable{
@@ -899,7 +922,7 @@ pub const Db = struct {
     /// reclaim this much).
     dead_bytes: u64,
     poisoned: bool,
-    lock: std.atomic.Mutex,
+    lock: Lock,
     options: Options,
     /// On-disk format version of the open data file: `version_plain` until
     /// the first expiring put upgrades it (see the format comment).
@@ -961,7 +984,7 @@ pub const Db = struct {
             .end = header_len,
             .dead_bytes = 0,
             .poisoned = false,
-            .lock = .unlocked,
+            .lock = .{ .io = store.io },
             .options = options,
             .version = version_plain,
             .expiring = 0,
@@ -1050,8 +1073,8 @@ pub const Db = struct {
     /// cannot promise). On a storage error the store poisons itself.
     /// Overwriting an expiring key removes its expiry.
     pub fn put(self: *Db, key: []const u8, value: []const u8) MutateError!void {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         return self.putLocked(key, value, no_expiry);
     }
 
@@ -1067,8 +1090,8 @@ pub const Db = struct {
     /// refuses the file instead of truncating it at the first expiring
     /// record. Compaction errors are returned as they are from `compact`.
     pub fn putExpiring(self: *Db, key: []const u8, value: []const u8, expires_at_ms: i64) CompactError!void {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
         // `no_expiry` is the keydir's marker, not an instant; a key living to
         // the end of i64 time is a key without expiry.
@@ -1137,8 +1160,8 @@ pub const Db = struct {
     /// anyway: without it, a wall clock stepped back before the expiry would
     /// bring the deleted key back.
     pub fn delete(self: *Db, key: []const u8) MutateError!void {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
         const existing = self.keydir.getPtr(key) orelse return;
 
@@ -1177,8 +1200,8 @@ pub const Db = struct {
     /// yields `error.Corrupt`, never bad bytes. Reads work on a poisoned
     /// store (they describe the last consistent state).
     pub fn get(self: *Db, gpa: Allocator, key: []const u8) GetError!?[]u8 {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         const e = self.liveEntry(key) orelse return null;
 
         const value = try gpa.alloc(u8, e.val_len);
@@ -1196,8 +1219,8 @@ pub const Db = struct {
     ///
     /// Same locking, same `read_verify` CRC check as `get`.
     pub fn getBuf(self: *Db, buf: []u8, key: []const u8) (GetError || error{BufferTooSmall})!?[]u8 {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         const e = self.liveEntry(key) orelse return null;
         if (e.val_len > buf.len) return error.BufferTooSmall;
         const value = buf[0..e.val_len];
@@ -1208,16 +1231,16 @@ pub const Db = struct {
     /// Byte length of `key`'s current value, or null if absent — for sizing a
     /// `getBuf` buffer. Pure in-memory (the keydir holds the length).
     pub fn valueLen(self: *Db, key: []const u8) ?u32 {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         const e = self.liveEntry(key) orelse return null;
         return e.val_len;
     }
 
     /// `key`'s expiry, or null if absent or already expired. Pure in-memory.
     pub fn expiresAt(self: *Db, key: []const u8) ?Expiry {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         const e = self.liveEntry(key) orelse return null;
         return if (e.expires()) .{ .at_ms = e.expires_at } else .never;
     }
@@ -1262,8 +1285,8 @@ pub const Db = struct {
 
     /// Whether `key` currently has a value (pure in-memory check).
     pub fn exists(self: *Db, key: []const u8) bool {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         return self.liveEntry(key) != null;
     }
 
@@ -1271,8 +1294,8 @@ pub const Db = struct {
     /// expiry; otherwise one pass over the keydir, since a key can expire
     /// without any operation touching it.
     pub fn count(self: *Db) usize {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.expiring == 0) return self.keydir.count();
         const now = self.options.clock.now();
         var n: usize = 0;
@@ -1292,8 +1315,8 @@ pub const Db = struct {
             out.deinit(gpa);
         }
         {
-            lockSpin(&self.lock);
-            defer self.lock.unlock();
+            self.lock.acquire();
+            defer self.lock.release();
             const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
             var it = self.keydir.iterator();
             while (it.next()) |kv| {
@@ -1315,8 +1338,8 @@ pub const Db = struct {
     /// expired keys — the caller's signal for when `compact` is worth it (v0
     /// compaction is caller-driven; automatic thresholds are a noted phase).
     pub fn deadBytes(self: *Db) u64 {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.expiring == 0) return self.dead_bytes;
         const now = self.options.clock.now();
         var dead = self.dead_bytes;
@@ -1336,8 +1359,8 @@ pub const Db = struct {
     /// namespace state is uncertain until reopen). Expired keys are left out
     /// of the new file and dropped from memory.
     pub fn compact(self: *Db) CompactError!void {
-        lockSpin(&self.lock);
-        defer self.lock.unlock();
+        self.lock.acquire();
+        defer self.lock.release();
         if (self.poisoned) return error.Poisoned;
         return self.compactLocked(self.version);
     }
@@ -2250,6 +2273,36 @@ test "keys and values are copied; caller buffers may be reused" {
     kbuf = "XXX".*;
     vbuf = "YYYYY".*;
     try expectGet(&db, "key", "value");
+}
+
+test "FsStorage hands its Io to the Db, whose lock then waits through it" {
+    // simio kv pilot finding: a spinlock held across `sync` spins forever
+    // under an `Io` that runs several tasks on one thread. Over `FsStorage`
+    // the lock is an `std.Io.Mutex`; two concurrent tasks still serialize.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    try testing.expect(fs_store.storage().io != null);
+    var db = try Db.open(testing.allocator, fs_store.storage(), "db", .{});
+    defer db.close();
+    try testing.expect(db.lock.io != null);
+
+    const Worker = struct {
+        fn run(d: *Db, prefix: u8) void {
+            for (0..40) |i| {
+                var key: [8]u8 = undefined;
+                const k = std.fmt.bufPrint(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
+                d.put(k, "v") catch unreachable;
+            }
+        }
+    };
+    var a = try testing.io.concurrent(Worker.run, .{ &db, 'a' });
+    var b = try testing.io.concurrent(Worker.run, .{ &db, 'b' });
+    a.await(testing.io);
+    b.await(testing.io);
+    try testing.expectEqual(@as(usize, 80), db.count());
+    try expectGet(&db, "a-39", "v");
+    try expectGet(&db, "b-0", "v");
 }
 
 test "concurrent puts from two threads (coarse lock smoke test)" {

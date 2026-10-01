@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Fix: `Db` no longer spins on its lock under a fiber/evented `Io`.**
+  A task suspended in `sync` while holding the spinlock was starved forever by a second task
+  of the same thread spinning on it (found by the simio kv pilot). `Storage` gained
+  `io: ?std.Io = null`, set by `FsStorage.storage()`; `Db` then locks with `std.Io.Mutex`.
+  Io-less storages keep the spinlock. Additive: existing `Storage` literals still compile.
 - **2026-09-30** — Key listing and per-key expiry (maturity task C9). `Db.keys(gpa, prefix)`:
   sorted copies of the live keys under a prefix (new `KeyList`). `Db.putExpiring(key, value,
   expires_at_ms)` / `Db.putTtl(key, value, ttl_ms)` / `Db.expiresAt(key) ?Expiry`: an expired key

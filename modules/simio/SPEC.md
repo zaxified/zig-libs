@@ -288,10 +288,9 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   caught losing acknowledged writes. `allocate`/`syncData` turned out to be unused by
   `Db`, so the raw `fallocate`/`fdatasync` were never reached. **Found a defect** once
   disk calls became preemption points (they were instantaneous before, which no real
-  disk is): `Db`'s spinlock, held across `sync`, spins forever when a second task of
-  the same thread calls into the store — recorded in kv's SPEC backlog as a decision
-  (it is the "repo-standard" io-less lock); no test here until it is fixed, since a
-  spinning task never returns to the scheduler.
+  disk is): `Db`'s spinlock, held across `sync`, spun forever when a second task of
+  the same thread called into the store. Fixed in kv (`std.Io.Mutex` when the storage
+  has an `Io`); the pilot's two-task test hangs with the old lock.
 - **http client** (2026-10-01): `Client` (pooling, the stale-connection retry, both
   timeouts) against a small HTTP/1.1 server in the pilot. Twenty fetches over one
   pooled connection; a server that closes behind a keep-alive costs a transparent
