@@ -10,8 +10,7 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `tlsclient` — std'
 - **Why:** a native client instead of shelling `curl` or depending on the
   churny `std.http` (explicit non-dependency). `dns` (DoH), `rdap` and the
   REST cluster (`router` → `ratelimit` → …) sit on this.
-- **Platform:** any (the server's read timeout needs poll(2) and is
-  compile-time disabled elsewhere). **Role:** both.
+- **Platform:** any. **Role:** both.
   **Concurrency:** single-owner handles; the Server runs its own
   per-connection tasks — handlers must be thread-safe if they share state.
   **Deps:** `netaddr`, `tlsclient`, `std.Io.net`.
@@ -493,23 +492,25 @@ failure for a new consumer moving real traffic onto this server. It applies
 to `enable_h2c` requests identically (`Server` forwards the same value into
 the HTTP/2 path), so raising or nulling it once covers both protocols.
 
-**Timeouts** (poll(2)-based; compile-time disabled on platforms without
-poll — then none of these fire):
+**Timeouts** — enforced through `std.Io` alone: every blocking read or write
+arms a deadline, and one reaper task per `serve` shuts down the sockets whose
+deadline passed, at most one tick late (a tenth of the shortest timeout,
+1..100 ms). An `Io` that cannot run that task concurrently serves without
+timeouts:
 
 | Timeout | Default | Bounds |
 |---|---|---|
 | `read_timeout_ms` | 10 s | any single read **stall**: head wait, body wait, keep-alive idle |
 | `request_timeout_ms` | 60 s | one whole request-read cycle — keep-alive idle + head + body, **dribble included** (Go `ReadTimeout` semantics; re-checked at every refill, so slowloris byte-trickling is bounded). Handler compute and response writing are not counted |
-| `write_timeout_ms` | 10 s | any single write **stall** (peer stops reading — slow-read attack); polled before every socket write. A trickle-reading peer restarts the window per write |
+| `write_timeout_ms` | 10 s | any single write **stall** (peer stops reading — slow-read attack); per socket write. A trickle-reading peer restarts the window per write |
 
 0 (or null for the size limits) disables the individual bound.
 
 A **cancelation is not a stall.** Cancel the connection tasks (`Group.cancel`
 on the group `serve` fills, or cancel the task `serve` itself runs on) and
 each connection leaves its read or write wait immediately, rather than
-sitting out the remaining `read_timeout_ms`/`write_timeout_ms` first — the
-`poll(2)` above is not a `std.Io` cancelation point and had to be made to ask
-explicitly. Handing a caller-owned stream to `serveStream` (the BYO-TLS
+sitting out the remaining `read_timeout_ms`/`write_timeout_ms` first: the
+waits are ordinary `std.Io` reads and writes. Handing a caller-owned stream to `serveStream` (the BYO-TLS
 entry) is the exception: there is no fd to consult there, a cancelation
 arrives as `error.ReadFailed`, and recovering the real cause from the
 concrete reader's `err` field belongs to whoever built it. Both entry points

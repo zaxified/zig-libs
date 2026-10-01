@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **Server timeouts are enforced through `std.Io`, not `poll(2)`.** The
+  read/write stall timeouts and the request/connection deadlines used to `poll` the raw socket
+  and read `clock_gettime` before every refill and write: invisible to any `Io` but the OS one
+  (under a simulator the poll saw an invalid descriptor and the server ran with no timeouts at
+  all), and not a cancelation point. Now each blocking read or write arms an atomic deadline and
+  one `Reaper` task per `serve` shuts down the sockets whose deadline passed, at most one tick
+  late (a tenth of the shortest timeout, 1..100 ms). One `poll` syscall per refill and per write
+  is gone; the price is one task per server. An `Io` without concurrency serves without timeouts
+  (it already served such connections inline). New tests: the reaper's sweep (expired vs. not
+  yet), a stalled write, and an integration test for `write_timeout_ms`, which had none. Piloted
+  under simio (`simio/src/pilots/http.zig`). Behavioural edge: a timeout now fires up to one tick
+  later than its nominal value.
 - **2026-09-30** — **h2: a stream's `ResponseWriter` lives in the stream's arena, not on the
   serving task's stack.** `Session.serveJob` built it with `init` (return by value), so its frame
   held the ~6 KB writer (`header_buf` alone is 4 KiB) twice -- the local and the temporary it was

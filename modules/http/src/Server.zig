@@ -34,12 +34,16 @@
 //! unchanged. io_uring is deliberately not used: its net vtable is
 //! `Unavailable` in std 0.16.
 //!
-//! Timeout model (poll(2)-based; compile-time disabled where poll is
-//! unavailable): `read_timeout_ms` bounds every read *stall* (request head,
+//! Timeout model: `read_timeout_ms` bounds every read *stall* (request head,
 //! body, keep-alive idle); `request_timeout_ms` is a whole-request read
 //! deadline (Go ReadTimeout shape: keep-alive idle + head + body share one
 //! budget, so a dribbling client cannot stretch a request forever);
 //! `write_timeout_ms` bounds every write stall (a peer that stops reading).
+//! All of them are enforced through `std.Io` alone: each blocking read or
+//! write arms a deadline, and one `Reaper` task per `serve` shuts down the
+//! sockets whose deadline passed, at most a tick (a tenth of the shortest
+//! timeout, 1..100 ms) late. An `Io` that cannot run that task concurrently
+//! serves without timeouts.
 //!
 //! Hardening (Phase 2.1, ../SPEC.md) — built to face the
 //! internet without a reverse proxy: the handler sees the socket peer
@@ -115,6 +119,8 @@ aux_listeners: []net.Server,
 /// before `serve` returns. In the multicore path each accept thread owns
 /// its own group instead.
 group: std.Io.Group,
+/// Enforces the read/write timeouts of every connection (see `Reaper`).
+reaper: Reaper,
 /// Connections currently admitted and being served (see
 /// `activeConnections`). Atomic: touched by the accept loop and every
 /// connection task.
@@ -428,8 +434,7 @@ pub const Options = struct {
     /// idle period.
     max_h2c_connection_ms: u32 = 4 * std.time.ms_per_hour,
     /// Max time a single write may stall because the peer stopped reading
-    /// (slow-read attack): the socket is polled for writability before
-    /// every write; 0 = no timeout.
+    /// (slow-read attack), per socket write; 0 = no timeout.
     write_timeout_ms: u32 = 10_000,
     /// Per-connection read buffer; also bounds a single request head line.
     read_buffer_size: usize = 16 * 1024,
@@ -621,6 +626,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
         .listener = null,
         .aux_listeners = &.{},
         .group = .init,
+        .reaper = .{ .tick_ms = reaperTickMs(&options) },
         .active_conns = .init(0),
         .last_bind_error = null,
     };
@@ -782,6 +788,18 @@ pub const ServeError = error{ AcceptFailed, Canceled };
 /// `Options.accept_threads` > 1 this fans the accept work out across N
 /// core-pinned threads (see `serveMulti`).
 pub fn serve(s: *Server) ServeError!void {
+    // The timeouts' enforcer outlives every connection: the groups are
+    // awaited before this defer cancels it. An `Io` with no concurrency to
+    // give runs no reaper, and then no timeout applies.
+    var reaper: ?std.Io.Future(std.Io.Cancelable!void) = if (wantsReaper(&s.options))
+        s.io.concurrent(Reaper.run, .{ &s.reaper, s.io }) catch null
+    else
+        null;
+    s.reaper.running = reaper != null;
+    defer if (reaper) |*r| {
+        r.cancel(s.io) catch {};
+        s.reaper.running = false;
+    };
     if (s.aux_listeners.len == 0) {
         defer s.group.await(s.io) catch {};
         return s.acceptLoop(&s.listener.?, &s.group);
@@ -1088,14 +1106,19 @@ fn connMain(s: *Server, stream: net.Stream) void {
     // All read buffering lives in the TimeoutReader (bounds head lines and
     // lets the timeout check see leftover bytes); the stream reader itself
     // is unbuffered. Same shape on the write side: the TimeoutWriter owns
-    // the buffer so every socket write passes its writability poll.
+    // the buffer so every socket write runs under its stall deadline.
     // The wrappers take the concrete socket reader/writer, not just their
     // interfaces: `err` — the only place a cancelation survives — lives on
     // the concrete type.
+    var watch: Watch = .{ .stream = stream };
+    const watched = s.reaper.running;
+    if (watched) s.reaper.add(s.io, &watch);
+    defer if (watched) s.reaper.remove(s.io, &watch);
+    const w: ?*Watch = if (watched) &watch else null;
     var sr = stream.reader(s.io, read_buf[0..0]);
-    var tr: TimeoutReader = .init(&sr, s.io, o.read_timeout_ms, o.request_timeout_ms, read_buf);
+    var tr: TimeoutReader = .init(&sr, s.io, w, o.read_timeout_ms, o.request_timeout_ms, read_buf);
     var sw = stream.writer(s.io, write_buf[0..0]);
-    var tw: TimeoutWriter = .init(&sw, s.io, o.write_timeout_ms, write_buf);
+    var tw: TimeoutWriter = .init(&sw, s.io, w, o.write_timeout_ms, write_buf);
 
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
@@ -1185,37 +1208,113 @@ fn ioEpochSeconds(ctx: ?*anyopaque) i64 {
     return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_s));
 }
 
-const have_poll_timeouts = builtin.os.tag != .windows and std.posix.pollfd != void;
-
-/// Monotonic now in nanoseconds for the whole-request deadline (only
-/// compiled where `have_poll_timeouts`). A clock failure returns 0 —
-/// deadlines then degrade to per-refill budgets instead of failing hard.
-fn monotonicNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+/// Monotonic now (the `Io`'s `.awake` clock) in nanoseconds.
+fn nowNs(io: std.Io) u64 {
+    return @intCast(@max(0, std.Io.Timestamp.now(io, .awake).nanoseconds));
 }
 
-/// Wraps the connection reader: whenever a refill would block, first polls
-/// the socket with the configured stall timeout, clamped to the remaining
-/// whole-request deadline (armed per request by the serving loop); a
-/// stalled peer or an expired deadline becomes `error.ReadFailed` with
-/// `timed_out` set and the connection is dropped. Because the deadline is
-/// re-checked on every refill, a dribbling client (one byte per poll
-/// window) is bounded too — the stall timeout alone cannot do that.
+/// One connection's deadlines, as the server's `Reaper` sees them. Each is
+/// the absolute `.awake` time by which the blocking read (or write) now in
+/// progress must finish; 0 = no such call in progress. Separate for reads
+/// and writes: an h2 dispatcher may do both at once on one connection.
+const Watch = struct {
+    stream: net.Stream,
+    read_deadline_ns: std.atomic.Value(u64) = .init(0),
+    write_deadline_ns: std.atomic.Value(u64) = .init(0),
+    /// Set by the reaper before it shuts the socket down, so the blocked
+    /// call's failure is filed as a timeout and not as a dead peer.
+    read_expired: std.atomic.Value(bool) = .init(false),
+    write_expired: std.atomic.Value(bool) = .init(false),
+    node: std.DoublyLinkedList.Node = .{},
+};
+
+/// The server's timeout enforcer: one task per `serve`, not one per
+/// connection. Every `tick_ms` it shuts down (`Stream.shutdown(.both)`) each
+/// registered connection whose read or write deadline has passed, which ends
+/// the blocked call inside `std.Io`. Timeouts therefore fire up to one tick
+/// late, and the only per-read cost is a clock read and two atomic stores —
+/// where a `poll(2)` before every read used to be, outside `std.Io` and
+/// invisible to any `Io` but the OS one (a simulator, an evented `Io`).
+const Reaper = struct {
+    mutex: std.Io.Mutex = .init,
+    list: std.DoublyLinkedList = .{},
+    tick_ms: u32 = 100,
+    /// The reaper task is running: connections register with it.
+    running: bool = false,
+
+    fn add(r: *Reaper, io: std.Io, w: *Watch) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        r.list.append(&w.node);
+    }
+
+    fn remove(r: *Reaper, io: std.Io, w: *Watch) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        r.list.remove(&w.node);
+    }
+
+    fn run(r: *Reaper, io: std.Io) std.Io.Cancelable!void {
+        while (true) {
+            try sleepMs(io, r.tick_ms);
+            r.sweep(io, nowNs(io));
+        }
+    }
+
+    fn sweep(r: *Reaper, io: std.Io, now: u64) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        var it = r.list.first;
+        while (it) |n| : (it = n.next) {
+            const w: *Watch = @fieldParentPtr("node", n);
+            const read_late = expire(&w.read_deadline_ns, &w.read_expired, now);
+            const write_late = expire(&w.write_deadline_ns, &w.write_expired, now);
+            if (read_late or write_late) w.stream.shutdown(io, .both) catch {};
+        }
+    }
+
+    /// Claims a passed deadline. The compare-and-swap loses to a connection
+    /// that finished its call and re-armed in the meantime.
+    fn expire(deadline: *std.atomic.Value(u64), expired: *std.atomic.Value(bool), now: u64) bool {
+        const d = deadline.load(.acquire);
+        if (d == 0 or now < d) return false;
+        if (deadline.cmpxchgStrong(d, 0, .acq_rel, .acquire) != null) return false;
+        expired.store(true, .release);
+        return true;
+    }
+};
+
+/// The tick that keeps a timeout's lateness under a tenth of the shortest
+/// one configured, within 1..100 ms.
+fn reaperTickMs(o: *const Options) u32 {
+    var shortest: u32 = std.math.maxInt(u32);
+    for ([_]u32{ o.read_timeout_ms, o.request_timeout_ms, o.write_timeout_ms }) |t| {
+        if (t != 0) shortest = @min(shortest, t);
+    }
+    if (o.enable_h2c and o.max_h2c_connection_ms != 0) shortest = @min(shortest, o.max_h2c_connection_ms);
+    return std.math.clamp(shortest / 10, 1, 100);
+}
+
+fn wantsReaper(o: *const Options) bool {
+    return o.read_timeout_ms != 0 or o.request_timeout_ms != 0 or o.write_timeout_ms != 0 or
+        (o.enable_h2c and o.max_h2c_connection_ms != 0);
+}
+
+/// Wraps the connection reader: before every refill that would block, arms
+/// the connection's read deadline — the stall timeout, clamped to the
+/// whole-request deadline (armed per request by the serving loop) — for the
+/// `Reaper`, and disarms it after. A stalled peer or an expired deadline
+/// becomes `error.ReadFailed` with `timed_out` set and the connection is
+/// dropped. Because the deadline is re-armed on every refill, a dribbling
+/// client (one byte per stall window) is bounded too — the stall timeout
+/// alone cannot do that. Without a `Watch` (no reaper running) nothing is
+/// bounded.
 ///
 /// Cancelation is recorded out of band, in `canceled`, for the same reason
 /// std records it out of band on the socket reader: `Reader.StreamError`
 /// cannot carry `error.Canceled`, so a vtable implementation has nowhere to
-/// *return* it however well it knows. Two separate blind spots feed that
-/// field. The `poll` below is not a `std.Io` cancelation point at all — it
-/// restarts itself on `EINTR`, and a thread parked in a syscall `std.Io`
-/// never registered is not signalled in the first place, so the wait runs
-/// its full timeout and the abandoned connection reports itself as a
-/// stalled peer; `checkCanceled` after the wait is what closes that. And
-/// once the read does reach the socket, the reason it failed survives only
-/// on `src.err`, which `readFailure` consults before flattening.
+/// *return* it however well it knows. The reason a read failed survives
+/// only on `src.err`, which `readFailure` consults before flattening.
 ///
 /// `timed_out` and `canceled` stay separate deliberately: a peer that
 /// stopped talking and a connection its own server gave up on are different
@@ -1228,7 +1327,7 @@ const TimeoutReader = struct {
     /// The socket reader itself, not just its interface — the concrete type
     /// is what carries `err`, and that is where a cancelation lives.
     src: *net.Stream.Reader,
-    handle: net.Socket.Handle,
+    watch: ?*Watch,
     timeout_ms: u32,
     request_timeout_ms: u32,
     /// Monotonic whole-request deadline; 0 = unarmed.
@@ -1242,11 +1341,11 @@ const TimeoutReader = struct {
     timed_out: bool = false,
     canceled: bool = false,
 
-    fn init(src: *net.Stream.Reader, io: std.Io, timeout_ms: u32, request_timeout_ms: u32, buffer: []u8) TimeoutReader {
+    fn init(src: *net.Stream.Reader, io: std.Io, watch: ?*Watch, timeout_ms: u32, request_timeout_ms: u32, buffer: []u8) TimeoutReader {
         return .{
             .io = io,
             .src = src,
-            .handle = src.stream.socket.handle,
+            .watch = watch,
             .timeout_ms = timeout_ms,
             .request_timeout_ms = request_timeout_ms,
             .reader = .{
@@ -1261,8 +1360,8 @@ const TimeoutReader = struct {
     /// Start the whole-request read budget (Go ReadTimeout shape): from
     /// here, keep-alive idle + head + body reads share one deadline.
     fn armRequest(t: *TimeoutReader) void {
-        if (!have_poll_timeouts or t.request_timeout_ms == 0) return;
-        t.deadline_ns = monotonicNowNs() + @as(u64, t.request_timeout_ms) * std.time.ns_per_ms;
+        if (t.watch == null or t.request_timeout_ms == 0) return;
+        t.deadline_ns = nowNs(t.io) + @as(u64, t.request_timeout_ms) * std.time.ns_per_ms;
     }
 
     /// Start the absolute connection-lifetime deadline (A1 http F7). Unlike
@@ -1271,8 +1370,8 @@ const TimeoutReader = struct {
     /// multiplexed h2 connection to hang it on anyway) would let a
     /// perpetually-productive-enough peer push it out forever.
     fn armConnection(t: *TimeoutReader, max_connection_ms: u32) void {
-        if (!have_poll_timeouts or max_connection_ms == 0) return;
-        t.conn_deadline_ns = monotonicNowNs() + @as(u64, max_connection_ms) * std.time.ns_per_ms;
+        if (t.watch == null or max_connection_ms == 0) return;
+        t.conn_deadline_ns = nowNs(t.io) + @as(u64, max_connection_ms) * std.time.ns_per_ms;
     }
 
     /// The earlier of the two deadlines that are currently armed, or 0 if
@@ -1286,84 +1385,69 @@ const TimeoutReader = struct {
         return @min(t.deadline_ns, t.conn_deadline_ns);
     }
 
-    /// `Io.checkCancel` *acknowledges* the request — it reports a pending
-    /// cancelation exactly once and returns void ever after — so the answer
-    /// is banked here and never asked for a second time. True means "this
-    /// wait ended because the connection was canceled".
-    fn checkCanceled(t: *TimeoutReader) bool {
-        t.io.checkCancel() catch {
-            t.canceled = true;
-            return true;
-        };
-        return false;
-    }
-
     /// A read that reached the socket and failed: recover the real cause
-    /// from the concrete reader before it is flattened into an anonymous
-    /// `ReadFailed`. Only one distinction is load-bearing here — a canceled
-    /// wait must not be filed as a dead or stalled peer.
+    /// before it is flattened into an anonymous `ReadFailed`. A deadline
+    /// the reaper enforced is a timeout; a canceled wait must not be filed
+    /// as a dead or stalled peer.
     fn readFailure(t: *TimeoutReader) Reader.Error {
-        if (t.src.err) |err| {
+        if (t.expired()) {
+            t.timed_out = true;
+        } else if (t.src.err) |err| {
             if (err == error.Canceled) t.canceled = true;
         }
         return error.ReadFailed;
     }
 
+    fn expired(t: *const TimeoutReader) bool {
+        const w = t.watch orelse return false;
+        return w.read_expired.load(.acquire);
+    }
+
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const t: *TimeoutReader = @alignCast(@fieldParentPtr("reader", r));
         const in = &t.src.interface;
-        const deadline_ns = t.earliestDeadlineNs();
-        if (have_poll_timeouts and in.bufferedLen() == 0 and
-            (t.timeout_ms != 0 or deadline_ns != 0))
-        {
-            var wait_ms: u64 = if (t.timeout_ms != 0) t.timeout_ms else std.math.maxInt(i32);
-            if (deadline_ns != 0) {
-                const now = monotonicNowNs();
-                if (now >= deadline_ns) {
+        // The reaper shut the socket down: whatever it now reports (an end
+        // of stream, mostly) is the timeout.
+        if (t.expired()) {
+            t.timed_out = true;
+            return error.ReadFailed;
+        }
+        var armed: ?*Watch = null;
+        defer if (armed) |watch| watch.read_deadline_ns.store(0, .release);
+        if (t.watch) |watch| if (in.bufferedLen() == 0) {
+            const deadline_ns = t.earliestDeadlineNs();
+            if (t.timeout_ms != 0 or deadline_ns != 0) {
+                const now = nowNs(t.io);
+                if (deadline_ns != 0 and now >= deadline_ns) {
                     t.timed_out = true;
                     return error.ReadFailed;
                 }
-                // Round up so we never poll(0)-spin just before the deadline.
-                wait_ms = @min(wait_ms, (deadline_ns - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+                var until: u64 = if (t.timeout_ms != 0) now + @as(u64, t.timeout_ms) * std.time.ns_per_ms else std.math.maxInt(u64);
+                if (deadline_ns != 0) until = @min(until, deadline_ns);
+                watch.read_deadline_ns.store(until, .release);
+                armed = watch;
             }
-            var fds = [_]std.posix.pollfd{.{
-                .fd = t.handle,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const timeout: i32 = std.math.cast(i32, wait_ms) orelse std.math.maxInt(i32);
-            // Both ways out of the wait have to ask, and neither can be
-            // skipped: a `poll` that failed outright swallowed the
-            // cancelation's signal exactly as one that ran to term did.
-            const ready = std.posix.poll(&fds, timeout) catch {
-                _ = t.checkCanceled();
-                return error.ReadFailed;
-            };
-            if (ready == 0) {
-                if (t.checkCanceled()) return error.ReadFailed;
+        };
+        return in.stream(w, limit) catch |err| switch (err) {
+            error.EndOfStream => if (t.expired()) {
                 t.timed_out = true;
                 return error.ReadFailed;
-            }
-        }
-        return in.stream(w, limit) catch |err| switch (err) {
-            error.EndOfStream => error.EndOfStream,
+            } else error.EndOfStream,
             error.WriteFailed => error.WriteFailed,
             error.ReadFailed => t.readFailure(),
         };
     }
 };
 
-/// Wraps the connection writer: polls the socket for writability (bounded
-/// by `write_timeout_ms`) before every socket write, so a peer that stops
-/// reading while a response streams (slow-read attack) becomes
-/// `error.WriteFailed` with `timed_out` set instead of pinning the
-/// connection task. Caveat (mirror of the read side): a peer that drains a
-/// trickle restarts the window per write — only full stalls are bounded.
+/// Wraps the connection writer: arms the connection's write deadline for the
+/// `Reaper` around every socket write, so a peer that stops reading while a
+/// response streams (slow-read attack) becomes `error.WriteFailed` with
+/// `timed_out` set instead of pinning the connection task. Caveat (mirror of
+/// the read side): a peer that drains a trickle restarts the window per
+/// write — only full stalls are bounded.
 ///
-/// `canceled` is the writer half of `TimeoutReader.canceled`, there for the
-/// same two reasons: `Writer.Error` is exactly `{WriteFailed}` and cannot
-/// carry a cancelation, and the writability `poll` below is no more a
-/// `std.Io` cancelation point than the readability one is.
+/// `canceled` is the writer half of `TimeoutReader.canceled`: `Writer.Error`
+/// is exactly `{WriteFailed}` and cannot carry a cancelation.
 ///
 /// Not movable after `writer` has been handed out.
 const TimeoutWriter = struct {
@@ -1371,17 +1455,17 @@ const TimeoutWriter = struct {
     /// The socket writer itself — `err` is the writer-side equivalent of
     /// `net.Stream.Reader.err`.
     dst: *net.Stream.Writer,
-    handle: net.Socket.Handle,
+    watch: ?*Watch,
     timeout_ms: u32,
     writer: Writer,
     timed_out: bool = false,
     canceled: bool = false,
 
-    fn init(dst: *net.Stream.Writer, io: std.Io, timeout_ms: u32, buffer: []u8) TimeoutWriter {
+    fn init(dst: *net.Stream.Writer, io: std.Io, watch: ?*Watch, timeout_ms: u32, buffer: []u8) TimeoutWriter {
         return .{
             .io = io,
             .dst = dst,
-            .handle = dst.stream.socket.handle,
+            .watch = watch,
             .timeout_ms = timeout_ms,
             .writer = .{
                 .vtable = &.{ .drain = drainFn },
@@ -1390,49 +1474,33 @@ const TimeoutWriter = struct {
         };
     }
 
-    /// See `TimeoutReader.checkCanceled` — the acknowledgement is one-shot,
-    /// so it is banked, not re-asked.
-    fn checkCanceled(t: *TimeoutWriter) bool {
-        t.io.checkCancel() catch {
-            t.canceled = true;
-            return true;
-        };
-        return false;
-    }
-
     /// The writer side of `TimeoutReader.readFailure`.
     fn writeFailure(t: *TimeoutWriter) Writer.Error {
-        if (t.dst.err) |err| {
+        if (t.expired()) {
+            t.timed_out = true;
+        } else if (t.dst.err) |err| {
             if (err == error.Canceled) t.canceled = true;
         }
         return error.WriteFailed;
     }
 
-    fn pollOut(t: *TimeoutWriter) Writer.Error!void {
-        if (!have_poll_timeouts or t.timeout_ms == 0) return;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = t.handle,
-            .events = std.posix.POLL.OUT,
-            .revents = 0,
-        }};
-        const timeout: i32 = std.math.cast(i32, t.timeout_ms) orelse std.math.maxInt(i32);
-        const ready = std.posix.poll(&fds, timeout) catch {
-            _ = t.checkCanceled();
-            return error.WriteFailed;
-        };
-        if (ready == 0) {
-            if (t.checkCanceled()) return error.WriteFailed;
-            t.timed_out = true;
-            return error.WriteFailed;
-        }
+    fn expired(t: *const TimeoutWriter) bool {
+        const w = t.watch orelse return false;
+        return w.write_expired.load(.acquire);
     }
 
-    /// Write all of `bytes` to the (unbuffered) socket writer, polling
-    /// before each partial write.
+    /// Write all of `bytes` to the (unbuffered) socket writer, each partial
+    /// write under its own stall deadline.
     fn sendAll(t: *TimeoutWriter, bytes: []const u8) Writer.Error!void {
         var rem = bytes;
         while (rem.len != 0) {
-            try t.pollOut();
+            if (t.expired()) {
+                t.timed_out = true;
+                return error.WriteFailed;
+            }
+            const watch: ?*Watch = if (t.timeout_ms != 0) t.watch else null;
+            if (watch) |w| w.write_deadline_ns.store(nowNs(t.io) + @as(u64, t.timeout_ms) * std.time.ns_per_ms, .release);
+            defer if (watch) |w| w.write_deadline_ns.store(0, .release);
             // Spelled out rather than caught bare: if `Writer.Error` ever
             // grows a second tag, this becomes a compile error instead of a
             // silent mis-map.
@@ -6606,9 +6674,9 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     // fallback -- tight enough that a server thread descheduled on a loaded
     // CI shard could miss it; 5 s now sits 4x under the unarmed path and
     // leaves the armed path seconds of scheduling slack.
-    const started_ns = monotonicNowNs();
+    const started_ns = nowNs(io);
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
-    const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
+    const elapsed_ms = (nowNs(io) - started_ns) / std.time.ns_per_ms;
     try testing.expect(elapsed_ms < 5_000);
 }
 
@@ -6657,7 +6725,7 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     try sw.interface.writeAll(wire.items);
     try sw.interface.flush();
 
-    const started_ns = monotonicNowNs();
+    const started_ns = nowNs(io);
     var rounds: usize = 0;
     while (rounds < 20) : (rounds += 1) {
         try sleepMs(io, 40);
@@ -6679,7 +6747,7 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     while (true) {
         _ = sr.interface.take(1) catch break; // EndOfStream or ReadFailed: connection is down
     }
-    const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
+    const elapsed_ms = (nowNs(io) - started_ns) / std.time.ns_per_ms;
     try testing.expect(elapsed_ms < 5_000);
 }
 
@@ -7003,7 +7071,7 @@ fn cancelWriteUntilBlocked(t: *TimeoutWriter) Writer.Error!void {
     while (left != 0) : (left -= chunk.len) try t.writer.writeAll(&chunk);
 }
 
-test "cancel: a cancelation during the read stall poll is not filed as a stalled peer" {
+test "cancel: a cancelation while a read stall deadline is armed is not filed as a stalled peer" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -7015,10 +7083,10 @@ test "cancel: a cancelation during the read stall poll is not filed as a stalled
 
     var buf: [64]u8 = undefined;
     var sr = pair.conn.reader(io, buf[0..0]);
-    // 600 ms: `poll` restarts on the cancelation's signal, so the task can
-    // only return once the stall timeout genuinely elapses — long enough to
-    // be unambiguous, short enough not to weigh on the module's suite.
-    var tr: TimeoutReader = .init(&sr, io, 600, 0, &buf);
+    // The deadline is armed (a `Watch` and a stall timeout) but no reaper
+    // runs: only the cancelation can end this read.
+    var watch: Watch = .{ .stream = pair.conn };
+    var tr: TimeoutReader = .init(&sr, io, &watch, 600, 0, &buf);
 
     var fut = try io.concurrent(cancelReadOnce, .{&tr});
     try io.sleep(.fromMilliseconds(100), .awake);
@@ -7040,10 +7108,9 @@ test "cancel: a canceled socket read is recovered from the reader's err field" {
 
     var buf: [64]u8 = undefined;
     var sr = pair.conn.reader(io, buf[0..0]);
-    // No stall timeout and no request deadline: the read skips `poll`
-    // entirely and parks inside `std.Io`, where the cancelation lands on
-    // `sr.err` instead.
-    var tr: TimeoutReader = .init(&sr, io, 0, 0, &buf);
+    // No stall timeout, no request deadline, no `Watch`: the read parks
+    // inside `std.Io`, where the cancelation lands on `sr.err`.
+    var tr: TimeoutReader = .init(&sr, io, null, 0, 0, &buf);
 
     var fut = try io.concurrent(cancelReadOnce, .{&tr});
     try io.sleep(.fromMilliseconds(200), .awake);
@@ -7052,7 +7119,7 @@ test "cancel: a canceled socket read is recovered from the reader's err field" {
     try testing.expect(!tr.timed_out);
 }
 
-test "cancel: a cancelation during the write stall poll is not filed as a stalled peer" {
+test "cancel: a cancelation while a write stall deadline is armed is not filed as a stalled peer" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -7065,7 +7132,8 @@ test "cancel: a cancelation during the write stall poll is not filed as a stalle
 
     var buf: [1024]u8 = undefined;
     var sw = pair.conn.writer(io, buf[0..0]);
-    var tw: TimeoutWriter = .init(&sw, io, 600, &buf);
+    var watch: Watch = .{ .stream = pair.conn };
+    var tw: TimeoutWriter = .init(&sw, io, &watch, 600, &buf);
 
     var fut = try io.concurrent(cancelWriteUntilBlocked, .{&tw});
     try io.sleep(.fromMilliseconds(100), .awake);
@@ -7087,15 +7155,138 @@ test "cancel: a canceled socket write is recovered from the writer's err field" 
 
     var buf: [1024]u8 = undefined;
     var sw = pair.conn.writer(io, buf[0..0]);
-    // No write stall timeout: `pollOut` is skipped and the write parks in
-    // `std.Io`, where the cancelation lands on `sw.err`.
-    var tw: TimeoutWriter = .init(&sw, io, 0, &buf);
+    // No write stall timeout: the write parks in `std.Io`, where the
+    // cancelation lands on `sw.err`.
+    var tw: TimeoutWriter = .init(&sw, io, null, 0, &buf);
 
     var fut = try io.concurrent(cancelWriteUntilBlocked, .{&tw});
     try io.sleep(.fromMilliseconds(200), .awake);
     try testing.expectError(error.WriteFailed, fut.cancel(io));
     try testing.expect(tw.canceled);
     try testing.expect(!tw.timed_out);
+}
+
+test "reaper: a read past its deadline is filed as timed out, not as a dead peer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+
+    var buf: [64]u8 = undefined;
+    var sr = pair.conn.reader(io, buf[0..0]);
+    var watch: Watch = .{ .stream = pair.conn };
+    var reaper: Reaper = .{};
+    reaper.add(io, &watch);
+    defer reaper.remove(io, &watch);
+    var tr: TimeoutReader = .init(&sr, io, &watch, 100, 0, &buf);
+
+    var fut = try io.concurrent(cancelReadOnce, .{&tr});
+    // Wait until the read has armed its deadline, then sweep as if it passed.
+    while (watch.read_deadline_ns.load(.acquire) == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    reaper.sweep(io, watch.read_deadline_ns.load(.acquire));
+    try testing.expectError(error.ReadFailed, fut.await(io));
+    try testing.expect(tr.timed_out);
+    try testing.expect(!tr.canceled);
+}
+
+test "reaper: a sweep before the deadline leaves the read alone" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+
+    var buf: [64]u8 = undefined;
+    var sr = pair.conn.reader(io, buf[0..0]);
+    var watch: Watch = .{ .stream = pair.conn };
+    var reaper: Reaper = .{};
+    reaper.add(io, &watch);
+    defer reaper.remove(io, &watch);
+    var tr: TimeoutReader = .init(&sr, io, &watch, 100, 0, &buf);
+
+    var fut = try io.concurrent(cancelReadOnce, .{&tr});
+    while (watch.read_deadline_ns.load(.acquire) == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    reaper.sweep(io, watch.read_deadline_ns.load(.acquire) - 1);
+    // Still parked: a byte from the peer completes it normally.
+    var pw = pair.peer.writer(io, &.{});
+    try pw.interface.writeAll("x");
+    try testing.expectEqual(@as(u8, 'x'), try fut.await(io));
+    try testing.expect(!tr.timed_out);
+}
+
+test "reaper: a write stalled past its deadline is filed as timed out" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+    pair.shrink();
+
+    var buf: [1024]u8 = undefined;
+    var sw = pair.conn.writer(io, buf[0..0]);
+    var watch: Watch = .{ .stream = pair.conn };
+    var reaper: Reaper = .{ .tick_ms = 5 };
+    reaper.add(io, &watch);
+    defer reaper.remove(io, &watch);
+    var tw: TimeoutWriter = .init(&sw, io, &watch, 50, &buf);
+
+    var reaper_task = try io.concurrent(Reaper.run, .{ &reaper, io });
+    defer reaper_task.cancel(io) catch {};
+    try testing.expectError(error.WriteFailed, cancelWriteUntilBlocked(&tw));
+    try testing.expect(tw.timed_out);
+    try testing.expect(!tw.canceled);
+}
+
+test "integration: a client that stops reading is dropped after the write timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{ .handler = bigHandler, .write_timeout_ms = 150 });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    const small = std.mem.toBytes(@as(c_int, 2048));
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    // Never read: the response (far larger than both socket buffers) stalls,
+    // and the server must give up on the connection.
+    while (server.activeConnections() == 0) try sleepMs(io, 5);
+    var waited: u32 = 0;
+    while (server.activeConnections() != 0) : (waited += 10) {
+        if (waited > 5000) return error.ConnectionNeverDropped;
+        try sleepMs(io, 10);
+    }
+}
+
+fn bigHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    const chunk: [16 * 1024]u8 = @splat('b');
+    for (0..256) |_| try rw.writeAll(&chunk);
 }
 
 // ── buffers_provider ────────────────────────────────────────────────────────
