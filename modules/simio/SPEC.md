@@ -346,9 +346,11 @@ Modules keep their own loopback tests (below, "timeouts").
   80 ms; with no timeout the caller's cancel lands at exactly 300 ms), `whois` (a
   slow peer abandoned at 80 ms, not at its 900 ms reply; dialed by host name),
   `stun.query` (a dark server at exactly 150 ms, an answer after one round trip) and
-  `ocspcache`'s fetch (no body: ends 200 ms after the head). `dns` and `http` had
-  their timing moved in their own pilots above. `llmclient`, `snmp`, `bacnet`: not
-  yet.
+  `ocspcache`'s fetch (no body: ends 200 ms after the head) and `llmclient`'s body
+  read (a one-byte-per-50-ms trickle ends 300 ms after the head). `dns` and `http`
+  had their timing moved in their own pilots above. `snmp` and `bacnet` turned out
+  to have no timing left to move: their cancel tests already wait for the request
+  to arrive instead of sleeping.
 
 **Spinlock audit (2026-10-01)**, after the kv finding: every module whose io-less lock
 (or spin-wait) could be held across a call that suspends under an `Io` running several

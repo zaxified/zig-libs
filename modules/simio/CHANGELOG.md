@@ -5,8 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** the timeouts pilot also checks
+  `llmclient`'s body deadline (test-only).
 - **2026-10-01** — `pilots/timeouts.zig`: the request timeouts of `modbus`,
-  `whois`, `stun` and `ocspcache` checked to the millisecond in virtual time — the
+  `whois`, `stun`, `ocspcache` and `llmclient` checked to the millisecond in virtual time — the
   timing half of their loopback tests, which stay in the modules.
 - **2026-10-01** — The differential oracle: one `std.Io` program on
   `std.Io.Threaded` (real loopback and disk) and on simio must report the same

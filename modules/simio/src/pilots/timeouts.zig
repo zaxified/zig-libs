@@ -2,7 +2,8 @@
 
 //! Pilot: the request timeouts of four transports that bound a stream or
 //! datagram exchange through `std.Io` alone — `modbus.TcpTransport`,
-//! `whois.TcpTransport`, `stun.query` and `ocspcache`'s HTTP fetch — moved
+//! `whois.TcpTransport`, `stun.query`, `ocspcache`'s HTTP fetch and
+//! `llmclient`'s body read — moved
 //! here from wall-clock loopback windows.
 //!
 //! Each module keeps its loopback tests: they are the real-kernel half, and
@@ -18,6 +19,7 @@ const modbus = @import("modbus");
 const whois = @import("whois");
 const stun = @import("stun");
 const ocspcache = @import("ocspcache");
+const llmclient = @import("llmclient");
 const http = @import("http");
 const sched = @import("../sched.zig");
 
@@ -40,6 +42,8 @@ const Peer = struct {
     delay_ms: ?u64,
     reply: []const u8,
     head_then_silence: bool = false,
+    /// After the head, one body byte every this many ms (an SSE trickle).
+    drip_ms: ?u64 = null,
 
     fn run(io: Io, p: *const Peer) !void {
         var listener = try net.IpAddress.listen(&.{ .ip4 = .unspecified(p.port) }, io, .{});
@@ -51,6 +55,21 @@ const Peer = struct {
         _ = sr.interface.readSliceShort(rbuf[0..1]) catch {};
         var wbuf: [256]u8 = undefined;
         var sw = s.writer(io, &wbuf);
+        if (p.drip_ms) |gap| {
+            // Drain the request head, so closing never resets unread input.
+            while (true) {
+                const line = sr.interface.takeDelimiterInclusive('\n') catch break;
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            try sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000000\r\n\r\n");
+            try sw.interface.flush();
+            for (0..200) |_| {
+                sw.interface.writeAll("d") catch return;
+                sw.interface.flush() catch return;
+                try io.sleep(.fromMilliseconds(@intCast(gap)), .awake);
+            }
+            return;
+        }
         if (p.head_then_silence) {
             try sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
             try sw.interface.flush();
@@ -226,4 +245,38 @@ test "timeouts: an OCSP fetch whose responder sends a head and no body ends at b
     // Connect and request take a round trip each; the body budget then runs
     // its 200 ms from the head's arrival.
     try testing.expect(out.elapsed_ms >= 220 and out.elapsed_ms <= 222);
+}
+
+// ── llmclient ──────────────────────────────────────────────────────────────
+
+fn llmClient(io: Io, ip: [4]u8, read_timeout_ms: u32, out: *Outcome) !void {
+    _ = ip;
+    try io.sleep(.fromMilliseconds(10), .awake);
+    var hc = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer hc.deinit();
+    var c: llmclient.Client = .init(&hc, "sk-test");
+    c.base_url = "http://peer:80";
+    c.read_timeout_ms = read_timeout_ms;
+    const req: llmclient.MessageRequest = .{
+        .max_tokens = 16,
+        .messages = &.{llmclient.MessageParam.user(&.{llmclient.textBlock("hello")})},
+    };
+    const start = Io.Timestamp.now(io, .awake);
+    if (c.create(testing.allocator, req)) |parsed| {
+        var p = parsed;
+        p.deinit();
+        out.ok = true;
+    } else |err| out.err = err;
+    out.elapsed_ms = msSince(io, start);
+}
+
+test "timeouts: llmclient gives up on a body that trickles in, read_timeout_ms after the head" {
+    // One byte every 50 ms never stalls a read for long; the body deadline
+    // ends it anyway.
+    const peer: Peer = .{ .port = 80, .delay_ms = null, .reply = "", .drip_ms = 50 };
+    var out: Outcome = .{};
+    try world(&peer, llmClient, .{ @as(u32, 300), &out });
+    try testing.expectEqual(@as(?anyerror, error.Timeout), out.err);
+    // Connect and request: a round trip each; then 300 ms of body.
+    try testing.expect(out.elapsed_ms >= 320 and out.elapsed_ms <= 322);
 }
