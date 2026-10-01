@@ -263,6 +263,13 @@ Moving a module's own loopback tests onto simio is a separate, later step.
   empty result, so a dead server read as "no addresses"; fixed in `dns` (Go's
   behaviour: no address + a failed query = that error), with a regression test there.
 
+- **mqtt** (2026-10-01): the real `TcpServer` + `Broker` and `Client` + `TcpTransport`;
+  QoS 1 at-least-once to two persistent-session subscribers through a 5 s partition,
+  a subscriber crash and restart, and 21 seeds of loss/duplication/partitions; the
+  clean-session-after-restart variant is caught losing messages. Needed `TcpServer`
+  to stop polling the raw socket and reading `clock_gettime` (now a watchdog task per
+  connection and `Io` time).
+
 **Readiness finding:** about 60 modules read the clock with `clock_gettime` (or
 `RtlGetSystemTimePrecise`) instead of `std.Io` — many only in tests or benchmarks,
 some in runtime paths (`sntp` was one). Each is invisible to a simulated `Io` and

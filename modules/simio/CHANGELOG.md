@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-01** — mqtt pilot: the real broker server and client under
+  partitions, a subscriber crash and seeded packet faults; QoS 1
+  at-least-once holds, a clean-session subscriber is caught losing messages.
 - **2026-10-01** — First pilots (`src/pilots/`, piloted modules as
   `test_deps`): `sntp` (needed `query` to read time through `std.Io`) and
   `dns` (found `lookupIp` reporting an outage as "no addresses"; fixed there).
