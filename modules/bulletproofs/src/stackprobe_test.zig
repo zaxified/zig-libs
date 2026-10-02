@@ -61,7 +61,7 @@ noinline fn snapshot() void {
 
 noinline fn runProve() void {
     var t = bp.Transcript.init(bp.rangeproof_domain);
-    const proof = bp.prove(std.testing.allocator, gens, &t, &secret_v, secret_gamma) catch unreachable;
+    const proof = bp.prove(std.testing.allocator, std.testing.io, gens, &t, &secret_v, secret_gamma) catch unreachable;
     last_a = proof.a;
     last_s = proof.s;
     proof.deinit(std.testing.allocator);

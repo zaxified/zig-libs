@@ -50,7 +50,7 @@ fn proveBatch(gens: Generators, values: []const u64) !Batch {
         c.* = commitU64(gens, v, g.*);
     }
     var t = Transcript.init(bp.rangeproof_domain);
-    const proof = try bp.proveMultiple(talloc, gens, &t, values, gammas);
+    const proof = try bp.proveMultiple(talloc, std.testing.io, gens, &t, values, gammas);
     return .{ .proof = proof, .commitments = commitments };
 }
 
@@ -93,7 +93,7 @@ test "m = 1: an aggregated proof of one value is the single proof, both ways" {
     try std.testing.expect(bp.verify(gens, &t1, commitment, batch.proof));
 
     var pt = Transcript.init(bp.rangeproof_domain);
-    const single = try bp.prove(talloc, gens, &pt, &v, gamma);
+    const single = try bp.prove(talloc, std.testing.io, gens, &pt, &v, gamma);
     defer single.deinit(talloc);
     try std.testing.expect(verifyBatch(gens, &.{commitment}, single));
 }
@@ -106,7 +106,7 @@ test "a single proof verifies over a wider party set (party 0 is the same)" {
     const v: u64 = 9;
     const gamma = gammaFor(5);
     var pt = Transcript.init(bp.rangeproof_domain);
-    const proof = try bp.prove(talloc, narrow, &pt, &v, gamma);
+    const proof = try bp.prove(talloc, std.testing.io, narrow, &pt, &v, gamma);
     defer proof.deinit(talloc);
     var vt = Transcript.init(bp.rangeproof_domain);
     try std.testing.expect(bp.verify(wide, &vt, commitU64(wide, v, gamma), proof));
@@ -119,17 +119,17 @@ test "proveMultiple refuses malformed batches and out-of-range values" {
     var t = Transcript.init(bp.rangeproof_domain);
 
     // Empty, not a power of two, gammas of another length.
-    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, gens, &t, &.{}, &.{}));
-    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, gens, &t, &.{ 1, 2, 3 }, g4[0..3]));
-    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, gens, &t, &.{ 1, 2 }, g4[0..1]));
+    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, std.testing.io, gens, &t, &.{}, &.{}));
+    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, std.testing.io, gens, &t, &.{ 1, 2, 3 }, g4[0..3]));
+    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, std.testing.io, gens, &t, &.{ 1, 2 }, g4[0..1]));
     // More values than the generator set has parties.
     const g8 = g4 ++ g4;
-    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, gens, &t, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &g8));
+    try std.testing.expectError(error.InvalidAggregation, bp.proveMultiple(talloc, std.testing.io, gens, &t, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &g8));
     // Any one value out of range refuses the whole batch, whatever its slot.
     for (0..4) |j| {
         var values = [_]u64{ 1, 2, 3, 4 };
         values[j] = 256;
-        try std.testing.expectError(error.ValueOutOfRange, bp.proveMultiple(talloc, gens, &t, &values, &g4));
+        try std.testing.expectError(error.ValueOutOfRange, bp.proveMultiple(talloc, std.testing.io, gens, &t, &values, &g4));
     }
 }
 

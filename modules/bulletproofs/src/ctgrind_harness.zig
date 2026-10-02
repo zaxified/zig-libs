@@ -74,7 +74,7 @@
 //!   secret one.
 //! - **`rangeproof.prove`'s own internal blinding draws** — `alpha`,
 //!   `rho`, `s_L`, `s_R`, `tau1`, `tau2` (`randomScalar()`, real
-//!   `getrandom(2)` output, drawn INSIDE `prove` on every call). These are
+//!   `io.randomSecure` output, drawn INSIDE `prove` on every call). These are
 //!   genuinely secret in the real protocol (their name is literally what
 //!   the task brief means by "the per-proof nonces of the inner-product
 //!   argument": `s_L`/`s_R` are exactly the blinding vectors that get
@@ -217,6 +217,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
     const allocator = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+    // `prove` draws its blinding from an `Io` (randomSecure); OS entropy is
+    // defined memory to valgrind, as getrandom(2)'s output was.
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
 
     // Public generators — never tainted (see module doc comment).
     const gens = try bulletproofs.Generators.init(allocator, n);
@@ -235,7 +239,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const v = std.mem.readInt(u64, &v_bytes, .little);
 
             var t = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
-            const proof = try bulletproofs.prove(allocator, gens, &t, &v, gamma);
+            const proof = try bulletproofs.prove(allocator, threaded.io(), gens, &t, &v, gamma);
             defer proof.deinit(allocator);
 
             // Propagation witness: downstream of both v and gamma.

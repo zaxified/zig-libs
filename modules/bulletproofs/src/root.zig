@@ -52,17 +52,13 @@
 //!
 //! ## Caveats
 //!
-//! - **Proving is Linux-only.** `rangeproof.prove` draws its secret
-//!   blinding material (`alpha`/`rho`/`s_L`/`s_R`/`tau1`/`tau2`) from the
-//!   OS via `getrandom(2)` directly (`rangeproof.zig`'s `fillRandom`,
-//!   `@compileError` on any non-Linux target — a predictable-blinding
-//!   range proof leaks the witness, so this never silently degrades to a
-//!   weaker source). `verify`/`verifyIpa`/`commit`/`deltaYZ`/`proveIpa`
-//!   (which takes its witness as parameters) and both byte codecs are
-//!   platform-independent; only the internal-entropy `prove` path is
-//!   gated. `meta.platform` is `.linux` to reflect the most-restrictive
-//!   reachable path honestly (porting `fillRandom` to a POSIX/Windows
-//!   entropy call would lift this).
+//! - **Proving takes an `std.Io` for its blinding randomness.**
+//!   `rangeproof.prove`/`proveMultiple` draw `alpha`/`rho`/`s_L`/`s_R`/
+//!   `tau1`/`tau2` from `io.randomSecure` — the OS, every call, no fallback;
+//!   a failure is `error.EntropyUnavailable`, never a weaker source (a
+//!   predictable-blinding range proof leaks the witness). Until 2026-10-02
+//!   this was a direct `getrandom(2)` and a compile error on every
+//!   non-Linux target.
 //! - **Proving is constant-time; verifying is deliberately not.** Every
 //!   scalar multiplication on a SECRET scalar (the bit-vectors
 //!   `a_L`/`a_R`/`s_L`/`s_R`, the blindings `alpha`/`rho`/`tau1`/`tau2`/
@@ -104,9 +100,9 @@ pub const meta = .{
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "linux",
+    .platform_note = "any",
     .targets = .{.linux64},
-    .platform = .linux, // prove()'s internal getrandom(2) blinding is Linux-only (see Caveats); verify/codec paths are portable
+    .platform = .any, // pure computation; prove()'s blinding comes from the caller's std.Io (randomSecure)
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "Bünz/Bootle/Boneh/Poelstra/Wuille/Maxwell, \"Bulletproofs: Short Proofs for Confidential Transactions and More\", IEEE S&P 2018 (eprint 2017/1066), §3 (Inner-Product Argument) + §4.1/§4.2 (range proof) + §4.3 (aggregated range proofs); wire-compatible with dalek-cryptography/bulletproofs 4.0 (Rust): Merlin transcript, dalek generators and byte layout (see NOTICE, interop_test.zig); std.crypto.ecc.Ristretto255 supplies the group",

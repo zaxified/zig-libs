@@ -24,7 +24,7 @@ construction/reduction (`rangeproof.zig`'s `prove`/`verify`) — are
 implemented (Fable core pass) and `gate.core_implemented` is `true`, so
 the full completeness + soundness KAT suite runs (green in Debug
 + ReleaseFast). See "Caveats" below for the non-constant-time and
-Linux-only-proving notes.
+entropy notes.
 
 ## Compared with
 
@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [monero-project/monero](https://github.com/monero-project/monero) | C++ | NOASSERTION (BSD-3-Clause per Monero convention, *inferred*; source not read) | 10.9k | pushed 2026-09 | The largest production Bulletproofs(+) deployment (aggregated range proofs on ed25519 in transaction outputs). Consensus-pinned wire format. |
 | Zig ecosystem (GitHub search "bulletproofs", language Zig, 2026-09-30) | Zig | — | — | — | No Bulletproofs repository found; nothing in Zig `std`. |
 
-**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`, since 2026-09-30, aggregation since 2026-10-02); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, and an exhaustive per-field tamper suite. **Where we are behind:** no multi-party dealer/party protocol (aggregation needs one caller holding every witness); no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts); `prove` is Linux-only (`getrandom(2)` compile error elsewhere); no batch verification of several proofs.
+**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`, since 2026-09-30, aggregation since 2026-10-02); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, and an exhaustive per-field tamper suite. **Where we are behind:** no multi-party dealer/party protocol (aggregation needs one caller holding every witness); no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts); no batch verification of several proofs. (`prove` was Linux-only until 2026-10-02; its randomness now comes from the caller's `std.Io`.)
 
 ## Design
 
@@ -327,17 +327,13 @@ comment.
 
 ## Caveats
 
-- **Proving is Linux-only.** `rangeproof.prove` draws its secret blinding
-  (`alpha`/`rho`/`s_L`/`s_R`/`tau1`/`tau2`) from `getrandom(2)` directly
-  (`rangeproof.zig`'s `fillRandom`, `@compileError` on any non-Linux
-  target — a predictable-blinding range proof leaks the witness, so this
-  never silently degrades to a weaker entropy source). `verify`/
-  `verifyIpa`/`commit`/`deltaYZ`/`proveIpa` (witness passed in as
-  parameters) and both byte codecs are platform-independent; only the
-  internal-entropy `prove` path is gated. `meta.platform` is therefore
-  `.linux` (not `.any`) — the honest tag for the most-restrictive
-  reachable path. Porting `fillRandom` to a POSIX/Windows entropy call
-  would lift the restriction.
+- **Proving takes its entropy from the caller's `std.Io`.** `rangeproof.prove`
+  draws its secret blinding (`alpha`/`rho`/`s_L`/`s_R`/`tau1`/`tau2`) from
+  `io.randomSecure` — the OS on every call, with no fallback, so a failure is
+  `error.EntropyUnavailable` and never a weaker source (a predictable-blinding
+  range proof leaks the witness). Until 2026-10-02 this was a direct
+  `getrandom(2)` with a `@compileError` on every non-Linux target, and
+  `meta.platform` was `.linux`; it is `.any` now.
 - **Constant-time on the prover's secrets — MEASURED 2026-09-09, and this
   bullet used to say the opposite.** It read "Not constant-time:
   `scalarvec.multiScalarMul` skips zero scalars (a `catch continue` on std's
@@ -360,7 +356,7 @@ comment.
   than a silent no-op.
 
   ⚠ What is NOT claimed: `prove` draws its own blinding (`alpha`, `rho`,
-  `s_L`, `s_R`, `tau1`, `tau2`) from `getrandom(2)` internally, and the
+  `s_L`, `s_R`, `tau1`, `tau2`) from `io.randomSecure` internally, and the
   harness cannot taint those without editing the module. They are outside the
   measurement, not proven by it. And a range proof's PRIVACY never rested on
   this anyway — it rests on the zero-knowledge property — so the bullet
@@ -421,6 +417,6 @@ B14), kept.
 - **Aggregated range proofs (paper §4.3, `m` values in one proof)** (survey 2026-09-30) — DONE 2026-10-02: `proveMultiple`/`verifyMultiple`, `Generators.initParties`, anchored both ways against dalek's `prove_multiple`/`verify_multiple` (see "Anchoring").
 - **Multi-party aggregation (dalek's dealer/party protocol)** (2026-10-02): parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
 - **Batch verification of several independent range proofs** (survey 2026-09-30): dalek batches many proofs into one MSM *(inferred)*; verifying blocks of outputs is the common bulk use. Effort: small-medium on top of the existing vartime MSM. Fits §2.
-- **Portable entropy for `prove` (drop the Linux-only `getrandom` compile error)** (survey 2026-09-30): dalek proves on every target; here `meta.platform` is `.linux`. Simplest fix is to take `random`/`std.Io` as a parameter as `bbs`/`frost` do. Effort: small. Fits §2.
+- ~~**Portable entropy for `prove`**~~ — done 2026-10-02: `prove`/`proveMultiple` take an `io: std.Io` and draw blinding from `io.randomSecure` (OS entropy every call, no fallback; failure is `error.EntropyUnavailable`). `meta.platform` is `.any`. Stack probe (ReleaseFast) and ctgrind (0 in-file contexts) re-run green.
 - **Wider values (`n > 64`) and an arithmetic-circuit/R1CS proof API** (survey 2026-09-30): dalek's R1CS API is experimental and unpublished, so this is a "nobody ships it stable" item; recorded so it is not proposed again as a gap. Effort: large. Fits §2.
 

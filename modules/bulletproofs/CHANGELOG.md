@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **BREAKING: `prove` and `proveMultiple` take an `io: std.Io`**
+  (after the allocator) and draw their blinding randomness from
+  `io.randomSecure`. The module builds and proves on every target now; it
+  was a compile error outside Linux (a direct `getrandom(2)`). An entropy
+  failure is `ProveError.EntropyUnavailable` (or `Canceled`), not a panic.
+  `meta.platform` `.linux` → `.any`. No consumer outside the module.
+
 - **2026-10-02** — Aggregated range proofs (paper §4.3): `proveMultiple`/
   `verifyMultiple` put `m` values (a power of two) in one proof of
   `log2(n*m)` IPA rounds, wire-compatible with dalek's `prove_multiple`/

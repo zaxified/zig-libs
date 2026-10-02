@@ -281,7 +281,7 @@ const Fixture = struct {
         errdefer gens.deinit(talloc);
         const v: u64 = if (n < 64) v_in & ((@as(u64, 1) << @intCast(n)) - 1) else v_in;
         var t = Transcript.init(rangeproof.transcript_domain);
-        const proof = try rangeproof.prove(talloc, gens, &t, &v, gamma);
+        const proof = try rangeproof.prove(talloc, std.testing.io, gens, &t, &v, gamma);
         return .{ .gens = gens, .v_point = rangeproof.commit(gens, u64Scalar(v), gamma), .proof = proof };
     }
 

@@ -496,8 +496,8 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=462	2fd1f4216680ed02	df18c96b59d38d0a
 # generators and Merlin transcript), which changes what `proveIpa` folds over.
 # Counts re-measured unchanged: rangeproof 8 total / 0 in-file, ipa 4 / 0,
 # controls and traps 0.
-bulletproofs	ReleaseFast	rangeproof	1	0	54131e7ee7400689	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	4f6a76f2fa741bf6	2ade41bb2f418497
+bulletproofs	ReleaseFast	rangeproof	1	0	5c4aa46b43491786	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	89b3fb2bdc8bacc3	2ade41bb2f418497
 paillier	ReleaseFast	crt	1	<=331	158deee694942af9	ca16fc01b4ebb44c
 paillier	ReleaseFast	noncrt	1	<=141	158deee694942af9	ca16fc01b4ebb44c
 paillier	ReleaseFast	mul	1	<=12	158deee694942af9	b2221403ad3dad41

@@ -40,7 +40,7 @@ const gamma: [32]u8 = .{
     0x1d, 0xc8, 0x40, 0x7b, 0x25, 0x96, 0x0e, 0xb3, 0x58, 0x2a, 0xf1, 0x67, 0x39, 0x04, 0xdd, 0x0a,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -59,8 +59,10 @@ pub fn main() !void {
     const v_commitment = bulletproofs.commit(gens, scalarOf(amount), gamma);
 
     var prover_transcript: bulletproofs.Transcript = .init(bulletproofs.rangeproof_domain);
-    const proof = bulletproofs.prove(gpa, gens, &prover_transcript, &amount, gamma) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+    const proof = bulletproofs.prove(gpa, init.io, gens, &prover_transcript, &amount, gamma) catch |err| switch (err) {
+        // No OS entropy, or a canceled `Io`: no proof rather than one with
+        // weak blinding, which would leak the amount.
+        error.OutOfMemory, error.EntropyUnavailable, error.Canceled => return err,
         // A wallet that lets a user type an amount wider than the ledger's
         // range must report that as a user-facing refusal, not a crash — so
         // the variant has to be nameable from out here.

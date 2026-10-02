@@ -244,33 +244,18 @@ fn invertScalar(s: [32]u8) [32]u8 {
     return inv.toBytes();
 }
 
-/// OS-entropy fill for the prover's secret blinding material (`alpha`,
-/// `rho`, `s_L`, `s_R`, `tau1`, `tau2`). Mirrors the `ssh` module's
-/// `transport.zig` `fillRandom`: direct getrandom(2), panic — never
-/// silently degrade — if the OS entropy source fails (a range proof made
-/// with predictable blinding leaks the witness).
-fn fillRandom(buf: []u8) void {
-    if (builtin.os.tag != .linux)
-        @compileError("bulletproofs rangeproof.prove: only the Linux getrandom(2) entropy path is wired up (same posture as ssh/transport.zig's fillRandom)");
-    var off: usize = 0;
-    while (off < buf.len) {
-        const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
-            @panic("bulletproofs: getrandom failed");
-        }
-        off += rc;
-    }
-}
-
-/// A uniformly random scalar in `[0, L)`: 64 OS-entropy bytes,
-/// wide-reduced — the same uniform reduction `transcript.challengeScalar`
-/// uses (RFC 8032's scalar-reduction convention).
-fn randomScalar() [32]u8 {
+/// A uniformly random scalar in `[0, L)` for the prover's secret blinding
+/// material (`alpha`, `rho`, `s_L`, `s_R`, `tau1`, `tau2`): 64 bytes of
+/// `io.randomSecure`, wide-reduced — the same uniform reduction
+/// `transcript.challengeScalar` uses (RFC 8032's scalar-reduction
+/// convention). `randomSecure` asks the OS every time and has no fallback,
+/// so a failure is an error, never a weaker source: a range proof made with
+/// predictable blinding leaks the witness. (Until 2026-10-02 this was a
+/// direct Linux `getrandom(2)` and a compile error on every other target.)
+fn randomScalar(io: std.Io) error{ EntropyUnavailable, Canceled }![32]u8 {
     var wide: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &wide);
-    fillRandom(&wide);
+    try io.randomSecure(&wide);
     const out = scalar.reduce64(wide);
     if (builtin.is_test and test_random_count < test_randoms.len) {
         test_randoms[test_random_count] = out;
@@ -281,8 +266,8 @@ fn randomScalar() [32]u8 {
 
 /// Test builds only: every scalar `randomScalar` returned since the last
 /// reset, so `stackprobe_test.zig` can look for the prover's random blinding
-/// secrets on the dead stack too — they are drawn from getrandom(2) and no
-/// test could know them otherwise. Zero-length and never written outside
+/// secrets on the dead stack too — they are drawn from the OS and no test
+/// could know them otherwise. Zero-length and never written outside
 /// `zig build test`.
 pub var test_randoms: [if (builtin.is_test) 512 else 0][32]u8 = undefined;
 pub var test_random_count: usize = 0;
@@ -433,6 +418,12 @@ pub const ProveError = error{
     /// mechanical; never reaches the stub body below).
     ValueOutOfRange,
     OutOfMemory,
+    /// `io.randomSecure` could not deliver: no proof is made rather than one
+    /// with weak blinding. The transcript has been written to and must be
+    /// discarded.
+    EntropyUnavailable,
+    /// The `Io` operation was canceled (same transcript caveat).
+    Canceled,
 };
 
 /// **FABLE CORE — implemented.** See the module doc comment for the full
@@ -451,18 +442,23 @@ pub const ProveError = error{
 ///
 /// Zeroes the stack its computation used before returning, on the error
 /// path too (audit finding B12, see `burnStack`).
+///
+/// `io` supplies the blinding randomness (`io.randomSecure`, any target).
 pub fn prove(
     allocator: std.mem.Allocator,
+    io: std.Io,
     gens: Generators,
     transcript: *Transcript,
     v: *const u64,
     gamma: [32]u8,
 ) ProveError!RangeProof {
-    const result = proveInner(allocator, gens, transcript, v[0..1], @as(*const [1][32]u8, &gamma));
+    const result = proveInner(allocator, io, gens, transcript, v[0..1], @as(*const [1][32]u8, &gamma));
     burnStack();
     return result catch |err| switch (err) {
         error.ValueOutOfRange => return error.ValueOutOfRange,
         error.OutOfMemory => return error.OutOfMemory,
+        error.EntropyUnavailable => return error.EntropyUnavailable,
+        error.Canceled => return error.Canceled,
         // One value, and every Generators set holds at least one party.
         error.InvalidAggregation => unreachable,
     };
@@ -483,12 +479,13 @@ pub const ProveMultipleError = ProveError || error{
 /// B12); the stack is zeroed before returning, as in `prove`.
 pub fn proveMultiple(
     allocator: std.mem.Allocator,
+    io: std.Io,
     gens: Generators,
     transcript: *Transcript,
     values: []const u64,
     gammas: []const [32]u8,
 ) ProveMultipleError!RangeProof {
-    const result = proveInner(allocator, gens, transcript, values, gammas);
+    const result = proveInner(allocator, io, gens, transcript, values, gammas);
     burnStack();
     return result;
 }
@@ -527,6 +524,7 @@ noinline fn burnStack() void {
 /// compiler does not inline a function this large today).
 noinline fn proveInner(
     allocator: std.mem.Allocator,
+    io: std.Io,
     gens: Generators,
     transcript: *Transcript,
     values: []const u64,
@@ -593,7 +591,7 @@ noinline fn proveInner(
 
     // 2. A = alpha*H + <a_L, G_vec> + <a_R, H_vec>. All lengths are nm by
     //    construction — LengthMismatch is unreachable throughout.
-    const alpha = randomScalar();
+    const alpha = try randomScalar(io);
     const a_commit = mulOrIdentity(gens.h, alpha)
         .add(scalarvec.multiScalarMul(a_l, g_vec) catch unreachable)
         .add(scalarvec.multiScalarMul(a_r, h_vec) catch unreachable);
@@ -604,10 +602,10 @@ noinline fn proveInner(
     const s_r = try scratch.alloc([32]u8, nm);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(s_r));
     for (s_l, s_r) |*sl, *sr| {
-        sl.* = randomScalar();
-        sr.* = randomScalar();
+        sl.* = try randomScalar(io);
+        sr.* = try randomScalar(io);
     }
-    const rho = randomScalar();
+    const rho = try randomScalar(io);
     const s_commit = mulOrIdentity(gens.h, rho)
         .add(scalarvec.multiScalarMul(s_l, g_vec) catch unreachable)
         .add(scalarvec.multiScalarMul(s_r, h_vec) catch unreachable);
@@ -676,8 +674,8 @@ noinline fn proveInner(
 
     // 6.-7. T1/T2 under the SAME g/h base points the V_j were committed
     //    under; bind them; draw x.
-    const tau1 = randomScalar();
-    const tau2 = randomScalar();
+    const tau1 = try randomScalar(io);
+    const tau2 = try randomScalar(io);
     const t1_commit = mulOrIdentity(gens.g, t1_scalar).add(mulOrIdentity(gens.h, tau1));
     const t2_commit = mulOrIdentity(gens.g, t2_scalar).add(mulOrIdentity(gens.h, tau2));
     transcript.appendPoint("T_1", t1_commit);
@@ -1153,8 +1151,8 @@ test "prove: rejects v >= 2^n at construction, without touching the stub" {
     const gens = try Generators.init(std.testing.allocator, 4); // n = 4, values must be < 16
     defer gens.deinit(std.testing.allocator);
     var t = Transcript.init("bulletproofs/range-proof/v1");
-    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, &@as(u64, 16), scalarvec.zero));
-    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, &@as(u64, 255), scalarvec.zero));
+    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, std.testing.io, gens, &t, &@as(u64, 16), scalarvec.zero));
+    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, std.testing.io, gens, &t, &@as(u64, 255), scalarvec.zero));
 }
 
 test "prove: n=64 construction-time guard is skipped, and the boundary values it would have to handle actually verify (audit B6)" {
@@ -1187,7 +1185,7 @@ test "prove: n=64 construction-time guard is skipped, and the boundary values it
         const commitment = commit(gens, v_bytes, gamma);
 
         var prove_t = Transcript.init(transcript_domain);
-        const proof = try prove(std.testing.allocator, gens, &prove_t, &v, gamma);
+        const proof = try prove(std.testing.allocator, std.testing.io, gens, &prove_t, &v, gamma);
         defer proof.deinit(std.testing.allocator);
 
         var verify_t = Transcript.init(transcript_domain);

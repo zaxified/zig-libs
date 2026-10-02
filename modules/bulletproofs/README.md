@@ -51,7 +51,7 @@ const gamma = ...; // caller-supplied random blinding scalar
 const commitment = bulletproofs.commit(gens, v_as_scalar_bytes, gamma);
 
 var prove_transcript = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
-const proof = try bulletproofs.prove(allocator, gens, &prove_transcript, &v, gamma);
+const proof = try bulletproofs.prove(allocator, io, gens, &prove_transcript, &v, gamma);
 defer proof.deinit(allocator);
 
 var verify_transcript = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
@@ -88,12 +88,10 @@ multi-party dealer/party protocol is not offered.
 
 ## Caveats
 
-- **Proving is Linux-only** (`meta.platform = .linux`). `prove` draws its
-  secret blinding via `getrandom(2)` directly (`@compileError` on non-Linux
-  — a predictable-blinding proof leaks the witness, so it never silently
-  degrades). `verify`/`verifyIpa`/`commit`/`deltaYZ`/`proveIpa` (witness
-  passed in) and both byte codecs are platform-independent; only the
-  internal-entropy `prove` path is gated.
+- **Proving needs an `std.Io`** for its secret blinding: `prove`/
+  `proveMultiple` draw it from `io.randomSecure` (the OS, every call, no
+  fallback — a predictable-blinding proof leaks the witness, so an entropy
+  failure is `error.EntropyUnavailable`, never a weaker source). Any target.
 - **Constant-time on the prover's secrets, measured.** This bullet used to
   say the opposite — that `multiScalarMul` skipped zero scalars and leaked the
   committed value's bit pattern. Audit finding F2 fixed that; the doc did not
