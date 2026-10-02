@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **BREAKING (no known consumer): the private base32hex is gone;
+  owner-hash labels go through the `base32` module (new dependency).** Removed
+  `nsec3.encode`, `nsec3.decode`, `nsec3.encodedLen`, `nsec3.decodedLen` and
+  `nsec3.Base32HexError` — use `base32.encode`/`decode` with
+  `.alphabet = .hex`. ⛔ The old decoder dropped leftover bits, so a
+  33-symbol owner label decoded to the same 20 bytes as its first 32 symbols:
+  two different owner names, one hash. Labels must now be exactly 32 symbols
+  (`base32` refuses 33 as `InvalidLength`). The fuzz corpus pin of folded
+  labels that decode went from 10 to 9 for exactly that seed.
+
 - **2026-09-12** — **BEHAVIOURAL, not breaking: F3 closed (round 2, Q6).**
   `nsec.proveDenial` and `nsec3.proveDenial` returned two DIFFERENT verdicts
   for the identical protocol state: an unsigned delegation (NS in the

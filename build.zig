@@ -317,7 +317,7 @@ const module_list = [_]Module{
     .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .test_deps = &.{"testkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
-    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" }, .test_deps = &.{"testkit"} },
+    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa", "base32" }, .test_deps = &.{"testkit"} },
     .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .test_deps = &.{"testkit"} },
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

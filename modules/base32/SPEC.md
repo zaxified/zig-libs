@@ -27,7 +27,7 @@ No foreign source was read; feature claims are from public documentation as reme
 | Python [`base64`](https://docs.python.org/3/library/base64.html) `b32encode`/`b32decode`/`b32hexencode` — **reference** | Python | PSF-2.0 (API: NOASSERTION for python/cpython) | — (cpython: 77.4k) | Python 3.x stdlib | `casefold`, `map01` (0→O, 1→L/I for hand-typed text); padding required on decode *(inferred)*. Used here as the black-box KAT oracle (`tools/gen_kat.py`). This module adds optional/forbidden padding and whitespace skipping, and lacks `map01`. |
 | [ia0/data-encoding](https://github.com/ia0/data-encoding) | Rust | MIT | 203 | push 2026-09-01 (no GitHub release) | Constant-per-spec encodings (BASE32, BASE32HEX, `_NOPAD`, DNSSEC), custom specifications, trailing-bit checking, streaming-friendly lengths *(inferred)*. The broad, spec-driven ceiling. |
 | [andreasots/base32](https://github.com/andreasots/base32) | Rust | Apache-2.0 | 35 | push 2026-08-23 | RFC 4648 and Crockford alphabets, simple encode/decode *(inferred)*. Source not read (not MIT). |
-| Zig `std` | Zig | MIT | — | Zig 0.16.0 | No base32 at all (`std.base64` only). `dnssec` here carries a private base32hex. |
+| Zig `std` | Zig | MIT | — | Zig 0.16.0 | No base32 at all (`std.base64` only). `dnssec` here carried a private base32hex until 2026-10-02; it uses this module now. |
 
 **Where we are ahead:** strict-by-default decoding (exact padding count, canonical trailing bits,
 typed errors per fault — accepted text maps injectively to bytes), opt-in leniency exactly
@@ -92,8 +92,7 @@ does not zero any buffer: callers own `dest` and should clear it after use.
 
 ## Backlog / deferred
 
-- **`dnssec` could switch to this module** for NSEC3 base32hex (it carries a
-  private copy). Not done here on purpose: `dnssec` is untouched by this change.
+- ~~**`dnssec` could switch to this module**~~ — done 2026-10-02: `dnssec.nsec3` reads owner-hash labels with `.hex`, `.forbidden` padding, `.insensitive` case. The strict trailing-length check closed an aliasing its private decoder had (a 33-symbol label decoding like the 32-symbol one).
 - Streaming encoder/decoder (for secrets read in pieces): none needed yet.
 - A branch-free table-less decoder, if a consumer ever needs a constant-time
   claim.

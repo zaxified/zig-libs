@@ -399,7 +399,7 @@ way to recognise it.
 | [`df-elect`](modules/df-elect/README.md) | 3 | EVPN-style Designated-Forwarder election for N-member segments (RFC 7432 mod-N, RFC 8584 HRW) with DF-wait failover + split-horizon, from a link-state flood; model-checked in netsim | any | netsim |
 | [`dnp3`](modules/dnp3/README.md) | 3 | DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation. Secure Auth (g120) scaffolded only, no crypto | any | aeskw |
 | [`dns`](modules/dns/README.md) | 2 | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
-| [`dnssec`](modules/dnssec/README.md) | 2 | Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence | any | dns, rsa |
+| [`dnssec`](modules/dnssec/README.md) | 2 | Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence | any | dns, rsa, base32 |
 | [`ebpf`](modules/ebpf/README.md) | 3 | eBPF program generation over `std.os.linux.bpf` — bytecode builders (kprobe counter, XDP filter, ring-buffer emitter); real-kernel verifier acceptance unverified in CI | **linux** | netlink |
 | [`enip`](modules/enip/README.md) | 3 | EtherNet/IP + CIP — encapsulation layer (register/SendRRData/SendUnitData), CIP messaging, connection manager, tag/symbolic path client for Logix controllers | any | netaddr |
 | [`ethfrag`](modules/ethfrag/README.md) | 2 | Hardened inner-frame fragmentation/reassembly codec — RFC 5722 overlap rejection, bounded per-datagram memory, caller-clocked timeout, fuzz-tested never-panic | any | — |

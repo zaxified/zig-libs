@@ -33,74 +33,22 @@ const testkit = @import("testkit");
 const seed = testkit.fuzz.seed;
 const vectors = @import("oracle_vectors.zig");
 
-// ── base32hex (RFC 4648 §7) ─────────────────────────────────────────────────
+// ── base32hex (RFC 4648 §7), through the `base32` module ─────────────────────
 
-const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+const base32 = @import("base32");
 
-pub const Base32HexError = error{InvalidBase32Hex};
+/// How an owner-hash label is read: RFC 4648 §7 alphabet, no padding (RFC 5155
+/// §3.3 — a SHA-1 digest is exactly 32 symbols), case-insensitive because DNS
+/// names are (§1.3 of RFC 4343). STRICT otherwise: until 2026-10-02 this
+/// module had its own decoder that ignored leftover bits, so a 33-character
+/// label decoded to the same 20 bytes as the 32-character one in front of it —
+/// two different owner names, one hash. `base32` refuses the impossible length.
+const label_decode: base32.DecodeOptions = .{ .alphabet = .hex, .padding = .forbidden, .case = .insensitive };
+/// How this module writes one (upper case, as `ldns-signzone` does).
+const label_encode: base32.EncodeOptions = .{ .alphabet = .hex, .pad = false };
 
-/// Longest base32hex text for `n` input bytes (8 chars per 5 bytes, rounded
-/// up; DNSSEC never pads — NSEC3 hash lengths are whole SHA-1/SHA-256
-/// digests, which happen to encode without padding at 20 and 32 bytes).
-pub fn encodedLen(byte_len: usize) usize {
-    return (byte_len * 8 + 4) / 5;
-}
-
-/// Encode `bytes` as unpadded base32hex text (RFC 4648 §7 alphabet
-/// `0-9A-V`), written into `out` (`out.len >= encodedLen(bytes.len)`).
-/// Returns the written slice.
-pub fn encode(bytes: []const u8, out: []u8) []u8 {
-    var bit_buf: u32 = 0;
-    var bit_count: u5 = 0;
-    var out_len: usize = 0;
-    for (bytes) |b| {
-        bit_buf = (bit_buf << 8) | b;
-        bit_count += 8;
-        while (bit_count >= 5) {
-            bit_count -= 5;
-            out[out_len] = alphabet[(bit_buf >> bit_count) & 0x1f];
-            out_len += 1;
-        }
-    }
-    if (bit_count > 0) {
-        out[out_len] = alphabet[(bit_buf << (5 - bit_count)) & 0x1f];
-        out_len += 1;
-    }
-    return out[0..out_len];
-}
-
-fn decodeChar(c: u8) Base32HexError!u5 {
-    return switch (c) {
-        '0'...'9' => @intCast(c - '0'),
-        'A'...'V' => @intCast(c - 'A' + 10),
-        'a'...'v' => @intCast(c - 'a' + 10),
-        else => error.InvalidBase32Hex,
-    };
-}
-
-/// Longest byte output for `n` input chars.
-pub fn decodedLen(text_len: usize) usize {
-    return (text_len * 5) / 8;
-}
-
-/// Decode unpadded base32hex `text` (case-insensitive) into `out`
-/// (`out.len >= decodedLen(text.len)`). Rejects non-alphabet characters.
-pub fn decode(text: []const u8, out: []u8) Base32HexError![]u8 {
-    var bit_buf: u32 = 0;
-    var bit_count: u5 = 0;
-    var out_len: usize = 0;
-    for (text) |c| {
-        const v = try decodeChar(c);
-        bit_buf = (bit_buf << 5) | v;
-        bit_count += 5;
-        if (bit_count >= 8) {
-            bit_count -= 8;
-            out[out_len] = @truncate(bit_buf >> bit_count);
-            out_len += 1;
-        }
-    }
-    return out[0..out_len];
-}
+/// Length of the owner-hash label of a SHA-1 digest.
+const sha1_label_len = base32.encodedLen(sha1_digest_len, false);
 
 // ── iterated hash (RFC 5155 §5) ─────────────────────────────────────────────
 
@@ -339,16 +287,12 @@ fn usableRecord(r: Nsec3Record, salt: []const u8, iterations: u16) bool {
 
 fn decodeOwnerHash(label: []const u8, out: *[sha1_digest_len]u8) ?[]const u8 {
     // An NSEC3 owner hash is always exactly one SHA-1 digest (RFC 5155 §5), so
-    // the label must decode to precisely `sha1_digest_len` bytes. Binding both
-    // bounds here (not just the lower one) is a memory-safety requirement, not
-    // just a validity check: `decode` writes `decodedLen(label.len)` bytes into
-    // `tmp` with no upper-bound check of its own, so an over-long
-    // attacker-controlled label would otherwise overflow the fixed buffer.
-    if (decodedLen(label.len) != sha1_digest_len) return null;
-    var tmp: [64]u8 = undefined;
-    const dec = decode(label, &tmp) catch return null;
-    if (dec.len != sha1_digest_len) return null;
-    @memcpy(out, dec);
+    // the label is exactly `sha1_label_len` symbols. (`base32.decode` bounds its own
+    // writes by `out.len`; the over-long-label overflow this function once had
+    // was the old private decoder's.)
+    if (label.len != sha1_label_len) return null;
+    const n = base32.decode(out, label, label_decode) catch return null;
+    if (n != sha1_digest_len) return null;
     return out;
 }
 
@@ -385,43 +329,39 @@ fn coverDecoded(decoded: []const DecodedRecord, name: []const u8, salt: []const 
 
 const testing = std.testing;
 
-test "base32hex: encode/decode round-trip, RFC 4648 alphabet" {
-    var enc_buf: [64]u8 = undefined;
-    var dec_buf: [64]u8 = undefined;
-    const inputs = [_][]const u8{ "", "f", "fo", "foo", "foob", "fooba", "foobar" };
-    for (inputs) |input| {
-        const enc = encode(input, &enc_buf);
-        const dec = try decode(enc, &dec_buf);
-        try testing.expectEqualSlices(u8, input, dec);
-    }
+test "owner-hash labels: the options this module reads and writes them with" {
+    // The alphabet itself is `base32`'s (and tested there against RFC 4648
+    // §10); what is this module's is the choice of options.
+    const h = iteratedHash("example", "", 0);
+    var enc_buf: [sha1_label_len]u8 = undefined;
+    const label = try base32.encode(&enc_buf, &h, label_encode);
+    try testing.expectEqual(@as(usize, 32), label.len);
+    var out: [sha1_digest_len]u8 = undefined;
+    try testing.expectEqualSlices(u8, &h, decodeOwnerHash(label, &out).?);
+
+    // Case-insensitive, as DNS names are.
+    var lower: [sha1_label_len]u8 = undefined;
+    for (label, &lower) |c, *l| l.* = std.ascii.toLower(c);
+    try testing.expectEqualSlices(u8, &h, decodeOwnerHash(&lower, &out).?);
+
+    // Out of the alphabet, padded, or of a length no digest has.
+    var bad = enc_buf;
+    bad[5] = 'W';
+    try testing.expect(decodeOwnerHash(&bad, &out) == null);
+    try testing.expect(decodeOwnerHash(label[0..31], &out) == null);
 }
 
-test "base32hex: known vector (RFC 4648 §10 base32 test vectors, hex alphabet)" {
-    // RFC 4648's own base32 (standard alphabet) test vectors for "foobar"
-    // decode to specific bit patterns; base32hex uses a different alphabet
-    // (0-9A-V rather than A-Z2-7) over the SAME bit-packing algorithm, so we
-    // verify structurally: encoding then decoding "foobar" must round-trip
-    // and produce the RFC 4648 §6 expected LENGTH (8 chars for 6 bytes,
-    // unpadded).
-    var buf: [16]u8 = undefined;
-    const enc = encode("foobar", &buf);
-    try testing.expectEqual(@as(usize, 10), enc.len); // ceil(6*8/5) = 10
-}
-
-test "base32hex: rejects out-of-alphabet characters" {
-    var buf: [8]u8 = undefined;
-    try testing.expectError(error.InvalidBase32Hex, decode("W", &buf)); // 'W' is past 'V'
-    try testing.expectError(error.InvalidBase32Hex, decode("!", &buf));
-}
-
-test "base32hex: lowercase accepted (case-insensitive decode)" {
-    var enc_buf: [16]u8 = undefined;
-    var dec_buf: [16]u8 = undefined;
-    const enc = encode("hi", &enc_buf);
-    var lower_buf: [16]u8 = undefined;
-    for (enc, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
-    const dec = try decode(lower_buf[0..enc.len], &dec_buf);
-    try testing.expectEqualSlices(u8, "hi", dec);
+test "regression: a 33-character label no longer aliases the 32-character one" {
+    // The private decoder this module had until 2026-10-02 dropped leftover
+    // bits: `label ++ "0"` decoded to the same 20 bytes as `label`, so two
+    // different owner names stood for one hash.
+    const h = iteratedHash("example", "", 0);
+    var enc_buf: [sha1_label_len + 1]u8 = undefined;
+    const label = try base32.encode(enc_buf[0..sha1_label_len], &h, label_encode);
+    enc_buf[sha1_label_len] = '0';
+    var out: [sha1_digest_len]u8 = undefined;
+    try testing.expect(decodeOwnerHash(label, &out) != null);
+    try testing.expect(decodeOwnerHash(&enc_buf, &out) == null);
 }
 
 test "iteratedHash: zero iterations equals a single SHA1(name||salt)" {
@@ -486,7 +426,7 @@ test "regression: over-long NSEC3 owner-hash label does not overflow (was OOB st
 /// written into `out` (>= 32 bytes). Mirrors what a signer puts in the zone.
 fn ownerLabel(name: []const u8, salt: []const u8, iterations: u16, out: []u8) []u8 {
     const h = hashName(name, salt, iterations).?;
-    return encode(&h, out);
+    return base32.encode(out, &h, label_encode) catch unreachable; // out.len >= sha1_label_len
 }
 
 test "proveDenial NSEC3: the next-closer/wildcard COVER is honored — an empty-gap chain is bogus" {
@@ -657,7 +597,7 @@ test "proveDenial NSEC3: insecure delegation -- DS NODATA with NS set, no SOA, n
 // "over-long owner-hash label" regression above was found in
 // (`decodeOwnerHash`'s fixed `[64]u8` scratch buffer). Drive `proveDenial`
 // itself (the real entry point over a `Nsec3Set` built from wire records) so
-// both `decodeOwnerHash` and the general `decode` base32hex routine are
+// both `decodeOwnerHash` and `base32.decode` behind it are
 // reached with a fuzzed label length/content, not just a single regression
 // value.
 
@@ -807,8 +747,11 @@ test "corpus: every label seed reaches decodeOwnerHash, and the hashes decoded a
     // the draw was fixed — `label_len` was 0 and the alphabet fold, which the
     // original comment says exists so `decode` is reached at all, never ran.
     try testing.expectEqual(@as(usize, 6), decoded_verbatim);
-    // ⭐ 10 against 6: folding into the alphabet turns four more seeds into a
+    // ⭐ 9 against 6: folding into the alphabet turns three more seeds into a
     // real digest, which is the size of what the dead `boolWeighted` knob was
-    // supposed to be buying and never bought once.
-    try testing.expectEqual(@as(usize, 10), decoded_folded);
+    // supposed to be buying and never bought once. It was 10 until 2026-10-02:
+    // the folded "…UVW" seed is 33 symbols, which the old private decoder
+    // read as the same 20 bytes as its first 32 — the aliasing the move to
+    // `base32` removed (see the "33-character label" regression test).
+    try testing.expectEqual(@as(usize, 9), decoded_folded);
 }

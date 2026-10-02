@@ -52,7 +52,7 @@ pub const meta = .{
     .role = .util, // pure validation logic; no I/O, no socket of its own
     .concurrency = .reentrant, // no shared/global state
     .model_after = "RFC 4033/4034/4035 (DNSSEC core), RFC 5155 (NSEC3), RFC 6605 (ECDSA), RFC 8080 (Ed25519); structure cross-checked vs. Go miekg/dns's dnssec.go and NLnet Labs' unbound/ldns validator behavior — design/behavioral reference only, no source copied",
-    .deps = .{ "dns", "rsa" },
+    .deps = .{ "dns", "rsa", "base32" },
 };
 
 /// Uncompressed-name decoding + canonical name encoding (RFC 4034 §6.2) —

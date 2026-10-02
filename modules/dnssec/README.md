@@ -49,7 +49,7 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 |------|------|--------|
 | `src/wire.zig` | Uncompressed name decode (RRSIG signer name / NSEC next name) + canonical name encoding (RFC 4034 §6.2) | real, tested |
 | `src/rdata.zig` | DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM RDATA parsing, Type Bit Maps, key tag | real, tested |
-| `src/nsec3.zig` | base32hex (RFC 4648 §7) + NSEC3 iterated-SHA-1 hash (RFC 5155 §5); closest-encloser / next-closer denial proof incl. Opt-Out (RFC 5155 §8) | real, oracle-verified |
+| `src/nsec3.zig` | owner-hash labels (base32hex via the `base32` module) + NSEC3 iterated-SHA-1 hash (RFC 5155 §5); closest-encloser / next-closer denial proof incl. Opt-Out (RFC 5155 §8) | real, oracle-verified |
 | `src/nsec.zig` | plain-NSEC (non-NSEC3) denial proof (RFC 4035 §5.4): canonical-order gap coverage (RFC 4034 §6.1), NODATA, wildcard, insecure-delegation | real, tested |
 | `src/keys.zig` | DNSKEY public-key wire decode (RFC 3110/6605/8080) + per-algorithm signature verify dispatch | real, tested |
 | `src/ds.zig` | DS digest computation (RFC 4034 §5.1.4) + DNSKEY matching | real, tested |
