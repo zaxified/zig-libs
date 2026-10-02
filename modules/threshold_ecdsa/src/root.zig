@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: MIT
-//! threshold_ecdsa — GG20 threshold-ECDSA over secp256k1: **Phase 2a
-//! (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params + the
-//! semi-honest MtA core) + Phase 2c (GG18 Appendix A zero-knowledge MtA
-//! range proofs + MtAwc, `zkproofs.zig`) + Phase 2d (GG20 online signing,
-//! `signing.zig`)** — the full arc (2a keygen · 2b aux-params/MtA · 2c
-//! range proofs + MtAwc · 2d signing) is implemented end to end. Depends
-//! on the sibling `paillier` module: GG20's whole design hinges on every
-//! party holding its own additively-homomorphic Paillier keypair — MtA
-//! (`mta.zig`) is literally `paillier`'s homomorphic ops composed into a
+//! threshold_ecdsa — GG20 threshold-ECDSA over secp256k1: trusted-dealer
+//! keygen (this file), ring-Pedersen aux params, MtA (`mta.zig`), the GG18
+//! Appendix A range proofs + MtAwc (`zkproofs.zig`), and GG20 signing as a
+//! per-signer state machine (`presign.zig`: Phases 1–6 → a `Presignature`,
+//! then one online round) with identifiable abort, driven in-process by
+//! `signing.signWithShares`. Depends on the sibling `paillier` module: GG20's
+//! whole design hinges on every party holding its own additively-homomorphic
+//! Paillier keypair — MtA is `paillier`'s homomorphic ops composed into a
 //! multiplicative→additive share conversion.
 //!
-//! **Status: keygen + aux-params + MtA + range proofs + online signing are
-//! all implemented (`signWithShares` genuinely produces a standard
+//! **Status:** every signer can run in its own process (`presign.Party`,
+//! message in → message out); every check of GG20 §3.2 is made, and every
+//! abort names its culprit except the paper's types 5 and 7, which need its
+//! §4.3 opening protocol (not implemented). The output is a standard
 //! secp256k1 ECDSA signature verifying under `std.crypto.sign.ecdsa
-//! .EcdsaSecp256k1Sha256`).** One security layer remains a documented,
-//! deliberate scope cut: GG20's identifiable-abort culprit-naming apparatus
-//! is not implemented and has no public entry point — "abort-only v1"
-//! never returns a bad signature but cannot name a culprit on abort; see
-//! `signing.zig`'s module doc comment for the exact boundary. The
+//! .EcdsaSecp256k1Sha256`. The
 //! Shamir-secret-sharing + Feldman-VSS + Lagrange-interpolation core
 //! (`splitSecretKey`, `groupPublicKey`, `derivePublicKeyShare`,
 //! `reconstructSecret`) is a direct port of this repo's already-KAT-
@@ -84,18 +81,19 @@ pub const mta = @import("mta.zig");
 /// into the fail-closed checked-MtA flow.
 pub const zkproofs = @import("zkproofs.zig");
 
-/// **Phase 2d** — the GG20 online threshold-ECDSA SIGNING protocol: ties
-/// keygen (this file) + MtA (`mta`) + the range proofs/MtAwc (`zkproofs`)
-/// into a `t`-of-`n` signature that is a STANDARD secp256k1 ECDSA
-/// signature, verifiable under `std.crypto.sign.ecdsa
-/// .EcdsaSecp256k1Sha256` against `KeyShare.group_public_key`. Round
-/// orchestration, the MtA/MtAwc wiring, and the signature arithmetic are
-/// all REAL (`signWithShares` genuinely produces a verifying signature,
-/// end to end); the GG20 identifiable-abort culprit-naming apparatus is a
-/// documented, deliberate scope cut ("abort-only v1" — never returns a bad
-/// signature, but cannot name a culprit on abort) — see `signing.zig`'s
-/// module doc comment.
+/// The in-process driver `signWithShares` (one `presign.Party` per share,
+/// messages routed by a loop) and `lagrangeCoefficient`. See `signing.zig`.
 pub const signing = @import("signing.zig");
+
+/// GG20 signing as one state machine per signer: `Party` (Phases 1–6,
+/// message in → message out), `Presignature` (one online round, used once),
+/// `PresignaturePublic.combine` (checks every share, names a bad one). See
+/// `presign.zig`'s module doc comment for the rounds and the caller's duties.
+pub const presign = @import("presign.zig");
+
+/// The curve-only Sigma proofs of GG20 §3.3 (`T_i`, `S_i`/`T_i`, `Γ_i`) and
+/// the NUMS Pedersen generator `H`.
+pub const ecproofs = @import("ecproofs.zig");
 
 /// **Audit-F1 closure (IMPLEMENTED)** — the Πprm/Πmod zero-knowledge
 /// proofs-of-correct-generation for `AuxParams` (CGGMP21 ePrint 2021/060
@@ -116,7 +114,7 @@ pub const gate = @import("gate.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen through online signing, producing standard verifiable ECDSA sigs. **Audit warranted before production use.**",
+    .doc = "GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen, per-signer presigning state machine with identifiable abort, one-round online signing; standard verifiable ECDSA sigs. **Audit warranted before production use.**",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -177,10 +175,12 @@ fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, dat
 const InvalidEncodingError = error{InvalidEncoding};
 
 fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]const u8 {
-    if (bytes.len < offset.* + 4) return error.InvalidEncoding;
+    // Subtractions, not `offset + len`: a u32 length added to a usize offset
+    // wraps on 32-bit targets and would pass the bound.
+    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
     const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
     offset.* += 4;
-    if (bytes.len < offset.* + len) return error.InvalidEncoding;
+    if (bytes.len - offset.* < len) return error.InvalidEncoding;
     const data = bytes[offset.* .. offset.* + len];
     offset.* += len;
     return data;
@@ -1251,6 +1251,10 @@ pub const PartyPublicKeys = struct {
     index: u32,
     paillier_pk: paillier.PublicKey,
     aux: AuxParams,
+    /// `X_j = x_j·G`, this party's Feldman-consistent public share. Every
+    /// signer needs every other signer's `X_j`: GG20's MtAwc binds the
+    /// counterparty's input to `W_j = λ_j·X_j` (`presign.zig`).
+    verifying_share: Element,
 };
 
 /// The full group's public material: one `PartyPublicKeys` per party,
@@ -1275,8 +1279,8 @@ pub const PublicKeys = struct {
 
     /// `u32-BE count || entry[0] || ... || entry[count-1]`, each entry
     /// `u32-BE index || len-prefixed(paillier n) || len-prefixed
-    /// (paillier g) || len-prefixed(aux.toBytesAlloc())`. REAL,
-    /// mechanical.
+    /// (paillier g) || len-prefixed(aux.toBytesAlloc()) ||
+    /// verifying_share (33 bytes)`. REAL, mechanical.
     pub fn toBytesAlloc(self: PublicKeys, allocator: std.mem.Allocator) AllocError![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
@@ -1304,12 +1308,14 @@ pub const PublicKeys = struct {
             const aux_bytes = try e.aux.toBytesAlloc(allocator);
             defer allocator.free(aux_bytes);
             try appendLenPrefixed(&list, allocator, aux_bytes);
+
+            try list.appendSlice(allocator, &e.verifying_share.toBytes());
         }
 
         return list.toOwnedSlice(allocator);
     }
 
-    pub const FromBytesError = error{InvalidEncoding} || paillier.PublicKey.FromBytesError || AuxParams.FromBytesError;
+    pub const FromBytesError = error{InvalidEncoding} || paillier.PublicKey.FromBytesError || AuxParams.FromBytesError || ElementError;
 
     /// Inverse of `toBytesAlloc`. Allocates `entries`; caller frees with
     /// `allocator`.
@@ -1327,8 +1333,8 @@ pub const PublicKeys = struct {
         // length-prefixed payloads), so reject a `count` the remaining
         // bytes could not possibly satisfy BEFORE allocating -- the same
         // bound `FeldmanCommitments.fromBytesAlloc` above already enforces
-        // for its own (fixed-size-element) count.
-        const min_entry_bytes = 16;
+        // for its own (fixed-size-element) count. (+33: the verifying share.)
+        const min_entry_bytes = 16 + Ne;
         if ((bytes.len - 4) / min_entry_bytes < count) return error.InvalidEncoding;
         var offset: usize = 4;
 
@@ -1346,8 +1352,13 @@ pub const PublicKeys = struct {
             const aux_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
             const aux = try AuxParams.fromBytesAlloc(aux_bytes);
 
-            slot.* = .{ .index = index, .paillier_pk = pk, .aux = aux };
+            if (bytes.len < offset + Ne) return error.InvalidEncoding;
+            const verifying_share = try Element.fromBytes(bytes[offset..][0..Ne].*);
+            offset += Ne;
+
+            slot.* = .{ .index = index, .paillier_pk = pk, .aux = aux, .verifying_share = verifying_share };
         }
+        if (offset != bytes.len) return error.InvalidEncoding;
         return .{ .entries = entries };
     }
 };
@@ -1464,6 +1475,7 @@ pub const KeyShare = struct {
         const paillier_secret = try paillier.SecretKey.fromBytes(sk_n_bytes, lambda_bytes, mu_bytes);
 
         const pubkeys_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
+        if (offset != bytes.len) return error.InvalidEncoding;
         const public_keys = try PublicKeys.fromBytesAlloc(allocator, pubkeys_bytes);
         errdefer allocator.free(public_keys.entries);
 
@@ -1475,7 +1487,9 @@ pub const KeyShare = struct {
         // top of `signWithShares`'s own fail-closed fix: a `KeyShare` built
         // by any OTHER path (not through this codec) still gets caught
         // there.
-        if (public_keys.get(index) == null) return error.InvalidEncoding;
+        const own = public_keys.get(index) orelse return error.InvalidEncoding;
+        // The broadcast copy of this party's own `X_i` must be the one it holds.
+        if (!std.mem.eql(u8, &own.verifying_share.toBytes(), &verifying_share.toBytes())) return error.InvalidEncoding;
 
         return .{
             .index = index,
@@ -1534,6 +1548,7 @@ pub fn keygenTrustedDealer(
             .index = i,
             .paillier_pk = paillier_keys[i - 1].public,
             .aux = aux_params[i - 1],
+            .verifying_share = try derivePublicKeyShare(split.commitments, i),
         };
     }
     const public_keys: PublicKeys = .{ .entries = party_pubs };
@@ -1542,7 +1557,7 @@ pub fn keygenTrustedDealer(
     errdefer allocator.free(key_shares);
     i = 1;
     while (i <= n) : (i += 1) {
-        const verifying_share = try derivePublicKeyShare(split.commitments, i);
+        const verifying_share = party_pubs[i - 1].verifying_share;
         key_shares[i - 1] = .{
             .index = i,
             .t = t,
@@ -2081,13 +2096,13 @@ test {
     _ = zkproofs;
 }
 
-// Pull the `signing` submodule's tests into this module's test binary —
-// same dark-tests rule. Phase 2d's `signWithShares` is REAL end to end
-// (its decisive std-ECDSA-verify test PASSES, does not panic); identifiable
-// abort is deferred work with no public stub. See `signing.zig`'s module doc
-// comment.
+// Pull the `signing`, `presign` and `ecproofs` submodules' tests into this
+// module's test binary — same dark-tests rule.
 test {
     _ = signing;
+    _ = presign;
+    _ = ecproofs;
+    _ = @import("tsslib_interop.zig");
 }
 
 // Pull the `aux_proofs` submodule's tests into this module's test binary —

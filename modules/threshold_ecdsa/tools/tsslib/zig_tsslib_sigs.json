@@ -1,0 +1,29 @@
+{
+  "message": "zig-libs threshold_ecdsa / tss-lib interop v1",
+  "signatures": [
+    {
+      "signers": [
+        1,
+        2
+      ],
+      "r": "2ac2d465880959b54376ddebe10625a70a59b6be2eb24f7881ca2d3058d03a09",
+      "s": "7eaf4664c7af9afc01501dedc14c8d80be6f5102b4e98652206775fe107250ac"
+    },
+    {
+      "signers": [
+        1,
+        3
+      ],
+      "r": "dd69994b72f14eed4de4dc2399117e0ce53cb85827e04a4664884143e4a25a25",
+      "s": "57cb44850252db81220dbfc5f8204ba59df2806522c939c25a21ca5fe04494be"
+    },
+    {
+      "signers": [
+        2,
+        3
+      ],
+      "r": "593f26d32c183c7d55455e145dfdf7b23b7fd4e96f9ffc1790cfdb3da911ceae",
+      "s": "3bd7614fbafe7d2a3d8aac51e09606e26ac6ed1f9930e3673ffd5283fc65babc"
+    }
+  ]
+}

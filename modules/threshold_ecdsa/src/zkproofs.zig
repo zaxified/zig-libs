@@ -214,10 +214,12 @@ fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, dat
 const InvalidEncodingError = error{InvalidEncoding};
 
 fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]const u8 {
-    if (bytes.len < offset.* + 4) return error.InvalidEncoding;
+    // Subtractions, not `offset + len`: a u32 length added to a usize offset
+    // wraps on 32-bit targets and would pass the bound.
+    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
     const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
     offset.* += 4;
-    if (bytes.len < offset.* + len) return error.InvalidEncoding;
+    if (bytes.len - offset.* < len) return error.InvalidEncoding;
     const data = bytes[offset.* .. offset.* + len];
     offset.* += len;
     return data;
@@ -700,6 +702,9 @@ fn chunkScalar(chunk: []const u8) Scalar {
 pub const range_proof_domain = "threshold_ecdsa/zkproofs/range-proof/v2";
 pub const mta_proof_domain = "threshold_ecdsa/zkproofs/mta-proof/v2";
 pub const mta_proof_wc_domain = "threshold_ecdsa/zkproofs/mta-proof-wc/v2";
+/// GG20 Phase 5's consistency proof between `R̄ = k·R` and `Enc(k)` — see
+/// `PdlProof`. Born with the Γ binding, hence no v1.
+pub const pdl_proof_domain = "threshold_ecdsa/zkproofs/pdl-proof/v1";
 
 /// Fiat-Shamir transcript builder: binds every public value relevant to a
 /// proof's soundness — the verifier's aux params, the ciphertexts/points
@@ -921,6 +926,34 @@ pub fn mtaProofWcChallenge(
     return t.finalize();
 }
 
+/// The challenge `provePdl`/`verifyPdl` commit to: the caller's context
+/// (session id and prover index) first, then everything
+/// `rangeProofChallenge` binds, then the curve statement (`base`, `point`)
+/// and the curve commitment `u_point`.
+pub fn pdlProofChallenge(
+    verifier_aux: root.AuxParams,
+    alice_pk: paillier.PublicKey,
+    c_a: paillier.Ciphertext,
+    z: root.AuxFe,
+    u: paillier.Ciphertext,
+    w: root.AuxFe,
+    ec: EcStatement,
+    u_point: root.Element,
+) Scalar {
+    var t = Transcript.init(pdl_proof_domain);
+    t.appendBytes(ec.context);
+    t.appendAuxParams(verifier_aux);
+    t.appendPaillierPublicKey(alice_pk);
+    t.appendCiphertext(c_a);
+    t.appendAuxFe(z);
+    t.appendCiphertext(u);
+    t.appendAuxFe(w);
+    t.appendElement(ec.base);
+    t.appendElement(ec.point);
+    t.appendElement(u_point);
+    return t.finalize();
+}
+
 // ── RangeProof — Alice's proof Πᵢ (STRUCT+CODEC real, MATH real, GG18 App. A) ─────
 
 /// GG18 Appendix A.1 "Range Proof" (Alice's proof): a non-interactive
@@ -1118,8 +1151,17 @@ pub fn proveAliceRange(
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var a_bytes = a.toBytes(.big);
     defer std.crypto.secureZero(u8, &a_bytes);
-    return proveAliceRangeInner(allocator, &a_bytes, r_a, alice_pk, verifier_aux, random);
+    return (try proveAliceRangeInner(allocator, &a_bytes, r_a, alice_pk, verifier_aux, null, random)).proof;
 }
+
+/// The curve half of a `PdlProof` statement: `point = m·base` for the same
+/// `m` the Paillier ciphertext encrypts. `context` is absorbed first, so a
+/// proof is bound to one session and one prover (see `PdlProof`).
+pub const EcStatement = struct {
+    base: root.Element,
+    point: root.Element,
+    context: []const u8,
+};
 
 /// `proveAliceRange` with the witness plaintext as raw big-endian bytes —
 /// split out so the SECURITY-CRITICAL reject test below can produce an
@@ -1127,14 +1169,20 @@ pub fn proveAliceRange(
 /// through the `Scalar`-typed public API) and assert that `verifyAliceRange`
 /// rejects it on the range check alone (equations 2/3 still hold — the
 /// exact Alpha-Rays/TSSHOCK failure shape). `m_bytes` must be < N.
+///
+/// `ec` non-null turns the range proof into a `PdlProof`: the same `alpha`
+/// that masks `m` also yields `u_point = (alpha mod q)·base`, and the
+/// challenge is `pdlProofChallenge` (which absorbs the curve statement)
+/// instead of `rangeProofChallenge`.
 fn proveAliceRangeInner(
     allocator: std.mem.Allocator,
     m_bytes: []const u8,
     r_a: paillier.Fe,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    ec: ?EcStatement,
     random: std.Random,
-) ProveError!RangeProof {
+) ProveError!struct { proof: RangeProof, u_point: ?root.Element } {
     const nt = verifier_aux.n_tilde;
     const nsq = alice_pk.n_sq;
 
@@ -1154,10 +1202,22 @@ fn proveAliceRangeInner(
     const n_len = alice_pk.nByteLen();
     alice_pk.nToBytes(n_buf[0..n_len]) catch unreachable;
 
-    // 1. Sample masks (all SECRET; zeroed on exit).
+    // 1. Sample masks (all SECRET; zeroed on exit). For a PdlProof `alpha`
+    // also masks the curve statement, so redraw in the (never-in-practice)
+    // case alpha ≡ 0 (mod q), where the curve API rejects the identity.
     var alpha: [96]u8 = undefined;
     defer std.crypto.secureZero(u8, &alpha);
-    _ = sampleBelow(random, &q3_bytes, &alpha);
+    var u_point: ?root.Element = null;
+    while (true) {
+        _ = sampleBelow(random, &q3_bytes, &alpha);
+        const st = ec orelse break;
+        const base_pt = st.base.point() catch unreachable; // provePdl checked it
+        var alpha_q = scalarFromWide(&alpha).toBytes(.big);
+        defer std.crypto.secureZero(u8, &alpha_q);
+        const pt = base_pt.mul(alpha_q, .big) catch continue;
+        u_point = root.Element.fromPoint(pt) catch continue;
+        break;
+    }
     var rho_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &rho_buf);
     const rho = sampleBelow(random, q_nt, &rho_buf);
@@ -1179,7 +1239,10 @@ fn proveAliceRangeInner(
     // 3. Fiat-Shamir challenge over the ciphertext this witness produces.
     const m_fe = paillier.Fe.fromBytes(nsq, stripLeadingZeros(m_bytes), .big) catch unreachable; // caller contract: m < N
     const c_a = paillier.encrypt(alice_pk, m_fe, r_a) catch unreachable; // r_a nonzero per witness contract
-    const e = rangeProofChallenge(verifier_aux, alice_pk, c_a, z, u, w);
+    const e = if (ec) |st|
+        pdlProofChallenge(verifier_aux, alice_pk, c_a, z, u, w, st, u_point.?)
+    else
+        rangeProofChallenge(verifier_aux, alice_pk, c_a, z, u, w);
     const e_bytes = e.toBytes(.big);
 
     // 4. Respond. s = r_a^e * beta mod N (mod N, not N²!).
@@ -1198,7 +1261,7 @@ fn proveAliceRangeInner(
     errdefer allocator.free(s1);
     const s2 = try mulAddOwned(allocator, &e_bytes, rho, gamma);
 
-    return .{ .z = z, .u = u, .w = w, .s = s, .s1 = s1, .s2 = s2 };
+    return .{ .proof = .{ .z = z, .u = u, .w = w, .s = s, .s1 = s1, .s2 = s2 }, .u_point = u_point };
 }
 
 /// **GG18 Appendix A.1 "Range Proof", verifier side — REAL, verified
@@ -1244,6 +1307,20 @@ pub fn verifyAliceRange(
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
 ) bool {
+    return verifyAliceRangeInner(proof, c_a, alice_pk, verifier_aux, null, null);
+}
+
+/// Shared verifier for `RangeProof` (`ec == null`) and `PdlProof` — the
+/// latter adds `[s1 mod q]·base == [e]·point + u_point` and takes its
+/// challenge from `pdlProofChallenge`.
+fn verifyAliceRangeInner(
+    proof: RangeProof,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    ec: ?EcStatement,
+    u_point: ?root.Element,
+) bool {
     const nt = verifier_aux.n_tilde;
     const nsq = alice_pk.n_sq;
 
@@ -1260,14 +1337,29 @@ pub fn verifyAliceRange(
     if (proof.z.isZero() or proof.w.isZero() or proof.s.isZero() or proof.u.c.isZero()) return false;
     if (c_a.c.isZero()) return false;
 
-    // 1. THE range check: s1 <= q³.
-    if (intCompare(proof.s1, &q3_bytes) == .gt) return false;
+    // 1. THE range check: s1 <= q³. (The length cap is a work bound: an
+    // honest prover never zero-pads, and `s1` is an exponent below.)
+    if (proof.s1.len > q3_bytes.len or intCompare(proof.s1, &q3_bytes) == .gt) return false;
     // ...and the work bound on the one field nothing bounded (see
     // `auxExponentTooLong`): `s2` is an unbounded-length exponent.
     if (auxExponentTooLong(proof.s2, nt)) return false;
 
-    const e = rangeProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w);
+    const e = if (ec) |st|
+        pdlProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w, st, u_point.?)
+    else
+        rangeProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w);
     const e_bytes = e.toBytes(.big);
+
+    // PdlProof only: [s1 mod q]·base == [e]·point + u_point. `s1` is reduced
+    // mod q HERE ONLY; the Paillier-side checks use the unreduced integer.
+    if (ec) |st| {
+        const base_pt = st.base.point() catch return false;
+        const lhs = base_pt.mulPublic(scalarFromWide(proof.s1).toBytes(.big), .big) catch return false;
+        const point_pt = st.point.point() catch return false;
+        const pe = point_pt.mulPublic(e_bytes, .big) catch return false;
+        const u_pt = (u_point.?).point() catch return false;
+        if (!lhs.equivalent(pe.add(u_pt))) return false;
+    }
 
     // 2. u * c^e == Γ^s1 * s^N (mod N²).
     const lhs2 = nsq.mul(proof.u.c, powPub(nsq, c_a.c, &e_bytes));
@@ -1284,6 +1376,106 @@ pub fn verifyAliceRange(
     if (!auxFeEql(lhs3, rhs3)) return false;
 
     return true;
+}
+
+// ── PdlProof — GG20 Phase 5: R̄ = k·R is consistent with Enc(k) ──────────
+
+/// GG20 (ePrint 2020/540) §3.2 Phase 5: each signer broadcasts `R̄_i = k_i·R`
+/// and proves the exponent is the `k_i` inside the ciphertext `c_i =
+/// Enc_i(k_i)` it sent as the first MtA message. The paper cites MacKenzie–
+/// Reiter, GGN16 and Lindell'17 for this "Paillier–discrete-log with slack"
+/// proof; this is the same construction those use, built exactly the way
+/// `MtaProofWc` extends A.3: the A.1 range proof (`RangeProof`, unchanged
+/// equations and bounds) plus one curve commitment `u_point = alpha·R` made
+/// from the SAME mask `alpha` that hides `k` in `s1 = e·k + alpha`, and the
+/// verifier's extra equation `[s1 mod q]·R == [e]·R̄ + u_point`.
+///
+/// Soundness sketch (special soundness, as for A.2): two accepting
+/// transcripts with challenges `e ≠ e'` give `(s1 − s1')·R = (e − e')·R̄`
+/// and, from the A.1 equations, `c` encrypting `(s1 − s1')/(e − e')` as an
+/// integer of size ≤ q³ — the same integer, so `R̄ = k·R` for the `k` inside
+/// `c`. Zero knowledge: `u_point` is `alpha·R` for a uniform `alpha` mod q
+/// (`alpha ∈ Z_{q³}` reduces to within `1/q²` of uniform).
+///
+/// `context` binds a proof to one signing session and one prover (the
+/// state machine passes `session id || prover index`); the challenge also
+/// binds the verifier's aux tuple, so a proof made for one verifier is
+/// useless to another.
+pub const PdlProof = struct {
+    range: RangeProof,
+    u_point: root.Element,
+
+    pub fn deinit(self: PdlProof, allocator: std.mem.Allocator) void {
+        self.range.deinit(allocator);
+    }
+
+    pub const AllocError = RangeProof.AllocError;
+
+    /// `len-prefixed(range.toBytesAlloc()) || u_point (33 bytes)`.
+    pub fn toBytesAlloc(self: PdlProof, allocator: std.mem.Allocator) AllocError![]u8 {
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(allocator);
+        const range_bytes = try self.range.toBytesAlloc(allocator);
+        defer allocator.free(range_bytes);
+        try appendLenPrefixed(&list, allocator, range_bytes);
+        try list.appendSlice(allocator, &self.u_point.toBytes());
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub const FromBytesError = RangeProof.FromBytesError || root.ElementError;
+
+    /// Inverse of `toBytesAlloc`; trailing bytes are an error.
+    pub fn fromBytesAlloc(
+        allocator: std.mem.Allocator,
+        n_tilde: root.AuxModulus,
+        alice_pk: paillier.PublicKey,
+        bytes: []const u8,
+    ) (std.mem.Allocator.Error || FromBytesError)!PdlProof {
+        var offset: usize = 0;
+        const range_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
+        if (bytes.len != offset + root.Ne) return error.InvalidEncoding;
+        const u_point = try root.Element.fromBytes(bytes[offset..][0..root.Ne].*);
+        const range = try RangeProof.fromBytesAlloc(allocator, n_tilde, alice_pk, range_bytes);
+        return .{ .range = range, .u_point = u_point };
+    }
+};
+
+/// Prover side of `PdlProof`: `c_a = Enc(k; r_a)` under `alice_pk` (the
+/// prover's own key), `point = k·base`, committed under `verifier_aux` (the
+/// VERIFIER's tuple — same ownership rule as `proveAliceRange`). Validates
+/// the received tuple and key first (audit F1/F2/F3), like every prover here.
+pub fn provePdl(
+    allocator: std.mem.Allocator,
+    k: Scalar,
+    r_a: paillier.Fe,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    base: root.Element,
+    point: root.Element,
+    context: []const u8,
+    random: std.Random,
+) ProveError!PdlProof {
+    try validateReceivedParams(verifier_aux, alice_pk, random);
+    _ = base.point() catch return error.InvalidAuxParams;
+    var k_bytes = k.toBytes(.big);
+    defer std.crypto.secureZero(u8, &k_bytes);
+    const out = try proveAliceRangeInner(allocator, &k_bytes, r_a, alice_pk, verifier_aux, .{ .base = base, .point = point, .context = context }, random);
+    return .{ .range = out.proof, .u_point = out.u_point.? };
+}
+
+/// Verifier side of `PdlProof`: every `verifyAliceRange` check (floors,
+/// generator, `s1 <= q³`, the two consistency equations) under the PDL
+/// challenge, plus `[s1 mod q]·base == [e]·point + u_point`.
+pub fn verifyPdl(
+    proof: PdlProof,
+    c_a: paillier.Ciphertext,
+    alice_pk: paillier.PublicKey,
+    verifier_aux: root.AuxParams,
+    base: root.Element,
+    point: root.Element,
+    context: []const u8,
+) bool {
+    return verifyAliceRangeInner(proof.range, c_a, alice_pk, verifier_aux, .{ .base = base, .point = point, .context = context }, proof.u_point);
 }
 
 // ── MtaProof — Bob's MtA proof Π^MtA (STRUCT+CODEC real, MATH real, GG18 App. A) ──
@@ -1693,8 +1885,9 @@ fn verifyBobInner(
     if (c_a.c.isZero() or c_b.c.isZero()) return false;
 
     // 1./2. THE range checks.
-    if (intCompare(proof.s1, &q3_bytes) == .gt) return false;
-    if (intCompare(proof.t1, &q7_bytes) == .gt) return false;
+    // The length caps are work bounds (honest responses are never zero-padded).
+    if (proof.s1.len > q3_bytes.len or intCompare(proof.s1, &q3_bytes) == .gt) return false;
+    if (proof.t1.len > q7_bytes.len or intCompare(proof.t1, &q7_bytes) == .gt) return false;
     // The two response exponents nothing bounded (see `auxExponentTooLong`).
     if (auxExponentTooLong(proof.s2, nt) or auxExponentTooLong(proof.t2, nt)) return false;
 
@@ -2198,7 +2391,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     const m_fe = paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable;
     const c_a = paillier.encrypt(pk, m_fe, r_a) catch unreachable;
 
-    const proof = try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, random);
+    const proof = (try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, null, random)).proof;
     defer proof.deinit(allocator);
     try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux));
 
@@ -3031,4 +3224,98 @@ fn fuzzMtaProofWcFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !
     const len: usize = smith.slice(&buf);
     const result = MtaProofWc.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
     defer result.deinit(allocator);
+}
+
+// -- PdlProof (GG20 Phase 5) --
+
+fn mulBase(base: root.Element, k: Scalar) root.Element {
+    const pt = (base.point() catch unreachable).mul(k.toBytes(.big), .big) catch unreachable;
+    return root.Element.fromPoint(pt) catch unreachable;
+}
+
+test "PdlProof: honest accepts (and after a codec round trip); every false statement and mangled field rejects" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0x70646c_0001);
+    const pk = setup.kp.public;
+    var prng = std.Random.DefaultPrng.init(0x70646c_6f6b); // "pdl ok"
+    const random = prng.random();
+
+    const k = scalarFromU64(0x1234_5678_9abc);
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, scalarToTestFe(k, pk), r_a) catch unreachable;
+    const base = mulBase(root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable, scalarFromU64(77));
+    const point = mulBase(base, k);
+    const ctx = "sid||1";
+
+    const proof = try provePdl(allocator, k, r_a, pk, setup.aux, base, point, ctx, random);
+    defer proof.deinit(allocator);
+    try testing.expect(verifyPdl(proof, c_a, pk, setup.aux, base, point, ctx));
+
+    const bytes = try proof.toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+    const back = try PdlProof.fromBytesAlloc(allocator, setup.aux.n_tilde, pk, bytes);
+    defer back.deinit(allocator);
+    try testing.expect(verifyPdl(back, c_a, pk, setup.aux, base, point, ctx));
+    const longer = try std.mem.concat(allocator, u8, &.{ bytes, &[_]u8{0} });
+    defer allocator.free(longer);
+    try testing.expectError(error.InvalidEncoding, PdlProof.fromBytesAlloc(allocator, setup.aux.n_tilde, pk, longer));
+
+    // R̄ for another exponent, another base, another context, another ciphertext.
+    try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx));
+    try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, mulBase(base, scalarFromU64(2)), point, ctx));
+    try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, point, "sid||2"));
+    const c_other = paillier.encrypt(pk, scalarToTestFe(k.add(Scalar.one), pk), r_a) catch unreachable;
+    try testing.expect(!verifyPdl(proof, c_other, pk, setup.aux, base, point, ctx));
+    // The A.1 range proof alone is not a PdlProof (different challenge).
+    try testing.expect(!verifyAliceRange(proof.range, c_a, pk, setup.aux));
+
+    // A prover whose ciphertext holds k but whose R̄ claims k+1: the curve
+    // equation fails even though the Paillier side is honest.
+    const lie = try provePdl(allocator, k, r_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx, random);
+    defer lie.deinit(allocator);
+    try testing.expect(!verifyPdl(lie, c_a, pk, setup.aux, base, mulBase(base, k.add(Scalar.one)), ctx));
+
+    // Transcript completeness for the base: a proof of a FALSE statement
+    // (`p_false` is not k·base) whose verifier base is solved for after the
+    // challenge, `base' = (s1 mod q)⁻¹·(e·p_false + u_point)`. Only binding
+    // `base` into the challenge makes that solution useless.
+    const p_false = mulBase(base, scalarFromU64(999));
+    const forged = try provePdl(allocator, k, r_a, pk, setup.aux, base, p_false, ctx, random);
+    defer forged.deinit(allocator);
+    const e = pdlProofChallenge(setup.aux, pk, c_a, forged.range.z, forged.range.u, forged.range.w, .{ .base = base, .point = p_false, .context = ctx }, forged.u_point);
+    const rhs = (p_false.point() catch unreachable).mul(e.toBytes(.big), .big) catch unreachable;
+    const solved = rhs.add(forged.u_point.point() catch unreachable).mul(scalarFromWide(forged.range.s1).invert().toBytes(.big), .big) catch unreachable;
+    const base_solved = root.Element.fromPoint(solved) catch unreachable;
+    try testing.expect(!verifyPdl(forged, c_a, pk, setup.aux, base_solved, p_false, ctx));
+
+    var bad = proof;
+    bad.u_point = mulBase(base, scalarFromU64(5));
+    try testing.expect(!verifyPdl(bad, c_a, pk, setup.aux, base, point, ctx));
+    var s1_mangled = try allocator.dupe(u8, proof.range.s1);
+    defer allocator.free(s1_mangled);
+    s1_mangled[s1_mangled.len - 1] ^= 0x01;
+    bad = proof;
+    bad.range.s1 = s1_mangled;
+    try testing.expect(!verifyPdl(bad, c_a, pk, setup.aux, base, point, ctx));
+}
+
+test "PdlProof reject (SECURITY-CRITICAL): an out-of-range exponent (s1 > q³) fails although every equation holds" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0x70646c_0002);
+    const pk = setup.kp.public;
+    var prng = std.Random.DefaultPrng.init(0x70646c_6f6f72); // "pdl oor"
+    const random = prng.random();
+
+    // 2q³ + 5: above q³, below N, and ≢ 0 (mod q) so `m·base` is a point.
+    const m_big = comptime comptimeIntBytes(97, 2 * (q_int * q_int * q_int) + 5);
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable, r_a) catch unreachable;
+    const base = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
+    const point = mulBase(base, scalarFromWide(&m_big)); // m mod q: the curve side is consistent
+    const out = try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, .{ .base = base, .point = point, .context = "c" }, random);
+    const proof: PdlProof = .{ .range = out.proof, .u_point = out.u_point.? };
+    defer proof.deinit(allocator);
+    try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, point, "c"));
 }

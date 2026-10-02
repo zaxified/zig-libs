@@ -19,36 +19,27 @@
 //! so it cannot rot into an unbuildable recipe; that compile is not a
 //! measurement (see `scripts/checks/ctgrind.sh`'s own header).
 //!
-//! ## Why `signWithShares`, not the private per-round helpers
+//! ## What it drives (rewritten 2026-10-02)
 //!
-//! The two lines this harness exists to settle live in `signing.zig`'s
-//! PRIVATE `provePoK`:
+//! Until 2026-10-02 the targets drove `signing.signWithShares`, then a single
+//! function computing every party's values, and tainted draws from the one
+//! `random` it took. `signWithShares` is now a loop over `presign.Party`
+//! state machines, each drawing from its own CSPRNG seeded up front — a
+//! wrapper around the caller's `random` would see only the seeds. So the
+//! harness runs the parties itself (`runProtocol`, the same routing
+//! `signWithShares` does), handing each party its own wrapped PRNG, and
+//! taints at the source of every secret draw. `t = n = 2`: 2 parties,
+//! 2 ordered pairs.
 //!
-//!   signing.zig:267  const r_full = Secp256k1.basePoint.mul(nonce.toBytes(.big), .big) catch continue;
-//!   signing.zig:508  const big_gamma_pt = Secp256k1.basePoint.mul(gamma_i.toBytes(.big), .big) catch return error.IdentityPoint;
+//! The secret-scalar `mul` sites this reaches are all in `presign.zig`,
+//! `ecproofs.zig` and `zkproofs.zig` (`γ_i·G`, `k_i·R`, `σ_i·R`, the
+//! Pedersen/ST/Schnorr nonces, `alpha·R` in the PDL proof), each through
+//! std's `Secp256k1.mul`, which ends in the one-bit `rejectIdentity` check
+//! the comment below discusses.
 //!
-//! (line 508 lives in `signWithShares` itself, not `provePoK` — both are
-//! secret-scalar `basePoint.mul` call sites in this file.) `provePoK`,
-//! `verifyPoK`, `commitGamma` and `pokChallenge` are all file-private
-//! (`fn`, not `pub fn`); Zig's privacy model makes them invisible to any
-//! file outside `signing.zig`, including this one, and this pass is not
-//! permitted to edit `modules/threshold_ecdsa/src/*.zig` to export them.
-//! So the only PUBLIC entry point that actually executes those two lines is
-//! `signing.signWithShares` itself — the real, shipped, end-to-end GG20
-//! online-signing driver, Paillier keygen and all. That is what both
-//! targets below drive. This is heavier than the other modules' harnesses
-//! (a real 2048-bit Paillier keypair + a 2048-bit ring-Pedersen aux tuple
-//! per party, per run — the audit-F2 floor `AuxParams.validate`/
-//! `paillierNMeetsFloor` enforces requires it; a smaller modulus makes the
-//! checked-MtA path fail closed with `error.InvalidAuxParams` before either
-//! disputed line is ever reached), but it is real code, not a stand-in.
-//! `t = n = 2` (mirrors `signing.zig`'s own "gamma_i values that sum to
-//! zero" test) keeps the pairwise MtA/MtAwc loop to its minimum: 2 ordered
-//! pairs.
+//! ## Why std's `Secp256k1.mul` is the right ladder here
 //!
-//! ## What prompted this file: a disputed triage claim, now settled
-//!
-//! A prior triage pass claimed `signing.zig` "reintroduces a fixed
+//! A prior triage pass claimed this module "reintroduces a fixed
 //! vulnerability class" by calling `std.crypto.ecc.Secp256k1.mul(...) catch
 //! ...` directly on secret scalars instead of routing through the sibling
 //! `k256` module. That claim does not survive reading `k256`'s own harness
@@ -58,55 +49,34 @@
 //! that this produces exactly the SAME shape of small, expected, non-zero
 //! context count as std's. Confirmed directly for THIS module by reading
 //! std's own source: `std.crypto.ecc.Secp256k1.mul`
-//! (`lib/std/crypto/pcurves/secp256k1.zig:430`, the exact function
-//! `signing.zig` calls at both disputed lines) bottoms out in `pcMul16`,
+//! (`lib/std/crypto/pcurves/secp256k1.zig:430`) bottoms out in `pcMul16`,
 //! which ends at line 408 with the identical `try q.rejectIdentity()` — the
 //! SAME one-bit "did the whole ladder land on the group identity"
 //! validation `k256`'s own ladder performs, not a differently-shaped
 //! branch. Routing through `k256` would not remove this branch; it would
-//! just move which file's name shows up in the stack. The measurement
-//! below is what actually settles whether it fires here, and where.
+//! just move which file's name shows up in the stack.
 //!
 //! ## The three targets
 //!
-//! (`betaprime` was added 2026-09-15; it is described after `nonce`.)
+//! * `share` — taints ONLY `secret_share` (`x_i`) on every `KeyShare`,
+//!   before the parties are built; every random draw stays real. The
+//!   LONG-TERM secret: it flows into `w_i = λ_i·x_i`, into the MtAwc
+//!   witness and `W_i` consistency, and into `σ_i`.
+//! * `nonce` — taints EVERY 48-byte draw of every party: this module's width
+//!   for a `Zq` secret scalar — `k_i`, `γ_i`, `ℓ_i`, and the nonces of the
+//!   Pedersen, Schnorr and ST proofs. `x_i` stays real. The draw count is
+//!   printed (`draws_48b_*`).
+//! * `betaprime` — taints every 160-byte draw: Bob's MtA blind
+//!   `β' ∈ [0, q⁵)` (audit F5), `2·t(t−1)` = 4 at `t = 2` — one MtA and one
+//!   MtAwc per ordered pair. The count is checked before the result is
+//!   printed (`TaintBetaPrime`). Positive control, measured on the old
+//!   driver (2026-09-15): a `testb`/`je` on `β'[100]` inserted after the draw
+//!   added exactly 2 contexts, both on the inserted line, one per caller.
 //!
-//! * `share` — taints ONLY `secret_share` (`x_i`, "the signing share" —
-//!   `KeyShare`'s own doc comment's term) on every `KeyShare` passed to
-//!   `signWithShares`, keeping every draw from `random` itself real
-//!   (untainted). This is the LONG-TERM secret: it flows into `w_i =
-//!   λ_i·secret_share` (`Scalar.mul`, pure field arithmetic — no curve
-//!   `mul`), into every `runCheckedMtAwc`'s Paillier-encrypted witness, and
-//!   into the final `s_i = m·k_i + r·σ_i` accumulation. It never itself
-//!   becomes the argument of a `basePoint.mul` call in this file.
-//! * `nonce` — taints exactly the first `3*t` 48-byte draws from `random`,
-//!   in call order: `k_i`,`γ_i` for each party (Phase 1, 2 draws/party)
-//!   then `provePoK`'s own internal Schnorr nonce for each party (Phase 2,
-//!   1 draw/party, assuming its `IdentityElement` retry never fires — it is
-//!   a q⁻¹-probability event and does not fire with the seed used here).
-//!   Every OTHER `random` draw in the run — Bob's `beta_prime` (a 160-byte
-//!   `q⁵`-range draw since audit F5, 2026-09-16; it was a 48-byte `Zq` draw
-//!   before) and every Paillier/range-proof mask — stays real. `TaintFirstN`
-//!   below counts 48-byte draws in ARRIVAL order and stops tainting once the
-//!   budget is spent, rather than assuming a fixed total call count, so no
-//!   later 48-byte draw is tainted by accident. This is what actually
-//!   exercises signing.zig:267 (the PoK nonce) and signing.zig:508 (`γ_i`
-//!   itself) with tainted input; `secret_share` stays real in this target.
-//! * `betaprime` (A1 threshold_ecdsa R1, 2026-09-15) — taints every
-//!   160-byte draw, which on this path is exactly Bob's MtA blind
-//!   `β' ∈ [0, q⁵)`. There are `2·t(t−1)` = 4 of them: one MtA and one MtAwc
-//!   per ordered pair. It is the only target that reaches the rejection
-//!   sampler, `β = −β' mod q` and `proveBobInner`'s arithmetic over `β'`
-//!   with a tainted input. The draw count is checked before the result is
-//!   printed; see `TaintBetaPrime`. Positive control, measured: a
-//!   `testb`/`je` on `β'[100]` inserted after the draw added exactly 2
-//!   contexts (321 -> 323), both on the inserted line, one per caller.
-//!
-//! Both targets run the REAL `keygenTrustedDealer` first (Phase 2a — a
-//! genuine Shamir+Feldman split and two genuine 2048-bit Paillier
-//! keypairs), so nothing about the secret material's shape is synthetic:
-//! only which bytes are marked undefined, and when, differs from an
-//! ordinary call.
+//! Every target runs the REAL `keygenTrustedDealer` first (a genuine
+//! Shamir+Feldman split and two genuine 2048-bit Paillier keypairs), so
+//! nothing about the secret material's shape is synthetic: only which bytes
+//! are marked undefined, and when, differs from an ordinary run.
 //!
 //! ## The result is only meaningful next to two controls
 //!
@@ -246,58 +216,45 @@ fn randomScalar(random: std.Random) Scalar {
     return Scalar.fromBytes48(buf, .big);
 }
 
-// ── target "nonce": taint the first 3*t 48-byte draws from `random` ───────
+// ── target "nonce": taint every 48-byte draw ─────────────────────────────
 
 /// Wraps a real PRNG. Every `.bytes()` call is served with GENUINE random
-/// bytes from `inner` (never fabricated), then — for exactly the first
-/// `taint_budget` calls whose length is 48 (this module's fixed width for
-/// every `Zq` scalar draw: `signing.zig`/`mta.zig`/`zkproofs.zig`'s shared
-/// `randomScalar` idiom) — marked undefined via
-/// `std.valgrind.memcheck.makeMemUndefined` before the caller ever reads
-/// them. The mark happens INSIDE this callback, before any consumer sees
-/// the bytes, so there is no window for a from-before-tainting defined copy
-/// to survive (the concern `ct25519`'s/`k256`'s `reloadVolatile` defends
-/// against) — the memory is never observably defined outside this
-/// function. Draws of any OTHER length (Paillier/range-proof randomness,
-/// hundreds of bytes wide) are never counted against the budget and never
-/// tainted, so later 48-byte draws (Phase 3, AFTER the budget is spent for
-/// realistic `t`) are excluded by construction, not by luck.
-const TaintFirstN = struct {
+/// bytes from `inner` (never fabricated); a 48-byte call — this module's
+/// fixed width for a `Zq` secret scalar (`presign.zig`, `ecproofs.zig`,
+/// `mta.zig`, `zkproofs.zig` all use the same `randomScalar` idiom) — is then
+/// marked undefined via `std.valgrind.memcheck.makeMemUndefined` before the
+/// caller reads it. The mark happens INSIDE this callback, so no defined copy
+/// survives (the concern `ct25519`'s/`k256`'s `reloadVolatile` defends
+/// against). Wider draws (Paillier/range-proof randomness, `β'`) are left
+/// alone.
+const TaintScalars = struct {
     inner: std.Random,
-    taint_budget: usize,
-    taint_calls_48: usize = 0,
-    total_calls_48: usize = 0,
+    taint: bool,
+    draws: usize = 0,
 
     fn fill(ptr: *anyopaque, buf: []u8) void {
-        const self: *TaintFirstN = @ptrCast(@alignCast(ptr));
+        const self: *TaintScalars = @ptrCast(@alignCast(ptr));
         self.inner.bytes(buf);
         if (buf.len == 48) {
-            self.total_calls_48 += 1;
-            if (self.taint_calls_48 < self.taint_budget) {
-                std.valgrind.memcheck.makeMemUndefined(buf);
-                self.taint_calls_48 += 1;
-            }
+            self.draws += 1;
+            if (self.taint) std.valgrind.memcheck.makeMemUndefined(buf);
         }
     }
 
-    fn random(self: *TaintFirstN) std.Random {
+    fn random(self: *TaintScalars) std.Random {
         return .{ .ptr = self, .fillFn = fill };
     }
 };
 
 // ── target "betaprime": taint every draw of Bob's MtA blind β' ────────────
 
-/// Since audit F5 (2026-09-16), Bob's blind `β'` is a uniform
-/// `[0, q⁵)` draw of `zkproofs.beta_prime_bytes` = 160 bytes
-/// (`mta.sampleBetaPrime`). `TaintFirstN` counts only 48-byte draws, so no
-/// row measured it: not the rejection sampler's `std.mem.order`, not
-/// `β = −β' mod q` (Bob's additive share), not `proveBobInner`'s arithmetic
-/// over `β'` (re-audit 2026-09-15, R1). This wrapper taints EVERY draw of
-/// exactly that width, and nothing else. On the sequential `signWithShares`
-/// path that width is unambiguous: scalars are 48 bytes, the proof masks are
-/// `q³` (96), `q⁷` (224) or `q·Ñ`-wide, and Paillier randomness is `|N|`.
-/// `draws` is checked against `2·t(t−1)` in `main`, so the width assumption
-/// fails the row instead of silently tainting nothing.
+/// Since audit F5 (2026-09-16), Bob's blind `β'` is a uniform `[0, q⁵)` draw
+/// of `zkproofs.beta_prime_bytes` = 160 bytes (`mta.sampleBetaPrime`). This
+/// wrapper taints EVERY draw of exactly that width, and nothing else: scalars
+/// are 48 bytes, the proof masks are `q³` (96), `q⁷` (224) or `q·Ñ`-wide,
+/// and Paillier randomness is `|N|`. The total over all parties is checked
+/// against `2·t(t−1)` in `main`, so a stale width assumption fails the row
+/// instead of silently tainting nothing.
 const TaintBetaPrime = struct {
     inner: std.Random,
     taint: bool,
@@ -317,6 +274,60 @@ const TaintBetaPrime = struct {
     }
 };
 
+// ── the protocol, one party per share (what `signWithShares` does) ───────
+
+const presign = root.presign;
+
+fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: []const std.Random, message: []const u8) !signing.Signature {
+    const t = shares.len;
+    var indices: [2]u32 = undefined;
+    for (shares, 0..) |s, i| indices[i] = s.index;
+    const sid = [_]u8{0x5a} ** 32;
+
+    var parties: [2]presign.Party = undefined;
+    for (0..t) |i| parties[i] = try presign.Party.init(allocator, shares[i], indices[0..t], sid);
+    defer for (parties[0..t]) |*p| p.deinit();
+
+    var inboxes: [2]std.ArrayList([]const u8) = @splat(.empty);
+    defer for (&inboxes) |*b| b.deinit(allocator);
+    var boxes: [2]?presign.Outbox = @splat(null);
+    defer for (boxes) |b| if (b) |o| o.deinit(allocator);
+
+    for (0..6) |_| {
+        var next: [2]?presign.Outbox = @splat(null);
+        errdefer for (next) |b| if (b) |o| o.deinit(allocator);
+        for (0..t) |i| next[i] = try parties[i].advance(inboxes[i].items, randoms[i]);
+        for (boxes) |b| if (b) |o| o.deinit(allocator);
+        boxes = next;
+        for (&inboxes) |*b| b.clearRetainingCapacity();
+        for (0..t) |from| {
+            for (boxes[from].?.messages) |m| {
+                for (0..t) |to| {
+                    if (to == from) continue;
+                    if (m.to) |dst| if (dst != indices[to]) continue;
+                    try inboxes[to].append(allocator, m.bytes);
+                }
+            }
+        }
+    }
+    var presigs: [2]presign.Presignature = undefined;
+    var made: usize = 0;
+    defer for (presigs[0..made]) |*p| p.deinit();
+    for (0..t) |i| {
+        presigs[i] = try parties[i].finish(inboxes[i].items);
+        made += 1;
+    }
+    var sig_shares: [2][]u8 = undefined;
+    var signed: usize = 0;
+    defer for (sig_shares[0..signed]) |b| allocator.free(b);
+    for (0..t) |i| {
+        sig_shares[i] = try presigs[i].signShare(.{ .bytes = message });
+        signed += 1;
+    }
+    var abort: ?presign.Abort = null;
+    return presigs[0].public.combine(.{ .bytes = message }, sig_shares[0..t], &abort);
+}
+
 // ── the harness proper ────────────────────────────────────────────────────
 
 const Target = enum { share, nonce, betaprime };
@@ -335,14 +346,13 @@ fn parseTaint(s: []const u8) !Taint {
     return error.UnknownTaint;
 }
 
-fn printOutcome(result: signing.SignError!signing.Signature) void {
+fn printOutcome(result: anyerror!signing.Signature) void {
     if (result) |sig| {
         std.debug.print("r={x} s={x}\n", .{ sig.r, sig.s });
     } else |err| {
         // Formatted regardless of taint state: still the propagation
-        // witness (the error NAME is fixed at comptime, but reaching this
-        // branch at all after a tainted run is itself informative, and
-        // `{t}` still touches std's error-name formatter).
+        // witness (reaching this branch after a tainted run is itself
+        // informative, and `{t}` touches std's error-name formatter).
         std.debug.print("aborted: {t}\n", .{err});
     }
 }
@@ -367,116 +377,48 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const fixture = try buildFixture(allocator, setup_random);
     defer fixture.deinit(allocator);
 
-    const message = "ctgrind harness message — threshold_ecdsa Phase 2d";
+    const message = "ctgrind harness message — threshold_ecdsa presign";
+    const t = fixture.key_shares.len;
+    var prngs = [2]std.Random.DefaultPrng{ .init(0x7061_7274_7931), .init(0x7061_7274_7932) }; // "party1", "party2"
 
     switch (target) {
         .share => {
-            // "The signing share": KeyShare.secret_share (x_i), tainted
-            // directly on each party's struct field. Every draw from
-            // `sign_random` below stays real — this target isolates the
-            // LONG-TERM secret, not the per-signature ephemeral one.
             if (tainted) {
                 for (fixture.key_shares) |*ks| {
                     std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&ks.secret_share));
                 }
             }
-            var sign_prng = std.Random.DefaultPrng.init(0x7368617265); // "share"
-            const sign_random = sign_prng.random();
-
-            const result = signing.signWithShares(allocator, fixture.key_shares, message, sign_random);
-            printOutcome(result);
+            const randoms = [2]std.Random{ prngs[0].random(), prngs[1].random() };
+            printOutcome(runProtocol(allocator, fixture.key_shares, &randoms, message));
         },
         .nonce => {
-            // "The per-signature nonce": the first 3*t = 6 draws from
-            // `random` — k_i, gamma_i (Phase 1) then provePoK's own
-            // ephemeral Schnorr nonce (Phase 2), for each of the t=2
-            // parties, in that order. secret_share stays real.
-            var inner_prng = std.Random.DefaultPrng.init(0x6e6f6e6365); // "nonce"
-            var wrapper: TaintFirstN = .{
-                .inner = inner_prng.random(),
-                .taint_budget = if (tainted) 3 * fixture.key_shares.len else 0,
+            var wrappers = [2]TaintScalars{
+                .{ .inner = prngs[0].random(), .taint = tainted },
+                .{ .inner = prngs[1].random(), .taint = tainted },
             };
-            const sign_random = wrapper.random();
-
-            const result = signing.signWithShares(allocator, fixture.key_shares, message, sign_random);
-            printOutcome(result);
-
-            // Self-check on the assumption the doc comment above states:
-            // exactly 3*t 48-byte draws should have occurred before this
-            // point plus however many Phase-3 `beta_prime` draws followed.
-            // Printed unconditionally (not gated on `tainted`) so a
-            // `taint=no` run reports the same total_calls_48 as a sanity
-            // cross-check between the two builds.
-            std.debug.print("draws_48b_total={d} draws_48b_tainted={d}\n", .{
-                wrapper.total_calls_48,
-                wrapper.taint_calls_48,
-            });
+            const randoms = [2]std.Random{ wrappers[0].random(), wrappers[1].random() };
+            printOutcome(runProtocol(allocator, fixture.key_shares, &randoms, message));
+            // Printed in both builds: a `taint=no` run must report the same
+            // count, a cross-check between the two.
+            std.debug.print("draws_48b={d}\n", .{wrappers[0].draws + wrappers[1].draws});
         },
         .betaprime => {
-            // Bob's MtA blind β', every draw: two ordered pairs × (MtA for
-            // γ + MtAwc for w) = 2·t(t−1) = 4 at t = 2. `k_i`/`γ_i`/`x_i`
-            // stay real. See TaintBetaPrime.
-            var inner_prng = std.Random.DefaultPrng.init(0x62657461); // "beta"
-            var wrapper: TaintBetaPrime = .{ .inner = inner_prng.random(), .taint = tainted };
-            const sign_random = wrapper.random();
-
-            const result = signing.signWithShares(allocator, fixture.key_shares, message, sign_random);
-            // Checked BEFORE the result is printed: a width assumption gone
-            // stale must leave the output pin with nothing to read, not a
-            // row that measured an untainted run.
-            const t = fixture.key_shares.len;
-            if (wrapper.draws != 2 * t * (t - 1)) {
-                std.debug.print("draws_160b={d}, expected {d}\n", .{ wrapper.draws, 2 * t * (t - 1) });
+            var wrappers = [2]TaintBetaPrime{
+                .{ .inner = prngs[0].random(), .taint = tainted },
+                .{ .inner = prngs[1].random(), .taint = tainted },
+            };
+            const randoms = [2]std.Random{ wrappers[0].random(), wrappers[1].random() };
+            const result = runProtocol(allocator, fixture.key_shares, &randoms, message);
+            // Checked BEFORE the result is printed: a stale width assumption
+            // must leave the output pin with nothing to read, not a row that
+            // measured an untainted run.
+            const draws = wrappers[0].draws + wrappers[1].draws;
+            if (draws != 2 * t * (t - 1)) {
+                std.debug.print("draws_160b={d}, expected {d}\n", .{ draws, 2 * t * (t - 1) });
                 return error.HarnessBetaPrimeDrawCount;
             }
             printOutcome(result);
-            std.debug.print("draws_160b={d}\n", .{wrapper.draws});
+            std.debug.print("draws_160b={d}\n", .{draws});
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh config (for the coordinator to paste in;
-// this file does not and must not edit that script itself) ───────────────
-//
-// declare -A TARGETS=(
-//     [threshold_ecdsa]="share nonce"
-// )
-// declare -A MODES=(
-//     [threshold_ecdsa]="ReleaseFast"
-// )
-// declare -A PATTERN=(
-//     # VERIFIED against real `valgrind --tool=memcheck` logs for both
-//     # targets (2026-09-09): every context in both claim rows classifies
-//     # into in-file or WITNESS with this pattern — zero `unattr` — so this
-//     # is not a guess. It is wide because this module's own dependency
-//     # surface is wide: this module's own 4 files, PLUS every file the
-//     # REAL end-to-end run actually passes tainted-derived data through —
-//     # `paillier`'s homomorphic ops and its `root.zig` (SAME basename as
-//     # this module's own `root.zig`; deliberately not disambiguated, same
-//     # as `chachapoly/aead` naming std's files — see this harness's own
-//     # doc comment), `montint`/`std.crypto.ff`'s modexp (ring-Pedersen /
-//     # range-proof commitments), std's secp256k1 ladder (both disputed
-//     # `basePoint.mul` lines) AND `common.zig`/`ecdsa.zig` (the final
-//     # signature's own std-ECDSA self-verify, Phase 2d step 6), plus the
-//     # big-int/mem plumbing (`mem.zig`/`int.zig`/`math.zig`/`memcpy.zig`/
-//     # `memmove.zig`/`compiler_rt.zig`) every one of those calls through.
-//     # Identical for both targets: the SAME dependency files show up
-//     # regardless of which secret is tainted, because both `share` and
-//     # `nonce` eventually flow into the same final `sig.verify()`.
-//     [threshold_ecdsa/share]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-//     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-// )
-// declare -A LABEL=(
-//     [threshold_ecdsa/share]='threshold_ecdsa signing share (x_i)+paillier+std ecdsa'
-//     [threshold_ecdsa/nonce]='threshold_ecdsa per-sig nonce (k_i/gamma_i/PoK)+paillier+std ecdsa'
-// )
-//
-// Measured (ReleaseFast, `t=n=2`, this pass, 2026-09-09):
-//   share: total=129 in=127 witness=2 unattr=0 (control=0, trap=0)
-//   nonce: total=404 in=400 witness=4 unattr=0 (control=0, trap=0)
-// Full per-context breakdown, class judgement (branches-on-a-secret-byte vs.
-// branches-on-a-value-the-output-discloses-anyway) and the rejectIdentity
-// tally are in this pass's harness report, not repeated here — a source
-// comment is the wrong place for a table that will be stale the moment the
-// code changes; `ctgrind-expected.tsv`'s pinned digest is what should catch
-// that, once the coordinator wires this in.

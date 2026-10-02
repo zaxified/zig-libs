@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **ADDITIVE:** `presign` — GG20 signing as one state machine per signer.
+  `presign.Party.init(allocator, share, signers, sid)` then six `advance(inbox, random)` calls
+  (byte messages in, `Outbox` of broadcast/p2p byte messages out) and `finish(inbox)` give a
+  `Presignature`; `Presignature.signShare(message)` is the one online round (used once, wipes
+  `k_i`/`σ_i`), `PresignaturePublic.combine(message, shares, &abort)` checks every share with
+  `s_j·R == m·R̄_j + r·S_j`, sums, normalises to low-S and verifies under the group key.
+  `Message` takes raw bytes or a prehashed digest. Every check of GG20 §3.2 is made: the Phase 3
+  Pedersen proof of `(σ_i, ℓ_i)`, the Phase 5 proof that `R̄_i = k_i·R` matches `Enc(k_i)`
+  (`zkproofs.PdlProof`, new: the A.1 range proof plus `alpha·R`) and `Σ R̄_j = G`, the Phase 6
+  proof that `S_i` and `T_i` share `σ_i` and `Σ S_j = X`. A failed check returns
+  `error.ProtocolAbort` with `Party.abort = { culprit, fault }`; the culprit is named for every
+  proof failure and every malformed, misaddressed, duplicate or missing message, and in combine
+  for a wrong share — `null` only for the paper's types 5 and 7 (`r_bar_sum`, `s_sum`) and for
+  `equivocation`: every message after round 1 carries the sender's running hash of all broadcasts,
+  so a signer who shows different broadcasts to different peers stops the session before honest
+  signers can blame each other. Every message and every new proof is bound to a session id derived
+  from the caller's `sid`, the group key, `t` and the signing set. New `ecproofs`
+  (`PedersenProof`, `StProof`, `SchnorrProof`, the NUMS generator `pedersenH`).
+- **2026-10-02** — **BREAKING:** `root.PartyPublicKeys` gains `verifying_share` (`X_j`, which every
+  signer needs for the MtAwc check against `W_j = λ_j·X_j`); `PublicKeys`' wire encoding appends it
+  to every entry, and `KeyShare.fromBytesAlloc` refuses a share whose own entry carries a different
+  `X_i`. `keygenTrustedDealer` fills it. Old encodings no longer decode. Both decoders now refuse
+  trailing bytes, and every length-prefixed reader bounds lengths by subtraction (an `offset + len`
+  could wrap on 32-bit targets). The range-proof verifiers cap the length of `s1`/`t1` (work bound).
+- **2026-10-02** — **BREAKING:** `signing.signWithShares` is now a driver over `presign.Party` (one
+  per share, messages routed by a loop) instead of its own implementation of the protocol — which
+  made neither GG20 Phase 5/6 check. Same signature; `SignError` is now `OutOfMemory |
+  InvalidParameters | SigningAborted`. `SignOptions` is `{ .threads }` (was `{ .pair_threads,
+  .pair_scratch_bytes }`): per-party work per round on threads, per-party CSPRNGs seeded up front,
+  worker allocations from per-party arenas over `page_allocator`. The round-message types
+  `GammaCommitment`, `SchnorrProof`, `GammaReveal`, `DeltaShare`, `SigShare` and the
+  `gamma_*_domain` constants are removed (the state machine has its own, session-bound ones).
+  No in-repo consumer.
+- **2026-10-02** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind harness drives `presign.Party`
+  state machines with one wrapped PRNG per party (`signWithShares` now seeds per-party CSPRNGs, so
+  a wrapper around its `random` would taint only the seeds), and `nonce` taints every 48-byte
+  secret-scalar draw (16, was 6). `ctgrind-expected.tsv`: share `<=394`, nonce `<=669`, betaprime
+  `<=462` in-file, controls and traps 0; every new context classified (verifier-side over-taint,
+  `paillier.decrypt`, std `rejectIdentity`, the draws' own reduction) — none on a prover-side branch.
+  New oracle: `tools/tsslib` (tss-lib v3.0.0, both directions) → `src/tsslib_vectors.zig`,
+  tested by `src/tsslib_interop.zig`.
 - **2026-09-30** — **BREAKING:** `signing.identifyAbortCulprit` is removed. It was a public
   `noreturn` function whose only behaviour was `@panic` (GG20 identifiable abort is not
   implemented), so a caller compiled and then crashed at run time. Identifiable abort stays a

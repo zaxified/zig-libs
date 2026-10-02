@@ -1,170 +1,56 @@
 // SPDX-License-Identifier: MIT
-//! signing — the GG20 online **threshold-ECDSA signing** protocol, I2
-//! **Phase 2d**: the arc's finale, tying keygen (2a, `root.zig`) + the
-//! semi-honest MtA core (2b, `mta.zig`) + the GG18 Appendix A malicious-
-//! secure range proofs / MtAwc (2c, `zkproofs.zig`, IMPLEMENTED — not a
-//! scaffold) into a `t`-of-`n` signature that is a STANDARD secp256k1 ECDSA
-//! signature, verifiable under `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`
-//! against `KeyShare.group_public_key` — no threshold-aware verifier is
-//! needed on the other end. See R. Gennaro, S. Goldfeder, "One Round
-//! Threshold ECDSA with Identifiable Abort" (GG20, IACR ePrint 2020/540)
-//! for the protocol this implements, and GG18 (ePrint 2019/114) §4 for the
-//! base MtA-driven signing shape GG20 refines into one round.
+//! signing — the in-process driver over `presign.zig`'s per-signer state
+//! machine, plus the pieces every signer shares (`lagrangeCoefficient`, the
+//! std ECDSA types the output verifies under).
 //!
-//! ## Status: round orchestration, MtA/MtAwc wiring, and the signature
-//! arithmetic are REAL (built entirely on already-implemented Phase-2b/2c
-//! primitives); ONE security layer is a documented, deliberate scope cut —
-//! see "Identifiable abort scope" below. `signWithShares` (this file's
-//! main entry point) produces a signature that genuinely verifies under
-//! `std`'s own ECDSA — it does not `@panic`.
+//! `signWithShares(allocator, shares, message, random)` runs one `presign.Party`
+//! per share, routes every message between them through its wire encoding,
+//! signs, combines, and returns a standard secp256k1 ECDSA signature that
+//! verifies under `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` against the
+//! group public key. It is the same protocol a deployment runs with one
+//! `Party` per process — GG20 (R. Gennaro, S. Goldfeder, IACR ePrint
+//! 2020/540) §3.2, Phases 1–7, with every check of the paper — only the
+//! transport is a loop. It exists for tests, for simulations, and for the
+//! single-operator case where one host legitimately holds every share.
 //!
-//! ## The protocol, phase by phase
+//! Until 2026-10-02 this file was its own, separate implementation of the
+//! protocol: one function computing every party's values side by side,
+//! without GG20's Phase 5/6 checks (`Σ R̄_j = G`, `Σ S_j = X`) and without
+//! culprit naming. One process holding every share made that safe for
+//! itself, but nothing of it carried over to separate signers. It now drives
+//! the state machine, so there is one implementation, tested both ways.
 //!
-//! For a signing subset `S` of `t` parties (each holding a `KeyShare`) and
-//! a message:
-//!
-//! 1. **Local secrets.** Each party `i` in `S` samples `k_i, γ_i ← Zq`
-//!    (`randomScalar`) and computes its LAGRANGE-WEIGHTED secret share
-//!    `w_i = λ_i · x_i` (`lagrangeCoefficient`, the same Lagrange-at-zero
-//!    weights `root.reconstructSecret` uses internally, exposed here as a
-//!    standalone function) — chosen so `Σ_{i∈S} w_i = x` (the group secret)
-//!    without ever reconstructing `x` itself.
-//! 2. **Γ commit-reveal.** Each party computes `Γ_i = γ_i·G`, commits to it
-//!    (`commitGamma`, a plain SHA-256 hash of the point), and proves
-//!    knowledge of `γ_i` via a standard Fiat-Shamir Schnorr NIZK
-//!    (`provePoK`/`verifyPoK`) — this is what stops a rushing adversary
-//!    from choosing its `Γ_i` AFTER seeing everyone else's (a classic
-//!    "last-mover" attack on the aggregated `R`). Every party then checks
-//!    every other party's `(commitment, Γ_i, proof)` triple.
-//! 3. **MtA phase.** For every ORDERED pair `(i,j)`, `i≠j`, in `S`:
-//!      - `i` (Alice, input `k_i`) and `j` (Bob, input `γ_j`) run the
-//!        Phase-2c CHECKED MtA (`runCheckedMtA` — `mta
-//!        .mtaAliceInitChecked`/`mtaBobResponseChecked`/
-//!        `mtaAliceFinalizeChecked` plus `zkproofs.proveAliceRange`/
-//!        `verifyAliceRange`/`proveBobMta`, all REAL, GG18 Appendix A) →
-//!        additive shares of `k_i·γ_j`.
-//!      - `i` (Alice, `k_i`) and `j` (Bob, input `w_j`) run the CHECKED
-//!        **MtAwc** (`runCheckedMtAwc` — `zkproofs.proveBobMtaWc`/
-//!        `verifyBobMtaWc`, REAL) against the PUBLIC point `W_j = λ_j·X_j`
-//!        (`j`'s Lagrange-weighted verifying share) → additive shares of
-//!        `k_i·w_j`, with Bob's `w_j` provably tied to his already-public
-//!        key share.
-//!    Summing every party's shares (own diagonal term `k_i·γ_i`/`k_i·w_i`
-//!    plus every pairwise `α`/`β`) yields `δ_i`/`σ_i` with `Σδ_i = k·γ` and
-//!    `Σσ_i = k·x` (see `signWithShares`'s body for the exact sum, which is
-//!    the standard telescoping-sum identity GG20 Figure 3 / GG18 §4 use).
-//! 4. **δ reveal → R.** `δ = Σδ_i` (plaintext scalars, no MtA needed to
-//!    reveal a sum) → `δ⁻¹` → `R = (Σ Γ_i)^{δ⁻¹} = k⁻¹·G` → `r = R.x mod q`.
-//! 5. **s shares → s.** Each party computes `s_i = m·k_i + r·σ_i` (`m` =
-//!    the message hash reduced into `Zq` via the SAME wide-reduction
-//!    `std.crypto.sign.ecdsa`'s own `Signer.finalizePrehashed` uses —
-//!    `scalarFromHash32`, so the resulting `m` matches std's own) and
-//!    reveals it; `s = Σs_i`, normalized to the smaller of `{s, q-s}`
-//!    (canonical/low-S form, BIP-62 convention — std's own verifier does
-//!    not require this, but a well-behaved signer produces it).
-//! 6. **Fail-closed self-check.** Before returning, `signWithShares`
-//!    verifies its OWN output against `group_public_key` via
-//!    `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.Signature.verify` — if
-//!    that fails for any reason (see "Identifiable abort scope"),
-//!    `error.SigningAborted` is returned instead of a bad signature. This
-//!    is a hard invariant: this function NEVER returns a signature that
-//!    does not verify.
-//!
-//! ## Identifiable-abort scope — DELIBERATE, DOCUMENTED CUT (read this
-//! before extending)
-//!
-//! GG20's headline contribution over GG18 is **identifiable abort**: when
-//! signing fails, the protocol doesn't just abort — it produces evidence
-//! naming EXACTLY which party misbehaved, without a trusted dealer. This
-//! file implements the WEAKER **"abort-only v1"**: every per-round check
-//! this file DOES perform (MtA/MtAwc range-proof verification, Γ
-//! commitment/knowledge-proof verification, and the final std-ECDSA
-//! self-check) is fail-closed — a cheating party can never cause a bad
-//! signature to be returned, only an `error.SigningAborted` (or one of the
-//! more specific `Invalid*` errors, if the culprit's misbehavior was
-//! caught mid-protocol at a specific pairwise check) — but the SPECIFIC
-//! residual gap it does NOT close is: **a malicious party could use an
-//! INCONSISTENT `k_i`/`γ_i`/`w_i` value across different pairwise MtA
-//! sessions** (e.g. a different `k_i` in the `(i,j)` session than in the
-//! `(i,l)` session). Each pairwise range/MtA proof only attests to THAT
-//! session's witness in isolation — nothing here proves the SAME `k_i` was
-//! used in every session `i` participates in. If that happens, the final
-//! self-check in step 6 will (with overwhelming probability) catch the
-//! resulting bad `(r,s)` and abort — so this gap is NOT an integrity hole
-//! against the "never return a bad signature" invariant — but it IS an
-//! availability/attribution hole: the honest parties learn only that
-//! SOMETHING was inconsistent, not WHO. Closing this — proving cross-
-//! session `k_i`/`γ_i`/`w_i` consistency and, on failure, opening enough
-//! transcript material to name a culprit — is GG20's actual identifiable-
-//! abort apparatus (paper §4's "Identifiable Abort" rounds). It is not
-//! implemented and has no public entry point (the `@panic` stub was removed
-//! 2026-09-30); see the comment near the end of this file and SPEC.md.
-//!
-//! ## Zig std GAP: none new — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`
-//! (the FINAL verification target), `std.crypto.ecc.Secp256k1`, and
-//! `std.crypto.hash.sha2.Sha256` are the only primitives this file needs
-//! beyond the sibling `root`/`mta`/`zkproofs` modules.
+//! Zig std GAP: none — `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256`,
+//! `std.crypto.ecc.Secp256k1` and `std.Thread` are all this file needs.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
-const mta = @import("mta.zig");
-const zkproofs = @import("zkproofs.zig");
+const presign = @import("presign.zig");
 
 pub const Scalar = root.Scalar;
 pub const Secp256k1 = root.Secp256k1;
 pub const Element = root.Element;
 const Ns = root.Ns;
-const Ne = root.Ne;
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
-
-/// The standard-library ECDSA scheme every `signWithShares` output MUST
-/// verify under — the whole point of this module.
+/// The standard-library ECDSA scheme every signature here verifies under.
 pub const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 /// Re-exported for callers that only import `signing` directly.
 pub const Signature = ecdsa.Signature;
 
-// ── small shared helpers (mechanical; mirror root.zig/zkproofs.zig's own
-// identically-shaped PRIVATE helpers — this repo's established "small
-// mechanical helper, copied per file" convention) ───────────────────────
-
-/// Sample a uniform `Zq` scalar from CSPRNG bytes (48-byte draw, constant-
-/// time wide reduction) — same idiom as `mta.zig`'s private `randomScalar`.
-fn randomScalar(random: std.Random) Scalar {
-    var buf: [48]u8 = undefined;
-    defer std.crypto.secureZero(u8, &buf);
-    random.bytes(&buf);
-    return Scalar.fromBytes48(buf, .big);
-}
-
-/// `int(bytes32) mod q` via the SAME wide-reduction idiom
-/// `std.crypto.sign.ecdsa`'s own `Signer.finalizePrehashed`/`Verifier.init`
-/// use internally for both the message-hash scalar `z` and the `r = R.x
-/// mod q` reduction (`reduceToScalar(32, ...)`, itself `fromBytes48` over a
-/// 16-zero-byte-padded 48-byte buffer) — using the IDENTICAL scheme here is
-/// what makes this module's `s_i = m·k_i + r·σ_i` land on the exact `m`/`r`
-/// std's own verifier will recompute.
-fn scalarFromHash32(bytes32: [32]u8) Scalar {
-    var wide = [_]u8{0} ** 48;
-    wide[16..48].* = bytes32;
-    return Scalar.fromBytes48(wide, .big);
-}
-
-/// Lagrange coefficient `λ_i = Prod_{j∈indices, j≠i} x_j / (x_j - x_i)` at
-/// evaluation point 0, over the PUBLIC participant `index` set — the same
-/// arithmetic `root.reconstructSecret` performs internally, exposed here
-/// standalone since signing needs each party's `w_i = λ_i · x_i` WITHOUT
-/// ever reconstructing the secret itself. `scalarFromIndex` duplicates
-/// `root.zig`'s private identically-named helper (same "small integer
-/// index, always canonical" convention).
+/// Converts a PUBLIC participant index to its `Scalar` (u32 << q, always
+/// canonical) — same convention as `root.zig`'s private helper.
 fn scalarFromIndex(index: u32) Scalar {
     var buf = [_]u8{0} ** Ns;
     std.mem.writeInt(u32, buf[Ns - 4 .. Ns], index, .big);
-    return Scalar.fromBytes(buf, .big) catch unreachable; // u32 << q: always canonical
+    return Scalar.fromBytes(buf, .big) catch unreachable;
 }
 
+/// Lagrange coefficient `λ_i = Π_{j∈indices, j≠i} x_j / (x_j − x_i)` at 0,
+/// over PUBLIC participant indices: `Σ_{i∈S} λ_i·x_i = x`, so each signer's
+/// `w_i = λ_i·x_i` is an additive share of the key without the key ever
+/// being assembled. `indices` must not contain duplicates.
 pub fn lagrangeCoefficient(indices: []const u32, index: u32) Scalar {
     const xi = scalarFromIndex(index);
     var numerator = Scalar.one;
@@ -178,504 +64,32 @@ pub fn lagrangeCoefficient(indices: []const u32, index: u32) Scalar {
     return numerator.mul(denominator.invert());
 }
 
-// ── Γ commit-reveal + Schnorr proof-of-knowledge (REAL — standard
-// Fiat-Shamir Sigma protocol, NOT verified byte-for-byte against GG20's own
-// Πzk instantiation; see the module doc comment) ────────────────────────
-
-pub const gamma_commit_domain = "threshold_ecdsa/signing/gamma-commit/v1";
-pub const gamma_pok_domain = "threshold_ecdsa/signing/gamma-pok/v1";
-
-/// Round-1 broadcast: `H(domain || index || Γ_i)`. Binding (a party can't
-/// change its mind about `Γ_i` after committing) is all this needs to buy —
-/// `Γ_i` alone never reveals `γ_i` (discrete-log hardness), so a plain hash
-/// commitment (no separate blinding nonce) is sufficient; this is NOT a
-/// general-purpose hiding commitment scheme.
-pub const GammaCommitment = struct {
-    index: u32,
-    commitment: [32]u8,
-
-    pub const encoded_length = 4 + 32;
-
-    pub fn toBytes(self: GammaCommitment) [encoded_length]u8 {
-        var out: [encoded_length]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4..encoded_length].* = self.commitment;
-        return out;
-    }
-
-    pub fn fromBytes(bytes: [encoded_length]u8) GammaCommitment {
-        return .{
-            .index = std.mem.readInt(u32, bytes[0..4], .big),
-            .commitment = bytes[4..encoded_length].*,
-        };
-    }
-};
-
-fn commitGamma(index: u32, big_gamma: Element) [32]u8 {
-    var h = Sha256.init(.{});
-    h.update(gamma_commit_domain);
-    var idx_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &idx_buf, index, .big);
-    h.update(&idx_buf);
-    h.update(&big_gamma.toBytes());
-    return h.finalResult();
-}
-
-/// A standard non-interactive (Fiat-Shamir) Schnorr proof of knowledge of
-/// the discrete log behind a public point — here, `Γ_i = γ_i·G`. Textbook
-/// construction (`R = k·G`, `e = H(...||Γ||R)`, `s = k + e·γ`, verify
-/// `s·G == R + e·Γ`); this is the well-known folklore Sigma protocol any
-/// implementation of this shape uses, NOT GG20's own paper-specific `Πzk`
-/// instantiation (which this scaffold pass did not have open) — see the
-/// module doc comment.
-pub const SchnorrProof = struct {
-    r_point: Element,
-    s: Scalar,
-
-    pub const encoded_length = Ne + Ns;
-
-    pub fn toBytes(self: SchnorrProof) [encoded_length]u8 {
-        var out: [encoded_length]u8 = undefined;
-        out[0..Ne].* = self.r_point.toBytes();
-        out[Ne..encoded_length].* = self.s.toBytes(.big);
-        return out;
-    }
-
-    pub const DecodeError = root.ElementError || error{InvalidEncoding};
-
-    pub fn fromBytes(bytes: [encoded_length]u8) DecodeError!SchnorrProof {
-        const r_point = try Element.fromBytes(bytes[0..Ne].*);
-        const s = Scalar.fromBytes(bytes[Ne..encoded_length].*, .big) catch return error.InvalidEncoding;
-        return .{ .r_point = r_point, .s = s };
-    }
-};
-
-fn pokChallenge(index: u32, big_gamma: Element, r_point: Element) Scalar {
-    var h = Sha256.init(.{});
-    h.update(gamma_pok_domain);
-    var idx_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &idx_buf, index, .big);
-    h.update(&idx_buf);
-    h.update(&big_gamma.toBytes());
-    h.update(&r_point.toBytes());
-    return scalarFromHash32(h.finalResult());
-}
-
-fn provePoK(index: u32, gamma: Scalar, big_gamma: Element, random: std.Random) SignError!SchnorrProof {
-    while (true) {
-        const nonce = randomScalar(random);
-        const r_full = Secp256k1.basePoint.mul(nonce.toBytes(.big), .big) catch continue;
-        const r_point = Element.fromPoint(r_full) catch continue;
-        const e = pokChallenge(index, big_gamma, r_point);
-        const s = nonce.add(e.mul(gamma));
-        return .{ .r_point = r_point, .s = s };
-    }
-}
-
-fn verifyPoK(index: u32, big_gamma: Element, proof: SchnorrProof) bool {
-    const e = pokChallenge(index, big_gamma, proof.r_point);
-    const lhs = Secp256k1.basePoint.mul(proof.s.toBytes(.big), .big) catch return false;
-    const gamma_pt = big_gamma.point() catch return false;
-    const e_gamma = gamma_pt.mul(e.toBytes(.big), .big) catch return false;
-    const r_pt = proof.r_point.point() catch return false;
-    return lhs.equivalent(e_gamma.add(r_pt));
-}
-
-/// Checks a Round-2 `GammaReveal` against the Round-1 `GammaCommitment` it
-/// claims to open: the index must match, `commitGamma` over the revealed
-/// `Γ_i` must equal the stored commitment hash, AND the accompanying
-/// Schnorr proof must verify against that same index/`Γ_i`. Split out from
-/// `signWithShares`'s loop (audit F3, 2026-09-10 fix) specifically so it is
-/// directly testable with adversarial, non-self-consistent inputs — a
-/// forged `Γ_i` revealed after a DIFFERENT one was committed, and a
-/// cross-index/foreign proof — see the two tests right below it. Before
-/// this split, `signWithShares` only ever called the equivalent of this
-/// check with `commitment`/`reveal` freshly derived from the SAME live
-/// `eph[idx].big_gamma` in the same breath, which could never disagree.
-fn verifyGammaReveal(commitment: GammaCommitment, reveal: GammaReveal) bool {
-    if (reveal.index != commitment.index) return false;
-    if (!std.mem.eql(u8, &commitGamma(reveal.index, reveal.big_gamma), &commitment.commitment)) return false;
-    return verifyPoK(reveal.index, reveal.big_gamma, reveal.proof);
-}
-
-test "verifyGammaReveal rejects a Γ_i revealed after a DIFFERENT one was committed (audit F3 MED, 2026-09-10 fix)" {
-    var prng = std.Random.DefaultPrng.init(0x6633636f6d6d6974); // "f3commit"
-    const random = prng.random();
-
-    const committed_gamma = randomScalar(random);
-    const committed_pt = Secp256k1.basePoint.mul(committed_gamma.toBytes(.big), .big) catch unreachable;
-    const committed_big_gamma = root.Element.fromPoint(committed_pt) catch unreachable;
-    const commitment: GammaCommitment = .{ .index = 1, .commitment = commitGamma(1, committed_big_gamma) };
-
-    // Party 1 REVEALS a different Γ_i than the one it committed to —
-    // rushing-adversary shape the doc comment describes. Proof is
-    // genuinely valid FOR the revealed (different) Γ_i, so only the
-    // commitment-hash check can catch this.
-    const revealed_gamma = randomScalar(random);
-    const revealed_pt = Secp256k1.basePoint.mul(revealed_gamma.toBytes(.big), .big) catch unreachable;
-    const revealed_big_gamma = root.Element.fromPoint(revealed_pt) catch unreachable;
-    try testing.expect(!std.mem.eql(u8, &revealed_big_gamma.toBytes(), &committed_big_gamma.toBytes()));
-    const proof = try provePoK(1, revealed_gamma, revealed_big_gamma, random);
-    const reveal: GammaReveal = .{ .index = 1, .big_gamma = revealed_big_gamma, .proof = proof };
-
-    try testing.expect(!verifyGammaReveal(commitment, reveal));
-
-    // Positive control: revealing the ACTUALLY-committed Γ_i with its own
-    // genuine proof passes — proves the rejection above is about the
-    // mismatch, not a broken predicate.
-    const honest_proof = try provePoK(1, committed_gamma, committed_big_gamma, random);
-    const honest_reveal: GammaReveal = .{ .index = 1, .big_gamma = committed_big_gamma, .proof = honest_proof };
-    try testing.expect(verifyGammaReveal(commitment, honest_reveal));
-}
-
-test "verifyGammaReveal rejects a foreign (cross-party) Schnorr proof (audit F3 MED, 2026-09-10 fix)" {
-    var prng = std.Random.DefaultPrng.init(0x66336669067265); // "f3foreign"
-    const random = prng.random();
-
-    const gamma_a = randomScalar(random);
-    const pt_a = Secp256k1.basePoint.mul(gamma_a.toBytes(.big), .big) catch unreachable;
-    const big_gamma_a = root.Element.fromPoint(pt_a) catch unreachable;
-    const commitment_a: GammaCommitment = .{ .index = 1, .commitment = commitGamma(1, big_gamma_a) };
-
-    // Party 2's genuine proof, over a DIFFERENT index and Γ entirely.
-    const gamma_b = randomScalar(random);
-    const pt_b = Secp256k1.basePoint.mul(gamma_b.toBytes(.big), .big) catch unreachable;
-    const big_gamma_b = root.Element.fromPoint(pt_b) catch unreachable;
-    const foreign_proof = try provePoK(2, gamma_b, big_gamma_b, random);
-
-    // Splice party 2's proof onto party 1's (genuinely-committed) Γ_i and
-    // index — the commitment-hash check alone would pass (Γ_i matches what
-    // was committed); only `verifyPoK` can catch the swapped proof.
-    const reveal: GammaReveal = .{ .index = 1, .big_gamma = big_gamma_a, .proof = foreign_proof };
-    try testing.expect(!verifyGammaReveal(commitment_a, reveal));
-}
-
-/// Round-2 reveal: `Γ_i` plus its knowledge-of-exponent proof. Every OTHER
-/// party checks this against the Round-1 `GammaCommitment` before trusting
-/// `Γ_i`.
-pub const GammaReveal = struct {
-    index: u32,
-    big_gamma: Element,
-    proof: SchnorrProof,
-
-    pub const encoded_length = 4 + Ne + SchnorrProof.encoded_length;
-
-    pub fn toBytes(self: GammaReveal) [encoded_length]u8 {
-        var out: [encoded_length]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4 .. 4 + Ne].* = self.big_gamma.toBytes();
-        out[4 + Ne .. encoded_length].* = self.proof.toBytes();
-        return out;
-    }
-
-    pub const DecodeError = root.ElementError || SchnorrProof.DecodeError;
-
-    pub fn fromBytes(bytes: [encoded_length]u8) DecodeError!GammaReveal {
-        const index = std.mem.readInt(u32, bytes[0..4], .big);
-        const big_gamma = try Element.fromBytes(bytes[4 .. 4 + Ne].*);
-        const proof = try SchnorrProof.fromBytes(bytes[4 + Ne .. encoded_length].*);
-        return .{ .index = index, .big_gamma = big_gamma, .proof = proof };
-    }
-};
-
-/// Round-4 reveal: one party's additive share of `k·γ` — plaintext scalars
-/// summed publicly (no MtA needed to open a value every party already
-/// helped compute additively).
-pub const DeltaShare = struct {
-    index: u32,
-    delta: Scalar,
-
-    pub const encoded_length = 4 + Ns;
-
-    pub fn toBytes(self: DeltaShare) [encoded_length]u8 {
-        var out: [encoded_length]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4..encoded_length].* = self.delta.toBytes(.big);
-        return out;
-    }
-
-    pub fn fromBytes(bytes: [encoded_length]u8) error{InvalidEncoding}!DeltaShare {
-        const index = std.mem.readInt(u32, bytes[0..4], .big);
-        const delta = Scalar.fromBytes(bytes[4..encoded_length].*, .big) catch return error.InvalidEncoding;
-        return .{ .index = index, .delta = delta };
-    }
-};
-
-/// Round-5 reveal: one party's signature share `s_i`.
-pub const SigShare = struct {
-    index: u32,
-    s: Scalar,
-
-    pub const encoded_length = 4 + Ns;
-
-    pub fn toBytes(self: SigShare) [encoded_length]u8 {
-        var out: [encoded_length]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4..encoded_length].* = self.s.toBytes(.big);
-        return out;
-    }
-
-    pub fn fromBytes(bytes: [encoded_length]u8) error{InvalidEncoding}!SigShare {
-        const index = std.mem.readInt(u32, bytes[0..4], .big);
-        const s = Scalar.fromBytes(bytes[4..encoded_length].*, .big) catch return error.InvalidEncoding;
-        return .{ .index = index, .s = s };
-    }
-};
-
-// ── Phase-2b/2c-composed MtA/MtAwc rounds (REAL — pure composition over
-// already-implemented mta.zig/zkproofs.zig entry points) ────────────────
-
-pub const SignError = std.mem.Allocator.Error || mta.MtaError || error{
+pub const SignError = std.mem.Allocator.Error || error{
+    /// Fewer than two shares, duplicate indices, shares of different keys,
+    /// or a share whose public material does not cover the signing set.
     InvalidParameters,
-    InvalidRangeProof,
-    InvalidMtaProof,
-    InvalidCommitment,
-    InvalidKnowledgeProof,
-    IdentityPoint,
+    /// A check of the protocol failed (`presign.Fault`). With every share in
+    /// one process this means corrupt key material.
     SigningAborted,
-    // Audit F1/F2: a RECEIVED aux tuple / Paillier key failed the fail-closed
-    // `zkproofs` prove-side validation (`root.AuxParams.validate` /
-    // `root.paillierNMeetsFloor`) — surfaced from `runCheckedMtA(wc)`.
-    InvalidAuxParams,
 };
 
-/// Alice's Phase-2c encryption of her secret, plus its range proof against
-/// `bob_aux` — factored out so ONE ordered pair `(i, j)` builds it ONCE and
-/// shares it between the pair's two conversions (γ and w), instead of each
-/// rebuilding an independent `c_a = Enc(k_i)` and an independent range
-/// proof of the SAME secret under the SAME `alice_pk`/`bob_aux` (audit F7,
-/// MED, fixed 2026-09-10). Measured cost of the duplicate this replaces:
-/// ~118 ms of ~425 ms per ordered pair (13.7% of `t=4`'s total signing
-/// time) — see the disposition in `A1/threshold_ecdsa.md` for the RED/GREEN
-/// numbers. `r_a` (Alice's Paillier encryption randomness) is SECRET and is
-/// zeroed by the caller once both conversions for this pair are done with
-/// it (`aliceRangeProofOnce`'s own doc comment on `AliceInitChecked`: "retain
-/// until the range proof has produced [it], then zero it").
-const AliceRangeProof = struct {
-    init: mta.AliceInitChecked,
+pub const SignOptions = struct {
+    /// `null` (the default): every party's round runs on the caller's
+    /// thread. `n`: each round's per-party work runs on `min(n, t)` threads,
+    /// the caller's included; a thread that cannot be spawned has its
+    /// parties run on the caller's thread. Each party draws from its own
+    /// ChaCha CSPRNG seeded from `random` up front, so the signature does not
+    /// depend on `n`. Worker threads allocate from per-party arenas over
+    /// `std.heap.page_allocator` (`allocator` need not be thread-safe and is
+    /// touched only from the caller's thread).
+    threads: ?usize = null,
 };
 
-fn aliceRangeProofOnce(
-    allocator: std.mem.Allocator,
-    alice_secret: Scalar,
-    alice_pk: paillier.PublicKey,
-    bob_aux: root.AuxParams,
-    random: std.Random,
-) SignError!AliceRangeProof {
-    const alice_init = try mta.mtaAliceInitChecked(alice_secret, alice_pk, random);
-    const range_proof = try zkproofs.proveAliceRange(allocator, alice_secret, alice_init.r_a, alice_pk, bob_aux, random);
-    defer range_proof.deinit(allocator);
-    if (!zkproofs.verifyAliceRange(range_proof, alice_init.c_a, alice_pk, bob_aux)) return error.InvalidRangeProof;
-    return .{ .init = alice_init };
-}
-
-/// One instance of the Phase-2c CHECKED MtA (`mta.zig`'s
-/// `*Checked`/`zkproofs`'s MtA proof — GG18 Appendix A.1/A.3, all REAL)
-/// between Alice (owned by the party whose `alice_pk`/`alice_sk`/
-/// `alice_aux` are passed, and whose already-proven `alice_range` the
-/// caller built via `aliceRangeProofOnce`) and `bob_secret` (owned by the
-/// counterparty). Returns Alice's `alpha` and Bob's `beta` with
-/// `alpha + beta ≡ alice_secret · bob_secret (mod q)`.
-fn runCheckedMtA(
-    allocator: std.mem.Allocator,
-    alice_range: AliceRangeProof,
-    bob_secret: Scalar,
-    alice_pk: paillier.PublicKey,
-    alice_sk: paillier.SecretKey,
-    alice_aux: root.AuxParams,
-    random: std.Random,
-) SignError!struct { alpha: Scalar, beta: Scalar } {
-    const alice_init = alice_range.init;
-    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
-    const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
-    defer mta_proof.deinit(allocator);
-
-    const alpha = try mta.mtaAliceFinalizeChecked(alice_init.c_a, bob_resp.c_b, mta_proof, alice_sk, alice_pk, alice_aux);
-    return .{ .alpha = alpha, .beta = bob_resp.beta };
-}
-
-/// The MtAwc variant: like `runCheckedMtA`, but Bob additionally proves his
-/// `bob_secret` matches the PUBLIC point `b_point` (`zkproofs
-/// .proveBobMtaWc`/`verifyBobMtaWc`, GG18 Appendix A.2, REAL) — this is
-/// what GG20's `k·x` share conversion needs (`b_point` = the counterparty's
-/// Lagrange-weighted verifying share `W_j = λ_j·X_j`). `mta.zig` has no
-/// `*Wc`-specific finalize wrapper, so this calls the plain (semi-honest)
-/// `mta.mtaAliceFinalize` for decryption AFTER this function's own
-/// `verifyBobMtaWc` gate — equivalent fail-closed posture to
-/// `mtaAliceFinalizeChecked`, just assembled locally. `alice_range` is the
-/// SAME already-proven encryption `runCheckedMtA` used for this ordered
-/// pair (audit F7 fix) — reused, not rebuilt.
-fn runCheckedMtAwc(
-    allocator: std.mem.Allocator,
-    alice_range: AliceRangeProof,
-    bob_secret: Scalar,
-    alice_pk: paillier.PublicKey,
-    alice_sk: paillier.SecretKey,
-    alice_aux: root.AuxParams,
-    b_point: Element,
-    random: std.Random,
-) SignError!struct { alpha: Scalar, beta: Scalar } {
-    const alice_init = alice_range.init;
-    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
-    const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
-    defer wc_proof.deinit(allocator);
-    if (!zkproofs.verifyBobMtaWc(wc_proof, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point)) return error.InvalidMtaProof;
-
-    const alpha = try mta.mtaAliceFinalize(bob_resp.c_b, alice_sk);
-    return .{ .alpha = alpha, .beta = bob_resp.beta };
-}
-
-// ── Phase 3 per-pair work (audit F6) ─────────────────────────────────────
-
-/// One ordered pair's two conversions: `α`/`β` of `k_i·γ_j` and of `k_i·w_j`.
-const PairShares = struct {
-    gamma_alpha: Scalar,
-    gamma_beta: Scalar,
-    x_alpha: Scalar,
-    x_beta: Scalar,
-};
-
-/// What every pair reads. Nothing here is written while pairs run.
-const PairCtx = struct {
-    shares: []const root.KeyShare,
-    indices: []const u32,
-    eph: []const Ephemeral,
-};
-
-/// Ordered pair `(ii, jj)`: Alice = party `ii` (her `k`), Bob = party `jj`
-/// (his `γ` and `w`). Reads `ctx` only; returns the four additive shares.
-fn computePair(
-    allocator: std.mem.Allocator,
-    ctx: PairCtx,
-    ii: usize,
-    jj: usize,
-    random: std.Random,
-) SignError!PairShares {
-    const ai_share = ctx.shares[ii];
-    const aj_share = ctx.shares[jj];
-    // Audit F2 (HIGH, 2026-09-10 fix): `KeyShare.fromBytesAlloc` does no
-    // cross-check that `public_keys` actually contains the share's OWN
-    // `index` -- a `KeyShare` that round-trips through the module's own
-    // codec but was assembled with a stripped/mismatched entry list used
-    // to reach here via `.get(index).?`, panicking in ReleaseSafe (SIGABRT)
-    // and undefined behavior in ReleaseFast. Fail closed instead, same as
-    // every other malformed-input guard in this function.
-    const ai_pubkeys = ai_share.public_keys.get(ai_share.index) orelse return error.InvalidParameters;
-    const alice_pk = ai_pubkeys.paillier_pk;
-    const alice_sk = ai_share.paillier_secret;
-    const alice_aux = ai_pubkeys.aux;
-    const bob_aux = (aj_share.public_keys.get(aj_share.index) orelse return error.InvalidParameters).aux;
-
-    // Audit F7 fix (2026-09-10): ONE `c_a = Enc(k_i)` + ONE range proof for
-    // this ordered pair, shared by both conversions below.
-    var alice_range = try aliceRangeProofOnce(allocator, ctx.eph[ii].k, alice_pk, bob_aux, random);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&alice_range));
-
-    const gamma_res = try runCheckedMtA(allocator, alice_range, ctx.eph[jj].gamma, alice_pk, alice_sk, alice_aux, random);
-
-    const xj_pt = aj_share.verifying_share.point() catch return error.IdentityPoint;
-    const lambda_j = lagrangeCoefficient(ctx.indices, aj_share.index);
-    const wj_pt = xj_pt.mul(lambda_j.toBytes(.big), .big) catch return error.IdentityPoint;
-    const w_point = Element.fromPoint(wj_pt) catch return error.IdentityPoint;
-
-    const x_res = try runCheckedMtAwc(allocator, alice_range, ctx.eph[jj].w, alice_pk, alice_sk, alice_aux, w_point, random);
-    return .{ .gamma_alpha = gamma_res.alpha, .gamma_beta = gamma_res.beta, .x_alpha = x_res.alpha, .x_beta = x_res.beta };
-}
-
-fn accumulatePair(eph: []Ephemeral, ii: usize, jj: usize, p: PairShares) void {
-    eph[ii].delta = eph[ii].delta.add(p.gamma_alpha);
-    eph[jj].delta = eph[jj].delta.add(p.gamma_beta);
-    eph[ii].sigma = eph[ii].sigma.add(p.x_alpha);
-    eph[jj].sigma = eph[jj].sigma.add(p.x_beta);
-}
-
-const max_pair_threads = 64;
-
-/// One pair's slot: inputs set by the caller's thread before any worker
-/// starts, `result` written by exactly one worker.
-const PairJob = struct {
-    ii: usize,
-    jj: usize,
-    seed: [std.Random.DefaultCsprng.secret_seed_length]u8,
-    result: SignError!PairShares,
-};
-
-/// Pair order `(0,1), (0,2), …, (t−1,t−2)` — the sequential loop's order —
-/// with one seed per pair drawn from `random` in that order.
-fn fillPairJobs(jobs: []PairJob, t: usize, random: std.Random) void {
-    var k: usize = 0;
-    for (0..t) |ii| {
-        for (0..t) |jj| {
-            if (ii == jj) continue;
-            jobs[k] = .{ .ii = ii, .jj = jj, .seed = undefined, .result = error.SigningAborted };
-            random.bytes(&jobs[k].seed);
-            k += 1;
-        }
-    }
-    std.debug.assert(k == jobs.len);
-}
-
-/// Worker `part` of `stride`: jobs `part, part+stride, …`, its own scratch.
-fn pairWorker(ctx: PairCtx, jobs: []PairJob, part: usize, stride: usize, scratch: []u8) void {
-    var fba = std.heap.FixedBufferAllocator.init(scratch);
-    var k = part;
-    while (k < jobs.len) : (k += stride) {
-        fba.reset();
-        var csprng = std.Random.DefaultCsprng.init(jobs[k].seed);
-        jobs[k].result = computePair(fba.allocator(), ctx, jobs[k].ii, jobs[k].jj, csprng.random());
-        std.crypto.secureZero(u8, std.mem.asBytes(&csprng));
-    }
-    std.crypto.secureZero(u8, scratch);
-}
-
-/// Run every job on `threads` workers, the caller's thread being worker 0.
-/// `scratch` is split evenly, one disjoint slice per worker.
-fn runPairJobs(ctx: PairCtx, jobs: []PairJob, scratch: []u8, threads: usize) void {
-    std.debug.assert(threads >= 1 and threads <= max_pair_threads and scratch.len % threads == 0);
-    const per = scratch.len / threads;
-    if (builtin.single_threaded) {
-        for (0..threads) |p| pairWorker(ctx, jobs, p, threads, scratch[p * per ..][0..per]);
-    } else {
-        var handles: [max_pair_threads]?std.Thread = @splat(null);
-        for (1..threads) |p| {
-            handles[p] = std.Thread.spawn(.{}, pairWorker, .{ ctx, jobs, p, threads, scratch[p * per ..][0..per] }) catch null;
-        }
-        pairWorker(ctx, jobs, 0, threads, scratch[0..per]);
-        for (1..threads) |p| {
-            if (handles[p]) |h| h.join() else pairWorker(ctx, jobs, p, threads, scratch[p * per ..][0..per]);
-        }
-    }
-}
-
-// ── the driver: signWithShares (REAL end to end) ─────────────────────────
-
-/// Per-party ephemeral state the driver threads through its rounds.
-const Ephemeral = struct {
-    k: Scalar,
-    gamma: Scalar,
-    w: Scalar,
-    big_gamma: Element,
-    delta: Scalar,
-    sigma: Scalar,
-};
-
-/// **The decisive entry point.** Runs the FULL GG20 online signing
-/// protocol, in-process, over `shares` (the signing subset `S` — any `t`
-/// of the group's `n` `KeyShare`s; `t`/`n`/`group_public_key` must agree
-/// across all of them), producing a standard secp256k1 ECDSA signature
-/// over `message` that VERIFIES under `shares[0].group_public_key` via
-/// `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` — see the module doc
-/// comment for the phase-by-phase construction and the "identifiable
-/// abort scope" section for exactly what security property this does
-/// and does not provide. Never returns an invalid signature (step 6's
-/// fail-closed self-check): callers get either a genuinely-verifying
-/// `Signature` or `error.SigningAborted`/one of the more specific
-/// `Invalid*` errors.
-///
-/// `random` MUST be cryptographically secure for real use. This function
-/// allocates and frees all its own working memory; nothing is retained.
+/// Runs GG20 presigning and signing over `shares` (the signing set — at
+/// least `t` shares of one key) in-process and returns a std ECDSA
+/// signature over `message` (SHA-256, as `EcdsaSecp256k1Sha256` does),
+/// normalised to low-S and verified under the group key before it is
+/// returned. `random` must be a CSPRNG for real use.
 pub fn signWithShares(
     allocator: std.mem.Allocator,
     shares: []const root.KeyShare,
@@ -685,31 +99,18 @@ pub fn signWithShares(
     return signWithSharesOptions(allocator, shares, message, random, .{});
 }
 
-/// Phase-3 execution options for `signWithSharesOptions` (audit F6).
-pub const SignOptions = struct {
-    /// `null` (the default, what `signWithShares` uses): Phase 3's `t(t−1)`
-    /// ordered pairs run one after another on the caller's thread, drawing
-    /// from `random` directly.
-    ///
-    /// `n`: before any pair starts, the caller's thread draws one 32-byte
-    /// ChaCha seed per pair from `random`, in pair order; the pairs then run
-    /// on `min(n, t(t−1), 64)` threads, the caller's included. Each thread
-    /// owns a fixed slice of scratch (`pair_scratch_bytes`, carved from
-    /// `allocator` up front) and writes only its own pairs' result slots; the
-    /// per-party accumulators `δ_i`/`σ_i` are summed on the caller's thread
-    /// after every worker has joined. No mutable state is shared between
-    /// threads, and the result does not depend on `n`. A thread that cannot
-    /// be spawned has its pairs run on the caller's thread instead.
-    ///
-    /// The signature is identical to the default path's for the same
-    /// `random` (Phase 3 randomness never reaches `r`/`s`); `random` ends in a
-    /// different state.
-    pair_threads: ?usize = null,
-    /// Scratch per thread for a pair's proof buffers (reset per pair).
-    pair_scratch_bytes: usize = 256 * 1024,
+const max_threads = 64;
+
+const PartySlot = struct {
+    party: presign.Party = undefined,
+    live: bool = false,
+    arena: ?std.heap.ArenaAllocator = null,
+    csprng: std.Random.DefaultCsprng = undefined,
+    inbox: std.ArrayList([]const u8) = .empty,
+    result: presign.Error!presign.Outbox = error.InvalidState,
 };
 
-/// `signWithShares` with explicit Phase-3 options — see `SignOptions`.
+/// `signWithShares` with explicit options — see `SignOptions`.
 pub fn signWithSharesOptions(
     allocator: std.mem.Allocator,
     shares: []const root.KeyShare,
@@ -719,192 +120,160 @@ pub fn signWithSharesOptions(
 ) SignError!Signature {
     const t = shares.len;
     if (t < 2) return error.InvalidParameters;
-
+    const group_pk = shares[0].group_public_key.toBytes();
+    for (shares[1..]) |s| {
+        if (!std.mem.eql(u8, &s.group_public_key.toBytes(), &group_pk)) return error.InvalidParameters;
+    }
     const indices = try allocator.alloc(u32, t);
     defer allocator.free(indices);
-    for (shares, 0..) |s, idx| indices[idx] = s.index;
-    for (indices, 0..) |a, ia| {
-        for (indices[ia + 1 ..]) |b| {
-            if (a == b) return error.InvalidParameters;
-        }
-    }
+    for (shares, indices) |s, *idx| idx.* = s.index;
 
-    const group_pk = shares[0].group_public_key;
-    for (shares[1..]) |s| {
-        if (!std.mem.eql(u8, &s.group_public_key.toBytes(), &group_pk.toBytes())) return error.InvalidParameters;
-    }
+    var sid: presign.SessionId = undefined;
+    random.bytes(&sid);
 
-    // ── Phase 1/2: local secrets + Γ commit-reveal + knowledge proofs ───
-    const eph = try allocator.alloc(Ephemeral, t);
-    // `k`/`gamma`/`w`/`delta`/`sigma` are all secret per-party scalars
-    // (the ephemeral nonce, blinding, weighted key share, and their MtA
-    // accumulators); `big_gamma` is the public Γ commitment. Zero the
-    // whole scratch array before freeing — nothing here is retained past
-    // this function, and it's simplest/safest to wipe it all.
+    const slots = try allocator.alloc(PartySlot, t);
+    @memset(slots, .{});
+    // Outboxes of the round whose messages sit in the inboxes right now.
+    var pending: ?[]presign.Outbox = null;
     defer {
-        std.crypto.secureZero(u8, std.mem.sliceAsBytes(eph));
-        allocator.free(eph);
-    }
-
-    for (shares, 0..) |s, idx| {
-        const k_i = randomScalar(random);
-        const gamma_i = randomScalar(random);
-        const lambda_i = lagrangeCoefficient(indices, s.index);
-        const w_i = lambda_i.mul(s.secret_share);
-        const big_gamma_pt = Secp256k1.basePoint.mul(gamma_i.toBytes(.big), .big) catch return error.IdentityPoint;
-        const big_gamma = Element.fromPoint(big_gamma_pt) catch return error.IdentityPoint;
-        eph[idx] = .{ .k = k_i, .gamma = gamma_i, .w = w_i, .big_gamma = big_gamma, .delta = Scalar.zero, .sigma = Scalar.zero };
-    }
-
-    // Round 1 (commit): every party broadcasts a `GammaCommitment`, stored
-    // here for EVERY party before any Round-2 reveal exists — routed
-    // through the wire codec (`GammaCommitment.toBytes`/`.fromBytes`) so
-    // `commitments[idx]` below is what a networked party would actually
-    // have on hand, a snapshot taken now, not a live re-read of
-    // `eph[idx].big_gamma`.
-    const commitments = try allocator.alloc(GammaCommitment, t);
-    defer allocator.free(commitments);
-    for (shares, 0..) |s, idx| {
-        const msg: GammaCommitment = .{ .index = s.index, .commitment = commitGamma(s.index, eph[idx].big_gamma) };
-        commitments[idx] = GammaCommitment.fromBytes(msg.toBytes());
-    }
-
-    // Round 2 (reveal + verify): every party reveals `(Γ_i, proof)` —
-    // audit F3 fix (2026-09-10): the OLD code compared
-    // `commitGamma(s.index, eph[idx].big_gamma)` against a `commitment`
-    // local that was the IDENTICAL expression evaluated moments earlier
-    // over the SAME still-unchanged `eph[idx].big_gamma` — a tautology
-    // that no input could ever fail. `verifyGammaReveal` below is a
-    // standalone, directly-testable predicate (two adversarial tests
-    // below it) fed the Round-1 message STORED above, not a fresh alias
-    // of the value it is checking.
-    for (shares, 0..) |s, idx| {
-        const proof = try provePoK(s.index, eph[idx].gamma, eph[idx].big_gamma, random);
-        const reveal_msg: GammaReveal = .{ .index = s.index, .big_gamma = eph[idx].big_gamma, .proof = proof };
-        const reveal = GammaReveal.fromBytes(reveal_msg.toBytes()) catch unreachable; // just encoded above; the round-trip cannot fail
-        if (!verifyGammaReveal(commitments[idx], reveal)) return error.InvalidCommitment;
-    }
-
-    var gamma_sum = Secp256k1.identityElement;
-    for (eph) |e| {
-        const pt = e.big_gamma.point() catch return error.IdentityPoint;
-        gamma_sum = gamma_sum.add(pt);
-    }
-
-    // ── Phase 3: MtA (k·γ) + MtAwc (k·x) over every ordered pair ─────────
-    // Pairs only READ `k`/`γ`/`w`; the `δ`/`σ` accumulators are written on
-    // this thread only (audit F6: they are the state a naive per-pair thread
-    // would race on — each party appears in 2(t−1) pairs).
-    const ctx: PairCtx = .{ .shares = shares, .indices = indices, .eph = eph };
-    if (options.pair_threads) |requested| {
-        const jobs = try allocator.alloc(PairJob, t * (t - 1));
-        defer {
-            std.crypto.secureZero(u8, std.mem.sliceAsBytes(jobs));
-            allocator.free(jobs);
+        if (pending) |boxes| freeOutboxes(allocator, slots, boxes);
+        for (slots) |*s| {
+            if (s.live) s.party.deinit();
+            s.inbox.deinit(allocator);
+            std.crypto.secureZero(u8, std.mem.asBytes(&s.csprng));
+            if (s.arena) |*a| a.deinit();
         }
-        fillPairJobs(jobs, t, random);
-        const threads = @max(1, @min(requested, @min(jobs.len, max_pair_threads)));
-        const scratch = try allocator.alloc(u8, threads * options.pair_scratch_bytes);
-        defer allocator.free(scratch); // each worker zeroes its own slice
-        runPairJobs(ctx, jobs, scratch, threads);
-        for (jobs) |job| accumulatePair(eph, job.ii, job.jj, try job.result);
-    } else {
-        for (0..t) |ii| {
-            for (0..t) |jj| {
-                if (ii == jj) continue;
-                accumulatePair(eph, ii, jj, try computePair(allocator, ctx, ii, jj, random));
+        allocator.free(slots);
+    }
+    const threaded = options.threads != null and !builtin.single_threaded;
+    for (slots) |*slot| {
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        random.bytes(&seed);
+        slot.csprng = .init(seed);
+        if (threaded) slot.arena = .init(std.heap.page_allocator);
+    }
+    for (slots, shares) |*slot, share| {
+        const party_alloc = if (slot.arena) |*a| a.allocator() else allocator;
+        slot.party = presign.Party.init(party_alloc, share, indices, sid) catch |e| return mapError(e);
+        slot.live = true;
+    }
+
+    // Phases 1-6: one `advance` per party, outputs routed into the
+    // recipients' inboxes for the next call.
+    for (0..6) |_| {
+        runRound(slots, options.threads orelse 1, threaded);
+        if (pending) |boxes| freeOutboxes(allocator, slots, boxes);
+        pending = null;
+        for (slots) |*s| s.inbox.clearRetainingCapacity();
+
+        var failed: ?presign.Error = null;
+        for (slots) |s| {
+            _ = s.result catch |e| {
+                failed = e;
+            };
+        }
+        // Allocated before anything can fail, so a failed allocation still
+        // frees every party's outbox (review F9).
+        const boxes_or = allocator.alloc(presign.Outbox, t);
+        if (failed == null) _ = boxes_or catch |e| {
+            failed = e;
+        };
+        if (failed) |e| {
+            for (slots) |*s| if (s.result) |b| b.deinit(s.party.allocator) else |_| {};
+            if (boxes_or) |b| allocator.free(b) else |_| {}
+            return mapError(e);
+        }
+        const boxes = boxes_or catch unreachable;
+        for (slots, boxes) |s, *b| b.* = s.result catch unreachable;
+        pending = boxes;
+
+        for (boxes, shares) |box, sender| {
+            for (box.messages) |m| {
+                for (slots, shares) |*dst, recipient| {
+                    if (recipient.index == sender.index) continue;
+                    if (m.to == null or m.to.? == recipient.index) try dst.inbox.append(allocator, m.bytes);
+                }
             }
         }
     }
-    for (eph) |*e| {
-        e.delta = e.delta.add(e.k.mul(e.gamma));
-        e.sigma = e.sigma.add(e.k.mul(e.w));
+
+    // End of presigning, then Phase 7.
+    const presigs = try allocator.alloc(presign.Presignature, t);
+    var made: usize = 0;
+    defer {
+        for (presigs[0..made]) |*p| p.deinit();
+        allocator.free(presigs);
     }
-
-    // ── Phase 4: δ reveal → R → r ─────────────────────────────────────
-    var delta_sum = Scalar.zero;
-    for (eph) |e| delta_sum = delta_sum.add(e.delta);
-    if (delta_sum.isZero()) return error.SigningAborted;
-    const delta_inv = delta_sum.invert();
-
-    const r_full = gamma_sum.mul(delta_inv.toBytes(.big), .big) catch return error.SigningAborted;
-    r_full.rejectIdentity() catch return error.SigningAborted;
-    const r = scalarFromHash32(r_full.affineCoordinates().x.toBytes(.big));
-    if (r.isZero()) return error.SigningAborted;
-
-    // ── Phase 5: s shares → s ────────────────────────────────────────
-    var digest: [32]u8 = undefined;
-    Sha256.hash(message, &digest, .{});
-    const m = scalarFromHash32(digest);
-
-    var s_sum = Scalar.zero;
-    for (eph) |e| {
-        const s_i = m.mul(e.k).add(r.mul(e.sigma));
-        s_sum = s_sum.add(s_i);
+    for (slots) |*s| {
+        presigs[made] = s.party.finish(s.inbox.items) catch |e| return mapError(e);
+        made += 1;
     }
-    if (s_sum.isZero()) return error.SigningAborted;
-
-    // Canonical/low-S form: the smaller of {s, q-s} (BIP-62 convention;
-    // std's verifier does not require this, but a well-behaved signer
-    // avoids the malleability of the other form).
-    const neg_s = s_sum.neg();
-    const s_final = if (std.mem.order(u8, &s_sum.toBytes(.big), &neg_s.toBytes(.big)) == .gt) neg_s else s_sum;
-
-    const sig: Signature = .{ .r = r.toBytes(.big), .s = s_final.toBytes(.big) };
-
-    // ── Phase 6: fail-closed self-check (see "Identifiable abort scope")
-    const pk = ecdsa.PublicKey.fromSec1(&group_pk.toBytes()) catch return error.SigningAborted;
-    sig.verify(message, pk) catch return error.SigningAborted;
-
-    return sig;
+    const sig_shares = try allocator.alloc([]u8, t);
+    var signed: usize = 0;
+    defer {
+        for (sig_shares[0..signed], presigs[0..signed]) |b, p| p.public.allocator.free(b);
+        allocator.free(sig_shares);
+    }
+    for (presigs) |*p| {
+        sig_shares[signed] = p.signShare(.{ .bytes = message }) catch |e| return mapError(e);
+        signed += 1;
+    }
+    var abort: ?presign.Abort = null;
+    return presigs[0].public.combine(.{ .bytes = message }, sig_shares, &abort) catch |e| mapError(e);
 }
 
-// ── Identifiable abort: NOT implemented (no public stub) ──────────────────
-//
-// There used to be a `pub fn identifyAbortCulprit(...) noreturn` here whose
-// only behaviour was `@panic`. Removed 2026-09-30: a public function that can
-// only crash compiles in a caller and fails at run time, which is worse than
-// its absence. The gap is recorded in SPEC.md (*Backlog*); what an
-// implementation needs:
-//
-// **STUB (TODO(core)).** GG20's actual identifiable-abort apparatus (paper
-// §4's "Identifiable Abort" rounds): when `signWithShares` returns
-// `error.SigningAborted`, name EXACTLY which party's `k_i`/`γ_i`/`w_i` was
-// used inconsistently across two different pairwise MtA sessions (the
-// residual gap `signWithShares`'s "abort-only v1" posture does not close
-// — see the module doc comment's "Identifiable abort scope" section for
-// the precise threat this closes and why it does NOT threaten the "never
-// return a bad signature" invariant, only attribution). A real
-// implementation needs:
-//
-//   1. Every party to RETAIN its pairwise MtA transcripts (the `c_a`/
-//      `c_b`/proof values `runCheckedMtA`/`runCheckedMtAwc` currently
-//      discard once each pairwise round finishes) tagged by session.
-//   2. On final-signature failure, an opening/decommitment sub-protocol
-//      (GG20's Rounds 6/7) that lets an auditor cross-check a party's
-//      committed `k_i`/`γ_i` against what it actually fed into EVERY
-//      pairwise session, and produce a publicly-checkable fault
-//      attributable to one party index.
-//
-// See GG20 (R. Gennaro, S. Goldfeder, IACR ePrint 2020/540) §4 for the
-// exact construction — deliberately NOT transcribed here (this scaffold
-// pass did not have the paper's identifiable-abort sections open; guessing
-// paper-exact machinery would be worse than an honest stub).
+fn mapError(err: presign.Error) SignError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidParameters => error.InvalidParameters,
+        error.ProtocolAbort, error.InvalidState, error.PresignatureUsed => error.SigningAborted,
+    };
+}
+
+fn freeOutboxes(allocator: std.mem.Allocator, slots: []PartySlot, boxes: []presign.Outbox) void {
+    for (boxes, slots) |b, *s| b.deinit(s.party.allocator);
+    allocator.free(boxes);
+}
+
+fn advanceOne(slot: *PartySlot) void {
+    slot.result = slot.party.advance(slot.inbox.items, slot.csprng.random());
+}
+
+fn worker(slots: []PartySlot, part: usize, stride: usize) void {
+    var k = part;
+    while (k < slots.len) : (k += stride) advanceOne(&slots[k]);
+}
+
+/// One round for every party: on the caller's thread, or on up to
+/// `requested` threads (the caller's included) when `threaded`.
+fn runRound(slots: []PartySlot, requested: usize, threaded: bool) void {
+    const threads = @max(1, @min(requested, @min(slots.len, max_threads)));
+    if (!threaded or threads == 1) return worker(slots, 0, 1);
+    var handles: [max_threads]?std.Thread = @splat(null);
+    for (1..threads) |p| handles[p] = std.Thread.spawn(.{}, worker, .{ slots, p, threads }) catch null;
+    worker(slots, 0, threads);
+    for (1..threads) |p| {
+        if (handles[p]) |h| h.join() else worker(slots, p, threads);
+    }
+}
 
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-/// Fast test-only ring-Pedersen aux params: derives a genuine (if not
-/// safe-prime, hence not production-strength) two-prime-product modulus
-/// from an ordinary `paillier.generate` RSA-strength keygen (skipping the
-/// slow safe-prime search `root.generateAuxParams` performs) and sets
-/// `h2 = h1^2` for a KNOWN small lambda — mirrors `mta.zig`'s own
-/// established end-to-end-test recipe (see its "Phase 2c end-to-end" test)
-/// for exactly the same reason: the prove/verify EQUATIONS are valid
-/// regardless of `N_tilde`'s provenance, only the SECURITY (statistical
-/// hiding / soundness margin) depends on it being a genuine safe-prime
-/// product — irrelevant for a correctness-focused unit test.
+fn randomScalar(random: std.Random) Scalar {
+    var buf: [48]u8 = undefined;
+    random.bytes(&buf);
+    return Scalar.fromBytes48(buf, .big);
+}
+
+/// Fast test-only ring-Pedersen aux params: a genuine (if not safe-prime,
+/// hence not production-strength) two-prime-product modulus from an ordinary
+/// `paillier.generate` keygen, with `h2 = h1²` (a known `lambda = 2`). The
+/// prove/verify EQUATIONS hold for any such modulus; only the SECURITY
+/// margin depends on it being a safe-prime product — irrelevant for a
+/// correctness test. 2048 bits: the audit-F2 floor wants `Ñ > q⁷`.
 fn sampleFeBelow(m: root.AuxModulus, random: std.Random) root.AuxFe {
     const n_bits = m.bits();
     const n_len = (n_bits + 7) / 8;
@@ -917,10 +286,7 @@ fn sampleFeBelow(m: root.AuxModulus, random: std.Random) root.AuxFe {
     }
 }
 
-fn testAuxParams(random: std.Random) !root.AuxParams {
-    // 2048-bit Ñ (was 512): the audit-F2 floor now requires every checked-path
-    // aux Ñ to exceed q⁷ ≈ 2^1792. h2 = h1² (lambda = 2) keeps a known DL for
-    // the completeness-only fixture — a square, hence Jacobi +1 like validate wants.
+pub fn testAuxParams(random: std.Random) !root.AuxParams {
     const nt_kp = try paillier.generate(random, 2048);
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
@@ -930,39 +296,34 @@ fn testAuxParams(random: std.Random) !root.AuxParams {
     const n_tilde = try root.AuxModulus.fromBytes(nt_buf[strip..nt_len], .big);
     const x = sampleFeBelow(n_tilde, random);
     const h1 = n_tilde.sq(x);
-    const h2 = n_tilde.sq(h1); // h2 = h1^2 = h1^lambda, lambda = 2
+    const h2 = n_tilde.sq(h1);
     return .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 };
 }
 
-const TestKeygen = struct {
+pub const TestKeygen = struct {
     key_shares: []root.KeyShare,
 
-    fn deinit(self: TestKeygen, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: TestKeygen, allocator: std.mem.Allocator) void {
         allocator.free(self.key_shares[0].public_keys.entries);
         allocator.free(self.key_shares);
     }
 };
 
-/// Small-but-real 1024-bit Paillier keys (the same "test-only fast size"
-/// this module's own `mta.zig`/`zkproofs.zig` tests already establish —
-/// see e.g. `zkproofs.zig`'s "Phase 2c end-to-end" test) + fast
-/// `testAuxParams` tuples, wired through the REAL `root.keygenTrustedDealer`.
-fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u32) !TestKeygen {
+/// Real 2048-bit Paillier keys + `testAuxParams` tuples, through the REAL
+/// `root.keygenTrustedDealer`. Shared with `presign.zig`'s tests.
+pub fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u32) !TestKeygen {
     const paillier_keys = try allocator.alloc(paillier.KeyPair, n);
     defer allocator.free(paillier_keys);
     const aux_params = try allocator.alloc(root.AuxParams, n);
     defer allocator.free(aux_params);
     for (0..n) |i| {
-        // 2048-bit (was 1024): audit-F2 floor requires checked-path Paillier N > q⁷.
         paillier_keys[i] = try paillier.generate(random, 2048);
         aux_params[i] = try testAuxParams(random);
     }
-
     const secret = randomScalar(random);
     const coefficients = try allocator.alloc(Scalar, t - 1);
     defer allocator.free(coefficients);
     for (coefficients) |*c| c.* = randomScalar(random);
-
     const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, coefficients, paillier_keys, aux_params);
     return .{ .key_shares = key_shares };
 }
@@ -972,10 +333,15 @@ fn expectVerifies(shares: []const root.KeyShare, message: []const u8, sig: Signa
     try sig.verify(message, pk);
 }
 
+fn isLowS(sig: Signature) bool {
+    const s = Scalar.fromBytes(sig.s, .big) catch return false;
+    return std.mem.order(u8, &sig.s, &s.neg().toBytes(.big)) != .gt;
+}
+
 test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> verifies under std EcdsaSecp256k1Sha256" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig, so
+    // the DEFAULT lane builds it at ReleaseSafe and runs this; it skips only
+    // under `-Dstrict-debug`.
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x736967_6e696e67); // "signing"
@@ -985,16 +351,13 @@ test "signWithShares: decisive test — keygen(2,3) -> sign over 2 shares -> ver
     defer kg.deinit(allocator);
 
     const subset = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1] };
-    const message = "GG20 threshold-ECDSA Phase 2d decisive test";
-
+    const message = "GG20 threshold-ECDSA decisive test";
     const sig = try signWithShares(allocator, &subset, message, random);
     try expectVerifies(kg.key_shares, message, sig);
+    try testing.expect(isLowS(sig));
 }
 
-test "signWithShares: different t-subsets of n all produce signatures that verify under X" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+test "signWithShares: every t-subset of n, and a signing set larger than t, verify under X" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7375627365747300); // "subsets"
@@ -1004,70 +367,44 @@ test "signWithShares: different t-subsets of n all produce signatures that verif
     defer kg.deinit(allocator);
 
     const message = "same group key, different signing subsets";
-    const pairs = [_][2]usize{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 2 } };
+    const pairs = [_][2]usize{ .{ 0, 1 }, .{ 0, 2 }, .{ 2, 1 } };
     for (pairs) |pair| {
         const subset = [_]root.KeyShare{ kg.key_shares[pair[0]], kg.key_shares[pair[1]] };
-        const sig = try signWithShares(allocator, &subset, message, random);
-        try expectVerifies(kg.key_shares, message, sig);
+        try expectVerifies(kg.key_shares, message, try signWithShares(allocator, &subset, message, random));
     }
+    try expectVerifies(kg.key_shares, message, try signWithShares(allocator, kg.key_shares, message, random));
 }
 
-test "signWithShares: tampered signature share does not verify" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+test "signWithShares: a flipped bit and a different message do not verify" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x74616d706572); // "tamper"
     const random = prng.random();
 
-    const kg = try testKeygen(allocator, random, 2, 3);
+    const kg = try testKeygen(allocator, random, 2, 2);
     defer kg.deinit(allocator);
 
-    const subset = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1] };
-    const message = "tamper me";
-    var sig = try signWithShares(allocator, &subset, message, random);
-    try expectVerifies(kg.key_shares, message, sig);
-
-    // Flip one bit of s: must no longer verify.
-    sig.s[31] ^= 0x01;
+    var sig = try signWithShares(allocator, kg.key_shares, "message A", random);
     const pk = try ecdsa.PublicKey.fromSec1(&kg.key_shares[0].group_public_key.toBytes());
-    try testing.expectError(error.SignatureVerificationFailed, sig.verify(message, pk));
-}
-
-test "signWithShares: signature over one message does not verify against a different message" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x6d69736d61746368); // "mismatch"
-    const random = prng.random();
-
-    const kg = try testKeygen(allocator, random, 2, 3);
-    defer kg.deinit(allocator);
-
-    const subset = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1] };
-    const sig = try signWithShares(allocator, &subset, "message A", random);
-
-    const pk = try ecdsa.PublicKey.fromSec1(&kg.key_shares[0].group_public_key.toBytes());
+    try sig.verify("message A", pk);
     try testing.expectError(error.SignatureVerificationFailed, sig.verify("message B", pk));
+    sig.s[31] ^= 0x01;
+    try testing.expectError(error.SignatureVerificationFailed, sig.verify("message A", pk));
 }
 
-test "signWithShares: rejects a subset with fewer than 2 shares or mismatched group_public_key" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+test "signWithShares: rejects one share, mixed keys, a duplicate index, a set below t" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x76616c6964617465); // "validate"
     const random = prng.random();
 
-    const kg = try testKeygen(allocator, random, 2, 3);
+    const kg = try testKeygen(allocator, random, 3, 3);
     defer kg.deinit(allocator);
 
-    const one = [_]root.KeyShare{kg.key_shares[0]};
-    try testing.expectError(error.InvalidParameters, signWithShares(allocator, &one, "m", random));
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, kg.key_shares[0..1], "m", random));
+    const dup = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[0], kg.key_shares[1] };
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, &dup, "m", random));
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, kg.key_shares[0..2], "m", random));
 
     const kg2 = try testKeygen(allocator, random, 2, 2);
     defer kg2.deinit(allocator);
@@ -1076,9 +413,6 @@ test "signWithShares: rejects a subset with fewer than 2 shares or mismatched gr
 }
 
 test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is missing from public_keys (audit F2 HIGH, 2026-09-10 fix)" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x66325f68696768); // "f2_high"
@@ -1087,75 +421,49 @@ test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is
     const kg = try testKeygen(allocator, random, 2, 3);
     defer kg.deinit(allocator);
 
-    // Reproduces the audit's exact shape: a `KeyShare` whose `public_keys`
-    // does not contain an entry for its OWN `index`. Before this fix,
-    // `signWithShares` looked itself up with `.get(ai_share.index).?` --
-    // ReleaseSafe turned the `null` unwrap into a panic (SIGABRT);
-    // ReleaseFast made it undefined behavior instead of a panic or any of
-    // the documented `Invalid*`/`SigningAborted` outcomes.
     var stripped_entries: std.ArrayList(root.PartyPublicKeys) = .empty;
     defer stripped_entries.deinit(allocator);
     for (kg.key_shares[0].public_keys.entries) |e| {
         if (e.index != kg.key_shares[0].index) try stripped_entries.append(allocator, e);
     }
-    try testing.expectEqual(kg.key_shares[0].public_keys.entries.len - 1, stripped_entries.items.len);
-
     var victim = kg.key_shares[0];
     victim.public_keys = .{ .entries = stripped_entries.items };
     const subset = [_]root.KeyShare{ victim, kg.key_shares[1] };
-
     try testing.expectError(error.InvalidParameters, signWithShares(allocator, &subset, "m", random));
 }
 
-fn expectSamePairShares(a: PairShares, b: PairShares) !void {
-    try testing.expectEqualSlices(u8, &a.gamma_alpha.toBytes(.big), &b.gamma_alpha.toBytes(.big));
-    try testing.expectEqualSlices(u8, &a.gamma_beta.toBytes(.big), &b.gamma_beta.toBytes(.big));
-    try testing.expectEqualSlices(u8, &a.x_alpha.toBytes(.big), &b.x_alpha.toBytes(.big));
-    try testing.expectEqualSlices(u8, &a.x_beta.toBytes(.big), &b.x_beta.toBytes(.big));
+test "signWithShares: a verifying share that does not match the key is refused before any round" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x62616478); // "badx"
+    const random = prng.random();
+
+    const kg = try testKeygen(allocator, random, 2, 2);
+    defer kg.deinit(allocator);
+
+    // Party 2's published X_2 replaced by G: Σ λ_j·X_j is no longer X.
+    const entries = try allocator.dupe(root.PartyPublicKeys, kg.key_shares[0].public_keys.entries);
+    defer allocator.free(entries);
+    entries[1].verifying_share = try Element.fromPoint(Secp256k1.basePoint);
+    var a = kg.key_shares[0];
+    a.public_keys = .{ .entries = entries };
+    var b = kg.key_shares[1];
+    b.public_keys = .{ .entries = entries };
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, &[_]root.KeyShare{ a, b }, "m", random));
 }
 
-test "audit F6: parallel pair phase — shares bit-identical for 1 vs 4 threads, signature identical to the sequential path" {
-    // Heavy: 2048-bit keygen, like every signing test here (skips only in Debug).
+test "audit F6: the threaded driver gives the same signature as the sequential one" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var kprng = std.Random.DefaultPrng.init(0xF6_6b6579); // "key"
     const kg = try testKeygen(allocator, kprng.random(), 3, 3);
     defer kg.deinit(allocator);
-    const subset = kg.key_shares[0..3];
 
-    // (1) The executor `signWithSharesOptions` calls: same seeds, 1 thread
-    // vs 4 threads (6 pairs, so threads really overlap) → identical shares.
-    var eprng = std.Random.DefaultPrng.init(0xF6_657068); // "eph"
-    var indices: [3]u32 = undefined;
-    for (subset, 0..) |s, i| indices[i] = s.index;
-    var eph: [3]Ephemeral = undefined;
-    for (subset, 0..) |s, i| {
-        eph[i] = .{
-            .k = randomScalar(eprng.random()),
-            .gamma = randomScalar(eprng.random()),
-            .w = lagrangeCoefficient(&indices, s.index).mul(s.secret_share),
-            .big_gamma = undefined, // not read by Phase 3
-            .delta = Scalar.zero,
-            .sigma = Scalar.zero,
-        };
-    }
-    const ctx: PairCtx = .{ .shares = subset, .indices = &indices, .eph = &eph };
-    var runs: [2][6]PairJob = undefined;
-    for (&runs, [_]usize{ 1, 4 }) |*jobs, threads| {
-        var sprng = std.Random.DefaultPrng.init(0xF6_73656564); // "seed"
-        fillPairJobs(jobs, 3, sprng.random());
-        const scratch = try allocator.alloc(u8, threads * (SignOptions{}).pair_scratch_bytes);
-        defer allocator.free(scratch);
-        runPairJobs(ctx, jobs, scratch, threads);
-    }
-    for (runs[0], runs[1]) |one, four| try expectSamePairShares(try one.result, try four.result);
-
-    // (2) End to end from the same PRNG state: sequential, 1 thread, 4 threads.
     const message = "audit F6";
     var sigs: [3]Signature = undefined;
-    for (&sigs, [_]?usize{ null, 1, 4 }) |*sig, pair_threads| {
+    for (&sigs, [_]?usize{ null, 1, 4 }) |*sig, threads| {
         var prng = std.Random.DefaultPrng.init(0xF6_7369676e); // "sign"
-        sig.* = try signWithSharesOptions(allocator, subset, message, prng.random(), .{ .pair_threads = pair_threads });
+        sig.* = try signWithSharesOptions(allocator, kg.key_shares, message, prng.random(), .{ .threads = threads });
         try expectVerifies(kg.key_shares, message, sig.*);
     }
     for (sigs[1..]) |s| {
@@ -1164,115 +472,7 @@ test "audit F6: parallel pair phase — shares bit-identical for 1 vs 4 threads,
     }
 }
 
-/// A `std.Random` that hands back `scripted[i]` (exactly `48` bytes each) for
-/// its first `scripted.len` calls to `.bytes()`, then falls through to
-/// `fallback` for everything after. `signWithShares`'s Phase 1 loop is the
-/// FIRST thing that draws randomness (`randomScalar` = one 48-byte
-/// `.bytes()` call each for `k_i` then `gamma_i`, per party, before
-/// anything else touches `random`) — so scripting exactly `2*t` chunks lets
-/// a test dictate every party's `k_i`/`gamma_i` and leave every later draw
-/// (commit-reveal PoK nonces, MtA/zkproof randomness) genuinely random.
-const RiggedRandom = struct {
-    scripted: []const [48]u8,
-    calls: usize = 0,
-    fallback: std.Random,
-
-    fn fill(ptr: *anyopaque, buf: []u8) void {
-        const self: *RiggedRandom = @ptrCast(@alignCast(ptr));
-        if (self.calls < self.scripted.len and buf.len == 48) {
-            @memcpy(buf, &self.scripted[self.calls]);
-            self.calls += 1;
-        } else {
-            self.fallback.bytes(buf);
-        }
-    }
-
-    fn random(self: *RiggedRandom) std.Random {
-        return .{ .ptr = self, .fillFn = fill };
-    }
-};
-
-/// `Scalar` `s`'s wide-reduction encoding: `randomScalar` reduces a 48-byte
-/// big-endian buffer mod q, so 16 zero bytes followed by `s`'s own 32-byte
-/// encoding reduces right back to `s` (no-op reduction, since `s < q`
-/// already by construction).
-fn wide48(s: Scalar) [48]u8 {
-    var buf = [_]u8{0} ** 48;
-    @memcpy(buf[16..48], &s.toBytes(.big));
-    return buf;
-}
-
-test "signWithShares: gamma_i values that sum to ZERO abort with SigningAborted, not a bad/degenerate signature" {
-    // The exact class this audit's mandate calls out: "the zero scalar ...
-    // on every public entry point." `delta_sum.isZero()` (Phase 4) is
-    // reachable in honest operation only if Sigma gamma_i == 0 — astronomically
-    // unlikely with real random draws, hence untested by every other test in
-    // this file (none of them ever calls `expectError(error.SigningAborted,
-    // ...)`). Rigging `gamma_1 = 1`, `gamma_2 = -1` forces the ALGEBRAIC
-    // IDENTITY `delta = k * gamma = k * 0 = 0` exactly — not approximately —
-    // so this is a reliable trigger, not a probabilistic one.
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
-    if (builtin.mode == .Debug) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x646567656e657261); // "degenera"
-    const setup_random = prng.random();
-
-    const kg = try testKeygen(allocator, setup_random, 2, 2);
-    defer kg.deinit(allocator);
-    const subset = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1] };
-
-    const k1 = Scalar.one.add(Scalar.one); // 2, arbitrary nonzero
-    const k2 = Scalar.one.add(Scalar.one).add(Scalar.one); // 3, arbitrary nonzero
-    const gamma1 = Scalar.one;
-    const gamma2 = Scalar.zero.sub(Scalar.one); // -1 mod q, so gamma1+gamma2 == 0
-
-    const scripted = [_][48]u8{ wide48(k1), wide48(gamma1), wide48(k2), wide48(gamma2) };
-    var rigged = RiggedRandom{ .scripted = &scripted, .fallback = setup_random };
-
-    try testing.expectError(error.SigningAborted, signWithShares(allocator, &subset, "message", rigged.random()));
-}
-
-test "round-message codecs round-trip" {
-    var prng = std.Random.DefaultPrng.init(0x636f6465635f7274); // "codec_rt"
-    const random = prng.random();
-
-    const gamma = randomScalar(random);
-    const big_gamma_pt = try Secp256k1.basePoint.mul(gamma.toBytes(.big), .big);
-    const big_gamma = try Element.fromPoint(big_gamma_pt);
-
-    const commitment: GammaCommitment = .{ .index = 7, .commitment = commitGamma(7, big_gamma) };
-    const c_back = GammaCommitment.fromBytes(commitment.toBytes());
-    try testing.expectEqual(commitment.index, c_back.index);
-    try testing.expectEqualSlices(u8, &commitment.commitment, &c_back.commitment);
-
-    const proof = try provePoK(7, gamma, big_gamma, random);
-    try testing.expect(verifyPoK(7, big_gamma, proof));
-    const p_back = try SchnorrProof.fromBytes(proof.toBytes());
-    try testing.expectEqualSlices(u8, &proof.r_point.toBytes(), &p_back.r_point.toBytes());
-    try testing.expectEqualSlices(u8, &proof.s.toBytes(.big), &p_back.s.toBytes(.big));
-
-    const reveal: GammaReveal = .{ .index = 7, .big_gamma = big_gamma, .proof = proof };
-    const r_back = try GammaReveal.fromBytes(reveal.toBytes());
-    try testing.expectEqual(reveal.index, r_back.index);
-    try testing.expectEqualSlices(u8, &reveal.big_gamma.toBytes(), &r_back.big_gamma.toBytes());
-
-    const delta_share: DeltaShare = .{ .index = 3, .delta = randomScalar(random) };
-    const d_back = try DeltaShare.fromBytes(delta_share.toBytes());
-    try testing.expectEqual(delta_share.index, d_back.index);
-    try testing.expectEqualSlices(u8, &delta_share.delta.toBytes(.big), &d_back.delta.toBytes(.big));
-
-    const sig_share: SigShare = .{ .index = 3, .s = randomScalar(random) };
-    const s_back = try SigShare.fromBytes(sig_share.toBytes());
-    try testing.expectEqual(sig_share.index, s_back.index);
-    try testing.expectEqualSlices(u8, &sig_share.s.toBytes(.big), &s_back.s.toBytes(.big));
-}
-
 test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group secret (self-consistency)" {
-    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
-    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
-    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6c6167_72616e6765); // "lagrange"
@@ -1281,7 +481,7 @@ test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group s
     const kg = try testKeygen(allocator, random, 2, 3);
     defer kg.deinit(allocator);
 
-    const indices = [_]u32{ kg.key_shares[0].index, kg.key_shares[1].index };
+    const indices = [_]u32{ kg.key_shares[0].index, kg.key_shares[2].index };
     var acc = Scalar.zero;
     for (indices) |idx| {
         const share = for (kg.key_shares) |s| {
@@ -1292,87 +492,4 @@ test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group s
     const expected_x = try Secp256k1.basePoint.mul(acc.toBytes(.big), .big);
     const actual_x = try kg.key_shares[0].group_public_key.point();
     try testing.expect(expected_x.equivalent(actual_x));
-}
-
-test "Ephemeral scratch: secureZero wipes the secret per-party k/gamma/w/delta/sigma scalars" {
-    // Regression test for signWithShares' `defer secureZero(...); allocator.free(eph)`
-    // (this file's Ephemeral[] scratch). Builds a small Ephemeral array with
-    // recognizably-nonzero secret fields, applies the SAME secureZero the
-    // driver's defer uses, and checks every byte went to zero — cheap
-    // (no keygen), so it runs in Debug too, unlike the heavy end-to-end tests.
-    const allocator = testing.allocator;
-    const nonzero = Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{0x42}, .big) catch unreachable;
-    const g = Element.fromPoint(Secp256k1.basePoint) catch unreachable;
-
-    const eph = try allocator.alloc(Ephemeral, 2);
-    defer allocator.free(eph);
-    for (eph) |*e| e.* = .{ .k = nonzero, .gamma = nonzero, .w = nonzero, .big_gamma = g, .delta = nonzero, .sigma = nonzero };
-
-    std.crypto.secureZero(u8, std.mem.sliceAsBytes(eph));
-
-    const zero_scalar_bytes = [_]u8{0} ** Ns;
-    for (eph) |e| {
-        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.k.toBytes(.big));
-        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.gamma.toBytes(.big));
-        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.w.toBytes(.big));
-        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.delta.toBytes(.big));
-        try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.sigma.toBytes(.big));
-    }
-}
-
-// ── fuzz coverage for the five wire-message codecs a counterparty sends
-// during signing (audit F8, MED — continued from root.zig's KeyShare
-// harness). All five are FIXED-SIZE `fromBytes([N]u8)`, unlike root.zig's
-// `fromBytesAlloc` decoders: no length to draw, so `smith.bytes` reading the
-// exact-width buffer is the whole harness — none of the "ranged draw
-// returns its minimum without a corpus" trap applies here (there is no
-// ranged draw). No corpus: these are single already-narrow types with no
-// sub-message to assemble, unlike root.zig's KeyShare/PublicKeys/AuxParams
-// (which embed real Paillier/curve material a random 4096-byte draw could
-// not plausibly stumble into) — plain arbitrary-bytes coverage is what F8
-// asks for these five.
-
-test "fuzz: GammaCommitment.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzGammaCommitmentFromBytes, .{});
-}
-fn fuzzGammaCommitmentFromBytes(_: void, smith: *std.testing.Smith) !void {
-    var buf: [GammaCommitment.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = GammaCommitment.fromBytes(buf);
-}
-
-test "fuzz: SchnorrProof.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzSchnorrProofFromBytes, .{});
-}
-fn fuzzSchnorrProofFromBytes(_: void, smith: *std.testing.Smith) !void {
-    var buf: [SchnorrProof.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = SchnorrProof.fromBytes(buf) catch return;
-}
-
-test "fuzz: GammaReveal.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzGammaRevealFromBytes, .{});
-}
-fn fuzzGammaRevealFromBytes(_: void, smith: *std.testing.Smith) !void {
-    var buf: [GammaReveal.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = GammaReveal.fromBytes(buf) catch return;
-}
-
-test "fuzz: DeltaShare.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzDeltaShareFromBytes, .{});
-}
-fn fuzzDeltaShareFromBytes(_: void, smith: *std.testing.Smith) !void {
-    var buf: [DeltaShare.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = DeltaShare.fromBytes(buf) catch return;
-}
-
-test "fuzz: SigShare.fromBytes never panics (audit F8)" {
-    try testing.fuzz({}, fuzzSigShareFromBytes, .{});
-}
-fn fuzzSigShareFromBytes(_: void, smith: *std.testing.Smith) !void {
-    var buf: [SigShare.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    _ = SigShare.fromBytes(buf) catch return;
 }

@@ -438,8 +438,24 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # Source pin moved 2026-10-02 (305ea2d4 removed the panicking
 # `identifyAbortCulprit` stub, off every measured path): share 267, nonce 378,
 # betaprime 313 in-file, each exactly at its bound, controls and traps 0.
-threshold_ecdsa	ReleaseFast	share	1	<=267	82a170458c38d1c5	4a6777ac538b5e90
-threshold_ecdsa	ReleaseFast	nonce	1	<=378	82a170458c38d1c5	31f7e323b84fd8a7
+# A14 (2026-10-02): the harness now drives `presign.Party` state machines (the
+# per-signer GG20 protocol, `signWithShares` is a loop over them) with one
+# wrapped PRNG per party, and `nonce` taints EVERY 48-byte secret-scalar draw
+# (k_i, γ_i, ℓ_i and the Pedersen/ST/Schnorr nonces: 16 draws, was 6). New
+# in-file counts: share 394, nonce 669, betaprime 462; controls and traps 0,
+# unattributed 0. Every context was classified by its first in-module frame
+# (`--stacks`): (a) verifier-side `mulPublic`/equality over values the
+# protocol publishes — proof responses t/u/s, δ, R, R̄_j, S_j, s_j, the
+# broadcast transcript hash (`ecproofs.verify*`, `zkproofs.verifyPdl`,
+# `presign` round 5 `δ⁻¹·Γ`, `combine`, the echo compare) — over-taint from
+# simulating every signer in one process, the class betaprime's R1 note names;
+# (b) `paillier.decrypt`'s `divFloor` (paillier/root.zig, A5 class, measured
+# by paillier's own rows); (c) std `Secp256k1.mul`'s one-bit `rejectIdentity`
+# (`presign.init`'s x_i·G, `γ_i·G`, `k_i·R`, `σ_i·R`); (d) the reductions
+# of the tainted draws themselves (`randomScalar`). No context has its first
+# in-module frame on a prover-side branch of `presign.zig` or `ecproofs.zig`.
+threshold_ecdsa	ReleaseFast	share	1	<=394	2fd1f4216680ed02	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	nonce	1	<=669	2fd1f4216680ed02	df18c96b59d38d0a
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -470,7 +486,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=378	82a170458c38d1c5	31f7e323b84fd8a7
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=313	82a170458c38d1c5	0d9a7f3232367fc7
+threshold_ecdsa	ReleaseFast	betaprime	1	<=462	2fd1f4216680ed02	df18c96b59d38d0a
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

@@ -105,10 +105,12 @@ fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, dat
 const InvalidEncodingError = error{InvalidEncoding};
 
 fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]const u8 {
-    if (bytes.len < offset.* + 4) return error.InvalidEncoding;
+    // Subtractions, not `offset + len`: a u32 length added to a usize offset
+    // wraps on 32-bit targets and would pass the bound.
+    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
     const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
     offset.* += 4;
-    if (bytes.len < offset.* + len) return error.InvalidEncoding;
+    if (bytes.len - offset.* < len) return error.InvalidEncoding;
     const data = bytes[offset.* .. offset.* + len];
     offset.* += len;
     return data;
