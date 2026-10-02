@@ -48,7 +48,8 @@
 //!                every `fromPrimes`/`generate`-derived key actually takes).
 //!                Taints `lambda`, `mu`, and the ENTIRE `crt` block
 //!                (`p_sq`/`q_sq`/`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/
-//!                `p_sq_fe`/`p_sq_inv`) — per `SecretKey.deinit`'s own doc
+//!                `p_sq_fe`/`p_sq_inv`; all but the montint slot, see
+//!                there) — per `SecretKey.deinit`'s own doc
 //!                comment, `p_sq`/`q_sq` are factorization-equivalent to
 //!                `p`/`q` (a square root away), so leaving them untainted
 //!                would let the ladder consume the secret factors through a
@@ -60,12 +61,11 @@
 //!                built via `fromBytes` from the first key's own
 //!                `n`/`lambda`/`mu` bytes (untainted), then `lambda`/`mu`
 //!                are tainted; `n`/`n_sq`/`n_sq_mont` stay public.
-//!   - `mul`    — `mulPlaintext`'s scalar `k` (the exponent `montint`'s
-//!                `montModexpSecret` consumes since paillier F5, wave-3
-//!                audit — previously `pk.n_sq.pow`; the value `k.isZero()`
-//!                branches on directly in `root.zig` before ever reaching
-//!                the modexp, unchanged by F5) is tainted; the ciphertext
-//!                operand is the fixed untainted public one.
+//!   - `mul`    — `mulPlaintext`'s scalar `k` (the exponent montint's
+//!                ladder consumes since paillier F5, wave-3 audit —
+//!                previously `pk.n_sq.pow`; the `k.isZero()` special case
+//!                that branched on it was dropped 2026-10-02) is tainted;
+//!                the ciphertext operand is the fixed untainted public one.
 //!   - `addm`   — `addPlaintext`'s plaintext `m` is tainted; same fixed
 //!                ciphertext operand. Exercises `gPow`'s binomial-shortcut
 //!                path for the standard generator `g = n+1` — SPEC.md's
@@ -239,6 +239,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // p/q (SecretKey.deinit's own doc comment), so every field
             // derived from them is secret material too.
             taintBytes(taint, std.mem.asBytes(&sk.crt.?));
+            // …except the montint slot `L` and digit width of p²/q²: both
+            // follow from the factors' bit LENGTH (the key size, public), and
+            // every montint call dispatches on `L`, so a tainted slot would
+            // report one artifact context per call site.
+            if (taint == .yes) inline for (.{ &sk.crt.?.p_sq_mont, &sk.crt.?.q_sq_mont }) |mp| {
+                std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.L));
+                std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&mp.digit_bits));
+            };
             const sk_reloaded = reloadVolatile(paillier.SecretKey, &sk);
 
             const m = try paillier.decrypt(sk_reloaded, c0);

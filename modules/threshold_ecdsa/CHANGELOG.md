@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **Prover-side products and conversions of secrets are off
+  `std.crypto.ff`.** `zkproofs`' private montint slot copy is replaced by
+  `montint.DynModint`; new helpers `pedersenCt`/`mulCt`/`rebase`/
+  `feFromSecretBytes` carry the ring-Pedersen commitments, the
+  `c_A^α·Enc(γ)`/`r^e·β` products and every secret moved between moduli
+  (range/MtA/Πfac provers, `mta`'s `b`, `β'` and encryption randomness), where
+  `ff`'s `mul` (extra-reduction bit) and `fromBytes`/`toBytes` branched on the
+  value. Together with paillier's move (decrypt's L-function and Garner,
+  `addCiphertexts`) ctgrind falls `share` 394 → 244, `nonce` 669 → 478,
+  `betaprime` 462 → 285, `fac` 17 → 5 in-file. Proof bytes unchanged.
+
 - **2026-10-02** — **ADDITIVE:** the Paillier half of dealer-free keygen.
   - `fac_proof` — Πfac (CGGMP21 Fig.28, "no small factor"), one proof per verifier under its
     ring-Pedersen tuple; non-negative variant, `ℓ = 256`, `ε = 512`. A modulus `3·X` passes all

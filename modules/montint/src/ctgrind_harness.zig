@@ -166,7 +166,7 @@ fn printElem(comptime M: type, name: []const u8, m: *const M, v: *const M.Elem) 
     std.debug.print("{s}={x}\n", .{ name, out });
 }
 
-const Target = enum { small, portable, asmcore, field, ffcontrol };
+const Target = enum { small, portable, asmcore, field, ffcontrol, dyn };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -175,6 +175,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "asmcore")) return .asmcore;
     if (std.mem.eql(u8, s, "field")) return .field;
     if (std.mem.eql(u8, s, "ffcontrol")) return .ffcontrol;
+    if (std.mem.eql(u8, s, "dyn")) return .dyn;
     return error.UnknownTarget;
 }
 
@@ -281,6 +282,99 @@ fn runFfControl(tainted: bool) !void {
     std.debug.print("pow={x}\n", .{out});
 }
 
+/// Taint `x` in place and return a copy loaded byte by byte through a
+/// volatile pointer, so the code under test reads tainted memory.
+fn taintedCopy(comptime T: type, x: *T, tainted: bool) T {
+    if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(x));
+    var out: T = undefined;
+    for (std.mem.asBytes(&out), std.mem.asBytes(x)) |*o, *b| {
+        const vb: *const volatile u8 = b;
+        o.* = vb.*;
+    }
+    return out;
+}
+
+/// `DynModint` with a SECRET modulus — the way `rsa` uses it for a CRT prime
+/// and `paillier` for p²/q². Unlike caveat 4 above, the modulus here is
+/// tainted, but only after construction (key setup is untainted in the
+/// consumers' harnesses too) and without its slot `L`/`digit_bits`, which
+/// follow from the bit length (the key size). Every operation a consumer
+/// calls is driven once; the API's own verdicts (`divExact`, `eql`,
+/// `elemFromBytesBE`'s canonical check) are the only branches it has.
+fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void {
+    const D = root.DynModint(4096);
+    const n = nbits / 64;
+    const raw = secretBytes(8 * n, "ctgrind-montint-harness-dyn-modulus-" ++ tag ++ "-v1");
+    var mv = D.zero;
+    for (mv[0..n], 0..) |*w, i| w.* = std.mem.readInt(u64, raw[i * 8 ..][0..8], .little);
+    mv[0] |= 1;
+    mv[n - 1] |= @as(u64, 1) << 63;
+    var mod = try D.fromLimbs(&mv);
+    std.debug.print("L={d}\n", .{mod.L});
+
+    // Operands below m (top bit cleared), an exponent, a 2×-wide value, a
+    // byte string of odd length, and an exact multiple q·m — all built
+    // untainted, tainted below.
+    var a = D.zero;
+    var b = D.zero;
+    var e = D.zero;
+    var q = D.zero;
+    inline for (.{ &a, &b, &e, &q }, 0..) |v, k| {
+        const r = secretBytes(8 * n, "ctgrind-montint-harness-dyn-op-" ++ tag ++ "-v1" ++ [_]u8{'0' + k});
+        for (v[0..n], 0..) |*w, i| w.* = std.mem.readInt(u64, r[i * 8 ..][0..8], .little);
+        v[n - 1] &= ~(@as(u64, 1) << 63);
+    }
+    var wide: [2 * n]u64 = undefined;
+    const wr = secretBytes(16 * n, "ctgrind-montint-harness-dyn-wide-" ++ tag ++ "-v1");
+    for (&wide, 0..) |*w, i| w.* = std.mem.readInt(u64, wr[i * 8 ..][0..8], .little);
+    var wbytes = secretBytes(16 * n + 3, "ctgrind-montint-harness-dyn-bytes-" ++ tag ++ "-v1");
+    var x: [2 * n]u64 = undefined;
+    root.limbs.mulSchoolbook(&x, q[0..n], mv[0..n]);
+    var a_be: [8 * n]u8 = undefined;
+    mod.toBytesBE(&a, &a_be);
+
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.m));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.n0inv));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.r2));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.one_mont));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&mod.digit_mont));
+    }
+    const md = taintedCopy(D, &mod, false);
+    const ar = taintedCopy(D.Elem, &a, tainted);
+    const br = taintedCopy(D.Elem, &b, tainted);
+    const er = taintedCopy(D.Elem, &e, tainted);
+    const wdr = taintedCopy([2 * n]u64, &wide, tainted);
+    const wbr = taintedCopy([16 * n + 3]u8, &wbytes, tainted);
+    const xr = taintedCopy([2 * n]u64, &x, tainted);
+    const abr = taintedCopy([8 * n]u8, &a_be, tainted);
+
+    var out: [8 * n]u8 = undefined;
+    const results = [_]struct { []const u8, D.Elem }{
+        .{ "add", md.add(&ar, &br) },
+        .{ "sub", md.sub(&ar, &br) },
+        .{ "neg", md.neg(&ar) },
+        .{ "mul", md.mul(&ar, &br) },
+        .{ "pow", md.pow(&ar, &er) },
+        .{ "powpub", md.powPublic(&ar, &.{ 1, 0, 1 }) },
+        .{ "reduce", md.reduceLimbs(&wdr) },
+        .{ "reducebytes", md.reduceBytesBE(&wbr) },
+    };
+    for (results) |r| {
+        md.toBytesBE(&r[1], &out);
+        std.debug.print("{s}={x}\n", .{ r[0], out });
+    }
+    // The three verdicts — one context each by design.
+    var qq: D.Elem = undefined;
+    const exact = md.divExact(&xr, &qq);
+    md.toBytesBE(&qq, &out);
+    std.debug.print("divexact={} q={x}\n", .{ exact, out });
+    std.debug.print("eql={}\n", .{D.eql(&ar, &br)});
+    const back = md.elemFromBytesBE(&abr) catch D.zero;
+    md.toBytesBE(&back, &out);
+    std.debug.print("load={x}\n", .{out});
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
@@ -320,5 +414,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .asmcore => try runPow(2048, "asm", tainted),
         .field => try runField(tainted),
         .ffcontrol => try runFfControl(tainted),
+        .dyn => {
+            try runDyn(1024, "portable", tainted); // L = 16: rsa-2048's CRT primes
+            try runDyn(2048, "asm", tainted); // L = 32: paillier-2048's p²/q²
+        },
     }
 }

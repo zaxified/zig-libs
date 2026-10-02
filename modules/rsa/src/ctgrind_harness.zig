@@ -45,15 +45,16 @@
 //!
 //! ## Why the pattern also names `montint`'s files
 //!
-//! `rsadpCrt`/`rsadp` bridge bytes into limbs and do the Garner CRT
-//! recombination in THIS module's `root.zig`, but the actual Montgomery
-//! ladder (`powMont`) that consumes the secret exponent runs inside the
-//! sibling `montint` module (`montint.zig`/`limbs.zig`/`asm_core.zig`) — the
-//! same "our own arithmetic, not std's" reasoning `bolt8`'s harness applies
-//! to `k256`. `std.crypto.ff` plays no role in the hot path this harness
-//! drives (SPEC.md: "routes through montint/Modulus.pow" — `Modulus.pow` is
-//! the key-derivation-time path, exercised by `SecretKey.fromPrimes` below
-//! BEFORE any taint, never by `rsadpCrt`/`rsadp`).
+//! `rsadpCrt`/`rsadp` bridge bytes into limbs in THIS module's `root.zig`,
+//! but every operation on the secrets — the reduction of `c` mod p/q, both
+//! ladders, the Garner recombination, the unblinding — runs inside the
+//! sibling `montint` module (`dyn.zig`/`montint.zig`/`limbs.zig`/
+//! `asm_core.zig`), the same "our own arithmetic, not std's" reasoning
+//! `bolt8`'s harness applies to `k256`. `std.crypto.ff` is on the private
+//! path only as the carrier of `dp`/`dq`/`qinv`, read limb by limb; until
+//! 2026-10-02 its `reduce`/`mul` did the CRT recombination and were most of
+//! this row's count. `ff.zig` stays in the pattern so a regression back onto
+//! it is counted.
 //!
 //! ## The two traps (see `ct25519`'s harness or `scripts/checks/ctgrind.sh`'s header)
 //!
@@ -133,6 +134,18 @@ fn taintBytes(t: Taint, bytes: []u8) void {
     if (t == .yes) std.valgrind.memcheck.makeMemUndefined(bytes);
 }
 
+/// Taint a `montint.DynModint`'s value fields, but not its slot `L`: the
+/// slot is the prime's limb count rounded up — the key size, public — and
+/// every operation dispatches on it, so tainting it would report one
+/// artifact context per call site rather than anything about the prime.
+fn taintMont(t: Taint, mp: anytype) void {
+    taintBytes(t, std.mem.asBytes(&mp.m));
+    taintBytes(t, std.mem.asBytes(&mp.n0inv));
+    taintBytes(t, std.mem.asBytes(&mp.r2));
+    taintBytes(t, std.mem.asBytes(&mp.one_mont));
+    taintBytes(t, std.mem.asBytes(&mp.digit_mont));
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
@@ -171,12 +184,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintBytes(taint, std.mem.asBytes(&sk.dq));
             taintBytes(taint, std.mem.asBytes(&sk.qinv));
             // p_mont/q_mont are separate memory from p/q (precomputed at key
-            // construction), carrying the same secret value in Montgomery
-            // form -- montPowSecret reads THIS struct's `.m` as the modulus,
-            // so leaving it untainted would let the ladder consume the
-            // secret modulus through a channel the taint never reached.
-            taintBytes(taint, std.mem.asBytes(&sk.p_mont));
-            taintBytes(taint, std.mem.asBytes(&sk.q_mont));
+            // construction), carrying the same secret value plus its
+            // Montgomery constants -- the private op reads THESE as the
+            // moduli, so leaving them untainted would let it consume the
+            // secret primes through a channel the taint never reached.
+            taintMont(taint, &sk.p_mont);
+            taintMont(taint, &sk.q_mont);
         },
         .noncrt => {
             taintBytes(taint, std.mem.asBytes(&sk.d));

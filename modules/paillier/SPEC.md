@@ -38,9 +38,10 @@ serialization, plus the full number-theoretic core: `fromPrimes` (n = p·q, λ =
 g = n+1, μ = L(g^λ mod n²)⁻¹ mod n with L(x) = (x−1)/n exact), `generate` (sieve +
 Miller-Rabin probable-prime search mirroring `rsa.generate`, minus its `e`-coprimality
 filter), `encrypt`/`decrypt`, and the three homomorphic ops. `std.crypto.ff`
-(`Uint`/`Modulus`/`Fe` at `max_bits = 4096`) carries every value and does keygen, the
-L-function's setup, the CRT/Garner recombination, and all serialization; the
-modular-exponentiation hot paths (`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, and
+(`Uint`/`Modulus`/`Fe` at `max_bits = 4096`) carries every value across the API and does
+keygen and serialization; every operation on a secret — since 2026-10-02 including the
+CRT/Garner recombination, the L-function and the `g^m` products — runs on
+`montint.DynModint`, and the modular-exponentiation hot paths (`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, and
 `mulPlaintext`'s `c^k mod n²`) are routed through the sibling `montint` module instead
 (full-radix-2^64 Montgomery modexp, sized to the actual key width — ~3–4× faster than
 `ff` on `decrypt`/`encrypt`, plus a further ~3.4× for `decrypt` from Paillier-CRT when the
@@ -103,16 +104,18 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   compiles to a conditional jump on `λ`; measured 2026-10-02) — part of the variable-time key
   derivation below. `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take
   `g^m` through `montint` since 2026-10-02 (it was ff's pow, leaking the plaintext's windows).
-  Constant-time in the secret exponent/scalar's *value*; per the module's ctgrind
-  harness (`src/ctgrind_harness.zig`, targets `crt`/`noncrt`/`mul`), `mulPlaintext`'s
-  `if (k.isZero())` short-circuit is a direct branch on `k` itself before the modexp is
-  ever reached — undocumented until the harness's own header comment named it; recorded
-  here rather than fixed, since removing it changes `mulPlaintext`'s `k = 0` handling and
-  is a decision for the fix queue, not a doc update.
-- **CRT decrypt's own variable-time surface, beyond the L-division below.** The Garner
-  recombination itself (`decryptCrtX`) is `ff` field arithmetic, and ff's `montgomeryMul`
-  branches on its extra-reduction bit in ReleaseFast (measured 2026-10-02; the same residual
-  `threshold_ecdsa` records) — inside the `crt` row's bound, not zero. `feFromMontBytes` — which turns each CRT half's raw modexp output
+  Constant-time in the secret exponent/scalar's *value*. `mulPlaintext`'s
+  `if (k.isZero())` short-circuit — a direct branch on `k` before the modexp, found by the
+  ctgrind harness — is gone (2026-10-02): montint's ladder yields `c^0 = 1` itself, so
+  `k = 0` still returns the encryption of 0 with no special case (`mul` row: 0 in-file).
+- **CRT decrypt's own variable-time surface — closed 2026-10-02.** The Garner
+  recombination (`decryptCrtX`) was `ff` field arithmetic — `reduce` of `c` into the
+  mod-p²/q² domains, `mul`/`sub`/`add` — and ff branches there in ReleaseFast (`reduce`'s
+  `shiftIn`/compare, `montgomeryMul`'s extra-reduction bit; measured 2026-10-02). It runs on
+  `montint.DynModint` now, values crossing from the `ff` carrier by a positional limb
+  repack (`feToElem`/`elemToFe`). ctgrind `crt`: 325 → 2 in-file contexts, the two being
+  `decrypt`'s rejections (`x = 0`, `x − 1` not a multiple of `n`); `noncrt`: 133 → 3 (the
+  same two plus the malformed-key `λ = 0` check). History: `feFromMontBytes` — which turned each CRT half's raw modexp output
   (`x_p`/`x_q`, both secret-derived) back into a canonical `Fe` — used to run that value
   through `stripLeadingZeros` first, a `while` loop whose iteration count depended on the
   secret-derived value's leading zero bytes; measured (wave-3 audit, ctgrind + callgrind)
@@ -131,15 +134,12 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   (variable-time extended-Euclid/gcd/lcm, exactly like `rsa.fromPrimesImpl` does for its
   own `d = e⁻¹ mod λ(n)`) — a one-time key-import cost, not a per-operation leak, same
   rationale as `rsa`'s SPEC.md.
-- **Known caveat:** `decrypt`'s L-function drops to `std.math.big.int` for the exact
-  `(x−1)/n` division (`ff` has no exact-division primitive), and that division is
-  variable-time in `x` — a per-decryption, plaintext-derived value. Measured (wave-3
-  audit, ctgrind): the majority of `decrypt`'s taint-tracked contexts sit on this one
-  division. The limb *widths* are fixed by the key size (the dominant cost driver in
-  `std.math.big.int`'s schoolbook division), so the residual signal is small, but it is
-  not the hard constant-time guarantee the modexp has. Callers running in an environment
-  with a co-located attacker measuring single decryptions should be aware; a
-  constant-time exact division is future work if a consumer ever needs it.
+- **The L-function is constant-time (2026-10-02).** `decrypt`'s exact `(x−1)/n` used to
+  drop to `std.math.big.int`'s `divFloor`, variable-time in `x`, whose quotient is
+  `m·λ mod n` — the plaintext and the key (wave-3 audit: most of `decrypt`'s contexts sat
+  on it). It is now `DynModint.divExact`: Hensel division, `q = (x−1)·n⁻¹ mod 2^(64·L)`,
+  then `q·n = x − 1` checked over the full width — the same quotient when the division is
+  exact, the same `error.InvalidCiphertext` when it is not, no branch on either value.
 - Prime generation (`generate`) is inherently variable-time in how *long* the search
   takes (every implementation's is); all candidate buffers are `secureZero`ed. The
   Miller-Rabin modexps use `ff`'s pow, which branches on the candidate-derived exponent in
@@ -251,16 +251,12 @@ The correctness anchors, in order of strength:
 
 ## Backlog / deferred
 
-- **Off `std.crypto.ff` for secrets** *(2026-10-02)*: ff is not constant-time in ReleaseFast
-  (ctgrind: `montgomeryMul`'s extra-reduction select, pow's window select). Left on it: the
-  Garner recombination and `encrypt`'s `g^m · r^n` product (extra-reduction bit, inside the
-  `crt`/`addm` bounds), and key generation (`g^λ`, Miller-Rabin). `bls12_381`/`bn254` moved
-  their `Fr` to `montint.Field`; a variable-width counterpart (runtime modulus, like
-  `MontParams`) would let this module and `rsa`/`threshold_ecdsa` drop ff for secrets too.
-  Effort: medium–large.
-
-- Constant-time exact division for `decrypt`'s L-function (see the timing caveat above) —
-  only if a consumer's threat model ever needs it.
+- **Key generation off `std.crypto.ff`** *(2026-10-02; operations done 2026-10-02)*: ff is
+  not constant-time in ReleaseFast (ctgrind: `montgomeryMul`'s extra-reduction select, pow's
+  window select). Every per-operation secret path moved to `montint.DynModint` on
+  2026-10-02 (Garner, L-function, `g^m · r^n`, `addPlaintext`); still on ff: key generation
+  (`g^λ`, `(p²)⁻¹ mod q²`, Miller-Rabin), variable-time anyway through `std.math.big.int`.
+  Effort: medium (needs a CT prime search, see `rsa`'s backlog).
 - Phase 2 (separate later module, depends on this one): proof of correct encryption, range
   proofs, MtA — see "Phase-2 boundary" above.
 

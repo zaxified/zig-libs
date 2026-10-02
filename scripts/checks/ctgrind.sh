@@ -183,7 +183,7 @@ declare -A TARGETS=(
     [ecvrf]="prove verify"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
-    [montint]="small portable asmcore field ffcontrol"
+    [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign"
     [rsa]="crt noncrt"
@@ -390,6 +390,7 @@ declare -A PATTERN=(
     # (like ssh/ffpow) — it must stay non-zero.
     [montint/field]='field[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/ffcontrol]='ff[.]zig'
+    [montint/dyn]='dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     # ── added 2026-09-09 ───────────────────────────────────────────────────
     [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     # `sign` names std's ecdsa/common/scalar for the same reason chachapoly's
@@ -397,8 +398,8 @@ declare -A PATTERN=(
     # signer over THIS module's group, so attributing that arithmetic to
     # someone else would be the evasion this gate exists to refuse.
     [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
-    [rsa/crt]='root[.]zig|ff[.]zig'
-    [rsa/noncrt]='root[.]zig|ff[.]zig'
+    [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [slhdsa/seed]='engine[.]zig|address[.]zig'
     [slhdsa/prf]='engine[.]zig|address[.]zig'
     [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
@@ -430,10 +431,10 @@ declare -A PATTERN=(
     # std's schoolbook big-int division under `divFloor` lives in int.zig, and
     # the Montgomery machinery in ff.zig. Naming only the module's own file is
     # the shape of under-measurement this gate exists to refuse.
-    [paillier/crt]='root[.]zig|ff[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [paillier/noncrt]='root[.]zig|ff[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [paillier/mul]='root[.]zig|ff[.]zig'
-    [paillier/addm]='root[.]zig|ff[.]zig'
+    [paillier/crt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/mul]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [paillier/addm]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     # `aescbc` does its own arithmetic over a secret in exactly one file.
     [aescbc/pkcs7]='root[.]zig'
     [aescbc/xmlenc]='root[.]zig'
@@ -626,6 +627,7 @@ declare -A LABEL=(
     [montint/asmcore]='montint src'
     [montint/field]='montint Field(r) (Fr backend)'
     [montint/ffcontrol]='montint ffcontrol (std.crypto.ff, positive control)'
+    [montint/dyn]='montint DynModint (secret modulus)'
     # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
     [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'
     [spake2plus/computel]='spake2plus computeL (w1*P)+p256 comb'

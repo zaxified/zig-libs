@@ -399,10 +399,21 @@ montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
 # that is understood.
 montint	ReleaseFast	field	1	1	124fbde3ecf76aa5	efbe5c72b7a484c2
 montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
+# montint dyn (2026-10-02): DynModint with a SECRET modulus (value fields
+# tainted after construction, slot L not), operands, exponent, wide inputs, at
+# L=16 and L=32. The 2 in-file are elemFromBytesBE's accept/reject, one per
+# width; divExact's and eql's verdicts branch in the printing (witness).
+montint	ReleaseFast	dyn	1	2	a1282f4f954866da	880a04f6d911e62c
 p256	ReleaseFast	comb	1	2	8dc7a6306ed8c563	50b80e702e9284d8
 p256	ReleaseFast	sign	1	<=12	521052e105bbd9bb	af4baed5c5134f3f
-rsa	ReleaseFast	crt	1	<=213	f03213b9781d2eb4	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	2	f03213b9781d2eb4	d4057b00f9df7b56
+# rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
+# mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
+# reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
+# primes; the 1 left is privateOpCrtPtr's F3 verdict `if (!eql(m^e, c))`,
+# returned as error.FaultDetected by design. noncrt 2 -> 0 (ff toBytes on d).
+# Harness taints p_mont/q_mont's value fields, not the slot L (key size).
+rsa	ReleaseFast	crt	1	1	a5d610b7db145e3b	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	a5d610b7db145e3b	d4057b00f9df7b56
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	6848022d967ef676	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
@@ -454,7 +465,13 @@ bls12_381	ReleaseFast	g2_scalarmul	1	2	3a74060e9fba4ac9	7f4e15a241002b3f
 #                reaches (A1 threshold_ecdsa, re-audit 2026-09-15).
 bip340	ReleaseFast	sign	1	<=80	426d8e387f091ad3	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=493	ec3c73bfc9e557df	4352055809b3f3c7
-blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
+# blindrsa sign 218 -> 7 (2026-10-02): rsa's CRT path left std.crypto.ff. Left,
+# all on the signature s that is about to be published: blindSign's ff parse of
+# s_b (rejectNonCanonical, 1) and its unblinding `sk.n.mul(s_b, b_inv)` (ff
+# montgomeryMul's extra-reduction select, 3 — over the §7.2 mask b_inv, see
+# blindrsa SPEC backlog), rsa's public-op parse of s in the self-check (1), the
+# self-check's timing_safe.eql verdict (1), and rsa's F3 verdict (1).
+blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # A1 threshold_ecdsa R2 fix (2026-09-15, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);
@@ -497,8 +514,15 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # (`presign.init`'s x_i·G, `γ_i·G`, `k_i·R`, `σ_i·R`); (d) the reductions
 # of the tainted draws themselves (`randomScalar`). No context has its first
 # in-module frame on a prover-side branch of `presign.zig` or `ecproofs.zig`.
-threshold_ecdsa	ReleaseFast	share	1	<=394	32c67e0e09b2c9f9	df18c96b59d38d0a
-threshold_ecdsa	ReleaseFast	nonce	1	<=669	32c67e0e09b2c9f9	df18c96b59d38d0a
+# 2026-10-02 (montint.DynModint): share 394 -> 244, nonce 669 -> 478. Gone:
+# class (b) — paillier.decrypt's divFloor is a Hensel exact division now — and
+# every prover-side std.crypto.ff product/parse (ring-Pedersen commitments,
+# c_A^alpha·Enc(gamma), r^e·beta, secrets moved between moduli, mta's b/beta'/
+# randomness, paillier.addCiphertexts). The ff.zig contexts left (25 / 34) all
+# sit under verify*Inner, the proofs' fromBytes parsers, auxFeEql/pailFeEql
+# and the verifier's gammaPowWide — class (a), public values over-tainted.
+threshold_ecdsa	ReleaseFast	share	1	<=244	806a21d481f8c66b	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	nonce	1	<=478	806a21d481f8c66b	df18c96b59d38d0a
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -529,7 +553,11 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=669	32c67e0e09b2c9f9	df18c96b59d38d0a
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=462	32c67e0e09b2c9f9	df18c96b59d38d0a
+# 2026-10-02: 462 -> 285 (montint.DynModint, see share/nonce above): the 13
+# ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
+# mta's beta' parse and the MtA products; what reaches beta' now is
+# sampleBetaPrime's std.mem.order (4) and the verifier side.
+threshold_ecdsa	ReleaseFast	betaprime	1	<=285	806a21d481f8c66b	df18c96b59d38d0a
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -545,7 +573,11 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=462	32c67e0e09b2c9f9	df18c96b59d38d0a
 #   2  stripLeadingZeros on e and on the response v (public)
 #   1  fac_proof.zig `if (borrow != 0)` — the v < 0 redraw, probability < 2^-256
 # The masks are NOT tainted here (only p, q); 6 witness contexts print z1/z2/v.
-threshold_ecdsa	ReleaseFast	fac	1	<=17	7a153bb8c46709fb	b014d308e3ab9ce7
+# 2026-10-02: 17 -> 5. The 3 Fe.fromBytes canonical checks and the 9 ff
+# montgomeryMul final subtractions went with powSecret's and the commitments'
+# move to montint.DynModint (pedersenCt). Left: Scalar.fromBytes48 on e (2),
+# stripLeadingZeros on e and v (2), the v < 0 redraw (1) — all as above.
+threshold_ecdsa	ReleaseFast	fac	1	5	94c22543ed19bd38	b014d308e3ab9ce7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
@@ -561,10 +593,17 @@ threshold_ecdsa	ReleaseFast	fac	1	<=17	7a153bb8c46709fb	b014d308e3ab9ce7
 # re-measured unchanged.
 bulletproofs	ReleaseFast	rangeproof	1	0	d2c420d56f7c9cf3	RANDOMIZED
 bulletproofs	ReleaseFast	ipa	1	0	59164a938059489a	2ade41bb2f418497
-paillier	ReleaseFast	crt	1	<=331	84c570c6ec84daea	ca16fc01b4ebb44c
-paillier	ReleaseFast	noncrt	1	<=141	84c570c6ec84daea	ca16fc01b4ebb44c
-paillier	ReleaseFast	mul	1	<=12	84c570c6ec84daea	b2221403ad3dad41
-paillier	ReleaseFast	addm	1	<=10	84c570c6ec84daea	526f0de009c0cbfb
+# paillier 2026-10-02 — decrypt, gPow and the homomorphic products moved onto
+# montint.DynModint; the L-function is DynModint.divExact (Hensel) instead of
+# std.math.big.int divFloor. crt 325 -> 2, noncrt 133 -> 3, mul 9 -> 0,
+# addm 10 -> 0. Left, all rejection verdicts the API returns as
+# error.InvalidCiphertext: decrypt's `x = 0` and `x - 1` not a multiple of n
+# (both rows), plus noncrt's malformed-key `lambda = 0`. mul lost its
+# `k.isZero()` short-circuit (montint gives c^0 = 1).
+paillier	ReleaseFast	crt	1	2	4920c176a6c28c66	ca16fc01b4ebb44c
+paillier	ReleaseFast	noncrt	1	3	4920c176a6c28c66	ca16fc01b4ebb44c
+paillier	ReleaseFast	mul	1	0	4920c176a6c28c66	b2221403ad3dad41
+paillier	ReleaseFast	addm	1	0	4920c176a6c28c66	526f0de009c0cbfb
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
 # tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
 # FELL because the Miller loop stopped inverting -- 32e751ad dropped

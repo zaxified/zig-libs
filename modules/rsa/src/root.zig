@@ -162,178 +162,68 @@ fn stripLeadingZeros(bytes: []const u8) []const u8 {
     return bytes[i..];
 }
 
-// ── montint modexp backend (the hot-path arithmetic) ────────────────────────
+// ── montint backend (every secret-touching operation) ──────────────────────
 //
-// `montint.Modint(bits)` fixes its limb count `L` at comptime, whereas an RSA
-// key's size is only known at runtime (512…4096-bit moduli, and CRT operates on
-// the ~half-width primes). We bridge the two with a runtime-dispatched set of
-// comptime `Modint` instantiations, keyed on the operand's limb count rounded
-// up to a multiple of `mont_step`. Rounding keeps the number of monomorphized
-// modexp instantiations small (16) while the common RSA sizes (2048/3072/4096
-// moduli, their 1024/1536/2048-bit primes) land on an exact multiple-of-4 limb
-// count with ZERO padding — a 2048-bit CRT sign runs mod-p at L=16, exactly the
-// Montgomery-resident portable win the audit targeted (L=16 < montint's
-// `asm_min_limbs`=32, so it takes the portable CIOS path). Padding, when it
-// happens (a non-round modulus width), only adds leading zero limbs, which
-// `montint` handles and which stays correct — just slightly slower.
+// `montint.DynModint` carries a modulus chosen at run time — a 512…4096-bit
+// `n`, or one of its ~half-width CRT primes — on the smallest comptime
+// `Modint` slot (a multiple of 4 limbs) that holds it, so a 2048-bit CRT sign
+// runs mod-p at L=16 with no padding. Its constants are computed once per key.
+//
+// Until 2026-10-02 only the two CRT modexps ran here; the reduction of `c`
+// into the mod-p/mod-q domains, the Garner recombination and the unblinding
+// stayed in `std.crypto.ff`, whose `reduce`/`montgomeryMul`/`toBytes` branch
+// on the secret values in ReleaseFast (ctgrind `rsa/crt`: 213 in-file
+// contexts, nearly all in `ff.zig`). The whole private path now runs on
+// `DynModint`; `std.crypto.ff` stays the public carrier type (`Modulus`,
+// `Fe`) and the key-import arithmetic.
 
-const mont_step: usize = 4;
-const mont_min_limbs: usize = 4;
-const mont_max_limbs: usize = (max_modulus_bits + 63) / 64; // 64
+/// A modulus plus its Montgomery constants (run-time size).
+const MontParams = montint.DynModint(max_modulus_bits);
+/// A normal-domain element of a `MontParams`, see `montint.DynModint`.
+const MontElem = MontParams.Elem;
 
-/// A modulus plus its precomputed Montgomery constants, stored in a max-width
-/// (`mont_max_limbs`) buffer with only the low `L` limbs live. Computed ONCE
-/// per key (at construction) so no per-operation Montgomery setup is paid — the
-/// `Modint` view is reconstructed field-by-field at op time, skipping the
-/// (relatively expensive) `computeConstants` doubling loop.
-const MontParams = struct {
-    /// Live limb count (a multiple of `mont_step`, in `[mont_min_limbs,
-    /// mont_max_limbs]`); selects the comptime `Modint` at op time.
-    L: usize = 0,
-    /// `-m[0]⁻¹ mod 2^64` (montint's CIOS reduction constant).
-    n0inv: u64 = 0,
-    /// The odd modulus, little-endian, low `L` limbs live.
-    m: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-    /// `R² mod m` (montint's `toMontgomery` constant).
-    r2: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-    /// `R mod m` — the value `1` in the Montgomery domain.
-    one: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-};
-
-/// Round a runtime limb count up to the modeled `Modint` slot: the smallest
-/// multiple of `mont_step` that is ≥ `L` and ≥ `mont_min_limbs`. `L ≤
-/// mont_max_limbs` always (a value ≤ `max_modulus_bits` wide), so the result is
-/// in the instantiated set `{4, 8, …, 64}`.
-fn montSlot(l: usize) usize {
-    var s: usize = mont_min_limbs;
-    while (s < l) s += mont_step;
-    return s;
-}
-
-/// Load a big-endian byte string into an `L`-limb little-endian value with NO
-/// value-dependent branch (the only branch is on the PUBLIC bit position vs the
-/// limb count) — so it is safe to use on the secret exponent. The caller
-/// guarantees the value fits in `slot` limbs (RSA operands always do: a
-/// reduced base is `< m`, and every exponent here is `< m`).
-fn beToLimbs(comptime slot: usize, be: []const u8) [slot]u64 {
-    var v = [_]u64{0} ** slot;
-    var idx: usize = 0;
-    var i: usize = be.len;
-    while (i > 0) : (idx += 8) {
-        i -= 1;
-        const limb = idx >> 6;
-        if (limb >= slot) break; // branch on public position, not on any value
-        v[limb] |= @as(u64, be[i]) << @intCast(idx & 63);
-    }
-    return v;
-}
-
-/// Precompute the montint modulus + Montgomery constants for an `ff` modulus.
-/// One-time (key construction) — walks the doubling-based `computeConstants`.
+/// Precompute the montint modulus for an `ff` modulus. Branchless in the
+/// value (`DynModint.fromFf`): this runs on the SECRET CRT primes `p` and
+/// `q`, not only on the public `n`.
 fn montParamsFromModulus(mod: Modulus) MontParams {
-    var be: [max_modulus_len]u8 = undefined;
-    mod.toBytes(&be, .big) catch unreachable; // 512-byte buffer never overflows
-    const slot = montSlot((mod.bits() + 63) / 64);
-    var mp: MontParams = .{ .L = slot };
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == slot) {
-            const M = montint.Modint(s * 64);
-            // NB: build via `fromElem` from a branchless-loaded limb array
-            // rather than montint's `fromBytesBE` — that loader skips zero
-            // bytes, so its work depends on the input's byte VALUES (montint
-            // SPEC.md § "Constant-time contract" states this as an explicit
-            // exclusion). This function is called on the SECRET CRT primes
-            // `p` and `q`, not only on the public `n`, so the branchless load
-            // is load-bearing here and not a style preference.
-            //
-            // (The older reason given here — that the loaders were "currently
-            // broken", referencing a `Self.Error` that `Modint` did not
-            // expose — has been stale since before 2026-07-21: the alias is
-            // present, pinned by montint's own regression test, and routing
-            // this call through `M.fromBytesBE` compiles and leaves all 76
-            // `test-rsa` tests green. Verified 2026-08-13, then reverted.)
-            const mm = M.fromElem(beToLimbs(s, &be)) catch unreachable; // odd, ≥3, fits
-            mp.n0inv = mm.n0inv;
-            @memcpy(mp.m[0..s], &mm.m);
-            @memcpy(mp.r2[0..s], &mm.r2);
-            @memcpy(mp.one[0..s], &mm.one_mont);
-            return mp;
-        }
-    }
-    unreachable;
+    return MontParams.fromFf(mod) catch unreachable; // odd, ≥ 512 bits
 }
 
-/// Reconstruct the comptime `Modint` view for slot `s` from precomputed params
-/// (no `computeConstants` — just copies the stored constants into the fields).
-fn montView(comptime s: usize, mp: *const MontParams) montint.Modint(s * 64) {
-    const M = montint.Modint(s * 64);
-    return M{
-        .m = mp.m[0..s].*,
-        .n0inv = mp.n0inv,
-        .r2 = mp.r2[0..s].*,
-        .one_mont = mp.one[0..s].*,
-    };
+/// `fe` as a montint element — a positional limb repack, no branch on the
+/// value (`DynModint.elemFromFf`). The secret CRT exponents and `qInv` come
+/// through here on every private op: they stay `ff` fields so the existing
+/// fault-injection tests and the ctgrind harness still reach the op through
+/// them. Every `Fe` this module stores is in the normal domain.
+fn feToElem(fe: *const Fe) MontElem {
+    return MontParams.elemFromFf(&fe.v);
 }
 
 /// Constant-time (in the exponent VALUE) modexp `base^exp mod m` over the
 /// precomputed modulus `mp`. `base_be`/`exp_be` are big-endian, both `< m`.
 /// Writes the big-endian result (slot-width) into `out_buf` and returns that
-/// slice. This is the analogue of `ff.Modulus.pow` (secret path) — used for the
-/// private CRT halves (`c^dP mod p`, `c^dQ mod q`) and the non-CRT `c^d mod n`.
+/// slice. Used for the non-CRT `c^d mod n`.
 fn montPowSecret(mp: *const MontParams, base_be: []const u8, exp_be: []const u8, out_buf: *[max_modulus_len]u8) []const u8 {
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == mp.L) {
-            const M = montint.Modint(s * 64);
-            const mod = montView(s, mp);
-            const b = beToLimbs(s, base_be);
-            const e = beToLimbs(s, exp_be);
-            const r = mod.powMont(&b, &e);
-            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
-            return out_buf[0..M.encoded_bytes];
-        }
-    }
-    unreachable;
+    var b = MontParams.loadBE(base_be) catch unreachable; // < m
+    defer std.crypto.secureZero(u64, &b);
+    var e = MontParams.loadBE(exp_be) catch unreachable; // < m
+    defer std.crypto.secureZero(u64, &e);
+    const r = mp.pow(&b, &e);
+    const out = out_buf[0 .. mp.L * 8];
+    mp.toBytesBE(&r, out);
+    return out;
 }
 
 /// Variable-time modexp `base^e mod m` for a PUBLIC exponent (RSA verify /
-/// encrypt) — a left-to-right square-and-multiply over `e`'s actual bit length,
-/// so the tiny public exponent (typically 65537) costs ~17 squarings + 2
-/// multiplies rather than the full-width `L·64` squarings a constant-time
-/// modexp would spend. Variable-time is fine: `e` is public. Uses montint's
-/// fast Montgomery multiply throughout. `base_be` is big-endian, `< m`.
+/// encrypt) — square-and-multiply over `e`'s actual bit length, so the tiny
+/// public exponent (typically 65537) costs ~17 squarings + 1 multiply rather
+/// than the full-width `L·64` squarings a constant-time modexp would spend.
+/// `base_be` is big-endian, `< m`. Slot-width result, as `montPowSecret`.
 fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, out_buf: *[max_modulus_len]u8) []const u8 {
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == mp.L) {
-            const M = montint.Modint(s * 64);
-            const mod = montView(s, mp);
-            const b = beToLimbs(s, base_be);
-            const b_mont = mod.toMontgomery(&b);
-            var acc: M.Elem = mod.one_mont;
-            var seen = false;
-            const eb = stripLeadingZeros(e_be);
-            for (eb) |byte| {
-                var mask: u8 = 0x80;
-                while (mask != 0) : (mask >>= 1) {
-                    if (seen) acc = mod.montSqr(&acc);
-                    if (byte & mask != 0) {
-                        if (seen) {
-                            acc = mod.montMul(&acc, &b_mont);
-                        } else {
-                            acc = b_mont; // first set bit: acc = base^1
-                            seen = true;
-                        }
-                    }
-                }
-            }
-            const r = mod.fromMontgomery(&acc);
-            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
-            return out_buf[0..M.encoded_bytes];
-        }
-    }
-    unreachable;
+    const b = MontParams.loadBE(base_be) catch unreachable; // < m
+    const r = mp.powPublic(&b, stripLeadingZeros(e_be));
+    const out = out_buf[0 .. mp.L * 8];
+    mp.toBytesBE(&r, out);
+    return out;
 }
 
 /// Copy a montint big-endian result (`res`, a Montgomery slot-width byte
@@ -756,16 +646,14 @@ fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
 }
 
 fn privateOpPtr(sk: *const SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
-    const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
+    const c = sk.n_mont.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
     // Secret exponent -> constant-time montint modexp; d is validated non-zero
     // by `fromPrimes`. (Non-CRT form; `rsadpCrt` is the fast default path.)
-    var cb: [max_modulus_len]u8 = undefined;
-    c.toBytes(&cb, .big) catch unreachable;
-    var db: [max_modulus_len]u8 = undefined;
-    sk.d.toBytes(&db, .big) catch unreachable;
-    var ob: [max_modulus_len]u8 = undefined;
-    const res = montPowSecret(&sk.n_mont, &cb, &db, &ob);
-    writeMontResult(out, res);
+    var d = feToElem(&sk.d);
+    defer std.crypto.secureZero(u64, &d);
+    var m = sk.n_mont.pow(&c, &d);
+    defer std.crypto.secureZero(u64, &m);
+    sk.n_mont.toBytesBE(&m, out);
 }
 
 /// Whether a CRT private op masks its input with F2 base blinding, and with
@@ -816,13 +704,13 @@ pub const Blinding = union(enum) {
 /// F2 base-blinding factors for one CRT private op: `c_blinded = c·r^e mod n`
 /// for a fresh random unit `r`, plus `r_inv = r⁻¹ mod n` to undo it afterwards
 /// (`m·r_inv = (c·r^e)^d·r⁻¹ = c^d·r·r⁻¹ = c^d mod n`).
-const BlindingFactors = struct { c_blinded: Fe, r_inv: Fe };
+const BlindingFactors = struct { c_blinded: MontElem, r_inv: MontElem };
 
 /// Draw a fresh blinding pair. All arithmetic here is on the PUBLIC modulus n
 /// and on `r` (a secret-independent random value), so the variable-time inverse
 /// and the `r^e` public modexp leak nothing about the private exponent. `rng`
 /// MUST be cryptographically secure — a predictable `r` voids the masking.
-fn makeBlinding(sk: *const SecretKey, c: Fe, rng: std.Random) BlindingFactors {
+fn makeBlinding(sk: *const SecretKey, c: *const MontElem, rng: std.Random) BlindingFactors {
     const n_len = byteLen(sk.n.bits());
     var n_be: [max_modulus_len]u8 = undefined;
     sk.n.toBytes(n_be[0..n_len], .big) catch unreachable;
@@ -842,13 +730,13 @@ fn makeBlinding(sk: *const SecretKey, c: Fe, rng: std.Random) BlindingFactors {
         // astronomically unlikely; redraw if so).
         var rinv_be: [max_modulus_len]u8 = undefined;
         const rinv = invModN(n_be[0..n_len], r_be[0..n_len], &rinv_be) orelse continue;
-        const r_inv = Fe.fromBytes(sk.n, rinv, .big) catch continue;
+        const r_inv = sk.n_mont.elemFromBytesBE(rinv) catch continue;
 
-        // re = r^e mod n (public modexp), then c_blinded = c·re mod n.
-        var re_out: [max_modulus_len]u8 = undefined;
-        const re_be = montPowPublic(&sk.n_mont, r_be[0..n_len], &e_be, &re_out);
-        const re = Fe.fromBytes(sk.n, re_be, .big) catch continue;
-        return .{ .c_blinded = sk.n.mul(c, re), .r_inv = r_inv };
+        // re = r^e mod n (public exponent), then c_blinded = c·re mod n —
+        // on montint, so the blinded base never meets `ff`'s branching mul.
+        const r_el = sk.n_mont.elemFromBytesBE(r_be[0..n_len]) catch unreachable; // < n
+        const re = sk.n_mont.powPublic(&r_el, stripLeadingZeros(&e_be));
+        return .{ .c_blinded = sk.n_mont.mul(c, &re), .r_inv = r_inv };
     }
 }
 
@@ -877,71 +765,61 @@ fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, blinding: Blinding) Pr
 }
 
 fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
-    const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
+    // OS2IP + range check on the PUBLIC input; from here on every value is
+    // a montint element (see "montint backend" above for why not `ff`).
+    const c = sk.n_mont.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
 
     // F2 (base blinding): with `.csprng`, run the CRT op on c' = c·r^e mod n
     // and unblind the result by r⁻¹ mod n below. This randomizes every secret-
     // dependent intermediate so any residual (compiler-defeated) timing/power
     // signal is masked. With `.none` the op runs unblinded but the F3 fault
     // check still applies.
-    var r_inv: ?Fe = null;
+    var r_inv: ?MontElem = null;
     var c_eff = c;
+    defer std.crypto.secureZero(u64, &c_eff);
     if (blinding.rng()) |g| {
-        const b = makeBlinding(sk, c, g);
+        const b = makeBlinding(sk, &c, g);
         c_eff = b.c_blinded;
         r_inv = b.r_inv;
     }
 
+    // The secret CRT parameters as montint elements, wiped on return.
+    var dp = feToElem(&sk.dp);
+    defer std.crypto.secureZero(u64, &dp);
+    var dq = feToElem(&sk.dq);
+    defer std.crypto.secureZero(u64, &dq);
+    var qinv = feToElem(&sk.qinv);
+    defer std.crypto.secureZero(u64, &qinv);
+
     // RFC 8017 §5.1.2 form (2), two-prime case:
     //   m1 = c^dP mod p, m2 = c^dQ mod q   (on the possibly-blinded c_eff)
-    // The two half-width modexps are the hot path — routed through montint
-    // (constant-time in the secret exponent). Reduction of `c_eff` into the
-    // mod-p / mod-q domains stays in `ff` (constant-time), as does the Garner
-    // recombination below; only the exponentiation moved.
-    const cp = reduceWide(sk.p, c_eff.v);
-    var cpb: [max_modulus_len]u8 = undefined;
-    cp.toBytes(&cpb, .big) catch unreachable;
-    var dpb: [max_modulus_len]u8 = undefined;
-    sk.dp.toBytes(&dpb, .big) catch unreachable;
-    var m1_buf: [max_modulus_len]u8 = undefined;
-    const m1_be = montPowSecret(&sk.p_mont, &cpb, &dpb, &m1_buf);
-    const m1 = Fe.fromBytes(sk.p, m1_be, .big) catch unreachable; // m1 < p
+    var m1 = sk.p_mont.pow(&sk.p_mont.reduceLimbs(c_eff[0..sk.n_mont.L]), &dp);
+    defer std.crypto.secureZero(u64, &m1);
+    var m2 = sk.q_mont.pow(&sk.q_mont.reduceLimbs(c_eff[0..sk.n_mont.L]), &dq);
+    defer std.crypto.secureZero(u64, &m2);
 
-    const cq = reduceWide(sk.q, c_eff.v);
-    var cqb: [max_modulus_len]u8 = undefined;
-    cq.toBytes(&cqb, .big) catch unreachable;
-    var dqb: [max_modulus_len]u8 = undefined;
-    sk.dq.toBytes(&dqb, .big) catch unreachable;
-    var m2_buf: [max_modulus_len]u8 = undefined;
-    const m2_be = montPowSecret(&sk.q_mont, &cqb, &dqb, &m2_buf);
-    const m2 = Fe.fromBytes(sk.q, m2_be, .big) catch unreachable; // m2 < q
-
-    //   h = (m1 - m2) * qInv mod p    (m2 reduced into mod-p domain first)
-    const h = sk.p.mul(sk.qinv, sk.p.sub(m1, reduceWide(sk.p, m2.v)));
+    //   h = (m1 - m2) * qInv mod p    (m2 reduced into the mod-p domain first)
+    var h = sk.p_mont.mul(&qinv, &sk.p_mont.sub(&m1, &sk.p_mont.reduceLimbs(m2[0..sk.q_mont.L])));
+    defer std.crypto.secureZero(u64, &h);
     //   m = m2 + q*h — the true integer value is < n (m2 < q, h <= p-1), so
-    //   computing it mod n is exact.
-    const m2_n = reduceWide(sk.n, m2.v);
-    const q_n = reduceWide(sk.n, sk.q.v);
-    const h_n = reduceWide(sk.n, h.v);
-    var m = sk.n.add(m2_n, sk.n.mul(q_n, h_n));
+    //   computing it mod n is exact. q, h and m2 are all < n, so each is
+    //   already a canonical element of n.
+    var m = sk.n_mont.add(&m2, &sk.n_mont.mul(&sk.q_mont.m, &h));
+    defer std.crypto.secureZero(u64, &m);
 
     // F2 unblind: m <- m·r⁻¹ mod n, recovering the true representative.
-    if (r_inv) |ri| m = sk.n.mul(m, ri);
+    if (r_inv) |*ri| m = sk.n_mont.mul(&m, ri);
 
     // F3 (Bellcore / BDL fault check): re-encrypt the UNBLINDED m and compare
     // to the ORIGINAL c. A fault in either CRT half makes m ≢ c^d, so m^e ≢ c
     // and we refuse to emit m — denying the attacker the faulty value from
     // which p = gcd(c − m^e mod n, n) would otherwise factor the modulus.
-    var m_be: [max_modulus_len]u8 = undefined;
-    m.toBytes(&m_be, .big) catch unreachable;
     var e_be: [max_modulus_len]u8 = undefined;
     sk.e.toBytes(&e_be, .big) catch unreachable;
-    var chk_buf: [max_modulus_len]u8 = undefined;
-    const chk_be = montPowPublic(&sk.n_mont, &m_be, &e_be, &chk_buf);
-    const chk = Fe.fromBytes(sk.n, chk_be, .big) catch unreachable;
-    if (!chk.eql(c)) return error.FaultDetected;
+    const chk = sk.n_mont.powPublic(&m, stripLeadingZeros(&e_be));
+    if (!MontParams.eql(&chk, &c)) return error.FaultDetected;
 
-    m.toBytes(out, .big) catch unreachable;
+    sk.n_mont.toBytesBE(&m, out);
 }
 
 /// RSAEP: c = m^e mod n (RFC 8017 §5.1.1), the encryption primitive.

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — ctgrind harness: taints the value fields of rsa's new
+  `montint.DynModint` (`p_mont`/`q_mont`) but not their slot `L`, the key size.
+  `sign` row 216 → 7 in-file — rsa's CRT path left `std.crypto.ff`; what
+  remains is this module's own `Fe` compare/parse. No code change here.
+
 - **2026-09-16** — `blind` and `blindSign` now zero the stack their callees
   used (audit B6 and B9). Every `Fe` and byte buffer on the secret path was
   already `secureZero`'d and the residue did not move: what survives is

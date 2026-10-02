@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **Decryption and the homomorphic ops are off
+  `std.crypto.ff`, and the L-function is constant-time.** The CRT reduction and
+  Garner recombination, `g^m`'s `1 + m·n`, the `g^m · r^n` and `c · g^m`
+  products move to `montint.DynModint` (which also replaces the private
+  `MontParams`/slot copy); `L(x) = (x−1)/n` is a Hensel exact division
+  (`DynModint.divExact`) instead of `std.math.big.int`'s variable-time
+  `divFloor`, whose quotient is `m·λ mod n`. `mulPlaintext` no longer branches
+  on `k = 0` (montint's ladder gives `c^0 = 1`). ctgrind: `crt` 325 → 2,
+  `noncrt` 133 → 3, `mul` 9 → 0, `addm` 10 → 0 in-file — what is left are the
+  rejection verdicts. API and outputs unchanged.
+
 - **2026-10-02** — **`g^m` under a non-standard `g` goes through montint.**
   `gPow`'s general case used `std.crypto.ff`'s pow, which branches on the
   exponent's windows in ReleaseFast — the plaintext. SPEC's "branchless ff"

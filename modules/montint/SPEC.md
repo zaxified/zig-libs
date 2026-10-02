@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/crypto-bigint](https://github.com/RustCrypto/crypto-bigint) 0.7.5 | Rust | Apache-2.0 OR MIT (`Cargo.toml`) | 310 | push 2026-09-28 | Constant-time by default, variable-time functions suffixed `_vartime` (its README); `modular/` has Montgomery forms (const, fixed and boxed/run-time-sized), `safegcd.rs` inversion, `sqrt.rs`, `lincomb.rs` and `pow.rs` (file listing of `src/modular`). NCC-audited (its README). |
 | [openssl/openssl](https://github.com/openssl/openssl) `BN_mod_exp_mont_consttime` | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | The speed yardstick: module's table has this module at 1.3–1.5× OpenSSL modmul and 1.8× modexp at 2048/4096 bits, faster at 256 bits (module's own measurements, not re-run). Also inversion, sqrt, primality, gcd. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** the API surface both competitors have — a variable-time public-exponent power (RSA verify with e = 65537 must run the full constant-time window loop through `powMont`), `reduce` of a wider value, element `eql`/`isZero`/`compare`, inversion and square roots, run-time-sized moduli — and aarch64 gets only the portable path (→ Backlog).
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** inversion and square roots, element `compare`, and aarch64 gets only the portable path (→ Backlog). (Closed 2026-10-02 by `DynModint`: a variable-time public-exponent power, `reduce` of a wider value, element `eql`/`isZero`, run-time-sized moduli.)
 
 ## What this module is
 
@@ -52,6 +52,32 @@ input tainted) — 0 in-file contexts except `inv`'s documented zero check —
 next to `ffcontrol`, the replaced ff path on the same operands, which must
 stay non-zero in `ff.zig` (27 contexts on 2026-10-02). Differential tests
 against `std.crypto.ff` at L=4 (bls12_381 `r`) and L=7 (ed448 `l`).
+
+**`DynModint(max_bits)` (2026-10-02)** is the run-time counterpart of `Field`:
+an odd modulus whose value AND limb count are chosen at run time (slots of 4
+limbs, each operation dispatched to the matching `Modint`), with normal-domain
+elements (`[max_limbs]u64`, so an element of `p²` is directly an operand mod
+`n²`). API: branchless `loadBE`, canonical `elemFromBytesBE` (CT up to the
+verdict), `toBytesBE`, `reduceLimbs`/`reduceBytesBE` of any width — Horner over
+`min(64, bits−1)`-bit digits, so every `montMul` operand stays `< m` down to
+`m = 3` —, `add`/`sub`/`neg`/`mul`/`sq`, `pow` (CT, all `64·L` bits),
+`powPublic` (variable-time in a public exponent), `isZero`/`eql`, and
+`divExact` (Hensel: `q = x·m⁻¹ mod 2^(64·L)`, then `q·m = x` checked over the
+full width — Paillier's L-function). It exists because `rsa` and `paillier`
+each carried a private copy of the slot machinery for their modexps while their
+other secret arithmetic stayed in `std.crypto.ff`; both now run every
+private-key operation on it (ctgrind `rsa/crt` 213 → 1, `paillier/crt` 325 → 2), and `threshold_ecdsa`'s provers their products (`fac` 17 → 5). `elemFromFf`/`elemToFf`/`fromFf` move values to and from `std.crypto.ff` by a positional limb repack, since `ff`'s own `toBytes`/`fromBytes` branch on the value.
+The bit LENGTH of the modulus (which picks the slot) is treated as public — it
+is the key size; its value is not. Evidence: ctgrind target `dyn` — secret
+modulus (value fields tainted after construction, slot not), operands,
+exponent, wide inputs, at L=16 and L=32 — 2 in-file contexts, both
+`elemFromBytesBE`'s accept/reject; differential tests against
+`std.math.big.int` at 2…8192-bit moduli. Mutation 2026-10-02 (schemata, 14
+mutants): 12 killed after one added test (`divExact` with a non-zero limb above
+`2·L`); 2 equivalent — forcing the digit width to 64 for a small modulus (the
+portable CIOS tolerates an operand `< R`; the narrower digit keeps the
+documented `< m` contract) and dropping the `m < 3` check (`Modint.fromElem`
+rejects it too).
 
 ## Why it exists (std-gap, not a dup)
 
@@ -555,11 +581,12 @@ speed dispatch, not a correctness bound.
 
 ## Backlog / deferred
 
-- **Variable-time `powPublic` (public exponent)** (survey 2026-09-30): `std.crypto.ff` has it and `rsa` calls it for verify (`pk.n.powPublic(m, pk.e)`); `powMont` walks all `L*64` exponent bits even for e = 65537, so a verify through montint would cost two orders of magnitude more multiplies than it needs. Effort S. Fits §2.
-- **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): consumers write their own (`rsa` calls a local `reduceWide`). ✅ for comptime prime moduli via `Field` (2026-10-02); still open for `Modint` itself. Effort S. Fits §2.
+- ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
+- **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); `isOdd`, and the fixed-width `Modint` itself, still open. Effort S. Fits §2.
 - **Modular inversion (odd modulus; constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today (`Field.inv` does), an RSA/Paillier composite cannot. Effort M. Fits §2.
-- **A run-time-modulus `Field` counterpart for secrets** (2026-10-02): `paillier`, `rsa` and `threshold_ecdsa` still do some secret arithmetic in `std.crypto.ff` (Garner recombination, products, keygen Miller-Rabin), each with the extra-reduction residual recorded in its ctgrind bound. A `MontParams`-style run-time modulus with `Field`'s API would let them drop ff for secrets. Effort M. Fits §2.
-- **Run-time-sized modulus (limb count chosen at run time)** (survey 2026-09-30): already in the SPEC's deferred list; crypto-bigint has boxed forms. Effort M. Fits §2.
+- ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
+- ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
+- **`DynModint.reduceLimbs` costs two Montgomery multiplies per 64-bit digit** (2026-10-02): a 2L-limb input reduces in 4L multiplies, ~5 % of a CRT half's modexp. A chunked form (`L` limbs at a time, `R²` per chunk) needs `montMul` to accept one operand `≥ m`, which the portable CIOS does (`< R` suffices) but the asm core's contract does not state. Effort S once the asm contract is checked. Fits §2.
 - **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5× slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64 CI. Fits §2.
 
 ## Provenance

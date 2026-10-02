@@ -123,11 +123,13 @@ pub const MtaError = paillier.EncryptError ||
 /// Encode a `Zq` scalar as a Paillier plaintext `Fe` canonical mod `n_sq`
 /// (per `paillier`'s "Fe construction contract" — plaintexts/scalars used
 /// as a base/exponent under `n_sq` must be constructed against `n_sq`, not
-/// `n`). Every scalar value is `< q < n`, hence `< n_sq`, so the
-/// canonicality check can never fire — `catch unreachable`.
+/// `n`). Every scalar value is `< q < n`, hence `< n_sq`. Loaded by position
+/// (`zkproofs.feFromSecretBytes`), not `Fe.fromBytes`, whose canonicality
+/// check branches on the value — the scalar is Bob's secret `b`.
 fn scalarToFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
-    const bytes = s.toBytes(.big); // 32-byte big-endian, value < q
-    return paillier.Fe.fromBytes(pk.n_sq, &bytes, .big) catch unreachable;
+    var bytes = s.toBytes(.big); // 32-byte big-endian, value < q
+    defer std.crypto.secureZero(u8, &bytes);
+    return zkproofs.feFromSecretBytes(pk.n_sq, paillier.Fe, &bytes);
 }
 
 /// Sample a uniform `Zq` scalar from CSPRNG bytes (48-byte draw folded mod
@@ -302,8 +304,9 @@ fn samplePaillierRandomness(pk: paillier.PublicKey, random: std.Random) paillier
         // `n_sq` (always canonical there once it's `< N < n_sq`).
         const in_range = paillier.Fe.fromBytes(pk.n, buf[0..n_len], .big) catch continue;
         if (in_range.isZero()) continue;
-        const r = paillier.Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch unreachable; // < N < n_sq: always canonical
-        return r;
+        // Re-encoded by position: `r` is the encryption randomness, secret,
+        // and `Fe.fromBytes`'s canonicality check branches on the value.
+        return zkproofs.feFromSecretBytes(pk.n_sq, paillier.Fe, buf[0..n_len]); // < N < n_sq
     }
 }
 
@@ -397,7 +400,7 @@ pub fn mtaBobResponseChecked(
     sampleBetaPrime(random, &beta_prime);
     errdefer std.crypto.secureZero(u8, &beta_prime);
     const b_fe = scalarToFe(b, alice_pk);
-    const bp_fe = paillier.Fe.fromBytes(alice_pk.n_sq, &beta_prime, .big) catch unreachable; // < q⁵ < N < N²
+    const bp_fe = zkproofs.feFromSecretBytes(alice_pk.n_sq, paillier.Fe, &beta_prime); // < q⁵ < N < N²
     const r_b = samplePaillierRandomness(alice_pk, random);
 
     const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);

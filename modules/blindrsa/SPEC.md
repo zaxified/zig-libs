@@ -309,6 +309,8 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
 
 ## Backlog / deferred
 
+- **`blindSign`'s unblinding off `std.crypto.ff`** (2026-10-02): `sk.n.mul(s_b, b_inv)` runs ff's `montgomeryMul`, whose extra-reduction select branches in ReleaseFast (ctgrind `sign`: 3 contexts, over the §7.2 mask `b_inv`); the parse of `s_b` adds one. `rsa` moved its own private path onto `montint.DynModint` the same day; doing the same here means carrying a `DynModint` for `n` (or rsa exposing its `n_mont`). Effort S. Fits §2.
+
 - **Partially blind RSA (draft-irtf-cfrg-partially-blind-rsa)** *(survey 2026-09-30)*.
   Public metadata bound into the signature — the feature that lets a token issuer
   put an expiry or a policy tag into blind tokens. jedisct1's Zig library and CIRCL

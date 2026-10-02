@@ -57,6 +57,11 @@ pub const asm_active = montint.asm_active;
 /// only from `Modint`'s constant-time primitives (see `field.zig`).
 pub const Field = @import("field.zig").Field;
 
+/// `DynModint(max_bits)` — an odd modulus chosen at run time (value and limb
+/// count) with a constant-time element API: the run-time counterpart of
+/// `Field`, for RSA/Paillier secrets (see `dyn.zig`).
+pub const DynModint = @import("dyn.zig").DynModint;
+
 pub const gate = @import("gate.zig");
 pub const asm_core = @import("asm_core.zig");
 pub const limbs = @import("limbs.zig");
@@ -70,6 +75,7 @@ test {
     _ = limbs;
     _ = kat_vectors;
     _ = @import("field.zig");
+    _ = @import("dyn.zig");
     _ = @import("kat_test.zig");
     _ = @import("bench.zig");
 }

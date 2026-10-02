@@ -74,8 +74,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 All modular exponentiation routes through the sibling `montint` module (a full-radix-2^64,
 Montgomery-resident, constant-time modexp, ~3× faster than `std.crypto.ff` on the portable path —
-see "Speed" below); `std.crypto.ff` (`Modulus`/`Fe`) remains the canonical big-integer carrier for
-key material, CRT recombination (Garner), reductions, and serialization. This module must never
+see "Speed" below), and since 2026-10-02 so does every other operation on a private-key value:
+the reduction of `c` into the mod-p/mod-q domains, the CRT recombination (Garner), base
+(un)blinding and the F3 re-encryption, all on `montint.DynModint`. `std.crypto.ff`
+(`Modulus`/`Fe`) remains the carrier type of the public API and of key material, and does the
+key-import arithmetic; `dP`/`dQ`/`qInv` cross into montint by a positional limb repack.
+Measured (ctgrind, ReleaseFast, 2048-bit KAT key): `crt` 213 → 1 in-file contexts — the one
+left is the F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` — and
+`noncrt` 2 → 0. The 212 that went were `std.crypto.ff`'s `reduce` (`shiftIn`, the
+compare-and-subtract) and `montgomeryMul` over the secret primes. This module must never
 implement its own bignum or a non-constant-time exponentiation over secret data. `rsasp1`/
 `rsadpCrt` are the CRT fast path (RFC 8017 §5.1.2 form (2)); `rsadp`/non-CRT `d` exist as the
 straightforward form and a correctness cross-check. Modeled after RFC 8017 (PKCS#1 v2.2);

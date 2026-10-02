@@ -259,8 +259,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintBytes(taint, std.mem.asBytes(&sk.dp));
             taintBytes(taint, std.mem.asBytes(&sk.dq));
             taintBytes(taint, std.mem.asBytes(&sk.qinv));
-            taintBytes(taint, std.mem.asBytes(&sk.p_mont));
-            taintBytes(taint, std.mem.asBytes(&sk.q_mont));
+            // Value fields only, not the slot `L` (the key size, public) —
+            // as rsa's harness does, see its `taintMont`.
+            inline for (.{ &sk.p_mont, &sk.q_mont }) |mp| {
+                taintBytes(taint, std.mem.asBytes(&mp.m));
+                taintBytes(taint, std.mem.asBytes(&mp.n0inv));
+                taintBytes(taint, std.mem.asBytes(&mp.r2));
+                taintBytes(taint, std.mem.asBytes(&mp.one_mont));
+                taintBytes(taint, std.mem.asBytes(&mp.digit_mont));
+            }
             const sk_reloaded = reloadVolatile(rsa.SecretKey, &sk);
 
             // The RFC's own published blinded_msg — a fixed, public,

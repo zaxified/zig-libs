@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **New `DynModint(max_bits)`: a run-time modulus with a
+  constant-time element API.** The modulus value AND its limb count are chosen
+  at run time (slots of 4 limbs, dispatched to the matching `Modint`); elements
+  are normal-domain `[max_limbs]u64`. Branchless `loadBE`, canonical
+  `elemFromBytesBE`, `toBytesBE`, `reduceLimbs`/`reduceBytesBE` of any width
+  (Horner over `min(64, bits−1)`-bit digits, so every `montMul` operand stays
+  `< m` down to `m = 3`), `add`/`sub`/`neg`/`mul`/`sq`, `pow` (CT), `powPublic`
+  (variable-time public exponent — closes that backlog item), CT `isZero`/`eql`
+  and `divExact` (Hensel exact division — Paillier's L-function). Replaces the
+  three private "MontParams + slot" copies in `rsa`/`paillier`/`threshold_ecdsa`,
+  whose secret arithmetic moves off `std.crypto.ff` with it; `elemFromFf`/
+  `elemToFf`/`fromFf` bridge `std.crypto.ff` values by a positional limb repack. Differential tests against
+  `std.math.big.int` at 2…8192-bit moduli; new ctgrind target `dyn` (secret
+  modulus, both the portable L=16 and asm L=32 slots): 2 in-file contexts, both
+  `elemFromBytesBE`'s accept/reject.
+
 - **2026-10-02** — **New `Field(p)`: a constant-time prime field over `Modint`.**
   `GF(p)` for a comptime prime, Montgomery-resident, built only from `montMul`/
   `montSqr`/`add`/`sub`/`powMont`: canonical `fromBytesBE`, `toBytesBE`,

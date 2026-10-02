@@ -138,287 +138,57 @@ fn stripLeadingZeros(bytes: []const u8) []const u8 {
     return bytes[i..];
 }
 
-// ── montint modexp backend (the hot-path arithmetic) ────────────────────────
+// ── montint backend (every secret-touching operation) ──────────────────────
 //
-// `montint.Modint(bits)` fixes its limb count `L` at comptime, whereas a
-// Paillier operation's width is only known at runtime: `n²` is `max_bits` wide
-// (L=64 at the canonical size) while the CRT halves work over `p²`/`q²`, each
-// ~half that (L=32). We bridge the two exactly as `rsa` does — a runtime-
-// dispatched set of comptime `Modint` instantiations, keyed on the operand's
-// limb count rounded up to a multiple of `mont_step`. Rounding keeps the
-// number of monomorphized modexp instantiations small (16). The canonical
-// sizes land on exact multiple-of-4 limb counts with ZERO padding: a 2048-bit
-// key's `n²` is L=64 and each `p²`/`q²` is L=32 — precisely the Montgomery-
-// resident portable win the audit targeted (both < montint's `asm_min_limbs`
-// =32… note `p²` sits right at the cutoff; the asm core is gated off repo-wide
-// so every size takes the portable CIOS path regardless). Padding, when a
-// non-round width forces it, only adds leading zero limbs, which `montint`
-// handles correctly (just slightly slower).
+// `montint.DynModint` carries a modulus chosen at run time — `n²` (L=64 at the
+// canonical size), `n`, or the CRT halves' `p²`/`q²` (L=32) — on the smallest
+// comptime `Modint` slot (a multiple of 4 limbs) that holds it. Constants are
+// computed once per key.
+//
+// Until 2026-10-02 only the modexps ran here: the reduction of `c` into the
+// mod-p²/q² domains, the Garner recombination, `g^m`'s `1 + m·n` and the
+// products with it stayed in `std.crypto.ff`, whose `reduce`/`montgomeryMul`/
+// `toBytes`/`fromBytes` branch on the values in ReleaseFast, and the
+// L-function divided with `std.math.big.int`'s variable-time `divFloor`
+// (ctgrind `paillier/crt`: 325 in-file contexts). All of it runs on
+// `DynModint` now. `std.crypto.ff` stays the public carrier type (`Fe`,
+// `Modulus`) and the key-derivation arithmetic; values cross between the two
+// through `feToElem`/`elemToFe`, which repack limbs by position only.
 
-const mont_step: usize = 4;
-const mont_min_limbs: usize = 4;
-const mont_max_limbs: usize = (max_bits + 63) / 64; // 64
+/// A modulus plus its Montgomery constants (run-time size).
+const MontParams = montint.DynModint(max_bits);
+/// A normal-domain element of a `MontParams`, see `montint.DynModint`.
+const MontElem = MontParams.Elem;
 
-/// A modulus plus its precomputed Montgomery constants, stored in a max-width
-/// buffer with only the low `L` limbs live. Computed ONCE per key so no
-/// per-operation Montgomery setup is paid — the `Modint` view is reconstructed
-/// field-by-field at op time, skipping the `computeConstants` doubling loop.
-const MontParams = struct {
-    /// Live limb count (multiple of `mont_step`); selects the comptime `Modint`.
-    L: usize = 0,
-    /// `-m[0]⁻¹ mod 2^64` (montint's CIOS reduction constant).
-    n0inv: u64 = 0,
-    /// The odd modulus, little-endian, low `L` limbs live.
-    m: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-    /// `R² mod m` (montint's `toMontgomery` constant).
-    r2: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-    /// `R mod m` — the value `1` in the Montgomery domain.
-    one: [mont_max_limbs]u64 = [_]u64{0} ** mont_max_limbs,
-};
-
-/// Round a runtime limb count up to the modeled `Modint` slot: the smallest
-/// multiple of `mont_step` that is ≥ `l` and ≥ `mont_min_limbs`.
-fn montSlot(l: usize) usize {
-    var s: usize = mont_min_limbs;
-    while (s < l) s += mont_step;
-    return s;
-}
-
-/// Load a big-endian byte string into an `slot`-limb little-endian value with
-/// NO value-dependent branch (the only branch is on the PUBLIC bit position vs
-/// the limb count) — safe on a secret exponent. The caller guarantees the
-/// value fits in `slot` limbs (every base/exponent here is `< m`).
-fn beToLimbs(comptime slot: usize, be: []const u8) [slot]u64 {
-    var v = [_]u64{0} ** slot;
-    var idx: usize = 0;
-    var i: usize = be.len;
-    while (i > 0) : (idx += 8) {
-        i -= 1;
-        const limb = idx >> 6;
-        if (limb >= slot) break; // branch on public position, not on any value
-        v[limb] |= @as(u64, be[i]) << @intCast(idx & 63);
-    }
-    return v;
-}
-
-/// Precompute the montint modulus + Montgomery constants for an `ff` modulus.
-/// One-time (key construction) — walks the doubling-based `computeConstants`.
+/// Precompute the montint modulus for an `ff` modulus — branchless in the
+/// value (`DynModint.fromFf`): `p²`/`q²` are secrets.
 fn montParamsFromModulus(mod: Modulus) MontParams {
-    var be: [modulus_sq_bytes]u8 = undefined;
-    mod.toBytes(&be, .big) catch unreachable; // n²-width buffer never overflows
-    const slot = montSlot((mod.bits() + 63) / 64);
-    var mp: MontParams = .{ .L = slot };
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == slot) {
-            const M = montint.Modint(s * 64);
-            // Build via the branchless `beToLimbs` + `fromElem` (NOT montint's
-            // `fromBytesBE`, whose zero-byte skip is value-dependent) so the
-            // path stays uniform; the modulus is public here regardless.
-            const mm = M.fromElem(beToLimbs(s, &be)) catch unreachable; // odd, ≥3, fits
-            mp.n0inv = mm.n0inv;
-            @memcpy(mp.m[0..s], &mm.m);
-            @memcpy(mp.r2[0..s], &mm.r2);
-            @memcpy(mp.one[0..s], &mm.one_mont);
-            return mp;
-        }
-    }
-    unreachable;
+    return MontParams.fromFf(mod) catch unreachable; // odd, ≥ 3
 }
 
-/// Reconstruct the comptime `Modint` view for slot `s` from precomputed params.
-fn montView(comptime s: usize, mp: *const MontParams) montint.Modint(s * 64) {
-    const M = montint.Modint(s * 64);
-    return M{
-        .m = mp.m[0..s].*,
-        .n0inv = mp.n0inv,
-        .r2 = mp.r2[0..s].*,
-        .one_mont = mp.one[0..s].*,
-    };
+/// An `ff` value as a montint element, by position only
+/// (`DynModint.elemFromFf`).
+fn uintToElem(u: *const Uint) MontElem {
+    return MontParams.elemFromFf(u);
 }
 
-/// Constant-time (in the exponent VALUE) modexp `base^exp mod m` over the
-/// precomputed modulus `mp`. `base_be`/`exp_be` are big-endian, both `< m`.
-/// Writes the big-endian result (slot-width) into `out_buf` and returns that
-/// slice. Used for the secret decrypt paths (`c^λ mod n²`, `c^dp mod p²`,
-/// `c^dq mod q²`).
-fn montPowSecret(mp: *const MontParams, base_be: []const u8, exp_be: []const u8, out_buf: *[modulus_sq_bytes]u8) []const u8 {
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == mp.L) {
-            const M = montint.Modint(s * 64);
-            const mod = montView(s, mp);
-            const b = beToLimbs(s, base_be);
-            var e = beToLimbs(s, exp_be);
-            // `exp_be` here is always a secret exponent (`decryptNonCrtX`'s
-            // λ, `decryptCrtX`'s dp/dq) — don't leave its limb form behind
-            // (paillier F2, wave-3 audit).
-            defer std.crypto.secureZero(u64, &e);
-            const r = mod.powMont(&b, &e);
-            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
-            return out_buf[0..M.encoded_bytes];
-        }
-    }
-    unreachable;
+/// `fe` (normal domain, as every `Fe` here is) as a montint element.
+fn feToElem(fe: *const Fe) MontElem {
+    return MontParams.elemFromFf(&fe.v);
 }
 
-/// Variable-time modexp `base^e mod m` for a PUBLIC exponent (the `r^n mod n²`
-/// term of `encrypt` — `n` is the public modulus). Left-to-right square-and-
-/// multiply over `e`'s actual bit length; variable-time is fine because `e` is
-/// public, and the base `r` is still processed through montint's Montgomery
-/// multiply. `base_be` is big-endian, `< m`.
-fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, out_buf: *[modulus_sq_bytes]u8) []const u8 {
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == mp.L) {
-            const M = montint.Modint(s * 64);
-            const mod = montView(s, mp);
-            const b = beToLimbs(s, base_be);
-            const b_mont = mod.toMontgomery(&b);
-            var acc: M.Elem = mod.one_mont;
-            var seen = false;
-            const eb = stripLeadingZeros(e_be);
-            for (eb) |byte| {
-                var mask: u8 = 0x80;
-                while (mask != 0) : (mask >>= 1) {
-                    if (seen) acc = mod.montSqr(&acc);
-                    if (byte & mask != 0) {
-                        if (seen) {
-                            acc = mod.montMul(&acc, &b_mont);
-                        } else {
-                            acc = b_mont; // first set bit: acc = base^1
-                            seen = true;
-                        }
-                    }
-                }
-            }
-            const r = mod.fromMontgomery(&acc);
-            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
-            return out_buf[0..M.encoded_bytes];
-        }
-    }
-    unreachable;
+/// A canonical element of `m` back into an `Fe` of `m`, by position only
+/// (`DynModint.elemToFf`) — `Fe.fromBytes(m, …)` without its value-dependent
+/// canonicality checks.
+fn elemToFe(m: Modulus, e: *const MontElem) Fe {
+    return MontParams.elemToFf(Fe, m, e);
 }
 
-/// Parse a montint big-endian result (slot-width, value `< m`) back into an
-/// `Fe` canonical mod `m`.
-///
-/// paillier F4 (A1/paillier.md): this used to run `res` through
-/// `stripLeadingZeros` first -- a data-dependent scan over a secret-derived
-/// value (`x_p`/`x_q` in the CRT path), 2 of the audit's 106 ctgrind
-/// contexts. It was never load-bearing: `Fe`'s backing `Uint(max_bits)` is
-/// ONE comptime type shared by every modulus this module uses (`n`, `n_sq`,
-/// `p_sq`, `q_sq`), so `Fe.fromBytes`'s length gate
-/// (`std.crypto.ff.Uint.fromBytes`) checks `res.len` against the GLOBAL
-/// `Fe.encoded_bytes = max_bits/8`, never against `m`'s own (possibly
-/// narrower) width -- and `res.len` is always `M.encoded_bytes` from a
-/// `montint.Modint` slot capped at `mont_max_limbs` (`(max_bits+63)/64`),
-/// which by construction never exceeds `max_bits/8` bytes. `Uint.fromBytes`
-/// also always returns a value with `limbs_len == max_limbs_count` (its
-/// `Self.zero` starting point) regardless of how many bytes were supplied,
-/// so `Modulus.shrink`'s "limbs beyond m's own width must be zero" check
-/// sees the identical value whether `res` carries leading zero bytes or
-/// not. Passing `res` unstripped therefore parses to the exact same `Fe`,
-/// just without the value-dependent scan.
-fn feFromMontBytes(m: Modulus, res: []const u8) Fe {
-    return Fe.fromBytes(m, res, .big) catch unreachable; // value < m, res.len <= Fe.encoded_bytes always
-}
-
-/// `base^exp mod m` (secret exponent, constant-time), returning an `Fe`
-/// canonical mod `m`. `base` must serialize to a value `< m`.
-fn montModexpSecret(mp: *const MontParams, m: Modulus, base: Fe, exp_be: []const u8) Fe {
-    var base_be: [modulus_sq_bytes]u8 = undefined;
-    base.toBytes(&base_be, .big) catch unreachable;
-    var out: [modulus_sq_bytes]u8 = undefined;
-    const res = montPowSecret(mp, &base_be, exp_be, &out);
-    return feFromMontBytes(m, res);
-}
-
-/// `a*b mod m` (both operands secret, constant-time in value), returning an
-/// `Fe` canonical mod `m`.
-///
-/// paillier F2 (A1/paillier.md): `decrypt`'s last line used to be
-/// `sk.n.mul(l_fe, sk.mu)` -- `std.crypto.ff.Modulus.mul`, a standard-
-/// library function. Passing a 512-byte secret `Fe` BY VALUE into it makes a
-/// parameter-passing copy inside `Modulus.mul`'s OWN call frame, an address
-/// this module has no way to reach and zero -- measured (revert-and-
-/// remeasure against `probe_stack.zig`) as the one secret copy `decrypt`'s
-/// own zeroization still left on the stack after everything else was fixed.
-/// Same class of problem `bn254`'s `Fr.toBytes` hit calling into
-/// `std.crypto.ff` for a value-dependent step (that one a branch, this one a
-/// copy) and fixed the same way: never hand the sensitive step to a
-/// standard-library function whose internals this module cannot reach.
-/// `montint`'s own arithmetic is what `decrypt`'s other secret operations
-/// already route through and this module's own ctgrind harness has measured
-/// as branchless (`montint frames anywhere in stack: 0` residual beyond the
-/// documented L-division/CRT surface, see F3/F4) -- so doing the multiply
-/// here, entirely in stack this function owns, needs no new barrier, only
-/// the same `secureZero` discipline `montPowSecret` already uses for a
-/// secret exponent.
-fn montMulSecret(mp: *const MontParams, m: Modulus, a_ptr: *const Fe, b_ptr: *const Fe) Fe {
-    // `a_ptr`/`b_ptr`: callers pass a POINTER, not a value -- a `Fe` is
-    // 512 B, too large for register passing, so a by-value parameter here
-    // would cost an ABI-level copy at every call site (the caller's own
-    // frame, not this function's), exactly the kind of copy this fix cannot
-    // reach. A pointer costs one register; `.*` below is this function's
-    // OWN single copy, made once, addressable, and zeroed on every exit.
-    var a = a_ptr.*;
-    var b = b_ptr.*;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&a));
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
-
-    var a_be: [modulus_sq_bytes]u8 = undefined;
-    a.toBytes(&a_be, .big) catch unreachable;
-    defer std.crypto.secureZero(u8, &a_be);
-    var b_be: [modulus_sq_bytes]u8 = undefined;
-    b.toBytes(&b_be, .big) catch unreachable;
-    defer std.crypto.secureZero(u8, &b_be);
-
-    comptime var s: usize = mont_min_limbs;
-    inline while (s <= mont_max_limbs) : (s += mont_step) {
-        if (s == mp.L) {
-            const M = montint.Modint(s * 64);
-            const mod = montView(s, mp);
-            var av = beToLimbs(s, &a_be);
-            defer std.crypto.secureZero(u64, &av);
-            var bv = beToLimbs(s, &b_be);
-            defer std.crypto.secureZero(u64, &bv);
-            const a_mont = mod.toMontgomery(&av);
-            const b_mont = mod.toMontgomery(&bv);
-            var r_mont = mod.montMul(&a_mont, &b_mont);
-            defer std.crypto.secureZero(u64, &r_mont);
-            var r = mod.fromMontgomery(&r_mont);
-            defer std.crypto.secureZero(u64, &r);
-            var out_buf: [modulus_sq_bytes]u8 = undefined;
-            defer std.crypto.secureZero(u8, &out_buf);
-            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
-            return feFromMontBytes(m, out_buf[0..M.encoded_bytes]);
-        }
-    }
-    unreachable;
-}
-
-/// `base^exp mod m` (public exponent, variable-time in `exp`), returning an
-/// `Fe` canonical mod `m`.
-fn montModexpPublic(mp: *const MontParams, m: Modulus, base: Fe, exp_be: []const u8) Fe {
-    var base_be: [modulus_sq_bytes]u8 = undefined;
-    base.toBytes(&base_be, .big) catch unreachable;
-    var out: [modulus_sq_bytes]u8 = undefined;
-    const res = montPowPublic(mp, &base_be, exp_be, &out);
-    return feFromMontBytes(m, res);
-}
-
-/// `ff.Modulus.reduce` assumes the input spans at least as many limbs as the
-/// modulus; zero-extend the active limbs first so it is safe for narrow inputs
-/// (e.g. reducing a mod-`p²` value into the mod-`q²` or mod-`n²` domain during
-/// CRT recombination). Mirrors `rsa`'s `reduceWide`.
-fn reduceWide(m: Modulus, x: Uint) Fe {
-    var xx = x;
-    if (xx.limbs_len < m.v.limbs_len) {
-        @memset(xx.limbs_buffer[xx.limbs_len..m.v.limbs_len], 0);
-        xx.limbs_len = m.v.limbs_len;
-    }
-    return m.reduce(xx);
+/// `x ← x − 1` over the limbs (borrow chain, no branch). `x ≥ 1`.
+fn decrementElem(x: *MontElem) void {
+    var one = MontParams.zero;
+    one[0] = 1;
+    _ = montint.limbs.subInto(x, &one);
 }
 
 // ── big-int scratch helpers (mechanical n² / n+1 derivation only — NO
@@ -1275,20 +1045,32 @@ fn nAsFeModNsq(n: Modulus, n_sq: Modulus) Fe {
 ///     possibly-secret `m` never enters a bit-scanned exponent path at all.
 ///   - **A caller-supplied non-standard `g` (`PublicKey.fromBytes` with
 ///     explicit `g_bytes`):** the general modexp through montint
-///     (`montModexpSecret`), constant-time in `m` — a plaintext, so possibly
+///     (`DynModint.pow`), constant-time in `m` — a plaintext, so possibly
 ///     secret. Until 2026-10-02 this was `std.crypto.ff`'s `pow`, whose
 ///     window select compiles to a conditional jump on the exponent in
 ///     ReleaseFast (ctgrind, the threshold_ecdsa `fac` finding). montint
 ///     yields `g^0 = 1` with no special case, so `m = 0` needs no branch.
 fn gPow(pk: PublicKey, m: Fe) HomomorphicError!Fe {
-    const one = pk.n_sq.one();
+    var r = gPowElem(&pk, &m);
+    defer std.crypto.secureZero(u64, &r);
+    return elemToFe(pk.n_sq, &r);
+}
+
+/// `gPow` on montint elements — what `encrypt`/`addPlaintext` multiply with.
+/// Both branches run on montint (`1 + m·n` was `std.crypto.ff`'s `mul`/`add`
+/// until 2026-10-02); the branch itself is on the PUBLIC generator.
+fn gPowElem(pk: *const PublicKey, m: *const Fe) MontElem {
     const n_fe = nAsFeModNsq(pk.n, pk.n_sq);
-    const g_std = pk.n_sq.add(n_fe, one); // the standard generator, n+1
-    if (pk.g.eql(g_std)) return pk.n_sq.add(pk.n_sq.mul(m, n_fe), one);
-    var m_be: [modulus_sq_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &m_be);
-    m.toBytes(&m_be, .big) catch unreachable; // canonical mod n_sq, full-width buffer
-    return montModexpSecret(&pk.n_sq_mont, pk.n_sq, pk.g, &m_be);
+    const g_std = pk.n_sq.add(n_fe, pk.n_sq.one()); // the standard generator, n+1
+    var m_el = feToElem(m);
+    defer std.crypto.secureZero(u64, &m_el);
+    if (pk.g.eql(g_std)) {
+        var one = MontParams.zero;
+        one[0] = 1;
+        const n_el = uintToElem(&pk.n.v); // n < n²: already canonical
+        return pk.n_sq_mont.add(&pk.n_sq_mont.mul(&m_el, &n_el), &one);
+    }
+    return pk.n_sq_mont.pow(&feToElem(&pk.g), &m_el);
 }
 
 /// Paillier encryption: `c = g^m * r^n mod n²` (Paillier 1999 §3). `m` must
@@ -1326,15 +1108,19 @@ pub fn encrypt(pk: PublicKey, m: Fe, r: Fe) EncryptError!Ciphertext {
     // — reject it here rather than let the caller discover a dead
     // ciphertext later (paillier F11, wave-3 audit).
     if (r.isZero()) return error.InvalidRandomness;
-    const gm = try gPow(pk, m);
+    var gm = gPowElem(&pk, &m);
+    defer std.crypto.secureZero(u64, &gm);
     // r^n mod n² — the modexp hot path, routed through montint. `n` is the
     // PUBLIC modulus (variable-time in the exponent is fine); the base `r`
     // still goes through montint's constant-time Montgomery multiply.
     var n_be: [modulus_bytes]u8 = undefined;
     const n_len = byteLen(pk.n.bits());
     pk.n.toBytes(n_be[0..n_len], .big) catch unreachable; // exact-size buffer
-    const rn = montModexpPublic(&pk.n_sq_mont, pk.n_sq, r, n_be[0..n_len]);
-    return .{ .c = pk.n_sq.mul(gm, rn) };
+    var r_el = feToElem(&r);
+    defer std.crypto.secureZero(u64, &r_el);
+    var rn = pk.n_sq_mont.powPublic(&r_el, n_be[0..n_len]);
+    defer std.crypto.secureZero(u64, &rn);
+    return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.mul(&gm, &rn)) };
 }
 
 /// `encrypt` with `r` sampled uniformly from `[1, pk.n)` by rejection
@@ -1384,59 +1170,62 @@ pub const DecryptError = std.crypto.ff.NullExponentError || std.crypto.ff.Repres
 /// guarantees `c^lambda ≡ 1 (mod n)` for a well-formed ciphertext, so `x - 1`
 /// is always an exact multiple of `n`).
 ///
-/// `c^lambda mod n²` is a constant-time `Modulus.pow` (`sk.lambda` is
-/// secret-key material — never `powPublic`). `L(x)` drops to
-/// `std.math.big.int` exact division (`std.crypto.ff` has no native
-/// L-function/exact-division primitive — mirrors how `rsa.fromPrimesImpl`
-/// drops to `big.int` for its own lcm/modinv steps); that division is
-/// variable-time in `x`, a plaintext-derived value — see SPEC.md's timing
-/// note. A `c` that is 0, shares a factor with `n`, or otherwise fails the
-/// `x ≡ 1 (mod n)` exactness guarantee is rejected as
-/// `error.InvalidCiphertext` rather than silently decrypting garbage.
-/// `x = c^λ mod n²` via the single-modulus montint path (constant-time in the
-/// secret `λ`). Returns `null` iff `λ = 0` (a malformed key — not a real
-/// Paillier secret), preserving the old `NullExponent → InvalidCiphertext`
-/// behavior. Used when no CRT block is available (`fromBytes` keys).
-/// `sk` is passed BY POINTER (not by value): `SecretKey` is a large
-/// (~13.9 KB) struct, and a by-value copy here would leave a second full
-/// copy of `lambda` on this function's own stack frame after `decrypt`
-/// returns — one of the residues `paillier` F2 (wave-3 audit) measured with
-/// a poisoned-stack probe. The caller (`decrypt`) still owns and zeroes the
-/// one copy it necessarily holds.
-fn decryptNonCrtX(sk: *const SecretKey, c: Fe) ?Fe {
-    if (sk.lambda.isZero()) return null;
-    var lam_be: [modulus_sq_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &lam_be); // F2: don't leave λ's big-endian image behind
-    sk.lambda.toBytes(&lam_be, .big) catch unreachable; // canonical mod n², full-width
-    return montModexpSecret(&sk.n_sq_mont, sk.n_sq, c, &lam_be);
+/// Every step runs on montint and is constant-time in `λ`/`µ`/the CRT block
+/// and in the plaintext: the modexp(s), the CRT recombination, `L` (a Hensel
+/// exact division, `DynModint.divExact`) and the final multiply. The only
+/// value-dependent branches are the two rejections, each on a verdict about
+/// the ciphertext: `x = 0` (`c` shares a factor with `n`) and `x − 1` not a
+/// multiple of `n` (`c` not a ciphertext under this key) — both
+/// `error.InvalidCiphertext`, never a silently decrypted garbage value.
+///
+/// `L` was `std.math.big.int`'s variable-time `divFloor` until 2026-10-02.
+/// Its quotient is `m·λ mod n`, so its timing was a function of the
+/// plaintext and of `λ` — measured reaching that line (ctgrind
+/// `paillier/crt`, `noncrt`; `threshold_ecdsa` F5 and `paillier` F3 traced
+/// what it could reveal). Exact division by a known odd divisor needs no
+/// long division: `q = (x − 1)·n⁻¹ mod 2^(64·L)` is the quotient whenever
+/// the division is exact, and `q·n = x − 1` checks that it was.
+///
+/// `x = c^λ mod n²` via the single-modulus montint path. Returns `null` iff
+/// `λ = 0` (a malformed key — not a real Paillier secret), preserving the old
+/// `NullExponent → InvalidCiphertext` behavior. Used when no CRT block is
+/// available (`fromBytes` keys). `sk` is passed BY POINTER (not by value):
+/// `SecretKey` is a large (~13.9 KB) struct, and a by-value copy here would
+/// leave a second full copy of `lambda` on this function's own stack frame
+/// after `decrypt` returns — one of the residues `paillier` F2 (wave-3 audit)
+/// measured with a poisoned-stack probe.
+fn decryptNonCrtX(sk: *const SecretKey, c: *const MontElem) ?MontElem {
+    var lam = feToElem(&sk.lambda);
+    defer std.crypto.secureZero(u64, &lam); // F2: no limb image of λ left behind
+    if (MontParams.isZero(&lam)) return null;
+    return sk.n_sq_mont.pow(c, &lam);
 }
 
 /// `x = c^λ mod n²` via Paillier-CRT: two half-width constant-time modexps
-/// `c^dp mod p²` and `c^dq mod q²`, Garner-recombined into `x` mod `n²`. Byte-
-/// identical to `decryptNonCrtX` for a well-formed ciphertext, but ~4× cheaper.
-/// Constant-time in the secret exponents; the recombination is all `ff` field
-/// arithmetic with no secret-dependent branch. Takes only `crt` (not the
-/// enclosing `SecretKey`) — every field this needs (`p_sq`/`q_sq`/`dp`/`dq`/
-/// the Montgomery params) lives on `CrtParams`, and the old `sk: SecretKey`
-/// by-value parameter was dead weight: an entire unused ~13.9 KB copy of the
-/// key (including the 128 B CRT block itself) left on the stack for every
-/// CRT decrypt (paillier F2, wave-3 audit).
-fn decryptCrtX(n_sq: Modulus, crt: *const CrtParams, c: Fe) Fe {
-    // `n_sq` is PUBLIC (the same value `PublicKey.n_sq` carries) — taking it
-    // by value here costs nothing security-wise, unlike the `sk: SecretKey`
-    // by-value parameter this replaced.
-    // Reduce c into the mod-p² and mod-q² domains (both constant-time).
-    const cp = reduceWide(crt.p_sq, c.v);
-    const cq = reduceWide(crt.q_sq, c.v);
-    // x_p = c^dp mod p², x_q = c^dq mod q² (constant-time secret exponents).
-    const xp = montModexpSecret(&crt.p_sq_mont, crt.p_sq, cp, &crt.dp);
-    const xq = montModexpSecret(&crt.q_sq_mont, crt.q_sq, cq, &crt.dq);
+/// `c^dp mod p²` and `c^dq mod q²`, Garner-recombined into `x` mod `n²`.
+/// Byte-identical to `decryptNonCrtX` for a well-formed ciphertext, but ~4×
+/// cheaper. Takes only `crt` (not the enclosing `SecretKey`) — the old
+/// by-value `sk: SecretKey` parameter left an unused ~13.9 KB copy of the key
+/// on the stack for every CRT decrypt (paillier F2, wave-3 audit).
+fn decryptCrtX(n_sq: *const MontParams, crt: *const CrtParams, c: *const MontElem) MontElem {
+    const ps = &crt.p_sq_mont;
+    const qs = &crt.q_sq_mont;
+    var dp = MontParams.loadBE(&crt.dp) catch unreachable; // < p², fits
+    defer std.crypto.secureZero(u64, &dp);
+    var dq = MontParams.loadBE(&crt.dq) catch unreachable;
+    defer std.crypto.secureZero(u64, &dq);
+    // x_p = c^dp mod p², x_q = c^dq mod q² (c reduced into each domain first).
+    var xp = ps.pow(&ps.reduceLimbs(c[0..n_sq.L]), &dp);
+    defer std.crypto.secureZero(u64, &xp);
+    var xq = qs.pow(&qs.reduceLimbs(c[0..n_sq.L]), &dq);
+    defer std.crypto.secureZero(u64, &xq);
     // Garner: u = (x_q − x_p)·(p²)⁻¹ mod q²;  x = x_p + p²·u   (0 ≤ x < n²).
-    const xp_q = reduceWide(crt.q_sq, xp.v);
-    const u = crt.q_sq.mul(crt.q_sq.sub(xq, xp_q), crt.p_sq_inv);
-    const xp_n = reduceWide(n_sq, xp.v);
-    const u_n = reduceWide(n_sq, u.v);
-    return n_sq.add(xp_n, n_sq.mul(crt.p_sq_fe, u_n));
+    var p_sq_inv = feToElem(&crt.p_sq_inv);
+    defer std.crypto.secureZero(u64, &p_sq_inv);
+    var u = qs.mul(&qs.sub(&xq, &qs.reduceLimbs(xp[0..ps.L])), &p_sq_inv);
+    defer std.crypto.secureZero(u64, &u);
+    // x_p < p², u < q² and p² < n² are all already canonical mod n².
+    return n_sq.add(&xp, &n_sq.mul(&ps.m, &u));
 }
 
 pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
@@ -1455,98 +1244,33 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
         if (sk.crt) |*crt| std.crypto.secureZero(u8, std.mem.asBytes(crt));
     }
 
-    // c must be a unit mod n² for L to be defined; c = 0 never is.
-    if (c.c.isZero()) return error.InvalidCiphertext;
+    // c must be a unit mod n² for L to be defined; c = 0 never is. `c` is
+    // public, so is this check.
+    const c_el = feToElem(&c.c);
+    if (MontParams.isZero(&c_el)) return error.InvalidCiphertext;
 
     // x = c^lambda mod n² — constant-time. CRT path (~4×) when the key carries
-    // its factors, else the single-modulus montint fallback.
-    const x = if (sk.crt) |*crt|
-        decryptCrtX(sk.n_sq, crt, c.c)
+    // its factors, else the single-modulus fallback.
+    var x = if (sk.crt) |*crt|
+        decryptCrtX(&sk.n_sq_mont, crt, &c_el)
     else
-        (decryptNonCrtX(&sk, c.c) orelse return error.InvalidCiphertext);
-    if (x.isZero()) return error.InvalidCiphertext; // gcd(c, n) != 1
+        (decryptNonCrtX(&sk, &c_el) orelse return error.InvalidCiphertext);
+    defer std.crypto.secureZero(u64, &x);
+    if (MontParams.isZero(&x)) return error.InvalidCiphertext; // gcd(c, n) != 1
 
-    // L(x) = (x - 1)/n via big.int exact division. Exact for well-formed
-    // ciphertexts (x ≡ 1 mod n, Paillier 1999 Theorem 2); a nonzero
-    // remainder means c was not a valid ciphertext under this key. The
-    // arena is amply sized for the handful of fixed-capacity big ints
-    // below, so allocation failures are impossible (`catch unreachable`).
-    //
-    // `divFloor` is variable-time in `x` (`paillier` F3 / `threshold_ecdsa`
-    // F5, wave-2 audit). Its quotient is `L(x) = m*lambda mod n` (since
-    // `c^lambda mod n² = 1 + (m*lambda mod n)*n`), so the timing is a function
-    // of the plaintext AND of `lambda` — the memcheck rows below confirm the
-    // key taint reaches it.
-    //
-    // ⚠ CORRECTED 2026-09-10 (threshold_ecdsa F5, third look): an earlier
-    // version of this comment called the leak "accepted" on the theory that
-    // `threshold_ecdsa`'s MtA masks the decrypted value with a uniform
-    // `beta'` drawn via `samplePaillierRandomness` before Alice's secret `a`
-    // is combined into it, making the masked sum information-theoretically
-    // independent of `a`. That reasoning does not hold as this module is
-    // actually wired, and `threshold_ecdsa`'s own `SPEC.md` (section "A5")
-    // already says so: `threshold_ecdsa/src/mta.zig`'s `beta_prime` is drawn
-    // by `randomScalar` — uniform over `Zq`, the ~256-bit curve scalar
-    // field — NOT by `samplePaillierRandomness` — uniform over `Z_N`, this
-    // module's ~2048-bit modulus. Those are two different functions over
-    // two very differently sized domains; `samplePaillierRandomness` in
-    // this file is `encrypt`'s/`mtaBobResponseChecked`'s *ciphertext*
-    // randomness `r`, never the MtA mask. The masked plaintext Bob actually
-    // decrypts is `a*b + beta'` — a value up to `~q²` masked by a `~q`
-    // blind — which is not remotely uniform over `Z_N`, so it is not
-    // independent of `a` (Alice's nonce share `k_i`) in the sense a full-
-    // width mask would give.
-    //
-    // What IS now measured (2026-09-10, ad hoc `zig build-exe -fvalgrind` +
-    // `valgrind --tool=memcheck` over this module's own gated
-    // `ctgrind_harness.zig`, `crt`/`noncrt` targets, `lambda`/`mu`/CRT-block
-    // tainted): the leak reaches this exact line. `target=crt`:
-    // **333 contexts / 92089 errors** tainted vs **0/0** untainted control;
-    // `target=noncrt`: **143/3851** vs **0/0**; `math.big.int.Managed.
-    // divFloor` called from `root.decrypt` (this line) is a first-class
-    // contributor in both (confirmed from the raw memcheck stack traces,
-    // not inferred). So: the taint DOES reach the L-function division —
-    // that half of the question is now answered, by this module's own
-    // pinned gate (`scripts/ctgrind-expected.tsv` rows `paillier/crt`,
-    // `paillier/noncrt`), not a new probe.
-    //
-    // ⚠ RESOLVED 2026-09-16 (threshold_ecdsa F5): the `Zq`-sized mask was
-    // worse than a timing question — Alice read Bob's `b` straight off the
-    // plaintext (`alpha'/a`). `threshold_ecdsa` now draws `beta'` from `Z_N`
-    // (semi-honest) / `Z_{q⁵}` (checked), so the plaintext reaching this
-    // line is statistically independent of `k_i` and `b`. What this
-    // division's timing can still reveal is about `lambda`, i.e. this
-    // module's own constant-time question, which the `crt`/`noncrt` rows
-    // measure.
-    var scratch: [scratch_bytes]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
+    // L(x) = (x − 1)/n, exact for a well-formed ciphertext (x ≡ 1 mod n,
+    // Paillier 1999 Theorem 2); x < n², so the quotient is < n.
+    decrementElem(&x);
+    var l: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &l);
+    if (!sk.n_mont.divExact(x[0..sk.n_sq_mont.L], &l)) return error.InvalidCiphertext;
 
-    var x_buf: [modulus_sq_bytes]u8 = undefined;
-    x.toBytes(&x_buf, .big) catch unreachable; // canonical value, full-width buffer
-    var bx = bigFromBytes(gpa, &x_buf) catch unreachable;
-    var bx1 = newBig(gpa) catch unreachable;
-    bx1.addScalar(&bx, -1) catch unreachable;
-
-    const n_len = byteLen(sk.n.bits());
-    var n_buf: [modulus_bytes]u8 = undefined;
-    sk.n.toBytes(n_buf[0..n_len], .big) catch unreachable; // exact-size buffer
-    var bn = bigFromBytes(gpa, n_buf[0..n_len]) catch unreachable;
-
-    var bl = newBig(gpa) catch unreachable;
-    var brem = newBig(gpa) catch unreachable;
-    bl.divFloor(&brem, &bx1, &bn) catch unreachable;
-    if (!brem.eqlZero()) return error.InvalidCiphertext;
-
-    var l_buf: [modulus_sq_bytes]u8 = undefined;
-    bl.toConst().writeTwosComplement(&l_buf, .big);
-    // L(x) < n always (x < n²), so this is canonical mod n by construction
-    // — fresh construction against sk.n per the Fe construction contract.
-    const l_fe = Fe.fromBytes(sk.n, &l_buf, .big) catch return error.InvalidCiphertext;
-
-    // m = L(x) * mu mod n. Routed through montint (paillier F2), not
-    // std.crypto.ff.Modulus.mul -- see montMulSecret's doc comment.
-    return montMulSecret(&sk.n_mont, sk.n, &l_fe, &sk.mu);
+    // m = L(x) * mu mod n.
+    var mu = feToElem(&sk.mu);
+    defer std.crypto.secureZero(u64, &mu);
+    var m = sk.n_mont.mul(&l, &mu);
+    defer std.crypto.secureZero(u64, &m);
+    return elemToFe(sk.n, &m);
 }
 
 // ── homomorphic ops (the whole point of this module) ─────────────────────
@@ -1563,12 +1287,16 @@ pub const HomomorphicError = std.crypto.ff.NullExponentError || std.crypto.ff.Re
 
 /// Ciphertext addition: `E(m1 + m2 mod n) = E(m1) * E(m2) mod n²` — the core
 /// additively-homomorphic property this module exists for (Paillier 1999
-/// §3.1). Construction: `pk.n_sq.mul(c1.c, c2.c)` — a single field
-/// multiplication, no modular exponentiation needed at all (unlike
-/// `addPlaintext`/`mulPlaintext` below). Cannot fail (`Modulus.mul` has no
-/// error cases).
+/// §3.1). One modular multiplication, no exponentiation (unlike
+/// `addPlaintext`/`mulPlaintext` below), on montint: a ciphertext operand
+/// can be an intermediate its owner never publishes — `threshold_ecdsa`'s MtA
+/// combines `c_A^b` with `Enc(β')` here — and `std.crypto.ff`'s `mul`
+/// branches on the Montgomery extra-reduction bit (ctgrind 2026-10-02,
+/// `threshold_ecdsa` rows). Cannot fail.
 pub fn addCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) Ciphertext {
-    return .{ .c = pk.n_sq.mul(c1.c, c2.c) };
+    var r = pk.n_sq_mont.mul(&feToElem(&c1.c), &feToElem(&c2.c));
+    defer std.crypto.secureZero(u64, &r);
+    return .{ .c = elemToFe(pk.n_sq, &r) };
 }
 
 /// Plaintext addition: `E(m1 + m2 mod n) = E(m1) * g^m2 mod n²`. `m` must be
@@ -1576,16 +1304,18 @@ pub fn addCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) Ciphertext 
 /// comment). The `g^m` term goes through `gPow` (binomial shortcut for the
 /// standard `g = n+1`, `m = 0` handled — see there).
 pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Ciphertext {
-    return .{ .c = pk.n_sq.mul(c.c, try gPow(pk, m)) };
+    var gm = gPowElem(&pk, &m);
+    defer std.crypto.secureZero(u64, &gm);
+    return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.mul(&feToElem(&c.c), &gm)) };
 }
 
 /// Plaintext (scalar) multiplication: `E(k*m mod n) = E(m)^k mod n²`. `k`
 /// must be canonical mod `pk.n_sq` (Fe construction contract). `k = 0`
 /// returns the deterministic, unblinded encryption of 0 (`c^0 = 1`, and
 /// `L(1^lambda) = 0` decrypts to 0) — exactly what `phe`'s `raw_mul` (python
-/// `pow(c, 0, n²) = 1`) produces; montint's ladder has no zero-exponent
-/// restriction, but the special case is kept anyway — one less thing to
-/// prove about the shared `montModexpSecret` path.
+/// `pow(c, 0, n²) = 1`) produces. montint's ladder gives `c^0 = 1` itself,
+/// so there is no special case: until 2026-10-02 one was kept, and its
+/// `k.isZero()` was a branch on the (possibly secret) scalar.
 ///
 /// Routed through montint (same `pk.n_sq_mont` params `encrypt`'s public
 /// `r^n` term precomputes), matching this module's other modexp hot paths —
@@ -1594,15 +1324,14 @@ pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Cipher
 /// independent of scalar width and ~16.5× slower than `decrypt` (paillier
 /// F5, wave-3 audit; numbers in CHANGELOG.md). `k` may be a secret scalar
 /// (e.g. in a future MtA context), so this keeps `decrypt`'s posture:
-/// constant-time in the exponent VALUE (`montModexpSecret`'s full-width
+/// constant-time in the exponent VALUE (`DynModint.pow`'s full-width
 /// ladder, no early exit on leading zero bits) — not the variable-time-in-
 /// k's-actual-bit-width trim the audit flagged as a separate, undecided
 /// optimization.
 pub fn mulPlaintext(pk: PublicKey, c: Ciphertext, k: Fe) HomomorphicError!Ciphertext {
-    if (k.isZero()) return .{ .c = pk.n_sq.one() };
-    var k_be: [modulus_sq_bytes]u8 = undefined;
-    k.toBytes(&k_be, .big) catch unreachable; // canonical mod n_sq, full-width buffer
-    return .{ .c = montModexpSecret(&pk.n_sq_mont, pk.n_sq, c.c, &k_be) };
+    var k_el = feToElem(&k);
+    defer std.crypto.secureZero(u64, &k_el);
+    return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.pow(&feToElem(&c.c), &k_el)) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

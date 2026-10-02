@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **The whole private-key path is off `std.crypto.ff`.**
+  The CRT op's reduction of `c` mod p/q, the Garner recombination, the base
+  blinding/unblinding and the F3 re-encryption ran in `std.crypto.ff`, whose
+  `reduce` and `montgomeryMul` branch on the secret primes in ReleaseFast. They
+  run on `montint.DynModint` now (which also replaces this module's private
+  `MontParams`/slot copy); `dP`/`dQ`/`qInv`/`d` are read from their `Fe`s by a
+  positional limb repack. ctgrind: `crt` 213 → 1 in-file (the F3 verdict),
+  `noncrt` 2 → 0. API unchanged.
+
 - **2026-10-02** — **Comments and SPEC no longer call key construction
   constant-time.** `qInv` and Miller-Rabin use `std.crypto.ff`'s pow, which
   branches on the exponent in ReleaseFast, and `d` comes from `std.math.big.int`;

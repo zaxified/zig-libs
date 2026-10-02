@@ -585,6 +585,18 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   are backlog: Πmod's 4th roots (`fourthRootBlum`, exponent AND modulus are
   the secret factor, already reduced with variable-time bignum division) and
   Miller-Rabin over secret prime candidates.
+- **Products and moves of secrets are off `std.crypto.ff` too** (2026-10-02):
+  `ff`'s `mul` branches on the Montgomery extra-reduction bit and its
+  `fromBytes`/`toBytes` on the value (ctgrind). The provers' ring-Pedersen
+  commitments (`pedersenCt`: `h1^x·h2^r`, Πfac's `s^p·t^μ` …), the
+  `c_A^α·Enc(γ)` and `r^e·β` products (`mulCt`), every secret moved between
+  moduli (`rebase`, `feFromSecretBytes`: `r_a mod N`, masks, `b`, `β'`, the
+  encryption randomness) and `paillier.addCiphertexts` run on
+  `montint.DynModint`, crossing from and to the `ff` carrier types by a
+  positional limb repack. ctgrind (in-file): `share` 394 → 244, `nonce` 669 → 478, `betaprime` 462 → 285,
+  `fac` 17 → 5; the rest of each row is the verifier side's over-taint (one
+  process simulates every signer), `std`'s secp256k1, and the scalar
+  reductions of the draws.
 - **`aux_info`**: `LocalAux` (own key + aux tuple + trapdoor), `Announcement`
   (codec; `verifyAnnouncement` = q⁷ floor, `Γ = N+1`, Πprm+Πmod(Ñ), Πmod(N)),
   `verifyFactors`, `findDuplicate` (any two of all `N_i`, `Ñ_i` equal — the

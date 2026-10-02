@@ -273,11 +273,11 @@ fn proveUnchecked(
         const y = sampleBelow(random, xy_bound, &y_buf);
 
         // 2. Commitments in the verifier's group.
-        const p_commit = nh.mul(powCt(nh, s, p), powCt(nh, t, mu));
-        const q_commit = nh.mul(powCt(nh, s, q), powCt(nh, t, nu));
-        const a = nh.mul(powCt(nh, s, alpha), powCt(nh, t, x));
-        const b = nh.mul(powCt(nh, s, beta), powCt(nh, t, y));
-        const t_commit = nh.mul(powCt(nh, q_commit, alpha), powCt(nh, t, r));
+        const p_commit = zkproofs.pedersenCt(nh, s, p, t, mu);
+        const q_commit = zkproofs.pedersenCt(nh, s, q, t, nu);
+        const a = zkproofs.pedersenCt(nh, s, alpha, t, x);
+        const b = zkproofs.pedersenCt(nh, s, beta, t, y);
+        const t_commit = zkproofs.pedersenCt(nh, q_commit, alpha, t, r);
 
         // 3. Challenge.
         const e = challenge(context, n0, aux, p_commit, q_commit, a, b, t_commit, stripLeadingZeros(sigma));
