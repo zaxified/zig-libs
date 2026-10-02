@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-01 · mutation 2026-10-01
+**Audit:** review 2026-10-02 (`ecdsa_keygen`; 2026-10-01 for the rest) · mutation 2026-10-02 (`ecdsa_keygen`, 5/5 killed; 2026-10-01 for the rest)
 
 **Known defects:** none recorded
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Pedersen/Gennaro DKG among many primitives; no longer maintained. |
 | Zig ecosystem (GitHub search "distributed key generation", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term and no echo-broadcast helper (the caller must supply reliable broadcast, as GJKR assumes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is still generated locally per party with no correctness proof exchanged inside the DKG; no persistence format for an in-flight run (a party that restarts mid-protocol starts over); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
+**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term and no echo-broadcast helper (the caller must supply reliable broadcast, as GJKR assumes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is generated per party, not jointly — but `EcdsaKeygen` (2026-10-02) exchanges it with its correctness proofs (Πmod, Πprm, Πfac) before the shares are dealt, as tss-lib v2+ and CGGMP21 do; the older `assembleKeyShares` path still attaches unproven material; no persistence format for an in-flight run (a party that restarts mid-protocol starts over); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
 
 ## Goal
 
@@ -201,6 +201,39 @@ leaves the party `.aborted`: a half-done round transition is never retried, so n
 queued twice. Deviation from Fig. 2: a dealer who is complained about defends *all* its
 complainants in one round.
 
+## Dealer-free ECDSA keygen (`ecdsa_keygen.zig`, 2026-10-02)
+
+`EcdsaKeygen` is one party of a full dealer-free `threshold_ecdsa` keygen,
+sans-I/O like `Participant`, which it wraps:
+
+```text
+start()    -> broadcast ecdsa_announcement (Paillier-Blum N_i, Ñ_i, Πprm+Πmod(Ñ_i), Πmod(N_i))
+.announce  -> advance(): verify every peer's (q⁷ floor, Γ = N+1, proofs), refuse a shared modulus,
+              send ecdsa_fac_proof Πfac(N_i) to each peer under that peer's Ñ
+.factors   -> advance(): verify every Πfac addressed to us; start GJKR
+.dkg       -> GJKR frames go to the inner Participant; advance() drives it
+.done      -> takeKeyShare(): a threshold_ecdsa.KeyShare (aux_info.assembleKeyShare)
+```
+
+The proofs live in `threshold_ecdsa` (`aux_proofs.Pimod.provePaillier`,
+`fac_proof`, `aux_info`); this file is protocol plumbing. Every proof is
+bound to `session id || u32-BE prover index`. The aux rounds need all `n`
+parties: a missing or failing announcement or Πfac aborts with `culprit()`
+naming the party; a duplicate modulus aborts without one (who copied whom is
+not visible in the bytes). The GJKR rounds keep their own rules. Why the
+proofs matter: without Πmod/Πfac a party that picks its own Paillier key can
+give it small factors and read an honest peer's share off the MtA responses
+(the BitForge class) — under `assembleKeyShares` the caller had to trust
+every peer's key.
+
+Tests (`ecdsa_keygen.zig`): 2-of-3 over frames → `KeyShare`s → every signer
+pair signs → `std` ECDSA verifies under the joint key; a tampered Πfac
+aborts the receiver with the prover named; an announcement replayed under
+another party's id is refused with that id named; a missing announcement
+names the absent party. The test material uses Blum (not safe) primes for
+`Ñ` so a run takes seconds, not minutes; the proofs and checks are the
+production ones.
+
 ## Resharing (`reshare.zig`)
 
 Proactive refresh and redistribution to a new committee `(n', t')`, group key unchanged.
@@ -334,6 +367,7 @@ here.
 - **Role-tagged sender for `ReshareReceiver`** (review 2026-10-01, F7): `handle` takes one `from` that is an OLD id for three kinds and a NEW id for `reshare_complaint`, and the kind octet comes from the frame. A transport that authenticates one id space for both committees would let new party `j` send a broadcast as old dealer `j` (its `B_0 = X_j` is public), win first-wins, and get the honest dealer excluded. Documented as the caller's routing contract today; a `from: struct { role, id }` would make it unforgeable. Effort: small.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
-- **Distributed aux-parameter generation with correctness proofs (Paillier + ring-Pedersen, `Πprm`/`Πmod` from `threshold_ecdsa.aux_proofs`)** (survey 2026-09-30): CGGMP keygen exchanges these inside the protocol; here each party generates them alone and `assembleKeyShares` attaches them without checking peers' proofs. Effort: medium (proofs exist in `threshold_ecdsa`). Fits §2.
+- ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).
+- **Context-bound Πprm/Πmod over Ñ** (2026-10-02): those proofs predate session binding, so a copied `Ñ` with its proofs verifies and only `findDuplicate` catches it. Binding them like Πmod(N) would make the duplicate check a second line instead of the only one. Effort: small (a `ModBinding`-style variant for Πprm).
 - **Resharing with aux refresh** (2026-09-30): a membership change needs new parties' Paillier/ring-Pedersen material; today it is attached by the caller.
 - **A FROST-flavoured DKG (Pedersen DKG with proof of knowledge, RFC 9591 ciphersuite)** (survey 2026-09-30): sibling `frost` has only a trusted dealer, and frost-core ships a DKG; the `commit.zig`/`core.zig` pieces are curve-generic in spirit but bound to secp256k1 `Element`/`Scalar` from `threshold_ecdsa`. Effort: medium; belongs with the `frost` module. Fits §2.

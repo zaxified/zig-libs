@@ -530,6 +530,36 @@ fn powCt(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
     unreachable;
 }
 
+/// `base^e mod m` with a SECRET exponent of any length over a PUBLIC modulus
+/// — `powCt` in chunks of the modulus' own limb width, so the montint slot
+/// stays the modulus' size however long `e` is (Πfac's masks reach ~4900
+/// bits; `powCt`'s slot ends at 4096). Chunks are taken from the most
+/// significant end; between two the accumulator is raised to `2^(8·chunk)`
+/// in two constant-time steps of `2^(4·chunk)`. Every length, chunk count
+/// and shift is a function of `e.len` and the modulus width only.
+///
+/// Use this, not `std.crypto.ff`'s `powWithEncodedExponent`, for a secret
+/// exponent: ctgrind measured (2026-10-02, `fac` target) that LLVM turns the
+/// latter's constant-time table select (`cmov(ct.eql(k, i))`) back into a
+/// conditional jump in ReleaseFast — the 4-bit windows of the exponent leak.
+pub fn powSecret(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
+    const chunk = 8 * ((m.bits() + 63) / 64);
+    if (e.len <= chunk) return powCt(m, base, e);
+    var shift: [mont_be_bytes / 2 + 1]u8 = undefined; // 2^(4·chunk): a 1, then chunk/2 zero bytes
+    std.debug.assert(chunk / 2 + 1 <= shift.len);
+    const half = shift[0 .. chunk / 2 + 1];
+    @memset(half, 0);
+    half[0] = 1;
+    const first = if (e.len % chunk == 0) chunk else e.len % chunk;
+    var acc = powCt(m, base, e[0..first]);
+    var off = first;
+    while (off < e.len) : (off += chunk) {
+        acc = powCt(m, powCt(m, acc, half), half);
+        acc = m.mul(acc, powCt(m, base, e[off..][0..chunk]));
+    }
+    return acc;
+}
+
 /// `base^e mod m` for PUBLIC exponents (verifier side: every exponent is a
 /// proof field or the Fiat-Shamir challenge, all public by definition). Left-
 /// to-right square-and-multiply over `e`'s actual bit length (variable-time is
@@ -811,6 +841,13 @@ pub const Transcript = struct {
         var g_buf: [paillier.modulus_sq_bytes]u8 = undefined;
         pk.gToBytes(&g_buf) catch unreachable; // fixed-width buffer, always sufficient
         self.appendBytes(&g_buf);
+    }
+
+    /// Appends caller bytes — a session id and prover index (`context`, as
+    /// `ecproofs` takes it), or a public integer that has no typed `append*`
+    /// here. Length-prefixed like every other field.
+    pub fn appendContext(self: *Transcript, bytes: []const u8) void {
+        self.appendBytes(bytes);
     }
 
     /// Appends a `Zq` scalar (32-byte big-endian).
@@ -3318,4 +3355,26 @@ test "PdlProof reject (SECURITY-CRITICAL): an out-of-range exponent (s1 > q³) f
     const proof: PdlProof = .{ .range = out.proof, .u_point = out.u_point.? };
     defer proof.deinit(allocator);
     try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, point, "c"));
+}
+
+test "powSecret: equals ff's public-exponent pow for exponents shorter than, equal to and longer than one chunk" {
+    var prng = std.Random.DefaultPrng.init(0x706f_7773);
+    const random = prng.random();
+    var nb: [root.aux_modulus_bytes]u8 = undefined;
+    random.bytes(&nb);
+    nb[0] |= 0x80;
+    nb[nb.len - 1] |= 1;
+    const m = try root.AuxModulus.fromBytes(&nb, .big);
+    var bb: [root.aux_modulus_bytes]u8 = undefined;
+    random.bytes(&bb);
+    bb[0] &= 0x3f;
+    const base = try root.AuxFe.fromBytes(m, &bb, .big);
+    var e: [700]u8 = undefined;
+    random.bytes(&e);
+    for ([_]usize{ 1, 31, 255, 256, 257, 300, 512, 513, 608, 700 }) |len| {
+        const want = try m.powWithEncodedPublicExponent(base, e[0..len], .big);
+        try testing.expect(auxFeEql(powSecret(m, base, e[0..len]), want));
+    }
+    // A zero exponent is 1 (ff's pow refuses it).
+    try testing.expect(auxFeEql(powSecret(m, base, &[_]u8{ 0, 0, 0 }), m.one()));
 }

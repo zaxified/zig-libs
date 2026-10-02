@@ -414,7 +414,7 @@ pub const ReshareReceiver = struct {
                 try self.expect(.defenses);
                 return self.onDefense(self.dealerPos(from) orelse return error.UnknownSender, from, body);
             },
-            .pedersen_broadcast, .share, .complaint, .defense, .feldman_broadcast, .feldman_complaint, .reveal => return error.UnknownKind,
+            .pedersen_broadcast, .share, .complaint, .defense, .feldman_broadcast, .feldman_complaint, .reveal, .ecdsa_announcement, .ecdsa_fac_proof => return error.UnknownKind,
         }
     }
 

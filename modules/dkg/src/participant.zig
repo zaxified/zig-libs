@@ -423,7 +423,7 @@ pub const Participant = struct {
                 try self.expect(.reveals);
                 return self.onReveal(from, body);
             },
-            .reshare_broadcast, .reshare_share, .reshare_complaint, .reshare_defense => return error.UnknownKind,
+            .reshare_broadcast, .reshare_share, .reshare_complaint, .reshare_defense, .ecdsa_announcement, .ecdsa_fac_proof => return error.UnknownKind,
         }
     }
 

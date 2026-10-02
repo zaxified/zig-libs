@@ -201,7 +201,9 @@ declare -A TARGETS=(
     # that before putting `--check` on a timer.
     # `betaprime` added 2026-09-15 (A1 threshold_ecdsa R1): since F5, Bob's MtA
     # blind β' is a 160-byte draw that `nonce` never tainted.
-    [threshold_ecdsa]="share nonce betaprime"
+    # `fac` added 2026-10-02 (dealer-free keygen): Πfac's prover over the
+    # Paillier factors p, q -- one proof, no protocol run, seconds.
+    [threshold_ecdsa]="share nonce betaprime fac"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm"
@@ -524,6 +526,7 @@ declare -A PATTERN=(
     [aesgcm/stateless]='root[.]zig'
     [aesgcm/generic]='root[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|ghash_polyval[.]zig|modes[.]zig|aes_gcm[.]zig|timing_safe[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/fac]='fac_proof[.]zig|root[.]zig|zkproofs[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -564,6 +567,7 @@ declare -A LABEL=(
     [threshold_ecdsa/share]='thr_ecdsa share x_i+paillier'
     [threshold_ecdsa/nonce]='thr_ecdsa nonce k_i/gamma+paillier'
     [threshold_ecdsa/betaprime]='thr_ecdsa MtA blind beta_prime (q^5)+paillier'
+    [threshold_ecdsa/fac]='thr_ecdsa Pi_fac prover, Paillier p,q'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'

@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **ADDITIVE:** the Paillier half of dealer-free keygen.
+  - `fac_proof` — Πfac (CGGMP21 Fig.28, "no small factor"), one proof per verifier under its
+    ring-Pedersen tuple; non-negative variant, `ℓ = 256`, `ε = 512`. A modulus `3·X` passes all
+    three equations and is refused by the range check alone (test).
+  - `aux_proofs.Pimod.provePaillier`/`verifyPaillier` — Πmod over a Paillier `N`, bound to the
+    caller's `session id || index` in a domain of its own; the aux-bound Πmod is unchanged.
+  - `root.generatePaillierBlum`, `paillierBlumFromPrimes`, `PaillierBlumKey`,
+    `paillierModulusAsAux` — Paillier-Blum keys that keep their factors for the proofs.
+  - `aux_info` — `LocalAux`, `Announcement` (codec), `verifyAnnouncement`, `verifyFactors`,
+    `findDuplicate`, `assembleKeyShare`. The protocol run is `dkg.EcdsaKeygen`.
+  - `zkproofs.Transcript.appendContext`, `zkproofs.powSecret`.
+  - ⛔ **Fixed: secret exponents through `std.crypto.ff`'s pow.** ctgrind (new target `fac`)
+    found its table select compiled to a branch in ReleaseFast; Πprm's commitments, Πmod's
+    `y^d` and `generateAuxParams`' `h1^λ` (all pre-existing) now go through `powSecret`
+    (montint) like Πfac. Πmod's 4th roots and the prime searches stay variable-time (backlog).
+
 - **2026-10-02** — **ADDITIVE:** `presign` — GG20 signing as one state machine per signer.
   `presign.Party.init(allocator, share, signers, sid)` then six `advance(inbox, random)` calls
   (byte messages in, `Outbox` of broadcast/p2p byte messages out) and `finish(inbox)` give a

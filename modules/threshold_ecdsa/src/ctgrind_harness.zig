@@ -328,15 +328,63 @@ fn runProtocol(allocator: std.mem.Allocator, shares: []const KeyShare, randoms: 
     return presigs[0].public.combine(.{ .bytes = message }, sig_shares[0..t], &abort);
 }
 
+// ── target "fac": taint the Paillier factors through Πfac's prover ───────
+//
+// Dealer-free keygen (2026-10-02): every party proves its Paillier `N` has
+// no small factor (`fac_proof.prove`), the one place outside `paillier`
+// where the factors `p`, `q` are arithmetic inputs. Real 2048-bit material:
+// tss-lib party 1's safe primes, party 2's ring-Pedersen tuple. Only `p`,
+// `q` are tainted (the masks stay real); `N` is computed before the taint,
+// as it is public. The printed `z1`/`z2`/`v` are the witness — public
+// responses into which `p`/`q` flow.
+
+fn unhexInto(buf: []u8, hex: []const u8) ![]u8 {
+    const len = (hex.len + 1) / 2;
+    const out = buf[0..len];
+    if (hex.len % 2 == 1) {
+        out[0] = try std.fmt.parseInt(u8, hex[0..1], 16);
+        _ = try std.fmt.hexToBytes(out[1..], hex[1..]);
+    } else {
+        _ = try std.fmt.hexToBytes(out, hex);
+    }
+    return out;
+}
+
+fn runFac(tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    const pp = vectors.tsslib_keygen.parties[0];
+    const vp = vectors.tsslib_keygen.parties[1];
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
+    _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
+    var key = try root.paillierBlumFromPrimes(&p, &q);
+    defer key.wipe();
+    const n0 = key.modulus();
+    var buf: [root.aux_modulus_bytes]u8 = undefined;
+    const nt = try root.AuxModulus.fromBytes(try unhexInto(&buf, vp.n_tilde), .big);
+    const h1 = try root.AuxFe.fromBytes(nt, try unhexInto(&buf, vp.h1), .big);
+    const h2 = try root.AuxFe.fromBytes(nt, try unhexInto(&buf, vp.h2), .big);
+
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(&p);
+        std.valgrind.memcheck.makeMemUndefined(&q);
+    }
+    var prng = std.Random.DefaultPrng.init(0x6661_6370_726f_7665); // "facprove"
+    const proof = try root.fac_proof.prove(n0, &p, &q, .{ .n_tilde = nt, .h1 = h1, .h2 = h2 }, "ctgrind", prng.random());
+    std.debug.print("z1={x} z2={x} v={x}\n", .{ proof.z1.bytes(), proof.z2.bytes(), proof.v.bytes() });
+}
+
 // ── the harness proper ────────────────────────────────────────────────────
 
-const Target = enum { share, nonce, betaprime };
+const Target = enum { share, nonce, betaprime, fac };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "share")) return .share;
     if (std.mem.eql(u8, s, "nonce")) return .nonce;
     if (std.mem.eql(u8, s, "betaprime")) return .betaprime;
+    if (std.mem.eql(u8, s, "fac")) return .fac;
     return error.UnknownTarget;
 }
 
@@ -368,6 +416,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var da: std.heap.DebugAllocator(.{}) = .init; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer _ = da.deinit();
     const allocator = da.allocator();
+
+    if (target == .fac) return runFac(tainted);
 
     // Fixture setup randomness is ALWAYS real — Phase 2a keygen is not
     // measured here (see buildFixture's doc comment).
@@ -420,5 +470,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printOutcome(result);
             std.debug.print("draws_160b={d}\n", .{draws});
         },
+        .fac => unreachable, // returned above
     }
 }

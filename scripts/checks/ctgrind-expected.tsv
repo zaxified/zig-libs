@@ -454,8 +454,8 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # (`presign.init`'s x_i·G, `γ_i·G`, `k_i·R`, `σ_i·R`); (d) the reductions
 # of the tainted draws themselves (`randomScalar`). No context has its first
 # in-module frame on a prover-side branch of `presign.zig` or `ecproofs.zig`.
-threshold_ecdsa	ReleaseFast	share	1	<=394	2fd1f4216680ed02	df18c96b59d38d0a
-threshold_ecdsa	ReleaseFast	nonce	1	<=669	2fd1f4216680ed02	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	share	1	<=394	32c67e0e09b2c9f9	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	nonce	1	<=669	32c67e0e09b2c9f9	df18c96b59d38d0a
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -486,7 +486,23 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=669	2fd1f4216680ed02	df18c96b59d38d0a
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=462	2fd1f4216680ed02	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	betaprime	1	<=462	32c67e0e09b2c9f9	df18c96b59d38d0a
+# threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
+# keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
+# powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
+# jne/je in ReleaseFast (6 contexts, objdump-confirmed) — fixed by routing every
+# secret exponent through zkproofs.powSecret (montint powMont): 0 contexts in
+# montint. The 17 in-file contexts left, classified (2026-10-02):
+#   3  ff Fe.fromBytes canonical check on a montint pow result — the result is
+#      always reduced, the branch always goes the same way
+#   9  ff montgomeryMul's final subtraction on s^p / s^q / Q^α products — the
+#      Montgomery extra-reduction bit, the same posture zkproofs already has
+#      (counted inside the share/nonce bounds); one-off at keygen
+#   2  secp256k1 Scalar.fromBytes48 on the challenge e (public)
+#   2  stripLeadingZeros on e and on the response v (public)
+#   1  fac_proof.zig `if (borrow != 0)` — the v < 0 redraw, probability < 2^-256
+# The masks are NOT tainted here (only p, q); 6 witness contexts print z1/z2/v.
+threshold_ecdsa	ReleaseFast	fac	1	<=17	7a153bb8c46709fb	b014d308e3ab9ce7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

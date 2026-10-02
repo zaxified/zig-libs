@@ -82,6 +82,10 @@ pub const pi_prm_iterations: usize = 80;
 pub const pi_mod_domain = "threshold_ecdsa/aux-proofs/pi-mod/v1";
 /// Domain-separation tag for Πprm's Fiat-Shamir seed.
 pub const pi_prm_domain = "threshold_ecdsa/aux-proofs/pi-prm/v1";
+/// Πmod over a party's PAILIER modulus (dealer-free keygen) — a domain of
+/// its own, so a proof about an aux `Ñ` can never pass as one about a
+/// Paillier `N` or the other way round.
+pub const pi_mod_paillier_domain = "threshold_ecdsa/aux-proofs/pi-mod-paillier/v1";
 
 // ── small shared helpers (mechanical byte-buffer plumbing only) ─────────
 //
@@ -330,12 +334,34 @@ fn expandChallenge(seed: [32]u8, index: u32, sub: u32, out: []u8) void {
 /// Binds the FULL `aux` tuple (`n_tilde`, `h1`, `h2`), not just `n_tilde`
 /// — a conservative superset of the paper's minimal binding, same
 /// "bind everything public" discipline `zkproofs.zig`'s transcripts use.
-fn deriveModSeed(aux: root.AuxParams, w: root.AuxFe) [32]u8 {
-    var t = zkproofs.Transcript.init(pi_mod_domain);
-    t.appendAuxParams(aux);
-    t.appendAuxFe(w);
-    return t.finalizeDigest();
+fn deriveModSeed(binding: ModBinding, w: root.AuxFe) [32]u8 {
+    switch (binding) {
+        .aux => |aux| {
+            var t = zkproofs.Transcript.init(pi_mod_domain);
+            t.appendAuxParams(aux);
+            t.appendAuxFe(w);
+            return t.finalizeDigest();
+        },
+        .paillier => |pb| {
+            var t = zkproofs.Transcript.init(pi_mod_paillier_domain);
+            t.appendContext(pb.context);
+            var n_buf: [root.aux_modulus_bytes]u8 = undefined;
+            pb.n.toBytes(&n_buf, .big) catch unreachable; // fixed-width buffer always sufficient
+            t.appendContext(&n_buf);
+            t.appendAuxFe(w);
+            return t.finalizeDigest();
+        },
+    }
 }
+
+/// What a Πmod transcript is bound to: an aux tuple (the original use, its
+/// seed unchanged), or a Paillier modulus plus the caller's `context`
+/// (`session id || prover index` in dealer-free keygen, so a proof can be
+/// neither replayed into another session nor claimed by another party).
+const ModBinding = union(enum) {
+    aux: root.AuxParams,
+    paillier: struct { n: root.AuxModulus, context: []const u8 },
+};
 
 /// Πmod's per-round challenge `y_i = FS(n_tilde, w, i) ∈ Z_n_tilde*`
 /// (CGGMP21 Fig.16 step 2). Deterministic rejection sampling via
@@ -807,7 +833,7 @@ pub const Piprm = struct {
                 ab[0] &= top_mask;
                 if (intCompare(ab[0..phi_len], phi_bytes) == .lt) break;
             }
-            commit.* = nt.powWithEncodedExponent(aux.h1, ab[0..phi_len], .big) catch nt.one(); // a_i = 0 -> s^0 = 1
+            commit.* = zkproofs.powSecret(nt, aux.h1, ab[0..phi_len]); // a_i = 0 -> s^0 = 1; ff's pow branches on secret windows
         }
 
         // 2. Fiat-Shamir bit-challenge — the REAL scaffold machinery above.
@@ -945,7 +971,33 @@ pub const Pimod = struct {
         trapdoor: root.AuxTrapdoor,
         random: std.Random,
     ) ProveError!ModProof {
-        const nt = aux.n_tilde;
+        return proveCore(allocator, aux.n_tilde, trapdoor.p, trapdoor.q, .{ .aux = aux }, random);
+    }
+
+    /// **Prover, Paillier modulus.** The same proof for a party's own
+    /// Paillier `N = p·q` (`p ≡ q ≡ 3 mod 4`, see `root.generatePaillierBlum`),
+    /// bound to `context`. Together with `fac_proof` it is what lets the
+    /// other parties trust an `N` they did not generate (CGGMP21 §4, Fig.16;
+    /// the BitForge class without it). `p`/`q` are big-endian, SECRET.
+    pub fn provePaillier(
+        allocator: std.mem.Allocator,
+        n: root.AuxModulus,
+        p: []const u8,
+        q: []const u8,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!ModProof {
+        return proveCore(allocator, n, p, q, .{ .paillier = .{ .n = n, .context = context } }, random);
+    }
+
+    fn proveCore(
+        allocator: std.mem.Allocator,
+        nt: root.AuxModulus,
+        p_secret: []const u8,
+        q_secret: []const u8,
+        binding: ModBinding,
+        random: std.Random,
+    ) ProveError!ModProof {
         const n_len = byteLen(nt.bits());
 
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
@@ -956,9 +1008,9 @@ pub const Pimod = struct {
         // Trapdoor factors — degenerate input is substituted fail-closed
         // (garbage proof a correct verifier rejects, never a panic/hang);
         // an aux/trapdoor mismatch is a caller bug per the contract.
-        var p = try bigFromBytes(allocator, stripLeadingZeros(trapdoor.p));
+        var p = try bigFromBytes(allocator, stripLeadingZeros(p_secret));
         defer p.deinit();
-        var q = try bigFromBytes(allocator, stripLeadingZeros(trapdoor.q));
+        var q = try bigFromBytes(allocator, stripLeadingZeros(q_secret));
         defer q.deinit();
         if (p.toConst().orderAgainstScalar(2) == .lt or p.bitCountAbs() > root.aux_modulus_bits) try p.set(3);
         if (q.toConst().orderAgainstScalar(2) == .lt or q.bitCountAbs() > root.aux_modulus_bits) try q.set(3);
@@ -1043,7 +1095,7 @@ pub const Pimod = struct {
         const jq_w = try jacobiBig(allocator, &w_big, &q);
 
         // 2. Fiat-Shamir challenges — the REAL scaffold machinery above.
-        const seed = deriveModSeed(aux, w_fe);
+        const seed = deriveModSeed(binding, w_fe);
         var entries: [pi_mod_iterations]ModEntry = undefined;
 
         // Loop temporaries for the CRT recombination.
@@ -1107,7 +1159,7 @@ pub const Pimod = struct {
             const x_fe = feFromBig(nt, &t);
 
             // 5. z_i = y_i^d (constant-time in the secret exponent d).
-            const z_fe = nt.powWithEncodedExponent(y, d_bytes, .big) catch nt.one();
+            const z_fe = zkproofs.powSecret(nt, y, d_bytes); // not ff's pow: it branches on secret windows
 
             slot.* = .{ .x = x_fe, .z = z_fe, .a = a_bit, .b = b_bit };
         }
@@ -1139,7 +1191,16 @@ pub const Pimod = struct {
     ///    non-Blum-integer n_tilde.)
     /// ```
     pub fn verify(aux: root.AuxParams, proof: ModProof) bool {
-        const nt = aux.n_tilde;
+        return verifyCore(aux.n_tilde, .{ .aux = aux }, proof);
+    }
+
+    /// **Verifier, Paillier modulus** — `provePaillier`'s counterpart.
+    /// `context` must be the prover's (`session id || prover index`).
+    pub fn verifyPaillier(n: root.AuxModulus, context: []const u8, proof: ModProof) bool {
+        return verifyCore(n, .{ .paillier = .{ .n = n, .context = context } }, proof);
+    }
+
+    fn verifyCore(nt: root.AuxModulus, binding: ModBinding, proof: ModProof) bool {
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
         nt.toBytes(&nt_buf, .big) catch return false;
         const n_bytes = stripLeadingZeros(&nt_buf);
@@ -1184,7 +1245,7 @@ pub const Pimod = struct {
 
         // 3+4. Recompute every y_i (the SAME derivation the prover used)
         //      and check BOTH per-round equations; reject on ANY failure.
-        const seed = deriveModSeed(aux, proof.w);
+        const seed = deriveModSeed(binding, proof.w);
         for (proof.entries, 0..) |e, idx| {
             const y = deriveModChallenge(nt, seed, @intCast(idx + 1));
 
@@ -1341,7 +1402,7 @@ test "deriveModChallenge: deterministic and canonical (< n_tilde), varies by ind
     const nt = toyModulus();
     const w = toyFe(nt, 5);
     const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 4), .h2 = toyFe(nt, 16) };
-    const seed = deriveModSeed(aux, w);
+    const seed = deriveModSeed(.{ .aux = aux }, w);
 
     const y1 = deriveModChallenge(nt, seed, 1);
     const y1_again = deriveModChallenge(nt, seed, 1);
@@ -1351,7 +1412,7 @@ test "deriveModChallenge: deterministic and canonical (< n_tilde), varies by ind
     try testing.expect(!y1.eql(y2));
 
     // Different seed (different w) -> different challenge at the same index.
-    const seed2 = deriveModSeed(aux, toyFe(nt, 25));
+    const seed2 = deriveModSeed(.{ .aux = aux }, toyFe(nt, 25));
     const y1_other_seed = deriveModChallenge(nt, seed2, 1);
     try testing.expect(!y1.eql(y1_other_seed));
 }
@@ -1726,7 +1787,7 @@ test "audit F4(b): Pimod.verify's Jacobi guard alone refuses a non-unit w that f
 
     for ([_]u8{ 0, 17 }) |w_val| {
         const w = toyFe(nt, w_val);
-        const seed = deriveModSeed(aux, w);
+        const seed = deriveModSeed(.{ .aux = aux }, w);
         var entries: [pi_mod_iterations]ModEntry = undefined;
         for (&entries, 0..) |*e, idx| {
             const y = toyInt(deriveModChallenge(nt, seed, @intCast(idx + 1)));
@@ -1789,4 +1850,66 @@ fn fuzzPrmProofFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
     const len: usize = smith.slice(&buf);
     _ = PrmProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch return;
+}
+
+// ── Πmod over a Paillier modulus (dealer-free keygen) ───────────────────
+
+const tss_vectors = @import("tsslib_vectors.zig");
+
+fn tssPaillier(party: usize, p: *[128]u8, q: *[128]u8) !root.AuxModulus {
+    const pp = tss_vectors.tsslib_keygen.parties[party];
+    _ = try std.fmt.hexToBytes(p, pp.paillier_p);
+    _ = try std.fmt.hexToBytes(q, pp.paillier_q);
+    const kp = try @import("paillier").fromPrimes(p, q);
+    return root.paillierModulusAsAux(kp.public) orelse error.TestUnexpectedResult;
+}
+
+test "Πmod/Paillier: tss-lib's 2048-bit N verifies, bound to its context and its own domain" {
+    var prng = std.Random.DefaultPrng.init(0x6d6f_6431);
+    const random = prng.random();
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    const n0 = try tssPaillier(0, &p, &q);
+    const ctx = "sid" ++ [_]u8{ 0, 0, 0, 1 };
+    const proof = try Pimod.provePaillier(testing.allocator, n0, &p, &q, ctx, random);
+    try testing.expect(Pimod.verifyPaillier(n0, ctx, proof));
+    try testing.expect(!Pimod.verifyPaillier(n0, "sid" ++ [_]u8{ 0, 0, 0, 2 }, proof));
+    // The same N as an aux modulus: a different transcript domain, so the
+    // proof does not carry over.
+    const as_aux: root.AuxParams = .{ .n_tilde = n0, .h1 = toyFe2048(n0, 4), .h2 = toyFe2048(n0, 9) };
+    try testing.expect(!Pimod.verify(as_aux, proof));
+    // Another party's N under this proof.
+    var p2: [128]u8 = undefined;
+    var q2: [128]u8 = undefined;
+    const n2 = try tssPaillier(1, &p2, &q2);
+    try testing.expect(!Pimod.verifyPaillier(n2, ctx, proof));
+}
+
+test "Πmod/Paillier: generatePaillierBlum keys are Blum and prove" {
+    var prng = std.Random.DefaultPrng.init(0x6d6f_6432);
+    const random = prng.random();
+    var key = try root.generatePaillierBlum(random, 512);
+    defer key.wipe();
+    try testing.expectEqual(@as(u8, 3), key.p()[key.p().len - 1] & 3);
+    try testing.expectEqual(@as(u8, 3), key.q()[key.q().len - 1] & 3);
+    const n = key.modulus();
+    try testing.expectEqual(@as(usize, 512), n.bits());
+    const proof = try Pimod.provePaillier(testing.allocator, n, key.p(), key.q(), "c", random);
+    try testing.expect(Pimod.verifyPaillier(n, "c", proof));
+
+    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 511));
+    try testing.expectError(error.InvalidBits, root.generatePaillierBlum(random, 256));
+}
+
+test "Πmod/Paillier TEETH: a modulus with a factor ≡ 1 (mod 4) is refused" {
+    // A two-prime N that is not Blum: p ≡ 3, q ≡ 1 (mod 4).
+    var prng = std.Random.DefaultPrng.init(0x6d6f_6433);
+    const random = prng.random();
+    // 1019 ≡ 3 (mod 4), 1033 ≡ 1 (mod 4): prime, so the prover's
+    // arithmetic is well-defined and only the Blum property is missing.
+    const p = [_]u8{ 0x03, 0xfb }; // 1019
+    const q = [_]u8{ 0x04, 0x09 }; // 1033
+    const n = try root.AuxModulus.fromBytes(&[_]u8{ 0x10, 0x0f, 0xd3 }, .big); // 1019 · 1033
+    const proof = try Pimod.provePaillier(testing.allocator, n, &p, &q, "c", random);
+    try testing.expect(!Pimod.verifyPaillier(n, "c", proof));
 }

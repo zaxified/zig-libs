@@ -33,6 +33,13 @@ pub const Kind = enum(u8) {
     reshare_share = 17,
     reshare_complaint = 18,
     reshare_defense = 19,
+    // dealer-free ECDSA keygen (`ecdsa_keygen.zig`) around the GJKR frames
+    /// A party's Paillier key, ring-Pedersen tuple and their generation
+    /// proofs (`threshold_ecdsa.aux_info.Announcement`). Broadcast.
+    ecdsa_announcement = 32,
+    /// Πfac for one peer (`threshold_ecdsa.fac_proof.FacProof`).
+    /// Point-to-point.
+    ecdsa_fac_proof = 33,
 };
 
 pub fn kindFromByte(b: u8) ?Kind {

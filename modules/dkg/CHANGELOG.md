@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **ADDITIVE:** `EcdsaKeygen` — dealer-free keygen for `threshold_ecdsa` as one
+  sans-I/O state machine per party: every party's Paillier key and ring-Pedersen tuple are
+  broadcast with Πprm/Πmod(Ñ) and Πmod(N), each peer gets Πfac(N) under its own tuple, then
+  GJKR runs and the result is a `threshold_ecdsa.KeyShare`. A failing or missing aux message
+  aborts with the party named. New frame kinds `ecdsa_announcement` (32), `ecdsa_fac_proof`
+  (33); `Participant`/`ReshareReceiver` refuse them as `UnknownKind`. End-to-end test: 2-of-3
+  over frames → every signer pair signs → `std` ECDSA verifies.
+
 - **2026-10-01** — ⚠ **Breaking: GJKR step 4 (public reconstruction) and an honest-majority
   check** (review of the 2026-09-30 per-participant layer). A QUAL dealer whose Feldman
   commitments failed a party's share used to make that party abort alone: a dealer bending its

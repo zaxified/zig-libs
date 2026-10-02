@@ -25,8 +25,11 @@
 //!
 //! `ReshareDealer` / `ReshareReceiver` move a finished key to a new committee
 //! (new `n'`, `t'`, or the same one for proactive refresh) keeping the public
-//! key. CGGMP21 signing-phase identifiable-abort and aux-parameter DKG are
-//! LATER increments (SPEC "Out of scope").
+//! key. `EcdsaKeygen` is the whole dealer-free `threshold_ecdsa` keygen: it
+//! wraps `Participant` with the rounds that exchange and prove every party's
+//! Paillier key and ring-Pedersen tuple (Πmod, Πprm, Πfac) and ends in a
+//! `threshold_ecdsa.KeyShare`. Jointly generated aux parameters remain out of
+//! scope (SPEC "Out of scope").
 //!
 //! **Status — COMPLETE.** The five irreducible GJKR functions in
 //! `core.zig` (`verifyPedersenShare`, `verifyFeldmanShare`, `computeQual`,
@@ -100,6 +103,13 @@ pub const deriveGroupPublicKey = core.deriveGroupPublicKey;
 pub const combineKeyShare = core.combineKeyShare;
 
 pub const checks = @import("checks.zig");
+
+/// Dealer-free keygen for `threshold_ecdsa`: GJKR plus every party's
+/// Paillier key and ring-Pedersen tuple, each proven (Πmod, Πprm, Πfac)
+/// before anyone runs MtA against it. Output: a `threshold_ecdsa.KeyShare`.
+pub const ecdsa_keygen = @import("ecdsa_keygen.zig");
+pub const EcdsaKeygen = ecdsa_keygen.EcdsaKeygen;
+pub const EcdsaKeygenPhase = ecdsa_keygen.Phase;
 
 const protocol = @import("protocol.zig");
 pub const Corruption = protocol.Corruption;
@@ -313,6 +323,7 @@ test {
     _ = types;
     _ = commit;
     _ = core;
+    _ = ecdsa_keygen;
     _ = checks;
     _ = protocol;
     _ = wire;

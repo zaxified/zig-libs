@@ -108,6 +108,17 @@ pub const ecproofs = @import("ecproofs.zig");
 /// see `aux_proofs.zig`'s module doc comment.
 pub const aux_proofs = @import("aux_proofs.zig");
 
+/// Πfac (CGGMP21 Fig.28): a party's Paillier `N` has no small factor —
+/// proven per verifier under the verifier's ring-Pedersen tuple. With
+/// `aux_proofs.Pimod.provePaillier` it is what dealer-free keygen needs
+/// before anyone runs MtA against a key it did not generate.
+pub const fac_proof = @import("fac_proof.zig");
+
+/// Dealer-free keygen, Paillier/ring-Pedersen half: per-party generation,
+/// the broadcast with its proofs, Πfac per peer, and `KeyShare` assembly
+/// from a DKG's output (the sibling `dkg` module runs the whole protocol).
+pub const aux_info = @import("aux_info.zig");
+
 /// Module-local feature gate — see `gate.zig`'s own doc comment.
 pub const gate = @import("gate.zig");
 
@@ -856,6 +867,144 @@ fn generateSafePrime(random: std.Random, prime_bits: usize, out: []u8) void {
     }
 }
 
+/// Search for a Blum prime `p ≡ 3 (mod 4)` of exactly `prime_bits` bits, top
+/// two bits set — the Paillier half of dealer-free keygen. Πmod needs both
+/// factors ≡ 3 (mod 4); a SAFE prime is not required there (CGGMP21 asks for
+/// a Paillier-Blum modulus), and a Blum prime is found as fast as any prime.
+/// Variable-time like every prime search; `out` is the caller's to zero.
+fn generateBlumPrime(random: std.Random, prime_bits: usize, out: []u8) void {
+    std.debug.assert(out.len == byteLen(prime_bits));
+    std.debug.assert(prime_bits >= 16);
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * out.len - prime_bits);
+    candidates: while (true) {
+        random.bytes(out);
+        out[0] &= top_mask;
+        setBitBe(out, prime_bits - 1);
+        setBitBe(out, prime_bits - 2);
+        out[out.len - 1] |= 0x03; // ≡ 3 (mod 4)
+        for (sieve_primes) |sp| {
+            if (bytesMod(out, sp) == 0) continue :candidates;
+        }
+        const m = AuxModulus.fromBytes(out, .big) catch continue :candidates;
+        if (isProbablePrime(m, random)) return;
+    }
+}
+
+/// Largest Paillier prime `generatePaillierBlum` produces (half of
+/// `aux_modulus_bits`, the widest modulus Πmod/Πfac take).
+pub const paillier_blum_prime_bytes = aux_modulus_bytes / 2;
+
+/// A party's own Paillier key for dealer-free keygen, WITH its factors: the
+/// prover of `aux_proofs.Pimod.provePaillier` and `fac_proof.prove` needs
+/// them, and nothing else does. `p`/`q` are SECRET — `wipe` when done.
+pub const PaillierBlumKey = struct {
+    key: paillier.KeyPair,
+    p_buf: [paillier_blum_prime_bytes]u8,
+    q_buf: [paillier_blum_prime_bytes]u8,
+    prime_len: usize,
+
+    pub fn p(self: *const PaillierBlumKey) []const u8 {
+        return self.p_buf[0..self.prime_len];
+    }
+
+    pub fn q(self: *const PaillierBlumKey) []const u8 {
+        return self.q_buf[0..self.prime_len];
+    }
+
+    /// `N` as the `AuxModulus` the proofs run over.
+    pub fn modulus(self: *const PaillierBlumKey) AuxModulus {
+        return paillierModulusAsAux(self.key.public) orelse unreachable; // bits <= aux_modulus_bits by construction
+    }
+
+    /// Zeroes the factors AND the Paillier secret key (λ, μ and the CRT
+    /// block are factorization-equivalent). The public key stays readable.
+    pub fn wipe(self: *PaillierBlumKey) void {
+        std.crypto.secureZero(u8, &self.p_buf);
+        std.crypto.secureZero(u8, &self.q_buf);
+        self.key.secret.deinit();
+    }
+};
+
+pub const GeneratePaillierBlumError = paillier.FromPrimesError || error{InvalidBits};
+
+/// Generate a Paillier key `N = p·q` of exactly `bits` bits with
+/// `p ≡ q ≡ 3 (mod 4)` (a Paillier-Blum modulus), keeping `p`, `q`. `bits`
+/// must be a multiple of 16 (whole-byte primes, so the closeness guard sees
+/// the real top 100 bits), at least `paillier.min_modulus_bits`, at most
+/// `aux_modulus_bits`; a real key is `paillier.modulus_bits` (2048). The two
+/// primes are refused when their top 100 bits coincide (Fermat closeness, as
+/// `paillier.generate` does). `random` MUST be a CSPRNG for real keys.
+pub fn generatePaillierBlum(random: std.Random, bits: usize) GeneratePaillierBlumError!PaillierBlumKey {
+    if (bits % 16 != 0 or bits < paillier.min_modulus_bits or bits > aux_modulus_bits) return error.InvalidBits;
+    const half = bits / 2;
+    var out: PaillierBlumKey = undefined;
+    out.prime_len = byteLen(half);
+    errdefer {
+        std.crypto.secureZero(u8, &out.p_buf);
+        std.crypto.secureZero(u8, &out.q_buf);
+    }
+    const p_bytes = out.p_buf[0..out.prime_len];
+    const q_bytes = out.q_buf[0..out.prime_len];
+    while (true) {
+        generateBlumPrime(random, half, p_bytes);
+        while (true) {
+            generateBlumPrime(random, half, q_bytes);
+            if (!topHundredBitsMatch(p_bytes, q_bytes)) break;
+        }
+        out.key = paillier.fromPrimes(p_bytes, q_bytes) catch |err| switch (err) {
+            error.InvalidPrimes => continue, // a Miller-Rabin false positive: search again
+            else => return err,
+        };
+        return out;
+    }
+}
+
+pub const PaillierBlumFromPrimesError = paillier.FromPrimesError || error{NotBlum};
+
+/// A `PaillierBlumKey` from factors the caller already has (precomputed
+/// primes, as tss-lib's "pre-params" are; or test vectors). Both must be
+/// ≡ 3 (mod 4) and at most `paillier_blum_prime_bytes` long;
+/// `paillier.fromPrimes` checks primality and closeness.
+pub fn paillierBlumFromPrimes(p_in: []const u8, q_in: []const u8) PaillierBlumFromPrimesError!PaillierBlumKey {
+    const p_bytes = stripLeadingZeros(p_in);
+    const q_bytes = stripLeadingZeros(q_in);
+    const len = @max(p_bytes.len, q_bytes.len);
+    if (p_bytes.len == 0 or q_bytes.len == 0 or len > paillier_blum_prime_bytes) return error.InvalidPrimes;
+    if (p_bytes[p_bytes.len - 1] & 3 != 3 or q_bytes[q_bytes.len - 1] & 3 != 3) return error.NotBlum;
+    var out: PaillierBlumKey = undefined;
+    out.prime_len = len;
+    errdefer {
+        std.crypto.secureZero(u8, &out.p_buf);
+        std.crypto.secureZero(u8, &out.q_buf);
+    }
+    @memset(&out.p_buf, 0);
+    @memset(&out.q_buf, 0);
+    @memcpy(out.p_buf[len - p_bytes.len .. len], p_bytes);
+    @memcpy(out.q_buf[len - q_bytes.len .. len], q_bytes);
+    out.key = try paillier.fromPrimes(p_bytes, q_bytes);
+    if (paillierModulusAsAux(out.key.public) == null) return error.InvalidPrimes;
+    return out;
+}
+
+/// FIPS 186-5 §A.1.3 closeness guard over the top 100 bits (same rule as
+/// `paillier.generate`; its helper is private there).
+fn topHundredBitsMatch(a: []const u8, b: []const u8) bool {
+    std.debug.assert(a.len == b.len and a.len >= 13);
+    if (!std.mem.eql(u8, a[0..12], b[0..12])) return false;
+    return (a[12] ^ b[12]) & 0xf0 == 0;
+}
+
+/// A Paillier `N` as an `AuxModulus` — the type Πmod/Πfac are written over.
+/// `null` when `N` is wider than `aux_modulus_bits` (no such key can be
+/// proven here) or not a valid modulus.
+pub fn paillierModulusAsAux(pk: paillier.PublicKey) ?AuxModulus {
+    var buf: [paillier.modulus_bytes]u8 = undefined;
+    const len = pk.nByteLen();
+    if (len > aux_modulus_bytes) return null;
+    pk.nToBytes(buf[0..len]) catch return null;
+    return AuxModulus.fromBytes(buf[0..len], .big) catch null;
+}
+
 /// Uniform nonzero `AuxFe` in [1, m) by rejection sampling (the base for
 /// deriving a quadratic residue h1 = r²). Not secret (h1/N_tilde are public).
 fn sampleNonzeroLtModulus(m: AuxModulus, random: std.Random) AuxFe {
@@ -983,8 +1132,13 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
         }
     };
 
-    // 5. h2 = h1^lambda mod N_tilde (constant-time modexp; lambda is secret).
-    const h2 = n_tilde.pow(h1, lambda_fe) catch unreachable; // lambda != 0
+    // 5. h2 = h1^lambda mod N_tilde (constant-time modexp; lambda is secret —
+    // montint via `zkproofs.powSecret`, not ff's pow, which branches on the
+    // exponent's windows once LLVM has optimised it).
+    var lam_bytes: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &lam_bytes);
+    lambda_fe.toBytes(&lam_bytes, .big) catch unreachable;
+    const h2 = zkproofs.powSecret(n_tilde, h1, &lam_bytes);
 
     return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe, .p = ret_p, .q = ret_q };
 }
@@ -2113,6 +2267,14 @@ test {
 // comment.
 test {
     _ = aux_proofs;
+}
+
+test {
+    _ = fac_proof;
+}
+
+test {
+    _ = aux_info;
 }
 
 test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde and h2 == h1^lambda" {
