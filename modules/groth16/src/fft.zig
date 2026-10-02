@@ -10,8 +10,8 @@
 //! Construction: the standard iterative in-place decimation-in-time
 //! Cooley-Tukey butterfly, with the twiddle factors taken as powers of the
 //! domain's primitive root of unity `ω` (forward) / `ω^{−1}` (inverse). No
-//! novel algorithm — this is the same NTT every SNARK toolchain (arkworks,
-//! gnark, snarkjs) runs.
+//! novel algorithm — this is the textbook radix-2 NTT (arkworks and gnark
+//! run the same one).
 
 const std = @import("std");
 const field = @import("field.zig");

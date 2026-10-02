@@ -110,8 +110,10 @@ Two paths, both live:
 
 ### 4a. What was learned about the formats, and how
 
-Black box only: snarkjs and circom are GPL-3.0, so their source was not read.
-Every layout fact in `snarkjs_bin.zig`/`zkey.zig`/`ptau.zig`/`circom.zig` came
+Black box only: snarkjs and circom are GPL-3.0, so their source was not read
+for any of this. (One earlier exception, the August 2026 JSON exporter, is
+recorded under § 5 — closed by a clean-room review on 2026-10-02.) Every
+layout fact in `snarkjs_bin.zig`/`zkey.zig`/`ptau.zig`/`circom.zig` came
 from comparing the bytes they write with the decimals their own `export json`
 prints, or from testing a hypothesis against the files. The non-obvious ones:
 
@@ -197,9 +199,11 @@ bytes, not another reading of the same in-repo types.
 
 Closed: `src/snarkjs_export.zig` renders this module's `Proof`/
 `VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses
-(reverse-engineered from `snarkjs@0.7.6`'s own bundled source, not guessed),
-and `src/snarkjs_kat_test.zig` freezes a run of the real, independently
--authored `snarkjs@0.7.6` (fetched via `bunx`, Apache-2.0, never vendored)
+(every rule now backed by a run — snarkjs's output files, its verdict on our
+proof, and `gen.sh json` for the identity points; see the provenance note
+below), and
+`src/snarkjs_kat_test.zig` freezes a run of the real, independently
+-authored `snarkjs@0.7.6` (GPL-3.0, black box, never vendored)
 accepting a proof from this module's own `setup`/`prove` — first try, no
 serialization deviation found — and rejecting a one-limb-tampered copy. See
 that file's module doc comment for the full transcript (including a Bun
@@ -210,6 +214,17 @@ the bookkeeping. What remains self-oracle, correctly: the QAP/R1CS layer —
 has no opinion on whether a proof corresponds to its circuit's intended
 semantics. That is a legitimate end state (no external vector exists for a
 custom circuit's intermediate polynomials), not remaining anchor debt.
+
+**Provenance (2026-10-02).** The exporter's August 2026 doc said its shape was
+read out of snarkjs's bundled source and called snarkjs Apache-2.0 — it is
+GPL-3.0, as is ffjavascript. Clean-room check: one isolated reviewer read the
+GPL source and this module and returned verdicts only (no code, no names);
+the module's code is behaviour-only or independent everywhere, with a few
+weak, format- or math-forced structural matches (zkey contribution field
+names that also appear in snarkjs's logs; the textbook accumulation order of
+the proof terms; two helper names, since renamed). The defect was the
+comments, which cited the reference's internals; they are rewritten, and each
+JSON rule is now established by running the tools (`tools/snarkjs/gen.sh`).
 
 ## 5b. Threat model
 
@@ -360,4 +375,4 @@ from a header count. Second run: 160 000 inputs clean in 74 s.
 - **Positional file source** (A8): readers take bytes in memory; a 2²⁸ ceremony file is ~150 GB. A `readAt` source over `std.Io.File` reading only the levels a circuit needs.
 - **Phase-1 (`.ptau`) contribution and verification**: reading only today.
 - **Circuit-building API (constraint-synthesis trait or gadget helpers)** (survey 2026-09-30): arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
-- **Provenance check of `snarkjs_export.zig`** (A8, 2026-10-02): its module doc says the JSON shape was "reverse-engineered from snarkjs@0.7.6's bundled source" — reading GPL source, against the clean-room rule. The shape itself is trivial (decimal strings, `[x, y, "1"]`); an isolated reviewer should say whether anything beyond it was taken, and the doc should be corrected.
+- **Domain-size boundary fixture** (provenance review 2026-10-02): `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (phase2.zig:74-78) is learnable black-box but no committed fixture pins it; a circom circuit landing on the boundary, run through `gen.sh`, would.

@@ -6,43 +6,35 @@
 //! decoder reading the SAME implementation's own encoder — it cannot see a
 //! serialization convention (coordinate order, endianness, compression flag)
 //! that both sides agreed on wrongly. This file renders our `bn254`-typed
-//! `Proof`/`VerifyingKey`/public-input values into the exact JSON shape
-//! `snarkjs groth16 verify` parses, so an independent, foreign
-//! implementation (iden3's `snarkjs`, Apache-2.0, run via `bunx`, never
-//! vendored) can sit in judgment of our encoding. See `snarkjs_kat_test.zig`
-//! for the frozen run and its verdict.
+//! `Proof`/`VerifyingKey`/public-input values into the JSON files
+//! `snarkjs groth16 verify` reads, so an independent, foreign implementation
+//! (iden3's `snarkjs`, GPL-3.0, run as a black box by `tools/snarkjs/gen.sh`,
+//! never vendored, its source not read) can sit in judgment of our encoding.
+//! See `snarkjs_kat_test.zig` for the frozen run and its verdict.
 //!
-//! ## The JSON shape (reverse-engineered from `snarkjs@0.7.6`'s bundled
-//! `build/snarkjs.js`, the actual installed code, not guessed from docs)
+//! ## The JSON shape, and where each part of it was observed
 //!
-//! `groth16Verify` (around its `IC0 = curve.G1.fromObject(...)` calls) reads
-//! `vk_alpha_1`/`vk_beta_2`/`vk_gamma_2`/`vk_delta_2`/`IC` from the
-//! verification key and `pi_a`/`pi_b`/`pi_c` from the proof, each field
-//! parsed by `ffjavascript`'s `WasmCurve.fromObject`/`WasmField2.fromObject`/
-//! `WasmField1.fromObject`:
-//!   - A field element (`Fp`/`Fr`) is a JSON STRING of decimal digits
-//!     (`WasmField1.toObject`/`fromObject`, no `0x`, no sign for our
-//!     always-canonical-reduced values).
-//!   - A `G1` point is a 3-element array `[x, y, z]`; `z` defaults to `"1"`
-//!     for affine points (`WasmCurve.fromObject`, `a.length==3` branch else
-//!     `z = F.one`) and `["0","1","0"]` encodes the point at infinity
-//!     (`WasmCurve.toObject`'s `isZero` branch).
-//!   - A `G2` point is `[[x.c0,x.c1], [y.c0,y.c1], ["1","0"]]` — each `Fp2`
-//!     coordinate is a 2-element `[c0, c1]` array in MATH order (real part
-//!     first: `WasmField2.toObject`/`fromObject` reads/writes index 0 then
-//!     index 1 with NO swap). This is the SAME `(c0, c1)` order the sibling
-//!     `bn254/src/groth16.zig` KAT doc comment already documents for its own
-//!     Dark Forest vectors ("MATH order... the opposite of `g2.zig`'s EIP-197
-//!     byte-codec order") — confirmed here independently by reading
-//!     snarkjs's own source rather than assumed to match.
-//!   - `verification_key.json` additionally carries `"protocol":"groth16"`,
-//!     `"curve":"bn128"` (accepted aliases: `"bn128"`/`"bn254"`/`"altbn128"`,
-//!     case/separator-insensitive — `getCurveFromName`'s `normalizeName`),
-//!     `"nPublic": <public input count>`. `proof.json` carries the same
-//!     `protocol`/`curve` pair (unused by `groth16Verify` itself but part of
-//!     `snarkjs`'s own export shape).
-//!   - `public.json` is a bare JSON array of decimal-digit-string public
-//!     inputs, no wrapper object.
+//! Every rule below comes from RUNNING snarkjs@0.7.6 / ffjavascript@0.3.1
+//! (both GPL-3.0), never from their source:
+//!   - The files snarkjs itself writes (`gen.sh fixtures`: `zkey export
+//!     verificationkey`, `groth16 prove`) show the field names, the
+//!     `"protocol":"groth16"`/`"curve":"bn128"` pair, `"nPublic"`, a field
+//!     element as a JSON string of decimal digits (no `0x`, no sign), a finite
+//!     `G1` point as `[x, y, "1"]`, a finite `G2` point as
+//!     `[[x.a, x.b], [y.a, y.b], ["1","0"]]`, and `public.json` as a bare
+//!     array of decimal strings.
+//!   - Which `Fp2` half is `a`: the verdict on OUR proof (`gen.sh ours`, frozen
+//!     in `snarkjs_kat_test.zig`) — written in MATH order (`c0` = real part
+//!     first), it verifies (a swapped pair is a different, generally
+//!     off-curve point, so acceptance pins the order); `pi_a.x + 1` is
+//!     refused, so the verdict has teeth. This is
+//!     the same `(c0, c1)` order the sibling `bn254/src/groth16.zig` KAT doc
+//!     comment documents for its Dark Forest vectors ("MATH order... the
+//!     opposite of `g2.zig`'s EIP-197 byte-codec order").
+//!   - The identity elements, which no output file in the recipe carries:
+//!     `gen.sh json` asks ffjavascript's public curve API to serialize its own
+//!     zeros — `G1` → `["0","1","0"]`, `G2` → `[["0","0"],["1","0"],["0","0"]]`
+//!     — and to parse ours back, which it reads as zero.
 //!
 //! Field-element decimal conversion (`decimalBytes` below) is schoolbook
 //! base-256→base-10 long division over the type's existing big-endian

@@ -12,6 +12,7 @@
 #     tools/snarkjs/gen.sh fixtures   # regenerate src/testdata/snarkjs (small circuit)
 #     tools/snarkjs/gen.sh ours       # snarkjs judges OUR proof (ours_proof.json)
 #     tools/snarkjs/gen.sh big        # 10 000-constraint circuit, both directions
+#     tools/snarkjs/gen.sh json       # how ffjavascript itself writes/reads JSON points
 #
 # Work happens in <repo>/.zig-cache/g16 (droppable). Node is fetched there
 # because snarkjs's worker pool crashes under Bun 1.3 (SIGILL), and setting
@@ -24,6 +25,9 @@
 # What the runs of 2026-10-02 printed:
 #   fixtures: groth16 verify -> OK!; zkey verify t.r1cs pot.ptau t1.zkey -> ZKey Ok!
 #   ours:     our proof -> OK!; pi_a.x + 1 -> "Proof commitments are not valid."
+#   json:     G1 zero -> ["0","1","0"]; G2 zero -> [["0","0"],["1","0"],["0","0"]];
+#             G1 generator -> ["1","2","1"]; both our identity encodings parse
+#             back as zero (pins in snarkjs_export.zig).
 #   big:      our proof on snarkjs's key -> OK!; newzkey vs groth16 setup ->
 #             64 differing bytes of 5 130 900 (the circuit hash, section 10);
 #             our verify on b0/b1 -> ok; our contribution -> our verify ok, our
@@ -95,6 +99,22 @@ ours)
          require("fs").writeFileSync("ours_bad.json", JSON.stringify(d))' "$td/ours_proof.json"
   $S groth16 verify "$td/vk.json" "$td/public.json" ours_bad.json 2>&1 | last || true
   ;;
+json)
+  # The JSON point shape snarkjs_export.zig writes, asked of the library's
+  # public curve API (run, not read): identity elements are the one case no
+  # snarkjs output file in this recipe ever carries.
+  $N -e '
+    const S = (o) => JSON.stringify(o, (k, v) => typeof v === "bigint" ? v.toString() : v);
+    require("ffjavascript").buildBn128(true).then(async (c) => {
+      console.log("G1 zero ->", S(c.G1.toObject(c.G1.zero)));
+      console.log("G2 zero ->", S(c.G2.toObject(c.G2.zero)));
+      console.log("G1 generator ->", S(c.G1.toObject(c.G1.toAffine(c.G1.g))));
+      console.log("our G1 identity parses as zero:", c.G1.isZero(c.G1.fromObject(["0", "1", "0"])));
+      console.log("our G2 identity parses as zero:",
+        c.G2.isZero(c.G2.fromObject([["0", "0"], ["1", "0"], ["0", "0"]])));
+      await c.terminate();
+    });'
+  ;;
 big)
   build_g16
   mkdir -p big && cd big
@@ -131,7 +151,7 @@ big)
   $S zkey verify big.r1cs pot.ptau o2.zkey 2>&1 | last || true
   ;;
 *)
-  sed -n '3,14p' "$0"
+  sed -n '3,15p' "$here/$(basename "$0")"
   exit 2
   ;;
 esac

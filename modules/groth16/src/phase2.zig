@@ -39,7 +39,7 @@
 //! `[x]₂` for `x = known/δ_before`, i.e. `[1/δ_before]₂`, which no record
 //! reveals — so a ceremony with one honest contributor still ends at a δ
 //! nobody knows. A real proof of knowledge needs a `g2_sp` of unknown
-//! discrete log (hash-to-G2, as snarkjs does) — SPEC.md backlog.
+//! discrete log (hash-to-G2) — SPEC.md backlog.
 
 const std = @import("std");
 const bn254 = @import("bn254");
@@ -352,14 +352,14 @@ fn g2Sp(transcript: [64]u8) G2.Affine {
 }
 
 /// `e(a1, b2) == e(a2, b1)`: the G1 pair and the G2 pair have the same ratio.
-fn sameRatio(a1: G1.Affine, a2: G1.Affine, b1: G2.Affine, b2: G2.Affine) bool {
+fn ratioMatches(a1: G1.Affine, a2: G1.Affine, b1: G2.Affine, b2: G2.Affine) bool {
     const neg_a2 = G1.Jacobian.fromAffine(a2).negate().toAffine();
     return bn254.pairing.pairingCheck(&.{ .{ .p = a1, .q = b2 }, .{ .p = neg_a2, .q = b1 } });
 }
 
 /// Checks the proof of knowledge of contribution `k` of `z` — one made by
-/// `contribute`. A snarkjs record (whose `g2_sp` is a hash-to-curve point
-/// this module does not reproduce) fails here; `verify` does not need it.
+/// `contribute`. A snarkjs record fails here (its `g2_sp` is not derived
+/// the way `g2Sp` derives ours); `verify` does not need it.
 pub fn verifyContribution(z: ZKey, k: usize) bool {
     if (k >= z.contributions.len) return false;
     const rec = z.contributions[k];
@@ -368,8 +368,8 @@ pub fn verifyContribution(z: ZKey, k: usize) bool {
     if (!std.mem.eql(u8, &transcriptOf(prev, delta_before, rec), &rec.transcript)) return false;
     if (rec.g1_s.infinity or rec.delta_after.infinity) return false;
     const sp = g2Sp(rec.transcript);
-    return sameRatio(rec.g1_s, rec.g1_sx, sp, rec.g2_spx) and
-        sameRatio(delta_before, rec.delta_after, sp, rec.g2_spx);
+    return ratioMatches(rec.g1_s, rec.g1_sx, sp, rec.g2_spx) and
+        ratioMatches(delta_before, rec.delta_after, sp, rec.g2_spx);
 }
 
 // ── verification ────────────────────────────────────────────────────────────
@@ -415,7 +415,7 @@ pub fn verify(allocator: Allocator, io: std.Io, r: circom.R1cs, p: Ptau, z: ZKey
 
     if (z.delta_g1.infinity or z.delta_g2.infinity) return .bad_delta;
     if (!G2.Jacobian.fromAffine(z.delta_g2).subgroupCheck()) return .bad_delta;
-    if (!sameRatio(G1.Affine.generator, z.delta_g1, G2.Affine.generator, z.delta_g2)) return .bad_delta;
+    if (!ratioMatches(G1.Affine.generator, z.delta_g1, G2.Affine.generator, z.delta_g2)) return .bad_delta;
 
     // Σ ρᵢ·(C ‖ H)ᵢ · δ == Σ ρᵢ·(C⁰ ‖ H⁰)ᵢ.
     const total = z.c.len + z.h.len;
@@ -425,7 +425,7 @@ pub fn verify(allocator: Allocator, io: std.Io, r: circom.R1cs, p: Ptau, z: ZKey
     const lhs = (try msm.pippengerG1(allocator, z.c, rho[0..z.c.len])).add(try msm.pippengerG1(allocator, z.h, rho[z.c.len..]));
     const rhs = (try msm.pippengerG1(allocator, fresh.c, rho[0..z.c.len])).add(try msm.pippengerG1(allocator, fresh.h, rho[z.c.len..]));
     // e(Σρ·X, δ₂) == e(Σρ·X⁰, [1]₂).
-    if (!sameRatio(lhs.toAffine(), rhs.toAffine(), G2.Affine.generator, z.delta_g2)) return .not_divided_by_delta;
+    if (!ratioMatches(lhs.toAffine(), rhs.toAffine(), G2.Affine.generator, z.delta_g2)) return .not_divided_by_delta;
     if (z.contributions.len == 0) {
         if (!eqG1(z.delta_g1, G1.Affine.generator)) return .chain_mismatch;
     } else if (!eqG1(z.contributions[z.contributions.len - 1].delta_after, z.delta_g1)) return .chain_mismatch;
@@ -467,6 +467,6 @@ test "verifyContribution: a δ that the proof of knowledge does not account for"
     rec.transcript = transcriptOf(z.circuit_hash, G1.Affine.generator, rec.*);
     rec.g2_spx = G2.Jacobian.fromAffine(g2Sp(rec.transcript)).scalarMul(x).toAffine();
     // The first check (g1_s, g1_sx) still holds — the forgery is consistent there.
-    try testing.expect(sameRatio(rec.g1_s, rec.g1_sx, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(ratioMatches(rec.g1_s, rec.g1_sx, g2Sp(rec.transcript), rec.g2_spx));
     try testing.expect(!verifyContribution(z, 0));
 }

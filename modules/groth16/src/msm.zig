@@ -42,7 +42,7 @@ pub fn msmG2(bases: []const G2.Affine, scalars: []const Fr) G2.Jacobian {
 //
 // ⚠ VARIABLE-TIME in the scalars: which bucket a base lands in, and whether a
 // bucket is still empty, depend on the scalar bits. Every Groth16 prover in
-// the survey (snarkjs, rapidsnark, arkworks, gnark) makes the same trade,
+// the survey whose source we could read (arkworks, gnark) makes this trade,
 // because the constant-time alternative costs an order of magnitude; the
 // scalars here are the WITNESS, so a co-resident attacker who can time or
 // cache-probe the prover learns about it. SPEC.md § 5b item 4. The naive

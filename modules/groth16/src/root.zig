@@ -33,9 +33,9 @@
 //! `gate.zig` and `SPEC.md`'s tier call.
 //!
 //! **The snarkjs ecosystem** (2026-10-02): `zkey`, `circom` (`.r1cs`, `.wtns`)
-//! and `ptau` read the real files; `zkprove.prove` proves from a `.zkey` the
-//! way `snarkjs groth16 prove` does (Pippenger MSM, quotient on a coset);
-//! `phase2` is the circuit-specific ceremony — `newZkey`, `contribute`,
+//! and `ptau` read the real files; `zkprove.prove` proves from a `.zkey`
+//! (Pippenger MSM, quotient on a coset — the form the key's H section was
+//! measured to take); `phase2` is the circuit-specific ceremony — `newZkey`, `contribute`,
 //! `verify` — that replaces `setup`'s plaintext toxic waste. snarkjs accepts
 //! the proofs, and proves with the keys; see `SPEC.md` § 4 for where
 //! compatibility stops.
@@ -57,7 +57,7 @@ pub const meta = .{
     .platform = .any, // pure computation — no I/O, threads, or libc
     .role = .util,
     .concurrency = .reentrant, // value types + caller-supplied buffers, no shared state
-    .model_after = "Groth16 (Groth 2016, 'On the Size of Pairing-based Non-interactive Arguments'); prover mirrors snarkjs/arkworks-groth16 over BN254, anchored by the sibling bn254 module's verifier",
+    .model_after = "Groth16 (Groth 2016, 'On the Size of Pairing-based Non-interactive Arguments'); prover follows the paper over BN254 (arkworks-groth16 compared; snarkjs as a black-box oracle), anchored by the sibling bn254 module's verifier",
     .deps = .{"bn254"}, // Fr / G1 / G2 / pairing / Groth16 verifier
 };
 

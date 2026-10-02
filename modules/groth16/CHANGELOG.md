@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — Provenance check (clean room). `snarkjs_export.zig`'s doc said
+  its JSON shape was read out of snarkjs's bundled source and called snarkjs
+  Apache-2.0; snarkjs and ffjavascript are GPL-3.0. An isolated reviewer read
+  the GPL source and the module and returned verdicts only: the code is
+  behaviour-only or independent everywhere (a few weak, format-forced
+  structural matches); the defect was the comments. Every rule of the JSON
+  shape is now backed by a run — snarkjs's own output files, its verdict on our
+  proof, and the new `tools/snarkjs/gen.sh json` (ffjavascript serialising its
+  own identity points); the comments citing internals are rewritten, two
+  helper names that coincided with the reference's renamed (`ratioMatches`,
+  `b_in_g1`), and the derived-never-observed `.ptau` power-28 branch marked as
+  such. No behaviour change.
+
 - **2026-10-02** — A8: the snarkjs ecosystem, both directions.
   - **New:** `zkey` (snarkjs `.zkey` reader/writer, round-trips snarkjs's files
     byte for byte), `circom` (`.r1cs`, `.wtns` reader/writer), `ptau`

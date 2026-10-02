@@ -8,10 +8,10 @@
 //! genuinely FOREIGN verifier rejected the bytes. This file freezes the one
 //! artifact that closes that gap: our own proof, exported through
 //! `snarkjs_export.zig`'s JSON encoder, judged by `snarkjs@0.7.6`
-//! (iden3, Apache-2.0) — fetched via `bunx`, run OUTSIDE this test suite,
-//! never vendored, never invoked from `zig build test` (no network/process
-//! spawn happens below — this file only asserts against the frozen
-//! transcript).
+//! (iden3, GPL-3.0, black box — its source not read) — run OUTSIDE this
+//! test suite, never vendored, never invoked from `zig build test` (no
+//! network/process spawn happens below — this file only asserts against the
+//! frozen transcript).
 //!
 //! ## The fixture: reproducible, not hand-transcribed
 //!
@@ -41,24 +41,21 @@
 //! $ bunx snarkjs groth16 verify verification_key.json public.json proof.json
 //! ```
 //! Crashed before ever reading the files — a Bun-RUNTIME bug, unrelated to
-//! our data: `ffjavascript`'s WASM curve builder spawns a `Worker` thread
-//! pool by default, and Bun's `web-worker` npm package shim for
-//! `worker_threads` throws inside the worker thread —
+//! our data: the stack trace ends inside a worker thread, in Bun's
+//! `web-worker` npm package shim for `worker_threads` —
 //! `TypeError: Argument 1 ('event') to EventTarget.dispatchEvent must be an
 //! instance of Event` — taking the process down with `SIGILL` (exit 132).
 //! Confirmed environment-specific (reproduces for ANY input, before JSON
 //! parsing even starts), not a rejection of our proof.
 //!
 //! **Final — the SAME unmodified `snarkjs@0.7.6` `groth16.verify`
-//! function**, invoked directly (bypassing only the CLI's process entry
-//! point, not one line of its verification logic) with the library's own
-//! documented single-thread fallback forced on — `ffjavascript`'s
-//! `buildThreadManager` source: `if (process.browser && !globalThis.Worker)
-//! singleThread = true;` — via `process.browser = true; delete
-//! globalThis.Worker;` before `require("snarkjs")`, the same technique real
-//! snarkjs deployments use to run inside browsers/bundlers with no thread
-//! pool (NOT a change to snarkjs's own code, just an environment condition
-//! its own source already branches on):
+//! function**, called through the library's public API (bypassing only the
+//! CLI's process entry point, not one line of its verification logic) in a
+//! browser-like environment (`process.browser = true`, no `Worker`), where it
+//! runs without a thread pool — no change to snarkjs's own code. (The same
+//! kind of verdict, on a proof of ours for the circom fixture circuit, is
+//! re-run by `tools/snarkjs/gen.sh ours` under Node 22 through the plain
+//! CLI; the Bun crash does not occur there.)
 //! ```
 //! $ bun run run_verify.js
 //! # run_verify.js:
@@ -77,10 +74,9 @@
 //! **snarkjs accepted our proof on the FIRST correctly-invoked try** — no
 //! serialization deviation found. The exporter's conventions (decimal-string
 //! field elements; `G1` as `[x,y,"1"]`; `G2` as
-//! `[[x.c0,x.c1],[y.c0,y.c1],["1","0"]]`, `(c0,c1)` MATH order — reverse-
-//! engineered from `snarkjs@0.7.6`'s own bundled source, see
-//! `snarkjs_export.zig`'s module doc comment) matched snarkjs's parser
-//! exactly.
+//! `[[x.c0,x.c1],[y.c0,y.c1],["1","0"]]`, `(c0,c1)` MATH order — observed in
+//! the files snarkjs writes, see `snarkjs_export.zig`'s module doc comment)
+//! matched snarkjs's parser exactly.
 //!
 //! **Tamper check — the converse, proving the oracle has teeth:** `pi_a`'s
 //! x-coordinate incremented by one decimal
@@ -92,8 +88,8 @@
 //! $ echo $?
 //! 1
 //! ```
-//! Rejected, as required (`isWellConstructed`'s on-curve check catches it
-//! before the pairing equation is even evaluated).
+//! Rejected, as required (the moved x-coordinate puts `pi_a` off the
+//! curve).
 //!
 //! No `.zkey`/`.wtns` file was read or produced. `curve`/`protocol` field
 //! NAMES are snarkjs's own schema vocabulary (not copyrightable expression —

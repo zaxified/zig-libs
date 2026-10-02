@@ -110,14 +110,14 @@ pub fn prove(allocator: Allocator, z: ZKey, witness: []const Fr, rand: prover.Ra
     pi_b = pi_b.add(try msm.pippengerG2(allocator, z.b_g2, witness));
     pi_b = pi_b.add(G2.Jacobian.fromAffine(z.delta_g2).scalarMul(s));
 
-    var pi_b1 = G1.Jacobian.fromAffine(z.beta_g1);
-    pi_b1 = pi_b1.add(try msm.pippengerG1(allocator, z.b_g1, witness));
-    pi_b1 = pi_b1.add(delta1.scalarMul(s));
+    var b_in_g1 = G1.Jacobian.fromAffine(z.beta_g1);
+    b_in_g1 = b_in_g1.add(try msm.pippengerG1(allocator, z.b_g1, witness));
+    b_in_g1 = b_in_g1.add(delta1.scalarMul(s));
 
     var pi_c = try msm.pippengerG1(allocator, z.c, witness[z.n_public + 1 ..]);
     pi_c = pi_c.add(try msm.pippengerG1(allocator, z.h, h));
     pi_c = pi_c.add(pi_a.scalarMul(s));
-    pi_c = pi_c.add(pi_b1.scalarMul(r));
+    pi_c = pi_c.add(b_in_g1.scalarMul(r));
     pi_c = pi_c.add(delta1.scalarMul(r.mul(s)).negate());
 
     return .{ .a = pi_a.toAffine(), .b = pi_b.toAffine(), .c = pi_c.toAffine() };

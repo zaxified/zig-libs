@@ -61,7 +61,10 @@ pub const Ptau = struct {
             .{ .ty = 5, .len = try bin.byteLen(n, bin.g1_bytes), .required = true },
             .{ .ty = 6, .len = bin.g2_bytes, .required = true },
             // Section 12 carries one level more (2^{p+1}) — except at p = 28,
-            // where Fr has no 2^29-th root of unity; checked below.
+            // where Fr has no 2^29-th root of unity; checked below. ⚠ The
+            // p = 28 branch is DERIVED from Fr's 2-adicity, never observed:
+            // no recipe run produces such a file. A real one laid out
+            // differently is refused (BadSectionSize), never misread.
             .{ .ty = 12, .len = 0, .required = false },
             .{ .ty = 13, .len = try bin.byteLen(2 * n - 1, bin.g2_bytes), .required = false },
             .{ .ty = 14, .len = try bin.byteLen(2 * n - 1, bin.g1_bytes), .required = false },
