@@ -70,9 +70,16 @@ pub const Fp2 = struct {
         return out;
     }
 
-    /// REAL: component-wise `Fp.isZero`.
+    /// REAL: zero iff both components are.
+    /// One accumulator over both components: `c0.isZero() and
+    /// c1.isZero()` short-circuits, a branch on `c0` — measured 2026-10-02
+    /// (ctgrind) inside `G2.Jacobian.add`'s identity checks on the ladder's
+    /// secret-derived accumulator.
     pub fn isZero(self: Fp2) bool {
-        return self.c0.isZero() and self.c1.isZero();
+        var acc: u64 = 0;
+        for (self.c0.limbs) |w| acc |= w;
+        for (self.c1.limbs) |w| acc |= w;
+        return acc == 0;
     }
 
     /// REAL: component-wise `Fp.eql`.

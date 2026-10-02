@@ -526,8 +526,8 @@ way to recognise it.
 | [`bitcoinscript`](modules/bitcoinscript/README.md) | 2 | Bitcoin Script consensus interpreter — full opcode set, CHECKSIG/CHECKMULTISIG; verifies bare/P2SH/segwit/P2TR key-path scripts. | any | bitcointx, k256, bip340, ripemd160 |
 | [`bitcointx`](modules/bitcointx/README.md) | 2 | Bitcoin transaction (de)serialization + signature hashing — legacy, BIP143 segwit-v0, and BIP341 taproot key-path sighash. | any | bip340 |
 | [`blindrsa`](modules/blindrsa/README.md) | 1 | RSA Blind Signatures (RFC 9474, RSABSSA) over `rsa` — the anonymous-token / Privacy Pass primitive: blind, sign, finalize, verify. | any | rsa |
-| [`bls12_381`](modules/bls12_381/README.md) | 3 | BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures, KZG commitments, threshold BLS. | any | entropy |
-| [`bn254`](modules/bn254/README.md) | 2 | BN254 / alt-bn128 curve — field tower/groups, optimal-ate pairing, EIP-196/197 EVM precompiles, and a Groth16 zkSNARK **verifier**. | any | — |
+| [`bls12_381`](modules/bls12_381/README.md) | 3 | BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures, KZG commitments, threshold BLS. | any | entropy, montint |
+| [`bn254`](modules/bn254/README.md) | 2 | BN254 / alt-bn128 curve — field tower/groups, optimal-ate pairing, EIP-196/197 EVM precompiles, and a Groth16 zkSNARK **verifier**. | any | montint |
 | [`bolt3`](modules/bolt3/README.md) | 3 | Lightning BOLT#3 key derivation — per-commitment blinded keys, split-secret revocation keys, shachain secret generation. | any | k256 |
 | [`bolt8`](modules/bolt8/README.md) | 2 | Lightning BOLT#8 encrypted transport (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — handshake plus transport with periodic key rotation. | any | noise, k256 |
 | [`btcaddr`](modules/btcaddr/README.md) | 3 | Bitcoin address layer -- scriptPubKey <-> address (P2PKH/P2SH/P2WPKH/P2WSH/P2TR/witness v1-16), network detection, WIF keys, P2SH/P2WSH helpers. | any | bech32, ripemd160 |

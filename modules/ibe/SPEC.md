@@ -262,9 +262,9 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
-| `extract` | `msk` | 3 | unchanged since first pinned; not re-read in the 2026-09-16 pass |
-| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 7 | `ibe.zig`'s `decrypt` (`:474`, `:497`), above the pairing substrate (`pairing.zig:223,270,278,283,432`) |
-| `fp12pow` | `sigma`, `message` | 2 | `ibe.zig:236` |
+| `extract` | `msk` | 1 | `toAffine` of `d_id` (the output) — 2026-10-02; the old 3 held two ff `toBytes` contexts |
+| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 10 | the Miller loop (`pairing.zig:270,278,283`), `Fp2.inv`, the FO compare (`ibe.zig:499` ×2), output `toAffine`/compression — 2026-10-02 |
+| `fp12pow` | `sigma`, `message` | 0 | the old 2 were ff `toBytes` on `r` (2026-10-02) |
 
 ⛔ Not a constant-time claim about the pairing — `bls12_381/src/pairing.zig`
 makes none. What is pinned is this module's own `fp12Pow` (audit F4, the same
@@ -276,6 +276,16 @@ sibling's Miller loop stopped paying an `Fp2` inversion per step
 `extract` and `fp12pow` stayed green throughout. Checked explicitly that the
 fall is not a harness that stopped reaching the module — `decrypt` still prints
 a real recovered plaintext.
+
+⚠ **Re-pinned 2026-10-02 — the rise is the sibling's fix, not a regression.**
+`bls12_381`'s `Fp.ctSelect` had no optimization barrier, so inside its ladders
+LLVM lowered the select to a jump on the scalar bit; memcheck tracks data flow,
+not control flow, so that jump dropped the taint and everything downstream of
+`[k]P` looked public. With the select branchless (and `Fr` off
+`std.crypto.ff`) the taint survives and these rows see more of the module:
+`toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
+canonical accept/reject, and `decrypt`'s FO re-encryption compare
+(`std.mem.eql`; accept/reject is public, per the code). Read with `--stacks`.
 
 ## Out of scope
 

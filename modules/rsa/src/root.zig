@@ -673,7 +673,10 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
     const e_fe = Fe.fromBytes(n, eb, .big) catch return error.InvalidPrivateKey;
 
     // qInv = q⁻¹ mod p = (q mod p)^(p-2) mod p — Fermat inversion, valid for
-    // prime p, constant-time via `ff` (the exponent p-2 is secret).
+    // prime p. NOT constant-time: the exponent p-2 is secret, and ff's pow
+    // branches on its windows in ReleaseFast (measured 2026-10-02). Key
+    // import is variable-time anyway (the big.int derivation above); SPEC
+    // § Backlog "constant-time key generation and import" covers both.
     const q_mod_p = reduceWide(p, q.v);
     if (q_mod_p.isZero()) return error.InvalidPrivateKey;
     const two = Fe.fromPrimitive(u8, p, 2) catch return error.InvalidPrivateKey;
@@ -2257,7 +2260,10 @@ fn isProbablePrime(m: Modulus, random: std.Random) bool {
     var round: usize = 0;
     rounds: while (round < mr_rounds) : (round += 1) {
         const a = randomWitness(m, random);
-        // a^d mod n — constant-time modexp (the exponent d is n-derived).
+        // a^d mod n. d is derived from the candidate (secret for the prime
+        // that is kept), and ff's pow branches on its windows in
+        // ReleaseFast (measured 2026-10-02) — keygen is variable-time, see
+        // SPEC § Backlog "constant-time key generation and import".
         var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d is odd, never 0
         if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
         var j: usize = 1;

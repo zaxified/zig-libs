@@ -101,8 +101,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing
     .concurrency = .reentrant, // every type is a plain value type, no shared state
-    .model_after = "BN254 / alt-bn128 (EIP-196/197) field tower; Fp is this module's own constant-time CIOS/SOS Montgomery arithmetic over four 64-bit limbs (std.crypto.ff still backs Fr), modelled on the sibling bls12_381 module and adapted to BN254's modulus/non-residues",
-    .deps = .{}, // std only (std.crypto.ff, for Fr)
+    .model_after = "BN254 / alt-bn128 (EIP-196/197) field tower; Fp is this module's own constant-time CIOS/SOS Montgomery arithmetic over four 64-bit limbs (Fr is montint.Field), modelled on the sibling bls12_381 module and adapted to BN254's modulus/non-residues",
+    .deps = .{"montint"}, // montint.Field is `Fr`'s constant-time arithmetic
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

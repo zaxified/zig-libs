@@ -590,9 +590,14 @@ pub const Fp = struct {
     }
 
     /// Constant-time select: returns `a` if `cond`, else `b` (masked
-    /// limb-wise merge on the Montgomery representation).
+    /// limb-wise merge on the Montgomery representation). The mask goes
+    /// through `blackBox`: without it, once `ctSelect` is inlined into the
+    /// `G1`/`G2` ladders LLVM recovers `cond ∈ {0,1}` from the scalar bit and
+    /// lowers the merge to a conditional jump — measured 2026-10-02 (ctgrind,
+    /// `fp.zig` ctSelect inside `scalarMulBytes`, every BLS secret-key
+    /// multiplication), the same defect `bn254`'s `ctSelect` closed earlier.
     pub fn ctSelect(cond: bool, a: Fp, b: Fp) Fp {
-        const mask: u64 = @as(u64, 0) -% @intFromBool(cond);
+        const mask: u64 = @as(u64, 0) -% blackBox(@as(u64, @intFromBool(cond)));
         var out: Limbs = undefined;
         inline for (0..L) |i| out[i] = (a.limbs[i] & mask) | (b.limbs[i] & ~mask);
         return .{ .limbs = out };

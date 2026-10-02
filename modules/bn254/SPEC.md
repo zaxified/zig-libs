@@ -51,8 +51,9 @@ accounting.
   `bn128_curve.curve_order` / `bn128_curve.G1` / `bn128_curve.G2`
   constants (these are PUBLISHED NUMBERS, not copyrightable expression
   — see the "NOTICE" section below for why no NOTICE entry is needed).
-- **`Fr` rides on `std.crypto.ff.Modulus`/`Fe` (`scalar.zig`); `Fp` no
-  longer does.** ⚠ Corrected 2026-09-03: this section said both fields
+- **`Fr` is `montint.Field(r)` (`scalar.zig`, since 2026-10-02 — it
+  rode on `std.crypto.ff` before, see the ctgrind section's item 2);
+  `Fp` is this module's own field.** ⚠ Corrected 2026-09-03: this section said both fields
   did, and that the module "does NOT reimplement big-integer or
   Montgomery arithmetic itself", for six weeks after commit `1892c814`
   replaced `Fp`'s backend with ~450 lines of hand-written constant-time
@@ -190,7 +191,7 @@ accounting.
 
 This is a **careful, verified ADAPTATION**, not novel cryptographic
 design. Every algorithm (CIOS/SOS Montgomery field arithmetic after
-Koç et al. in `fp.zig`, `std.crypto.ff` for `Fr`, Karatsuba/Devegili
+Koç et al. in `fp.zig`, `montint.Field` for `Fr`, Karatsuba/Devegili
 tower multiplication, the
 Adj–Rodriguez-Henriquez complex-method square root, Granger–Scott
 cyclotomic squaring, programmatic Frobenius-coefficient derivation) is
@@ -902,7 +903,7 @@ signal):
 | target | tainted input | in-file contexts |
 |---|---|---:|
 | `field` | an `Fp` value (limbs, after a clean parse) | 1 |
-| `scalarmul` | the `Fr` scalar of `G1.Jacobian.scalarMul` | 5 |
+| `scalarmul` | the `Fr` scalar of `G1.Jacobian.scalarMul` | 2 (`toAffine`'s Z test + `Fp.inv`, on the public result; was 5 — item 2 below) |
 
 ⚠ **Until 2026-09-03 there was no such measurement at all.** Commit
 `1892c814` replaced `Fp`'s `std.crypto.ff` backend with a hand-written
@@ -925,12 +926,16 @@ let `p256`'s HIGH survive an audit. Two things the first run found:
    bytes to walk its bits, and that conversion runs `Modulus.fromMontgomery`
    → `shrink` → `eql`, all of which memcheck reports as branching on the
    secret (`ff.zig:595`, `:490`, `:889`). The ladder above it is genuinely
-   branchless; the CONVERSION THAT FEEDS IT is not. **Recorded, not fixed:**
-   closing it means giving `Fr` the same hand-written Montgomery backend
-   `Fp` now has, which is a field rewrite with the Groth16/Poseidon KATs as
-   its acceptance surface — not a patch. Until then the module's
-   "constant-time double-and-add-ALWAYS, the only quantity leaked is
-   `s.len`" is true of the ladder and not of `scalarMul` as a whole.
+   branchless; the CONVERSION THAT FEEDS IT is not. **Fixed 2026-10-02:**
+   `Fr` is now `montint.Field(r)` (no `std.crypto.ff` left in its
+   arithmetic). The same day's ctgrind showed the wider defect behind these
+   three: ff's `montgomeryMul` branches on its extra-reduction bit in every
+   `mul`/`sq`, and its secret-exponent pow on the exponent windows, so
+   `Fr.mul`/`square`/`pow` over a witness leaked, not only `toBytes`. The
+   Groth16/Poseidon KATs are the acceptance surface, as planned; the
+   constant-time evidence is montint's `field` target (with an `ffcontrol`
+   positive control on the old path). `scalarmul` re-measured after the
+   switch — see `scripts/checks/ctgrind-expected.tsv`.
 
 The other two contexts are `toAffine`'s `Z == 0` test and the `Fp.inv` it
 guards, on the RESULT point: taint propagates to an output that is public by

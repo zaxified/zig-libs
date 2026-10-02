@@ -213,6 +213,16 @@ as a measurement rather than a rediscovery.
   above.
 - Anything not covered by the phase list above (there is no known scope gap versus RFC 8017 P1–P6
   today; flag here if one is found).
+- **Constant-time key generation and import** *(2026-10-02)*: the per-operation paths are
+  montint and measured (ctgrind `crt`/`noncrt`), but key construction is not constant-time and
+  this SPEC never said so: `fromPrimes` derives `d`/`dP`/`dQ` with `std.math.big.int`
+  (variable-time extended Euclid), computes `qInv = q^(p-2) mod p` with `std.crypto.ff`'s pow, and
+  `generate`'s Miller-Rabin raises witnesses to the candidate-derived `d` with the same pow —
+  whose window select compiles to a conditional jump in ReleaseFast (measured 2026-10-02, see
+  `montint`'s ctgrind `ffcontrol`). One trace per key, and the binary-GCD class of keygen attack
+  (Aldaya et al. 2019) is the realistic one. Fix: montint for qInv and Miller-Rabin (secret
+  modulus via `fromElem` from a branchless load, as `montParamsFromModulus` already does), a
+  constant-time modular inverse for `d`. Effort: medium. Fits §2.
 - **Wycheproof RSA vectors** *(survey 2026-09-30)*: PKCS#1 v1.5 verify (`rsa_signature_*`), PSS verify and OAEP decrypt are where RSA implementations historically fail (BER-lax parsing, padding-check leaks); today's evidence is OpenSSL-generated valid signatures, not malformed ones. Effort: small–medium (test data, three runners). Fits §2.
 - **Moduli above 4096 bits** *(survey 2026-09-30)*: `max_modulus_bits = 4096` is a compile-time constant of `std.crypto.ff.Uint`, so an 8192-bit key (rare, but certificates and OpenSSH keys exist) is rejected at parse. Effort: medium (re-instantiate `Uint`/`Modulus`, check the `montint` limb capacity and the stack cost of a `SecretKey`). Fits §2.
 - **Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)** *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.

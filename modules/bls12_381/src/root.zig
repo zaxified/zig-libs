@@ -82,8 +82,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
     .concurrency = .reentrant, // every type is a plain value type; kzg's only global is a write-once atomic memo of the embedded (compile-time-constant) trusted setup
-    .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; std.crypto.ff supplies the constant-time Montgomery modular arithmetic Fp/Fr are built on",
-    .deps = .{"entropy"}, // otherwise std only (std.crypto.ff); entropy backs `Fr.random`
+    .model_after = "draft-irtf-cfrg-pairing-friendly-curves (the BLS12-381 parameter set) + the ZCash/IETF BLS12-381 point-serialization convention; Fp is a hand-rolled constant-time Montgomery field, Fr is montint.Field",
+    .deps = .{ "entropy", "montint" }, // entropy backs `Fr.random`; montint.Field is `Fr`'s constant-time arithmetic
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

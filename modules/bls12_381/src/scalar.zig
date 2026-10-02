@@ -6,12 +6,17 @@
 //! built on top of this module (BLS signatures, threshold BLS, KZG
 //! openings — see `README.md`'s multi-part arc).
 //!
-//! **Status: implemented** — all arithmetic delegates to
-//! `std.crypto.ff` with the same canonical-storage convention as
-//! `fp.zig` (see that file's convention note above `Fp.add`).
+//! **Status: implemented** — arithmetic is `montint.Field(r)`: Montgomery
+//! form, built only from montint's constant-time primitives. Until
+//! 2026-10-02 it delegated to `std.crypto.ff`, which is NOT constant-time
+//! in ReleaseFast (ctgrind: `montgomeryMul`'s extra-reduction select and
+//! `powWithEncodedExponent`'s window select compile to conditional jumps),
+//! so every `mul` over a secret key or share leaked. `modulus` (the ff
+//! value) and `FrError` stay for API compatibility; no arithmetic uses ff.
 
 const std = @import("std");
 const entropy = @import("entropy");
+const montint = @import("montint");
 
 /// Container width for `Fr`: 256 bits (32 bytes), the next byte-aligned
 /// width above `r`'s actual 255 bits — mirrors `fp.zig`'s `modulus_bits`
@@ -19,7 +24,6 @@ const entropy = @import("entropy");
 pub const modulus_bits = 256;
 
 const FfModulus = std.crypto.ff.Modulus(modulus_bits);
-const FfFe = FfModulus.Fe;
 
 fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
     @setEvalBranchQuota(100_000);
@@ -43,8 +47,8 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 pub const r_bytes: [32]u8 = hexBytes(32, "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001");
 
 /// The BLS12-381 scalar field modulus, as a `std.crypto.ff.Modulus(256)`
-/// instance, computed once at comptime. REAL (see `fp.zig`'s `modulus`
-/// for the identical reasoning).
+/// instance, computed once at comptime. Kept for callers that read its
+/// `bits()`; `Fr`'s arithmetic does not use it (see the module doc).
 pub const modulus: FfModulus = blk: {
     @setEvalBranchQuota(100_000);
     break :blk FfModulus.fromBytes(&r_bytes, .big) catch
@@ -53,96 +57,85 @@ pub const modulus: FfModulus = blk: {
 
 pub const FrError = std.crypto.ff.OverflowError || std.crypto.ff.FieldElementError;
 
+/// `r` as a `comptime_int`, re-derived from `r_bytes`.
+const r_int: comptime_int = blk: {
+    var x: comptime_int = 0;
+    for (r_bytes) |b| x = x * 256 + @as(comptime_int, b);
+    break :blk x;
+};
+
+/// The constant-time field `Fr` is a view of.
+const F = montint.Field(r_int);
+
 /// An element of the BLS12-381 scalar field `GF(r)`.
 pub const Fr = struct {
-    fe: FfFe,
+    v: F,
 
     /// Fixed-size big-endian wire encoding: 32 bytes.
     pub const encoded_bytes = 32;
 
-    pub const zero: Fr = .{ .fe = modulus.zero };
-    pub const one: Fr = .{ .fe = modulus.one() };
+    pub const zero: Fr = .{ .v = F.zero };
+    pub const one: Fr = .{ .v = F.one };
 
-    /// Parses a big-endian 32-byte value, REJECTING anything `>= r`. REAL.
+    /// Parses a big-endian 32-byte value, REJECTING anything `>= r`.
+    /// Constant-time up to the accept/reject outcome.
     pub fn fromBytes(bytes: [encoded_bytes]u8) FrError!Fr {
-        return .{ .fe = try FfFe.fromBytes(modulus, &bytes, .big) };
+        return .{ .v = F.fromBytesBE(&bytes) catch return error.NonCanonical };
     }
 
-    /// Serializes to big-endian 32 bytes. REAL, provided canonical
-    /// (non-Montgomery) storage at the struct boundary — see `fp.zig`'s
-    /// module doc comment for the same caveat, applied here to `Fr`.
+    /// Serializes to big-endian 32 bytes. Constant time.
     pub fn toBytes(self: Fr) [encoded_bytes]u8 {
-        var out: [encoded_bytes]u8 = undefined;
-        self.fe.toBytes(&out, .big) catch unreachable;
-        return out;
+        return self.v.toBytesBE();
     }
 
     pub fn isZero(self: Fr) bool {
-        return self.fe.isZero();
+        return self.v.isZero();
     }
 
     pub fn eql(a: Fr, b: Fr) bool {
-        return a.fe.eql(b.fe);
+        return a.v.eql(b.v);
     }
 
-    // ── field arithmetic ────────────────────────────────────────────────
-    //
-    // Same canonical-storage convention as `fp.zig` (values are stored
-    // non-Montgomery at rest; every ff operation preserves the first
-    // operand's form) — see `Fp.add`'s convention note.
+    // ── field arithmetic (all constant time; montint.Field) ──────────────
 
-    /// `a + b (mod r)`. Constant time.
+    /// `a + b (mod r)`.
     pub fn add(a: Fr, b: Fr) Fr {
-        return .{ .fe = modulus.add(a.fe, b.fe) };
+        return .{ .v = a.v.add(b.v) };
     }
 
-    /// `a - b (mod r)`. Constant time.
+    /// `a - b (mod r)`.
     pub fn sub(a: Fr, b: Fr) Fr {
-        return .{ .fe = modulus.sub(a.fe, b.fe) };
+        return .{ .v = a.v.sub(b.v) };
     }
 
-    /// `-a (mod r)`. Constant time.
+    /// `-a (mod r)`.
     pub fn neg(a: Fr) Fr {
-        return .{ .fe = modulus.sub(Fr.zero.fe, a.fe) };
+        return .{ .v = a.v.neg() };
     }
 
-    /// `a * b (mod r)`. Constant time (Montgomery multiplication).
+    /// `a * b (mod r)` (one Montgomery multiplication).
     pub fn mul(a: Fr, b: Fr) Fr {
-        return .{ .fe = modulus.mul(a.fe, b.fe) };
+        return .{ .v = a.v.mul(b.v) };
     }
 
-    /// `a^2 (mod r)`. Constant time.
+    /// `a^2 (mod r)`.
     pub fn square(a: Fr) Fr {
-        return .{ .fe = modulus.sq(a.fe) };
+        return .{ .v = a.v.sq() };
     }
 
     /// Multiplicative inverse; `error.NotInvertible` if `a == 0`.
-    /// Construction: Fermat, `a^(r-2) mod r` — same shape as
-    /// `fp.zig`'s `Fp.inv`, but the base IS commonly a SECRET value
-    /// here (e.g. inverting a secret share/blinding scalar for
-    /// threshold BLS — `README.md`'s Part 6), so the fully
-    /// constant-time exponentiation variant is used.
+    /// Fermat, `a^(r-2) mod r`, constant-time in `a` (commonly SECRET here:
+    /// a threshold share, a blinding scalar — `README.md`'s Part 6); the
+    /// zero check is the only branch.
     pub fn inv(a: Fr) error{NotInvertible}!Fr {
-        if (a.isZero()) return error.NotInvertible;
-        // Fermat: a^(r-2). The exponent r-2 is a FIXED PUBLIC constant
-        // (only the BASE `a` is potentially secret here — a threshold
-        // share, a blinding scalar); std.crypto.ff's exponentiation is
-        // constant-time with respect to the base in both variants, so
-        // the fully-constant-time `powWithEncodedExponent` is used as
-        // the conservative default per this stub's original guidance.
-        const fe = modulus.powWithEncodedExponent(a.fe, &r_minus_2_bytes, .big) catch
-            unreachable; // r-2 is nonzero
-        return .{ .fe = fe };
+        return .{ .v = try a.v.inv() };
     }
 
     /// `a^e (mod r)`, `e` a big-endian byte string. Constant time with
-    /// respect to BOTH the base and the exponent
-    /// (`powWithEncodedExponent`); `e == 0` returns `one` (`a^0 = 1` —
-    /// ff itself rejects a null exponent; mapping it leaks only whether
-    /// `e == 0`).
+    /// respect to BOTH the base and the exponent (montint `powMont`: all
+    /// 256 exponent bits processed); `e == 0` returns `one`.
     pub fn pow(a: Fr, e: [encoded_bytes]u8) Fr {
-        const fe = modulus.powWithEncodedExponent(a.fe, &e, .big) catch return Fr.one;
-        return .{ .fe = fe };
+        return .{ .v = a.v.pow(&e) };
     }
 
     /// Reduces a wider byte string (e.g. a 32-, 48-, or 64-byte hash
@@ -150,26 +143,15 @@ pub const Fr = struct {
     /// RFC 9380 §5/hash-to-field, or from BIP340-style `taggedHash`
     /// output as `bip340`/`adaptor`/`musig2` do for secp256k1) into an
     /// `Fr` element via `int(bytes) mod r` — a REDUCING conversion,
-    /// unlike `fromBytes` (which REJECTS non-canonical input). Same
-    /// shape as `bip340.reduceToScalar`/`adaptor.reduceToScalar`, but
-    /// generalized to an arbitrary input width (a BLS `hash_to_field`
-    /// draws MORE than 32 bytes per scalar — RFC 9380 §5.3's `L`
-    /// parameter — specifically to bound statistical bias below the
-    /// field's own gap-from-a-power-of-two, unlike this module's own
-    /// `Fp`/`Fr` byte widths which happen to be tight already).
-    /// Construction: widen `bytes` into a `std.crypto.ff.Uint(N)` (`N`
-    /// large enough for the widest expected input, e.g. 512 bits) via
-    /// `Uint(N).fromBytes`, then `modulus.reduce(wide)`.
+    /// unlike `fromBytes` (which REJECTS non-canonical input). A BLS
+    /// `hash_to_field` draws MORE than 32 bytes per scalar (RFC 9380
+    /// §5.3's `L` = 48 here) to bound the statistical bias. Constant time
+    /// in the bytes (work depends on the length only). Inputs wider than
+    /// 64 bytes are a caller bug (assert — the width is static at every
+    /// call site).
     pub fn reduceWide(bytes: []const u8) Fr {
-        // Widen into a 512-bit Uint (large enough for every expected
-        // caller width — 32/48/64-byte hash outputs; RFC 9380 §5's L
-        // parameter for a 255-bit field is 48) and let ff's
-        // constant-time `reduce` fold it mod r. Inputs wider than 64
-        // bytes are a caller bug (assert, not error — the width is
-        // static at every call site).
         std.debug.assert(bytes.len <= 64);
-        const wide = std.crypto.ff.Uint(512).fromBytes(bytes, .big) catch unreachable;
-        return .{ .fe = modulus.reduce(wide) };
+        return .{ .v = F.reduceBytesBE(bytes) };
     }
 
     /// A uniformly random scalar. Same rejection-sampling shape as
@@ -193,23 +175,6 @@ pub const Fr = struct {
             return Fr.fromBytes(buf) catch continue; // >= r: reject, redraw
         }
     }
-};
-
-/// `r - 2`, big-endian — the Fermat inversion exponent (`Fr.inv`),
-/// comptime-derived from the verified `r_bytes`.
-const r_minus_2_bytes: [32]u8 = blk: {
-    @setEvalBranchQuota(100_000);
-    var x: comptime_int = 0;
-    for (r_bytes) |byte| x = x * 256 + @as(comptime_int, byte);
-    x -= 2;
-    var out: [32]u8 = undefined;
-    var i: usize = 32;
-    while (i > 0) {
-        i -= 1;
-        out[i] = x % 256;
-        x = x / 256;
-    }
-    break :blk out;
 };
 
 // ── tests ────────────────────────────────────────────────────────────────

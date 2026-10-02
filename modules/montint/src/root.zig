@@ -53,6 +53,10 @@ pub const negInvMod2_64 = montint.negInvMod2_64;
 /// True iff the accelerated amd64 core is available AND switched on.
 pub const asm_active = montint.asm_active;
 
+/// `Field(p)` — `GF(p)` for a comptime prime, Montgomery-resident, built
+/// only from `Modint`'s constant-time primitives (see `field.zig`).
+pub const Field = @import("field.zig").Field;
+
 pub const gate = @import("gate.zig");
 pub const asm_core = @import("asm_core.zig");
 pub const limbs = @import("limbs.zig");
@@ -65,6 +69,7 @@ test {
     _ = montint;
     _ = limbs;
     _ = kat_vectors;
+    _ = @import("field.zig");
     _ = @import("kat_test.zig");
     _ = @import("bench.zig");
 }

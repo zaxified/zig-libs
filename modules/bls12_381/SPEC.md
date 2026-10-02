@@ -57,12 +57,16 @@ see "Part 6 design" below.
   point-serialization convention — see `NOTICE` for the full citation
   list and the independent re-derivation/verification performed on
   every embedded constant.
-- **`Fp`/`Fr` ride on `std.crypto.ff.Modulus`/`Fe`** (`fp.zig`/
-  `scalar.zig`): std's own constant-time, allocation-free Montgomery
-  modular-arithmetic machinery for a fixed-width odd modulus. This
-  module supplies the BLS12-381-specific modulus values and the
-  field-arithmetic entry points on top; it does NOT reimplement
-  big-integer or Montgomery arithmetic itself. `Fp` uses a 384-bit
+- **`Fp` is hand-rolled, `Fr` is `montint.Field`** (`fp.zig`/
+  `scalar.zig`). ⚠ Corrected 2026-10-02: this said both rode on
+  `std.crypto.ff`. `Fp` has had its own constant-time Montgomery
+  backend (CIOS/SOS, `blackBox` barrier) for a while; `Fr` moved to
+  `montint.Field(r)` on 2026-10-02 after ctgrind showed `std.crypto.ff`
+  is not constant-time in ReleaseFast (`montgomeryMul`'s extra-reduction
+  select and `powWithEncodedExponent`'s window select compile to
+  conditional jumps) — every `Fr.mul` over a secret key or share leaked.
+  `std.crypto.ff` remains only as the `modulus` constant and a test
+  oracle. `Fp` uses a 384-bit
   (48-byte) container for the 381-bit `p`; `Fr` uses a 256-bit
   (32-byte) container for the 255-bit `r`.
 - **Design references for the field-tower arithmetic** (implemented by
@@ -410,7 +414,9 @@ see "Part 6 design" below.
   round trips.
 - **Part 4 constant-time choices (crypto-core pass).** The SECRET-key
   paths — `keyGen`, `skToPk`, `sign`, `popProve` — touch `sk` only via
-  `Fr`'s ff-backed constant-time arithmetic and Part 1's constant-time
+  `Fr`'s constant-time arithmetic (`montint.Field`; it was
+  `std.crypto.ff` until 2026-10-02, which was NOT constant-time — see
+  above) and Part 1's constant-time
   double-and-add-always `scalarMul` (`skToPk` on `G1`, `sign`/`popProve`
   on `G2`); they contain no secret-dependent branches or memory
   accesses (`keyGen`'s retry loop branches only on the derived scalar
@@ -578,8 +584,8 @@ see "Part 6 design" below.
 - **Part 6 const-time choices (secret paths).**
   - `evalPolynomialAt` (Shamir share computation — the secret `sk`, the
     secret coefficients, AND the output share): pure `Fr.add`/`Fr.mul`
-    Horner loop, constant-time via `std.crypto.ff`'s Montgomery
-    arithmetic; loop bound and evaluation point are public.
+    Horner loop, constant-time via `montint.Field`'s Montgomery
+    arithmetic (since 2026-10-02; `std.crypto.ff` before, which leaked); loop bound and evaluation point are public.
   - `feldmanCommitCoefficient` (`[coeff]G1` for a secret coefficient):
     `g1.Jacobian.scalarMul`, Part 1's constant-time
     double-and-add-always ladder — exactly `bls_sig.skToPk`'s path.
@@ -649,15 +655,14 @@ see "Part 6 design" below.
   the membership theorem it implements — see "Subgroup checks" below),
   so it is `true` exactly for members of `G1`/`G2`.
 - **Constant-time choices (as implemented).**
-  - `Fp`/`Fr` `add`/`sub`/`neg`/`mul`/`square` delegate to
-    `std.crypto.ff` — constant-time by construction.
-  - `Fr.pow` uses ff's fully-constant-time `powWithEncodedExponent`
-    (constant-time in base AND exponent); `Fr.inv` likewise (its
-    exponent `r-2` is fixed/public, but the conservative variant costs
-    nothing and the base is often secret — threshold shares). `Fp.inv`/
-    `Fp.sqrt` use the PUBLIC-EXPONENT variant — the exponents (`p-2`,
-    `(p+1)/4`) are fixed public constants, and ff remains constant-time
-    with respect to the BASE either way.
+  - `Fr` `add`/`sub`/`neg`/`mul`/`square`/`pow`/`inv`/`reduceWide` are
+    `montint.Field` — measured by montint's ctgrind `field` target
+    (0 in-file contexts but `inv`'s zero check), with `ffcontrol` as the
+    positive control on the replaced `std.crypto.ff` path. `Fr.pow` is
+    constant-time in base AND exponent (`powMont`, all 256 bits);
+    `Fr.inv` is Fermat with the public exponent `r-2`. `Fp` is this
+    module's own field (`fp.zig`); `Fp.inv`/`Fp.sqrt` use fixed public
+    exponents and are constant-time in the BASE.
   - `Fp2.pow` (and the test-local `Fp6`/`Fp12` pows) are square-and-
     multiply, VARIABLE-TIME in the exponent bits — used exclusively
     with fixed public exponents (sqrt exponents, Frobenius-coefficient
@@ -676,8 +681,14 @@ see "Part 6 design" below.
     case fired (the accumulator's state is secret-dependent inside
     scalarMul).
   - `ctSelect` (`Fp`, lifted componentwise to `Fp2` and points) is a
-    byte-mask merge over canonical serializations — branch-free and
-    index-free.
+    limb-mask merge, the mask laundered through `blackBox`. ⚠ Until
+    2026-10-02 it was not: inlined into the `G1`/`G2` ladders, LLVM
+    lowered the unlaundered mask to a conditional jump on the SCALAR BIT
+    (ctgrind `fp.zig:597` inside `scalarMulBytes`) — every `skToPk`/`sign`
+    leaked the key bit by bit. The same day `Fp2.isZero`'s `and` (a
+    short-circuit branch inside `G2.add`'s identity checks) became one
+    accumulator. The ladder rows were counting both without saying so;
+    they now read 2 each, the public result's `toAffine`.
   - `Fp.random`/`Fr.random` rejection-sample (never reduce a same-width
     sample — the classic bias footgun for these field shapes).
   Verification-side operations on public data (subgroup checks of

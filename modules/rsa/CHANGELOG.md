@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **Comments and SPEC no longer call key construction
+  constant-time.** `qInv` and Miller-Rabin use `std.crypto.ff`'s pow, which
+  branches on the exponent in ReleaseFast, and `d` comes from `std.math.big.int`;
+  Backlog entry "constant-time key generation and import". No code change.
+
 - **2026-09-16** — documentation only: `PublicKey.fromDer` re-measured at
   453 µs (was recorded ~500 µs on 2026-09-08). It still decides `x509`'s
   PKCS#1 v1.5 dispatch, whose threshold is 352 µs.

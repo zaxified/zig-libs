@@ -37,6 +37,22 @@ Because it must accept composite moduli (RSA/Paillier `N`, a hidden-order VDF
 group) it is deliberately **not** called a "field" — there is no inversion by
 Fermat, no primality assumption.
 
+**`Field(p)` (2026-10-02)** is the one prime-field layer on top: `GF(p)` for a
+comptime prime, Montgomery-resident, with `fromBytesBE` (canonical check),
+`toBytesBE`, `reduceBytesBE` (any width, Horner over 64-bit limbs so every
+`montMul` operand stays `< p`), `add`/`sub`/`neg`/`mul`/`sq`, `pow` (all
+`64·L` exponent bits through `powMont`) and Fermat `inv`. Constants are
+`comptime_int` arithmetic, no `computeConstants` loop. It exists because
+`std.crypto.ff` — which `bls12_381.Fr` and `bn254.Fr` wrapped — is not
+constant-time in ReleaseFast (ctgrind 2026-10-02: `montgomeryMul`'s
+extra-reduction select and `powWithEncodedExponent`'s window select compile to
+conditional jumps); both `Fr`s are now views of `Field`. Evidence: ctgrind
+target `field` (the bls12_381 `r`, operands, exponent and a 64-byte reduce
+input tainted) — 0 in-file contexts except `inv`'s documented zero check —
+next to `ffcontrol`, the replaced ff path on the same operands, which must
+stay non-zero in `ff.zig` (27 contexts on 2026-10-02). Differential tests
+against `std.crypto.ff` at L=4 (bls12_381 `r`) and L=7 (ed448 `l`).
+
 ## Why it exists (std-gap, not a dup)
 
 The internal deep audit (`rsa`, `paillier`, `vdf`) measured every
@@ -540,8 +556,9 @@ speed dispatch, not a correctness bound.
 ## Backlog / deferred
 
 - **Variable-time `powPublic` (public exponent)** (survey 2026-09-30): `std.crypto.ff` has it and `rsa` calls it for verify (`pk.n.powPublic(m, pk.e)`); `powMont` walks all `L*64` exponent bits even for e = 65537, so a verify through montint would cost two orders of magnitude more multiplies than it needs. Effort S. Fits §2.
-- **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): consumers write their own (`rsa` calls a local `reduceWide`). Effort S. Fits §2.
-- **Modular inversion (odd modulus; constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today, an RSA/Paillier composite cannot. Effort M. Fits §2.
+- **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): consumers write their own (`rsa` calls a local `reduceWide`). ✅ for comptime prime moduli via `Field` (2026-10-02); still open for `Modint` itself. Effort S. Fits §2.
+- **Modular inversion (odd modulus; constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today (`Field.inv` does), an RSA/Paillier composite cannot. Effort M. Fits §2.
+- **A run-time-modulus `Field` counterpart for secrets** (2026-10-02): `paillier`, `rsa` and `threshold_ecdsa` still do some secret arithmetic in `std.crypto.ff` (Garner recombination, products, keygen Miller-Rabin), each with the extra-reduction residual recorded in its ctgrind bound. A `MontParams`-style run-time modulus with `Field`'s API would let them drop ff for secrets. Effort M. Fits §2.
 - **Run-time-sized modulus (limb count chosen at run time)** (survey 2026-09-30): already in the SPEC's deferred list; crypto-bigint has boxed forms. Effort M. Fits §2.
 - **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5× slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64 CI. Fits §2.
 

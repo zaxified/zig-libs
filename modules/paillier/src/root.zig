@@ -900,7 +900,10 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     if (lambda.isZero()) return error.InvalidPrimes; // impossible for p, q >= 3
 
     // 4. mu = L(g^lambda mod n²)⁻¹ mod n, L(x) = (x-1)/n (exact division).
-    const x = n_sq.pow(g, lambda) catch return error.InvalidPrimes; // constant-time
+    // NOT constant-time in lambda (ff's pow branches on its windows in
+    // ReleaseFast, measured 2026-10-02); key derivation is variable-time
+    // anyway (big.int above) — SPEC "Constant-time discipline", Backlog.
+    const x = n_sq.pow(g, lambda) catch return error.InvalidPrimes;
     var x_buf: [modulus_sq_bytes]u8 = undefined;
     x.toBytes(&x_buf, .big) catch return error.InvalidPrimes;
     var bx = try bigFromBytes(gpa, &x_buf);
@@ -995,10 +998,10 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
 // q-1 >= p, impossible when both lie in [2^(b-1)+2^(b-2), 2^b) with p ≠ q.
 //
 // Timing: the prime search loop is inherently variable-time (every
-// implementation's is); the modexps inside Miller-Rabin still use `ff`'s
-// constant-time path, and all candidate buffers are secureZero'ed. What
-// remains observable is how long the search took, which reveals nothing
-// useful about the primes that were kept.
+// implementation's is), and all candidate buffers are secureZero'ed. The
+// modexps inside Miller-Rabin use `ff`'s pow, which is NOT constant-time in
+// ReleaseFast (its window select branches on the exponent `d`, derived from
+// the kept prime; measured 2026-10-02) — SPEC § Backlog.
 
 /// Miller-Rabin rounds per candidate — see the section comment above.
 const mr_rounds = 64;
@@ -1109,7 +1112,8 @@ fn isProbablePrime(m: Modulus, random: std.Random) bool {
     var round: usize = 0;
     rounds: while (round < mr_rounds) : (round += 1) {
         const a = randomWitness(m, random);
-        // a^d mod m — constant-time modexp (the exponent d is m-derived).
+        // a^d mod m. d is derived from the candidate; ff's pow branches on
+        // its windows in ReleaseFast — keygen is variable-time (SPEC § Backlog).
         var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d is odd, never 0
         if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
         var j: usize = 1;
@@ -1269,18 +1273,22 @@ fn nAsFeModNsq(n: Modulus, n_sq: Modulus) Fe {
 ///     constant-time `mul` + `add` replaces a full modexp. This also handles
 ///     `m = 0` for free (1 + 0·n = 1) with no data-dependent branch, and a
 ///     possibly-secret `m` never enters a bit-scanned exponent path at all.
-///   - **`m = 0` under a caller-supplied non-standard `g`
-///     (`PublicKey.fromBytes` with explicit `g_bytes`):** `ff`'s `pow`
-///     rejects zero exponents (`NullExponent`), but `E(0)` is a valid
-///     plaintext — `g^0 = 1`. Otherwise fall back to the general
-///     constant-time `pow`.
+///   - **A caller-supplied non-standard `g` (`PublicKey.fromBytes` with
+///     explicit `g_bytes`):** the general modexp through montint
+///     (`montModexpSecret`), constant-time in `m` — a plaintext, so possibly
+///     secret. Until 2026-10-02 this was `std.crypto.ff`'s `pow`, whose
+///     window select compiles to a conditional jump on the exponent in
+///     ReleaseFast (ctgrind, the threshold_ecdsa `fac` finding). montint
+///     yields `g^0 = 1` with no special case, so `m = 0` needs no branch.
 fn gPow(pk: PublicKey, m: Fe) HomomorphicError!Fe {
     const one = pk.n_sq.one();
     const n_fe = nAsFeModNsq(pk.n, pk.n_sq);
     const g_std = pk.n_sq.add(n_fe, one); // the standard generator, n+1
     if (pk.g.eql(g_std)) return pk.n_sq.add(pk.n_sq.mul(m, n_fe), one);
-    if (m.isZero()) return one;
-    return pk.n_sq.pow(pk.g, m);
+    var m_be: [modulus_sq_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &m_be);
+    m.toBytes(&m_be, .big) catch unreachable; // canonical mod n_sq, full-width buffer
+    return montModexpSecret(&pk.n_sq_mont, pk.n_sq, pk.g, &m_be);
 }
 
 /// Paillier encryption: `c = g^m * r^n mod n²` (Paillier 1999 §3). `m` must
@@ -1649,6 +1657,18 @@ test "PublicKey.fromBytes accepts an explicit g" {
     // the standard variant); use g=2 here just to exercise the branch.
     const pk = try PublicKey.fromBytesImpl(&kat_n, &[_]u8{2}, .unchecked);
     try testing.expectEqual(@as(u32, 2), try pk.g.toPrimitive(u32));
+}
+
+test "gPow under a non-standard g is g^m mod n² (montint path), m = 0 included" {
+    // n = 187, n² = 34969, g = 2: plain integer arithmetic is the oracle.
+    const pk = try PublicKey.fromBytesImpl(&kat_n, &[_]u8{2}, .unchecked);
+    const ms = [_]u32{ 0, 1, 2, 17, 186 };
+    for (ms) |m| {
+        var want: u64 = 1;
+        for (0..m) |_| want = want * 2 % 34969;
+        const got = try gPow(pk, try Fe.fromPrimitive(u32, pk.n_sq, m));
+        try testing.expectEqual(want, try got.toPrimitive(u64));
+    }
 }
 
 test "SecretKey.fromBytes round-trips n/lambda/mu" {

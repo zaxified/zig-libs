@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **`g^m` under a non-standard `g` goes through montint.**
+  `gPow`'s general case used `std.crypto.ff`'s pow, which branches on the
+  exponent's windows in ReleaseFast — the plaintext. SPEC's "branchless ff"
+  claims for the Garner step and the keygen pow corrected (extra-reduction
+  residual, variable-time keygen); Backlog entry for the rest.
+
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** test only (audit F14). A spliced `std.Random`
   feeds `generate` a Fermat-close `q` as its first candidate and pins the `topBitsMatch` call in
   the search loop, the only closeness guard on that path.

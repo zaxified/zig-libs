@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **`Fr` is constant-time now: `montint.Field` replaces
+  `std.crypto.ff`.** ctgrind showed ff's `montgomeryMul` branching on its
+  extra-reduction bit and its secret-exponent pow on the exponent windows in
+  ReleaseFast, so `Fr.mul`/`square`/`pow` over a secret key, share or blinding
+  scalar leaked — while SPEC said the secret paths touch `sk` only through
+  "constant-time" `Fr` arithmetic (the module's ctgrind pattern left `ff.zig`
+  out, so its rows could not see it). API unchanged; the field is now `v`, not
+  `fe` (no caller outside the module used it). New dependency: `montint`.
+- **2026-10-02** — **The scalar-multiplication ladders are branch-free now.**
+  `Fp.ctSelect`'s mask had no `blackBox`, and once inlined into
+  `G1`/`G2.scalarMulBytes` LLVM turned the select into a conditional jump on the
+  scalar bit (ctgrind, ReleaseFast) — `skToPk`, `sign`, `popProve`, threshold
+  shares, every consumer's secret multiplication. `Fp2.isZero` short-circuited
+  (`and`) inside `G2.add`'s identity checks; now one accumulator. ctgrind
+  `g1_scalarmul` 5 → 2, `g2_scalarmul` 8 → 2 (the result's `toAffine`). The
+  consumer rows (bbs, coconut, ibe, tlock) rose: the old branch had dropped the
+  taint, so their downstream contexts were invisible — see
+  `scripts/checks/ctgrind-expected.tsv`.
+
 - **2026-09-16** — **NO API CHANGE, NO BEHAVIOURAL CHANGE + ⚠ large performance change:** A1 `drand` F4. The Miller loop kept its accumulator `T` in AFFINE coordinates and computed the slope `λ` explicitly, paying one `Fp2.inv` per step per pair — and `Fp.inv` is Fermat's `a^(p-2)`, a full 381-bit exponentiation. Measured on `drand`'s 2-pair beacon check (ReleaseFast, process CPU time): **136 inversions at 42.8 µs = 5.82 ms of a 10.01 ms verification**, 78 % of the Miller loop. `T` is now `g2.Jacobian` — this module's own audited, complete group law, reused rather than a second copy — and each step multiplies its line through by the factor that clears the denominators (`2YZ³` doubling, `Z·h` addition), so no step inverts. That is free for the same reason the twisted-image evaluation's `w^3` factor always was, in a stronger form: the final exponentiation's easy part raises to `p^6−1` and `Frobenius^6` fixes `Fp6` — hence `Fp2` — elementwise, so `c^(p^6−1) = 1` for every `c ∈ Fp6*`. A new test pins that lemma, with a control (squaring the raw Miller value DOES change the pairing) so it cannot pass by the final exponentiation collapsing everything. ⚠ A `w`-component factor is NOT a valid control — it is killed too, because `p^2+1` is even. **7 interleaved paired reps, both arms in one binary: `multiMillerLoop` (2 pairs) 6.92 → 1.94 ms (3.6×), `drand.verifyRoundPoints` 9.27 → 4.28 ms (2.17×)**, new faster in 7/7 with non-overlapping ranges. The pairing VALUES are unchanged: the byte-exact `e(G1, G2)` KAT did not move, and a new randomized differential runs 12 random point pairs through both the retained affine reference (`millerLoopAffineRef`, test-only — the same role `subgroupCheckByOrder` plays for the subgroup checks) and the new steps. Raw Miller values DO differ, by the `Fp2` scale factor, by design. 220/220 tests in ReleaseFast and ReleaseSafe (was 218/218), consumers green: `drand` 61/61, `tlock` 36/36, `poseidon` 65/65, `coconut` 26/26, `ibe` 45/45, `bbs` 45/46 (1 unrelated skip). No ctgrind re-pin this time — the rows pin `fp.zig`/`fp2.zig`/`g1.zig`/`g2.zig`/`scalar.zig`, and this change is confined to `pairing.zig`.
 
 - **2026-09-15** — **BEHAVIOURAL (stricter only on invalid input) + ⚠ large performance change:** A1 `drand` F4. `g1.Jacobian.subgroupCheck` and `g2.Jacobian.subgroupCheck` no longer compute `[r]P == O`; they check the curve equation and then the endomorphism membership tests `φ(P) == [−x²]P` (`G1`) and `ψ(P) == [x]P` (`G2`, untwist-Frobenius-twist) — Scott, ePrint 2021/1130 §6/§4; proof and conditions from El Housni–Guillevic–Piellard, ePrint 2022/352 §4.3 Propositions 4/5, whose gcd conditions the new "F4 subgroup" tests re-derive for this curve. ReleaseFast, 7 interleaved reps: `G1` **0.774 → 0.123 ms**, `G2` **2.41 → 0.175 ms**; `drand.verifyRoundPoints` 10.34 → 9.72 ms median. Verdicts are unchanged for every point ON the curve (differential tests against the kept reference `[r]P == O` over members, random non-members, `[r]R` torsion, points of order 3/11/13/23, RFC 9380's pre-`clear_cofactor` `Q0/Q1`, and 60 live drand signatures); the one difference is deliberate: an OFF-curve point of order `r` — e.g. the image `(a²x, a³y)` of a member on an isomorphic curve — used to pass and is now refused. Every decoder already required `isOnCurve`, so only a caller that builds a raw `Affine` sees it. `kzg`'s trusted-setup loader now uses `subgroupCheck` for `G1` (faster than its own variable-time `[r]P`, which stays as a test reference). `scalarMulBytes`/`scalarMul` (the secret-scalar engine) are untouched; `g1.zig`/`g2.zig` digests changed, so the ctgrind rows `g1_scalarmul`/`g2_scalarmul` need a re-pin.

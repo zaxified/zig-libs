@@ -166,13 +166,15 @@ fn printElem(comptime M: type, name: []const u8, m: *const M, v: *const M.Elem) 
     std.debug.print("{s}={x}\n", .{ name, out });
 }
 
-const Target = enum { small, portable, asmcore };
+const Target = enum { small, portable, asmcore, field, ffcontrol };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "small")) return .small;
     if (std.mem.eql(u8, s, "portable")) return .portable;
     if (std.mem.eql(u8, s, "asmcore")) return .asmcore;
+    if (std.mem.eql(u8, s, "field")) return .field;
+    if (std.mem.eql(u8, s, "ffcontrol")) return .ffcontrol;
     return error.UnknownTarget;
 }
 
@@ -207,6 +209,76 @@ fn runPow(comptime bits: comptime_int, comptime tag: []const u8, tainted: bool) 
     // driven at both widths through `powMont`'s multiplies and squarings.
     const dif = m.sub(&base, &exp);
     printElem(M, "sub", &m, &dif);
+}
+
+/// BLS12-381's scalar order — `Field`'s first callers are the pairing
+/// modules' `Fr`, so the target measures that exact instantiation (L = 4).
+const field_p: comptime_int = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
+
+/// Canonical operands for `field`/`ffcontrol`: public bytes, top bits
+/// cleared so the value is below `field_p` (whose top byte is 0x73).
+fn fieldOperand(comptime domain: []const u8) [32]u8 {
+    var b = secretBytes(32, domain);
+    b[0] &= 0x3f;
+    return b;
+}
+
+fn runField(tainted: bool) !void {
+    const F = root.Field(field_p);
+    var a = try F.fromBytesBE(&fieldOperand("ctgrind-montint-harness-field-a-v1"));
+    var b = try F.fromBytesBE(&fieldOperand("ctgrind-montint-harness-field-b-v1"));
+    var e = secretBytes(32, "ctgrind-montint-harness-field-e-v1");
+    var wide = secretBytes(64, "ctgrind-montint-harness-field-wide-v1");
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&a));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&b));
+        std.valgrind.memcheck.makeMemUndefined(&e);
+        std.valgrind.memcheck.makeMemUndefined(&wide);
+    }
+    const ar: F = .{ .mont = @bitCast(reloadVolatile(32, @ptrCast(&a.mont))) };
+    const br: F = .{ .mont = @bitCast(reloadVolatile(32, @ptrCast(&b.mont))) };
+    const er = reloadVolatile(32, &e);
+    const wr = reloadVolatile(64, &wide);
+
+    std.debug.print("add={x}\n", .{ar.add(br).toBytesBE()});
+    std.debug.print("sub={x}\n", .{ar.sub(br).toBytesBE()});
+    std.debug.print("neg={x}\n", .{ar.neg().toBytesBE()});
+    std.debug.print("mul={x}\n", .{ar.mul(br).toBytesBE()});
+    std.debug.print("sq={x}\n", .{ar.sq().toBytesBE()});
+    std.debug.print("pow={x}\n", .{ar.pow(&er).toBytesBE()});
+    // `inv`'s one documented branch is its zero check (the API's
+    // `NotInvertible`) — 1 in-file context by design.
+    std.debug.print("inv={x}\n", .{(try ar.inv()).toBytesBE()});
+    std.debug.print("reduce={x}\n", .{F.reduceBytesBE(&wr).toBytesBE()});
+}
+
+/// POSITIVE CONTROL: the `std.crypto.ff` path `Field` replaced in
+/// `bls12_381.Fr`/`bn254.Fr`, on the same operands. Must stay non-zero in
+/// `ff.zig` (montgomeryMul's extra-reduction select, the pow window select);
+/// a zero means std fixed ff or this instrument went blind, and `field`'s
+/// zero means nothing until that is understood.
+fn runFfControl(tainted: bool) !void {
+    const Ff = std.crypto.ff.Modulus(256);
+    var p_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &p_be, field_p, .big);
+    const m = try Ff.fromBytes(&p_be, .big);
+    var a = try Ff.Fe.fromBytes(m, &fieldOperand("ctgrind-montint-harness-field-a-v1"), .big);
+    var b = try Ff.Fe.fromBytes(m, &fieldOperand("ctgrind-montint-harness-field-b-v1"), .big);
+    var e = secretBytes(32, "ctgrind-montint-harness-field-e-v1");
+    if (tainted) {
+        // Limbs only: the `montgomery` flag and limb count are public.
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&a.v.limbs_buffer));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&b.v.limbs_buffer));
+        std.valgrind.memcheck.makeMemUndefined(&e);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.mem.doNotOptimizeAway(&b);
+    const er = reloadVolatile(32, &e);
+    var out: [32]u8 = undefined;
+    try m.mul(a, b).toBytes(&out, .big);
+    std.debug.print("mul={x}\n", .{out});
+    try (try m.powWithEncodedExponent(a, &er, .big)).toBytes(&out, .big);
+    std.debug.print("pow={x}\n", .{out});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -246,5 +318,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .portable => try runPow(1024, "portable", tainted),
         .asmcore => try runPow(2048, "asm", tainted),
+        .field => try runField(tainted),
+        .ffcontrol => try runFfControl(tainted),
     }
 }

@@ -183,7 +183,7 @@ declare -A TARGETS=(
     [ecvrf]="prove verify"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
-    [montint]="small portable asmcore"
+    [montint]="small portable asmcore field ffcontrol"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign"
     [rsa]="crt noncrt"
@@ -352,7 +352,7 @@ declare -A PATTERN=(
     # ladder the tainted scalar drives. `scalar.zig` is listed for the
     # scalarmul target because `Fr` IS the secret there.
     [bn254/field]='fp[.]zig'
-    [bn254/scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
+    [bn254/scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ct25519/ct25519]='root[.]zig'
     [ct25519/std]='edwards25519[.]zig|ristretto255[.]zig|curve25519[.]zig'
     [ct25519/comb]='root[.]zig'
@@ -384,6 +384,12 @@ declare -A PATTERN=(
     [montint/small]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/portable]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/asmcore]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    # `field` (2026-10-02): `Field(p)` over the bls12_381 scalar order, the
+    # backend of `bls12_381.Fr`/`bn254.Fr`. `ffcontrol` is the positive control:
+    # the replaced std.crypto.ff path on the same operands, counted in ff.zig only
+    # (like ssh/ffpow) — it must stay non-zero.
+    [montint/field]='field[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [montint/ffcontrol]='ff[.]zig'
     # ── added 2026-09-09 ───────────────────────────────────────────────────
     [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     # `sign` names std's ecdsa/common/scalar for the same reason chachapoly's
@@ -398,8 +404,8 @@ declare -A PATTERN=(
     [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
     # ── round 2, 2026-09-09 ────────────────────────────────────────────────
     [bls12_381/field]='fp[.]zig'
-    [bls12_381/g1_scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
-    [bls12_381/g2_scalarmul]='g2[.]zig|fp2[.]zig|fp[.]zig|scalar[.]zig'
+    [bls12_381/g1_scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [bls12_381/g2_scalarmul]='g2[.]zig|fp2[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [bip340/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
     # ⛔⛔ THIS PATTERN CANNOT TELL TWO FILES APART, and the harness's author
     # found it the hard way. `modules/blindrsa/src/root.zig` and
@@ -431,10 +437,10 @@ declare -A PATTERN=(
     # `aescbc` does its own arithmetic over a secret in exactly one file.
     [aescbc/pkcs7]='root[.]zig'
     [aescbc/xmlenc]='root[.]zig'
-    [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig'
-    [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig'
-    [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig'
-    [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig'
+    [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ibe/fp12pow]='ibe[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig'
     # ── round 4, 2026-09-09 ────────────────────────────────────────────────
     [frost/commit]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
@@ -453,11 +459,11 @@ declare -A PATTERN=(
     [spake2plus/verifierstart]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     [spake2plus/proverfinish]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|sha2[.]zig|hmac[.]zig|hkdf[.]zig|timing_safe[.]zig'
     [spake2plus/verifierfinish]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|sha2[.]zig|hmac[.]zig|hkdf[.]zig|timing_safe[.]zig'
-    [bbs/sign]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
-    [bbs/proofgen]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
-    [coconut/authority_sign]='credential[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig'
-    [coconut/user_issue]='params[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
-    [coconut/user_show]='credential[.]zig|g1[.]zig|g2[.]zig|fp[.]zig|fp2[.]zig|scalar[.]zig'
+    [bbs/sign]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [bbs/proofgen]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [coconut/authority_sign]='credential[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [coconut/user_issue]='params[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [coconut/user_show]='credential[.]zig|g1[.]zig|g2[.]zig|fp[.]zig|fp2[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [hpke/x25519_decap]='dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
     [hpke/x25519_authdecap]='dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
     [hpke/p256_decap]='dhkem[.]zig|suite[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
@@ -618,6 +624,8 @@ declare -A LABEL=(
     [montint/small]='montint src'
     [montint/portable]='montint src'
     [montint/asmcore]='montint src'
+    [montint/field]='montint Field(r) (Fr backend)'
+    [montint/ffcontrol]='montint ffcontrol (std.crypto.ff, positive control)'
     # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
     [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'
     [spake2plus/computel]='spake2plus computeL (w1*P)+p256 comb'

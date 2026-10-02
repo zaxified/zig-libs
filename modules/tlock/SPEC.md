@@ -195,8 +195,8 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
-| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 2 | `tlock.zig:358`, `tlock.zig:361` |
-| `decrypt` | the round signature handed to `pairing.pairing` | 3 | `tlock.zig:406`, `:430`, `:432` |
+| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | `tlock.zig:358`, `tlock.zig:361`, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit (2026-10-02) |
+| `decrypt` | the round signature handed to `pairing.pairing` | 8 | `tlock.zig:406`, `:430`, `:432`, + the FO compare at `:433` ×2 and the output points' `toAffine`/compression (2026-10-02) |
 
 ⛔ These numbers are **not** a constant-time claim about the pairing.
 `bls12_381/src/pairing.zig` makes none, and `decrypt`'s contexts sit on top of
@@ -210,6 +210,16 @@ module changed. The sibling's Miller loop stopped inverting once per step
 line evaluation), so those branches vanished from underneath. A count that only
 falls looks the same as a harness that stopped reaching the module, so that was
 checked separately: the run still prints a real recovered plaintext.
+
+⚠ **Re-pinned 2026-10-02 — the rise is the sibling's fix, not a regression.**
+`bls12_381`'s `Fp.ctSelect` had no optimization barrier, so inside its ladders
+LLVM lowered the select to a jump on the scalar bit; memcheck tracks data flow,
+not control flow, so that jump dropped the taint and everything downstream of
+`[k]P` looked public. With the select branchless (and `Fr` off
+`std.crypto.ff`) the taint survives and these rows see more of the module:
+`toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
+canonical accept/reject, and `decrypt`'s FO re-encryption compare
+(`std.mem.eql`; accept/reject is public, per the code). Read with `--stacks`.
 
 ## Out of scope
 

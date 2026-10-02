@@ -99,7 +99,10 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   `fromPrimes`/`generate` case), `decrypt` additionally splits into the Paillier-CRT
   path: two half-width constant-time `montint` modexps (`c^dp mod p²`, `c^dq mod q²`)
   Garner-recombined — see "CRT decrypt" below. `fromPrimes`'s `g^λ mod n²` still uses
-  `std.crypto.ff`'s `Modulus.pow`, never `powPublic` (`λ` is factorization-equivalent).
+  `std.crypto.ff`'s `Modulus.pow`, which is NOT constant-time in ReleaseFast (its window select
+  compiles to a conditional jump on `λ`; measured 2026-10-02) — part of the variable-time key
+  derivation below. `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take
+  `g^m` through `montint` since 2026-10-02 (it was ff's pow, leaking the plaintext's windows).
   Constant-time in the secret exponent/scalar's *value*; per the module's ctgrind
   harness (`src/ctgrind_harness.zig`, targets `crt`/`noncrt`/`mul`), `mulPlaintext`'s
   `if (k.isZero())` short-circuit is a direct branch on `k` itself before the modexp is
@@ -107,8 +110,9 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   here rather than fixed, since removing it changes `mulPlaintext`'s `k = 0` handling and
   is a decision for the fix queue, not a doc update.
 - **CRT decrypt's own variable-time surface, beyond the L-division below.** The Garner
-  recombination itself (`decryptCrtX`) is branchless `ff` field arithmetic (`ct.eql`/
-  `cmov`/`shiftIn`). `feFromMontBytes` — which turns each CRT half's raw modexp output
+  recombination itself (`decryptCrtX`) is `ff` field arithmetic, and ff's `montgomeryMul`
+  branches on its extra-reduction bit in ReleaseFast (measured 2026-10-02; the same residual
+  `threshold_ecdsa` records) — inside the `crt` row's bound, not zero. `feFromMontBytes` — which turns each CRT half's raw modexp output
   (`x_p`/`x_q`, both secret-derived) back into a canonical `Fe` — used to run that value
   through `stripLeadingZeros` first, a `while` loop whose iteration count depended on the
   secret-derived value's leading zero bytes; measured (wave-3 audit, ctgrind + callgrind)
@@ -137,8 +141,9 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   with a co-located attacker measuring single decryptions should be aware; a
   constant-time exact division is future work if a consumer ever needs it.
 - Prime generation (`generate`) is inherently variable-time in how *long* the search
-  takes (every implementation's is); the Miller-Rabin modexps use `ff`'s constant-time
-  path and all candidate buffers are `secureZero`ed — same posture as `rsa`.
+  takes (every implementation's is); all candidate buffers are `secureZero`ed. The
+  Miller-Rabin modexps use `ff`'s pow, which branches on the candidate-derived exponent in
+  ReleaseFast — keygen is variable-time, same as `rsa` (Backlog).
 - **This section now has an instrument, not just prose** —
   `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
   `mul`/`addm`); previously none of the sentences above had a measurement behind them
@@ -245,6 +250,14 @@ The correctness anchors, in order of strength:
   `decrypt` rejects `c = 0`, `c = n`, `c = p`; `generate` rejects invalid bit sizes.
 
 ## Backlog / deferred
+
+- **Off `std.crypto.ff` for secrets** *(2026-10-02)*: ff is not constant-time in ReleaseFast
+  (ctgrind: `montgomeryMul`'s extra-reduction select, pow's window select). Left on it: the
+  Garner recombination and `encrypt`'s `g^m · r^n` product (extra-reduction bit, inside the
+  `crt`/`addm` bounds), and key generation (`g^λ`, Miller-Rabin). `bls12_381`/`bn254` moved
+  their `Fr` to `montint.Field`; a variable-width counterpart (runtime modulus, like
+  `MontParams`) would let this module and `rsa`/`threshold_ecdsa` drop ff for secrets too.
+  Effort: medium–large.
 
 - Constant-time exact division for `decrypt`'s L-function (see the timing caveat above) —
   only if a consumer's threat model ever needs it.

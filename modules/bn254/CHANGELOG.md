@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **`Fr` is constant-time now: `montint.Field` replaces
+  `std.crypto.ff`.** The open SPEC item ("closing it means giving `Fr` the same
+  hand-written Montgomery backend `Fp` has") is closed, and it was wider than
+  `toBytes`: ff's `montgomeryMul` branches on its extra-reduction bit and its
+  secret-exponent pow on the exponent windows in ReleaseFast, so `mul`/
+  `square`/`pow` over a Groth16 witness leaked. API unchanged; the field is now
+  `v`, not `fe`. New dependency: `montint`. `Fp2.isZero` no longer
+  short-circuits (`and` → one accumulator), as in `bls12_381`.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `Fr.toBytes` no longer calls
   `std.crypto.ff`'s `Modulus.fromMontgomery`. That call's internal `shrink`/
   `montgomeryMul` branch on the secret value in this build, reachable from

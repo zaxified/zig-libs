@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **New `Field(p)`: a constant-time prime field over `Modint`.**
+  `GF(p)` for a comptime prime, Montgomery-resident, built only from `montMul`/
+  `montSqr`/`add`/`sub`/`powMont`: canonical `fromBytesBE`, `toBytesBE`,
+  `reduceBytesBE` of any width, `add`/`sub`/`neg`/`mul`/`sq`/`pow`/`inv`.
+  `bls12_381.Fr` and `bn254.Fr` move onto it from `std.crypto.ff`, which ctgrind
+  shows branching on secrets in ReleaseFast (`montgomeryMul`'s extra-reduction
+  select, the pow window select). New ctgrind targets `field` (0 in-file but
+  `inv`'s zero check) and `ffcontrol` (positive control on the ff path).
+
 - **2026-09-08** — **Montgomery setup: R² now comes from a ladder, not 64·L more
   doublings.** `computeConstants` derived both R and R² by repeated doubling —
   128·L passes, so 4 096 of them for a 2048-bit modulus — on the reasoning that
