@@ -1933,7 +1933,7 @@ test "runTimeout: a child that closes stdout and stderr and runs on is still kil
 
     const start = monoNowNs();
     var out = try runTimeout(testing.allocator, io, .{
-        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; sleep 30" },
+        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; exec sleep 30" },
     }, "", 200 * std.time.ns_per_ms);
     defer out.deinit(testing.allocator);
     const elapsed = monoNowNs() - start;
@@ -1961,7 +1961,7 @@ test "Cancel: a child that closes its pipes and runs on is still ended by the to
     defer t.join();
     const start = monoNowNs();
     var out = try run(testing.allocator, io, .{
-        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; sleep 30" },
+        .argv = &.{ "sh", "-c", "exec >/dev/null 2>&1; exec sleep 30" },
         .cancel = &cancel,
     }, "");
     defer out.deinit(testing.allocator);
@@ -2844,7 +2844,7 @@ test "Handle.killGroup is a documented no-op without Spec.new_process_group" {
 
 // ── rlimit sandbox tests ────────────────────────────────────────────────────
 
-test "RlimitSpec.file_size_bytes: exceeding it kills the child with SIGXFSZ" {
+test "RlimitSpec.file_size_bytes: a write past the cap fails and the file stops exactly at the cap" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!std.process.can_spawn) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -2858,22 +2858,26 @@ test "RlimitSpec.file_size_bytes: exceeding it kills the child with SIGXFSZ" {
     const of_arg = try std.fmt.allocPrint(testing.allocator, "of={s}/fsize_target", .{path_buf[0..dir_abs_len]});
     defer testing.allocator.free(of_arg);
 
-    // 200 blocks of 4096 bytes each, capped to 512 bytes (1 block): the
-    // very first write already overshoots, so this fails fast.
+    // 200 blocks of 4096 bytes each, capped to 512 bytes (1 block). The
+    // child ignores SIGXFSZ (an ignored disposition survives `exec`), so
+    // the write past the cap fails with EFBIG instead of killing `dd`: the
+    // default disposition dumps core, and every test run would land in the
+    // host's crash reporter (systemd-coredump, DrKonqi, apport) as a "dd
+    // crash". The kernel still writes up to the cap before refusing, so
+    // the file ends exactly at 512 bytes — the limit applied, unloosened.
     var out = try run(testing.allocator, io, .{
-        .argv = &.{ "dd", "if=/dev/zero", of_arg, "bs=4096", "count=200" },
+        .argv = &.{ "sh", "-c", "trap '' XFSZ; exec dd if=/dev/zero \"$1\" bs=4096 count=200", "sh", of_arg },
         .rlimit = .{ .file_size_bytes = 512 },
     }, "");
     defer out.deinit(testing.allocator);
 
-    try testing.expect(out.term == .signal);
-    try testing.expectEqual(std.posix.SIG.XFSZ, out.term.signal);
+    try testing.expect(out.term == .exited);
+    try testing.expect(out.term.exited != 0);
 
-    // The limit actually bit — the file must not have grown past the cap.
     var f = try tmp.dir.openFile(io, "fsize_target", .{});
     defer f.close(io);
     const stat = try f.stat(io);
-    try testing.expect(stat.size <= 512);
+    try testing.expectEqual(@as(u64, 512), stat.size);
 }
 
 test "RlimitSpec.cpu_seconds: a busy loop is terminated well inside a generous safety timeout" {
