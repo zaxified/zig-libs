@@ -962,6 +962,173 @@ pub fn verifyMultipleTraced(
     return sides.lhs.equivalent(sides.rhs);
 }
 
+/// One proof in a `verifyBatch` call: its own transcript (positioned exactly
+/// as `verifyMultiple` would receive it), its commitments in the prover's
+/// order (`commitments.len` is the proof's `m`), and the proof.
+pub const BatchEntry = struct {
+    transcript: *Transcript,
+    commitments: []const Ristretto255,
+    proof: RangeProof,
+};
+
+pub const VerifyBatchError = error{ EntropyUnavailable, Canceled };
+
+/// Verifies several independent range proofs (single or aggregated, mixed
+/// `m`) with ONE vartime multi-scalar multiplication — dalek's batch
+/// verification. Each proof's two checks are rewritten as one equation equal
+/// to the identity (the IPA check expanded through `P`, so the shared
+/// generators `G_k`, `H_k`, `g`, `h` appear once with summed coefficients),
+/// weighted by two fresh random scalars per proof, and summed:
+///
+/// ```text
+///   α·[ Σ_k (a·s_k + z)·G_k + Σ_k (b·s'_k·y^{-k} − c_k)·H_k
+///       + w·(a·b − t̂)·g + μ·h − A − x·S − Σ_j (u_j²·L_j + u_j^{-2}·R_j) ]
+/// + β·[ (t̂ − δ)·g + τ_x·h − Σ_j z^{2+j}·V_j − x·T_1 − x²·T_2 ]  =  O
+/// ```
+///
+/// (`c_k = (z·y^k + z^{2+j}·2^i)·y^{-k}`, `s'_k = s_{nm−1−k}`, as in
+/// `verifyMultiple`.) A forged proof survives only if its weighted sum
+/// cancels the others', probability about `2^-252` per proof for weights the
+/// prover cannot predict — which is why they come from `io.randomSecure`
+/// and an entropy failure is an error, never a verdict. `true` iff every
+/// proof verifies; an empty batch is `true`. Per-proof structural checks
+/// and transcript replay are `verifyMultiple`'s, so a proof that
+/// `verifyMultiple` rejects for shape or an identity point fails the batch.
+/// All data is public (variable-time by design); scratch comes from the page
+/// allocator and OOM rejects, like `verify`.
+pub fn verifyBatch(gens: Generators, io: std.Io, entries: []const BatchEntry) VerifyBatchError!bool {
+    const n = gens.n;
+    if (n == 0 or !std.math.isPowerOfTwo(n)) return false;
+    const gens_len = std.math.mul(usize, n, gens.parties) catch return false;
+    if (gens.g_vec.len != gens_len or gens.h_vec.len != gens_len) return false;
+    if (entries.len == 0) return true;
+
+    const scratch = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see verify's doc comment)
+
+    // Shape pass: sizes for the MSM, and verifyMultiple's structural checks.
+    var max_nm: usize = 0;
+    var per_proof_terms: usize = 0;
+    for (entries) |e| {
+        const m = e.commitments.len;
+        if (m == 0 or !std.math.isPowerOfTwo(m) or m > gens.parties) return false;
+        const nm = n * m;
+        const rounds: usize = std.math.log2_int(usize, nm);
+        if (e.proof.ipa.l_vec.len != rounds or e.proof.ipa.r_vec.len != rounds) return false;
+        max_nm = @max(max_nm, nm);
+        per_proof_terms += 4 + 2 * rounds + m; // A, S, T1, T2, L/R, V
+    }
+    const shared = 2 * max_nm + 2; // G_k, H_k, g, h
+    const total = shared + per_proof_terms;
+    const scalars = scratch.alloc([32]u8, total) catch return false;
+    defer scratch.free(scalars);
+    const points = scratch.alloc(Ristretto255, total) catch return false;
+    defer scratch.free(points);
+    @memset(scalars[0..shared], scalarvec.zero);
+    @memcpy(points[0..max_nm], gens.g_vec[0..max_nm]);
+    @memcpy(points[max_nm .. 2 * max_nm], gens.h_vec[0..max_nm]);
+    points[2 * max_nm] = gens.g;
+    points[2 * max_nm + 1] = gens.h;
+    const g_coef = &scalars[2 * max_nm];
+    const h_coef = &scalars[2 * max_nm + 1];
+
+    var at: usize = shared;
+    for (entries) |e| {
+        const m = e.commitments.len;
+        const nm = n * m;
+        const rounds: usize = std.math.log2_int(usize, nm);
+        const proof = e.proof;
+        const t = e.transcript;
+
+        // verifyMultiple's transcript replay, step for step.
+        appendDomainSepMultiple(t, n, m);
+        for (e.commitments) |v| t.appendPoint("V", v);
+        t.validateAndAppendPoint("A", proof.a) catch return false;
+        t.validateAndAppendPoint("S", proof.s) catch return false;
+        const y = t.challengeScalar("y");
+        const z = t.challengeScalar("z");
+        t.validateAndAppendPoint("T_1", proof.t1) catch return false;
+        t.validateAndAppendPoint("T_2", proof.t2) catch return false;
+        const x = t.challengeScalar("x");
+        t.appendScalar("t_x", proof.t_hat);
+        t.appendScalar("t_x_blinding", proof.tau_x);
+        t.appendScalar("e_blinding", proof.mu);
+        const w = t.challengeScalar("w");
+        var u: [64][32]u8 = undefined;
+        var u_inv: [64][32]u8 = undefined;
+        if (!ipa.replayChallenges(t, nm, proof.ipa, &u, &u_inv)) return false;
+        const s = ipa.challengeProducts(scratch, u[0..rounds], u_inv[0..rounds], nm) orelse return false;
+        defer scratch.free(s);
+        const delta = deltaYZMultiple(scratch, y, z, n, m) catch return false;
+
+        const alpha = try randomScalar(io);
+        const beta = try randomScalar(io);
+        const neg_alpha = scalar.neg(alpha);
+        const neg_beta = scalar.neg(beta);
+        const x2 = scalar.mul(x, x);
+
+        // Shared generators. zz = z^{2+j} for value j's block.
+        const y_inv = invertScalar(y);
+        var y_pow = scalarvec.one;
+        var y_inv_pow = scalarvec.one;
+        var two_pow = scalarvec.one;
+        var zz = scalar.mul(z, z);
+        const a_alpha = scalar.mul(proof.ipa.a, alpha);
+        const b_alpha = scalar.mul(proof.ipa.b, alpha);
+        const z_alpha = scalar.mul(z, alpha);
+        for (0..nm) |k| {
+            if (k != 0 and k % n == 0) {
+                two_pow = scalarvec.one;
+                zz = scalar.mul(zz, z);
+            }
+            // G_k: α·(a·s_k + z)
+            scalars[k] = scalar.add(scalars[k], scalar.mulAdd(a_alpha, s[k], z_alpha));
+            // H_k: α·(b·s'_k − (z·y^k + zz·2^i))·y^{-k}
+            const c = scalar.mulAdd(zz, two_pow, scalar.mul(z, y_pow));
+            const hk = scalar.mul(scalar.sub(scalar.mul(b_alpha, s[nm - 1 - k]), scalar.mul(alpha, c)), y_inv_pow);
+            scalars[max_nm + k] = scalar.add(scalars[max_nm + k], hk);
+            y_pow = scalar.mul(y_pow, y);
+            y_inv_pow = scalar.mul(y_inv_pow, y_inv);
+            two_pow = scalar.add(two_pow, two_pow);
+        }
+        // g: α·w·(a·b − t̂) + β·(t̂ − δ);  h: α·μ + β·τ_x
+        const ab = scalar.mul(proof.ipa.a, proof.ipa.b);
+        const g_this = scalar.add(
+            scalar.mul(scalar.mul(alpha, w), scalar.sub(ab, proof.t_hat)),
+            scalar.mul(beta, scalar.sub(proof.t_hat, delta)),
+        );
+        g_coef.* = scalar.add(g_coef.*, g_this);
+        h_coef.* = scalar.add(h_coef.*, scalar.add(scalar.mul(alpha, proof.mu), scalar.mul(beta, proof.tau_x)));
+
+        // Per-proof points.
+        scalars[at] = neg_alpha;
+        points[at] = proof.a;
+        scalars[at + 1] = scalar.mul(neg_alpha, x);
+        points[at + 1] = proof.s;
+        scalars[at + 2] = scalar.mul(neg_beta, x);
+        points[at + 2] = proof.t1;
+        scalars[at + 3] = scalar.mul(neg_beta, x2);
+        points[at + 3] = proof.t2;
+        at += 4;
+        for (0..rounds) |j| {
+            scalars[at] = scalar.mul(neg_alpha, scalar.mul(u[j], u[j]));
+            points[at] = proof.ipa.l_vec[j];
+            scalars[at + 1] = scalar.mul(neg_alpha, scalar.mul(u_inv[j], u_inv[j]));
+            points[at + 1] = proof.ipa.r_vec[j];
+            at += 2;
+        }
+        var zj = scalar.mul(z, z);
+        for (e.commitments) |v| {
+            scalars[at] = scalar.mul(neg_beta, zj);
+            points[at] = v;
+            at += 1;
+            zj = scalar.mul(zj, z);
+        }
+    }
+    std.debug.assert(at == total);
+    const sum = scalarvec.multiScalarMulVartime(scalars, points) catch return false;
+    return sum.equivalent(scalarvec.identity_point);
+}
+
 // ── tests (commit + deltaYZ + codec + construction-time guard — REAL, ungated) ──
 
 test "commit: matches direct scalar-mult + add" {

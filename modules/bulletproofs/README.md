@@ -28,7 +28,7 @@ design and the verification methodology.
 | `transcript.zig` | **REAL.** `Transcript` — Merlin v1.0 (STROBE-128) Fiat-Shamir transcript, byte-compatible with the `merlin` crate |
 | `scalarvec.zig` | **REAL.** Scalar/vector arithmetic (`innerProduct`, `hadamard`, `addVec`/`subVec`/`scaleVec`, `powers`) + `multiScalarMul` over Ristretto255 |
 | `ipa.zig` | **FABLE CORE (implemented):** `proveIpa`/`verifyIpa`. `InnerProductProof`'s struct + byte codec are REAL |
-| `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`, aggregated `proveMultiple`/`verifyMultiple`. `commit`, `deltaYZ`/`deltaYZMultiple`, and `RangeProof`'s struct + byte codec are REAL |
+| `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`, aggregated `proveMultiple`/`verifyMultiple`, `verifyBatch` (many proofs, one MSM). `commit`, `deltaYZ`/`deltaYZMultiple`, and `RangeProof`'s struct + byte codec are REAL |
 | `gate.zig` | The single switch (`core_implemented`) gating the two cores' tests |
 | `kat_test.zig` | The property/soundness KAT harness (completeness + soundness scenarios) |
 | `aggregate_test.zig` | Aggregated proofs: completeness for m = 1..8, malformed batches, reordered/swapped/dropped commitments |
@@ -73,11 +73,24 @@ const gammas: [4][32]u8 = ...; // one blinding per value
 // commitments[j] = bulletproofs.commit(gens, values[j] as scalar bytes, gammas[j])
 
 var pt = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
-const proof = try bulletproofs.proveMultiple(allocator, gens, &pt, &values, &gammas);
+const proof = try bulletproofs.proveMultiple(allocator, io, gens, &pt, &values, &gammas);
 defer proof.deinit(allocator);
 
 var vt = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
 const ok = bulletproofs.verifyMultiple(gens, &vt, &commitments, proof); // true
+```
+
+Many independent proofs (single or aggregated, mixed sizes, one `gens`)
+verify faster together — one multi-scalar multiplication, random weights from
+`io`:
+
+```zig
+var t1 = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
+var t2 = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
+const all_ok = try bulletproofs.verifyBatch(gens, io, &.{
+    .{ .transcript = &t1, .commitments = &commitments, .proof = proof },
+    .{ .transcript = &t2, .commitments = &other_commitments, .proof = other_proof },
+});
 ```
 
 `proveMultiple` refuses an empty batch, a length that is not a power of

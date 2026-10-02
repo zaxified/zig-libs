@@ -555,8 +555,12 @@ threshold_ecdsa	ReleaseFast	fac	1	<=17	7a153bb8c46709fb	b014d308e3ab9ce7
 # generators and Merlin transcript), which changes what `proveIpa` folds over.
 # Counts re-measured unchanged: rangeproof 8 total / 0 in-file, ipa 4 / 0,
 # controls and traps 0.
-bulletproofs	ReleaseFast	rangeproof	1	0	5c4aa46b43491786	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	89b3fb2bdc8bacc3	2ade41bb2f418497
+# Source pin moved 2026-10-02 (batch verification: `verifyBatch` added to
+# rangeproof.zig, the IPA transcript replay and challenge products moved into
+# `ipa.replayChallenges`/`challengeProducts`, verifier side only). Both rows
+# re-measured unchanged.
+bulletproofs	ReleaseFast	rangeproof	1	0	d2c420d56f7c9cf3	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	59164a938059489a	2ade41bb2f418497
 paillier	ReleaseFast	crt	1	<=331	84c570c6ec84daea	ca16fc01b4ebb44c
 paillier	ReleaseFast	noncrt	1	<=141	84c570c6ec84daea	ca16fc01b4ebb44c
 paillier	ReleaseFast	mul	1	<=12	84c570c6ec84daea	b2221403ad3dad41

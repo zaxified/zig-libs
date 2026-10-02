@@ -396,37 +396,19 @@ pub fn equationSides(
     const rounds: usize = std.math.log2_int(usize, n);
     if (proof.l_vec.len != rounds or proof.r_vec.len != rounds) return null;
 
-    appendDomainSep(transcript, n);
-
     // `rounds <= 63` always (n fits in a usize), so a fixed stack array
     // keeps this verifier allocation-free (its signature has no
     // allocator).
     var u: [64][32]u8 = undefined;
     var u_inv: [64][32]u8 = undefined;
-    for (0..rounds) |j| {
-        // Replay the prover's exact transcript ops: L/R bound before u.
-        // dalek's verifier refuses an identity L/R before binding it.
-        transcript.validateAndAppendPoint("L", proof.l_vec[j]) catch return null;
-        transcript.validateAndAppendPoint("R", proof.r_vec[j]) catch return null;
-        u[j] = transcript.challengeScalar("u");
-        u_inv[j] = invertScalar(u[j]);
-    }
+    if (!replayChallenges(transcript, n, proof, &u, &u_inv)) return null;
 
     // §3.1's single-multi-exponentiation form: rather than folding a
     // shrinking P' round by round, fold the ORIGINAL generators by the
-    // accumulated per-index challenge products
-    //   s_i     = prod_j u_j^{+1 if bit (rounds-1-j) of i is 1, else -1}
-    //   s_i^{-1} = the same product with the exponents negated
-    // (round j consumes index bit rounds-1-j: round 0 splits on the TOP
-    // bit) and check
+    // accumulated per-index challenge products `s_i` (`challengeProducts`)
+    // and check
     //   <a*s, G> + <b*s^{-1}, H> + (a*b)*Q
     //     == P + sum_j (u_j^2 * L_j + u_j^{-2} * R_j).
-    // The per-index products s_i are computed the O(n) incremental way
-    // (dalek's trick) instead of an O(n·log n) per-index inner loop:
-    //   s_0 = prod_j u_j^{-1};  setting the highest bit of an index i
-    //   multiplies s by the corresponding u_j^2.
-    // The inverse product s_i^{-1} needs no per-index inversion: bit-
-    // complementing the index inverts every factor, so s_i^{-1} = s_{n-1-i}.
     //
     // This whole multi-exponentiation is over PUBLIC data (the proof, the
     // public generators/Q/P, and the challenges replayed from the proof), so
@@ -440,19 +422,8 @@ pub fn equationSides(
     // concern applies (matching `rangeproof.verify`).
     const alloc = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
-    var allinv = scalarvec.one;
-    for (0..rounds) |j| allinv = scalar.mul(allinv, u_inv[j]);
-
-    const s = alloc.alloc([32]u8, n) catch return null;
+    const s = challengeProducts(alloc, u[0..rounds], u_inv[0..rounds], n) orelse return null;
     defer alloc.free(s);
-    s[0] = allinv;
-    for (1..n) |i| {
-        const lg = std.math.log2_int(usize, i); // floor(log2 i), i >= 1
-        const k = @as(usize, 1) << @intCast(lg);
-        const jj = rounds - 1 - lg;
-        const u_sq = scalar.mul(u[jj], u[jj]);
-        s[i] = scalar.mul(s[i - k], u_sq);
-    }
 
     // lhs = <a*s, G> + <b*s^{-1}, H> + (a*b)*Q as one (2n+1)-term MSM.
     const terms = 2 * n + 1;
@@ -482,6 +453,58 @@ pub fn equationSides(
     }
 
     return .{ .lhs = lhs, .rhs = rhs };
+}
+
+/// Replays the verifier's half of the IPA transcript — the domain separator,
+/// then per round `L`, `R` (identity refused, as dalek does) and the
+/// challenge `u` — writing `u_j` and `u_j^{-1}` for the `log2(n)` rounds.
+/// `false` on an identity `L`/`R`. Shared by `equationSides` and
+/// `rangeproof.verifyBatch`, so the two cannot drift apart. The caller has
+/// checked `proof.l_vec.len == proof.r_vec.len == log2(n)`.
+pub fn replayChallenges(
+    transcript: *Transcript,
+    n: usize,
+    proof: InnerProductProof,
+    u: *[64][32]u8,
+    u_inv: *[64][32]u8,
+) bool {
+    appendDomainSep(transcript, n);
+    for (0..proof.l_vec.len) |j| {
+        transcript.validateAndAppendPoint("L", proof.l_vec[j]) catch return false;
+        transcript.validateAndAppendPoint("R", proof.r_vec[j]) catch return false;
+        u[j] = transcript.challengeScalar("u");
+        u_inv[j] = invertScalar(u[j]);
+    }
+    return true;
+}
+
+/// The per-index challenge products of §3.1's single-MSM check, `n` of them:
+///   s_i = prod_j u_j^{+1 if bit (rounds-1-j) of i is 1, else -1}
+/// (round j consumes index bit rounds-1-j: round 0 splits on the TOP bit).
+/// Computed the O(n) incremental way (dalek's trick) instead of an
+/// O(n·log n) per-index loop: `s_0 = prod_j u_j^{-1}`, and setting the
+/// highest bit of an index multiplies by the corresponding `u_j^2`. The
+/// inverse product needs no inversion: bit-complementing the index inverts
+/// every factor, so `s_i^{-1} = s_{n-1-i}`. Caller frees; `null` on OOM.
+pub fn challengeProducts(
+    alloc: std.mem.Allocator,
+    u: []const [32]u8,
+    u_inv: []const [32]u8,
+    n: usize,
+) ?[][32]u8 {
+    const rounds = u.len;
+    var allinv = scalarvec.one;
+    for (u_inv) |ui| allinv = scalar.mul(allinv, ui);
+    const s = alloc.alloc([32]u8, n) catch return null;
+    s[0] = allinv;
+    for (1..n) |i| {
+        const lg = std.math.log2_int(usize, i); // floor(log2 i), i >= 1
+        const k = @as(usize, 1) << @intCast(lg);
+        const jj = rounds - 1 - lg;
+        const u_sq = scalar.mul(u[jj], u[jj]);
+        s[i] = scalar.mul(s[i - k], u_sq);
+    }
+    return s;
 }
 
 // ── tests (codec + mechanical preconditions — REAL, ungated) ───────────────

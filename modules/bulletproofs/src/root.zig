@@ -145,6 +145,11 @@ pub const verify = rangeproof_mod.verify;
 /// proof over `Generators.initParties(n, >= m)`.
 pub const proveMultiple = rangeproof_mod.proveMultiple;
 pub const verifyMultiple = rangeproof_mod.verifyMultiple;
+/// Several independent proofs (mixed `m`) in one vartime MSM, random
+/// weights from the caller's `std.Io` — see `rangeproof.verifyBatch`.
+pub const verifyBatch = rangeproof_mod.verifyBatch;
+pub const BatchEntry = rangeproof_mod.BatchEntry;
+pub const VerifyBatchError = rangeproof_mod.VerifyBatchError;
 pub const ProveMultipleError = rangeproof_mod.ProveMultipleError;
 /// The aggregated `delta(y,z)`; `m = 1` is `deltaYZ`.
 pub const deltaYZMultiple = rangeproof_mod.deltaYZMultiple;
@@ -166,6 +171,7 @@ pub const Ristretto255 = std.crypto.ecc.Ristretto255;
 
 const kat_test = @import("kat_test.zig");
 const aggregate_test = @import("aggregate_test.zig");
+const batch_test = @import("batch_test.zig");
 const interop_test = @import("interop_test.zig");
 const stackprobe_test = @import("stackprobe_test.zig");
 const verify_b8_diff_test = @import("verify_b8_diff_test.zig");
@@ -174,6 +180,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = kat_test;
     _ = aggregate_test;
+    _ = batch_test;
     _ = interop_test;
     _ = stackprobe_test;
     _ = verify_b8_diff_test;

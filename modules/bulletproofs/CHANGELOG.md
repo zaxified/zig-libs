@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **Batch verification: `verifyBatch`.** Several independent
+  proofs (single or aggregated, mixed `m`) checked with one vartime MSM, each
+  proof's two checks folded into one identity equation with two fresh random
+  weights from the caller's `std.Io` (dalek's construction). The IPA
+  transcript replay moved into `ipa.replayChallenges`/`challengeProducts`,
+  shared with `equationSides`. New `BatchEntry`, `VerifyBatchError`.
+
 - **2026-10-02** — **BREAKING: `prove` and `proveMultiple` take an `io: std.Io`**
   (after the allocator) and draw their blinding randomness from
   `io.randomSecure`. The module builds and proves on every target now; it
