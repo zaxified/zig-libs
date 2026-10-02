@@ -386,9 +386,9 @@ k256	ReleaseFast	ecdsa	1	11	de35a6b6fdf0588c	8ff4812d21149442
 # structural rewrite alone did NOT fix it (7 → 7, 5 → 5) — see
 # `modules/montint/SPEC.md` § "Constant-time contract" for that table. Any
 # non-zero appearing here again is a regression, not a new validation.
-montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
-montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	507ee5745c60770e	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	507ee5745c60770e	5c44fe7ce913f8f6
+montint	ReleaseFast	asmcore	1	0	507ee5745c60770e	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -397,13 +397,13 @@ montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	124fbde3ecf76aa5	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	393fcb29d93091a8	efbe5c72b7a484c2
 montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # montint dyn (2026-10-02): DynModint with a SECRET modulus (value fields
 # tainted after construction, slot L not), operands, exponent, wide inputs, at
 # L=16 and L=32. The 2 in-file are elemFromBytesBE's accept/reject, one per
 # width; divExact's and eql's verdicts branch in the printing (witness).
-montint	ReleaseFast	dyn	1	2	a1282f4f954866da	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	37e11d7a6be7418b	880a04f6d911e62c
 p256	ReleaseFast	comb	1	2	8dc7a6306ed8c563	50b80e702e9284d8
 p256	ReleaseFast	sign	1	<=12	521052e105bbd9bb	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
@@ -514,15 +514,16 @@ blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # (`presign.init`'s x_i·G, `γ_i·G`, `k_i·R`, `σ_i·R`); (d) the reductions
 # of the tainted draws themselves (`randomScalar`). No context has its first
 # in-module frame on a prover-side branch of `presign.zig` or `ecproofs.zig`.
-# 2026-10-02 (montint.DynModint): share 394 -> 244, nonce 669 -> 478. Gone:
+# 2026-10-02 (montint.DynModint): share 394 -> 244, nonce 669 -> 478 (243 / 477
+# after the 2026-10-03 constant-time Miller-Rabin). Gone:
 # class (b) — paillier.decrypt's divFloor is a Hensel exact division now — and
 # every prover-side std.crypto.ff product/parse (ring-Pedersen commitments,
 # c_A^alpha·Enc(gamma), r^e·beta, secrets moved between moduli, mta's b/beta'/
 # randomness, paillier.addCiphertexts). The ff.zig contexts left (25 / 34) all
 # sit under verify*Inner, the proofs' fromBytes parsers, auxFeEql/pailFeEql
 # and the verifier's gammaPowWide — class (a), public values over-tainted.
-threshold_ecdsa	ReleaseFast	share	1	<=244	806a21d481f8c66b	df18c96b59d38d0a
-threshold_ecdsa	ReleaseFast	nonce	1	<=478	806a21d481f8c66b	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	share	1	<=243	83705fe4d7ee1fcc	2420e05cd0b2cd15
+threshold_ecdsa	ReleaseFast	nonce	1	<=477	83705fe4d7ee1fcc	2420e05cd0b2cd15
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -553,11 +554,12 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=478	806a21d481f8c66b	df18c96b59d38d0a
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-# 2026-10-02: 462 -> 285 (montint.DynModint, see share/nonce above): the 13
+# 2026-10-02: 462 -> 285, 284 on 2026-10-03 (montint.DynModint, see share/nonce
+# above): the 13
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=285	806a21d481f8c66b	df18c96b59d38d0a
+threshold_ecdsa	ReleaseFast	betaprime	1	<=284	83705fe4d7ee1fcc	2420e05cd0b2cd15
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -577,7 +579,24 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=285	806a21d481f8c66b	df18c96b59d38d0a
 # montgomeryMul final subtractions went with powSecret's and the commitments'
 # move to montint.DynModint (pedersenCt). Left: Scalar.fromBytes48 on e (2),
 # stripLeadingZeros on e and v (2), the v < 0 redraw (1) — all as above.
-threshold_ecdsa	ReleaseFast	fac	1	5	94c22543ed19bd38	b014d308e3ab9ce7
+threshold_ecdsa	ReleaseFast	fac	1	5	efa64f0b61642b12	b014d308e3ab9ce7
+# threshold_ecdsa pimod (2026-10-03) — Πmod prover over tss-lib's 2048-bit N,
+# Paillier p, q tainted. The per-round work (Legendre symbols by Euler's
+# criterion, the 4th roots with a CT ±s select, the CRT, q^-1 mod p by Fermat)
+# runs on montint.DynModint modulo the secret primes: 0 contexts there. Left,
+# all key-setup big-int arithmetic on p, q: d = Ñ^-1 mod φ by extended Euclid
+# (`modInverse`, 451), φ and the big-int copies of p, q (`proveCore`, 84;
+# `bigFromBytes`/`stripLeadingZeros`, 4), and fromLimbsBits's length verdict
+# (1). The inverse needs a CT inversion modulo an even modulus — montint
+# backlog (safegcd); tracked in threshold_ecdsa's SPEC backlog.
+threshold_ecdsa	ReleaseFast	pimod	1	<=540	83167dadaad1b093	32fb00d8e8d6b688
+# threshold_ecdsa prime (2026-10-03) — root.isProbablePrime on tss-lib's
+# 1024-bit Blum prime, tainted, its length (1024) given by the caller as the
+# prime searches do. 4 in-file: fromLimbsBits's verdict (1), the `s` scan over
+# bits 0-1 of m-1 (1; ≡ 3 mod 4 by construction), and the round verdict
+# `pass` (2; always 1 for a prime). The verdict printed is a constant on a
+# prime's path, so the witness prints the tainted input.
+threshold_ecdsa	ReleaseFast	prime	1	4	b54d01830c17f6ad	b2dd6eba5614834e
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

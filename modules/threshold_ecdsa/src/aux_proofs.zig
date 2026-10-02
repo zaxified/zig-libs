@@ -62,6 +62,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
+const montint = @import("montint");
 const gate = @import("gate.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -86,6 +87,11 @@ pub const pi_prm_domain = "threshold_ecdsa/aux-proofs/pi-prm/v1";
 /// its own, so a proof about an aux `Ñ` can never pass as one about a
 /// Paillier `N` or the other way round.
 pub const pi_mod_paillier_domain = "threshold_ecdsa/aux-proofs/pi-mod-paillier/v1";
+/// Πmod and Πprm over an aux `Ñ` BOUND to the prover's context (`session id
+/// || prover index`, as every other proof in dealer-free keygen) — domains
+/// of their own, so a bound proof never passes as an unbound one or back.
+pub const pi_mod_bound_domain = "threshold_ecdsa/aux-proofs/pi-mod-bound/v1";
+pub const pi_prm_bound_domain = "threshold_ecdsa/aux-proofs/pi-prm-bound/v1";
 
 // ── small shared helpers (mechanical byte-buffer plumbing only) ─────────
 //
@@ -342,6 +348,13 @@ fn deriveModSeed(binding: ModBinding, w: root.AuxFe) [32]u8 {
             t.appendAuxFe(w);
             return t.finalizeDigest();
         },
+        .aux_bound => |ab| {
+            var t = zkproofs.Transcript.init(pi_mod_bound_domain);
+            t.appendContext(ab.context);
+            t.appendAuxParams(ab.aux);
+            t.appendAuxFe(w);
+            return t.finalizeDigest();
+        },
         .paillier => |pb| {
             var t = zkproofs.Transcript.init(pi_mod_paillier_domain);
             t.appendContext(pb.context);
@@ -360,6 +373,9 @@ fn deriveModSeed(binding: ModBinding, w: root.AuxFe) [32]u8 {
 /// neither replayed into another session nor claimed by another party).
 const ModBinding = union(enum) {
     aux: root.AuxParams,
+    /// An aux tuple plus the prover's context: a copied `Ñ` with its proof
+    /// does not verify under the copier's context.
+    aux_bound: struct { aux: root.AuxParams, context: []const u8 },
     paillier: struct { n: root.AuxModulus, context: []const u8 },
 };
 
@@ -388,9 +404,14 @@ pub fn deriveModChallenge(n_tilde: root.AuxModulus, seed: [32]u8, index: u32) ro
 
 /// The Πprm Fiat-Shamir seed (CGGMP21 Fig.17: "e = FS(N, s, t, A_1..A_m)").
 /// Binds the full `aux` tuple plus every round's first-message commitment
-/// `A_i`.
-fn derivePrmSeed(aux: root.AuxParams, commitments: []const root.AuxFe) [32]u8 {
-    var t = zkproofs.Transcript.init(pi_prm_domain);
+/// `A_i`, and — for a bound proof — the prover's `context` under a domain of
+/// its own.
+fn derivePrmSeed(aux: root.AuxParams, context: ?[]const u8, commitments: []const root.AuxFe) [32]u8 {
+    var t = if (context) |c| blk: {
+        var tb = zkproofs.Transcript.init(pi_prm_bound_domain);
+        tb.appendContext(c);
+        break :blk tb;
+    } else zkproofs.Transcript.init(pi_prm_domain);
     t.appendAuxParams(aux);
     for (commitments) |a| t.appendAuxFe(a);
     return t.finalizeDigest();
@@ -669,67 +690,99 @@ fn isProbablePrime(m: root.AuxModulus, random: std.Random) bool {
     return true;
 }
 
-/// The `ff` modulus + fixed-width `(r+1)/4` square-root exponent for one
-/// Blum-prime factor `r` (Πmod prover side). `e_buf` is caller-owned
-/// backing storage for the returned exponent slice — fixed width = `r`'s
-/// byte length (the exponent VALUE is secret — it reveals the factor —
-/// but its LENGTH is public: each factor is half the public modulus).
-/// Fail-closed on a degenerate `r` (even, etc.): the `ff` modulus falls
-/// back to `nt`, yielding garbage a correct verifier rejects.
-fn blumFactorCtx(
-    gpa: std.mem.Allocator,
-    r_big: *const BigInt,
-    nt: root.AuxModulus,
-    e_buf: *[root.aux_modulus_bytes]u8,
-) std.mem.Allocator.Error!struct { m: root.AuxModulus, e_bytes: []const u8 } {
-    var r_buf: [root.aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &r_buf);
-    r_big.toConst().writeTwosComplement(&r_buf, .big);
-    const m = root.AuxModulus.fromBytes(stripLeadingZeros(&r_buf), .big) catch nt;
+/// The run-time montint modulus the Πmod prover works in (a factor of Ñ,
+/// or Ñ itself).
+const Ct = montint.DynModint(root.aux_modulus_bits);
 
-    var t1 = try newBig(gpa);
-    defer t1.deinit();
-    var t2 = try newBig(gpa);
-    defer t2.deinit();
-    try t1.addScalar(r_big, 1);
-    try t2.shiftRight(&t1, 2); // (r+1)/4 — exact for r ≡ 3 (mod 4)
-    @memset(e_buf, 0);
-    t2.toConst().writeTwosComplement(e_buf, .big);
-    const r_len = byteLen(r_big.bitCountAbs());
-    return .{ .m = m, .e_bytes = e_buf[root.aux_modulus_bytes - r_len ..] };
+/// One Blum-prime factor `r` of the prover's modulus as a SECRET montint
+/// modulus, with the exponents the per-round steps need. Fail-closed on a
+/// degenerate `r` (even, < 3): the modulus falls back to `nt`, yielding
+/// garbage a correct verifier rejects.
+const BlumCt = struct {
+    m: Ct,
+    /// `(r+1)/4` — the square-root exponent for `r ≡ 3 (mod 4)`.
+    sqrt_e: Ct.Elem,
+    /// `(r-1)/2` — Euler's criterion.
+    leg_e: Ct.Elem,
+    /// `r-2` — Fermat inversion.
+    pm2: Ct.Elem,
+    /// 1 iff `-1` is a non-residue mod `r`, i.e. `r ≡ 3 (mod 4)` (bit 1 of
+    /// an odd `r`) — read off the value, no branch.
+    nm1: u1,
+    one: Ct.Elem,
+
+    /// `r_be` is the secret factor's big-endian bytes. Its bit length is
+    /// taken as `⌈bits(Ñ)/2⌉` — the public key size — so nothing scans the
+    /// value for it; a factor of another length falls back to a scan
+    /// (`fromBytesBE`), a degenerate one to `nt`.
+    fn init(r_be: []const u8, nt: root.AuxModulus) BlumCt {
+        var v = Ct.loadBE(r_be) catch Ct.zero;
+        defer std.crypto.secureZero(u64, &v);
+        const m = Ct.fromLimbsBits(&v, (nt.bits() + 1) / 2) catch
+            Ct.fromBytesBE(r_be) catch (Ct.fromFf(nt) catch unreachable);
+        var one = Ct.zero;
+        one[0] = 1;
+        var two = Ct.zero;
+        two[0] = 2;
+        var rp1 = m.m;
+        _ = montint.limbs.addInto(&rp1, &one);
+        var rm1 = m.m;
+        _ = montint.limbs.subInto(&rm1, &one);
+        var rm2 = m.m;
+        _ = montint.limbs.subInto(&rm2, &two);
+        defer std.crypto.secureZero(u64, &rp1);
+        defer std.crypto.secureZero(u64, &rm1);
+        return .{
+            .m = m,
+            .sqrt_e = shrElem(&rp1, 2),
+            .leg_e = shrElem(&rm1, 1),
+            .pm2 = rm2,
+            .nm1 = @truncate(m.m[0] >> 1),
+            .one = one,
+        };
+    }
+
+    fn wipe(self: *BlumCt) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+
+    /// 1 iff `c` is not a non-zero QR mod `r` (Euler's criterion,
+    /// `c^((r-1)/2) ≠ 1`), constant-time. Returned as a bit for the caller
+    /// to combine with bit operations, never to branch on.
+    fn nonResidue(self: *const BlumCt, c: *const Ct.Elem) u1 {
+        var l = self.m.pow(c, &self.leg_e);
+        defer std.crypto.secureZero(u64, &l);
+        return @intFromBool(!Ct.eql(&l, &self.one));
+    }
+
+    /// A 4th root of the QR `c` mod `r ≡ 3 (mod 4)`: `s = c^((r+1)/4)`, the
+    /// QR one of `±s` (exactly one is, `-1` being a non-residue) picked by a
+    /// constant-time select, then its square root again.
+    fn fourthRoot(self: *const BlumCt, c: *const Ct.Elem) Ct.Elem {
+        var s = self.m.pow(c, &self.sqrt_e);
+        defer std.crypto.secureZero(u64, &s);
+        var neg = self.m.neg(&s);
+        defer std.crypto.secureZero(u64, &neg);
+        var qr = Ct.select(self.nonResidue(&s) == 1, &neg, &s);
+        defer std.crypto.secureZero(u64, &qr);
+        return self.m.pow(&qr, &self.sqrt_e);
+    }
+};
+
+/// `v >> k` over the limbs (`k < 64`), positions only.
+fn shrElem(v: *const Ct.Elem, comptime k: u6) Ct.Elem {
+    var out: Ct.Elem = undefined;
+    for (&out, 0..) |*o, i| {
+        const hi: u64 = if (i + 1 < v.len) v[i + 1] else 0;
+        o.* = (v[i] >> k) | (hi << @intCast(64 - @as(u7, k)));
+    }
+    return out;
 }
 
-/// A 4th root of `c` modulo one Blum-prime factor `r` (`r ≡ 3 (mod 4)`,
-/// `c` a QR mod `r`): two successive square roots via the closed form
-/// `v^{(r+1)/4} mod r`, flipping the intermediate root's sign to land on
-/// the QR square root before the second one (for `r ≡ 3 (mod 4)`, exactly
-/// one of `±s` is a QR — `-1` is a non-residue). `rm`/`r_big` are the SAME
-/// modulus in `ff`/big-int form; `e_bytes` is `blumFactorCtx`'s exponent.
-/// Returns the root as an owned big integer (for CRT recombination).
-fn fourthRootBlum(
-    gpa: std.mem.Allocator,
-    rm: root.AuxModulus,
-    r_big: *const BigInt,
-    c_big: *const BigInt,
-    e_bytes: []const u8,
-) std.mem.Allocator.Error!BigInt {
-    var quot = try newBig(gpa);
-    defer quot.deinit();
-    var rem = try newBig(gpa);
-    defer rem.deinit();
-    try quot.divFloor(&rem, c_big, r_big); // c mod r
-    const c_fe = feFromBig(rm, &rem);
-
-    // First square root s = c^{(r+1)/4}; pick the QR one of ±s.
-    var s = rm.powWithEncodedExponent(c_fe, e_bytes, .big) catch rm.one();
-    {
-        var s_big = try bigFromFe(gpa, s);
-        defer s_big.deinit();
-        if ((try jacobiBig(gpa, &s_big, r_big)) == -1) s = rm.sub(rm.zero, s);
-    }
-    // Second square root: a 4th root of c mod r.
-    const x_fe = rm.powWithEncodedExponent(s, e_bytes, .big) catch rm.one();
-    return bigFromFe(gpa, x_fe);
+/// 1 iff `(-1)^a · w^b · y` is a QR mod one prime, from the three
+/// non-residue bits — `ny ⊕ a·nm1 ⊕ b·nw = 0`.
+inline fn qrBit(ny: u1, nm1: u1, nw: u1, a: u1, b: u1) u1 {
+    return ~(ny ^ (a & nm1) ^ (b & nw));
 }
 
 // ── Piprm / Pimod — the two irreducible ZK-proof cores (IMPLEMENTED) ────
@@ -772,6 +825,28 @@ pub const Piprm = struct {
         allocator: std.mem.Allocator,
         aux: root.AuxParams,
         trapdoor: root.AuxTrapdoor,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        return proveCtx(allocator, aux, trapdoor, null, random);
+    }
+
+    /// `prove`, bound to the prover's `context` (`session id || prover
+    /// index`): verifies only under `verifyBound` with the same context.
+    pub fn proveBound(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!PrmProof {
+        return proveCtx(allocator, aux, trapdoor, context, random);
+    }
+
+    fn proveCtx(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: root.AuxTrapdoor,
+        context: ?[]const u8,
         random: std.Random,
     ) ProveError!PrmProof {
         const nt = aux.n_tilde;
@@ -837,7 +912,7 @@ pub const Piprm = struct {
         }
 
         // 2. Fiat-Shamir bit-challenge — the REAL scaffold machinery above.
-        const seed = derivePrmSeed(aux, &commitments);
+        const seed = derivePrmSeed(aux, context, &commitments);
         var e_bits: [pi_prm_iterations]bool = undefined;
         derivePrmChallengeBits(seed, &e_bits);
 
@@ -882,6 +957,15 @@ pub const Piprm = struct {
     /// 4. Accept (return true) only if every round's equation holds.
     /// ```
     pub fn verify(aux: root.AuxParams, proof: PrmProof) bool {
+        return verifyCtx(aux, null, proof);
+    }
+
+    /// `proveBound`'s counterpart; `context` must be the prover's.
+    pub fn verifyBound(aux: root.AuxParams, context: []const u8, proof: PrmProof) bool {
+        return verifyCtx(aux, context, proof);
+    }
+
+    fn verifyCtx(aux: root.AuxParams, context: ?[]const u8, proof: PrmProof) bool {
         const nt = aux.n_tilde;
         const one = nt.one();
 
@@ -907,7 +991,7 @@ pub const Piprm = struct {
         //    SAME derivePrmSeed/derivePrmChallengeBits call the prover made.
         var commitments: [pi_prm_iterations]root.AuxFe = undefined;
         for (proof.entries, &commitments) |e, *c| c.* = e.a_commit;
-        const seed = derivePrmSeed(aux, &commitments);
+        const seed = derivePrmSeed(aux, context, &commitments);
         var e_bits: [pi_prm_iterations]bool = undefined;
         derivePrmChallengeBits(seed, &e_bits);
 
@@ -972,6 +1056,18 @@ pub const Pimod = struct {
         random: std.Random,
     ) ProveError!ModProof {
         return proveCore(allocator, aux.n_tilde, trapdoor.p, trapdoor.q, .{ .aux = aux }, random);
+    }
+
+    /// `prove`, bound to the prover's `context` (`session id || prover
+    /// index`): verifies only under `verifyBound` with the same context.
+    pub fn proveBound(
+        allocator: std.mem.Allocator,
+        aux: root.AuxParams,
+        trapdoor: root.AuxTrapdoor,
+        context: []const u8,
+        random: std.Random,
+    ) ProveError!ModProof {
+        return proveCore(allocator, aux.n_tilde, trapdoor.p, trapdoor.q, .{ .aux_bound = .{ .aux = aux, .context = context } }, random);
     }
 
     /// **Prover, Paillier modulus.** The same proof for a party's own
@@ -1045,22 +1141,20 @@ pub const Pimod = struct {
         }
         const d_bytes = d_buf[root.aux_modulus_bytes - n_len ..];
 
-        // Per-factor ff moduli + (r+1)/4 square-root exponents.
-        var ep_buf: [root.aux_modulus_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &ep_buf);
-        const pctx = try blumFactorCtx(allocator, &p, nt, &ep_buf);
-        var eq_buf: [root.aux_modulus_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &eq_buf);
-        const qctx = try blumFactorCtx(allocator, &q, nt, &eq_buf);
-
-        // CRT constant q^{-1} mod p (Garner recombination), fail-closed 0.
-        var qinv = (try modInverse(allocator, &q, &p)) orelse blk: {
-            var zero_big = try newBig(allocator);
-            errdefer zero_big.deinit();
-            try zero_big.set(0);
-            break :blk zero_big;
-        };
-        defer qinv.deinit();
+        // Per-factor constant-time contexts: the primes are SECRET moduli
+        // (montint.DynModint), and every per-round step below — Legendre
+        // symbols, square roots, the CRT — runs on them without a branch on
+        // their value. (Until 2026-10-02 this was big-int Jacobi symbols and
+        // division plus std.crypto.ff pow modulo the secret factor.)
+        var pb = BlumCt.init(p_secret, nt);
+        defer pb.wipe();
+        var qb = BlumCt.init(q_secret, nt);
+        defer qb.wipe();
+        const ntc = Ct.fromFf(nt) catch unreachable; // odd, ≥ 3
+        // CRT constant q^{-1} mod p by Fermat (p prime) — constant-time,
+        // unlike the extended Euclid it replaces.
+        var qinv_p = pb.m.pow(&pb.m.reduceLimbs(qb.m.m[0..qb.m.L]), &pb.pm2);
+        defer std.crypto.secureZero(u64, &qinv_p);
 
         // 1. Witness w with Jacobi (w/n_tilde) = -1. Exactly half of
         //    Z_n_tilde* qualifies for a genuine Blum modulus, so the search
@@ -1082,81 +1176,52 @@ pub const Pimod = struct {
             }
         }
 
-        // Per-prime characters of -1 and w, computed once: the per-round
-        // (a_i, b_i) selection only multiplies these signs together.
-        // χ_r(-1) = -1 exactly when r ≡ 3 (mod 4) — true for both factors
-        // of a genuine Blum modulus, which is what makes the four
-        // candidates cover all four QR classes.
-        const jp_m1: i8 = if ((p.toConst().limbs[0] & 3) == 3) -1 else 1;
-        const jq_m1: i8 = if ((q.toConst().limbs[0] & 3) == 3) -1 else 1;
-        var w_big = try bigFromFe(allocator, w_fe);
-        defer w_big.deinit();
-        const jp_w = try jacobiBig(allocator, &w_big, &p);
-        const jq_w = try jacobiBig(allocator, &w_big, &q);
+        // Non-residue bits of w per prime, computed once (w is public, its
+        // characters modulo the secret primes are not).
+        const w_el = Ct.elemFromFf(&w_fe.v);
+        const nw_p = pb.nonResidue(&pb.m.reduceLimbs(w_el[0..ntc.L]));
+        const nw_q = qb.nonResidue(&qb.m.reduceLimbs(w_el[0..ntc.L]));
 
         // 2. Fiat-Shamir challenges — the REAL scaffold machinery above.
         const seed = deriveModSeed(binding, w_fe);
         var entries: [pi_mod_iterations]ModEntry = undefined;
 
-        // Loop temporaries for the CRT recombination.
-        var t = try newBig(allocator);
-        defer t.deinit();
-        var quot = try newBig(allocator);
-        defer quot.deinit();
-        var rem = try newBig(allocator);
-        defer rem.deinit();
-
         for (&entries, 0..) |*slot, idx| {
             const y = deriveModChallenge(nt, seed, @intCast(idx + 1));
 
             // 3. Pick (a_i, b_i) making y' = (-1)^{a_i} w^{b_i} y_i a QR
-            //    mod BOTH factors (Legendre via the Jacobi routine — the
-            //    factors are prime for an honest trapdoor). Exactly one
-            //    pair works for a genuine Blum modulus; fall back to (0,0)
+            //    mod BOTH factors: the first of (0,0),(1,0),(0,1),(1,1) that
+            //    works, chosen with bit operations on the secret
+            //    per-prime characters. (a_i, b_i) themselves are published.
+            //    Exactly one pair works for a genuine Blum modulus; (0,0)
             //    otherwise (garbage the verifier rejects).
-            var y_big = try bigFromFe(allocator, y);
-            defer y_big.deinit();
-            const jp_y = try jacobiBig(allocator, &y_big, &p);
-            const jq_y = try jacobiBig(allocator, &y_big, &q);
-
-            var a_bit = false;
-            var b_bit = false;
-            for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |ab| {
-                var sp = jp_y;
-                var sq = jq_y;
-                if (ab[0]) {
-                    sp *= jp_m1;
-                    sq *= jq_m1;
-                }
-                if (ab[1]) {
-                    sp *= jp_w;
-                    sq *= jq_w;
-                }
-                if (sp == 1 and sq == 1) {
-                    a_bit = ab[0];
-                    b_bit = ab[1];
-                    break;
-                }
-            }
+            const y_el = Ct.elemFromFf(&y.v);
+            const ny_p = pb.nonResidue(&pb.m.reduceLimbs(y_el[0..ntc.L]));
+            const ny_q = qb.nonResidue(&qb.m.reduceLimbs(y_el[0..ntc.L]));
+            const ok00 = qrBit(ny_p, pb.nm1, nw_p, 0, 0) & qrBit(ny_q, qb.nm1, nw_q, 0, 0);
+            const ok10 = qrBit(ny_p, pb.nm1, nw_p, 1, 0) & qrBit(ny_q, qb.nm1, nw_q, 1, 0);
+            const ok01 = qrBit(ny_p, pb.nm1, nw_p, 0, 1) & qrBit(ny_q, qb.nm1, nw_q, 0, 1);
+            const ok11 = qrBit(ny_p, pb.nm1, nw_p, 1, 1) & qrBit(ny_q, qb.nm1, nw_q, 1, 1);
+            const a_bit = (~ok00 & (ok10 | (~ok01 & ok11))) == 1;
+            const b_bit = (~ok00 & ~ok10 & (ok01 | ok11)) == 1;
 
             var y_prime = y;
             if (b_bit) y_prime = nt.mul(w_fe, y_prime);
             if (a_bit) y_prime = nt.sub(nt.zero, y_prime);
 
             // 4. x_i = 4th root of y' — per-factor Blum roots + Garner CRT
-            //    x = x_q + q * ((x_p - x_q) * q^{-1} mod p) < p*q.
-            var c_big = try bigFromFe(allocator, y_prime);
-            defer c_big.deinit();
-            var xp = try fourthRootBlum(allocator, pctx.m, &p, &c_big, pctx.e_bytes);
-            defer xp.deinit();
-            var xq = try fourthRootBlum(allocator, qctx.m, &q, &c_big, qctx.e_bytes);
-            defer xq.deinit();
-            try t.sub(&xp, &xq);
-            try t.mul(&t, &qinv);
-            try quot.divFloor(&rem, &t, &p);
-            try t.mul(&rem, &q);
-            try t.add(&t, &xq);
-            const x_fe = feFromBig(nt, &t);
+            //    x = x_q + q * ((x_p - x_q) * q^{-1} mod p) < p*q, the last
+            //    step mod n_tilde (exact: x < p*q = n_tilde).
+            const c_el = Ct.elemFromFf(&y_prime.v);
+            var xp = pb.fourthRoot(&pb.m.reduceLimbs(c_el[0..ntc.L]));
+            defer std.crypto.secureZero(u64, &xp);
+            var xq = qb.fourthRoot(&qb.m.reduceLimbs(c_el[0..ntc.L]));
+            defer std.crypto.secureZero(u64, &xq);
+            var h = pb.m.mul(&pb.m.sub(&xp, &pb.m.reduceLimbs(xq[0..qb.m.L])), &qinv_p);
+            defer std.crypto.secureZero(u64, &h);
+            var x = ntc.add(&xq, &ntc.mul(&qb.m.m, &h));
+            defer std.crypto.secureZero(u64, &x);
+            const x_fe = Ct.elemToFf(root.AuxFe, nt, &x);
 
             // 5. z_i = y_i^d (constant-time in the secret exponent d).
             const z_fe = zkproofs.powSecret(nt, y, d_bytes); // not ff's pow: it branches on secret windows
@@ -1192,6 +1257,11 @@ pub const Pimod = struct {
     /// ```
     pub fn verify(aux: root.AuxParams, proof: ModProof) bool {
         return verifyCore(aux.n_tilde, .{ .aux = aux }, proof);
+    }
+
+    /// `proveBound`'s counterpart; `context` must be the prover's.
+    pub fn verifyBound(aux: root.AuxParams, context: []const u8, proof: ModProof) bool {
+        return verifyCore(aux.n_tilde, .{ .aux_bound = .{ .aux = aux, .context = context } }, proof);
     }
 
     /// **Verifier, Paillier modulus** — `provePaillier`'s counterpart.
@@ -1309,6 +1379,22 @@ pub fn proveWellFormed(
     };
 }
 
+/// `proveWellFormed`, both proofs bound to the prover's `context`
+/// (`session id || prover index`) — what dealer-free keygen broadcasts, so a
+/// party cannot copy another's `Ñ` together with its proofs.
+pub fn proveWellFormedBound(
+    allocator: std.mem.Allocator,
+    aux: root.AuxParams,
+    trapdoor: root.AuxTrapdoor,
+    context: []const u8,
+    random: std.Random,
+) ProveError!WellFormedProof {
+    return .{
+        .prm = try Piprm.proveBound(allocator, aux, trapdoor, context, random),
+        .mod = try Pimod.proveBound(allocator, aux, trapdoor, context, random),
+    };
+}
+
 /// Validator-side: decide whether a RECEIVED `aux` tuple can be trusted —
 /// `aux.validate(random)` (the structural floor, including `Ñ > q⁷`) and
 /// then BOTH proofs-of-correct-generation. Fail-closed: any refusal rejects
@@ -1323,6 +1409,14 @@ pub fn proveWellFormed(
 pub fn verifyWellFormed(aux: root.AuxParams, proof: WellFormedProof, random: std.Random) VerifyError!void {
     aux.validate(random) catch return error.InvalidAuxParams;
     try verifyProofs(aux, proof);
+}
+
+/// `verifyWellFormed` for `proveWellFormedBound`; `context` must be the
+/// prover's.
+pub fn verifyWellFormedBound(aux: root.AuxParams, context: []const u8, proof: WellFormedProof, random: std.Random) VerifyError!void {
+    aux.validate(random) catch return error.InvalidAuxParams;
+    if (!Piprm.verifyBound(aux, context, proof.prm)) return error.InvalidWellFormedProof;
+    if (!Pimod.verifyBound(aux, context, proof.mod)) return error.InvalidWellFormedProof;
 }
 
 /// The two proofs alone, without `validate` — for the proof tests, which
@@ -1423,7 +1517,7 @@ test "derivePrmChallengeBits: deterministic, not degenerate (ungated)" {
     var commitments: [pi_prm_iterations]root.AuxFe = undefined;
     for (&commitments, 0..) |*c, i| c.* = toyFe(nt, @intCast(2 + i % 90));
 
-    const seed = derivePrmSeed(aux, &commitments);
+    const seed = derivePrmSeed(aux, null, &commitments);
     var bits1: [pi_prm_iterations]bool = undefined;
     derivePrmChallengeBits(seed, &bits1);
     var bits2: [pi_prm_iterations]bool = undefined;
@@ -1441,7 +1535,7 @@ test "derivePrmChallengeBits: deterministic, not degenerate (ungated)" {
 
     // Different commitments -> a different bit-string (overwhelmingly likely).
     commitments[0] = toyFe(nt, 99);
-    const seed3 = derivePrmSeed(aux, &commitments);
+    const seed3 = derivePrmSeed(aux, null, &commitments);
     var bits3: [pi_prm_iterations]bool = undefined;
     derivePrmChallengeBits(seed3, &bits3);
     try testing.expect(!std.mem.eql(bool, &bits1, &bits3));
@@ -1590,6 +1684,32 @@ test "Πprm+Πmod completeness: honest generateAuxParamsWithTrapdoor -> proveWel
 
     const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
     try verifyProofs(gen.params, proof);
+}
+
+test "bound Πprm/Πmod over Ñ: verify only under the prover's context, never as unbound (GATED)" {
+    if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
+
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x626f756e64); // "bound"
+    const random = prng.random();
+    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    defer gen.trapdoor.deinit(allocator);
+    const aux = gen.params;
+    const ctx_a = "session-7" ++ [_]u8{ 0, 0, 0, 1 };
+    const ctx_b = "session-7" ++ [_]u8{ 0, 0, 0, 2 };
+
+    const prm = try Piprm.proveBound(allocator, aux, gen.trapdoor, ctx_a, random);
+    try testing.expect(Piprm.verifyBound(aux, ctx_a, prm));
+    try testing.expect(!Piprm.verifyBound(aux, ctx_b, prm));
+    try testing.expect(!Piprm.verify(aux, prm));
+    const mod = try Pimod.proveBound(allocator, aux, gen.trapdoor, ctx_a, random);
+    try testing.expect(Pimod.verifyBound(aux, ctx_a, mod));
+    try testing.expect(!Pimod.verifyBound(aux, ctx_b, mod));
+    try testing.expect(!Pimod.verify(aux, mod));
+    // …and an unbound proof does not pass as a bound one.
+    const unbound = try proveWellFormed(allocator, aux, gen.trapdoor, random);
+    try testing.expect(!Piprm.verifyBound(aux, ctx_a, unbound.prm));
+    try testing.expect(!Pimod.verifyBound(aux, ctx_a, unbound.mod));
 }
 
 // ── tamper (GATED — needs a valid proof to tamper) ──────────────────────

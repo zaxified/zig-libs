@@ -66,6 +66,9 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
 
         /// The active slot (limb count the arithmetic runs at).
         L: usize,
+        /// The modulus's bit length, fixed at construction (public: the key
+        /// size) so no later call scans the value for it again.
+        nbits: usize,
         /// The modulus, low `L` limbs live, the rest zero.
         m: Elem,
         /// `-m[0]⁻¹ mod 2^64`.
@@ -99,21 +102,49 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         // ── construction ────────────────────────────────────────────────────
 
         /// Build from a little-endian limb value. Rejects an even modulus and
-        /// one below 3. Constant-time in the value; the bit length (which
-        /// picks the slot) is treated as public.
+        /// one below 3. Constant-time in the value except for its bit
+        /// length, which this scans for (it picks the slot) and treats as
+        /// public — `fromLimbsBits` takes the length from the caller instead.
         pub fn fromLimbs(v: *const Elem) Error!Self {
             if (v[0] & 1 == 0) return error.EvenModulus;
             const n = activeLimbs(v);
             if (n == 1 and v[0] < 3) return error.ModulusTooSmall;
-            const nbits = (n - 1) * 64 + (64 - @clz(v[n - 1]));
+            return build(v, (n - 1) * 64 + (64 - @clz(v[n - 1])));
+        }
+
+        /// Build from a limb value whose bit length the caller knows — the
+        /// key size of a secret prime. Nothing reads the value to find its
+        /// length, and the checks (exactly `nbits` bits, odd, `≥ 3`) are
+        /// combined bitwise into one verdict: `error.NonCanonical` if `v` is
+        /// not an odd `nbits`-bit number of at least 2 bits.
+        pub fn fromLimbsBits(v: *const Elem, nbits: usize) Error!Self {
+            if (nbits < 2) return error.ModulusTooSmall;
+            if (nbits > 64 * max_limbs) return error.Overflow;
+            const top = nbits - 1;
+            var bad: u64 = ~v[0] & 1; // even
+            for (v, 0..) |w, i| {
+                // bits at or above position nbits must be zero
+                const allowed: u64 = if (i < top / 64) ~@as(u64, 0) else if (i == top / 64)
+                    (if (top % 64 == 63) ~@as(u64, 0) else (@as(u64, 2) << @intCast(top % 64)) - 1)
+                else
+                    0;
+                bad |= w & ~allowed;
+            }
+            bad |= ~(v[top / 64] >> @intCast(top % 64)) & 1; // top bit set
+            if (bad != 0) return error.NonCanonical;
+            return build(v, nbits);
+        }
+
+        fn build(v: *const Elem, nbits: usize) Self {
             const d: u7 = @intCast(@min(64, nbits - 1));
-            const slot = slotFor(n);
+            const slot = slotFor((nbits + 63) / 64);
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
                 if (s == slot) {
-                    const mm = try Mod(s).fromElem(v[0..s].*);
+                    const mm = Mod(s).fromElemUnchecked(v[0..s].*);
                     var self: Self = .{
                         .L = s,
+                        .nbits = nbits,
                         .m = zero,
                         .n0inv = mm.n0inv,
                         .r2 = zero,
@@ -155,8 +186,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
 
         /// Bit length of the modulus.
         pub fn bits(self: *const Self) usize {
-            const n = activeLimbs(&self.m);
-            return (n - 1) * 64 + (64 - @clz(self.m[n - 1]));
+            return self.nbits;
         }
 
         /// Byte length of the modulus (the width of its minimal encoding).
@@ -340,6 +370,17 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return acc == 0;
         }
 
+        /// `a` if `on`, else `b`, without a branch: the mask is laundered
+        /// through an asm barrier so LLVM cannot turn the blend back into a
+        /// jump on `on` (the montint `blackBox` lesson). `on` may be secret —
+        /// as long as the caller does not branch on it either.
+        pub fn select(on: bool, a: *const Elem, b: *const Elem) Elem {
+            const mask = blackBox(0 -% @as(u64, @intFromBool(on)));
+            var out: Elem = undefined;
+            for (&out, a, b) |*o, x, y| o.* = (x & mask) | (y & ~mask);
+            return out;
+        }
+
         // ── arithmetic (operands `< m`) ─────────────────────────────────────
 
         pub fn add(self: *const Self, a: *const Elem, b: *const Elem) Elem {
@@ -489,6 +530,16 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             unreachable;
         }
     };
+}
+
+/// Optimization barrier, as `Modint`'s: an empty asm the optimizer cannot see
+/// through, so a mask derived from a secret bit stays a mask.
+inline fn blackBox(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
 }
 
 /// `z = x·y mod 2^(64n)` — the low half of the schoolbook product.
@@ -710,6 +761,38 @@ test "DynModint std.crypto.ff bridge round-trips and matches ff's own encoding" 
         mod.toBytesBE(&mod.mul(&a, &a), &b_be);
         try testing.expectEqualSlices(u8, &want, &b_be);
     }
+}
+
+test "DynModint fromLimbsBits: the caller's length, checked in one verdict" {
+    const D = DynModint(1024);
+    var prng = std.Random.DefaultPrng.init(0x6269_7473);
+    const rnd = prng.random();
+    for ([_]usize{ 2, 63, 64, 65, 500, 1024 }) |nbits| {
+        const mv = randModulus(D, rnd, nbits);
+        const a = try D.fromLimbs(&mv);
+        const b = try D.fromLimbsBits(&mv, nbits);
+        try testing.expect(a.L == b.L and a.nbits == b.nbits and D.eql(&a.r2, &b.r2) and D.eql(&a.digit_mont, &b.digit_mont));
+        if (nbits < 1024) try testing.expectError(error.NonCanonical, D.fromLimbsBits(&mv, nbits + 1)); // top bit not set
+        if (nbits > 2) try testing.expectError(error.NonCanonical, D.fromLimbsBits(&mv, nbits - 1)); // a bit above
+        var even = mv;
+        even[0] &= ~@as(u64, 1);
+        try testing.expectError(error.NonCanonical, D.fromLimbsBits(&even, nbits));
+    }
+    var one = D.zero;
+    one[0] = 1;
+    try testing.expectError(error.ModulusTooSmall, D.fromLimbsBits(&one, 1));
+    try testing.expectError(error.Overflow, D.fromLimbsBits(&one, 1025));
+}
+
+test "DynModint select" {
+    const D = DynModint(256);
+    var a = D.zero;
+    a[0] = 5;
+    a[3] = 7;
+    var b = D.zero;
+    b[1] = 9;
+    try testing.expect(D.eql(&D.select(true, &a, &b), &a));
+    try testing.expect(D.eql(&D.select(false, &a, &b), &b));
 }
 
 test "DynModint slots: limb count picks the smallest multiple of step" {

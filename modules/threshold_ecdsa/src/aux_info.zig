@@ -16,11 +16,12 @@
 //!
 //! `ctx_i` is the caller's `session id || u32-BE i`, the same shape the
 //! signing proofs use: a proof can be neither replayed into another session
-//! nor claimed by another party. The ring-Pedersen proofs (Πprm/Πmod over
-//! `Ñ`, `aux_proofs.verifyWellFormed`) predate that binding; a party that
-//! copies another's `Ñ` together with its proofs is caught by
-//! `findDuplicate` instead (every party sees every announcement — the
-//! transport's reliable broadcast).
+//! nor claimed by another party. That includes the ring-Pedersen proofs
+//! (Πprm/Πmod over `Ñ`, `aux_proofs.proveWellFormedBound`, since
+//! 2026-10-02): a party that copies another's `Ñ` together with its proofs
+//! fails `verifyAnnouncement` under its own context. `findDuplicate` stays as
+//! the second line (two announcements sharing a modulus are refused even if
+//! someone re-proved a copied one — impossible without its trapdoor).
 //!
 //! Why each check (CGGMP21 §4, the BitForge disclosure): a Paillier `N`
 //! with small factors, or one that is not a product of two primes, lets
@@ -73,7 +74,7 @@ pub const LocalAux = struct {
         return .{
             .paillier_pk = self.paillier.key.public,
             .aux = self.aux,
-            .aux_proof = try aux_proofs.proveWellFormed(allocator, self.aux, self.trapdoor, random),
+            .aux_proof = try aux_proofs.proveWellFormedBound(allocator, self.aux, self.trapdoor, context, random),
             .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, self.paillier.modulus(), self.paillier.p(), self.paillier.q(), context, random),
         };
     }
@@ -157,7 +158,7 @@ pub fn verifyAnnouncement(a: Announcement, context: []const u8, random: std.Rand
         return error.InvalidPaillierKey;
     const n = root.paillierModulusAsAux(a.paillier_pk) orelse return error.InvalidPaillierKey;
     if (n.bits() != paillier.modulus_bits) return error.InvalidPaillierKey;
-    aux_proofs.verifyWellFormed(a.aux, a.aux_proof, random) catch return error.InvalidAuxParams;
+    aux_proofs.verifyWellFormedBound(a.aux, context, a.aux_proof, random) catch return error.InvalidAuxParams;
     if (!aux_proofs.Pimod.verifyPaillier(n, context, a.paillier_proof)) return error.InvalidPaillierProof;
 }
 
@@ -361,8 +362,12 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
         a.* = try Announcement.fromBytes(bytes);
         try verifyAnnouncement(a.*, &ctx, random);
     }
-    // Bound to its sender: party 2 cannot present party 1's Πmod(N) as its own.
-    try testing.expectError(error.InvalidPaillierProof, verifyAnnouncement(anns[0], &ctxFor(2), random));
+    // Bound to its sender: party 2 cannot present party 1's announcement as
+    // its own — the Ñ proofs refuse first (bound since 2026-10-02), and the
+    // Πmod(N) on its own refuses too.
+    try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(anns[0], &ctxFor(2), random));
+    try testing.expect(!aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(2), anns[0].paillier_proof));
+    try testing.expect(aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(1), anns[0].paillier_proof));
     try testing.expectEqual(@as(?struct { usize, usize }, null), findDuplicate(&anns));
 
     // Πfac, every ordered pair.
@@ -402,7 +407,7 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, 1, split.shares[0].scalar, commits, &locals[1], &anns));
 }
 
-test "aux_info: a copied Ñ passes its (unbound) proofs — findDuplicate is what catches it" {
+test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6175_7832);
     const random = prng.random();
@@ -413,9 +418,13 @@ test "aux_info: a copied Ñ passes its (unbound) proofs — findDuplicate is wha
 
     const ann_a = try a.announce(allocator, &ctxFor(1), random);
     var ann_b = try b.announce(allocator, &ctxFor(2), random);
+    try verifyAnnouncement(ann_b, &ctxFor(2), random);
     ann_b.aux = ann_a.aux;
     ann_b.aux_proof = ann_a.aux_proof;
-    try verifyAnnouncement(ann_b, &ctxFor(2), random); // the gap
+    // Was the gap until 2026-10-02 (the Ñ proofs were unbound): now the
+    // copied proofs are bound to party 1's context, not party 2's.
+    try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(ann_b, &ctxFor(2), random));
+    try verifyAnnouncement(ann_a, &ctxFor(1), random);
     const dup = findDuplicate(&.{ ann_a, ann_b }) orelse return error.TestExpectedDuplicate;
     try testing.expectEqual(@as(usize, 0), dup[0]);
     try testing.expectEqual(@as(usize, 1), dup[1]);
@@ -435,7 +444,7 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
     const ann: Announcement = .{
         .paillier_pk = small.key.public,
         .aux = full.aux,
-        .aux_proof = try aux_proofs.proveWellFormed(allocator, full.aux, full.trapdoor, random),
+        .aux_proof = try aux_proofs.proveWellFormedBound(allocator, full.aux, full.trapdoor, &ctx, random),
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, small.modulus(), small.p(), small.q(), &ctx, random),
     };
     try testing.expectError(error.InvalidPaillierKey, verifyAnnouncement(ann, &ctx, random));

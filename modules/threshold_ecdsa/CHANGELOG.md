@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Πmod's rounds and Miller-Rabin are constant-time in the
+  secret factor.** The Πmod prover's Legendre symbols (Euler's criterion),
+  4th roots (`v^((r+1)/4)`, the QR one of `±s` by a CT select), CRT and
+  `q⁻¹ mod p` (Fermat) run on `montint.DynModint` modulo the secret primes
+  (was big-int Jacobi/division and `std.crypto.ff` pow modulo the factor);
+  `(a_i, b_i)` are picked with bit operations. `root.isProbablePrime(m,
+  n_bits, random)` — now taking the candidate's known length — runs its ladder
+  modulo the secret candidate with no length scan, no witness rejection and
+  one combined round verdict. New ctgrind targets `pimod` (rounds: 0;
+  `d = Ñ⁻¹ mod φ` by extended Euclid and the big-int setup remain, backlog)
+  and `prime` (4, all verdicts). Proofs and keys unchanged.
+
+- **2026-10-02** — **Πprm/Πmod over `Ñ` can be bound to the prover's
+  context.** `Piprm.proveBound`/`verifyBound`, `Pimod.proveBound`/
+  `verifyBound` and `proveWellFormedBound`/`verifyWellFormedBound` put the
+  caller's `session id || index` into the Fiat-Shamir seed under domains of
+  their own (`pi-prm-bound`/`pi-mod-bound`), so a bound proof never passes as
+  an unbound one or under another context. `aux_info`'s announcement uses
+  them: a party that copies another's `Ñ` with its proofs now fails
+  `verifyAnnouncement` (`InvalidAuxParams`) instead of being caught only by
+  `findDuplicate`. The unbound functions are unchanged. ⚠ Announcement wire
+  compatibility: an announcement from an older build no longer verifies.
+
 - **2026-10-02** — **Prover-side products and conversions of secrets are off
   `std.crypto.ff`.** `zkproofs`' private montint slot copy is replaced by
   `montint.DynModint`; new helpers `pedersenCt`/`mulCt`/`rebase`/

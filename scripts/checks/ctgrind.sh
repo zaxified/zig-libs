@@ -206,7 +206,7 @@ declare -A TARGETS=(
     # blind β' is a 160-byte draw that `nonce` never tainted.
     # `fac` added 2026-10-02 (dealer-free keygen): Πfac's prover over the
     # Paillier factors p, q -- one proof, no protocol run, seconds.
-    [threshold_ecdsa]="share nonce betaprime fac"
+    [threshold_ecdsa]="share nonce betaprime fac pimod prime"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm"
@@ -540,6 +540,8 @@ declare -A PATTERN=(
     [aesgcm/generic]='root[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|ghash_polyval[.]zig|modes[.]zig|aes_gcm[.]zig|timing_safe[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [threshold_ecdsa/fac]='fac_proof[.]zig|root[.]zig|zkproofs[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/pimod]='aux_proofs[.]zig|root[.]zig|zkproofs[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/prime]='root[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -581,6 +583,8 @@ declare -A LABEL=(
     [threshold_ecdsa/nonce]='thr_ecdsa nonce k_i/gamma+paillier'
     [threshold_ecdsa/betaprime]='thr_ecdsa MtA blind beta_prime (q^5)+paillier'
     [threshold_ecdsa/fac]='thr_ecdsa Pi_fac prover, Paillier p,q'
+    [threshold_ecdsa/pimod]='thr_ecdsa Pi_mod prover, Paillier p,q'
+    [threshold_ecdsa/prime]='thr_ecdsa Miller-Rabin on a secret prime'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'

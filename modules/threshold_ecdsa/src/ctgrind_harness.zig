@@ -377,7 +377,54 @@ fn runFac(tainted: bool) !void {
 
 // ── the harness proper ────────────────────────────────────────────────────
 
-const Target = enum { share, nonce, betaprime, fac };
+// ── target "pimod": taint the Paillier factors through Πmod's prover ─────
+//
+// `aux_proofs.Pimod.provePaillier` over tss-lib's 2048-bit N, `p`/`q`
+// tainted. Since 2026-10-02 the per-round work (Legendre symbols, 4th roots,
+// CRT, q⁻¹ mod p) runs on montint.DynModint modulo the secret primes; what
+// stays variable-time is the big-integer setup (φ, d = Ñ⁻¹ mod φ by extended
+// Euclid) — the classified residue in the tsv.
+fn runPimod(allocator: std.mem.Allocator, tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    const pp = vectors.tsslib_keygen.parties[0];
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
+    _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
+    var key = try root.paillierBlumFromPrimes(&p, &q);
+    defer key.wipe();
+    const n0 = key.modulus();
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(&p);
+        std.valgrind.memcheck.makeMemUndefined(&q);
+    }
+    var prng = std.Random.DefaultPrng.init(0x7069_6d6f_64); // "pimod"
+    const proof = try root.aux_proofs.Pimod.provePaillier(allocator, n0, &p, &q, "ctgrind", prng.random());
+    var xb: [root.aux_modulus_bytes]u8 = undefined;
+    try proof.entries[0].x.toBytes(&xb, .big);
+    std.debug.print("x0={x}\n", .{xb});
+}
+
+// ── target "prime": Miller-Rabin on a secret prime ──────────────────────
+//
+// `root.isProbablePrime` on tss-lib's 1024-bit Blum prime `p`, tainted —
+// the path every accepted candidate of the prime searches takes.
+fn runPrime(tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    var p: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, vectors.tsslib_keygen.parties[0].paillier_p);
+    var m = try root.AuxModulus.fromBytes(&p, .big);
+    if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&m.v.limbs_buffer));
+    std.mem.doNotOptimizeAway(&m);
+    var prng = std.Random.DefaultPrng.init(0x7072_696d_65); // "prime"
+    const verdict = root.isProbablePrime(m, 1024, prng.random());
+    // The verdict on a prime's path is a constant (every round passes), so
+    // it carries no taint; print the tainted input too, as the witness that
+    // the taint was live when the test ran.
+    std.debug.print("prime={} ctgrind_result={x}\n", .{ verdict, std.mem.asBytes(&m.v.limbs_buffer)[0..16] });
+}
+
+const Target = enum { share, nonce, betaprime, fac, pimod, prime };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -385,6 +432,8 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "nonce")) return .nonce;
     if (std.mem.eql(u8, s, "betaprime")) return .betaprime;
     if (std.mem.eql(u8, s, "fac")) return .fac;
+    if (std.mem.eql(u8, s, "pimod")) return .pimod;
+    if (std.mem.eql(u8, s, "prime")) return .prime;
     return error.UnknownTarget;
 }
 
@@ -418,6 +467,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = da.allocator();
 
     if (target == .fac) return runFac(tainted);
+    if (target == .pimod) return runPimod(allocator, tainted);
+    if (target == .prime) return runPrime(tainted);
 
     // Fixture setup randomness is ALWAYS real — Phase 2a keygen is not
     // measured here (see buildFixture's doc comment).
@@ -470,6 +521,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printOutcome(result);
             std.debug.print("draws_160b={d}\n", .{draws});
         },
-        .fac => unreachable, // returned above
+        .fac, .pimod, .prime => unreachable, // returned above
     }
 }

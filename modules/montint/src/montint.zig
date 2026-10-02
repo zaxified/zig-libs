@@ -130,6 +130,21 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             return self;
         }
 
+        /// `fromElem` without its two checks (odd, `≥ 3`), for a caller that
+        /// has already verified both without branching on the value —
+        /// `fromElem`'s checks are branches on the modulus's low bits, which
+        /// a secret modulus (a CRT prime) must not get. Constant-time in `v`.
+        pub fn fromElemUnchecked(v: Elem) Self {
+            var self: Self = .{
+                .m = v,
+                .n0inv = negInvMod2_64(v[0]),
+                .r2 = undefined,
+                .one_mont = undefined,
+            };
+            self.computeConstants();
+            return self;
+        }
+
         /// Actual bit-length of the modulus.
         pub fn bits(self: *const Self) usize {
             var i: usize = L;

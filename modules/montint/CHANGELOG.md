@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **`DynModint` for secret primes whose length is known.**
+  `fromLimbsBits(v, nbits)` takes the bit length from the caller (the key
+  size) and checks it, oddness and `≥ 3` in one combined verdict — nothing
+  scans the secret value for its length, and `Modint`'s own odd/`≥ 3`
+  branches are skipped through the new `Modint.fromElemUnchecked`. The bit
+  length is stored at construction (`bits()` no longer rescans). New CT
+  `DynModint.select` (asm-laundered mask). Used by `threshold_ecdsa`'s
+  constant-time Πmod prover and Miller-Rabin.
+
 - **2026-10-02** — **New `DynModint(max_bits)`: a run-time modulus with a
   constant-time element API.** The modulus value AND its limb count are chosen
   at run time (slots of 4 limbs, dispatched to the matching `Modint`); elements

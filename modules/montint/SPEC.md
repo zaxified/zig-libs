@@ -68,7 +68,12 @@ each carried a private copy of the slot machinery for their modexps while their
 other secret arithmetic stayed in `std.crypto.ff`; both now run every
 private-key operation on it (ctgrind `rsa/crt` 213 → 1, `paillier/crt` 325 → 2), and `threshold_ecdsa`'s provers their products (`fac` 17 → 5). `elemFromFf`/`elemToFf`/`fromFf` move values to and from `std.crypto.ff` by a positional limb repack, since `ff`'s own `toBytes`/`fromBytes` branch on the value.
 The bit LENGTH of the modulus (which picks the slot) is treated as public — it
-is the key size; its value is not. Evidence: ctgrind target `dyn` — secret
+is the key size; its value is not. `fromLimbs` finds the length by scanning;
+`fromLimbsBits(v, nbits)` (2026-10-03) takes it from the caller and checks
+length, oddness and `≥ 3` in one combined verdict, so a secret prime is never
+scanned (`threshold_ecdsa`'s Πmod prover and Miller-Rabin use it; built on
+`Modint.fromElemUnchecked`, which skips `fromElem`'s two branches on the low
+bits). `select(on, a, b)` is a constant-time blend with an asm-laundered mask. Evidence: ctgrind target `dyn` — secret
 modulus (value fields tainted after construction, slot not), operands,
 exponent, wide inputs, at L=16 and L=32 — 2 in-file contexts, both
 `elemFromBytesBE`'s accept/reject; differential tests against
@@ -583,7 +588,7 @@ speed dispatch, not a correctness bound.
 
 - ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
 - **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); `isOdd`, and the fixed-width `Modint` itself, still open. Effort S. Fits §2.
-- **Modular inversion (odd modulus; constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today (`Field.inv` does), an RSA/Paillier composite cannot. Effort M. Fits §2.
+- **Modular inversion (constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today (`Field.inv` does), an RSA/Paillier composite cannot. **Consumer (2026-10-03):** `threshold_ecdsa`'s Πmod prover needs `Ñ⁻¹ mod (p−1)` — an EVEN secret modulus, so the inversion must not assume an odd one (Bernstein-Yang safegcd does not); today it is big-int extended Euclid, 451 of ctgrind `pimod`'s 540 contexts. Effort M. Fits §2.
 - ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
 - ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
 - **`DynModint.reduceLimbs` costs two Montgomery multiplies per 64-bit digit** (2026-10-02): a 2L-limb input reduces in 4L multiplies, ~5 % of a CRT half's modexp. A chunked form (`L` limbs at a time, `R²` per chunk) needs `montMul` to accept one operand `≥ m`, which the portable CIOS does (`< R` suffices) but the asm core's contract does not state. Effort S once the asm contract is checked. Fits §2.

@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Multi-primitive Go library including threshold signing *(inferred)*; unmaintained. |
 | Zig ecosystem (GitHub search "threshold ecdsa", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig threshold ECDSA found; **one-round online signing over presignatures** (GG20 §3; tss-lib signs GG18-style, all rounds online) with **identifiable abort** for every fault the paper can attribute without its opening protocol (`presign.Fault`, culprit index on the abort); every message and every proof added here is bound to a session id and the sender; the final signature is a plain secp256k1 ECDSA signature verified under `std.crypto.sign.ecdsa` before it is returned; Πprm/Πmod aux-parameter proofs (CGGMP21 Fig. 16/17) reject crafted 3-prime and `h2 ∉ ⟨h1⟩` parameters that a bare structural check accepts; received Paillier `N` and ring-Pedersen `Ñ` are held to the `N > q^7` floor at every checked entry point; threat model and an itemised auditor brief (A1-A9) are written down; constant-time modexp through `montint`. **Where we are behind:** dealer-free keygen exists only through the sibling `dkg` (`EcdsaKeygen`, 2026-10-02 — the proofs it exchanges, Πmod/Πfac over each Paillier `N`, live here in `aux_proofs`/`fac_proof`/`aux_info`), and its ring-Pedersen proofs (Πprm/Πmod over `Ñ`) are not yet bound to a session; no resharing / key refresh; aborts of GG20 types 5 and 7 (`Σ R̄_j ≠ G`, `Σ S_j ≠ X` with every proof valid) are not attributed (§4.3 opening protocol); no presignature serialisation (presignatures live in memory); an equivocating signer is detected (echoed transcript) but not named; no independent audit (the README states this); cross-implementation evidence is key material and signatures, not proofs (different Fiat-Shamir transcripts) (→ Backlog).
+**Where we are ahead:** the only Zig threshold ECDSA found; **one-round online signing over presignatures** (GG20 §3; tss-lib signs GG18-style, all rounds online) with **identifiable abort** for every fault the paper can attribute without its opening protocol (`presign.Fault`, culprit index on the abort); every message and every proof added here is bound to a session id and the sender; the final signature is a plain secp256k1 ECDSA signature verified under `std.crypto.sign.ecdsa` before it is returned; Πprm/Πmod aux-parameter proofs (CGGMP21 Fig. 16/17) reject crafted 3-prime and `h2 ∉ ⟨h1⟩` parameters that a bare structural check accepts; received Paillier `N` and ring-Pedersen `Ñ` are held to the `N > q^7` floor at every checked entry point; threat model and an itemised auditor brief (A1-A9) are written down; constant-time modexp through `montint`. **Where we are behind:** dealer-free keygen exists only through the sibling `dkg` (`EcdsaKeygen`, 2026-10-02 — the proofs it exchanges, Πmod/Πfac over each Paillier `N`, live here in `aux_proofs`/`fac_proof`/`aux_info`); no resharing / key refresh; aborts of GG20 types 5 and 7 (`Σ R̄_j ≠ G`, `Σ S_j ≠ X` with every proof valid) are not attributed (§4.3 opening protocol); no presignature serialisation (presignatures live in memory); an equivocating signer is detected (echoed transcript) but not named; no independent audit (the README states this); cross-implementation evidence is key material and signatures, not proofs (different Fiat-Shamir transcripts) (→ Backlog).
 
 ## Design & invariants
 
@@ -581,10 +581,18 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   `cmov(ct.eql(k, i))` into `jne`/`je` (objdump), so a secret exponent's 4-bit
   windows leak. Every secret-exponent pow over a PUBLIC modulus here now goes
   through `powSecret`: Πfac, Πmod's `y^d`, Πprm's commitments `h1^{a_i}`,
-  `generateAuxParams`' `h1^λ`. Two keygen-time sites stay variable-time and
-  are backlog: Πmod's 4th roots (`fourthRootBlum`, exponent AND modulus are
-  the secret factor, already reduced with variable-time bignum division) and
-  Miller-Rabin over secret prime candidates.
+  `generateAuxParams`' `h1^λ`. The two keygen-time sites that also had the
+  secret factor as the MODULUS moved on 2026-10-03, once `montint.DynModint`
+  took a secret modulus: Πmod's per-round work (Legendre symbols by Euler's
+  criterion, the 4th roots `v^((r+1)/4)` with a constant-time `±s` select,
+  the CRT, `q⁻¹ mod p` by Fermat; ctgrind `pimod`: 0 contexts in the rounds)
+  and Miller-Rabin over secret prime candidates (`isProbablePrime(m, n_bits,
+  …)`: montint ladder, length from the caller, witnesses below `2^(bits−1)`,
+  the round's two verdicts combined; ctgrind `prime`: 4 contexts, all
+  verdicts on public-by-construction bits). Still variable-time: Πmod's
+  `d = Ñ⁻¹ mod φ` (extended Euclid modulo an even secret — needs a CT
+  inversion, montint backlog) and the big-int setup of φ (→ Backlog), and the
+  prime searches' trial-division sieve.
 - **Products and moves of secrets are off `std.crypto.ff` too** (2026-10-02):
   `ff`'s `mul` branches on the Montgomery extra-reduction bit and its
   `fromBytes`/`toBytes` on the value (ctgrind). The provers' ring-Pedersen
@@ -600,7 +608,7 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
 - **`aux_info`**: `LocalAux` (own key + aux tuple + trapdoor), `Announcement`
   (codec; `verifyAnnouncement` = q⁷ floor, `Γ = N+1`, Πprm+Πmod(Ñ), Πmod(N)),
   `verifyFactors`, `findDuplicate` (any two of all `N_i`, `Ñ_i` equal — the
-  only defence against a copied `Ñ`, whose proofs are not session-bound), and
+  second line against a copied `Ñ` — the Ñ proofs are bound to the sender's context since 2026-10-02, `proveWellFormedBound`), and
   `assembleKeyShare` (DKG share + Feldman commitments + every announcement →
   `KeyShare`, refusing a share that does not match its commitment).
 
@@ -1087,7 +1095,7 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 
 - ~~Per-participant signing state machine~~ — **done 2026-10-02** (`presign.zig`). ~~Pre-signing / 1-round online signing~~ — **done 2026-10-02** (GG20 §3, not CGGMP21). ~~Identifiable abort~~ — **done 2026-10-02** except types 5/7 (item above).
 - ~~**Dealer-free keygen wired in**~~ — done 2026-10-02: `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`. Original note (survey 2026-09-30): the trusted dealer sees `x`. Sibling `dkg` (GJKR) exists but is a lockstep simulation and does not exchange Paillier / aux proofs; finishing both together is the real fix. It must come with **Πmod + Πfac for every party's Paillier `N`** (CGGMP21 Fig. 16/28): once parties generate their own Paillier keys, an unproven `N` with small factors lets its owner extract an honest Bob's `w_j` through the MtA responses — the BitForge class (Fireblocks, 2023). Today the dealer generates every Paillier key, so the precondition does not arise. Effort: large. Fits §2.
-- **Constant-time Πmod prover and prime search** (2026-10-02): `fourthRootBlum` computes square roots modulo the SECRET factor with `std.crypto.ff` pow and `std.math.big` division and Jacobi symbols (all variable-time), and the Miller-Rabin rounds of every prime search run ff pow modulo the secret candidate. Keygen-time and one-off, but a co-resident observer of a party's keygen could learn factor bits. Fix: CRT roots through a constant-time ladder with a blinded modulus, or montint once it takes a secret modulus. Effort: medium.
+- **Constant-time Πmod prover and prime search** (2026-10-02): ✅ 2026-10-03 for the rounds and Miller-Rabin (`montint.DynModint` modulo the secret factor; ctgrind `pimod`, `prime`). Left: `d = Ñ⁻¹ mod φ(Ñ)` by `modInverse` (extended Euclid, 451 of `pimod`'s 540 contexts) and the big-int `φ`/`p`/`q` setup (89), and the sieve's `bytesMod`. Fix: CRT exponents `Ñ⁻¹ mod (p−1)`, `mod (q−1)` through a constant-time inversion (montint backlog "modular inversion, safegcd-style" — the modulus is even), then no `φ` at all. Effort: medium (the inversion).
 - **Presignature serialisation** (2026-10-02): a codec for `Presignature` so a presigning pool survives a restart. Deliberately absent: a stored presignature can be restored twice, and two messages under one `R` reveal the key; it needs a consume-once store design, not just bytes. Effort: small for the codec, the store is the caller's.
 - **Naming an equivocator** (2026-10-02): the echoed transcript detects a signer who shows different broadcasts to different peers, but cannot say who; with signed messages, the two conflicting copies are the proof. Needs a signature scheme over messages (the transport's today). Effort: small once messages are signed.
 - **Key refresh / resharing** (survey 2026-09-30): tss-lib resharing, cggmp21 refresh. Effort: large. Fits §2.

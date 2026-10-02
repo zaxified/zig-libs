@@ -59,6 +59,7 @@
 
 const std = @import("std");
 const paillier = @import("paillier");
+const montint = @import("montint");
 
 /// The MtA (multiplicative-to-additive) share-conversion protocol — I2
 /// Phase 2b's semi-honest core. Converts a product `a·b` of two parties'
@@ -620,7 +621,7 @@ pub const AuxParams = struct {
         const one = nt.one();
 
         // F1: Ñ composite (reject a PRIME Ñ).
-        if (isProbablePrime(nt, random)) return error.InvalidAuxParams;
+        if (isProbablePrime(nt, nt.bits(), random)) return error.InvalidAuxParams;
 
         // F1: 1 < h1 < Ñ and 1 < h2 < Ñ.
         if (self.h1.isZero() or self.h1.eql(one)) return error.InvalidAuxParams;
@@ -769,59 +770,75 @@ fn setBitBe(buf: []u8, bit: usize) void {
     buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
 }
 
-/// Uniform Miller-Rabin witness in [2, m-2] by rejection sampling — mirrors
-/// `paillier.randomWitness`, typed onto `AuxModulus`.
-fn randomWitness(m: AuxModulus, random: std.Random) AuxFe {
-    const n_bits = m.bits();
-    const n_len = byteLen(n_bits);
-    const n_minus_1 = m.sub(m.zero, m.one());
-    var buf: [aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, buf[0..n_len]);
-    while (true) {
-        random.bytes(buf[0..n_len]);
-        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
-        const a = AuxFe.fromBytes(m, buf[0..n_len], .big) catch continue;
-        if (a.isZero() or a.eql(m.one()) or a.eql(n_minus_1)) continue;
-        return a;
-    }
-}
+/// Miller-Rabin probable-prime test. `m` must be odd (every `AuxModulus` is)
+/// and exactly `n_bits` bits long — the length the caller already knows (a
+/// prime search's target size), so the test never scans the secret value
+/// for it; any other `m` is reported composite. `pub` for the ctgrind
+/// harness (target `prime`).
+///
+/// Constant-time in `m`'s value along the path a PRIME takes (2026-10-02):
+/// this runs on the secret candidates of `generateSafePrime`/
+/// `generateBlumPrime`, so the ladder is montint's (`DynModint.pow` modulo
+/// the secret `m`, where `std.crypto.ff`'s pow branched on its windows), the
+/// witnesses are drawn below `2^(bits−1)` (always `< m`, so no rejection
+/// compares a public draw against the secret `m`), and a round's two
+/// verdicts `x = 1`/`x = −1` are combined before the one branch — for a prime
+/// with `s = 1` (every candidate here is `≡ 3 mod 4`) the round always passes,
+/// and which of the two held is the Legendre symbol of the public witness
+/// modulo the secret prime. What a REJECTED candidate reveals is about a
+/// value that is thrown away. Variable-time still: the `s` scan (public for
+/// these candidates) and `bytesMod`'s trial division in the callers' sieve.
+pub fn isProbablePrime(m: AuxModulus, n_bits: usize, random: std.Random) bool {
+    const D = montint.DynModint(aux_modulus_bits);
+    var mv = D.elemFromFf(&m.v);
+    defer std.crypto.secureZero(u64, &mv);
+    var mc = D.fromLimbsBits(&mv, n_bits) catch return false;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&mc));
+    if (n_bits < 3) return n_bits == 2; // m = 3
 
-/// Miller-Rabin probable-prime test — mirrors `paillier.isProbablePrime`,
-/// typed onto `AuxModulus`. `m` must be odd (every `AuxModulus` is).
-fn isProbablePrime(m: AuxModulus, random: std.Random) bool {
-    const n_len = byteLen(m.bits());
-
-    var d_buf: [aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, d_buf[0..n_len]);
-    m.toBytes(d_buf[0..n_len], .big) catch unreachable;
-    d_buf[n_len - 1] &= 0xfe; // m - 1 (m odd)
+    var one = D.zero;
+    one[0] = 1;
+    var mm1 = mc.m;
+    defer std.crypto.secureZero(u64, &mm1);
+    _ = montint.limbs.subInto(&mm1, &one);
+    // m − 1 = d·2^s
     var s: usize = 0;
-    var i: usize = n_len;
-    while (i > 0) {
-        i -= 1;
-        if (d_buf[i] == 0) {
-            s += 8;
-        } else {
-            s += @ctz(d_buf[i]);
-            break;
-        }
+    while ((mm1[s / 64] >> @intCast(s % 64)) & 1 == 0) s += 1;
+    var d = D.zero;
+    defer std.crypto.secureZero(u64, &d);
+    for (&d, 0..) |*w, i| {
+        const lo_i = i + s / 64;
+        const lo: u64 = if (lo_i < D.max_limbs) mm1[lo_i] else 0;
+        const hi: u64 = if (lo_i + 1 < D.max_limbs) mm1[lo_i + 1] else 0;
+        const sh: u6 = @intCast(s % 64);
+        w.* = if (sh == 0) lo else (lo >> sh) | (hi << @intCast(64 - @as(u7, sh)));
     }
-    shrBytesBe(d_buf[0..n_len], s);
-    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
 
-    const one = m.one();
-    const n_minus_1 = m.sub(m.zero, one);
-
+    const n_len = byteLen(n_bits - 1);
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * n_len - (n_bits - 1));
+    var buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
     var round: usize = 0;
     rounds: while (round < aux_mr_rounds) : (round += 1) {
-        const a = randomWitness(m, random);
-        var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d odd, never 0
-        if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
+        // A public witness a ∈ [2, 2^(bits−1)): below m by its length.
+        var a: D.Elem = undefined;
+        while (true) {
+            random.bytes(buf[0..n_len]);
+            buf[0] &= top_mask;
+            a = D.loadBE(buf[0..n_len]) catch unreachable;
+            var hi_or: u64 = 0;
+            for (a[1..]) |w| hi_or |= w;
+            if (hi_or != 0 or a[0] >= 2) break;
+        }
+        var x = mc.pow(&a, &d);
+        defer std.crypto.secureZero(u64, &x);
+        const pass = @intFromBool(D.eql(&x, &one)) | @intFromBool(D.eql(&x, &mm1));
+        if (pass == 1) continue :rounds;
         var j: usize = 1;
         while (j < s) : (j += 1) {
-            x = m.sq(x);
-            if (x.eql(n_minus_1)) continue :rounds;
-            if (x.eql(one)) return false;
+            x = mc.sq(&x);
+            if (D.eql(&x, &mm1)) continue :rounds;
+            if (D.eql(&x, &one)) return false;
         }
         return false;
     }
@@ -860,9 +877,9 @@ fn generateSafePrime(random: std.Random, prime_bits: usize, out: []u8) void {
         }
 
         const m_p = AuxModulus.fromBytes(out, .big) catch continue :candidates;
-        if (!isProbablePrime(m_p, random)) continue :candidates;
+        if (!isProbablePrime(m_p, prime_bits, random)) continue :candidates;
         const m_pprime = AuxModulus.fromBytes(stripLeadingZeros(pprime_buf[0..out.len]), .big) catch continue :candidates;
-        if (!isProbablePrime(m_pprime, random)) continue :candidates;
+        if (!isProbablePrime(m_pprime, prime_bits - 1, random)) continue :candidates;
         return; // out holds a safe prime p̃
     }
 }
@@ -886,7 +903,7 @@ fn generateBlumPrime(random: std.Random, prime_bits: usize, out: []u8) void {
             if (bytesMod(out, sp) == 0) continue :candidates;
         }
         const m = AuxModulus.fromBytes(out, .big) catch continue :candidates;
-        if (isProbablePrime(m, random)) return;
+        if (isProbablePrime(m, prime_bits, random)) return;
     }
 }
 
@@ -2068,7 +2085,7 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     try testing.expect((try aux.n_tilde.v.toPrimitive(u128)) & 1 == 1);
 
     // N_tilde is COMPOSITE (it is p̃·q̃): Miller-Rabin must reject it.
-    try testing.expect(!isProbablePrime(aux.n_tilde, random));
+    try testing.expect(!isProbablePrime(aux.n_tilde, aux.n_tilde.bits(), random));
 
     // h1, h2 in range [2, N_tilde): nonzero, not one, canonical (fromBytes
     // already guarantees < N_tilde).
@@ -2083,7 +2100,7 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     // The public wrapper produces an equally well-formed (independent) tuple
     // and it round-trips through the byte codec.
     const pub_aux = generateAuxParams(random, bits);
-    try testing.expect(!isProbablePrime(pub_aux.n_tilde, random));
+    try testing.expect(!isProbablePrime(pub_aux.n_tilde, pub_aux.n_tilde.bits(), random));
     const bytes = try pub_aux.toBytesAlloc(testing.allocator);
     defer testing.allocator.free(bytes);
     const back = try AuxParams.fromBytesAlloc(bytes);

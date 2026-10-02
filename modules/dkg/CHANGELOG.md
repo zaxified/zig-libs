@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — `EcdsaKeygen`'s announcements carry Πprm/Πmod over `Ñ`
+  bound to the sender's context (via `threshold_ecdsa.aux_info`): a copied
+  `Ñ` with its proofs aborts the run naming the copier
+  (`InvalidAnnouncement`), not only as a duplicate. ⚠ Not compatible with
+  announcements from older builds.
+
 - **2026-10-02** — **`ReshareReceiver.handle` takes a role-tagged sender
   (review F7).** `from` was a bare id — an OLD id for broadcast/share/defense,
   a NEW id for complaints — and the id spaces overlap, so on a transport that
