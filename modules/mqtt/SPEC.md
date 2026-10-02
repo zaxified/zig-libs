@@ -207,6 +207,14 @@ The expiry clock carries over too (2026-09-28, egw audit R5): `SessionState.offl
 when an offline session went offline (null while online) on the caller's clock, and
 `restoreSession`'s last argument takes it back — for a session that was online, the restart's
 own `now`. Only meaningful if that clock is wall time, which survives the restart.
+5.0 sessions round-trip whole since 2026-10-02: `SessionSub` carries No Local, Retain As
+Published and the Subscription Identifier (defaulted fields — Retain Handling acts once, at the
+SUBSCRIBE, and is not session state), and `restoreSessionWith(…, .{ .expiry_interval_s })` takes
+`SessionState.expiry_interval_s` back, capped by `Config.session_expiry_ms` as a CONNECT's would
+be. `restoreSession` is `restoreSessionWith(…, .{})`: a 3.1.1 session. It also refuses No Local
+on a Shared Subscription and a Subscription Identifier above 268 435 455, which the packet
+decoder refuses on SUBSCRIBE. ⚠ A client that resumes a restored 5.0 session sets its expiry
+anew with its CONNECT (absent = 0, 3.1.2.11.2), as with any resume.
 
 ## QoS 2 in the broker (2026-10-01)
 Spec 4.3.3, both directions, 3.1.1 and 5.0 alike. **Inbound:** a QoS 2 PUBLISH is routed once
@@ -456,7 +464,7 @@ under valgrind memcheck, all clean; TSan is a no-op stub in Zig 0.16.0, so real-
 fallback). Client: MQTT 5.0 out of scope.
 - ~~**MQTT 5.0**~~ — DONE 2026-10-01 (codec, client, broker; see *MQTT 5.0*). ~~**Broker-side inbound QoS 2**~~ — DONE 2026-10-01, both directions (see *QoS 2 in the broker*).
 - **Broker extended authentication** (2026-10-01, deferred from the 5.0 work): AUTH exchanges (4.12) need a hook shaped like `authenticateFn` but multi-step (method, data in → continue/success/deny + data out) and per-connection state between CONNECT and CONNACK, plus re-authentication. Today a CONNECT naming a method gets CONNACK 0x8C, which 4.12.0-1 allows. Effort: medium. The client side already exists (caller-driven).
-- **`restoreSession` for 5.0 sessions** (2026-10-01): `sessionStates` reports `expiry_interval_s`, but subscriptions are reported without their 5.0 options (No Local, Retain As Published, Subscription Identifier) and `restoreSession` takes neither back — a restored 5.0 session falls back to `Config.session_expiry_ms` and default options. Needs a richer `SessionSub` (defaulted fields, so egw's stand-ins keep compiling). Effort: small.
+- ~~**`restoreSession` for 5.0 sessions**~~ — done 2026-10-02: `SessionSub` options, `restoreSessionWith` with `expiry_interval_s` (see § sessions above).
 - **Broker outbound Topic Aliases** (2026-10-01): the broker never aliases toward a client (legal: 3.1.2-27 only forbids exceeding the client's maximum). Mosquitto does (measured in the interop capture). Effort: small–medium (per-connection LRU of topics, alias per delivery).
 - **Payload Format validation** (2026-10-01): a PUBLISH marked UTF-8 is not checked (the receiver MAY, answering 0x99). Effort: small; costs a UTF-8 scan per such message.
 - **Response Information / Reason Strings from the broker** (2026-10-01): both MAY; not sent. Effort: small.

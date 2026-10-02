@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — 5.0 sessions survive a server restart whole.
+  `Broker.SessionSub` gains `no_local`, `retain_as_published` and `sub_id`
+  (defaulted, so hand-built values keep compiling); `sessionStates` reports
+  them and `restoreSession` restores them. New `restoreSessionWith(…, opts)`
+  takes `RestoreOptions.expiry_interval_s` (from `SessionState`) back, capped
+  by `Config.session_expiry_ms`; before, a restored 5.0 session fell back to
+  the config's expiry and default options. Restore now also refuses No Local
+  on a `$share` filter and a Subscription Identifier above 268 435 455.
+  `restoreSession`'s signature is unchanged.
+
 - **2026-10-01** — **Independent review of the QoS 2 + 5.0 broker**, fixes with tests: two
   same-id 5.0 CONNECTs could deadlock (a take-over superseded a connection still inside its
   CONNECT; its DISCONNECT 0x8E blocked on the other `tx_lock`) — only connected ones are

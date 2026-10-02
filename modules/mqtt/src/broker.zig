@@ -1465,8 +1465,19 @@ pub const Broker = struct {
     }
 
     /// One subscription of a persistent session, as `sessionStates` reports
-    /// it and `restoreSession` takes it back.
-    pub const SessionSub = struct { filter: []const u8, qos: QoS };
+    /// it and `restoreSession` takes it back. The 5.0 subscription options
+    /// (3.8.3.1) are defaulted — what a 3.1.1 subscription means — so a
+    /// stand-in that builds these by hand keeps compiling. Retain Handling is
+    /// not here: it acts once, when the SUBSCRIBE arrives, and is not part of
+    /// the session.
+    pub const SessionSub = struct {
+        filter: []const u8,
+        qos: QoS,
+        no_local: bool = false,
+        retain_as_published: bool = false,
+        /// Subscription Identifier, 0 = none.
+        sub_id: u32 = 0,
+    };
 
     /// What a persistent session holds, as of one instant.
     pub const SessionState = struct {
@@ -1489,8 +1500,8 @@ pub const Broker = struct {
         drops: u64,
         subs: []SessionSub,
         /// 5.0 Session Expiry Interval in force (seconds, 0xFFFFFFFF never);
-        /// null for a 3.1.1 session. Reported only: `restoreSession` brings a
-        /// session back under `Config.session_expiry_ms` (backlog).
+        /// null for a 3.1.1 session, which `Config.session_expiry_ms` governs.
+        /// Hand it back to `restoreSessionWith`.
         expiry_interval_s: ?u32 = null,
     };
 
@@ -1510,10 +1521,16 @@ pub const Broker = struct {
         const out = try arena.alloc(SessionState, b.sessions.items.len);
         for (b.sessions.items, out) |x, *o| {
             const subs = try arena.alloc(SessionSub, x.subs.items.len);
-            for (x.subs.items, subs) |f, *d| d.* = .{
-                .filter = try arena.dupe(u8, f),
-                .qos = if (b.indexRef(f, .{ .session = x })) |r| r.qos else .at_most_once,
-            };
+            for (x.subs.items, subs) |f, *d| {
+                const r: SubRef = b.indexRef(f, .{ .session = x }) orelse .{ .owner = .{ .session = x }, .qos = .at_most_once };
+                d.* = .{
+                    .filter = try arena.dupe(u8, f),
+                    .qos = r.qos,
+                    .no_local = r.no_local,
+                    .retain_as_published = r.retain_as_published,
+                    .sub_id = r.sub_id,
+                };
+            }
             x.lock.lock();
             defer x.lock.unlock();
             o.* = .{
@@ -1541,8 +1558,9 @@ pub const Broker = struct {
         /// A username longer than `max_username`.
         InvalidUsername,
         /// A filter that is not one (4.7), one nested past the broker's
-        /// limit, or a QoS above `Config.maximum_qos` — nothing a SUBSCRIBE
-        /// could have granted.
+        /// limit, a QoS above `Config.maximum_qos`, No Local on a Shared
+        /// Subscription (3.8.3-4) or a Subscription Identifier above
+        /// 268 435 455 — nothing a SUBSCRIBE could have granted.
         InvalidSubscription,
         /// `max_subscriptions_per_conn` or `max_subscriptions_total`.
         TooManySubscriptions,
@@ -1571,6 +1589,22 @@ pub const Broker = struct {
     /// ⚠ A kept value only means something if that clock survives a restart
     /// — wall time, not a monotonic counter that starts again at zero.
     pub fn restoreSession(b: *Broker, client_id: []const u8, username: ?[]const u8, subs: []const SessionSub, offline_since_ms: i64) RestoreError!void {
+        return b.restoreSessionWith(client_id, username, subs, offline_since_ms, .{});
+    }
+
+    /// What `restoreSessionWith` takes beyond `restoreSession`'s arguments.
+    pub const RestoreOptions = struct {
+        /// The session's 5.0 Session Expiry Interval
+        /// (`SessionState.expiry_interval_s`); null brings it back as a 3.1.1
+        /// session, under `Config.session_expiry_ms`. Capped by that config
+        /// value as a CONNECT's would be — the config may have changed across
+        /// the restart.
+        expiry_interval_s: ?u32 = null,
+    };
+
+    /// `restoreSession` for a 5.0 session: the same, plus its Session Expiry
+    /// Interval. The subscriptions' 5.0 options travel in `SessionSub`.
+    pub fn restoreSessionWith(b: *Broker, client_id: []const u8, username: ?[]const u8, subs: []const SessionSub, offline_since_ms: i64, opts: RestoreOptions) RestoreError!void {
         if (client_id.len == 0 or client_id.len > max_client_id) return error.InvalidClientId;
         if (username) |u| if (u.len > max_username) return error.InvalidUsername;
         if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
@@ -1579,6 +1613,8 @@ pub const Broker = struct {
             topic.validateFilter(sub.filter) catch return error.InvalidSubscription;
             const inner = (splitShared(sub.filter) catch return error.InvalidSubscription) orelse sub.filter;
             if (std.mem.count(u8, inner, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
+            if (sub.no_local and inner.len != sub.filter.len) return error.InvalidSubscription;
+            if (sub.sub_id > packet.max_remaining_length) return error.InvalidSubscription;
         }
         b.mutex.lock();
         defer b.mutex.unlock();
@@ -1587,12 +1623,20 @@ pub const Broker = struct {
         if (b.subscriptions_total + subs.len > b.config.max_subscriptions_total) return error.TooManySubscriptions;
         const x = b.createSession(client_id, username) catch return error.OutOfMemory;
         x.offline_since_ms = offline_since_ms;
+        x.expiry_s = if (opts.expiry_interval_s) |e| b.cappedExpiry(e) else null;
         for (subs) |sub| {
+            const ref: SubRef = .{
+                .owner = .{ .session = x },
+                .qos = sub.qos,
+                .no_local = sub.no_local,
+                .retain_as_published = sub.retain_as_published,
+                .sub_id = sub.sub_id,
+            };
             if (b.hasSessionSub(x, sub.filter)) {
-                b.indexUpdate(sub.filter, .{ .owner = .{ .session = x }, .qos = sub.qos });
+                b.indexUpdate(sub.filter, ref);
                 continue;
             }
-            b.addSessionSub(x, sub.filter, sub.qos) catch {
+            b.addSessionSub(x, sub.filter, ref) catch {
                 b.discardSession(x);
                 return error.OutOfMemory;
             };
@@ -1607,12 +1651,12 @@ pub const Broker = struct {
     }
 
     /// Caller holds `mutex`.
-    fn addSessionSub(b: *Broker, x: *Session, filter: []const u8, qos: QoS) error{OutOfMemory}!void {
+    fn addSessionSub(b: *Broker, x: *Session, filter: []const u8, ref: SubRef) error{OutOfMemory}!void {
         const owned = try b.allocator.dupe(u8, filter);
         errdefer b.allocator.free(owned);
         try x.subs.append(b.allocator, owned);
         errdefer x.subs.items.len -= 1;
-        b.indexAdd(filter, .{ .owner = .{ .session = x }, .qos = qos }) catch return error.OutOfMemory;
+        b.indexAdd(filter, ref) catch return error.OutOfMemory;
         b.subscriptions_total += 1;
     }
 
@@ -7224,6 +7268,100 @@ test "v5 sessions: Session Expiry keeps one, Clean Start 0 resumes it, expiry 0 
     try testing.expect(!s5.connack.session_present);
     try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
     b.remove(s5.conn);
+}
+
+test "v5 restore: subscription options and Session Expiry survive sessionStates -> restoreSessionWith" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 500_000 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connect5(&b, &t1, .{ .client_id = "n", .clean_session = false, .properties = .{ .session_expiry_interval = 100 } }, 0);
+    _ = try send5(&b, s1.conn, .{ .subscribe = .{
+        .packet_id = 1,
+        .filters = &.{.{ .filter = "t", .qos = .at_least_once, .no_local = true, .retain_as_published = true }},
+        .properties = .{ .subscription_ids = .{ .items = &.{7} } },
+    } }, 0);
+    _ = (try next5(&t1)).?;
+    b.remove(s1.conn); // offline since 0
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const st = (try b.sessionStates(arena.allocator()))[0];
+    try testing.expectEqual(@as(?u32, 100), st.expiry_interval_s);
+    try testing.expectEqual(@as(usize, 1), st.subs.len);
+    try testing.expect(st.subs[0].no_local and st.subs[0].retain_as_published);
+    try testing.expectEqual(@as(u32, 7), st.subs[0].sub_id);
+
+    // The server restarts.
+    var b2 = Broker.init(testing.allocator, .{ .session_expiry_ms = 500_000 });
+    defer b2.deinit();
+    try b2.restoreSessionWith(st.client_id, st.username, st.subs, st.offline_since_ms.?, .{ .expiry_interval_s = st.expiry_interval_s });
+    // A second copy that stays offline, to watch its expiry.
+    try b2.restoreSessionWith("e", st.username, st.subs, st.offline_since_ms.?, .{ .expiry_interval_s = st.expiry_interval_s });
+    const again = for (try b2.sessionStates(arena.allocator())) |x| {
+        if (std.mem.eql(u8, x.client_id, "n")) break x;
+    } else unreachable;
+    try testing.expectEqual(@as(?u32, 100), again.expiry_interval_s);
+    try testing.expect(again.subs[0].no_local and again.subs[0].retain_as_published);
+    try testing.expectEqual(@as(u32, 7), again.subs[0].sub_id);
+
+    // The options act: its own retained message does not come back (No
+    // Local); another client's arrives with the retain flag kept (Retain As
+    // Published) and the Subscription Identifier.
+    var t2 = TestTransport{};
+    // (A CONNECT sets the session's expiry anew — absent would mean 0 — so
+    // the client states its 100 s again; the restored value is what governs
+    // while the session waits offline, as "e" does below.)
+    const s2 = try connect5(&b2, &t2, .{ .client_id = "n", .clean_session = false, .properties = .{ .session_expiry_interval = 100 } }, 1_000);
+    try testing.expect(s2.connack.session_present);
+    _ = try send5(&b2, s2.conn, .{ .publish = .{ .topic = "t", .payload = "mine", .retain = true } }, 1_001);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&t2));
+    var to = TestTransport{};
+    const o = try connect5(&b2, &to, .{ .client_id = "other" }, 1_002);
+    _ = try send5(&b2, o.conn, .{ .publish = .{ .topic = "t", .payload = "theirs", .retain = true } }, 1_003);
+    const m = (try next5(&t2)).?.publish;
+    try testing.expectEqualStrings("theirs", m.payload);
+    try testing.expect(m.retain);
+    try testing.expectEqual(@as(?u32, 7), m.properties.subscription_ids.first());
+
+    // "e", offline since 0: its own 100 s, not the config's 500 s ("n" is online).
+    try testing.expectEqual(@as(usize, 0), b2.expireSessions(99_999));
+    try testing.expectEqual(@as(usize, 1), b2.expireSessions(100_000));
+    try testing.expectEqual(@as(?usize, null), b2.sessionQueued("e"));
+}
+
+test "v5 restore: the config caps a restored Session Expiry; null restores a 3.1.1 session" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 10_000 });
+    defer b.deinit();
+    const sub: []const Broker.SessionSub = &.{.{ .filter = "a", .qos = .at_least_once }};
+    try b.restoreSessionWith("long", null, sub, 0, .{ .expiry_interval_s = std.math.maxInt(u32) });
+    try b.restoreSession("old", null, sub, 0);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (try b.sessionStates(arena.allocator())) |st| {
+        if (std.mem.eql(u8, st.client_id, "long")) {
+            try testing.expectEqual(@as(?u32, 10), st.expiry_interval_s); // "never" capped at 10 s
+        } else try testing.expectEqual(@as(?u32, null), st.expiry_interval_s);
+    }
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(9_999));
+    try testing.expectEqual(@as(usize, 2), b.expireSessions(10_000));
+}
+
+test "v5 restore refuses options no SUBSCRIBE could have granted" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", null, &.{.{ .filter = "$share/g/t", .qos = .at_least_once, .no_local = true }}, 0));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", null, &.{.{ .filter = "t", .qos = .at_least_once, .sub_id = packet.max_remaining_length + 1 }}, 0));
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+    try b.restoreSession("x", null, &.{
+        .{ .filter = "$share/g/t", .qos = .at_least_once, .retain_as_published = true },
+        .{ .filter = "u", .qos = .at_least_once, .sub_id = packet.max_remaining_length },
+    }, 0);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const st = (try b.sessionStates(arena.allocator()))[0];
+    for (st.subs) |sb| {
+        if (std.mem.eql(u8, sb.filter, "u")) try testing.expectEqual(packet.max_remaining_length, sb.sub_id) else try testing.expect(sb.retain_as_published);
+    }
 }
 
 test "v5 DISCONNECT: a Session Expiry may shorten, never revive a session that was to end" {
