@@ -406,11 +406,7 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
   filter and closes at once (see "Design & invariants"), because nothing here emits a change
   notification. It becomes real together with the `list_changed` / resource-subscription item below:
   a push seam in this module plus a held-open response in `http`/`mcp-http`. Effort: medium-large.
-- **Validate `x-mcp-header` at `addTool`** (2026-09-30, M5 follow-up). The spec makes a tool whose
-  annotation breaks the rules (not a `properties`-only chain, `number` type, duplicate names,
-  non-token name) invalid for a client, which then drops it from its list; `mcp-http` checks only the
-  annotations that are valid. Refusing such a tool at registration would surface the defect to the
-  server author instead of silently hiding the tool from HTTP clients. Effort: small.
+- ~~**Validate `x-mcp-header` at `addTool`**~~ — **done 2026-10-02** (`header_annotations.zig`): non-token or empty names, case-insensitive duplicates, a type other than `string`/`integer`/`boolean`, and annotations off a `properties`-only chain (or deeper than `max_chain` = 32, the depth `mcp-http` reads) are refused with `HeaderAnnotation*` errors. Rules read from the 2026-07-28 `server/tools.mdx` and `transports/streamable-http.mdx`.
 - **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
   `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
   largest break since the transport rewrite: **MCP becomes stateless**.

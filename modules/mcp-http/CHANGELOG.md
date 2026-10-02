@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — `x-mcp-header` annotations are read to `mcp`'s
+  `header_annotations.max_chain` (32 `properties` levels; was an off-by-one 33),
+  the depth `mcp.Server.addTool` now enforces, so a registered tool can carry
+  no annotation this transport would miss. Tests no longer register a tool
+  with an annotation under `items` (`addTool` refuses it); `paramHeaders`
+  ignoring one is checked directly. The example shows the refusal.
+
 - **2026-09-30** — **The 2026-07-28 stateless transport** (plan M5 in `mcp`'s SPEC), next to the
   session-era one, decided per POST by the body's `_meta` protocol version (new `src/modern.zig`).
   Modern requests need no session and get none; `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`

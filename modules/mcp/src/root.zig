@@ -101,6 +101,8 @@
 //! written, so a long-lived server does not accumulate per-request garbage.
 
 const std = @import("std");
+/// `x-mcp-header` annotation rules, checked by `Server.addTool`.
+pub const header_annotations = @import("header_annotations.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -2651,8 +2653,14 @@ pub const Server = struct {
 
     /// Register a tool. All slices in `tool` (name, description, schemas) must
     /// outlive the server — typically they are static literals or app-owned.
-    pub fn addTool(self: *Server, tool: Tool) error{ OutOfMemory, DuplicateTool }!void {
+    ///
+    /// The `inputSchema`'s `x-mcp-header` annotations are checked against the
+    /// spec's rules (`header_annotations`): a tool that breaks them is one a
+    /// Streamable HTTP client must drop from its list, so it is refused here,
+    /// where its author sees it, instead.
+    pub fn addTool(self: *Server, tool: Tool) (error{DuplicateTool} || header_annotations.Error)!void {
         if (self.findTool(tool.name) != null) return error.DuplicateTool;
+        try header_annotations.validate(self.gpa, tool.input_schema);
         try self.tools.append(self.gpa, tool);
     }
 
@@ -3977,6 +3985,11 @@ fn expectResponse(s: *Server, msg: []const u8, expected: []const u8) !void {
     defer aw.deinit();
     try s.handleMessage(msg, &aw.writer);
     try testing.expectEqualStrings(expected, aw.written());
+}
+
+// A bare `pub const x = @import(...)` does not pull x's tests in (CONVENTIONS §6).
+test {
+    _ = header_annotations;
 }
 
 test "jsonrpc: malformed JSON -> -32700, no panic" {

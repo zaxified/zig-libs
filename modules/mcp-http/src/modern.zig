@@ -225,7 +225,9 @@ pub fn paramHeaders(arena: std.mem.Allocator, input_schema: []const u8) error{Ou
 fn walkProperties(arena: std.mem.Allocator, schema: std.json.Value, path: *std.ArrayList([]const u8), out: *std.ArrayList(ParamHeader), depth: u8) error{OutOfMemory}!void {
     // The chain is as deep as the schema author made it; a registered schema
     // is the server's own, so this bound only stops a runaway, not an attack.
-    if (depth > 32 or schema != .object) return;
+    // It is `mcp`'s bound: `addTool` refuses an annotation deeper than this,
+    // so nothing registered can hold one this walk would miss.
+    if (depth >= mcp.header_annotations.max_chain or schema != .object) return;
     const props = schema.object.get("properties") orelse return;
     if (props != .object) return;
     var it = props.object.iterator();
@@ -414,8 +416,7 @@ const sql_schema =
     \\        "shard": { "type": "integer", "x-mcp-header": "Shard" },
     \\        "dry": { "type": "boolean", "x-mcp-header": "Dry" }
     \\      }
-    \\    },
-    \\    "list": { "type": "array", "items": { "type": "string", "x-mcp-header": "NotAHeader" } }
+    \\    }
     \\  },
     \\  "required": ["region", "query"]
     \\}
@@ -580,7 +581,13 @@ test "x-mcp-header: only properties chains count; nested, integer and boolean va
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const found = try paramHeaders(a, sql_schema);
-    try testing.expectEqual(@as(usize, 3), found.len); // not the one under `items`
+    try testing.expectEqual(@as(usize, 3), found.len);
+    // An annotation under `items` is not a header. `mcp`'s `addTool` refuses
+    // such a tool outright (`mcp.header_annotations`), so this walk only
+    // meets one when called directly — as here.
+    try testing.expectEqual(@as(usize, 0), (try paramHeaders(a,
+        \\{"type":"object","properties":{"list":{"type":"array","items":{"type":"string","x-mcp-header":"NotAHeader"}}}}
+    )).len);
     try testing.expectEqualStrings("Region", found[0].name);
     try testing.expectEqualStrings("Shard", found[1].name);
     try testing.expectEqualStrings("opts", found[1].path[0]);
@@ -606,8 +613,6 @@ test "x-mcp-header: only properties chains count; nested, integer and boolean va
         // Absent or null in the body: no header expected, and one sent is refused.
         .{ .args = "{\"region\":\"eu\",\"opts\":{\"shard\":null}}", .extra = &.{}, .ok = true },
         .{ .args = "{\"region\":\"eu\"}", .extra = &.{.{ "Mcp-Param-Shard", "1" }}, .ok = false },
-        // The value under `items` is not a header, whatever arrives.
-        .{ .args = "{\"region\":\"eu\",\"list\":[\"x\"]}", .extra = &.{.{ "Mcp-Param-NotAHeader", "x" }}, .ok = true },
     };
     for (cases, 0..) |c, i| {
         var pairs: std.ArrayList([2][]const u8) = .empty;

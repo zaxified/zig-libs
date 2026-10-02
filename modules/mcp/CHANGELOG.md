@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — `Server.addTool` checks the tool's `x-mcp-header`
+  annotations (spec 2026-07-28) and refuses a tool that breaks them —
+  `HeaderAnnotationNotReachable`, `HeaderAnnotationInvalidName`,
+  `HeaderAnnotationDuplicate`, `HeaderAnnotationInvalidType`. Such a tool is one
+  a Streamable HTTP client must drop from `tools/list`; before, it vanished for
+  those clients without anyone being told. New `header_annotations` namespace.
+  **Source-breaking for an exhaustive `switch`** over `addTool`'s errors (a
+  `try` is unaffected); `mcp-http`'s example had one.
+
 - **2026-09-30** — **`subscriptions/listen`** (spec 2026-07-28, basic/patterns/subscriptions.mdx):
   answered with the acknowledgment of an empty filter (`notifications/subscriptions/acknowledged`,
   `_meta.io.modelcontextprotocol/subscriptionId`) followed at once by the graceful-close result, since

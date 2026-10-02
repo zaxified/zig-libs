@@ -42,6 +42,13 @@ pub fn main() !void {
         // Named from outside: a second registration under the same name is
         // rejected rather than silently shadowing the first.
         error.DuplicateTool => unreachable, // this is the only registration
+        // The schema carries no `x-mcp-header`, so none of its rules can fail
+        // here; a schema that has one is checked at this call.
+        error.HeaderAnnotationNotReachable,
+        error.HeaderAnnotationInvalidName,
+        error.HeaderAnnotationDuplicate,
+        error.HeaderAnnotationInvalidType,
+        => unreachable,
         error.OutOfMemory => return err,
     };
 

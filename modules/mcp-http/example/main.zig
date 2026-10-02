@@ -53,7 +53,22 @@ pub fn main() !void {
         return error.DuplicateToolUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DuplicateTool => std.debug.print("addTool(\"shout\" again): DuplicateTool (expected)\n", .{}),
-        error.OutOfMemory => return err,
+        else => return err,
+    }
+
+    // An `x-mcp-header` annotation a Streamable HTTP client cannot honour
+    // (here: under `items`, not on a `properties` chain) makes the tool one
+    // the client must drop from its list. `addTool` says so up front.
+    if (server.addTool(.{
+        .name = "tag_all",
+        .description = "bad annotation",
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"x-mcp-header\":\"Tag\"}}}}",
+        .handler = shoutTool,
+    })) |_| {
+        return error.UnreachableAnnotationAccepted;
+    } else |err| switch (err) {
+        error.HeaderAnnotationNotReachable => std.debug.print("addTool(\"tag_all\"): HeaderAnnotationNotReachable (expected)\n", .{}),
+        else => return err,
     }
 
     var transport = mcphttp.Transport{ .gpa = gpa, .server = &server };
