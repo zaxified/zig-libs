@@ -144,6 +144,7 @@ pub fn assembleKeyShares(
             .index = @intCast(i + 1),
             .paillier_pk = paillier_keys[i].public,
             .aux = aux_params[i],
+            .verifying_share = outputs[i].verifying_share,
         };
     }
     const public_keys: tecdsa.PublicKeys = .{ .entries = entries };

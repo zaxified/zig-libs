@@ -151,7 +151,7 @@ pub fn signWithSharesOptions(
         defer std.crypto.secureZero(u8, &seed);
         random.bytes(&seed);
         slot.csprng = .init(seed);
-        if (threaded) slot.arena = .init(std.heap.page_allocator);
+        if (threaded) slot.arena = .init(std.heap.page_allocator); // global-alloc-ok: worker threads need a thread-safe backing allocator and the caller's need not be one (documented on `SignOptions.threads`)
     }
     for (slots, shares) |*slot, share| {
         const party_alloc = if (slot.arena) |*a| a.allocator() else allocator;
