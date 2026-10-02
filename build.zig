@@ -379,7 +379,7 @@ const module_list = [_]Module{
     .{ .name = "fss", .libs = &.{"crypto"} },
     .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"}, .test_deps = &.{"testkit"} },
     .{ .name = "bfv", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
-    .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"} },
+    .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"}, .test_deps = &.{"testkit"} },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy

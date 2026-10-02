@@ -47,9 +47,10 @@ pub const VerifyingKey = bn254.Groth16VerifyingKey;
 
 /// The Groth16 proving key (CRS) the prover consumes. Standard Groth-2016 /
 /// snarkjs `.zkey` layout: precomputed group-element "query" vectors indexed
-/// by witness variable, plus the `H(x)` bases. Populated by `setup` (gated)
-/// or ingested from a snarkjs `.zkey` (a deferred Phase-3 increment — see
-/// `SPEC.md`). All slices are borrowed; the prover never mutates them.
+/// by witness variable, plus the `H(x)` bases. Populated by the toy `setup`.
+/// A real ceremony's key is a snarkjs `.zkey` instead (`zkey.ZKey`, proved
+/// against by `zkprove.prove`). All slices are borrowed; the prover never
+/// mutates them.
 pub const ProvingKey = struct {
     alpha_g1: G1.Affine,
     beta_g1: G1.Affine,
@@ -85,8 +86,8 @@ pub const Randomizers = struct { r: Fr, s: Fr };
 /// multi-party MPC ceremony (e.g. Powers-of-Tau + a per-circuit Phase-2), so
 /// no single party ever learns them. This struct hands `setup` all five in the
 /// clear purely so the end-to-end anchor is self-contained and deterministic.
-/// Replacing this with `.zkey` ingestion of a real ceremony's CRS is the
-/// deferred Phase-3 increment (see `SPEC.md`).
+/// The real path is `phase2.newZkey` over a published `.ptau` plus
+/// `phase2.contribute` (see `SPEC.md` § 4).
 ///
 /// Constraints: `gamma` and `delta` MUST be nonzero (they are inverted), and
 /// `tau` MUST NOT be one of the domain's roots of unity (else `Z(tau)=0` and

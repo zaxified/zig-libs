@@ -28,6 +28,12 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 | `qap.zig` | R1CS→QAP interpolation + the `A·B−C` divisibility oracle |
 | `prover.zig` | **real** `setup`/`prove` (the toy CRS + proof assembly) + `brokenProof` positive control |
 | `snarkjs_export.zig` | renders our `Proof`/`VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses — closes the one blind spot the `bn254`-verifier anchor can't see (it decodes our own encoding; see `SPEC.md` §5a) |
+| `snarkjs_bin.zig` | the iden3 binary container and the field/point encodings inside it |
+| `zkey.zig` | snarkjs `.zkey` (Groth16 proving key) reader and writer — round-trips snarkjs's files byte for byte |
+| `circom.zig` | circom `.r1cs` reader, `.wtns` reader and writer |
+| `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand |
+| `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, Pippenger MSM, quotient on a coset |
+| `phase2.zig` | phase-2 ceremony: `newZkey(r1cs, ptau)`, `contribute`, `verifyContribution`, `verify` |
 
 ## The anchor
 
@@ -57,7 +63,42 @@ end-to-end test itself:
   `SPEC.md` §5a for why this closes a gap the sibling `bn254` verifier alone
   could not.
 
-## Using it
+## Proving a circom circuit
+
+```zig
+const groth16 = @import("groth16");
+
+// Files from circom + snarkjs (read them however you like; the readers take bytes).
+var z = try groth16.zkey.parse(gpa, zkey_bytes); // snarkjs `.zkey`
+defer z.deinit(gpa);
+const w = try groth16.circom.parseWitness(gpa, wtns_bytes); // circom `.wtns`
+defer gpa.free(w);
+
+// Fresh r, s for EVERY proof.
+const proof = try groth16.zkprove.prove(gpa, z, w, .{ .r = groth16.Fr.random(io), .s = groth16.Fr.random(io) });
+std.debug.assert(try groth16.verify(z.verifyingKey(), proof, w[1 .. z.n_public + 1]));
+const json = try groth16.snarkjs_export.proofJson(gpa, proof); // what `snarkjs groth16 verify` reads
+```
+
+Before trusting a key someone else made, check it against the circuit and the
+ceremony it claims to come from:
+
+```zig
+var r = try groth16.circom.parseR1cs(gpa, r1cs_bytes);
+const p = try groth16.ptau.Ptau.parse(ptau_bytes);
+switch (try groth16.phase2.verify(gpa, io, r, p, z)) {
+    .ok => {},
+    else => |why| return error.UntrustedKey, // circuit_mismatch, bad_delta, …
+}
+```
+
+Making a key yourself: `phase2.newZkey(gpa, r, p)`, then one
+`phase2.contribute(gpa, &z, x, s, "name")` per participant with fresh secrets
+they destroy afterwards. `tools/snarkjs/g16.zig` is all of this as a command
+line. ⚠ snarkjs's own `zkey verify` rejects keys made or contributed here
+(SPEC.md § 4b); its prover and verifier accept them.
+
+## Using it (hand-built R1CS, toy setup)
 
 ```zig
 const groth16 = @import("groth16");
@@ -94,6 +135,9 @@ zig fmt --check modules/groth16
 ```
 
 Provenance: pure clean-room-from-spec (Groth 2016) — no third-party source
-ported. See [SPEC.md](SPEC.md) for the design, the Fable-vs-Opus tier call, and
+ported. The test data in `src/testdata/snarkjs/` is output of circom 2.2.3 and
+snarkjs@0.7.6 run as black-box oracles by `tools/snarkjs/gen.sh` (their GPL
+source was not read; the files hold points and field elements of our own
+circuit, see SPEC.md § 8). See [SPEC.md](SPEC.md) for the design, the Fable-vs-Opus tier call, and
 the anchor plan. Depends on the sibling `bn254` module for `Fr`/`G1`/`G2`/the
 pairing/the verifier.

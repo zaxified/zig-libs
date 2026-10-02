@@ -53,6 +53,19 @@ fn rootExponent(comptime n: usize) [32]u8 {
 /// An evaluation domain of size `n` (a power of two, `n ≤ 2^28`). All the
 /// roots-of-unity constants are computed once from `bn254.Fr`'s verified
 /// modulus; nothing here re-implements field arithmetic.
+/// Largest power-of-two domain `Fr` has: `r − 1` is divisible by `2^28`.
+pub const max_log_size = 28;
+
+/// A primitive `2^log_n`-th root of unity, `5^{(r−1)/2^log_n}` — the same root
+/// `Domain(2^log_n).root()` returns, for a size known only at run time (a
+/// circuit read from a file). Computed as the `2^28`-th root squared down.
+pub fn rootOfUnity(log_n: u5) Fr {
+    std.debug.assert(log_n <= max_log_size);
+    var w = Domain(1 << max_log_size).root();
+    for (0..max_log_size - @as(usize, log_n)) |_| w = w.square();
+    return w;
+}
+
 pub fn Domain(comptime n: usize) type {
     return struct {
         pub const size: usize = n;
@@ -129,4 +142,12 @@ test "n_inv * n == 1" {
 test "root_inv * root == 1" {
     const D = Domain(32);
     try std.testing.expect(D.rootInv().mul(D.root()).eql(Fr.one));
+}
+
+test "rootOfUnity agrees with the comptime Domain roots" {
+    try std.testing.expect(rootOfUnity(3).eql(Domain(8).root()));
+    try std.testing.expect(rootOfUnity(10).eql(Domain(1024).root()));
+    try std.testing.expect(rootOfUnity(0).eql(Fr.one));
+    // Primitive: ω^{n/2} = −1.
+    try std.testing.expect(field.frPowU64(rootOfUnity(5), 16).eql(Fr.zero.sub(Fr.one)));
 }

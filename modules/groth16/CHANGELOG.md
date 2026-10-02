@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — A8: the snarkjs ecosystem, both directions.
+  - **New:** `zkey` (snarkjs `.zkey` reader/writer, round-trips snarkjs's files
+    byte for byte), `circom` (`.r1cs`, `.wtns` reader/writer), `ptau`
+    (powers-of-tau reader), `snarkjs_bin` (container and encodings),
+    `zkprove.prove` (proof from a `.zkey` + witness — snarkjs's verifier
+    accepts it, at 10 000 constraints too), `phase2.newZkey`/`contribute`/
+    `verifyContribution`/`verify` (the circuit-specific ceremony over a
+    `.ptau`; `newZkey` equals `snarkjs groth16 setup` outside the 64-byte
+    circuit hash), `msm.pippengerG1`/`pippengerG2` (variable-time — SPEC § 5b
+    item 4), `domain.rootOfUnity` (runtime-sized domains).
+    Formats established black-box (SPEC § 4a); limits of snarkjs
+    compatibility in SPEC § 4b. `tools/snarkjs/` holds the recipe and a CLI.
+  - ⛔ **Found by the new fuzz harness:** `.r1cs` took its wire count from the
+    header unchecked — a 400-byte file could announce 2³² wires and make the
+    caller allocate a 128 GiB witness. Section 3 (8 bytes per wire) is now
+    required and bounds it. `zkey` checks every section size before allocating
+    from a header count.
+  - Fuzz exemption EMIT-ONLY retired: there is a decode surface now.
+  - `test_deps = testkit` (fuzz driver) in the root `build.zig`.
+
 - **2026-09-03** — Drift re-audit (last audited `b199192` — a *Sonnet light confirmation
   pass*, while the ledger records the module's own tier call as Opus, so the previous
   ground was thin). Six mutations, six red.

@@ -548,7 +548,7 @@ way to recognise it.
 | [`falcon`](modules/falcon/README.md) | 2 | FN-DSA — Falcon-512 and Falcon-1024 NIST post-quantum lattice signatures: keygen, sign, verify, and key/signature codecs. | any | — |
 | [`frost`](modules/frost/README.md) | 3 | FROST threshold Schnorr signatures (RFC 9591), secp256k1 — t-of-n keygen, 2-round signing, aggregate. **Not BIP340-compatible.** | any | bip340, k256 |
 | [`fss`](modules/fss/README.md) | 3 | Function Secret Sharing — 2-party single-point Distributed Point Function (BGI16), plus multi-point FSS; the primitive under `pir` and private analytics. | any | — |
-| [`groth16`](modules/groth16/README.md) | 4 | Groth16 zk-SNARK **prover** over BN254 — R1CS→QAP, produces proofs `bn254.groth16Verify` accepts. `setup` is a toy, **insecure** trusted setup. | any | bn254 |
+| [`groth16`](modules/groth16/README.md) | 3 | Groth16 zk-SNARK **prover** over BN254 — proves from snarkjs `.zkey` + circom `.wtns` (snarkjs accepts the proofs); phase-2 setup, contribution and key verification over a `.ptau`. `setup` is a toy, **insecure** trusted setup for tests. | any | bn254 |
 | [`hashdigest`](modules/hashdigest/README.md) | 2 | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | — |
 | [`hpke`](modules/hpke/README.md) | 2 | HPKE — Hybrid Public Key Encryption (RFC 9180): DHKEM(X25519/P-256) encap/decap, all four key-schedule modes, AEAD seal/open + export. | any | p256, chachapoly, entropy |
 | [`hqc`](modules/hqc/README.md) | 2 | HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt. | any | — |

@@ -32,16 +32,23 @@
 //! self-consistent-but-wrong failure mode the way a Fable-tier core has). See
 //! `gate.zig` and `SPEC.md`'s tier call.
 //!
-//! Deferred increments (all OUT of Phase 1 — see `SPEC.md`): snarkjs `.zkey`/
-//! witness ingestion for a byte-exact external anchor, Pippenger MSM,
-//! circuit/gadget DSL, PLONK/Halo2 (explicit scope non-goals), recursion.
+//! **The snarkjs ecosystem** (2026-10-02): `zkey`, `circom` (`.r1cs`, `.wtns`)
+//! and `ptau` read the real files; `zkprove.prove` proves from a `.zkey` the
+//! way `snarkjs groth16 prove` does (Pippenger MSM, quotient on a coset);
+//! `phase2` is the circuit-specific ceremony — `newZkey`, `contribute`,
+//! `verify` — that replaces `setup`'s plaintext toxic waste. snarkjs accepts
+//! the proofs, and proves with the keys; see `SPEC.md` § 4 for where
+//! compatibility stops.
+//!
+//! Not here (see `SPEC.md` backlog): threads, a circuit DSL, PLONK/Halo2
+//! (scope non-goals), recursion.
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Groth16 zk-SNARK **prover** over BN254 — R1CS→QAP, produces proofs `bn254.groth16Verify` accepts. `setup` is a toy, **insecure** trusted setup.",
+    .doc = "Groth16 zk-SNARK **prover** over BN254 — proves from snarkjs `.zkey` + circom `.wtns` (snarkjs accepts the proofs); phase-2 setup, contribution and key verification over a `.ptau`. `setup` is a toy, **insecure** trusted setup for tests.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -65,6 +72,12 @@ pub const qap = @import("qap.zig");
 pub const bn254 = @import("bn254");
 const prover = @import("prover.zig");
 pub const snarkjs_export = @import("snarkjs_export.zig");
+pub const snarkjs_bin = @import("snarkjs_bin.zig");
+pub const zkey = @import("zkey.zig");
+pub const circom = @import("circom.zig");
+pub const ptau = @import("ptau.zig");
+pub const zkprove = @import("zkprove.zig");
+pub const phase2 = @import("phase2.zig");
 
 // Convenience re-exports.
 pub const Fr = field.Fr;
@@ -113,6 +126,14 @@ test {
     _ = qap;
     _ = prover;
     _ = snarkjs_export;
+    _ = snarkjs_bin;
+    _ = zkey;
+    _ = circom;
+    _ = ptau;
+    _ = zkprove;
+    _ = phase2;
+    _ = @import("snarkjs_files_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("harness_test.zig");
     _ = @import("snarkjs_kat_test.zig");
 }
