@@ -6,9 +6,12 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-02 (`ecdsa_keygen`; 2026-10-01 for the rest) · mutation 2026-10-02 (`ecdsa_keygen`, 5/5 killed; 2026-10-01 for the rest)
+**Audit:** review 2026-10-02 · mutation 2026-10-02
 
 **Known defects:** none recorded
+
+The 2026-10-02 review and mutation run (5/5 killed) covered `ecdsa_keygen`; the
+rest of the module was reviewed and mutated on 2026-10-01.
 
 The 2026-10-01 review covered the per-participant layer (`participant.zig`, `wire.zig`,
 `reshare.zig`, 2026-09-30) — the code that parses frames from the network. It found that a
