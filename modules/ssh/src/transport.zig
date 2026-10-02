@@ -22,6 +22,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
+const montint = @import("montint");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -1389,10 +1390,6 @@ fn magnitudeGreaterOrEqual(a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) != .lt;
 }
 
-/// RFC 3526 modulus large enough for both group14 (2048-bit) and group16
-/// (4096-bit) primes.
-const DhModulus = std.crypto.ff.Modulus(4096);
-
 /// The RFC 3526 group parameters (prime + which digest the KEX method hashes
 /// with) for one `diffie-hellman-group*` name. `pub` so the server-role
 /// `dhGroupKexServer` (server.zig) can reuse the same primes + digest choice.
@@ -1447,24 +1444,57 @@ pub fn hashStringH(comptime H: type, sh: *H, data: []const u8) void {
     sh.update(data);
 }
 
-/// Modular exponentiation `base^exp mod m` (constant-time, Montgomery) via
-/// `std.crypto.ff`, returning the minimal big-endian magnitude in `out`.
-fn dhModExp(m: DhModulus, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
-    const base = DhModulus.Fe.fromBytes(m, base_be, .big) catch return error.KexFailed;
-    const res = m.powWithEncodedExponent(base, exp_be, .big) catch return error.KexFailed;
-    var full: [DhModulus.Fe.encoded_bytes]u8 = undefined;
-    res.toBytes(&full, .big) catch return error.KexFailed;
+/// `base^exp mod prime` for an RFC 3526 group prime (group14 or group16),
+/// constant-time in the secret exponent, returning the minimal big-endian
+/// magnitude in `out`. `pub` for `dhGroupKexServer`'s reuse.
+///
+/// montint's `powMont` (fixed 5-bit windows, branchless table gather), with
+/// the exponent loaded by a branchless limb loader. NOT `std.crypto.ff`'s
+/// `powWithEncodedExponent`: measured 2026-10-02 (threshold_ecdsa ctgrind,
+/// objdump), LLVM compiles its constant-time window select to a conditional
+/// jump in ReleaseFast, so the DH secret's 4-bit windows leaked here.
+pub fn dhPowModPrime(prime_be: []const u8, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
+    return switch (prime_be.len) {
+        group14_prime.len => dhPowN(2048, prime_be, base_be, exp_be, out),
+        group16_prime.len => dhPowN(4096, prime_be, base_be, exp_be, out),
+        else => error.KexFailed,
+    };
+}
+
+fn dhPowN(comptime bits: comptime_int, prime_be: []const u8, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
+    const M = montint.Modint(bits);
+    const L = @typeInfo(M.Elem).array.len;
+    if (exp_be.len > M.encoded_bytes) return error.KexFailed;
+    const m = M.fromBytesBE(prime_be) catch return error.KexFailed; // public
+    const base = m.elementFromBytesBE(base_be) catch return error.KexFailed; // public (g, or the peer's value)
+    var e = beToLimbsCt(L, exp_be);
+    defer std.crypto.secureZero(u64, &e);
+    var r = m.powMont(&base, &e);
+    defer std.crypto.secureZero(u64, &r);
+    var full: [M.encoded_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &full);
+    m.toBytesBE(&r, &full);
+    // The magnitude's length follows the value (an mpint drops leading zeros
+    // by definition — RFC 4251 §5); for K that is the protocol's, not ours.
     const mag = stripLeadingZeros(&full);
     if (mag.len > out.len) return error.KexFailed;
     @memcpy(out[0..mag.len], mag);
     return out[0..mag.len];
 }
 
-/// `base^exp mod prime` for an RFC 3526 group prime, building the constant-time
-/// modulus internally. `pub` for `dhGroupKexServer`'s reuse.
-pub fn dhPowModPrime(prime_be: []const u8, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
-    const m = DhModulus.fromBytes(prime_be, .big) catch return error.KexFailed;
-    return dhModExp(m, base_be, exp_be, out);
+/// A big-endian byte string as an `L`-limb little-endian value with no
+/// value-dependent branch (the only branch is on the public byte position).
+fn beToLimbsCt(comptime L: usize, be: []const u8) [L]u64 {
+    var v = [_]u64{0} ** L;
+    var idx: usize = 0;
+    var i: usize = be.len;
+    while (i > 0) : (idx += 8) {
+        i -= 1;
+        const limb = idx >> 6;
+        if (limb >= L) break;
+        v[limb] |= @as(u64, be[i]) << @intCast(idx & 63);
+    }
+    return v;
 }
 
 /// Run the client side of classic MODP Diffie-Hellman key exchange (RFC 4253
@@ -1488,7 +1518,6 @@ pub fn dhGroupKex(
     negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     const group = DhGroup.forName(kex_name) orelse return error.UnsupportedAlgorithm;
-    const m = DhModulus.fromBytes(group.prime, .big) catch return error.KexFailed;
     const g = [_]u8{2};
 
     // Secret exponent x: a full prime-length random value (secrecy dominates;
@@ -1502,7 +1531,7 @@ pub fn dhGroupKex(
 
     // e = g^x mod p.
     var ebuf: [group16_prime.len]u8 = undefined;
-    const e = try dhModExp(m, &g, xb, &ebuf);
+    const e = try dhPowModPrime(group.prime, &g, xb, &ebuf);
 
     // SSH_MSG_KEXDH_INIT: byte || mpint e.
     var ibuf: [8 + group16_prime.len]u8 = undefined;
@@ -1528,7 +1557,7 @@ pub fn dhGroupKex(
     // K = f^x mod p.
     var kbuf: [group16_prime.len]u8 = undefined;
     defer std.crypto.secureZero(u8, &kbuf);
-    const k_mag = try dhModExp(m, f_mag, xb, &kbuf);
+    const k_mag = try dhPowModPrime(group.prime, f_mag, xb, &kbuf);
 
     var res = KexResult{ .hash_len = if (group.sha512) 64 else 32 };
     if (group.sha512) {
@@ -3857,4 +3886,31 @@ test "readPacket enforces RFC 4253 §6's four-byte padding minimum" {
         try t.expectEqualStrings("payload", pkt.payload);
         try t.expect(pkt.padding_length >= 4);
     }
+}
+
+test "dhPowModPrime (montint, constant-time exponent) equals ff's public pow on group14 and group16" {
+    var prng = std.Random.DefaultPrng.init(0x6468_6d6f_6465);
+    const random = prng.random();
+    inline for (.{ &group14_prime, &group16_prime }) |prime| {
+        const Ff = std.crypto.ff.Modulus(prime.len * 8);
+        const m = try Ff.fromBytes(prime, .big);
+        var x: [prime.len]u8 = undefined;
+        var base: [prime.len]u8 = undefined;
+        for (0..3) |_| {
+            random.bytes(&x);
+            x[0] &= 0x7f;
+            random.bytes(&base);
+            base[0] &= 0x3f;
+            for ([_][]const u8{ &[_]u8{2}, &base }) |b| {
+                var out: [prime.len]u8 = undefined;
+                const got = try dhPowModPrime(prime, b, &x, &out);
+                const want_fe = try m.powWithEncodedPublicExponent(try Ff.Fe.fromBytes(m, b, .big), &x, .big);
+                var want_full: [prime.len]u8 = undefined;
+                try want_fe.toBytes(&want_full, .big);
+                try std.testing.expectEqualSlices(u8, stripLeadingZeros(&want_full), got);
+            }
+        }
+    }
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.KexFailed, dhPowModPrime(&[_]u8{ 0xff, 0xfb }, &[_]u8{2}, &[_]u8{3}, &out));
 }

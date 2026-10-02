@@ -162,6 +162,9 @@ declare -A TARGETS=(
     [chachapoly]="poly1305 aead"
     [hqc]="decaps keygen encaps sampler"
     [oscore]="derive protect unprotect"
+    # 2026-10-02: the MODP DH exponent (dhPowModPrime, montint) + `ffpow`, the
+    # positive control that runs the replaced std.crypto.ff pow on the same x.
+    [ssh]="dh ffpow"
     # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
@@ -257,6 +260,7 @@ declare -A MODES=(
     [chachapoly]="ReleaseFast ReleaseSafe"
     [hqc]="ReleaseFast"
     [oscore]="ReleaseFast"
+    [ssh]="ReleaseFast"
     [ct25519]="ReleaseFast"
     [decaf448]="ReleaseFast"
     [bn254]="ReleaseFast"
@@ -328,6 +332,8 @@ declare -A PATTERN=(
     [oscore/derive]='root[.]zig|hmac[.]zig|hkdf[.]zig|sha2[.]zig'
     [oscore/protect]='root[.]zig|aes_ccm[.]zig|aes[.]zig|aes_gcm[.]zig|modes[.]zig'
     [oscore/unprotect]='root[.]zig|aes_ccm[.]zig|aes[.]zig|aes_gcm[.]zig|modes[.]zig'
+    [ssh/dh]='transport[.]zig|montint[.]zig|limbs[.]zig'
+    [ssh/ffpow]='ff[.]zig'
     # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
     # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
     # target alone, so `SPEC.md`'s constant-time sentence about the tag
@@ -586,6 +592,8 @@ declare -A LABEL=(
     [oscore/derive]='oscore+std hkdf'
     [oscore/protect]='oscore+std ccm'
     [oscore/unprotect]='oscore+std ccm'
+    [ssh/dh]='ssh MODP DH x (montint)'
+    [ssh/ffpow]='ssh POSITIVE CONTROL: std ff pow on x'
     [bn254/field]='bn254 fp.zig'
     [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'

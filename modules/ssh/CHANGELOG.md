@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — ⛔ **Fixed: the MODP DH secret exponent leaked through timing.** `dhPowModPrime`
+  (group14/group16 kex, client and server) used `std.crypto.ff`'s `powWithEncodedExponent`, whose
+  constant-time window select LLVM compiles to a conditional jump in ReleaseFast (measured by
+  ctgrind + objdump in threshold_ecdsa). It is now montint's `powMont` with a branchless exponent
+  loader; `ssh` depends on `montint`. New ctgrind harness: `dh` (montint 0 contexts) and `ffpow`,
+  the old path as a positive control. Test: equal to ff's public pow on both groups.
 - **2026-10-01** — **BREAKING (low-level API only).** Entropy can come from
   `std.Io`: `transport.Entropy` (`.os` = getrandom(2), the default; `.io` =
   `Io.randomSecure`) and `Transport.entropy`. Ephemeral keys, KEXINIT cookies and

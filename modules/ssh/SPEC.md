@@ -278,7 +278,7 @@ environment with OpenSSH installed.
 
 ## Backlog / deferred
 
-- ⛔ **DEFECT (found 2026-10-02, threshold_ecdsa ctgrind): the finite-field DH exponent goes through `std.crypto.ff`'s pow** (`transport.zig` `dhModExp`, `diffie-hellman-group14-sha256` / `group16-sha512`). Its constant-time table select (`cmov(ct.eql(k, i))`) is compiled by LLVM into a conditional jump in ReleaseFast — measured with memcheck and objdump on the same ff code in `threshold_ecdsa` — so the secret exponent's 4-bit windows leak through timing. The fix there was montint's `powMont` (`threshold_ecdsa.zkproofs.powSecret`); here it means a `montint` dependency (root `build.zig`) or a ctgrind-checked ladder of our own, plus an ssh ctgrind target over `dhModExp`. Not fixed yet — waiting for the user's go-ahead. The X25519 / ML-KEM kex paths are not affected.
+- ~~DH exponent through `std.crypto.ff`'s pow~~ — **fixed 2026-10-02**: `dhPowModPrime` is montint's `powMont` with a branchless exponent loader (ff's window select compiles to a jump in ReleaseFast — measured). ctgrind target `dh` (0 contexts in montint; 4 on the mpint length of `e`/`K`, inherent to RFC 4251) with the old ff path kept as the `ffpow` positive control.
 Parts 1-3 are implemented. What is deliberately *not* here:
 
 - **Userauth methods:** `keyboard-interactive` (RFC 4256), `hostbased` (RFC 4252 §9), the §8
