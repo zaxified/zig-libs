@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-02** — **`ReshareReceiver.handle` takes a role-tagged sender
+  (review F7).** `from` was a bare id — an OLD id for broadcast/share/defense,
+  a NEW id for complaints — and the id spaces overlap, so on a transport that
+  authenticates one id space for both committees new party `j` could pass a
+  broadcast off as old dealer `j` (public `B_0 = X_j`), win first-wins and get
+  the honest dealer excluded. Now `handle(from: ReshareSender, …)` with
+  `.dealer`/`.receiver`; a kind/role mismatch is `UnknownSender`. ⚠ Breaking
+  for callers of `ReshareReceiver.handle` (no consumer in the repo).
+
 - **2026-10-02** — **ADDITIVE:** `EcdsaKeygen` — dealer-free keygen for `threshold_ecdsa` as one
   sans-I/O state machine per party: every party's Paillier key and ring-Pedersen tuple are
   broadcast with Πprm/Πmod(Ñ) and Πmod(N), each peer gets Πfac(N) under its own tuple, then

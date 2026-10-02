@@ -663,8 +663,10 @@ tfhe	ReleaseFast	noise	1	0	7f42607f6207a66f	57f844d8aeb1660a
 # 178), SEC1 decoding of secret-derived commitments (root.zig:222/223) and
 # the final `basePoint.mul` (protocol.zig:237). Bound tightened to the
 # measurement. The `Participant` state machine is not measured by this harness.
-dkg	ReleaseFast	coeffs	1	<=92	f4f220f391c8ab28	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	0	c1f0e4700ec89dc2	6407896882d3491c
+# Source pin moved 2026-10-02 (F7: `ReshareReceiver.handle` takes a role-tagged
+# `Sender`; frame routing only, no arithmetic). Both rows re-measured unchanged.
+dkg	ReleaseFast	coeffs	1	<=92	2f3c558fe944e90d	ace23d0e40b2c8f5
+dkg	ReleaseFast	combine	1	0	d860362ee8db08cc	6407896882d3491c
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
 # functions END in `if (invalid != 0) return error.InvalidPadding` and return

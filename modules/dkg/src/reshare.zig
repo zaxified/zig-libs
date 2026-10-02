@@ -44,9 +44,10 @@
 //! `ReshareReceiver` (a new party) are separate state machines; one process
 //! that sits in both committees runs both. Dealer ids are the OLD committee's
 //! ids, receiver ids the NEW committee's, and they may coincide numerically.
-//! In `ReshareReceiver.handle` the `from` argument is an old id for
-//! `reshare_broadcast`/`reshare_share`/`reshare_defense` and a new id for
-//! `reshare_complaint`. Routing:
+//! `ReshareReceiver.handle` therefore takes a role-tagged `Sender`
+//! (`.dealer` = old id for `reshare_broadcast`/`reshare_share`/
+//! `reshare_defense`, `.receiver` = new id for `reshare_complaint`) and
+//! refuses a frame whose kind does not match the role. Routing:
 //!
 //! ```text
 //! dealer.start()      broadcast -> every receiver;  party(j) -> receiver j
@@ -275,6 +276,28 @@ pub const ReceiverAdvanceError = error{
     Inconsistent,
 } || commit.CommitError || Allocator.Error;
 
+/// Who sent a frame to a `ReshareReceiver`, as the caller's transport
+/// authenticated it: an old-committee dealer or a new-committee receiver.
+/// The role is part of the identity — the two id spaces overlap.
+pub const Sender = union(enum) {
+    dealer: u32,
+    receiver: u32,
+
+    fn asDealer(self: Sender) ?u32 {
+        return switch (self) {
+            .dealer => |id| id,
+            .receiver => null,
+        };
+    }
+
+    fn asReceiver(self: Sender) ?u32 {
+        return switch (self) {
+            .receiver => |id| id,
+            .dealer => null,
+        };
+    }
+};
+
 pub const ReshareReceiver = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -385,9 +408,15 @@ pub const ReshareReceiver = struct {
         if (self.phase_ != p) return error.WrongRound;
     }
 
-    /// Feed one frame. `from` is an OLD id for `reshare_broadcast`,
-    /// `reshare_share` and `reshare_defense`, a NEW id for `reshare_complaint`.
-    pub fn handle(self: *ReshareReceiver, from: u32, bytes: []const u8) MessageError!void {
+    /// Feed one frame. `from` is the sender as the transport authenticated
+    /// it, role included: `reshare_broadcast`, `reshare_share` and
+    /// `reshare_defense` must come from a `.dealer` (an OLD id),
+    /// `reshare_complaint` from a `.receiver` (a NEW id); anything else is
+    /// `UnknownSender`. The two id spaces overlap numerically, so a bare id
+    /// would let new party `j` pass a broadcast off as old dealer `j` (whose
+    /// `B_0 = X_j` is public), win first-wins and get the honest dealer
+    /// excluded (review 2026-10-01, F7).
+    pub fn handle(self: *ReshareReceiver, from: Sender, bytes: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
@@ -399,20 +428,24 @@ pub const ReshareReceiver = struct {
         switch (kind) {
             .reshare_broadcast => {
                 try self.expect(.shares);
-                return self.onBroadcast(self.dealerPos(from) orelse return error.UnknownSender, from, body);
+                const sid = from.asDealer() orelse return error.UnknownSender;
+                return self.onBroadcast(self.dealerPos(sid) orelse return error.UnknownSender, sid, body);
             },
             .reshare_share => {
                 try self.expect(.shares);
-                return self.onShare(self.dealerPos(from) orelse return error.UnknownSender, from, body);
+                const sid = from.asDealer() orelse return error.UnknownSender;
+                return self.onShare(self.dealerPos(sid) orelse return error.UnknownSender, sid, body);
             },
             .reshare_complaint => {
                 try self.expect(.complaints);
-                if (from < 1 or from > self.rc.new.n or from == self.me) return error.UnknownSender;
-                return self.onComplaint(from, body);
+                const sid = from.asReceiver() orelse return error.UnknownSender;
+                if (sid < 1 or sid > self.rc.new.n or sid == self.me) return error.UnknownSender;
+                return self.onComplaint(sid, body);
             },
             .reshare_defense => {
                 try self.expect(.defenses);
-                return self.onDefense(self.dealerPos(from) orelse return error.UnknownSender, from, body);
+                const sid = from.asDealer() orelse return error.UnknownSender;
+                return self.onDefense(self.dealerPos(sid) orelse return error.UnknownSender, sid, body);
             },
             .pedersen_broadcast, .share, .complaint, .defense, .feldman_broadcast, .feldman_complaint, .reveal, .ecdsa_announcement, .ecdsa_fac_proof => return error.UnknownKind,
         }
@@ -629,10 +662,13 @@ pub const Rig = struct {
         self.allocator.free(self.receivers);
     }
 
-    fn send(self: *Rig, comptime Rcv: type, r: *Rcv, from: u32, bytes: []const u8) !void {
+    fn send(self: *Rig, comptime Rcv: type, r: *Rcv, from: if (Rcv == ReshareReceiver) Sender else u32, bytes: []const u8) !void {
         const copy = try self.allocator.dupe(u8, bytes);
         defer self.allocator.free(copy);
-        if (self.filter) |f| if (f(from, r.id(), copy) == .drop) return;
+        const from_id: u32 = if (Rcv == ReshareReceiver) switch (from) {
+            inline else => |id| id,
+        } else from;
+        if (self.filter) |f| if (f(from_id, r.id(), copy) == .drop) return;
         r.handle(from, copy) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => self.refused += 1,
@@ -644,8 +680,8 @@ pub const Rig = struct {
             const msgs = try d.takeOutgoing();
             defer wire.freeOutgoing(self.allocator, msgs);
             for (msgs) |m| switch (m.to) {
-                .broadcast => for (self.receivers) |*r| try self.send(ReshareReceiver, r, d.id(), m.bytes),
-                .party => |j| try self.send(ReshareReceiver, &self.receivers[j - 1], d.id(), m.bytes),
+                .broadcast => for (self.receivers) |*r| try self.send(ReshareReceiver, r, .{ .dealer = d.id() }, m.bytes),
+                .party => |j| try self.send(ReshareReceiver, &self.receivers[j - 1], .{ .dealer = d.id() }, m.bytes),
             };
         }
     }
@@ -655,7 +691,7 @@ pub const Rig = struct {
             const msgs = try r.takeOutgoing();
             defer wire.freeOutgoing(self.allocator, msgs);
             for (msgs) |m| {
-                for (self.receivers) |*q| if (q.id() != r.id()) try self.send(ReshareReceiver, q, r.id(), m.bytes);
+                for (self.receivers) |*q| if (q.id() != r.id()) try self.send(ReshareReceiver, q, .{ .receiver = r.id() }, m.bytes);
                 for (self.dealers) |*d| try self.send(ReshareDealer, d, r.id(), m.bytes);
             }
         }
@@ -941,56 +977,61 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     const share = msgs[1].bytes; // to party 1
     try testing.expectEqual(Target{ .party = 1 }, msgs[1].to);
 
-    try testing.expectError(error.Malformed, r1.handle(1, &.{}));
-    try testing.expectError(error.UnknownKind, r1.handle(1, &.{0}));
-    try testing.expectError(error.UnknownKind, r1.handle(1, &.{@intFromEnum(wire.Kind.share)}));
-    try testing.expectError(error.UnknownSender, r1.handle(3, bc)); // 3 is not a dealer
-    try testing.expectError(error.UnknownSender, r1.handle(0, share));
-    try testing.expectError(error.SenderMismatch, r1.handle(2, bc)); // says dealer 1
-    try testing.expectError(error.SenderMismatch, r1.handle(2, share));
-    try testing.expectError(error.Malformed, r1.handle(1, bc[0 .. bc.len - 1]));
-    try testing.expectError(error.Malformed, r1.handle(1, share[0 .. share.len - 1]));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, &.{}));
+    try testing.expectError(error.UnknownKind, r1.handle(.{ .dealer = 1 }, &.{0}));
+    try testing.expectError(error.UnknownKind, r1.handle(.{ .dealer = 1 }, &.{@intFromEnum(wire.Kind.share)}));
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .dealer = 3 }, bc)); // 3 is not a dealer
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .dealer = 0 }, share));
+    try testing.expectError(error.SenderMismatch, r1.handle(.{ .dealer = 2 }, bc)); // says dealer 1
+    try testing.expectError(error.SenderMismatch, r1.handle(.{ .dealer = 2 }, share));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, bc[0 .. bc.len - 1]));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, share[0 .. share.len - 1]));
     var bad_pt = try allocator.dupe(u8, bc);
     defer allocator.free(bad_pt);
     bad_pt[1 + 8] = 0x04;
-    try testing.expectError(error.Malformed, r1.handle(1, bad_pt));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, bad_pt));
     var bad_sc = try allocator.dupe(u8, share);
     defer allocator.free(bad_sc);
     @memset(bad_sc[1 + 8 ..][0..Ns], 0xff);
-    try testing.expectError(error.Malformed, r1.handle(1, bad_sc));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, bad_sc));
     var wrong = try allocator.dupe(u8, share);
     defer allocator.free(wrong);
     std.mem.writeInt(u32, wrong[1 + 4 ..][0..4], 2, .big);
-    try testing.expectError(error.WrongRecipient, r1.handle(1, wrong));
+    try testing.expectError(error.WrongRecipient, r1.handle(.{ .dealer = 1 }, wrong));
     // A commitment count that lies.
     var lie = try allocator.dupe(u8, bc);
     defer allocator.free(lie);
     std.mem.writeInt(u32, lie[1 + 4 ..][0..4], 0xffff_ffff, .big);
-    try testing.expectError(error.Malformed, r1.handle(1, lie));
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, lie));
 
     try testing.expect(!r1.allReceived());
-    try r1.handle(1, bc);
-    try r1.handle(1, share);
-    try testing.expectError(error.DuplicateMessage, r1.handle(1, bc));
-    try testing.expectError(error.DuplicateMessage, r1.handle(1, share));
+    // F7: the same frames from new party 1 (receiver role) are refused —
+    // the id matches dealer 1's, the role does not.
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 1 }, bc));
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 1 }, share));
+    try r1.handle(.{ .dealer = 1 }, bc);
+    try r1.handle(.{ .dealer = 1 }, share);
+    try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, bc));
+    try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, share));
     // Wrong round while collecting shares.
-    try testing.expectError(error.WrongRound, r1.handle(2, &.{@intFromEnum(wire.Kind.reshare_complaint)}));
-    try testing.expectError(error.WrongRound, r1.handle(1, &.{@intFromEnum(wire.Kind.reshare_defense)}));
+    try testing.expectError(error.WrongRound, r1.handle(.{ .receiver = 2 }, &.{@intFromEnum(wire.Kind.reshare_complaint)}));
+    try testing.expectError(error.WrongRound, r1.handle(.{ .dealer = 1 }, &.{@intFromEnum(wire.Kind.reshare_defense)}));
 
     // Dealer 2 never came: r1 excludes it later, and complains about nobody.
     try r1.advance();
-    try testing.expectError(error.WrongRound, r1.handle(1, bc));
+    try testing.expectError(error.WrongRound, r1.handle(.{ .dealer = 1 }, bc));
     var cf: [1 + Complaint.encoded_length]u8 = undefined;
     cf[0] = @intFromEnum(wire.Kind.reshare_complaint);
     @memcpy(cf[1..], &(Complaint{ .complainant = 2, .accused = 1 }).toBytes());
-    try testing.expectError(error.UnknownSender, r1.handle(1, &cf)); // ourselves
-    try testing.expectError(error.UnknownSender, r1.handle(9, &cf));
-    try testing.expectError(error.SenderMismatch, r1.handle(3, &cf));
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 1 }, &cf)); // ourselves
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 9 }, &cf));
+    try testing.expectError(error.SenderMismatch, r1.handle(.{ .receiver = 3 }, &cf));
     var bad_acc = cf;
     std.mem.writeInt(u32, bad_acc[1 + 4 ..][0..4], 3, .big); // not a dealer
-    try testing.expectError(error.Malformed, r1.handle(2, &bad_acc));
-    try r1.handle(2, &cf);
-    try testing.expectError(error.DuplicateMessage, r1.handle(2, &cf));
+    try testing.expectError(error.Malformed, r1.handle(.{ .receiver = 2 }, &bad_acc));
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .dealer = 2 }, &cf)); // F7: a complaint is a receiver's
+    try r1.handle(.{ .receiver = 2 }, &cf);
+    try testing.expectError(error.DuplicateMessage, r1.handle(.{ .receiver = 2 }, &cf));
     try r1.advance();
     // A defense for a complaint that exists, from the right dealer, but that
     // dealer's broadcast was accepted above: it verifies and is recorded.
@@ -998,13 +1039,13 @@ test "receiver and dealer refuse malformed, misrouted, replayed and out-of-round
     df[0] = @intFromEnum(wire.Kind.reshare_defense);
     const sm: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 2, .s = commit.evalPoly(d1.g, commit.scalarFromIndex(2)) };
     @memcpy(df[1..], &sm.toBytes());
-    try testing.expectError(error.SenderMismatch, r1.handle(2, &df)); // the frame names dealer 1
+    try testing.expectError(error.SenderMismatch, r1.handle(.{ .dealer = 2 }, &df)); // the frame names dealer 1
     var df2 = df;
     const sm2: types.ScalarShareMsg = .{ .dealer = 2, .receiver = 1, .s = Scalar.one };
     @memcpy(df2[1..], &sm2.toBytes());
-    try testing.expectError(error.Unsolicited, r1.handle(2, &df2)); // nobody complained about dealer 2
-    try r1.handle(1, &df);
-    try testing.expectError(error.DuplicateMessage, r1.handle(1, &df));
+    try testing.expectError(error.Unsolicited, r1.handle(.{ .dealer = 2 }, &df2)); // nobody complained about dealer 2
+    try r1.handle(.{ .dealer = 1 }, &df);
+    try testing.expectError(error.DuplicateMessage, r1.handle(.{ .dealer = 1 }, &df));
     // Dealer: complaint handling.
     var d2 = try ReshareDealer.init(allocator, old[1], cfg, prng.random());
     defer d2.deinit();
@@ -1168,7 +1209,10 @@ const FuzzWorld = struct {
 fn fuzzReceiverHandle(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    const from: u32 = @intCast(smith.value(u64) % 5);
+    // 0..4 = a dealer id (what every seed before F7 meant), 5..9 = the same
+    // ids in the receiver role.
+    const raw: u32 = @intCast(smith.value(u64) % 10);
+    const from: Sender = if (raw < 5) .{ .dealer = raw } else .{ .receiver = raw - 5 };
     const steps: usize = @intCast(smith.value(u64) % 4);
     var w = try FuzzWorld.build(testing.allocator, steps);
     defer w.rig.deinit();
@@ -1208,7 +1252,7 @@ test "fuzz: ReshareReceiver.handle never panics, in any round" {
                 if (r.id() == 1) continue;
                 for (r.outbox.items) |m| {
                     const buf = try aa.alloc(u8, 20 + m.bytes.len);
-                    try seeds.append(aa, seedFrame(buf, m.bytes, r.id(), steps));
+                    try seeds.append(aa, seedFrame(buf, m.bytes, @as(u64, r.id()) + 5, steps));
                 }
             }
         }

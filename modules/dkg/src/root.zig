@@ -92,6 +92,9 @@ const reshare = @import("reshare.zig");
 pub const ReshareConfig = reshare.ReshareConfig;
 pub const ReshareDealer = reshare.ReshareDealer;
 pub const ReshareReceiver = reshare.ReshareReceiver;
+/// The role-tagged sender `ReshareReceiver.handle` takes (old dealer or
+/// new receiver — the id spaces overlap).
+pub const ReshareSender = reshare.Sender;
 pub const ReshareReceiverPhase = reshare.ReceiverPhase;
 pub const ReshareDealerPhase = reshare.DealerPhase;
 

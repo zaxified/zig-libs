@@ -367,7 +367,7 @@ here.
 ## Backlog / deferred
 
 - ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
-- **Role-tagged sender for `ReshareReceiver`** (review 2026-10-01, F7): `handle` takes one `from` that is an OLD id for three kinds and a NEW id for `reshare_complaint`, and the kind octet comes from the frame. A transport that authenticates one id space for both committees would let new party `j` send a broadcast as old dealer `j` (its `B_0 = X_j` is public), win first-wins, and get the honest dealer excluded. Documented as the caller's routing contract today; a `from: struct { role, id }` would make it unforgeable. Effort: small.
+- ~~**Role-tagged sender for `ReshareReceiver`**~~ (review 2026-10-01, F7) ✅ 2026-10-02: `handle(from: ReshareSender, …)` — `.dealer`/`.receiver`; a frame whose kind does not match the role is `UnknownSender`, so new party `j` can no longer pass a broadcast off as old dealer `j` (tested both ways).
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).
