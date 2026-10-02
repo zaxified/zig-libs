@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! harness_test — the anti-self-consistency verification harness. TFHE gate
-//! bootstrapping has NO external byte-exact KAT (TFHE-rs / OpenFHE-binfhe /
-//! concrete all differ in encoding and parameters), so a self-consistent-but-
-//! wrong core can pass a naive round-trip. This harness defends on three fronts:
+//! harness_test — the anti-self-consistency verification harness, written
+//! when TFHE gate bootstrapping had no external byte-exact anchor here (one
+//! exists since 2026-10-02: `interop_test.zig` against tfhe-rs). It keeps
+//! guarding the `toy` set on three fronts:
 //!
 //!   1. A NOISELESS cleartext blind-rotation oracle (`clearBootstrap`) that pins
 //!      the LUT construction + modulus-switch + rotation indexing WITHOUT the
@@ -72,10 +72,10 @@ test "clearBootstrap oracle: NOT LUT flips every bit" {
 fn brokenSampleExtract(ct: *const Toy.Glwe) Toy.LweBig {
     const N = P.N;
     var out: Toy.LweBig = undefined;
-    out.b = ct.b.c[0];
-    out.a[0] = ct.a.c[0];
+    out.b = ct.body.c[0];
+    out.a[0] = ct.mask[0].c[0];
     var j: usize = 1;
-    while (j < N) : (j += 1) out.a[j] = ct.a.c[N - j]; // BUG: missing the `0 -%`
+    while (j < N) : (j += 1) out.a[j] = ct.mask[0].c[N - j]; // BUG: missing the `0 -%`
     return out;
 }
 
@@ -167,22 +167,30 @@ const KeySet = struct {
     ksk: Toy.KeySwitchKey,
 };
 
-fn setupKeys(rnd: std.Random) KeySet {
+fn setupKeys(rnd: std.Random) !KeySet {
     const small = Toy.lweKeyGenForTest(64, rnd);
     const glwe = Toy.glweKeyGenForTest(rnd);
+    var bsk = try Toy.bootstrapKeyGenForTest(testing.allocator, &small, &glwe, rnd);
+    errdefer bsk.deinit(testing.allocator);
     return .{
         .small = small,
         .glwe = glwe,
-        .bsk = Toy.bootstrapKeyGenForTest(&small, &glwe, rnd),
-        .ksk = Toy.keySwitchKeyGenForTest(&glwe, &small, rnd),
+        .bsk = bsk,
+        .ksk = try Toy.keySwitchKeyGenForTest(testing.allocator, &glwe, &small, rnd),
     };
+}
+
+fn freeKeys(ks: *KeySet) void {
+    ks.bsk.deinit(testing.allocator);
+    ks.ksk.deinit(testing.allocator);
 }
 
 test "programmable gate: bootstrap(identity) and bootstrap(NOT) decode correctly" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(300);
     const rnd = prng.random();
-    const ks = setupKeys(rnd);
+    var ks = try setupKeys(rnd);
+    defer freeKeys(&ks);
     const id = lutIdentity();
     const not = lutNot();
     for (0..16) |_| {
@@ -199,7 +207,8 @@ test "programmable 2-input gate: homomorphic AND via LWE sum + LUT" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(301);
     const rnd = prng.random();
-    const ks = setupKeys(rnd);
+    var ks = try setupKeys(rnd);
+    defer freeKeys(&ks);
     // bits at Δ = q/8 so the sum a+b ∈ {0,1,2} stays in the lower half.
     const d8: T = 1 << 29;
     const and_lut = Toy.testPolynomial(3, .{ 0, 0, d8, 0 }); // AND: 1 only when a+b=2
@@ -220,7 +229,8 @@ test "UNLIMITED DEPTH: a long chain of bootstraps preserves the message" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(302);
     const rnd = prng.random();
-    const ks = setupKeys(rnd);
+    var ks = try setupKeys(rnd);
+    defer freeKeys(&ks);
     const id = lutIdentity();
     const chain = 16; // a leveled scheme fails long before this; bootstrapping does not.
     for ([_]u32{ 0, 1 }) |b| {
@@ -237,13 +247,14 @@ test "positive control: a corrupted bootstrap key must NOT bootstrap correctly" 
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(303);
     const rnd = prng.random();
-    var ks = setupKeys(rnd);
+    var ks = try setupKeys(rnd);
+    defer freeKeys(&ks);
     // Randomise every GGSW row — the bsk no longer encrypts the secret bits, so
     // blind rotation selects garbage and the output must not decode to the input.
-    for (&ks.bsk.ggsw) |*g| {
+    for (ks.bsk.ggsw) |*g| {
         for (&g.rows) |*row| {
-            for (&row.a.c) |*x| x.* = rnd.int(T);
-            for (&row.b.c) |*x| x.* = rnd.int(T);
+            for (&row.mask[0].c) |*x| x.* = rnd.int(T);
+            for (&row.body.c) |*x| x.* = rnd.int(T);
         }
     }
     const id = lutIdentity();
@@ -261,7 +272,8 @@ test "noise budget: a bootstrapped ciphertext has noise well below Δ/2" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(304);
     const rnd = prng.random();
-    const ks = setupKeys(rnd);
+    var ks = try setupKeys(rnd);
+    defer freeKeys(&ks);
     const id = lutIdentity();
     for (0..16) |_| {
         const b = rnd.uintLessThan(u32, 2);

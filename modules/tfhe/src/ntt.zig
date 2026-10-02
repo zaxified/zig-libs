@@ -78,10 +78,26 @@ pub const max_degree: usize = 1 << 13;
 // ── modular arithmetic mod p (canonical, branch-light) ───────────────────────
 
 /// All-ones iff `c` is set — the arithmetic-select mask these routines use in
-/// place of a branch. (Chosen for *speed*, not for secrecy: nothing in this
-/// file touches a secret. Branches here were measured at ~2× the cost.)
+/// place of a branch.
+///
+/// This was first written for *speed* ("nothing in this file touches a
+/// secret"), and that premise was false: `tfhe.zig` multiplies the GLWE secret
+/// key through this NTT in key generation, encryption and decryption
+/// (`glweEncrypt`'s `mask·s`, `glwePhase`). ctgrind measured LLVM turning the
+/// masked `r -%= p & mask(r >= p)` back into a `jb` at 8 inlined call sites
+/// (`ctgrind_harness.zig`, "A genuine class-1 branch"). `blackBox` hides the
+/// mask's two-valuedness from the optimizer, so every site stays a mask.
 inline fn mask(c: u1) u64 {
-    return 0 -% @as(u64, c);
+    return blackBox(0 -% @as(u64, c));
+}
+
+/// Optimization barrier (the `p256`/`hqc`/`montint` idiom). No-op at runtime.
+inline fn blackBox(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
 }
 
 /// `a + b mod p` for canonical `a, b < p`.

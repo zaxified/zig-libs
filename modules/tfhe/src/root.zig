@@ -14,48 +14,33 @@
 //! negacyclic ring, no pairing, no external C) and is the canonical
 //! bootstrapping demonstration.
 //!
-//! ## Status: the gated Fable core is IMPLEMENTED (`gate.fable_core_implemented
-//! = true`) — no `@panic` remains in this module; all tests pass, no skips.
-//! The mechanical layer — the negacyclic ring (`poly`), the signed gadget
-//! decomposition (`gadget`), torus (de)coding and modulus switching (`torus`),
-//! plus `tfhe.Tfhe`'s LWE/GLWE/GGSW keygen/encrypt/decrypt, bootstrap-key +
-//! key-switch-key generation, sample extraction, LWE key switching, and the
-//! cleartext LUT+rotation oracle (`clearBootstrap`) — was always real and
-//! tested. The **irreducible soundness core** — `externalProduct`, `cmux`,
-//! `blindRotate`, `bootstrap` — is now real too: the once-gated
-//! `@panic("TODO(fable/core)")` stubs are gone, and the previously
-//! SKIP-gated end-to-end anchors (programmable gate, 2-input AND,
-//! unlimited-depth bootstrap chain, corrupted-bootstrap-key control, noise
-//! budget) all run and pass. There is still no external byte-exact KAT for
-//! these four functions, so verification leans on the cleartext oracle, the
-//! deliberately-broken positive controls, and the unlimited-depth chain
-//! property instead — see `SPEC.md` for the full verification-level
-//! breakdown and the failure-probability ledger.
-//!
-//! **Toy/test parameters only — no security level is claimed.**
+//! The parameter sets, key/ciphertext layouts and the gate encoding are
+//! tfhe-rs 1.8.1's boolean layer (`params.tfhers_default` = its
+//! `DEFAULT_PARAMETERS`); `interop_test.zig` holds this module to tfhe-rs in
+//! both directions — key switching and the bootstrap byte-identical, gates
+//! evaluated across implementations. `boolean.zig` is the consumer-facing
+//! layer (`ClientKey`, `ServerKey`, gates), `codec.zig` the byte encodings.
+//! `toy` remains for fast tests and claims no security; for the tfhe-rs sets
+//! the security level is tfhe-rs's sizing (see `SPEC.md`).
 //!
 //! ## Randomness
 //!
 //! Key generation and encryption take `io: std.Io` and draw through
 //! `entropy.SecureSource`, the fail-closed `std.Random` adapter over
-//! `std.Io.randomSecure` (`modules/entropy`) — not the silently-degrading
-//! `std.Io.random` a bare `std.Random.IoSource` would bind. A bare
-//! `std.Random` parameter would still be worse — it would let a consumer
-//! pass `DefaultPrng.init(0)` at a call site that looks identical to a
-//! correct one, and a predictable stream does not weaken this scheme — it
-//! removes it (`dim` ciphertexts then recover the secret key by Gaussian
-//! elimination). The `…ForTest` twins keep `std.Random` for the KATs and
-//! seeded end-to-end tests; see `tfhe.zig`'s "Randomness" doc comment for
-//! the fuller picture, including why failing closed via
-//! `std.Io.randomSecure` is settled policy now, not an open question
-//! (`CONVENTIONS.md` §2.2, formerly tracked as B7).
+//! `std.Io.randomSecure` (`modules/entropy`). A bare `std.Random` parameter
+//! would let a consumer pass `DefaultPrng.init(0)` at a call site that looks
+//! identical to a correct one, and a predictable stream does not weaken this
+//! scheme — it removes it (`dim` ciphertexts then recover the secret key by
+//! Gaussian elimination). The `…ForTest` twins keep `std.Random` for the KATs
+//! and seeded end-to-end tests; see `tfhe.zig`'s "Randomness" doc comment
+//! (`CONVENTIONS.md` §2.2).
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TFHE/FHEW programmable gate bootstrapping — unbounded-depth FHE via blind rotation over a power-of-two torus. **Toy parameters only, no security level claimed.**",
+    .doc = "TFHE gate bootstrapping — unbounded-depth FHE on encrypted bits: binary gates, programmable bootstrap, tfhe-rs's boolean parameter sets and key/ciphertext layouts (interoperates with tfhe-rs 1.8.1 both ways).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -75,10 +60,16 @@ pub const poly = @import("poly.zig");
 /// rounding budget) — the engine behind `poly.Poly(N).mul` for large `N`.
 pub const ntt = @import("ntt.zig");
 pub const gadget = @import("gadget.zig");
+/// Constant-time Gaussian error sampling (Box–Muller without branches).
+pub const noise = @import("noise.zig");
 pub const params = @import("params.zig");
 
-// Scheme layer (types + mechanical ops real; the four cores gated).
+// Scheme layer.
 pub const gate = @import("gate.zig");
+/// Encrypted bits and binary gates (tfhe-rs's boolean encoding).
+pub const boolean = @import("boolean.zig");
+/// Byte encodings of keys and ciphertexts (tfhe-rs's container order).
+pub const codec = @import("codec.zig");
 const tfhe_mod = @import("tfhe.zig");
 /// `Tfhe(P)` — a TFHE instance for a compile-time parameter set. See `tfhe.zig`.
 pub const Tfhe = tfhe_mod.Tfhe;
@@ -96,9 +87,14 @@ test {
     _ = poly;
     _ = ntt;
     _ = gadget;
+    _ = noise;
     _ = params;
     _ = tfhe_mod;
+    _ = boolean;
+    _ = codec;
     _ = @import("harness_test.zig");
+    _ = @import("interop_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
 }
 

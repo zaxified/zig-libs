@@ -21,9 +21,10 @@
 //!     producing a FRESH low-noise LWE encrypting the programmed LUT of the
 //!     input. This is what makes depth unbounded.
 //!
-//! There is NO external byte-exact KAT for these (TFHE-rs / OpenFHE-binfhe /
-//! concrete all differ in encoding and params), so a self-consistent-but-wrong
-//! core can pass a naive round-trip. The harness defends with: a mechanical
+//! When this flag was introduced there was no external byte-exact KAT for
+//! these, so a self-consistent-but-wrong core could pass a naive round-trip.
+//! Since 2026-10-02 there is one: `interop_test.zig` holds the bootstrap
+//! byte-identical to tfhe-rs's on tfhe-rs's own keys and ciphertexts. The harness defends with: a mechanical
 //! cleartext blind-rotation oracle (`clearBootstrap`) that pins the LUT +
 //! rotation indexing WITHOUT the core; deliberately-broken positive controls
 //! (wrong sample-extract sign, dropped-level gadget, wrong rotation sign) that

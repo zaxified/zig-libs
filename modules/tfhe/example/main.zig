@@ -6,10 +6,9 @@
 //!
 //! The reason to reach for TFHE rather than the sibling leveled `bfv` is
 //! depth: every gate here ends in a bootstrap, which re-decodes the message
-//! through a lookup table and emits a FRESH low-noise ciphertext, so the
-//! circuit can be as deep as the policy needs and nobody has to size a noise
-//! budget in advance. The cost is that a gate is milliseconds, not
-//! nanoseconds.
+//! and emits a FRESH low-noise ciphertext, so the circuit can be as deep as
+//! the policy needs and nobody has to size a noise budget in advance. The
+//! cost is that a gate is a fraction of a second, not nanoseconds.
 //!
 //! This is an example in the gate sense — it is built against the PUBLISHED
 //! module (`@import("tfhe")` and nothing else). If a type needed to call the
@@ -17,22 +16,16 @@
 //! stops compiling. The module's own tests cannot notice either, because they
 //! live inside it.
 //!
-//! **Toy parameters — no security level is claimed.** They are the only ones
-//! the module ships, which is itself the thing a consumer needs to know
-//! before deploying anything built on this.
+//! The parameter set is tfhe-rs's `DEFAULT_PARAMETERS` (`params.tfhers_default`),
+//! for which tfhe-rs states 128-bit security and a gate failure probability of
+//! at most 2^-64. The keys and ciphertexts below are the same objects tfhe-rs
+//! would produce for them (`src/interop_test.zig`).
 
 const std = @import("std");
 const tfhe = @import("tfhe");
 
-/// The parameter set. `Tfhe` is generic over it, so a deployment that
-/// commissions a secure set changes this line and nothing else.
-const Fhe = tfhe.Tfhe(tfhe.params.toy);
-
-/// Bit scale for the 2-input gate below. Single-bit values live at `Δ = q/4`,
-/// but a gate that adds two ciphertexts first needs the SUM `a + b ∈ {0,1,2}`
-/// to stay inside the LUT's lower half, so its inputs go in at `q/8`.
-const gate_delta: tfhe.Torus = 1 << 29;
-const gate_delta_log: u6 = 29;
+/// The parameter set. `Tfhe` is generic over it.
+const Fhe = tfhe.Tfhe(tfhe.params.tfhers_default);
 
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -40,32 +33,21 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     // Every production key-generation and encryption entry point draws
-    // through `std.Io`, and that is the module's most consumer-visible design
-    // decision: a predictable stream here does not weaken LWE, it dissolves
-    // it — `n` ciphertexts recover the secret key by Gaussian elimination —
-    // so the seeded twins are all suffixed `…ForTest` to keep a
-    // `DefaultPrng.init(0)` from ever appearing at a call site that looks
-    // production-shaped. The consequence for a consumer is this block: an I/O
-    // implementation is required even though nothing below touches a file or
-    // a socket.
+    // through `std.Io`: a predictable stream here does not weaken LWE, it
+    // dissolves it — `n` ciphertexts recover the secret key by Gaussian
+    // elimination — so the seeded twins are all suffixed `…ForTest`. The
+    // consequence for a consumer is this block: an I/O implementation is
+    // required even though nothing below touches a file or a socket.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io: std.Io = threaded.io();
 
-    // Validates the parameter set's structure (power-of-two ring degree,
-    // gadget decompositions that fit the 32-bit torus). NOT a security check.
-    _ = Fhe.init() catch |err| {
-        std.debug.print("parameter set is malformed: {s}\n", .{@errorName(err)});
-        return;
-    };
-
     // ── the rejection a caller must handle ───────────────────────────────
-    // Anyone tuning parameters — the only way to get a secure set, since the
-    // shipped one is a toy — hits this first. `validate` names the specific
-    // structural fault, which is what makes it actionable rather than a
-    // wrong answer three thousand gates later.
-    var tuned = tfhe.params.toy;
-    tuned.ell = 6; // 7 bits x 6 levels = 42 > 32: the gadget no longer fits
+    // Anyone tuning parameters hits this first. `validate` names the specific
+    // structural fault, which is what makes it actionable rather than a wrong
+    // answer three thousand gates later. NOT a security check.
+    var tuned = tfhe.params.tfhers_default;
+    tuned.ell = 4; // 10 bits x 4 levels = 40 > 32: the gadget no longer fits
     if (tuned.validate()) |_| {
         return error.BadGadgetAccepted;
     } else |err| switch (err) {
@@ -74,76 +56,76 @@ pub fn main() !void {
     }
 
     // ── client: keys ─────────────────────────────────────────────────────
-    // The two secret keys stay with the client. The bootstrap key and the
-    // key-switch key go to the evaluator: both are ENCRYPTIONS of secret
-    // material, not the material itself, which is what makes outsourcing
-    // possible at all.
-    var small = Fhe.lweKeyGen(Fhe.lwe_dim, io);
-    defer small.deinit();
-    var glwe = Fhe.glweKeyGen(io);
-    defer glwe.deinit();
-
-    // Heap, not stack: the evaluation keys are megabytes for even these toy
-    // parameters (the bootstrap key alone is one GGSW ciphertext per bit of
-    // the LWE key). They are returned by value, so a consumer that wants them
-    // off the stack has to place them itself, as here.
-    const bsk = try gpa.create(Fhe.BootstrapKey);
-    defer gpa.destroy(bsk);
-    bsk.* = Fhe.bootstrapKeyGen(&small, &glwe, io);
-    defer bsk.deinit();
-
-    const ksk = try gpa.create(Fhe.KeySwitchKey);
-    defer gpa.destroy(ksk);
-    ksk.* = Fhe.keySwitchKeyGen(&glwe, &small, io);
-    defer ksk.deinit();
+    // The client key (two secret keys) stays with the client. The server key
+    // — a bootstrap key and a key-switch key, both ENCRYPTIONS of secret
+    // material — goes to the evaluator. It is ~78 MB, which is why it lives
+    // on the heap and why it travels as bytes.
+    var client = Fhe.ClientKey.generate(io);
+    defer client.deinit();
+    var server_key_bytes: std.Io.Writer.Allocating = .init(gpa);
+    defer server_key_bytes.deinit();
+    {
+        var sk = try Fhe.ServerKey.generate(gpa, &client, io);
+        defer sk.deinit(gpa);
+        try Fhe.Codec.writeServerKey(&server_key_bytes.writer, &sk);
+    }
+    std.debug.print("server key: {d} bytes\n", .{server_key_bytes.written().len});
 
     // ── client: encrypt the policy inputs ────────────────────────────────
-    // "is a paid subscriber" AND "is inside the licensed region" — two bits
-    // the evaluator must not learn.
-    var subscriber = Fhe.lweEncrypt(Fhe.lwe_dim, &small, tfhe.torus.encode(1, gate_delta), io);
-    const in_region = Fhe.lweEncrypt(Fhe.lwe_dim, &small, tfhe.torus.encode(1, gate_delta), io);
+    // "is a paid subscriber", "is inside the licensed region", "has a staff
+    // override" — three bits the evaluator must not learn.
+    var wire: std.Io.Writer.Allocating = .init(gpa);
+    defer wire.deinit();
+    for ([_]bool{ true, false, true }) |b| {
+        const ct = client.encrypt(b, io);
+        try Fhe.Codec.writeLwe(&wire.writer, &ct);
+    }
 
-    // ── evaluator: one homomorphic AND ───────────────────────────────────
-    // A 2-input gate is an LWE sum followed by a bootstrap whose LUT reads
-    // the sum: output 1 only when `a + b == 2`.
-    //
-    // The sum is written out by hand because the module publishes `glweAdd`/
-    // `glweSub` for GLWE ciphertexts but nothing equivalent for LWE ones —
-    // so every consumer building any two-input gate re-derives this loop from
-    // the ciphertext's raw `(a, b)` components.
-    for (&subscriber.a, in_region.a) |*x, y| x.* +%= y;
-    subscriber.b +%= in_region.b;
-
-    const and_lut = Fhe.testPolynomial(3, .{ 0, 0, gate_delta, 0 });
-    const answer = Fhe.bootstrap(bsk, ksk, &and_lut, &subscriber);
+    // ── evaluator: allowed = subscriber AND (in_region OR override) ───────
+    var server = blk: {
+        var r: std.Io.Reader = .fixed(server_key_bytes.written());
+        break :blk try Fhe.Codec.readServerKey(gpa, &r);
+    };
+    defer server.deinit(gpa);
+    var inputs: std.Io.Reader = .fixed(wire.written());
+    const subscriber = try Fhe.Codec.readLwe(&inputs);
+    const in_region = try Fhe.Codec.readLwe(&inputs);
+    const override = try Fhe.Codec.readLwe(&inputs);
+    const where = server.@"or"(&in_region, &override);
+    const allowed_ct = server.@"and"(&subscriber, &where);
+    // A MUX picks between two encrypted answers without learning which.
+    const quota = server.mux(&allowed_ct, &Fhe.ServerKey.trivial(true), &override);
 
     // ── client: decrypt ──────────────────────────────────────────────────
-    const allowed = tfhe.torus.decode(
-        Fhe.lwePhase(Fhe.lwe_dim, &small, &answer),
-        gate_delta_log,
-        1,
-    );
-    std.debug.print("policy evaluated blind: allowed = {d}\n", .{allowed});
-    if (allowed != 1) return error.GateComputedWrongAnswer;
+    const allowed = client.decrypt(&allowed_ct);
+    std.debug.print("policy evaluated blind: allowed = {}, quota = {}\n", .{ allowed, client.decrypt(&quota) });
+    if (!allowed or !client.decrypt(&quota)) return error.GateComputedWrongAnswer;
 
     // ── unbounded depth ──────────────────────────────────────────────────
     // The point of bootstrapping: the output of a gate is as clean as a fresh
     // encryption, so it can feed the next gate forever. A leveled scheme
     // stops long before this loop does.
-    const identity = Fhe.testPolynomial(2, .{ Fhe.encodeBit(0), Fhe.encodeBit(1) });
-    var carried = Fhe.lweEncrypt(Fhe.lwe_dim, &small, Fhe.encodeBit(1), io);
-    for (0..8) |_| carried = Fhe.bootstrap(bsk, ksk, &identity, &carried);
-    if (Fhe.lweDecryptBit(Fhe.lwe_dim, &small, &carried) != 1) return error.DepthLostTheMessage;
-    std.debug.print("8 chained bootstraps: message intact\n", .{});
+    var carried = allowed_ct;
+    for (0..4) |_| carried = server.xnor(&carried, &Fhe.ServerKey.trivial(true));
+    if (!client.decrypt(&carried)) return error.DepthLostTheMessage;
+    std.debug.print("4 more chained gates: message intact\n", .{});
+
+    // ── decoding refuses bytes for another parameter set ─────────────────
+    var r: std.Io.Reader = .fixed(wire.written());
+    if (tfhe.Tfhe(tfhe.params.tfhers_tfhe_lib).Codec.readLwe(&r)) |_| {
+        return error.ForeignCiphertextAccepted;
+    } else |err| switch (err) {
+        error.ParameterMismatch => std.debug.print("refused a ciphertext made for other parameters\n", .{}),
+        else => return err,
+    }
 
     // ── what a caller cannot check ───────────────────────────────────────
-    // There is no rejection path on this side. A ciphertext decrypted under
-    // the wrong key, or an evaluation key that was corrupted in transit,
-    // yields a bit — just not the right one — and nothing in the API reports
-    // it. A deployment that cares must authenticate the keys and ciphertexts
-    // itself; FHE hides the data, it does not authenticate it.
-    var other = Fhe.lweKeyGen(Fhe.lwe_dim, io);
+    // A ciphertext decrypted under the wrong key, or an evaluation key that
+    // was corrupted in transit, yields a bit — just not the right one — and
+    // nothing in the API reports it. A deployment that cares must
+    // authenticate the keys and ciphertexts itself; FHE hides the data, it
+    // does not authenticate it.
+    var other = Fhe.ClientKey.generate(io);
     defer other.deinit();
-    const nonsense = Fhe.lweDecryptBit(Fhe.lwe_dim, &other, &carried);
-    std.debug.print("under an unrelated key the same ciphertext reads {d}, with no error\n", .{nonsense});
+    std.debug.print("under an unrelated key the answer reads {}, with no error\n", .{other.decrypt(&carried)});
 }

@@ -4,17 +4,41 @@
 //! external product and by LWE-to-LWE key switching.
 //!
 //! A torus element `x ∈ Z_{2^32}` is approximated by `ℓ` signed base-`B` digits
-//! (`B = 2^b_bits`), each in the balanced range `[−B/2, B/2)`:
+//! (`B = 2^b_bits`), each in the balanced range `[−B/2, B/2]`:
 //!
-//!     x ≈ Σ_{i=0}^{ℓ−1} d_i · (q / B^{i+1}),   d_i ∈ [−B/2, B/2)
+//!     x ≈ Σ_{i=0}^{ℓ−1} d_i · (q / B^{i+1})
 //!
-//! keeping only the top `ℓ·b_bits` bits (round-to-nearest on the dropped tail).
-//! The **balanced** digit range is what keeps the external-product noise small
-//! (digits bounded by `B/2`, not `B`); a plain unsigned decomposition would
-//! blow the noise budget — that is the deliberately-broken positive control in
-//! the harness. All REAL/ungated: this is exact integer bit-fiddling, no
-//! secrets. The gated core CONSUMES a decomposition; producing one is
-//! mechanical.
+//! keeping only the top `ℓ·b_bits` bits (round-to-nearest on the dropped tail,
+//! a tie rounding up). The **balanced** digit range is what keeps the
+//! external-product noise small (digits bounded by `B/2`, not `B`); a plain
+//! unsigned decomposition would blow the noise budget — that is the
+//! deliberately-broken positive control in the harness.
+//!
+//! ## Which digit at a tie — tfhe-rs's rule, recovered from its output
+//!
+//! A raw digit of exactly `B/2` can be written `+B/2` or `−B/2` (with a carry
+//! into the next level); both recompose to the same value, but key switching
+//! subtracts `digit · row`, so the choice decides the output bytes. This module
+//! makes the choice tfhe-rs 1.8.1 makes, so that `keySwitch` is byte-identical
+//! to tfhe-rs's on the same key and input (`interop_test.zig`). The rule was
+//! derived from tfhe-rs's `SignedDecomposer` used as a black box — 40 000
+//! decompositions over five `(B, ℓ)` shapes, ties planted at every level, no
+//! source read — and matches all of them:
+//!
+//!   1. Round `x` to its top `L = ℓ·b_bits` bits: `state = ⌊x / 2^{32−L}⌉`,
+//!      remembering the rounding bit `rb` (bit `31−L` of `x`).
+//!   2. If the top bit of `state` is set and the value is *strictly* above
+//!      `2^{L−1}` — the low `L−1` bits nonzero, or `rb` set — read `state` as
+//!      the negative number `state − 2^L`.
+//!   3. Peel digits least-significant first: `res = state mod B`; shift
+//!      `state` right (arithmetically); carry iff `res > B/2`, or `res = B/2`
+//!      and the next raw digit's top bit is set; `res −= carry·B`,
+//!      `state += carry`.
+//!
+//! Rule 3 keeps the digits balanced between levels; rule 2 does the same for
+//! the top level, which has no next digit to look at. All REAL/ungated and
+//! branch-free: exact integer bit-fiddling on ciphertext coefficients (no
+//! secrets).
 
 const std = @import("std");
 const torus = @import("torus.zig");
@@ -31,37 +55,42 @@ pub fn maxError(comptime b_bits: u6, comptime ell: usize) u64 {
     return @as(u64, 1) << @intCast(31 - rep_bits);
 }
 
-/// Signed base-`2^b_bits` decomposition of `x` into `ell` balanced digits,
-/// `digits[0]` the most significant (weight `q/B`). `b_bits·ell ≤ 32`.
+/// Signed base-`2^b_bits` decomposition of `x` into `ell` balanced digits in
+/// `[−B/2, B/2]`, `digits[0]` the most significant (weight `q/B`), with
+/// tfhe-rs's tie rule (see the file comment). `b_bits·ell ≤ 32`.
 pub fn decompose(comptime b_bits: u6, comptime ell: usize, x: T) [ell]i32 {
-    comptime std.debug.assert(b_bits >= 1 and @as(u32, b_bits) * ell <= 32);
-    const B: u32 = @as(u32, 1) << @intCast(b_bits);
-    const half: u32 = B >> 1;
-    const mask: u32 = B - 1;
-    const rep_bits: u6 = @intCast(@as(u32, b_bits) * ell);
-    const ignored: u6 = 32 - rep_bits;
+    comptime std.debug.assert(b_bits >= 1 and b_bits <= 31 and ell >= 1 and @as(u32, b_bits) * ell <= 32);
+    const L: u6 = @intCast(@as(u32, b_bits) * ell);
+    const ignored: u6 = 32 - L;
+    const mask: i64 = (@as(i64, 1) << b_bits) - 1;
+    const half: i64 = @as(i64, 1) << (b_bits - 1);
 
-    // Round `x` to the top `rep_bits` bits (nearest), giving a `rep_bits`-bit
-    // integer `v` whose base-B digits are the raw (unsigned) digits.
-    var v: u32 = if (ignored == 0)
-        x
-    else
-        @truncate((@as(u64, x) + (@as(u64, 1) << @intCast(ignored - 1))) >> @intCast(ignored));
+    // 1. Round to the top L bits; `rb` is the rounding bit.
+    var state: u64 = undefined;
+    var rb: u64 = 0;
+    if (ignored == 0) {
+        state = x;
+    } else {
+        const pre: u64 = @as(u64, x) >> (ignored - 1);
+        rb = pre & 1;
+        state = ((pre + 1) >> 1) & ((@as(u64, 1) << L) - 1);
+    }
+    // 2. Strictly above half the range ⇒ the negative representative.
+    const top = (state >> (L - 1)) & 1;
+    const rest = state & ((@as(u64, 1) << (L - 1)) - 1);
+    const neg: u64 = top & @intFromBool((rest | rb) != 0);
+    var st: i64 = @as(i64, @intCast(state)) - @as(i64, @intCast(neg << L));
 
+    // 3. Balanced digits, least significant first.
     var digits: [ell]i32 = undefined;
-    var carry: u32 = 0;
     var i: usize = ell;
     while (i > 0) : (i -= 1) {
-        const d: u32 = (v & mask) + carry;
-        v >>= @intCast(b_bits);
-        // Balance into [−B/2, B/2): if d ≥ B/2 borrow one from the next digit.
-        if (d >= half) {
-            digits[i - 1] = @as(i32, @intCast(d)) - @as(i32, @intCast(B));
-            carry = 1;
-        } else {
-            digits[i - 1] = @intCast(d);
-            carry = 0;
-        }
+        var res: i64 = st & mask;
+        st >>= b_bits;
+        const carry: i64 = (((res - 1) | st) & res & half) >> (b_bits - 1);
+        res -= carry << b_bits;
+        st += carry;
+        digits[i - 1] = @intCast(res);
     }
     return digits;
 }
@@ -92,7 +121,7 @@ test "signed decomposition round-trips within maxError, digits balanced" {
         const x = rnd.int(T);
         const d = decompose(b_bits, ell, x);
         for (d) |di| {
-            try testing.expect(di >= -half and di < half); // balanced range
+            try testing.expect(di >= -half and di <= half); // balanced range
         }
         const back = recompose(b_bits, ell, d);
         const err = @min(x -% back, back -% x); // |x − back| as unsigned distance
@@ -110,4 +139,22 @@ test "exact-cover decomposition (b·ell = 32) has zero error" {
         const x = rnd.int(T);
         try testing.expectEqual(x, recompose(b_bits, ell, decompose(b_bits, ell, x)));
     }
+}
+
+test "KAT: tfhe-rs 1.8.1 SignedDecomposer digits (black-box samples)" {
+    // From `tools/tfhers` (SignedDecomposer::decompose, levels printed most
+    // significant first). Ties at the top level go both ways depending on
+    // the rounding bit and the lower bits — rule 2 of the file comment.
+    const cases = [_]struct { u32, [5]i32 }{
+        .{ 0x0000_0000, .{ 0, 0, 0, 0, 0 } },
+        .{ 0xffff_ffff, .{ 0, 0, 0, 0, 0 } },
+        .{ 0x8000_0000, .{ 4, 0, 0, 0, 0 } },
+        .{ 0x7fff_8000, .{ -4, 0, 0, 0, 0 } },
+        .{ 0x1234_5678, .{ 1, -3, -4, 3, 2 } },
+        .{ 0x0001_0000, .{ 0, 0, 0, 0, 1 } },
+        .{ 0x0000_ffff, .{ 0, 0, 0, 0, 0 } },
+        .{ 0xdead_beef, .{ -1, 0, -3, 3, -1 } },
+        .{ 0x0003_0000, .{ 0, 0, 0, 0, 2 } },
+    };
+    for (cases) |c| try testing.expectEqual(c[1], decompose(3, 5, c[0]));
 }

@@ -1,4 +1,4 @@
-# tfhe — TFHE/FHEW gate bootstrapping (unbounded-depth FHE)
+# tfhe — TFHE gate bootstrapping (unbounded-depth FHE on encrypted bits)
 
 **Bootstrapping** is what turns *leveled* FHE (the sibling `bfv`, which can add
 and multiply only to a bounded depth) into *unbounded-depth* FHE. After every
@@ -8,92 +8,89 @@ noise is reset rather than accumulated and an arbitrarily deep circuit stays
 correct. This module implements the TFHE/FHEW line (Chillotti–Gama–Georgieva–
 Izabachène; Ducas–Micciancio): LWE/GLWE/GGSW ciphertexts over the power-of-two
 torus `Z_{2^32}`, blind rotation by CMux over a GGSW bootstrap key, sample
-extraction, and LWE key switching. It is self-contained and **std-only** — no
-pairing, no floating point, no external C. The ring modulus stays `2^32`
-(exact wrapping `u32`); an auxiliary 64-bit prime is used *inside* `ntt.zig`
-purely to compute the same convolution faster, and its output is bit-identical
-to the schoolbook one.
+extraction, LWE key switching, and binary gates on top. It is **std-only** — no
+external C, and an exact integer NTT instead of a floating-point FFT.
 
-**The module is complete**: the entire mechanical layer is real and tested,
-and the irreducible soundness core (external product / CMux / blind rotation /
-bootstrap) — previously gated behind a flag for a later Fable-tier pass — is
-now implemented for real (`gate.fable_core_implemented = true`, no `@panic`
-remains). Toy/test parameters only — **no security level is claimed**.
-
-## What is real today (mechanical)
-
-| Piece | File | What |
-|---|---|---|
-| Torus | `torus.zig` | `Z_{2^32}` encode/decode by a scale `Δ`, round-to-nearest modulus switch (`q → 2N`), gadget weights — exact integer rounding |
-| Negacyclic ring | `poly.zig` | `Poly(N)` over `Z_{2^32}[X]/(X^N+1)` — add/sub/negate/scalar, monomial rotation `X^e`, and `mul`: **exact** `O(N²)` schoolbook below `ntt_min_degree`, **exact** `O(N log N)` integer NTT above it (bit-identical, no FFT, no rounding budget) |
-| Exact NTT | `ntt.zig` | negacyclic transform over the Goldilocks prime `2^64−2^32+1` with 16-bit operand splitting; 4 forward + 1 inverse transform per product. Measured vs schoolbook: 1.7× at `N=256`, 7.0× at `N=1024`, 12.1× at `N=2048`; a `toy` gate bootstrap goes 54.4 ms → 33.3 ms |
-| Gadget | `gadget.zig` | signed (balanced) base-`2^b` decomposition into `ℓ` digits + `recompose`, with an explicit `maxError` bound |
-| Parameters | `params.zig` | `Params` + validation; the `toy` set and the failure-probability ledger |
-| Scheme | `tfhe.zig` | `Tfhe(P)`: LWE/GLWE/GGSW keygen·encrypt·decrypt, bootstrap-key + key-switch-key gen, `sampleExtract`, `keySwitch`, `decomposeGlwe`, LUT builder, and `clearBootstrap` (the cleartext oracle) |
-
-## The Fable core (now implemented)
-
-`Tfhe(P)` exposes four functions behind `gate.fable_core_implemented` (now
-`true`; no `@panic` remains):
-
-- `externalProduct(ggsw, glwe)` — GGSW ⊠ GLWE (decompose + dot with the GGSW
-  rows); the noise-growth heart.
-- `cmux(ctrl, d0, d1)` — the encrypted selector `d0 + ctrl ⊠ (d1 − d0)`.
-- `blindRotate(bsk, lut, b̃, ã)` — the accumulator loop of `n` CMux over the
-  bootstrap key (the rotation exponents live here).
-- `bootstrap(bsk, ksk, lut, ct)` — mod-switch → blind-rotate → sample-extract →
-  key-switch → fresh LWE.
+**Compatible with tfhe-rs 1.8.1's boolean layer.** The parameter sets are
+tfhe-rs's (`params.tfhers_default` = its `DEFAULT_PARAMETERS`, for which tfhe-rs
+states 128-bit security and a gate failure probability ≤ 2^-64), and keys and
+ciphertexts have tfhe-rs's standard layout: tfhe-rs decrypts this module's
+ciphertexts and runs its gates with this module's evaluation key, and the other
+way round (`src/interop_test.zig`, `tools/tfhers/`). Key switching and the
+bootstrap are byte-identical to tfhe-rs's on the same inputs at the small
+`k = 2` interop set; at `DEFAULT_PARAMETERS` the gates agree across the two
+implementations in both directions (bytes are not compared there: tfhe-rs's
+f64 FFT is not exact at that size).
 
 ## Usage
 
 ```zig
 const tfhe = @import("tfhe");
-const T = tfhe.Tfhe(tfhe.params.toy);
-const inst = try T.init();
+const F = tfhe.Tfhe(tfhe.params.tfhers_default);
 
+// Client: secret keys, and the evaluation key for the server (~78 MB).
 // `io` is a `std.Io`: key generation and encryption draw through
-// `entropy.SecureSource`, the fail-closed adapter over `std.Io.randomSecure`
-// (see the "Randomness" note in `src/tfhe.zig`) — not the silently-degrading
-// `std.Io.random`. Still far better than a `std.Random` parameter, which
-// would accept `DefaultPrng.init(0)` at a call site that looks identical, and
-// with predictable `e`/`a` the LWE problem collapses into linear algebra
-// (`dim` ciphertexts recover `sk`). The `…ForTest` twins take a `std.Random`
-// for KAT reproducibility and are named so you cannot reach for one by
-// accident.
-const sk   = T.lweKeyGen(64, io);
-const gk   = T.glweKeyGen(io);
-const bsk  = T.bootstrapKeyGen(&sk, &gk, io);
-const ksk  = T.keySwitchKeyGen(&gk, &sk, io);
+// `entropy.SecureSource`, fail-closed on `std.Io.randomSecure`.
+var client = F.ClientKey.generate(io);
+defer client.deinit();
+var server = try F.ServerKey.generate(gpa, &client, io);
+defer server.deinit(gpa);
 
-const lut  = T.testPolynomial(2, .{ T.encodeBit(0), T.encodeBit(1) }); // identity
-const ct   = T.lweEncrypt(64, &sk, T.encodeBit(1), io);
-const fresh = T.bootstrap(&bsk, &ksk, &lut, &ct);   // Dec == 1, noise reset
+const a = client.encrypt(true, io);
+const b = client.encrypt(false, io);
+
+// Server: gates on ciphertexts. Each bootstraps, so they compose without limit.
+const c = server.@"and"(&a, &b);   // also nand, @"or", nor, xor, xnor, mux, not
+const d = server.mux(&c, &a, &F.ServerKey.trivial(true));
+
+// Client: decrypt.
+const result = client.decrypt(&d);
+
+// Bytes: F.Codec.writeServerKey / readServerKey, writeLwe / readLwe, … — the
+// payload is tfhe-rs's container order; the header refuses other parameters.
 ```
 
-Every piece above — the mechanical surface (ring, gadget, `sampleExtract`/
-`keySwitch`, `clearBootstrap`) AND `bootstrap` itself — is real and tested
-today; the snippet runs end to end.
+`example/main.zig` runs a three-input policy circuit end to end with the key
+and the ciphertexts passed through bytes. The programmable layer under the
+gates — `testPolynomial`, `bootstrap`/`PreparedBootstrapKey.bootstrapBig`,
+`externalProduct`, `cmux`, `blindRotate`, `keySwitch` — is public too.
+
+## Pieces
+
+| Piece | File | What |
+|---|---|---|
+| Torus | `torus.zig` | `Z_{2^32}` encode/decode by a scale `Δ`, round-to-nearest modulus switch (`q → 2N`), gadget weights |
+| Negacyclic ring | `poly.zig` | `Poly(N)` over `Z_{2^32}[X]/(X^N+1)`; `mul` is exact: schoolbook below `ntt_min_degree`, integer NTT above |
+| Exact NTT | `ntt.zig` | negacyclic transform over the Goldilocks prime, constant-time masks (inline-asm barrier) |
+| Gadget | `gadget.zig` | signed balanced decomposition with tfhe-rs's tie rule (byte-identical key switching) |
+| Error sampling | `noise.zig` | constant-time Gaussian (branch-free Box–Muller) and uniform errors |
+| Parameters | `params.zig` | `Params` (`n`, `k`, `N`, gadgets, LWE/GLWE error), `toy`, and the three tfhe-rs boolean sets |
+| Scheme | `tfhe.zig` | `Tfhe(P)`: keys, LWE/GLWE/GGSW encryption, bootstrap and key-switch keys (heap), `PreparedBootstrapKey` (NTT domain), sample extraction, key switching, blind rotation, bootstrap |
+| Gates | `boolean.zig` | `ClientKey`, `ServerKey`, and/nand/or/nor/xor/xnor/not/mux on tfhe-rs's `±q/8` encoding |
+| Bytes | `codec.zig` | header + tfhe-rs-ordered payload for ciphertexts, client/server/bootstrap/key-switch keys |
+
+Speed (ReleaseFast, one core, `tfhers_default`): a gate ≈ 0.25 s, MUX ≈ 0.5 s,
+key generation ≈ 2 s. tfhe-rs's f64 FFT with SIMD is roughly 20× faster per
+gate; this module trades that for exact integer arithmetic and no floating point
+in the evaluation path (see `SPEC.md`).
 
 ## Verify
 
 ```
-zig build test-tfhe --summary all                    # Debug
+zig build test-tfhe --summary all
 zig build test-tfhe -Doptimize=ReleaseFast --summary all
+TFHE_BENCH=1 zig build test-tfhe -Doptimize=ReleaseFast   # timings
 ```
 
-All pass, no skips (Debug and ReleaseFast). This includes the core-dependent
-end-to-end anchors — the programmable gate (`bootstrap(identity)`/
-`bootstrap(NOT)`), a 2-input homomorphic AND, an unlimited-depth bootstrap
-chain, a corrupted-bootstrap-key control, and the output noise-budget
-assertion — plus the ring/gadget/torus tests, the LWE/GLWE round-trips, the
-sample-extract and key-switch anchors, the cleartext LUT+rotation oracle over
-64 random bits, and three deliberately-broken positive controls (sign-dropped
-sample extraction, dropped-level gadget decomposition, wrong-sign rotation
-exponent) that prove the harness has teeth independent of the core.
+The tfhe-rs interop vectors are regenerated by `tools/tfhers` (see its README).
 
-Provenance: clean-room from the TFHE (ePrint 2016/870) and FHEW (EUROCRYPT 2015)
-papers; no third-party source ported and no implementation studied as a design
-reference. **No external byte-exact KAT exists** for gate bootstrapping —
-verified by property (homomorphic gate + unlimited-depth chain) + positive
-controls + the cleartext oracle. See `SPEC.md`. No `NOTICE` entry required
-(CONVENTIONS.md §5).
+Provenance: clean-room from the TFHE (ePrint 2016/870) and FHEW (EUROCRYPT
+2015) papers. tfhe-rs (BSD-3-Clause-Clear) is used only as a black box by the
+tools under `tools/tfhers/`, fetched by cargo and never shipped. Only its
+documentation and public signatures were read, no implementation — its
+conventions (layouts, the decomposition's tie rule) were recovered from its
+public API's outputs. The committed data, `src/testdata/tfhers_vectors.bin`,
+was generated by our own tooling (`tools/tfhers`) and observed from a
+third-party binary run as a black-box oracle: tfhe-rs 1.8.1's keys, ciphertexts
+and outputs at seeds fixed in the tool. No upstream test data is reproduced.
+No `NOTICE` entry required (CONVENTIONS.md §5).

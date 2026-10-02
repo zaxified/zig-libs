@@ -16,12 +16,15 @@
 //!      `poly.ntt_min_degree` is set from, and the loop also asserts the two
 //!      paths agree bit for bit so a mis-optimised measurement cannot pass.
 //!   2. End-to-end gate bootstrap at the `toy` parameter set (`N = 256`),
-//!      which issues `n·2·(2ℓ) = 1024` ring multiplies.
+//!      which issues `n·2·(2ℓ) = 1024` ring multiplies, unprepared and with
+//!      the bootstrap key prepared in the NTT domain.
+//!   3. The boolean layer at `tfhers_default` (tfhe-rs's DEFAULT_PARAMETERS):
+//!      key generation, preparation, one AND gate, one MUX.
 //!
-//! Sizing: the largest working set is one bootstrap key (~1 MB) plus a handful
-//! of `[1024]u64` scratch arrays. Nothing here allocates a large buffer — an
-//! oversized benchmark in this repo once OOM-killed the host's editor. Run
-//! under `scripts/lib/capped`.
+//! Sizing: the largest working set is (3): a 53 MB bootstrap key, its 105 MB
+//! prepared copy and a 25 MB key-switch key, ~185 MB at peak. Run under
+//! `hw run` (an oversized benchmark in this repo once OOM-killed the host's
+//! editor).
 
 const std = @import("std");
 const polymod = @import("poly.zig");
@@ -109,8 +112,10 @@ test "bench: end-to-end gate bootstrap at the toy parameter set" {
     const rnd = prng.random();
     const small = Toy.lweKeyGenForTest(64, rnd);
     const glwe = Toy.glweKeyGenForTest(rnd);
-    const bsk = Toy.bootstrapKeyGenForTest(&small, &glwe, rnd);
-    const ksk = Toy.keySwitchKeyGenForTest(&glwe, &small, rnd);
+    var bsk = try Toy.bootstrapKeyGenForTest(std.testing.allocator, &small, &glwe, rnd);
+    defer bsk.deinit(std.testing.allocator);
+    var ksk = try Toy.keySwitchKeyGenForTest(std.testing.allocator, &glwe, &small, rnd);
+    defer ksk.deinit(std.testing.allocator);
 
     // Identity LUT over a 2-slot message space — the same one the harness's
     // end-to-end anchor uses.
@@ -132,4 +137,47 @@ test "bench: end-to-end gate bootstrap at the toy parameter set" {
     });
     // The bootstrap must still be CORRECT at the speed it just reported.
     try std.testing.expectEqual(@as(u32, 1), Toy.lweDecryptBit(64, &small, &Toy.bootstrap(&bsk, &ksk, &id, &ct)));
+}
+
+test "bench: boolean gates at tfhers_default (tfhe-rs DEFAULT_PARAMETERS)" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const D = tfhe.Tfhe(params.tfhers_default);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    const t0 = nowNs();
+    var ck = D.ClientKey.generate(io);
+    defer ck.deinit();
+    var bsk = try D.bootstrapKeyGen(gpa, &ck.lwe, &ck.glwe, io);
+    defer bsk.deinit(gpa);
+    const t1 = nowNs();
+    const ksk = try D.keySwitchKeyGen(gpa, &ck.glwe, &ck.lwe, io);
+    const t2 = nowNs();
+    var sk = try D.ServerKey.fromKeys(gpa, &bsk, ksk);
+    defer sk.deinit(gpa);
+    const t3 = nowNs();
+
+    const a = ck.encrypt(true, io);
+    const b = ck.encrypt(false, io);
+    const reps = 5;
+    var r: D.LweN = undefined;
+    const g0 = nowNs();
+    for (0..reps) |_| r = sk.@"and"(&a, &b);
+    const g1 = nowNs();
+    for (0..reps) |_| r = sk.mux(&a, &b, &a);
+    const g2 = nowNs();
+    try std.testing.expect(!ck.decrypt(&r));
+    try std.testing.expect(!ck.decrypt(&sk.@"and"(&a, &b)));
+
+    const ms = struct {
+        fn f(x: u64, y: u64) f64 {
+            return @as(f64, @floatFromInt(y - x)) / 1.0e6;
+        }
+    }.f;
+    std.debug.print("\n  tfhers_default: bsk keygen {d:.0} ms, ksk keygen {d:.0} ms, prepare {d:.0} ms; AND {d:.1} ms, MUX {d:.1} ms\n", .{
+        ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(g0, g1) / reps, ms(g1, g2) / reps,
+    });
 }

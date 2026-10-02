@@ -55,7 +55,7 @@
 //! `modules/entropy/src/root.zig`'s test-only `CountingIo` already use in
 //! this collection, applied here rather than reinvented.
 //!
-//! ## The four targets
+//! ## The five targets
 //!
 //!   * `keygen`   — taints the ENTROPY `lweKeyGen`/`glweKeyGen` draw through
 //!     `io.randomSecure` (`SyntheticIo.taint = true`), exercising the real
@@ -78,10 +78,22 @@
 //!     drives the REAL `bootstrap`: mod-switch → `blindRotate`'s `n`
 //!     CMux/`externalProduct` steps over the now-tainted bootstrap key →
 //!     sample-extract → key-switch through the now-tainted key-switch key.
+//!     Since 2026-10-02 that is `PreparedBootstrapKey.bootstrap`, the NTT-
+//!     domain path a server evaluates with (`boolean.ServerKey`).
 //!     The ciphertext being bootstrapped is built from an UNTAINTED copy of
 //!     the SAME key, so `a_tilde`/`b_tilde` (blindRotate's rotation
 //!     exponents) stay public data throughout — see below for why that
 //!     separation is exactly what the module's own design makes true.
+//!
+//!   * `noise` (2026-10-02) — the Gaussian sampler (`noise.zig`). REAL keys;
+//!     the ENCRYPTION entropy of one `lweEncrypt` and one `glweEncrypt` is
+//!     tainted at the source, so every Box–Muller input is undefined. The
+//!     encrypt target above deliberately leaves this entropy clean (it is
+//!     per-ciphertext randomness); this target exists because the ERROR it
+//!     becomes is not: a known `e` turns a ciphertext into a linear equation
+//!     in the key. Runs on a `N = 64` ring with tfhe-rs's DEFAULT error
+//!     widths, so the GLWE products stay schoolbook and `ntt.zig`'s known
+//!     contexts (below) cannot mask the sampler's.
 //!
 //! ## Is there a secret-indexed memory access in blind rotation? Measured,
 //! ## not read off the source — the source shape and the compiled shape
@@ -139,6 +151,11 @@
 //!      — an address COMPARISON feeding a real jump, not a memory-address
 //!      computation — on data that traces back to the GLWE/LWE secret key,
 //!      not merely to a value the output discloses anyway: **class 1**.
+//!      **Fixed 2026-10-02:** `ntt.zig`'s `mask()` now launders the mask
+//!      through an inline-asm `blackBox`, so LLVM can no longer see that it is
+//!      two-valued and keeps every site a mask. `decrypt` went from 10 in-file
+//!      contexts to 0 and `bootstrap` from 39 (prepared path) / ≤186 to 0; the
+//!      NTT got ~25 % slower (a `tfhers_default` gate 208 → 247 ms).
 //!   2. **No branch where the source (and `SPEC.md`) warns of one.**
 //!      `gadget.decompose`'s `if (d >= half) { … } else { … }`
 //!      (`gadget.zig:58`) is a plain source-level `if`, and `SPEC.md`
@@ -153,6 +170,8 @@
 //!      diamond into a branch-free select despite the plain `if` in source.
 //!      Not a finding against the module — the opposite of one — but
 //!      reported as measured rather than assumed, symmetrically with (1).
+//!      (Since 2026-10-02 `gadget.decompose` is branch-free in source too: it
+//!      reproduces tfhe-rs's digit rule with shifts and masks.)
 //!
 //! `mulSchoolbook`'s fallback `if (k < N)` branches only on the LOOP INDEX
 //! `k = i+j`, never on a coefficient value (and is not even the path `toy`
@@ -193,9 +212,11 @@
 //!
 //! ## Parameters
 //!
-//! `root.params.toy` (`n=64`, `N=256`) throughout — the only parameter set
-//! this module ships, and small enough that `blindRotate`'s 64 CMux steps
-//! finish under memcheck in well under a minute.
+//! `root.params.toy` (`n=64`, `N=256`) for `keygen`/`encrypt`/`decrypt`/
+//! `bootstrap` — small enough that `blindRotate`'s 64 CMux steps finish under
+//! memcheck in seconds, and `N = 256` takes the NTT path the real sets take.
+//! `noise` uses a `N = 64` set with `tfhers_default`'s Gaussian widths (see
+//! that target).
 //!
 //! ## The propagation witness
 //!
@@ -210,6 +231,22 @@ const root = @import("root.zig");
 
 const Toy = root.Tfhe(root.params.toy);
 const T = root.Torus;
+
+/// Gaussian errors at tfhe-rs's DEFAULT widths on a ring small enough
+/// (`N = 64 < poly.ntt_min_degree`) that the GLWE products stay schoolbook:
+/// the `noise` target measures the sampler, not `ntt.zig`'s known contexts.
+const Gauss = root.Tfhe(.{
+    .n = 16,
+    .k = 2,
+    .N = 64,
+    .bg_bits = 6,
+    .ell = 3,
+    .bks_bits = 3,
+    .ell_ks = 6,
+    .lwe_noise = root.params.tfhers_default.lwe_noise,
+    .glwe_noise = root.params.tfhers_default.glwe_noise,
+});
+const gpa = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
 
 /// A `std.Io` that hands `randomSecure` deterministic, optionally-tainted
 /// bytes instead of a real `getrandom(2)` draw, delegating everything else
@@ -277,7 +314,7 @@ fn reloadVolatile(comptime V: type, value: *const V) V {
     return out;
 }
 
-const Target = enum { keygen, encrypt, decrypt, bootstrap };
+const Target = enum { keygen, encrypt, decrypt, bootstrap, noise };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -285,6 +322,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "encrypt")) return .encrypt;
     if (std.mem.eql(u8, s, "decrypt")) return .decrypt;
     if (std.mem.eql(u8, s, "bootstrap")) return .bootstrap;
+    if (std.mem.eql(u8, s, "noise")) return .noise;
     return error.UnknownTarget;
 }
 
@@ -334,7 +372,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // formatted through a non-constant-time path.
             var chk: T = 0;
             for (lwe_key.s) |x| chk ^= x;
-            for (glwe_key.s.c) |x| chk ^= x;
+            for (glwe_key.s[0].c) |x| chk ^= x;
             // Through `toBytes`: `T` is a u32, and `{x}` on an integer drops leading
             // zeros, so a small checksum would print fewer hex digits than the
             // output pin's floor and the pin would track the VALUE, not the code.
@@ -364,7 +402,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             std.debug.print("ctgrind_result[0]={x} ctgrind_result[1]={x}\n", .{
                 std.mem.toBytes(lwe_ct.b),
-                std.mem.toBytes(glwe_ct.b.c[0]),
+                std.mem.toBytes(glwe_ct.body.c[0]),
             });
         },
 
@@ -415,9 +453,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const glwe_key_loaded = reloadVolatile(Toy.GlweKey, &glwe_key_for_keys);
 
             var bsk_src: SyntheticIo = .{ .inner = base_io, .taint = false };
-            const bsk = Toy.bootstrapKeyGen(&lwe_key_loaded, &glwe_key_loaded, bsk_src.io());
+            const bsk = try Toy.bootstrapKeyGen(gpa, &lwe_key_loaded, &glwe_key_loaded, bsk_src.io());
             var ksk_src: SyntheticIo = .{ .inner = base_io, .taint = false };
-            const ksk = Toy.keySwitchKeyGen(&glwe_key_loaded, &lwe_key_loaded, ksk_src.io());
+            const ksk = try Toy.keySwitchKeyGen(gpa, &glwe_key_loaded, &lwe_key_loaded, ksk_src.io());
+            // The evaluation path a server runs: the NTT-domain key.
+            const pk = try Toy.PreparedBootstrapKey.init(gpa, &bsk);
 
             // The ciphertext under test: encrypted under the REAL,
             // untainted key and REAL entropy, so a_tilde/b_tilde are public
@@ -425,7 +465,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const lut = identityLut();
             var ct_src: SyntheticIo = .{ .inner = base_io, .taint = false };
             const ct = Toy.lweEncrypt(64, &real_lwe_key, Toy.encodeBit(1), ct_src.io());
-            const out = Toy.bootstrap(&bsk, &ksk, &lut, &ct);
+            const out = pk.bootstrap(&ksk, &lut, &ct);
 
             // Propagation proof: decrypt under the REAL key (the output
             // ciphertext itself carries the taint from bsk/ksk, through
@@ -440,6 +480,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.mem.sliceAsBytes(out.a[0..]),
             });
         },
+
+        // The Gaussian sampler (`noise.zig`): REAL, untainted keys; the
+        // ENCRYPTION entropy is tainted at the source, so every mask word
+        // and every Box–Muller input is undefined. A branch or an index on a
+        // tainted value inside `noise.zig` would be the sampler leaking the
+        // error through timing.
+        .noise => {
+            var clean1: SyntheticIo = .{ .inner = base_io, .taint = false };
+            var clean2: SyntheticIo = .{ .inner = base_io, .taint = false };
+            const lwe_key = Gauss.lweKeyGen(16, clean1.io());
+            const glwe_key = Gauss.glweKeyGen(clean2.io());
+            var enc: SyntheticIo = .{ .inner = base_io, .taint = tainted };
+            const lwe_ct = Gauss.lweEncrypt(16, &lwe_key, 1 << 29, enc.io());
+            const msg = Gauss.Poly.zero();
+            const glwe_ct = Gauss.glweEncrypt(&glwe_key, &msg, enc.io());
+            std.debug.print("noise ctgrind_result={x} {x}\n", .{
+                std.mem.toBytes(lwe_ct.b),
+                std.mem.sliceAsBytes(glwe_ct.body.c[0..4]),
+            });
+        },
     }
 }
 
@@ -450,19 +510,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
 // below WITHOUT that flag reproduces this pass's ~7000-error false-positive
 // flood on every single row, on every target including `keygen`.
 //
-// declare -A TARGETS+=( [tfhe]="keygen encrypt decrypt bootstrap" )
+// declare -A TARGETS+=( [tfhe]="keygen encrypt decrypt bootstrap noise" )
 // declare -A MODES+=(   [tfhe]="ReleaseFast" )
 // declare -A PATTERN+=(
 //     [tfhe/keygen]='tfhe[.]zig'
 //     [tfhe/encrypt]='tfhe[.]zig'
 //     [tfhe/decrypt]='tfhe[.]zig|torus[.]zig|poly[.]zig|ntt[.]zig'
 //     [tfhe/bootstrap]='tfhe[.]zig|gadget[.]zig|poly[.]zig|torus[.]zig|ntt[.]zig'
+//     [tfhe/noise]='noise[.]zig|tfhe[.]zig'
 // )
 // declare -A LABEL+=(
 //     [tfhe/keygen]='tfhe lweKeyGen/glweKeyGen sampleBit (RNG entropy)'
 //     [tfhe/encrypt]='tfhe lweEncrypt/glweEncrypt plaintext mu/msg'
 //     [tfhe/decrypt]='tfhe lweDecryptBit/lwePhase/glwePhase secret key -> ntt.zig ring mul'
 //     [tfhe/bootstrap]='tfhe bootstrap: blindRotate+cmux+externalProduct+keySwitch, bsk/ksk from tainted LWE+GLWE key'
+//     [tfhe/noise]='tfhe Gaussian sampler (encryption entropy)'
 // )
 // No per-module WITNESS override needed -- the global `Writer[.]zig|Format[.]zig|fmt[.]zig`
 // already covers this harness's `std.debug.print` propagation-proof calls.

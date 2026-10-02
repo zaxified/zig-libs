@@ -391,7 +391,7 @@ const module_list = [_]Module{
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
     .{ .name = "rescue", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
-    .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
+    .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "chachapoly", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "aesgcm", .libs = &.{ "crypto", "net" } },

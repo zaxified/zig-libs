@@ -1,0 +1,5 @@
+# tools/tfhers check — this module's keys and ciphertexts through tfhe-rs 1.8.1.
+# Input: tools/tfhers/emit_zig.zig (fresh keys from the OS CSPRNG, ~78 MB, not
+# committed). Run 2026-10-02 (first run; both lines below are the tool's output).
+S: n=16 k=2 N=64: tfhe-rs decrypted 32 module ciphertexts and 112 module gate outputs, and evaluated 112 gates with the module's bootstrap/key-switch keys: all as expected
+D: n=805 k=3 N=512: tfhe-rs decrypted 8 module ciphertexts and 28 module gate outputs, and evaluated 28 gates with the module's bootstrap/key-switch keys: all as expected

@@ -1,0 +1,8 @@
+[package]
+name = "tfhe_tfhers_vectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tfhe = { version = "=1.8.1", features = ["boolean"] }

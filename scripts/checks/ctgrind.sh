@@ -229,7 +229,7 @@ declare -A TARGETS=(
     [ctap2pin]="ecdh one two token"
     [fss]="gen eval"
     [bfv]="keygen encrypt decrypt"
-    [tfhe]="keygen encrypt decrypt bootstrap"
+    [tfhe]="keygen encrypt decrypt bootstrap noise"
     [dkg]="coeffs combine"
     # ── writeback round, 2026-09-09: the sealedbox contradiction ───────────
     # A1 `sealedbox.md` M1 said the secret-key codecs light up; the coverage
@@ -485,6 +485,7 @@ declare -A PATTERN=(
     [tfhe/encrypt]='tfhe[.]zig'
     [tfhe/decrypt]='tfhe[.]zig|torus[.]zig|poly[.]zig|ntt[.]zig'
     [tfhe/bootstrap]='tfhe[.]zig|gadget[.]zig|poly[.]zig|torus[.]zig|ntt[.]zig'
+    [tfhe/noise]='noise[.]zig|tfhe[.]zig'
     [dkg/coeffs]='protocol[.]zig|commit[.]zig|core[.]zig|root[.]zig|secp256k1[.]zig|common[.]zig|scalar[.]zig'
     [dkg/combine]='core[.]zig|root[.]zig|secp256k1[.]zig'
     # ⛔ `fmt[.]zig` is DELIBERATELY ABSENT even though `bytesToHex`/`hexToBytes`
@@ -643,8 +644,9 @@ declare -A LABEL=(
     [bfv/decrypt]='bfv decrypt (sk)+CRT reconstruct'
     [tfhe/keygen]='tfhe lwe/glwe keyGen samplers'
     [tfhe/encrypt]='tfhe encrypt (plaintext)'
-    [tfhe/decrypt]='tfhe decrypt (key) -- DEFECT ntt.zig:93/127'
+    [tfhe/decrypt]='tfhe decrypt (key)'
     [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
+    [tfhe/noise]='tfhe Gaussian sampler (encryption entropy)'
     [dkg/coeffs]='dkg round-1 secret coefficients'
     [dkg/combine]='dkg final combined share'
     # ⭐ Were 8/7/43/47 with std's tables; now table-free. The parsers keep ONE
