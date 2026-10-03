@@ -544,8 +544,13 @@ blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # 2026-10-03: share/nonce/betaprime +1 each, the same site: presign `combine`'s
 # low-s `std.mem.order` on the PUBLISHED s (presign.zig) now compiles to two
 # branches instead of one — codegen, no new class.
-threshold_ecdsa	ReleaseFast	share	1	<=244	6f00d4e2b425b4a6	706487e9e4a6df1e
-threshold_ecdsa	ReleaseFast	nonce	1	<=478	6f00d4e2b425b4a6	706487e9e4a6df1e
+# 2026-10-03 (relation audit): nonce +1 — verifyAliceRangeInner's new
+# `unitsModN` verdict (zkproofs.zig, `return false` on a non-unit c_A·s),
+# class (a): a public verdict over ciphertexts the single-process harness
+# derives from the tainted k_i. The unit test itself is montint divsteps;
+# a variable-time big-int gcd there hit the 1000-context cap.
+threshold_ecdsa	ReleaseFast	share	1	<=244	06f74111064b4125	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	nonce	1	<=479	06f74111064b4125	706487e9e4a6df1e
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -581,7 +586,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=478	6f00d4e2b425b4a6	706487e9e4a6df1e
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=285	6f00d4e2b425b4a6	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	betaprime	1	<=285	06f74111064b4125	706487e9e4a6df1e
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -601,7 +606,7 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=285	6f00d4e2b425b4a6	706487e9e4a6df1e
 # montgomeryMul final subtractions went with powSecret's and the commitments'
 # move to montint.DynModint (pedersenCt). Left: Scalar.fromBytes48 on e (2),
 # stripLeadingZeros on e and v (2), the v < 0 redraw (1) — all as above.
-threshold_ecdsa	ReleaseFast	fac	1	5	25772e0436f30d67	b014d308e3ab9ce7
+threshold_ecdsa	ReleaseFast	fac	1	5	dd97dc1777ebe1cb	b014d308e3ab9ce7
 # threshold_ecdsa pimod (2026-10-03) — Πmod prover over tss-lib's 2048-bit N,
 # Paillier p, q tainted. The per-round work (Legendre symbols by Euler's
 # criterion, the 4th roots with a CT ±s select, the CRT, q^-1 mod p by Fermat)
@@ -611,14 +616,14 @@ threshold_ecdsa	ReleaseFast	fac	1	5	25772e0436f30d67	b014d308e3ab9ce7
 # of p, q, φ and the extended Euclid (451 + 84 + 4). Left: fromLimbsBits's
 # length verdict, once per factor (2), and the `if (b_bit)`/`if (a_bit)`
 # blends of y' (aux_proofs.zig, 2) — a_i, b_i are published in the proof.
-threshold_ecdsa	ReleaseFast	pimod	1	4	b0e1ea6b2c89ad3a	32fb00d8e8d6b688
+threshold_ecdsa	ReleaseFast	pimod	1	4	3269e2ba4aef48c7	32fb00d8e8d6b688
 # threshold_ecdsa piprm (2026-10-03) — Πprm prover (proveBound) over tss-lib's
 # 2048-bit Ñ, p̃, q̃ and λ tainted. φ is a limb product, z_i = a_i + e_i·λ mod φ
 # one masked subtraction (was big-int divFloor on φ, λ). Left: fromLimbsBits's
 # length verdict for p̃ and q̃ (2) and the nonce draw's accept verdict a_i < φ
 # (aux_proofs.zig, 1 — its count depends on φ/2^bits only). The witness folds
 # every z_i (z_i = a_i alone when e_i = 0).
-threshold_ecdsa	ReleaseFast	piprm	1	3	b0e1ea6b2c89ad3a	4c16d808e507fa15
+threshold_ecdsa	ReleaseFast	piprm	1	3	3269e2ba4aef48c7	4c16d808e507fa15
 # threshold_ecdsa prime (2026-10-03) — root.isProbablePrime on tss-lib's
 # 1024-bit Blum prime, tainted, its length (1024) given by the caller as the
 # prime searches do. 4 in-file: fromLimbsBits's verdict (1), the `s` scan over
@@ -718,9 +723,9 @@ spake2plus	ReleaseFast	proverfinish	1	12	98d3a68346d3d767	5cdf0fe20429a208
 spake2plus	ReleaseFast	verifierfinish	1	10	98d3a68346d3d767	dbdff43379a90cf5
 bbs	ReleaseFast	sign	1	3	d86719a46eb0093c	2f5b06d6bd92ab96
 bbs	ReleaseFast	proofgen	1	9	d86719a46eb0093c	01535db4bf6b0ff6
-coconut	ReleaseFast	authority_sign	1	2	04e312f73ccbddb6	3492f1201b641f09
+coconut	ReleaseFast	authority_sign	1	2	f1bcbd02f5d1281f	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
-coconut	ReleaseFast	user_show	1	27	04e312f73ccbddb6	c75d6d631d2311f7
+coconut	ReleaseFast	user_show	1	27	f1bcbd02f5d1281f	286e5ea12d924b29
 hpke	ReleaseFast	x25519_decap	1	1	ceef922c5fee3703	c0cee0a8c6bf72c3
 hpke	ReleaseFast	x25519_authdecap	1	2	ceef922c5fee3703	05af25d1d0e3943d
 hpke	ReleaseFast	p256_decap	1	2	ceef922c5fee3703	851ee3406999dacc

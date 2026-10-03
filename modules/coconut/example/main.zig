@@ -130,18 +130,26 @@ pub fn main() !void {
     var disclosed: [attribute_count]bool = @splat(false);
     disclosed[zone_index] = true;
 
-    const proof = try coconut.proveCredential(gpa, io, parameters, gate_vk, pass, &attributes, &disclosed);
+    // The gate opens every tap with a fresh nonce under its own name; the
+    // proof is bound to that context, so a recorded show opens neither this
+    // gate again nor any other.
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    var context_buf: [64]u8 = undefined;
+    const context = try std.fmt.bufPrint(&context_buf, "gate:north-7/{x}", .{nonce});
+
+    const proof = try coconut.proveCredential(gpa, io, parameters, gate_vk, pass, &attributes, &disclosed, context);
     defer proof.deinit(gpa);
 
     const disclosed_values = [_]bls.Fr{attributes[zone_index]};
-    if (!try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed_values)) {
+    if (!try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed, &disclosed_values, context)) {
         return error.HonestShowRejected;
     }
     std.debug.print("gate accepted: zone shown, age band not revealed\n", .{});
 
     // Two taps produce two unlinkable proofs: the credential is re-randomised
     // on every show, so the bytes differ even though the pass does not.
-    const second_tap = try coconut.proveCredential(gpa, io, parameters, gate_vk, pass, &attributes, &disclosed);
+    const second_tap = try coconut.proveCredential(gpa, io, parameters, gate_vk, pass, &attributes, &disclosed, context);
     defer second_tap.deinit(gpa);
     const first_bytes = try proof.toBytes(gpa);
     defer gpa.free(first_bytes);
@@ -155,7 +163,7 @@ pub fn main() !void {
     //    commits to the signed value, so a rewritten claim shifts the
     //    Fiat-Shamir challenge and the equations stop closing.
     const lied = [_]bls.Fr{attributeScalar("zone:A-B-C")};
-    if (try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &lied)) {
+    if (try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed, &lied, context)) {
         return error.RewrittenDisclosureAccepted;
     }
     std.debug.print("rewritten zone claim rejected\n", .{});
@@ -165,14 +173,24 @@ pub fn main() !void {
     //    not a failed proof, and the caller has to be able to tell those
     //    apart before logging one as an attack.
     const too_many = [_]bls.Fr{ attributes[zone_index], attributes[age_band_index] };
-    if (coconut.verifyCredential(gpa, parameters, gate_vk, proof, &too_many)) |_| {
+    if (coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed, &too_many, context)) |_| {
         return error.MismatchedDisclosureAccepted;
     } else |err| switch (err) {
         error.InvalidDisclosure => std.debug.print("value/mask count mismatch reported as a caller error\n", .{}),
         else => return err,
     }
 
-    // 3. A wallet that reached the threshold only in its own imagination.
+    // 3. A recorded show played back at the next tap. The gate drew a new
+    //    nonce, the proof answers the old one, the challenge does not close.
+    try io.randomSecure(&nonce);
+    var next_buf: [64]u8 = undefined;
+    const next_context = try std.fmt.bufPrint(&next_buf, "gate:north-7/{x}", .{nonce});
+    if (try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed, &disclosed_values, next_context)) {
+        return error.ReplayAccepted;
+    }
+    std.debug.print("replayed show rejected at the next tap\n", .{});
+
+    // 4. A wallet that reached the threshold only in its own imagination.
     //    One partial is not a credential, and aggregation says so by name
     //    rather than returning a pass that fails later for no clear reason.
     if (coconut.aggregateCredential(gpa, partials[0..1], threshold)) |_| {

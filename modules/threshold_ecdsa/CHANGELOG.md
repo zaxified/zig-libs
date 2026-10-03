@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** the range proof's unit check (entry
+  below) is now one constant-time inversion of `c_A·s mod N` (montint divsteps; `u` is
+  a unit by equation 2 once `c_A` and `s` are) instead of three big-int gcds. The
+  inputs are public, but the single-process ctgrind harness taints ciphertexts derived
+  from `k_i`, and the variable-time gcd hit the 1000-context cap on the `nonce` row;
+  now it is +1 (the verdict), pinned at `<=479`.
+
 - **2026-10-03** — **⛔ Security fix: the range proof accepted non-unit `u`/`s`.** The
   verifier uses the inversion-free form `u·c^e == Γ^s1·s^N (mod N²)`; the paper's
   `u = Γ^s1·s^N·c^-e` presumes units, the rewrite dropped that. Alice, who knows

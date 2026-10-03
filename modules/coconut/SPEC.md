@@ -62,8 +62,10 @@ attributes, `t`-of-`n` authorities.
   Fiat-Shamir NIZK proving knowledge of the **hidden** attributes and the
   blinding `r`. Disclosed attributes are sent in the clear.
 
-- **VerifyCred (§4.2)** — recompute the challenge over the transcript, check the
-  NIZK responses, enforce `σ₁' ≠ 1`, and verify `e(σ₁', κ) == e(σ₂' · ν, g2)`.
+- **VerifyCred (§4.2)** — refuse a proof whose disclosure mask differs from the
+  one the verifier asked for, recompute the challenge over the transcript (with the
+  verifier's context), check the NIZK responses, enforce `σ₁' ≠ 1` and every point
+  in its subgroup, and verify `e(σ₁', κ) == e(σ₂' · ν, g2)`.
 
 ### 1a. Fiat-Shamir transcript (`showChallenge`)
 
@@ -73,7 +75,10 @@ rests entirely on the challenge binding every commitment. The challenge is
 is fixed-width given `q`, so the encoding is injective (no concatenation
 ambiguity):
 
-1. `show_challenge_dst` — domain separation (scheme / curve / transcript version);
+1. `show_challenge_dst` — domain separation (scheme / curve / transcript version,
+   now `V02`);
+1b. `context.len` (u64 BE) ‖ `context` — the verifier's context (nonce, session,
+   audience), so a captured proof does not replay to another verifier or show;
 2. `q` (u64 BE) — attribute count, frames every vector below;
 3. `hs[0..q]` (G1, 48 B each) — the attribute generators / parameter set;
 4. `vk.alpha` (G2, 96 B) then `vk.betas[0..q]` (G2, 96 B each) — the authority
@@ -226,14 +231,6 @@ them. Do not use either outside a test.
 **How it got there.** No Coconut implementation publishes vectors and the NIZK is implementation-defined (SPEC §3), so the NIZK stays SELF. The Pointcheval-Sanders core (`sigma = (h, h^(x + sum y_j m_j))`, `e(h, X~ prod Y~_j^m_j) == e(s, g~)`) and Lagrange-at-0 aggregation are universal, so on 2026-09-30 they were anchored against `coconut-crypto` (Apache-2.0; `coconut_sig` was not used). Its `SignatureParams.g_tilde` is hash-derived by default; the tool builds the params with the standard G2 generator (public fields), and signs with `Signature::new_deterministic` so all authorities share `h`. Points are converted from arkworks affine coordinates to ZCash compressed (the tool asserts the codec on both generators); attributes are uniformly random `Fr` as 32-byte big-endian hex. No foreign code was copied.
 
 ## Backlog / deferred
-
-- **Relation audit 2026-10-03 — open MED items** (the HIGH subgroup forgery was fixed the same day):
-  (1) the show challenge binds no verifier context or nonce, so a captured show proof replays to
-  any verifier — add a `context` argument to `proveCredential`/`verifyCredential` hashed into
-  `showChallenge` (transcript version bump, V01 → V02); (2) `verifyCredential` takes the disclosure
-  mask from the proof, so a caller expecting attribute 0 disclosed can be handed a proof that
-  discloses attribute 2 with the same value — take the expected mask from the caller (or return
-  it and document that the caller must compare). Both are API changes; decide together.
 
 - **Blind issuance (paper §4.3) — ElGamal-encrypted private attributes, formation NIZK `pi_s`, `blindSign`, `unblind`** (survey 2026-09-30): this is the reason to pick Coconut over threshold PS; without it the issuing authorities learn every attribute, so the privacy claim is only "hidden from the verifier". Already SPEC §6 "Deferred increments"; `params.hs` is already carried for it. Effort: medium (a new NIZK with its own transcript; the most soundness-critical new code). Fits CONVENTIONS §2.
 - **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the dealer. Effort: medium; fits §2.

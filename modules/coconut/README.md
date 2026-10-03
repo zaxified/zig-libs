@@ -47,10 +47,16 @@ const h = p.commonBase(&attributes);
 // Fable cores (threshold-issue → aggregate → selective-disclosure show → verify):
 const partial = try coconut.signPartial(keys.sk_shares[j], h, &attributes);
 const cred    = try coconut.aggregateCredential(allocator, partials, t);
-const proof   = try coconut.proveCredential(allocator, io, p, vk, cred, &attributes, &disclosed);
+// `context` = the verifier's fresh nonce + its name; the proof answers only that.
+const proof   = try coconut.proveCredential(allocator, io, p, vk, cred, &attributes, &disclosed, context);
 defer proof.deinit(allocator);
-const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed_values);
+// The verifier passes the mask IT asked for, not the one inside the proof.
+const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed, &disclosed_values, context);
 ```
+
+A show proof is bound to `context`: issue a fresh nonce per show and refuse a
+nonce you have seen, or a recorded proof opens the door again. An empty context
+binds nothing.
 
 ## Randomness
 

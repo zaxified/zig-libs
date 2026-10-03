@@ -40,6 +40,9 @@ const g1 = bls.g1;
 const Fr = bls.Fr;
 const Parameters = params_mod.Parameters;
 
+/// The verifier context every show in this file is bound to.
+const show_context = "harness-gate/nonce-0001";
+
 /// Mechanically sign a partial PS signature under authority `share`'s
 /// Shamir share of `(x, y_i)`, over common base `h` — the mechanical
 /// stand-in for the (gated) `credential.signPartial`, used only by the
@@ -151,11 +154,11 @@ test "ANCHOR (gated): threshold-issue → aggregate → show → verify PASSES" 
 
     // Disclose attribute 0, hide 1 and 2.
     const disclosed = [_]bool{ true, false, false };
-    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
+    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed, show_context);
     defer proof.deinit(allocator);
 
     const disclosed_values = [_]Fr{attrs[0]};
-    try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &disclosed_values));
+    try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &disclosed, &disclosed_values, show_context));
 }
 
 test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated challenge / forged attribute all REJECTED" {
@@ -175,21 +178,21 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     };
     const credential = try cred.aggregateCredential(allocator, &partials, 2);
     const disclosed = [_]bool{ true, false };
-    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed);
+    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &disclosed, show_context);
     defer proof.deinit(allocator);
 
     // 1. wrong disclosed value → reject
     const wrong_disclosed = [_]Fr{frOf(999)};
-    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &wrong_disclosed));
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &disclosed, &wrong_disclosed, show_context));
 
     // 2. mutated Fiat-Shamir challenge → reject
     var tampered = proof;
     tampered.challenge = proof.challenge.add(Fr.one);
     const good_disclosed = [_]Fr{attrs[0]};
-    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, tampered, &good_disclosed));
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, tampered, &disclosed, &good_disclosed, show_context));
 
     // 3. honest proof still verifies (control for the above)
-    try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &good_disclosed));
+    try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &disclosed, &good_disclosed, show_context));
 
     // 4. forged UNDISCLOSED attribute → reject. The prover builds a FULLY
     // self-consistent show proof over a credential it holds (real m = [11,22])
@@ -200,9 +203,49 @@ test "SOUNDNESS (gated): tampered credential / wrong disclosed value / mutated c
     // on the REAL vector. The PS pairing equation e(σ₁',κ)==e(σ₂'·ν,g2) is the
     // backstop that binds the credential to the claimed attributes and REJECTS.
     const forged_attrs = [_]Fr{ frOf(11), frOf(999) };
-    const forged = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &forged_attrs, &disclosed);
+    const forged = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &forged_attrs, &disclosed, show_context);
     defer forged.deinit(allocator);
-    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, forged, &good_disclosed));
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, forged, &disclosed, &good_disclosed, show_context));
+}
+
+test "SOUNDNESS (gated): a show proof answers only the verifier's context and the verifier's mask" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const p = try Parameters.generate(allocator, 3);
+    defer p.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(0xC7C7);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+    defer kk.deinit(allocator);
+
+    // Attributes 0 and 2 carry the same value, so a revealed VALUE alone
+    // does not say which attribute was shown.
+    const attrs = [_]Fr{ frOf(5), frOf(9), frOf(5) };
+    const h = p.commonBase(&attrs);
+    const partials = [_]cred.PartialCredential{
+        try cred.signPartial(kk.sk_shares[0], h, &attrs),
+        try cred.signPartial(kk.sk_shares[1], h, &attrs),
+    };
+    const credential = try cred.aggregateCredential(allocator, &partials, 2);
+
+    const reveal_2 = [_]bool{ false, false, true };
+    const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, kk.master_vk, credential, &attrs, &reveal_2, show_context);
+    defer proof.deinit(allocator);
+    const value = [_]Fr{frOf(5)};
+    try std.testing.expect(try cred.verifyCredential(allocator, p, kk.master_vk, proof, &reveal_2, &value, show_context));
+
+    // A gate that asks for attribute 0 must not accept a proof about attribute 2.
+    const reveal_0 = [_]bool{ true, false, false };
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &reveal_0, &value, show_context));
+
+    // A proof captured at one gate does not replay at another, nor under a
+    // fresh nonce at the same gate.
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &reveal_2, &value, "other-gate/nonce-0001"));
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &reveal_2, &value, "harness-gate/nonce-0002"));
+    try std.testing.expect(!try cred.verifyCredential(allocator, p, kk.master_vk, proof, &reveal_2, &value, ""));
+
+    // The caller's own inconsistency stays an error, not a verdict.
+    const short_mask = [_]bool{ false, true };
+    try std.testing.expectError(error.InvalidDisclosure, cred.verifyCredential(allocator, p, kk.master_vk, proof, &short_mask, &value, show_context));
 }
 
 test "THRESHOLD (gated): fewer than t partials fails aggregation" {

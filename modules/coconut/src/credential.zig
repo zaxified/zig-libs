@@ -304,7 +304,7 @@ pub fn psVerifyPlain(vk: VerificationKey, cred: Credential, attributes: []const 
 /// Domain-separation tag for the show-proof Fiat-Shamir challenge. Names
 /// the scheme, the curve, and the transcript version — bumping the wire
 /// or transcript layout MUST bump the version.
-const show_challenge_dst = "COCONUT-BLS12381_XMD:SHA-512_SHOW-V01_CHALLENGE_";
+const show_challenge_dst = "COCONUT-BLS12381_XMD:SHA-512_SHOW-V02_CHALLENGE_";
 
 /// The Fiat-Shamir challenge for the selective-disclosure show proof —
 /// SHA-512 over the FULL transcript, reduced into `Fr` (`Fr.reduceWide`,
@@ -318,6 +318,10 @@ const show_challenge_dst = "COCONUT-BLS12381_XMD:SHA-512_SHOW-V01_CHALLENGE_";
 /// encoding is injective — no length-extension/concatenation ambiguity):
 ///
 ///  1. `show_challenge_dst`             — domain separation (scheme/curve/version);
+///  1b. `context.len` (u64 BE) ‖ `context` — the verifier's context (nonce,
+///                                        session id, audience): without it a
+///                                        captured show proof replays to any
+///                                        verifier of the same authority set;
 ///  2. `q` (u64 BE)                     — attribute count, frames all vectors;
 ///  3. `hs[0..q]` (48 B each)           — the attribute generators: binds the
 ///                                        parameter set the commitment/base
@@ -351,10 +355,14 @@ fn showChallenge(
     bw: g1.Affine,
     disclosed: []const bool,
     disclosed_values: []const Fr,
+    context: []const u8,
 ) Fr {
     var hasher = std.crypto.hash.sha2.Sha512.init(.{});
     hasher.update(show_challenge_dst);
     var u64buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &u64buf, @as(u64, context.len), .big);
+    hasher.update(&u64buf);
+    hasher.update(context);
     std.mem.writeInt(u64, &u64buf, @as(u64, parameters.q), .big);
     hasher.update(&u64buf);
     for (parameters.hs) |h| hasher.update(&g1.toBytesCompressed(h));
@@ -460,6 +468,12 @@ pub fn aggregateCredential(
 /// every HIDDEN attribute, by the standard two-transcript extraction. A
 /// verifier who simply watches two shows learns exactly what selective
 /// disclosure exists to withhold. Tests use `proveCredentialSeededForTest`.
+///
+/// **Context.** `context` is hashed into the challenge and must equal the
+/// verifier's: a nonce or session id the verifier issued, plus whatever
+/// names the verifier (audience). The proof then verifies only there and
+/// only once per nonce — the replay protection is the verifier's nonce
+/// discipline; an empty context gives none.
 pub fn proveCredential(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -468,8 +482,9 @@ pub fn proveCredential(
     cred: Credential,
     attributes: []const Fr,
     disclosed: []const bool,
+    context: []const u8,
 ) CoconutError!ShowProof {
-    return proveCredentialFrom(allocator, .{ .io = io }, parameters, vk, cred, attributes, disclosed);
+    return proveCredentialFrom(allocator, .{ .io = io }, parameters, vk, cred, attributes, disclosed, context);
 }
 
 /// **TEST ONLY** — `proveCredential` over a caller-seeded `std.Random`, so a
@@ -484,8 +499,9 @@ pub fn proveCredentialSeededForTest(
     cred: Credential,
     attributes: []const Fr,
     disclosed: []const bool,
+    context: []const u8,
 ) CoconutError!ShowProof {
-    return proveCredentialFrom(allocator, .{ .seeded_for_test = random }, parameters, vk, cred, attributes, disclosed);
+    return proveCredentialFrom(allocator, .{ .seeded_for_test = random }, parameters, vk, cred, attributes, disclosed, context);
 }
 
 fn proveCredentialFrom(
@@ -496,6 +512,7 @@ fn proveCredentialFrom(
     cred: Credential,
     attributes: []const Fr,
     disclosed: []const bool,
+    context: []const u8,
 ) CoconutError!ShowProof {
     const q = parameters.q;
     if (attributes.len != q or vk.betas.len != q) return error.MismatchedAttributes;
@@ -561,7 +578,7 @@ fn proveCredentialFrom(
             k += 1;
         }
     }
-    const challenge = showChallenge(parameters, vk, sigma1, sigma2, kappa, nu, aw, bw, disclosed, disclosed_values);
+    const challenge = showChallenge(parameters, vk, sigma1, sigma2, kappa, nu, aw, bw, disclosed, disclosed_values, context);
 
     // Responses: z = witness + c · secret (ascending attribute-index
     // order for the hidden responses, matching the verifier's walk).
@@ -592,23 +609,33 @@ fn proveCredentialFrom(
 /// §4.2 `VerifyCred`: recompute the Fiat-Shamir challenge from the proof's
 /// transcript (`κ ‖ ν ‖ σ' ‖ disclosed indices/values ‖ vk`), check every
 /// NIZK response equation, enforce `σ₁' ≠ 1`, and finally verify the PS
-/// pairing equation `e(σ₁', κ) == e(σ₂' · ν, g2)`. `disclosed_values`
-/// holds the revealed attribute scalars in ascending index order (matching
-/// `proof.disclosed`). Returns `true` iff every check passes. GATED core.
+/// pairing equation `e(σ₁', κ) == e(σ₂' · ν, g2)`. `disclosed` is the
+/// mask the VERIFIER asks for (length `q`) and `disclosed_values` its
+/// revealed attribute scalars in ascending index order; a proof that
+/// reveals any other set is refused (`false`) — the mask is not taken from
+/// the proof, or a caller expecting attribute 0 could be handed a proof
+/// revealing attribute 2 with the same value. `context` must be the one
+/// the prover hashed (see `proveCredential`). Returns `true` iff every
+/// check passes; `error.InvalidDisclosure` for the caller's own
+/// inconsistent arguments (or a proof whose mask is not length `q`). GATED
+/// core.
 pub fn verifyCredential(
     allocator: std.mem.Allocator,
     parameters: Parameters,
     vk: VerificationKey,
     proof: ShowProof,
+    disclosed: []const bool,
     disclosed_values: []const Fr,
+    context: []const u8,
 ) CoconutError!bool {
     _ = allocator; // recompute-commitment verification is allocation-free
     const q = parameters.q;
     if (vk.betas.len != q) return error.MismatchedAttributes;
-    if (proof.disclosed.len != q) return error.InvalidDisclosure;
+    if (disclosed.len != q or proof.disclosed.len != q) return error.InvalidDisclosure;
     var revealed: usize = 0;
-    for (proof.disclosed) |d| revealed += @intFromBool(d);
+    for (disclosed) |d| revealed += @intFromBool(d);
     if (disclosed_values.len != revealed) return error.InvalidDisclosure;
+    if (!std.mem.eql(bool, disclosed, proof.disclosed)) return false;
     if (proof.responses_m.len != q - revealed) return error.InvalidDisclosure;
 
     // σ₁' ≠ 1 — mandatory: with σ₁' = 1 the pairing equation is trivially
@@ -627,7 +654,7 @@ pub fn verifyCredential(
     var a_acc = g2.Jacobian.fromAffine(vk.alpha);
     {
         var k: usize = 0;
-        for (proof.disclosed, vk.betas) |d, beta| {
+        for (disclosed, vk.betas) |d, beta| {
             if (!d) continue;
             a_acc = a_acc.add(g2.Jacobian.fromAffine(beta).scalarMul(disclosed_values[k]));
             k += 1;
@@ -644,7 +671,7 @@ pub fn verifyCredential(
     var aw_acc = g2gen.scalarMul(proof.response_r);
     {
         var k: usize = 0;
-        for (proof.disclosed, vk.betas) |d, beta| {
+        for (disclosed, vk.betas) |d, beta| {
             if (d) continue;
             aw_acc = aw_acc.add(g2.Jacobian.fromAffine(beta).scalarMul(proof.responses_m[k]));
             k += 1;
@@ -664,8 +691,9 @@ pub fn verifyCredential(
         proof.nu,
         aw_acc.toAffine(),
         bw.toAffine(),
-        proof.disclosed,
+        disclosed,
         disclosed_values,
+        context,
     );
     if (!expected.eql(proof.challenge)) return false;
 
@@ -776,7 +804,7 @@ test "SOUNDNESS: a point outside G1 is no credential (no authority signed anythi
     const aw = g2gen.scalarMul(r_tilde).add(g2.Jacobian.fromAffine(kk.master_vk.betas[1]).scalarMul(m_tilde)).toAffine();
     const bw = t_jac.scalarMul(r_tilde).toAffine();
     const disclosed_values = [_]Fr{attrs[0]};
-    const c = showChallenge(p, kk.master_vk, t, g1.Affine.identity, kappa, g1.Affine.identity, aw, bw, &disclosed, &disclosed_values);
+    const c = showChallenge(p, kk.master_vk, t, g1.Affine.identity, kappa, g1.Affine.identity, aw, bw, &disclosed, &disclosed_values, "");
     var responses_m = [_]Fr{m_tilde.add(c.mul(attrs[1]))};
     var disclosed_mask = disclosed;
     const proof = ShowProof{
@@ -789,7 +817,7 @@ test "SOUNDNESS: a point outside G1 is no credential (no authority signed anythi
         .responses_m = &responses_m,
         .disclosed = &disclosed_mask,
     };
-    if (try verifyCredential(allocator, p, kk.master_vk, proof, &disclosed_values)) return error.ShowForgeryAccepted;
+    if (try verifyCredential(allocator, p, kk.master_vk, proof, &disclosed, &disclosed_values, "")) return error.ShowForgeryAccepted;
     const wire = try proof.toBytes(allocator);
     defer allocator.free(wire);
     try std.testing.expectError(error.InvalidEncoding, ShowProof.fromBytes(allocator, wire));

@@ -585,38 +585,26 @@ fn auxFeEql(a: root.AuxFe, b: root.AuxFe) bool {
     return std.mem.eql(u8, &ab, &bb);
 }
 
-/// `gcd(x, N) == 1` for a PUBLIC value held mod `N` or `N²` — a unit of
-/// `Z*_N` (and so of `Z*_{N²}`). The paper's verifier divides by `c^e`, which
-/// presumes it; the inversion-free form used here does not, and without
-/// this check a prover who knows `N = P·Q` sends `u ≡ 0 (mod P²)` and
-/// `s ≡ 0 (mod P)`: equation 2 then holds as `0 = 0` mod `P²` for ANY
+/// `c` and `s` (held mod `N` or `N²`) are both units of `Z*_N`, i.e. their
+/// product mod `N` is invertible. The paper's verifier divides by `c^e`,
+/// which presumes units; the inversion-free form used here does not, and
+/// without this check a prover who knows `N = P·Q` sends `u ≡ 0 (mod P²)`
+/// and `s ≡ 0 (mod P)`: equation 2 then holds as `0 = 0` mod `P²` for ANY
 /// plaintext there, and only mod `Q²` does the range proof still bind
-/// anything. Variable-time over public values; the scratch stays on the
-/// stack (gcd of a 4096-bit and a 2048-bit integer).
-fn isUnitModN(pk: paillier.PublicKey, x: paillier.Fe) bool {
-    var scratch: [16 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
-    var x_buf: [paillier.modulus_sq_bytes]u8 = undefined;
-    x.toBytes(&x_buf, .big) catch return false;
-    var n_buf: [paillier.modulus_bytes]u8 = undefined;
-    const n_len = pk.nByteLen();
-    pk.nToBytes(n_buf[0..n_len]) catch return false;
-    const xb = stripLeadingZeros(&x_buf);
-    if (xb.len == 0) return false;
-    var xi = bigFromBytes(gpa, xb) catch return false;
-    var ni = bigFromBytes(gpa, stripLeadingZeros(n_buf[0..n_len])) catch return false;
-    var g = std.math.big.int.Managed.init(gpa) catch return false;
-    g.gcd(&xi, &ni) catch return false;
-    return g.toConst().orderAgainstScalar(1) == .eq;
-}
-
-fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
-    var x = try std.math.big.int.Managed.initCapacity(gpa, bytes.len / @sizeOf(std.math.big.Limb) + 2);
-    var m = x.toMutable();
-    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
-    x.setMetadata(m.positive, m.len);
-    return x;
+/// anything. `u` needs no check of its own: with `c` and `s` units,
+/// equation 2 makes `u` one. Constant-time (montint divsteps) although
+/// every input is public: a single-process ctgrind harness taints the
+/// ciphertexts it derives from a secret, and a variable-time gcd here
+/// flooded its `nonce` row (1000 contexts).
+fn unitsModN(pk: paillier.PublicKey, c: paillier.Fe, s: paillier.Fe) bool {
+    const ctn = ctMod(pk.n);
+    var c_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    c.toBytes(&c_buf, .big) catch return false;
+    var s_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    s.toBytes(&s_buf, .big) catch return false;
+    const prod = ctn.mul(&ctn.reduceBytesBE(&c_buf), &ctn.reduceBytesBE(&s_buf));
+    var inv: Ct.Elem = undefined;
+    return ctn.inverse(&prod, &inv);
 }
 
 /// Byte-exact `paillier.Fe` equality (same rationale as `auxFeEql`).
@@ -1370,10 +1358,10 @@ fn verifyAliceRangeInner(
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.w.isZero() or proof.s.isZero() or proof.u.c.isZero()) return false;
     if (c_a.c.isZero()) return false;
-    // Units only (see `isUnitModN`): a non-unit `u`/`s` lets Alice's own
+    // Units only (see `unitsModN`): a non-unit `u`/`s` lets Alice's own
     // factor P blank equation 2 mod P² and slip a plaintext of size ~N past
     // the range check — Bob's MtA reply then hands her `b` outright.
-    if (!isUnitModN(alice_pk, c_a.c) or !isUnitModN(alice_pk, proof.u.c) or !isUnitModN(alice_pk, proof.s)) return false;
+    if (!unitsModN(alice_pk, c_a.c, proof.s)) return false;
 
     // 1. THE range check: s1 <= q³. (The length cap is a work bound: an
     // honest prover never zero-pads, and `s1` is an exponent below.)
@@ -2437,6 +2425,14 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     try testing.expect(verifyAliceRange(proof_ok, c_ok, pk, setup.aux));
 }
 
+fn testBigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
+    var x = try std.math.big.int.Managed.initCapacity(gpa, bytes.len / @sizeOf(std.math.big.Limb) + 2);
+    var m = x.toMutable();
+    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
+    x.setMetadata(m.positive, m.len);
+    return x;
+}
+
 test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank equation 2 and leak Bob's b" {
     // Alice owns N = P·Q. She encrypts a = k·Q ≈ 2^1300 (≡ 0 mod Q, huge
     // mod P) and proves "plaintext 0" mod Q² honestly, while u ≡ 0 (mod P²)
@@ -2463,9 +2459,9 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const Big = std.math.big.int.Managed;
     var p_sq_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try p_sq.toBytes(&p_sq_buf, .big);
-    var p_sq_big = try bigFromBytes(allocator, stripLeadingZeros(&p_sq_buf));
+    var p_sq_big = try testBigFromBytes(allocator, stripLeadingZeros(&p_sq_buf));
     defer p_sq_big.deinit();
-    var n_big = try bigFromBytes(allocator, n_bytes);
+    var n_big = try testBigFromBytes(allocator, n_bytes);
     defer n_big.deinit();
     var p_big = try Big.init(allocator);
     defer p_big.deinit();
@@ -2540,12 +2536,12 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const dec = try paillier.decrypt(setup.kp.secret, c_b);
     var dec_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try dec.toBytes(&dec_buf, .big);
-    var dec_big = try bigFromBytes(allocator, stripLeadingZeros(&dec_buf));
+    var dec_big = try testBigFromBytes(allocator, stripLeadingZeros(&dec_buf));
     defer dec_big.deinit();
     var b_got = try Big.init(allocator);
     defer b_got.deinit();
     try b_got.divFloor(&rem, &dec_big, &a_big);
-    var b_big = try bigFromBytes(allocator, &b_bytes);
+    var b_big = try testBigFromBytes(allocator, &b_bytes);
     defer b_big.deinit();
     try testing.expect(b_got.eql(b_big));
 }

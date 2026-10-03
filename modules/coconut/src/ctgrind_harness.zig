@@ -332,7 +332,7 @@ fn runUserShow(allocator: std.mem.Allocator, tainted: bool) !void {
     const disclosed = [_]bool{ true, false, true, false };
 
     var rnd = TaintedRandom{ .domain = "ctgrind-coconut-user-show-blinding-v1", .tainted = tainted };
-    const proof = try coconut.proveCredentialSeededForTest(allocator, rnd.random(), p, kk.master_vk, cred, &attrs, &disclosed);
+    const proof = try coconut.proveCredentialSeededForTest(allocator, rnd.random(), p, kk.master_vk, cred, &attrs, &disclosed, "ctgrind-gate");
     defer proof.deinit(allocator);
 
     std.debug.print("sigma1={x}\n", .{bls.g1.toBytesCompressed(proof.sigma1)});

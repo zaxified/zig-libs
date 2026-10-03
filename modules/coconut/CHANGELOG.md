@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **BREAKING (API + transcript):** the show proof is bound to the
+  verifier, and the verifier states what it asked for. `proveCredential` /
+  `proveCredentialSeededForTest` take a trailing `context: []const u8` (the verifier's
+  nonce, session id and name), hashed into the challenge right after the DST; the DST
+  is now `…SHOW-V02_CHALLENGE_`, so V01 proofs no longer verify. `verifyCredential`
+  takes `disclosed` (the mask the verifier asked for) before `disclosed_values` and
+  `context` after it; a proof revealing a different set returns `false`. Before, the
+  mask came from the proof: a gate expecting attribute 0 accepted a proof revealing
+  attribute 2 with the same value, and any recorded show replayed to any verifier of
+  the same authority set. Migration: add the two arguments at every call; issue a
+  fresh nonce per show and refuse repeats. Relation audit MED items 1–2.
+
 - **2026-10-03** — **⛔ Security fix: no subgroup check → universal forgery.** Every
   `G1`/`G2` point a credential or show proof carries was decoded with
   `fromBytesCompressed`, which checks the curve only. A point `T` whose order divides

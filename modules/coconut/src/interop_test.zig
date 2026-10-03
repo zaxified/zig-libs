@@ -179,7 +179,7 @@ test "our show proof (SELF NIZK) runs over a foreign-issued credential" {
         const disclosed = try allocator.alloc(bool, c.q);
         defer allocator.free(disclosed);
         for (disclosed, 0..) |*d, i| d.* = (i % 2 == 0);
-        const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, vk, sigma, attrs, disclosed);
+        const proof = try cred.proveCredentialSeededForTest(allocator, prng.random(), p, vk, sigma, attrs, disclosed, "interop");
         defer proof.deinit(allocator);
 
         const revealed = try allocator.alloc(Fr, (c.q + 1) / 2);
@@ -190,12 +190,12 @@ test "our show proof (SELF NIZK) runs over a foreign-issued credential" {
             revealed[k] = m;
             k += 1;
         }
-        try std.testing.expect(try cred.verifyCredential(allocator, p, vk, proof, revealed));
+        try std.testing.expect(try cred.verifyCredential(allocator, p, vk, proof, disclosed, revealed, "interop"));
 
         // A wrong claimed disclosed value must fail.
         const bad = try allocator.dupe(Fr, revealed);
         defer allocator.free(bad);
         bad[0] = bad[0].add(Fr.one);
-        try std.testing.expect(!(try cred.verifyCredential(allocator, p, vk, proof, bad)));
+        try std.testing.expect(!(try cred.verifyCredential(allocator, p, vk, proof, disclosed, bad, "interop")));
     }
 }
