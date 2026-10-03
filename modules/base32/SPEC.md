@@ -6,7 +6,7 @@
 
 **Scope:** core — Go `encoding/base32`, Python `base64` (surveyed 2026-09-30)
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -90,7 +90,42 @@ does not zero any buffer: callers own `dest` and should clear it after use.
 - Fuzz harness: decode never panics; every accepted text equals the canonical
   encoding of its own output modulo case, padding and whitespace.
 
+### Audit 2026-10-03
+
+Reviewed: all of `src/root.zig` (encode, table-driven decode, length helpers,
+alloc wrappers) against RFC 4648 §6/§7/§3.3/§3.5 and the Go/Python behaviour
+named in the card. No HIGH or MED defect. Findings:
+
+- LOW (fixed): the module doc pointed at SPEC.md "Threat model"; the section is
+  "Constant-time contract".
+- INFO: `decodeAlloc` decodes into a temporary buffer and frees it without
+  clearing it, so a decoded secret (also the partial one of a failed decode)
+  stays in freed heap memory. Consistent with "the module does not zero any
+  buffer" above, but see Backlog.
+- INFO: `encodedLen` multiplies `n * 8` unchecked; it overflows only for
+  `n >= 2^61`, which no slice can have.
+- INFO: when `dest` is too small, `BufferTooSmall` is reported where the
+  buffer runs out, before the length / padding / canonical-bits faults that a
+  complete scan would find (stated in the `decode` doc comment as "unspecified
+  contents on error"; the error precedence list covers the other faults only).
+
+Mutation run (schemata, ReleaseSafe, 40 mutants over `encodedLen`,
+`decodedLenUpperBound`, the encoder's block/shift/padding/case logic, the
+tables, whitespace set, padding modes, buffer bounds, length switch and
+canonical-bits check): 38 killed, 2 equivalent. The first pass left 6; four
+real ones are pinned now: lower-case `A` in `encode` (no test looked at
+lower-case output beyond three strings), the tab and carriage return members
+of the whitespace set (only space and LF were exercised), and `decodeAlloc`'s
+buffer size for unpadded text (only padded text went through it). Equivalent:
+the digit symbols `0`-`9` already have bit 0x20 set, so OR-ing the case bit
+into a digit (encoder) or building its table entry (`c | 0x20`, decoder)
+changes nothing.
+
 ## Backlog / deferred
+
+- `decodeAlloc` could `secureZero` its temporary buffer before freeing it
+  (found in the 2026-10-03 audit; TOTP secrets pass through it). Not
+  observable by a test, so not done here.
 
 - ~~**`dnssec` could switch to this module**~~ — done 2026-10-02: `dnssec.nsec3` reads owner-hash labels with `.hex`, `.forbidden` padding, `.insensitive` case. The strict trailing-length check closed an aliasing its private decoder had (a 33-symbol label decoding like the 32-symbol one).
 - Streaming encoder/decoder (for secrets read in pieces): none needed yet.

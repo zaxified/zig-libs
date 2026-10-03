@@ -6,7 +6,7 @@
 
 **Scope:** core — CPython `configparser` 3.14, GLib `GKeyFile` 2.88 (surveyed 2026-09-30)
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -125,7 +125,50 @@ The rest — `unquote`, `unescapeDesktop` (Desktop Entry Specification,
 "Possible value types"), `getBool` (configparser's `BOOLEAN_STATES`), the
 default preset, lenient mode — is checked by hand-written expectations.
 
+### Audit 2026-10-03
+
+Reviewed: all of `src/root.zig` (line classification, continuation buffer and
+its pointer lifetime, header and key rules, `Document` lookups, `unquote`,
+`unescapeDesktop`, `getBool`, allocation-failure paths) against the grammar
+above, CPython `configparser` (run, not read) and the Desktop Entry
+specification. No HIGH or MED defect; no panic reachable from input (every
+slice is bounded by a prior check; the 100 000-line and fuzz tests agree).
+Findings:
+
+- LOW (not fixed, Backlog): `inline_comments` is applied to the value after the
+  line was split at the separator, and only to the entry's own line.
+  `configparser` with `inline_comment_prefixes` strips the comment from every
+  line first, so `x ; y = z` is a parse error there and key `x ; y` here, and a
+  comment on a continuation line is cut there and kept here (run on CPython
+  3.x, 2026-10-03). No preset sets the option and the goldens never use it, so
+  the corpus cannot see it.
+- INFO: with `trim_values = false` and `inline_comments`, the text before an
+  inline comment is still right-trimmed (`k = v ; c` is `v`); GKeyFile has no
+  inline comments, so nothing to disagree with. Pinned by a test now.
+- INFO: a lone `\r` (classic Mac) is not a line break; only `\n` is, with one
+  trailing `\r` dropped (as the Grammar says).
+- INFO: allocation failure at any point of a parse frees everything (arena
+  `errdefer`); a new test fails every allocation of three option sets in turn.
+
+Mutation run (schemata, ReleaseSafe, 77 mutants over BOM and CR handling,
+indentation, blank/comment/continuation rules, header and entry classification,
+key and locale-key rules, line numbers and `ErrorInfo`, inline comments, the
+lenient skips, `unquote`, `unescapeDesktop`, `getBool`, case-insensitive
+lookups and the entry iterator): 77 killed, 0 equivalent. The first pass left
+17 alive, all real gaps, each pinned by a test now: the locale rule's blank,
+`[` and `]` checks one by one, a tab before an inline comment, trimming before
+an inline comment with `trim_values = false`, a lone single quote and a
+trailing backslash in `unquote`, the `\t` and `\r` escapes of `unquote` and of
+`unescapeDesktop` and `\\` of the latter, the words `1`, `on` and `0` of
+`getBool`, and `case_insensitive_keys` (never exercised: neither the lookup
+nor the flag reaching the `Document`).
+
 ## Backlog / deferred
+
+- **`inline_comments` like `configparser`'s `inline_comment_prefixes`**
+  *(audit 2026-10-03)*: strip the comment from the whole line before the
+  separator is looked for, and from continuation lines too; needs goldens with
+  the option on (`tools/gen_goldens.py`) before the behaviour is changed.
 
 - **Typed getters** *(survey 2026-09-30)*: `getInt(T, section, key)` / `getFloat` beside `getBool`, with the same `null` / typed-error contract. Why: configparser's `getint`/`getfloat` and GKeyFile's typed getters are used by nearly every config consumer; each caller re-does the parse and error mapping. Effort: small. Fits CONVENTIONS §2.
 - **Writer** *(survey 2026-09-30)*: serialise a `Document` back to text, preserving order and, ideally, comments. Why: rust-ini, go-ini and configparser all write; tools that edit a user's config need it. The SPEC says "No writer. Nobody asked … Not now" — recorded because a typical user of the references expects one; a comment-preserving round trip is its own design (needs the parser to keep comments and layout). Effort: medium–large. Fits §2.

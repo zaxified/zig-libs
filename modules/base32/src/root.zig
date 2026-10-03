@@ -18,7 +18,7 @@
 //!
 //! **Not constant-time**: decoding uses a 256-entry lookup table and branches
 //! on the input, so timing and cache behaviour depend on the text. See
-//! SPEC.md "Threat model".
+//! SPEC.md "Constant-time contract".
 //!
 //! Provenance: clean-room from RFC 4648 (public IETF specification); vectors
 //! are the RFC's §10 table plus values captured from Python's stdlib as a
@@ -453,6 +453,47 @@ test "injective: flipping any spare bit of a canonical text is rejected" {
     }
 }
 
+test "lower-case encoding folds every letter, including A, and no digit" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("aaaa====", try encode(&buf, "\x00\x00", .{ .lowercase = true }));
+    try testing.expectEqualStrings("a0======", try encode(&buf, "\x50", .{ .alphabet = .hex, .lowercase = true }));
+    try testing.expectEqualStrings("7777777777777777", try encode(&buf, "\xff" ** 10, .{ .lowercase = true }));
+}
+
+test "skip_whitespace skips exactly space, tab, CR and LF" {
+    var out: [16]u8 = undefined;
+    const opts: DecodeOptions = .{ .skip_whitespace = true };
+    // each of the four, alone, between symbols and inside the padding
+    for ([_]u8{ ' ', '\t', '\r', '\n' }) |ws| {
+        const text = "MZXW6===".*;
+        for (0..text.len + 1) |at| {
+            var spaced: [9]u8 = undefined;
+            @memcpy(spaced[0..at], text[0..at]);
+            spaced[at] = ws;
+            @memcpy(spaced[at + 1 ..], text[at..]);
+            try testing.expectEqual(@as(usize, 3), try decode(&out, &spaced, opts));
+        }
+    }
+    // other control bytes (VT, FF, NUL, NBSP lead byte) stay invalid
+    for ([_]u8{ 0x0b, 0x0c, 0x00, 0xa0, 0x1f }) |bad| {
+        const text = [_]u8{ 'M', 'Z', 'X', 'W', bad, '6', '=', '=', '=' };
+        try testing.expectError(error.InvalidCharacter, decode(&out, &text, opts));
+    }
+}
+
+test "decodeAlloc sizes its buffer for unpadded text of every length" {
+    var prng = std.Random.DefaultPrng.init(0x32);
+    var raw: [64]u8 = undefined;
+    var enc: [encodedLen(64, false)]u8 = undefined;
+    for (0..raw.len + 1) |len| {
+        prng.random().bytes(raw[0..len]);
+        const text = try encode(&enc, raw[0..len], .{ .pad = false });
+        const dec = try decodeAlloc(testing.allocator, text, .{ .padding = .forbidden });
+        defer testing.allocator.free(dec);
+        try testing.expectEqualSlices(u8, raw[0..len], dec);
+    }
+}
+
 const kat = @import("kat_vectors.zig");
 
 test "KAT: Python stdlib vectors (padded, unpadded, lowercase)" {
@@ -472,6 +513,13 @@ test "KAT: Python stdlib vectors (padded, unpadded, lowercase)" {
         try testing.expectEqualStrings(bare, try encode(&enc, n, .{ .pad = false }));
         const d3 = try decode(&dec, bare, .{ .padding = .forbidden });
         try testing.expectEqualSlices(u8, n, dec[0..d3]);
+        // Lower case is the same text with every letter folded (Python has no
+        // lower-case output, so this is checked against the folded oracle text,
+        // including the letter `A`, the first one of both alphabets).
+        var lower_std: [encodedLen(256, true)]u8 = undefined;
+        var lower_hex: [encodedLen(256, true)]u8 = undefined;
+        try testing.expectEqualStrings(std.ascii.lowerString(&lower_std, v.std), try encode(&enc, n, .{ .lowercase = true }));
+        try testing.expectEqualStrings(std.ascii.lowerString(&lower_hex, v.hex), try encode(&enc, n, .{ .alphabet = .hex, .lowercase = true }));
     }
 }
 

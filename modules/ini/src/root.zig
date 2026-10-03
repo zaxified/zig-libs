@@ -603,6 +603,106 @@ test "unquote: double quotes take escapes, single quotes none, anything else as 
     }
 }
 
+test "locale keys: a blank, `[` or `]` inside the locale is an InvalidKey, each on its own" {
+    for ([_][]const u8{ "a[b\tc]", "a[b c]", "a[b[c]", "a[b]c]" }) |k| {
+        var line_buf: [32]u8 = undefined;
+        const t = try std.fmt.bufPrint(&line_buf, "[g]\n{s}=v\n", .{k});
+        try testing.expectError(error.InvalidKey, parse(testing.allocator, t, .desktop));
+    }
+    // lenient: the same lines are skipped, not fatal
+    var lax = try parse(testing.allocator, "[g]\na[b[c]=v\na[b]c]=v\nok[cs]=v\n", .{ .locale_keys = true, .strict = false });
+    defer lax.deinit();
+    try testing.expectEqualSlices(usize, &.{ 2, 3 }, lax.skipped);
+    try testing.expectEqualStrings("v", lax.get("g", "ok[cs]").?);
+}
+
+test "inline comments: a tab also precedes one, and the value is trimmed even without trim_values" {
+    var doc = try parse(testing.allocator, "[a]\nk = v\t; note\nj = w  # note\n", .{ .inline_comments = true, .trim_values = false });
+    defer doc.deinit();
+    try testing.expectEqualStrings("v", doc.get("a", "k").?);
+    try testing.expectEqualStrings("w", doc.get("a", "j").?);
+    // no blank before the character: it is part of the value
+    var doc2 = try parse(testing.allocator, "[a]\nk = a;b#c\n", .{ .inline_comments = true });
+    defer doc2.deinit();
+    try testing.expectEqualStrings("a;b#c", doc2.get("a", "k").?);
+}
+
+test "unquote: every escape, a trailing backslash, a lone quote" {
+    const cases = [_][2][]const u8{
+        .{ "\"a\\tb\\rc\"", "a\tb\rc" },
+        .{ "\"a\\", "\"a\\" }, // not closed: as is
+        .{ "\"ab\\\"", "ab\\" }, // a lone backslash before the closing quote is kept
+        .{ "'", "'" },
+        .{ "''", "" },
+        .{ "\"\"", "" },
+        .{ "'\"x\"'", "\"x\"" },
+        .{ "\"'x'\"", "'x'" },
+        .{ "", "" },
+    };
+    for (cases) |c| {
+        const got = try unquote(testing.allocator, c[0]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "unescapeDesktop: every escape of the specification, and the first bad one" {
+    const got = try unescapeDesktop(testing.allocator, "a\\sb\\nc\\td\\re\\\\f");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("a b\nc\td\re\\f", got);
+    try testing.expectError(error.InvalidEscape, unescapeDesktop(testing.allocator, "\\;"));
+    const plain = try unescapeDesktop(testing.allocator, "no escapes");
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings("no escapes", plain);
+}
+
+test "getBool: every word of both lists, any case, and what is neither" {
+    for ([_][]const u8{ "1", "yes", "true", "on", "YES", "True", "ON" }) |v| {
+        var buf: [32]u8 = undefined;
+        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        defer doc.deinit();
+        try testing.expectEqual(@as(?bool, true), try doc.getBool("a", "k"));
+    }
+    for ([_][]const u8{ "0", "no", "false", "off", "NO", "False", "OFF" }) |v| {
+        var buf: [32]u8 = undefined;
+        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        defer doc.deinit();
+        try testing.expectEqual(@as(?bool, false), try doc.getBool("a", "k"));
+    }
+    for ([_][]const u8{ "2", "", "y", "yess", "tru", "t", "of" }) |v| {
+        var buf: [32]u8 = undefined;
+        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        defer doc.deinit();
+        try testing.expectError(error.NotABool, doc.getBool("a", "k"));
+    }
+}
+
+test "case_insensitive_keys: lookups fold case, the stored key keeps it; off by default" {
+    var doc = try parse(testing.allocator, "[a]\nKey=1\nkey=2\nother=3\n", .{ .case_insensitive_keys = true });
+    defer doc.deinit();
+    try testing.expectEqualStrings("2", doc.get("a", "KEY").?);
+    try testing.expectEqualStrings("3", doc.get("a", "OTHER").?);
+    try testing.expectEqualStrings("Key", doc.sections[0].entries[0].key);
+    // section names are a separate switch
+    try testing.expectEqual(@as(?[]const u8, null), doc.get("A", "key"));
+    var strict_case = try parse(testing.allocator, "[a]\nKey=1\n", .{});
+    defer strict_case.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), strict_case.get("a", "key"));
+    try testing.expectEqualStrings("1", strict_case.get("a", "Key").?);
+}
+
+fn parseThenFree(gpa: Allocator, text: []const u8, opts: Options) !void {
+    var doc = try parse(gpa, text, opts);
+    doc.deinit();
+}
+
+test "every allocation of a parse can fail without a leak" {
+    const body = "[a]\nk = first\n  second\n  third\nj=v\n[b]\nx=y\n[a]\nz=1\n";
+    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ "top=1\n" ++ body, Options{ .continuation_lines = true } });
+    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ body, Options.python });
+    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ "junk\n" ++ body, Options{ .strict = false, .continuation_lines = true } });
+}
+
 // ── fuzz: parse never panics, lenient never fails, strict agrees with it ────
 
 const seed = @import("testkit").fuzz.seed;
