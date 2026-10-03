@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Presignatures can outlive their process: `Presignature.toBytesAlloc`/
+  `fromBytesAlloc` (secret bytes, a used presignature refused), `PresignatureStore` (whose
+  `take` hands a record out at most once), `PresignaturePool` (`put` wipes the in-memory
+  original, `take` restores once) and `MemoryPresignatureStore`.
 - **2026-10-03** — **Identifiable abort for types 5 and 7 (GG20 §4.3).** A `r_bar_sum` or
   `s_sum` abort keeps the session's nonce material; `Party.openAbort` broadcasts the
   signer's opening and `Party.identify` checks everyone's and names the culprit. New:

@@ -562,8 +562,8 @@ blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # (presign.zig). Class (a): the bodies are public wire bytes the
 # single-process harness derives from the tainted secrets. Signing our own
 # messages (KeyPair.sign) added none.
-threshold_ecdsa	ReleaseFast	share	1	<=275	fd4d807a632708e7	706487e9e4a6df1e
-threshold_ecdsa	ReleaseFast	nonce	1	<=517	fd4d807a632708e7	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	share	1	<=275	b69f95bf60531b43	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	nonce	1	<=517	b69f95bf60531b43	706487e9e4a6df1e
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -599,7 +599,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=517	fd4d807a632708e7	706487e9e4a6df1e
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=320	fd4d807a632708e7	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	betaprime	1	<=320	b69f95bf60531b43	706487e9e4a6df1e
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to

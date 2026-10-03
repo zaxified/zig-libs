@@ -82,7 +82,10 @@
 //!   the inbox is handed in, a missing message is a `missing_message` fault.
 //! - **One presignature, one message.** `signShare` wipes `k_i`/`σ_i` and
 //!   refuses a second call; a presignature must never be copied (two
-//!   messages under one `R` reveal the key).
+//!   messages under one `R` reveal the key). To keep presignatures across a
+//!   restart, use `PresignaturePool` over a `PresignatureStore` whose `take`
+//!   hands each record out at most once (`MemoryPresignatureStore` for one
+//!   process); `Presignature.toBytesAlloc` is the codec underneath.
 
 const std = @import("std");
 const paillier = @import("paillier");
@@ -1568,6 +1571,148 @@ pub const Presignature = struct {
         return bytes;
     }
 
+    pub const codec_version: u8 = 1;
+
+    /// The presignature as bytes, SECRET (`k_i`, `σ_i`, the message seed): a
+    /// store must keep them encrypted at rest. Restoring the same bytes twice
+    /// and signing two messages reveals the key — never keep or restore a
+    /// copy; go through `PresignaturePool`, whose `take` hands a stored
+    /// presignature out at most once. Refuses a used presignature.
+    ///
+    /// `version || sid || index || group key || n || signers[n] || R || r ||
+    /// R̄[n] || S[n] || Phase-6 attestations[n] || message keys[n] || k || σ ||
+    /// message seed`, integers big-endian.
+    pub fn toBytesAlloc(self: *const Presignature, allocator: std.mem.Allocator) Error![]u8 {
+        if (self.used) return error.PresignatureUsed;
+        const pb = &self.public;
+        const n = pb.signers.len;
+        var list: std.ArrayList(u8) = .empty;
+        errdefer {
+            std.crypto.secureZero(u8, list.items);
+            list.deinit(allocator);
+        }
+        var u: [4]u8 = undefined;
+        try list.append(allocator, codec_version);
+        try list.appendSlice(allocator, &pb.sid);
+        std.mem.writeInt(u32, &u, self.index, .big);
+        try list.appendSlice(allocator, &u);
+        try list.appendSlice(allocator, &pb.group_public_key.toBytes());
+        std.mem.writeInt(u32, &u, @intCast(n), .big);
+        try list.appendSlice(allocator, &u);
+        for (pb.signers) |idx| {
+            std.mem.writeInt(u32, &u, idx, .big);
+            try list.appendSlice(allocator, &u);
+        }
+        try list.appendSlice(allocator, &pb.r_point.toBytes());
+        try list.appendSlice(allocator, &pb.r.toBytes(.big));
+        for (pb.r_bar) |e| try list.appendSlice(allocator, &e.toBytes());
+        for (pb.s_points) |e| try list.appendSlice(allocator, &e.toBytes());
+        for (pb.round6) |a| {
+            var buf: [attestation_entry_length]u8 = undefined;
+            writeAttestation(a, &buf);
+            try list.appendSlice(allocator, &buf);
+        }
+        for (pb.message_keys) |k| try list.appendSlice(allocator, &k.toBytes());
+        try list.appendSlice(allocator, &self.k.toBytes(.big));
+        try list.appendSlice(allocator, &self.sigma.toBytes(.big));
+        try list.appendSlice(allocator, &self.message_seed);
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub const DecodeError = Error || error{InvalidEncoding};
+
+    /// Inverse of `toBytesAlloc`, checking every field (points on the curve,
+    /// canonical scalars, ascending signers holding `index`, decodable keys,
+    /// the seed matching this signer's key). Allocates with `allocator`.
+    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Presignature {
+        const fixed = 1 + 32 + 4 + Ne + 4;
+        if (bytes.len < fixed or bytes[0] != codec_version) return error.InvalidEncoding;
+        const index = std.mem.readInt(u32, bytes[33..37], .big);
+        const group_public_key = Element.fromBytes(bytes[37..][0..Ne].*) catch return error.InvalidEncoding;
+        const n = std.mem.readInt(u32, bytes[37 + Ne ..][0..4], .big);
+        if (n < 2 or n > 0xffff) return error.InvalidEncoding;
+        const per = 4 + Ne + Ne + attestation_entry_length + 32;
+        if (bytes.len != fixed + n * per + Ne + Ns + 3 * 32) return error.InvalidEncoding;
+        var off: usize = fixed;
+
+        const signers = try allocator.alloc(u32, n);
+        errdefer allocator.free(signers);
+        for (signers, 0..) |*sg, i| {
+            sg.* = std.mem.readInt(u32, bytes[off..][0..4], .big);
+            off += 4;
+            if (sg.* == 0 or (i > 0 and sg.* <= signers[i - 1])) return error.InvalidEncoding;
+        }
+        const pos = std.mem.indexOfScalar(u32, signers, index) orelse return error.InvalidEncoding;
+        const r_point = Element.fromBytes(bytes[off..][0..Ne].*) catch return error.InvalidEncoding;
+        off += Ne;
+        const r = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        off += Ns;
+        const r_bar = try allocator.alloc(Element, n);
+        errdefer allocator.free(r_bar);
+        for (r_bar) |*e| {
+            e.* = Element.fromBytes(bytes[off..][0..Ne].*) catch return error.InvalidEncoding;
+            off += Ne;
+        }
+        const s_points = try allocator.alloc(Element, n);
+        errdefer allocator.free(s_points);
+        for (s_points) |*e| {
+            e.* = Element.fromBytes(bytes[off..][0..Ne].*) catch return error.InvalidEncoding;
+            off += Ne;
+        }
+        const round6 = try allocator.alloc(Attestation, n);
+        errdefer allocator.free(round6);
+        for (round6) |*a| {
+            a.* = readAttestation(bytes[off..][0..attestation_entry_length]);
+            off += attestation_entry_length;
+        }
+        const keys = try allocator.alloc(Ed25519.PublicKey, n);
+        errdefer allocator.free(keys);
+        for (keys) |*k| {
+            k.* = Ed25519.PublicKey.fromBytes(bytes[off..][0..32].*) catch return error.InvalidEncoding;
+            off += 32;
+        }
+        const k = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        off += Ns;
+        const sigma = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        off += Ns;
+        const seed = bytes[off..][0..32].*;
+        off += 32;
+        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidEncoding;
+        if (!std.mem.eql(u8, &kp.public_key.toBytes(), &keys[pos].toBytes())) return error.InvalidEncoding;
+        std.debug.assert(off == bytes.len);
+        return .{
+            .public = .{
+                .allocator = allocator,
+                .sid = bytes[1..33].*,
+                .group_public_key = group_public_key,
+                .signers = signers,
+                .r_point = r_point,
+                .r = r,
+                .r_bar = r_bar,
+                .s_points = s_points,
+                .round6 = round6,
+                .message_keys = keys,
+            },
+            .index = index,
+            .k = k,
+            .sigma = sigma,
+            .message_seed = seed,
+        };
+    }
+
+    /// The id a `PresignaturePool` files this presignature under:
+    /// `SHA-256(domain || sid || index || R)` — one per signer per session.
+    pub fn id(self: *const Presignature) [32]u8 {
+        var h = Sha256.init(.{});
+        h.update("threshold_ecdsa/presign/pool-id/v1");
+        h.update(&self.public.sid);
+        var u: [4]u8 = undefined;
+        std.mem.writeInt(u32, &u, self.index, .big);
+        h.update(&u);
+        h.update(&self.public.r_point.toBytes());
+        return h.finalResult();
+    }
+
     fn wipe(self: *Presignature) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.k));
         std.crypto.secureZero(u8, std.mem.asBytes(&self.sigma));
@@ -1584,6 +1729,107 @@ pub const Presignature = struct {
         self.wipeAll();
         self.public.deinit();
         self.* = undefined;
+    }
+};
+
+/// Where a `PresignaturePool` keeps encoded presignatures (SECRET bytes:
+/// encrypt at rest). The contract that makes a presigning pool safe across
+/// restarts is `take`'s: it hands a record out at most once, ever — it must
+/// remove the record durably (and atomically) BEFORE returning it, so a crash
+/// after `take` loses the presignature instead of letting it be taken again.
+pub const PresignatureStore = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Files `bytes` under `id` (copying them). Refuse an `id` already there.
+        put: *const fn (ptr: *anyopaque, id: [32]u8, bytes: []const u8) anyerror!void,
+        /// Removes the record under `id` and returns it (owned by
+        /// `allocator`), or null when there is none.
+        take: *const fn (ptr: *anyopaque, id: [32]u8, allocator: std.mem.Allocator) anyerror!?[]u8,
+    };
+};
+
+/// A pool of presignatures over a `PresignatureStore`: `put` moves an
+/// in-memory presignature into the store (wiping the original, so the only
+/// copy is the stored one) and `take` restores it at most once.
+pub const PresignaturePool = struct {
+    store: PresignatureStore,
+
+    /// Encodes `presig`, files it, then wipes and deinits `presig` (also on
+    /// failure: a presignature that may have reached the store must not live
+    /// on in memory). Returns its id.
+    pub fn put(self: PresignaturePool, allocator: std.mem.Allocator, presig: *Presignature) anyerror![32]u8 {
+        defer presig.deinit();
+        const presig_id = presig.id();
+        const bytes = try presig.toBytesAlloc(allocator);
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            allocator.free(bytes);
+        }
+        try self.store.vtable.put(self.store.ptr, presig_id, bytes);
+        return presig_id;
+    }
+
+    /// The presignature filed under `id`, removed from the store; null when
+    /// it is not there (never stored, or taken before). Deinit the result.
+    pub fn take(self: PresignaturePool, allocator: std.mem.Allocator, presig_id: [32]u8) anyerror!?Presignature {
+        const bytes = (try self.store.vtable.take(self.store.ptr, presig_id, allocator)) orelse return null;
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            allocator.free(bytes);
+        }
+        const presig = try Presignature.fromBytesAlloc(allocator, bytes);
+        if (!std.mem.eql(u8, &presig.id(), &presig_id)) {
+            var p = presig;
+            p.deinit();
+            return error.InvalidEncoding;
+        }
+        return presig;
+    }
+};
+
+/// An in-memory `PresignatureStore` (one process, nothing survives a
+/// restart): for tests and for a pool that never needs to outlive its
+/// process. Wipes what it holds on `deinit`.
+pub const MemoryPresignatureStore = struct {
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) MemoryPresignatureStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *MemoryPresignatureStore) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |v| {
+            std.crypto.secureZero(u8, v.*);
+            self.allocator.free(v.*);
+        }
+        self.map.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn store(self: *MemoryPresignatureStore) PresignatureStore {
+        return .{ .ptr = self, .vtable = &.{ .put = putFn, .take = takeFn } };
+    }
+
+    fn putFn(ptr: *anyopaque, presig_id: [32]u8, bytes: []const u8) anyerror!void {
+        const self: *MemoryPresignatureStore = @ptrCast(@alignCast(ptr));
+        if (self.map.contains(presig_id)) return error.DuplicateId;
+        const copy = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(copy);
+        try self.map.put(self.allocator, presig_id, copy);
+    }
+
+    fn takeFn(ptr: *anyopaque, presig_id: [32]u8, allocator: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *MemoryPresignatureStore = @ptrCast(@alignCast(ptr));
+        const kv = self.map.fetchRemove(presig_id) orelse return null;
+        defer {
+            std.crypto.secureZero(u8, kv.value);
+            self.allocator.free(kv.value);
+        }
+        return try allocator.dupe(u8, kv.value);
     }
 };
 
@@ -2036,6 +2282,68 @@ test "presign: §4.3 opening — a forged round-2 message or a false ν' in an o
             try testing.expectEqual(Abort{ .culprit = shares[0].index, .fault = c[1] }, a.abort);
         }
     }
+}
+
+test "presign: a pooled presignature survives encoding, is taken at most once, and signs" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x706f_6f6c);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 2);
+    defer kg.deinit(allocator);
+    var res = try runSession(allocator, kg.key_shares, random, .honest);
+    defer res.deinit(allocator);
+
+    // The codec round-trips, and refuses what it must.
+    const bytes = try res.presigs[1].toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+    {
+        var back = try Presignature.fromBytesAlloc(allocator, bytes);
+        defer back.deinit();
+        try testing.expectEqualSlices(u8, &res.presigs[1].id(), &back.id());
+        try testing.expect(back.k.equivalent(res.presigs[1].k) and back.sigma.equivalent(res.presigs[1].sigma));
+        const again = try back.toBytesAlloc(allocator);
+        defer allocator.free(again);
+        try testing.expectEqualSlices(u8, bytes, again);
+    }
+    const bad = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad);
+    bad[0] = 9; // version
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bytes[0 .. bytes.len - 1]));
+    @memcpy(bad, bytes);
+    bad[bad.len - 1] ^= 0x01; // a message seed that is not this signer's key
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+    @memcpy(bad, bytes);
+    const signers_at = 1 + 32 + 4 + Ne + 4;
+    std.mem.writeInt(u32, bad[signers_at..][0..4], std.mem.readInt(u32, bad[signers_at + 4 ..][0..4], .big), .big); // signers not ascending
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, bad));
+
+    // Pool: put moves it out (the in-memory original is wiped), take restores
+    // it once.
+    var mem = MemoryPresignatureStore.init(allocator);
+    defer mem.deinit();
+    const pool: PresignaturePool = .{ .store = mem.store() };
+    const presig_id = try pool.put(allocator, &res.presigs[1]);
+    res.presigs[1] = (try pool.take(allocator, presig_id)).?; // res.deinit frees it
+    try testing.expect((try pool.take(allocator, presig_id)) == null);
+
+    var abort: ?Abort = null;
+    const sig = try signAll(allocator, res.presigs, .{ .bytes = "from the pool" }, &abort);
+    const pk = try signing.ecdsa.PublicKey.fromSec1(&kg.key_shares[0].group_public_key.toBytes());
+    try sig.verify("from the pool", pk);
+    // A used presignature is not encoded (it no longer holds k_i, σ_i).
+    try testing.expectError(error.PresignatureUsed, res.presigs[1].toBytesAlloc(allocator));
+}
+
+test "fuzz: Presignature.fromBytesAlloc never panics" {
+    try testing.fuzz({}, fuzzPresigDecode, .{});
+}
+fn fuzzPresigDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1200]u8 = undefined;
+    const bytes = buf[0..smith.slice(&buf)];
+    var p = Presignature.fromBytesAlloc(testing.allocator, bytes) catch return;
+    p.deinit();
 }
 
 test "presign: a wrong signature share is named by combine; a missing or foreign one is refused" {
