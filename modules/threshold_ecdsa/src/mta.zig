@@ -127,7 +127,7 @@ pub const MtaError = paillier.EncryptError ||
 /// `n`). Every scalar value is `< q < n`, hence `< n_sq`. Loaded by position
 /// (`zkproofs.feFromSecretBytes`), not `Fe.fromBytes`, whose canonicality
 /// check branches on the value — the scalar is Bob's secret `b`.
-fn scalarToFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
+pub fn scalarToFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
     var bytes = s.toBytes(.big); // 32-byte big-endian, value < q
     defer std.crypto.secureZero(u8, &bytes);
     return zkproofs.feFromSecretBytes(pk.n_sq, paillier.Fe, &bytes);
@@ -290,7 +290,7 @@ fn finalizeLift(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey, centered
 /// nothing to read. An honest `β' < q⁵` is unaffected (`α' < 2q⁵ < N/2`).
 /// Constant time in `α'` (secret): both candidates are computed and the
 /// choice is a borrow-derived mask.
-fn centeredModQ(alpha: []const u8, n: []const u8) Scalar {
+pub fn centeredModQ(alpha: []const u8, n: []const u8) Scalar {
     std.debug.assert(alpha.len == n.len);
     // t = N − α' (no borrow: α' < N), then borrow(t − α') = [α' > t] = [2α' > N].
     var t_buf: [paillier.modulus_bytes]u8 = undefined;
@@ -311,6 +311,39 @@ fn centeredModQ(alpha: []const u8, n: []const u8) Scalar {
     var out = pos;
     out.fe.cMov(neg.fe, @truncate(montint.nt.blackBox(above_half)));
     return out;
+}
+
+/// A decryption with its proof: the plaintext `m` of `c` and the Paillier
+/// randomness `ρ` with `c = Γ^m·ρ^N mod N²` (`Γ = N+1`), so anyone can
+/// re-encrypt and compare. Alice's half of the GG20 §4.3 type-7 opening
+/// (`presign`). With `Γ = N+1`, `c ≡ ρ^N (mod N)`, so `ρ = c^(N⁻¹ mod λ) mod N`;
+/// `N⁻¹ mod λ` (λ even) and the power run on montint, constant-time in λ.
+pub const DecryptionWithRandomness = struct { m: paillier.Fe, rho: paillier.Fe };
+
+pub fn decryptWithRandomness(sk: paillier.SecretKey, pk: paillier.PublicKey, c: paillier.Ciphertext) (MtaError || error{InvalidKey})!DecryptionWithRandomness {
+    const m = try paillier.decrypt(sk, c);
+    const D = montint.DynModint(paillier.max_bits);
+    const n_len = sk.nByteLen();
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    sk.nToBytes(n_buf[0..n_len]) catch return error.InvalidKey;
+    const dn = D.fromBytesBE(n_buf[0..n_len]) catch return error.InvalidKey;
+    var lam_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &lam_buf);
+    sk.lambdaToBytes(&lam_buf) catch return error.InvalidKey;
+    var lam = D.loadBE(&lam_buf) catch return error.InvalidKey;
+    defer std.crypto.secureZero(u64, &lam);
+    var d: D.Elem = undefined;
+    defer std.crypto.secureZero(u64, &d);
+    if (!dn.inverseOfModulus(&lam, &d)) return error.InvalidKey; // N⁻¹ mod λ
+    var c_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    c.toBytes(&c_buf) catch return error.InvalidKey;
+    const base = dn.reduceBytesBE(&c_buf);
+    var rho = dn.pow(&base, &d);
+    defer std.crypto.secureZero(u64, &rho);
+    var rho_bytes: [paillier.modulus_bytes]u8 = undefined;
+    dn.toBytesBE(&rho, rho_bytes[0..n_len]);
+    const rho_fe = paillier.Fe.fromBytes(pk.n_sq, rho_bytes[0..n_len], .big) catch return error.InvalidKey;
+    return .{ .m = m, .rho = rho_fe };
 }
 
 /// `out = x − y` over equal-length big-endian byte strings; returns the
@@ -786,6 +819,21 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // Bob round 2 + his MtA proof (beta_prime = the q⁵-range blind
     // mtaBobResponseChecked folded into c_b).
     const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+    // Alice's decryption, with its proof: re-encrypting the plaintext under
+    // the recovered randomness gives c_B back byte for byte; a shifted
+    // plaintext does not.
+    {
+        const opened = try decryptWithRandomness(kp.secret, kp.public, bob.c_b);
+        const again = try paillier.encrypt(kp.public, opened.m, opened.rho);
+        var want: [paillier.modulus_sq_bytes]u8 = undefined;
+        var got: [paillier.modulus_sq_bytes]u8 = undefined;
+        try bob.c_b.toBytes(&want);
+        try again.toBytes(&got);
+        try testing.expectEqualSlices(u8, &want, &got);
+        const shifted = try paillier.encrypt(kp.public, scalarToFe(Scalar.one, kp.public), opened.rho);
+        try shifted.toBytes(&got);
+        try testing.expect(!std.mem.eql(u8, &want, &got));
+    }
     const beta_prime = &bob.beta_prime;
     const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer bob_proof.deinit(testing.allocator);

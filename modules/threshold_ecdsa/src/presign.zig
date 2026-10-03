@@ -41,8 +41,12 @@
 //! malformed, misaddressed, duplicate or missing message, and in Phase 7 a
 //! signature share failing `s_j·R == m·R̄_j + r·S_j` (type 8). Types 5 and 7
 //! (`Σ R̄_j ≠ G`, `Σ S_j ≠ X` with every proof valid) abort with
-//! `culprit == null`: naming the party there needs the paper's §4.3 opening
-//! protocol, which is not implemented (SPEC.md backlog).
+//! `culprit == null` and keep the session's nonce material: the paper's §4.3
+//! opening names the party — every signer calls `openAbort` (its opening, a
+//! signed broadcast) and `identify` on everyone's openings, which returns the
+//! culprit and wipes the secrets. What is opened never includes the key
+//! share (type 7 opens the `k_i·w_j` masks and proves `S_i = σ_i·R` by DLEQ
+//! against a `σ_i·G` everyone recomputes, instead of revealing `σ_i`).
 //!
 //! ## Signed messages and broadcast consistency (in the protocol, not assumed)
 //!
@@ -121,8 +125,12 @@ pub const message_domain = "threshold_ecdsa/presign/message/v2";
 /// Rounds whose messages attest the previous round's broadcasts: every round
 /// that follows a broadcast round (1, 3, 4, 5, 6), Phase 7 included.
 pub fn hasAttestation(round: u8) bool {
-    return round == 2 or round >= 4;
+    return round == 2 or (round >= 4 and round <= sign_round);
 }
+
+/// The §4.3 opening round: after a type-5 or type-7 abort every signer
+/// broadcasts what it must reveal (`Party.openAbort`).
+pub const open_round: u8 = 8;
 
 /// `SHA-256(body)` and the sender's signature over `signedBytes(header, that
 /// hash)`. Self-contained evidence: with the header rebuilt from (session,
@@ -237,11 +245,13 @@ pub const Fault = enum {
     gamma_proof,
     /// Phase 5: proof that `R̄_j` matches `c_j` (type 4).
     pdl_proof,
-    /// Phase 5: `Σ R̄_j ≠ G` with every proof valid (type 5, unattributed).
+    /// Phase 5: `Σ R̄_j ≠ G` with every proof valid (type 5; unattributed
+    /// until the §4.3 opening, see `Party.openAbort`).
     r_bar_sum,
     /// Phase 6: proof that `S_j` and `T_j` share `σ_j` (type 6).
     st_proof,
-    /// Phase 6: `Σ S_j ≠ X` with every proof valid (type 7, unattributed).
+    /// Phase 6: `Σ S_j ≠ X` with every proof valid (type 7; unattributed
+    /// until the §4.3 opening).
     s_sum,
     /// Phase 7: `s_j·R ≠ m·R̄_j + r·S_j` (type 8).
     sig_share,
@@ -260,8 +270,8 @@ pub const Fault = enum {
 };
 
 pub const Abort = struct {
-    /// The party the fault is attributed to, or null (types 5 and 7, and
-    /// `degenerate`).
+    /// The party the fault is attributed to, or null (types 5 and 7 before
+    /// the §4.3 opening, and `degenerate`).
     culprit: ?u32,
     fault: Fault,
 };
@@ -293,7 +303,20 @@ pub const Outbox = struct {
     }
 };
 
-const State = enum { round1, round2, round3, round4, round5, round6, finish, done, aborted };
+const State = enum { round1, round2, round3, round4, round5, round6, finish, done, aborted, opening, identify };
+
+/// What one signer keeps per peer for the GG20 §4.3 opening, until the
+/// presignature is finished (or the opening is done).
+const PeerOpen = struct {
+    /// The signed round-2 message this signer (as Alice) got from the peer.
+    round2: ?[]u8 = null,
+    /// SECRET until opened: this signer's (as Bob) mask `β'` and Paillier
+    /// randomness in the `k_j·γ_i` response it sent the peer.
+    gamma_beta_prime: [zkproofs.beta_prime_bytes]u8 = @splat(0),
+    gamma_r: paillier.Fe = undefined,
+    /// SECRET until opened: its mask `ν'` in the `k_j·w_i` response.
+    w_beta_prime: [zkproofs.beta_prime_bytes]u8 = @splat(0),
+};
 
 /// `sid || u32 index`: the context every proof of `index` is bound to.
 fn proofContext(sid: SessionId, index: u32) [36]u8 {
@@ -415,6 +438,10 @@ pub const Party = struct {
     last_bc: []Attestation,
     /// Attestation of this party's own broadcast of the current round.
     own_bc: Attestation = undefined,
+    /// Per position: what the §4.3 opening needs (see `PeerOpen`).
+    open: []PeerOpen,
+    /// This party's own opening message, once sent.
+    own_open: ?[]u8 = null,
     /// Set when a call returns `error.ProtocolAbort`.
     abort: ?Abort = null,
 
@@ -484,6 +511,9 @@ pub const Party = struct {
         }
         const ssid = h.finalResult();
         const last_bc = try allocator.alloc(Attestation, sorted.len);
+        errdefer allocator.free(last_bc);
+        const open = try allocator.alloc(PeerOpen, sorted.len);
+        @memset(open, .{});
         return .{
             .allocator = allocator,
             .share = share,
@@ -493,6 +523,7 @@ pub const Party = struct {
             .peers = peers,
             .message_kp = message_kp,
             .last_bc = last_bc,
+            .open = open,
         };
     }
 
@@ -505,6 +536,8 @@ pub const Party = struct {
         self.allocator.free(self.peers);
         self.allocator.free(self.signers);
         self.allocator.free(self.last_bc);
+        self.allocator.free(self.open);
+        if (self.own_open) |m| self.allocator.free(m);
         self.* = undefined;
     }
 
@@ -514,12 +547,25 @@ pub const Party = struct {
 
     fn wipe(self: *Party) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.secrets));
+        for (self.open) |*o| {
+            if (o.round2) |m| self.allocator.free(m);
+            std.crypto.secureZero(u8, std.mem.asBytes(o));
+            o.* = .{};
+        }
     }
 
     fn fail(self: *Party, culprit: ?u32, fault: Fault) error{ProtocolAbort} {
         self.abort = .{ .culprit = culprit, .fault = fault };
         self.state = .aborted;
         self.wipe();
+        return error.ProtocolAbort;
+    }
+
+    /// A type-5 or type-7 abort: unattributed for now, and the secrets the
+    /// §4.3 opening reveals are kept (`openAbort`, `identify`).
+    fn failOpen(self: *Party, fault: Fault) error{ProtocolAbort} {
+        self.abort = .{ .culprit = null, .fault = fault };
+        self.state = .opening;
         return error.ProtocolAbort;
     }
 
@@ -545,11 +591,13 @@ pub const Party = struct {
             .round4 => self.round4(inbox, random),
             .round5 => self.round5(inbox, random),
             .round6 => self.round6(inbox, random),
-            .finish, .done, .aborted => return error.InvalidState,
+            .finish, .done, .aborted, .opening, .identify => return error.InvalidState,
         };
         return result catch |e| {
-            self.state = .aborted;
-            self.wipe();
+            if (self.state != .opening) {
+                self.state = .aborted;
+                self.wipe();
+            }
             return e;
         };
     }
@@ -773,6 +821,10 @@ pub const Party = struct {
 
             self.secrets.delta = self.secrets.delta.add(g.beta);
             self.secrets.sigma = self.secrets.sigma.add(x.beta);
+            // Kept for a §4.3 opening (wiped with the other secrets).
+            self.open[pos].gamma_beta_prime = g.beta_prime;
+            self.open[pos].gamma_r = g.r_b;
+            self.open[pos].w_beta_prime = x.beta_prime;
 
             try appendLenPrefixed(&payload, self.allocator, &ciphertextBytes(g.c_b));
             const gp = g_proof.toBytesAlloc(self.allocator) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else unreachable;
@@ -796,6 +848,14 @@ pub const Party = struct {
 
     fn round3Inner(self: *Party, inbox: []const []const u8, slots: Slots, random: std.Random) Error!Outbox {
         try self.collect(inbox, 2, false, true, slots);
+        // The signed round-2 messages, for a §4.3 opening (`collect` checked
+        // that each peer sent exactly one).
+        for (inbox) |raw| {
+            const h = peekHeader(raw) catch unreachable;
+            if (h.from == self.myIndex() or h.to == null) continue;
+            const pos = std.mem.indexOfScalar(u32, self.signers, h.from).?;
+            if (self.open[pos].round2 == null) self.open[pos].round2 = try self.allocator.dupe(u8, raw);
+        }
         const me = &self.peers[self.me];
         const sk = self.share.paillier_secret;
 
@@ -966,7 +1026,7 @@ pub const Party = struct {
         }
         var r_bar_sum = Secp256k1.identityElement;
         for (self.peers) |p| r_bar_sum = r_bar_sum.add(p.r_bar.point() catch unreachable);
-        if (!r_bar_sum.equivalent(Secp256k1.basePoint)) return self.fail(null, .r_bar_sum);
+        if (!r_bar_sum.equivalent(Secp256k1.basePoint)) return self.failOpen(.r_bar_sum);
 
         const r_pt = self.r_point.point() catch unreachable;
         const s_pt = r_pt.mul(self.secrets.sigma.toBytes(.big), .big) catch return self.fail(null, .degenerate);
@@ -992,8 +1052,10 @@ pub const Party = struct {
     pub fn finish(self: *Party, inbox: []const []const u8) Error!Presignature {
         if (self.state != .finish) return error.InvalidState;
         return self.finishInner(inbox) catch |e| {
-            self.state = .aborted;
-            self.wipe();
+            if (self.state != .opening) {
+                self.state = .aborted;
+                self.wipe();
+            }
             return e;
         };
     }
@@ -1018,7 +1080,7 @@ pub const Party = struct {
         }
         var s_sum = Secp256k1.identityElement;
         for (self.peers) |p| s_sum = s_sum.add(p.s_point.point() catch unreachable);
-        if (!s_sum.equivalent(self.share.group_public_key.point() catch unreachable)) return self.fail(null, .s_sum);
+        if (!s_sum.equivalent(self.share.group_public_key.point() catch unreachable)) return self.failOpen(.s_sum);
 
         const signers = try self.allocator.dupe(u32, self.signers);
         errdefer self.allocator.free(signers);
@@ -1056,7 +1118,308 @@ pub const Party = struct {
         self.state = .done;
         return presig;
     }
+
+    // ── §4.3 identification of type-5 and type-7 aborts ─────────────────
+
+    /// After `advance`/`finish` aborted with `r_bar_sum` (type 5) or `s_sum`
+    /// (type 7) and `culprit == null`: this signer's opening, a broadcast
+    /// for every other signer (GG20 §4.3). The session is dead, so its
+    /// nonce material may be revealed; nothing that leaks the key share is.
+    ///
+    /// - Type 5: `k_i` and the randomness of `c_i`, `γ_i`, every signed
+    ///   round-2 message this signer received, and per peer its own mask
+    ///   `β'` and randomness in the `k_j·γ_i` response. Anyone recomputes
+    ///   every `δ_j` and names the signer whose broadcast `δ_j` differs, or
+    ///   whose opening does not match its earlier messages.
+    /// - Type 7: `k_i` and the randomness of `c_i`, every signed round-2
+    ///   message received with the decryption `μ'` of its `k_i·w_j` part
+    ///   and that ciphertext's randomness (a proof of the decryption), per
+    ///   peer its own mask `ν'`, and a DLEQ proof that `S_i = σ_i·R` for the
+    ///   `σ_i·G` everyone computes from the opened values (`σ_i` itself
+    ///   would reveal `w_i`).
+    ///
+    /// Then hand every peer's opening to `identify`.
+    pub fn openAbort(self: *Party, random: std.Random) Error!Outbox {
+        if (self.state != .opening) return error.InvalidState;
+        const fault = self.abort.?.fault;
+        const me = self.peers[self.me];
+        var payload: std.ArrayList(u8) = .empty;
+        defer {
+            std.crypto.secureZero(u8, payload.items);
+            payload.deinit(self.allocator);
+        }
+        try payload.append(self.allocator, if (fault == .r_bar_sum) 5 else 7);
+        try payload.appendSlice(self.allocator, &self.secrets.k.toBytes(.big));
+        var fe_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+        self.secrets.r_k.toBytes(&fe_buf, .big) catch unreachable;
+        try appendLenPrefixed(&payload, self.allocator, &fe_buf);
+        if (fault == .r_bar_sum) {
+            try payload.appendSlice(self.allocator, &self.secrets.gamma.toBytes(.big));
+            for (self.open, 0..) |o, pos| {
+                if (pos == self.me) continue;
+                try appendLenPrefixed(&payload, self.allocator, o.round2.?);
+                try payload.appendSlice(self.allocator, &o.gamma_beta_prime);
+                o.gamma_r.toBytes(&fe_buf, .big) catch unreachable;
+                try appendLenPrefixed(&payload, self.allocator, &fe_buf);
+            }
+        } else {
+            const sk = self.share.paillier_secret;
+            const n_len = me.pk.nByteLen();
+            for (self.open, 0..) |o, pos| {
+                if (pos == self.me) continue;
+                try appendLenPrefixed(&payload, self.allocator, o.round2.?);
+                const fields = round2Fields(o.round2.?, self.peers.len) orelse unreachable; // checked in round 3
+                const c_w = paillier.Ciphertext.fromBytes(me.pk, fields[2]) catch unreachable;
+                const opened = mta.decryptWithRandomness(sk, me.pk, c_w) catch return error.InvalidParameters;
+                var m_buf: [paillier.modulus_bytes]u8 = undefined;
+                opened.m.toBytes(m_buf[0..n_len], .big) catch unreachable;
+                try appendLenPrefixed(&payload, self.allocator, m_buf[0..n_len]);
+                opened.rho.toBytes(&fe_buf, .big) catch unreachable;
+                try appendLenPrefixed(&payload, self.allocator, &fe_buf);
+                try payload.appendSlice(self.allocator, &o.w_beta_prime);
+            }
+            const sigma_pt = Secp256k1.basePoint.mul(self.secrets.sigma.toBytes(.big), .big) catch return error.InvalidParameters;
+            const sigma_el = Element.fromPoint(sigma_pt) catch return error.InvalidParameters;
+            const proof = ecproofs.proveDleq(self.secrets.sigma, self.r_point, me.s_point, sigma_el, &self.myCtx(), random) catch unreachable;
+            try payload.appendSlice(self.allocator, &proof.toBytes());
+        }
+        var out: OutboxBuilder = .{ .allocator = self.allocator };
+        errdefer out.deinit();
+        try out.add(self, open_round, null, payload.items);
+        self.own_open = try self.allocator.dupe(u8, out.list.items[0].bytes);
+        self.state = .identify;
+        return out.finish();
+    }
+
+    /// Checks every signer's opening (the inbox: one `openAbort` broadcast
+    /// from every peer) and names the culprit: the first signer, in signer
+    /// order of the checks below, whose opening contradicts its earlier
+    /// signed messages or the values it broadcast. Returns the verdict (also
+    /// in `abort`); the party is done afterwards, its secrets wiped. A peer
+    /// whose opening is missing, unsigned or malformed is the culprit.
+    pub fn identify(self: *Party, inbox: []const []const u8) Error!Abort {
+        if (self.state != .identify) return error.InvalidState;
+        const fault = self.abort.?.fault;
+        const verdict = self.identifyInner(inbox, fault) catch |e| switch (e) {
+            error.ProtocolAbort => self.abort.?, // from `collect`: missing, unsigned, malformed
+            else => {
+                self.state = .aborted;
+                self.wipe();
+                return e;
+            },
+        };
+        self.abort = verdict;
+        self.state = .aborted;
+        self.wipe();
+        return verdict;
+    }
+
+    fn identifyInner(self: *Party, inbox: []const []const u8, fault: Fault) Error!Abort {
+        const n = self.peers.len;
+        const bc = try self.allocator.alloc(?[]const u8, n);
+        defer self.allocator.free(bc);
+        const p2p = try self.allocator.alloc(?[]const u8, n);
+        defer self.allocator.free(p2p);
+        try self.collect(inbox, open_round, true, false, .{ .broadcast = bc, .p2p = p2p });
+        const own = self.own_open.?;
+        bc[self.me] = own[header_length .. own.len - signature_length];
+
+        const openings = try self.allocator.alloc(Opening, n);
+        defer self.allocator.free(openings);
+        const sections = try self.allocator.alloc(OpenSection, n * n);
+        defer self.allocator.free(sections);
+        for (openings, bc, 0..) |*o, body, i| {
+            o.* = parseOpening(body.?, fault, i, sections[i * n ..][0..n]) orelse
+                return .{ .culprit = self.signers[i], .fault = fault };
+        }
+        const culprit = if (fault == .r_bar_sum)
+            try self.identifyType5(openings, sections)
+        else
+            try self.identifyType7(openings, sections);
+        return .{ .culprit = culprit, .fault = fault };
+    }
+
+    /// The round-2 message `a` (Alice) received from `b`, as `a` opened it:
+    /// signed by `b`, addressed to `a`, this session. Its four fields, or
+    /// null (then `a` forged or mangled it — `a` is named).
+    fn openedRound2(self: *const Party, sec: OpenSection, a: usize, b: usize) ?[4][]const u8 {
+        const msg = sec.round2;
+        const h = peekHeader(msg) catch return null;
+        if (h.round != 2 or h.from != self.signers[b] or h.to != self.signers[a] or !std.mem.eql(u8, &h.sid, &self.sid)) return null;
+        if (msg.len < header_length + signature_length) return null;
+        var att: Attestation = .{ .body_hash = undefined, .signature = msg[msg.len - signature_length ..][0..signature_length].* };
+        Sha256.hash(msg[header_length .. msg.len - signature_length], &att.body_hash, .{});
+        if (!verifyAttestation(self.peers[b].message_key, msg[0..header_length].*, att)) return null;
+        return round2Fields(msg, self.peers.len);
+    }
+
+    fn checkNonce(self: *const Party, o: Opening, i: usize) bool {
+        const pk = self.peers[i].pk;
+        const r_k = paillier.Fe.fromBytes(pk.n_sq, o.r_k, .big) catch return false;
+        const c = paillier.encrypt(pk, mta.scalarToFe(o.k, pk), r_k) catch return false;
+        return std.mem.eql(u8, &ciphertextBytes(c), &ciphertextBytes(self.peers[i].c_k));
+    }
+
+    fn identifyType5(self: *const Party, openings: []const Opening, sections: []const OpenSection) Error!?u32 {
+        const n = self.peers.len;
+        for (openings, self.peers, 0..) |o, p, i| {
+            if (!self.checkNonce(o, i)) return p.index;
+            const g_pt = Secp256k1.basePoint.mul(o.gamma.toBytes(.big), .big) catch return p.index;
+            if (!g_pt.equivalent(p.big_gamma.point() catch unreachable)) return p.index;
+        }
+        // α_ab = k_a·γ_b + β'_ba for every Alice a, Bob b — once b's opened
+        // β' and randomness rebuild the c_γ that b signed and a opened.
+        for (0..n) |a| for (0..n) |b| {
+            if (a == b) continue;
+            const fields = self.openedRound2(sections[a * n + b], a, b) orelse return self.signers[a];
+            const pk = self.peers[a].pk;
+            const bob = sections[b * n + a];
+            const r = paillier.Fe.fromBytes(pk.n_sq, bob.rand, .big) catch return self.signers[b];
+            const beta_fe = zkproofs.feFromSecretBytes(pk.n_sq, paillier.Fe, bob.mask);
+            const scaled = paillier.mulPlaintext(pk, self.peers[a].c_k, mta.scalarToFe(openings[b].gamma, pk)) catch return self.signers[b];
+            const masked = paillier.encrypt(pk, beta_fe, r) catch return self.signers[b];
+            const want = paillier.addCiphertexts(pk, scaled, masked);
+            if (!std.mem.eql(u8, fields[0], &ciphertextBytes(want))) return self.signers[b];
+        };
+        for (openings, self.peers, 0..) |o, p, a| {
+            var delta = o.k.mul(o.gamma);
+            for (0..n) |b| {
+                if (a == b) continue;
+                // As Alice: α_ab; as Bob: −β'_ab.
+                delta = delta.add(o.k.mul(openings[b].gamma)).add(zkproofs.scalarFromWide(sections[b * n + a].mask));
+                delta = delta.sub(zkproofs.scalarFromWide(sections[a * n + b].mask));
+            }
+            if (!delta.equivalent(p.delta)) return p.index;
+            const r_pt = self.r_point.point() catch unreachable;
+            const r_bar = r_pt.mul(o.k.toBytes(.big), .big) catch return p.index;
+            if (!r_bar.equivalent(p.r_bar.point() catch unreachable)) return p.index;
+        }
+        return null;
+    }
+
+    fn identifyType7(self: *const Party, openings: []const Opening, sections: []const OpenSection) Error!?u32 {
+        const n = self.peers.len;
+        for (openings, self.peers, 0..) |o, p, i| if (!self.checkNonce(o, i)) return p.index;
+        const mu = try self.allocator.alloc(Scalar, n * n);
+        defer self.allocator.free(mu);
+        for (0..n) |a| for (0..n) |b| {
+            if (a == b) continue;
+            const fields = self.openedRound2(sections[a * n + b], a, b) orelse return self.signers[a];
+            const pk = self.peers[a].pk;
+            const alice = sections[a * n + b];
+            // a's decryption of c_w, with its randomness: re-encrypt and compare.
+            const m_fe = paillier.Fe.fromBytes(pk.n_sq, alice.plain, .big) catch return self.signers[a];
+            const rho = paillier.Fe.fromBytes(pk.n_sq, alice.rand, .big) catch return self.signers[a];
+            const again = paillier.encrypt(pk, m_fe, rho) catch return self.signers[a];
+            if (!std.mem.eql(u8, fields[2], &ciphertextBytes(again))) return self.signers[a];
+            var n_buf: [paillier.modulus_bytes]u8 = undefined;
+            const n_len = pk.nByteLen();
+            pk.nToBytes(n_buf[0..n_len]) catch unreachable;
+            if (alice.plain.len != n_len) return self.signers[a];
+            mu[a * n + b] = mta.centeredModQ(alice.plain, n_buf[0..n_len]);
+            // b's mask: μ_ab·G = k_a·W_b + ν'_ba·G.
+            const nu = zkproofs.scalarFromWide(sections[b * n + a].mask);
+            const lhs = pointMulPublic(mu[a * n + b]);
+            const wb = self.peers[b].w_point.point() catch unreachable;
+            const ka_wb = wb.mulPublic(openings[a].k.toBytes(.big), .big) catch Secp256k1.identityElement;
+            const rhs = ka_wb.add(pointMulPublic(nu));
+            if (!lhs.equivalent(rhs)) return self.signers[b];
+        };
+        for (openings, self.peers, 0..) |o, p, i| {
+            // σ_i·G = k_i·W_i + Σ_b μ_ib·G − Σ_b ν'_ib·G.
+            var scalar_part = Scalar.zero;
+            for (0..n) |b| {
+                if (b == i) continue;
+                scalar_part = scalar_part.add(mu[i * n + b]).sub(zkproofs.scalarFromWide(sections[i * n + b].mask));
+            }
+            const wi = p.w_point.point() catch unreachable;
+            const ki_wi = wi.mulPublic(o.k.toBytes(.big), .big) catch Secp256k1.identityElement;
+            const sigma_pt = ki_wi.add(pointMulPublic(scalar_part));
+            const sigma_el = Element.fromPoint(sigma_pt) catch return p.index;
+            const ctx = proofContext(self.sid, p.index);
+            if (!ecproofs.verifyDleq(o.dleq.?, self.r_point, p.s_point, sigma_el, &ctx)) return p.index;
+        }
+        return null;
+    }
 };
+
+/// `s·G` for a public scalar (the identity for `s = 0`).
+fn pointMulPublic(s: Scalar) Secp256k1 {
+    return Secp256k1.basePoint.mulPublic(s.toBytes(.big), .big) catch Secp256k1.identityElement;
+}
+
+/// The four length-prefixed fields of a round-2 payload (`c_γ`, its proof,
+/// `c_w`, its proof), from the full signed message; null when malformed.
+fn round2Fields(msg: []const u8, signers: usize) ?[4][]const u8 {
+    const at = header_length + signers * attestation_entry_length;
+    if (msg.len < at + signature_length) return null;
+    const payload = msg[at .. msg.len - signature_length];
+    var off: usize = 0;
+    var out: [4][]const u8 = undefined;
+    for (&out) |*f| f.* = readLenPrefixed(payload, &off) orelse return null;
+    if (off != payload.len) return null;
+    return out;
+}
+
+/// One signer's opening, parsed (slices into the message).
+const Opening = struct {
+    k: Scalar,
+    r_k: []const u8,
+    /// Type 5 only.
+    gamma: Scalar = Scalar.zero,
+    /// Type 7 only.
+    dleq: ?ecproofs.DleqProof = null,
+};
+
+/// The opener's section for one peer (by the peer's position).
+const OpenSection = struct {
+    round2: []const u8 = &.{},
+    /// The opener's own mask as Bob for that peer (`β'` in type 5, `ν'` in 7).
+    mask: []const u8 = &.{},
+    /// Type 5: the opener's Bob randomness; type 7: the randomness of its
+    /// decryption (as Alice).
+    rand: []const u8 = &.{},
+    /// Type 7: the opener's decryption of the peer's `c_w`.
+    plain: []const u8 = &.{},
+};
+
+fn parseOpening(body: []const u8, fault: Fault, me: usize, sections: []OpenSection) ?Opening {
+    const kind: u8 = if (fault == .r_bar_sum) 5 else 7;
+    if (body.len < 1 + Ns or body[0] != kind) return null;
+    var off: usize = 1;
+    var o: Opening = .{ .k = decodeScalar(body[off..][0..Ns].*) orelse return null, .r_k = undefined };
+    off += Ns;
+    o.r_k = readLenPrefixed(body, &off) orelse return null;
+    if (kind == 5) {
+        if (body.len - off < Ns) return null;
+        o.gamma = decodeScalar(body[off..][0..Ns].*) orelse return null;
+        off += Ns;
+    }
+    for (sections, 0..) |*sec, pos| {
+        sec.* = .{};
+        if (pos == me) continue;
+        sec.round2 = readLenPrefixed(body, &off) orelse return null;
+        if (kind == 5) {
+            if (body.len - off < zkproofs.beta_prime_bytes) return null;
+            sec.mask = body[off..][0..zkproofs.beta_prime_bytes];
+            off += zkproofs.beta_prime_bytes;
+            sec.rand = readLenPrefixed(body, &off) orelse return null;
+        } else {
+            sec.plain = readLenPrefixed(body, &off) orelse return null;
+            sec.rand = readLenPrefixed(body, &off) orelse return null;
+            if (body.len - off < zkproofs.beta_prime_bytes) return null;
+            sec.mask = body[off..][0..zkproofs.beta_prime_bytes];
+            off += zkproofs.beta_prime_bytes;
+        }
+    }
+    if (kind == 7) {
+        if (body.len - off != ecproofs.DleqProof.encoded_length) return null;
+        o.dleq = ecproofs.DleqProof.fromBytes(body[off..][0..ecproofs.DleqProof.encoded_length].*) catch return null;
+        off += ecproofs.DleqProof.encoded_length;
+    }
+    if (off != body.len) return null;
+    return o;
+}
 
 /// The message to sign: raw bytes (hashed with SHA-256, as
 /// `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` does) or a 32-byte digest
@@ -1259,6 +1622,13 @@ const Case = enum {
     equivocate,
     bad_signature,
     false_echo,
+    /// `delta_shift`, and signer 0 lies in its §4.3 opening (a wrong γ).
+    open_lie,
+    /// `delta_shift`; signer 0's opening carries a round-2 message the
+    /// sender never signed.
+    open_lie_round2,
+    /// `sigma_shift`; signer 0 opens a wrong `ν'` for signer 1.
+    open_lie_nu,
 };
 
 const Observed = struct { observer: u32, abort: Abort };
@@ -1342,13 +1712,15 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         var next: [8]?Outbox = @splat(null);
         errdefer for (next) |b| if (b) |o| o.deinit(allocator);
         for (0..t) |i| {
-            if (case == .sigma_shift and round == 3 and i == cheat_pos)
+            if ((case == .sigma_shift or case == .open_lie_nu) and round == 3 and i == cheat_pos)
                 parties[i].secrets.sigma = parties[i].secrets.sigma.add(Scalar.one);
             next[i] = parties[i].advance(inboxes[i].items, random) catch |e| switch (e) {
                 error.ProtocolAbort => blk: {
                     try aborts.append(allocator, .{ .observer = parties[i].myIndex(), .abort = parties[i].abort.? });
-                    // An abort wipes the secrets.
-                    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&parties[i].secrets), 0));
+                    // An abort wipes the secrets — except one that awaits the
+                    // §4.3 opening (wiped by `identify`, checked there).
+                    if (parties[i].state != .opening)
+                        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&parties[i].secrets), 0));
                     break :blk null;
                 },
                 else => return e,
@@ -1356,7 +1728,10 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         }
         for (boxes) |b| if (b) |o| o.deinit(allocator);
         boxes = next;
-        if (aborts.items.len != 0) return .{ .presigs = try allocator.alloc(Presignature, 0), .aborts = try aborts.toOwnedSlice(allocator) };
+        if (aborts.items.len != 0) {
+            try openIfTypes5or7(allocator, parties[0..t], &aborts, random, case);
+            return .{ .presigs = try allocator.alloc(Presignature, 0), .aborts = try aborts.toOwnedSlice(allocator) };
+        }
 
         // The cheater's deviation, on its outgoing bytes — re-signed, as a
         // malicious signer holding its own key would (except `bad_signature`).
@@ -1367,7 +1742,7 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                 .range_proof => if (r == 1 and m.to != null) flipLast(m.bytes),
                 .mta_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, false, t),
                 .mtawc_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, true, t),
-                .delta_shift => if (r == 3) {
+                .delta_shift, .open_lie, .open_lie_round2 => if (r == 3) {
                     const me = &parties[cheat_pos].peers[parties[cheat_pos].me];
                     me.delta = me.delta.add(Scalar.one);
                     m.bytes[at..][0..Ns].* = me.delta.toBytes(.big);
@@ -1461,9 +1836,46 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
     if (aborts.items.len != 0) {
         for (presigs, ok[0..t]) |*p, made| if (made) p.deinit();
         allocator.free(presigs);
+        try openIfTypes5or7(allocator, parties[0..t], &aborts, random, case);
         return .{ .presigs = try allocator.alloc(Presignature, 0), .aborts = try aborts.toOwnedSlice(allocator) };
     }
     return .{ .presigs = presigs, .aborts = try aborts.toOwnedSlice(allocator) };
+}
+
+/// When every party aborted with an unattributed type 5 or 7, runs the §4.3
+/// opening among them and replaces each abort by that party's verdict.
+fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.ArrayList(Observed), random: std.Random, case: Case) !void {
+    if (aborts.items.len != parties.len) return;
+    for (aborts.items) |a| {
+        if (a.abort.culprit != null or (a.abort.fault != .r_bar_sum and a.abort.fault != .s_sum)) return;
+    }
+    var openings: [8]Outbox = undefined;
+    for (parties, 0..) |*p, i| openings[i] = try p.openAbort(random);
+    defer for (openings[0..parties.len]) |o| o.deinit(allocator);
+    if (case == .open_lie or case == .open_lie_round2 or case == .open_lie_nu) {
+        // Signer 0 lies in its opening, and signs the lie.
+        const m = openings[0].messages[0].bytes;
+        const body = m[header_length .. m.len - signature_length];
+        var sections: [8]OpenSection = undefined;
+        _ = parseOpening(body, parties[0].abort.?.fault, 0, sections[0..parties.len]).?;
+        const at = switch (case) {
+            .open_lie => header_length + 1 + Ns + 4 + paillier.modulus_sq_bytes + Ns - 1, // γ
+            .open_lie_round2 => @intFromPtr(sections[1].round2.ptr) - @intFromPtr(m.ptr) + header_length + 10,
+            else => @intFromPtr(sections[1].mask.ptr) - @intFromPtr(m.ptr) + 7,
+        };
+        m[at] ^= 0x01;
+        resign(&parties[0], m, false);
+    }
+    for (parties, aborts.items) |*p, *a| {
+        var inbox: [8][]const u8 = undefined;
+        var k: usize = 0;
+        for (openings[0..parties.len]) |o| {
+            inbox[k] = o.messages[0].bytes;
+            k += 1;
+        }
+        a.abort = try p.identify(inbox[0..k]);
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.secrets), 0));
+    }
 }
 
 fn expectLowS(sig: signing.Signature) !void {
@@ -1554,9 +1966,9 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
         // attester is named, not the signer it misquotes.
         .{ .case = .false_echo, .fault = .equivocation, .attributed = true },
         // Types 5 and 7: consistent lies every proof accepts; caught by the
-        // sums, not attributable without the §4.3 opening protocol.
-        .{ .case = .delta_shift, .fault = .r_bar_sum, .attributed = false },
-        .{ .case = .sigma_shift, .fault = .s_sum, .attributed = false },
+        // sums, then named by the §4.3 opening (`openAbort`, `identify`).
+        .{ .case = .delta_shift, .fault = .r_bar_sum, .attributed = true },
+        .{ .case = .sigma_shift, .fault = .s_sum, .attributed = true },
     };
     for (cases) |c| {
         var res = try runSession(allocator, &shares, random, c.case);
@@ -1573,6 +1985,9 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
                 // attestations show it: then it names itself.
                 if (c.case == .equivocate) {
                     try testing.expectEqual(Abort{ .culprit = cheat, .fault = .equivocation }, a.abort);
+                } else if (c.case == .delta_shift or c.case == .sigma_shift) {
+                    // It opens too, and its own opening convicts it.
+                    try testing.expectEqual(Abort{ .culprit = cheat, .fault = c.fault }, a.abort);
                 } else try testing.expect(!c.attributed);
                 continue;
             }
@@ -1581,6 +1996,45 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
             try testing.expectEqual(if (c.attributed) @as(?u32, cheat) else null, a.abort.culprit);
         }
         try testing.expectEqual(shares.len - 1, honest_aborts);
+    }
+}
+
+test "presign: §4.3 opening — a signer lying in its opening is named by everyone who received the lie" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6f70_656e_6c69_65);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    const shares = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1], kg.key_shares[2] };
+    var res = try runSession(allocator, &shares, random, .open_lie);
+    defer res.deinit(allocator);
+    try testing.expectEqual(shares.len, res.aborts.len);
+    for (res.aborts) |a| {
+        // Signer 0 checks its own opening as it made it (true γ) and so
+        // names the δ cheater; everyone else saw the false γ and names it.
+        const want = if (a.observer == shares[0].index) shares[1].index else shares[0].index;
+        try testing.expectEqual(Abort{ .culprit = want, .fault = .r_bar_sum }, a.abort);
+    }
+}
+
+test "presign: §4.3 opening — a forged round-2 message or a false ν' in an opening names the opener" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6f70_656e_6c69_6532);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    const shares = [_]root.KeyShare{ kg.key_shares[0], kg.key_shares[1], kg.key_shares[2] };
+    for ([_]struct { Case, Fault }{ .{ .open_lie_round2, .r_bar_sum }, .{ .open_lie_nu, .s_sum } }) |c| {
+        var res = try runSession(allocator, &shares, random, c[0]);
+        defer res.deinit(allocator);
+        errdefer std.debug.print("case {s}: {any}\n", .{ @tagName(c[0]), res.aborts });
+        try testing.expectEqual(shares.len, res.aborts.len);
+        for (res.aborts) |a| {
+            if (a.observer == shares[0].index) continue; // it checks its own honest version
+            try testing.expectEqual(Abort{ .culprit = shares[0].index, .fault = c[1] }, a.abort);
+        }
     }
 }
 

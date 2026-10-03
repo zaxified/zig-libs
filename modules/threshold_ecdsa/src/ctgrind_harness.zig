@@ -486,6 +486,33 @@ fn runAuxgen(allocator: std.mem.Allocator, tainted: bool) !void {
     std.debug.print("h1={x}\n", .{hb});
 }
 
+// ── target "open7": Alice's decryption proof in a §4.3 type-7 opening ───
+//
+// `mta.decryptWithRandomness` under tss-lib's 2048-bit Paillier key with λ
+// tainted: ρ = c^(N⁻¹ mod λ) mod N, the inverse modulo the secret even λ by
+// montint's inverseOfModulus and the power by its constant-time ladder.
+// (The plaintext half is `paillier.decrypt`, measured with the presign rows.)
+fn runOpen7(tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    const pp = vectors.tsslib_keygen.parties[0];
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, pp.paillier_p);
+    _ = try std.fmt.hexToBytes(&q, pp.paillier_q);
+    var kp = try paillier.fromPrimes(&p, &q);
+    var m_buf = [_]u8{0} ** 32;
+    m_buf[31] = 0x2a;
+    var r_buf = [_]u8{0} ** 32;
+    r_buf[31] = 0x07;
+    const c = try paillier.encrypt(kp.public, try paillier.Fe.fromBytes(kp.public.n_sq, &m_buf, .big), try paillier.Fe.fromBytes(kp.public.n_sq, &r_buf, .big));
+    if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.secret.lambda.v.limbs_buffer));
+    std.mem.doNotOptimizeAway(&kp);
+    const opened = try root.mta.decryptWithRandomness(kp.secret, kp.public, c);
+    var rb: [paillier.modulus_sq_bytes]u8 = undefined;
+    try opened.rho.toBytes(&rb, .big);
+    std.debug.print("ctgrind_result={x}\n", .{rb[rb.len - 16 ..]});
+}
+
 // ── target "prime": sieve + Miller-Rabin on a secret prime ───────────────
 //
 // `root.sieveRejects` + `root.isProbablePrimeBE` on tss-lib's 1024-bit Blum
@@ -507,7 +534,7 @@ fn runPrime(tainted: bool) !void {
     std.debug.print("sieved={} prime={} ctgrind_result={x}\n", .{ sieved, verdict, p[0..16] });
 }
 
-const Target = enum { share, nonce, betaprime, fac, pimod, piprm, prime, auxgen };
+const Target = enum { share, nonce, betaprime, fac, pimod, piprm, prime, auxgen, open7 };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -519,6 +546,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "piprm")) return .piprm;
     if (std.mem.eql(u8, s, "prime")) return .prime;
     if (std.mem.eql(u8, s, "auxgen")) return .auxgen;
+    if (std.mem.eql(u8, s, "open7")) return .open7;
     return error.UnknownTarget;
 }
 
@@ -556,6 +584,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (target == .piprm) return runPiprm(allocator, tainted);
     if (target == .prime) return runPrime(tainted);
     if (target == .auxgen) return runAuxgen(allocator, tainted);
+    if (target == .open7) return runOpen7(tainted);
 
     // Fixture setup randomness is ALWAYS real — Phase 2a keygen is not
     // measured here (see buildFixture's doc comment).
@@ -608,6 +637,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printOutcome(result);
             std.debug.print("draws_160b={d}\n", .{draws});
         },
-        .fac, .pimod, .piprm, .prime, .auxgen => unreachable, // returned above
+        .fac, .pimod, .piprm, .prime, .auxgen, .open7 => unreachable, // returned above
     }
 }

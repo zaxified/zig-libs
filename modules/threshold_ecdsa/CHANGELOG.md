@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Identifiable abort for types 5 and 7 (GG20 §4.3).** A `r_bar_sum` or
+  `s_sum` abort keeps the session's nonce material; `Party.openAbort` broadcasts the
+  signer's opening and `Party.identify` checks everyone's and names the culprit. New:
+  `ecproofs.DleqProof` (Chaum–Pedersen), `mta.decryptWithRandomness` (a decryption with its
+  Paillier randomness, constant-time in λ). Tests: the δ and σ cheaters are named, and so is
+  a signer lying in its opening (wrong γ, a round-2 message its sender never signed, a false
+  `ν'`).
 - **2026-10-03** — **BREAKING (wire v2, codecs, API): signed presigning messages, the
   equivocator is named.** `PartyPublicKeys.message_key` / `KeyShare.message_seed`
   (Ed25519); `keygenTrustedDealer` takes `message_seeds`, `aux_info.LocalAux` generates

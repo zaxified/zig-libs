@@ -1087,12 +1087,16 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   and the dedicated Phase 2c section for the verification-level breakdown.
   Phase 2d inherits this same residual audit debt, since `signing.zig` is
   built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
-- **Identifiable abort, types 5 and 7** (GG20 §4.3): on `r_bar_sum` /
-  `s_sum` every signer opens `k_i`, `γ_i`, its MtA shares and encryption
-  randomness (type 5), or `k_i`, `μ_ij` and a Chaum–Pedersen proof of
-  `g^{σ_i}` vs `S_i` (type 7), so the inconsistent signer is named. Needs
-  every party to retain the session's MtA transcripts until the
-  presignature is finished. Effort: medium.
+- ~~**Identifiable abort, types 5 and 7**~~ — ✅ 2026-10-03: `Party.openAbort`/`identify`
+  (GG20 §4.3). Each signer keeps the signed round-2 messages it received and its own Bob
+  masks until the presignature is finished. Type 5 opens `k_i` (with `c_i`'s randomness),
+  `γ_i`, the received round-2 messages and its `β'` masks with randomness; everyone rebuilds
+  each `c_γ`, recomputes every `δ_j` and names the inconsistent signer. Type 7 opens `k_i`,
+  the decryptions `μ'` of the received `c_w` with their Paillier randomness
+  (`mta.decryptWithRandomness`), its `ν'` masks, and a DLEQ proof (`ecproofs.DleqProof`)
+  that `S_i = σ_i·R` for the `σ_i·G = k_i·W_i + Σ(μ − ν')·G` everyone recomputes — `σ_i`
+  and `w_i` stay closed. Openings are signed messages, and the round-2 messages inside are
+  checked against their senders' signatures, so a lie in an opening names the liar.
 - `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): a
   trapdoor-retaining variant, `root.generateAuxParamsWithTrapdoor`, now
   exists (ordinary `generateAuxParams` is unchanged — still discards

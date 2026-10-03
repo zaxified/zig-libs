@@ -562,8 +562,8 @@ blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # (presign.zig). Class (a): the bodies are public wire bytes the
 # single-process harness derives from the tainted secrets. Signing our own
 # messages (KeyPair.sign) added none.
-threshold_ecdsa	ReleaseFast	share	1	<=275	d464e29b15d0e6ab	706487e9e4a6df1e
-threshold_ecdsa	ReleaseFast	nonce	1	<=517	d464e29b15d0e6ab	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	share	1	<=275	fd4d807a632708e7	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	nonce	1	<=517	fd4d807a632708e7	706487e9e4a6df1e
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -599,7 +599,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=517	d464e29b15d0e6ab	706487e9e4a6df1e
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=320	d464e29b15d0e6ab	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	betaprime	1	<=320	fd4d807a632708e7	706487e9e4a6df1e
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -660,6 +660,12 @@ threshold_ecdsa	ReleaseFast	prime	1	3	b961de3dc347f91d	d2b3154e6a6b44ed
 # stripLeadingZeros on N~ (1); the last is the accept verdict (1).
 # Before: std.math.big.int products and a big-int compare against ord.
 threshold_ecdsa	ReleaseFast	auxgen	1	116	dfb61e757b8ddb5f	9577aa06dd1bf0e4
+# open7 (2026-10-03): mta.decryptWithRandomness, the §4.3 type-7 opening's
+# decryption proof, with the Paillier lambda tainted. 2 in-file: the
+# inverseOfModulus verdict (gcd(N, lambda) = 1, constant for a valid key) and
+# ff's canonicality check on rho — the opening PUBLISHES rho. The inverse
+# modulo the secret even lambda and the power ran without a context.
+threshold_ecdsa	ReleaseFast	open7	1	2	0114eb39d4e59828	e040997143d67ecf
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

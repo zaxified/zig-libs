@@ -12,6 +12,10 @@
 //!     checks `t·R == α + c·S` and `t·G + u·H == β + c·T`.
 //!   - `SchnorrProof` (Phase 4): knowledge of `γ` with `Γ = γ·G`, the
 //!     textbook Schnorr proof.
+//!   - `DleqProof` (§4.3 type-7 opening): the same `σ` behind `S = σ·R` and
+//!     `Σ = σ·G` (Chaum–Pedersen). Prover sends `α = a·R`, `β = a·G`,
+//!     answers `t = a + cσ`; verifier checks `t·R == α + c·S` and
+//!     `t·G == β + c·Σ`.
 //!
 //! `H` (`pedersenH`) is a nothing-up-my-sleeve second generator: the first
 //! x-coordinate of the form `SHA-256(pedersen_h_domain || u32 ctr)` that is
@@ -41,6 +45,7 @@ pub const pedersen_h_domain = "threshold_ecdsa/ecproofs/pedersen-h/v1";
 pub const pedersen_proof_domain = "threshold_ecdsa/ecproofs/pedersen-pok/v1";
 pub const st_proof_domain = "threshold_ecdsa/ecproofs/st-proof/v1";
 pub const schnorr_proof_domain = "threshold_ecdsa/ecproofs/schnorr-pok/v1";
+pub const dleq_proof_domain = "threshold_ecdsa/ecproofs/dleq/v1";
 
 /// The second Pedersen generator `H` (see the module doc comment). Cheap to
 /// recompute (a hash and a square root), so it is not cached.
@@ -318,6 +323,71 @@ pub fn verifySchnorr(proof: SchnorrProof, x_point: Element, context: []const u8)
     return lhs.equivalent(r_pt.add(cx));
 }
 
+// ── §4.3 type-7 opening: the same σ behind S = σ·R and Σ = σ·G ──────────
+
+pub const DleqProof = struct {
+    alpha: Element,
+    beta: Element,
+    t: Scalar,
+
+    pub const encoded_length = 2 * Ne + Ns;
+
+    pub fn toBytes(self: DleqProof) [encoded_length]u8 {
+        var out: [encoded_length]u8 = undefined;
+        out[0..Ne].* = self.alpha.toBytes();
+        out[Ne..][0..Ne].* = self.beta.toBytes();
+        out[2 * Ne ..][0..Ns].* = self.t.toBytes(.big);
+        return out;
+    }
+
+    pub const DecodeError = root.ElementError || error{InvalidEncoding};
+
+    pub fn fromBytes(bytes: [encoded_length]u8) DecodeError!DleqProof {
+        return .{
+            .alpha = try Element.fromBytes(bytes[0..Ne].*),
+            .beta = try Element.fromBytes(bytes[Ne..][0..Ne].*),
+            .t = try decodeScalar(bytes[2 * Ne ..][0..Ns].*),
+        };
+    }
+};
+
+fn dleqChallenge(context: []const u8, r_point: Element, s_point: Element, sigma_point: Element, alpha: Element, beta: Element) Scalar {
+    var c = Challenge.init(dleq_proof_domain, context);
+    c.element(r_point);
+    c.element(s_point);
+    c.element(sigma_point);
+    c.element(alpha);
+    c.element(beta);
+    return c.finish();
+}
+
+/// Proves `log_R(S) = log_G(Σ) = σ`. `error.InvalidElement` only for an
+/// `r_point` that does not decode.
+pub fn proveDleq(sigma: Scalar, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8, random: std.Random) root.ElementError!DleqProof {
+    const r_pt = try r_point.point();
+    while (true) {
+        var a = randomScalar(random);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&a));
+        const alpha = Element.fromPoint(r_pt.mul(a.toBytes(.big), .big) catch continue) catch continue;
+        const beta = Element.fromPoint(Secp256k1.basePoint.mul(a.toBytes(.big), .big) catch continue) catch continue;
+        const c = dleqChallenge(context, r_point, s_point, sigma_point, alpha, beta);
+        return .{ .alpha = alpha, .beta = beta, .t = a.add(c.mul(sigma)) };
+    }
+}
+
+/// `t·R == α + c·S` and `t·G == β + c·Σ`.
+pub fn verifyDleq(proof: DleqProof, r_point: Element, s_point: Element, sigma_point: Element, context: []const u8) bool {
+    const c = dleqChallenge(context, r_point, s_point, sigma_point, proof.alpha, proof.beta);
+    const c_bytes = c.toBytes(.big);
+    const t_bytes = proof.t.toBytes(.big);
+    const r_pt = r_point.point() catch return false;
+    const tr = r_pt.mulPublic(t_bytes, .big) catch return false;
+    const cs = (s_point.point() catch return false).mulPublic(c_bytes, .big) catch return false;
+    if (!tr.equivalent((proof.alpha.point() catch return false).add(cs))) return false;
+    const tg = Secp256k1.basePoint.mulPublic(t_bytes, .big) catch return false;
+    const csig = (sigma_point.point() catch return false).mulPublic(c_bytes, .big) catch return false;
+    return tg.equivalent((proof.beta.point() catch return false).add(csig));
+}
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -453,6 +523,36 @@ test "SchnorrProof: honest accepts; foreign point, wrong context, mangled fields
     try testing.expect(verifySchnorr(back, x_point, "ctx"));
 }
 
+test "DleqProof: honest accepts; S or Σ from another σ, wrong R, wrong context, mangled fields reject" {
+    var prng = std.Random.DefaultPrng.init(0x646c_6571);
+    const random = prng.random();
+    const sigma = randomScalar(random);
+    const r_point = pointOf(randomScalar(random));
+    const s_point = try Element.fromPoint(try (try r_point.point()).mul(sigma.toBytes(.big), .big));
+    const sigma_point = pointOf(sigma);
+    const proof = try proveDleq(sigma, r_point, s_point, sigma_point, "ctx", random);
+    try testing.expect(verifyDleq(proof, r_point, s_point, sigma_point, "ctx"));
+    try testing.expect(!verifyDleq(proof, r_point, s_point, sigma_point, "ctx2"));
+    try testing.expect(!verifyDleq(proof, r_point, s_point, pointOf(sigma.add(Scalar.one)), "ctx"));
+    const s_other = try Element.fromPoint(try (try r_point.point()).mul(sigma.add(Scalar.one).toBytes(.big), .big));
+    try testing.expect(!verifyDleq(proof, r_point, s_other, sigma_point, "ctx"));
+    try testing.expect(!verifyDleq(proof, pointOf(Scalar.one), s_point, sigma_point, "ctx"));
+    // A prover whose σ is not the one behind Σ cannot make a proof that verifies.
+    const lying = try proveDleq(sigma.add(Scalar.one), r_point, s_point, sigma_point, "ctx", random);
+    try testing.expect(!verifyDleq(lying, r_point, s_point, sigma_point, "ctx"));
+    var bad = proof;
+    bad.t = bad.t.add(Scalar.one);
+    try testing.expect(!verifyDleq(bad, r_point, s_point, sigma_point, "ctx"));
+    bad = proof;
+    bad.alpha = pointOf(Scalar.one);
+    try testing.expect(!verifyDleq(bad, r_point, s_point, sigma_point, "ctx"));
+    bad = proof;
+    bad.beta = pointOf(Scalar.one);
+    try testing.expect(!verifyDleq(bad, r_point, s_point, sigma_point, "ctx"));
+    const back = try DleqProof.fromBytes(proof.toBytes());
+    try testing.expect(verifyDleq(back, r_point, s_point, sigma_point, "ctx"));
+}
+
 test "fuzz: PedersenProof/StProof/SchnorrProof.fromBytes never panic" {
     try testing.fuzz({}, fuzzDecoders, .{});
 }
@@ -466,4 +566,7 @@ fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
     var c: [SchnorrProof.encoded_length]u8 = undefined;
     smith.bytes(&c);
     _ = SchnorrProof.fromBytes(c) catch {};
+    var d: [DleqProof.encoded_length]u8 = undefined;
+    smith.bytes(&d);
+    _ = DleqProof.fromBytes(d) catch {};
 }

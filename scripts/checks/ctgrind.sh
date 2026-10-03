@@ -206,7 +206,7 @@ declare -A TARGETS=(
     # blind β' is a 160-byte draw that `nonce` never tainted.
     # `fac` added 2026-10-02 (dealer-free keygen): Πfac's prover over the
     # Paillier factors p, q -- one proof, no protocol run, seconds.
-    [threshold_ecdsa]="share nonce betaprime fac pimod piprm prime auxgen"
+    [threshold_ecdsa]="share nonce betaprime fac pimod piprm prime auxgen open7"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm keygen"
@@ -546,6 +546,7 @@ declare -A PATTERN=(
     [threshold_ecdsa/piprm]='aux_proofs[.]zig|root[.]zig|zkproofs[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [threshold_ecdsa/prime]='root[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/auxgen]='root[.]zig|zkproofs[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
+    [threshold_ecdsa/open7]='mta[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -592,6 +593,7 @@ declare -A LABEL=(
     [threshold_ecdsa/piprm]='thr_ecdsa Pi_prm prover, aux p~,q~,lambda'
     [threshold_ecdsa/prime]='thr_ecdsa sieve + Miller-Rabin on a secret prime'
     [threshold_ecdsa/auxgen]='thr_ecdsa ring-Pedersen setup, safe p~,q~'
+    [threshold_ecdsa/open7]='thr_ecdsa type-7 opening: rho under secret lambda'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'
