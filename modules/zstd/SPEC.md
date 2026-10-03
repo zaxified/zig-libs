@@ -852,10 +852,9 @@ while the pre-fix code gives 456 and does not match).
 
 The 14 survivors were then re-run against the **full** `test-zstd` suite
 (not just the dict filter, since a filtered binary is a different
-binary and a survivor there could still be caught elsewhere): 2 flipped
+binary and a survivor there could still be caught elsewhere): 1 flipped
 to KILLED outright (`m04`, an argument-order bug in the continuation
-call -- some *other* test in the full suite already covered it) or were
-found by hunting. Orig-vs-mutant search (plan §5.4: random `(dict,
+call -- some *other* test in the full suite already covered it). Orig-vs-mutant search (plan §5.4: random `(dict,
 input)` triples, `forceAttachDict=1`, ~15–100 k tries per batch,
 capped) killed **7 more** with a real divergence confirmed against
 libzstd, each now a golden (`surv-m12-fast`, `surv-m17-fast`,
@@ -867,7 +866,8 @@ acceptance (`fastDictMatchStateBlock`'s `m12`, `dfastDictMatchStateBlock`'s
 `>` vs `>=` read against `dict_start_index` in the dict-match acceptance
 and the long-match-plus-one dict branch (`m23`, `m27`).
 
-**Final tally: 28/33 killed, 2 confirmed equivalent, 3 open.**
+**Final tally: 27/33 killed (19 + `m04` + 7 hunted), 2 confirmed
+equivalent, 4 open.**
 - **Equivalent** (justified, not hunted further): `m01`/`m02`
   (`countAcrossDict`'s `p_match > m_end` vs `>=`, and `v_end > p_in` vs
   `>=`) -- at the exact boundary these mutate (`p_match == m_end`), the

@@ -7,7 +7,7 @@ and level, and a **decoder** ported from libzstd's, one-shot and streaming (also
 concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
 leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
-Not yet a full libzstd replacement — that is the goal: one-shot
+A full replacement for linking libzstd (the goal, reached 2026-09-30): one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
 for the same calls, buffered or with the caller's stable buffers) covers
 every level too, `StreamWriter` is a `std.Io.Writer` with those bytes and
@@ -32,8 +32,12 @@ jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 (`OptimizeParams.nb_threads`, the single-threaded result for any count),
 and so is the **sequence-level API** (`compressSequences`,
 `generateSequences`, a block-level `SequenceProducer` in place of the match
-finder: libzstd's bytes and errors for the same sequences). The rest is
-queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
+finder: libzstd's bytes and errors for the same sequences), and so is the
+**seekable format** (`zstd.seekable`, libzstd's `contrib/seekable_format`).
+What libzstd has and this module does not: run-time CPU dispatch (Z22,
+waits on Zig; build with `-Dcpu=x86_64_v3` or `native` meanwhile) and,
+refused, the legacy v0.5–v0.7 frames, the legacy dictionary trainer and
+`--trace` — see [SPEC.md](SPEC.md).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
