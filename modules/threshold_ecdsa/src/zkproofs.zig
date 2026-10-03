@@ -2729,6 +2729,95 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     try testing.expect(verifyBobMta(out3.proof, c_a, c_b3, pk, setup.aux, test_ctx));
 }
 
+test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit v satisfies every equation and is still refused" {
+    // The Bob-side twin of the non-unit Alice test (mutation audit, mutant
+    // 71: dropping `unitsModN(c_b, s)` from `verifyBobInner` survived).
+    // The prover knows N = P·Q. It multiplies `v` by (P²)^N and `s` by P²,
+    // so equation 5, c_a^s1 · s^N · Γ^t1 = c_b^e · v (mod N²), gains the
+    // same factor P^(2N) on both sides — a unit mod Q², zero mod P² — and
+    // still holds, while `s` is no unit of Z*_N. Equations 3 and 4 (mod Ñ)
+    // and the range bounds do not see `s` or `v`. Only the unit check does.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0xb0b_0005);
+    const pk = setup.kp.public;
+    const nsq = pk.n_sq;
+    const nt = setup.aux.n_tilde;
+    const p_sq = setup.kp.secret.crt.?.p_sq_fe;
+
+    var prng = std.Random.DefaultPrng.init(0x62_6f62_6e6f_6e75); // "bobnonu"
+    const random = prng.random();
+
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = pk.nByteLen();
+    pk.nToBytes(n_buf[0..n_len]) catch unreachable;
+    const n_bytes = n_buf[0..n_len];
+
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, scalarToTestFe(scalarFromU64(0xa11ce), pk), r_a) catch unreachable;
+    const x_bytes = scalarFromU64(0xb0b5ec7e7).toBytes(.big);
+    const y_bytes = scalarFromU64(0xb14b).toBytes(.big);
+    const r_b = testPaillierRandomness(pk, random);
+    const c_b = buildCb(pk, c_a, &x_bytes, &y_bytes, r_b);
+
+    // Control: the honest proof for this (c_a, c_b) verifies in this fixture.
+    const honest = try proveBobInner(allocator, &x_bytes, &y_bytes, r_b, c_a, c_b, pk, setup.aux, test_ctx, null, random);
+    defer honest.proof.deinit(allocator);
+    try testing.expect(verifyBobMta(honest.proof, c_a, c_b, pk, setup.aux, test_ctx));
+
+    // proveBobInner by hand, with `v` and `s` carrying the P² factor.
+    var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
+    nt.toBytes(&nt_buf, .big) catch unreachable;
+    const nt_bytes = stripLeadingZeros(&nt_buf);
+    var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
+    const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
+    mulBytes(&q_bytes, nt_bytes, q_nt);
+    var q3_nt_buf: [96 + root.aux_modulus_bytes]u8 = undefined;
+    const q3_nt = q3_nt_buf[0 .. 96 + nt_bytes.len];
+    mulBytes(&q3_bytes, nt_bytes, q3_nt);
+    var alpha: [96]u8 = undefined;
+    _ = sampleBelow(random, &q3_bytes, &alpha);
+    var rho_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
+    const rho = sampleBelow(random, q_nt, &rho_buf);
+    var rho_prime_buf: [96 + root.aux_modulus_bytes]u8 = undefined;
+    const rho_prime = sampleBelow(random, q3_nt, &rho_prime_buf);
+    var sigma_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
+    const sigma = sampleBelow(random, q_nt, &sigma_buf);
+    var tau_buf: [96 + root.aux_modulus_bytes]u8 = undefined;
+    const tau = sampleBelow(random, q3_nt, &tau_buf);
+    var gamma: [224]u8 = undefined;
+    _ = sampleBelow(random, &q7_bytes, &gamma);
+    var beta_buf: [paillier.modulus_bytes]u8 = undefined;
+    const beta = sampleNonzeroBelow(random, n_bytes, &beta_buf);
+
+    const z = pedersenCt(nt, setup.aux.h1, &x_bytes, setup.aux.h2, rho);
+    const z1 = pedersenCt(nt, setup.aux.h1, &alpha, setup.aux.h2, rho_prime);
+    const t_commit = pedersenCt(nt, setup.aux.h1, &y_bytes, setup.aux.h2, sigma);
+    const gamma_fe = feFromSecretBytes(nsq, paillier.Fe, &gamma);
+    const beta_nsq = feFromSecretBytes(nsq, paillier.Fe, beta);
+    const enc_gamma = paillier.encrypt(pk, gamma_fe, beta_nsq) catch unreachable;
+    const v_honest = mulCt(nsq, powCt(nsq, c_a.c, &alpha), enc_gamma.c);
+    const p_sq_n = powPub(nsq, p_sq, n_bytes); // (P²)^N mod N²
+    const v: paillier.Ciphertext = .{ .c = nsq.mul(v_honest, p_sq_n) };
+    const w = pedersenCt(nt, setup.aux.h1, &gamma, setup.aux.h2, tau);
+    const e = mtaProofChallenge(test_ctx, setup.aux, pk, c_a, c_b, z, z1, t_commit, v, w);
+    const e_bytes = e.toBytes(.big);
+    const r_n = rebase(pk.n, paillier.Fe, r_b);
+    const beta_n = feFromSecretBytes(pk.n, paillier.Fe, beta);
+    const s_n = mulCt(pk.n, powCt(pk.n, r_n, &e_bytes), beta_n);
+    const s = nsq.mul(rebase(nsq, paillier.Fe, s_n), p_sq);
+
+    // No errdefer on these: `forged.deinit` owns them once built (an OOM in
+    // this test's own allocations may leak, a failed expect must not double free).
+    const s1 = try mulAddOwned(allocator, &e_bytes, &x_bytes, &alpha);
+    const s2 = try mulAddOwned(allocator, &e_bytes, rho, rho_prime);
+    const t1 = try mulAddOwned(allocator, &e_bytes, &y_bytes, &gamma);
+    const t2 = try mulAddOwned(allocator, &e_bytes, sigma, tau);
+    const forged = MtaProof{ .z = z, .z1 = z1, .t = t_commit, .v = v, .w = w, .s = s, .s1 = s1, .s2 = s2, .t1 = t1, .t2 = t2 };
+    defer forged.deinit(allocator);
+    try testing.expect(!verifyBobMta(forged, c_a, c_b, pk, setup.aux, test_ctx));
+}
+
 test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, and every mangled proof field" {
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;

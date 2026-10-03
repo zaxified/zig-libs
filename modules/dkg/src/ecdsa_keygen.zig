@@ -471,17 +471,58 @@ test "dealer-free keygen: a tampered Πfac aborts the receiver and names the pro
     for (&parties) |*p| try p.start();
     try rig.deliver(allocator, null);
     for (&parties) |*p| try p.advance();
-    // Party 2's Πfac to party 3 has its last byte (inside `v`) flipped.
+    // Party 2's Πfac to party 3 has its last byte (inside `v`) flipped, and
+    // the one to party 1 is lost.
     try rig.deliver(allocator, struct {
         fn f(from: u32, to: u32, bytes: []u8) bool {
-            if (from == 2 and to == 3 and bytes[0] == @intFromEnum(wire.Kind.ecdsa_fac_proof)) bytes[bytes.len - 1] ^= 1;
+            if (from != 2 or bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+            if (to == 1) return false;
+            bytes[bytes.len - 1] ^= 1;
             return true;
         }
     }.f);
-    try parties[0].advance();
+    try testing.expectError(error.MissingMessage, parties[0].advance());
+    try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
     try testing.expectError(error.InvalidFactorProof, parties[2].advance());
     try testing.expectEqual(Phase.aborted, parties[2].phase());
     try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
+}
+
+test "dealer-free keygen: a second Πfac frame from one prover is refused (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_D5A_0006);
+    const random = prng.random();
+    const cfg: types.Config = .{ .t = 2, .n = 3 };
+
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+
+    var parties: [3]EcdsaKeygen = undefined;
+    var inited: usize = 0;
+    defer for (parties[0..inited]) |*p| p.deinit();
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaKeygen.init(allocator, cfg, @intCast(inited + 1), "test-session-6", &locals[inited], random);
+
+    var rig: Rig = .{ .parties = &parties };
+    for (&parties) |*p| try p.start();
+    try rig.deliver(allocator, null);
+    for (&parties) |*p| try p.advance();
+    // Party 1's Πfac for party 2, delivered twice: the second copy must not
+    // replace the first (or be taken as a fresh proof).
+    const msgs = try parties[0].takeOutgoing();
+    defer wire.freeOutgoing(allocator, msgs);
+    for (msgs) |m| {
+        if (m.bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) continue;
+        switch (m.to) {
+            .party => |p| if (p != 2) continue,
+            .broadcast => continue,
+        }
+        try parties[1].handle(1, m.bytes);
+        try testing.expectError(error.DuplicateMessage, parties[1].handle(1, m.bytes));
+        return;
+    }
+    return error.TestUnexpectedResult; // no Πfac for party 2 was queued
 }
 
 test "dealer-free keygen: an announcement bound to another party's context is refused, culprit named" {
@@ -507,6 +548,9 @@ test "dealer-free keygen: an announcement bound to another party's context is re
     defer wire.freeOutgoing(allocator, msgs);
     try parties[2].handle(2, msgs[0].bytes);
     try parties[2].handle(1, msgs[0].bytes);
+    // A second frame from the same sender, and one from oneself, are refused.
+    try testing.expectError(error.DuplicateMessage, parties[2].handle(1, msgs[0].bytes));
+    try testing.expectError(error.UnknownSender, parties[0].handle(1, msgs[0].bytes));
     try testing.expectError(error.InvalidAnnouncement, parties[2].advance());
     try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
 }
@@ -525,6 +569,29 @@ test "dealer-free keygen: a missing announcement aborts with the absent party na
     try testing.expectEqual(@as(?u32, 2), p.culprit());
     try testing.expectError(error.Aborted, p.advance());
     try testing.expectError(error.EmptySessionId, EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, 1, "", &local, random));
+}
+
+test "dealer-free keygen: two parties announcing one modulus abort with DuplicateModulus (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_D5A_0005);
+    const random = prng.random();
+    var locals: [2]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 2) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    // Party 3 announces party 2's moduli (each proof is valid under its own
+    // context; only the distinctness check sees it).
+    var twin = locals[1];
+    twin.message_seed = @splat(0x77); // not deinit'ed: it shares `locals[1]`'s buffers
+    const refs = [3]*aux_info.LocalAux{ &locals[0], &locals[1], &twin };
+    var parties: [3]EcdsaKeygen = undefined;
+    var inited: usize = 0;
+    defer for (parties[0..inited]) |*p| p.deinit();
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, @intCast(inited + 1), "test-session-5", refs[inited], random);
+    var rig: Rig = .{ .parties = &parties };
+    for (&parties) |*p| try p.start();
+    try rig.deliver(allocator, null);
+    try testing.expectError(error.DuplicateModulus, parties[0].advance());
 }
 
 /// `form || session id || u32-BE t || u32-BE n || u32-BE index` (see

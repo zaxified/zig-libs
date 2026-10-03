@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Mutation audit of the 2026-10-03 additions (two rounds, schemata): tests
+  only — Bob's non-unit MtA proof, lies in the last signer's opening section, opening-parser
+  prefixes, wrong-kind signed messages, the session id's key-table hash, aux_info refusals.
+  SPEC § Audit 2026-10-03.
 - **2026-10-03** — **Review of the 2026-10-03 additions (BREAKING: fault set, session id).**
   F1/F2: see the §4.3 entry below. `Party.collect` and `PresignaturePublic.combine` check the
   signature first and drop what proves nothing about its claimed sender (garbage, forged headers,

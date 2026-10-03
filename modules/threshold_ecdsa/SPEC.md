@@ -6,7 +6,7 @@
 
 **Scope:** core — bnb-chain/tss-lib (surveyed 2026-09-30; re-assessed 2026-10-03 against the same table: dealer-free keygen and key refresh through `dkg`, one-round online signing over presignatures, identifiable abort for every GG20 type including 5 and 7, signed messages naming an equivocator, a consume-once presignature pool; the gaps a user can hit are under Backlog)
 
-**Audit:** review 2026-10-02 · mutation 2026-10-02
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -786,6 +786,28 @@ by a new test: the `init` checks (signer count below `t`, `Σ λ_j·X_j = X`,
 Fiat-Shamir completeness forgeries (a Pedersen proof for a `T` solved after
 the challenge; a PDL proof for a base solved after the challenge).
 
+**Audit 2026-10-03** (plan F: signed messages, the §4.3 opening, the presignature pool, the CT
+key setup, `dkg.EcdsaRefresh`). Review: see the Backlog entry (2 HIGH — the type-7 opening
+leaked every key share; a decryption lifted by `N` framed an honest Bob — both fixed with
+F3/F4/F9/F10). Mutation, schemata, ReleaseSafe, two rounds (83 + 111 mutants over
+`presign`, `zkproofs`, `mta`, `aux_proofs`, `aux_info`, `ecproofs`, `root` and `dkg`'s
+`ecdsa_keygen`/`ecdsa_refresh`; round 1 mutants on code rewritten after the review were
+superseded and re-done in round 2). Every real survivor got a test — among them Bob's MtA
+proof with a non-unit `c_B`/`s` (forged with a `P²` factor so that every equation holds), a
+lie in the LAST signer's opening section (decryption +1, a decryption with a leading zero
+dropped, a cut round-2 message, a Bob mask — a skipped check would blame the first-checked
+honest signer), every strict prefix of an opening, a signed broadcast in a p2p round and the
+reverse, the ssid's key-table hash, a duplicate Πfac frame. Left alive, with reasons:
+`verifyStrict`→`verify` (small-order keys refused earlier); two implied presignature
+relations (the per-share equation and `r = R.x`); `centeredModQ` vs plain (proof-bounded
+value); the group-key check in refresh (the receiver checks it); `n < 2` and the ssid's group
+key in the codec/init (fixed by the key table and the relation checks); in `openedRound2` the
+round, trailing-byte and length guards behind the sender's signature (an honest sender never
+signs such a message; a colluding pair only moves blame between two cheaters); a failed `r_k`
+read (later fields misalign, the opener is named anyway); and two redundant pairs in type 5 —
+the nonce check vs `k·R = R̄_i`, the `Γ` check vs the rebuilt `c_γ` — where dropping either one
+names the same signer through the other.
+
 **Tests.** `presign.zig`: honest 2-of-3 (signers out of order) and 3-of-3,
 bytes and prehashed; a presignature signs once; 19 deviations by one signer (incl. equivocation)
 (each injected into its outgoing bytes or, for the consistent-liar cases,
@@ -1165,7 +1187,7 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   `k·R = R̄_i`, `σ·R = S_i`; **F8** attestation block documented as a hash echo; **F9** the
   session id hashes the public-key table; **F10** `root.decodeMessageKey` refuses small-order
   message keys, signatures checked with `verifyStrict`; **F12** `MemoryPresignatureStore`
-  documented as single-thread. Open items below.
+  documented as single-thread. Mutation runs: see § Audit 2026-10-03. Open items below.
 - **Opening round without attestation** (review 2026-10-03 F5): a signer can show different,
   validly signed openings to different honest signers. After F1/F2 every check in `identify` is
   deterministic in signed data (Alice's decryption is unique below `N`, `σ_i·G` follows), so each

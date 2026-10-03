@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Mutation audit of `EcdsaKeygen`/`EcdsaRefresh` (with `threshold_ecdsa`'s):
+  tests only — refresh refusals, keygen frame checks, a duplicate Πfac frame.
 - **2026-10-03** — **New: `EcdsaRefresh`**, proactive refresh of a `threshold_ecdsa` key as a
   sans-I/O state machine: new aux rounds (Paillier, ring-Pedersen, message keys, each
   proven), then the reshare within the same committee with every party as dealer and

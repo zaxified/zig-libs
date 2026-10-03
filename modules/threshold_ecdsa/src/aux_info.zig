@@ -471,6 +471,18 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
         defer allocator.free(bytes);
         a.* = try Announcement.fromBytes(bytes);
         try verifyAnnouncement(a.*, &ctx, random);
+        // Mutation audit: the codec takes exactly the 32-byte message key
+        // after the proofs (no trailing byte), and refuses a small-order one.
+        const longer = try allocator.alloc(u8, bytes.len + 1);
+        defer allocator.free(longer);
+        @memcpy(longer[0..bytes.len], bytes);
+        longer[bytes.len] = 0;
+        try testing.expectError(error.InvalidEncoding, Announcement.fromBytes(longer));
+        const weak = try allocator.dupe(u8, bytes);
+        defer allocator.free(weak);
+        @memset(weak[weak.len - 32 ..], 0);
+        weak[weak.len - 32] = 1; // the identity point
+        try testing.expectError(error.InvalidEncoding, Announcement.fromBytes(weak));
     }
     // Bound to its sender: party 2 cannot present party 1's announcement as
     // its own — the Ñ proofs refuse first (bound since 2026-10-02), and the
@@ -479,6 +491,10 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     try testing.expect(!aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(2), anns[0].paillier_proof));
     try testing.expect(aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(1), anns[0].paillier_proof));
     try testing.expectEqual(@as(?struct { usize, usize }, null), findDuplicate(&anns));
+    // Πmod(N) alone failing (another party's proof for another modulus) is its own error (mutation audit).
+    var wrong_mod = anns[1];
+    wrong_mod.paillier_proof = anns[0].paillier_proof;
+    try testing.expectError(error.InvalidPaillierProof, verifyAnnouncement(wrong_mod, &ctxFor(2), random));
 
     // Each party's view: announcements, distinct moduli, then Πfac from
     // every peer made for it (every ordered pair).
@@ -500,6 +516,30 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
             try testing.expect(!sets[j - 1].verifyPeerFactors(@intCast(i), &ctxFor(@intCast(j)), proof));
             try testing.expect(sets[j - 1].verifyPeerFactors(@intCast(i), &ctx, proof));
         }
+    }
+
+    // Mutation audit: a set counts only what was checked. A valid Πfac from a
+    // peer whose announcement was not verified is refused (94); with every
+    // announcement and Πfac in, the set is still not verified before the
+    // distinctness check has run (95), and not before every Πfac is in (96).
+    {
+        var fresh = try AnnouncementSet.init(allocator, &anns, 1);
+        defer fresh.deinit(allocator);
+        var proofs: [2]fac_proof.FacProof = undefined;
+        for (&proofs, 2..) |*pr, j| pr.* = try locals[j - 1].proveFactors(anns[0].aux, &ctxFor(@intCast(j)), random);
+        try testing.expect(!fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
+        for (2..4) |j| try fresh.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
+        try testing.expect(fresh.verifyPeerFactors(2, &ctxFor(2), proofs[0]));
+        try testing.expect(fresh.checkDistinct() == null);
+        try testing.expect(fresh.verified() == null); // Πfac of party 3 missing
+        try testing.expect(fresh.verifyPeerFactors(3, &ctxFor(3), proofs[1]));
+        try testing.expect(fresh.verified() != null);
+
+        var fresh2 = try AnnouncementSet.init(allocator, &anns, 1);
+        defer fresh2.deinit(allocator);
+        for (2..4) |j| try fresh2.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
+        for ([_]usize{ 0, 1 }, 2..) |pi, j| try testing.expect(fresh2.verifyPeerFactors(@intCast(j), &ctxFor(@intCast(j)), proofs[pi]));
+        try testing.expect(fresh2.verified() == null); // everything in, but never checked for distinctness
     }
 
     // A 2-of-3 sharing stands in for the DKG's output here (the `dkg`
@@ -526,6 +566,10 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     // announcement in this party's slot.
     try testing.expectError(error.ShareMismatch, assembleKeyShare(allocator, sets[0].verified().?, split.shares[1].scalar, commits, &locals[0]));
     try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &locals[1]));
+    // Same moduli and ring-Pedersen tuple, another message-signing seed (mutation audit).
+    var other_seed = locals[0];
+    other_seed.message_seed = @splat(0x55);
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &other_seed));
 }
 
 test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {
@@ -618,6 +662,14 @@ test "findDuplicate: a party whose Paillier N doubles as its own Ñ" {
     const dup2 = findDuplicate(&.{ a, b }) orelse return error.TestExpectedDuplicate;
     try testing.expectEqual(@as(usize, 0), dup2[0]);
     try testing.expectEqual(@as(usize, 1), dup2[1]);
+    // Only a's Ñ equals b's N (b's Ñ is a stranger): both of a's moduli are compared (mutation audit).
+    var k4 = try root.generatePaillierBlum(random, 512);
+    defer k4.wipe();
+    b.aux.n_tilde = k4.modulus();
+    b.paillier_pk = k2.key.public;
+    const dup3 = findDuplicate(&.{ a, b }) orelse return error.TestExpectedDuplicate;
+    try testing.expectEqual(@as(usize, 0), dup3[0]);
+    try testing.expectEqual(@as(usize, 1), dup3[1]);
 }
 
 test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2048 bits (review F6)" {

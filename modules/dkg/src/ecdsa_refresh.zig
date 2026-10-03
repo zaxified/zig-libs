@@ -583,3 +583,94 @@ test "refresh 2-of-3: a dealer dealing a share that is not its published one is 
     const sig = try tecdsa.signing.signWithShares(allocator, &.{ new[0], new[2] }, "two dealers", random);
     try sig.verify("two dealers", pk);
 }
+
+/// Delivers everything queued (a broadcast to every other party); `filter`
+/// sees each copy, may change its bytes, and returns false to drop it.
+fn deliverAll(allocator: std.mem.Allocator, parties: []EcdsaRefresh, filter: ?*const fn (from: u32, to: u32, bytes: []u8) bool) !void {
+    for (parties, 1..) |*src, from| {
+        const msgs = try src.takeOutgoing();
+        defer wire.freeOutgoing(allocator, msgs);
+        for (msgs) |m| for (parties, 1..) |*dst, to| {
+            if (to == from) continue;
+            switch (m.to) {
+                .broadcast => {},
+                .party => |j| if (j != to) continue,
+            }
+            if (filter) |f| if (!f(@intCast(from), @intCast(to), m.bytes)) continue;
+            dst.handle(@intCast(from), m.bytes) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {},
+            };
+        };
+    }
+}
+
+test "refresh: a missing, replayed or tampered frame and a shared modulus abort the round, naming the culprit (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0003);
+    const random = prng.random();
+    const kg = try tecdsa.signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+
+    // Announcement round: party 1 never hears from party 2; party 3 is
+    // handed party 1's own (valid, party-1-bound) frame as if party 2 sent it.
+    {
+        var parties: [3]EcdsaRefresh = undefined;
+        var inited: usize = 0;
+        defer for (parties[0..inited]) |*p| p.deinit();
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-1", &locals[inited], random);
+        for (&parties) |*p| try p.start();
+        const from1 = try parties[0].takeOutgoing();
+        defer wire.freeOutgoing(allocator, from1);
+        const from3 = try parties[2].takeOutgoing();
+        defer wire.freeOutgoing(allocator, from3);
+        try parties[2].handle(2, from1[0].bytes);
+        try parties[2].handle(1, from1[0].bytes);
+        try testing.expectError(error.InvalidAnnouncement, parties[2].advance());
+        try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
+        try parties[0].handle(3, from3[0].bytes);
+        try testing.expectError(error.MissingMessage, parties[0].advance());
+        try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
+    }
+
+    // Πfac round: party 2's proof to party 1 is lost, its proof to party 3 tampered.
+    {
+        var parties: [3]EcdsaRefresh = undefined;
+        var inited: usize = 0;
+        defer for (parties[0..inited]) |*p| p.deinit();
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-2", &locals[inited], random);
+        for (&parties) |*p| try p.start();
+        try deliverAll(allocator, &parties, null);
+        for (&parties) |*p| try p.advance();
+        try deliverAll(allocator, &parties, struct {
+            fn f(from: u32, to: u32, bytes: []u8) bool {
+                if (from != 2 or bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+                if (to == 1) return false;
+                bytes[bytes.len - 1] ^= 1;
+                return true;
+            }
+        }.f);
+        try testing.expectError(error.MissingMessage, parties[0].advance());
+        try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
+        try testing.expectError(error.InvalidFactorProof, parties[2].advance());
+        try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
+    }
+
+    // Two parties announcing one Paillier and ring-Pedersen modulus (each
+    // proof is valid under its own context; only the distinctness check sees it).
+    {
+        var twin = locals[1];
+        twin.message_seed = @splat(0x77); // not deinit'ed: it shares `locals[1]`'s buffers
+        var parties: [3]EcdsaRefresh = undefined;
+        var inited: usize = 0;
+        defer for (parties[0..inited]) |*p| p.deinit();
+        while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-fault-3", if (inited == 2) &twin else &locals[inited], random);
+        for (&parties) |*p| try p.start();
+        try deliverAll(allocator, &parties, null);
+        try testing.expectError(error.DuplicateModulus, parties[0].advance());
+    }
+}
