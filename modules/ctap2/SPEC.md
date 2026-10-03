@@ -6,7 +6,7 @@
 
 **Scope:** core — python-fido2 2.2.1 `ClientPin` (surveyed 2026-09-30): every clientPIN subcommand of CTAP 2.1 over both protocols, getInfo, CTAPHID framing; the rest of CTAP2 (makeCredential, getAssertion, credential management) is out of this module
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -117,6 +117,45 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   loopback `Channel` with keep-alives and foreign traffic.
 - A `std.testing.fuzz` harness over every response parser and a client run.
 
+### Audit 2026-10-03
+
+Reviewed: all of `src/` (CTAPHID framing against §11.2, CBOR response parsing, PIN
+handling and wiping, key-agreement validation, GetInfo). `cbor` and `ctap2pin` are
+out of scope and were read only to understand the calls.
+
+**Mutation run** (schemata, ReleaseSafe, one binary, 87 mutants): 83 killed by an
+assertion or panic, 1 killed by hang (mutant 94, the keep-alive cap removed: a device
+that only sends keep-alives is then waited on forever), 3 survivors, all equivalent
+as far as a test can see:
+
+- `setPin`/`changePin` skipping the wipe of the padded PIN block, `tokenWithPin`
+  skipping the wipe of the PIN hash (3 mutants): the program's visible behaviour is
+  identical, the wipe only changes stack bytes after return; checked by reading the
+  `defer`s, not by a test.
+
+The first pass left 20 further mutants alive; each now has a test (`ctaphid.zig`,
+`client_test.zig`, `getinfo.zig`, `framing.zig` tail tests): transport claiming more
+bytes than the buffer, 17-byte aaguid, duplicate option id, the four version strings,
+`supportsPinWithPermissions`/`supportsUvWithPermissions` needing both options,
+protocol-One `Token.authenticate` over a 32-byte token, `Token.deinit` zeroing the
+length, a 31-byte `y`, exactly 8 scalar draws, `maxMsgSize` clamped from below, the
+`max_payload` bound with a large buffer, two messages on one `Assembler`, a buffer of
+exactly the message size, INIT response field offsets, keep-alive cap, a response to
+another command, an empty CTAPHID_ERROR, a stale `last_hid_error`.
+
+**Findings:**
+
+| Sev | Where | Finding | Status |
+|---|---|---|---|
+| LOW | `ctaphid.zig` `Channel.open` | A device could answer INIT with CID 0 (reserved) or `0xFFFFFFFF` (broadcast); the channel then used it for every CBOR transaction. | Fixed: `TransportFailed`; test `Channel.open: a device that allocates CID 0 ...` |
+| INFO | `ctaphid.zig` `Channel.open` | An INIT response with a different nonce (another application's INIT on the broadcast CID) fails with `TransportFailed`; §11.2.3 tells the host to ignore it and keep reading. | Backlog |
+| INFO | `ctaphid.zig` `Assembler.feed` | A stray continuation packet on our CID with nothing in progress (leftover of a timed-out response) is `UnexpectedContinuation`, hence `TransportFailed`; it could be ignored. | Backlog |
+| INFO | `ctaphid.zig` `exchange` | The read loop has no bound on foreign-channel or stray packets; termination relies on the `ReportDevice` timing out (documented under Backlog). | Documented |
+| INFO | `clientpin.zig` `Token.authenticate` | On a default-constructed or `deinit`ed protocol-One `Token` (`len == 0`) the `catch unreachable` is reached: a panic in safe builds, UB in ReleaseFast. Tokens returned by this module are never empty. | Backlog |
+| INFO | `clientpin.zig` `parseKeyAgreementResponse` | `alg` -25 is required, as the spec says; python-fido2 does not check it, so an authenticator that omits it works there but not here. | Kept (spec) |
+| INFO | `clientpin.zig` | `rp_id` is not enforced client-side for `mc`/`ga` permissions; the authenticator answers `MissingParameter`. | Kept |
+| INFO | `status.zig` | The table lists the codes the author could verify; spec codes 0x16, 0x20, 0x29, 0x2A (obsolete or removed in 2.1) are `UnknownStatus`. Not checked against the spec text in this audit. | Unverified |
+
 ## Non-goals
 
 - Device I/O of any kind (USB HID nodes, NFC, BLE): the caller supplies `Transport`.
@@ -141,6 +180,12 @@ against the spec's layouts and by round trip (no external CTAPHID capture).
 
 ## Backlog / deferred
 
+- **Audit 2026-10-03 leftovers (INFO):** ~~`Channel.open` should skip an INIT response with
+  a foreign nonce instead of failing~~ (done the same day: §11.2.3, another client's INIT
+  answer on the broadcast channel is skipped); `Assembler`/`Channel` could ignore a stray
+  continuation packet; `Token.authenticate` on an empty protocol-One token should return
+  an error or be made impossible (`catch unreachable` today); a bound on packets read
+  without progress in `Channel.exchange`.
 - **Unicode NFC normalization for PINs** (zig-libs request: no module and no `std`
   facility normalizes to Form C; CTAP 2.1 §6.5.5.5 requires the platform to collect
   the PIN in NFC). Workaround today: the caller normalizes; this module validates

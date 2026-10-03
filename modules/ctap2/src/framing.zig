@@ -226,3 +226,15 @@ test "find: absent, present, duplicate and non-integer keys" {
     };
     try std.testing.expectError(error.DuplicateKey, find(&dup, 1));
 }
+
+test "Transport.transact: a transport that claims more bytes than the buffer holds" {
+    const Liar = struct {
+        fn transact(_: *anyopaque, _: []const u8, response: []u8) TransportError!usize {
+            return response.len + 1;
+        }
+    };
+    var dummy: u8 = 0;
+    const t: Transport = .{ .ctx = &dummy, .transactFn = Liar.transact };
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.ResponseBufferTooSmall, t.transact(&.{0x04}, &buf));
+}

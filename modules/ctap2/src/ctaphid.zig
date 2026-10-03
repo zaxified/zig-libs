@@ -242,14 +242,24 @@ pub const Channel = struct {
     pub fn open(dev: ReportDevice, nonce: [8]u8) framing.TransportError!Channel {
         var ch: Channel = .{ .dev = dev, .cid = broadcast_cid };
         var buf: [64]u8 = undefined;
-        const msg = try ch.exchange(.init, &nonce, &buf);
+        const msg = try ch.exchangeFiltered(.init, &nonce, &buf, &nonce);
         const info = parseInitResponse(msg, nonce) catch return error.TransportFailed;
         if (!info.supportsCbor()) return error.TransportFailed;
+        // CID 0 is reserved and the broadcast CID is for INIT only (§11.2.3): a
+        // device that hands either out as the new channel is not speaking CTAPHID.
+        if (info.cid == 0 or info.cid == broadcast_cid) return error.TransportFailed;
         ch.cid = info.cid;
         return ch;
     }
 
     fn exchange(self: *Channel, cmd: Command, payload: []const u8, out: []u8) framing.TransportError![]const u8 {
+        return self.exchangeFiltered(cmd, payload, out, null);
+    }
+
+    /// `init_nonce`: an INIT response on the broadcast channel whose nonce is
+    /// not this one answers another client's INIT and is skipped (§11.2.3:
+    /// "the client ignores it and keeps reading"), instead of failing `open`.
+    fn exchangeFiltered(self: *Channel, cmd: Command, payload: []const u8, out: []u8, init_nonce: ?*const [8]u8) framing.TransportError![]const u8 {
         self.last_hid_error = null;
         var enc = Encoder.init(self.cid, cmd, payload) catch return error.TransportFailed;
         var pkt: Packet = undefined;
@@ -276,6 +286,10 @@ pub const Channel = struct {
                     },
                     else => {
                         if (m.cmd != cmd) return error.TransportFailed;
+                        if (init_nonce) |n| if (m.payload.len >= 8 and !std.mem.eql(u8, m.payload[0..8], n)) {
+                            asm_ = Assembler.init(self.cid, out);
+                            continue;
+                        };
                         return m.payload;
                     },
                 },
@@ -551,4 +565,166 @@ test "Channel: CTAPHID_ERROR, a too-small buffer, and a device without CBOR" {
     var hid2: FakeHid = .{ .a = a, .caps = 0x08 };
     defer hid2.queue.deinit(a);
     try testing.expectError(error.TransportFailed, Channel.open(hid2.dev(), .{ 0, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+test "parseInitResponse: every field is read from its own offset" {
+    const nonce = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var payload: [17]u8 = undefined;
+    @memcpy(payload[0..8], &nonce);
+    std.mem.writeInt(u32, payload[8..12], 0xa1b2c3d4, .big);
+    payload[12] = 2;
+    payload[13] = 5;
+    payload[14] = 6;
+    payload[15] = 7;
+    payload[16] = 0x05;
+    const r = try parseInitResponse(&payload, nonce);
+    try testing.expectEqual(@as(u8, 2), r.protocol_version);
+    try testing.expectEqual(@as(u8, 5), r.device_major);
+    try testing.expectEqual(@as(u8, 6), r.device_minor);
+    try testing.expectEqual(@as(u8, 7), r.device_build);
+    try testing.expectEqual(@as(u8, 0x05), r.capabilities);
+}
+
+test "assembler: the length bound is the protocol's, not only the buffer's" {
+    const a = testing.allocator;
+    const buf = try a.alloc(u8, max_payload + 100);
+    defer a.free(buf);
+    var asm_ = Assembler.init(5, buf);
+    var p: Packet = @splat(0);
+    std.mem.writeInt(u32, p[0..4], 5, .big);
+    p[4] = 0x90;
+    // 7610 bytes would need 129 continuation packets; sequence number 128 has bit 7 set.
+    std.mem.writeInt(u16, p[5..7], max_payload + 1, .big);
+    try testing.expectError(error.PayloadTooLarge, asm_.feed(&p));
+    std.mem.writeInt(u16, p[5..7], max_payload, .big);
+    try testing.expectEqual(Feed.incomplete, try asm_.feed(&p));
+}
+
+test "assembler: back-to-back messages on one assembler, and a buffer of exactly the message size" {
+    const a = testing.allocator;
+    var asm_ = Assembler.init(9, try a.alloc(u8, 130));
+    defer a.free(asm_.buf);
+    // First message: 130 bytes = 57 + 59 + 14, so the last packet is partial and
+    // fills the buffer to its last byte.
+    var first: [130]u8 = undefined;
+    for (&first, 0..) |*b, i| b.* = @intCast(i);
+    var enc = try Encoder.init(9, .cbor, &first);
+    var p: Packet = undefined;
+    var done: ?Message = null;
+    while (enc.next(&p)) {
+        switch (try asm_.feed(&p)) {
+            .complete => |m| done = m,
+            else => {},
+        }
+    }
+    try testing.expectEqualSlices(u8, &first, done.?.payload);
+    // Second message on the same assembler: sequence numbers restart at 0 and a
+    // finished message leaves nothing in progress.
+    var second: [100]u8 = undefined;
+    for (&second, 0..) |*b, i| b.* = @intCast(255 - i);
+    var enc2 = try Encoder.init(9, .ping, &second);
+    done = null;
+    while (enc2.next(&p)) {
+        switch (try asm_.feed(&p)) {
+            .complete => |m| done = m,
+            else => {},
+        }
+    }
+    try testing.expectEqualSlices(u8, &second, done.?.payload);
+    try testing.expectEqual(Command.ping, done.?.cmd);
+    // Nothing is in progress now: a continuation packet is a stray.
+    p[4] = 0;
+    try testing.expectError(error.UnexpectedContinuation, asm_.feed(&p));
+    // ... and a fresh init is not "an init during a message".
+    p[4] = 0x90;
+    std.mem.writeInt(u16, p[5..7], 1, .big);
+    try testing.expect((try asm_.feed(&p)) == .complete);
+}
+
+/// A scripted device for hostile-device cases: writes are swallowed, reads pop
+/// `queue`, or (with `flood_cid` set) are an endless stream of keep-alives.
+const ScriptDev = struct {
+    a: std.mem.Allocator,
+    queue: std.ArrayList(Packet) = .empty,
+    flood_cid: ?u32 = null,
+    reads: usize = 0,
+
+    fn dev(self: *ScriptDev) ReportDevice {
+        return .{ .ctx = self, .writeFn = write, .readFn = read };
+    }
+
+    fn push(self: *ScriptDev, cid: u32, cmd: Command, payload: []const u8) !void {
+        var enc = try Encoder.init(cid, cmd, payload);
+        var p: Packet = undefined;
+        while (enc.next(&p)) try self.queue.append(self.a, p);
+    }
+
+    fn write(_: *anyopaque, _: *const Packet) framing.TransportError!void {}
+
+    fn read(ctx: *anyopaque, report: *Packet) framing.TransportError!void {
+        const self: *ScriptDev = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        if (self.flood_cid) |cid| {
+            var enc = Encoder.init(cid, .keepalive, &.{1}) catch unreachable;
+            _ = enc.next(report);
+            return;
+        }
+        if (self.queue.items.len == 0) return error.TransportFailed;
+        report.* = self.queue.orderedRemove(0);
+    }
+};
+
+test "Channel: a device that only ever sends keep-alives is given up on" {
+    var sd: ScriptDev = .{ .a = testing.allocator, .flood_cid = 7 };
+    var ch: Channel = .{ .dev = sd.dev(), .cid = 7 };
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
+    try testing.expectEqual(@as(usize, max_keepalives + 1), sd.reads);
+}
+
+test "Channel: a response to another command, an empty error, and a stale error" {
+    const a = testing.allocator;
+    var sd: ScriptDev = .{ .a = a };
+    defer sd.queue.deinit(a);
+    var ch: Channel = .{ .dev = sd.dev(), .cid = 7 };
+    var out: [64]u8 = undefined;
+
+    // A PING answer to a CBOR request is not the answer.
+    try sd.push(7, .ping, &.{ 0, 1, 2 });
+    try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
+
+    // CTAPHID_ERROR without its code byte: reported as `other`, no out-of-range read.
+    sd.queue.clearRetainingCapacity();
+    try sd.push(7, .@"error", &.{});
+    try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
+    try testing.expectEqual(HidError.other, ch.last_hid_error.?);
+
+    // The next successful transaction clears the recorded error.
+    sd.queue.clearRetainingCapacity();
+    try sd.push(7, .cbor, &.{0x00});
+    try testing.expectEqual(@as(usize, 1), try ch.transact(&.{0x04}, &out));
+    try testing.expectEqual(@as(?HidError, null), ch.last_hid_error);
+}
+
+test "Channel.open: a device that allocates CID 0 or the broadcast CID is refused" {
+    const a = testing.allocator;
+    for ([_]u32{ 0, broadcast_cid }) |bad| {
+        var hid: FakeHid = .{ .a = a, .cid = bad };
+        defer hid.queue.deinit(a);
+        try testing.expectError(error.TransportFailed, Channel.open(hid.dev(), .{ 1, 2, 3, 4, 5, 6, 7, 8 }));
+    }
+}
+
+test "Channel.open: another client's INIT response on the broadcast channel is skipped" {
+    const a = testing.allocator;
+    var hid: FakeHid = .{ .a = a };
+    defer hid.queue.deinit(a);
+    // Queued before ours: the answer to someone else's INIT (other nonce, other CID).
+    var foreign: [17]u8 = @splat(0);
+    @memcpy(foreign[0..8], &[_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 });
+    std.mem.writeInt(u32, foreign[8..12], 0x11223344, .big);
+    foreign[16] = 0x04;
+    try hid.push(broadcast_cid, .init, &foreign);
+    const ch = try Channel.open(hid.dev(), .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try testing.expectEqual(hid.cid, ch.cid);
 }

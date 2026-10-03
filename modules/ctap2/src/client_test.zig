@@ -439,3 +439,83 @@ test "SharedSecret encrypt/decryptToken round trip and wipe" {
     s.deinit();
     for (s.bytes) |b| try testing.expectEqual(@as(u8, 0), b);
 }
+
+// ── audit 2026-10-03 additions ──────────────────────────────────────────────
+
+test "Token.authenticate, protocol One: the whole 32-byte token is the HMAC key, output 16 bytes" {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var t: clientpin.Token = .{ .protocol = .one, .len = 32 };
+    for (&t.bytes, 0..) |*b, i| b.* = @intCast(0x40 + i);
+    const msg = "client data hash stand-in";
+    var full: [32]u8 = undefined;
+    Hmac.create(&full, msg, &t.bytes);
+    const sig = t.authenticate(msg);
+    try testing.expectEqual(@as(u8, 16), sig.len);
+    try testing.expectEqualSlices(u8, full[0..16], sig.slice());
+    // A 16-byte token keys with those 16 bytes only.
+    var t16: clientpin.Token = .{ .protocol = .one, .len = 16 };
+    @memcpy(t16.bytes[0..16], t.bytes[0..16]);
+    var full16: [32]u8 = undefined;
+    Hmac.create(&full16, msg, t.bytes[0..16]);
+    try testing.expectEqualSlices(u8, full16[0..16], t16.authenticate(msg).slice());
+}
+
+test "Token.deinit wipes the bytes and the length" {
+    var t: clientpin.Token = .{ .protocol = .two, .len = 32 };
+    @memset(&t.bytes, 0xee);
+    t.deinit();
+    try testing.expectEqual(@as(u8, 0), t.len);
+    try testing.expectEqual(@as(usize, 0), t.slice().len);
+    for (t.bytes) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "getKeyAgreement: a y coordinate of 31 bytes is rejected, not read past" {
+    const pk = authKey();
+    const g = goodKeyEntries(&pk);
+    const y31 = pk.y[0..31];
+    const entries = [_]MapEntry{ g[0], g[1], g[2], g[3], .{ .key = Value.fromI64(-3), .value = .{ .bytes = y31 } } };
+    const r = try keyResp(&entries);
+    defer a.free(r);
+    var h = harness(&.{r}, "");
+    defer h.deinit();
+    try testing.expectError(error.InvalidKeyAgreement, h.client(.one).getKeyAgreement());
+}
+
+/// A random source that counts how many times it is asked for bytes.
+const CountingRandom = struct {
+    calls: usize = 0,
+    fn random(self: *CountingRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+    fn fill(self: *CountingRandom, buf: []u8) void {
+        self.calls += 1;
+        @memset(buf, 0);
+    }
+};
+
+test "an unusable ECDH scalar is redrawn exactly 8 times, then EntropyFailure" {
+    const pk = authKey();
+    const ke = goodKeyEntries(&pk);
+    const kr = try keyResp(&ke);
+    defer a.free(kr);
+    var tr = testutil.ScriptTransport.init(a, &.{kr});
+    defer tr.deinit();
+    var cr: CountingRandom = .{};
+    const c = clientpin.Client.init(a, tr.transport(), cr.random(), .one);
+    try testing.expectError(error.EntropyFailure, c.getPinToken("1234"));
+    try testing.expectEqual(@as(usize, 8), cr.calls);
+}
+
+test "fromInfo: maxMsgSize is clamped from below as well as above" {
+    var h = harness(&.{}, "");
+    defer h.deinit();
+    var info: getinfo.Info = .{};
+    info.max_msg_size = 10;
+    try testing.expectEqual(@as(usize, 64), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
+    info.max_msg_size = 0;
+    try testing.expectEqual(@as(usize, 64), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
+    info.max_msg_size = 4000;
+    try testing.expectEqual(@as(usize, 4000), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
+    info.max_msg_size = null;
+    try testing.expectEqual(@as(usize, 2048), clientpin.Client.fromInfo(a, h.tr.transport(), h.rnd.random(), info).?.max_response);
+}

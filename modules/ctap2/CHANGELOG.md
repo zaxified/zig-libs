@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Audit (review + mutation, 87 mutants). Fix: `ctaphid.Channel.open`
+  now refuses a device that allocates CID 0 or the broadcast CID (`TransportFailed`), and
+  skips an INIT response carrying another client's nonce instead of failing (§11.2.3).
+  20 new tests pin the guards the first mutation pass left unchecked; see SPEC.md
+  § Audit 2026-10-03.
 - **2026-09-30** — New module: the CTAP 2.1 `authenticatorClientPIN` command layer
   over a caller-supplied `Transport`, on top of `ctap2pin` (crypto) and `cbor`.
   Message framing (command byte || CBOR, status byte || CBOR), every CTAP 2.1 §8.2

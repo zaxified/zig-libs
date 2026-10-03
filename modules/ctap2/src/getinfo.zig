@@ -332,3 +332,62 @@ test "parse: not a map, empty, truncated and trailing bytes" {
     try testing.expectError(error.UnexpectedType, parse(a, &.{0x80}));
     try testing.expectError(error.MalformedCbor, parse(a, &.{ 0xa0, 0x00 })); // trailing garbage
 }
+
+test "parse: an aaguid longer than 16 bytes is refused" {
+    const aaguid = [_]u8{0} ** 17;
+    const b = baseEntries(&aaguid);
+    try expectParseError(error.BadLength, &b);
+}
+
+test "parse: a duplicated option id is refused" {
+    const aaguid = [_]u8{0} ** 16;
+    const b = baseEntries(&aaguid);
+    const opts = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "uv" }, .value = .{ .bool = true } },
+        .{ .key = .{ .text = "uv" }, .value = .{ .bool = false } },
+    };
+    try expectParseError(error.DuplicateKey, &.{ b[0], b[1], .{ .key = .{ .uint = 4 }, .value = .{ .map = &opts } } });
+}
+
+test "parse: every version string sets its own flag" {
+    const a = testing.allocator;
+    const aaguid = [_]u8{0} ** 16;
+    const b = baseEntries(&aaguid);
+    const names = [_][]const u8{ "FIDO_2_1", "FIDO_2_0", "FIDO_2_1_PRE", "U2F_V2" };
+    for (names, 0..) |name, which| {
+        const versions = [_]cbor.Value{.{ .text = name }};
+        const entries = [_]cbor.MapEntry{ .{ .key = .{ .uint = 1 }, .value = .{ .array = &versions } }, b[1] };
+        const bytes = try enc(a, .{ .map = &entries });
+        defer a.free(bytes);
+        const v = (try parse(a, bytes)).versions;
+        try testing.expectEqual(which == 0, v.fido_2_1);
+        try testing.expectEqual(which == 1, v.fido_2_0);
+        try testing.expectEqual(which == 2, v.fido_2_1_pre);
+        try testing.expectEqual(which == 3, v.u2f_v2);
+    }
+}
+
+test "supportsPinWithPermissions / supportsUvWithPermissions need both options" {
+    var info: Info = .{};
+    try testing.expect(!info.supportsPinWithPermissions());
+    info.options.client_pin = true;
+    try testing.expect(!info.supportsPinWithPermissions()); // pinUvAuthToken absent
+    info.options.pin_uv_auth_token = false;
+    try testing.expect(!info.supportsPinWithPermissions());
+    info.options.client_pin = false;
+    info.options.pin_uv_auth_token = true;
+    try testing.expect(!info.supportsPinWithPermissions()); // no PIN set / supported
+    info.options.client_pin = true;
+    try testing.expect(info.supportsPinWithPermissions());
+
+    var uv: Info = .{};
+    uv.options.pin_uv_auth_token = true;
+    try testing.expect(!uv.supportsUvWithPermissions()); // uv absent
+    uv.options.uv = false;
+    try testing.expect(!uv.supportsUvWithPermissions());
+    uv.options.uv = true;
+    uv.options.pin_uv_auth_token = false;
+    try testing.expect(!uv.supportsUvWithPermissions());
+    uv.options.pin_uv_auth_token = true;
+    try testing.expect(uv.supportsUvWithPermissions());
+}
