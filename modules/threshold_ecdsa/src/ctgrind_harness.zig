@@ -167,8 +167,8 @@ fn fixtureAuxParams(random: std.Random) !root.AuxParams {
     while (strip < nt_len and nt_buf[strip] == 0) : (strip += 1) {}
     const n_tilde = try root.AuxModulus.fromBytes(nt_buf[strip..nt_len], .big);
     const x = sampleFeBelow(n_tilde, random);
-    const h1 = n_tilde.sq(x);
-    const h2 = n_tilde.sq(h1);
+    const h2 = n_tilde.sq(x);
+    const h1 = n_tilde.sq(h2); // h1 ∈ ⟨h2⟩, as generateAuxParams
     return .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 };
 }
 
@@ -408,7 +408,8 @@ fn runPimod(allocator: std.mem.Allocator, tainted: bool) !void {
 // ── target "piprm": taint the ring-Pedersen trapdoor through Πprm's prover ─
 //
 // `aux_proofs.Piprm.proveBound` over tss-lib's 2048-bit Ñ, `p̃`, `q̃` and
-// `λ` (log_h1 h2) tainted. Since 2026-10-03 φ is a limb product and the
+// `λ` tainted (tss-lib's α = log_h1 h2, not this module's log_h2 h1: the
+// proof it yields does not verify, and the timing does not care). Since 2026-10-03 φ is a limb product and the
 // responses `a_i + e_i·λ mod φ` one masked subtraction; what branches is the
 // nonce draw's accept verdict (`a_i < φ`).
 fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {

@@ -226,6 +226,12 @@ as a measurement rather than a rediscovery.
 
 ## Backlog / deferred
 
+- **Review 2026-10-03 (L6):** `fromPrimes` trusts `q` to be prime (documented) and a Carmichael
+  `p` passes the `qInv` Fermat self-check; the sign-time fault check then refuses such a key, so it
+  fails late rather than at import. Paillier's checked path tests primality; rsa could offer the same
+  (`DynModint.isProbablePrime` on both). Also reword the "2^-128 worst case" Miller-Rabin comment
+  (witnesses come from the lower half — montint backlog L2). Effort S.
+
 - The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT — see "Verification"
   above.
 - Anything not covered by the phase list above (there is no known scope gap versus RFC 8017 P1–P6

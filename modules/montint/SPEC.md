@@ -639,6 +639,15 @@ speed dispatch, not a correctness bound.
 
 ## Backlog / deferred
 
+- **Review 2026-10-03 (independent, read-only) — no wrong value found; LOW items:** (L1)
+  `isProbablePrime(rounds = 0)` answers "prime" for every odd modulus — refuse or assert `rounds > 0`;
+  (L2) witnesses are drawn from `[2, 2^(bits−1))`, the lower half, so the `4^-rounds` worst-case bound
+  rsa/paillier quote is not the theorem's (uniform over `[2, m−2]`) — reword, or draw below `m`;
+  (L3) `inverse` needs `a < m`: a wider `a` is truncated to the slot or refused (verdict-checked, never
+  a wrong inverse) — pin it in a test; (L4) `nt.divExact(b = 0)` returns garbage, `gcd`/`lcm` are
+  documented for ≥ 1 only — debug assert; (L5) `toBytesBE`'s length check is a debug assert, so a
+  short buffer truncates in ReleaseFast. All callers are safe today. Effort S.
+
 - ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
 - **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); `isOdd`, and the fixed-width `Modint` itself, still open. Effort S. Fits §2.
 - ~~**Modular inversion (constant-time, safegcd-style)**~~ ✅ 2026-10-03 `DynModint.inverse` (divsteps) and `inverseOfModulus` (any `n`, even included); `threshold_ecdsa`'s Πmod `d = Ñ⁻¹ mod φ` moved onto it (ctgrind `pimod` 540 → 4). Still open: **square root for prime moduli** (crypto-bigint, OpenSSL) — Effort S–M; and **batched divsteps** (62 steps per transition matrix, as crypto-bigint/libsecp256k1): one step at a time costs ~one modexp per inversion, fine for key setup, ~10× too slow for a per-message path. Effort M. Fits §2.

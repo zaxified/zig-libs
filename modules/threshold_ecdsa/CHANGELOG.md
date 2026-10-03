@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **⛔ Security fix: Πprm proved the wrong direction.**
+  Aux generation drew `h1` and set `h2 = h1^λ`, and Πprm proved that, i.e.
+  `h2 ∈ ⟨h1⟩`. The commitment `h1^x·h2^ρ` hides `x` only if `h1 ∈ ⟨h2⟩`;
+  a dishonest tuple owner could pick `h2 = h1^M` (smooth `M`, Blum primes
+  pass Πmod) and read `x mod M` out of every commitment the other parties
+  made under its tuple — their MtA witnesses, key shares included. Now
+  `h2 = r²`, `h1 = h2^λ`, and Πprm proves `h1 = h2^λ` (CGGMP21 Fig.17's
+  `s = t^λ`). **Breaking:** `AuxTrapdoor.lambda` is `log_{h2} h1`; Πprm
+  proofs made before do not verify. Wire format unchanged. Also: `Pimod`
+  verification refuses `Ñ` below 5 bits — `Ñ = 3` looped forever in the
+  Miller-Rabin witness draw (both found by an independent review).
+
 - **2026-10-03** — **Πprm's prover is constant-time in `p̃`, `q̃`, `λ`;
   Miller-Rabin lives in `montint`.** `φ` is a limb product, the responses
   `a_i + e_i·λ mod φ` one masked subtraction and the nonce draw's `a_i < φ`

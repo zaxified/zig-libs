@@ -85,7 +85,10 @@ pub fn main(init: std.process.Init) !void {
         try w.writeAll("\",\n      \"aux_q_safe\": \"");
         try hex(w, auxes[i].trapdoor.q);
         try w.writeAll("\",\n      \"aux_lambda\": \"");
-        try auxFeHex(w, auxes[i].trapdoor.lambda);
+        // tss-lib's Alpha (h2 = h1^Alpha) is the inverse of this module's
+        // trapdoor (h1 = h2^lambda, since 2026-10-03).
+        const td = auxes[i].trapdoor;
+        try auxFeHex(w, try tecdsa.auxLogInverse(aux_params[i].n_tilde, td.p, td.q, td.lambda));
         try w.print("\"\n    }}{s}\n", .{if (i + 1 < n) "," else ""});
     }
     try w.writeAll("  ]\n}\n");

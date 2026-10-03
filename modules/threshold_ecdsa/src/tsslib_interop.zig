@@ -101,7 +101,8 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
         const tp = try unhex(allocator, p.aux_p_safe);
         errdefer allocator.free(tp);
         const tq = try unhex(allocator, p.aux_q_safe);
-        trapdoors[i] = .{ .p = tp, .q = tq, .lambda = try auxFe(allocator, nt, p.aux_lambda) };
+        // `aux_lambda` is tss-lib's Alpha (h2 = h1^Alpha); the trapdoor is its inverse.
+        trapdoors[i] = .{ .p = tp, .q = tq, .lambda = try root.auxLogInverse(nt, tp, tq, try auxFe(allocator, nt, p.aux_lambda)) };
         made += 1;
         shares[i] = .{
             .index = p.index,
@@ -148,8 +149,8 @@ test "tss-lib keygen output: this module signs with it; tss-lib's ring-Pedersen 
         try sig.verify(set.message, pk);
     }
 
-    // tss-lib's N-tilde are Blum products with h2 ∈ ⟨h1⟩: our proofs of
-    // correct generation, made from tss-lib's trapdoor, verify.
+    // tss-lib's N-tilde are Blum products with ⟨h1⟩ = ⟨h2⟩: our proofs of
+    // correct generation (h1 ∈ ⟨h2⟩), made from tss-lib's trapdoor, verify.
     for (loaded.entries, loaded.trapdoors) |e, td| {
         const proof = try aux_proofs.proveWellFormed(allocator, e.aux, td, random);
         try aux_proofs.verifyWellFormed(e.aux, proof, random);

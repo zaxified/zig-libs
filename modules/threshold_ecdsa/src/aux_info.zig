@@ -292,7 +292,6 @@ fn readLenPrefixed(bytes: []const u8, offset: *usize) error{InvalidEncoding}![]c
 
 const testing = std.testing;
 const vectors = @import("tsslib_vectors.zig");
-
 fn unhexAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, (hex.len + 1) / 2);
     errdefer allocator.free(out);
@@ -329,10 +328,12 @@ fn tssLocal(allocator: std.mem.Allocator, i: usize) !LocalAux {
     errdefer allocator.free(tp);
     const tq = try unhexAlloc(allocator, p.aux_q_safe);
     errdefer allocator.free(tq);
+    // tss-lib ships Alpha = log_{h1} h2; this module's trapdoor is its inverse.
+    const lambda = try root.auxLogInverse(nt, tp, tq, try fe(allocator, nt, p.aux_lambda));
     return LocalAux.fromParts(
         key,
         .{ .n_tilde = nt, .h1 = try fe(allocator, nt, p.h1), .h2 = try fe(allocator, nt, p.h2) },
-        .{ .p = tp, .q = tq, .lambda = try fe(allocator, nt, p.aux_lambda) },
+        .{ .p = tp, .q = tq, .lambda = lambda },
     );
 }
 

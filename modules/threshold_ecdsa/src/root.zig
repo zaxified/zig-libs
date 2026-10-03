@@ -492,8 +492,10 @@ pub const aux_modulus_bytes = aux_modulus_bits / 8;
 /// One party's ring-Pedersen auxiliary parameters (GG18 §4 / GG20's
 /// Appendix, "Pedersen commitment parameters"): a safe-prime-product
 /// modulus `N_tilde` and two generators `h1`, `h2` of its group of
-/// squares, with `h2 = h1^lambda mod N_tilde` for a secret `lambda` known
-/// only to the generating party. Phase-2b/2c ZK range proofs (proving a
+/// squares, with `h1 = h2^lambda mod N_tilde` for a secret `lambda` known
+/// only to the generating party (so `h1 ∈ ⟨h2⟩`: the commitment
+/// `h1^x·h2^ρ` hides `x` because its randomness base generates the message
+/// base). Phase-2b/2c ZK range proofs (proving a
 /// Paillier plaintext lies in a bounded range without revealing it) use
 /// these as the commitment base for a Pedersen-style hiding commitment
 /// mod `N_tilde` — see GG18 §4/§6 and GG20's proof-system appendices.
@@ -611,7 +613,7 @@ pub const AuxParams = struct {
     ///
     /// **TODO(Πprm/Πmod):** the full fix is a GG20/CMP zero-knowledge
     /// proof-of-correct-generation broadcast alongside the tuple (that `Ñ` is
-    /// a product of two safe primes and `h2 = h1^λ` for a known `λ`) — the
+    /// a product of two safe primes and `h1 = h2^λ` for a known `λ`) — the
     /// larger, deliberately-deferred item (`generateAuxParamsInternal`
     /// already returns the `λ` such a prover would need). This structural
     /// validation is the cheap, always-enforced floor beneath it, not a
@@ -987,13 +989,13 @@ fn sampleNonzeroLtModulus(m: AuxModulus, random: std.Random) AuxFe {
 }
 
 /// The full ring-Pedersen generation, returning the secret discrete log
-/// `lambda` (= log_{h1} h2) ALONGSIDE the public `AuxParams`.
+/// `lambda` (= log_{h2} h1) ALONGSIDE the public `AuxParams`.
 /// `generateAuxParams` calls this and discards `lambda` (see its doc
 /// comment's retention decision); this module's own test uses the returned
-/// `lambda` to verify `h2 == h1^lambda`.
+/// `lambda` to verify `h1 == h2^lambda`.
 const AuxGen = struct {
     params: AuxParams,
-    /// log_{h1} h2 ∈ [1, p'·q') — SECRET. Canonical mod `n_tilde`.
+    /// log_{h2} h1 ∈ [1, p'·q') — SECRET. Canonical mod `n_tilde`.
     lambda: AuxFe,
     /// Non-null only when `generateAuxParamsInternal` was called with a
     /// non-null `retain_allocator`: `p̃`/`q̃` (big-endian, owned by that
@@ -1070,14 +1072,17 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
     const ord_bits = b_ord.bitCountAbs();
     const ord_len = byteLen(ord_bits);
 
-    // 3. h1 = r² mod N_tilde — a random element of the group of squares.
+    // 3. h2 = r² mod N_tilde — a random element of the group of squares.
+    //    h2 is the base the commitment's RANDOMNESS rides on (`h1^x·h2^ρ`),
+    //    so it is the one drawn uniformly and h1 is derived from it in step
+    //    5: Πprm then proves h1 ∈ ⟨h2⟩, the direction hiding needs.
     const one = n_tilde.one();
-    var h1: AuxFe = undefined;
+    var h2: AuxFe = undefined;
     while (true) {
         const r = sampleNonzeroLtModulus(n_tilde, random);
         const cand = n_tilde.sq(r);
         if (!cand.isZero() and !cand.eql(one)) {
-            h1 = cand;
+            h2 = cand;
             break;
         }
     }
@@ -1098,20 +1103,20 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
         }
     };
 
-    // 5. h2 = h1^lambda mod N_tilde (constant-time modexp; lambda is secret —
+    // 5. h1 = h2^lambda mod N_tilde (constant-time modexp; lambda is secret —
     // montint via `zkproofs.powSecret`, not ff's pow, which branches on the
     // exponent's windows once LLVM has optimised it).
     var lam_bytes: [aux_modulus_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &lam_bytes);
     lambda_fe.toBytes(&lam_bytes, .big) catch unreachable;
-    const h2 = zkproofs.powSecret(n_tilde, h1, &lam_bytes);
+    const h1 = zkproofs.powSecret(n_tilde, h2, &lam_bytes);
 
     return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe, .p = ret_p, .q = ret_q };
 }
 
 /// The trapdoor behind a ring-Pedersen `AuxParams` tuple: the two safe-prime
-/// factors `p̃`, `q̃` of `n_tilde` and the secret exponent `lambda = log_{h1}
-/// h2`. SECRET — as sensitive as any other private-key material. Needed by
+/// factors `p̃`, `q̃` of `n_tilde` and the secret exponent `lambda = log_{h2}
+/// h1` (CGGMP21's `s = t^λ` with `s := h1`, `t := h2`). SECRET — as sensitive as any other private-key material. Needed by
 /// `aux_proofs.Piprm.prove`/`aux_proofs.Pimod.prove` (the Πprm/Πmod
 /// proofs-of-correct-generation that close audit F1 for real, on top of the
 /// structural floor `AuxParams.validate` already enforces) to PROVE this
@@ -1121,7 +1126,9 @@ pub const AuxTrapdoor = struct {
     p: []const u8,
     /// `q̃` (big-endian, owned — free via `deinit`). SECRET.
     q: []const u8,
-    /// `log_{h1} h2 mod p'·q'`, canonical mod `n_tilde`. SECRET.
+    /// `log_{h2} h1 mod p'·q'`, canonical mod `n_tilde`. SECRET. Until
+    /// 2026-10-03 this was `log_{h1} h2` and Πprm proved the wrong
+    /// direction (see `aux_proofs.Piprm`).
     lambda: AuxFe,
 
     pub fn deinit(self: AuxTrapdoor, allocator: std.mem.Allocator) void {
@@ -1129,6 +1136,37 @@ pub const AuxTrapdoor = struct {
         allocator.free(self.q);
     }
 };
+
+/// `x⁻¹ mod p'·q'` for the safe primes `p̃ = 2p'+1`, `q̃ = 2q'+1` of
+/// `n_tilde` (big-endian) — the trapdoor converted between this module's
+/// `log_{h2} h1` and tss-lib's `LocalPreParams.Alpha = log_{h1} h2`, either
+/// way (the two are inverse mod the squares' order `p'·q'`). For interop
+/// tooling and fixtures; constant-time like `montint.DynModint.inverse`.
+pub fn auxLogInverse(n_tilde: AuxModulus, p_safe: []const u8, q_safe: []const u8, x: AuxFe) error{ NotInvertible, InvalidTrapdoor }!AuxFe {
+    const D = montint.DynModint(aux_modulus_bits);
+    var pp = D.loadBE(p_safe) catch return error.InvalidTrapdoor;
+    defer std.crypto.secureZero(u64, &pp);
+    var qp = D.loadBE(q_safe) catch return error.InvalidTrapdoor;
+    defer std.crypto.secureZero(u64, &qp);
+    for ([_]*D.Elem{ &pp, &qp }) |v| { // p' = (p̃ − 1)/2 = p̃ >> 1, p̃ odd
+        for (v, 0..) |*limb, i| limb.* = (limb.* >> 1) | if (i + 1 < v.len) v[i + 1] << 63 else 0;
+    }
+    var prod: [2 * D.max_limbs]u64 = undefined;
+    defer std.crypto.secureZero(u64, &prod);
+    montint.limbs.mulSchoolbook(&prod, &pp, &qp);
+    for (prod[D.max_limbs..]) |hi| if (hi != 0) return error.InvalidTrapdoor;
+    const ord = D.fromLimbs(prod[0..D.max_limbs]) catch return error.InvalidTrapdoor;
+    var x_buf: [aux_modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &x_buf);
+    x.toBytes(&x_buf, .big) catch unreachable; // canonical mod n_tilde, which fits
+    var xr = ord.reduceBytesBE(&x_buf); // tss-lib's Alpha may exceed p'·q'
+    defer std.crypto.secureZero(u64, &xr);
+    var inv: D.Elem = undefined;
+    defer std.crypto.secureZero(u64, &inv);
+    if (!ord.inverse(&xr, &inv)) return error.NotInvertible;
+    ord.toBytesBE(&inv, &x_buf);
+    return AuxFe.fromBytes(n_tilde, &x_buf, .big) catch error.InvalidTrapdoor; // < p'·q' < n_tilde
+}
 
 pub const AuxParamsWithTrapdoor = struct {
     params: AuxParams,
@@ -1169,10 +1207,12 @@ pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.R
 ///    probable-prime search shape + an extra Miller-Rabin pass on
 ///    (candidate-1)/2, and a p̃ ≡ 3 (mod 4) filter so p' is odd).
 /// 2. N_tilde = p̃ · q̃.
-/// 3. h1 = r² mod N_tilde for a random r — a uniform element of N_tilde's
+/// 3. h2 = r² mod N_tilde for a random r — a uniform element of N_tilde's
 ///    group of quadratic residues (order p'·q').
 /// 4. lambda ← [1, p'·q') uniformly, the secret exponent.
-/// 5. h2 = h1^lambda mod N_tilde (constant-time modexp).
+/// 5. h1 = h2^lambda mod N_tilde (constant-time modexp) — h1 ∈ ⟨h2⟩, the
+///    relation Πprm proves (the commitment `h1^x·h2^ρ` hides x only if it
+///    holds; see `aux_proofs.Piprm`).
 /// ```
 ///
 /// **λ-retention decision: `lambda` is DISCARDED here** — `AuxParams` holds
@@ -1180,12 +1220,12 @@ pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.R
 /// GG18/GG20 the tuple belongs to this party acting as the *verifier* of
 /// range proofs about OTHER parties' Paillier plaintexts; soundness (binding
 /// of the Pedersen commitment) requires the *prover* — i.e. every other
-/// party — not to know `lambda = log_{h1} h2`, and this party never acts as
+/// party — not to know `lambda = log_{h2} h1`, and this party never acts as
 /// a prover under its own tuple, so retaining `lambda` buys nothing and only
 /// widens the secret's exposure. It is therefore zeroed with the rest of the
 /// safe-prime material before return. **TODO(2c):** if a later phase adds
 /// the ZK proof of *correct aux-param generation* (a "Πprm"/"Πmod"-style
-/// proof that `h2 = h1^lambda` for a known `lambda`, which some GG20/CMP
+/// proof that `h1 = h2^lambda` for a known `lambda`, which some GG20/CMP
 /// variants broadcast alongside the tuple), that proof's PROVER step needs
 /// `lambda` retained during setup — expose it then via
 /// `generateAuxParamsInternal` (which already returns it) rather than
@@ -1199,7 +1239,7 @@ pub fn generateAuxParamsWithTrapdoor(allocator: std.mem.Allocator, random: std.R
 ///
 /// **Const-time:** the safe-prime *search* is inherently variable-time (how
 /// long it took reveals nothing about the primes kept); the secret exponent
-/// `lambda`'s use in `h2 = h1^lambda mod N_tilde` is the constant-time
+/// `lambda`'s use in `h1 = h2^lambda mod N_tilde` is the constant-time
 /// `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s `g^lambda mod n²`
 /// step. All secret buffers are `secureZero`'d.
 pub fn generateAuxParams(random: std.Random, bits: usize) AuxParams {
@@ -2015,8 +2055,8 @@ test {
 // generateAuxParams is now IMPLEMENTED (Phase 2b) — this test asserts the
 // ring-Pedersen tuple is well-formed at a small, fast bit size, and (via the
 // internal generator that also returns the secret exponent) that
-// h2 = h1^lambda actually holds.
-test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/odd/right-size, h1/h2 in range, h2 = h1^lambda)" {
+// h1 = h2^lambda actually holds.
+test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/odd/right-size, h1/h2 in range, h1 = h2^lambda)" {
     var prng = std.Random.DefaultPrng.init(0x617578706172616d); // "auxparam"
     const random = prng.random();
 
@@ -2042,9 +2082,9 @@ test "generateAuxParams: ring-Pedersen tuple is well-formed (N_tilde composite/o
     try testing.expect(!aux.h1.isZero() and !aux.h1.eql(one));
     try testing.expect(!aux.h2.isZero() and !aux.h2.eql(one));
 
-    // The load-bearing relation: h2 == h1^lambda mod N_tilde.
-    const h2_check = try aux.n_tilde.pow(aux.h1, gen.lambda);
-    try testing.expect(h2_check.eql(aux.h2));
+    // The load-bearing relation: h1 == h2^lambda mod N_tilde (h1 ∈ ⟨h2⟩).
+    const h1_check = try aux.n_tilde.pow(aux.h2, gen.lambda);
+    try testing.expect(h1_check.eql(aux.h1));
 
     // The public wrapper produces an equally well-formed (independent) tuple
     // and it round-trips through the byte codec.
@@ -2243,7 +2283,7 @@ test {
     _ = aux_info;
 }
 
-test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde and h2 == h1^lambda" {
+test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde and h1 == h2^lambda" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x747261706400); // "trapd\0"
     const random = prng.random();
@@ -2270,10 +2310,10 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
     const expected_n = bigFromBytes(gpa, stripLeadingZeros(&n_buf)) catch unreachable;
     try testing.expect(bn.order(expected_n) == .eq);
 
-    // h2 == h1^lambda mod n_tilde — same load-bearing relation the ungated
+    // h1 == h2^lambda mod n_tilde — same load-bearing relation the ungated
     // `generateAuxParams` test checks via the internal `lambda`.
-    const h2_check = try gen.params.n_tilde.pow(gen.params.h1, gen.trapdoor.lambda);
-    try testing.expect(h2_check.eql(gen.params.h2));
+    const h1_check = try gen.params.n_tilde.pow(gen.params.h2, gen.trapdoor.lambda);
+    try testing.expect(h1_check.eql(gen.params.h1));
 }
 
 // ── fuzz: the length-prefixed / counted wire codecs never panic or ───────
@@ -2493,7 +2533,7 @@ const Corpus = struct {
         k += 1;
         std.debug.assert(k == self.ks_entries.len);
 
-        // ── AuxParams: a REAL ring-Pedersen triple, `h2 = h1^lambda mod Ñ`,
+        // ── AuxParams: a REAL ring-Pedersen triple, `h1 = h2^lambda mod Ñ`,
         //    from this module's own generator; plus the toy triple.
         const gen = try generateAuxParamsWithTrapdoor(allocator, random, 128);
         defer gen.trapdoor.deinit(allocator);

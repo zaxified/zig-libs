@@ -368,11 +368,11 @@ fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalA
     var buf: [tecdsa.aux_modulus_bytes]u8 = undefined;
     random.bytes(&buf);
     buf[0] &= 0x3f;
-    const h1 = nt.sq(try tecdsa.AuxFe.fromBytes(nt, &buf, .big));
+    const h2 = nt.sq(try tecdsa.AuxFe.fromBytes(nt, &buf, .big));
     random.bytes(&buf);
     buf[0] &= 0x3f;
     const lambda = try tecdsa.AuxFe.fromBytes(nt, &buf, .big);
-    const h2 = try nt.pow(h1, lambda);
+    const h1 = try nt.pow(h2, lambda); // h1 ∈ ⟨h2⟩, the relation Πprm proves
     const p = try allocator.dupe(u8, ring.p());
     errdefer allocator.free(p);
     const q = try allocator.dupe(u8, ring.q());

@@ -33,10 +33,19 @@
 //! ## `s`/`t` vs `h1`/`h2` — the naming this module bridges
 //!
 //! CGGMP21 Fig.17 (Πprm) writes the ring-Pedersen generators as `s`, `t`
-//! with `t = s^lambda mod N`; this repo's `root.zig` calls them `h1`, `h2`
-//! with the IDENTICAL relation `h2 = h1^lambda mod n_tilde` (see
+//! with `s = t^lambda mod N` and commits as `s^x·t^ρ`; this repo's
+//! `root.zig` calls them `h1`, `h2` with the IDENTICAL relation `h1 =
+//! h2^lambda mod n_tilde` and commitment `h1^x·h2^ρ` (see
 //! `root.generateAuxParams`'s construction). Concretely: `s := aux.h1`,
-//! `t := aux.h2`. Every doc comment below uses `s`/`t` when quoting the
+//! `t := aux.h2`.
+//!
+//! ⚠ The direction is the security property. `h1 ∈ ⟨h2⟩` makes
+//! `h1^x·h2^ρ = h2^{λx+ρ}`, which `ρ` masks. Until 2026-10-03 this module
+//! had it reversed (`h2 = h1^λ`, proving `h2 ∈ ⟨h1⟩`), which a dishonest
+//! tuple owner satisfies with `h2 = h1^M` for a smooth `M | ord(h1)`: the
+//! commitment then fixes `x mod M` whatever `ρ` is, and Pohlig–Hellman
+//! reads it off (Alpha-Rays/TSSHOCK class). Πmod does not stop it — Blum
+//! primes may have smooth `(p̃−1)/2`. Every doc comment below uses `s`/`t` when quoting the
 //! paper's equations and `h1`/`h2` when referring to this module's fields
 //! — they are the SAME values.
 //!
@@ -237,7 +246,7 @@ pub const ModProof = struct {
 
 /// One of Πprm's `pi_prm_iterations` per-round responses (CGGMP21 Fig.17
 /// step 1/3): `a_commit` is the round's first-message commitment `A_i =
-/// s^{a_i} mod n_tilde`, `z` is the response `z_i = a_i + e_i*lambda mod
+/// t^{a_i} mod n_tilde`, `z` is the response `z_i = a_i + e_i*lambda mod
 /// phi(n_tilde)` (re-encoded canonical mod `n_tilde`, valid since `z_i <
 /// phi(n_tilde) < n_tilde`).
 pub const PrmEntry = struct {
@@ -738,17 +747,18 @@ pub const ProveError = std.mem.Allocator.Error;
 
 /// Πprm — CGGMP21 ePrint 2021/060 **Fig.17**, "ring-Pedersen parameters".
 pub const Piprm = struct {
-    /// **Prover.** Proves `t = s^lambda mod n_tilde` (`s := aux.h1`,
-    /// `t := aux.h2`) for a KNOWN `lambda`, i.e. that `s` and `t` generate
-    /// the SAME cyclic subgroup of `Z_n_tilde*` — WITHOUT revealing
-    /// `lambda`. Soundness `~2^-80` (`pi_prm_iterations` 1-bit rounds).
+    /// **Prover.** Proves `s = t^lambda mod n_tilde` (`s := aux.h1`,
+    /// `t := aux.h2`) for a KNOWN `lambda`, i.e. that `s ∈ ⟨t⟩` — the
+    /// message base lies in the subgroup the randomness base generates,
+    /// which is what makes `s^x·t^ρ` hiding — WITHOUT revealing `lambda`.
+    /// (It does NOT show `⟨s⟩ = ⟨t⟩`, and hiding does not need that.) Soundness `~2^-80` (`pi_prm_iterations` 1-bit rounds).
     ///
     /// Construction (prover knows `trapdoor.lambda` AND `phi(n_tilde) =
     /// (p̃-1)(q̃-1)`, computable from `trapdoor.p`/`.q`):
     ///
     /// ```text
     /// 1. For i in 1..=m: sample a_i <- Z_{phi(n_tilde)} uniformly,
-    ///    compute A_i = s^{a_i} mod n_tilde.
+    ///    compute A_i = t^{a_i} mod n_tilde.
     /// 2. e = derivePrmChallengeBits(derivePrmSeed(aux, A_1..A_m))
     ///    ∈ {0,1}^m — REAL, already implemented above.
     /// 3. For i in 1..=m: z_i = a_i + e_i*lambda mod phi(n_tilde) (plain
@@ -827,7 +837,7 @@ pub const Piprm = struct {
         //    (public; φ has n_tilde's length up to one bit, so a draw is kept
         //    with probability ≥ 1/2), kept when the borrow of a_i − φ says
         //    a_i < φ — the accept verdict is the only branch, its count
-        //    depends on φ/2^bits only. Commitment A_i = s^{a_i}
+        //    depends on φ/2^bits only. Commitment A_i = t^{a_i}
         //    (constant-time modexp — a_i masks λ).
         const n_bits = nt.bits();
         const n_len = byteLen(n_bits);
@@ -847,7 +857,7 @@ pub const Piprm = struct {
                 if (montint.limbs.subInto(&t, &phi) == 1) break; // a_i < φ
             }
             ntc.toBytesBE(ae, a_buf[0..n_len]);
-            commit.* = zkproofs.powSecret(nt, aux.h1, a_buf[0..n_len]); // a_i = 0 -> s^0 = 1; ff's pow branches on secret windows
+            commit.* = zkproofs.powSecret(nt, aux.h2, a_buf[0..n_len]); // a_i = 0 -> t^0 = 1; ff's pow branches on secret windows
         }
 
         // 2. Fiat-Shamir bit-challenge — the REAL scaffold machinery above.
@@ -888,7 +898,7 @@ pub const Piprm = struct {
     /// 2. Recompute e = derivePrmChallengeBits(derivePrmSeed(aux,
     ///    proof.entries[*].a_commit)) — the SAME call the prover made.
     /// 3. For each i in 1..=m: verify
-    ///      s^{z_i} == A_i * t^{e_i} (mod n_tilde)
+    ///      t^{z_i} == A_i * s^{e_i} (mod n_tilde)
     ///    (powWithEncodedPublicExponent — z_i/A_i/e_i are all PUBLIC
     ///    proof fields). Reject (return false) on ANY single failure.
     /// 4. Accept (return true) only if every round's equation holds.
@@ -932,13 +942,14 @@ pub const Piprm = struct {
         var e_bits: [pi_prm_iterations]bool = undefined;
         derivePrmChallengeBits(seed, &e_bits);
 
-        // 3+4. Per-round equation s^{z_i} == A_i * t^{e_i} (mod n_tilde);
-        //      reject on ANY single failure.
+        // 3+4. Per-round equation t^{z_i} == A_i * s^{e_i} (mod n_tilde);
+        //      reject on ANY single failure. t = h2 is the base: the
+        //      equation shows s = h1 ∈ ⟨h2⟩ (module doc, "direction").
         for (proof.entries, e_bits) |e, e_i| {
             var z_buf: [root.aux_modulus_bytes]u8 = undefined;
             e.z.toBytes(&z_buf, .big) catch return false;
-            const lhs = nt.powWithEncodedPublicExponent(aux.h1, stripLeadingZeros(&z_buf), .big) catch nt.one(); // z = 0 -> s^0 = 1
-            const rhs = if (e_i) nt.mul(e.a_commit, aux.h2) else e.a_commit;
+            const lhs = nt.powWithEncodedPublicExponent(aux.h2, stripLeadingZeros(&z_buf), .big) catch nt.one(); // z = 0 -> t^0 = 1
+            const rhs = if (e_i) nt.mul(e.a_commit, aux.h1) else e.a_commit;
             if (!auxFeEql(lhs, rhs)) return false;
         }
         return true;
@@ -1201,6 +1212,10 @@ pub const Pimod = struct {
     }
 
     fn verifyCore(nt: root.AuxModulus, binding: ModBinding, proof: ModProof) bool {
+        // The smallest Paillier-Blum modulus is 3·7 = 21 (5 bits). Below it
+        // the Miller-Rabin witness range [2, N−2] is empty for N = 3 and
+        // `randomWitness` would never return (review 2026-10-03 F2).
+        if (nt.bits() < 5) return false;
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
         nt.toBytes(&nt_buf, .big) catch return false;
         const n_bytes = stripLeadingZeros(&nt_buf);
@@ -1549,14 +1564,14 @@ fn toyFe2048(nt: root.AuxModulus, v: u8) root.AuxFe {
     return root.AuxFe.fromBytes(nt, &[_]u8{v}, .big) catch unreachable;
 }
 
-// ── F1 soundness scenario (b): h2 outside <h1> ──────────────────────────
+// ── F1 soundness scenario (b): h1 outside <h2> ──────────────────────────
 
 /// A genuine ~2000-bit odd composite (two ~1000-bit comptime factors —
 /// same construction `root.zig`'s own F1/F2 `validate` test uses for its
 /// `nt_ok`) with `h1 = 4 = 2^2`, `h2 = 9 = 3^2`: both perfect squares
 /// (hence Jacobi `+1`, hence `AuxParams.validate` accepts), but nothing
-/// ties `9` to a power of `4` mod this modulus — `h2` is (with
-/// overwhelming likelihood) NOT in the cyclic subgroup `<h1>`, exactly
+/// ties `4` to a power of `9` mod this modulus — `h1` is (with
+/// overwhelming likelihood) NOT in the cyclic subgroup `<h2>`, exactly
 /// what Πprm exists to rule out.
 fn outsideSubgroupAux() root.AuxParams {
     const composite = comptime blk: {
@@ -1569,7 +1584,7 @@ fn outsideSubgroupAux() root.AuxParams {
     return .{ .n_tilde = nt, .h1 = toyFe2048(nt, 4), .h2 = toyFe2048(nt, 9) };
 }
 
-test "F1 soundness (b) — h2 outside <h1>: AuxParams.validate() ACCEPTS it (documents the gap, ungated)" {
+test "F1 soundness (b) — h1 outside <h2>: AuxParams.validate() ACCEPTS it (documents the gap, ungated)" {
     var prng = std.Random.DefaultPrng.init(0x6f75747369646562); // "outsideb"
     const random = prng.random();
 
@@ -1577,7 +1592,7 @@ test "F1 soundness (b) — h2 outside <h1>: AuxParams.validate() ACCEPTS it (doc
     try aux.validate(random); // ACCEPTS — this is the gap Πprm closes.
 }
 
-test "F1 soundness (b) — h2 outside <h1>: Piprm.verify REJECTS it (documents the fix, GATED)" {
+test "F1 soundness (b) — h1 outside <h2>: Piprm.verify REJECTS it (documents the fix, GATED)" {
     if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
 
     const aux = outsideSubgroupAux();
@@ -1726,7 +1741,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
 const floor_p_hex = "e8b9d6a3adc7c356c8dc34ffac5c310c26f00d339da9d4d29a3242df890a8b3cb99621e9a5d9b7b2a2dda75cc47080dfa428ff071f2903bdf7e1cf9b63a6703a1faba133533045cd2d586c96f58ce9dddcc758f0eed9a26dd4f39d63ea6e95d1d602ac84de4a4b6cf3282aaf63499c03e8516bdd687f9edef9bfb59e406f7f27";
 const floor_q_hex = "d8b302a58e7c2892e3da8d73f56ebae0e4500b2ba96ec204744bf9a36457c881cd250e64f64324d8449678f54d11525a7ddaa66e3d883bcee543e5fba24ca57e227b630d1ef07860a60234f364b0b63877b3082d45c03fb69c86d38ee4f5754069e3d4c88d268ccb2f8185f2627ab4020fda8ab65951980adcc4843dc244a52f";
 
-/// `(Ñ = p̃·q̃, h1 = r², h2 = h1^λ)` with its trapdoor, the shape
+/// `(Ñ = p̃·q̃, h2 = r², h1 = h2^λ)` with its trapdoor, the shape
 /// `root.generateAuxParamsWithTrapdoor` produces, from the fixed primes.
 /// `λ` is a random 256-bit value: any `λ ∈ [1, p'·q')` is honest, and
 /// `p'·q' ≈ 2^2046`.
@@ -1749,12 +1764,12 @@ fn floorAuxWithTrapdoor(allocator: std.mem.Allocator, random: std.Random) !root.
     bn.toConst().writeTwosComplement(&n_buf, .big);
     const n_tilde = try root.AuxModulus.fromBytes(stripLeadingZeros(&n_buf), .big);
 
-    const h1 = n_tilde.sq(sampleNonzeroLtModulus(n_tilde, random));
+    const h2 = n_tilde.sq(sampleNonzeroLtModulus(n_tilde, random));
     var lam: [32]u8 = undefined;
     random.bytes(&lam);
     lam[0] |= 0x80;
     const lambda = try root.AuxFe.fromBytes(n_tilde, &lam, .big);
-    const h2 = try n_tilde.pow(h1, lambda);
+    const h1 = try n_tilde.pow(h2, lambda);
     return .{
         .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 },
         .trapdoor = .{ .p = p, .q = q, .lambda = lambda },
@@ -1859,20 +1874,73 @@ test "audit F4(b): Pimod.verify's Jacobi guard alone refuses a non-unit w that f
     }
 }
 
+/// A hand-built Πprm proof over the toy Ñ = 187 that `base^{z_i} = A_i ·
+/// other^{e_i}` with `other = base^log`: the honest prover's arithmetic
+/// without reducing mod φ (`z_i = a_i + e_i·log` stays below 187).
+fn toyPrmProof(aux: root.AuxParams, base: u64, log: u64) PrmProof {
+    const nt = aux.n_tilde;
+    var commitments: [pi_prm_iterations]root.AuxFe = undefined;
+    var a_vals: [pi_prm_iterations]u64 = undefined;
+    for (&commitments, &a_vals, 0..) |*c, *a, i| {
+        a.* = 1 + (i * 37) % 150;
+        c.* = toyFe(nt, @intCast(powModSmall(base, a.*, 187)));
+    }
+    var e_bits: [pi_prm_iterations]bool = undefined;
+    derivePrmChallengeBits(derivePrmSeed(aux, null, &commitments), &e_bits);
+    var entries: [pi_prm_iterations]PrmEntry = undefined;
+    for (&entries, commitments, a_vals, e_bits) |*e, c, a, e_i| {
+        e.* = .{ .a_commit = c, .z = toyFe(nt, @intCast(a + if (e_i) log else 0)) };
+    }
+    return .{ .entries = entries };
+}
+
+test "review 2026-10-03 F1: Πprm proves h1 ∈ ⟨h2⟩ — a proof of h2 ∈ ⟨h1⟩ over a tuple with [⟨h1⟩:⟨h2⟩] = 5 is refused" {
+    // Ñ = 187: 3 has order 80, 3^5 = 56 has order 16. The tuple (h1 = 3,
+    // h2 = 56) is the attack shape: h2 = h1^5, h1 ∉ ⟨h2⟩. Until 2026-10-03
+    // the verifier checked h1^{z} = A·h2^{e} and accepted the owner's proof
+    // of it (λ = 5) — while every commitment c = h1^x·h2^ρ gives x mod 5
+    // away: c^16 = h1^{16x} (ord h2 = 16) and h1^16 has order 5.
+    const n: u64 = 187;
+    for (0..80) |x| for (0..16) |rho| {
+        const c = powModSmall(3, x, n) * powModSmall(56, rho, n) % n;
+        try testing.expectEqual(powModSmall(3, 16 * (x % 5), n), powModSmall(c, 16, n));
+    };
+
+    const nt = toyModulus();
+    const attack: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 3), .h2 = toyFe(nt, 56) };
+    // The reversed-relation proof (base h1, log 5) is what the old verifier took.
+    try testing.expect(!Piprm.verify(attack, toyPrmProof(attack, 3, 5)));
+
+    // Positive control, same machinery: h2 = 3 (order 80), h1 = 3^7 ∈ ⟨h2⟩,
+    // proof with base h2 and log 7 — the honest direction verifies.
+    const honest: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, @intCast(powModSmall(3, 7, n))), .h2 = toyFe(nt, 3) };
+    try testing.expect(Piprm.verify(honest, toyPrmProof(honest, 3, 7)));
+}
+
+test "review 2026-10-03 F2: Pimod.verify refuses Ñ = 3 instead of looping in the witness draw" {
+    // AuxModulus accepts any odd value ≥ 3 and the wire codec parses one;
+    // Miller-Rabin's witness range [2, N−2] is empty for N = 3.
+    const nt = try root.AuxModulus.fromBytes(&[_]u8{3}, .big);
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 2), .h2 = toyFe(nt, 2) };
+    var entries: [pi_mod_iterations]ModEntry = undefined;
+    for (&entries) |*e| e.* = .{ .x = toyFe(nt, 1), .z = toyFe(nt, 1), .a = false, .b = false };
+    try testing.expect(!Pimod.verify(aux, .{ .w = toyFe(nt, 2), .entries = entries }));
+}
+
 test "audit F4(c): Piprm.verify's h in {0,1} guard alone refuses a degenerate tuple whose proof is otherwise honest" {
-    // h2 = t = 1 makes `t = s^λ` TRUE for λ = 0, so the honest prover
-    // (A_i = s^{a_i}, z_i = a_i) passes every round — and a Pedersen
-    // commitment h1^m·h2^ρ = h1^m under that tuple hides nothing. With
+    // h1 = s = 1 makes `s = t^λ` TRUE for λ = 0, so the honest prover
+    // (A_i = t^{a_i}, z_i = a_i) passes every round — and a Pedersen
+    // commitment h1^m·h2^ρ = h2^ρ under that tuple binds nothing. With
     // h1 = h2 = 1 every round holds trivially. Jacobi (1/Ñ) = 1, so the
     // coprimality half of step 1 lets both through; the `eql(one)` checks
     // (CGGMP21 Fig.17's s, t ∈ Z_N^* with s, t ≠ 1) are the only refusal.
     const nt = toyModulus();
-    for ([_][2]u8{ .{ 4, 1 }, .{ 1, 1 } }) |c| {
+    for ([_][2]u8{ .{ 1, 4 }, .{ 1, 1 } }) |c| {
         const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, c[0]), .h2 = toyFe(nt, c[1]) };
         var entries: [pi_prm_iterations]PrmEntry = undefined;
         for (&entries, 0..) |*e, i| {
             const a: u64 = 1 + (i * 37) % 150;
-            e.* = .{ .a_commit = toyFe(nt, @intCast(powModSmall(c[0], a, 187))), .z = toyFe(nt, @intCast(a)) };
+            e.* = .{ .a_commit = toyFe(nt, @intCast(powModSmall(c[1], a, 187))), .z = toyFe(nt, @intCast(a)) };
         }
         try testing.expect(!Piprm.verify(aux, .{ .entries = entries }));
     }

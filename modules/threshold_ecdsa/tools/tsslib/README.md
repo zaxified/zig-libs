@@ -66,7 +66,9 @@ JSON, all byte strings lowercase hex, big-endian, no `0x`. `t` = signers needed
 (tss-lib threshold = t-1). Per party: `index` (Shamir x-coordinate = `PartyID.Key`),
 `x` (32-byte share), `big_x` (33-byte compressed x*G), `paillier_p/q` (N = p*q,
 g = N+1), `n_tilde`, `h1`, `h2`, `aux_p_safe`, `aux_q_safe` (n_tilde = p~*q~,
-safe primes p~ = 2p'+1), `aux_lambda` (h2 = h1^lambda mod n_tilde). Top level:
+safe primes p~ = 2p'+1), `aux_lambda` (h2 = h1^lambda mod n_tilde — tss-lib's
+`Alpha`; this module's `AuxTrapdoor.lambda` is its inverse mod p'q', converted
+by `auxLogInverse` both ways since 2026-10-03). Top level:
 `public_key` (33-byte SEC1 compressed). Signatures file:
 `{"message": ..., "signatures": [{"signers": [1,2], "r": ..., "s": ...}]}`.
 

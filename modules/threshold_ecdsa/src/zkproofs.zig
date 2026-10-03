@@ -2273,8 +2273,8 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 // -- honest accept / reject: the real Phase-2c security net --
 
 /// A REAL test fixture: a **2048-bit** Alice Paillier key plus ring-Pedersen
-/// params over a genuine **2048-bit** two-prime composite `N_tilde` with `h1`
-/// a square and `h2 = h1^lambda` (the same shape `root.generateAuxParams`
+/// params over a genuine **2048-bit** two-prime composite `N_tilde` with `h2`
+/// a square and `h1 = h2^lambda` (the same shape `root.generateAuxParams`
 /// produces, minus the safe-prime search — completeness/reject behavior
 /// doesn't depend on safe primes). **Sized at 2048 bits (not the old 1024 /
 /// 512) because the audit-F2 floor now REQUIRES every checked-path Paillier
@@ -2295,10 +2295,10 @@ fn realAuxAndKey(seed: u64) !struct { kp: paillier.KeyPair, aux: root.AuxParams 
     var x_buf: [paillier.modulus_bytes]u8 = undefined;
     const x_bytes = sampleNonzeroBelow(random, nt_buf[0..nt_len], &x_buf);
     const x = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(x_bytes), .big) catch unreachable;
-    const h1 = n_tilde.sq(x);
+    const h2 = n_tilde.sq(x);
     var l_buf: [paillier.modulus_bytes]u8 = undefined;
     const lambda_bytes = sampleNonzeroBelow(random, nt_buf[0..nt_len], &l_buf);
-    const h2 = powCt(n_tilde, h1, lambda_bytes);
+    const h1 = powCt(n_tilde, h2, lambda_bytes);
 
     return .{ .kp = kp, .aux = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 } };
 }

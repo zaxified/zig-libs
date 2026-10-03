@@ -80,8 +80,9 @@ its reject tests are fast and run in EVERY mode:**
   search (p̃ = 2p'+1 with p' also prime, `generateSafePrime` — the
   paillier/rsa probable-prime shape + an extra Miller-Rabin pass on
   (candidate-1)/2 and a p̃ ≡ 3 (mod 4) filter), `N_tilde = p̃·q̃`, a random
-  quadratic residue `h1 = r²`, a secret exponent `lambda ← [1, p'·q')`, and
-  `h2 = h1^lambda mod N_tilde`. `lambda` is DISCARDED (the tuple's owner is a
+  quadratic residue `h2 = r²`, a secret exponent `lambda ← [1, p'·q')`, and
+  `h1 = h2^lambda mod N_tilde` (so `h1 ∈ ⟨h2⟩`; until 2026-10-03 it was
+  `h2 = h1^lambda`, the wrong direction — see "Πprm / Πmod"). `lambda` is DISCARDED (the tuple's owner is a
   proof *verifier*, not a prover under its own `N_tilde`; see the function's
   doc comment for the retention decision). A separate trapdoor-retaining
   variant, `generateAuxParamsWithTrapdoor`, exists for a party that DOES
@@ -195,7 +196,7 @@ internal serialization, real and round-trip-tested, not a standard.
 - **`generateAuxParams` const-time posture.** The safe-prime *search* is
   inherently variable-time (how long it took reveals nothing about the primes
   kept) — same acceptable posture `paillier.generatePrime`/`rsa` establish.
-  The secret exponent `lambda`'s use in `h2 = h1^lambda mod N_tilde` is the
+  The secret exponent `lambda`'s use in `h1 = h2^lambda mod N_tilde` is the
   constant-time `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s
   `g^lambda mod n²`. All secret buffers (p̃/q̃/p'/q'/`lambda` source bytes)
   are `secureZero`'d.
@@ -467,11 +468,25 @@ Aborts", IACR ePrint 2021/060) Fig.16 ("Πmod", Paillier-Blum-modulus proof)
 and Fig.17 ("Πprm", ring-Pedersen-parameter proof) let the GENERATOR of an
 `AuxParams` tuple prove it is well-formed — Πmod proves `n_tilde` is a
 genuine product of two Blum primes `p̃, q̃ ≡ 3 (mod 4)` with `gcd(n_tilde,
-φ(n_tilde)) = 1`; Πprm proves `h1` (paper's `s`) and `h2` (paper's `t`)
-generate the same cyclic subgroup, i.e. `h2 = h1^lambda mod n_tilde` for a
-KNOWN `lambda` — and let the VALIDATOR verify those proofs, fully closing
+φ(n_tilde)) = 1`; Πprm proves `h1` (paper's `s`) lies in the subgroup `h2`
+(paper's `t`) generates, i.e. `h1 = h2^lambda mod n_tilde` for a KNOWN
+`lambda` — and let the VALIDATOR verify those proofs, fully closing
 audit F1 (the Jacobi check above is necessary-but-not-sufficient; these
 proofs are the sufficient fix the F1 write-up always pointed at).
+
+**Direction (review 2026-10-03, fixed the same day).** The commitment is
+`h1^x·h2^ρ`, so hiding needs the MESSAGE base in the subgroup of the
+RANDOMNESS base: `h1 = h2^λ` makes it `h2^{λx+ρ}`, which `ρ` masks. Πprm
+shows exactly `h1 ∈ ⟨h2⟩` — not `⟨h1⟩ = ⟨h2⟩`, which hiding does not need.
+Until 2026-10-03 the module generated and proved `h2 = h1^λ` (`h2 ∈ ⟨h1⟩`),
+which a dishonest tuple owner satisfies with `h2 = h1^M` for a smooth `M`
+dividing `ord(h1)`: Blum primes with smooth `(p̃−1)/2` pass Πmod, the
+commitment fixes `x mod M` for every `ρ`, and Pohlig–Hellman reads it off —
+the honest prover's MtA witness, the key share among them (Alpha-Rays /
+TSSHOCK class). tss-lib avoids it by proving both directions (two DLN
+proofs); CGGMP21 Fig.17 proves `s = t^λ`, the one that matters, which is
+what this module now does. Wire format unchanged; a proof made before the
+fix does not verify after it. Regression test: "review 2026-10-03 F1".
 
 **Status: IMPLEMENTED, `pi_mod_iterations`/`pi_prm_iterations` soundness
 parameter `m = 80` (≈2^-80 error) for both.** REAL: the `ModProof`/
@@ -538,7 +553,7 @@ in an honest proof → `verifyWellFormed` rejects) and a completeness test
 - Exactly which signing-round steps invoke plain MtA vs. MtAwc — that
   wiring belongs to Phase 2d (the signing protocol itself), not this file;
   `zkproofs.zig`/`mta.zig` only provide the primitives.
-- `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h2 = h1^lambda`)
+- `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h1 = h2^lambda`)
   is now DONE. The CHEAP structural validation of received aux tuples (audit
   F1 — composite `Ñ`, in-range square-subgroup `h1`/`h2`, coprimality) is
   enforced fail-closed at the prove entry points (`root.AuxParams.validate`);
@@ -580,8 +595,8 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   target `fac`, 2026-10-02): LLVM compiles its table select
   `cmov(ct.eql(k, i))` into `jne`/`je` (objdump), so a secret exponent's 4-bit
   windows leak. Every secret-exponent pow over a PUBLIC modulus here now goes
-  through `powSecret`: Πfac, Πmod's `y^d`, Πprm's commitments `h1^{a_i}`,
-  `generateAuxParams`' `h1^λ`. The two keygen-time sites that also had the
+  through `powSecret`: Πfac, Πmod's `y^d`, Πprm's commitments `h2^{a_i}`,
+  `generateAuxParams`' `h2^λ`. The two keygen-time sites that also had the
   secret factor as the MODULUS moved on 2026-10-03, once `montint.DynModint`
   took a secret modulus: Πmod's per-round work (Legendre symbols by Euler's
   criterion, the 4th roots `v^((r+1)/4)` with a constant-time `±s` select,
@@ -1051,6 +1066,19 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 `signWithShares` from the same PRNG state).
 
 ## Backlog / deferred
+
+- **Review 2026-10-03 (independent, read-only) — LOW items left open** (F1 Πprm direction and F2
+  `Ñ = 3` hang were fixed the same day): (F3) Πmod does not check `gcd(y_i, Ñ) = 1` — not exploitable
+  at the size floor, Πfac covers small factors; (F4) `ModProof`/`PrmProof` decoders accept trailing
+  bytes and any nonzero `a`/`b` byte, and `x ↦ Ñ − x` is a second valid response — proofs are
+  malleable, harmless unless someone de-duplicates by proof bytes; (F5) `aux_info.assembleKeyShare`
+  relies on the caller having run `verifyAnnouncement`/`findDuplicate`/`verifyFactors` (dkg does) —
+  a `Verified` wrapper type would make it structural; (F6) `Ñ` is held only to the `q⁷` floor, not
+  to the 2048 bits the Paillier `N` is pinned to — decide and pin; (F7) Πprm/Πmod soundness is
+  `2^-80` (80 binary rounds, grindable), below the ~128-bit level the rest of the module reads as;
+  (F8) dkg's keygen context `sid | SHA-256(sid) if len > 64` lets a raw 32-byte sid equal another
+  sid's digest — prefix a flag byte; the unbound `Piprm.verify`/`Pimod.verify` stay public, document
+  "never in keygen". Effort S each, F7 M (rounds or a larger challenge space).
 
 - Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
   constructions against GG18 Appendix A before production use — see the

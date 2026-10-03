@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — `EcdsaKeygen` picks up `threshold_ecdsa`'s Πprm direction
+  fix: the ring-Pedersen tuple is now `h1 = h2^λ` and Πprm proves `h1 ∈ ⟨h2⟩`
+  (before, `h2 ∈ ⟨h1⟩`, which let a dishonest party's tuple leak the others'
+  MtA witnesses mod a smooth factor). ⚠ Announcements from older builds fail
+  verification.
+
 - **2026-10-02** — `EcdsaKeygen`'s announcements carry Πprm/Πmod over `Ñ`
   bound to the sender's context (via `threshold_ecdsa.aux_info`): a copied
   `Ñ` with its proofs aborts the run naming the copier
