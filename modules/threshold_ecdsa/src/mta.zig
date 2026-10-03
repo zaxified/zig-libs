@@ -642,7 +642,7 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
 
     const secret = scalarFromU64(0xa11ce);
     const coeffs = [_]Scalar{scalarFromU64(0xb0b)};
-    const key_shares = try root.keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params);
+    const key_shares = try root.keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, &.{ @splat(1), @splat(2) });
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 

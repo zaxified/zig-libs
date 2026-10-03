@@ -146,9 +146,10 @@ pub fn assembleKeyShares(
     t: u32,
     paillier_keys: []const paillier.KeyPair,
     aux_params: []const tecdsa.AuxParams,
+    message_seeds: []const [32]u8,
 ) AssembleError![]tecdsa.KeyShare {
     const n = outputs.len;
-    if (paillier_keys.len != n or aux_params.len != n) return error.LengthMismatch;
+    if (paillier_keys.len != n or aux_params.len != n or message_seeds.len != n) return error.LengthMismatch;
 
     const entries = try allocator.alloc(tecdsa.PartyPublicKeys, n);
     errdefer allocator.free(entries);
@@ -158,6 +159,7 @@ pub fn assembleKeyShares(
             .paillier_pk = paillier_keys[i].public,
             .aux = aux_params[i],
             .verifying_share = outputs[i].verifying_share,
+            .message_key = tecdsa.messagePublicKey(message_seeds[i]) catch unreachable, // a clamped Ed25519 scalar is never zero
         };
     }
     const public_keys: tecdsa.PublicKeys = .{ .entries = entries };
@@ -175,6 +177,7 @@ pub fn assembleKeyShares(
             .verifying_share = outputs[i].verifying_share,
             .paillier_secret = paillier_keys[i].secret,
             .public_keys = public_keys,
+            .message_seed = message_seeds[i],
         };
     }
     return shares;
@@ -235,11 +238,14 @@ test "END-TO-END ANCHOR: DKG shares -> threshold sign -> std ECDSA verify under 
     defer allocator.free(paillier_keys);
     const aux_params = try allocator.alloc(tecdsa.AuxParams, cfg.n);
     defer allocator.free(aux_params);
+    const message_seeds = try allocator.alloc([32]u8, cfg.n);
+    defer allocator.free(message_seeds);
+    for (message_seeds, 1..) |*sd, i| sd.* = @splat(@intCast(i));
     for (0..cfg.n) |i| {
         paillier_keys[i] = try paillier.generate(random, 2048);
         aux_params[i] = try testAuxParams(random);
     }
-    const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params);
+    const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params, message_seeds);
     defer {
         allocator.free(key_shares[0].public_keys.entries);
         allocator.free(key_shares);
@@ -277,6 +283,9 @@ test "END-TO-END (per-participant): DKG over frames -> sign -> refresh -> sign a
     defer allocator.free(paillier_keys);
     const aux_params = try allocator.alloc(tecdsa.AuxParams, cfg.n);
     defer allocator.free(aux_params);
+    const message_seeds = try allocator.alloc([32]u8, cfg.n);
+    defer allocator.free(message_seeds);
+    for (message_seeds, 1..) |*sd, i| sd.* = @splat(@intCast(i));
     for (0..cfg.n) |i| {
         paillier_keys[i] = try paillier.generate(random, 2048);
         aux_params[i] = try testAuxParams(random);
@@ -284,7 +293,7 @@ test "END-TO-END (per-participant): DKG over frames -> sign -> refresh -> sign a
     const ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
     const pk = try ecdsa.PublicKey.fromSec1(&outs[0].group_public_key.toBytes());
 
-    const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params);
+    const key_shares = try assembleKeyShares(allocator, outs, cfg.t, paillier_keys, aux_params, message_seeds);
     defer {
         allocator.free(key_shares[0].public_keys.entries);
         allocator.free(key_shares);
@@ -311,7 +320,7 @@ test "END-TO-END (per-participant): DKG over frames -> sign -> refresh -> sign a
     try testing.expect(!std.mem.eql(u8, &outs[0].secret_share.toBytes(.big), &fresh[0].secret_share.toBytes(.big)));
 
     // 4. The refreshed shares sign under the unchanged key.
-    const key_shares2 = try assembleKeyShares(allocator, fresh, cfg.t, paillier_keys, aux_params);
+    const key_shares2 = try assembleKeyShares(allocator, fresh, cfg.t, paillier_keys, aux_params, message_seeds);
     defer {
         allocator.free(key_shares2[0].public_keys.entries);
         allocator.free(key_shares2);

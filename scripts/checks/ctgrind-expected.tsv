@@ -555,8 +555,15 @@ blindrsa	ReleaseFast	sign	1	7	ec3c73bfc9e557df	4d5e3740a158032d
 # mta.centeredModQ (Alice's centered lift, secret α') adds nothing: its select
 # is fiat cMov behind montint's blackBox (a byte-mask select measured +3 and a
 # `Scalar.fromBytes48` detour +2 before that).
-threshold_ecdsa	ReleaseFast	share	1	<=244	cd04c2910d825021	706487e9e4a6df1e
-threshold_ecdsa	ReleaseFast	nonce	1	<=481	cd04c2910d825021	706487e9e4a6df1e
+# 2026-10-03 (signed presigning messages, step 14): share/nonce/betaprime
+# +31/+36/+33 — every new context is the VERIFICATION of a peer's message:
+# std Ed25519 Verifier.init/verify (mulDoubleBasePublic, slide, isIdentity)
+# over SHA-256 of message bodies, and checkAttestations' body-hash compare
+# (presign.zig). Class (a): the bodies are public wire bytes the
+# single-process harness derives from the tainted secrets. Signing our own
+# messages (KeyPair.sign) added none.
+threshold_ecdsa	ReleaseFast	share	1	<=275	d464e29b15d0e6ab	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	nonce	1	<=517	d464e29b15d0e6ab	706487e9e4a6df1e
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -592,7 +599,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=481	cd04c2910d825021	706487e9e4a6df1e
 # ff montgomeryMul/add final subtractions on beta' named in R1 are gone with
 # mta's beta' parse and the MtA products; what reaches beta' now is
 # sampleBetaPrime's std.mem.order (4) and the verifier side.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=287	cd04c2910d825021	706487e9e4a6df1e
+threshold_ecdsa	ReleaseFast	betaprime	1	<=320	d464e29b15d0e6ab	706487e9e4a6df1e
 # threshold_ecdsa fac — Πfac prover over the Paillier factors p, q (dealer-free
 # keygen, 2026-10-02). First measurement found the real defect: std.crypto.ff's
 # powWithEncodedExponent compiles its cmov(ct.eql(k, i)) window select to
@@ -612,7 +619,7 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=287	cd04c2910d825021	706487e9e4a6df1e
 # montgomeryMul final subtractions went with powSecret's and the commitments'
 # move to montint.DynModint (pedersenCt). Left: Scalar.fromBytes48 on e (2),
 # stripLeadingZeros on e and v (2), the v < 0 redraw (1) — all as above.
-threshold_ecdsa	ReleaseFast	fac	1	5	bef36a1c5cc16d6f	b014d308e3ab9ce7
+threshold_ecdsa	ReleaseFast	fac	1	5	0a109c61253b1aeb	b014d308e3ab9ce7
 # threshold_ecdsa pimod (2026-10-03) — Πmod prover over tss-lib's 2048-bit N,
 # Paillier p, q tainted. The per-round work (Legendre symbols by Euler's
 # criterion, the 4th roots with a CT ±s select, the CRT, q^-1 mod p by Fermat)
@@ -622,14 +629,14 @@ threshold_ecdsa	ReleaseFast	fac	1	5	bef36a1c5cc16d6f	b014d308e3ab9ce7
 # of p, q, φ and the extended Euclid (451 + 84 + 4). Left: fromLimbsBits's
 # length verdict, once per factor (2), and the `if (b_bit)`/`if (a_bit)`
 # blends of y' (aux_proofs.zig, 2) — a_i, b_i are published in the proof.
-threshold_ecdsa	ReleaseFast	pimod	1	4	364a29ee0763aa85	97edec9453ab2d0b
+threshold_ecdsa	ReleaseFast	pimod	1	4	32df05d0ea4170f7	97edec9453ab2d0b
 # threshold_ecdsa piprm (2026-10-03) — Πprm prover (proveBound) over tss-lib's
 # 2048-bit Ñ, p̃, q̃ and λ tainted. φ is a limb product, z_i = a_i + e_i·λ mod φ
 # one masked subtraction (was big-int divFloor on φ, λ). Left: fromLimbsBits's
 # length verdict for p̃ and q̃ (2) and the nonce draw's accept verdict a_i < φ
 # (aux_proofs.zig, 1 — its count depends on φ/2^bits only). The witness folds
 # every z_i (z_i = a_i alone when e_i = 0).
-threshold_ecdsa	ReleaseFast	piprm	1	3	364a29ee0763aa85	dba9d0e9fdb30553
+threshold_ecdsa	ReleaseFast	piprm	1	3	32df05d0ea4170f7	dba9d0e9fdb30553
 # threshold_ecdsa prime (2026-10-03) — root.isProbablePrime on tss-lib's
 # 1024-bit Blum prime, tainted, its length (1024) given by the caller as the
 # prime searches do. 4 in-file: fromLimbsBits's verdict (1), the `s` scan over
@@ -642,7 +649,7 @@ threshold_ecdsa	ReleaseFast	piprm	1	3	364a29ee0763aa85	dba9d0e9fdb30553
 # (dyn.zig, 1 — s = v2(p − 1) is documented as observable; 1 for these
 # candidates, all ≡ 3 mod 4), and the round verdict `pass == 0` (dyn.zig, 1;
 # always passes for a prime).
-threshold_ecdsa	ReleaseFast	prime	1	3	875221ce43a44508	d2b3154e6a6b44ed
+threshold_ecdsa	ReleaseFast	prime	1	3	b961de3dc347f91d	d2b3154e6a6b44ed
 # auxgen (2026-10-03): the ring-Pedersen setup over tss-lib's tainted safe
 # primes (root.auxParamsWithTrapdoorFromSafePrimes). N~ = p~·q~ and
 # ord = p'·q' are montint limb products, lambda is kept on the borrow of
@@ -652,7 +659,7 @@ threshold_ecdsa	ReleaseFast	prime	1	3	875221ce43a44508	d2b3154e6a6b44ed
 # powSecret's montint modulus build (5), lambda's ff encoding mod N~ (2),
 # stripLeadingZeros on N~ (1); the last is the accept verdict (1).
 # Before: std.math.big.int products and a big-int compare against ord.
-threshold_ecdsa	ReleaseFast	auxgen	1	116	216a252a07f398be	9577aa06dd1bf0e4
+threshold_ecdsa	ReleaseFast	auxgen	1	116	dfb61e757b8ddb5f	9577aa06dd1bf0e4
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

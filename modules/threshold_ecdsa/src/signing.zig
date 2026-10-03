@@ -324,7 +324,10 @@ pub fn testKeygen(allocator: std.mem.Allocator, random: std.Random, t: u32, n: u
     const coefficients = try allocator.alloc(Scalar, t - 1);
     defer allocator.free(coefficients);
     for (coefficients) |*c| c.* = randomScalar(random);
-    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, coefficients, paillier_keys, aux_params);
+    const message_seeds = try allocator.alloc([32]u8, n);
+    defer allocator.free(message_seeds);
+    for (message_seeds) |*sd| random.bytes(sd);
+    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, coefficients, paillier_keys, aux_params, message_seeds);
     return .{ .key_shares = key_shares };
 }
 

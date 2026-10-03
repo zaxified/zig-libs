@@ -44,24 +44,31 @@
 //! `culprit == null`: naming the party there needs the paper's §4.3 opening
 //! protocol, which is not implemented (SPEC.md backlog).
 //!
-//! ## Broadcast consistency (in the protocol, not assumed)
+//! ## Signed messages and broadcast consistency (in the protocol, not assumed)
 //!
-//! GG20 assumes a reliable broadcast channel. Here every message after
-//! round 1 starts with the sender's running hash of every broadcast it has
-//! processed (its own included, in signer order); a receiver whose own hash
-//! differs aborts with `equivocation` (unattributed) before it uses anything
-//! from that round. Without it, a signer showing different broadcasts to
-//! different peers would make the honest ones fail each other's proofs —
-//! and blame each other. Phase-7 shares carry the final hash, `combine`
-//! compares it.
+//! Every message ends with its sender's Ed25519 signature over
+//! `message_domain || header || SHA-256(body)` (`signedBytes`), under the
+//! `message_key` each signer publishes with its key share; a message whose
+//! signature fails aborts with `bad_signature`, naming the sender.
+//!
+//! GG20 assumes a reliable broadcast channel. Here every message of a round
+//! that follows a broadcast round starts with an attestation block: for
+//! each signer, the body hash and signature of that signer's previous-round
+//! broadcast as the sender received it. A receiver compares every entry with
+//! its own view before using anything from the round. A different body under
+//! a valid signature is two signed versions of one broadcast: the signer who
+//! made them is named (`equivocation`). A different body whose signature
+//! fails names the sender of the attestation instead — it misquoted. Without
+//! this, a signer showing different broadcasts to different peers would make
+//! the honest ones fail each other's proofs and blame each other. Phase-7
+//! shares attest the Phase-6 broadcasts; `combine` checks them the same way.
 //!
 //! ## What the caller must provide
 //!
-//! - **Authenticated delivery.** The header's `from` is taken as the sender:
-//!   the transport must check it against the authenticated peer
-//!   (`peekHeader`) before handing a message in, and hand in only the
-//!   messages of the round being run (`peekHeader().round`), buffering early
-//!   ones. A party's own messages coming back are ignored.
+//! - **Delivery.** Hand in only the messages of the round being run
+//!   (`peekHeader().round`), buffering early ones. The signature, not the
+//!   transport, decides who sent a message; a party's own messages coming
+//!   back are ignored.
 //! - **A fresh session id** per presigning session, agreed by all signers.
 //!   The id on the wire is `SHA-256(session_domain || sid || X || t ||
 //!   signers)`, so a signer configured with another set or key is refused at
@@ -82,6 +89,7 @@ const ecproofs = @import("ecproofs.zig");
 const signing = @import("signing.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Ed25519 = std.crypto.sign.Ed25519;
 const Scalar = root.Scalar;
 const Secp256k1 = root.Secp256k1;
 const Element = root.Element;
@@ -90,20 +98,93 @@ const Ne = root.Ne;
 
 pub const SessionId = [32]u8;
 
-pub const wire_version: u8 = 1;
+pub const wire_version: u8 = 2;
 /// `version(1) || round(1) || sid(32) || from(4) || to(4)`; `to == 0` marks a
-/// broadcast (party indices start at 1). From round 2 on, the payload starts
-/// with the `echo_length`-byte broadcast transcript hash.
+/// broadcast (party indices start at 1). A message is `header || body ||
+/// signature`: the body is the attestation block (rounds with
+/// `hasAttestation`) followed by the round's payload, and the last
+/// `signature_length` bytes are the sender's Ed25519 signature (see
+/// `signedBytes`).
 pub const header_length = 1 + 1 + 32 + 4 + 4;
+pub const signature_length = 64;
+/// One attestation entry: `SHA-256(body) || signature` of one signer's
+/// broadcast of the previous round, as this sender received it.
+pub const attestation_entry_length = 32 + signature_length;
 /// Phase 7 messages carry this round number.
 pub const sign_round: u8 = 7;
 
 pub const gamma_commit_domain = "threshold_ecdsa/presign/gamma-commit/v1";
 pub const session_domain = "threshold_ecdsa/presign/session/v1";
-pub const transcript_domain = "threshold_ecdsa/presign/broadcast-transcript/v1";
-/// Every message after round 1 starts its payload with the sender's running
-/// hash of all broadcasts so far (see `Party.transcript`).
-pub const echo_length = 32;
+/// Domain of every message signature (`signedBytes`).
+pub const message_domain = "threshold_ecdsa/presign/message/v2";
+
+/// Rounds whose messages attest the previous round's broadcasts: every round
+/// that follows a broadcast round (1, 3, 4, 5, 6), Phase 7 included.
+pub fn hasAttestation(round: u8) bool {
+    return round == 2 or round >= 4;
+}
+
+/// `SHA-256(body)` and the sender's signature over `signedBytes(header, that
+/// hash)`. Self-contained evidence: with the header rebuilt from (session,
+/// round, sender, broadcast), anyone holding the sender's key can check it.
+pub const Attestation = struct {
+    body_hash: [32]u8,
+    signature: [signature_length]u8,
+};
+
+/// What a message signature signs: `message_domain || header || SHA-256(body)`.
+/// The header fixes session, round, sender and recipient (0 = broadcast), so
+/// a signature on a p2p message or on another round can never stand in for
+/// a broadcast of this one.
+pub fn signedBytes(header: [header_length]u8, body_hash: [32]u8) [message_domain.len + header_length + 32]u8 {
+    var out: [message_domain.len + header_length + 32]u8 = undefined;
+    out[0..message_domain.len].* = message_domain.*;
+    out[message_domain.len..][0..header_length].* = header;
+    out[message_domain.len + header_length ..][0..32].* = body_hash;
+    return out;
+}
+
+fn sign(kp: Ed25519.KeyPair, header: [header_length]u8, body: []const u8) Attestation {
+    var h: [32]u8 = undefined;
+    Sha256.hash(body, &h, .{});
+    const sig = kp.sign(&signedBytes(header, h), null) catch unreachable; // a key pair from a seed signs
+    return .{ .body_hash = h, .signature = sig.toBytes() };
+}
+
+fn verifyAttestation(key: Ed25519.PublicKey, header: [header_length]u8, a: Attestation) bool {
+    Ed25519.Signature.fromBytes(a.signature).verify(&signedBytes(header, a.body_hash), key) catch return false;
+    return true;
+}
+
+fn broadcastHeader(sid: SessionId, round: u8, from: u32) [header_length]u8 {
+    var out: [header_length]u8 = undefined;
+    (Header{ .round = round, .sid = sid, .from = from, .to = null }).write(&out);
+    return out;
+}
+
+fn readAttestation(bytes: *const [attestation_entry_length]u8) Attestation {
+    return .{ .body_hash = bytes[0..32].*, .signature = bytes[32..][0..signature_length].* };
+}
+
+fn writeAttestation(a: Attestation, out: *[attestation_entry_length]u8) void {
+    out[0..32].* = a.body_hash;
+    out[32..][0..signature_length].* = a.signature;
+}
+
+/// Compares an attestation block (one entry per signer, signer order) with
+/// `mine`, this party's view of broadcast round `round`. A different body
+/// with a valid signature by its sender is two signed versions of one
+/// broadcast — that sender equivocated; an invalid signature means the
+/// block's sender (`from`) lied about what it received.
+fn checkAttestations(sid: SessionId, round: u8, signers: []const u32, keys: []const Ed25519.PublicKey, mine: []const Attestation, block: []const u8, from: u32) ?Abort {
+    for (signers, keys, mine, 0..) |idx, key, m, pos| {
+        const entry = readAttestation(block[pos * attestation_entry_length ..][0..attestation_entry_length]);
+        if (std.mem.eql(u8, &entry.body_hash, &m.body_hash)) continue;
+        if (verifyAttestation(key, broadcastHeader(sid, round, idx), entry)) return .{ .culprit = idx, .fault = .equivocation };
+        return .{ .culprit = from, .fault = .equivocation };
+    }
+    return null;
+}
 
 pub const Header = struct {
     round: u8,
@@ -164,12 +245,15 @@ pub const Fault = enum {
     s_sum,
     /// Phase 7: `s_j·R ≠ m·R̄_j + r·S_j` (type 8).
     sig_share,
-    /// A peer's running hash of the broadcasts so far differs from this
-    /// party's: someone showed different broadcasts to different signers (or
-    /// lied about what it saw). Unattributed — the transport's signatures
-    /// would be needed to tell which — but it stops the session BEFORE the
-    /// inconsistent views make honest signers blame each other.
+    /// Two signers saw different broadcasts from one sender. The culprit is
+    /// the sender when both versions carry its valid signature, or the
+    /// signer whose attestation carries a signature that does not verify.
+    /// Stops the session BEFORE the inconsistent views make honest signers
+    /// blame each other.
     equivocation,
+    /// A message whose Ed25519 signature does not verify under its sender's
+    /// `message_key` (or that is too short to carry one).
+    bad_signature,
     /// `δ = 0`, `R` = identity, `r = 0` or `s = 0` — probability ~2⁻²⁵⁶
     /// unless someone cheated in a way no single check pins on them.
     degenerate,
@@ -282,6 +366,8 @@ const Peer = struct {
     aux: root.AuxParams,
     /// `W_j = λ_j·X_j`.
     w_point: Element,
+    /// Ed25519 key of this signer's messages.
+    message_key: Ed25519.PublicKey,
     commitment: [32]u8 = undefined,
     c_k: paillier.Ciphertext = undefined,
     delta: Scalar = undefined,
@@ -319,13 +405,16 @@ pub const Party = struct {
     secrets: Secrets = undefined,
     r_point: Element = undefined,
     r: Scalar = undefined,
-    /// Running hash of every broadcast this party has processed, its own
-    /// included, in signer order. Sent at the head of every later message
-    /// and compared on receipt: the in-protocol substitute for the reliable
-    /// broadcast GG20 assumes (review F1, 2026-10-02).
-    transcript: [32]u8 = undefined,
-    /// Hash of this party's own broadcast payload of the current round.
-    own_bc_hash: [32]u8 = undefined,
+    /// This party's message-signing key (from `share.message_seed`).
+    message_kp: Ed25519.KeyPair,
+    /// This party's view of the latest broadcast round, one attestation per
+    /// signer position, its own included: attested at the head of the next
+    /// round's messages and compared with every peer's (the in-protocol
+    /// substitute for the reliable broadcast GG20 assumes; review F1,
+    /// 2026-10-02 — signed since 2026-10-03, so the equivocator is named).
+    last_bc: []Attestation,
+    /// Attestation of this party's own broadcast of the current round.
+    own_bc: Attestation = undefined,
     /// Set when a call returns `error.ProtocolAbort`.
     abort: ?Abort = null,
 
@@ -352,6 +441,7 @@ pub const Party = struct {
 
         const peers = try allocator.alloc(Peer, sorted.len);
         errdefer allocator.free(peers);
+        const message_kp = Ed25519.KeyPair.generateDeterministic(share.message_seed) catch return error.InvalidParameters;
         var x_sum = Secp256k1.identityElement;
         for (sorted, peers) |idx, *p| {
             const pub_keys = share.public_keys.get(idx) orelse return error.InvalidParameters;
@@ -364,6 +454,7 @@ pub const Party = struct {
                 .pk = pub_keys.paillier_pk,
                 .aux = pub_keys.aux,
                 .w_point = Element.fromPoint(w_pt) catch return error.InvalidParameters,
+                .message_key = Ed25519.PublicKey.fromBytes(pub_keys.message_key) catch return error.InvalidParameters,
             };
         }
         // This party's own share must be the one its public entry announces.
@@ -371,6 +462,8 @@ pub const Party = struct {
         if (!std.mem.eql(u8, &own_x.toBytes(), &share.verifying_share.toBytes())) return error.InvalidParameters;
         const x_g = Secp256k1.basePoint.mul(share.secret_share.toBytes(.big), .big) catch return error.InvalidParameters;
         if (!x_g.equivalent(own_x.point() catch return error.InvalidParameters)) return error.InvalidParameters;
+        // …and so must its message key.
+        if (!std.mem.eql(u8, &message_kp.public_key.toBytes(), &share.public_keys.get(share.index).?.message_key)) return error.InvalidParameters;
         const group_pt = share.group_public_key.point() catch return error.InvalidParameters;
         if (!x_sum.equivalent(group_pt)) return error.InvalidParameters;
 
@@ -390,19 +483,33 @@ pub const Party = struct {
             h.update(&u);
         }
         const ssid = h.finalResult();
-        var t = Sha256.init(.{});
-        t.update(transcript_domain);
-        t.update(&ssid);
-        return .{ .allocator = allocator, .share = share, .sid = ssid, .signers = sorted, .me = me, .peers = peers, .transcript = t.finalResult() };
+        const last_bc = try allocator.alloc(Attestation, sorted.len);
+        return .{
+            .allocator = allocator,
+            .share = share,
+            .sid = ssid,
+            .signers = sorted,
+            .me = me,
+            .peers = peers,
+            .message_kp = message_kp,
+            .last_bc = last_bc,
+        };
     }
 
     pub fn deinit(self: *Party) void {
         self.wipe();
         std.crypto.secureZero(u8, std.mem.asBytes(&self.share.secret_share));
+        std.crypto.secureZero(u8, &self.share.message_seed);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.message_kp.secret_key));
         self.share.paillier_secret.deinit();
         self.allocator.free(self.peers);
         self.allocator.free(self.signers);
+        self.allocator.free(self.last_bc);
         self.* = undefined;
+    }
+
+    fn messageKeys(self: *const Party, out: []Ed25519.PublicKey) void {
+        for (self.peers, out) |p, *k| k.* = p.message_key;
     }
 
     fn wipe(self: *Party) void {
@@ -455,27 +562,42 @@ pub const Party = struct {
     };
 
     /// Sorts `inbox` into one broadcast and/or one p2p payload per peer and
-    /// requires every peer to have sent exactly what `round` calls for.
+    /// requires every peer to have sent exactly what `round` calls for. Every
+    /// message's signature is checked first, then its attestation block
+    /// against this party's view of the previous broadcast round.
     fn collect(self: *Party, inbox: []const []const u8, round: u8, want_bc: bool, want_p2p: bool, slots: Slots) Error!void {
         @memset(slots.broadcast, null);
         @memset(slots.p2p, null);
+        const bc_att = try self.allocator.alloc(Attestation, self.peers.len);
+        defer self.allocator.free(bc_att);
+        const keys = try self.allocator.alloc(Ed25519.PublicKey, self.peers.len);
+        defer self.allocator.free(keys);
+        self.messageKeys(keys);
+        const att_len: usize = if (hasAttestation(round)) self.peers.len * attestation_entry_length else 0;
         for (inbox) |msg| {
             const h = peekHeader(msg) catch return self.fail(null, .malformed_message);
             // A bus that hands a party its own broadcast back is not a fault.
             if (h.from == self.myIndex()) continue;
             const pos = std.mem.indexOfScalar(u32, self.signers, h.from) orelse return self.fail(h.from, .unexpected_message);
             if (h.round != round or !std.mem.eql(u8, &h.sid, &self.sid)) return self.fail(h.from, .unexpected_message);
-            var payload = msg[header_length..];
-            if (round >= 2) {
-                if (payload.len < echo_length) return self.fail(h.from, .malformed_message);
-                if (!std.mem.eql(u8, payload[0..echo_length], &self.transcript)) return self.fail(null, .equivocation);
-                payload = payload[echo_length..];
+            if (msg.len < header_length + signature_length) return self.fail(h.from, .bad_signature);
+            const body = msg[header_length .. msg.len - signature_length];
+            var att: Attestation = .{ .body_hash = undefined, .signature = msg[msg.len - signature_length ..][0..signature_length].* };
+            Sha256.hash(body, &att.body_hash, .{});
+            if (!verifyAttestation(self.peers[pos].message_key, msg[0..header_length].*, att)) return self.fail(h.from, .bad_signature);
+            var payload = body;
+            if (att_len != 0) {
+                if (payload.len < att_len) return self.fail(h.from, .malformed_message);
+                if (checkAttestations(self.sid, round - 1, self.signers, keys, self.last_bc, payload[0..att_len], h.from)) |ab|
+                    return self.fail(ab.culprit, ab.fault);
+                payload = payload[att_len..];
             }
             const slot = if (h.to) |to| blk: {
                 if (to != self.myIndex() or !want_p2p) return self.fail(h.from, .unexpected_message);
                 break :blk &slots.p2p[pos];
             } else blk: {
                 if (!want_bc) return self.fail(h.from, .unexpected_message);
+                bc_att[pos] = att;
                 break :blk &slots.broadcast[pos];
             };
             if (slot.* != null) return self.fail(h.from, .duplicate_message);
@@ -487,15 +609,7 @@ pub const Party = struct {
             if (want_p2p and slots.p2p[pos] == null) return self.fail(p.index, .missing_message);
         }
         if (want_bc) {
-            var t = Sha256.init(.{});
-            t.update(&self.transcript);
-            t.update(&[_]u8{round});
-            for (slots.broadcast, 0..) |b, pos| {
-                var d: [32]u8 = undefined;
-                if (pos == self.me) d = self.own_bc_hash else Sha256.hash(b.?, &d, .{});
-                t.update(&d);
-            }
-            self.transcript = t.finalResult();
+            for (self.last_bc, bc_att, 0..) |*l, a, pos| l.* = if (pos == self.me) self.own_bc else a;
         }
     }
 
@@ -517,13 +631,18 @@ pub const Party = struct {
         }
 
         fn add(self: *OutboxBuilder, party: *Party, round: u8, to: ?u32, payload: []const u8) std.mem.Allocator.Error!void {
-            const echo: usize = if (round >= 2) echo_length else 0;
-            const bytes = try self.allocator.alloc(u8, header_length + echo + payload.len);
+            const att_len: usize = if (hasAttestation(round)) party.peers.len * attestation_entry_length else 0;
+            const bytes = try self.allocator.alloc(u8, header_length + att_len + payload.len + signature_length);
             errdefer self.allocator.free(bytes);
             (Header{ .round = round, .sid = party.sid, .from = party.myIndex(), .to = to }).write(bytes[0..header_length]);
-            if (echo != 0) bytes[header_length..][0..echo_length].* = party.transcript;
-            @memcpy(bytes[header_length + echo ..], payload);
-            if (to == null) Sha256.hash(payload, &party.own_bc_hash, .{});
+            for (party.last_bc, 0..) |a, pos| {
+                if (att_len == 0) break;
+                writeAttestation(a, bytes[header_length + pos * attestation_entry_length ..][0..attestation_entry_length]);
+            }
+            @memcpy(bytes[header_length + att_len ..][0..payload.len], payload);
+            const a = sign(party.message_kp, bytes[0..header_length].*, bytes[header_length .. bytes.len - signature_length]);
+            bytes[bytes.len - signature_length ..][0..signature_length].* = a.signature;
+            if (to == null) party.own_bc = a;
             try self.list.append(self.allocator, .{ .to = to, .bytes = bytes });
         }
 
@@ -906,10 +1025,15 @@ pub const Party = struct {
         const r_bar = try self.allocator.alloc(Element, self.peers.len);
         errdefer self.allocator.free(r_bar);
         const s_points = try self.allocator.alloc(Element, self.peers.len);
+        errdefer self.allocator.free(s_points);
         for (self.peers, r_bar, s_points) |p, *rb, *sp| {
             rb.* = p.r_bar;
             sp.* = p.s_point;
         }
+        const bc6 = try self.allocator.dupe(Attestation, self.last_bc);
+        errdefer self.allocator.free(bc6);
+        const keys = try self.allocator.alloc(Ed25519.PublicKey, self.peers.len);
+        self.messageKeys(keys);
         const presig: Presignature = .{
             .public = .{
                 .allocator = self.allocator,
@@ -920,11 +1044,13 @@ pub const Party = struct {
                 .r = self.r,
                 .r_bar = r_bar,
                 .s_points = s_points,
-                .transcript = self.transcript,
+                .round6 = bc6,
+                .message_keys = keys,
             },
             .index = self.myIndex(),
             .k = self.secrets.k,
             .sigma = self.secrets.sigma,
+            .message_seed = self.share.message_seed,
         };
         self.wipe();
         self.state = .done;
@@ -965,24 +1091,36 @@ pub const PresignaturePublic = struct {
     r_bar: []Element,
     /// `S_j = σ_j·R`, by position in `signers`, owned.
     s_points: []Element,
-    /// The broadcast transcript hash every signer ended presigning with;
-    /// carried by every Phase-7 share and compared in `combine`.
-    transcript: [32]u8,
+    /// This signer's view of the Phase-6 broadcasts, one attestation per
+    /// signer position, owned: every Phase-7 share attests its sender's view
+    /// and `combine` compares (naming an equivocator as in presigning).
+    round6: []Attestation,
+    /// Every signer's message key, by position, owned: `combine` checks each
+    /// share's signature.
+    message_keys: []Ed25519.PublicKey,
 
     pub fn deinit(self: *PresignaturePublic) void {
         self.allocator.free(self.signers);
         self.allocator.free(self.r_bar);
         self.allocator.free(self.s_points);
+        self.allocator.free(self.round6);
+        self.allocator.free(self.message_keys);
         self.* = undefined;
+    }
+
+    /// Length of a Phase-7 share message for this signer set.
+    pub fn shareLength(self: *const PresignaturePublic) usize {
+        return header_length + self.signers.len * attestation_entry_length + Ns + signature_length;
     }
 
     /// Phase 7: checks every share against `s_j·R == m·R̄_j + r·S_j`
     /// (naming the first signer whose share fails, fault `sig_share`), sums
     /// them, normalises to low-S and verifies the result under the group key
     /// with std ECDSA. `shares` must hold exactly one Phase-7 message from
-    /// EVERY signer — the caller's own share too, when the caller signed. The
-    /// header's `from` is trusted here as everywhere: the transport
-    /// authenticates it.
+    /// EVERY signer — the caller's own share too, when the caller signed.
+    /// Each share's signature is checked under its sender's message key
+    /// (`bad_signature`), and its attestation of the Phase-6 broadcasts
+    /// against this signer's (`equivocation`, named as in presigning).
     pub fn combine(self: *const PresignaturePublic, message: Message, shares: []const []const u8, abort: *?Abort) Error!signing.Signature {
         abort.* = null;
         const found = try self.allocator.alloc(?Scalar, self.signers.len);
@@ -992,10 +1130,16 @@ pub const PresignaturePublic = struct {
             const h = peekHeader(msg) catch return failCombine(abort, null, .malformed_message);
             const pos = std.mem.indexOfScalar(u32, self.signers, h.from) orelse return failCombine(abort, h.from, .unexpected_message);
             if (h.round != sign_round or h.to != null or !std.mem.eql(u8, &h.sid, &self.sid)) return failCombine(abort, h.from, .unexpected_message);
-            if (msg.len != header_length + echo_length + Ns) return failCombine(abort, h.from, .malformed_message);
+            if (msg.len != self.shareLength()) return failCombine(abort, h.from, .malformed_message);
             if (found[pos] != null) return failCombine(abort, h.from, .duplicate_message);
-            if (!std.mem.eql(u8, msg[header_length..][0..echo_length], &self.transcript)) return failCombine(abort, null, .equivocation);
-            found[pos] = decodeScalar(msg[header_length + echo_length ..][0..Ns].*) orelse return failCombine(abort, h.from, .malformed_message);
+            const body = msg[header_length .. msg.len - signature_length];
+            var att: Attestation = .{ .body_hash = undefined, .signature = msg[msg.len - signature_length ..][0..signature_length].* };
+            Sha256.hash(body, &att.body_hash, .{});
+            if (!verifyAttestation(self.message_keys[pos], msg[0..header_length].*, att)) return failCombine(abort, h.from, .bad_signature);
+            const att_len = self.signers.len * attestation_entry_length;
+            if (checkAttestations(self.sid, 6, self.signers, self.message_keys, self.round6, body[0..att_len], h.from)) |ab|
+                return failCombine(abort, ab.culprit, ab.fault);
+            found[pos] = decodeScalar(body[att_len..][0..Ns].*) orelse return failCombine(abort, h.from, .malformed_message);
         }
         const m = message.scalar();
         const r_pt = self.r_point.point() catch unreachable;
@@ -1038,6 +1182,8 @@ pub const Presignature = struct {
     index: u32,
     k: Scalar,
     sigma: Scalar,
+    /// SECRET: this signer's message-signing seed, for the Phase-7 share.
+    message_seed: [32]u8,
     used: bool = false,
 
     /// Phase 7: `s_i = m·k_i + r·σ_i` as a broadcast message (owned by the
@@ -1047,10 +1193,15 @@ pub const Presignature = struct {
         self.used = true;
         defer self.wipe();
         const s_i = message.scalar().mul(self.k).add(self.public.r.mul(self.sigma));
-        const bytes = try self.public.allocator.alloc(u8, header_length + echo_length + Ns);
+        const bytes = try self.public.allocator.alloc(u8, self.public.shareLength());
         (Header{ .round = sign_round, .sid = self.public.sid, .from = self.index, .to = null }).write(bytes[0..header_length]);
-        bytes[header_length..][0..echo_length].* = self.public.transcript;
-        bytes[header_length + echo_length ..][0..Ns].* = s_i.toBytes(.big);
+        for (self.public.round6, 0..) |a, pos| writeAttestation(a, bytes[header_length + pos * attestation_entry_length ..][0..attestation_entry_length]);
+        const att_len = self.public.signers.len * attestation_entry_length;
+        bytes[header_length + att_len ..][0..Ns].* = s_i.toBytes(.big);
+        var kp = Ed25519.KeyPair.generateDeterministic(self.message_seed) catch unreachable; // checked by Party.init
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+        const a = sign(kp, bytes[0..header_length].*, bytes[header_length .. bytes.len - signature_length]);
+        bytes[bytes.len - signature_length ..][0..signature_length].* = a.signature;
         return bytes;
     }
 
@@ -1059,8 +1210,15 @@ pub const Presignature = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.sigma));
     }
 
-    pub fn deinit(self: *Presignature) void {
+    /// Also wipes the message seed (`deinit`; a used presignature keeps it
+    /// until then only because the type is one value).
+    fn wipeAll(self: *Presignature) void {
         self.wipe();
+        std.crypto.secureZero(u8, &self.message_seed);
+    }
+
+    pub fn deinit(self: *Presignature) void {
+        self.wipeAll();
         self.public.deinit();
         self.* = undefined;
     }
@@ -1099,6 +1257,8 @@ const Case = enum {
     misaddressed,
     truncated,
     equivocate,
+    bad_signature,
+    false_echo,
 };
 
 const Observed = struct { observer: u32, abort: Abort };
@@ -1114,14 +1274,29 @@ const SessionResult = struct {
     }
 };
 
+/// Flips the last payload byte (the byte before the signature).
 fn flipLast(bytes: []u8) void {
-    bytes[bytes.len - 1] ^= 0x01;
+    bytes[bytes.len - signature_length - 1] ^= 0x01;
+}
+
+/// Offset of a round's payload in a message: past the header and, for a
+/// round that attests, the attestation block.
+fn payloadAt(round: u8, signers: usize) usize {
+    return header_length + if (hasAttestation(round)) signers * attestation_entry_length else 0;
+}
+
+/// Re-signs a message the test changed, as its (malicious) sender would; a
+/// broadcast also becomes the sender's own view of what it sent.
+fn resign(party: *Party, msg: []u8, own: bool) void {
+    const a = sign(party.message_kp, msg[0..header_length].*, msg[header_length .. msg.len - signature_length]);
+    msg[msg.len - signature_length ..][0..signature_length].* = a.signature;
+    if (own and (peekHeader(msg) catch unreachable).to == null) party.own_bc = a;
 }
 
 /// Swaps the first and third length-prefixed fields of a Phase-2 payload
 /// (`c_γ` and `c_w`), or puts the first in place of the third (`both_first`).
-fn rewriteRound2(allocator: std.mem.Allocator, msg: []u8, both_first: bool) !void {
-    const payload = msg[header_length + echo_length ..];
+fn rewriteRound2(allocator: std.mem.Allocator, msg: []u8, both_first: bool, signers: usize) !void {
+    const payload = msg[payloadAt(2, signers) .. msg.len - signature_length];
     var off: usize = 0;
     var fields: [4][]const u8 = undefined;
     for (&fields) |*f| f.* = readLenPrefixed(payload, &off).?;
@@ -1183,33 +1358,33 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         boxes = next;
         if (aborts.items.len != 0) return .{ .presigs = try allocator.alloc(Presignature, 0), .aborts = try aborts.toOwnedSlice(allocator) };
 
-        // The cheater's deviation, on its outgoing bytes.
+        // The cheater's deviation, on its outgoing bytes — re-signed, as a
+        // malicious signer holding its own key would (except `bad_signature`).
         for (boxes[cheat_pos].?.messages) |m| {
             const r: u8 = @intCast(round);
+            const at = payloadAt(r, t);
             switch (case) {
                 .range_proof => if (r == 1 and m.to != null) flipLast(m.bytes),
-                .mta_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, false),
-                .mtawc_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, true),
+                .mta_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, false, t),
+                .mtawc_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, true, t),
                 .delta_shift => if (r == 3) {
                     const me = &parties[cheat_pos].peers[parties[cheat_pos].me];
                     me.delta = me.delta.add(Scalar.one);
-                    m.bytes[header_length + echo_length ..][0..Ns].* = me.delta.toBytes(.big);
-                    // A consistent liar hashes what it actually sent.
-                    Sha256.hash(m.bytes[header_length + echo_length ..], &parties[cheat_pos].own_bc_hash, .{});
+                    m.bytes[at..][0..Ns].* = me.delta.toBytes(.big);
                 },
                 .pedersen_proof => if (r == 3) flipLast(m.bytes),
                 .gamma_swap => if (r == 4) {
-                    m.bytes[header_length + echo_length ..][0..Ne].* = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
+                    m.bytes[at..][0..Ne].* = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
                 },
                 .gamma_blind => if (r == 4) {
-                    m.bytes[header_length + echo_length + Ne] ^= 0x01;
+                    m.bytes[at + Ne] ^= 0x01;
                 },
                 .gamma_proof => if (r == 4) flipLast(m.bytes),
                 .pdl_proof => if (r == 5 and m.to != null) {
-                    m.bytes[m.bytes.len - Ne - 1] ^= 0x01; // last byte of the range proof's s2
+                    m.bytes[m.bytes.len - signature_length - Ne - 1] ^= 0x01; // last byte of the range proof's s2
                 },
                 .r_bar_swap => if (r == 5 and m.to == null) {
-                    m.bytes[header_length + echo_length ..][0..Ne].* = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
+                    m.bytes[at..][0..Ne].* = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
                 },
                 .st_proof => if (r == 6) flipLast(m.bytes),
                 .wrong_sid => if (r == 2) {
@@ -1221,8 +1396,16 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                 .misaddressed => if (r == 1 and m.to != null) {
                     std.mem.writeInt(u32, m.bytes[38..42], 9999, .big);
                 },
+                // Lies about signer 0's round-3 broadcast in its round-4
+                // attestations (a body hash signer 0 never signed).
+                .false_echo => if (r == 4) {
+                    m.bytes[header_length] ^= 0x01;
+                },
                 else => {},
             }
+            if (case == .bad_signature) {
+                if (r == 3 and m.to == null) m.bytes[m.bytes.len - 1] ^= 0x01;
+            } else resign(&parties[cheat_pos], m.bytes, true);
         }
 
         for (&inboxes) |*b| b.clearRetainingCapacity();
@@ -1239,9 +1422,11 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                     if (deliver and case == .equivocate and round == 3 and m.to == null and to == t - 1) {
                         const copy = try allocator.dupe(u8, m.bytes);
                         try copies.append(allocator, copy);
-                        const at = header_length + echo_length;
+                        const at = payloadAt(3, t);
                         const d = Scalar.fromBytes(copy[at..][0..Ns].*, .big) catch unreachable;
                         copy[at..][0..Ns].* = d.add(Scalar.one).toBytes(.big);
+                        // The cheater signs this second version too.
+                        resign(&parties[cheat_pos], copy, false);
                         try inboxes[to].append(allocator, copy);
                         continue;
                     }
@@ -1358,11 +1543,16 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
         .{ .case = .wrong_sid, .fault = .unexpected_message, .attributed = true },
         .{ .case = .wrong_round, .fault = .unexpected_message, .attributed = true },
         .{ .case = .misaddressed, .fault = .unexpected_message, .attributed = true },
-        .{ .case = .truncated, .fault = .malformed_message, .attributed = true },
-        // Different broadcasts to different signers: caught by the echoed
-        // transcript before anyone acts on the split view (review F1) —
-        // without it each victim would blame the OTHER honest one.
-        .{ .case = .equivocate, .fault = .equivocation, .attributed = false },
+        // A truncated message no longer carries its signature.
+        .{ .case = .truncated, .fault = .bad_signature, .attributed = true },
+        .{ .case = .bad_signature, .fault = .bad_signature, .attributed = true },
+        // Different broadcasts to different signers: caught by the signed
+        // attestations before anyone acts on the split view (review F1) —
+        // and since the cheater signed both versions, it is named.
+        .{ .case = .equivocate, .fault = .equivocation, .attributed = true },
+        // An attestation of a broadcast its sender never signed: the
+        // attester is named, not the signer it misquotes.
+        .{ .case = .false_echo, .fault = .equivocation, .attributed = true },
         // Types 5 and 7: consistent lies every proof accepts; caught by the
         // sums, not attributable without the §4.3 opening protocol.
         .{ .case = .delta_shift, .fault = .r_bar_sum, .attributed = false },
@@ -1378,8 +1568,12 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
         var honest_aborts: usize = 0;
         for (res.aborts) |a| {
             if (a.observer == cheat) {
-                // The cheater's own party only ever sees honest input.
-                try testing.expect(!c.attributed);
+                // The cheater's own party only ever sees honest input — except
+                // its own second version of a broadcast, which the victims'
+                // attestations show it: then it names itself.
+                if (c.case == .equivocate) {
+                    try testing.expectEqual(Abort{ .culprit = cheat, .fault = .equivocation }, a.abort);
+                } else try testing.expect(!c.attributed);
                 continue;
             }
             honest_aborts += 1;
@@ -1408,13 +1602,33 @@ test "presign: a wrong signature share is named by combine; a missing or foreign
     const public = &res.presigs[0].public;
     var abort: ?Abort = null;
 
-    // Signer 2's share shifted by one: equation (1) of §4.2 fails for 2 only.
+    // Signer 2's share shifted by one (and re-signed by signer 2): equation
+    // (1) of §4.2 fails for 2 only.
+    const kp2 = try Ed25519.KeyPair.generateDeterministic(kg.key_shares[1].message_seed);
+    const s_at = header_length + public.signers.len * attestation_entry_length;
     const bad = try allocator.dupe(u8, s2);
     defer allocator.free(bad);
-    const s_val = Scalar.fromBytes(bad[header_length + echo_length ..][0..Ns].*, .big) catch unreachable;
-    bad[header_length + echo_length ..][0..Ns].* = s_val.add(Scalar.one).toBytes(.big);
+    const s_val = Scalar.fromBytes(bad[s_at..][0..Ns].*, .big) catch unreachable;
+    bad[s_at..][0..Ns].* = s_val.add(Scalar.one).toBytes(.big);
+    bad[bad.len - signature_length ..][0..signature_length].* = sign(kp2, bad[0..header_length].*, bad[header_length .. bad.len - signature_length]).signature;
     try testing.expectError(error.ProtocolAbort, public.combine(msg, &[_][]const u8{ s1, bad }, &abort));
     try testing.expectEqual(Abort{ .culprit = kg.key_shares[1].index, .fault = .sig_share }, abort.?);
+
+    // The same change without signer 2's signature: refused before any math.
+    const unsigned = try allocator.dupe(u8, s2);
+    defer allocator.free(unsigned);
+    unsigned[s_at] ^= 0x01;
+    try testing.expectError(error.ProtocolAbort, public.combine(msg, &[_][]const u8{ s1, unsigned }, &abort));
+    try testing.expectEqual(Abort{ .culprit = kg.key_shares[1].index, .fault = .bad_signature }, abort.?);
+
+    // Signer 2 attesting a Phase-6 broadcast of signer 1 that signer 1 never
+    // signed: signer 2 is named.
+    const lying = try allocator.dupe(u8, s2);
+    defer allocator.free(lying);
+    lying[header_length] ^= 0x01;
+    lying[lying.len - signature_length ..][0..signature_length].* = sign(kp2, lying[0..header_length].*, lying[header_length .. lying.len - signature_length]).signature;
+    try testing.expectError(error.ProtocolAbort, public.combine(msg, &[_][]const u8{ s1, lying }, &abort));
+    try testing.expectEqual(Abort{ .culprit = kg.key_shares[1].index, .fault = .equivocation }, abort.?);
 
     // The right shares for another message: every share fails, the first is named.
     try testing.expectError(error.ProtocolAbort, public.combine(.{ .bytes = "other" }, &[_][]const u8{ s1, s2 }, &abort));
@@ -1479,7 +1693,7 @@ test "fuzz: peekHeader and PresignaturePublic.combine never panic on arbitrary s
     try testing.fuzz({}, fuzzCombine, .{});
 }
 fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
-    var buf: [2][header_length + echo_length + Ns + 8]u8 = undefined;
+    var buf: [2][header_length + 2 * attestation_entry_length + Ns + signature_length + 8]u8 = undefined;
     var shares: [2][]const u8 = undefined;
     for (&buf, &shares) |*b, *s| s.* = b[0..smith.slice(b)];
     for (shares) |s| _ = peekHeader(s) catch {};
@@ -1487,6 +1701,9 @@ fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
     var signers = [_]u32{ 1, 2 };
     var r_bar = [_]Element{ g, g };
     var s_points = [_]Element{ g, g };
+    var round6: [2]Attestation = @splat(.{ .body_hash = @splat(0), .signature = @splat(0) });
+    const kp = Ed25519.KeyPair.generateDeterministic(@splat(1)) catch unreachable;
+    var keys = [_]Ed25519.PublicKey{ kp.public_key, kp.public_key };
     const public: PresignaturePublic = .{
         .allocator = testing.allocator,
         .sid = [_]u8{0} ** 32,
@@ -1496,7 +1713,8 @@ fn fuzzCombine(_: void, smith: *std.testing.Smith) !void {
         .r = Scalar.one,
         .r_bar = &r_bar,
         .s_points = &s_points,
-        .transcript = [_]u8{0} ** 32,
+        .round6 = &round6,
+        .message_keys = &keys,
     };
     var abort: ?Abort = null;
     _ = public.combine(.{ .bytes = "fuzz" }, &shares, &abort) catch {};

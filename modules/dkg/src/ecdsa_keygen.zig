@@ -375,7 +375,9 @@ fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalA
     const p = try allocator.dupe(u8, ring.p());
     errdefer allocator.free(p);
     const q = try allocator.dupe(u8, ring.q());
-    return aux_info.LocalAux.fromParts(key, .{ .n_tilde = nt, .h1 = h1, .h2 = h2 }, .{ .p = p, .q = q, .lambda = lambda });
+    var seed: [32]u8 = undefined;
+    random.bytes(&seed);
+    return aux_info.LocalAux.fromParts(key, .{ .n_tilde = nt, .h1 = h1, .h2 = h2 }, .{ .p = p, .q = q, .lambda = lambda }, seed);
 }
 
 const Rig = struct {

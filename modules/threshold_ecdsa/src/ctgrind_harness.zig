@@ -201,7 +201,9 @@ fn buildFixture(allocator: std.mem.Allocator, setup_random: std.Random) !Fixture
     var coefficients: [1]Scalar = undefined;
     coefficients[0] = randomScalar(setup_random);
 
-    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, &coefficients, &paillier_keys, &aux_params);
+    var message_seeds: [n][32]u8 = undefined;
+    for (&message_seeds) |*sd| setup_random.bytes(sd);
+    const key_shares = try root.keygenTrustedDealer(allocator, t, n, secret, &coefficients, &paillier_keys, &aux_params, &message_seeds);
     return .{ .key_shares = key_shares };
 }
 

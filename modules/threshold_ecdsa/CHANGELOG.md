@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **BREAKING (wire v2, codecs, API): signed presigning messages, the
+  equivocator is named.** `PartyPublicKeys.message_key` / `KeyShare.message_seed`
+  (Ed25519); `keygenTrustedDealer` takes `message_seeds`, `aux_info.LocalAux` generates
+  one and `Announcement` carries its public key (`findDuplicate` refuses a shared one).
+  Every `presign` message is signed (`bad_signature`), and the running broadcast
+  transcript is replaced by signed per-signer attestations: `equivocation` now names
+  the signer who signed two versions of a broadcast, or the one who misquoted it.
+  `PresignaturePublic` holds the Phase-6 attestations and message keys (`combine`
+  checks shares the same way).
 - **2026-10-03** — Constant-time key setup, the last two pieces: the ring-Pedersen
   derivation (`Ñ`, `ord`, `λ`) runs on montint limbs instead of `std.math.big.int`, and
   the prime searches' trial-division sieve multiplies by reciprocals instead of

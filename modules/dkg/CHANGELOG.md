@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — `assembleKeyShares` takes `message_seeds` (`threshold_ecdsa`'s
+  Ed25519 message keys); `EcdsaKeygen`'s announcements carry each party's message key.
 - **2026-10-03** — `EcdsaKeygen`: the per-party proof context starts with a form
   byte (0 raw session id, 1 its SHA-256 when longer than 64 bytes), so a raw 32-byte
   session id can no longer equal another session's digest (review F8); the

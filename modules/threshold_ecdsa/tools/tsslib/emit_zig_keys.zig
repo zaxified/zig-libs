@@ -53,7 +53,9 @@ pub fn main(init: std.process.Init) !void {
 
     const secret = tecdsa.Scalar.random(init.io);
     const coefficient = tecdsa.Scalar.random(init.io);
-    const shares = try tecdsa.keygenTrustedDealer(gpa, 2, n, secret, &.{coefficient}, &keys, &aux_params);
+    var message_seeds: [n][32]u8 = undefined;
+    for (&message_seeds) |*sd| sd.* = tecdsa.Scalar.random(init.io).toBytes(.big);
+    const shares = try tecdsa.keygenTrustedDealer(gpa, 2, n, secret, &.{coefficient}, &keys, &aux_params, &message_seeds);
     defer gpa.free(shares);
     defer gpa.free(shares[0].public_keys.entries);
 

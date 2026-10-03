@@ -41,21 +41,26 @@ pub const LocalAux = struct {
     paillier: root.PaillierBlumKey,
     aux: root.AuxParams,
     trapdoor: root.AuxTrapdoor,
+    /// SECRET: the Ed25519 seed this party will sign its presigning
+    /// messages with (`root.KeyShare.message_seed`).
+    message_seed: [32]u8,
 
-    /// Generate a 2048-bit Paillier-Blum key and a 2048-bit ring-Pedersen
-    /// tuple with its trapdoor. Slow (two safe primes); `random` MUST be a
-    /// CSPRNG. Free with `deinit`.
+    /// Generate a 2048-bit Paillier-Blum key, a 2048-bit ring-Pedersen
+    /// tuple with its trapdoor and a message-signing seed. Slow (two safe
+    /// primes); `random` MUST be a CSPRNG. Free with `deinit`.
     pub fn generate(allocator: std.mem.Allocator, random: std.Random) (root.GeneratePaillierBlumError || std.mem.Allocator.Error)!LocalAux {
         var key = try root.generatePaillierBlum(random, paillier.modulus_bits);
         errdefer key.wipe();
         const at = try root.generateAuxParamsWithTrapdoor(allocator, random, root.aux_modulus_bits);
-        return .{ .paillier = key, .aux = at.params, .trapdoor = at.trapdoor };
+        var seed: [32]u8 = undefined;
+        random.bytes(&seed);
+        return .{ .paillier = key, .aux = at.params, .trapdoor = at.trapdoor, .message_seed = seed };
     }
 
     /// From material generated earlier (precomputed primes). Takes
     /// ownership of `trapdoor`.
-    pub fn fromParts(key: root.PaillierBlumKey, aux: root.AuxParams, trapdoor: root.AuxTrapdoor) LocalAux {
-        return .{ .paillier = key, .aux = aux, .trapdoor = trapdoor };
+    pub fn fromParts(key: root.PaillierBlumKey, aux: root.AuxParams, trapdoor: root.AuxTrapdoor, message_seed: [32]u8) LocalAux {
+        return .{ .paillier = key, .aux = aux, .trapdoor = trapdoor, .message_seed = message_seed };
     }
 
     /// Wipes the Paillier factors and secret key and the aux trapdoor. A
@@ -65,6 +70,7 @@ pub const LocalAux = struct {
         self.paillier.wipe();
         std.crypto.secureZero(u8, @constCast(self.trapdoor.p));
         std.crypto.secureZero(u8, @constCast(self.trapdoor.q));
+        std.crypto.secureZero(u8, &self.message_seed);
         self.trapdoor.deinit(allocator);
     }
 
@@ -73,6 +79,8 @@ pub const LocalAux = struct {
     pub fn announce(self: *const LocalAux, allocator: std.mem.Allocator, context: []const u8, random: std.Random) aux_proofs.ProveError!Announcement {
         return .{
             .paillier_pk = self.paillier.key.public,
+            // A clamped Ed25519 scalar is never zero: no seed fails here.
+            .message_key = root.messagePublicKey(self.message_seed) catch unreachable,
             .aux = self.aux,
             .aux_proof = try aux_proofs.proveWellFormedBound(allocator, self.aux, self.trapdoor, context, random),
             .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, self.paillier.modulus(), self.paillier.p(), self.paillier.q(), context, random),
@@ -88,6 +96,9 @@ pub const LocalAux = struct {
 
 pub const Announcement = struct {
     paillier_pk: paillier.PublicKey,
+    /// Ed25519 key of this party's presigning messages
+    /// (`root.PartyPublicKeys.message_key`).
+    message_key: [32]u8,
     aux: root.AuxParams,
     aux_proof: aux_proofs.WellFormedProof,
     paillier_proof: aux_proofs.ModProof,
@@ -95,7 +106,7 @@ pub const Announcement = struct {
     pub const AllocError = std.mem.Allocator.Error || paillier.PublicKey.ByteError || root.AuxParams.AllocError || aux_proofs.ModProof.AllocError || aux_proofs.PrmProof.AllocError;
 
     /// `len-prefixed` each of: Paillier `N`, `aux.toBytesAlloc()`, Πprm(Ñ),
-    /// Πmod(Ñ), Πmod(N).
+    /// Πmod(Ñ), Πmod(N); then the 32-byte message key.
     pub fn toBytesAlloc(self: Announcement, allocator: std.mem.Allocator) AllocError![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
@@ -117,6 +128,7 @@ pub const Announcement = struct {
             defer allocator.free(part);
             try appendLenPrefixed(&list, allocator, part);
         }
+        try list.appendSlice(allocator, &self.message_key);
         return list.toOwnedSlice(allocator);
     }
 
@@ -133,8 +145,10 @@ pub const Announcement = struct {
         const prm = aux_proofs.PrmProof.fromBytesAlloc(aux.n_tilde, try readLenPrefixed(bytes, &off)) catch return error.InvalidEncoding;
         const mod_aux = aux_proofs.ModProof.fromBytesAlloc(aux.n_tilde, try readLenPrefixed(bytes, &off)) catch return error.InvalidEncoding;
         const mod_n = aux_proofs.ModProof.fromBytesAlloc(n_mod, try readLenPrefixed(bytes, &off)) catch return error.InvalidEncoding;
-        if (off != bytes.len) return error.InvalidEncoding;
-        return .{ .paillier_pk = pk, .aux = aux, .aux_proof = .{ .prm = prm, .mod = mod_aux }, .paillier_proof = mod_n };
+        if (bytes.len - off != 32) return error.InvalidEncoding;
+        const message_key = bytes[off..][0..32].*;
+        _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(message_key) catch return error.InvalidEncoding;
+        return .{ .paillier_pk = pk, .message_key = message_key, .aux = aux, .aux_proof = .{ .prm = prm, .mod = mod_aux }, .paillier_proof = mod_n };
     }
 };
 
@@ -179,6 +193,11 @@ pub fn verifyFactors(prover: Announcement, own_aux: root.AuxParams, context: []c
 /// (or its factorization is known to two parties); which one cannot be told
 /// from the bytes, so the run must abort. Indices are into `all`.
 pub fn findDuplicate(all: []const Announcement) ?struct { usize, usize } {
+    // A shared message key would let one party's signed message be pinned
+    // on another: the keys must be distinct too.
+    for (all, 0..) |a, i| {
+        for (all[i + 1 ..], i + 1..) |b, j| if (std.mem.eql(u8, &a.message_key, &b.message_key)) return .{ i, j };
+    }
     for (all, 0..) |a, i| {
         const ai = [2][root.aux_modulus_bytes]u8{ modulusBytes(a.paillier_pk), auxModulusBytes(a.aux.n_tilde) };
         if (std.mem.eql(u8, &ai[0], &ai[1])) return .{ i, i };
@@ -328,7 +347,8 @@ pub fn assembleKeyShare(
     const own_ann = announcements[index - 1];
     if (!std.mem.eql(u8, &modulusBytes(own_ann.paillier_pk), &modulusBytes(own.paillier.key.public)) or
         !std.mem.eql(u8, &auxModulusBytes(own_ann.aux.n_tilde), &auxModulusBytes(own.aux.n_tilde)) or
-        !feBytesEql(own_ann.aux.h1, own.aux.h1) or !feBytesEql(own_ann.aux.h2, own.aux.h2))
+        !feBytesEql(own_ann.aux.h1, own.aux.h1) or !feBytesEql(own_ann.aux.h2, own.aux.h2) or
+        !std.mem.eql(u8, &own_ann.message_key, &(root.messagePublicKey(own.message_seed) catch return error.NotOwnAnnouncement)))
         return error.NotOwnAnnouncement;
 
     const own_x = try root.derivePublicKeyShare(vvec, index);
@@ -343,6 +363,7 @@ pub fn assembleKeyShare(
             .paillier_pk = a.paillier_pk,
             .aux = a.aux,
             .verifying_share = try root.derivePublicKeyShare(vvec, @intCast(j)),
+            .message_key = a.message_key,
         };
     }
     return .{
@@ -354,6 +375,7 @@ pub fn assembleKeyShare(
         .verifying_share = own_x,
         .paillier_secret = own.paillier.key.secret,
         .public_keys = .{ .entries = entries },
+        .message_seed = own.message_seed,
     };
 }
 
@@ -420,6 +442,7 @@ fn tssLocal(allocator: std.mem.Allocator, i: usize) !LocalAux {
         key,
         .{ .n_tilde = nt, .h1 = try fe(allocator, nt, p.h1), .h2 = try fe(allocator, nt, p.h2) },
         .{ .p = tp, .q = tq, .lambda = lambda },
+        @splat(@intCast(i + 1)), // distinct per party; a test seed
     );
 }
 
@@ -541,6 +564,7 @@ test "aux_info: verifyAnnouncement refuses a Paillier key below the floor" {
     const ctx = ctxFor(1);
     const ann: Announcement = .{
         .paillier_pk = small.key.public,
+        .message_key = try root.messagePublicKey(full.message_seed),
         .aux = full.aux,
         .aux_proof = try aux_proofs.proveWellFormedBound(allocator, full.aux, full.trapdoor, &ctx, random),
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, small.modulus(), small.p(), small.q(), &ctx, random),
@@ -579,9 +603,11 @@ test "findDuplicate: a party whose Paillier N doubles as its own Ñ" {
     var a: Announcement = undefined;
     a.paillier_pk = k1.key.public;
     a.aux = .{ .n_tilde = k2.modulus(), .h1 = h, .h2 = h };
+    a.message_key = @splat(1);
     var b: Announcement = undefined;
     b.paillier_pk = k3.key.public;
     b.aux = .{ .n_tilde = k3.modulus(), .h1 = h, .h2 = h }; // N = Ñ
+    b.message_key = @splat(2);
     try testing.expectEqual(@as(?struct { usize, usize }, null), findDuplicate(&.{a}));
     const dup = findDuplicate(&.{ a, b }) orelse return error.TestExpectedDuplicate;
     try testing.expectEqual(@as(usize, 1), dup[0]);
@@ -621,9 +647,39 @@ test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2
 
     const ann: Announcement = .{
         .paillier_pk = full.paillier.key.public,
+        .message_key = try root.messagePublicKey(full.message_seed),
         .aux = aux,
         .aux_proof = aux_proof,
         .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, full.paillier.modulus(), full.paillier.p(), full.paillier.q(), &ctx, random),
     };
     try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(ann, &ctx, random));
+}
+
+test "findDuplicate: two parties announcing one message key" {
+    var prng = std.Random.DefaultPrng.init(0x6175_7837);
+    const random = prng.random();
+    var k1 = try root.generatePaillierBlum(random, 512);
+    defer k1.wipe();
+    var k2 = try root.generatePaillierBlum(random, 512);
+    defer k2.wipe();
+    var k3 = try root.generatePaillierBlum(random, 512);
+    defer k3.wipe();
+    var k4 = try root.generatePaillierBlum(random, 512);
+    defer k4.wipe();
+    const h = k1.modulus().one();
+    var a: Announcement = undefined;
+    a.paillier_pk = k1.key.public;
+    a.aux = .{ .n_tilde = k2.modulus(), .h1 = h, .h2 = h };
+    a.message_key = @splat(1);
+    var b: Announcement = undefined;
+    b.paillier_pk = k3.key.public;
+    b.aux = .{ .n_tilde = k4.modulus(), .h1 = h, .h2 = h };
+    b.message_key = @splat(2);
+    try testing.expectEqual(@as(?struct { usize, usize }, null), findDuplicate(&.{ a, b }));
+    // Distinct moduli, one message key: one party's signed message could be
+    // pinned on the other.
+    b.message_key = a.message_key;
+    const dup = findDuplicate(&.{ a, b }) orelse return error.TestExpectedDuplicate;
+    try testing.expectEqual(@as(usize, 0), dup[0]);
+    try testing.expectEqual(@as(usize, 1), dup[1]);
 }

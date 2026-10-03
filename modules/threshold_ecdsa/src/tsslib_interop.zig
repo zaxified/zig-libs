@@ -97,6 +97,8 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
             .paillier_pk = kp.public,
             .aux = .{ .n_tilde = nt, .h1 = try auxFe(allocator, nt, p.h1), .h2 = try auxFe(allocator, nt, p.h2) },
             .verifying_share = big_x,
+            // tss-lib has no message keys; a fresh one per party (a test seed).
+            .message_key = try root.messagePublicKey(@splat(@intCast(p.index))),
         };
         const tp = try unhex(allocator, p.aux_p_safe);
         errdefer allocator.free(tp);
@@ -113,6 +115,7 @@ fn load(allocator: std.mem.Allocator, set: vectors.KeySet) !Loaded {
             .verifying_share = big_x,
             .paillier_secret = kp.secret,
             .public_keys = undefined,
+            .message_seed = @splat(@intCast(p.index)),
         };
     }
     for (shares) |*s| s.public_keys = .{ .entries = entries };

@@ -1499,7 +1499,19 @@ pub const PartyPublicKeys = struct {
     /// signer needs every other signer's `X_j`: GG20's MtAwc binds the
     /// counterparty's input to `W_j = λ_j·X_j` (`presign.zig`).
     verifying_share: Element,
+    /// Ed25519 public key this party signs its presigning messages with
+    /// (`presign.zig`): a signed broadcast shown two ways is proof of who
+    /// equivocated, and a signed p2p message cannot be disowned when the
+    /// identifiable-abort openings are checked. Encoded, validated by the
+    /// codec and by `presign.Party.init`.
+    message_key: [32]u8,
 };
+
+/// The Ed25519 public key of a message-signing seed (`KeyShare.message_seed`).
+pub fn messagePublicKey(seed: [32]u8) error{InvalidParameters}![32]u8 {
+    const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidParameters;
+    return kp.public_key.toBytes();
+}
 
 /// The full group's public material: one `PartyPublicKeys` per party,
 /// `1..=n`. Every `KeyShare` this module's `keygenTrustedDealer` returns
@@ -1524,7 +1536,8 @@ pub const PublicKeys = struct {
     /// `u32-BE count || entry[0] || ... || entry[count-1]`, each entry
     /// `u32-BE index || len-prefixed(paillier n) || len-prefixed
     /// (paillier g) || len-prefixed(aux.toBytesAlloc()) ||
-    /// verifying_share (33 bytes)`. REAL, mechanical.
+    /// verifying_share (33 bytes) || message_key (32 bytes)`. REAL,
+    /// mechanical.
     pub fn toBytesAlloc(self: PublicKeys, allocator: std.mem.Allocator) AllocError![]u8 {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
@@ -1554,6 +1567,7 @@ pub const PublicKeys = struct {
             try appendLenPrefixed(&list, allocator, aux_bytes);
 
             try list.appendSlice(allocator, &e.verifying_share.toBytes());
+            try list.appendSlice(allocator, &e.message_key);
         }
 
         return list.toOwnedSlice(allocator);
@@ -1577,8 +1591,9 @@ pub const PublicKeys = struct {
         // length-prefixed payloads), so reject a `count` the remaining
         // bytes could not possibly satisfy BEFORE allocating -- the same
         // bound `FeldmanCommitments.fromBytesAlloc` above already enforces
-        // for its own (fixed-size-element) count. (+33: the verifying share.)
-        const min_entry_bytes = 16 + Ne;
+        // for its own (fixed-size-element) count. (+33: the verifying share,
+        // +32: the message key.)
+        const min_entry_bytes = 16 + Ne + 32;
         if ((bytes.len - 4) / min_entry_bytes < count) return error.InvalidEncoding;
         var offset: usize = 4;
 
@@ -1600,7 +1615,12 @@ pub const PublicKeys = struct {
             const verifying_share = try Element.fromBytes(bytes[offset..][0..Ne].*);
             offset += Ne;
 
-            slot.* = .{ .index = index, .paillier_pk = pk, .aux = aux, .verifying_share = verifying_share };
+            if (bytes.len < offset + 32) return error.InvalidEncoding;
+            const message_key = bytes[offset..][0..32].*;
+            offset += 32;
+            _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(message_key) catch return error.InvalidEncoding;
+
+            slot.* = .{ .index = index, .paillier_pk = pk, .aux = aux, .verifying_share = verifying_share, .message_key = message_key };
         }
         if (offset != bytes.len) return error.InvalidEncoding;
         return .{ .entries = entries };
@@ -1643,11 +1663,14 @@ pub const KeyShare = struct {
     verifying_share: Element,
     paillier_secret: paillier.SecretKey,
     public_keys: PublicKeys,
+    /// SECRET: the Ed25519 seed this party signs its presigning messages
+    /// with; its public key is `public_keys.get(index).message_key`.
+    message_seed: [32]u8,
 
     pub const AllocError = std.mem.Allocator.Error || paillier.SecretKey.ByteError || PublicKeys.AllocError;
 
     /// `index(4) || t(4) || n(4) || secret_share(32) ||
-    /// group_public_key(33) || verifying_share(33) || len-prefixed
+    /// group_public_key(33) || verifying_share(33) || message_seed(32) || len-prefixed
     /// (paillier_secret.n) || len-prefixed(paillier_secret.lambda) ||
     /// len-prefixed(paillier_secret.mu) || len-prefixed
     /// (public_keys.toBytesAlloc())`. REAL, mechanical — composes
@@ -1668,6 +1691,7 @@ pub const KeyShare = struct {
         try list.appendSlice(allocator, &secret_bytes);
         try list.appendSlice(allocator, &self.group_public_key.toBytes());
         try list.appendSlice(allocator, &self.verifying_share.toBytes());
+        try list.appendSlice(allocator, &self.message_seed);
 
         const sk_n_len = self.paillier_secret.nByteLen();
         const sk_n_buf = try allocator.alloc(u8, sk_n_len);
@@ -1700,7 +1724,7 @@ pub const KeyShare = struct {
     /// Inverse of `toBytesAlloc`. Allocates `public_keys.entries`;
     /// caller frees with `allocator`.
     pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) (std.mem.Allocator.Error || FromBytesError)!KeyShare {
-        if (bytes.len < 12 + Ns + Ne + Ne) return error.InvalidEncoding;
+        if (bytes.len < 12 + Ns + Ne + Ne + 32) return error.InvalidEncoding;
         const index = std.mem.readInt(u32, bytes[0..4], .big);
         const t = std.mem.readInt(u32, bytes[4..8], .big);
         const n = std.mem.readInt(u32, bytes[8..12], .big);
@@ -1712,6 +1736,8 @@ pub const KeyShare = struct {
         offset += Ne;
         const verifying_share = try Element.fromBytes(bytes[offset..][0..Ne].*);
         offset += Ne;
+        const message_seed = bytes[offset..][0..32].*;
+        offset += 32;
 
         const sk_n_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const lambda_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
@@ -1734,6 +1760,9 @@ pub const KeyShare = struct {
         const own = public_keys.get(index) orelse return error.InvalidEncoding;
         // The broadcast copy of this party's own `X_i` must be the one it holds.
         if (!std.mem.eql(u8, &own.verifying_share.toBytes(), &verifying_share.toBytes())) return error.InvalidEncoding;
+        // …and so must its message key.
+        const own_mk = messagePublicKey(message_seed) catch return error.InvalidEncoding;
+        if (!std.mem.eql(u8, &own_mk, &own.message_key)) return error.InvalidEncoding;
 
         return .{
             .index = index,
@@ -1744,6 +1773,7 @@ pub const KeyShare = struct {
             .verifying_share = verifying_share,
             .paillier_secret = paillier_secret,
             .public_keys = public_keys,
+            .message_seed = message_seed,
         };
     }
 };
@@ -1762,9 +1792,10 @@ pub const KeygenError = error{InvalidParameters} || SplitError || DerivePublicKe
 /// fully passing today, with only a dedicated `generateAuxParams` test
 /// panicking).
 ///
-/// `paillier_keys.len` and `aux_params.len` MUST both equal `n` (one
-/// entry per party, `paillier_keys[i-1]`/`aux_params[i-1]` for party
-/// `i`); `coefficients.len` MUST equal `t - 1` (`splitSecretKey`'s own
+/// `paillier_keys.len`, `aux_params.len` and `message_seeds.len` MUST all
+/// equal `n` (one entry per party, `paillier_keys[i-1]`/`aux_params[i-1]`/
+/// `message_seeds[i-1]` for party `i`; a seed is 32 random bytes, the
+/// party's Ed25519 message-signing key); `coefficients.len` MUST equal `t - 1` (`splitSecretKey`'s own
 /// precondition). Returns `n` `KeyShare`s — see `KeyShare`'s doc comment
 /// for the shared-allocation ownership contract.
 pub fn keygenTrustedDealer(
@@ -1775,8 +1806,9 @@ pub fn keygenTrustedDealer(
     coefficients: []const Scalar,
     paillier_keys: []const paillier.KeyPair,
     aux_params: []const AuxParams,
+    message_seeds: []const [32]u8,
 ) KeygenError![]KeyShare {
-    if (paillier_keys.len != n or aux_params.len != n) return error.InvalidParameters;
+    if (paillier_keys.len != n or aux_params.len != n or message_seeds.len != n) return error.InvalidParameters;
 
     const split = try splitSecretKey(allocator, secret_key, t, n, coefficients);
     defer allocator.free(split.shares);
@@ -1793,6 +1825,7 @@ pub fn keygenTrustedDealer(
             .paillier_pk = paillier_keys[i - 1].public,
             .aux = aux_params[i - 1],
             .verifying_share = try derivePublicKeyShare(split.commitments, i),
+            .message_key = try messagePublicKey(message_seeds[i - 1]),
         };
     }
     const public_keys: PublicKeys = .{ .entries = party_pubs };
@@ -1811,6 +1844,7 @@ pub fn keygenTrustedDealer(
             .verifying_share = verifying_share,
             .paillier_secret = paillier_keys[i - 1].secret,
             .public_keys = public_keys,
+            .message_seed = message_seeds[i - 1],
         };
     }
     return key_shares;
@@ -1829,6 +1863,13 @@ pub fn keygenTrustedDealer(
 // module with one deliberately-deferred crypto core).
 
 const testing = std.testing;
+
+/// Distinct message-signing seeds for test key shares (party i gets seed i+1).
+const test_message_seeds = blk: {
+    var out: [8][32]u8 = undefined;
+    for (&out, 1..) |*x, i| x.* = @splat(@intCast(i));
+    break :blk out;
+};
 
 fn testScalar(seed: u8) Scalar {
     var buf = [_]u8{0} ** 48;
@@ -2006,7 +2047,7 @@ test "generate-based Paillier keygen wiring: keygenTrustedDealer wires distinct 
     const secret = testScalar(9);
     const coeffs = [_]Scalar{testScalar(10)};
 
-    const key_shares = try keygenTrustedDealer(allocator, t, n, secret, &coeffs, &paillier_keys, &aux_params);
+    const key_shares = try keygenTrustedDealer(allocator, t, n, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..n]);
     // LIFO defer order matters: `entries` is reached THROUGH
     // `key_shares[0]`, so it must be freed BEFORE `key_shares` itself —
     // meaning its `defer` must be declared AFTER (so it runs first).
@@ -2066,7 +2107,7 @@ test "KeyShare toBytesAlloc/fromBytesAlloc round-trip" {
 
     const secret = testScalar(11);
     const coeffs = [_]Scalar{testScalar(12)}; // t=2 needs exactly t-1=1 coefficient
-    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params);
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
@@ -2098,7 +2139,7 @@ test "KeyShare.fromBytesAlloc rejects a tuple whose own index is missing from pu
 
     const secret = testScalar(41);
     const coeffs = [_]Scalar{testScalar(42)}; // t=2 needs exactly t-1=1 coefficient
-    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params);
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
     defer allocator.free(key_shares);
     defer allocator.free(key_shares[0].public_keys.entries);
 
@@ -2540,6 +2581,7 @@ const Corpus = struct {
             &[_]Scalar{testScalar(12)},
             &[_]paillier.KeyPair{ kp1, kp2 },
             &[_]AuxParams{ aux, aux },
+            test_message_seeds[0..2],
         );
         defer allocator.free(key_shares);
         defer allocator.free(key_shares[0].public_keys.entries);
