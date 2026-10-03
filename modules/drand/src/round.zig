@@ -160,15 +160,17 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 
     var sig_g1: ?g1.Affine = null;
     if (sig_len == sig_g1_bytes) {
-        const pt = g1.fromBytesCompressed(sig_bytes[0..sig_g1_bytes].*) catch return error.InvalidPoint;
+        // The decoder runs the subgroup check the pairing equation cannot do
+        // for us — see the module doc comment. Same guard `chaininfo.parseInfo`
+        // applies to the G2 public key (`PublicKeyNotInSubgroup`).
+        const pt = g1.fromBytesCompressed(sig_bytes[0..sig_g1_bytes].*) catch |err| return switch (err) {
+            error.NotInSubgroup => error.SignatureNotInSubgroup,
+            else => error.InvalidPoint,
+        };
         // The identity is never a signature; `parseInfo` refuses the identity
         // key the same way. A caller using only the parser would otherwise be
         // handed the point at infinity from a "successful" parse.
         if (pt.infinity) return error.InvalidPoint;
-        // The subgroup check the pairing equation cannot do for us — see
-        // the module doc comment. Same guard `chaininfo.parseInfo` applies
-        // to the G2 public key (`PublicKeyNotInSubgroup`).
-        if (!g1.Jacobian.fromAffine(pt).subgroupCheck()) return error.SignatureNotInSubgroup;
         sig_g1 = pt;
     }
 
@@ -278,14 +280,14 @@ test "parseRound: decoded G1 signature is in the subgroup" {
 test "parseRound: an on-curve signature OUTSIDE G1 → SignatureNotInSubgroup (W2-32)" {
     // The on-curve, non-subgroup point at x = 4 (the same construction
     // `bls12_381`'s own subgroupCheck test uses), presented as a round
-    // signature. Decompression succeeds — `fromBytesCompressed` only
-    // checks the curve equation — so `InvalidPoint` never fires and this
+    // signature. Only the curve equation holds, so `InvalidPoint` never
+    // fires; the decoder's subgroup check (mapped to SignatureNotInSubgroup)
     // is the ONLY guard between such a point and the pairing equation,
     // which cannot see it.
     var comp = [_]u8{0} ** sig_g1_bytes;
     comp[0] = 0x80;
     comp[sig_g1_bytes - 1] = 4;
-    const pt = try g1.fromBytesCompressed(comp);
+    const pt = try g1.fromBytesCompressedUnchecked(comp);
     try testing.expect(g1.Jacobian.fromAffine(pt).isOnCurve());
     try testing.expect(!g1.Jacobian.fromAffine(pt).subgroupCheck());
 

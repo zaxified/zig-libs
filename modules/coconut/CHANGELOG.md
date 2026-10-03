@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — `decodeG1`/`decodeG2` rely on `bls12_381`'s checked decoders, which
+  now refuse a point outside the subgroup themselves (the hole of `c8d601e7` closed
+  at the source).
 - **2026-10-03** — **BREAKING (API + transcript):** the show proof is bound to the
   verifier, and the verifier states what it asked for. `proveCredential` /
   `proveCredentialSeededForTest` take a trailing `context: []const u8` (the verifier's

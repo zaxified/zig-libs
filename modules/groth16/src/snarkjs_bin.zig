@@ -58,6 +58,8 @@ pub const ParseError = error{
     NonCanonical,
     /// A point is not on the curve.
     NotOnCurve,
+    /// A G2 point is on the twist but outside the order-`r` subgroup.
+    NotInSubgroup,
     /// A count or index is out of the range the header allows.
     BadIndex,
     /// A feature of the format this reader does not implement (named per
@@ -265,10 +267,20 @@ pub fn g1ToBytes(p: G1.Affine) [g1_bytes]u8 {
 }
 
 /// A G2 point from 128 bytes; all-zero = infinity. Checks the twist
-/// equation only: the `[r]P == O` subgroup check costs a full scalar
-/// multiplication per point, so it belongs to `phase2.verify` (the step that
-/// decides whether a key can be trusted), not to every load.
+/// equation AND membership of `G2` (`error.NotInSubgroup`, one `[r]P`
+/// ladder): for the few G2 points a verifier or a contribution check
+/// consumes (the verifying key's β/γ/δ, a record's `g2_spx`).
 pub fn g2FromBytes(b: *const [g2_bytes]u8) ParseError!G2.Affine {
+    const p = try g2FromBytesUnchecked(b);
+    if (!G2.Jacobian.fromAffine(p).subgroupCheck()) return error.NotInSubgroup;
+    return p;
+}
+
+/// `g2FromBytes` without the subgroup check (twist equation still
+/// checked): the check costs a full scalar multiplication per point, so
+/// bulk sections the caller trusts — a `.ptau`, a prover's `b_g2` — skip
+/// it; `phase2.verify` compares them against a freshly derived key.
+pub fn g2FromBytesUnchecked(b: *const [g2_bytes]u8) ParseError!G2.Affine {
     if (std.mem.allEqual(u8, b, 0)) return G2.Affine.identity;
     const p: G2.Affine = .{
         .x = .{ .c0 = try fpFromMontLe(b[0..32]), .c1 = try fpFromMontLe(b[32..64]) },
@@ -290,9 +302,11 @@ pub fn g1Slice(bytes: []const u8, out: []G1.Affine) ParseError!void {
     for (out, 0..) |*p, i| p.* = try g1FromBytes(bytes[i * g1_bytes ..][0..g1_bytes]);
 }
 
-pub fn g2Slice(bytes: []const u8, out: []G2.Affine) ParseError!void {
+/// Decodes `out.len` consecutive G2 points WITHOUT the subgroup check
+/// (see `g2FromBytesUnchecked`): bulk sections only.
+pub fn g2SliceUnchecked(bytes: []const u8, out: []G2.Affine) ParseError!void {
     if (bytes.len != try byteLen(out.len, g2_bytes)) return error.BadSectionSize;
-    for (out, 0..) |*p, i| p.* = try g2FromBytes(bytes[i * g2_bytes ..][0..g2_bytes]);
+    for (out, 0..) |*p, i| p.* = try g2FromBytesUnchecked(bytes[i * g2_bytes ..][0..g2_bytes]);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -355,4 +369,28 @@ test "off-curve G2 point refused" {
     var enc = g2ToBytes(G2.Affine.generator);
     enc[100] ^= 1;
     try std.testing.expectError(error.NotOnCurve, g2FromBytes(&enc));
+    try std.testing.expectError(error.NotOnCurve, g2FromBytesUnchecked(&enc));
+}
+
+/// An on-twist point outside G2: x = u (bn254's own test point).
+fn testNonMemberG2() G2.Affine {
+    var c1: [32]u8 = @splat(0);
+    c1[31] = 1;
+    return .{
+        .x = .{ .c0 = Fp.zero, .c1 = Fp.fromBytes(c1) catch unreachable },
+        .y = .{
+            .c0 = Fp.fromBytes(hexBe("0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8")) catch unreachable,
+            .c1 = Fp.fromBytes(hexBe("07bca656753ef8cbee60335acbffe3def91636952d4ab9eb0b839c7f3566c0e2")) catch unreachable,
+        },
+    };
+}
+
+test "G2 point outside the subgroup: refused by g2FromBytes, kept by the Unchecked decoder" {
+    const q = testNonMemberG2();
+    try std.testing.expect(G2.Jacobian.fromAffine(q).isOnCurve());
+    const enc = g2ToBytes(q);
+    try std.testing.expectError(error.NotInSubgroup, g2FromBytes(&enc));
+    const back = try g2FromBytesUnchecked(&enc);
+    try std.testing.expect(back.x.eql(q.x) and back.y.eql(q.y));
+    _ = try g2FromBytes(&g2ToBytes(G2.Affine.generator));
 }

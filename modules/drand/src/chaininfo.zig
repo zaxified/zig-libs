@@ -268,10 +268,13 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     var pubkey_g2: ?g2.Affine = null;
     if (scheme.isVerifiable()) {
         if (pubkey_nbytes != g2.compressed_bytes) return error.InvalidLength;
-        const pt = g2.fromBytesCompressed(pubkey_bytes[0..g2.compressed_bytes].*) catch return error.InvalidPoint;
-        // drand KeyValidate: reject identity and non-subgroup keys.
+        // drand KeyValidate: reject identity and non-subgroup keys (the
+        // decoder checks the subgroup).
+        const pt = g2.fromBytesCompressed(pubkey_bytes[0..g2.compressed_bytes].*) catch |err| return switch (err) {
+            error.NotInSubgroup => error.PublicKeyNotInSubgroup,
+            else => error.InvalidPoint,
+        };
         if (pt.infinity) return error.InvalidPoint;
-        if (!g2.Jacobian.fromAffine(pt).subgroupCheck()) return error.PublicKeyNotInSubgroup;
         pubkey_g2 = pt;
     }
 
@@ -349,15 +352,16 @@ test "parseInfo: decoded pubkey is in the G2 subgroup (KeyValidate ran)" {
 }
 
 /// An on-curve G2 point OUTSIDE the order-r subgroup, found by scanning
-/// small x-coordinates (the audit's P9 found one at x = 2). Decompression
-/// only checks the curve equation, so only `subgroupCheck` can refuse it.
+/// small x-coordinates (the audit's P9 found one at x = 2). The curve
+/// equation holds, so only the subgroup check can refuse it (the checked
+/// decoder does; the scan uses the Unchecked one to find it).
 fn nonSubgroupG2Compressed() ![g2.compressed_bytes]u8 {
     var x: u8 = 1;
     while (x < 255) : (x += 1) {
         var comp = [_]u8{0} ** g2.compressed_bytes;
         comp[0] = 0x80;
         comp[g2.compressed_bytes - 1] = x;
-        const pt = g2.fromBytesCompressed(comp) catch continue;
+        const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
         if (pt.infinity) continue;
         if (!g2.Jacobian.fromAffine(pt).subgroupCheck()) return comp;
     }
@@ -391,7 +395,7 @@ test "parseInfo: an on-curve public key OUTSIDE G2 → PublicKeyNotInSubgroup (a
     // the rejection vector; the point is on the curve, so only the subgroup
     // check can catch it.
     const comp = try nonSubgroupG2Compressed();
-    const pt = try g2.fromBytesCompressed(comp);
+    const pt = try g2.fromBytesCompressedUnchecked(comp);
     try testing.expect(g2.Jacobian.fromAffine(pt).isOnCurve());
     const doc = try infoWithKey(testing.allocator, &std.fmt.bytesToHex(comp, .lower));
     defer testing.allocator.free(doc);

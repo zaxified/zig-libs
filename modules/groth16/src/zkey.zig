@@ -132,8 +132,12 @@ pub const Error = ParseError || Allocator.Error;
 /// Largest domain BN254's `Fr` has roots of unity for (2-adicity 28).
 pub const max_domain_power = 28;
 
-/// Parses a Groth16 `.zkey`. All points are checked on-curve; G2 subgroup
-/// membership is left to `phase2.verify` (see `snarkjs_bin.g2FromBytes`).
+/// Parses a Groth16 `.zkey`. All points are checked on-curve. The G2 points
+/// a verifier or a contribution check consumes — the verifying key's β, γ,
+/// δ and every record's `g2_spx` — are checked in `G2` too
+/// (`error.NotInSubgroup`), so `verifyingKey()` of a parsed key is safe to
+/// hand to `bn254.groth16Verify`. The bulk `b_g2` section (prover only) is
+/// not; `phase2.verify` compares it against a freshly derived key.
 /// The result owns its arrays; `bytes` may be freed afterwards.
 pub fn parse(allocator: Allocator, bytes: []const u8) Error!ZKey {
     const f = try bin.BinFile.parse(bytes, magic);
@@ -205,7 +209,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!ZKey {
         const b2 = try f.get(7);
         if (b2.len != try bin.byteLen(n_vars, bin.g2_bytes)) return error.BadSectionSize;
         z.b_g2 = try allocator.alloc(G2.Affine, n_vars);
-        try bin.g2Slice(b2, z.b_g2);
+        try bin.g2SliceUnchecked(b2, z.b_g2);
     }
     z.c = try g1Section(allocator, f, 8, n_vars - n_public - 1);
     z.h = try g1Section(allocator, f, 9, domain_size);

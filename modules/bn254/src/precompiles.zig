@@ -91,7 +91,6 @@ const pairing = @import("pairing.zig");
 /// subgroup check (see module doc comment).
 pub const PrecompileError = g1.G1Error || g2.G2Error || error{
     BadLength,
-    NotInSubgroup,
 };
 
 /// `ecPairingCheck`/`ecPairing` additionally need a caller-supplied
@@ -169,8 +168,9 @@ const pair_encoded_bytes = g1.encoded_bytes + g2.encoded_bytes;
 /// automatically, `g1.zig`'s module doc comment, so `g1.fromBytes`'s
 /// existing on-curve check is already sufficient — no separate call
 /// needed) and every decoded `G2` must be on-curve AND additionally
-/// pass `g2.Jacobian.subgroupCheck` — the check this function calls
-/// EXPLICITLY and MANDATORILY, because `G2`'s nontrivial cofactor means
+/// pass `g2.Jacobian.subgroupCheck` — MANDATORY, done inside
+/// `g2.fromBytes` (since 2026-10-03; before, this function called it
+/// explicitly), because `G2`'s nontrivial cofactor means
 /// on-curve does NOT imply subgroup-member (`g2.zig`'s module doc
 /// comment): an attacker-supplied on-curve-but-outside-subgroup `G2`
 /// operand would otherwise make the pairing check forgeable. A batch
@@ -193,10 +193,9 @@ pub fn ecPairingCheck(allocator: std.mem.Allocator, input: []const u8) EcPairing
     for (0..k) |i| {
         const off = i * pair_encoded_bytes;
         const p = try g1.fromBytes(input[off .. off + g1.encoded_bytes]);
-        const q = try g2.fromBytes(input[off + g1.encoded_bytes .. off + pair_encoded_bytes]);
         // MANDATORY, security-critical (module doc comment): g2.fromBytes
-        // only checked on-curve, not subgroup membership.
-        if (!g2.Jacobian.fromAffine(q).subgroupCheck()) return error.NotInSubgroup;
+        // checks on-curve and subgroup membership (error.NotInSubgroup).
+        const q = try g2.fromBytes(input[off + g1.encoded_bytes .. off + pair_encoded_bytes]);
         pairs[i] = .{ .p = p, .q = q };
     }
     return pairing.pairingCheck(pairs);

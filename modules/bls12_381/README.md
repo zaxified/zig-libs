@@ -99,7 +99,7 @@ const parsed = try bls12_381.G1.fromBytesCompressed(compressed); // 48 bytes -> 
 const sum = a.add(a);                    // field ops: add/sub/neg/mul/square/inv/pow/sqrt
 const doubled = p.double();              // point ops: add/double/negate/scalarMul/toAffine
 const pk = p.scalarMul(s);               // constant-time (secret-scalar-safe)
-const ok = pk.subgroupCheck();           // REQUIRED for untrusted points (see SPEC.md)
+const ok = pk.subgroupCheck();           // decoders do this; REQUIRED for points built otherwise
 
 // The pairing (Part 2 — subgroup inputs required, see SPEC.md):
 const gt = bls12_381.pairing.pairing(g1_gen, g2_gen); // e(G1, G2) ∈ Gt (== Fp12)
@@ -151,9 +151,11 @@ const ok9 = bls.verify(threshold.groupPublicKey(split.vvec), "message", combined
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
-the curve equation but deliberately NOT subgroup membership — callers
-crossing a trust boundary MUST also call `subgroupCheck` (the classic
-BLS pitfall; see `SPEC.md`'s threat model).
+the curve equation AND subgroup membership (`error.NotInSubgroup`) — the
+classic BLS pitfall closed at the boundary (see `SPEC.md`'s threat
+model). `fromBytes*Unchecked` skip the subgroup check, for bytes the
+caller already trusts only. A point built some other way still needs
+`subgroupCheck` before it meets a pairing.
 
 ## File layout
 

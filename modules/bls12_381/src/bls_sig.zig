@@ -141,11 +141,11 @@ pub const PublicKey = struct {
     pub const encoded_bytes = g1.compressed_bytes; // 48
 
     /// REAL — delegates to `g1.toBytesCompressed`/`fromBytesCompressed`
-    /// directly. Decoding does NOT subgroup-check (same contract as
-    /// `g1.fromBytesCompressed` itself — see that function's doc
-    /// comment): callers crossing a trust boundary MUST additionally
-    /// call `keyValidate` (below), matching draft §2.5's own
-    /// `KeyValidate` obligation.
+    /// directly, so decoding checks on-curve and subgroup membership
+    /// (`error.NotInSubgroup`). It still accepts the identity, which
+    /// draft §2.5's `KeyValidate` refuses: `verify` and friends run
+    /// `keyValidate` (below) themselves, and a `PublicKey` built without
+    /// this decoder gets the same check there.
     pub fn toBytes(self: PublicKey) [encoded_bytes]u8 {
         return g1.toBytesCompressed(self.point);
     }
@@ -162,11 +162,11 @@ pub const Signature = struct {
 
     pub const encoded_bytes = g2.compressed_bytes; // 96
 
-    /// REAL — same shape/caveat as `PublicKey.toBytes`/`fromBytes`, one
-    /// tower level up: decoding does NOT subgroup-check; `verify` and
-    /// friends MUST call `g2.Jacobian.subgroupCheck` on `sig.point`
-    /// themselves (draft §2.7 step 3, "signature_subgroup_check") —
-    /// see each function's doc comment below.
+    /// REAL — same shape as `PublicKey.toBytes`/`fromBytes`, one tower
+    /// level up: decoding checks subgroup membership. `verify` and
+    /// friends still run `g2.Jacobian.subgroupCheck` on `sig.point`
+    /// (draft §2.7 step 3, "signature_subgroup_check"), because a
+    /// `Signature` can be built without this decoder.
     pub fn toBytes(self: Signature) [encoded_bytes]u8 {
         return g2.toBytesCompressed(self.point);
     }
@@ -401,9 +401,9 @@ pub fn verify(pk: PublicKey, msg: []const u8, sig: Signature) bool {
 /// `coreAggregateVerify`/`fastAggregateVerify`, above/below).
 /// Precondition `n >= 1` (draft): `error.EmptySet` otherwise, matching
 /// the draft's own INVALID-on-empty-input contract. Does NOT subgroup-
-/// check its inputs (same convention as `Signature.fromBytes` — a
-/// `Signature` value is assumed already validated by whatever produced
-/// it; `coreAggregateVerify`/`fastAggregateVerify` re-check the
+/// check its inputs (a `Signature` value is assumed already validated by
+/// whatever produced it — `Signature.fromBytes` checks;
+/// `coreAggregateVerify`/`fastAggregateVerify` re-check the
 /// AGGREGATE result's subgroup membership themselves, per the draft).
 pub fn aggregate(sigs: []const Signature) BlsError!Signature {
     if (sigs.len == 0) return error.EmptySet;
@@ -684,7 +684,10 @@ test "keyValidate rejects a non-subgroup G1 point" {
     var comp = [_]u8{0} ** g1.compressed_bytes;
     comp[0] = 0x80;
     comp[g1.compressed_bytes - 1] = 4;
-    const pk = try PublicKey.fromBytes(comp);
+    // The decoder refuses it; a `PublicKey` built around it some other way
+    // must still fail `keyValidate`.
+    try std.testing.expectError(error.NotInSubgroup, PublicKey.fromBytes(comp));
+    const pk: PublicKey = .{ .point = try g1.fromBytesCompressedUnchecked(comp) };
     try std.testing.expect(!keyValidate(pk));
 }
 

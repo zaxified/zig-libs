@@ -439,10 +439,24 @@ fn recoverY(x: Fp2, sort: bool) G2Error!Fp2 {
     return y;
 }
 
-/// Parses the 192-byte uncompressed form, including the on-curve
-/// check. Does NOT check subgroup membership — see `g1.zig`'s
-/// `fromBytesUncompressed` doc comment for the identical caveat.
+/// Parses the 192-byte uncompressed form: flags, canonical coordinates,
+/// on-curve AND membership of the order-`r` subgroup `G2`
+/// (`error.NotInSubgroup`). The point at infinity is accepted; callers
+/// that must refuse it (public keys) check `infinity` themselves.
+/// Safe on bytes from a peer — the checking decoder is the default, as
+/// in zkcrypto `bls12_381` and arkworks (2026-10-03: coconut's verifier
+/// trusted an unchecked decode and accepted a cofactor-order point).
 pub fn fromBytesUncompressed(bytes: [uncompressed_bytes]u8) G2Error!Affine {
+    const p = try fromBytesUncompressedUnchecked(bytes);
+    if (!Jacobian.fromAffine(p).subgroupCheck()) return error.NotInSubgroup;
+    return p;
+}
+
+/// `fromBytesUncompressed` without the subgroup check (on-curve still
+/// checked). Only for bytes the caller already trusts — its own output,
+/// a pinned constant, a test vector of a point deliberately outside
+/// `G2`. Never for bytes from a peer.
+pub fn fromBytesUncompressedUnchecked(bytes: [uncompressed_bytes]u8) G2Error!Affine {
     const split = splitFlags(bytes[0]);
     if (split.flags.compression) return error.InvalidEncoding;
     if (split.flags.infinity) {
@@ -459,9 +473,18 @@ pub fn fromBytesUncompressed(bytes: [uncompressed_bytes]u8) G2Error!Affine {
     return p;
 }
 
-/// Parses the 96-byte compressed form. See `g1.zig`'s
-/// `fromBytesCompressed` for the identical caveat re: `recoverY`.
+/// Parses the 96-byte compressed form (`y` recovered via `recoverY`,
+/// so on-curve by construction) and checks membership of `G2`
+/// (`error.NotInSubgroup`) — the same contract as `fromBytesUncompressed`.
 pub fn fromBytesCompressed(bytes: [compressed_bytes]u8) G2Error!Affine {
+    const p = try fromBytesCompressedUnchecked(bytes);
+    if (!Jacobian.fromAffine(p).subgroupCheck()) return error.NotInSubgroup;
+    return p;
+}
+
+/// `fromBytesCompressed` without the subgroup check. Same rule as
+/// `fromBytesUncompressedUnchecked`: never for bytes from a peer.
+pub fn fromBytesCompressedUnchecked(bytes: [compressed_bytes]u8) G2Error!Affine {
     const split = splitFlags(bytes[0]);
     if (!split.flags.compression) return error.InvalidEncoding;
     if (split.flags.infinity) {
@@ -648,7 +671,8 @@ test "G2 subgroupCheck: generator passes, non-subgroup twist point fails; clearC
     var comp = [_]u8{0} ** compressed_bytes;
     comp[0] = 0x80; // compression flag, sort = 0; x.c1's top byte
     comp[Fp.encoded_bytes - 1] = 1; // x.c1 = 1
-    const p = try fromBytesCompressed(comp);
+    try std.testing.expectError(error.NotInSubgroup, fromBytesCompressed(comp));
+    const p = try fromBytesCompressedUnchecked(comp);
     const jac = Jacobian.fromAffine(p);
     try std.testing.expect(jac.isOnCurve());
     try std.testing.expect(!jac.subgroupCheck());
@@ -883,4 +907,36 @@ test "F4 subgroup G2: fast check == [r]P == O on members, non-members and off-tw
 
     try std.testing.expectEqual(@as(usize, 12), members);
     try std.testing.expectEqual(@as(usize, 36), outsiders);
+}
+
+test "decoders refuse a G2-curve point outside the subgroup; the Unchecked twins return it" {
+    var prng = std.Random.DefaultPrng.init(0x5b9_2026_1003);
+    const rng = prng.random();
+    var outsiders: usize = 0;
+    for (0..6) |_| {
+        const p = randomTwistPoint(rng);
+        const a = p.toAffine();
+        const comp = toBytesCompressed(a);
+        const unc = toBytesUncompressed(a);
+        if (p.subgroupCheckByOrder()) {
+            // A member drawn by chance: both decoders accept it.
+            _ = try fromBytesCompressed(comp);
+            _ = try fromBytesUncompressed(unc);
+            continue;
+        }
+        outsiders += 1;
+        try std.testing.expectError(error.NotInSubgroup, fromBytesCompressed(comp));
+        try std.testing.expectError(error.NotInSubgroup, fromBytesUncompressed(unc));
+        const back_c = try fromBytesCompressedUnchecked(comp);
+        const back_u = try fromBytesUncompressedUnchecked(unc);
+        try std.testing.expect(back_c.x.eql(a.x) and back_c.y.eql(a.y));
+        try std.testing.expect(back_u.x.eql(a.x) and back_u.y.eql(a.y));
+        // Clearing the cofactor lands in the subgroup: the checked decoders accept it.
+        const m = p.clearCofactor().toAffine();
+        _ = try fromBytesCompressed(toBytesCompressed(m));
+        _ = try fromBytesUncompressed(toBytesUncompressed(m));
+    }
+    try std.testing.expect(outsiders > 0);
+    // The identity is a member and decodes through the checked path.
+    try std.testing.expect((try fromBytesCompressed(toBytesCompressed(Affine.identity))).infinity);
 }

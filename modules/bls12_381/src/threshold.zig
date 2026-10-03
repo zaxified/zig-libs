@@ -182,12 +182,10 @@ pub const PublicKeyShare = struct {
         return out;
     }
 
-    /// REAL. Rejects `index == 0`; does NOT subgroup-check `point` (the
-    /// same convention as `bls_sig.PublicKey.fromBytes` — callers
-    /// crossing a trust boundary must additionally call
-    /// `bls_sig.keyValidate` on the unwrapped point, or rely on
-    /// `verifyPartialSignature`'s own fail-closed checks, which run
-    /// `bls_sig.verify`'s mandatory `keyValidate`/subgroup checks).
+    /// REAL. Rejects `index == 0`; `point` is checked on-curve and in
+    /// `G1` by `g1.fromBytesCompressed` (the identity still decodes;
+    /// `verifyPartialSignature` refuses it through `bls_sig.verify`'s
+    /// `keyValidate`).
     pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!PublicKeyShare {
         const index = std.mem.readInt(u32, bytes[0..4], .big);
         if (index == 0) return error.ZeroIndex;
@@ -214,11 +212,9 @@ pub const PartialSignature = struct {
         return out;
     }
 
-    /// REAL. Rejects `index == 0`; does NOT subgroup-check `point` —
-    /// same convention as `bls_sig.Signature.fromBytes`
-    /// (`verifyPartialSignature`/`combineSignatures`'s eventual
-    /// implementation are the trust-boundary checkpoints, exactly as
-    /// `bls_sig.verify` is for an ordinary `Signature`).
+    /// REAL. Rejects `index == 0`; `point` is checked on-curve and in
+    /// `G2` by `g2.fromBytesCompressed`, so `combineSignatures` never
+    /// sees a torsion component from a decoded partial.
     pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!PartialSignature {
         const index = std.mem.readInt(u32, bytes[0..4], .big);
         if (index == 0) return error.ZeroIndex;
@@ -266,9 +262,9 @@ pub const VerificationVector = struct {
 
     /// Inverse of `toBytesAlloc`. REAL: validates the length-prefix
     /// against the actual byte length, then decodes each compressed
-    /// point (on-curve checked by `g1.fromBytesCompressed`; NOT
-    /// subgroup-checked — same convention as every other `fromBytes` in
-    /// this module). Caller frees the returned `commitments` slice with
+    /// point (on-curve and subgroup checked by `g1.fromBytesCompressed`,
+    /// so `groupPublicKey`/`derivePublicKeyShare` never fold a torsion
+    /// component from a dealer's broadcast into a key). Caller frees the returned `commitments` slice with
     /// `allocator`.
     pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ThresholdError!VerificationVector {
         if (bytes.len < 4) return error.InvalidEncoding;

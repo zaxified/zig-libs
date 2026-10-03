@@ -23,7 +23,8 @@
 //! onto the twist), so cofactor CLEARING has no consumer in this arc.
 //! What every future pairing/Groth16 consumer DOES need is
 //! `subgroupCheck` (`[r]P == O`) — implemented below, mandatory before
-//! trusting any externally-supplied `G2` point (an unchecked
+//! trusting any externally-supplied `G2` point, and run by `fromBytes`
+//! itself since 2026-10-03 (`fromBytesUnchecked` skips it; an unchecked
 //! small-subgroup point lets an attacker force a degenerate/predictable
 //! pairing result — same pitfall `bls12_381/src/g2.zig`'s `SPEC.md`
 //! documents for its own `G2`).
@@ -78,6 +79,8 @@ pub const G2Error = error{
     InvalidFieldElement,
     /// The decoded `(x, y)` does not satisfy `y^2 = x^3 + b'`.
     NotOnCurve,
+    /// On the twist but not in the order-`r` subgroup `G2`.
+    NotInSubgroup,
 };
 
 /// An affine `G2` point: `(x, y) ∈ Fp2 x Fp2`, or the point at infinity.
@@ -278,11 +281,13 @@ pub const Jacobian = struct {
     /// implied by `isOnCurve()` here, unlike `G1` (`g1.zig`'s module
     /// doc comment): `G2`'s cofactor `h2 > 1`, so `E'(Fp2)` has proper
     /// nontrivial subgroups an attacker-supplied point could land in.
-    /// Construction: the simple, always-correct `[r]P == O` via
-    /// `scalarMulBytes` — mandatory before trusting any externally
-    /// supplied `G2` point in a future pairing consumer (see module doc
-    /// comment).
+    /// Construction: the twist equation, then the simple, always-correct
+    /// `[r]P == O` via `scalarMulBytes`. The twist equation comes first
+    /// (2026-10-03, as in `bls12_381`): `[r]P == O` alone also holds for
+    /// points that are not on the twist at all, and the result must be
+    /// `true` exactly for members of `G2`.
     pub fn subgroupCheck(self: Jacobian) bool {
+        if (!self.isOnCurve()) return false;
         return scalarMulBytes(self, &scalarmod.r_bytes).isIdentity();
     }
 };
@@ -325,16 +330,24 @@ pub fn toBytes(p: Affine) [encoded_bytes]u8 {
     return out;
 }
 
-/// Parses the EIP-197 128-byte form (imaginary-first ordering),
-/// including the on-curve check. Accepts a runtime-length slice — see
-/// `g1.zig`'s `fromBytes` doc comment for why. All-zero input decodes
-/// to the point at infinity (`(0,0)` is never on-twist for `b' != 0`).
-/// Does NOT check subgroup membership — callers that need a validated
-/// `G2` element (anything crossing a network/deserialization boundary
-/// into a future pairing consumer) MUST additionally call
-/// `Jacobian.subgroupCheck` (see the module doc comment's pitfall
-/// note).
+/// Parses the EIP-197 128-byte form (imaginary-first ordering): the
+/// on-curve check AND membership of `G2` (`error.NotInSubgroup`, one
+/// `[r]P` ladder). Accepts a runtime-length slice — see `g1.zig`'s
+/// `fromBytes` doc comment for why. All-zero input decodes to the point
+/// at infinity (`(0,0)` is never on-twist for `b' != 0`). Safe on bytes
+/// from a peer (2026-10-03; before, the subgroup check was the caller's
+/// separate duty — see the module doc comment's pitfall note).
 pub fn fromBytes(bytes: []const u8) G2Error!Affine {
+    const p = try fromBytesUnchecked(bytes);
+    if (!Jacobian.fromAffine(p).subgroupCheck()) return error.NotInSubgroup;
+    return p;
+}
+
+/// `fromBytes` without the subgroup check (on-curve still checked).
+/// Only for bytes the caller already trusts — its own output, a pinned
+/// constant, a test vector of a deliberate non-member. Never for bytes
+/// from a peer.
+pub fn fromBytesUnchecked(bytes: []const u8) G2Error!Affine {
     if (bytes.len != encoded_bytes) return error.InvalidEncoding;
     if (std.mem.allEqual(u8, bytes, 0)) return Affine.identity;
     const x_c1 = Fp.fromBytes(bytes[0 * Fp.encoded_bytes .. 1 * Fp.encoded_bytes].*) catch return error.InvalidFieldElement;
@@ -496,6 +509,26 @@ test "G2 subgroupCheck: an on-twist point OUTSIDE the subgroup fails; isOnCurve 
     const jac = Jacobian.fromAffine(.{ .x = x, .y = y });
     try std.testing.expect(jac.isOnCurve());
     try std.testing.expect(!jac.subgroupCheck());
+
+    // The decoder refuses it; the Unchecked twin returns it.
+    const enc = toBytes(.{ .x = x, .y = y });
+    try std.testing.expectError(error.NotInSubgroup, fromBytes(&enc));
+    const back = try fromBytesUnchecked(&enc);
+    try std.testing.expect(back.x.eql(x) and back.y.eql(y));
+}
+
+test "G2 subgroupCheck refuses an off-twist point even when [r]P == O" {
+    // [k]G2 moved off the twist by the isomorphism (x, y) -> (4x, 8y):
+    // the ladder's formulas do not use b', so the image still has
+    // [r]P == O, but it is not a point of E'(Fp2) at all.
+    var k: [32]u8 = @splat(0);
+    k[31] = 0x2b;
+    const m = jacGen().scalarMulBytes(&k);
+    const two = Fp2.one.add(Fp2.one);
+    const img: Jacobian = .{ .x = m.x.mul(two.square()), .y = m.y.mul(two.square().mul(two)), .z = m.z };
+    try std.testing.expect(!img.isOnCurve());
+    try std.testing.expect(img.scalarMulBytes(&scalarmod.r_bytes).isIdentity());
+    try std.testing.expect(!img.subgroupCheck());
 }
 
 // Cross-check vectors: [k]G2 for small k and a larger scalar, computed

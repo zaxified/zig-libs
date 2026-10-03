@@ -557,6 +557,8 @@ test "corpus: every damage script actually damages, and the counts are pinned" {
     // pristine one, eleven times. After:
     try std.testing.expectEqual(@as(usize, 16), flips);
     try std.testing.expectEqual(damage_seeds.len, distinct);
-    try std.testing.expectEqual(@as(usize, 8), decoded);
+    // 8 decoded until 2026-10-03; two damaged `U` encodings are on the twist
+    // but outside G2, and the checked decoder refuses them before `decrypt`.
+    try std.testing.expectEqual(@as(usize, 6), decoded);
     try std.testing.expectEqual(@as(usize, 1), decrypted);
 }

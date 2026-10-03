@@ -641,16 +641,20 @@ see "Part 6 design" below.
   implementation bug — an attacker can submit a small-subgroup point
   and force a degenerate or predictable pairing result, potentially
   forging signatures or breaking aggregation soundness depending on the
-  scheme built on top. Every wire-decode entry point in this module
+  scheme built on top. **Since 2026-10-03 every wire-decode entry point
   (`fromBytesUncompressed`/`fromBytesCompressed` for both `G1` and
-  `G2`) checks `isOnCurve` but explicitly does NOT check
-  `subgroupCheck` — that is a SEPARATE call callers crossing a trust
-  boundary MUST make (documented in each decode function's doc
-  comment). Whether a later part of this module's arc (e.g. Part 4's
-  BLS verify) folds the subgroup check into its own point-parsing
-  entry point, or requires callers to call it explicitly, is that
-  part's own design decision — Part 1 only guarantees the primitive
-  (`subgroupCheck`) exists and is documented. Since 2026-09-15
+  `G2`) checks subgroup membership itself** (`error.NotInSubgroup`), as
+  zkcrypto `bls12_381` and arkworks do; the old behaviour is the
+  explicitly named `fromBytes*Unchecked`, for bytes the caller already
+  trusts (its own output, a pinned constant, a vector of a deliberately
+  non-member point). Before that the check was a separate call every
+  consumer had to remember, and one did not: coconut's verifier
+  accepted `σ = (T, 1)` with `T` of cofactor order, a universal
+  credential forgery (relation audit 2026-10-03). The identity still
+  decodes (it is a member); `keyValidate` refuses it for public keys.
+  Functions that take an already-built `Affine` (`verify` and friends)
+  keep their own checks, because an `Affine` can be made without the
+  decoder. Since 2026-09-15
   `subgroupCheck` also checks the curve equation itself (the premise of
   the membership theorem it implements — see "Subgroup checks" below),
   so it is `true` exactly for members of `G1`/`G2`.

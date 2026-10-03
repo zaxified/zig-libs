@@ -102,7 +102,7 @@ pub fn newZkey(allocator: Allocator, r: circom.R1cs, p: Ptau) Error!ZKey {
     defer allocator.free(l_beta);
     const l_tau2 = try allocator.alloc(G2.Affine, n);
     defer allocator.free(l_tau2);
-    try bin.g2Slice(try p.lagrangeBytes(.tau_g2, log_n), l_tau2);
+    try bin.g2SliceUnchecked(try p.lagrangeBytes(.tau_g2, log_n), l_tau2);
 
     // Per-signal term lists, built once: A and B from the coefficient list
     // (which has the public rows), C straight from the r1cs.

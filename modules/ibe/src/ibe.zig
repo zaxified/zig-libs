@@ -382,14 +382,10 @@ pub fn Scheme(comptime cs: type) type {
                 return out;
             }
 
-            /// Inverse of `toBytes`. Does NOT subgroup-check `U` (same
-            /// deserialization contract as `bls12_381.bls_sig.
-            /// Signature.fromBytes` — see that type's doc comment);
-            /// `decrypt` performs its own consistency check
-            /// (`U == r*gen`) on every call, which is a STRONGER,
-            /// scheme-specific check than a bare subgroup test, so no
-            /// separate subgroup-check obligation is placed on callers
-            /// here.
+            /// Inverse of `toBytes`. `g2.fromBytesCompressed` refuses a `U`
+            /// outside `G2` (since 2026-10-03), so the pairing in `decrypt`
+            /// never runs on a torsion point; `decrypt`'s own consistency
+            /// check (`U == r*gen`) stays the scheme-specific guard. REAL.
             pub fn fromBytes(bytes: [encoded_bytes]u8) g2.G2Error!@This() {
                 const u = try g2.fromBytesCompressed(bytes[0..g2.compressed_bytes].*);
                 return .{

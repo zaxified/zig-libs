@@ -102,9 +102,9 @@ pub const Signature = struct {
     /// `0` or `>= r`), so `verify`/`proofGen` operate only on subgroup inputs.
     /// REAL.
     pub fn fromBytes(bytes: [encoded_bytes]u8) BbsError!Signature {
+        // The decoder refuses a point outside the subgroup.
         const a = G1.fromBytesCompressed(bytes[0..G1.compressed_bytes].*) catch return error.InvalidSignatureEncoding;
         if (a.infinity) return error.InvalidSignatureEncoding;
-        if (!G1.Jacobian.fromAffine(a).subgroupCheck()) return error.InvalidSignatureEncoding;
         const e = Fr.fromBytes(bytes[G1.compressed_bytes..].*) catch return error.InvalidSignatureEncoding;
         if (e.isZero()) return error.InvalidSignatureEncoding;
         return .{ .a = a, .e = e };
@@ -179,13 +179,12 @@ pub const Proof = struct {
         const u = (bytes.len - floor) / Fr.encoded_bytes;
 
         var off: usize = 0;
+        // The decoder refuses a point outside the subgroup.
         const abar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
         if (abar.infinity) return error.InvalidProofEncoding;
-        if (!G1.Jacobian.fromAffine(abar).subgroupCheck()) return error.InvalidProofEncoding;
         off += G1.compressed_bytes;
         const bbar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
         if (bbar.infinity) return error.InvalidProofEncoding;
-        if (!G1.Jacobian.fromAffine(bbar).subgroupCheck()) return error.InvalidProofEncoding;
         off += G1.compressed_bytes;
 
         const r2_hat = try fromBytesNonzeroScalar(bytes[off..][0..Fr.encoded_bytes].*);

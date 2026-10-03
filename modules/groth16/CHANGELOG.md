@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **`zkey.parse` checks the verifying key's G2 points (β, γ, δ) and every
+  contribution's `g2_spx` in `G2`** (`error.NotInSubgroup`, new in `ParseError`), so
+  `verifyingKey()` of a parsed file is safe for `bn254.groth16Verify` and a torsion
+  `g2_spx` cannot help a forged contribution pass `verifyContribution`.
+  `snarkjs_bin.g2FromBytes` checks the subgroup now; the old on-curve-only decoder is
+  `g2FromBytesUnchecked` and `g2Slice` became `g2SliceUnchecked` (bulk `b_g2` and the
+  trusted `.ptau`, BREAKING rename).
 - **2026-10-02** — Provenance check (clean room). `snarkjs_export.zig`'s doc said
   its JSON shape was read out of snarkjs's bundled source and called snarkjs
   Apache-2.0; snarkjs and ffjavascript are GPL-3.0. An isolated reviewer read

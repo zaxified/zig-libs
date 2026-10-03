@@ -361,7 +361,7 @@ fn cofactorTorsionPoint() !g1.Jacobian {
     var comp = [_]u8{0} ** g1.compressed_bytes;
     comp[0] = 0x80; // compression flag set, sort = 0
     comp[g1.compressed_bytes - 1] = 4;
-    const p = try g1.fromBytesCompressed(comp);
+    const p = try g1.fromBytesCompressedUnchecked(comp);
     return g1.Jacobian.fromAffine(p).scalarMulBytes(&bls12_381.scalar.r_bytes);
 }
 

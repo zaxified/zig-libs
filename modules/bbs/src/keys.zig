@@ -87,15 +87,15 @@ pub const PublicKey = struct {
         return G2.toBytesCompressed(self.point);
     }
 
-    /// REAL — delegates to `G2.fromBytesCompressed`, then runs the draft's
-    /// `KeyValidate` (§3.4.2): rejects the identity and any point outside the
-    /// prime-order subgroup, so the pairing/challenge checks in `verify`/
+    /// REAL — the draft's `KeyValidate` (§3.4.2): `G2.fromBytesCompressed`
+    /// rejects any point outside the prime-order subgroup, then the identity
+    /// is rejected here, so the pairing/challenge checks in `verify`/
     /// `proofVerify` only ever operate on the domain their soundness proof
     /// assumes (a cofactor-tainted key can otherwise sit outside that model).
     pub fn fromBytes(bytes: [encoded_bytes]u8) !PublicKey {
-        const point = try G2.fromBytesCompressed(bytes);
+        const point = G2.fromBytesCompressed(bytes) catch |err|
+            return if (err == error.NotInSubgroup) error.InvalidPublicKey else err;
         if (point.infinity) return error.InvalidPublicKey;
-        if (!G2.Jacobian.fromAffine(point).subgroupCheck()) return error.InvalidPublicKey;
         return .{ .point = point };
     }
 };

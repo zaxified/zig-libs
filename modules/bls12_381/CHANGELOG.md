@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **BREAKING (behaviour): the point decoders check subgroup
+  membership.** `g1`/`g2` `fromBytesCompressed`/`fromBytesUncompressed` now
+  return `error.NotInSubgroup` for an on-curve point outside `G1`/`G2`; the
+  old behaviour is `fromBytes*Unchecked`, for bytes the caller already trusts.
+  The signatures did not change, so a caller that relied on decoding a
+  non-member gets the error at run time, not at compile time. `bls_sig`,
+  `threshold` (`PublicKeyShare`, `PartialSignature`, `VerificationVector`) and
+  `kzg` inherit the check; `kzg` keeps `PointNotInSubgroup` and decodes a
+  commitment once instead of twice. Reason: coconut forgot the separate check
+  and accepted a cofactor-order credential (relation audit).
 - **2026-10-02** — **`Fr` is constant-time now: `montint.Field` replaces
   `std.crypto.ff`.** ctgrind showed ff's `montgomeryMul` branching on its
   extra-reduction bit and its secret-exponent pow on the exponent windows in

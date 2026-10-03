@@ -354,20 +354,20 @@ fn parseLineCount(line_opt: ?[]const u8) KzgError!usize {
 }
 
 /// Parses one hex line into a `G1.Affine`, REAL end to end: hex decode
-/// (exact-width check), `g1.fromBytesCompressed` (on-curve check), then
-/// a subgroup check (REQUIRED — a trusted-setup file is untrusted input
-/// until validated; see `KzgError.PointNotInSubgroup`'s doc comment).
-/// The subgroup check is `g1.Jacobian.subgroupCheck` (the endomorphism
-/// test) — the loader's dominant cost across 8192 `G1` points, and the
-/// fastest check this module has.
+/// (exact-width check), then `g1.fromBytesCompressed`, which checks
+/// on-curve and subgroup (REQUIRED — a trusted-setup file is untrusted
+/// input until validated; see `KzgError.PointNotInSubgroup`'s doc
+/// comment). The subgroup check (the endomorphism test) is the loader's
+/// dominant cost across 8192 `G1` points.
 fn parseG1Line(line_raw: []const u8) KzgError!g1.Affine {
     const line = trimLine(line_raw);
     if (line.len != 2 * g1.compressed_bytes) return error.MalformedTrustedSetup;
     var bytes: [g1.compressed_bytes]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, line) catch return error.MalformedTrustedSetup;
-    const affine = g1.fromBytesCompressed(bytes) catch return error.MalformedTrustedSetup;
-    if (!g1.Jacobian.fromAffine(affine).subgroupCheck()) return error.PointNotInSubgroup;
-    return affine;
+    return g1.fromBytesCompressed(bytes) catch |err| switch (err) {
+        error.NotInSubgroup => error.PointNotInSubgroup,
+        else => error.MalformedTrustedSetup,
+    };
 }
 
 /// `parseG1Line`'s `G2` mirror.
@@ -376,9 +376,10 @@ fn parseG2Line(line_raw: []const u8) KzgError!g2.Affine {
     if (line.len != 2 * g2.compressed_bytes) return error.MalformedTrustedSetup;
     var bytes: [g2.compressed_bytes]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, line) catch return error.MalformedTrustedSetup;
-    const affine = g2.fromBytesCompressed(bytes) catch return error.MalformedTrustedSetup;
-    if (!g2.Jacobian.fromAffine(affine).subgroupCheck()) return error.PointNotInSubgroup;
-    return affine;
+    return g2.fromBytesCompressed(bytes) catch |err| switch (err) {
+        error.NotInSubgroup => error.PointNotInSubgroup,
+        else => error.MalformedTrustedSetup,
+    };
 }
 
 /// The process-wide, write-once cache of the parsed-and-validated
@@ -556,22 +557,28 @@ pub fn blsFieldToBytes(x: Fr) Bytes32 {
 /// unconditionally (compared byte-for-byte against
 /// `G1_POINT_AT_INFINITY`, the canonical compressed-infinity encoding —
 /// no curve arithmetic needed for that comparison), otherwise require the
-/// BLS "KeyValidate" check (on-curve + subgroup, `g1.fromBytesCompressed`
-/// + `Jacobian.subgroupCheck`, mirroring `bls_sig.zig`'s own
+/// BLS "KeyValidate" check (on-curve + subgroup, both inside
+/// `g1.fromBytesCompressed`, mirroring `bls_sig.zig`'s own
 /// `keyValidate` for the identical reason: an unchecked non-subgroup
 /// point is the same small-subgroup attack class `SPEC.md`'s threat
 /// model already centers on for every other pairing-based entry point in
 /// this module).
 pub fn validateKzgG1(bytes: Bytes48) KzgError!void {
-    if (std.mem.eql(u8, &bytes, &G1_POINT_AT_INFINITY)) return;
-    const affine = g1.fromBytesCompressed(bytes) catch return error.InvalidCommitment;
-    if (!g1.Jacobian.fromAffine(affine).subgroupCheck()) return error.PointNotInSubgroup;
+    _ = try decodeKzgG1(bytes);
+}
+
+/// `validateKzgG1` returning the decoded point (one decode, one check).
+fn decodeKzgG1(bytes: Bytes48) KzgError!g1.Affine {
+    if (std.mem.eql(u8, &bytes, &G1_POINT_AT_INFINITY)) return g1.Affine.identity;
+    return g1.fromBytesCompressed(bytes) catch |err| switch (err) {
+        error.NotInSubgroup => error.PointNotInSubgroup,
+        else => error.InvalidCommitment,
+    };
 }
 
 /// Spec's `bytes_to_kzg_commitment`: `validateKzgG1` then decode.
 pub fn bytesToKzgCommitment(bytes: Bytes48) KzgError!g1.Affine {
-    try validateKzgG1(bytes);
-    return g1.fromBytesCompressed(bytes) catch unreachable; // re-decoding what validateKzgG1 just validated
+    return decodeKzgG1(bytes);
 }
 
 /// Spec's `bytes_to_kzg_proof`: identical validation to

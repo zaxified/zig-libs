@@ -715,7 +715,8 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
     var parsed: usize = 0;
     var refused_by_decode: usize = 0;
     var decrypted: usize = 0;
-    for (seeds) |sd| {
+    var refused_mask: u8 = 0;
+    for (seeds, 0..) |sd, i| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
         const n: usize = smith.slice(&buf);
@@ -724,6 +725,7 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
         @memcpy(bytes[0..n], buf[0..n]);
         const ct = ibe.Ciphertext.fromBytes(bytes) catch {
             refused_by_decode += 1;
+            refused_mask |= @as(u8, 1) << @intCast(i);
             continue;
         };
         parsed += 1;
@@ -733,7 +735,11 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
     // Measured 2026-09-07. Before: 1 round, 1 input, 0 octets corrupted,
     // 1 decryption of the pristine ciphertext and 0 refusals of any kind.
     try std.testing.expectEqual(@as(usize, 7), nonempty); // the deliberate empty seed is the eighth
-    try std.testing.expectEqual(@as(usize, 4), refused_by_decode); // seeds 1, 3, 6 and 7
-    try std.testing.expectEqual(@as(usize, 4), parsed); // seeds 0, 2, 4 and 5
+    // Seed 2 joined the decode refusals 2026-10-03: its damaged `U` is on the
+    // twist but outside G2, which the checked decoder now refuses (before,
+    // it reached `decrypt` and failed the FO check there).
+    try std.testing.expectEqual(@as(u8, 0b1100_1110), refused_mask);
+    try std.testing.expectEqual(@as(usize, 5), refused_by_decode); // seeds 1, 2, 3, 6 and 7
+    try std.testing.expectEqual(@as(usize, 3), parsed); // seeds 0, 4 and 5
     try std.testing.expectEqual(@as(usize, 1), decrypted);
 }

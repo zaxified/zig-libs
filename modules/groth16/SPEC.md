@@ -248,7 +248,10 @@ re-export of `bn254.groth16Verify`, which validates the untrusted PROOF — an
 G2 point `B`, so the classic Groth16 G2-subgroup bug is not present. The
 verifying key is trusted verbatim. `bn254` states that boundary; this module's
 re-export repeated none of it. A `vk` an attacker supplies is a `vk` an attacker
-can forge proofs against.
+can forge proofs against. (Since 2026-10-03 `zkey.parse` refuses β₂/γ₂/δ₂ and every
+contribution's `g2_spx` outside `G2`, closing the relation audit's LOW on
+`g2_spx`; a vk from a parsed `.zkey` therefore has subgroup points, but a
+parsed `.zkey` is still only as trustworthy as whoever made it.)
 
 **3. The evaluation domain is part of the statement.** `setup`, `prove` and
 `qap.checkDivisible` all refuse a constraint system larger than the domain
@@ -367,10 +370,6 @@ from a header count. Second run: 160 000 inputs clean in 74 s.
 **How it got there.** 2026-08-02: snarkjs judged this module's toy-setup proof (`snarkjs_kat_test.zig`). 2026-10-02 (A8): the file formats were established black-box (§ 4a), then checked both directions — our prover on snarkjs keys, snarkjs's prover on our keys (`newZkey` and after `contribute`), at 10 000 constraints as well as on the committed fixture. Mutation 2026-10-02: 49 mutants over the new code, 46 killed; two equivalent (the small-MSM threshold changes only speed; the B₂ size check before allocation is unreachable because sections 5 and 6 pin `n_vars` first) and one undecided (`verify`'s G2 subgroup check on δ₂: the off-subgroup point we can build fails the δ same-ratio check anyway — kept as defence in depth). The run asked for 24 tests, all added.
 
 ## Backlog / deferred
-
-- **Relation audit 2026-10-03 — LOW:** `verifyContribution` does not subgroup-check `g2_spx` before
-  the same-ratio pairing checks (on-curve only). The record is a consistency proof anyway (§5.6),
-  but a twist point outside `G2` makes the pairing non-bilinear; refuse it at decode.
 
 - **snarkjs's circuit hash and contribution proof** (A8, 2026-10-02): needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b). Black-box only; 29 340 hash constructions tried. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
 - **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log.

@@ -165,10 +165,10 @@ stop) feeding crafted bytes:
   `InvalidLength`.
 - **Invalid or non-subgroup public key** → `InvalidPoint` /
   `PublicKeyNotInSubgroup`. drand `KeyValidate` (on-curve + order-`r`
-  subgroup, non-identity) runs on the quicknet key at parse time, because
-  `bls12_381`'s `fromBytesCompressed` deliberately does NOT subgroup-
-  check (that module's documented pitfall — callers at trust boundaries
-  must, and this module is that boundary).
+  subgroup, non-identity) runs on the quicknet key at parse time: the
+  subgroup half inside `bls12_381`'s `fromBytesCompressed` (checking since
+  2026-10-03; before, this module ran `subgroupCheck` itself), the
+  identity refusal here. The error names are unchanged.
 - **Non-subgroup beacon signature** → `SignatureNotInSubgroup` at
   `parseRound`, and `false` from `verifyRoundPoints`. The same
   `KeyValidate` obligation applies to the `G1` signature, and the pairing

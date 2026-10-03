@@ -106,7 +106,7 @@ pub const Ptau = struct {
     pub fn lagrangeG2(self: Ptau, level: u5, i: usize) ParseError!G2.Affine {
         const s = try self.lagrangeBytes(.tau_g2, level);
         if (i >= s.len / bin.g2_bytes) return error.BadIndex;
-        return bin.g2FromBytes(s[i * bin.g2_bytes ..][0..bin.g2_bytes]);
+        return bin.g2FromBytesUnchecked(s[i * bin.g2_bytes ..][0..bin.g2_bytes]); // the .ptau is trusted (phase2.verify)
     }
 
     /// `[τⁱ]₁`, `i < 2^{p+1} − 1`.
@@ -138,5 +138,5 @@ pub const Ptau = struct {
 fn pointAt(comptime A: type, s: []const u8, i: usize) ParseError!A {
     const w: usize = if (A == G1.Affine) bin.g1_bytes else bin.g2_bytes;
     if (i >= s.len / w) return error.BadIndex;
-    return if (A == G1.Affine) bin.g1FromBytes(s[i * w ..][0..bin.g1_bytes]) else bin.g2FromBytes(s[i * w ..][0..bin.g2_bytes]);
+    return if (A == G1.Affine) bin.g1FromBytes(s[i * w ..][0..bin.g1_bytes]) else bin.g2FromBytesUnchecked(s[i * w ..][0..bin.g2_bytes]);
 }

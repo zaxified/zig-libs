@@ -174,7 +174,9 @@ accounting.
   see `g2.zig`'s module doc comment. `subgroupCheck` alone (no
   clearing) is sufficient and IS exercised: a constructed on-twist,
   non-subgroup point (`x = u`) is verified to FAIL it (see `g2.zig`'s
-  tests and "Verification performed" below).
+  tests and "Verification performed" below). Since 2026-10-03 `g2.fromBytes` runs it
+  (decoders check by default, `fromBytesUnchecked` for trusted bytes),
+  and `subgroupCheck` checks the twist equation first.
 - **`b' = 3/ξ = 3*(9+u)^-1` is DERIVED at runtime via real `Fp2`
   arithmetic (`g2.zig`'s `twistB()`), never hand-transcribed as a
   numeric literal.** Pinned byte-exact against an independent Python

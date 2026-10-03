@@ -76,20 +76,17 @@ pub const CoconutError = error{
 // ── credential types ────────────────────────────────────────────────────────
 
 /// Decodes a compressed `G1` point and refuses anything outside the
-/// order-`r` subgroup. `g1.fromBytesCompressed` checks the curve only, and
-/// the pairing is blind to a point whose order divides the cofactor: with
+/// order-`r` subgroup (`g1.fromBytesCompressed` checks it since 2026-10-03).
+/// The pairing is blind to a point whose order divides the cofactor: with
 /// `σ = (T, 1)` for such a `T`, `e(T, κ) == e(1, g2)` holds for every key and
-/// every attribute vector — a universal forgery.
+/// every attribute vector — a universal forgery, which this module accepted
+/// while the decoder checked the curve only.
 fn decodeG1(bytes: [g1.compressed_bytes]u8) CoconutError!g1.Affine {
-    const p = g1.fromBytesCompressed(bytes) catch return error.InvalidEncoding;
-    if (!inG1(p)) return error.InvalidEncoding;
-    return p;
+    return g1.fromBytesCompressed(bytes) catch error.InvalidEncoding;
 }
 
 fn decodeG2(bytes: [g2.compressed_bytes]u8) CoconutError!g2.Affine {
-    const p = g2.fromBytesCompressed(bytes) catch return error.InvalidEncoding;
-    if (!inG2(p)) return error.InvalidEncoding;
-    return p;
+    return g2.fromBytesCompressed(bytes) catch error.InvalidEncoding;
 }
 
 fn inG1(p: g1.Affine) bool {
@@ -765,7 +762,7 @@ fn cofactorTorsionPoint() g1.Affine {
         var enc = [_]u8{0} ** g1.compressed_bytes;
         enc[0] = 0x80;
         enc[g1.compressed_bytes - 1] = x;
-        const p = g1.fromBytesCompressed(enc) catch continue;
+        const p = g1.fromBytesCompressedUnchecked(enc) catch continue;
         const t = g1.Jacobian.fromAffine(p).scalarMulBytes(&r_be);
         if (!t.isIdentity()) return t.toAffine();
     }

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **BREAKING (behaviour): `g2.fromBytes` checks subgroup
+  membership** (`error.NotInSubgroup`, new in `G2Error`); `g2.fromBytesUnchecked`
+  keeps the old on-curve-only decode for trusted bytes. `g2.Jacobian.subgroupCheck`
+  now checks the twist equation first, so it is `true` exactly for members (an
+  off-twist image of a member passed `[r]P == O`). `ecPairingCheck` relies on the
+  decoder; `PrecompileError` gets `NotInSubgroup` through `G2Error`.
 - **2026-10-02** — **`Fr` is constant-time now: `montint.Field` replaces
   `std.crypto.ff`.** The open SPEC item ("closing it means giving `Fr` the same
   hand-written Montgomery backend `Fp` has") is closed, and it was wider than

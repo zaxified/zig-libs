@@ -597,3 +597,34 @@ test "phase2.verifyContribution: the record's name is bound by its transcript" {
     params[2] = 'A';
     try testing.expect(!phase2.verifyContribution(z, 0));
 }
+
+test "zkey: a verifying-key G2 point outside the subgroup is refused at parse" {
+    // On the twist, not in G2: x = u (bn254's g2.zig test point).
+    var c1: [32]u8 = @splat(0);
+    c1[31] = 1;
+    var y0: [32]u8 = undefined;
+    var y1: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&y0, "0cf32d3c49a2cb8a092f24ec3201e68dc299b6216e6321ee60573e3a7f596ea8");
+    _ = try std.fmt.hexToBytes(&y1, "07bca656753ef8cbee60335acbffe3def91636952d4ab9eb0b839c7f3566c0e2");
+    const bad: G2.Affine = .{
+        .x = .{ .c0 = Fp.zero, .c1 = try Fp.fromBytes(c1) },
+        .y = .{ .c0 = try Fp.fromBytes(y0), .c1 = try Fp.fromBytes(y1) },
+    };
+    const bad_enc = bin.g2ToBytes(bad);
+
+    var z = try zkey.parse(testing.allocator, t1_zkey);
+    const targets = [_][bin.g2_bytes]u8{
+        bin.g2ToBytes(z.gamma_g2),
+        bin.g2ToBytes(z.delta_g2),
+        bin.g2ToBytes(z.contributions[z.contributions.len - 1].g2_spx),
+    };
+    z.deinit(testing.allocator);
+
+    for (targets) |target| {
+        const buf = try testing.allocator.dupe(u8, t1_zkey);
+        defer testing.allocator.free(buf);
+        const at = std.mem.indexOf(u8, buf, &target) orelse return error.TestPointNotFound;
+        buf[at..][0..bin.g2_bytes].* = bad_enc;
+        try testing.expectError(error.NotInSubgroup, zkey.parse(testing.allocator, buf));
+    }
+}
