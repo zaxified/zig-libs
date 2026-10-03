@@ -457,26 +457,55 @@ fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
     std.debug.print("zfold={x}\n", .{acc});
 }
 
-// ── target "prime": Miller-Rabin on a secret prime ──────────────────────
+// ── target "auxgen": the ring-Pedersen setup over secret safe primes ────
 //
-// `root.isProbablePrime` on tss-lib's 1024-bit Blum prime `p`, tainted —
-// the path every accepted candidate of the prime searches takes.
+// `root.auxParamsWithTrapdoorFromSafePrimes` over tss-lib's 1024-bit safe
+// primes `p̃`, `q̃`, tainted: Ñ = p̃·q̃ and ord = p'·q' as montint limb
+// products, λ drawn below 2^(bits−2) and kept on the borrow of λ − ord,
+// h1 = h2^λ. Since 2026-10-03 (was std.math.big.int and a big-int compare
+// against ord). Ñ itself is PUBLIC but computed from the tainted primes, so
+// its parse into `AuxModulus` (ff) and h2's draw mod Ñ count as class (a).
+fn runAuxgen(allocator: std.mem.Allocator, tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    const pp = vectors.tsslib_keygen.parties[0];
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, pp.aux_p_safe);
+    _ = try std.fmt.hexToBytes(&q, pp.aux_q_safe);
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(&p);
+        std.valgrind.memcheck.makeMemUndefined(&q);
+    }
+    var prng = std.Random.DefaultPrng.init(0x6175_7867_656e); // "auxgen"
+    const gen = try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, prng.random());
+    defer gen.trapdoor.deinit(allocator);
+    var hb: [root.aux_modulus_bytes]u8 = undefined;
+    try gen.params.h1.toBytes(&hb, .big);
+    std.debug.print("h1={x}\n", .{hb});
+}
+
+// ── target "prime": sieve + Miller-Rabin on a secret prime ───────────────
+//
+// `root.sieveRejects` + `root.isProbablePrimeBE` on tss-lib's 1024-bit Blum
+// prime `p`, tainted — the path every accepted candidate of the prime
+// searches takes.
 fn runPrime(tainted: bool) !void {
     const vectors = @import("tsslib_vectors.zig");
     var p: [128]u8 = undefined;
     _ = try std.fmt.hexToBytes(&p, vectors.tsslib_keygen.parties[0].paillier_p);
-    var m = try root.AuxModulus.fromBytes(&p, .big);
-    if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&m.v.limbs_buffer));
-    std.mem.doNotOptimizeAway(&m);
+    if (tainted) std.valgrind.memcheck.makeMemUndefined(&p);
+    std.mem.doNotOptimizeAway(&p);
     var prng = std.Random.DefaultPrng.init(0x7072_696d_65); // "prime"
-    const verdict = root.isProbablePrime(m, 1024, prng.random());
-    // The verdict on a prime's path is a constant (every round passes), so
-    // it carries no taint; print the tainted input too, as the witness that
-    // the taint was live when the test ran.
-    std.debug.print("prime={} ctgrind_result={x}\n", .{ verdict, std.mem.asBytes(&m.v.limbs_buffer)[0..16] });
+    // The search's path for the candidate that becomes the prime (since
+    // 2026-10-03): the constant-time sieve, then Miller-Rabin from bytes.
+    const sieved = root.sieveRejects(&p);
+    const verdict = root.isProbablePrimeBE(&p, 1024, prng.random());
+    // Both verdicts on a prime's path are constants, so they carry no taint;
+    // print the tainted input too, as the witness that the taint was live.
+    std.debug.print("sieved={} prime={} ctgrind_result={x}\n", .{ sieved, verdict, p[0..16] });
 }
 
-const Target = enum { share, nonce, betaprime, fac, pimod, piprm, prime };
+const Target = enum { share, nonce, betaprime, fac, pimod, piprm, prime, auxgen };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -487,6 +516,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "pimod")) return .pimod;
     if (std.mem.eql(u8, s, "piprm")) return .piprm;
     if (std.mem.eql(u8, s, "prime")) return .prime;
+    if (std.mem.eql(u8, s, "auxgen")) return .auxgen;
     return error.UnknownTarget;
 }
 
@@ -523,6 +553,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (target == .pimod) return runPimod(allocator, tainted);
     if (target == .piprm) return runPiprm(allocator, tainted);
     if (target == .prime) return runPrime(tainted);
+    if (target == .auxgen) return runAuxgen(allocator, tainted);
 
     // Fixture setup randomness is ALWAYS real — Phase 2a keygen is not
     // measured here (see buildFixture's doc comment).
@@ -575,6 +606,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printOutcome(result);
             std.debug.print("draws_160b={d}\n", .{draws});
         },
-        .fac, .pimod, .piprm, .prime => unreachable, // returned above
+        .fac, .pimod, .piprm, .prime, .auxgen => unreachable, // returned above
     }
 }

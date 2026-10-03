@@ -743,15 +743,45 @@ const sieve_primes = blk: {
 /// (4^-64 = 2^-128 worst-case error per accepted candidate).
 const aux_mr_rounds = 64;
 
-/// Big-endian unsigned `bytes` mod `divisor` (u128 intermediate) —
-/// pre-sieve only, mirrors `paillier.bytesMod`.
-fn bytesMod(bytes: []const u8, divisor: u64) u64 {
-    std.debug.assert(divisor != 0);
+/// `⌊2^32 / p⌋` for every sieve prime — the reciprocals `bytesModCt`
+/// multiplies by instead of dividing.
+const sieve_recips = blk: {
+    var out: [sieve_primes.len]u64 = undefined;
+    for (sieve_primes, &out) |sp, *m| m.* = (@as(u64, 1) << 32) / sp;
+    break :blk out;
+};
+
+/// Big-endian unsigned `bytes` mod `d` (`d < 2^10`, `m = ⌊2^32/d⌋`) without
+/// a division: per byte `x = 256·r + b < 2^18`, `q = ⌊x·m / 2^32⌋` is the
+/// true quotient or one less (the error is `< x / 2^32 < 1`), and one masked
+/// subtraction fixes the remainder. Constant time in the bytes: a hardware
+/// or compiler-rt division takes value-dependent time, and the sieve runs
+/// on the secret candidate that ends up being the prime (2026-10-03; was
+/// `u128 % u64`).
+fn bytesModCt(bytes: []const u8, d: u64, m: u64) u64 {
     var r: u64 = 0;
     for (bytes) |b| {
-        r = @intCast(((@as(u128, r) << 8) | b) % divisor);
+        const x = (r << 8) | b;
+        const q = (x * m) >> 32;
+        const rr = x - q * d; // in [0, 2d)
+        const ge = 1 -% ((rr -% d) >> 63); // 1 iff rr >= d
+        r = rr - (d & (0 -% ge));
     }
     return r;
+}
+
+/// True when some sieve prime divides the big-endian `candidate`. Every
+/// remainder is computed (`bytesModCt`) and the zero flags are OR-ed, so the
+/// one branch is the verdict — a candidate that survives (the secret prime)
+/// takes the same path as every other survivor. `pub` for the ctgrind
+/// harness (target `prime`).
+pub fn sieveRejects(candidate: []const u8) bool {
+    var hit: u64 = 0;
+    for (sieve_primes, sieve_recips) |sp, m| {
+        const r = bytesModCt(candidate, sp, m);
+        hit |= (r -% 1) >> 63; // 1 iff r == 0 (r < 2^10)
+    }
+    return montint.nt.blackBox(hit) != 0;
 }
 
 /// In-place big-endian right shift by `s` bits — mirrors `paillier.shrBytesBe`.
@@ -786,12 +816,28 @@ fn setBitBe(buf: []u8, bit: usize) void {
 /// below `2^(bits−1)` (no compare against `m`), `m − 1 = d·2^s` by masked
 /// shifts, a round's verdicts OR-ed before the one branch. Variable-time
 /// still: the squaring count `s` (`= 1` for every candidate here, all
-/// `≡ 3 mod 4`) and `bytesMod`'s trial division in the callers' sieve.
+/// `≡ 3 mod 4`). The callers' sieve is `sieveRejects` (constant-time since
+/// 2026-10-03) and they test bytes directly (`isProbablePrimeBE`).
 pub fn isProbablePrime(m: AuxModulus, n_bits: usize, random: std.Random) bool {
     const D = montint.DynModint(aux_modulus_bits);
     var mv = D.elemFromFf(&m.v);
     defer std.crypto.secureZero(u64, &mv);
-    var mc = D.fromLimbsBits(&mv, n_bits) catch return false;
+    return isProbablePrimeLimbs(&mv, n_bits, random);
+}
+
+/// `isProbablePrime` straight from big-endian bytes — the prime searches'
+/// path: no detour through `AuxModulus.fromBytes` (ff), which is not
+/// constant-time in the value it parses.
+pub fn isProbablePrimeBE(m: []const u8, n_bits: usize, random: std.Random) bool {
+    const D = montint.DynModint(aux_modulus_bits);
+    var mv = D.loadBE(m) catch return false;
+    defer std.crypto.secureZero(u64, &mv);
+    return isProbablePrimeLimbs(&mv, n_bits, random);
+}
+
+fn isProbablePrimeLimbs(mv: *const montint.DynModint(aux_modulus_bits).Elem, n_bits: usize, random: std.Random) bool {
+    const D = montint.DynModint(aux_modulus_bits);
+    var mc = D.fromLimbsBits(mv, n_bits) catch return false;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&mc));
     return mc.isProbablePrime(random, aux_mr_rounds);
 }
@@ -822,15 +868,10 @@ fn generateSafePrime(random: std.Random, prime_bits: usize, out: []u8) void {
 
         // Trial-division pre-sieve on BOTH p̃ and p' (a zero remainder is a
         // proper factor for either — both are >= 2^(prime_bits-2) ≫ 1024).
-        for (sieve_primes) |sp| {
-            if (bytesMod(out, sp) == 0) continue :candidates;
-            if (bytesMod(pprime_buf[0..out.len], sp) == 0) continue :candidates;
-        }
+        if (sieveRejects(out) or sieveRejects(pprime_buf[0..out.len])) continue :candidates;
 
-        const m_p = AuxModulus.fromBytes(out, .big) catch continue :candidates;
-        if (!isProbablePrime(m_p, prime_bits, random)) continue :candidates;
-        const m_pprime = AuxModulus.fromBytes(stripLeadingZeros(pprime_buf[0..out.len]), .big) catch continue :candidates;
-        if (!isProbablePrime(m_pprime, prime_bits - 1, random)) continue :candidates;
+        if (!isProbablePrimeBE(out, prime_bits, random)) continue :candidates;
+        if (!isProbablePrimeBE(pprime_buf[0..out.len], prime_bits - 1, random)) continue :candidates;
         return; // out holds a safe prime p̃
     }
 }
@@ -850,11 +891,8 @@ fn generateBlumPrime(random: std.Random, prime_bits: usize, out: []u8) void {
         setBitBe(out, prime_bits - 1);
         setBitBe(out, prime_bits - 2);
         out[out.len - 1] |= 0x03; // ≡ 3 (mod 4)
-        for (sieve_primes) |sp| {
-            if (bytesMod(out, sp) == 0) continue :candidates;
-        }
-        const m = AuxModulus.fromBytes(out, .big) catch continue :candidates;
-        if (isProbablePrime(m, prime_bits, random)) return;
+        if (sieveRejects(out)) continue :candidates;
+        if (isProbablePrimeBE(out, prime_bits, random)) return;
     }
 }
 
@@ -1005,6 +1043,22 @@ const AuxGen = struct {
     q: ?[]const u8 = null,
 };
 
+/// Little-endian limbs → big-endian bytes, `out.len` bytes (the low ones).
+fn limbsToBE(l: []const u64, out: []u8) void {
+    for (out, 0..) |*b, i| {
+        const pos = out.len - 1 - i;
+        b.* = if (pos / 8 < l.len) @truncate(l[pos / 8] >> @intCast(8 * (pos % 8))) else 0;
+    }
+}
+
+/// `x >>= 1` over little-endian limbs (no branch on the values).
+fn shrLimbs1(x: []u64) void {
+    for (x, 0..) |*w, i| {
+        const hi: u64 = if (i + 1 < x.len) x[i + 1] << 63 else 0;
+        w.* = (w.* >> 1) | hi;
+    }
+}
+
 /// `retain_allocator`: when non-null, `p̃`/`q̃` are duplicated into
 /// allocator-owned slices and returned via `AuxGen.p`/`.q` INSTEAD of being
 /// discarded — the trapdoor `aux_proofs.zig`'s Πprm/Πmod provers need. When
@@ -1016,7 +1070,6 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
 
     const prime_bits = bits / 2;
     const prime_len = byteLen(prime_bits);
-    const n_len = byteLen(bits);
 
     // 1. Two distinct safe primes p̃ = 2p'+1, q̃ = 2q'+1.
     var p_buf: [aux_modulus_bytes]u8 = undefined;
@@ -1040,37 +1093,39 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
         ret_q = try gpa2.dupe(u8, q_buf[0..prime_len]);
     }
 
-    // p' = (p̃-1)/2, q' = (q̃-1)/2 — the squares-subgroup order is p'·q'.
-    var pp_buf: [aux_modulus_bytes]u8 = undefined;
-    var qp_buf: [aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, pp_buf[0..prime_len]);
-    defer std.crypto.secureZero(u8, qp_buf[0..prime_len]);
-    @memcpy(pp_buf[0..prime_len], p_buf[0..prime_len]);
-    @memcpy(qp_buf[0..prime_len], q_buf[0..prime_len]);
-    pp_buf[prime_len - 1] &= 0xfe;
-    qp_buf[prime_len - 1] &= 0xfe;
-    shrBytesBe(pp_buf[0..prime_len], 1);
-    shrBytesBe(qp_buf[0..prime_len], 1);
+    const d = deriveAuxFromSafePrimes(p_buf[0..prime_len], q_buf[0..prime_len], bits, random);
+    return .{ .params = d.params, .lambda = d.lambda, .p = ret_p, .q = ret_q };
+}
 
-    // 2. N_tilde = p̃·q̃ and 4. ord = p'·q' (big-int; a one-time derivation).
-    var scratch: [aux_scratch_bytes]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
-
-    var bp = bigFromBytes(gpa, p_buf[0..prime_len]) catch unreachable;
-    var bq = bigFromBytes(gpa, q_buf[0..prime_len]) catch unreachable;
-    var bn = newBig(gpa) catch unreachable;
-    bn.mul(&bp, &bq) catch unreachable;
+/// Steps 2–5 of `generateAuxParams` over the caller's safe primes
+/// `p̃`, `q̃` (big-endian, `bits / 2` bits each): `N_tilde`, `h2`, `λ`,
+/// `h1`. Constant-time in `p̃`, `q̃` and `λ` up to the λ draw's accept
+/// verdict (ctgrind target `auxgen`).
+fn deriveAuxFromSafePrimes(p_be: []const u8, q_be: []const u8, bits: usize, random: std.Random) struct { params: AuxParams, lambda: AuxFe } {
+    const n_len = byteLen(bits);
+    // 2. N_tilde = p̃·q̃ and ord = p'·q' (p' = (p̃−1)/2, q' = (q̃−1)/2, the
+    //    squares-subgroup order) on montint limbs: the primes are SECRET and
+    //    nothing below branches on them (until 2026-10-03 this was
+    //    std.math.big.int, and the λ rejection loop compared against ord
+    //    with a big-int `order`).
+    const D = montint.DynModint(aux_modulus_bits);
+    var p_l = D.loadBE(p_be) catch unreachable; // ≤ aux_modulus_bytes
+    defer std.crypto.secureZero(u64, &p_l);
+    var q_l = D.loadBE(q_be) catch unreachable;
+    defer std.crypto.secureZero(u64, &q_l);
+    var prod: [2 * D.max_limbs]u64 = undefined;
+    defer std.crypto.secureZero(u64, &prod);
+    montint.limbs.mulSchoolbook(&prod, &p_l, &q_l);
     var n_buf: [aux_modulus_bytes]u8 = undefined;
-    bn.toConst().writeTwosComplement(n_buf[0..n_len], .big);
+    limbsToBE(prod[0..D.max_limbs], n_buf[0..n_len]);
     const n_tilde = AuxModulus.fromBytes(stripLeadingZeros(n_buf[0..n_len]), .big) catch unreachable;
 
-    var bpp = bigFromBytes(gpa, stripLeadingZeros(pp_buf[0..prime_len])) catch unreachable;
-    var bqp = bigFromBytes(gpa, stripLeadingZeros(qp_buf[0..prime_len])) catch unreachable;
-    var b_ord = newBig(gpa) catch unreachable;
-    b_ord.mul(&bpp, &bqp) catch unreachable; // ord = p'·q'
-    const ord_bits = b_ord.bitCountAbs();
-    const ord_len = byteLen(ord_bits);
+    // p̃, q̃ are odd: (p̃−1)/2 = p̃ >> 1.
+    shrLimbs1(&p_l);
+    shrLimbs1(&q_l);
+    montint.limbs.mulSchoolbook(&prod, &p_l, &q_l);
+    var ord: D.Elem = prod[0..D.max_limbs].*;
+    defer std.crypto.secureZero(u64, &ord);
 
     // 3. h2 = r² mod N_tilde — a random element of the group of squares.
     //    h2 is the base the commitment's RANDOMNESS rides on (`h1^x·h2^ρ`),
@@ -1087,21 +1142,31 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
         }
     }
 
-    // 4. lambda ← [1, ord) uniformly (SECRET). Rejection-sample against ord.
+    // 4. lambda ← [1, ord) uniformly (SECRET). Draws below the PUBLIC bound
+    //    2^(bits−2) (ord has bits−2 or bits−3 bits, so a draw is kept with
+    //    probability ≥ 1/4), kept when the borrow of λ − ord says λ < ord and
+    //    λ ≠ 0 — the accept verdict is the only branch.
+    const draw_bits = bits - 2;
+    const draw_len = byteLen(draw_bits);
     var lam_buf: [aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, lam_buf[0..ord_len]);
-    const lam_top_mask = @as(u8, 0xff) >> @intCast(8 * ord_len - ord_bits);
-    const lambda_fe: AuxFe = blk: {
-        while (true) {
-            random.bytes(lam_buf[0..ord_len]);
-            lam_buf[0] &= lam_top_mask;
-            var cand = bigFromBytes(gpa, lam_buf[0..ord_len]) catch unreachable;
-            if (cand.eqlZero()) continue; // lambda != 0
-            if (cand.order(b_ord) != .lt) continue; // lambda < ord
-            // lambda < ord < N_tilde ⇒ canonical mod n_tilde.
-            break :blk AuxFe.fromBytes(n_tilde, stripLeadingZeros(lam_buf[0..ord_len]), .big) catch unreachable;
-        }
-    };
+    defer std.crypto.secureZero(u8, lam_buf[0..draw_len]);
+    const lam_top_mask = @as(u8, 0xff) >> @intCast(8 * draw_len - draw_bits);
+    var lam_l: D.Elem = undefined;
+    defer std.crypto.secureZero(u64, &lam_l);
+    while (true) {
+        random.bytes(lam_buf[0..draw_len]);
+        lam_buf[0] &= lam_top_mask;
+        lam_l = D.loadBE(lam_buf[0..draw_len]) catch unreachable;
+        var t = lam_l;
+        defer std.crypto.secureZero(u64, &t);
+        const below = montint.limbs.subInto(&t, &ord);
+        var nz: u64 = 0;
+        for (lam_l) |w| nz |= w;
+        const nonzero: u1 = @intFromBool(nz != 0);
+        if (below & nonzero == 1) break;
+    }
+    // lambda < ord < N_tilde ⇒ canonical mod n_tilde.
+    const lambda_fe = D.elemToFf(AuxFe, n_tilde, &lam_l);
 
     // 5. h1 = h2^lambda mod N_tilde (constant-time modexp; lambda is secret —
     // montint via `zkproofs.powSecret`, not ff's pow, which branches on the
@@ -1111,7 +1176,7 @@ fn generateAuxParamsInternal(random: std.Random, bits: usize, retain_allocator: 
     lambda_fe.toBytes(&lam_bytes, .big) catch unreachable;
     const h1 = zkproofs.powSecret(n_tilde, h2, &lam_bytes);
 
-    return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe, .p = ret_p, .q = ret_q };
+    return .{ .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 }, .lambda = lambda_fe };
 }
 
 /// The trapdoor behind a ring-Pedersen `AuxParams` tuple: the two safe-prime
@@ -1172,6 +1237,25 @@ pub const AuxParamsWithTrapdoor = struct {
     params: AuxParams,
     trapdoor: AuxTrapdoor,
 };
+
+/// `generateAuxParamsWithTrapdoor` over the caller's own safe primes
+/// `p̃ = 2p'+1`, `q̃ = 2q'+1` (big-endian, equal length, top bit of the
+/// first byte set — `Ñ` is taken to be `16·p.len` bits — both ≡ 3 mod 4,
+/// distinct) — for importing a ring-Pedersen key generated
+/// elsewhere (tss-lib's `LocalPreParams`) or for measuring the derivation
+/// alone. The primes are NOT checked: wrong ones give a tuple whose Πprm/Πmod
+/// a correct verifier refuses. The trapdoor's `p`/`q` are copies owned by
+/// `allocator` (free with `trapdoor.deinit`).
+pub fn auxParamsWithTrapdoorFromSafePrimes(allocator: std.mem.Allocator, p: []const u8, q: []const u8, random: std.Random) std.mem.Allocator.Error!AuxParamsWithTrapdoor {
+    // The bit length comes from the public byte length, not from the secret
+    // top byte (`@clz(p[0])` made every loop bound below depend on p̃).
+    std.debug.assert(p.len == q.len and p.len > 0);
+    const d = deriveAuxFromSafePrimes(p, q, 16 * p.len, random);
+    const p_copy = try allocator.dupe(u8, p);
+    errdefer allocator.free(p_copy);
+    const q_copy = try allocator.dupe(u8, q);
+    return .{ .params = d.params, .trapdoor = .{ .p = p_copy, .q = q_copy, .lambda = d.lambda } };
+}
 
 /// Like `generateAuxParams`, but ALSO retains the trapdoor
 /// (`p̃`/`q̃`/`lambda`) a Πprm/Πmod prover needs — see `AuxTrapdoor`'s doc
@@ -2775,4 +2859,39 @@ test "the local seedInto helper produces what Smith.slice reads back" {
     var buf: [32]u8 = undefined;
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
+}
+
+test "bytesModCt equals % for every sieve prime, and sieveRejects finds a small factor" {
+    var prng = std.Random.DefaultPrng.init(0x7369_6576_65); // "sieve"
+    const random = prng.random();
+    var buf: [128]u8 = undefined;
+    for (0..64) |_| {
+        random.bytes(&buf);
+        for (sieve_primes, sieve_recips) |sp, m| {
+            var r: u64 = 0;
+            for (buf) |b| r = @intCast(((@as(u128, r) << 8) | b) % sp);
+            try testing.expectEqual(r, bytesModCt(&buf, sp, m));
+        }
+    }
+    // 1021 (the largest sieve prime) times a large number: rejected. The top
+    // two bytes of the multiplicand are zero so the product fits.
+    @memset(&buf, 0xff);
+    buf[0] = 0;
+    buf[1] = 0;
+    var x: [128]u8 = undefined;
+    var carry: u32 = 0;
+    var i: usize = buf.len;
+    while (i > 0) {
+        i -= 1;
+        const v = @as(u32, buf[i]) * 1021 + carry;
+        x[i] = @truncate(v);
+        carry = v >> 8;
+    }
+    try testing.expectEqual(@as(u32, 0), carry);
+    try testing.expect(sieveRejects(&x));
+    // A prime above the sieve (2^127 − 1, a Mersenne prime): kept.
+    var mp: [16]u8 = undefined;
+    @memset(&mp, 0xff);
+    mp[0] = 0x7f;
+    try testing.expect(!sieveRejects(&mp));
 }

@@ -172,3 +172,26 @@ test "this module's key material: tss-lib signed with it (committed signatures v
     const sig = try signing.signWithShares(allocator, loaded.shares[1..3], set.message, random);
     try sig.verify(set.message, pk);
 }
+
+test "auxParamsWithTrapdoorFromSafePrimes: tss-lib's safe primes give tss-lib's Ñ, and our Πprm/Πmod over it verify" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const pp = vectors.tsslib_keygen.parties[0];
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, pp.aux_p_safe);
+    _ = try std.fmt.hexToBytes(&q, pp.aux_q_safe);
+    var prng = std.Random.DefaultPrng.init(0x6175_7867_656e);
+    const random = prng.random();
+    const gen = try root.auxParamsWithTrapdoorFromSafePrimes(allocator, &p, &q, random);
+    defer gen.trapdoor.deinit(allocator);
+
+    var want: [256]u8 = undefined;
+    const want_s = try std.fmt.hexToBytes(&want, pp.n_tilde);
+    var got: [root.aux_modulus_bytes]u8 = undefined;
+    try gen.params.n_tilde.toBytes(&got, .big);
+    try testing.expectEqualSlices(u8, want_s, got[got.len - want_s.len ..]);
+
+    const proof = try aux_proofs.proveWellFormedBound(allocator, gen.params, gen.trapdoor, "auxgen", random);
+    try aux_proofs.verifyWellFormedBound(gen.params, "auxgen", proof, random);
+}

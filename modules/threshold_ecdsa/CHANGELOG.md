@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Constant-time key setup, the last two pieces: the ring-Pedersen
+  derivation (`Ñ`, `ord`, `λ`) runs on montint limbs instead of `std.math.big.int`, and
+  the prime searches' trial-division sieve multiplies by reciprocals instead of
+  dividing (`sieveRejects`) and tests candidates from bytes (`isProbablePrimeBE`). New
+  `auxParamsWithTrapdoorFromSafePrimes` (import a ring-Pedersen key from its safe
+  primes). ctgrind: new target `auxgen`, `prime` now measures the search's path.
 - **2026-10-03** — **BREAKING (wire + API): relation-audit and review LOWs closed.**
   Range/MtA/MtAwc proofs are bound to a caller `context` (new parameter on every
   prove/verify and on `mta.mtaAliceFinalizeChecked`; transcript domains `v3`). Bob's
