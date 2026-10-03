@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** the asyncua replay
+  transcript was re-taken (`zig build interop-opcua -- --capture`, asyncua
+  2.0.1, driver exit 0). `rsa.generate`'s new constant-time Miller-Rabin
+  (rsa, same day) draws a different number of bytes from the fixture's
+  CSPRNG on its way to the SAME key (the `fixture cert_sha256=` line is
+  unchanged), which shifted every later draw — the OAEP seeds of the
+  asymmetric responses — and broke the byte-for-byte replay in CI.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `decodeArray`/
   `decodeVariantArraySlice` (private, services.zig/encoding.zig) now take a
   `freeItem` so a truncated wire array frees what it already decoded instead
