@@ -3,6 +3,7 @@
 //! tree-cache differential. RFC vectors are in `kat_test.zig`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lms = @import("root.zig");
 const core = @import("core.zig");
 
@@ -520,4 +521,226 @@ test "the LM-OTS randomizer is derived, deterministic and leaf-specific" {
         const x = core.deriveX(&idOf(1), 0, @intCast(i), &seedOf(2));
         try std.testing.expect(!std.mem.eql(u8, &x, &c0));
     }
+}
+
+// ── audit 2026-10-03: state discipline, derivation and bounds ────────────────
+
+test "LMS: out exactly signatureLength is enough, one byte less is OutputTooSmall" {
+    var sk = try lms.LmsSecretKey.init(gpa, .sha256_m32_h5, .sha256_n32_w8, idOf(3), seedOf(4));
+    defer sk.deinit();
+    const len = sk.signatureLength();
+    const buf = try gpa.alloc(u8, len);
+    defer gpa.free(buf);
+    try std.testing.expectError(error.OutputTooSmall, sk.sign("m", buf[0 .. len - 1]));
+    try std.testing.expectEqual(@as(u32, 0), sk.q);
+    const sig = try sk.sign("m", buf);
+    try std.testing.expectEqual(len, sig.len);
+    try std.testing.expect(sk.publicKey().verify("m", sig));
+}
+
+test "HssPublicKey.verify: a hand-built key with L outside 1..8 verifies nothing" {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
+    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(1), idOf(1), null);
+    defer sk.deinit();
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    const sig = try sk.sign("m", buf);
+    var pk = sk.publicKey();
+    try std.testing.expect(pk.verify("m", sig));
+    for ([_]u8{ 0, 9, 255 }) |bad_levels| {
+        pk.levels = bad_levels;
+        try std.testing.expect(!pk.verify("m", sig)); // L = 0 must not reach `L - 1`
+    }
+}
+
+test "HSS: every lower tree is its own tree, and its seed is not its public identifier" {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 3;
+    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(0x5a), idOf(0x5b), null);
+    defer sk.deinit();
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    const pk = sk.publicKey().toBytes();
+    // Level-1 / level-2 public keys embedded in three signatures.
+    const one = lms.lmsSignatureLength(levels[0].lms, levels[0].ots);
+    var embedded: [3][2][lms.LmsPublicKey.encoded_len]u8 = undefined;
+    var k: usize = 0;
+    for ([_]usize{ 0, 31, 1000 }) |extra| {
+        for (0..extra) |_| _ = try sk.sign("skip", buf);
+        const sig = try sk.sign("probe", buf);
+        try std.testing.expect(lms.hssVerify(&pk, "probe", sig));
+        embedded[k][0] = sig[4 + one ..][0..lms.LmsPublicKey.encoded_len].*;
+        embedded[k][1] = sig[4 + 2 * one + lms.LmsPublicKey.encoded_len ..][0..lms.LmsPublicKey.encoded_len].*;
+        // The tree actually built for this path: seed != identifier prefix.
+        for (1..3) |lv| {
+            const t = &sk.trees[lv].?;
+            try std.testing.expect(!std.mem.eql(u8, t.id[0..], t.seed[0..16]));
+            try std.testing.expect(!std.mem.eql(u8, &t.seed, &sk.seed));
+        }
+        k += 1;
+    }
+    // Probes are messages 0 -> (0,0,0), 32 -> (0,1,0) and 1033 -> (1,0,9)
+    // (q0, q1, q2). Level-1 keys depend on q0 only, level-2 keys on (q0, q1):
+    // different parents must certify different child key pairs, or two parent
+    // leaves certify one tree and that tree's leaves sign twice.
+    try std.testing.expectEqualSlices(u8, &embedded[0][0], &embedded[1][0]); // same q0
+    try std.testing.expect(!std.mem.eql(u8, &embedded[0][0], &embedded[2][0]));
+    try std.testing.expect(!std.mem.eql(u8, &embedded[0][1], &embedded[1][1]));
+    try std.testing.expect(!std.mem.eql(u8, &embedded[1][1], &embedded[2][1]));
+}
+
+test "HSS: out of memory while building a lower tree burns no leaf; staying in a tree allocates nothing" {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    var fa = std.testing.FailingAllocator.init(gpa, .{});
+    var log: Log = .{};
+    const sk = try lms.SecretKey.init(fa.allocator(), &levels, seedOf(6), idOf(6), null);
+    var handle: lms.SigningKey = undefined;
+    lms.SigningKey.init(&handle, sk, log.hook());
+    defer handle.deinit();
+    const buf = try gpa.alloc(u8, handle.sk.signatureLength());
+    defer gpa.free(buf);
+
+    for (0..32) |_| _ = try handle.sign("m", buf); // fills tree 0's leaf 0, level-1 tree #0
+    try std.testing.expectEqual(@as(u32, 32), @as(u32, @intCast(log.calls)));
+    try std.testing.expectEqual(@as(u32, 1), handle.position().q[0]);
+    try std.testing.expectEqual(@as(u32, 0), handle.position().q[1]);
+
+    // The 33rd signature needs the level-1 tree under parent leaf 1. Fail the
+    // tree's node cache (first allocation), then the certificate buffer (second).
+    for ([_]usize{ 0, 1 }) |skip| {
+        fa.fail_index = fa.alloc_index + skip;
+        try std.testing.expectError(error.OutOfMemory, handle.sign("m", buf));
+        try std.testing.expectEqual(@as(usize, 32), log.calls); // hook not reached
+        try std.testing.expectEqual(@as(u32, 1), handle.position().q[0]);
+        try std.testing.expectEqual(@as(u32, 0), handle.position().q[1]);
+        try std.testing.expect(!handle.position().exhausted);
+    }
+    fa.fail_index = std.math.maxInt(usize);
+    const sig = try handle.sign("m", buf);
+    var qs: [lms.max_levels]u32 = undefined;
+    signatureQs(sig, &levels, &qs);
+    try std.testing.expectEqual(@as(u32, 1), qs[0]); // the leaf the failed calls did not spend
+    try std.testing.expectEqual(@as(u32, 0), qs[1]);
+    try std.testing.expect(lms.hssVerify(&handle.sk.publicKey().toBytes(), "m", sig));
+
+    // Inside the same lower tree no allocation is needed: the cached path is reused.
+    fa.fail_index = fa.alloc_index;
+    for (1..5) |i| {
+        const s2 = try handle.sign("m", buf);
+        signatureQs(s2, &levels, &qs);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), qs[1]);
+    }
+}
+
+test "HSS: a position persisted as exhausted restores as exhausted and never signs" {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }} ** 2;
+    var last: lms.Position = .{};
+    last.q[0] = 31;
+    last.q[1] = 31;
+    const done = last.next(&levels);
+    try std.testing.expect(done.exhausted);
+    try std.testing.expectEqual(@as(u32, 0), done.q[0]);
+    try std.testing.expectEqual(@as(u32, 0), done.q[1]);
+    var sk = try lms.SecretKey.init(gpa, &levels, seedOf(2), idOf(2), done);
+    defer sk.deinit();
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    try std.testing.expectError(error.KeyExhausted, sk.sign("m", buf));
+    try std.testing.expect(sk.position().exhausted);
+    // The last leaf of the last tree is still usable, and only once.
+    var sk2 = try lms.SecretKey.init(gpa, &levels, seedOf(2), idOf(2), last);
+    defer sk2.deinit();
+    _ = try sk2.sign("m", buf);
+    try std.testing.expect(sk2.position().exhausted);
+    try std.testing.expectError(error.KeyExhausted, sk2.sign("m", buf));
+}
+
+/// Hook that checks, while it runs, that the signature does not exist yet.
+const Probe = struct {
+    out: []const u8,
+    handle: *lms.SigningKey,
+    expect_old: lms.Position = .{},
+    calls: usize = 0,
+    bad: bool = false,
+    last: lms.Position = .{},
+    fn write(ctx: *anyopaque, next: lms.Position) anyerror!void {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        // No signature byte yet, and the key's own position is still the old one.
+        if (!std.mem.allEqual(u8, self.out, 0)) self.bad = true;
+        const cur = self.handle.sk.pos;
+        if (cur.q[0] != self.expect_old.q[0] or cur.q[1] != self.expect_old.q[1] or cur.exhausted != self.expect_old.exhausted) self.bad = true;
+        if (next.q[0] == cur.q[0] and next.q[1] == cur.q[1] and !next.exhausted) self.bad = true; // must be strictly later
+        self.last = next;
+    }
+};
+
+test "SigningKey: the position is durable before any signature byte exists; the last write says exhausted" {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }};
+    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(7), idOf(7), null);
+    var handle: lms.SigningKey = undefined;
+    const buf = try gpa.alloc(u8, sk.signatureLength());
+    defer gpa.free(buf);
+    var probe: Probe = .{ .out = buf, .handle = &handle };
+    lms.SigningKey.init(&handle, sk, .{ .ctx = &probe, .write = Probe.write });
+    defer handle.deinit();
+    for (0..32) |i| {
+        @memset(buf, 0);
+        probe.expect_old = handle.position();
+        const sig = try handle.sign("m", buf);
+        try std.testing.expect(!probe.bad);
+        try std.testing.expectEqual(i + 1, probe.calls);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)) % 32, probe.last.q[0]);
+        try std.testing.expectEqual(i == 31, probe.last.exhausted);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, sig[4..8], .big));
+    }
+    // An exhausted key does not call the hook again.
+    try std.testing.expectError(error.KeyExhausted, handle.sign("m", buf));
+    try std.testing.expectEqual(@as(usize, 32), probe.calls);
+}
+
+/// Hook that stays inside `write` for a while and lets a second signer, on
+/// another thread, try to enter it.
+const Excl = struct {
+    io: std.Io,
+    handle: *lms.SigningKey,
+    in_hook: std.atomic.Value(bool) = .init(false),
+    violation: std.atomic.Value(bool) = .init(false),
+    spawned: bool = false,
+    thread: ?std.Thread = null,
+    fn write(ctx: *anyopaque, _: lms.Position) anyerror!void {
+        const self: *Excl = @ptrCast(@alignCast(ctx));
+        if (self.in_hook.swap(true, .acq_rel)) self.violation.store(true, .release);
+        if (!self.spawned) {
+            self.spawned = true;
+            self.thread = try std.Thread.spawn(.{}, other, .{self});
+        }
+        try self.io.sleep(.fromMilliseconds(150), .awake);
+        self.in_hook.store(false, .release);
+    }
+    fn other(self: *Excl) void {
+        var buf: [1300]u8 = undefined;
+        _ = self.handle.sign("b", &buf) catch {};
+    }
+};
+
+fn exclusionRun(with_io: bool) !void {
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w8 }}; // 1296-byte signatures
+    const io = std.testing.io;
+    var ex: Excl = .{ .io = io, .handle = undefined };
+    const sk = try lms.SecretKey.init(gpa, &levels, seedOf(9), idOf(9), null);
+    var handle: lms.SigningKey = undefined;
+    ex.handle = &handle;
+    lms.SigningKey.init(&handle, sk, .{ .ctx = &ex, .write = Excl.write, .io = if (with_io) io else null });
+    defer handle.deinit();
+    var buf: [1300]u8 = undefined;
+    _ = try handle.sign("a", &buf);
+    if (ex.thread) |t| t.join();
+    try std.testing.expect(!ex.violation.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), handle.position().q[0]); // both signed, one leaf each
+}
+
+test "SigningKey: a second signer cannot enter while the first is inside the persist hook" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    try exclusionRun(false); // spin guard
+    try exclusionRun(true); // Io mutex
 }

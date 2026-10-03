@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core `DecodeDestination`/`EncodeDestination`/`DecodeSecret`/`EncodeSecret` + rust-bitcoin `Address` (surveyed 2026-09-30)
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -110,6 +110,27 @@ networks, `toScriptPubKeyFor`) and as WIF. `src/unit_test.zig`: each typed reaso
 sets, BIP173/BIP350 examples (P2WPKH, P2WSH, P2TR, v16), BIP143's P2SH-P2WPKH scriptPubKey, key
 `1` WIF strings (mainnet/compressed/uncompressed/signet), helper limits, and the P2SH / P2WSH
 helper results, whose expected values were derived independently with Python `hashlib`.
+
+### Audit 2026-10-03
+
+Review of `src/root.zig` (templates, both decode paths, WIF, helpers) against Bitcoin Core's
+`key_io.cpp` behaviour and BIP16/141/143/173/350, plus the `bech32.base58` bounds it relies on. No
+HIGH/MED/LOW defect found: every rejection path returns a typed error, scratch is wiped on every
+exit, no input-controlled index or allocation exists. INFO only: (1) `keyInRange` (`root.zig`,
+`std.mem.eql`/`order`) is not constant-time in the key; the module makes no such claim and the
+check compares against a public constant, but a caller who needs it must not rely on this function.
+(2) `wifEncode` needs only the encoded length in `out`, not `max_wif_len` as its doc says (a
+10-byte buffer gives `BufferTooSmall`, a 51-byte one suffices for an uncompressed key).
+(3) `Decoded.script_buf` / `Address.buf` bytes past `len` are undefined; use `script()` / `slice()`.
+
+Mutation run (schemata, ReleaseSafe, one binary, 53 mutants on the template bytes, version-opcode
+range, network versions / HRP / sets, decode path selection, WIF length / flag / key range, helper
+bounds): 53 killed, 0 equivalent. The first pass left 11 alive: each fixed byte of the P2PKH and
+P2SH templates (8 mutants: no test altered a single template byte), the witness-version range
+edges `0x50` / `0x61` (OP_RESERVED / OP_NOP would have been read as v0 / v17), "any version with a
+32-byte program is P2TR", and the `0x04` prefix check of 65-byte keys (hybrid `06`/`07`). Three
+tests added in `src/unit_test.zig` (`classify: every byte ...`, `classify: the witness version
+opcode ...`, `helpers: a 65-byte key must start with 0x04`); the 11 mutants were rerun and die.
 
 ## Backlog / deferred
 

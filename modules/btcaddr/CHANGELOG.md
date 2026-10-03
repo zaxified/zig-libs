@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** first audit (review + mutation run, 53
+  mutants, 11 survived the first pass, all killed now); three tests added for the template
+  bytes, the witness-version opcode range and the 65-byte key prefix. No source change.
+
 - **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** a fuzz harness over `toScriptPubKey` and
   `wifDecode` (tests only) and `example/main.zig`, a wallet's send-to field and key import.
 

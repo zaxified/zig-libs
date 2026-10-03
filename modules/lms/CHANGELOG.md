@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** first audit (review + schemata mutation run,
+  67 mutants: 60 killed, 7 equivalent; 7 survived the first pass and are now killed). Eight tests
+  added: the persist hook runs before any signature byte exists, an allocation failure while
+  building a lower tree burns no leaf, a lower tree is built once per parent leaf and differs
+  per parent, an exhausted position restores as exhausted, mutual exclusion of `SigningKey` (spin
+  and `Io` guards), `cacheHeight`, exact-size output, `L` outside 1..8. No source change.
+
 - **2026-10-01** — `Persist.io`: the `Io` the persist hook blocks in. With it, `SigningKey.sign`
   guards with an `std.Io.Mutex`, so a second signer parks instead of spinning on one suspended
   in the hook — required when the `Io` runs several tasks on one thread. Without it, unchanged.

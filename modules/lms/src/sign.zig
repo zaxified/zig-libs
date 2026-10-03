@@ -518,3 +518,11 @@ pub const SigningKey = struct {
         return self.sk.signPersisting(msg, out, self.persist);
     }
 };
+
+test "cacheHeight: nodes are cached whole up to H15, and capped at 2^16 - 1 above" {
+    try std.testing.expectEqual(@as(u5, 0), cacheHeight(.sha256_m32_h5));
+    try std.testing.expectEqual(@as(u5, 0), cacheHeight(.sha256_m32_h10));
+    try std.testing.expectEqual(@as(u5, 0), cacheHeight(.sha256_m32_h15));
+    try std.testing.expectEqual(@as(u5, 5), cacheHeight(.sha256_m32_h20));
+    try std.testing.expectEqual(@as(u5, 10), cacheHeight(.sha256_m32_h25));
+}

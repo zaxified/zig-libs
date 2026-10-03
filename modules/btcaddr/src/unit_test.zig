@@ -80,6 +80,50 @@ test "fromScriptPubKey: non-standard scripts are UnsupportedScript" {
     }
 }
 
+test "classify: every byte of the P2PKH / P2SH templates is checked" {
+    const h20 = "751e76e8199196d454941c45d1b3a323f1433bd6";
+    const p2pkh = hex("76a914" ++ h20 ++ "88ac").*;
+    const p2sh = hex("a914" ++ h20 ++ "87").*;
+    try testing.expectEqual(btcaddr.ScriptKind.p2pkh, btcaddr.classify(&p2pkh).?);
+    try testing.expectEqual(btcaddr.ScriptKind.p2sh, btcaddr.classify(&p2sh).?);
+    // Flip each fixed (non-hash) byte of each template in turn; the 20 hash
+    // bytes are free, so only the template positions can reject.
+    for ([_]usize{ 0, 1, 2, 23, 24 }) |i| {
+        var s = p2pkh;
+        s[i] ^= 0x01;
+        try testing.expect(btcaddr.classify(&s) == null);
+        try testing.expectError(error.UnsupportedScript, btcaddr.fromScriptPubKey(&s, .mainnet));
+    }
+    for ([_]usize{ 0, 1, 22 }) |i| {
+        var s = p2sh;
+        s[i] ^= 0x01;
+        try testing.expect(btcaddr.classify(&s) == null);
+        try testing.expectError(error.UnsupportedScript, btcaddr.fromScriptPubKey(&s, .mainnet));
+    }
+}
+
+test "classify: the witness version opcode is exactly OP_0 or OP_1..OP_16" {
+    const prog = "751e76e8199196d454941c45d1b3a323f1433bd6";
+    // 0x50 (OP_RESERVED) and 0x61 (OP_NOP) are not versions.
+    try testing.expect(btcaddr.classify(hex("5014" ++ prog)) == null);
+    try testing.expect(btcaddr.classify(hex("6114" ++ prog)) == null);
+    try testing.expect(btcaddr.classify(hex("5114" ++ prog)).? == .witness_unknown);
+    try testing.expect(btcaddr.classify(hex("6014" ++ prog)).? == .witness_unknown);
+    // Only version 1 with 32 bytes is taproot; v2 with 32 bytes is not.
+    const k32 = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    try testing.expectEqual(btcaddr.ScriptKind.p2tr, btcaddr.classify(hex("5120" ++ k32)).?);
+    try testing.expectEqual(btcaddr.ScriptKind.witness_unknown, btcaddr.classify(hex("5220" ++ k32)).?);
+    try testing.expectEqual(btcaddr.ScriptKind.witness_unknown, btcaddr.classify(hex("6020" ++ k32)).?);
+}
+
+test "helpers: a 65-byte key must start with 0x04 (hybrid 06/07 refused)" {
+    var hybrid = [_]u8{0x06} ++ [_]u8{0x11} ** 64;
+    try testing.expectError(error.InvalidPublicKey, btcaddr.p2pkhOfPublicKey(&hybrid));
+    hybrid[0] = 0x07;
+    try testing.expectError(error.InvalidPublicKey, btcaddr.p2pkhOfPublicKey(&hybrid));
+    try testing.expectError(error.InvalidPublicKey, btcaddr.p2wpkhOfPublicKey(&hybrid));
+}
+
 test "toScriptPubKey: typed rejection reasons" {
     // bech32 side (BIP173/BIP350 invalid vectors)
     try testing.expectError(error.InvalidVariant, btcaddr.toScriptPubKey("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd"));
