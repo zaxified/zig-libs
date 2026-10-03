@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Re-surveyed against turmoil: Scope `poc` → `core` (the `poc`
+  dated from the M1 commit and was never revisited after M5); grade 4 → 2. Three
+  gaps a user can hit filed under Backlog (lock deadlock reported as step limit,
+  `MSG_TRUNC` on request, fiber-only architectures). No code change.
 - **2026-10-01** — **Review fixes** (see SPEC.md § Review): stdio answers
   `Unseekable` to positional I/O (default stdout writer and stdin reader work),
   `Io.lockStderr` works, total-loss links time out instead of looping, `MSG_PEEK`,
