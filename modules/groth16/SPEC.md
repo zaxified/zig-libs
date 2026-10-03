@@ -368,6 +368,10 @@ from a header count. Second run: 160 000 inputs clean in 74 s.
 
 ## Backlog / deferred
 
+- **Relation audit 2026-10-03 — LOW:** `verifyContribution` does not subgroup-check `g2_spx` before
+  the same-ratio pairing checks (on-curve only). The record is a consistency proof anyway (§5.6),
+  but a twist point outside `G2` makes the pairing non-bilinear; refuse it at decode.
+
 - **snarkjs's circuit hash and contribution proof** (A8, 2026-10-02): needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b). Black-box only; 29 340 hash constructions tried. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
 - **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log.
 - **Multi-threaded prover and setup** (A8): snarkjs uses every core; ours is one. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`.

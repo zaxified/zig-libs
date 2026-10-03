@@ -585,6 +585,40 @@ fn auxFeEql(a: root.AuxFe, b: root.AuxFe) bool {
     return std.mem.eql(u8, &ab, &bb);
 }
 
+/// `gcd(x, N) == 1` for a PUBLIC value held mod `N` or `N²` — a unit of
+/// `Z*_N` (and so of `Z*_{N²}`). The paper's verifier divides by `c^e`, which
+/// presumes it; the inversion-free form used here does not, and without
+/// this check a prover who knows `N = P·Q` sends `u ≡ 0 (mod P²)` and
+/// `s ≡ 0 (mod P)`: equation 2 then holds as `0 = 0` mod `P²` for ANY
+/// plaintext there, and only mod `Q²` does the range proof still bind
+/// anything. Variable-time over public values; the scratch stays on the
+/// stack (gcd of a 4096-bit and a 2048-bit integer).
+fn isUnitModN(pk: paillier.PublicKey, x: paillier.Fe) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var x_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    x.toBytes(&x_buf, .big) catch return false;
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = pk.nByteLen();
+    pk.nToBytes(n_buf[0..n_len]) catch return false;
+    const xb = stripLeadingZeros(&x_buf);
+    if (xb.len == 0) return false;
+    var xi = bigFromBytes(gpa, xb) catch return false;
+    var ni = bigFromBytes(gpa, stripLeadingZeros(n_buf[0..n_len])) catch return false;
+    var g = std.math.big.int.Managed.init(gpa) catch return false;
+    g.gcd(&xi, &ni) catch return false;
+    return g.toConst().orderAgainstScalar(1) == .eq;
+}
+
+fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
+    var x = try std.math.big.int.Managed.initCapacity(gpa, bytes.len / @sizeOf(std.math.big.Limb) + 2);
+    var m = x.toMutable();
+    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
+    x.setMetadata(m.positive, m.len);
+    return x;
+}
+
 /// Byte-exact `paillier.Fe` equality (same rationale as `auxFeEql`).
 fn pailFeEql(a: paillier.Fe, b: paillier.Fe) bool {
     var ab: [paillier.modulus_sq_bytes]u8 = undefined;
@@ -1336,6 +1370,10 @@ fn verifyAliceRangeInner(
     // Degenerate-value hardening (fail closed before any arithmetic).
     if (proof.z.isZero() or proof.w.isZero() or proof.s.isZero() or proof.u.c.isZero()) return false;
     if (c_a.c.isZero()) return false;
+    // Units only (see `isUnitModN`): a non-unit `u`/`s` lets Alice's own
+    // factor P blank equation 2 mod P² and slip a plaintext of size ~N past
+    // the range check — Bob's MtA reply then hands her `b` outright.
+    if (!isUnitModN(alice_pk, c_a.c) or !isUnitModN(alice_pk, proof.u.c) or !isUnitModN(alice_pk, proof.s)) return false;
 
     // 1. THE range check: s1 <= q³. (The length cap is a work bound: an
     // honest prover never zero-pads, and `s1` is an exponent below.)
@@ -2397,6 +2435,119 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     const proof_ok = try proveAliceRange(allocator, a_ok, r_ok, pk, setup.aux, random);
     defer proof_ok.deinit(allocator);
     try testing.expect(verifyAliceRange(proof_ok, c_ok, pk, setup.aux));
+}
+
+test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank equation 2 and leak Bob's b" {
+    // Alice owns N = P·Q. She encrypts a = k·Q ≈ 2^1300 (≡ 0 mod Q, huge
+    // mod P) and proves "plaintext 0" mod Q² honestly, while u ≡ 0 (mod P²)
+    // and s ≡ 0 (mod P) make equation 2 read 0 = 0 mod P². Multiplying u by
+    // (P²)^N and s by P² keeps the Q² side consistent (the factor cancels).
+    // Every non-unit-aware check passes: s1 = alpha ≤ q³, Ñ side commits to 0.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0xa11ce_0004);
+    const pk = setup.kp.public;
+    const nsq = pk.n_sq;
+    const nt = setup.aux.n_tilde;
+    const p_sq = setup.kp.secret.crt.?.p_sq_fe;
+
+    var prng = std.Random.DefaultPrng.init(0x6e6f6e756e6974); // "nonunit"
+    const random = prng.random();
+
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = pk.nByteLen();
+    pk.nToBytes(n_buf[0..n_len]) catch unreachable;
+    const n_bytes = n_buf[0..n_len];
+
+    // a = ⌊2^1300 / Q⌋ · Q, Q = N / √(P²).
+    const Big = std.math.big.int.Managed;
+    var p_sq_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    try p_sq.toBytes(&p_sq_buf, .big);
+    var p_sq_big = try bigFromBytes(allocator, stripLeadingZeros(&p_sq_buf));
+    defer p_sq_big.deinit();
+    var n_big = try bigFromBytes(allocator, n_bytes);
+    defer n_big.deinit();
+    var p_big = try Big.init(allocator);
+    defer p_big.deinit();
+    try p_big.sqrt(&p_sq_big);
+    var q_big = try Big.init(allocator);
+    defer q_big.deinit();
+    var rem = try Big.init(allocator);
+    defer rem.deinit();
+    try q_big.divFloor(&rem, &n_big, &p_big);
+    try testing.expect(rem.eqlZero());
+    var two_1300 = try Big.initSet(allocator, 1);
+    defer two_1300.deinit();
+    try two_1300.shiftLeft(&two_1300, 1300);
+    var k = try Big.init(allocator);
+    defer k.deinit();
+    try k.divFloor(&rem, &two_1300, &q_big);
+    var a_big = try Big.init(allocator);
+    defer a_big.deinit();
+    try a_big.mul(&k, &q_big);
+    var a_bytes = [_]u8{0} ** paillier.modulus_bytes;
+    a_big.toConst().writeTwosComplement(&a_bytes, .big);
+
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, paillier.Fe.fromBytes(nsq, &a_bytes, .big) catch unreachable, r_a) catch unreachable;
+
+    // Commitments for a claimed plaintext 0.
+    var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
+    nt.toBytes(&nt_buf, .big) catch unreachable;
+    const nt_bytes = stripLeadingZeros(&nt_buf);
+    var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
+    const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
+    mulBytes(&q_bytes, nt_bytes, q_nt);
+    var q3_nt_buf: [96 + root.aux_modulus_bytes]u8 = undefined;
+    const q3_nt = q3_nt_buf[0 .. 96 + nt_bytes.len];
+    mulBytes(&q3_bytes, nt_bytes, q3_nt);
+    var alpha: [96]u8 = undefined;
+    _ = sampleBelow(random, &q3_bytes, &alpha);
+    var rho_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
+    const rho = sampleBelow(random, q_nt, &rho_buf);
+    var gamma_buf: [96 + root.aux_modulus_bytes]u8 = undefined;
+    const gamma = sampleBelow(random, q3_nt, &gamma_buf);
+    var beta_buf: [paillier.modulus_bytes]u8 = undefined;
+    const beta = sampleNonzeroBelow(random, n_bytes, &beta_buf);
+    const beta_fe = feFromSecretBytes(nsq, paillier.Fe, beta);
+
+    const z = pedersenCt(nt, setup.aux.h1, &[_]u8{0}, setup.aux.h2, rho);
+    const u_honest = paillier.encrypt(pk, feFromSecretBytes(nsq, paillier.Fe, &alpha), beta_fe) catch unreachable;
+    const p_sq_n = powPub(nsq, p_sq, n_bytes);
+    const u = paillier.Ciphertext{ .c = nsq.mul(u_honest.c, p_sq_n) };
+    const w = pedersenCt(nt, setup.aux.h1, &alpha, setup.aux.h2, gamma);
+    const e = rangeProofChallenge(setup.aux, pk, c_a, z, u, w);
+    const e_bytes = e.toBytes(.big);
+    const s = nsq.mul(nsq.mul(powPub(nsq, r_a, &e_bytes), beta_fe), p_sq);
+    const proof = RangeProof{
+        .z = z,
+        .u = u,
+        .w = w,
+        .s = s,
+        .s1 = try allocator.dupe(u8, &alpha),
+        .s2 = try mulAddOwned(allocator, &e_bytes, rho, gamma),
+    };
+    defer proof.deinit(allocator);
+    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux));
+
+    // Why it matters: had Bob answered c_B = c_A^b · Enc(β'), Alice reads b
+    // as ⌊Dec(c_B) / a⌋ — a·b + β' < N, β' < a.
+    const b = scalarFromU64(0xb0b5ec7e7);
+    const b_bytes = b.toBytes(.big);
+    var beta_prime: [96]u8 = undefined;
+    _ = sampleBelow(random, &q3_bytes, &beta_prime);
+    const c_b = buildCb(pk, c_a, &b_bytes, &beta_prime, testPaillierRandomness(pk, random));
+    const dec = try paillier.decrypt(setup.kp.secret, c_b);
+    var dec_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    try dec.toBytes(&dec_buf, .big);
+    var dec_big = try bigFromBytes(allocator, stripLeadingZeros(&dec_buf));
+    defer dec_big.deinit();
+    var b_got = try Big.init(allocator);
+    defer b_got.deinit();
+    try b_got.divFloor(&rem, &dec_big, &a_big);
+    var b_big = try bigFromBytes(allocator, &b_bytes);
+    defer b_big.deinit();
+    try testing.expect(b_got.eql(b_big));
 }
 
 test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof field" {

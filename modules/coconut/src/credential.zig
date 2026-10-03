@@ -75,6 +75,31 @@ pub const CoconutError = error{
 
 // ── credential types ────────────────────────────────────────────────────────
 
+/// Decodes a compressed `G1` point and refuses anything outside the
+/// order-`r` subgroup. `g1.fromBytesCompressed` checks the curve only, and
+/// the pairing is blind to a point whose order divides the cofactor: with
+/// `σ = (T, 1)` for such a `T`, `e(T, κ) == e(1, g2)` holds for every key and
+/// every attribute vector — a universal forgery.
+fn decodeG1(bytes: [g1.compressed_bytes]u8) CoconutError!g1.Affine {
+    const p = g1.fromBytesCompressed(bytes) catch return error.InvalidEncoding;
+    if (!inG1(p)) return error.InvalidEncoding;
+    return p;
+}
+
+fn decodeG2(bytes: [g2.compressed_bytes]u8) CoconutError!g2.Affine {
+    const p = g2.fromBytesCompressed(bytes) catch return error.InvalidEncoding;
+    if (!inG2(p)) return error.InvalidEncoding;
+    return p;
+}
+
+fn inG1(p: g1.Affine) bool {
+    return g1.Jacobian.fromAffine(p).subgroupCheck();
+}
+
+fn inG2(p: g2.Affine) bool {
+    return g2.Jacobian.fromAffine(p).subgroupCheck();
+}
+
 /// A PS credential `σ = (h, s)` — the aggregated, unblinded credential.
 pub const Credential = struct {
     h: g1.Affine,
@@ -90,8 +115,8 @@ pub const Credential = struct {
     }
 
     pub fn fromBytes(bytes: [encoded_bytes]u8) CoconutError!Credential {
-        const h = g1.fromBytesCompressed(bytes[0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
-        const s = g1.fromBytesCompressed(bytes[g1.compressed_bytes..].*) catch return error.InvalidEncoding;
+        const h = try decodeG1(bytes[0..g1.compressed_bytes].*);
+        const s = try decodeG1(bytes[g1.compressed_bytes..].*);
         return .{ .h = h, .s = s };
     }
 };
@@ -114,8 +139,8 @@ pub const PartialCredential = struct {
 
     pub fn fromBytes(bytes: [encoded_bytes]u8) CoconutError!PartialCredential {
         const index = std.mem.readInt(u64, bytes[0..8], .big);
-        const h = g1.fromBytesCompressed(bytes[8..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
-        const s = g1.fromBytesCompressed(bytes[8 + g1.compressed_bytes ..].*) catch return error.InvalidEncoding;
+        const h = try decodeG1(bytes[8..][0..g1.compressed_bytes].*);
+        const s = try decodeG1(bytes[8 + g1.compressed_bytes ..].*);
         return .{ .index = index, .h = h, .s = s };
     }
 };
@@ -197,13 +222,13 @@ pub const ShowProof = struct {
         // k hidden responses must match q - revealed.
         if (k + revealed != q) return error.InvalidDisclosure;
 
-        const sigma1 = g1.fromBytesCompressed(bytes[off..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
+        const sigma1 = try decodeG1(bytes[off..][0..g1.compressed_bytes].*);
         off += g1.compressed_bytes;
-        const sigma2 = g1.fromBytesCompressed(bytes[off..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
+        const sigma2 = try decodeG1(bytes[off..][0..g1.compressed_bytes].*);
         off += g1.compressed_bytes;
-        const kappa = g2.fromBytesCompressed(bytes[off..][0..g2.compressed_bytes].*) catch return error.InvalidEncoding;
+        const kappa = try decodeG2(bytes[off..][0..g2.compressed_bytes].*);
         off += g2.compressed_bytes;
-        const nu = g1.fromBytesCompressed(bytes[off..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
+        const nu = try decodeG1(bytes[off..][0..g1.compressed_bytes].*);
         off += g1.compressed_bytes;
         const challenge = Fr.fromBytes(bytes[off..][0..32].*) catch return error.InvalidEncoding;
         off += 32;
@@ -263,6 +288,8 @@ pub fn kappaPlain(vk: VerificationKey, attributes: []const Fr) g2.Affine {
 /// output, rejects any tampered `s`).
 pub fn psVerifyPlain(vk: VerificationKey, cred: Credential, attributes: []const Fr) bool {
     if (g1.Jacobian.fromAffine(cred.h).isIdentity()) return false;
+    // A struct built in memory never passed `decodeG1`; see its note.
+    if (!inG1(cred.h) or !inG1(cred.s)) return false;
     const kappa = kappaPlain(vk, attributes);
     const neg_s = g1.Jacobian.fromAffine(cred.s).negate().toAffine();
     // e(h, κ) · e(−s, g2) == 1  ⇔  e(h, κ) == e(s, g2).
@@ -362,6 +389,12 @@ fn showChallenge(
 /// combined). GATED core.
 pub fn signPartial(share: SecretKeyShare, h: g1.Affine, attributes: []const Fr) CoconutError!PartialCredential {
     if (share.ys.len != attributes.len) return error.MismatchedAttributes;
+    // `h` must be `Parameters.commonBase(attributes)` (a hash-to-curve point,
+    // so in G1 and never reused across attribute vectors: two PS signatures
+    // on one `h` combine linearly into a signature on a third vector). That
+    // binding is the caller's; what is checked here is the part that leaks
+    // the key: `[e] T` for a `T` of small order reveals `e` mod that order.
+    if (g1.Jacobian.fromAffine(h).isIdentity() or !inG1(h)) return error.InvalidEncoding;
     // The share is a point-evaluation of the master key vector, so the
     // partial signing exponent is the SAME `x + Σ mᵢ yᵢ` form over the
     // share's scalars — Lagrange over these exponents reconstructs the
@@ -582,6 +615,11 @@ pub fn verifyCredential(
     // satisfiable by σ₂'·ν = 1 without any credential.
     const sigma1_jac = g1.Jacobian.fromAffine(proof.sigma1);
     if (sigma1_jac.isIdentity()) return false;
+    // Every point in G1/G2 — a proof built in memory never passed
+    // `decodeG1`. Outside G1 the pairing is blind: σ₁' = T of cofactor
+    // order, σ₂' = ν = 1 and an NIZK over r = 0 (public data only) pass
+    // `e(T, κ) == e(1, g2)` with no credential at all.
+    if (!inG1(proof.sigma1) or !inG1(proof.sigma2) or !inG1(proof.nu) or !inG2(proof.kappa)) return false;
 
     // Public offset A = α · Π_{disclosed i} βᵢ^{vᵢ} from the CLAIMED
     // disclosed values — a wrong claim shifts A, hence Aw', hence the
@@ -683,6 +721,78 @@ test "psSignWithSecret / psVerifyPlain: valid credential accepted, tamper reject
     // block; without it, `(identity, identity)` verifies against EVERY key.
     const forged = Credential{ .h = g1.Affine.identity, .s = g1.Affine.identity };
     try std.testing.expect(!psVerifyPlain(kk.master_vk, forged, &attrs));
+}
+
+/// A point of `E(Fp)` outside `G1`: some curve point times `r`, so its order
+/// divides the cofactor `h1` (coprime to `r`). The ate pairing is a power of
+/// the reduced Tate pairing `t_r(Q, ·)`, trivial on `[r]E`, so `e(T, Q) = 1`
+/// for every `Q` — the forger's point.
+fn cofactorTorsionPoint() g1.Affine {
+    const r_be = [_]u8{
+        0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8, 0x08, 0x09, 0xa1, 0xd8, 0x05,
+        0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe, 0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+    };
+    var x: u8 = 1;
+    while (true) : (x += 1) {
+        var enc = [_]u8{0} ** g1.compressed_bytes;
+        enc[0] = 0x80;
+        enc[g1.compressed_bytes - 1] = x;
+        const p = g1.fromBytesCompressed(enc) catch continue;
+        const t = g1.Jacobian.fromAffine(p).scalarMulBytes(&r_be);
+        if (!t.isIdentity()) return t.toAffine();
+    }
+}
+
+test "SOUNDNESS: a point outside G1 is no credential (no authority signed anything)" {
+    const allocator = std.testing.allocator;
+    const p = try Parameters.generate(allocator, 2);
+    defer p.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(0x7070);
+    var kk = try keys.keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    defer kk.deinit(allocator);
+
+    const t = cofactorTorsionPoint();
+    const t_jac = g1.Jacobian.fromAffine(t);
+    if (!t_jac.isOnCurve() or t_jac.subgroupCheck()) return error.ProbePointNotOutsideG1;
+
+    // σ = (T, 1) for ANY key and ANY attribute vector: the pairing is blind
+    // to T, so without the subgroup guard both sides are 1.
+    const attrs = [_]Fr{ frOf(1234), frOf(5678) };
+    const forged = Credential{ .h = t, .s = g1.Affine.identity };
+    if (psVerifyPlain(kk.master_vk, forged, &attrs)) return error.PsForgeryAccepted;
+    try std.testing.expectError(error.InvalidEncoding, Credential.fromBytes(forged.toBytes()));
+    // An authority asked to sign under T would hand out `[e] T`, i.e. its
+    // signing exponent mod the order of T.
+    try std.testing.expectError(error.InvalidEncoding, signPartial(kk.sk_shares[0], t, &attrs));
+
+    // Show proof from public data only: σ₁' = T, σ₂' = ν = 1, blinding r = 0
+    // (so ν = [0] T and no scalar is reduced mod r against a point of another
+    // order), κ = α·Π βᵢ^{mᵢ}, and an honest Sigma protocol over that.
+    const disclosed = [_]bool{ true, false };
+    const g2gen = g2.Jacobian.fromAffine(g2.Affine.generator);
+    const kappa = kappaPlain(kk.master_vk, &attrs);
+    const r_tilde = frOf(77);
+    const m_tilde = frOf(88);
+    const aw = g2gen.scalarMul(r_tilde).add(g2.Jacobian.fromAffine(kk.master_vk.betas[1]).scalarMul(m_tilde)).toAffine();
+    const bw = t_jac.scalarMul(r_tilde).toAffine();
+    const disclosed_values = [_]Fr{attrs[0]};
+    const c = showChallenge(p, kk.master_vk, t, g1.Affine.identity, kappa, g1.Affine.identity, aw, bw, &disclosed, &disclosed_values);
+    var responses_m = [_]Fr{m_tilde.add(c.mul(attrs[1]))};
+    var disclosed_mask = disclosed;
+    const proof = ShowProof{
+        .sigma1 = t,
+        .sigma2 = g1.Affine.identity,
+        .kappa = kappa,
+        .nu = g1.Affine.identity,
+        .challenge = c,
+        .response_r = r_tilde,
+        .responses_m = &responses_m,
+        .disclosed = &disclosed_mask,
+    };
+    if (try verifyCredential(allocator, p, kk.master_vk, proof, &disclosed_values)) return error.ShowForgeryAccepted;
+    const wire = try proof.toBytes(allocator);
+    defer allocator.free(wire);
+    try std.testing.expectError(error.InvalidEncoding, ShowProof.fromBytes(allocator, wire));
 }
 
 test "Credential / PartialCredential codec round-trips" {

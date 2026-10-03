@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **⛔ Security fix: the range proof accepted non-unit `u`/`s`.** The
+  verifier uses the inversion-free form `u·c^e == Γ^s1·s^N (mod N²)`; the paper's
+  `u = Γ^s1·s^N·c^-e` presumes units, the rewrite dropped that. Alice, who knows
+  `N = P·Q`, sends `u ≡ 0 (mod P²)` and `s ≡ 0 (mod P)` (multiply an honest `u` by
+  `(P²)^N` and `s` by `P²`): equation 2 reads `0 = 0` mod `P²`, so only the `Q²` side
+  still binds the plaintext. She encrypts `a = k·Q ≈ 2^1300` (zero mod `Q`, huge mod
+  `P`), proves "plaintext 0", and Bob's MtA reply `a·b + β'` (no wrap, `β' < a`) gives
+  her `b = ⌊Dec(c_B)/a⌋` — his `γ_i` or `w_i` in one session. `verifyAliceRange` and
+  the PDL proof built on it now require `gcd(c_A, N) = gcd(u, N) = gcd(s, N) = 1`.
+  Regression test runs the attack end to end (including recovering `b`); with the check
+  removed it fails. Found by the 2026-10-03 relation audit.
+
 - **2026-10-03** — **⛔ Security fix: Πprm proved the wrong direction.**
   Aux generation drew `h1` and set `h2 = h1^λ`, and Πprm proved that, i.e.
   `h2 ∈ ⟨h1⟩`. The commitment `h1^x·h2^ρ` hides `x` only if `h1 ∈ ⟨h2⟩`;

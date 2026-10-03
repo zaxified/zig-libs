@@ -1067,6 +1067,15 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 
 ## Backlog / deferred
 
+- **Relation audit 2026-10-03 — LOW items** (the HIGH non-unit `u`/`s` range-proof bypass was fixed
+  the same day): (1) range/MtA/MtAwc challenges bind no session or prover id (PDL and the ec proofs
+  do); the prover's `pk` and the verifier's aux are hashed, so only same-signer session replay
+  remains; (2) Bob's MtA proofs do not check `c_B`/`v`/`s` are units — Bob cannot make non-units
+  without factoring Alice's `N`, and `decrypt` refuses them; add the same `isUnitModN` for symmetry;
+  (3) a Bob who sends a signed (negative) `β'` chooses whether `a·b' + β'` wraps mod `N` and reads
+  one threshold bit of Alice's `k_j` from an aborted session — bound `β'` to non-negative as GG18
+  states.
+
 - **Review 2026-10-03 (independent, read-only) — LOW items left open** (F1 Πprm direction and F2
   `Ñ = 3` hang were fixed the same day): (F3) Πmod does not check `gcd(y_i, Ñ) = 1` — not exploitable
   at the size floor, Πfac covers small factors; (F4) `ModProof`/`PrmProof` decoders accept trailing

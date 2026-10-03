@@ -443,6 +443,10 @@ B14), kept.
 
 ## Backlog / deferred
 
+- **Relation audit 2026-10-03 — LOW:** the standalone `verifyIpa` relies on the caller having
+  absorbed `P` and `Q` into the transcript first (the range proof does); a direct caller who does
+  not gets a weak Fiat–Shamir. Absorb them inside, or document it at the function.
+
 - **Aggregated range proofs (paper §4.3, `m` values in one proof)** (survey 2026-09-30) — DONE 2026-10-02: `proveMultiple`/`verifyMultiple`, `Generators.initParties`, anchored both ways against dalek's `prove_multiple`/`verify_multiple` (see "Anchoring").
 - **Multi-party aggregation (dalek's dealer/party protocol)** (2026-10-02): parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
 - ~~**Batch verification of several independent range proofs**~~ ✅ 2026-10-02: `verifyBatch` (see "Batch verification" above).

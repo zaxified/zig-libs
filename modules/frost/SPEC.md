@@ -256,6 +256,11 @@ pass, Debug and ReleaseFast.
 
 ## Backlog / deferred
 
+- **Relation audit 2026-10-03 — LOW:** `verifySignatureShare` takes `comm_i` separately and never
+  checks it is the entry for participant `i` in the commitment list the binding factors were
+  computed over; `aggregate` does not verify its output (RFC 9591 §5.3 lets the coordinator do
+  so to identify a cheater). Look the commitment up from the list; offer a verifying aggregate.
+
 
 - **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** (survey 2026-09-30): ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
 - **Distributed key generation for FROST** (survey 2026-09-30): the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why this SPEC refused it, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.

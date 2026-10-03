@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **⛔ Security fix: no subgroup check → universal forgery.** Every
+  `G1`/`G2` point a credential or show proof carries was decoded with
+  `fromBytesCompressed`, which checks the curve only. A point `T` whose order divides
+  the `G1` cofactor is invisible to the pairing (the ate pairing is a power of the
+  reduced Tate pairing, trivial on `[r]E`), so `σ = (T, 1)` passed `psVerifyPlain` for
+  every key and every attribute vector, and a show proof built from public data alone
+  (`σ₁' = T`, `σ₂' = ν = 1`, blinding `r = 0`) passed `verifyCredential` — no
+  authority needed. Now `Credential`/`PartialCredential`/`ShowProof.fromBytes` refuse
+  points outside the subgroup (`error.InvalidEncoding`), `psVerifyPlain` and
+  `verifyCredential` check every point again (in-memory structs never pass a
+  decoder), and `signPartial` refuses an `h` outside `G1` or the identity (`[e]T`
+  would hand out the signing exponent mod the order of `T`). Regression test builds
+  both forgeries; with the verify check removed it fails on `ShowForgeryAccepted`.
+  Found by the 2026-10-03 relation audit. ⚠ Behaviour change: inputs that used to
+  decode now return `error.InvalidEncoding`; none of them could come from an honest
+  party.
+
 - **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** the Pointcheval-Sanders core and threshold aggregation are now cross-checked against the foreign `coconut-crypto` 0.14 (`src/interop_test.zig`, vectors from `tools/vectors`): our `psVerifyPlain` accepts foreign aggregated credentials, `aggregateCredential`/`aggregateVerificationKeys` reproduce the foreign aggregate sigma and group key byte for byte (2-of-3, 3-of-5, q = 1..4, several subsets). The show-proof NIZK stays SELF. Anchor grade oracle SELF -> MIXED.
 
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **authority_sign 69 / user_issue 3 / user_show 51**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. No constant-time claim exists in `SPEC.md` or `README.md`; nothing was added. Three targets split by which party holds the secret (authority key share, user attributes at local commitment, user attributes plus blinding at proof showing). ⭐ Independently reproduced `bls12_381`'s `ctSelect` finding with the identical disassembled sequence `bt %esi,%edx; jae` — the second witness that turned it from one measurement's surprise into a settled result. ⭐ This agent also added the campaign's third context class: **over-taint artifact** — `ff.zig`'s `conditionalAdd`/`conditionalSub`/`limbsCmpLt` are real `je`/`jne` but branch on a limb COUNT or a Montgomery-form FLAG, not on the secret's value, and light up only because the harness taints the whole opaque `Fe` struct including its metadata (as `bls12_381`'s own harness also does). ⚠ Not adjusted for single-process over-taint either.

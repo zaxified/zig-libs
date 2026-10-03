@@ -227,6 +227,14 @@ them. Do not use either outside a test.
 
 ## Backlog / deferred
 
+- **Relation audit 2026-10-03 — open MED items** (the HIGH subgroup forgery was fixed the same day):
+  (1) the show challenge binds no verifier context or nonce, so a captured show proof replays to
+  any verifier — add a `context` argument to `proveCredential`/`verifyCredential` hashed into
+  `showChallenge` (transcript version bump, V01 → V02); (2) `verifyCredential` takes the disclosure
+  mask from the proof, so a caller expecting attribute 0 disclosed can be handed a proof that
+  discloses attribute 2 with the same value — take the expected mask from the caller (or return
+  it and document that the caller must compare). Both are API changes; decide together.
+
 - **Blind issuance (paper §4.3) — ElGamal-encrypted private attributes, formation NIZK `pi_s`, `blindSign`, `unblind`** (survey 2026-09-30): this is the reason to pick Coconut over threshold PS; without it the issuing authorities learn every attribute, so the privacy claim is only "hidden from the verifier". Already SPEC §6 "Deferred increments"; `params.hs` is already carried for it. Effort: medium (a new NIZK with its own transcript; the most soundness-critical new code). Fits CONVENTIONS §2.
 - **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the dealer. Effort: medium; fits §2.
 
