@@ -22,9 +22,26 @@
 //! .complaints  collect complaints
 //! advance()  -> dealers open the shares they are accused over
 //! .defenses    collect the openings
-//! advance()  -> new x'_j = Σ λ_i g_i(j); assemble the new `KeyShare`
+//! advance()  -> new x'_j = Σ λ_i g_i(j); assemble the new `KeyShare`;
+//!               broadcast ecdsa_confirm: SHA-256 of its public part
+//! .confirm     collect every peer's confirmation
+//! advance()  -> every digest equals this party's own, or abort
 //! .done        `takeKeyShare()`
 //! ```
+//!
+//! **Key confirmation** (review 2026-10-03 F6). Agreement on the new key
+//! table and commitments used to rest on the transport's reliable broadcast
+//! alone: a transport that showed one party a different announcement or
+//! dealer set left honest parties holding shares that do not fit together —
+//! and the caller may already have erased the old share. Now no party
+//! reaches `.done` (or hands out its new share) before every party has
+//! confirmed the same group key, `t`, `n` and public-key table (which fixes
+//! every new verifying share, so the commitments and the dealer set too).
+//! **Erase the old share only after `.done`**; on an abort, keep it — the
+//! old shares still form the key. A party can still reach `.done` while a
+//! peer misses the last confirmations (its delivery failed): that peer
+//! aborts with the old share intact, and the others' new shares carry the
+//! key as long as `t` of them finished; rerun the refresh to bring it in.
 //!
 //! Every party is both a dealer (old committee) and a receiver (new
 //! committee): its own dealer's frames reach its own receiver inside this
@@ -33,8 +50,11 @@
 //! stop the refresh as long as `t` dealers survive. Proofs are bound to
 //! `session_id`, `t`, `n` and the prover's index exactly as in keygen
 //! (`ecdsa_keygen.keygenContext`), so a refresh needs a session id no other
-//! run used. Transport duties are as in keygen: reliable broadcast,
-//! authenticated senders, confidential point-to-point frames.
+//! run used, and every frame carries the run tag (`ecdsa_keygen.runTag`,
+//! protocol `refresh`): frames of another run or of a keygen are refused
+//! with `WrongSession` (review 2026-10-03 F7). Transport duties are as in
+//! keygen: reliable broadcast, authenticated senders, confidential
+//! point-to-point frames.
 
 const std = @import("std");
 const tecdsa = @import("threshold_ecdsa");
@@ -48,7 +68,7 @@ const fac_proof = tecdsa.fac_proof;
 const Element = types.Element;
 const Outgoing = wire.Outgoing;
 
-pub const Phase = enum { new, announce, factors, shares, complaints, defenses, done, aborted };
+pub const Phase = enum { new, announce, factors, shares, complaints, defenses, confirm, done, aborted };
 
 pub const InitError = reshare.DealerInitError || reshare.ReceiverInitError || error{ EmptySessionId, InvalidKeyShare };
 pub const StartError = error{WrongRound} || tecdsa.aux_proofs.ProveError || aux_info.Announcement.AllocError;
@@ -66,6 +86,9 @@ pub const AdvanceError = error{
     InvalidFactorProof,
     /// The refreshed share does not belong to the group key it refreshes.
     InvalidKeyShare,
+    /// A peer confirmed a different new key table (`culprit`: the first
+    /// such peer — which side is wrong cannot be told from here).
+    ConfirmationMismatch,
 } || reshare.ReceiverAdvanceError || reshare.DealerAdvanceError || reshare.MessageError ||
     fac_proof.ProveError || fac_proof.FacProof.AllocError || aux_info.AssembleError || std.mem.Allocator.Error;
 
@@ -90,8 +113,13 @@ pub const EcdsaRefresh = struct {
     checked: ?aux_info.AnnouncementSet = null,
 
     outbox: std.ArrayList(Outgoing) = .empty,
+    /// The new share, from the end of the defense round; handed out only in
+    /// `.done`, after every peer confirmed it.
     share: ?tecdsa.KeyShare = null,
     culprit_: ?u32 = null,
+    tag: ecdsa_keygen.RunTag,
+    own_confirm: [32]u8 = undefined,
+    confirms: []?[32]u8,
 
     /// Refresh `current` (this party's key share; borrowed for the call, its
     /// secret is copied into the dealer) with the new aux material `local`
@@ -134,10 +162,15 @@ pub const EcdsaRefresh = struct {
         errdefer allocator.free(anns);
         @memset(anns, null);
         const fac = try allocator.alloc(?fac_proof.FacProof, cfg.n);
+        errdefer allocator.free(fac);
         @memset(fac, null);
+        const confirms = try allocator.alloc(?[32]u8, cfg.n);
+        @memset(confirms, null);
         return .{
             .allocator = allocator,
             .cfg = cfg,
+            .tag = ecdsa_keygen.runTag(.refresh, session_id, cfg),
+            .confirms = confirms,
             .me = current.index,
             .session_id = sid,
             .local = local,
@@ -171,6 +204,7 @@ pub const EcdsaRefresh = struct {
         self.allocator.free(self.session_id);
         self.allocator.free(self.announcements);
         self.allocator.free(self.fac);
+        self.allocator.free(self.confirms);
         self.* = undefined;
     }
 
@@ -183,10 +217,12 @@ pub const EcdsaRefresh = struct {
         return self.culprit_;
     }
 
-    /// The refreshed `KeyShare`, handed over once. The caller frees
+    /// The refreshed `KeyShare`, handed over once, and only in `.done` —
+    /// after every party confirmed the same key table. The caller frees
     /// `share.public_keys.entries` with the allocator given to `init`, and
     /// erases the old share it replaces.
     pub fn takeKeyShare(self: *EcdsaRefresh) ?tecdsa.KeyShare {
+        if (self.phase_ != .done) return null;
         const s = self.share orelse return null;
         self.share = null;
         return s;
@@ -204,7 +240,7 @@ pub const EcdsaRefresh = struct {
         const ann = try self.local.announce(self.allocator, self.context(&ctx_buf, self.me), self.random);
         const bytes = try ann.toBytesAlloc(self.allocator);
         defer self.allocator.free(bytes);
-        try wire.pushFrame(&self.outbox, self.allocator, .broadcast, .ecdsa_announcement, bytes);
+        try ecdsa_keygen.pushTagged(&self.outbox, self.allocator, self.tag, .broadcast, .ecdsa_announcement, bytes);
         self.announcements[self.me - 1] = ann;
         self.phase_ = .announce;
     }
@@ -212,12 +248,13 @@ pub const EcdsaRefresh = struct {
     /// Feed one frame from the authenticated peer `from`. A frame for a later
     /// round is refused with `WrongRound` (hold it, redeliver after
     /// `advance`); a refused frame changes nothing.
-    pub fn handle(self: *EcdsaRefresh, from: u32, bytes: []const u8) reshare.MessageError!void {
+    pub fn handle(self: *EcdsaRefresh, from: u32, tagged: []const u8) reshare.MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
             else => {},
         }
+        const bytes = try ecdsa_keygen.untag(self.tag, tagged);
         if (bytes.len == 0) return error.Malformed;
         const kind = wire.kindFromByte(bytes[0]) orelse return error.UnknownKind;
         if (from < 1 or from > self.cfg.n or from == self.me) return error.UnknownSender;
@@ -245,6 +282,12 @@ pub const EcdsaRefresh = struct {
                 if (self.phase_ != .defenses) return error.WrongRound;
                 try self.receiver.handle(.{ .dealer = from }, bytes);
             },
+            .ecdsa_confirm => {
+                if (self.phase_ != .confirm) return error.WrongRound;
+                if (self.confirms[from - 1] != null) return error.DuplicateMessage;
+                if (bytes.len != 1 + 32) return error.Malformed;
+                self.confirms[from - 1] = bytes[1..33].*;
+            },
             else => return error.UnknownKind,
         }
     }
@@ -259,6 +302,7 @@ pub const EcdsaRefresh = struct {
             .shares => self.advanceShares(),
             .complaints => self.advanceComplaints(),
             .defenses => self.advanceDefenses(),
+            .confirm => self.advanceConfirm(),
             .done => return error.Finished,
             .aborted => return error.Aborted,
         };
@@ -299,7 +343,7 @@ pub const EcdsaRefresh = struct {
             const proof = try self.local.proveFactors(a.?.aux, own_ctx, self.random);
             const bytes = try proof.toBytesAlloc(self.allocator);
             defer self.allocator.free(bytes);
-            try wire.pushFrame(&self.outbox, self.allocator, .{ .party = @intCast(j) }, .ecdsa_fac_proof, bytes);
+            try ecdsa_keygen.pushTagged(&self.outbox, self.allocator, self.tag, .{ .party = @intCast(j) }, .ecdsa_fac_proof, bytes);
         }
         self.phase_ = .factors;
     }
@@ -354,10 +398,50 @@ pub const EcdsaRefresh = struct {
             return error.InvalidKeyShare;
         }
         self.share = share;
+        self.own_confirm = try confirmDigest(self.allocator, self.tag, share);
+        try ecdsa_keygen.pushTagged(&self.outbox, self.allocator, self.tag, .broadcast, .ecdsa_confirm, &self.own_confirm);
+        self.phase_ = .confirm;
+    }
+
+    fn advanceConfirm(self: *EcdsaRefresh) AdvanceError!void {
+        for (self.confirms, 1..) |c, j| {
+            if (j == self.me) continue;
+            const d = c orelse {
+                self.culprit_ = @intCast(j);
+                return error.MissingMessage;
+            };
+            if (!std.mem.eql(u8, &d, &self.own_confirm)) {
+                self.culprit_ = @intCast(j);
+                return error.ConfirmationMismatch;
+            }
+        }
         self.phase_ = .done;
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
+
+    /// `SHA-256(domain || run tag || group key || u32-BE t || u32-BE n ||
+    /// public-key table)`: what every party must agree on before anyone
+    /// erases an old share. The table holds every new verifying share, so it
+    /// also fixes the combined commitments and the dealer set behind them.
+    fn confirmDigest(allocator: std.mem.Allocator, tag: ecdsa_keygen.RunTag, share: tecdsa.KeyShare) AdvanceError![32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("dkg/ecdsa/refresh-confirm/v1");
+        h.update(&tag);
+        h.update(&share.group_public_key.toBytes());
+        var u: [4]u8 = undefined;
+        std.mem.writeInt(u32, &u, share.t, .big);
+        h.update(&u);
+        std.mem.writeInt(u32, &u, share.n, .big);
+        h.update(&u);
+        const table = share.public_keys.toBytesAlloc(allocator) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidKeyShare,
+        };
+        defer allocator.free(table);
+        h.update(table);
+        return h.finalResult();
+    }
 
     fn context(self: *const EcdsaRefresh, buf: *[ecdsa_keygen.EcdsaKeygen.ctx_max]u8, index: u32) []const u8 {
         return ecdsa_keygen.keygenContext(buf, self.session_id, self.cfg.t, self.cfg.n, index);
@@ -404,7 +488,7 @@ pub const EcdsaRefresh = struct {
                 },
                 .broadcast => {},
             }
-            try self.outbox.append(self.allocator, m);
+            try ecdsa_keygen.appendTagged(&self.outbox, self.allocator, self.tag, m);
         }
     }
 
@@ -418,7 +502,7 @@ pub const EcdsaRefresh = struct {
         while (moved < msgs.len) : (moved += 1) {
             const m = msgs[moved];
             try self.dealer.handle(self.me, m.bytes);
-            try self.outbox.append(self.allocator, m);
+            try ecdsa_keygen.appendTagged(&self.outbox, self.allocator, self.tag, m);
         }
     }
 };
@@ -648,7 +732,7 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         for (&parties) |*p| try p.advance();
         try deliverAll(allocator, &parties, struct {
             fn f(from: u32, to: u32, bytes: []u8) bool {
-                if (from != 2 or bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+                if (from != 2 or bytes[ecdsa_keygen.run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
                 if (to == 1) return false;
                 bytes[bytes.len - 1] ^= 1;
                 return true;
@@ -673,4 +757,96 @@ test "refresh: a missing, replayed or tampered frame and a shared modulus abort 
         try deliverAll(allocator, &parties, null);
         try testing.expectError(error.DuplicateModulus, parties[0].advance());
     }
+}
+
+test "refresh: frames of another session or of a keygen are refused by the run tag (review F7)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0004);
+    const random = prng.random();
+    const kg = try tecdsa.signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+
+    // Run "epoch-7a" aborted; its frames must not count in the retry "epoch-7b".
+    var old_run = try EcdsaRefresh.init(allocator, kg.key_shares[1], "epoch-7a", &locals[1], random);
+    defer old_run.deinit();
+    try old_run.start();
+    const stale = try old_run.takeOutgoing();
+    defer wire.freeOutgoing(allocator, stale);
+
+    var retry = try EcdsaRefresh.init(allocator, kg.key_shares[0], "epoch-7b", &locals[0], random);
+    defer retry.deinit();
+    try retry.start();
+    try testing.expectError(error.WrongSession, retry.handle(2, stale[0].bytes));
+    try testing.expectError(error.Malformed, retry.handle(2, stale[0].bytes[0 .. ecdsa_keygen.run_tag_len - 1]));
+
+    // A keygen frame under the SAME session id is not a refresh frame.
+    var kgen = try ecdsa_keygen.EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, 2, "epoch-7b", &locals[1], random);
+    defer kgen.deinit();
+    try kgen.start();
+    const kframes = try kgen.takeOutgoing();
+    defer wire.freeOutgoing(allocator, kframes);
+    try testing.expectError(error.WrongSession, retry.handle(2, kframes[0].bytes));
+
+    // The same announcement re-tagged for this run is taken: only the tag differed.
+    const fixed = try allocator.dupe(u8, stale[0].bytes);
+    defer allocator.free(fixed);
+    fixed[0..ecdsa_keygen.run_tag_len].* = ecdsa_keygen.runTag(.refresh, "epoch-7b", .{ .t = 2, .n = 3 });
+    try retry.handle(2, fixed);
+}
+
+test "refresh: parties that end with different key tables abort in the confirmation round; nobody hands out a share (review F6)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0005);
+    const random = prng.random();
+    const kg = try tecdsa.signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+
+    var parties: [3]EcdsaRefresh = undefined;
+    var inited: usize = 0;
+    defer for (parties[0..inited]) |*p| p.deinit();
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, kg.key_shares[inited], "refresh-split", &locals[inited], random);
+    for (&parties) |*p| try p.start();
+
+    // A transport that hides dealer 2 from party 3 (and only from party 3):
+    // party 3 refreshes with dealers {1, 3}, parties 1 and 2 with {1, 2, 3}.
+    const hide = struct {
+        fn f(from: u32, to: u32, bytes: []u8) bool {
+            const kind = bytes[ecdsa_keygen.run_tag_len];
+            const dealing = kind == @intFromEnum(wire.Kind.reshare_broadcast) or kind == @intFromEnum(wire.Kind.reshare_share);
+            return !(from == 2 and to == 3 and dealing);
+        }
+    }.f;
+    var errs: [3]?anyerror = @splat(null);
+    var rounds: usize = 0;
+    while (rounds < 16) : (rounds += 1) {
+        try deliverAll(allocator, &parties, hide);
+        var live: usize = 0;
+        for (&parties, &errs) |*p, *e| {
+            if (p.phase() == .done or p.phase() == .aborted) continue;
+            live += 1;
+            p.advance() catch |err| {
+                e.* = err;
+            };
+        }
+        if (live == 0) break;
+    }
+    var mismatches: usize = 0;
+    for (&parties, errs) |*p, e| {
+        // Nobody finished: whoever saw the split stopped, and its peers then
+        // missed its confirmation (or saw a different one).
+        try testing.expect(p.phase() != .done);
+        try testing.expect(p.takeKeyShare() == null);
+        if (e) |err| {
+            if (err == error.ConfirmationMismatch) mismatches += 1;
+        }
+    }
+    try testing.expect(mismatches >= 1);
 }

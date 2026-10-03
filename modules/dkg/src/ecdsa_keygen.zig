@@ -21,7 +21,12 @@
 //!
 //! Every proof is bound to `session_id || u32-BE t || u32-BE n || u32-BE
 //! prover index`, so the caller must give each run a session id no other run
-//! uses.
+//! uses. Every frame — the GJKR ones included — starts with a 16-byte run
+//! tag (`runTag`: protocol, session id, `t`, `n`); a frame whose tag is not
+//! this run's is refused with `WrongSession`, so the frames of an aborted run
+//! cannot be replayed into the retry, nor keygen frames into a refresh
+//! (review 2026-10-03 F7: the Feldman, complaint and defense frames carried
+//! no session binding of their own). Hand `handle` the frame as sent.
 //!
 //! **Early frames.** A frame for a later round (a fast peer's Πfac while we
 //! are still in `.announce`, its first GJKR frame while we are in
@@ -91,6 +96,7 @@ pub const EcdsaKeygen = struct {
     outbox: std.ArrayList(Outgoing) = .empty,
     share: ?tecdsa.KeyShare = null,
     culprit_: ?u32 = null,
+    tag: RunTag,
 
     /// Party `index` (1-based) of a `cfg` run. `session_id` is copied;
     /// `local` is borrowed; `random` (a CSPRNG) feeds the GJKR polynomials
@@ -123,6 +129,7 @@ pub const EcdsaKeygen = struct {
             .inner = inner,
             .announcements = anns,
             .fac = fac,
+            .tag = runTag(.keygen, session_id, cfg),
         };
     }
 
@@ -186,19 +193,20 @@ pub const EcdsaKeygen = struct {
         const ann = try self.local.announce(self.allocator, self.context(&ctx_buf, self.me), self.random);
         const bytes = try ann.toBytesAlloc(self.allocator);
         defer self.allocator.free(bytes);
-        try wire.pushFrame(&self.outbox, self.allocator, .broadcast, .ecdsa_announcement, bytes);
+        try pushTagged(&self.outbox, self.allocator, self.tag, .broadcast, .ecdsa_announcement, bytes);
         self.announcements[self.me - 1] = ann;
         self.phase_ = .announce;
     }
 
     /// Feed one frame from the authenticated peer `from`. A refused frame
     /// changes nothing.
-    pub fn handle(self: *EcdsaKeygen, from: u32, bytes: []const u8) MessageError!void {
+    pub fn handle(self: *EcdsaKeygen, from: u32, tagged: []const u8) MessageError!void {
         switch (self.phase_) {
             .done => return error.Finished,
             .aborted => return error.Aborted,
             else => {},
         }
+        const bytes = try untag(self.tag, tagged);
         if (bytes.len == 0) return error.Malformed;
         const kind = wire.kindFromByte(bytes[0]) orelse return error.UnknownKind;
         if (from < 1 or from > self.cfg.n or from == self.me) return error.UnknownSender;
@@ -274,7 +282,7 @@ pub const EcdsaKeygen = struct {
             const proof = try self.local.proveFactors(a.?.aux, own_ctx, self.random);
             const bytes = try proof.toBytesAlloc(self.allocator);
             defer self.allocator.free(bytes);
-            try wire.pushFrame(&self.outbox, self.allocator, .{ .party = @intCast(j) }, .ecdsa_fac_proof, bytes);
+            try pushTagged(&self.outbox, self.allocator, self.tag, .{ .party = @intCast(j) }, .ecdsa_fac_proof, bytes);
         }
         self.phase_ = .factors;
     }
@@ -346,9 +354,64 @@ pub const EcdsaKeygen = struct {
         defer self.allocator.free(msgs);
         var moved: usize = 0;
         errdefer for (msgs[moved..]) |m| m.deinit(self.allocator);
-        while (moved < msgs.len) : (moved += 1) try self.outbox.append(self.allocator, msgs[moved]);
+        while (moved < msgs.len) : (moved += 1) try appendTagged(&self.outbox, self.allocator, self.tag, msgs[moved]);
     }
 };
+
+// ── run tag (review 2026-10-03 F7) ───────────────────────────────────────
+
+pub const run_tag_len = 16;
+pub const RunTag = [run_tag_len]u8;
+
+/// Which wrapper a run tag belongs to, so a keygen frame never passes as a
+/// refresh frame under the same session id.
+pub const Protocol = enum(u8) { keygen = 1, refresh = 2 };
+
+/// `SHA-256(domain || protocol || u32-BE len || session id || u32-BE t ||
+/// u32-BE n)[0..16]`: the prefix of every frame of one run.
+pub fn runTag(protocol: Protocol, session_id: []const u8, cfg: types.Config) RunTag {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("dkg/ecdsa/run-tag/v1");
+    h.update(&.{@intFromEnum(protocol)});
+    var u: [4]u8 = undefined;
+    std.mem.writeInt(u32, &u, @intCast(session_id.len), .big);
+    h.update(&u);
+    h.update(session_id);
+    std.mem.writeInt(u32, &u, cfg.t, .big);
+    h.update(&u);
+    std.mem.writeInt(u32, &u, cfg.n, .big);
+    h.update(&u);
+    const d = h.finalResult();
+    return d[0..run_tag_len].*;
+}
+
+/// The frame behind the run tag, or `WrongSession` / `Malformed`.
+pub fn untag(tag: RunTag, tagged: []const u8) wire.MessageError![]const u8 {
+    if (tagged.len < run_tag_len) return error.Malformed;
+    if (!std.mem.eql(u8, tagged[0..run_tag_len], &tag)) return error.WrongSession;
+    return tagged[run_tag_len..];
+}
+
+/// `tag || kind || body` onto `list`.
+pub fn pushTagged(list: *std.ArrayList(Outgoing), allocator: std.mem.Allocator, tag: RunTag, to: wire.Target, kind: wire.Kind, body: []const u8) std.mem.Allocator.Error!void {
+    const bytes = try allocator.alloc(u8, run_tag_len + 1 + body.len);
+    errdefer {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    }
+    bytes[0..run_tag_len].* = tag;
+    bytes[run_tag_len] = @intFromEnum(kind);
+    @memcpy(bytes[run_tag_len + 1 ..], body);
+    try list.append(allocator, .{ .to = to, .bytes = bytes });
+}
+
+/// An inner machine's frame, tagged, onto `list`. Takes `m` on success (its
+/// bytes are wiped and freed); on error `m` stays the caller's.
+pub fn appendTagged(list: *std.ArrayList(Outgoing), allocator: std.mem.Allocator, tag: RunTag, m: Outgoing) std.mem.Allocator.Error!void {
+    const kind = wire.kindFromByte(m.bytes[0]).?; // an inner machine's own frame
+    try pushTagged(list, allocator, tag, m.to, kind, m.bytes[1..]);
+    m.deinit(allocator);
+}
 
 // ── tests ────────────────────────────────────────────────────────────────
 
@@ -475,7 +538,7 @@ test "dealer-free keygen: a tampered Πfac aborts the receiver and names the pro
     // the one to party 1 is lost.
     try rig.deliver(allocator, struct {
         fn f(from: u32, to: u32, bytes: []u8) bool {
-            if (from != 2 or bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
+            if (from != 2 or bytes[run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) return true;
             if (to == 1) return false;
             bytes[bytes.len - 1] ^= 1;
             return true;
@@ -513,7 +576,7 @@ test "dealer-free keygen: a second Πfac frame from one prover is refused (mutat
     const msgs = try parties[0].takeOutgoing();
     defer wire.freeOutgoing(allocator, msgs);
     for (msgs) |m| {
-        if (m.bytes[0] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) continue;
+        if (m.bytes[run_tag_len] != @intFromEnum(wire.Kind.ecdsa_fac_proof)) continue;
         switch (m.to) {
             .party => |p| if (p != 2) continue,
             .broadcast => continue,

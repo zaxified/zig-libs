@@ -223,7 +223,17 @@ The proofs live in `threshold_ecdsa` (`aux_proofs.Pimod.provePaillier`,
 bound to `session id || u32-BE prover index`. The aux rounds need all `n`
 parties: a missing or failing announcement or Πfac aborts with `culprit()`
 naming the party; a duplicate modulus aborts without one (who copied whom is
-not visible in the bytes). The GJKR rounds keep their own rules. Why the
+not visible in the bytes). The GJKR rounds keep their own rules. Every
+frame, the inner GJKR ones included, starts with a 16-byte run tag
+(`runTag`: protocol keygen/refresh, session id, `t`, `n`); a frame with
+another tag is `WrongSession` (review 2026-10-03 F7 — before, the Feldman,
+complaint and defense frames were bound to a run by the transport alone, so
+an aborted run's frames could be replayed into the retry). `EcdsaRefresh`
+ends with a key-confirmation round (`ecdsa_confirm`, F6): every party
+broadcasts `SHA-256` over its new share's public part (group key, `t`, `n`,
+the whole public-key table) and reaches `.done` — and hands out the share —
+only when every digest equals its own; the old share is erased only after
+that. Why the
 proofs matter: without Πmod/Πfac a party that picks its own Paillier key can
 give it small factors and read an honest peer's share off the MtA responses
 (the BitForge class) — under `assembleKeyShares` the caller had to trust
@@ -368,21 +378,21 @@ here.
 
 - ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
 - ~~**Role-tagged sender for `ReshareReceiver`**~~ (review 2026-10-01, F7) ✅ 2026-10-02: `handle(from: ReshareSender, …)` — `.dealer`/`.receiver`; a frame whose kind does not match the role is `UnknownSender`, so new party `j` can no longer pass a broadcast off as old dealer `j` (tested both ways).
-- **Key confirmation after `EcdsaRefresh`** (review 2026-10-03 F6): agreement on the new
-  public-key table, the Feldman commitments and the dealer set rests on the transport's reliable
-  broadcast; only `Q` is compared. A transport that equivocates on one announcement leaves honest
-  parties with different "new" states, and the caller may already have erased the old share. Add a
-  confirmation round (broadcast `SHA-256(public_keys || commitments || dealers)`; erase the old
-  share only when every digest matches). Since F9 a split table at least fails at the first
-  presigning header instead of blaming a peer. Effort: small–medium.
-- **Session id in the Feldman/complaint/defense frames** (review 2026-10-03 F7): only the aux
-  proofs carry the session id; dealing frames are bound to a run by the transport alone. Frames of
-  an aborted run of the same epoch replay into the retry (no leak while one fresh honest dealer
-  takes part, but the refresh's freshness is lost). Bind the run id into every frame. Effort:
-  medium (wire change).
+- ~~**Key confirmation after `EcdsaRefresh`**~~ (review 2026-10-03 F6) ✅ 2026-10-04: round
+  `confirm` (`ecdsa_confirm`, digest of the new share's public part); `.done` and `takeKeyShare`
+  only after every digest matches (`ConfirmationMismatch` names the first differing peer). Tested
+  with a transport that hides one dealer from one party: nobody finishes, nobody hands out a share.
+  Left: a party whose last confirmations are lost aborts while the others finish (it keeps the
+  old share; rerun to bring it in) — inherent to any final round.
+- ~~**Session id in the Feldman/complaint/defense frames**~~ (review 2026-10-03 F7) ✅
+  2026-10-04, in the ECDSA wrappers: every `EcdsaKeygen`/`EcdsaRefresh` frame starts with the run
+  tag (protocol, session id, `t`, `n`), checked before anything else (`WrongSession`). The bare
+  `Participant` and `Reshare*` machines still leave run binding to the transport (documented in
+  `wire.zig`); a caller using them directly must keep runs apart itself.
 - **Refresh with the old aux material** (review 2026-10-03 F14): `EcdsaRefresh` does not refuse a
-  `LocalAux` whose `N`/`Ñ`/message key equals the old one, and keygen and refresh announcements
-  share one context format (no protocol tag). Effort: small.
+  `LocalAux` whose `N`/`Ñ`/message key equals the old one. ~~Keygen and refresh frames share one
+  format~~ — the run tag's protocol byte now keeps a keygen frame out of a refresh (F7); the
+  announcement's proof context is still the same format. Effort: small.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).

@@ -7,7 +7,10 @@
 //!
 //! The state machines are sans-I/O: they consume `(sender, bytes)` and produce
 //! `Outgoing` frames; carrying those frames (and authenticating who sent them,
-//! and encrypting the point-to-point ones) is the caller's transport.
+//! and encrypting the point-to-point ones) is the caller's transport. The bare
+//! `Participant` and `Reshare*` frames carry no session binding: keeping runs
+//! apart is the transport's duty there. `EcdsaKeygen` and `EcdsaRefresh` put a
+//! run tag in front of every frame and check it (`ecdsa_keygen.runTag`).
 
 const std = @import("std");
 
@@ -40,6 +43,9 @@ pub const Kind = enum(u8) {
     /// Πfac for one peer (`threshold_ecdsa.fac_proof.FacProof`).
     /// Point-to-point.
     ecdsa_fac_proof = 33,
+    /// `EcdsaRefresh` key confirmation: SHA-256 over the public part of the
+    /// party's new `KeyShare` (review 2026-10-03 F6). Broadcast.
+    ecdsa_confirm = 34,
 };
 
 pub fn kindFromByte(b: u8) ?Kind {
@@ -98,6 +104,10 @@ pub const MessageError = error{
     WrongRound,
     /// This sender already delivered this message.
     DuplicateMessage,
+    /// The frame's run tag is not this run's (`EcdsaKeygen`, `EcdsaRefresh`):
+    /// a frame of another session or of the other protocol, replayed or
+    /// misrouted (review 2026-10-03 F7).
+    WrongSession,
     /// Well-formed but refers to something that does not exist: a defense
     /// nobody complained about, a Feldman broadcast from a disqualified dealer.
     Unsolicited,

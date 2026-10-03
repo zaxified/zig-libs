@@ -447,7 +447,7 @@ pub const ReshareReceiver = struct {
                 const sid = from.asDealer() orelse return error.UnknownSender;
                 return self.onDefense(self.dealerPos(sid) orelse return error.UnknownSender, sid, body);
             },
-            .pedersen_broadcast, .share, .complaint, .defense, .feldman_broadcast, .feldman_complaint, .reveal, .ecdsa_announcement, .ecdsa_fac_proof => return error.UnknownKind,
+            .pedersen_broadcast, .share, .complaint, .defense, .feldman_broadcast, .feldman_complaint, .reveal, .ecdsa_announcement, .ecdsa_fac_proof, .ecdsa_confirm => return error.UnknownKind,
         }
     }
 

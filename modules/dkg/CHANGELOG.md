@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **BREAKING (wire): run tag and key confirmation** (review 2026-10-03 F6,
+  F7). Every `EcdsaKeygen`/`EcdsaRefresh` frame — the inner GJKR and reshare frames included —
+  starts with a 16-byte run tag (`ecdsa_keygen.runTag`: protocol, session id, `t`, `n`); a frame
+  of another run or of the other protocol is refused with the new `WrongSession`. `EcdsaRefresh`
+  gains a final round `confirm` (new frame kind `ecdsa_confirm`): `.done` and `takeKeyShare` only
+  after every party confirmed the same new key table (`ConfirmationMismatch` otherwise). Erase
+  the old share only after `.done`.
 - **2026-10-03** — Mutation audit of `EcdsaKeygen`/`EcdsaRefresh` (with `threshold_ecdsa`'s):
   tests only — refresh refusals, keygen frame checks, a duplicate Πfac frame.
 - **2026-10-03** — **New: `EcdsaRefresh`**, proactive refresh of a `threshold_ecdsa` key as a
