@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **`montint.nt` (constant-time gcd, lcm, odd part, exact
+  division on limb arrays) and `DynModint.isProbablePrime`.** `nt.gcd`/`lcm`
+  run divsteps on the odd parts and shift the powers of two back in;
+  `nt.divExact` divides by any exact divisor, even ones included;
+  `isProbablePrime(random, rounds)` is Miller-Rabin constant-time in the
+  modulus's value along a prime's path (masked `m − 1 = d·2^s`, montint
+  ladder, verdicts OR-ed per round). `DynModint.inverse`'s masked-limb helpers
+  moved into `nt.zig` (shared, no behaviour change). Used by `rsa`'s and
+  `paillier`'s key derivation and by all three prime searches.
+
 - **2026-10-03** — **Constant-time modular inversion: `DynModint.inverse` and
   `inverseOfModulus`.** `inverse(a, out) bool` is `a⁻¹ mod m` by
   Bernstein–Yang divsteps (masked blends, the paper's step bound from the

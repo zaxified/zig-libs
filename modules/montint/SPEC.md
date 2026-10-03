@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/crypto-bigint](https://github.com/RustCrypto/crypto-bigint) 0.7.5 | Rust | Apache-2.0 OR MIT (`Cargo.toml`) | 310 | push 2026-09-28 | Constant-time by default, variable-time functions suffixed `_vartime` (its README); `modular/` has Montgomery forms (const, fixed and boxed/run-time-sized), `safegcd.rs` inversion, `sqrt.rs`, `lincomb.rs` and `pow.rs` (file listing of `src/modular`). NCC-audited (its README). |
 | [openssl/openssl](https://github.com/openssl/openssl) `BN_mod_exp_mont_consttime` | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | The speed yardstick: module's table has this module at 1.3–1.5× OpenSSL modmul and 1.8× modexp at 2048/4096 bits, faster at 256 bits (module's own measurements, not re-run). Also inversion, sqrt, primality, gcd. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** square roots, a batched (62-step matrix) inversion, element `compare`, and aarch64 gets only the portable path (→ Backlog). (Closed 2026-10-02 by `DynModint`: a variable-time public-exponent power, `reduce` of a wider value, element `eql`/`isZero`, run-time-sized moduli; 2026-10-03: constant-time inversion, `DynModint.inverse`/`inverseOfModulus`.)
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** square roots, a batched (62-step matrix) inversion, a Baillie-PSW/Lucas primality test (Miller-Rabin only), element `compare`, and aarch64 gets only the portable path (→ Backlog). (Closed 2026-10-02 by `DynModint`: a variable-time public-exponent power, `reduce` of a wider value, element `eql`/`isZero`, run-time-sized moduli; 2026-10-03: constant-time inversion, `DynModint.inverse`/`inverseOfModulus`.)
 
 ## What this module is
 
@@ -110,6 +110,32 @@ slack: one step fewer (Theorem 11.2's bound is not tight; the exhaustive
 `g ≡ e·a` hold for any swap schedule — only the speed of convergence changes),
 and dropping the `g = 0` half of the verdict (redundant once the bound holds;
 it is the fail-closed guard for a bound that would not).
+
+**`nt` and primality (2026-10-03).** `montint.nt` holds constant-time number
+theory on plain limb arrays — the key-setup arithmetic no odd modulus carries:
+`oddPart` (`x = u·2^t` by masked one-bit shifts over every position), `gcd`
+and `lcm` (odd parts, divsteps on them with `f` odd, the common power of two
+shifted back in; `lcm = (odd(a)/g)·odd(b)·2^max(t_a, t_b)`, the division a
+Hensel one), `divExact` (any divisor, even included: its power of two shifted
+out of the dividend, then Hensel by the odd part), and the shared masked-limb
+helpers `DynModint.inverse` uses. `DynModint.isProbablePrime(random, rounds)`
+is Miller-Rabin constant-time in the modulus's value along a prime's path:
+`m − 1 = d·2^s` by `nt.oddPart`, the ladder `pow` modulo the secret `m`,
+witnesses below `2^(bits−1)` (no compare against `m`), a round's verdicts
+(`x = 1`, `x = −1` at any of the `s` squarings) OR-ed before the one branch.
+Observable by design: `s` (the squaring count) and everything about a
+rejected candidate. `rsa`, `paillier` and `threshold_ecdsa` run their prime
+searches and key derivations on these (their ctgrind `keygen`/`prime`/`pimod`/
+`piprm` rows: no context in `nt.zig` or in the inversion/ladder code).
+Evidence: `gcd`/`lcm`/`oddPart` exhaustive over every pair below 600 and
+differential against `std.math.big.int` at 64…4096 bits with shared powers of
+two and odd factors; `divExact` for odd and even divisors at 1…64 limbs;
+`isProbablePrime` on every odd `m < 3000`, eight Carmichael numbers including
+a 180-bit Chernick one with ~60-bit factors, RFC 3526's 2048-bit safe prime,
+its Sophie Germain half and two composites near it. Mutation 2026-10-03
+(schemata, 20 mutants): 20 killed — one only after the Chernick number was
+added (a Fermat-test mutant passed the small Carmichael numbers, whose
+witnesses hit a factor).
 
 ## Why it exists (std-gap, not a dup)
 

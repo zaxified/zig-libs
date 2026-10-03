@@ -62,6 +62,10 @@ pub const Field = @import("field.zig").Field;
 /// `Field`, for RSA/Paillier secrets (see `dyn.zig`).
 pub const DynModint = @import("dyn.zig").DynModint;
 
+/// Constant-time `gcd`/`lcm`/odd part on plain limb arrays — the key-setup
+/// arithmetic no odd modulus carries (`λ = lcm(p − 1, q − 1)`), see `nt.zig`.
+pub const nt = @import("nt.zig");
+
 pub const gate = @import("gate.zig");
 pub const asm_core = @import("asm_core.zig");
 pub const limbs = @import("limbs.zig");
@@ -76,6 +80,7 @@ test {
     _ = kat_vectors;
     _ = @import("field.zig");
     _ = @import("dyn.zig");
+    _ = @import("nt.zig");
     _ = @import("kat_test.zig");
     _ = @import("bench.zig");
 }

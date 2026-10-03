@@ -483,19 +483,6 @@ fn bigFromFe(gpa: std.mem.Allocator, fe: root.AuxFe) std.mem.Allocator.Error!Big
     return bigFromBytes(gpa, stripLeadingZeros(&buf));
 }
 
-/// Non-negative big integer `x < m` -> canonical `AuxFe`. Fail-closed: an
-/// out-of-range value (only reachable through a corrupt/mismatched
-/// trapdoor) maps to zero — a garbage proof value a correct verifier
-/// rejects, never a panic.
-fn feFromBig(m: root.AuxModulus, x: *const BigInt) root.AuxFe {
-    if (x.bitCountAbs() > root.aux_modulus_bits or !x.isPositive() and !x.eqlZero()) return m.zero;
-    var buf: [root.aux_modulus_bytes]u8 = undefined;
-    x.toConst().writeTwosComplement(&buf, .big);
-    const stripped = stripLeadingZeros(&buf);
-    if (stripped.len == 0) return m.zero;
-    return root.AuxFe.fromBytes(m, stripped, .big) catch m.zero;
-}
-
 /// Byte-exact `AuxFe` equality — copy of `zkproofs.zig`'s identically-named
 /// private helper (comparing via canonical serialization sidesteps ff's
 /// internal Montgomery-form flag, which raw `eql` on mixed-provenance
@@ -804,65 +791,63 @@ pub const Piprm = struct {
         random: std.Random,
     ) ProveError!PrmProof {
         const nt = aux.n_tilde;
+        _ = allocator; // kept in the signature; nothing here allocates since 2026-10-03
 
-        // phi(n_tilde) = (p̃-1)(q̃-1) from the trapdoor. Degenerate factors
-        // (< 2, or wider than the modulus type) are substituted fail-closed
-        // — the resulting proof is garbage a correct verifier rejects; an
-        // aux/trapdoor mismatch is a caller bug per this function's
-        // contract, never a soundness question.
-        var p = try bigFromBytes(allocator, stripLeadingZeros(trapdoor.p));
-        defer p.deinit();
-        var q = try bigFromBytes(allocator, stripLeadingZeros(trapdoor.q));
-        defer q.deinit();
-        if (p.toConst().orderAgainstScalar(2) == .lt or p.bitCountAbs() > root.aux_modulus_bits) try p.set(3);
-        if (q.toConst().orderAgainstScalar(2) == .lt or q.bitCountAbs() > root.aux_modulus_bits) try q.set(3);
-
-        var phi = try newBig(allocator);
-        defer phi.deinit();
+        // φ(n_tilde) = (p̃−1)(q̃−1) from the trapdoor, on montint limbs: the
+        // primes are SECRET and nothing below branches on them (until
+        // 2026-10-03 this was std.math.big.int — `divFloor` on φ and λ,
+        // a byte compare in the rejection loop). Degenerate factors are
+        // substituted fail-closed by `BlumCt.init` — the resulting proof is
+        // garbage a correct verifier rejects; an aux/trapdoor mismatch is a
+        // caller bug per this function's contract.
+        var pb = BlumCt.init(trapdoor.p, nt);
+        defer pb.wipe();
+        var qb = BlumCt.init(trapdoor.q, nt);
+        defer qb.wipe();
+        const ntc = Ct.fromFf(nt) catch unreachable; // odd, ≥ 3
+        var phi: Ct.Elem = undefined;
+        defer std.crypto.secureZero(u64, &phi);
         {
-            var p1 = try newBig(allocator);
-            defer p1.deinit();
-            var q1 = try newBig(allocator);
-            defer q1.deinit();
-            try p1.addScalar(&p, -1);
-            try q1.addScalar(&q, -1);
-            try phi.mul(&p1, &q1);
+            var p1 = pb.m.m;
+            p1[0] &= ~@as(u64, 1);
+            defer std.crypto.secureZero(u64, &p1);
+            var q1 = qb.m.m;
+            q1[0] &= ~@as(u64, 1);
+            defer std.crypto.secureZero(u64, &q1);
+            var prod: [2 * Ct.max_limbs]u64 = undefined;
+            defer std.crypto.secureZero(u64, &prod);
+            montint.limbs.mulSchoolbook(&prod, &p1, &q1);
+            phi = prod[0..Ct.max_limbs].*;
         }
-        if (phi.toConst().orderAgainstScalar(1) != .gt or phi.bitCountAbs() > root.aux_modulus_bits) try phi.set(4);
+        // λ < ord(h1) < φ (generateAuxParams); moved off ff positionally.
+        var lam = Ct.elemFromFf(&trapdoor.lambda.v);
+        defer std.crypto.secureZero(u64, &lam);
 
-        // phi is SECRET (equivalent to n_tilde's factorization) — its byte
-        // image below is zeroed on return; its bit LENGTH is public (an
-        // honest phi has n_tilde's size).
-        const phi_bits = phi.bitCountAbs();
-        const phi_len = byteLen(phi_bits);
-        var phi_buf: [root.aux_modulus_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &phi_buf);
-        phi.toConst().writeTwosComplement(&phi_buf, .big);
-        const phi_bytes = phi_buf[root.aux_modulus_bytes - phi_len ..];
-
-        var lam_big = blk: {
-            var lam_buf: [root.aux_modulus_bytes]u8 = undefined;
-            defer std.crypto.secureZero(u8, &lam_buf);
-            trapdoor.lambda.toBytes(&lam_buf, .big) catch unreachable; // fixed-width buffer always sufficient
-            break :blk try bigFromBytes(allocator, stripLeadingZeros(&lam_buf));
-        };
-        defer lam_big.deinit();
-
-        // 1. Per-round nonce a_i <- Z_phi (uniform via rejection sampling
-        //    against phi's byte image) and commitment A_i = s^{a_i}
-        //    (constant-time modexp — a_i masks lambda).
-        var a_bufs: [pi_prm_iterations][root.aux_modulus_bytes]u8 = undefined;
-        defer for (&a_bufs) |*ab| std.crypto.secureZero(u8, ab);
+        // 1. Per-round nonce a_i <- Z_φ, uniform: draws below 2^bits(n_tilde)
+        //    (public; φ has n_tilde's length up to one bit, so a draw is kept
+        //    with probability ≥ 1/2), kept when the borrow of a_i − φ says
+        //    a_i < φ — the accept verdict is the only branch, its count
+        //    depends on φ/2^bits only. Commitment A_i = s^{a_i}
+        //    (constant-time modexp — a_i masks λ).
+        const n_bits = nt.bits();
+        const n_len = byteLen(n_bits);
+        var a_elems: [pi_prm_iterations]Ct.Elem = undefined;
+        defer for (&a_elems) |*ae| std.crypto.secureZero(u64, ae);
+        var a_buf: [root.aux_modulus_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &a_buf);
         var commitments: [pi_prm_iterations]root.AuxFe = undefined;
-        const top_mask: u8 = @as(u8, 0xff) >> @intCast(8 * phi_len - phi_bits);
-        for (&a_bufs, &commitments) |*ab, *commit| {
-            @memset(ab, 0);
+        const top_mask: u8 = @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        for (&a_elems, &commitments) |*ae, *commit| {
             while (true) {
-                random.bytes(ab[0..phi_len]);
-                ab[0] &= top_mask;
-                if (intCompare(ab[0..phi_len], phi_bytes) == .lt) break;
+                random.bytes(a_buf[0..n_len]);
+                a_buf[0] &= top_mask;
+                ae.* = Ct.loadBE(a_buf[0..n_len]) catch unreachable; // ≤ aux_modulus_bytes
+                var t = ae.*;
+                defer std.crypto.secureZero(u64, &t);
+                if (montint.limbs.subInto(&t, &phi) == 1) break; // a_i < φ
             }
-            commit.* = zkproofs.powSecret(nt, aux.h1, ab[0..phi_len]); // a_i = 0 -> s^0 = 1; ff's pow branches on secret windows
+            ntc.toBytesBE(ae, a_buf[0..n_len]);
+            commit.* = zkproofs.powSecret(nt, aux.h1, a_buf[0..n_len]); // a_i = 0 -> s^0 = 1; ff's pow branches on secret windows
         }
 
         // 2. Fiat-Shamir bit-challenge — the REAL scaffold machinery above.
@@ -870,25 +855,23 @@ pub const Piprm = struct {
         var e_bits: [pi_prm_iterations]bool = undefined;
         derivePrmChallengeBits(seed, &e_bits);
 
-        // 3. Responses z_i = a_i + e_i*lambda mod phi (z_i < phi < n_tilde,
-        //    so the canonical-mod-n_tilde re-encoding is always valid).
+        // 3. Responses z_i = a_i + e_i·λ mod φ: a_i, λ < φ, so the sum is
+        //    below 2φ and one masked subtraction of φ reduces it (the carry
+        //    out of the top limb counts as "≥ φ"). e_i is public (the
+        //    challenge), so its `if` is not a leak. z_i < φ < n_tilde, so
+        //    the positional move into an n_tilde element is canonical.
         var entries: [pi_prm_iterations]PrmEntry = undefined;
-        var z = try newBig(allocator);
-        defer z.deinit();
-        var sum = try newBig(allocator);
-        defer sum.deinit();
-        var quot = try newBig(allocator);
-        defer quot.deinit();
-        for (&entries, &a_bufs, &commitments, e_bits) |*slot, *ab, commit, e_i| {
-            var av = try bigFromBytes(allocator, stripLeadingZeros(ab[0..phi_len]));
-            defer av.deinit();
+        for (&entries, &a_elems, &commitments, e_bits) |*slot, *ae, commit, e_i| {
+            var z = ae.*;
+            defer std.crypto.secureZero(u64, &z);
             if (e_i) {
-                try sum.add(&av, &lam_big);
-                try quot.divFloor(&z, &sum, &phi);
-            } else {
-                try z.copy(av.toConst());
+                const carry = montint.limbs.addInto(&z, &lam);
+                var t = z;
+                defer std.crypto.secureZero(u64, &t);
+                const borrow = montint.limbs.subInto(&t, &phi);
+                z = Ct.select((carry | (borrow ^ 1)) == 1, &t, &z); // z ≥ φ → z − φ
             }
-            slot.* = .{ .a_commit = commit, .z = feFromBig(nt, &z) };
+            slot.* = .{ .a_commit = commit, .z = Ct.elemToFf(root.AuxFe, nt, &z) };
         }
         return .{ .entries = entries };
     }

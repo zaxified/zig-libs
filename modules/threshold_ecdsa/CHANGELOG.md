@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Πprm's prover is constant-time in `p̃`, `q̃`, `λ`;
+  Miller-Rabin lives in `montint`.** `φ` is a limb product, the responses
+  `a_i + e_i·λ mod φ` one masked subtraction and the nonce draw's `a_i < φ`
+  a borrow (was big-int `divFloor` and a byte compare); new ctgrind target
+  `piprm` (3). `isProbablePrime` is now a wrapper over
+  `montint.DynModint.isProbablePrime`, the recipe this module introduced
+  (`prime` 4 → 3). Proofs and their wire format unchanged.
+
 - **2026-10-03** — **Πmod's exponent `d = Ñ⁻¹ mod φ` is constant-time.**
   `φ = (p−1)(q−1)` is a limb product of the secret primes (`p − 1` = `p` with
   bit 0 cleared) and `d` comes from `montint`'s `inverseOfModulus` (an even

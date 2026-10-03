@@ -592,9 +592,13 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   verdicts on public-by-construction bits). Πmod's `d = Ñ⁻¹ mod φ` followed
   the same day: φ as a limb product of the secret primes and `d` from
   `montint`'s `inverseOfModulus` (constant-time, even modulus) — `pimod` 540 →
-  4, the rest length verdicts and the published `a_i`/`b_i`. Still
-  variable-time: Πprm's responses `z_i = a_i + e_i·λ mod φ` and its `φ`
-  (big-int, → Backlog), and the prime searches' trial-division sieve.
+  4, the rest length verdicts and the published `a_i`/`b_i`. Πprm followed too:
+  `φ` a limb product, `z_i = a_i + e_i·λ mod φ` one masked subtraction, the
+  nonce draw's `a_i < φ` a borrow (ctgrind `piprm`: 3 — two length verdicts and
+  that accept verdict). Miller-Rabin moved into `montint`
+  (`DynModint.isProbablePrime`, shared with `rsa` and `paillier`; `prime` 4 →
+  3). Still variable-time: the prime searches' trial-division sieve, and
+  `generateAuxParams`' big-int `λ` sampling (keygen-time, → Backlog).
 - **Products and moves of secrets are off `std.crypto.ff` too** (2026-10-02):
   `ff`'s `mul` branches on the Montgomery extra-reduction bit and its
   `fromBytes`/`toBytes` on the value (ctgrind). The provers' ring-Pedersen
@@ -1098,7 +1102,8 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 - ~~Per-participant signing state machine~~ — **done 2026-10-02** (`presign.zig`). ~~Pre-signing / 1-round online signing~~ — **done 2026-10-02** (GG20 §3, not CGGMP21). ~~Identifiable abort~~ — **done 2026-10-02** except types 5/7 (item above).
 - ~~**Dealer-free keygen wired in**~~ — done 2026-10-02: `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`. Original note (survey 2026-09-30): the trusted dealer sees `x`. Sibling `dkg` (GJKR) exists but is a lockstep simulation and does not exchange Paillier / aux proofs; finishing both together is the real fix. It must come with **Πmod + Πfac for every party's Paillier `N`** (CGGMP21 Fig. 16/28): once parties generate their own Paillier keys, an unproven `N` with small factors lets its owner extract an honest Bob's `w_j` through the MtA responses — the BitForge class (Fireblocks, 2023). Today the dealer generates every Paillier key, so the precondition does not arise. Effort: large. Fits §2.
 - ~~**Constant-time Πmod prover and prime search**~~ (2026-10-02): ✅ 2026-10-03 — rounds and Miller-Rabin on `montint.DynModint` modulo the secret factor, then `d = Ñ⁻¹ mod φ` through `montint`'s constant-time `inverseOfModulus` (ctgrind `pimod` 540 → 4, `prime` 4). Left: the prime search's trial-division sieve (`bytesMod`).
-- **Constant-time Πprm prover** (2026-10-03): `Piprm.proveCtx` still builds `φ` and the responses `z_i = a_i + e_i·λ mod φ` in `std.math.big.int` (`divFloor` on secrets) and rejection-samples `a_i` with a variable-time compare. Fix: `φ` as a limb product (as Πmod), `z_i` by add + one masked conditional subtract (`a_i, λ < φ`), a borrow-based compare; ctgrind target `piprm`. Effort S.
+- ~~**Constant-time Πprm prover**~~ (2026-10-03): ✅ same day — `φ` as a limb product, `z_i` by add + one masked subtraction, a borrow-based accept for `a_i < φ`; ctgrind target `piprm` (3, all verdicts).
+- **`generateAuxParams` off big-int** (2026-10-03): the ring-Pedersen setup still samples `λ ← [1, ord)` with a big-int compare against the secret `ord = p′q′` and builds it with `std.math.big.int` (keygen-time, one trace per aux key). Fix: `ord` as a limb product, the compare a borrow (as Πprm's nonce). Effort S.
 - **Presignature serialisation** (2026-10-02): a codec for `Presignature` so a presigning pool survives a restart. Deliberately absent: a stored presignature can be restored twice, and two messages under one `R` reveal the key; it needs a consume-once store design, not just bytes. Effort: small for the codec, the store is the caller's.
 - **Naming an equivocator** (2026-10-02): the echoed transcript detects a signer who shows different broadcasts to different peers, but cannot say who; with signed messages, the two conflicting copies are the proof. Needs a signature scheme over messages (the transport's today). Effort: small once messages are signed.
 - **Key refresh / resharing** (survey 2026-09-30): tss-lib resharing, cggmp21 refresh. Effort: large. Fits §2.

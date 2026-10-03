@@ -405,6 +405,57 @@ fn runPimod(allocator: std.mem.Allocator, tainted: bool) !void {
     std.debug.print("x0={x}\n", .{xb});
 }
 
+// ── target "piprm": taint the ring-Pedersen trapdoor through Πprm's prover ─
+//
+// `aux_proofs.Piprm.proveBound` over tss-lib's 2048-bit Ñ, `p̃`, `q̃` and
+// `λ` (log_h1 h2) tainted. Since 2026-10-03 φ is a limb product and the
+// responses `a_i + e_i·λ mod φ` one masked subtraction; what branches is the
+// nonce draw's accept verdict (`a_i < φ`).
+fn runPiprm(allocator: std.mem.Allocator, tainted: bool) !void {
+    const vectors = @import("tsslib_vectors.zig");
+    const pp = vectors.tsslib_keygen.parties[0];
+    var nt_b: [256]u8 = undefined;
+    var h1_b: [256]u8 = undefined;
+    var h2_b: [256]u8 = undefined;
+    var lam_b: [256]u8 = undefined;
+    var p: [128]u8 = undefined;
+    var q: [128]u8 = undefined;
+    const nt_s = try std.fmt.hexToBytes(&nt_b, pp.n_tilde);
+    const h1_s = try std.fmt.hexToBytes(&h1_b, pp.h1);
+    const h2_s = try std.fmt.hexToBytes(&h2_b, pp.h2);
+    const lam_s = try std.fmt.hexToBytes(&lam_b, pp.aux_lambda);
+    _ = try std.fmt.hexToBytes(&p, pp.aux_p_safe);
+    _ = try std.fmt.hexToBytes(&q, pp.aux_q_safe);
+    const nt = try root.AuxModulus.fromBytes(nt_s, .big);
+    const aux: root.AuxParams = .{
+        .n_tilde = nt,
+        .h1 = try root.AuxFe.fromBytes(nt, h1_s, .big),
+        .h2 = try root.AuxFe.fromBytes(nt, h2_s, .big),
+    };
+    var trapdoor: root.AuxTrapdoor = .{
+        .p = &p,
+        .q = &q,
+        .lambda = try root.AuxFe.fromBytes(nt, lam_s, .big),
+    };
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(&p);
+        std.valgrind.memcheck.makeMemUndefined(&q);
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&trapdoor.lambda.v.limbs_buffer));
+    }
+    std.mem.doNotOptimizeAway(&trapdoor);
+    var prng = std.Random.DefaultPrng.init(0x7069_7072_6d); // "piprm"
+    const proof = try root.aux_proofs.Piprm.proveBound(allocator, aux, trapdoor, "ctgrind", prng.random());
+    // XOR of every z_i: the rounds with e_i = 1 carry λ's taint (z_i = a_i
+    // alone when e_i = 0, untainted), so one fold is the witness for all.
+    var acc = [_]u8{0} ** root.aux_modulus_bytes;
+    for (proof.entries) |entry| {
+        var zb: [root.aux_modulus_bytes]u8 = undefined;
+        try entry.z.toBytes(&zb, .big);
+        for (&acc, zb) |*a, b| a.* ^= b;
+    }
+    std.debug.print("zfold={x}\n", .{acc});
+}
+
 // ── target "prime": Miller-Rabin on a secret prime ──────────────────────
 //
 // `root.isProbablePrime` on tss-lib's 1024-bit Blum prime `p`, tainted —
@@ -424,7 +475,7 @@ fn runPrime(tainted: bool) !void {
     std.debug.print("prime={} ctgrind_result={x}\n", .{ verdict, std.mem.asBytes(&m.v.limbs_buffer)[0..16] });
 }
 
-const Target = enum { share, nonce, betaprime, fac, pimod, prime };
+const Target = enum { share, nonce, betaprime, fac, pimod, piprm, prime };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -433,6 +484,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "betaprime")) return .betaprime;
     if (std.mem.eql(u8, s, "fac")) return .fac;
     if (std.mem.eql(u8, s, "pimod")) return .pimod;
+    if (std.mem.eql(u8, s, "piprm")) return .piprm;
     if (std.mem.eql(u8, s, "prime")) return .prime;
     return error.UnknownTarget;
 }
@@ -468,6 +520,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (target == .fac) return runFac(tainted);
     if (target == .pimod) return runPimod(allocator, tainted);
+    if (target == .piprm) return runPiprm(allocator, tainted);
     if (target == .prime) return runPrime(tainted);
 
     // Fixture setup randomness is ALWAYS real — Phase 2a keygen is not
@@ -521,6 +574,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             printOutcome(result);
             std.debug.print("draws_160b={d}\n", .{draws});
         },
-        .fac, .pimod, .prime => unreachable, // returned above
+        .fac, .pimod, .piprm, .prime => unreachable, // returned above
     }
 }

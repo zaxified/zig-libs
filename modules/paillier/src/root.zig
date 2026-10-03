@@ -506,43 +506,6 @@ pub const KeyPair = struct {
 pub const FromPrimesError = error{ InvalidPrimes, Overflow };
 pub const GenerateError = FromPrimesError || error{InvalidBits};
 
-/// x⁻¹ (mod m) via the extended Euclidean algorithm; fails unless
-/// gcd(x, m) = 1. Variable-time — used only inside the one-time `fromPrimes`
-/// key derivation (see SPEC.md's timing note). Same shape as `rsa`'s
-/// `bigModInverse`.
-fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !BigInt {
-    // Invariants: t0*x ≡ r0, t1*x ≡ r1 (mod m).
-    var r0 = try newBig(gpa);
-    try r0.copy(m.toConst());
-    var r1 = try newBig(gpa);
-    try r1.copy(x.toConst());
-    var t0 = try newBig(gpa);
-    try t0.set(0);
-    var t1 = try newBig(gpa);
-    try t1.set(1);
-    var quot = try newBig(gpa);
-    var rem = try newBig(gpa);
-    var tmp = try newBig(gpa);
-    var new_t = try newBig(gpa);
-
-    while (!r1.eqlZero()) {
-        try quot.divFloor(&rem, &r0, &r1);
-        // (r0, r1) <- (r1, r0 mod r1)
-        r0.swap(&r1);
-        r1.swap(&rem);
-        // (t0, t1) <- (t1, t0 - quot*t1)
-        try tmp.mul(&quot, &t1);
-        try new_t.sub(&t0, &tmp);
-        t0.swap(&t1);
-        t1.swap(&new_t);
-    }
-    // r0 = gcd(x, m); must be 1 for x to be invertible.
-    if (r0.toConst().orderAgainstScalar(1) != .eq) return error.NotInvertible;
-    // t0*x ≡ 1 (mod m); normalize t0 (possibly negative) into [0, m).
-    try quot.divFloor(&rem, &t0, m);
-    return rem;
-}
-
 /// Derive a `KeyPair` from two prime factors `p`, `q` (raw big-endian
 /// bytes), for deterministic/reproducible construction (KATs, testing) —
 /// mirrors `rsa.SecretKey.fromPrimes`.
@@ -576,14 +539,14 @@ fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !Bi
 /// Construction (Paillier 1999 §3, standard `g = n+1` variant):
 ///   1. `n = p * q`; reject `p == q` and products over `modulus_bits`
 ///      (`error.Overflow`).
-///   2. `lambda = lcm(p-1, q-1) = (p-1)*(q-1) / gcd(p-1, q-1)` (big-int
-///      gcd, exactly like `rsa.fromPrimesImpl`'s λ(n) step).
+///   2. `lambda = lcm(p-1, q-1)` (`montint.nt.lcm`, constant-time).
 ///   3. `g = n + 1`.
-///   4. `mu = L(g^lambda mod n²)⁻¹ mod n`, where `L(x) = (x-1)/n` (exact
-///      integer division — `g^lambda ≡ 1 (mod n)` is guaranteed for prime
-///      p, q, Paillier 1999 Theorem 2) and `⁻¹` is `bigModInverse`.
-///      `g^lambda mod n²` uses constant-time `pow`, never `powPublic` —
-///      `lambda` is factorization-equivalent secret material.
+///   4. `mu = L(g^lambda mod n²)⁻¹ mod n`, `L(x) = (x-1)/n` — for `g = n+1`
+///      that is `lambda⁻¹ mod n` exactly (`(1+n)^λ ≡ 1 + λn`, `λ < n`),
+///      computed by montint's constant-time `inverse`.
+/// Since 2026-10-03 every step on p, q is montint limb arithmetic,
+/// constant-time in their values up to the verdicts, except building the
+/// `std.crypto.ff` carriers of `p²`, `q²` (SPEC Backlog).
 pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8) FromPrimesError!KeyPair {
     return fromPrimesImpl(p_bytes, q_bytes, .checked) catch |err| switch (err) {
         error.Overflow => error.Overflow,
@@ -603,133 +566,120 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     if (pb.len == 0 or qb.len == 0) return error.InvalidPrimes;
     if (pb.len > modulus_bytes or qb.len > modulus_bytes) return error.InvalidPrimes;
 
-    // All big.int scratch lives in a stack arena; individual deinit is
-    // pointless (fixed buffer), the whole arena dies with this frame — same
-    // idiom as `rsa.fromPrimesImpl`. Doubled vs `scratch_bytes` because the
-    // CRT-parameter derivation below adds a second modular inversion plus
-    // several full-width products, all in this one arena.
-    var scratch: [2 * scratch_bytes]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
-
-    var bp = try bigFromBytes(gpa, pb);
-    var bq = try bigFromBytes(gpa, qb);
-    if (bp.order(bq) == .eq) return error.InvalidPrimes; // p == q
+    // The derivation runs on montint limbs, constant-time in p, q
+    // (2026-10-03; until then std.math.big.int — gcd, divFloor and an
+    // extended Euclid on secrets). The verdicts are the only branches on
+    // them; building the `std.crypto.ff` carriers of p², q² (`crt.p_sq`,
+    // `crt.q_sq`) is the one variable-time step left (SPEC Backlog).
+    const L = MontParams.max_limbs;
+    var pv = MontParams.loadBE(pb) catch return error.InvalidPrimes;
+    defer std.crypto.secureZero(u64, &pv);
+    var qv = MontParams.loadBE(qb) catch return error.InvalidPrimes;
+    defer std.crypto.secureZero(u64, &qv);
+    if (MontParams.eql(&pv, &qv)) return error.InvalidPrimes; // p == q
     // p, q >= 3: p = 2 would make n even (Montgomery needs odd) and p <= 1
     // breaks p-1; reject explicitly rather than let later steps fail.
-    if (bp.toConst().orderAgainstScalar(3) == .lt) return error.InvalidPrimes;
-    if (bq.toConst().orderAgainstScalar(3) == .lt) return error.InvalidPrimes;
+    if (below3(&pv) or below3(&qv)) return error.InvalidPrimes;
 
-    // 1. n = p*q, capped at modulus_bits.
-    var bn = try newBig(gpa);
-    try bn.mul(&bp, &bq);
-    if (bn.bitCountAbs() > modulus_bits) return error.Overflow;
+    // 1. n = p*q, capped at modulus_bits (n is public: its size may branch).
+    var nw: [2 * L]u64 = undefined;
+    montint.limbs.mulSchoolbook(&nw, &pv, &qv);
+    for (nw[modulus_bits / 64 ..]) |w| if (w != 0) return error.Overflow;
+    const n_bits = bitLen(nw[0..L]);
     // The factor checks run after the size cap: an oversized product stays
     // `Overflow`, and Miller-Rabin is never spent on it.
     if (origin == .checked) {
         if (!factorIsPrime(pb) or !factorIsPrime(qb)) return error.InvalidPrimes;
-        if (try factorsTooClose(gpa, &bp, &bq, bn.bitCountAbs())) return error.InvalidPrimes;
+        if (factorsTooClose(&pv, &qv, n_bits)) return error.InvalidPrimes;
     }
     var n_buf: [modulus_bytes]u8 = undefined;
-    bn.toConst().writeTwosComplement(&n_buf, .big);
+    limbsToBe(nw[0..L], &n_buf);
     const n = Modulus.fromBytes(&n_buf, .big) catch return error.InvalidPrimes; // rejects even n
 
-    // n² (the same mechanical squaring `squareModulus` performs, kept in
-    // this arena to avoid a second scratch buffer) and 3. g = n + 1.
-    var bn_sq = try newBig(gpa);
-    try bn_sq.mul(&bn, &bn);
+    // n² and 3. g = n + 1 — public.
+    var nsq_w: [2 * L]u64 = undefined;
+    montint.limbs.mulSchoolbook(&nsq_w, nw[0..L], nw[0..L]);
     var nsq_buf: [modulus_sq_bytes]u8 = undefined;
-    bn_sq.toConst().writeTwosComplement(&nsq_buf, .big);
+    limbsToBe(nsq_w[0..L], &nsq_buf); // n < 2^modulus_bits ⇒ n² fits
     const n_sq = Modulus.fromBytes(&nsq_buf, .big) catch return error.InvalidPrimes;
-
-    var bg = try newBig(gpa);
-    try bg.addScalar(&bn, 1);
+    var gw: MontElem = nw[0..L].*;
+    var one = MontParams.zero;
+    one[0] = 1;
+    _ = montint.limbs.addInto(&gw, &one);
     var g_buf: [modulus_sq_bytes]u8 = undefined;
-    bg.toConst().writeTwosComplement(&g_buf, .big);
+    limbsToBe(&gw, &g_buf);
     // Canonical mod n_sq per the Fe construction contract (n+1 < n² always).
     const g = Fe.fromBytes(n_sq, &g_buf, .big) catch return error.InvalidPrimes;
 
-    // 2. lambda = lcm(p-1, q-1) = (p-1)(q-1) / gcd(p-1, q-1).
-    var p1 = try newBig(gpa);
-    try p1.addScalar(&bp, -1);
-    var q1 = try newBig(gpa);
-    try q1.addScalar(&bq, -1);
-    var gg = try newBig(gpa);
-    try gg.gcd(&p1, &q1);
-    var phi = try newBig(gpa);
-    try phi.mul(&p1, &q1);
-    var lambda_big = try newBig(gpa);
-    var rem = try newBig(gpa);
-    try lambda_big.divFloor(&rem, &phi, &gg); // exact: gcd | (p-1)(q-1)
+    // 2. λ = lcm(p−1, q−1) (p, q odd — n is: p − 1 is p with bit 0 cleared).
+    var p1 = pv;
+    p1[0] &= ~@as(u64, 1);
+    defer std.crypto.secureZero(u64, &p1);
+    var q1 = qv;
+    q1[0] &= ~@as(u64, 1);
+    defer std.crypto.secureZero(u64, &q1);
+    var lam_w = montint.nt.lcm(L, &p1, &q1);
+    defer std.crypto.secureZero(u64, &lam_w);
+    var lam: MontElem = lam_w[0..L].*; // λ ≤ φ < n
+    defer std.crypto.secureZero(u64, &lam);
+    // Canonical mod n_sq — λ is the exponent of c^λ mod n², λ < n < n².
+    const lambda = elemToFe(n_sq, &lam);
 
-    var lambda_buf: [modulus_sq_bytes]u8 = undefined;
-    lambda_big.toConst().writeTwosComplement(&lambda_buf, .big);
-    // Canonical mod n_sq — lambda is the exponent of c^lambda mod n², and
-    // lambda <= (p-1)(q-1) < n < n² always.
-    const lambda = Fe.fromBytes(n_sq, &lambda_buf, .big) catch return error.InvalidPrimes;
-    if (lambda.isZero()) return error.InvalidPrimes; // impossible for p, q >= 3
-
-    // 4. mu = L(g^lambda mod n²)⁻¹ mod n, L(x) = (x-1)/n (exact division).
-    // NOT constant-time in lambda (ff's pow branches on its windows in
-    // ReleaseFast, measured 2026-10-02); key derivation is variable-time
-    // anyway (big.int above) — SPEC "Constant-time discipline", Backlog.
-    const x = n_sq.pow(g, lambda) catch return error.InvalidPrimes;
-    var x_buf: [modulus_sq_bytes]u8 = undefined;
-    x.toBytes(&x_buf, .big) catch return error.InvalidPrimes;
-    var bx = try bigFromBytes(gpa, &x_buf);
-    var bx1 = try newBig(gpa);
-    try bx1.addScalar(&bx, -1);
-    var bl = try newBig(gpa);
-    try bl.divFloor(&rem, &bx1, &bn);
-    // Paillier 1999 Theorem 2: g^lambda ≡ 1 (mod n) for prime p, q — a
-    // nonzero remainder means the supplied factors weren't prime.
-    if (!rem.eqlZero()) return error.InvalidPrimes;
-    // bigModInverse also proves gcd(L, n) = 1 (and rejects L = 0).
-    var bmu = try bigModInverse(gpa, &bl, &bn);
-    var mu_buf: [modulus_bytes]u8 = undefined;
-    bmu.toConst().writeTwosComplement(&mu_buf, .big);
-    const mu = Fe.fromBytes(n, &mu_buf, .big) catch return error.InvalidPrimes; // canonical mod n
+    // 4. µ = L(g^λ mod n²)⁻¹ mod n. For g = n + 1, (1 + n)^λ ≡ 1 + λ·n
+    //    (mod n²) and λ < n, so L(·) = λ exactly and µ = λ⁻¹ mod n — no
+    //    modexp, no division. (The old L-exactness check could never fail
+    //    for this g: the remainder of (λ·n)/n is 0 for any p, q.) The
+    //    inversion's verdict proves gcd(λ, n) = 1, i.e. gcd(n, φ(n)) = 1
+    //    (paillier F9).
+    const n_mont = montParamsFromModulus(n);
+    var mu_el: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &mu_el);
+    if (!n_mont.inverse(&lam, &mu_el)) return error.InvalidPrimes;
+    const mu = elemToFe(n, &mu_el);
 
     // ── CRT decryption parameters (Paillier-CRT / Hazay-Lindell) ──────────
-    // p², q² as ff moduli (odd; p,q ≥ 3 ⇒ p²,q² ≥ 9). Both < 2^modulus_bits.
-    var bp_sq = try newBig(gpa);
-    try bp_sq.mul(&bp, &bp);
-    var bq_sq = try newBig(gpa);
-    try bq_sq.mul(&bq, &bq);
+    // p², q² (odd; p,q ≥ 3 ⇒ p²,q² ≥ 9; both < n² < 2^max_bits).
+    var psq_w: [2 * L]u64 = undefined;
+    defer std.crypto.secureZero(u64, &psq_w);
+    montint.limbs.mulSchoolbook(&psq_w, &pv, &pv);
+    var qsq_w: [2 * L]u64 = undefined;
+    defer std.crypto.secureZero(u64, &qsq_w);
+    montint.limbs.mulSchoolbook(&qsq_w, &qv, &qv);
     var psq_buf: [modulus_sq_bytes]u8 = undefined;
-    bp_sq.toConst().writeTwosComplement(&psq_buf, .big);
+    defer std.crypto.secureZero(u8, &psq_buf);
+    limbsToBe(psq_w[0..L], &psq_buf);
     const p_sq = Modulus.fromBytes(&psq_buf, .big) catch return error.InvalidPrimes;
     var qsq_buf: [modulus_sq_bytes]u8 = undefined;
-    bq_sq.toConst().writeTwosComplement(&qsq_buf, .big);
+    defer std.crypto.secureZero(u8, &qsq_buf);
+    limbsToBe(qsq_w[0..L], &qsq_buf);
     const q_sq = Modulus.fromBytes(&qsq_buf, .big) catch return error.InvalidPrimes;
 
     // Reduced CRT exponents: dp = λ mod p(p-1), dq = λ mod q(q-1). Valid to
     // reduce because a well-formed ciphertext is a unit mod p²/q² and
     // |(Z/p²)*| = p(p-1) (Lagrange), so c^λ ≡ c^(λ mod p(p-1)) (mod p²).
-    var p_ord = try newBig(gpa);
-    try p_ord.mul(&bp, &p1); // p·(p-1)
-    var q_ord = try newBig(gpa);
-    try q_ord.mul(&bq, &q1); // q·(q-1)
-    var quo = try newBig(gpa);
-    var dp_big = try newBig(gpa);
-    try quo.divFloor(&dp_big, &lambda_big, &p_ord); // remainder = λ mod p(p-1)
-    var dq_big = try newBig(gpa);
-    try quo.divFloor(&dq_big, &lambda_big, &q_ord);
+    // (p−1) | λ, so λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p): an exact
+    // division by the even p − 1 (`nt.divExact`) and a reduction mod p.
     var dp_buf = [_]u8{0} ** modulus_bytes;
-    dp_big.toConst().writeTwosComplement(&dp_buf, .big); // < p(p-1) < 2^modulus_bits
     var dq_buf = [_]u8{0} ** modulus_bytes;
-    dq_big.toConst().writeTwosComplement(&dq_buf, .big);
+    try crtExponent(&lam, &pv, &p1, 8 * pb.len - @clz(pb[0]), &dp_buf);
+    try crtExponent(&lam, &qv, &q1, 8 * qb.len - @clz(qb[0]), &dq_buf);
 
     // Garner coefficient (p²)⁻¹ mod q² (gcd(p²,q²)=1 for distinct primes),
     // and p² as an Fe canonical mod n² (the x = x_p + p²·u multiplier).
-    var pinv_big = try bigModInverse(gpa, &bp_sq, &bq_sq);
-    var pinv_buf: [modulus_sq_bytes]u8 = undefined;
-    pinv_big.toConst().writeTwosComplement(&pinv_buf, .big);
-    const p_sq_inv = Fe.fromBytes(q_sq, stripLeadingZeros(&pinv_buf), .big) catch return error.InvalidPrimes;
-    const p_sq_fe = Fe.fromBytes(n_sq, stripLeadingZeros(&psq_buf), .big) catch return error.InvalidPrimes;
+    // p² has 2b or 2b − 1 bits for a b-bit p: built from the limbs with
+    // that length (one verdict) instead of `montParamsFromModulus`'s scan of
+    // the secret value — both reveal the same one bit.
+    const p_sq_mont = try montFromSquare(psq_w[0..L], 2 * (8 * pb.len - @clz(pb[0])));
+    const q_sq_mont = try montFromSquare(qsq_w[0..L], 2 * (8 * qb.len - @clz(qb[0])));
+    var psq_mod = q_sq_mont.reduceLimbs(psq_w[0..L]);
+    defer std.crypto.secureZero(u64, &psq_mod);
+    var pinv: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &pinv);
+    if (!q_sq_mont.inverse(&psq_mod, &pinv)) return error.InvalidPrimes;
+    const p_sq_inv = elemToFe(q_sq, &pinv);
+    const p_sq_fe = elemToFe(n_sq, psq_w[0..L]);
 
     const n_sq_mont = montParamsFromModulus(n_sq);
-    const n_mont = montParamsFromModulus(n);
 
     return .{
         .public = .{ .n = n, .n_sq = n_sq, .g = g, .n_sq_mont = n_sq_mont },
@@ -741,8 +691,8 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
             .n_sq_mont = n_sq_mont,
             .n_mont = n_mont,
             .crt = .{
-                .p_sq_mont = montParamsFromModulus(p_sq),
-                .q_sq_mont = montParamsFromModulus(q_sq),
+                .p_sq_mont = p_sq_mont,
+                .q_sq_mont = q_sq_mont,
                 .dp = dp_buf,
                 .dq = dq_buf,
                 .p_sq = p_sq,
@@ -752,6 +702,53 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
             },
         },
     };
+}
+
+/// `λ mod r(r−1)` as big-endian bytes into `out`, for a prime `r`
+/// (`rv`, with `r1 = r − 1`): `(r−1)·((λ/(r−1)) mod r)` — `(r−1) | λ`.
+/// Constant-time in `λ` and `r`.
+fn crtExponent(lam: *const MontElem, rv: *const MontElem, r1: *const MontElem, r_bits: usize, out: *[modulus_bytes]u8) !void {
+    const L = MontParams.max_limbs;
+    var k = montint.nt.divExact(L, lam, r1);
+    defer std.crypto.secureZero(u64, &k);
+    // The prime's length from its byte string (public), not a scan of it.
+    const r_mod = MontParams.fromLimbsBits(rv, r_bits) catch return error.InvalidPrimes; // odd, ≥ 3
+    var kr = r_mod.reduceLimbs(&k);
+    defer std.crypto.secureZero(u64, &kr);
+    var e: [2 * L]u64 = undefined;
+    defer std.crypto.secureZero(u64, &e);
+    montint.limbs.mulSchoolbook(&e, r1, &kr);
+    limbsToBe(e[0 .. modulus_bits / 64], out); // < r(r−1) < n < 2^modulus_bits
+}
+
+/// A montint modulus for a square of known maximal length `bits2`.
+fn montFromSquare(v: *const MontElem, bits2: usize) !MontParams {
+    return MontParams.fromLimbsBits(v, bits2) catch
+        MontParams.fromLimbsBits(v, bits2 - 1) catch error.InvalidPrimes;
+}
+
+/// `v < 3` (one limb, below 3) — a reject verdict.
+fn below3(v: *const MontElem) bool {
+    var hi: u64 = 0;
+    for (v[1..]) |w| hi |= w;
+    return hi == 0 and v[0] < 3;
+}
+
+/// Bit length of a PUBLIC limb value (scans from the top).
+fn bitLen(v: []const u64) usize {
+    var i: usize = v.len;
+    while (i > 0) : (i -= 1) {
+        if (v[i - 1] != 0) return 64 * (i - 1) + (64 - @clz(v[i - 1]));
+    }
+    return 0;
+}
+
+/// Little-endian limbs → big-endian bytes filling `out` (positions only).
+fn limbsToBe(v: []const u64, out: []u8) void {
+    for (out, 0..) |*o, i| {
+        const pos = out.len - 1 - i;
+        o.* = if (pos / 8 < v.len) @truncate(v[pos / 8] >> @intCast(8 * (pos % 8))) else 0;
+    }
 }
 
 // ── prime generation (mirrors `rsa`'s probable-prime search) ──────────────
@@ -767,11 +764,14 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
 // holds by construction for two same-length primes: p | q-1 would need
 // q-1 >= p, impossible when both lie in [2^(b-1)+2^(b-2), 2^b) with p ≠ q.
 //
-// Timing: the prime search loop is inherently variable-time (every
-// implementation's is), and all candidate buffers are secureZero'ed. The
-// modexps inside Miller-Rabin use `ff`'s pow, which is NOT constant-time in
-// ReleaseFast (its window select branches on the exponent `d`, derived from
-// the kept prime; measured 2026-10-02) — SPEC § Backlog.
+// Timing: the search loop is data-dependent (every implementation's is),
+// but what it reveals is about REJECTED candidates; all candidate buffers
+// are secureZero'ed. Along a kept prime's path Miller-Rabin is
+// constant-time in its value since 2026-10-03
+// (`montint.DynModint.isProbablePrime`; `ff`'s pow, used until then,
+// branches on the exponent windows in ReleaseFast). Still observable: the
+// squaring count `s` (the 2-adic valuation of `p − 1`) and the sieve's `%`
+// on the candidate (`bytesMod`).
 
 /// Miller-Rabin rounds per candidate — see the section comment above.
 const mr_rounds = 64;
@@ -814,88 +814,25 @@ fn bytesMod(bytes: []const u8, divisor: u64) u64 {
     return r;
 }
 
-/// In-place big-endian right shift by `s` bits (zero-fill from the left).
-fn shrBytesBe(buf: []u8, s: usize) void {
-    const byte_sh = s / 8;
-    const bit_sh: u4 = @intCast(s % 8);
-    var i: usize = buf.len;
-    while (i > 0) {
-        i -= 1;
-        const lo: u16 = if (i >= byte_sh) buf[i - byte_sh] else 0;
-        const hi: u16 = if (i >= byte_sh + 1) buf[i - byte_sh - 1] else 0;
-        buf[i] = @truncate(((hi << 8) | lo) >> bit_sh);
-    }
-}
-
 /// Set bit `bit` (LSB = 0) of a big-endian byte string.
 fn setBitBe(buf: []u8, bit: usize) void {
     buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
 }
 
-/// Uniform random Miller-Rabin witness in [2, m-2] by rejection sampling
-/// (mask to m's bit length, retry on out-of-range — expected < 2 draws).
-fn randomWitness(m: Modulus, random: std.Random) Fe {
-    const n_bits = m.bits();
-    const n_len = byteLen(n_bits);
-    const n_minus_1 = m.sub(m.zero, m.one());
-    var buf: [modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, buf[0..n_len]);
-    while (true) {
-        random.bytes(buf[0..n_len]);
-        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
-        const a = Fe.fromBytes(m, buf[0..n_len], .big) catch continue; // >= m: redraw
-        if (a.isZero() or a.eql(m.one()) or a.eql(n_minus_1)) continue; // outside [2, m-2]
-        return a;
-    }
+/// Miller-Rabin with `mr_rounds` witnesses on a candidate whose bit length
+/// `bits` is known (public: the search's size) — `montint`'s constant-time
+/// test (see the section comment). `false` for an even or wrongly sized `v`.
+fn isProbablePrimeLimbs(v: *const MontElem, bits: usize, random: std.Random) bool {
+    var m = MontParams.fromLimbsBits(v, bits) catch return false;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
+    return m.isProbablePrime(random, mr_rounds);
 }
 
-/// Miller-Rabin probable-prime test with `mr_rounds` random witnesses from
-/// `random`. `m` must be an odd integer >= 5 (every `Modulus` is odd by
-/// construction; callers here only ever pass >= 2^255). Returns false iff a
-/// witness proves `m` composite.
+/// The same on an `ff` modulus (the tests' known primes and composites).
 fn isProbablePrime(m: Modulus, random: std.Random) bool {
-    const n_len = byteLen(m.bits());
-
-    // m - 1 = d * 2^s with d odd: m is odd, so m-1 is just m with the low
-    // bit cleared, s = ctz(m-1) >= 1, d = (m-1) >> s.
-    var d_buf: [modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, d_buf[0..n_len]);
-    m.toBytes(d_buf[0..n_len], .big) catch unreachable; // buffer is exactly byteLen(bits)
-    d_buf[n_len - 1] &= 0xfe;
-    var s: usize = 0;
-    var i: usize = n_len;
-    while (i > 0) {
-        i -= 1;
-        if (d_buf[i] == 0) {
-            s += 8;
-        } else {
-            s += @ctz(d_buf[i]);
-            break;
-        }
-    }
-    shrBytesBe(d_buf[0..n_len], s);
-    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
-
-    const one = m.one();
-    const n_minus_1 = m.sub(m.zero, one);
-
-    var round: usize = 0;
-    rounds: while (round < mr_rounds) : (round += 1) {
-        const a = randomWitness(m, random);
-        // a^d mod m. d is derived from the candidate; ff's pow branches on
-        // its windows in ReleaseFast — keygen is variable-time (SPEC § Backlog).
-        var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d is odd, never 0
-        if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
-        var j: usize = 1;
-        while (j < s) : (j += 1) {
-            x = m.sq(x);
-            if (x.eql(n_minus_1)) continue :rounds;
-            // A nontrivial square root of 1: composite for sure — stop early.
-            if (x.eql(one)) return false;
-        }
-        return false; // never hit m-1: `a` witnesses compositeness
-    }
-    return true;
+    var v = MontParams.elemFromFf(&m.v);
+    defer std.crypto.secureZero(u64, &v);
+    return isProbablePrimeLimbs(&v, m.bits(), random);
 }
 
 /// Draw random odd candidates of exactly `prime_bits` bits with the top two
@@ -919,9 +856,10 @@ fn generatePrime(random: std.Random, prime_bits: usize, out: []u8) void {
             if (bytesMod(out, sp) == 0) continue :candidates;
         }
 
-        // Odd, >= 3, <= modulus_bytes bytes: Modulus.fromBytes can't fail.
-        const m = Modulus.fromBytes(out, .big) catch unreachable;
-        if (isProbablePrime(m, random)) return;
+        // Odd, exactly prime_bits bits (both set above).
+        var v = MontParams.loadBE(out) catch unreachable; // <= modulus_bytes bytes
+        defer std.crypto.secureZero(u64, &v);
+        if (isProbablePrimeLimbs(&v, prime_bits, random)) return;
     }
 }
 
@@ -956,7 +894,10 @@ fn factorIsPrime(bytes: []const u8) bool {
     for (sieve_primes) |sp| {
         if (bytesMod(bytes, sp) == 0) return false;
     }
-    const m = Modulus.fromBytes(bytes, .big) catch return false; // even → not prime
+    var v = MontParams.loadBE(bytes) catch return false;
+    defer std.crypto.secureZero(u64, &v);
+    // The factor's bit length is public (the key size); the value is not.
+    const bits = 8 * bytes.len - @clz(bytes[0]); // bytes stripped: bytes[0] != 0
     var seed: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -965,20 +906,25 @@ fn factorIsPrime(bytes: []const u8) bool {
     h.final(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&csprng)); // keyed by a secret factor
-    return isProbablePrime(m, csprng.random());
+    return isProbablePrimeLimbs(&v, bits, csprng.random()); // even → false
 }
 
 /// FIPS 186-5 §A.1.3: `|p − q|` must exceed `2^(nlen/2 − 100)` (audit F7
 /// m8). Not defined for `nlen/2 <= 100`, where nothing is refused.
-fn factorsTooClose(gpa: std.mem.Allocator, bp: *const BigInt, bq: *const BigInt, n_bits: usize) !bool {
+/// Constant-time in p, q: `|p − q|` by a masked negation, the comparison a
+/// borrow — the returned verdict is the only branch.
+fn factorsTooClose(p: *const MontElem, q: *const MontElem, n_bits: usize) bool {
     if (n_bits / 2 <= 100) return false;
-    var diff = try newBig(gpa);
-    try diff.sub(bp, bq);
-    diff.abs();
-    var bound = try newBig(gpa);
-    try bound.set(1);
-    try bound.shiftLeft(&bound, n_bits / 2 - 100);
-    return diff.order(bound) != .gt;
+    var d = p.*;
+    defer std.crypto.secureZero(u64, &d);
+    const borrow = montint.limbs.subInto(&d, q); // p − q mod 2^W
+    montint.nt.condNeg(MontParams.max_limbs, &d, montint.nt.blackBox(0 -% @as(u64, borrow)));
+    // too close ⟺ |p − q| ≤ 2^h ⟺ |p − q| − (2^h + 1) borrows
+    const h = n_bits / 2 - 100;
+    var bound = MontParams.zero;
+    bound[h / 64] = @as(u64, 1) << @intCast(h % 64);
+    bound[0] |= 1; // h ≥ 1, so bit 0 is free
+    return montint.limbs.subInto(&d, &bound) == 1;
 }
 
 /// Floor `generate` enforces on `bits` — mirrors `rsa`'s 512-bit minimum
@@ -1524,7 +1470,7 @@ test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
 // `{0, 1, 2}` against `q` (or `p`) in `[2, 99]`, both orders — **0 of either
 // census got ACCEPTED, identical to the guards-enabled baseline (also 0)**.
 // Every case this test pins below is independently caught downstream (the
-// L-exactness check / `bigModInverse`'s implicit `gcd` requirement) even
+// L-exactness check / the µ inversion's implicit `gcd` requirement) even
 // with its own dedicated guard removed. `m9`/`m10` are therefore REFUTED —
 // harmless defense-in-depth, the same class as `m1`/`m2`/`m16`/`m11` — not
 // confirmed gaps; no new pin needed since this test already exercises every
@@ -1542,6 +1488,40 @@ test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
     var big2 = big1;
     big2[modulus_bytes - 1] = 0xfd; // differ from big1, still odd
     try testing.expectError(error.Overflow, fromPrimes(&big1, &big2));
+}
+
+test "fromPrimes closeness guard: |p − q| = 2^(nlen/2 − 100) exactly is refused" {
+    // Two 256-bit primes exactly 2^156 apart (n is 512 bits, so the bound
+    // is 2^(256 − 100)); FIPS 186-5 wants |p − q| > 2^156. Found offline
+    // (Python, 40-round Miller-Rabin); the mutation run of 2026-10-03 had
+    // `< 2^156` survive without this pair.
+    var p: [32]u8 = undefined;
+    var q: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, "efc9a3c047a982350a5df5ac011898c389262496b8913f664dd15c52eefb6ba5");
+    _ = try std.fmt.hexToBytes(&q, "efc9a3c047a982350a5df5ac111898c389262496b8913f664dd15c52eefb6ba5");
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q));
+    // Control: `.generated` skips the guard and derives a key from the same
+    // pair, so the refusal above is the closeness check.
+    _ = try fromPrimesImpl(&p, &q, .generated);
+}
+
+test "fromPrimes CRT exponents are λ mod p(p−1) exactly (factors of unequal size)" {
+    // p 64-bit, q 256-bit: λ = lcm(p−1, q−1) exceeds p(p−1), so dp is a
+    // real reduction (for same-size factors dp = λ, which hid a skipped
+    // reduction from the mutation run of 2026-10-03). Expected values from
+    // Python's integers.
+    var p: [8]u8 = undefined;
+    var q: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, "ad78dc4bfb9e8ddb");
+    _ = try std.fmt.hexToBytes(&q, "ac6f9f32ccf71d1ae7fe9bb833a10b7c9c83c19d6fb3c23f19b78bf9dacfedd7");
+    var kp = try fromPrimes(&p, &q);
+    defer kp.secret.deinit();
+    var want_dp = [_]u8{0} ** modulus_bytes;
+    _ = try std.fmt.hexToBytes(want_dp[modulus_bytes - 16 ..], "4776ec7037a754bd972d839646d9666a");
+    var want_dq = [_]u8{0} ** modulus_bytes;
+    _ = try std.fmt.hexToBytes(want_dq[modulus_bytes - 40 ..], "3a6c6ba587a94e074f6ce5849e17300c4f8fd748950d870f4e0a009a4ea367eda0e1a8403b91b31e");
+    try testing.expectEqualSlices(u8, &want_dp, &kp.secret.crt.?.dp);
+    try testing.expectEqualSlices(u8, &want_dq, &kp.secret.crt.?.dq);
 }
 
 // F7 (wave-3 audit) reported `m7` (Miller-Rabin round count 64 -> 1) and
@@ -1862,7 +1842,7 @@ test "fromPrimes rejects composite factors that pass every earlier structural ch
     // with the check enabled and disabled. The audit's claim about THIS line
     // is therefore REFUTED, not confirmed — same shape as F7's own m1/m2/m16
     // census (isZero guards found to be harmless defense-in-depth, not real
-    // gaps). Something else (most likely `bigModInverse`'s implicit
+    // gaps). Something else (most likely the µ inversion's implicit
     // `gcd(L, n) = 1` check a few lines below) is the guard actually doing
     // the rejecting; not traced further here — this test pins the observable
     // behavior (composite factors of this shape get rejected), not which

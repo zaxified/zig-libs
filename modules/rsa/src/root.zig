@@ -357,12 +357,14 @@ pub const SecretKey = struct {
     /// structure — oddness, p ≠ q, gcd(e, λ(n)) = 1, qInv·q ≡ 1 (mod p) —
     /// but performs no primality test; that is P5 territory).
     ///
-    /// Timing note: the runtime primitives are constant-time via
-    /// `std.crypto.ff`, and qInv is derived with a constant-time Fermat
-    /// inversion (q^(p-2) mod p). The n/λ/d/dP/dQ derivation, however, uses
-    /// `std.math.big.int` (extended Euclid), which is variable-time — `ff`
-    /// cannot express it since λ(n) and p-1/q-1 are even. This is a one-time
-    /// key-import cost, not a per-operation leak.
+    /// Timing note (2026-10-03): the derivation is montint limb arithmetic,
+    /// constant-time in the primes — `n` a limb product, `λ` from
+    /// `montint.nt.lcm`, `d`/`dP`/`dQ` from `inverseOfModulus` (inverses
+    /// modulo the even `λ`, `p−1`, `q−1`), `qInv` by Fermat on montint. The
+    /// one step still variable-time on `p`, `q` is building their
+    /// `std.crypto.ff` `Modulus` carriers (`sk.p`, `sk.q`); SPEC Backlog.
+    /// Cost: a few milliseconds at 4096-bit width (the gcd and lcm run at the
+    /// full `max_modulus_bits` capacity, whatever the key size).
     pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
         return fromPrimesImpl(p_bytes, q_bytes, e_bytes) catch error.InvalidPrivateKey;
     }
@@ -403,13 +405,17 @@ pub const SecretKey = struct {
     }
 };
 
-// ── fromPrimes internals (big.int-backed key derivation) ────────────────────
+// ── big.int helpers (the public-operand inverse only) ───────────────────────
+//
+// `fromPrimes` stopped using these on 2026-10-03 (montint limb arithmetic,
+// constant-time); what remains is `bigModInverse` for the per-op blinding
+// inverse of a fresh public random `r` and for `blindrsa`.
 
 const BigInt = std.math.big.int.Managed;
 
 /// Limb capacity covering 2×`max_modulus_bits` products plus headroom; every
-/// scratch `BigInt` is pre-sized to this so the derivation below performs no
-/// reallocation-driven growth inside the fixed-buffer arena.
+/// scratch `BigInt` is pre-sized to this so no reallocation-driven growth
+/// happens inside the fixed-buffer arena.
 const big_capacity = (2 * max_modulus_bits) / @bitSizeOf(std.math.big.Limb) + 4;
 
 fn newBig(gpa: std.mem.Allocator) !BigInt {
@@ -430,24 +436,14 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
     return x;
 }
 
-/// Non-negative `BigInt` -> canonical `Fe` of `m` (fails if out of range).
-fn feFromBig(m: Modulus, x: *const BigInt) !Fe {
-    if (!x.isPositive() and !x.eqlZero()) return error.InvalidPrivateKey;
-    if (x.bitCountAbs() > max_modulus_bits) return error.InvalidPrivateKey;
-    var buf: [max_modulus_len]u8 = undefined;
-    x.toConst().writeTwosComplement(&buf, .big);
-    return Fe.fromBytes(m, &buf, .big);
-}
-
 /// `e⁻¹ (mod m)` via the extended Euclidean algorithm over a (possibly
 /// composite) `m`; fails with `error.InvalidPrivateKey` unless gcd(e, m) = 1.
 /// VARIABLE-TIME in both operands (division-based Euclid — `std.crypto.ff`
 /// has no `invert`, and Fermat inversion needs a *prime* modulus, which a
 /// composite-modulus caller may not even know the factorization of). Used
-/// internally for `d = e⁻¹ mod λ(n)` key derivation (`fromPrimes`, offline,
-/// operates on already-known primes) and per-op CRT base-blinding
-/// (`invModN`, called on a fresh public random `r`, never on secret key
-/// material) — both call sites only ever feed it a *non-secret* operand.
+/// internally for per-op CRT base-blinding only (`invModN`, called on a
+/// fresh public random `r`, never on secret key material); key derivation
+/// uses montint's constant-time `inverseOfModulus` since 2026-10-03.
 ///
 /// `pub` so sibling modules needing a generic composite-modulus inverse
 /// (currently `blindrsa`, for its RFC 9474 blinding-factor inversion) can
@@ -500,94 +496,125 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
     const eb = stripLeadingZeros(e_bytes);
     if (pb.len > max_modulus_len or qb.len > max_modulus_len) return error.InvalidPrivateKey;
     // e must be odd and >= 3 (RFC 8017 §3.1); evenness would also fail the
-    // gcd check below, but reject early and explicitly.
+    // invertibility verdict below, but reject early and explicitly. e is
+    // public, so are these branches.
     if (eb.len == 0 or eb[eb.len - 1] & 1 == 0) return error.InvalidPrivateKey;
     if (eb.len == 1 and eb[0] < 3) return error.InvalidPrivateKey;
 
     // `Modulus.fromBytes` rejects even and < 3 values, covering p, q oddness.
+    // ⚠ These two `std.crypto.ff` constructions are the derivation's one
+    // remaining variable-time step on the secret primes (ff's Montgomery
+    // setup branches on the value) — they are the key's public carrier
+    // type (`sk.p`, `sk.q`); SPEC Backlog.
     const p = Modulus.fromBytes(pb, .big) catch return error.InvalidPrivateKey;
     const q = Modulus.fromBytes(qb, .big) catch return error.InvalidPrivateKey;
 
-    // All big.int scratch lives in a stack arena; individual deinit is
-    // pointless (fixed buffer), the whole arena dies with this frame.
-    var scratch: [128 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
+    // Everything else is montint limb arithmetic, constant-time in the
+    // primes' values (2026-10-03; until then std.math.big.int — `gcd`,
+    // `divFloor` and an extended Euclid on λ, the binary-GCD class of
+    // single-trace keygen attack, Aldaya et al. 2019).
+    var pv = MontParams.loadBE(pb) catch return error.InvalidPrivateKey;
+    defer std.crypto.secureZero(u64, &pv);
+    var qv = MontParams.loadBE(qb) catch return error.InvalidPrivateKey;
+    defer std.crypto.secureZero(u64, &qv);
+    if (MontParams.eql(&pv, &qv)) return error.InvalidPrivateKey; // p == q
 
-    var bp = try bigFromBytes(gpa, pb);
-    var bq = try bigFromBytes(gpa, qb);
-    var be = try bigFromBytes(gpa, eb);
-    if (bp.order(bq) == .eq) return error.InvalidPrivateKey; // p == q
-
-    // n = p*q, capped at max_modulus_bits.
-    var bn = try newBig(gpa);
-    try bn.mul(&bp, &bq);
-    if (bn.bitCountAbs() > max_modulus_bits) return error.InvalidPrivateKey;
+    // n = p·q, capped at max_modulus_bits (n is public: its size may branch).
+    var nprod: [2 * MontParams.max_limbs]u64 = undefined;
+    defer std.crypto.secureZero(u64, &nprod);
+    montint.limbs.mulSchoolbook(&nprod, &pv, &qv);
+    for (nprod[MontParams.max_limbs..]) |w| if (w != 0) return error.InvalidPrivateKey;
     var n_buf: [max_modulus_len]u8 = undefined;
-    bn.toConst().writeTwosComplement(&n_buf, .big);
+    limbsToBe(nprod[0..MontParams.max_limbs], &n_buf);
     const n = Modulus.fromBytes(&n_buf, .big) catch return error.InvalidPrivateKey;
 
-    // λ(n) = lcm(p-1, q-1) = (p-1)(q-1) / gcd(p-1, q-1).
-    var p1 = try newBig(gpa);
-    try p1.addScalar(&bp, -1);
-    var q1 = try newBig(gpa);
-    try q1.addScalar(&bq, -1);
-    var g = try newBig(gpa);
-    try g.gcd(&p1, &q1);
-    var phi = try newBig(gpa);
-    try phi.mul(&p1, &q1);
-    var lambda = try newBig(gpa);
-    var rem = try newBig(gpa);
-    try lambda.divFloor(&rem, &phi, &g); // exact: g | (p-1)(q-1)
+    // λ(n) = lcm(p−1, q−1) (p, q odd: p − 1 is p with bit 0 cleared).
+    var p1 = pv;
+    p1[0] &= ~@as(u64, 1);
+    defer std.crypto.secureZero(u64, &p1);
+    var q1 = qv;
+    q1[0] &= ~@as(u64, 1);
+    defer std.crypto.secureZero(u64, &q1);
+    var lam_wide = montint.nt.lcm(MontParams.max_limbs, &p1, &q1);
+    defer std.crypto.secureZero(u64, &lam_wide);
+    var lam: MontElem = lam_wide[0..MontParams.max_limbs].*; // λ ≤ φ < n: fits
 
-    // d = e⁻¹ mod λ(n); also proves gcd(e, λ(n)) = 1.
-    var bd = try bigModInverse(gpa, &be, &lambda);
-    if (bd.eqlZero()) return error.InvalidPrivateKey;
-
-    // dP = d mod (p-1), dQ = d mod (q-1).
-    var quot = try newBig(gpa);
-    var bdp = try newBig(gpa);
-    try quot.divFloor(&bdp, &bd, &p1);
-    var bdq = try newBig(gpa);
-    try quot.divFloor(&bdq, &bd, &q1);
-
-    const d = try feFromBig(n, &bd);
-    const dp = try feFromBig(p, &bdp);
-    const dq = try feFromBig(q, &bdq);
-    // Zero CRT exponents are impossible for prime p, q (e·dP ≡ 1 mod p-1);
-    // reject rather than trip `ff`'s NullExponent later on garbage input.
-    if (d.isZero() or dp.isZero() or dq.isZero()) return error.InvalidPrivateKey;
+    // d = e⁻¹ mod λ(n), dP = e⁻¹ mod (p−1), dQ = e⁻¹ mod (q−1) — the
+    // inverses of the odd public modulus e modulo three EVEN secrets
+    // (`inverseOfModulus`). dP equals d mod (p−1): (p−1) | λ. The verdicts
+    // prove gcd(e, λ) = 1 (the key is valid) and are the only branches.
+    const ev = MontParams.loadBE(eb) catch return error.InvalidPrivateKey;
+    const e_mod = MontParams.fromLimbs(&ev) catch return error.InvalidPrivateKey; // odd, ≥ 3
+    var d_el: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &d_el);
+    var dp_el: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &dp_el);
+    var dq_el: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &dq_el);
+    const ok_d = e_mod.inverseOfModulus(&lam, &d_el);
+    const ok_p = e_mod.inverseOfModulus(&p1, &dp_el);
+    const ok_q = e_mod.inverseOfModulus(&q1, &dq_el);
+    std.crypto.secureZero(u64, &lam);
+    if (!(ok_d and ok_p and ok_q)) return error.InvalidPrivateKey;
+    // Zero CRT exponents are impossible for prime p, q (e·dP ≡ 1 mod p−1);
+    // reject rather than trip a NullExponent later on garbage input.
+    if (MontParams.isZero(&d_el) or MontParams.isZero(&dp_el) or MontParams.isZero(&dq_el)) return error.InvalidPrivateKey;
 
     // Public exponent as an `Fe` of `n` (used by the CRT fault check to
     // re-encrypt `m^e mod n`). e < 2³² < n, so this never overflows.
     const e_fe = Fe.fromBytes(n, eb, .big) catch return error.InvalidPrivateKey;
 
-    // qInv = q⁻¹ mod p = (q mod p)^(p-2) mod p — Fermat inversion, valid for
-    // prime p. NOT constant-time: the exponent p-2 is secret, and ff's pow
-    // branches on its windows in ReleaseFast (measured 2026-10-02). Key
-    // import is variable-time anyway (the big.int derivation above); SPEC
-    // § Backlog "constant-time key generation and import" covers both.
-    const q_mod_p = reduceWide(p, q.v);
-    if (q_mod_p.isZero()) return error.InvalidPrivateKey;
-    const two = Fe.fromPrimitive(u8, p, 2) catch return error.InvalidPrivateKey;
-    const p_minus_2 = p.sub(p.zero, two); // (0 - 2) mod p = p - 2
-    const qinv = p.pow(q_mod_p, p_minus_2) catch return error.InvalidPrivateKey;
-    // Self-check qInv·q ≡ 1 (mod p): catches a non-prime p sneaking past.
-    if (!p.mul(qinv, q_mod_p).eql(p.one())) return error.InvalidPrivateKey;
+    // qInv = q⁻¹ mod p = (q mod p)^(p−2) mod p — Fermat inversion on montint
+    // (constant-time in p, q); the self-check qInv·q ≡ 1 (mod p) also
+    // catches a non-prime p sneaking past (Fermat's answer is then wrong).
+    // From the limbs with the length the byte strings already give (the key
+    // size, public) — `montParamsFromModulus` would scan the secret value
+    // for it.
+    const p_mont = MontParams.fromLimbsBits(&pv, bitLenBe(pb)) catch return error.InvalidPrivateKey;
+    const q_mont = MontParams.fromLimbsBits(&qv, bitLenBe(qb)) catch return error.InvalidPrivateKey;
+    var q_mod_p = p_mont.reduceLimbs(&qv);
+    defer std.crypto.secureZero(u64, &q_mod_p);
+    var pm2 = pv;
+    defer std.crypto.secureZero(u64, &pm2);
+    var two = MontParams.zero;
+    two[0] = 2;
+    _ = montint.limbs.subInto(&pm2, &two);
+    var qinv_el = p_mont.pow(&q_mod_p, &pm2);
+    defer std.crypto.secureZero(u64, &qinv_el);
+    var one = MontParams.zero;
+    one[0] = 1;
+    if (!MontParams.eql(&p_mont.mul(&qinv_el, &q_mod_p), &one)) return error.InvalidPrivateKey;
 
+    // Into the `ff` carrier fields by a positional repack (ff's own
+    // `fromBytes` branches on the value): d < λ < n, dP < p, dQ < q,
+    // qInv < p.
     return .{
         .n = n,
-        .d = d,
+        .d = MontParams.elemToFf(Fe, n, &d_el),
         .p = p,
         .q = q,
-        .dp = dp,
-        .dq = dq,
-        .qinv = qinv,
+        .dp = MontParams.elemToFf(Fe, p, &dp_el),
+        .dq = MontParams.elemToFf(Fe, q, &dq_el),
+        .qinv = MontParams.elemToFf(Fe, p, &qinv_el),
         .e = e_fe,
         .n_mont = montParamsFromModulus(n),
-        .p_mont = montParamsFromModulus(p),
-        .q_mont = montParamsFromModulus(q),
+        .p_mont = p_mont,
+        .q_mont = q_mont,
     };
+}
+
+/// Bit length of a stripped big-endian byte string (`be[0] != 0`): its
+/// length, which for a key component is the public key size.
+fn bitLenBe(be: []const u8) usize {
+    return 8 * be.len - @clz(be[0]);
+}
+
+/// Little-endian limbs → big-endian bytes filling `out` (positions only).
+fn limbsToBe(v: []const u64, out: []u8) void {
+    for (out, 0..) |*o, i| {
+        const pos = out.len - 1 - i;
+        o.* = if (pos / 8 < v.len) @truncate(v[pos / 8] >> @intCast(8 * (pos % 8))) else 0;
+    }
 }
 
 // ── low-level primitives (RFC 8017 §5) ───────────────────────────────────────
@@ -2018,14 +2045,18 @@ fn parsePrivateSection(section: []const u8, cipher: OpensshCipher, encrypted: bo
 // a worst-case (adversarial-composite) error bound of 4^-64 = 2^-128 per
 // accepted candidate — for self-generated random candidates the
 // average-case error (Damgård-Landrock-Pomerance) is far smaller still.
-// Witnesses are drawn from the caller's `random`, uniformly in [2, n-2].
+// Witnesses are drawn from the caller's `random`, uniformly in
+// [2, 2^(bits−1)) — below every candidate by its length, so no draw is
+// compared against the secret.
 //
-// Timing: prime generation is inherently variable-time (the search loop
-// itself is data-dependent — every implementation's is). The modexps inside
-// Miller-Rabin still use `ff`'s constant-time `powWithEncodedExponent`
-// path, and all candidate/intermediate buffers are `secureZero`ed; what
-// unavoidably remains observable is how *long* the search took, which
-// reveals nothing useful about the primes that were kept.
+// Timing: the search loop is data-dependent (every implementation's is),
+// but what it reveals is about REJECTED candidates. Along the path a kept
+// prime takes, Miller-Rabin is constant-time in its value since 2026-10-03
+// (`montint.DynModint.isProbablePrime`: montint ladder, `p − 1 = d·2^s` by
+// masked shifts, round verdicts OR-ed before the one branch) — `ff`'s pow,
+// used until then, branches on its exponent windows in ReleaseFast. Still
+// observable: `s` (the 2-adic valuation of `p − 1`, via the squaring count)
+// and the trial-division sieve's `%` on the candidate (`bytesMod`).
 
 /// Miller-Rabin rounds per candidate — see the section comment above for the
 /// FIPS 186-5 Table B.1 rationale.
@@ -2070,90 +2101,19 @@ fn bytesMod(bytes: []const u8, divisor: u64) u64 {
     return r;
 }
 
-/// In-place big-endian right shift by `s` bits (zero-fill from the left).
-fn shrBytesBe(buf: []u8, s: usize) void {
-    const byte_sh = s / 8;
-    const bit_sh: u4 = @intCast(s % 8);
-    var i: usize = buf.len;
-    while (i > 0) {
-        i -= 1;
-        const lo: u16 = if (i >= byte_sh) buf[i - byte_sh] else 0;
-        const hi: u16 = if (i >= byte_sh + 1) buf[i - byte_sh - 1] else 0;
-        buf[i] = @truncate(((hi << 8) | lo) >> bit_sh);
-    }
-}
-
 /// Set bit `bit` (LSB = 0) of a big-endian byte string.
 fn setBitBe(buf: []u8, bit: usize) void {
     buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
 }
 
-/// Uniform random Miller-Rabin witness in [2, n-2] by rejection sampling
-/// (mask to n's bit length, retry on out-of-range — expected < 2 draws).
-fn randomWitness(m: Modulus, random: std.Random) Fe {
-    const n_bits = m.bits();
-    const n_len = byteLen(n_bits);
-    const n_minus_1 = m.sub(m.zero, m.one());
-    var buf: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, buf[0..n_len]);
-    while (true) {
-        random.bytes(buf[0..n_len]);
-        buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
-        const a = Fe.fromBytes(m, buf[0..n_len], .big) catch continue; // >= n: redraw
-        if (a.isZero() or a.eql(m.one()) or a.eql(n_minus_1)) continue; // outside [2, n-2]
-        return a;
-    }
-}
-
-/// Miller-Rabin probable-prime test with `mr_rounds` random witnesses from
-/// `random`. `m` must be an odd integer >= 5 (every `Modulus` is odd by
-/// construction; callers here only ever pass >= 2^255). Returns false iff a
-/// witness proves `m` composite.
+/// Miller-Rabin with `mr_rounds` witnesses on an `ff` modulus — the
+/// tests' entry point (their known primes and composites); the search
+/// itself calls `DynModint.isProbablePrime` on the candidate directly.
 fn isProbablePrime(m: Modulus, random: std.Random) bool {
-    const n_len = byteLen(m.bits());
-
-    // n - 1 = d * 2^s with d odd: n is odd, so n-1 is just n with the low
-    // bit cleared, s = ctz(n-1) >= 1, d = (n-1) >> s.
-    var d_buf: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, d_buf[0..n_len]);
-    m.toBytes(d_buf[0..n_len], .big) catch unreachable; // buffer is exactly byteLen(bits)
-    d_buf[n_len - 1] &= 0xfe;
-    var s: usize = 0;
-    var i: usize = n_len;
-    while (i > 0) {
-        i -= 1;
-        if (d_buf[i] == 0) {
-            s += 8;
-        } else {
-            s += @ctz(d_buf[i]);
-            break;
-        }
-    }
-    shrBytesBe(d_buf[0..n_len], s);
-    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
-
-    const one = m.one();
-    const n_minus_1 = m.sub(m.zero, one);
-
-    var round: usize = 0;
-    rounds: while (round < mr_rounds) : (round += 1) {
-        const a = randomWitness(m, random);
-        // a^d mod n. d is derived from the candidate (secret for the prime
-        // that is kept), and ff's pow branches on its windows in
-        // ReleaseFast (measured 2026-10-02) — keygen is variable-time, see
-        // SPEC § Backlog "constant-time key generation and import".
-        var x = m.powWithEncodedExponent(a, d_bytes, .big) catch unreachable; // d is odd, never 0
-        if (x.eql(one) or x.eql(n_minus_1)) continue :rounds;
-        var j: usize = 1;
-        while (j < s) : (j += 1) {
-            x = m.sq(x);
-            if (x.eql(n_minus_1)) continue :rounds;
-            // A nontrivial square root of 1: composite for sure — stop early.
-            if (x.eql(one)) return false;
-        }
-        return false; // never hit n-1: `a` witnesses compositeness
-    }
-    return true;
+    var v = MontParams.elemFromFf(&m.v);
+    defer std.crypto.secureZero(u64, &v);
+    const mc = MontParams.fromLimbsBits(&v, m.bits()) catch return false;
+    return mc.isProbablePrime(random, mr_rounds);
 }
 
 /// Draw random odd candidates of exactly `prime_bits` bits with the top two
@@ -2184,9 +2144,14 @@ fn generatePrime(random: std.Random, prime_bits: usize, e: u64, out: []u8) void 
         const p1_mod_e = (p_mod_e + e - 1) % e; // no overflow: e < 2^32
         if (p1_mod_e == 0 or std.math.gcd(e, p1_mod_e) != 1) continue :candidates;
 
-        // Odd, >= 3, <= max_modulus_len bytes: Modulus.fromBytes can't fail.
-        const m = Modulus.fromBytes(out, .big) catch unreachable;
-        if (isProbablePrime(m, random)) return;
+        // Odd, exactly prime_bits bits (both set above): the candidate as a
+        // montint modulus of known length, Miller-Rabin on it constant-time
+        // in its value along a prime's path (`DynModint.isProbablePrime`).
+        var v = MontParams.loadBE(out) catch unreachable; // <= max_modulus_len bytes
+        defer std.crypto.secureZero(u64, &v);
+        var m = MontParams.fromLimbsBits(&v, prime_bits) catch unreachable;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
+        if (m.isProbablePrime(random, mr_rounds)) return;
     }
 }
 

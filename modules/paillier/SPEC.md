@@ -45,8 +45,9 @@ CRT/Garner recombination, the L-function and the `g^m` products — runs on
 `mulPlaintext`'s `c^k mod n²`) are routed through the sibling `montint` module instead
 (full-radix-2^64 Montgomery modexp, sized to the actual key width — ~3–4× faster than
 `ff` on `decrypt`/`encrypt`, plus a further ~3.4× for `decrypt` from Paillier-CRT when the
-key carries its factors). `std.math.big.int` is used only for the one-off derivations
-`ff` has no primitive for (gcd/lcm, extended-Euclid inverse, the exact L division).
+key carries its factors). `std.math.big.int` is used only for the PUBLIC `n² = n·n` and
+`g = n + 1` of `PublicKey.fromBytes`/`SecretKey.fromBytes`; `fromPrimes`'s derivation runs on
+montint limbs (`montint.nt`, `DynModint.inverse`) since 2026-10-03.
 
 **The `g = n+1` binomial shortcut.** For the standard generator the binomial theorem
 collapses `(1+n)^m = Σ C(m,k)·n^k ≡ 1 + m·n (mod n²)` (every k ≥ 2 term carries an n²
@@ -99,10 +100,9 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   may be a secret scalar. When the key carries its factors (`SecretKey.crt`, the
   `fromPrimes`/`generate` case), `decrypt` additionally splits into the Paillier-CRT
   path: two half-width constant-time `montint` modexps (`c^dp mod p²`, `c^dq mod q²`)
-  Garner-recombined — see "CRT decrypt" below. `fromPrimes`'s `g^λ mod n²` still uses
-  `std.crypto.ff`'s `Modulus.pow`, which is NOT constant-time in ReleaseFast (its window select
-  compiles to a conditional jump on `λ`; measured 2026-10-02) — part of the variable-time key
-  derivation below. `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take
+  Garner-recombined — see "CRT decrypt" below. `fromPrimes` no longer computes `g^λ mod n²`
+  at all (2026-10-03: for `g = n+1`, `L(g^λ mod n²) = λ` exactly, so `µ = λ⁻¹ mod n`).
+  `encrypt`/`addPlaintext` under a caller-supplied non-standard `g` take
   `g^m` through `montint` since 2026-10-02 (it was ff's pow, leaking the plaintext's windows).
   Constant-time in the secret exponent/scalar's *value*. `mulPlaintext`'s
   `if (k.isZero())` short-circuit — a direct branch on `k` before the modexp, found by the
@@ -130,20 +130,29 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
 - `encrypt`'s `r^n` term uses `montint` too (the same `pk.n_sq_mont` params `mulPlaintext`
   now shares), sized to the public modulus `n`'s width; the base `r` may be secret
   (semantic security depends on it, see below) and the ladder does not branch on it.
-- `fromPrimes`'s one-time key derivation drops to `std.math.big.int`
-  (variable-time extended-Euclid/gcd/lcm, exactly like `rsa.fromPrimesImpl` does for its
-  own `d = e⁻¹ mod λ(n)`) — a one-time key-import cost, not a per-operation leak, same
-  rationale as `rsa`'s SPEC.md.
+- **`fromPrimes`'s key derivation is constant-time in p, q (2026-10-03)** — it was
+  `std.math.big.int` (gcd, divFloor, extended Euclid) and `ff`'s pow. Now: `n`, `n²`, `p²`,
+  `q²` limb products; `λ = montint.nt.lcm(p−1, q−1)`; `µ = λ⁻¹ mod n` (`DynModint.inverse`,
+  closed form of `L(g^λ mod n²)⁻¹` for `g = n+1` — byte-identical; the old L-exactness
+  check could never fail for this `g`, and the inversion's verdict is the `gcd(n, φ(n)) = 1`
+  check); CRT exponents `λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p)` (`nt.divExact` by the even
+  `p − 1`); Garner `(p²)⁻¹ mod q²` (`inverse`); factor checks by montint Miller-Rabin and a
+  borrow-based closeness compare. ctgrind `keygen` (p, q tainted): no context in that
+  arithmetic; the ≤ 294 left are the `ff` carriers of `p²`, `q²` and of the public `n`, `n²`
+  (Backlog), the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve
+  and its factor-keyed witness stream, length verdicts and the reject verdicts — each class
+  named in `ctgrind-expected.tsv`.
 - **The L-function is constant-time (2026-10-02).** `decrypt`'s exact `(x−1)/n` used to
   drop to `std.math.big.int`'s `divFloor`, variable-time in `x`, whose quotient is
   `m·λ mod n` — the plaintext and the key (wave-3 audit: most of `decrypt`'s contexts sat
   on it). It is now `DynModint.divExact`: Hensel division, `q = (x−1)·n⁻¹ mod 2^(64·L)`,
   then `q·n = x − 1` checked over the full width — the same quotient when the division is
   exact, the same `error.InvalidCiphertext` when it is not, no branch on either value.
-- Prime generation (`generate`) is inherently variable-time in how *long* the search
-  takes (every implementation's is); all candidate buffers are `secureZero`ed. The
-  Miller-Rabin modexps use `ff`'s pow, which branches on the candidate-derived exponent in
-  ReleaseFast — keygen is variable-time, same as `rsa` (Backlog).
+- Prime generation (`generate`) is variable-time in how *long* the search takes (every
+  implementation's is), which is about rejected candidates; all candidate buffers are
+  `secureZero`ed. Along a kept prime's path Miller-Rabin is `DynModint.isProbablePrime`
+  (constant-time in the value since 2026-10-03); observable: `s = v2(p − 1)` and the sieve's
+  `%` (Backlog).
 - **This section now has an instrument, not just prose** —
   `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
   `mul`/`addm`); previously none of the sentences above had a measurement behind them
@@ -187,9 +196,8 @@ silently assumed.
   (e.g. `p=5, q=11`: `n=55`, `λ=20`, `5 | gcd(20,55)`). Rejected via the `μ`-invertibility
   self-check above, under the same `error.InvalidPrimes` as every other rejection reason —
   the error name does not say which precondition failed (paillier F9, wave-3 audit).
-- **Timing:** see "Constant-time discipline" above (secret-exponent modexps constant-time;
-  decrypt's L-division and keygen's big.int derivation variable-time with documented
-  rationale).
+- **Timing:** see "Constant-time discipline" above (secret-exponent modexps, decrypt's
+  L-division and — since 2026-10-03 — key derivation constant-time; documented residue).
 - **Malicious-ciphertext robustness is NOT provided.** `decrypt` rejects the cheaply
   detectable garbage (`c = 0`, non-units mod `n`, anything failing `x ≡ 1 (mod n)`), but
   Paillier ciphertexts are malleable *by design* (that's the feature) — nothing here
@@ -251,12 +259,11 @@ The correctness anchors, in order of strength:
 
 ## Backlog / deferred
 
-- **Key generation off `std.crypto.ff`** *(2026-10-02; operations done 2026-10-02)*: ff is
-  not constant-time in ReleaseFast (ctgrind: `montgomeryMul`'s extra-reduction select, pow's
-  window select). Every per-operation secret path moved to `montint.DynModint` on
-  2026-10-02 (Garner, L-function, `g^m · r^n`, `addPlaintext`); still on ff: key generation
-  (`g^λ`, `(p²)⁻¹ mod q²`, Miller-Rabin), variable-time anyway through `std.math.big.int`.
-  Effort: medium (needs a CT prime search, see `rsa`'s backlog).
+- ~~**Key generation off `std.crypto.ff`**~~ *(2026-10-02)*: ✅ 2026-10-03 — derivation,
+  factor checks and Miller-Rabin on montint (see "Constant-time discipline"). Left: the
+  `ff` `Modulus` carriers of `p²`, `q²` (`crt.p_sq`/`crt.q_sq`, used to reduce `c`
+  before the montint path — replaceable by `p_sq_mont`/`q_sq_mont` alone; Effort S–M) and
+  the sieve's `bytesMod` `%` plus the observable `s` (as `rsa`'s Backlog item). Fits §2.
 - Phase 2 (separate later module, depends on this one): proof of correct encryption, range
   proofs, MtA — see "Phase-2 boundary" above.
 

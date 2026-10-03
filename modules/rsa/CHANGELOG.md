@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Key derivation and Miller-Rabin are constant-time in the
+  primes.** `SecretKey.fromPrimes` computes `n`, `λ = lcm(p−1, q−1)`
+  (`montint.nt.lcm`), `d`/`dP`/`dQ` (`DynModint.inverseOfModulus`, inverses
+  modulo even secrets) and `qInv` (Fermat on montint) on montint limbs instead
+  of `std.math.big.int`'s gcd/divFloor/extended Euclid and `std.crypto.ff`'s
+  pow; the values are unchanged (the OpenSSL KAT pins all four). `generate`'s
+  Miller-Rabin runs on `DynModint.isProbablePrime`. New ctgrind target
+  `keygen`. Remaining: `ff` `Modulus` carriers of `p`, `q` (Backlog). Key import
+  costs a few milliseconds more (gcd/lcm at the full 4096-bit capacity).
+
 - **2026-10-02** — **The whole private-key path is off `std.crypto.ff`.**
   The CRT op's reduction of `c` mod p/q, the Garner recombination, the base
   blinding/unblinding and the F3 re-encryption ran in `std.crypto.ff`, whose

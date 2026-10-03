@@ -115,12 +115,13 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-const Target = enum { crt, noncrt };
+const Target = enum { crt, noncrt, keygen };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "crt")) return .crt;
     if (std.mem.eql(u8, s, "noncrt")) return .noncrt;
+    if (std.mem.eql(u8, s, "keygen")) return .keygen;
     return error.UnknownTarget;
 }
 
@@ -156,11 +157,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target_arg });
 
-    // Key construction (variable-time by SPEC's own admission: fromPrimes'
-    // n/lambda/d/dP/dQ derivation uses std.math.big.int) runs entirely on the
-    // UNTAINTED fixed KAT bytes -- this is the one-time key-import cost the
-    // module's doc comment excludes from the constant-time claim, not the
-    // per-operation path this harness measures.
+    // Target `keygen` (2026-10-03): `fromPrimes` itself on TAINTED p, q —
+    // n, λ = lcm(p−1, q−1), d/dP/dQ (inverses modulo even secrets), qInv by
+    // Fermat, all montint since that day. What it still branches on is the
+    // documented residue (ff's `Modulus` carriers for p, q; the verdicts).
+    if (target == .keygen) {
+        var p = kat_p;
+        var q = kat_q;
+        taintBytes(taint, &p);
+        taintBytes(taint, &q);
+        const pr = reloadVolatile([kat_p.len]u8, &p);
+        const qr = reloadVolatile([kat_q.len]u8, &q);
+        var key = try rsa.SecretKey.fromPrimes(&pr, &qr, &kat_e);
+        defer key.deinit();
+        var d_out: [modulus_len]u8 = undefined;
+        try key.d.toBytes(&d_out, .big);
+        std.debug.print("d={x}\n", .{d_out});
+        return;
+    }
+
+    // For `crt`/`noncrt`, key construction runs on the UNTAINTED fixed KAT
+    // bytes — the per-operation path is what those targets measure; the
+    // import itself is target `keygen`'s.
     var sk = try rsa.SecretKey.fromPrimes(&kat_p, &kat_q, &kat_e);
     const pk = try rsa.PublicKey.fromBytes(&kat_n, &kat_e);
 
@@ -194,6 +212,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .noncrt => {
             taintBytes(taint, std.mem.asBytes(&sk.d));
         },
+        .keygen => unreachable, // returned above
     }
 
     const sk_reloaded = reloadVolatile(rsa.SecretKey, &sk);
@@ -202,6 +221,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     switch (target) {
         .crt => out = try rsa.rsadpCrt(modulus_len, c, sk_reloaded),
         .noncrt => out = try rsa.rsadp(modulus_len, c, sk_reloaded),
+        .keygen => unreachable,
     }
 
     // Propagation proof: format the (tainted, if taint=yes) result through a

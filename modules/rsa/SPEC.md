@@ -77,11 +77,21 @@ Montgomery-resident, constant-time modexp, ~3× faster than `std.crypto.ff` on t
 see "Speed" below), and since 2026-10-02 so does every other operation on a private-key value:
 the reduction of `c` into the mod-p/mod-q domains, the CRT recombination (Garner), base
 (un)blinding and the F3 re-encryption, all on `montint.DynModint`. `std.crypto.ff`
-(`Modulus`/`Fe`) remains the carrier type of the public API and of key material, and does the
-key-import arithmetic; `dP`/`dQ`/`qInv` cross into montint by a positional limb repack.
-Measured (ctgrind, ReleaseFast, 2048-bit KAT key): `crt` 213 → 1 in-file contexts — the one
-left is the F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` — and
-`noncrt` 2 → 0. The 212 that went were `std.crypto.ff`'s `reduce` (`shiftIn`, the
+(`Modulus`/`Fe`) remains the carrier type of the public API and of key material;
+`dP`/`dQ`/`qInv` cross into montint by a positional limb repack.
+Measured (ctgrind, ReleaseFast, 2048-bit KAT key): `crt` 213 → 2 in-file contexts — both the
+F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` (the compare and the
+`try` that propagates it) — and `noncrt` 2 → 0.
+**Key derivation (2026-10-03)** is montint limb arithmetic too, constant-time in `p`, `q`:
+`n` a limb product, `λ = montint.nt.lcm(p−1, q−1)`, `d = e⁻¹ mod λ`, `dP = e⁻¹ mod (p−1)`,
+`dQ = e⁻¹ mod (q−1)` by `DynModint.inverseOfModulus` (inverses modulo even secrets; `dP` IS
+`d mod (p−1)` since `(p−1) | λ`), `qInv` by Fermat on montint with its self-check kept; the
+values are byte-identical to the big-int derivation they replace (the OpenSSL KAT pins
+`d`/`dP`/`dQ`/`qInv`). `generate`'s Miller-Rabin is `DynModint.isProbablePrime`. ctgrind
+`keygen` (p, q tainted): no context in the derivation's arithmetic; the ≤ 173 left are the
+`std.crypto.ff` carriers of `p`, `q`, `n` (`sk.p`/`sk.q` are API fields — Backlog), the public
+`n` (tainted by derivation in the harness), length scans and verdicts, each class named in
+`ctgrind-expected.tsv`. The 212 that went were `std.crypto.ff`'s `reduce` (`shiftIn`, the
 compare-and-subtract) and `montgomeryMul` over the secret primes. This module must never
 implement its own bignum or a non-constant-time exponentiation over secret data. `rsasp1`/
 `rsadpCrt` are the CRT fast path (RFC 8017 §5.1.2 form (2)); `rsadp`/non-CRT `d` exist as the
@@ -220,16 +230,18 @@ as a measurement rather than a rediscovery.
   above.
 - Anything not covered by the phase list above (there is no known scope gap versus RFC 8017 P1–P6
   today; flag here if one is found).
-- **Constant-time key generation and import** *(2026-10-02)*: the per-operation paths are
-  montint and measured (ctgrind `crt`/`noncrt`), but key construction is not constant-time and
-  this SPEC never said so: `fromPrimes` derives `d`/`dP`/`dQ` with `std.math.big.int`
-  (variable-time extended Euclid), computes `qInv = q^(p-2) mod p` with `std.crypto.ff`'s pow, and
-  `generate`'s Miller-Rabin raises witnesses to the candidate-derived `d` with the same pow —
-  whose window select compiles to a conditional jump in ReleaseFast (measured 2026-10-02, see
-  `montint`'s ctgrind `ffcontrol`). One trace per key, and the binary-GCD class of keygen attack
-  (Aldaya et al. 2019) is the realistic one. Fix: montint for qInv and Miller-Rabin (secret
-  modulus via `fromElem` from a branchless load, as `montParamsFromModulus` already does), a
-  constant-time modular inverse for `d`. Effort: medium. Fits §2.
+- ~~**Constant-time key generation and import**~~ *(2026-10-02)*: ✅ 2026-10-03 — `fromPrimes`'s
+  derivation on montint (`nt.lcm`, `inverseOfModulus`, Fermat `qInv`), `generate`'s
+  Miller-Rabin on `DynModint.isProbablePrime`; ctgrind `keygen`. Left (each its own item below).
+- **`p`, `q` as `std.crypto.ff` `Modulus` carriers** *(2026-10-03)*: `sk.p`/`sk.q` are public
+  API fields of ff's type, and `Modulus.fromBytes` on them branches on the value (`shrink`,
+  `shiftIn`, `computeRR` — most of ctgrind `keygen`'s ≤ 173). Fix: carry the CRT primes as
+  `DynModint` only (`p_mont`/`q_mont` exist) and keep the ff `Modulus` for public values —
+  breaking for callers that read `sk.p`/`sk.q`. Effort: medium. Fits §2.
+- **Prime search sieve** *(2026-10-03)*: `bytesMod`'s `%` on the candidate (variable-latency
+  division) and Miller-Rabin's squaring count `s = v2(p − 1)` stay observable for a kept
+  prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole table, and
+  `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits §2.
 - **Wycheproof RSA vectors** *(survey 2026-09-30)*: PKCS#1 v1.5 verify (`rsa_signature_*`), PSS verify and OAEP decrypt are where RSA implementations historically fail (BER-lax parsing, padding-check leaks); today's evidence is OpenSSL-generated valid signatures, not malformed ones. Effort: small–medium (test data, three runners). Fits §2.
 - **Moduli above 4096 bits** *(survey 2026-09-30)*: `max_modulus_bits = 4096` is a compile-time constant of `std.crypto.ff.Uint`, so an 8192-bit key (rare, but certificates and OpenSSH keys exist) is rejected at parse. Effort: medium (re-instantiate `Uint`/`Modulus`, check the `montint` limb capacity and the stack cost of a `SecretKey`). Fits §2.
 - **Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)** *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.

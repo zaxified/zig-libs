@@ -166,7 +166,7 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-const Target = enum { crt, noncrt, mul, addm };
+const Target = enum { crt, noncrt, mul, addm, keygen };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -174,6 +174,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "noncrt")) return .noncrt;
     if (std.mem.eql(u8, s, "mul")) return .mul;
     if (std.mem.eql(u8, s, "addm")) return .addm;
+    if (std.mem.eql(u8, s, "keygen")) return .keygen;
     return error.UnknownTarget;
 }
 
@@ -213,11 +214,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target_arg });
 
-    // One-time key derivation (variable-time by SPEC's own admission,
-    // exactly like `rsa.SecretKey.fromPrimes`) runs entirely on the
-    // UNTAINTED fixed primes above — the one-time key-import/derivation
-    // cost the module's doc comment excludes from the constant-time claim,
-    // not the per-operation path this harness measures.
+    // Target `keygen` (2026-10-03): `fromPrimes` itself on TAINTED p, q —
+    // the factor checks (montint Miller-Rabin, closeness), n, λ by
+    // `montint.nt.lcm`, µ = λ⁻¹ mod n, the CRT exponents and the Garner
+    // coefficient, all montint since that day. Residue: the ff carriers of
+    // p², q² and of the (derived, so tainted here) public n, n², g.
+    if (target == .keygen) {
+        var p = harness_p;
+        var q = harness_q;
+        taintBytes(taint, &p);
+        taintBytes(taint, &q);
+        const pr = reloadVolatile([harness_p.len]u8, &p);
+        const qr = reloadVolatile([harness_q.len]u8, &q);
+        var key = try paillier.fromPrimes(&pr, &qr);
+        defer key.secret.deinit();
+        printFe("lambda", key.secret.lambda);
+        return;
+    }
+
+    // For the other targets the one-time key derivation runs on the
+    // UNTAINTED fixed primes above — the per-operation path is what they
+    // measure; the derivation itself is target `keygen`'s.
     const kp = try paillier.fromPrimes(&harness_p, &harness_q);
     const pk = kp.public;
 
@@ -297,5 +314,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const c = try paillier.addPlaintext(pk, c0, m_reloaded);
             printCiphertext("c", c);
         },
+        .keygen => unreachable, // returned above
     }
 }

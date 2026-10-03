@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **`fromPrimes`/`generate` are constant-time in the primes.**
+  λ by `montint.nt.lcm`, `µ = λ⁻¹ mod n` by `DynModint.inverse` (the closed form
+  of `L(g^λ mod n²)⁻¹` for `g = n+1`; no more `g^λ` through `std.crypto.ff`'s
+  branching pow), the CRT exponents by `nt.divExact` + reduction, the Garner
+  coefficient by `inverse`, the factor checks by montint Miller-Rabin
+  (`DynModint.isProbablePrime`) and a borrow-based closeness compare. Keys are
+  byte-identical. New tests: the closeness guard exactly at `2^(nlen/2 − 100)`,
+  CRT exponents of unequal-size factors pinned to Python's values. New ctgrind
+  target `keygen`. Remaining: `ff` carriers of `p²`, `q²` (Backlog).
+
 - **2026-10-02** — **Decryption and the homomorphic ops are off
   `std.crypto.ff`, and the L-function is constant-time.** The CRT reduction and
   Garner recombination, `g^m`'s `1 + m·n`, the `g^m · r^n` and `c · g^m`

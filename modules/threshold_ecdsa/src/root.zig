@@ -776,73 +776,22 @@ fn setBitBe(buf: []u8, bit: usize) void {
 /// for it; any other `m` is reported composite. `pub` for the ctgrind
 /// harness (target `prime`).
 ///
-/// Constant-time in `m`'s value along the path a PRIME takes (2026-10-02):
-/// this runs on the secret candidates of `generateSafePrime`/
-/// `generateBlumPrime`, so the ladder is montint's (`DynModint.pow` modulo
-/// the secret `m`, where `std.crypto.ff`'s pow branched on its windows), the
-/// witnesses are drawn below `2^(bits−1)` (always `< m`, so no rejection
-/// compares a public draw against the secret `m`), and a round's two
-/// verdicts `x = 1`/`x = −1` are combined before the one branch — for a prime
-/// with `s = 1` (every candidate here is `≡ 3 mod 4`) the round always passes,
-/// and which of the two held is the Legendre symbol of the public witness
-/// modulo the secret prime. What a REJECTED candidate reveals is about a
-/// value that is thrown away. Variable-time still: the `s` scan (public for
-/// these candidates) and `bytesMod`'s trial division in the callers' sieve.
+/// Constant-time in `m`'s value along the path a PRIME takes: this runs on
+/// the secret candidates of `generateSafePrime`/`generateBlumPrime`. Since
+/// 2026-10-03 it is `montint.DynModint.isProbablePrime` (the recipe this
+/// function introduced on 2026-10-02, moved into montint so `rsa` and
+/// `paillier` share it): montint ladder modulo the secret `m`, witnesses
+/// below `2^(bits−1)` (no compare against `m`), `m − 1 = d·2^s` by masked
+/// shifts, a round's verdicts OR-ed before the one branch. Variable-time
+/// still: the squaring count `s` (`= 1` for every candidate here, all
+/// `≡ 3 mod 4`) and `bytesMod`'s trial division in the callers' sieve.
 pub fn isProbablePrime(m: AuxModulus, n_bits: usize, random: std.Random) bool {
     const D = montint.DynModint(aux_modulus_bits);
     var mv = D.elemFromFf(&m.v);
     defer std.crypto.secureZero(u64, &mv);
     var mc = D.fromLimbsBits(&mv, n_bits) catch return false;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&mc));
-    if (n_bits < 3) return n_bits == 2; // m = 3
-
-    var one = D.zero;
-    one[0] = 1;
-    var mm1 = mc.m;
-    defer std.crypto.secureZero(u64, &mm1);
-    _ = montint.limbs.subInto(&mm1, &one);
-    // m − 1 = d·2^s
-    var s: usize = 0;
-    while ((mm1[s / 64] >> @intCast(s % 64)) & 1 == 0) s += 1;
-    var d = D.zero;
-    defer std.crypto.secureZero(u64, &d);
-    for (&d, 0..) |*w, i| {
-        const lo_i = i + s / 64;
-        const lo: u64 = if (lo_i < D.max_limbs) mm1[lo_i] else 0;
-        const hi: u64 = if (lo_i + 1 < D.max_limbs) mm1[lo_i + 1] else 0;
-        const sh: u6 = @intCast(s % 64);
-        w.* = if (sh == 0) lo else (lo >> sh) | (hi << @intCast(64 - @as(u7, sh)));
-    }
-
-    const n_len = byteLen(n_bits - 1);
-    const top_mask = @as(u8, 0xff) >> @intCast(8 * n_len - (n_bits - 1));
-    var buf: [aux_modulus_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &buf);
-    var round: usize = 0;
-    rounds: while (round < aux_mr_rounds) : (round += 1) {
-        // A public witness a ∈ [2, 2^(bits−1)): below m by its length.
-        var a: D.Elem = undefined;
-        while (true) {
-            random.bytes(buf[0..n_len]);
-            buf[0] &= top_mask;
-            a = D.loadBE(buf[0..n_len]) catch unreachable;
-            var hi_or: u64 = 0;
-            for (a[1..]) |w| hi_or |= w;
-            if (hi_or != 0 or a[0] >= 2) break;
-        }
-        var x = mc.pow(&a, &d);
-        defer std.crypto.secureZero(u64, &x);
-        const pass = @intFromBool(D.eql(&x, &one)) | @intFromBool(D.eql(&x, &mm1));
-        if (pass == 1) continue :rounds;
-        var j: usize = 1;
-        while (j < s) : (j += 1) {
-            x = mc.sq(&x);
-            if (D.eql(&x, &mm1)) continue :rounds;
-            if (D.eql(&x, &one)) return false;
-        }
-        return false;
-    }
-    return true;
+    return mc.isProbablePrime(random, aux_mr_rounds);
 }
 
 /// Search for a SAFE prime p̃ = 2p' + 1 (p' also prime) of exactly

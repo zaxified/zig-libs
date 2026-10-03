@@ -43,6 +43,17 @@
 const std = @import("std");
 const montint = @import("montint.zig");
 const limbs = @import("limbs.zig");
+const nt = @import("nt.zig");
+const blackBox = nt.blackBox;
+const mulLow = nt.mulLow;
+const nzBit = nt.nzBit;
+const condSwap = nt.condSwap;
+const condNeg = nt.condNeg;
+const addMasked = nt.addMasked;
+const blend = nt.blend;
+const sar1 = nt.sar1;
+const halveMod = nt.halveMod;
+const divstepCount = nt.divstepCount;
 
 /// Slot granularity in limbs: a modulus runs on the next multiple of this.
 pub const step: usize = 4;
@@ -490,7 +501,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
                     const m = self.m[0..s];
-                    const inv = invPow2(s, m, self.n0inv);
+                    const inv = nt.invPow2(s, m);
                     var xl = [_]u64{0} ** s;
                     for (0..s) |i| xl[i] = if (i < x.len) x[i] else 0;
                     var qq: [s]u64 = undefined;
@@ -513,6 +524,65 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 }
             }
             unreachable;
+        }
+
+        // ── primality ───────────────────────────────────────────────────────
+
+        /// Miller-Rabin with `rounds` witnesses from `random`: `false` if one
+        /// proves this (odd) modulus composite. Build the modulus with
+        /// `fromLimbsBits` from the candidate's known length, so nothing
+        /// scans the secret value.
+        ///
+        /// Constant-time in the modulus's value along the path a PRIME takes
+        /// — this runs on the secret candidates of RSA/Paillier/aux prime
+        /// searches, where `std.crypto.ff`'s pow branched on its windows:
+        /// `m − 1 = d·2^s` comes from `nt.oddPart` (masked shifts); the
+        /// ladder is `pow` modulo the secret `m`; witnesses are drawn below
+        /// `2^(bits−1)`, so always `< m` with no compare against it; and a
+        /// round's verdicts (`x = 1` at the start, `x = −1` at any of the
+        /// `s` squarings) are OR-ed before the one branch, which a prime
+        /// always passes. What stays observable: `s` itself, through the
+        /// number of squarings (the 2-adic valuation of `p − 1`: about two
+        /// bits of a random prime on average, nothing for `p ≡ 3 mod 4`),
+        /// and everything about a REJECTED candidate, a value thrown away.
+        pub fn isProbablePrime(self: *const Self, random: std.Random, rounds: usize) bool {
+            if (self.nbits < 3) return true; // the only odd 2-bit modulus is 3
+            var one = zero;
+            one[0] = 1;
+            var mm1 = self.m;
+            defer std.crypto.secureZero(u64, &mm1);
+            mm1[0] &= ~@as(u64, 1); // m odd: m − 1 clears bit 0
+            var split = nt.oddPart(max_limbs, &mm1);
+            defer std.crypto.secureZero(u64, &split.u);
+
+            const wbits = self.nbits - 1;
+            const wlen = (wbits + 7) / 8;
+            const top_mask = @as(u8, 0xff) >> @intCast(8 * wlen - wbits);
+            var buf: [8 * max_limbs]u8 = undefined;
+            defer std.crypto.secureZero(u8, &buf);
+            var round: usize = 0;
+            while (round < rounds) : (round += 1) {
+                // A public witness a ∈ [2, 2^(bits−1)): below m by its length.
+                var a: Elem = undefined;
+                while (true) {
+                    random.bytes(buf[0..wlen]);
+                    buf[0] &= top_mask;
+                    a = loadBE(buf[0..wlen]) catch unreachable;
+                    var hi_or: u64 = 0;
+                    for (a[1..]) |w| hi_or |= w;
+                    if (hi_or != 0 or a[0] >= 2) break;
+                }
+                var x = self.pow(&a, &split.u);
+                defer std.crypto.secureZero(u64, &x);
+                var pass = @intFromBool(eql(&x, &one)) | @intFromBool(eql(&x, &mm1));
+                var j: usize = 1;
+                while (j < split.t) : (j += 1) {
+                    x = self.sq(&x);
+                    pass |= @intFromBool(eql(&x, &mm1));
+                }
+                if (pass == 0) return false;
+            }
+            return true;
         }
 
         // ── inversion ───────────────────────────────────────────────────────
@@ -638,7 +708,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var one = zero;
             one[0] = 1;
             _ = limbs.subInto(&t, &one);
-            const minv = invPow2(max_limbs, &self.m, self.n0inv);
+            const minv = nt.invPow2(max_limbs, &self.m);
             var kq: Elem = undefined;
             defer std.crypto.secureZero(u64, &kq);
             mulLow(max_limbs, &kq, &t, &minv); // k = (n·z − 1)/m
@@ -651,117 +721,6 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return (@intFromBool(ok) & nzBit(hi)) == 1;
         }
     };
-}
-
-/// Divsteps that bring `g` to zero for `0 ≤ g < f < 2^b` (Bernstein–Yang
-/// Theorem 11.2; see `inverse`).
-fn divstepCount(b: usize) usize {
-    return if (b < 46) (49 * b + 80) / 17 else (49 * b + 57) / 17;
-}
-
-/// `m⁻¹ mod 2^(64n)` for an odd `m` (only its low `n` limbs are read), by
-/// Newton from the 64-bit inverse `−n0inv`, precision doubling each step;
-/// the step count depends on `n` only.
-fn invPow2(comptime n: usize, m: []const u64, n0inv: u64) [n]u64 {
-    var inv = [_]u64{0} ** n;
-    inv[0] = 0 -% n0inv;
-    const mm: *const [n]u64 = m[0..n];
-    var prec: usize = 64;
-    while (prec < 64 * n) : (prec *= 2) {
-        var t: [n]u64 = undefined;
-        mulLow(n, &t, mm, &inv); // m·y
-        var two = [_]u64{0} ** n;
-        two[0] = 2;
-        _ = limbs.subInto(&two, &t); // 2 − m·y
-        var y: [n]u64 = undefined;
-        mulLow(n, &y, &inv, &two);
-        inv = y;
-    }
-    return inv;
-}
-
-/// 1 if `x ≠ 0`, else 0, without a comparison.
-inline fn nzBit(x: u64) u64 {
-    return (x | (0 -% x)) >> 63;
-}
-
-/// `(x, y) ← (y, x)` under an all-ones `mask`, else unchanged.
-inline fn condSwap(comptime n: usize, x: *[n]u64, y: *[n]u64, mask: u64) void {
-    for (x, y) |*a, *b| {
-        const t = (a.* ^ b.*) & mask;
-        a.* ^= t;
-        b.* ^= t;
-    }
-}
-
-/// `x ← −x` (two's complement over `n` limbs) under an all-ones `mask`.
-inline fn condNeg(comptime n: usize, x: *[n]u64, mask: u64) void {
-    var carry: u64 = mask & 1;
-    for (x) |*w| {
-        const r = @addWithOverflow(w.* ^ mask, carry);
-        w.* = r[0];
-        carry = r[1];
-    }
-}
-
-/// `x ← x + (y & mask)` over `n` limbs (wrapping).
-inline fn addMasked(comptime n: usize, x: *[n]u64, y: *const [n]u64, mask: u64) void {
-    var carry: u1 = 0;
-    for (x, y) |*a, b| {
-        const r1 = @addWithOverflow(a.*, b & mask);
-        const r2 = @addWithOverflow(r1[0], carry);
-        a.* = r2[0];
-        carry = r1[1] | r2[1];
-    }
-}
-
-/// `x ← y` under an all-ones `mask`, else unchanged.
-inline fn blend(comptime n: usize, x: *[n]u64, y: *const [n]u64, mask: u64) void {
-    for (x, y) |*a, b| a.* = (b & mask) | (a.* & ~mask);
-}
-
-/// Arithmetic shift right by one over `n` two's-complement limbs.
-inline fn sar1(comptime n: usize, x: *[n]u64) void {
-    for (0..n - 1) |i| x[i] = (x[i] >> 1) | (x[i + 1] << 63);
-    x[n - 1] = @bitCast(@as(i64, @bitCast(x[n - 1])) >> 1);
-}
-
-/// `e ← e/2 mod m` for `e < m`, `m` odd: `(e + (m if e odd))/2`, the
-/// carry of the addition shifted back in on top.
-inline fn halveMod(comptime n: usize, e: *[n]u64, m: *const [n]u64) void {
-    const mask = blackBox(0 -% (e[0] & 1));
-    var carry: u1 = 0;
-    for (e, m) |*a, b| {
-        const r1 = @addWithOverflow(a.*, b & mask);
-        const r2 = @addWithOverflow(r1[0], carry);
-        a.* = r2[0];
-        carry = r1[1] | r2[1];
-    }
-    for (0..n - 1) |i| e[i] = (e[i] >> 1) | (e[i + 1] << 63);
-    e[n - 1] = (e[n - 1] >> 1) | (@as(u64, carry) << 63);
-}
-
-/// Optimization barrier, as `Modint`'s: an empty asm the optimizer cannot see
-/// through, so a mask derived from a secret bit stays a mask.
-inline fn blackBox(x: u64) u64 {
-    if (@inComptime()) return x;
-    return asm volatile (""
-        : [ret] "=r" (-> u64),
-        : [x] "0" (x),
-    );
-}
-
-/// `z = x·y mod 2^(64n)` — the low half of the schoolbook product.
-fn mulLow(comptime n: usize, z: *[n]u64, x: *const [n]u64, y: *const [n]u64) void {
-    z.* = [_]u64{0} ** n;
-    for (0..n) |i| {
-        var carry: u64 = 0;
-        for (0..n - i) |j| {
-            const p = @as(u128, x[i]) * @as(u128, y[j]) + z[i + j] + carry;
-            z[i + j] = @truncate(p);
-            carry = @truncate(p >> 64);
-        }
-    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -1093,6 +1052,68 @@ test "DynModint inverseOfModulus: m⁻¹ mod n for even and odd n of any width" 
     try testing.expect(me.inverseOfModulus(&n, &y) and y[0] == 1 and D.isZero(&(y[1..].* ++ [_]u64{0})));
     n[0] = 65536; // 65537 ≡ 1 mod 2^16
     try testing.expect(me.inverseOfModulus(&n, &y) and y[0] == 1);
+}
+
+test "DynModint isProbablePrime: every odd m < 3000, Carmichael numbers, a 2048-bit safe prime" {
+    const D = DynModint(2048);
+    var prng = std.Random.DefaultPrng.init(0x6d725f74_657374);
+    const rnd = prng.random();
+    var mv = D.zero;
+    var m: u64 = 3;
+    while (m < 3000) : (m += 2) {
+        mv[0] = m;
+        const nbits = 64 - @clz(m);
+        const mod = try D.fromLimbsBits(&mv, nbits);
+        var is_prime = true;
+        var k: u64 = 3;
+        while (k * k <= m) : (k += 2) {
+            if (m % k == 0) is_prime = false;
+        }
+        try testing.expectEqual(is_prime, mod.isProbablePrime(rnd, 24));
+    }
+    // Carmichael numbers fool Fermat, not Miller-Rabin.
+    for ([_]u64{ 561, 1105, 1729, 41041, 825265, 321197185, 5394826801, 232250619601 }) |c| {
+        mv[0] = c;
+        const mod = try D.fromLimbsBits(&mv, 64 - @clz(c));
+        try testing.expect(!mod.isProbablePrime(rnd, 24));
+    }
+    // A Carmichael number with LARGE factors (Chernick: (6k+1)(12k+1)(18k+1),
+    // k = 96076792050576470, factors ~59–61 bits): a random witness is
+    // coprime to it, so a Fermat test (`a^(m−1) = 1`) passes every round —
+    // the small Carmichael numbers above do not show that, their witnesses
+    // hit a factor (mutation 2026-10-03: a Fermat mutant survived them).
+    {
+        var big: [24]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&big, "000c00000000026d14c0000029db0bebf000f0b38f39ee49");
+        const cv = try D.loadBE(&big);
+        const mod = try D.fromLimbsBits(&cv, 180);
+        try testing.expect(!mod.isProbablePrime(rnd, 24));
+    }
+    // RFC 3526 group 14: a 2048-bit safe prime p, (p − 1)/2 prime too; p − 2
+    // and p·(a 64-bit prime) are composite (the latter has p − 1's shape
+    // and a large factor, so only a real witness finds it).
+    const p_hex = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF";
+    var p_be: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p_be, p_hex);
+    const pv = try D.loadBE(&p_be);
+    const p = try D.fromLimbsBits(&pv, 2048);
+    try testing.expect(p.isProbablePrime(rnd, 24));
+    var half = pv;
+    for (0..D.max_limbs - 1) |i| half[i] = (half[i] >> 1) | (half[i + 1] << 63);
+    half[D.max_limbs - 1] >>= 1;
+    try testing.expect((try D.fromLimbsBits(&half, 2047)).isProbablePrime(rnd, 24));
+    var pm2 = pv;
+    pm2[0] -= 2;
+    try testing.expect(!(try D.fromLimbsBits(&pm2, 2048)).isProbablePrime(rnd, 24));
+    const D2 = DynModint(2048 + 64);
+    var prod: [2 * D2.max_limbs]u64 = .{0} ** (2 * D2.max_limbs);
+    var pw = D2.zero;
+    @memcpy(pw[0..D.max_limbs], &pv);
+    var small = D2.zero;
+    small[0] = 0xffff_ffff_ffff_ffc5; // the largest 64-bit prime
+    limbs.mulSchoolbook(&prod, &pw, &small);
+    const pq = try D2.fromLimbsBits(prod[0..D2.max_limbs], 2048 + 64);
+    try testing.expect(!pq.isProbablePrime(rnd, 4));
 }
 
 test "DynModint std.crypto.ff bridge round-trips and matches ff's own encoding" {

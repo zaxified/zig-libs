@@ -186,7 +186,7 @@ declare -A TARGETS=(
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign"
-    [rsa]="crt noncrt"
+    [rsa]="crt noncrt keygen"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
     # have a row because the red would only measure the sampler's deliberate
@@ -206,10 +206,10 @@ declare -A TARGETS=(
     # blind β' is a 160-byte draw that `nonce` never tainted.
     # `fac` added 2026-10-02 (dealer-free keygen): Πfac's prover over the
     # Paillier factors p, q -- one proof, no protocol run, seconds.
-    [threshold_ecdsa]="share nonce betaprime fac pimod prime"
+    [threshold_ecdsa]="share nonce betaprime fac pimod piprm prime"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
-    [paillier]="crt noncrt mul addm"
+    [paillier]="crt noncrt mul addm keygen"
     [aescbc]="pkcs7 xmlenc"
     [tlock]="fp12pow decrypt"
     [ibe]="extract decrypt fp12pow"
@@ -390,7 +390,7 @@ declare -A PATTERN=(
     # (like ssh/ffpow) — it must stay non-zero.
     [montint/field]='field[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/ffcontrol]='ff[.]zig'
-    [montint/dyn]='dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [montint/dyn]='dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     # ── added 2026-09-09 ───────────────────────────────────────────────────
     [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     # `sign` names std's ecdsa/common/scalar for the same reason chachapoly's
@@ -398,8 +398,9 @@ declare -A PATTERN=(
     # signer over THIS module's group, so attributing that arithmetic to
     # someone else would be the evasion this gate exists to refuse.
     [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
-    [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
-    [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [slhdsa/seed]='engine[.]zig|address[.]zig'
     [slhdsa/prf]='engine[.]zig|address[.]zig'
     [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
@@ -431,10 +432,11 @@ declare -A PATTERN=(
     # std's schoolbook big-int division under `divFloor` lives in int.zig, and
     # the Montgomery machinery in ff.zig. Naming only the module's own file is
     # the shape of under-measurement this gate exists to refuse.
-    [paillier/crt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [paillier/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [paillier/mul]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
-    [paillier/addm]='root[.]zig|ff[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [paillier/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/mul]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [paillier/addm]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [paillier/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     # `aescbc` does its own arithmetic over a secret in exactly one file.
     [aescbc/pkcs7]='root[.]zig'
     [aescbc/xmlenc]='root[.]zig'
@@ -540,8 +542,9 @@ declare -A PATTERN=(
     [aesgcm/generic]='root[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|ghash_polyval[.]zig|modes[.]zig|aes_gcm[.]zig|timing_safe[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [threshold_ecdsa/fac]='fac_proof[.]zig|root[.]zig|zkproofs[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [threshold_ecdsa/pimod]='aux_proofs[.]zig|root[.]zig|zkproofs[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
-    [threshold_ecdsa/prime]='root[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
+    [threshold_ecdsa/pimod]='aux_proofs[.]zig|root[.]zig|zkproofs[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/piprm]='aux_proofs[.]zig|root[.]zig|zkproofs[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/prime]='root[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|ff[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|presign[.]zig|ecproofs[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -566,6 +569,7 @@ declare -A LABEL=(
     [paillier/noncrt]='paillier decrypt non-CRT+std bigint'
     [paillier/mul]='paillier mulPlaintext (k)'
     [paillier/addm]='paillier addPlaintext (m)'
+    [paillier/keygen]='paillier fromPrimes, p/q tainted'
     [aescbc/pkcs7]='aescbc unpadPkcs7 (N secret)'
     [aescbc/xmlenc]='aescbc unpadXmlEnc (N secret)'
     [tlock/fp12pow]='tlock encrypt r->fp12Pow (F3)'
@@ -584,11 +588,13 @@ declare -A LABEL=(
     [threshold_ecdsa/betaprime]='thr_ecdsa MtA blind beta_prime (q^5)+paillier'
     [threshold_ecdsa/fac]='thr_ecdsa Pi_fac prover, Paillier p,q'
     [threshold_ecdsa/pimod]='thr_ecdsa Pi_mod prover, Paillier p,q'
+    [threshold_ecdsa/piprm]='thr_ecdsa Pi_prm prover, aux p~,q~,lambda'
     [threshold_ecdsa/prime]='thr_ecdsa Miller-Rabin on a secret prime'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'
     [rsa/noncrt]='rsa non-CRT d+std ff'
+    [rsa/keygen]='rsa fromPrimes, p/q tainted'
     [slhdsa/seed]='slhdsa SK.seed'
     [slhdsa/prf]='slhdsa SK.prf'
     [falcon/sign]='falcon sign (fpr+sampler)'
