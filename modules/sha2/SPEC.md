@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSL 4.0 / Zig std 0.16.0 SHA-2 family (surveyed 2026-09-30)
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -165,6 +165,45 @@ alignment (loads are unaligned; `@ptrCast` to `*align(1)` vectors).
   it, where std runs its scalar code) and the arm64 build.
 
 **Anchor grade:** class B · oracle MIXED
+
+### Audit 2026-10-03
+
+Reviewed `src/root.zig` whole (947 lines) against FIPS 180-4: padding (the
+`0x80` byte, the spill to a second block exactly when fewer than `len_bytes`
+bytes remain, the big-endian bit count), the buffering in `update` (every
+partial/whole/partial split, `buf_len` as `u8`), the derived constants and
+initial values (`fracRoot` stays inside `u256` for both word sizes), the
+rounds, both schedules, the transpose and its masks, the batch loop in
+`compressSimd` (a remainder is 0 or 1 block, so `compressScalar` reads a whole
+block), the `.stdlib` hand-over to std's `update`, and the layout cast of the
+`[rounds]V` table to `[rounds][lanes]Word`. No defect found. The
+constant-time statement holds on reading: every branch and every batch size
+depends on the input length only. INFO: `final` leaves the last partial block
+and the padding in `buf` and the chaining state in `s` (documented under
+*Constant-time contract*, same as std).
+
+Mutation run (schemata, ReleaseSafe, one binary, baseline 1 s): **54 mutants,
+52 killed, 2 equivalent, 0 real**. Covered: every branch and bound of `update`
+and `final` (partial-buffer guard and take, early-return length, whole-block
+split, padding threshold at both edges, `0x80`, the two zero fills, bit-count
+shift and byte order, digest byte order, `init`); `compressBlocks` loop and the
+`.stdlib` state hand-back; `compressSimd` batch threshold, batch size, block
+count, trailing lone block; `scheduleSimd` lane clamp, byte swap, both
+recurrence distances, `K` addition, transpose stage; every rotation/shift
+amount of `sigma0/1`, `vsigma0/1`, `Σ0`, `Σ1`, `vrotr`; `Ch`, `Maj` and its
+carried `b ^ c` (both compressors), the working-variable update, `T1` terms, the
+final state addition (both compressors), the schedule start round, the big-endian
+word load, the table column. Not mutated: the comptime constants (`K`, initial
+values, `maskLow`/`maskHigh`), which are evaluated at compile time; any wrong
+`K` entry, initial value or mask changes every multi-block digest and fails the
+FIPS known answers.
+
+Equivalent:
+- `d.total_len +%= take` instead of `b.len` in `update`'s early return: that path
+  is taken only when the whole input fits the buffer, so `take == b.len`.
+- `compressSimd` loop `>= block_len` instead of `>= 2 * block_len`: a lone block
+  through the lane-wide schedule (`n = 1`, padding lanes ignored) gives the same
+  state; the threshold is a speed choice only.
 
 ## Speed
 

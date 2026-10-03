@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Audit (review + 54-mutant schemata run): no defect, no surviving
+  mutant that is not equivalent (two, with reasons in SPEC). No source change.
 - **2026-09-29** — New module: SHA-224/256/384/512 (FIPS 180-4) as a drop-in for
   `std.crypto.hash.sha2` (same declarations; works under std's `Hmac`/`Hkdf`), with an
   AVX2 multi-block message schedule that makes runs of two or more blocks 1.24–1.40×

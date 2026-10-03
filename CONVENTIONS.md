@@ -842,7 +842,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   (`README.md` for the few without one) opens with a `## Maturity` card — **Scope** against
   other implementations (`parity`/`core`/`mvp`/`poc`, set only by a survey per
   `SURVEY-PLAYBOOK.md`, otherwise `unsurveyed`), **Audit** (latest in-house review and latest
-  mutation run, dated), **Known defects**, **Downstream consumer** — and the anchor grade
+  mutation run, dated), **Known defects**, **Downstream consumer** (a project outside this
+  collection imports it; sibling modules do not count) — and the anchor grade
   supplies the evidence axis. The **grade** is 1 (best) … 5 (fix now), the worst of those axes;
   `?` marks it provisional while the scope is unsurveyed. The exact rule is `maturityGrade` in
   `build.zig`, the scale is explained in the README's "Module grades", and the grade appears in

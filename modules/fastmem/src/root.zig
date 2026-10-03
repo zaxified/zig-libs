@@ -167,6 +167,12 @@ test "memset: C semantics -- returns dest, takes the low byte of c, len 0 touche
     for (a) |b| try testing.expectEqual(@as(u8, 0xFF), b);
 }
 
+test "memset: len 0 accepts a null dest and dereferences nothing" {
+    // C callers (and LLVM-emitted calls on empty slices) may pass a null or
+    // dangling pointer with length 0; only a non-zero length may touch `dest`.
+    try testing.expectEqual(@as(?[*]u8, null), memset(null, 0xAB, 0));
+}
+
 test "the export took effect: the linked `memset` is this module's" {
     if (builtin.link_libc) return error.SkipZigTest;
     // Exported HERE rather than from a file-level `comptime` block: the export

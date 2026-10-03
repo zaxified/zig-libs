@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Audit (review + 65-mutant schemata run, x86-64 and ARMv8 under
+  qemu): no defect in the code; two tests added where mutants survived (`.table`
+  availability; run-time CPU detection against `/proc/cpuinfo`). No API or
+  behaviour change.
 - **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
   or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
   backend cannot encode the run-time-dispatched PCLMULQDQ path for such a CPU. That build now uses

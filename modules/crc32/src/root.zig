@@ -602,6 +602,42 @@ test "backend picks the hardware when the CPU has it" {
     try testing.expectEqual(@as(?u32, null), hashWith(foreign, "x"));
 }
 
+test "the table backend is always available and gives the catalogue value" {
+    // `hashWith` returns null for an unavailable backend and the other tests
+    // skip those, so without this a `.table` that reported itself unavailable
+    // would drop out of every comparison unnoticed.
+    try testing.expect(available(.table));
+    try testing.expectEqual(@as(?u32, 0xCBF4_3926), hashWith(.table, "123456789"));
+}
+
+test "run-time detection agrees with the kernel's CPU flags" {
+    // `cpuidPclmul` / `hwcapCrc32` are what a baseline build dispatches on, and
+    // the dispatch test above compares them with themselves. /proc/cpuinfo is
+    // the kernel's own reading of the same bits.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const key: []const u8, const flag: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => .{ "flags", "pclmulqdq" },
+        .aarch64 => .{ "Features", "crc32" },
+        else => return error.SkipZigTest,
+    };
+    const text = std.Io.Dir.cwd().readFileAlloc(testing.io, "/proc/cpuinfo", testing.allocator, .limited(4 << 20)) catch return error.SkipZigTest;
+    defer testing.allocator.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        var has = false;
+        var toks = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+        while (toks.next()) |t| {
+            if (std.mem.eql(u8, t, flag)) has = true;
+        }
+        const detected_now = if (builtin.cpu.arch == .x86_64) cpuidPclmul() else hwcapCrc32();
+        try testing.expectEqual(has, detected_now);
+        return;
+    }
+    return error.SkipZigTest;
+}
+
 test "extend and the streaming form build the checksum of a whole from its pieces" {
     var buf: [3000]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(7);

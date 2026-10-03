@@ -6,7 +6,7 @@
 
 **Scope:** parity — musl libc `memset` (MIT) (surveyed 2026-09-30)
 
-**Audit:** review none · mutation none
+**Audit:** review 2026-10-03 · mutation 2026-10-03
 
 **Known defects:** none recorded
 
@@ -83,6 +83,35 @@ The expected bytes are computed per position from `memset`'s definition
 corpus to agree with.
 
 **Anchor grade:** class C · oracle n/a
+
+### Audit 2026-10-03
+
+Reviewed `src/root.zig` whole (188 lines) against musl's `memset` semantics and the
+SPEC's algorithm: every store of `set` stays inside `[dest, dest+len)` (the loop
+runs while `p < start+len-32`, so its last vector ends before `start+len`), the
+head vector, the aligned middle and the tail vector leave no gap, and the small
+arms cover `[0, n)` with two overlapping stores. No defect found. INFO only: an
+address sum `start + len` that wraps the address space is unreachable for a real
+allocation; `memset(null, c, n != 0)` is C undefined behaviour and traps in safe
+builds (`dest.?`), as it should.
+
+Mutation run (schemata, ReleaseSafe, 28 mutants over the `len < 32` split, head
+and tail stores, middle-loop start/end/stride, every small arm's threshold,
+tail offset and fill constant, the C wrapper's length guard, return value and
+byte truncation): **23 killed, 4 equivalent, 1 real**. Not mutated: `exportSymbols`
+(its test needs the real linked `memset`; the schemata copy skips it because a
+binary-wide `memset` runs before the test runner has an environment).
+
+- 1 `len <= 32` for the small path: a 32-byte length is two 16-byte stores, the
+  same bytes as head + tail. Equivalent.
+- 5 `alignForward(start, 32)` instead of `start + 1`: when `start` is aligned the
+  loop re-stores the head vector. Equivalent.
+- 6 `end = start + len - 31`: the extra iteration is the aligned address
+  `start + len - 32`, whose vector ends exactly at `start + len`. Equivalent.
+- 11 `p <= end`: same case as 6. Equivalent.
+- 24 real survivor: `len != 0` guard dropped, so `memset(null, c, 0)` would
+  panic on `dest.?`. Killed by `memset: len 0 accepts a null dest and
+  dereferences nothing`.
 
 ## What is deliberately not done
 

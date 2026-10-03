@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Audit (review + 28-mutant schemata run): no defect; one test
+  added for `memset(null, c, 0)` (the length guard had no test). No API or
+  behaviour change.
 - **2026-09-28** — The test binary exports `memset` from inside the test that
   checks the export instead of a file-level `comptime` block, which also fired
   when `check-pubfn-reach` imported the file and analysed `exportSymbols`: two
