@@ -720,9 +720,14 @@ fn chunkScalar(chunk: []const u8) Scalar {
 /// "no claimed interop wire format" note). Bumping the tag rather than
 /// silently changing the absorbed bytes means a stale proof fails as a plain
 /// verification failure, never as a subtly-mismatched challenge.
-pub const range_proof_domain = "threshold_ecdsa/zkproofs/range-proof/v2";
-pub const mta_proof_domain = "threshold_ecdsa/zkproofs/mta-proof/v2";
-pub const mta_proof_wc_domain = "threshold_ecdsa/zkproofs/mta-proof-wc/v2";
+///
+/// **BREAKING, v2 → v3 (relation audit 2026-10-03, LOW 1).** The range,
+/// MtA and MtAwc transcripts absorb the caller's `context` (session id and
+/// prover index, as `PdlProof` and `ecproofs` always did) first, so a proof
+/// made in one session, or by one prover, does not verify in another.
+pub const range_proof_domain = "threshold_ecdsa/zkproofs/range-proof/v3";
+pub const mta_proof_domain = "threshold_ecdsa/zkproofs/mta-proof/v3";
+pub const mta_proof_wc_domain = "threshold_ecdsa/zkproofs/mta-proof-wc/v3";
 /// GG20 Phase 5's consistency proof between `R̄ = k·R` and `Enc(k)` — see
 /// `PdlProof`. Born with the Γ binding, hence no v1.
 pub const pdl_proof_domain = "threshold_ecdsa/zkproofs/pdl-proof/v1";
@@ -874,11 +879,12 @@ pub const Transcript = struct {
 };
 
 /// The concrete transcript `proveAliceRange`/`verifyAliceRange` commit to
-/// — binds Bob's (the verifier's) aux params, Alice's Paillier public key,
+/// — binds the caller's `context` (session id, prover index), Bob's (the verifier's) aux params, Alice's Paillier public key,
 /// the ciphertext `c_A` the proof is ABOUT, and the proof's own first-
 /// message commitments (`z`, `u`, `w`). REAL, mechanical — the actual
 /// VALUES `z`/`u`/`w` come from the prover.
 pub fn rangeProofChallenge(
+    context: []const u8,
     verifier_aux: root.AuxParams,
     alice_pk: paillier.PublicKey,
     c_a: paillier.Ciphertext,
@@ -887,6 +893,7 @@ pub fn rangeProofChallenge(
     w: root.AuxFe,
 ) Scalar {
     var t = Transcript.init(range_proof_domain);
+    t.appendContext(context);
     t.appendAuxParams(verifier_aux);
     t.appendPaillierPublicKey(alice_pk);
     t.appendCiphertext(c_a);
@@ -901,6 +908,7 @@ pub fn rangeProofChallenge(
 /// ciphertexts (`c_A` public input, `c_B` the ciphertext being proven
 /// well-formed), and the proof's five first-message commitments.
 pub fn mtaProofChallenge(
+    context: []const u8,
     verifier_aux: root.AuxParams,
     alice_pk: paillier.PublicKey,
     c_a: paillier.Ciphertext,
@@ -912,6 +920,7 @@ pub fn mtaProofChallenge(
     w: root.AuxFe,
 ) Scalar {
     var t = Transcript.init(mta_proof_domain);
+    t.appendContext(context);
     t.appendAuxParams(verifier_aux);
     t.appendPaillierPublicKey(alice_pk);
     t.appendCiphertext(c_a);
@@ -927,6 +936,7 @@ pub fn mtaProofChallenge(
 /// `mtaProofChallenge` plus the MtAwc extension's extra public inputs: the
 /// public point `B = b·G` and the Schnorr commitment `u1_point`.
 pub fn mtaProofWcChallenge(
+    context: []const u8,
     verifier_aux: root.AuxParams,
     alice_pk: paillier.PublicKey,
     c_a: paillier.Ciphertext,
@@ -940,6 +950,7 @@ pub fn mtaProofWcChallenge(
     u1_point: root.Element,
 ) Scalar {
     var t = Transcript.init(mta_proof_wc_domain);
+    t.appendContext(context);
     t.appendAuxParams(verifier_aux);
     t.appendPaillierPublicKey(alice_pk);
     t.appendCiphertext(c_a);
@@ -1174,12 +1185,13 @@ pub fn proveAliceRange(
     r_a: paillier.Fe,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     random: std.Random,
 ) ProveError!RangeProof {
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var a_bytes = a.toBytes(.big);
     defer std.crypto.secureZero(u8, &a_bytes);
-    return (try proveAliceRangeInner(allocator, &a_bytes, r_a, alice_pk, verifier_aux, null, random)).proof;
+    return (try proveAliceRangeInner(allocator, &a_bytes, r_a, alice_pk, verifier_aux, context, null, random)).proof;
 }
 
 /// The curve half of a `PdlProof` statement: `point = m·base` for the same
@@ -1208,6 +1220,7 @@ fn proveAliceRangeInner(
     r_a: paillier.Fe,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     ec: ?EcStatement,
     random: std.Random,
 ) ProveError!struct { proof: RangeProof, u_point: ?root.Element } {
@@ -1270,7 +1283,7 @@ fn proveAliceRangeInner(
     const e = if (ec) |st|
         pdlProofChallenge(verifier_aux, alice_pk, c_a, z, u, w, st, u_point.?)
     else
-        rangeProofChallenge(verifier_aux, alice_pk, c_a, z, u, w);
+        rangeProofChallenge(context, verifier_aux, alice_pk, c_a, z, u, w);
     const e_bytes = e.toBytes(.big);
 
     // 4. Respond. s = r_a^e * beta mod N (mod N, not N²!).
@@ -1328,8 +1341,9 @@ pub fn verifyAliceRange(
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
 ) bool {
-    return verifyAliceRangeInner(proof, c_a, alice_pk, verifier_aux, null, null);
+    return verifyAliceRangeInner(proof, c_a, alice_pk, verifier_aux, context, null, null);
 }
 
 /// Shared verifier for `RangeProof` (`ec == null`) and `PdlProof` — the
@@ -1340,6 +1354,7 @@ fn verifyAliceRangeInner(
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     ec: ?EcStatement,
     u_point: ?root.Element,
 ) bool {
@@ -1373,7 +1388,7 @@ fn verifyAliceRangeInner(
     const e = if (ec) |st|
         pdlProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w, st, u_point.?)
     else
-        rangeProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w);
+        rangeProofChallenge(context, verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w);
     const e_bytes = e.toBytes(.big);
 
     // PdlProof only: [s1 mod q]·base == [e]·point + u_point. `s1` is reduced
@@ -1485,7 +1500,7 @@ pub fn provePdl(
     _ = base.point() catch return error.InvalidAuxParams;
     var k_bytes = k.toBytes(.big);
     defer std.crypto.secureZero(u8, &k_bytes);
-    const out = try proveAliceRangeInner(allocator, &k_bytes, r_a, alice_pk, verifier_aux, .{ .base = base, .point = point, .context = context }, random);
+    const out = try proveAliceRangeInner(allocator, &k_bytes, r_a, alice_pk, verifier_aux, context, .{ .base = base, .point = point, .context = context }, random);
     return .{ .range = out.proof, .u_point = out.u_point.? };
 }
 
@@ -1501,7 +1516,7 @@ pub fn verifyPdl(
     point: root.Element,
     context: []const u8,
 ) bool {
-    return verifyAliceRangeInner(proof.range, c_a, alice_pk, verifier_aux, .{ .base = base, .point = point, .context = context }, proof.u_point);
+    return verifyAliceRangeInner(proof.range, c_a, alice_pk, verifier_aux, context, .{ .base = base, .point = point, .context = context }, proof.u_point);
 }
 
 // ── MtaProof — Bob's MtA proof Π^MtA (STRUCT+CODEC real, MATH real, GG18 App. A) ──
@@ -1718,12 +1733,13 @@ pub fn proveBobMta(
     c_b: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     random: std.Random,
 ) ProveError!MtaProof {
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
-    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, null, random);
+    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, context, null, random);
     return out.proof;
 }
 
@@ -1743,6 +1759,7 @@ fn proveBobInner(
     c_b: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     b_point: ?root.Element,
     random: std.Random,
 ) ProveError!struct { proof: MtaProof, u1_point: ?root.Element } {
@@ -1813,9 +1830,9 @@ fn proveBobInner(
 
     // 3. Challenge.
     const e = if (b_point) |bp|
-        mtaProofWcChallenge(verifier_aux, alice_pk, c_a, c_b, z, z1, t_commit, v, w, bp, u1_point.?)
+        mtaProofWcChallenge(context, verifier_aux, alice_pk, c_a, c_b, z, z1, t_commit, v, w, bp, u1_point.?)
     else
-        mtaProofChallenge(verifier_aux, alice_pk, c_a, c_b, z, z1, t_commit, v, w);
+        mtaProofChallenge(context, verifier_aux, alice_pk, c_a, c_b, z, z1, t_commit, v, w);
     const e_bytes = e.toBytes(.big);
 
     // 4. Respond. s = r_b^e * beta mod N.
@@ -1874,8 +1891,9 @@ pub fn verifyBobMta(
     c_b: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
 ) bool {
-    return verifyBobInner(proof, c_a, c_b, alice_pk, verifier_aux, null, null);
+    return verifyBobInner(proof, c_a, c_b, alice_pk, verifier_aux, context, null, null);
 }
 
 /// Shared verifier for Π^MtA (A.3, `b_point == null`) and Π^MtAwc (A.2,
@@ -1886,6 +1904,7 @@ fn verifyBobInner(
     c_b: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    context: []const u8,
     b_point: ?root.Element,
     u1_point: ?root.Element,
 ) bool {
@@ -1903,6 +1922,12 @@ fn verifyBobInner(
     if (proof.z.isZero() or proof.z1.isZero() or proof.t.isZero() or
         proof.w.isZero() or proof.s.isZero() or proof.v.c.isZero()) return false;
     if (c_a.c.isZero() or c_b.c.isZero()) return false;
+    // Units only, as Alice's range proof (relation audit 2026-10-03, LOW 2):
+    // with `c_b` and `s` units of `Z*_N`, equation 5 makes `v` one too.
+    // Defence in depth — a Bob who does not know Alice's factors cannot
+    // produce a non-unit, and `paillier.decrypt` refuses one — but the
+    // inversion-free equations below presume units, so say so here.
+    if (!unitsModN(alice_pk, c_b.c, proof.s)) return false;
 
     // 1./2. THE range checks.
     // The length caps are work bounds (honest responses are never zero-padded).
@@ -1912,9 +1937,9 @@ fn verifyBobInner(
     if (auxExponentTooLong(proof.s2, nt) or auxExponentTooLong(proof.t2, nt)) return false;
 
     const e = if (b_point) |bp|
-        mtaProofWcChallenge(verifier_aux, alice_pk, c_a, c_b, proof.z, proof.z1, proof.t, proof.v, proof.w, bp, u1_point.?)
+        mtaProofWcChallenge(context, verifier_aux, alice_pk, c_a, c_b, proof.z, proof.z1, proof.t, proof.v, proof.w, bp, u1_point.?)
     else
-        mtaProofChallenge(verifier_aux, alice_pk, c_a, c_b, proof.z, proof.z1, proof.t, proof.v, proof.w);
+        mtaProofChallenge(context, verifier_aux, alice_pk, c_a, c_b, proof.z, proof.z1, proof.t, proof.v, proof.w);
     const e_bytes = e.toBytes(.big);
 
     // 6. (MtAwc only) [s1 mod q]·G == [e]·B + u1 — the paper's
@@ -2040,12 +2065,13 @@ pub fn proveBobMtaWc(
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
     b_point: root.Element,
+    context: []const u8,
     random: std.Random,
 ) ProveError!MtaProofWc {
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
-    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, b_point, random);
+    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, context, b_point, random);
     return .{ .base = out.proof, .u1_point = out.u1_point.? };
 }
 
@@ -2075,11 +2101,18 @@ pub fn verifyBobMtaWc(
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
     b_point: root.Element,
+    context: []const u8,
 ) bool {
-    return verifyBobInner(proof.base, c_a, c_b, alice_pk, verifier_aux, b_point, proof.u1_point);
+    return verifyBobInner(proof.base, c_a, c_b, alice_pk, verifier_aux, context, b_point, proof.u1_point);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
+
+/// Session/prover context the tests bind their proofs to.
+const test_ctx: []const u8 = "zkproofs-test-session";
+/// The same proof presented in another session, and as another prover's.
+const other_session_ctx: []const u8 = "zkproofs-test-session-2";
+const other_prover_ctx: []const u8 = "zkproofs-test-session\x01";
 //
 // No cross-implementation KAT exists for these proofs (the Fiat-Shamir
 // transcript is implementation-defined — see the module doc comment's
@@ -2376,9 +2409,12 @@ test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies afte
     // c_a is the SAME (a, r_a) pair proveAliceRange is given as witness.
     const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
 
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, random);
+    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
-    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux));
+    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx));
+    // Bound to its context (relation audit LOW 1): no replay across sessions or provers.
+    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux, other_session_ctx));
+    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux, other_prover_ctx));
 
     // Wire-format round-trip must verify identically (a proof is bytes on
     // a real network).
@@ -2386,7 +2422,7 @@ test "GG18 A.1 honest accept: Alice's range proof verifies, and re-verifies afte
     defer allocator.free(bytes);
     const back = try RangeProof.fromBytesAlloc(allocator, setup.aux.n_tilde, pk, bytes);
     defer back.deinit(allocator);
-    try testing.expect(verifyAliceRange(back, c_a, pk, setup.aux));
+    try testing.expect(verifyAliceRange(back, c_a, pk, setup.aux, test_ctx));
 }
 
 test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check even though the consistency equations hold" {
@@ -2411,18 +2447,18 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): out-of-range a fails the range check 
     const m_fe = paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable;
     const c_a = paillier.encrypt(pk, m_fe, r_a) catch unreachable;
 
-    const proof = (try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, null, random)).proof;
+    const proof = (try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, test_ctx, null, random)).proof;
     defer proof.deinit(allocator);
-    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx));
 
     // Control in the same fixture: an in-range witness DOES verify (so
     // the reject above is the range check, not a broken fixture).
     const a_ok = scalarFromU64(0x5eed);
     const r_ok = testPaillierRandomness(pk, random);
     const c_ok = paillier.encrypt(pk, scalarToTestFe(a_ok, pk), r_ok) catch unreachable;
-    const proof_ok = try proveAliceRange(allocator, a_ok, r_ok, pk, setup.aux, random);
+    const proof_ok = try proveAliceRange(allocator, a_ok, r_ok, pk, setup.aux, test_ctx, random);
     defer proof_ok.deinit(allocator);
-    try testing.expect(verifyAliceRange(proof_ok, c_ok, pk, setup.aux));
+    try testing.expect(verifyAliceRange(proof_ok, c_ok, pk, setup.aux, test_ctx));
 }
 
 fn testBigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
@@ -2512,7 +2548,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const p_sq_n = powPub(nsq, p_sq, n_bytes);
     const u = paillier.Ciphertext{ .c = nsq.mul(u_honest.c, p_sq_n) };
     const w = pedersenCt(nt, setup.aux.h1, &alpha, setup.aux.h2, gamma);
-    const e = rangeProofChallenge(setup.aux, pk, c_a, z, u, w);
+    const e = rangeProofChallenge(test_ctx, setup.aux, pk, c_a, z, u, w);
     const e_bytes = e.toBytes(.big);
     const s = nsq.mul(nsq.mul(powPub(nsq, r_a, &e_bytes), beta_fe), p_sq);
     const proof = RangeProof{
@@ -2524,7 +2560,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
         .s2 = try mulAddOwned(allocator, &e_bytes, rho, gamma),
     };
     defer proof.deinit(allocator);
-    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx));
 
     // Why it matters: had Bob answered c_B = c_A^b · Enc(β'), Alice reads b
     // as ⌊Dec(c_B) / a⌋ — a·b + β' < N, β' < a.
@@ -2562,43 +2598,43 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
     const a = scalarFromU64(0xfeed);
     const r_a = testPaillierRandomness(pk, random);
     const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, random);
+    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
-    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux)); // control
+    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx)); // control
 
     // Tampered ciphertext: same proof, homomorphically-shifted c_a.
     const one_fe = paillier.Fe.fromPrimitive(u64, pk.n_sq, 1) catch unreachable;
     const c_bad = paillier.addPlaintext(pk, c_a, one_fe) catch unreachable;
-    try testing.expect(!verifyAliceRange(proof, c_bad, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(proof, c_bad, pk, setup.aux, test_ctx));
 
     // Every field mangled (value-level perturbations that keep each field
     // well-formed, so the REJECT comes from the equations, not a parser).
     var bad = proof;
     bad.z = nt.mul(proof.z, setup.aux.h1);
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
     bad = proof;
     bad.u = .{ .c = pk.n_sq.mul(proof.u.c, proof.u.c) };
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
     bad = proof;
     bad.w = nt.mul(proof.w, setup.aux.h2);
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
     bad = proof;
     bad.s = pk.n_sq.mul(proof.s, proof.s);
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
 
     var s1_mangled = try allocator.dupe(u8, proof.s1);
     defer allocator.free(s1_mangled);
     s1_mangled[s1_mangled.len - 1] ^= 0x01;
     bad = proof;
     bad.s1 = s1_mangled;
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
 
     var s2_mangled = try allocator.dupe(u8, proof.s2);
     defer allocator.free(s2_mangled);
     s2_mangled[s2_mangled.len - 1] ^= 0x01;
     bad = proof;
     bad.s2 = s2_mangled;
-    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux, test_ctx));
 }
 
 /// A small test blind left-padded to the provers' `β'` width (value-identical
@@ -2631,15 +2667,17 @@ test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertext
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
+    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
-    try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux));
+    try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux, test_ctx));
+    try testing.expect(!verifyBobMta(proof, c_a, c_b, pk, setup.aux, other_session_ctx));
+    try testing.expect(!verifyBobMta(proof, c_a, c_b, pk, setup.aux, other_prover_ctx));
 
     const bytes = try proof.toBytesAlloc(allocator);
     defer allocator.free(bytes);
     const back = try MtaProof.fromBytesAlloc(allocator, setup.aux.n_tilde, pk, bytes);
     defer back.deinit(allocator);
-    try testing.expect(verifyBobMta(back, c_a, c_b, pk, setup.aux));
+    try testing.expect(verifyBobMta(back, c_a, c_b, pk, setup.aux, test_ctx));
 }
 
 test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-range beta' (t1 > q⁷)" {
@@ -2668,9 +2706,9 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     const y_ok = scalarFromU64(0xbeef).toBytes(.big);
     const r_b1 = testPaillierRandomness(pk, random);
     const c_b1 = buildCb(pk, c_a, &x_big, &y_ok, r_b1);
-    const out1 = try proveBobInner(allocator, &x_big, &y_ok, r_b1, c_a, c_b1, pk, setup.aux, null, random);
+    const out1 = try proveBobInner(allocator, &x_big, &y_ok, r_b1, c_a, c_b1, pk, setup.aux, test_ctx, null, random);
     defer out1.proof.deinit(allocator);
-    try testing.expect(!verifyBobMta(out1.proof, c_a, c_b1, pk, setup.aux));
+    try testing.expect(!verifyBobMta(out1.proof, c_a, c_b1, pk, setup.aux, test_ctx));
 
     // x in range, y = 2q⁷ (out of range; still < N² so the ciphertext
     // composition stays well-formed — the proof equations remain
@@ -2679,16 +2717,16 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): out-of-range b (s1 > q³) and out-of-
     const y_big = comptime comptimeIntBytes(225, 2 * (q_int * q_int * q_int * q_int * q_int * q_int * q_int));
     const r_b2 = testPaillierRandomness(pk, random);
     const c_b2 = buildCb(pk, c_a, &x_ok, &y_big, r_b2);
-    const out2 = try proveBobInner(allocator, &x_ok, &y_big, r_b2, c_a, c_b2, pk, setup.aux, null, random);
+    const out2 = try proveBobInner(allocator, &x_ok, &y_big, r_b2, c_a, c_b2, pk, setup.aux, test_ctx, null, random);
     defer out2.proof.deinit(allocator);
-    try testing.expect(!verifyBobMta(out2.proof, c_a, c_b2, pk, setup.aux));
+    try testing.expect(!verifyBobMta(out2.proof, c_a, c_b2, pk, setup.aux, test_ctx));
 
     // Control: both in range verifies.
     const r_b3 = testPaillierRandomness(pk, random);
     const c_b3 = buildCb(pk, c_a, &x_ok, &y_ok, r_b3);
-    const out3 = try proveBobInner(allocator, &x_ok, &y_ok, r_b3, c_a, c_b3, pk, setup.aux, null, random);
+    const out3 = try proveBobInner(allocator, &x_ok, &y_ok, r_b3, c_a, c_b3, pk, setup.aux, test_ctx, null, random);
     defer out3.proof.deinit(allocator);
-    try testing.expect(verifyBobMta(out3.proof, c_a, c_b3, pk, setup.aux));
+    try testing.expect(verifyBobMta(out3.proof, c_a, c_b3, pk, setup.aux, test_ctx));
 }
 
 test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, and every mangled proof field" {
@@ -2714,46 +2752,46 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
+    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
-    try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux)); // control
+    try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux, test_ctx)); // control
 
     // Tampered c_b after the proof was produced (equation 5).
     const one_fe = paillier.Fe.fromPrimitive(u64, pk.n_sq, 1) catch unreachable;
     const c_b_bad = paillier.addPlaintext(pk, c_b, one_fe) catch unreachable;
-    try testing.expect(!verifyBobMta(proof, c_a, c_b_bad, pk, setup.aux));
+    try testing.expect(!verifyBobMta(proof, c_a, c_b_bad, pk, setup.aux, test_ctx));
 
     // Wrong beta' witness: prover claims a beta' different from the one
     // actually folded into c_b (equations 4/5).
     const wrong_bp = scalarFromU64(0x4444);
-    const proof_wrong = try proveBobMta(allocator, b, &bpWide(wrong_bp), r_b, c_a, c_b, pk, setup.aux, random);
+    const proof_wrong = try proveBobMta(allocator, b, &bpWide(wrong_bp), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof_wrong.deinit(allocator);
-    try testing.expect(!verifyBobMta(proof_wrong, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(proof_wrong, c_a, c_b, pk, setup.aux, test_ctx));
 
     // Wrong b witness too, for completeness (equations 3/5).
-    const proof_wrong_b = try proveBobMta(allocator, scalarFromU64(0x5555), &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
+    const proof_wrong_b = try proveBobMta(allocator, scalarFromU64(0x5555), &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, test_ctx, random);
     defer proof_wrong_b.deinit(allocator);
-    try testing.expect(!verifyBobMta(proof_wrong_b, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(proof_wrong_b, c_a, c_b, pk, setup.aux, test_ctx));
 
     // Every field mangled.
     var bad = proof;
     bad.z = nt.mul(proof.z, setup.aux.h1);
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     bad = proof;
     bad.z1 = nt.mul(proof.z1, setup.aux.h1);
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     bad = proof;
     bad.t = nt.mul(proof.t, setup.aux.h2);
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     bad = proof;
     bad.v = .{ .c = pk.n_sq.mul(proof.v.c, proof.v.c) };
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     bad = proof;
     bad.w = nt.mul(proof.w, setup.aux.h2);
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     bad = proof;
     bad.s = pk.n_sq.mul(proof.s, proof.s);
-    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
 
     inline for (.{ "s1", "s2", "t1", "t2" }) |field| {
         const orig = @field(proof, field);
@@ -2762,7 +2800,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
         mangled[mangled.len - 1] ^= 0x01;
         bad = proof;
         @field(bad, field) = mangled;
-        try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux));
+        try testing.expect(!verifyBobMta(bad, c_a, c_b, pk, setup.aux, test_ctx));
     }
 }
 
@@ -2791,32 +2829,34 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     // B = b·G — the public point the proof must tie Bob's MtA input to.
     const b_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, b_point, random);
+    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, b_point, test_ctx, random);
     defer proof.deinit(allocator);
-    try testing.expect(verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point));
+    try testing.expect(verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point, test_ctx));
+    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point, other_session_ctx));
+    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point, other_prover_ctx));
 
     // Codec round-trip re-verifies.
     const bytes = try proof.toBytesAlloc(allocator);
     defer allocator.free(bytes);
     const back = try MtaProofWc.fromBytesAlloc(allocator, setup.aux.n_tilde, pk, bytes);
     defer back.deinit(allocator);
-    try testing.expect(verifyBobMtaWc(back, c_a, c_b, pk, setup.aux, b_point));
+    try testing.expect(verifyBobMtaWc(back, c_a, c_b, pk, setup.aux, b_point, test_ctx));
 
     // Wrong B: the SAME b in MtA but a different public point (the exact
     // cheat MtAwc exists to catch — check 6).
     const b_wrong = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.add(Scalar.one).toBytes(.big), .big) catch unreachable) catch unreachable;
-    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_wrong));
+    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_wrong, test_ctx));
 
     // Tampered u1 (check 6 + challenge binding).
     const u1_pt = proof.u1_point.point() catch unreachable;
     const u1_bad = root.Element.fromPoint(u1_pt.add(root.Secp256k1.basePoint)) catch unreachable;
     const proof_bad_u1: MtaProofWc = .{ .base = proof.base, .u1_point = u1_bad };
-    try testing.expect(!verifyBobMtaWc(proof_bad_u1, c_a, c_b, pk, setup.aux, b_point));
+    try testing.expect(!verifyBobMtaWc(proof_bad_u1, c_a, c_b, pk, setup.aux, b_point, test_ctx));
 
     // Cross-protocol confusion: the Wc proof's base must NOT verify as a
     // plain MtA proof (different Fiat-Shamir domain + transcript — this
     // is what the domain-separation tags buy).
-    try testing.expect(!verifyBobMta(proof.base, c_a, c_b, pk, setup.aux));
+    try testing.expect(!verifyBobMta(proof.base, c_a, c_b, pk, setup.aux, test_ctx));
 }
 
 test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transcript unchanged (audit F4(a) MED, 2026-09-10)" {
@@ -2860,20 +2900,20 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     try testing.expect(!std.mem.eql(u8, &b_mismatch.toBytes(.big), &b.toBytes(.big)));
     const wrong_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b_mismatch.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, wrong_point, random);
+    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, wrong_point, test_ctx, random);
     defer proof.deinit(allocator);
 
     // Equations 3-5 hold (same challenge on both sides, real Paillier
     // relations over the real `b`) — only equation 6 can reject this.
-    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, wrong_point));
+    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, wrong_point, test_ctx));
 
     // Positive control, same setup: proving/verifying against the point
     // that genuinely IS `b`'s discrete log passes — proves the rejection
     // above is about the b/B mismatch, not a broken predicate.
     const true_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
-    const proof_honest = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, true_point, random);
+    const proof_honest = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, true_point, test_ctx, random);
     defer proof_honest.deinit(allocator);
-    try testing.expect(verifyBobMtaWc(proof_honest, c_a, c_b, pk, setup.aux, true_point));
+    try testing.expect(verifyBobMtaWc(proof_honest, c_a, c_b, pk, setup.aux, true_point, test_ctx));
 }
 
 // -- audit F1/F2: checked-path received-parameter validation (NEW) --
@@ -2908,11 +2948,11 @@ test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received
     const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
 
     // Ñ = 251 is PRIME -> Miller-Rabin composite check rejects.
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(251, 2, 4), random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(251, 2, 4), test_ctx, random));
     // h1 = 1 (out of range) on a composite Ñ.
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 1, 16), random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 1, 16), test_ctx, random));
     // h1 = 5 is a quadratic NON-residue mod 187 (Jacobi -1).
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 5, 4), random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 5, 4), test_ctx, random));
 
     // Same fail-closed gate on Bob's prover (shares validateReceivedParams).
     const b = scalarFromU64(6);
@@ -2921,7 +2961,7 @@ test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received
     const one_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable;
     const two_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable;
     const c_dummy = paillier.encrypt(pk, one_fe, two_fe) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, &bpWide(bp), r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), random));
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, &bpWide(bp), r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), test_ctx, random));
 }
 
 test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the checked path" {
@@ -2935,7 +2975,7 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
     {
         const pk = toyPaillierPk();
         const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
-        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 4, 16), random));
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, auxFromBytes(187, 4, 16), test_ctx, random));
     }
 
     // (b) VALID > q⁷ aux (a genuine ~2000-bit composite with perfect-square
@@ -2952,7 +2992,7 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
         };
         const pk = toyPaillierPk();
         const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
-        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, good_aux, random));
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_a, pk, good_aux, test_ctx, random));
 
         // And the verify-side F2 floor (defense-in-depth): a proof "verified"
         // against a sub-floor Paillier key is rejected outright. Build a
@@ -2967,7 +3007,7 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
         };
         defer dummy.deinit(allocator);
         const c_dummy = paillier.encrypt(pk, paillier.Fe.fromPrimitive(u32, pk.n_sq, 4) catch unreachable, paillier.Fe.fromPrimitive(u32, pk.n_sq, 5) catch unreachable) catch unreachable;
-        try testing.expect(!verifyAliceRange(dummy, c_dummy, pk, good_aux));
+        try testing.expect(!verifyAliceRange(dummy, c_dummy, pk, good_aux, test_ctx));
     }
 }
 
@@ -3015,22 +3055,22 @@ test "audit F3 (a): the FS challenge binds the Paillier generator Γ, not just N
     const point = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
 
     // Alice's range proof.
-    const e_std = rangeProofChallenge(aux, pk_std, c_a, aux.h1, u_ct, aux.h2);
-    const e_same = rangeProofChallenge(aux, pk_same, c_a, aux.h1, u_ct, aux.h2);
-    const e_alt = rangeProofChallenge(aux, pk_alt, c_a, aux.h1, u_ct, aux.h2);
+    const e_std = rangeProofChallenge(test_ctx, aux, pk_std, c_a, aux.h1, u_ct, aux.h2);
+    const e_same = rangeProofChallenge(test_ctx, aux, pk_same, c_a, aux.h1, u_ct, aux.h2);
+    const e_alt = rangeProofChallenge(test_ctx, aux, pk_alt, c_a, aux.h1, u_ct, aux.h2);
     // Control: same n AND same Γ (however constructed) ⇒ same challenge.
     try testing.expectEqualSlices(u8, &e_std.toBytes(.big), &e_same.toBytes(.big));
     // The property: a different Γ under the same n ⇒ a different challenge.
     try testing.expect(!std.mem.eql(u8, &e_std.toBytes(.big), &e_alt.toBytes(.big)));
 
     // Bob's MtA proof.
-    const m_std = mtaProofChallenge(aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
-    const m_alt = mtaProofChallenge(aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
+    const m_std = mtaProofChallenge(test_ctx, aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
+    const m_alt = mtaProofChallenge(test_ctx, aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2);
     try testing.expect(!std.mem.eql(u8, &m_std.toBytes(.big), &m_alt.toBytes(.big)));
 
     // MtAwc.
-    const w_std = mtaProofWcChallenge(aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
-    const w_alt = mtaProofWcChallenge(aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
+    const w_std = mtaProofWcChallenge(test_ctx, aux, pk_std, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
+    const w_alt = mtaProofWcChallenge(test_ctx, aux, pk_alt, c_a, c_b, aux.h1, aux.h2, aux.h1, u_ct, aux.h2, point, point);
     try testing.expect(!std.mem.eql(u8, &w_std.toBytes(.big), &w_alt.toBytes(.big)));
 }
 
@@ -3059,7 +3099,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
 
     const a = scalarFromU64(7);
     const r_bad = paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 3) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_bad, pk_bad, good_aux, random));
+    try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, a, r_bad, pk_bad, good_aux, test_ctx, random));
 
     // Positive control — Γ is provably the SOLE cause of that rejection:
     // `validateReceivedParams` has exactly three gates, and the other two
@@ -3073,7 +3113,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
 
     // Bob's prover shares `validateReceivedParams`.
     const c_dummy_bad = paillier.encrypt(pk_bad, paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 1) catch unreachable, r_bad) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, &bpWide(a), r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, random));
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, &bpWide(a), r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, test_ctx, random));
 
     // Verify side (defense in depth): both verifiers reject outright.
     const dummy_range: RangeProof = .{
@@ -3085,7 +3125,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
         .s2 = try allocator.dupe(u8, &[_]u8{1}),
     };
     defer dummy_range.deinit(allocator);
-    try testing.expect(!verifyAliceRange(dummy_range, c_dummy_bad, pk_bad, good_aux));
+    try testing.expect(!verifyAliceRange(dummy_range, c_dummy_bad, pk_bad, good_aux, test_ctx));
 
     const dummy_mta: MtaProof = .{
         .z = good_aux.h1,
@@ -3100,7 +3140,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
         .t2 = try allocator.dupe(u8, &[_]u8{1}),
     };
     defer dummy_mta.deinit(allocator);
-    try testing.expect(!verifyBobMta(dummy_mta, c_dummy_bad, c_dummy_bad, pk_bad, good_aux));
+    try testing.expect(!verifyBobMta(dummy_mta, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, test_ctx));
 }
 
 test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha + beta == a*b" {
@@ -3140,15 +3180,15 @@ test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha
         const y_big = comptime comptimeIntBytes(65, (1 << 512) - X);
         const r_b = testPaillierRandomness(pk, random);
         const c_b = buildCb(pk, c_a, &x_ok, &y_big, r_b);
-        const out = try proveBobInner(allocator, &x_ok, &y_big, r_b, c_a, c_b, pk, setup.aux, null, random);
+        const out = try proveBobInner(allocator, &x_ok, &y_big, r_b, c_a, c_b, pk, setup.aux, test_ctx, null, random);
         defer out.proof.deinit(allocator);
 
         // The verifier accepts: every range bound and every equation holds.
-        try testing.expect(verifyBobMta(out.proof, c_a, c_b, pk, setup.aux));
+        try testing.expect(verifyBobMta(out.proof, c_a, c_b, pk, setup.aux, test_ctx));
 
         // ...so the checked finalize runs, and its result must satisfy the
         // module's whole invariant.
-        const alpha = try mta_mod.mtaAliceFinalizeChecked(c_a, c_b, out.proof, sk, pk, setup.aux);
+        const alpha = try mta_mod.mtaAliceFinalizeChecked(c_a, c_b, out.proof, sk, pk, setup.aux, test_ctx);
         const beta = scalarFromWide(&y_big).neg();
         try testing.expectEqualSlices(u8, &a.toBytes(.big), &alpha.add(beta).toBytes(.big));
     }
@@ -3172,12 +3212,12 @@ test "audit: an over-long s2 is refused before it is used as an exponent" {
     const a = scalarFromU64(7);
     const r_a = testPaillierRandomness(pk, random);
     const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
-    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, random);
+    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, test_ctx, random);
     defer proof.deinit(allocator);
 
     // The honest proof still verifies, and its `s2` sits at the cap's own
     // ceiling -- so a cap set one byte tighter would break honest provers.
-    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux));
+    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux, test_ctx));
     const nt_len = (setup.aux.n_tilde.bits() + 7) / 8;
     try testing.expect(proof.s2.len <= 96 + nt_len + 1);
     try testing.expect(!auxExponentTooLong(proof.s2, setup.aux.n_tilde));
@@ -3189,7 +3229,7 @@ test "audit: an over-long s2 is refused before it is used as an exponent" {
         defer allocator.free(s2_big);
         random.bytes(s2_big);
         const evil: RangeProof = .{ .z = proof.z, .u = proof.u, .w = proof.w, .s = proof.s, .s1 = proof.s1, .s2 = s2_big };
-        try testing.expect(!verifyAliceRange(evil, c_a, pk, setup.aux));
+        try testing.expect(!verifyAliceRange(evil, c_a, pk, setup.aux, test_ctx));
     }
 }
 
@@ -3409,7 +3449,7 @@ test "PdlProof: honest accepts (and after a codec round trip); every false state
     const c_other = paillier.encrypt(pk, scalarToTestFe(k.add(Scalar.one), pk), r_a) catch unreachable;
     try testing.expect(!verifyPdl(proof, c_other, pk, setup.aux, base, point, ctx));
     // The A.1 range proof alone is not a PdlProof (different challenge).
-    try testing.expect(!verifyAliceRange(proof.range, c_a, pk, setup.aux));
+    try testing.expect(!verifyAliceRange(proof.range, c_a, pk, setup.aux, test_ctx));
 
     // A prover whose ciphertext holds k but whose R̄ claims k+1: the curve
     // equation fails even though the Paillier side is honest.
@@ -3455,7 +3495,7 @@ test "PdlProof reject (SECURITY-CRITICAL): an out-of-range exponent (s1 > q³) f
     const c_a = paillier.encrypt(pk, paillier.Fe.fromBytes(pk.n_sq, &m_big, .big) catch unreachable, r_a) catch unreachable;
     const base = root.Element.fromPoint(root.Secp256k1.basePoint) catch unreachable;
     const point = mulBase(base, scalarFromWide(&m_big)); // m mod q: the curve side is consistent
-    const out = try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, .{ .base = base, .point = point, .context = "c" }, random);
+    const out = try proveAliceRangeInner(allocator, &m_big, r_a, pk, setup.aux, "c", .{ .base = base, .point = point, .context = "c" }, random);
     const proof: PdlProof = .{ .range = out.proof, .u_point = out.u_point.? };
     defer proof.deinit(allocator);
     try testing.expect(!verifyPdl(proof, c_a, pk, setup.aux, base, point, "c"));

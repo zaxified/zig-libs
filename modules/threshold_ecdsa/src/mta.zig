@@ -99,6 +99,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const paillier = @import("paillier");
+const montint = @import("montint");
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
 
@@ -223,14 +224,26 @@ fn sampleBetaPrime(random: std.Random, out: *[zkproofs.beta_prime_bytes]u8) void
 }
 
 /// **Alice, finalize.** Decrypt Bob's `c_B` with Alice's secret key and
-/// reduce the resulting plaintext `α' = a·b + β'` (an integer in `[0, N)`,
-/// unwrapped by the range precondition above) into `Zq`, giving Alice's
+/// reduce the resulting plaintext `α' = a·b + β'` (an integer in `[0, N)`)
+/// into `Zq`, giving Alice's
 /// additive share `α = α' (mod q)`. Guarantees `α + β ≡ a·b (mod q)`.
 ///
 /// The plaintext `α' < q² + q < 2^512` fits in 64 bytes; `Scalar.fromBytes64`
 /// performs the constant-time `mod q` reduction.
 pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
-    const alpha_fe = try paillier.decrypt(alice_sk, c_b); // = a·b + β' (mod n), no wrap
+    return finalizeLift(c_b, alice_sk, false);
+}
+
+/// `mtaAliceFinalize` for a `c_B` whose MtA/MtAwc proof VERIFIED: the
+/// plaintext is lifted to its centered representative in `(−N/2, N/2]`
+/// (`centeredModQ`), because the proof bounds `|β'|` but not its sign. Not
+/// for the semi-honest path, whose `β'` is uniform in `[1, N)`.
+pub fn mtaAliceFinalizeVerified(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) MtaError!Scalar {
+    return finalizeLift(c_b, alice_sk, true);
+}
+
+fn finalizeLift(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey, centered: bool) MtaError!Scalar {
+    const alpha_fe = try paillier.decrypt(alice_sk, c_b); // = a·b + β' (mod n)
 
     // decrypt's Fe is backed by the FULL modulus width, so it must be
     // serialized into an `n`-wide buffer (Fe.toBytes rejects a buffer smaller
@@ -252,13 +265,66 @@ pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) 
     //
     // Reducing the FULL width removes the precondition instead of asserting
     // it: the identity now holds for every `β'` the proof can accept, since
-    // `q⁷ + q² < N` for any `N` meeting the module's key-size floor, so the
-    // Paillier plaintext cannot wrap either.
+    // `q⁷ + q² < N` for any `N` meeting the module's key-size floor, so a
+    // non-negative `β'` cannot wrap the Paillier plaintext either. A NEGATIVE
+    // `β'` (which the proof's slack also admits) is what `centeredModQ`
+    // handles (relation audit LOW 3).
     const n_len = alice_sk.nByteLen();
     var wide: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
     defer std.crypto.secureZero(u8, wide[0..n_len]);
     try alpha_fe.toBytes(wide[0..n_len], .big);
-    return zkproofs.scalarFromWide(wide[0..n_len]);
+    if (!centered) return zkproofs.scalarFromWide(wide[0..n_len]);
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    try alice_sk.nToBytes(n_buf[0..n_len]);
+    return centeredModQ(wide[0..n_len], n_buf[0..n_len]);
+}
+
+/// `α' mod q` for the CENTERED representative of `α' ∈ [0, N)`: `α'` itself
+/// when `2α' ≤ N`, else `α' − N` (negative). Relation audit 2026-10-03,
+/// LOW 3: the range proof bounds Bob's `β'` only to `|β'| ≲ q⁷`, so a Bob may
+/// send a NEGATIVE `β'`; with the plain `[0, N)` lift, `a·b + β' < 0` wraps
+/// to `N + a·b + β'`, Alice's share is off by `N mod q`, the session aborts,
+/// and Bob reads whether `a·b < |β'|` — one bit of the nonce product. With
+/// `|a·b + β'| ≤ q² + q⁷ < N/2` the centered lift IS the integer
+/// `a·b + β'`, so `α ≡ a·b + β' (mod q)` for either sign: no wrap, no abort,
+/// nothing to read. An honest `β' < q⁵` is unaffected (`α' < 2q⁵ < N/2`).
+/// Constant time in `α'` (secret): both candidates are computed and the
+/// choice is a borrow-derived mask.
+fn centeredModQ(alpha: []const u8, n: []const u8) Scalar {
+    std.debug.assert(alpha.len == n.len);
+    // t = N − α' (no borrow: α' < N), then borrow(t − α') = [α' > t] = [2α' > N].
+    var t_buf: [paillier.modulus_bytes]u8 = undefined;
+    const t = t_buf[0..n.len];
+    defer std.crypto.secureZero(u8, t);
+    _ = subBytesBE(t, n, alpha);
+    var scratch: [paillier.modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, scratch[0..n.len]);
+    const above_half = subBytesBE(scratch[0..n.len], t, alpha);
+
+    const pos = zkproofs.scalarFromWide(alpha);
+    const neg = pos.sub(zkproofs.scalarFromWide(n));
+    // Select in the field representation (fiat's `cmovznz`), with the bit
+    // laundered through montint's asm barrier: LLVM turns a recovered mask
+    // back into a jump otherwise, and a detour through bytes would hit
+    // `Scalar.fromBytes*`'s canonicality branch (both measured by ctgrind's
+    // `share`/`nonce`/`betaprime` rows).
+    var out = pos;
+    out.fe.cMov(neg.fe, @truncate(montint.nt.blackBox(above_half)));
+    return out;
+}
+
+/// `out = x − y` over equal-length big-endian byte strings; returns the
+/// final borrow (1 iff `x < y`). Branch-free in the values.
+fn subBytesBE(out: []u8, x: []const u8, y: []const u8) u1 {
+    var borrow: u16 = 0;
+    var i = x.len;
+    while (i > 0) {
+        i -= 1;
+        const d: u16 = @as(u16, x[i]) + 0x100 - y[i] - borrow;
+        out[i] = @truncate(d);
+        borrow = 1 - (d >> 8);
+    }
+    return @intCast(borrow);
 }
 
 // ── Phase 2c: malicious-secure ("checked") MtA — REAL wiring + REAL proofs
@@ -451,14 +517,19 @@ pub fn mtaAliceFinalizeChecked(
     alice_sk: paillier.SecretKey,
     alice_pk: paillier.PublicKey,
     verifier_aux: root.AuxParams,
+    /// The context Bob's proof was made under (session id, Bob's index).
+    context: []const u8,
 ) MtaCheckedError!Scalar {
-    if (!zkproofs.verifyBobMta(proof, c_a, c_b, alice_pk, verifier_aux)) {
+    if (!zkproofs.verifyBobMta(proof, c_a, c_b, alice_pk, verifier_aux, context)) {
         return error.InvalidMtaProof;
     }
-    return mtaAliceFinalize(c_b, alice_sk);
+    return mtaAliceFinalizeVerified(c_b, alice_sk);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+/// Session/prover context the tests bind their proofs to.
+const test_ctx: []const u8 = "mta-test-session";
 //
 // No external KAT exists for MtA (like threshold-BLS/paillier) — the
 // decisive net is the additive-sharing identity α + β ≡ a·b (mod q), checked
@@ -708,31 +779,31 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     // Alice round 1 + her range proof; Bob verifies it before doing any
     // homomorphic work on c_a (his fail-closed gate).
     const alice = try mtaAliceInitChecked(a, kp.public, random);
-    const alice_proof = try zkproofs.proveAliceRange(testing.allocator, a, alice.r_a, kp.public, aux, random);
+    const alice_proof = try zkproofs.proveAliceRange(testing.allocator, a, alice.r_a, kp.public, aux, test_ctx, random);
     defer alice_proof.deinit(testing.allocator);
-    try testing.expect(zkproofs.verifyAliceRange(alice_proof, alice.c_a, kp.public, aux));
+    try testing.expect(zkproofs.verifyAliceRange(alice_proof, alice.c_a, kp.public, aux, test_ctx));
 
     // Bob round 2 + his MtA proof (beta_prime = the q⁵-range blind
     // mtaBobResponseChecked folded into c_b).
     const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
     const beta_prime = &bob.beta_prime;
-    const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
+    const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer bob_proof.deinit(testing.allocator);
 
     // Alice finalize: verify-then-decrypt, and the additive sharing holds.
-    const alpha = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bob_proof, kp.secret, kp.public, aux);
+    const alpha = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bob_proof, kp.secret, kp.public, aux, test_ctx);
     try expectAdditiveShare(a, b, alpha, bob.beta);
 
     // Fail-closed: a tampered c_b (proof no longer matches) must be
     // REFUSED before decryption, not decrypted-then-shrugged-at.
     const one_fe = paillier.Fe.fromPrimitive(u64, kp.public.n_sq, 1) catch unreachable;
     const c_b_bad = try paillier.addPlaintext(kp.public, bob.c_b, one_fe);
-    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, c_b_bad, bob_proof, kp.secret, kp.public, aux));
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, c_b_bad, bob_proof, kp.secret, kp.public, aux, test_ctx));
 
     // Fail-closed: a proof produced for a DIFFERENT b must be refused too.
-    const bad_proof = try zkproofs.proveBobMta(testing.allocator, b.add(Scalar.one), beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
+    const bad_proof = try zkproofs.proveBobMta(testing.allocator, b.add(Scalar.one), beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
     defer bad_proof.deinit(testing.allocator);
-    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, kp.secret, kp.public, aux));
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, kp.secret, kp.public, aux, test_ctx));
 }
 
 // ── audit F5 (2026-09-16): the plaintext Alice decrypts must hide Bob's b ──
@@ -823,4 +894,31 @@ test "audit F5: Alice's own decryption of c_B must not reveal Bob's b (the β' b
     }
 
     try testing.expectEqualSlices(usize, &.{ 0, 0 }, &recovered);
+}
+
+test "centeredModQ: a negative β' (wrapped plaintext) still yields α ≡ a·b + β' (mod q) — relation audit LOW 3" {
+    // N = a toy odd modulus wide enough for the arithmetic; the lift only
+    // needs N's bytes, not a Paillier key.
+    var n: [64]u8 = undefined;
+    @memset(&n, 0xab);
+    n[63] |= 1;
+    const n_int = std.mem.readInt(u512, &n, .big);
+    const ab: u512 = 1000;
+    // β' = −1500: the plaintext a·b + β' = −500 wraps to N − 500.
+    var wrapped: [64]u8 = undefined;
+    std.mem.writeInt(u512, &wrapped, n_int - 500, .big);
+    const got = centeredModQ(&wrapped, &n);
+    const want = zkproofs.scalarFromWide(&[_]u8{ 0x01, 0xf4 }).neg(); // −500 mod q
+    try testing.expect(got.equivalent(want));
+    // β' = +1500: no wrap, the plain value.
+    var plain: [64]u8 = undefined;
+    std.mem.writeInt(u512, &plain, ab + 1500, .big);
+    try testing.expect(centeredModQ(&plain, &n).equivalent(zkproofs.scalarFromWide(&[_]u8{ 0x09, 0xc4 })));
+    // The boundary: 2α' = N − 1 stays positive, 2α' = N + 1 turns negative.
+    var lo: [64]u8 = undefined;
+    std.mem.writeInt(u512, &lo, n_int / 2, .big);
+    try testing.expect(centeredModQ(&lo, &n).equivalent(zkproofs.scalarFromWide(&lo)));
+    var hi: [64]u8 = undefined;
+    std.mem.writeInt(u512, &hi, n_int / 2 + 1, .big);
+    try testing.expect(centeredModQ(&hi, &n).equivalent(zkproofs.scalarFromWide(&hi).sub(zkproofs.scalarFromWide(&n))));
 }

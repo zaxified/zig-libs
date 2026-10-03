@@ -489,7 +489,8 @@ what this module now does. Wire format unchanged; a proof made before the
 fix does not verify after it. Regression test: "review 2026-10-03 F1".
 
 **Status: IMPLEMENTED, `pi_mod_iterations`/`pi_prm_iterations` soundness
-parameter `m = 80` (≈2^-80 error) for both.** REAL: the `ModProof`/
+parameter `m = 128` (≈2^-128 error) for both** (80 until 2026-10-03, review F7:
+a non-interactive proof is grindable, so `2^-80` meant 80-bit security). REAL: the `ModProof`/
 `PrmProof` struct shapes and byte codecs, the Fiat-Shamir transcript wiring
 (`deriveModChallenge`/`derivePrmChallengeBits`, built on
 `zkproofs.Transcript`'s new `finalizeDigest` — the same domain-separated
@@ -517,7 +518,7 @@ composite) is carried entirely by the per-round `z_i^N ≡ y_i` and
 `x_i^4 ≡ (−1)^{a_i} w^{b_i} y_i` equations — verified empirically: for the
 crafted 3-prime KAT below, MR reports composite (does not reject), the prover
 finds a genuine `(w/n_tilde) = −1` witness (Jacobi step does not reject), yet
-all 80 rounds fail BOTH per-round equations. Πprm's soundness is likewise
+every round fails BOTH per-round equations. Πprm's soundness is likewise
 carried by the per-round `s^{z_i} ≡ A_i · t^{e_i}` check.
 
 **KAT harness — the F1-soundness scenarios are the deliverable.** No
@@ -622,7 +623,7 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   moduli (`rebase`, `feFromSecretBytes`: `r_a mod N`, masks, `b`, `β'`, the
   encryption randomness) and `paillier.addCiphertexts` run on
   `montint.DynModint`, crossing from and to the `ff` carrier types by a
-  positional limb repack. ctgrind (in-file): `share` 394 → 244, `nonce` 669 → 478, `betaprime` 462 → 285,
+  positional limb repack. ctgrind (in-file): `share` 394 → 244, `nonce` 669 → 478 (481 after the Bob unit check, 2026-10-03), `betaprime` 462 → 285 (287),
   `fac` 17 → 5; the rest of each row is the verifier side's over-taint (one
   process simulates every signer), `std`'s secp256k1, and the scalar
   reductions of the draws.
@@ -1067,27 +1068,18 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 
 ## Backlog / deferred
 
-- **Relation audit 2026-10-03 — LOW items** (the HIGH non-unit `u`/`s` range-proof bypass was fixed
-  the same day): (1) range/MtA/MtAwc challenges bind no session or prover id (PDL and the ec proofs
-  do); the prover's `pk` and the verifier's aux are hashed, so only same-signer session replay
-  remains; (2) Bob's MtA proofs do not check `c_B`/`v`/`s` are units — Bob cannot make non-units
-  without factoring Alice's `N`, and `decrypt` refuses them; add the same `isUnitModN` for symmetry;
-  (3) a Bob who sends a signed (negative) `β'` chooses whether `a·b' + β'` wraps mod `N` and reads
-  one threshold bit of Alice's `k_j` from an aborted session — bound `β'` to non-negative as GG18
-  states.
-
-- **Review 2026-10-03 (independent, read-only) — LOW items left open** (F1 Πprm direction and F2
-  `Ñ = 3` hang were fixed the same day): (F3) Πmod does not check `gcd(y_i, Ñ) = 1` — not exploitable
-  at the size floor, Πfac covers small factors; (F4) `ModProof`/`PrmProof` decoders accept trailing
-  bytes and any nonzero `a`/`b` byte, and `x ↦ Ñ − x` is a second valid response — proofs are
-  malleable, harmless unless someone de-duplicates by proof bytes; (F5) `aux_info.assembleKeyShare`
-  relies on the caller having run `verifyAnnouncement`/`findDuplicate`/`verifyFactors` (dkg does) —
-  a `Verified` wrapper type would make it structural; (F6) `Ñ` is held only to the `q⁷` floor, not
-  to the 2048 bits the Paillier `N` is pinned to — decide and pin; (F7) Πprm/Πmod soundness is
-  `2^-80` (80 binary rounds, grindable), below the ~128-bit level the rest of the module reads as;
-  (F8) dkg's keygen context `sid | SHA-256(sid) if len > 64` lets a raw 32-byte sid equal another
-  sid's digest — prefix a flag byte; the unbound `Piprm.verify`/`Pimod.verify` stay public, document
-  "never in keygen". Effort S each, F7 M (rounds or a larger challenge space).
+- ~~**Relation audit 2026-10-03 — LOW items** and **review 2026-10-03 F3–F8**~~ — closed
+  2026-10-03: (1) range/MtA/MtAwc transcripts absorb the caller's context (session id, prover
+  index; domains `v3`), `presign` passes `sid || index` as for PDL; (2) Bob's MtA proofs require
+  `c_B`, `s` units (`v` follows); (3) after a verified MtA, Alice lifts `Dec(c_B)` to its centered
+  representative (`mta.mtaAliceFinalizeVerified`), so a negative `β'` neither wraps nor aborts —
+  nothing to read (the semi-honest `mtaAliceFinalize` keeps `[0, N)`, its `β'` is uniform); F3
+  Πmod refuses `gcd(y_i, Ñ) > 1`; F4 strict `ModProof`/`PrmProof` codecs (full-width fields, flag
+  bytes 0/1, no trailing bytes) and the canonical root `x ≤ Ñ − x` (prover picks it without a
+  branch); F5 `aux_info.AnnouncementSet` → `Verified` is what `assembleKeyShare` takes; F6
+  `verifyAnnouncement` requires a 2048-bit `Ñ`; F7 128 rounds; F8 `dkg`'s keygen context carries a
+  form byte (raw vs hashed session id) and the unbound `Piprm.verify`/`Pimod.verify` say "never in
+  keygen".
 
 - Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
   constructions against GG18 Appendix A before production use — see the

@@ -84,6 +84,10 @@ pub const EcdsaKeygen = struct {
     /// Πfac received from peer `j`, `fac[j - 1]`.
     fac: []?fac_proof.FacProof,
 
+    /// The announcements and the checks they passed, from the end of the
+    /// announce round on.
+    checked: ?aux_info.AnnouncementSet = null,
+
     outbox: std.ArrayList(Outgoing) = .empty,
     share: ?tecdsa.KeyShare = null,
     culprit_: ?u32 = null,
@@ -132,6 +136,7 @@ pub const EcdsaKeygen = struct {
             s.paillier_secret.deinit();
             self.allocator.free(s.public_keys.entries);
         }
+        if (self.checked) |*c| c.deinit(self.allocator);
         self.inner.deinit();
         self.allocator.free(self.session_id);
         self.allocator.free(self.announcements);
@@ -246,17 +251,22 @@ pub const EcdsaKeygen = struct {
             return error.MissingMessage;
         }
         var ctx_buf: [ctx_max]u8 = undefined;
-        for (self.announcements, 1..) |a, j| {
+        const all = try self.allocator.alloc(aux_info.Announcement, self.cfg.n);
+        defer self.allocator.free(all);
+        for (all, self.announcements) |*d, a| d.* = a.?;
+        self.checked = aux_info.AnnouncementSet.init(self.allocator, all, self.me) catch |e| switch (e) {
+            error.InvalidParameters => unreachable, // me is 1..=n by `init`
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const checked = &self.checked.?;
+        for (1..self.cfg.n + 1) |j| {
             if (j == self.me) continue;
-            aux_info.verifyAnnouncement(a.?, self.context(&ctx_buf, @intCast(j)), self.random) catch {
+            checked.verifyPeer(@intCast(j), self.context(&ctx_buf, @intCast(j)), self.random) catch {
                 self.culprit_ = @intCast(j);
                 return error.InvalidAnnouncement;
             };
         }
-        const all = try self.allocator.alloc(aux_info.Announcement, self.cfg.n);
-        defer self.allocator.free(all);
-        for (all, self.announcements) |*d, a| d.* = a.?;
-        if (aux_info.findDuplicate(all) != null) return error.DuplicateModulus;
+        if (checked.checkDistinct() != null) return error.DuplicateModulus;
 
         const own_ctx = self.context(&ctx_buf, self.me);
         for (self.announcements, 1..) |a, j| {
@@ -275,9 +285,10 @@ pub const EcdsaKeygen = struct {
             return error.MissingMessage;
         }
         var ctx_buf: [ctx_max]u8 = undefined;
-        for (self.fac, self.announcements, 1..) |f, a, j| {
+        const checked = &self.checked.?;
+        for (self.fac, 1..) |f, j| {
             if (j == self.me) continue;
-            if (!aux_info.verifyFactors(a.?, self.local.aux, self.context(&ctx_buf, @intCast(j)), f.?)) {
+            if (!checked.verifyPeerFactors(@intCast(j), self.context(&ctx_buf, @intCast(j)), f.?)) {
                 self.culprit_ = @intCast(j);
                 return error.InvalidFactorProof;
             }
@@ -293,40 +304,28 @@ pub const EcdsaKeygen = struct {
         if (self.inner.phase() != .done) return;
         var out = self.inner.output().?;
         defer out.deinit();
-        const all = try self.allocator.alloc(aux_info.Announcement, self.cfg.n);
-        defer self.allocator.free(all);
-        for (all, self.announcements) |*d, a| d.* = a.?;
         self.share = try aux_info.assembleKeyShare(
             self.allocator,
-            self.me,
+            self.checked.?.verified().?, // every check passed in the earlier rounds
             out.secret_share,
             self.inner.publicCommitments().?,
             self.local,
-            all,
         );
         self.phase_ = .done;
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
 
-    /// Longest session id `context` handles; longer ones are hashed down.
-    const ctx_max = 64 + 12;
+    /// Longest session id `context` keeps raw; longer ones are hashed down.
+    const ctx_max = 1 + 64 + 12;
 
-    /// `session id || u32-BE t || u32-BE n || u32-BE index` — a session id
-    /// longer than 64 bytes is replaced by its SHA-256 (every party does the
-    /// same, so contexts agree).
+    /// `form || session id || u32-BE t || u32-BE n || u32-BE index`, `form`
+    /// 0 for a raw session id and 1 for a session id longer than 64 bytes
+    /// replaced by its SHA-256 (every party does the same, so contexts
+    /// agree). The form byte keeps a raw 32-byte session id from equalling
+    /// another session id's digest (review F8, 2026-10-03).
     fn context(self: *const EcdsaKeygen, buf: *[ctx_max]u8, index: u32) []const u8 {
-        var sid: []const u8 = self.session_id;
-        var digest: [32]u8 = undefined;
-        if (sid.len > 64) {
-            std.crypto.hash.sha2.Sha256.hash(sid, &digest, .{});
-            sid = &digest;
-        }
-        @memcpy(buf[0..sid.len], sid);
-        std.mem.writeInt(u32, buf[sid.len..][0..4], self.cfg.t, .big);
-        std.mem.writeInt(u32, buf[sid.len + 4 ..][0..4], self.cfg.n, .big);
-        std.mem.writeInt(u32, buf[sid.len + 8 ..][0..4], index, .big);
-        return buf[0 .. sid.len + 12];
+        return keygenContext(buf, self.session_id, self.cfg.t, self.cfg.n, index);
     }
 
     fn missing(self: *const EcdsaKeygen, which: enum { announce, factors }) ?u32 {
@@ -524,4 +523,36 @@ test "dealer-free keygen: a missing announcement aborts with the absent party na
     try testing.expectEqual(@as(?u32, 2), p.culprit());
     try testing.expectError(error.Aborted, p.advance());
     try testing.expectError(error.EmptySessionId, EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, 1, "", &local, random));
+}
+
+fn keygenContext(buf: *[EcdsaKeygen.ctx_max]u8, session_id: []const u8, t: u32, n: u32, index: u32) []const u8 {
+    var sid: []const u8 = session_id;
+    var digest: [32]u8 = undefined;
+    buf[0] = 0;
+    if (sid.len > 64) {
+        std.crypto.hash.sha2.Sha256.hash(sid, &digest, .{});
+        sid = &digest;
+        buf[0] = 1;
+    }
+    @memcpy(buf[1..][0..sid.len], sid);
+    const tail = buf[1 + sid.len ..];
+    std.mem.writeInt(u32, tail[0..4], t, .big);
+    std.mem.writeInt(u32, tail[4..8], n, .big);
+    std.mem.writeInt(u32, tail[8..12], index, .big);
+    return buf[0 .. 1 + sid.len + 12];
+}
+
+test "keygen context: a raw 32-byte session id never equals a long session id's digest (review F8)" {
+    const long_sid = "a session id longer than sixty-four bytes, so the context hashes it down";
+    try std.testing.expect(long_sid.len > 64);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(long_sid, &digest, .{});
+    var buf_a: [EcdsaKeygen.ctx_max]u8 = undefined;
+    var buf_b: [EcdsaKeygen.ctx_max]u8 = undefined;
+    const a = keygenContext(&buf_a, long_sid, 2, 3, 1);
+    const b = keygenContext(&buf_b, &digest, 2, 3, 1);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    // Same input, same context (every party derives the same one).
+    var buf_c: [EcdsaKeygen.ctx_max]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, a, keygenContext(&buf_c, long_sid, 2, 3, 1));
 }

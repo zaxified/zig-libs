@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — `EcdsaKeygen`: the per-party proof context starts with a form
+  byte (0 raw session id, 1 its SHA-256 when longer than 64 bytes), so a raw 32-byte
+  session id can no longer equal another session's digest (review F8); the
+  announce/factor checks run through `threshold_ecdsa`'s `AnnouncementSet`, whose
+  `verified()` is what `assembleKeyShare` now takes. Contexts changed: proofs from an
+  older build do not verify.
 - **2026-10-03** — `EcdsaKeygen` picks up `threshold_ecdsa`'s Πprm direction
   fix: the ring-Pedersen tuple is now `h1 = h2^λ` and Πprm proves `h1 ∈ ⟨h2⟩`
   (before, `h2 ∈ ⟨h1⟩`, which let a dishonest party's tuple leak the others'

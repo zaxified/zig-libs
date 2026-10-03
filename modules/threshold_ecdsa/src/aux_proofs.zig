@@ -52,17 +52,17 @@
 //! ## Soundness parameter
 //!
 //! Both proofs are `m`-round Fiat-Shamir Sigma protocols; `m` is a NAMED
-//! CONSTANT below (`pi_mod_iterations`/`pi_prm_iterations`, both `80`),
-//! giving soundness error `~2^-80` per proof (Πmod: each of `m`
+//! CONSTANT below (`pi_mod_iterations`/`pi_prm_iterations`, both `128`),
+//! giving soundness error `~2^-128` per proof (Πmod: each of `m`
 //! independent `y_i` challenges catches a cheating prover with probability
 //! `>= 1/2`; Πprm: each of `m` independent single-bit challenges catches a
-//! cheating prover with probability `>= 1/2` — `(1/2)^80 = 2^-80` for
-//! both, the same target `zkproofs.zig`'s own Fiat-Shamir challenge space
-//! achieves via a single `~2^-256`-soundness `Zq` challenge; `m=80`
-//! rounds of a 1-bit challenge is the standard CGGMP21 parameterization
-//! rather than a wide single challenge, since both proofs' per-round
-//! algebra is cheap but the challenge itself cannot be widened past 1
-//! bit/round without leaking additional structure).
+//! cheating prover with probability `>= 1/2` — `(1/2)^128` for both).
+//! Rounds of a 1-bit challenge rather than one wide challenge, since the
+//! challenge cannot be widened past 1 bit/round without leaking structure.
+//! Until 2026-10-03 `m` was CGGMP21's and tss-lib's `80`: a non-interactive
+//! proof is GRINDABLE (the prover can re-roll its commitments offline until
+//! the derived bits suit a false statement), so `2^-80` was an 80-bit
+//! security level under a module that otherwise reads as ~128 (review F7).
 //!
 //! Zig std GAP: none new — `std.crypto.ff` (via `root.AuxModulus`/
 //! `root.AuxFe`) and `std.crypto.hash.sha2.Sha256` (via `zkproofs
@@ -78,13 +78,13 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Soundness parameter for Πmod (CGGMP21 Fig.16) — `m` independent
 /// Fiat-Shamir challenges `y_1..y_m`, each catching a cheating prover with
-/// probability `>= 1/2`; `(1/2)^80 ≈ 2^-80` soundness error.
-pub const pi_mod_iterations: usize = 80;
+/// probability `>= 1/2`; `(1/2)^128` soundness error (was 80, review F7).
+pub const pi_mod_iterations: usize = 128;
 
 /// Soundness parameter for Πprm (CGGMP21 Fig.17) — `m` independent
-/// single-bit Fiat-Shamir challenges `e_1..e_m`; `(1/2)^80 ≈ 2^-80`
-/// soundness error.
-pub const pi_prm_iterations: usize = 80;
+/// single-bit Fiat-Shamir challenges `e_1..e_m`; `(1/2)^128` soundness
+/// error (was 80, review F7).
+pub const pi_prm_iterations: usize = 128;
 
 /// Domain-separation tag for Πmod's Fiat-Shamir seed — same
 /// per-proof-kind domain-separation discipline as `zkproofs.zig`'s
@@ -161,6 +161,36 @@ fn comptimeIntBytes(comptime len: usize, comptime value: comptime_int) [len]u8 {
     return out;
 }
 
+/// One length-prefixed field of a proof, held to the exact width `toBytesAlloc`
+/// writes (`root.aux_modulus_bytes`), so each value has ONE encoding (review
+/// F4: leading-zero variants used to decode to the same proof).
+fn readFixedFe(n_tilde: root.AuxModulus, bytes: []const u8, offset: *usize) error{InvalidEncoding}!root.AuxFe {
+    const field = readLenPrefixed(bytes, offset) catch return error.InvalidEncoding;
+    if (field.len != root.aux_modulus_bytes) return error.InvalidEncoding;
+    return root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(field), .big) catch error.InvalidEncoding;
+}
+
+/// `a <= b` for canonical `AuxFe`s (public values; big-endian byte order).
+fn auxFeLeq(a: root.AuxFe, b: root.AuxFe) bool {
+    var ab: [root.aux_modulus_bytes]u8 = undefined;
+    a.toBytes(&ab, .big) catch return false;
+    var bb: [root.aux_modulus_bytes]u8 = undefined;
+    b.toBytes(&bb, .big) catch return false;
+    return std.mem.order(u8, &ab, &bb) != .gt;
+}
+
+/// `a < b` over little-endian limbs, without a branch on the values (the
+/// borrow of `a − b`).
+fn limbsLessCt(a: anytype, b: anytype) bool {
+    var borrow: u1 = 0;
+    for (a, b) |x, y| {
+        const d1 = @subWithOverflow(x, y);
+        const d2 = @subWithOverflow(d1[0], borrow);
+        borrow = d1[1] | d2[1];
+    }
+    return borrow == 1;
+}
+
 // ── ModProof — Πmod's proof object (STRUCT+CODEC real) ──────────────────
 
 /// One of Πmod's `pi_mod_iterations` per-round responses (CGGMP21 Fig.16
@@ -223,21 +253,21 @@ pub const ModProof = struct {
     /// (`entries` is a fixed-size array).
     pub fn fromBytesAlloc(n_tilde: root.AuxModulus, bytes: []const u8) FromBytesError!ModProof {
         var offset: usize = 0;
-        const w_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const w = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(w_bytes), .big) catch return error.InvalidEncoding;
+        const w = try readFixedFe(n_tilde, bytes, &offset);
 
         var entries: [pi_mod_iterations]ModEntry = undefined;
         for (&entries) |*slot| {
-            const x_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-            const x = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(x_bytes), .big) catch return error.InvalidEncoding;
-            const z_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-            const z = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(z_bytes), .big) catch return error.InvalidEncoding;
+            const x = try readFixedFe(n_tilde, bytes, &offset);
+            const z = try readFixedFe(n_tilde, bytes, &offset);
             if (bytes.len < offset + 2) return error.InvalidEncoding;
-            const a = bytes[offset] != 0;
-            const b = bytes[offset + 1] != 0;
+            // One encoding per proof (review F4): flag bytes are 0 or 1.
+            if (bytes[offset] > 1 or bytes[offset + 1] > 1) return error.InvalidEncoding;
+            const a = bytes[offset] == 1;
+            const b = bytes[offset + 1] == 1;
             offset += 2;
             slot.* = .{ .x = x, .z = z, .a = a, .b = b };
         }
+        if (offset != bytes.len) return error.InvalidEncoding; // no trailing bytes (F4)
         return .{ .w = w, .entries = entries };
     }
 };
@@ -291,12 +321,11 @@ pub const PrmProof = struct {
         var offset: usize = 0;
         var entries: [pi_prm_iterations]PrmEntry = undefined;
         for (&entries) |*slot| {
-            const a_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-            const a_commit = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(a_bytes), .big) catch return error.InvalidEncoding;
-            const z_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-            const z = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(z_bytes), .big) catch return error.InvalidEncoding;
+            const a_commit = try readFixedFe(n_tilde, bytes, &offset);
+            const z = try readFixedFe(n_tilde, bytes, &offset);
             slot.* = .{ .a_commit = a_commit, .z = z };
         }
+        if (offset != bytes.len) return error.InvalidEncoding; // no trailing bytes (F4)
         return .{ .entries = entries };
     }
 };
@@ -428,7 +457,7 @@ fn derivePrmSeed(aux: root.AuxParams, context: ?[]const u8, commitments: []const
 
 /// Πprm's `pi_prm_iterations`-bit challenge `e ∈ {0,1}^m` (CGGMP21 Fig.17
 /// step 2) — one deterministic expansion block, sliced into individual
-/// bits (`m = 80 <= 256` fits inside a single `expandChallenge` call's
+/// bits (`m = 128 <= 256` fits inside a single `expandChallenge` call's
 /// first block; the loop still handles `m > 256` correctly if the
 /// soundness constant is ever widened).
 pub fn derivePrmChallengeBits(seed: [32]u8, out_bits: *[pi_prm_iterations]bool) void {
@@ -751,7 +780,7 @@ pub const Piprm = struct {
     /// `t := aux.h2`) for a KNOWN `lambda`, i.e. that `s ∈ ⟨t⟩` — the
     /// message base lies in the subgroup the randomness base generates,
     /// which is what makes `s^x·t^ρ` hiding — WITHOUT revealing `lambda`.
-    /// (It does NOT show `⟨s⟩ = ⟨t⟩`, and hiding does not need that.) Soundness `~2^-80` (`pi_prm_iterations` 1-bit rounds).
+    /// (It does NOT show `⟨s⟩ = ⟨t⟩`, and hiding does not need that.) Soundness `~2^-128` (`pi_prm_iterations` 1-bit rounds).
     ///
     /// Construction (prover knows `trapdoor.lambda` AND `phi(n_tilde) =
     /// (p̃-1)(q̃-1)`, computable from `trapdoor.p`/`.q`):
@@ -903,6 +932,10 @@ pub const Piprm = struct {
     ///    proof fields). Reject (return false) on ANY single failure.
     /// 4. Accept (return true) only if every round's equation holds.
     /// ```
+    ///
+    /// UNBOUND: the proof names no session or prover, so it can be replayed
+    /// into any run. Never use it in keygen — there, `verifyBound` with the
+    /// prover's context (review F8). Kept for standalone checks of a tuple.
     pub fn verify(aux: root.AuxParams, proof: PrmProof) bool {
         return verifyCtx(aux, null, proof);
     }
@@ -964,7 +997,7 @@ pub const Pimod = struct {
     /// guarantees, via `generateSafePrime`'s own `p̃ ≡ 3 (mod 4)` filter)
     /// with `gcd(n_tilde, phi(n_tilde)) = 1` (automatic for a genuine
     /// two-DISTINCT-prime product), WITHOUT revealing `p̃`/`q̃`. Soundness
-    /// `~2^-80` (`pi_mod_iterations` rounds, each catching a cheating
+    /// `~2^-128` (`pi_mod_iterations` rounds, each catching a cheating
     /// prover with probability `>= 1/2`).
     ///
     /// Construction (prover knows `p̃ = trapdoor.p`, `q̃ = trapdoor.q`,
@@ -1160,7 +1193,15 @@ pub const Pimod = struct {
             defer std.crypto.secureZero(u64, &xq);
             var h = pb.m.mul(&pb.m.sub(&xp, &pb.m.reduceLimbs(xq[0..qb.m.L])), &qinv_p);
             defer std.crypto.secureZero(u64, &h);
-            var x = ntc.add(&xq, &ntc.mul(&qb.m.m, &h));
+            var x_any = ntc.add(&xq, &ntc.mul(&qb.m.m, &h));
+            defer std.crypto.secureZero(u64, &x_any);
+            // Canonical root (review F4): of the pair {x, Ñ − x} publish the
+            // smaller one, which the verifier enforces — anyone could flip a
+            // published x to Ñ − x and get a second valid proof otherwise.
+            // Selected without a branch: x derives from the secret factors.
+            var x_neg = ntc.neg(&x_any);
+            defer std.crypto.secureZero(u64, &x_neg);
+            var x = Ct.select(limbsLessCt(&x_neg, &x_any), &x_neg, &x_any);
             defer std.crypto.secureZero(u64, &x);
             const x_fe = Ct.elemToFf(root.AuxFe, nt, &x);
 
@@ -1196,6 +1237,10 @@ pub const Pimod = struct {
     ///    are vanishingly unlikely to hold simultaneously for a
     ///    non-Blum-integer n_tilde.)
     /// ```
+    ///
+    /// UNBOUND: the proof names no session or prover, so it can be replayed
+    /// into any run. Never use it in keygen — there, `verifyBound` /
+    /// `verifyPaillier` with the prover's context (review F8).
     pub fn verify(aux: root.AuxParams, proof: ModProof) bool {
         return verifyCore(aux.n_tilde, .{ .aux = aux }, proof);
     }
@@ -1264,6 +1309,22 @@ pub const Pimod = struct {
         for (proof.entries, 0..) |e, idx| {
             const y = deriveModChallenge(nt, seed, @intCast(idx + 1));
 
+            // gcd(y_i, n_tilde) = 1 (review F3): a challenge sharing a factor
+            // with n_tilde is no member of Z_n_tilde*, and the per-round
+            // equations below argue about units. Jacobi 0 <=> gcd > 1.
+            {
+                var scratch: [verify_scratch_bytes]u8 = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&scratch);
+                const gpa = fba.allocator();
+                const yb = bigFromFe(gpa, y) catch return false;
+                const nb = bigFromBytes(gpa, n_bytes) catch return false;
+                if ((jacobiBig(gpa, &yb, &nb) catch return false) == 0) return false;
+            }
+
+            // Canonical root (review F4): x <= n_tilde − x, so a third party
+            // cannot turn one valid proof into a second by negating x.
+            if (!auxFeLeq(e.x, nt.sub(nt.zero, e.x))) return false;
+
             // z_i^{n_tilde} == y_i — forces gcd(n_tilde, phi(n_tilde)) = 1
             // (the n-th-power map must be a bijection on Z_n_tilde*).
             const zn = nt.powWithEncodedPublicExponent(e.z, n_bytes, .big) catch return false;
@@ -1273,7 +1334,7 @@ pub const Pimod = struct {
             // (4th roots of a full QR-class cover exist only when both
             // prime factors are ≡ 3 mod 4; a 3-prime or prime-power
             // n_tilde fails this with overwhelming probability across the
-            // 80 rounds).
+            // `pi_mod_iterations` rounds).
             const x4 = nt.sq(nt.sq(e.x));
             var rhs = y;
             if (e.b) rhs = nt.mul(rhs, proof.w);
@@ -1684,6 +1745,43 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.mod.w = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
+    // Review F4: the negated root Ñ − x satisfies x⁴ just the same; only the
+    // canonical-root rule refuses it, so a third party cannot re-mint a proof.
+    {
+        var tampered = proof;
+        tampered.mod.entries[0].x = nt.sub(nt.zero, proof.mod.entries[0].x);
+        try testing.expect(nt.sq(nt.sq(tampered.mod.entries[0].x)).eql(nt.sq(nt.sq(proof.mod.entries[0].x))));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
+    }
+    // Review F4: one encoding per proof — no trailing byte, flag bytes 0/1,
+    // fields at their full width.
+    {
+        const bytes = try proof.mod.toBytesAlloc(allocator);
+        defer allocator.free(bytes);
+        _ = try ModProof.fromBytesAlloc(nt, bytes);
+        const longer = try std.mem.concat(allocator, u8, &.{ bytes, &[_]u8{0} });
+        defer allocator.free(longer);
+        try testing.expectError(error.InvalidEncoding, ModProof.fromBytesAlloc(nt, longer));
+        const flag_at = 4 + root.aux_modulus_bytes + 2 * (4 + root.aux_modulus_bytes); // entries[0].a
+        try testing.expect(bytes[flag_at] <= 1);
+        const flagged = try allocator.dupe(u8, bytes);
+        defer allocator.free(flagged);
+        flagged[flag_at] = 2;
+        try testing.expectError(error.InvalidEncoding, ModProof.fromBytesAlloc(nt, flagged));
+        // w re-encoded one byte narrower (its top byte is zero for a 128-bit Ñ).
+        const narrow = try allocator.alloc(u8, bytes.len - 1);
+        defer allocator.free(narrow);
+        std.mem.writeInt(u32, narrow[0..4], root.aux_modulus_bytes - 1, .big);
+        @memcpy(narrow[4..], bytes[5..]);
+        try testing.expectError(error.InvalidEncoding, ModProof.fromBytesAlloc(nt, narrow));
+
+        const prm_bytes = try proof.prm.toBytesAlloc(allocator);
+        defer allocator.free(prm_bytes);
+        _ = try PrmProof.fromBytesAlloc(nt, prm_bytes);
+        const prm_longer = try std.mem.concat(allocator, u8, &.{ prm_bytes, &[_]u8{0} });
+        defer allocator.free(prm_longer);
+        try testing.expectError(error.InvalidEncoding, PrmProof.fromBytesAlloc(nt, prm_longer));
+    }
     // Flip Πmod's entries[0].x.
     {
         var tampered = proof;
@@ -1842,7 +1940,7 @@ test "audit F4(b): Pimod.verify's Jacobi guard alone refuses a non-unit w that f
     // z-equation holds in every round. With w ≡ 0 (mod 17) and b_i = 1 the
     // x-equation holds too: x ≡ 0 (mod 17), and mod 11 (≡ 3 mod 4) one of
     // ±w·y is a square, and every square is a 4th power. A prover knowing
-    // the factors answers all 80 rounds; only `(w/Ñ) = −1` — which is 0 for
+    // the factors answers every round; only `(w/Ñ) = −1` — which is 0 for
     // a non-unit w — refuses it. CGGMP21 Fig.16 picks w with Jacobi −1.
     const nt = toyModulus();
     const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 4), .h2 = toyFe(nt, 16) };
@@ -2030,4 +2128,41 @@ test "Πmod/Paillier TEETH: a modulus with a factor ≡ 1 (mod 4) is refused" {
     const n = try root.AuxModulus.fromBytes(&[_]u8{ 0x10, 0x0f, 0xd3 }, .big); // 1019 · 1033
     const proof = try Pimod.provePaillier(testing.allocator, n, &p, &q, "c", random);
     try testing.expect(!Pimod.verifyPaillier(n, "c", proof));
+}
+
+test "review F3: Πmod refuses a round whose challenge y_i shares a factor with Ñ" {
+    // Ñ = 77 = 7·11, both ≡ 3 (mod 4): a genuine Paillier-Blum modulus, and
+    // gcd(77, φ = 60) = 1 (d = 77⁻¹ mod 60 = 53). An honest prover answers
+    // every round — including the non-unit y_i (≡ 0 mod 7 or 11), whose
+    // roots exist too (0 is its own root). Every other check passes (w has
+    // Jacobi −1, roots canonical), so only the gcd(y_i, Ñ) = 1 rule refuses it.
+    const n: u64 = 77;
+    const d: u64 = 53;
+    try testing.expectEqual(@as(u64, 1), (n * d) % 60);
+    const nt = root.AuxModulus.fromBytes(&[_]u8{77}, .big) catch unreachable;
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 4), .h2 = toyFe(nt, 16) };
+    const w_val: u64 = 2; // (2/7) = +1, (2/11) = −1: Jacobi −1
+    const w = toyFe(nt, @intCast(w_val));
+    const seed = deriveModSeed(.{ .aux = aux }, w);
+    var entries: [pi_mod_iterations]ModEntry = undefined;
+    var non_units: usize = 0;
+    for (&entries, 0..) |*e, idx| {
+        const y = toyInt(deriveModChallenge(nt, seed, @intCast(idx + 1)));
+        if (y % 7 == 0 or y % 11 == 0) non_units += 1;
+        var found: ?ModEntry = null;
+        search: for ([_]bool{ false, true }) |b| for ([_]bool{ false, true }) |a| {
+            var rhs = if (b) (w_val * y) % n else y;
+            if (a) rhs = (n - rhs) % n;
+            var x: u64 = 0;
+            while (x <= n / 2) : (x += 1) { // the canonical half
+                if (powModSmall(x, 4, n) == rhs) {
+                    found = .{ .x = toyFe(nt, @intCast(x)), .z = toyFe(nt, @intCast(powModSmall(y, d, n))), .a = a, .b = b };
+                    break :search;
+                }
+            }
+        };
+        e.* = found orelse return error.TestFixtureHasNoFourthRoot;
+    }
+    try testing.expect(non_units > 0);
+    try testing.expect(!Pimod.verify(aux, .{ .w = w, .entries = entries }));
 }

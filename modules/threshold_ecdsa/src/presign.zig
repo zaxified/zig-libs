@@ -584,9 +584,10 @@ pub const Party = struct {
         bc[36..].* = ciphertextBytes(me.c_k);
         try out.add(self, 1, null, &bc);
 
+        const my_ctx = self.myCtx();
         for (self.peers, 0..) |p, pos| {
             if (pos == self.me) continue;
-            const proof = zkproofs.proveAliceRange(self.allocator, self.secrets.k, self.secrets.r_k, me.pk, p.aux, random) catch |e|
+            const proof = zkproofs.proveAliceRange(self.allocator, self.secrets.k, self.secrets.r_k, me.pk, p.aux, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer proof.deinit(self.allocator);
             const bytes = proof.toBytesAlloc(self.allocator) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else unreachable;
@@ -623,7 +624,8 @@ pub const Party = struct {
             const proof = zkproofs.RangeProof.fromBytesAlloc(self.allocator, ctx_me.aux.n_tilde, p.pk, slots.p2p[pos].?) catch |e|
                 return if (e == error.OutOfMemory) error.OutOfMemory else self.fail(p.index, .malformed_message);
             defer proof.deinit(self.allocator);
-            if (!zkproofs.verifyAliceRange(proof, p.c_k, p.pk, ctx_me.aux)) return self.fail(p.index, .range_proof);
+            const p_ctx = proofContext(self.sid, p.index);
+            if (!zkproofs.verifyAliceRange(proof, p.c_k, p.pk, ctx_me.aux, &p_ctx)) return self.fail(p.index, .range_proof);
         }
 
         var out: OutboxBuilder = .{ .allocator = self.allocator };
@@ -631,6 +633,7 @@ pub const Party = struct {
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
 
+        const my_ctx = self.myCtx();
         for (self.peers, 0..) |p, pos| {
             if (pos == self.me) continue;
             payload.clearRetainingCapacity();
@@ -638,14 +641,14 @@ pub const Party = struct {
             // MtA for k_j·γ_i: this party is Bob.
             var g = mta.mtaBobResponseChecked(self.secrets.gamma, p.c_k, p.pk, random) catch |e| return self.proveFailed(p.index, e);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&g));
-            const g_proof = zkproofs.proveBobMta(self.allocator, self.secrets.gamma, &g.beta_prime, g.r_b, p.c_k, g.c_b, p.pk, p.aux, random) catch |e|
+            const g_proof = zkproofs.proveBobMta(self.allocator, self.secrets.gamma, &g.beta_prime, g.r_b, p.c_k, g.c_b, p.pk, p.aux, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer g_proof.deinit(self.allocator);
 
             // MtAwc for k_j·w_i, bound to W_i.
             var x = mta.mtaBobResponseChecked(self.secrets.w, p.c_k, p.pk, random) catch |e| return self.proveFailed(p.index, e);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
-            const x_proof = zkproofs.proveBobMtaWc(self.allocator, self.secrets.w, &x.beta_prime, x.r_b, p.c_k, x.c_b, p.pk, p.aux, me.w_point, random) catch |e|
+            const x_proof = zkproofs.proveBobMtaWc(self.allocator, self.secrets.w, &x.beta_prime, x.r_b, p.c_k, x.c_b, p.pk, p.aux, me.w_point, &my_ctx, random) catch |e|
                 return self.proveFailed(p.index, e);
             defer x_proof.deinit(self.allocator);
 
@@ -695,10 +698,11 @@ pub const Party = struct {
                 return if (e == error.OutOfMemory) error.OutOfMemory else self.fail(p.index, .malformed_message);
             defer x_proof.deinit(self.allocator);
 
-            if (!zkproofs.verifyBobMta(g_proof, me.c_k, c_g, me.pk, me.aux)) return self.fail(p.index, .mta_proof);
-            if (!zkproofs.verifyBobMtaWc(x_proof, me.c_k, c_x, me.pk, me.aux, p.w_point)) return self.fail(p.index, .mtawc_proof);
-            var alpha = mta.mtaAliceFinalize(c_g, sk) catch return self.fail(p.index, .mta_proof);
-            var mu = mta.mtaAliceFinalize(c_x, sk) catch return self.fail(p.index, .mtawc_proof);
+            const p_ctx = proofContext(self.sid, p.index);
+            if (!zkproofs.verifyBobMta(g_proof, me.c_k, c_g, me.pk, me.aux, &p_ctx)) return self.fail(p.index, .mta_proof);
+            if (!zkproofs.verifyBobMtaWc(x_proof, me.c_k, c_x, me.pk, me.aux, p.w_point, &p_ctx)) return self.fail(p.index, .mtawc_proof);
+            var alpha = mta.mtaAliceFinalizeVerified(c_g, sk) catch return self.fail(p.index, .mta_proof);
+            var mu = mta.mtaAliceFinalizeVerified(c_x, sk) catch return self.fail(p.index, .mtawc_proof);
             self.secrets.delta = self.secrets.delta.add(alpha);
             self.secrets.sigma = self.secrets.sigma.add(mu);
             std.crypto.secureZero(u8, std.mem.asBytes(&alpha));

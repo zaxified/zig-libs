@@ -143,7 +143,8 @@ pub const AnnouncementError = error{
     /// (The `q⁷` floor alone would admit ~1793 bits, where Πfac's bound
     /// only guarantees factors of ~2^127; at 2048 it is ~2^253.)
     InvalidPaillierKey,
-    /// The ring-Pedersen tuple failed `validate` or its Πprm/Πmod.
+    /// `Ñ` not exactly `root.aux_modulus_bits` (2048) wide, or the
+    /// ring-Pedersen tuple failed `validate` or its Πprm/Πmod.
     InvalidAuxParams,
     /// Πmod over `N` failed: not a Paillier-Blum modulus (or not bound to
     /// this sender's context).
@@ -158,6 +159,10 @@ pub fn verifyAnnouncement(a: Announcement, context: []const u8, random: std.Rand
         return error.InvalidPaillierKey;
     const n = root.paillierModulusAsAux(a.paillier_pk) orelse return error.InvalidPaillierKey;
     if (n.bits() != paillier.modulus_bits) return error.InvalidPaillierKey;
+    // Ñ is held to the same width as N (review F6): the q⁷ floor alone
+    // admits ~1793 bits, and the range proofs' hiding leans on Ñ as much as
+    // their soundness leans on N.
+    if (a.aux.n_tilde.bits() != root.aux_modulus_bits) return error.InvalidAuxParams;
     aux_proofs.verifyWellFormedBound(a.aux, context, a.aux_proof, random) catch return error.InvalidAuxParams;
     if (!aux_proofs.Pimod.verifyPaillier(n, context, a.paillier_proof)) return error.InvalidPaillierProof;
 }
@@ -221,20 +226,101 @@ pub const AssembleError = error{
     NotOwnAnnouncement,
 } || root.DerivePublicKeyShareError || std.mem.Allocator.Error;
 
-/// Builds party `index`'s `KeyShare` from a finished DKG — its share
+/// Every party's announcement as party `me` sees them, with a record of
+/// which checks have passed: each peer's `verifyAnnouncement`, the
+/// distinct-moduli check, and each peer's Πfac made for `me`. Only
+/// `verified` turns it into the `Verified` that `assembleKeyShare` takes, so
+/// a key share cannot be assembled from announcements nobody checked
+/// (review F5, 2026-10-03; it used to be a doc-comment precondition).
+pub const AnnouncementSet = struct {
+    all: []Announcement,
+    me: u32,
+    announced: []bool,
+    factored: []bool,
+    distinct: bool = false,
+
+    pub const InitError = error{InvalidParameters} || std.mem.Allocator.Error;
+
+    /// `all[j-1]` is party `j`'s announcement, `me`'s own included (it
+    /// counts as checked). Copies `all`.
+    pub fn init(allocator: std.mem.Allocator, all: []const Announcement, me: u32) InitError!AnnouncementSet {
+        if (me == 0 or me > all.len) return error.InvalidParameters;
+        const copy = try allocator.dupe(Announcement, all);
+        errdefer allocator.free(copy);
+        const announced = try allocator.alloc(bool, all.len);
+        errdefer allocator.free(announced);
+        const factored = try allocator.alloc(bool, all.len);
+        @memset(announced, false);
+        @memset(factored, false);
+        announced[me - 1] = true;
+        factored[me - 1] = true;
+        return .{ .all = copy, .me = me, .announced = announced, .factored = factored };
+    }
+
+    pub fn deinit(self: *AnnouncementSet, allocator: std.mem.Allocator) void {
+        allocator.free(self.all);
+        allocator.free(self.announced);
+        allocator.free(self.factored);
+        self.* = undefined;
+    }
+
+    /// `verifyAnnouncement` on peer `j`'s announcement, `context` being
+    /// `j`'s; records the pass.
+    pub fn verifyPeer(self: *AnnouncementSet, j: u32, context: []const u8, random: std.Random) AnnouncementError!void {
+        std.debug.assert(j >= 1 and j <= self.all.len and j != self.me);
+        try verifyAnnouncement(self.all[j - 1], context, random);
+        self.announced[j - 1] = true;
+    }
+
+    /// `findDuplicate` over the set; records the pass when there is none.
+    pub fn checkDistinct(self: *AnnouncementSet) ?struct { usize, usize } {
+        const dup = findDuplicate(self.all);
+        self.distinct = dup == null;
+        return dup;
+    }
+
+    /// `verifyFactors` on peer `j`'s Πfac made for this party (against this
+    /// party's own announced `Ñ`), `context` being `j`'s. False also when
+    /// `j`'s announcement has not passed yet.
+    pub fn verifyPeerFactors(self: *AnnouncementSet, j: u32, context: []const u8, proof: fac_proof.FacProof) bool {
+        std.debug.assert(j >= 1 and j <= self.all.len and j != self.me);
+        if (!self.announced[j - 1]) return false;
+        if (!verifyFactors(self.all[j - 1], self.all[self.me - 1].aux, context, proof)) return false;
+        self.factored[j - 1] = true;
+        return true;
+    }
+
+    /// The set as `Verified`, once every check has passed for every peer.
+    pub fn verified(self: *const AnnouncementSet) ?Verified {
+        if (!self.distinct) return null;
+        for (self.announced, self.factored) |a, f| if (!a or !f) return null;
+        return .{ .all = self.all, .me = self.me, .seal = .checked };
+    }
+};
+
+/// Announcements that passed every check of an `AnnouncementSet`, as party
+/// `me` saw them. Borrowed from the set: keep the set alive while using it.
+pub const Verified = struct {
+    all: []const Announcement,
+    me: u32,
+    /// Produced only by `AnnouncementSet.verified`.
+    seal: enum { checked },
+};
+
+/// Builds party `verified.me`'s `KeyShare` from a finished DKG — its share
 /// `secret_share`, the group's Feldman commitments `group_commitments`
-/// (`F_0 = Q`, length `t`) — and every party's VERIFIED announcement,
-/// `announcements[j-1]` for party `j` (this party's own included). The
-/// returned share owns `public_keys.entries`: free it with
+/// (`F_0 = Q`, length `t`) — and the announcements as `verified` holds
+/// them. The returned share owns `public_keys.entries`: free it with
 /// `allocator.free(share.public_keys.entries)`.
 pub fn assembleKeyShare(
     allocator: std.mem.Allocator,
-    index: u32,
+    verified: Verified,
     secret_share: root.Scalar,
     group_commitments: []const root.Element,
     own: *const LocalAux,
-    announcements: []const Announcement,
 ) AssembleError!root.KeyShare {
+    const announcements = verified.all;
+    const index = verified.me;
     const n: u32 = @intCast(announcements.len);
     if (index == 0 or index > n or group_commitments.len == 0 or group_commitments.len > n) return error.InvalidParameters;
     const vvec: root.FeldmanCommitments = .{ .commitments = group_commitments };
@@ -371,7 +457,16 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     try testing.expect(aux_proofs.Pimod.verifyPaillier(root.paillierModulusAsAux(anns[0].paillier_pk).?, &ctxFor(1), anns[0].paillier_proof));
     try testing.expectEqual(@as(?struct { usize, usize }, null), findDuplicate(&anns));
 
-    // Πfac, every ordered pair.
+    // Each party's view: announcements, distinct moduli, then Πfac from
+    // every peer made for it (every ordered pair).
+    var sets: [3]AnnouncementSet = undefined;
+    for (&sets, 1..) |*set, me| {
+        set.* = try AnnouncementSet.init(allocator, &anns, @intCast(me));
+        for (1..4) |j| if (j != me) try set.verifyPeer(@intCast(j), &ctxFor(@intCast(j)), random);
+        try testing.expect(set.verified() == null); // Πfac still missing
+        try testing.expectEqual(@as(?struct { usize, usize }, null), set.checkDistinct());
+    }
+    defer for (&sets) |*set| set.deinit(allocator);
     for (&locals, anns, 1..) |*prover, prover_ann, i| {
         for (&locals, anns, 1..) |*verifier, verifier_ann, j| {
             if (i == j) continue;
@@ -379,6 +474,8 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
             const proof = try prover.proveFactors(verifier_ann.aux, &ctx, random);
             try testing.expect(verifyFactors(prover_ann, verifier.aux, &ctx, proof));
             try testing.expect(!verifyFactors(prover_ann, verifier.aux, &ctxFor(@intCast(j)), proof));
+            try testing.expect(!sets[j - 1].verifyPeerFactors(@intCast(i), &ctxFor(@intCast(j)), proof));
+            try testing.expect(sets[j - 1].verifyPeerFactors(@intCast(i), &ctx, proof));
         }
     }
 
@@ -392,7 +489,7 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     const commits = split.commitments.commitments;
 
     for (split.shares, 1..) |sh, i| {
-        const share = try assembleKeyShare(allocator, @intCast(i), sh.scalar, commits, &locals[i - 1], &anns);
+        const share = try assembleKeyShare(allocator, sets[i - 1].verified().?, sh.scalar, commits, &locals[i - 1]);
         defer allocator.free(share.public_keys.entries);
         try testing.expectEqual(@as(u32, 2), share.t);
         try testing.expectEqual(@as(u32, 3), share.n);
@@ -404,8 +501,8 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     }
     // A share that does not belong to the commitments, and someone else's
     // announcement in this party's slot.
-    try testing.expectError(error.ShareMismatch, assembleKeyShare(allocator, 1, split.shares[1].scalar, commits, &locals[0], &anns));
-    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, 1, split.shares[0].scalar, commits, &locals[1], &anns));
+    try testing.expectError(error.ShareMismatch, assembleKeyShare(allocator, sets[0].verified().?, split.shares[1].scalar, commits, &locals[0]));
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &locals[1]));
 }
 
 test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {
@@ -495,4 +592,38 @@ test "findDuplicate: a party whose Paillier N doubles as its own Ñ" {
     const dup2 = findDuplicate(&.{ a, b }) orelse return error.TestExpectedDuplicate;
     try testing.expectEqual(@as(usize, 0), dup2[0]);
     try testing.expectEqual(@as(usize, 1), dup2[1]);
+}
+
+test "aux_info: verifyAnnouncement refuses a ring-Pedersen modulus that is not 2048 bits (review F6)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6175_7836);
+    const random = prng.random();
+    var full = try tssLocal(allocator, 0);
+    defer full.deinit(allocator);
+
+    // A 1808-bit Blum Ñ (above the q⁷ floor) with a real trapdoor:
+    // h2 = r², h1 = h2^λ, so Πprm and Πmod are genuinely valid.
+    var small = try root.generatePaillierBlum(random, 1808);
+    defer small.wipe();
+    const nt = small.modulus();
+    const r = try root.AuxFe.fromBytes(nt, &[_]u8{ 0x05, 0x39 }, .big);
+    const h2 = nt.sq(r);
+    var lam_bytes: [32]u8 = undefined;
+    random.bytes(&lam_bytes);
+    const lambda = try root.AuxFe.fromBytes(nt, &lam_bytes, .big);
+    const h1 = try nt.pow(h2, lambda);
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
+    const td: root.AuxTrapdoor = .{ .p = small.p(), .q = small.q(), .lambda = lambda };
+    const ctx = ctxFor(1);
+    const aux_proof = try aux_proofs.proveWellFormedBound(allocator, aux, td, &ctx, random);
+    // The proofs hold; only the width is wrong.
+    try aux_proofs.verifyWellFormedBound(aux, &ctx, aux_proof, random);
+
+    const ann: Announcement = .{
+        .paillier_pk = full.paillier.key.public,
+        .aux = aux,
+        .aux_proof = aux_proof,
+        .paillier_proof = try aux_proofs.Pimod.provePaillier(allocator, full.paillier.modulus(), full.paillier.p(), full.paillier.q(), &ctx, random),
+    };
+    try testing.expectError(error.InvalidAuxParams, verifyAnnouncement(ann, &ctx, random));
 }

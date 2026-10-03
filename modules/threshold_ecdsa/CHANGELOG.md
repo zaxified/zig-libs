@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **BREAKING (wire + API): relation-audit and review LOWs closed.**
+  Range/MtA/MtAwc proofs are bound to a caller `context` (new parameter on every
+  prove/verify and on `mta.mtaAliceFinalizeChecked`; transcript domains `v3`). Bob's
+  MtA proofs must have unit `c_B`/`s`. `mta.mtaAliceFinalizeVerified` (used by
+  `presign` and the checked finalize) lifts the plaintext to its centered
+  representative, so a negative `β'` cannot wrap and leak a bit through an abort.
+  Πprm/Πmod run 128 rounds (was 80), Πmod refuses non-unit challenges and non-canonical
+  roots, and their codecs accept exactly one encoding. `aux_info.assembleKeyShare`
+  takes an `AnnouncementSet.verified()` instead of a plain slice; `verifyAnnouncement`
+  requires a 2048-bit `Ñ`.
 - **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** the range proof's unit check (entry
   below) is now one constant-time inversion of `c_A·s mod N` (montint divsteps; `u` is
   a unit by equation 2 once `c_A` and `s` are) instead of three big-int gcds. The
