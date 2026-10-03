@@ -114,6 +114,12 @@ pub const ecdsa_keygen = @import("ecdsa_keygen.zig");
 pub const EcdsaKeygen = ecdsa_keygen.EcdsaKeygen;
 pub const EcdsaKeygenPhase = ecdsa_keygen.Phase;
 
+/// Proactive refresh of a `threshold_ecdsa` key: new shares of the same key,
+/// new Paillier, ring-Pedersen and message keys, each proven as in keygen.
+pub const ecdsa_refresh = @import("ecdsa_refresh.zig");
+pub const EcdsaRefresh = ecdsa_refresh.EcdsaRefresh;
+pub const EcdsaRefreshPhase = ecdsa_refresh.Phase;
+
 const protocol = @import("protocol.zig");
 pub const Corruption = protocol.Corruption;
 pub const DriverError = protocol.DriverError;
@@ -336,6 +342,7 @@ test {
     _ = commit;
     _ = core;
     _ = ecdsa_keygen;
+    _ = ecdsa_refresh;
     _ = checks;
     _ = protocol;
     _ = wire;

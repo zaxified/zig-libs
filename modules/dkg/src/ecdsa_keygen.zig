@@ -317,7 +317,7 @@ pub const EcdsaKeygen = struct {
     // ── helpers ──────────────────────────────────────────────────────────
 
     /// Longest session id `context` keeps raw; longer ones are hashed down.
-    const ctx_max = 1 + 64 + 12;
+    pub const ctx_max = 1 + 64 + 12;
 
     /// `form || session id || u32-BE t || u32-BE n || u32-BE index`, `form`
     /// 0 for a raw session id and 1 for a session id longer than 64 bytes
@@ -527,7 +527,9 @@ test "dealer-free keygen: a missing announcement aborts with the absent party na
     try testing.expectError(error.EmptySessionId, EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, 1, "", &local, random));
 }
 
-fn keygenContext(buf: *[EcdsaKeygen.ctx_max]u8, session_id: []const u8, t: u32, n: u32, index: u32) []const u8 {
+/// `form || session id || u32-BE t || u32-BE n || u32-BE index` (see
+/// `EcdsaKeygen.context`); `EcdsaRefresh` binds its proofs the same way.
+pub fn keygenContext(buf: *[EcdsaKeygen.ctx_max]u8, session_id: []const u8, t: u32, n: u32, index: u32) []const u8 {
     var sid: []const u8 = session_id;
     var digest: [32]u8 = undefined;
     buf[0] = 0;

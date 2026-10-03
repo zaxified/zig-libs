@@ -805,8 +805,8 @@ tfhe	ReleaseFast	noise	1	0	7f42607f6207a66f	57f844d8aeb1660a
 # measurement. The `Participant` state machine is not measured by this harness.
 # Source pin moved 2026-10-02 (F7: `ReshareReceiver.handle` takes a role-tagged
 # `Sender`; frame routing only, no arithmetic). Both rows re-measured unchanged.
-dkg	ReleaseFast	coeffs	1	<=92	2f3c558fe944e90d	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	0	d860362ee8db08cc	6407896882d3491c
+dkg	ReleaseFast	coeffs	1	<=92	79fd1ca9f75a6ba9	ace23d0e40b2c8f5
+dkg	ReleaseFast	combine	1	0	821d045320127229	6407896882d3491c
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
 # functions END in `if (invalid != 0) return error.InvalidPadding` and return

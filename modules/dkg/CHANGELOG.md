@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **New: `EcdsaRefresh`**, proactive refresh of a `threshold_ecdsa` key as a
+  sans-I/O state machine: new aux rounds (Paillier, ring-Pedersen, message keys, each
+  proven), then the reshare within the same committee with every party as dealer and
+  receiver, then a new `KeyShare` of the same group key. A dealer whose commitments are not
+  its published share is excluded by everyone, itself included. `keygenContext` and
+  `EcdsaKeygen.ctx_max` are public (the refresh binds its proofs the same way).
 - **2026-10-03** — `assembleKeyShares` takes `message_seeds` (`threshold_ecdsa`'s
   Ed25519 message keys); `EcdsaKeygen`'s announcements carry each party's message key.
 - **2026-10-03** — `EcdsaKeygen`: the per-party proof context starts with a form

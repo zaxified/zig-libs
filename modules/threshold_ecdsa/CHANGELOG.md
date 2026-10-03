@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — Key refresh: `dkg.EcdsaRefresh` gives every party a new share of the same
+  key with new Paillier, ring-Pedersen and message keys (see `dkg`'s changelog).
 - **2026-10-03** — Presignatures can outlive their process: `Presignature.toBytesAlloc`/
   `fromBytesAlloc` (secret bytes, a used presignature refused), `PresignatureStore` (whose
   `take` hands a record out at most once), `PresignaturePool` (`put` wipes the in-memory
