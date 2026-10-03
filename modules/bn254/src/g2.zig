@@ -22,7 +22,8 @@
 //! `G2` points — e.g. a proof's `π_2` — never hash an arbitrary message
 //! onto the twist), so cofactor CLEARING has no consumer in this arc.
 //! What every future pairing/Groth16 consumer DOES need is
-//! `subgroupCheck` (`[r]P == O`) — implemented below, mandatory before
+//! `subgroupCheck` (`ψ(Q) == [6x²]Q`, equivalent to `[r]P == O` on the
+//! twist — proof at the function) — implemented below, mandatory before
 //! trusting any externally-supplied `G2` point, and run by `fromBytes`
 //! itself since 2026-10-03 (`fromBytesUnchecked` skips it; an unchecked
 //! small-subgroup point lets an attacker force a degenerate/predictable
@@ -50,6 +51,28 @@ pub const Fr = scalarmod.Fr;
 /// the whole `Fp6`/`Fp12` tower for a single `Fp2` constant; the value
 /// itself is pinned equal to `fp6.nonresidue` by this file's own test.
 const xi: Fp2 = .{ .c0 = Fp.fromInt(u8, 9) catch unreachable, .c1 = Fp.one };
+
+/// The BN seed `x` (`pairing.bn_x`, the defining-polynomial parameter).
+const bn_x: u64 = 4965661367192848881;
+
+/// `6x² = t − 1` (`t` the trace of Frobenius of `E/Fp`): the eigenvalue of
+/// `endomorphismPsi` on `G2` — see `Jacobian.subgroupCheck`. Fits `u128`
+/// (`≈ 1.48e38`); `t = p + 1 − r` is re-derived from `p` and `r` by this
+/// file's tests.
+const six_x_squared: u128 = 6 * @as(u128, bn_x) * @as(u128, bn_x);
+
+/// `ψ`'s coefficients `ξ^((p−1)/3)` (x) and `ξ^((p−1)/2)` (y), derived
+/// at comptime (never transcribed) — the twist-Frobenius γ that
+/// `pairing.zig` uses for the Miller loop's Frobenius tail, now shared
+/// from here.
+pub const psi_gamma_x: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk xi.pow(&fp.pExponentBytes(-1, 3));
+};
+pub const psi_gamma_y: Fp2 = blk: {
+    @setEvalBranchQuota(50_000_000);
+    break :blk xi.pow(&fp.pExponentBytes(-1, 2));
+};
 
 /// The twist curve equation constant `b' = 3/ξ = 3*(9+u)^-1 ∈ Fp2`.
 /// Construction: REAL `Fp2.inv` (Fermat via `std.crypto.ff`) plus a
@@ -251,8 +274,8 @@ pub const Jacobian = struct {
     /// see `g1.zig`'s `scalarMulBytes` (identical constant-time
     /// double-and-add-always construction, over `Fp2` point
     /// arithmetic). The engine behind both `scalarMul` (32-byte `Fr`
-    /// scalars) and `subgroupCheck` (the 32-byte group order `r`
-    /// itself, NOT a canonical `Fr` value).
+    /// scalars) and the test-only `subgroupCheckByOrder` (the 32-byte
+    /// group order `r` itself, NOT a canonical `Fr` value).
     pub fn scalarMulBytes(p: Jacobian, s: []const u8) Jacobian {
         var acc = identity;
         for (s) |byte| {
@@ -281,14 +304,65 @@ pub const Jacobian = struct {
     /// implied by `isOnCurve()` here, unlike `G1` (`g1.zig`'s module
     /// doc comment): `G2`'s cofactor `h2 > 1`, so `E'(Fp2)` has proper
     /// nontrivial subgroups an attacker-supplied point could land in.
-    /// Construction: the twist equation, then the simple, always-correct
-    /// `[r]P == O` via `scalarMulBytes`. The twist equation comes first
-    /// (2026-10-03, as in `bls12_381`): `[r]P == O` alone also holds for
-    /// points that are not on the twist at all, and the result must be
-    /// `true` exactly for members of `G2`.
+    ///
+    /// Construction (2026-10-03): the twist equation, then
+    /// `ψ(Q) == [6x²]Q`, `ψ` the twisted Frobenius (`endomorphismPsi`),
+    /// `x` the BN seed. Proof, for `Q ∈ E'(Fp2)`:
+    ///   - `ψ` is the `p`-power Frobenius of `E` carried to `E'` by the
+    ///     twist isomorphism, so it satisfies Frobenius's characteristic
+    ///     polynomial: `ψ² − [t]ψ + [p] = 0`, `t = p + 1 − r = 6x² + 1`.
+    ///   - (⇐) If `ψ(Q) = [t−1]Q`, then `ψ²(Q) = [(t−1)²]Q` and
+    ///     `O = (ψ² − tψ + p)(Q) = [(t−1)² − t(t−1) + p]Q = [p + 1 − t]Q
+    ///     = [r]Q`.
+    ///   - (⇒) `#E'(Fp2) = (p+1−t)(p−1+t) = r·(2p − r)` and `r ∤ 2p − r`,
+    ///     so `E'(Fp2)[r] = G2` is cyclic and `ψ` (which maps `E'(Fp2)`
+    ///     to itself) acts on it as one scalar, a root of
+    ///     `X² − tX + p ≡ (X − 1)(X − p) (mod r)`. It is `p ≡ t − 1`, not
+    ///     `1`: pinned on the generator by this file's tests.
+    /// The twist equation comes first because the polynomial identity is
+    /// about points of `E'`; `[r]P == O` and the ψ test both hold for
+    /// some points that are not on the twist at all. Cost: one
+    /// multiplication by the public 127-bit `6x²` (variable time —
+    /// every input of this check is a public point) instead of the
+    /// 254-bit constant-time ladder by `r`, which stays as the
+    /// test-only reference `subgroupCheckByOrder`.
     pub fn subgroupCheck(self: Jacobian) bool {
         if (!self.isOnCurve()) return false;
+        return endomorphismPsi(self).add(mulPublic(self, six_x_squared).negate()).isIdentity();
+    }
+
+    /// The pre-2026-10-03 check, `[r]P == O` via the constant-time
+    /// ladder — the definition of the subgroup, kept ONLY as the
+    /// reference the differential tests hold `subgroupCheck` against.
+    fn subgroupCheckByOrder(self: Jacobian) bool {
+        if (!self.isOnCurve()) return false;
         return scalarMulBytes(self, &scalarmod.r_bytes).isIdentity();
+    }
+
+    /// `ψ(X, Y, Z) = (X^p·γx, Y^p·γy, Z^p)`: `pairing.zig`'s twist
+    /// Frobenius on Jacobian coordinates (Frobenius is a field
+    /// automorphism, so it goes onto `Z` too, and on `Fp2` it is
+    /// conjugation). Maps the identity (`Z = 0`) to the identity.
+    fn endomorphismPsi(p: Jacobian) Jacobian {
+        return .{
+            .x = p.x.frobenius().mul(psi_gamma_x),
+            .y = p.y.frobenius().mul(psi_gamma_y),
+            .z = p.z.frobenius(),
+        };
+    }
+
+    /// `[k]P` for a PUBLIC constant `k`: plain double-and-add, variable
+    /// time in the bits of `k` only (`add` is complete, so no input
+    /// point needs special-casing).
+    fn mulPublic(p: Jacobian, k: u128) Jacobian {
+        var acc = identity;
+        var i: u8 = 128;
+        while (i > 0) {
+            i -= 1;
+            acc = acc.double();
+            if ((k >> @intCast(i)) & 1 == 1) acc = acc.add(p);
+        }
+        return acc;
     }
 };
 
@@ -634,4 +708,117 @@ test "fromBytes rejects an off-curve (x, y) pair" {
     bytes[64..96].* = [_]u8{0} ** 32; // y.c1 = 0
     bytes[96..128].* = one_bytes; // y.c0 = 1
     try std.testing.expectError(error.NotOnCurve, fromBytes(&bytes));
+}
+
+// ── ψ subgroup check (2026-10-03): the proof's premises, then a
+// differential against the [r]P == O reference ──────────────────────────
+
+fn pInt() u256 {
+    return std.mem.readInt(u256, &fp.p_bytes, .big);
+}
+
+fn rInt() u256 {
+    return std.mem.readInt(u256, &scalarmod.r_bytes, .big);
+}
+
+fn beBytes(v: u256) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.mem.writeInt(u256, &out, v, .big);
+    return out;
+}
+
+fn randomTwistPoint(rng: std.Random) Jacobian {
+    while (true) {
+        var b0: [Fp.encoded_bytes]u8 = undefined;
+        var b1: [Fp.encoded_bytes]u8 = undefined;
+        rng.bytes(&b0);
+        rng.bytes(&b1);
+        b0[0] &= 0x1f;
+        b1[0] &= 0x1f;
+        const x: Fp2 = .{ .c0 = Fp.fromBytes(b0) catch continue, .c1 = Fp.fromBytes(b1) catch continue };
+        const y = x.square().mul(x).add(twistB()).sqrt() orelse continue;
+        return Jacobian.fromAffine(.{ .x = x, .y = y });
+    }
+}
+
+fn eqlJac(a: Jacobian, b: Jacobian) bool {
+    return a.add(b.negate()).isIdentity();
+}
+
+test "ψ subgroup check premises: t − 1 = 6x², r ∤ 2p − r, p ≢ 1 (mod r), the seed matches pairing.zig" {
+    const p = pInt();
+    const r = rInt();
+    const t = p + 1 - r;
+    try std.testing.expectEqual(@as(u256, six_x_squared), t - 1);
+    try std.testing.expectEqual(@import("pairing.zig").bn_x, bn_x);
+    // #E'(Fp2) = (p+1−t)(p−1+t) = r·(2p − r); r must not divide the cofactor.
+    const h2: u512 = 2 * @as(u512, p) - r;
+    try std.testing.expect(h2 % r != 0);
+    // The other root of X² − tX + p mod r is 1; the test needs p ≢ 1.
+    try std.testing.expect(p % r != 1);
+}
+
+test "ψ satisfies ψ² − [t]ψ + [p] = 0 on points of E'(Fp2) outside G2 too" {
+    var prng = std.Random.DefaultPrng.init(0xb254_2026_1003);
+    const rng = prng.random();
+    const t_bytes = beBytes(pInt() + 1 - rInt());
+    for (0..4) |_| {
+        const q = randomTwistPoint(rng);
+        const psi_q = Jacobian.endomorphismPsi(q);
+        const lhs = Jacobian.endomorphismPsi(psi_q)
+            .add(psi_q.scalarMulBytes(&t_bytes).negate())
+            .add(q.scalarMulBytes(&fp.p_bytes));
+        try std.testing.expect(lhs.isIdentity());
+    }
+}
+
+test "ψ acts as [6x²] on G2, and [2p − r] clears the cofactor" {
+    var prng = std.Random.DefaultPrng.init(0xb254_2026_1004);
+    const rng = prng.random();
+    const g = jacGen();
+    try std.testing.expect(eqlJac(Jacobian.endomorphismPsi(g), Jacobian.mulPublic(g, six_x_squared)));
+    const h2_bytes = beBytes(2 * pInt() - rInt());
+    for (0..3) |_| {
+        const q = randomTwistPoint(rng);
+        try std.testing.expect(!q.subgroupCheckByOrder());
+        const m = q.scalarMulBytes(&h2_bytes);
+        try std.testing.expect(!m.isIdentity());
+        try std.testing.expect(m.subgroupCheckByOrder());
+        try std.testing.expect(eqlJac(Jacobian.endomorphismPsi(m), Jacobian.mulPublic(m, six_x_squared)));
+    }
+}
+
+fn expectMembership(q: Jacobian, member: bool) !void {
+    // The reference decides what the point IS; the fast check must agree.
+    try std.testing.expectEqual(member, q.subgroupCheckByOrder());
+    try std.testing.expectEqual(member, q.subgroupCheck());
+}
+
+test "ψ subgroup check == [r]P == O on members, non-members and off-twist points" {
+    var prng = std.Random.DefaultPrng.init(0xb254_2026_1005);
+    const rng = prng.random();
+    const h2_bytes = beBytes(2 * pInt() - rInt());
+
+    try expectMembership(Jacobian.identity, true);
+    try expectMembership(jacGen(), true);
+    for (0..8) |_| {
+        var k: [32]u8 = undefined;
+        rng.bytes(&k);
+        try expectMembership(jacGen().scalarMulBytes(&k), true);
+    }
+    for (0..8) |_| {
+        const q = randomTwistPoint(rng);
+        try expectMembership(q, false);
+        try expectMembership(q.scalarMulBytes(&h2_bytes), true);
+        // A member plus a non-member is a non-member.
+        try expectMembership(q.add(jacGen()), false);
+    }
+    // Off the twist: the isomorphic image (4x, 8y) of members and non-members.
+    const two = Fp2.one.add(Fp2.one);
+    for (0..4) |i| {
+        const m = if (i % 2 == 0) jacGen().scalarMulBytes(&beBytes(@as(u256, i) + 7)) else randomTwistPoint(rng);
+        const img: Jacobian = .{ .x = m.x.mul(two.square()), .y = m.y.mul(two.square().mul(two)), .z = m.z };
+        try std.testing.expect(!img.isOnCurve());
+        try expectMembership(img, false);
+    }
 }

@@ -294,30 +294,12 @@ const TwistPoint = struct {
     y: Fp2,
 };
 
-/// `(p-1)/3` and `(p-1)/2`, big-endian — the twist-Frobenius γ
-/// exponents (`twistFrobenius`), comptime-derived from `fp.zig`'s
-/// verified `p_bytes`; both divisions are exact since `p ≡ 1 (mod 6)`
-/// (enforced at comptime by `fp.pExponentBytes`). Same values
-/// `fp6.zig`/`fp2.zig` derive privately for their own Frobenius/sqrt —
-/// re-derived here rather than exported, keeping each file's constants
-/// self-contained (the derivation is one comptime call).
-const p_minus_1_over_3_bytes: [32]u8 = fp.pExponentBytes(-1, 3);
-const p_minus_1_over_2_bytes: [32]u8 = fp.pExponentBytes(-1, 2);
-
 /// The twist-Frobenius γ coefficients `ξ^((p-1)/3)` (x) and `ξ^((p-1)/2)`
-/// (y), PRECOMPUTED ONCE at COMPTIME (the fixed-public `Fp2.pow`s are
-/// evaluated by the compiler) — `twistFrobenius` runs on the Miller
-/// loop's BN Frobenius tail, so recomputing these two 254-bit `pow`s per
-/// call was pure waste. Derived, never transcribed; the pairing KATs
-/// anchor them.
-const twist_gamma_x: Fp2 = blk: {
-    @setEvalBranchQuota(50_000_000);
-    break :blk fp6mod.nonresidue.pow(&p_minus_1_over_3_bytes);
-};
-const twist_gamma_y: Fp2 = blk: {
-    @setEvalBranchQuota(50_000_000);
-    break :blk fp6mod.nonresidue.pow(&p_minus_1_over_2_bytes);
-};
+/// (y), comptime-derived (never transcribed) in `g2.zig`, which needs the
+/// same map for its subgroup check (`g2.Jacobian.subgroupCheck`, ψ); the
+/// pairing KATs anchor them.
+const twist_gamma_x: Fp2 = g2.psi_gamma_x;
+const twist_gamma_y: Fp2 = g2.psi_gamma_y;
 
 /// The `p`-power Frobenius endomorphism `π` transported to the twist
 /// `E'(Fp2)`: `π_twist = ψ^-1 ∘ Frobenius ∘ ψ` for this tower's D-type

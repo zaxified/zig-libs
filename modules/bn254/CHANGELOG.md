@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Fast `G2` subgroup check:** `g2.Jacobian.subgroupCheck` is
+  `ψ(Q) == [6x²]Q` after the twist equation — one variable-time multiplication by
+  a public 127-bit constant instead of the 254-bit constant-time ladder by `r`
+  (the old check stays as the test-only reference). Proof in the doc comment;
+  premises (`t − 1 = 6x²`, ψ's characteristic polynomial on points outside `G2`,
+  cofactor `2p − r`) and a differential against `[r]P == O` are tests. `pairing`
+  takes its twist-Frobenius coefficients from `g2` (`psi_gamma_x`/`psi_gamma_y`).
 - **2026-10-03** — **BREAKING (behaviour): `g2.fromBytes` checks subgroup
   membership** (`error.NotInSubgroup`, new in `G2Error`); `g2.fromBytesUnchecked`
   keeps the old on-curve-only decode for trusted bytes. `g2.Jacobian.subgroupCheck`

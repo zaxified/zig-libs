@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ethereum/py_ecc](https://github.com/ethereum/py_ecc) | Python | MIT | 231 | v3.0.0 (2020-05-12), pushed 2025-12-17 | Not a competitor: the oracle this module's pairing KATs were generated from. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No pairing-friendly curves. A GitHub search for BN254 in Zig found nothing. |
 
-**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against geth's own conformance vectors and a real snarkjs proof; constant-time scalar multiplication. **Where we are behind:** no compressed point encoding (EIP-196/197 have none; arkworks/gnark users expect one), no public MSM, no Groth16 prover, no hash-to-curve, no fast G2 subgroup check (the SPEC's own backlog) (→ Backlog).
+**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against geth's own conformance vectors and a real snarkjs proof; constant-time scalar multiplication. **Where we are behind:** no compressed point encoding (EIP-196/197 have none; arkworks/gnark users expect one), no public MSM, no Groth16 prover, no hash-to-curve (→ Backlog).
 
 ## Purpose
 
@@ -176,7 +176,12 @@ accounting.
   non-subgroup point (`x = u`) is verified to FAIL it (see `g2.zig`'s
   tests and "Verification performed" below). Since 2026-10-03 `g2.fromBytes` runs it
   (decoders check by default, `fromBytesUnchecked` for trusted bytes),
-  and `subgroupCheck` checks the twist equation first.
+  and `subgroupCheck` checks the twist equation first. Since the same
+  day the check itself is `ψ(Q) == [6x²]Q` (ψ the twisted Frobenius,
+  `t − 1 = 6x²`), proved in `g2.zig`'s doc comment from
+  `ψ² − tψ + p = 0` and `r ∤ #E'(Fp2)/r`; every premise is a test, and a
+  differential test holds it against `[r]P == O` (kept, test-only) on
+  members, non-members and off-twist points.
 - **`b' = 3/ξ = 3*(9+u)^-1` is DERIVED at runtime via real `Fp2`
   arithmetic (`g2.zig`'s `twistB()`), never hand-transcribed as a
   numeric literal.** Pinned byte-exact against an independent Python
@@ -976,11 +981,6 @@ is justified by the count CHANGING, not by the count existing.
 - ~~Persistent Montgomery storage / precomputed Frobenius-coefficient
   tables~~ — **both shipped** (`1892c814`/`a1d72299` and `8644b485`);
   this entry outlived them.
-- `G2`'s fast endomorphism-based subgroup check (untwist-Frobenius-twist
-  — same technique `bls12_381/src/g2.zig`'s Backlog defers) — the
-  simple `[r]P == O` form implemented here is correct and is what a
-  scaffolding-stage Part 3 needs; a faster check is a follow-up
-  optimization, not a correctness gap.
 - `G2` cofactor value/`clearCofactor` — deliberately out of scope for
   this arc (see "Design & invariants" above); revisit only if a future
   part adds hash-to-`G2`.
