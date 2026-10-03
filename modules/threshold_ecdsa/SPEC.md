@@ -1113,8 +1113,8 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   and the dedicated Phase 2c section for the verification-level breakdown.
   Phase 2d inherits this same residual audit debt, since `signing.zig` is
   built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
-- ~~**Identifiable abort, types 5 and 7**~~ — ✅ 2026-10-03: `Party.openAbort`/`identify`
-  (GG20 §4.3). Each signer keeps the signed round-2 messages it received and its own Bob
+- ~~**Identifiable abort, types 5 and 7**~~ — ✅ 2026-10-03: `Party.openAbort`/`echoOpenings`/
+  `identify` (GG20 §4.3; the echo round since 2026-10-04, review F5). Each signer keeps the signed round-2 messages it received and its own Bob
   masks until the presignature is finished. Type 5 opens `k_i` (with `c_i`'s randomness),
   `γ_i`, the received round-2 messages and its `β'` masks with randomness; everyone rebuilds
   each `c_γ`, recomputes every `δ_j` and names the inconsistent signer. Type 7 opens `k_i`,
@@ -1188,22 +1188,23 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
   session id hashes the public-key table; **F10** `root.decodeMessageKey` refuses small-order
   message keys, signatures checked with `verifyStrict`; **F12** `MemoryPresignatureStore`
   documented as single-thread. Mutation runs: see § Audit 2026-10-03. Open items below.
-- **Opening round without attestation** (review 2026-10-03 F5): a signer can show different,
-  validly signed openings to different honest signers. After F1/F2 every check in `identify` is
-  deterministic in signed data (Alice's decryption is unique below `N`, `σ_i·G` follows), so each
-  honest verdict names a signer whose opening or `S_i` is wrong — a cheater — but two cheaters can
-  make honest signers name different ones. An attested round 9 (hash echo of the openings) would
-  make the verdicts agree. Effort: small–medium.
-- **`toBytesAlloc` does not consume** (review F11): a caller can encode, keep the in-memory
-  presignature and sign with both. `PresignaturePool.put` wipes the original; a direct
-  `toBytesAlloc` caller is on its own. Also: stack copies of `k`/`σ` in `fromBytesAlloc` are not
-  wiped, a party left in `.opening` keeps its secrets until `deinit`. Effort: small.
-- **`aux_info.Verified` can be built by hand** (review F13): the seal is a public field, so
-  "assembled only from checked announcements" is convention. Make construction go through
-  `verified()` only. Effort: small (API).
-- **`proveFailed` blames the peer for any prover error** (review F15): map only the errors that a
-  peer's key or tuple causes; a local fault should not name an honest peer. Effort: small.
-- ~~**Key refresh / resharing**~~ — ✅ 2026-10-03: `dkg.EcdsaRefresh` (the refresh lives next to `dkg.EcdsaKeygen`, which it mirrors): the new aux rounds (fresh Paillier, ring-Pedersen and message keys, Πmod/Πprm/Πfac, every check through `aux_info.AnnouncementSet`), then `dkg`'s Desmedt–Jajodia reshare within the same committee (each party both dealer and receiver), then `aux_info.assembleKeyShare` — a new share of the same `Q`. A dealer whose commitments are not its published share is excluded by every receiver (its own included) and the refresh completes with the rest. Redistribution to a different committee (`n'`, `t'`) is `dkg.ReshareDealer`/`ReshareReceiver` underneath but has no `threshold_ecdsa` wrapper yet (the new parties' aux rounds would need a new committee's announcements).
+- ~~**Opening round without attestation**~~ (review 2026-10-03 F5) ✅ 2026-10-04: round 9
+  (`echoOpenings`): an empty broadcast whose attestation block carries the openings as received;
+  `identify` checks the echoes first, so a signer who showed two signed openings is named
+  (`equivocation`) by every honest signer before any opening is judged (test: the last signer
+  shows signer 0 another version — all three name it).
+- ~~**`toBytesAlloc` does not consume**~~ (review F11) ✅ 2026-10-04: encoding marks the
+  presignature used and wipes `k`/`σ` (the bytes are the only copy left); `fromBytesAlloc` wipes
+  its stack copies of `k`, `σ`, the seed and the derived secret key; `Party.abandon` wipes what a
+  pending §4.3 opening kept, at once instead of at `deinit`.
+- ~~**`aux_info.Verified` can be built by hand**~~ (review F13) ✅ 2026-10-04: the seal is the
+  address of a declaration private to `aux_info.zig`; `assembleKeyShare` refuses any other
+  (`InvalidParameters`; test with a hand-written `Verified`).
+- ~~**`proveFailed` blames the peer for any prover error**~~ (review F15) — checked 2026-10-04,
+  kept: every non-OOM prover error can only come from the peer's key, tuple or ciphertext (this
+  party's own were validated in `round1`, secrets are canonical, `random` cannot fail).
+  Documented at `proveFailed`, whose parameter is now the provers' error sets instead of
+  `anyerror`, so a new variant has to be placed deliberately.
 
 ## Anchoring
 

@@ -71,7 +71,12 @@ const Outgoing = wire.Outgoing;
 pub const Phase = enum { new, announce, factors, shares, complaints, defenses, confirm, done, aborted };
 
 pub const InitError = reshare.DealerInitError || reshare.ReceiverInitError || error{ EmptySessionId, InvalidKeyShare };
-pub const StartError = error{WrongRound} || tecdsa.aux_proofs.ProveError || aux_info.Announcement.AllocError;
+pub const StartError = error{
+    WrongRound,
+    /// This party's new aux material repeats a modulus or the message key of
+    /// the old table: the refresh would renew nothing (review 2026-10-03 F14).
+    StaleAuxMaterial,
+} || tecdsa.aux_proofs.ProveError || aux_info.Announcement.AllocError;
 pub const AdvanceError = error{
     WrongRound,
     Finished,
@@ -82,6 +87,9 @@ pub const AdvanceError = error{
     InvalidAnnouncement,
     /// Two announcements share a modulus or a message key.
     DuplicateModulus,
+    /// A peer's announcement repeats a modulus or message key of the old
+    /// table (`culprit`): it would keep exposed material (review F14).
+    StaleAuxMaterial,
     /// A peer's Πfac did not verify (`culprit`).
     InvalidFactorProof,
     /// The refreshed share does not belong to the group key it refreshes.
@@ -104,6 +112,9 @@ pub const EcdsaRefresh = struct {
     /// Owned backing of the reshare configuration.
     dealer_ids: []u32,
     old_xs: []Element,
+    /// The old table's entries (copied: `current` is borrowed for `init`
+    /// only), to refuse new announcements that reuse their material.
+    old_keys: []tecdsa.PartyPublicKeys,
     dealer: reshare.ReshareDealer,
     receiver: reshare.ReshareReceiver,
     phase_: Phase = .new,
@@ -137,6 +148,8 @@ pub const EcdsaRefresh = struct {
         const old_xs = try allocator.alloc(Element, cfg.n);
         errdefer allocator.free(old_xs);
         for (old_xs, 1..) |*x, j| x.* = (current.public_keys.get(@intCast(j)) orelse return error.InvalidKeyShare).verifying_share;
+        const old_keys = try allocator.dupe(tecdsa.PartyPublicKeys, current.public_keys.entries);
+        errdefer allocator.free(old_keys);
         const dealer_ids = try allocator.alloc(u32, cfg.n);
         errdefer allocator.free(dealer_ids);
         for (dealer_ids, 1..) |*d, j| d.* = @intCast(j);
@@ -178,6 +191,7 @@ pub const EcdsaRefresh = struct {
             .group_public_key = current.group_public_key,
             .dealer_ids = dealer_ids,
             .old_xs = old_xs,
+            .old_keys = old_keys,
             .dealer = dealer,
             .receiver = receiver,
             .announcements = anns,
@@ -201,6 +215,7 @@ pub const EcdsaRefresh = struct {
         self.receiver.deinit();
         self.allocator.free(self.dealer_ids);
         self.allocator.free(self.old_xs);
+        self.allocator.free(self.old_keys);
         self.allocator.free(self.session_id);
         self.allocator.free(self.announcements);
         self.allocator.free(self.fac);
@@ -238,6 +253,7 @@ pub const EcdsaRefresh = struct {
         if (self.phase_ != .new) return error.WrongRound;
         var ctx_buf: [ecdsa_keygen.EcdsaKeygen.ctx_max]u8 = undefined;
         const ann = try self.local.announce(self.allocator, self.context(&ctx_buf, self.me), self.random);
+        if (self.reusesOld(ann)) return error.StaleAuxMaterial;
         const bytes = try ann.toBytesAlloc(self.allocator);
         defer self.allocator.free(bytes);
         try ecdsa_keygen.pushTagged(&self.outbox, self.allocator, self.tag, .broadcast, .ecdsa_announcement, bytes);
@@ -336,6 +352,12 @@ pub const EcdsaRefresh = struct {
             };
         }
         if (checked.checkDistinct() != null) return error.DuplicateModulus;
+        for (self.announcements, 1..) |a, j| {
+            if (j != self.me and self.reusesOld(a.?)) {
+                self.culprit_ = @intCast(j);
+                return error.StaleAuxMaterial;
+            }
+        }
 
         const own_ctx = self.context(&ctx_buf, self.me);
         for (self.announcements, 1..) |a, j| {
@@ -445,6 +467,11 @@ pub const EcdsaRefresh = struct {
 
     fn context(self: *const EcdsaRefresh, buf: *[ecdsa_keygen.EcdsaKeygen.ctx_max]u8, index: u32) []const u8 {
         return ecdsa_keygen.keygenContext(buf, self.session_id, self.cfg.t, self.cfg.n, index);
+    }
+
+    fn reusesOld(self: *const EcdsaRefresh, a: aux_info.Announcement) bool {
+        for (self.old_keys) |old| if (aux_info.reusesMaterial(a, old)) return true;
+        return false;
     }
 
     fn missing(self: *const EcdsaRefresh, which: enum { announce, factors }) ?u32 {
@@ -849,4 +876,50 @@ test "refresh: parties that end with different key tables abort in the confirmat
         }
     }
     try testing.expect(mismatches >= 1);
+}
+
+test "refresh: aux material of the old table is refused, from this party and from a peer (review F14)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0006);
+    const random = prng.random();
+    var locals: [5]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 5) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    var old = try keygen(allocator, random, locals[0..3], "stale-keygen");
+    defer freeShares(allocator, &old);
+
+    // This party starts with its old LocalAux: refused before anything is sent.
+    {
+        var p = try EcdsaRefresh.init(allocator, old[0], "stale-1", &locals[0], random);
+        defer p.deinit();
+        try testing.expectError(error.StaleAuxMaterial, p.start());
+    }
+    // Peer 2 announces its old material (a valid announcement under this
+    // run's context, so every proof passes): party 1 refuses it, naming 2.
+    {
+        var p1 = try EcdsaRefresh.init(allocator, old[0], "stale-2", &locals[3], random);
+        defer p1.deinit();
+        var p3 = try EcdsaRefresh.init(allocator, old[2], "stale-2", &locals[4], random);
+        defer p3.deinit();
+        try p1.start();
+        try p3.start();
+        const from3 = try p3.takeOutgoing();
+        defer wire.freeOutgoing(allocator, from3);
+        try p1.handle(3, from3[0].bytes);
+
+        var ctx_buf: [ecdsa_keygen.EcdsaKeygen.ctx_max]u8 = undefined;
+        const ann = try locals[1].announce(allocator, ecdsa_keygen.keygenContext(&ctx_buf, "stale-2", 2, 3, 2), random);
+        const body = try ann.toBytesAlloc(allocator);
+        defer allocator.free(body);
+        var list: std.ArrayList(Outgoing) = .empty;
+        defer {
+            for (list.items) |m| m.deinit(allocator);
+            list.deinit(allocator);
+        }
+        try ecdsa_keygen.pushTagged(&list, allocator, ecdsa_keygen.runTag(.refresh, "stale-2", .{ .t = 2, .n = 3 }), .broadcast, .ecdsa_announcement, body);
+        try p1.handle(2, list.items[0].bytes);
+        try testing.expectError(error.StaleAuxMaterial, p1.advance());
+        try testing.expectEqual(@as(?u32, 2), p1.culprit());
+    }
 }

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **BREAKING (API): review 2026-10-03 F5, F11, F13, F15.** The §4.3
+  opening gains an echo round: `openAbort` → `echoOpenings(openings)` (returns the round-9 echo)
+  → `identify(echoes)`; an opening shown two ways names its signer (`equivocation`).
+  `Presignature.toBytesAlloc` now takes `*Presignature` and consumes it (marked used, `k`/`σ`
+  wiped). New `Party.abandon` (wipe a pending opening now). `aux_info.Verified` can no longer be
+  written by hand (its seal is a private address; `assembleKeyShare` refuses another). New
+  `aux_info.reusesMaterial` (used by `dkg.EcdsaRefresh`).
 - **2026-10-03** — Mutation audit of the 2026-10-03 additions (two rounds, schemata): tests
   only — Bob's non-unit MtA proof, lies in the last signer's opening section, opening-parser
   prefixes, wrong-kind signed messages, the session id's key-table hash, aux_info refusals.

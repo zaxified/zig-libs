@@ -389,10 +389,11 @@ here.
   tag (protocol, session id, `t`, `n`), checked before anything else (`WrongSession`). The bare
   `Participant` and `Reshare*` machines still leave run binding to the transport (documented in
   `wire.zig`); a caller using them directly must keep runs apart itself.
-- **Refresh with the old aux material** (review 2026-10-03 F14): `EcdsaRefresh` does not refuse a
-  `LocalAux` whose `N`/`Ñ`/message key equals the old one. ~~Keygen and refresh frames share one
-  format~~ — the run tag's protocol byte now keeps a keygen frame out of a refresh (F7); the
-  announcement's proof context is still the same format. Effort: small.
+- ~~**Refresh with the old aux material**~~ (review 2026-10-03 F14) ✅ 2026-10-04: `start`
+  refuses this party's own new material when it repeats a modulus or the message key of the old
+  table, and the announce round refuses a peer's (`StaleAuxMaterial`, culprit named) —
+  `threshold_ecdsa.aux_info.reusesMaterial` against every old entry. Keygen frames are kept out of
+  a refresh by the run tag (F7); the announcement's proof context keeps one format for both.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).

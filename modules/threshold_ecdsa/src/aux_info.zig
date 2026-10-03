@@ -213,6 +213,20 @@ pub fn findDuplicate(all: []const Announcement) ?struct { usize, usize } {
     return null;
 }
 
+/// True when `new` reuses any of `old`'s published material: its Paillier
+/// `N` or ring-Pedersen `Ñ` equal to either of `old`'s moduli, or the same
+/// message key. A key refresh must refuse it — renewed shares under a
+/// Paillier key or `Ñ` that was already exposed are not renewed (review
+/// 2026-10-03 F14; `dkg.EcdsaRefresh` checks every announcement against
+/// every entry of the old table).
+pub fn reusesMaterial(new: Announcement, old: root.PartyPublicKeys) bool {
+    if (std.mem.eql(u8, &new.message_key, &old.message_key)) return true;
+    const a = [2][root.aux_modulus_bytes]u8{ modulusBytes(new.paillier_pk), auxModulusBytes(new.aux.n_tilde) };
+    const b = [2][root.aux_modulus_bytes]u8{ modulusBytes(old.paillier_pk), auxModulusBytes(old.aux.n_tilde) };
+    for (a) |x| for (b) |y| if (std.mem.eql(u8, &x, &y)) return true;
+    return false;
+}
+
 fn modulusBytes(pk: paillier.PublicKey) [root.aux_modulus_bytes]u8 {
     var out = [_]u8{0} ** root.aux_modulus_bytes;
     const len = pk.nByteLen();
@@ -235,8 +249,9 @@ fn auxModulusBytes(m: root.AuxModulus) [root.aux_modulus_bytes]u8 {
 }
 
 pub const AssembleError = error{
-    /// `announcements.len != n`, `index` outside `1..=n`, or a commitment
-    /// count outside `1..=n` (that count is the threshold `t`).
+    /// `announcements.len != n`, `index` outside `1..=n`, a commitment
+    /// count outside `1..=n` (that count is the threshold `t`), or a
+    /// `Verified` that `AnnouncementSet.verified` did not make.
     InvalidParameters,
     /// `x_i·G` is not the `X_i` the commitments give: the DKG output and
     /// the commitments do not belong together.
@@ -313,7 +328,7 @@ pub const AnnouncementSet = struct {
     pub fn verified(self: *const AnnouncementSet) ?Verified {
         if (!self.distinct) return null;
         for (self.announced, self.factored) |a, f| if (!a or !f) return null;
-        return .{ .all = self.all, .me = self.me, .seal = .checked };
+        return .{ .all = self.all, .me = self.me, .seal = &verified_token };
     }
 };
 
@@ -322,9 +337,16 @@ pub const AnnouncementSet = struct {
 pub const Verified = struct {
     all: []const Announcement,
     me: u32,
-    /// Produced only by `AnnouncementSet.verified`.
-    seal: enum { checked },
+    /// The address of a declaration private to this file, set only by
+    /// `AnnouncementSet.verified`: a `Verified` cannot be written by hand
+    /// from outside (review 2026-10-03 F13 — the old `enum { checked }` seal
+    /// took any `.checked` literal). `assembleKeyShare` refuses another.
+    seal: *const u8,
 };
+
+/// Only its address is used (`Verified.seal`); not `pub`, so no other file
+/// can name it.
+var verified_token: u8 = 0;
 
 /// Builds party `verified.me`'s `KeyShare` from a finished DKG — its share
 /// `secret_share`, the group's Feldman commitments `group_commitments`
@@ -338,6 +360,7 @@ pub fn assembleKeyShare(
     group_commitments: []const root.Element,
     own: *const LocalAux,
 ) AssembleError!root.KeyShare {
+    if (verified.seal != &verified_token) return error.InvalidParameters;
     const announcements = verified.all;
     const index = verified.me;
     const n: u32 = @intCast(announcements.len);
@@ -570,6 +593,10 @@ test "aux_info: three parties announce, check each other, prove factors pairwise
     var other_seed = locals[0];
     other_seed.message_seed = @splat(0x55);
     try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, sets[0].verified().?, split.shares[0].scalar, commits, &other_seed));
+    // A `Verified` written by hand over the same announcements (review F13).
+    var not_the_token: u8 = 0;
+    const forged: Verified = .{ .all = sets[0].verified().?.all, .me = 1, .seal = &not_the_token };
+    try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, forged, split.shares[0].scalar, commits, &locals[0]));
 }
 
 test "aux_info: a copied Ñ with its proofs fails under the copier's context; findDuplicate is the second line" {

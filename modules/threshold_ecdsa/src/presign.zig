@@ -43,8 +43,10 @@
 //! (`Σ R̄_j ≠ G`, `Σ S_j ≠ X` with every proof valid) abort with
 //! `culprit == null` and keep the session's nonce material: the paper's §4.3
 //! opening names the party — every signer calls `openAbort` (its opening, a
-//! signed broadcast) and `identify` on everyone's openings, which returns the
-//! culprit and wipes the secrets. What is opened never includes the key
+//! signed broadcast), `echoOpenings` on everyone's openings (its echo: an
+//! attestation of the openings as received, so two versions of one opening
+//! name their signer) and `identify` on everyone's echoes, which returns the
+//! culprit and wipes the secrets; `abandon` gives an opening up. What is opened never includes the key
 //! share (type 7 opens the `k_i·w_j` masks and proves `S_i = σ_i·R` by DLEQ
 //! against a `σ_i·G` everyone recomputes, instead of revealing `σ_i`).
 //!
@@ -132,12 +134,17 @@ pub const message_domain = "threshold_ecdsa/presign/message/v2";
 /// Rounds whose messages attest the previous round's broadcasts: every round
 /// that follows a broadcast round (1, 3, 4, 5, 6), Phase 7 included.
 pub fn hasAttestation(round: u8) bool {
-    return round == 2 or (round >= 4 and round <= sign_round);
+    return round == 2 or (round >= 4 and round <= sign_round) or round == open_echo_round;
 }
 
 /// The §4.3 opening round: after a type-5 or type-7 abort every signer
 /// broadcasts what it must reveal (`Party.openAbort`).
 pub const open_round: u8 = 8;
+/// The echo of the openings (`Party.echoOpenings`): an empty broadcast whose
+/// attestation block carries the round-8 openings as its sender received
+/// them, so a signer who showed different signed openings to different
+/// peers is named before anyone judges an opening (review 2026-10-03 F5).
+pub const open_echo_round: u8 = 9;
 
 /// `SHA-256(body)` and the sender's signature over `signedBytes(header, that
 /// hash)`. Self-contained evidence: with the header rebuilt from (session,
@@ -315,7 +322,7 @@ pub const Outbox = struct {
     }
 };
 
-const State = enum { round1, round2, round3, round4, round5, round6, finish, done, aborted, opening, identify };
+const State = enum { round1, round2, round3, round4, round5, round6, finish, done, aborted, opening, echo, identify };
 
 /// What one signer keeps per peer for the GG20 §4.3 opening, until the
 /// presignature is finished (or the opening is done).
@@ -452,6 +459,9 @@ pub const Party = struct {
     open: []PeerOpen,
     /// This party's own opening message, once sent.
     own_open: ?[]u8 = null,
+    /// Every signer's opening body as this party received it (owned copies),
+    /// from `echoOpenings` to `identify`.
+    opened: [][]u8 = &.{},
     /// Set when a call returns `error.ProtocolAbort`.
     abort: ?Abort = null,
 
@@ -558,6 +568,7 @@ pub const Party = struct {
         self.allocator.free(self.last_bc);
         self.allocator.free(self.open);
         if (self.own_open) |m| self.allocator.free(m);
+        self.freeOpened();
         self.* = undefined;
     }
 
@@ -581,8 +592,19 @@ pub const Party = struct {
         return error.ProtocolAbort;
     }
 
+    /// Gives up a pending §4.3 opening — its round timed out, or the caller
+    /// will not identify: wipes the nonce material and key-share copy kept
+    /// for it now rather than at `deinit` (review 2026-10-03 F11). The abort
+    /// stays unattributed. No effect in any other state.
+    pub fn abandon(self: *Party) void {
+        if (self.state != .opening and self.state != .echo and self.state != .identify) return;
+        self.state = .aborted;
+        self.wipe();
+        self.freeOpened();
+    }
+
     /// A type-5 or type-7 abort: unattributed for now, and the secrets the
-    /// §4.3 opening reveals are kept (`openAbort`, `identify`).
+    /// §4.3 opening reveals are kept (`openAbort`, `identify`, or `abandon`).
     fn failOpen(self: *Party, fault: Fault) error{ProtocolAbort} {
         self.abort = .{ .culprit = null, .fault = fault };
         self.state = .opening;
@@ -611,7 +633,7 @@ pub const Party = struct {
             .round4 => self.round4(inbox, random),
             .round5 => self.round5(inbox, random),
             .round6 => self.round6(inbox, random),
-            .finish, .done, .aborted, .opening, .identify => return error.InvalidState,
+            .finish, .done, .aborted, .opening, .echo, .identify => return error.InvalidState,
         };
         return result catch |e| {
             if (self.state != .opening) {
@@ -734,14 +756,24 @@ pub const Party = struct {
         }
     };
 
-    /// Maps an error from proving under peer `j`'s keys: a refused key or
-    /// tuple is `j`'s fault, anything else propagates.
-    fn proveFailed(self: *Party, j: u32, err: anyerror) Error {
+    /// Maps an error from proving under peer `j`'s keys: allocation failure
+    /// propagates, everything else is `j`'s fault. That holds because every
+    /// other input of these provers is sound by construction: this party's
+    /// own Paillier key and aux tuple passed the same checks in `round1`
+    /// (review F3), its secrets are canonical scalars and `random` cannot
+    /// fail — so a refused key, tuple, floor or a Paillier operation that
+    /// fails can only come from `j`'s published key, tuple or ciphertext
+    /// (review 2026-10-03 F15: checked, kept). The parameter is the provers'
+    /// error sets, not `anyerror`, so a new error variant there has to be
+    /// placed here deliberately.
+    fn proveFailed(self: *Party, j: u32, err: ProverError) Error {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => self.fail(j, .invalid_peer_keys),
         };
     }
+
+    const ProverError = zkproofs.ProveError || mta.MtaError;
 
     // ── Phase 1 ──────────────────────────────────────────────────────────
 
@@ -1176,7 +1208,8 @@ pub const Party = struct {
     ///   did exactly that). Everyone derives `ν'·G = μ'_ji·G − k_j·W_i`
     ///   instead; `μ'_ji` alone hides `k_j·w_i` behind `ν' < q⁵`.
     ///
-    /// Then hand every peer's opening to `identify`.
+    /// Then hand every peer's opening to `echoOpenings`, and every peer's
+    /// echo to `identify`.
     pub fn openAbort(self: *Party, random: std.Random) Error!Outbox {
         if (self.state != .opening) return error.InvalidState;
         const fault = self.abort.?.fault;
@@ -1224,30 +1257,84 @@ pub const Party = struct {
         errdefer out.deinit();
         try out.add(self, open_round, null, payload.items);
         self.own_open = try self.allocator.dupe(u8, out.list.items[0].bytes);
+        self.state = .echo;
+        return out.finish();
+    }
+
+    /// Takes every signer's opening (the inbox: one `openAbort` broadcast
+    /// from every peer), keeps a copy, and returns this party's echo: an
+    /// empty broadcast attesting the openings as received (round 9). A peer
+    /// whose opening is missing or unsigned is named here (`ProtocolAbort`,
+    /// the verdict in `abort`; the party is done, its secrets wiped).
+    pub fn echoOpenings(self: *Party, inbox: []const []const u8) Error!Outbox {
+        if (self.state != .echo) return error.InvalidState;
+        return self.echoInner(inbox) catch |e| {
+            if (self.state != .aborted) {
+                self.state = .aborted;
+                self.wipe();
+            }
+            return e;
+        };
+    }
+
+    fn echoInner(self: *Party, inbox: []const []const u8) Error!Outbox {
+        const n = self.peers.len;
+        const bc = try self.allocator.alloc(?[]const u8, n);
+        defer self.allocator.free(bc);
+        const p2p = try self.allocator.alloc(?[]const u8, n);
+        defer self.allocator.free(p2p);
+        try self.collect(inbox, open_round, true, false, .{ .broadcast = bc, .p2p = p2p });
+        const own = self.own_open.?;
+        bc[self.me] = own[header_length .. own.len - signature_length];
+        const opened = try self.allocator.alloc([]u8, n);
+        var copied: usize = 0;
+        errdefer {
+            for (opened[0..copied]) |o| self.allocator.free(o);
+            self.allocator.free(opened);
+        }
+        while (copied < n) : (copied += 1) opened[copied] = try self.allocator.dupe(u8, bc[copied].?);
+        self.opened = opened;
+        var out: OutboxBuilder = .{ .allocator = self.allocator };
+        errdefer out.deinit();
+        try out.add(self, open_echo_round, null, &.{});
         self.state = .identify;
         return out.finish();
     }
 
-    /// Checks every signer's opening (the inbox: one `openAbort` broadcast
-    /// from every peer) and names the culprit: the first signer, in signer
-    /// order of the checks below, whose opening contradicts its earlier
-    /// signed messages or the values it broadcast. Returns the verdict (also
-    /// in `abort`); the party is done afterwards, its secrets wiped. A peer
-    /// whose opening is missing, unsigned or malformed is the culprit.
+    fn freeOpened(self: *Party) void {
+        for (self.opened) |o| {
+            std.crypto.secureZero(u8, o);
+            self.allocator.free(o);
+        }
+        if (self.opened.len != 0) self.allocator.free(self.opened);
+        self.opened = &.{};
+    }
+
+    /// Checks every peer's echo (round 9) against the openings this party
+    /// received — two signed versions of one opening name the signer who made
+    /// them (`equivocation`), so honest signers judge the same openings
+    /// (review 2026-10-03 F5) — then every opening, and names the culprit:
+    /// the first signer, in signer order of the checks below, whose opening
+    /// contradicts its earlier signed messages or the values it broadcast.
+    /// Returns the verdict (also in `abort`); the party is done afterwards,
+    /// its secrets wiped. A peer whose echo is missing or unsigned, or whose
+    /// opening is malformed, is the culprit.
     pub fn identify(self: *Party, inbox: []const []const u8) Error!Abort {
         if (self.state != .identify) return error.InvalidState;
         const fault = self.abort.?.fault;
         const verdict = self.identifyInner(inbox, fault) catch |e| switch (e) {
-            error.ProtocolAbort => self.abort.?, // from `collect`: missing, unsigned, malformed
+            error.ProtocolAbort => self.abort.?, // from `collect`: missing, unsigned, equivocation
             else => {
                 self.state = .aborted;
                 self.wipe();
+                self.freeOpened();
                 return e;
             },
         };
         self.abort = verdict;
         self.state = .aborted;
         self.wipe();
+        self.freeOpened();
         return verdict;
     }
 
@@ -1257,16 +1344,14 @@ pub const Party = struct {
         defer self.allocator.free(bc);
         const p2p = try self.allocator.alloc(?[]const u8, n);
         defer self.allocator.free(p2p);
-        try self.collect(inbox, open_round, true, false, .{ .broadcast = bc, .p2p = p2p });
-        const own = self.own_open.?;
-        bc[self.me] = own[header_length .. own.len - signature_length];
+        try self.collect(inbox, open_echo_round, true, false, .{ .broadcast = bc, .p2p = p2p });
 
         const openings = try self.allocator.alloc(Opening, n);
         defer self.allocator.free(openings);
         const sections = try self.allocator.alloc(OpenSection, n * n);
         defer self.allocator.free(sections);
-        for (openings, bc, 0..) |*o, body, i| {
-            o.* = parseOpening(body.?, fault, i, sections[i * n ..][0..n]) orelse
+        for (openings, self.opened, 0..) |*o, body, i| {
+            o.* = parseOpening(body, fault, i, sections[i * n ..][0..n]) orelse
                 return .{ .culprit = self.signers[i], .fault = fault };
         }
         const culprit = if (fault == .r_bar_sum)
@@ -1617,15 +1702,18 @@ pub const Presignature = struct {
     pub const codec_version: u8 = 1;
 
     /// The presignature as bytes, SECRET (`k_i`, `σ_i`, the message seed): a
-    /// store must keep them encrypted at rest. Restoring the same bytes twice
-    /// and signing two messages reveals the key — never keep or restore a
-    /// copy; go through `PresignaturePool`, whose `take` hands a stored
-    /// presignature out at most once. Refuses a used presignature.
+    /// store must keep them encrypted at rest. CONSUMES the presignature: on
+    /// success it is marked used and `k_i`, `σ_i` are wiped, so the bytes are
+    /// the only copy left and the in-memory one can no longer sign (review
+    /// 2026-10-03 F11 — before, a caller could encode, keep the original and
+    /// sign with both, which reveals the key). Restoring the same bytes twice
+    /// does the same — go through `PresignaturePool`, whose `take` hands a
+    /// stored presignature out at most once. Refuses a used presignature.
     ///
     /// `version || sid || index || group key || n || signers[n] || R || r ||
     /// R̄[n] || S[n] || Phase-6 attestations[n] || message keys[n] || k || σ ||
     /// message seed`, integers big-endian.
-    pub fn toBytesAlloc(self: *const Presignature, allocator: std.mem.Allocator) Error![]u8 {
+    pub fn toBytesAlloc(self: *Presignature, allocator: std.mem.Allocator) Error![]u8 {
         if (self.used) return error.PresignatureUsed;
         const pb = &self.public;
         const n = pb.signers.len;
@@ -1659,7 +1747,10 @@ pub const Presignature = struct {
         try list.appendSlice(allocator, &self.k.toBytes(.big));
         try list.appendSlice(allocator, &self.sigma.toBytes(.big));
         try list.appendSlice(allocator, &self.message_seed);
-        return list.toOwnedSlice(allocator);
+        const out = try list.toOwnedSlice(allocator);
+        self.used = true;
+        self.wipe();
+        return out;
     }
 
     pub const DecodeError = Error || error{InvalidEncoding};
@@ -1720,13 +1811,18 @@ pub const Presignature = struct {
             k.* = root.decodeMessageKey(bytes[off..][0..32].*) catch return error.InvalidEncoding;
             off += 32;
         }
-        const k = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        // The secrets' stack copies are wiped on every path (review F11).
+        var k = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
         off += Ns;
-        const sigma = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        var sigma = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&sigma));
         off += Ns;
-        const seed = bytes[off..][0..32].*;
+        var seed = bytes[off..][0..32].*;
+        defer std.crypto.secureZero(u8, &seed);
         off += 32;
-        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidEncoding;
+        var kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidEncoding;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
         if (!std.mem.eql(u8, &kp.public_key.toBytes(), &keys[pos].toBytes())) return error.InvalidEncoding;
         std.debug.assert(off == bytes.len);
         const r_pt = r_point.point() catch return error.InvalidEncoding;
@@ -1957,6 +2053,11 @@ const Case = enum {
     /// The cheater's round-4 messages carry a signed body shorter than the
     /// attestation block that must head them.
     short_body,
+    /// `sigma_shift`, then every signer abandons the opening (`abandon`).
+    abandon_open,
+    /// `sigma_shift`; the last signer shows signer 0 a second, signed version
+    /// of its opening (review F5): the echo round names it.
+    open_equivocate,
     /// `sigma_shift`; signer 0 opens a `k` that is not the one in its signed `c_k`.
     open_lie_k,
     /// A type-7 / type-5 opening of the LAST signer with a byte appended, or
@@ -2100,7 +2201,8 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         errdefer for (next) |b| if (b) |o| o.deinit(allocator);
         for (0..t) |i| {
             if ((case == .sigma_shift or case == .open_plain_n or case == .open_lie_k or case == .open_trailing7 or case == .open_short7 or
-                case == .open7_late_mu or case == .open7_late_strip or case == .open7_late_round2) and round == 3 and i == cheat_pos)
+                case == .open7_late_mu or case == .open7_late_strip or case == .open7_late_round2 or
+                case == .abandon_open or case == .open_equivocate) and round == 3 and i == cheat_pos)
                 parties[i].secrets.sigma = parties[i].secrets.sigma.add(Scalar.one);
             next[i] = parties[i].advance(inboxes[i].items, random) catch |e| switch (e) {
                 error.ProtocolAbort => blk: {
@@ -2265,6 +2367,14 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
     for (aborts.items) |a| {
         if (a.abort.culprit != null or (a.abort.fault != .r_bar_sum and a.abort.fault != .s_sum)) return;
     }
+    if (case == .abandon_open) {
+        for (parties) |*p| {
+            p.abandon();
+            try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.secrets), 0));
+            try testing.expectError(error.InvalidState, p.openAbort(random));
+        }
+        return;
+    }
     var openings: [8]Outbox = undefined;
     for (parties, 0..) |*p, i| openings[i] = try p.openAbort(random);
     defer for (openings[0..parties.len]) |o| o.deinit(allocator);
@@ -2278,7 +2388,7 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
         const fresh = try allocator.alloc(u8, header_length + body_len + extra + signature_length);
         @memcpy(fresh[0 .. header_length + body_len], old[0 .. header_length + body_len]);
         if (extra == 1) fresh[header_length + body_len] = 0xAA;
-        resign(&parties[liar], fresh, false);
+        try lieConsistently(allocator, &parties[liar], fresh);
         allocator.free(old);
         openings[liar].messages[0].bytes = fresh;
     }
@@ -2313,7 +2423,7 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
                 openings[liar].messages[0].bytes = fresh;
             },
         }
-        resign(&parties[liar], openings[liar].messages[0].bytes, false);
+        try lieConsistently(allocator, &parties[liar], openings[liar].messages[0].bytes);
     }
     if (case == .open_lie or case == .open_lie_round2 or case == .open_plain_n or case == .open_lie_k) {
         // Signer 0 (the last one for `open_lie_k`) lies in its opening, and signs the lie.
@@ -2344,18 +2454,61 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
             }
             try testing.expectEqual(@as(u16, 0), carry);
         } else m[at] ^= 0x01;
+        try lieConsistently(allocator, &parties[liar], m);
+    }
+    // `open_equivocate`: the last signer shows signer 0 a second, signed
+    // version of its opening (a byte of its decryption for signer 0 changed)
+    // and everyone else the real one.
+    var second: ?[]u8 = null;
+    defer if (second) |b| allocator.free(b);
+    if (case == .open_equivocate) {
+        const liar = parties.len - 1;
+        const m = try allocator.dupe(u8, openings[liar].messages[0].bytes);
+        second = m;
+        var sections: [8]OpenSection = undefined;
+        _ = parseOpening(m[header_length .. m.len - signature_length], parties[0].abort.?.fault, liar, sections[0..parties.len]).?;
+        m[@intFromPtr(sections[0].plain.ptr) - @intFromPtr(m.ptr) + sections[0].plain.len - 1] ^= 0x01;
         resign(&parties[liar], m, false);
     }
-    for (parties, aborts.items) |*p, *a| {
+    // Round 8 → 9: every party echoes the openings it got.
+    var echoes: [8]?Outbox = @splat(null);
+    defer for (echoes[0..parties.len]) |e| if (e) |o| o.deinit(allocator);
+    for (parties, aborts.items, 0..) |*p, *a, to| {
+        var inbox: [8][]const u8 = undefined;
+        for (openings[0..parties.len], 0..) |o, from| {
+            inbox[from] = if (second != null and from == parties.len - 1 and to == 0) second.? else o.messages[0].bytes;
+        }
+        echoes[to] = p.echoOpenings(inbox[0..parties.len]) catch |e| switch (e) {
+            error.ProtocolAbort => blk: {
+                a.abort = p.abort.?;
+                break :blk null;
+            },
+            else => return e,
+        };
+    }
+    for (parties, aborts.items, 0..) |*p, *a, to| {
+        if (echoes[to] == null) continue;
         var inbox: [8][]const u8 = undefined;
         var k: usize = 0;
-        for (openings[0..parties.len]) |o| {
-            inbox[k] = o.messages[0].bytes;
-            k += 1;
+        for (echoes[0..parties.len], 0..) |e, from| {
+            if (from == to) continue;
+            if (e) |o| {
+                inbox[k] = o.messages[0].bytes;
+                k += 1;
+            }
         }
         a.abort = try p.identify(inbox[0..k]);
         try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.secrets), 0));
     }
+}
+
+/// A lying signer's opening, as a real one would send it: signed, and the
+/// same lie to everyone — its own record (`own_bc`, `own_open`) is the lie
+/// too, or the echo round would see two versions and call it equivocation.
+fn lieConsistently(allocator: std.mem.Allocator, party: *Party, msg: []u8) !void {
+    resign(party, msg, true);
+    allocator.free(party.own_open.?);
+    party.own_open = try allocator.dupe(u8, msg);
 }
 
 /// `parseOpening` on hostile bytes (mutation audit round 2): every strict
@@ -2558,10 +2711,8 @@ test "presign: §4.3 opening — a signer lying in its opening is named by every
     defer res.deinit(allocator);
     try testing.expectEqual(shares.len, res.aborts.len);
     for (res.aborts) |a| {
-        // Signer 0 checks its own opening as it made it (true γ) and so
-        // names the δ cheater; everyone else saw the false γ and names it.
-        const want = if (a.observer == shares[0].index) shares[1].index else shares[0].index;
-        try testing.expectEqual(Abort{ .culprit = want, .fault = .r_bar_sum }, a.abort);
+        // Everyone judges the same (false) γ — the liar too — and names it.
+        try testing.expectEqual(Abort{ .culprit = shares[0].index, .fault = .r_bar_sum }, a.abort);
     }
 }
 
@@ -2598,6 +2749,35 @@ test "presign: §4.3 opening — a forged round-2 message or a decryption lifted
     }
 }
 
+test "presign: an opening shown two ways is caught by the echo round, its signer named by everyone (review F5)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6563_686f_6f70_656e);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var res = try runSession(allocator, kg.key_shares, random, .open_equivocate);
+    defer res.deinit(allocator);
+    try testing.expectEqual(kg.key_shares.len, res.aborts.len);
+    const liar = kg.key_shares[kg.key_shares.len - 1].index;
+    // Signers 0 and 1 saw different openings from the liar; the echoes show
+    // both its signatures to both, and the liar its own two versions.
+    for (res.aborts) |a| try testing.expectEqual(Abort{ .culprit = liar, .fault = .equivocation }, a.abort);
+}
+
+test "presign: an abandoned §4.3 opening wipes the kept secrets at once (review F11)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6162_616e_646f_6e);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var res = try runSession(allocator, kg.key_shares, random, .abandon_open);
+    defer res.deinit(allocator);
+    try testing.expectEqual(kg.key_shares.len, res.aborts.len);
+    for (res.aborts) |a| try testing.expectEqual(Abort{ .culprit = null, .fault = .s_sum }, a.abort);
+}
+
 test "presign: a pooled presignature survives encoding, is taken at most once, and signs" {
     if (builtin.mode == .Debug) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -2608,14 +2788,20 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
     var res = try runSession(allocator, kg.key_shares, random, .honest);
     defer res.deinit(allocator);
 
-    // The codec round-trips, and refuses what it must.
+    // The codec round-trips, and refuses what it must. Encoding consumes the
+    // original (review F11): it can no longer sign or be encoded again.
+    const k_orig = res.presigs[1].k;
+    const sigma_orig = res.presigs[1].sigma;
     const bytes = try res.presigs[1].toBytesAlloc(allocator);
     defer allocator.free(bytes);
+    try testing.expectError(error.PresignatureUsed, res.presigs[1].signShare(.{ .bytes = "kept copy" }));
+    try testing.expectError(error.PresignatureUsed, res.presigs[1].toBytesAlloc(allocator));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&res.presigs[1].k), 0));
     {
         var back = try Presignature.fromBytesAlloc(allocator, bytes);
         defer back.deinit();
         try testing.expectEqualSlices(u8, &res.presigs[1].id(), &back.id());
-        try testing.expect(back.k.equivalent(res.presigs[1].k) and back.sigma.equivalent(res.presigs[1].sigma));
+        try testing.expect(back.k.equivalent(k_orig) and back.sigma.equivalent(sigma_orig));
         const again = try back.toBytesAlloc(allocator);
         defer allocator.free(again);
         try testing.expectEqualSlices(u8, bytes, again);
@@ -2675,7 +2861,10 @@ test "presign: a pooled presignature survives encoding, is taken at most once, a
     }
 
     // Pool: put moves it out (the in-memory original is wiped), take restores
-    // it once.
+    // it once. (The original was consumed by the encoding above: start from
+    // its bytes.)
+    res.presigs[1].deinit();
+    res.presigs[1] = try Presignature.fromBytesAlloc(allocator, bytes);
     var mem = MemoryPresignatureStore.init(allocator);
     defer mem.deinit();
     const pool: PresignaturePool = .{ .store = mem.store() };

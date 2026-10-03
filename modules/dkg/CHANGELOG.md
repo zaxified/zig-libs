@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — `EcdsaRefresh` refuses new aux material that repeats a modulus or the
+  message key of the old table — this party's own at `start`, a peer's in the announce round
+  (`StaleAuxMaterial`; review 2026-10-03 F14).
 - **2026-10-04** — **BREAKING (wire): run tag and key confirmation** (review 2026-10-03 F6,
   F7). Every `EcdsaKeygen`/`EcdsaRefresh` frame — the inner GJKR and reshare frames included —
   starts with a 16-byte run tag (`ecdsa_keygen.runTag`: protocol, session id, `t`, `n`); a frame
