@@ -554,52 +554,6 @@ fn jacobiBig(gpa: std.mem.Allocator, a_in: *const BigInt, n_in: *const BigInt) s
     return 0; // gcd(a, n) > 1
 }
 
-/// `a^{-1} mod m` (for `m > 1`), or `null` when `gcd(a, m) != 1`. Standard
-/// iterative extended Euclid over `std.math.big.int` (signed Bezout
-/// coefficient, folded back into `[0, m)` at the end). Variable-time —
-/// prove-side only, on values the prover already knows.
-fn modInverse(gpa: std.mem.Allocator, a_in: *const BigInt, m_in: *const BigInt) std.mem.Allocator.Error!?BigInt {
-    if (m_in.toConst().orderAgainstScalar(1) != .gt) return null;
-    var r0 = try newBig(gpa);
-    defer r0.deinit();
-    var r1 = try newBig(gpa);
-    defer r1.deinit();
-    var s0 = try newBig(gpa);
-    defer s0.deinit();
-    var s1 = try newBig(gpa);
-    defer s1.deinit();
-    var quot = try newBig(gpa);
-    defer quot.deinit();
-    var rem = try newBig(gpa);
-    defer rem.deinit();
-    var tmp = try newBig(gpa);
-    defer tmp.deinit();
-
-    try r0.copy(m_in.toConst());
-    try quot.divFloor(&rem, a_in, m_in); // r1 = a mod m
-    r1.swap(&rem);
-    try s0.set(0);
-    try s1.set(1);
-
-    while (!r1.eqlZero()) {
-        try quot.divFloor(&rem, &r0, &r1);
-        r0.swap(&r1);
-        r1.swap(&rem);
-        // (s0, s1) := (s1, s0 - quot*s1)
-        try tmp.mul(&quot, &s1);
-        try tmp.sub(&s0, &tmp);
-        s0.swap(&s1);
-        s1.swap(&tmp);
-    }
-    if (r0.toConst().orderAgainstScalar(1) != .eq) return null;
-
-    var out = try newBig(gpa);
-    errdefer out.deinit();
-    try quot.divFloor(&rem, &s0, m_in); // fold the Bezout coefficient into [0, m)
-    try out.copy(rem.toConst());
-    return out;
-}
-
 /// Uniform nonzero `AuxFe` in `[1, m)` by rejection sampling — copy of
 /// `root.zig`'s identically-named private helper (the Πmod witness `w` is
 /// public once broadcast).
@@ -1101,56 +1055,49 @@ pub const Pimod = struct {
         var n_big = try bigFromBytes(allocator, stripLeadingZeros(&nt_buf));
         defer n_big.deinit();
 
-        // Trapdoor factors — degenerate input is substituted fail-closed
-        // (garbage proof a correct verifier rejects, never a panic/hang);
-        // an aux/trapdoor mismatch is a caller bug per the contract.
-        var p = try bigFromBytes(allocator, stripLeadingZeros(p_secret));
-        defer p.deinit();
-        var q = try bigFromBytes(allocator, stripLeadingZeros(q_secret));
-        defer q.deinit();
-        if (p.toConst().orderAgainstScalar(2) == .lt or p.bitCountAbs() > root.aux_modulus_bits) try p.set(3);
-        if (q.toConst().orderAgainstScalar(2) == .lt or q.bitCountAbs() > root.aux_modulus_bits) try q.set(3);
-
-        var phi = try newBig(allocator);
-        defer phi.deinit();
-        {
-            var p1 = try newBig(allocator);
-            defer p1.deinit();
-            var q1 = try newBig(allocator);
-            defer q1.deinit();
-            try p1.addScalar(&p, -1);
-            try q1.addScalar(&q, -1);
-            try phi.mul(&p1, &q1);
-        }
-        if (phi.toConst().orderAgainstScalar(1) != .gt or phi.bitCountAbs() > root.aux_modulus_bits) try phi.set(4);
-
-        // 5's exponent: d = n_tilde^{-1} mod phi — SECRET (factor-
-        // equivalent), hence the fixed-width buffer + constant-time modexp
-        // below, and a fail-closed d = 1 when phi is degenerate or
-        // gcd(n_tilde, phi) != 1 (an honest two-distinct-Blum-prime
-        // trapdoor always inverts — that is exactly the property Πmod
-        // establishes).
-        var d_buf: [root.aux_modulus_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &d_buf);
-        @memset(&d_buf, 0);
-        d_buf[d_buf.len - 1] = 1;
-        if (try modInverse(allocator, &n_big, &phi)) |d_val| {
-            var d = d_val;
-            defer d.deinit();
-            d.toConst().writeTwosComplement(&d_buf, .big);
-        }
-        const d_bytes = d_buf[root.aux_modulus_bytes - n_len ..];
-
         // Per-factor constant-time contexts: the primes are SECRET moduli
-        // (montint.DynModint), and every per-round step below — Legendre
+        // (montint.DynModint), and every step below — φ and d, the Legendre
         // symbols, square roots, the CRT — runs on them without a branch on
         // their value. (Until 2026-10-02 this was big-int Jacobi symbols and
-        // division plus std.crypto.ff pow modulo the secret factor.)
+        // division plus std.crypto.ff pow modulo the secret factor; until
+        // 2026-10-03 φ and d were big-int extended Euclid.) A degenerate
+        // factor is substituted fail-closed inside `BlumCt.init` (garbage
+        // proof a correct verifier rejects, never a panic/hang); an
+        // aux/trapdoor mismatch is a caller bug per the contract.
         var pb = BlumCt.init(p_secret, nt);
         defer pb.wipe();
         var qb = BlumCt.init(q_secret, nt);
         defer qb.wipe();
         const ntc = Ct.fromFf(nt) catch unreachable; // odd, ≥ 3
+
+        // 5's exponent: d = n_tilde^{-1} mod φ, φ = (p−1)(q−1) — SECRET
+        // (factor-equivalent). p, q are odd, so p − 1 is p with bit 0
+        // cleared. `inverseOfModulus` takes the even modulus φ; a fail-closed
+        // d = 1 when gcd(n_tilde, φ) != 1 (an honest two-distinct-Blum-prime
+        // trapdoor always inverts — that is exactly the property Πmod
+        // establishes). A product wider than the element (only for the
+        // substituted factors) is truncated: garbage, as above.
+        var d_buf: [root.aux_modulus_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &d_buf);
+        {
+            var p1 = pb.m.m;
+            p1[0] &= ~@as(u64, 1);
+            defer std.crypto.secureZero(u64, &p1);
+            var q1 = qb.m.m;
+            q1[0] &= ~@as(u64, 1);
+            defer std.crypto.secureZero(u64, &q1);
+            var prod: [2 * Ct.max_limbs]u64 = undefined;
+            defer std.crypto.secureZero(u64, &prod);
+            montint.limbs.mulSchoolbook(&prod, &p1, &q1);
+            var d: Ct.Elem = undefined;
+            defer std.crypto.secureZero(u64, &d);
+            const ok = ntc.inverseOfModulus(prod[0..Ct.max_limbs], &d);
+            var one = Ct.zero;
+            one[0] = 1;
+            d = Ct.select(ok, &d, &one);
+            ntc.toBytesBE(&d, &d_buf);
+        }
+        const d_bytes = d_buf[root.aux_modulus_bytes - n_len ..];
         // CRT constant q^{-1} mod p by Fermat (p prime) — constant-time,
         // unlike the extended Euclid it replaces.
         var qinv_p = pb.m.pow(&pb.m.reduceLimbs(qb.m.m[0..qb.m.L]), &pb.pm2);

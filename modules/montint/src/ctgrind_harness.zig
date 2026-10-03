@@ -373,6 +373,29 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
     const back = md.elemFromBytesBE(&abr) catch D.zero;
     md.toBytesBE(&back, &out);
     std.debug.print("load={x}\n", .{out});
+    // Inversion: a secret element, and the secret modulus inverted modulo a
+    // secret EVEN value (the `Ñ⁻¹ mod φ` shape). Own operands, picked (the
+    // `-v2` domains) coprime to the modulus at both widths so the run walks
+    // the success path — the 3 that divides this modulus also divided `a` and
+    // `b`. Python's `pow(x, -1, m)` on the same SHAKE-derived values gives the
+    // printed inverses. Both verdicts branch only in the printing (witness).
+    var c = D.zero;
+    var ev = D.zero;
+    inline for (.{ &c, &ev }, .{ "inv", "even" }) |v, name| {
+        const r = secretBytes(8 * n, "ctgrind-montint-harness-dyn-" ++ name ++ "-" ++ tag ++ "-v2");
+        for (v[0..n], 0..) |*w, i| w.* = std.mem.readInt(u64, r[i * 8 ..][0..8], .little);
+        v[n - 1] &= ~(@as(u64, 1) << 63);
+    }
+    ev[0] &= ~@as(u64, 1);
+    const cr = taintedCopy(D.Elem, &c, tainted);
+    const evr = taintedCopy(D.Elem, &ev, tainted);
+    var inv: D.Elem = undefined;
+    const inv_ok = md.inverse(&cr, &inv);
+    md.toBytesBE(&inv, &out);
+    std.debug.print("inverse={} {x}\n", .{ inv_ok, out });
+    const invm_ok = md.inverseOfModulus(&evr, &inv);
+    md.toBytesBE(&inv, &out);
+    std.debug.print("inverseofmodulus={} {x}\n", .{ invm_ok, out });
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

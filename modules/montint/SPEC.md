@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/crypto-bigint](https://github.com/RustCrypto/crypto-bigint) 0.7.5 | Rust | Apache-2.0 OR MIT (`Cargo.toml`) | 310 | push 2026-09-28 | Constant-time by default, variable-time functions suffixed `_vartime` (its README); `modular/` has Montgomery forms (const, fixed and boxed/run-time-sized), `safegcd.rs` inversion, `sqrt.rs`, `lincomb.rs` and `pow.rs` (file listing of `src/modular`). NCC-audited (its README). |
 | [openssl/openssl](https://github.com/openssl/openssl) `BN_mod_exp_mont_consttime` | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | The speed yardstick: module's table has this module at 1.3–1.5× OpenSSL modmul and 1.8× modexp at 2048/4096 bits, faster at 256 bits (module's own measurements, not re-run). Also inversion, sqrt, primality, gcd. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** inversion and square roots, element `compare`, and aarch64 gets only the portable path (→ Backlog). (Closed 2026-10-02 by `DynModint`: a variable-time public-exponent power, `reduce` of a wider value, element `eql`/`isZero`, run-time-sized moduli.)
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core; ctgrind-measured constant-time (`scripts/checks/ctgrind.sh montint`). **Where we are behind:** square roots, a batched (62-step matrix) inversion, element `compare`, and aarch64 gets only the portable path (→ Backlog). (Closed 2026-10-02 by `DynModint`: a variable-time public-exponent power, `reduce` of a wider value, element `eql`/`isZero`, run-time-sized moduli; 2026-10-03: constant-time inversion, `DynModint.inverse`/`inverseOfModulus`.)
 
 ## What this module is
 
@@ -83,6 +83,33 @@ mutants): 12 killed after one added test (`divExact` with a non-zero limb above
 portable CIOS tolerates an operand `< R`; the narrower digit keeps the
 documented `< m` contract) and dropping the `m < 3` check (`Modint.fromElem`
 rejects it too).
+
+**Inversion (2026-10-03).** `inverse(a, out) bool` is `a⁻¹ mod m` by
+Bernstein–Yang divsteps (2019, §11), one step at a time, every branch a masked
+blend, run for the paper's bound — `⌊(49b + 57)/17⌋` steps for `b ≥ 46` bits,
+`⌊(49b + 80)/17⌋` below (Theorem 11.2) — with `b` the modulus's (public) bit
+length. `d`, `e` are tracked mod `m` (`f ≡ d·a`, `g ≡ e·a`), halving `g`
+becoming `e·2⁻¹`. The verdict checks `g = 0` and `f = ±1`, so a bound that fell
+short would refuse rather than return a wrong value. `inverseOfModulus(n, out)
+bool` is `m⁻¹ mod n` for ANY `n ≥ 2`, even included — the shape the callers
+have (`Ñ⁻¹ mod φ(Ñ)`, `e⁻¹ mod (p − 1)`), which divsteps cannot take directly:
+`z = n⁻¹ mod m` (odd side), then `m⁻¹ mod n = n − (n·z − 1)/m`, the exact
+division a Hensel product with `m⁻¹ mod 2^(64·max_limbs)`. Both are CT in the
+operand AND the modulus value up to the verdict. Cost (amd64, ReleaseFast,
+`bench.zig`): 0.8 / 3.5 / 16 ms at 1024 / 2048 / 4096 bits — about one modexp
+of the same width; meant for key setup and provers. Evidence: exhaustive over
+every `a` below every odd `m < 512`; differential against `std.math.big.int` at
+46…4096 bits (units and constructed non-units) and for `inverseOfModulus` at
+mixed widths (2…4096 bits, even and odd `n`); ctgrind `dyn` drives both on
+tainted operands and modulus at L=16 and L=32 (coprime operands, so the success
+path runs; values equal Python's `pow(x, -1, m)`) — no context added. Mutation
+2026-10-03 (schemata, 24 mutants on the divsteps, the halving, the verdict and
+the Hensel step): 21 killed, 3 equivalent — all three lean on the step bound's
+slack: one step fewer (Theorem 11.2's bound is not tight; the exhaustive
+`m < 512` sweep still converges), `δ += 2` (the invariants `f ≡ d·a`,
+`g ≡ e·a` hold for any swap schedule — only the speed of convergence changes),
+and dropping the `g = 0` half of the verdict (redundant once the bound holds;
+it is the fail-closed guard for a bound that would not).
 
 ## Why it exists (std-gap, not a dup)
 
@@ -588,7 +615,7 @@ speed dispatch, not a correctness bound.
 
 - ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
 - **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); `isOdd`, and the fixed-width `Modint` itself, still open. Effort S. Fits §2.
-- **Modular inversion (constant-time, safegcd-style) and, for prime moduli, square root** (survey 2026-09-30): crypto-bigint and OpenSSL have them; a prime modulus can invert by `powMont(m-2)` today (`Field.inv` does), an RSA/Paillier composite cannot. **Consumer (2026-10-03):** `threshold_ecdsa`'s Πmod prover needs `Ñ⁻¹ mod (p−1)` — an EVEN secret modulus, so the inversion must not assume an odd one (Bernstein-Yang safegcd does not); today it is big-int extended Euclid, 451 of ctgrind `pimod`'s 540 contexts. Effort M. Fits §2.
+- ~~**Modular inversion (constant-time, safegcd-style)**~~ ✅ 2026-10-03 `DynModint.inverse` (divsteps) and `inverseOfModulus` (any `n`, even included); `threshold_ecdsa`'s Πmod `d = Ñ⁻¹ mod φ` moved onto it (ctgrind `pimod` 540 → 4). Still open: **square root for prime moduli** (crypto-bigint, OpenSSL) — Effort S–M; and **batched divsteps** (62 steps per transition matrix, as crypto-bigint/libsecp256k1): one step at a time costs ~one modexp per inversion, fine for key setup, ~10× too slow for a per-message path. Effort M. Fits §2.
 - ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
 - ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
 - **`DynModint.reduceLimbs` costs two Montgomery multiplies per 64-bit digit** (2026-10-02): a 2L-limb input reduces in 4L multiplies, ~5 % of a CRT half's modexp. A chunked form (`L` limbs at a time, `R²` per chunk) needs `montMul` to accept one operand `≥ m`, which the portable CIOS does (`< R` suffices) but the asm core's contract does not state. Effort S once the asm contract is checked. Fits §2.

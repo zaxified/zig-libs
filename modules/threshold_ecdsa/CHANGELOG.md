@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Πmod's exponent `d = Ñ⁻¹ mod φ` is constant-time.**
+  `φ = (p−1)(q−1)` is a limb product of the secret primes (`p − 1` = `p` with
+  bit 0 cleared) and `d` comes from `montint`'s `inverseOfModulus` (an even
+  modulus); the big-int copies of `p`, `q`, `φ` and the extended-Euclid
+  `modInverse` are gone. ctgrind `pimod` 540 → 4 (two length verdicts, two
+  blends on the published `a_i`/`b_i`). Proofs unchanged.
+
 - **2026-10-03** — **Πmod's rounds and Miller-Rabin are constant-time in the
   secret factor.** The Πmod prover's Legendre symbols (Euler's criterion),
   4th roots (`v^((r+1)/4)`, the QR one of `±s` by a CT select), CRT and

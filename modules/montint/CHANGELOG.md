@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Constant-time modular inversion: `DynModint.inverse` and
+  `inverseOfModulus`.** `inverse(a, out) bool` is `a⁻¹ mod m` by
+  Bernstein–Yang divsteps (masked blends, the paper's step bound from the
+  modulus's public bit length, verdict `g = 0 ∧ f = ±1`);
+  `inverseOfModulus(n, out) bool` is `m⁻¹ mod n` for any `n ≥ 2`, even
+  included (odd-side inverse, then a Hensel exact division). Constant-time in
+  the operand and the modulus value up to the verdict (ctgrind `dyn`: no new
+  context). ~3.5 ms at 2048 bits (≈ one modexp) — for key setup and provers.
+  `divExact`'s Newton step moved into a shared helper (no behaviour change).
+
 - **2026-10-03** — **`DynModint` for secret primes whose length is known.**
   `fromLimbsBits(v, nbits)` takes the bit length from the caller (the key
   size) and checks it, oddness and `≥ 3` in one combined verdict — nothing

@@ -198,4 +198,38 @@ test "bench (opt-in via MONTINT_BENCH)" {
     benchSize(1024, rand);
     benchSize(2048, rand);
     benchSize(4096, rand);
+    benchInverse(1024, rand);
+    benchInverse(2048, rand);
+    benchInverse(4096, rand);
+}
+
+/// `DynModint.inverse` (divsteps) and `inverseOfModulus` against an even
+/// value of the same width — key-setup costs, one call each per key.
+fn benchInverse(comptime bits: usize, rand: std.Random) void {
+    const D = @import("dyn.zig").DynModint(4096);
+    var mv = D.zero;
+    for (mv[0 .. bits / 64]) |*w| w.* = rand.int(u64);
+    mv[0] |= 1;
+    mv[bits / 64 - 1] |= 1 << 63;
+    const m = D.fromLimbs(&mv) catch return;
+    var a = D.zero;
+    for (a[0 .. bits / 64 - 1]) |*w| w.* = rand.int(u64);
+    var n = a;
+    n[0] &= ~@as(u64, 1);
+    var out: D.Elem = undefined;
+    const iters: u64 = 20;
+    var t0 = nowNs();
+    for (0..iters) |_| {
+        std.mem.doNotOptimizeAway(m.inverse(&a, &out));
+        std.mem.doNotOptimizeAway(&out);
+    }
+    var dt = nowNs() - t0;
+    std.debug.print("dyn inverse          {d:>5}-bit: {d:>10} ns/op\n", .{ bits, dt / iters });
+    t0 = nowNs();
+    for (0..iters) |_| {
+        std.mem.doNotOptimizeAway(m.inverseOfModulus(&n, &out));
+        std.mem.doNotOptimizeAway(&out);
+    }
+    dt = nowNs() - t0;
+    std.debug.print("dyn inverseOfModulus {d:>5}-bit: {d:>10} ns/op\n", .{ bits, dt / iters });
 }

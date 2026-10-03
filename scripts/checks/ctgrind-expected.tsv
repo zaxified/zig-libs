@@ -403,7 +403,11 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # tainted after construction, slot L not), operands, exponent, wide inputs, at
 # L=16 and L=32. The 2 in-file are elemFromBytesBE's accept/reject, one per
 # width; divExact's and eql's verdicts branch in the printing (witness).
-montint	ReleaseFast	dyn	1	2	37e11d7a6be7418b	880a04f6d911e62c
+# 2026-10-03: + `inverse` (divsteps) on a secret element and `inverseOfModulus`
+# against a secret EVEN value, both widths, operands coprime to the modulus so
+# the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
+# the divsteps and the Hensel step add no context, their verdicts are witness.
+montint	ReleaseFast	dyn	1	2	57aee45bb40092c3	880a04f6d911e62c
 p256	ReleaseFast	comb	1	2	8dc7a6306ed8c563	50b80e702e9284d8
 p256	ReleaseFast	sign	1	<=12	521052e105bbd9bb	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
@@ -583,13 +587,13 @@ threshold_ecdsa	ReleaseFast	fac	1	5	efa64f0b61642b12	b014d308e3ab9ce7
 # threshold_ecdsa pimod (2026-10-03) — Πmod prover over tss-lib's 2048-bit N,
 # Paillier p, q tainted. The per-round work (Legendre symbols by Euler's
 # criterion, the 4th roots with a CT ±s select, the CRT, q^-1 mod p by Fermat)
-# runs on montint.DynModint modulo the secret primes: 0 contexts there. Left,
-# all key-setup big-int arithmetic on p, q: d = Ñ^-1 mod φ by extended Euclid
-# (`modInverse`, 451), φ and the big-int copies of p, q (`proveCore`, 84;
-# `bigFromBytes`/`stripLeadingZeros`, 4), and fromLimbsBits's length verdict
-# (1). The inverse needs a CT inversion modulo an even modulus — montint
-# backlog (safegcd); tracked in threshold_ecdsa's SPEC backlog.
-threshold_ecdsa	ReleaseFast	pimod	1	<=540	83167dadaad1b093	32fb00d8e8d6b688
+# runs on montint.DynModint modulo the secret primes: 0 contexts there.
+# Same day, 540 -> 4: φ = (p−1)(q−1) by limb product and d = Ñ^-1 mod φ by
+# montint `inverseOfModulus` (divsteps + Hensel) replaced the big-int copies
+# of p, q, φ and the extended Euclid (451 + 84 + 4). Left: fromLimbsBits's
+# length verdict, once per factor (2), and the `if (b_bit)`/`if (a_bit)`
+# blends of y' (aux_proofs.zig, 2) — a_i, b_i are published in the proof.
+threshold_ecdsa	ReleaseFast	pimod	1	4	5a62e2b418cec7ba	32fb00d8e8d6b688
 # threshold_ecdsa prime (2026-10-03) — root.isProbablePrime on tss-lib's
 # 1024-bit Blum prime, tainted, its length (1024) given by the caller as the
 # prime searches do. 4 in-file: fromLimbsBits's verdict (1), the `s` scan over

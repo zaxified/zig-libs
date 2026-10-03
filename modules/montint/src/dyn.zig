@@ -490,22 +490,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             inline while (s <= max_limbs) : (s += step) {
                 if (s == self.L) {
                     const m = self.m[0..s];
-                    // inv = m⁻¹ mod 2^(64s): Newton from the 64-bit inverse,
-                    // precision doubling each step; the step count depends on
-                    // `s` only.
-                    var inv = [_]u64{0} ** s;
-                    inv[0] = 0 -% self.n0inv;
-                    var prec: usize = 64;
-                    while (prec < 64 * s) : (prec *= 2) {
-                        var t: [s]u64 = undefined;
-                        mulLow(s, &t, m, &inv); // m·y
-                        var two = [_]u64{0} ** s;
-                        two[0] = 2;
-                        _ = limbs.subInto(&two, &t); // 2 − m·y
-                        var y: [s]u64 = undefined;
-                        mulLow(s, &y, &inv, &two);
-                        inv = y;
-                    }
+                    const inv = invPow2(s, m, self.n0inv);
                     var xl = [_]u64{0} ** s;
                     for (0..s) |i| xl[i] = if (i < x.len) x[i] else 0;
                     var qq: [s]u64 = undefined;
@@ -529,7 +514,231 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             }
             unreachable;
         }
+
+        // ── inversion ───────────────────────────────────────────────────────
+
+        /// `a⁻¹ mod m`: if `gcd(a, m) = 1`, writes the inverse (`< m`) to
+        /// `out` and returns `true`; else returns `false` (`out` then holds
+        /// garbage). `a < m`. Constant-time in `a` and in the modulus's value
+        /// up to that verdict; the work depends on the modulus's bit length
+        /// only.
+        ///
+        /// Bernstein–Yang divsteps ("Fast constant-time gcd computation and
+        /// modular inversion", 2019, §11), one step at a time: `f = m`,
+        /// `g = a`, `δ = 1`, and per step
+        ///
+        ///     if δ > 0 and g odd:  (δ, f, g) ← (1 − δ, g, (g − f)/2)
+        ///     elif g odd:          (δ, f, g) ← (1 + δ, f, (g + f)/2)
+        ///     else:                (δ, f, g) ← (1 + δ, f, g/2)
+        ///
+        /// with every branch a masked blend. `d`, `e` track `f ≡ d·a`,
+        /// `g ≡ e·a (mod m)`, the halving of `g` becoming a multiplication of
+        /// `e` by `2⁻¹ mod m`. After the paper's bound — `⌊(49b + 57)/17⌋`
+        /// steps for `b ≥ 46` bits, `⌊(49b + 80)/17⌋` below (Theorem 11.2,
+        /// `f² + 4g² ≤ 5·2^(2b)` holds for `0 ≤ g < f < 2^b`) — `g = 0` and
+        /// `f = ±gcd(a, m)`. The verdict checks both, so a bound that ever
+        /// fell short would refuse, not return a wrong inverse.
+        ///
+        /// One step at a time costs `O(b)` limb passes per step, `O(b²/64)`
+        /// in all — about 6 000 steps of 33-limb passes at 2048 bits. That
+        /// is for key setup and provers, not for a per-message hot path
+        /// (batched 62-step transition matrices are the Backlog item).
+        pub fn inverse(self: *const Self, a: *const Elem, out: *Elem) bool {
+            comptime var s: usize = min_limbs;
+            inline while (s <= max_limbs) : (s += step) {
+                if (s == self.L) return self.inverseSlot(s, a, out);
+            }
+            unreachable;
+        }
+
+        fn inverseSlot(self: *const Self, comptime s: usize, a: *const Elem, out: *Elem) bool {
+            const v = self.view(s);
+            const W = s + 1; // f, g: two's complement, one sign limb on top
+            var f = [_]u64{0} ** W;
+            f[0..s].* = self.m[0..s].*;
+            var g = [_]u64{0} ** W;
+            g[0..s].* = a[0..s].*;
+            var d = [_]u64{0} ** s;
+            var e = [_]u64{0} ** s;
+            e[0] = 1;
+            const zero_s = [_]u64{0} ** s;
+            defer std.crypto.secureZero(u64, &f);
+            defer std.crypto.secureZero(u64, &g);
+            defer std.crypto.secureZero(u64, &d);
+            defer std.crypto.secureZero(u64, &e);
+
+            // δ is a small signed counter (|δ| ≤ steps + 1); held as u64.
+            var delta: u64 = 1;
+            var k: usize = divstepCount(self.nbits);
+            while (k > 0) : (k -= 1) {
+                // δ > 0 ⟺ −δ < 0 (no overflow: δ is small).
+                const pos: u64 = @bitCast(@as(i64, @bitCast(0 -% delta)) >> 63);
+                const swap = blackBox(pos & (0 -% (g[0] & 1)));
+                delta = (delta ^ swap) -% swap; // δ ← −δ under swap
+                // (f, g) ← (g, −f), (d, e) ← (e, −d) under swap
+                condSwap(W, &f, &g, swap);
+                condNeg(W, &g, swap);
+                condSwap(s, &d, &e, swap);
+                const ne = v.sub(&zero_s, &e);
+                blend(s, &e, &ne, swap);
+                // g odd (always after a swap): g ← g + f, e ← e + d
+                const odd = blackBox(0 -% (g[0] & 1));
+                addMasked(W, &g, &f, odd);
+                const ed = v.add(&e, &d);
+                blend(s, &e, &ed, odd);
+                // g ← g/2 (exact), e ← e/2 mod m
+                sar1(W, &g);
+                halveMod(s, &e, self.m[0..s]);
+                delta +%= 1;
+            }
+
+            // g = 0 and f = ±1; the inverse is d·f.
+            var gz: u64 = 0;
+            for (g) |w| gz |= w;
+            var plus: u64 = f[0] ^ 1; // f = 1
+            var minus: u64 = ~f[0]; // f = −1 (all ones)
+            for (f[1..]) |w| {
+                plus |= w;
+                minus |= ~w;
+            }
+            const neg_f = blackBox(nzBit(minus) -% 1); // all ones iff f = −1
+            const nd = v.sub(&zero_s, &d);
+            blend(s, &d, &nd, neg_f);
+            out.* = zero;
+            out[0..s].* = d;
+            // ok ⟺ g = 0 and (f = 1 or f = −1)
+            const bad = nzBit(gz) | (nzBit(plus) & nzBit(minus));
+            return bad == 0;
+        }
+
+        /// `m⁻¹ mod n` for any `n ≥ 2` — **even included** — where `m` is
+        /// this modulus: if `gcd(m, n) = 1`, writes the inverse (`< n`) to
+        /// `out` and returns `true`; else returns `false` (`out` then holds
+        /// garbage). Constant-time in `n` and `m` up to that verdict. `n`
+        /// may be wider than `m` (an `Elem` of this type's full capacity).
+        ///
+        /// The even case is the one `inverse` cannot take (divsteps need an
+        /// odd modulus), and the one the callers have: `d = Ñ⁻¹ mod φ(Ñ)`,
+        /// `e⁻¹ mod (p − 1)`. It goes through the odd side instead: with
+        /// `z = n⁻¹ mod m` (`inverse`, on `n mod m`), `n·z = 1 + k·m` for an
+        /// integer `0 ≤ k < n`, and `m·(n − k) = n·m − n·z + 1 ≡ 1 (mod n)`.
+        /// `k = (n·z − 1)/m` is an exact division, done as a Hensel division
+        /// (a product with `m⁻¹ mod 2^(64·max_limbs)`, which holds all of
+        /// `k`), so the answer `n − k` needs no reduction modulo `n`.
+        pub fn inverseOfModulus(self: *const Self, n: *const Elem, out: *Elem) bool {
+            var r = self.reduceLimbs(n);
+            defer std.crypto.secureZero(u64, &r);
+            var z: Elem = undefined;
+            defer std.crypto.secureZero(u64, &z);
+            const ok = self.inverse(&r, &z);
+
+            var t: Elem = undefined;
+            defer std.crypto.secureZero(u64, &t);
+            mulLow(max_limbs, &t, n, &z); // n·z (< n·m, ≥ 1 when ok)
+            var one = zero;
+            one[0] = 1;
+            _ = limbs.subInto(&t, &one);
+            const minv = invPow2(max_limbs, &self.m, self.n0inv);
+            var kq: Elem = undefined;
+            defer std.crypto.secureZero(u64, &kq);
+            mulLow(max_limbs, &kq, &t, &minv); // k = (n·z − 1)/m
+            out.* = n.*;
+            _ = limbs.subInto(out, &kq);
+
+            // n ≥ 2: some bit above bit 0.
+            var hi: u64 = n[0] >> 1;
+            for (n[1..]) |w| hi |= w;
+            return (@intFromBool(ok) & nzBit(hi)) == 1;
+        }
     };
+}
+
+/// Divsteps that bring `g` to zero for `0 ≤ g < f < 2^b` (Bernstein–Yang
+/// Theorem 11.2; see `inverse`).
+fn divstepCount(b: usize) usize {
+    return if (b < 46) (49 * b + 80) / 17 else (49 * b + 57) / 17;
+}
+
+/// `m⁻¹ mod 2^(64n)` for an odd `m` (only its low `n` limbs are read), by
+/// Newton from the 64-bit inverse `−n0inv`, precision doubling each step;
+/// the step count depends on `n` only.
+fn invPow2(comptime n: usize, m: []const u64, n0inv: u64) [n]u64 {
+    var inv = [_]u64{0} ** n;
+    inv[0] = 0 -% n0inv;
+    const mm: *const [n]u64 = m[0..n];
+    var prec: usize = 64;
+    while (prec < 64 * n) : (prec *= 2) {
+        var t: [n]u64 = undefined;
+        mulLow(n, &t, mm, &inv); // m·y
+        var two = [_]u64{0} ** n;
+        two[0] = 2;
+        _ = limbs.subInto(&two, &t); // 2 − m·y
+        var y: [n]u64 = undefined;
+        mulLow(n, &y, &inv, &two);
+        inv = y;
+    }
+    return inv;
+}
+
+/// 1 if `x ≠ 0`, else 0, without a comparison.
+inline fn nzBit(x: u64) u64 {
+    return (x | (0 -% x)) >> 63;
+}
+
+/// `(x, y) ← (y, x)` under an all-ones `mask`, else unchanged.
+inline fn condSwap(comptime n: usize, x: *[n]u64, y: *[n]u64, mask: u64) void {
+    for (x, y) |*a, *b| {
+        const t = (a.* ^ b.*) & mask;
+        a.* ^= t;
+        b.* ^= t;
+    }
+}
+
+/// `x ← −x` (two's complement over `n` limbs) under an all-ones `mask`.
+inline fn condNeg(comptime n: usize, x: *[n]u64, mask: u64) void {
+    var carry: u64 = mask & 1;
+    for (x) |*w| {
+        const r = @addWithOverflow(w.* ^ mask, carry);
+        w.* = r[0];
+        carry = r[1];
+    }
+}
+
+/// `x ← x + (y & mask)` over `n` limbs (wrapping).
+inline fn addMasked(comptime n: usize, x: *[n]u64, y: *const [n]u64, mask: u64) void {
+    var carry: u1 = 0;
+    for (x, y) |*a, b| {
+        const r1 = @addWithOverflow(a.*, b & mask);
+        const r2 = @addWithOverflow(r1[0], carry);
+        a.* = r2[0];
+        carry = r1[1] | r2[1];
+    }
+}
+
+/// `x ← y` under an all-ones `mask`, else unchanged.
+inline fn blend(comptime n: usize, x: *[n]u64, y: *const [n]u64, mask: u64) void {
+    for (x, y) |*a, b| a.* = (b & mask) | (a.* & ~mask);
+}
+
+/// Arithmetic shift right by one over `n` two's-complement limbs.
+inline fn sar1(comptime n: usize, x: *[n]u64) void {
+    for (0..n - 1) |i| x[i] = (x[i] >> 1) | (x[i + 1] << 63);
+    x[n - 1] = @bitCast(@as(i64, @bitCast(x[n - 1])) >> 1);
+}
+
+/// `e ← e/2 mod m` for `e < m`, `m` odd: `(e + (m if e odd))/2`, the
+/// carry of the addition shifted back in on top.
+inline fn halveMod(comptime n: usize, e: *[n]u64, m: *const [n]u64) void {
+    const mask = blackBox(0 -% (e[0] & 1));
+    var carry: u1 = 0;
+    for (e, m) |*a, b| {
+        const r1 = @addWithOverflow(a.*, b & mask);
+        const r2 = @addWithOverflow(r1[0], carry);
+        a.* = r2[0];
+        carry = r1[1] | r2[1];
+    }
+    for (0..n - 1) |i| e[i] = (e[i] >> 1) | (e[i + 1] << 63);
+    e[n - 1] = (e[n - 1] >> 1) | (@as(u64, carry) << 63);
 }
 
 /// Optimization barrier, as `Modint`'s: an empty asm the optimizer cannot see
@@ -730,6 +939,160 @@ test "DynModint matches std.math.big.int (max 4096: 2..4096-bit moduli)" {
 
 test "DynModint matches std.math.big.int (max 8192, Paillier n² widths)" {
     try diffAgainstBigInt(8192, &.{ 2048, 4096, 8192 }, 0x64796e5f_38313932);
+}
+
+/// `gcd(a, b) == 1` through big.int.
+fn coprimeBig(gpa: std.mem.Allocator, a: *const Managed, b: *const Managed) !bool {
+    var g = try Managed.init(gpa);
+    defer g.deinit();
+    try g.gcd(a, b);
+    return g.toConst().orderAgainstScalar(1) == .eq;
+}
+
+/// `x·y mod m == 1` through big.int.
+fn isInverseBig(gpa: std.mem.Allocator, x: *const Managed, y: *const Managed, m: *const Managed) !bool {
+    var p = try Managed.init(gpa);
+    defer p.deinit();
+    try p.mul(x, y);
+    try reduceBig(gpa, &p, m);
+    return p.toConst().orderAgainstScalar(1) == .eq;
+}
+
+test "DynModint inverse: every a below every odd m < 512 (verdict = gcd, value = inverse)" {
+    const D = DynModint(256);
+    var mv = D.zero;
+    var m: u64 = 3;
+    while (m < 512) : (m += 2) {
+        mv[0] = m;
+        const mod = try D.fromLimbs(&mv);
+        var a: u64 = 0;
+        while (a < m) : (a += 1) {
+            var av = D.zero;
+            av[0] = a;
+            var y: D.Elem = undefined;
+            const ok = mod.inverse(&av, &y);
+            try testing.expectEqual(std.math.gcd(a, m) == 1, ok);
+            if (ok) {
+                try testing.expect(y[0] < m and D.isZero(&(y[1..].* ++ [_]u64{0})));
+                try testing.expectEqual(@as(u128, 1), @as(u128, a) * y[0] % m);
+            }
+        }
+    }
+}
+
+test "DynModint inverse matches std.math.big.int (64..4096-bit moduli, units and non-units)" {
+    const D = DynModint(4096);
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x696e_7665_7273_65);
+    const rnd = prng.random();
+    for ([_]usize{ 46, 47, 64, 65, 127, 256, 1000, 1024, 2048, 2047 + 64, 4096 }) |nbits| {
+        var round: usize = 0;
+        while (round < 4) : (round += 1) {
+            const mv = randModulus(D, rnd, nbits);
+            const mod = try D.fromLimbsBits(&mv, nbits);
+            var bm = try toBig(gpa, &mv);
+            defer bm.deinit();
+            const a = randBelow(D, rnd, &mod);
+            var ba = try toBig(gpa, &a);
+            defer ba.deinit();
+            var y: D.Elem = undefined;
+            const ok = mod.inverse(&a, &y);
+            try testing.expectEqual(try coprimeBig(gpa, &ba, &bm), ok);
+            if (ok) {
+                var by = try toBig(gpa, &y);
+                defer by.deinit();
+                try testing.expect(by.order(bm) == .lt);
+                try testing.expect(try isInverseBig(gpa, &ba, &by, &bm));
+            }
+            // a non-unit: m = 3·k, a = 3·j
+            var m3 = D.zero;
+            const k_limbs = (nbits - 2 + 63) / 64;
+            for (m3[0..k_limbs]) |*w| w.* = rnd.int(u64);
+            const rem = (nbits - 2) % 64;
+            if (rem != 0) m3[k_limbs - 1] &= (@as(u64, 1) << @intCast(rem)) - 1;
+            m3[0] |= 1;
+            var three = D.zero;
+            three[0] = 3;
+            var prod: [2 * D.max_limbs]u64 = undefined;
+            limbs.mulSchoolbook(&prod, &m3, &three);
+            const mod3 = try D.fromLimbs(prod[0..D.max_limbs]);
+            var a3 = D.zero;
+            a3[0] = 3 * @as(u64, rnd.int(u32) | 1);
+            try testing.expect(!mod3.inverse(&a3, &y));
+            try testing.expect(!mod.inverse(&D.zero, &y));
+        }
+    }
+}
+
+test "DynModint inverse edges: 1, m−1, 2 and the smallest modulus" {
+    const D = DynModint(1024);
+    var prng = std.Random.DefaultPrng.init(11);
+    const mv = randModulus(D, prng.random(), 1000);
+    const mod = try D.fromLimbs(&mv);
+    var one = D.zero;
+    one[0] = 1;
+    var y: D.Elem = undefined;
+    try testing.expect(mod.inverse(&one, &y) and D.eql(&y, &one));
+    var m1 = mv;
+    m1[0] -= 1;
+    try testing.expect(mod.inverse(&m1, &y) and D.eql(&y, &m1)); // (−1)⁻¹ = −1
+    var two = D.zero;
+    two[0] = 2;
+    try testing.expect(mod.inverse(&two, &y));
+    try testing.expect(D.eql(&mod.mul(&y, &two), &one));
+    var three = D.zero;
+    three[0] = 3;
+    const m3 = try D.fromLimbs(&three);
+    try testing.expect(m3.inverse(&two, &y) and y[0] == 2);
+}
+
+test "DynModint inverseOfModulus: m⁻¹ mod n for even and odd n of any width" {
+    const D = DynModint(4096);
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6576_656e_6d6f_64);
+    const rnd = prng.random();
+    // (bits of m, bits of n): a public exponent against p − 1, Ñ against
+    // φ(Ñ), and mixed widths both ways.
+    const shapes = [_][2]usize{ .{ 2, 64 }, .{ 17, 1024 }, .{ 17, 2048 }, .{ 2048, 2047 }, .{ 2048, 2048 }, .{ 1000, 4096 }, .{ 4096, 300 }, .{ 65, 65 }, .{ 300, 2 } };
+    for (shapes) |shape| {
+        var round: usize = 0;
+        while (round < 6) : (round += 1) {
+            const mv = randModulus(D, rnd, shape[0]);
+            const mod = try D.fromLimbs(&mv);
+            var n = randModulus(D, rnd, shape[1]);
+            if (round % 2 == 0) n[0] &= ~@as(u64, 1); // even half the time
+            var bm = try toBig(gpa, &mv);
+            defer bm.deinit();
+            var bn = try toBig(gpa, &n);
+            defer bn.deinit();
+            var y: D.Elem = undefined;
+            const ok = mod.inverseOfModulus(&n, &y);
+            const want_ok = (try coprimeBig(gpa, &bm, &bn)) and bn.toConst().orderAgainstScalar(2) != .lt;
+            try testing.expectEqual(want_ok, ok);
+            if (ok) {
+                var by = try toBig(gpa, &y);
+                defer by.deinit();
+                try testing.expect(by.order(bn) == .lt);
+                try testing.expect(try isInverseBig(gpa, &bm, &by, &bn));
+            }
+        }
+    }
+    // gcd > 1, n = 0, n = 1, n = 2
+    var e = D.zero;
+    e[0] = 65537;
+    const me = try D.fromLimbs(&e);
+    var n = D.zero;
+    var y: D.Elem = undefined;
+    n[0] = 65537 * 4;
+    try testing.expect(!me.inverseOfModulus(&n, &y));
+    n[0] = 0;
+    try testing.expect(!me.inverseOfModulus(&n, &y));
+    n[0] = 1;
+    try testing.expect(!me.inverseOfModulus(&n, &y));
+    n[0] = 2;
+    try testing.expect(me.inverseOfModulus(&n, &y) and y[0] == 1 and D.isZero(&(y[1..].* ++ [_]u64{0})));
+    n[0] = 65536; // 65537 ≡ 1 mod 2^16
+    try testing.expect(me.inverseOfModulus(&n, &y) and y[0] == 1);
 }
 
 test "DynModint std.crypto.ff bridge round-trips and matches ff's own encoding" {
