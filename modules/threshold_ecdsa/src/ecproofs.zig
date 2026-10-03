@@ -570,3 +570,25 @@ fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&d);
     _ = DleqProof.fromBytes(d) catch {};
 }
+
+test "DleqProof: each equation is load-bearing, and the challenge binds Σ" {
+    var prng = std.Random.DefaultPrng.init(0x646c_6571_32);
+    const random = prng.random();
+    const sigma = randomScalar(random);
+    const other = sigma.add(Scalar.one);
+    const r_point = pointOf(randomScalar(random));
+    const s_true = try Element.fromPoint(try (try r_point.point()).mul(sigma.toBytes(.big), .big));
+    const s_other = try Element.fromPoint(try (try r_point.point()).mul(other.toBytes(.big), .big));
+    // The witness matches Σ = σ'·G but S = σ·R: only S R-equation can refuse.
+    const split_s = try proveDleq(other, r_point, s_true, pointOf(other), "ctx", random);
+    try testing.expect(!verifyDleq(split_s, r_point, s_true, pointOf(other), "ctx"));
+    // The witness matches S = σ'·R but Σ = σ·G: only the G-equation can refuse.
+    const split_g = try proveDleq(other, r_point, s_other, pointOf(sigma), "ctx", random);
+    try testing.expect(!verifyDleq(split_g, r_point, s_other, pointOf(sigma), "ctx"));
+    // Control: a consistent statement verifies.
+    const ok = try proveDleq(other, r_point, s_other, pointOf(other), "ctx", random);
+    try testing.expect(verifyDleq(ok, r_point, s_other, pointOf(other), "ctx"));
+    // The challenge depends on Σ.
+    const a = pointOf(Scalar.one);
+    try testing.expect(!dleqChallenge("ctx", r_point, s_true, pointOf(sigma), a, a).equivalent(dleqChallenge("ctx", r_point, s_true, pointOf(other), a, a)));
+}

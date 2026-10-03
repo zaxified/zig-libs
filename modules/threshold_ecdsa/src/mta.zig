@@ -970,3 +970,64 @@ test "centeredModQ: a negative β' (wrapped plaintext) still yields α ≡ a·b 
     std.mem.writeInt(u512, &hi, n_int / 2 + 1, .big);
     try testing.expect(centeredModQ(&hi, &n).equivalent(zkproofs.scalarFromWide(&hi).sub(zkproofs.scalarFromWide(&n))));
 }
+
+test "mutation audit: the verified finalize centres a wrapped plaintext; the checked finalize is bound to the proof context" {
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    var kprng = std.Random.DefaultPrng.init(0x6d75_7461_7564_6974);
+    const krandom = kprng.random();
+    const kp = try paillier.generate(krandom, 2048);
+    var prng = std.Random.DefaultPrng.init(0x6d75_7461_7564_3032);
+    const random = prng.random();
+
+    // (1) A plaintext N - 500 (a negative β' mod N): the verified finalize
+    // reads it as -500, the plain one as the wrapped value.
+    var n_buf: [paillier.modulus_bytes]u8 = undefined;
+    const n_len = kp.public.nByteLen();
+    try kp.public.nToBytes(n_buf[0..n_len]);
+    var rem: u32 = 500;
+    var i = n_len;
+    while (i > 0 and rem != 0) {
+        i -= 1;
+        const sub: u32 = rem & 0xff;
+        rem >>= 8;
+        const cur: u32 = n_buf[i];
+        if (cur >= sub) {
+            n_buf[i] = @intCast(cur - sub);
+        } else {
+            n_buf[i] = @intCast(cur + 256 - sub);
+            rem += 1;
+        }
+    }
+    const m_fe = try paillier.Fe.fromBytes(kp.public.n_sq, n_buf[0..n_len], .big);
+    const c = try paillier.encrypt(kp.public, m_fe, samplePaillierRandomness(kp.public, random));
+    const want = zkproofs.scalarFromWide(&[_]u8{ 0x01, 0xf4 }).neg(); // -500 mod q
+    try testing.expect((try mtaAliceFinalizeVerified(c, kp.secret)).equivalent(want));
+    try testing.expect(!(try mtaAliceFinalize(c, kp.secret)).equivalent(want));
+
+    // (2) mtaAliceFinalizeChecked verifies under the context it is given.
+    const nt_kp = try paillier.generate(krandom, 2048);
+    var nt_buf: [paillier.modulus_bytes]u8 = undefined;
+    const nt_len = nt_kp.public.nByteLen();
+    nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;
+    var strip: usize = 0;
+    while (strip < nt_len and nt_buf[strip] == 0) : (strip += 1) {}
+    const n_tilde = root.AuxModulus.fromBytes(nt_buf[strip..nt_len], .big) catch unreachable;
+    const x_root = samplePaillierRandomness(nt_kp.public, random);
+    var x_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+    const nt_sq_len = (nt_kp.public.n_sq.bits() + 7) / 8;
+    x_root.toBytes(x_buf[0..nt_sq_len], .big) catch unreachable;
+    var xs: usize = 0;
+    while (xs < nt_sq_len and x_buf[xs] == 0) : (xs += 1) {}
+    const x_fe = root.AuxFe.fromBytes(n_tilde, x_buf[xs..nt_sq_len], .big) catch unreachable;
+    const h1 = n_tilde.sq(x_fe);
+    const aux: root.AuxParams = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = n_tilde.sq(h1) };
+
+    const a = scalarFromU64(0xa11ce);
+    const b = scalarFromU64(0xb0b);
+    const alice = try mtaAliceInitChecked(a, kp.public, random);
+    const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+    const proof = try zkproofs.proveBobMta(testing.allocator, b, &bob.beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, test_ctx, random);
+    defer proof.deinit(testing.allocator);
+    _ = try mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, kp.secret, kp.public, aux, test_ctx);
+    try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, proof, kp.secret, kp.public, aux, "another-context"));
+}

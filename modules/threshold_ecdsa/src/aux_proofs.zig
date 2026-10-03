@@ -2166,3 +2166,32 @@ test "review F3: Πmod refuses a round whose challenge y_i shares a factor with 
     try testing.expect(non_units > 0);
     try testing.expect(!Pimod.verify(aux, .{ .w = w, .entries = entries }));
 }
+
+test "mutation audit: Πmod refuses a modulus below 5 bits instead of looping in Miller-Rabin" {
+    const nt = root.AuxModulus.fromBytes(&[_]u8{3}, .big) catch unreachable;
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 2), .h2 = toyFe(nt, 2) };
+    var entries: [pi_mod_iterations]ModEntry = undefined;
+    for (&entries) |*e| e.* = .{ .x = toyFe(nt, 1), .z = toyFe(nt, 1), .a = false, .b = false };
+    const proof: ModProof = .{ .w = toyFe(nt, 2), .entries = entries };
+    // Without the width guard the witness range [2, N-2] is empty and
+    // `isProbablePrime` never returns (this call would hang, not fail).
+    try testing.expect(!Pimod.verify(aux, proof));
+    try testing.expect(!Pimod.verifyPaillier(nt, "ctx", proof));
+}
+
+test "mutation audit: verifyWellFormedBound runs the structural floor, honest bound proofs or not" {
+    if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x666c6f6f72); // "floor"
+    const random = prng.random();
+    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    defer gen.trapdoor.deinit(allocator);
+    const aux = gen.params;
+    const ctx = "floor-ctx";
+    const proof = try proveWellFormedBound(allocator, aux, gen.trapdoor, ctx, random);
+    // Both proofs verify on their own (a 128-bit Ñ is a fine toy modulus)…
+    try testing.expect(Piprm.verifyBound(aux, ctx, proof.prm));
+    try testing.expect(Pimod.verifyBound(aux, ctx, proof.mod));
+    // …but the tuple is far below the q⁷ floor and must be refused as a whole.
+    try testing.expectError(error.InvalidAuxParams, verifyWellFormedBound(aux, ctx, proof, random));
+}

@@ -1507,6 +1507,28 @@ pub const PartyPublicKeys = struct {
     message_key: [32]u8,
 };
 
+/// Decodes a message key: canonical, and not of small order. `presign`
+/// verifies message signatures with `verifyStrict`, but a small-order key
+/// is still refused at the door: under cofactored verification anyone could
+/// sign for it, and no honest key is one (review 2026-10-03 F10).
+pub fn decodeMessageKey(bytes: [32]u8) error{InvalidEncoding}!std.crypto.sign.Ed25519.PublicKey {
+    const key = std.crypto.sign.Ed25519.PublicKey.fromBytes(bytes) catch return error.InvalidEncoding;
+    const p = std.crypto.ecc.Edwards25519.fromBytes(bytes) catch return error.InvalidEncoding;
+    p.rejectLowOrder() catch return error.InvalidEncoding;
+    return key;
+}
+
+test "decodeMessageKey refuses small-order keys (review F10) and takes a real one" {
+    var order8: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&order8, "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a");
+    const order4: [32]u8 = @splat(0); // y = 0: the order-4 point (sqrt(-1), 0)
+    var identity: [32]u8 = @splat(0);
+    identity[0] = 1;
+    for ([_][32]u8{ order8, order4, identity }) |k| try std.testing.expectError(error.InvalidEncoding, decodeMessageKey(k));
+    const real = try messagePublicKey(@splat(7));
+    _ = try decodeMessageKey(real);
+}
+
 /// The Ed25519 public key of a message-signing seed (`KeyShare.message_seed`).
 pub fn messagePublicKey(seed: [32]u8) error{InvalidParameters}![32]u8 {
     const kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidParameters;
@@ -1618,7 +1640,7 @@ pub const PublicKeys = struct {
             if (bytes.len < offset + 32) return error.InvalidEncoding;
             const message_key = bytes[offset..][0..32].*;
             offset += 32;
-            _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(message_key) catch return error.InvalidEncoding;
+            _ = try decodeMessageKey(message_key);
 
             slot.* = .{ .index = index, .paillier_pk = pk, .aux = aux, .verifying_share = verifying_share, .message_key = message_key };
         }
@@ -2936,4 +2958,31 @@ test "bytesModCt equals % for every sieve prime, and sieveRejects finds a small 
     @memset(&mp, 0xff);
     mp[0] = 0x7f;
     try testing.expect(!sieveRejects(&mp));
+}
+
+test "KeyShare.fromBytesAlloc rejects a message seed that is not the one behind its own announced message key" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d73_6773_6565_64);
+    const random = prng.random();
+    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
+    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+    const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
+    const aux = toyAuxParams();
+    const aux_params = [_]AuxParams{ aux, aux };
+    const coeffs = [_]Scalar{testScalar(12)};
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, testScalar(11), &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+    defer allocator.free(key_shares);
+    defer allocator.free(key_shares[0].public_keys.entries);
+
+    const bytes = try key_shares[0].toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+    const back = try KeyShare.fromBytesAlloc(allocator, bytes);
+    allocator.free(back.public_keys.entries);
+    // The seed of party 1 is 32 x 0x01 (`test_message_seeds`); the announced
+    // keys are derived from it. Change the seed in the encoding only.
+    const at = std.mem.indexOf(u8, bytes, &test_message_seeds[0]) orelse return error.TestFixtureSeedNotFound;
+    const bad = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad);
+    bad[at] ^= 0x01;
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bad));
 }

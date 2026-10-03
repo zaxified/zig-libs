@@ -368,6 +368,21 @@ here.
 
 - ~~GJKR recovery branch~~ — done 2026-10-01 (`feldman_complaint` + `reveal` rounds).
 - ~~**Role-tagged sender for `ReshareReceiver`**~~ (review 2026-10-01, F7) ✅ 2026-10-02: `handle(from: ReshareSender, …)` — `.dealer`/`.receiver`; a frame whose kind does not match the role is `UnknownSender`, so new party `j` can no longer pass a broadcast off as old dealer `j` (tested both ways).
+- **Key confirmation after `EcdsaRefresh`** (review 2026-10-03 F6): agreement on the new
+  public-key table, the Feldman commitments and the dealer set rests on the transport's reliable
+  broadcast; only `Q` is compared. A transport that equivocates on one announcement leaves honest
+  parties with different "new" states, and the caller may already have erased the old share. Add a
+  confirmation round (broadcast `SHA-256(public_keys || commitments || dealers)`; erase the old
+  share only when every digest matches). Since F9 a split table at least fails at the first
+  presigning header instead of blaming a peer. Effort: small–medium.
+- **Session id in the Feldman/complaint/defense frames** (review 2026-10-03 F7): only the aux
+  proofs carry the session id; dealing frames are bound to a run by the transport alone. Frames of
+  an aborted run of the same epoch replay into the retry (no leak while one fresh honest dealer
+  takes part, but the refresh's freshness is lost). Bind the run id into every frame. Effort:
+  medium (wire change).
+- **Refresh with the old aux material** (review 2026-10-03 F14): `EcdsaRefresh` does not refuse a
+  `LocalAux` whose `N`/`Ñ`/message key equals the old one, and keygen and refresh announcements
+  share one context format (no protocol tag). Effort: small.
 - **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).

@@ -147,7 +147,7 @@ pub const Announcement = struct {
         const mod_n = aux_proofs.ModProof.fromBytesAlloc(n_mod, try readLenPrefixed(bytes, &off)) catch return error.InvalidEncoding;
         if (bytes.len - off != 32) return error.InvalidEncoding;
         const message_key = bytes[off..][0..32].*;
-        _ = std.crypto.sign.Ed25519.PublicKey.fromBytes(message_key) catch return error.InvalidEncoding;
+        _ = try root.decodeMessageKey(message_key);
         return .{ .paillier_pk = pk, .message_key = message_key, .aux = aux, .aux_proof = .{ .prm = prm, .mod = mod_aux }, .paillier_proof = mod_n };
     }
 };

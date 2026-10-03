@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-03** — **Review of the 2026-10-03 additions (BREAKING: fault set, session id).**
+  F1/F2: see the §4.3 entry below. `Party.collect` and `PresignaturePublic.combine` check the
+  signature first and drop what proves nothing about its claimed sender (garbage, forged headers,
+  bad signatures, replays, other rounds, sessions or recipients); an identical copy is skipped,
+  a second signed version is `duplicate_message`. Fault `bad_signature` is gone — such a sender
+  ends up `missing_message`. `Presignature.fromBytesAlloc` checks the relations of a finished
+  session (`r = R.x`, `ΣR̄ = G`, `ΣS = X`, `k·R = R̄_i`, `σ·R = S_i`). The presigning session id
+  (`session/v2`) also hashes the public-key table. New `root.decodeMessageKey` refuses
+  small-order message keys (codecs, `Party.init`); message signatures are checked with
+  `verifyStrict`.
 - **2026-10-03** — Key refresh: `dkg.EcdsaRefresh` gives every party a new share of the same
   key with new Paillier, ring-Pedersen and message keys (see `dkg`'s changelog).
 - **2026-10-03** — Presignatures can outlive their process: `Presignature.toBytesAlloc`/
@@ -16,8 +26,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   signer's opening and `Party.identify` checks everyone's and names the culprit. New:
   `ecproofs.DleqProof` (Chaum–Pedersen), `mta.decryptWithRandomness` (a decryption with its
   Paillier randomness, constant-time in λ). Tests: the δ and σ cheaters are named, and so is
-  a signer lying in its opening (wrong γ, a round-2 message its sender never signed, a false
-  `ν'`).
+  a signer lying in its opening (wrong γ, a round-2 message its sender never signed, a
+  decryption lifted by `N`). A type-7 opening never contains a signer's Bob masks `ν'`
+  (review 2026-10-03 F1: the first draft of this entry opened them, and with `k_j` and `μ'`
+  public that revealed every honest key share; never released).
 - **2026-10-03** — **BREAKING (wire v2, codecs, API): signed presigning messages, the
   equivocator is named.** `PartyPublicKeys.message_key` / `KeyShare.message_seed`
   (Ed25519); `keygenTrustedDealer` takes `message_seeds`, `aux_info.LocalAux` generates
