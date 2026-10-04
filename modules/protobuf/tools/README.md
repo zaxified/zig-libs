@@ -59,3 +59,11 @@ silently stops comparing what you think it compares.
   fields the reference reports as unknown because the tag was non-minimal), and
   failing on those would cry wolf every run. Read its buckets instead. `camp2.py`
   and `camp4.py` sit between the two — see their headers.
+
+## `gen_core_vectors.py` (2026-10-04)
+
+Recipe for `../src/testdata/core_vectors.zig`: the reference (Python `protobuf`, public API
+only, descriptors built at run time) on `oneof`, `map` and the well-known types — its bytes for
+messages built in the script, and its parse verdict (re-serialized) on hand-made non-canonical
+inputs. `python3 gen_core_vectors.py > ../src/testdata/core_vectors.zig && zig fmt ...`. The
+script's schema `core.C` must stay field for field identical to `core_test.zig`'s `C`.

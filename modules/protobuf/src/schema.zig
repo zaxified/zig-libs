@@ -86,7 +86,74 @@ pub const Field = struct {
     packed_encoding: ?bool = null,
 };
 
-pub const Cardinality = enum { singular, optional, repeated };
+/// `oneof`: one member of a `oneof` group — the Zig field is `?U` with `U`
+/// a `union(enum)`, and each member is an `Info` of its own.
+pub const Cardinality = enum { singular, optional, repeated, oneof };
+
+/// The `pb_fields` entry for a `oneof` group: the Zig field is `?U`, `U` a
+/// `union(enum)` that declares its own `pb_fields` — one `Field` per variant,
+/// each with its own field number:
+///
+/// ```zig
+/// choice: ?Choice = null,           // pb_fields: .choice = protobuf.oneof
+/// const Choice = union(enum) {
+///     id: i32,
+///     name: []const u8,
+///     point: Point,                 // a message member, by value
+///     pub const pb_fields = .{
+///         .id = Field{ .number = 4, .kind = .int32 },
+///         .name = Field{ .number = 5, .kind = .string },
+///         .point = Field{ .number = 6, .kind = .message },
+///     };
+/// };
+/// ```
+pub const Oneof = struct {};
+pub const oneof: Oneof = .{};
+
+/// True for a map entry type (`MapEntry(..)`, or any message that declares
+/// `pub const pb_map_entry = true`): a `[]const E` field of kind `.message`
+/// is then a proto3 `map<K, V>`.
+pub fn isMapEntry(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "pb_map_entry") and T.pb_map_entry;
+}
+
+/// The entry message of a proto3 `map<K, V>` field: `key = 1`, `value = 2`.
+/// Declare the map field as `[]const MapEntry(..)` with `kind = .message`.
+/// On the wire a map is exactly a repeated entry message (the encoding spec's
+/// own definition); what makes it a map is two rules this type switches on:
+/// both key and value are always written (the reference writes `0a 00` for
+/// an empty-string key), and on decode a repeated key keeps its first
+/// position and takes the last value ("the last key seen is used").
+/// `key_kind` may be any integer kind, `bool` or `string` (the spec rules out
+/// floats, bytes, enums and messages as keys); a message value is held by
+/// value, not optional — an entry without one reads as the empty message.
+pub fn MapEntry(comptime key_kind: Kind, comptime K: type, comptime value_kind: Kind, comptime V: type) type {
+    switch (key_kind) {
+        .double, .float, .bytes, .message, .@"enum" => @compileError("protobuf: a map key cannot be ." ++ @tagName(key_kind)),
+        else => {},
+    }
+    return struct {
+        key: K = defaultOf(key_kind, K),
+        value: V = defaultOf(value_kind, V),
+
+        pub const pb_map_entry = true;
+        pub const pb_fields = .{
+            .key = Field{ .number = 1, .kind = key_kind },
+            .value = Field{ .number = 2, .kind = value_kind },
+        };
+    };
+}
+
+fn defaultOf(comptime kind: Kind, comptime T: type) T {
+    return switch (kind) {
+        .string, .bytes => "",
+        .bool => false,
+        .@"enum" => @enumFromInt(0),
+        .message => .{},
+        .float, .double => 0.0,
+        else => 0,
+    };
+}
 
 /// A field descriptor after derivation: descriptor + what the Zig type said.
 pub const Info = struct {
@@ -100,6 +167,9 @@ pub const Info = struct {
     /// The field is `?*const T` — a boxed singular submessage, the shape a
     /// self-recursive message needs.
     boxed: bool,
+    /// For a `.oneof` member: the message struct's field (`?U`) it lives in;
+    /// `name` is then the union variant.
+    oneof_field: []const u8 = "",
 };
 
 /// Carrier for fields the decoder did not recognise.
@@ -132,6 +202,21 @@ fn typeName(comptime T: type) []const u8 {
 /// Derive the full field table for message `T`. Comptime-only (it carries
 /// `type` values), consumed exclusively by `inline for`.
 pub fn infos(comptime T: type) []const Info {
+    return comptime infosImpl(T);
+}
+
+fn oneofMembers(comptime Desc: type, comptime struct_fields: anytype) usize {
+    var n: usize = 0;
+    for (struct_fields) |sf| {
+        if (@hasField(Desc, sf.name) and @FieldType(Desc, sf.name) == Oneof) {
+            const U = @typeInfo(sf.type).optional.child;
+            n += @typeInfo(U).@"union".fields.len;
+        }
+    }
+    return n;
+}
+
+fn infosImpl(comptime T: type) []const Info {
     comptime {
         // Derivation is O(fields^2) in the duplicate-number check and runs
         // once per message type. 20_000 was not enough for a message with
@@ -153,8 +238,9 @@ pub fn infos(comptime T: type) []const Info {
         const desc_fields = @typeInfo(Desc).@"struct".fields;
         const struct_fields = @typeInfo(T).@"struct".fields;
 
-        var out: [desc_fields.len]Info = undefined;
+        var out: [desc_fields.len + oneofMembers(Desc, struct_fields)]Info = undefined;
         var n: usize = 0;
+        var oneof_groups: usize = 0;
 
         for (struct_fields) |sf| {
             if (sf.type == Unknown) {
@@ -171,6 +257,38 @@ pub fn infos(comptime T: type) []const Info {
                 @compileError("protobuf: " ++ typeName(T) ++ "." ++ sf.name ++
                     " needs a default value — the decoder starts from `T{}` so an absent field keeps proto3's default");
 
+            if (@TypeOf(@field(T.pb_fields, sf.name)) == Oneof) {
+                const where = "protobuf: " ++ typeName(T) ++ "." ++ sf.name;
+                const ti = @typeInfo(sf.type);
+                if (ti != .optional or @typeInfo(ti.optional.child) != .@"union" or
+                    @typeInfo(ti.optional.child).@"union".tag_type == null)
+                    @compileError(where ++ ": a oneof is a ?U with U a union(enum), got " ++ typeName(sf.type));
+                const U = ti.optional.child;
+                if (!@hasDecl(U, "pb_fields"))
+                    @compileError(where ++ ": the oneof union " ++ typeName(U) ++ " has no `pub const pb_fields`");
+                for (@typeInfo(U).@"union".fields) |uf| {
+                    if (!@hasField(@TypeOf(U.pb_fields), uf.name))
+                        @compileError(where ++ ": oneof member ." ++ uf.name ++ " has no pb_fields entry");
+                    const md: Field = @field(U.pb_fields, uf.name);
+                    validateNumber(U, uf.name, md.number);
+                    if (md.packed_encoding != null)
+                        @compileError(where ++ ": oneof member ." ++ uf.name ++ " is singular and cannot be packed");
+                    checkElem(where ++ "." ++ uf.name, uf.type, md.kind);
+                    out[n] = .{
+                        .name = uf.name,
+                        .number = md.number,
+                        .kind = md.kind,
+                        .card = .oneof,
+                        .is_packed = false,
+                        .Elem = uf.type,
+                        .boxed = false,
+                        .oneof_field = sf.name,
+                    };
+                    n += 1;
+                }
+                oneof_groups += 1;
+                continue;
+            }
             const desc: Field = @field(T.pb_fields, sf.name);
             validateNumber(T, sf.name, desc.number);
             const shape = classify(T, sf.name, sf.type, desc.kind);
@@ -191,7 +309,13 @@ pub fn infos(comptime T: type) []const Info {
             n += 1;
         }
 
-        if (n != desc_fields.len) {
+        if (isMapEntry(T)) {
+            if (n != 2 or out[0].number + out[1].number != 3 or out[0].number * out[1].number != 2 or
+                out[0].card != .singular or out[1].card != .singular)
+                @compileError("protobuf: map entry " ++ typeName(T) ++ " must have exactly singular key = 1 and value = 2");
+        }
+
+        if (n - oneofMembersCount(out[0..n]) + oneof_groups != desc_fields.len) {
             // Some pb_fields entry names a field that does not exist.
             for (desc_fields) |df| {
                 if (!@hasField(T, df.name))
@@ -211,6 +335,14 @@ pub fn infos(comptime T: type) []const Info {
         const frozen = out[0..n].*;
         return &frozen;
     }
+}
+
+fn oneofMembersCount(comptime list: []const Info) usize {
+    var k: usize = 0;
+    for (list) |i| {
+        if (i.card == .oneof) k += 1;
+    }
+    return k;
 }
 
 fn numStr(comptime n: u32) []const u8 {
@@ -266,6 +398,13 @@ fn classify(
         const Child = @typeInfo(FieldType).pointer.child;
         checkElem(where, Child, kind);
         return .{ .card = .repeated, .Elem = Child, .boxed = false };
+    }
+
+    // A map entry's message value is held by value: the entry always carries
+    // one on the wire, and an absent one reads as the empty message.
+    if (kind == .message and isMapEntry(T)) {
+        checkElem(where, FieldType, kind);
+        return .{ .card = .singular, .Elem = FieldType, .boxed = false };
     }
 
     if (kind == .message)

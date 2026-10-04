@@ -18,7 +18,7 @@ a loop, and embedded-message nesting is capped.
 Provenance: the protobuf encoding specification is a public specification (merger doctrine —
 CONVENTIONS.md §5); clean-room, no third-party source ported. The Python `protobuf` package is
 run as a black-box test oracle only. No NOTICE entry needed. Test data:
-`src/testdata/reference.py` is this repo's own script (`SPDX-License-Identifier:
+`tools/reference.py` is this repo's own script (`SPDX-License-Identifier:
 MIT`) that drives that oracle; it reproduces none of the `protobuf` package.
 
 ## Declaring a message
@@ -136,6 +136,42 @@ defer partial.deinit();
 const forwarded = try protobuf.encodeAlloc(gpa, partial.value, .{}); // still carries the rest
 ```
 
+## `oneof`, `map`, well-known types
+
+```zig
+const Labels = protobuf.MapEntry(.string, []const u8, .int32, i32); // map<string, int32>
+
+const Req = struct {
+    labels: []const Labels = &.{},        // a map: kind = .message on []const MapEntry(..)
+    target: ?Target = null,               // a oneof: ?U, U a union(enum) with its own pb_fields
+    when: ?protobuf.wkt.Timestamp = null, // well-known types are ordinary messages
+    pub const pb_fields = .{
+        .labels = protobuf.Field{ .number = 1, .kind = .message },
+        .target = protobuf.oneof,
+        .when = protobuf.Field{ .number = 4, .kind = .message },
+    };
+    const Target = union(enum) {
+        id: u64,
+        name: []const u8,
+        pub const pb_fields = .{
+            .id = protobuf.Field{ .number = 2, .kind = .uint64 },
+            .name = protobuf.Field{ .number = 3, .kind = .string },
+        };
+    };
+};
+```
+
+- **`oneof`**: the set member is always written (explicit presence, even `0` or `""`); on decode
+  the last member on the wire wins, and a message member that appears again while still set is
+  merged into itself — a different member in between starts it afresh (the reference's rule).
+- **`map<K, V>`** (`MapEntry(key_kind, K, value_kind, V)`): key and value are always written;
+  on decode a repeated key keeps its first position and takes its last value; an entry missing its
+  key or value reads as the default. Entries are encoded in slice order — `protobuf.sortMap(E,
+  entries)` gives the reference's deterministic (key-sorted) order.
+- **`protobuf.wkt`**: `Timestamp` (`fromUnixNanos`, `toUnixNanos`, `isValid`), `Duration`
+  (`fromNanos`, `toNanos`, `isValid`), `Empty`, the nine wrappers, `FieldMask`, `Any` (`pack`,
+  `unpack`, `is`, `typeName`), and `Struct` / `Value` / `ListValue` / `NullValue`.
+
 ## Verify
 
 ```bash
@@ -162,8 +198,16 @@ reference's parser verdict on the 8 non-canonical byte strings) — and `golden_
 `interop_replay_test.zig` replay both. `zig build check-interop` compiles the program without
 running it, so it cannot rot unnoticed.
 
+`tools/gen_core_vectors.py` (2026-10-04) freezes the reference's bytes and parse verdicts for
+`oneof`, `map` and the well-known types into `testdata/core_vectors.zig` (replayed by
+`core_test.zig`). `fuzz_test.zig` is a deterministic fuzz driver (`PROTOBUF_FUZZ=<runs>[,<seed>]`,
+testkit) over random maps/oneofs/`Struct` documents damaged at tags, lengths and duplicated
+fields: no crash, hang or leak, intact input round-trips byte for byte, every accepted input is a
+fixed point after one re-encode, no decoded map keeps a duplicate key. 300 seeds run in every
+test run.
+
 ## Not implemented
 
-Groups (wire types 3/4, removed in proto3), `map<k,v>` (its wire form is a repeated submessage;
-express it that way for now), `Any`/`oneof`/well-known types, the canonical JSON mapping, and
-`.proto`-to-Zig code generation. See SPEC.md for why each, and for the threat model.
+Groups (wire types 3/4, removed in proto3), proto2 extensions and `required`, the canonical JSON
+and text mappings (including the well-known types' JSON forms), descriptors/reflection, streaming
+decode, and `.proto`-to-Zig code generation (a separate project, by decision). See SPEC.md for why each, and for the threat model.

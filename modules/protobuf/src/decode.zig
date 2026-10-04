@@ -238,7 +238,21 @@ fn Lists(comptime T: type) type {
         var types: [inf.len + 1]type = undefined;
         var attrs: [inf.len + 1]Attrs = undefined;
         var n: usize = 0;
-        for (inf) |i| {
+        for (inf, 0..) |i, at| {
+            if (i.card == .oneof) {
+                // One `OneofBuf` per oneof group, named after the group's
+                // field, added at the group's first member.
+                const first = for (inf[0..at]) |prev| {
+                    if (prev.card == .oneof and std.mem.eql(u8, prev.oneof_field, i.oneof_field)) break false;
+                } else true;
+                if (first) {
+                    names[n] = i.oneof_field;
+                    types[n] = OneofBuf;
+                    attrs[n] = .{ .default_value_ptr = emptyOneofBufPtr() };
+                    n += 1;
+                }
+                continue;
+            }
             if (i.card != .repeated) {
                 if (i.kind == .message) {
                     names[n] = i.name;
@@ -275,6 +289,23 @@ fn emptyListPtr(comptime L: type) *const anyopaque {
 
 fn emptyMergeBufPtr() *const anyopaque {
     const d: MergeBuf = .{};
+    return @ptrCast(&d);
+}
+
+/// The pending message member of a `oneof` group. The spec's rule: of all
+/// members seen on the wire the LAST one wins, and a message member that
+/// appears again while it is still the set member is MERGED into itself
+/// (`MergeFrom`) — so a different member in between starts it afresh
+/// (verified against the reference: `22 02 08 01  10 07  22 02 10 05` reads
+/// as `c { y: 5 }`, without the `x: 1` of the first occurrence). `member` is
+/// the field number of the message member being gathered, 0 for none.
+const OneofBuf = struct {
+    buf: MergeBuf = .{},
+    member: u32 = 0,
+};
+
+fn emptyOneofBufPtr() *const anyopaque {
+    const d: OneofBuf = .{};
     return @ptrCast(&d);
 }
 
@@ -321,8 +352,18 @@ fn decodeMessage(
     }
 
     inline for (comptime schema.infos(T)) |info| {
-        if (info.card == .repeated) {
-            @field(out, info.name) = try @field(lists, info.name).toOwnedSlice(arena);
+        if (info.card == .oneof) {
+            if (comptime info.kind == .message) {
+                const ob = &@field(lists, info.oneof_field);
+                if (ob.member == info.number) {
+                    var sub = Cursor.init(ob.buf.bytes().?);
+                    const v = try decodeMessage(info.Elem, arena, &sub, options, depth + 1);
+                    @field(out, info.oneof_field) = @unionInit(@typeInfo(@FieldType(T, info.oneof_field)).optional.child, info.name, v);
+                }
+            }
+        } else if (info.card == .repeated) {
+            const items = try @field(lists, info.name).toOwnedSlice(arena);
+            @field(out, info.name) = if (comptime schema.isMapEntry(info.Elem)) try dedupeMap(info.Elem, arena, items) else items;
         } else if (info.kind == .message) {
             // Every occurrence of this field, concatenated, decoded once —
             // which is exactly `MergeFrom` over the occurrences. See MergeBuf.
@@ -367,6 +408,25 @@ fn readField(
 ) Error!void {
     const E = info.Elem;
 
+    if (info.card == .oneof) {
+        const U = @typeInfo(@FieldType(T, info.oneof_field)).optional.child;
+        const ob = &@field(lists, info.oneof_field);
+        if (comptime info.kind == .message) {
+            const n = try cur.varint();
+            const payload = try cur.take(n);
+            if (ob.member != info.number) ob.* = .{ .member = info.number };
+            try ob.buf.add(arena, payload);
+            // Decided after the last tag (see OneofBuf); a later scalar
+            // member overwrites this and clears `member`.
+            @field(out.*, info.oneof_field) = null;
+        } else {
+            const v = try readValue(info.kind, E, arena, cur, options, depth);
+            ob.* = .{};
+            @field(out.*, info.oneof_field) = @unionInit(U, info.name, v);
+        }
+        return;
+    }
+
     if (info.card == .repeated) {
         // Which form arrived is decided by the wire type, not by what this
         // side would have emitted — `accepts` let both through on purpose.
@@ -409,8 +469,54 @@ fn readField(
         } else {
             @field(out, info.name) = v;
         },
-        .repeated => comptime unreachable,
+        .repeated, .oneof => comptime unreachable,
     }
+}
+
+/// proto3 map semantics over the decoded entries: a key seen again keeps its
+/// first position and takes the later value ("the last key seen is used";
+/// the reference's dict does the same). Sort-based, O(n log n) with no
+/// hashing — the keys are the sender's, so a hash table would be a
+/// collision target — and allocation only for the index array.
+fn dedupeMap(comptime E: type, arena: std.mem.Allocator, items: []E) error{OutOfMemory}![]E {
+    if (items.len < 2) return items;
+    const idx = try arena.alloc(u32, items.len);
+    for (idx, 0..) |*x, i| x.* = @intCast(i);
+    const Ctx = struct {
+        items: []E,
+        fn lessThan(c: @This(), a: u32, b: u32) bool {
+            return switch (keyOrder(c.items[a].key, c.items[b].key)) {
+                .lt => true,
+                .gt => false,
+                .eq => a < b,
+            };
+        }
+    };
+    std.mem.sort(u32, idx, Ctx{ .items = items }, Ctx.lessThan);
+    // Within a run of equal keys (ascending original position), the first
+    // keeps its slot and takes the last one's value; the rest are dropped.
+    const keep = try arena.alloc(bool, items.len);
+    @memset(keep, false);
+    var i: usize = 0;
+    while (i < idx.len) {
+        var j = i + 1;
+        while (j < idx.len and keyOrder(items[idx[i]].key, items[idx[j]].key) == .eq) j += 1;
+        keep[idx[i]] = true;
+        items[idx[i]].value = items[idx[j - 1]].value;
+        i = j;
+    }
+    var n: usize = 0;
+    for (items, keep) |it, k| if (k) {
+        items[n] = it;
+        n += 1;
+    };
+    return items[0..n];
+}
+
+fn keyOrder(a: anytype, b: @TypeOf(a)) std.math.Order {
+    if (@TypeOf(a) == []const u8) return std.mem.order(u8, a, b);
+    if (@TypeOf(a) == bool) return std.math.order(@intFromBool(a), @intFromBool(b));
+    return std.math.order(a, b);
 }
 
 fn readValue(
@@ -815,4 +921,16 @@ test "corpus: the depth seeds drive both sides of the boundary, and the counts a
     try std.testing.expectEqual(depth_seeds.len - 1, nonempty); // all but the empty script
     try std.testing.expectEqual(@as(usize, 2), over);
     try std.testing.expectEqual(@as(usize, 200), deepest);
+}
+
+/// Sort a map's entries by key, in place — the order the reference's
+/// deterministic serialization (`SerializeToString(deterministic=True)`)
+/// writes. The encoder itself writes entries in slice order.
+pub fn sortMap(comptime E: type, items: []E) void {
+    comptime std.debug.assert(schema.isMapEntry(E));
+    std.mem.sort(E, items, {}, struct {
+        fn lessThan(_: void, a: E, b: E) bool {
+            return keyOrder(a.key, b.key) == .lt;
+        }
+    }.lessThan);
 }

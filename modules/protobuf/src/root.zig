@@ -34,15 +34,17 @@
 //! declared length is validated against the bytes actually remaining before
 //! it can size an allocation or bound a loop, and embedded-message nesting
 //! is capped (`DecodeOptions.max_depth`). See SPEC.md for the threat model
-//! and for what is deliberately not implemented (groups, maps, Any/JSON
-//! mapping, `.proto` code generation).
+//! and for what is deliberately not implemented (groups, proto2 extensions,
+//! the JSON and text mappings, `.proto` code generation). `oneof` (a Zig
+//! tagged union), `map<K, V>` (`MapEntry`) and the well-known types (`wkt`)
+//! are supported.
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened.",
+    .doc = "Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -71,6 +73,20 @@ pub const Kind = schema.Kind;
 pub const Unknown = schema.Unknown;
 /// Derived field table — exposed for tooling/introspection, comptime-only.
 pub const infos = schema.infos;
+/// `pb_fields` entry for a `oneof` group (`?U`, `U` a `union(enum)` with its
+/// own `pb_fields`); `Oneof` is its type.
+pub const oneof = schema.oneof;
+pub const Oneof = schema.Oneof;
+/// The entry message of a `map<K, V>` field (`[]const MapEntry(..)`, kind
+/// `.message`).
+pub const MapEntry = schema.MapEntry;
+pub const isMapEntry = schema.isMapEntry;
+/// Sort a map's entries by key — the reference's deterministic order.
+pub const sortMap = decode_mod.sortMap;
+
+/// Well-known types: Timestamp, Duration, Empty, wrappers, FieldMask, Any,
+/// Struct/Value/ListValue/NullValue.
+pub const wkt = @import("wkt.zig");
 
 // ── wire primitives ─────────────────────────────────────────────────────────
 
@@ -120,6 +136,9 @@ test {
     _ = @import("adversarial.zig");
     _ = @import("golden_test.zig");
     _ = @import("interop_replay_test.zig");
+    _ = @import("wkt.zig");
+    _ = @import("core_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "readme example round trips" {

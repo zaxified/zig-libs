@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core** (reference: protocolbuffers/protobuf).
+  - **New:** `oneof` — a `?U` field with `U` a `union(enum)` declaring its own `pb_fields`, entry
+    `protobuf.oneof` in the message's `pb_fields`; set member always written; decode keeps the last
+    member and merges a message member only with itself. `map<K, V>` — `MapEntry(key_kind, K,
+    value_kind, V)` (or any message with `pub const pb_map_entry = true`) as `[]const E`, kind
+    `.message`; key and value always written; a repeated key keeps its first position and takes
+    the last value (sort-based, O(n log n), no hashing of sender-chosen keys). `sortMap`.
+    `wkt`: Timestamp, Duration, Empty, the wrappers, FieldMask, Any (pack/unpack/is/typeName),
+    Struct/Value/ListValue/NullValue.
+  - **API change:** `Cardinality` gained `.oneof` and `Info` gained `oneof_field` (an exhaustive
+    `switch (info.card)` needs the new arm; none outside this module exists).
+  - **Evidence:** the reference (Python `protobuf`) as a black-box oracle,
+    `tools/gen_core_vectors.py` → `testdata/core_vectors.zig`: 25 map/oneof inputs with its parse
+    verdicts (duplicate keys, entries missing key/value, oneof switches and merges), three messages
+    built field for field, every WKT's bytes, FromNanoseconds splits. Fuzz driver
+    (`PROTOBUF_FUZZ`) 600 000 runs clean. Mutation 24 mutants, all killed (3 by tests the run asked
+    for).
+
 - **2026-09-15** — **PERFORMANCE, no API/behaviour change:** audit F6, hybrid (coordinator review
   rejected the first, unconditional cache — see below). `encodeAlloc`'s first, allocation-free
   sizing pass now also tracks the deepest nesting seen (free — `depth` was already threaded

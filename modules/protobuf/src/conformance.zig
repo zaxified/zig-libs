@@ -431,9 +431,17 @@ pub const vectors = @import("testdata/interop_vectors.zig");
 
 pub fn expectMessageEqual(comptime T: type, want: T, got: T) !void {
     inline for (comptime pb.infos(T)) |info| {
-        const a = @field(want, info.name);
-        const b = @field(got, info.name);
+        const a = @field(want, if (info.card == .oneof) info.oneof_field else info.name);
+        const b = @field(got, if (info.card == .oneof) info.oneof_field else info.name);
         switch (info.card) {
+            .oneof => {
+                try testing.expect((a == null) == (b == null));
+                if (a != null) {
+                    try testing.expectEqual(std.meta.activeTag(a.?), std.meta.activeTag(b.?));
+                    if (std.meta.activeTag(a.?) == @field(std.meta.Tag(@TypeOf(a.?)), info.name))
+                        try expectElemEqual(info.kind, info.Elem, @field(a.?, info.name), @field(b.?, info.name));
+                }
+            },
             .singular => try expectElemEqual(info.kind, info.Elem, a, b),
             .optional => {
                 if (a == null or b == null) {

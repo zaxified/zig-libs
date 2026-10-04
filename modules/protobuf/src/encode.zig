@@ -239,12 +239,21 @@ fn messageSize(
     var total: usize = 0;
 
     inline for (comptime schema.infos(T)) |info| {
-        const f = @field(value, info.name);
+        const f = @field(value, if (info.card == .oneof) info.oneof_field else info.name);
         switch (info.card) {
             .singular => {
-                if (!isDefault(info.kind, info.Elem, f))
+                // A map entry writes key and value always (see MapEntry).
+                if ((comptime schema.isMapEntry(T)) or !isDefault(info.kind, info.Elem, f))
                     total += wire.tagLen(info.number, info.kind.wireType()) +
                         try valueSize(info.kind, info.Elem, f, options, depth, mode, ctx);
+            },
+            .oneof => {
+                // Explicit presence: the set member is written even when it
+                // holds its type's default (the reference writes `10 00`).
+                if (f) |u| if (std.meta.activeTag(u) == @field(std.meta.Tag(@TypeOf(u)), info.name)) {
+                    total += wire.tagLen(info.number, info.kind.wireType()) +
+                        try valueSize(info.kind, info.Elem, @field(u, info.name), options, depth, mode, ctx);
+                };
             },
             .optional => {
                 if (f) |present| {
@@ -329,13 +338,19 @@ fn emitMessage(comptime T: type, value: T, e: *wire.Emitter, options: Options, d
     // outcome, because there is no reachable path where it would have fired.
 
     inline for (comptime schema.infos(T)) |info| {
-        const f = @field(value, info.name);
+        const f = @field(value, if (info.card == .oneof) info.oneof_field else info.name);
         switch (info.card) {
             .singular => {
-                if (!isDefault(info.kind, info.Elem, f)) {
+                if ((comptime schema.isMapEntry(T)) or !isDefault(info.kind, info.Elem, f)) {
                     e.tag(info.number, info.kind.wireType());
                     try emitValue(info.kind, info.Elem, f, e, options, depth, cache);
                 }
+            },
+            .oneof => {
+                if (f) |u| if (std.meta.activeTag(u) == @field(std.meta.Tag(@TypeOf(u)), info.name)) {
+                    e.tag(info.number, info.kind.wireType());
+                    try emitValue(info.kind, info.Elem, @field(u, info.name), e, options, depth, cache);
+                };
             },
             .optional => {
                 if (f) |present| {
