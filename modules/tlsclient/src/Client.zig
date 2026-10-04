@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) Zig contributors -- a copy of Zig 0.16.0's
 // lib/std/crypto/tls/Client.zig; see ../NOTICE. Changed by zig-libs: the
-// std import, and the server Certificate message handler (search for
-// "zig-libs tlsclient"). Everything else is Zig's.
+// std import, the server Certificate message handler, and two additions
+// that are off by default -- ALPN (RFC 7301) and TLS 1.3 client
+// certificates (RFC 8446 §4.4.2-4.4.3). Every change is marked
+// "zig-libs tlsclient". Everything else is Zig's.
 
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
@@ -56,6 +58,10 @@ application_cipher: tls.ApplicationCipher,
 /// allows other programs with access to that file to decrypt all traffic over
 /// this connection.
 ssl_key_log: ?*SslKeyLog,
+
+// zig-libs tlsclient: ALPN. The protocol the server selected, borrowed from
+// `Options.alpn_protocols` (null: none offered, or the server chose none).
+alpn_protocol: ?[]const u8 = null,
 
 pub const ReadError = error{
     /// The alert description will be stored in `alert`.
@@ -143,7 +149,58 @@ pub const Options = struct {
     /// Populated when `error.TlsAlert` is returned from `init`.
     alert: ?*tls.Alert = null,
 
+    // zig-libs tlsclient: additions. Both default to off, and with the
+    // defaults the handshake is byte-for-byte std's.
+
+    /// ALPN (RFC 7301): the application protocols to offer, most preferred
+    /// first (e.g. `&.{ "h2", "http/1.1" }`). Empty (the default): no
+    /// extension is sent and a server's ALPN reply is ignored, as in std.
+    /// Each name is 1..255 bytes; the list at most `max_alpn_len` bytes on
+    /// the wire. The server's choice is `Client.alpn_protocol`; a choice not
+    /// offered is `error.TlsIllegalParameter`. Borrowed for the connection.
+    alpn_protocols: []const []const u8 = &.{},
+    /// A client certificate for a TLS 1.3 server that sends a
+    /// CertificateRequest. Null (the default): such a request is
+    /// `error.TlsUnexpectedMessage`, as in std. Set: the chain is sent and
+    /// signed for with `key`; when the request's signature_algorithms do not
+    /// include `key`'s scheme, an empty Certificate is sent (RFC 8446
+    /// §4.4.2.3) and the server decides. TLS 1.2 client authentication is
+    /// not implemented (a TLS 1.2 CertificateRequest stays an error).
+    client_auth: ?ClientAuth = null,
+
     pub const entropy_len = 240;
+};
+
+// zig-libs tlsclient: ALPN and client-certificate types.
+
+/// Longest ALPN extension payload offered (the protocol_name_list).
+pub const max_alpn_len = 512;
+/// Most bytes of client Certificate + CertificateVerify messages.
+pub const max_client_auth_len = 16 * 1024;
+
+pub const ClientAuth = struct {
+    /// DER certificates, leaf first. Borrowed during `init`.
+    certificate_chain: []const []const u8,
+    /// The leaf's private key. Copied into short-lived locals while signing
+    /// and wiped after; the caller owns (and wipes) this value.
+    key: PrivateKey,
+
+    pub const PrivateKey = union(enum) {
+        /// P-256 scalar, big-endian (SEC1). Signs `ecdsa_secp256r1_sha256`.
+        ecdsa_secp256r1_sha256: [32]u8,
+        /// P-384 scalar, big-endian. Signs `ecdsa_secp384r1_sha384`.
+        ecdsa_secp384r1_sha384: [48]u8,
+        /// Ed25519 seed (RFC 8032 private key). Signs `ed25519`.
+        ed25519: [32]u8,
+
+        pub fn scheme(k: *const PrivateKey) tls.SignatureScheme {
+            return switch (k.*) {
+                .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
+                .ecdsa_secp384r1_sha384 => .ecdsa_secp384r1_sha384,
+                .ed25519 => .ed25519,
+            };
+        }
+    };
 };
 
 pub const InitError = error{
@@ -192,6 +249,13 @@ pub const InitError = error{
     NotSquare,
     NonCanonical,
     WeakPublicKey,
+    // zig-libs tlsclient: additions, reachable only through the new options.
+    /// An empty or over-255-byte name, or a list over `max_alpn_len`.
+    AlpnProtocolsInvalid,
+    /// The client chain does not fit `max_client_auth_len`, or is empty.
+    ClientCertificateTooLarge,
+    /// `ClientAuth.key` is not a valid key for its curve.
+    ClientKeyInvalid,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
@@ -289,11 +353,37 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .explicit => &cleartext_header_buf,
     };
 
+    // zig-libs tlsclient: ALPN. With no protocols the ClientHello is std's,
+    // byte for byte. Otherwise the extension goes last (after the host
+    // name) and the three length fields in front of it grow by its size.
+    var alpn_ext_buf: [4 + 2 + max_alpn_len]u8 = undefined;
+    const alpn_ext = try alpnExtension(&alpn_ext_buf, options.alpn_protocols);
+    var patched_header_buf: [cleartext_header_buf.len]u8 = undefined;
+    const hello_header: []const u8 = if (alpn_ext.len == 0) cleartext_header else blk: {
+        const h = patched_header_buf[0..cleartext_header.len];
+        @memcpy(h, cleartext_header);
+        const ext_len_at = tls.record_header_len + 4 + 2 + 32 + 1 + 32 + cipher_suites.len + 2;
+        const grow: u16 = @intCast(alpn_ext.len);
+        mem.writeInt(u16, h[3..5], mem.readInt(u16, h[3..5], .big) + grow, .big);
+        mem.writeInt(u24, h[6..9], mem.readInt(u24, h[6..9], .big) + grow, .big);
+        mem.writeInt(u16, h[ext_len_at..][0..2], mem.readInt(u16, h[ext_len_at..][0..2], .big) + grow, .big);
+        break :blk h;
+    };
+
     {
-        var iovecs: [2][]const u8 = .{ cleartext_header, host };
-        try output.writeVecAll(iovecs[0..if (host.len == 0) 1 else 2]);
+        var iovecs: [3][]const u8 = .{ hello_header, host, alpn_ext };
+        var n: usize = 0;
+        for (iovecs) |v| {
+            if (v.len == 0) continue;
+            iovecs[n] = v;
+            n += 1;
+        }
+        try output.writeVecAll(iovecs[0..n]);
         try output.flush();
     }
+    // zig-libs tlsclient: client authentication -- the server's
+    // CertificateRequest, when one came.
+    var cert_request: ?CertRequest = null;
 
     var tls_version: tls.ProtocolVersion = undefined;
     var chain: Certificate.Chain = if (Certificate.Chain != void) .empty;
@@ -336,6 +426,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         finished,
     };
     var handshake_state: HandshakeState = .hello;
+    // zig-libs tlsclient: ALPN -- the server's choice, one of ours.
+    var alpn_selected: ?[]const u8 = null;
     var handshake_cipher: tls.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
@@ -472,6 +564,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         const cipher_suite_tag = hsd.decode(tls.CipherSuite);
                         hsd.skip(1); // legacy_compression_method
                         var supported_version: ?u16 = null;
+                        // zig-libs tlsclient: ALPN.
+                        var alpn_seen = false;
                         if (!hsd.eof()) {
                             try hsd.ensure(2);
                             const extensions_size = hsd.decode(u16);
@@ -494,6 +588,12 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         const key_size = extd.decode(u16);
                                         try extd.ensure(key_size);
                                         try key_share.exchange(named_group, extd.slice(key_size));
+                                    },
+                                    // zig-libs tlsclient: ALPN (TLS 1.2 answers in ServerHello).
+                                    .application_layer_protocol_negotiation => if (options.alpn_protocols.len != 0) {
+                                        if (alpn_seen) return error.TlsIllegalParameter;
+                                        alpn_seen = true;
+                                        alpn_selected = try alpnSelected(options.alpn_protocols, extd.rest());
                                     },
                                     else => {},
                                 }
@@ -524,8 +624,9 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     .version = undefined,
                                 });
                                 const p = &@field(handshake_cipher, @tagName(tag.with()));
-                                p.transcript_hash.update(cleartext_header[tls.record_header_len..]); // Client Hello part 1
+                                p.transcript_hash.update(hello_header[tls.record_header_len..]); // Client Hello part 1
                                 p.transcript_hash.update(host); // Client Hello part 2
+                                p.transcript_hash.update(alpn_ext); // zig-libs tlsclient: ALPN (empty when off)
                                 p.transcript_hash.update(wrapped_handshake);
                             },
 
@@ -593,16 +694,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         try hsd.ensure(2);
                         const total_ext_size = hsd.decode(u16);
                         var all_extd = try hsd.sub(total_ext_size);
-                        while (!all_extd.eof()) {
-                            try all_extd.ensure(4);
-                            const et = all_extd.decode(tls.ExtensionType);
-                            const ext_size = all_extd.decode(u16);
-                            const extd = try all_extd.sub(ext_size);
-                            _ = extd;
-                            switch (et) {
-                                .server_name => {},
-                                else => {},
-                            }
+                        // zig-libs tlsclient: ALPN (TLS 1.3 answers in
+                        // EncryptedExtensions); std's loop read nothing.
+                        if (try encryptedExtensionsAlpn(&all_extd, options.alpn_protocols)) |sel| {
+                            if (alpn_selected != null) return error.TlsIllegalParameter;
+                            alpn_selected = sel;
                         }
                         handshake_state = .certificate;
                     },
@@ -706,6 +802,19 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
 
                         cert_buf_index += 1;
+                    },
+                    // zig-libs tlsclient: client authentication. Without
+                    // `client_auth`, or in TLS 1.2, this is std's
+                    // TlsUnexpectedMessage.
+                    .certificate_request => {
+                        const auth = if (options.client_auth) |*a| a else return error.TlsUnexpectedMessage;
+                        if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
+                        if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
+                        if (handshake_state != .certificate or cert_request != null) return error.TlsUnexpectedMessage;
+                        switch (handshake_cipher) {
+                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                        }
+                        cert_request = try parseCertRequest(&hsd, auth.key.scheme());
                     },
                     .server_key_exchange => {
                         if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
@@ -862,8 +971,21 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     p.transcript_hash.update(wrapped_handshake);
                                     const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
-                                    const handshake_hash = p.transcript_hash.finalResult();
-                                    const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
+                                    // zig-libs tlsclient: `peek`, not std's
+                                    // `finalResult` (the same digest) -- client
+                                    // authentication extends the transcript.
+                                    const handshake_hash = p.transcript_hash.peek();
+                                    // zig-libs tlsclient: client authentication.
+                                    // The application secrets stay on the
+                                    // transcript through the server Finished;
+                                    // the client Finished covers our
+                                    // Certificate and CertificateVerify too.
+                                    var auth_buf: [max_client_auth_len]u8 = undefined;
+                                    const auth_msgs: []const u8 = if (cert_request) |*req|
+                                        try clientAuthMessages(&auth_buf, req, &options.client_auth.?, &p.transcript_hash)
+                                    else
+                                        "";
+                                    const verify_data = tls.hmac(P.Hmac, &p.transcript_hash.peek(), pv.client_finished_key);
                                     const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
                                         array(u24, u8, verify_data) ++
                                         .{@intFromEnum(tls.ContentType.handshake)};
@@ -880,12 +1002,21 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     const nonce = pv.client_handshake_iv;
                                     P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
 
-                                    var all_msgs_vec: [2][]const u8 = .{
-                                        &client_change_cipher_spec_msg,
-                                        &finished_msg,
-                                    };
-                                    try output.writeVecAll(&all_msgs_vec);
-                                    try output.flush();
+                                    if (auth_msgs.len == 0) {
+                                        var all_msgs_vec: [2][]const u8 = .{
+                                            &client_change_cipher_spec_msg,
+                                            &finished_msg,
+                                        };
+                                        try output.writeVecAll(&all_msgs_vec);
+                                        try output.flush();
+                                    } else {
+                                        // zig-libs tlsclient: client authentication --
+                                        // Certificate, CertificateVerify and Finished
+                                        // under the handshake key, sequence 0, 1, ….
+                                        try output.writeAll(&client_change_cipher_spec_msg);
+                                        try writeHandshakeRecords(P, output, &.{ auth_msgs, out_cleartext[0 .. out_cleartext.len - 1] }, pv.client_handshake_key, pv.client_handshake_iv);
+                                        try output.flush();
+                                    }
 
                                     const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
                                     const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
@@ -956,6 +1087,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .allow_truncation_attacks = options.allow_truncation_attacks,
                             .application_cipher = app_cipher,
                             .ssl_key_log = options.ssl_key_log,
+                            .alpn_protocol = alpn_selected, // zig-libs tlsclient: ALPN
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -968,6 +1100,209 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         cleartext_fragment_start = 0;
         cleartext_fragment_end = 0;
     }
+}
+
+// ── zig-libs tlsclient: ALPN and client-certificate helpers ──────────────
+
+/// The ALPN extension (type, length, protocol_name_list) for `protocols`,
+/// or "" when there are none.
+fn alpnExtension(buf: *[4 + 2 + max_alpn_len]u8, protocols: []const []const u8) error{AlpnProtocolsInvalid}![]const u8 {
+    if (protocols.len == 0) return "";
+    var n: usize = 6;
+    for (protocols) |p| {
+        if (p.len == 0 or p.len > 255 or n + 1 + p.len > buf.len) return error.AlpnProtocolsInvalid;
+        buf[n] = @intCast(p.len);
+        @memcpy(buf[n + 1 ..][0..p.len], p);
+        n += 1 + p.len;
+    }
+    mem.writeInt(u16, buf[0..2], @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation), .big);
+    mem.writeInt(u16, buf[2..4], @intCast(n - 4), .big);
+    mem.writeInt(u16, buf[4..6], @intCast(n - 6), .big);
+    return buf[0..n];
+}
+
+/// The ALPN choice in an EncryptedExtensions block (null: none, or none
+/// offered -- then a server's answer is ignored, as std ignores it). The
+/// extension twice is `TlsIllegalParameter` (RFC 8446 §4.2).
+fn encryptedExtensionsAlpn(all_extd: *tls.Decoder, offered: []const []const u8) !?[]const u8 {
+    var selected: ?[]const u8 = null;
+    while (!all_extd.eof()) {
+        try all_extd.ensure(4);
+        const et = all_extd.decode(tls.ExtensionType);
+        const ext_size = all_extd.decode(u16);
+        const extd = try all_extd.sub(ext_size);
+        if (et != .application_layer_protocol_negotiation or offered.len == 0) continue;
+        if (selected != null) return error.TlsIllegalParameter;
+        selected = try alpnSelected(offered, extd.rest());
+    }
+    return selected;
+}
+
+/// The server's ALPN answer (RFC 7301 §3.1: a protocol_name_list holding
+/// exactly one name) resolved to the offered entry it names. Anything else
+/// -- a list of zero or several names, trailing bytes, a name we did not
+/// offer -- is `TlsIllegalParameter` (§3.2's illegal_parameter).
+fn alpnSelected(offered: []const []const u8, ext: []const u8) error{TlsIllegalParameter}![]const u8 {
+    if (ext.len < 3) return error.TlsIllegalParameter;
+    const list_len = mem.readInt(u16, ext[0..2], .big);
+    if (list_len != ext.len - 2) return error.TlsIllegalParameter;
+    // An empty name cannot match: every offered one is 1..255 bytes.
+    if (3 + @as(usize, ext[2]) != ext.len) return error.TlsIllegalParameter;
+    const name = ext[3..];
+    for (offered) |o| if (mem.eql(u8, o, name)) return o;
+    return error.TlsIllegalParameter;
+}
+
+const CertRequest = struct {
+    context: [255]u8 = undefined,
+    context_len: u8 = 0,
+    /// The request's signature_algorithms list includes our key's scheme.
+    scheme_ok: bool = false,
+};
+
+/// A TLS 1.3 CertificateRequest (RFC 8446 §4.3.2): the context, and
+/// whether `ours` is among its signature_algorithms. The extension is
+/// mandatory there; without it, or with it twice, the request is refused.
+fn parseCertRequest(hsd: *tls.Decoder, ours: tls.SignatureScheme) !CertRequest {
+    var req: CertRequest = .{};
+    try hsd.ensure(1);
+    req.context_len = hsd.decode(u8);
+    try hsd.ensure(@as(usize, req.context_len) + 2);
+    @memcpy(req.context[0..req.context_len], hsd.slice(req.context_len));
+    const ext_len = hsd.decode(u16);
+    var all_extd = try hsd.sub(ext_len);
+    var seen = false;
+    while (!all_extd.eof()) {
+        try all_extd.ensure(4);
+        const et = all_extd.decode(tls.ExtensionType);
+        const size = all_extd.decode(u16);
+        var extd = try all_extd.sub(size);
+        if (et != .signature_algorithms) continue;
+        if (seen) return error.TlsIllegalParameter;
+        seen = true;
+        try extd.ensure(2);
+        const list_len = extd.decode(u16);
+        if (list_len % 2 != 0) return error.TlsDecodeError;
+        try extd.ensure(list_len);
+        var i: usize = 0;
+        while (i < list_len) : (i += 2) {
+            if (extd.decode(tls.SignatureScheme) == ours) req.scheme_ok = true;
+        }
+    }
+    if (!seen) return error.TlsIllegalParameter;
+    return req;
+}
+
+/// The client's Certificate (and, when the request accepts our scheme, a
+/// CertificateVerify) into `buf`, each mixed into `transcript` as written.
+/// RFC 8446 §4.4.2.3: with no acceptable certificate the client sends an
+/// empty Certificate and no CertificateVerify -- the server then decides
+/// (openssl `-verify` proceeds, `-Verify` aborts with certificate_required).
+fn clientAuthMessages(buf: *[max_client_auth_len]u8, req: *const CertRequest, auth: *const ClientAuth, transcript: anytype) ![]const u8 {
+    var w: Writer = .fixed(buf);
+    const send_chain = req.scheme_ok and auth.certificate_chain.len != 0;
+    // Certificate (§4.4.2).
+    var list_len: usize = 0;
+    if (send_chain) for (auth.certificate_chain) |der| {
+        if (der.len == 0) return error.ClientCertificateTooLarge;
+        list_len += 3 + der.len + 2;
+    };
+    const cert_body = 1 + @as(usize, req.context_len) + 3 + list_len;
+    if (4 + cert_body > buf.len) return error.ClientCertificateTooLarge;
+    w.writeByte(@intFromEnum(tls.HandshakeType.certificate)) catch unreachable;
+    w.writeInt(u24, @intCast(cert_body), .big) catch unreachable;
+    w.writeByte(req.context_len) catch unreachable;
+    w.writeAll(req.context[0..req.context_len]) catch unreachable;
+    w.writeInt(u24, @intCast(list_len), .big) catch unreachable;
+    if (send_chain) for (auth.certificate_chain) |der| {
+        w.writeInt(u24, @intCast(der.len), .big) catch unreachable;
+        w.writeAll(der) catch unreachable;
+        w.writeInt(u16, 0, .big) catch unreachable; // no CertificateEntry extensions
+    };
+    transcript.update(w.buffered());
+    if (!send_chain) return w.buffered();
+
+    // CertificateVerify (§4.4.3): the signature covers 64 spaces, the
+    // context string, a zero byte and the transcript hash through our
+    // Certificate.
+    const cv_start = w.end;
+    const content = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00";
+    var msg: [content.len + 64]u8 = undefined;
+    const th = transcript.peek();
+    @memcpy(msg[0..content.len], content);
+    @memcpy(msg[content.len..][0..th.len], &th);
+    const signed = msg[0 .. content.len + th.len];
+    var sig_buf: [160]u8 = undefined;
+    const sig = try signCertificateVerify(&sig_buf, &auth.key, signed);
+    if (w.end + 4 + 4 + sig.len > buf.len) return error.ClientCertificateTooLarge;
+    w.writeByte(@intFromEnum(tls.HandshakeType.certificate_verify)) catch unreachable;
+    w.writeInt(u24, @intCast(4 + sig.len), .big) catch unreachable;
+    w.writeInt(u16, @intFromEnum(auth.key.scheme()), .big) catch unreachable;
+    w.writeInt(u16, @intCast(sig.len), .big) catch unreachable;
+    w.writeAll(sig) catch unreachable;
+    transcript.update(w.buffered()[cv_start..]);
+    return w.buffered();
+}
+
+/// Sign with the client key; every copy of the secret made here is wiped
+/// before return. ECDSA is RFC 6979 deterministic (no noise), DER-encoded
+/// as TLS wants; Ed25519 is RFC 8032.
+fn signCertificateVerify(out: *[160]u8, key: *const ClientAuth.PrivateKey, msg: []const u8) error{ClientKeyInvalid}![]const u8 {
+    switch (key.*) {
+        inline .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => |*raw, tag| {
+            const E = if (tag == .ecdsa_secp256r1_sha256) crypto.sign.ecdsa.EcdsaP256Sha256 else crypto.sign.ecdsa.EcdsaP384Sha384;
+            var sk = E.SecretKey.fromBytes(raw.*) catch return error.ClientKeyInvalid;
+            defer crypto.secureZero(u8, mem.asBytes(&sk));
+            var kp = E.KeyPair.fromSecretKey(sk) catch return error.ClientKeyInvalid;
+            defer crypto.secureZero(u8, mem.asBytes(&kp));
+            const sig = kp.sign(msg, null) catch return error.ClientKeyInvalid;
+            var der: [E.Signature.der_encoded_length_max]u8 = undefined;
+            const d = sig.toDer(&der);
+            @memcpy(out[0..d.len], d);
+            return out[0..d.len];
+        },
+        .ed25519 => |*seed| {
+            var kp = crypto.sign.Ed25519.KeyPair.generateDeterministic(seed.*) catch return error.ClientKeyInvalid;
+            defer crypto.secureZero(u8, mem.asBytes(&kp));
+            const sig = (kp.sign(msg, null) catch return error.ClientKeyInvalid).toBytes();
+            @memcpy(out[0..64], &sig);
+            return out[0..64];
+        },
+    }
+}
+
+/// Encrypt the concatenated handshake `parts` into TLS 1.3 records of at
+/// most 2^14 plaintext bytes each, sequence numbers from 0 (RFC 8446 §5.2).
+fn writeHandshakeRecords(comptime P: type, output: *Writer, parts: []const []const u8, key: [P.AEAD.key_length]u8, iv: [P.AEAD.nonce_length]u8) Writer.Error!void {
+    var all: [max_client_auth_len + 4 + 64]u8 = undefined;
+    var n: usize = 0;
+    for (parts) |part| {
+        @memcpy(all[n..][0..part.len], part);
+        n += part.len;
+    }
+    var seq: u64 = 0;
+    var off: usize = 0;
+    while (off < n) : (seq += 1) {
+        const chunk = all[off..@min(n, off + tls.max_ciphertext_inner_record_len - 1)];
+        off += chunk.len;
+        var inner: [tls.max_ciphertext_inner_record_len]u8 = undefined;
+        @memcpy(inner[0..chunk.len], chunk);
+        inner[chunk.len] = @intFromEnum(tls.ContentType.handshake);
+        const pt = inner[0 .. chunk.len + 1];
+        var rec: [@as(usize, tls.record_header_len) + tls.max_ciphertext_inner_record_len + P.AEAD.tag_length]u8 = undefined;
+        rec[0] = @intFromEnum(tls.ContentType.application_data);
+        mem.writeInt(u16, rec[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
+        mem.writeInt(u16, rec[3..5], @intCast(pt.len + P.AEAD.tag_length), .big);
+        const nonce = nonce: {
+            const V = @Vector(P.AEAD.nonce_length, u8);
+            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+            const operand: V = pad ++ @as([8]u8, @bitCast(big(seq)));
+            break :nonce @as(V, iv) ^ operand;
+        };
+        P.AEAD.encrypt(rec[5..][0..pt.len], rec[5 + pt.len ..][0..P.AEAD.tag_length], pt, rec[0..5], nonce, key);
+        try output.writeAll(rec[0 .. 5 + pt.len + P.AEAD.tag_length]);
+    }
+    crypto.secureZero(u8, all[0..n]);
 }
 
 fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
@@ -1674,3 +2009,194 @@ else
         .AES_256_GCM_SHA384,
         .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     });
+
+// ── zig-libs tlsclient: unit tests for the additions ──────────────────────
+
+test "alpnSelected: exactly one offered name, nothing else (RFC 7301 §3.1-3.2)" {
+    const offered = [_][]const u8{ "h2", "http/1.1" };
+    try std.testing.expectEqualStrings("h2", try alpnSelected(&offered, "\x00\x03\x02h2"));
+    try std.testing.expectEqualStrings("http/1.1", try alpnSelected(&offered, "\x00\x09\x08http/1.1"));
+    const bad = [_][]const u8{
+        "\x00\x03\x02h3", // not offered
+        "\x00\x06\x02h2\x02h2", // two names
+        "\x00\x01\x00", // an empty name
+        "\x00\x04\x02h2", // list length over the data
+        "\x00\x03\x02h2x", // trailing byte
+        "\x00\x03\x03h2", // name length over the data
+        "",
+        "\x00",
+        "\x00\x00",
+    };
+    for (bad) |b| try std.testing.expectError(error.TlsIllegalParameter, alpnSelected(&offered, b));
+}
+
+test "parseCertRequest: context, our scheme, mandatory signature_algorithms" {
+    // context "ab"; extensions: signature_algorithms [ecdsa_secp384r1_sha384, ed25519]
+    var good = "\x02ab\x00\x0a\x00\x0d\x00\x06\x00\x04\x05\x03\x08\x07".*;
+    var d: tls.Decoder = .fromTheirSlice(&good);
+    const r = try parseCertRequest(&d, .ed25519);
+    try std.testing.expectEqualStrings("ab", r.context[0..r.context_len]);
+    try std.testing.expect(r.scheme_ok);
+    var good2 = good;
+    d = .fromTheirSlice(&good2);
+    try std.testing.expect(!(try parseCertRequest(&d, .ecdsa_secp256r1_sha256)).scheme_ok);
+    // No signature_algorithms extension at all.
+    var none = "\x00\x00\x04\x00\x2f\x00\x00".*;
+    d = .fromTheirSlice(&none);
+    try std.testing.expectError(error.TlsIllegalParameter, parseCertRequest(&d, .ed25519));
+    // The extension twice.
+    var twice = "\x00\x00\x10\x00\x0d\x00\x04\x00\x02\x08\x07\x00\x0d\x00\x04\x00\x02\x08\x07".*;
+    d = .fromTheirSlice(&twice);
+    try std.testing.expectError(error.TlsIllegalParameter, parseCertRequest(&d, .ed25519));
+    // An odd list length; a truncated context.
+    var odd = "\x00\x00\x07\x00\x0d\x00\x03\x00\x01\x08".*;
+    d = .fromTheirSlice(&odd);
+    try std.testing.expectError(error.TlsDecodeError, parseCertRequest(&d, .ed25519));
+    var short = "\x05ab".*;
+    d = .fromTheirSlice(&short);
+    if (parseCertRequest(&d, .ed25519)) |_| return error.TestExpectedError else |_| {}
+}
+
+test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public key" {
+    // The signed bytes must be 64 spaces, the client context string, 0x00
+    // and the transcript hash; an independent verifier over exactly that
+    // content accepts the signature, one over the server string does not.
+    var req: CertRequest = .{ .scheme_ok = true };
+    req.context_len = 0;
+    const seed = [_]u8{7} ** 32;
+    const kp = try crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = .{ .ed25519 = seed } };
+    var th = crypto.hash.sha2.Sha256.init(.{});
+    th.update("transcript so far");
+    var buf: [max_client_auth_len]u8 = undefined;
+    const msgs = try clientAuthMessages(&buf, &req, &auth, &th);
+    // Certificate: type 0b, length 11 = context length (1) + list length
+    // (3) + one entry (3 + 2 + 2); empty context, list length 7, entry
+    // length 2, the DER 30 00, no extensions.
+    try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x0b\x00\x00\x00\x07\x00\x00\x02\x30\x00\x00\x00", msgs[0..15]);
+    const cv = msgs[15..];
+    try std.testing.expectEqual(@as(u8, 15), cv[0]);
+    try std.testing.expectEqual(@as(u16, 0x0807), mem.readInt(u16, cv[4..6], .big));
+    const sig = crypto.sign.Ed25519.Signature.fromBytes(cv[8..72].*);
+    var h2 = crypto.hash.sha2.Sha256.init(.{});
+    h2.update("transcript so far");
+    h2.update(msgs[0..15]);
+    const digest = h2.finalResult();
+    try sig.verify(" " ** 64 ++ "TLS 1.3, client CertificateVerify\x00" ++ digest, kp.public_key);
+    try std.testing.expectError(error.SignatureVerificationFailed, sig.verify(" " ** 64 ++ "TLS 1.3, server CertificateVerify\x00" ++ digest, kp.public_key));
+    // Without our scheme: an empty Certificate and nothing else.
+    var th2 = crypto.hash.sha2.Sha256.init(.{});
+    const empty = try clientAuthMessages(&buf, &CertRequest{ .scheme_ok = false }, &auth, &th2);
+    try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x04\x00\x00\x00\x00", empty);
+}
+
+test "client Certificate echoes the request context (RFC 8446 §4.4.2)" {
+    var req: CertRequest = .{ .scheme_ok = false, .context_len = 3 };
+    @memcpy(req.context[0..3], "xyz");
+    const auth: ClientAuth = .{ .certificate_chain = &.{"\x30\x00"}, .key = .{ .ed25519 = [_]u8{7} ** 32 } };
+    var th = crypto.hash.sha2.Sha256.init(.{});
+    var buf: [max_client_auth_len]u8 = undefined;
+    // Empty Certificate: type 0b, length 7 = 1 + 3 (context) + 3 (empty list).
+    try std.testing.expectEqualSlices(u8, "\x0b\x00\x00\x07\x03xyz\x00\x00\x00", try clientAuthMessages(&buf, &req, &auth, &th));
+}
+
+test "writeHandshakeRecords: over 2^14 - 1 bytes splits into records with sequence 0, 1" {
+    // Decrypted independently, record by record, with the RFC 8446 §5.3
+    // per-record nonce (iv XOR big-endian sequence number).
+    const A = crypto.aead.aes_gcm.Aes128Gcm;
+    const P = struct {
+        const AEAD = A;
+    };
+    const key = [_]u8{1} ** A.key_length;
+    const iv = [_]u8{2} ** A.nonce_length;
+    // Just over one record's 2^14 - 1 handshake bytes, within what the
+    // function is ever given (client auth messages + Finished).
+    var payload: [16400]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    var out_buf: [2 * (5 + 16384 + 16)]u8 = undefined;
+    var w: Writer = .fixed(&out_buf);
+    try writeHandshakeRecords(P, &w, &.{ payload[0..12000], payload[12000..] }, key, iv);
+    var rest = w.buffered();
+    var got: [16400]u8 = undefined;
+    var n: usize = 0;
+    var seq: u64 = 0;
+    while (rest.len > 0) : (seq += 1) {
+        const len = mem.readInt(u16, rest[3..5], .big);
+        try std.testing.expectEqual(@as(u8, 23), rest[0]);
+        const body = rest[5..][0..len];
+        var nonce = iv;
+        for (nonce[4..], mem.toBytes(mem.nativeToBig(u64, seq))) |*x, y| x.* ^= y;
+        var pt: [16384 + 1]u8 = undefined;
+        try A.decrypt(pt[0 .. len - 16], body[0 .. len - 16], body[len - 16 ..][0..16].*, rest[0..5], nonce, key);
+        try std.testing.expectEqual(@as(u8, 22), pt[len - 17]); // inner content type: handshake
+        @memcpy(got[n..][0 .. len - 17], pt[0 .. len - 17]);
+        n += len - 17;
+        rest = rest[5 + len ..];
+    }
+    try std.testing.expectEqual(@as(u64, 2), seq);
+    try std.testing.expectEqualSlices(u8, &payload, got[0..n]);
+}
+
+test "encryptedExtensionsAlpn: one answer, or none; twice is refused" {
+    const offered = [_][]const u8{"h2"};
+    // server_name (empty) + ALPN "h2".
+    var one = "\x00\x00\x00\x00\x00\x10\x00\x05\x00\x03\x02h2".*;
+    var d: tls.Decoder = .fromTheirSlice(&one);
+    try std.testing.expectEqualStrings("h2", (try encryptedExtensionsAlpn(&d, &offered)).?);
+    // Not offered anything: the server's answer is ignored, as std does.
+    var one2 = one;
+    d = .fromTheirSlice(&one2);
+    try std.testing.expectEqual(@as(?[]const u8, null), try encryptedExtensionsAlpn(&d, &.{}));
+    var twice = "\x00\x10\x00\x05\x00\x03\x02h2\x00\x10\x00\x05\x00\x03\x02h2".*;
+    d = .fromTheirSlice(&twice);
+    try std.testing.expectError(error.TlsIllegalParameter, encryptedExtensionsAlpn(&d, &offered));
+    var none = "\x00\x00\x00\x00".*;
+    d = .fromTheirSlice(&none);
+    try std.testing.expectEqual(@as(?[]const u8, null), try encryptedExtensionsAlpn(&d, &offered));
+}
+
+test "sweep: the server-controlled ALPN and CertificateRequest parsers on damaged input" {
+    // Valid encodings damaged at random (a byte set, flipped or dropped,
+    // length fields aimed at), seeded and deterministic. Every result is a
+    // clean error or a value within the input's promises: an ALPN choice is
+    // always one of ours, a request context never over 255 bytes.
+    const offered = [_][]const u8{ "h2", "http/1.1" };
+    const ee = "\x00\x10\x00\x0b\x00\x09\x08http/1.1\x00\x00\x00\x00";
+    const cr = "\x02ab\x00\x0a\x00\x0d\x00\x06\x00\x04\x05\x03\x08\x07";
+    var reach = [_]usize{ 0, 0, 0, 0 };
+    for (0..20_000) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        const src: []const u8 = if (seed % 2 == 0) ee else cr;
+        var buf: [64]u8 = undefined;
+        @memcpy(buf[0..src.len], src);
+        var len = src.len;
+        for (0..r.intRangeAtMost(usize, 1, 3)) |_| {
+            switch (r.uintLessThan(u8, 4)) {
+                0 => buf[r.uintLessThan(usize, len)] = r.int(u8),
+                1 => buf[r.uintLessThan(usize, len)] ^= @as(u8, 1) << r.int(u3),
+                2 => buf[r.uintLessThan(usize, @min(len, 8))] = r.uintLessThan(u8, 12), // length fields
+                else => len = r.uintAtMost(usize, len),
+            }
+            if (len == 0) break;
+        }
+        var d: tls.Decoder = .fromTheirSlice(buf[0..len]);
+        if (seed % 2 == 0) {
+            if (encryptedExtensionsAlpn(&d, &offered)) |sel| {
+                if (sel) |s| {
+                    try std.testing.expect(s.ptr == offered[0].ptr or s.ptr == offered[1].ptr);
+                    reach[0] += 1;
+                }
+            } else |_| reach[1] += 1;
+        } else {
+            if (parseCertRequest(&d, .ed25519)) |req| {
+                try std.testing.expect(req.context_len <= 255);
+                reach[2] += 1;
+            } else |_| reach[3] += 1;
+        }
+    }
+    // Measured 2026-10-04: 323 ALPN answers accepted (each one of ours),
+    // 8 209 refused; 1 394 requests parsed, 8 606 refused.
+    try std.testing.expect(reach[0] > 200 and reach[1] > 6000);
+    try std.testing.expect(reach[2] > 1000 and reach[3] > 6000);
+}

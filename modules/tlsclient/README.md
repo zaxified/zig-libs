@@ -1,6 +1,7 @@
 # tlsclient
 
-std's TLS client (TLS 1.3 and 1.2), with one change: the certificate chain a
+std's TLS client (TLS 1.3 and 1.2), with one fix and two opt-in additions.
+The fix: the certificate chain a
 server sends is verified by RFC 5280 path validation (`x509.verifyChain`), not
 link by link. Zig 0.16's `std.crypto.tls.Client` checks the issuer name, the
 validity and the signature of each link and nothing else -- no
@@ -20,7 +21,7 @@ the fix and this module goes.
 
 ## Use
 
-The API is std's, unchanged. Swap the import:
+The API is std's, with two optional `Options` fields. Swap the import:
 
 ```zig
 const tls = @import("tlsclient"); // was: std.crypto.tls
@@ -38,6 +39,30 @@ What changes for a caller: a chain std would have accepted is refused with
 `error.TlsCertificateNotVerified` when an issuer in it is not a CA, a
 pathLen/keyUsage/nameConstraints rule is broken, or the leaf's extKeyUsage
 excludes serverAuth. `http.Client` uses this module for every https dial.
+
+## Additions (off by default; with the defaults the handshake is std's, byte for byte)
+
+```zig
+var client = try tls.Client.init(&r.interface, &w.interface, .{
+    // ... std's options ...
+    .alpn_protocols = &.{ "h2", "http/1.1" },          // RFC 7301 offer
+    .client_auth = .{                                   // TLS 1.3 client certificate
+        .certificate_chain = &.{ leaf_der, intermediate_der },
+        .key = .{ .ecdsa_secp256r1_sha256 = scalar },   // or .ecdsa_secp384r1_sha384 / .ed25519
+    },
+});
+const proto = client.alpn_protocol; // ?[]const u8, one of ours
+```
+
+- **ALPN:** a server answer that is not exactly one of the offered names is
+  `TlsIllegalParameter`; a server that refuses all of them sends
+  no_application_protocol (`TlsAlert`).
+- **Client certificates (TLS 1.3 only):** answered with Certificate +
+  CertificateVerify (RFC 8446 §4.4.3). When the server's CertificateRequest
+  does not accept our key's scheme, an empty Certificate is sent (RFC 8446
+  §4.4.2.3) and the server decides. Without `client_auth`, and in TLS 1.2, a
+  CertificateRequest is `TlsUnexpectedMessage`, as in std. RSA keys and
+  session resumption are not supported.
 
 Provenance: Zig 0.16.0 `lib/std/crypto/tls/Client.zig` copied under the MIT
 license (see ./NOTICE); the change is this collection's.

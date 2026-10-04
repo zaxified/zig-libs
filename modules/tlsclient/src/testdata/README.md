@@ -14,6 +14,30 @@ mirror a misreading of its own. All P-256, ten years from 2026-09-24.
 `leaf.key.pem` and `forged.key.pem` are kept for `tools/openssl-oracle.sh`,
 which serves these chains with `openssl s_server`; they are throwaway keys.
 
+Client certificates (2026-10-04, for the TLS 1.3 client-auth interop): a
+separate throwaway CA (`client-ca.pem`, key discarded) and three leaves with
+EKU clientAuth -- `client-p256.pem`, `client-p384.pem`, `client-ed25519.pem` --
+whose throwaway private keys are kept as DER (`*.key.der`: SEC1 for the EC
+ones, PKCS#8 for Ed25519) so the test can cut the raw scalar/seed at a fixed,
+prefix-checked offset.
+
+```sh
+E="-newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes"
+openssl req -x509 $E -keyout cca.key -out client-ca.pem -days 3650 -subj "/CN=tlsclient test client CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+cl() { # name keyopts serial
+  openssl req $2 -keyout $1.key.pem -out $1.csr -subj "/CN=$1"
+  printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n" > c.cnf
+  openssl x509 -req -in $1.csr -CA client-ca.pem -CAkey cca.key -set_serial $3 -days 3650 -extfile c.cnf -out $1.pem
+}
+cl client-p256 "-newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes" 10
+cl client-p384 "-newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes" 11
+cl client-ed25519 "-newkey ed25519 -nodes" 12
+for k in client-p256 client-p384; do openssl ec -in $k.key.pem -outform DER -out $k.key.der; done
+openssl pkey -in client-ed25519.key.pem -outform DER -out client-ed25519.key.der
+rm cca.key c.cnf client-*.csr client-*.key.pem
+```
+
 Regenerate (from this directory):
 
 ```sh

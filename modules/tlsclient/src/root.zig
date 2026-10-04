@@ -15,8 +15,12 @@
 //! reproduces that against `openssl s_server` and keeps a tripwire test that
 //! goes red the day std refuses the forged chain -- then this module retires.
 //!
-//! The API is std's, unchanged: `Client.init(reader, writer, options)` with
-//! the same `Options`, so a consumer switches by changing one import.
+//! The API is std's: `Client.init(reader, writer, options)` with the same
+//! `Options`, so a consumer switches by changing one import. Two opt-in
+//! additions (2026-10-04), off by default: ALPN (`Options.alpn_protocols`,
+//! `Client.alpn_protocol`) and TLS 1.3 client certificates
+//! (`Options.client_auth`); with the defaults the handshake is std's byte
+//! for byte.
 
 const std = @import("std");
 
@@ -33,7 +37,7 @@ comptime {
 pub const meta = .{
     // The module catalog's one-line entry -- README.md's table is rendered
     // from this by `zig build gen-catalog`.
-    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 (no basicConstraints check).",
+    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877; opt-in ALPN and TLS 1.3 client certificates, std's handshake byte for byte by default.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
