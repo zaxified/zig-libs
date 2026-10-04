@@ -419,8 +419,8 @@ p256	ReleaseFast	sign	1	<=12	521052e105bbd9bb	af4baed5c5134f3f
 # 2026-10-03: crt 1 -> 2, same verdict counted twice — the `try` in
 # rsadpCrtBlinded that propagates FaultDetected now has its own context (LLVM
 # stopped folding it after fromPrimesImpl changed in the same file).
-rsa	ReleaseFast	crt	1	2	34b0fab384772cd8	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	34b0fab384772cd8	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	2	d9cb06202b4f46ab	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	d9cb06202b4f46ab	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -432,7 +432,7 @@ rsa	ReleaseFast	noncrt	1	0	34b0fab384772cd8	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	34b0fab384772cd8	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	d9cb06202b4f46ab	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	6848022d967ef676	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
