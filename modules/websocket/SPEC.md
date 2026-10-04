@@ -6,7 +6,7 @@
 
 **Scope:** core — coder/websocket v1.8.15 + Autobahn|Testsuite (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -42,8 +42,12 @@ GET, HTTP/1.1+, `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Vers
 `Sec-WebSocket-Key` that decodes to exactly 16 bytes. `computeAcceptKey` is
 `base64(SHA1(key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))` (§1.3) — hashes the raw base64 *key
 string*, not its decoded bytes, per spec. Subprotocol negotiation (`Sec-WebSocket-Protocol`) picks
-the first client-offered token (client preference order) present in the caller's allowed set;
-absent that header or an empty allowed set, no subprotocol is negotiated. Client side mirrors this:
+the first client-offered token (client preference order) present in the caller's allowed set,
+compared **byte for byte** (so the answer is always a spelling the client sent — RFC 6455 §4.1 has
+the client fail a subprotocol "not present in the client's handshake"; gorilla/websocket,
+python-websockets and browsers compare exactly; case-insensitive until 2026-10-04); absent that
+header or an empty allowed set, no subprotocol is negotiated. `verifyResponse` accepts only a
+subprotocol byte-identical to one it offered. Client side mirrors this:
 `generateKey` takes a caller-supplied `std.Random` (never `std.crypto.random` — this module has no
 opinion on the CSPRNG source, matching the rest of zig-libs' caller-supplied-randomness
 convention), and `verifyResponse` recomputes the expected accept value and rejects on any mismatch
@@ -260,6 +264,26 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   still borrowed from the read buffer), single-frame and reassembled invalid-UTF-8
   rejection, the split-codepoint-across-fragments positive control, and control-frame interleaving
   mid-fragmentation.
+
+**Mutation (2026-10-04,** schemata over a copy of `frame.zig` + `connection.zig` + `handshake.zig`,
+one ReleaseSafe build, the whole suite): 69 mutants — RSV bits, reserved opcodes, both masking
+directions, the three length-encoding checks, control-frame FIN/125 limits, `max_frame_size`,
+`parseFrame`'s completeness test, the mask tail, `writeFrame`'s control checks and length-form
+thresholds, `encodeCloseBody`'s two bounds, `isValidCloseCode` (1004-1006, 1015, 999, 5000), the
+close-body length/code/UTF-8 checks, the incremental UTF-8 validator (invalid lead, range, range
+reset, unfinished sequence), the after-close frame cap and `DataAfterClose`, fragmentation
+sequencing, fragment cap, per-fragment and final UTF-8, both message caps, `bothClosed`, the error
+reset, the partial-text key rotation, and every handshake check (key length/decode, method,
+HTTP/1.0, duplicates, Upgrade/Connection tokens, version, origin policy incl. no-Host, empty
+authority, `*` and exact entry, subprotocol match both sides, `respond`'s upgradability, request
+field validation, 101 status, accept, extensions, unoffered subprotocol). First run: 59 killed,
+9 alive; seven tests added (frame cap boundary, 126-byte length form per §5.2, close-body bounds
+per §5.5/§5.5.1, Upgrade/Connection token presence per §4.2.1, same-host with no Host, exact
+subprotocol match on each side); rerun: 68 killed, 1 equivalent — the same-host default's
+`authority.len != 0` (`h1` refuses an empty `Host`, so an empty authority can never equal it).
+**Finding, fixed:** subprotocols were matched case-insensitively on both sides and the server
+answered its own spelling — a differently-cased offer got an answer a conformant client must
+reject (RFC 6455 §4.1); now exact on both sides.
 - **External anchor (Markus Kuhn's UTF-8 stress-test corpus, frozen 2026-08-08):** a ~45-vector
   subset of `http://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt`, transcribed from the
   installed (but unrunnable — see below) `autobahntestsuite` package's own

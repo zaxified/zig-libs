@@ -243,15 +243,21 @@ fn countHeader(head: h1.RequestHead, name: []const u8) usize {
 }
 
 /// First token in the comma-separated `offered` list (client preference
-/// order) that case-insensitively matches an entry in `allowed`
+/// order) that is byte-for-byte equal to an entry in `allowed`
 /// (server-supported set). Returns a slice of `allowed` (stable regardless
-/// of the client buffer's lifetime).
+/// of the client buffer's lifetime) — the same bytes the client sent.
+///
+/// Exact, not case-insensitive (fixed 2026-10-04): RFC 6455 §4.1 has the
+/// client fail the connection when the response names a subprotocol "that
+/// was not present in the client's handshake", and gorilla/websocket,
+/// python-websockets and browsers compare exactly — answering our own
+/// spelling of a differently-cased offer produced handshakes they reject.
 fn selectProtocol(offered: []const u8, allowed: []const []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, offered, ',');
     while (it.next()) |raw| {
         const tok = std.mem.trim(u8, raw, " \t");
         for (allowed) |a| {
-            if (std.ascii.eqlIgnoreCase(tok, a)) return a;
+            if (std.mem.eql(u8, tok, a)) return a;
         }
     }
     return null;
@@ -455,8 +461,10 @@ pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols:
     var protocol: ?[]const u8 = null;
     if (head.header("sec-websocket-protocol")) |p| {
         var matched = false;
+        // Exact match (RFC 6455 §4.1: a subprotocol "not present in the
+        // client's handshake" fails the connection) — see `selectProtocol`.
         for (offered_protocols) |o| {
-            if (std.ascii.eqlIgnoreCase(o, p)) {
+            if (std.mem.eql(u8, o, p)) {
                 matched = true;
                 break;
             }
@@ -1108,4 +1116,49 @@ test "respond: refused on a writer that cannot upgrade, with no header left behi
     const accept: ServerAccept = .{ .accept_key = computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), .protocol = null };
     try std.testing.expectError(error.Unsupported, respond(&rw, accept));
     try std.testing.expectEqual(@as(usize, 0), rw.headers_len);
+}
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "acceptHandshake: Upgrade and Connection must CONTAIN the right token, not merely be present" {
+    // §4.2.1 point 3: an |Upgrade| header field containing the value
+    // "websocket"; point 4: a |Connection| header field that includes the
+    // token "Upgrade". Present-but-wrong is as bad as absent.
+    const no_ws = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+    try testing.expectError(error.MissingUpgrade, acceptHandshake(try h1.RequestHead.parse(no_ws), .{}));
+    const no_up = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+    try testing.expectError(error.MissingConnection, acceptHandshake(try h1.RequestHead.parse(no_up), .{}));
+}
+
+test "acceptHandshake: default same-host policy needs a Host to compare" {
+    // `ServerAcceptOptions.origins` doc: the Origin's authority is compared
+    // against the request's own Host; with no Host there is nothing to be
+    // "same" as — refused.
+    const no_host = "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://h\r\nSec-WebSocket-Version: 13\r\n";
+    try testing.expectError(error.OriginNotAllowed, acceptHandshake(try h1.RequestHead.parse(no_host), .{}));
+}
+
+test "subprotocols match exactly on the server: a differently-cased offer negotiates nothing" {
+    // RFC 6455 §4.2.2 /subprotocol/: the server picks one of the values the
+    // client sent; §4.1: the client fails a response naming one "not present
+    // in the client's handshake". Answering "Chat" to an offer of "chat"
+    // would be exactly that, so a case-only match is no match.
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectEqual(@as(?[]const u8, null), (try acceptHandshake(head, .{ .protocols = &.{"Chat"} })).protocol);
+    try testing.expectEqualStrings("superchat", (try acceptHandshake(head, .{ .protocols = &.{ "Chat", "superchat" } })).protocol.?);
+}
+
+test "subprotocols match exactly on the client: a differently-cased answer fails the handshake" {
+    // RFC 6455 §4.1: "If the response includes a |Sec-WebSocket-Protocol|
+    // header field and this header field indicates the use of a subprotocol
+    // that was not present in the client's handshake ... the client MUST
+    // _Fail the WebSocket Connection_."
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    var buf: [256]u8 = undefined;
+    const resp = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: Chat\r\n\r\n", .{&accept});
+    try testing.expectError(error.UnexpectedSubprotocol, verifyResponse(try h1.ResponseHead.parse(resp), key, &.{"chat"}));
+    const ok = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\n\r\n", .{&accept});
+    try testing.expectEqualStrings("chat", (try verifyResponse(try h1.ResponseHead.parse(ok), key, &.{"chat"})).protocol.?);
 }

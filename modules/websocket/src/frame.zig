@@ -999,3 +999,42 @@ test "corpus: every close-body seed reaches the decoder, and the codes read are 
     try testing.expectEqual(@as(usize, 10), codes);
     try testing.expectEqual(@as(usize, 131), reason_bytes);
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "max_frame_size: a payload of exactly the cap parses, one byte more is FrameTooLarge" {
+    // `parseFrame` doc / `FrameTooLarge`: "declared payload length EXCEEDS
+    // the caller's max_frame_size" — the cap itself is allowed.
+    var at = [_]u8{ 0x82, 0x04, 1, 2, 3, 4 };
+    _ = (try parseFrame(&at, .client, 4)).frame;
+    var over = [_]u8{ 0x82, 0x05, 1, 2, 3, 4, 5 };
+    try testing.expectError(error.FrameTooLarge, parseFrame(&over, .client, 4));
+}
+
+test "writeFrame: 126 bytes take the 16-bit length form (126 is the marker, not a length)" {
+    // RFC 6455 §5.2: payload length 0-125 is the 7-bit value itself; the
+    // value 126 means "the following 2 bytes are the length". So a 126-byte
+    // payload is `7e 00 7e`, and must read back as 126 bytes.
+    var payload: [126]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    var buf: [200]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeFrame(&w, .{ .opcode = .binary, .payload = &payload });
+    const wire = w.buffered();
+    try testing.expectEqualSlices(u8, &.{ 0x82, 0x7e, 0x00, 0x7e }, wire[0..4]);
+    try testing.expectEqual(@as(usize, 4 + 126), wire.len);
+    const f = (try parseFrame(buf[0..wire.len], .client, 1 << 20)).frame;
+    try testing.expectEqualSlices(u8, &payload, f.payload);
+}
+
+test "encodeCloseBody: a reason needs a code, and code + reason fit in 125 bytes" {
+    // §5.5.1: a close body, if present, starts with the 2-byte status code,
+    // so a reason alone cannot be encoded; §5.5: a control frame's payload is
+    // at most 125 bytes, so the reason is at most 123.
+    var out: [200]u8 = undefined;
+    try testing.expectError(error.ReasonTooLong, encodeCloseBody(&out, null, "x"));
+    const ok_reason = [_]u8{'r'} ** 123;
+    try testing.expectEqual(@as(usize, 125), (try encodeCloseBody(&out, 1000, &ok_reason)).len);
+    const long_reason = [_]u8{'r'} ** 124;
+    try testing.expectError(error.ReasonTooLong, encodeCloseBody(&out, 1000, &long_reason));
+}

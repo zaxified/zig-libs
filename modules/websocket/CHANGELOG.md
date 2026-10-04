@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix (behaviour change, not breaking API): `Sec-WebSocket-Protocol` is now
+  matched **exactly** (byte for byte) on both sides. The server (`acceptHandshake`) used to select
+  case-insensitively and answer with its own spelling, so a client that offered `chat` to a
+  server configured with `Chat` got `Chat` back — a subprotocol "not present in the client's
+  handshake", which RFC 6455 §4.1 makes the client fail (gorilla/websocket, python-websockets and
+  browsers compare exactly). Now such a peer gets no subprotocol negotiated; and `verifyResponse`
+  fails the handshake (`error.UnexpectedSubprotocol`) on a differently-cased answer instead of
+  accepting it. Also tests from a mutation schemata run (69 mutants, 68 killed, 1 equivalent).
 - **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane): invalid UTF-8 is
   now refused **within one frame** that has not fully arrived. When `Connection.receive` returns
   `.need_more` for an incomplete text frame (or a continuation of a text message), the payload
