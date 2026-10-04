@@ -877,3 +877,46 @@ test "StreamReader .span: a newline-free record is still RecordTooLong" {
     defer sr.deinit();
     try t.expectError(error.RecordTooLong, sr.next());
 }
+
+// ── mutation run 2026-10-04 ─────────────────────────────────────────────────
+
+test "ChunkReader: bytes appended after init are read; EOF comes only from a read of 0" {
+    // The F6 comment in `nextChunk`: the size seen at `init` is a HINT, and
+    // "EOF now comes from a read returning 0, which is the only thing that
+    // means it". The stat-0 test above skips on hosts without the shape it
+    // needs, so nothing pinned this. Mutation 2026-10-04: deciding EOF from
+    // the stat size survived -- the appended records were dropped.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "grow.csv", .data = "a\nb\n" });
+    var f = try tmp.dir.openFile(t.io, "grow.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{ .chunk_size = 4 });
+    defer sr.deinit();
+    // The file grows after `init` took its size.
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "grow.csv", .data = "a\nb\nc\nd\n" });
+    var got: usize = 0;
+    while (try sr.next()) |_| got += 1;
+    try t.expectEqual(@as(usize, 4), got);
+}
+
+test "StreamReader .span: a quote right after a leading BOM opens a field, in the chunk cut too" {
+    // `findCut`'s comment: `StreamReader` strips a leading BOM before
+    // splitting, so the cut must skip it as well, or the quote after it
+    // opens a field for the split and not for the cut. With 8-byte reads the
+    // first cut decides where the spanned record may end. Mutation
+    // 2026-10-04: dropping the BOM skip from the cut survived.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "bom.csv", .data = line.utf8_bom ++ "\"a\nb\",c\nd,e\n" });
+    var f = try tmp.dir.openFile(t.io, "bom.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{ .chunk_size = 8, .max_record_len = 64, .quoted_newlines = .span });
+    defer sr.deinit();
+    const r0 = (try sr.next()).?;
+    try t.expectEqualStrings("\"a\nb\",c", r0.bytes);
+    try t.expect(r0.spanned and !r0.unbalanced_quote);
+    try t.expectEqual(@as(u64, 3), r0.byte_offset);
+    try t.expectEqualStrings("d,e", (try sr.next()).?.bytes);
+    try t.expect((try sr.next()) == null);
+}

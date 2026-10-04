@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (46 schemata mutants, 42 killed, 4 equivalent;
+  6 new tests). Pins the `.span` close-before-CRLF arm, `.first_record` ignoring a leading blank
+  line, `freeFields` on a copy adjacent to the record, long rows in both arity checks, reading
+  bytes appended after `init`, and the BOM skip in the `.span` chunk cut. No code change.
+
 - **2026-09-30** — **Multi-line quoted fields as an opt-in `.span` mode** (additive; the default is
   unchanged). `StreamReader.Options.quoted_newlines = .span` (+ `max_quoted_lines`, default 64, and
   `field_check`: `.none` / `.first_record` / `.count`), `LineIterator.initSpan`/`initSpanScanner`,

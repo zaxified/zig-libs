@@ -160,3 +160,14 @@ test "Header.init: empty header (zero columns) is valid" {
     try t.expectEqual(@as(usize, 0), h.len());
     try h.validateArity(&.{});
 }
+
+test "validateArity: a LONG row is a mismatch too" {
+    // Both arity checks promise "exactly as many fields" (their docs); a
+    // ragged file has long rows as well as short ones. Mutation 2026-10-04:
+    // accepting rows longer than expected survived -- only a short row was
+    // tested.
+    try t.expectError(error.FieldCountMismatch, validateArity(&.{ "1", "2", "3" }, 2));
+    var h = try Header.init(t.allocator, &.{ "a", "b" });
+    defer h.deinit();
+    try t.expectError(error.FieldCountMismatch, h.validateArity(&.{ "1", "2", "3" }));
+}

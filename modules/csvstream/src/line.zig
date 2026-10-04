@@ -1457,3 +1457,52 @@ test "span: the record scanner and splitFields agree on where fields end" {
     try t.expectEqualStrings("a\"b\nc", fields[0]);
     try t.expectEqual(@as(usize, 2), countFields(recs[0].bytes, ',', '"'));
 }
+
+// ── mutation run 2026-10-04: one test per mutant the suite let through ─────
+
+test "span: a closing quote followed by CRLF ends the field and the record" {
+    // `SpanConfig` doc: a quote followed by the delimiter, `\n`, `\r\n` or
+    // the end of input closes the field. Mutation 2026-10-04: dropping the
+    // `\r\n` arm survived -- the quote then read as literal and the record
+    // swallowed the next line.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const recs = try spanRecords(arena_state.allocator(), "\"a\"\r\nb\r\n", .{});
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expectEqualStrings("\"a\"", recs[0].bytes);
+    try t.expect(!recs[0].spanned and !recs[0].unbalanced_quote);
+    try t.expectEqualStrings("b", recs[1].bytes);
+}
+
+test "span: .first_record takes the first NON-EMPTY record as the header" {
+    // `FieldCheck.first_record` doc: "The first non-empty record (the
+    // header) sets the count". A leading blank line is no header; counted
+    // as one (0 fields) it would make every later spanned record fall back.
+    // Mutation 2026-10-04: counting the empty record survived.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const recs = try spanRecords(arena_state.allocator(), "\nh1,h2\n\"a\nb\",c\n", .{ .field_check = .first_record });
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expectEqualStrings("h1,h2", recs[0].bytes);
+    try t.expectEqualStrings("\"a\nb\",c", recs[1].bytes);
+    try t.expect(recs[1].spanned and !recs[1].unbalanced_quote);
+}
+
+test "freeFields frees a copy that sits right after the record in memory" {
+    // `freeFields` must free every unescaped copy and nothing borrowed. A
+    // copy can start exactly at `line.ptr + line.len` -- a bump allocator
+    // places the next allocation there -- and that address is NOT inside
+    // `line` (a slice's range excludes its end). Mutation 2026-10-04: an
+    // inclusive end in `borrowsFrom` survived; it leaks that copy.
+    var mem: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    const a = fba.allocator();
+    const line_buf = try a.dupe(u8, "\"x\"\"y\"");
+    const after_line = fba.end_index;
+    var buf: [4][]const u8 = undefined;
+    const fields = try splitFields(line_buf, &buf, ',', '"', a);
+    try t.expectEqualStrings("x\"y", fields[0]);
+    try t.expectEqual(@intFromPtr(line_buf.ptr) + line_buf.len, @intFromPtr(fields[0].ptr));
+    freeFields(line_buf, fields, a);
+    try t.expectEqual(after_line, fba.end_index); // the copy was given back
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — Go encoding/csv, rust-csv (surveyed 2026-09-30; raised from mvp 2026-09-30 with the `.span` mode for multi-line quoted fields)
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -142,6 +142,25 @@ mid-field quotes literal, the IMDb shape (two stray quotes 200 lines apart → 1
 the exact `max_quoted_lines` bound, `field_check` catching two close stray quotes that the line cap
 lets through, the byte cap and EOF-inside-quote fallbacks, and the chunk-size sweep that holds the
 stream to the in-memory reading.
+
+**Audit 2026-10-04 (mutation).** 46 schemata mutants over `splitFieldsOpts` (quoting, doubled
+quotes, the lazy-quote rule, delimiter skip, unescape, overflow policy), `countFields`,
+`freeFields`/`borrowsFrom`, the `.span` scanner (quote at buffer end, escape/close/CRLF
+arms, `max_quoted_lines`, the byte cap, field-start rule, EOF fallback, `field_check` and
+the `.first_record` header), `LineIterator` (escapes, unbalanced flag, CR strip, empty
+records, offsets), `ChunkReader`/`StreamReader` (record cap, capacity bound, offsets, EOF,
+BOM in the span cut and the offsets), the writer's quoting, `Header`/`validateArity` and
+`parseBool`: 42 killed, 4 equivalent, 0 left alive. Equivalent: treating a quote that is the
+last byte of a NON-final buffer as closing (the loop then ends and returns `.incomplete`
+regardless); skipping `""` outside quotes in `LineIterator.next` (only the quote parity at
+the newline is observable, and a pair keeps it); committing the scanner as last scanned in
+`findCut` (`scan` changes state only when it returns a record, and every record is
+committed); `base_offset == 0 or …` in the BOM check (it runs on the first chunk only, whose
+offset is always 0). Tests added for the 6 real gaps: a closing quote before CRLF in `.span`,
+`.first_record` skipping a leading blank line, `freeFields` freeing a copy that sits right
+after the record (bump allocator), long rows failing both arity checks, bytes appended after
+`init` being read (EOF only from a 0-byte read), and a quote right after a leading BOM in a
+`.span` stream cut into 8-byte reads.
 
 ## Backlog / deferred
 From README "Deferred (not implemented in v1)", now trimmed to what's still actually deferred:
