@@ -204,12 +204,16 @@ fn multModP(a: u32, b: u32) u32 {
     return p;
 }
 
-/// x^(2^k) mod P for k = 0 … 31.
-const x2n: [32]u32 = blk: {
-    var t: [32]u32 = undefined;
+/// x^(2^k) mod P for k = 0 … 66: every k `xPow8n` reaches (3 + the 64 bits
+/// of its `u64`). Not folded to 32 entries with `k & 31` as zlib does for its
+/// polynomial: CRC-32C's P = (x + 1)·Q, Q of degree 31, so x^(2^k) mod P
+/// repeats every 31, not every 32.
+const x2n: [67]u32 = blk: {
+    @setEvalBranchQuota(20_000);
+    var t: [67]u32 = undefined;
     var p: u32 = 1 << 30; // x¹
     t[0] = p;
-    for (1..32) |i| {
+    for (1..67) |i| {
         p = multModP(p, p);
         t[i] = p;
     }
@@ -223,7 +227,7 @@ fn xPow8n(n: u64) u32 {
     var k: usize = 3;
     var rest = n;
     while (rest != 0) : (rest >>= 1) {
-        if (rest & 1 != 0) p = multModP(x2n[k & 31], p);
+        if (rest & 1 != 0) p = multModP(x2n[k], p);
         k += 1;
     }
     return p;
@@ -454,6 +458,30 @@ test "combine joins two checksums without the bytes" {
     }
     // An empty right-hand side changes nothing, whatever its "checksum".
     try testing.expectEqual(hash("abc"), combine(hash("abc"), 0, 0));
+}
+
+test "combine's zero-byte operator x^(8n) is right for every u64 length" {
+    // `combine` is right exactly when `xPow8n(n)` is x^(8n) mod P. Two
+    // oracles that do not go through the `x2n` table: (1) x^(8·2^j) is x
+    // squared j + 3 times; (2) exponents add, x^(8(a+b)) = x^(8a)·x^(8b).
+    // Regression (review 2026-10-04): the table used to be indexed `k & 31`,
+    // i.e. it assumed x^(2^32) ≡ x (mod P). That holds for an irreducible P
+    // of degree 32, not for CRC-32C: P has an even number of terms, so
+    // P = (x + 1)·Q with Q of degree 31, and x^(2^k) repeats every 31 — the
+    // combined checksum was wrong whenever `len_b` ≥ 2^29 bytes.
+    var sq: u32 = 1 << 30; // x
+    for (0..3) |_| sq = multModP(sq, sq); // x^8
+    for (0..64) |j| {
+        try testing.expectEqual(sq, xPow8n(@as(u64, 1) << @intCast(j)));
+        sq = multModP(sq, sq);
+    }
+    var prng = std.Random.DefaultPrng.init(29);
+    const rnd = prng.random();
+    for (0..200) |_| {
+        const a = rnd.int(u64) >> 1;
+        const b = rnd.int(u64) >> 1;
+        try testing.expectEqual(xPow8n(a + b), multModP(xPow8n(a), xPow8n(b)));
+    }
 }
 
 test "fuzz: every backend, extend and combine agree with std on arbitrary bytes" {

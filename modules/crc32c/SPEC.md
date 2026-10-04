@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `hash/crc32` Castagnoli + google/crc32c 1.1.2 (surveyed 2026-09-30)
 
-**Audit:** review none · mutation 2026-09-27
+**Audit:** review 2026-10-04 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -56,7 +56,11 @@ without the conditioning; `extend(c, b) = ~reg(b, ~c)`.
   compile time from `multModP`.
 - **`combine(a, b, n)`** = `multModP(x^(8n) mod P, a) ⊕ b` — valid on the
   conditioned values because the conditioning of `a ‖ b` and of its parts
-  cancels; `x^(8n)` by square-and-multiply over `x^(2^k)`, as zlib 1.2.12+.
+  cancels; `x^(8n)` by square-and-multiply over `x^(2^k)`, as zlib 1.2.12+,
+  but with the table `x2n` holding all 67 powers a `u64` length reaches:
+  zlib folds its table to 32 entries (`k & 31`) because for its irreducible
+  polynomial x^(2^32) ≡ x; CRC-32C's P has an even number of terms, so
+  P = (x + 1)·Q with Q of degree 31, and x^(2^k) mod P repeats every **31**.
 
 **Dispatch.** If the build target has `sse4_2` (x86-64) or `crc` (aarch64),
 that backend is fixed at compile time. Otherwise the first call detects it —
@@ -91,6 +95,25 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
   lane and locally under `qemu-aarch64` (both the run-time-detected and the
   `+crc` static build, 2026-09-27). The test fails if an x86-64 or arm64 run
   never took a hardware path.
+
+- **Audit 2026-10-04** (independent review + mutation schemata over a copy,
+  one ReleaseSafe build for a baseline `-mcpu=x86_64`, so the run-time CPUID
+  dispatch is exercised). **Finding, fixed:** `combine` was wrong for
+  `len_b ≥ 2^29` bytes — `xPow8n` indexed `x2n[k & 31]`, copying zlib's
+  period-32 assumption, which does not hold for CRC-32C (period 31, above).
+  The old tests stopped at 70 000 bytes. New test `combine's zero-byte
+  operator x^(8n) is right for every u64 length` checks `xPow8n(2^j)` for
+  j = 0 … 63 against repeated squaring of x, and `xPow8n(a + b) =
+  xPow8n(a)·xPow8n(b)` for random 63-bit `a`, `b` — two oracles that do not
+  use the table; it failed before the fix. 33 mutants (conditioning in
+  `extend`/`hashWith`, `combine`'s terms, `Crc32c.update`, the dispatch cache
+  and CPUID, `multModP`'s early exit/reduction/start bit, `xPow8n`'s start
+  power, bit test and the `k & 31` regression, slicing-by-8 table and index
+  choice and the bytewise tail, the shift-table map, the three-way chain
+  seeds/offsets/joins, the word byte order, the dropped tail): 32 killed
+  (two of them by hanging), 1 alive — CPUID bit 30 for bit 20, alive only
+  because this host has both RDRAND and SSE4.2; the bit number is the SDM's,
+  checked by review.
 
 **Anchor grade:** class B · oracle MIXED
 
