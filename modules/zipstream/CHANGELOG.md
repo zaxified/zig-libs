@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (37 schemata mutants, 36 killed, 1 equivalent;
+  7 new tests). Pins the central-directory pre-check's exact edge and its own errors (bad
+  signature, unsupported method), backslash normalisation, the Unix-host rule for `mode`,
+  the `UT` mtime flag, the bomb cap at exactly `max_output`, the deflate clamp to the
+  declared size, `DosDateTime.toUnix` range and leap-year checks, the 65 535-entry writer
+  limit and the writer's permission-bit mask. No code change.
+
 - **2026-09-30** — **Entry modification time and Unix mode, write and read.** `AddEntryOptions.mtime`
   (Unix seconds → DOS fields + Info-ZIP `UT` extra field) and `.mode` (host Unix + `S_IFREG|mode`
   attributes); `Entry.mtime` / `Entry.mode` on read (`UT` preferred over the DOS fields); new

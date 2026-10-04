@@ -6,7 +6,7 @@
 
 **Scope:** core — Go archive/zip, zip2 as the broad reference (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation none
+**Audit:** review 2026-08-11 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -144,6 +144,20 @@ the frozen bytes, and this module's own `Archive`/`EntryReader` are asserted to 
 original plaintext. `std.zip.Iterator`'s agreement is kept as an extra internal-consistency check but
 is not counted as the external oracle (see that file's doc comment for the reasoning). Run: `zig build
 test-zipstream`.
+
+**Audit 2026-10-04 (mutation).** 37 schemata mutants over the central-directory pre-check
+(u16 advance cap, signature), method gate, name normalisation, directory skip, mode/host
+rules, the `UT` extra-field walk, `isSafeEntryName`, the local-header checks, the
+decompression-bomb cap and deflate clamp, CRC verification, `DosDateTime` ranges and leap
+years, and the writer's name/offset/count/mode/`UT` paths: 36 killed, 1 equivalent, 0 left
+alive. Equivalent: dropping `readUtMtime`'s `len > left` guard -- std's `Iterator.next`
+validates every central-directory extra record (`ZipBadExtraFieldSize`) before
+`Archive.init` reads it, so an overrunning record never reaches this walk (std 0.16). 15
+survivors got tests: the exact 65 536-byte pre-check edge, a bad CD signature and a BZIP2
+method refused at init, backslash normalisation, mode only from a Unix host with non-zero
+attributes, a `UT` record without the mtime flag, the cap at exactly `max_output`, deflate
+output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 / 2024-02-29,
+65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
 
 ## Backlog / deferred
 zip64 **writing** (`ArchiveWriter` is classic-format only — zip64 reading is fully supported, see

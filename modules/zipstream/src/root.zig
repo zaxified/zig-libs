@@ -1542,6 +1542,205 @@ test "ArchiveWriter: classic-format 32-bit overflow guards fail closed (ZipWrite
 }
 
 // ---------------------------------------------------------------------------
+// Mutation run 2026-10-04: one test per mutant the suite above let through.
+// ---------------------------------------------------------------------------
+
+/// Offset of the (first) central-directory header in `zip`.
+fn cdStart(zip: []const u8) usize {
+    return std.mem.indexOf(u8, zip, &std.zip.central_file_header_sig).?;
+}
+
+/// `Archive.init` over `zip`, returning the archive or the init error.
+fn initArchive(tmp: *std.testing.TmpDir, archive: *Archive, file: *std.Io.File, zip: []const u8) !void {
+    file.* = try openZip(tmp, zip);
+    errdefer file.close(testing.io);
+    try archive.init(testing.io, testing.allocator, file.*);
+}
+
+fn expectInitError(expected: anyerror, zip: []const u8) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try openZip(&tmp, zip);
+    defer f.close(testing.io);
+    var archive: Archive = undefined;
+    if (archive.init(testing.io, testing.allocator, f)) |_| {
+        archive.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(expected, err);
+}
+
+test "Archive.init: the central-directory pre-check is exact and owns its errors" {
+    const a = testing.allocator;
+    // A record whose advance is exactly 65 536 (46 + 65 490) is the first
+    // that std's u16 sum cannot hold -- the pre-check's own comment. The
+    // CRIT test above uses 0xFFFF, far past the edge; mutation 2026-10-04
+    // showed a cap one higher survived it.
+    {
+        const zip = try buildZip(a, &.{.{ .name = "a.csv", .data = "x" }});
+        defer a.free(zip);
+        std.mem.writeInt(u16, zip[cdStart(zip) + 28 ..][0..2], 65490, .little);
+        try expectInitError(Error.ZipBadCentralDirectory, zip);
+    }
+    // A record without the central-header signature is this module's
+    // `ZipBadCentralDirectory` (the pre-check), not whatever std's
+    // iterator would raise later (mutation 2026-10-04: dropping the
+    // signature check survived).
+    {
+        const zip = try buildZip(a, &.{.{ .name = "a.csv", .data = "x" }});
+        defer a.free(zip);
+        zip[cdStart(zip) + 3] = 0;
+        try expectInitError(Error.ZipBadCentralDirectory, zip);
+    }
+    // A method other than Store/Deflate is refused at init, before any
+    // entry is listed (APPNOTE 4.4.5 method 12 = BZIP2; mutation 2026-10-04:
+    // accepting it at init survived).
+    {
+        const zip = try buildZip(a, &.{.{ .name = "a.csv", .data = "x" }});
+        defer a.free(zip);
+        std.mem.writeInt(u16, zip[cdStart(zip) + 10 ..][0..2], 12, .little);
+        try expectInitError(Error.UnsupportedCompressionMethod, zip);
+    }
+}
+
+test "Archive: backslashes are normalised; mode comes only from a Unix host's non-zero attributes" {
+    const a = testing.allocator;
+    const zip = try buildZip(a, &.{
+        .{ .name = "dir\\win.txt", .data = "w" },
+        .{ .name = "unix0.txt", .data = "u" },
+        .{ .name = "dos.txt", .data = "d" },
+    });
+    defer a.free(zip);
+    // Second record: host 3 (Unix) with all-zero attributes. Third: host 0
+    // (MS-DOS) with S_IFREG|0644 in the high half anyway.
+    var cd = cdStart(zip);
+    cd += 46 + "dir\\win.txt".len;
+    std.mem.writeInt(u16, zip[cd + 4 ..][0..2], (3 << 8) | 20, .little);
+    cd += 46 + "unix0.txt".len;
+    std.mem.writeInt(u32, zip[cd + 38 ..][0..4], 0o100644 << 16, .little);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f: std.Io.File = undefined;
+    var archive: Archive = undefined;
+    try initArchive(&tmp, &archive, &f, zip);
+    defer f.close(testing.io);
+    defer archive.deinit();
+    // `Entry.name` doc: "Backslashes in the stored path are normalised to
+    // '/'" (APPNOTE 4.4.17: '/' is the separator).
+    try testing.expect(archive.find("dir/win.txt") != null);
+    // `Entry.mode` doc: set only for host 3 AND attributes that carry bits;
+    // APPNOTE 4.4.15 makes the external attributes host-dependent, so an
+    // MS-DOS record's high half is not a Unix mode.
+    try testing.expect(archive.find("unix0.txt").?.mode == null);
+    try testing.expect(archive.find("dos.txt").?.mode == null);
+}
+
+test "Archive: a UT record without the mtime flag gives no time, the DOS fields decide" {
+    // Info-ZIP extended timestamp: flags bit 0 = "modification time
+    // present". Without it the DOS fields decide -- an ODD Unix second makes
+    // the two sources distinguishable (DOS keeps even seconds). Mutation
+    // 2026-10-04: ignoring the flag survived. (A record running past the
+    // extra field never reaches `readUtMtime`: std's `Iterator.next` refuses
+    // it first with `ZipBadExtraFieldSize`.)
+    const a = testing.allocator;
+    const t: i64 = 1_000_000_001;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addEntry("a", "x", .{ .method = .store, .mtime = t });
+    try zw.finish();
+    const ut = cdStart(aw.writer.buffered()) + 46 + 1; // the CD's UT record
+
+    const zip = try a.dupe(u8, aw.writer.buffered());
+    defer a.free(zip);
+    zip[ut + 4] = 0; // flags: no mtime
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f: std.Io.File = undefined;
+    var archive: Archive = undefined;
+    try initArchive(&tmp, &archive, &f, zip);
+    defer f.close(testing.io);
+    defer archive.deinit();
+    try testing.expectEqual(@as(?i64, t - 1), archive.find("a").?.mtime);
+}
+
+test "EntryReader: the cap admits an entry of exactly max_output, and deflate output stops at the declared size" {
+    const a = testing.allocator;
+    // `initMax` doc: an entry whose size "already exceeds the cap" is
+    // refused -- equal is not over (mutation 2026-10-04: `>=` survived).
+    // And "the running output is additionally clamped to the declared
+    // size": a deflate stream that expands past it is cut there (mutation:
+    // an unclamped stream survived). The CD here declares 5 bytes and the
+    // CRC of "hello" for a stream that inflates to "hello world".
+    const zip = try buildZip(a, &.{.{ .name = "z", .data = "hello world", .method = .deflate }});
+    defer a.free(zip);
+    const cd = cdStart(zip);
+    std.mem.writeInt(u32, zip[cd + 24 ..][0..4], 5, .little);
+    std.mem.writeInt(u32, zip[cd + 16 ..][0..4], std.hash.Crc32.hash("hello"), .little);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f: std.Io.File = undefined;
+    var archive: Archive = undefined;
+    try initArchive(&tmp, &archive, &f, zip);
+    defer f.close(testing.io);
+    defer archive.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var er: EntryReader = undefined;
+    try er.initMax(&archive, archive.find("z").?, &window, 5);
+    const got = try er.reader().allocRemaining(a, .unlimited);
+    defer a.free(got);
+    try testing.expectEqualStrings("hello", got);
+}
+
+test "DosDateTime.toUnix: month 0, second 60 and 2100-02-29 are not times; 2024-02-29 is" {
+    // APPNOTE 4.4.6 / FAT: month 1..12, seconds stored /2 as 0..29 (so 30 =
+    // 60 s is out of range), and the Gregorian leap rule -- 2100 is not a
+    // leap year. The `toUnix` doc lists "month 0" itself. Mutation
+    // 2026-10-04: all three checks could be dropped unnoticed.
+    const d2020: u16 = (40 << 9) | (6 << 5) | 15;
+    try testing.expect((DosDateTime{ .time = 0, .date = (40 << 9) | (0 << 5) | 15 }).toUnix() == null);
+    try testing.expect((DosDateTime{ .time = 30, .date = d2020 }).toUnix() == null);
+    try testing.expect((DosDateTime{ .time = 29, .date = d2020 }).toUnix() != null);
+    try testing.expect((DosDateTime{ .time = 0, .date = (120 << 9) | (2 << 5) | 29 }).toUnix() == null);
+    try testing.expect((DosDateTime{ .time = 0, .date = (120 << 9) | (2 << 5) | 28 }).toUnix() != null);
+    try testing.expect((DosDateTime{ .time = 0, .date = (44 << 9) | (2 << 5) | 29 }).toUnix() != null); // 2024: leap
+}
+
+test "ArchiveWriter: 65 535 entries fit, the 65 536th is ZipWriteTooLarge" {
+    // The EOCD record counts are u16 (APPNOTE 4.3.16), so a classic archive
+    // holds at most 65 535 entries. Mutation 2026-10-04: admitting one more
+    // survived (the count would then not fit the field).
+    const a = testing.allocator;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Discarding = .init(&sink_buf);
+    var zw = ArchiveWriter.init(a, &sink.writer);
+    defer zw.deinit();
+    for (0..std.math.maxInt(u16)) |_| try zw.addEntry("e", "", .{ .method = .store });
+    try testing.expectError(Error.ZipWriteTooLarge, zw.addEntry("e", "", .{ .method = .store }));
+    try zw.finish();
+}
+
+test "ArchiveWriter: mode keeps only permission bits, the entry stays a regular file" {
+    // `AddEntryOptions.mode` is "Unix permission bits" and the record is
+    // marked `S_IFREG | mode`; type bits a caller passes along (0o040000,
+    // a directory) must not turn the member into another file type in the
+    // external attributes. Mutation 2026-10-04: an unmasked mode survived
+    // because the reader masks again on the way back.
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addEntry("f", "x", .{ .method = .store, .mode = 0o40755 });
+    try zw.finish();
+    const zip = aw.writer.buffered();
+    const attrs = std.mem.readInt(u32, zip[cdStart(zip) + 38 ..][0..4], .little);
+    try testing.expectEqual(@as(u32, 0o100755), attrs >> 16);
+}
+
+// ---------------------------------------------------------------------------
 // zip64 read tests
 // ---------------------------------------------------------------------------
 
