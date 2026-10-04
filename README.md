@@ -441,7 +441,7 @@ way to recognise it.
 | [`pping`](modules/pping/README.md) | 3 | Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — bounded per-direction table, no double-counting of duplicate/delayed ACKs | any | — |
 | [`probe`](modules/probe/README.md) | 2 | TCP-connect reachability prober — up/refused/timeout + RTT, fan-out with bounded concurrency, latency aggregation | any | netaddr, latency-stats |
 | [`procnet`](modules/procnet/README.md) | 3 | Linux `/proc`+`/sys` parsers — ARP/routes/TCP+UDP sockets/conntrack/process stats/device health, typed | **linux** | netaddr |
-| [`raft`](modules/raft/README.md) | 4 | Raft consensus (Ongaro & Ousterhout) — leader election + log replication, model-checked in netsim against all five formal safety properties; membership changes are design-only | any | netsim |
+| [`raft`](modules/raft/README.md) | 3 | Raft consensus (Ongaro & Ousterhout) — a runnable server (`Node`: tick/step/propose → ready/advance over your transport and disk), model-checked in netsim against all five formal safety properties; no snapshots or membership changes yet | any | netsim |
 | [`rawsock`](modules/rawsock/README.md) | 3 | Linux AF_PACKET raw-frame capture + inject — BPF filter, promiscuous mode, typed frame decode | **linux** | netaddr |
 | [`rdap`](modules/rdap/README.md) | 2 | RDAP client (RFC 7480–7484) — JSON-over-HTTPS whois successor: query URLs, typed response model, IANA bootstrap, fetch seam | any | http, netaddr |
 | [`readthrough`](modules/readthrough/README.md) | 2 | Backend-agnostic read-through cache coordinator — serve-from-cache or single-flight-coalesce a miss into one backend fetch, TTL + invalidation + negative caching | any | ramcache |

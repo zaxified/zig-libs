@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **`raft.Node`: a runnable server; scope poc → mvp (user decision, reverses 2026-09-30).**
+  `Node` (`node.zig`) is one Raft server as a pure state machine — `tick` / `step` /
+  `stepBytes` / `propose` → `ready` / `advance` — over caller-owned transport, disk and
+  clock, any cluster size, entries carrying bytes (`Entry`, `Message` and a fail-closed
+  codec in `message.zig`), restart from persisted state (`Restore`). The leader counts
+  its own log toward a majority only up to what `advance` confirmed persisted.
+  **Breaking for the netsim harness:** `RaftServer` now runs N `Node`s (`nodes` →
+  `slots` / `node(i)`, `malformed_dropped` → `malformedDropped()`, `RaftConfig` gains
+  `tick` and `drain_every_event`, `InjectedBug` moved to `node.zig`); a restart rebuilds
+  a server from its persisted state alone, and the disk must equal the log after every
+  drain. Structural fixes on the way: tick-driven elections (the "step-down forgot to
+  re-arm the timer" class cannot recur), no term past `max_term` (two elections at the
+  ceiling used to overflow `current_term += 1`), senders taken from the transport, not
+  the frame. `example-apps/raft-kv` now runs on `Node` (its own plumbing had no bound
+  on a peer's claimed match index — a forged ack could commit what no majority held).
+  **Review (Sonnet, adversarial): 1 HIGH fixed** — H1: a leader deposed by a `step`
+  between `propose` and `ready` broadcast its stale tail under the NEW term; unreachable
+  for the old harness, which drained after every event; pinned by a unit test (the new
+  batched-Ready sweep was measured NOT to catch it re-introduced).
+  MED fixed: no re-send on a duplicate/stale ack or an unmoved rejection; persist order
+  inside a Ready documented; term-0 requests/entries refused. **Mutation** (schemata,
+  ReleaseSafe): 36 + 17 mutants; every survivor got a test except two equivalent ones
+  (the two independent H1 guards, each redundant alone — both removed is killed) (late grant from an older
+  term, verified-prefix ack, unpersisted no-op, immediate commit broadcast, propose on a
+  follower, vote-grant timer reset, `Restore.applied`, stale ack lowering `match`,
+  trailing bytes on fixed messages). Not done: snapshots, membership, pre-vote,
+  ReadIndex, a torn-Ready fault (SPEC § Backlog 3, 5, 7–11).
+
 - **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
   (F2/F3/F6): `netsim.Protocol.resetFn` is mandatory now, so
   `StepDownProbe.reset`'s `inner.resetFn.?(inner.ctx)` no longer compiles

@@ -5,11 +5,11 @@
 //! an RPC and then forgets what it answered can elect two leaders. `kv.Db`
 //! fsyncs on every `put`, so "this function returned" IS the durability
 //! point, and the calling order in `node.zig` is: persist, THEN send the
-//! message that promises it.
+//! message that promises it (`raft.Node`'s `ready` contract).
 //!
 //! Layout, one record per fact:
 //!   "m"            term(8) | vote(4)               — persistent state (§5.1)
-//!   "l" ++ idx(8)  term(8) | kind(1) | cmd(8) | blob — log entry + its payload
+//!   "l" ++ idx(8)  term(8) | kind(1) | data — log entry (raft.Entry)
 //!
 //! Log indices are dense from 1, so "iterate" is `get(1), get(2), …` until
 //! the first miss — no ordered scan needed. commitIndex is deliberately NOT
@@ -68,15 +68,15 @@ pub const Store = struct {
         return buf;
     }
 
-    pub fn putEntry(self: *Store, gpa: std.mem.Allocator, idx: raft.LogIndex, entry: raft.LogEntry, blob: []const u8) !void {
+    /// Record: term(8) | kind(1) | data(rest).
+    pub fn putEntry(self: *Store, gpa: std.mem.Allocator, entry: raft.Entry) !void {
         var kbuf: [9]u8 = undefined;
-        const rec = try gpa.alloc(u8, 17 + blob.len);
+        const rec = try gpa.alloc(u8, 9 + entry.data.len);
         defer gpa.free(rec);
         std.mem.writeInt(u64, rec[0..8], entry.term, .little);
         rec[8] = @intFromEnum(entry.kind);
-        std.mem.writeInt(u64, rec[9..17], entry.command, .little);
-        @memcpy(rec[17..], blob);
-        try self.db.put(entryKey(idx, &kbuf), rec);
+        @memcpy(rec[9..], entry.data);
+        try self.db.put(entryKey(entry.index, &kbuf), rec);
     }
 
     pub fn delEntry(self: *Store, idx: raft.LogIndex) !void {
@@ -84,21 +84,18 @@ pub const Store = struct {
         try self.db.delete(entryKey(idx, &kbuf));
     }
 
-    pub const LoadedEntry = struct { entry: raft.LogEntry, blob: []u8 };
-
-    /// Caller frees `blob`.
-    pub fn getEntry(self: *Store, gpa: std.mem.Allocator, idx: raft.LogIndex) !?LoadedEntry {
+    /// Caller frees `data`.
+    pub fn getEntry(self: *Store, gpa: std.mem.Allocator, idx: raft.LogIndex) !?raft.Entry {
         var kbuf: [9]u8 = undefined;
         const rec = (try self.db.get(gpa, entryKey(idx, &kbuf))) orelse return null;
-        errdefer gpa.free(rec);
-        if (rec.len < 17) return error.Corrupt;
-        const entry: raft.LogEntry = .{
+        defer gpa.free(rec);
+        if (rec.len < 9) return error.Corrupt;
+        const kind = std.enums.fromInt(raft.EntryKind, rec[8]) orelse return error.Corrupt;
+        return .{
+            .index = idx,
             .term = std.mem.readInt(u64, rec[0..8], .little),
-            .kind = std.enums.fromInt(raft.EntryKind, rec[8]) orelse return error.Corrupt,
-            .command = std.mem.readInt(u64, rec[9..17], .little),
+            .kind = kind,
+            .data = try gpa.dupe(u8, rec[9..]),
         };
-        const blob = try gpa.dupe(u8, rec[17..]);
-        gpa.free(rec);
-        return .{ .entry = entry, .blob = blob };
     }
 };

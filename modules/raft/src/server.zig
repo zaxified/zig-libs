@@ -2,29 +2,38 @@
 
 //! server — the `netsim.Protocol` consumer(s).
 //!
-//!  - `RaftServer` is the real thing: election timers + heartbeats, RequestVote
-//!    and AppendEntries RPC exchange, the leader-commit loop — making every
-//!    safety-relevant decision through `safety.zig` (the Fable core, now
-//!    implemented) and MECHANICALLY executing the verdict (truncate/append the
-//!    log, advance commitIndex, apply). Its model-checking tests run for real
-//!    now that `gate.fable_core_implemented` is `true`.
+//!  - `RaftServer` runs one `node.Node` per simulated server — the same state
+//!    machine a deployment drives — and plays every role the deployment
+//!    plays around it: the clock (a `Node.tick` every `RaftConfig.tick`), the
+//!    transport (`Message.encode` → `sim.send` → `Node.stepBytes`), the disk
+//!    (each `Ready`'s hard state, truncation and entries, kept per server) and
+//!    the state machine (each `Ready.committed`, fed to the invariant
+//!    checkers). A restart after a crash rebuilds the node from its disk ALONE,
+//!    so commit index, applied index, role and the leader's bookkeeping are
+//!    lost exactly as Figure 2 says volatile state is. The fuzzed fault sweep
+//!    therefore checks the code a consumer runs, not a copy of it.
 //!  - `BrokenRaft` is the POSITIVE CONTROL: a deliberately-wrong election that
 //!    declares leadership WITHOUT collecting a majority and never calls
-//!    `safety.zig`, so it runs today. Its job is to prove `checks.SafetyChecker`
-//!    has teeth — it reuses that EXACT type, so the `error.ElectionSafety` it
-//!    trips is provably the same check the real protocol will be held to.
+//!    `safety.zig`. Its job is to prove `checks.SafetyChecker` has teeth — it
+//!    reuses that EXACT type, so the `error.ElectionSafety` it trips is
+//!    provably the same check the real protocol is held to.
 //!
 //! Cluster topology (`scenario`): a 5-node full mesh, so a partition can carve
 //! the cluster into a majority and a minority side (the case leader election and
 //! the commit rule must survive) and heal.
+//!
+//! History: until 2026-10-04 this file held its own copy of the Raft plumbing
+//! around the kernel (timers, vote tally, nextIndex/matchIndex, the apply
+//! loop), and `example-apps/raft-kv` held a second one. The model-check
+//! verified the first; nothing verified the second, and it had drifted (no
+//! bound on a peer's claimed match index). `node.zig` is now the only copy.
 
 const std = @import("std");
 const netsim = @import("netsim");
 const types = @import("types.zig");
-const log_mod = @import("log.zig");
-const safety = @import("safety.zig");
 const checks = @import("checks.zig");
-const gate = @import("gate.zig");
+const node_mod = @import("node.zig");
+const message = @import("message.zig");
 
 const Allocator = std.mem.Allocator;
 const NodeId = netsim.NodeId;
@@ -37,72 +46,65 @@ const Term = types.Term;
 const LogIndex = types.LogIndex;
 const Command = types.Command;
 const LogEntry = types.LogEntry;
-const Log = log_mod.Log;
+const Node = node_mod.Node;
+const Entry = node_mod.Entry;
+const Message = node_mod.Message;
+const Role = node_mod.Role;
 const no_vote = types.no_vote;
+
+/// Moved to `node.zig`, where the rules it breaks now live.
+pub const InjectedBug = node_mod.InjectedBug;
 
 // ── shared topology + config ────────────────────────────────────────────────
 
 pub const CLUSTER_N = 5;
 
 pub const RaftConfig = struct {
-    /// Base ticks a follower waits without hearing from a leader before starting
+    /// Base time a follower waits without hearing from a leader before starting
     /// an election.
     election_timeout: Time = 100,
     /// Per-node deterministic offset added to `election_timeout` (`node *
     /// election_spread`) — Raft's randomized timeout, made deterministic for the
-    /// sim so it still de-synchronizes candidates and avoids perpetual split
-    /// votes.
+    /// sim (`Node`'s jitter is off here) so it still de-synchronizes candidates
+    /// and avoids perpetual split votes.
     election_spread: Time = 15,
     /// How often a leader emits heartbeats. Must be well under
     /// `election_timeout` so a live leader keeps followers from timing out.
     heartbeat_period: Time = 30,
+    /// Simulated time per `Node.tick`. The three periods above are rounded
+    /// down to whole ticks.
+    tick: Time = 10,
     /// Propose one DISTINCT client command per heartbeat while leader.
     ///
     /// This is what gives the live State-Machine-Safety and Log-Matching
-    /// checkers teeth. With it off, every replicated entry is the leader's own
-    /// `command = 0` no-op, so `SafetyChecker.recordApply` — which keys on the
-    /// command VALUE — compares zero against zero at every index and can never
-    /// observe a divergent apply: the deepest invariant certifies instead of
-    /// checking. See `commandFor` and the `bug:` positive controls.
+    /// checkers teeth. With it off, the only entries are leader no-ops, and a
+    /// partitioned leader's log cannot outgrow the majority's — the shape the
+    /// §5.4.1 positive control needs. See `commandFor`.
     propose_client_commands: bool = true,
+    /// Drain each node's `Ready` after EVERY event (true) or only on its tick
+    /// (false). The second batches every message a node receives between two
+    /// ticks into one `ready` — legal under the contract, and the only way
+    /// the sweep can reach a bug that needs two inputs before a `ready`. Each
+    /// event's Ready used to be persisted, sent and applied atomically, which
+    /// hid every bug of that shape. (Measured: it does NOT catch the review's
+    /// H1 re-introduced — that bug's damage needs a peer to accept the stale
+    /// broadcast while holding committed entries to lose; `node.zig`'s H1
+    /// test is what pins it.)
+    drain_every_event: bool = true,
 };
 
-/// The command payload for the entry a leader creates at `index` while serving
-/// `term`: the pair packed into the sim's `u64` command word.
+/// The command a leader proposes when its next entry will be `index` while
+/// serving `term`: the pair packed into a `u64`, carried as the entry's 8 bytes.
 ///
 /// Distinctness is the whole point. Two servers may legally hold DIFFERENT
 /// entries at the same index (an uncommitted tail from a deposed leader), and
 /// State Machine Safety is the claim that they never *apply* different ones
 /// there. That claim is only observable if entries created by different terms
-/// at the same index carry different commands — Election Safety already gives
-/// at most one leader per term, so `(term, index)` uniquely names an entry's
-/// creator, and equal commands at an index now mean "the same entry" rather
-/// than "both were zero".
+/// at the same index differ — Election Safety already gives at most one leader
+/// per term, so `(term, index)` uniquely names an entry's creator.
 pub fn commandFor(term: Term, index: LogIndex) Command {
     return (@as(Command, @truncate(term)) << 32) | @as(Command, @truncate(index));
 }
-
-/// A deliberately-wrong Raft rule, injectable into the REAL `RaftServer` so the
-/// live model-check can be shown to catch it. Distinct from `BrokenRaft`, which
-/// is a separate protocol that never calls `safety.zig` at all: these mutate
-/// one clause of the real algorithm, which is the shape a regression actually
-/// takes. Both were injected by hand during the audit, and both PASSED the
-/// 300-seed sweep back when every entry was a `command = 0` no-op — they are
-/// the exact reason `propose_client_commands` exists.
-pub const InjectedBug = enum {
-    /// The real algorithm.
-    none,
-    /// §5.3 conflict rule replaced by the naive "truncate everything after
-    /// prevLogIndex, then append the whole batch" — a delayed or duplicated
-    /// AppendEntries rolls back entries the follower already accepted (and may
-    /// already have applied) from a later RPC.
-    naive_truncation,
-    /// §5.4.1 election restriction with the TERM-first clause dropped: a
-    /// candidate is up-to-date iff its log is at least as LONG. A partitioned
-    /// ex-leader with a long stale-term tail can then win and overwrite
-    /// committed entries.
-    index_only_up_to_date,
-};
 
 pub fn scenario(sim: *Sim) anyerror!void {
     var i: usize = 0;
@@ -115,81 +117,43 @@ pub fn scenario(sim: *Sim) anyerror!void {
     }
 }
 
-fn majority(node_count: usize) u32 {
-    return @intCast(node_count / 2 + 1);
-}
+// ── RaftServer: N real `Node`s inside netsim ────────────────────────────────
 
-// Timer id space: heartbeat uses a fixed sentinel; election timers carry a
-// per-node epoch (< sentinel) so a stale election timer that fires after the
-// node re-armed can be recognized and ignored (netsim timers cannot be
-// cancelled).
-const HEARTBEAT_TIMER: u64 = std.math.maxInt(u64);
-
-const Role = enum { follower, candidate, leader };
-
-// ── RaftServer: the real protocol (calls the Fable stub) ────────────────────
-
-const NodeState = struct {
-    // persistent (Figure 2)
-    current_term: Term = 0,
-    voted_for: NodeId = no_vote,
-    log: Log = .{},
-    // volatile (all servers)
-    role: Role = .follower,
-    commit_index: LogIndex = 0,
-    last_applied: LogIndex = 0,
-    election_epoch: u64 = 0,
-    // Candidate vote tally, per GRANTING PEER (self included) — a set, not a
-    // counter: the network duplicates messages (dup faults), and counting the
-    // same voter's duplicated grant twice would manufacture a fake majority —
-    // two leaders in one term (Election Safety gone) from one dup_once fault.
-    votes_from: []bool,
-    // volatile (leaders) — per-peer, indexed by NodeId; self slot tracks own log
-    next_index: []LogIndex,
-    match_index: []LogIndex,
-    // Leader Append-Only witness: the leader's log as of the previous `check`.
+/// One simulated server: its node (null before the first start) and what
+/// survives a crash — its disk.
+const Slot = struct {
+    node: ?Node = null,
+    disk_hs: node_mod.HardState = .{},
+    /// Persisted entries; `data` owned.
+    disk: std.ArrayList(Entry) = .empty,
+    /// Tick-timer generation. netsim timers cannot be cancelled, so a restart
+    /// starts a new chain and a timer from an older one is ignored.
+    epoch: u64 = 0,
+    ticks: u64 = 0,
+    /// `malformed_dropped` of node incarnations before this one.
+    dropped_before: u64 = 0,
+    /// The term this server was last recorded leader of (Election Safety).
+    leader_recorded: Term = 0,
+    /// Leader Append-Only witness: the log as of the previous `check`.
     prev_log: std.ArrayList(LogEntry) = .empty,
 
-    fn init(gpa: Allocator, node_count: usize) Allocator.Error!NodeState {
-        const vf = try gpa.alloc(bool, node_count);
-        errdefer gpa.free(vf);
-        @memset(vf, false);
-        const ni = try gpa.alloc(LogIndex, node_count);
-        errdefer gpa.free(ni);
-        @memset(ni, 0);
-        const mi = try gpa.alloc(LogIndex, node_count);
-        @memset(mi, 0);
-        return .{ .votes_from = vf, .next_index = ni, .match_index = mi };
+    fn wipe(s: *Slot, gpa: Allocator) void {
+        if (s.node) |*n| n.deinit();
+        s.node = null;
+        for (s.disk.items) |e| gpa.free(e.data);
+        s.disk.clearRetainingCapacity();
+        s.disk_hs = .{};
+        s.epoch = 0;
+        s.ticks = 0;
+        s.dropped_before = 0;
+        s.leader_recorded = 0;
+        s.prev_log.clearRetainingCapacity();
     }
 
-    fn deinit(self: *NodeState, gpa: Allocator) void {
-        self.log.deinit(gpa);
-        gpa.free(self.votes_from);
-        gpa.free(self.next_index);
-        gpa.free(self.match_index);
-        self.prev_log.deinit(gpa);
-    }
-
-    fn resetAll(self: *NodeState) void {
-        self.current_term = 0;
-        self.voted_for = no_vote;
-        self.log.reset();
-        self.role = .follower;
-        self.commit_index = 0;
-        self.last_applied = 0;
-        self.election_epoch = 0;
-        @memset(self.votes_from, false);
-        @memset(self.next_index, 0);
-        @memset(self.match_index, 0);
-        self.prev_log.clearRetainingCapacity();
-    }
-
-    fn voteCount(self: *const NodeState) u32 {
-        var n: u32 = 0;
-        for (self.votes_from) |g| {
-            if (g) n += 1;
-        }
-        return n;
+    fn deinit(s: *Slot, gpa: Allocator) void {
+        s.wipe(gpa);
+        s.disk.deinit(gpa);
+        s.prev_log.deinit(gpa);
     }
 };
 
@@ -197,55 +161,59 @@ pub const RaftServer = struct {
     gpa: Allocator,
     node_count: usize,
     cfg: RaftConfig,
-    nodes: []NodeState,
+    slots: []Slot,
     checker: checks.SafetyChecker = .{},
     /// index → the term in which that index was FIRST committed (the committing
     /// leader's term). Raft's Leader Completeness (Figure 3) constrains "the
     /// leaders of all HIGHER-numbered terms" than the commit — a deposed leader
     /// still holding `.leader` inside a minority partition legally misses
     /// entries committed in LATER terms, so `check` must scope the predicate by
-    /// this term or it flags legal executions. The first `recordCommitted` for
-    /// an index is always by the committing leader itself (commitIndex advances
-    /// on the leader synchronously in `handleAppendResp`, before any follower
-    /// can observe the new leaderCommit), so first-record term == commit term.
+    /// this term or it flags legal executions. The first record for an index is
+    /// always the committing leader's own: it applies the entry in the same
+    /// event in which its commit index passes it, and a follower can only learn
+    /// that commit index from a message sent in that event.
     commit_terms: std.AutoHashMapUnmanaged(LogIndex, Term) = .empty,
+    /// index → the `commandFor` value applied there (command entries only).
+    applied_commands: std.AutoHashMapUnmanaged(LogIndex, Command) = .empty,
+    wire: std.ArrayList(u8) = .empty,
 
-    /// Inbound messages dropped because they did not decode (see
-    /// `dropMalformed`). Raft has no "your message was garbage" reply in
-    /// Figure 2, so a malformed datagram is DROPPED — but it is counted, not
-    /// silently swallowed, because a drop is otherwise invisible.
-    ///
-    /// In this harness the only sender is our own `encode`, so a non-zero
-    /// count means a codec bug on our side, and the model-check asserts it
-    /// stays 0 (`expectNoMalformed`). That is what makes the counter load-
-    /// bearing rather than decorative.
-    malformed_dropped: u64 = 0,
-
-    /// Deliberate defect to run instead of the real rule. `.none` in every
-    /// production path; the positive-control tests set it and REQUIRE the live
-    /// checker to trip. See `InjectedBug`.
+    /// Deliberate defect to run instead of the real rule, installed into every
+    /// node. `.none` in every production path; the positive-control tests set
+    /// it and REQUIRE the live checker to trip. See `InjectedBug`.
     bug: InjectedBug = .none,
 
     pub fn init(gpa: Allocator, node_count: usize, cfg: RaftConfig) Allocator.Error!RaftServer {
-        const nodes = try gpa.alloc(NodeState, node_count);
-        var made: usize = 0;
-        errdefer {
-            for (nodes[0..made]) |*n| n.deinit(gpa);
-            gpa.free(nodes);
-        }
-        for (nodes) |*n| {
-            n.* = try NodeState.init(gpa, node_count);
-            made += 1;
-        }
-        return .{ .gpa = gpa, .node_count = node_count, .cfg = cfg, .nodes = nodes };
+        const slots = try gpa.alloc(Slot, node_count);
+        @memset(slots, .{});
+        return .{ .gpa = gpa, .node_count = node_count, .cfg = cfg, .slots = slots };
     }
 
     pub fn deinit(self: *RaftServer, gpa: Allocator) void {
-        for (self.nodes) |*n| n.deinit(gpa);
-        gpa.free(self.nodes);
+        for (self.slots) |*s| s.deinit(gpa);
+        gpa.free(self.slots);
         self.checker.deinit(gpa);
         self.commit_terms.deinit(gpa);
+        self.applied_commands.deinit(gpa);
+        self.wire.deinit(gpa);
         self.* = undefined;
+    }
+
+    /// Server `i`'s current node incarnation (it must have started).
+    pub fn node(self: *RaftServer, i: NodeId) *Node {
+        return &self.slots[i].node.?;
+    }
+
+    /// Inbound messages dropped as malformed, across every node and every
+    /// incarnation of it, in this run. In this harness every byte on the wire
+    /// came from our own `encode`, so the model-check requires 0: a fail-closed
+    /// decoder must not be allowed to quietly hide a codec bug.
+    pub fn malformedDropped(self: *const RaftServer) u64 {
+        var n: u64 = 0;
+        for (self.slots) |s| {
+            n += s.dropped_before;
+            if (s.node) |x| n += x.malformed_dropped;
+        }
+        return n;
     }
 
     pub fn protocol(self: *RaftServer) Protocol {
@@ -265,358 +233,119 @@ pub const RaftServer = struct {
 
     fn reset(ctx: *anyopaque) void {
         const self = cast(ctx);
-        for (self.nodes) |*n| n.resetAll();
+        for (self.slots) |*s| s.wipe(self.gpa);
         self.checker.reset();
         self.commit_terms.clearRetainingCapacity();
-        self.malformed_dropped = 0;
+        self.applied_commands.clearRetainingCapacity();
     }
 
-    // ── timers ──────────────────────────────────────────────────────────────
-
-    fn resetElectionTimer(self: *RaftServer, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        ns.election_epoch += 1;
-        const delay = self.cfg.election_timeout + @as(Time, node) * self.cfg.election_spread;
-        try sim.setTimer(node, delay, ns.election_epoch);
+    fn ticksOf(self: *const RaftServer, t: Time) u32 {
+        return @intCast(@max(1, t / self.cfg.tick));
     }
 
-    /// Adopt `new_term`, revert to follower (§5.1) and RE-ARM the election
-    /// timer.
-    ///
-    /// The re-arm is the part that is easy to lose, and losing it is a silent
-    /// liveness bug rather than a crash. A leader holds NO live election timer:
-    /// `onTimer` swallows the one it armed as a candidate (`role == .leader` →
-    /// return) without re-arming, because a leader must not campaign against
-    /// itself. So from one timeout after its election, a leader's only way back
-    /// to an armed timer is a step-down that re-arms. A step-down that does not
-    /// leaves a node that answers every RPC correctly and is never electable
-    /// again — see the `demoted by a RESPONSE` regression test, which asserts an
-    /// election actually STARTS, since asserting `role == .follower` passes
-    /// either way.
-    fn stepDown(self: *RaftServer, sim: *Sim, node: NodeId, new_term: Term) anyerror!void {
-        const ns = &self.nodes[node];
-        ns.current_term = new_term;
-        ns.role = .follower;
-        ns.voted_for = no_vote;
-        try self.resetElectionTimer(sim, node);
+    fn nodeConfig(self: *const RaftServer, i: NodeId) node_mod.Config {
+        const hb = self.ticksOf(self.cfg.heartbeat_period);
+        return .{
+            .id = i,
+            .cluster_size = @intCast(self.node_count),
+            .election_ticks = @max(hb + 1, self.ticksOf(self.cfg.election_timeout + @as(Time, i) * self.cfg.election_spread)),
+            .election_jitter_ticks = 0,
+            .heartbeat_ticks = hb,
+            .max_append_entries = types.max_entries_per_msg,
+            .seed = i,
+        };
     }
 
-    fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+    /// First start and every restart: a node built from this server's disk.
+    fn onStart(ctx: *anyopaque, sim: *Sim, i: NodeId) anyerror!void {
         const self = cast(ctx);
-        self.nodes[node].role = .follower;
-        try self.resetElectionTimer(sim, node);
+        const s = &self.slots[i];
+        if (s.node) |*old| {
+            s.dropped_before += old.malformed_dropped;
+            old.deinit();
+            s.node = null;
+        }
+        s.node = try Node.init(self.gpa, self.nodeConfig(i), .{ .hard_state = s.disk_hs, .entries = s.disk.items });
+        s.node.?.injected_bug = self.bug;
+        s.epoch += 1;
+        s.ticks = 0;
+        try sim.setTimer(i, self.cfg.tick, s.epoch);
     }
 
-    fn onTimer(ctx: *anyopaque, sim: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+    fn onTimer(ctx: *anyopaque, sim: *Sim, i: NodeId, timer_id: u64) anyerror!void {
         const self = cast(ctx);
-        if (timer_id == HEARTBEAT_TIMER) {
-            if (self.nodes[node].role == .leader) {
-                if (self.cfg.propose_client_commands) try self.proposeClientCommand(node);
-                try self.broadcastAppendEntries(sim, node);
-                try sim.setTimer(node, self.cfg.heartbeat_period, HEARTBEAT_TIMER);
-            }
-            return;
+        const s = &self.slots[i];
+        if (timer_id != s.epoch) return;
+        const n = &s.node.?;
+        s.ticks += 1;
+        // A client request arriving at the leader, once per heartbeat period
+        // (the sim has no clients). Proposed BEFORE the tick, so the heartbeat
+        // it triggers carries it.
+        if (self.cfg.propose_client_commands and n.role == .leader and s.ticks % n.cfg.heartbeat_ticks == 0) {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(Command, &b, commandFor(n.term, n.lastIndex() + 1), .little);
+            _ = try n.propose(&b);
         }
-        // Election timer — ignore if superseded by a newer epoch.
-        if (timer_id != self.nodes[node].election_epoch) return;
-        // A leader does not campaign, so its election timer is dropped here
-        // WITHOUT being re-armed — which is precisely why every step-down must
-        // re-arm it (`stepDown`). Do not "simplify" this by re-arming here: the
-        // node would then campaign on the remainder of a stale timeout instead
-        // of a fresh one.
-        if (self.nodes[node].role == .leader) return;
-        try self.startElection(sim, node);
+        try n.tick();
+        try self.drain(sim, i);
+        try sim.setTimer(i, self.cfg.tick, s.epoch);
     }
 
-    // ── elections ─────────────────────────────────────────────────────────────
-
-    fn startElection(self: *RaftServer, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        ns.current_term += 1;
-        ns.role = .candidate;
-        ns.voted_for = node;
-        @memset(ns.votes_from, false);
-        ns.votes_from[node] = true; // votes for itself
-        const info = ns.log.info();
-        var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
-        (types.RequestVoteReq{
-            .term = ns.current_term,
-            .candidate_id = node,
-            .last_log_index = info.last_index,
-            .last_log_term = info.last_term,
-        }).encode(&buf);
-        try self.broadcast(sim, node, &buf);
-        try self.resetElectionTimer(sim, node);
-    }
-
-    fn becomeLeader(self: *RaftServer, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        ns.role = .leader;
-        // Election Safety witness: assert exactly one leader per term.
-        try self.checker.recordLeader(self.gpa, ns.current_term, node);
-        // A fresh leader appends a no-op in its own term so prior-term entries
-        // can commit indirectly (the Figure-8 mechanism, §5.4.2). It carries a
-        // `(term, index)` command like every other entry: a real no-op has no
-        // payload, but two DIFFERENT no-ops (different terms, same index) that
-        // both encode `command = 0` are invisible to the apply-keyed State
-        // Machine Safety check — see `commandFor`.
-        const noop_index = ns.log.lastIndex() + 1;
-        try ns.log.append(self.gpa, .{
-            .term = ns.current_term,
-            .kind = .noop,
-            .command = commandFor(ns.current_term, noop_index),
-        });
-        const last = ns.log.lastIndex();
-        for (ns.next_index, ns.match_index) |*ni, *mi| {
-            ni.* = last + 1;
-            mi.* = 0;
-        }
-        ns.match_index[node] = last;
-        try self.broadcastAppendEntries(sim, node);
-        try sim.setTimer(node, self.cfg.heartbeat_period, HEARTBEAT_TIMER);
-    }
-
-    /// Send `payload` to every other node. (The scaffold referenced this helper
-    /// from `startElection` but never defined it — scaffold defect, added
-    /// during the core pass.)
-    fn broadcast(self: *RaftServer, sim: *Sim, node: NodeId, payload: []const u8) anyerror!void {
-        var peer: NodeId = 0;
-        while (peer < self.node_count) : (peer += 1) {
-            if (peer == node) continue;
-            try sim.send(node, peer, payload);
-        }
-    }
-
-    // ── replication ────────────────────────────────────────────────────────────
-
-    /// Append one distinct client command to the leader's own log. Stands in
-    /// for a client request arriving at the leader; the sim has no clients, so
-    /// the heartbeat tick drives it.
-    fn proposeClientCommand(self: *RaftServer, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        const idx = ns.log.lastIndex() + 1;
-        try ns.log.append(self.gpa, .{
-            .term = ns.current_term,
-            .kind = .command,
-            .command = commandFor(ns.current_term, idx),
-        });
-        // The leader replicates to itself synchronously (Figure 2: a leader
-        // counts its own log toward the majority).
-        ns.match_index[node] = ns.log.lastIndex();
-    }
-
-    fn broadcastAppendEntries(self: *RaftServer, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        var peer: NodeId = 0;
-        while (peer < self.node_count) : (peer += 1) {
-            if (peer == node) continue;
-            const next = ns.next_index[peer];
-            const prev_index = next - 1;
-            const prev_term = ns.log.termAt(prev_index) orelse 0;
-            // Send up to one batch of entries starting at `next`.
-            var scratch: [types.max_entries_per_msg]LogEntry = undefined;
-            var count: usize = 0;
-            var idx = next;
-            while (idx <= ns.log.lastIndex() and count < types.max_entries_per_msg) : (idx += 1) {
-                scratch[count] = ns.log.get(idx).?;
-                count += 1;
-            }
-            var buf: [types.AppendEntriesReq.max_wire]u8 = undefined;
-            const n = (types.AppendEntriesReq{
-                .term = ns.current_term,
-                .leader_id = node,
-                .prev_log_index = prev_index,
-                .prev_log_term = prev_term,
-                .entries = scratch[0..count],
-                .leader_commit = ns.commit_index,
-            }).encode(&buf);
-            try sim.send(node, peer, buf[0..n]);
-        }
-    }
-
-    /// A message that did not decode is dropped and counted.
-    ///
-    /// Why drop: Figure 2 defines no negative acknowledgement, so there is
-    /// nothing legal to reply. Inventing one would add a protocol message AND
-    /// an amplification vector (an attacker sending 1-byte datagrams would get
-    /// full-size replies). Dropping is also exactly what the network already
-    /// does to a corrupted packet, and Raft's liveness argument is built on
-    /// tolerating loss: a dropped RequestVote is retried by the next election
-    /// timeout, a dropped AppendEntries by the next heartbeat. So a drop costs
-    /// no more liveness than the packet loss Raft already assumes.
-    ///
-    /// Why count: a peer that emits ONLY malformed messages is, to this node,
-    /// indistinguishable from a dead link — and if enough peers do it, the
-    /// cluster loses quorum while every node looks healthy. That is a real
-    /// liveness concern, but it is not one a decoder can fix: the correct
-    /// response (evict the peer? alarm? refuse to count it toward quorum?) is
-    /// an operational policy decision above this layer. The counter is
-    /// deliberately the whole mechanism here — it makes the condition
-    /// observable and leaves the policy to the caller. See SPEC.md
-    /// §"Malformed messages".
-    fn dropMalformed(self: *RaftServer, err: types.DecodeError) void {
-        // Both variants are dropped identically today; the switch exists so
-        // that a future policy split (e.g. alarm only on InvalidEncoding, which
-        // cannot be caused by truncation in transit) has an obvious home.
-        switch (err) {
-            error.Truncated, error.InvalidEncoding => self.malformed_dropped += 1,
-        }
-    }
-
-    fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+    fn onMessage(ctx: *anyopaque, sim: *Sim, i: NodeId, from: NodeId, payload: []const u8) anyerror!void {
         const self = cast(ctx);
-        const tag = types.tagOf(payload) catch |e| return self.dropMalformed(e);
-        switch (tag) {
-            .request_vote_req => try self.handleVoteReq(sim, node, from, payload),
-            .request_vote_resp => try self.handleVoteResp(sim, node, from, payload),
-            .append_entries_req => try self.handleAppendReq(sim, node, from, payload),
-            .append_entries_resp => try self.handleAppendResp(sim, node, from, payload),
-        }
+        try self.node(i).stepBytes(from, payload);
+        if (self.cfg.drain_every_event) try self.drain(sim, i);
     }
 
-    fn handleVoteReq(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const ns = &self.nodes[node];
-        const req = types.RequestVoteReq.decode(payload) catch |e| return self.dropMalformed(e);
-        // THE FABLE CORE: the grant decision (term step-up + single-vote +
-        // up-to-date restriction).
-        var d = safety.handleRequestVote(ns.current_term, ns.voted_for, ns.log.info(), req);
-        if (self.bug == .index_only_up_to_date and !d.grant) {
-            // INJECTED DEFECT (§5.4.1 with the term-first clause dropped): keep
-            // every other clause of the real decision and widen the up-to-date
-            // test to "at least as long". Only ever ADDS grants, so a refusal
-            // for any other reason (stale term, already voted) still stands.
-            const effective_vote: NodeId = if (d.term_advanced) no_vote else ns.voted_for;
-            const may_vote = effective_vote == no_vote or effective_vote == req.candidate_id;
-            if (req.term >= ns.current_term and may_vote and req.last_log_index >= ns.log.lastIndex()) {
-                d.grant = true;
-                d.voted_for = req.candidate_id;
+    /// The deployment's half of the contract, in its order: persist, send,
+    /// apply, advance.
+    fn drain(self: *RaftServer, sim: *Sim, i: NodeId) anyerror!void {
+        const gpa = self.gpa;
+        const s = &self.slots[i];
+        const n = &s.node.?;
+        while (n.hasReady()) {
+            const rd = try n.ready();
+
+            if (rd.hard_state) |hs| s.disk_hs = hs;
+            if (rd.truncate_after) |t| {
+                while (s.disk.items.len > t) gpa.free(s.disk.pop().?.data);
             }
-        }
-        // Step down BEFORE the grant branch: a refused vote (the candidate's
-        // log is not up to date) still adopts the term and still demotes, and
-        // then only `stepDown`'s re-arm keeps this node electable.
-        if (d.term_advanced) try self.stepDown(sim, node, d.new_term);
-        if (d.grant) {
-            ns.voted_for = d.voted_for;
-            try self.resetElectionTimer(sim, node);
-        }
-        var buf: [types.RequestVoteResp.wire_len]u8 = undefined;
-        (types.RequestVoteResp{ .term = ns.current_term, .vote_granted = d.grant }).encode(&buf);
-        try sim.send(node, from, &buf);
-    }
-
-    fn handleVoteResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const ns = &self.nodes[node];
-        const resp = types.RequestVoteResp.decode(payload) catch |e| return self.dropMalformed(e);
-        const obs = safety.observeTerm(ns.current_term, resp.term);
-        if (obs.term_advanced) {
-            try self.stepDown(sim, node, obs.new_term);
-            return;
-        }
-        if (ns.role != .candidate or resp.term != ns.current_term) return;
-        if (resp.vote_granted) {
-            // Set semantics — a duplicated grant from the same voter must not
-            // count twice (see `votes_from`).
-            ns.votes_from[from] = true;
-            if (ns.voteCount() >= majority(self.node_count)) try self.becomeLeader(sim, node);
-        }
-    }
-
-    fn handleAppendReq(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const ns = &self.nodes[node];
-        var scratch: [types.max_entries_per_msg]LogEntry = undefined;
-        const req = types.AppendEntriesReq.decode(payload, &scratch) catch |e| return self.dropMalformed(e);
-        // THE FABLE CORE: consistency check + conflict-only truncation +
-        // follower commit advancement.
-        var out = safety.handleAppendEntries(ns.current_term, &ns.log, ns.commit_index, req);
-        if (self.bug == .naive_truncation and out.success) {
-            // INJECTED DEFECT (§5.3 conflict rule → naive rule): cut everything
-            // after prevLogIndex and re-append the whole batch, instead of
-            // cutting only at the first genuine term conflict.
-            out.truncate_to = req.prev_log_index;
-            out.append_from = 0;
-        }
-        if (out.term_advanced) {
-            ns.current_term = out.new_term;
-            ns.voted_for = no_vote;
-        }
-        if (req.term >= ns.current_term) {
-            ns.role = .follower;
-            try self.resetElectionTimer(sim, node);
-        }
-        if (out.success) {
-            ns.log.truncateAfter(out.truncate_to);
-            try ns.log.appendSlice(self.gpa, req.entries[out.append_from..]);
-            ns.commit_index = out.new_commit_index;
-            try self.applyCommitted(node);
-        }
-        var buf: [types.AppendEntriesResp.wire_len]u8 = undefined;
-        (types.AppendEntriesResp{
-            .term = ns.current_term,
-            .success = out.success,
-            // The core's verdict (prev + entries.len — the VERIFIED region),
-            // never the raw last index: a stale unverified tail past the batch
-            // window must not be advertised as replicated (see AppendOutcome).
-            .match_index = if (out.success) out.match_index else 0,
-        }).encode(&buf);
-        try sim.send(node, from, &buf);
-    }
-
-    fn handleAppendResp(self: *RaftServer, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
-        const ns = &self.nodes[node];
-        const resp = types.AppendEntriesResp.decode(payload) catch |e| return self.dropMalformed(e);
-        const obs = safety.observeTerm(ns.current_term, resp.term);
-        if (obs.term_advanced) {
-            try self.stepDown(sim, node, obs.new_term);
-            return;
-        }
-        if (ns.role != .leader or resp.term != ns.current_term) return;
-        if (resp.success) {
-            // `match_index` is an unconstrained wire `u64` — `decode` bounds
-            // the term and nothing else — and the line below is an
-            // unconditional `+ 1` on it. That is the exact shape `max_term`
-            // exists to rule out for `current_term` (see types.zig): a panic
-            // under Debug/ReleaseSafe, and under ReleaseFast a wrap to 0
-            // whose `prev_index = next - 1` underflows straight into
-            // `log.get(0).?`, which is `null` by contract.
-            //
-            // Rejected, not clamped. Clamping to `lastIndex()` would be the
-            // worse bug: it would record that this follower has matched the
-            // WHOLE log, and `leaderCommitIndex` counts exactly those
-            // match_index values for its majority — so one forged response
-            // could commit entries no majority ever replicated. A crash is
-            // an availability problem; that would be a safety violation.
-            // An honest follower can never match more than the leader holds,
-            // so a larger value is corruption or hostility either way.
-            if (resp.match_index > ns.log.lastIndex()) {
-                self.malformed_dropped += 1;
-                return;
+            for (rd.entries) |e| {
+                if (e.index != s.disk.items.len + 1) return error.ReadyEntriesNotContiguous;
+                var owned = e;
+                owned.data = try gpa.dupe(u8, e.data);
+                errdefer gpa.free(owned.data);
+                try s.disk.append(gpa, owned);
             }
-            ns.match_index[from] = resp.match_index;
-            ns.next_index[from] = resp.match_index + 1;
-            ns.match_index[node] = ns.log.lastIndex();
-            // THE FABLE CORE: the Figure-8 commit rule.
-            const nc = safety.leaderCommitIndex(ns.current_term, ns.commit_index, ns.match_index, self.node_count, &ns.log);
-            if (nc > ns.commit_index) {
-                ns.commit_index = nc;
-                try self.applyCommitted(node);
-            }
-        } else if (ns.next_index[from] > 1) {
-            ns.next_index[from] -= 1; // decrement and retry (§5.3)
-        }
-    }
 
-    fn applyCommitted(self: *RaftServer, node: NodeId) anyerror!void {
-        const ns = &self.nodes[node];
-        while (ns.last_applied < ns.commit_index) {
-            ns.last_applied += 1;
-            const e = ns.log.get(ns.last_applied).?;
-            try self.checker.recordApply(self.gpa, ns.last_applied, e.command);
-            try self.checker.recordCommitted(self.gpa, .{ .index = ns.last_applied, .term = e.term, .command = e.command });
-            // First recorder == committing leader (see `commit_terms`); later
-            // (follower/indirect) records must not overwrite the commit term.
-            const gop = try self.commit_terms.getOrPut(self.gpa, ns.last_applied);
-            if (!gop.found_existing) gop.value_ptr.* = ns.current_term;
+            for (rd.messages) |m| {
+                try self.wire.resize(gpa, m.encodedLen());
+                _ = m.encode(self.wire.items);
+                try sim.send(m.from, m.to, self.wire.items);
+            }
+
+            for (rd.committed) |e| {
+                const fp = node_mod.fingerprint(e);
+                try self.checker.recordApply(gpa, e.index, fp);
+                try self.checker.recordCommitted(gpa, .{ .index = e.index, .term = e.term, .command = fp });
+                const gop = try self.commit_terms.getOrPut(gpa, e.index);
+                if (!gop.found_existing) gop.value_ptr.* = n.term;
+                if (e.kind == .command and e.data.len == 8)
+                    try self.applied_commands.put(gpa, e.index, std.mem.readInt(Command, e.data[0..8], .little));
+            }
+
+            try n.advance();
+        }
+        // The disk now holds exactly the node's log — a Ready that missed an
+        // overwrite of equal length would leave them differing in content.
+        if (s.disk.items.len != n.lastIndex()) return error.DiskDiverged;
+        for (s.disk.items) |e| {
+            if (n.log.get(e.index).?.command != node_mod.fingerprint(e)) return error.DiskDiverged;
+        }
+        // Election Safety witness: at most one leader per term.
+        if (n.role == .leader and s.leader_recorded != n.term) {
+            try self.checker.recordLeader(gpa, n.term, i);
+            s.leader_recorded = n.term;
         }
     }
 
@@ -631,24 +360,24 @@ pub const RaftServer = struct {
         // Log Matching — across every node's current log.
         const logs = try self.gpa.alloc([]const LogEntry, self.node_count);
         defer self.gpa.free(logs);
-        for (self.nodes, logs) |*n, *slot| slot.* = n.log.entries.items;
+        for (self.slots, logs) |*s, *slot| slot.* = if (s.node) |*n| n.log.entries.items else &.{};
         if (checks.logMatchingViolation(logs) != null) return error.LogMatching;
 
         // Committed-set workspace for Leader Completeness, re-filtered per leader.
         var committed: std.ArrayList(checks.CommitRec) = .empty;
         defer committed.deinit(self.gpa);
 
-        for (self.nodes) |*n| {
+        for (self.slots) |*s| {
+            const n = if (s.node) |*x| x else continue;
             if (n.role != .leader) continue;
             // Leader Append-Only — never shrinks/overwrites its own log.
-            if (!checks.appendOnlyHolds(n.prev_log.items, n.log.entries.items)) return error.LeaderAppendOnly;
+            if (!checks.appendOnlyHolds(s.prev_log.items, n.log.entries.items)) return error.LeaderAppendOnly;
             // Leader Completeness — Figure 3 scopes it to "the leaders of all
             // HIGHER-numbered terms" than the commit, so a stale leader (deposed
             // but unaware inside a minority partition) is only held to entries
             // committed in terms ≤ its own; requiring more flags legal runs.
             // (`<=` keeps the committing leader itself checked — strictly
-            // stronger, and it trivially holds its own commits.) The predicate
-            // in checks.zig is unchanged; only its input set is scoped. A real
+            // stronger, and it trivially holds its own commits.) A real
             // Figure-8 loss is still caught twice over: any FUTURE leader
             // missing the entry trips this check, and an overwritten committed
             // entry trips recordCommitted/recordApply (State Machine Safety).
@@ -656,14 +385,14 @@ pub const RaftServer = struct {
             var it = self.checker.committed.iterator();
             while (it.next()) |kv| {
                 const commit_term = self.commit_terms.get(kv.key_ptr.*) orelse 0;
-                if (commit_term <= n.current_term) try committed.append(self.gpa, kv.value_ptr.*);
+                if (commit_term <= n.term) try committed.append(self.gpa, kv.value_ptr.*);
             }
             if (!checks.leaderCompletenessHolds(n.log.entries.items, committed.items)) return error.LeaderCompleteness;
         }
         // Refresh the append-only witnesses AFTER the check.
-        for (self.nodes) |*n| {
-            n.prev_log.clearRetainingCapacity();
-            try n.prev_log.appendSlice(self.gpa, n.log.entries.items);
+        for (self.slots) |*s| {
+            s.prev_log.clearRetainingCapacity();
+            if (s.node) |*n| try s.prev_log.appendSlice(self.gpa, n.log.entries.items);
         }
     }
 };
@@ -757,6 +486,7 @@ pub const BrokenRaft = struct {
 // ── unguarded tests: the positive control proves the harness has teeth ──────
 
 const testing = std.testing;
+const gate = @import("gate.zig");
 
 const DEFAULT_CFG = RaftConfig{};
 const UNTIL: Time = 2000;
@@ -806,10 +536,7 @@ test "shrink: a fuzzed failing schedule against BrokenRaft minimizes to a still-
     try testing.expect(res.after <= res.before);
     // netsim audit F6: `BrokenRaft` fires "on a clean run with no injected
     // faults" (see its own doc comment above) — the true minimal reproducer
-    // is the EMPTY fault set, and netsim's shrinker now finds exactly that
-    // instead of a pre-fix floor of >= 1 that blamed an arbitrary surviving
-    // fault. This used to read `if (res.before >= 1) try
-    // testing.expect(res.after >= 1);`.
+    // is the EMPTY fault set, and netsim's shrinker finds exactly that.
     try testing.expectEqual(@as(usize, 0), res.after);
 
     const r = try netsim.replay(gpa, failing.case, res.trace.events, null);
@@ -828,13 +555,7 @@ test "smoke: the cluster scenario builds the expected full mesh" {
     try testing.expectEqual(@as(usize, CLUSTER_N * (CLUSTER_N - 1)), topo.links.len);
 }
 
-// ── the real-RaftServer model-check tests (formerly gated) ──────────────────
-//
-// See `gate.zig`. With the Fable core implemented and the gate flipped, these
-// drive the real cluster through netsim's crash/partition/reorder/clock-skew
-// fuzzer, enforcing all five safety properties continuously. (While the core
-// was a `@panic` stub they reported SKIP — a panic would have aborted the whole
-// test binary, so they could not run at all.)
+// ── the real model-check: N `Node`s under fuzzed faults ─────────────────────
 
 test "real: RaftServer upholds all five safety invariants across a fuzzed fault sweep" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
@@ -852,7 +573,29 @@ test "real: RaftServer upholds all five safety invariants across a fuzzed fault 
     }
 }
 
-test "real: a leader is eventually elected on a quiet network (liveness sanity)" {
+test "real: a 150-seed sweep with Readys batched per tick (several inputs before one ready)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var cfg = DEFAULT_CFG;
+    cfg.drain_every_event = false;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+
+    const failing = try netsim.findFailing(gpa, template, .{}, 1, 150);
+    if (failing) |*f| {
+        var mf = f.*;
+        defer mf.deinit();
+        std.debug.print("raft: batched cluster tripped {} at seed {}\n", .{ mf.err, mf.case.seed });
+        return error.HardInvariantViolated;
+    }
+    // …and it still makes progress.
+    const r = try netsim.replay(gpa, .{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL }, &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    try testing.expect(srv.applied_commands.count() >= 20);
+}
+
+test "real: a leader is eventually elected on a quiet network, and commits" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
     var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
@@ -861,39 +604,24 @@ test "real: a leader is eventually elected on a quiet network (liveness sanity)"
     const r = try netsim.replay(gpa, case, &.{}, null);
     try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
     var leaders: usize = 0;
-    for (srv.nodes) |*n| {
-        if (n.role == .leader) leaders += 1;
+    for (0..CLUSTER_N) |i| {
+        if (srv.node(@intCast(i)).role == .leader) leaders += 1;
     }
-    try testing.expect(leaders >= 1);
+    try testing.expectEqual(@as(usize, 1), leaders);
+    // Liveness, not just election: on a quiet network the leader keeps
+    // committing a command per heartbeat for the whole run.
+    try testing.expect(srv.applied_commands.count() >= 30);
 }
 
 // ── the live State-Machine-Safety key actually varies ───────────────────────
 //
-// The audit's F1: `becomeLeader` appended only `.{ .kind = .noop, .command = 0 }`
-// and nothing else was ever proposed, so every replicated entry in the whole
-// run carried the SAME command. `SafetyChecker.recordApply` keys on the command
-// value, so it compared 0 against 0 at every index — State Machine Safety, the
-// deepest of the five, could not fail no matter what the algorithm did. The two
-// tests below are the ones that go RED if that returns: the first fails on the
-// distinctness itself, the second and third fail because the injected defects
-// stop being visible.
+// The audit's F1: once every replicated entry carried the SAME command, so
+// `SafetyChecker.recordApply`, which keys on the command value, compared 0
+// against 0 at every index — State Machine Safety, the deepest of the five,
+// could not fail no matter what the algorithm did. The key is now the entry's
+// fingerprint (index, term, kind, bytes), and the bytes are `commandFor`.
 
-/// How many DIFFERENT command values the run applied, and whether any two
-/// indices were applied the same command (which would mean the key does not
-/// separate entries).
-fn appliedCommandStats(gpa: Allocator, c: *const checks.SafetyChecker) !struct { total: usize, distinct: usize } {
-    var seen: std.AutoHashMapUnmanaged(Command, void) = .empty;
-    defer seen.deinit(gpa);
-    var it = c.applied.iterator();
-    var total: usize = 0;
-    while (it.next()) |kv| {
-        total += 1;
-        try seen.put(gpa, kv.value_ptr.*, {});
-    }
-    return .{ .total = total, .distinct = seen.count() };
-}
-
-test "real: every applied index carries a DISTINCT command (State Machine Safety has a key that varies)" {
+test "real: every applied command is DISTINCT and names the (term, index) that created it" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
     var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
@@ -902,21 +630,17 @@ test "real: every applied index carries a DISTINCT command (State Machine Safety
     const r = try netsim.replay(gpa, case, &.{}, null);
     try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
 
-    const stats = try appliedCommandStats(gpa, &srv.checker);
-    // Several entries were committed and applied…
-    try testing.expect(stats.total >= 3);
-    // …and no two indices shared a command value. With the pre-fix harness
-    // (`propose_client_commands = false` and a zero no-op payload) this is
-    // `distinct == 1` for any `total`, and the assert fires.
-    try testing.expectEqual(stats.total, stats.distinct);
-
-    // Each applied command names the (term, index) of the leader that created
-    // it — mutate `commandFor` to a constant and this pins it.
-    var it = srv.checker.applied.iterator();
+    var seen: std.AutoHashMapUnmanaged(Command, void) = .empty;
+    defer seen.deinit(gpa);
+    var it = srv.applied_commands.iterator();
     while (it.next()) |kv| {
+        try seen.put(gpa, kv.value_ptr.*, {});
+        // Mutate `commandFor` to a constant and this pins it.
         const rec = srv.checker.committed.get(kv.key_ptr.*).?;
         try testing.expectEqual(commandFor(rec.term, kv.key_ptr.*), kv.value_ptr.*);
     }
+    try testing.expect(srv.applied_commands.count() >= 3);
+    try testing.expectEqual(srv.applied_commands.count(), seen.count());
 }
 
 /// The minority side of the directed schedule below: node 0 alone.
@@ -927,16 +651,13 @@ const CUT0 = [_]NodeId{0};
 ///
 ///  1. `partition` node 0 away. It is the term-1 leader and stays leader inside
 ///     its minority (Raft has no lease), so it keeps proposing — accumulating a
-///     LONG tail of STALE-term entries. This is the shape that could not exist
-///     before F1 was fixed: with no client commands proposed, a partitioned
-///     leader's log grew by exactly one no-op per term and could never outgrow
-///     the majority's.
+///     LONG tail of STALE-term entries.
 ///  2. `crash` the majority's term-2 leader, so the term-3 leader elected in its
 ///     place has never spoken to node 0 — its `nextIndex[0]` starts at its own
-///     log end, so re-syncing node 0 needs a long walk-back rather than one
+///     log end, so re-syncing node 0 needs a walk-back rather than one
 ///     matching batch.
-///  3. `heal`. Node 0 hears the term-3 leader, steps down and re-arms its
-///     election timer, but the walk-back has not yet cut its stale tail.
+///  3. `heal`. Node 0 hears the term-3 leader and steps down, but the walk-back
+///     has not yet cut its stale tail.
 ///  4. `crash` the term-3 leader before the walk-back finishes. Node 0 times out
 ///     first (lowest `election_spread` offset) and campaigns while still holding
 ///     the long stale tail.
@@ -983,10 +704,9 @@ test "positive control: the index-only §5.4.1 election restriction is caught LI
     }
 
     // (c) …and this is WHY it used to pass: with no client commands proposed
-    // (the pre-fix harness) the same defect, the same schedule and the same
-    // checkers see nothing at all, because a partitioned leader's log cannot
-    // grow and the index-only comparison never has anything to be wrong about.
-    // Set `propose_client_commands = false` and (b) above stops failing.
+    // the same defect, the same schedule and the same checkers see nothing at
+    // all, because a partitioned leader's log cannot grow and the index-only
+    // comparison never has anything to be wrong about.
     {
         var cfg = DEFAULT_CFG;
         cfg.propose_client_commands = false;
@@ -999,36 +719,23 @@ test "positive control: the index-only §5.4.1 election restriction is caught LI
     }
 }
 
-// ── stepping down must RE-ARM the election timer (a liveness regression) ────
+// ── a step-down must leave the node electable and able to vote ──────────────
 //
-// A leader has NO live election timer: `onTimer` sees `role == .leader` and
-// swallows the fired timer without re-arming it (a leader does not campaign
-// against itself), and `resetElectionTimer` is what re-arms. So from one full
-// timeout after it was elected, a leader's only route back to an armed timer is
-// a step-down that calls `resetElectionTimer`.
-//
-// `handleAppendReq` does that. Every OTHER step-down path did not: a higher term
-// observed on an AppendEntries RESPONSE, on a RequestVote response, or on a
-// RequestVote request that is refused (candidate's log not up to date) demoted
-// the node to `.follower` and left it with no timer at all. Such a node is not
-// wedged in any way a crash test can see — it answers every RPC correctly — it
-// has simply stopped being electable, forever, unless some other leader happens
-// to talk to it. If the rest of the cluster is gone, the cluster is dead with a
-// perfectly healthy-looking node in it.
-//
-// Hence the assertion below is on LIVENESS, not on state: a test that checked
-// `role == .follower` after the step-down passes against the bug — that part was
-// always right. What fails is that the timeout never comes.
+// Two liveness regressions the pre-`Node` plumbing had, kept as tests because
+// a state-based `checkFn` cannot see either: (1) a leader demoted by anything
+// but an AppendEntries REQUEST was left with no armed election timer — it
+// answered every RPC correctly and was never electable again; (2) a step-down
+// left `votedFor` naming last term's candidate, so the node refused a vote it
+// had to grant in the term it had just adopted. With tick-driven elections (1)
+// has no place to live any more — but the test is what proves it.
 
 const StepDownVia = enum {
-    /// `handleAppendResp` — a follower/candidate replies with a higher term.
+    /// A follower/candidate replies to an AppendEntries with a higher term.
     append_resp,
-    /// `handleVoteResp` — a peer's vote reply carries a higher term.
+    /// A peer's vote reply carries a higher term.
     vote_resp,
-    /// `handleVoteReq` — a candidate at a higher term whose log is NOT up to
-    /// date: the vote is REFUSED (so the grant branch's re-arm never runs) but
-    /// the term is still adopted and the role still drops to follower. Not
-    /// named in the finding; found by sweeping every `role = .follower` site.
+    /// A candidate at a higher term whose log is NOT up to date: the vote is
+    /// REFUSED but the term is still adopted and the role still drops.
     vote_req_refused,
 };
 
@@ -1043,10 +750,8 @@ const StepDownProbe = struct {
     inject_at: Time,
     /// If set, deliver a SECOND message this many ticks after the step-down: a
     /// legitimate RequestVote at the term the node has just adopted, from a
-    /// candidate whose log is exactly as up-to-date. Nothing about that message
-    /// carries a term bump, so `handleRequestVote`'s own step-up compensation
-    /// does not apply and the grant depends purely on `votedFor` having been
-    /// cleared by the step-down.
+    /// candidate whose log is exactly as up-to-date. Nothing about it carries a
+    /// term bump, so the grant depends purely on `votedFor` having been cleared.
     follow_up_after: ?Time = null,
     /// Observed at injection time — the preconditions the test asserts, so a
     /// scheduling change that stops producing the situation FAILS rather than
@@ -1082,8 +787,6 @@ const StepDownProbe = struct {
     fn reset(ctx: *anyopaque) void {
         const self = cast(ctx);
         const inner = self.srv.protocol();
-        // audit F3 (netsim): `Protocol.resetFn` is mandatory now, so this is
-        // no longer optional to unwrap.
         inner.resetFn(inner.ctx);
         self.injected = false;
         self.was_leader = false;
@@ -1119,40 +822,30 @@ const StepDownProbe = struct {
         }
     }
 
+    fn deliver(inner: Protocol, sim: *Sim, node: NodeId, from: NodeId, body: message.Body) anyerror!void {
+        var buf: [Message.append_header_len]u8 = undefined;
+        const m: Message = .{ .from = from, .to = node, .body = body };
+        const n = m.encode(&buf);
+        try inner.onMessageFn(inner.ctx, sim, node, from, buf[0..n]);
+    }
+
     fn stepDownInjection(self: *StepDownProbe, inner: Protocol, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.srv.nodes[node];
+        const ns = self.srv.node(node);
         self.injected = true;
         self.was_leader = ns.role == .leader;
-        self.term_before = ns.current_term;
+        self.term_before = ns.term;
         self.voted_for_before = ns.voted_for;
-        const higher = ns.current_term + 1;
+        const higher = ns.term + 1;
         const peer: NodeId = if (node == 0) 1 else 0;
         switch (self.via) {
-            .append_resp => {
-                var buf: [types.AppendEntriesResp.wire_len]u8 = undefined;
-                (types.AppendEntriesResp{ .term = higher, .success = false, .match_index = 0 }).encode(&buf);
-                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
-            },
-            .vote_resp => {
-                var buf: [types.RequestVoteResp.wire_len]u8 = undefined;
-                (types.RequestVoteResp{ .term = higher, .vote_granted = false }).encode(&buf);
-                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
-            },
-            .vote_req_refused => {
-                var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
-                // An EMPTY log at a higher term: §5.4.1 refuses the vote (the
-                // leader's own log is long), so only the term step-down runs.
-                (types.RequestVoteReq{
-                    .term = higher,
-                    .candidate_id = peer,
-                    .last_log_index = 0,
-                    .last_log_term = 0,
-                }).encode(&buf);
-                try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
-            },
+            .append_resp => try deliver(inner, sim, node, peer, .{ .append_resp = .{ .term = higher, .success = false, .index = 0 } }),
+            .vote_resp => try deliver(inner, sim, node, peer, .{ .vote_resp = .{ .term = higher, .granted = false } }),
+            // An EMPTY log at a higher term: §5.4.1 refuses the vote (the
+            // leader's own log is long), so only the term step-down runs.
+            .vote_req_refused => try deliver(inner, sim, node, peer, .{ .vote_req = .{ .term = higher, .last_log_index = 0, .last_log_term = 0 } }),
         }
         self.role_after = ns.role;
-        self.term_after = ns.current_term;
+        self.term_after = ns.term;
         if (self.follow_up_after) |d| try sim.setTimer(node, d, FOLLOWUP_TIMER);
     }
 
@@ -1160,18 +853,11 @@ const StepDownProbe = struct {
     /// (no step-up), from a candidate claiming this node's own log summary — so
     /// §5.4.1 is satisfied exactly, and the only remaining gate is `votedFor`.
     fn voteReqInjection(self: *StepDownProbe, inner: Protocol, sim: *Sim, node: NodeId) anyerror!void {
-        const ns = &self.srv.nodes[node];
+        const ns = self.srv.node(node);
         const peer: NodeId = if (node == 0) 1 else 0;
         const info = ns.log.info();
-        self.follow_up_term = ns.current_term;
-        var buf: [types.RequestVoteReq.wire_len]u8 = undefined;
-        (types.RequestVoteReq{
-            .term = ns.current_term,
-            .candidate_id = peer,
-            .last_log_index = info.last_index,
-            .last_log_term = info.last_term,
-        }).encode(&buf);
-        try inner.onMessageFn(inner.ctx, sim, node, peer, &buf);
+        self.follow_up_term = ns.term;
+        try deliver(inner, sim, node, peer, .{ .vote_req = .{ .term = ns.term, .last_log_index = info.last_index, .last_log_term = info.last_term } });
         self.follow_up_done = true;
         self.voted_for_after_follow_up = ns.voted_for;
     }
@@ -1185,17 +871,14 @@ const StepDownProbe = struct {
 
 /// Node 0 is the only candidate at t=100 and wins term 1 uncontested: the next
 /// node's first timeout is 40 ticks later, far past the ~12 ticks the election
-/// takes on a 5±2-tick link. Its own election timer then fires at t=200 and is
-/// swallowed by the `role == .leader` branch of `onTimer`, which is the state
-/// the regression needs.
+/// takes on a 5±2-tick link.
 const LIVENESS_CFG = RaftConfig{ .election_timeout = 100, .election_spread = 40, .heartbeat_period = 30 };
-const INJECT_AT: Time = 600;
+const INJECT_AT: Time = 603;
 const LIVENESS_UNTIL: Time = 1400;
 
-/// Isolate the target by crashing every peer one tick before the step-down, so
-/// that after it nothing can re-arm its timer FOR it. Without this the bug is
-/// masked: a surviving leader's next heartbeat lands in `handleAppendReq`, which
-/// re-arms — the one step-down path that was already correct.
+/// Isolate the target by crashing every peer just before the step-down, so
+/// that after it nothing can reset its timer FOR it: a surviving leader's next
+/// heartbeat would.
 const CRASH_PEERS = [_]netsim.FaultEvent{
     .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 1 } } },
     .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 2 } } },
@@ -1203,7 +886,7 @@ const CRASH_PEERS = [_]netsim.FaultEvent{
     .{ .time = INJECT_AT - 1, .kind = .{ .crash_node = .{ .node = 4 } } },
 };
 
-test "real: a leader demoted by a RESPONSE re-arms its election timer and stands for election again" {
+test "real: a leader demoted by a RESPONSE or a refused vote stands for election again" {
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
 
@@ -1211,12 +894,7 @@ test "real: a leader demoted by a RESPONSE re-arms its election timer and stands
         var srv = try RaftServer.init(gpa, CLUSTER_N, LIVENESS_CFG);
         defer srv.deinit(gpa);
         var probe = StepDownProbe{ .srv = &srv, .via = via, .target = 0, .inject_at = INJECT_AT };
-        const case = netsim.Case{
-            .seed = 5,
-            .scenario = scenario,
-            .protocol = probe.protocol(),
-            .until = LIVENESS_UNTIL,
-        };
+        const case = netsim.Case{ .seed = 5, .scenario = scenario, .protocol = probe.protocol(), .until = LIVENESS_UNTIL };
         const r = try netsim.replay(gpa, case, &CRASH_PEERS, null);
         try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
 
@@ -1228,17 +906,17 @@ test "real: a leader demoted by a RESPONSE re-arms its election timer and stands
         try testing.expectEqual(Role.follower, probe.role_after);
         try testing.expectEqual(probe.term_before + 1, probe.term_after);
 
-        // Liveness: 800 ticks — eight election timeouts — after the step-down,
-        // the node must have STOOD FOR ELECTION. With the timer left unarmed it
-        // sits at exactly `term_after` in `.follower` forever, answering RPCs.
-        try testing.expect(srv.nodes[0].current_term > probe.term_after);
-        try testing.expectEqual(Role.candidate, srv.nodes[0].role);
-        try testing.expectEqual(@as(NodeId, 0), srv.nodes[0].voted_for);
+        // Liveness: 800 time units — eight election timeouts — after the
+        // step-down, the node must have STOOD FOR ELECTION.
+        const n0 = srv.node(0);
+        try testing.expect(n0.term > probe.term_after);
+        try testing.expectEqual(Role.candidate, n0.role);
+        try testing.expectEqual(@as(NodeId, 0), n0.voted_for);
     }
 }
 
-/// Ten ticks after the step-down — well inside the fresh election timeout, so
-/// the node is still sitting at the term it just adopted and has not yet
+/// Ten time units after the step-down — well inside the fresh election
+/// timeout, so the node is still at the term it just adopted and has not yet
 /// campaigned (which would set `votedFor` to itself and destroy the observable).
 const FOLLOW_UP_AFTER: Time = 10;
 
@@ -1246,18 +924,10 @@ test "real: a step-down CLEARS votedFor, so the node can still vote in the term 
     if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
 
-    // Two messages, because one cannot see this. `handleRequestVote` computes
-    // `effective_vote = if (term_advanced) no_vote else voted_for`, so the
-    // message that CARRIES the higher term is decided as if the vote were
-    // already cleared — a single-message test is green either way. The stale
-    // `votedFor` only bites the NEXT request, which arrives at a term that is no
-    // longer new: `term_advanced` is false, the compensation does not fire, and
-    // the node refuses a vote it must grant. §5.1 requires `votedFor` to reset
-    // whenever `currentTerm` changes, and that reset is `stepDown`'s job.
-    //
-    // The consequence is liveness again, and again invisible to a state-based
-    // `checkFn`: the refusal is a perfectly well-formed reply, and every node
-    // involved looks healthy. The cluster just fails to elect for another term.
+    // Two messages, because one cannot see this. `handleRequestVote` treats the
+    // message that CARRIES the higher term as if the vote were already cleared,
+    // so a single-message test is green either way. The stale `votedFor` only
+    // bites the NEXT request, at a term that is no longer new.
     for ([_]StepDownVia{ .append_resp, .vote_resp, .vote_req_refused }) |via| {
         var srv = try RaftServer.init(gpa, CLUSTER_N, LIVENESS_CFG);
         defer srv.deinit(gpa);
@@ -1268,181 +938,71 @@ test "real: a step-down CLEARS votedFor, so the node can still vote in the term 
             .inject_at = INJECT_AT,
             .follow_up_after = FOLLOW_UP_AFTER,
         };
-        const case = netsim.Case{
-            .seed = 5,
-            .scenario = scenario,
-            .protocol = probe.protocol(),
-            .until = LIVENESS_UNTIL,
-        };
+        const case = netsim.Case{ .seed = 5, .scenario = scenario, .protocol = probe.protocol(), .until = LIVENESS_UNTIL };
         const r = try netsim.replay(gpa, case, &CRASH_PEERS, null);
         try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
 
         // Preconditions: it was the leader of `term_before`, which means it had
-        // voted for ITSELF in that term — the stale value that must not survive
-        // into the next one.
+        // voted for ITSELF in that term — the stale value that must not survive.
         try testing.expect(probe.injected);
         try testing.expect(probe.was_leader);
         try testing.expectEqual(@as(NodeId, 0), probe.voted_for_before);
         try testing.expectEqual(probe.term_before + 1, probe.term_after);
 
-        // The second message arrived at the SAME term the step-down adopted —
-        // the condition under which `handleRequestVote`'s step-up compensation
-        // cannot help.
+        // The second message arrived at the SAME term the step-down adopted.
         try testing.expect(probe.follow_up_done);
         try testing.expectEqual(probe.term_after, probe.follow_up_term);
 
-        // …and the vote was GRANTED. With `votedFor` left naming node 0 itself,
-        // `may_vote` is false and this stays 0 (the stale self-vote).
+        // …and the vote was GRANTED.
         try testing.expectEqual(@as(NodeId, 1), probe.voted_for_after_follow_up);
     }
 }
 
-/// Drive raw payloads into `node` as if they arrived from `from`, through the
-/// real `Protocol` vtable.
-fn feedFrom(srv: *RaftServer, node: NodeId, from: NodeId, payloads: []const []const u8) !void {
-    const gpa = testing.allocator;
-    var log: netsim.Log = .{};
-    defer log.deinit(gpa);
-    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
-    defer sim.deinit();
-    try scenario(&sim);
-    const p = srv.protocol();
-    for (payloads) |payload| try p.onMessageFn(p.ctx, &sim, node, from, payload);
-}
-
-/// AppendEntries wire bytes, written into `buf`.
-fn encodeAppend(buf: *[types.AppendEntriesReq.max_wire]u8, prev_index: LogIndex, prev_term: Term, entries: []const LogEntry, leader_commit: LogIndex) []const u8 {
-    const n = (types.AppendEntriesReq{
-        .term = 1,
-        .leader_id = 1,
-        .prev_log_index = prev_index,
-        .prev_log_term = prev_term,
-        .entries = entries,
-        .leader_commit = leader_commit,
-    }).encode(buf);
-    return buf[0..n];
-}
-
-test "the naive §5.3 truncation rule rolls back COMMITTED entries; the conflict-only rule keeps them" {
-    const gpa = testing.allocator;
-    const e = [_]LogEntry{
-        .{ .term = 1, .command = commandFor(1, 1) },
-        .{ .term = 1, .command = commandFor(1, 2) },
-        .{ .term = 1, .command = commandFor(1, 3) },
-        .{ .term = 1, .command = commandFor(1, 4) },
-        .{ .term = 1, .command = commandFor(1, 5) },
-    };
-    var b1: [types.AppendEntriesReq.max_wire]u8 = undefined;
-    var b2: [types.AppendEntriesReq.max_wire]u8 = undefined;
-    const ae1 = encodeAppend(&b1, 0, 0, e[0..3], 0);
-    const ae2 = encodeAppend(&b2, 3, 1, e[3..5], 5);
-    // AE#1, then AE#2, then a DUPLICATE of AE#1 arriving late (netsim's
-    // `dup_once` / `delay_once` produce exactly this).
-    const stream = [_][]const u8{ ae1, ae2, ae1 };
-
-    // Conflict-only (§5.3): the duplicate matches entry-for-entry, so nothing
-    // is cut and nothing is re-appended.
-    {
-        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
-        defer srv.deinit(gpa);
-        try feedFrom(&srv, 0, 1, &stream);
-        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].log.lastIndex());
-        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].commit_index);
-        try testing.expectEqual(@as(LogIndex, 5), srv.nodes[0].last_applied);
-    }
-
-    // Naive ("cut everything after prevLogIndex, re-append the batch"): the
-    // duplicate deletes indices 4 and 5 — which this follower had already
-    // COMMITTED and APPLIED. The state machine is now ahead of the log.
-    {
-        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
-        defer srv.deinit(gpa);
-        srv.bug = .naive_truncation;
-        try feedFrom(&srv, 0, 1, &stream);
-        try testing.expectEqual(@as(LogIndex, 3), srv.nodes[0].log.lastIndex());
-        try testing.expect(srv.nodes[0].last_applied > srv.nodes[0].log.lastIndex());
-    }
-
-    // NOTE (beyond the finding): this rollback is still INVISIBLE to the live
-    // model-check, distinct commands or not. An entry's identity is
-    // `(creating term, index)` — Election Safety makes that unique — so when the
-    // same leader re-replicates indices 4 and 5 it restores byte-identical
-    // entries, and `recordApply` sees the value it already has. The §5.3
-    // conflict-rule trap therefore remains covered by `safety.zig`'s unit test
-    // (`§5.3 the trap`) and by this test, NOT by the fuzzed sweep. F1's other
-    // half — the §5.4.1 election restriction — is the one the sweep now catches.
-}
-
-// ── malformed inbound messages: dropped, counted, never fatal ───────────────
+// ── malformed inbound messages, through the real Protocol entry point ───────
 //
-// Every payload below used to PANIC inside `onMessage` (out-of-bounds index,
-// "invalid enum value", or — with safety off — an out-of-bounds write past
-// `handleAppendReq`'s 8-element `scratch`). Driving them through the real
-// `Protocol` vtable is what proves the fix reaches the actual entry point and
-// not just the codec: `tagOf` runs before any decoder, so a fail-closed
-// decoder behind a panicking tag read would never have been reached.
+// `node.zig` pins the node-level rules; this proves the drops reach the
+// harness's counter, which is what the sweep below holds at 0.
 
-fn feedMalformed(srv: *RaftServer, payloads: []const []const u8) !void {
-    const gpa = testing.allocator;
-    var log: netsim.Log = .{};
-    defer log.deinit(gpa);
-    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
-    defer sim.deinit();
+fn startedSim(gpa: Allocator, srv: *RaftServer, log: *netsim.Log) !netsim.Sim {
+    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), log, UNTIL, 10_000);
+    errdefer sim.deinit();
     try scenario(&sim);
     const p = srv.protocol();
-    for (payloads) |payload| try p.onMessageFn(p.ctx, &sim, 0, 1, payload);
+    for (0..CLUSTER_N) |i| try p.onStartFn.?(p.ctx, &sim, @intCast(i));
+    return sim;
 }
 
 test "malformed inbound messages are dropped and counted, and never crash the node" {
     const gpa = testing.allocator;
     var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
     defer srv.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try startedSim(gpa, &srv, &log);
+    defer sim.deinit();
 
-    // A header claiming 65535 entries — the out-of-bounds WRITE.
-    var lying_count = [_]u8{0} ** types.AppendEntriesReq.header_len;
-    lying_count[0] = @intFromEnum(types.RpcTag.append_entries_req);
-    std.mem.writeInt(u16, lying_count[37..39], 0xFFFF, .little);
+    // The old format's frames are garbage to a `Node` too.
+    var old: [types.RequestVoteReq.wire_len]u8 = undefined;
+    (types.RequestVoteReq{ .term = 5, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 }).encode(&old);
+    const cases = [_][]const u8{ &.{}, &.{99}, &.{0x10}, &.{0x12}, &.{0x13}, &old };
+    const p = srv.protocol();
+    for (cases) |c| try p.onMessageFn(p.ctx, &sim, 0, 1, c);
 
-    // A well-formed tag whose entry count exceeds the bytes present.
-    var short_batch = [_]u8{0} ** types.AppendEntriesReq.header_len;
-    short_batch[0] = @intFromEnum(types.RpcTag.append_entries_req);
-    std.mem.writeInt(u16, short_batch[37..39], 4, .little);
+    try testing.expectEqual(@as(u64, cases.len), srv.malformedDropped());
+    const n0 = srv.node(0);
+    try testing.expectEqual(@as(Term, 0), n0.term);
+    try testing.expectEqual(no_vote, n0.voted_for);
+    try testing.expectEqual(@as(LogIndex, 0), n0.lastIndex());
 
-    const cases = [_][]const u8{
-        &.{}, // empty: tagOf out of bounds
-        &.{99}, // undefined RPC tag: "invalid enum value"
-        &.{@intFromEnum(types.RpcTag.request_vote_req)}, // the reported reproducer
-        &.{@intFromEnum(types.RpcTag.request_vote_resp)},
-        &.{@intFromEnum(types.RpcTag.append_entries_req)},
-        &.{@intFromEnum(types.RpcTag.append_entries_resp)},
-        &lying_count,
-        &short_batch,
-    };
-    try feedMalformed(&srv, &cases);
-
-    // Every one was dropped — counted, not silently swallowed.
-    try testing.expectEqual(@as(u64, cases.len), srv.malformed_dropped);
-    // …and none of them moved the consensus state.
-    for (srv.nodes) |*n| {
-        try testing.expectEqual(@as(Term, 0), n.current_term);
-        try testing.expectEqual(no_vote, n.voted_for);
-        try testing.expectEqual(@as(LogIndex, 0), n.log.lastIndex());
-    }
-}
-
-test "a well-formed message is still accepted (the guard is not over-tight)" {
-    const gpa = testing.allocator;
-    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
-    defer srv.deinit(gpa);
-
-    var rq: [types.RequestVoteReq.wire_len]u8 = undefined;
-    (types.RequestVoteReq{ .term = 5, .candidate_id = 1, .last_log_index = 0, .last_log_term = 0 }).encode(&rq);
-    try feedMalformed(&srv, &.{&rq});
-
-    try testing.expectEqual(@as(u64, 0), srv.malformed_dropped);
-    // The vote request was acted on: node 0 stepped up to term 5 and voted.
-    try testing.expectEqual(@as(Term, 5), srv.nodes[0].current_term);
-    try testing.expectEqual(@as(NodeId, 1), srv.nodes[0].voted_for);
+    // The guard is not over-tight: a well-formed RequestVote is acted on.
+    var buf: [Message.vote_req_len]u8 = undefined;
+    _ = (Message{ .from = 1, .to = 0, .body = .{ .vote_req = .{ .term = 5, .last_log_index = 0, .last_log_term = 0 } } }).encode(&buf);
+    try p.onMessageFn(p.ctx, &sim, 0, 1, &buf);
+    try testing.expectEqual(@as(u64, cases.len), srv.malformedDropped());
+    try testing.expectEqual(@as(Term, 5), n0.term);
+    try testing.expectEqual(@as(NodeId, 1), n0.voted_for);
+    // …and the vote reached the server's disk before the reply left.
+    try testing.expectEqual(@as(NodeId, 1), srv.slots[0].disk_hs.voted_for);
 }
 
 test "real: the model-checked cluster never drops a message of its own making" {
@@ -1462,45 +1022,32 @@ test "real: the model-checked cluster never drops a message of its own making" {
         case.seed = seed;
         var gr = try netsim.run(gpa, case, .{});
         defer gr.trace.deinit();
-        try testing.expectEqual(@as(u64, 0), srv.malformed_dropped);
+        try testing.expectEqual(@as(u64, 0), srv.malformedDropped());
     }
 }
 
-test "a leader rejects an AppendEntriesResp claiming more log than it has" {
-    // `match_index` is an unconstrained wire u64 and `decode` bounds only the
-    // term, so `next_index = match_index + 1` was an unconditional increment
-    // on peer-controlled input -- the shape `max_term` exists to rule out for
-    // `current_term`. Rejected rather than clamped: clamping would record the
-    // follower as having matched the WHOLE log, and `leaderCommitIndex`
-    // counts exactly those values for its majority, so a forged response
-    // could commit entries no majority ever replicated.
+test "real: a crashed server restarts from its disk alone and the cluster stays safe" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
     const gpa = testing.allocator;
     var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
     defer srv.deinit(gpa);
-
-    var log: netsim.Log = .{};
-    defer log.deinit(gpa);
-    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
-    defer sim.deinit();
-    try scenario(&sim);
-
-    // Put node 0 in the one state that reaches the arithmetic.
-    const ns = &srv.nodes[0];
-    ns.role = .leader;
-    ns.current_term = 1;
-
-    var payload = [_]u8{0} ** 18;
-    payload[0] = @intFromEnum(types.RpcTag.append_entries_resp);
-    std.mem.writeInt(u64, payload[1..9], 1, .little); // term == leader's
-    payload[9] = 1; // success
-    std.mem.writeInt(u64, payload[10..18], std.math.maxInt(u64), .little);
-
-    const before = srv.malformed_dropped;
-    const p = srv.protocol();
-    try p.onMessageFn(p.ctx, &sim, 0, 1, &payload);
-
-    // Dropped and counted, and nothing about the peer's replication state moved.
-    try testing.expectEqual(before + 1, srv.malformed_dropped);
-    try testing.expectEqual(@as(LogIndex, 0), ns.match_index[1]);
-    try testing.expect(ns.commit_index == 0);
+    // Crash the first leader mid-run and bring it back much later.
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 600, .kind = .{ .crash_node = .{ .node = 0 } } },
+        .{ .time = 1200, .kind = .{ .restart_node = .{ .node = 0 } } },
+    };
+    const case = netsim.Case{ .seed = 11, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+    const r = try netsim.replay(gpa, case, &trace, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    // The restarted incarnation came back from the disk (epoch 2), lost its
+    // volatile state, and caught up with the new leader's log.
+    try testing.expectEqual(@as(u64, 2), srv.slots[0].epoch);
+    var leader: ?NodeId = null;
+    for (1..CLUSTER_N) |i| {
+        if (srv.node(@intCast(i)).role == .leader) leader = @intCast(i);
+    }
+    const l = leader orelse return error.NoLeader;
+    try testing.expect(srv.node(0).term >= 2);
+    try testing.expect(srv.node(0).lastIndex() + types.max_entries_per_msg >= srv.node(l).lastIndex());
+    try testing.expect(srv.node(0).applied > 0);
 }

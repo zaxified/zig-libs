@@ -1,118 +1,159 @@
 // SPDX-License-Identifier: MIT
 
-//! What a consumer builds `raft` INTO: a follower's RPC receive path running
-//! over its OWN transport, not `netsim`. The module ships two kinds of public
-//! surface — a simulation harness (`RaftServer`, `scenario`, the `netsim`
-//! wiring) for model-checking, and the underlying decision kernel (`types`'
-//! wire codecs + `safety`'s pure `handleRequestVote` / `handleAppendEntries`)
-//! that a real server calls directly against RPCs that arrived over TCP,
-//! QUIC, whatever transport the consumer already has. This example is the
-//! second kind: decode two RPCs off the wire, run them through the safety
-//! kernel, and apply the mechanical log mutation the kernel's verdict
-//! prescribes — exactly what `server.zig` does internally, but from OUTSIDE
-//! the module, which is what proves the kernel is usable standalone.
+//! What a consumer builds `raft` INTO: three `raft.Node`s replicating a tiny
+//! key-value log, with the caller supplying everything a node does not own —
+//! the clock (`tick`), the transport (here a FIFO of encoded frames; in a
+//! deployment, TCP or QUIC), the disk (here a slice per node; in a deployment,
+//! fsync) and the state machine (here a list of applied commands).
+//!
+//! The loop every server runs is the one in `drain`: persist what `ready`
+//! says, THEN send its messages, THEN apply its committed entries, then
+//! `advance`. Crashing a node below throws away everything but its disk, and
+//! the restarted node catches up from the leader.
 //!
 //! Built against the PUBLISHED module (`@import("raft")`) only.
 
 const std = @import("std");
 const raft = @import("raft");
 
+const N = 3;
+
+const Server = struct {
+    node: ?raft.Node = null,
+    // "Disk": what survives a crash.
+    hs: raft.HardState = .{},
+    log: std.ArrayList(raft.Entry) = .empty,
+    // State machine: rebuilt from the log on every start.
+    applied: std.ArrayList([]const u8) = .empty,
+};
+
+const Frame = struct { from: raft.NodeId, to: raft.NodeId, bytes: []u8 };
+
+const Cluster = struct {
+    gpa: std.mem.Allocator,
+    servers: [N]Server = @splat(.{}),
+    wire: std.ArrayList(Frame) = .empty,
+
+    fn start(c: *Cluster, id: raft.NodeId) !void {
+        const s = &c.servers[id];
+        s.node = try raft.Node.init(c.gpa, .{
+            .id = id,
+            .cluster_size = N,
+            .election_ticks = 10,
+            .election_jitter_ticks = 10,
+            .heartbeat_ticks = 2,
+            .seed = 0x5eed + id, // distinct per server: no lockstep timeouts
+        }, .{ .hard_state = s.hs, .entries = s.log.items });
+        s.applied.clearRetainingCapacity();
+    }
+
+    fn crash(c: *Cluster, id: raft.NodeId) void {
+        c.servers[id].node.?.deinit();
+        c.servers[id].node = null;
+    }
+
+    /// The contract, in its order: persist, send, apply, advance.
+    fn drain(c: *Cluster, id: raft.NodeId) !void {
+        const s = &c.servers[id];
+        const node = &s.node.?;
+        while (node.hasReady()) {
+            const rd = try node.ready();
+            // 1. persist
+            if (rd.hard_state) |hs| s.hs = hs;
+            if (rd.truncate_after) |t| {
+                while (s.log.items.len > t) c.gpa.free(s.log.pop().?.data);
+            }
+            for (rd.entries) |e| {
+                var owned = e;
+                owned.data = try c.gpa.dupe(u8, e.data);
+                try s.log.append(c.gpa, owned);
+            }
+            // 2. send
+            for (rd.messages) |m| try c.wire.append(c.gpa, .{ .from = m.from, .to = m.to, .bytes = try m.encodeAlloc(c.gpa) });
+            // 3. apply (the bytes stay valid: they live on this server's disk)
+            for (rd.committed) |e| {
+                if (e.kind == .command) try s.applied.append(c.gpa, s.log.items[@intCast(e.index - 1)].data);
+            }
+            try node.advance();
+        }
+    }
+
+    fn deliverAll(c: *Cluster) !void {
+        while (c.wire.items.len > 0) {
+            const f = c.wire.orderedRemove(0);
+            defer c.gpa.free(f.bytes);
+            if (c.servers[f.to].node) |*node| {
+                // A frame that does not decode is dropped and counted inside.
+                try node.stepBytes(f.from, f.bytes);
+                try c.drain(f.to);
+            }
+        }
+    }
+
+    fn tick(c: *Cluster, times: usize) !void {
+        for (0..times) |_| {
+            for (&c.servers, 0..) |*s, id| {
+                if (s.node) |*node| {
+                    try node.tick();
+                    try c.drain(@intCast(id));
+                }
+            }
+            try c.deliverAll();
+        }
+    }
+
+    fn leader(c: *Cluster) ?raft.NodeId {
+        for (c.servers, 0..) |s, id| {
+            if (s.node) |node| if (node.role == .leader) return @intCast(id);
+        }
+        return null;
+    }
+
+    fn deinit(c: *Cluster) void {
+        for (&c.servers) |*s| {
+            if (s.node) |*node| node.deinit();
+            for (s.log.items) |e| c.gpa.free(e.data);
+            s.log.deinit(c.gpa);
+            s.applied.deinit(c.gpa);
+        }
+        for (c.wire.items) |f| c.gpa.free(f.bytes);
+        c.wire.deinit(c.gpa);
+    }
+};
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    // This follower is at term 3, has not voted this term, and holds two
-    // entries from term 1 and term 2.
-    var log: raft.Log = .{};
-    defer log.deinit(gpa);
-    try log.append(gpa, .{ .term = 1, .command = 10 });
-    try log.append(gpa, .{ .term = 2, .command = 11 });
+    var c: Cluster = .{ .gpa = gpa };
+    defer c.deinit();
+    for (0..N) |id| try c.start(@intCast(id));
 
-    var current_term: raft.Term = 3;
-    var voted_for: raft.NodeId = raft.no_vote;
-    var commit_index: raft.LogIndex = 1;
+    try c.tick(40);
+    const l = c.leader() orelse return error.NoLeaderElected;
+    std.debug.print("node {d} is leader of term {d}\n", .{ l, c.servers[l].node.?.term });
 
-    // ── a RequestVote arrives as wire bytes (a peer over our own transport) ──
-    var rv_buf: [raft.RequestVoteReq.wire_len]u8 = undefined;
-    (raft.RequestVoteReq{
-        .term = 4,
-        .candidate_id = 7,
-        .last_log_index = 2,
-        .last_log_term = 2,
-    }).encode(&rv_buf);
+    for ([_][]const u8{ "city=Brno", "river=Svratka" }) |cmd| _ = try c.servers[l].node.?.propose(cmd);
+    try c.drain(l);
+    try c.tick(5);
 
-    // This buffer was just encoded above, not received off a real wire, so a
-    // decode failure here means encode/decode disagree with each other, not
-    // "malformed peer datagram" — a module regression, not an expected path.
-    const rv_req = raft.RequestVoteReq.decode(&rv_buf) catch |err| switch (err) {
-        error.Truncated, error.InvalidEncoding => return err,
-    };
-
-    const vote = raft.handleRequestVote(current_term, voted_for, log.info(), rv_req);
-    if (vote.term_advanced) current_term = vote.new_term;
-    if (vote.grant) voted_for = vote.voted_for;
-    std.debug.print("RequestVote from node {d}: grant={}, term now {d}\n", .{
-        rv_req.candidate_id, vote.grant, current_term,
+    // Crash a follower, keep writing, bring it back from its disk alone.
+    const f: raft.NodeId = (l + 1) % N;
+    c.crash(f);
+    _ = try c.servers[l].node.?.propose("hill=Spilberk");
+    try c.drain(l);
+    try c.tick(5);
+    try c.start(f);
+    std.debug.print("node {d} restarted with {d} entries on disk, commit index {d}\n", .{
+        f, c.servers[f].log.items.len, c.servers[f].node.?.commit,
     });
-    // The candidate's term (4) is ahead of ours (3), we have not voted this
-    // term, and its log (last entry term=2, index=2) is at least as
-    // up-to-date as ours (term=2, index=2) — §5.4.1 grants the vote.
-    if (!vote.grant) return error.VoteUnexpectedlyDenied;
+    try c.tick(10);
 
-    // ── AppendEntries from the leader we just voted for ─────────────────────
-    //
-    // `AppendEntriesReq.decode` writes into a caller-owned `*[N]LogEntry`
-    // scratch array sized to the wire format's own entry cap. `raft` does not
-    // re-export the constant that cap is defined from (`types.max_entries_
-    // per_msg`, private to the module) — the size has to be rederived from
-    // the two wire-length constants it DOES export. See the note at the
-    // bottom of this file.
-    const max_entries_per_msg = (raft.AppendEntriesReq.max_wire - raft.AppendEntriesReq.header_len) / raft.LogEntry.wire_len;
-
-    const new_entries = [_]raft.LogEntry{.{ .term = 4, .command = 99 }};
-    var ae_buf: [raft.AppendEntriesReq.max_wire]u8 = undefined;
-    const ae_len = (raft.AppendEntriesReq{
-        .term = 4,
-        .leader_id = 7,
-        .prev_log_index = 2,
-        .prev_log_term = 2,
-        .entries = &new_entries,
-        .leader_commit = 2,
-    }).encode(&ae_buf);
-
-    var entry_scratch: [max_entries_per_msg]raft.LogEntry = undefined;
-    // Same reasoning as above: this is our own just-encoded buffer, so a
-    // decode failure is encode/decode disagreeing, not a hostile peer.
-    const ae_req = raft.AppendEntriesReq.decode(ae_buf[0..ae_len], &entry_scratch) catch |err| switch (err) {
-        error.Truncated, error.InvalidEncoding => return err,
-    };
-
-    const outcome = raft.handleAppendEntries(current_term, &log, commit_index, ae_req);
-    if (outcome.term_advanced) current_term = outcome.new_term;
-    // prevLogIndex=2/prevLogTerm=2 matches this follower's log exactly, so
-    // §5.3's consistency check must pass.
-    if (!outcome.success) return error.AppendEntriesUnexpectedlyRejected;
-
-    // The kernel decided WHAT to do (conflict-only truncation, which entries
-    // to append, where commitIndex may advance); applying that verdict to the
-    // log is mechanical and is ours to do, exactly as `server.zig` does.
-    log.truncateAfter(outcome.truncate_to);
-    try log.appendSlice(gpa, ae_req.entries[outcome.append_from..]);
-    commit_index = outcome.new_commit_index;
-
-    std.debug.print(
-        "AppendEntries accepted: log now has {d} entries, commitIndex={d}, matchIndex={d}\n",
-        .{ log.lastIndex(), commit_index, outcome.match_index },
-    );
-
-    // Reply the leader needs to advance matchIndex/nextIndex for this node —
-    // encoded the same way this follower would put it back on the wire.
-    var resp_buf: [raft.AppendEntriesResp.wire_len]u8 = undefined;
-    (raft.AppendEntriesResp{
-        .term = current_term,
-        .success = true,
-        .match_index = outcome.match_index,
-    }).encode(&resp_buf);
-    std.debug.print("reply: {d} bytes ready to send back to the leader\n", .{resp_buf.len});
+    for (c.servers, 0..) |s, id| {
+        std.debug.print("node {d} applied:", .{id});
+        for (s.applied.items) |a| std.debug.print(" {s}", .{a});
+        std.debug.print("\n", .{});
+        if (s.applied.items.len != 3) return error.NotReplicated;
+    }
 }
