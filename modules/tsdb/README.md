@@ -131,7 +131,7 @@ try db.appendBatch(&.{
 // A byte BUDGET on live data (kvtree never shrinks the file — see below):
 // drops the globally oldest points, by timestamp across every series, until
 // live data fits (or opts.max_deletes is spent — call again to continue).
-const size = try db.liveSize();               // exact: every point is 25 bytes
+const size = try db.liveSize();               // exact: raw points + block bytes
 const r = try db.sweepToBudget(64 << 20, .{});
 // r.before / r.after / r.deleted / r.done
 ```
@@ -158,12 +158,40 @@ the emptied leaves stayed in the tree and the file grew ~60 KiB per 1000 points 
 steady size is above `liveSize`: pages are not repacked, and pages freed while a reader holds a
 snapshot wait for it.
 
-## Not in v1 (deliberate, see `SPEC.md`)
+## Compression and series deletion
 
-Sample compression (Gorilla-style delta-of-delta timestamps + XOR floats),
-downsampling/rollups, any query language, and aggregation functions. These are
-scope decisions, not oversights; each is listed in `SPEC.md` with what it would
-take.
+```zig
+// Pack everything older than an hour into Gorilla blocks (delta-of-delta
+// timestamps, XOR'd values; up to 1024 samples / 1 KiB per block). Writes keep
+// landing raw — cheap appends, overwrites, out-of-order — and reads merge the
+// two; a raw sample shadows a block sample with the same timestamp.
+const c = try db.compact(now_ms - std.time.ms_per_hour, .{});
+// c.compacted / c.blocks_written / c.done
+
+// Drop one series: every sample (raw and compacted), then its index entries,
+// in bounded transactions. The id is never reused.
+_ = try db.deleteSeries(id, .{});
+```
+
+Measured on copies of real stores (2026-10-04): ttydesk's history (16 series,
+3080 samples) went from 25.0 to 2.72 bytes per sample of live data (9.2×,
+including the block keys); a regular 15 s gauge packs below 0.5 byte per sample
+inside a block. A series with only a handful of samples gains little — the
+17-byte block key dominates. `compact` leaves a series' newest run raw until it
+has `min_run` (64) samples below the horizon, so compacting every minute does
+not cut a tiny block per minute; samples that land inside or between existing
+blocks are always merged. Compaction is idempotent, one transaction per chunk,
+crash-swept like retention. Retention (`sweep`) deletes whole expired blocks and
+rewrites the one straddling the cutoff; `sweepToBudget` drops whole blocks,
+oldest first. Stores written before compaction existed need nothing: their
+samples are raw, and stay readable as they are until `compact` packs them.
+
+## Not built (deliberate, see `SPEC.md`)
+
+Downsampling/rollups, label matchers beyond exact/superset (`!=`, regex, a
+cross-metric lookup), per-series retention, any query language, and
+aggregation functions. These are scope decisions, not oversights; each is
+listed in `SPEC.md` with what it would take.
 
 ## Verify
 
@@ -173,7 +201,8 @@ zig build test-tsdb -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
 All tests run for real (no skips). The key codec's ordering identity is a
-property test over random and boundary `(series, timestamp)` pairs; retention is
-checked against a crash sweep over every storage side effect in all four
-`kv.SimStorage` crash modes. See `SPEC.md` for the verification argument and the
+property test over random and boundary `(series, timestamp)` pairs; retention and
+compaction are checked against a crash sweep over every storage side effect in
+all four `kv.SimStorage` crash modes; a model check drives random appends,
+overwrites, late samples, compactions and sweeps against a plain map. See `SPEC.md` for the verification argument and the
 mutation results.

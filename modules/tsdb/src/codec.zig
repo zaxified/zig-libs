@@ -53,6 +53,12 @@ pub const tag_point: u8 = 0x01;
 pub const tag_series_index: u8 = 0x02;
 /// Reverse index: `tag | series_id(BE u64)` → canonical(name, labels).
 pub const tag_series_rev: u8 = 0x03;
+// 0x04 is reserved for the inverted label index (SPEC §9).
+/// A compacted block of samples: `tag | series_id(BE u64) | orderedTs(LAST
+/// sample, BE u64)` → `chunk.zig` block bytes. Keyed by the LAST timestamp so
+/// that `seek(blockKey(series, from))` lands on the first block that can hold
+/// a sample at or after `from` — kvtree's cursor only moves forward.
+pub const tag_block: u8 = 0x05;
 
 pub const point_key_len = 1 + 8 + 8;
 /// A point key plus one byte — the successor used to resume a scan strictly
@@ -119,6 +125,32 @@ pub fn pointKeySuccessor(key: [point_key_len]u8) [max_scan_key_len]u8 {
     @memcpy(out[0..point_key_len], &key);
     out[point_key_len] = 0;
     return out;
+}
+
+// ── block keys ───────────────────────────────────────────────────────────────
+
+pub const block_key_len = 1 + 8 + 8;
+
+/// `tag_block | series(BE) | orderedTs(last)(BE)` — the same fixed-width shape
+/// as a point key, so byte order equals `(series, last ts)` order.
+pub fn blockKey(series: SeriesId, last_ts: Timestamp) [block_key_len]u8 {
+    var out = pointKey(series, last_ts);
+    out[0] = tag_block;
+    return out;
+}
+
+/// Decode a block key (series, LAST timestamp), or null if `key` is not one.
+pub fn decodeBlockKey(key: []const u8) ?PointRef {
+    if (key.len != block_key_len or key[0] != tag_block) return null;
+    return .{
+        .series = std.mem.readInt(u64, key[1..9], .big),
+        .ts = unorderedTs(std.mem.readInt(u64, key[9..17], .big)),
+    };
+}
+
+/// The smallest block key of `series`.
+pub fn seriesBlockStartKey(series: SeriesId) [block_key_len]u8 {
+    return blockKey(series, std.math.minInt(Timestamp));
 }
 
 // ── sample values ────────────────────────────────────────────────────────────
@@ -360,6 +392,30 @@ test "point keys sort inside the point tag partition, never outside it" {
     try testing.expect(std.mem.order(u8, &meta_key_retention, &lo) == .lt);
     try testing.expect(std.mem.order(u8, &hi, &[_]u8{tag_series_index}) == .lt);
     try testing.expect(std.mem.order(u8, &hi, &[_]u8{tag_series_rev}) == .lt);
+}
+
+test "block keys: own partition above every index entry, (series, last ts) order, decode round trip" {
+    // The block partition is one contiguous run ABOVE the indexes, so a point
+    // scan that leaves its partition never wanders into blocks by accident and
+    // a block scan never into points.
+    const lo = seriesBlockStartKey(0);
+    const hi_rev = [_]u8{ tag_series_rev, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    try testing.expect(std.mem.order(u8, &hi_rev, &lo) == .lt);
+    try testing.expect(std.mem.order(u8, &pointKey(std.math.maxInt(u64), std.math.maxInt(i64)), &lo) == .lt);
+    // Same order identity as point keys, including pre-epoch timestamps.
+    const ts_vals = [_]Timestamp{ std.math.minInt(i64), -1, 0, 1, 255, 256, std.math.maxInt(i64) };
+    for ([_]SeriesId{ 0, 1, 256, std.math.maxInt(u64) }) |sa| for (ts_vals) |ta| {
+        const ka = blockKey(sa, ta);
+        const back = decodeBlockKey(&ka).?;
+        try testing.expectEqual(sa, back.series);
+        try testing.expectEqual(ta, back.ts);
+        try testing.expect(decodePointKey(&ka) == null); // never mistaken for a point
+        for ([_]SeriesId{ 0, 1, 256, std.math.maxInt(u64) }) |sb| for (ts_vals) |tb| {
+            const want: std.math.Order = if (sa != sb) std.math.order(sa, sb) else std.math.order(ta, tb);
+            try testing.expectEqual(want, std.mem.order(u8, &ka, &blockKey(sb, tb)));
+        };
+    };
+    try testing.expect(decodeBlockKey(&pointKey(1, 1)) == null);
 }
 
 test "seriesStartKey is the infimum of its series and successor skips exactly one key" {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! tsdb — a time-series persistence layer over `kvtree`: append a sample,
-//! stream an ordered `[from, to)` range back, and expire old data with a
-//! chunked, resumable retention sweep.
+//! stream an ordered `[from, to)` range back, pack older samples into
+//! compressed blocks (`compact`), and expire old data with a chunked,
+//! resumable retention sweep.
 //!
 //! **Why `kvtree` and not `kv`.** A time series is nothing but ordered range
 //! scans over time. `kv` is a Bitcask-style append-only log with an unordered
@@ -21,9 +22,10 @@
 //! wrong window rather than failing — which is why it is asserted as a property
 //! over random pairs, not spot-checked with examples.
 //!
-//! **Deliberate non-goals in v1** (see SPEC.md): sample compression
-//! (Gorilla-style delta-of-delta + XOR), downsampling/rollups, a query
-//! language, aggregation functions. `metrics` (registry + Prometheus
+//! **Compression** (SPEC.md §5b): writes stay one key per sample; `compact`
+//! packs samples below a horizon into Gorilla blocks (`chunk.zig`), and reads
+//! merge the two. **Deliberate non-goals** (see SPEC.md): downsampling/rollups,
+//! a query language, aggregation functions. `metrics` (registry + Prometheus
 //! exposition), `latency-stats` and `finstats` cover live counters, latency
 //! summaries and portfolio statistics respectively; none of them persists
 //! anything, and this is the persistence layer they lack.
@@ -34,7 +36,7 @@ const kvtree = @import("kvtree");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, crash-safe retention-by-age.",
+    .doc = "Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -55,6 +57,9 @@ pub const meta = .{
 };
 
 pub const codec = @import("codec.zig");
+/// The compressed block codec (Gorilla delta-of-delta timestamps + XOR'd
+/// values) that `Db.compact` packs samples into.
+pub const chunk = @import("chunk.zig");
 
 pub const Timestamp = codec.Timestamp;
 pub const SeriesId = codec.SeriesId;
@@ -77,7 +82,9 @@ pub const Error = codec.CanonError ||
         /// A series-index entry exists but is not an 8-byte id — the tree was
         /// written by something else, or corrupted below kvtree's checks.
         CorruptIndex,
-        /// A point entry's value is not an 8-byte sample.
+        /// A point entry's value is not an 8-byte sample, or a block entry's
+        /// value does not decode (`chunk.Reader` refused it, or its samples
+        /// disagree with the block key).
         CorruptPoint,
         /// A retention chunk neither deleted anything nor advanced its resume
         /// position while claiming more work remains. Unreachable by
@@ -354,6 +361,264 @@ pub const Db = struct {
         try txn.commit();
     }
 
+    // ── series deletion ──────────────────────────────────────────────────────
+
+    pub const DeleteSeriesOptions = struct {
+        /// Entries (raw points or blocks) deleted per transaction.
+        chunk_deletes: usize = 4096,
+    };
+
+    pub const DeleteSeriesResult = struct {
+        /// Samples deleted (a block counts its samples).
+        deleted: usize = 0,
+        /// Transactions committed.
+        chunks: usize = 0,
+        /// False when `id` was not registered (nothing to delete).
+        existed: bool = false,
+    };
+
+    /// Drop series `id`: every sample (raw and compacted) and its index
+    /// entries. The data goes in bounded chunks; the LAST transaction removes
+    /// the forward and reverse index together, so the series disappears from
+    /// `lookupSeries`/`seriesIterator` only once its data is gone. A crash
+    /// part-way leaves a registered series with fewer samples — call again;
+    /// the operation is idempotent. The id is never handed out again (the
+    /// counter only grows), so a name registered afterwards gets a fresh id
+    /// and no stale sample can resurface under it.
+    ///
+    /// The id is dead afterwards: do not `append` through a `SeriesId` held
+    /// from before the delete — those samples would have no index entry (no
+    /// listing or budget sweep reaches them, though `liveSize` counts them).
+    /// Re-resolve with `seriesId`.
+    pub fn deleteSeries(self: *Db, id: SeriesId, opts: DeleteSeriesOptions) Error!DeleteSeriesResult {
+        std.debug.assert(opts.chunk_deletes >= 1);
+        const rev_key = reverseKey(id);
+        const canon = (try self.tree.get(self.gpa, &rev_key)) orelse return .{};
+        defer self.gpa.free(canon);
+        var res: DeleteSeriesResult = .{ .existed = true };
+        var keys: std.ArrayList([codec.point_key_len]u8) = .empty;
+        defer keys.deinit(self.gpa);
+        while (true) {
+            keys.clearRetainingCapacity();
+            var more = false;
+            {
+                var cur = try self.tree.cursor();
+                defer cur.deinit();
+                for ([_]bool{ false, true }) |block| {
+                    try cur.seek(if (block) &codec.seriesBlockStartKey(id) else &codec.seriesStartKey(id));
+                    while (try cur.next()) |e| {
+                        const ref = (if (block) codec.decodeBlockKey(e.key) else codec.decodePointKey(e.key)) orelse break;
+                        if (ref.series != id) break;
+                        if (keys.items.len >= opts.chunk_deletes) {
+                            more = true;
+                            break;
+                        }
+                        try keys.append(self.gpa, e.key[0..codec.point_key_len].*);
+                        res.deleted += if (block) try blockCount(e.val) else 1;
+                    }
+                    if (more) break;
+                }
+            }
+            var txn = try self.tree.begin();
+            {
+                errdefer txn.rollback();
+                for (keys.items) |*k| try txn.del(k);
+                if (!more) {
+                    var idx_key: std.ArrayList(u8) = .empty;
+                    defer idx_key.deinit(self.gpa);
+                    try idx_key.append(self.gpa, codec.tag_series_index);
+                    try idx_key.appendSlice(self.gpa, canon);
+                    try txn.del(idx_key.items);
+                    try txn.del(&rev_key);
+                    if (self.series_cache.fetchRemove(idx_key.items)) |kv| self.gpa.free(kv.key);
+                }
+            }
+            try txn.commit();
+            res.chunks += 1;
+            if (!more) return res;
+        }
+    }
+
+    // ── compaction ───────────────────────────────────────────────────────────
+    //
+    // Writes land as one key per sample (`tag_point`) — cheap to append, to
+    // overwrite and to write out of order. `compact` later packs the samples
+    // below a horizon into Gorilla blocks (`tag_block`, `chunk.zig`), one key
+    // per block. Reads merge the two partitions; a raw sample shadows a block
+    // sample with the same timestamp, because a raw key inside a block's span
+    // can only come from a write AFTER that block was made (compaction deletes
+    // every raw key it absorbs, in the same transaction). See SPEC.md §5b.
+
+    pub const CompactOptions = struct {
+        /// A run of raw samples AFTER a series' last block (the ordinary
+        /// "new data" case) is left raw until at least this many of them are
+        /// below `before` — so a caller compacting every minute does not cut
+        /// one tiny block per minute. Samples that fall inside or between
+        /// existing blocks (late writes, overwrites) are always merged.
+        min_run: usize = 64,
+        /// Raw samples absorbed per transaction (bounds the transaction and
+        /// the chunk's memory, ~16 bytes each plus the blocks it rewrites).
+        chunk_points: usize = 4096,
+        /// Raw keys read per chunk — bounds a chunk that finds nothing to
+        /// pack (every series' raw tail shorter than `min_run`).
+        chunk_examines: usize = 16384,
+        /// Chunks this call may run before returning `done = false`. 0 = all.
+        max_chunks: usize = 0,
+    };
+
+    pub const CompactResult = struct {
+        /// Raw samples packed into blocks (their raw keys deleted).
+        compacted: usize = 0,
+        /// Block entries written (new or rewritten).
+        blocks_written: usize = 0,
+        /// Raw keys read.
+        examined: usize = 0,
+        /// Chunks (= transactions) run.
+        chunks: usize = 0,
+        /// True when the whole raw partition was scanned.
+        done: bool = false,
+    };
+
+    /// Pack every raw sample with `ts < before` into compressed blocks.
+    ///
+    /// Each chunk is ONE transaction that writes the blocks and deletes the
+    /// raw keys they absorbed, so a crash or an error leaves every sample
+    /// exactly once — raw or in a block, never both lost, never torn. There is
+    /// no resume record: compaction is idempotent ("pack what is still raw"),
+    /// and a re-run reads only what is still raw, which after a completed run
+    /// is the short tail per series plus everything at or above `before`.
+    /// Choose `before` so recent data — still being written, perhaps out of
+    /// order — stays raw (e.g. `now - 1h`).
+    pub fn compact(self: *Db, before: Timestamp, opts: CompactOptions) Error!CompactResult {
+        std.debug.assert(opts.chunk_points >= 1 and opts.chunk_examines >= 1);
+        var pos: ScanPos = .{};
+        pos.set(&[_]u8{codec.tag_point});
+        var res: CompactResult = .{};
+        while (true) {
+            const c = try self.compactChunk(before, opts, &pos);
+            res.compacted += c.compacted;
+            res.blocks_written += c.blocks;
+            res.examined += c.examined;
+            res.chunks += 1;
+            if (c.done) {
+                res.done = true;
+                break;
+            }
+            if (opts.max_chunks != 0 and res.chunks >= opts.max_chunks) break;
+        }
+        return res;
+    }
+
+    const CompactChunk = struct { compacted: usize, blocks: usize, examined: usize, done: bool };
+
+    fn compactChunk(self: *Db, before: Timestamp, opts: CompactOptions, pos: *ScanPos) Error!CompactChunk {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // 1. Collect raw runs below `before`, in key order: (series, samples).
+        const Run = struct { series: SeriesId, start: usize, end: usize };
+        var samples: std.ArrayList(Sample) = .empty;
+        var runs: std.ArrayList(Run) = .empty;
+        var examined: usize = 0;
+        var done = false;
+        {
+            var cur = try self.tree.cursor();
+            defer cur.deinit();
+            try cur.seek(pos.slice());
+            while (true) {
+                const e = (try cur.next()) orelse {
+                    done = true;
+                    break;
+                };
+                const p = codec.decodePointKey(e.key) orelse {
+                    done = true;
+                    break;
+                };
+                examined += 1;
+                var reseek = false;
+                if (p.ts < before) {
+                    const v = codec.decodeValue(e.val) orelse return error.CorruptPoint;
+                    if (runs.items.len == 0 or runs.items[runs.items.len - 1].series != p.series)
+                        try runs.append(a, .{ .series = p.series, .start = samples.items.len, .end = samples.items.len });
+                    try samples.append(a, .{ .ts = p.ts, .value = v });
+                    runs.items[runs.items.len - 1].end = samples.items.len;
+                    pos.set(&codec.pointKeySuccessor(e.key[0..codec.point_key_len].*));
+                } else {
+                    // At or above the horizon: the rest of this series is too.
+                    if (p.series == std.math.maxInt(SeriesId)) {
+                        done = true;
+                        break;
+                    }
+                    pos.set(&codec.seriesStartKey(p.series + 1));
+                    reseek = true;
+                }
+                if (samples.items.len >= opts.chunk_points) break;
+                if (examined >= opts.chunk_examines) break;
+                if (reseek) try cur.seek(pos.slice());
+            }
+        }
+        if (runs.items.len == 0) return .{ .compacted = 0, .blocks = 0, .examined = examined, .done = done };
+
+        // 2. Place each run against the series' blocks and write, in ONE txn.
+        var compacted: usize = 0;
+        var blocks: usize = 0;
+        // Per-placement scratch (a block copy, a merge): reset every
+        // iteration, so a chunk that rewrites many blocks holds one at a
+        // time — `txn.put` has already copied what it keeps.
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var txn = try self.tree.begin();
+        {
+            errdefer txn.rollback();
+            var bcur = try self.tree.cursor();
+            defer bcur.deinit();
+            for (runs.items) |run| {
+                const r = samples.items[run.start..run.end];
+                var i: usize = 0;
+                while (i < r.len) {
+                    _ = scratch.reset(.retain_capacity);
+                    // The first block that can hold r[i]: the lowest whose last
+                    // timestamp is >= r[i].ts (blocks never overlap).
+                    try bcur.seek(&codec.blockKey(run.series, r[i].ts));
+                    var blk: ?BlockRef = null;
+                    if (try bcur.next()) |e| if (codec.decodeBlockKey(e.key)) |bk| if (bk.series == run.series) {
+                        blk = .{
+                            .key = e.key[0..codec.block_key_len].*,
+                            .last = bk.ts,
+                            .first = chunk.firstTs(e.val) catch return error.CorruptPoint,
+                            .val = try sa.dupe(u8, e.val),
+                        };
+                    };
+                    var j = i;
+                    if (blk) |b| if (b.first <= r[i].ts) {
+                        // Inside a block's span: merge every raw sample up to
+                        // its last timestamp into it (raw wins on a tie).
+                        while (j < r.len and r[j].ts <= b.last) j += 1;
+                        const merged = try mergeIntoBlock(sa, b, r[i..j]);
+                        try txn.del(&b.key); // the last piece re-puts this key
+                        blocks += try putBlocks(&txn, run.series, merged);
+                        for (r[i..j]) |sm| try txn.del(&codec.pointKey(run.series, sm.ts));
+                        compacted += j - i;
+                        i = j;
+                        continue;
+                    };
+                    // In the gap before `blk`, or past the last block.
+                    const limit: ?Timestamp = if (blk) |b| b.first else null;
+                    while (j < r.len and (limit == null or r[j].ts < limit.?)) j += 1;
+                    if (limit == null and j - i < opts.min_run) break; // short tail: stays raw
+                    blocks += try putBlocks(&txn, run.series, r[i..j]);
+                    for (r[i..j]) |sm| try txn.del(&codec.pointKey(run.series, sm.ts));
+                    compacted += j - i;
+                    i = j;
+                }
+            }
+        }
+        try txn.commit();
+        return .{ .compacted = compacted, .blocks = blocks, .examined = examined, .done = done };
+    }
+
     // ── reads ────────────────────────────────────────────────────────────────
 
     /// Stream `[from, to)` of one series in ascending time order.
@@ -369,9 +634,13 @@ pub const Db = struct {
         errdefer snap.release();
         var cur = try snap.cursor();
         errdefer cur.deinit();
-        const start = codec.pointKey(series, from);
-        try cur.seek(&start);
-        return .{ .snap = snap, .cur = cur, .series = series, .to = to, .done = false };
+        try cur.seek(&codec.pointKey(series, from));
+        // Blocks are keyed by their LAST timestamp, so this lands on the
+        // first block that can hold a sample at or after `from`.
+        var bcur = try snap.cursor();
+        errdefer bcur.deinit();
+        try bcur.seek(&codec.blockKey(series, from));
+        return .{ .snap = snap, .cur = cur, .bcur = bcur, .series = series, .from = from, .to = to };
     }
 
     // ── retention ────────────────────────────────────────────────────────────
@@ -429,15 +698,15 @@ pub const Db = struct {
         var res: SweepResult = .{};
         while (true) {
             const before = pos;
-            const chunk = try self.sweepChunk(cutoff, opts, &pos);
-            res.deleted += chunk.deleted;
-            res.examined += chunk.examined;
+            const ch = try self.sweepChunk(cutoff, opts, &pos);
+            res.deleted += ch.deleted;
+            res.examined += ch.examined;
             res.chunks += 1;
-            if (chunk.done) {
+            if (ch.done) {
                 res.done = true;
                 break;
             }
-            if (chunk.deleted == 0 and std.mem.order(u8, pos.slice(), before.slice()) != .gt)
+            if (ch.deleted == 0 and std.mem.order(u8, pos.slice(), before.slice()) != .gt)
                 return error.SweepStalled;
             if (opts.max_chunks != 0 and res.chunks >= opts.max_chunks) break;
         }
@@ -447,15 +716,24 @@ pub const Db = struct {
     const ChunkResult = struct { deleted: usize, examined: usize, done: bool };
 
     /// One bounded chunk: scan forward from `pos`, then commit the deletions
-    /// together with the new `pos` in a single transaction.
+    /// together with the new `pos` in a single transaction. The scan covers
+    /// the raw partition, then the block partition: a block wholly below the
+    /// cutoff is deleted, a block straddling it is rewritten with its suffix.
     fn sweepChunk(self: *Db, cutoff: Timestamp, opts: SweepOptions, pos: *ScanPos) Error!ChunkResult {
         // Retained across chunks/calls (F5) — was a fresh `alloc`/`free` of
         // up to `chunk_deletes * point_key_len` bytes (68 KiB at the
         // defaults) every single chunk of a long retention sweep.
         self.sweep_scratch.clearRetainingCapacity();
         const deletes = &self.sweep_scratch;
+        // Straddling blocks' surviving suffixes (rare: at most one per series).
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Rewrite = struct { series: SeriesId, samples: []const Sample };
+        var rewrites: std.ArrayList(Rewrite) = .empty;
 
         var examined: usize = 0;
+        var deleted: usize = 0; // samples
         var done = false;
 
         {
@@ -467,31 +745,70 @@ pub const Db = struct {
                     done = true;
                     break;
                 };
-                const p = codec.decodePointKey(e.key) orelse {
-                    // Left the point partition (or a malformed key): every
-                    // later key sorts above every point key, so we are done.
+                var reseek = false;
+                if (codec.decodePointKey(e.key)) |p| {
+                    examined += 1;
+                    if (p.ts < cutoff) {
+                        const key = e.key[0..codec.point_key_len].*;
+                        try deletes.append(self.gpa, key);
+                        deleted += 1;
+                        const succ = codec.pointKeySuccessor(key);
+                        pos.set(&succ);
+                    } else {
+                        // Within a series, points at or above the cutoff are a
+                        // suffix — nothing further in THIS series can expire, so
+                        // jump straight to the next one.
+                        if (p.series == std.math.maxInt(SeriesId)) {
+                            pos.set(&[_]u8{codec.tag_block}); // on to the blocks
+                        } else {
+                            const next_series = codec.seriesStartKey(p.series + 1);
+                            pos.set(&next_series);
+                        }
+                        reseek = true;
+                    }
+                } else if (codec.decodeBlockKey(e.key)) |bk| {
+                    examined += 1;
+                    const key = e.key[0..codec.block_key_len].*;
+                    if (bk.ts < cutoff) {
+                        // The block's LAST sample is expired: all of it is.
+                        try deletes.append(self.gpa, key);
+                        deleted += try blockCount(e.val);
+                        pos.set(&codec.pointKeySuccessor(key));
+                    } else {
+                        const first = chunk.firstTs(e.val) catch return error.CorruptPoint;
+                        if (first < cutoff) {
+                            // Straddles the cutoff: keep the suffix. Later
+                            // blocks of this series start after this one ends.
+                            var keep: std.ArrayList(Sample) = .empty;
+                            var rd = chunk.Reader.init(e.val) catch return error.CorruptPoint;
+                            while (rd.next() catch return error.CorruptPoint) |bs| {
+                                if (bs.ts < cutoff) {
+                                    deleted += 1;
+                                } else {
+                                    try keep.append(a, .{ .ts = bs.ts, .value = bs.value });
+                                }
+                            }
+                            try deletes.append(self.gpa, key);
+                            try rewrites.append(a, .{ .series = bk.series, .samples = keep.items });
+                        }
+                        // Either way nothing later in this series can expire.
+                        if (bk.series == std.math.maxInt(SeriesId)) {
+                            done = true;
+                            break;
+                        }
+                        pos.set(&codec.seriesBlockStartKey(bk.series + 1));
+                        reseek = true;
+                    }
+                } else if (e.key.len != 0 and e.key[0] < codec.tag_block) {
+                    // Left the raw partition (the series indexes sort between
+                    // it and the blocks): continue at the first block key.
+                    pos.set(&[_]u8{codec.tag_block});
+                    reseek = true;
+                } else {
+                    // Past the block partition (or a malformed key there):
+                    // every later key sorts above every key this sweeps.
                     done = true;
                     break;
-                };
-                examined += 1;
-
-                var reseek = false;
-                if (p.ts < cutoff) {
-                    const key = e.key[0..codec.point_key_len].*;
-                    try deletes.append(self.gpa, key);
-                    const succ = codec.pointKeySuccessor(key);
-                    pos.set(&succ);
-                } else {
-                    // Within a series, points at or above the cutoff are a
-                    // suffix — nothing further in THIS series can expire, so
-                    // jump straight to the next one.
-                    if (p.series == std.math.maxInt(SeriesId)) {
-                        done = true;
-                        break;
-                    }
-                    const next_series = codec.seriesStartKey(p.series + 1);
-                    pos.set(&next_series);
-                    reseek = true;
                 }
 
                 if (deletes.items.len >= opts.chunk_deletes) break;
@@ -505,6 +822,9 @@ pub const Db = struct {
         {
             errdefer txn.rollback();
             for (deletes.items) |*k| try txn.del(k);
+            // A rewritten suffix keeps the block's last timestamp, so its last
+            // piece re-puts the key deleted just above.
+            for (rewrites.items) |rw| _ = try putBlocks(&txn, rw.series, rw.samples);
             if (done) {
                 try txn.del(&codec.meta_key_retention);
             } else {
@@ -515,7 +835,7 @@ pub const Db = struct {
         }
         try txn.commit();
 
-        return .{ .deleted = deletes.items.len, .examined = examined, .done = done };
+        return .{ .deleted = deleted, .examined = examined, .done = done };
     }
 
     /// Where the next chunk starts: the persisted position when it belongs to
@@ -567,14 +887,14 @@ pub const Db = struct {
     // own `fileSize()`, `src/diskhist.zig`) and which these two functions
     // cannot promise to shrink.
 
-    /// Live point-data size, in bytes: `(number of samples) *
-    /// codec.point_entry_bytes`. EXACT, not an estimate — every point key and
-    /// value is fixed-width (see `codec.point_entry_bytes`), so a point count
-    /// converts to a byte count with no rounding or sampling. Excludes the
-    /// series index/reverse-index entries (small — one per series, never
-    /// touched by retention) and kvtree's own on-disk page/freelist overhead
-    /// (the file itself never shrinks — see this section's doc comment
-    /// above). Costs one forward scan of the point partition: O(live points).
+    /// Live sample-data size, in bytes: every raw point entry
+    /// (`codec.point_entry_bytes` each) plus every block entry's key and
+    /// value bytes as stored. EXACT, not an estimate — it sums the entries'
+    /// own lengths. Excludes the series index/reverse-index entries (small —
+    /// one per series, never touched by retention) and kvtree's own on-disk
+    /// page/freelist overhead (the file itself never shrinks — see this
+    /// section's doc comment above). Costs one forward scan of both
+    /// partitions: O(raw points + blocks).
     pub fn liveSize(self: *Db) Error!u64 {
         var cur = try self.tree.cursor();
         defer cur.deinit();
@@ -584,96 +904,92 @@ pub const Db = struct {
             _ = codec.decodePointKey(e.key) orelse break; // left the point partition
             count += 1;
         }
-        return count * codec.point_entry_bytes;
+        var bytes = count * codec.point_entry_bytes;
+        try cur.seek(&[_]u8{codec.tag_block});
+        while (try cur.next()) |e| {
+            _ = codec.decodeBlockKey(e.key) orelse break;
+            bytes += e.key.len + e.val.len;
+        }
+        return bytes;
     }
 
     pub const SweepToBudgetOptions = struct {
-        /// Deletions per committed transaction. Bounds one transaction's
+        /// Entries deleted per committed transaction. Bounds one transaction's
         /// size, same role as `SweepOptions.chunk_deletes` — but see the
         /// doc comment on `sweepToBudget` for why chunking here does NOT
         /// give the same resumability `sweep` has.
         chunk_deletes: usize = 4096,
-        /// Upper bound on deletions this call will make. `sweepToBudget`
-        /// seeds one probe per series up front (see its doc comment); this
-        /// additionally bounds the deletions themselves, the same way
-        /// `SweepOptions.chunk_examines` bounds one retention chunk's work.
+        /// Upper bound on SAMPLES this call deletes, checked before each
+        /// entry — so a block (up to `chunk.max_block_samples` samples) can
+        /// carry the total past it by less than one block.
         max_deletes: usize = 65536,
     };
 
     pub const SweepToBudgetResult = struct {
         /// `liveSize()` before this call.
         before: u64,
-        /// `liveSize()` after. Exact: `before - after == deleted *
-        /// codec.point_entry_bytes` (see `liveSize`'s doc comment on why
-        /// this needs no re-scan to compute).
+        /// `liveSize()` after: exactly `before` minus the bytes of the entries
+        /// deleted (each entry's size is known when it is picked).
         after: u64,
-        /// Points deleted by this call.
+        /// Samples deleted by this call.
         deleted: usize = 0,
         /// True iff `after <= max_bytes`. False means `max_deletes` was hit
         /// before the budget was met — call again to continue.
         done: bool = false,
     };
 
-    /// Delete the globally OLDEST points — across every series, by
-    /// timestamp, not by key order — until live data is at most `max_bytes`,
-    /// or until `opts.max_deletes` is spent (call again to continue). A
-    /// no-op, `.done = true`, if the budget is already met.
+    /// Delete the globally OLDEST data — across every series, by timestamp,
+    /// not by key order — until live data is at most `max_bytes`, or until
+    /// `opts.max_deletes` is spent (call again to continue). A no-op,
+    /// `.done = true`, if the budget is already met.
     ///
-    /// **Why not `sweep` with a computed cutoff.** A point key sorts
-    /// `(series, timestamp)` — series-MAJOR — so "the earliest keys in the
-    /// tree" is NOT "the oldest points in the store": series 9 can hold data
-    /// from a decade ago while series 0 was created five minutes ago. Age
-    /// retention (`sweep`) is fine with this because it applies ONE cutoff
-    /// independently to every series; a size BUDGET has no such per-series
-    /// answer — "which points are `oldest`" is a comparison across series,
-    /// and only their timestamps answer it.
+    /// **Unit of deletion.** A raw point, or a WHOLE compacted block, ordered
+    /// by its oldest timestamp (a block's first sample). Splitting a block to
+    /// free a few bytes would cost a rewrite and gain little; a block holds a
+    /// bounded window, so the newest sample dropped this way is at most one
+    /// block span younger than a per-sample policy would have dropped.
     ///
-    /// **The algorithm**: a k-way merge over per-series "current oldest
-    /// surviving point" candidates, seeded once via `seriesIterator` (one
-    /// tree probe per series) and kept in a min-heap ordered by timestamp
-    /// (ties broken by series id, for determinism). Popping the heap's
-    /// minimum and re-probing that one series for its next point costs
-    /// O(log(series count)) per deletion — NOT a rescan of the whole store,
-    /// and NOT a bisection over candidate cutoffs (which would need many
-    /// full-store passes to evaluate each candidate). Because every point is
-    /// fixed-width (`codec.point_entry_bytes`), the number of points to
-    /// delete is computed exactly from `liveSize()` up front — no repeated
-    /// re-measurement is needed as deletions are collected.
+    /// **Why not `sweep` with a computed cutoff.** A key sorts `(series,
+    /// timestamp)` — series-MAJOR — so "the earliest keys in the tree" is NOT
+    /// "the oldest data in the store": series 9 can hold data from a decade
+    /// ago while series 0 was created five minutes ago. Age retention
+    /// (`sweep`) applies ONE cutoff independently to every series; a size
+    /// BUDGET is a comparison across series, and only timestamps answer it.
+    ///
+    /// **The algorithm**: a k-way merge over per-series, per-partition "oldest
+    /// surviving entry" candidates, seeded once via `seriesIterator` (two tree
+    /// probes per series) and kept in a min-heap ordered by timestamp (ties
+    /// broken by series id, then BLOCK before raw — see `less`). Popping
+    /// the minimum and re-probing that one stream costs O(log(series count))
+    /// per entry — no rescan of the store, no bisection over candidate
+    /// cutoffs.
     ///
     /// **Crash-safety — narrower than `sweep`'s.** Each chunk of
     /// `opts.chunk_deletes` deletions commits atomically (kvtree's COW
-    /// commit), so a crash mid-call leaves a CONSISTENT tree — never a
-    /// torn chunk. But unlike `sweep`, there is no persisted resume record:
-    /// a crash (or hitting `max_deletes`) leaves the merge's in-memory
-    /// progress on the floor. This is still CORRECT, just not linear the way
-    /// resumed retention is — the next call recomputes `liveSize` and
-    /// reseeds the heap from scratch, which costs one more series-count
-    /// probe pass but reaches the same end state (deleting the globally
-    /// oldest points is idempotent in the same sense `sweep`'s cutoff delete
-    /// is: re-running never un-deletes anything or deletes the wrong ones).
-    /// A future version could persist a resume record shaped like `sweep`'s,
-    /// keyed by `max_bytes` instead of a cutoff; not built for v1 — this is
-    /// a scope decision, matching how `sweep` itself once lacked resumability
-    /// (SPEC.md §5) until that specific gap was closed deliberately.
+    /// commit), so a crash mid-call leaves a CONSISTENT tree — never a torn
+    /// chunk. But there is no persisted resume record: a crash (or hitting
+    /// `max_deletes`) leaves the merge's in-memory progress on the floor; the
+    /// next call recomputes `liveSize` and reseeds from scratch, reaching the
+    /// same end state (deleting the globally oldest entries is idempotent).
     pub fn sweepToBudget(self: *Db, max_bytes: u64, opts: SweepToBudgetOptions) Error!SweepToBudgetResult {
         const before = try self.liveSize();
         if (before <= max_bytes) return .{ .before = before, .after = before, .done = true };
-
         const excess = before - max_bytes;
-        const needed: u64 = (excess + codec.point_entry_bytes - 1) / codec.point_entry_bytes;
-        const want: usize = @intCast(@min(@as(u64, opts.max_deletes), needed));
 
-        const Candidate = struct { key: [codec.point_key_len]u8, series: SeriesId };
         const less = struct {
-            fn f(_: void, a: Candidate, b: Candidate) std.math.Order {
-                const pa = codec.decodePointKey(&a.key).?;
-                const pb = codec.decodePointKey(&b.key).?;
-                if (pa.ts != pb.ts) return std.math.order(pa.ts, pb.ts);
-                return std.math.order(pa.series, pb.series); // deterministic tie-break
+            fn f(_: void, x: Unit, y: Unit) std.math.Order {
+                if (x.oldest != y.oldest) return std.math.order(x.oldest, y.oldest);
+                if (x.series != y.series) return std.math.order(x.series, y.series);
+                // Block before raw: a raw point can shadow a block sample with
+                // its own timestamp (B3), and if the raw one went first the
+                // older value it replaced would read again. Any raw point that
+                // shadows a block sample has `ts >= block.first`, so with this
+                // order the block is always deleted no later than its shadow.
+                return std.math.order(@intFromBool(y.block), @intFromBool(x.block));
             }
         }.f;
 
-        var heap: std.PriorityQueue(Candidate, void, less) = .empty;
+        var heap: std.PriorityQueue(Unit, void, less) = .empty;
         defer heap.deinit(self.gpa);
         {
             var it = try self.seriesIterator();
@@ -682,19 +998,23 @@ pub const Db = struct {
                 var entry_mut = entry_val;
                 const entry = &entry_mut;
                 defer entry.deinit(self.gpa);
-                if (try self.firstPointOf(entry.id)) |k| try heap.push(self.gpa, .{ .key = k, .series = entry.id });
+                if (try self.unitAt(&codec.seriesStartKey(entry.id), entry.id, false)) |u| try heap.push(self.gpa, u);
+                if (try self.unitAt(&codec.seriesBlockStartKey(entry.id), entry.id, true)) |u| try heap.push(self.gpa, u);
             }
         }
 
         var deletes: std.ArrayList([codec.point_key_len]u8) = .empty;
         defer deletes.deinit(self.gpa);
-        while (deletes.items.len < want) {
-            const cand = heap.pop() orelse break; // no live points anywhere
-            try deletes.append(self.gpa, cand.key);
-            if (try self.nextPointAfter(cand.key)) |k| try heap.push(self.gpa, .{ .key = k, .series = cand.series });
+        var freed: u64 = 0;
+        var deleted: usize = 0;
+        while (freed < excess and deleted < opts.max_deletes) {
+            const u = heap.pop() orelse break; // no live data anywhere
+            try deletes.append(self.gpa, u.key);
+            freed += u.bytes;
+            deleted += u.samples;
+            if (try self.unitAt(&codec.pointKeySuccessor(u.key), u.series, u.block)) |n| try heap.push(self.gpa, n);
         }
 
-        var deleted: usize = 0;
         var i: usize = 0;
         while (i < deletes.items.len) {
             const end = @min(i + opts.chunk_deletes, deletes.items.len);
@@ -704,41 +1024,124 @@ pub const Db = struct {
                 for (deletes.items[i..end]) |*k| try txn.del(k);
             }
             try txn.commit();
-            deleted += end - i;
             i = end;
         }
 
-        const after = before - @as(u64, deleted) * codec.point_entry_bytes;
+        const after = before - freed;
         return .{ .before = before, .after = after, .deleted = deleted, .done = after <= max_bytes };
     }
 
-    /// `series`'s current oldest surviving point, or null if it has none.
-    fn firstPointOf(self: *Db, series: SeriesId) Error!?[codec.point_key_len]u8 {
-        var cur = try self.tree.cursor();
-        defer cur.deinit();
-        const start = codec.seriesStartKey(series);
-        try cur.seek(&start);
-        const e = (try cur.next()) orelse return null;
-        const p = codec.decodePointKey(e.key) orelse return null;
-        if (p.series != series) return null; // this series has no points
-        return e.key[0..codec.point_key_len].*;
-    }
+    /// One deletable entry for `sweepToBudget`: a raw point or a whole block.
+    const Unit = struct {
+        key: [codec.point_key_len]u8,
+        series: SeriesId,
+        /// Its oldest timestamp (a block's first sample).
+        oldest: Timestamp,
+        /// Its bytes as `liveSize` counts them.
+        bytes: u64,
+        samples: u32,
+        block: bool,
+    };
 
-    /// The next surviving point strictly after `key`, WITHIN THE SAME
-    /// SERIES `key` belongs to — never the next series' first point, which
-    /// would silently merge two series' timelines.
-    fn nextPointAfter(self: *Db, key: [codec.point_key_len]u8) Error!?[codec.point_key_len]u8 {
-        const want_series = codec.decodePointKey(&key).?.series;
+    /// The first entry at or after `seek_key` in `series`' raw (or block)
+    /// partition, or null when that partition of the series is exhausted.
+    fn unitAt(self: *Db, seek_key: []const u8, series: SeriesId, block: bool) Error!?Unit {
         var cur = try self.tree.cursor();
         defer cur.deinit();
-        const succ = codec.pointKeySuccessor(key);
-        try cur.seek(&succ);
+        try cur.seek(seek_key);
         const e = (try cur.next()) orelse return null;
+        if (block) {
+            const bk = codec.decodeBlockKey(e.key) orelse return null;
+            if (bk.series != series) return null;
+            return .{
+                .key = e.key[0..codec.block_key_len].*,
+                .series = series,
+                .oldest = chunk.firstTs(e.val) catch return error.CorruptPoint,
+                .bytes = e.key.len + e.val.len,
+                .samples = try blockCount(e.val),
+                .block = true,
+            };
+        }
         const p = codec.decodePointKey(e.key) orelse return null;
-        if (p.series != want_series) return null; // exhausted this series
-        return e.key[0..codec.point_key_len].*;
+        if (p.series != series) return null; // this series has no (more) points
+        return .{
+            .key = e.key[0..codec.point_key_len].*,
+            .series = series,
+            .oldest = p.ts,
+            .bytes = codec.point_entry_bytes,
+            .samples = 1,
+            .block = false,
+        };
     }
 };
+
+// ── blocks ───────────────────────────────────────────────────────────────────
+
+/// One block entry read for a rewrite: its key, its span, and a copy of its
+/// bytes (the cursor's value is invalidated by the next cursor call).
+const BlockRef = struct {
+    key: [codec.block_key_len]u8,
+    first: Timestamp,
+    last: Timestamp,
+    val: []const u8,
+};
+
+/// Decode `b`, check it against its own key (a block's span IS its key),
+/// and merge `raw` into it: ascending, and a raw sample replaces a block
+/// sample with the same timestamp. Allocates the result on `a`.
+fn mergeIntoBlock(a: Allocator, b: BlockRef, raw: []const Sample) Error![]Sample {
+    var rd = chunk.Reader.init(b.val) catch return error.CorruptPoint;
+    var out: std.ArrayList(Sample) = .empty;
+    try out.ensureTotalCapacity(a, raw.len + rd.count());
+    var i: usize = 0;
+    var prev: ?Timestamp = null;
+    while (rd.next() catch return error.CorruptPoint) |bs| {
+        if (prev == null and bs.ts != b.first) return error.CorruptPoint;
+        prev = bs.ts;
+        while (i < raw.len and raw[i].ts < bs.ts) : (i += 1) out.appendAssumeCapacity(raw[i]);
+        if (i < raw.len and raw[i].ts == bs.ts) {
+            out.appendAssumeCapacity(raw[i]); // the later write wins
+            i += 1;
+        } else {
+            out.appendAssumeCapacity(.{ .ts = bs.ts, .value = bs.value });
+        }
+    }
+    if (prev == null or prev.? != b.last) return error.CorruptPoint;
+    while (i < raw.len) : (i += 1) out.appendAssumeCapacity(raw[i]);
+    return out.items;
+}
+
+/// Encode strictly ascending `samples` into as many blocks as the caps need,
+/// each keyed by its own last timestamp, into `txn`. Returns the block count.
+fn putBlocks(txn: *kvtree.Txn, series: SeriesId, samples: []const Sample) Error!usize {
+    var w = chunk.Writer.init();
+    var n: usize = 0;
+    for (samples) |sm| {
+        const cs: chunk.Sample = .{ .ts = sm.ts, .value = sm.value };
+        w.append(cs) catch |err| switch (err) {
+            error.BlockFull => {
+                try txn.put(&codec.blockKey(series, w.lastTs()), w.bytes());
+                n += 1;
+                w = chunk.Writer.init();
+                // One sample always fits an empty block.
+                w.append(cs) catch return error.CorruptPoint;
+            },
+            // Callers pass raw keys (unique, ascending) or a merge of them.
+            error.OutOfOrder => return error.CorruptPoint,
+        };
+    }
+    if (w.count() != 0) {
+        try txn.put(&codec.blockKey(series, w.lastTs()), w.bytes());
+        n += 1;
+    }
+    return n;
+}
+
+/// The sample count stored in a block's header, or `CorruptPoint`.
+fn blockCount(val: []const u8) Error!u32 {
+    const rd = chunk.Reader.init(val) catch return error.CorruptPoint;
+    return rd.count();
+}
 
 /// `version(1) | cutoff (raw i64 BE, equality only) | resume key bytes`.
 fn encodeResume(out: *[1 + 8 + codec.max_scan_key_len]u8, cutoff: Timestamp, pos: []const u8) usize {
@@ -888,36 +1291,111 @@ fn labelsMatch(have: []const Label, filter: []const Label) bool {
 // ── Range ────────────────────────────────────────────────────────────────────
 
 /// A streaming `[from, to)` iterator. Holds an MVCC snapshot, so concurrent
-/// commits do not disturb it; `deinit` releases both the cursor and the
+/// commits do not disturb it; `deinit` releases both cursors and the
 /// snapshot (leaking a snapshot pins kvtree's page reclaim, so always `defer`).
+///
+/// It merges two ordered streams — raw samples and the samples of compacted
+/// blocks — and on a timestamp present in both returns the raw one (the
+/// later write; see `Db.compact`). The one block being decoded is copied into
+/// a fixed buffer inside the `Range`, so memory stays bounded by one block,
+/// never by the window.
 pub const Range = struct {
     snap: kvtree.Snapshot,
     cur: kvtree.Cursor,
+    bcur: kvtree.Cursor,
     series: SeriesId,
+    from: Timestamp,
     to: Timestamp,
-    done: bool,
+    raw_done: bool = false,
+    raw_peek: ?Sample = null,
+    blk_done: bool = false,
+    blk_peek: ?Sample = null,
+    /// The current block's bytes; `reader` decodes from here. Re-pointed on
+    /// every use, so a `Range` stays valid if it is moved between calls.
+    blk_buf: [chunk.max_block_bytes]u8 = undefined,
+    blk_len: usize = 0,
+    reader: ?chunk.Reader = null,
 
     pub fn next(self: *Range) Error!?Sample {
-        if (self.done) return null;
+        try self.fillRaw();
+        try self.fillBlock();
+        const r = self.raw_peek;
+        const b = self.blk_peek;
+        if (r) |rs| {
+            if (b) |bs| {
+                if (bs.ts < rs.ts) {
+                    self.blk_peek = null;
+                    return bs;
+                }
+                if (bs.ts == rs.ts) self.blk_peek = null; // shadowed by the raw write
+            }
+            self.raw_peek = null;
+            return rs;
+        }
+        if (b) |bs| {
+            self.blk_peek = null;
+            return bs;
+        }
+        return null;
+    }
+
+    fn fillRaw(self: *Range) Error!void {
+        if (self.raw_peek != null or self.raw_done) return;
         const e = (try self.cur.next()) orelse {
-            self.done = true;
-            return null;
+            self.raw_done = true;
+            return;
         };
         const p = codec.decodePointKey(e.key) orelse {
-            self.done = true;
-            return null;
+            self.raw_done = true;
+            return;
         };
         // Ordering is the whole contract: once the key leaves this series or
         // reaches the exclusive upper bound, nothing later can qualify.
         if (p.series != self.series or p.ts >= self.to) {
-            self.done = true;
-            return null;
+            self.raw_done = true;
+            return;
         }
         const v = codec.decodeValue(e.val) orelse return error.CorruptPoint;
-        return .{ .ts = p.ts, .value = v };
+        self.raw_peek = .{ .ts = p.ts, .value = v };
+    }
+
+    fn fillBlock(self: *Range) Error!void {
+        while (self.blk_peek == null and !self.blk_done) {
+            if (self.reader) |*rd| {
+                rd.rebind(self.blk_buf[0..self.blk_len]);
+                const s = (rd.next() catch return error.CorruptPoint) orelse {
+                    self.reader = null;
+                    continue;
+                };
+                if (s.ts < self.from) continue;
+                if (s.ts >= self.to) {
+                    self.blk_done = true; // blocks are ordered: nothing later qualifies
+                    return;
+                }
+                self.blk_peek = .{ .ts = s.ts, .value = s.value };
+                return;
+            }
+            const e = (try self.bcur.next()) orelse {
+                self.blk_done = true;
+                return;
+            };
+            const bk = codec.decodeBlockKey(e.key) orelse {
+                self.blk_done = true;
+                return;
+            };
+            if (bk.series != self.series) {
+                self.blk_done = true;
+                return;
+            }
+            if (e.val.len > self.blk_buf.len) return error.CorruptPoint;
+            @memcpy(self.blk_buf[0..e.val.len], e.val);
+            self.blk_len = e.val.len;
+            self.reader = chunk.Reader.init(self.blk_buf[0..self.blk_len]) catch return error.CorruptPoint;
+        }
     }
 
     pub fn deinit(self: *Range) void {
+        self.bcur.deinit();
         self.cur.deinit();
         self.snap.release();
         self.* = undefined;
@@ -2091,4 +2569,747 @@ test "retention bounds the file: appending and sweeping at the same rate reaches
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, live_rounds * per_round), got.len);
     try testing.expectEqual(@as(i64, (80 - live_rounds) * per_round), got[0].ts);
+}
+
+// ── compaction (§5b) ─────────────────────────────────────────────────────────
+
+/// Every block of every series, checked: key = its last sample, header first
+/// = its first sample, strictly ascending inside, and blocks of one series
+/// never overlap (each starts after the previous one ends). Returns the count.
+fn checkBlockInvariants(db: *Db) !usize {
+    var cur = try db.tree.cursor();
+    defer cur.deinit();
+    try cur.seek(&[_]u8{codec.tag_block});
+    var n: usize = 0;
+    var prev_series: ?SeriesId = null;
+    var prev_last: Timestamp = 0;
+    while (try cur.next()) |e| {
+        const bk = codec.decodeBlockKey(e.key) orelse break;
+        var rd = try chunk.Reader.init(e.val);
+        var first: ?Timestamp = null;
+        var last: Timestamp = 0;
+        var count: u32 = 0;
+        while (try rd.next()) |s| {
+            if (first == null) first = s.ts else try testing.expect(s.ts > last);
+            last = s.ts;
+            count += 1;
+        }
+        try testing.expectEqual(@as(u32, rd.count()), count);
+        try testing.expectEqual(bk.ts, last);
+        try testing.expectEqual(first.?, try chunk.firstTs(e.val));
+        if (prev_series != null and prev_series.? == bk.series) try testing.expect(first.? > prev_last);
+        prev_series = bk.series;
+        prev_last = last;
+        n += 1;
+    }
+    return n;
+}
+
+fn rawCount(db: *Db) !usize {
+    var cur = try db.tree.cursor();
+    defer cur.deinit();
+    try cur.seek(&[_]u8{codec.tag_point});
+    var n: usize = 0;
+    while (try cur.next()) |e| {
+        _ = codec.decodePointKey(e.key) orelse break;
+        n += 1;
+    }
+    return n;
+}
+
+test "compact: a regular series packs into blocks, reads back bit-exact, and live size drops below a tenth" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("cpu", &.{.{ .name = "host", .value = "a" }});
+    var pts: std.ArrayList(Sample) = .empty;
+    defer pts.deinit(gpa);
+    // A 15 s scrape of a slowly moving gauge, plus one NaN and a -0.0.
+    for (0..3000) |i| try pts.append(gpa, .{
+        .ts = 1_700_000_000_000 + @as(i64, @intCast(i)) * 15_000,
+        .value = if (i == 7) std.math.nan(f64) else if (i == 8) -0.0 else 40.0 + @as(f64, @floatFromInt(i % 17)) * 0.25,
+    });
+    try fx.db.appendMany(s, pts.items);
+    const raw_size = try fx.db.liveSize();
+    try testing.expectEqual(@as(u64, 3000) * codec.point_entry_bytes, raw_size);
+
+    const res = try fx.db.compact(std.math.maxInt(i64), .{});
+    try testing.expect(res.done);
+    try testing.expectEqual(@as(usize, 3000), res.compacted);
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+    try testing.expect(try checkBlockInvariants(&fx.db) >= 3); // ≤ 1024 samples per block
+
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(pts.items.len, got.len);
+    for (pts.items, got) |want, have| {
+        try testing.expectEqual(want.ts, have.ts);
+        try testing.expectEqual(@as(u64, @bitCast(want.value)), @as(u64, @bitCast(have.value)));
+    }
+    const packed_size = try fx.db.liveSize();
+    try testing.expect(packed_size * 10 < raw_size);
+
+    // A window in the middle, cut inside a block, is still exact and half-open.
+    const mid = try collect(gpa, &fx.db, s, pts.items[1500].ts, pts.items[1510].ts);
+    defer gpa.free(mid);
+    try testing.expectEqual(@as(usize, 10), mid.len);
+    try testing.expectEqual(pts.items[1500].ts, mid[0].ts);
+
+    // Persisted: a reopen reads the same.
+    try fx.reopen();
+    const again = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(again);
+    try testing.expectEqual(got.len, again.len);
+}
+
+test "compact: a short tail after the last block stays raw until min_run samples are below the horizon" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..30) |i| try fx.db.append(s, @intCast(i), 1);
+    var res = try fx.db.compact(1000, .{ .min_run = 64 });
+    try testing.expectEqual(@as(usize, 0), res.compacted);
+    try testing.expectEqual(@as(usize, 30), try rawCount(&fx.db));
+    for (30..100) |i| try fx.db.append(s, @intCast(i), 1);
+    // The horizon still splits it: only samples below 64 count.
+    res = try fx.db.compact(63, .{ .min_run = 64 });
+    try testing.expectEqual(@as(usize, 0), res.compacted);
+    res = try fx.db.compact(64, .{ .min_run = 64 });
+    try testing.expectEqual(@as(usize, 64), res.compacted);
+    try testing.expectEqual(@as(usize, 36), try rawCount(&fx.db)); // 64..99 stay raw
+    try testing.expectEqual(@as(usize, 1), try checkBlockInvariants(&fx.db));
+}
+
+test "compact: an overwrite after compaction wins on read, and the next compaction merges it into the block" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..200) |i| try fx.db.append(s, @as(i64, @intCast(i)) * 10, @floatFromInt(i));
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+
+    try fx.db.append(s, 500, -1); // overwrite a compacted sample
+    try fx.db.append(s, 505, -2); // a late sample inside the block's span
+    var got = try collect(gpa, &fx.db, s, 490, 520);
+    try testing.expectEqualSlices(Sample, &.{
+        .{ .ts = 490, .value = 49 }, .{ .ts = 500, .value = -1 }, .{ .ts = 505, .value = -2 }, .{ .ts = 510, .value = 51 },
+    }, got);
+    gpa.free(got);
+
+    const res = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try testing.expectEqual(@as(usize, 2), res.compacted);
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+    _ = try checkBlockInvariants(&fx.db);
+    got = try collect(gpa, &fx.db, s, 490, 520);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(Sample, &.{
+        .{ .ts = 490, .value = 49 }, .{ .ts = 500, .value = -1 }, .{ .ts = 505, .value = -2 }, .{ .ts = 510, .value = 51 },
+    }, got);
+}
+
+test "compact: samples between two blocks become their own block without overlapping either" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..100) |i| try fx.db.append(s, @intCast(i), 1);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    for (1000..1100) |i| try fx.db.append(s, @intCast(i), 2);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    // Late data in the gap, and one sample older than every block.
+    for (500..510) |i| try fx.db.append(s, @intCast(i), 3);
+    try fx.db.append(s, -5, 4);
+    // The gap run is placed even though it is shorter than min_run.
+    const res = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 64 });
+    try testing.expectEqual(@as(usize, 11), res.compacted);
+    try testing.expectEqual(@as(usize, 4), try checkBlockInvariants(&fx.db));
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 211), got.len);
+    try testing.expectEqual(@as(i64, -5), got[0].ts);
+}
+
+test "compact + retention: whole expired blocks go, a straddling block keeps its suffix, chunked equals one-shot" {
+    const gpa = testing.allocator;
+    var one: Fixture = try .init(gpa);
+    defer one.deinit();
+    var chunked: Fixture = try .init(gpa);
+    defer chunked.deinit();
+    for ([_]*Fixture{ &one, &chunked }) |fx| {
+        for (0..3) |k| {
+            const s = try fx.db.seriesId("m", &.{.{ .name = "k", .value = &.{@as(u8, '0') + @as(u8, @intCast(k))} }});
+            for (0..2500) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i * (k + 1)));
+            _ = try fx.db.compact(2400, .{ .min_run = 1 }); // 2400..2499 stay raw
+        }
+    }
+    const r1 = try one.db.sweep(1500, .{});
+    try testing.expect(r1.done);
+    try testing.expectEqual(@as(usize, 3 * 1500), r1.deleted);
+    var rc: Db.SweepResult = .{};
+    while (!rc.done) rc = try chunked.db.sweep(1500, .{ .chunk_deletes = 1, .max_chunks = 1 });
+    for (1..4) |id| {
+        const a = try collect(gpa, &one.db, id, std.math.minInt(i64), std.math.maxInt(i64));
+        defer gpa.free(a);
+        const b = try collect(gpa, &chunked.db, id, std.math.minInt(i64), std.math.maxInt(i64));
+        defer gpa.free(b);
+        try testing.expectEqual(@as(usize, 1000), a.len);
+        try testing.expectEqual(@as(i64, 1500), a[0].ts);
+        try testing.expectEqualSlices(Sample, a, b);
+    }
+    _ = try checkBlockInvariants(&one.db);
+    _ = try checkBlockInvariants(&chunked.db);
+    try testing.expectEqual(try one.db.liveSize(), try chunked.db.liveSize());
+}
+
+test "compact + sweepToBudget: whole blocks go oldest-first across series, and the accounting is exact" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const old = try fx.db.seriesId("old", &.{});
+    const new = try fx.db.seriesId("new", &.{});
+    for (0..2000) |i| try fx.db.append(old, @intCast(i), 1); // older data, lower id
+    for (0..2000) |i| try fx.db.append(new, @as(i64, @intCast(i)) + 10_000, 2);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    const before = try fx.db.liveSize();
+    const r = try fx.db.sweepToBudget(before / 2, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(try fx.db.liveSize(), r.after);
+    // Everything of `old` goes before anything of `new`.
+    const left_old = try collect(gpa, &fx.db, old, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(left_old);
+    const left_new = try collect(gpa, &fx.db, new, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(left_new);
+    try testing.expect(left_old.len == 0 or left_new.len == 2000);
+    try testing.expectEqual(@as(usize, 4000) - r.deleted, left_old.len + left_new.len);
+}
+
+test "compact: model check — random appends, overwrites, compactions, sweeps and windows agree with a map" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x75db_c0de);
+    const rnd = prng.random();
+    var round: usize = 0;
+    while (round < 12) : (round += 1) {
+        var fx = try Fixture.init(gpa);
+        defer fx.deinit();
+        var ids: [3]SeriesId = undefined;
+        var model: [3]std.AutoArrayHashMapUnmanaged(Timestamp, u64) = @splat(.empty);
+        defer for (&model) |*m| m.deinit(gpa);
+        for (&ids, 0..) |*id, k| id.* = try fx.db.seriesId("m", &.{.{ .name = "k", .value = &.{@as(u8, '0') + @as(u8, @intCast(k))} }});
+        var horizon: Timestamp = 0;
+        var step: usize = 0;
+        while (step < 120) : (step += 1) {
+            const k = rnd.uintLessThan(usize, 3);
+            switch (rnd.uintLessThan(u8, 10)) {
+                0...4 => { // a batch of appends around a moving front, some late, some overwrites
+                    var batch: [40]Sample = undefined;
+                    const n = rnd.uintLessThan(usize, batch.len) + 1;
+                    for (batch[0..n]) |*b| {
+                        const late = rnd.uintLessThan(u8, 5) == 0;
+                        // An overwrite of a timestamp the series already has —
+                        // often a block's first sample, the tie review H1 is about.
+                        const over = model[k].count() != 0 and rnd.uintLessThan(u8, 4) == 0;
+                        const ts: Timestamp = if (over)
+                            model[k].keys()[rnd.uintLessThan(usize, model[k].count())]
+                        else if (late) rnd.intRangeLessThan(i64, -50, horizon + 1) else horizon + rnd.intRangeLessThan(i64, 0, 30);
+                        b.* = .{ .ts = ts, .value = @bitCast(rnd.int(u64) & 0xfff0_0000_0000_ffff) };
+                    }
+                    // appendMany keeps the LAST write of a duplicated ts in a batch.
+                    try fx.db.appendMany(ids[k], batch[0..n]);
+                    for (batch[0..n]) |b| try model[k].put(gpa, b.ts, @bitCast(b.value));
+                    horizon += rnd.intRangeLessThan(i64, 0, 25);
+                },
+                5, 6 => _ = try fx.db.compact(horizon - rnd.intRangeLessThan(i64, 0, 40), .{
+                    .min_run = rnd.uintLessThan(usize, 80) + 1,
+                    .chunk_points = rnd.uintLessThan(usize, 300) + 1,
+                }),
+                7 => {
+                    const cutoff = horizon - rnd.intRangeLessThan(i64, 50, 400);
+                    var rr: Db.SweepResult = .{};
+                    while (!rr.done) rr = try fx.db.sweep(cutoff, .{ .chunk_deletes = rnd.uintLessThan(usize, 50) + 1, .max_chunks = 1 });
+                    for (&model) |*m| {
+                        var i: usize = 0;
+                        while (i < m.count()) {
+                            if (m.keys()[i] < cutoff) m.swapRemoveAt(i) else i += 1;
+                        }
+                    }
+                },
+                8 => {
+                    // A budget drops whole entries oldest-first; which ones is
+                    // the store's choice, so the check is one-sided: nothing
+                    // it still returns may differ from the model (no
+                    // overwritten value may come back — review H1); then the
+                    // model adopts what is left.
+                    const live = try fx.db.liveSize();
+                    _ = try fx.db.sweepToBudget(live * rnd.uintLessThan(u64, 100) / 100, .{
+                        .chunk_deletes = rnd.uintLessThan(usize, 5) + 1,
+                    });
+                    for (ids, 0..) |id, m| {
+                        const all = try collect(gpa, &fx.db, id, std.math.minInt(i64), std.math.maxInt(i64));
+                        defer gpa.free(all);
+                        for (all) |g| {
+                            const want = model[m].get(g.ts) orelse return error.TestUnexpectedResult;
+                            try testing.expectEqual(want, @as(u64, @bitCast(g.value)));
+                        }
+                        model[m].clearRetainingCapacity();
+                        for (all) |g| try model[m].put(gpa, g.ts, @bitCast(g.value));
+                    }
+                },
+                else => {}, // a read-only step
+            }
+            // Every series, any window: the store equals the model.
+            _ = try checkBlockInvariants(&fx.db);
+            for (ids, 0..) |id, m| {
+                const lo = rnd.intRangeLessThan(i64, -60, horizon + 10);
+                const hi = lo + rnd.intRangeLessThan(i64, 0, 400);
+                var want: std.ArrayList(Sample) = .empty;
+                defer want.deinit(gpa);
+                for (model[m].keys(), model[m].values()) |ts, v| if (ts >= lo and ts < hi) try want.append(gpa, .{ .ts = ts, .value = @bitCast(v) });
+                std.mem.sort(Sample, want.items, {}, struct {
+                    fn lt(_: void, x: Sample, y: Sample) bool {
+                        return x.ts < y.ts;
+                    }
+                }.lt);
+                const got = try collect(gpa, &fx.db, id, lo, hi);
+                defer gpa.free(got);
+                try testing.expectEqual(want.items.len, got.len);
+                for (want.items, got) |w, g| {
+                    try testing.expectEqual(w.ts, g.ts);
+                    try testing.expectEqual(@as(u64, @bitCast(w.value)), @as(u64, @bitCast(g.value)));
+                }
+            }
+        }
+    }
+}
+
+test "compact: a crash at any storage effect leaves every sample exactly once; re-running finishes it" {
+    const gpa = testing.allocator;
+    var ref: Fixture = try .init(gpa);
+    defer ref.deinit();
+    const ref_ids = try seedGrid(&ref, 3, 300);
+    defer gpa.free(ref_ids);
+    const ref_before = try collectAll(gpa, &ref.db, ref_ids);
+    defer freeAll(gpa, ref_before);
+    _ = try ref.db.compact(std.math.maxInt(i64), .{ .min_run = 1, .chunk_points = 200 });
+
+    const CrashMode = @FieldType(kvtree.SimStorage, "crash_mode");
+    const modes = [_]CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        var crash_at: usize = 0;
+        var survived_without_crashing = false;
+        while (!survived_without_crashing) : (crash_at += 1) {
+            try testing.expect(crash_at < 400);
+            var fx = try Fixture.init(gpa);
+            defer fx.deinit();
+            fx.sim.crash_mode = mode;
+            fx.sim.reorder_seed = 0x6c1f +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
+            const ids = try seedGrid(&fx, 3, 300);
+            defer gpa.free(ids);
+
+            fx.sim.ops_until_crash = crash_at;
+            if (fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1, .chunk_points = 200 })) |_| {
+                survived_without_crashing = true;
+            } else |_| {}
+            fx.sim.reboot();
+            try fx.reopen();
+
+            // Whatever committed, every sample is there exactly once.
+            const mid = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, mid);
+            for (ref_before, mid) |a, b| try testing.expectEqualSlices(Sample, a, b);
+            _ = try checkBlockInvariants(&fx.db);
+
+            const fin = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1, .chunk_points = 200 });
+            try testing.expect(fin.done);
+            try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+            const after = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, after);
+            for (ref_before, after) |a, b| try testing.expectEqualSlices(Sample, a, b);
+        }
+    }
+}
+
+fn collectAll(gpa: Allocator, db: *Db, ids: []const SeriesId) ![][]Sample {
+    const out = try gpa.alloc([]Sample, ids.len);
+    for (ids, out) |id, *o| o.* = try collect(gpa, db, id, std.math.minInt(i64), std.math.maxInt(i64));
+    return out;
+}
+
+fn freeAll(gpa: Allocator, all: [][]Sample) void {
+    for (all) |a| gpa.free(a);
+    gpa.free(all);
+}
+
+test "deleteSeries: raw and compacted samples and both index entries go; the id is not reused; other series untouched" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const keep = try fx.db.seriesId("keep", &.{});
+    const gone = try fx.db.seriesId("gone", &.{.{ .name = "a", .value = "1" }});
+    for (0..3000) |i| {
+        try fx.db.append(keep, @intCast(i), 1);
+        try fx.db.append(gone, @intCast(i), 2);
+    }
+    _ = try fx.db.compact(2000, .{ .min_run = 1 }); // both partitions populated
+    const before_keep = try fx.db.liveSize();
+
+    // Small chunks: several transactions, the index removed only by the last.
+    const r = try fx.db.deleteSeries(gone, .{ .chunk_deletes = 3 });
+    try testing.expect(r.existed);
+    try testing.expectEqual(@as(usize, 3000), r.deleted);
+    try testing.expect(r.chunks > 1);
+    try testing.expect((try fx.db.lookupSeries("gone", &.{.{ .name = "a", .value = "1" }})) == null);
+    try testing.expect((try fx.db.seriesCanonical(gpa, gone)) == null);
+    const none = try collect(gpa, &fx.db, gone, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    const kept = try collect(gpa, &fx.db, keep, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(kept);
+    try testing.expectEqual(@as(usize, 3000), kept.len);
+    try testing.expect(try fx.db.liveSize() < before_keep);
+
+    var it = try fx.db.seriesIterator();
+    defer it.deinit();
+    var n: usize = 0;
+    while (try it.next(gpa)) |e_val| {
+        var e = e_val;
+        defer e.deinit(gpa);
+        try testing.expectEqual(keep, e.id);
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n);
+
+    // Re-registering the name gets a fresh id with no stale samples, also
+    // through the in-memory cache that had the old id.
+    const again = try fx.db.seriesId("gone", &.{.{ .name = "a", .value = "1" }});
+    try testing.expect(again != gone);
+    const fresh = try collect(gpa, &fx.db, again, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(fresh);
+    try testing.expectEqual(@as(usize, 0), fresh.len);
+    // Deleting an unknown or already deleted id is a no-op.
+    try testing.expect(!(try fx.db.deleteSeries(gone, .{})).existed);
+}
+
+// ── mutation-audit additions (2026-10-04) ────────────────────────────────────
+
+fn blockBytesInTree(db: *Db) !u64 {
+    var cur = try db.tree.cursor();
+    defer cur.deinit();
+    try cur.seek(&[_]u8{codec.tag_block});
+    var bytes: u64 = 0;
+    while (try cur.next()) |e| {
+        _ = codec.decodeBlockKey(e.key) orelse break;
+        bytes += e.val.len + e.key.len;
+    }
+    return bytes;
+}
+
+test "compact: chunk_points, chunk_examines and max_chunks bound a call exactly; the raw tail above the horizon is skipped by one seek" {
+    // Kills: `>=` -> `>` on the two chunk caps and on max_chunks, and a
+    // dropped reseek after the horizon (the tail would be read and counted).
+    const gpa = testing.allocator;
+    {
+        var fx = try Fixture.init(gpa);
+        defer fx.deinit();
+        const s = try fx.db.seriesId("m", &.{});
+        for (0..10) |i| try fx.db.append(s, @intCast(i), 1);
+        for (100..105) |i| try fx.db.append(s, @intCast(i), 1);
+        const res = try fx.db.compact(50, .{ .min_run = 1, .chunk_points = 3 });
+        try testing.expect(res.done);
+        try testing.expectEqual(@as(usize, 10), res.compacted);
+        try testing.expectEqual(@as(usize, 4), res.chunks); // 3 + 3 + 3 + 1
+        try testing.expectEqual(@as(usize, 4), res.blocks_written);
+        // 10 below the horizon, then ONE tail key read before the skip.
+        try testing.expectEqual(@as(usize, 11), res.examined);
+        try testing.expectEqual(@as(usize, 5), try rawCount(&fx.db));
+    }
+    {
+        var fx = try Fixture.init(gpa);
+        defer fx.deinit();
+        const s = try fx.db.seriesId("m", &.{});
+        for (0..10) |i| try fx.db.append(s, @intCast(i), 1);
+        for (100..105) |i| try fx.db.append(s, @intCast(i), 1);
+        const res = try fx.db.compact(50, .{ .min_run = 1, .chunk_examines = 4 });
+        try testing.expect(res.done);
+        try testing.expectEqual(@as(usize, 10), res.compacted);
+        try testing.expectEqual(@as(usize, 3), res.blocks_written); // 4 + 4 + 2
+    }
+    {
+        var fx = try Fixture.init(gpa);
+        defer fx.deinit();
+        const s = try fx.db.seriesId("m", &.{});
+        for (0..10) |i| try fx.db.append(s, @intCast(i), 1);
+        var res = try fx.db.compact(50, .{ .min_run = 1, .chunk_points = 3, .max_chunks = 2 });
+        try testing.expect(!res.done);
+        try testing.expectEqual(@as(usize, 2), res.chunks);
+        try testing.expectEqual(@as(usize, 6), res.compacted);
+        res = try fx.db.compact(50, .{ .min_run = 1, .chunk_points = 3 });
+        try testing.expect(res.done);
+        try testing.expectEqual(@as(usize, 4), res.compacted);
+    }
+}
+
+test "compact: merging late samples into a full block splits it, counts every piece, and sizes the merge buffer by the raw count" {
+    // Kills: merge `blocks_written` drift, an uncounted BlockFull split, and a
+    // merge buffer that ignores raw.len (2024 samples > any growth slack).
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..1024) |i| try fx.db.append(s, @as(i64, @intCast(i)) * 10, 1);
+    var res = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try testing.expectEqual(@as(usize, 1), res.blocks_written); // exactly max_block_samples
+    for (0..1000) |k| try fx.db.append(s, @as(i64, @intCast(k)) * 10 + 5, 1); // inside the span
+    res = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try testing.expectEqual(@as(usize, 1000), res.compacted);
+    try testing.expectEqual(@as(usize, 2), res.blocks_written); // 1024 + 1000
+    try testing.expectEqual(@as(usize, 2), try checkBlockInvariants(&fx.db));
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 2024), got.len);
+}
+
+test "compact: a block whose last sample disagrees with its key is CorruptPoint, not silently merged" {
+    // Kills: the last-vs-key check in mergeIntoBlock dropped.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    var w = chunk.Writer.init();
+    for ([_]Timestamp{ 10, 20, 30 }) |t| try w.append(.{ .ts = t, .value = 1 });
+    try fx.tree.put(&codec.blockKey(s, 35), w.bytes()); // key says 35, last sample is 30
+    try fx.db.append(s, 15, 2);
+    try testing.expectError(error.CorruptPoint, fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 }));
+    try testing.expectEqual(@as(usize, 1), try rawCount(&fx.db)); // rolled back
+}
+
+test "Range: a Range moved to new memory mid-block keeps decoding (the reader is rebound every use)" {
+    // Kills: `rd.rebind` removed from fillBlock.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..100) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i));
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    var rng = try fx.db.range(s, std.math.minInt(i64), std.math.maxInt(i64));
+    for (0..5) |i| try testing.expectEqual(@as(Timestamp, @intCast(i)), (try rng.next()).?.ts);
+    const moved = try gpa.create(Range);
+    defer gpa.destroy(moved);
+    moved.* = rng;
+    @memset(std.mem.asBytes(&rng), 0xAA); // the old copy's block buffer is garbage now
+    defer moved.deinit();
+    var i: usize = 5;
+    while (try moved.next()) |smp| : (i += 1) {
+        try testing.expectEqual(@as(Timestamp, @intCast(i)), smp.ts);
+        try testing.expectEqual(@as(f64, @floatFromInt(i)), smp.value);
+    }
+    try testing.expectEqual(@as(usize, 100), i);
+}
+
+test "series id maxInt: compact, sweep and reads survive the next-series overflow edge in both partitions" {
+    // Kills: the maxInt-series guards in sweepChunk (raw and block branch)
+    // dropped -- `series + 1` would overflow and panic.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const top: SeriesId = std.math.maxInt(SeriesId);
+    for (0..10) |i| try fx.db.append(top, @intCast(i), @floatFromInt(i));
+    const c = try fx.db.compact(5, .{ .min_run = 1 });
+    try testing.expect(c.done);
+    try testing.expectEqual(@as(usize, 5), c.compacted);
+    const r = try fx.db.sweep(3, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 3), r.deleted); // 0, 1, 2 of the block
+    const got = try collect(gpa, &fx.db, top, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 7), got.len);
+    try testing.expectEqual(@as(Timestamp, 3), got[0].ts);
+    try testing.expectEqual(@as(Timestamp, 9), got[6].ts);
+}
+
+test "sweep: a malformed key in the block tag range ends the scan instead of looping" {
+    // Kills: `<` -> `<=` on the leave-the-raw-partition test (it would re-seek
+    // to the first block forever).
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..10) |i| try fx.db.append(s, @intCast(i), 1);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try fx.tree.put(&[_]u8{ codec.tag_block, 0xff }, "x");
+    const r = try fx.db.sweep(5, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 5), r.deleted);
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 5), got.len);
+}
+
+test "sweep: chunk_deletes bounds the deletes of one chunk exactly" {
+    // Kills: `>=` -> `>` on the sweepChunk delete cap.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..10) |i| try fx.db.append(s, @intCast(i), 1);
+    const r = try fx.db.sweep(5, .{ .chunk_deletes = 2 });
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 5), r.deleted);
+    try testing.expectEqual(@as(usize, 3), r.chunks); // 2 + 2 + 1
+}
+
+test "liveSize: a block entry counts its key and value bytes exactly, next to the raw points" {
+    // Kills: the block scan seeking the wrong tag, and a dropped key length.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..300) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i % 7));
+    _ = try fx.db.compact(200, .{ .min_run = 1 });
+    const packed_bytes = try blockBytesInTree(&fx.db);
+    try testing.expect(packed_bytes > 0);
+    try testing.expectEqual(@as(usize, 100), try rawCount(&fx.db));
+    try testing.expectEqual(100 * codec.point_entry_bytes + packed_bytes, try fx.db.liveSize());
+}
+
+test "sweepToBudget: equal timestamps go lowest series id first" {
+    // Kills: the series tie-break reversed.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+    for ([_]SeriesId{ a, b }) |id| {
+        try fx.db.append(id, 100, 1);
+        try fx.db.append(id, 200, 2);
+    }
+    const before = try fx.db.liveSize();
+    const r = try fx.db.sweepToBudget(before - codec.point_entry_bytes, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 1), r.deleted);
+    const got_a = try collect(gpa, &fx.db, a, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got_a);
+    try testing.expectEqual(@as(usize, 1), got_a.len);
+    try testing.expectEqual(@as(Timestamp, 200), got_a[0].ts);
+    const got_b = try collect(gpa, &fx.db, b, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got_b);
+    try testing.expectEqual(@as(usize, 2), got_b.len);
+}
+
+test "sweepToBudget: on a timestamp tie the block goes before the raw point that shadows it (review H1)" {
+    // Kills: the tie-break reversed to raw-first — which deleted the newer
+    // raw value and let the overwritten block sample read again.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (100..150) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i));
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try fx.db.append(s, 100, -1); // overwrite of the block's first sample
+    try fx.db.append(s, 1000, 5);
+    const before = try fx.db.liveSize();
+    const r = try fx.db.sweepToBudget(before - codec.point_entry_bytes, .{});
+    try testing.expectEqual(@as(usize, 50), r.deleted); // the whole block
+    const got = try collect(gpa, &fx.db, s, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got);
+    // Never the stale 100: the newer -1 survives, or nothing at ts 100 does.
+    for (got) |g| if (g.ts == 100) try testing.expectEqual(@as(f64, -1), g.value);
+    try testing.expectEqual(@as(usize, 2), got.len);
+}
+
+test "sweepToBudget: a block is ordered by its FIRST sample, not its key (last sample)" {
+    // Kills: unitAt's block `oldest` taken from the key.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+    for (0..101) |i| try fx.db.append(a, @intCast(i), 1);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try fx.db.append(b, 50, 2); // between the block's first (0) and last (100)
+    const before = try fx.db.liveSize();
+    const r = try fx.db.sweepToBudget(before - codec.point_entry_bytes, .{});
+    try testing.expect(r.done);
+    const got_a = try collect(gpa, &fx.db, a, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got_a);
+    try testing.expectEqual(@as(usize, 0), got_a.len);
+    const got_b = try collect(gpa, &fx.db, b, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(got_b);
+    try testing.expectEqual(@as(usize, 1), got_b.len);
+}
+
+test "sweepToBudget: a series without raw points or without blocks is never credited with its neighbour's entries" {
+    // Kills: the series checks in unitAt dropped (a probe would land on the
+    // next series' entry and the accounting would count it twice).
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s1 = try fx.db.seriesId("s1", &.{});
+    const s2 = try fx.db.seriesId("s2", &.{});
+    const s3 = try fx.db.seriesId("s3", &.{});
+    for (0..100) |i| {
+        try fx.db.append(s1, @intCast(i), 1);
+        try fx.db.append(s3, @intCast(i), 1);
+    }
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 }); // s1, s3: blocks only
+    for (0..10) |i| try fx.db.append(s2, @intCast(i), 1); // s2: raw only
+    const r = try fx.db.sweepToBudget(0, .{});
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 210), r.deleted);
+    try testing.expectEqual(@as(u64, 0), r.after);
+    try testing.expectEqual(@as(u64, 0), try fx.db.liveSize());
+}
+
+test "sweepToBudget: chunk_deletes bounds the entries per commit" {
+    // Kills: the delete chunk widened by one (half the commits at chunk 1).
+    const gpa = testing.allocator;
+    var sim = kvtree.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var counting = CountingStorage{ .inner = sim.storage() };
+    var tree = try kvtree.Db.open(gpa, counting.storage(), "series.kvt", .{});
+    defer tree.close();
+    var db = Db.init(gpa, &tree);
+    defer db.deinit();
+    const s = try db.seriesId("m", &.{});
+    for (0..12) |i| try db.append(s, @intCast(i), 1);
+
+    var t0 = counting.sync_count;
+    var before = try db.liveSize();
+    var r = try db.sweepToBudget(before - 4 * codec.point_entry_bytes, .{ .chunk_deletes = 100 });
+    try testing.expectEqual(@as(usize, 4), r.deleted);
+    const per_commit = counting.sync_count - t0;
+    try testing.expect(per_commit > 0);
+
+    t0 = counting.sync_count;
+    before = try db.liveSize();
+    r = try db.sweepToBudget(before - 4 * codec.point_entry_bytes, .{ .chunk_deletes = 1 });
+    try testing.expectEqual(@as(usize, 4), r.deleted);
+    try testing.expectEqual(4 * per_commit, counting.sync_count - t0);
+}
+
+test "deleteSeries: deleting a LOWER id never touches a higher series, and chunking is exact" {
+    // Kills: the series-boundary break dropped in either pass, and
+    // `>=` -> `>` on chunk_deletes.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+    for (0..100) |i| {
+        try fx.db.append(a, @intCast(i), 1);
+        try fx.db.append(b, @intCast(i), 2);
+    }
+    _ = try fx.db.compact(50, .{ .min_run = 1 }); // 50 raw + 1 block each
+    const r = try fx.db.deleteSeries(a, .{ .chunk_deletes = 10 });
+    try testing.expect(r.existed);
+    try testing.expectEqual(@as(usize, 100), r.deleted);
+    try testing.expectEqual(@as(usize, 6), r.chunks); // 5 x 10 raw keys, then the block
+    const kept = try collect(gpa, &fx.db, b, std.math.minInt(i64), std.math.maxInt(i64));
+    defer gpa.free(kept);
+    try testing.expectEqual(@as(usize, 100), kept.len);
+    try testing.expectEqual(@as(usize, 50), try rawCount(&fx.db));
+    try testing.expectEqual(@as(usize, 1), try checkBlockInvariants(&fx.db));
 }

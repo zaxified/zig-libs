@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED, no format break: sample compression and series deletion (survey
+  2026-09-30 gaps). `Db.compact(before, opts)` packs raw samples below a horizon into
+  Gorilla blocks (`chunk.zig`: delta-of-delta timestamps, XOR'd values, ≤ 1024 samples / 1 KiB)
+  under a new key partition `0x05` keyed by each block's LAST timestamp; `range` merges raw and
+  block samples (raw shadows a block sample with the same timestamp); `sweep` deletes expired
+  blocks and rewrites the one straddling the cutoff; `liveSize` counts block bytes;
+  `sweepToBudget` deletes whole blocks oldest-first (its `max_deletes` counts samples and may be
+  passed by less than one block). `Db.deleteSeries(id, opts)`. Measured on a copy of
+  ttydesk's history: 9.2× less live data. Stores written earlier need no migration (their samples
+  stay raw until compacted). ⚠ Downgrade hazard: an OLDER tsdb opening a store that has been
+  compacted does not see the `0x05` blocks — their samples are missing from its reads and never
+  expire. Behaviour note: `SweepToBudgetResult.after` is now `before` minus the
+  deleted entries' bytes (it was `deleted × 25`, the same thing while every entry was a point).
+
 - **2026-09-28** — Retention now bounds the file: with kvtree dropping emptied leaves (same day),
   appending and sweeping at the same rate reaches a steady file size instead of growing ~60 KiB
   per 1000 points. No tsdb code change; README/SPEC corrected and a test pins the steady size.
