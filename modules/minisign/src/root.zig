@@ -1626,3 +1626,110 @@ test "KeyPair.wipe destroys the long-term secret key, leaving the public half us
         opened.ed25519.public_key.toBytes(),
     );
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "isPrintableComment: overlong, out-of-range, broken and C1-control UTF-8 rejected" {
+    // RFC 3629 §3/§4: the octets C0, C1 and F5..FF never appear in UTF-8; E0
+    // needs A0..BF next and F0 needs 90..BF (no overlong forms); F4 needs
+    // 80..8F (nothing above U+10FFFF); every trailing octet is 10xxxxxx. And
+    // U+0080..U+009F are the C1 controls — U+009B is CSI, the 8-bit form of
+    // the terminal escape `ESC [` this function exists to keep out of a
+    // verifier's output (module doc; minisign.c `is_printable`).
+    const bad = [_][]const u8{
+        "\xc0\xa1", // overlong '!'
+        "\xc1\xbf", // overlong DEL
+        "\xe0\x80\xa1", // overlong '!' (3 octets)
+        "\xf0\x80\x80\xa1", // overlong '!' (4 octets)
+        "\xf4\x90\x80\x80", // U+110000
+        "\xf5\x80\x80\x80", // lead octet F5
+        "\xc3\x41", // a lead octet followed by ASCII
+        "\xc2\x9b", // U+009B CSI
+        "\xc2\x80", // U+0080
+    };
+    for (bad) |s| try std.testing.expect(!isPrintableComment(s));
+    // The nearest valid neighbours are accepted (non-vacuity).
+    const good = [_][]const u8{ "\xc2\xa0", "\xe0\xa0\x80", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf", "\xed\x9f\xbf" };
+    for (good) |s| try std.testing.expect(isPrintableComment(s));
+}
+
+test "parseSignatureFile: trusted-comment prefix and printability, CRLF line ends, padding" {
+    // A real signature file (kat_vectors.zig) with exactly one thing changed.
+    const real = kat.prehashed_signature_file;
+    var buf: [1024]u8 = undefined;
+
+    // CRLF: minisign's own `trim()` strips a trailing "\r" from every line,
+    // so a file saved with Windows line ends is the same file.
+    var crlf: std.ArrayList(u8) = .empty;
+    defer crlf.deinit(std.testing.allocator);
+    for (real) |c| {
+        if (c == '\n') try crlf.append(std.testing.allocator, '\r');
+        try crlf.append(std.testing.allocator, c);
+    }
+    const pub_key = try parsePublicKeyFile(kat.unencrypted_public_key_file);
+    try verifyFile(std.testing.allocator, pub_key.key, kat.message, try parseSignatureFile(crlf.items));
+
+    // Line 3 must start with "trusted comment: " (the reference refuses the
+    // file otherwise).
+    const tc = std.mem.indexOf(u8, real, "\n" ++ trusted_comment_prefix).? + 1; // not the "untrusted …" one
+    @memcpy(buf[0..real.len], real);
+    buf[tc] = 'T';
+    try std.testing.expectError(error.MissingTrustedCommentPrefix, parseSignatureFile(buf[0..real.len]));
+
+    // A trusted comment carrying ESC is refused at parse time, before any
+    // caller can print it.
+    @memcpy(buf[0..real.len], real);
+    buf[tc + trusted_comment_prefix.len] = 0x1b;
+    try std.testing.expectError(error.UnprintableComment, parseSignatureFile(buf[0..real.len]));
+
+    // Line 2 is the base64 of the 74-octet struct: 100 characters ending in
+    // ONE '=' (RFC 4648 §4). With the final group made `xA==` it has the right length but encodes 73 octets — not the
+    // struct, so not a signature line.
+    const l2 = std.mem.indexOfScalar(u8, real, '\n').? + 1;
+    const l2_end = std.mem.indexOfScalarPos(u8, real, l2, '\n').?;
+    try std.testing.expectEqual(@as(usize, 100), l2_end - l2);
+    try std.testing.expectEqual(@as(u8, '='), real[l2_end - 1]);
+    @memcpy(buf[0..real.len], real);
+    buf[l2_end - 3] = 'A'; // zero low bits: a canonical 1-octet final group
+    buf[l2_end - 2] = '=';
+    try std.testing.expectError(error.InvalidBase64, parseSignatureFile(buf[0..real.len]));
+}
+
+test "parsePublicKeyFile / parseSecretKeyFile: comment prefix and every algorithm tag checked" {
+    // Both files are `untrusted comment: …` + base64 (minisign.c refuses a
+    // file whose first line lacks the prefix), and a secret key names its
+    // signature ("Ed"), checksum ("B2") and KDF ("Sc" or none) algorithms —
+    // anything else is a key this module cannot use, refused at parse time.
+    const pk = try parsePublicKeyFile(kat.unencrypted_public_key_file);
+    const pk_b64 = PublicKeyCodec.encode(pk.key.toBytes());
+    var buf: [512]u8 = undefined;
+    const no_prefix = try std.fmt.bufPrint(&buf, "untrusted remark: x\n{s}\n", .{pk_b64});
+    try std.testing.expectError(error.MissingUntrustedCommentPrefix, parsePublicKeyFile(no_prefix));
+
+    const sk = try parseSecretKeyFile(kat.unencrypted_secret_key_file); // control
+    inline for (.{ "sig_alg", "chk_alg", "kdf_alg" }) |field| {
+        var raw = sk.key;
+        @field(raw, field) = .{ 'X', 'X' };
+        var w = std.Io.Writer.fixed(&buf);
+        try writeSecretKeyFile(&w, "c", raw);
+        try std.testing.expectError(error.UnsupportedAlgorithm, parseSecretKeyFile(w.buffered()));
+    }
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSecretKeyFile(&w, "c", sk.key);
+    const text = w.buffered();
+    text[0] = 'U';
+    try std.testing.expectError(error.MissingUntrustedCommentPrefix, parseSecretKeyFile(text));
+}
+
+test "writers refuse a carriage return and an unprintable trusted comment" {
+    // `checkComment` refuses '\r' as well as '\n' (a reader that splits on
+    // either would see an extra line), and `writeSignatureFile` refuses what
+    // `parseSignatureFile` would refuse, so it never writes a file its own
+    // parser rejects.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const pk: RawPublicKey = .{ .sig_alg = sig_alg_legacy, .key_number = @splat(0), .key = @splat(0) };
+    try std.testing.expectError(error.EmbeddedNewline, writePublicKeyFile(&w, "bad\rcomment", pk));
+    const sig: RawSignature = .{ .sig_alg = sig_alg_prehashed, .key_number = @splat(0), .signature = @splat(0) };
+    try std.testing.expectError(error.UnprintableComment, writeSignatureFile(&w, "ok", sig, "esc\x1b[31m", @splat(0)));
+}

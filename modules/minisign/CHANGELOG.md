@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (43 mutants, 42 killed, 1 equivalent).
+  Four new tests: malformed / overlong / out-of-range / C1-control UTF-8 refused by
+  `isPrintableComment` (U+009B is the 8-bit CSI), a CRLF signature file verifies, the
+  trusted-comment prefix and an ESC in the trusted comment refused at parse time, a
+  right-length base64 line encoding 73 octets refused, all three secret-key algorithm
+  tags and the comment prefix checked by `parseSecretKeyFile`, and the writers' `\r`
+  and unprintable-comment refusals. No behaviour change.
 - **2026-09-10** — A1 audit F1 (HIGH): a file-controlled `mem_limit` in `[0, 1023]`
   bytes reached `scrypt.Params.fromLimits` unguarded and panicked via `math.log2(0)`
   — before any password check, on a key file nobody had authenticated. Confirmed

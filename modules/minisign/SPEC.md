@@ -6,7 +6,7 @@
 
 **Scope:** parity — jedisct1/minisign 0.12 (file format and crypto; the CLI is out of scope by design) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -235,6 +235,21 @@ real `minisign -G`/`-S` output accepted by `minisign-demo -V` — for both
 algorithms and for a file larger than the CLI's 64 KiB streaming chunk size
 (confirming genuine multi-chunk streaming, not a single `update()` call).
 See the module CHANGELOG for the dated entry.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, every
+non-fuzz test): 43 mutants — the base64 length and decoded-length checks, every
+comment-prefix and algorithm-tag check of the three parsers, `trimCr`, each branch
+of `isPrintableComment` (tab, DEL, lead-octet ranges, truncation, continuation
+octets, the four overlong/range guards, C1 controls), both writer guards, the key-id
+byte order, `openSecretKey`'s tag/`mem_limit`/checksum checks and KDF dispatch, both
+key-id checks, `verifyDigest`'s legacy refusal, the signed bytes, the
+trusted-comment concatenation and both composed verifiers. First run: 25 killed,
+18 alive; four tests added (RFC 3629 / RFC 4648 / minisign.c `trim` cited per case:
+malformed and C1-control UTF-8, a CRLF file, the trusted-comment prefix and an ESC
+in it, a right-length base64 line encoding 73 octets, secret-key tags, writer `\r`
+and an unprintable trusted comment); rerun: 42 killed, 1 equivalent — the
+`MemLimitTooLarge` cast replaced by a truncation (identical where `usize` is 64
+bits, every target this module has). No defect found.
 
 ## Anchoring
 
