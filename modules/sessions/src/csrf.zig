@@ -568,3 +568,54 @@ test "middleware and Csrf.check agree: a request the middleware 403s also fails 
     const mirrored = runWire(&r, "GET /check-mirror HTTP/1.1\r\nHost: t\r\nCookie: session=sess-deny\r\nConnection: close\r\n\r\n", &out_get);
     try testing.expect(std.mem.endsWith(u8, mirrored, "false"));
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "verify: a token must be exactly 64 hex digits — a prefix of the right one fails" {
+    // `verify` doc: "A wrong length or non-hex token is rejected". The raw MAC
+    // is 32 octets; a shorter hex string would leave the rest of the decode
+    // buffer unset and compare whatever it held.
+    const c = Csrf{ .key = @splat(0x21) };
+    var buf: [token_hex_len]u8 = undefined;
+    const tok = c.token("sid", &buf);
+    try testing.expect(c.verify("sid", tok)); // control
+    try testing.expect(!c.verify("sid", tok[0 .. tok.len - 2]));
+    try testing.expect(!c.verify("sid", tok[0..2]));
+}
+
+test "Csrf.presented: an empty header falls back to the query; an empty or look-alike query is absent" {
+    // `presented` doc: header first, then the query parameter; "both
+    // trimmed; empty counts as absent". The parameter is matched by its
+    // exact name, so `csrf_tokenx` is a different parameter.
+    const c = Csrf{ .key = @splat(0x67) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.get("/p", hReportPresented);
+
+    var out1: [4096]u8 = undefined;
+    const blank_header = runWire(&r, "GET /p?csrf_token=from-query HTTP/1.1\r\nHost: t\r\nX-CSRF-Token:   \r\nConnection: close\r\n\r\n", &out1);
+    try testing.expect(std.mem.endsWith(u8, blank_header, "from-query"));
+    var out2: [4096]u8 = undefined;
+    const empty_query = runWire(&r, "GET /p?csrf_token= HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out2);
+    try testing.expect(std.mem.endsWith(u8, empty_query, "<absent>"));
+    var out3: [4096]u8 = undefined;
+    const look_alike = runWire(&r, "GET /p?csrf_tokenx=abc HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out3);
+    try testing.expect(std.mem.endsWith(u8, look_alike, "<absent>"));
+}
+
+test "Csrf.check: no session cookie is false even with the token an empty session id would have" {
+    // `check` doc: true iff the request carries a session cookie AND a token
+    // that verifies against it. A missing cookie is not the empty id.
+    const c = Csrf{ .key = @splat(0x78) };
+    var buf: [token_hex_len]u8 = undefined;
+    const tok_for_empty = c.token("", &buf);
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.get("/c", hReportCheck);
+    var req_buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok_for_empty});
+    var out: [4096]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, runWire(&r, req, &out), "false"));
+}

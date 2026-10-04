@@ -1587,7 +1587,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
 
 const App = struct {
     manager: *Manager,
-    action: enum { touch, write_big, revoke, regenerate, read_only, keep } = .touch,
+    action: enum { touch, write_big, revoke, regenerate, regenerate_only, read_only, keep } = .touch,
 };
 
 fn hSession(ctx: *router.Ctx) anyerror!void {
@@ -1612,6 +1612,10 @@ fn hSession(ctx: *router.Ctx) anyerror!void {
             app.manager.regenerate(s);
             try s.setData("uid=42"); // data set AFTER rotation must survive the final save
             try ctx.res.writeAll(s.id()); // echo the NEW id
+        },
+        .regenerate_only => {
+            app.manager.regenerate(s); // no setData / keep
+            try ctx.res.writeAll(s.id());
         },
         .read_only => try ctx.res.writeAll(s.id()),
         .keep => {
@@ -2209,4 +2213,152 @@ test "KvStore waits on its lock through the Db's Io when the storage has one" {
     defer db2.close();
     const over_sim = try KvStore.init(&db2, .{});
     try testing.expect(over_sim.lock.io == null);
+}
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "setData takes exactly max_session_bytes, refuses one more" {
+    // The documented bound: `error.Overflow` when the payload EXCEEDS
+    // `max_session_bytes` — so the bound itself fits.
+    var s: Session = .{};
+    const full: [max_session_bytes]u8 = @splat('d');
+    try s.setData(&full);
+    try testing.expectEqual(@as(usize, max_session_bytes), s.data().len);
+    const over: [max_session_bytes + 1]u8 = @splat('d');
+    try testing.expectError(error.Overflow, s.setData(&over));
+}
+
+test "timeouts are strict: a session exactly at its idle or absolute limit still loads" {
+    // `idle_timeout_ns`: "reject a session unused for LONGER than this";
+    // `absolute_timeout_ns`: "OLDER than this" — strict inequalities, so the
+    // limit itself is still valid and one nanosecond past it is not.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 500, .absolute = 100_000 });
+    var s: Session = .{};
+    m.create(&s); // created = last_seen = 1000
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    seed(&m, &s);
+    env.clk.now_ns = 1500;
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+    // `lookup` refreshes `last_seen_ns` to now (its doc: "On .loaded,
+    // out.last_seen_ns is refreshed to now").
+    try testing.expectEqual(@as(i64, 1500), l.last_seen_ns);
+    try testing.expectEqual(@as(i64, 1000), l.created_ns);
+
+    var m2 = try env.manager(.{ .idle = 1_000_000, .absolute = 5_000 });
+    var s2: Session = .{};
+    m2.create(&s2); // created = 1500
+    const id2 = try testing.allocator.dupe(u8, s2.id());
+    defer testing.allocator.free(id2);
+    seed(&m2, &s2);
+    env.clk.now_ns = 6500;
+    try testing.expectEqual(Manager.LoadResult.loaded, m2.lookup(id2, &l));
+    env.clk.now_ns = 6501;
+    try testing.expectEqual(Manager.LoadResult.expired, m2.lookup(id2, &l));
+}
+
+/// A `Store` that hands back one record whose payload is larger than any
+/// `Session` can hold — what a corrupt or foreign backend (the `Store`
+/// vtable is public) could return.
+const OversizedStore = struct {
+    fn get(_: *anyopaque, gpa: Allocator, _: []const u8) StoreError!?Loaded {
+        const rec = try gpa.alloc(u8, record_header_len + max_session_bytes + 1);
+        @memset(rec, 0);
+        return .{ .record = rec, .generation = 1 };
+    }
+    fn put(_: *anyopaque, _: []const u8, _: []const u8, _: Generation) ?Generation {
+        return null;
+    }
+    fn delete(_: *anyopaque, _: []const u8) void {}
+    const vtable: Store.VTable = .{ .get = get, .put = put, .delete = delete };
+};
+
+test "lookup treats a record with an oversized payload as absent, never copies it" {
+    // `lookup`'s contract: "corrupt / oversized → absent". The payload is
+    // copied into the fixed `Session.data_buf`, so the check is all that
+    // stands between a bad store and an out-of-bounds write.
+    var dummy: u8 = 0;
+    const store: Store = .{ .ptr = &dummy, .vtable = &OversizedStore.vtable };
+    const m = try Manager.init(testing.allocator, store, .{ .io = testing.io, .idle_timeout_ns = 0, .absolute_timeout_ns = 0 });
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup("ab", &l));
+}
+
+test "maxAgeSeconds: a disabled idle timeout gives the absolute default, never 0" {
+    // RFC 6265 §5.2.2: Max-Age ≤ 0 makes the cookie expire at once. With the
+    // idle timeout disabled (0) the cookie must live as long as the absolute
+    // default (12 h), not be deleted by the very response that issues it.
+    try testing.expectEqual(@as(i64, 12 * 60 * 60), maxAgeSeconds(0));
+    try testing.expectEqual(@as(i64, 12 * 60 * 60), maxAgeSeconds(-5));
+    try testing.expectEqual(@as(i64, 30), maxAgeSeconds(30 * std.time.ns_per_s));
+}
+
+test "middleware: allow_insecure_cookie really drops Secure from the Set-Cookie" {
+    // The escape hatch's whole effect is on the wire; the Manager field
+    // alone (tested above) does not show the cookie writer honours it.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .allow_insecure_cookie = true });
+    var app = App{ .manager = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = getWithCookie(&r, null, &out, &rbody);
+    const sc = headerValue(got, "Set-Cookie").?;
+    try testing.expect(std.mem.indexOf(u8, sc, "Secure") == null);
+    try testing.expect(std.mem.indexOf(u8, sc, "HttpOnly") != null);
+}
+
+test "middleware: a new session whose handler only regenerates is persisted" {
+    // `Options.persist_untouched_sessions` doc: a new session is dropped
+    // "unless the handler called setData, keep or Manager.regenerate" — a
+    // regenerate alone (e.g. a login step that stores nothing yet) counts.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m, .action = .regenerate_only };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = getWithCookie(&r, null, &out, &rbody);
+    const id = cookieId(headerValue(got, "Set-Cookie").?);
+    try testing.expectEqualStrings(id, bodyOf(got));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+}
+
+test "KvStore: once closed by a failed write, a readable record is still not served" {
+    // `KvStore` doc, "Fail closed": after any kv error on a write every `get`
+    // answers absent — even when the disk can be read again, since the
+    // failed write may have been a logout.
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expect(m.persist(&s));
+    env.sim.ops_until_crash = 0;
+    m.store.delete(s.id()); // the logout fails
+    try testing.expect(env.store.hasFailed());
+    env.sim.reboot(); // the disk answers reads again; the store stays closed
+    var kbuf: KvStore.KeyBuf = undefined;
+    var vbuf: KvStore.ValueBuf = undefined;
+    try testing.expect((try env.db.getBuf(&vbuf, env.storeKey(&kbuf, s.id()))) != null); // non-vacuous
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(s.id(), &l));
 }

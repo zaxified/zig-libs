@@ -6,7 +6,7 @@
 
 **Scope:** core — alexedwards/scs v2.9.0 (surveyed 2026-09-30); raised from mvp 2026-09-30 with the persistent `KvStore`
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -198,6 +198,30 @@ fallback, header wins over query, absent), **`check`** (false: no session cookie
 true: matching session cookie + token), **middleware/`check` agreement** (a request the middleware
 lets through also passes `check`; a request the middleware 403s also fails `check`). Plus the
 dark-tests aggregator pulling in `csrf.zig`. Run: `zig build test-sessions`.
+
+**Mutation (2026-10-04,** schemata over a copy of `root.zig` + `csrf.zig`, one ReleaseSafe
+build, the whole suite): 48 mutants — both stores' CAS compare, generation bump and
+tombstone, `KvStore`'s key bound, value framing, fail-closed flag (get/put/set on write
+and delete errors) and TTL write, `setData`'s bound and `kept`, every `Manager.init`
+check, the `Secure`/`HttpOnly` cookie attributes, `lookup`'s record checks, both timeout
+comparisons and the eviction, the rolling refresh, the loaded generation, `persist`'s
+generation advance, `regenerate`'s delete and generation reset, the id length,
+`maxAgeSeconds`, the middleware's revoke/untouched decision, and in `csrf.zig` the token
+length check, the MAC compare, `presented`'s empty-header / empty-query rules, `check`'s
+missing cookie, the guard, the token cookie's `HttpOnly`, `issue_on_safe` and the query
+name match. First run: 32 killed, 16 alive; ten tests added (exact timeout limits and
+the rolling refresh, `setData` at the bound, an oversized record from a foreign `Store`,
+`maxAgeSeconds` with the idle timeout off — RFC 6265 §5.2.2, `Secure` dropped on the
+wire, a regenerate-only new session persisted, a closed `KvStore` with a readable disk,
+a truncated CSRF token, `presented`'s empty/look-alike cases, `check` without a cookie);
+rerun: 45 killed, 2 equivalent, 1 alive. Equivalent: a tombstone served as an empty
+record (`lookup` refuses any record shorter than its 16-byte header), and `KvStore.put`
+on a closed store (`kv` refuses every write once poisoned, so the write fails and returns
+null anyway). Alive: dropping `Csrf.verify`'s 64-digit length check — a shorter even-length
+token leaves the rest of the decode buffer uninitialised, so the outcome depends on stack
+garbage (the added test asserts the contract; it kills the mutant only when the garbage
+differs from the MAC tail, which it did not here). The check stays; it is what makes
+`verify` independent of that garbage. No defect found.
 
 ## Backlog / deferred
 

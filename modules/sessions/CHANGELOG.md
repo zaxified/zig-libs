@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (48 mutants, 45 killed, 2 equivalent, 1
+  alive by design — see SPEC § Verification). Ten new tests: timeouts at their exact
+  limits and the rolling `last_seen` refresh, `setData` at `max_session_bytes`, an
+  oversized record from a foreign `Store` refused, `maxAgeSeconds` with the idle timeout
+  off, `allow_insecure_cookie` on the wire, a regenerate-only new session persisted, a
+  closed `KvStore` that can read again still serving nothing, a truncated CSRF token,
+  `Csrf.presented`'s empty-header/empty-query/look-alike-name cases, `Csrf.check`
+  without a session cookie. No behaviour change.
 - **2026-10-01** — **Fix: `KvStore` no longer spins on its lock under a fiber/evented `Io`.**
   It held an io-less spinlock across `kv` writes (an fsync each); a second task of the same
   thread spun on it forever while the holder was suspended in the fsync. It now uses `kv.Lock`
