@@ -224,8 +224,13 @@ pub const max_untrusted_elements = 8192;
 /// because a first draft of it was already false: three sites inlined the same
 /// options instead of calling the helper, which carries the property but not the
 /// guarantee the sentence claims.
+/// `utf8_only`: since 2026-10-04 `xml` also reads UTF-16 / ISO-8859-1 /
+/// US-ASCII input. A SAML message is UTF-8 in practice, and accepting more
+/// encodings here would only widen what a forged message can try against
+/// another parser on the path (an encoding-confusion surface), so this module
+/// keeps refusing them, as it did before.
 fn untrustedXmlOptions() xml.Options {
-    return .{ .id_attr_names = &.{"ID"}, .max_elements = max_untrusted_elements };
+    return .{ .id_attr_names = &.{"ID"}, .max_elements = max_untrusted_elements, .utf8_only = true };
 }
 
 /// As `untrustedXmlOptions`, for IdP METADATA. Metadata is not a SAML protocol
@@ -233,7 +238,7 @@ fn untrustedXmlOptions() xml.Options {
 /// deliberately keeps `xml`'s default `id_attr_names` — the one reason it cannot
 /// share the helper above.
 fn untrustedMetadataXmlOptions() xml.Options {
-    return .{ .max_elements = max_untrusted_elements };
+    return .{ .max_elements = max_untrusted_elements, .utf8_only = true };
 }
 
 // ── configuration ────────────────────────────────────────────────────────────
@@ -3823,4 +3828,13 @@ test "TEETH: every untrusted parse in this file goes through an options helper" 
     // The positive control: if the needle ever stops matching, the loop above
     // passes vacuously and this catches it.
     try testing.expect(checked >= 6);
+}
+
+test "untrusted SAML input stays UTF-8 only although xml now reads UTF-16" {
+    // `<a/>` as UTF-16LE with a BOM: xml's default reads it, saml's options refuse it.
+    const utf16 = "\xff\xfe<\x00a\x00/\x00>\x00";
+    var plain = try xml.parse(testing.allocator, utf16, .{});
+    plain.deinit();
+    try testing.expectError(error.UnsupportedEncoding, xml.parse(testing.allocator, utf16, untrustedXmlOptions()));
+    try testing.expectError(error.UnsupportedEncoding, xml.parse(testing.allocator, utf16, untrustedMetadataXmlOptions()));
 }
