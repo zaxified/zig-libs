@@ -1033,6 +1033,69 @@ test "CircuitBreaker: abandonProbe releases a slot without pronouncing a verdict
     try testing.expectEqual(.closed, cb.state());
 }
 
+test "CircuitBreaker: probe bookkeeping across a re-open, the reclaim anchor, abandon while open" {
+    // Mutation 2026-10-04: three survivors, one assertion each.
+    var tc: TestClock = .{};
+    var cb: CircuitBreaker = .init(.{
+        .failure_threshold = 1,
+        .cooldown_ms = 1000,
+        .half_open_probes = 2,
+        .probe_timeout_ms = 10,
+        .clock = tc.clock(),
+    });
+    cb.onFailure();
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow()); // half-open, probe 1
+    cb.onSuccess(); // 1 of 2
+    try testing.expect(cb.allow()); // probe 2
+    cb.onFailure(); // re-opens with a fresh cooldown
+    // `abandonProbe` doc: "No-op outside `half_open`" -- even with the old
+    // half-open counters still lying around.
+    try testing.expect(!cb.abandonProbe());
+
+    // A new half-open episode starts from zero successes: the probe it just
+    // admitted is outstanding, so it can be abandoned. (Keeping the old
+    // success count made that probe look already answered.)
+    tc.advanceMs(1000);
+    try testing.expect(cb.allow());
+    try testing.expect(cb.abandonProbe());
+
+    // `last_admit_ns` is "the instant of the most recent probe admission":
+    // admitting probe 2 at +8 ms moves the reclaim anchor, so at +12 ms
+    // (4 ms after the last admission, under the 10 ms timeout) nothing is
+    // reclaimed and the full budget still refuses.
+    try testing.expect(cb.allow()); // probe 1 again, t = 0
+    tc.advanceMs(8);
+    try testing.expect(cb.allow()); // probe 2, t = 8 ms
+    tc.advanceMs(4);
+    try testing.expect(!cb.allow()); // t = 12 ms: no reclaim yet
+}
+
+const CountingClock = struct {
+    reads: u32 = 0,
+    fn now(ctx: ?*anyopaque) u64 {
+        const self: *CountingClock = @ptrCast(@alignCast(ctx.?));
+        self.reads += 1;
+        return 0;
+    }
+    fn clock(self: *CountingClock) Clock {
+        return .{ .ctx = self, .nowFn = now };
+    }
+};
+
+test "Bulkhead: with max_wait_ns = 0 a full bulkhead never consults the clock" {
+    // `Bulkhead.Options.clock` doc: "Never consulted when `max_wait_ns = 0`"
+    // -- the non-blocking mode rejects without a time read. Mutation
+    // 2026-10-04: entering the wait loop with a zero budget survived (it
+    // still rejected, but read the clock).
+    var cc: CountingClock = .{};
+    var b: Bulkhead = .init(.{ .max_concurrent = 1, .clock = cc.clock() });
+    try b.acquire();
+    try testing.expectError(error.BulkheadFull, b.acquire());
+    b.release();
+    try testing.expectEqual(@as(u32, 0), cc.reads);
+}
+
 test "CircuitBreaker: probe_timeout_ms = 0 keeps the strict never-reclaim behaviour" {
     var tc: TestClock = .{};
     var cb: CircuitBreaker = .init(.{

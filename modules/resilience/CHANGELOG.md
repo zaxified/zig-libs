@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (34 schemata mutants, 33 killed, 1 equivalent). New
+  tests pin the half-open counters across a re-open, the reclaim anchor on the latest probe
+  admission, `abandonProbe` while open, and a non-waiting bulkhead never reading its clock.
+  No code change.
+
 - **2026-07-19** — Security audit: two findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit. Modeled on resilience4j (composition +
   breaker states + semaphore Bulkhead) + Polly (consecutive-failure trip) + AWS

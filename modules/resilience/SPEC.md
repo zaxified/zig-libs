@@ -6,7 +6,7 @@
 
 **Scope:** core — resilience4j v2.4.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -84,6 +84,19 @@ fast-fails a full bulkhead without invoking the op; bounded wait succeeds within
 budget and times out poll-by-poll otherwise; a real cross-thread handover; an 8-thread `run()`
 hammer asserting in-flight never exceeds `max_concurrent` and no slot leaks. Run:
 `zig build test-resilience`.
+
+**Audit 2026-10-04 (mutation).** 34 schemata mutants over the breaker (cooldown edge,
+half-open admission and its counters, the reclaim anchor/default/disable switch,
+`abandonProbe`, success/failure transitions, trip threshold, fresh cooldown), the bulkhead
+(cap, no-wait mode, wait deadline, `run`'s release), `Retry` (jitter flavours, cap,
+exponent), `Deadline`, and `run` (attempt count, breaker gate, timeout edge, late
+success/error, failure reporting, `retryable`, backoff): 33 killed, 1 equivalent, 0 left
+alive. Equivalent: dropping `reclaimStaleProbes`' "nothing outstanding" early return -- the
+counters' guards keep `probes_succeeded <= probes_admitted`, so in that case the reclaim
+assignment `probes_admitted = probes_succeeded` is a no-op. Tests added for the 4 real gaps:
+a new half-open episode starts from zero successes, a later probe admission moves the reclaim
+anchor, `abandonProbe` is a no-op while open after a half-open trip, and a full non-waiting
+bulkhead never reads its clock.
 
 ## Backlog / deferred
 
