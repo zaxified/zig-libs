@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core** (reference: libxml2 2.15 / libexpat 2.8).
+  - **New: input encodings** UTF-16 LE/BE (BOM or Appendix F detection), ISO-8859-1, US-ASCII,
+    transcoded to UTF-8 up front (`Document.source_encoding`, `SourceEncoding`,
+    `Options.utf8_only`). **Behaviour change:** these were `UnsupportedEncoding` before and are
+    now read — also by `xmldsig`/`saml`/`xmlenc`/`netconf`, which can set `utf8_only` to keep the
+    old refusal. `Document.source` is the transcoded UTF-8 text for such input.
+  - **New: `DoctypePolicy.internal_entities`** (opt-in; `.reject` stays default): internal general
+    entities, text-only, bounded by `max_entity_depth` / `max_entity_expansion` (bytes plus one per
+    reference). New errors `UnsupportedEntity`, `EntityLoop`, `EntityLimit`.
+  - **New: writer** — `Writer`, `writeDocument`, `writeElement` (`writer.zig`); `isNameStartChar`,
+    `isNameChar`, `isXmlChar` are now public.
+  - **Evidence:** libxml2 via lxml as a black-box oracle (`tools/gen_core_vectors.py` →
+    `core_vectors.zig`, 27 cases); the writer's output read back by libxml2 equals the original's
+    C14N for 119/119 documents (`tools/writer_oracle.*`); every xmlconf accept vector round-trips
+    and 102/105 expand under `.internal_entities` (3 hold markup in an entity); fuzz driver
+    (`XML_FUZZ`) 360 000 runs clean. Mutation 30 mutants, 29 killed (2 by new tests), 1 argued
+    equivalent. Self-review found and fixed an entity fan-out over EMPTY replacement text that
+    charged nothing (10^n expansions, 0 bytes) — every reference now costs one unit.
+
 - **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q5/Q7,
   audit `A1/xml.md`, five findings closed). BEHAVIOURAL — see SPEC.md's new
   "BEHAVIOURAL" section for the full rationale:

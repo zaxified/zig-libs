@@ -76,11 +76,37 @@ test data is a separate matter: this module vendors a slice of the W3C XML
 Conformance Test Suite, which carries required attribution, so see
 [`NOTICE`](NOTICE) beside this file, which is where the obligation lives.
 
+## Input encodings, internal entities, writing (2026-10-04)
+
+- **Encodings.** UTF-8 (BOM optional), UTF-16 LE/BE (BOM, or detected from
+  `<?xml` per XML 1.0 Appendix F), ISO-8859-1 (`latin1`) and US-ASCII by their
+  declaration — transcoded to UTF-8 before parsing; `doc.source` is then the
+  UTF-8 copy the spans index and `doc.source_encoding` says what came in. A
+  declaration that contradicts the bytes (a UTF-16 BOM labelled "UTF-8") and
+  any other encoding are `UnsupportedEncoding`. `Options.utf8_only = true`
+  refuses everything but UTF-8.
+- **Internal DTD entities**, opt-in: `.doctype = .internal_entities` reads
+  `<!ENTITY name "text">` from the internal subset and expands references in
+  content and attribute values. Text-only (a replacement holding `<` is
+  `UnsupportedEntity`), never external or parameter entities, bounded:
+  `max_entity_depth` (8) nesting, `max_entity_expansion` (1 MiB) total bytes
+  plus one per reference — billion laughs, and its empty-string variant,
+  stop at the cap (`EntityLimit`); a self-reference is `EntityLoop`.
+  `.reject` stays the default.
+- **Writer.** `xml.Writer` (push: `startElement`, `attribute`, `namespace`,
+  `text`, `cdata`, `comment`, `pi`, `endElement`, `end`) onto any
+  `*std.Io.Writer`, with escaping that survives a re-parse (attribute TAB/LF/CR
+  as character references, CR in text as `&#xD;`) and refusals instead of
+  silent damage (bad names, characters XML cannot carry, `--` in a comment);
+  `xml.writeDocument` / `xml.writeElement` serialize a parsed tree
+  (iteratively — no recursion). After a write error the output is not usable.
+
 ## Out of scope
 
 Not a validating parser (no DTD content-model validation / DTD-declared
-defaults or ID typing); no XML 1.1; no XPath; UTF-8 only (other encodings
-rejected). Canonicalization and signature verification themselves live in the
+defaults or ID typing); no XML 1.1; no XPath; no streaming/pull reader;
+entities whose replacement text holds markup; encodings beyond UTF-8/16,
+ISO-8859-1 and US-ASCII. Canonicalization and signature verification themselves live in the
 `xmldsig` layer — this module only guarantees the infoset that layer needs. See
 `SPEC.md` for the full parse model, C14N-fidelity guarantees, and threat model.
 
@@ -92,3 +118,10 @@ Composition: W3C-pattern well-formed docs (namespaces / mixed content / entities
 + Namespaces error cases), and security tests (XXE, billion-laughs, depth,
 attribute count, duplicate ID, invalid UTF-8) each with a positive control.
 `zig fmt --check modules/xml` clean.
+
+2026-10-04: `core_test.zig` replays libxml2's (lxml's) reading of 27 encoding
+and entity cases (`core_vectors.zig`, recipe `tools/gen_core_vectors.py`) and
+round-trips every xmlconf accept vector through the writer; `fuzz_test.zig` is
+a deterministic fuzz driver (`XML_FUZZ=<runs>[,<seed>]`); `tools/writer_oracle.*`
+hands the writer's output to libxml2 and compares canonical forms (119 of 119
+documents equal).

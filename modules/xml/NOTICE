@@ -163,3 +163,8 @@ reproduced. The implementation under test (`parse` and friends in
 `src/root.zig`) is the authors' own (MIT); its design references (W3C XML 1.0
 5th ed., Namespaces in XML 1.0 3rd ed., OWASP XXE guidance) are recorded in
 `SPEC.md`, not as a condition.
+
+Added 2026-10-04: `src/core_vectors.zig` holds what libxml2 (through lxml)
+PRODUCED when driven through its public API on documents this module's recipe
+wrote (`tools/gen_core_vectors.py`) -- oracle output, no libxml2/lxml code or
+test data copied. Not a condition.

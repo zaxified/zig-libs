@@ -16,7 +16,11 @@
 //!
 //! Reference: W3C "Extensible Markup Language (XML) 1.0 (Fifth Edition)" +
 //! "Namespaces in XML 1.0 (Third Edition)". NOT a validating parser (no DTD
-//! content-model validation); no XML 1.1; no XPath; UTF-8 only.
+//! content-model validation); no XML 1.1; no XPath. Input in UTF-8, UTF-16
+//! (BOM or Appendix F detection), ISO-8859-1 or US-ASCII, transcoded to UTF-8
+//! up front; internal DTD general entities expand only when asked for
+//! (`DoctypePolicy.internal_entities`, text-only, bounded). Output: `Writer`
+//! and `writeDocument` (`writer.zig`).
 
 const std = @import("std");
 
@@ -322,7 +326,13 @@ pub const ElementIterator = struct {
 /// needs).
 pub const Document = struct {
     arena: std.heap.ArenaAllocator,
+    /// The UTF-8 text every `Span` indexes. The caller's input itself unless
+    /// it was UTF-16 / ISO-8859-1 (then a transcoded copy owned by the
+    /// document — see `source_encoding`).
     source: []const u8,
+    /// What the input bytes were, as detected (BOM, XML 1.0 Appendix F) and
+    /// confirmed by the encoding declaration.
+    source_encoding: SourceEncoding = .utf8,
     root: *Element,
     /// Comments/PIs before the root element (document prolog misc), in order.
     prolog: []const Child,
@@ -404,6 +414,17 @@ pub const Document = struct {
 
 // ── options & errors ────────────────────────────────────────────────────────
 
+/// The encodings `parse` reads. Everything else is `UnsupportedEncoding`.
+pub const SourceEncoding = enum {
+    utf8,
+    utf16le,
+    utf16be,
+    /// ISO-8859-1 (`latin1`): every byte is the code point of the same value.
+    latin1,
+    /// US-ASCII: a byte >= 0x80 is `InvalidCharacter`.
+    ascii,
+};
+
 pub const DoctypePolicy = enum {
     /// Reject any `<!DOCTYPE ...>` with error.DoctypeForbidden (default, safest
     /// — an external subset can never even be looked at).
@@ -413,6 +434,18 @@ pub const DoctypePolicy = enum {
     /// later reference to a non-predefined entity therefore fails with
     /// error.UndefinedEntity. Still XXE- and billion-laughs-proof.
     ignore,
+    /// Read the internal subset's general entity declarations
+    /// (`<!ENTITY name "text">`) and expand references to them in content and
+    /// attribute values — the roxmltree/expat feature, opt-in. Bounded:
+    /// nesting of references ≤ `Options.max_entity_depth`, a reference loop is
+    /// `EntityLoop`, and the TOTAL bytes produced by expansion over the whole
+    /// document ≤ `Options.max_entity_expansion` (`EntityLimit`) — the
+    /// billion-laughs shape stops at the cap, not in the allocator. Never
+    /// read: external entities (`SYSTEM`/`PUBLIC` — declared, but a reference
+    /// is `UnsupportedEntity`; nothing is fetched, ever), parameter entities (a
+    /// `%name;` reference is `UnsupportedEntity`), and replacement text
+    /// containing markup (`<`) — `UnsupportedEntity`: text-only entities.
+    internal_entities,
 };
 
 pub const Options = struct {
@@ -452,6 +485,18 @@ pub const Options = struct {
     max_name_len: usize = 1 << 20,
     /// DOCTYPE handling. See DoctypePolicy.
     doctype: DoctypePolicy = .reject,
+    /// `.internal_entities` only: how deeply entity references may nest
+    /// inside replacement text.
+    max_entity_depth: u8 = 8,
+    /// `.internal_entities` only: total bytes all entity expansions in the
+    /// document may produce, plus one per reference expanded (expat's
+    /// amplification guard, as a hard number).
+    max_entity_expansion: usize = 1 << 20,
+    /// Refuse anything but UTF-8 input (`UnsupportedEncoding`) — for a
+    /// consumer that does not want a transcoding step in front of, e.g., a
+    /// signature check. Default false: UTF-16, ISO-8859-1 and US-ASCII are
+    /// read, as libxml2 and expat read them.
+    utf8_only: bool = false,
     /// Unqualified attribute local names treated as ID-typed for
     /// `getElementById`. `xml:id` is ALWAYS treated as an ID regardless.
     id_attr_names: []const []const u8 = &.{ "ID", "Id", "id" },
@@ -484,6 +529,13 @@ pub const ParseError = error{
     MultipleRootElements,
     TrailingContent,
     DuplicateId,
+    /// A reference to an external or parameter entity, or to one whose
+    /// replacement text holds markup (`DoctypePolicy.internal_entities`).
+    UnsupportedEntity,
+    /// An entity whose expansion refers back to itself.
+    EntityLoop,
+    /// Entity expansion past `max_entity_depth` / `max_entity_expansion`.
+    EntityLimit,
 } || std.mem.Allocator.Error;
 
 // ── entry point ─────────────────────────────────────────────────────────────
@@ -498,15 +550,26 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, options: Options) Parse
 /// `parse`, with an optional work counter. Test-only seam: it lets a regression
 /// test pin the *complexity* of duplicate detection with a deterministic number
 /// instead of a stopwatch. `stats == null` is the production path.
-fn parseCounted(gpa: std.mem.Allocator, source: []const u8, options: Options, stats: ?*Stats) ParseError!Document {
-    if (!std.unicode.utf8ValidateSlice(source)) return error.InvalidCharacter;
-
+fn parseCounted(gpa: std.mem.Allocator, input: []const u8, options: Options, stats: ?*Stats) ParseError!Document {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
+    const enc = try detectEncoding(input);
+    if (options.utf8_only and enc != .utf8) return error.UnsupportedEncoding;
+    const source: []const u8 = switch (enc) {
+        .utf8, .ascii => input,
+        .utf16le, .utf16be => try utf16ToUtf8(a, input, enc),
+        .latin1 => try latin1ToUtf8(a, input),
+    };
+    if (enc == .ascii) {
+        for (source) |c| if (c >= 0x80) return error.InvalidCharacter;
+    }
+    if (!std.unicode.utf8ValidateSlice(source)) return error.InvalidCharacter;
+
     var p: Parser = .{
         .src = source,
+        .source_encoding = enc,
         .i = 0,
         .a = a,
         .opts = options,
@@ -533,6 +596,7 @@ fn parseCounted(gpa: std.mem.Allocator, source: []const u8, options: Options, st
     return .{
         .arena = arena,
         .source = source,
+        .source_encoding = enc,
         .root = r,
         .prolog = try prolog.toOwnedSlice(a),
         .epilog = try epilog.toOwnedSlice(a),
@@ -541,6 +605,91 @@ fn parseCounted(gpa: std.mem.Allocator, source: []const u8, options: Options, st
         .standalone = standalone,
         .ids = p.ids,
     };
+}
+
+// ── input encodings ─────────────────────────────────────────────────────────
+
+/// XML 1.0 §4.3.3 + Appendix F: a byte-order mark names UTF-16 (or UTF-8);
+/// without one, `3C 00 3F 00` / `00 3C 00 3F` is UTF-16 LE / BE; otherwise
+/// the input is ASCII-compatible and the encoding declaration (read here
+/// from the first bytes, before any decoding) picks UTF-8, ISO-8859-1 or
+/// US-ASCII. The declaration is checked against what was detected again
+/// when it is parsed properly (`Parser.parseXmlDecl`).
+fn detectEncoding(input: []const u8) ParseError!SourceEncoding {
+    if (std.mem.startsWith(u8, input, "\xFE\xFF")) return .utf16be;
+    if (std.mem.startsWith(u8, input, "\xFF\xFE")) return .utf16le;
+    if (std.mem.startsWith(u8, input, "\x3C\x00\x3F\x00")) return .utf16le;
+    if (std.mem.startsWith(u8, input, "\x00\x3C\x00\x3F")) return .utf16be;
+    const body = if (std.mem.startsWith(u8, input, "\xEF\xBB\xBF")) input[3..] else input;
+    const decl = declaredEncoding(body) orelse return .utf8;
+    if (asciiEqualIgnoreCase(decl, "iso-8859-1") or asciiEqualIgnoreCase(decl, "latin1") or
+        asciiEqualIgnoreCase(decl, "iso_8859-1"))
+    {
+        if (body.len != input.len) return error.UnsupportedEncoding; // a UTF-8 BOM says otherwise
+        return .latin1;
+    }
+    if (asciiEqualIgnoreCase(decl, "us-ascii") or asciiEqualIgnoreCase(decl, "ascii")) {
+        if (body.len != input.len) return error.UnsupportedEncoding;
+        return .ascii;
+    }
+    return .utf8;
+}
+
+/// The value of `encoding="…"` in an XML declaration at the very start of
+/// `s`, by a plain ASCII scan bounded to the declaration — or null.
+fn declaredEncoding(s: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, s, "<?xml") or s.len < 6 or !isWs(s[5])) return null;
+    const end = std.mem.indexOf(u8, s[0..@min(s.len, 512)], "?>") orelse return null;
+    const decl = s[0..end];
+    const at = std.mem.indexOf(u8, decl, "encoding") orelse return null;
+    var i = at + "encoding".len;
+    while (i < decl.len and isWs(decl[i])) i += 1;
+    if (i >= decl.len or decl[i] != '=') return null;
+    i += 1;
+    while (i < decl.len and isWs(decl[i])) i += 1;
+    if (i >= decl.len or (decl[i] != '"' and decl[i] != '\'')) return null;
+    const q = decl[i];
+    const close = std.mem.indexOfScalarPos(u8, decl, i + 1, q) orelse return null;
+    return decl[i + 1 .. close];
+}
+
+/// UTF-16 → UTF-8, the BOM (if any) dropped. Odd length or an unpaired
+/// surrogate is `InvalidCharacter`.
+fn utf16ToUtf8(a: std.mem.Allocator, input: []const u8, enc: SourceEncoding) ParseError![]const u8 {
+    var body = input;
+    if (body.len >= 2 and ((body[0] == 0xFE and body[1] == 0xFF) or (body[0] == 0xFF and body[1] == 0xFE))) body = body[2..];
+    if (body.len % 2 != 0) return error.InvalidCharacter;
+    const units = try a.alloc(u16, body.len / 2);
+    defer a.free(units);
+    // `utf16LeToUtf8Alloc` reads each unit as little-endian in memory.
+    for (units, 0..) |*u, k| u.* = std.mem.nativeToLittle(u16, if (enc == .utf16be)
+        std.mem.readInt(u16, body[2 * k ..][0..2], .big)
+    else
+        std.mem.readInt(u16, body[2 * k ..][0..2], .little));
+    return std.unicode.utf16LeToUtf8Alloc(a, units) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidCharacter,
+    };
+}
+
+fn latin1ToUtf8(a: std.mem.Allocator, input: []const u8) ParseError![]const u8 {
+    var n: usize = input.len;
+    for (input) |c| {
+        if (c >= 0x80) n += 1;
+    }
+    const out = try a.alloc(u8, n);
+    var j: usize = 0;
+    for (input) |c| {
+        if (c < 0x80) {
+            out[j] = c;
+            j += 1;
+        } else {
+            out[j] = 0xC0 | (c >> 6);
+            out[j + 1] = 0x80 | (c & 0x3F);
+            j += 2;
+        }
+    }
+    return out;
 }
 
 // ── parser ──────────────────────────────────────────────────────────────────
@@ -603,6 +752,14 @@ const Parser = struct {
     stats: ?*Stats = null,
     /// Elements seen so far — the breadth counterpart to `stack.items.len`.
     n_elements: usize = 0,
+    source_encoding: SourceEncoding = .utf8,
+    /// `.internal_entities`: name → replacement text (character references
+    /// already expanded, per XML §4.5), or null for a declared external
+    /// entity. First declaration wins (XML §4.2).
+    entities: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// Bytes produced by entity expansion so far, against
+    /// `max_entity_expansion`.
+    entity_bytes: usize = 0,
 
     fn countCompares(self: *Parser, n: usize) void {
         if (self.stats) |s| s.dup_compares += n;
@@ -699,7 +856,7 @@ const Parser = struct {
         if (self.starts("encoding")) {
             if (!had_ws) return error.MalformedPI;
             const enc = try self.parsePseudoAttr("encoding");
-            if (!asciiEqualIgnoreCase(enc, "utf-8")) return error.UnsupportedEncoding;
+            if (!declMatches(enc, self.source_encoding)) return error.UnsupportedEncoding;
             encoding.* = enc;
             const before = self.i;
             self.skipWs();
@@ -717,6 +874,20 @@ const Parser = struct {
         }
         if (!self.starts("?>")) return error.MalformedPI;
         self.i += 2;
+    }
+
+    /// Does the declared `encoding` name the encoding the bytes were
+    /// detected in? (A UTF-16 document declaring "UTF-8", or an
+    /// ASCII-compatible one declaring "UTF-16", is refused.)
+    fn declMatches(enc: []const u8, detected: SourceEncoding) bool {
+        return switch (detected) {
+            .utf8 => asciiEqualIgnoreCase(enc, "utf-8"),
+            .utf16le, .utf16be => asciiEqualIgnoreCase(enc, "utf-16") or
+                asciiEqualIgnoreCase(enc, if (detected == .utf16le) "utf-16le" else "utf-16be"),
+            .latin1 => asciiEqualIgnoreCase(enc, "iso-8859-1") or asciiEqualIgnoreCase(enc, "latin1") or
+                asciiEqualIgnoreCase(enc, "iso_8859-1"),
+            .ascii => asciiEqualIgnoreCase(enc, "us-ascii") or asciiEqualIgnoreCase(enc, "ascii"),
+        };
     }
 
     fn parsePseudoAttr(self: *Parser, key: []const u8) ParseError![]const u8 {
@@ -826,6 +997,9 @@ const Parser = struct {
                 while (!self.eof() and !self.starts("-->")) self.i += 1;
                 if (self.eof()) return error.UnexpectedEof;
                 self.i += "-->".len;
+            } else if (c == '[' and self.opts.doctype == .internal_entities) {
+                self.i += 1;
+                try self.parseInternalSubset();
             } else if (c == '[') {
                 self.i += 1;
                 // A `]` inside a quoted literal (EntityValue/AttValue/
@@ -867,6 +1041,172 @@ const Parser = struct {
             }
         }
         return error.UnexpectedEof;
+    }
+
+    /// `.internal_entities`: the internal subset, up to and including its
+    /// `]`. General entity declarations are recorded; ELEMENT / ATTLIST /
+    /// NOTATION declarations, comments and PIs are skipped (quote-aware);
+    /// a parameter-entity reference is `UnsupportedEntity` (its text could
+    /// declare anything, and it may be external).
+    fn parseInternalSubset(self: *Parser) ParseError!void {
+        while (true) {
+            self.skipWs();
+            if (self.eof()) return error.UnexpectedEof;
+            const c = self.src[self.i];
+            if (c == ']') {
+                self.i += 1;
+                return;
+            }
+            if (c == '%') return error.UnsupportedEntity;
+            if (self.starts("<!--")) {
+                _ = try self.parseComment();
+            } else if (self.starts("<?")) {
+                _ = try self.parsePi();
+            } else if (self.starts("<!ENTITY")) {
+                try self.parseEntityDecl();
+            } else if (self.starts("<!ELEMENT") or self.starts("<!ATTLIST") or self.starts("<!NOTATION")) {
+                self.i += 2;
+                var quote: ?u8 = null;
+                while (true) {
+                    if (self.eof()) return error.UnexpectedEof;
+                    const cc = self.src[self.i];
+                    self.i += 1;
+                    if (quote) |q| {
+                        if (cc == q) quote = null;
+                    } else if (cc == '"' or cc == '\'') {
+                        quote = cc;
+                    } else if (cc == '>') break;
+                }
+            } else return error.UnexpectedChar;
+        }
+    }
+
+    /// `<!ENTITY S Name S EntityValue S? '>'` (internal general entity),
+    /// `<!ENTITY S Name S ExternalID NDataDecl? S? '>'` (external: recorded
+    /// as such, never read), `<!ENTITY S '%' S Name S PEDef S? '>'`
+    /// (parameter: skipped).
+    fn parseEntityDecl(self: *Parser) ParseError!void {
+        self.i += "<!ENTITY".len;
+        try self.requireWs();
+        var parameter = false;
+        if (self.peek() == '%') {
+            parameter = true;
+            self.i += 1;
+            try self.requireWs();
+        }
+        const name = try self.parseNameRaw();
+        if (std.mem.indexOfScalar(u8, name, ':') != null) return error.NamespaceError;
+        try self.requireWs();
+        const q = self.peek() orelse return error.UnexpectedEof;
+        var value: ?[]const u8 = null;
+        if (q == '"' or q == '\'') {
+            self.i += 1;
+            const start = self.i;
+            const close = std.mem.indexOfScalarPos(u8, self.src, start, q) orelse return error.UnexpectedEof;
+            const raw = self.src[start..close];
+            self.i = close + 1;
+            if (!parameter) value = try self.entityValue(raw);
+        } else {
+            // ExternalID ('SYSTEM' literal | 'PUBLIC' literal literal), maybe
+            // NDATA name: skipped to '>' with quote awareness. Not fetched.
+            var quote: ?u8 = null;
+            while (true) {
+                if (self.eof()) return error.UnexpectedEof;
+                const cc = self.src[self.i];
+                if (quote) |qq| {
+                    if (cc == qq) quote = null;
+                } else if (cc == '"' or cc == '\'') {
+                    quote = cc;
+                } else if (cc == '>') break;
+                self.i += 1;
+            }
+        }
+        self.skipWs();
+        if (self.peek() != '>') return error.UnexpectedChar;
+        self.i += 1;
+        if (parameter) return;
+        // XML §4.6: the predefined five may be (re)declared; the built-in
+        // meaning stays. XML §4.2: the first declaration of a name binds.
+        if (predefinedEntity(name) != null) return;
+        const gop = try self.entities.getOrPut(self.a, name);
+        if (!gop.found_existing) gop.value_ptr.* = value;
+    }
+
+    /// An EntityValue's replacement text (XML §4.5): character references
+    /// expanded now, general entity references kept for expansion at use,
+    /// a parameter-entity reference refused (not allowed inside a markup
+    /// declaration of the internal subset).
+    fn entityValue(self: *Parser, raw: []const u8) ParseError![]const u8 {
+        try self.validateChars(raw);
+        const lit = try normalizeLineEndings(self.a, raw);
+        var out: std.ArrayList(u8) = .empty;
+        var k: usize = 0;
+        while (k < lit.len) {
+            const c = lit[k];
+            if (c == '%') return error.UnsupportedEntity;
+            if (c == '&') {
+                const semi = std.mem.indexOfScalarPos(u8, lit, k + 1, ';') orelse return error.UndefinedEntity;
+                const ref = lit[k + 1 .. semi];
+                if (ref.len == 0) return error.UndefinedEntity;
+                if (ref[0] == '#') {
+                    try appendCodepoint(self.a, &out, try charRefValue(ref));
+                } else {
+                    // A general entity reference must at least be a Name.
+                    _ = try nameLen(ref);
+                    try out.appendSlice(self.a, lit[k .. semi + 1]);
+                }
+                k = semi + 1;
+            } else {
+                try out.append(self.a, c);
+                k += 1;
+            }
+        }
+        return out.toOwnedSlice(self.a);
+    }
+
+    /// Expand entity `name`'s replacement text into `out`, recursively.
+    /// `in_attr`: XML §3.3.3 — white space in replacement text becomes a
+    /// space, and `<` is not allowed. In content, `<` would be markup, which
+    /// this text-only expander refuses.
+    fn expandEntity(self: *Parser, name: []const u8, out: *std.ArrayList(u8), in_attr: bool, depth: u8, chain: *[16][]const u8) ParseError!void {
+        const entry = self.entities.get(name) orelse return error.UndefinedEntity;
+        // Every reference costs at least one unit of the budget, even one
+        // whose replacement text is empty: otherwise ten levels of ten
+        // references to "" are 10^10 expansions that charge nothing.
+        try self.chargeEntity(1);
+        const text = entry orelse return error.UnsupportedEntity; // external
+        if (depth >= self.opts.max_entity_depth or depth >= chain.len) return error.EntityLimit;
+        for (chain[0..depth]) |n| if (std.mem.eql(u8, n, name)) return error.EntityLoop;
+        chain[depth] = name;
+        var k: usize = 0;
+        while (k < text.len) {
+            const c = text[k];
+            if (c == '<') return if (in_attr) error.UnexpectedChar else error.UnsupportedEntity;
+            if (c == '&') {
+                const semi = std.mem.indexOfScalarPos(u8, text, k + 1, ';') orelse return error.UndefinedEntity;
+                const ref = text[k + 1 .. semi];
+                if (ref.len == 0) return error.UndefinedEntity;
+                if (ref[0] == '#') {
+                    try self.chargeEntity(4);
+                    try appendCodepoint(self.a, out, try charRefValue(ref));
+                } else if (predefinedEntity(ref)) |ch| {
+                    try self.chargeEntity(1);
+                    try out.append(self.a, ch);
+                } else {
+                    try self.expandEntity(ref, out, in_attr, depth + 1, chain);
+                }
+                k = semi + 1;
+                continue;
+            }
+            try self.chargeEntity(1);
+            try out.append(self.a, if (in_attr and (c == '\t' or c == '\n' or c == '\r')) ' ' else c);
+            k += 1;
+        }
+    }
+
+    fn chargeEntity(self: *Parser, n: usize) ParseError!void {
+        self.entity_bytes += n;
+        if (self.entity_bytes > self.opts.max_entity_expansion) return error.EntityLimit;
     }
 
     // ── comment / PI / CDATA ────────────────────────────────────────────────
@@ -990,10 +1330,20 @@ const Parser = struct {
     /// error.UndefinedEntity (this is what makes user-defined entities, and
     /// therefore billion-laughs and external-entity XXE, impossible).
     fn decodeReference(self: *Parser, out: *std.ArrayList(u8)) ParseError!void {
+        return self.decodeReferenceIn(out, false);
+    }
+
+    fn decodeReferenceIn(self: *Parser, out: *std.ArrayList(u8), in_attr: bool) ParseError!void {
         std.debug.assert(self.src[self.i] == '&');
         const semi = std.mem.indexOfScalarPos(u8, self.src, self.i + 1, ';') orelse return error.UndefinedEntity;
         const name = self.src[self.i + 1 .. semi];
         if (name.len == 0) return error.UndefinedEntity;
+        if (name[0] != '#' and predefinedEntity(name) == null and self.opts.doctype == .internal_entities) {
+            var chain: [16][]const u8 = undefined;
+            try self.expandEntity(name, out, in_attr, 0, &chain);
+            self.i = semi + 1;
+            return;
+        }
         if (name[0] == '#') {
             var cp: u32 = 0;
             // CharRef ::= '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';' -- the 'x'
@@ -1343,7 +1693,7 @@ const Parser = struct {
             const c = self.src[self.i];
             if (c == '<') return error.UnexpectedChar; // '<' illegal in attr value
             if (c == '&') {
-                try self.decodeReference(&out);
+                try self.decodeReferenceIn(&out, true);
             } else if (c == '\t' or c == '\n') {
                 // Attribute-value normalization: literal whitespace → space.
                 try out.append(self.a, ' ');
@@ -1441,7 +1791,7 @@ fn isWs(c: u8) bool {
 /// Takes a decoded codepoint, not a raw byte -- see `parseNameRaw`, which
 /// used to accept ANY byte >= 0x80 here without decoding at all (audit
 /// A1/xml.md F4, F9 sub-finding M16).
-fn isNameStartChar(cp: u32) bool {
+pub fn isNameStartChar(cp: u32) bool {
     return switch (cp) {
         ':', 'A'...'Z', '_', 'a'...'z' => true,
         0xC0...0xD6, 0xD8...0xF6, 0xF8...0x2FF, 0x370...0x37D, 0x37F...0x1FFF, 0x200C...0x200D, 0x2070...0x218F, 0x2C00...0x2FEF, 0x3001...0xD7FF, 0xF900...0xFDCF, 0xFDF0...0xFFFD, 0x10000...0xEFFFF => true,
@@ -1451,12 +1801,61 @@ fn isNameStartChar(cp: u32) bool {
 
 /// NameChar ::= NameStartChar | "-" | "." | [0-9] | #xB7 | [#x0300-#x036F] |
 /// [#x203F-#x2040]
-fn isNameChar(cp: u32) bool {
+pub fn isNameChar(cp: u32) bool {
     if (isNameStartChar(cp)) return true;
     return switch (cp) {
         '-', '.', '0'...'9', 0xB7, 0x300...0x36F, 0x203F, 0x2040 => true,
         else => false,
     };
+}
+
+fn predefinedEntity(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "lt")) return '<';
+    if (std.mem.eql(u8, name, "gt")) return '>';
+    if (std.mem.eql(u8, name, "amp")) return '&';
+    if (std.mem.eql(u8, name, "apos")) return '\'';
+    if (std.mem.eql(u8, name, "quot")) return '"';
+    return null;
+}
+
+/// The code point of a character reference body (`#65`, `#x41`).
+fn charRefValue(ref: []const u8) ParseError!u21 {
+    var cp: u32 = 0;
+    if (ref.len >= 2 and ref[1] == 'x') {
+        if (ref.len == 2) return error.InvalidCharRef;
+        for (ref[2..]) |d| {
+            const v = hexVal(d) orelse return error.InvalidCharRef;
+            cp = std.math.mul(u32, cp, 16) catch return error.InvalidCharRef;
+            cp = std.math.add(u32, cp, v) catch return error.InvalidCharRef;
+            if (cp > 0x10FFFF) return error.InvalidCharRef;
+        }
+    } else {
+        if (ref.len == 1) return error.InvalidCharRef;
+        for (ref[1..]) |d| {
+            if (d < '0' or d > '9') return error.InvalidCharRef;
+            cp = std.math.mul(u32, cp, 10) catch return error.InvalidCharRef;
+            cp = std.math.add(u32, cp, @as(u32, d - '0')) catch return error.InvalidCharRef;
+            if (cp > 0x10FFFF) return error.InvalidCharRef;
+        }
+    }
+    if (!isXmlChar(cp)) return error.InvalidCharRef;
+    return @intCast(cp);
+}
+
+fn appendCodepoint(a: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) ParseError!void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidCharRef;
+    try out.appendSlice(a, buf[0..n]);
+}
+
+/// Length of the XML Name at the start of `s` if `s` is exactly one Name.
+fn nameLen(s: []const u8) ParseError!usize {
+    var view = std.unicode.Utf8View.init(s) catch return error.InvalidName;
+    var it = view.iterator();
+    const first = it.nextCodepoint() orelse return error.InvalidName;
+    if (!isNameStartChar(first)) return error.InvalidName;
+    while (it.nextCodepoint()) |cp| if (!isNameChar(cp)) return error.InvalidName;
+    return s.len;
 }
 
 fn hexVal(c: u8) ?u32 {
@@ -1468,7 +1867,8 @@ fn hexVal(c: u8) ?u32 {
     };
 }
 
-fn isXmlChar(cp: u32) bool {
+/// XML 1.0 `Char`: the code points a document may contain.
+pub fn isXmlChar(cp: u32) bool {
     return cp == 0x9 or cp == 0xA or cp == 0xD or
         (cp >= 0x20 and cp <= 0xD7FF) or
         (cp >= 0xE000 and cp <= 0xFFFD) or
@@ -1483,9 +1883,24 @@ fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+// ── writer ──────────────────────────────────────────────────────────────────
+
+/// XML output: a push `Writer` and tree serialization (`writer.zig`).
+pub const writer = @import("writer.zig");
+pub const Writer = writer.Writer;
+pub const WriteError = writer.Error;
+pub const writeDocument = writer.writeDocument;
+pub const writeElement = writer.writeElement;
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = writer;
+    _ = @import("core_test.zig");
+    _ = @import("fuzz_test.zig");
+}
 
 test "smoke: minimal document" {
     var doc = try parse(testing.allocator, "<root/>", .{});
@@ -2563,8 +2978,8 @@ test "security: invalid UTF-8 rejected" {
     try testing.expectError(error.InvalidCharacter, parse(testing.allocator, "<a>\xFF\xFE</a>", .{}));
 }
 
-test "unsupported: non-UTF-8 encoding declaration rejected" {
-    try testing.expectError(error.UnsupportedEncoding, parse(testing.allocator, "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>", .{}));
+test "unsupported: an encoding outside UTF-8/16, ISO-8859-1, US-ASCII is rejected" {
+    try testing.expectError(error.UnsupportedEncoding, parse(testing.allocator, "<?xml version=\"1.0\" encoding=\"Shift_JIS\"?><a/>", .{}));
 }
 
 test "unsupported: XML 1.1 version rejected" {
@@ -2616,7 +3031,7 @@ const parse_seeds = [_][]const u8{
     seed("<r>\xc3\xa1\xc4\x8d\xc5\xbe</r>"), // multi-byte UTF-8 in content
     seed("<r><a ID=\"x\"/><b ID=\"x\"/></r>"), // duplicate ID → the signature-wrapping refusal
     seed("<a>\xff\xfe</a>"), // invalid UTF-8 → InvalidCharacter
-    seed("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>"), // → UnsupportedEncoding
+    seed("<?xml version=\"1.0\" encoding=\"Shift_JIS\"?><a/>"), // → UnsupportedEncoding
     seed("<?xml version=\"1.1\"?><a/>"), // → UnsupportedVersion
     seed("<a><b></a>"), // mismatched end tag
     seed("<a"), // truncated inside the start tag

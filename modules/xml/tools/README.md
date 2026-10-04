@@ -55,3 +55,11 @@ to `xmllint --c14n`.
 ⚠ **Use `--c14n`, not `--c14n-with-comments`.** This libxml2 (21502) has no such
 flag and prints NOTHING for it, exit 0 — a comparison that looks clean because
 the oracle returned an empty string. `--c14n` already includes comments here.
+
+## 2026-10-04: core vectors and the writer oracle
+
+- `gen_core_vectors.py` — recipe for `../src/core_vectors.zig`: libxml2's (lxml's) reading of
+  encoding and internal-entity cases, as the dump format the recipe defines.
+- `writer_oracle.zig` + `writer_oracle.py` — differential oracle for the writer: libxml2 reads
+  each original and the document `writeDocument` produced from it; their C14N must be equal.
+  Measured 2026-10-04: same=119 differ=0 (28 inputs refused by one side, skipped).
