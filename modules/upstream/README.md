@@ -23,8 +23,8 @@ techniques.
   injected `HealthChecker`/`probe.Connector` seam. **Role:** client.
   **Concurrency:** threadsafe — `pick`/`report`/`call`/`healthTick`/stats
   are internally synchronized (pool spinlock + atomics; breaker/bulkhead
-  synchronize themselves); registration (`add`) and `deinit` are
-  single-owner setup/teardown.
+  synchronize themselves); membership (`add`/`remove`/`drain`/`reap`) may
+  change while the pool serves; only `deinit` is single-owner teardown.
 - **Deps:** `resilience` (breaker + bulkhead), `probe` (`Target` address
   model + `Connector` health seam).
 
@@ -38,7 +38,10 @@ techniques.
 | `report(u, ok, rtt)` | passive health: feeds the breaker, frees the slot, folds latency/EWMA | — |
 | `healthTick(now)` | active health: mark up/down + breaker recovery probe, at most once per interval | an injected `HealthChecker`, caller-supplied `now` |
 | `call(op, .{.max_tries})` | route + failover: pick → run → report → next healthy on failure | an op with `call(self, u: *Upstream) E!T` |
-| `upstreamStats(u)` / `stats()` | health, breaker state, in-flight, picks, failures, latency min/avg/max | — |
+| `pickByKey(key)` | `.ring_hash`: the key's ring owner, or the next admissible member on the ring | same admission as `pick()` |
+| `drain(u)` / `undrain(u)` | stop / resume routing new calls to `u`; calls in flight finish | — |
+| `remove(id)` / `reap()` | take a member out while serving (its keys alone move on the ring); free removed members once nothing is in flight on them | `reap` from the owner that stopped handing out their pointers |
+| `upstreamStats(u)` / `stats()` | health, draining, breaker state, in-flight, picks, failures, latency min/avg/max; retired count | — |
 
 ## Strategies
 
@@ -51,6 +54,15 @@ techniques.
 - `least_connections` — fewest in-flight calls.
 - `ewma_latency` — lowest EWMA of reported RTTs (`ewma_alpha`);
   never-measured upstreams score 0 and get tried first (warm-up).
+- `least_request` — power of two choices (Envoy's default least-request):
+  two distinct random healthy members, the one with fewer in flight wins.
+- `ring_hash` — consistent hashing (Envoy `RING_HASH`, nginx `hash …
+  consistent`): `weight × ring_points_per_weight` (160) points per member,
+  `XxHash64(id ++ "-" ++ j)`; `pickByKey(key)` takes the first point at or
+  after `XxHash64(key)` and walks on past members that cannot take the call.
+  Removing a member moves only its keys; adding one takes keys only for
+  itself. `pick()` without a key hashes a PRNG draw. The ring is capped at
+  `max_ring_points` (+1 per member).
 
 ## Usage
 
@@ -118,6 +130,14 @@ pool.healthTick(now_ns);
 - **Bounded, no panics.** The fleet is capped (`max_upstreams`); a bad
   `host:port` is a typed error; empty/exhausted pools return null/typed
   errors.
+
+- **Membership while serving.** `remove(id)` drains the member, takes it
+  out of the list and the ring, and keeps its memory for the calls still
+  in flight — their `report`s land normally. `reap()` frees removed members
+  with nothing in flight and no health check running on them; after that
+  their pointers dangle. `healthTick` checks a pinned snapshot, so a member
+  removed and reaped during a tick is freed only after it. `add`/`remove`
+  allocate under the pool spinlock.
 
 ## Verification
 

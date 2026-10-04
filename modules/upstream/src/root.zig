@@ -39,9 +39,9 @@
 //!
 //! ## Thread-safety
 //!
-//! Registration (`add`) and `deinit` are setup/teardown — single-owner,
-//! complete them before concurrent use. After that, `pick`/`report`/`call`/
-//! `healthTick`/stats may race from any thread: strategy state (cursor,
+//! Only `deinit` is single-owner teardown. `add`/`remove`/`drain`/`reap`
+//! may run while the pool serves, and `pick`/`report`/`call`/
+//! `healthTick`/stats may race from any thread: membership and strategy state (cursor,
 //! PRNG, smooth-WRR credits, latency) lives under a pool spinlock (the
 //! documented `std.atomic.Mutex` pattern of the resilience sibling);
 //! counters are atomics; breaker/bulkhead synchronize themselves. The
@@ -87,7 +87,7 @@ const Allocator = std.mem.Allocator;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Load-balanced upstream pool + failover — round-robin/weighted/least-conn/EWMA, per-upstream breaker+bulkhead, active+passive health checks",
+    .doc = "Load-balanced upstream pool + failover — round-robin/weighted/least-conn/P2C/EWMA/consistent-hash ring, add/remove/drain while serving, per-upstream breaker+bulkhead, active+passive health checks",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -95,8 +95,8 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any, // pure logic; health I/O goes through the injected seam
     .role = .client,
-    // pick/report/call/healthTick internally synchronized (pool spinlock +
-    // atomics); add/deinit are single-owner setup/teardown.
+    // pick/report/call/healthTick and add/remove/drain/reap internally
+    // synchronized (pool spinlock + atomics); deinit is single-owner teardown.
     .concurrency = .threadsafe,
     .model_after = "Envoy/HAProxy upstream cluster + resilience4j Bulkhead",
     .deps = .{ "resilience", "probe" },
@@ -123,6 +123,21 @@ pub const Strategy = enum {
     /// smoothing over reported RTTs; never-measured upstreams score 0 and
     /// are tried first — deliberate warm-up).
     ewma_latency,
+    /// Power of two choices (Envoy's `LEAST_REQUEST` default): two distinct
+    /// healthy upstreams drawn at random from the seeded PRNG, the one with
+    /// fewer in-flight calls wins (ties → the first drawn). Near
+    /// least-connections quality without scanning the fleet, and no herd on
+    /// the single least-loaded member. Weights are not consulted.
+    least_request,
+    /// Consistent hashing on a ring (Envoy `RING_HASH`, nginx `hash …
+    /// consistent`): `pickByKey(key)` maps a key to the first ring point at or
+    /// after `XxHash64(key)`; each upstream owns `weight ×
+    /// ring_points_per_weight` points hashed from its `id`, so adding or
+    /// removing one member moves only the keys it gains or loses. A key whose
+    /// owner is not admissible walks on to the next distinct upstream on the
+    /// ring. `pick()` without a key hashes a PRNG draw (Envoy's behaviour
+    /// for a request without a hash key).
+    ring_hash,
 };
 
 /// One member of the fleet. Created by `Pool.add`; stable address for the
@@ -140,6 +155,17 @@ pub const Upstream = struct {
     bulkhead: ?resilience.Bulkhead,
     /// Active health verdict (`healthTick`): true = skip in `pick`.
     down: std.atomic.Value(bool) = .init(false),
+    /// Administratively drained (`Pool.drain`, or removed): `pick` skips it,
+    /// calls already admitted finish and `report` normally.
+    draining: std.atomic.Value(bool) = .init(false),
+    /// `Pool.remove`d: no longer in the member list; freed by `Pool.reap`
+    /// (or `deinit`) once nothing is in flight on it. Guarded by the pool lock.
+    retired: bool = false,
+    /// `healthTick` holds of a member while its check runs outside the lock;
+    /// `reap` never frees a pinned upstream.
+    pins: std.atomic.Value(u32) = .init(0),
+    /// Scratch mark for one ring walk ("already refused"). Pool lock.
+    ring_refused: bool = false,
 
     /// Calls admitted by `pick` and not yet `report`ed.
     in_flight: std.atomic.Value(u32) = .init(0),
@@ -237,6 +263,12 @@ pub const Options = struct {
     clock: resilience.Clock = .monotonic,
     /// Hard bound on the fleet size (`add` rejects beyond it).
     max_upstreams: usize = 1024,
+    /// `.ring_hash`: ring points per unit of weight (nginx and ketama use
+    /// 160). Scaled down, never below one point per upstream, when the ring
+    /// would exceed `max_ring_points`.
+    ring_points_per_weight: u32 = 160,
+    /// `.ring_hash`: hard bound on the ring's size (16 bytes a point).
+    max_ring_points: usize = 1 << 20,
 };
 
 // ── the pool ────────────────────────────────────────────────────────────────
@@ -284,6 +316,14 @@ pub const Pool = struct {
     lock: std.atomic.Mutex = .unlocked,
     rr_cursor: usize = 0,
     last_health_ns: ?u64 = null,
+    /// `remove`d members still referenced (in flight or pinned); `reap`
+    /// frees the idle ones.
+    retired: std.ArrayList(*Upstream) = .empty,
+    /// `.ring_hash`: the ring, sorted by hash; `idx` indexes `upstreams`.
+    /// Rebuilt under the lock on every membership change.
+    ring: []RingPoint = &.{},
+    /// A `healthTick` is running its checks (outside the lock).
+    health_busy: bool = false,
 
     pub fn init(gpa: Allocator, options: Options) Pool {
         std.debug.assert(options.ewma_alpha > 0 and options.ewma_alpha <= 1);
@@ -294,23 +334,30 @@ pub const Pool = struct {
         };
     }
 
+    /// Frees every member and every retired one — nothing may be in flight.
     pub fn deinit(pool: *Pool) void {
         for (pool.upstreams.items) |u| pool.gpa.destroy(u);
         pool.upstreams.deinit(pool.gpa);
+        for (pool.retired.items) |u| pool.gpa.destroy(u);
+        pool.retired.deinit(pool.gpa);
         pool.gpa.free(pool.scratch);
+        pool.gpa.free(pool.ring);
         pool.* = undefined;
     }
 
-    /// Register one upstream. Setup-phase only (single-owner — complete all
-    /// `add`s before concurrent `pick`/`call` use). The returned pointer is
-    /// stable for the pool's lifetime. Typed errors, never a panic:
-    /// `TooManyUpstreams` past `max_upstreams`, `DuplicateId`,
+    /// Register one upstream — at setup or while the pool is serving (it
+    /// takes the pool lock, and allocates under it). The returned pointer is
+    /// stable until the member is `remove`d and then `reap`ed. Typed errors,
+    /// never a panic: `TooManyUpstreams` past `max_upstreams`, `DuplicateId`
+    /// (among current members — a removed id may be added again),
     /// `InvalidHostPort` for a malformed address.
     pub fn add(pool: *Pool, spec: UpstreamSpec) AddError!*Upstream {
+        const target = try probe.Target.parse(spec.address);
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
         if (pool.upstreams.items.len >= pool.options.max_upstreams)
             return error.TooManyUpstreams;
-        if (pool.getById(spec.id) != null) return error.DuplicateId;
-        const target = try probe.Target.parse(spec.address);
+        if (pool.getByIdLocked(spec.id) != null) return error.DuplicateId;
 
         const u = try pool.gpa.create(Upstream);
         errdefer pool.gpa.destroy(u);
@@ -326,19 +373,190 @@ pub const Pool = struct {
         };
         try pool.upstreams.append(pool.gpa, u);
         errdefer _ = pool.upstreams.pop();
-        pool.scratch = try pool.gpa.realloc(pool.scratch, pool.upstreams.items.len);
+        if (pool.scratch.len < pool.upstreams.items.len)
+            pool.scratch = try pool.gpa.realloc(pool.scratch, pool.upstreams.items.len);
+        try pool.rebuildRingLocked();
         return u;
     }
 
+    /// Stop routing new calls to `u`; calls already admitted finish and
+    /// report normally. Undo with `undrain`. Independent of active health:
+    /// a drained upstream stays drained through passing checks.
+    pub fn drain(pool: *Pool, u: *Upstream) void {
+        _ = pool;
+        u.draining.store(true, .seq_cst);
+    }
+
+    /// Route to a drained upstream again (not to a removed one).
+    pub fn undrain(pool: *Pool, u: *Upstream) void {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        if (!u.retired) u.draining.store(false, .seq_cst);
+    }
+
+    /// Take the member `id` out of the pool while it is serving: it is
+    /// drained at once, leaves the member list (and the ring — only its keys
+    /// move), and its memory stays valid for calls still in flight and for
+    /// `report`s on it, until `reap` (or `deinit`) frees it. False = no such
+    /// member. The id can be `add`ed again at once.
+    pub fn remove(pool: *Pool, id: []const u8) error{OutOfMemory}!bool {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        const items = pool.upstreams.items;
+        const i = for (items, 0..) |u, k| {
+            if (std.mem.eql(u8, u.id, id)) break k;
+        } else return false;
+        try pool.retired.ensureUnusedCapacity(pool.gpa, 1);
+        const u = items[i];
+        u.draining.store(true, .seq_cst);
+        u.retired = true;
+        _ = pool.upstreams.orderedRemove(i);
+        pool.retired.appendAssumeCapacity(u);
+        // Keep the rotation where it was: the member after the removed one
+        // is next.
+        if (pool.rr_cursor > i) pool.rr_cursor -= 1;
+        if (pool.rr_cursor >= pool.upstreams.items.len) pool.rr_cursor = 0;
+        // A smaller ring never needs more memory; on the impossible failure
+        // the old ring is dropped and `.ring_hash` picks see an empty ring.
+        pool.rebuildRingLocked() catch {
+            pool.gpa.free(pool.ring);
+            pool.ring = &.{};
+        };
+        return true;
+    }
+
+    /// Free every removed upstream that nothing references any more (no
+    /// call in flight, no health check running on it); the number freed.
+    /// After this, pointers to the freed members are dangling — call it from
+    /// the owner that stopped handing them out.
+    pub fn reap(pool: *Pool) usize {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        var freed: usize = 0;
+        var i: usize = 0;
+        while (i < pool.retired.items.len) {
+            const u = pool.retired.items[i];
+            if (u.in_flight.load(.seq_cst) == 0 and u.pins.load(.seq_cst) == 0) {
+                _ = pool.retired.swapRemove(i);
+                pool.gpa.destroy(u);
+                freed += 1;
+            } else i += 1;
+        }
+        return freed;
+    }
+
+    /// Removed members not yet freed by `reap`.
+    pub fn retiredCount(pool: *Pool) usize {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        return pool.retired.items.len;
+    }
+
+    /// The current member `id`, or null. The pointer is valid until the
+    /// member is removed and reaped.
     pub fn getById(pool: *Pool, id: []const u8) ?*Upstream {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        return pool.getByIdLocked(id);
+    }
+
+    fn getByIdLocked(pool: *Pool, id: []const u8) ?*Upstream {
         for (pool.upstreams.items) |u| {
             if (std.mem.eql(u8, u.id, id)) return u;
         }
         return null;
     }
 
+    /// Current members (removed ones not counted).
     pub fn count(pool: *const Pool) usize {
+        // The lock is interior state; `count` stays callable on a const pool.
+        const lock = @constCast(&pool.lock);
+        lockSpin(lock);
+        defer lock.unlock();
         return pool.upstreams.items.len;
+    }
+
+    // ── consistent-hash ring ────────────────────────────────────────────
+
+    fn rebuildRingLocked(pool: *Pool) error{OutOfMemory}!void {
+        if (pool.options.strategy != .ring_hash) return;
+        const items = pool.upstreams.items;
+        var total_weight: u64 = 0;
+        for (items) |u| total_weight += u.weight;
+        var points: usize = 0;
+        for (items) |u| points += pool.ringPoints(u.weight, total_weight);
+        const ring = try pool.gpa.alloc(RingPoint, points);
+        var n: usize = 0;
+        for (items, 0..) |u, idx| {
+            const k = pool.ringPoints(u.weight, total_weight);
+            for (0..k) |j| {
+                ring[n] = .{ .hash = pointHash(u.id, j), .idx = @intCast(idx) };
+                n += 1;
+            }
+        }
+        std.mem.sortUnstable(RingPoint, ring, {}, RingPoint.lessThan);
+        pool.gpa.free(pool.ring);
+        pool.ring = ring;
+    }
+
+    /// Points of a member of `weight` in a fleet of `total_weight`:
+    /// `weight × ring_points_per_weight`, or — when that would put more
+    /// than `max_ring_points` on the ring — its proportional share of
+    /// `max_ring_points`; never fewer than one. The ring is therefore at
+    /// most `max_ring_points + members` long.
+    fn ringPoints(pool: *const Pool, weight: u32, total_weight: u64) usize {
+        const ppw: u128 = pool.options.ring_points_per_weight;
+        const max: u128 = pool.options.max_ring_points;
+        const k: u128 = if (@as(u128, total_weight) * ppw <= max)
+            @as(u128, weight) * ppw
+        else
+            @as(u128, weight) * max / total_weight;
+        return @intCast(@max(1, k));
+    }
+
+    /// The upstream for `key` under `.ring_hash` (see `Strategy.ring_hash`);
+    /// for any other strategy this is `pick()`. Same admission contract as
+    /// `pick`: a non-null result must be `report`ed exactly once.
+    pub fn pickByKey(pool: *Pool, key: []const u8) ?*Upstream {
+        if (pool.options.strategy != .ring_hash) return pool.pick();
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        return pool.pickRingLocked(std.hash.XxHash64.hash(0, key));
+    }
+
+    /// The member that owns `key` on the ring, admissible or not — for
+    /// tests and for routing decisions made elsewhere. Null when the ring is
+    /// empty or the strategy is not `.ring_hash`.
+    pub fn ringOwner(pool: *Pool, key: []const u8) ?*Upstream {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        if (pool.ring.len == 0) return null;
+        const at = ringIndex(pool.ring, std.hash.XxHash64.hash(0, key));
+        return pool.upstreams.items[pool.ring[at].idx];
+    }
+
+    fn pickRingLocked(pool: *Pool, h: u64) ?*Upstream {
+        const ring = pool.ring;
+        if (ring.len == 0) return null;
+        const items = pool.upstreams.items;
+        // Walk the ring from the key's point; each distinct upstream is
+        // tried once (`ring_refused` marks the refused ones, `scratch` lists
+        // them for the reset), so the walk is at most one lap: O(points).
+        var refused: usize = 0;
+        defer for (pool.scratch[0..refused]) |u| {
+            u.ring_refused = false;
+        };
+        const start = ringIndex(ring, h);
+        var off: usize = 0;
+        while (off < ring.len and refused < items.len) : (off += 1) {
+            const u = items[ring[(start + off) % ring.len].idx];
+            if (u.ring_refused) continue;
+            if (admit(u)) return u;
+            u.ring_refused = true;
+            pool.scratch[refused] = u;
+            refused += 1;
+        }
+        return null;
     }
 
     // ── pick ────────────────────────────────────────────────────────────
@@ -386,6 +604,9 @@ pub const Pool = struct {
         const n = items.len;
         if (n == 0) return null;
 
+        if (pool.options.strategy == .ring_hash)
+            return pool.pickRingLocked(pool.prng.random().int(u64));
+
         if (pool.options.strategy == .round_robin) {
             // Strict rotation: walk from the cursor, first admissible wins.
             for (0..n) |off| {
@@ -403,7 +624,7 @@ pub const Pool = struct {
         // and re-select among the rest.
         var len: usize = 0;
         for (items) |u| {
-            if (u.down.load(.seq_cst)) continue;
+            if (u.down.load(.seq_cst) or u.draining.load(.seq_cst)) continue;
             pool.scratch[len] = u;
             len += 1;
         }
@@ -420,7 +641,7 @@ pub const Pool = struct {
     /// Strategy selection among `set` (non-empty, pool lock held).
     fn selectIndex(pool: *Pool, set: []*Upstream) usize {
         switch (pool.options.strategy) {
-            .round_robin => unreachable, // handled inline in pickLocked
+            .round_robin, .ring_hash => unreachable, // handled inline in pickLocked
             .random => return pool.prng.random().uintLessThan(usize, set.len),
             .weighted_round_robin => {
                 // Smooth WRR (nginx): everyone earns its weight, the
@@ -450,6 +671,15 @@ pub const Pool = struct {
                 }
                 return best;
             },
+            .least_request => {
+                if (set.len == 1) return 0;
+                const r = pool.prng.random();
+                const a = r.uintLessThan(usize, set.len);
+                // A second, distinct draw: one of the other len-1 members.
+                var b = r.uintLessThan(usize, set.len - 1);
+                if (b >= a) b += 1;
+                return if (set[b].in_flight.load(.seq_cst) < set[a].in_flight.load(.seq_cst)) b else a;
+            },
         }
     }
 
@@ -465,14 +695,6 @@ pub const Pool = struct {
             _ = u.failures.fetchAdd(1, .monotonic);
         }
         if (u.bulkhead) |*bh| bh.release();
-        // In-flight decrement: a report without a matching pick is a caller
-        // bug — assert in Debug, saturate at 0 in release builds.
-        var cur = u.in_flight.load(.seq_cst);
-        while (true) {
-            std.debug.assert(cur > 0);
-            if (cur == 0) break;
-            cur = u.in_flight.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
-        }
 
         if (rtt_ns) |rtt| {
             lockSpin(&pool.lock);
@@ -486,6 +708,18 @@ pub const Pool = struct {
                 rtt_f
             else
                 pool.options.ewma_alpha * rtt_f + (1.0 - pool.options.ewma_alpha) * u.ewma_ns;
+        }
+
+        // In-flight decrement LAST: it is the release of this call's hold
+        // on `u` — once it reaches 0 a removed `u` may be freed by `reap`
+        // on another thread, so nothing below may touch `u`. A report
+        // without a matching pick is a caller bug — assert in Debug,
+        // saturate at 0 in release builds.
+        var cur = u.in_flight.load(.seq_cst);
+        while (true) {
+            std.debug.assert(cur > 0);
+            if (cur == 0) break;
+            cur = u.in_flight.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
         }
     }
 
@@ -508,19 +742,36 @@ pub const Pool = struct {
     /// breaker's cooldown admits one, the probe success walks it
     /// open → half_open → closed across ticks, without risking a live
     /// request on a possibly-dead upstream.
+    ///
+    /// Membership may change while the checks run: the tick works on a
+    /// snapshot of the members taken under the lock, each pinned so `reap`
+    /// cannot free it mid-check. One tick runs at a time — a tick arriving
+    /// while another is checking is a no-op; so is one that cannot allocate
+    /// its snapshot.
     pub fn healthTick(pool: *Pool, now_ns: u64) void {
         const hc = pool.options.health_checker orelse return;
-        {
+        const snap: []*Upstream = blk: {
             lockSpin(&pool.lock);
             defer pool.lock.unlock();
+            if (pool.health_busy) return;
             if (pool.last_health_ns) |last| {
                 if (now_ns -| last < pool.options.health_interval_ns) return;
             }
+            const snap = pool.gpa.dupe(*Upstream, pool.upstreams.items) catch return;
             pool.last_health_ns = now_ns;
+            pool.health_busy = true;
+            for (snap) |u| _ = u.pins.fetchAdd(1, .seq_cst);
+            break :blk snap;
+        };
+        defer {
+            lockSpin(&pool.lock);
+            for (snap) |u| _ = u.pins.fetchSub(1, .seq_cst);
+            pool.health_busy = false;
+            pool.lock.unlock();
+            pool.gpa.free(snap);
         }
-        // Checks run outside the lock (the checker may do real I/O); the
-        // upstream list is registration-frozen by the `add` contract.
-        for (pool.upstreams.items) |u| {
+        // Checks run outside the lock (the checker may do real I/O).
+        for (snap) |u| {
             if (hc.check(u.address, pool.options.health_timeout_ns)) {
                 u.down.store(false, .seq_cst);
                 if (u.breaker.state() != .closed) {
@@ -576,7 +827,8 @@ pub const Pool = struct {
         defer pool.lock.unlock();
         return .{
             .id = u.id,
-            .healthy = !u.down.load(.seq_cst) and breaker_state != .open,
+            .healthy = !u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and breaker_state != .open,
+            .draining = u.draining.load(.seq_cst),
             .breaker_state = breaker_state,
             .in_flight = u.in_flight.load(.seq_cst),
             .picks = u.picks.load(.seq_cst),
@@ -592,9 +844,11 @@ pub const Pool = struct {
 
     /// Point-in-time snapshot of the whole pool.
     pub fn stats(pool: *Pool) PoolStats {
-        var s: PoolStats = .{ .upstreams = pool.upstreams.items.len };
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        var s: PoolStats = .{ .upstreams = pool.upstreams.items.len, .retired = pool.retired.items.len };
         for (pool.upstreams.items) |u| {
-            if (!u.down.load(.seq_cst) and u.breaker.state() != .open) s.healthy += 1;
+            if (!u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and u.breaker.state() != .open) s.healthy += 1;
             s.in_flight += u.in_flight.load(.seq_cst);
             s.picks += u.picks.load(.seq_cst);
             s.failures += u.failures.load(.seq_cst);
@@ -607,7 +861,7 @@ pub const Pool = struct {
 /// breaker admission would leak a half-open probe slot, an unpaired
 /// bulkhead slot is returned on the spot).
 fn admit(u: *Upstream) bool {
-    if (u.down.load(.seq_cst)) return false;
+    if (u.down.load(.seq_cst) or u.draining.load(.seq_cst)) return false;
     if (u.bulkhead) |*bh| {
         if (!bh.tryAcquire()) return false; // bulkhead full → skip
     }
@@ -622,8 +876,11 @@ fn admit(u: *Upstream) bool {
 
 pub const UpstreamStats = struct {
     id: []const u8,
-    /// Not marked down by active health, and the breaker is not open.
+    /// Not marked down by active health, not drained, and the breaker is
+    /// not open.
     healthy: bool,
+    /// Drained or removed (`Pool.drain`, `Pool.remove`).
+    draining: bool = false,
     breaker_state: resilience.CircuitBreaker.State,
     in_flight: u32,
     picks: u64,
@@ -639,12 +896,47 @@ pub const UpstreamStats = struct {
 };
 
 pub const PoolStats = struct {
+    /// Current members.
     upstreams: usize,
+    /// Removed members not yet freed by `reap`.
+    retired: usize = 0,
     healthy: usize = 0,
     in_flight: u64 = 0,
     picks: u64 = 0,
     failures: u64 = 0,
 };
+
+/// One point of the `.ring_hash` ring.
+pub const RingPoint = struct {
+    hash: u64,
+    idx: u32,
+
+    fn lessThan(_: void, a: RingPoint, b: RingPoint) bool {
+        return a.hash < b.hash or (a.hash == b.hash and a.idx < b.idx);
+    }
+};
+
+/// Point `j` of member `id`: XxHash64 (seed 0) of `id ++ "-" ++ decimal(j)`
+/// — a function of the id alone, so a member keeps its points across
+/// rebuilds and address changes.
+fn pointHash(id: []const u8, j: usize) u64 {
+    var h = std.hash.XxHash64.init(0);
+    h.update(id);
+    var buf: [21]u8 = undefined;
+    h.update(std.fmt.bufPrint(&buf, "-{d}", .{j}) catch unreachable);
+    return h.final();
+}
+
+/// The first point with `hash >= h`, wrapping to 0 past the end.
+fn ringIndex(ring: []const RingPoint, h: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = ring.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ring[mid].hash < h) lo = mid + 1 else hi = mid;
+    }
+    return if (lo == ring.len) 0 else lo;
+}
 
 // ── operation-type plumbing (mirrors resilience.run) ────────────────────────
 
@@ -1259,4 +1551,508 @@ test "concurrent call(): per-upstream bulkhead cap is never exceeded, nothing le
     const ps = pool.stats();
     try testing.expectEqual(0, ps.in_flight); // every admission reported back
     try testing.expectEqual(2, ps.healthy);
+}
+
+// ── core (2026-10-04): membership while serving, ring hash, P2C ─────────────
+
+test "remove while a call is in flight: the report still lands, reap frees only the idle" {
+    var pool: Pool = .init(testing.allocator, .{});
+    defer pool.deinit();
+    try addThree(&pool);
+
+    const a = pool.pick().?; // round robin: a, held
+    try testing.expectEqualStrings("a", a.id);
+    try testing.expect(try pool.remove("a"));
+    try testing.expect(!try pool.remove("a")); // gone from the member list
+    try testing.expectEqual(2, pool.count());
+    try testing.expectEqual(1, pool.retiredCount());
+    for (0..6) |_| try testing.expect(!std.mem.eql(u8, "a", pickReport(&pool).?.id));
+
+    // In flight → not freed; the late report is safe and counted.
+    try testing.expectEqual(0, pool.reap());
+    pool.report(a, false, 5);
+    try testing.expectEqual(1, a.failures.load(.seq_cst));
+    try testing.expectEqual(1, pool.reap());
+    try testing.expectEqual(0, pool.retiredCount());
+
+    // The id is free again, at a new address.
+    const a2 = try pool.add(.{ .id = "a", .address = "10.0.0.9:81" });
+    try testing.expectEqual(81, a2.address.port);
+    try testing.expectEqual(a2, pool.getById("a").?);
+    try testing.expectEqual(3, pool.stats().upstreams);
+}
+
+test "remove keeps the rotation: the member after the removed one is next" {
+    var pool: Pool = .init(testing.allocator, .{});
+    defer pool.deinit();
+    try addThree(&pool);
+    try testing.expectEqualStrings("a", pickReport(&pool).?.id); // cursor → b
+    try testing.expect(try pool.remove("a")); // [b, c]; cursor was past a
+    try testing.expectEqualStrings("b", pickReport(&pool).?.id);
+    try testing.expectEqualStrings("c", pickReport(&pool).?.id);
+    try testing.expect(try pool.remove("c")); // cursor at 0 stays
+    try testing.expectEqualStrings("b", pickReport(&pool).?.id);
+    try testing.expect(try pool.remove("b"));
+    try testing.expectEqual(null, pool.pick());
+    try testing.expectEqual(3, pool.reap());
+}
+
+test "drain: skipped by every strategy, in-flight work finishes, undrain restores" {
+    for ([_]Strategy{ .round_robin, .random, .weighted_round_robin, .least_connections, .ewma_latency, .least_request, .ring_hash }) |st| {
+        var pool: Pool = .init(testing.allocator, .{ .strategy = st, .seed = 7 });
+        defer pool.deinit();
+        try addThree(&pool);
+        const b = pool.getById("b").?;
+        pool.drain(b);
+        for (0..30) |i| {
+            var kb: [8]u8 = undefined;
+            const u = pool.pickByKey(std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable).?;
+            try testing.expect(u != b);
+            pool.report(u, true, null);
+        }
+        try testing.expect(!pool.upstreamStats(b).healthy);
+        try testing.expect(pool.upstreamStats(b).draining);
+        try testing.expectEqual(2, pool.stats().healthy);
+        // Undrained, with the other two drained, b is the only choice left.
+        pool.undrain(b);
+        pool.drain(pool.getById("a").?);
+        pool.drain(pool.getById("c").?);
+        try testing.expectEqual(b, pickReport(&pool).?);
+        try testing.expectEqual(b, pool.pickByKey("any").?);
+        pool.report(b, true, null);
+    }
+}
+
+test "healthTick pins its snapshot: a member removed mid-check is not freed under it" {
+    // The checker removes and reaps "b" while the tick is checking it — the
+    // check runs outside the pool lock, exactly where a concurrent owner
+    // could do this.
+    const Remover = struct {
+        pool: *Pool,
+        reaped_during: usize = 99,
+        fn hc(r: *@This()) HealthChecker {
+            return .{ .ctx = r, .checkFn = check };
+        }
+        fn check(ctx: *anyopaque, address: probe.Target, _: u64) bool {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, address.host, "10.0.0.2")) {
+                _ = r.pool.remove("b") catch unreachable;
+                r.reaped_during = r.pool.reap();
+            }
+            return true;
+        }
+    };
+    var pool: Pool = .init(testing.allocator, .{ .health_interval_ns = 0 });
+    defer pool.deinit();
+    var rm: Remover = .{ .pool = &pool };
+    pool.options.health_checker = rm.hc();
+    try addThree(&pool);
+    pool.healthTick(1);
+    try testing.expectEqual(0, rm.reaped_during); // pinned by the tick
+    try testing.expectEqual(1, pool.reap()); // unpinned after it
+    try testing.expectEqual(2, pool.count());
+}
+
+// The expected owners below come from Python's `xxhash` package (a black-box
+// XxHash64), building the same ring by the rule `pointHash` documents: points
+// `xxh64(id ++ "-" ++ j, seed 0)` for j < weight × 160, sorted by (hash,
+// member index), a key owned by the first point with hash ≥ xxh64(key).
+
+test "ring_hash: owners match the Python xxhash oracle, and removal moves only the removed member's keys" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash });
+    defer pool.deinit();
+    const ids = [_][]const u8{ "m0", "m1", "m2", "m3", "m4" };
+    const addrs = [_][]const u8{ "10.0.1.0:80", "10.0.1.1:80", "10.0.1.2:80", "10.0.1.3:80", "10.0.1.4:80" };
+    for (ids, addrs) |id, ad| _ = try pool.add(.{ .id = id, .address = ad });
+    const want = [_][]const u8{ "m2", "m0", "m3", "m1", "m0", "m4", "m1", "m2" };
+    for (want, 1..) |w, k| {
+        var kb: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "user-{d}", .{k}) catch unreachable;
+        try testing.expectEqualStrings(w, pool.ringOwner(key).?.id);
+        const u = pool.pickByKey(key).?;
+        try testing.expectEqualStrings(w, u.id);
+        pool.report(u, true, null);
+    }
+    try testing.expect(try pool.remove("m2"));
+    const want2 = [_][]const u8{ "m0", "m0", "m3", "m1", "m0", "m4", "m1", "m1" };
+    for (want2, 1..) |w, k| {
+        var kb: [16]u8 = undefined;
+        try testing.expectEqualStrings(w, pool.ringOwner(std.fmt.bufPrint(&kb, "user-{d}", .{k}) catch unreachable).?.id);
+    }
+}
+
+test "ring_hash: minimal disruption over 5000 keys, both ways" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash });
+    defer pool.deinit();
+    const ids = [_][]const u8{ "m0", "m1", "m2", "m3", "m4" };
+    for (ids, 0..) |id, i| {
+        var ab: [16]u8 = undefined;
+        _ = try pool.add(.{ .id = id, .address = std.fmt.bufPrint(&ab, "10.0.2.{d}:80", .{i}) catch unreachable });
+    }
+    var before: [5000][]const u8 = undefined;
+    for (&before, 0..) |*b, k| {
+        var kb: [16]u8 = undefined;
+        b.* = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+    }
+    try testing.expect(try pool.remove("m3"));
+    var moved: usize = 0;
+    for (before, 0..) |b, k| {
+        var kb: [16]u8 = undefined;
+        const now = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+        if (std.mem.eql(u8, b, "m3")) {
+            try testing.expect(!std.mem.eql(u8, now, "m3"));
+            moved += 1;
+        } else try testing.expectEqualStrings(b, now); // nobody else's key moved
+    }
+    try testing.expect(moved > 500 and moved < 1500); // ~1/5 of 5000
+    // Adding a member takes keys only for itself.
+    _ = try pool.add(.{ .id = "m5", .address = "10.0.2.5:80" });
+    var gained: usize = 0;
+    for (0..5000) |k| {
+        var kb: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable;
+        const now = pool.ringOwner(key).?.id;
+        const prev = if (std.mem.eql(u8, before[k], "m3")) null else before[k];
+        if (std.mem.eql(u8, now, "m5")) gained += 1 else if (prev) |p| try testing.expectEqualStrings(p, now);
+    }
+    try testing.expect(gained > 500 and gained < 1500);
+    _ = pool.reap();
+}
+
+test "ring_hash: weights 1:2:3 split 30000 keys exactly as the Python oracle does" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "w1", .address = "10.0.3.1:80", .weight = 1 });
+    _ = try pool.add(.{ .id = "w2", .address = "10.0.3.2:80", .weight = 2 });
+    _ = try pool.add(.{ .id = "w3", .address = "10.0.3.3:80", .weight = 3 });
+    try testing.expectEqual(@as(usize, 960), pool.ring.len);
+    var counts = [_]usize{ 0, 0, 0 };
+    for (0..30000) |k| {
+        var kb: [16]u8 = undefined;
+        const id = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+        counts[id[1] - '1'] += 1;
+    }
+    try testing.expectEqual([_]usize{ 4539, 9666, 15795 }, counts);
+}
+
+test "ring_hash: a down owner's keys walk to the next member; everyone else's stay" {
+    var hosts = [_]FakeChecker.Entry{ .{ .host = "10.0.0.1", .up = true }, .{ .host = "10.0.0.2", .up = false }, .{ .host = "10.0.0.3", .up = true } };
+    var fc: FakeChecker = .{ .entries = &hosts };
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash, .health_checker = fc.healthChecker(), .health_interval_ns = 0 });
+    defer pool.deinit();
+    try addThree(&pool);
+    pool.healthTick(1); // b down
+    var b_keys: usize = 0;
+    for (0..2000) |k| {
+        var kb: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable;
+        const owner = pool.ringOwner(key).?;
+        const got = pool.pickByKey(key).?;
+        defer pool.report(got, true, null);
+        if (std.mem.eql(u8, owner.id, "b")) {
+            b_keys += 1;
+            try testing.expect(got != owner);
+        } else try testing.expectEqual(owner, got);
+    }
+    try testing.expect(b_keys > 300);
+    // Every member refused → null, and the walk terminated.
+    pool.drain(pool.getById("a").?);
+    pool.drain(pool.getById("c").?);
+    try testing.expectEqual(null, pool.pickByKey("k1"));
+    try testing.expectEqual(null, pool.pick());
+}
+
+test "ring_hash: the ring is bounded by max_ring_points, every member keeps a point" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash, .max_ring_points = 100 });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "heavy", .address = "10.0.4.1:80", .weight = 1_000_000 });
+    _ = try pool.add(.{ .id = "light", .address = "10.0.4.2:80", .weight = 1 });
+    // heavy: 1e6 × 100 / 1 000 001 = 99 points; light: max(1, 0) = 1.
+    try testing.expectEqual(@as(usize, 100), pool.ring.len);
+    var light: usize = 0;
+    for (pool.ring) |p| light += @intFromBool(p.idx == 1);
+    try testing.expectEqual(@as(usize, 1), light);
+}
+
+test "least_request (P2C): the loaded member never wins a pair; one member is always chosen" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .least_request, .seed = 3 });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "solo", .address = "10.0.5.1:80" });
+    const s = pool.pick().?;
+    try testing.expectEqualStrings("solo", s.id);
+    pool.report(s, true, null);
+    try testing.expect(try pool.remove("solo"));
+    _ = pool.reap();
+    try addThree(&pool);
+    // Five calls held on a: a has more in flight than b or c, so in any
+    // pair it loses — it is never picked while they are idle.
+    var held: [5]*Upstream = undefined;
+    const a = pool.getById("a").?;
+    for (&held) |*h| {
+        h.* = a;
+        try testing.expect(admit(a));
+    }
+    var hits = [_]usize{ 0, 0, 0 };
+    for (0..200) |_| {
+        const u = pickReport(&pool).?;
+        hits[u.id[0] - 'a'] += 1;
+    }
+    try testing.expectEqual(0, hits[0]);
+    try testing.expect(hits[1] > 50 and hits[2] > 50);
+    for (held) |h| pool.report(h, true, null);
+}
+
+// ── seeded model sweep: membership churn under every strategy ──────────────
+//
+// Random add/remove/drain/undrain/pick/report/healthTick/reap sequences,
+// checked after every step against a model: a pick never returns a member
+// that is removed, drained or down; the pool's in-flight count per member is
+// exactly the number of picks the model holds; `reap` frees exactly the
+// removed members with nothing held; nothing leaks (testing.allocator).
+
+test "sweep: membership churn keeps every invariant under every strategy" {
+    const strategies = [_]Strategy{ .round_robin, .random, .weighted_round_robin, .least_connections, .ewma_latency, .least_request, .ring_hash };
+    var reach = struct { picks: usize = 0, removes: usize = 0, reaped: usize = 0, drained_skips: usize = 0, null_picks: usize = 0 }{};
+    const id_names = [_][]const u8{ "u0", "u1", "u2", "u3", "u4", "u5" };
+    const addr_names = [_][]const u8{ "10.9.0.0:80", "10.9.0.1:80", "10.9.0.2:80", "10.9.0.3:80", "10.9.0.4:80", "10.9.0.5:80" };
+    for (0..140) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var hosts: [6]FakeChecker.Entry = undefined;
+        for (&hosts, addr_names) |*h, ad| h.* = .{ .host = ad[0..8], .up = true };
+        var fc: FakeChecker = .{ .entries = &hosts };
+        var pool: Pool = .init(testing.allocator, .{
+            .strategy = strategies[seed % strategies.len],
+            .seed = seed,
+            .health_checker = fc.healthChecker(),
+            .health_interval_ns = 0,
+            .max_per_upstream = 3,
+            .ring_points_per_weight = 8,
+        });
+        defer pool.deinit();
+        var held: std.ArrayList(*Upstream) = .empty;
+        defer held.deinit(testing.allocator);
+        for (0..300) |_| {
+            switch (r.uintLessThan(u8, 10)) {
+                0 => {
+                    const i = r.uintLessThan(usize, id_names.len);
+                    _ = pool.add(.{ .id = id_names[i], .address = addr_names[i], .weight = r.intRangeAtMost(u32, 1, 4) }) catch |e| switch (e) {
+                        error.DuplicateId => {},
+                        else => return e,
+                    };
+                },
+                1 => if (try pool.remove(id_names[r.uintLessThan(usize, id_names.len)])) {
+                    reach.removes += 1;
+                },
+                2 => if (pool.getById(id_names[r.uintLessThan(usize, id_names.len)])) |u| {
+                    if (r.boolean()) pool.drain(u) else pool.undrain(u);
+                },
+                3 => {
+                    fc.entries[r.uintLessThan(usize, 6)].up = r.uintLessThan(u8, 4) != 0;
+                    pool.healthTick(1);
+                },
+                4, 5, 6 => {
+                    var kb: [8]u8 = undefined;
+                    const key = std.fmt.bufPrint(&kb, "{d}", .{r.int(u16)}) catch unreachable;
+                    const got = if (r.boolean()) pool.pick() else pool.pickByKey(key);
+                    if (got) |u| {
+                        reach.picks += 1;
+                        if (u.retired or u.draining.load(.seq_cst) or u.down.load(.seq_cst)) return error.PickedInadmissible;
+                        try held.append(testing.allocator, u);
+                    } else {
+                        reach.null_picks += 1;
+                        // Null only when no current member is admissible
+                        // by the model's view: none up, undrained and
+                        // under its bulkhead cap.
+                        for (pool.upstreams.items) |u| {
+                            if (!u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and u.in_flight.load(.seq_cst) < 3 and u.breaker.state() == .closed)
+                                return error.NullWithAdmissibleMember;
+                        }
+                    }
+                },
+                7, 8 => if (held.items.len > 0) {
+                    const u = held.swapRemove(r.uintLessThan(usize, held.items.len));
+                    pool.report(u, r.uintLessThan(u8, 5) != 0, r.uintAtMost(u64, 1000));
+                },
+                else => {
+                    var idle_retired: usize = 0;
+                    for (pool.retired.items) |u| {
+                        var h: usize = 0;
+                        for (held.items) |x| h += @intFromBool(x == u);
+                        idle_retired += @intFromBool(h == 0);
+                    }
+                    const freed = pool.reap();
+                    if (freed != idle_retired) return error.ReapMismatch;
+                    reach.reaped += freed;
+                },
+            }
+            // Per-member in-flight equals what the model holds.
+            for (pool.upstreams.items) |u| {
+                var h: u32 = 0;
+                for (held.items) |x| h += @intFromBool(x == u);
+                if (u.in_flight.load(.seq_cst) != h) return error.InFlightDrift;
+                if (u.draining.load(.seq_cst)) reach.drained_skips += 1;
+            }
+            if (pool.options.strategy == .ring_hash) {
+                for (pool.ring) |p| if (p.idx >= pool.upstreams.items.len) return error.RingIndexStale;
+            }
+        }
+        for (held.items) |u| pool.report(u, true, null);
+        held.clearRetainingCapacity();
+        _ = pool.reap();
+        try testing.expectEqual(0, pool.retiredCount());
+    }
+    // Measured 2026-10-04: picks 8286, null picks 4295 (each checked against
+    // the model), removes 1899, reaped 1564, drained member-steps 25473.
+    try testing.expect(reach.picks > 7000);
+    try testing.expect(reach.null_picks > 3000);
+    try testing.expect(reach.removes > 1500);
+    try testing.expect(reach.reaped > 1200);
+    try testing.expect(reach.drained_skips > 20000);
+}
+
+test "concurrent call() while another thread removes, re-adds and reaps members" {
+    // Freed memory is overwritten (0xAA) in safe builds, so a call or report
+    // that touched a reaped member would see a garbage id or trip the
+    // in-flight assertion; the op checks the id from inside the call.
+    const ids = [_][]const u8{ "a", "b", "c" };
+    const addrs = [_][]const u8{ "10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80" };
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .least_request, .max_per_upstream = 4, .seed = 1 });
+    defer pool.deinit();
+    for (ids, addrs) |id, ad| _ = try pool.add(.{ .id = id, .address = ad });
+
+    const Shared = struct {
+        bad: std.atomic.Value(u32) = .init(0),
+        done: std.atomic.Value(bool) = .init(false),
+    };
+    const Op = struct {
+        s: *Shared,
+        pub fn call(self: *@This(), u: *Upstream) error{Never}!u32 {
+            const ok = u.id.len == 1 and u.id[0] >= 'a' and u.id[0] <= 'c';
+            if (!ok) _ = self.s.bad.fetchAdd(1, .seq_cst);
+            std.atomic.spinLoopHint();
+            return 1;
+        }
+    };
+    const Worker = struct {
+        fn hammer(p: *Pool, s: *Shared) void {
+            while (!s.done.load(.seq_cst)) {
+                var op: Op = .{ .s = s };
+                _ = p.call(&op, .{ .max_tries = 2 }) catch {};
+            }
+        }
+        fn churn(p: *Pool, s: *Shared) void {
+            for (0..3000) |i| {
+                const k = i % 3;
+                _ = p.remove(ids[k]) catch {};
+                _ = p.reap();
+                _ = p.add(.{ .id = ids[k], .address = addrs[k] }) catch {};
+            }
+            s.done.store(true, .seq_cst);
+        }
+    };
+    var shared: Shared = .{};
+    var workers: [3]std.Thread = undefined;
+    for (&workers) |*h| h.* = try std.Thread.spawn(.{}, Worker.hammer, .{ &pool, &shared });
+    const churner = try std.Thread.spawn(.{}, Worker.churn, .{ &pool, &shared });
+    churner.join();
+    for (workers) |h| h.join();
+    try testing.expectEqual(0, shared.bad.load(.seq_cst));
+    _ = pool.reap();
+    try testing.expectEqual(0, pool.retiredCount());
+    try testing.expectEqual(0, pool.stats().in_flight);
+}
+
+// ── tests added for mutation survivors (2026-10-04) ─────────────────────────
+
+test "remove of the member the rotation points at: the one after it is next" {
+    var pool: Pool = .init(testing.allocator, .{});
+    defer pool.deinit();
+    try addThree(&pool);
+    try testing.expectEqualStrings("a", pickReport(&pool).?.id); // cursor → b
+    try testing.expect(try pool.remove("b")); // [a, c]; b was next, so c is
+    try testing.expectEqualStrings("c", pickReport(&pool).?.id);
+    try testing.expectEqualStrings("a", pickReport(&pool).?.id);
+    _ = pool.reap();
+}
+
+test "a removed member reports drained in its stats, and undrain cannot revive it" {
+    // Its stats must say it takes no traffic: a dashboard reading a removed
+    // member that is still finishing calls would otherwise show it healthy.
+    var pool: Pool = .init(testing.allocator, .{});
+    defer pool.deinit();
+    try addThree(&pool);
+    const a = pool.pick().?;
+    try testing.expect(try pool.remove("a"));
+    try testing.expect(pool.upstreamStats(a).draining);
+    try testing.expect(!pool.upstreamStats(a).healthy);
+    pool.undrain(a);
+    try testing.expect(pool.upstreamStats(a).draining);
+    pool.report(a, true, null);
+    try testing.expectEqual(1, pool.reap());
+}
+
+test "weighted_round_robin with a drained member splits exactly by the others' weights" {
+    // A drained member must not take part in the credit exchange at all:
+    // over every window of sum(weights of the rest) picks each remaining
+    // member is chosen exactly its weight times.
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .weighted_round_robin });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80", .weight = 1 });
+    _ = try pool.add(.{ .id = "b", .address = "10.0.0.2:80", .weight = 2 });
+    _ = try pool.add(.{ .id = "c", .address = "10.0.0.3:80", .weight = 3 });
+    pool.drain(pool.getById("c").?);
+    for (0..4) |_| {
+        var hits = [_]usize{ 0, 0, 0 };
+        for (0..3) |_| hits[pickReport(&pool).?.id[0] - 'a'] += 1;
+        try testing.expectEqual([_]usize{ 1, 2, 0 }, hits);
+    }
+}
+
+test "ring_hash: a key equal to a point lands on that point's member (lower bound)" {
+    // The ring rule is "the first point at or after the key's hash": a key
+    // spelled like point j of member m hashes to exactly that point.
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash });
+    defer pool.deinit();
+    try addThree(&pool);
+    for ([_][]const u8{ "a", "b", "c" }) |id| {
+        for (0..20) |j| {
+            var kb: [16]u8 = undefined;
+            const key = std.fmt.bufPrint(&kb, "{s}-{d}", .{ id, j }) catch unreachable;
+            try testing.expectEqualStrings(id, pool.ringOwner(key).?.id);
+        }
+    }
+}
+
+test "ring_hash: pick() without a key spreads over every member" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .ring_hash, .seed = 11 });
+    defer pool.deinit();
+    try addThree(&pool);
+    var hits = [_]usize{ 0, 0, 0 };
+    for (0..300) |_| hits[pickReport(&pool).?.id[0] - 'a'] += 1;
+    for (hits) |h| try testing.expect(h > 50);
+}
+
+test "healthTick: a tick started from inside a running tick's check is a no-op" {
+    // One tick at a time: the snapshot and its pins belong to one tick.
+    const Nested = struct {
+        pool: *Pool,
+        calls: usize = 0,
+        fn hc(n: *@This()) HealthChecker {
+            return .{ .ctx = n, .checkFn = check };
+        }
+        fn check(ctx: *anyopaque, _: probe.Target, _: u64) bool {
+            const n: *@This() = @ptrCast(@alignCast(ctx));
+            n.calls += 1;
+            n.pool.healthTick(n.calls * 1000);
+            return true;
+        }
+    };
+    var pool: Pool = .init(testing.allocator, .{ .health_interval_ns = 0 });
+    defer pool.deinit();
+    var n: Nested = .{ .pool = &pool };
+    pool.options.health_checker = n.hc();
+    try addThree(&pool);
+    pool.healthTick(1);
+    try testing.expectEqual(3, n.calls);
 }

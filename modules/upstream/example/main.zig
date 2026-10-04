@@ -77,4 +77,31 @@ pub fn main() !void {
         pool_stats.healthy,
         pool_stats.in_flight,
     });
+
+    // Consistent hashing with a fleet that changes while it serves: a
+    // session key keeps its backend, and removing one member moves only
+    // the keys that member owned.
+    var ring: upstream.Pool = .init(gpa, .{ .strategy = .ring_hash });
+    defer ring.deinit();
+    _ = try ring.add(.{ .id = "cache-1", .address = "10.0.0.1:6379" });
+    _ = try ring.add(.{ .id = "cache-2", .address = "10.0.0.2:6379" });
+    _ = try ring.add(.{ .id = "cache-3", .address = "10.0.0.3:6379" });
+    var owners: [100][]const u8 = undefined;
+    for (&owners, 0..) |*o, i| {
+        var kb: [16]u8 = undefined;
+        o.* = ring.ringOwner(try std.fmt.bufPrint(&kb, "session-{d}", .{i})).?.id;
+    }
+    const held = ring.pickByKey("session-7").?; // a call in flight
+    _ = try ring.remove("cache-2"); // removed while serving
+    var moved: usize = 0;
+    for (owners, 0..) |o, i| {
+        var kb: [16]u8 = undefined;
+        const now = ring.ringOwner(try std.fmt.bufPrint(&kb, "session-{d}", .{i})).?.id;
+        if (!std.mem.eql(u8, o, now)) {
+            if (!std.mem.eql(u8, o, "cache-2")) return error.UnrelatedKeyMoved;
+            moved += 1;
+        }
+    }
+    ring.report(held, true, null); // safe even if `held` was the removed one
+    std.debug.print("removed cache-2: {d} of 100 session keys moved, freed {d} retired member(s)\n", .{ moved, ring.reap() });
 }
