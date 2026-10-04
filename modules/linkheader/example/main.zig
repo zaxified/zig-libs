@@ -59,8 +59,7 @@ pub fn main() !void {
     // error — a segment with no `<...>` or with no `rel` is dropped and the
     // iterator resynchronizes on the next top-level comma (SPEC.md "Error
     // policy = skip, never panic"). There is no named-error rejection path
-    // for a malformed *segment*; the only fallible entry point in the whole
-    // module is `bufPrint` on an undersized destination buffer (below).
+    // for a malformed *segment*; the builder is where errors live (below).
     const malformed_header = "garbage-no-brackets, <https://api/no-rel>; title=\"dropped\", <https://api/z>; rel=\"self\"";
     var mit = linkheader.parse(malformed_header);
     const survivor = mit.next() orelse return error.MissingLink;
@@ -83,12 +82,36 @@ pub fn main() !void {
     const out = try linkheader.bufPrint(&out_buf, links);
     std.debug.print("built: {s}\n", .{out});
 
-    // Negative case, named error: the one fallible entry point in this
-    // module — a destination buffer too small to hold the header.
+    // Negative case, named error: a destination buffer too small to hold
+    // the header.
     var tiny: [8]u8 = undefined;
     if (linkheader.bufPrint(&tiny, links)) |_| {
         return error.ExpectedRejection;
     } else |err| switch (err) {
         error.NoSpaceLeft => std.debug.print("bufPrint into an 8-byte buffer: NoSpaceLeft (expected)\n", .{}),
+        error.InvalidLink => return error.WrongRejection,
     }
+
+    // Negative case: a title carrying CR LF would split the header and
+    // inject a second one. The builder refuses it before writing a byte.
+    const evil = [_]linkheader.Link{.{ .uri = "/x", .rel = "next", .title = "hi\r\nSet-Cookie: s=1" }};
+    if (linkheader.bufPrint(&out_buf, &evil)) |_| {
+        return error.ExpectedRejection;
+    } else |err| switch (err) {
+        error.InvalidLink => std.debug.print("title with CR LF: InvalidLink (expected)\n", .{}),
+        error.NoSpaceLeft => return error.WrongRejection,
+    }
+
+    // Every param, RFC 8187 `title*` and a relative target: a preload hint
+    // from RFC 8288 §3.5's `title*` shape, resolved against the request URI.
+    const hint = "<../s.css>; rel=preload; as=style; title*=UTF-8'de'n%c3%a4chstes%20Kapitel";
+    const pre = linkheader.find(hint, "preload") orelse return error.MissingLink;
+    const as = pre.param("as") orelse return error.MissingParam;
+    var title_buf: [64]u8 = undefined;
+    const title = (try pre.preferredTitle(&title_buf)) orelse return error.MissingTitle;
+    if (!std.mem.eql(u8, title, "n\u{e4}chstes Kapitel")) return error.WrongTitle;
+    var abs_buf: [512]u8 = undefined;
+    const abs = try linkheader.resolve(&abs_buf, "https://example.org/app/page/index.html", pre.uri);
+    if (!std.mem.eql(u8, abs, "https://example.org/app/s.css")) return error.WrongResolution;
+    std.debug.print("preload as={s} title=\"{s}\" -> {s}\n", .{ as.value, title, abs });
 }
