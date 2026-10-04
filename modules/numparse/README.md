@@ -9,7 +9,7 @@ an exact `decimal.Decimal`, with strict structural validation.
   subset).
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state). **Allocation:** none — the
-  normalized digits are rewritten into a stack buffer.
+  normalized digits are rewritten into a stack buffer. **Scope:** core since 2026-10-04.
 - **Deps:** `decimal`.
 
 Provenance: original work of the zig-libs authors (MIT). The expr-internal
@@ -41,6 +41,27 @@ Grammar: `[-]?d{1,3}(<thousands>d{3})+(<decimal>d+)?`
   trailing characters) or when the normalized value is out of the `decimal`
   range.
 
+## `parse` — any locale's grouping, signs, percent (2026-10-04)
+
+```zig
+const cs = numparse.locale("cs").?;                     // group U+00A0, decimal ','
+numparse.parse("1\u{00A0}234\u{00A0}567,89", cs);     // → 1234567.89
+numparse.parse("1234,5", cs);                           // → 1234.5 (ungrouped is fine)
+numparse.parse("1,23,45,678", numparse.locale("en_IN").?); // → 12345678 (lakh/crore)
+
+var o = numparse.locale("en").?;
+o.parentheses = true;                                   // accounting exports
+o.percent = true;
+numparse.parse("(1,234.56)", o);                        // → -1234.56
+numparse.parse("12.5%", o);                             // → 0.125
+```
+
+Separators are UTF-8 slices; `lenient_spaces` accepts any space-like spelling for a space-like
+separator (one spelling per number). Refused on purpose: a grouped number starting with `0`, `5.`,
+an exponent after a grouped number, two signs. Checked against Babel's strict `parse_decimal` on
+5 452 cases over 25 CLDR locales (`tools/babel-oracle.py`). The legacy `parseGroupedNumber` below
+is unchanged.
+
 ## Implementation notes
 
 Semantics (grammar, strictness) are preserved exactly. Two mechanical
@@ -52,11 +73,10 @@ adaptations from an earlier design iteration:
 - Parameters renamed `thousands`/`decimal` → `thousands_sep`/`decimal_sep`
   (avoids colliding with the `decimal` dependency name).
 
-## Deferred (Fable-scoped follow-on, not v1)
+## Deferred
 
-Scientific notation, currency symbols / percent suffixes, non-3-digit
-grouping (Indian lakh/crore 2-digit, CJK 4-digit myriad), and full ICU
-`NumberFormat` locale coverage.
+Currency symbols, CJK 4-digit myriad grouping, non-Latin digits, and full
+CLDR locale coverage (25 locales are built in). See `SPEC.md`.
 
 ## Verify
 

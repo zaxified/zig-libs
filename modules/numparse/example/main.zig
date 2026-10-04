@@ -66,7 +66,18 @@ pub fn main() !void {
     const glibc_cs_locale_bytes = "1\xe2\x80\xaf234,56"; // literal glibc cs_CZ.UTF-8 output
     const rejected = numparse.parseGroupedNumber(glibc_cs_locale_bytes, ' ', ',');
     must(rejected == null, @src());
-    std.debug.print("glibc cs_CZ.UTF-8 output (U+202F separator) rejected: numparse's u8 separator cannot express it (finding)\n", .{});
+    std.debug.print("glibc cs_CZ.UTF-8 output (U+202F separator) rejected by the u8 legacy API\n", .{});
+
+    // `parse` (2026-10-04) takes UTF-8 separators. CLDR's cs separator is
+    // U+00A0, glibc emits U+202F: with `lenient_spaces` any space-like
+    // spelling is accepted (one per number), so both read the same.
+    var cs = numparse.locale("cs").?;
+    cs.lenient_spaces = true;
+    const glibc_ok = numparse.parse(glibc_cs_locale_bytes, cs).?;
+    must(glibc_ok.raw == (try Decimal.parse("1234.56")).raw, @src());
+    const cldr_ok = numparse.parse("1\u{00A0}234,56", cs).?;
+    must(cldr_ok.raw == glibc_ok.raw, @src());
+    std.debug.print("parse(locale cs, lenient_spaces): glibc U+202F and CLDR U+00A0 both -> {s}\n", .{glibc_ok.toString(&buf)});
 
     // Structural validation: a lone 2-digit group is rejected outright
     // (grammar requires exactly 3 digits per group after the first).
