@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: multicast **event monitoring**
+  (`RTNLGRP`, `rtnlGroupMask`, `Socket.openMonitor`, `Socket.recvEvents` → `EventIterator` of
+  typed `Event`s — link/addr/route/neigh/rule new/del — decoded by the dump parsers; `Overrun`
+  = lost events, re-dump); **policy rules** (`RuleSpec`, `Socket.ruleAdd`/`ruleDel`/`rules`,
+  `Rule`, `parseRule`; `FRA_TABLE` above 255 like routes); **kind data** for `linkAdd`
+  (`LinkAddSpec.parent` = `IFLA_LINK`, `.kind_data = .veth{peer}` / `.vlan{id, protocol}`);
+  **link read-back** of `kind()`, `parent`, `master`, `operstate`, `vlan_id`/`vlan_protocol` and
+  `stats` (`IFLA_STATS64` → `LinkStats`, the ten counters `ip -s link` prints). Request bytes
+  match `strace` of iproute2 (`ip link add … type veth|vlan`, `ip rule add|del`). New
+  `BuildError` members `InvalidPrefixLength`, `InvalidVlanId`, `ParentRequired`,
+  `KindDataMismatch` — ⚠ only an exhaustive `switch` over `BuildError`/`WriteError` notices
+  (none in this repo or in axp). `Link` grew defaulted fields only (still plain data, one
+  `gpa.free`). `linkAdd`'s doc no longer says kind data is out of scope. Mutation: 41 mutants,
+  37 killed at once, 4 survivors killed by new tests. All nine direct dependents re-tested.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `recvDatagramStrict`'s
   "only the kernel is a verified sender" guard was fail-OPEN on an
   undersized `msg_namelen` (accepted the datagram instead of rejecting it);

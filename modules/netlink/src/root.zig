@@ -368,6 +368,93 @@ pub const IFLA_TXQLEN: u16 = @intFromEnum(linux.IFLA.TXQLEN);
 pub const IFLA_LINKINFO: u16 = @intFromEnum(linux.IFLA.LINKINFO);
 /// `IFLA_MASTER` — the bridge/bond an interface is enslaved to (0 = release).
 pub const IFLA_MASTER: u16 = bridge.IFLA_MASTER;
+/// `IFLA_LINK` — the lower device: a VLAN's parent, a veth's peer.
+pub const IFLA_LINK: u16 = 5;
+/// `IFLA_OPERSTATE` — RFC 2863 operational state (`IF_OPER`), a u8.
+pub const IFLA_OPERSTATE: u16 = 16;
+/// `IFLA_STATS64` — `struct rtnl_link_stats64`.
+pub const IFLA_STATS64: u16 = 23;
+
+/// `IF_OPER_*` (linux/if.h) — what `ip link` prints as `state …`.
+pub const IF_OPER = struct {
+    pub const UNKNOWN: u8 = 0;
+    pub const NOTPRESENT: u8 = 1;
+    pub const DOWN: u8 = 2;
+    pub const LOWERLAYERDOWN: u8 = 3;
+    pub const TESTING: u8 = 4;
+    pub const DORMANT: u8 = 5;
+    pub const UP: u8 = 6;
+};
+
+/// `IFLA_VLAN_*` (linux/if_link.h), inside `IFLA_INFO_DATA` of a "vlan".
+pub const IFLA_VLAN = struct {
+    pub const ID: u16 = 1;
+    pub const PROTOCOL: u16 = 5;
+};
+
+/// `VETH_INFO_PEER` (linux/veth.h): inside a "veth"'s `IFLA_INFO_DATA`, a
+/// whole `struct ifinfomsg` + `IFLA_*` attributes describing the peer.
+pub const VETH_INFO_PEER: u16 = 1;
+
+/// Policy-routing messages (linux/rtnetlink.h).
+pub const RTM_NEWRULE: u16 = 32;
+pub const RTM_DELRULE: u16 = 33;
+pub const RTM_GETRULE: u16 = 34;
+
+/// `struct fib_rule_hdr` (linux/fib_rules.h): family, dst_len, src_len, tos,
+/// table, res1, res2, action (u8 each), flags (u32).
+pub const fib_rule_hdr_len = 12;
+
+/// `enum fib_rule_attr` (linux/fib_rules.h) — the subset this module speaks.
+pub const FRA = struct {
+    pub const DST: u16 = 1;
+    pub const SRC: u16 = 2;
+    pub const IIFNAME: u16 = 3;
+    pub const PRIORITY: u16 = 6;
+    pub const FWMARK: u16 = 10;
+    pub const TABLE: u16 = 15;
+    pub const FWMASK: u16 = 16;
+    pub const OIFNAME: u16 = 17;
+};
+
+/// `FIB_RULE_INVERT` — `ip rule add not …`.
+pub const FIB_RULE_INVERT: u32 = 0x2;
+
+/// `FR_ACT_*` — what a matching rule does.
+pub const RuleAction = enum(u8) {
+    to_table = 1,
+    goto = 2,
+    nop = 3,
+    blackhole = 6,
+    @"unreachable" = 7,
+    prohibit = 8,
+    _,
+};
+
+/// `RTNLGRP_*` (linux/rtnetlink.h) — the multicast groups `ip monitor`
+/// listens on. Pass a set of them to `rtnlGroupMask`.
+pub const RTNLGRP = struct {
+    pub const LINK: u32 = 1;
+    pub const NEIGH: u32 = 3;
+    pub const IPV4_IFADDR: u32 = 5;
+    pub const IPV4_ROUTE: u32 = 7;
+    pub const IPV4_RULE: u32 = 8;
+    pub const IPV6_IFADDR: u32 = 9;
+    pub const IPV6_ROUTE: u32 = 11;
+    pub const IPV6_RULE: u32 = 19;
+};
+
+/// The legacy `nl_groups` bit set for these groups: group *n* is bit *n-1*.
+/// Groups above 32 cannot be expressed in it (`error.GroupOutOfRange`; they
+/// need `NETLINK_ADD_MEMBERSHIP`, which no group listed in `RTNLGRP` does).
+pub fn rtnlGroupMask(groups: []const u32) error{GroupOutOfRange}!u32 {
+    var mask: u32 = 0;
+    for (groups) |g| {
+        if (g == 0 or g > 32) return error.GroupOutOfRange;
+        mask |= @as(u32, 1) << @intCast(g - 1);
+    }
+    return mask;
+}
 
 const ifla_address = IFLA_ADDRESS;
 const ifla_ifname = IFLA_IFNAME;
@@ -399,11 +486,54 @@ pub const Link = struct {
     mac: ?[6]u8,
     name_buf: [ifnamsiz]u8 = @splat(0),
     name_len: u8 = 0,
+    /// `IFLA_LINK`: the lower device's index (a VLAN's parent, a veth's
+    /// peer); 0 when absent.
+    parent: u32 = 0,
+    /// `IFLA_MASTER`: the bridge/bond this port belongs to; 0 when none.
+    master: u32 = 0,
+    /// `IFLA_OPERSTATE` (`IF_OPER.*`); `IF_OPER.UNKNOWN` when absent.
+    operstate: u8 = IF_OPER.UNKNOWN,
+    /// `IFLA_INFO_KIND` ("veth", "vlan", "bridge", …); empty for a physical
+    /// device or a kind longer than the buffer (none such exists today).
+    kind_buf: [kind_max]u8 = @splat(0),
+    kind_len: u8 = 0,
+    /// For a "vlan": `IFLA_VLAN_ID` and `IFLA_VLAN_PROTOCOL` (host order,
+    /// 0x8100 = 802.1Q, 0x88a8 = 802.1ad).
+    vlan_id: ?u16 = null,
+    vlan_protocol: ?u16 = null,
+    /// `IFLA_STATS64` counters (`ip -s link`); null when the kernel sent none.
+    stats: ?LinkStats = null,
+
+    pub const kind_max = 24;
 
     /// Interface name ("lo", "eth0", …).
     pub fn name(l: *const Link) []const u8 {
         return l.name_buf[0..l.name_len];
     }
+
+    /// rtnl_link kind; "" for a device without one.
+    pub fn kind(l: *const Link) []const u8 {
+        return l.kind_buf[0..l.kind_len];
+    }
+};
+
+/// The first ten counters of `struct rtnl_link_stats64` (linux/if_link.h) —
+/// the ones `ip -s link` prints. Their offsets have been fixed since the
+/// struct appeared (later kernels only append fields).
+pub const LinkStats = struct {
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_errors: u64,
+    tx_errors: u64,
+    rx_dropped: u64,
+    tx_dropped: u64,
+    multicast: u64,
+    collisions: u64,
+
+    /// Bytes of `rtnl_link_stats64` this decodes (10 × u64).
+    pub const wire_len = 80;
 };
 
 /// One interface address (RTM_GETADDR → struct ifaddrmsg + IFA_* attrs).
@@ -543,6 +673,52 @@ pub fn parseLink(payload: []const u8) codec.Error!?Link {
         ifla_address => {
             if (a.data.len == 6) l.mac = a.data[0..6].*;
         },
+        IFLA_LINK => l.parent = @bitCast(try a.asI32()),
+        IFLA_MASTER => l.master = try a.asU32(),
+        IFLA_OPERSTATE => l.operstate = try a.asU8(),
+        IFLA_STATS64 => {
+            if (a.data.len < LinkStats.wire_len) return error.BadLength;
+            var v: [10]u64 = undefined;
+            for (&v, 0..) |*x, i| x.* = std.mem.readInt(u64, a.data[i * 8 ..][0..8], native_endian);
+            l.stats = .{
+                .rx_packets = v[0],
+                .tx_packets = v[1],
+                .rx_bytes = v[2],
+                .tx_bytes = v[3],
+                .rx_errors = v[4],
+                .tx_errors = v[5],
+                .rx_dropped = v[6],
+                .tx_dropped = v[7],
+                .multicast = v[8],
+                .collisions = v[9],
+            };
+        },
+        ifla_linkinfo => {
+            // KIND is read first; DATA is interpreted only once the kind is
+            // known, whatever order the two arrive in.
+            var info_data: ?[]const u8 = null;
+            var li = a.nested();
+            while (try li.next()) |ia| switch (ia.type) {
+                IFLA_INFO.KIND => {
+                    const k = ia.asString();
+                    if (k.len <= l.kind_buf.len) {
+                        @memcpy(l.kind_buf[0..k.len], k);
+                        l.kind_len = @intCast(k.len);
+                    }
+                },
+                IFLA_INFO.DATA => info_data = ia.data,
+                else => {},
+            };
+            if (info_data) |d| if (std.mem.eql(u8, l.kind(), "vlan")) {
+                var vi: codec.AttrIterator = .{ .buf = d };
+                while (try vi.next()) |va| switch (va.type) {
+                    IFLA_VLAN.ID => l.vlan_id = try va.asU16(),
+                    // __be16 on the wire (`802.1ad` → 88 a8).
+                    IFLA_VLAN.PROTOCOL => l.vlan_protocol = std.mem.bigToNative(u16, try va.asU16()),
+                    else => {},
+                };
+            };
+        },
         else => {},
     };
     return l;
@@ -645,6 +821,142 @@ pub fn parseNeighbor(payload: []const u8) codec.Error!?Neighbor {
     return n;
 }
 
+/// One policy-routing rule (`RTM_GETRULE` → struct fib_rule_hdr + FRA_*).
+pub const Rule = struct {
+    family: u8,
+    /// Selector prefix lengths (0 = "from all" / "to all").
+    src_len: u8,
+    dst_len: u8,
+    tos: u8,
+    /// `RuleAction` value (1 = lookup a table).
+    action: u8,
+    /// `FIB_RULE_*` flags (`FIB_RULE_INVERT` = `not`).
+    flags: u32,
+    /// Table id: `FRA_TABLE` when present, else the u8 in the header.
+    table: u32,
+    /// Rule preference (`ip rule … priority`); 0 for the `local` rule.
+    priority: u32 = 0,
+    fwmark: ?u32 = null,
+    fwmask: ?u32 = null,
+    src: [16]u8 = @splat(0),
+    src_addr_len: u8 = 0,
+    dst: [16]u8 = @splat(0),
+    dst_addr_len: u8 = 0,
+    iif_buf: [ifnamsiz]u8 = @splat(0),
+    iif_len: u8 = 0,
+    oif_buf: [ifnamsiz]u8 = @splat(0),
+    oif_len: u8 = 0,
+
+    pub fn srcBytes(r: *const Rule) []const u8 {
+        return r.src[0..r.src_addr_len];
+    }
+    pub fn dstBytes(r: *const Rule) []const u8 {
+        return r.dst[0..r.dst_addr_len];
+    }
+    pub fn iifname(r: *const Rule) []const u8 {
+        return r.iif_buf[0..r.iif_len];
+    }
+    pub fn oifname(r: *const Rule) []const u8 {
+        return r.oif_buf[0..r.oif_len];
+    }
+};
+
+/// Parse an RTM_NEWRULE payload (struct fib_rule_hdr + FRA_* attributes).
+pub fn parseRule(payload: []const u8) codec.Error!?Rule {
+    if (payload.len < fib_rule_hdr_len) return error.Truncated;
+    var r: Rule = .{
+        .family = payload[0],
+        .dst_len = payload[1],
+        .src_len = payload[2],
+        .tos = payload[3],
+        .table = payload[4],
+        .action = payload[7],
+        .flags = std.mem.readInt(u32, payload[8..12], native_endian),
+    };
+    var it: codec.AttrIterator = .{ .buf = payload[fib_rule_hdr_len..] };
+    while (try it.next()) |a| switch (a.type) {
+        FRA.SRC => if (ipLen(a.data.len)) {
+            @memcpy(r.src[0..a.data.len], a.data);
+            r.src_addr_len = @intCast(a.data.len);
+        },
+        FRA.DST => if (ipLen(a.data.len)) {
+            @memcpy(r.dst[0..a.data.len], a.data);
+            r.dst_addr_len = @intCast(a.data.len);
+        },
+        FRA.IIFNAME => {
+            const n = a.asString();
+            if (n.len > r.iif_buf.len) return error.BadLength;
+            @memcpy(r.iif_buf[0..n.len], n);
+            r.iif_len = @intCast(n.len);
+        },
+        FRA.OIFNAME => {
+            const n = a.asString();
+            if (n.len > r.oif_buf.len) return error.BadLength;
+            @memcpy(r.oif_buf[0..n.len], n);
+            r.oif_len = @intCast(n.len);
+        },
+        FRA.PRIORITY => r.priority = try a.asU32(),
+        FRA.FWMARK => r.fwmark = try a.asU32(),
+        FRA.FWMASK => r.fwmask = try a.asU32(),
+        FRA.TABLE => r.table = try a.asU32(),
+        else => {},
+    };
+    return r;
+}
+
+// ── multicast events (`ip monitor`) ─────────────────────────────────────────
+
+/// One rtnetlink notification, decoded with the same parsers the dumps use.
+pub const Event = union(enum) {
+    link_new: Link,
+    link_del: Link,
+    addr_new: Address,
+    addr_del: Address,
+    route_new: Route,
+    route_del: Route,
+    neigh_new: Neighbor,
+    neigh_del: Neighbor,
+    rule_new: Rule,
+    rule_del: Rule,
+};
+
+/// Decode one message of a monitor stream. Null for a message type that is
+/// not an event this module models (`NLMSG_DONE`, `RTM_NEWQDISC`, …) and for
+/// a degenerate entry the matching parser skips (an address without one).
+/// A malformed event is an error, exactly as in a dump.
+pub fn parseEvent(m: codec.Message) codec.Error!?Event {
+    return switch (m.type) {
+        RTM_NEWLINK => if (try parseLink(m.payload)) |v| .{ .link_new = v } else null,
+        RTM_DELLINK => if (try parseLink(m.payload)) |v| .{ .link_del = v } else null,
+        RTM_NEWADDR => if (try parseAddress(m.payload)) |v| .{ .addr_new = v } else null,
+        RTM_DELADDR => if (try parseAddress(m.payload)) |v| .{ .addr_del = v } else null,
+        RTM_NEWROUTE => if (try parseRoute(m.payload)) |v| .{ .route_new = v } else null,
+        RTM_DELROUTE => if (try parseRoute(m.payload)) |v| .{ .route_del = v } else null,
+        RTM_NEWNEIGH => if (try parseNeighbor(m.payload)) |v| .{ .neigh_new = v } else null,
+        RTM_DELNEIGH => if (try parseNeighbor(m.payload)) |v| .{ .neigh_del = v } else null,
+        RTM_NEWRULE => if (try parseRule(m.payload)) |v| .{ .rule_new = v } else null,
+        RTM_DELRULE => if (try parseRule(m.payload)) |v| .{ .rule_del = v } else null,
+        else => null,
+    };
+}
+
+/// The events in one received datagram (`Socket.recvEvents`). Borrows the
+/// datagram: finish iterating before the next receive.
+pub const EventIterator = struct {
+    msgs: codec.MessageIterator,
+
+    pub fn init(datagram: []const u8) EventIterator {
+        return .{ .msgs = .{ .buf = datagram } };
+    }
+
+    pub fn next(it: *EventIterator) codec.Error!?Event {
+        while (try it.msgs.next()) |m| {
+            if (try parseEvent(m)) |e| return e;
+        }
+        return null;
+    }
+};
+
 /// True for the two IP payload sizes rtnetlink carries. Attributes with any
 /// other length are ignored rather than rejected (defensive: kernels never
 /// send them, and dropping one odd attribute beats failing a whole dump).
@@ -667,6 +979,11 @@ fn matchAddress(a: Address, f: Filter) bool {
 fn matchRoute(r: Route, f: Filter) bool {
     if (f.family) |fam| if (r.family != fam) return false;
     if (f.ifindex) |ifi| if (r.oif != ifi) return false;
+    return true;
+}
+
+fn matchRule(r: Rule, f: Filter) bool {
+    if (f.family) |fam| if (r.family != fam) return false;
     return true;
 }
 
@@ -824,6 +1141,63 @@ pub const LinkAddSpec = struct {
     /// Bring the device up in the same request (`ifi_flags`/`ifi_change` =
     /// IFF_UP).
     up: bool = false,
+    /// `IFLA_LINK` — the lower device. Required for a "vlan".
+    parent: ?u32 = null,
+    /// Kind-specific `IFLA_INFO_DATA`; must agree with `kind`
+    /// (`error.KindDataMismatch`).
+    kind_data: KindData = .none,
+};
+
+/// `IFLA_INFO_DATA` for the kinds this module models.
+pub const KindData = union(enum) {
+    none,
+    /// `ip link add <name> type veth peer name <peer>` — both ends are
+    /// created by the one request.
+    veth: struct { peer: []const u8 },
+    /// `ip link add link <parent> name <name> type vlan id <id> [protocol …]`.
+    /// `id` is 0…4094 (4095 is reserved, 802.1Q §9.6); null `protocol` lets
+    /// the kernel default to 802.1Q, as `ip` does when none is given.
+    vlan: struct { id: u16, protocol: ?VlanProtocol = null },
+
+    fn kindName(d: KindData) ?[]const u8 {
+        return switch (d) {
+            .none => null,
+            .veth => "veth",
+            .vlan => "vlan",
+        };
+    }
+};
+
+/// VLAN tag protocol (the TPID), host order.
+pub const VlanProtocol = enum(u16) {
+    dot1q = 0x8100,
+    dot1ad = 0x88a8,
+};
+
+/// A policy-routing rule for `Socket.ruleAdd`/`ruleDel` (`ip rule`).
+pub const RuleSpec = struct {
+    /// AF.INET/AF.INET6; derived from `src`/`dst` when null, required when
+    /// neither is given (`ip` defaults to IPv4 there; this module asks).
+    family: ?u8 = null,
+    /// `from <src>/<src_len>`; `src_len` defaults to the full address.
+    src: ?[]const u8 = null,
+    src_len: ?u8 = null,
+    /// `to <dst>/<dst_len>`.
+    dst: ?[]const u8 = null,
+    dst_len: ?u8 = null,
+    iifname: ?[]const u8 = null,
+    oifname: ?[]const u8 = null,
+    fwmark: ?u32 = null,
+    fwmask: ?u32 = null,
+    /// `priority` (the rule's preference); the kernel picks one when null.
+    priority: ?u32 = null,
+    /// `table`/`lookup`. ≤ 255 travels in the header, larger in `FRA_TABLE`.
+    table: ?u32 = null,
+    /// Null: `to_table` for an add (what `ip rule add … table` sends), and
+    /// "any" (0) for a delete, which matches on the fields given.
+    action: ?RuleAction = null,
+    /// `not` — invert the selector.
+    invert: bool = false,
 };
 
 /// A neighbour (ARP/NDP) entry for `Socket.neighborAdd`/`.neighborDel`
@@ -939,6 +1313,14 @@ pub const BuildError = error{
     /// A `LinkChange` that would change nothing (empty `ifi_change`, no
     /// attributes) — rejected rather than sent as a silent no-op.
     NothingToChange,
+    /// A prefix length longer than its address (`/33` on IPv4).
+    InvalidPrefixLength,
+    /// A VLAN id above 4094.
+    InvalidVlanId,
+    /// A kind that needs a lower device ("vlan") was given no `parent`.
+    ParentRequired,
+    /// `LinkAddSpec.kind_data` describes a different kind than `kind`.
+    KindDataMismatch,
     /// A nested attribute grew past what an `nlattr` length can express
     /// (65535 bytes), so the request cannot be sent as one message. Raised by
     /// `codec.nestEnd`; see its doc comment for why refusing beats truncating.
@@ -1147,6 +1529,15 @@ fn buildLinkAddRequest(
     try checkName(spec.name);
     try checkName(spec.kind);
     if (spec.mac) |m| try checkLinkAddr(m);
+    if (spec.kind_data.kindName()) |k| if (!std.mem.eql(u8, k, spec.kind)) return error.KindDataMismatch;
+    switch (spec.kind_data) {
+        .none => {},
+        .veth => |v| try checkName(v.peer),
+        .vlan => |v| {
+            if (v.id > 4094) return error.InvalidVlanId;
+            if (spec.parent == null) return error.ParentRequired;
+        },
+    }
 
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -1154,11 +1545,36 @@ fn buildLinkAddRequest(
     const up_bit: u32 = if (spec.up) IFF.UP else 0;
     try appendIfinfomsg(gpa, &list, 0, up_bit, up_bit);
 
+    // `ip link add link zv0 name zv0.10 type vlan id 10` sends IFLA_LINK
+    // before IFLA_IFNAME (captured; see the test).
+    if (spec.parent) |p| try codec.appendAttrU32(gpa, &list, IFLA_LINK, p);
     try appendAttrStringChecked(gpa, &list, ifla_ifname, spec.name);
     if (spec.mtu) |m| try codec.appendAttrU32(gpa, &list, ifla_mtu, m);
     if (spec.mac) |m| try appendAttrChecked(gpa, &list, ifla_address, m);
     const nest = try codec.nestBegin(gpa, &list, ifla_linkinfo);
     try appendAttrStringChecked(gpa, &list, IFLA_INFO.KIND, spec.kind);
+    switch (spec.kind_data) {
+        .none => {},
+        .veth => |v| {
+            // VETH_INFO_PEER carries a whole peer link request body: a zeroed
+            // ifinfomsg, then the peer's IFLA_IFNAME. `ip` sets no
+            // NLA_F_NESTED on either level, and neither does this.
+            const data = try codec.nestBegin(gpa, &list, IFLA_INFO.DATA);
+            const peer = try codec.nestBegin(gpa, &list, VETH_INFO_PEER);
+            try appendIfinfomsg(gpa, &list, 0, 0, 0);
+            try appendAttrStringChecked(gpa, &list, ifla_ifname, v.peer);
+            try codec.nestEnd(&list, peer);
+            try codec.nestEnd(&list, data);
+        },
+        .vlan => |v| {
+            const data = try codec.nestBegin(gpa, &list, IFLA_INFO.DATA);
+            // PROTOCOL (when given) precedes ID, and is __be16 (captured
+            // `protocol 802.1ad` → 88 a8).
+            if (v.protocol) |pr| try codec.appendAttrBe16(gpa, &list, IFLA_VLAN.PROTOCOL, @intFromEnum(pr));
+            try codec.appendAttrU16(gpa, &list, IFLA_VLAN.ID, v.id);
+            try codec.nestEnd(&list, data);
+        },
+    }
     try codec.nestEnd(&list, nest);
 
     codec.finishHeader(&list, hdr);
@@ -1179,6 +1595,56 @@ fn buildLinkDelRequest(gpa: std.mem.Allocator, seq: u32, ifindex: u32) BuildErro
         0,
     );
     try appendIfinfomsg(gpa, &list, ifindex, 0, 0);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build an `RTM_NEWRULE`/`RTM_DELRULE` request: nlmsghdr | fib_rule_hdr |
+/// FRA_SRC | FRA_DST | FRA_IIFNAME | FRA_OIFNAME | FRA_FWMARK | FRA_FWMASK |
+/// FRA_PRIORITY | FRA_TABLE (each only when set). Verified against
+/// `strace -e sendmsg ip rule add …` / `ip rule del priority …`.
+fn buildRuleRequest(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    msg_type: u16,
+    flags: u16,
+    spec: RuleSpec,
+) BuildError![]u8 {
+    var fam = try mergeFamily(null, spec.src);
+    fam = try mergeFamily(fam, spec.dst);
+    if (spec.family) |f| {
+        if (fam) |d| if (d != f) return error.MixedFamilies;
+        fam = f;
+    }
+    const family = fam orelse return error.FamilyRequired;
+    const max_len: u8 = if (family == AF.INET6) 128 else 32;
+    const src_len: u8 = if (spec.src) |_| spec.src_len orelse max_len else 0;
+    const dst_len: u8 = if (spec.dst) |_| spec.dst_len orelse max_len else 0;
+    if (src_len > max_len or dst_len > max_len) return error.InvalidPrefixLength;
+    if (spec.iifname) |n| try checkName(n);
+    if (spec.oifname) |n| try checkName(n);
+    const table = spec.table orelse 0;
+    const default_action: u8 = if (msg_type == RTM_NEWRULE) @intFromEnum(RuleAction.to_table) else 0;
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, msg_type, flags, seq, 0);
+    var fixed: [fib_rule_hdr_len]u8 = @splat(0);
+    fixed[0] = family;
+    fixed[1] = dst_len;
+    fixed[2] = src_len;
+    fixed[4] = if (table <= 255) @intCast(table) else @intCast(RT_TABLE.UNSPEC);
+    fixed[7] = if (spec.action) |a| @intFromEnum(a) else default_action;
+    std.mem.writeInt(u32, fixed[8..12], if (spec.invert) FIB_RULE_INVERT else 0, native_endian);
+    try codec.appendPadded(gpa, &list, &fixed);
+    if (spec.src) |a| try codec.appendAttr(gpa, &list, FRA.SRC, a);
+    if (spec.dst) |a| try codec.appendAttr(gpa, &list, FRA.DST, a);
+    if (spec.iifname) |n| try appendAttrStringChecked(gpa, &list, FRA.IIFNAME, n);
+    if (spec.oifname) |n| try appendAttrStringChecked(gpa, &list, FRA.OIFNAME, n);
+    if (spec.fwmark) |m| try codec.appendAttrU32(gpa, &list, FRA.FWMARK, m);
+    if (spec.fwmask) |m| try codec.appendAttrU32(gpa, &list, FRA.FWMASK, m);
+    if (spec.priority) |p| try codec.appendAttrU32(gpa, &list, FRA.PRIORITY, p);
+    if (table > 255) try codec.appendAttrU32(gpa, &list, FRA.TABLE, table);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -1668,8 +2134,8 @@ pub const Socket = struct {
     }
 
     /// Create a virtual device of the given kind ("dummy", "veth", "bridge",
-    /// "vlan"…) — `RTM_NEWLINK` with `NLM_F_CREATE` + `IFLA_LINKINFO`.
-    /// Kind-specific `IFLA_INFO_DATA` payloads are out of scope for now.
+    /// "vlan"…) — `RTM_NEWLINK` with `NLM_F_CREATE` + `IFLA_LINKINFO`, plus
+    /// the kind's `IFLA_INFO_DATA` for a veth peer or a VLAN (`KindData`).
     pub fn linkAdd(self: *Socket, spec: LinkAddSpec, opts: Create) WriteError!void {
         return self.writeOp(try buildLinkAddRequest(
             self.gpa,
@@ -1677,6 +2143,44 @@ pub const Socket = struct {
             opts.flags(),
             spec,
         ));
+    }
+
+    /// Add a policy-routing rule (`ip rule add`, `RTM_NEWRULE`).
+    pub fn ruleAdd(self: *Socket, spec: RuleSpec, opts: Create) WriteError!void {
+        return self.writeOp(try buildRuleRequest(self.gpa, self.nextSeq(), RTM_NEWRULE, opts.flags(), spec));
+    }
+
+    /// Delete the first rule matching every field `spec` sets (`ip rule del`).
+    pub fn ruleDel(self: *Socket, spec: RuleSpec) WriteError!void {
+        return self.writeOp(try buildRuleRequest(
+            self.gpa,
+            self.nextSeq(),
+            RTM_DELRULE,
+            codec.NLM_F_REQUEST | codec.NLM_F_ACK,
+            spec,
+        ));
+    }
+
+    /// Dump the policy-routing rules (`ip rule show`). `filter.family`
+    /// selects IPv4 or IPv6 kernel-side; AF_UNSPEC (null) returns both.
+    pub fn rules(self: *Socket, filter: Filter) DumpError![]Rule {
+        return self.dump(Rule, parseRule, matchRule, RTM_GETRULE, RTM_NEWRULE, fib_rule_hdr_len, filter);
+    }
+
+    /// An rtnetlink socket subscribed to `mask` (`rtnlGroupMask`) — what
+    /// `ip monitor` opens. Read it with `recvEvents`. Needs no privilege for
+    /// the groups in `RTNLGRP`.
+    pub fn openMonitor(gpa: std.mem.Allocator, mask: u32) OpenError!Socket {
+        return openProtocolGroups(gpa, linux.NETLINK.ROUTE, mask);
+    }
+
+    /// Block for the next notification datagram and iterate its events.
+    /// `error.Overrun` means the kernel dropped notifications (the socket
+    /// buffer filled): the caller's view is stale and must be rebuilt with a
+    /// dump — exactly what `ip monitor` reports as "lost". The iterator
+    /// borrows the receive buffer until the next receive.
+    pub fn recvEvents(self: *Socket) StrictRecvError!EventIterator {
+        return EventIterator.init(try self.recvDatagramStrict());
     }
 
     /// Delete an interface by index (`RTM_DELLINK`) — virtual devices only;
@@ -4676,6 +5180,610 @@ fn expectWriteError(expected: anyerror, actual: WriteError!void) !void {
             return error.TestWrongWriteError;
         }
     }
+}
+
+// ── 2026-10-04: kind data, rules, stats, events ─────────────────────────────
+// Expected request bytes below are rebuilt from `strace -e sendmsg` of
+// iproute2 (`unshare -rn`, Linux 7.0, 2026-10-04): strace decoded every field
+// (`{ifi_family=AF_UNSPEC, …}`, `[{nla_len=8, nla_type=IFLA_LINK}, 3]`, the
+// raw `IFLA_INFO_DATA` bytes), and each line below is one of those fields.
+// nlmsg_seq is 1 here; `ip` used a time-derived one.
+
+test "build: veth == `ip link add zv0 type veth peer name zv1`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildLinkAddRequest(testing.allocator, 1, (Create{}).flags(), .{
+        .name = "zv0",
+        .kind = "veth",
+        .kind_data = .{ .veth = .{ .peer = "zv1" } },
+    });
+    defer testing.allocator.free(req);
+    try expectRequestBytes(req, &(.{
+        0x58, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06, // len 88, RTM_NEWLINK, REQ|ACK|EXCL|CREATE
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // seq, pid
+    } ++ [_]u8{0} ** 16 ++ .{ // ifinfomsg, all zero
+        0x08, 0x00, 0x03, 0x00, 'z', 'v', '0', 0x00, // IFLA_IFNAME
+        0x30, 0x00, 0x12, 0x00, // IFLA_LINKINFO, 48
+        0x09, 0x00, 0x01, 0x00, 'v', 'e', 't', 'h', 0x00, 0x00, 0x00, 0x00, // IFLA_INFO_KIND
+        0x20, 0x00, 0x02, 0x00, // IFLA_INFO_DATA, 32
+        0x1c, 0x00, 0x01, 0x00, // VETH_INFO_PEER, 28 (no NLA_F_NESTED, as `ip` sends it)
+    } ++ [_]u8{0} ** 16 ++ .{ // the peer's ifinfomsg
+        0x08, 0x00, 0x03, 0x00, 'z', 'v', '1', 0x00, // the peer's IFLA_IFNAME
+    }));
+}
+
+test "build: vlan == `ip link add link zv0 name zv0.10 type vlan id 10` (zv0 = 3)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildLinkAddRequest(testing.allocator, 1, (Create{}).flags(), .{
+        .name = "zv0.10",
+        .kind = "vlan",
+        .parent = 3,
+        .kind_data = .{ .vlan = .{ .id = 10 } },
+    });
+    defer testing.allocator.free(req);
+    try expectRequestBytes(req, &(.{
+        0x50, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    } ++ [_]u8{0} ** 16 ++ .{
+        0x08, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00, // IFLA_LINK = 3, BEFORE the name
+        0x0b, 0x00, 0x03, 0x00, 'z', 'v', '0', '.', '1', '0', 0x00, 0x00, // IFLA_IFNAME
+        0x1c, 0x00, 0x12, 0x00, // IFLA_LINKINFO, 28
+        0x09, 0x00, 0x01, 0x00,
+        'v',  'l',  'a',  'n',
+        0x00, 0x00, 0x00, 0x00,
+        0x0c, 0x00, 0x02, 0x00, // IFLA_INFO_DATA
+        0x06, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x00, 0x00, // IFLA_VLAN_ID = 10 (host u16)
+    }));
+}
+
+test "build: vlan 802.1ad == `… type vlan protocol 802.1ad id 20`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildLinkAddRequest(testing.allocator, 1, (Create{}).flags(), .{
+        .name = "zv0.20",
+        .kind = "vlan",
+        .parent = 3,
+        .kind_data = .{ .vlan = .{ .id = 20, .protocol = .dot1ad } },
+    });
+    defer testing.allocator.free(req);
+    try expectRequestBytes(req, &(.{
+        0x58, 0x00, 0x00, 0x00, 0x10, 0x00, 0x05, 0x06,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    } ++ [_]u8{0} ** 16 ++ .{
+        0x08, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x0b, 0x00, 0x03, 0x00, 'z',  'v',  '0',  '.',
+        '2',  '0',  0x00, 0x00,
+        0x24, 0x00, 0x12, 0x00, // IFLA_LINKINFO, 36
+        0x09, 0x00, 0x01, 0x00,
+        'v',  'l',  'a',  'n',
+        0x00, 0x00, 0x00, 0x00,
+        0x14, 0x00, 0x02, 0x00, // IFLA_INFO_DATA, 20
+        0x06, 0x00, 0x05, 0x00, 0x88, 0xa8, 0x00, 0x00, // IFLA_VLAN_PROTOCOL, __be16 0x88a8
+        0x06, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00, // IFLA_VLAN_ID = 20
+    }));
+}
+
+test "build: kind data is validated before anything is sent" {
+    const gpa = testing.allocator;
+    const f = (Create{}).flags();
+    // 4095 is reserved (802.1Q); the kernel's own check is `id >= 0xfff`.
+    try testing.expectError(error.InvalidVlanId, buildLinkAddRequest(gpa, 1, f, .{
+        .name = "v",
+        .kind = "vlan",
+        .parent = 3,
+        .kind_data = .{ .vlan = .{ .id = 4095 } },
+    }));
+    // …while 4094 is the last valid id.
+    const ok = try buildLinkAddRequest(gpa, 1, f, .{
+        .name = "v",
+        .kind = "vlan",
+        .parent = 3,
+        .kind_data = .{ .vlan = .{ .id = 4094 } },
+    });
+    gpa.free(ok);
+    try testing.expectError(error.ParentRequired, buildLinkAddRequest(gpa, 1, f, .{
+        .name = "v",
+        .kind = "vlan",
+        .kind_data = .{ .vlan = .{ .id = 1 } },
+    }));
+    try testing.expectError(error.KindDataMismatch, buildLinkAddRequest(gpa, 1, f, .{
+        .name = "v",
+        .kind = "dummy",
+        .kind_data = .{ .veth = .{ .peer = "p" } },
+    }));
+    try testing.expectError(error.InvalidName, buildLinkAddRequest(gpa, 1, f, .{
+        .name = "v",
+        .kind = "veth",
+        .kind_data = .{ .veth = .{ .peer = "a-name-too-long!" } },
+    }));
+}
+
+fn ruleReq(spec: RuleSpec) ![]u8 {
+    return buildRuleRequest(testing.allocator, 1, RTM_NEWRULE, (Create{}).flags(), spec);
+}
+
+test "build: RTM_NEWRULE == `ip rule add from 10.0.0.0/8 table 100 priority 1000`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .src_len = 8, .table = 100, .priority = 1000 });
+    defer testing.allocator.free(req);
+    try expectRequestBytes(req, &.{
+        0x2c, 0x00, 0x00, 0x00, 0x20, 0x00, 0x05, 0x06, // len 44, RTM_NEWRULE (32)
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x08, 0x00, 0x64, 0x00, 0x00, 0x01, // AF_INET, dst 0, src /8, tos 0, table 100, action TO_TBL
+        0x00, 0x00, 0x00, 0x00, // flags
+        0x08, 0x00, 0x02, 0x00, 10, 0, 0, 0, // FRA_SRC
+        0x08, 0x00, 0x06, 0x00, 0xe8, 0x03, 0x00, 0x00, // FRA_PRIORITY 1000
+    });
+}
+
+test "build: rule selectors == `ip rule add to …/24 lookup 200`, `fwmark 0x10`, `iif zv0`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const to = try ruleReq(.{ .dst = &.{ 192, 0, 2, 0 }, .dst_len = 24, .table = 200, .priority = 1001 });
+    defer testing.allocator.free(to);
+    try testing.expectEqualSlices(u8, &.{
+        0x02, 0x18, 0x00, 0x00, 0xc8, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x01, 0x00, 192,  0,    2,    0, // FRA_DST
+        0x08, 0x00, 0x06, 0x00, 0xe9, 0x03, 0x00, 0x00,
+    }, to[16..]);
+    const fw = try ruleReq(.{ .family = AF.INET, .fwmark = 0x10, .table = 101, .priority = 1002 });
+    defer testing.allocator.free(fw);
+    try testing.expectEqualSlices(u8, &.{
+        0x02, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x0a, 0x00, 0x10, 0x00, 0x00, 0x00, // FRA_FWMARK
+        0x08, 0x00, 0x06, 0x00, 0xea, 0x03, 0x00, 0x00,
+    }, fw[16..]);
+    const iif = try ruleReq(.{ .family = AF.INET, .iifname = "zv0", .table = 102, .priority = 1003 });
+    defer testing.allocator.free(iif);
+    try testing.expectEqualSlices(u8, &.{
+        0x02, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x03, 0x00, 'z',  'v',  '0',  0x00, // FRA_IIFNAME
+        0x08, 0x00, 0x06, 0x00, 0xeb, 0x03, 0x00, 0x00,
+    }, iif[16..]);
+}
+
+test "build: IPv6 rule == `ip -6 rule add from 2001:db8::/32 table 103 priority 1004`" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const req = try ruleReq(.{ .src = &a, .src_len = 32, .table = 103, .priority = 1004 });
+    defer testing.allocator.free(req);
+    try expectRequestBytes(req, &(.{
+        0x38, 0x00, 0x00, 0x00, 0x20, 0x00, 0x05, 0x06,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0a, 0x00, 0x20, 0x00, 0x67, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // AF_INET6, src /32
+        0x14, 0x00, 0x02, 0x00,
+    } ++ a ++ .{ 0x08, 0x00, 0x06, 0x00, 0xec, 0x03, 0x00, 0x00 }));
+}
+
+test "build: RTM_DELRULE == `ip rule del priority 1000` (action and table 0 = any)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildRuleRequest(testing.allocator, 1, RTM_DELRULE, codec.NLM_F_REQUEST | codec.NLM_F_ACK, .{
+        .family = AF.INET,
+        .priority = 1000,
+    });
+    defer testing.allocator.free(req);
+    // The captured hex dump, byte for byte (seq aside).
+    try expectRequestBytes(req, &.{
+        0x24, 0x00, 0x00, 0x00, 0x21, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x06, 0x00,
+        0xe8, 0x03, 0x00, 0x00,
+    });
+}
+
+test "build: rule table > 255 moves to FRA_TABLE; bad specs are refused" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try ruleReq(.{ .family = AF.INET, .table = 1000, .invert = true, .fwmark = 1, .fwmask = 0xff });
+    defer testing.allocator.free(req);
+    try testing.expectEqual(@as(u8, 0), req[16 + 4]); // header table = RT_TABLE_UNSPEC
+    try testing.expectEqual(FIB_RULE_INVERT, std.mem.readInt(u32, req[24..28], native_endian));
+    const r = (try parseRule(req[16..])).?;
+    try testing.expectEqual(@as(u32, 1000), r.table);
+    try testing.expectEqual(@as(?u32, 0xff), r.fwmask);
+    try testing.expectEqual(FIB_RULE_INVERT, r.flags);
+    // Same 255/256 split as routes: 255 still fits the header.
+    const t255 = try ruleReq(.{ .family = AF.INET, .table = 255 });
+    defer testing.allocator.free(t255);
+    try testing.expectEqual(@as(u8, 255), t255[16 + 4]);
+    try testing.expectEqual(@as(usize, 16 + 12), t255.len);
+
+    try testing.expectError(error.FamilyRequired, ruleReq(.{ .table = 100 }));
+    try testing.expectError(error.InvalidPrefixLength, ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .src_len = 33 }));
+    try testing.expectError(error.InvalidPrefixLength, ruleReq(.{ .dst = &([_]u8{0} ** 16), .dst_len = 129 }));
+    try testing.expectError(error.MixedFamilies, ruleReq(.{ .family = AF.INET6, .src = &.{ 10, 0, 0, 0 } }));
+    try testing.expectError(error.MixedFamilies, ruleReq(.{ .src = &.{ 10, 0, 0, 0 }, .dst = &([_]u8{0} ** 16) }));
+    try testing.expectError(error.InvalidName, ruleReq(.{ .family = AF.INET, .oifname = "" }));
+    // A /32 default: `from 10.1.2.3` with no length means the one host.
+    const host = try ruleReq(.{ .src = &.{ 10, 1, 2, 3 } });
+    defer testing.allocator.free(host);
+    try testing.expectEqual(@as(u8, 32), host[16 + 2]);
+}
+
+test "parseRule: every selector reads back; hostile lengths are refused" {
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const req = try ruleReq(.{
+        .dst = &a,
+        .dst_len = 48,
+        .iifname = "eth0",
+        .oifname = "wg0",
+        .fwmark = 7,
+        .priority = 42,
+        .table = 9,
+        .action = .blackhole,
+    });
+    defer testing.allocator.free(req);
+    const r = (try parseRule(req[16..])).?;
+    try testing.expectEqual(AF.INET6, r.family);
+    try testing.expectEqual(@as(u8, 48), r.dst_len);
+    try testing.expectEqualSlices(u8, &a, r.dstBytes());
+    try testing.expectEqualStrings("eth0", r.iifname());
+    try testing.expectEqualStrings("wg0", r.oifname());
+    try testing.expectEqual(@as(?u32, 7), r.fwmark);
+    try testing.expectEqual(@as(u32, 42), r.priority);
+    try testing.expectEqual(@as(u32, 9), r.table);
+    try testing.expectEqual(@intFromEnum(RuleAction.blackhole), r.action);
+    try testing.expectEqual(@as(usize, 0), r.srcBytes().len);
+
+    try testing.expectError(error.Truncated, parseRule(&.{ 2, 0, 0 }));
+    // FRA_PRIORITY with a 2-byte value.
+    const bad = [_]u8{0} ** 12 ++ [_]u8{ 0x06, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    try testing.expectError(error.BadLength, parseRule(&bad));
+    // An IIFNAME longer than IFNAMSIZ.
+    const long = [_]u8{0} ** 12 ++ [_]u8{ 0x18, 0x00, 0x03, 0x00 } ++ [_]u8{'x'} ** 20;
+    try testing.expectError(error.BadLength, parseRule(&long));
+}
+
+/// An RTM_NEWLINK payload: ifinfomsg + the given attribute bytes.
+fn linkPayload(buf: *[256]u8, attrs: []const u8) []const u8 {
+    @memset(buf, 0);
+    std.mem.writeInt(i32, buf[4..8], 7, native_endian);
+    @memcpy(buf[ifinfomsg_len..][0..attrs.len], attrs);
+    return buf[0 .. ifinfomsg_len + attrs.len];
+}
+
+test "parseLink: kind, vlan data, parent, master, operstate and stats64" {
+    if (native_endian != .little) return error.SkipZigTest;
+    var stats: [LinkStats.wire_len + 8]u8 = @splat(0); // longer than decoded: newer kernels append
+    for (0..10) |i| std.mem.writeInt(u64, stats[i * 8 ..][0..8], 100 + i, .little);
+    const attrs = [_]u8{
+        0x08, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00, // IFLA_LINK = 3
+        0x08, 0x00, 0x0a, 0x00, 0x09, 0x00, 0x00, 0x00, // IFLA_MASTER = 9
+        0x05, 0x00, 0x10, 0x00, 0x06, 0x00, 0x00, 0x00, // IFLA_OPERSTATE = UP
+        0x24, 0x00, 0x12, 0x80, // IFLA_LINKINFO (kernel sets NLA_F_NESTED), 36
+        0x09, 0x00, 0x01, 0x00,
+        'v',  'l',  'a',  'n',
+        0x00, 0x00, 0x00, 0x00,
+        0x14, 0x00, 0x02, 0x80,
+        0x06, 0x00, 0x05, 0x00,
+        0x88, 0xa8, 0x00, 0x00,
+        0x06, 0x00, 0x01, 0x00,
+        0x14, 0x00, 0x00, 0x00,
+        0x5c, 0x00, 0x17, 0x00, // IFLA_STATS64, 4 + 88
+    } ++ stats;
+    var pb: [256]u8 = undefined;
+    const l = (try parseLink(linkPayload(&pb, &attrs))).?;
+    try testing.expectEqual(@as(u32, 3), l.parent);
+    try testing.expectEqual(@as(u32, 9), l.master);
+    try testing.expectEqual(IF_OPER.UP, l.operstate);
+    try testing.expectEqualStrings("vlan", l.kind());
+    try testing.expectEqual(@as(?u16, 20), l.vlan_id);
+    try testing.expectEqual(@as(?u16, 0x88a8), l.vlan_protocol);
+    // rtnl_link_stats64 order: rx_packets, tx_packets, rx_bytes, tx_bytes,
+    // rx_errors, tx_errors, rx_dropped, tx_dropped, multicast, collisions.
+    const st = l.stats.?;
+    try testing.expectEqual(@as(u64, 100), st.rx_packets);
+    try testing.expectEqual(@as(u64, 101), st.tx_packets);
+    try testing.expectEqual(@as(u64, 102), st.rx_bytes);
+    try testing.expectEqual(@as(u64, 103), st.tx_bytes);
+    try testing.expectEqual(@as(u64, 104), st.rx_errors);
+    try testing.expectEqual(@as(u64, 105), st.tx_errors);
+    try testing.expectEqual(@as(u64, 106), st.rx_dropped);
+    try testing.expectEqual(@as(u64, 107), st.tx_dropped);
+    try testing.expectEqual(@as(u64, 108), st.multicast);
+    try testing.expectEqual(@as(u64, 109), st.collisions);
+}
+
+test "parseLink: vlan data of another kind is ignored; short stats are refused" {
+    var pb: [256]u8 = undefined;
+    // A "veth" whose INFO_DATA happens to hold type-1 attributes must not be
+    // read as a VLAN id.
+    const veth = [_]u8{
+        0x1c, 0x00, 0x12, 0x00,
+        0x09, 0x00, 0x01, 0x00,
+        'v',  'e',  't',  'h',
+        0x00, 0x00, 0x00, 0x00,
+        0x0c, 0x00, 0x02, 0x00,
+        0x06, 0x00, 0x01, 0x00,
+        0x0a, 0x00, 0x00, 0x00,
+    };
+    const lv = (try parseLink(linkPayload(&pb, &veth))).?;
+    try testing.expectEqualStrings("veth", lv.kind());
+    try testing.expectEqual(@as(?u16, null), lv.vlan_id);
+    // DATA before KIND still decodes (the kind is applied after the walk).
+    const swapped = [_]u8{
+        0x1c, 0x00, 0x12, 0x00,
+        0x0c, 0x00, 0x02, 0x00,
+        0x06, 0x00, 0x01, 0x00,
+        0x0a, 0x00, 0x00, 0x00,
+        0x09, 0x00, 0x01, 0x00,
+        'v',  'l',  'a',  'n',
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const ls = (try parseLink(linkPayload(&pb, &swapped))).?;
+    try testing.expectEqual(@as(?u16, 10), ls.vlan_id);
+    // Exactly the ten decoded counters (80 bytes) is enough — the bound is
+    // what is READ, not the size of today's struct (mutation 2026-10-04).
+    const exact = [_]u8{ 0x54, 0x00, 0x17, 0x00 } ++ [_]u8{0} ** 72 ++ [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 };
+    const le = (try parseLink(linkPayload(&pb, &exact))).?;
+    try testing.expectEqual(@as(u64, 9), le.stats.?.collisions);
+    // 72 bytes of stats: one u64 short of the ten decoded counters.
+    const short = [_]u8{ 0x4c, 0x00, 0x17, 0x00 } ++ [_]u8{0} ** 72;
+    try testing.expectError(error.BadLength, parseLink(linkPayload(&pb, &short)));
+    // A kind longer than the buffer leaves kind empty rather than failing
+    // the whole dump.
+    const long_kind = [_]u8{ 0x24, 0x00, 0x12, 0x00, 0x20, 0x00, 0x01, 0x00 } ++ [_]u8{'k'} ** 28;
+    const lk = (try parseLink(linkPayload(&pb, &long_kind))).?;
+    try testing.expectEqual(@as(usize, 0), lk.kind().len);
+    // A kind exactly at the buffer size is kept.
+    const max_kind = [_]u8{ 0x20, 0x00, 0x12, 0x00, 0x1c, 0x00, 0x01, 0x00 } ++ [_]u8{'k'} ** Link.kind_max;
+    const lm = (try parseLink(linkPayload(&pb, &max_kind))).?;
+    try testing.expectEqual(@as(usize, Link.kind_max), lm.kind().len);
+}
+
+test "matchRule re-checks the family client-side (the documented belt and braces)" {
+    const r6: Rule = .{ .family = AF.INET6, .src_len = 0, .dst_len = 0, .tos = 0, .action = 1, .flags = 0, .table = 254 };
+    try testing.expect(!matchRule(r6, .{ .family = AF.INET }));
+    try testing.expect(matchRule(r6, .{ .family = AF.INET6 }));
+    try testing.expect(matchRule(r6, .{}));
+}
+
+test "rtnlGroupMask: group n is bit n-1; 0 and > 32 are refused" {
+    // RTNLGRP_LINK = 1 → bit 0, RTNLGRP_IPV4_IFADDR = 5 → bit 4,
+    // RTNLGRP_IPV6_RULE = 19 → bit 18 (linux/rtnetlink.h).
+    try testing.expectEqual(@as(u32, 0x11), try rtnlGroupMask(&.{ RTNLGRP.LINK, RTNLGRP.IPV4_IFADDR }));
+    try testing.expectEqual(@as(u32, 1 << 18), try rtnlGroupMask(&.{RTNLGRP.IPV6_RULE}));
+    try testing.expectEqual(@as(u32, 1 << 31), try rtnlGroupMask(&.{32}));
+    try testing.expectEqual(@as(u32, 0), try rtnlGroupMask(&.{}));
+    try testing.expectError(error.GroupOutOfRange, rtnlGroupMask(&.{0}));
+    try testing.expectError(error.GroupOutOfRange, rtnlGroupMask(&.{33}));
+}
+
+test "EventIterator: typed events from one datagram, other messages skipped" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var dg: std.ArrayList(u8) = .empty;
+    defer dg.deinit(gpa);
+    // RTM_NEWLINK for ifindex 7 named "zv0".
+    const h1 = try codec.appendHeader(gpa, &dg, RTM_NEWLINK, 0, 0, 0);
+    try appendIfinfomsg(gpa, &dg, 7, 0, 0);
+    try codec.appendAttrString(gpa, &dg, ifla_ifname, "zv0");
+    codec.finishHeader(&dg, h1);
+    // A message type no event models (RTM_NEWQDISC = 36): skipped.
+    const h2 = try codec.appendHeader(gpa, &dg, 36, 0, 0, 0);
+    try codec.appendPadded(gpa, &dg, &([_]u8{0} ** 20));
+    codec.finishHeader(&dg, h2);
+    // RTM_DELADDR 10.0.0.1/24 on 7.
+    const h3 = try codec.appendHeader(gpa, &dg, RTM_DELADDR, 0, 0, 0);
+    try codec.appendPadded(gpa, &dg, &.{ AF.INET, 24, 0, 0, 7, 0, 0, 0 });
+    try codec.appendAttr(gpa, &dg, ifa_local, &.{ 10, 0, 0, 1 });
+    codec.finishHeader(&dg, h3);
+    // A NEWADDR carrying no address: the parser's degenerate entry → skipped.
+    const h4 = try codec.appendHeader(gpa, &dg, RTM_NEWADDR, 0, 0, 0);
+    try codec.appendPadded(gpa, &dg, &.{ AF.INET, 24, 0, 0, 7, 0, 0, 0 });
+    codec.finishHeader(&dg, h4);
+    // RTM_DELLINK for ifindex 8: a removal, not an addition.
+    const h6 = try codec.appendHeader(gpa, &dg, RTM_DELLINK, 0, 0, 0);
+    try appendIfinfomsg(gpa, &dg, 8, 0, 0);
+    codec.finishHeader(&dg, h6);
+    // RTM_DELRULE priority 5.
+    const h5 = try codec.appendHeader(gpa, &dg, RTM_DELRULE, 0, 0, 0);
+    try codec.appendPadded(gpa, &dg, &.{ AF.INET, 0, 0, 0, 100, 0, 0, 1, 0, 0, 0, 0 });
+    try codec.appendAttrU32(gpa, &dg, FRA.PRIORITY, 5);
+    codec.finishHeader(&dg, h5);
+
+    var it = EventIterator.init(dg.items);
+    const e1 = (try it.next()).?;
+    try testing.expectEqualStrings("zv0", e1.link_new.name());
+    try testing.expectEqual(@as(u32, 7), e1.link_new.index);
+    const e2 = (try it.next()).?;
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, e2.addr_del.bytes());
+    const e3 = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 8), e3.link_del.index);
+    const e4 = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 5), e4.rule_del.priority);
+    try testing.expect((try it.next()) == null);
+
+    // A malformed event is an error, not silently skipped.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    const hb = try codec.appendHeader(gpa, &bad, RTM_NEWLINK, 0, 0, 0);
+    try codec.appendPadded(gpa, &bad, &.{ 0, 0, 0, 0 }); // ifinfomsg cut short
+    codec.finishHeader(&bad, hb);
+    var bit = EventIterator.init(bad.items);
+    try testing.expectError(error.Truncated, bit.next());
+}
+
+test "integration: an rtnetlink monitor socket opens without privilege" {
+    // `ip monitor` runs as any user: rtnetlink lets unprivileged sockets
+    // join its multicast groups. A refusal here would make openMonitor
+    // useless for the daemons it exists for.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var m = try Socket.openMonitor(testing.allocator, try rtnlGroupMask(&.{
+        RTNLGRP.LINK, RTNLGRP.IPV4_IFADDR, RTNLGRP.IPV6_IFADDR, RTNLGRP.IPV4_ROUTE, RTNLGRP.NEIGH,
+    }));
+    m.close();
+}
+
+test "integration (netns): veth/vlan kind data, rules, lo stats and link events" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rc = linux.fork();
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    if (rc == 0) {
+        var code: u8 = netns_skip;
+        if (enterNetns()) {
+            if (netnsCoreRoundTrip()) |_| {
+                code = 0;
+            } else |err| {
+                code = switch (err) {
+                    error.AccessDenied => netns_skip,
+                    else => netns_fail,
+                };
+            }
+        }
+        linux.exit_group(code);
+    }
+    const pid: i32 = @intCast(rc);
+    var status: u32 = 0;
+    while (true) {
+        const wrc = linux.waitpid(pid, &status, 0);
+        switch (linux.errno(wrc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    if (status & 0x7f != 0) return error.TestChildKilledBySignal;
+    switch (@as(u8, @truncate(status >> 8))) {
+        0 => {},
+        netns_skip => {
+            if (verboseSkip()) std.debug.print("SKIPPED (netns core round-trip): no netns here\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return error.TestNetnsRoundTripFailed,
+    }
+}
+
+fn netnsCoreRoundTrip() !void {
+    netnsStep("Socket.open");
+    var nl = try Socket.open(std.heap.page_allocator); // global-alloc-ok: fork()'d child of a netns integration test
+    defer nl.close();
+    return netnsCoreOn(&nl) catch |err| {
+        netnsReport("veth/vlan/rule/stats/events", err, &nl);
+        return err;
+    };
+}
+
+fn netnsCoreOn(nl: *Socket) !void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: fork()'d child of a netns integration test
+
+    // Subscribe BEFORE the changes, so their notifications are queued.
+    netnsStep("openMonitor");
+    var mon = try Socket.openMonitor(gpa, try rtnlGroupMask(&.{ RTNLGRP.LINK, RTNLGRP.IPV4_RULE }));
+    defer mon.close();
+    try mon.setRecvTimeout(2000);
+
+    // 1. veth pair: both ends from one request.
+    netnsStep("linkAdd(veth)");
+    nl.linkAdd(.{ .name = "zv0", .kind = "veth", .kind_data = .{ .veth = .{ .peer = "zv1" } } }, .{}) catch |err| switch (err) {
+        // No veth driver in this kernel: nothing below can run.
+        error.NotSupported => return error.AccessDenied,
+        else => return err,
+    };
+    const v0 = (try findLink(nl, "zv0")) orelse return error.TestVethMissing;
+    const v1 = (try findLink(nl, "zv1")) orelse return error.TestVethPeerMissing;
+    if (!std.mem.eql(u8, v0.kind(), "veth") or !std.mem.eql(u8, v1.kind(), "veth")) return error.TestVethKind;
+    // Each end names the other as IFLA_LINK.
+    if (v0.parent != v1.index or v1.parent != v0.index) return error.TestVethPeerIndex;
+
+    // 2. an 802.1ad VLAN on zv0.
+    netnsStep("linkAdd(vlan)");
+    try nl.linkAdd(.{
+        .name = "zv0.20",
+        .kind = "vlan",
+        .parent = v0.index,
+        .kind_data = .{ .vlan = .{ .id = 20, .protocol = .dot1ad } },
+    }, .{});
+    const vl = (try findLink(nl, "zv0.20")) orelse return error.TestVlanMissing;
+    if (!std.mem.eql(u8, vl.kind(), "vlan")) return error.TestVlanKind;
+    if (vl.vlan_id != 20 or vl.vlan_protocol != 0x88a8) return error.TestVlanData;
+    if (vl.parent != v0.index) return error.TestVlanParent;
+
+    // 3. rules: add two, read them back, delete one by priority.
+    netnsStep("ruleAdd");
+    try nl.ruleAdd(.{ .src = &.{ 10, 0, 0, 0 }, .src_len = 8, .table = 100, .priority = 1000 }, .{});
+    try nl.ruleAdd(.{ .family = AF.INET, .iifname = "zv0", .fwmark = 0x10, .table = 4000, .priority = 1001 }, .{});
+    netnsStep("rules");
+    var seen: u8 = 0;
+    {
+        const rs = try nl.rules(.{ .family = AF.INET });
+        defer gpa.free(rs);
+        for (rs) |r| switch (r.priority) {
+            1000 => {
+                if (r.table != 100 or r.src_len != 8 or r.srcBytes()[0] != 10) return error.TestRule1000;
+                if (r.action != @intFromEnum(RuleAction.to_table)) return error.TestRuleAction;
+                seen |= 1;
+            },
+            1001 => {
+                // table 4000 > 255: it can only have come back via FRA_TABLE.
+                if (r.table != 4000 or r.fwmark != 0x10 or !std.mem.eql(u8, r.iifname(), "zv0")) return error.TestRule1001;
+                seen |= 2;
+            },
+            else => {},
+        };
+    }
+    if (seen != 3) return error.TestRulesMissing;
+    // The family filter reaches the kernel: an IPv6 rule stays out of an
+    // AF_INET dump and shows up in an AF_INET6 one.
+    try nl.ruleAdd(.{ .src = &(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12), .src_len = 32, .table = 103, .priority = 1002 }, .{});
+    {
+        const r4 = try nl.rules(.{ .family = AF.INET });
+        defer gpa.free(r4);
+        for (r4) |r| if (r.priority == 1002) return error.TestRuleFamilyLeak;
+        const r6 = try nl.rules(.{ .family = AF.INET6 });
+        defer gpa.free(r6);
+        var found6 = false;
+        for (r6) |r| if (r.priority == 1002 and r.src_len == 32) {
+            found6 = true;
+        };
+        if (!found6) return error.TestRule6Missing;
+    }
+    netnsStep("ruleDel");
+    try nl.ruleDel(.{ .family = AF.INET, .priority = 1000 });
+    {
+        const rs = try nl.rules(.{ .family = AF.INET });
+        defer gpa.free(rs);
+        for (rs) |r| if (r.priority == 1000) return error.TestRuleNotDeleted;
+    }
+
+    // 4. stats: one datagram over lo shows up as tx AND rx on lo.
+    netnsStep("lo stats");
+    try nl.linkUp(1);
+    const before = ((try findLink(nl, "lo")) orelse return error.TestNoLo).stats orelse return error.TestNoStats;
+    {
+        const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) return error.TestUdpSocket;
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+        var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, 9), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+        if (linux.errno(linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+            return error.TestUdpSend;
+    }
+    const after = ((try findLink(nl, "lo")) orelse return error.TestNoLo).stats orelse return error.TestNoStats;
+    // A loopback transmit is also a receive; 29 = IPv4 20 + UDP 8 + 1 byte.
+    if (after.tx_packets < before.tx_packets + 1 or after.rx_packets < before.rx_packets + 1) return error.TestStatsPackets;
+    if (after.tx_bytes < before.tx_bytes + 29) return error.TestStatsBytes;
+
+    // 5. events: the monitor saw zv0's creation and the rule deletion.
+    netnsStep("recvEvents");
+    var saw_link = false;
+    var saw_rule_del = false;
+    var rounds: usize = 0;
+    while (!(saw_link and saw_rule_del) and rounds < 64) : (rounds += 1) {
+        var it = mon.recvEvents() catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        while (try it.next()) |e| switch (e) {
+            .link_new => |l| if (std.mem.eql(u8, l.name(), "zv0")) {
+                saw_link = true;
+            },
+            .rule_del => |r| if (r.priority == 1000) {
+                saw_rule_del = true;
+            },
+            else => {},
+        };
+    }
+    if (!saw_link) return error.TestNoLinkEvent;
+    if (!saw_rule_del) return error.TestNoRuleEvent;
 }
 
 test {

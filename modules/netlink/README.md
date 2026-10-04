@@ -79,6 +79,43 @@ nl.routeAdd(bad_spec, .{}) catch |err| switch (err) {
 };
 ```
 
+### Kind data, rules, counters, events
+
+```zig
+// veth pairs and VLANs (IFLA_INFO_DATA), read back with kind/parent/vlan_id.
+try nl.linkAdd(.{ .name = "v0", .kind = "veth", .kind_data = .{ .veth = .{ .peer = "v1" } } }, .{});
+try nl.linkAdd(.{ .name = "v0.20", .kind = "vlan", .parent = v0_index,
+                  .kind_data = .{ .vlan = .{ .id = 20, .protocol = .dot1ad } } }, .{});
+for (try nl.links()) |l| _ = .{ l.kind(), l.parent, l.master, l.operstate, l.vlan_id };
+
+// `ip -s link`: IFLA_STATS64, decoded on every link dump.
+if (l.stats) |s| _ = .{ s.rx_packets, s.tx_bytes, s.rx_dropped };
+
+// `ip rule`: policy routing.
+try nl.ruleAdd(.{ .src = &.{ 10, 0, 0, 0 }, .src_len = 8, .table = 100, .priority = 1000 }, .{});
+const rules = try nl.rules(.{ .family = netlink.AF.INET });   // []Rule
+try nl.ruleDel(.{ .family = netlink.AF.INET, .priority = 1000 });
+
+// `ip monitor`: subscribe, then iterate typed events per datagram.
+var mon = try netlink.Socket.openMonitor(gpa, try netlink.rtnlGroupMask(&.{
+    netlink.RTNLGRP.LINK, netlink.RTNLGRP.IPV4_IFADDR, netlink.RTNLGRP.IPV4_ROUTE,
+}));
+defer mon.close();
+while (true) {
+    var it = mon.recvEvents() catch |err| switch (err) {
+        error.Overrun => { /* events were lost: re-dump to resync */ continue; },
+        else => return err,
+    };
+    while (try it.next()) |ev| switch (ev) {
+        .link_new => |l| std.log.info("link {s} up={}", .{ l.name(), l.flags & netlink.IFF.UP != 0 }),
+        .addr_del => |a| std.log.info("address gone on {d}", .{a.ifindex}),
+        else => {},
+    };
+}
+```
+
+Monitoring needs no privilege (rtnetlink lets any user join its groups).
+
 ### Bridges (AF_BRIDGE)
 
 Everything `ip link … type bridge`, `bridge fdb`, `bridge vlan` and
