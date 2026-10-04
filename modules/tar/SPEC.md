@@ -6,7 +6,7 @@
 
 **Scope:** core — Go `archive/tar` / tar-rs 0.4.46; GNU tar, busybox and pax archives read (pax `path`/`linkpath`/`size`/`uid`/`gid`/`mtime` incl. nanoseconds), pax 'x' headers written on request (`WriteOptions.long_names = .pax`), both since 2026-09-30; missing: sparse files, pax global ('g') headers, arbitrary pax records (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-01 · mutation none
+**Audit:** review 2026-09-01 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -116,6 +116,22 @@ or `u32`/`i64`-overflowing `uid`/`gid`/`mtime`, a path over `max_name_len`, a pa
 — each `error.BadHeader`.
 
 Run: `zig build test-tar`.
+
+**Audit 2026-10-04 (mutation).** 53 schemata mutants over the reader's guards (short and
+zero blocks, checksum incl. the signed form and the 8-byte space window, size-overflow
+guards, GNU 'L'/'K' and pax caps, every pax record-shape check, keyword deletion and
+per-entry scope, `carries_content`, typeflag mapping, prefix under POSIX vs GNU magic,
+base-256 high bytes) and the writer's (field ranges, NUL refusal, 'L' threshold,
+`splitPrefix` limits, pax record length fixed point and thresholds, octal/base-256 switch,
+checksum): 51 killed, 2 equivalent, 0 left alive. Equivalent: dropping `sp == 0` in
+`readPax` (an empty length then fails `parseInt`, still `BadHeader`); `len <= sp + 1` →
+`len < sp + 1` (at `len == sp + 1` the record's last byte is the space, so the newline
+check refuses it). 16 survivors got tests: size guards on the 'g' and pax-size paths
+(no overflow panic), pax `size` scoped to its own entry, `size=` deleting the keyword,
+signed / `_`-free decimal digits in pax lengths and values, '7' as a regular file, an empty
+'L' payload, GNU-magic atime bytes not read as a prefix, a 7-digit+NUL checksum field and a
+signed-sum header accepted, the exact 100/155-byte name/prefix limits on both writer modes,
+and the 8 GiB octal/base-256/pax-`size` boundary.
 
 ## Backlog / deferred
 - ~~(survey 2026-09-30) **pax extended header interpretation**~~ — DONE 2026-09-30: `path`, `linkpath`, `size` (the survey found the reader returning the truncated ustar name and desynchronising on a pax `size`; graded a defect, fixed the same day, with an external anchor against GNU tar `--format=pax`) and, the same day (C17), `uid`, `gid`, `mtime` incl. nanoseconds (`Entry.mtime_nsec`), anchored to GNU tar and Python tarfile archives. Why a user cared: bsdtar/macOS tar, Go and many CI tools emit pax by default; today the reader silently returns the truncated ustar name or 0/absent size for such entries (SPEC currently only says "skipped, never fatal"). ~200 lines incl. bounded-record parsing (reuse `max_name_len`); fits CONVENTIONS section 2.

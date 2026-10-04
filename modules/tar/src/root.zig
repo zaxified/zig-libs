@@ -2651,6 +2651,239 @@ test "GNU tar lists + extracts our pax-mode archive (external cross-check of the
     }
 }
 
+// ── mutation run 2026-10-04: one test per surviving mutant ─────────────────
+
+/// Read every entry of `archive` and return the first `next()` error, or
+/// null when the archive reads cleanly.
+fn firstReadError(archive: []const u8) !?ReadError {
+    var src: std.Io.Reader = .fixed(archive);
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    while (true) {
+        // The error is the VALUE returned here, hence the `@as`.
+        const e = tr.next() catch |err| return @as(?ReadError, err);
+        if (e == null) return null;
+    }
+}
+
+test "reader: a size near maxInt(u64) is BadHeader on every path, never a skip that overflows" {
+    // The guards' own comments: no real archive needs a size this close to
+    // maxInt(u64), and `size + padding` would wrap. Mutation 2026-10-04:
+    // removing either guard survived -- a 'g' header reached
+    // `discard(h.size + content_pad)` (a ReleaseSafe panic), a pax `size`
+    // record was handed out as the entry's size.
+    var buf: [6 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "global", "", 0, 0, 0, std.math.maxInt(u64), 0, 'g');
+    try w.writeAll(&block);
+    try writeZeros(&w, 2 * block_size);
+    try testing.expectEqual(@as(?ReadError, error.BadHeader), try firstReadError(w.buffered()));
+
+    var rb: [64]u8 = undefined;
+    var abuf: [8 * block_size]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&abuf);
+    emitHeader(&block, "f", "", 0o644, 0, 0, 0, 0, '0');
+    try paxArchive(&aw, paxRecord(&rb, "size", "18446744073709551615"), &block, "");
+    try testing.expectEqual(@as(?ReadError, error.BadHeader), try firstReadError(aw.buffered()));
+}
+
+test "pax: a 'size' record applies to its own entry only" {
+    // POSIX pax 'x': "the extended header records shall apply only to the
+    // following file". Mutation 2026-10-04: a pax size left set for the
+    // NEXT entry survived; that entry would then be read 5 bytes long.
+    var rb: [64]u8 = undefined;
+    const payload = paxRecord(&rb, "size", "5");
+    var abuf: [10 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&abuf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "PaxHeaders/one", "", 0, 0, 0, payload.len, 0, 'x');
+    try w.writeAll(&block);
+    try w.writeAll(payload);
+    try writeZeros(&w, padding(payload.len));
+    emitHeader(&block, "one", "", 0o644, 0, 0, 0, 0, '0'); // header says 0, pax says 5
+    try w.writeAll(&block);
+    try w.writeAll("12345");
+    try writeZeros(&w, padding(5));
+    emitHeader(&block, "two", "", 0o644, 0, 0, 3, 0, '0');
+    try w.writeAll(&block);
+    try w.writeAll("abc");
+    try writeZeros(&w, padding(3) + 2 * block_size);
+
+    var src: std.Io.Reader = .fixed(w.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqual(@as(u64, 5), (try tr.next()).?.size);
+    const two = (try tr.next()).?;
+    try testing.expectEqualStrings("two", two.path);
+    try testing.expectEqual(@as(u64, 3), two.size);
+    var cbuf: [8]u8 = undefined;
+    try testing.expectEqualStrings("abc", cbuf[0..try tr.read(&cbuf)]);
+    try testing.expect((try tr.next()) == null);
+}
+
+test "pax: an empty 'size' value deletes the keyword, the header's size stands" {
+    // POSIX pax: "If the <value> field is zero length, it shall delete any
+    // header block field ... of the same name" -- the readPax doc says the
+    // same. Mutation 2026-10-04: refusing `size=` survived.
+    var rb: [64]u8 = undefined;
+    var abuf: [8 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&abuf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "f", "", 0o644, 0, 0, 3, 0, '0');
+    try paxArchive(&w, paxRecord(&rb, "size", ""), &block, "abc");
+    var src: std.Io.Reader = .fixed(w.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqual(@as(u64, 3), (try tr.next()).?.size);
+}
+
+test "pax: the record length and a numeric value are plain decimal digits" {
+    // POSIX pax record: "<length> <keyword>=<value>\n", length "a decimal
+    // number"; `size` "a decimal number". `std.fmt.parseInt` alone also takes
+    // a sign and `_` separators -- the digit loops are what refuse them.
+    // Mutation 2026-10-04: dropping either digit loop survived.
+    var rb: [64]u8 = undefined;
+    var abuf: [8 * block_size]u8 = undefined;
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "f", "", 0o644, 0, 0, 0, 0, '0');
+    var w: std.Io.Writer = .fixed(&abuf);
+    try paxArchive(&w, "+13 path=abc\n", &block, "");
+    try testing.expectEqual(@as(?ReadError, error.BadHeader), try firstReadError(w.buffered()));
+    w = .fixed(&abuf);
+    try paxArchive(&w, paxRecord(&rb, "size", "+0"), &block, "");
+    try testing.expectEqual(@as(?ReadError, error.BadHeader), try firstReadError(w.buffered()));
+}
+
+test "typeflag '7' (contiguous file) reads as a regular file with its content" {
+    // POSIX ustar: '7' is "reserved to represent a file to which an
+    // implementation has associated some high-performance attribute";
+    // implementations without one treat it as a regular file, as GNU tar
+    // does (the `carries_content` comment above). Mutation 2026-10-04:
+    // reporting it as `.other` survived.
+    var abuf: [6 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&abuf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "c", "", 0o644, 0, 0, 2, 0, '7');
+    try w.writeAll(&block);
+    try w.writeAll("hi");
+    try writeZeros(&w, padding(2) + 2 * block_size);
+    var src: std.Io.Reader = .fixed(w.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    const e = (try tr.next()).?;
+    try testing.expectEqual(Kind.file, e.kind);
+    try testing.expectEqual(@as(u64, 2), e.size);
+}
+
+test "GNU 'L' record with an empty payload is BadHeader" {
+    // `ReadError.BadHeader` doc: "bad 'L'-'K' size". An empty long name
+    // would leave the next entry nameless. Mutation 2026-10-04: accepting
+    // size 0 survived.
+    var abuf: [6 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&abuf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, gnu_longlink_name, "", 0, 0, 0, 0, 0, 'L');
+    try w.writeAll(&block);
+    emitHeader(&block, "real", "", 0o644, 0, 0, 0, 0, '0');
+    try w.writeAll(&block);
+    try writeZeros(&w, 2 * block_size);
+    try testing.expectEqual(@as(?ReadError, error.BadHeader), try firstReadError(w.buffered()));
+}
+
+test "GNU magic: bytes 345..500 are not a ustar prefix" {
+    // GNU's old header (`struct oldgnu_header`, magic "ustar  \0") keeps
+    // atime/ctime/offsets where POSIX ustar has `prefix`; reading them as a
+    // prefix would invent a directory. Mutation 2026-10-04: honouring the
+    // prefix under GNU magic survived.
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "file", "", 0o644, 0, 0, 0, 0, '0');
+    @memcpy(block[257..265], "ustar  \x00");
+    @memcpy(block[345..357], "14751346217\x00"); // an atime, as GNU writes it
+    fixChecksum(&block);
+    var abuf: [3 * block_size]u8 = undefined;
+    @memcpy(abuf[0..block_size], &block);
+    @memset(abuf[block_size..], 0);
+    var src: std.Io.Reader = .fixed(&abuf);
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectEqualStrings("file", (try tr.next()).?.path);
+}
+
+test "checksum: all 8 field bytes count as spaces, and a signed sum is accepted" {
+    // POSIX ustar: the checksum is "the sum of all bytes in the header block
+    // ... treating each byte of the chksum field as a space", whatever those
+    // bytes hold -- so a field written as 7 digits + NUL (no trailing space)
+    // checks the same. And historical tars summed SIGNED bytes; GNU tar
+    // accepts either (the `verifyChecksum` doc). Mutation 2026-10-04: both a
+    // 7-byte space window and dropping the signed form survived.
+    var abuf: [3 * block_size]u8 = undefined;
+    @memset(abuf[block_size..], 0);
+
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "seven", "", 0o644, 0, 0, 0, 0, '0');
+    @memset(block[148..156], ' ');
+    var sum: u64 = 0;
+    for (block) |b| sum += b;
+    _ = try std.fmt.bufPrint(block[148..156], "{o:0>7}\x00", .{sum});
+    @memcpy(abuf[0..block_size], &block);
+    try testing.expectEqual(@as(?ReadError, null), try firstReadError(&abuf));
+
+    emitHeader(&block, "hi\xe9\xff", "", 0o644, 0, 0, 0, 0, '0');
+    @memset(block[148..156], ' ');
+    var signed: i64 = 0;
+    for (block) |b| signed += @as(i8, @bitCast(b));
+    _ = try std.fmt.bufPrint(block[148..156], "{o:0>6}\x00 ", .{@as(u64, @intCast(signed))});
+    @memcpy(abuf[0..block_size], &block);
+    try testing.expectEqual(@as(?ReadError, null), try firstReadError(&abuf));
+}
+
+test "writer: the ustar name/prefix limits are exact (100 / 155 bytes)" {
+    // POSIX ustar: `name` is 100 bytes, `prefix` 155. A path one byte over
+    // either needs the GNU 'L' record or a pax `path` record, and must come
+    // back whole. Mutation 2026-10-04: off-by-one limits in the GNU 'L'
+    // threshold and in `splitPrefix` (name 101, prefix 156) all survived --
+    // the copy into the field silently truncated.
+    const cases = [_]struct { path: []const u8, mode: LongNames }{
+        .{ .path = "a" ** 101, .mode = .gnu },
+        .{ .path = "d/" ++ "n" ** 101, .mode = .pax },
+        .{ .path = "p" ** 156 ++ "/n", .mode = .pax },
+    };
+    for (cases) |c| {
+        var abuf: [8 * block_size]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&abuf);
+        const tw = Writer.initOptions(&w, .{ .long_names = c.mode });
+        try tw.writeEntry(.{ .path = c.path, .mode = 0o644 }, "x");
+        try tw.finish();
+        var src: std.Io.Reader = .fixed(w.buffered());
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+        try testing.expectEqualStrings(c.path, (try tr.next()).?.path);
+    }
+}
+
+test "writer: 8 GiB - 1 is still octal; 8 GiB needs base-256, and a pax 'size' record in pax mode" {
+    // The 12-byte ustar size field holds 11 octal digits, at most
+    // 0o77777777777 = 8 GiB - 1 (`writeSizeField` doc: base-256 only beyond,
+    // as GNU tar does); `LongNames.pax` emits records "for exactly the fields
+    // that do not fit". Mutation 2026-10-04: moving either threshold by one
+    // survived -- the reader decodes both encodings, so only the bytes show it.
+    var abuf: [4 * block_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&abuf);
+    try Writer.init(&w).writeHeader(.{ .path = "f", .size = 0o77777777777 });
+    try testing.expectEqualStrings("77777777777\x00", w.buffered()[124..136]);
+
+    w = .fixed(&abuf);
+    try Writer.initOptions(&w, .{ .long_names = .pax }).writeHeader(.{ .path = "f", .size = 0o77777777777 });
+    try testing.expectEqual(@as(usize, block_size), w.buffered().len); // no 'x' header
+    w = .fixed(&abuf);
+    try Writer.initOptions(&w, .{ .long_names = .pax }).writeHeader(.{ .path = "f", .size = 0o100000000000 });
+    const out = w.buffered();
+    try testing.expectEqual(@as(u8, 'x'), out[156]);
+    try testing.expect(std.mem.indexOf(u8, out[block_size .. 2 * block_size], "size=8589934592\n") != null);
+    try testing.expectEqual(@as(u8, 0x80), out[2 * block_size + 124]); // base-256 in the entry's own field
+}
+
 // ── offline write-path anchor (real GNU tar captures, no subprocess) ──────
 //
 // Complements the live cross-check above (host-gated, skips without a `tar`

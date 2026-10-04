@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (53 schemata mutants, 51 killed, 2 equivalent;
+  16 new assertions in 10 tests). Pins the size-overflow guards on the 'g' and pax `size`
+  paths, the per-entry scope and deletion (`size=`) of pax records, digit-only pax lengths
+  and values, typeflag '7' as a file, an empty GNU 'L' payload refused, GNU-magic atime
+  bytes not taken as a prefix, both checksum forms, the exact ustar name/prefix limits and
+  the 8 GiB size-encoding boundary. No code change.
+
 - **2026-09-30** — **Additive** (C17): pax `uid`, `gid` and `mtime` records are honoured on read
   and pax 'x' headers can be written. `Entry` gains `mtime_nsec: u32 = 0` (also on `OwnedEntry`;
   `mtime` stays whole seconds, floor semantics: -1.25 s is `mtime = -2`, `mtime_nsec = 750_000_000`).
