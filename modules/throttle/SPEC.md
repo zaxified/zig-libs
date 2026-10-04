@@ -6,7 +6,7 @@
 
 **Scope:** core — Netflix concurrency-limits (static limit; adaptive missing) / x/sync semaphore (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -70,6 +70,30 @@ error, throttled 404s, bounded-wait 200-after-release and 503-after-deadline). I
 (`router` + `http.Server` + `http.Client` over loopback): N slots occupied by live blocked requests →
 request N+1 sheds with 503 + `Retry-After`, a released slot serves a fresh request, everything drains
 to zero — skips only when loopback binding is unavailable. Run: `zig build test-throttle`.
+
+## Mutation run 2026-10-04
+
+27 mutants (mutant schemata, one ReleaseSafe build, run per mutant under a 20 s cap): `>=`/`>` in
+`tryAcquire`, the waiter cap and the deadline test, the unit and origin of the deadline, the
+counter increments and decrements (slots and waiters), every step of `release` (decrement,
+notify gate, generation bump, wake, wake count), the `maxWaiters` default and explicit value,
+`Retry-After` rounding and floor, the middleware's `defer release` and `acquire` vs `tryAcquire`,
+the injected clock, the monotonic clock's nanosecond part, the 503 status, the cancel path.
+First run: 19 killed, 8 survived. Survivors and verdicts:
+
+- Equivalent: `acquire` without the `max_wait_ms == 0` early return (with a zero wait the loop
+  makes one more `tryAcquire` and sheds at once; with no `Io` it still sheds); `wake all` reduced
+  to `wake one` (one freed slot needs one woken waiter; the difference only shows when the woken
+  waiter simultaneously hits its deadline, which no deterministic test can schedule).
+- Test gaps, now killed: `now >= deadline` vs `>` (fake-clock reading counts), clock injection
+  ignored, a lost wakeup in the window between the failed attempt and the futex wait (the scripted
+  clock releases inside that window), canceled wait not shedding, `Retry-After` floor of 1 s,
+  monotonic clock without nanoseconds.
+
+Tests added: 5 (`bounded wait: deadline is the first clock reading ...`, `... a release between
+the failed attempt and the futex wait is not lost`, `... canceled Io wait sheds at once ...`,
+`middleware: Retry-After is ceil(ms / 1000) with a floor of 1 second`, `Clock.monotonic keeps
+sub-second resolution ...`). Final run: 25 of 27 killed, 2 equivalent, 0 findings.
 
 ## Backlog / deferred
 Adaptive limit discovery (Netflix Gradient-style AIMD on observed latency) — documented TODO in

@@ -1101,3 +1101,165 @@ test "acquire sheds instead of unwrapping a null io when the precondition is vio
     try testing.expect(!t.acquire()); // full + no io → shed, not a wild read
     t.release();
 }
+
+// ── tests: mutation-run additions (2026-10-04) ──────────────────────────────
+
+/// Scripted clock: every reading advances by `step_ns`; an optional hook runs
+/// on one chosen reading. Lets a test pin exactly which `Clock.now` call
+/// `acquire` makes where, without any real waiting for the deadline logic.
+const FakeClock = struct {
+    t: u64 = 0,
+    step_ns: u64,
+    calls: u32 = 0,
+    release_on_call: u32 = 0,
+    th: ?*Throttle = null,
+
+    fn now(ctx: ?*anyopaque) u64 {
+        const c: *FakeClock = @ptrCast(@alignCast(ctx.?));
+        const reading = c.t;
+        c.t += c.step_ns;
+        c.calls += 1;
+        if (c.calls == c.release_on_call) c.th.?.release();
+        return reading;
+    }
+
+    fn clock(c: *FakeClock) Clock {
+        return .{ .ctx = c, .nowFn = now };
+    }
+};
+
+test "bounded wait: deadline is the first clock reading plus max_wait_ms, reached with >=" {
+    // WHY these numbers (derived from the documented rule "wait up to
+    // max_wait_ms", not from observed output): `acquire` reads the clock once
+    // to set the deadline, then once per loop turn. With readings 0, 50, 100
+    // ms and max_wait_ms = 100 the deadline is 100 ms; the third reading is
+    // exactly at the deadline, so the wait is over (a wait that has used its
+    // whole budget must not start another) -> 3 readings. A step of 30 ms
+    // gives readings 0, 30, 60, 90, 120: the first at/after the deadline is
+    // the fifth -> 5 readings. Fewer readings = shed too early, more = waited
+    // past the budget. A clock that is ignored (the real one used instead)
+    // would not produce these counts at all.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const cases = [_]struct { step_ms: u64, readings: u32 }{
+        .{ .step_ms = 50, .readings = 3 },
+        .{ .step_ms = 30, .readings = 5 },
+    };
+    for (cases) |cs| {
+        var fc: FakeClock = .{ .step_ns = cs.step_ms * std.time.ns_per_ms };
+        var th: Throttle = .init(.{
+            .max_in_flight = 1,
+            .max_wait_ms = 100,
+            .io = threaded.io(),
+            .clock = fc.clock(),
+        });
+        try testing.expect(th.tryAcquire()); // saturate
+        try testing.expect(!th.acquire());
+        try testing.expectEqual(cs.readings, fc.calls);
+        try testing.expectEqual(0, th.waiting());
+        th.release();
+        th.deinit();
+    }
+}
+
+test "bounded wait: a release between the failed attempt and the futex wait is not lost" {
+    // The clock reading right after the failed `tryAcquire` runs inside the
+    // window the generation counter exists for. The scripted clock performs
+    // the release there (call 2 = first loop turn). `release` must bump the
+    // generation so the futex wait on the stale snapshot returns at once and
+    // the retry takes the slot. A lost wakeup would park until the 3 s
+    // deadline instead (invariant: the "no lost wakeup" audit in `acquire`).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fc: FakeClock = .{ .step_ns = std.time.ns_per_ms, .release_on_call = 2 };
+    var th: Throttle = .init(.{
+        .max_in_flight = 1,
+        .max_wait_ms = 3_000,
+        .io = threaded.io(),
+        .clock = fc.clock(),
+    });
+    fc.th = &th;
+    try testing.expect(th.tryAcquire()); // saturate; the clock hook frees it
+    const t0 = Clock.monotonic.now();
+    try testing.expect(th.acquire());
+    const elapsed_ms = (Clock.monotonic.now() - t0) / std.time.ns_per_ms;
+    try testing.expect(elapsed_ms < 1_500); // promptly, not at the deadline
+    try testing.expectEqual(1, th.inFlight());
+    try testing.expectEqual(0, th.waiting());
+    th.release();
+    th.deinit();
+}
+
+fn acquireTask(t: *Throttle) bool {
+    return t.acquire();
+}
+
+test "bounded wait: a canceled Io wait sheds at once instead of waiting out the deadline" {
+    // Documented: "A canceled Io wait (server shutdown) also sheds."
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var th: Throttle = .init(.{ .max_in_flight = 1, .max_wait_ms = 20_000, .io = io });
+    defer th.deinit();
+    try testing.expect(th.tryAcquire()); // saturate
+
+    var fut = try io.concurrent(acquireTask, .{&th});
+    var tries: usize = 0;
+    while (th.waiting() != 1) : (tries += 1) {
+        if (tries > 1000) {
+            _ = fut.cancel(io);
+            return error.TestTimeout;
+        }
+        try sleepMs(io, 10);
+    }
+    const t0 = Clock.monotonic.now();
+    const got = fut.cancel(io);
+    const elapsed_ms = (Clock.monotonic.now() - t0) / std.time.ns_per_ms;
+    try testing.expect(!got);
+    try testing.expect(elapsed_ms < 5_000);
+    try testing.expectEqual(0, th.waiting());
+    try testing.expectEqual(1, th.inFlight()); // the saturating slot is untouched
+    th.release();
+}
+
+test "middleware: Retry-After is ceil(ms / 1000) with a floor of 1 second" {
+    // Documented: "rounded up to whole seconds, minimum 1". 0 ms and 1 ms
+    // would be 0 s without the floor; 1000 is exact; 1001 rounds up to 2.
+    const cases = [_]struct { ms: u64, line: []const u8 }{
+        .{ .ms = 0, .line = "Retry-After: 1" },
+        .{ .ms = 1, .line = "Retry-After: 1" },
+        .{ .ms = 999, .line = "Retry-After: 1" },
+        .{ .ms = 1_000, .line = "Retry-After: 1" },
+        .{ .ms = 1_001, .line = "Retry-After: 2" },
+        .{ .ms = 60_000, .line = "Retry-After: 60" },
+    };
+    for (cases) |cs| {
+        var th: Throttle = .init(.{ .max_in_flight = 1, .retry_after_ms = cs.ms });
+        var r = router.Router.init(testing.allocator);
+        try r.use(th.middleware());
+        try r.get("/t", hBoom);
+        try testing.expect(th.tryAcquire());
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, wire("/t"), &buf);
+        try expectStatus(got, "503");
+        const needle = try std.fmt.allocPrint(testing.allocator, "\r\n{s}\r\n", .{cs.line});
+        defer testing.allocator.free(needle);
+        try testing.expect(std.mem.indexOf(u8, got, needle) != null);
+        th.release();
+        r.deinit();
+        th.deinit();
+    }
+}
+
+test "Clock.monotonic keeps sub-second resolution and advances across a sleep" {
+    // A 20 ms sleep must advance a monotonic clock by at least 20 ms and, with
+    // generous scheduler slack, well under a second. A reading that dropped
+    // the nanosecond part would advance by 0 or by a whole second.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const a = Clock.monotonic.now();
+    try sleepMs(threaded.io(), 20);
+    const b = Clock.monotonic.now();
+    try testing.expect(b >= a + 20 * std.time.ns_per_ms);
+    try testing.expect(b - a < 900 * std.time.ns_per_ms);
+}

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (27 mutants, 25 killed, 2 equivalent); 5 tests added
+  (fake-clock deadline arithmetic and `>=` boundary, release in the pre-wait window, canceled
+  wait, `Retry-After` rounding and floor, monotonic clock resolution). No source change.
 - **2026-08-13** — **BEHAVIOURAL, not breaking** — the 503 shed path no longer forces an early
   `ResponseWriter.end()`. The `Retry-After` value is formatted on `shed`'s
   stack frame and the early `end()` existed only to beat that frame's death;
