@@ -674,8 +674,7 @@ pub const PosixConnector = struct {
         // budget, and a definitive negative is only reported once they have
         // all been tried (F1). `.refused` outranks `.@"error"` as the answer
         // to keep: it is the one the caller is told is definitive.
-        var best: Verdict = .{ .status = .@"error" };
-        var ran_out = false;
+        var fold: VerdictFold = .{};
         for (addrs[0..n]) |ip| {
             // Charge resolution and earlier attempts against the budget: each
             // connect gets the REMAINDER, and once it is gone nothing more is
@@ -684,22 +683,14 @@ pub const PosixConnector = struct {
             const remaining: u64 = if (timeout_ns == 0)
                 0 // 0 == "no budget", same convention as `overBudget`
             else if (spent_now >= timeout_ns) {
-                ran_out = true;
+                fold.budgetGone();
                 break;
             } else timeout_ns - spent_now;
 
-            const attempt = connectBounded(ip, target.port, remaining);
-            if (attempt.status == .up) {
-                best = attempt;
-                break;
-            }
-            if (attempt.status == .timeout) ran_out = true;
-            if (best.status != .refused) best = attempt;
+            if (fold.add(connectBounded(ip, target.port, remaining))) break;
         }
-        if (best.status != .up and ran_out and best.status != .refused)
-            best = .{ .status = .timeout, .errno = best.errno };
 
-        const v = best;
+        const v = fold.result();
         const rtt = monoNs() -| start;
         return switch (v.status) {
             // `overBudget` still guards the success path: a connect that
@@ -721,6 +712,44 @@ pub const PosixConnector = struct {
     /// failed) and on the handful of exits with no specific errno to name
     /// (`POLLNVAL`, "writable check came back clear but not writable").
     const Verdict = struct { status: Status, errno: ?i32 = null };
+
+    /// How `connectImpl` turns the per-address verdicts of one attempt into
+    /// its answer -- the loop's decision logic on its own, a pure value, so
+    /// every sequence of outcomes can be tested without a resolver that
+    /// returns several addresses (the only way the loop sees more than one).
+    /// Extracted 2026-10-04 with the verdict for every sequence unchanged:
+    ///
+    ///  * an `.up` decides at once (`add` returns true: try no further address);
+    ///  * `.refused` outranks every later non-`.up` verdict -- it is the
+    ///    definitive negative the caller is promised;
+    ///  * a per-address `.timeout`, or the budget running out before the next
+    ///    address (`budgetGone`), makes a non-`.refused` answer `.timeout`.
+    const VerdictFold = struct {
+        best: Verdict = .{ .status = .@"error" },
+        ran_out: bool = false,
+
+        /// Feed one address's verdict. True when the attempt is decided.
+        fn add(f: *VerdictFold, attempt: Verdict) bool {
+            if (attempt.status == .up) {
+                f.best = attempt;
+                return true;
+            }
+            if (attempt.status == .timeout) f.ran_out = true;
+            if (f.best.status != .refused) f.best = attempt;
+            return false;
+        }
+
+        /// The budget was gone before the next address could be tried.
+        fn budgetGone(f: *VerdictFold) void {
+            f.ran_out = true;
+        }
+
+        fn result(f: VerdictFold) Verdict {
+            if (f.best.status != .up and f.ran_out and f.best.status != .refused)
+                return .{ .status = .timeout, .errno = f.best.errno };
+            return f.best;
+        }
+    };
 
     /// One non-blocking connect bounded by `budget_ns` (0 = unbounded).
     /// Never allocates; closes its descriptor on every exit path.
@@ -1579,6 +1608,47 @@ test "canceledCount counts only cancellations; one up repetition is reachable" {
     try testing.expectEqual(@as(usize, 1), r.canceledCount());
     try testing.expectEqual(@as(u64, 1), r.stats.received);
     try testing.expect(r.reachable());
+}
+
+test "PosixConnector.VerdictFold: every multi-address rule, one sequence each" {
+    // The fold is `connectImpl`'s per-address logic extracted unchanged
+    // (2026-10-04) so these sequences -- reachable live only through a name
+    // resolving to several addresses -- can be pinned. WHY each expectation
+    // is right: the doc of `connectImpl`/`VerdictFold` -- `.refused` is the
+    // definitive negative and outranks a later error; a timeout (per address
+    // or budget) turns a non-refused answer into `.timeout`; `.up` wins.
+    const F = PosixConnector.VerdictFold;
+    const V = PosixConnector.Verdict;
+    const ecr: i32 = @intFromEnum(std.os.linux.E.CONNREFUSED);
+    {
+        // refused, then an error from the next address: still refused.
+        var f: F = .{};
+        try testing.expect(!f.add(V{ .status = .refused, .errno = ecr }));
+        try testing.expect(!f.add(V{ .status = .@"error", .errno = 113 }));
+        try testing.expectEqual(Status.refused, f.result().status);
+        try testing.expectEqual(@as(?i32, ecr), f.result().errno);
+    }
+    {
+        // a timeout, then an error: the budget-miss is the answer.
+        var f: F = .{};
+        _ = f.add(V{ .status = .timeout });
+        _ = f.add(V{ .status = .@"error", .errno = 113 });
+        try testing.expectEqual(Status.timeout, f.result().status);
+    }
+    {
+        // refused, then the budget runs out before the next address: refused.
+        var f: F = .{};
+        _ = f.add(V{ .status = .refused, .errno = ecr });
+        f.budgetGone();
+        try testing.expectEqual(Status.refused, f.result().status);
+    }
+    {
+        // an error, then up: up decides and stops the walk.
+        var f: F = .{};
+        try testing.expect(!f.add(V{ .status = .@"error" }));
+        try testing.expect(f.add(V{ .status = .up }));
+        try testing.expectEqual(Status.up, f.result().status);
+    }
 }
 
 test "PosixConnector: a budget already spent before the connect is a timeout, and nothing is attempted" {

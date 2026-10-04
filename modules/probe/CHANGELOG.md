@@ -5,8 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Internal: `PosixConnector`'s per-address verdict logic extracted into
+  `VerdictFold` (private) so its multi-address rules can be tested without a resolver; the
+  verdict for every sequence of per-address outcomes is unchanged. **Tests:** one sequence per
+  rule (refused outranks a later error, a timeout or a spent budget makes a non-refused answer
+  `.timeout`, `.up` decides) — the three mutants left alive by the morning's run now die.
+
 - **2026-10-04** — **Tests:** mutation run (27 schemata mutants, 21 killed, 1 equivalent, 5 left
-  alive on resolver/kernel-dependent paths, see SPEC). New tests: `canceledCount` counts only
+  alive on resolver/kernel-dependent paths -- 3 of them pinned by the entry above, see SPEC). New tests: `canceledCount` counts only
   cancellations, one `.up` repetition is reachable, a spent budget is `.timeout` before any
   connect. No code change.
 

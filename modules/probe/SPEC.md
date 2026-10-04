@@ -178,17 +178,18 @@ signals delivered. Run: `zig build test-probe`.
 carry), the aggregation (cancellations excluded, an `.up` without rtt as loss), the
 target cap and fan-out, `overBudget`, `classifyErr`/`classifyErrno`, and `PosixConnector`
 (literal-only, the per-address budget fold, `connectBounded`'s deadline, poll and SO_ERROR
-logic): 21 killed, 1 equivalent, 5 left alive. Equivalent: the `n == 0` early return after
-resolution (with no address the fold never runs and `best` is already `.error`). Alive, all
-on paths no offline test can drive deterministically: the multi-address fold in
-`connectImpl` -- `ran_out` on a per-address timeout, `.refused` outranking a later
-`.error`, and `.refused` surviving a spent budget -- needs a name resolving to two or more
-addresses (the system resolver's answer is host-dependent); `connect()` completing
-synchronously on a non-blocking socket (Linux loopback answers `EINPROGRESS`); and a poll
-wake with `SO_ERROR = 0` but no `POLLOUT` (a kernel edge). Making the fold a pure function
-over per-address verdicts would let all three be pinned. Tests added for the 3 real gaps:
-`canceledCount` counts only cancellations, a single `.up` repetition is reachable, and a
-budget already spent before the connect is `.timeout` with nothing attempted.
+logic): 24 killed, 1 equivalent, 2 left alive. Equivalent: the `n == 0` early return after
+resolution (with no address the fold never runs and its verdict is already `.error`).
+Alive, kernel edges no offline test can drive: `connect()` completing synchronously on a
+non-blocking socket (Linux loopback answers `EINPROGRESS`), and a poll wake with
+`SO_ERROR = 0` but no `POLLOUT`. The multi-address rules (`ran_out` on a per-address
+timeout, `.refused` outranking a later `.error`, `.refused` surviving a spent budget) were
+reachable only through a name resolving to several addresses; the loop's decision logic was
+extracted unchanged into `PosixConnector.VerdictFold` (same verdict for every sequence of
+per-address outcomes) and is pinned there -- a 6-mutant follow-up run on the fold killed all
+six. Tests added: `canceledCount` counts only cancellations, a single `.up` repetition is
+reachable, a budget already spent before the connect is `.timeout` with nothing attempted,
+and one sequence per fold rule.
 
 ## Backlog / deferred
 Name resolution is not bounded by `timeout_ns` and cannot be by a `poll`-based connector — see the
