@@ -6,7 +6,7 @@
 
 **Scope:** core — Apache httpd `mod_log_config` (Combined Log Format), httpd 2.4 docs (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -344,6 +344,14 @@ into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 rec
 329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
 i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
 nothing is copied when the input is clean.
+
+**Audit 2026-10-04 (mutation).** 33 schemata mutants over `utf8Step` (every second-byte
+range of Table 3-7, continuation checks, maximal-subpart lengths), `writeJsonString`
+(escapes, U+FFFD substitution and step), logfmt quoting triggers and escapes, Combined
+(`hostOnly`, `%u` delimiters, `]`/DEL/control escapes, `-` for absent fields) and
+`entryFromRequest` (protocol, `request_bytes` override, Referer): 33 killed, 0 equivalent,
+0 left alive. One survivor of the first run got a test: a logfmt value holding DEL (0x7F)
+must be quoted and hex-escaped (`logfmtNeedsQuote` in lockstep with `writeLogfmtValue`).
 
 ## Anchoring
 

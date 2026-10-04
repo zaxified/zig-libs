@@ -632,6 +632,22 @@ fn responseBytesOf(res: *const http.Server.ResponseWriter) ?u64 {
 
 const testing = std.testing;
 
+test "logfmt: a value holding DEL (0x7F) is quoted and the byte hex-escaped" {
+    // `writeLogfmt` doc: a value is quoted when it holds "a control byte",
+    // and `logfmtNeedsQuote` must stay in lockstep with the escape set in
+    // `writeLogfmtValue`, which escapes 0x7F as `\x7f` (DEL is a control
+    // character, C0/DEL, as in the Combined format's `ap_escape_logitem`).
+    // Mutation 2026-10-04: leaving DEL out of the trigger set survived; the
+    // raw byte then went out unquoted and unescaped.
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = sampleEntry();
+    e.method = "GE\x7fT";
+    try writeLogfmt(e, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), " method=\"GE\\x7fT\" ") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, w.buffered(), 0x7f) == null);
+}
+
 fn sampleEntry() Entry {
     return .{
         .timestamp_ns = 1734000000000000000,

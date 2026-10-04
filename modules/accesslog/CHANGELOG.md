@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (33 schemata mutants, all killed after one new test:
+  a logfmt value holding DEL is quoted and hex-escaped). No code change.
+
 - **2026-09-28** — `response_bytes` is now known for streamed responses (chunked, compressed,
   HTTP/1.0 until-close), from `http`'s `ResponseWriter.bodyBytesSent`; they logged `-` before.
   Wanted by qap M11.5c.
