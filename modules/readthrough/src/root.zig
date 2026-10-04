@@ -1111,6 +1111,175 @@ test "OOM on the leader's result copy surfaces as an error, not as an empty valu
     }
 }
 
+test "TTL boundary: fresh at exactly ttl, reloaded one ns later (positive and negative)" {
+    // WHY: `ramcache` expires an entry when `(now - inserted) > ttl` (its own
+    // "TTL boundary" test and the predicate comment in `ramcache/src/root.zig`),
+    // so age == ttl is still fresh. readthrough must hand `ttl_ns` /
+    // `negative_ttl_ns` to ramcache unchanged -- an off-by-one in either
+    // direction moves this boundary.
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "k", "v");
+    var c = rig.open(.{ .ttl_ns = 100, .negative_ttl_ns = 50 });
+    defer c.deinit();
+
+    rig.clock.t = 1000;
+    c.free(try c.get("k"));
+    try testing.expect((try c.get("gone")) == .missing);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+
+    rig.clock.t = 1050; // negative entry: age == negative ttl, still fresh
+    try testing.expect((try c.get("gone")) == .missing);
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1051; // negative entry: one ns past
+    try testing.expect((try c.get("gone")) == .missing);
+    try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic));
+
+    rig.clock.t = 1100; // positive entry: age == ttl, still fresh
+    c.free(try c.get("k"));
+    try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1101; // positive entry: one ns past
+    c.free(try c.get("k"));
+    try testing.expectEqual(@as(u64, 4), rig.ldr.calls.load(.monotonic));
+}
+
+test "loader error with negative_ttl_ns = 0 is never cached, even with cache_loader_errors" {
+    // WHY: Options.negative_ttl_ns doc -- `<= 0` disables negative caching
+    // entirely; `cache_loader_errors` is only honoured when `negative_ttl_ns > 0`
+    // (SPEC §3, §6). Stored with ttl 0 an error entry would never expire.
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.ldr.fail = true;
+    var c = rig.open(.{ .negative_ttl_ns = 0, .cache_loader_errors = true });
+    defer c.deinit();
+
+    try testing.expectError(error.BackendDown, c.get("k"));
+    try testing.expectError(error.BackendDown, c.get("k"));
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+}
+
+/// A loader that invalidates from inside the load (the loader runs outside the
+/// cache lock, so `invalidate*` is legal there; only `get` of the same key is
+/// forbidden), then returns a canned outcome.
+const InvalidatingLoader = struct {
+    cache: *Cache = undefined,
+    all: bool,
+    kind: enum { value, missing, fail },
+    calls: u64 = 0,
+
+    fn loadFn(ctx: ?*anyopaque, key: []const u8) anyerror!LoadOutcome {
+        const self: *InvalidatingLoader = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.all) self.cache.invalidateAll() else self.cache.invalidate(key);
+        return switch (self.kind) {
+            .value => .{ .value = "v" },
+            .missing => .missing,
+            .fail => error.BackendDown,
+        };
+    }
+};
+
+test "invalidate / invalidateAll during a load: the result is returned but never cached (value, missing, error)" {
+    // WHY: SPEC §4 -- "an invalidation is never lost": the in-flight caller
+    // still gets the result, the cache does not durably serve it, so the next
+    // get must call the loader again. Holds for positive, negative-missing and
+    // negative-error results, for single-key and all-key invalidation.
+    for ([_]bool{ false, true }) |all| {
+        for ([_]@TypeOf(@as(InvalidatingLoader, undefined).kind){ .value, .missing, .fail }) |kind| {
+            var il: InvalidatingLoader = .{ .all = all, .kind = kind };
+            var threaded = std.Io.Threaded.init(testing.allocator, .{});
+            defer threaded.deinit();
+            var clock: ManualClock = .{};
+            var c = Cache.init(testing.allocator, .{
+                .io = threaded.io(),
+                .loader = .{ .ctx = &il, .load = InvalidatingLoader.loadFn },
+                .clock = clock.clock(),
+                .ttl_ns = 1_000_000,
+                .negative_ttl_ns = 1_000_000,
+                .cache_loader_errors = true,
+                .max_bytes = 1 << 20,
+                .max_entries = 64,
+            });
+            defer c.deinit();
+            il.cache = &c;
+
+            switch (kind) {
+                .value => c.free(try c.get("k")),
+                .missing => try testing.expect((try c.get("k")) == .missing),
+                .fail => try testing.expectError(error.BackendDown, c.get("k")),
+            }
+            try testing.expectEqual(@as(u64, 1), il.calls);
+            // Not cached: the second get runs the loader again (and, for .fail,
+            // returns the original error rather than CachedLoaderError).
+            switch (kind) {
+                .value => c.free(try c.get("k")),
+                .missing => try testing.expect((try c.get("k")) == .missing),
+                .fail => try testing.expectError(error.BackendDown, c.get("k")),
+            }
+            try testing.expectEqual(@as(u64, 2), il.calls);
+        }
+    }
+}
+
+test "stats: invalidate and invalidateAll each count once; ifCached on a negative entry counts a negative hit" {
+    // WHY: Stats docs -- `invalidations` is "invalidate + invalidateAll calls";
+    // `negative_hits` is "hits served from a negative entry" and `ifCached`
+    // mirrors `get`'s accounting (comment in `ifCached`).
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = rig.open(.{ .negative_ttl_ns = 1000 });
+    defer c.deinit();
+
+    c.invalidate("never-cached");
+    try testing.expectEqual(@as(u64, 1), c.getStats().invalidations);
+    c.invalidateAll();
+    try testing.expectEqual(@as(u64, 2), c.getStats().invalidations);
+
+    try testing.expect((try c.get("gone")) == .missing); // populate the negative entry
+    try testing.expectEqual(@as(u64, 0), c.getStats().negative_hits);
+    try testing.expect(!c.ifCached("gone", null, struct {
+        fn cb(_: ?*anyopaque, _: []const u8) void {}
+    }.cb));
+    try testing.expectEqual(@as(u64, 1), c.getStats().negative_hits);
+    try testing.expectEqual(@as(u64, 1), c.getStats().hits);
+}
+
+test "invalidate of an absent key does not displace a live entry in a full cache" {
+    // WHY: SPEC §4 -- presence is probed first precisely so an absent key
+    // inserts nothing; a poison put into a full store could evict a live entry.
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    var c = rig.open(.{ .max_entries = 1 });
+    defer c.deinit();
+
+    c.free(try c.get("a"));
+    c.invalidate("absent");
+    c.free(try c.get("a"));
+    try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic)); // still cached
+}
+
+test "max_entries bounds the store" {
+    // WHY: Options.max_entries is the ramcache entry-count budget; the store
+    // never holds more than that many entries (ramcache invariant).
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = rig.open(.{ .max_entries = 2, .negative_ttl_ns = 1_000_000 });
+    defer c.deinit();
+
+    var buf: [8]u8 = undefined;
+    for (0..8) |i| {
+        const k = std.fmt.bufPrint(&buf, "key{d}", .{i}) catch unreachable;
+        try testing.expect((try c.get(k)) == .missing);
+        try testing.expect(c.store.stats.entries <= 2);
+    }
+}
+
 test "meta is well-formed" {
     try testing.expect(meta.platform == .any);
     try testing.expect(meta.concurrency == .threadsafe);
