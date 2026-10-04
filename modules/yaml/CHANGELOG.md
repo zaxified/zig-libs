@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core** (reference: libyaml 0.2.5 / libfyaml 1.0).
+  - **New: emitter** (`emit.zig`: `stringify`, `writeValue`, `writeAll`, `emit.isSafePlain`) —
+    output that composes back to the same `Value` under YAML 1.2 core and under PyYAML (1.1);
+    shared nodes anchored/aliased (linear output for alias bombs).
+  - **New: typed mapping** (`typed.zig`: `parse`, `Parsed`, `fromValue`, `toValue`, `stringify`;
+    `yaml_keys` renames; `max_alloc_bytes` cap).
+  - **New: `ComposeOptions.merge_keys`** (YAML 1.1 `<<`, opt-in) and `error.InvalidMerge`.
+    `valueEql` is now public (naive; trusted trees only).
+  - **Evidence:** yaml-test-suite: every `in.json` case (279) still equal after emit → compose
+    (`suite_test.zig`); PyYAML reads our emitted text to the same JSON for all 279
+    (`tools/emit_oracle.{zig,py}`); merge keys against PyYAML (`tools/gen_merge_vectors.py` →
+    `testdata/merge_vectors.zig`, 13 cases). Fuzz driver (`YAML_FUZZ`) 240 000 runs clean.
+    Mutation 26 mutants: 24 killed (5 by tests the run asked for), 2 argued equivalent.
+    Self-review found and fixed: an aliased KEY was written `*a1:`, which reads as the alias
+    named `a1:` — now `*a1 :`.
+
 - **2026-09-17** — **BEHAVIOURAL (refuses more):** audit A1 F11, user decision. The scanner now
   rejects, with `error.InvalidYaml` and a `problem_mark` at the offending byte, any stream that is
   not valid UTF-8 (YAML 1.2 §5.2) or contains a character outside `c-printable` (§5.1: C0

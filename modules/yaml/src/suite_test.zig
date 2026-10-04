@@ -407,6 +407,9 @@ test "yaml-test-suite: every case reaches exactly its ledger outcome" {
     var ev_pass: usize = 0;
     var js_pass: usize = 0;
     var js_total: usize = 0;
+    // 2026-10-04: the emitter rides on Part 2 (see below).
+    var emit_ok: usize = 0;
+    var emit_bad: usize = 0;
 
     for (ids.items) |id| {
         const entry = listed.get(id).?;
@@ -492,6 +495,33 @@ test "yaml-test-suite: every case reaches exactly its ledger outcome" {
                 if (!try cmp.eq(yv, jv)) break :blk false;
                 cmp.path.shrinkRetainingCapacity(mark);
             }
+            // The emitter, against the same external oracle: write what was
+            // composed, compose that, and it must still equal in.json. Kept
+            // out of `js_reached`, so the ledger stays about the reader.
+            emit: {
+                var aw: std.Io.Writer.Allocating = .init(aa);
+                yaml.writeAll(aa, &aw.writer, composed) catch |e| {
+                    std.debug.print("{s}: emit failed: {s}\n", .{ id, @errorName(e) });
+                    emit_bad += 1;
+                    break :emit;
+                };
+                const again = yaml.composeAllLeaky(aa, aw.written(), .{}) catch |e| {
+                    std.debug.print("{s}: emitted text does not compose ({s}):\n{s}\n", .{ id, @errorName(e), aw.written() });
+                    emit_bad += 1;
+                    break :emit;
+                };
+                var ecmp: Cmp = .{ .gpa = gpa };
+                defer ecmp.deinit();
+                const same = again.len == want_docs.len and for (again, want_docs) |yv, jv| {
+                    if (!try ecmp.eq(yv, jv)) break false;
+                } else true;
+                if (!same) {
+                    std.debug.print("{s}: emitted text composes differently:\n{s}\n", .{ id, aw.written() });
+                    emit_bad += 1;
+                    break :emit;
+                }
+                emit_ok += 1;
+            }
             break :blk true;
         };
         if (js_reached) js_pass += 1;
@@ -511,6 +541,10 @@ test "yaml-test-suite: every case reaches exactly its ledger outcome" {
         }
     }
 
+    if (emit_bad != 0 or emit_ok != js_pass) {
+        std.debug.print("emitter round trip: {d} ok, {d} bad of {d}\n", .{ emit_ok, emit_bad, js_pass });
+        return error.EmitterRoundTrip;
+    }
     const bad = off_ledger != 0 or unexpectedly_passing != 0;
     if (bad or verbose())
         std.debug.print("\nyaml-test-suite: events {d}/{d} · json {d}/{d}\n", .{ ev_pass, ids.items.len, js_pass, js_total });
@@ -587,4 +621,37 @@ test "in.json may hold several documents" {
     try testing.expectEqual(@as(usize, 3), docs.len);
     try testing.expectEqualStrings("a", docs[0].string);
     try testing.expect(docs[2] == .null);
+}
+
+// ── merge keys against PyYAML (2026-10-04) ─────────────────────────────────
+
+test "merge keys: PyYAML's verdicts (tools/gen_merge_vectors.py)" {
+    const gpa = testing.allocator;
+    const mv = @import("testdata/merge_vectors.zig");
+    for (mv.cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        if (c.ours) |want| {
+            if (yaml.composeAllLeaky(aa, c.yaml, .{ .merge_keys = true })) |_| {
+                std.debug.print("{s}: composed, want {s}\n", .{ c.name, want });
+                return error.TestUnexpectedResult;
+            } else |e| try testing.expectEqualStrings(want, @errorName(e));
+            continue;
+        }
+        const docs = try yaml.composeAllLeaky(aa, c.yaml, .{ .merge_keys = true });
+        const want = try parseJsonDocs(aa, c.json.?);
+        var cmp: Cmp = .{ .gpa = gpa };
+        defer cmp.deinit();
+        if (!try cmp.eq(docs[0], want[0])) {
+            std.debug.print("{s}\n", .{c.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Off by default: `<<` is an ordinary key, and the merge-of-a-scalar
+    // document composes.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plain = try yaml.composeAllLeaky(arena.allocator(), "x: {<<: 1}\n", .{});
+    try testing.expectEqualStrings("<<", plain[0].get("x").?.mapping[0].key.string);
 }

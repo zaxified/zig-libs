@@ -66,7 +66,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected.",
+    .doc = "YAML 1.2 reader and emitter (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans), typed struct mapping, opt-in `<<` merge keys; cyclic aliases rejected.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -103,6 +103,18 @@ pub const ComposeError = compose_mod.Error;
 
 /// Compose every document in `source` into native `Value` trees (Part 2).
 pub const composeAll = compose_mod.composeAll;
+/// Naive structural equality (no depth bound, no memo — for trusted trees).
+pub const valueEql = compose_mod.valueEql;
+
+/// The emitter: `Value` → YAML text that composes back to the same `Value`.
+pub const emit = @import("emit.zig");
+pub const EmitError = emit.Error;
+pub const stringify = emit.stringify;
+pub const writeValue = emit.writeValue;
+pub const writeAll = emit.writeAll;
+
+/// Typed mapping between YAML and Zig types.
+pub const typed = @import("typed.zig");
 /// As `composeAll`, allocating from a caller-owned arena and freeing nothing.
 pub const composeAllLeaky = compose_mod.composeAllLeaky;
 /// Compose a stream that must hold exactly one document.
@@ -137,6 +149,10 @@ test {
     _ = events;
     _ = compose_mod;
     _ = @import("suite_test.zig");
+    _ = emit;
+    _ = typed;
+    _ = @import("core_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // ── unit tests ──────────────────────────────────────────────────────────────

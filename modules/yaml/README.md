@@ -123,11 +123,29 @@ repo's own record of verdicts — one line per yaml-test-suite case ID with our
 pass/fail/reject classification. It cites those IDs but reproduces none of the
 suite's documents, so nothing of yaml-test-suite is vendored here.
 
-## Deferred
+## Writing YAML, typed mapping, merge keys (2026-10-04)
 
-- **Emitter.** Writing YAML back out. Nothing here serializes.
-- **`parseInto(T, …)`.** Mapping a `Value` onto a user struct, the way
-  `std.json.parseFromSlice` does. The dynamic `Value` is the whole API today.
+- **Emitter** — `yaml.stringify(gpa, value)`, `yaml.writeValue(gpa, w, value)`,
+  `yaml.writeAll(gpa, w, docs)`. Block style, two-space indent. A string is
+  plain only when it is a simple word no YAML 1.1 or 1.2 resolver reads as
+  anything else; otherwise double-quoted with every non-printable escaped.
+  Floats are written so both 1.1 and 1.2 read them back as the same bits
+  (`1.0e+300`, `.inf`, `.nan`). A node the composer shared (an alias) is
+  written once with an anchor and then aliased, so a billion-laughs tree
+  emits in linear size. Checked both ways on the yaml-test-suite: what we emit
+  composes back to the suite's `in.json` (279/279), and PyYAML reads it to the
+  same JSON (279/279).
+- **Typed mapping** — `yaml.typed.parse(T, gpa, source, .{})` → `Parsed(T)`,
+  `yaml.typed.fromValue`, `yaml.typed.toValue`, `yaml.typed.stringify`.
+  Structs (keys renamed with `pub const yaml_keys = .{ .max_conn =
+  "max-connections" }`), optionals, defaults, enums by name, tagged unions,
+  slices, arrays, tuples, pointers, `Value`. Strict: `version: 1.10` is a float
+  to the core schema, so a `[]const u8` field refuses it (`WrongType`).
+- **`<<` merge keys** — `ComposeOptions.merge_keys = true` (off by default; not
+  YAML 1.2). Explicit keys win, earlier mappings in a `[*a, *b]` list win,
+  checked against PyYAML.
+
+## Deferred
 - **Schemas other than core.** The failsafe and JSON schemas, and the `!!binary`
   / `!!timestamp` / `!!set` / `!!omap` types, are not resolved; those tags leave
   their scalars as text.
@@ -145,6 +163,7 @@ branch), at both layers, from implementations that have never seen this code:
 |---|---|---|
 | events (scanner + parser) | `test.event`, byte-exact | **402/402**, including all 94 must-reject cases |
 | values (composer + core schema) | `in.json`, structural | **279/279** |
+| emitter (2026-10-04) | `in.json`, after emit → compose | **279/279** |
 
 279, not 282: three `in.json` files belong to must-reject cases, where they are
 a prefix artefact rather than a pass condition. A further 29 non-error cases

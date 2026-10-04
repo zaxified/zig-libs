@@ -63,3 +63,12 @@ changes in between).
 PyYAML 6.0.3 is MIT (`pip show pyyaml` → `License: MIT`); libyaml is Expat
 (`/usr/share/doc/libyaml-0-2/copyright`, Debian's copy of the upstream licence) —
 both permissive, no copyleft obligation.
+
+## 2026-10-04: emitter and merge-key oracles
+
+- `emit_oracle.zig` + `emit_oracle.py` — every yaml-test-suite case with an `in.json`: this
+  module composes and EMITS it, PyYAML (CSafeLoader, YAML 1.1) loads the emitted text, and the
+  result must equal `in.json`. Measured 2026-10-04: 279 distinct cases (1362 paths with the
+  suite's symlinked views), differ=0.
+- `gen_merge_vectors.py` — recipe for `../src/testdata/merge_vectors.zig`: PyYAML's reading of
+  13 merge-key documents.

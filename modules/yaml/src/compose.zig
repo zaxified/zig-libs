@@ -267,7 +267,7 @@ const DupTracker = struct {
 /// `dupEql` (above) has, and the duplicate-key check in `composeNode` does
 /// NOT call this function precisely because untrusted input is what it must
 /// survive. See `dupEql`'s doc comment for the two measured failure modes.
-fn valueEql(a: Value, b: Value) bool {
+pub fn valueEql(a: Value, b: Value) bool {
     return switch (a) {
         .null => b == .null,
         .bool => |av| b == .bool and av == b.bool,
@@ -305,6 +305,9 @@ pub const Error = parser.Error || error{
     DuplicateKey,
     /// Composing needed more than `Options.max_heap_bytes`.
     HeapBudgetExceeded,
+    /// `Options.merge_keys`: a `<<` whose value is neither a mapping nor a
+    /// sequence of mappings.
+    InvalidMerge,
 };
 
 pub const Options = struct {
@@ -351,6 +354,15 @@ pub const Options = struct {
     /// with a producer that emits them on purpose) than have the parse fail
     /// out from under it.
     reject_duplicate_keys: bool = true,
+    /// Resolve YAML 1.1 merge keys (yaml.org/type/merge.html): a plain,
+    /// untagged `<<` (or one tagged `!!merge`) whose value is a mapping, or a
+    /// sequence of mappings, contributes their pairs to the enclosing
+    /// mapping, in place of the `<<` pair — except keys the mapping already
+    /// has explicitly (they win, wherever they stand), and, across a
+    /// sequence, keys an earlier mapping already gave. Not part of YAML 1.2,
+    /// hence off by default: `<<` is then an ordinary string key. Merged keys
+    /// are never duplicates; explicit ones are checked as before.
+    merge_keys: bool = false,
     /// Most bytes the parse and the composed tree may request from the
     /// allocator; `error.HeapBudgetExceeded` past it. `null` means no budget.
     ///
@@ -671,12 +683,15 @@ const Composer = struct {
                 var pairs: std.ArrayList(Pair) = .empty;
                 var dup: DupTracker = .{};
                 defer dup.deinit(self.alloc);
+                // Index in `pairs` of each `<<` pair (merge_keys only).
+                var merges: std.ArrayList(usize) = .empty;
                 while (true) {
                     const nxt = (try self.peek()) orelse return error.InvalidYaml;
                     if (nxt == .mapping_end) {
                         _ = try self.next();
                         break;
                     }
+                    if (self.options.merge_keys and isMergeKey(nxt)) try merges.append(self.alloc, pairs.items.len);
                     const k = try self.composeNode(depth + 1);
                     const val = try self.composeNode(depth + 1);
                     if (self.options.reject_duplicate_keys) {
@@ -684,12 +699,56 @@ const Composer = struct {
                     }
                     try pairs.append(self.alloc, .{ .key = k, .value = val });
                 }
-                const v: Value = .{ .mapping = pairs.items };
+                const v: Value = .{ .mapping = if (merges.items.len == 0) pairs.items else try self.applyMerges(pairs.items, merges.items) };
                 self.finishAnchor(slot, v);
                 return v;
             },
             else => return error.InvalidYaml,
         }
+    }
+
+    /// The pairs of a mapping with every `<<` pair (at `merges`) replaced by
+    /// the pairs it merges in. Keys are compared by data-model equality
+    /// through a `DupTracker`: every explicit key first, then each candidate
+    /// in merge order — one hash probe per scalar key, so merging a large
+    /// shared anchor into many mappings costs time linear in what is added
+    /// (and what is added is charged to `max_heap_bytes`).
+    fn applyMerges(self: *Composer, pairs: []const Pair, merges: []const usize) Error![]const Pair {
+        var seen: DupTracker = .{};
+        defer seen.deinit(self.alloc);
+        var m: usize = 0;
+        for (pairs, 0..) |p, i| {
+            if (m < merges.len and merges[m] == i) {
+                m += 1;
+                continue;
+            }
+            _ = try seen.checkAndInsert(self.alloc, p.key, self.effectiveMaxDepth(), &self.dup_probes);
+        }
+        var out: std.ArrayList(Pair) = .empty;
+        m = 0;
+        for (pairs, 0..) |p, i| {
+            if (!(m < merges.len and merges[m] == i)) {
+                try out.append(self.alloc, p);
+                continue;
+            }
+            m += 1;
+            const sources: []const Value = switch (p.value) {
+                .mapping => (&p.value)[0..1],
+                .sequence => |items| items,
+                else => return error.InvalidMerge,
+            };
+            for (sources) |src| {
+                const src_pairs = switch (src) {
+                    .mapping => |sp| sp,
+                    else => return error.InvalidMerge,
+                };
+                for (src_pairs) |sp| {
+                    if (!try seen.checkAndInsert(self.alloc, sp.key, self.effectiveMaxDepth(), &self.dup_probes))
+                        try out.append(self.alloc, sp);
+                }
+            }
+        }
+        return out.items;
     }
 
     fn resolveScalar(self: *Composer, text: []const u8, style: parser.ScalarStyle, tag: ?[]const u8) Error!Value {
@@ -702,6 +761,18 @@ const Composer = struct {
         return resolvePlain(owned);
     }
 };
+
+/// A merge key: the plain scalar `<<` with no tag, or any scalar tagged
+/// `tag:yaml.org,2002:merge`. A quoted `"<<"` is an ordinary string.
+fn isMergeKey(ev: Event) bool {
+    return switch (ev) {
+        .scalar => |s| if (s.tag) |t|
+            std.mem.eql(u8, t, "tag:yaml.org,2002:merge")
+        else
+            s.style == .plain and std.mem.eql(u8, s.value, "<<"),
+        else => false,
+    };
+}
 
 // ── core schema resolution (YAML 1.2 §10.2.2) ───────────────────────────────
 
