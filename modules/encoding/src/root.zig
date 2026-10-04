@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! encoding — legacy single-byte code page ↔ UTF-8 conversion
-//! (windows-1250/1252, iso-8859-1/2/15). Data-lenient, never traps.
+//! (windows-1250/1252, iso-8859-1/2/15), plus UTF-16, BOM sniffing, a
+//! streaming decoder and a fatal mode (2026-10-04). Lenient by default.
 //!
 //! The WHATWG "single-byte" decoder/encoder for the European code pages a
 //! legacy broker / Excel export is realistically saved in. Internal currency
@@ -23,7 +24,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15).",
+    .doc = "Text decoding to and from UTF-8: 5 European single-byte code pages, UTF-8 and UTF-16 with BOM sniffing, streaming and fatal modes (WHATWG semantics).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -93,40 +94,32 @@ pub const Encoding = enum {
     }
 };
 
-/// Copy `bytes`, replacing every malformed UTF-8 sequence with U+FFFD
-/// (REPLACEMENT CHARACTER) — the WHATWG Encoding Standard's decoder error
-/// mode. Resynchronisation is byte-at-a-time on a malformed sequence, the
-/// same rule `encodeFromUtf8` uses, so a structural ASCII byte following bad
-/// input is never swallowed.
+/// Copy `bytes`, replacing malformed UTF-8 with U+FFFD exactly as the WHATWG
+/// Encoding Standard's UTF-8 decoder does: one U+FFFD per MAXIMAL SUBPART of an
+/// ill-formed sequence (Unicode's recommended practice, also Python's
+/// `errors="replace"`) — `e2 82` truncated is ONE U+FFFD, `f0 80 80` is three
+/// (`80` cannot follow `f0`). Until 2026-10-04 this replaced byte by byte
+/// (two for `e2 82`) while the doc said "WHATWG". Either way a byte that
+/// cannot continue a sequence is re-read on its own, so an ASCII delimiter
+/// after bad input is never swallowed.
 fn sanitizeUtf8(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
     // Overwhelmingly the input is already valid; pay one scan to find out.
     if (std.unicode.utf8ValidateSlice(bytes)) return alloc.dupe(u8, bytes);
-
+    var d: Decoder = .init(.{ .encoding = .utf8 }, .{});
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.ensureTotalCapacity(alloc, bytes.len);
-
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
-            try out.appendSlice(alloc, replacement_char);
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > bytes.len) {
-            try out.appendSlice(alloc, replacement_char);
-            i += 1;
-            continue;
-        }
-        _ = std.unicode.utf8Decode(bytes[i .. i + seq_len]) catch {
-            try out.appendSlice(alloc, replacement_char);
-            i += 1;
-            continue;
-        };
-        try out.appendSlice(alloc, bytes[i .. i + seq_len]);
-        i += seq_len;
-    }
+    d.feed(alloc, &out, bytes) catch |e| return lenientOnly(e);
+    d.finish(alloc, &out) catch |e| return lenientOnly(e);
     return out.toOwnedSlice(alloc);
+}
+
+/// A lenient decoder never reports `Malformed`; only allocation can fail.
+fn lenientOnly(e: Decoder.Error) error{OutOfMemory} {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Malformed => unreachable,
+    };
 }
 
 /// U+FFFD in UTF-8.
@@ -216,6 +209,270 @@ pub fn encodeFromUtf8(alloc: std.mem.Allocator, utf8: []const u8, enc: Encoding)
     }
     return out.toOwnedSlice(alloc);
 }
+
+// ── UTF-16, BOM sniffing, streaming and fatal decoding (2026-10-04) ─────────
+//
+// UTF-16 is deliberately NOT a member of `Encoding`. Every `Encoding` is
+// ASCII-compatible: a byte below 0x80 is that ASCII character in every one,
+// which is what lets a caller transcode a CSV cell by cell and write its
+// delimiters as plain bytes (bxp does). UTF-16 breaks that — `,` is `2c 00` —
+// so it gets its own entry points and cannot be picked by accident through
+// `Encoding.parse` or an enum listing.
+
+pub const Utf16Endian = enum { le, be };
+
+/// What a byte-order mark at the start of a buffer says.
+pub const Bom = enum {
+    utf8, // ef bb bf
+    utf16le, // ff fe
+    utf16be, // fe ff
+
+    pub fn len(self: Bom) usize {
+        return if (self == .utf8) 3 else 2;
+    }
+};
+
+/// The BOM `bytes` starts with, if any (WHATWG "BOM sniff"). Note that a
+/// UTF-32LE BOM (`ff fe 00 00`) sniffs as UTF-16LE, as in the Standard.
+pub fn sniffBom(bytes: []const u8) ?Bom {
+    if (std.mem.startsWith(u8, bytes, "\xef\xbb\xbf")) return .utf8;
+    if (std.mem.startsWith(u8, bytes, "\xff\xfe")) return .utf16le;
+    if (std.mem.startsWith(u8, bytes, "\xfe\xff")) return .utf16be;
+    return null;
+}
+
+pub const Decoded = struct {
+    /// Valid UTF-8, without the BOM. Caller owns it.
+    text: []u8,
+    /// The BOM that decided the encoding, or null when `fallback` was used.
+    bom: ?Bom,
+};
+
+/// The WHATWG "decode" algorithm: a BOM, when present, overrides `fallback`
+/// and is removed; otherwise `bytes` are decoded as `fallback`. Lenient
+/// (malformed input becomes U+FFFD). Use this for a file whose encoding is
+/// declared somewhere but might carry a BOM — an Excel "Unicode Text" export
+/// is UTF-16LE with `ff fe`, whatever the declaration says.
+pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, fallback: Encoding) !Decoded {
+    if (sniffBom(bytes)) |b| {
+        const rest = bytes[b.len()..];
+        const text = switch (b) {
+            .utf8 => try sanitizeUtf8(alloc, rest),
+            .utf16le => try decodeUtf16(alloc, rest, .le),
+            .utf16be => try decodeUtf16(alloc, rest, .be),
+        };
+        return .{ .text = text, .bom = b };
+    }
+    return .{ .text = try decodeToUtf8(alloc, bytes, fallback), .bom = null };
+}
+
+/// Decode UTF-16 (no BOM handling — see `decode`) into valid UTF-8, the WHATWG
+/// way: an unpaired surrogate is one U+FFFD, a lead surrogate followed by a
+/// non-trail unit is U+FFFD and the unit is read again, an odd final byte is
+/// U+FFFD. Caller owns the result.
+pub fn decodeUtf16(alloc: std.mem.Allocator, bytes: []const u8, endian: Utf16Endian) ![]u8 {
+    var d: Decoder = .init(.{ .utf16 = endian }, .{});
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, bytes.len + bytes.len / 2);
+    d.feed(alloc, &out, bytes) catch |e| return lenientOnly(e);
+    d.finish(alloc, &out) catch |e| return lenientOnly(e);
+    return out.toOwnedSlice(alloc);
+}
+
+/// Encode UTF-8 as UTF-16 (`bom`: prepend `ff fe` / `fe ff`). Malformed UTF-8
+/// becomes U+FFFD (maximal subparts, as the decoder) — unlike the single-byte
+/// encoders it cannot pass a stray byte through, UTF-16 has no byte to keep.
+/// Caller owns the result.
+pub fn encodeUtf16(alloc: std.mem.Allocator, utf8: []const u8, endian: Utf16Endian, bom: bool) ![]u8 {
+    const valid = try sanitizeUtf8(alloc, utf8);
+    defer alloc.free(valid);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, valid.len * 2 + 2);
+    if (bom) try appendUnit(alloc, &out, 0xFEFF, endian);
+    const view = std.unicode.Utf8View.initUnchecked(valid);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp >= 0x10000) {
+            const v = cp - 0x10000;
+            try appendUnit(alloc, &out, @intCast(0xD800 + (v >> 10)), endian);
+            try appendUnit(alloc, &out, @intCast(0xDC00 + (v & 0x3FF)), endian);
+        } else try appendUnit(alloc, &out, @intCast(cp), endian);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn appendUnit(alloc: std.mem.Allocator, out: *std.ArrayList(u8), unit: u16, endian: Utf16Endian) !void {
+    var b: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b, unit, if (endian == .le) .little else .big);
+    try out.appendSlice(alloc, &b);
+}
+
+/// Whole-buffer decode in FATAL mode (WHATWG `fatal`): `error.Malformed` at
+/// the first ill-formed sequence instead of U+FFFD. Single-byte pages cannot
+/// be malformed, so for them this equals `decodeToUtf8`.
+pub fn decodeFatal(alloc: std.mem.Allocator, bytes: []const u8, kind: Decoder.Kind) Decoder.Error![]u8 {
+    var d: Decoder = .init(kind, .{ .fatal = true });
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, bytes.len);
+    try d.feed(alloc, &out, bytes);
+    try d.finish(alloc, &out);
+    return out.toOwnedSlice(alloc);
+}
+
+/// Streaming decoder: feed input in chunks of any size — a multi-byte UTF-8
+/// sequence or a UTF-16 unit / surrogate pair split across chunks is carried
+/// over — and call `finish` at the end of the stream. The output is the same
+/// as decoding the concatenation in one call (tested at every split point).
+/// State is a few bytes; no allocation beyond `out`.
+pub const Decoder = struct {
+    kind: Kind,
+    fatal: bool,
+    // UTF-8 (WHATWG "UTF-8 decoder" state).
+    needed: u8 = 0,
+    seen: u8 = 0,
+    cp: u21 = 0,
+    lower: u8 = 0x80,
+    upper: u8 = 0xBF,
+    // UTF-16.
+    lead_byte: ?u8 = null,
+    lead_surrogate: ?u16 = null,
+    /// Set once `fatal` reported an error; the decoder refuses further input.
+    failed: bool = false,
+
+    pub const Kind = union(enum) {
+        /// Any `Encoding` (UTF-8 or a single-byte page).
+        encoding: Encoding,
+        utf16: Utf16Endian,
+    };
+    pub const Options = struct {
+        /// `error.Malformed` instead of U+FFFD (WHATWG `fatal`).
+        fatal: bool = false,
+    };
+    pub const Error = std.mem.Allocator.Error || error{Malformed};
+
+    pub fn init(kind: Kind, opts: Options) Decoder {
+        return .{ .kind = kind, .fatal = opts.fatal };
+    }
+
+    fn bad(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+        if (self.fatal) {
+            self.failed = true;
+            return error.Malformed;
+        }
+        try out.appendSlice(alloc, replacement_char);
+    }
+
+    fn emit(alloc: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) !void {
+        var b: [4]u8 = undefined;
+        // Only scalar values reach here (surrogates are filtered by both
+        // state machines), so this cannot fail.
+        const n = std.unicode.utf8Encode(cp, &b) catch unreachable;
+        try out.appendSlice(alloc, b[0..n]);
+    }
+
+    /// Decode `chunk`, appending UTF-8 to `out`.
+    pub fn feed(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8), chunk: []const u8) Error!void {
+        if (self.failed) return error.Malformed;
+        switch (self.kind) {
+            .encoding => |enc| if (enc == .utf8) {
+                for (chunk) |b| try self.utf8Byte(alloc, out, b);
+            } else {
+                const table = highTable(enc);
+                for (chunk) |b| {
+                    if (b < 0x80) try out.append(alloc, b) else try emit(alloc, out, table[b - 0x80]);
+                }
+            },
+            .utf16 => |endian| for (chunk) |b| try self.utf16Byte(alloc, out, b, endian),
+        }
+    }
+
+    /// End of stream: an unfinished sequence is one more U+FFFD (or
+    /// `error.Malformed`). The decoder is reset and may be reused.
+    pub fn finish(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+        if (self.failed) return error.Malformed;
+        const pending = self.needed != 0 or self.lead_byte != null or self.lead_surrogate != null;
+        self.* = .init(self.kind, .{ .fatal = self.fatal });
+        if (pending) try self.bad(alloc, out);
+    }
+
+    fn utf8Byte(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8), b: u8) Error!void {
+        if (self.needed == 0) {
+            switch (b) {
+                0x00...0x7F => try out.append(alloc, b),
+                0xC2...0xDF => {
+                    self.needed = 1;
+                    self.cp = b & 0x1F;
+                },
+                0xE0...0xEF => {
+                    if (b == 0xE0) self.lower = 0xA0; // no overlongs
+                    if (b == 0xED) self.upper = 0x9F; // no surrogates
+                    self.needed = 2;
+                    self.cp = b & 0x0F;
+                },
+                0xF0...0xF4 => {
+                    if (b == 0xF0) self.lower = 0x90; // no overlongs
+                    if (b == 0xF4) self.upper = 0x8F; // nothing past U+10FFFF
+                    self.needed = 3;
+                    self.cp = b & 0x07;
+                },
+                else => try self.bad(alloc, out),
+            }
+            return;
+        }
+        if (b < self.lower or b > self.upper) {
+            // The maximal subpart so far is one error; `b` is read again.
+            self.needed = 0;
+            self.seen = 0;
+            self.cp = 0;
+            self.lower = 0x80;
+            self.upper = 0xBF;
+            try self.bad(alloc, out);
+            return self.utf8Byte(alloc, out, b);
+        }
+        self.lower = 0x80;
+        self.upper = 0xBF;
+        self.cp = (self.cp << 6) | (b & 0x3F);
+        self.seen += 1;
+        if (self.seen != self.needed) return;
+        const cp = self.cp;
+        self.needed = 0;
+        self.seen = 0;
+        self.cp = 0;
+        try emit(alloc, out, cp);
+    }
+
+    fn utf16Byte(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8), b: u8, endian: Utf16Endian) Error!void {
+        const lead = self.lead_byte orelse {
+            self.lead_byte = b;
+            return;
+        };
+        self.lead_byte = null;
+        const unit: u16 = if (endian == .le) (@as(u16, b) << 8) | lead else (@as(u16, lead) << 8) | b;
+        try self.utf16Unit(alloc, out, unit);
+    }
+
+    fn utf16Unit(self: *Decoder, alloc: std.mem.Allocator, out: *std.ArrayList(u8), unit: u16) Error!void {
+        if (self.lead_surrogate) |ls| {
+            self.lead_surrogate = null;
+            if (unit >= 0xDC00 and unit <= 0xDFFF) {
+                const cp: u21 = 0x10000 + ((@as(u21, ls) - 0xD800) << 10) + (unit - 0xDC00);
+                return emit(alloc, out, cp);
+            }
+            // Unpaired lead: one error, then this unit on its own.
+            try self.bad(alloc, out);
+            return self.utf16Unit(alloc, out, unit);
+        }
+        if (unit >= 0xD800 and unit <= 0xDBFF) {
+            self.lead_surrogate = unit;
+            return;
+        }
+        if (unit >= 0xDC00 and unit <= 0xDFFF) return self.bad(alloc, out);
+        try emit(alloc, out, unit);
+    }
+};
 
 /// Reverse lookup: find the high byte (0x80–0xFF) that maps to `cp` in `table`.
 /// Linear scan — the table is 128 entries and the encode path is a rare,
@@ -677,8 +934,227 @@ test "corpus: every seed reaches both codecs, and the octets produced are pinned
     try std.testing.expectEqual(codec_seeds.len, nonempty);
     // Measured 2026-09-07: with the collapsing draw and the collapsing index,
     // 0 seeds arrived non-empty and every run was `.utf8` over an empty slice —
-    // 0 / 0 / 0. After: 12 seeds, 208 / 879 / 550.
-    try std.testing.expectEqual(@as(usize, 208), utf8_decoded);
+    // 0 / 0 / 0. After: 12 seeds, 208 / 879 / 550. 2026-10-04: 205 — the
+    // `ab e2 82` seed now decodes to ONE U+FFFD (maximal subpart, WHATWG),
+    // not two, which is 3 octets fewer.
+    try std.testing.expectEqual(@as(usize, 205), utf8_decoded);
     try std.testing.expectEqual(@as(usize, 879), table_decoded);
     try std.testing.expectEqual(@as(usize, 550), table_encoded);
+}
+
+// ── UTF-8 / UTF-16 against CPython, streaming, fatal, BOM (2026-10-04) ─────
+
+fn hexAlloc(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, hex.len / 2);
+    _ = try std.fmt.hexToBytes(out, hex);
+    return out;
+}
+
+fn decodeKind(alloc: std.mem.Allocator, kind: Decoder.Kind, bytes: []const u8) ![]u8 {
+    return switch (kind) {
+        .encoding => |e| decodeToUtf8(alloc, bytes, e),
+        .utf16 => |e| decodeUtf16(alloc, bytes, e),
+    };
+}
+
+/// Decode through the streaming decoder with `bytes` cut at `cut` (and
+/// byte by byte when `cut` is null).
+fn decodeSplit(alloc: std.mem.Allocator, kind: Decoder.Kind, bytes: []const u8, cut: ?usize) ![]u8 {
+    var d: Decoder = .init(kind, .{});
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (cut) |c| {
+        try d.feed(alloc, &out, bytes[0..c]);
+        try d.feed(alloc, &out, bytes[c..]);
+    } else for (bytes) |b| try d.feed(alloc, &out, &.{b});
+    try d.finish(alloc, &out);
+    return out.toOwnedSlice(alloc);
+}
+
+test "UTF-8 / UTF-16 decode and UTF-16 encode agree with CPython's codecs on every golden case" {
+    // `tools/codec-oracle.py` wrote these from CPython (errors="replace",
+    // maximal subparts — the WHATWG rule): valid sequences of every length,
+    // truncations, overlongs, encoded surrogates, lone/swapped surrogates, odd
+    // lengths and random bytes. Each case is also decoded through the
+    // streaming decoder at every split point and byte by byte, and in fatal
+    // mode, which must fail exactly when CPython's strict decode does.
+    const a = testing.allocator;
+    var lines = std.mem.splitScalar(u8, @embedFile("testdata/codec_golden.txt"), '\n');
+    var n_dec: usize = 0;
+    var n_bad: usize = 0;
+    var n_enc: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const codec = f.next().?;
+        const input = try hexAlloc(a, f.next().?);
+        defer a.free(input);
+        const want = try hexAlloc(a, f.next().?);
+        defer a.free(want);
+        const strict = std.mem.eql(u8, f.next().?, "1");
+
+        if (std.mem.startsWith(u8, codec, "enc-")) {
+            const e: Utf16Endian = if (std.mem.endsWith(u8, codec, "le")) .le else .be;
+            const got = try encodeUtf16(a, input, e, false);
+            defer a.free(got);
+            try testing.expectEqualSlices(u8, want, got);
+            n_enc += 1;
+            continue;
+        }
+        const kind: Decoder.Kind = if (std.mem.eql(u8, codec, "utf-8"))
+            .{ .encoding = .utf8 }
+        else if (std.mem.eql(u8, codec, "utf-16le")) .{ .utf16 = .le } else .{ .utf16 = .be };
+
+        const got = try decodeKind(a, kind, input);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+        for (0..input.len + 1) |cut| {
+            const s = try decodeSplit(a, kind, input, cut);
+            defer a.free(s);
+            try testing.expectEqualSlices(u8, want, s);
+        }
+        const bb = try decodeSplit(a, kind, input, null);
+        defer a.free(bb);
+        try testing.expectEqualSlices(u8, want, bb);
+
+        if (decodeFatal(a, input, kind)) |ok| {
+            defer a.free(ok);
+            try testing.expect(strict);
+            try testing.expectEqualSlices(u8, want, ok);
+        } else |err| {
+            try testing.expectEqual(error.Malformed, err);
+            try testing.expect(!strict);
+            n_bad += 1;
+        }
+        n_dec += 1;
+    }
+    // Both outcomes in bulk, for all three codecs, or the file is not what it was.
+    try testing.expect(n_dec > 4500);
+    try testing.expect(n_bad > 3500);
+    try testing.expect(n_enc > 1000);
+}
+
+test "UTF-8 replacement is per maximal subpart (WHATWG), and delimiters survive" {
+    // Hand-checked against the Standard's UTF-8 decoder: `e2 82` is one
+    // unfinished sequence; `f0 80`: 80 is outside f0's 90..bf, so f0 alone is
+    // an error and both 80s are lone continuations; `ed a0`: a0 is outside
+    // ed's 80..9f (it would encode a surrogate).
+    try expectDecode(.utf8, "a\xe2\x82,b", "a\u{FFFD},b");
+    try expectDecode(.utf8, "\xf0\x80\x80", "\u{FFFD}\u{FFFD}\u{FFFD}");
+    try expectDecode(.utf8, "\xed\xa0\x80", "\u{FFFD}\u{FFFD}\u{FFFD}");
+    try expectDecode(.utf8, "\xf0\x9f\x98", "\u{FFFD}");
+    try expectDecode(.utf8, "\xf4\x90\x80\x80", "\u{FFFD}" ** 4);
+    try expectDecode(.utf8, "\xe2\x82\xac\xe2\x82", "\u{20AC}\u{FFFD}");
+}
+
+test "UTF-16: surrogate handling by hand" {
+    const a = testing.allocator;
+    const Case = struct { []const u8, Utf16Endian, []const u8 };
+    for ([_]Case{
+        .{ "A\x00", .le, "A" },
+        .{ "\x00A", .be, "A" },
+        .{ "\x3d\xd8\x00\xde", .le, "\u{1F600}" }, // D83D DE00
+        .{ "\x00\xd8A\x00", .le, "\u{FFFD}A" }, // lead + non-trail: error, unit re-read
+        .{ "\x00\xd8\x00\xd8\x00\xdc", .le, "\u{FFFD}\u{10000}" },
+        .{ "\x00\xdc", .le, "\u{FFFD}" }, // lone trail
+        .{ "A\x00B", .le, "A\u{FFFD}" }, // odd final byte
+        .{ "\x00\xd8", .le, "\u{FFFD}" }, // lead at end
+        .{ "\x00\xd8A", .le, "\u{FFFD}" }, // lead + odd byte at end: one error (Standard: both pending, one error)
+    }) |c| {
+        const got = try decodeUtf16(a, c[0], c[1]);
+        defer a.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
+}
+
+test "BOM: sniffed, removed, and it overrides the fallback" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(?Bom, .utf8), sniffBom("\xef\xbb\xbfx"));
+    try testing.expectEqual(@as(?Bom, .utf16le), sniffBom("\xff\xfex\x00"));
+    try testing.expectEqual(@as(?Bom, .utf16be), sniffBom("\xfe\xff\x00x"));
+    try testing.expectEqual(@as(?Bom, null), sniffBom("\xef\xbb"));
+    try testing.expectEqual(@as(?Bom, null), sniffBom(""));
+
+    // An Excel "Unicode Text" export: UTF-16LE with BOM, declared windows-1250.
+    const xl = "\xff\xfe" ++ "P\x00\x59\x01\xed\x00,\x00\n\x00";
+    const d = try decode(a, xl, .windows_1250);
+    defer a.free(d.text);
+    try testing.expectEqual(@as(?Bom, .utf16le), d.bom);
+    try testing.expectEqualStrings("P\u{159}\u{ed},\n", d.text);
+    // UTF-8 BOM removed.
+    const d8 = try decode(a, "\xef\xbb\xbfa,b", .windows_1250);
+    defer a.free(d8.text);
+    try testing.expectEqualStrings("a,b", d8.text);
+    // No BOM: the fallback decides (0xF8 is ř in windows-1250).
+    const dl = try decode(a, "\xf8", .windows_1250);
+    defer a.free(dl.text);
+    try testing.expectEqual(@as(?Bom, null), dl.bom);
+    try testing.expectEqualStrings("\u{159}", dl.text);
+}
+
+test "encodeUtf16: BOM, surrogate pairs, round trip" {
+    const a = testing.allocator;
+    const le = try encodeUtf16(a, "A\u{1F600}", .le, true);
+    defer a.free(le);
+    try testing.expectEqualSlices(u8, "\xff\xfeA\x00\x3d\xd8\x00\xde", le);
+    const be = try encodeUtf16(a, "A\u{1F600}", .be, false);
+    defer a.free(be);
+    try testing.expectEqualSlices(u8, "\x00A\xd8\x3d\xde\x00", be);
+    // U+10000 is the first codepoint that needs a pair: D800 DC00 (mutation
+    // 2026-10-04: `cp > 0x10000` survived — nothing encoded the boundary).
+    const first_pair = try encodeUtf16(a, "\u{10000}\u{FFFF}", .le, false);
+    defer a.free(first_pair);
+    try testing.expectEqualSlices(u8, "\x00\xd8\x00\xdc\xff\xff", first_pair);
+    const back = try decode(a, le, .utf8);
+    defer a.free(back.text);
+    try testing.expectEqualStrings("A\u{1F600}", back.text);
+}
+
+test "Decoder: fatal stops at the first error and stays failed; lenient is reusable after finish" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    var d: Decoder = .init(.{ .encoding = .utf8 }, .{ .fatal = true });
+    try d.feed(a, &out, "ok");
+    try testing.expectError(error.Malformed, d.feed(a, &out, "\xff"));
+    try testing.expectError(error.Malformed, d.feed(a, &out, "more"));
+    try testing.expectError(error.Malformed, d.finish(a, &out));
+    try testing.expectEqualStrings("ok", out.items);
+    // A truncated sequence is only an error at finish.
+    out.clearRetainingCapacity();
+    var t: Decoder = .init(.{ .encoding = .utf8 }, .{ .fatal = true });
+    try t.feed(a, &out, "\xe2\x82");
+    try testing.expectError(error.Malformed, t.finish(a, &out));
+    // Lenient: finish flushes the pending sequence and resets.
+    out.clearRetainingCapacity();
+    var l: Decoder = .init(.{ .utf16 = .le }, .{});
+    try l.feed(a, &out, "A");
+    try l.finish(a, &out);
+    try l.feed(a, &out, "B\x00");
+    try l.finish(a, &out);
+    try testing.expectEqualStrings("\u{FFFD}B", out.items);
+    // Single-byte pages cannot be malformed: fatal == lenient.
+    const all = comptime blk: {
+        var b: [256]u8 = undefined;
+        for (&b, 0..) |*x, i| x.* = i;
+        break :blk b;
+    };
+    const f = try decodeFatal(a, &all, .{ .encoding = .windows_1250 });
+    defer a.free(f);
+    const g = try decodeToUtf8(a, &all, .windows_1250);
+    defer a.free(g);
+    try testing.expectEqualStrings(g, f);
+}
+
+test "Encoding stays ASCII-compatible: UTF-16 is not one of its members" {
+    // bxp transcodes CSV cell by cell and writes delimiters as raw bytes, which
+    // is only sound because every `Encoding` maps bytes < 0x80 to ASCII.
+    inline for (@typeInfo(Encoding).@"enum".fields) |f| {
+        const e: Encoding = @enumFromInt(f.value);
+        const got = try decodeToUtf8(testing.allocator, ",;\"\r\n", e);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(",;\"\r\n", got);
+    }
+    try testing.expect(Encoding.parse("utf-16le") == null);
+    try testing.expect(Encoding.parse("utf-16") == null);
 }

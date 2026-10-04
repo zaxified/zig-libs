@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core.** UTF-16 (`decodeUtf16`, `encodeUtf16`, `Utf16Endian`), BOM
+  sniffing (`sniffBom`, `Bom`, `decode` = WHATWG "decode": a BOM overrides the fallback and is
+  removed), a streaming `Decoder` (chunks of any size, split sequences carried over) and fatal
+  mode (`decodeFatal`, `Decoder.Options.fatal` → `error.Malformed`). UTF-16 is deliberately not an
+  `Encoding` member (every `Encoding` stays ASCII-compatible). **Behaviour change:**
+  `decodeToUtf8(.utf8)` now replaces each maximal subpart of ill-formed UTF-8 with one U+FFFD, as
+  WHATWG does (`e2 82` → one U+FFFD; was two). Checked against CPython's codecs on 5 669 cases
+  (`tools/codec-oracle.py`), every split point; mutation 18 mutants, 0 surviving (1 equivalent).
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/normative_test.zig`, `src/normative_vectors.zig` and `src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

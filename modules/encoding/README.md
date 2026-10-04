@@ -14,10 +14,10 @@ source code. Tests are anchored against vendored third-party normative DATA
 (the WHATWG Encoding Standard's `index-*.txt` tables and Unicode.org's
 `8859-1.TXT`); see `modules/encoding/NOTICE` for the attribution that data
 carries.
-This is the WHATWG **single-byte European subset** — the deliberate, complete
-scope of this module (the legacy code pages a European broker / Excel export is
-realistically saved in). Broader coverage (other single-byte pages, multi-byte/
-CJK, UTF-16) is intentionally **out of scope**, not planned — see below.
+This is the WHATWG **single-byte European subset** plus, since 2026-10-04,
+**UTF-16** (LE/BE), **BOM sniffing**, a **streaming** decoder and a **fatal**
+mode — WHATWG semantics throughout. Other single-byte pages and CJK stay out
+of scope — see below.
 
 ## Supported encodings
 
@@ -49,12 +49,31 @@ fn Encoding.canonicalName(self) []const u8;
 
 fn decodeToUtf8(alloc, bytes: []const u8, enc: Encoding) ![]u8;   // caller owns result
 fn encodeFromUtf8(alloc, utf8: []const u8, enc: Encoding) ![]u8;  // caller owns result
+
+// 2026-10-04: UTF-16, BOM, streaming, fatal
+fn decode(alloc, bytes, fallback: Encoding) !Decoded;           // WHATWG "decode": a BOM wins and is removed
+fn sniffBom(bytes) ?Bom;                                         // .utf8 / .utf16le / .utf16be
+fn decodeUtf16(alloc, bytes, endian: Utf16Endian) ![]u8;
+fn encodeUtf16(alloc, utf8, endian: Utf16Endian, bom: bool) ![]u8;
+fn decodeFatal(alloc, bytes, kind: Decoder.Kind) ![]u8;         // error.Malformed instead of U+FFFD
+
+var d: Decoder = .init(.{ .encoding = .windows_1250 }, .{});    // or .{ .utf16 = .le }; .fatal = true
+try d.feed(alloc, &out, chunk);                                  // any chunking: split sequences carry over
+try d.finish(alloc, &out);                                       // end of stream
 ```
+
+**UTF-16 is not an `Encoding` member, on purpose.** Every `Encoding` maps bytes
+below 0x80 to ASCII, which is what lets a caller transcode a CSV cell by cell and
+write the delimiters as raw bytes. In UTF-16 `,` is `2c 00`, so UTF-16 has its own
+entry points and cannot be selected through `Encoding.parse` or an enum listing.
+An Excel "Unicode Text" export (UTF-16LE with `ff fe`) is read with
+`decode(alloc, bytes, fallback)`.
 
 **Data-lenient — never traps.** `decodeToUtf8` returns **valid UTF-8
 unconditionally**: from a legacy page structurally (all 128 high bytes map),
-and from `.utf8` because malformed input is replaced with U+FFFD, WHATWG's own
-decoder error mode. On encode, a codepoint with no representation in the target
+and from `.utf8` because malformed input is replaced with U+FFFD — one per
+**maximal subpart** of an ill-formed sequence, WHATWG's decoder error mode (since
+2026-10-04; before it was one per byte, so `e2 82` was two U+FFFD, now one). On encode, a codepoint with no representation in the target
 page becomes `'?'`, and invalid/truncated UTF-8 passes through verbatim
 byte-for-byte, resynchronising **one byte at a time** so a delimiter right
 after bad input is never swallowed. Neither direction ever errors on content
@@ -71,8 +90,9 @@ these five pages is accepted, and leading/trailing whitespace is stripped.
 ## Out of scope (not planned)
 
 Broader WHATWG Encoding Standard coverage — other single-byte pages
-(windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS,
-EUC-JP, GBK/GB18030, Big5), and UTF-16 — is **intentionally not built**. The
+(windows-1251/1253–1258, KOI8, ISO-8859-3..16) and multi-byte/CJK (Shift-JIS,
+EUC-JP, GBK/GB18030, Big5) — is **intentionally not built** (every table ships
+in every consumer's binary). The
 `build(&overrides)` table pattern would generalize, but there is no in-house
 need beyond the European subset; a project that must ingest CJK/Cyrillic legacy
 text should handle that at its own edge. Reopen only on a concrete requirement.
@@ -82,6 +102,10 @@ text should handle that at its own edge. Reopen only on a concrete requirement.
 ```
 zig build test-encoding
 ```
+
+UTF-8 and UTF-16 decoding (whole buffer, at every split point, byte by byte,
+fatal) and UTF-16 encoding are checked against CPython's codecs on 5 669 cases
+(`tools/codec-oracle.py`, golden in `src/testdata/codec_golden.txt`).
 
 Every high-table entry (128 bytes × 5 code pages = 640 byte/codepoint pairs)
 is cross-checked in both directions (decode and encode) against the vendored
