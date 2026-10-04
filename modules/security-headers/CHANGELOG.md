@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (26 mutants, all killed). One new test: the
+  `init`-time header-budget sum equals the bytes `apply` serializes, every header enabled.
+  No behaviour change.
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` said the reproduced
   OWASP example header lines "add no condition beyond MIT's own" and pointed the reader
   at upstream's `LICENSE.txt` — not a file in this tree. Apache-2.0 §4(a) is now

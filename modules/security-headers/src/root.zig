@@ -1072,3 +1072,43 @@ test "init rejects an extra header whose NAME is not a field token" {
         .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
     });
 }
+
+// ── audit 2026-10-04: test asked for by mutation survivors ──────────────────
+
+test "the init-time budget sum counts exactly the bytes apply puts on the wire" {
+    // `appliedHeaderBytes` "mirrors apply's own field list and conditions
+    // exactly" — it is what `init`'s `HeaderBudgetExceeded` check measures,
+    // so a header it forgets is budget the check cannot see. Oracle: the
+    // serialized head of a response `apply` wrote, every header enabled,
+    // summing name + value of each line except the two the writer adds itself.
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const sh: SecurityHeaders = try .init(.{
+        .hsts = .{ .max_age_s = 63072000, .include_subdomains = true, .preload = true },
+        .content_security_policy = "default-src 'self'",
+        .content_security_policy_report_only = "script-src 'none'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "srv",
+        .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
+    });
+    try sh.apply(&rw);
+    try rw.end();
+    const head = out.buffered();
+    var it = std.mem.splitSequence(u8, head[0..std.mem.indexOf(u8, head, "\r\n\r\n").?], "\r\n");
+    _ = it.next(); // status line
+    var wire_bytes: usize = 0;
+    var lines: usize = 0;
+    while (it.next()) |line| {
+        const colon = std.mem.indexOf(u8, line, ": ").?;
+        const name = line[0..colon];
+        if (std.mem.eql(u8, name, "Connection") or std.mem.eql(u8, name, "Content-Length")) continue;
+        wire_bytes += name.len + line.len - colon - 2;
+        lines += 1;
+    }
+    try testing.expectEqual(@as(usize, 12), lines); // all eleven named headers + one extra
+    try testing.expectEqual(wire_bytes, sh.appliedHeaderBytes());
+}

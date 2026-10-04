@@ -6,7 +6,7 @@
 
 **Scope:** core — helmet.js 8.3.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -93,6 +93,14 @@ OWASP page publish a single recommended CSP value string comparable to `csp_helm
 self-anchored; running `helmet.js` itself was ruled out by the missing `node`/`npm`, not attempted.
 
 Run: `zig build test-security-headers`.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 26
+mutants — `validFieldName` (empty, `:`/SP), the extra-name check, both HSTS flags, the budget
+comparison (boundary and removal), seven terms of `appliedHeaderBytes` and every one of
+`apply`'s twelve emissions. First run: 22 killed, 4 alive — `appliedHeaderBytes` terms
+(Report-Only CSP, COEP, Server, Permissions-Policy) the budget tests never summed; one test
+added that checks the sum against the bytes `apply` actually serialized with every header
+enabled; rerun: 26 killed. No defect found.
 
 ## Backlog / deferred
 
