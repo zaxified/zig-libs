@@ -821,6 +821,10 @@ fn controlDatagram(pid: u32, seq: u32, flags: u16) [codec.header_len]u8 {
 /// The first message of the golden dump reply, with its header's `pid`,
 /// `seq` and `type` replaced -- one canned single-entry reply datagram.
 fn goldenFirstMessage(buf: []u8, pid: u32, seq: u32, msg_type: u16) []const u8 {
+    // The golden bytes are little-endian; on a big-endian target the length
+    // read below is a comptime-known garbage value and the slice would not
+    // even compile (check-portable, mips32). Callers skip there.
+    if (comptime native_endian != .little) return &.{};
     const g = &goldens.dump_reply_three_flows;
     const len = std.mem.readInt(u32, g[0..4], native_endian);
     @memcpy(buf[0..len], g[0..len]);
@@ -831,6 +835,7 @@ fn goldenFirstMessage(buf: []u8, pid: u32, seq: u32, msg_type: u16) []const u8 {
 }
 
 test "single-entry await: replies for another port or sequence are skipped; a bare ACK is NotFound" {
+    if (native_endian != .little) return error.SkipZigTest; // golden bytes are LE
     // `awaitFlowOver` answers only a message addressed to THIS socket's port
     // and THIS request's sequence (a late reply to an earlier request, or one
     // for another socket, must not be taken as the answer), and a bare ACK
@@ -857,6 +862,7 @@ test "single-entry await: replies for another port or sequence are skipped; a ba
 }
 
 test "dump engine: a record that is not IPCTNL_MSG_CT_NEW is skipped, not decoded as a flow" {
+    if (native_endian != .little) return error.SkipZigTest; // golden bytes are LE
     // A dump answers with `IPCTNL_MSG_CT_NEW` records; anything else in the
     // stream (here the same entry re-typed `CT_DELETE`) is not a table entry
     // and must not be collected. Mutation 2026-10-04: dropping the type
