@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog items 1–4 except the ring). ADDED
+  `rawsock.filter`: `compile` (a pcap-filter(7) subset — `ip`/`ip6`/`arp`/`icmp`/`tcp`/`udp`/
+  `sctp`, `ether src|dst|host|proto`, `ip [src|dst] host|net`, `ip proto`, `[tcp|udp|sctp]
+  [src|dst] port`, `and`/`or`/`not`/parentheses — with libpcap's meaning, verified frame by frame
+  against `tcpdump -r` on a 20-frame corpus for 35 expressions) and `run` (a classic-BPF
+  interpreter with kernel semantics, itself checked against libpcap's own `tcpdump -dd`
+  programs). `rawsock.pcap`: savefile writer/reader (µs/ns, either byte order) that reproduces
+  `tcpdump -w` files byte for byte. `Options.timestamps` → `Frame.timestamp_ns`
+  (`SO_TIMESTAMPNS`). `Socket.joinFanout` (`PACKET_FANOUT`, `FanoutMode`, defrag/rollover).
+  `Frame.timestamp_ns` is a defaulted field and `Options.timestamps` is best-effort like
+  `PACKET_AUXDATA` (null when the kernel refuses), so no error set changed — source-compatible. Mutation: 41 mutants, 35
+  killed at once, 4 killed by new tests, 2 equivalent (removed: a dead step guard in `run`, a
+  redundant empty-octet check in the IPv4 parser).
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's last surviving
   mutant (m33, `setPromisc(false)` never actually issuing `DROP_MEMBERSHIP`) gets a
   permanent regression test. The prior measurement attempt checked the wrong kernel

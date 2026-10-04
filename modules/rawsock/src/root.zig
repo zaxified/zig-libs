@@ -45,6 +45,11 @@ const testkit = @import("testkit");
 const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 
+/// pcap savefile writer/reader (tcpdump interchange) — see `pcap.zig`.
+pub const pcap = @import("pcap.zig");
+/// tcpdump-style filter expressions → classic BPF, and a BPF interpreter.
+pub const filter = @import("filter.zig");
+
 const linux = std.os.linux;
 
 comptime {
@@ -447,6 +452,13 @@ pub const Socket = struct {
         /// worth on a busy segment) and stay there, delivered despite the
         /// filter once it finally attaches. See `A1/rawsock.md` F4.
         filter: ?[]const BpfInsn = null,
+        /// Ask the kernel for a receive timestamp per frame
+        /// (`SO_TIMESTAMPNS`), delivered as `Frame.timestamp_ns` — the time
+        /// the frame reached the socket layer, not the time `recv` ran. Off by
+        /// default: a capture that does not keep times should not pay for the
+        /// control message. Best-effort: a kernel that refuses
+        /// `SO_TIMESTAMPNS` yields `timestamp_ns = null`, not an open error.
+        timestamps: bool = false,
     };
 
     /// Open a `SOCK_RAW` capture socket for `ethertype` (use `eth_p.all` for
@@ -515,6 +527,10 @@ pub const Socket = struct {
             var one: c_int = 1;
             _ = linux.setsockopt(fd, linux.SOL.PACKET, linux.PACKET.AUXDATA, @ptrCast(&one), @sizeOf(c_int));
         }
+        // Best-effort, like PACKET_AUXDATA above: a kernel that refuses
+        // leaves `Frame.timestamp_ns` null rather than failing the open —
+        // and keeps `OpenError` unchanged for callers that switch on it.
+        if (opts.timestamps) enableTimestamps(fd) catch {};
         return .{ .fd = fd };
     }
 
@@ -541,7 +557,8 @@ pub const Socket = struct {
     /// `sockaddr_ll`.
     /// Bytes of `recvmsg` control-message buffer set aside for a
     /// `PACKET_AUXDATA` cmsg: `CMSG_SPACE(sizeof(struct tpacket_auxdata))`.
-    const aux_cmsg_space = cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(@sizeOf(TpacketAuxdata));
+    const aux_cmsg_space = cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(@sizeOf(TpacketAuxdata)) +
+        cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(@sizeOf(KernelTimespec));
 
     pub fn recv(self: Socket, buf: []u8) RecvError!Frame {
         var sll: linux.sockaddr.ll = undefined;
@@ -583,6 +600,7 @@ pub const Socket = struct {
             .ethertype = la.protocol,
             .pkttype = la.pkttype,
             .vlan_tci = parseAuxdataVlan(control[0..msg.controllen]),
+            .timestamp_ns = parseTimestampNs(control[0..msg.controllen]),
         };
     }
 
@@ -669,6 +687,25 @@ pub const Socket = struct {
         }
     }
 
+    /// Join a `PACKET_FANOUT` group: every socket that joins the same
+    /// `group` id (in this network namespace) with the same `mode` shares
+    /// the traffic instead of each receiving a copy — the way to spread one
+    /// interface's capture over several threads or processes. A socket can
+    /// join one group, once; the kernel refuses a second join and a join
+    /// whose mode or flags disagree with the group's (`error.FanoutFailed`).
+    pub fn joinFanout(self: Socket, group: u16, mode: FanoutMode, opts: FanoutOptions) FanoutError!void {
+        var type_flags: u32 = @intFromEnum(mode);
+        if (opts.defrag) type_flags |= PACKET_FANOUT_FLAG_DEFRAG;
+        if (opts.rollover) type_flags |= PACKET_FANOUT_FLAG_ROLLOVER;
+        var arg: u32 = fanoutArg(group, type_flags);
+        const rc = linux.setsockopt(self.fd, linux.SOL.PACKET, linux.PACKET.FANOUT, @ptrCast(&arg), @sizeOf(u32));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .PERM, .ACCES => return error.AccessDenied,
+            else => return error.FanoutFailed,
+        }
+    }
+
     /// Close the socket fd.
     pub fn close(self: Socket) void {
         _ = linux.close(self.fd);
@@ -698,7 +735,87 @@ pub const Frame = struct {
     /// Raw VLAN TCI: bits 0-11 VID, bit 12 DEI, bits 13-15 PCP — see
     /// 802.1Q §9.6. See F3.
     vlan_tci: ?u16,
+    /// Kernel receive time, nanoseconds since the Unix epoch — only when the
+    /// socket was opened with `Options.timestamps` (null otherwise, or if the
+    /// kernel attached none).
+    timestamp_ns: ?u64 = null,
 };
+
+/// `PACKET_FANOUT_*` (linux/if_packet.h) — how a fanout group picks the
+/// member socket for each frame.
+pub const FanoutMode = enum(u16) {
+    /// By flow hash: a flow always lands on the same socket.
+    hash = 0,
+    /// Round robin.
+    lb = 1,
+    /// By the CPU the frame arrived on.
+    cpu = 2,
+    /// Fill one socket, spill to the next when its queue is full.
+    rollover = 3,
+    /// Random.
+    rnd = 4,
+    /// By the frame's recorded receive queue.
+    qm = 5,
+};
+
+pub const FanoutOptions = struct {
+    /// `PACKET_FANOUT_FLAG_DEFRAG`: reassemble IP fragments first, so all
+    /// fragments of a datagram hash to the same socket.
+    defrag: bool = false,
+    /// `PACKET_FANOUT_FLAG_ROLLOVER`: spill to another member when the
+    /// chosen one's queue is full.
+    rollover: bool = false,
+};
+
+pub const FanoutError = error{ AccessDenied, FanoutFailed };
+
+const PACKET_FANOUT_FLAG_ROLLOVER: u32 = 0x1000;
+const PACKET_FANOUT_FLAG_DEFRAG: u32 = 0x8000;
+
+/// The `PACKET_FANOUT` setsockopt argument: group id in the low 16 bits,
+/// mode | flags in the high 16 (packet(7)).
+fn fanoutArg(group: u16, type_flags: u32) u32 {
+    return @as(u32, group) | (type_flags << 16);
+}
+
+/// `struct __kernel_timespec` — what `SO_TIMESTAMPNS_NEW` delivers on every
+/// architecture (64-bit seconds and nanoseconds).
+const KernelTimespec = extern struct { sec: i64, nsec: i64 };
+
+/// Turn on `SO_TIMESTAMPNS_NEW` (Linux 5.1+, the y2038-safe layout); on an
+/// older 64-bit kernel fall back to `SO_TIMESTAMPNS_OLD`, whose `timespec`
+/// has the same layout there. 32-bit hosts need the new option.
+fn enableTimestamps(fd: i32) error{TimestampsFailed}!void {
+    var one: c_int = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, @ptrCast(&one), @sizeOf(c_int))) == .SUCCESS) return;
+    if (@sizeOf(usize) == 8 and linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD, @ptrCast(&one), @sizeOf(c_int))) == .SUCCESS) return;
+    return error.TimestampsFailed;
+}
+
+/// The `SCM_TIMESTAMPNS` control message of a `recvmsg`, as ns since the
+/// epoch; null when there is none or it is malformed (negative, a nanosecond
+/// field of a second or more, too short, or past 2554 in u64 ns).
+fn parseTimestampNs(control: []const u8) ?u64 {
+    var off: usize = 0;
+    while (off + @sizeOf(linux.cmsghdr) <= control.len) {
+        const hdr: linux.cmsghdr = @as(*align(1) const linux.cmsghdr, @ptrCast(control[off..].ptr)).*;
+        if (hdr.len < @sizeOf(linux.cmsghdr)) break;
+        const data_off = off + cmsgAlign(@sizeOf(linux.cmsghdr));
+        const data_end = off + hdr.len;
+        const is_ts = hdr.level == linux.SOL.SOCKET and (hdr.type == linux.SO.TIMESTAMPNS_NEW or
+            (@sizeOf(usize) == 8 and hdr.type == linux.SO.TIMESTAMPNS_OLD));
+        if (is_ts and data_end <= control.len and data_end >= data_off + @sizeOf(KernelTimespec)) {
+            const ts: KernelTimespec = @as(*align(1) const KernelTimespec, @ptrCast(control[data_off..].ptr)).*;
+            if (ts.sec < 0 or ts.nsec < 0 or ts.nsec >= std.time.ns_per_s) return null;
+            const whole = std.math.mul(u64, @intCast(ts.sec), std.time.ns_per_s) catch return null;
+            return std.math.add(u64, whole, @intCast(ts.nsec)) catch null;
+        }
+        const next = off + cmsgAlign(hdr.len);
+        if (next <= off) break;
+        off = next;
+    }
+    return null;
+}
 
 // ── interface helpers ─────────────────────────────────────────────────────────
 
@@ -2492,6 +2609,164 @@ test "F14 fix: Options.recv_buf_bytes actually moves SO_RCVBUF (needs CAP_NET_RA
     // in `A1/rawsock.md` F5/F14 (and directly responsible for that finding's
     // 98.9% burst loss). Requesting 8192 must move it well below that.
     try testing.expect(got < 212992);
+}
+
+// ── 2026-10-04: timestamps, fanout, compiled filters ─────────────────────────
+
+fn tsCmsg(buf: []u8, level: i32, typ: i32, sec: i64, nsec: i64) []const u8 {
+    const hl = cmsgAlign(@sizeOf(linux.cmsghdr));
+    const total = hl + @sizeOf(KernelTimespec);
+    var hdr: linux.cmsghdr = undefined;
+    hdr.len = total;
+    hdr.level = level;
+    hdr.type = typ;
+    @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&hdr));
+    const ts: KernelTimespec = .{ .sec = sec, .nsec = nsec };
+    @memcpy(buf[hl..][0..@sizeOf(KernelTimespec)], std.mem.asBytes(&ts));
+    return buf[0..total];
+}
+
+test "parseTimestampNs: SCM_TIMESTAMPNS decoded; malformed or foreign cmsgs ignored" {
+    var buf: [64]u8 align(8) = undefined;
+    // 1791107093.632837053 s (a real tcpdump timestamp from pcap.zig's fixture).
+    try testing.expectEqual(@as(?u64, 1791107093_632837053), parseTimestampNs(tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, 1791107093, 632837053)));
+    if (@sizeOf(usize) == 8)
+        try testing.expectEqual(@as(?u64, 5_000000007), parseTimestampNs(tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD, 5, 7)));
+    // A nanosecond field of a whole second, a negative time, a u64 overflow.
+    try testing.expectEqual(@as(?u64, null), parseTimestampNs(tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, 1, 1_000_000_000)));
+    try testing.expectEqual(@as(?u64, null), parseTimestampNs(tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, -1, 0)));
+    try testing.expectEqual(@as(?u64, null), parseTimestampNs(tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, std.math.maxInt(i64), 0)));
+    // Right type, wrong level (an AUXDATA-level cmsg); and a cmsg cut short.
+    try testing.expectEqual(@as(?u64, null), parseTimestampNs(tsCmsg(&buf, linux.SOL.PACKET, linux.SO.TIMESTAMPNS_NEW, 5, 7)));
+    const full = tsCmsg(&buf, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_NEW, 5, 7);
+    try testing.expectEqual(@as(?u64, null), parseTimestampNs(full[0 .. full.len - 1]));
+}
+
+test "fanoutArg: group id low 16 bits, mode and flags high 16 (packet(7))" {
+    // PACKET_FANOUT_LB = 1, PACKET_FANOUT_FLAG_DEFRAG = 0x8000.
+    try testing.expectEqual(@as(u32, 0x8001_0007), fanoutArg(7, @intFromEnum(FanoutMode.lb) | PACKET_FANOUT_FLAG_DEFRAG));
+    try testing.expectEqual(@as(u32, 0x1003_ffff), fanoutArg(0xffff, @intFromEnum(FanoutMode.rollover) | PACKET_FANOUT_FLAG_ROLLOVER));
+    try testing.expectEqual(@as(u32, 0), fanoutArg(0, @intFromEnum(FanoutMode.hash)));
+}
+
+/// Open a capture on `lo` for `test_ethertype`, or skip (no CAP_NET_RAW).
+fn loCapture(opts: Socket.Options) !Socket {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var o = opts;
+    o.iface = "lo";
+    if (o.recv_timeout_ms == 0) o.recv_timeout_ms = 300;
+    return Socket.open(test_ethertype, o) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+fn injectOnLo(payload: []const u8, dst: [hwaddr_len]u8, ethertype: u16) !void {
+    const lo = try ifaceByName("lo");
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+    inj.send(lo, dst, ethertype, payload) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+fn realtimeNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "live: Options.timestamps stamps a frame with the kernel's receive time (needs CAP_NET_RAW + netns)" {
+    var cap = try loCapture(.{ .timestamps = true });
+    defer cap.close();
+    const before = realtimeNs();
+    try injectOnLo("rawsock-timestamp", .{ 0x02, 0, 0, 0, 0, 1 }, test_ethertype);
+    var buf: [256]u8 = undefined;
+    const f = recvWatchdog(cap, &buf, 2000) catch return error.SkipZigTest;
+    const after = realtimeNs();
+    // Stamped by the kernel between our send and our recv, on the same
+    // CLOCK_REALTIME the kernel uses for SO_TIMESTAMPNS.
+    const t = f.timestamp_ns orelse return error.TestMissingTimestamp;
+    try testing.expect(t >= before and t <= after);
+    // Without the option, no control message and no timestamp.
+    var plain = try loCapture(.{});
+    defer plain.close();
+    try injectOnLo("rawsock-timestamp", .{ 0x02, 0, 0, 0, 0, 1 }, test_ethertype);
+    const g = recvWatchdog(plain, &buf, 2000) catch return error.SkipZigTest;
+    try testing.expectEqual(@as(?u64, null), g.timestamp_ns);
+}
+
+test "live: a PACKET_FANOUT group splits frames between its members (needs CAP_NET_RAW + netns)" {
+    var a = try loCapture(.{ .nonblocking = true });
+    defer a.close();
+    var b = try loCapture(.{ .nonblocking = true });
+    defer b.close();
+    try a.joinFanout(4242, .lb, .{});
+    try b.joinFanout(4242, .lb, .{});
+    // A second join of the same socket, and a member with another mode, are
+    // refused by the kernel (EALREADY / EINVAL).
+    try testing.expectError(error.FanoutFailed, a.joinFanout(4242, .lb, .{}));
+    var c = try loCapture(.{});
+    defer c.close();
+    try testing.expectError(error.FanoutFailed, c.joinFanout(4242, .hash, .{}));
+    // The flags are part of the group's identity too: a group created with
+    // DEFRAG refuses a member without it, which proves the bit reaches the
+    // kernel.
+    var d1 = try loCapture(.{});
+    defer d1.close();
+    try d1.joinFanout(4343, .hash, .{ .defrag = true });
+    var d2 = try loCapture(.{});
+    defer d2.close();
+    try testing.expectError(error.FanoutFailed, d2.joinFanout(4343, .hash, .{}));
+    try d2.joinFanout(4343, .hash, .{ .defrag = true });
+
+    const sent = 8;
+    for (0..sent) |_| try injectOnLo("rawsock-fanout", .{ 0x02, 0, 0, 0, 0, 1 }, test_ethertype);
+    var buf: [256]u8 = undefined;
+    var got: [2]usize = .{ 0, 0 };
+    for ([_]Socket{ a, b }, 0..) |s, i| {
+        while (s.recv(&buf)) |_| got[i] += 1 else |e| if (e != error.WouldBlock) return e;
+    }
+    if (got[0] + got[1] == 0) return error.SkipZigTest; // no loopback delivery here
+    // Round robin: both members get frames, and between them they get each
+    // delivery once — not one copy each, which is what two sockets outside a
+    // group would see.
+    try testing.expect(got[0] > 0 and got[1] > 0);
+    try testing.expect(got[0] + got[1] <= 2 * sent); // lo shows a frame as outgoing + incoming at most
+    const diff = if (got[0] > got[1]) got[0] - got[1] else got[1] - got[0];
+    try testing.expect(diff <= 1);
+}
+
+test "live: a compiled filter attached at open passes only what it names (needs CAP_NET_RAW + netns)" {
+    const prog = try filter.compile(testing.allocator, "ether proto 0x88b5 and ether dst 02:00:00:00:00:07");
+    defer testing.allocator.free(prog);
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = prog }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // Wrong destination, wrong EtherType, then the one that matches.
+    try injectOnLo("rawsock-filter-no", .{ 0x02, 0, 0, 0, 0, 8 }, test_ethertype);
+    try injectOnLo("rawsock-filter-no", .{ 0x02, 0, 0, 0, 0, 7 }, 0x88b6);
+    try injectOnLo("rawsock-filter-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var buf: [256]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const f = recvWatchdog(cap, &buf, 1000) catch break;
+        seen += 1;
+        // Everything that got through is the matching frame, and the
+        // in-kernel verdict agrees with the userspace interpreter's.
+        try testing.expect(std.mem.indexOf(u8, f.bytes, "rawsock-filter-yes") != null);
+        try testing.expect(filter.run(prog, f.bytes) != 0);
+    }
+    if (seen == 0) return error.SkipZigTest;
 }
 
 test {

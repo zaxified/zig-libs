@@ -78,6 +78,24 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
   `BpfInsn` is 8 bytes, asserted).
 - `arp.buildRequest` / `arp.parseReply` — minimal ARP-over-Ethernet codec;
   addresses surface as `netaddr.Ip`.
+- `filter.compile(gpa, "tcp dst port 22 and not ip src net 10.0.0.0/8")` — a
+  tcpdump-style expression → classic BPF for `Options.filter`, same meaning as
+  libpcap's (checked against `tcpdump -r` on a frame corpus); `filter.run(prog,
+  frame)` executes any classic-BPF program in userspace, with the kernel's
+  semantics. The supported subset is in `src/filter.zig`'s header.
+- `pcap.writeHeader` / `pcap.writeRecord` / `pcap.Reader` — classic `.pcap`
+  savefiles (µs or ns), byte-compatible with `tcpdump -w`/`-r`.
+
+### Capture extras
+
+```zig
+const prog = try rawsock.filter.compile(gpa, "udp port 67 or udp port 68");
+defer gpa.free(prog);
+const sock = try rawsock.Socket.open(rawsock.eth_p.all, .{ .filter = prog, .timestamps = true });
+const f = try sock.recv(&buf);            // f.timestamp_ns = kernel receive time
+try rawsock.pcap.writeRecord(&w, .nano, f.timestamp_ns.?, @intCast(f.wire_len), f.bytes);
+try sock.joinFanout(7, .hash, .{});       // spread one capture over N sockets
+```
 
 ## Testing
 
@@ -99,7 +117,9 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 
 ## Deferred (v2)
 
-- `PACKET_RX_RING` / `recvmmsg` batching (mmap'd zero-copy RX for throughput).
-- `TPACKET_V3` block-based capture.
+- `PACKET_RX_RING` / `TPACKET_V3` ring / `recvmmsg` batching (mmap'd
+  zero-copy RX for throughput).
+- pcapng, and the filter language beyond the subset (IPv6 addresses, `vlan`,
+  `portrange`, byte-offset expressions).
 - IPv6 Neighbor-Discovery helpers (the ND counterpart to the ARP codec).
 - Remains Linux-only — the documented AF_PACKET ceiling (no BSD `/dev/bpf`).
