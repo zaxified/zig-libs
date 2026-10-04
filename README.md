@@ -558,7 +558,7 @@ way to recognise it.
 | [`lninvoice`](modules/lninvoice/README.md) | 2 | Lightning BOLT#11 payment requests (+ BOLT#12 offer decode) — decode/verify and encode/sign, with node-pubkey signature recovery. | any | bech32, k256, lnwire, bip340 |
 | [`lnwire`](modules/lnwire/README.md) | 3 | Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management and gossip messages, over `bolt8`. | any | — |
 | [`megolm`](modules/megolm/README.md) | 3 | Megolm — Matrix's group-messaging ratchet: a one-way HMAC hash ratchet (fast-forward only, never rewinds) plus Ed25519-signed message frames. | any | aescbc, entropy |
-| [`minisign`](modules/minisign/README.md) | 2 | minisign file format (jedisct1/minisign) — Ed25519 sign/verify for signed files/releases, including scrypt-encrypted secret keys. | any | entropy |
+| [`minisign`](modules/minisign/README.md) | 1 | minisign file format (jedisct1/minisign) — Ed25519 sign/verify for signed files/releases, including scrypt-encrypted secret keys. | any | entropy |
 | [`mls`](modules/mls/README.md) | 3 | MLS — Messaging Layer Security (RFC 9420): cipher-suite/codec foundation plus TreeKEM (ratchet tree), for scalable group messaging. | any | hpke |
 | [`montint`](modules/montint/README.md) | 3 | Constant-time Montgomery modular arithmetic over arbitrary odd moduli — faster native-Zig alternative to `std.crypto.ff`, x86-64 asm + portable fallback. | x86-64 asm + portable fallback | — |
 | [`musig2`](modules/musig2/README.md) | 2 | MuSig2 multi-signature (BIP327) producing BIP340 signatures — rogue-key-safe key aggregation, 2-round nonces, partial sign/verify. | any | bip340, k256 |
