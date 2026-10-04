@@ -2264,3 +2264,38 @@ test "an un-echoable reflected ACRH stays a 204, it does not become a 500" {
         try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
     }
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "list origins match the whole serialization: a prefix or a longer host is not the same origin" {
+    // An origin is compared as its full ASCII serialization (RFC 6454 §5,
+    // Fetch "same origin"): `https://app.example` grants neither
+    // `https://app.example.evil` nor `https://app.example:8443`.
+    var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .list = &.{"https://app.example"} } });
+    defer c.deinit();
+    try testing.expectEqualStrings("https://app.example", c.allowOriginValue("https://app.example").?);
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("https://app.example.evil"));
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("https://app.example:8443"));
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("https://app.exampl"));
+}
+
+test "allow_unconditional_wildcard: a bare OPTIONS gets only the wildcard, no preflight grant" {
+    // `applyPreflight`: a bare OPTIONS (no Access-Control-Request-Method)
+    // "has no requested method/headers to gate on" and gets "nothing more
+    // to advertise" — Allow-Methods/-Headers/Max-Age answer a preflight's
+    // questions (Fetch, CORS-preflight fetch), and this was not one.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .any,
+        .allow_unconditional_wildcard = true,
+        .max_age_s = 600,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/t", ""), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
+    try expectNoHeader(got, "Access-Control-Allow-Methods");
+    try expectNoHeader(got, "Access-Control-Max-Age");
+}

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (36 mutants, all killed). Two new tests: a
+  listed origin grants only its exact serialization (not a longer host or a port variant), and
+  a bare OPTIONS under `allow_unconditional_wildcard` carries no Allow-Methods/Max-Age. No
+  behaviour change.
 - **2026-09-10** — A1 audit close-out, 4 findings from the original audit
   report (the ledger's own table only carried 2 of them — the other 2 were
   listed in `0a53c673`'s own commit message as "reported in the audit notes,

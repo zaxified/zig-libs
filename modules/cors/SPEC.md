@@ -6,7 +6,7 @@
 
 **Scope:** core — rs/cors (Go) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -151,6 +151,19 @@ bare `OPTIONS` with 204 (both cases also golden the default's unchanged behavior
 loopback): preflight → 204 + CORS headers with handler never invoked; allowed-origin `GET` →
 headers + `Vary`; disallowed origin → no CORS headers — skips only when loopback binding is
 unavailable.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 36
+mutants — every `init` rejection (credentialed `.any`, list `"null"`/`"*"`, wildcard without
+`.any`, empty methods), the wildcard preflight branch (bare-OPTIONS return, Allow-Methods,
+Max-Age), each preflight gate (origin, method, requested headers), the reflect overflow
+fallback (gated and static), credentials/Max-Age/`Vary` emission, the actual-request method
+gate, `Vary: Origin` (both directions), credentials and expose headers, the origin matcher
+(exact vs. case-folded vs. prefix), predicate and `.none`, OPTIONS always allowed, method and
+header case-insensitivity, the ACRH trim/empty/failure rules, the interception condition
+(both directions), `isPreflight` and the static reflect `Vary`. First run: 34 killed, 2 alive;
+two tests added (a list origin must match the whole serialization — a prefix match would grant
+`https://app.example.evil`; a bare OPTIONS under `allow_unconditional_wildcard` gets no
+preflight grant); rerun: 36 killed. No defect found.
 
 ## Backlog / deferred
 
