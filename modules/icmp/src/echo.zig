@@ -827,6 +827,60 @@ test "golden: real capture — v6 dest-unreachable quoting a UDP datagram is ign
     try std.testing.expectEqual(Reply.ignored, parseV6(&v6_dest_unreach_icmp));
 }
 
+test "golden: real capture — writeEchoRequest reproduces ping's own v4 and v6 requests" {
+    // The encoder's wire bytes held to `ping`'s (captured above), not to a
+    // hand-computed header: same identifier, sequence and payload in, the
+    // captured packet out — for v4 including the checksum `ping`/the kernel
+    // put on the wire; for v6 everything but the checksum, which the kernel
+    // fills in (this module leaves it 0 by design).
+    var b4 = v4_echo_req_icmp;
+    @memset(b4[0..echo_header_len], 0xa5);
+    try writeEchoRequest(.v4, &b4, 0x9555, 1);
+    try std.testing.expectEqualSlices(u8, &v4_echo_req_icmp, &b4);
+
+    var b6 = v6_echo_req_icmp;
+    @memset(b6[0..echo_header_len], 0xa5);
+    try writeEchoRequest(.v6, &b6, 0x955a, 1);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, b6[2..4], .big));
+    b6[2..4].* = v6_echo_req_icmp[2..4].*;
+    try std.testing.expectEqualSlices(u8, &v6_echo_req_icmp, &b6);
+
+    // The timestamp request the kernel answered (it replies only to a
+    // request whose checksum verifies) is what writeTimestampRequest makes.
+    var ts: [timestamp_msg_len]u8 = undefined;
+    writeTimestampRequest(&ts, 0x1357, 1, 0x3039);
+    try std.testing.expectEqualSlices(u8, &v4_ts_req_icmp, &ts);
+}
+
+test "golden: tcpdump-decoded ICMP errors the loopback capture cannot produce" {
+    // tools/gen_tcpdump_fixtures.py: every expected value below (kind, code,
+    // the quoted request's identifier/sequence and addresses) is read from
+    // tcpdump's decoding of the packet, not from the code that built it.
+    const fx = @import("tcpdump_fixtures.zig");
+    for (fx.cases) |c| {
+        const want_kind = std.meta.stringToEnum(ErrorKind, c.kind).?;
+        const replies: []const Reply = switch (c.family) {
+            .v4 => &.{ parseV4(c.icmp, false), parseV4(c.ip, true) },
+            .v6 => &.{parseV6(c.icmp)},
+        };
+        for (replies) |r| {
+            const e = switch (r) {
+                .icmp_error => |e| e,
+                else => {
+                    std.debug.print("not parsed as an ICMP error: {s}\n", .{c.tcpdump});
+                    return error.TestUnexpectedResult;
+                },
+            };
+            try std.testing.expectEqual(want_kind, e.kind);
+            try std.testing.expectEqual(c.code, e.code);
+            try std.testing.expectEqual(c.ident, e.orig_ident);
+            try std.testing.expectEqual(c.seq, e.orig_seq);
+            try std.testing.expectEqualSlices(u8, c.quoted_src, e.quoted_src[0..c.quoted_src.len]);
+            try std.testing.expectEqualSlices(u8, c.quoted_dst, e.quoted_dst[0..c.quoted_dst.len]);
+        }
+    }
+}
+
 test "golden: real-capture fixture count + size canary — 8 real loopback captures" {
     // Pins fixture shapes so a future re-capture silently changing sizes
     // (e.g. a kernel start sending ping payload padding differently) doesn't

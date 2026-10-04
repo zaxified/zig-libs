@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: the encoder is held to `ping`'s captured requests (v4 byte for byte,
+  v6 but the kernel-filled checksum) and the kernel-answered timestamp request; the ICMP
+  error types loopback cannot produce are checked against tcpdump's decoding
+  (`tools/gen_tcpdump_fixtures.py` → `src/tcpdump_fixtures.zig`). Anchor grade MIXED →
+  EXTERNAL. No behaviour change.
 - **2026-10-01** — `Config.io`: `Pinger` over `std.Io` instead of raw syscalls — ping sockets
   from `std.Io.net` (`IoSocket`), clocks and waits from the `Io`, so a deterministic `Io` (simio)
   or an evented one can run it. Narrower than the raw path: no RAW sockets, kernel receive
