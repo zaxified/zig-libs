@@ -408,6 +408,10 @@ pub const WorkerPool = struct {
                 .running, .draining => {},
                 .stopping_now, .stopped => return false,
             }
+            // Test seam -- see `wait_seam`.
+            if (builtin.is_test) {
+                if (wait_seam.load(.seq_cst)) |f| f();
+            }
             self.io.futexWaitUncancelable(u32, &self.done_gen.raw, gen);
         }
     }
@@ -611,6 +615,20 @@ pub const Submitter = struct {
 ///   watchdog.
 var park_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
+/// **Test-only seam BEFORE the `notify` snapshot**: between a worker's first
+/// look at an empty queue and the generation it will park on. A job published
+/// there bumps `notify` before the snapshot, so only the FINAL re-check of the
+/// queue can find it -- this seam is how a test proves that re-check is
+/// load-bearing. Same rules as `park_seam`: `null` in every build, the call
+/// site is `comptime`-gated on `builtin.is_test`.
+var snapshot_seam: std.atomic.Value(?*const fn () void) = .init(null);
+
+/// **Test-only seam inside `wait`**, between its last check of the counts and
+/// state and its park on `done_gen`. Lets a test run a whole `shutdownNow`
+/// there, so the only thing that can release the waiter is `shutdownNow`'s own
+/// `wakeWaiters`. Same rules as `park_seam`.
+var wait_seam: std.atomic.Value(?*const fn () void) = .init(null);
+
 /// The pool whose worker the current thread is, if any — how `wait` detects
 /// being called from one of its own jobs.
 threadlocal var current_pool: ?*const WorkerPool = null;
@@ -650,6 +668,10 @@ fn workerRun(w: *Worker) void {
             }
         }
 
+        // Test seam -- see `snapshot_seam`.
+        if (builtin.is_test) {
+            if (snapshot_seam.load(.seq_cst)) |f| f();
+        }
         // st == .running: park until woken. Snapshot the generation FIRST,
         // then re-check the queue and state, so any submit/shutdown that raced
         // in between bumped the generation and makes the wait return at once.
@@ -1548,6 +1570,162 @@ test "TEETH: the notify snapshot must precede the final queue re-check" {
 
     pool.drain();
     try testing.expectEqual(@as(u64, 1), pool.completedCount());
+    try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
+}
+
+// ── TEETH: the final re-check, and shutdownNow's waiter wake ────────────────
+//
+// Two more properties only a held-open window can show (2026-10-04: the
+// mutation run left both alive -- removing either changed no test).
+
+/// Shared state for the two seams below; one test at a time installs it.
+const SeamCtx = struct {
+    io: std.Io,
+    pool: ?*WorkerPool = null,
+    job_ctx: ?*Counter = null,
+    /// One-shot guards.
+    used: std.atomic.Value(u32) = .init(0),
+    /// Worker held in `park_seam` (wait test) ...
+    held: std.atomic.Value(u32) = .init(0),
+    /// ... until the test releases it.
+    release: std.atomic.Value(u32) = .init(0),
+    used_wait: std.atomic.Value(u32) = .init(0),
+};
+
+var seam_ctx: std.atomic.Value(?*SeamCtx) = .init(null);
+
+fn pollFlag(io: std.Io, v: *std.atomic.Value(u32)) void {
+    while (v.load(.seq_cst) == 0) {
+        io.futexWaitTimeout(u32, &v.raw, 0, .{ .duration = .{
+            .raw = .fromMilliseconds(1),
+            .clock = .awake,
+        } }) catch {};
+    }
+}
+
+/// `snapshot_seam`: the worker has just seen an empty queue and has not yet
+/// taken its `notify` snapshot -- publish a job right here, from the worker's
+/// own thread, so its generation bump lands BEFORE the snapshot.
+fn submitBeforeSnapshot() void {
+    const ctx = seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.used.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    ctx.pool.?.submit(.{ .func = incr, .ctx = ctx.job_ctx.? }) catch unreachable;
+}
+
+test "TEETH: a job published before the notify snapshot is found by the final re-check" {
+    // The worker's last look at the queue (after the snapshot) exists for a
+    // job published between its first empty look and the snapshot: that
+    // job's `notify` bump is already IN the snapshot, so the park would not
+    // return for it, and with `idle` still 0 the submit issued no wake. Only
+    // the re-check can find it. Held open by `snapshot_seam`; one worker so no
+    // sibling absorbs the job. Without the re-check the worker parks with the
+    // job queued and the watchdog fires.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var c = Counter{};
+    var ctx = SeamCtx{ .io = io, .job_ctx = &c };
+    seam_ctx.store(&ctx, .seq_cst);
+    defer seam_ctx.store(null, .seq_cst);
+
+    // Installed before the pool exists, so the worker's very first empty
+    // look takes the seam.
+    snapshot_seam.store(submitBeforeSnapshot, .seq_cst);
+    defer snapshot_seam.store(null, .seq_cst);
+    const pool = blk: {
+        // The seam needs the pool pointer before the worker can reach it:
+        // hold the seam off (`used` = 1) until `ctx.pool` is set.
+        ctx.used.store(1, .seq_cst);
+        const p = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+        ctx.pool = p;
+        break :blk p;
+    };
+    defer pool.deinit();
+    // Wait until the worker has committed to parking (`idle` is raised just
+    // before the futex wait, after its snapshot), then arm the seam and bump
+    // the generation: the worker's park returns, it loops, finds the queue
+    // empty and takes the armed seam on its next empty look.
+    while (pool.idle.load(.seq_cst) == 0) std.atomic.spinLoopHint();
+    ctx.used.store(0, .seq_cst);
+    pool.wakeAll();
+
+    var poll = std.atomic.Value(u32).init(0);
+    while (c.n.load(.seq_cst) == 0) {
+        io.futexWaitTimeout(u32, &poll.raw, 0, .{ .duration = .{
+            .raw = .fromMilliseconds(1),
+            .clock = .awake,
+        } }) catch {};
+    }
+    try testing.expectEqual(@as(u32, 1), ctx.used.load(.seq_cst));
+    pool.drain();
+    try testing.expectEqual(@as(u64, 1), pool.completedCount());
+}
+
+/// `park_seam` for the wait test: hold the worker in its pre-park window.
+fn holdWorker() void {
+    const ctx = seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.held.load(.seq_cst) != 0) return; // one-shot
+    ctx.held.store(1, .seq_cst);
+    ctx.io.futexWake(u32, &ctx.held.raw, std.math.maxInt(u32));
+    pollFlag(ctx.io, &ctx.release);
+}
+
+fn shutdownNowThread(pool: *WorkerPool) void {
+    pool.shutdownNow();
+}
+
+/// `wait_seam`: the waiter has checked counts and state (running) and is
+/// about to park. Run a complete `shutdownNow` right here: the worker is let
+/// go only once the state says `stopping_now`, so it drops the queued job
+/// without running it -- no completion will ever bump `done_gen` again.
+fn shutdownInsideWait() void {
+    const ctx = seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.used_wait.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    const pool = ctx.pool.?;
+    const th = std.Thread.spawn(.{}, shutdownNowThread, .{pool}) catch unreachable;
+    while (pool.state.load(.seq_cst) == .running) std.atomic.spinLoopHint();
+    ctx.release.store(1, .seq_cst);
+    ctx.io.futexWake(u32, &ctx.release.raw, std.math.maxInt(u32));
+    th.join();
+}
+
+test "TEETH: shutdownNow releases a wait() that parked on work it then dropped" {
+    // `wait` doc: "false when it was shut down with `shutdownNow` instead
+    // (dropped jobs never complete, so waiting on them would hang)". The
+    // worker is held before parking while one job is queued (no completion
+    // can come from it), the waiter checks -- 0 of 1 done, running -- and
+    // `shutdownNow` runs to the end before it parks. Nothing but
+    // `shutdownNow`'s own `wakeWaiters` changes `done_gen` from the waiter's
+    // snapshot, so without it the waiter parks forever (the watchdog fires).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var ctx = SeamCtx{ .io = io };
+    seam_ctx.store(&ctx, .seq_cst);
+    defer seam_ctx.store(null, .seq_cst);
+    park_seam.store(holdWorker, .seq_cst);
+    defer park_seam.store(null, .seq_cst);
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    ctx.pool = pool;
+    pollFlag(io, &ctx.held); // the worker is in its pre-park window
+
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c }); // queued; the held worker is not idle, no wake
+
+    wait_seam.store(shutdownInsideWait, .seq_cst);
+    defer wait_seam.store(null, .seq_cst);
+    try testing.expect(!pool.wait());
+    try testing.expectEqual(@as(u64, 0), c.n.load(.seq_cst)); // dropped, never run
     try testing.expectEqual(@as(i64, 0), pool.outstandingBoxes());
 }
 

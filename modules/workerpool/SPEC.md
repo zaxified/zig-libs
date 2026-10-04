@@ -241,15 +241,16 @@ underlying `seq_cst` reclamation proof lives in `lockfree`).
 lifecycle (`drain` idempotence, `shutdownNow` box flush and waiter wake, `deinit` drain),
 `wait`, the shutdown refusals of `submit`/`registerSubmitter`, the enqueue rollback, the
 wake gate and `idle` accounting, `runBox`, `freeQueuedBoxes`, the worker loop's stop/drain
-exits, the spin and the final pre-park re-check, and `drainedCleanly`: 21 killed, 0
-equivalent, 2 left alive. Alive, both race-only and not deterministically reachable without a
-new test seam: (1) `shutdownNow`'s `wakeWaiters` -- it matters only when a `wait` caller
-re-parks between an in-flight job's completion wake and the state change, and the worker then
-exits without running the queued rest; (2) the final queue re-check before parking -- it
-covers a job published between the worker's empty dequeue and its `notify` snapshot, a window
-the existing `park_seam` (placed after the re-check) cannot enter. Tests added for the three
-real gaps: `n_workers = 0` clamps to one worker, `registerSubmitter` after `drain` is
-`Shutdown`, and a job submitted during a 5 s `spin_ns` runs long before the spin would end.
+exits, the spin and the final pre-park re-check, and `drainedCleanly`: 23 killed, 0
+equivalent, 0 left alive. Two of them sit in windows no free-running test can enter, and
+got comptime-gated test seams (no code, field or branch outside `builtin.is_test`, like
+`park_seam`): `snapshot_seam` (between a worker's empty look and its `notify` snapshot) pins
+the final queue re-check -- a job published there is only found by it; `wait_seam` (between
+`wait`'s last check and its park) runs a whole `shutdownNow` there with the worker held by
+`park_seam`, so only `shutdownNow`'s `wakeWaiters` can release the waiter. Both TEETH tests
+hang into the watchdog with their mutant applied. Other tests added: `n_workers = 0` clamps
+to one worker, `registerSubmitter` after `drain` is `Shutdown`, and a job submitted during a
+5 s `spin_ns` runs long before the spin would end.
 
 ## 6b. Backlog / deferred
 

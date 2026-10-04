@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** two test-only seams (`snapshot_seam`, `wait_seam`; comptime-gated
+  on `builtin.is_test`, nothing in a release build) and two deterministic TEETH tests that pin
+  the worker's final pre-park queue re-check and `shutdownNow` waking a `wait` caller — the two
+  race-only mutants the morning's run left alive now die (23/23 killed).
+
 - **2026-10-04** — **Tests:** mutation run (23 schemata mutants, 21 killed, 2 race-only survivors
   documented in SPEC §6). New tests: `n_workers = 0` clamps to one worker, `registerSubmitter`
   after `drain` is `Shutdown`, a job submitted during the spin is taken at once. No code change.
