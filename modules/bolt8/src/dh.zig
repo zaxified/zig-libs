@@ -198,6 +198,17 @@ test "meta-shape: public_length/seed_length match BOLT#8's 33/32-byte split" {
     try testing.expectEqual(@as(usize, 32), seed_length);
 }
 
+test "KeyPair.generateDeterministic rejects 0 and the group order n" {
+    // A secp256k1 private key is an integer in [1, n - 1] (SEC 1 v2 §3.2.1);
+    // 0 has no public key and n reduces to 0.
+    try testing.expectError(error.InvalidSecretKey, KeyPair.generateDeterministic([_]u8{0} ** 32));
+    var n: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+    try testing.expectError(error.InvalidSecretKey, KeyPair.generateDeterministic(n));
+    n[31] -= 1; // n - 1 is the largest valid key
+    _ = try KeyPair.generateDeterministic(n);
+}
+
 test "KeyPair.generate: rejects nothing observable, always yields a valid public key" {
     var prng = std.Random.DefaultPrng.init(0xb01783);
     const random = prng.random();

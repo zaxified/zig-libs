@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation run (32 mutants, 29 killed, 3 equivalent). New tests for
+  a message of exactly 65535 bytes, an output buffer one byte too large, and
+  `generateDeterministic` on 0, `n` and `n − 1`. No behaviour change.
 - **2026-09-11** — **API CHANGE:** `Initiator.State`/`Responder.State` gain
   a new member, `.failed` (audit finding F5). Every act function
   (`act1`/`readAct2`/`genAct3` on `Initiator`, `readAct1`/`act2`/`readAct3`

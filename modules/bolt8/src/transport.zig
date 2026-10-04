@@ -256,6 +256,10 @@ test "Transport.sendMessage: rejects an oversized message and a wrong-size buffe
     var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try testing.expectError(error.BufferWrongSize, t.sendMessage("hello", out[0 .. out.len - 1]));
+    // Too LARGE is wrong too: the caller sends `out` as-is, so a spare tail
+    // would go on the wire as garbage after the frame.
+    var roomy: [length_frame_len + 5 + 16 + 1]u8 = undefined;
+    try testing.expectError(error.BufferWrongSize, t.sendMessage("hello", &roomy));
 
     // Heap-allocated: max_message_len+1 (~64KiB) is too large to comfortably
     // put on the test-runner's stack twice over (message + output buffer).
@@ -264,6 +268,26 @@ test "Transport.sendMessage: rejects an oversized message and a wrong-size buffe
     const big_out = try testing.allocator.alloc(u8, length_frame_len + too_big.len + 16);
     defer testing.allocator.free(big_out);
     try testing.expectError(error.MessageTooLong, t.sendMessage(too_big, big_out));
+}
+
+test "Transport: a message of exactly 65535 bytes, BOLT#8's maximum, is sent and received" {
+    // BOLT#8 "Encrypting and Sending Messages": the length is a 2-byte
+    // big-endian integer and a message MUST NOT exceed 65535 bytes — so
+    // 65535 itself is legal and has to get through.
+    const result: handshake.HandshakeResult = .{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 };
+    var a = Transport.init(result);
+    var b = Transport.init(.{ .sk = result.rk, .rk = result.sk, .ck = result.ck, .handshake_hash = result.handshake_hash, .remote_static = result.remote_static });
+    const m = try testing.allocator.alloc(u8, max_message_len);
+    defer testing.allocator.free(m);
+    for (m, 0..) |*x, i| x.* = @truncate(i *% 31);
+    const wire = try testing.allocator.alloc(u8, length_frame_len + m.len + 16);
+    defer testing.allocator.free(wire);
+    try a.sendMessage(m, wire);
+    try testing.expectEqual(@as(u16, max_message_len), try b.recvLength(wire[0..length_frame_len]));
+    const got = try testing.allocator.alloc(u8, m.len);
+    defer testing.allocator.free(got);
+    try b.recvMessage(wire[length_frame_len..], got);
+    try testing.expectEqualSlices(u8, m, got);
 }
 
 test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypting anything into it" {

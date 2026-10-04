@@ -529,7 +529,7 @@ way to recognise it.
 | [`bls12_381`](modules/bls12_381/README.md) | 3 | BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures, KZG commitments, threshold BLS. | any | entropy, montint |
 | [`bn254`](modules/bn254/README.md) | 2 | BN254 / alt-bn128 curve — field tower/groups, optimal-ate pairing, EIP-196/197 EVM precompiles, and a Groth16 zkSNARK **verifier**. | any | montint |
 | [`bolt3`](modules/bolt3/README.md) | 3 | Lightning BOLT#3 key derivation — per-commitment blinded keys, split-secret revocation keys, shachain secret generation. | any | k256 |
-| [`bolt8`](modules/bolt8/README.md) | 2 | Lightning BOLT#8 encrypted transport (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — handshake plus transport with periodic key rotation. | any | noise, k256 |
+| [`bolt8`](modules/bolt8/README.md) | 1 | Lightning BOLT#8 encrypted transport (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — handshake plus transport with periodic key rotation. | any | noise, k256 |
 | [`btcaddr`](modules/btcaddr/README.md) | 2 | Bitcoin address layer -- scriptPubKey <-> address (P2PKH/P2SH/P2WPKH/P2WSH/P2TR/witness v1-16), network detection, WIF keys, P2SH/P2WSH helpers. | any | bech32, ripemd160 |
 | [`btcp2p`](modules/btcp2p/README.md) | 3 | Bitcoin P2P wire-message codec — envelope, version/verack handshake, inventory/data messages. Codec only: no chain state or validation. | any | bitcointx |
 | [`bulletproofs`](modules/bulletproofs/README.md) | 2 | Bulletproofs — zero-knowledge range proofs over Ristretto255, proving a Pedersen-committed value is in range with logarithmic proof size. | any | ct25519 |

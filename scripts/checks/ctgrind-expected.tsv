@@ -137,10 +137,10 @@
 #
 # `act1` has no row on purpose: the initiator's Act One never touches the static
 # key, so its zero would say nothing about constant time. See the harness.
-bolt8	ReleaseFast	dh	1	1	133f64b49f95282f	0147038b2745ef44
-bolt8	ReleaseFast	keygen	1	3	133f64b49f95282f	d7a8d7540234ad3e
-bolt8	ReleaseFast	act3	1	6	2d54eabc5fe940df	f60e20889f25f0aa
-bolt8	ReleaseFast	transport	1	3	cb5d5d200f748105	859416d386f56f8a
+bolt8	ReleaseFast	dh	1	1	0cc47380f258135b	0147038b2745ef44
+bolt8	ReleaseFast	keygen	1	3	0cc47380f258135b	d7a8d7540234ad3e
+bolt8	ReleaseFast	act3	1	6	9fc24863658142e8	f60e20889f25f0aa
+bolt8	ReleaseFast	transport	1	3	b0f99ad4139636d7	859416d386f56f8a
 bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
 # bn254 scalarmul 5 -> 2 (re-pin 2026-09-15): `3cda42bf`/`b80e3cce` made
 # `Fr.toBytes` reduce with bn254's own CIOS behind a `blackBox` barrier instead
