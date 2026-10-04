@@ -186,12 +186,14 @@ pub const Decimal = struct {
     /// Re-quantise to `n` fractional digits, **round-half-away-from-zero**
     /// (Excel's ROUND: `ROUND(2.5, 0) = 3`, `ROUND(-2.5, 0) = -3`) — the same
     /// mode `× ÷` use. `n >= 12` is a no-op (already max precision); `n < 0`
-    /// rounds to tens/hundreds/… Returns self unchanged if the result would
-    /// overflow.
+    /// rounds to tens/hundreds/… (a rounding place beyond 10^36 gives 0).
+    /// Returns self unchanged if the rounded result would overflow.
     pub fn round(self: Decimal, n: i32) Decimal {
         if (n >= @as(i32, @intCast(scale))) return self;
         const drop: u32 = @intCast(@as(i64, scale) - n); // 1..(12+|n|)
-        if (drop > max_pow10) return self;
+        // Past 10^48 the divisor exceeds twice any i128 magnitude (< 1.7e38), so
+        // the rounded result is 0 -- the same answer `rescale` gives.
+        if (drop > max_pow10) return Decimal.zero;
         const divisor = pow10_256(drop);
         const q = divRoundHalfAway(@as(i256, self.raw), divisor);
         const scaled = q * divisor;
@@ -565,8 +567,10 @@ pub const Decimal = struct {
             raw256 = m[0];
         } else {
             const drop: i64 = -shift;
-            if (drop > max_pow10) return error.Overflow; // rounds to zero / unrepresentable
-            raw256 = divRoundHalfAway(mant, pow10_256(@intCast(drop)));
+            // mant < 10^60 (width cap above), so a drop of 61+ digits leaves a
+            // fraction below 0.1 of the last place: it rounds to 0, not Overflow.
+            // Up to 60 the divisor still fits i256 and the usual rounding applies.
+            raw256 = if (drop > 60) 0 else divRoundHalfAway(mant, pow10_256(@intCast(drop)));
         }
         if (is_neg) raw256 = -raw256;
         if (raw256 > std.math.maxInt(i128) or raw256 < std.math.minInt(i128)) return error.Overflow;
@@ -1536,4 +1540,125 @@ test "float bridge: toFloat(fromFloatShortest(x)) == x for typed decimals with <
         try expectBits(x, d.toFloat());
         try testing.expect(d.eql(try Decimal.parse(text)));
     }
+}
+
+// ── mutation run 2026-10-04: boundary and short-circuit pins ────────────────
+//
+// Each test below kills one or more mutants that the earlier suite let
+// survive (see SPEC.md "Mutation run 2026-10-04"). The expected values come
+// from the stated invariant or from Python 3 `decimal` (General Decimal
+// Arithmetic reference implementation, `Context(prec=300)`), noted per test.
+
+test "boundary: results that land exactly on the i128 extremes are representable" {
+    const max: Decimal = .{ .raw = std.math.maxInt(i128) };
+    const min: Decimal = .{ .raw = std.math.minInt(i128) };
+    // -(min + 1) == max: only |min| itself is unrepresentable.
+    const almost_min: Decimal = .{ .raw = std.math.minInt(i128) + 1 };
+    try testing.expectEqual(max.raw, (try almost_min.neg()).raw);
+    // x * 1 == x and x / 1 == x exactly, so the extremes must come back, not Overflow.
+    try testing.expectEqual(max.raw, (try max.mul(Decimal.one)).raw);
+    try testing.expectEqual(min.raw, (try min.mul(Decimal.one)).raw);
+    try testing.expectEqual(max.raw, (try max.div(Decimal.one)).raw);
+    try testing.expectEqual(min.raw, (try min.div(Decimal.one)).raw);
+    // divRound at scale 12 is x / 1 with no digit dropped, in every mode.
+    for ([_]RoundingMode{ .half_even, .up, .down, .ceiling, .floor }) |mode| {
+        try testing.expectEqual(max.raw, (try max.divRound(Decimal.one, 12, mode)).raw);
+        try testing.expectEqual(min.raw, (try min.divRound(Decimal.one, 12, mode)).raw);
+    }
+    // The minimum parses back (the asymmetric end of the range).
+    try testing.expectEqual(min.raw, (try Decimal.parse("-170141183460469231731687303.715884105728")).raw);
+    try testing.expectEqual(max.raw, (try Decimal.parse("170141183460469231731687303.715884105727")).raw);
+}
+
+test "round: a 48-digit drop still rounds to zero (Python quantize(Decimal('1E+36')) -> 0E+36)" {
+    // 123.456 is far nearer 0 than 10^36, so the rounded result is zero.
+    try testing.expectEqual(@as(i128, 0), dec("123.456").round(-36).raw);
+}
+
+test "divRound: a divisor so large that den * 10^-scale leaves i256 still rounds by mode" {
+    // 5 / 1e26 = 5e-26. Rounding to a multiple of 10^45 (scale -45) gives 0 in
+    // every nearest/toward-zero mode and 10^45 for `up` -- which is outside the
+    // ~1.7e26 range, so Overflow. (den.raw = 1e38; 1e38 * 1e45 overflows i256.)
+    const five = dec("5");
+    const huge = dec("100000000000000000000000000");
+    try testing.expectError(error.Overflow, five.divRound(huge, -45, .up));
+    try testing.expectEqual(@as(i128, 0), (try five.divRound(huge, -45, .down)).raw);
+    try testing.expectEqual(@as(i128, 0), (try five.divRound(huge, -45, .half_even)).raw);
+}
+
+test "bridge: a fraction of an ulp whose digit count equals the dropped digits is not 'below half'" {
+    // Python: Decimal('6E-13').quantize(Decimal('1E-12'), mode) and the same for
+    // 5E-13 (an exact tie) and -1E-20, per mode in this order:
+    // half_even, half_up, half_down, up, down, ceiling, floor.
+    const modes = [_]RoundingMode{ .half_even, .half_up, .half_down, .up, .down, .ceiling, .floor };
+    const cases = [_]struct { text: []const u8, want: [7]i128 }{
+        .{ .text = "6e-13", .want = .{ 1, 1, 1, 1, 0, 1, 0 } },
+        .{ .text = "5e-13", .want = .{ 0, 1, 0, 1, 0, 1, 0 } },
+        .{ .text = "-6e-13", .want = .{ -1, -1, -1, -1, 0, 0, -1 } },
+        .{ .text = "-5e-13", .want = .{ 0, -1, 0, -1, 0, 0, -1 } },
+        // drop (19) > digits (1): strictly below half, only the away modes move.
+        .{ .text = "-1e-20", .want = .{ 0, 0, 0, -1, 0, 0, -1 } },
+        .{ .text = "1e-20", .want = .{ 0, 0, 0, 1, 0, 1, 0 } },
+    };
+    for (cases) |c| {
+        var b = try BigDecimal.parse(testing.allocator, c.text);
+        defer b.deinit();
+        for (modes, c.want) |mode, want| {
+            const got = try Decimal.fromBigDecimal(testing.allocator, b, mode);
+            testing.expectEqual(want, got.raw) catch |err| {
+                std.debug.print("fromBigDecimal({s}, {s})\n", .{ c.text, @tagName(mode) });
+                return err;
+            };
+        }
+    }
+}
+
+test "float bridge: huge magnitudes are Overflow, tiny-but-not-negligible ones still round" {
+    // 1e70 >> 1.7e26: Overflow (and the shift must not wrap the i256 intermediate).
+    try testing.expectError(error.Overflow, Decimal.fromFloat(1e70, 12, .half_even));
+    try testing.expectError(error.Overflow, Decimal.fromFloat(-1e70, 12, .down));
+    // x = (2^53 - 1) * 2^-91 = 3.6379788070917125...e-12 (Python Decimal(x) * 10**12
+    // = 3.63797880709171254...), so scale 12 gives raw 4 half-even / up, 3 down.
+    const x = std.math.ldexp(@as(f64, 9007199254740991.0), -91);
+    try testing.expectEqual(@as(i128, 4), (try Decimal.fromFloat(x, 12, .half_even)).raw);
+    try testing.expectEqual(@as(i128, 3), (try Decimal.fromFloat(x, 12, .down)).raw);
+    // Shortest digits 12345678901234567 at 10^-23: 1.2345678901234567e-7 is raw
+    // 123457 at scale 12 (Python: Decimal(repr(x)).quantize(Decimal('1E-12')) = 1.23457E-7).
+    try testing.expectEqual(@as(i128, 123457), (try Decimal.fromFloatShortest(1.2345678901234567e-7, 12, .half_even)).raw);
+}
+
+test "parse: documented width and exponent limits sit exactly where the doc comment says" {
+    // 60 mantissa digits are accepted, the 61st is the documented Overflow.
+    try testing.expectEqual(Decimal.one.raw, (try Decimal.parse("0" ** 59 ++ "1")).raw);
+    try testing.expectError(error.Overflow, Decimal.parse("0" ** 61));
+    // Exponent literals: up to 4 digits; a 5th is InvalidCharacter.
+    try testing.expectEqual(@as(i128, 100_000) * Decimal.scale_factor, (try Decimal.parse("1e0005")).raw);
+    try testing.expectError(error.InvalidCharacter, Decimal.parse("1e00005"));
+    // Zero times any power of ten is zero: 0e36 scales by exactly 10^48 (the
+    // cap) and must not be mistaken for out-of-range.
+    try testing.expectEqual(@as(i128, 0), (try Decimal.parse("0e36")).raw);
+    // 6e47 * 10^-60 = 6e-13 -> half-away rounds to one ulp (Python:
+    // Decimal('6E-13').quantize(Decimal('1E-12'), ROUND_HALF_UP) = 1E-12);
+    // this drops exactly 48 digits, the largest power the rounder materialises.
+    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("6" ++ "0" ** 47 ++ "e-60")).raw);
+}
+
+test "round: any rounding place past the range is 0, not 'unchanged' (Python quantize -> 0E+37)" {
+    // 123.456 is far nearer 0 than 10^37 or 10^100; rescale already gave 0 here.
+    const x = dec("123.456");
+    try testing.expectEqual(@as(i128, 0), x.round(-37).raw);
+    try testing.expectEqual(@as(i128, 0), x.round(-100).raw);
+    try testing.expectEqual(@as(i128, 0), dec("-123.456").round(-1000).raw);
+    try testing.expectEqual((try x.rescale(-37, .half_up)).raw, x.round(-37).raw);
+}
+
+test "parse: values far below the last place round to 0 instead of Overflow" {
+    // Python: Decimal('1E-61').quantize(Decimal('1E-12')) = 0E-12 (below half an ulp).
+    try testing.expectEqual(@as(i128, 0), (try Decimal.parse("1e-61")).raw);
+    try testing.expectEqual(@as(i128, 0), (try Decimal.parse("-1e-100")).raw);
+    // 60-digit mantissa 5e59 * 10^-70 = 5e-11 = 50 ulps, with the exponent
+    // dropping 58 digits (49..60 still divide exactly, then round half-away).
+    try testing.expectEqual(@as(i128, 50), (try Decimal.parse("5" ++ "0" ** 59 ++ "e-70")).raw);
+    // Half-away tie at a 49-digit drop: 5e48 * 10^-61 = 5e-13 -> one ulp.
+    try testing.expectEqual(@as(i128, 1), (try Decimal.parse("5" ++ "0" ** 48 ++ "e-61")).raw);
 }

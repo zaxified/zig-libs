@@ -6,7 +6,7 @@
 
 **Scope:** core — Python `decimal` / General Decimal Arithmetic 2.62 (libmpdec), `java.math.BigDecimal` shape (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation ?
+**Audit:** review 2026-08-11 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -216,6 +216,28 @@ mirror the negative tie rule; the shared `half_even` tie-break inverted; `precis
 five bridge mutations (silent truncation instead of the caller's mode, widening at the wrong scale,
 below-half-ulp always zero, the post-rounding range check dropped). No survivors. Run:
 `zig build test-decimal`.
+
+**Mutation run 2026-10-04.** 117 schemata mutants (one ReleaseSafe build, env switch, 20 s cap per
+run) over `root.zig` and `big.zig`: i128/i32 boundary comparisons, width/exponent/shift caps, every
+rounding-mode prong, zero/negative-zero handling, min/max tie rules, sqrt/pow budgets. 97 killed,
+19 equivalent, 1 superseded. First pass: 62 survivors, after the new tests 21. Equivalent (reason):
+`floor`/`ceil`/`round`/`rescale` result-vs-limit comparisons (a multiple of 10^k, k >= 1, never
+equals i128 max/min, which end in 7/8), `round`/`rescale`/`quantize` entry guards at exactly
+12 digits (identity either way), `rescale` clamp at 48, `divRound` `-s <= 60` and `back > 48` (both
+sides give 0/Overflow), `fromBigDecimal`'s `digits + shift` guard (only bounds work; `rescale`'s
+`max_align_shift` gives the same Overflow), `fromRoundedMagnitude` limit (floats and shortest digits
+cannot equal i128 max), `parse`'s `i != s.len` (unreachable), `add` branch order (equal exponents
+handled earlier), `rescale` `<=` vs `<` (zero-digit drop), `pickA` exponent `<=` vs `<` (equal
+exponents: same clone), `sqrt` exact-root `<= prec` vs `< prec` and `k = prec` (output identical).
+Superseded: `exp_digits < 16` was the symptom of finding F3 (below). Tests added (all with the WHY
+in the test comment: i128/i32 invariants or Python `decimal`): boundary results, round/divRound/
+fromBigDecimal/fromFloat/parse limits, exponent-literal bounds, zero exponents, `max_align_shift`
+inclusive, `toFloat` cut-off, -0 min/max, sqrt budgets, exact quotients in all modes.
+Findings fixed in the same run (behavioural): `Decimal.round` with a rounding place past 10^36
+returned the value unchanged (now 0, as `rescale`); `Decimal.parse` of a value below 1e-60 was
+`Overflow` (now rounds half-away, 0 below half an ulp); `BigDecimal.parse` read only the first 15
+digits of an exponent literal, so `1e0000000000000012` had exponent 1 (now leading zeros are
+skipped and more than 15 significant digits is `Overflow`).
 
 ## Backlog / deferred
 None open. The rounding core (`roundedDivMag`) is implemented and KAT-covered, and the

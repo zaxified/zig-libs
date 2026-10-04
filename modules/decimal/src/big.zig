@@ -217,16 +217,25 @@ pub const BigDecimal = struct {
                 i += 1;
             }
             var exp_digits: u32 = 0;
+            var exp_sig: u32 = 0;
+            var exp_too_long = false;
             while (i < s.len) : (i += 1) {
                 if (!std.ascii.isDigit(s[i])) return error.InvalidCharacter;
                 // Cap accumulation width (not value range): ~15 digits is
                 // already far past i32, so this only stops the i64
                 // accumulator itself from overflowing on a pathological
                 // input like a 40-digit exponent literal.
-                if (exp_digits < 15) exp = exp * 10 + @as(i64, s[i] - '0');
                 exp_digits += 1;
+                // Leading zeros carry no value; count only significant digits so
+                // `1e0000000000000012` is 12, not a truncated read.
+                if (exp_sig > 0 or s[i] != '0') {
+                    exp_sig += 1;
+                    if (exp_sig <= 15) exp = exp * 10 + @as(i64, s[i] - '0') else exp_too_long = true;
+                }
             }
             if (exp_digits == 0) return error.InvalidCharacter;
+            // More than 15 significant digits is far past i32: out of range.
+            if (exp_too_long) return error.Overflow;
             if (exp_neg) exp = -exp;
         }
         if (i != s.len) return error.InvalidCharacter;
@@ -2295,4 +2304,220 @@ test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned"
     // non-zero value here would mean a quarter of the corpus's own literals
     // were being rewritten into something else before the parser saw them.
     try testing.expectEqual(@as(usize, 0), substituted);
+}
+
+// ---------------------------------------------------------------------------
+// Mutation run 2026-10-04: boundary and short-circuit pins. Each test kills
+// mutants the earlier suite let survive (SPEC.md "Mutation run 2026-10-04").
+// Expected values come from the stated invariant or from Python 3 `decimal`
+// (the General Decimal Arithmetic reference), noted per test.
+// ---------------------------------------------------------------------------
+
+test "parse: exponent literal bounds are the i32 range, inclusive" {
+    const max_i32 = std.math.maxInt(i32);
+    const min_i32 = std.math.minInt(i32);
+    var hi = dec("1e2147483647");
+    defer hi.deinit();
+    try testing.expectEqual(@as(i32, max_i32), hi.exponent);
+    var lo = dec("1e-2147483648");
+    defer lo.deinit();
+    try testing.expectEqual(@as(i32, min_i32), lo.exponent);
+    // 0.1e-2147483647: the fraction digit lowers the exponent to exactly i32 min.
+    var lo2 = dec("0.1e-2147483647");
+    defer lo2.deinit();
+    try testing.expectEqual(@as(i32, min_i32), lo2.exponent);
+    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e2147483648"));
+    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e-2147483649"));
+}
+
+test "parse: a 15-digit exponent literal with leading zeros keeps its last digit" {
+    // Python: Decimal('1e000000000000012') == Decimal('1E+12').
+    var a = dec("1e000000000000012");
+    defer a.deinit();
+    try testing.expectEqual(@as(i32, 12), a.exponent);
+}
+
+test "mul / scaleByPowerOfTen / pow: an exponent landing exactly on the i32 limits is fine" {
+    const max_i32 = std.math.maxInt(i32);
+    const min_i32 = std.math.minInt(i32);
+    var hi = dec("1e2147483647");
+    defer hi.deinit();
+    var lo = dec("1e-2147483648");
+    defer lo.deinit();
+    var one = dec("1");
+    defer one.deinit();
+
+    var p = try BigDecimal.mul(talloc, hi, one);
+    defer p.deinit();
+    try testing.expectEqual(@as(i32, max_i32), p.exponent);
+    var q = try BigDecimal.mul(talloc, lo, one);
+    defer q.deinit();
+    try testing.expectEqual(@as(i32, min_i32), q.exponent);
+
+    var s1 = try BigDecimal.scaleByPowerOfTen(one, max_i32);
+    defer s1.deinit();
+    try testing.expectEqual(@as(i32, max_i32), s1.exponent);
+    var s2 = try BigDecimal.scaleByPowerOfTen(one, min_i32);
+    defer s2.deinit();
+    try testing.expectEqual(@as(i32, min_i32), s2.exponent);
+
+    // a^1 == a, so its exponent (== the limit) must survive pow's exponent check.
+    var w1 = try BigDecimal.pow(talloc, hi, 1);
+    defer w1.deinit();
+    try testing.expectEqual(@as(i32, max_i32), w1.exponent);
+    var w2 = try BigDecimal.pow(talloc, lo, 1);
+    defer w2.deinit();
+    try testing.expectEqual(@as(i32, min_i32), w2.exponent);
+}
+
+test "normalize: stops at the i32 exponent ceiling instead of overflowing it" {
+    var a = dec("10e2147483647"); // coefficient 10 at the largest exponent
+    defer a.deinit();
+    var n = try BigDecimal.normalize(talloc, a);
+    defer n.deinit();
+    // The value 10 * 10^max cannot be re-expressed with a larger exponent, so
+    // the coefficient stays 10 (a wrap or trap here would be the bug).
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), n.exponent);
+    try testing.expectEqual(@as(i64, 10), try n.coeff.toConst().toInt(i64));
+}
+
+test "div / rescale: zero results carry the requested exponent" {
+    // GDA quantize gives the requested exponent even for zero:
+    // Python Decimal('0.00').quantize(Decimal('1E+2')) = Decimal('0E+2').
+    var z = dec("0.00");
+    defer z.deinit();
+    var five = dec("5");
+    defer five.deinit();
+    var r = try BigDecimal.rescale(talloc, z, 2, .half_even);
+    defer r.deinit();
+    try testing.expect(r.isZero());
+    try testing.expectEqual(@as(i32, 2), r.exponent);
+    // Java BigDecimal.ZERO.divide(x, scale, mode) has that scale: exponent = -scale.
+    var q = try BigDecimal.div(talloc, z, five, 3, .half_even);
+    defer q.deinit();
+    try testing.expect(q.isZero());
+    try testing.expectEqual(@as(i32, -3), q.exponent);
+}
+
+test "div: an alignment shift of exactly max_align_shift is allowed, one more is Overflow" {
+    const lim: i32 = @intCast(BigDecimal.max_align_shift);
+    var one = dec("1");
+    defer one.deinit();
+    // numerator side: shift = target_scale
+    var a = try BigDecimal.div(talloc, one, one, lim, .down);
+    defer a.deinit();
+    try testing.expectEqual(-lim, a.exponent);
+    // 10^1000000 has 3321929 bits (floor(1e6 * log2(10)) + 1); `precision` would be needlessly slow here.
+    try testing.expectEqual(@as(usize, 3_321_929), a.coeff.bitCountAbs());
+    try testing.expectError(error.Overflow, BigDecimal.div(talloc, one, one, lim + 1, .down));
+    // divisor side: shift = target_scale + a.exponent - b.exponent = -lim; 1e-lim / 1 -> 0 (.down)
+    var tiny = dec("1e-1000000");
+    defer tiny.deinit();
+    var b = try BigDecimal.div(talloc, tiny, one, 0, .down);
+    defer b.deinit();
+    try testing.expect(b.isZero());
+    var tinier = dec("1e-1000001");
+    defer tinier.deinit();
+    try testing.expectError(error.Overflow, BigDecimal.div(talloc, tinier, one, 0, .down));
+}
+
+test "toFloat: 1.5e308 is finite (the infinity cut-off is above f64 max)" {
+    // Python: float(Decimal('1.5e308')) == 1.5e308; f64 max is 1.7976931348623157e308.
+    var a = dec("1.5e308");
+    defer a.deinit();
+    try expectBits(1.5e308, try a.toFloat(talloc));
+}
+
+test "min/max: -0 versus +0 follows total order (Python: max -> 0, min -> -0)" {
+    var pz = dec("0");
+    defer pz.deinit();
+    var nz = dec("0");
+    defer nz.deinit();
+    nz.negate(); // negative zero is representable (see `negate`)
+    try testing.expect(!nz.coeff.isPositive());
+
+    var m1 = try BigDecimal.max(talloc, nz, pz);
+    defer m1.deinit();
+    try testing.expect(m1.coeff.isPositive());
+    var m2 = try BigDecimal.max(talloc, pz, nz);
+    defer m2.deinit();
+    try testing.expect(m2.coeff.isPositive());
+    var n1 = try BigDecimal.min(talloc, nz, pz);
+    defer n1.deinit();
+    try testing.expect(!n1.coeff.isPositive());
+    var n2 = try BigDecimal.min(talloc, pz, nz);
+    defer n2.deinit();
+    try testing.expect(!n2.coeff.isPositive());
+}
+
+test "sqrt: the digit budgets are inclusive and -0 is not a negative operand" {
+    const lim = BigDecimal.max_result_digits;
+    // prec == limit is allowed (exact root 2 returns before any heavy work);
+    // prec == limit + 1 is not.
+    var four = dec("4");
+    defer four.deinit();
+    var two = try BigDecimal.sqrt(talloc, four, lim, .half_even);
+    defer two.deinit();
+    try expectStr(two, "2");
+    try testing.expectError(error.PrecisionTooLarge, BigDecimal.sqrt(talloc, four, lim + 1, .half_even));
+
+    // A radicand of exactly `lim` digits is allowed. Python, prec=5:
+    // sqrt(Decimal(10)**99999) = 3.1623E+49999 -> coefficient 31623, exponent 49995.
+    var wide = dec("1" ++ "0" ** 99999);
+    defer wide.deinit();
+    var r = try BigDecimal.sqrt(talloc, wide, 5, .half_even);
+    defer r.deinit();
+    try testing.expectEqual(@as(i32, 49995), r.exponent);
+    try testing.expectEqual(@as(i64, 31623), try r.coeff.toConst().toInt(i64));
+    var too_wide = dec("1" ++ "0" ** 100000);
+    defer too_wide.deinit();
+    try testing.expectError(error.PrecisionTooLarge, BigDecimal.sqrt(talloc, too_wide, 5, .half_even));
+
+    // Python: Decimal('-0').sqrt() == Decimal('-0') -- valid, not Invalid_operation.
+    var nz = dec("0");
+    defer nz.deinit();
+    nz.negate();
+    var z = try BigDecimal.sqrt(talloc, nz, 5, .half_even);
+    defer z.deinit();
+    try testing.expect(z.isZero());
+}
+
+test "rescale / div: an exact quotient is never bumped, whatever the mode" {
+    const modes = [_]RoundingMode{ .half_even, .half_up, .half_down, .up, .down, .ceiling, .floor };
+    var a = dec("1.50");
+    defer a.deinit();
+    var six = dec("6");
+    defer six.deinit();
+    var neg_six = dec("-6");
+    defer neg_six.deinit();
+    var three = dec("3");
+    defer three.deinit();
+    for (modes) |mode| {
+        // Python: Decimal('1.50').quantize(Decimal('0.1'), rounding=ROUND_UP) = 1.5 (digit dropped is 0)
+        var r = try BigDecimal.rescale(talloc, a, -1, mode);
+        defer r.deinit();
+        try expectStr(r, "1.5");
+        // 6/3 = 2 and -6/3 = -2 exactly.
+        var q = try BigDecimal.div(talloc, six, three, 0, mode);
+        defer q.deinit();
+        try expectStr(q, "2");
+        var nq = try BigDecimal.div(talloc, neg_six, three, 0, mode);
+        defer nq.deinit();
+        try expectStr(nq, "-2");
+    }
+}
+
+test "parse: long exponent literals are read by value, never truncated" {
+    // Python: Decimal('1e0000000000000012') == Decimal('1E+12'); leading zeros are not digits of value.
+    var a = dec("1e0000000000000012");
+    defer a.deinit();
+    try testing.expectEqual(@as(i32, 12), a.exponent);
+    var b = dec("1e-" ++ "0" ** 40 ++ "12");
+    defer b.deinit();
+    try testing.expectEqual(@as(i32, -12), b.exponent);
+    // 16 significant digits is far past i32: the module's out-of-range error, not a wrong value.
+    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e1000000000000000"));
+    try testing.expectError(error.Overflow, BigDecimal.parse(talloc, "1e-" ++ "9" ** 40));
+    // Junk after a long literal is still malformed.
+    try testing.expectError(error.InvalidCharacter, BigDecimal.parse(talloc, "1e" ++ "9" ** 40 ++ "x"));
 }
