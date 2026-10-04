@@ -641,6 +641,12 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
 ///
 /// See `serve` on why a canceled read reaches here as `error.ReadFailed`
 /// and where its real cause is recoverable: the transport is yours.
+///
+/// So is the close, and it should LINGER: shut the write side, read and drop
+/// what the peer still sends (bounded), then close. A socket closed with
+/// unread input is reset, and the reset can discard the frames the peer has
+/// not read yet -- the GOAWAY that explains the close. `Server` does this for
+/// its h2c connections (`lingerClose`); h2spec 3.8/1 and 7/1 fail without it.
 pub fn serveStream(
     gpa: Allocator,
     in: *Reader,
@@ -928,6 +934,13 @@ const Session = struct {
             // existing one and keeps the connection open (§6.8).
             const drained = s.peer_goaway and s.jobs.count() == 0 and
                 s.detached.items.len == 0;
+            // Answer the peer's GOAWAY with ours before closing (§6.8: an
+            // endpoint SHOULD send one before it closes), so a client that
+            // races a request against the close learns none was processed.
+            if (drained and !over_total) {
+                s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                s.flushWire() catch {};
+            }
             s.unlock();
             if (over_total or drained) return;
             // The embedder's turn, before the loop blocks on the peer: with
@@ -4183,6 +4196,26 @@ test "h2c serve: total-streams cap → graceful GOAWAY(NO_ERROR) after serving" 
     // a well-behaved client simply reconnects.
     try testing.expectEqual(@as(u16, 200), peer.resp(sid1).status);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.no_error), peer.goaway);
+}
+
+test "h2c serve: a client GOAWAY is answered with ours once its streams are served (§6.8)" {
+    // Found by h2spec 3.8/1 and 7/1 (tools/interop.zig): after the peer's
+    // GOAWAY the session returned without one of its own. §6.8: an endpoint
+    // SHOULD send GOAWAY before closing, so a request racing the close is
+    // known to be unprocessed. The client's own stream is still served.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
     try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.no_error), peer.goaway);
 }
 

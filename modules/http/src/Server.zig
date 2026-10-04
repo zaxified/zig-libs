@@ -1156,6 +1156,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .stream_request = o.h2_stream_request,
                 .dispatcher = o.h2_dispatcher,
             }, &tr.reader, &tw.writer);
+            lingerClose(s.io, stream, &tr.reader);
             return;
         }
     }
@@ -1178,6 +1179,31 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .verify_inbound_trailer = o.verify_inbound_trailer,
         .max_requests_per_conn = o.max_requests_per_conn,
     }, &tr.reader, &tw.writer, bufs, &tr);
+}
+
+/// Bytes `lingerClose` reads and drops before it gives up on a peer that keeps
+/// sending after we stopped.
+const max_linger_drain = 64 * 1024;
+
+/// Close the write side, then read and drop what the peer still sends until
+/// it closes too (or `max_linger_drain` bytes, or the reader's stall timeout).
+///
+/// An h2 session ends with frames the peer has not read yet — our GOAWAY,
+/// the last responses — while the peer may still be sending (a PING after its
+/// own GOAWAY, a request racing the close). Closing a socket with unread input
+/// makes the kernel answer with RST instead of FIN, and a RST can discard the
+/// peer's unread receive buffer: the GOAWAY that explains the close is lost
+/// exactly when it matters. h2spec 3.8/1 and 7/1 caught it (a GOAWAY then a
+/// PING: "connection reset by peer"). The h1 loop's equivalent is its bounded
+/// unread-body drain.
+fn lingerClose(io: std.Io, stream: net.Stream, in: *Reader) void {
+    stream.shutdown(io, .send) catch return;
+    var left: usize = max_linger_drain;
+    while (left != 0) {
+        const n = in.discard(.limited(left)) catch return; // EOF, reset or stall: done
+        if (n == 0) return;
+        left -= n;
+    }
 }
 
 /// Peek (never consume) whether the connection opens with the HTTP/2
@@ -7589,6 +7615,55 @@ const ConnStateTally = struct {
         }
     }
 };
+
+test "integration: an h2c session ends in FIN, not RST, while the peer is still sending (lingering close)" {
+    // Found by h2spec 3.8/1 and 7/1 (tools/interop.zig): the client sent
+    // GOAWAY, then a PING; the session ended at the GOAWAY and the socket was
+    // closed with the PING unread. The kernel answers a close with unread
+    // input by RST instead of FIN, and the RST can throw away what the peer
+    // had not read yet -- our GOAWAY, the frame that explains the close.
+    //
+    // Deterministic shape: GOAWAY followed at once by ~32 KiB of PINGs. The
+    // session ends (the GOAWAY, or the PING-flood guard) long before it has
+    // read them all, so without the lingering close the socket closes with
+    // input pending: RST, and the client's read fails. With it the write side
+    // shuts first, the rest (under `max_linger_drain`) is read and dropped,
+    // and the client sees the server's frames and then EOF.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{ .handler = testHandler, .enable_h2c = true });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    const settings = [_]u8{ 0, 0, 0, 4, 0, 0, 0, 0, 0 };
+    const goaway = [_]u8{ 0, 0, 8, 7, 0, 0, 0, 0, 0 } ++ [_]u8{0} ** 8;
+    const ping = [_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "lingerok".*;
+    try sw.interface.writeAll(h2.preface ++ settings ++ goaway);
+    for (0..32 * 1024 / ping.len) |_| try sw.interface.writeAll(&ping);
+    try sw.interface.flush();
+    stream.shutdown(io, .send) catch {};
+
+    var rbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    sr.interface.appendRemainingUnlimited(testing.allocator, &got) catch |err| {
+        std.debug.print("read ended in {t} ({?t}), not EOF\n", .{ err, sr.err });
+        return err;
+    };
+    // The server's GOAWAY made it across.
+    try testing.expect(std.mem.indexOf(u8, got.items, &[_]u8{ 0, 0, 8, 7, 0 }) != null);
+}
 
 test "integration: a connection dropped before serving still reports .new/.closed" {
     // Regression for a connection-slot leak. `on_connect` admits up in the

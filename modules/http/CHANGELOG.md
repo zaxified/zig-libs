@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix (h2, found by h2spec 3.8/1 + 7/1): after a client's GOAWAY the session now
+  answers with its own GOAWAY(NO_ERROR) once the client's streams are served (RFC 9113 §6.8), and
+  `Server` closes h2c connections lingering (write side shut, at most 64 KiB of further input read
+  and dropped, then close). Before, a client that sent anything after its GOAWAY got a TCP reset,
+  which can discard frames it had not read yet. `h2_server.serveStream` callers own their transport
+  and its close; the doc now says to linger the same way. New `tools/interop.zig`: h2spec against
+  the shared h1/h2c `Server` and against `serveStream` alone, 145/145 both.
+
 - **2026-10-01** — **The two `live:` tests left `test-http` for `tools/live.zig` (`zig build
   live-http`).** A GET of https://example.com and a plaintext request that may redirect. Without a
   route to the internet both timed out and SKIPPED, so `test-http` was green while doing less —

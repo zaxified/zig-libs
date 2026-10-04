@@ -315,6 +315,20 @@ request-body decompression, size-capped by `max_decompressed_request_bytes` but 
 fuzz-verified here). These are std's parsers, not ours, to fix or fuzz-harness directly; ReleaseSafe
 (below) is exactly the mitigation for that residual, un-fuzzed surface.
 
+**h2 server conformance against h2spec** (2026-10-04, `tools/interop.zig`, `zig build
+interop-http -- --h2spec PATH`): summerwind/h2spec 2.0.0, all 145 cases, run twice — against the
+real `Server` with h1 and h2c prior knowledge on one port, and against `h2_server.serveStream` alone
+(the ALPN "h2" entry point). Both 145/145. On the shared port case 3.5/2 ("invalid connection
+preface") is allowed either way: those bytes are a malformed HTTP/1.1 request there, answered 400 as
+Go's h2c handler does, and whether h2spec reads the 400 or the close first is timing; the h2-only
+phase holds the engine to it. The first run failed 3.8/1 and 7/1: after the client's GOAWAY the
+session returned without a GOAWAY of its own, and the socket was closed with the client's next
+PING unread, so the kernel reset the connection. Fixed (GOAWAY(NO_ERROR) once the peer's streams
+are served; `Server` closes h2c connections lingering: write side shut, ≤ 64 KiB read and dropped,
+then close), each with a regression test that fails without its half (mutation-checked; the
+lingering one deterministic: a GOAWAY followed by 32 KiB of PINGs, `ConnectionResetByPeer` 3 of 3
+without it). The suite needs no fixture: it is the oracle, run before a release.
+
 ## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
 This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
 framing, multipart bodies, Range headers, HPACK blocks, HTTP/2 frames) into typed values before any
@@ -516,6 +530,6 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self
+**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`); h1/smuggling goldens self
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
