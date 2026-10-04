@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED (survey 2026-09-30 ranks 1–4), `src/counters.zig`: `/proc/net/dev`
+  (`parseNetDev`/`readNetDev`, `NetDevEntry`), `/proc/stat` (`parseStat`/`readStat`, `Stat`,
+  `CpuTimes` with `total`/`busy`/`busyFraction`), `/proc/meminfo` typed (`parseMeminfo`/
+  `readMeminfo`, `MemInfo` with `used()`; exact-key match, so `Cached:` is never `SwapCached:`),
+  `/proc/diskstats` (`parseDiskstats`/`readDiskstats`, `DiskStat`; 11/15/17-field kernels),
+  `/proc/net/ipv6_route` (`parseIpv6Routes`/`readIpv6Routes`, `Ipv6RouteEntry`). Real-capture
+  fixtures (sanitized), expected values read off the fixture text by documented column; a fuzz
+  harness over all five plus a 3000-script deterministic driver. Mutation 2026-10-04: 25 mutants,
+  25 killed (2 tests added). No change to existing APIs.
+
 - **2026-09-07** — **All five fuzz harnesses parsed the empty string, every iteration,
   for their whole lives — and one earlier audit fix aimed at exactly this bought
   nothing.**

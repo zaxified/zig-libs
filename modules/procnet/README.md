@@ -77,6 +77,22 @@ var snap = try procnet.snapshot(gpa, io);
 defer snap.deinit(gpa);
 ```
 
+### Host counters (2026-10-04, `src/counters.zig`)
+
+```zig
+const devs = try procnet.readNetDev(gpa, io);      // []NetDevEntry: rx/tx bytes, packets, errs, drop, … (16 counters)
+const st = try procnet.readStat(gpa, io);          // Stat{ cpu, cpus, ctxt, btime, processes, procs_running, procs_blocked }
+defer st.deinit(gpa);
+_ = procnet.CpuTimes.busyFraction(prev.cpu, st.cpu); // ?f64 between two samples (iowait counts as idle)
+const mem = procnet.readMeminfo(gpa, io);          // MemInfo: typed kB fields, null when the kernel omits the line; mem.used()
+const disks = try procnet.readDiskstats(gpa, io);  // []DiskStat per iostats.rst; discard/flush groups null on older kernels
+const r6 = try procnet.readIpv6Routes(gpa, io);    // []Ipv6RouteEntry: dest/src Prefix, next_hop, metric, flags, iface
+```
+
+Formats are the kernel's documented ones (proc(5), `iostats.rst`); fixtures
+are real captures; each parser also runs under the shared fuzz harness and a
+3000-script deterministic driver that feeds every parser every damaged sample.
+
 Every table follows the same split: `parseX(gpa, text) → []Entry` is pure
 and offline-testable (golden-text fixtures in `src/testdata/`); `readX(gpa,
 io)` reads the live file and calls the pure parser. A missing or unreadable
@@ -155,13 +171,9 @@ routes, `-N` neighbours and `-s` snapshot.
   `ConntrackFlow` decodes the original-direction tuple only, which the type
   says; the reply tuple is where NAT translation is visible and deserves
   explicit modelling rather than four more fields.
-- `/proc/net/dev` interface byte/packet counters — a different shape
-  (per-iface throughput, not a neighbor/route/socket table); own parser.
-- `/proc/diskstats` — disk I/O counters; not yet covered, needs its own
-  design pass.
 - `/proc/<pid>/status` — richer per-process fields (VmRSS breakdown, uid/gid,
   cgroup) beyond `stat`'s scalars; a `status.zig` sibling to `process.zig`.
-- `/proc/net/ipv6_route` — the IPv6 routing table (different column layout
-  from v4's `/proc/net/route`, not just a wider address).
+- `/proc/net/snmp` / `/proc/net/netstat` protocol counters — two-line
+  header/value pairs per protocol; no consumer reads them yet.
 - `statvfs`/`/proc/mounts` disk usage — filesystem space, not a `/proc/net`
   or per-process concern; a different module axis entirely.

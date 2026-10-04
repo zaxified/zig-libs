@@ -92,6 +92,7 @@ pub const routes = @import("routes.zig");
 pub const sockets = @import("sockets.zig");
 pub const conntrack = @import("conntrack.zig");
 pub const process = @import("process.zig");
+pub const counters = @import("counters.zig");
 
 // Flattened re-exports — the primary type + functions of each submodule, so
 // `procnet.parseArp(...)` works without reaching through the namespace.
@@ -137,6 +138,23 @@ pub const SocketOwnerIndex = process.SocketOwnerIndex;
 pub const SocketOwnerOptions = process.SocketOwnerOptions;
 pub const parseSocketInode = process.parseSocketInode;
 pub const indexSocketOwners = process.indexSocketOwners;
+
+pub const NetDevEntry = counters.NetDevEntry;
+pub const parseNetDev = counters.parseNetDev;
+pub const readNetDev = counters.readNetDev;
+pub const CpuTimes = counters.CpuTimes;
+pub const Stat = counters.Stat;
+pub const parseStat = counters.parseStat;
+pub const readStat = counters.readStat;
+pub const MemInfo = counters.MemInfo;
+pub const parseMeminfo = counters.parseMeminfo;
+pub const readMeminfo = counters.readMeminfo;
+pub const DiskStat = counters.DiskStat;
+pub const parseDiskstats = counters.parseDiskstats;
+pub const readDiskstats = counters.readDiskstats;
+pub const Ipv6RouteEntry = counters.Ipv6RouteEntry;
+pub const parseIpv6Routes = counters.parseIpv6Routes;
+pub const readIpv6Routes = counters.readIpv6Routes;
 
 // ── virtual-file reading ────────────────────────────────────────────────────
 
@@ -414,6 +432,7 @@ fn readThermalZones(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
 // another file `zig build test-procnet` compiles) — see CONVENTIONS.md.
 
 test {
+    _ = counters;
     _ = arp;
     _ = routes;
     _ = sockets;
