@@ -46,7 +46,8 @@ pub const Usage = struct {
     /// per musl's `statvfs` fixup (`f_frsize ? f_frsize : f_bsize`), treat
     /// `block_size` as the true unit when this is 0.
     fragment_size: i64,
-    /// Total blocks, in units of `block_size` (`f_blocks`).
+    /// Total blocks (`f_blocks`), in units of `fragment_size` — or of
+    /// `block_size` when `fragment_size` is 0 (see `unitBytes`).
     blocks_total: u64,
     /// Free blocks, **including** the filesystem's superuser-reserved margin
     /// (`f_bfree`). This is *not* what `df`'s "Avail" column reports — see
@@ -71,26 +72,49 @@ pub const Usage = struct {
     /// Maximum filename length the filesystem supports (`f_namelen`).
     name_max: i64,
 
-    /// `blocks_total * block_size`, saturating (never wraps on an
-    /// adversarial/corrupt report).
+    /// `blocks_total · unit`, saturating (never wraps on an
+    /// adversarial/corrupt report) — `df -B1`'s "1B-blocks"/"Size".
     pub fn totalBytes(u: Usage) u64 {
-        return u.blocks_total *| blockSizeU64(u);
+        return u.blocks_total *| u.unitBytes();
     }
-    /// `blocks_free * block_size` — includes the root-reserved margin; see
-    /// the field doc comment.
+    /// `blocks_free · unit` — includes the root-reserved margin; see the
+    /// field doc comment.
     pub fn freeBytes(u: Usage) u64 {
-        return u.blocks_free *| blockSizeU64(u);
+        return u.blocks_free *| u.unitBytes();
     }
-    /// `blocks_available * block_size` — matches `df`'s "Available"/use%.
+    /// `blocks_available · unit` — `df`'s "Available".
     pub fn availableBytes(u: Usage) u64 {
-        return u.blocks_available *| blockSizeU64(u);
+        return u.blocks_available *| u.unitBytes();
+    }
+    /// `(blocks_total − blocks_free) · unit` — `df`'s "Used" (the reserved
+    /// margin is neither used nor available, which is why Used + Available
+    /// can fall short of Size on ext-family filesystems).
+    pub fn usedBytes(u: Usage) u64 {
+        return (u.blocks_total -| u.blocks_free) *| u.unitBytes();
+    }
+    /// `df`'s "Use%": used / (used + available), rounded UP to a whole
+    /// percent (so any use at all shows at least 1 %), null when both are
+    /// zero (`df` prints `-`). Pinned to captured `df` output.
+    pub fn usePercent(u: Usage) ?u8 {
+        const used: u128 = u.blocks_total -| u.blocks_free;
+        const denom: u128 = used + u.blocks_available;
+        if (denom == 0) return null;
+        return @intCast((used * 100 + denom - 1) / denom);
     }
 
-    fn blockSizeU64(u: Usage) u64 {
-        // block_size is a kernel-reported `long`; on real filesystems this is
-        // always a small positive power of two, but a hostile/corrupt report
-        // is clamped to 0 rather than trusted as a negative multiplier.
-        return if (u.block_size > 0) @intCast(u.block_size) else 0;
+    /// The byte size of one counted block: `fragment_size`, or `block_size`
+    /// when the kernel reports a 0 fragment size. POSIX defines the
+    /// `statvfs` counts in `f_frsize` units; musl's `statvfs` (and glibc's)
+    /// copy the counts unchanged and fill `f_frsize` with `f_bsize` only when
+    /// it is 0, and GNU `df` multiplies by that — so this is the unit that
+    /// agrees with `df`. (Before 2026-10-04 the counts were multiplied by
+    /// `block_size`: identical wherever the two sizes agree, which is every
+    /// mount the `df` differential has seen, wrong where they differ.)
+    /// A non-positive size (hostile/corrupt report) is clamped to 0 rather
+    /// than trusted as a negative multiplier.
+    pub fn unitBytes(u: Usage) u64 {
+        const unit = if (u.fragment_size != 0) u.fragment_size else u.block_size;
+        return if (unit > 0) @intCast(unit) else 0;
     }
 };
 
@@ -624,4 +648,119 @@ test "totalBytes: normal values multiply without saturating" {
     try testing.expectEqual(@as(u64, 4096 * 1000), u.totalBytes());
     try testing.expectEqual(@as(u64, 4096 * 500), u.freeBytes());
     try testing.expectEqual(@as(u64, 4096 * 400), u.availableBytes());
+}
+
+test "unitBytes: f_frsize is the unit, f_bsize only when f_frsize is 0" {
+    // POSIX statvfs: f_blocks/f_bfree/f_bavail count f_frsize-sized units.
+    // A filesystem reporting bsize 4096 (preferred I/O size) and frsize 512
+    // with 100 blocks is 51200 bytes, not 409600.
+    var u = Usage{
+        .block_size = 4096,
+        .fragment_size = 512,
+        .blocks_total = 100,
+        .blocks_free = 40,
+        .blocks_available = 30,
+        .inodes_total = 0,
+        .inodes_free = 0,
+        .fs_type_magic = 0,
+        .name_max = 255,
+    };
+    try testing.expectEqual(@as(u64, 51200), u.totalBytes());
+    try testing.expectEqual(@as(u64, 20480), u.freeBytes());
+    try testing.expectEqual(@as(u64, 15360), u.availableBytes());
+    try testing.expectEqual(@as(u64, 30720), u.usedBytes()); // (100 − 40) · 512
+    u.fragment_size = 0; // the fixup case: fall back to f_bsize
+    try testing.expectEqual(@as(u64, 409600), u.totalBytes());
+    u.fragment_size = -1; // corrupt: clamped, not used as a multiplier
+    try testing.expectEqual(@as(u64, 0), u.totalBytes());
+}
+
+test "usePercent: df's rounding up, and its '-' for an empty filesystem" {
+    const base = Usage{
+        .block_size = 4096,
+        .fragment_size = 4096,
+        .blocks_total = 0,
+        .blocks_free = 0,
+        .blocks_available = 0,
+        .inodes_total = 0,
+        .inodes_free = 0,
+        .fs_type_magic = 0,
+        .name_max = 255,
+    };
+    var u = base;
+    try testing.expectEqual(@as(?u8, null), u.usePercent()); // df prints "-"
+    // 1 used of 1000 available: 0.0999 % rounds UP to 1 %.
+    u.blocks_total = 1001;
+    u.blocks_free = 1000;
+    u.blocks_available = 1000;
+    try testing.expectEqual(@as(?u8, 1), u.usePercent());
+    // Reserved margin is excluded from the denominator: total 100, free 10,
+    // available 5 → used 90 / (90 + 5) = 94.7 % → 95 %.
+    u = base;
+    u.blocks_total = 100;
+    u.blocks_free = 10;
+    u.blocks_available = 5;
+    try testing.expectEqual(@as(?u8, 95), u.usePercent());
+    // Read-only image: everything used, nothing available.
+    u.blocks_free = 0;
+    u.blocks_available = 0;
+    try testing.expectEqual(@as(?u8, 100), u.usePercent());
+    // Huge counts do not overflow the percentage arithmetic.
+    u.blocks_total = std.math.maxInt(u64);
+    u.blocks_free = 1;
+    u.blocks_available = 1;
+    try testing.expectEqual(@as(?u8, 100), u.usePercent());
+    // A hostile report with free > total: used saturates at 0.
+    u.blocks_total = 5;
+    u.blocks_free = 9;
+    u.blocks_available = 9;
+    try testing.expectEqual(@as(?u8, 0), u.usePercent());
+    try testing.expectEqual(@as(u64, 0), u.usedBytes());
+}
+
+test "df golden: Usage reproduces GNU df's columns from the same statfs numbers" {
+    // `tools/capture-df-golden.sh`: raw statfs numbers (`stat -f`) and what
+    // GNU df 9.7 printed for the same filesystem at the same moment, on a
+    // dozen real mounts — ext4 with a root reserve, vfat (no inodes),
+    // squashfs (full), tmpfs, efivarfs (1-byte blocks), and three empty
+    // pseudo filesystems where df prints `-`.
+    const golden = @embedFile("testdata/df_golden.txt");
+    var lines = std.mem.splitScalar(u8, golden, '\n');
+    var rows: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var parts = std.mem.splitSequence(u8, line, "\t|\t");
+        var raw = std.mem.tokenizeScalar(u8, parts.next().?, ' ');
+        var dfc = std.mem.tokenizeScalar(u8, parts.next().?, ' ');
+        var r: [7]u64 = undefined;
+        for (&r) |*x| x.* = try std.fmt.parseInt(u64, raw.next().?, 10);
+        var d: [6]u64 = undefined;
+        for (&d) |*x| x.* = try std.fmt.parseInt(u64, dfc.next().?, 10);
+        const pcent = dfc.next().?;
+        const u = Usage{
+            .block_size = @intCast(r[0]),
+            .fragment_size = @intCast(r[1]),
+            .blocks_total = r[2],
+            .blocks_free = r[3],
+            .blocks_available = r[4],
+            .inodes_total = r[5],
+            .inodes_free = r[6],
+            .fs_type_magic = 0,
+            .name_max = 255,
+        };
+        try testing.expectEqual(d[0], u.totalBytes());
+        try testing.expectEqual(d[1], u.usedBytes());
+        try testing.expectEqual(d[2], u.availableBytes());
+        try testing.expectEqual(d[3], u.inodes_total);
+        try testing.expectEqual(d[4], u.inodes_total - u.inodes_free);
+        try testing.expectEqual(d[5], u.inodes_free);
+        if (std.mem.eql(u8, pcent, "-")) {
+            try testing.expectEqual(@as(?u8, null), u.usePercent());
+        } else {
+            const want = try std.fmt.parseInt(u8, pcent[0 .. pcent.len - 1], 10);
+            try testing.expectEqual(@as(?u8, want), u.usePercent());
+        }
+        rows += 1;
+    }
+    try testing.expectEqual(@as(usize, 12), rows);
 }

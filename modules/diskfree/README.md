@@ -87,6 +87,16 @@ the margin a filesystem reserves for its superuser (ext-family: `tune2fs
 percentage, from `f_bavail`; a consumer replacing `df` output should read
 `availableBytes()`, not `freeBytes()`.
 
+`df`'s columns come straight off a `Usage`: `totalBytes()` (Size),
+`usedBytes()` (Used = total − free), `availableBytes()` (Avail),
+`usePercent()` (Use%: rounded up; null where `df` prints `-`) and the inode
+counts. The byte unit is `f_frsize` (`unitBytes()`; `f_bsize` only when the
+kernel reports 0), as POSIX `statvfs` and `df` use it. **Checked against GNU
+`df` itself:** a golden of captured `df` output for twelve real filesystems
+is in the test suite (`tools/capture-df-golden.sh`), and `tools/df-diff.sh`
+compares the module with `df` live on every mount of the machine it runs on
+(2026-10-04: 61 SAME, 2 live-drift, 0 DIFF over 63 mounts).
+
 `mounts.parseMounts`/`mountinfo.parseMountinfo` are pure (`(gpa, text) →
 []Entry`, golden-text tested against real kernel captures in `src/testdata/`,
 including octal-escaped paths — see `mounts.unescapeOctal`'s doc comment);

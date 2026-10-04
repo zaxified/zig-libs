@@ -6,7 +6,7 @@
 
 **Scope:** core — GNU coreutils df 9.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-04
+**Audit:** review 2026-10-04 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -260,7 +260,34 @@ Not applicable — no secret material is handled anywhere in this module.
 
 ## Anchoring
 
-**Anchor grade:** class B · oracle REDERIVED
+**Anchor grade:** class B · oracle EXTERNAL
+
+- **Oracle EXTERNAL (2026-10-04): GNU coreutils `df`.** Two instruments, both driving `df` only
+  through its public output (`df -B1 --output=size,used,avail,itotal,iused,iavail,pcent`):
+  - **In the suite:** `src/testdata/df_golden.txt` (recipe `tools/capture-df-golden.sh`) holds,
+    for twelve real filesystems, the raw statfs numbers (`stat -f`) and what `df` printed for the
+    same filesystem at the same moment (captured until two `stat -f` reads around the `df` call
+    agree). The test rebuilds a `Usage` from the raw numbers and must reproduce every `df` column —
+    Size, Used, Avail, inodes, Use% including its round-up and its `-` — exactly. Shapes covered:
+    ext4 with a root reserve (Used + Avail < Size), vfat (no inodes), squashfs (100 %), tmpfs,
+    efivarfs (1-byte blocks), and empty pseudo filesystems (`-`).
+  - **By hand, live:** `tools/df-diff.sh` builds `tools/df_dump.zig` (the module's `query` + `Usage`
+    helpers over every mount in `/proc/self/mounts`) and compares it with one `df` call per mount.
+    Measured 2026-10-04 with df 9.7 on the x86_64 development host: **61 SAME, 2 DRIFT** (`/` and
+    `/run/snapd/ns`: used/avail moved 4–20 KiB between the two reads, totals equal), **0 DIFF, 0 SKIP**
+    over 63 mounts.
+  - **What it found:** nothing on that host — but asking the question exposed that the module
+    multiplied the block counts by `f_bsize`, where POSIX `statvfs` (and `df`, and musl's `statvfs`
+    fixup the `fragment_size` doc already cited) count in `f_frsize` units. Identical on every mount
+    there (`stat -f` shows the two sizes equal on all 63), wrong wherever they differ; fixed
+    (`Usage.unitBytes`) and pinned by a unit test from the POSIX definition, since no available
+    filesystem could exhibit it.
+  - **Blind spots, stated:** the golden and the live diff test the statfs → columns arithmetic and
+    the x86_64 syscall path; the 32-bit/MIPS struct families stay anchored by the qemu-user runs
+    below, and the mount-table parsers by the real-`/proc` captures (`hostile-ns.sh`) — `df` does
+    not expose those to compare against.
+
+Previously (kept for the record — the evidence that made it REDERIVED):
 
 - **Class B** — the wire formats (`statfs64` struct layout, `/proc/self/
   mounts`/`mountinfo` text shape) are real external kernel ABI/UAPI

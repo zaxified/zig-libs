@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — EXTERNAL ORACLE (GNU coreutils `df`), and a unit fix it prompted.
+  - `tools/df-diff.sh` + `tools/df_dump.zig`: a live differential against `df -B1 --output=…`,
+    mount by mount (2026-10-04, df 9.7: 61 SAME, 2 DRIFT on live filesystems, 0 DIFF, 0 SKIP over
+    63 mounts). `tools/capture-df-golden.sh` → `src/testdata/df_golden.txt`: raw statfs numbers +
+    `df`'s columns for 12 real filesystems (ext4 with reserve, vfat, squashfs, tmpfs, efivarfs,
+    empty pseudo filesystems), reproduced exactly by the new test.
+  - ADDED `Usage.usedBytes`, `Usage.usePercent` (df's Use%, rounded up, null for `-`),
+    `Usage.unitBytes`.
+  - FIXED (behaviour change only where `f_frsize ≠ f_bsize`): the byte unit of the block counts is
+    now `f_frsize` (falling back to `f_bsize` when it is 0) — POSIX `statvfs`'s unit and `df`'s;
+    it was `f_bsize`. No mount on the differential host has the two differ, so the live diff could
+    not show it; a unit test pins the POSIX definition.
+  - Mutation 2026-10-04 (the new arithmetic): 9 mutants, 8 killed, 1 equivalent.
+
 - **2026-09-10** — **A1 audit, F8.** `mountinfo.parseLine` scanned for the mandated `-` separator
   by stopping at the FIRST bare `-` token. A forged row (untrusted bind-mounted/faked `/proc`, or a
   caller-supplied snapshot — both already-documented reachable inputs) carrying a SECOND `-` earlier
