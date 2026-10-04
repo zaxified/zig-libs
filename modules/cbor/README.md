@@ -25,11 +25,30 @@ NOTICE entry needed.
    — `Value` does not record "was this indefinite on the wire" (see Deferred below).
 2. **Encode ← `Value`.** `cbor.encode(allocator, value, .{})` always emits definite-length,
    shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization"). Pass
-   `.{ .canonical = true }` to additionally sort every map's entries by the bytewise order of their
-   *encoded* keys (RFC 8949 §4.2.1's map-key rule). That is core-deterministic output only for
-   values without floats: a float keeps the width it was given, while §4.2.1 asks for the shortest
-   one that preserves the value.
-3. **COSE (`cose.zig`).** `cose.parseKey`/`cose.encodeEc2Key`/`cose.encodeOkpKey` for `COSE_Key`
+   `.{ .canonical = true }` for RFC 8949 §4.2.1 Core Deterministic Encoding: every map's entries
+   sorted by the bytewise order of their *encoded* keys, and every float in the shortest width that
+   keeps its value (`1.5` → `f93e00`; every NaN → `f97e00`). `.{ .shortest_floats = true }` asks
+   for the float rule alone.
+3. **Strict decoding.** `DecodeOptions.reject_duplicate_keys` (data-model equal keys, RFC 8949
+   §5.6 → `error.DuplicateKey`), `.reject_indefinite`, and `.deterministic` (only the canonical
+   encoding of the value passes: shortest heads and floats, sorted keys, definite lengths →
+   `error.NotDeterministic`); `cbor.strict_options` turns all three on — what a COSE/CTAP2/dCBOR
+   verifier wants before it hashes or signs bytes.
+4. **CBOR Sequences** (RFC 8742): `cbor.Sequence.init(a, bytes, opts)`, `next()` item by item.
+5. **Diagnostic notation** (RFC 8949 §8): `cbor.diagnostic(a, value)` / `cbor.writeDiagnostic(w,
+   value)` — `[1, {"a": h'0102'}, 1(1363896240)]`, exactly as RFC 8949 Appendix A prints.
+6. **Streaming** (`cbor.stream`): `cbor.Reader` pulls tokens out of a slice with no allocation
+   (strings borrowed from the input; a token cut short is `error.Truncated` with nothing consumed,
+   so data arriving in pieces can be retried), `skipValue`/`rawValue` walk one whole item with
+   `decode`'s exact verdicts; `cbor.Writer` pushes heads and items onto any `*std.Io.Writer` — a
+   caller buffer via `std.Io.Writer.fixed`, a file, a socket.
+7. **Typed mapping** (`cbor.typed`): `typed.decode(T, gpa, bytes, .{})` → `Parsed(T)` and
+   `typed.encode(gpa, x, .{})` for bools, integers, floats, strings, byte arrays, slices, arrays,
+   tuples, structs (keys by field name or `pub const cbor_options = .{ .keys = .{ .alg = 3 } }`,
+   integer keys negative too), optionals, enums, tagged unions, pointers, and raw `Value`s.
+   Missing / duplicate / unknown fields, range, length and type mismatches are typed errors; what
+   the mapping allocates is capped (`max_alloc_bytes`, default 64 MiB).
+8. **COSE (`cose.zig`).** `cose.parseKey`/`cose.encodeEc2Key`/`cose.encodeOkpKey` for `COSE_Key`
    (EC2/OKP public keys — the shape `ctap2pin`'s inline `PublicKey{x,y}` generalizes — plus AKP,
    RFC 9964's post-quantum key type, whose ML-DSA parameter set comes from the REQUIRED `alg` and
    is never inferred from the key length), and
@@ -54,8 +73,13 @@ off the wire) by design:
   check, never an allocation attempt.
 - **Fail-closed typed errors, never a panic/OOB.** Every malformed/truncated/trailing-garbage input
   maps to a `DecodeError` variant (`Truncated`, `Malformed`, `DepthLimitExceeded`,
-  `TrailingGarbage`, `OutOfMemory`) — see `kat_test.zig`'s hostile-input tests and the
-  arbitrary-bytes fuzz test.
+  `TrailingGarbage`, `DuplicateKey`, `NotDeterministic`, `OutOfMemory`) — see `kat_test.zig`'s
+  hostile-input tests and the fuzz harnesses.
+- **Deterministic fuzz driver** (`fuzz_test.zig`, `CBOR_FUZZ=<runs>[,<seed>]`): random trees,
+  encoded and damaged at heads, arguments and copied token ranges, through every parser — the
+  reader must reach `decode`'s verdict, `deterministic` must accept exactly the canonical
+  encodings, `reject_duplicate_keys` must agree with an independent data-model equality, no leak.
+  300 seeds run in every ordinary test run.
 
 ## API
 
@@ -66,7 +90,8 @@ const cbor = @import("cbor");
 const Value = cbor.Value; // tagged union: uint/negint/bytes/text/array/map/tag/simple/bool/
                            // null_value/undefined_value/f16/f32/f64
 const MapEntry = cbor.MapEntry; // { key: Value, value: Value }
-const DecodeError = cbor.DecodeError; // error{ Truncated, Malformed, DepthLimitExceeded, TrailingGarbage, OutOfMemory }
+const DecodeError = cbor.DecodeError; // error{ Truncated, Malformed, DepthLimitExceeded, TrailingGarbage,
+                                      //        DuplicateKey, NotDeterministic, OutOfMemory }
 const EncodeError = cbor.EncodeError; // Allocator.Error
 
 fn decode(a: Allocator, bytes: []const u8, opts: cbor.DecodeOptions) DecodeError!Value;
@@ -77,6 +102,27 @@ fn freeValue(a: Allocator, value: Value) void; // release a decoded tree without
 
 // value.toI64() -> ?i64   (uint/negint as a signed int, if it fits)
 // Value.fromI64(i: i64) -> Value
+// DecodeOptions{ .max_depth = 64, .reject_duplicate_keys, .reject_indefinite, .deterministic }
+// cbor.strict_options    (all three)
+// EncodeOptions{ .canonical, .shortest_floats }
+
+// ── sequences, diagnostic notation ──
+var seq = cbor.Sequence.init(a, bytes, opts); // while (try seq.next()) |v| { ...; cbor.freeValue(a, v); }
+fn diagnostic(a: Allocator, value: Value) Allocator.Error![]u8;
+fn writeDiagnostic(w: *std.Io.Writer, value: Value) std.Io.Writer.Error!void;
+
+// ── streaming (no allocation) ──
+var r = cbor.Reader.init(bytes); // r.next() -> ?Token, r.peek(), r.skipValue(max_depth), r.rawValue(max_depth)
+const cw = cbor.Writer.init(w);  // uint int negint bytes text beginArray(?n) beginMap(?n) beginBytes
+                                 // beginText end tag boolean null_ undefined_ simple float float16/32/64 value
+fn shortestFloat(x: f64) cbor.FloatWidth; fn head(major: u3, arg: u64) cbor.Head;
+
+// ── typed ──
+fn typed.decode(comptime T: type, gpa: Allocator, bytes: []const u8, o: typed.Options) typed.Error!typed.Parsed(T);
+fn typed.decodeLeaky(comptime T: type, arena: Allocator, bytes: []const u8, o: typed.Options) typed.Error!T;
+fn typed.fromValue(comptime T: type, arena: Allocator, v: Value, o: typed.Options) typed.Error!T;
+fn typed.toValue(arena: Allocator, x: anytype) Allocator.Error!Value;
+fn typed.encode(gpa: Allocator, x: anytype, o: cbor.EncodeOptions) Allocator.Error![]u8;
 
 // ── COSE ──
 const cose = cbor.cose;
@@ -101,7 +147,12 @@ returned slices borrow the `Value` tree you already decoded.
 zig build test-cbor
 zig build test-cbor -Doptimize=ReleaseFast
 zig fmt --check modules/cbor
+CBOR_FUZZ=150000,0 <test binary built with --test-filter "fuzz driver">   # fuzz verdict
 ```
+
+Vector recipes: `tools/gen_diag_vectors.py` (RFC 8949 Appendix A from the RFC text) and
+`tools/gen_cbor2_vectors.py` (Python cbor2 6.1.5 as a black-box oracle: float widths, whole
+trees, duplicate-key and indefinite-length verdicts).
 
 ## Deferred (backlog, not implemented here)
 
@@ -109,16 +160,18 @@ zig fmt --check modules/cbor
   byte-string/text-string/array/map produces the same shape as the definite form; `encode` always
   emits definite-length. A caller that specifically needs to reproduce an indefinite-length
   encoding byte-for-byte (rather than just its decoded value) isn't served by this module.
-- **Float width is never re-minimized on encode.** `Value.f64`/`.f32`/`.f16` always re-encodes at
-  that exact width; RFC 8949's "preferred serialization" additionally allows shrinking a float to
-  the shortest width that round-trips exactly (e.g. `1.0` could be `f16` instead of `f64`) — not
-  implemented. `canonical = true` therefore does not fully reach RFC 8949 §4.2.1's floating-point
-  requirement, only its map-key-ordering requirement.
+- **NaN payloads under `canonical`/`shortest_floats`.** Every NaN is written as `f97e00`; a
+  payload is not kept (RFC 8949 §4.2.2 leaves NaN to the protocol; dCBOR and cbor2 do the same).
+- **Bignum-aware preferred serialization.** RFC 8949 §3.4.3 asks a bignum that fits 64 bits to
+  be encoded as a plain integer; `canonical` leaves tags 2/3 as given.
+- **Typed mapping limits.** No integers wider than 64 bits, no sentinel-terminated slices, no
+  untagged unions; tags are not mapped to Zig types (use a `Value` field).
 - **No bignum (RFC 8949 §3.4.3, tags 2/3) arithmetic.** A bignum tag decodes structurally (tag
   number + the byte-string payload, like any other tag) but this module does no big-integer math
   on it — consumers that need the numeric value convert the byte string themselves.
 - **COSE scope:** only `COSE_Key` (EC2/OKP/AKP; RSA and symmetric key types return
   `error.UnsupportedKty`) and `COSE_Sign1`. No `COSE_Mac0`, `COSE_Encrypt0`, or full `COSE_Sign`
-  (multi-signer). Private-key material (COSE label `-4` `d` for EC2/OKP, `-2` `priv` for AKP) is
+  (multi-signer) — libcbor, the reference, has no COSE at all, and no consumer in the collection
+  needs them yet. Private-key material (COSE label `-4` `d` for EC2/OKP, `-2` `priv` for AKP) is
   never parsed or emitted — this is a verifier/public-key-consumer layer, not a key-storage
   format.

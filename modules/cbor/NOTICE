@@ -26,6 +26,14 @@ WHAT WAS TAKEN
   - `src/cose_kat_vectors.zig` — `COSE_Sign1` examples from RFC 9052
     Appendix C, including the C.2.1 "Single ECDSA Signature" worked example,
     transcribed byte-for-byte from the RFC text.
+  - `src/diag_vectors.zig` (added 2026-10-04) — the same RFC 8949 Appendix A
+    table, this time its diagnostic-notation column next to the hex, generated
+    from the RFC text by `tools/gen_diag_vectors.py`. Same grant as above.
+
+  Not third-party material: `src/cbor2_vectors.zig` (2026-10-04) holds bytes
+  that Python cbor2 6.1.5 (MIT) PRODUCED when driven through its public
+  `dumps`/`loads` — oracle output for inputs this module's recipe chose, no
+  cbor2 code or test data copied, no cbor2 source read.
 
 ⭐ A SECOND SOURCE WAS CONSULTED AND NOTHING WAS TAKEN FROM IT. The Appendix A
 transcription was cross-checked against the community repository

@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core** (reference: libcbor 0.14; feature yardstick fxamacker/cbor 2.9).
+  - **Strict decoding:** `DecodeOptions.reject_duplicate_keys` (RFC 8949 §5.6 data-model
+    equality: `1` and `1801`, binary16 and binary64 `1.0`, a chunked and a definite string are the
+    same key), `reject_indefinite`, `deterministic` (RFC 8949 §4.2.1 — an input passes iff it is the
+    canonical encoding of its own value), and `strict_options` (all three). New
+    `DecodeError.DuplicateKey` and `DecodeError.NotDeterministic` (⚠ an error set that grew: an
+    exhaustive `switch` over `DecodeError` needs the two new arms).
+  - **Behaviour change:** `EncodeOptions.canonical = true` now also writes every float in the
+    shortest width that keeps its value and every NaN as `f97e00` — full Core Deterministic
+    Encoding. Output without floats is unchanged. `shortest_floats` gives the float rule alone.
+  - **New:** `Sequence` (RFC 8742 CBOR Sequences); `diag` / `diagnostic` / `writeDiagnostic`
+    (RFC 8949 §8 diagnostic notation, Appendix A's layout); `stream.Reader` (zero-allocation token
+    reader, incremental at token granularity, `skipValue`/`rawValue` with `decode`'s verdicts) and
+    `stream.Writer` (push encoder onto any `std.Io.Writer`); `typed` (comptime struct/enum/union/
+    slice/optional mapping with `cbor_options.keys`/`.bytes`, `Parsed(T)`, allocation cap
+    `max_alloc_bytes`); `head`, `floatBytes`, `shortestFloat`, `FloatWidth`.
+  - **Evidence:** all 81 rows of the RFC 8949 Appendix A table as diagnostic notation
+    (`diag_vectors.zig`, from the RFC text by `tools/gen_diag_vectors.py`); Python cbor2 6.1.5 as a
+    black-box oracle for float widths, 80 whole trees and 22 duplicate-key/indefinite verdicts
+    (`cbor2_vectors.zig`, `tools/gen_cbor2_vectors.py`); a deterministic fuzz driver
+    (`fuzz_test.zig`, `CBOR_FUZZ`) — 900 000 runs clean; mutation 51 mutants, 47 killed, 4 argued
+    equivalent (SPEC).
+
 - **2026-09-30** — **New `decodePrefix(allocator, bytes, options) !Prefix`**: decode the one item at
   the start of `bytes` and report how many bytes it took (`Prefix{ value, len }`), leaving the rest to
   the caller — for data that puts a CBOR item with no length of its own in front of more data

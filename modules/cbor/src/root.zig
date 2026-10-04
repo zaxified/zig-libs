@@ -21,13 +21,20 @@
 //!
 //! **Encode ← `Value`.** `encode()` always emits definite-length,
 //! shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization").
-//! `EncodeOptions.canonical = true` additionally sorts every map's entries
-//! by the bytewise order of their *encoded* keys (RFC 8949 §4.2.1 core
-//! deterministic encoding's map-key rule). That is core-deterministic output
-//! only for values without floats: float width is never re-minimized, while
-//! §4.2.1 asks for the shortest float that keeps the value. A
-//! `Value.f64` always re-encodes as an 8-byte float, matching whatever width
-//! `decode()` (or the caller) chose — see README for why.
+//! `EncodeOptions.canonical = true` is RFC 8949 §4.2.1 Core Deterministic
+//! Encoding: map entries sorted by the bytewise order of their *encoded*
+//! keys, and every float in the shortest width that keeps its value (NaN as
+//! `f97e00`). `shortest_floats = true` asks for the float rule alone. Without
+//! either, a float keeps the width its `Value` variant names.
+//!
+//! **Strict decoding** (`DecodeOptions.reject_duplicate_keys`,
+//! `reject_indefinite`, `deterministic`, or all three as `strict_options`)
+//! accepts only what a COSE/CTAP2/dCBOR verifier should hash or sign; under
+//! `deterministic` an input passes iff it is the canonical encoding of its
+//! own value. **Also here:** CBOR Sequences (RFC 8742, `Sequence`), RFC 8949
+//! §8 diagnostic notation (`diag`), a zero-allocation token `Reader` and a
+//! push `Writer` onto any `std.Io.Writer` (`stream`), and comptime mapping
+//! of Zig types (`typed`).
 //!
 //! **Untrusted-input hardening** (this parses hostile bytes, e.g. an
 //! attacker-controlled WebAuthn attestation object): a nesting-depth cap
@@ -56,7 +63,7 @@ const Allocator = std.mem.Allocator;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "CBOR (RFC 8949) codec — all 8 major types, canonical encoding option, untrusted-input hardened; plus a minimal COSE (RFC 9052) layer.",
+    .doc = "CBOR (RFC 8949) codec — all 8 major types, deterministic encoding and strict decoding, sequences, diagnostic notation, streaming reader/writer, typed struct mapping; untrusted-input hardened; plus a minimal COSE (RFC 9052) layer.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -92,6 +99,17 @@ pub const DecodeError = error{
     /// `decode()` consumed a complete, valid CBOR item but bytes remained
     /// after it.
     TrailingGarbage,
+    /// A map holds two keys that are equal in the CBOR data model, and
+    /// `DecodeOptions.reject_duplicate_keys` (or `deterministic`) is set.
+    /// RFC 8949 §5.6: such a map is not valid CBOR for most protocols.
+    DuplicateKey,
+    /// Well-formed CBOR in a form the strictness options forbid:
+    /// an indefinite length under `reject_indefinite`/`deterministic`, or,
+    /// under `deterministic`, anything RFC 8949 §4.2.1 Core Deterministic
+    /// Encoding rules out (a longer-than-needed argument, a float that would
+    /// fit a shorter width, a NaN other than `0xf97e00`, map keys out of
+    /// bytewise order).
+    NotDeterministic,
     OutOfMemory,
 };
 
@@ -194,7 +212,31 @@ pub const DecodeOptions = struct {
     /// input an attacker chooses. Raise it only against a stack you have
     /// measured, and never past low thousands.
     max_depth: u32 = 64,
+    /// Fail `error.DuplicateKey` when a map holds two keys that are equal in
+    /// the CBOR data model (RFC 8949 §5.6) — `1` and `0x1801`, `1.0` as
+    /// binary16 and as binary64, a byte string sent definite and chunked.
+    /// Keys are compared through their deterministic encoding, so the check
+    /// costs one re-encode of each key and a sort per map: O(n log n). All
+    /// NaNs count as one key (the canonical encoder writes every NaN as
+    /// `0xf97e00`). Off by default: RFC 8949 leaves duplicates to the
+    /// protocol, and `Value.map` keeps every entry.
+    reject_duplicate_keys: bool = false,
+    /// Fail `error.NotDeterministic` on any indefinite-length string, array
+    /// or map (CTAP2, COSE and dCBOR all require definite lengths).
+    reject_indefinite: bool = false,
+    /// Accept only RFC 8949 §4.2.1 Core Deterministic Encoding: shortest
+    /// arguments, the shortest float width that keeps the value (NaN only
+    /// as `0xf97e00`), definite lengths, and map keys strictly ascending in
+    /// the bytewise order of their encodings — equal keys are
+    /// `error.DuplicateKey`, out-of-order ones `error.NotDeterministic`.
+    /// Exactly the bytes `encode(.., .{ .canonical = true })` produces: an
+    /// input passes iff it is the canonical encoding of its own value.
+    deterministic: bool = false,
 };
+
+/// Every strictness check on: what a COSE/CTAP2/dCBOR verifier wants before it
+/// hashes or signs the bytes it was given.
+pub const strict_options: DecodeOptions = .{ .reject_duplicate_keys = true, .reject_indefinite = true, .deterministic = true };
 
 /// Recursively releases everything a decoded `Value` owns (`bytes`/`text`
 /// slices, `array`/`map` backing storage and every element inside, `tag`'s
@@ -244,7 +286,7 @@ pub fn freeValue(allocator: Allocator, v: Value) void {
 /// error return there is nothing to release: the partial tree is unwound
 /// before the error leaves this function.
 pub fn decode(allocator: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Value {
-    var d: Decoder = .{ .bytes = bytes, .pos = 0, .allocator = allocator, .max_depth = options.max_depth };
+    var d: Decoder = .init(allocator, bytes, options);
     const v = try d.decodeValue(0);
     if (d.pos != bytes.len) {
         // A fully-decoded tree that turns out to have trailing garbage is
@@ -270,10 +312,35 @@ pub const Prefix = struct {
 /// allocation and cleanup contract as `decode`; `decode` is this plus the
 /// no-trailing-bytes check.
 pub fn decodePrefix(allocator: Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Prefix {
-    var d: Decoder = .{ .bytes = bytes, .pos = 0, .allocator = allocator, .max_depth = options.max_depth };
+    var d: Decoder = .init(allocator, bytes, options);
     const v = try d.decodeValue(0);
     return .{ .value = v, .len = d.pos };
 }
+
+/// A CBOR Sequence (RFC 8742): zero or more CBOR items back to back, no
+/// framing. `next()` decodes one item at a time with `decodePrefix`, so the
+/// limits and the ownership contract are `decode`'s, per item (each returned
+/// `Value` is the caller's to free). At the end of the input it returns
+/// `null`. On an error it does not move: `pos` still points at the item that
+/// failed, and the bytes before it were complete items. An empty input is
+/// the empty sequence (RFC 8742 §2).
+pub const Sequence = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    allocator: Allocator,
+    options: DecodeOptions = .{},
+
+    pub fn init(allocator: Allocator, bytes: []const u8, options: DecodeOptions) Sequence {
+        return .{ .bytes = bytes, .allocator = allocator, .options = options };
+    }
+
+    pub fn next(self: *Sequence) DecodeError!?Value {
+        if (self.pos == self.bytes.len) return null;
+        const p = try decodePrefix(self.allocator, self.bytes[self.pos..], self.options);
+        self.pos += p.len;
+        return p.value;
+    }
+};
 
 const Arg = union(enum) { value: u64, indefinite };
 
@@ -282,6 +349,21 @@ const Decoder = struct {
     pos: usize,
     allocator: Allocator,
     max_depth: u32,
+    deterministic: bool,
+    reject_indefinite: bool,
+    reject_duplicate_keys: bool,
+
+    fn init(allocator: Allocator, bytes: []const u8, options: DecodeOptions) Decoder {
+        return .{
+            .bytes = bytes,
+            .pos = 0,
+            .allocator = allocator,
+            .max_depth = options.max_depth,
+            .deterministic = options.deterministic,
+            .reject_indefinite = options.reject_indefinite or options.deterministic,
+            .reject_duplicate_keys = options.reject_duplicate_keys,
+        };
+    }
 
     fn readByte(self: *Decoder) DecodeError!u8 {
         if (self.pos >= self.bytes.len) return error.Truncated;
@@ -319,14 +401,33 @@ const Decoder = struct {
     /// Read the additional-info argument, allowing the major types (2/3/4/5)
     /// that permit indefinite length to report it.
     fn readArgFull(self: *Decoder, info: u5) DecodeError!Arg {
-        return switch (info) {
+        const arg: Arg = switch (info) {
             0...23 => .{ .value = info },
             24 => .{ .value = try self.readUintN(1) },
             25 => .{ .value = try self.readUintN(2) },
             26 => .{ .value = try self.readUintN(4) },
             27 => .{ .value = try self.readUintN(8) },
-            28, 29, 30 => error.Malformed,
+            28, 29, 30 => return error.Malformed,
             31 => .indefinite,
+        };
+        switch (arg) {
+            .indefinite => if (self.reject_indefinite) return error.NotDeterministic,
+            // RFC 8949 §4.2.1: "0 to 23 and -1 to -24 MUST be expressed in
+            // the same byte as the major type; 24 to 255 ... with an
+            // additional uint8_t" and so on — the argument takes the
+            // shortest of the five forms that holds it.
+            .value => |v| if (self.deterministic and info >= 24 and v <= minForInfo(info)) return error.NotDeterministic,
+        }
+        return arg;
+    }
+
+    /// The largest argument the next-shorter form could have carried.
+    fn minForInfo(info: u5) u64 {
+        return switch (info) {
+            24 => 23,
+            25 => 0xff,
+            26 => 0xffff,
+            else => 0xffff_ffff,
         };
     }
 
@@ -340,9 +441,9 @@ const Decoder = struct {
 
     fn decodeValue(self: *Decoder, depth: u32) DecodeError!Value {
         if (depth > self.max_depth) return error.DepthLimitExceeded;
-        const head = try self.readByte();
-        const major: u3 = @intCast(head >> 5);
-        const info: u5 = @intCast(head & 0x1f);
+        const ib = try self.readByte();
+        const major: u3 = @intCast(ib >> 5);
+        const info: u5 = @intCast(ib & 0x1f);
         return switch (major) {
             0 => .{ .uint = try self.readArg(info) },
             1 => .{ .negint = try self.readArg(info) },
@@ -472,12 +573,27 @@ const Decoder = struct {
             }
             list.deinit(self.allocator);
         }
+        // Under `deterministic` every key must be strictly greater, bytewise,
+        // than the one before it — on the WIRE bytes, which are the
+        // deterministic encoding once every head has passed the shortest-form
+        // check. Comparing neighbours needs no allocation.
+        var prev_key: ?[]const u8 = null;
         switch (try self.readArgFull(info)) {
             .value => |n| {
                 var i: u64 = 0;
                 while (i < n) : (i += 1) {
+                    const key_start = self.pos;
                     const k = try self.decodeValue(depth + 1);
                     errdefer freeValue(self.allocator, k);
+                    if (self.deterministic) {
+                        const key_bytes = self.bytes[key_start..self.pos];
+                        if (prev_key) |p| switch (std.mem.order(u8, p, key_bytes)) {
+                            .lt => {},
+                            .eq => return error.DuplicateKey,
+                            .gt => return error.NotDeterministic,
+                        };
+                        prev_key = key_bytes;
+                    }
                     const v = try self.decodeValue(depth + 1);
                     errdefer freeValue(self.allocator, v);
                     try list.append(self.allocator, .{ .key = k, .value = v });
@@ -494,7 +610,43 @@ const Decoder = struct {
                 _ = try self.readByte();
             },
         }
+        if (self.reject_duplicate_keys and list.items.len > 1) try self.checkDuplicateKeys(list.items);
         return try list.toOwnedSlice(self.allocator);
+    }
+
+    /// Data-model key equality (RFC 8949 §5.6) through the deterministic
+    /// encoding: two keys are equal iff their canonical encodings are equal
+    /// bytes. Sort the encodings, compare neighbours: O(n log n), and the
+    /// scratch is freed whatever happens.
+    fn checkDuplicateKeys(self: *Decoder, entries: []const MapEntry) DecodeError!void {
+        const a = self.allocator;
+        const keys = try a.alloc([]u8, entries.len);
+        defer a.free(keys);
+        var built: usize = 0;
+        defer for (keys[0..built]) |k| a.free(k);
+        for (entries, 0..) |e, i| {
+            keys[i] = try encode(a, e.key, .{ .canonical = true });
+            built = i + 1;
+        }
+        std.mem.sort([]u8, keys, {}, struct {
+            fn lessThan(_: void, x: []u8, y: []u8) bool {
+                return std.mem.order(u8, x, y) == .lt;
+            }
+        }.lessThan);
+        for (keys[1..], keys[0 .. keys.len - 1]) |k, prev| {
+            if (std.mem.eql(u8, k, prev)) return error.DuplicateKey;
+        }
+    }
+
+    /// Under `deterministic`: a float must be in the width `shortestFloat`
+    /// picks for it, and a NaN must be the one canonical NaN.
+    fn checkFloat(self: *Decoder, x: f64, width: FloatWidth, f16_bits: u16) DecodeError!void {
+        if (!self.deterministic) return;
+        if (std.math.isNan(x)) {
+            if (width != .f16 or f16_bits != canonical_nan_f16) return error.NotDeterministic;
+            return;
+        }
+        if (shortestFloat(x) != width) return error.NotDeterministic;
     }
 
     fn decodeSimpleOrFloat(self: *Decoder, info: u5) DecodeError!Value {
@@ -513,9 +665,22 @@ const Decoder = struct {
                 if (b < 32) return error.Malformed;
                 break :blk .{ .simple = @intCast(b) };
             },
-            25 => .{ .f16 = @bitCast(@as(u16, @intCast(try self.readUintN(2)))) },
-            26 => .{ .f32 = @bitCast(@as(u32, @intCast(try self.readUintN(4)))) },
-            27 => .{ .f64 = @bitCast(try self.readUintN(8)) },
+            25 => blk: {
+                const bits: u16 = @intCast(try self.readUintN(2));
+                const f: f16 = @bitCast(bits);
+                try self.checkFloat(f, .f16, bits);
+                break :blk .{ .f16 = f };
+            },
+            26 => blk: {
+                const f: f32 = @bitCast(@as(u32, @intCast(try self.readUintN(4))));
+                try self.checkFloat(f, .f32, 0);
+                break :blk .{ .f32 = f };
+            },
+            27 => blk: {
+                const f: f64 = @bitCast(try self.readUintN(8));
+                try self.checkFloat(f, .f64, 0);
+                break :blk .{ .f64 = f };
+            },
             28, 29, 30 => error.Malformed,
             31 => error.Malformed, // "break" outside an indefinite-length context
         };
@@ -531,8 +696,22 @@ pub const EncodeOptions = struct {
     /// (typically wire/insertion order, e.g. after a decode round-trip).
     /// Length/integer encoding is always shortest-form and arrays/maps are
     /// always definite-length regardless of this flag (RFC 8949 §4.1
-    /// "preferred serialization") — `canonical` only changes map-key order.
+    /// "preferred serialization").
+    ///
+    /// Since 2026-10-04 `canonical` is the whole of RFC 8949 §4.2.1 Core
+    /// Deterministic Encoding: it also implies `shortest_floats`, so a
+    /// float is written in the shortest width that keeps its value and every
+    /// NaN as `0xf97e00`. `decode` with `.deterministic = true` accepts
+    /// exactly this output.
     canonical: bool = false,
+    /// RFC 8949 §4.1 preferred serialization for floats: write each float in
+    /// the shortest of binary16/32/64 that represents it exactly (`1.5` →
+    /// `f9 3e00`, `100000.0` → `fa 47c35000`, `1.1` stays `fb ...`), `-0.0`
+    /// and the infinities included, and every NaN as `0xf97e00` (the NaN
+    /// payload is dropped — RFC 8949 §4.2.2 leaves NaN to the protocol;
+    /// this is the choice dCBOR and Python cbor2's canonical mode make).
+    /// Off by default: a decoded `Value.f64` then re-encodes as 8 bytes.
+    shortest_floats: bool = false,
 };
 
 /// Encode `value` to freshly `allocator`-owned bytes.
@@ -558,24 +737,96 @@ fn appendBE(list: *std.ArrayList(u8), a: Allocator, v: anytype) EncodeError!void
     try list.appendSlice(a, &buf);
 }
 
+/// A head (initial byte + argument) in its shortest form, ready to copy.
+pub const Head = struct {
+    buf: [9]u8,
+    len: u8,
+
+    pub fn slice(self: *const Head) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// The shortest-form head for `major` with argument `arg` (RFC 8949 §4.1).
+pub fn head(major: u3, arg: u64) Head {
+    const mt: u8 = @as(u8, major) << 5;
+    var h: Head = .{ .buf = undefined, .len = 0 };
+    if (arg < 24) {
+        h.buf[0] = mt | @as(u8, @intCast(arg));
+        h.len = 1;
+    } else if (arg <= 0xff) {
+        h.buf[0] = mt | 24;
+        h.buf[1] = @intCast(arg);
+        h.len = 2;
+    } else if (arg <= 0xffff) {
+        h.buf[0] = mt | 25;
+        std.mem.writeInt(u16, h.buf[1..3], @intCast(arg), .big);
+        h.len = 3;
+    } else if (arg <= 0xffff_ffff) {
+        h.buf[0] = mt | 26;
+        std.mem.writeInt(u32, h.buf[1..5], @intCast(arg), .big);
+        h.len = 5;
+    } else {
+        h.buf[0] = mt | 27;
+        std.mem.writeInt(u64, h.buf[1..9], arg, .big);
+        h.len = 9;
+    }
+    return h;
+}
+
 /// Write a major-type head with shortest-form argument encoding.
 fn writeHead(list: *std.ArrayList(u8), a: Allocator, major: u3, arg: u64) EncodeError!void {
-    const mt: u8 = @as(u8, major) << 5;
-    if (arg < 24) {
-        try list.append(a, mt | @as(u8, @intCast(arg)));
-    } else if (arg <= 0xff) {
-        try list.append(a, mt | 24);
-        try list.append(a, @intCast(arg));
-    } else if (arg <= 0xffff) {
-        try list.append(a, mt | 25);
-        try appendBE(list, a, @as(u16, @intCast(arg)));
-    } else if (arg <= 0xffff_ffff) {
-        try list.append(a, mt | 26);
-        try appendBE(list, a, @as(u32, @intCast(arg)));
-    } else {
-        try list.append(a, mt | 27);
-        try appendBE(list, a, arg);
+    const h = head(major, arg);
+    try list.appendSlice(a, h.slice());
+}
+
+// ── float width (preferred serialization) ──────────────────────────────────
+
+pub const FloatWidth = enum { f16, f32, f64 };
+
+/// The one NaN the canonical encoder writes: binary16 quiet NaN, `f9 7e00`.
+pub const canonical_nan_f16: u16 = 0x7e00;
+
+/// The shortest IEEE 754 width that holds `x` exactly (RFC 8949 §4.1:
+/// "the shortest floating-point encoding that preserves its value"). Exact
+/// means the bits survive the round trip — `-0.0` stays `-0.0`, a binary16
+/// subnormal counts, a value that rounds is not shrunk. NaN is not asked
+/// about here (callers write the canonical NaN).
+pub fn shortestFloat(x: f64) FloatWidth {
+    const as16: f16 = @floatCast(x);
+    if (@as(u64, @bitCast(@as(f64, as16))) == @as(u64, @bitCast(x))) return .f16;
+    const as32: f32 = @floatCast(x);
+    if (@as(u64, @bitCast(@as(f64, as32))) == @as(u64, @bitCast(x))) return .f32;
+    return .f64;
+}
+
+/// The preferred-serialization bytes of the float `x` (head included).
+pub fn floatBytes(x: f64) Head {
+    var h: Head = .{ .buf = undefined, .len = 0 };
+    if (std.math.isNan(x)) {
+        h.buf[0] = 0xf9;
+        std.mem.writeInt(u16, h.buf[1..3], canonical_nan_f16, .big);
+        h.len = 3;
+        return h;
     }
+    switch (shortestFloat(x)) {
+        .f16 => {
+            h.buf[0] = 0xf9;
+            std.mem.writeInt(u16, h.buf[1..3], @bitCast(@as(f16, @floatCast(x))), .big);
+            h.len = 3;
+        },
+        .f32 => {
+            h.buf[0] = 0xfa;
+            std.mem.writeInt(u32, h.buf[1..5], @bitCast(@as(f32, @floatCast(x))), .big);
+            h.len = 5;
+        },
+        .f64 => {
+            h.buf[0] = 0xfb;
+            std.mem.writeInt(u64, h.buf[1..9], @bitCast(x), .big);
+            h.len = 9;
+        },
+    }
+    return h;
 }
 
 fn encodeInto(list: *std.ArrayList(u8), a: Allocator, value: Value, options: EncodeOptions) EncodeError!void {
@@ -610,19 +861,23 @@ fn encodeInto(list: *std.ArrayList(u8), a: Allocator, value: Value, options: Enc
         .bool => |b| try list.append(a, if (b) 0xf5 else 0xf4),
         .null_value => try list.append(a, 0xf6),
         .undefined_value => try list.append(a, 0xf7),
-        .f16 => |f| {
+        .f16 => |f| if (shrinks(options)) try list.appendSlice(a, floatBytes(f).slice()) else {
             try list.append(a, 0xf9);
             try appendBE(list, a, @as(u16, @bitCast(f)));
         },
-        .f32 => |f| {
+        .f32 => |f| if (shrinks(options)) try list.appendSlice(a, floatBytes(f).slice()) else {
             try list.append(a, 0xfa);
             try appendBE(list, a, @as(u32, @bitCast(f)));
         },
-        .f64 => |f| {
+        .f64 => |f| if (shrinks(options)) try list.appendSlice(a, floatBytes(f).slice()) else {
             try list.append(a, 0xfb);
             try appendBE(list, a, @as(u64, @bitCast(f)));
         },
     }
+}
+
+fn shrinks(options: EncodeOptions) bool {
+    return options.canonical or options.shortest_floats;
 }
 
 fn encodeMap(list: *std.ArrayList(u8), a: Allocator, entries: []const MapEntry, options: EncodeOptions) EncodeError!void {
@@ -672,10 +927,32 @@ fn encodeMap(list: *std.ArrayList(u8), a: Allocator, entries: []const MapEntry, 
 
 pub const cose = @import("cose.zig");
 
+// ── streaming, diagnostic notation, typed mapping ──────────────────────────
+
+/// Zero-allocation pull reader (tokens borrowed from the input) and a push
+/// writer onto any `std.Io.Writer` (a caller buffer via `.fixed`).
+pub const stream = @import("stream.zig");
+pub const Reader = stream.Reader;
+pub const Writer = stream.Writer;
+pub const Token = stream.Token;
+
+/// RFC 8949 §8 diagnostic notation.
+pub const diag = @import("diag.zig");
+pub const writeDiagnostic = diag.write;
+pub const diagnostic = diag.alloc;
+
+/// Comptime mapping between Zig types and CBOR.
+pub const typed = @import("typed.zig");
+
 // Dark-tests aggregator (CONVENTIONS.md §6.3): a bare re-export does not
 // pull a submodule's tests into the test binary — this reference does.
 test {
     _ = cose;
+    _ = stream;
+    _ = diag;
+    _ = typed;
+    _ = @import("core_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("kat_test.zig");
     _ = @import("cose_kat_test.zig");
 }
