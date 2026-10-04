@@ -82,7 +82,9 @@ fn DecoderOf(comptime Sink: type) type {
         br: *BitReader,
         out: *Sink,
 
-        wbits: u6 = 0,
+        /// 10..24 (no large window): a `u5`, which is also the shift type of
+        /// a 32-bit `usize`.
+        wbits: u5 = 0,
         max_backward: usize = 0,
         dist_rb: [4]i32 = .{ 16, 15, 11, 4 },
         dist_rb_idx: u32 = 0,
@@ -662,7 +664,7 @@ fn DecoderOf(comptime Sink: type) type {
     };
 }
 
-fn decodeWindowBits(br: *BitReader) BrotliError!u6 {
+fn decodeWindowBits(br: *BitReader) BrotliError!u5 {
     if ((try br.takeBits(1)) == 0) return 16;
     const n = try br.takeBits(3);
     if (n != 0) return @intCast(17 + n);
@@ -824,7 +826,7 @@ const RingSink = struct {
     /// The ring's limit: the window, or less when the output cap is smaller
     /// (then nothing ever wraps, and a distance past what was produced is
     /// refused before it is read). It starts small; see `makeRoom`.
-    fn setWindow(s: *RingSink, wbits: u6) Error!void {
+    fn setWindow(s: *RingSink, wbits: u5) Error!void {
         const window = @as(usize, 1) << wbits;
         const cap_pow2 = std.math.ceilPowerOfTwo(usize, @max(s.options.max_output, 1)) catch window;
         s.limit = @min(window, cap_pow2);

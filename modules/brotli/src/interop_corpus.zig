@@ -98,7 +98,10 @@ pub fn build(gpa: std.mem.Allocator, shape: Shape) ![]u8 {
                 const pick: usize = if (a.skewed and (r >> 40) % 10 != 0)
                     0
                 else
-                    @as(usize, @truncate(r >> 3)) % a.alpha;
+                    // The remainder in u64, never in `usize`: truncating
+                    // first kept 32 bits on a 32-bit target, a different
+                    // input than the reference judged (alpha 3 and 5).
+                    @intCast((r >> 3) % a.alpha);
                 b.* = @intCast(pick * 37 + 1);
             }
             return buf;

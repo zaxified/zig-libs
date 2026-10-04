@@ -700,9 +700,9 @@ const Matcher = struct {
     fn init(gpa: std.mem.Allocator, data: []const u8, chain_depth: usize) std.mem.Allocator.Error!Matcher {
         // Both tables are sized to the input: compressing a few hundred bytes
         // must not cost a fixed half-megabyte of zeroed hash table.
-        var chain_log: u6 = 1;
+        var chain_log: u5 = 1;
         while (chain_log < chain_log_max and (@as(usize, 1) << chain_log) < data.len) chain_log += 1;
-        var hash_log: u6 = 8;
+        var hash_log: u5 = 8;
         while (hash_log < hash_log_max and (@as(usize, 1) << hash_log) < data.len) hash_log += 1;
 
         const size = @as(usize, 1) << chain_log;
@@ -716,7 +716,7 @@ const Matcher = struct {
             .head = head,
             .prev = prev,
             .mask = size - 1,
-            .hash_shift = @intCast(32 - hash_log),
+            .hash_shift = @intCast(32 - @as(u6, hash_log)),
             .data = data,
         };
     }
@@ -914,7 +914,7 @@ const nlog2n_table: [4096]f32 = blk: {
 };
 
 fn nlog2n(n: u64) f64 {
-    if (n < nlog2n_table.len) return nlog2n_table[n];
+    if (n < nlog2n_table.len) return nlog2n_table[@intCast(n)];
     const x: f64 = @floatFromInt(n);
     return x * @log2(x);
 }
@@ -1408,7 +1408,7 @@ pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOpt
     // Window bits: 16 unless the input can actually use a bigger one. Encoded
     // as a single 0 bit for 16, otherwise 1 + (wbits - 17) in three bits.
     const big_window = input.len > 65520;
-    const wbits: u6 = if (big_window) 21 else 16;
+    const wbits: u5 = if (big_window) 21 else 16;
     if (big_window) {
         try w.writeBits(1, 1);
         try w.writeBits(wbits - 17, 3);

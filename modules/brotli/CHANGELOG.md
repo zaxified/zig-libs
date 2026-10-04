@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Builds for 32-bit and Windows: `meta.targets` is now linux64, linux32 (mips32,
+  big-endian, soft-float) and windows. Window and table-size exponents are `u5` (a 32-bit `usize`
+  shifts by a `u5`; they never exceed 24), and the interop corpus generator took its remainder in
+  `usize`, so a 32-bit target generated different input than the reference judged. The whole
+  suite passes on big-endian mips32 under qemu-mips. No change on 64-bit.
+
 - **2026-10-04** — Fix (BEHAVIOURAL): a meta-block whose commands produced more than MLEN bytes
   (an insert, a copy or a dictionary word running past the declared length) was accepted and
   decoded to more bytes than MLEN. RFC 7932 section 9.2 requires exactly MLEN; the reference decoder

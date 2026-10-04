@@ -30,7 +30,7 @@ pub const meta = .{
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any",
-    .targets = .{.linux64},
+    .targets = .{ .linux64, .linux32, .windows },
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
