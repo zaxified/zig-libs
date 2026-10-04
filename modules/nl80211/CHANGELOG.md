@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog, items 1, 2 and 4). ADDED `config.zig`:
+  `Nl80211.survey` (`GET_SURVEY` → `Survey`: frequency, noise dBm, in-use, active/busy/ext-busy/
+  rx/tx/scan/bss-rx ms), `setTxPower` (auto/limit/fixed mBm), `setChannel` (full chandef —
+  `Channel` validates that the centre tiles the primary 20 MHz, HT20/HT40± get their legacy
+  channel type), `newInterface` (returns the kernel's `Interface`), `delInterface`,
+  `setInterfaceType`, `setPowerSave`/`powerSave`; `Target` (wiphy index or ifindex); new
+  `uapi` constants. 17 new request goldens from `iw` 6.17 (captured in `unshare -rn` against
+  `lo` / a non-existent wiphy, so nothing on the host changed) plus a captured
+  `GET_POWER_SAVE` reply from a real iwlwifi radio. Additive only — no API change for existing
+  callers. Mutation: 28 mutants, 23 killed at once, 4 killed by new tests, 1 equivalent.
+
 - **2026-09-07** — **all seven fuzz harnesses fetched their input and threw it away — and the
   collapse made them look perfect.** Each opened `smith.bytes(&raw)` and then sliced the buffer
   to `smith.valueRangeAtMost(u16, 0, raw.len)`; a `Smith` ranged draw reads eight input octets

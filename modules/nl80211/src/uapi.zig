@@ -30,9 +30,12 @@ pub const family_version: u8 = 0;
 
 pub const CMD = struct {
     pub const GET_WIPHY: u8 = 1;
+    pub const SET_WIPHY: u8 = 2;
     pub const NEW_WIPHY: u8 = 3;
     pub const GET_INTERFACE: u8 = 5;
+    pub const SET_INTERFACE: u8 = 6;
     pub const NEW_INTERFACE: u8 = 7;
+    pub const DEL_INTERFACE: u8 = 8;
     pub const GET_STATION: u8 = 17;
     pub const NEW_STATION: u8 = 19;
     pub const REQ_SET_REG: u8 = 27;
@@ -51,6 +54,8 @@ pub const CMD = struct {
     pub const DISCONNECT: u8 = 48;
     pub const GET_SURVEY: u8 = 50;
     pub const NEW_SURVEY_RESULTS: u8 = 51;
+    pub const SET_POWER_SAVE: u8 = 61;
+    pub const GET_POWER_SAVE: u8 = 62;
     pub const GET_PROTOCOL_FEATURES: u8 = 95;
     pub const WIPHY_REG_CHANGE: u8 = 113;
 };
@@ -70,6 +75,7 @@ pub const ATTR = struct {
     pub const REG_ALPHA2: u16 = 33;
     pub const REG_RULES: u16 = 34;
     pub const WIPHY_FREQ: u16 = 38;
+    pub const WIPHY_CHANNEL_TYPE: u16 = 39;
     pub const IE: u16 = 42;
     pub const MAX_NUM_SCAN_SSIDS: u16 = 43;
     pub const SCAN_FREQUENCIES: u16 = 44;
@@ -94,7 +100,10 @@ pub const ATTR = struct {
     pub const AKM_SUITES: u16 = 76;
     pub const PREV_BSSID: u16 = 79;
     pub const KEYS: u16 = 81;
+    pub const SURVEY_INFO: u16 = 84;
+    pub const PS_STATE: u16 = 93;
     pub const @"4ADDR": u16 = 83;
+    pub const WIPHY_TX_POWER_SETTING: u16 = 97;
     pub const WIPHY_TX_POWER_LEVEL: u16 = 98;
     pub const SOFTWARE_IFTYPES: u16 = 121;
     pub const MAX_NUM_SCHED_SCAN_SSIDS: u16 = 123;
@@ -110,10 +119,47 @@ pub const ATTR = struct {
     pub const SOCKET_OWNER: u16 = 204;
     pub const PMK: u16 = 254;
     pub const WANT_1X_4WAY_HS: u16 = 257;
+    pub const WIPHY_FREQ_OFFSET: u16 = 290;
     pub const SAE_PASSWORD: u16 = 277;
 };
 
 // ── nested attribute spaces ────────────────────────────────────────────────
+
+/// enum nl80211_survey_info — inside `ATTR.SURVEY_INFO`.
+pub const SURVEY_INFO = struct {
+    pub const FREQUENCY: u16 = 1;
+    pub const NOISE: u16 = 2;
+    pub const IN_USE: u16 = 3;
+    pub const TIME: u16 = 4;
+    pub const TIME_BUSY: u16 = 5;
+    pub const TIME_EXT_BUSY: u16 = 6;
+    pub const TIME_RX: u16 = 7;
+    pub const TIME_TX: u16 = 8;
+    pub const TIME_SCAN: u16 = 9;
+    pub const TIME_BSS_RX: u16 = 11;
+    pub const FREQUENCY_OFFSET: u16 = 12;
+};
+
+/// enum nl80211_tx_power_setting.
+pub const TX_POWER = struct {
+    pub const AUTOMATIC: u32 = 0;
+    pub const LIMITED: u32 = 1;
+    pub const FIXED: u32 = 2;
+};
+
+/// enum nl80211_channel_type — the pre-VHT channel description.
+pub const CHAN = struct {
+    pub const NO_HT: u32 = 0;
+    pub const HT20: u32 = 1;
+    pub const HT40MINUS: u32 = 2;
+    pub const HT40PLUS: u32 = 3;
+};
+
+/// enum nl80211_ps_state.
+pub const PS = struct {
+    pub const DISABLED: u32 = 0;
+    pub const ENABLED: u32 = 1;
+};
 
 /// enum nl80211_bss — inside `ATTR.BSS`.
 pub const BSS = struct {

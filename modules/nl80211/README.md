@@ -20,9 +20,10 @@ shell-outs, no `wpa_supplicant` linkage, no libc.
   `nl80211.genl`; `netlink` — its bounds-checked wire codec (nlmsghdr + nlattr
   TLV build/parse), re-exported as `nl80211.codec`.
 - **Privileges:** the dumps (`wiphys`, `interfaces`, `stations`,
-  `scanResults`, `regDomains`), family resolution and multicast subscription
-  need **none**. `triggerScan`, `connect`, `disconnect` and `requestRegDomain`
-  need **CAP_NET_ADMIN**.
+  `scanResults`, `regDomains`, `survey`, `powerSave`), family resolution and
+  multicast subscription need **none**. `triggerScan`, `connect`, `disconnect`,
+  `requestRegDomain`, `setTxPower`, `setChannel`, `newInterface`,
+  `delInterface`, `setInterfaceType` and `setPowerSave` need **CAP_NET_ADMIN**.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
 kernel UAPI (`linux/nl80211.h`, GPL-2.0 WITH Linux-syscall-note — the
@@ -42,9 +43,9 @@ ceiling**:
 
 | | |
 |---|---|
-| **Implemented** | `GET_WIPHY` (split dump, merged), `GET_INTERFACE`, `TRIGGER_SCAN` + `GET_SCAN` + the `scan` multicast event, `GET_STATION`, `CONNECT`/`DISCONNECT`, `GET_REG`/`REQ_SET_REG` |
+| **Implemented** | `GET_WIPHY` (split dump, merged), `GET_INTERFACE`, `TRIGGER_SCAN` + `GET_SCAN` + the `scan` multicast event, `GET_STATION`, `CONNECT`/`DISCONNECT`, `GET_REG`/`REQ_SET_REG`, `GET_SURVEY`, `SET_WIPHY` (channel/chandef, tx power), `NEW_INTERFACE`/`DEL_INTERFACE`/`SET_INTERFACE` (type), `SET_POWER_SAVE`/`GET_POWER_SAVE` |
 | **Escape hatch** | `Nl80211.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred** | AP mode, mesh, IBSS, P2P, monitor config, survey, TDLS, WoWLAN, scheduled scan, key management, vendor commands, MLO — see `SPEC.md` |
+| **Deferred** | AP mode, mesh, IBSS, P2P, monitor flags, TDLS, WoWLAN, scheduled scan, key management, vendor commands, MLO, HT/VHT/HE capability decoding — see `SPEC.md` |
 | **Out of scope, permanently** | the supplicant (4-way handshake, EAP, SAE) — see "Connecting" below |
 
 ## API
@@ -102,6 +103,19 @@ defer nl80211.reg.freeAll(gpa, doms);
 for (doms) |d| _ = .{ d.alpha2, d.dfs_region, d.ruleFor(5500) };
 try wifi.requestRegDomain("DE");            // a hint; needs CAP_NET_ADMIN
 
+// ── survey, radio and interface configuration, power save ────────────────
+const sv = try wifi.survey(ifindex);         // per-channel noise + airtime
+defer gpa.free(sv);
+for (sv) |c| _ = .{ c.frequency_mhz, c.noise_dbm, c.in_use, c.busy_ms, c.active_ms };
+const ps = try wifi.powerSave(ifindex);      // bool
+// The writes below need CAP_NET_ADMIN.
+try wifi.setTxPower(.{ .wiphy = 0 }, .{ .limit_mbm = 2000 });      // 20 dBm cap
+try wifi.setChannel(.{ .ifindex = mon }, .{ .freq_mhz = 5180, .width = .@"80", .center1_mhz = 5210 });
+const m = try wifi.newInterface(0, "mon0", .monitor);              // the new Interface
+try wifi.setInterfaceType(ifindex, .monitor);
+try wifi.setPowerSave(ifindex, false);
+try wifi.delInterface(m.ifindex.?);
+
 // ── anything not modelled above ──────────────────────────────────────────
 const replies = try wifi.raw(.{ .cmd = nl80211.uapi.CMD.GET_PROTOCOL_FEATURES });
 defer nl80211.Nl80211.freeRawReplies(gpa, replies);
@@ -109,7 +123,7 @@ defer nl80211.Nl80211.freeRawReplies(gpa, replies);
 
 Sub-namespaces, all `pub`: `uapi` (every constant and enum), `ie`
 (information-element parsing), `wiphy`, `iface`, `station`, `scan`, `connect`,
-`reg`, `client`, plus `genl` and `codec` for driving `raw`. Every request
+`reg`, `config`, `client`, plus `genl` and `codec` for driving `raw`. Every request
 builder is a pure `(allocator, family_id, seq, params) → []u8` function, so the
 wire format is testable without a socket.
 

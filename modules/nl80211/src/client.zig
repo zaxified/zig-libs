@@ -56,6 +56,7 @@ const wiphy_mod = @import("wiphy.zig");
 const scan_mod = @import("scan.zig");
 const connect_mod = @import("connect.zig");
 const reg_mod = @import("reg.zig");
+const config_mod = @import("config.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h).
 pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
@@ -431,6 +432,107 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
         try cl.awaitAck(seq);
+    }
+
+    // ── configuration, survey, power save ──────────────────────────────────
+
+    fn mapBuild(e: config_mod.BuildError) RequestError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidRequest => error.InvalidRequest,
+        };
+    }
+
+    /// Send a request and wait for its ACK.
+    fn command(cl: *Nl80211, seq: u32, req: []u8) RequestError!void {
+        defer cl.allocator().free(req);
+        try cl.send(req);
+        try cl.awaitAck(seq);
+    }
+
+    /// Channel survey of an interface's radio (`NL80211_CMD_GET_SURVEY`,
+    /// `iw dev <dev> survey dump`): noise and busy/rx/tx airtime per channel.
+    /// Unprivileged. A driver that keeps no survey answers with an empty
+    /// list. Caller frees the slice.
+    pub fn survey(cl: *Nl80211, ifindex: u32) RequestError![]config_mod.Survey {
+        const gpa = cl.allocator();
+        const seq = cl.sock.nextSeq();
+        const req = config_mod.buildGetSurvey(gpa, cl.family_id, seq, ifindex) catch |e| return mapBuild(e);
+        defer gpa.free(req);
+        try cl.send(req);
+        var out: std.ArrayList(config_mod.Survey) = .empty;
+        errdefer out.deinit(gpa);
+        var walk: Dump = .{ .cl = cl, .seq = seq };
+        while (try walk.next()) |m| {
+            if (m.cmd != uapi.CMD.NEW_SURVEY_RESULTS) continue;
+            if (config_mod.parseSurvey(m.attrs) catch return error.MalformedReply) |sv| try out.append(gpa, sv);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// `iw … set txpower`. Needs **CAP_NET_ADMIN**.
+    pub fn setTxPower(cl: *Nl80211, target: config_mod.Target, power: config_mod.TxPower) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        return cl.command(seq, config_mod.buildSetTxPower(cl.allocator(), cl.family_id, seq, target, power) catch |e| return mapBuild(e));
+    }
+
+    /// `iw … set channel|freq`. Needs **CAP_NET_ADMIN**; most drivers only
+    /// accept it on a monitor (or not-yet-started AP) interface.
+    pub fn setChannel(cl: *Nl80211, target: config_mod.Target, ch: config_mod.Channel) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        return cl.command(seq, config_mod.buildSetChannel(cl.allocator(), cl.family_id, seq, target, ch) catch |e| return mapBuild(e));
+    }
+
+    /// `iw phy <phy> interface add <name> type <t>`. Needs **CAP_NET_ADMIN**.
+    /// Returns the new interface as the kernel reports it in the reply.
+    pub fn newInterface(cl: *Nl80211, wiphy_index: u32, name: []const u8, iftype: uapi.Iftype) RequestError!iface.Interface {
+        const gpa = cl.allocator();
+        const seq = cl.sock.nextSeq();
+        const req = config_mod.buildNewInterface(gpa, cl.family_id, seq, wiphy_index, name, iftype) catch |e| return mapBuild(e);
+        defer gpa.free(req);
+        try cl.send(req);
+        var walk: Dump = .{ .cl = cl, .seq = seq };
+        var found: ?iface.Interface = null;
+        while (try walk.next()) |m| {
+            if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
+            found = iface.parse(m.attrs) catch return error.MalformedReply;
+        }
+        return found orelse error.MalformedReply;
+    }
+
+    /// `iw dev <dev> del`. Needs **CAP_NET_ADMIN**.
+    pub fn delInterface(cl: *Nl80211, ifindex: u32) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        return cl.command(seq, config_mod.buildDelInterface(cl.allocator(), cl.family_id, seq, ifindex) catch |e| return mapBuild(e));
+    }
+
+    /// `iw dev <dev> set type <t>`. Needs **CAP_NET_ADMIN**; the interface
+    /// usually has to be down.
+    pub fn setInterfaceType(cl: *Nl80211, ifindex: u32, iftype: uapi.Iftype) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        return cl.command(seq, config_mod.buildSetInterfaceType(cl.allocator(), cl.family_id, seq, ifindex, iftype) catch |e| return mapBuild(e));
+    }
+
+    /// `iw dev <dev> set power_save on|off`. Needs **CAP_NET_ADMIN**.
+    pub fn setPowerSave(cl: *Nl80211, ifindex: u32, on: bool) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        return cl.command(seq, config_mod.buildSetPowerSave(cl.allocator(), cl.family_id, seq, ifindex, on) catch |e| return mapBuild(e));
+    }
+
+    /// `iw dev <dev> get power_save`. Unprivileged.
+    pub fn powerSave(cl: *Nl80211, ifindex: u32) RequestError!bool {
+        const gpa = cl.allocator();
+        const seq = cl.sock.nextSeq();
+        const req = config_mod.buildGetPowerSave(gpa, cl.family_id, seq, ifindex) catch |e| return mapBuild(e);
+        defer gpa.free(req);
+        try cl.send(req);
+        var walk: Dump = .{ .cl = cl, .seq = seq };
+        var state: ?bool = null;
+        while (try walk.next()) |m| {
+            if (m.cmd != uapi.CMD.GET_POWER_SAVE or state != null) continue;
+            state = config_mod.parsePowerSave(m.attrs) catch return error.MalformedReply;
+        }
+        return state orelse error.MalformedReply;
     }
 
     // ── multicast groups ───────────────────────────────────────────────────

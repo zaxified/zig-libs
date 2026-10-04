@@ -132,6 +132,9 @@ pub const scan = @import("scan.zig");
 pub const connect = @import("connect.zig");
 /// Regulatory domain decoding + `REQ_SET_REG`.
 pub const reg = @import("reg.zig");
+
+/// Radio/interface configuration, channel survey, power save.
+pub const config = @import("config.zig");
 /// The socket client and the multicast event socket.
 pub const client = @import("client.zig");
 
@@ -161,6 +164,10 @@ pub const TriggerOptions = scan.TriggerOptions;
 pub const ConnectOptions = connect.ConnectOptions;
 pub const RegDomain = reg.RegDomain;
 pub const RegRule = reg.RegRule;
+pub const Survey = config.Survey;
+pub const Channel = config.Channel;
+pub const TxPower = config.TxPower;
+pub const Target = config.Target;
 pub const Security = ie.Security;
 
 pub const Iftype = uapi.Iftype;
@@ -288,6 +295,44 @@ test "live: GET_STATION dump on every interface (unprivileged)" {
         }
     }
     if (!any) return skip("no interface accepted a station dump");
+}
+
+test "live: GET_SURVEY and GET_POWER_SAVE on every interface (unprivileged, read-only)" {
+    var wifi = try openOrSkip();
+    defer wifi.close();
+    const list = wifi.interfaces() catch return skip("GET_INTERFACE dump");
+    defer testing.allocator.free(list);
+
+    var any = false;
+    for (list) |i| {
+        const idx = i.ifindex orelse continue;
+        // Power save is a station-interface property; others answer
+        // EOPNOTSUPP. Whatever comes back must be a definite on/off.
+        if (wifi.powerSave(idx)) |_| {
+            any = true;
+        } else |e| switch (e) {
+            error.NotSupported, error.NoSuchDevice, error.AccessDenied => {},
+            else => return e,
+        }
+        const surveys = wifi.survey(idx) catch |e| switch (e) {
+            error.NotSupported, error.NoSuchDevice, error.AccessDenied => continue,
+            else => return e,
+        };
+        defer testing.allocator.free(surveys);
+        any = true;
+        // Some drivers (iwlwifi) keep no survey and answer an empty dump.
+        // Whatever entries do come: real Wi-Fi frequencies, at most one in use,
+        // busy time never above the active time it is part of.
+        var in_use: usize = 0;
+        for (surveys) |sv| {
+            try testing.expect(sv.frequency_mhz > 700 and sv.frequency_mhz < 8000);
+            if (sv.in_use) in_use += 1;
+            if (sv.active_ms) |act| if (sv.busy_ms) |busy| try testing.expect(busy <= act);
+            if (sv.noise_dbm) |n| try testing.expect(n < 0);
+        }
+        try testing.expect(in_use <= 1);
+    }
+    if (!any) return skip("no interface answered GET_SURVEY / GET_POWER_SAVE");
 }
 
 test "live: GET_SCAN dump of the kernel's BSS table (unprivileged)" {
@@ -451,6 +496,7 @@ test {
     _ = scan;
     _ = connect;
     _ = reg;
+    _ = config;
     _ = client;
     _ = @import("goldens.zig");
 }

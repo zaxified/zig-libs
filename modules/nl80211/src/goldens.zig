@@ -106,6 +106,7 @@ const wiphy = @import("wiphy.zig");
 const scan = @import("scan.zig");
 const connect = @import("connect.zig");
 const reg = @import("reg.zig");
+const config = @import("config.zig");
 const client = @import("client.zig");
 
 /// The family id nlctrl handed out on the machine the captures came from.
@@ -1733,3 +1734,249 @@ const get_wiphy_split_dump = hex("8800000029000200fb2b9f95d1c09ce303010000080001
     "5400000029000200fb2b9f95d1c09ce303010000080001000000000009000200" ++
     "706879300000000008002e000100000024005881050003000000000005000400" ++
     "0000000006000500000000000500060000000000");
+
+// ── 2026-10-04: configuration, survey, power save ──────────────────────────
+// Captured with the same recipe, but inside `unshare -rn` and against `lo`
+// (ifindex 1, not a wireless device) or `phy#99` (no such radio): the kernel
+// refused every command, so nothing on the capture host changed — the request
+// bytes are what `iw` sends regardless. Family id 41 again (see the header).
+
+test "golden: GET_SURVEY dump" {
+    // strace … iw dev lo survey dump   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c0000002900050332e23d9500000000" ++
+            "32000000" ++
+            "0800030001000000",
+    );
+    const req = try config.buildGetSurvey(testing.allocator, fam, 0x953de232, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY txpower fixed (phy)" {
+    // strace … iw phy#99 set txpower fixed 1500   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2c0000002900050032e23d9500000000" ++
+            "02000000" ++
+            "0800010063000000080061000200000008006200dc050000",
+    );
+    const req = try config.buildSetTxPower(testing.allocator, fam, 0x953de232, .{ .wiphy = 99 }, .{ .fixed_mbm = 1500 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY txpower auto" {
+    // strace … iw phy#99 set txpower auto   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "240000002900050032e23d9500000000" ++
+            "02000000" ++
+            "08000100630000000800610000000000",
+    );
+    const req = try config.buildSetTxPower(testing.allocator, fam, 0x953de232, .{ .wiphy = 99 }, .auto);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY txpower limit" {
+    // strace … iw phy#99 set txpower limit 2000   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2c0000002900050032e23d9500000000" ++
+            "02000000" ++
+            "0800010063000000080061000100000008006200d0070000",
+    );
+    const req = try config.buildSetTxPower(testing.allocator, fam, 0x953de232, .{ .wiphy = 99 }, .{ .limit_mbm = 2000 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY txpower fixed (dev)" {
+    // strace … iw dev lo set txpower fixed 1000   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2c0000002900050032e23d9500000000" ++
+            "02000000" ++
+            "0800030001000000080061000200000008006200e8030000",
+    );
+    const req = try config.buildSetTxPower(testing.allocator, fam, 0x953de232, .{ .ifindex = 1 }, .{ .fixed_mbm = 1000 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY channel 6 (dev, 20 MHz no-HT)" {
+    // strace … iw dev lo set channel 6   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "440000002900050032e23d9500000000" ++
+            "02000000" ++
+            "080003000100000008002600850900000800220100000000" ++
+            "08009f000000000008002700000000000800a00085090000",
+    );
+    const req = try config.buildSetChannel(testing.allocator, fam, 0x953de232, .{ .ifindex = 1 }, config.Channel.legacy(2437));
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY freq 5180 80 5210 (VHT80, no channel type)" {
+    // strace … iw dev lo set freq 5180 80 5210   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "3c0000002900050032e23d9500000000" ++
+            "02000000" ++
+            "0800030001000000080026003c1400000800220100000000" ++
+            "08009f00030000000800a0005a140000",
+    );
+    const req = try config.buildSetChannel(testing.allocator, fam, 0x953de232, .{ .ifindex = 1 }, .{ .freq_mhz = 5180, .width = .@"80", .center1_mhz = 5210 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY freq 2437 HT40- (centre 2427)" {
+    // strace … iw dev lo set freq 2437 HT40-   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "440000002900050032e23d9500000000" ++
+            "02000000" ++
+            "080003000100000008002600850900000800220100000000" ++
+            "08009f000200000008002700020000000800a0007b090000",
+    );
+    const req = try config.buildSetChannel(testing.allocator, fam, 0x953de232, .{ .ifindex = 1 }, .{ .freq_mhz = 2437, .width = .@"40", .center1_mhz = 2427 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY channel 11 (phy)" {
+    // strace … iw phy#99 set channel 11   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "440000002900050032e23d9500000000" ++
+            "02000000" ++
+            "0800010063000000080026009e0900000800220100000000" ++
+            "08009f000000000008002700000000000800a0009e090000",
+    );
+    const req = try config.buildSetChannel(testing.allocator, fam, 0x953de232, .{ .wiphy = 99 }, config.Channel.legacy(2462));
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: NEW_INTERFACE monitor" {
+    // strace … iw phy#99 interface add zmon0 type monitor   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "300000002900050032e23d9500000000" ++
+            "07000000" ++
+            "08000100630000000a0004007a6d6f6e3000000008000500" ++
+            "06000000",
+    );
+    const req = try config.buildNewInterface(testing.allocator, fam, 0x953de232, 99, "zmon0", .monitor);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: NEW_INTERFACE managed" {
+    // strace … iw phy#99 interface add zsta0 type managed   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "300000002900050032e23d9500000000" ++
+            "07000000" ++
+            "08000100630000000a0004007a7374613000000008000500" ++
+            "02000000",
+    );
+    const req = try config.buildNewInterface(testing.allocator, fam, 0x953de232, 99, "zsta0", .station);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: DEL_INTERFACE" {
+    // strace … iw dev lo del   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c0000002900050032e23d9500000000" ++
+            "08000000" ++
+            "0800030001000000",
+    );
+    const req = try config.buildDelInterface(testing.allocator, fam, 0x953de232, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_INTERFACE type monitor" {
+    // strace … iw dev lo set type monitor   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "240000002900050032e23d9500000000" ++
+            "06000000" ++
+            "08000300010000000800050006000000",
+    );
+    const req = try config.buildSetInterfaceType(testing.allocator, fam, 0x953de232, 1, .monitor);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_INTERFACE type managed" {
+    // strace … iw dev lo set type managed   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "240000002900050032e23d9500000000" ++
+            "06000000" ++
+            "08000300010000000800050002000000",
+    );
+    const req = try config.buildSetInterfaceType(testing.allocator, fam, 0x953de232, 1, .station);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_POWER_SAVE on" {
+    // strace … iw dev lo set power_save on   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "240000002900050032e23d9500000000" ++
+            "3d000000" ++
+            "080003000100000008005d0001000000",
+    );
+    const req = try config.buildSetPowerSave(testing.allocator, fam, 0x953de232, 1, true);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_POWER_SAVE off" {
+    // strace … iw dev lo set power_save off   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "240000002900050032e23d9500000000" ++
+            "3d000000" ++
+            "080003000100000008005d0000000000",
+    );
+    const req = try config.buildSetPowerSave(testing.allocator, fam, 0x953de232, 1, false);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: GET_POWER_SAVE" {
+    // strace … iw dev lo get power_save   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c0000002900050032e23d9500000000" ++
+            "3e000000" ++
+            "0800030001000000",
+    );
+    const req = try config.buildGetPowerSave(testing.allocator, fam, 0x953de232, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden reply: GET_POWER_SAVE on a real iwlwifi radio decodes to \"off\"" {
+    // strace -e trace=recvmsg -e read=all … iw dev wlp2s0 get power_save
+    // (host, unprivileged, read-only). `iw` printed "Power save: off" for this
+    // reply; NL80211_ATTR_PS_STATE (93) = NL80211_PS_DISABLED (0).
+    try skipUnlessLittleEndian();
+    const reply = hex("1c00000029000000fee13d9560d41ae5" ++ "3e010000" ++ "08005d0000000000");
+    var it: codec.MessageIterator = .{ .buf = &reply };
+    const m = (try it.next()).?;
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.GET_POWER_SAVE, p.cmd);
+    try testing.expectEqual(@as(?bool, false), try config.parsePowerSave(p.attrs));
+}
