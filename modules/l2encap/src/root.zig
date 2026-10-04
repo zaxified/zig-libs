@@ -510,6 +510,22 @@ test "decode: reserved flag bits are rejected, never masked" {
     try testing.expect(dec.fields.bum);
 }
 
+test "decode: each reserved flag bit 1..7 is rejected on its own, with and without bum" {
+    // WHY: the wire-format doc says bits 1..7 of `flags` are reserved and MUST
+    // be zero and that `decode` rejects ANY nonzero reserved bit. Testing only
+    // 0x02 and 0xFE leaves a bit that is silently dropped from the mask unseen,
+    // so every single bit is set alone (and alongside the legal bum bit).
+    var buf = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00 };
+    var bit: u3 = 1;
+    while (true) : (bit += 1) {
+        buf[1] = @as(u8, 1) << bit;
+        try testing.expectError(error.InvalidHeader, decode(&buf));
+        buf[1] |= flag_bum;
+        try testing.expectError(error.InvalidHeader, decode(&buf));
+        if (bit == 7) break;
+    }
+}
+
 test "semantics: TTL decrements and drops at zero" {
     const f: Fields = .{ .isid = 1, .ttl = 2, .bum = false, .ingress_pe = 7 };
     const f1 = try decrementTtl(f);

@@ -6,7 +6,7 @@
 
 **Scope:** core — VXLAN (RFC 7348) / Geneve (RFC 8926) codecs (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -256,6 +256,26 @@ recorded above as design-provenance confirmation, not as a code anchor. No
 `/NOTICE` entry: this was a black-box run of the kernel's own network stack —
 observed behavior only, no source or design consulted beyond the two RFCs
 already cited (root `NOTICE` §0).
+
+## Mutation run 2026-10-04
+
+First mutation-schemata run (one ReleaseSafe test binary, 34 mutants behind a
+runtime switch, baseline first): 34 mutants, 34 killed, 0 equivalent. Covered:
+every `writeHeader` field (version, bum bit, reserved-bit leak, I-SID shift and
+endianness, TTL, ingress-PE endianness), the `max_frame_len` / buffer-size
+comparisons in `encode`, `encodeAlloc` and `decode` (`>` vs `>=`, `<` vs `<=`),
+the `Truncated` boundary, the version check, each reserved-flag bit in
+`decode`, every field offset and endianness in `decode`, the payload start,
+`decrementTtl` (expiry boundary, step), `droppedBySplitHorizon` (and/or,
+equality, bum guard) and the `looksLikeEthernet` threshold.
+
+One mutant survived the existing tests: dropping reserved bit 7 from the
+decode mask (the tests only set bit 1 and the all-bits value 0xFE, where the
+other bits still trip the check). It was killed by a new test that sets each
+reserved bit 1..7 alone, with and without the bum bit. Expected result comes
+from the wire-format doc comment (bits 1..7 reserved, MUST be zero, `decode`
+rejects any nonzero one); the format is this module's own, so there is no
+external fixture. No source defects found.
 
 ## Backlog / deferred
 

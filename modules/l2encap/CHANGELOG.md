@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (34 mutants, 34 killed); added a test that rejects each reserved `flags` bit 1..7 individually.
+
 - **2026-09-30** — Anchor grade corrected from class A · oracle SELF to **class D · oracle n/a**: the
   8-byte header is this module's own format (no third party implements it), so there is no outside
   truth to anchor on. Documentation only; grade 4 → 2 follows from the honest class, not new evidence.
