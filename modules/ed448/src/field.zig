@@ -605,6 +605,19 @@ test "Fe.fromBytes rejects p itself (non-canonical) and accepts p-1" {
     _ = try Fe.fromBytes(p_minus_1);
 }
 
+test "Fe.isZero and Fe.eql read every limb" {
+    // 2^440 (only the top byte set; < p, so canonical) is not zero, and it
+    // differs from 0 and 2^440 + 1 from 1 although their low limbs agree.
+    var bytes = [_]u8{0} ** encoded_bytes;
+    bytes[encoded_bytes - 1] = 1;
+    const top = try Fe.fromBytes(bytes);
+    try std.testing.expect(!top.isZero());
+    try std.testing.expect(!top.eql(Fe.zero));
+    bytes[0] = 1;
+    const top_plus_one = try Fe.fromBytes(bytes);
+    try std.testing.expect(!top_plus_one.eql(Fe.one));
+}
+
 test "Fe.fromBytes / toBytes round-trip on an arbitrary canonical value (REAL codec)" {
     var bytes = [_]u8{0} ** encoded_bytes;
     bytes[0] = 0x12;

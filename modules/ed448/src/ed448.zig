@@ -610,10 +610,12 @@ pub const VerifyError = ContextError || Point.DecodeError || error{ InvalidScala
 /// Shared RFC 8032 §5.2.7 verify construction (variable-time is
 /// acceptable throughout — every input to verification is public):
 ///
-/// 1. Decode `sig.r` as `R` (`Point.fromBytes`), `sig.s` as `S` (already
-///    range-checked by `Signature.fromBytes` — re-derived here from the
-///    struct fields directly, no re-parse needed), `pubkey.bytes` as
-///    `A'` (`Point.fromBytes`). Any decode failure => invalid signature.
+/// 1. Decode `sig.r` as `R` (`Point.fromBytes`), `sig.s` as `S`
+///    (`0 <= S < L`, else `error.InvalidScalar` — checked here again, not
+///    only in `Signature.fromBytes`, because `Signature`'s fields are public
+///    and a value built field by field never went through that parse),
+///    `pubkey.bytes` as `A'` (`Point.fromBytes`). Any decode failure =>
+///    invalid signature.
 /// 2. `k = SHAKE256(dom4(phflag,ctx) || sig.r || pubkey || ph_message,
 ///    114) mod L` — IDENTICAL computation to `signInternal`'s step 4.
 /// 3. Accept iff `[4][S]B == [4]R + [4][k]A'` (the COFACTORED check RFC
@@ -623,6 +625,11 @@ pub const VerifyError = ContextError || Point.DecodeError || error{ InvalidScala
 ///    method's cofactored-verification choice for the analogous 25519
 ///    case; see `../SPEC.md`'s threat-model note on why).
 fn verifyInternal(sig: Signature, ph_message: []const u8, ctx: []const u8, pubkey: PublicKey, phflag: u1) VerifyError!void {
+    // RFC 8032 §5.2.7 step 1. Without it `S + L` verifies like `S` (the
+    // scalar multiplication reads S mod L, and ignores bits 448..455 outright):
+    // a second valid encoding of the same signature. Found by the 2026-10-04
+    // mutation run.
+    scalar.rejectNonCanonical(sig.s) catch return error.InvalidScalar;
     const r_point = try Point.fromBytes(sig.r);
     const a_point = try Point.fromBytes(pubkey.bytes);
 
@@ -850,14 +857,21 @@ test "verify rejects an identity public key (universal forgery)" {
     const good = try sign(kp, "hello", "");
     try verify(good, "hello", "", kp.public_key);
 
-    // ⚠ THE TWO GUARDS ARE NOT INDEPENDENTLY PINNABLE, and that is a fact
-    // about the attack rather than a weakness of this test. The forgery needs
-    // A' = O *and* (s = 0, R = O) together, so either guard alone blocks it —
-    // removing just one is an EQUIVALENT MUTANT with respect to this attack
-    // (measured: disabling either one leaves all 54 tests green). The cases
-    // below keep one operand legitimate, and they are rejected by the
-    // verification equation itself, not by the guards; they are here to prove
-    // the guards did not turn into a blanket reject.
+    // The public-key guard on its own: with A' = O the [k]A' term vanishes,
+    // so ANY pair with R = [S]B verifies for every message — no need for
+    // R = O. Here S = 1, R = B. (An earlier note here called the two guards
+    // "not independently pinnable" because the pair above needs both; the
+    // 2026-10-04 mutation run left the A' guard's removal alive.)
+    var one = [_]u8{0} ** 57;
+    one[0] = 1;
+    const sig_b: Signature = .{ .r = Point.basePoint.toBytes(), .s = one };
+    for ([_][]const u8{ "", "any message at all" }) |msg| {
+        try std.testing.expectError(error.SignatureVerificationFailed, verify(sig_b, msg, "", pk));
+    }
+
+    // The cases below keep one operand legitimate, and they are rejected by
+    // the verification equation itself, not by the guards; they are here to
+    // prove the guards did not turn into a blanket reject.
     try std.testing.expectError(
         error.SignatureVerificationFailed,
         verify(good, "hello", "", PublicKey.fromBytes(id_bytes)),
@@ -866,6 +880,88 @@ test "verify rejects an identity public key (universal forgery)" {
         error.SignatureVerificationFailed,
         verify(.{ .r = id_bytes, .s = good.s }, "hello", "", kp.public_key),
     );
+}
+
+/// The key holder's clamped secret scalar `s` (RFC 8032 §5.2.5), for tests
+/// that build a signature by hand.
+fn testSecretScalar(kp: KeyPair) scalar.CompressedScalar {
+    var h: [114]u8 = undefined;
+    Shake256.hash(&kp.secret_key.bytes, &h, .{});
+    var s = h[0..57].*;
+    scalar.clamp(&s);
+    return s;
+}
+
+test "verify rejects a small-order R even from the key holder (this module's policy)" {
+    // NOT an RFC 8032 rule: §5.2.7's equation accepts this signature, and only
+    // the holder of the secret key can make it (r = 0, so R = O and
+    // S = k·s). `verifyInternal` refuses small-order R before the equation as
+    // defence in depth; this pins that choice. Without the guard both sides
+    // of the cofactored equation are the identity and it verifies.
+    const kp = KeyPair.create([_]u8{7} ** 57);
+    const r_bytes = Point.identityElement.toBytes();
+    const k = scalar.reduceWide(try shake114(0, "", &.{ &r_bytes, &kp.public_key.bytes, "hello" }));
+    const sig: Signature = .{ .r = r_bytes, .s = scalar.mulAdd(k, testSecretScalar(kp), scalar.zero) };
+    try std.testing.expectError(error.SignatureVerificationFailed, verify(sig, "hello", "", kp.public_key));
+}
+
+test "verify is cofactored: an order-4 component on R is accepted (RFC 8032 §5.2.7)" {
+    // (1, 0) is on edwards448 (1 + 0 = 1 + d·1·0) and has order 4: doubling
+    // it gives (0, -1), which has order 2. RFC 8032 §5.2.7's group equation is
+    // [4][S]B = [4]R + [4][k]A', so a signature whose R carries this point —
+    // made honestly for that R — verifies; an equation multiplied by 2 only
+    // would reject it.
+    const t4: Point = .{ .x = Fe.one, .y = Fe.zero, .z = Fe.one };
+    try std.testing.expect(t4.clearCofactor().equivalent(Point.identityElement));
+    try std.testing.expect(!t4.dbl().equivalent(Point.identityElement));
+
+    const kp = KeyPair.create([_]u8{5} ** 57);
+    var r = scalar.zero;
+    r[0] = 42;
+    const r_bytes = Point.mulBasePoint(r).add(t4).toBytes();
+    const k = scalar.reduceWide(try shake114(0, "", &.{ &r_bytes, &kp.public_key.bytes, "msg" }));
+    const sig: Signature = .{ .r = r_bytes, .s = scalar.mulAdd(k, testSecretScalar(kp), r) };
+    try verify(sig, "msg", "", kp.public_key);
+}
+
+test "verify rejects S >= L in a Signature built field by field (RFC 8032 §5.2.7 step 1)" {
+    // S + L is the same scalar mod L, so without the range check inside
+    // verify the equation holds: a second valid encoding of one signature.
+    // `Signature.fromBytes` rejects it, but the struct's fields are public.
+    const kp = KeyPair.create([_]u8{9} ** 57);
+    const good = try sign(kp, "msg", "");
+    try verify(good, "msg", "", kp.public_key);
+
+    var s_plus_l: [57]u8 = undefined;
+    var carry: u16 = 0;
+    for (&s_plus_l, good.s, scalar.l_bytes) |*o, a, b| {
+        const t = @as(u16, a) + b + carry;
+        o.* = @truncate(t);
+        carry = t >> 8;
+    }
+    try std.testing.expectEqual(@as(u16, 0), carry); // S + L < 2L < 2^447
+    try std.testing.expectError(error.InvalidScalar, verify(.{ .r = good.r, .s = s_plus_l }, "msg", "", kp.public_key));
+
+    // Bits 448..455 are never read by the scalar multiplication at all.
+    var high = good.s;
+    high[56] = 0x01;
+    try std.testing.expectError(error.InvalidScalar, verify(.{ .r = good.r, .s = high }, "msg", "", kp.public_key));
+}
+
+test "Point.equivalent tells P from -P" {
+    // (x, y) and (-x, y) are distinct points whenever x != 0, and the base
+    // point's x is not 0 — the y coordinates alone cannot decide.
+    try std.testing.expect(Point.basePoint.equivalent(Point.basePoint));
+    try std.testing.expect(!Point.basePoint.equivalent(Point.basePoint.neg()));
+}
+
+test "a context of exactly 255 octets signs and verifies (RFC 8032 §5.2)" {
+    // RFC 8032 §5.2: the context is "an octet string of at most 255 octets".
+    const ctx = [_]u8{0xab} ** max_context_length;
+    const kp = KeyPair.create([_]u8{3} ** 57);
+    const sig = try sign(kp, "m", &ctx);
+    try verify(sig, "m", &ctx, kp.public_key);
+    try std.testing.expectError(error.ContextTooLong, sign(kp, "m", &([_]u8{0xab} ** (max_context_length + 1))));
 }
 
 // ── the RNG seam (entropy re-audit 2026-08-13) ──────────────────────────────

@@ -261,6 +261,16 @@ test "rejectNonCanonical rejects L itself and accepts L-1 (REAL)" {
     try rejectNonCanonical(l_minus_1);
 }
 
+test "rejectNonCanonical decides at the most significant differing byte" {
+    // L with its top byte raised to 1 and its low byte lowered to 0 is
+    // L - 0xf3 + 2^448 > L: non-canonical, although its low byte is below
+    // L's. A compare that let any lower byte decide would accept it.
+    var s = l_bytes;
+    s[encoded_bytes - 1] = 1;
+    s[0] = 0;
+    try std.testing.expectError(error.NonCanonical, rejectNonCanonical(s));
+}
+
 test "clamp: RFC 8032 §5.2.5 pruning (REAL)" {
     var buf = [_]u8{0xff} ** encoded_bytes;
     clamp(&buf);

@@ -7,6 +7,7 @@
 const std = @import("std");
 const x448 = @import("x448.zig");
 const ed448 = @import("ed448.zig");
+const scalar = @import("scalar.zig");
 const v = @import("kat_vectors.zig");
 
 // ── X448 (RFC 7748 §5.2, §6.2) ──────────────────────────────────────────
@@ -45,6 +46,23 @@ test "RFC 7748 §6.2: X448 Diffie-Hellman example — shared secret, byte-exact,
     try std.testing.expectEqualSlices(u8, &v.x448.dh.shared, &k_bob);
 }
 
+test "RFC 7748 §5: X448 of a small-order u (0, 1, p - 1) is all zeros" {
+    // u = 0 has order 2 and u = ±1 order 4 (on the curve or its twist); the
+    // clamped scalar is a multiple of the cofactor 4, so the ladder ends at
+    // the point at infinity, z_2 = 0, and RFC 7748 §5's x_2 · z_2^(p-2) is 0.
+    // RFC 7748 §6.2 names this all-zero output as the check a caller MAY make.
+    var p_minus_1 = [_]u8{0xff} ** 56; // p = 2^448 - 2^224 - 1, little-endian
+    p_minus_1[28] = 0xfe;
+    p_minus_1[0] = 0xfe;
+    var one = [_]u8{0} ** 56;
+    one[0] = 1;
+    const zero = [_]u8{0} ** 56;
+    for ([_][56]u8{ zero, one, p_minus_1 }) |u| {
+        const out = try x448.scalarmult(v.x448.dh.alice_private, u);
+        try std.testing.expectEqualSlices(u8, &zero, &out);
+    }
+}
+
 // ── Ed448 / Ed448ph (RFC 8032 §7.4, §7.5) ───────────────────────────────
 
 fn checkEd448Vector(vec: v.ed448.Vec) !void {
@@ -80,6 +98,20 @@ test "RFC 8032 §7.4: Ed448 '1 octet (with context)' vector — keygen + sign + 
 
 test "RFC 8032 §7.4: Ed448 '11 octets' vector — keygen + sign + verify, byte-exact" {
     try checkEd448Vector(v.ed448.eleven_octets);
+}
+
+test "RFC 8032 §7.4/§7.5: the variable-base Point.mul reproduces the public keys" {
+    // A = [s]B (RFC 8032 §5.2.5). `KeyPair.create` uses the fixed-base comb;
+    // this asks the generic windowed `Point.mul` (decaf448's path) for the
+    // same point, against the RFC's public keys.
+    for ([_]v.ed448.Vec{ v.ed448.blank, v.ed448.one_octet, v.ed448.one_octet_with_context, v.ed448.eleven_octets, v.ed448.ph_test_abc }) |vec| {
+        var h: [114]u8 = undefined;
+        std.crypto.hash.sha3.Shake256.hash(&vec.sk, &h, .{});
+        var s = h[0..57].*;
+        scalar.clamp(&s);
+        const a = ed448.Point.mul(ed448.Point.basePoint, s);
+        try std.testing.expectEqualSlices(u8, &vec.pk, &a.toBytes());
+    }
 }
 
 test "RFC 8032 §7.4: context binding — a signature made under one context fails to verify under another" {

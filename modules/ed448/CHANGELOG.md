@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix (BEHAVIOURAL): `verify`/`verifyPh` now reject `S >= L` themselves
+  (`error.InvalidScalar`). Before, only `Signature.fromBytes` checked it, so a `Signature`
+  built field by field with `S + L` (or bits 448..455 set) verified — a malleable second
+  encoding (RFC 8032 §5.2.7 step 1). Signatures parsed with `Signature.fromBytes` are
+  unaffected. Found by a mutation run (58 mutants, 56 killed, 2 equivalent); tests added
+  for `Point.mul` (against the RFC 8032 public keys), the cofactored equation, the
+  public-key guard on its own, small-order X448 inputs, a 255-octet context and limb-wide
+  `Fe.isZero`/`Fe.eql`.
 - **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: both `x448.zig` and
   `ed448.zig` gained a seam test proving their `KeyPair.generate`'s
   `entropy.fill` draw is actually read (two key pairs from the same `io`
