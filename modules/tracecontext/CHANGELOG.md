@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (22 schemata mutants, all killed after one new test
+  covering the byte-35/52 delimiters, `Options.sampled = false` and DEL in a tracestate). No code
+  change.
+
 - **2026-09-30** — **NO CONSUMER-VISIBLE CHANGE:** the W3C suite's three
   `test_traceparent_version_0xcc` vectors run again. They had stayed marked out of scope
   ("forward-compat not implemented") after forward-compatible parsing landed on 2026-08-02, so

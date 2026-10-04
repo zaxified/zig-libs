@@ -6,7 +6,7 @@
 
 **Scope:** core — W3C Trace Context Level 1 + OpenTelemetry `TraceContext` propagator (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -77,6 +77,16 @@ this module's `NOTICE`): 73 hand-transcribed request/verdict vectors from the su
 both must-accept and must-reject through this module's own middleware, 15 excluded with a recorded
 reason apiece (a count canary fails loudly on unreclassified drift). Run: `zig build
 test-tracecontext`.
+
+**Audit 2026-10-04 (mutation).** 22 schemata mutants over `TraceParent.parse` (version
+`ff`, `00` exact length, future-version delimiter, all three field delimiters, zero ids,
+uppercase hex), `write`/`sampled`/`childOf`, the middleware (`trust_incoming`, `sampled`,
+`echo`, tracestate only with a parsed parent, duplicate traceparent) and `isValidState` /
+`combinedHeader`: 22 killed, 0 equivalent, 0 left alive. Four survivors of the first run
+got tests: a non-dash at byte 35 and at byte 52 (W3C Trace Context §3.2.2), a fresh trace
+under `Options.sampled = false` is unsampled, and DEL in a tracestate fails `isValidState`
+(asserted on the guard itself: `http.Server`'s h1 parser already refuses a header value with
+DEL, so the wire cannot reach it).
 
 ## Backlog / deferred
 - Beyond the survey items below, none beyond the documented Level-2/vendor-tracestate/sampling-logic/

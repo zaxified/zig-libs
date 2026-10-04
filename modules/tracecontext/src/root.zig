@@ -576,6 +576,39 @@ test "tracestate is carried through unchanged" {
     );
 }
 
+test "traceparent: every field delimiter is checked; a fresh trace honours Options.sampled; DEL in tracestate is dropped" {
+    // W3C Trace Context §3.2.2: `version "-" trace-id "-" parent-id "-"
+    // trace-flags` -- a non-dash at byte 35 or 52 is no traceparent.
+    // Mutation 2026-10-04: dropping either delimiter check survived (the
+    // vectors only break the first one).
+    const tid = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const pid = "00f067aa0ba902b7";
+    try testing.expectError(error.BadFormat, TraceParent.parse("00-" ++ tid ++ "x" ++ pid ++ "-01"));
+    try testing.expectError(error.BadFormat, TraceParent.parse("00-" ++ tid ++ "-" ++ pid ++ "x01"));
+
+    // `Options.sampled`: "Sampled flag for a newly *started* trace" -- false
+    // starts an unsampled trace (flags 00). Mutation: ignoring it survived.
+    {
+        var tc = TraceContext{ .options = .{ .sampled = false } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoCurrent);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+        const tp = try TraceParent.parse(headerValue(got, "traceparent").?);
+        try testing.expect(!tp.sampled());
+    }
+
+    // `isValidState`: printable ASCII or tab only; DEL (0x7f) is a control
+    // character. Mutation: admitting 0x7f survived (only 0x01 was tested).
+    // Checked on the guard itself: `http.Server` already refuses a header
+    // value carrying DEL, so over the wire it never gets this far -- the
+    // guard is what holds for any other server feeding this middleware.
+    try testing.expect(!isValidState("rojo=\x7fbad"));
+    try testing.expect(isValidState("rojo=00f067aa0ba902b7,\tcongo=t61rcWkgMzE"));
+}
+
 test "tracestate: invalid values (empty, too long, control char) are dropped, not passed through" {
     // Empty value: dropped.
     {
