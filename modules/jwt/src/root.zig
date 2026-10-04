@@ -8287,3 +8287,471 @@ test "acceptIdTokenProvider: turnkey ID Token acceptance through the cached Prov
     }));
     try testing.expectEqual(@as(usize, 2), stub.calls);
 }
+
+// ── tests: gaps found by the 2026-10-04 mutation run ────────────────────────
+//
+// Every test below was asked for by a surviving mutant: the code was right,
+// but nothing pinned the property, so a regression to the mutated form would
+// have stayed green. Each one states why its expected value is correct.
+
+test "SECURITY: `alg` is a case-sensitive string (RFC 7515 §4.1.1)" {
+    // RFC 7515 §4.1.1: "The `alg` value is a case-sensitive ASCII string".
+    // A validly MACed token whose header says `hs256` is not an HS256 token,
+    // and a verifier that folded case would accept a name no conforming
+    // producer emits — the same lax-matching shape as `"None"` once was.
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"hs256"}
+    ,
+        \\{"exp":100000}
+    );
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, "case-test-secret");
+    const token = finishToken(&buf, si.len, &mac);
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.unknown, parsed.alg);
+    try testing.expectError(error.UnsupportedAlg, verify(&parsed, .{ .hmac = "case-test-secret" }));
+
+    // `NONE` is likewise not `none`: it is an unknown algorithm, rejected as
+    // such, and the header keeps the producer's spelling verbatim.
+    var buf2: [256]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"NONE"}
+    ,
+        \\{"exp":100000}
+    );
+    const none_upper = finishToken(&buf2, si2.len, "");
+    var p2 = try parse(testing.allocator, none_upper);
+    defer p2.deinit();
+    try testing.expectEqualStrings("NONE", p2.header.alg);
+    try testing.expectEqual(Alg.unknown, p2.alg);
+    try testing.expectError(error.UnsupportedAlg, verify(&p2, .{ .hmac = "case-test-secret" }));
+}
+
+test "validateClaims: nbf and iat accept exactly now + leeway, and reject one second later" {
+    // RFC 7519 §4.1.5: the token "MUST NOT be accepted for processing BEFORE"
+    // `nbf` — at `nbf` itself it is acceptable, so with leeway L the first
+    // accepted instant is `now == nbf − L`. `iat` under `reject_future_iat`
+    // uses the same inclusive edge (it mirrors the `nbf` rule).
+    var buf: [512]u8 = undefined;
+    const token = buildToken(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":100000,"nbf":5000,"iat":5000}
+    );
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    const base: Options = .{ .now_s = 4940, .leeway_s = 60, .issuer = .any, .audience = .any };
+    try validateClaims(parsed.claims, base);
+    var early = base;
+    early.now_s = 4939;
+    try testing.expectError(error.NotYetValid, validateClaims(parsed.claims, early));
+
+    // iat alone (no nbf), strict mode.
+    var buf2: [512]u8 = undefined;
+    const iat_only = buildToken(&buf2,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":100000,"iat":5000}
+    );
+    var p2 = try parse(testing.allocator, iat_only);
+    defer p2.deinit();
+    var strict = base;
+    strict.reject_future_iat = true;
+    try validateClaims(p2.claims, strict);
+    strict.now_s = 4939;
+    try testing.expectError(error.IssuedInFuture, validateClaims(p2.claims, strict));
+}
+
+test "SECURITY: iss and aud are exact, case-sensitive matches — no prefix, no case folding" {
+    // RFC 7519 §2 (StringOrURI) and §4.1.1/§4.1.3: these values are compared
+    // as case-sensitive strings with no transformations. A prefix match would
+    // let `https://issuer.example.evil` pass for `https://issuer.example`, and
+    // `api://svc-admin` for `api://svc`.
+    var buf: [512]u8 = undefined;
+    const token = buildToken(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":100000,"iss":"https://issuer.example.evil","aud":"api://svc-admin"}
+    );
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectError(error.IssuerMismatch, validateClaims(parsed.claims, .{
+        .now_s = 1000,
+        .issuer = .{ .required = "https://issuer.example" },
+        .audience = .any,
+    }));
+    try testing.expectError(error.AudienceMismatch, validateClaims(parsed.claims, .{
+        .now_s = 1000,
+        .issuer = .any,
+        .audience = .{ .required = "api://svc" },
+    }));
+
+    var buf2: [512]u8 = undefined;
+    const upper = buildToken(&buf2,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":100000,"aud":["API://SVC","api://other"]}
+    );
+    var p2 = try parse(testing.allocator, upper);
+    defer p2.deinit();
+    try testing.expectError(error.AudienceMismatch, validateClaims(p2.claims, .{
+        .now_s = 1000,
+        .issuer = .any,
+        .audience = .{ .required = "api://svc" },
+    }));
+}
+
+/// A `ParsedToken` carrying only what `verify` reads (alg, signing input,
+/// signature) — for signature-shape tests that need no claims.
+fn sigOnlyToken(alg: Alg, signing_input: []const u8, signature: []const u8) ParsedToken {
+    return .{
+        .header = .{ .alg = @tagName(alg) },
+        .claims = .{ .raw = .null },
+        .signing_input = signing_input,
+        .signature = signature,
+        .alg = alg,
+        .arena = undefined, // never deinit'd; verify does not touch it
+    };
+}
+
+/// Verify `sig` as-is (must pass), then with one zero byte appended (must
+/// be `BadSignature`).
+fn expectExactSigLength(alg: Alg, si: []const u8, sig: []const u8, key: Key) !void {
+    var exact = sigOnlyToken(alg, si, sig);
+    try verify(&exact, key);
+    var longer_buf: [4096]u8 = undefined;
+    @memcpy(longer_buf[0..sig.len], sig);
+    longer_buf[sig.len] = 0;
+    var longer = sigOnlyToken(alg, si, longer_buf[0 .. sig.len + 1]);
+    testing.expectError(error.BadSignature, verify(&longer, key)) catch |e| {
+        std.debug.print("{s}: a valid signature with one byte appended was accepted\n", .{@tagName(alg)});
+        return e;
+    };
+}
+
+test "SECURITY: a valid signature with a byte appended is BadSignature, every alg" {
+    // Every JWS signature has one exact length, and a verifier that only
+    // checked "long enough" and read a prefix would accept the same token
+    // under many encodings — signature malleability, and a different
+    // `VerifiedCache` key for the same authorization. The lengths are fixed
+    // by: RFC 7518 §3.2 (HMAC: the full MAC output, compared whole), §3.3 +
+    // RFC 8017 §8.2.2 step 1 (RSA: "If the length of the signature S is not k
+    // octets, output 'invalid signature'"), §3.4 (ECDSA: R‖S of 64 / 96
+    // octets), RFC 8037 §3.1 + RFC 8032 (Ed25519: 64 octets), RFC 9964 §2 +
+    // FIPS 204 (ML-DSA-65: 3309 octets).
+    const si = "eyJhbGciOiJ4In0.eyJleHAiOjEwMDB9";
+
+    var mac: [32]u8 = undefined;
+    hmac_sha2.HmacSha256.create(&mac, si, "suffix-secret");
+    try expectExactSigLength(.HS256, si, &mac, .{ .hmac = "suffix-secret" });
+
+    const es256 = try testEs256KeyPair();
+    const es256_sig = (try es256.sign(si, null)).toBytes();
+    try expectExactSigLength(.ES256, si, &es256_sig, .{ .ecdsa_p256 = es256.public_key });
+
+    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{0x42} ** EcdsaP384Sha384.KeyPair.seed_length);
+    const es384_sig = (try es384.sign(si, null)).toBytes();
+    try expectExactSigLength(.ES384, si, &es384_sig, .{ .ecdsa_p384 = es384.public_key });
+
+    const ed = try testEd25519KeyPair();
+    const ed_sig = (try ed.sign(si, null)).toBytes();
+    try expectExactSigLength(.EdDSA, si, &ed_sig, .{ .ed25519 = ed.public_key });
+
+    var n_buf: [256]u8 = undefined;
+    var d_buf: [256]u8 = undefined;
+    const rs_sig = rsaTestSign(sha2.Sha256, 256, si, b64uDecode(&n_buf, rfc7515_a2_n_b64), b64uDecode(&d_buf, rfc7515_a2_d_b64));
+    try expectExactSigLength(.RS256, si, &rs_sig, rfc7515A2Key());
+
+    const ml = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x34} ** 32);
+    const ml_sig = (try ml.sign(si, null)).toBytes();
+    try expectExactSigLength(.@"ML-DSA-65", si, &ml_sig, .{ .ml_dsa_65 = ml.public_key });
+}
+
+/// Parse a one-key JWKS `{"keys":[<prefix><b64(material)><suffix>]}` and
+/// expect that key skipped as `invalid_key`.
+fn expectJwkInvalidKey(prefix: []const u8, material: []const u8, suffix: []const u8) !void {
+    var b64: [4096]u8 = undefined;
+    const s = std.base64.url_safe_no_pad.Encoder.encode(&b64, material);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(testing.allocator);
+    try doc.appendSlice(testing.allocator, "{\"keys\":[");
+    try doc.appendSlice(testing.allocator, prefix);
+    try doc.appendSlice(testing.allocator, s);
+    try doc.appendSlice(testing.allocator, suffix);
+    try doc.appendSlice(testing.allocator, "]}");
+    var set = try parseJwks(testing.allocator, doc.items);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(@as(usize, 1), set.skipped.len);
+    try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[0].reason);
+}
+
+test "JWKS: key material one byte too long is invalid_key, never truncated" {
+    // Each member has exactly one length: RFC 7518 §6.2.1.2/§6.2.1.3 (EC `x`/`y`
+    // "MUST be the full size of a coordinate for the curve": 32 octets for
+    // P-256, 48 for P-384), RFC 8037 §2 (OKP Ed25519 `x` is the 32-octet
+    // public key), RFC 9964 §5 (AKP `pub` is the raw FIPS-204 key, 1952 octets
+    // for ML-DSA-65). A parser that checked only a minimum would read a
+    // prefix and silently trust a key the document did not state. Each case
+    // takes a VALID key and appends one zero octet.
+    var a3_x: [32]u8 = undefined;
+    var a3_y: [33]u8 = undefined;
+    _ = b64uDecode(&a3_x, rfc7515_a3_x_b64);
+    _ = b64uDecode(a3_y[0..32], rfc7515_a3_y_b64);
+    a3_y[32] = 0;
+    var x_b64: [43]u8 = undefined;
+    const x_s = std.base64.url_safe_no_pad.Encoder.encode(&x_b64, &a3_x);
+    var p256_prefix: [128]u8 = undefined;
+    try expectJwkInvalidKey(
+        try std.fmt.bufPrint(&p256_prefix, "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{s}\",\"y\":\"", .{x_s}),
+        &a3_y,
+        "\"}",
+    );
+
+    const es384 = try EcdsaP384Sha384.KeyPair.generateDeterministic([_]u8{0x42} ** EcdsaP384Sha384.KeyPair.seed_length);
+    const sec1 = es384.public_key.toUncompressedSec1();
+    var long_x: [49]u8 = undefined;
+    @memcpy(long_x[0..48], sec1[1..49]);
+    long_x[48] = 0;
+    var y384_b64: [64]u8 = undefined;
+    const y384_s = std.base64.url_safe_no_pad.Encoder.encode(&y384_b64, sec1[49..97]);
+    var p384_suffix: [128]u8 = undefined;
+    try expectJwkInvalidKey(
+        "{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"",
+        &long_x,
+        try std.fmt.bufPrint(&p384_suffix, "\",\"y\":\"{s}\"}}", .{y384_s}),
+    );
+
+    const ed = try testEd25519KeyPair();
+    var long_ed: [33]u8 = undefined;
+    @memcpy(long_ed[0..32], &ed.public_key.toBytes());
+    long_ed[32] = 0;
+    try expectJwkInvalidKey("{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"", &long_ed, "\"}");
+
+    const ml = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x35} ** 32);
+    const ml_pub = ml.public_key.toBytes();
+    var long_ml: [ml_pub.len + 1]u8 = undefined;
+    @memcpy(long_ml[0..ml_pub.len], &ml_pub);
+    long_ml[ml_pub.len] = 0;
+    try expectJwkInvalidKey("{\"kty\":\"AKP\",\"alg\":\"ML-DSA-65\",\"pub\":\"", &long_ml, "\"}");
+}
+
+test "Provider by issuer: iss is checked against the DISCOVERED issuer, not the configured spelling" {
+    // OIDC Core §3.1.3.7 step 2 / Discovery §4.3: the token's `iss` must
+    // exactly equal the issuer identifier in the discovery document. This
+    // module tolerates a trailing `/` on the CONFIGURED issuer (several real
+    // IdPs are sloppy about it), so configured "https://issuer.example/" and
+    // discovered "https://issuer.example" are the same provider — and a token
+    // carrying the discovered spelling must verify.
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x52} ** 32);
+    const pub_bytes = kp.public_key.toBytes();
+    var x_b64: [43]u8 = undefined;
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"ed","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&x_b64, &pub_bytes)});
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example/" });
+    defer provider.deinit();
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"EdDSA","kid":"ed"}
+    ,
+        \\{"iss":"https://issuer.example","aud":"api://svc","exp":2000}
+    );
+    const sig = (try kp.sign(si, null)).toBytes();
+    const token = finishToken(&buf, si.len, &sig);
+    var verified = try provider.verify(gpa, token, 1000, .{ .audience = .{ .required = "api://svc" } });
+    defer verified.deinit();
+    try testing.expectEqualStrings("https://issuer.example", verified.claims.iss.?);
+}
+
+test "ResourceServer: protect=.mutations gates DELETE; only `Bearer SP token` is a bearer credential" {
+    // DELETE is a mutation (RFC 9110 §9.3.5) and must be gated with the
+    // others. And RFC 6750 §2.1's credentials are `"Bearer" 1*SP b64token`:
+    // another six-letter scheme (`Digest`) or a token glued to the scheme
+    // (`BearerX…`) is not a bearer credential, so both answer 401 with the
+    // bare challenge before the token is even looked at.
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
+        .protect = .mutations,
+        .clock = fc.clock(),
+    });
+    defer rs.deinit();
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.delete("/data", resProtectedHandler);
+
+    var tok_buf: [1024]u8 = undefined;
+    const good = mintRs256(&tok_buf,
+        \\{"aud":"api://svc","sub":"alice","exp":2000,"scope":"read"}
+    );
+    var auth_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    res_test_hits = 0;
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "DELETE", "/data", null), &out_buf);
+        try resExpectStatus(got, "401");
+    }
+    for ([_][]const u8{ "Digest ", "BearerX" }) |scheme| {
+        const auth = std.fmt.bufPrint(&auth_buf, "{s}{s}", .{ scheme, good }) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "DELETE", "/data", auth), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer");
+    }
+    try testing.expectEqual(@as(u32, 0), res_test_hits);
+    // Positive control: the same token as a proper credential is admitted.
+    {
+        const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{good}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "DELETE", "/data", auth), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(u32, 1), res_test_hits);
+    }
+}
+
+test "SECURITY: a realm carrying CR or LF is refused by both guards (header injection)" {
+    // The realm is embedded verbatim in `WWW-Authenticate`; a CR/LF would end
+    // the header line and let configuration inject response headers. The
+    // existing test covers `"`; CR, LF and CRLF are the other three ways out.
+    var provider = Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
+    defer provider.deinit();
+    for ([_][]const u8{ "a\rb", "a\nb", "a\r\nSet-Cookie: x=1" }) |realm| {
+        try testing.expectError(error.InvalidRealm, ResourceServer.init(testing.allocator, .{
+            .provider = &provider,
+            .claim_opts = .{ .issuer = .any, .audience = .any },
+            .realm = realm,
+        }));
+        try testing.expectError(error.InvalidRealm, Guard.init(testing.allocator, .{
+            .provider = &provider,
+            .claim_opts = .{ .issuer = .any, .audience = .any },
+            .realm = realm,
+        }));
+    }
+}
+
+test "SECURITY: scopes match whole space-delimited tokens exactly — no prefix, no case folding" {
+    // RFC 6749 §3.3: scope is a list of space-delimited, case-sensitive
+    // strings. So `admin:all` does not grant `admin`, `readwrite` does not
+    // grant `read`, `User.Read` does not grant `user.read`, `read,write` is
+    // ONE (odd) scope token rather than two, `,admin` is not `admin`, and an
+    // empty scope is never granted, not even by an empty `scp` entry.
+    const gpa = testing.allocator;
+    var t1 = try scopeClaimsOf(gpa,
+        \\{"scope":"admin:all readwrite read,write ,admin"}
+    );
+    defer t1.deinit();
+    try testing.expect(!scopeGranted(t1.claims, "admin"));
+    try testing.expect(!scopeGranted(t1.claims, "read"));
+    try testing.expect(!scopeGranted(t1.claims, "write"));
+    try testing.expect(scopeGranted(t1.claims, "read,write"));
+    var it: ScopeIter = .{ .rest = "read,write" };
+    try testing.expectEqualStrings("read,write", it.next().?);
+
+    var t2 = try scopeClaimsOf(gpa,
+        \\{"scp":["User.Read",""]}
+    );
+    defer t2.deinit();
+    try testing.expect(!scopeGranted(t2.claims, "user.read"));
+    try testing.expect(!scopeGranted(t2.claims, ""));
+    try testing.expectError(error.InsufficientScope, requireScope(t2.claims, ""));
+}
+
+test "acceptIdToken: a one-element aud array needs no azp (OIDC Core §3.1.3.7 step 3 is for MULTIPLE audiences)" {
+    // Step 3: "If the ID Token contains multiple audiences, the Client SHOULD
+    // verify that an azp Claim is present." `["my-client-id"]` is one
+    // audience written as an array (RFC 7519 §4.1.3 allows either form), so
+    // it is accepted without `azp`, exactly like the string form.
+    var buf: [512]u8 = undefined;
+    const token = buildIdToken(
+        &buf,
+        "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":[\"" ++ id_token_client_id ++ "\"]," ++
+            "\"exp\":100000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+    );
+    var accepted = try acceptIdToken(testing.allocator, token, .{ .hmac = id_token_secret }, .{
+        .now_s = 1000,
+        .issuer = id_token_issuer,
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    });
+    defer accepted.deinit();
+}
+
+test "SECURITY: acceptIdTokenProvider rejects an ID Token audienced at ANOTHER client" {
+    // OIDC Core §3.1.3.7 step 3: the Client MUST validate that `aud` contains
+    // its client_id. The Provider path wires that through `ClaimOptions`, and
+    // nothing pinned it: a validly signed token with the right iss and nonce
+    // but `aud` naming a different client must fail with AudienceMismatch.
+    const gpa = testing.allocator;
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x54} ** 32);
+    const pub_bytes = kp.public_key.toBytes();
+    var x_b64: [43]u8 = undefined;
+    var set_buf: [256]u8 = undefined;
+    const set = try std.fmt.bufPrint(&set_buf,
+        \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
+    , .{enc.encode(&x_b64, &pub_bytes)});
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = set },
+    } };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer provider.deinit();
+
+    var buf: [512]u8 = undefined;
+    const si = signingInputInto(
+        &buf,
+        \\{"alg":"EdDSA","kid":"op-key"}
+    ,
+        "{\"iss\":\"https://issuer.example\",\"aud\":\"another-client\"," ++
+            "\"exp\":2000,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+    );
+    const sig = (try kp.sign(si, null)).toBytes();
+    const token = finishToken(&buf, si.len, &sig);
+    try testing.expectError(error.AudienceMismatch, acceptIdTokenProvider(&provider, gpa, token, 1000, .{
+        .client_id = id_token_client_id,
+        .nonce = id_token_nonce,
+    }));
+}
+
+test "NumericDate: a float of exactly 2^63 is InvalidClaim, and -2^63 is the last value in range" {
+    // i64 spans [-2^63, 2^63 − 1]. 9.223372036854775808e18 is exactly 2^63
+    // as an f64 — one past the top — so it must be refused BEFORE
+    // `@intFromFloat` (which is illegal behaviour out of range), while -2^63
+    // is representable and converts exactly to `minInt(i64)`.
+    var buf: [512]u8 = undefined;
+    const top = buildToken(&buf,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":9.223372036854775808e18}
+    );
+    try testing.expectError(error.InvalidClaim, parse(testing.allocator, top));
+
+    var buf2: [512]u8 = undefined;
+    const bottom = buildToken(&buf2,
+        \\{"alg":"HS256"}
+    ,
+        \\{"exp":-9.223372036854775808e18}
+    );
+    var parsed = try parse(testing.allocator, bottom);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(?i64, std.math.minInt(i64)), parsed.claims.exp);
+}

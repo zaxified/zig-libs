@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first dated mutation run (111 mutants, 105 killed, 6 equivalent;
+  `SPEC.md` § "Mutation run 2026-10-04"). No defect; 12 new tests close the 29 test gaps it found
+  — case-sensitive `alg`, inclusive `nbf`/`iat` edges, exact `iss`/`aud`/scope matching, exact
+  signature lengths for every alg, exact JWK material lengths, the discovered-issuer spelling,
+  DELETE under `protect = .mutations`, strict `Bearer SP` extraction, CR/LF in a realm, the
+  one-element `aud` array, `acceptIdTokenProvider`'s audience, NumericDate at ±2^63. No source
+  change.
 - **2026-09-29** — **`Provider` can measure its refresh intervals on a clock that never steps.**
   `ProviderOptions.interval_clock` (default null: the intervals follow the caller's `now_s`, as
   before) and `Clock.boot` (seconds since boot counting suspend: CLOCK_BOOTTIME on Linux,

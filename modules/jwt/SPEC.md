@@ -6,7 +6,7 @@
 
 **Scope:** core — golang-jwt/jwt v5.3.1 and panva/jose v6.2.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-01 · mutation ?
+**Audit:** review 2026-09-01 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -302,6 +302,45 @@ guard adds self-constructed policy tests (own signer, not external interop KATs 
 approach for policy logic): `Guard.authenticate` valid/missing/garbage/expired/insufficient/
 alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp` scope helpers
 (single/all/any), and `writeBearerChallenge` header formatting. Run: `zig build test-jwt`.
+
+### Mutation run 2026-10-04
+
+Mutant schemata over a copy of `root.zig` + `cache.zig` (one ReleaseSafe build with the whole
+dependency closure, 134 tests in the binary, `setsid -w timeout -s KILL 20` per mutant):
+**111 mutants, 105 killed, 6 equivalent**. Points: segment split, every `crit` rule, `aud`/`iss`
+matching, `exp`/`nbf`/`iat` edges and leeway, `require_exp`, the `none`/unknown/PS*/ES512 arms,
+every signature-length check, the HMAC secret and compare, RSA modulus sizes, `parseAndVerify`'s
+stages, JWKS key selection (kid, pinned `alg`, ambiguity, `use`), private-key and `oct` refusal on
+the network path, key-material lengths, the `https://` rule, discovery issuer and `jwks_uri`
+checks, fetch status, the network/local trust source, Provider rate limit, TTL, step-back and
+issuer fallback, `protect`, Bearer extraction, both guards' scope and `at+jwt` checks, `Guard.init`
+key-source rules, scope matching, realm validation, percent-encoding, `azp`/`nonce`/multi-`aud`
+RP checks, NumericDate bounds, and the `VerifiedCache` set id, time re-check, insert guards, key
+folding and eviction.
+
+First pass: 35 survivors. **No defect in the code; 29 were test gaps**, closed by 12 tests at the
+end of `root.zig` (each states why its expected value is right):
+
+- `alg` is case-sensitive (RFC 7515 §4.1.1): `hs256` with a valid MAC and `NONE` are unknown.
+- `nbf`/`iat` accept exactly `now == value − leeway` and refuse one second earlier.
+- `iss`/`aud` are exact case-sensitive matches (RFC 7519 §2): no prefix, no case folding.
+- A valid signature with one byte appended is `BadSignature` for HS256, ES256, ES384, EdDSA,
+  RS256 and ML-DSA-65 — every length check was `!=`-only by accident of coverage (`<` survived).
+- JWK `x`/`y`/`pub` one octet too long is `invalid_key`, for P-256, P-384, Ed25519 and ML-DSA-65.
+- `Provider` checks `iss` against the DISCOVERED issuer when the configured one has a trailing `/`.
+- `protect = .mutations` gates DELETE; `Digest <jwt>` and `BearerX<jwt>` are not credentials.
+- A realm with CR, LF or CRLF is refused by both `ResourceServer.init` and `Guard.init`.
+- Scopes match whole tokens exactly: no prefix, no case folding, `,admin` ≠ `admin`, `""` never.
+- A one-element `aud` array needs no `azp` (OIDC Core §3.1.3.7 step 3 is for multiple audiences).
+- `acceptIdTokenProvider` refuses an ID Token audienced at another client.
+- NumericDate 2^63 as a float is `InvalidClaim` before `@intFromFloat`; −2^63 converts exactly.
+
+Equivalent (reason): `https:` matched without `//` (the scheme is still https — no plaintext key
+source); `verifyWithStaticJwks`'s `.provider` arm (only `Guard` calls it, and `Guard.init` already
+refuses that combination); NumericDate's `isFinite` (std.json cannot produce NaN, and ±inf fail
+the range check after it); `lookup`'s and `insert`'s `set.id == 0` guards (each makes the other
+redundant: an id-0 entry is never stored or never probed); `require_exp` not folded into the cache
+key (a hit re-runs `checkTimes`, which applies it).
 
 ## Backlog / deferred
 
