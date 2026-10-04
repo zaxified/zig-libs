@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation run (29 mutants, 26 killed, 3 equivalent). New tests pin
+  the implicit-rejection key to `J(H(ek), sigma, c)` (dropping sigma from `J` used to pass)
+  and the rejection sampler's refusal of a draw equal to its threshold. No behaviour change.
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The opt-in,
   print-only dead-stack probe `src/zeroize_probe_test.zig` (A1 H4,
   `HQC_ZEROIZE_SCAN`) is deleted: it asserted nothing, and CONVENTIONS.md §9

@@ -155,6 +155,50 @@ test "implicit reject: corrupted ciphertext decaps returns a differing, determin
     try testImplicitReject(Kem256, 102);
 }
 
+// ── the rejection key is J(H(ek), sigma, c), and so depends on sigma ─────
+//
+// HQC (spec of 2025-08-22, Decaps; the reference's `crypto_kem_dec`):
+// K_bar = J(H(ek_kem), sigma, c_kem) over the RECEIVED ciphertext. sigma is
+// the only secret in that formula: a rejection key computed without it is
+// one anyone holding ek and c can compute. The tests above only require the
+// rejection value to differ from the real one and from sigma itself — the
+// 2026-10-04 mutation run dropped sigma from J and they stayed green.
+
+fn testRejectionKeyIsJ(comptime Kem: type, seed_val: u64) !void {
+    var rng = std.Random.DefaultPrng.init(seed_val);
+    const random = rng.random();
+    var seed_kem: [params.seed_bytes]u8 = undefined;
+    random.bytes(&seed_kem);
+    const kp = Kem.keypair(&seed_kem);
+    var coins: [Kem.coins_bytes]u8 = undefined;
+    random.bytes(&coins);
+    const enc = Kem.encaps(kp.ek, &coins);
+
+    var corrupted = enc.ct;
+    corrupted[Kem.Ring.n_bytes + 3] ^= 0x10; // inside v
+
+    // dk = ek || dk_pke || sigma || seed_kem
+    const sigma_off = Kem.ek_bytes + params.seed_bytes;
+    const sigma = kp.dk[sigma_off..][0..Kem.security_bytes];
+    var h_ek: [params.seed_bytes]u8 = undefined;
+    prng.hashH(&h_ek, &kp.ek);
+    var want: [Kem.ss_bytes]u8 = undefined;
+    prng.hashJ(&want, &h_ek, sigma, &corrupted);
+    try testing.expectEqualSlices(u8, &want, &Kem.decaps(kp.dk, corrupted));
+
+    // A different sigma changes the rejection key and nothing else.
+    var dk2 = kp.dk;
+    dk2[sigma_off] ^= 0x01;
+    try testing.expect(!std.mem.eql(u8, &want, &Kem.decaps(dk2, corrupted)));
+    try testing.expectEqualSlices(u8, &enc.ss, &Kem.decaps(dk2, enc.ct));
+}
+
+test "implicit reject: the rejection key is J(H(ek), sigma, c) over the received ciphertext" {
+    try testRejectionKeyIsJ(Kem128, 200);
+    try testRejectionKeyIsJ(Kem192, 201);
+    try testRejectionKeyIsJ(Kem256, 202);
+}
+
 // ── H2: the FO comparison must depend on every byte of `v`, not just u/salt ─
 //
 // Audit A1 finding `hqc` H2: `vectCompare(&ct_prime, &ct)` can be shrunk to

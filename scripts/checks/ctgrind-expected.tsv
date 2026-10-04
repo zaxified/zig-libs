@@ -358,10 +358,10 @@ ed448	ReleaseFast	ladder	1	0	8ca40db7192e1f6a	43db8426e0d6c6e7
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
 # ⭐ encaps' 0 means something only because the row carries an output pin.
-hqc	ReleaseFast	decaps	1	2	1b33fe8f22ee9b7e	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	1b33fe8f22ee9b7e	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	1b33fe8f22ee9b7e	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	8eeeec94620e623e	b93fa60c89578576
+hqc	ReleaseFast	decaps	1	2	dbddabd3be31e3ef	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	dbddabd3be31e3ef	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	dbddabd3be31e3ef	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	2102f69c936e7ddb	b93fa60c89578576
 k256	ReleaseFast	field	1	0	9cea496ddcd0b4a7	4f13cccddea81376
 # k256, re-pin 2026-09-15, after F5 (1ce3087e: signed-window variable-base
 # mul) and the re-audit fixes in ff305abc.

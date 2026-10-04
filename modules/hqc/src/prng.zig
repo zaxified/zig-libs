@@ -482,6 +482,35 @@ test "sampleFixedWeightRejection: exact weight, no duplicates, in range" {
     try t.expectEqual(@as(u32, P.omega), w);
 }
 
+test "sampleFixedWeightRejection rejects a draw equal to the threshold" {
+    // A 24-bit draw is accepted only if it is < t = floor(2^24 / n) * n
+    // (`params.rejectionThreshold`); t itself must be rejected like every
+    // larger value, or position t mod n = 0 is over-weighted and the support
+    // differs from the reference's for such seeds. A draw of exactly t has
+    // probability 2^-24, which no KAT reaches: this seed was found by search
+    // (2026-10-04) so that the stream's first 3-byte draw is t. The first
+    // support position must then come from the SECOND draw.
+    const p = params.hqc128;
+    var seed: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, seed[0..8], 7444866, .little);
+    var probe = Xof.init(&seed);
+    var head: [6]u8 = undefined;
+    probe.getBytes(&head);
+    const draw = struct {
+        fn f(b: []const u8) u32 {
+            return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | b[2];
+        }
+    }.f;
+    try std.testing.expectEqual(p.rejectionThreshold(), draw(head[0..3]));
+    const second = draw(head[3..6]);
+    try std.testing.expect(second < p.rejectionThreshold());
+
+    var xof = Xof.init(&seed);
+    var support: [p.omega]u32 = undefined;
+    sampleFixedWeightRejection(&xof, p.n, p.nMu(), p.rejectionThreshold(), p.omega, &support);
+    try std.testing.expectEqual(second % p.n, support[0]);
+}
+
 test "sampleFixedWeightBiased: exact weight, no duplicates, in range" {
     const t = std.testing;
     const P = params.hqc128;

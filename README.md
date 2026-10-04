@@ -551,7 +551,7 @@ way to recognise it.
 | [`groth16`](modules/groth16/README.md) | 3 | Groth16 zk-SNARK **prover** over BN254 — proves from snarkjs `.zkey` + circom `.wtns` (snarkjs accepts the proofs); phase-2 setup, contribution and key verification over a `.ptau`. `setup` is a toy, **insecure** trusted setup for tests. | any | bn254 |
 | [`hashdigest`](modules/hashdigest/README.md) | 2 | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | — |
 | [`hpke`](modules/hpke/README.md) | 2 | HPKE — Hybrid Public Key Encryption (RFC 9180): DHKEM(X25519/P-256) encap/decap, all four key-schedule modes, AEAD seal/open + export. | any | p256, chachapoly, entropy |
-| [`hqc`](modules/hqc/README.md) | 2 | HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt. | any | — |
+| [`hqc`](modules/hqc/README.md) | 1 | HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt. | any | — |
 | [`ibe`](modules/ibe/README.md) | 2 | Standalone Boneh-Franklin Identity-Based Encryption over `bls12_381` — a self-run PKG extracts per-identity keys. Not post-quantum; key escrow is inherent. | any | bls12_381, entropy |
 | [`k256`](modules/k256/README.md) | 2 | asm-accelerated secp256k1 — Solinas field + GLV verify, bit-exact vs `std.crypto.ecc.Secp256k1`/BIP340. GLV is vartime/public-only, not for secrets. | amd64 asm + portable fallback | — |
 | [`lms`](modules/lms/README.md) | 2 | LMS / HSS (RFC 8554), SHA-256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first. | any | — |
