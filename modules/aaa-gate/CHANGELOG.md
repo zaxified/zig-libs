@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (43 mutants, 42 killed, 1 equivalent).
+  Four new tests: an `api_key_verify` callback alone keeps the api-key plane closed, the
+  denied-audit fold count resets after each admitted entry, `Bearer` followed only by
+  blanks presents no token, and `.either` with only a bearer token configured stays
+  closed under `allow_when_unconfigured`. No behaviour change.
 - **2026-09-17** — ⚠ **BREAKING (`KeyFn`):** `keyFor` takes a third parameter,
   `*[client_key_len_max]u8` of caller-owned scratch, and `formatPeerKey` is
   public.

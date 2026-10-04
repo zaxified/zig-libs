@@ -2903,3 +2903,67 @@ test "clientKeyFrom: XFF rightmost, then X-Real-IP, then peer, then fallback; cl
     const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 9 }, .port = 4433 } };
     try testing.expectEqualStrings("192.0.2.9", clientKeyFrom(null, null, peer, &buf));
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "verifyApiKey: a key verifier alone closes the api-key open plane" {
+    // `verifyApiKey` doc: `.ok_open` only "with no key set and no callback"
+    // — the callback IS the configuration (mirror of the bearer test above).
+    const want: []const u8 = "from-the-store";
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .allow_when_unconfigured = true,
+        .api_key_verify = dynVerify,
+        .api_key_verify_ctx = @ptrCast(@constCast(&want)),
+    });
+    defer g.deinit();
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey("wrong"));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyApiKey(null));
+    try testing.expectEqual(Gate.Verdict.ok_api_key, g.verifyApiKey("from-the-store"));
+}
+
+test "throttle: an admitted entry resets the suppressed count — the next window folds only its own" {
+    // `deniedDecision`: an admitted entry carries "the number of previously
+    // suppressed denials". After window 1's fold of 2, window 2 saw exactly
+    // one suppressed denial, so its admission must fold 1, not 3.
+    var tc: TestClock = .{};
+    var g = try Gate.init(testing.allocator, .{ .token = "t", .throttle_window_ms = 1_000, .clock = tc.clock() });
+    defer g.deinit();
+    tc.ns = 1000;
+    try testing.expectEqual(@as(?u64, 0), g.deniedDecision("k"));
+    try testing.expectEqual(@as(?u64, null), g.deniedDecision("k"));
+    try testing.expectEqual(@as(?u64, null), g.deniedDecision("k"));
+    tc.advanceMs(1_000);
+    try testing.expectEqual(@as(?u64, 2), g.deniedDecision("k"));
+    try testing.expectEqual(@as(?u64, null), g.deniedDecision("k"));
+    tc.advanceMs(1_000);
+    try testing.expectEqual(@as(?u64, 1), g.deniedDecision("k"));
+}
+
+test "bearerTokenOf: a scheme with only whitespace after it carries no token" {
+    // RFC 6750 §2.1: `credentials = "Bearer" 1*SP b64token`, and b64token is
+    // one or more characters — `Bearer` followed by blanks presents nothing.
+    try testing.expectEqual(@as(?[]const u8, null), bearerTokenOf("Bearer    "));
+    try testing.expectEqual(@as(?[]const u8, null), bearerTokenOf("Bearer \t "));
+    try testing.expectEqualStrings("x", bearerTokenOf("Bearer  x ").?);
+}
+
+test "middleware either: one configured scheme keeps the plane closed even with allow_when_unconfigured" {
+    // `authorize` doc: in `.either` "the plane is open only when no
+    // credential is configured for the active mode(s)" — a configured bearer
+    // token must not be bypassed because the api-key side is unconfigured.
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .either,
+        .token = "b3arer",
+        .allow_when_unconfigured = true,
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hHello);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", ""), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "X-Api-Key: anything\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "200");
+}

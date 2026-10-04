@@ -6,7 +6,7 @@
 
 **Scope:** core — labstack/echo `KeyAuth` middleware, v5.4.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -113,6 +113,22 @@ unchanged, `exempt` routes admitted without identity or audit, audit-entry field
 and a
 loopback integration (`router`+`http.Server`+`http.Client`), skipping only when loopback binding is
 unavailable.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 43
+mutants — both verifiers' open-plane rule, fail-open, static-set match and callback,
+`containsFp`'s accumulation, both removals, `addToken`'s idempotence and `init`'s dedupe,
+`secretEqual`, the throttle (window boundary, suppressed count, its reset, `last_ns`, the
+sweep's two conditions, the key cap), `isMutating`, `bearerTokenOf` (scheme case, separator,
+trim, empty token), `apiKeyPresented` (empty header, query fallback, empty query),
+`queryValue`'s exact name, the XFF rightmost-element rule and empty element, the
+`X-Real-IP` fallback, `clampKey`, IPv4-mapped unification, `.either`'s open rule and
+precedence, exemption, the deny short-circuit, read/write audit split, the 500-on-error
+status and the denied-audit coalescing. First run: 39 killed, 4 alive; four tests added
+(an api-key verifier alone closes the plane; an admitted entry resets the fold count;
+`Bearer` + blanks carries no token, RFC 6750 §2.1; `.either` with one configured scheme
+stays closed under `allow_when_unconfigured`); rerun: 42 killed, 1 equivalent —
+`bearerTokenOf`'s empty-token check (the whole value is trimmed first, so text after
+`Bearer ` can never trim to empty). No defect found.
 
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass, paired with `jwt`): const-time compare,
