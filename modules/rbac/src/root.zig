@@ -1713,3 +1713,75 @@ test "Decision.isPermit collapses non-permit results" {
     try testing.expect((Decision{ .result = .permit, .reason = "x" }).isPermit());
     try testing.expect(!(Decision{ .result = .deny, .reason = "x" }).isPermit());
 }
+
+// -- mutation-run additions (2026-10-04) --------------------------------------
+
+test "abac: eq/ne across kinds is TypeMismatch, never a silent true/false" {
+    // Documented: equality is type-checked ("comparing a string to an int is
+    // error.TypeMismatch, never a silent false"). `ne` is the dangerous one:
+    // a silent `eq = false` would turn `ne` into `true`, i.e. grant.
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "name", abac.str("alice"));
+    try attrs.put(testing.allocator, .subject, "age", abac.int(30));
+    const name = abac.attr(.subject, "name");
+    try testing.expectError(error.TypeMismatch, abac.evalCondition(abac.eq(name, abac.lit(abac.int(1))), &attrs, abac.default_max_depth));
+    try testing.expectError(error.TypeMismatch, abac.evalCondition(abac.ne(name, abac.lit(abac.int(1))), &attrs, abac.default_max_depth));
+    try testing.expectError(error.TypeMismatch, abac.evalCondition(abac.ne(name, abac.lit(abac.boolean(true))), &attrs, abac.default_max_depth));
+    try testing.expectError(error.TypeMismatch, abac.evalCondition(abac.eq(abac.attr(.subject, "age"), abac.lit(abac.str("30"))), &attrs, abac.default_max_depth));
+}
+
+test "abac: in — a differently-typed list element never matches; a non-list RHS is TypeMismatch" {
+    // Fail closed: membership must not be granted through an element of the
+    // wrong kind (a string "1" is not the int 1). Documented: `in` requires
+    // its RHS to resolve to a `.list` (otherwise TypeMismatch).
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "role", abac.str("admin"));
+    const role = abac.attr(.subject, "role");
+    const mixed = [_]abac.Value{ abac.int(1), abac.boolean(true), abac.str("guest") };
+    try testing.expect(!(try abac.evalCondition(abac.inList(role, abac.lit(abac.list(&mixed))), &attrs, abac.default_max_depth)));
+    const mixed_hit = [_]abac.Value{ abac.int(1), abac.str("admin") };
+    try testing.expect(try abac.evalCondition(abac.inList(role, abac.lit(abac.list(&mixed_hit))), &attrs, abac.default_max_depth));
+    try testing.expectError(error.TypeMismatch, abac.evalCondition(abac.inList(role, abac.lit(abac.str("admin"))), &attrs, abac.default_max_depth));
+}
+
+test "abac: depth bound is inclusive — a chain exactly max_depth deep evaluates, one more is rejected" {
+    // Documented: recursion is allowed "up to Policy.max_depth" and fails
+    // "past it". The root is depth 0, so a leaf under `max_depth` nested
+    // `not`s sits at depth == max_depth (allowed); one more `not` puts it at
+    // max_depth + 1.
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "flag", abac.boolean(true));
+    const limit = abac.default_max_depth;
+    var nodes: [limit + 2]abac.Condition = undefined;
+    nodes[0] = abac.eq(abac.attr(.subject, "flag"), abac.lit(abac.boolean(true)));
+    var i: usize = 1;
+    while (i < nodes.len) : (i += 1) nodes[i] = abac.not(&nodes[i - 1]);
+    // nodes[limit] = `limit` nots over the leaf (an even count -> true).
+    try testing.expect(try abac.evalCondition(nodes[limit], &attrs, limit));
+    try testing.expectError(error.MaxDepthExceeded, abac.evalCondition(nodes[limit + 1], &attrs, limit));
+    // The same boundary on a tiny bound: one `not` over a leaf needs max_depth >= 1.
+    try testing.expect(!(try abac.evalCondition(nodes[1], &attrs, 1)));
+    try testing.expectError(error.MaxDepthExceeded, abac.evalCondition(nodes[1], &attrs, 0));
+}
+
+test "abac: deny-overrides — an Indeterminate rule beats a firing Permit (fail closed)" {
+    // XACML deny-overrides: a rule that could not be evaluated might have
+    // been a Deny, so a Permit elsewhere must not win. Result Indeterminate,
+    // which `evaluate` collapses to Deny. (No Deny rule fires here.)
+    var attrs: abac.Attributes = .{};
+    defer attrs.deinit(testing.allocator);
+    try attrs.put(testing.allocator, .subject, "role", abac.str("staff"));
+    const rules = [_]abac.Rule{
+        .{ .id = "staff-permit", .effect = .permit, .condition = abac.eq(abac.attr(.subject, "role"), abac.lit(abac.str("staff"))) },
+        .{ .id = "needs-missing", .effect = .deny, .condition = abac.eq(abac.attr(.subject, "absent"), abac.lit(abac.str("x"))) },
+    };
+    const det = abac.evaluateDetailed(.{ .rules = &rules }, &attrs);
+    try testing.expectEqual(abac.RuleOutcome.indeterminate, det.outcome);
+    try testing.expect(!abac.evaluate(.{ .rules = &rules }, &attrs).isPermit());
+    // Sibling: without the unevaluable rule the same Permit wins.
+    const only = [_]abac.Rule{rules[0]};
+    try testing.expect(abac.evaluate(.{ .rules = &only }, &attrs).isPermit());
+}

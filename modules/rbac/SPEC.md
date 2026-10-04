@@ -6,7 +6,7 @@
 
 **Scope:** core — Casbin v3.11.0 (RBAC + ABAC) (surveyed 2026-09-30); raised from mvp 2026-09-30 with revoke/remove
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -222,6 +222,26 @@ Every "should-permit"/"should-match" test above has an adjacent "should-deny"/"s
 sibling built by the minimal change that flips the outcome (a wrong field, a missing edge, an
 unmet boundary, a swapped algorithm) — proving each check actually has discriminating power
 rather than passing by default-deny alone.
+
+## Mutation run 2026-10-04
+
+55 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run), deny paths first: grants
+that would appear where the engine must deny (`check` default-deny in both branches, permission
+match `and` -> `or` / action only / resource only, transitive walk, static-SoD enforcement and its
+order independence, unknown-role rejections, cycle rejection), the revoke/remove family (idempotence,
+returned flags, cascade steps of `removeRole`, empty-user cleanup), and the ABAC evaluator (type-checked
+`eq`/`ne`, `lt`/`le`/`gt`/`ge` boundaries, `in`, and/or/not, depth bound, both combining algorithms,
+the collapse of NotApplicable/Indeterminate to Deny, rule-effect and attribute-category mix-ups).
+First run: 49 killed, 6 survived. Survivors and verdicts:
+
+- Equivalent: `addHierarchy` without the explicit self-edge check (a self-edge is reachable from
+  itself, so the cycle check rejects it with the same `CyclicHierarchy`).
+- Test gaps, now killed: `eq`/`ne` across kinds silently `false` instead of `TypeMismatch` (for `ne`
+  that is a grant), `in` matching through a differently-typed list element, `in` against a non-list,
+  the inclusive depth bound (`depth == max_depth` allowed), and `deny_overrides` returning a
+  Permit although another rule was Indeterminate (the module fails closed: Indeterminate wins).
+
+Tests added: 4 (in `root.zig`, reasons in the comments). No findings. Final: 54 killed, 1 equivalent.
 
 ## Backlog / deferred
 

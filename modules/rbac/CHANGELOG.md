@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (55 mutants, 54 killed, 1 equivalent); 4 tests added
+  (`eq`/`ne` kind mismatch, `in` with mixed-type list and non-list RHS, inclusive depth bound,
+  `deny_overrides` with an Indeterminate rule next to a Permit). No source change.
 - **2026-09-30** — `rbac.Engine` revoke/remove operations: `unassignRole`, `removePermission`,
   `removeHierarchy`, `removeStaticSoD` (return `error{UnknownRole}!bool`, `false` = nothing to
   remove) and `removeRole` (NIST `DeleteRole`: cascades over the role's permissions,
