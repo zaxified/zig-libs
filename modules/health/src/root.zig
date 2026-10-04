@@ -333,6 +333,73 @@ fn flagCheck(_: ?*anyopaque) bool {
     return ready_flag;
 }
 
+fn alwaysDown(_: ?*anyopaque) bool {
+    return false;
+}
+
+/// `runWire` with room for a body past 512 bytes, so a full detail body
+/// arrives in one piece.
+fn runWireWide(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [2048]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = r.handler(),
+        .context = r,
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "readiness detail: lines that exactly fill the budget are all kept; one more adds the marker" {
+    // `detail_buf_len` (512) bounds the "not ready: <name>" lines; past it
+    // the body is "truncated with a marker rather than growing". A line is
+    // 11 + name + 1 bytes: names of 200 and 288 give 212 + 300 = 512, the
+    // exact budget -- both listed, no marker. A third failing check does not
+    // fit and is replaced by `not ready: ...`. And a 503 is `no-store` like
+    // the 200 (a cached "not ready" would outlive the outage). Mutation
+    // 2026-10-04: an off-by-one budget, a dropped marker and a dropped
+    // Cache-Control on /readyz all survived.
+    const n200 = "a" ** 200;
+    const n288 = "b" ** 288;
+    var exact = [_]Check{
+        .{ .name = n200, .checkFn = alwaysDown },
+        .{ .name = n288, .checkFn = alwaysDown },
+    };
+    var over = [_]Check{
+        .{ .name = n200, .checkFn = alwaysDown },
+        .{ .name = n288, .checkFn = alwaysDown },
+        .{ .name = "c", .checkFn = alwaysDown },
+    };
+    var buf: [4096]u8 = undefined;
+    {
+        var h = Health{ .checks = &exact };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(h.middleware());
+        const got = runWireWide(&r, wire("/readyz"), &buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 503"));
+        try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+        try testing.expectEqualStrings("not ready: " ++ n200 ++ "\nnot ready: " ++ n288 ++ "\n", bodyOf(got));
+    }
+    {
+        var h = Health{ .checks = &over };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(h.middleware());
+        const got = runWireWide(&r, wire("/readyz"), &buf);
+        try testing.expectEqualStrings("not ready: " ++ n200 ++ "\nnot ready: " ++ n288 ++ "\nnot ready: ...\n", bodyOf(got));
+    }
+}
+
 test "liveness: always 200, on the configured path only" {
     var h = Health{};
     var r = router.Router.init(testing.allocator);

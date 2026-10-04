@@ -6,7 +6,7 @@
 
 **Scope:** core — alexliesenfeld/health v0.8.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -57,6 +57,15 @@ Offline tests through `http.Server.serveStream`: liveness always-200 + pass-thro
 paths, readiness 200/503 with the failing-check listing, the empty-checks default (no checks
 registered → always ready), custom probe paths. Green in Debug + ReleaseFast. Run: `zig build
 test-health`.
+
+**Audit 2026-10-04 (mutation).** 12 schemata mutants over the probe methods and paths,
+`probeFor`, the readiness checks, the 503 detail body (budget edge, truncation marker, line
+ends, `detail = false`), the status and `Cache-Control: no-store` on both probes: 11 killed,
+1 equivalent, 0 left alive. Equivalent: collecting failing names while `detail` is off -- the
+`!detail` branch writes `not ready` and never the collected bytes. The survivors that were
+real gaps got one test: two names that fill the 512-byte detail budget exactly are both
+listed with no marker, a third failing check adds `not ready: ...`, and the 503 carries
+`Cache-Control: no-store`.
 
 ## Backlog / deferred
 None beyond its place in the "prod-API hardening + nice-to-have cluster"
