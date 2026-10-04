@@ -51,9 +51,13 @@
 //!   (repeated greylistings escalate to a permanent ban).
 //!
 //! Keying: the socket peer IP — the real client in a direct-internet
-//! deployment. IPs are keyed in their 16-byte mapped form (`netaddr.Ip`'s
-//! `as16`), which makes an IPv4-mapped IPv6 peer and its plain IPv4 form
-//! one entry — one client, one budget (the `unmap` unification). The
+//! deployment. IPs are unmapped (an IPv4-mapped IPv6 peer and its plain
+//! IPv4 form are one client, one budget), then masked to
+//! `Options.ipv6_key_bits` (default /64: one subscriber, RFC 6177) /
+//! `ipv4_key_bits` and keyed in the 16-byte `as16` form; all per-key state
+//! lives on that key. `Options.allow` exempts addresses from reputation
+//! (fail2ban `ignoreip`), `banPrefix` bans ranges, and `snapshot` /
+//! `restore` (+ a text codec) carry bans across a restart. The
 //! middleware can optionally key on the `ratelimit` trusted-XFF chain for
 //! behind-proxy deployments (`Options.middleware_key`).
 //!
@@ -197,8 +201,36 @@ pub const Options = struct {
     /// per-IP cap, ban or greylist applies to it, but it counts in
     /// `total_conns` and `max_conns_total` still refuses it. Pick it when
     /// the lockout is worse than an uncapped address — and then set
-    /// `max_conns_total`, the one bound left on those connections.
+    /// `max_conns_total`, the one bound left on those connections. `init`
+    /// does not insist on it: a consumer may knowingly run without a global
+    /// cap (qap's default does, and documents it), so that check belongs to
+    /// the consumer's configuration validation.
     on_store_full: StoreFull = .reject,
+    /// Addresses exempt from every reputation verdict (fail2ban `ignoreip`):
+    /// a health checker, an office range, a peer proxy. A member is never
+    /// answered `.banned` / `.greylisted` (by an entry or by `banPrefix`),
+    /// `record` and the middleware's auto-strike are no-ops for it and
+    /// create no entry. Resource caps still apply (`max_conns_per_ip`,
+    /// `max_conns_total`, `store_full`) -- a cap is not reputation. Matched
+    /// against the peer after `Ip.unmap`, so a v4 prefix covers both a plain
+    /// v4 peer and its v4-mapped v6 form. A manual `ban` / `greylist` of a
+    /// member is still stored (and snapshotted) but `admit` ignores it while
+    /// the address stays allowlisted. Linear scan; the slice is borrowed and
+    /// must outlive the Guard.
+    allow: []const netaddr.Prefix = &.{},
+    /// Width of the IPv6 reputation key, in bits (1..128). Every per-key
+    /// state -- live-connection count, strikes, ban, greylist, offenses --
+    /// belongs to the peer address masked to this width, so an attacker
+    /// rotating addresses inside one /64 (one subscriber, RFC 6177) shares
+    /// one budget. 128 = per single address (the pre-2026-10-04 behaviour).
+    ipv6_key_bits: u8 = 64,
+    /// Width of the IPv4 reputation key, in bits (1..32); see
+    /// `ipv6_key_bits`. IPv4-mapped IPv6 peers are unmapped first and use
+    /// this one.
+    ipv4_key_bits: u8 = 32,
+    /// At most this many `banPrefix` ranges (a linear scan per admission, so
+    /// keep it small). Beyond it `banPrefix` fails with `TooManyPrefixBans`.
+    max_prefix_bans: usize = 256,
     /// Time source — inject a fake for deterministic tests. The store never
     /// reads a wall clock on its own.
     clock: Clock = .monotonic,
@@ -225,7 +257,8 @@ pub const AdmitVerdict = enum {
     /// Connection admitted; the per-IP and total counters were incremented.
     /// Pair with exactly one `connClosed` when the connection ends.
     admitted,
-    /// The IP is banned (manual `ban` or offense escalation).
+    /// The IP is banned (manual `ban`, offense escalation or a `banPrefix`
+    /// range).
     banned,
     /// The IP is greylisted and the TTL has not expired yet.
     greylisted,
@@ -250,8 +283,10 @@ pub const Guard = struct {
     gpa: Allocator,
     options: Options,
     lock: std.atomic.Mutex = .unlocked,
-    /// Keyed by the IP's 16-byte mapped form (`netaddr.Ip.as16`), which
-    /// unifies IPv4 with IPv4-mapped IPv6 — one client, one entry.
+    /// Keyed by the unmapped IP masked to the key width (`keyOf`) in its
+    /// 16-byte mapped form (`netaddr.Ip.as16`), which unifies IPv4 with
+    /// IPv4-mapped IPv6 and a v6 /64 with its subscriber — one client, one
+    /// entry.
     map: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     /// Front = most recently touched; eviction scans from the back.
     lru: std.DoublyLinkedList = .{},
@@ -260,6 +295,9 @@ pub const Guard = struct {
     total_conns: usize = 0,
     /// Live connections admitted with no entry (`.admitted_untracked`).
     untracked_conns: usize = 0,
+    /// `banPrefix` ranges: canonical (`masked`, unmapped), unique, at most
+    /// `Options.max_prefix_bans`.
+    prefix_bans: std.ArrayList(netaddr.Prefix) = .empty,
 
     const Key = [16]u8;
 
@@ -285,6 +323,8 @@ pub const Guard = struct {
         std.debug.assert(options.greylist_ttl_ms >= 1);
         if (options.max_conns_per_ip) |m| std.debug.assert(m >= 1);
         if (options.max_conns_total) |m| std.debug.assert(m >= 1);
+        std.debug.assert(options.ipv6_key_bits >= 1 and options.ipv6_key_bits <= 128);
+        std.debug.assert(options.ipv4_key_bits >= 1 and options.ipv4_key_bits <= 32);
         return .{ .gpa = gpa, .options = options };
     }
 
@@ -292,6 +332,7 @@ pub const Guard = struct {
         var it = g.map.valueIterator();
         while (it.next()) |e| g.gpa.destroy(e.*);
         g.map.deinit(g.gpa);
+        g.prefix_bans.deinit(g.gpa);
         g.* = undefined;
     }
 
@@ -323,7 +364,8 @@ pub const Guard = struct {
     // ── the admission engine (direct drive; no HTTP types) ──────────────
 
     /// Decide one incoming connection from `ip` at the injected clock's
-    /// now: reject when banned / greylisted / over the per-IP cap / over
+    /// now: reject when banned (entry or `banPrefix` range) / greylisted /
+    /// over the per-key cap / over
     /// the global cap / untrackable (unless `on_store_full` admits it
     /// untracked) — otherwise count it and admit. Thread-safe. Every
     /// `.admitted` must be paired with one `connClosed`, every
@@ -337,7 +379,12 @@ pub const Guard = struct {
         if (g.options.max_conns_total) |max| {
             if (g.total_conns >= max) return .total_cap;
         }
-        const e = g.getOrCreate(ip.as16(), now_ns) orelse switch (g.options.on_store_full) {
+        const allowed = g.isAllowed(ip);
+        // A banned range is refused before any entry is looked up or made, so
+        // a rejected peer neither churns the LRU nor, when the store is full,
+        // slips in through `.admit_untracked`.
+        if (!allowed and g.inPrefixBan(ip)) return .banned;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse switch (g.options.on_store_full) {
             .reject => return .store_full,
             .admit_untracked => {
                 g.untracked_conns += 1;
@@ -345,9 +392,11 @@ pub const Guard = struct {
                 return .admitted_untracked;
             },
         };
-        if (e.banned) return .banned;
-        if (now_ns < e.greylisted_until_ns) return .greylisted;
-        e.greylisted_until_ns = 0; // lazy expiry
+        if (!allowed) {
+            if (e.banned) return .banned;
+            if (now_ns < e.greylisted_until_ns) return .greylisted;
+            e.greylisted_until_ns = 0; // lazy expiry
+        }
         if (g.options.max_conns_per_ip) |max| {
             if (e.active_conns >= max) return .per_ip_cap;
         }
@@ -369,7 +418,7 @@ pub const Guard = struct {
     pub fn connClosed(g: *Guard, ip: netaddr.Ip) void {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        if (g.map.get(ip.as16())) |e| if (e.active_conns != 0) {
+        if (g.map.get(g.keyOf(ip))) |e| if (e.active_conns != 0) {
             e.active_conns -= 1;
             g.total_conns -|= 1;
             return;
@@ -404,7 +453,7 @@ pub const Guard = struct {
     pub fn reconcile(g: *Guard, ip: netaddr.Ip, live: u32) void {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return;
+        const e = g.map.get(g.keyOf(ip)) orelse return;
         if (live < e.active_conns) {
             g.total_conns -|= e.active_conns - live;
         } else {
@@ -420,7 +469,9 @@ pub const Guard = struct {
     /// decay per `strike_decay_ms`; when the decayed balance reaches
     /// `ban_threshold` it resets, the offense count rises and the IP is
     /// greylisted for `greylist_ttl_ms` — or banned outright once
-    /// `ban_after_offenses` is reached. `weight` 0 is a no-op. Best-effort
+    /// `ban_after_offenses` is reached. `weight` 0 is a no-op, and so is any
+    /// weight for an `Options.allow` member. Strikes are per key
+    /// (`Options.ipv6_key_bits`). Best-effort
     /// under memory pressure: when the IP cannot be tracked (store full of
     /// live connections / OOM) the strike is dropped. Thread-safe.
     pub fn record(g: *Guard, ip: netaddr.Ip, weight: u32) void {
@@ -428,7 +479,8 @@ pub const Guard = struct {
         const now_ns = g.options.clock.now();
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.getOrCreate(ip.as16(), now_ns) orelse return;
+        if (g.isAllowed(ip)) return;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
         const drained = g.drainedSince(e, now_ns);
         e.strikes = @max(0, e.strikes - @as(f64, @floatFromInt(drained))) +
             @as(f64, @floatFromInt(weight));
@@ -467,7 +519,7 @@ pub const Guard = struct {
         const now_ns = g.options.clock.now();
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.getOrCreate(ip.as16(), now_ns) orelse return;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
         e.banned = true;
     }
 
@@ -476,7 +528,7 @@ pub const Guard = struct {
     pub fn unban(g: *Guard, ip: netaddr.Ip) void {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return;
+        const e = g.map.get(g.keyOf(ip)) orelse return;
         e.banned = false;
         e.greylisted_until_ns = 0;
         e.strikes = 0;
@@ -491,15 +543,18 @@ pub const Guard = struct {
         const now_ns = g.options.clock.now();
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.getOrCreate(ip.as16(), now_ns) orelse return;
+        const e = g.getOrCreate(g.keyOf(ip), now_ns) orelse return;
         e.greylisted_until_ns = now_ns +| ((ttl_ms orelse g.options.greylist_ttl_ms) *| std.time.ns_per_ms);
     }
 
-    /// Whether `ip` is currently banned. Thread-safe.
+    /// Whether `ip` is currently banned: its key's ban or a `banPrefix`
+    /// range. Reports the stored state -- an allowlisted address can read
+    /// true here and still be admitted. Thread-safe.
     pub fn isBanned(g: *Guard, ip: netaddr.Ip) bool {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return false;
+        if (g.inPrefixBan(ip)) return true;
+        const e = g.map.get(g.keyOf(ip)) orelse return false;
         return e.banned;
     }
 
@@ -508,8 +563,120 @@ pub const Guard = struct {
         const now_ns = g.options.clock.now();
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return false;
+        const e = g.map.get(g.keyOf(ip)) orelse return false;
         return now_ns < e.greylisted_until_ns;
+    }
+
+    // ── range bans, persistence ─────────────────────────────────────────
+
+    /// Ban every address in `p` (permanent until `unbanPrefix`; new
+    /// admissions only). Stored canonical and unmapped (`p.masked()`, a
+    /// v4-mapped v6 prefix of /96 or longer becomes the v4 prefix); an equal
+    /// prefix already banned is a no-op. Independent of the key width: a
+    /// /48 ban covers every /64 inside it. `TooManyPrefixBans` at
+    /// `Options.max_prefix_bans`. Thread-safe.
+    pub fn banPrefix(g: *Guard, p: netaddr.Prefix) error{ OutOfMemory, TooManyPrefixBans }!void {
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        return g.banPrefixLocked(canonicalPrefix(p));
+    }
+
+    fn banPrefixLocked(g: *Guard, c: netaddr.Prefix) error{ OutOfMemory, TooManyPrefixBans }!void {
+        for (g.prefix_bans.items) |q| if (q.eql(c)) return;
+        if (g.prefix_bans.items.len >= g.options.max_prefix_bans) return error.TooManyPrefixBans;
+        try g.prefix_bans.append(g.gpa, c);
+    }
+
+    /// Lift a `banPrefix` ban of exactly `p` (after the same canonicalising).
+    /// True when one was removed. Does not touch per-key bans. Thread-safe.
+    pub fn unbanPrefix(g: *Guard, p: netaddr.Prefix) bool {
+        const c = canonicalPrefix(p);
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        for (g.prefix_bans.items, 0..) |q, i| {
+            if (q.eql(c)) {
+                _ = g.prefix_bans.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The reputation worth keeping across a restart (fail2ban's ban DB):
+    /// every banned key (as a prefix of the key width), every `banPrefix`
+    /// range (marked `.range`, so it comes back as a range even when it is
+    /// exactly key width), every live greylist with its remaining time rounded UP (a
+    /// restored greylist is never shorter). Strikes and offense counts are
+    /// NOT included. Caller owns the slice (`gpa.free`); feed it to
+    /// `writeSnapshot` / `restore`. Thread-safe.
+    pub fn snapshot(g: *Guard, gpa: Allocator) error{OutOfMemory}![]BanRecord {
+        const now_ns = g.options.clock.now();
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        var out: std.ArrayList(BanRecord) = .empty;
+        errdefer out.deinit(gpa);
+        for (g.prefix_bans.items) |p| try out.append(gpa, .{ .prefix = p, .range = true });
+        var it = g.lru.first;
+        while (it) |n| : (it = n.next) {
+            const e: *const Entry = @fieldParentPtr("node", n);
+            const prefix = g.prefixOfKey(e.key);
+            if (e.banned) try out.append(gpa, .{ .prefix = prefix });
+            if (now_ns < e.greylisted_until_ns) {
+                const remaining_ns = e.greylisted_until_ns - now_ns;
+                const ms = remaining_ns / std.time.ns_per_ms +
+                    @intFromBool(remaining_ns % std.time.ns_per_ms != 0);
+                try out.append(gpa, .{ .prefix = prefix, .greylist_remaining_ms = ms });
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Load records produced by `snapshot` / `parseSnapshotLine` into this
+    /// Guard (normally a fresh one):
+    ///  - a `.range` record goes to `banPrefix`, whatever its length — an
+    ///    operator's range ban stays a range (never evicted, `unbanPrefix`
+    ///    finds it);
+    ///  - a plain ban of exactly the key width of its family becomes that
+    ///    key's ban (evictable as a last resort, like any auto-ban); of any
+    ///    other length — e.g. written under another key width — it goes to
+    ///    `banPrefix`, which keeps it exact;
+    ///  - a greylist (now + remaining) lands on the key that covers its
+    ///    prefix when the prefix is at least key width (a /128 greylist
+    ///    restored under /64 keys greylists the /64), and is SKIPPED when the
+    ///    prefix is wider than a key — a greylist cannot cover a range, and
+    ///    it would expire anyway.
+    /// `InvalidRecord` only for a malformed record (a prefix longer than its
+    /// family, `.range` together with a greylist). All records are validated
+    /// before the first is applied; `TooManyPrefixBans` / `StoreFull` /
+    /// `OutOfMemory` can still leave a prefix of the list applied, and
+    /// restoring more key records than `max_tracked_ips` evicts earlier ones
+    /// (the store's ordinary bound). Thread-safe; holds the guard's lock for
+    /// the whole list, so admissions wait while it runs.
+    pub fn restore(g: *Guard, records: []const BanRecord) error{ OutOfMemory, TooManyPrefixBans, StoreFull, InvalidRecord }!void {
+        const now_ns = g.options.clock.now();
+        lockSpin(&g.lock);
+        defer g.lock.unlock();
+        for (records) |r| {
+            if (r.prefix.bits > r.prefix.width()) return error.InvalidRecord;
+            if (r.range and r.greylist_remaining_ms != null) return error.InvalidRecord;
+        }
+        for (records) |r| {
+            const c = canonicalPrefix(r.prefix);
+            const key_bits = g.keyBits(c.addr);
+            if (r.greylist_remaining_ms) |ms| {
+                if (c.bits < key_bits) continue;
+                const e = g.getOrCreate(g.keyOf(c.addr), now_ns) orelse return error.StoreFull;
+                const until = now_ns +| (ms *| std.time.ns_per_ms);
+                e.greylisted_until_ns = @max(e.greylisted_until_ns, until);
+                continue;
+            }
+            if (r.range or c.bits != key_bits) {
+                try g.banPrefixLocked(c);
+                continue;
+            }
+            const e = g.getOrCreate(g.keyOf(c.addr), now_ns) orelse return error.StoreFull;
+            e.banned = true;
+        }
     }
 
     // ── diagnostics ─────────────────────────────────────────────────────
@@ -518,7 +685,7 @@ pub const Guard = struct {
     pub fn connCount(g: *Guard, ip: netaddr.Ip) u32 {
         lockSpin(&g.lock);
         defer g.lock.unlock();
-        const e = g.map.get(ip.as16()) orelse return 0;
+        const e = g.map.get(g.keyOf(ip)) orelse return 0;
         return e.active_conns;
     }
 
@@ -563,6 +730,44 @@ pub const Guard = struct {
     }
 
     // ── store internals (all callers hold the lock) ─────────────────────
+
+    /// Key width in bits for the family of `ip` (after unmapping).
+    fn keyBits(g: *const Guard, ip: netaddr.Ip) u8 {
+        return switch (ip.unmap()) {
+            .v4 => g.options.ipv4_key_bits,
+            .v6 => g.options.ipv6_key_bits,
+        };
+    }
+
+    /// The store key of `ip`: unmapped, masked to the key width, 16 bytes.
+    fn keyOf(g: *const Guard, ip: netaddr.Ip) Key {
+        const u = ip.unmap();
+        return (netaddr.Prefix{ .addr = u, .bits = g.keyBits(u) }).masked().addr.as16();
+    }
+
+    /// Inverse of `keyOf`: the prefix a key stands for. A key in the
+    /// v4-mapped range can only come from an IPv4 address (a native v6
+    /// address in that range is unmapped before masking).
+    fn prefixOfKey(g: *const Guard, key: Key) netaddr.Prefix {
+        const v6: netaddr.Ip = .{ .v6 = key };
+        if (v6.isIpv4Mapped()) return .{ .addr = v6.unmap(), .bits = g.options.ipv4_key_bits };
+        return .{ .addr = v6, .bits = g.options.ipv6_key_bits };
+    }
+
+    fn isAllowed(g: *const Guard, ip: netaddr.Ip) bool {
+        const u = ip.unmap();
+        // Canonical like a ban prefix, so `::ffff:192.0.2.0/120` covers the
+        // v4 peers it names (a raw v4-mapped prefix never matches an
+        // unmapped peer).
+        for (g.options.allow) |p| if (canonicalPrefix(p).contains(u)) return true;
+        return false;
+    }
+
+    fn inPrefixBan(g: *const Guard, ip: netaddr.Ip) bool {
+        const u = ip.unmap();
+        for (g.prefix_bans.items) |p| if (p.contains(u)) return true;
+        return false;
+    }
 
     /// Look up `key`, refreshing its LRU position — or insert a fresh entry,
     /// first sweeping empty entries off the LRU tail and evicting at the
@@ -649,6 +854,68 @@ pub const Guard = struct {
         g.gpa.destroy(e);
     }
 };
+
+/// Canonical form of a ban prefix: host bits zeroed, and a v4-mapped v6
+/// prefix of /96 or longer rewritten as the v4 prefix it denotes (the same
+/// unification the store applies to peers).
+fn canonicalPrefix(p: netaddr.Prefix) netaddr.Prefix {
+    const m = p.masked();
+    if (m.addr == .v6 and m.addr.isIpv4Mapped() and m.bits >= 96)
+        return .{ .addr = m.addr.unmap(), .bits = m.bits - 96 };
+    return m;
+}
+
+// ── persistence records ─────────────────────────────────────────────────────
+
+/// One persisted piece of reputation (`Guard.snapshot` / `Guard.restore`).
+pub const BanRecord = struct {
+    prefix: netaddr.Prefix,
+    /// null = a permanent ban; otherwise a greylist with this many
+    /// milliseconds left.
+    greylist_remaining_ms: ?u64 = null,
+    /// A `banPrefix` range (not a key's own ban): `restore` puts it back
+    /// as a range whatever its length. Never set together with a greylist.
+    range: bool = false,
+};
+
+/// Write `records` as text, one line each: `ban <prefix>`, `range <prefix>`
+/// or `greylist <prefix> <remaining_ms>`. Read back with `parseSnapshotLine`.
+pub fn writeSnapshot(records: []const BanRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var buf: [netaddr.max_prefix_text_len]u8 = undefined;
+    for (records) |r| {
+        const text = netaddr.formatPrefix(r.prefix, &buf);
+        if (r.greylist_remaining_ms) |ms| {
+            try w.print("greylist {s} {d}\n", .{ text, ms });
+        } else if (r.range) {
+            try w.print("range {s}\n", .{text});
+        } else {
+            try w.print("ban {s}\n", .{text});
+        }
+    }
+}
+
+/// Parse one line of `writeSnapshot` output (without its newline). Null for
+/// a blank line or a `#` comment; strict otherwise: an unknown keyword, a
+/// malformed prefix, a missing or non-decimal or overflowing millisecond
+/// count, or any trailing token is `InvalidRecord`.
+pub fn parseSnapshotLine(line: []const u8) error{InvalidRecord}!?BanRecord {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (t.len == 0 or t[0] == '#') return null;
+    var it = std.mem.splitScalar(u8, t, ' ');
+    const word = it.next().?;
+    const prefix = netaddr.parsePrefix(it.next() orelse return error.InvalidRecord) orelse
+        return error.InvalidRecord;
+    if (std.mem.eql(u8, word, "ban") or std.mem.eql(u8, word, "range")) {
+        if (it.next() != null) return error.InvalidRecord;
+        return .{ .prefix = prefix, .range = word[0] == 'r' };
+    }
+    if (!std.mem.eql(u8, word, "greylist")) return error.InvalidRecord;
+    const ms_text = it.next() orelse return error.InvalidRecord;
+    if (it.next() != null or ms_text.len == 0) return error.InvalidRecord;
+    for (ms_text) |c| if (c < '0' or c > '9') return error.InvalidRecord;
+    const ms = std.fmt.parseInt(u64, ms_text, 10) catch return error.InvalidRecord;
+    return .{ .prefix = prefix, .greylist_remaining_ms = ms };
+}
 
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
@@ -1784,4 +2051,509 @@ test "integration: middleware auto-strike on real 404s escalates to accept-time 
     // After the TTL (injected clock) the client is served again.
     tc.advanceMs(60_001);
     try expectServed(io, addr, "200");
+}
+
+// ── tests: allowlist, prefix keying, range bans, persistence ────────────────
+
+fn mkPrefix(text: []const u8) netaddr.Prefix {
+    return netaddr.parsePrefix(text).?;
+}
+
+test "allowlist: exempt from record/ban/greylist/prefix ban, not from the per-key cap" {
+    var tc: TestClock = .{};
+    const allow = [_]netaddr.Prefix{mkPrefix("192.0.2.0/24")};
+    var g = Guard.init(testing.allocator, .{
+        .allow = &allow,
+        .max_conns_per_ip = 1,
+        .ban_threshold = 1,
+        .ban_after_offenses = 1,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const friend = mkIp("192.0.2.77");
+    const stranger = mkIp("198.51.100.1");
+
+    g.record(friend, 100); // no-op: no strikes, no entry
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try testing.expect(!g.isBanned(friend));
+    g.record(stranger, 1);
+    try testing.expect(g.isBanned(stranger)); // the same call does bite elsewhere
+
+    // Manual state is stored but ignored while allowlisted.
+    g.ban(friend);
+    g.greylist(friend, null);
+    try testing.expect(g.isBanned(friend));
+    try g.banPrefix(mkPrefix("192.0.2.0/25"));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(friend));
+    // ... but the resource cap still applies.
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(friend));
+    g.connClosed(friend);
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(stranger));
+
+    // The v4-mapped form of a member is a member.
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("::ffff:192.0.2.77")));
+    g.connClosed(friend);
+}
+
+test "allowlist: the middleware's auto-strike is a no-op for a member" {
+    var tc: TestClock = .{};
+    const allow = [_]netaddr.Prefix{mkPrefix("203.0.113.0/24")};
+    var g = Guard.init(testing.allocator, .{ .allow = &allow, .ban_threshold = 1, .clock = tc.clock() });
+    defer g.deinit();
+    var r = try guardedRouter(&g);
+    defer r.deinit();
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWirePeer(&r, wire("/nope", ""), &buf, mkPeer4("203.0.113.9", 1)), "404");
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try expectStatus(runWirePeer(&r, wire("/nope", ""), &buf, mkPeer4("198.51.100.9", 1)), "404");
+    try testing.expect(g.isGreylisted(mkIp("198.51.100.9")));
+}
+
+test "keying: two IPv6 addresses in one /64 share strikes; 128 bits separates them" {
+    var tc: TestClock = .{};
+    const a = mkIp("2001:db8:1:2::1");
+    const b = mkIp("2001:db8:1:2:ffff::9");
+    const other = mkIp("2001:db8:1:3::1");
+    {
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 2,
+            .ban_after_offenses = 1,
+            .strike_decay_ms = 0,
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        g.record(a, 1);
+        g.record(b, 1); // second strike on the same /64 key
+        try testing.expect(g.isBanned(a));
+        try testing.expect(g.isBanned(b));
+        try testing.expect(!g.isBanned(other)); // the next /64 is another client
+        try testing.expectEqual(AdmitVerdict.banned, g.admit(b));
+        try testing.expectEqual(@as(usize, 1), g.trackedCount());
+        g.unban(b); // any member lifts the whole key
+        try testing.expect(!g.isBanned(a));
+    }
+    {
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 2,
+            .ban_after_offenses = 1,
+            .strike_decay_ms = 0,
+            .ipv6_key_bits = 128,
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        g.record(a, 1);
+        g.record(b, 1);
+        try testing.expect(!g.isBanned(a));
+        try testing.expect(!g.isBanned(b));
+        try testing.expectEqual(@as(usize, 2), g.trackedCount());
+    }
+}
+
+test "keying: the per-key connection cap is per /64 for IPv6, ipv4_key_bits = 24 groups a /24" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_conns_per_ip = 2,
+        .ipv4_key_bits = 24,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("2001:db8::1")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("2001:db8::2")));
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(mkIp("2001:db8::3")));
+    try testing.expectEqual(@as(u32, 2), g.connCount(mkIp("2001:db8::ffff")));
+    g.reconcile(mkIp("2001:db8::9"), 1);
+    try testing.expectEqual(@as(u32, 1), g.connCount(mkIp("2001:db8::1")));
+    g.connClosed(mkIp("2001:db8::5"));
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.1.2.3")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("::ffff:10.1.2.200")));
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(mkIp("10.1.2.99")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.1.3.1"))); // next /24
+    try testing.expectEqual(@as(usize, 2), g.trackedCount());
+    g.ban(mkIp("10.1.2.1"));
+    try testing.expect(g.isBanned(mkIp("10.1.2.250")));
+    try testing.expect(!g.isBanned(mkIp("10.1.3.250")));
+}
+
+test "banPrefix: rejects members, unbanPrefix re-admits, bound, idempotent" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_prefix_bans = 2, .clock = tc.clock() });
+    defer g.deinit();
+    const inside = mkIp("198.51.100.200");
+    const outside = mkIp("198.51.101.1");
+
+    try g.banPrefix(mkPrefix("198.51.100.17/24")); // host bits are masked away
+    try g.banPrefix(mkPrefix("198.51.100.0/24")); // equal prefix: idempotent
+    try testing.expectEqual(@as(usize, 1), g.prefix_bans.items.len);
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(inside));
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("::ffff:198.51.100.5")));
+    try testing.expect(g.isBanned(inside));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(outside));
+    g.connClosed(outside);
+    try testing.expectEqual(@as(usize, 1), g.trackedCount()); // rejecting inserted nothing
+
+    try g.banPrefix(mkPrefix("2001:db8::/32"));
+    try testing.expectError(error.TooManyPrefixBans, g.banPrefix(mkPrefix("10.0.0.0/8")));
+    try g.banPrefix(mkPrefix("2001:db8::/32")); // still idempotent at the bound
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("2001:db8:ffff::1")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("2001:db9::1")));
+    g.connClosed(mkIp("2001:db9::1"));
+
+    try testing.expect(!g.unbanPrefix(mkPrefix("198.51.100.0/25"))); // not an exact match
+    try testing.expect(g.unbanPrefix(mkPrefix("198.51.100.0/24")));
+    try testing.expect(!g.unbanPrefix(mkPrefix("198.51.100.0/24")));
+    try testing.expect(!g.isBanned(inside));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(inside));
+    g.connClosed(inside);
+    try g.banPrefix(mkPrefix("10.0.0.0/8")); // room again
+}
+
+test "banPrefix: a rejected range member does not slip in as untracked when the store is full" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .max_tracked_ips = 1,
+        .max_conns_total = 10,
+        .on_store_full = .admit_untracked,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.0.0.1")));
+    try g.banPrefix(mkPrefix("192.0.2.0/24"));
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("192.0.2.1")));
+    try testing.expectEqual(@as(usize, 0), g.untrackedConns());
+    g.connClosed(mkIp("10.0.0.1"));
+}
+
+test "persist: snapshot -> text -> parse -> restore into a fresh Guard" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    g.ban(mkIp("192.0.2.9"));
+    g.ban(mkIp("2001:db8:aa:bb::1"));
+    try g.banPrefix(mkPrefix("203.0.113.0/24"));
+    try g.banPrefix(mkPrefix("2001:db8:ffff::/48"));
+    g.greylist(mkIp("198.51.100.4"), 90_000);
+    g.greylist(mkIp("198.51.100.5"), 0); // already expired: not a record
+    tc.advanceMs(1500);
+    tc.ns.store(tc.ns.load(.monotonic) + 300_000, .monotonic); // +0.3 ms: remaining 88 499.7 ms rounds up
+    g.record(mkIp("198.51.100.6"), 1); // strikes are not persisted
+
+    const recs = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(recs);
+    try testing.expectEqual(@as(usize, 5), recs.len);
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeSnapshot(recs, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "greylist 198.51.100.4/32 88500\n") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "ban 192.0.2.9/32\n") != null);
+
+    var parsed: std.ArrayList(BanRecord) = .empty;
+    defer parsed.deinit(testing.allocator);
+    var lines = std.mem.splitScalar(u8, aw.written(), '\n');
+    while (lines.next()) |line| {
+        if (try parseSnapshotLine(line)) |r| try parsed.append(testing.allocator, r);
+    }
+    try testing.expectEqual(recs.len, parsed.items.len);
+
+    // The new process: a fresh Guard whose clock starts elsewhere.
+    var tc2: TestClock = .{ .ns = .init(7_000_000_000) };
+    var g2 = Guard.init(testing.allocator, .{ .clock = tc2.clock() });
+    defer g2.deinit();
+    try g2.restore(parsed.items);
+    try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("192.0.2.9")));
+    try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("2001:db8:aa:bb::77"))); // same /64
+    try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("203.0.113.200")));
+    try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("2001:db8:ffff:1::1")));
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(mkIp("198.51.100.5")));
+    g2.connClosed(mkIp("198.51.100.5"));
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(mkIp("198.51.100.6")));
+    g2.connClosed(mkIp("198.51.100.6"));
+
+    // Greylist: 88 500 ms left (rounded up) -- held right up to the instant.
+    const grey = mkIp("198.51.100.4");
+    tc2.advanceMs(88_498);
+    try testing.expectEqual(AdmitVerdict.greylisted, g2.admit(grey));
+    tc2.advanceMs(1);
+    try testing.expectEqual(AdmitVerdict.greylisted, g2.admit(grey)); // 1 ms left
+    tc2.advanceMs(1);
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(grey));
+    g2.connClosed(grey);
+}
+
+test "persist: restore across a key-width change -- greylists land on the covering key or are skipped, bans stay exact (review A2)" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    // Malformed: `.range` together with a greylist. Validation precedes
+    // application: the good record before it is not applied.
+    try testing.expectError(error.InvalidRecord, g.restore(&.{
+        .{ .prefix = mkPrefix("10.0.0.1/32") },
+        .{ .prefix = mkPrefix("10.9.0.0/16"), .range = true, .greylist_remaining_ms = 5 },
+    }));
+    try testing.expect(!g.isBanned(mkIp("10.0.0.1")));
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+
+    // A file written under /128 v6 keys and /24 v4 keys, restored under the
+    // defaults (/64, /32). Before the fix any one of these greylists made the
+    // whole restore fail with InvalidRecord -- every ban in the file lost.
+    try g.restore(&.{
+        .{ .prefix = mkPrefix("2001:db8:0:5::7/128"), .greylist_remaining_ms = 1000 }, // narrower: covering /64
+        .{ .prefix = mkPrefix("2001:db8::/56"), .greylist_remaining_ms = 1000 }, // wider than a key: skipped
+        .{ .prefix = mkPrefix("10.0.0.0/24"), .greylist_remaining_ms = 1000 }, // wider than a key: skipped
+        .{ .prefix = mkPrefix("2001:db8::/56") }, // ban, other width: an exact range
+        .{ .prefix = mkPrefix("::ffff:10.2.0.0/120") }, // mapped form of 10.2.0.0/24
+        .{ .prefix = mkPrefix("10.3.0.4/32") }, // key width: a key ban
+    });
+    try testing.expect(g.isGreylisted(mkIp("2001:db8:0:5::1"))); // same /64 as ::7
+    try testing.expect(!g.isGreylisted(mkIp("10.0.0.1")));
+    try testing.expectEqual(@as(usize, 2), g.prefix_bans.items.len);
+    try testing.expect(g.isBanned(mkIp("2001:db8:0:ff::1")));
+    try testing.expect(!g.isBanned(mkIp("2001:db8:0:100::1")));
+    try testing.expect(g.isBanned(mkIp("10.2.0.77")));
+    try testing.expect(g.isBanned(mkIp("10.3.0.4")));
+    try testing.expectEqual(@as(usize, 2), g.trackedCount()); // the /64 greylist + 10.3.0.4
+}
+
+test "persist: an operator range ban of exactly key width comes back as a range, not an evictable key ban (review A1)" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    try g.banPrefix(mkPrefix("203.0.113.9/32")); // key width for v4
+    const recs = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(recs);
+    try testing.expectEqual(@as(usize, 1), recs.len);
+    try testing.expect(recs[0].range);
+
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writeSnapshot(recs, &w);
+    try testing.expectEqualStrings("range 203.0.113.9/32\n", w.buffered());
+    const back = (try parseSnapshotLine(std.mem.trimEnd(u8, w.buffered(), "\n"))).?;
+    try testing.expect(back.range);
+
+    var g2 = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    defer g2.deinit();
+    try g2.restore(&.{back});
+    try testing.expectEqual(@as(usize, 0), g2.trackedCount()); // not an entry...
+    // ...so a flood of new addresses cannot evict it,
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(mkIp("198.51.100.1")));
+    g2.connClosed(mkIp("198.51.100.1"));
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(mkIp("198.51.100.2")));
+    g2.connClosed(mkIp("198.51.100.2"));
+    try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("203.0.113.9")));
+    // ...and `unbanPrefix` finds it.
+    try testing.expect(g2.unbanPrefix(mkPrefix("203.0.113.9/32")));
+    try testing.expectEqual(AdmitVerdict.admitted, g2.admit(mkIp("203.0.113.9")));
+    g2.connClosed(mkIp("203.0.113.9"));
+}
+
+test "allowlist: a v4-mapped allow prefix covers the v4 peers it names (review A3)" {
+    var tc: TestClock = .{};
+    const allow = [_]netaddr.Prefix{mkPrefix("::ffff:192.0.2.0/120")};
+    var g = Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
+    defer g.deinit();
+    g.ban(mkIp("192.0.2.7"));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("192.0.2.7")));
+    g.connClosed(mkIp("192.0.2.7"));
+    g.ban(mkIp("192.0.3.7"));
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("192.0.3.7")));
+}
+
+test "persist: restore bounds -- store_full and prefix-ban limit" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .max_prefix_bans = 1, .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.0.0.1"))); // pins the only slot
+    try testing.expectError(error.StoreFull, g.restore(&.{.{ .prefix = mkPrefix("10.0.0.2/32") }}));
+    try testing.expectError(error.TooManyPrefixBans, g.restore(&.{
+        .{ .prefix = mkPrefix("10.1.0.0/16") },
+        .{ .prefix = mkPrefix("10.2.0.0/16") },
+    }));
+    g.connClosed(mkIp("10.0.0.1"));
+}
+
+test "persist: parseSnapshotLine accepts blanks and comments, rejects every malformed form" {
+    try testing.expectEqual(@as(?BanRecord, null), try parseSnapshotLine(""));
+    try testing.expectEqual(@as(?BanRecord, null), try parseSnapshotLine("   \r"));
+    try testing.expectEqual(@as(?BanRecord, null), try parseSnapshotLine("# saved 2026-10-04"));
+
+    const ban = (try parseSnapshotLine("ban 192.0.2.0/24")).?;
+    try testing.expect(ban.prefix.eql(mkPrefix("192.0.2.0/24")));
+    try testing.expectEqual(@as(?u64, null), ban.greylist_remaining_ms);
+    try testing.expect(!ban.range);
+    const range = (try parseSnapshotLine("range 192.0.2.0/24")).?;
+    try testing.expect(range.range and range.greylist_remaining_ms == null);
+    const grey = (try parseSnapshotLine("greylist 2001:db8::/64 18446744073709551615")).?;
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), grey.greylist_remaining_ms);
+
+    const bad = [_][]const u8{
+        "ban", // missing prefix
+        "ban 192.0.2.0", // not a prefix
+        "ban 192.0.2.0/33", // bad width
+        "ban 192.0.2.0/24 extra", // trailing junk
+        "ban 192.0.2.0/24 5", // ms on a ban
+        "range 192.0.2.0/24 5", // ms on a range
+        "range", // missing prefix
+        "greylist 192.0.2.1/32", // missing ms
+        "greylist 192.0.2.1/32 ", // empty ms
+        "greylist 192.0.2.1/32 -5",
+        "greylist 192.0.2.1/32 5x",
+        "greylist 192.0.2.1/32 18446744073709551616", // overflow
+        "greylist 192.0.2.1/32 5 6",
+        "unban 192.0.2.1/32",
+        "BAN 192.0.2.1/32",
+        "192.0.2.1/32",
+    };
+    for (bad) |line| try testing.expectError(error.InvalidRecord, parseSnapshotLine(line));
+}
+
+test "init asserts are reachable only by misuse; documented defaults hold" {
+    const o: Options = .{};
+    try testing.expectEqual(@as(u8, 64), o.ipv6_key_bits);
+    try testing.expectEqual(@as(u8, 32), o.ipv4_key_bits);
+    try testing.expectEqual(@as(usize, 256), o.max_prefix_bans);
+    try testing.expectEqual(@as(usize, 0), o.allow.len);
+}
+
+// ── mutation-audit additions (2026-10-04) ───────────────────────────────────
+
+test "persist: snapshot prefixes carry the configured key widths; a greylist ending this instant is not recorded" {
+    // Kills: prefixOfKey using the other family's width (v4 <- ipv6_key_bits,
+    // v6 <- ipv4_key_bits) and the snapshot `now < until` boundary (<=).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .ipv4_key_bits = 24, .ipv6_key_bits = 48, .clock = tc.clock() });
+    defer g.deinit();
+    g.ban(mkIp("10.1.2.3"));
+    g.ban(mkIp("2001:db8:1:2::1"));
+    g.greylist(mkIp("198.51.100.4"), 5);
+    tc.advanceMs(5); // now == greylisted_until: expired, remaining would be 0 ms
+
+    const recs = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(recs);
+    try testing.expectEqual(@as(usize, 2), recs.len);
+    var seen4 = false;
+    var seen6 = false;
+    for (recs) |r| {
+        try testing.expectEqual(@as(?u64, null), r.greylist_remaining_ms);
+        if (r.prefix.eql(mkPrefix("10.1.2.0/24"))) seen4 = true;
+        if (r.prefix.eql(mkPrefix("2001:db8:1::/48"))) seen6 = true;
+    }
+    try testing.expect(seen4 and seen6);
+}
+
+test "persist: restore -- a ban longer than the key width is a range, a later shorter greylist never shortens" {
+    // Kills: `c.bits != keyBits` weakened to `<` (a /128 ban would widen to the
+    // whole /64 key) and `@max(old, until)` replaced by `until`.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    try g.restore(&.{
+        .{ .prefix = mkPrefix("2001:db8::1/128") },
+        .{ .prefix = mkPrefix("10.0.0.1/32"), .greylist_remaining_ms = 9000 },
+        .{ .prefix = mkPrefix("10.0.0.1/32"), .greylist_remaining_ms = 1000 },
+    });
+    try testing.expectEqual(@as(usize, 1), g.prefix_bans.items.len);
+    try testing.expect(g.isBanned(mkIp("2001:db8::1")));
+    try testing.expect(!g.isBanned(mkIp("2001:db8::2"))); // not widened to the /64
+    tc.advanceMs(5000);
+    try testing.expect(g.isGreylisted(mkIp("10.0.0.1"))); // the 9000 ms won
+}
+
+test "banPrefix: ::ffff:0:0/96 is all of IPv4; unbanPrefix canonicalises like banPrefix" {
+    // Kills: canonicalPrefix `bits >= 96` weakened to `> 96`, and unbanPrefix
+    // comparing the raw (host bits set / mapped) prefix.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    try g.banPrefix(mkPrefix("::ffff:0:0/96"));
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("203.0.113.1")));
+    try testing.expect(g.unbanPrefix(mkPrefix("0.0.0.7/0")));
+    try testing.expectEqual(@as(usize, 0), g.prefix_bans.items.len);
+
+    try g.banPrefix(mkPrefix("198.51.100.0/24"));
+    try testing.expect(g.unbanPrefix(mkPrefix("198.51.100.17/24"))); // host bits set
+    try g.banPrefix(mkPrefix("198.51.100.0/24"));
+    try testing.expect(g.unbanPrefix(mkPrefix("::ffff:198.51.100.0/120"))); // mapped form
+    try testing.expectEqual(@as(usize, 0), g.prefix_bans.items.len);
+}
+
+test "persist: parseSnapshotLine rejects a sign, an unknown keyword with a valid tail" {
+    // Kills: the decimal-digit loop dropped (parseInt takes "+5") and the
+    // `greylist` keyword check dropped (any word with a ms count parsed).
+    try testing.expectError(error.InvalidRecord, parseSnapshotLine("greylist 192.0.2.1/32 +5"));
+    try testing.expectError(error.InvalidRecord, parseSnapshotLine("foo 192.0.2.1/32 5"));
+}
+
+test "init asserts: the smallest key widths (1 bit) are accepted and key one half of the space" {
+    // Kills: the lower-bound asserts on ipv4_key_bits / ipv6_key_bits shifted
+    // from `>= 1` to `>= 2`.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .ipv4_key_bits = 1, .ipv6_key_bits = 1, .clock = tc.clock() });
+    defer g.deinit();
+    g.ban(mkIp("10.0.0.1"));
+    try testing.expect(g.isBanned(mkIp("100.0.0.1"))); // same 0.0.0.0/1 half
+    try testing.expect(!g.isBanned(mkIp("200.0.0.1")));
+    g.ban(mkIp("2001:db8::1"));
+    try testing.expect(g.isBanned(mkIp("3fff::1"))); // same 0::/1 half
+    try testing.expect(!g.isBanned(mkIp("fe80::1")));
+}
+
+test "record: the offense that bans also clears the greylist the first offense set" {
+    // Kills: the ban branch no longer zeroing greylisted_until_ns (a banned
+    // key would stay "greylisted" and be snapshotted twice).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("203.0.113.50");
+    g.record(ip, 1);
+    try testing.expect(g.isGreylisted(ip));
+    g.record(ip, 1);
+    try testing.expect(g.isBanned(ip));
+    try testing.expect(!g.isGreylisted(ip));
+    const recs = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(recs);
+    try testing.expectEqual(@as(usize, 1), recs.len);
+}
+
+test "record: an idle key with an offense history is not swept as empty" {
+    // Kills: entryIsEmpty ignoring `offenses` (the history would vanish as
+    // soon as the greylist lapsed and any new key was created).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 1,
+        .ban_after_offenses = 2,
+        .greylist_ttl_ms = 1000,
+        .strike_decay_ms = 0,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const a = mkIp("203.0.113.60");
+    g.record(a, 1); // first offense -> greylist
+    tc.advanceMs(2000); // greylist over, strikes 0, no connections
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("203.0.113.61")));
+    try testing.expectEqual(@as(usize, 2), g.trackedCount()); // `a` survived the tail sweep
+    g.connClosed(mkIp("203.0.113.61"));
+    g.record(a, 1); // second offense -> ban
+    try testing.expect(g.isBanned(a));
+}
+
+fn hServerErrStatus(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(500);
+    try ctx.res.writeAll("boom");
+}
+
+test "middleware: a 500 response is the server's fault and never strikes" {
+    // Kills: the 4xx range upper bound `< 500` widened to `<= 500`.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .clock = tc.clock() });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/boom", hServerErrStatus);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWirePeer(&r, wire("/boom", ""), &buf, mkPeer4("203.0.113.70", 1)), "500");
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
 }

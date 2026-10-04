@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Added (survey 2026-09-30 backlog): `Options.allow` (fail2ban
+  `ignoreip` allowlist of `netaddr.Prefix`; exempts from every reputation verdict and from
+  `record`/auto-strike, caps still apply); `Options.ipv6_key_bits` / `ipv4_key_bits`
+  (reputation keyed per masked prefix); `banPrefix` / `unbanPrefix` +
+  `Options.max_prefix_bans` (range bans, new error `TooManyPrefixBans`); `BanRecord`,
+  `Guard.snapshot` / `Guard.restore`, `writeSnapshot`, `parseSnapshotLine` (persist bans
+  across a restart, text lines `ban` / `range` / `greylist`; a file written under other key
+  widths still restores; strikes and offenses are not kept).
+  ⚠ BEHAVIOUR CHANGE: `ipv6_key_bits` defaults to **64**, so IPv6 clients are keyed per /64
+  (one subscriber, RFC 6177) instead of per address: `max_conns_per_ip`, strikes, bans and
+  greylists are now shared by every address in a /64. Set `ipv6_key_bits = 128` for the old
+  behaviour.
+
 - **2026-09-29** — Added: `Options.on_store_full` (`.reject` default, `.admit_untracked`).
   The fail-closed store was itself a lockout: 4096 addresses each holding one idle
   connection filled the default store and every NEW address got `store_full` while the

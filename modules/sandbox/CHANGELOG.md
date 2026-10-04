@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **ADDITIVE + one BREAKING edge:** the survey's core gaps.
+  - `seccomp.buildRules(gpa, rules, default_action)`: ordered `Rule{ sysno, when, action }` with
+    per-argument conditions `ArgCmp{ arg, op, width, value, mask }` (`eq ne lt le gt ge
+    masked_eq`, `.u32`/`.u64` width — required, see SPEC), per-rule actions, allow-list or
+    deny-list default; on x86-64 x32-numbered syscalls are killed. New `Action.log` and
+    `Action.allow`, `seccomp.actionAvailable`, `bpf.jgt`/`bpf.jge`.
+  - Landlock: `Ruleset.initWith(Handled)` with opt-in TCP rights (`access_net`, ABI 4) and scopes
+    (`scope.abstract_unix_socket`, `scope.signal`, ABI 6); `allowPort`; `handled_net` / `scoped`
+    fields report what the kernel enforces; `restrictSelfWith(RestrictFlags)` (ABI 7 log flags)
+    and `restrictSelfAllThreads` (ABI 8 TSYNC — Landlock CAN now reach existing threads).
+    `init()`/`initHandling()` are unchanged in what they handle.
+  - BREAKING (error sets only): `LandlockError` gains `ThreadSyncNotSupported`; `BuildError` gains
+    `InvalidAction`, `InvalidRule`, `TooManyRules`, `ProgramTooLong`, and `build`/`buildWx` now refuse `.allow` as a
+    deny action. An exhaustive `switch` over these error sets or over `Action` needs the new arms.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** audit S13, S14 (remainder), S17, S18. Tests only,
   and the root-gated ones now actually run: `scripts/vm/run.sh sandbox` (real root in a disposable
   Debian 6.12.96 guest) gives 35 pass / 1 skip, and `--kernel-append lsm=apparmor` gives 29 / 7.

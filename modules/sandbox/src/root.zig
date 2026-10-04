@@ -259,16 +259,26 @@ pub fn limitAddressSpace(bytes: linux.rlim_t) RlimitError!void {
     return setLimit(.AS, bytes, bytes);
 }
 
-// ── 4. Landlock (filesystem allow-list, kernel ≥ 5.13) ─────────────────────────
+// ── 4. Landlock (filesystem + TCP allow-list, IPC scopes; kernel ≥ 5.13) ──────
 
 // UAPI: linux/landlock.h. Syscall numbers come from std.os.linux.SYS.
 
 /// `struct landlock_ruleset_attr` — the set of access rights this ruleset will
-/// *handle* (i.e. deny unless a rule re-allows). ABI 4 added a net field; we
-/// only model the filesystem field (a trailing unmodelled field is fine — we
-/// pass our own `size`).
+/// *handle* (i.e. deny unless a rule re-allows). ABI 4 appended
+/// `handled_access_net`, ABI 6 `scoped`. The size handed to the kernel is the
+/// prefix the running ABI knows (`attrSizeForAbi`), so an older kernel never
+/// sees a field it would have to reject.
 const RulesetAttr = extern struct {
     handled_access_fs: u64,
+    handled_access_net: u64 = 0,
+    scoped: u64 = 0,
+};
+
+/// `struct landlock_net_port_attr` — NOT packed in the UAPI (two u64s, 16 bytes).
+/// `port` is in host byte order.
+const NetPortAttr = extern struct {
+    allowed_access: u64,
+    port: u64,
 };
 
 /// `struct landlock_path_beneath_attr` — packed in the UAPI (u64 then s32, 12
@@ -280,7 +290,16 @@ const PathBeneathAttr = extern struct {
 };
 
 const landlock_rule_path_beneath: u32 = 1;
+const landlock_rule_net_port: u32 = 2;
 const landlock_create_ruleset_version: u32 = 1 << 0;
+
+/// Bytes of `RulesetAttr` a given ABI understands: `handled_access_fs` from
+/// ABI 1, `+ handled_access_net` from 4, `+ scoped` from 6.
+fn attrSizeForAbi(abi: i32) usize {
+    if (abi >= 6) return @sizeOf(RulesetAttr);
+    if (abi >= 4) return @offsetOf(RulesetAttr, "scoped");
+    return @offsetOf(RulesetAttr, "handled_access_net");
+}
 
 fn sys_landlock_create_ruleset(attr: ?*const RulesetAttr, size: usize, flags: u32) usize {
     return linux.syscall3(.landlock_create_ruleset, @intFromPtr(attr), size, flags);
@@ -304,7 +323,10 @@ fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) usize {
 
 pub const LandlockError = error{
     /// Kernel does not implement Landlock at all (< 5.13, or CONFIG_SECURITY_
-    /// LANDLOCK=n) — `landlock_create_ruleset` returned ENOSYS.
+    /// LANDLOCK=n) — `landlock_create_ruleset` returned ENOSYS. Also from
+    /// `initWith` when the kernel's ABI knows NONE of what the ruleset was
+    /// asked to handle (e.g. network rights only, below ABI 4): there is
+    /// nothing to restrict, and an empty ruleset is not a sandbox.
     NotSupported,
     /// Landlock is compiled in but disabled at boot (no "landlock" LSM) —
     /// EOPNOTSUPP.
@@ -325,6 +347,12 @@ pub const LandlockError = error{
     RulesetFailed,
     /// `restrictSelf` needs PR_SET_NO_NEW_PRIVS set first (or CAP_SYS_ADMIN).
     NoNewPrivsRequired,
+    /// `restrictSelfWith(.{ .tsync = true })` on a kernel below Landlock ABI 8,
+    /// which cannot apply a domain to the other threads. Never degraded to a
+    /// calling-thread-only restriction: the caller asked for the threads that
+    /// already exist to be confined, and a silent fallback would leave them
+    /// open while reporting success.
+    ThreadSyncNotSupported,
 };
 
 /// Query the Landlock ABI version the running kernel supports. Returns ≥ 1 on
@@ -350,7 +378,52 @@ pub fn landlockAbiVersion() LandlockError!i32 {
 pub const Ruleset = struct {
     fd: i32,
     abi: i32,
+    /// Handled filesystem rights after clamping to the ABI.
     handled: u64,
+    /// Handled network rights after clamping (0 below ABI 4 — then no TCP
+    /// port is restricted, whatever was asked; check this to log it).
+    handled_net: u64 = 0,
+    /// Scopes in force after clamping (0 below ABI 6).
+    scoped: u64 = 0,
+
+    /// Network access-right bits (UAPI `LANDLOCK_ACCESS_NET_*`, ABI 4+). TCP
+    /// only; `port` in a rule is the local port for `bind_tcp` and the remote
+    /// port for `connect_tcp`.
+    pub const access_net = struct {
+        pub const bind_tcp: u64 = 1 << 0;
+        pub const connect_tcp: u64 = 1 << 1;
+        /// Every network right this module knows.
+        pub const all: u64 = bind_tcp | connect_tcp;
+    };
+
+    /// Scope bits (UAPI `LANDLOCK_SCOPE_*`, ABI 6+). A scope needs no rule:
+    /// handling it forbids the domain from reaching OUT of itself.
+    pub const scope = struct {
+        /// No `connect` to an abstract UNIX socket bound by a process outside
+        /// this domain (the parent, an unsandboxed daemon, …).
+        pub const abstract_unix_socket: u64 = 1 << 0;
+        /// No signal (including the permission probe `kill(pid, 0)`) to a
+        /// process outside this domain.
+        pub const signal: u64 = 1 << 1;
+        pub const all: u64 = abstract_unix_socket | signal;
+    };
+
+    /// What a ruleset handles, per kind. The filesystem default is
+    /// `access.all`, as in `init()`; network rights and scopes default to
+    /// NONE and are opt-in, because a server confined to its files usually
+    /// still dials out (a JWKS fetch, an upstream, DNS over TCP) and the
+    /// kernel would deny every connect not granted by an `allowPort`. ⚠ The
+    /// same rule as for files applies: a network right that is not handled is
+    /// unrestricted for every port.
+    pub const Handled = struct {
+        fs: u64 = access.all,
+        net: u64 = 0,
+        scoped: u64 = 0,
+
+        /// Every right and scope this module knows: files, TCP bind/connect,
+        /// abstract UNIX sockets, signals.
+        pub const everything: Handled = .{ .fs = access.all, .net = access_net.all, .scoped = scope.all };
+    };
 
     /// Filesystem access-right bits (UAPI `LANDLOCK_ACCESS_FS_*`) plus a few
     /// convenience unions for the common server shapes.
@@ -401,6 +474,16 @@ pub const Ruleset = struct {
         return m;
     }
 
+    /// Bits of `access_net` a given ABI understands (ABI 4+).
+    fn netMaskForAbi(abi: i32) u64 {
+        return if (abi >= 4) access_net.all else 0;
+    }
+
+    /// Bits of `scope` a given ABI understands (ABI 6+).
+    fn scopeMaskForAbi(abi: i32) u64 {
+        return if (abi >= 6) scope.all else 0;
+    }
+
     /// Create a ruleset that handles — denies unless a rule re-allows —
     /// EVERY filesystem right the running kernel's Landlock ABI knows
     /// (`access.all` clamped by `accessMaskForAbi`). This is the shape a
@@ -428,17 +511,41 @@ pub const Ruleset = struct {
     /// that must be able to exec anything), and never pass a convenience
     /// union meant for `allowPath` here.
     pub fn initHandling(handled_access: u64) LandlockError!Ruleset {
+        return initWith(.{ .fs = handled_access });
+    }
+
+    /// Create a ruleset that handles `h.fs` filesystem rights, `h.net` TCP
+    /// rights and `h.scoped` scopes, each clamped to what the running ABI
+    /// understands — on an older kernel the unknown part degrades to
+    /// unrestricted rather than failing, and the clamped masks are left in
+    /// `handled`, `handled_net` and `scoped` for the caller to log or refuse.
+    /// `initWith(.everything)` is the strictest shape; then grant with
+    /// `allowPath` and `allowPort`.
+    pub fn initWith(h: Handled) LandlockError!Ruleset {
         const abi = try landlockAbiVersion();
-        const handled = handled_access & accessMaskForAbi(abi);
-        const attr = RulesetAttr{ .handled_access_fs = handled };
-        const rc = sys_landlock_create_ruleset(&attr, @sizeOf(RulesetAttr), 0);
+        const attr = RulesetAttr{
+            .handled_access_fs = h.fs & accessMaskForAbi(abi),
+            .handled_access_net = h.net & netMaskForAbi(abi),
+            .scoped = h.scoped & scopeMaskForAbi(abi),
+        };
+        // Everything asked for is newer than this kernel: the kernel would
+        // answer ENOMSG (an empty ruleset), which reads as a generic failure.
+        if (h.fs | h.net | h.scoped != 0 and
+            attr.handled_access_fs | attr.handled_access_net | attr.scoped == 0) return error.NotSupported;
+        const rc = sys_landlock_create_ruleset(&attr, attrSizeForAbi(abi), 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .NOSYS => return error.NotSupported,
             .OPNOTSUPP => return error.Disabled,
             else => return error.RulesetFailed,
         }
-        return .{ .fd = @intCast(@as(isize, @bitCast(rc))), .abi = abi, .handled = handled };
+        return .{
+            .fd = @intCast(@as(isize, @bitCast(rc))),
+            .abi = abi,
+            .handled = attr.handled_access_fs,
+            .handled_net = attr.handled_access_net,
+            .scoped = attr.scoped,
+        };
     }
 
     /// Allow `allowed_access` on everything beneath `path` (a directory or a
@@ -468,22 +575,87 @@ pub const Ruleset = struct {
         if (linux.errno(rc) != .SUCCESS) return error.RulesetFailed;
     }
 
+    /// Allow `allowed_access` (`access_net` bits) on TCP `port`: the local
+    /// port for `bind_tcp`, the remote port for `connect_tcp`. Port 0 with
+    /// `bind_tcp` allows binding to a kernel-chosen ephemeral port. The
+    /// access is clamped to `handled_net`; when nothing is left — a kernel
+    /// below ABI 4, or a ruleset that does not handle these rights — there is
+    /// nothing to re-allow and the call is a no-op, because no port is
+    /// restricted in the first place (`handled_net` says so).
+    pub fn allowPort(self: *Ruleset, port: u16, allowed_access: u64) LandlockError!void {
+        const allowed = allowed_access & self.handled_net;
+        if (allowed == 0) return;
+        const attr = NetPortAttr{ .allowed_access = allowed, .port = port };
+        const rc = sys_landlock_add_rule(self.fd, landlock_rule_net_port, &attr, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.RulesetFailed;
+    }
+
+    /// `landlock_restrict_self` flags (UAPI `LANDLOCK_RESTRICT_SELF_*`).
+    pub const RestrictFlags = packed struct(u32) {
+        /// ABI 7+: do not audit-log denials from this thread and its children
+        /// while they run the same executable (script interpreters). Dropped
+        /// on an older kernel — it only changes logging.
+        log_same_exec_off: bool = false,
+        /// ABI 7+: audit-log denials after an `execve` too. Dropped on an
+        /// older kernel.
+        log_new_exec_on: bool = false,
+        /// ABI 7+: do not audit-log denials from nested domains created later.
+        /// Dropped on an older kernel.
+        log_subdomains_off: bool = false,
+        /// ABI 8+: apply the domain to EVERY thread of the process atomically,
+        /// not only the calling thread; when the caller has no-new-privs, the
+        /// kernel sets it on the sibling threads too. NOT dropped on an older
+        /// kernel: `error.ThreadSyncNotSupported`.
+        tsync: bool = false,
+        _: u28 = 0,
+    };
+
+    /// The flags word `restrictSelfWith` hands the kernel for `abi`: logging
+    /// flags the ABI predates are dropped, `tsync` below ABI 8 is an error.
+    fn restrictFlagsForAbi(abi: i32, flags: RestrictFlags) LandlockError!u32 {
+        var f = flags;
+        if (f.tsync and abi < 8) return error.ThreadSyncNotSupported;
+        if (abi < 7) {
+            f.log_same_exec_off = false;
+            f.log_new_exec_on = false;
+            f.log_subdomains_off = false;
+        }
+        return @bitCast(f);
+    }
+
     /// Enforce the ruleset on the CALLING THREAD and everything it later
     /// forks/spawns. Irreversible. Requires PR_SET_NO_NEW_PRIVS (call
     /// `noNewPrivs()` first) unless the process holds `CAP_SYS_ADMIN`.
     ///
-    /// ⚠ Per-thread, like the prctl-form seccomp install — and unlike
-    /// seccomp, Landlock offers NO `TSYNC`-style flag that would reach threads
-    /// already running. A worker spawned before this call stays unconfined
-    /// (measured: main thread EACCES, pre-existing worker SUCCESS on the same
-    /// path). Restrict before spawning workers; there is no later fix-up.
+    /// ⚠ Per-thread, like the prctl-form seccomp install. A worker spawned
+    /// before this call stays unconfined (measured: main thread EACCES,
+    /// pre-existing worker SUCCESS on the same path). Restrict before spawning
+    /// workers, or use `restrictSelfAllThreads` on a kernel with ABI 8+.
     pub fn restrictSelf(self: *Ruleset) LandlockError!void {
-        const rc = sys_landlock_restrict_self(self.fd, 0);
+        return self.restrictSelfWith(.{});
+    }
+
+    /// `restrictSelf` with flags; see `RestrictFlags` for what each one does
+    /// and how it degrades.
+    pub fn restrictSelfWith(self: *Ruleset, flags: RestrictFlags) LandlockError!void {
+        const word = try restrictFlagsForAbi(self.abi, flags);
+        const rc = sys_landlock_restrict_self(self.fd, word);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .PERM => return error.NoNewPrivsRequired,
             else => return error.RulesetFailed,
         }
+    }
+
+    /// Enforce the ruleset on every thread of the process at once
+    /// (`LANDLOCK_RESTRICT_SELF_TSYNC`, ABI 8+) — the Landlock counterpart of
+    /// `seccomp.installTsync`, for hardening that happens after workers exist.
+    /// The sibling threads also get no-new-privs when the caller has it
+    /// (UAPI: only then).
+    /// `error.ThreadSyncNotSupported` below ABI 8, never a silent fallback to
+    /// the calling thread.
+    pub fn restrictSelfAllThreads(self: *Ruleset) LandlockError!void {
+        return self.restrictSelfWith(.{ .tsync = true });
     }
 
     /// Close the ruleset fd. Safe (and expected) to call after `restrictSelf` —
@@ -525,6 +697,8 @@ pub const bpf = struct {
     pub const abs: u16 = 0x20; // fixed offset into the seccomp_data struct
     // jump op / source
     pub const jeq: u16 = 0x10; // A == k
+    pub const jgt: u16 = 0x20; // A > k (unsigned)
+    pub const jge: u16 = 0x30; // A >= k (unsigned)
     pub const k: u16 = 0x00; // constant operand
     // ALU op
     pub const and_: u16 = 0x50; // A = A & k
@@ -582,6 +756,15 @@ pub const seccomp = struct {
         errno: u16,
         /// Raise SIGSYS so a handler can decide (used by tracing sandboxes).
         trap,
+        /// Let the call run and write an audit record (`SECCOMP_RET_LOG`,
+        /// Linux 4.14+). As the deny action of an allow-list it is the
+        /// profiling mode: nothing breaks, and the audit log names every
+        /// syscall the list would have refused.
+        log,
+        /// Let the call run. Only meaningful as a `Rule.action`, or as the
+        /// `buildRules` default of a deny-list; `build`/`buildWx` refuse it as
+        /// a deny action (`error.InvalidAction`) — it would deny nothing.
+        allow,
     };
 
     // seccomp_data field offsets — the "packet" the filter inspects.
@@ -609,6 +792,7 @@ pub const seccomp = struct {
     const ret_kill_thread = linux.SECCOMP.RET.KILL_THREAD;
     const ret_errno = linux.SECCOMP.RET.ERRNO;
     const ret_trap = linux.SECCOMP.RET.TRAP;
+    const ret_log = linux.SECCOMP.RET.LOG;
     const ret_data_mask = linux.SECCOMP.RET.DATA;
 
     fn actionWord(a: Action) u32 {
@@ -617,6 +801,8 @@ pub const seccomp = struct {
             .kill_thread => ret_kill_thread,
             .errno => |e| ret_errno | (@as(u32, e) & ret_data_mask),
             .trap => ret_trap,
+            .log => ret_log,
+            .allow => ret_allow,
         };
     }
 
@@ -627,6 +813,17 @@ pub const seccomp = struct {
         TooManySyscalls,
         /// An `Action.errno` outside `1..4095` — see `Action.errno`.
         InvalidErrno,
+        /// `.allow` as the deny action of `build`/`buildWx`, or as `buildWx`'s
+        /// W^X action — a filter whose deny case allows is a no-op.
+        InvalidAction,
+        /// A `Rule` with more than `max_rule_conditions` conditions, or an
+        /// `ArgCmp.arg` above 5.
+        InvalidRule,
+        /// More than `max_rules` rules.
+        TooManyRules,
+        /// The compiled program would exceed the kernel's 4096 instructions
+        /// (`BPF_MAXINSNS`), which `install` would refuse anyway.
+        ProgramTooLong,
     };
 
     /// The largest errno the kernel will hand back through `SECCOMP_RET_ERRNO`
@@ -641,8 +838,24 @@ pub const seccomp = struct {
         }
     }
 
+    /// `validateAction` for a deny case: also refuses `.allow`.
+    fn validateDeny(a: Action) BuildError!void {
+        if (a == .allow) return error.InvalidAction;
+        try validateAction(a);
+    }
+
     /// `SECCOMP_GET_ACTION_AVAIL` (UAPI seccomp.h, operation 2).
     const seccomp_get_action_avail: u32 = 2;
+
+    /// True when the running kernel knows `a` (`SECCOMP_GET_ACTION_AVAIL`).
+    /// An action the kernel does not know is not refused at install time — it
+    /// behaves as `KILL_PROCESS` when it fires — so a program that uses `.log`
+    /// on a pre-4.14 kernel checks this first.
+    pub fn actionAvailable(a: Action) bool {
+        const word: u32 = actionWord(a) & ~@as(u32, ret_data_mask);
+        const rc = linux.syscall3(.seccomp, seccomp_get_action_avail, 0, @intFromPtr(&word));
+        return linux.errno(rc) == .SUCCESS;
+    }
 
     /// True when this kernel can install a seccomp-bpf filter at all
     /// (`CONFIG_SECCOMP_FILTER`, and the `seccomp(2)` syscall). Probed with
@@ -681,7 +894,7 @@ pub const seccomp = struct {
     /// KILL, independent of `on_deny`. Caller owns the returned slice.
     pub fn build(gpa: Allocator, allowed: []const linux.SYS, on_deny: Action) BuildError![]SockFilter {
         if (allowed.len > 255) return error.TooManySyscalls;
-        try validateAction(on_deny);
+        try validateDeny(on_deny);
         const m: u8 = @intCast(allowed.len);
 
         var list: std.ArrayList(SockFilter) = .empty;
@@ -909,7 +1122,8 @@ pub const seccomp = struct {
     /// W^X is a hard invariant here, not a soft "missed the allow-list" case.
     /// A syscall not in `allowed` at all gets no special treatment — it falls
     /// through to the plain deny leaf like any other unlisted nr, exactly as
-    /// in `build`.
+    /// in `build`. `wx_action = .log` is the profiling form: a W|X request is
+    /// audit-logged and RUNS — the guard is then not enforced.
     ///
     /// Two correctness points that are easy to get wrong in a BPF W^X filter:
     ///  - The check is a **bitmask test**, not an equality: `prot ==
@@ -927,8 +1141,8 @@ pub const seccomp = struct {
     ///    treated as a violation here (fail closed), never silently ignored.
     pub fn buildWx(gpa: Allocator, allowed: []const linux.SYS, on_deny: Action, wx_action: Action) BuildError![]SockFilter {
         if (allowed.len > 255) return error.TooManySyscalls;
-        try validateAction(on_deny);
-        try validateAction(wx_action);
+        try validateDeny(on_deny);
+        try validateDeny(wx_action);
         const m: u8 = @intCast(allowed.len);
 
         var list: std.ArrayList(SockFilter) = .empty;
@@ -996,6 +1210,250 @@ pub const seccomp = struct {
     pub fn buildDefaultWx(gpa: Allocator, on_deny: Action, wx_action: Action) BuildError![]SockFilter {
         return buildWx(gpa, default_allowlist, on_deny, wx_action);
     }
+
+    // ── general rules (per-argument conditions, per-rule actions) ────────────
+
+    /// How an `ArgCmp` compares the argument with `value` (unsigned).
+    pub const Op = enum { eq, ne, lt, le, gt, ge, masked_eq };
+
+    /// How much of the 64-bit argument register a condition reads.
+    pub const Width = enum {
+        /// The low 32 bits only — exactly what the kernel acts on for an
+        /// `int`/`unsigned int` parameter (`socket`'s family, `ioctl`'s
+        /// request, `prctl`'s option, `close`'s fd). Go by the parameter type
+        /// in the kernel's `SYSCALL_DEFINE`, not libc's prototype: `mmap`'s
+        /// `prot` is an `unsigned long` there (`.u64`). The high half of such a
+        /// register is whatever the caller left there; comparing it would let
+        /// a raw syscall with junk above bit 31 slip past a deny rule that the
+        /// kernel then executes as the denied value.
+        u32,
+        /// All 64 bits — for `long`, pointer and `size_t` parameters (`clone`
+        /// flags, lengths, addresses).
+        u64,
+    };
+
+    /// One condition on one syscall argument.
+    pub const ArgCmp = struct {
+        /// Argument index, 0..5.
+        arg: u3,
+        op: Op,
+        width: Width,
+        value: u64,
+        /// For `masked_eq`: the condition is `(arg & mask) == value`. Ignored
+        /// by the other operators.
+        mask: u64 = std.math.maxInt(u64),
+    };
+
+    /// `rule` matches when the syscall number is `sysno` and EVERY condition
+    /// in `when` holds (none = the number alone).
+    pub const Rule = struct {
+        sysno: linux.SYS,
+        when: []const ArgCmp = &.{},
+        action: Action = .allow,
+    };
+
+    /// `max_rule_conditions` keeps every jump of a rule block inside a
+    /// classic-BPF `u8` offset (≤ 39 instructions per rule). The program as a
+    /// whole must also fit the kernel's `BPF_MAXINSNS` (`max_program_len`),
+    /// checked from the exact length: 512 one-number rules fit, 512 rules
+    /// with six 64-bit conditions each do not (`error.ProgramTooLong`).
+    pub const max_rule_conditions: usize = 6;
+    pub const max_rules: usize = 512;
+    pub const max_program_len: usize = 4096;
+
+    /// x86-64 only: the x32 ABI enters with `__X32_SYSCALL_BIT` set in `nr`
+    /// and the SAME `AUDIT_ARCH_X86_64`, so its numbers are not the ones a
+    /// rule names. An allow-list never matches them (default deny); a
+    /// deny-list would let every one of them through, so `buildRules` kills
+    /// them outright.
+    const x32_syscall_bit: u32 = 0x4000_0000;
+    const x32_guard_len: usize = if (builtin.cpu.arch == .x86_64) 3 else 0;
+
+    /// Instructions one condition compiles to (see `emitCond`).
+    fn condLen(c: ArgCmp) usize {
+        return switch (c.width) {
+            .u32 => if (c.op == .masked_eq) 3 else 2,
+            .u64 => switch (c.op) {
+                .eq, .ne => 4,
+                .masked_eq => 6,
+                .lt, .le, .gt, .ge => 5,
+            },
+        };
+    }
+
+    fn ruleLen(r: Rule) usize {
+        var n: usize = 2; // ld nr; jeq nr
+        for (r.when) |c| n += condLen(c);
+        return n + 1; // ret action
+    }
+
+    fn argField(comptime i: u3) struct { lo: u32, hi: u32 } {
+        const h = argHalves(std.fmt.comptimePrint("arg{d}", .{i}));
+        return .{ .lo = h.lo, .hi = h.hi };
+    }
+
+    fn argOffsets(i: u3) struct { lo: u32, hi: u32 } {
+        return switch (i) {
+            inline 0...5 => |c| blk: {
+                const f = argField(c);
+                break :blk .{ .lo = f.lo, .hi = f.hi };
+            },
+            else => unreachable, // `buildRules` validated the index
+        };
+    }
+
+    /// A jump whose targets are "the next condition" (pass) or "the next
+    /// rule" (fail), resolved against the block layout by `emitCond`.
+    const Target = enum { next, pass, fail };
+
+    /// Emit one condition. `fail_at` is the index of the first instruction
+    /// AFTER the rule's `ret` (the next rule); `pass` is the instruction
+    /// right after this condition's block. Every offset is local to the rule.
+    fn emitCond(list: *std.ArrayList(SockFilter), c: ArgCmp, fail_at: usize) void {
+        const off = argOffsets(c.arg);
+        const pass_at = list.items.len + condLen(c);
+        const ld = bpf.ld | bpf.w | bpf.abs;
+        const S = struct {
+            fn rel(l: *std.ArrayList(SockFilter), t: Target, pass: usize, fail: usize) u8 {
+                const here = l.items.len + 1; // offsets count from the next instruction
+                return @intCast(switch (t) {
+                    .next => 0,
+                    .pass => pass - here,
+                    .fail => fail - here,
+                });
+            }
+            fn j(l: *std.ArrayList(SockFilter), op: u16, imm: u32, t: Target, f: Target, pass: usize, fail: usize) void {
+                const jt = rel(l, t, pass, fail);
+                const jf = rel(l, f, pass, fail);
+                l.appendAssumeCapacity(bpf.jump(bpf.jmp | op | bpf.k, imm, jt, jf));
+            }
+        };
+        const v_lo: u32 = @truncate(c.value);
+        const v_hi: u32 = @truncate(c.value >> 32);
+        const m_lo: u32 = @truncate(c.mask);
+        const m_hi: u32 = @truncate(c.mask >> 32);
+        switch (c.width) {
+            .u32 => {
+                list.appendAssumeCapacity(bpf.stmt(ld, off.lo));
+                switch (c.op) {
+                    .eq => S.j(list, bpf.jeq, v_lo, .next, .fail, pass_at, fail_at),
+                    .ne => S.j(list, bpf.jeq, v_lo, .fail, .next, pass_at, fail_at),
+                    .gt => S.j(list, bpf.jgt, v_lo, .next, .fail, pass_at, fail_at),
+                    .ge => S.j(list, bpf.jge, v_lo, .next, .fail, pass_at, fail_at),
+                    .lt => S.j(list, bpf.jge, v_lo, .fail, .next, pass_at, fail_at),
+                    .le => S.j(list, bpf.jgt, v_lo, .fail, .next, pass_at, fail_at),
+                    .masked_eq => {
+                        list.appendAssumeCapacity(bpf.stmt(bpf.alu | bpf.and_ | bpf.k, m_lo));
+                        S.j(list, bpf.jeq, v_lo & m_lo, .next, .fail, pass_at, fail_at);
+                    },
+                }
+            },
+            .u64 => switch (c.op) {
+                // eq: hi == vh AND lo == vl. ne: the negation.
+                .eq, .ne => {
+                    const eq = c.op == .eq;
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.hi));
+                    S.j(list, bpf.jeq, v_hi, .next, if (eq) .fail else .pass, pass_at, fail_at);
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.lo));
+                    S.j(list, bpf.jeq, v_lo, if (eq) .next else .fail, if (eq) .fail else .next, pass_at, fail_at);
+                },
+                .masked_eq => {
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.hi));
+                    list.appendAssumeCapacity(bpf.stmt(bpf.alu | bpf.and_ | bpf.k, m_hi));
+                    S.j(list, bpf.jeq, v_hi & m_hi, .next, .fail, pass_at, fail_at);
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.lo));
+                    list.appendAssumeCapacity(bpf.stmt(bpf.alu | bpf.and_ | bpf.k, m_lo));
+                    S.j(list, bpf.jeq, v_lo & m_lo, .next, .fail, pass_at, fail_at);
+                },
+                // Unsigned 64-bit order from two 32-bit words: the high
+                // words decide unless they are equal, then the low words do.
+                //   ld hi; jgt vh → (gt/ge: pass, lt/le: fail)
+                //          jeq vh → next  else (gt/ge: fail, lt/le: pass)
+                //   ld lo; <low compare>
+                .gt, .ge, .lt, .le => {
+                    const upward = c.op == .gt or c.op == .ge;
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.hi));
+                    S.j(list, bpf.jgt, v_hi, if (upward) .pass else .fail, .next, pass_at, fail_at);
+                    S.j(list, bpf.jeq, v_hi, .next, if (upward) .fail else .pass, pass_at, fail_at);
+                    list.appendAssumeCapacity(bpf.stmt(ld, off.lo));
+                    switch (c.op) {
+                        .gt => S.j(list, bpf.jgt, v_lo, .next, .fail, pass_at, fail_at),
+                        .ge => S.j(list, bpf.jge, v_lo, .next, .fail, pass_at, fail_at),
+                        .lt => S.j(list, bpf.jge, v_lo, .fail, .next, pass_at, fail_at),
+                        .le => S.j(list, bpf.jgt, v_lo, .fail, .next, pass_at, fail_at),
+                        else => unreachable,
+                    }
+                },
+            },
+        }
+        std.debug.assert(list.items.len == pass_at);
+    }
+
+    /// Build a program from `rules`, evaluated IN ORDER: the first rule whose
+    /// number and conditions all match decides the syscall (its `action`);
+    /// a syscall no rule matches gets `default_action`. Layout:
+    ///
+    ///   arch guard                     ; as in `build` — always KILL
+    ///   [x86-64] nr ≥ X32 bit → KILL   ; see `x32_syscall_bit`
+    ///   per rule:  ld nr; jeq sysno (else next rule);
+    ///              each condition (else next rule); ret action
+    ///   ret default_action
+    ///
+    /// Every jump is local to its rule's block, so rules compose without
+    /// knowing each other's position, like `buildWx`'s blocks. Two shapes:
+    ///  - **allow-list** — `default_action` denies (`kill_process`, `errno`,
+    ///    …), rules `.allow` what the program needs, optionally narrowed by
+    ///    conditions (`socket` only for `AF_INET`/`AF_INET6`). The stronger
+    ///    shape: what nobody thought of is refused.
+    ///  - **deny-list** — `default_action` is `.allow` (or `.log`), rules
+    ///    refuse specific calls. Weaker: a syscall added to the kernel next
+    ///    year is allowed. Prefer it only for profiling (`.log`) or as a
+    ///    narrow patch over a program you cannot profile.
+    ///
+    /// Several rules may name one syscall; order decides. The scan is linear
+    /// in the rules a syscall passes before its match — fine for the tens of
+    /// rules a service uses; no binary-tree dispatch (libseccomp's) yet.
+    /// Caller owns the returned slice.
+    pub fn buildRules(gpa: Allocator, rules: []const Rule, default_action: Action) BuildError![]SockFilter {
+        if (rules.len > max_rules) return error.TooManyRules;
+        try validateAction(default_action);
+        var total: usize = 3 + x32_guard_len + 1;
+        for (rules) |r| {
+            try validateAction(r.action);
+            if (r.when.len > max_rule_conditions) return error.InvalidRule;
+            for (r.when) |c| if (c.arg > 5) return error.InvalidRule;
+            total += ruleLen(r);
+        }
+        if (total > max_program_len) return error.ProgramTooLong;
+
+        var list: std.ArrayList(SockFilter) = .empty;
+        errdefer list.deinit(gpa);
+        try list.ensureTotalCapacityPrecise(gpa, total);
+
+        list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_arch));
+        list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, audit_arch, 1, 0));
+        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
+        if (x32_guard_len != 0) {
+            list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, x32_syscall_bit, 0, 1));
+            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
+        }
+
+        for (rules) |r| {
+            const start = list.items.len;
+            const next_rule = start + ruleLen(r);
+            // Conditions clobber the accumulator, so every rule reloads nr.
+            list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+            const nr: u32 = @intCast(@intFromEnum(r.sysno));
+            const to_next: u8 = @intCast(next_rule - (list.items.len + 1));
+            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nr, 0, to_next));
+            for (r.when) |c| emitCond(&list, c, next_rule);
+            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
+            std.debug.assert(list.items.len == next_rule);
+        }
+        list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(default_action)));
+        return list.toOwnedSlice(gpa);
+    }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1054,7 +1512,9 @@ fn runInChild(child: *const fn () void) !ChildResult {
 test "struct sizes match the kernel ABI" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(SockFilter)); // sock_filter
     try testing.expectEqual(@as(usize, 12), @sizeOf(PathBeneathAttr)); // packed: u64+s32
-    try testing.expectEqual(@as(usize, 8), @sizeOf(RulesetAttr));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(RulesetAttr)); // fs, net (ABI 4), scoped (ABI 6)
+    try testing.expectEqual(@as(usize, 16), @sizeOf(NetPortAttr)); // NOT packed: u64+u64
+    try testing.expectEqual(@as(usize, 8), @offsetOf(NetPortAttr, "port"));
     // seccomp_data: nr at 0, arch at 4.
     try testing.expectEqual(@as(usize, 0), seccomp.off_nr);
     try testing.expectEqual(@as(usize, 4), seccomp.off_arch);
@@ -1222,6 +1682,224 @@ test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruc
     try testing.expectEqual(@as(u32, seccomp.ret_allow), prog[pos + 7].k);
 }
 
+// ── seccomp.buildRules: codegen checked against a reference evaluator ─────────
+
+/// A classic-BPF interpreter for exactly the instructions this module emits
+/// (ld w abs, alu and k, jeq/jgt/jge k, ret k). Anything else fails the test.
+fn runBpf(prog: []const SockFilter, d: *const linux.SECCOMP.data) !u32 {
+    const bytes = std.mem.asBytes(d);
+    var a: u32 = 0;
+    var pc: usize = 0;
+    while (pc < prog.len) {
+        const ins = prog[pc];
+        pc += 1;
+        switch (ins.code) {
+            bpf.ld | bpf.w | bpf.abs => {
+                if (ins.k + 4 > bytes.len) return error.LoadOutOfRange;
+                a = std.mem.readInt(u32, bytes[ins.k..][0..4], builtin.cpu.arch.endian());
+            },
+            bpf.alu | bpf.and_ | bpf.k => a &= ins.k,
+            bpf.jmp | bpf.jeq | bpf.k, bpf.jmp | bpf.jgt | bpf.k, bpf.jmp | bpf.jge | bpf.k => {
+                const hit = switch (ins.code & 0xf0) {
+                    bpf.jeq => a == ins.k,
+                    bpf.jgt => a > ins.k,
+                    bpf.jge => a >= ins.k,
+                    else => unreachable,
+                };
+                pc += if (hit) ins.jt else ins.jf;
+            },
+            bpf.ret | bpf.k => return ins.k,
+            else => return error.UnknownInstruction,
+        }
+    }
+    return error.FellOffTheEnd;
+}
+
+/// What `buildRules` promises, written directly — no BPF.
+fn evalRules(rules: []const seccomp.Rule, default_action: seccomp.Action, d: *const linux.SECCOMP.data) u32 {
+    if (d.arch != audit_arch) return seccomp.ret_kill_process;
+    const nr: u32 = @bitCast(d.nr);
+    if (builtin.cpu.arch == .x86_64 and nr >= seccomp.x32_syscall_bit) return seccomp.ret_kill_process;
+    const args = [6]u64{ d.arg0, d.arg1, d.arg2, d.arg3, d.arg4, d.arg5 };
+    rules: for (rules) |r| {
+        if (nr != @as(u32, @intCast(@intFromEnum(r.sysno)))) continue;
+        for (r.when) |c| {
+            const x: u64 = if (c.width == .u32) @as(u32, @truncate(args[c.arg])) else args[c.arg];
+            const v: u64 = if (c.width == .u32) @as(u32, @truncate(c.value)) else c.value;
+            const m: u64 = if (c.width == .u32) @as(u32, @truncate(c.mask)) else c.mask;
+            const ok = switch (c.op) {
+                .eq => x == v,
+                .ne => x != v,
+                .lt => x < v,
+                .le => x <= v,
+                .gt => x > v,
+                .ge => x >= v,
+                .masked_eq => (x & m) == (v & m),
+            };
+            if (!ok) continue :rules;
+        }
+        return seccomp.actionWord(r.action);
+    }
+    return seccomp.actionWord(default_action);
+}
+
+/// Values where a 64-bit compare built from two 32-bit words goes wrong:
+/// word boundaries, all-ones halves, and their neighbours.
+const edge_values = [_]u64{
+    0,                     1,                     0x7fff_ffff,           0x8000_0000,
+    0xffff_fffe,           0xffff_ffff,           0x1_0000_0000,         0x1_0000_0001,
+    0xffff_ffff_0000_0000, 0xffff_fffe_ffff_ffff, 0xffff_ffff_ffff_fffe, 0xffff_ffff_ffff_ffff,
+};
+
+fn pickValue(r: std.Random) u64 {
+    return switch (r.uintLessThan(u8, 4)) {
+        0, 1 => edge_values[r.uintLessThan(usize, edge_values.len)],
+        2 => r.int(u64),
+        else => r.int(u32),
+    };
+}
+
+/// A value near `v`: equal, off by one either way, or with one half changed —
+/// the inputs that separate lt/le/gt/ge and hi-word/lo-word mistakes.
+fn nearValue(r: std.Random, v: u64) u64 {
+    return switch (r.uintLessThan(u8, 6)) {
+        0 => v,
+        1 => v +% 1,
+        2 => v -% 1,
+        3 => v ^ (@as(u64, r.int(u32)) << 32), // same low word, other high word
+        4 => (v & 0xffff_ffff_0000_0000) | r.int(u32), // same high word
+        else => pickValue(r),
+    };
+}
+
+test "seccomp.buildRules: compiled program agrees with the reference evaluator on 40 000 random rule sets" {
+    const sysnos = [_]linux.SYS{ .read, .write, .close, .socket, .ioctl, .mmap };
+    const ops = std.enums.values(seccomp.Op);
+    const actions = [_]seccomp.Action{ .allow, .log, .kill_process, .trap, .{ .errno = 1 }, .{ .errno = 4095 } };
+    var prng = std.Random.DefaultPrng.init(0x5ecc_0b9f);
+    const r = prng.random();
+    var conds: [8 * seccomp.max_rule_conditions]seccomp.ArgCmp = undefined;
+    var rules: [8]seccomp.Rule = undefined;
+    var round: usize = 0;
+    while (round < 40_000) : (round += 1) {
+        const n_rules = r.uintLessThan(usize, rules.len) + 1;
+        var used: usize = 0;
+        for (rules[0..n_rules]) |*rule| {
+            const n_conds = r.uintLessThan(usize, seccomp.max_rule_conditions + 1);
+            for (conds[used..][0..n_conds]) |*c| c.* = .{
+                .arg = @intCast(r.uintLessThan(u8, 6)),
+                .op = ops[r.uintLessThan(usize, ops.len)],
+                .width = if (r.boolean()) .u32 else .u64,
+                .value = pickValue(r),
+                .mask = pickValue(r),
+            };
+            rule.* = .{
+                .sysno = sysnos[r.uintLessThan(usize, sysnos.len)],
+                .when = conds[used..][0..n_conds],
+                .action = actions[r.uintLessThan(usize, actions.len)],
+            };
+            used += n_conds;
+        }
+        const default_action = actions[r.uintLessThan(usize, actions.len)];
+        const prog = try seccomp.buildRules(testing.allocator, rules[0..n_rules], default_action);
+        defer testing.allocator.free(prog);
+
+        var probe: usize = 0;
+        while (probe < 16) : (probe += 1) {
+            // Aim the input at one rule's conditions so matches are common.
+            const target = rules[r.uintLessThan(usize, n_rules)];
+            var args: [6]u64 = undefined;
+            for (&args) |*a| a.* = pickValue(r);
+            for (target.when) |c| args[c.arg] = nearValue(r, c.value);
+            const nr: u32 = switch (r.uintLessThan(u8, 8)) {
+                0 => @intCast(@intFromEnum(sysnos[r.uintLessThan(usize, sysnos.len)])),
+                1 => seccomp.x32_syscall_bit | @as(u32, @intCast(@intFromEnum(target.sysno))),
+                else => @intCast(@intFromEnum(target.sysno)),
+            };
+            const d: linux.SECCOMP.data = .{
+                .nr = @bitCast(nr),
+                .arch = if (r.uintLessThan(u8, 16) == 0) audit_arch ^ 1 else audit_arch,
+                .instruction_pointer = 0,
+                .arg0 = args[0],
+                .arg1 = args[1],
+                .arg2 = args[2],
+                .arg3 = args[3],
+                .arg4 = args[4],
+                .arg5 = args[5],
+            };
+            const got = try runBpf(prog, &d);
+            const want = evalRules(rules[0..n_rules], default_action, &d);
+            if (got != want) {
+                std.debug.print("round {d} probe {d}: bpf {x} want {x}\n", .{ round, probe, got, want });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "seccomp.buildRules: structure — arch guard, x32 guard, one self-contained block per rule, default leaf" {
+    const rules = [_]seccomp.Rule{
+        .{ .sysno = .getpid },
+        .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = 1 }}, .action = .{ .errno = 1 } },
+    };
+    const prog = try seccomp.buildRules(testing.allocator, &rules, .kill_process);
+    defer testing.allocator.free(prog);
+    const ld = bpf.ld | bpf.w | bpf.abs;
+    const jeq = bpf.jmp | bpf.jeq | bpf.k;
+    var i: usize = 0;
+    // Arch guard, identical to `build`'s.
+    try testing.expectEqual(bpf.stmt(ld, seccomp.off_arch), prog[0]);
+    try testing.expectEqual(bpf.jump(jeq, audit_arch, 1, 0), prog[1]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[2]);
+    i = 3;
+    if (builtin.cpu.arch == .x86_64) {
+        try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[3]);
+        try testing.expectEqual(bpf.jump(bpf.jmp | bpf.jge | bpf.k, 0x4000_0000, 0, 1), prog[4]);
+        try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[5]);
+        i = 6;
+    }
+    // Rule 0: number only — ld nr; jeq getpid (else skip 1); ret allow.
+    try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.getpid)), 0, 1), prog[i + 1]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow), prog[i + 2]);
+    i += 3;
+    // Rule 1: ld nr; jeq socket (else skip 3); ld arg0 LOW word only; jeq 1 (else skip 1); ret errno.
+    try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@intFromEnum(linux.SYS.socket)), 0, 3), prog[i + 1]);
+    try testing.expectEqual(bpf.stmt(ld, seccomp.argHalves("arg0").lo), prog[i + 2]);
+    try testing.expectEqual(bpf.jump(jeq, 1, 0, 1), prog[i + 3]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | 1), prog[i + 4]);
+    i += 5;
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[i]);
+    try testing.expectEqual(i + 1, prog.len);
+}
+
+test "seccomp.buildRules / build: refused inputs" {
+    const gpa = testing.allocator;
+    const six: [7]seccomp.ArgCmp = @splat(.{ .arg = 0, .op = .eq, .width = .u32, .value = 0 });
+    try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &six }}, .kill_process));
+    try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &.{.{ .arg = 6, .op = .eq, .width = .u32, .value = 0 }} }}, .kill_process));
+    try testing.expectError(error.InvalidErrno, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .action = .{ .errno = 0 } }}, .kill_process));
+    try testing.expectError(error.InvalidErrno, seccomp.buildRules(gpa, &.{}, .{ .errno = 4096 }));
+    const many: [seccomp.max_rules + 1]seccomp.Rule = @splat(.{ .sysno = .read });
+    try testing.expectError(error.TooManyRules, seccomp.buildRules(gpa, &many, .kill_process));
+    // 512 rules × 6 u64 order conditions = 512 × 33 instructions > BPF_MAXINSNS.
+    const heavy_conds: [6]seccomp.ArgCmp = @splat(.{ .arg = 1, .op = .ge, .width = .u64, .value = 7 });
+    const heavy: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read, .when = &heavy_conds });
+    try testing.expectError(error.ProgramTooLong, seccomp.buildRules(gpa, &heavy, .kill_process));
+    // ...while 512 number-only rules fit (512 × 3 + 7 instructions).
+    const light: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read });
+    const lp = try seccomp.buildRules(gpa, &light, .kill_process);
+    defer gpa.free(lp);
+    try testing.expect(lp.len <= seccomp.max_program_len);
+    // An allow-list whose deny case allows is a no-op filter.
+    try testing.expectError(error.InvalidAction, seccomp.build(gpa, &.{.read}, .allow));
+    try testing.expectError(error.InvalidAction, seccomp.buildWx(gpa, &.{.read}, .kill_process, .allow));
+    // `.allow` IS a valid deny-list default.
+    const p = try seccomp.buildRules(gpa, &.{.{ .sysno = .read, .action = .kill_process }}, .allow);
+    gpa.free(p);
+}
+
 test "landlock access mask grows monotonically with ABI" {
     const m1 = Ruleset.accessMaskForAbi(1);
     const m3 = Ruleset.accessMaskForAbi(3);
@@ -1230,6 +1908,39 @@ test "landlock access mask grows monotonically with ABI" {
     try testing.expect(m3 & Ruleset.access.truncate != 0); // ABI 3 does
     try testing.expect(m5 & Ruleset.access.ioctl_dev != 0); // ABI 5 adds IOCTL_DEV
     try testing.expect(m1 == m1 & m3 and m3 == m3 & m5); // strictly grows
+}
+
+test "landlock: ruleset attr size, net and scope masks follow the ABI that introduced each field" {
+    // An ABI-1..3 kernel must be handed 8 bytes, 4..5 16 bytes, 6+ all 24.
+    try testing.expectEqual(@as(usize, 8), attrSizeForAbi(1));
+    try testing.expectEqual(@as(usize, 8), attrSizeForAbi(3));
+    try testing.expectEqual(@as(usize, 16), attrSizeForAbi(4));
+    try testing.expectEqual(@as(usize, 16), attrSizeForAbi(5));
+    try testing.expectEqual(@as(usize, 24), attrSizeForAbi(6));
+    try testing.expectEqual(@as(usize, 24), attrSizeForAbi(8));
+    try testing.expectEqual(@as(u64, 0), Ruleset.netMaskForAbi(3));
+    try testing.expectEqual(Ruleset.access_net.all, Ruleset.netMaskForAbi(4));
+    try testing.expectEqual(@as(u64, 0), Ruleset.scopeMaskForAbi(5));
+    try testing.expectEqual(Ruleset.scope.all, Ruleset.scopeMaskForAbi(6));
+    // UAPI values.
+    try testing.expectEqual(@as(u64, 3), Ruleset.access_net.all);
+    try testing.expectEqual(@as(u64, 3), Ruleset.scope.all);
+    // Opt-in: the default `Handled` restricts files only.
+    const d: Ruleset.Handled = .{};
+    try testing.expectEqual(Ruleset.access.all, d.fs);
+    try testing.expectEqual(@as(u64, 0), d.net);
+    try testing.expectEqual(@as(u64, 0), d.scoped);
+}
+
+test "landlock: restrict flags — logging flags dropped below ABI 7, tsync below ABI 8 is an error, never dropped" {
+    const log_all: Ruleset.RestrictFlags = .{ .log_same_exec_off = true, .log_new_exec_on = true, .log_subdomains_off = true };
+    try testing.expectEqual(@as(u32, 0), try Ruleset.restrictFlagsForAbi(6, log_all));
+    try testing.expectEqual(@as(u32, 0b0111), try Ruleset.restrictFlagsForAbi(7, log_all));
+    try testing.expectError(error.ThreadSyncNotSupported, Ruleset.restrictFlagsForAbi(7, .{ .tsync = true }));
+    try testing.expectError(error.ThreadSyncNotSupported, Ruleset.restrictFlagsForAbi(1, .{ .tsync = true }));
+    // UAPI: LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3.
+    try testing.expectEqual(@as(u32, 1 << 3), try Ruleset.restrictFlagsForAbi(8, .{ .tsync = true }));
+    try testing.expectEqual(@as(u32, 0), try Ruleset.restrictFlagsForAbi(8, .{}));
 }
 
 // ── real: seccomp (fork children) ────────────────────────────────────────────
@@ -1718,6 +2429,89 @@ test "seccomp(2)+TSYNC: a sibling thread with its own prior, different filter is
     try testing.expect(res.exitedWith(0));
 }
 
+// ── real: seccomp.buildRules (fork children) ─────────────────────────────────
+
+const af_unix: u64 = 1;
+const af_inet: u64 = 2;
+
+/// A deny-list over the real kernel: `socket(AF_UNIX, …)` refused with EPERM,
+/// `close(fd ≥ 1000)` refused with EPERM, everything else allowed.
+fn rulesDenyList(gpa: Allocator) ![]SockFilter {
+    return seccomp.buildRules(gpa, &.{
+        .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = af_unix }}, .action = .{ .errno = @intFromEnum(E.PERM) } },
+        .{ .sysno = .close, .when = &.{.{ .arg = 0, .op = .ge, .width = .u32, .value = 1000 }}, .action = .{ .errno = @intFromEnum(E.PERM) } },
+    }, .allow);
+}
+
+var g_rules_prog: []const SockFilter = &.{};
+
+fn childRulesDenyList() void {
+    noNewPrivs() catch linux.exit(82);
+    seccomp.install(g_rules_prog) catch linux.exit(83);
+    // The condition matches: refused.
+    if (linux.errno(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)) != .PERM) linux.exit(10);
+    // Junk above bit 31 of an `int` argument: the kernel creates an AF_UNIX
+    // socket from the low word, so a `.u32` condition must still refuse it.
+    if (linux.errno(linux.syscall3(.socket, (@as(usize, 1) << 32) | af_unix, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)) != .PERM) linux.exit(11);
+    // The condition does not match: allowed (AF_INET socket created).
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) linux.exit(12);
+    _ = linux.close(@intCast(@as(isize, @bitCast(rc))));
+    // The `ge 1000` boundary: 999 reaches the kernel (EBADF), 1000 does not.
+    if (linux.errno(linux.close(999)) != .BADF) linux.exit(20);
+    if (linux.errno(linux.close(1000)) != .PERM) linux.exit(21);
+    linux.exit(0);
+}
+
+test "seccomp.buildRules on the kernel: argument conditions decide, a junk high word does not bypass a .u32 rule, ge is exact at the boundary" {
+    try requireSeccompFilter();
+    const prog = try rulesDenyList(testing.allocator);
+    defer testing.allocator.free(prog);
+    g_rules_prog = prog;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childRulesDenyList)).status);
+}
+
+fn childRulesX32() void {
+    noNewPrivs() catch linux.exit(82);
+    seccomp.install(g_rules_prog) catch linux.exit(83);
+    // x32 `getpid` (nr 39 | __X32_SYSCALL_BIT): killed by the guard whether or
+    // not this kernel has x32 at all (without the guard: ENOSYS or a pid).
+    // Raw `syscall`: std's wrappers take a `SYS` enum, which has no x32 numbers.
+    if (builtin.cpu.arch == .x86_64) _ = asm volatile ("syscall"
+        : [ret] "={rax}" (-> usize),
+        : [nr] "{rax}" (@as(usize, 0x4000_0000 | 39)),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+    linux.exit(1);
+}
+
+test "seccomp.buildRules on the kernel (x86-64): a deny-list kills x32-numbered syscalls instead of letting them past" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    try requireSeccompFilter();
+    const prog = try seccomp.buildRules(testing.allocator, &.{.{ .sysno = .getpid, .action = .kill_process }}, .allow);
+    defer testing.allocator.free(prog);
+    g_rules_prog = prog;
+    const res = try runInChild(childRulesX32);
+    try testing.expect(res.killedBy(.SYS));
+}
+
+fn childRulesLog() void {
+    noNewPrivs() catch linux.exit(82);
+    seccomp.install(g_rules_prog) catch linux.exit(83);
+    // `.log` default: every syscall still runs.
+    if (linux.getpid() <= 0) linux.exit(10);
+    linux.exit(0);
+}
+
+test "seccomp .log action: the profiling default lets every call run" {
+    try requireSeccompFilter();
+    if (!seccomp.actionAvailable(.log)) return error.SkipZigTest; // pre-4.14
+    try testing.expect(seccomp.actionAvailable(.kill_process));
+    const prog = try seccomp.build(testing.allocator, &.{ .exit, .exit_group }, .log);
+    defer testing.allocator.free(prog);
+    g_rules_prog = prog;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childRulesLog)).status);
+}
+
 // ── real: landlock (fork children) ───────────────────────────────────────────
 
 // Absolute paths shared with the child via COW memory. Filled by the test body
@@ -1920,9 +2714,10 @@ test "landlock: allowPath refuses a symlink by name instead of granting its targ
     try rs.allowPath("/tmp", Ruleset.access.read_only);
 }
 
-// Audit S4: `landlock_restrict_self` confines the calling thread; there is no
-// TSYNC for Landlock. This pins the measured kernel behaviour so the docs'
-// "restrict BEFORE spawning workers" is a tested statement, not a hope.
+// Audit S4: `landlock_restrict_self` without flags confines the calling thread
+// only (TSYNC exists from ABI 8 — `restrictSelfAllThreads`, tested below). This
+// pins the measured kernel behaviour so the docs' "restrict BEFORE spawning
+// workers" is a tested statement, not a hope.
 var g_ll_worker_result: std.atomic.Value(u32) = .init(0);
 
 fn landlockWorker(release: *std.atomic.Value(bool)) void {
@@ -1958,6 +2753,226 @@ test "landlock: restrictSelf confines the calling thread only — a worker spawn
     const res = try runInChild(childLandlockThreads);
     if (res.exitedWith(120)) return error.SkipZigTest; // could not spawn a thread here
     try testing.expect(res.exitedWith(0));
+}
+
+/// The ABI 8 counterpart of the test above: `restrictSelfAllThreads` reaches
+/// the worker that already exists.
+fn childLandlockAllThreads() void {
+    armWatchdog(5);
+    var release = std.atomic.Value(bool).init(false);
+    const worker = std.Thread.spawn(.{}, landlockWorker, .{&release}) catch linux.exit(120);
+    var rs = Ruleset.init() catch linux.exit(80);
+    defer rs.deinit();
+    rs.allowPath(g_ll_allowed_dir.ptr, Ruleset.access.read_only) catch linux.exit(81);
+    noNewPrivs() catch linux.exit(82);
+    rs.restrictSelfAllThreads() catch linux.exit(83);
+    if (!expectDenied(openReadonly(ll_forbidden_file.ptr))) linux.exit(30);
+    release.store(true, .release);
+    worker.join();
+    // 2 = the worker's open was denied: the domain reached it.
+    linux.exit(if (g_ll_worker_result.load(.acquire) == 2) 0 else 51);
+}
+
+test "landlock: restrictSelfAllThreads (TSYNC, ABI 8) confines a worker spawned before it" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
+    if ((try landlockAbiVersion()) < 8) return error.SkipZigTest;
+    g_ll_worker_result.store(0, .release);
+    const res = try runInChild(childLandlockAllThreads);
+    if (res.exitedWith(120)) return error.SkipZigTest; // could not spawn a thread here
+    try testing.expectEqual(@as(u32, 0), res.status);
+}
+
+// ── real: landlock network rules and scopes (fork children) ──────────────────
+
+/// Two loopback TCP listeners owned by the test process: the child may
+/// connect to `allowed` only, and `taken` doubles as an in-use port whose
+/// bind the child must see refused by Landlock (EACCES) where an unconfined
+/// process sees EADDRINUSE — so the denial cannot be mistaken for the port
+/// merely being busy.
+var g_ll_port_allowed: u16 = 0;
+var g_ll_port_taken: u16 = 0;
+
+fn tcpSocket() ?i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(@as(isize, @bitCast(rc)));
+}
+
+fn loopback(port: u16) linux.sockaddr.in {
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+}
+
+fn bindLoopback(fd: i32, port: u16) E {
+    const sa = loopback(port);
+    return linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in)));
+}
+
+fn connectLoopback(fd: i32, port: u16) E {
+    const sa = loopback(port);
+    return linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in)));
+}
+
+/// Bind + listen on an ephemeral loopback port; null when loopback is not
+/// usable here (the test then skips before any child runs).
+fn listenLoopback(port_out: *u16) ?i32 {
+    const fd = tcpSocket() orelse return null;
+    if (bindLoopback(fd, 0) != .SUCCESS or linux.errno(linux.listen(fd, 4)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    var sa: linux.sockaddr.in = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(fd, @ptrCast(&sa), &len)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    port_out.* = std.mem.bigToNative(u16, sa.port);
+    return fd;
+}
+
+/// Exit codes: 1x = bind, 2x = connect; the child checks the allowed case
+/// before the denied one so a ruleset that denies everything fails as well.
+fn childLandlockNet() void {
+    var rs = Ruleset.initWith(.{ .fs = 0, .net = Ruleset.access_net.all }) catch linux.exit(80);
+    defer rs.deinit();
+    if (rs.handled_net != Ruleset.access_net.all) linux.exit(84);
+    rs.allowPort(0, Ruleset.access_net.bind_tcp) catch linux.exit(81);
+    rs.allowPort(g_ll_port_allowed, Ruleset.access_net.connect_tcp) catch linux.exit(81);
+    noNewPrivs() catch linux.exit(82);
+    rs.restrictSelf() catch linux.exit(83);
+
+    const b1 = tcpSocket() orelse linux.exit(90);
+    if (bindLoopback(b1, 0) != .SUCCESS) linux.exit(10); // port 0 granted
+    const b2 = tcpSocket() orelse linux.exit(90);
+    if (bindLoopback(b2, g_ll_port_taken) != .ACCES) linux.exit(11); // not EADDRINUSE
+    const c1 = tcpSocket() orelse linux.exit(90);
+    if (connectLoopback(c1, g_ll_port_allowed) != .SUCCESS) linux.exit(20);
+    const c2 = tcpSocket() orelse linux.exit(90);
+    if (connectLoopback(c2, g_ll_port_taken) != .ACCES) linux.exit(21);
+    linux.exit(0);
+}
+
+/// Control: the same calls unconfined — what the confined child's EACCES
+/// would otherwise have been.
+fn childLandlockNetControl() void {
+    const b2 = tcpSocket() orelse linux.exit(90);
+    if (bindLoopback(b2, g_ll_port_taken) != .ADDRINUSE) linux.exit(11);
+    const c2 = tcpSocket() orelse linux.exit(90);
+    if (connectLoopback(c2, g_ll_port_taken) != .SUCCESS) linux.exit(21);
+    linux.exit(0);
+}
+
+test "landlock net (ABI 4): bind/connect only on granted TCP ports; EACCES, not EADDRINUSE, on a busy denied port" {
+    if ((landlockAbiVersion() catch return error.SkipZigTest) < 4) return error.SkipZigTest;
+    const a = listenLoopback(&g_ll_port_allowed) orelse return error.SkipZigTest;
+    defer _ = linux.close(a);
+    const t = listenLoopback(&g_ll_port_taken) orelse return error.SkipZigTest;
+    defer _ = linux.close(t);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockNetControl)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockNet)).status);
+}
+
+test "landlock: initWith of only what this ABI lacks is NotSupported, not an empty ruleset (review S1)" {
+    const abi = landlockAbiVersion() catch return error.SkipZigTest;
+    // A bit above every known one stands in for "newer than this kernel".
+    try testing.expectError(error.NotSupported, Ruleset.initWith(.{ .fs = 1 << 40 }));
+    if (abi < 4) try testing.expectError(error.NotSupported, Ruleset.initWith(.{ .fs = 0, .net = Ruleset.access_net.all }));
+    // Asking for nothing at all is the caller's mistake, not the kernel's age.
+    try testing.expectError(error.RulesetFailed, Ruleset.initWith(.{ .fs = 0 }));
+}
+
+test "landlock net: allowPort is a no-op when the ruleset does not handle network rights" {
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    var rs = try Ruleset.init();
+    defer rs.deinit();
+    try testing.expectEqual(@as(u64, 0), rs.handled_net);
+    try rs.allowPort(443, Ruleset.access_net.all); // the kernel would reject a rule here
+}
+
+/// `kill(pid, 0)`: the permission check without a signal (std's `kill` takes
+/// a `SIG` enum, which has no 0).
+fn killProbe(pid: linux.pid_t) usize {
+    return linux.syscall2(.kill, @as(usize, @bitCast(@as(isize, pid))), 0);
+}
+
+fn childLandlockScopeSignal(scoped: bool) void {
+    if (scoped) {
+        var rs = Ruleset.initWith(.{ .fs = 0, .scoped = Ruleset.scope.signal }) catch linux.exit(80);
+        defer rs.deinit();
+        if (rs.scoped != Ruleset.scope.signal) linux.exit(84);
+        noNewPrivs() catch linux.exit(82);
+        rs.restrictSelf() catch linux.exit(83);
+    }
+    // Inside the domain: signalling itself is fine.
+    if (linux.errno(killProbe(linux.getpid())) != .SUCCESS) linux.exit(40);
+    // The test process is outside it. `kill(pid, 0)` runs the full permission
+    // check without delivering anything.
+    const want: E = if (scoped) .PERM else .SUCCESS;
+    if (linux.errno(killProbe(linux.getppid())) != want) linux.exit(41);
+    linux.exit(0);
+}
+
+fn childScopeSignalOn() void {
+    childLandlockScopeSignal(true);
+}
+
+fn childScopeSignalOff() void {
+    childLandlockScopeSignal(false);
+}
+
+test "landlock scope (ABI 6): signal — the domain cannot signal its parent, control can" {
+    if ((landlockAbiVersion() catch return error.SkipZigTest) < 6) return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeSignalOff)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeSignalOn)).status);
+}
+
+/// An abstract-namespace UNIX listener owned by the test process.
+var g_ll_abstract: linux.sockaddr.un = undefined;
+var g_ll_abstract_len: linux.socklen_t = 0;
+
+fn childLandlockScopeAbstract(scoped: bool) void {
+    if (scoped) {
+        var rs = Ruleset.initWith(.{ .fs = 0, .scoped = Ruleset.scope.abstract_unix_socket }) catch linux.exit(80);
+        defer rs.deinit();
+        if (rs.scoped != Ruleset.scope.abstract_unix_socket) linux.exit(84);
+        noNewPrivs() catch linux.exit(82);
+        rs.restrictSelf() catch linux.exit(83);
+    }
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) linux.exit(90);
+    const fd: i32 = @intCast(@as(isize, @bitCast(rc)));
+    const want: E = if (scoped) .PERM else .SUCCESS;
+    if (linux.errno(linux.connect(fd, @ptrCast(&g_ll_abstract), g_ll_abstract_len)) != want) linux.exit(42);
+    linux.exit(0);
+}
+
+fn childScopeAbstractOn() void {
+    childLandlockScopeAbstract(true);
+}
+
+fn childScopeAbstractOff() void {
+    childLandlockScopeAbstract(false);
+}
+
+test "landlock scope (ABI 6): abstract UNIX socket — no connect to a listener outside the domain, control can" {
+    if ((landlockAbiVersion() catch return error.SkipZigTest) < 6) return error.SkipZigTest;
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(@as(isize, @bitCast(rc)));
+    defer _ = linux.close(fd);
+    g_ll_abstract = .{ .path = @splat(0) };
+    // Abstract namespace: a leading NUL byte, no filesystem entry to clean up.
+    const name = try std.fmt.bufPrint(g_ll_abstract.path[1..], "zig_sandbox_scope_{d}", .{linux.getpid()});
+    g_ll_abstract_len = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
+    if (linux.errno(linux.bind(fd, @ptrCast(&g_ll_abstract), g_ll_abstract_len)) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.listen(fd, 4)) != .SUCCESS) return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeAbstractOff)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeAbstractOn)).status);
 }
 
 // ── real: rlimit (fork children) ─────────────────────────────────────────────
@@ -2307,6 +3322,63 @@ fn childClearCapabilities() void {
 
 test "clearCapabilities: effective/permitted/inheritable read back as zero" {
     const res = try runInChild(childClearCapabilities);
+    try testing.expect(res.exitedWith(0));
+}
+
+// ── mutation-audit additions (2026-10-04) ────────────────────────────────────
+
+test "seccomp.buildRules accepts exactly max_rules rules (kills the `>=` boundary mutant)" {
+    const rules: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read });
+    const prog = try seccomp.buildRules(testing.allocator, &rules, .kill_process);
+    testing.allocator.free(prog);
+}
+
+test "seccomp.actionWord: every action maps to its own SECCOMP_RET word (kills .log/.allow word swaps)" {
+    try testing.expectEqual(seccomp.ret_log, seccomp.actionWord(.log));
+    try testing.expectEqual(seccomp.ret_allow, seccomp.actionWord(.allow));
+    try testing.expectEqual(seccomp.ret_kill_process, seccomp.actionWord(.kill_process));
+    try testing.expectEqual(seccomp.ret_kill_thread, seccomp.actionWord(.kill_thread));
+    try testing.expectEqual(seccomp.ret_trap, seccomp.actionWord(.trap));
+    try testing.expectEqual(seccomp.ret_errno | 4095, seccomp.actionWord(.{ .errno = 4095 }));
+    try testing.expect(seccomp.actionWord(.log) != seccomp.actionWord(.allow));
+}
+
+test "seccomp.actionAvailable: agrees with available(), and strips the errno data bits before asking" {
+    if (!seccomp.available()) {
+        try testing.expect(!seccomp.actionAvailable(.kill_process));
+        return;
+    }
+    try testing.expect(seccomp.actionAvailable(.kill_process));
+    try testing.expect(seccomp.actionAvailable(.trap));
+    // An errno action carries data bits; the kernel only knows the bare word.
+    try testing.expect(seccomp.actionAvailable(.{ .errno = 1 }));
+}
+
+test "landlock initWith: bits the ABI does not know are clamped away, never handed to the kernel (kills the clamp mutants)" {
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    // Bit 20 (fs), bit 5 (net, scope) exist in no ABI: unclamped they make
+    // landlock_create_ruleset fail with EINVAL.
+    var rs = try Ruleset.initWith(.{
+        .fs = Ruleset.access.read_file | (1 << 20),
+        .net = Ruleset.access_net.bind_tcp | (1 << 5),
+        .scoped = Ruleset.scope.signal | (1 << 5),
+    });
+    defer rs.deinit();
+    try testing.expectEqual(Ruleset.access.read_file, rs.handled);
+    try testing.expectEqual(Ruleset.netMaskForAbi(rs.abi) & Ruleset.access_net.bind_tcp, rs.handled_net);
+    try testing.expectEqual(Ruleset.scopeMaskForAbi(rs.abi) & Ruleset.scope.signal, rs.scoped);
+}
+
+fn childRestrictWithoutNoNewPrivs() void {
+    var rs = Ruleset.init() catch linux.exit(80);
+    if (rs.restrictSelf()) |_| linux.exit(77) else |e| linux.exit(if (e == error.NoNewPrivsRequired) 0 else 1);
+}
+
+test "landlock restrictSelf without no-new-privs reports NoNewPrivsRequired, not a generic failure" {
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    if (linux.getuid() == 0) return error.SkipZigTest; // CAP_SYS_ADMIN would allow it
+    const res = try runInChild(childRestrictWithoutNoNewPrivs);
+    if (res.exitedWith(77)) return error.SkipZigTest; // the harness already runs under no-new-privs
     try testing.expect(res.exitedWith(0));
 }
 

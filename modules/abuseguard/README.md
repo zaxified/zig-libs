@@ -73,6 +73,27 @@ failure, malformed input, …) — and manage lists manually: `ban`, `unban`
 (full forgiveness), `greylist(ip, ttl_ms)`, `isBanned`, `isGreylisted`.
 Diagnostics: `connCount(ip)`, `totalConns()`, `trackedCount()`.
 
+Operator controls (all keyed as described under *Keying* below):
+
+```zig
+const allow = [_]netaddr.Prefix{ netaddr.parsePrefix("192.0.2.0/24").? }; // health checker
+var guard = abuseguard.Guard.init(gpa, .{
+    .allow = &allow, // fail2ban ignoreip; borrowed, must outlive the Guard
+    .ipv6_key_bits = 64, // default: one /64 = one client; 128 = per address
+    .max_prefix_bans = 256,
+});
+try guard.banPrefix(netaddr.parsePrefix("203.0.113.0/24").?); // range ban
+_ = guard.unbanPrefix(netaddr.parsePrefix("203.0.113.0/24").?);
+
+// Persist bans across a restart (the caller owns the file):
+const recs = try guard.snapshot(gpa); // bans, range bans, live greylists
+defer gpa.free(recs);
+try abuseguard.writeSnapshot(recs, writer); // "ban <prefix>" / "greylist <prefix> <ms>"
+// ... after restart, per line of the file:
+if (try abuseguard.parseSnapshotLine(line)) |rec| try list.append(gpa, rec);
+try guard.restore(list.items);
+```
+
 ## Semantics (and where they come from)
 
 - **Admission (`on_connect`):** reject when the peer IP is banned, is
@@ -93,12 +114,34 @@ Diagnostics: `connCount(ip)`, `totalConns()`, `trackedCount()`.
   punished (the server's fault, not the client's). Register the guard
   middleware first so it wraps — and therefore observes — inner middleware
   denials and the router's own 404/405.
-- **Keying:** the socket peer IP, keyed in its 16-byte mapped form so an
-  IPv4-mapped IPv6 peer and its plain IPv4 form are **one client, one
-  entry** (`netaddr` unmap semantics). Ports are irrelevant. The middleware
+- **Keying:** the socket peer IP, unmapped (an IPv4-mapped IPv6 peer and
+  its plain IPv4 form are **one client, one entry**, `netaddr` unmap
+  semantics) and then masked to `Options.ipv6_key_bits` (default **64**:
+  one subscriber is one /64, RFC 6177, so an attacker rotating addresses
+  inside it shares one budget) or `ipv4_key_bits` (default 32). Live-conn
+  count, strikes, ban, greylist and offenses are per such key, and every
+  public function taking an `ip` masks it the same way -- so
+  `max_conns_per_ip` is a cap per /64 for IPv6 clients. Set
+  `ipv6_key_bits = 128` for the old per-address behaviour. Ports are
+  irrelevant. The middleware
   can key on the `ratelimit` trusted-XFF chain instead
   (`Options.middleware_key = .forwarded_ip`) for behind-proxy deployments;
   header values must parse as IP literals or they fall through to the peer.
+- **Allowlist (`Options.allow`):** a member of any listed prefix (matched
+  after unmapping) is never rejected for reputation -- not by an entry's
+  ban/greylist, not by `banPrefix` -- and `record` / the middleware's
+  auto-strike do nothing for it. Caps still apply (a cap is not
+  reputation). A manual `ban`/`greylist` of a member is stored but ignored
+  while it stays listed; `isBanned` reports the stored state.
+- **Range bans:** `banPrefix` / `unbanPrefix` (at most `max_prefix_bans`,
+  linear scan per admission, checked before any entry is created so a
+  rejected peer costs no store slot). Independent of the key width.
+- **Persistence:** `snapshot` returns the bans, range bans and live
+  greylists (remaining time rounded up); strikes and offense counts are not
+  kept. `restore` puts a key-width record back as a key ban/greylist and a
+  ban of another width as a range ban; a greylist of another width is
+  `InvalidRecord`. The text codec is one line per record, `#` comments and
+  blank lines ignored on read.
 - **Bounded store (the store must not be an abuse vector itself):** at most
   `max_tracked_ips` entries. Fully-lapsed entries (no live connections, no
   ban, no offenses, greylist over, strikes decayed away) are swept from the

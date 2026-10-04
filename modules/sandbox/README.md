@@ -19,12 +19,18 @@ Five independent steps, weakest-precondition first:
    (`RLIMIT_CORE=0`) so a crash can't spill in-memory keys to a core file.
 4. **Landlock** — an unprivileged filesystem **allow-list** (kernel ≥ 5.13):
    `init()` handles every filesystem right (deny by default), `allowPath`
-   grants what each tree may be used for, `restrict_self` enforces. ABI
-   version is negotiated; a too-old kernel returns a typed error.
-5. **seccomp-bpf** — a classic-BPF syscall **allow-list** installed via
-   `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`, with a configurable action for
-   denied calls (kill the process, or return an errno). Ships a tunable default
-   allow-list for a non-blocking network server.
+   grants what each tree may be used for, `restrict_self` enforces. Opt-in on
+   top: TCP **port** rules (`allowPort`, ABI 4+), IPC **scopes** (no signal or
+   abstract-UNIX connect out of the domain, ABI 6+), and `TSYNC` for a process
+   that already has threads (ABI 8+). ABI version is negotiated; a too-old
+   kernel returns a typed error, and what could not be enforced is readable on
+   the ruleset.
+5. **seccomp-bpf** — a classic-BPF syscall filter installed via
+   `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` or `seccomp(2)` + `TSYNC`: a
+   plain number **allow-list** with a configurable deny action (kill, errno,
+   trap, log), a W^X preset, and general **rules** with per-argument conditions
+   and per-rule actions (`buildRules`). Ships a tunable default allow-list for a
+   non-blocking network server.
 
 - **Model after:** the Linux kernel UAPI (`prctl`/`seccomp`/`landlock`/
   `capability`) plus the sandboxing shape of OpenSSH's seccomp filter and
@@ -52,8 +58,9 @@ third-party implementation was ported or studied. See SPEC.md for the citation.
 const sandbox = @import("sandbox");
 
 // Do this LAST, after bind()/listen() and opening every privileged fd — and
-// BEFORE spawning worker threads (Landlock and the prctl-form seccomp
-// install confine the calling thread only; Landlock has no TSYNC).
+// BEFORE spawning worker threads (Landlock's plain restrictSelf and the
+// prctl-form seccomp install confine the calling thread only; the TSYNC
+// forms below exist for a process that already has threads).
 
 // 1. no-new-privs (also required before an unprivileged seccomp filter).
 try sandbox.noNewPrivs();
@@ -80,6 +87,16 @@ if (sandbox.landlockAbiVersion()) |_| {
     try ll.restrictSelf(); // needs noNewPrivs() first
 } else |_| { /* kernel too old / disabled — log and continue */ }
 
+// 4b. Files AND TCP ports AND IPC scopes. Network rights are opt-in: a
+//     server that dials out must allowPort every remote port it uses.
+var strict = try sandbox.Landlock.initWith(.everything);
+defer strict.deinit();
+try strict.allowPath("/var/www", sandbox.Landlock.access.read_only);
+try strict.allowPort(443, sandbox.Landlock.access_net.connect_tcp); // upstream
+try strict.allowPort(53, sandbox.Landlock.access_net.connect_tcp);  // DNS over TCP
+if (strict.handled_net == 0) log.warn("kernel < ABI 4: TCP ports not restricted", .{});
+try strict.restrictSelfAllThreads(); // ABI 8+: every thread; error below it
+
 // 5. seccomp syscall allow-list — kill the process on anything off the list.
 const prog = try sandbox.seccomp.buildDefault(gpa, .kill_process);
 defer gpa.free(prog);
@@ -99,6 +116,23 @@ try sandbox.seccomp.install(wx);
 // Already multi-threaded at hardening time? install() only filters the
 // calling thread — use the seccomp(2)+TSYNC form to cover every thread.
 try sandbox.seccomp.installTsync(prog);
+
+// General rules: first match wins; a syscall no rule matches gets the default.
+const S = sandbox.seccomp;
+const rules = [_]S.Rule{
+    // socket() only for AF_INET (2) / AF_INET6 (10); `.u32`: an int argument.
+    .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = 2 }} },
+    .{ .sysno = .socket, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = 10 }} },
+    .{ .sysno = .socket, .action = .{ .errno = 97 } }, // EAFNOSUPPORT for the rest
+    .{ .sysno = .read }, .{ .sysno = .write }, .{ .sysno = .close }, .{ .sysno = .exit_group },
+};
+const p3 = try S.buildRules(gpa, &rules, .kill_process);
+defer gpa.free(p3);
+
+// Profiling a list before enforcing it: `.log` lets everything run and
+// audit-logs what the list would have refused.
+const probe = try S.build(gpa, &custom, .log);
+defer gpa.free(probe);
 ```
 
 ### Landlock access rights
@@ -117,6 +151,19 @@ deployment that means it.) `allowPath` refuses a symlink as the final path
 component (`error.PathIsSymlink`) — resolve it yourself if that is what you
 mean. The handled mask is intersected with what the running ABI supports, so
 the same code degrades cleanly across kernels.
+
+`Landlock.access_net` (`bind_tcp`, `connect_tcp`) and `Landlock.scope`
+(`abstract_unix_socket`, `signal`) are **opt-in** through `initWith(.{ .net =
+…, .scoped = … })` or `initWith(.everything)`: `init()` handles files only,
+because handling TCP without granting the ports a server dials out to would
+break it on every kernel with ABI 4+. `allowPort(port, rights)` grants a local
+port for `bind_tcp` (port 0 = an ephemeral port) and a remote port for
+`connect_tcp`; on a kernel below ABI 4 it is a no-op, since nothing is
+restricted there, and `handled_net` / `scoped` read 0 so the caller can log or
+refuse. `restrictSelfWith(.{ … })` passes the ABI 7 audit-logging flags
+(dropped on older kernels — they only change logging) and `tsync` (ABI 8),
+which `restrictSelfAllThreads` wraps; `tsync` below ABI 8 is
+`error.ThreadSyncNotSupported`, never a silent calling-thread-only restriction.
 
 ### seccomp default allow-list
 
@@ -137,7 +184,26 @@ entry's nr 39 is `mkdir`, while x86-64's nr 39 is `getpid`. (x32 is stopped
 by default-deny, not by the guard — it reports `AUDIT_ARCH_X86_64`, but its
 numbers carry `__X32_SYSCALL_BIT` and never equal a bare allowed `nr`.)
 `Action.errno` must be in `1..4095`; `.errno = 0` would make a denied call
-report success.
+report success. `.log` (Linux 4.14+, check `seccomp.actionAvailable`) as the
+deny action is the profiling mode; `.allow` is refused there
+(`error.InvalidAction`).
+
+### seccomp rules (argument conditions, per-rule actions)
+
+`seccomp.buildRules(gpa, rules, default_action)` compiles an ordered list of
+`Rule{ sysno, when, action }`: the **first** rule whose number matches and whose
+conditions (`ArgCmp{ arg, op, width, value, mask }`, all of them, at most 6)
+hold decides; anything no rule matches gets `default_action`. Operators are
+unsigned `eq ne lt le gt ge masked_eq`. **`width` is required**: `.u32`
+compares the low 32 bits only — exactly what the kernel uses for an `int`
+parameter (`socket` family, `ioctl` request, `prctl` option), so a raw syscall
+with junk in the high half cannot slip past a deny rule; `.u64` compares the
+whole register for `long`/pointer/`size_t` parameters. A deny-list
+(`default_action = .allow` or `.log`) is supported but weaker than an
+allow-list — a syscall nobody listed is allowed. On x86-64 every `buildRules`
+program kills x32-numbered syscalls (`nr ≥ __X32_SYSCALL_BIT`, same
+`AUDIT_ARCH_X86_64`), which a deny-list would otherwise let through. Dispatch
+is a linear scan (no binary tree yet): fine for tens of rules.
 
 ### seccomp W^X preset
 
@@ -203,8 +269,20 @@ zig build test-sandbox -Doptimize=ReleaseFast
   it cannot create, overwrite, mkdir, symlink or unlink outside the tree, nor
   write inside it, while `read_write` on the tree still permits creating
   there; a symlink handed to `allowPath` is refused by name; a worker thread
-  spawned before `restrictSelf` is measured unconfined (there is no TSYNC for
-  Landlock — restrict before spawning). Skips on a pre-5.13 kernel.
+  spawned before `restrictSelf` is measured unconfined, and confined by
+  `restrictSelfAllThreads` (ABI 8). Skips on a pre-5.13 kernel.
+- **Landlock net / scopes** — against two loopback listeners the child may
+  bind port 0 and connect to the granted port only; the other, busy port
+  gives EACCES where an unconfined control gets EADDRINUSE (so the denial is
+  Landlock's, not the port's). With `scope.signal` the child cannot
+  `kill(parent, 0)`, with `scope.abstract_unix_socket` it cannot connect to
+  the parent's abstract socket; both controls can. Each skips below its ABI.
+- **seccomp rules** — `buildRules` output is run through a classic-BPF
+  interpreter and compared with a direct evaluation of the rules on 40 000
+  random rule sets × 16 inputs aimed at 32-bit word boundaries. On the
+  kernel: a `socket(AF_UNIX)` deny rule holds against a junk high word,
+  `close(fd ≥ 1000)` is exact at 999/1000, x32 numbers are killed under a
+  deny-list, and `.log` lets calls run.
 - **rlimit** — a child caps `RLIMIT_NOFILE`, exhausts it (EMFILE at the cap),
   and confirms it cannot raise the hard limit back.
 - **privilege drop** — needs to *start* as root; drops to `nobody` and asserts
@@ -219,12 +297,10 @@ sudo zig build test-sandbox                     # adds the priv-drop tests
 
 ## Deferred (v2)
 
-- seccomp **argument** filtering beyond the W^X preset — e.g. allow
-  `socket(AF_INET)` but deny `AF_PACKET`, or gate `ioctl` requests. The W^X
-  preset (`buildWx`/`buildDefaultWx`) and `seccomp(2)`+`TSYNC`
-  (`installTsync`) are both built; general-purpose arg matching on arbitrary
-  syscalls/argument indices is not.
-- Landlock **network** rules (`LANDLOCK_RULE_NET_PORT`, ABI 4+) and the
-  scoped-abstraction rules (ABI 6+).
+- seccomp `USER_NOTIF` / `TRACE` actions, multi-architecture filters (compat
+  ABIs in one program), binary-tree dispatch for long rule lists.
+- Landlock ABI 9+ (`FS_RESOLVE_UNIX`, UDP rights, `ADD_RULE_QUIET`,
+  `RESTRICT_SELF_NO_NEW_PRIVS`) — not in the kernel this was built and tested
+  against.
 - Remains Linux-only — the documented ceiling (no OpenBSD `pledge`/`unveil`,
   no FreeBSD Capsicum).
