@@ -1231,3 +1231,143 @@ test "corpus: every CSR seed reaches parseCsr, and the SANs recovered are pinned
     try testing.expectEqual(@as(usize, 2), accepted);
     try testing.expectEqual(@as(usize, 3), sans_recovered);
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "isValidDomain: the RFC 1035 limits and the LDH alphabet" {
+    // RFC 1035 §2.3.4: labels ≤ 63 octets, names ≤ 255 octets on the wire
+    // (≤ 253 as text without the trailing dot); RFC 952/1123 LDH: letters,
+    // digits, hyphen — no underscore in a hostname.
+    const l63 = "a" ** 63;
+    try testing.expect(isValidDomain(l63 ++ ".example"));
+    try testing.expect(!isValidDomain("a" ** 64 ++ ".example"));
+    const n253 = l63 ++ "." ++ l63 ++ "." ++ l63 ++ "." ++ "a" ** 61; // 253
+    try testing.expect(isValidDomain(n253));
+    try testing.expect(!isValidDomain(n253 ++ "a"));
+    try testing.expect(!isValidDomain("under_score.example"));
+}
+
+test "readElem: indefinite length and a truncated long-form length are malformed" {
+    // X.690 §10.1 (DER): definite length only — 0x80 is BER's indefinite
+    // form; and a long-form length whose octets are missing cannot be read.
+    try testing.expectError(error.Malformed, readElem("\x04\x80\x00\x00", 0));
+    try testing.expectError(error.Malformed, readElem("\x04\x82\x01", 0));
+}
+
+test "derWellFormed: nesting past the depth bound is refused, not recursed into" {
+    // `wellFormedRange` stops at depth 32 so attacker-controlled DER cannot
+    // drive unbounded recursion; 40 nested SEQUENCEs are well-formed TLVs and
+    // must still be refused.
+    var buf: [80]u8 = undefined;
+    for (0..40) |i| {
+        buf[2 * i] = 0x30;
+        buf[2 * i + 1] = @intCast(2 * (39 - i));
+    }
+    try testing.expect(!derWellFormed(&buf));
+    try testing.expect(derWellFormed(buf[2 * 20 ..])); // 20 levels: fine
+}
+
+test "parseCsr: trailing bytes, a foreign version or algorithm, and a nonzero unused-bits octet are refused by name" {
+    // `parseCsr` checks version 0 and the P-256/ES256 algorithms (RFC 2986
+    // §4.1, RFC 5480, RFC 5758 §3.2) before the signature and reports them
+    // as `UnsupportedCsr`; bytes after the CSR are not part of it.
+    const kp = testKeyPair(5);
+    const good = try csrDer(testing.allocator, kp, &.{"example.org"});
+    defer testing.allocator.free(good);
+    var p = try parseCsr(testing.allocator, good); // control
+    p.deinit();
+
+    var buf: [1024]u8 = undefined;
+    @memcpy(buf[0..good.len], good);
+    buf[good.len] = 0;
+    try testing.expectError(error.MalformedCsr, parseCsr(testing.allocator, buf[0 .. good.len + 1]));
+
+    const Case = struct { pattern: []const u8, delta: usize, last: bool };
+    const cases = [_]Case{
+        .{ .pattern = "\x02\x01\x00", .delta = 2, .last = false }, // version 0 -> 1
+        .{ .pattern = oid_ec_public_key, .delta = 0, .last = false },
+        .{ .pattern = oid_p256, .delta = 0, .last = false },
+        .{ .pattern = "\x03\x42\x00\x04", .delta = 2, .last = false }, // BIT STRING unused bits
+        .{ .pattern = oid_ecdsa_sha256, .delta = 0, .last = true }, // signatureAlgorithm (unsigned)
+    };
+    for (cases) |c| {
+        @memcpy(buf[0..good.len], good);
+        const at = (if (c.last) std.mem.lastIndexOf(u8, good, c.pattern) else std.mem.indexOf(u8, good, c.pattern)).? + c.delta;
+        buf[at] ^= 1;
+        try testing.expectError(error.UnsupportedCsr, parseCsr(testing.allocator, buf[0..good.len]));
+    }
+}
+
+/// `csrDer`'s structure with two knobs it never sets: an explicit
+/// `critical` flag on the SAN extension, and an extra iPAddress GeneralName.
+fn csrVariant(gpa: Allocator, key_pair: Es256.KeyPair, critical: bool, ip: bool) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d: Der = .{ .a = arena.allocator() };
+    const pub_sec1 = key_pair.public_key.toUncompressedSec1();
+    const spki = try d.seq(&.{
+        try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(oid_p256) }),
+        try d.bitString(&pub_sec1),
+    });
+    const names = if (ip)
+        try d.seq(&.{ try d.tlv(0x87, "\x7f\x00\x00\x01"), try d.tlv(0x82, "example.org") })
+    else
+        try d.seq(&.{try d.tlv(0x82, "example.org")});
+    const san_ext = if (critical)
+        try d.seq(&.{ try d.oid(oid_subject_alt_name), try d.tlv(0x01, "\xff"), try d.tlv(0x04, names) })
+    else
+        try d.seq(&.{ try d.oid(oid_subject_alt_name), try d.tlv(0x04, names) });
+    const attributes = try d.tlv(0xa0, try d.seq(&.{ try d.oid(oid_extension_request), try d.tlv(0x31, try d.seq(&.{san_ext})) }));
+    const info = try d.seq(&.{ try d.tlv(0x02, "\x00"), try d.seq(&.{}), spki, attributes });
+    const sig = try key_pair.sign(info, null);
+    var sig_buf: [Es256.Signature.der_encoded_length_max]u8 = undefined;
+    const csr = try d.seq(&.{ info, try d.seq(&.{try d.oid(oid_ecdsa_sha256)}), try d.bitString(sig.toDer(&sig_buf)) });
+    return gpa.dupe(u8, csr);
+}
+
+test "parseCsr: a critical SAN extension is read, and only dNSName entries are returned" {
+    // RFC 5280 §4.1: Extension ::= SEQUENCE { extnID, critical BOOLEAN
+    // DEFAULT FALSE, extnValue } — the flag may be present. §4.2.1.6: a
+    // GeneralName is one of several choices; dNSName is [2], iPAddress [7],
+    // and an IP address is not a DNS name.
+    const kp = testKeyPair(6);
+    const crit = try csrVariant(testing.allocator, kp, true, false);
+    defer testing.allocator.free(crit);
+    var p1 = try parseCsr(testing.allocator, crit);
+    defer p1.deinit();
+    try testing.expectEqual(@as(usize, 1), p1.sans.len);
+    try testing.expectEqualStrings("example.org", p1.sans[0]);
+    const with_ip = try csrVariant(testing.allocator, kp, false, true);
+    defer testing.allocator.free(with_ip);
+    var p2 = try parseCsr(testing.allocator, with_ip);
+    defer p2.deinit();
+    try testing.expectEqual(@as(usize, 1), p2.sans.len);
+    try testing.expectEqualStrings("example.org", p2.sans[0]);
+}
+
+test "pemDecode: an over-long label and an empty body are typed errors" {
+    // The label is caller-supplied and formatted into fixed buffers (see
+    // `pemDecode`'s comment); RFC 7468 §3: a block carries base64 data.
+    try testing.expectError(error.LabelTooLong, pemDecode(testing.allocator, "L" ** (max_pem_label_len + 1), "x"));
+    try testing.expectError(error.InvalidPem, pemDecode(testing.allocator, "CERTIFICATE", "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"));
+}
+
+test "ecPrivateKeyFromPem: version must be 1 and the private octets at most 32" {
+    // RFC 5915 §3: ECPrivateKey version is ecPrivkeyVer1 (1); privateKey is
+    // ceiling(log2(n)/8) = 32 octets for P-256.
+    const kp = testKeyPair(7);
+    const pem = try ecPrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(pem);
+    const der_bytes = try pemDecode(testing.allocator, "EC PRIVATE KEY", pem);
+    defer testing.allocator.free(der_bytes);
+    const v_at = std.mem.indexOf(u8, der_bytes, "\x02\x01\x01").? + 2;
+    der_bytes[v_at] = 2;
+    const pem_v2 = try pemEncode(testing.allocator, "EC PRIVATE KEY", der_bytes);
+    defer testing.allocator.free(pem_v2);
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(testing.allocator, pem_v2));
+
+    const long_priv = "\x30\x26\x02\x01\x01\x04\x21" ++ "\x01" ** 33;
+    const pem_long = try pemEncode(testing.allocator, "EC PRIVATE KEY", long_priv);
+    defer testing.allocator.free(pem_long);
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(testing.allocator, pem_long));
+}

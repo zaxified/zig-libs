@@ -702,3 +702,57 @@ test "verifyFlattened: malformed and tampered inputs never verify" {
     const no_key = "{\"protected\":\"" ++ "eyJhbGciOiJFUzI1NiJ9" ++ "\",\"payload\":\"\",\"signature\":\"" ++ ("A" ** 86) ++ "\"}";
     try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, no_key, null));
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+/// A flattened JWS with a hand-written protected header, genuinely ES256-
+/// signed by `kp` over `b64(protected) "." b64(payload)` — so the only
+/// thing wrong with it is whatever the header says.
+fn craftJws(a: std.mem.Allocator, kp: KeyPair, protected: []const u8, sig_extra: []const u8) ![]u8 {
+    const p64 = try base64UrlEncodeAlloc(a, protected);
+    const input = try std.mem.concat(a, u8, &.{ p64, "." });
+    const sig = try kp.sign(input, null);
+    const raw = try std.mem.concat(a, u8, &.{ &sig.toBytes(), sig_extra });
+    const s64 = try base64UrlEncodeAlloc(a, raw);
+    return std.fmt.allocPrint(a, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+}
+
+test "verifyFlattened refuses a validly signed JWS whose header breaks RFC 8555 §6.2 / RFC 7518" {
+    // §6.2: alg MUST be an asymmetric algorithm the server supports (ES256
+    // here); "jwk" and "kid" are mutually exclusive, exactly one present;
+    // the JWK must be an EC P-256 key (RFC 7518 §6.2.1) with 32-byte
+    // coordinates. And an account-key verification (`expected_key`) must
+    // use THAT key — an embedded jwk cannot substitute its own. Every JWS
+    // below carries a genuine signature by the key it names.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kp = try rfc7515KeyPair();
+    var jwk_buf: [256]u8 = undefined;
+    const jwk = canonicalJwk(&jwk_buf, kp.public_key);
+
+    const ok = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    var v = try verifyFlattened(testing.allocator, ok, null); // control
+    v.deinit();
+
+    const bad_alg = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES384\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, bad_alg, null));
+    const both = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"kid\":\"acct\",\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, both, null));
+    const rsa_kty = try std.mem.replaceOwned(u8, a, jwk, "\"kty\":\"EC\"", "\"kty\":\"RSA\"");
+    const wrong_kty = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{rsa_kty}), "");
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, wrong_kty, null));
+    const short_x = "{\"alg\":\"ES256\",\"jwk\":{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"" ++ rfc7515_y ++ "\"},\"nonce\":\"n\",\"url\":\"u\"}";
+    try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, try craftJws(a, kp, short_x, ""), null));
+    // A 65-byte "signature": the real 64 bytes plus one — not an ES256
+    // signature (RFC 7518 §3.4: exactly R ‖ S, 64 octets).
+    const long_sig = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "\x00");
+    try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, long_sig, null));
+
+    // An attacker's own key, embedded as jwk, against the account key.
+    const attacker = try KeyPair.generateDeterministic(@splat(9));
+    var ajwk_buf: [256]u8 = undefined;
+    const ajwk = canonicalJwk(&ajwk_buf, attacker.public_key);
+    const forged = try craftJws(a, attacker, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ajwk}), "");
+    try testing.expectError(error.BadSignature, verifyFlattened(testing.allocator, forged, kp.public_key));
+}

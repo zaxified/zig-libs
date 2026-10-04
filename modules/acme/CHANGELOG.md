@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (47 mutants, 43 killed, 3 equivalent, 1 alive
+  by design). Nine new tests: validly signed JWS whose header breaks RFC 8555 §6.2 / RFC 7518
+  (alg, jwk+kid, kty, short coordinate, 65-octet signature, an embedded jwk against the account
+  key), RFC 1035 domain limits, DER indefinite/truncated lengths and the nesting bound, CSR
+  fields refused by name plus a critical SAN and a non-dNSName entry, PEM label/body errors,
+  RFC 5915 key version/length, and the challenge responder never serving a slash-bearing name.
+  No behaviour change.
 - **2026-09-30** — **DNS-01 challenge and wildcard certificates.** `ChallengeType.dns_01`,
   `Options.dns_publisher` (`DnsPublisher`: `present`/`cleanup` callbacks — provider code stays the
   caller's), `jws.dns01TxtValue`, `Client.dns01RecordName`, `x509.isValidWildcardDomain`. `obtain`

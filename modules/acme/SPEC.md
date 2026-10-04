@@ -6,7 +6,7 @@
 
 **Scope:** core — Go `x/crypto/acme` + `autocert` (RFC 8555 client for auto-TLS servers), against lego and certbot; all three challenges incl. DNS-01/wildcards; no EAB, no revocation, no ARI (surveyed 2026-09-30; raised from mvp 2026-09-30 with DNS-01)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -106,6 +106,27 @@ STRING shape; those re-parsed bytes are frozen as a golden and compared byte-for
 encoder's output (see `x509.zig`'s "openssl builds + re-parses the same bytes we do" test). A live
 `acme-tls/1` TLS handshake against a real CA remains out of scope, since running the TLS listener is
 app/ianic territory — that is a distinct gap from the extension encoding closed here.
+
+**Mutation (2026-10-04,** schemata over a copy of `jws.zig` + `x509.zig` + `root.zig` +
+`Client.zig`, one ReleaseSafe build of every test except the two loopback `integration:` ones):
+47 mutants — the token alphabet and bounds, `keyAuthorization`'s token check, every
+`verifyFlattened` gate (empty parts, 64-octet signature, alg, jwk/kid exclusivity, JWK kty/crv,
+which key verifies, the verify itself, coordinate length), `isValidDomain`'s limits and alphabet,
+the wildcard prefix, every `readElem` bound, `wellFormedRange`'s three checks, every `parseCsr`
+check (trailing bytes, version, both key OIDs, unused bits, signature OID, signature, critical
+flag, dNSName tag), `pemDecode`'s label and empty-body checks, the EC key version and length,
+`certNotAfter`'s pre-scan, `needsRenewal`'s boundary and fail direction, and in `Client.zig` the
+responder's method/nested-path/length checks, first-http-01 selection, `isBadNonce` and the
+unknown-status fallback. First run: 18 killed, 29 alive; nine tests added (crafted, validly
+signed JWS headers breaking RFC 8555 §6.2 / RFC 7518 — incl. an embedded jwk substituting for the
+account key; RFC 1035 name limits; DER indefinite/truncated lengths; the depth bound; CSR fields
+refused by name; a critical SAN and a non-dNSName GeneralName; PEM label/body; RFC 5915 key
+version/length; the responder never serving a slash-bearing name); rerun: 43 killed,
+3 equivalent, 1 alive. Equivalent: `verifyFlattened`'s empty protected/signature check (an empty
+protected header fails the JSON parse, an empty signature the 64-octet check, with the same
+error), and `wellFormedRange`'s child-past-parent error and final `index == end` (each is
+redundant given the other). Alive: `parseAuthz` taking the FIRST http-01 challenge when a CA
+lists two — RFC 8555 does not define duplicates, so no test pins a choice. No defect found.
 
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the

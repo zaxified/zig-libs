@@ -2256,3 +2256,21 @@ test "parseAuthz: selects dns-01 and reads the wildcard flag" {
     const plain = try parseAuthz(a, "{\"status\":\"pending\",\"challenges\":[]}");
     try testing.expect(!plain.wildcard and plain.dns01 == null);
 }
+
+// ── audit 2026-10-04: test asked for by a mutation survivor ──────────────────
+
+test "Responder: a path with a '/' after the prefix is never a token, even one that was set" {
+    // RFC 8555 §8.3: the token is a single path segment (base64url, §8.1 —
+    // no '/'); the responder answers only that shape, so a key authorization
+    // stored under a slash-bearing name (only `set` by hand can do it) is
+    // never served.
+    var responder = Responder.init(testing.allocator);
+    defer responder.deinit();
+    try responder.set("a/b", "a/b.THUMBPRINT");
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(responder.middleware());
+    var buf: [1024]u8 = undefined;
+    const nested = runWire(&r, wire("GET", "/.well-known/acme-challenge/a/b"), &buf);
+    try testing.expect(std.mem.startsWith(u8, nested, "HTTP/1.1 404"));
+}
