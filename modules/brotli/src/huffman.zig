@@ -167,3 +167,12 @@ fn sort4(v: *[4]u16) void {
         }
     }
 }
+
+test "buildComplex: only complete codes are accepted (RFC 7932 section 3.5)" {
+    const gpa = std.testing.allocator;
+    // Lengths 1,2,2 are complete; 1,2 leaves a quarter unused; 1,1,1 is over-subscribed.
+    var ok = try buildComplex(gpa, &.{ 1, 2, 2 });
+    ok.deinit(gpa);
+    try std.testing.expectError(error.InvalidHuffman, buildComplex(gpa, &.{ 1, 2 }));
+    try std.testing.expectError(error.InvalidHuffman, buildComplex(gpa, &.{ 1, 1, 1 }));
+}

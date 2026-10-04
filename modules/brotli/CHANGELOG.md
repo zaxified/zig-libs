@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix (BEHAVIOURAL): a meta-block whose commands produced more than MLEN bytes
+  (an insert, a copy or a dictionary word running past the declared length) was accepted and
+  decoded to more bytes than MLEN. RFC 7932 section 9.2 requires exactly MLEN; the reference decoder
+  rejects such streams, and `decompress`/`decompressStream` now fail with `InvalidLength`. Malformed
+  streams that used to decode now fail; valid streams are unaffected. Found by the mutation run below.
+- **2026-10-04** — Tests: dated mutation run (132 switches, 110 killed, 22 equivalent; see SPEC).
+  New `src/crafted_test.zig` (hand-built RFC 7932 streams, cross-checked with the python reference
+  decoder: metadata blocks, header guards, simple/complex prefix-code bounds, block-type switching,
+  trivial-literal detection, dictionary and transform limits, window edge 1008/1009, MLEN overshoot,
+  ring wrap in the streaming decoder, read-ahead contract), `transformWord` semantics tests
+  (UPPERCASE_FIRST/ALL, OMIT_FIRST/LAST 1..9), a WBITS table test, and a `buildComplex` completeness test.
+
 - **2026-09-30** — **Encoder: effort levels and a stronger encoder** (maturity task C19, second half).
   New `compressWith(gpa, input, .{ .effort = .fast | .default | .best })`, `CompressOptions`, `Effort`;
   `compress` = `.default`. Matches are scored by the bits they save (the block's literal entropy

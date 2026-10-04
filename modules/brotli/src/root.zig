@@ -82,6 +82,7 @@ test {
     // produced them is `tools/interop.zig`.
     _ = @import("interop_replay_test.zig");
     _ = @import("stream_test.zig");
+    _ = @import("crafted_test.zig");
 }
 
 fn expectDecodes(comptime name: []const u8) !void {

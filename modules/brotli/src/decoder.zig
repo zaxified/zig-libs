@@ -537,6 +537,8 @@ fn DecoderOf(comptime Sink: type) type {
                     self.block_length[0] -= 1;
                 }
                 mlen -= insert_len;
+                // RFC 7932 9.2: the commands produce exactly MLEN bytes.
+                if (mlen < 0) return error.InvalidLength;
                 if (mlen <= 0) break;
 
                 // Distance.
@@ -591,6 +593,7 @@ fn DecoderOf(comptime Sink: type) type {
                     try self.ensureRoom(wlen);
                     try self.out.putSlice(buf[0..wlen]);
                     mlen -= @intCast(wlen);
+                    if (mlen < 0) return error.InvalidLength;
                 } else {
                     // Normal LZ77 backward copy.
                     if (distance <= 0) return error.InvalidDistance;
@@ -604,6 +607,7 @@ fn DecoderOf(comptime Sink: type) type {
                     var k: usize = 0;
                     while (k < copy) : (k += 1) try self.out.put(self.out.back(d));
                     mlen -= @intCast(copy);
+                    if (mlen < 0) return error.InvalidLength;
                 }
                 if (mlen <= 0) break;
             }
@@ -881,4 +885,33 @@ pub fn decompressStream(gpa: std.mem.Allocator, in: *std.Io.Reader, out: *std.Io
     try sink.flushAll();
     try out.flush();
     return sink.total;
+}
+
+test "WBITS codes (RFC 7932 section 9.1)" {
+    // The stream header: "0" is 16; "1" + 3 bits n != 0 is 17 + n; "1" + "000"
+    // + 3 bits m is 17 for m = 0, invalid (large window) for m = 1, 8 + m
+    // otherwise. Bits are listed in reading order, first bit first.
+    const Case = struct { bits: []const u8, want: ?u6 };
+    const cases = [_]Case{
+        .{ .bits = "0", .want = 16 },
+        .{ .bits = "1100", .want = 18 }, // n = 1 (3-bit field, LSB first: 100)
+        .{ .bits = "1111", .want = 24 }, // n = 7
+        .{ .bits = "1000000", .want = 17 },
+        .{ .bits = "1000100", .want = null }, // m = 1
+        .{ .bits = "1000010", .want = 10 }, // m = 2
+        .{ .bits = "1000110", .want = 11 }, // m = 3
+        .{ .bits = "1000111", .want = 15 }, // m = 7
+    };
+    for (cases) |c| {
+        var byte = [_]u8{ 0, 0 };
+        for (c.bits, 0..) |ch, i| {
+            if (ch == '1') byte[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+        }
+        var br = BitReader.init(&byte);
+        if (c.want) |w| {
+            try std.testing.expectEqual(w, try decodeWindowBits(&br));
+        } else {
+            try std.testing.expectError(error.InvalidWindowBits, decodeWindowBits(&br));
+        }
+    }
 }

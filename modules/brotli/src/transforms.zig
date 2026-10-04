@@ -309,3 +309,53 @@ pub fn transformWord(dst: []u8, word: []const u8, len_in: usize, transform_idx: 
     std.debug.assert(idx <= dst.len);
     return idx;
 }
+
+// --- RFC 7932 Appendix B / section 8 semantics (mutation run 2026-10-04) ------
+// Transforms with an empty prefix and suffix, so the output is the bare word
+// transform: 0 identity, 9 UPPERCASE_FIRST, 44 UPPERCASE_ALL, and the OMIT
+// kinds (indices from the Appendix B table, type column).
+
+fn applyBare(idx: usize, word: []const u8, out: []u8) []const u8 {
+    const n = transformWord(out, word, word.len, idx);
+    return out[0..n];
+}
+
+test "transform: uppercase first (section 8)" {
+    var buf: [64]u8 = undefined;
+    // ASCII lower case a..z is xor 32; the neighbours of the range are not.
+    try std.testing.expectEqualStrings("Abcd", applyBare(9, "abcd", &buf));
+    try std.testing.expectEqualStrings("Zbcd", applyBare(9, "zbcd", &buf));
+    try std.testing.expectEqualStrings("`bcd", applyBare(9, "`bcd", &buf));
+    try std.testing.expectEqualStrings("{bcd", applyBare(9, "{bcd", &buf));
+    // A first byte 0xC0..0xDF starts a two-byte sequence: the second byte is
+    // xor 32; the lead byte below 0xC0 is a one-byte rule.
+    try std.testing.expectEqualSlices(u8, &.{ 0xC0, 'A', 'b', 'c' }, applyBare(9, &.{ 0xC0, 'a', 'b', 'c' }, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0xBF, 'a', 'b', 'c' }, applyBare(9, &.{ 0xBF, 'a', 'b', 'c' }, &buf));
+    // 0xE0 and above: a three-byte sequence, the third byte is xor 5.
+    try std.testing.expectEqualSlices(u8, &.{ 0xE0, 'a', 'g', 'c' }, applyBare(9, &.{ 0xE0, 'a', 'b', 'c' }, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0xDF, 'A', 'b', 'c' }, applyBare(9, &.{ 0xDF, 'a', 'b', 'c' }, &buf));
+}
+
+test "transform: uppercase all, including sequences cut short by the word's end (section 8)" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{ 'A', 'B', 0xC3, 0x89 }, applyBare(44, &.{ 'a', 'b', 0xC3, 0xA9 }, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0xE2, 0x82, 0xA9, 'A' }, applyBare(44, &.{ 0xE2, 0x82, 0xAC, 'a' }, &buf));
+    // A lead byte whose continuation is missing is left alone.
+    try std.testing.expectEqualSlices(u8, &.{ 'A', 'B', 'C', 0xC3 }, applyBare(44, &.{ 'a', 'b', 'c', 0xC3 }, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 'A', 'B', 0xE0, 0x80 }, applyBare(44, &.{ 'a', 'b', 0xE0, 0x80 }, &buf));
+}
+
+test "transform: omit first N and omit last N, N = 1..9 (Appendix B)" {
+    var buf: [64]u8 = undefined;
+    const word = "abcdefghijkl";
+    const omit_last = [_]usize{ 12, 27, 23, 42, 63, 56, 48, 59, 64 }; // OMIT_LAST_1..9
+    for (omit_last, 1..) |idx, n| try std.testing.expectEqualStrings(word[0 .. word.len - n], applyBare(idx, word, &buf));
+    const omit_first = [_]struct { idx: usize, n: usize }{
+        .{ .idx = 3, .n = 1 },  .{ .idx = 11, .n = 2 }, .{ .idx = 26, .n = 3 }, .{ .idx = 34, .n = 4 },
+        .{ .idx = 39, .n = 5 }, .{ .idx = 40, .n = 6 }, .{ .idx = 55, .n = 7 }, .{ .idx = 54, .n = 9 },
+    };
+    for (omit_first) |o| try std.testing.expectEqualStrings(word[o.n..], applyBare(o.idx, word, &buf));
+    // Omitting at least the whole word leaves nothing.
+    try std.testing.expectEqualStrings("", applyBare(64, "abcd", &buf));
+    try std.testing.expectEqualStrings("", applyBare(54, "abcd", &buf));
+}

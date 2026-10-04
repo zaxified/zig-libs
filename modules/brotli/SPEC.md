@@ -6,7 +6,7 @@
 
 **Scope:** core — google/brotli 1.2.0 (surveyed 2026-09-30; raised from mvp 2026-09-30: streaming decoder, effort levels, an encoder between the reference's q5 and q9)
 
-**Audit:** review 2026-08-06 · mutation ?
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -265,6 +265,32 @@ larger than its input, and `compress` itself never fails except on allocation.
   to stay *consistent* between writer and reader (perturbing `reverseBits` in
   the shared `huffman.zig`): it leaves every self round-trip green and is caught
   only by the reference decoder — which is exactly why that anchor exists.
+
+- **Mutation run 2026-10-04** (schemata, one ReleaseSafe build, 132 switches in `decoder.zig`,
+  `bitreader.zig`, `huffman.zig`, `transforms.zig`: meta-block and metadata headers, WBITS, simple and
+  complex prefix-code bounds, context map, block-type switching, distance ring and short codes,
+  dictionary/transform bounds, MLEN accounting, the ring sink's flush/grow/wrap and cap logic, bit reader
+  edges). First run: 63 survivors — the hostile-header guards had no test at all. 110 killed, 22 equivalent.
+  New hand-built streams (`src/crafted_test.zig`, each checked against the python reference decoder),
+  `transformWord` semantics tests, a `decodeWindowBits` table test and a `buildComplex` completeness
+  test killed the rest. **Defect found and fixed:** a command producing more than MLEN bytes was
+  accepted (the reference rejects it); now `InvalidLength`. The 22 equivalent: `n == 0` in
+  VarLenUint8 (`(1<<0)+0` is the same 1); the checks on tables whose alphabets already bound the value
+  (`block_length` code < 26, `dist_offset.len`, `shift == 0`, `woff + copy`, `dv > max_allowed_distance`
+  — a 24-bit distance code cannot reach 2^31, `h.mlen > 2^24` — six nibbles cannot exceed it, the null
+  type/length trees — unreachable while a block count can only run out after the last command,
+  `distance <= 0`); the two redundant prefix-code completeness guards (`space2 != 0` is backed by the
+  Kraft check in `buildComplex` for two or more symbols and now has its own single-symbol test;
+  `num_codes == 1 or space == 0` likewise; `l > 15` and `nonzero == 0` fail with the same error one line
+  later); the ring's `min(2*len, limit)` and the cap-bounded limit (the ring never wraps under a
+  smaller cap, so only memory differs); refill at `cnt < 56`; `ttype > len` / `skip >= len` in
+  `transformWord` (the boundary case gives the same empty word either way); `r <= 0` /
+  `r >= max_allowed_distance` for ring distances (both give `InvalidDistance`, the second is
+  unreachable); `wlen == 0 and distance <= 120` (cannot fire: a transform that empties the word has an
+  index of 12 or more, hence a distance far above 120). ⚠ The sentence above about the fuzz harness's
+  surviving mutant ("the stored copy ignoring the unwritten-bytes bound is equivalent") was wrong:
+  a stored block that starts mid-ring and is longer than the free tail loses unwritten bytes without
+  that bound; `crafted: stream: a stored block longer than the ring's free tail…` kills it.
 - All tests pass in **Debug** and **ReleaseFast** (`zig build test-brotli`
   [`-Doptimize=ReleaseFast`]).
 
