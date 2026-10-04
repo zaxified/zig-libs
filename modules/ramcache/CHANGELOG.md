@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix (**BEHAVIOURAL**): `Sharded.stats()` now reports `rehashes` (it was
+  silently always 0 because the aggregator never added the field).
+- **2026-10-04** — Tests: mutation run (60 mutants, 58 killed, 2 unpinned heuristic boundaries)
+  added TTL-boundary agreement of get/pin/eviction, exact `max_bytes` values, region sizes, the
+  admission coin, sketch reset, saturating deadlines, the `evictStep` progress guard, heap-order
+  checks after random operations and a non-vacuous reflective `Sharded.stats` test.
 - **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** `Sharded`'s `on_evict`/`drainDirty` contract
   now states that a callback must not suspend in a `std.Io` when tasks of one thread share the
   cache (the shard lock does not wait through the `Io`). Documentation only.

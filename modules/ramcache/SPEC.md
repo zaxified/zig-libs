@@ -6,7 +6,7 @@
 
 **Scope:** core — Caffeine 3.3.0 (W-TinyLFU) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation ?
+**Audit:** review 2026-08-11 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -257,6 +257,29 @@ dedicated copy-window test existed, which is why it exists); the same for `get`'
 `put` without its lock (5/5); `shardIndex` collapsed to a constant; `clear`, `stats` and
 `drainDirty` each skipping a shard; `markCleanIf` acking unconditionally; `buffer_too_small`
 reported as a miss; per-shard caps not divided.
+
+**Mutation run 2026-10-04.** 60 schemata mutants (one ReleaseSafe build, env switch, 20 s cap per
+run) over `root.zig` and `sharded.zig`: TTL and generation comparisons in `get`/`pin`/the expiry
+heap, `max_bytes` ceilings (insert, replace, reserve), entry/byte eviction triggers, window and
+protected region sizes, the admission gate (`>=` vs `>`, the `>= 6` coin, its rate), sketch
+saturation/reset, saturating deadlines, expiry/LRU heap sift directions, `removeMatching`, the
+progress guard, `Sharded` shard clamping, `getBuf` exact fit, `stats` aggregation, `markCleanIf`,
+`clear`/`drainDirty` shard coverage and the lock-held-during-copy invariant. 58 killed (including
+3 by timeout), 2 survivors not pinned on purpose: the aging trigger `samples >= sample_limit` vs
+`>` and the tombstone rebuild trigger `removals < max(32, cap/4)` vs `<=` -- both are approximate
+heuristics by their own doc ("~10x capacity", "passes a quarter of the capacity"), one sample or
+one removal of difference has no observable contract, and a test would enshrine an arbitrary
+boundary. First pass: 29 survivors; tests added (WHY in each test: doc comment or
+module invariant): TTL boundary agreement of get/pin/eviction, gen 0 immunity for `pin`,
+exact `max_bytes` values, region sizes (1%, 80%), the admit coin (threshold 6, rate 1/128, via a
+fixed-PRNG band), sketch reset per nibble, saturating deadlines (insert, replace, release),
+replacing a TTL entry with ttl 0, the `evictStep` progress guard (a corrupted node must end the
+loop), `removeMatching` with a key equal to the prefix, a 4000-step random operation test that
+checks every heap's order and back-pointers after each step, non-zero `Sharded.stats` fields,
+`deriveSeed` uniqueness. The `getBuf`/`get` early-unlock mutants were killed deterministically by
+the copy-window probe test (no race test involved). Finding fixed in the same run (behavioural):
+`Sharded.stats()` did not add `Stats.rehashes` (always 0); the reflective stats test now makes
+every field, `rehashes` included, non-zero.
 
 ## Backlog / deferred
 

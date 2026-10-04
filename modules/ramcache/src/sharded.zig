@@ -533,6 +533,7 @@ pub const Sharded = struct {
             // a missing line, and the aggregation test now walks `Stats`
             // reflectively so the next field cannot be dropped the same way.
             total.pinned += st.pinned;
+            total.rehashes += st.rehashes;
         }
         return total;
     }
@@ -1635,4 +1636,52 @@ test "concurrent stress: parallel clear never leaves a shard behind or double-fr
     sc.clear();
     try testing.expectEqual(@as(usize, 0), sc.stats().entries);
     try expectInvariants(&sc);
+}
+
+// ── mutation run 2026-10-04 ─────────────────────────────────────────────────
+
+test "stats() sums admissions, rejections, expired and evictions too -- with non-zero values" {
+    // The reflective test above compares every field but its workload leaves
+    // several of them at 0, where a dropped term is invisible. Here a skewed
+    // workload with TTLs and a tiny cap makes each of them positive.
+    var sc = try testSharded(1 << 20, 16, 2);
+    defer sc.deinit();
+    var kbuf: [16]u8 = undefined;
+    var state: u64 = 0xDEC0DE;
+    var i: i64 = 0;
+    while (i < 3000) : (i += 1) {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r = state >> 33;
+        const key = if (r % 3 == 0)
+            std.fmt.bufPrint(&kbuf, "hot{d}", .{r % 4}) catch unreachable
+        else
+            std.fmt.bufPrint(&kbuf, "cold{d}", .{@rem(i, 97)}) catch unreachable;
+        const now = i * 10;
+        sc.put(key, "vv", now, if (@rem(i, 7) == 0) 30 else 0, 0);
+        var buf: [8]u8 = undefined;
+        _ = sc.getBuf(key, now + 100, 0, &buf);
+    }
+    var sum: Stats = .{};
+    for (sc.shards) |*sh| {
+        const st = sh.cache.stats;
+        inline for (@typeInfo(Stats).@"struct".fields) |f| {
+            @field(sum, f.name) += @field(st, f.name);
+        }
+    }
+    const agg = sc.stats();
+    try testing.expect(agg.admissions > 0);
+    try testing.expect(agg.rejections > 0);
+    try testing.expect(agg.expired > 0);
+    try testing.expect(agg.evictions > 0);
+    try testing.expect(agg.rehashes > 0); // the field the aggregator once dropped
+    try testing.expect(agg.entries > 0 and agg.bytes > 0);
+    inline for (@typeInfo(Stats).@"struct".fields) |f| {
+        try testing.expectEqual(@field(sum, f.name), @field(agg, f.name));
+    }
+}
+
+test "deriveSeed gives two different seeds for the same anchor address" {
+    // Doc on `seed_counter`: two caches built back to back get different
+    // seeds "even if the allocator hands back the same address".
+    try testing.expect(Sharded.deriveSeed(0x1000) != Sharded.deriveSeed(0x1000));
 }

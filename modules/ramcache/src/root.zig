@@ -3172,3 +3172,234 @@ test "hit-ratio benchmark: W-TinyLFU beats plain LRU on a skewed trace" {
     // And by a real margin, not noise: at least 10% more hits.
     try testing.expect(c.stats.hits * 10 >= lru_hits * 11);
 }
+
+// ── mutation run 2026-10-04: boundary and heap-order pins ───────────────────
+//
+// Each test kills mutants the earlier suite let survive (SPEC.md "Mutation
+// run 2026-10-04"). The WHY of every expected value is stated per test.
+
+test "TTL boundary: fresh at exactly ttl, expired one ns later; get, pin and the eviction pass agree" {
+    // The module's predicate is `(now - inserted) > ttl` everywhere (the
+    // expiry-heap comment in `findExpiredKey` says it is the same as the scan
+    // it replaced), so now - inserted == ttl is still fresh.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("k", "v", 0, 100, 0);
+    try testing.expect(c.get("k", 100, 0) != null);
+    try testing.expect(c.get("k", 101, 0) == null);
+
+    c.put("p", "v", 0, 100, 0);
+    const b = c.pin("p", 100, 0).?;
+    c.release(b);
+    try testing.expect(c.pin("p", 101, 0) == null);
+
+    // The eviction pass must not call an entry expired that `get` still serves.
+    // cap 2: B (no ttl) -> probation, A (ttl 100) stays in the window and gets hot.
+    var d = testCache(1 << 20, 2);
+    defer d.deinit();
+    d.put("B", "b", 0, 0, 0);
+    d.put("A", "a", 0, 100, 0);
+    var i: usize = 0;
+    while (i < 4) : (i += 1) _ = d.get("A", 50, 0);
+    // Pressure at now == A's deadline: candidate A (freq 5) beats victim B
+    // (freq 1), so B goes. If A were treated as expired it would go instead.
+    d.put("C", "c", 100, 0, 0);
+    try testing.expect(d.get("A", 100, 0) != null);
+    try testing.expect(d.get("B", 100, 0) == null);
+}
+
+test "generation 0 is immune to generation bumps for pin as well as get" {
+    // Documented on `put`: `gen == 0` = TTL-only, not invalidated by a bump.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("k", "v", 0, 0, 0);
+    const b = c.pin("k", 1, 7).?;
+    c.release(b);
+    try testing.expectEqualStrings("v", c.get("k", 1, 7).?);
+}
+
+test "a value of exactly max_bytes is stored (only a LARGER one is refused): insert, replace, reserve" {
+    // Doc on `Options.max_bytes`: "An item larger than this is never stored".
+    var c = testCache(8, 16);
+    defer c.deinit();
+    c.put("k", "12345678", 0, 0, 0);
+    try testing.expectEqualStrings("12345678", c.get("k", 1, 0).?);
+    c.put("k", "abcdefgh", 0, 0, 0); // replace path
+    try testing.expectEqualStrings("abcdefgh", c.get("k", 1, 0).?);
+    c.put("k", "123456789", 0, 0, 0); // one byte over: dropped, not served stale
+    try testing.expect(c.get("k", 1, 0) == null);
+
+    var d = testCache(8, 16);
+    defer d.deinit();
+    const f = d.reserve("r", 8, 0, 0, 0).?;
+    d.discard(f);
+    try testing.expect(d.reserve("r", 9, 0, 0, 0) == null);
+}
+
+test "region sizes: the window is ~1% and the protected segment 80% of the main region" {
+    // `windowCap` doc: "~1% of capacity (min 1)"; `protectedCap` doc: "80% of
+    // the main (non-window) region".
+    var c = testCache(1 << 20, 300);
+    defer c.deinit();
+    var kbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) c.put(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 3), c.window_count); // 300 / 100
+    try testing.expectEqual(@as(usize, 7), c.probation_count);
+
+    var d = testCache(1 << 20, 100);
+    defer d.deinit();
+    i = 0;
+    while (i < 100) : (i += 1) d.put(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+    i = 0;
+    while (i < 100) : (i += 1) _ = d.get(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, 1, 0);
+    // window 1, main 99, protected cap 99 * 4 / 5 = 79; the rest demoted to probation.
+    try testing.expectEqual(@as(usize, 1), d.window_count);
+    try testing.expectEqual(@as(usize, 79), d.protected_count);
+    try testing.expectEqual(@as(usize, 20), d.probation_count);
+}
+
+test "admit: a frequency tie is broken by a ~1/128 coin, and only for candidates with estimate >= 6" {
+    // `admit` doc: "A moderately warm candidate (estimate >= 6) occasionally
+    // wins a tie via a deterministic ~1/128 coin"; cold candidates never do.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.noteAccess("init"); // creates the sketch
+    const s = &c.sketch.?;
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        s.record("warm-cand");
+        s.record("warm-vict");
+    }
+    i = 0;
+    while (i < 5) : (i += 1) {
+        s.record("cool-cand");
+        s.record("cool-vict");
+    }
+    try testing.expectEqual(@as(u64, 6), s.estimate("warm-cand"));
+    try testing.expectEqual(@as(u64, 6), s.estimate("warm-vict"));
+    try testing.expectEqual(@as(u64, 5), s.estimate("cool-cand"));
+    try testing.expectEqual(@as(u64, 5), s.estimate("cool-vict"));
+
+    var warm_wins: usize = 0;
+    var cool_wins: usize = 0;
+    i = 0;
+    while (i < 64_000) : (i += 1) {
+        if (c.admit("warm-cand", "warm-vict")) warm_wins += 1;
+        if (c.admit("cool-cand", "cool-vict")) cool_wins += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), cool_wins);
+    // Expected 64000 / 128 = 500, sd ~22: a 1/64 or 1/256 coin lands far outside.
+    try testing.expect(warm_wins > 300 and warm_wins < 700);
+}
+
+test "sketch reset halves every 4-bit counter independently and clears the doorkeeper" {
+    var s = try FrequencySketch.init(testing.allocator, 16);
+    defer s.deinit(testing.allocator);
+    // nibbles (low to high): 3, 1 | 0, 15. floor(3/2)=1, floor(1/2)=0, 0, floor(15/2)=7.
+    s.counters[0] = 0x13;
+    s.counters[1] = 0xF0;
+    s.doorkeeper[0] = 0xFF;
+    s.samples = 10;
+    s.reset();
+    try testing.expectEqual(@as(u64, 0x01), s.counters[0]); // a carry from the next nibble would give 0x09
+    try testing.expectEqual(@as(u64, 0x70), s.counters[1]);
+    try testing.expectEqual(@as(u64, 0), s.doorkeeper[0]);
+    try testing.expectEqual(@as(u64, 5), s.samples);
+}
+
+test "a huge TTL saturates the deadline instead of overflowing (insert, replace, release)" {
+    // `+|` is deliberate: a practically-infinite TTL must not trap in a safe build.
+    const huge = std.math.maxInt(i64);
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("k", "v", 1000, huge, 0);
+    c.put("k", "w", 2000, huge, 0);
+    try testing.expectEqualStrings("w", c.get("k", 3000, 0).?);
+    const b = c.pin("k", 3000, 0).?;
+    c.release(b);
+    try testing.expectEqualStrings("w", c.get("k", 4000, 0).?);
+}
+
+test "replacing a TTL entry with ttl 0 removes it from the expiry heap (it never expires by time)" {
+    // Doc on `put`: ttl_ns <= 0 = no time expiry. A stale heap node would make
+    // the eviction pass drop the entry as "expired" under later pressure.
+    var c = testCache(1 << 20, 2);
+    defer c.deinit();
+    c.put("k", "v", 0, 100, 0);
+    c.put("k", "w", 10, 0, 0);
+    c.put("X", "x", 10, 0, 0); // k -> probation, X in the window
+    c.put("Y", "y", 1000, 0, 0); // pressure at now = 1000: window candidate X (freq 1) loses to k (freq 2)
+    try testing.expectEqualStrings("w", c.get("k", 1000, 0).?);
+    try testing.expect(c.get("X", 1000, 0) == null);
+}
+
+test "eviction terminates even when the chosen victim key is not in the map (progress guard)" {
+    // `evictStep` doc: "true has to mean an entry was actually removed" -- a
+    // node whose key the map does not hold must end the loop, not spin it.
+    // Corrupt a window node's key on purpose; without the guard `maintain`
+    // loops forever (the harness kills a hang at 20 s).
+    var c = testCache(1 << 20, 4);
+    defer c.deinit();
+    c.put("a", "1", 0, 0, 0);
+    c.put("b", "2", 0, 0, 0); // a -> probation, b stays in the window
+    c.options.max_entries = 1;
+    const node = c.map.getPtr("b").?.node;
+    const real_key = node.key;
+    node.key = &.{};
+    c.maintain(0);
+    node.key = real_key;
+    try testing.expectEqual(@as(usize, 2), c.map.count()); // nothing was removable
+}
+
+test "removeMatching removes a key equal to the prefix too" {
+    // "every resident entry whose key starts with `prefix`": a key equal to the prefix does.
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("ab", "1", 0, 0, 0);
+    c.put("abc", "2", 0, 0, 0);
+    c.put("b", "3", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 2), c.removeMatching("ab"));
+    try testing.expect(c.get("ab", 1, 0) == null);
+    try testing.expect(c.get("abc", 1, 0) == null);
+    try testing.expectEqualStrings("3", c.get("b", 1, 0).?);
+}
+
+fn expectHeapsOrdered(c: *Cache) !void {
+    for (&c.lru) |*h| {
+        for (h.items, 0..) |n, i| {
+            try testing.expectEqual(@as(u32, @intCast(i)), n.heap_idx);
+            if (i > 0) try testing.expect(h.items[(i - 1) / 2].tick <= n.tick);
+        }
+    }
+    for (c.exp.items, 0..) |n, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), n.exp_idx);
+        if (i > 0) try testing.expect(c.exp.items[(i - 1) / 2].deadline <= n.deadline);
+    }
+}
+
+test "random put/get/remove/replace sequences keep every region heap and the expiry heap ordered" {
+    // A heap whose root is not the minimum silently evicts the wrong entry, so
+    // the min-heap property (parent <= child on tick / deadline) and the
+    // back-pointers are checked after EVERY operation. Fixed LCG, 48 keys in a
+    // 100-entry cache: no eviction, so all three regions fill and entries move
+    // between them.
+    var c = testCache(1 << 20, 100);
+    defer c.deinit();
+    var state: u64 = 0x1234_5678_9ABC_DEF0;
+    var now: i64 = 0;
+    var kbuf: [16]u8 = undefined;
+    var step: usize = 0;
+    while (step < 4000) : (step += 1) {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const r = state >> 33;
+        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{r % 48}) catch unreachable;
+        now += @intCast(r % 7);
+        switch ((r >> 8) % 5) {
+            0, 1 => c.put(key, "v", now, if ((r >> 12) % 3 == 0) 0 else @as(i64, @intCast(20 + (r >> 14) % 400)), 0),
+            2, 3 => _ = c.get(key, now, 0),
+            else => _ = c.remove(key),
+        }
+        try expectHeapsOrdered(&c);
+    }
+}
