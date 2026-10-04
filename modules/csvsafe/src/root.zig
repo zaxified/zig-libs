@@ -320,3 +320,43 @@ test "guardSep honors a non-default decimal separator" {
     defer a.free(dangerous);
     try testing.expectEqualStrings("'-,5", dangerous);
 }
+
+// ── Mutation-run additions (2026-10-04) ────────────────────────────────────
+
+test "guard (default separator) decides like needsGuard: '.' is the decimal point" {
+    // `guard` must use `default_decimal_sep` ('.'): "-.5" is a number there
+    // and passes; "-,5" is not and is guarded. A `guard` that quietly used ','
+    // would flip both.
+    const a = testing.allocator;
+    const num = try guard(a, "-.5");
+    defer a.free(num);
+    try testing.expectEqualStrings("-.5", num);
+    const not_num = try guard(a, "-,5");
+    defer a.free(not_num);
+    try testing.expectEqualStrings("'-,5", not_num);
+}
+
+test "signed number tail: the caller's decimal separator is accepted, whatever byte it is" {
+    // The tail rule is "digits, the decimal separator, spaces" (plus the
+    // grouping punctuation '.' and ','). A custom separator byte must be
+    // honored in the tail as well as right after the sign: "-1_5" is a number
+    // for sep '_', and an unknown punctuation byte (so a possible formula
+    // character) for sep '.'.
+    try testing.expect(!needsGuardSep("-1_5", '_'));
+    try testing.expect(!needsGuardSep("+_5", '_'));
+    try testing.expect(needsGuardSep("-1_5", '.'));
+    try testing.expect(needsGuardSep("-1_5", ','));
+}
+
+test "signed number tail: digit-grouping '.' and ',' never make a number suspicious" {
+    // A tail of only digits, '.', ',' and spaces cannot contain an operator,
+    // a function name or a cell reference, so the cell is not executable
+    // under either locale (the invariant the exception relies on).
+    try testing.expect(!needsGuardSep("-1,000.50", '.'));
+    try testing.expect(!needsGuardSep("-1.000,50", ','));
+    try testing.expect(!needsGuardSep("+1 234,5", '.'));
+    try testing.expect(!needsGuardSep("+1 234.5", ','));
+    // ...while one formula-capable byte anywhere in the tail guards it.
+    try testing.expect(needsGuardSep("-1,000+1", '.'));
+    try testing.expect(needsGuardSep("-1.000;1", ','));
+}

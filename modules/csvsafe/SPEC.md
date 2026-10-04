@@ -6,7 +6,7 @@
 
 **Scope:** core — OWASP CSV Injection guidance; defusedcsv / go-safe-csv-writer as peers (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -61,6 +61,24 @@ exposed as `guard_char` for reference only, not a parameter).
 `needsGuard`/`needsGuardSep` over the dangerous-lead set and the signed-number exception (both
 decimal separators), `writeSafe`/`writeSafeSep` streaming output, `guard`/`guardSep` allocation
 round-trip.
+
+## Mutation run 2026-10-04
+
+27 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run): each of the nine guarded leads
+dropped one at a time (`=`, `@`, tab, CR, LF, `|`, `%`, `+`, `-`), the empty-cell check, the inverted
+signed-number decision, `isSignedNumber`'s length check, first-byte check and each of the tail's five
+accepted byte classes (digit, caller's separator, `.`, `,`, space), the default separator in `needsGuard`
+and `guard`, the separator argument dropped in `writeSafeSep` and `guardSep`, and the guard prefix (dropped,
+wrong byte, value not written, inverted in `guardSep`).
+First run: 23 killed, 4 survived (3 mutants of the tail/default separator, plus the `guard` default
+separator); all four were test gaps, none equivalent: the caller's separator inside the tail
+(`-1_5` with sep `_`), `,` as grouping punctuation under a `.` locale, and `guard` with the default separator.
+Tests added: 3, each stating the rule it pins. Final: 27 of 27 killed, 0 equivalent, 0 findings.
+
+Note for the SPEC's own prose: the code accepts both `.` and `,` in the tail of a signed number under every
+locale (grouping punctuation), not only the configured separator as the "Design & invariants" bullet reads;
+the invariant (no operator, function name or cell reference can be formed) still holds, so this is
+documentation drift, not a defect.
 
 ## Backlog / deferred
 From README "DEFER (intentionally out of scope for this v1)": RFC 4180 quoting, decimal-separator
