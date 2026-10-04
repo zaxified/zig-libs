@@ -129,6 +129,9 @@ pub const AttributeType = enum(u16) {
     unknown_attributes = 0x000A,
     realm = 0x0014,
     nonce = 0x0015,
+    message_integrity_sha256 = 0x001C,
+    password_algorithm = 0x001D,
+    userhash = 0x001E,
     xor_mapped_address = 0x0020,
     software = 0x8022,
     alternate_server = 0x8023,
@@ -160,6 +163,12 @@ pub const DecodeError = error{
 pub const BuildError = error{
     /// The caller buffer could not hold the next attribute.
     BufferTooSmall,
+    /// An attribute value longer than its field allows (ERROR-CODE reason
+    /// over 763 bytes, a value over 65535, an UNKNOWN-ATTRIBUTES list that
+    /// cannot fit one attribute).
+    ValueTooLong,
+    /// An ERROR-CODE outside 300-699 (RFC 8489 §14.8).
+    InvalidErrorCode,
 };
 
 // ── decoded address ──────────────────────────────────────────────────────────
@@ -181,6 +190,11 @@ pub const Builder = struct {
     buf: []u8,
     /// Bytes written so far = the total message length (header + attributes).
     len: usize,
+    /// The byte padding fills an attribute value to a 4-byte boundary with.
+    /// RFC 8489 §14: receivers MUST ignore it, senders may put anything — 0
+    /// here; RFC 5769's sample messages use 0x20, and setting it reproduces
+    /// them byte for byte.
+    pad: u8 = 0,
 
     /// Start a message: writes the 20-byte header (type, zero length, cookie,
     /// transaction id). Fails if `buf` cannot hold the header.
@@ -210,9 +224,44 @@ pub const Builder = struct {
         std.mem.writeInt(u16, self.buf[self.len..][0..2], typ, .big);
         std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], @intCast(value.len), .big);
         @memcpy(self.buf[self.len + 4 ..][0..value.len], value);
-        @memset(self.buf[self.len + 4 + value.len ..][0 .. padded - value.len], 0);
+        if (value.len > std.math.maxInt(u16)) return error.ValueTooLong;
+        @memset(self.buf[self.len + 4 + value.len ..][0 .. padded - value.len], self.pad);
         self.len += 4 + padded;
         self.setLengthField(self.attrRegionLen());
+    }
+
+    /// Append ERROR-CODE (RFC 8489 §14.8): class (hundreds) and number, then
+    /// a UTF-8 reason phrase of at most 763 bytes.
+    pub fn addErrorCode(self: *Builder, code: u16, reason: []const u8) BuildError!void {
+        if (code < 300 or code > 699) return error.InvalidErrorCode;
+        if (reason.len > 763) return error.ValueTooLong;
+        var v: [4 + 763]u8 = undefined;
+        v[0] = 0;
+        v[1] = 0;
+        v[2] = @intCast(code / 100);
+        v[3] = @intCast(code % 100);
+        @memcpy(v[4..][0..reason.len], reason);
+        return self.addAttribute(attrCode(.error_code), v[0 .. 4 + reason.len]);
+    }
+
+    /// Append UNKNOWN-ATTRIBUTES (RFC 8489 §14.9): the 16-bit types a 420
+    /// response names.
+    pub fn addUnknownAttributes(self: *Builder, types: []const u16) BuildError!void {
+        var v: [128]u8 = undefined;
+        if (types.len * 2 > v.len) return error.ValueTooLong;
+        for (types, 0..) |t, i| std.mem.writeInt(u16, v[i * 2 ..][0..2], t, .big);
+        return self.addAttribute(attrCode(.unknown_attributes), v[0 .. types.len * 2]);
+    }
+
+    /// Append USERNAME / REALM / NONCE (RFC 8489 §14.3/§14.9/§14.10).
+    pub fn addUsername(self: *Builder, name: []const u8) BuildError!void {
+        return self.addAttribute(attrCode(.username), name);
+    }
+    pub fn addRealm(self: *Builder, realm: []const u8) BuildError!void {
+        return self.addAttribute(attrCode(.realm), realm);
+    }
+    pub fn addNonce(self: *Builder, nonce: []const u8) BuildError!void {
+        return self.addAttribute(attrCode(.nonce), nonce);
     }
 
     /// Append a SOFTWARE attribute (a human-readable agent description).
@@ -270,6 +319,200 @@ pub const Builder = struct {
         return self.buf[0..self.len];
     }
 };
+
+/// The long-term credential key (RFC 8489 §9.2.2, the MD5 password
+/// algorithm): MD5(username ":" realm ":" password). Pass it to
+/// `Builder.addMessageIntegrity` / `Message.verifyMessageIntegrity`.
+///
+/// The three strings must already be processed as RFC 8489 requires —
+/// username and password through the OpaqueString profile (RFC 8265), realm
+/// as received. For printable ASCII that processing changes nothing, so
+/// ASCII credentials can be passed as they are; this module carries no
+/// Unicode tables and does not do it for anything else.
+pub fn longTermKey(username: []const u8, realm: []const u8, password: []const u8) [16]u8 {
+    var h = std.crypto.hash.Md5.init(.{});
+    h.update(username);
+    h.update(":");
+    h.update(realm);
+    h.update(":");
+    h.update(password);
+    var out: [16]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+// ── server side: the Binding responder ──────────────────────────────────────
+
+pub const ResponderOptions = struct {
+    /// SOFTWARE to include, if any.
+    software: ?[]const u8 = null,
+    /// Short-term credential: when set, the request must carry USERNAME and
+    /// a MESSAGE-INTEGRITY that verifies under this key (400 if either is
+    /// missing, 401 if the MAC fails), and the success response is signed
+    /// with it.
+    integrity_key: ?[]const u8 = null,
+    /// Append FINGERPRINT (RFC 8489 §14.7) to every response.
+    fingerprint: bool = true,
+    /// Comprehension-required attribute types (below 0x8000) the caller
+    /// understands beyond the STUN ones — e.g. ICE's PRIORITY (0x0024) and
+    /// USE-CANDIDATE (0x0025). Any other one gets a 420.
+    known_attributes: []const u16 = &.{},
+    /// See `Builder.pad`.
+    pad: u8 = 0,
+};
+
+pub const RespondError = BuildError || error{
+    /// Not a Binding request (an indication, a response, another method):
+    /// RFC 8489 §6.3 — drop it, send nothing.
+    NotBindingRequest,
+};
+
+/// Answer a Binding request received from `from` (RFC 8489 §6.3): a success
+/// response carrying XOR-MAPPED-ADDRESS = `from`, or the error response the
+/// request earns (420 with UNKNOWN-ATTRIBUTES for comprehension-required
+/// attributes the server does not understand, 400/401 for short-term
+/// credential failures). The response echoes the request's transaction id.
+pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: ResponderOptions) RespondError![]const u8 {
+    if (request.class != .request or request.method != .binding) return error.NotBindingRequest;
+
+    // §6.3.1: unknown comprehension-required attributes → 420.
+    var unknown: [32]u16 = undefined;
+    var n_unknown: usize = 0;
+    var it = request.attributes();
+    while (it.next()) |a| {
+        if (a.type >= 0x8000 or stunUnderstands(a.type)) continue;
+        if (std.mem.indexOfScalar(u16, opts.known_attributes, a.type) != null) continue;
+        if (std.mem.indexOfScalar(u16, unknown[0..n_unknown], a.type) != null) continue;
+        if (n_unknown < unknown.len) {
+            unknown[n_unknown] = a.type;
+            n_unknown += 1;
+        }
+    }
+    if (n_unknown > 0) {
+        var b = try Builder.init(out, .error_response, .binding, request.transaction_id);
+        b.pad = opts.pad;
+        try b.addErrorCode(420, "Unknown Attribute");
+        try b.addUnknownAttributes(unknown[0..n_unknown]);
+        if (opts.fingerprint) try b.addFingerprint();
+        return b.finish();
+    }
+
+    if (opts.integrity_key) |key| {
+        const has_user = request.find(attrCode(.username)) != null;
+        const has_mi = request.find(attrCode(.message_integrity)) != null;
+        if (!has_user or !has_mi) return errorResponse(request, out, 400, "Bad Request", opts);
+        if (!request.verifyMessageIntegrity(key)) return errorResponse(request, out, 401, "Unauthorized", opts);
+    }
+
+    var b = try Builder.init(out, .success_response, .binding, request.transaction_id);
+    b.pad = opts.pad;
+    if (opts.software) |sw| try b.addSoftware(sw);
+    try b.addMappedAddress(from.ip, from.port, true);
+    if (opts.integrity_key) |key| try b.addMessageIntegrity(key);
+    if (opts.fingerprint) try b.addFingerprint();
+    return b.finish();
+}
+
+fn errorResponse(request: Message, out: []u8, code: u16, reason: []const u8, opts: ResponderOptions) RespondError![]const u8 {
+    var b = try Builder.init(out, .error_response, .binding, request.transaction_id);
+    b.pad = opts.pad;
+    try b.addErrorCode(code, reason);
+    if (opts.fingerprint) try b.addFingerprint();
+    return b.finish();
+}
+
+/// Comprehension-required STUN attributes a Binding server handles itself.
+fn stunUnderstands(t: u16) bool {
+    return switch (t) {
+        attrCode(.username),
+        attrCode(.message_integrity),
+        attrCode(.message_integrity_sha256),
+        attrCode(.realm),
+        attrCode(.nonce),
+        attrCode(.password_algorithm),
+        attrCode(.userhash),
+        => true,
+        else => false,
+    };
+}
+
+// ── STUN / TURN URIs (RFC 7064, RFC 7065) ───────────────────────────────────
+
+pub const Uri = struct {
+    scheme: Scheme,
+    /// Host as written: a registered name, an IPv4 literal, or an IPv6
+    /// literal WITHOUT its brackets.
+    host: []const u8,
+    /// The explicit port, or the scheme's default (3478 / 5349).
+    port: u16,
+    /// TURN only: `?transport=` (RFC 7065 §3.1), null when absent.
+    transport: ?Transport = null,
+
+    pub const Scheme = enum { stun, stuns, turn, turns };
+    pub const Transport = enum { udp, tcp };
+
+    pub fn secure(u: Uri) bool {
+        return u.scheme == .stuns or u.scheme == .turns;
+    }
+};
+
+pub const UriError = error{InvalidUri};
+
+/// Parse `stun:` / `stuns:` (RFC 7064) and `turn:` / `turns:` (RFC 7065)
+/// URIs: scheme ":" host [":" port], and for TURN ["?transport=" (udp|tcp)].
+/// Default ports: 3478 for stun/turn, 5349 for stuns/turns (RFC 8489 §6.2.2,
+/// §6.2.3 — the TLS port). No userinfo, path or fragment is allowed.
+pub fn parseUri(text: []const u8) UriError!Uri {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidUri;
+    const scheme_text = text[0..colon];
+    const scheme: Uri.Scheme = inline for (@typeInfo(Uri.Scheme).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(scheme_text, f.name)) break @enumFromInt(f.value);
+    } else return error.InvalidUri;
+    var rest = text[colon + 1 ..];
+    var out: Uri = .{
+        .scheme = scheme,
+        .host = undefined,
+        .port = if (scheme == .stuns or scheme == .turns) 5349 else 3478,
+    };
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        if (scheme == .stun or scheme == .stuns) return error.InvalidUri; // RFC 7064 has no query
+        const query_part = rest[q + 1 ..];
+        const prefix = "transport=";
+        if (!std.ascii.startsWithIgnoreCase(query_part, prefix)) return error.InvalidUri;
+        const tv = query_part[prefix.len..];
+        out.transport = if (std.ascii.eqlIgnoreCase(tv, "udp")) .udp else if (std.ascii.eqlIgnoreCase(tv, "tcp")) .tcp else return error.InvalidUri;
+        rest = rest[0..q];
+    }
+    if (rest.len == 0) return error.InvalidUri;
+    var host_end: usize = undefined;
+    if (rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return error.InvalidUri;
+        out.host = rest[1..close];
+        if (out.host.len == 0) return error.InvalidUri;
+        for (out.host) |c| if (!(std.ascii.isHex(c) or c == ':' or c == '.')) return error.InvalidUri;
+        host_end = close + 1;
+    } else {
+        host_end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+        out.host = rest[0..host_end];
+        if (out.host.len == 0) return error.InvalidUri;
+        // RFC 3986 reg-name / IPv4address: unreserved, pct-encoded,
+        // sub-delims. "@" (userinfo), "/" (path), "#" (fragment) are not.
+        for (out.host) |c| {
+            const ok = std.ascii.isAlphanumeric(c) or switch (c) {
+                '-', '.', '_', '~', '%', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=' => true,
+                else => false,
+            };
+            if (!ok) return error.InvalidUri;
+        }
+    }
+    const tail = rest[host_end..];
+    if (tail.len > 0) {
+        if (tail[0] != ':' or tail.len == 1) return error.InvalidUri;
+        out.port = std.fmt.parseInt(u16, tail[1..], 10) catch return error.InvalidUri;
+        if (out.port == 0) return error.InvalidUri;
+    }
+    return out;
+}
 
 /// Build a bare Binding request (just the header) into `out`. The convenience
 /// entry point named in the module scope.
@@ -504,12 +747,52 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
 /// same unit, same "0 = wait indefinitely" convention — since both are one
 /// UDP request/response exchange with the identical bounding need.
 pub const QueryOptions = struct {
-    /// Receive budget; 0 = wait indefinitely. Default is 0, NOT `sntp`'s
-    /// 5000 ms: this preserves `query`'s original unbounded behavior so
-    /// existing callers of the collection are unaffected by this option's
-    /// introduction (three consumers pin this collection). Pass an explicit
-    /// non-zero value for a bounded probe.
+    /// Overall budget in ms; 0 = no cap beyond the retransmission schedule
+    /// below (which ends after `max_requests` sends and a final wait).
     timeout_ms: u32 = 0,
+    /// Initial retransmission timeout (RFC 8489 §6.2.1 RECOMMENDS 500 ms
+    /// when nothing better is known); doubles after every send.
+    rto_ms: u32 = 500,
+    /// Rc: requests sent in total (RFC 8489 default 7). 1 = no
+    /// retransmission (the pre-2026-10-04 behaviour).
+    max_requests: u8 = 7,
+    /// Rm: after the last request, wait `last_wait_factor * rto_ms` more
+    /// (RFC 8489 default 16).
+    last_wait_factor: u8 = 16,
+};
+
+/// The RFC 8489 §6.2.1 schedule: when (ms after the first send) each request
+/// goes out, and when the client gives up. With the defaults: 0, 500, 1500,
+/// 3500, 7500, 15500, 31500, giving up at 39500 — the RFC's own example.
+pub const Schedule = struct {
+    opts: QueryOptions,
+    sent: u8 = 0,
+    at_ms: u64 = 0,
+    rto_ms: u64,
+
+    pub fn init(opts: QueryOptions) Schedule {
+        return .{ .opts = opts, .rto_ms = opts.rto_ms };
+    }
+
+    /// Offset of the next send, or null when every request has gone out.
+    pub fn nextSend(s: *Schedule) ?u64 {
+        if (s.sent >= @max(s.opts.max_requests, 1)) return null;
+        const at = s.at_ms;
+        s.sent += 1;
+        // Saturating: `max_requests` up to 255 doubles the RTO past u64 —
+        // the schedule then just never comes due (timeout_ms still caps it).
+        s.at_ms +|= s.rto_ms;
+        s.rto_ms *|= 2;
+        return at;
+    }
+
+    /// When to stop waiting after send number `sent` (1-based): the next
+    /// send's time, or — after the last — that send plus Rm × the initial RTO.
+    pub fn waitUntil(s: *const Schedule) u64 {
+        if (s.sent < @max(s.opts.max_requests, 1)) return s.at_ms;
+        const last = s.at_ms - (s.rto_ms / 2);
+        return last + @as(u64, s.opts.last_wait_factor) * s.opts.rto_ms;
+    }
 };
 
 /// Send one Binding request to `server` over UDP and return the reflexive
@@ -521,12 +804,14 @@ pub const QueryOptions = struct {
 /// returned `AddressPort` only if you keep the (unrelated) reason slices — the
 /// address is copied out.
 ///
-/// `options.timeout_ms` bounds the wait for the reply (0 = wait indefinitely,
-/// the default — matching the original unbounded behavior of this function).
-/// On expiry this returns `error.Timeout`, the same error name `sntp.query`
-/// uses for the same condition. Exercised by two loopback tests below (a
-/// dark/no-responder timeout, and a normal answered exchange) — neither needs
-/// live network access.
+/// Retransmits per RFC 8489 §6.2.1 (`Schedule`: RTO doubling from
+/// `options.rto_ms`, `max_requests` sends, then `last_wait_factor` × RTO);
+/// `options.timeout_ms` caps the whole exchange (0 = only the schedule). A
+/// datagram that is not STUN or carries another transaction id is discarded
+/// and the wait goes on (§6.3.4); if nothing better arrives, the give-up error
+/// is that stray's (`TransactionMismatch`, `BadCookie`, …) instead of
+/// `error.Timeout`, the error a silent server earns. A STUN error response for
+/// our transaction stops the exchange with `error.ErrorResponse`.
 pub fn query(
     io: std.Io,
     server: std.Io.net.IpAddress,
@@ -544,21 +829,51 @@ pub fn query(
 
     var req_buf: [header_len]u8 = undefined;
     const req = try bindingRequest(txid, &req_buf);
-    try sock.send(io, &server, req);
 
-    const deadline = deadlineFromMs(io, options.timeout_ms);
-    const msg = try sock.receiveTimeout(io, buf, deadline);
-    const parsed = try decode(msg.data);
-    if (!std.mem.eql(u8, &parsed.transaction_id, &txid)) return error.TransactionMismatch;
-    return (try parsed.mappedAddress()) orelse error.NoMappedAddress;
-}
-
-/// Turn a millisecond budget into an `Io.Timeout` deadline; `0` means wait
-/// indefinitely. Mirrors `sntp`'s helper of the same name and shape.
-fn deadlineFromMs(io: std.Io, ms: u32) std.Io.Timeout {
-    if (ms == 0) return .none;
-    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
-    return t.toDeadline(io);
+    const clock: std.Io.Clock = .awake;
+    const start = std.Io.Clock.Timestamp.now(io, clock);
+    const cap_ms: ?u64 = if (options.timeout_ms == 0) null else options.timeout_ms;
+    var sched = Schedule.init(options);
+    // What arrived instead of our answer, if anything: reported on give-up
+    // in place of `error.Timeout`, so "the server answered garbage" stays
+    // distinguishable from "nothing came back" (the errors the pre-2026-10-04
+    // single-shot `query` returned at once).
+    var stray: ?(DecodeError || error{TransactionMismatch}) = null;
+    while (sched.nextSend()) |send_at| {
+        if (cap_ms) |c| if (send_at >= c) break;
+        try sock.send(io, &server, req);
+        var until = sched.waitUntil();
+        if (cap_ms) |c| until = @min(until, c);
+        const deadline: std.Io.Timeout = .{ .deadline = start.addDuration(.{
+            .raw = .fromMilliseconds(@intCast(until)),
+            .clock = clock,
+        }) };
+        // RFC 8489 §6.3.4: a response whose transaction id does not match,
+        // or a datagram that is not STUN at all, is discarded — keep
+        // waiting for ours until this send's window ends, then retransmit.
+        while (true) {
+            const msg = sock.receiveTimeout(io, buf, deadline) catch |e| switch (e) {
+                error.Timeout => break,
+                else => return e,
+            };
+            const parsed = decode(msg.data) catch |e| {
+                stray = e;
+                continue;
+            };
+            if (!std.mem.eql(u8, &parsed.transaction_id, &txid)) {
+                stray = error.TransactionMismatch;
+                continue;
+            }
+            if (parsed.class == .error_response) {
+                // A definitive answer (RFC 8489 §6.3.4): stop retransmitting.
+                return error.ErrorResponse;
+            }
+            if (parsed.class != .success_response) continue;
+            return (try parsed.mappedAddress()) orelse error.NoMappedAddress;
+        }
+    }
+    if (stray) |e| return e;
+    return error.Timeout;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1013,6 +1328,284 @@ test "query: normal answered path still works, unaffected by the bound" {
     const result = try query(io, server_sock.address, txid, &buf, .{ .timeout_ms = 5000 });
     try testing.expect(result.ip.eql(want_ip));
     try testing.expectEqual(@as(u16, 4989), result.port);
+}
+
+// ── 2026-10-04: retransmission, responder, URIs, long-term credentials ─────
+
+test "Schedule: the RFC 8489 §6.2.1 example — 0, 500, 1500, 3500, 7500, 15500, 31500, give up at 39500" {
+    // RFC 8489 §6.2.1: "if RTO is 500 ms, requests would be sent at times
+    // 0 ms, 500 ms, 1500 ms, 3500 ms, 7500 ms, 15500 ms, and 31500 ms. If
+    // the client has not received a response after 39500 ms, the client
+    // will consider the transaction to have timed out."
+    var sch = Schedule.init(.{});
+    const want = [_]u64{ 0, 500, 1500, 3500, 7500, 15500, 31500 };
+    for (want, 0..) |w, i| {
+        try testing.expectEqual(@as(?u64, w), sch.nextSend());
+        const until: u64 = if (i + 1 < want.len) want[i + 1] else 39500;
+        try testing.expectEqual(until, sch.waitUntil());
+    }
+    try testing.expectEqual(@as(?u64, null), sch.nextSend());
+    // No retransmission: one send, then Rm × RTO.
+    var one = Schedule.init(.{ .max_requests = 1, .rto_ms = 100, .last_wait_factor = 3 });
+    try testing.expectEqual(@as(?u64, 0), one.nextSend());
+    try testing.expectEqual(@as(u64, 300), one.waitUntil());
+    try testing.expectEqual(@as(?u64, null), one.nextSend());
+}
+
+test "Schedule: 255 requests saturate instead of overflowing" {
+    var sch = Schedule.init(.{ .max_requests = 255, .rto_ms = std.math.maxInt(u32) });
+    var n: usize = 0;
+    while (sch.nextSend()) |_| n += 1;
+    try testing.expectEqual(@as(usize, 255), n);
+    _ = sch.waitUntil();
+}
+
+test "bindingResponse reproduces RFC 5769 §2.2 and §2.3 byte for byte" {
+    // The §2.1 request carries USERNAME "evtj:h6vY", ICE's PRIORITY (0x0024,
+    // comprehension-required — the caller declares it known) and
+    // ICE-CONTROLLED (optional), a MESSAGE-INTEGRITY under the §2.1 password
+    // and a FINGERPRINT. §2.2/§2.3 are its success responses for a client at
+    // 192.0.2.1:32853 / [2001:db8:1234:5678:11:2233:4455:6677]:32853, with
+    // SOFTWARE "test vector" whose pad byte is 0x20 (RFC 5769 §2: "padding
+    // bytes are set to 0x20").
+    const req = try decode(&req_2_1);
+    const opts: ResponderOptions = .{
+        .software = "test vector",
+        .integrity_key = rfc5769_password,
+        .known_attributes = &.{0x0024},
+        .pad = 0x20,
+    };
+    var out: [128]u8 = undefined;
+    const r4 = try bindingResponse(req, .{ .ip = netaddr.parseIp("192.0.2.1").?, .port = 32853 }, &out, opts);
+    try testing.expectEqualSlices(u8, &resp_2_2, r4);
+    const r6 = try bindingResponse(req, .{ .ip = netaddr.parseIp("2001:db8:1234:5678:11:2233:4455:6677").?, .port = 32853 }, &out, opts);
+    try testing.expectEqualSlices(u8, &resp_2_3, r6);
+}
+
+test "bindingResponse: 420 for unknown comprehension-required attributes, 400/401 for credentials" {
+    const req = try decode(&req_2_1);
+    const from: AddressPort = .{ .ip = netaddr.parseIp("192.0.2.1").?, .port = 32853 };
+    var out: [128]u8 = undefined;
+    // PRIORITY (0x0024) is comprehension-required and not declared known:
+    // RFC 8489 §6.3.1 — 420 with UNKNOWN-ATTRIBUTES naming it, and no
+    // XOR-MAPPED-ADDRESS.
+    const e = try decode(try bindingResponse(req, from, &out, .{}));
+    try testing.expectEqual(Class.error_response, e.class);
+    try testing.expectEqualSlices(u8, &rfc5769_txid, &e.transaction_id);
+    try testing.expectEqual(@as(u16, 420), (try e.errorCode()).?.code);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x24 }, e.find(attrCode(.unknown_attributes)).?.value);
+    try testing.expect((try e.mappedAddress()) == null);
+    try testing.expect(e.verifyFingerprint());
+    // A wrong short-term key: 401 (RFC 8489 §9.1.3).
+    const u = try decode(try bindingResponse(req, from, &out, .{ .integrity_key = "wrong", .known_attributes = &.{0x0024} }));
+    try testing.expectEqual(@as(u16, 401), (try u.errorCode()).?.code);
+    // No USERNAME / MESSAGE-INTEGRITY at all while credentials are required: 400.
+    var bare_buf: [header_len]u8 = undefined;
+    const bare = try decode(try bindingRequest(rfc5769_txid, &bare_buf));
+    const b = try decode(try bindingResponse(bare, from, &out, .{ .integrity_key = rfc5769_password }));
+    try testing.expectEqual(@as(u16, 400), (try b.errorCode()).?.code);
+    // Without credentials the bare request gets its address, nothing else
+    // required; FINGERPRINT on by default, off on request.
+    const ok = try decode(try bindingResponse(bare, from, &out, .{}));
+    try testing.expectEqual(Class.success_response, ok.class);
+    try testing.expectEqual(from.port, (try ok.mappedAddress()).?.port);
+    try testing.expect(ok.verifyFingerprint());
+    const nofp = try decode(try bindingResponse(bare, from, &out, .{ .fingerprint = false }));
+    try testing.expect(nofp.find(attrCode(.fingerprint)) == null);
+    // Responses and indications are not answered.
+    try testing.expectError(error.NotBindingRequest, bindingResponse(try decode(&resp_2_2), from, &out, .{}));
+    // A duplicated unknown attribute is named once.
+    var dbuf: [64]u8 = undefined;
+    var db = try Builder.init(&dbuf, .request, .binding, rfc5769_txid);
+    try db.addAttribute(0x7001, "a");
+    try db.addAttribute(0x7001, "b");
+    try db.addAttribute(0x0006, "user"); // USERNAME: understood
+    const d = try decode(try bindingResponse(try decode(db.finish()), from, &out, .{}));
+    try testing.expectEqualSlices(u8, &.{ 0x70, 0x01 }, d.find(attrCode(.unknown_attributes)).?.value);
+}
+
+test "Builder: ERROR-CODE and UNKNOWN-ATTRIBUTES encode per RFC 8489 §14.8/§14.9" {
+    var buf: [64]u8 = undefined;
+    var b = try Builder.init(&buf, .error_response, .binding, rfc5769_txid);
+    try b.addErrorCode(438, "Stale Nonce");
+    // Class 4 in the low 3 bits of the third byte, number 38 in the fourth.
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x09, 0x00, 0x0f, 0, 0, 4, 38 }, buf[20..28]);
+    try testing.expectEqual(@as(u16, 438), (try (try decode(b.finish())).errorCode()).?.code);
+    try testing.expectError(error.InvalidErrorCode, b.addErrorCode(299, "x"));
+    try testing.expectError(error.InvalidErrorCode, b.addErrorCode(700, "x"));
+    try testing.expectError(error.ValueTooLong, b.addErrorCode(500, &([_]u8{'x'} ** 764)));
+    try testing.expectError(error.ValueTooLong, b.addUnknownAttributes(&([_]u16{1} ** 65)));
+}
+
+test "STUN/TURN URIs: RFC 7064 and RFC 7065 examples" {
+    // RFC 7064 §3.2 / RFC 7065 §3.2 examples, with the default ports of
+    // RFC 8489 §6.2.2/§6.2.3 (3478 UDP/TCP, 5349 TLS).
+    const S = Uri.Scheme;
+    for ([_]struct { []const u8, S, []const u8, u16, ?Uri.Transport }{
+        .{ "stun:example.org", .stun, "example.org", 3478, null },
+        .{ "stuns:example.org", .stuns, "example.org", 5349, null },
+        .{ "stun:example.org:8000", .stun, "example.org", 8000, null },
+        .{ "turn:example.org", .turn, "example.org", 3478, null },
+        .{ "turns:example.org", .turns, "example.org", 5349, null },
+        .{ "turn:example.org:8000", .turn, "example.org", 8000, null },
+        .{ "turn:example.org?transport=udp", .turn, "example.org", 3478, .udp },
+        .{ "turn:example.org?transport=tcp", .turn, "example.org", 3478, .tcp },
+        .{ "turns:example.org?transport=tcp", .turns, "example.org", 5349, .tcp },
+        .{ "stun:192.0.2.1:19302", .stun, "192.0.2.1", 19302, null },
+        .{ "stun:[2001:db8::1]:3479", .stun, "2001:db8::1", 3479, null },
+        .{ "STUN:Example.ORG", .stun, "Example.ORG", 3478, null }, // scheme is case-insensitive (RFC 3986 §3.1)
+    }) |c| {
+        const u = try parseUri(c[0]);
+        try testing.expectEqual(c[1], u.scheme);
+        try testing.expectEqualStrings(c[2], u.host);
+        try testing.expectEqual(c[3], u.port);
+        try testing.expectEqual(c[4], u.transport);
+    }
+    try testing.expect((try parseUri("stuns:example.org")).secure());
+    try testing.expect(!(try parseUri("turn:example.org")).secure());
+    for ([_][]const u8{
+        "example.org",              "http:example.org",   "stun:",                  "stun:user@example.org",          "stun:example.org/path",
+        "stun:example.org:",        "stun:example.org:0", "stun:example.org:65536", "stun:example.org?transport=udp", "turn:example.org?transport=sctp",
+        "turn:example.org?foo=udp", "stun:[]",            "stun:[2001:db8::1",      "stun:[g::1]",                    "stun:example.org#frag",
+    }) |bad| {
+        testing.expectError(error.InvalidUri, parseUri(bad)) catch |e| {
+            std.debug.print("accepted: {s}\n", .{bad});
+            return e;
+        };
+    }
+}
+
+test "long-term credentials: RFC 5769 §2.4's request verifies under MD5(user:realm:pass)" {
+    // RFC 5769 §2.4 "Sample Request with Long-Term Authentication": USERNAME
+    // "マトリックス" (U+30DE U+30C8 U+30EA U+30C3 U+30AF U+30B9, 18 bytes of
+    // UTF-8), NONCE "f//499k954d6OL34oL9FSTvy64sA", REALM "example.org",
+    // password "The<U+00AD>M<U+00AA>tr<U+2168>" which SASLprep maps to
+    // "TheMatrIX" (the RFC gives the prepared form).
+    const req_2_4 = [_]u8{
+        0x00, 0x01, 0x00, 0x60, 0x21, 0x12, 0xa4, 0x42, 0x78, 0xad, 0x34, 0x33, 0xc6, 0xad, 0x72, 0xc0, 0x29, 0xda, 0x41, 0x2e,
+        0x00, 0x06, 0x00, 0x12, 0xe3, 0x83, 0x9e, 0xe3, 0x83, 0x88, 0xe3, 0x83, 0xaa, 0xe3, 0x83, 0x83, 0xe3, 0x82, 0xaf, 0xe3,
+        0x82, 0xb9, 0x00, 0x00, 0x00, 0x15, 0x00, 0x1c, 0x66, 0x2f, 0x2f, 0x34, 0x39, 0x39, 0x6b, 0x39, 0x35, 0x34, 0x64, 0x36,
+        0x4f, 0x4c, 0x33, 0x34, 0x6f, 0x4c, 0x39, 0x46, 0x53, 0x54, 0x76, 0x79, 0x36, 0x34, 0x73, 0x41, 0x00, 0x14, 0x00, 0x0b,
+        0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x6f, 0x72, 0x67, 0x00, 0x00, 0x08, 0x00, 0x14, 0xf6, 0x70, 0x24, 0x65,
+        0x6d, 0xd6, 0x4a, 0x3e, 0x02, 0xb8, 0xe0, 0x71, 0x2e, 0x85, 0xc9, 0xa2, 0x8c, 0xa8, 0x96, 0x66,
+    };
+    const m = try decode(&req_2_4);
+    const user = m.find(attrCode(.username)).?.value;
+    try testing.expectEqualStrings("マトリックス", user);
+    const realm = m.find(attrCode(.realm)).?.value;
+    try testing.expectEqualStrings("example.org", realm);
+    try testing.expectEqualStrings("f//499k954d6OL34oL9FSTvy64sA", m.find(attrCode(.nonce)).?.value);
+    const key = longTermKey(user, realm, "TheMatrIX");
+    try testing.expect(m.verifyMessageIntegrity(&key));
+    // The unprepared password gives another key, which does not verify.
+    const raw = longTermKey(user, realm, "The\u{00AD}M\u{00AA}tr\u{2168}");
+    try testing.expect(!m.verifyMessageIntegrity(&raw));
+    // Builder round trip: the same attributes signed with the key verify.
+    var buf: [128]u8 = undefined;
+    var b = try Builder.init(&buf, .request, .binding, m.transaction_id);
+    try b.addUsername(user);
+    try b.addNonce("f//499k954d6OL34oL9FSTvy64sA");
+    try b.addRealm(realm);
+    try b.addMessageIntegrity(&key);
+    try testing.expectEqualSlices(u8, &req_2_4, b.finish());
+}
+
+/// A loopback STUN server that misbehaves on purpose: it drops the first
+/// `drop` requests, sends a stray reply with a foreign transaction id before
+/// answering, or answers only with an error response.
+const RetransServer = struct {
+    io: std.Io,
+    sock: std.Io.net.Socket,
+    drop: usize,
+    mode: enum { answer, stray_only, error_response } = .answer,
+    seen: usize = 0,
+
+    fn run(self: *RetransServer) void {
+        while (true) {
+            var req_buf: [512]u8 = undefined;
+            const incoming = self.sock.receiveTimeout(self.io, &req_buf, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }) catch return;
+            const req = decode(incoming.data) catch return;
+            self.seen += 1;
+            if (self.seen <= self.drop) continue;
+            var out: [64]u8 = undefined;
+            // A stray first: same shape, another transaction id.
+            var stray_id = req.transaction_id;
+            stray_id[0] ^= 0xff;
+            var sb = Builder.init(&out, .success_response, .binding, stray_id) catch return;
+            sb.addMappedAddress(netaddr.parseIp("198.51.100.66").?, 1, true) catch return;
+            self.sock.send(self.io, &incoming.from, sb.finish()) catch return;
+            if (self.mode == .stray_only) continue;
+            var b = Builder.init(&out, if (self.mode == .answer) .success_response else .error_response, .binding, req.transaction_id) catch return;
+            if (self.mode == .answer) {
+                b.addMappedAddress(netaddr.parseIp("203.0.113.9").?, 4989, true) catch return;
+            } else {
+                b.addErrorCode(420, "Unknown Attribute") catch return;
+            }
+            self.sock.send(self.io, &incoming.from, b.finish()) catch return;
+            return;
+        }
+    }
+};
+
+fn retransRun(mode: @FieldType(RetransServer, "mode"), drop: usize, opts: QueryOptions) !struct { result: anyerror!AddressPort, seen: usize } {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bind_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const server_sock = try bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer server_sock.close(io);
+    var srv: RetransServer = .{ .io = io, .sock = server_sock, .drop = drop, .mode = mode };
+    var th = try std.Thread.spawn(.{}, RetransServer.run, .{&srv});
+    var buf: [512]u8 = undefined;
+    const txid: TransactionId = .{ 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
+    const result = query(io, server_sock.address, txid, &buf, opts);
+    th.join();
+    return .{ .result = result, .seen = srv.seen };
+}
+
+test "query retransmits until answered and ignores a stray reply on the way (RFC 8489 §6.2.1, §6.3.4)" {
+    // Two requests are dropped; the third gets a foreign-transaction stray,
+    // then the real answer. RTO 40 ms: sends at 0, 40, 120 ms.
+    const r = try retransRun(.answer, 2, .{ .rto_ms = 40, .timeout_ms = 3000 });
+    const ap = try r.result;
+    try testing.expect(ap.ip.eql(netaddr.parseIp("203.0.113.9").?));
+    try testing.expectEqual(@as(u16, 4989), ap.port);
+    try testing.expectEqual(@as(usize, 3), r.seen);
+}
+
+test "query: max_requests = 1 sends once (the old behaviour), and a lone stray is reported, not a Timeout" {
+    const once = try retransRun(.answer, 1, .{ .rto_ms = 40, .max_requests = 1, .last_wait_factor = 4, .timeout_ms = 3000 });
+    try testing.expectError(error.Timeout, once.result);
+    try testing.expectEqual(@as(usize, 1), once.seen);
+    // Only strays come back: after the schedule ends, the error names what
+    // arrived instead of pretending nothing did.
+    const stray = try retransRun(.stray_only, 0, .{ .rto_ms = 20, .max_requests = 2, .last_wait_factor = 4, .timeout_ms = 3000 });
+    try testing.expectError(error.TransactionMismatch, stray.result);
+    try testing.expectEqual(@as(usize, 2), stray.seen);
+}
+
+test "query: timeout_ms caps a single long retransmission window too" {
+    // RTO 10 s, cap 100 ms: the first window must end at the cap, not at the
+    // RTO. The 5 s bound below is 50x the cap — slack for a loaded machine,
+    // still far short of the 10 s an uncapped window would take.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dark_local = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var dark = try dark_local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer dark.close(io);
+    var buf: [512]u8 = undefined;
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    const r = query(io, dark.address, .{ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 }, &buf, .{ .timeout_ms = 100, .rto_ms = 10_000 });
+    try testing.expectError(error.Timeout, r);
+    const elapsed = t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
+    try testing.expect(elapsed.raw.toMilliseconds() < 5000);
+}
+
+test "query: an error response for our transaction ends the exchange" {
+    const r = try retransRun(.error_response, 0, .{ .rto_ms = 40, .timeout_ms = 3000 });
+    try testing.expectError(error.ErrorResponse, r.result);
+    try testing.expectEqual(@as(usize, 1), r.seen);
 }
 
 /// `testkit.fuzz.seed`: a corpus entry is NOT the packet. `Smith.slice` reads a

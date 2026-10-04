@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: the server side
+  (`bindingResponse`, `ResponderOptions`, `RespondError`) — reproduces RFC 5769 §2.2/§2.3 byte
+  for byte; `longTermKey` (RFC 8489 §9.2 MD5 key; verifies RFC 5769 §2.4); `parseUri`
+  (RFC 7064/7065 stun/stuns/turn/turns); `Builder.addErrorCode`/`addUnknownAttributes`/
+  `addUsername`/`addRealm`/`addNonce` and `Builder.pad`; `Schedule`; `AttributeType` gained
+  MESSAGE-INTEGRITY-SHA256 / PASSWORD-ALGORITHM / USERHASH codes; `BuildError` gained
+  `ValueTooLong`/`InvalidErrorCode`. BEHAVIOURAL: `query` now retransmits per RFC 8489 §6.2.1
+  (defaults: RTO 500 ms doubling, 7 requests, give up 39.5 s after the first — so
+  `timeout_ms = 0` no longer waits forever); `max_requests = 1` restores a single send. A reply
+  with another transaction id (or a non-STUN datagram) is discarded instead of failing at once;
+  it is reported only if nothing better arrives before give-up. An error response now returns
+  `error.ErrorResponse`. Every error name `query` could return before is still in its set, so
+  existing `switch`es compile (axp's included); with axp's `timeout_ms = 2000` a lost request is
+  now resent at 500 and 1500 ms. Self-review: the schedule saturates instead of overflowing at
+  `max_requests = 255` (test added). Mutation: 31 mutants, all killed (1 after a new test).
+
 - **2026-09-07** — `fuzzDecode` had never decoded a message. It drew its packet with
   `smith.bytes(&packet)` and then took a length from `smith.valueRangeAtMost(u16, 0, 1024)`;
   a ranged `Smith` draw reads eight octets as a little-endian `u64` and returns the range
