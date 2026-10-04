@@ -6,7 +6,7 @@
 
 **Scope:** core — go-chi/chi v5.3.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation none
+**Audit:** review 2026-09-11 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -142,6 +142,23 @@ HEAD→GET, both trailing-slash policies, middleware order/short-circuit/state, 
 driven through the socket-free `http.Server.serveStream`. In-process integration: `http.Server` +
 this router on `127.0.0.1:0`, exercised with the Phase-1 `http.Client` (dispatch, params, middleware
 header, 404/405 + `Allow` over a real TCP connection). Run: `zig build test-router`.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 32
+mutants — the origin-form check, both normalizing postures' `checkOriginPath` and dot-segment
+handling, 405/`Allow` in both method postures, auto-OPTIONS, the trailing-slash policy, every
+`tryRedirect` guard (root path, method on both variants, query, 301/308), `groupFor`'s segment
+boundary and deepest choice, the empty param name, both `ParamNameConflict`s, `DuplicateRoute`,
+the `min_reach` distance, HEAD→GET, the F7 capture restore, empty-segment params, the wildcard's
+endpoint and method checks, the leaf `Allow` union, `Params.get`'s name match, HEAD in `Allow`,
+`rawPath` and `segmentsRemaining`. First run: 24 killed, 8 alive; five tests added (a direct
+caller's `%00` path is a 400 in both normalizing postures; no redirect from `/` or toward a
+variant without the method; fallbacks run the deepest group's middleware; a param branch that is
+entered and abandoned drops its capture; `Params.get` matches the whole name); rerun: 31 killed,
+1 equivalent — the first-match wildcard's `bits.count() != 0` (a wildcard node is created only by
+an insert that gives it an endpoint in the same call, so it always has one). Test-quality finding:
+the existing F7 test ("backtracking never leaves a failed param branch's capture") had become
+vacuous when F4's `min_reach` pruning landed — its param branch is pruned by length and never
+entered; the new test reaches it. No code defect found.
 
 ## Backlog / deferred
 

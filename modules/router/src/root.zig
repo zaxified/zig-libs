@@ -3131,3 +3131,121 @@ test "M2.2 differential: Static answers exactly as the runtime Router, generated
         try diffOne(routes, .first_match);
     }
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+/// Dispatch a raw GET of `target` straight into `r` — a caller driving `Router`
+/// without `http.Server` in front, so nothing has checked or normalized the
+/// target before the router sees it.
+fn dispatchRawGet(r: *Router, comptime target: []const u8, out_buf: []u8) ![]const u8 {
+    var in: Reader = .fixed("GET " ++ target ++ " HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    var req: http.Server.Request = .{
+        .method = .get,
+        .target = head.target,
+        .path = head.target,
+        .query = "",
+        .head = head,
+        .body = &body,
+        .context = r,
+    };
+    var out: Writer = .fixed(out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+    try r.dispatch(&req, &rw);
+    try rw.end();
+    return out.buffered();
+}
+
+test "a direct caller's %00 path is refused (400) before matching, in both normalizing postures" {
+    // `http.Server.checkOriginPath` refuses NUL and `%00` in a path (a
+    // truncation point for any C-string consumer behind the route). The
+    // router runs it itself because a direct caller has no server to do it;
+    // a route whose pattern contains the same bytes proves the 400 is that
+    // check and not a 404.
+    inline for (.{ NormalizePath.remove_dot_segments, NormalizePath.reject_non_canonical }) |mode| {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.normalize_path = mode;
+        try r.get("/a%00b", hHello);
+        var buf: [1024]u8 = undefined;
+        try expectStatus(try dispatchRawGet(&r, "/a%00b", &buf), "400");
+    }
+}
+
+test "trailing-slash redirect: never from \"/\" itself, never toward a variant without this method" {
+    // `tryRedirect`: redirect "toward the variant that has the route" for
+    // the request's method (httprouter's RedirectTrailingSlash), so a GET to
+    // "/x/" when only POST /x exists is a 404, not a 301 into a 405; and
+    // the root "/" has no slash-less variant to probe.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.post("/x", hCreated);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/x/"), &buf), "404");
+    try expectStatus(runWire(&r, wire("GET", "/"), &buf), "404");
+    try expectStatus(runWire(&r, wire("POST", "/x/"), &buf), "308"); // control
+}
+
+test "fallbacks run the DEEPEST enclosing group's middleware" {
+    // `groupFor`: "the deepest group (by prefix length) whose prefix is a
+    // segment-boundary prefix of `path`" — a 404 under /api/v1 must pass
+    // /api/v1's own middleware (V, inside G), not only /api's.
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    const api = try r.group("/api");
+    try api.use(.{ .run = mwG });
+    const v1 = try api.group("/v1");
+    try v1.use(.{ .run = mwV });
+    try v1.get("/ok", hTrace);
+    try api.get("/top", hTrace);
+    var buf: [1024]u8 = undefined;
+    trace = .{};
+    try expectStatus(runWire(&r, wire("GET", "/api/v1/missing"), &buf), "404");
+    try testing.expectEqualStrings("GVvg", trace.get());
+    trace = .{};
+    try expectStatus(runWire(&r, wire("GET", "/api/missing"), &buf), "404");
+    try testing.expectEqualStrings("Gg", trace.get());
+}
+
+fn hOneCapture(ctx: *Ctx) anyerror!void {
+    // Only the winning branch's capture may be live (F7).
+    try testing.expectEqual(@as(usize, 1), ctx.params.len);
+    try testing.expectEqual(@as(?[]const u8, null), ctx.params.get("p"));
+    try ctx.res.writeAll(ctx.params.get("w").?);
+}
+
+test "backtracking out of an ENTERED param branch drops its capture (F7, past the F4 pruning)" {
+    // The F7 test above stopped reaching the param branch once F4's
+    // `min_reach` pruning landed ("/x/:p/a/end" needs two more segments,
+    // "/x/A/B" has one). Here the param child IS reachable by length
+    // ("/x/:p/a" needs exactly one more), is entered, captures p = "A",
+    // fails on "B", and must leave `params` as it found it before the
+    // wildcard sibling captures.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x/:p/a", hHello);
+    try r.get("/x/*w", hOneCapture);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("A/B", bodyOf(runWire(&r, wire("GET", "/x/A/B"), &buf)));
+}
+
+fn hNamePrefix(ctx: *Ctx) anyerror!void {
+    try testing.expectEqual(@as(?[]const u8, null), ctx.params.get("user"));
+    try ctx.res.writeAll(ctx.params.get("user_id").?);
+}
+
+test "Params.get matches the whole name, not a prefix of it" {
+    // `get`: "value of the NAMED :param" — `user` is not `user_id`.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/u/:user_id", hNamePrefix);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("42", bodyOf(runWire(&r, wire("GET", "/u/42"), &buf)));
+}

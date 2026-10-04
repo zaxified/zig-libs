@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (32 mutants, 31 killed, 1 equivalent). Five
+  new tests: a direct caller's `%00` path answered 400 in both normalizing postures, no
+  trailing-slash redirect from `/` or toward a variant lacking the method, fallbacks running the
+  deepest group's middleware, a param branch entered then abandoned leaving no capture (the old F7
+  test no longer reached that branch after the F4 pruning), and `Params.get` matching whole names.
+  No behaviour change.
 - **2026-09-28** — `RouteDoc` gains `query_schema: ?[]const u8 = null` (JSON Schema text of the
   query string as an object; `openapi` turns its properties into `in: query` parameters).
   **Fix:** `Router.addDoc` copied a `RouteDoc` field by field and dropped `Response.schema` and
