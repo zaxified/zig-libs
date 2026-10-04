@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED (all four survey 2026-09-30 gaps), no breaking change: `applyDelta` /
+  `Editor.applyDelta` replay a staged-delta file (`/tmp/.uci/<pkg>`) so a file reader sees what
+  `uci get` sees; `Editor` (`set`, `setSection`, `add`, `delete`, `deleteOption`,
+  `deleteListItem`, `addList`, `delList`, `rename`, `renameOption`, `reorder`, `toPackage`) with
+  libuci's semantics; `show` / `Editor.show` (`uci show`, `-X`); `Section.getBool` / `getInt`;
+  `Package.resolveSection` (name, `@type[N]`, anonymous id); `anonymousName` (libuci's
+  `cfg%02x%04x` ids: section counter + DJB2 of the type, measured); `validNameChars` /
+  `validTypeChars` are now public. All formats measured on the real `uci` through its command
+  line (`tools/capture-delta.sh` → `src/testdata/delta_capture.txt`, replayed byte for byte).
+  Refused where `uci` accepts: renames onto a name/key in use (would produce a package `parse`
+  rejects). axp can drop its `uci get` fallback for packages with a pending delta.
+  Mutation 2026-10-04: 36 mutants, 35 killed, 1 equivalent; it also found that an index delete
+  on a SINGLE option deletes it in `uci` (fixed before landing, test added).
+
 - **2026-09-17** — **BEHAVIOURAL (accepts more; `SerializeError` grows):** audit A1 U25, user
   decision (behave as real `uci`). A `config` block reusing the name of an earlier section of the
   same type now continues that section instead of failing with `DuplicateSection`: a repeated

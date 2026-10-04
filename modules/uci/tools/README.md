@@ -1,6 +1,6 @@
 # `uci` verification instruments
 
-Seven instruments, run by hand. None is wired into `zig build`: five of them
+Eight instruments, run by hand. None is wired into `zig build`: five of them
 (`oracle_dump.c`, `classify.sh`, `diff_run.sh`, `diff_fuzz.py`,
 `capture-grammar.sh`) need the real **`libuci`**, built from source and used as
 a black-box oracle.
@@ -24,6 +24,7 @@ Figures below were measured on 2026-09-17 against the tree as it stands.
 | `diff_run.sh` | The same without classification, printing raw differences. |
 | `diff_fuzz.py` | Random differential; `--valid` keeps statement shape legal so the parser is actually reached. |
 | `capture-grammar.sh` | Captures the frozen `uci` grammar fixtures the suite pins. |
+| `capture-delta.sh` | Captures `src/testdata/delta_capture.txt` (2026-10-04): real `uci` commands → the delta file written + `uci show`/`-X show`, the expected values of the staged-delta and `Editor` tests. Builds the CLI into `.zig-cache/uci-delta` (override with `BASE=`). |
 
 Measured over the 65 probes: **37 SAME · 23 BOTH-REJECT · 2 fail-open ·
 3 deliberate strictness · 0 VALUE-DIVERGE.**

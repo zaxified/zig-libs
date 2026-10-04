@@ -67,7 +67,38 @@ defer gpa.free(text);
 
 // Deep equality (used by the round-trip tests)
 _ = pkg.eql(&other);
+
+// Typed values (OpenWrt's boolean words; base-10 integers)
+_ = lan.getBool("enabled");                     // ?bool: 1 yes on true enabled / 0 no off false disabled
+_ = lan.getInt("mtu");                          // ?i64
+
+// Any reference `uci` accepts: name, @type[N], anonymous id (cfg0389a1)
+_ = pkg.resolveSection("@rule[-1]");
+
+// Staged-but-uncommitted changes (`/tmp/.uci/<pkg>`): what `uci get` reports
+var live = try uci.applyDelta(gpa, &pkg, "network", delta_bytes, &diag); // DeltaError!Package
+defer live.deinit(gpa);
+
+// Editing with libuci's operations, then back to a Package
+var ed = try uci.Editor.init(gpa, &pkg);
+defer ed.deinit();
+try ed.set("lan", "proto", "dhcp");
+const id = try ed.add("rule");                  // "cfg0589a1"-style id
+try ed.addList(id, "proto", "tcp");
+try ed.reorder(id, 0);
+var edited = try ed.toPackage(gpa);
+defer edited.deinit(gpa);
+const shown = try ed.show(gpa, "network", .{}); // `uci show` text
 ```
+
+**Staged deltas, ids and `show` are measured, not read:** `tools/capture-delta.sh`
+drives the real `uci` (built from OpenWrt's tree, used only through its command
+line) through every operation and records the delta file it writes and what
+`uci show` / `uci -X show` then print; the tests replay those deltas and must
+print the same text byte for byte. Two cases real `uci` accepts are refused:
+a rename onto a section name or option key already in use (`uci` then holds
+two of one name, which `parse` refuses and `serialize` cannot write) —
+`error.DuplicateSection` / `error.DuplicateOption`.
 
 ## Format coverage / semantics
 
@@ -147,9 +178,10 @@ _ = pkg.eql(&other);
 - Values containing ANY control character below 0x20 — `\n` `\t` `\r`
   included, since none of them has a working escape (see above) — cannot be
   represented in UCI text and serialize to `error.UnserializableValue`.
-- UCI CLI-level features (`uci set/commit`, `/etc/config` discovery, state
-  files) are out of scope — this is the file codec only. In particular: a
-  file-only reader loses staged-but-uncommitted state (`uci set` without
-  `commit`, common on live devices — LuCI's "Save" without "Apply"); see
-  SPEC.md's threat-model section for the concrete trap and for `uci
-  revert`'s truncate-not-delete delta-file behavior.
+- Staged-but-uncommitted state (`uci set` without `commit` — LuCI's "Save"
+  without "Apply") is NOT in `/etc/config/<pkg>`: read the delta file
+  (`/tmp/.uci/<pkg>`; the reading stays the caller's I/O) and pass it to
+  `applyDelta`. An empty delta file means nothing is staged (`uci revert`
+  truncates rather than deletes it). Still out of scope: `commit` itself
+  (writing `/etc/config` — keep that on the binary, which also runs the
+  hooks), `/etc/config` discovery, `/var/state`, `uci import`.

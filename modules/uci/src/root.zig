@@ -112,6 +112,21 @@ pub const max_line_len: usize = 1 << 14; // 16 KiB
 /// converting unbounded RSS growth into an early, controlled rejection.
 pub const max_total_items: usize = 300_000;
 
+// ── editing, staged deltas, `uci show` (edit.zig) ──────────────────────────
+
+const edit = @import("edit.zig");
+pub const Editor = edit.Editor;
+pub const EditError = edit.EditError;
+pub const DeltaError = edit.DeltaError;
+pub const ShowOptions = edit.ShowOptions;
+pub const applyDelta = edit.applyDelta;
+pub const show = edit.show;
+pub const anonymousName = edit.anonymousName;
+
+test {
+    _ = edit;
+}
+
 // ── errors / diagnostics ────────────────────────────────────────────────────
 
 pub const ParseError = error{
@@ -241,6 +256,30 @@ pub const Section = struct {
         return o.values;
     }
 
+    /// `key` read as a UCI boolean: `1 yes on true enabled` → true,
+    /// `0 no off false disabled` → false (the word lists of OpenWrt's UCI
+    /// documentation and `config_get_bool`), exact and case-sensitive. Null
+    /// when the key is absent or holds anything else — the caller picks the
+    /// default, as `config_get_bool` takes one.
+    pub fn getBool(self: *const Section, key: []const u8) ?bool {
+        const v = self.get(key) orelse return null;
+        const yes = [_][]const u8{ "1", "yes", "on", "true", "enabled" };
+        const no = [_][]const u8{ "0", "no", "off", "false", "disabled" };
+        for (yes) |w| if (std.mem.eql(u8, v, w)) return true;
+        for (no) |w| if (std.mem.eql(u8, v, w)) return false;
+        return null;
+    }
+
+    /// `key` as a base-10 integer (an optional sign, digits, nothing else);
+    /// null when absent, malformed or out of `i64` range.
+    pub fn getInt(self: *const Section, key: []const u8) ?i64 {
+        const v = self.get(key) orelse return null;
+        // Digits only: `std.fmt.parseInt` would also take `1_000`.
+        const digits = if (v.len > 0 and (v[0] == '-' or v[0] == '+')) v[1..] else v;
+        for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+        return std.fmt.parseInt(i64, v, 10) catch null;
+    }
+
     pub fn eql(a: *const Section, b: *const Section) bool {
         if (!std.mem.eql(u8, a.type, b.type)) return false;
         if (!optStrEql(a.name, b.name)) return false;
@@ -333,6 +372,27 @@ pub const Package = struct {
         return null; // unreachable given the bounds check above
     }
 
+    /// A section by the reference forms `uci` accepts after the package:
+    /// a name, `@type[N]` (`nth`), or an anonymous section's generated id
+    /// (`cfg0389a1`, see `edit.anonymousName`). The generated ids assume the
+    /// package came straight from `parse` (section i was the i-th the
+    /// package allocated); after `applyDelta` address through an `Editor`.
+    pub fn resolveSection(self: *const Package, ref: []const u8) ?*const Section {
+        if (ref.len > 0 and ref[0] == '@') {
+            if (ref[ref.len - 1] != ']') return null;
+            const lb = std.mem.indexOfScalar(u8, ref, '[') orelse return null;
+            const index = std.fmt.parseInt(i64, ref[lb + 1 .. ref.len - 1], 10) catch return null;
+            return self.nth(ref[1..lb], index);
+        }
+        if (self.sectionByName(ref)) |s| return s;
+        for (self.sections, 1..) |*s, counter| {
+            if (s.name != null) continue;
+            var buf: [24]u8 = undefined;
+            if (std.mem.eql(u8, edit.anonymousName(&buf, counter, s.type), ref)) return s;
+        }
+        return null;
+    }
+
     pub fn eql(a: *const Package, b: *const Package) bool {
         if (!optStrEql(a.name, b.name)) return false;
         if (a.sections.len != b.sections.len) return false;
@@ -387,7 +447,9 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 /// Section names and option keys: real `uci` allows only alphanumeric or
 /// `_` there (NOT even `-`).
-fn validNameChars(s: []const u8) bool {
+/// (Public since 2026-10-04: a caller naming a section can check it with the
+/// same rule `parse` applies. An empty string passes — see above.)
+pub fn validNameChars(s: []const u8) bool {
     for (s) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
     }
@@ -396,7 +458,7 @@ fn validNameChars(s: []const u8) bool {
 
 /// Section types: real `uci` is looser here -- alphanumeric/`_`, or any
 /// other printable, non-space ASCII byte (33-126).
-fn validTypeChars(s: []const u8) bool {
+pub fn validTypeChars(s: []const u8) bool {
     for (s) |c| {
         if (c < 33 or c > 126) return false;
     }

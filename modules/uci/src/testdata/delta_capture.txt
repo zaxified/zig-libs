@@ -1,0 +1,112 @@
+### scenario every_op probe
+--- config
+config alpha 'alpha'
+	option v 'A'
+	list l 'x'
+	list l 'y'
+
+config beta
+	option w '1'
+
+config beta
+	option w '2'
+--- delta
+probe.alpha.v='Z'
+probe.alpha.q='it'\''s'
+|probe.alpha.l='z'
+~probe.alpha.l='x'
+probe.cfg0389a1.w='9'
+-probe.cfg0289a1
++probe.cfg04eae8='gamma'
+probe.new='delta'
+@probe.alpha.v='vv'
+@probe.alpha='aa'
+^probe.aa='2'
+-probe.aa.q
+probe.aa.l='single'
+--- show -X
+probe.cfg0389a1=beta
+probe.cfg0389a1.w='9'
+probe.cfg04eae8=gamma
+probe.aa=alpha
+probe.aa.vv='Z'
+probe.aa.l='single'
+probe.new=delta
+--- show
+probe.@beta[0]=beta
+probe.@beta[0].w='9'
+probe.@gamma[0]=gamma
+probe.aa=alpha
+probe.aa.vv='Z'
+probe.aa.l='single'
+probe.new=delta
+### end
+### scenario lists_and_types p
+--- config
+config a 'n1'
+	option o 'single'
+	list l 'x'
+	list l 'y'
+	list l 'x'
+	option k 'K'
+
+config b
+	option w '1'
+--- delta
+p.n1='newtype'
+|p.n1.o='two'
+~p.n1.l='x'
+-p.n1.l='0'
+^p.n1='99'
++p.cfg03b616='q'
+@p.cfg02b607='named'
+-p.named.w
+p.n1.m='line1
+line2'
+p.n1.d='a"b\c'\''d'
+|p.n1.l='last'
+--- show -X
+p.named=b
+p.n1=newtype
+p.n1.o='single' 'two'
+p.n1.l='last'
+p.n1.k='K'
+p.n1.m='line1
+line2'
+p.n1.d='a"b\c'\''d'
+p.cfg03b616=q
+--- show
+p.named=b
+p.n1=newtype
+p.n1.o='single' 'two'
+p.n1.l='last'
+p.n1.k='K'
+p.n1.m='line1
+line2'
+p.n1.d='a"b\c'\''d'
+p.@q[0]=q
+### end
+### scenario counter p
+--- config
+config a 'n1'
+
+config b
+--- delta
+p.newsec='t'
++p.cfg04b619='t'
++p.cfg05b619='t'
+-p.newsec
++p.cfg06b61a='u'
+--- show -X
+p.n1=a
+p.cfg02b607=b
+p.cfg04b619=t
+p.cfg05b619=t
+p.cfg06b61a=u
+--- show
+p.n1=a
+p.@b[0]=b
+p.@t[0]=t
+p.@t[1]=t
+p.@u[0]=u
+### end
