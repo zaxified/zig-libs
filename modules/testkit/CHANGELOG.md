@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — `fuzz.driver.run` skips off 64-bit Linux (`fuzz.driver.supported`) instead of
+  failing to compile: its watchdog state is 64-bit atomics (none on mips32) and it calls the
+  Linux kernel directly (no `Environ.getPosix` on Windows). The Linux code is not compiled there,
+  so brotli, which uses the driver, now builds for mips32 and Windows.
+
 - **2026-10-01** — **New `loopbackSkip`, `loopbackGuaranteed`, `netns_env`.** The give-up for a test
   that cannot get a loopback socket: `error.SkipZigTest` as before, unless `ZIGLIBS_NETNS` is set
   (by `scripts/lib/netns-run`, which brings `lo` up and checks it), where it is

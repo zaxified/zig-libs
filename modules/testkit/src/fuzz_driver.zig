@@ -36,7 +36,15 @@
 //! `REACH <label>=<n>` when it is done. "0 of N reached it" is not clean.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
+
+/// Where the driver runs: Linux (it calls the kernel directly -- clock,
+/// sleep, open) with 64-bit atomics (the watchdog's nanosecond state). That
+/// is every lane that runs a fuzz verdict. Elsewhere `run` skips, without the
+/// Linux code being compiled, so a module whose tests use the driver still
+/// builds for the other targets it declares (brotli: mips32, Windows).
+pub const supported = builtin.os.tag == .linux and @bitSizeOf(usize) == 64;
 
 /// `std.testing.Smith`'s drawing methods, from a PRNG.
 pub const Rng = struct {
@@ -170,6 +178,10 @@ fn openZ(path: []const u8, flags: linux.O, mode: linux.mode_t) ?i32 {
 /// leaks but records no stack traces — unwinding the stack at every
 /// allocation was most of a run's time.
 pub fn run(comptime harness: anytype, opts: Options) !void {
+    if (comptime supported) return runHere(harness, opts) else return error.SkipZigTest;
+}
+
+fn runHere(comptime harness: anytype, opts: Options) !void {
     var kb: [96]u8 = undefined;
     if (env(&kb, opts.prefix, "_ONLY")) |only| {
         if (std.mem.indexOf(u8, opts.name, only) == null) return error.SkipZigTest;

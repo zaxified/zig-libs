@@ -119,7 +119,10 @@ second, `DONE <name> runs=… in … ms`, `REACH <name> <label>=<n>`, and
 `FAIL <name> seed=N: <error>` / `HANG <name> seed=N` (exit 124). One job per
 core with disjoint seed ranges is the caller's runner. The source of choices
 is `fuzz.Rng` — never `Smith{ .in = random bytes }`, which answers the range
-minimum for almost every draw.
+minimum for almost every draw. The driver runs on 64-bit Linux
+(`fuzz.driver.supported`) and skips everywhere else without compiling its
+Linux code, so a module that uses it can still declare 32-bit or Windows
+targets.
 
 ## The golden diff
 
