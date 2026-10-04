@@ -19,7 +19,7 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 - **Platform:** linux — the live path is a raw ICMP socket (`icmp.Socket`,
   CAP_NET_RAW) with per-probe `IP_TTL` / `IPV6_UNICAST_HOPS`; the hop state
   machine itself is pure and runs behind an injectable `Transport` seam.
-- **Model after:** traceroute(8) / mtr ICMP method.
+- **Model after:** traceroute(8) / mtr (ICMP echo and UDP methods).
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
 
@@ -37,6 +37,14 @@ already tell you the other two ways a trace can stop early. Only `error.InvalidO
 and `error.OutOfMemory` are real Zig errors, because neither has a partial trace to
 show for it — they happen before any probe is sent.
 
+Two probe methods (`Options.method`): `.icmp` (the default; `traceroute -I`,
+mtr) and `.udp` (traceroute(8)'s default: UDP to port 33434 upwards, the
+destination answers Port Unreachable — the method that still works where ICMP
+echo is filtered). Routers that quote an RFC 4950 MPLS label stack in an RFC
+4884 extension get it on the hop (`Probe.mpls`, what `traceroute -e` shows).
+On a multi-homed host, `Options.iface` / `.source` / `.tos` / `.fwmark` pick
+the egress for the live `trace`.
+
 ```zig
 const traceroute = @import("traceroute");
 const netaddr = @import("netaddr");
@@ -51,7 +59,12 @@ defer tr.deinit(gpa);
 for (tr.hops) |hop| {
     const st = hop.stats(); // min/avg/max RTT, loss %
     _ = st;
+    for (hop.probes[0].mpls.slice()) |l| _ = .{ l.label, l.tc, l.ttl };
 }
+
+// UDP probes out of a chosen interface:
+var tr2 = try traceroute.trace(gpa, dest, .{ .method = .udp, .iface = "wan2" });
+defer tr2.deinit(gpa);
 ```
 
 Tests are offline-first: the hop state machine runs against a fake

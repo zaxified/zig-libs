@@ -104,7 +104,7 @@ pub const meta = .{
     .platform = .linux, // live path = raw ICMP socket (icmp.Socket); engine is pure
     .role = .client,
     .concurrency = .single_owner, // one trace run owns its transport + buffers
-    .model_after = "traceroute(8) / mtr ICMP method",
+    .model_after = "traceroute(8) / mtr (ICMP and UDP methods)",
     .deps = .{ "icmp", "netaddr", "latency-stats" },
 };
 
@@ -119,14 +119,43 @@ pub const Probe = struct {
     /// Round-trip time, send → matching response. Null for `.timeout`.
     rtt_ns: ?u64 = null,
     /// ICMP code for `.dest_unreachable` (RFC 792: 0 net, 1 host, 3 port,
-    /// 13 administratively prohibited, …).
+    /// 13 administratively prohibited, …), and for a UDP-method `.reply`
+    /// (the destination's own Port Unreachable: 3 on IPv4, 4 on IPv6).
     code: ?u8 = null,
+    /// MPLS label stack the router quoted in an RFC 4950 extension of its
+    /// ICMP error (RFC 4884 multi-part message) — what `traceroute -e`
+    /// prints as `<MPLS:L=…>`. Empty when there was none.
+    mpls: MplsStack = .{},
 
-    /// `reply` = Echo Reply from the destination; `time_exceeded` = an
+    /// `reply` = the destination answered (Echo Reply for the ICMP method,
+    /// its own Port Unreachable for the UDP method); `time_exceeded` = an
     /// intermediate router; `dest_unreachable` = terminal ICMP error;
     /// `timeout` = no answer (traceroute's `*`).
     pub const Kind = enum { reply, time_exceeded, dest_unreachable, timeout };
 };
+
+/// One MPLS label stack entry (RFC 3032 §2.1), as quoted by RFC 4950.
+pub const MplsEntry = struct {
+    label: u20,
+    /// Traffic class (the former EXP bits, RFC 5462).
+    tc: u3,
+    /// S: bottom of the stack.
+    bottom: bool,
+    ttl: u8,
+};
+
+/// A bounded MPLS label stack (plain data, so `Probe` stays copyable).
+pub const MplsStack = struct {
+    entries: [max_mpls_labels]MplsEntry = undefined,
+    len: u8 = 0,
+
+    pub fn slice(m: *const MplsStack) []const MplsEntry {
+        return m.entries[0..m.len];
+    }
+};
+
+/// Labels kept per probe; deeper stacks are truncated (real ones are 1-3).
+pub const max_mpls_labels = 8;
 
 /// One TTL step: `probes.len == Options.probes_per_hop`.
 pub const Hop = struct {
@@ -220,6 +249,17 @@ pub const max_payload = 1024;
 /// = 16 min); `Options.validate` rejects anything past it.
 pub const max_run_ms: u64 = 30 * 60 * 1000;
 
+/// How probes are sent. traceroute(8) defaults to `.udp`; mtr and
+/// `traceroute -I` use `.icmp`. A network that drops ICMP echo shows a wall
+/// of `*` with `.icmp` and usually not with `.udp`, and vice versa.
+pub const Method = enum {
+    /// ICMP Echo Request; the destination answers Echo Reply.
+    icmp,
+    /// UDP datagrams to `udp_port_base + k`; the destination answers ICMP
+    /// Port Unreachable (nothing should listen on those ports).
+    udp,
+};
+
 pub const Options = struct {
     /// Highest TTL probed (inclusive). Bounded by the u8 TTL itself.
     max_hops: u8 = 30,
@@ -235,12 +275,36 @@ pub const Options = struct {
     ident: u16 = 0x7472, // "tr"
     /// First sequence number; probe #k is sent as `seq_base +% k`.
     seq_base: u16 = 1,
+    method: Method = .icmp,
+    /// UDP method: probe #k goes to destination port `udp_port_base + k`
+    /// (traceroute(8)'s classic 33434 upwards); a reply is matched by the
+    /// quoted destination port. The source port is the correlation token
+    /// (`ident`): the live `trace` uses the socket's bound port.
+    udp_port_base: u16 = 33434,
+
+    // Live path only (`trace`); `traceWith` ignores them — the injected
+    // transport decides where packets go.
+    /// Bind to this interface (SO_BINDTODEVICE) — pick the egress on a
+    /// multi-homed host.
+    iface: ?[]const u8 = null,
+    /// Source address to send from.
+    source: ?netaddr.Ip = null,
+    /// IP TOS / IPv6 traffic class of the probes.
+    tos: ?u8 = null,
+    /// Routing mark (SO_MARK, policy routing); needs CAP_NET_ADMIN.
+    fwmark: ?u32 = null,
 
     pub fn validate(o: Options) error{InvalidOptions}!void {
         if (o.first_ttl == 0 or o.max_hops < o.first_ttl) return error.InvalidOptions;
         if (o.probes_per_hop == 0 or o.probes_per_hop > max_probes_per_hop) return error.InvalidOptions;
         if (o.timeout_ms == 0) return error.InvalidOptions;
         if (o.payload_size > max_payload) return error.InvalidOptions;
+        if (o.method == .udp) {
+            // Every probe needs its own, non-zero destination port.
+            const probes_total: u32 = (@as(u32, o.max_hops) - o.first_ttl + 1) * o.probes_per_hop;
+            if (o.udp_port_base == 0 or @as(u32, o.udp_port_base) + probes_total - 1 > std.math.maxInt(u16))
+                return error.InvalidOptions;
+        }
         // A1 F6/F8: bound the PRODUCT, not just each field — see max_run_ms.
         const hop_count: u64 = @as(u64, o.max_hops - o.first_ttl) + 1;
         const total_probes: u64 = hop_count * @as(u64, o.probes_per_hop);
@@ -270,6 +334,10 @@ pub const Transport = struct {
     strip_ip_header: bool = false,
     /// Send one echo-request probe with the given IP TTL / hop limit.
     sendFn: *const fn (ctx: *anyopaque, ttl: u8, packet: []const u8) TransportError!void,
+    /// UDP method: send `payload` to the destination's `dst_port` with this
+    /// TTL. Null for a transport that cannot (`traceWith` then refuses
+    /// `Method.udp` with `error.InvalidOptions`).
+    sendUdpFn: ?*const fn (ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void = null,
     /// Receive one packet into `buf` within `timeout_ns`; null on timeout.
     recvFn: *const fn (ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet,
     /// Monotonic clock, nanoseconds.
@@ -296,6 +364,7 @@ pub fn traceWith(
     opts: Options,
 ) TraceError!Trace {
     try opts.validate();
+    if (opts.method == .udp and t.sendUdpFn == null) return error.InvalidOptions;
 
     const family: echo.Family = switch (dest) {
         .v4 => .v4,
@@ -332,22 +401,33 @@ pub fn traceWith(
             const slot = hi * ppn + pi;
             const seq = opts.seq_base +% @as(u16, @intCast(slot));
 
-            const packet = pkt_buf[0 .. echo.echo_header_len + opts.payload_size];
-            @memset(packet, 0);
-            // `packet` is sliced to `echo_header_len + payload_size` two
-            // lines up, so it cannot be short. A panic rather than
-            // `unreachable`: `unreachable` is undefined behaviour in the
-            // release modes, which is the fail-open shape this writer's new
-            // signature exists to remove.
-            echo.writeEchoRequest(family, packet, opts.ident, seq) catch
-                @panic("traceroute: probe buffer smaller than the ICMP header");
-
             // A transport failure stops the trace here, but — unlike
             // InvalidOptions/OutOfMemory above, which happen before any probe
             // is sent — hops already collected are real data. `break :outer`
             // rather than `try`/`return`, so the packing below still runs and
             // hands back a partial `Trace` with `transport_err` set.
-            t.sendFn(t.ctx, ttl, packet) catch |err| {
+            const sent: TransportError!void = switch (opts.method) {
+                .icmp => blk: {
+                    const packet = pkt_buf[0 .. echo.echo_header_len + opts.payload_size];
+                    @memset(packet, 0);
+                    // `packet` is sliced to `echo_header_len + payload_size`
+                    // just above, so it cannot be short. A panic rather than
+                    // `unreachable`: `unreachable` is undefined behaviour in
+                    // the release modes, which is the fail-open shape this
+                    // writer's new signature exists to remove.
+                    echo.writeEchoRequest(family, packet, opts.ident, seq) catch
+                        @panic("traceroute: probe buffer smaller than the ICMP header");
+                    break :blk t.sendFn(t.ctx, ttl, packet);
+                },
+                .udp => blk: {
+                    const payload = pkt_buf[0..opts.payload_size];
+                    @memset(payload, 0);
+                    // validate() proved base + slot never passes 65535.
+                    const port: u16 = opts.udp_port_base + @as(u16, @intCast(slot));
+                    break :blk t.sendUdpFn.?(t.ctx, ttl, port, payload);
+                },
+            };
+            sent catch |err| {
                 transport_err = err;
                 // If this was the hop's very first probe, nothing about this
                 // hop was ever attempted — exclude it, matching what
@@ -375,6 +455,50 @@ pub fn traceWith(
                     break :outer;
                 }
                 const rcv_at = t.nowFn(t.ctx);
+
+                const icmp_msg = icmpMessage(family, rbuf[0..resp.len], t.strip_ip_header) orelse continue :recv;
+
+                if (opts.method == .udp) {
+                    const ue = parseUdpError(family, icmp_msg) orelse continue :recv;
+                    if (ue.sport != opts.ident) continue :recv;
+                    const j = slotOf(ue.dport, opts.udp_port_base, total) orelse continue :recv;
+                    const st = send_times[j] orelse continue :recv; // not sent yet: spoof
+                    if (probes[j].kind != .timeout) continue :recv; // A1 F12, see below
+                    if (!quotedDestIs(dest, ue.quoted_dst)) continue :recv; // A1 F3, see below
+                    const rtt = rcv_at -| st;
+                    switch (ue.kind) {
+                        .time_exceeded => probes[j] = .{
+                            .kind = .time_exceeded,
+                            .address = resp.from,
+                            .rtt_ns = rtt,
+                            .mpls = mplsOf(family, icmp_msg),
+                        },
+                        .dest_unreachable => {
+                            // The destination's own Port Unreachable is the
+                            // UDP method's "reply" — the counterpart of the
+                            // ICMP method's Echo Reply, held to the same
+                            // source check (A1 F1). Anything else, or from
+                            // anyone else, is a terminal error.
+                            const port_unreach: u8 = if (family == .v4) 3 else 4;
+                            const from_dest = if (resp.from) |from| from.eql(dest) else true;
+                            if (ue.code == port_unreach and from_dest) {
+                                probes[j] = .{ .kind = .reply, .address = resp.from orelse dest, .rtt_ns = rtt, .code = ue.code };
+                                reached = true;
+                            } else {
+                                probes[j] = .{
+                                    .kind = .dest_unreachable,
+                                    .address = resp.from,
+                                    .rtt_ns = rtt,
+                                    .code = ue.code,
+                                    .mpls = mplsOf(family, icmp_msg),
+                                };
+                                unreachable_code = ue.code;
+                            }
+                        },
+                    }
+                    if (j == slot) break :recv;
+                    continue :recv;
+                }
 
                 // Reuse the icmp codec: bounds-checked, never panics;
                 // anything malformed / not ours comes back `.ignored`.
@@ -444,6 +568,7 @@ pub fn traceWith(
                                 .kind = .time_exceeded,
                                 .address = resp.from,
                                 .rtt_ns = rcv_at -| st,
+                                .mpls = mplsOf(family, icmp_msg),
                             },
                             .dest_unreachable => {
                                 probes[j] = .{
@@ -451,6 +576,7 @@ pub fn traceWith(
                                     .address = resp.from,
                                     .rtt_ns = rcv_at -| st,
                                     .code = ie.code,
+                                    .mpls = mplsOf(family, icmp_msg),
                                 };
                                 unreachable_code = ie.code;
                             },
@@ -491,6 +617,142 @@ pub fn traceWith(
     };
 }
 
+fn quotedDestIs(dest: netaddr.Ip, quoted: [16]u8) bool {
+    return switch (dest) {
+        .v4 => |q| std.mem.eql(u8, quoted[0..4], &q),
+        .v6 => |b| std.mem.eql(u8, &quoted, &b),
+    };
+}
+
+/// The ICMP message inside a received packet: past the IPv4 header when the
+/// transport delivers it (raw IPv4 sockets do), and with a valid ICMPv4
+/// checksum (RFC 792) — the same gate `icmp.echo.parseV4` applies. ICMPv6's
+/// checksum needs the pseudo-header, which only the kernel has; it verifies
+/// it before delivery to an ICMPv6 socket.
+fn icmpMessage(family: echo.Family, buf: []const u8, strip_ip_header: bool) ?[]const u8 {
+    var b = buf;
+    if (family == .v4 and strip_ip_header) {
+        if (b.len < 20) return null;
+        const ihl: usize = @as(usize, b[0] & 0x0f) * 4;
+        if (ihl < 20 or b.len < ihl) return null;
+        b = b[ihl..];
+    }
+    if (b.len < echo.echo_header_len) return null;
+    if (family == .v4 and echo.checksum(b) != 0) return null;
+    return b;
+}
+
+/// An ICMP Time Exceeded / Destination Unreachable that quotes a UDP probe.
+const UdpError = struct {
+    kind: enum { time_exceeded, dest_unreachable },
+    code: u8,
+    quoted_dst: [16]u8,
+    sport: u16,
+    dport: u16,
+};
+
+/// Parse an ICMP error quoting an IPv4/IPv6 header + the first 8 bytes of a
+/// UDP datagram (RFC 792 / RFC 4443 §3.1 guarantee at least those). Null for
+/// anything else — other ICMP types, a quoted protocol other than UDP, a
+/// quote too short to hold the ports.
+fn parseUdpError(family: echo.Family, msg: []const u8) ?UdpError {
+    const kind: @FieldType(UdpError, "kind") = switch (family) {
+        .v4 => switch (msg[0]) {
+            echo.v4.time_exceeded => .time_exceeded,
+            echo.v4.dest_unreachable => .dest_unreachable,
+            else => return null,
+        },
+        .v6 => switch (msg[0]) {
+            echo.v6.time_exceeded => .time_exceeded,
+            echo.v6.dest_unreachable => .dest_unreachable,
+            else => return null,
+        },
+    };
+    const quoted = msg[echo.echo_header_len..];
+    var out: UdpError = .{ .kind = kind, .code = msg[1], .quoted_dst = @splat(0), .sport = 0, .dport = 0 };
+    const udp: []const u8 = switch (family) {
+        .v4 => blk: {
+            if (quoted.len < 20) return null;
+            const qihl: usize = @as(usize, quoted[0] & 0x0f) * 4;
+            if (qihl < 20 or quoted.len < qihl + 8) return null;
+            if (quoted[9] != 17) return null; // quoted protocol must be UDP
+            @memcpy(out.quoted_dst[0..4], quoted[16..20]);
+            break :blk quoted[qihl..];
+        },
+        .v6 => blk: {
+            if (quoted.len < 40 + 8) return null;
+            if (quoted[6] != 17) return null; // next header must be UDP
+            @memcpy(&out.quoted_dst, quoted[24..40]);
+            break :blk quoted[40..];
+        },
+    };
+    out.sport = std.mem.readInt(u16, udp[0..2], .big);
+    out.dport = std.mem.readInt(u16, udp[2..4], .big);
+    return out;
+}
+
+/// The RFC 4884 extension structure's objects of an ICMP Time Exceeded /
+/// Destination Unreachable, or null when it carries none (or a damaged one).
+///
+/// RFC 4884 §4/§5: the ICMP header's length field (IPv4: byte 5, 32-bit
+/// words; IPv6: byte 4, 64-bit words) gives the size of the quoted original
+/// datagram, which is then at least 128 bytes, and the extension structure
+/// follows it. Routers that predate RFC 4884 append it at a fixed 128 bytes
+/// with the length field left 0 ("compatibility", §5): that case is accepted
+/// only when a version-2 header with a verified checksum sits right there.
+pub fn extensionObjects(family: echo.Family, msg: []const u8) ?[]const u8 {
+    if (msg.len < echo.echo_header_len) return null;
+    const is_error = switch (family) {
+        .v4 => msg[0] == echo.v4.time_exceeded or msg[0] == echo.v4.dest_unreachable,
+        .v6 => msg[0] == echo.v6.time_exceeded or msg[0] == echo.v6.dest_unreachable,
+    };
+    if (!is_error) return null;
+    const words: usize = if (family == .v4) msg[5] else msg[4];
+    const unit: usize = if (family == .v4) 4 else 8;
+    const compat = words == 0;
+    const orig_len: usize = if (compat) 128 else words * unit;
+    if (orig_len < 128) return null;
+    const off = echo.echo_header_len + orig_len;
+    if (msg.len < off + 4) return null;
+    const ext = msg[off..];
+    if (ext[0] >> 4 != 2) return null; // extension structure version 2
+    const cks = std.mem.readInt(u16, ext[2..4], .big);
+    // The checksum is mandatory for a compatibility-mode guess (it is the
+    // only evidence the bytes are an extension at all); otherwise a zero
+    // field means "not computed".
+    if (cks != 0 or compat) {
+        if (cks == 0 or echo.checksum(ext) != 0) return null;
+    }
+    return ext[4..];
+}
+
+/// The MPLS label stack (RFC 4950: class 1, c-type 1) among an ICMP error's
+/// extension objects; empty when there is none.
+pub fn mplsOf(family: echo.Family, msg: []const u8) MplsStack {
+    var out: MplsStack = .{};
+    var objs = extensionObjects(family, msg) orelse return out;
+    while (objs.len >= 4) {
+        const len = std.mem.readInt(u16, objs[0..2], .big);
+        if (len < 4 or len > objs.len) break;
+        if (objs[2] == 1 and objs[3] == 1) {
+            var e = objs[4..len];
+            while (e.len >= 4 and out.len < max_mpls_labels) : (e = e[4..]) {
+                const v = std.mem.readInt(u32, e[0..4], .big);
+                out.entries[out.len] = .{
+                    .label = @intCast(v >> 12),
+                    .tc = @intCast((v >> 9) & 0x7),
+                    .bottom = v & 0x100 != 0,
+                    .ttl = @intCast(v & 0xff),
+                };
+                out.len += 1;
+            }
+            return out;
+        }
+        objs = objs[len..];
+    }
+    return out;
+}
+
 /// Map a wire sequence number back to its flat probe slot (bounded scheme:
 /// wraparound-safe subtraction, then a range check).
 fn slotOf(seq: u16, base: u16, total: usize) ?usize {
@@ -506,39 +768,127 @@ fn slotOf(seq: u16, base: u16, total: usize) ?usize {
 pub const LinuxTransport = struct {
     sock: icmp.Socket,
     dest: DestAddr,
+    /// UDP method: the send socket, and its bound source port (the probes'
+    /// correlation token, `Options.ident`).
+    udp_fd: ?i32 = null,
+    udp_port: u16 = 0,
 
     const DestAddr = union(enum) {
         v4: linux.sockaddr.in,
         v6: linux.sockaddr.in6,
     };
 
-    pub const OpenError = icmp.Socket.OpenError;
+    pub const OpenError = icmp.Socket.OpenError || error{UdpSocketFailed};
 
     pub fn open(dest_ip: netaddr.Ip) OpenError!LinuxTransport {
+        return openWith(dest_ip, .{});
+    }
+
+    /// `open` honouring `opts.method`, `.iface`, `.source`, `.tos` and
+    /// `.fwmark`. The raw ICMP socket receives every reply (for both
+    /// methods: Time Exceeded / Port Unreachable for a UDP probe arrive as
+    /// ICMP); the UDP method adds a datagram socket to send from.
+    pub fn openWith(dest_ip: netaddr.Ip, opts: Options) OpenError!LinuxTransport {
         if (comptime builtin.os.tag != .linux)
             @compileError("traceroute.LinuxTransport is Linux-only (raw ICMP sockets)");
         const family: icmp.Socket.Family = switch (dest_ip) {
             .v4 => .v4,
             .v6 => .v6,
         };
-        const sock = try icmp.Socket.open(family, .raw, .{});
-        return .{
+        const src_sa: ?SockAddr = if (opts.source) |src| sockAddr(src, 0) else null;
+        var sock = try icmp.Socket.open(family, .raw, .{
+            .iface = opts.iface,
+            .tos = if (opts.method == .icmp) opts.tos else null,
+            .fwmark = opts.fwmark,
+            .source = if (src_sa) |sa| switch (sa) {
+                .v4 => |v| .{ .v4 = v },
+                .v6 => |v| .{ .v6 = v },
+            } else null,
+        });
+        errdefer sock.close();
+        var lt: LinuxTransport = .{
             .sock = sock,
             .dest = switch (dest_ip) {
                 .v4 => |q| .{ .v4 = .{ .port = 0, .addr = @bitCast(q) } },
                 .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
             },
         };
+        if (opts.method == .udp) {
+            const fd = try openUdp(family, opts, src_sa);
+            lt.udp_fd = fd;
+            lt.udp_port = boundPort(fd) catch {
+                _ = linux.close(fd);
+                return error.UdpSocketFailed;
+            };
+        }
+        return lt;
+    }
+
+    const SockAddr = union(enum) { v4: linux.sockaddr.in, v6: linux.sockaddr.in6 };
+
+    fn sockAddr(ip: netaddr.Ip, port: u16) SockAddr {
+        return switch (ip) {
+            .v4 => |q| .{ .v4 = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(q) } },
+            .v6 => |b| .{ .v6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = b, .scope_id = 0 } },
+        };
+    }
+
+    fn openUdp(family: icmp.Socket.Family, opts: Options, src: ?SockAddr) OpenError!i32 {
+        const af: u32 = if (family == .v4) linux.AF.INET else linux.AF.INET6;
+        const rc = linux.socket(af, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.UdpSocketFailed;
+        const fd: i32 = @intCast(rc);
+        errdefer _ = linux.close(fd);
+        if (opts.iface) |name| {
+            if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, name.ptr, @intCast(name.len))) != .SUCCESS)
+                return error.UdpSocketFailed;
+        }
+        if (opts.tos) |tos| {
+            const v: u32 = tos;
+            const r = switch (family) {
+                .v4 => linux.setsockopt(fd, linux.SOL.IP, linux.IP.TOS, @ptrCast(&v), @sizeOf(u32)),
+                .v6 => linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.TCLASS, @ptrCast(&v), @sizeOf(u32)),
+            };
+            if (linux.errno(r) != .SUCCESS) return error.UdpSocketFailed;
+        }
+        if (opts.fwmark) |mark| {
+            if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.MARK, @ptrCast(&mark), @sizeOf(u32))) != .SUCCESS)
+                return error.UdpSocketFailed;
+        }
+        // Bind (to the source address, or any) with port 0: the kernel picks
+        // an ephemeral source port, which becomes the correlation token.
+        const any: SockAddr = if (family == .v4)
+            .{ .v4 = .{ .port = 0, .addr = 0 } }
+        else
+            .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 } };
+        const sa = src orelse any;
+        const brc = switch (sa) {
+            .v4 => |*v| linux.bind(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in)),
+            .v6 => |*v| linux.bind(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in6)),
+        };
+        if (linux.errno(brc) != .SUCCESS) return error.UdpSocketFailed;
+        return fd;
+    }
+
+    fn boundPort(fd: i32) error{UdpSocketFailed}!u16 {
+        var ss: linux.sockaddr.in6 = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+        if (linux.errno(linux.getsockname(fd, @ptrCast(&ss), &len)) != .SUCCESS) return error.UdpSocketFailed;
+        // sin_port and sin6_port sit at the same offset.
+        return std.mem.bigToNative(u16, ss.port);
     }
 
     pub fn close(lt: *LinuxTransport) void {
+        if (lt.udp_fd) |fd| _ = linux.close(fd);
         lt.sock.close();
         lt.* = undefined;
     }
 
-    /// The socket's echo identifier — pass it as `Options.ident`.
+    /// The probes' correlation token — pass it as `Options.ident`: the UDP
+    /// socket's source port for the UDP method, else the ICMP socket's echo
+    /// identifier.
     pub fn ident(lt: *const LinuxTransport) u16 {
-        return lt.sock.ident;
+        return if (lt.udp_fd != null) lt.udp_port else lt.sock.ident;
     }
 
     pub fn transport(lt: *LinuxTransport) Transport {
@@ -547,9 +897,47 @@ pub const LinuxTransport = struct {
             // Raw v4 sockets deliver the IP header; ICMPv6 never does.
             .strip_ip_header = lt.sock.family == .v4,
             .sendFn = sendImpl,
+            .sendUdpFn = if (lt.udp_fd != null) sendUdpImpl else null,
             .recvFn = recvImpl,
             .nowFn = nowImpl,
         };
+    }
+
+    fn sendUdpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        const fd = lt.udp_fd orelse return error.SendFailed;
+        const v: u32 = ttl;
+        const rc = switch (lt.sock.family) {
+            .v4 => linux.setsockopt(fd, linux.SOL.IP, linux.IP.TTL, @ptrCast(&v), @sizeOf(u32)),
+            .v6 => linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, @ptrCast(&v), @sizeOf(u32)),
+        };
+        if (linux.errno(rc) != .SUCCESS) return error.SendFailed;
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            const port = std.mem.nativeToBig(u16, dst_port);
+            const sent = switch (lt.dest) {
+                .v4 => |sa| blk: {
+                    var d = sa;
+                    d.port = port;
+                    break :blk linux.sendto(fd, payload.ptr, payload.len, 0, @ptrCast(&d), @sizeOf(linux.sockaddr.in));
+                },
+                .v6 => |sa| blk: {
+                    var d = sa;
+                    d.port = port;
+                    break :blk linux.sendto(fd, payload.ptr, payload.len, 0, @ptrCast(&d), @sizeOf(linux.sockaddr.in6));
+                },
+            };
+            switch (linux.errno(sent)) {
+                .SUCCESS => return,
+                // A previous probe's ICMP error can surface as a pending
+                // socket error on this send (ECONNREFUSED for a Port
+                // Unreachable, EHOSTUNREACH, …). The raw socket already
+                // delivered that ICMP message; the error is not this send's
+                // — clear it by retrying once.
+                .CONNREFUSED, .HOSTUNREACH, .NETUNREACH => if (attempt > 0) return error.SendFailed,
+                else => return error.SendFailed,
+            }
+        }
     }
 
     fn sendImpl(ctx: *anyopaque, ttl: u8, packet: []const u8) TransportError!void {
@@ -655,11 +1043,14 @@ fn randomIdentAndSeq() struct { ident: u16, seq_base: u16 } {
 /// values for this trace (A1 F2) — the socket's own PID-derived identifier
 /// is never used for probes sent by this function.
 pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceError!Trace {
-    var lt = try LinuxTransport.open(dest);
+    try opts.validate();
+    var lt = try LinuxTransport.openWith(dest, opts);
     defer lt.close();
     var o = opts;
     const r = randomIdentAndSeq();
-    o.ident = r.ident;
+    // UDP: the kernel-chosen ephemeral source port is the token — it is what
+    // the replies quote back.
+    o.ident = if (opts.method == .udp) lt.ident() else r.ident;
     o.seq_base = r.seq_base;
     return traceWith(gpa, lt.transport(), dest, o);
 }
@@ -1520,12 +1911,15 @@ const ReplayTransport = struct {
             .ctx = r,
             .strip_ip_header = true, // real raw-socket capture includes the IP header
             .sendFn = sendImpl,
+            .sendUdpFn = sendUdpImpl,
             .recvFn = recvImpl,
             .nowFn = nowImpl,
         };
     }
 
     fn sendImpl(_: *anyopaque, _: u8, _: []const u8) TransportError!void {}
+
+    fn sendUdpImpl(_: *anyopaque, _: u8, _: u16, _: []const u8) TransportError!void {}
 
     fn nowImpl(ctx: *anyopaque) u64 {
         const r: *ReplayTransport = @ptrCast(@alignCast(ctx));
@@ -1644,6 +2038,9 @@ test "REAL CAPTURE: fixture count + size canary — 3 real veth-router captures"
 }
 
 test "live: trace to 127.0.0.1 (skipped without CAP_NET_RAW)" {
+    // A fresh `unshare -rn` namespace starts with `lo` down; this test used
+    // to fail there (not skip) whenever it ran before anything brought it up.
+    bringLoopbackUp();
     const dest = netaddr.parseIp("127.0.0.1").?;
     var lt = LinuxTransport.open(dest) catch |err| switch (err) {
         error.PermissionDenied => return error.SkipZigTest,
@@ -1659,6 +2056,475 @@ test "live: trace to 127.0.0.1 (skipped without CAP_NET_RAW)" {
     const p = tr.hops[0].probes[0];
     try testing.expectEqual(Probe.Kind.reply, p.kind);
     try testing.expect(p.address.?.eql(dest));
+}
+
+// ── 2026-10-04: UDP method, MPLS extensions, live options ───────────────────
+
+// Real kernel replies to UDP probes, captured with tcpdump in the same kind of
+// throwaway veth sandbox as the captures above (client 10.0.0.1 → router
+// 10.0.0.2/10.0.1.1 → server 10.0.1.2, `ip_forward=1` in the router netns,
+// all inside `unshare -rnm`, 2026-10-04). The client sent UDP from port 40000
+// to 10.0.1.2: TTL 1 to port 33434 (the router's Time Exceeded) and TTL 2 to
+// port 33435 (the server's Port Unreachable — nothing listens there).
+// `tcpdump -vv` decoded them as "ICMP time exceeded in-transit … 10.0.0.1.40000
+// > 10.0.1.2.33434" and "ICMP 10.0.1.2 udp port 33435 unreachable".
+const real_udp_time_exceeded = [_]u8{
+    0x45, 0xc0, 0x00, 0x44, 0x0b, 0xb0, 0x00, 0x00, 0x40, 0x01, 0x5a, 0x47, 0x0a, 0x00, 0x00, 0x02,
+    0x0a, 0x00, 0x00, 0x01, 0x0b, 0x00, 0xc0, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x28,
+    0x76, 0xa9, 0x40, 0x00, 0x01, 0x11, 0xee, 0x19, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x01, 0x02,
+    0x9c, 0x40, 0x82, 0x9a, 0x00, 0x14, 0x15, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+const real_udp_port_unreachable = [_]u8{
+    0x45, 0xc0, 0x00, 0x44, 0xad, 0xe8, 0x00, 0x00, 0x3f, 0x01, 0xb8, 0x0e, 0x0a, 0x00, 0x01, 0x02,
+    0x0a, 0x00, 0x00, 0x01, 0x03, 0x03, 0xc8, 0xe4, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x28,
+    0x76, 0xaa, 0x40, 0x00, 0x01, 0x11, 0xee, 0x18, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x01, 0x02,
+    0x9c, 0x40, 0x82, 0x9b, 0x00, 0x14, 0x15, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
+const udp_trace_opts: Options = .{
+    .method = .udp,
+    .max_hops = 2,
+    .probes_per_hop = 1,
+    .ident = 40000, // the captured probes' source port
+    .udp_port_base = 33434,
+    .timeout_ms = 500,
+};
+
+test "REAL CAPTURE: a UDP trace — router Time Exceeded, then the server's Port Unreachable" {
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_udp_time_exceeded[20..]));
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_udp_port_unreachable[20..]));
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_udp_time_exceeded, .from = real_router_addr },
+        .{ .bytes = &real_udp_port_unreachable, .from = real_server_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, udp_trace_opts);
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(?u8, null), tr.unreachable_code);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(real_router_addr));
+    const last = tr.hops[1].probes[0];
+    try testing.expectEqual(Probe.Kind.reply, last.kind);
+    try testing.expectEqual(@as(?u8, 3), last.code); // RFC 792: port unreachable
+    try testing.expect(last.address.?.eql(real_server_addr));
+    // No RFC 4884 extension in a plain kernel reply.
+    try testing.expectEqual(@as(usize, 0), tr.hops[0].probes[0].mpls.slice().len);
+}
+
+test "UDP replies are matched on the quoted source AND destination port and the quoted destination" {
+    // Same real bytes, three ways to not match: another source port (another
+    // traceroute's probes), a port base that puts 33434 outside this trace's
+    // window, and a destination the probes did not go to.
+    for ([_]struct { Options, netaddr.Ip }{
+        .{ blk: {
+            var o = udp_trace_opts;
+            o.ident = 40001;
+            break :blk o;
+        }, real_server_addr },
+        .{ blk: {
+            var o = udp_trace_opts;
+            o.udp_port_base = 33500;
+            break :blk o;
+        }, real_server_addr },
+        .{ udp_trace_opts, real_unreachable_dest },
+    }) |c| {
+        var r: ReplayTransport = .{ .packets = &.{
+            .{ .bytes = &real_udp_time_exceeded, .from = real_router_addr },
+        } };
+        var tr = try traceWith(testing.allocator, r.transport(), c[1], c[0]);
+        defer tr.deinit(testing.allocator);
+        try testing.expect(!tr.reached);
+        for (tr.hops) |h| try testing.expectEqual(Probe.Kind.timeout, h.probes[0].kind);
+    }
+}
+
+test "UDP: a Port Unreachable from someone other than the destination is terminal, not 'reached'" {
+    // The server's real Port Unreachable, delivered as if it came from the
+    // router: A1 F1's rule (the destination's answer must come from the
+    // destination) applies to the UDP method's "reply" too.
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_udp_time_exceeded, .from = real_router_addr },
+        .{ .bytes = &real_udp_port_unreachable, .from = real_router_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, udp_trace_opts);
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(?u8, 3), tr.unreachable_code);
+    try testing.expectEqual(Probe.Kind.dest_unreachable, tr.hops[1].probes[0].kind);
+}
+
+test "UDP: an ICMP-method trace ignores UDP errors and vice versa" {
+    // An echo-method trace (ident 40000 as the echo id) must not take a
+    // quoted UDP header for its own probe…
+    var r: ReplayTransport = .{ .packets = &.{.{ .bytes = &real_udp_time_exceeded, .from = real_router_addr }} };
+    var o = udp_trace_opts;
+    o.method = .icmp;
+    o.max_hops = 1;
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, o);
+    defer tr.deinit(testing.allocator);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    // …and a UDP trace must not take a quoted echo request (the ICMP-method
+    // real capture, ident 0x7472 seq 1) for one of its probes.
+    var r2: ReplayTransport = .{ .packets = &.{.{ .bytes = &real_time_exceeded_icmp, .from = real_router_addr }} };
+    var o2 = udp_trace_opts;
+    o2.ident = 0x7472;
+    o2.max_hops = 1;
+    var tr2 = try traceWith(testing.allocator, r2.transport(), real_server_addr, o2);
+    defer tr2.deinit(testing.allocator);
+    try testing.expectEqual(Probe.Kind.timeout, tr2.hops[0].probes[0].kind);
+}
+
+test "UDP options: port window must fit, and the transport must be able to send UDP" {
+    var o = udp_trace_opts;
+    o.udp_port_base = 0;
+    try testing.expectError(error.InvalidOptions, o.validate());
+    // 2 probes from 65535 would need port 65536.
+    o.udp_port_base = 65535;
+    try testing.expectError(error.InvalidOptions, o.validate());
+    o.udp_port_base = 65534;
+    try o.validate();
+    // A transport without `sendUdpFn` (the ICMP-only fake) refuses the method.
+    var f: FakeTransport = .{ .behaviors = &.{.reply} };
+    defer f.deinit();
+    try testing.expectError(error.InvalidOptions, runFake(&f, udp_trace_opts));
+}
+
+// An ICMP Time Exceeded quoting a UDP probe (10.0.0.1.40000 → 10.0.1.2.33434)
+// padded to 128 bytes, with an RFC 4884 length field (32 words) and an RFC 4950
+// MPLS object of two entries — built for this test and decoded by tcpdump
+// 4.99.6: "ICMP Multi-Part extension v2, checksum 0xc2f0 (correct), length 16",
+// "MPLS Stack Entry Object (1), Class-Type: 1, length 12", "label 16, tc 0,
+// ttl 1". (tcpdump prints only the first entry; the second — label 17, TC 5,
+// bottom of stack, TTL 255 — is read off RFC 3032 §2.1's layout.)
+const mpls_time_exceeded = blk: {
+    const h =
+        "450000ac00070000400166480a0000020a0000010b00d5f0002000004500002800074000011164bc0a0000010a000102" ++
+        "9c40829a0014000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000002000c2f0000c01010001000100011bff";
+    @setEvalBranchQuota(10000);
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    break :blk out;
+};
+
+test "MPLS label stack (RFC 4950) is read from an RFC 4884 extension and attached to the hop" {
+    var r: ReplayTransport = .{ .packets = &.{.{ .bytes = &mpls_time_exceeded, .from = real_router_addr }} };
+    var o = udp_trace_opts;
+    o.max_hops = 1;
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, o);
+    defer tr.deinit(testing.allocator);
+    const p = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.time_exceeded, p.kind);
+    const labels = p.mpls.slice();
+    try testing.expectEqual(@as(usize, 2), labels.len);
+    try testing.expectEqualDeep(MplsEntry{ .label = 16, .tc = 0, .bottom = false, .ttl = 1 }, labels[0]);
+    try testing.expectEqualDeep(MplsEntry{ .label = 17, .tc = 5, .bottom = true, .ttl = 255 }, labels[1]);
+}
+
+test "extensionObjects: length field, compatibility mode, version and checksum gates" {
+    const msg = mpls_time_exceeded[20..]; // past the outer IPv4 header
+    try testing.expect(extensionObjects(.v4, msg) != null);
+    // RFC 4884 §5 compatibility: length field 0, extension at 128 bytes —
+    // accepted because a version-2 header with a valid checksum sits there.
+    var compat = mpls_time_exceeded;
+    compat[20 + 5] = 0;
+    try testing.expectEqual(@as(usize, 2), mplsOf(.v4, compat[20..]).len);
+    // …but not when the checksum is zero (nothing proves it is an extension).
+    var compat0 = compat;
+    compat0[20 + 8 + 128 + 2] = 0;
+    compat0[20 + 8 + 128 + 3] = 0;
+    try testing.expect(extensionObjects(.v4, compat0[20..]) == null);
+    // A length field below 128 bytes (31 words) is not RFC 4884.
+    var short = mpls_time_exceeded;
+    short[20 + 5] = 31;
+    try testing.expect(extensionObjects(.v4, short[20..]) == null);
+    // Version 1, or a damaged checksum, is not an extension.
+    var v1 = mpls_time_exceeded;
+    v1[20 + 8 + 128] = 0x10;
+    try testing.expect(extensionObjects(.v4, v1[20..]) == null);
+    var bad = mpls_time_exceeded;
+    bad[bad.len - 1] ^= 1;
+    try testing.expect(extensionObjects(.v4, bad[20..]) == null);
+    // A zero checksum with an explicit length field means "not computed".
+    var nock = mpls_time_exceeded;
+    nock[20 + 8 + 128 + 2] = 0;
+    nock[20 + 8 + 128 + 3] = 0;
+    try testing.expect(extensionObjects(.v4, nock[20..]) != null);
+    // Not an error message at all.
+    try testing.expect(extensionObjects(.v4, real_echo_reply_icmp[20..]) == null);
+    // An object whose length runs past the data stops the walk, empty-handed.
+    var long_obj = mpls_time_exceeded;
+    long_obj[20 + 8 + 128 + 4 + 1] = 0x40; // object length 64 > remaining
+    long_obj[20 + 8 + 128 + 2] = 0;
+    long_obj[20 + 8 + 128 + 3] = 0;
+    try testing.expectEqual(@as(usize, 0), mplsOf(.v4, long_obj[20..]).len);
+}
+
+test "MPLS: a stack deeper than max_mpls_labels is truncated, never overflows" {
+    var buf: [8 + 128 + 4 + 4 + 4 * 12]u8 = @splat(0);
+    buf[0] = echo.v4.time_exceeded;
+    buf[5] = 32; // 128 bytes of original datagram
+    const ext = buf[8 + 128 ..];
+    ext[0] = 0x20;
+    std.mem.writeInt(u16, ext[4..6], 4 + 4 * 12, .big);
+    ext[6] = 1;
+    ext[7] = 1;
+    for (0..12) |i| std.mem.writeInt(u32, ext[8 + 4 * i ..][0..4], @as(u32, @intCast(100 + i)) << 12, .big);
+    const st = mplsOf(.v4, &buf);
+    try testing.expectEqual(@as(usize, max_mpls_labels), st.slice().len);
+    try testing.expectEqual(@as(u20, 100 + max_mpls_labels - 1), st.slice()[max_mpls_labels - 1].label);
+}
+
+test "IPv6 UDP: Port Unreachable is code 4 and quotes a 40-byte header" {
+    const dest6 = netaddr.parseIp("2001:db8::2").?;
+    const router6 = netaddr.parseIp("2001:db8::1").?;
+    // RFC 4443 §3.3 / §3.1: type 3 (Time Exceeded) / type 1 code 4 (port
+    // unreachable), 4 unused bytes, then the invoking packet: a 40-byte IPv6
+    // header (next header 17 at offset 6, destination at 24) + the UDP header.
+    var te: [8 + 40 + 8]u8 = @splat(0);
+    te[0] = echo.v6.time_exceeded;
+    te[8 + 6] = 17;
+    @memcpy(te[8 + 24 ..][0..16], &dest6.v6);
+    std.mem.writeInt(u16, te[48..50], 40000, .big);
+    std.mem.writeInt(u16, te[50..52], 33434, .big);
+    var pu = te;
+    pu[0] = echo.v6.dest_unreachable;
+    pu[1] = 4;
+    std.mem.writeInt(u16, pu[50..52], 33435, .big);
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &te, .from = router6 },
+        .{ .bytes = &pu, .from = dest6 },
+    } };
+    var t = r.transport();
+    t.strip_ip_header = false; // ICMPv6 sockets never deliver the IPv6 header
+    var tr = try traceWith(testing.allocator, t, dest6, udp_trace_opts);
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(?u8, 4), tr.hops[1].probes[0].code);
+    // IPv4's port-unreachable code (3) from the destination is NOT the IPv6
+    // "reached" signal (that is 3 = address unreachable there).
+    var pu3 = pu;
+    pu3[1] = 3;
+    var r3: ReplayTransport = .{ .packets = &.{ .{ .bytes = &te, .from = router6 }, .{ .bytes = &pu3, .from = dest6 } } };
+    var t3 = r3.transport();
+    t3.strip_ip_header = false;
+    var tr3 = try traceWith(testing.allocator, t3, dest6, udp_trace_opts);
+    defer tr3.deinit(testing.allocator);
+    try testing.expect(!tr3.reached);
+    try testing.expectEqual(@as(?u8, 3), tr3.unreachable_code);
+}
+
+/// An ICMPv4 Time Exceeded with `orig_len` bytes of quoted datagram (a UDP
+/// probe 10.0.0.1.40000 → 10.0.1.2.33434 at its start), the RFC 4884 length
+/// field set to `words`, and `ext` appended — every checksum computed, so a
+/// test can switch exactly one rule off.
+fn buildExtTe(buf: []u8, words: u8, orig_len: usize, ext: []const u8) []u8 {
+    const msg = buf[0 .. 8 + orig_len + ext.len];
+    @memset(msg, 0);
+    msg[0] = echo.v4.time_exceeded;
+    msg[5] = words;
+    const q = msg[8..];
+    q[0] = 0x45;
+    q[9] = 17;
+    @memcpy(q[16..20], &[_]u8{ 10, 0, 1, 2 });
+    std.mem.writeInt(u16, q[20..22], 40000, .big);
+    std.mem.writeInt(u16, q[22..24], 33434, .big);
+    @memcpy(msg[8 + orig_len ..], ext);
+    std.mem.writeInt(u16, msg[2..4], echo.checksum(msg), .big);
+    return msg;
+}
+
+/// An extension structure (version `ver`) holding one object of `class`/
+/// `ctype` with `entries`, its checksum computed.
+fn buildExt(buf: []u8, ver: u4, class: u8, ctype: u8, entries: []const u32) []u8 {
+    const len = 4 + 4 + 4 * entries.len;
+    const e = buf[0..len];
+    @memset(e, 0);
+    e[0] = @as(u8, ver) << 4;
+    std.mem.writeInt(u16, e[4..6], @intCast(4 + 4 * entries.len), .big);
+    e[6] = class;
+    e[7] = ctype;
+    for (entries, 0..) |v, i| std.mem.writeInt(u32, e[8 + 4 * i ..][0..4], v, .big);
+    std.mem.writeInt(u16, e[2..4], echo.checksum(e), .big);
+    return e;
+}
+
+test "extensions: each RFC 4884/4950 rule rejects on its own (every checksum valid)" {
+    var eb: [64]u8 = undefined;
+    var mb: [300]u8 = undefined;
+    const lse = (@as(u32, 300) << 12) | (1 << 9) | 64; // label 300, TC 1, S = 0, TTL 64
+    // Baseline: a well-formed one decodes — TC 1 sets bit 9 and S (bit 8)
+    // stays clear, so the two fields cannot be confused.
+    const good = buildExtTe(&mb, 32, 128, buildExt(&eb, 2, 1, 1, &.{lse}));
+    const st = mplsOf(.v4, good);
+    try testing.expectEqual(@as(usize, 1), st.slice().len);
+    try testing.expectEqualDeep(MplsEntry{ .label = 300, .tc = 1, .bottom = false, .ttl = 64 }, st.slice()[0]);
+    // A length field of 31 words (124 bytes) with a valid extension right
+    // after: RFC 4884 §4.1 requires the original datagram field to be at
+    // least 128 bytes when an extension follows — not an extension.
+    try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 31, 124, buildExt(&eb, 2, 1, 1, &.{lse}))) == null);
+    // Version 1 with a correct checksum: only version 2 is defined.
+    try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 32, 128, buildExt(&eb, 1, 1, 1, &.{lse}))) == null);
+    // Class 1 but C-Type 2: not the MPLS label stack object.
+    try testing.expectEqual(@as(usize, 0), mplsOf(.v4, buildExtTe(&mb, 32, 128, buildExt(&eb, 2, 1, 2, &.{lse}))).slice().len);
+    // Compatibility mode (length 0) whose extension checksums to exactly
+    // 0x0000 — a real one's-complement sum can, so pick the TTL that makes
+    // it so: still refused, since a zero field means "not computed" and a
+    // guessed extension needs a checksum to be believed.
+    // Words: 0x2000 (version) + 0x0008 + 0x0101 (object header) + 0x0012 +
+    // 0xdee4 (the entry) = 0xffff, so the computed checksum is 0x0000.
+    const zero_ck = buildExt(&eb, 2, 1, 1, &.{0x0012dee4});
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, zero_ck[2..4], .big));
+    try testing.expectEqual(@as(u16, 0), echo.checksum(zero_ck));
+    try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 0, 128, zero_ck)) == null);
+    // The same bytes with an explicit length field are accepted ("not
+    // computed" is allowed there).
+    try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 32, 128, zero_ck)) != null);
+}
+
+test "UDP: a quoted datagram that is not UDP, or a damaged ICMPv4 checksum, is ignored" {
+    // The real Time Exceeded, re-labelled as quoting TCP (protocol 6) with the
+    // same ports in place — then its ICMP checksum fixed up so only the
+    // protocol rule can reject it.
+    var tcp = real_udp_time_exceeded;
+    tcp[20 + 8 + 9] = 6;
+    tcp[22] = 0;
+    tcp[23] = 0;
+    std.mem.writeInt(u16, tcp[22..24], echo.checksum(tcp[20..]), .big);
+    var broken = real_udp_time_exceeded;
+    broken[broken.len - 1] ^= 0x01; // payload bit flip, checksum now wrong
+    for ([_][]const u8{ &tcp, &broken }) |bytes| {
+        var r: ReplayTransport = .{ .packets = &.{.{ .bytes = bytes, .from = real_router_addr }} };
+        var o = udp_trace_opts;
+        o.max_hops = 1;
+        var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, o);
+        defer tr.deinit(testing.allocator);
+        try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    }
+    // IPv6: a quoted next header of 6 (TCP) is not a UDP probe either.
+    const dest6 = netaddr.parseIp("2001:db8::2").?;
+    var te: [8 + 40 + 8]u8 = @splat(0);
+    te[0] = echo.v6.time_exceeded;
+    te[8 + 6] = 6;
+    @memcpy(te[8 + 24 ..][0..16], &dest6.v6);
+    std.mem.writeInt(u16, te[48..50], 40000, .big);
+    std.mem.writeInt(u16, te[50..52], 33434, .big);
+    var r6: ReplayTransport = .{ .packets = &.{.{ .bytes = &te, .from = netaddr.parseIp("2001:db8::1").? }} };
+    var t6 = r6.transport();
+    t6.strip_ip_header = false;
+    var o6 = udp_trace_opts;
+    o6.max_hops = 1;
+    var tr6 = try traceWith(testing.allocator, t6, dest6, o6);
+    defer tr6.deinit(testing.allocator);
+    try testing.expectEqual(Probe.Kind.timeout, tr6.hops[0].probes[0].kind);
+}
+
+test "UDP: a late duplicate for an answered probe does not overwrite it (A1 F12)" {
+    // Probe 1 answered by the router; while probe 2 waits, a second Time
+    // Exceeded for probe 1 arrives from somewhere else; then probe 2's own
+    // Port Unreachable. The first answer for a slot wins.
+    var dup = real_udp_time_exceeded;
+    _ = &dup;
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_udp_time_exceeded, .from = real_router_addr },
+        .{ .bytes = &dup, .from = test_dest },
+        .{ .bytes = &real_udp_port_unreachable, .from = real_server_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, udp_trace_opts);
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(real_router_addr));
+    try testing.expect(tr.reached);
+}
+
+test "live: iface/source/tos land on the sockets themselves (skipped without CAP_NET_RAW)" {
+    bringLoopbackUp();
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    for ([_]Method{ .icmp, .udp }) |method| {
+        var lt = LinuxTransport.openWith(dest, .{ .method = method, .iface = "lo", .source = dest, .tos = 0x10 }) catch |err| switch (err) {
+            error.PermissionDenied => return error.SkipZigTest,
+            else => return err,
+        };
+        defer lt.close();
+        // The socket that SENDS carries TOS and the interface binding.
+        const send_fd = lt.udp_fd orelse lt.sock.fd;
+        var tos: u32 = 0;
+        var tl: linux.socklen_t = @sizeOf(u32);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockopt(send_fd, linux.SOL.IP, linux.IP.TOS, @ptrCast(&tos), &tl)));
+        try testing.expectEqual(@as(u32, 0x10), tos);
+        var dev: [16]u8 = @splat(0);
+        var dl: linux.socklen_t = dev.len;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockopt(send_fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &dev, &dl)));
+        try testing.expectEqualStrings("lo", std.mem.sliceTo(&dev, 0));
+        // The receiving raw socket is bound to the interface as well.
+        dl = dev.len;
+        @memset(&dev, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockopt(lt.sock.fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &dev, &dl)));
+        try testing.expectEqualStrings("lo", std.mem.sliceTo(&dev, 0));
+        // UDP: the token is the bound source port, not the ICMP ident.
+        if (method == .udp) try testing.expectEqual(lt.udp_port, lt.ident());
+    }
+}
+
+fn bringLoopbackUp() void {
+    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var ifr: extern struct { name: [16]u8, flags: i16, pad: [22]u8 } = .{ .name = @splat(0), .flags = 0, .pad = @splat(0) };
+    @memcpy(ifr.name[0..2], "lo");
+    if (linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&ifr))) != .SUCCESS) return;
+    ifr.flags |= 1; // IFF_UP
+    _ = linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&ifr));
+}
+
+test "live: UDP trace to 127.0.0.1 ends on the loopback's own Port Unreachable (skipped without CAP_NET_RAW)" {
+    bringLoopbackUp();
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    var tr = trace(testing.allocator, dest, .{ .method = .udp, .max_hops = 3, .probes_per_hop = 2, .timeout_ms = 2000 }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer tr.deinit(testing.allocator);
+    if (tr.transport_err != null and tr.hops.len == 0) return error.SkipZigTest; // no usable loopback
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    for (tr.hops[0].probes) |p| {
+        try testing.expectEqual(Probe.Kind.reply, p.kind);
+        try testing.expectEqual(@as(?u8, 3), p.code);
+        try testing.expect(p.address.?.eql(dest));
+    }
+}
+
+test "live: source/interface/tos options reach the sockets (skipped without CAP_NET_RAW)" {
+    bringLoopbackUp();
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    // Bound to `lo`, from 127.0.0.1, TOS 0x10: still reaches the destination.
+    var tr = trace(testing.allocator, dest, .{
+        .max_hops = 2,
+        .probes_per_hop = 1,
+        .timeout_ms = 2000,
+        .iface = "lo",
+        .source = dest,
+        .tos = 0x10,
+    }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer tr.deinit(testing.allocator);
+    if (tr.transport_err != null and tr.hops.len == 0) return error.SkipZigTest;
+    try testing.expect(tr.reached);
+    // A source address this host does not own cannot be bound: the open fails.
+    try testing.expectError(error.SourceAddressBind, trace(testing.allocator, dest, .{ .source = netaddr.parseIp("192.0.2.77").? }));
+    // An interface that does not exist cannot be bound either.
+    if (trace(testing.allocator, dest, .{ .method = .udp, .iface = "nonexistent0" })) |t_ok| {
+        var t2 = t_ok;
+        t2.deinit(testing.allocator);
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
 }
 
 // ── A1 F9: fuzz — arbitrary ICMP bytes through the full hop state machine ──

@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 items: UDP method, MPLS/ICMP extensions,
+  source/interface/TOS). ADDED `Options.method` (`.icmp` default, `.udp` = traceroute(8)'s
+  classic UDP-to-33434+ probes, matched on the quoted source port + destination port + quoted
+  destination; the destination's own Port Unreachable is the `.reply`), `Options.udp_port_base`,
+  live-only `Options.iface`/`.source`/`.tos`/`.fwmark` (`LinuxTransport.openWith`),
+  `Transport.sendUdpFn` (optional; a transport without it refuses `.udp`), `Probe.mpls`
+  (`MplsStack` of `MplsEntry`) from RFC 4884 extensions (length field, or the 128-byte
+  compatibility position only with a verified checksum), `extensionObjects`, `mplsOf`. Anchored
+  on real kernel replies from a veth router sandbox and an MPLS extension tcpdump decodes as
+  "checksum … (correct)". FIXED (test only): the live ICMP test failed instead of skipping in a
+  fresh netns with `lo` down. ⚠ `LinuxTransport.OpenError` (and so `LiveTraceError`) gained
+  `UdpSocketFailed` — only an exhaustive `switch` notices (axp's has `else`). Mutation: 29
+  mutants, all killed (13 after new, rule-isolating tests).
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, follow-up closing the
   three findings left open by the same day's earlier fix wave below (F3, F4, F10 — all
   three blocked on the sibling `icmp` module, which gained the needed field and check
