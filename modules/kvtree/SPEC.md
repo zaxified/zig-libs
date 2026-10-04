@@ -6,7 +6,7 @@
 
 **Scope:** core — bbolt (etcd-io/bbolt v1.5.0) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-29
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [etcd-io/bbolt](https://github.com/etcd-io/bbolt) — **reference** | Go | MIT | 9.8k | v1.5.0 (2026-06-21) | Same design family (COW B+tree, double meta, one writer, MVCC readers). Has nested buckets, forward and backward cursors, backup/`Tx.WriteTo`, mmap zero-copy reads, multi-process readers, `Compact`. This module: flat keyspace, forward cursor only, no backup/compact, readers in-process. *(inferred from docs)* |
+| [etcd-io/bbolt](https://github.com/etcd-io/bbolt) — **reference** | Go | MIT | 9.8k | v1.5.0 (2026-06-21) | Same design family (COW B+tree, double meta, one writer, MVCC readers). Has nested buckets, forward and backward cursors, backup/`Tx.WriteTo`, mmap zero-copy reads, multi-process readers, `Compact`. This module: flat keyspace, readers in-process; a cursor in both directions and a backup that is also a compaction (`copyTo`, like bbolt's offline `Compact`) since 2026-10-04. *(inferred from docs)* |
 | [LMDB](https://github.com/LMDB/lmdb) | C | OpenLDAP Public License 2.8 | 3.0k | pushed 2026-08 | The original of the design. Named sub-databases, `MDB_PREV`/`LAST`, multi-process readers, dup-sort, ~500-byte key limit. Source not read. |
 | [cberner/redb](https://github.com/cberner/redb) | Rust | Apache-2.0 | 4.8k | v4.3.0 (2026-09-15) | Pure Rust COW B-tree, typed tables, savepoints, range iteration both directions, repair/compaction. |
 | [dgraph-io/badger](https://github.com/dgraph-io/badger) | Go | Apache-2.0 | 15.8k | v4.9.6 (2026-08-05) | LSM; write-heavy scale, TTL, iterators both ways, transactions with conflict detection. Different trade-off (write amplification, many files). |
 | [xit-vcs/xitdb](https://github.com/xit-vcs/xitdb) | Zig | MIT | 109 | pushed 2026-09-17 (no releases) | The Zig alternative: immutable persistent structures with snapshot semantics; no ordered scans over arbitrary byte keys *(inferred from README)*; no injectable storage or fault-injection sweep. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No embedded database or ordered on-disk store. |
 
-**Where we are ahead:** the only Zig entry with an ordered transactional store (B-tree, MVCC snapshots, multi-key ACID) plus crash-safety proved by a fault-injection sweep over every storage side effect, four crash modes; injectable `Storage` (deterministic testing, `pagecache` tiering); node merge, tail-of-file shrink and overflow chains; pure Zig, no C. **Where we are behind:** no buckets, no backward iteration (`last`/`prev`), no cross-process readers, no backup/online compaction, no batching of concurrent writers (→ Backlog items).
+**Where we are ahead:** the only Zig entry with an ordered transactional store (B-tree, MVCC snapshots, multi-key ACID) plus crash-safety proved by a fault-injection sweep over every storage side effect, four crash modes; injectable `Storage` (deterministic testing, `pagecache` tiering); node merge, tail-of-file shrink and overflow chains; pure Zig, no C. **Where we are behind:** no buckets, no cross-process readers, no in-place compaction (`copyTo` compacts into a new file, as bbolt's `Compact` does), no batching of concurrent writers (→ Backlog items).
 
 ## Status: core IMPLEMENTED (gate flipped)
 
@@ -311,6 +311,45 @@ opens after a truncate, and a crash sweep over commits that cut and truncate.
 Mutation check (26 schemata mutants over overflow, merge and shrink): all
 killed after the tests the first run asked for.
 
+**The cursor walks both ways** (2026-10-04). A cursor sits in a GAP between
+two keys: `next` yields the key after it and steps over it, `prev` the key
+before it. `first`/`last` put it before the first / after the last key, `seek`
+before the first key >= k, `seekAfter` after the last key <= k — so a reverse
+scan from k down is `seekAfter(k)` + `prev`, and "the latest entry" is `last` +
+`prev`. A `next` then `prev` yields one entry twice (Java's `ListIterator`; bbolt
+stands ON an entry instead). At either end a step yields null and leaves the
+stack as it is, so the other direction walks back from there — `next` used to
+pop its exhausted stack, which made a turn at the end impossible. Tests: a
+30 000-step random walk of `next`/`prev`/all four positioning calls over a
+two-level tree with overflow values, against the gap-count model, hitting both
+ends; an empty store.
+
+**`copyTo`: a backup that is also a compaction** (2026-10-04). `Snapshot.copyTo`
+(and `Db.copyTo` for the newest version) writes the version as a NEW store, not
+through `commit`: `bulk.zig` builds it bottom-up from the cursor's ordered
+entries, filling every node until the next entry does not fit. Copying through
+commits would not compact: a commit halves an overflowing node, so a sorted
+bulk insert leaves nodes between half and fully used. Each level holds one
+closed node back so the last two can be split by bytes at the end (the union
+never fits one page — the first was closed because the entry opening the
+second did not fit), which keeps a near-empty last node and a one-child branch
+out of the copy. Pages go out in key order, an overflow chain right before its
+leaf; the freelist is empty; both meta slots hold txn 0 (`initFresh`'s shape).
+Crash safety is a temp file, not the commit core: `<path>.copy` is synced,
+renamed over `path`, then the directory synced, so a crash leaves `path` absent
+or as it was, and a returned copy is durable. A key not strictly above the one
+before it is `Corrupt` — a copy does not carry a torn tree forward. Tests:
+churned source vs copy (same entries, page accounting exact with nothing free,
+under 70 % of the source's tree pages, v3 kept, the copy takes writes); every
+size from 0 to 400 quarter-page keys (up to three branch levels) — no non-root
+node under a quarter full, no one-child branch; leaf and branch filled to the
+last byte; a snapshot copied while the writer moves on, over an older copy,
+`SamePath`; a crash sweep over every side effect of the copy in all four crash
+modes, with and without an older copy at the destination, plus a crash right
+after it returns. Mutation run (30 schemata mutants over the cursor, the loader
+and the rename sequence): 29 killed; the survivor was dead code (a "union fits
+one page" branch), removed.
+
 ## Backlog / deferred (mechanical, orthogonal to the Fable core)
 
 - ~~**Overflow pages**~~ — DONE 2026-09-29 for values (see "On-disk layout"):
@@ -327,15 +366,17 @@ killed after the tests the first run asked for.
   "The file gives its tail back" above. The in-memory page cache half is the
   `pagecache` module (a `Storage` in front of the backend), so nothing is left
   to compose here.
-- **Compaction** (moving live pages down so a free page BELOW a live one can
-  leave the file too) — not built. The lowest-page-first allocation makes live
+- **In-place compaction** (moving live pages down so a free page BELOW a live
+  one can leave the file too) — not built; `copyTo` + swapping the copy in does
+  it offline, the way bbolt's `Compact` does. The lowest-page-first allocation makes live
   pages drift down on their own as commits rewrite them, so a store that keeps
   writing ends up with a free tail; a store that stops writing keeps its holes.
-- **Backward iteration (`last`/`prev`, seek-for-prev)** *(survey 2026-09-30)* — bbolt, LMDB, redb and badger all have it; "latest N entries" and reverse time-order scans are common. Effort: small-medium (mirror of `next` in `Cursor`). Fits CONVENTIONS §2.
+- ~~**Backward iteration (`last`/`prev`, seek-for-prev)**~~ *(survey 2026-09-30)* — DONE 2026-10-04 (`last`, `prev`, `seekAfter`; see "The cursor walks both ways").
 - **Buckets / named sub-keyspaces** *(survey 2026-09-30)* — bbolt makes them the basic unit; here users must prefix keys by hand. Effort: medium-large (nested tree roots in leaves, format change, freelist accounting). Fits §2.
-- **Backup / consistent snapshot copy of the file** *(survey 2026-09-30)* — `Tx.WriteTo`-style; without it a live store cannot be backed up. Effort: small (stream pages of a pinned snapshot). Fits §2.
+- ~~**Backup / consistent snapshot copy of the file**~~ *(survey 2026-09-30)* — DONE 2026-10-04 as `copyTo` (a compact copy to a path on a `Storage`). Not built: bbolt's `Tx.WriteTo` to an arbitrary byte stream (an HTTP response) — a caller can copy to a temp path and stream that file.
 - **Cross-process readers** *(survey 2026-09-30)* — bbolt/LMDB allow other processes to read while one writes; here `flock` is exclusive. Effort: large (shared lock mode, reader-table for page-reuse gate). Fits §2.
-- **Full compaction (holes below live pages)** — already listed above; the survey confirms bbolt ships `Compact`. *(survey 2026-09-30)*
+- ~~**Full compaction (holes below live pages)**~~ *(survey 2026-09-30)* — offline DONE 2026-10-04 (`copyTo`, same as bbolt's `Compact`); in place see above.
+- **Batching of concurrent writers** *(survey 2026-09-30)* — bbolt's `DB.Batch` coalesces commits from many goroutines into one fsync. Here a `Db` has one owner (`single_owner`); a caller with many writers serializes them itself (`writebehind` batches). Effort: medium. Fits §2.
 
 ## Status line
 

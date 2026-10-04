@@ -22,10 +22,10 @@ that see a consistent snapshot without blocking the writer.
 > `gate.fable_core_implemented` is `true`: the property tests drive the real
 > `Db` through commit/snapshot schedules (including a multi-level-tree phase)
 > and a crash-point sweep over every storage side effect of a commit, across
-> all four `kv.SimStorage` crash modes. Remaining scaffold simplifications
-> (documented in `SPEC.md`'s backlog): no overflow pages for entries larger
-> than a page, merge-less deletes (a leaf a delete EMPTIES leaves the tree and
-> its page is recycled; an underfull one stays until written again).
+> all four `kv.SimStorage` crash modes. Values larger than a page live in
+> overflow chains; underfull nodes are merged; the free end of the file is
+> given back. Not built yet (`SPEC.md`'s backlog): buckets, readers in other
+> processes, in-place compaction (`copyTo` compacts into a new file).
 > The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
 > more pages than one page holds chains another, so nothing is silently
 > leaked. Chain-storage pages are recycled from the freelist like tree pages;
@@ -71,8 +71,17 @@ defer cur.deinit();
 try cur.seek("m");                  // first key >= "m"
 while (try cur.next()) |e| {        // ordered iteration; e.key/e.val borrow
     if (!std.mem.lessThan(u8, e.key, "t")) break; // scan [m, t)
-    // use e.key, e.val (valid until the cursor's next next()/seek()/first())
+    // use e.key, e.val (valid until the cursor's next call)
 }
+
+// Both directions: the cursor sits BETWEEN keys; next() yields the one after,
+// prev() the one before. Newest first, from a key down (the key included):
+try cur.seekAfter("t");             // or cur.last() for the very end
+while (try cur.prev()) |e| { _ = e; }
+
+// Backup and compaction in one: a full, compact copy of the newest version,
+// written to "<path>.copy", synced, then renamed into place.
+try db.copyTo(store, "app.kvt.bak");
 ```
 
 Production wires `kvtree.FsStorage` over a real directory; tests use

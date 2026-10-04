@@ -59,6 +59,7 @@ const format = @import("format.zig");
 const pager_mod = @import("pager.zig");
 const core = @import("core.zig");
 const gate = @import("gate.zig");
+const bulk = @import("bulk.zig");
 
 // ── re-exports ────────────────────────────────────────────────────────────────
 
@@ -106,11 +107,16 @@ pub const ValueRef = struct {
 };
 pub const CommitError = core.CommitError;
 
+/// `copyTo`: the source store's read errors (`Corrupt` also for a leaf order
+/// or an entry its pages could not have held), the destination's write
+/// errors, and `SamePath` for a copy over the store itself.
+pub const CopyError = kv.Storage.Error || error{ Corrupt, OutOfMemory, SamePath };
+
 /// A borrowed key/value pair yielded by a `Cursor`. The slices point into the
 /// cursor's current leaf-page buffer and stay valid only until the cursor's
-/// next method call — `next()`, `seek()`, **or `first()`** (repositioning to
-/// the start reuses the same frame storage, `clearRetainingCapacity`, so it
-/// invalidates exactly like the other two even though it looks like a fresh
+/// next method call — `next()`, `prev()`, a `seek`, **or `first()`/`last()`**
+/// (repositioning reuses the same frame storage, `clearRetainingCapacity`, so
+/// it invalidates exactly like a step even though it looks like a fresh
 /// start) — or `deinit()`. Copy them if you need to keep them past that.
 pub const KV = struct { key: []const u8, val: []const u8 };
 
@@ -409,6 +415,14 @@ pub const Db = struct {
         return .{ .db = self, .root = self.meta_rec.root, .txn_id = self.meta_rec.txn_id };
     }
 
+    /// `Snapshot.copyTo` of the newest committed version, pinned for as long
+    /// as the copy takes.
+    pub fn copyTo(self: *Db, dest: kv.Storage, path: []const u8) CopyError!void {
+        var snap = try self.snapshot();
+        defer snap.release();
+        return snap.copyTo(dest, path);
+    }
+
     /// Lowest txn any open snapshot is pinned to, or "one past current" when
     /// none is open — the `oldest_reader_txn` the reclaim gate is fed.
     fn oldestReader(self: *const Db) u64 {
@@ -569,6 +583,25 @@ pub const Snapshot = struct {
         return Cursor.init(self.db.gpa, &self.db.pager, self.root);
     }
 
+    /// Write this version as a new store at `path` on `dest`. It is a backup
+    /// that opens like any store, and a compaction: every node full, pages
+    /// in key order, no free page anywhere -- so it is also how free pages
+    /// BELOW live ones leave a store, which `shrink_min_pages` cannot do
+    /// (bbolt's `Compact` is the same copy). The writer may commit
+    /// meanwhile; the copy is this snapshot's version either way.
+    ///
+    /// Written to `<path>.copy`, synced, renamed over `path`, then the
+    /// directory synced: a crash leaves `path` as it was -- absent, or the
+    /// previous copy -- never a partial store (a stale `<path>.copy` may
+    /// stay; the next copy truncates it). An existing `path` is replaced, so
+    /// it must not be a store anything has open; `error.SamePath` refuses
+    /// the one such case this can see, the store itself on the same
+    /// `Storage`. Reads every live page once, writes the copy once; the
+    /// source does not change.
+    pub fn copyTo(self: *Snapshot, dest: kv.Storage, path: []const u8) CopyError!void {
+        return copyVersion(self.db, self.root, dest, path);
+    }
+
     pub fn release(self: *Snapshot) void {
         self.db.releaseSnapshot(self.txn_id);
         self.* = undefined;
@@ -576,6 +609,38 @@ pub const Snapshot = struct {
 };
 
 // ── read path: descend + ordered cursor (all mechanical) ─────────────────────
+
+/// `Snapshot.copyTo`: the version at `root` of `db`, bulk-loaded into a temp
+/// next to `path` and renamed into place.
+fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyError!void {
+    if (dest.ctx == db.pager.store.ctx and std.mem.eql(u8, path, db.path)) return error.SamePath;
+    const tmp_path = try std.fmt.allocPrint(db.gpa, "{s}.copy", .{path});
+    defer db.gpa.free(tmp_path);
+    const h = try dest.open(tmp_path, .create_truncate);
+    var renamed = false;
+    defer {
+        dest.close(h);
+        if (!renamed) dest.delete(tmp_path) catch {};
+    }
+    var out = Pager.init(dest, h, 0);
+    var loader = bulk.Loader.init(db.gpa, &out);
+    defer loader.deinit();
+    var cur = try Cursor.init(db.gpa, &db.pager, root);
+    defer cur.deinit();
+    try cur.first();
+    while (try cur.next()) |e| loader.add(e.key, e.val) catch |err| return switch (err) {
+        // The source held this entry, so its pages are lying about it.
+        error.EntryTooLarge => error.Corrupt,
+        else => |x| x,
+    };
+    loader.finish() catch |err| return switch (err) {
+        error.EntryTooLarge => unreachable, // `finish` adds no entry
+        else => |x| x,
+    };
+    try dest.rename(tmp_path, path);
+    renamed = true;
+    try dest.syncDir();
+}
 
 /// `lookup` without the copy: the leaf page stays borrowed from the store and
 /// the value points into it. The caller has checked `canLend`.
@@ -665,17 +730,26 @@ fn readOverflow(pager: *Pager, first: PageId, out: []u8) (kv.Storage.Error || er
     }
 }
 
-/// In-order cursor over a B-tree version. Holds a root-to-leaf stack of page
-/// copies so it can walk leaves left to right; yielded `KV` slices borrow the
-/// leaf frame and are valid only until the cursor's next method call — see
-/// `KV`'s doc (`first()` invalidates them too, same as `next()`/`seek()`).
+/// Ordered cursor over a B-tree version, both directions. Holds a
+/// root-to-leaf stack of page copies; yielded `KV` slices borrow the leaf
+/// frame and are valid only until the cursor's next method call — see `KV`'s
+/// doc (every positioning call invalidates them too, same as `next()`/`prev()`).
+///
+/// **Position.** A cursor sits in a GAP between two adjacent keys (or before
+/// the first, or after the last). `next` yields the key after the gap and
+/// moves past it; `prev` yields the key before it and moves back over it. So a
+/// `next` followed by a `prev` yields the same entry twice, the way Java's
+/// `ListIterator` does — not bbolt's cursor, which stands ON an entry. At either
+/// end the call yields null and the cursor stays where it is, so the other
+/// direction still walks back. A cursor never positioned yields nothing.
 pub const Cursor = struct {
     gpa: Allocator,
     pager: *Pager,
     root: PageId,
     stack: std.ArrayList(Frame),
-    /// Where an overflow value is assembled for `next` to yield; reused, so a
-    /// yielded value is valid until the next call, like an inline one.
+    /// Where an overflow value is assembled for `next`/`prev` to yield;
+    /// reused, so a yielded value is valid until the next call, like an
+    /// inline one.
     ovf_buf: std.ArrayList(u8) = .empty,
     /// Set when the cursor owns its reclaim-gate pin — i.e. it came straight
     /// from `Db.cursor`. A cursor over a `Snapshot` leaves this null, because
@@ -687,9 +761,11 @@ pub const Cursor = struct {
         page: [page_size]u8,
         id: PageId,
         /// For a branch: ordinal of the child we descended into. For a leaf:
-        /// index of the next entry to yield.
+        /// the gap — the number of its entries before the cursor.
         idx: u16,
     };
+
+    const Error = kv.Storage.Error || error{ Corrupt, OutOfMemory };
 
     fn init(gpa: Allocator, pager: *Pager, root: PageId) Allocator.Error!Cursor {
         return .{ .gpa = gpa, .pager = pager, .root = root, .stack = .empty };
@@ -702,17 +778,36 @@ pub const Cursor = struct {
         self.* = undefined;
     }
 
-    /// Position at the first (smallest) key. Like `seek`, this invalidates any
-    /// `KV` still held from a previous `next()` — it reuses the same frame
-    /// storage (`clearRetainingCapacity`), so a stale `KV` stays in-bounds and
-    /// silently reads whatever this call wrote there, rather than crashing.
-    pub fn first(self: *Cursor) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+    /// Position before the first (smallest) key. Like `seek`, this
+    /// invalidates any `KV` still held from a previous `next()` — it reuses
+    /// the same frame storage (`clearRetainingCapacity`), so a stale `KV`
+    /// stays in-bounds and silently reads whatever this call wrote there,
+    /// rather than crashing.
+    pub fn first(self: *Cursor) Error!void {
         self.stack.clearRetainingCapacity();
         try self.descendLeftmost(self.root);
     }
 
-    /// Position at the first key >= `key` (range-scan start).
-    pub fn seek(self: *Cursor, key: []const u8) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+    /// Position after the last (largest) key: `prev` then walks the keys in
+    /// descending order.
+    pub fn last(self: *Cursor) Error!void {
+        self.stack.clearRetainingCapacity();
+        try self.descendRightmost(self.root);
+    }
+
+    /// Position before the first key >= `key`: `next` yields it (range-scan
+    /// start), `prev` the largest key < `key`.
+    pub fn seek(self: *Cursor, key: []const u8) Error!void {
+        return self.seekGap(key, false);
+    }
+
+    /// Position after the last key <= `key`: `prev` yields it (a reverse
+    /// scan from `key` down, `key` included), `next` the smallest key > `key`.
+    pub fn seekAfter(self: *Cursor, key: []const u8) Error!void {
+        return self.seekGap(key, true);
+    }
+
+    fn seekGap(self: *Cursor, key: []const u8, after: bool) Error!void {
         self.stack.clearRetainingCapacity();
         var id = self.root;
         while (true) {
@@ -720,6 +815,8 @@ pub const Cursor = struct {
             try self.pager.readPage(id, &frame.page);
             switch (format.kindOf(&frame.page) orelse return error.Corrupt) {
                 .branch => {
+                    // The child that holds `key`'s place: every key left of
+                    // it is < `key`, every key right of it is > `key`.
                     const br = format.Branch.init(&frame.page);
                     const ci = br.childIndexFor(key);
                     frame.idx = @intCast(ci);
@@ -727,8 +824,8 @@ pub const Cursor = struct {
                     id = br.childAtIndex(ci);
                 },
                 .leaf => {
-                    const leaf = format.Leaf.init(&frame.page);
-                    frame.idx = leaf.search(key).index; // first entry >= key
+                    const s = format.Leaf.init(&frame.page).search(key);
+                    frame.idx = s.index + @intFromBool(after and s.found);
                     try self.stack.append(self.gpa, frame);
                     return;
                 },
@@ -736,7 +833,7 @@ pub const Cursor = struct {
         }
     }
 
-    fn descendLeftmost(self: *Cursor, from: PageId) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
+    fn descendLeftmost(self: *Cursor, from: PageId) Error!void {
         var id = from;
         while (true) {
             var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
@@ -748,37 +845,89 @@ pub const Cursor = struct {
         }
     }
 
-    /// Yield the next entry in key order, or null at the end. Returned slices
-    /// borrow the cursor's leaf buffer — valid until the next call.
-    pub fn next(self: *Cursor) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!?KV {
+    fn descendRightmost(self: *Cursor, from: PageId) Error!void {
+        var id = from;
+        while (true) {
+            var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
+            try self.pager.readPage(id, &frame.page);
+            const kind = format.kindOf(&frame.page) orelse return error.Corrupt;
+            // A leaf's gap after its last entry; a branch's last child.
+            frame.idx = switch (kind) {
+                .leaf => format.Leaf.init(&frame.page).count(),
+                .branch => format.Branch.init(&frame.page).count(),
+            };
+            try self.stack.append(self.gpa, frame);
+            if (kind == .leaf) return;
+            const top = &self.stack.items[self.stack.items.len - 1];
+            id = format.Branch.init(&top.page).childAtIndex(top.idx);
+        }
+    }
+
+    /// Yield the entry after the cursor and move past it, or null at the end.
+    /// Returned slices borrow the cursor's leaf buffer — valid until the next
+    /// call.
+    pub fn next(self: *Cursor) Error!?KV {
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             const leaf = format.Leaf.init(&top.page);
             if (top.idx < leaf.count()) {
                 const i = top.idx;
                 top.idx += 1;
-                if (leaf.ovfLen(i)) |len| {
-                    try self.ovf_buf.resize(self.gpa, len);
-                    try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
-                    return .{ .key = leaf.keyAt(i), .val = self.ovf_buf.items };
-                }
-                return .{ .key = leaf.keyAt(i), .val = leaf.valAt(i) };
+                return try self.entry(leaf, i);
             }
-            // Leaf exhausted → climb to the nearest ancestor with a next child.
-            _ = self.stack.pop();
-            while (self.stack.items.len > 0) {
-                const anc = &self.stack.items[self.stack.items.len - 1];
+            // Leaf exhausted → the nearest ancestor with a child to the
+            // right. With none, the stack stays as it is: the cursor is in
+            // the gap after the last key, and `prev` walks back from there.
+            var lvl = self.stack.items.len - 1;
+            while (lvl > 0) {
+                lvl -= 1;
+                const anc = &self.stack.items[lvl];
                 const br = format.Branch.init(&anc.page);
                 if (anc.idx < br.count()) { // children are 0..count
                     anc.idx += 1;
                     const child = br.childAtIndex(anc.idx);
+                    self.stack.shrinkRetainingCapacity(lvl + 1);
                     try self.descendLeftmost(child);
                     break; // retry the outer loop against the new leaf
                 }
-                _ = self.stack.pop();
-            }
+            } else return null;
         }
         return null;
+    }
+
+    /// Yield the entry before the cursor and move back over it, or null at
+    /// the start. The mirror of `next`, with the same borrowing rule.
+    pub fn prev(self: *Cursor) Error!?KV {
+        while (self.stack.items.len > 0) {
+            const top = &self.stack.items[self.stack.items.len - 1];
+            const leaf = format.Leaf.init(&top.page);
+            if (top.idx > 0) {
+                top.idx -= 1;
+                return try self.entry(leaf, top.idx);
+            }
+            var lvl = self.stack.items.len - 1;
+            while (lvl > 0) {
+                lvl -= 1;
+                const anc = &self.stack.items[lvl];
+                if (anc.idx > 0) {
+                    anc.idx -= 1;
+                    const child = format.Branch.init(&anc.page).childAtIndex(anc.idx);
+                    self.stack.shrinkRetainingCapacity(lvl + 1);
+                    try self.descendRightmost(child);
+                    break;
+                }
+            } else return null;
+        }
+        return null;
+    }
+
+    fn entry(self: *Cursor, leaf: format.Leaf, i: usize) Error!KV {
+        if (leaf.ovfLen(i)) |len| {
+            try self.ovf_buf.resize(self.gpa, len);
+            try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
+            return .{ .key = leaf.keyAt(i), .val = self.ovf_buf.items };
+        }
+        return .{ .key = leaf.keyAt(i), .val = leaf.valAt(i) };
     }
 };
 
@@ -792,6 +941,7 @@ test {
     _ = @import("prng.zig");
     _ = @import("harness.zig");
     _ = @import("gate.zig");
+    _ = @import("bulk.zig");
 }
 
 const testing = std.testing;
@@ -2180,4 +2330,309 @@ test "a free tail shorter than shrink_min_pages stays; one at least that long go
         }
         _ = try checkTreeShape(&db);
     }
+}
+
+// ── backward iteration and `copyTo` ──────────────────────────────────────────
+
+const walk_val_max = 2 * page_size + 100;
+
+/// Key `id`'s value in the walk and copy tests: a few bytes, or (every 97th
+/// id) one past two overflow pages.
+fn walkVal(buf: *[walk_val_max]u8, id: u64) []const u8 {
+    const len: usize = if (id % 97 == 0) walk_val_max else 1 + id % 40;
+    for (buf[0..len], 0..) |*b, i| b.* = @truncate(id *% 31 +% i);
+    return buf[0..len];
+}
+
+fn expectWalkEntry(got: ?KV, id: u64) !void {
+    var kb: [long_key_len]u8 = undefined;
+    var vb: [walk_val_max]u8 = undefined;
+    const e = got orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, longKey(&kb, id), e.key);
+    try testing.expectEqualSlices(u8, walkVal(&vb, id), e.val);
+}
+
+test "a cursor walks both ways: a random walk of next, prev and all four seeks agrees with the gap model" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "w.kvt", .{});
+    defer db.close();
+    // Keys 0, 2, 4, ...: an odd probe falls between two of them.
+    const n = 700;
+    var kb: [long_key_len]u8 = undefined;
+    var vb: [walk_val_max]u8 = undefined;
+    var txn = try db.begin();
+    for (0..n) |i| try txn.put(longKey(&kb, 2 * i), walkVal(&vb, 2 * i));
+    try txn.commit();
+    // Leaves under branches under the root: a step can cross two levels.
+    try testing.expectEqual(@as(?usize, 2), (try checkTreeShape(&db)).depth);
+
+    var cur = try db.cursor();
+    defer cur.deinit();
+    // Never positioned: nothing either way.
+    try testing.expect(try cur.next() == null);
+    try testing.expect(try cur.prev() == null);
+
+    var prng = std.Random.DefaultPrng.init(0x6a9);
+    const r = prng.random();
+    // The model: the number of keys before the cursor.
+    var gap: usize = 0;
+    try cur.first();
+    var stopped_at_start: usize = 0;
+    var stopped_at_end: usize = 0;
+    for (0..30_000) |_| {
+        switch (r.uintLessThan(u8, 24)) {
+            0 => {
+                try cur.first();
+                gap = 0;
+            },
+            1 => {
+                try cur.last();
+                gap = n;
+            },
+            2, 3 => {
+                // Present, absent, below the first and past the last key.
+                const probe = r.uintLessThan(u64, 2 * n + 2);
+                const key = if (probe == 2 * n + 1) "" else longKey(&kb, probe);
+                const after = r.boolean();
+                if (after) try cur.seekAfter(key) else try cur.seek(key);
+                gap = if (key.len == 0) 0 else @min(n, if (after) probe / 2 + 1 else (probe + 1) / 2);
+            },
+            else => |op| if (op % 2 == 0) {
+                const got = try cur.next();
+                if (gap == n) {
+                    try testing.expect(got == null);
+                    stopped_at_end += 1;
+                } else {
+                    try expectWalkEntry(got, 2 * gap);
+                    gap += 1;
+                }
+            } else {
+                const got = try cur.prev();
+                if (gap == 0) {
+                    try testing.expect(got == null);
+                    stopped_at_start += 1;
+                } else {
+                    gap -= 1;
+                    try expectWalkEntry(got, 2 * gap);
+                }
+            },
+        }
+    }
+    // Teeth: the walk hit both ends and turned back from them.
+    try testing.expect(stopped_at_start > 10 and stopped_at_end > 10);
+
+    // A full reverse scan yields every key, largest first.
+    try cur.last();
+    var i: usize = n;
+    while (try cur.prev()) |e| {
+        i -= 1;
+        try expectWalkEntry(e, 2 * i);
+    }
+    try testing.expectEqual(@as(usize, 0), i);
+}
+
+test "an empty store's cursor yields nothing from either end or any seek" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "e.kvt", .{});
+    defer db.close();
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.last();
+    try testing.expect(try cur.prev() == null);
+    try testing.expect(try cur.next() == null);
+    try cur.seekAfter("k");
+    try testing.expect(try cur.prev() == null);
+    try testing.expect(try cur.next() == null);
+}
+
+/// What a bulk load promises beyond `checkTreeShape`: no node but the root
+/// under a quarter full, and no branch with a single child.
+fn checkCompact(db: *Db, id: PageId, is_root: bool) !void {
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(id, &page);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    switch (format.kindOf(&page).?) {
+        .leaf => if (!is_root) try testing.expect(!(try format.LeafBuilder.fromPage(arena.allocator(), &page)).underflows()),
+        .branch => {
+            const br = format.Branch.init(&page);
+            try testing.expect(br.count() > 0);
+            if (!is_root) try testing.expect(!(try format.BranchBuilder.fromPage(arena.allocator(), &page)).underflows());
+            var i: usize = 0;
+            while (i <= br.count()) : (i += 1) try checkCompact(db, br.childAtIndex(i), false);
+        },
+    }
+}
+
+fn expectSameEntries(a: *Db, b: *Db) !void {
+    var ca = try a.cursor();
+    defer ca.deinit();
+    var cb = try b.cursor();
+    defer cb.deinit();
+    try ca.first();
+    try cb.first();
+    while (try ca.next()) |ea| {
+        // `ea` borrows `ca`'s frame only, so stepping `cb` keeps it valid.
+        const eb = (try cb.next()) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, ea.key, eb.key);
+        try testing.expectEqualSlices(u8, ea.val, eb.val);
+    }
+    try testing.expect(try cb.next() == null);
+}
+
+test "copyTo writes a compact copy: the same entries, every page accounted for, nothing free, nodes full" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    var kb: [long_key_len]u8 = undefined;
+    var vb: [walk_val_max]u8 = undefined;
+    // Churn: grow by commits (nodes half to fully used), then delete two of
+    // every three keys and rewrite some -- free pages, holes below live ones.
+    for (0..6) |round| {
+        var txn = try db.begin();
+        for (0..250) |j| {
+            const id = round * 250 + j;
+            try txn.put(longKey(&kb, id), walkVal(&vb, id));
+        }
+        try txn.commit();
+    }
+    {
+        var txn = try db.begin();
+        for (0..1500) |id| if (id % 3 != 0) try txn.del(longKey(&kb, id));
+        for (0..1500) |id| if (id % 21 == 0) try txn.put(longKey(&kb, id), walkVal(&vb, id + 1));
+        try txn.commit();
+    }
+    const src = try checkTreeShape(&db);
+    try testing.expect(db.meta_rec.free_count > 0);
+
+    try db.copyTo(sim.storage(), "c.kvt");
+    try testing.expect(sim.fileContent("c.kvt.copy") == null);
+    var copy = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+    defer copy.close();
+    try expectSameEntries(&db, &copy);
+    // `checkTreeShape` accounts for every page below the high water; with an
+    // empty freelist that is: metas, tree, overflow chains, nothing else.
+    const got = try checkTreeShape(&copy);
+    try testing.expectEqual(@as(u64, 0), copy.meta_rec.free_count);
+    try testing.expectEqual(src.keys, got.keys);
+    try testing.expectEqual(src.ovf_pages, got.ovf_pages);
+    try checkCompact(&copy, copy.meta_rec.root, true);
+    // Full nodes against the commit path's half-to-full ones, and the file
+    // without the source's free pages.
+    try testing.expect(got.tree_pages * 10 < src.tree_pages * 7);
+    try testing.expect(copy.meta_rec.high_water < db.meta_rec.high_water);
+    try testing.expectEqual(format.format_v3, copy.meta_rec.version);
+
+    // The copy is a store like any other: it takes writes (its full leaves
+    // split) and deletes, and reopens.
+    {
+        var txn = try copy.begin();
+        for (0..1500) |id| if (id % 3 == 1) try txn.put(longKey(&kb, id), walkVal(&vb, id));
+        for (0..1500) |id| if (id % 6 == 0) try txn.del(longKey(&kb, id));
+        try txn.commit();
+    }
+    _ = try checkTreeShape(&copy);
+    try testing.expectEqual(@as(?[]u8, null), try copy.get(testing.allocator, longKey(&kb, 6)));
+    const v = (try copy.get(testing.allocator, longKey(&kb, 97 * 4))).?;
+    defer testing.allocator.free(v);
+    try testing.expectEqualSlices(u8, walkVal(&vb, 97 * 4), v);
+}
+
+const fat_key_len = 1000;
+
+/// A key that fills a quarter of a page: four to a leaf, five children to a
+/// branch, so a few hundred keys are three levels of branches.
+fn fatKey(buf: *[fat_key_len]u8, id: u64) []const u8 {
+    std.mem.writeInt(u64, buf[0..8], id, .big);
+    @memset(buf[8..], 'f');
+    return buf;
+}
+
+test "copyTo at every size from empty to three branch levels: no underfull node, no one-child branch" {
+    var kb: [fat_key_len]u8 = undefined;
+    var vb: [8]u8 = undefined;
+    var deepest: usize = 0;
+    for (0..400) |n| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+        defer db.close();
+        if (n > 0) {
+            var txn = try db.begin();
+            for (0..n) |id| try txn.put(fatKey(&kb, id), std.fmt.bufPrint(&vb, "{d}", .{id}) catch unreachable);
+            try txn.commit();
+        }
+        try db.copyTo(sim.storage(), "c.kvt");
+        var copy = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+        defer copy.close();
+        const shape = try checkTreeShape(&copy);
+        try testing.expectEqual(n, shape.keys);
+        try checkCompact(&copy, copy.meta_rec.root, true);
+        try expectSameEntries(&db, &copy);
+        try testing.expectEqual(format.format_v2, copy.meta_rec.version);
+        deepest = @max(deepest, shape.depth.?);
+    }
+    try testing.expectEqual(@as(usize, 3), deepest);
+}
+
+test "copyTo fills a leaf and a branch to their last byte" {
+    // Keys of 1014 bytes and empty values: a leaf entry is 2 + 6 + 1014
+    // bytes and a branch cell the same, so four entries plus the 8-byte
+    // header fill a leaf exactly, and four cells after the leftmost child a
+    // branch. 40 keys: 10 full leaves under 2 full branches under the root.
+    var kb: [1014]u8 = undefined;
+    @memset(&kb, 'x');
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    var txn = try db.begin();
+    for (0..40) |id| {
+        std.mem.writeInt(u64, kb[0..8], id, .big);
+        try txn.put(&kb, "");
+    }
+    try txn.commit();
+    try db.copyTo(sim.storage(), "c.kvt");
+    var copy = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+    defer copy.close();
+    const shape = try checkTreeShape(&copy);
+    try testing.expectEqual(@as(usize, 40), shape.keys);
+    try testing.expectEqual(@as(usize, 10 + 2 + 1), shape.tree_pages);
+}
+
+test "Snapshot.copyTo copies the pinned version while the writer moves on; it replaces an older copy, never the store itself" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    try db.put("a", "1");
+    try db.put("b", "2");
+    var snap = try db.snapshot();
+    try db.del("a");
+    try db.put("c", "3");
+    try snap.copyTo(sim.storage(), "p.kvt");
+    snap.release();
+    {
+        var copy = try Db.open(testing.allocator, sim.storage(), "p.kvt", .{});
+        defer copy.close();
+        try expectGet(&copy, "a", "1");
+        try testing.expectEqual(@as(?[]u8, null), try copy.get(testing.allocator, "c"));
+    }
+    // Over the older copy: now the newest version.
+    try db.copyTo(sim.storage(), "p.kvt");
+    {
+        var copy = try Db.open(testing.allocator, sim.storage(), "p.kvt", .{});
+        defer copy.close();
+        try expectSameEntries(&db, &copy);
+    }
+    try testing.expectError(error.SamePath, db.copyTo(sim.storage(), "s.kvt"));
+    try expectGet(&db, "c", "3");
 }

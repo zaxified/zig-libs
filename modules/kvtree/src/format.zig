@@ -470,6 +470,17 @@ pub fn fitsOverflowRef(klen: usize) bool {
     return leafCellBytes(klen, ovf_ref_len) + hdr_len + slot_len <= page_size;
 }
 
+/// What an empty node takes (its header), and what one more leaf entry or
+/// branch cell adds to it (slot + cell): for the bulk loader (`bulk.zig`),
+/// which has to know whether an entry fits before it copies it.
+pub const empty_node_bytes = hdr_len;
+pub fn leafEntryBytes(klen: usize, vlen: usize) usize {
+    return slot_len + leafCellBytes(klen, vlen);
+}
+pub fn branchEntryBytes(klen: usize) usize {
+    return slot_len + branchCellBytes(klen);
+}
+
 /// Node builders BORROW every key, value and separator handed to them --
 /// from the page they were decoded from (`fromPage`), from the caller's
 /// change list (`put`), from a child's promoted separator (`insert`). Nothing

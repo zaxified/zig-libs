@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **The cursor walks both ways**: `Cursor.last`, `Cursor.prev` and
+  `Cursor.seekAfter` (after the last key <= k). The cursor sits between two keys; `next` at the
+  end now leaves it there instead of emptying its stack, so `prev` can walk back. No change for
+  forward-only callers.
+- **2026-10-04** — **`Db.copyTo` / `Snapshot.copyTo`**: a backup that is also a compaction — the
+  version bulk-loaded into a new store with full nodes, pages in key order and nothing free,
+  written to `<path>.copy`, synced and renamed over `path`. New error set `CopyError`.
+
 - **2026-10-01** — `kvtree.Lock` (re-export of `kv.Lock`) and `Db.io()`: a caller that
   serializes its own access to a `Db` across tasks can wait through the storage's `Io` instead
   of spinning (`writebehind.KvtreeSink` does).

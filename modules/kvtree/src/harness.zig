@@ -639,6 +639,98 @@ test "real Db: crash at a commit that gives the file's tail back recovers to one
     };
 }
 
+test "real Db: a crash anywhere in copyTo leaves the destination as it was or the whole copy" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // `copyTo` writes a temp, syncs it, renames it over the destination and
+    // syncs the directory. Crash at every side effect of that, with no
+    // destination yet (`prior` false: absent or the whole copy) and over an
+    // older copy (`prior`: that copy or the whole new one) -- never a torn
+    // store, and the source untouched either way.
+    var val: [100]u8 = undefined;
+    @memset(&val, 'c');
+    var big: [2 * format.page_size]u8 = undefined;
+    @memset(&big, 'B');
+    const modes = [_]kv.CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    var crashed_in_copy: usize = 0;
+    for (modes) |mode| for ([_]bool{ false, true }) |prior| {
+        var crash_at: usize = 0;
+        var progressed = false;
+        while (!progressed) : (crash_at += 1) {
+            try testing.expect(crash_at < 200);
+            var sim = kv.SimStorage.init(gpa);
+            defer sim.deinit();
+            sim.allow_overwrite = true;
+            sim.crash_mode = mode;
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var old = Model.init(a);
+            var new: Model = undefined;
+            {
+                var db = try kvtree.Db.open(gpa, sim.storage(), "src.kvt", .{});
+                defer db.close();
+                var txn = try db.begin();
+                for (0..300) |id| {
+                    const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                    const v: []const u8 = if (id % 50 == 0) &big else &val;
+                    try txn.put(k, v);
+                    try old.put(k, v);
+                }
+                try txn.commit();
+                if (prior) try db.copyTo(sim.storage(), "bak.kvt");
+                new = try old.clone(a);
+                var t2 = try db.begin();
+                for (0..300) |id| if (id % 2 == 1) { // the overflow values stay
+                    const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                    try t2.del(k);
+                    new.del(k);
+                };
+                try t2.put("zzz", "new");
+                try new.put("zzz", "new");
+                try t2.commit();
+                sim.reorder_seed = 0xc09 +% (@as(u64, @intFromBool(prior)) *% 512 + @as(u64, crash_at)) *% 0x9e3779b97f4a7c15;
+                sim.ops_until_crash = crash_at;
+                db.copyTo(sim.storage(), "bak.kvt") catch {};
+                progressed = !sim.crashed;
+                if (sim.crashed) crashed_in_copy += 1;
+                // A copy that returned is durable: crash at the very next
+                // side effect, and only what reached media is left.
+                if (progressed) {
+                    sim.ops_until_crash = 0;
+                    db.put("after", "copy") catch {};
+                    try testing.expect(sim.crashed);
+                }
+            }
+            sim.reboot();
+            {
+                var src = try kvtree.Db.open(gpa, sim.storage(), "src.kvt", .{});
+                defer src.close();
+                var cur = try src.cursor();
+                defer cur.deinit();
+                try checkSerializable(new.entries(), try drainCursor(&cur, a));
+            }
+            if (sim.fileContent("bak.kvt") == null) {
+                try testing.expect(!prior); // an older copy never goes missing
+                continue;
+            }
+            var bak = try kvtree.Db.open(gpa, sim.storage(), "bak.kvt", .{});
+            defer bak.close();
+            var cur = try bak.cursor();
+            defer cur.deinit();
+            const got = try drainCursor(&cur, a);
+            if (progressed)
+                try checkSerializable(new.entries(), got)
+            else if (prior)
+                try checkRecoveredPrefix(&.{ old.entries(), new.entries() }, got)
+            else
+                try checkRecoveredPrefix(&.{new.entries()}, got);
+        }
+    };
+    // Teeth: the sweep crashed inside the copy, at every one of its steps.
+    try testing.expect(crashed_in_copy > 8 * 15);
+}
+
 /// The crash-point sweep behind the two tests above, over values of
 /// `val_len` bytes; with `overwrite`, the baseline key holds such a value too
 /// and every in-flight commit overwrites it with another.
