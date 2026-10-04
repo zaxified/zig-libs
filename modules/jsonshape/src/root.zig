@@ -567,6 +567,23 @@ fn jsonToValue(a: std.mem.Allocator, jv: std.json.Value, want: ColumnType) Error
             const f = jsonToFloat(jv) orelse break :blk .null;
             break :blk (Value{ .float = f }).cast(.decimal) orelse .null;
         },
+        // An instant: an ISO 8601 / RFC 3339 string, or a number already in
+        // the column's unit (microseconds since the epoch) — `Value.cast`'s
+        // rules, so a JSON feed and a cast agree. Anything else → null.
+        .timestamp => blk: {
+            const v: Value = switch (jv) {
+                .string => |s| .{ .text = s },
+                .integer => |i| .{ .int = i },
+                // A numeric literal std.json kept as text: exact when it is an
+                // integer, else through f64 like `.float`.
+                .number_string => |s| if (std.fmt.parseInt(i64, s, 10)) |i|
+                    .{ .int = i }
+                else |_| if (std.fmt.parseFloat(f64, s)) |f| .{ .float = f } else |_| break :blk .null,
+                .float => |f| .{ .float = f },
+                else => break :blk .null,
+            };
+            break :blk v.cast(.timestamp) orelse .null;
+        },
     };
 }
 
@@ -1032,6 +1049,32 @@ test "TEETH: an out-of-range JSON number degrades to null in a .decimal column t
         .columns = &.{.{ .name = "v", .key = "v", .type = .decimal }},
     });
     try testing.expect(ok.rows[0][0] == .decimal);
+}
+
+test "shape: a .timestamp column reads RFC 3339 strings and microsecond numbers" {
+    // 2009-02-13T23:31:30Z is Unix time 1234567890 (a published anchor); the
+    // column unit is microseconds, so the cell is that times 1e6. A number is
+    // taken as already being in that unit (dataset's `Value.cast` rule); text
+    // that is not an instant, a bool, and an out-of-range float are null.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a,
+        \\{"r":[{"t":"2009-02-14T00:31:30+01:00"},{"t":1234567890000000},{"t":2.5},
+        \\{"t":"yesterday"},{"t":true},{"t":1e300},{"t":"2009-02-13"}]}
+    , .{
+        .path = "r",
+        .columns = &.{.{ .name = "t", .key = "t", .type = .timestamp }},
+    });
+    try testing.expectEqual(@as(usize, 7), d.rows.len);
+    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.rows[0][0]);
+    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.rows[1][0]);
+    try testing.expectEqual(Value{ .int = 2 }, d.rows[2][0]);
+    try testing.expect(d.rows[3][0] == .null);
+    try testing.expect(d.rows[4][0] == .null);
+    try testing.expect(d.rows[5][0] == .null);
+    // 2009-02-13 UTC midnight = 1234567890 - (23*3600 + 31*60 + 30) = 1234483200.
+    try testing.expectEqual(Value{ .int = 1234483200_000000 }, d.rows[6][0]);
 }
 
 test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {

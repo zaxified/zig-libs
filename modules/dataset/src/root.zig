@@ -53,6 +53,16 @@ pub const ColumnType = enum {
     /// the convention). Appended last so its ordinal (4→5 shift point) never
     /// collides with an already-serialized `.date` byte; do not reorder.
     decimal,
+    /// An instant on the UTC timeline. The cell value is `Value.int`: whole
+    /// MICROseconds since 1970-01-01T00:00:00Z (`timestamp_units_per_second`),
+    /// the unit of PostgreSQL's and DuckDB's `TIMESTAMP` and of Arrow's
+    /// `timestamp[us]`. Like `.date`, the column tag carries the intent and the
+    /// cell reuses an existing `Value` variant — so the wire format gets no new
+    /// value tag and no consumer `switch` over `Value` breaks. Text in, text
+    /// out: `parseIsoTimestamp` / `formatIsoTimestamp`; `toJson` renders the
+    /// cells of a `.timestamp` column as RFC 3339 strings. Appended last (wire
+    /// ordinal 6); do not reorder.
+    timestamp,
 };
 
 pub const Column = struct {
@@ -68,9 +78,16 @@ pub const Column = struct {
 /// `decimal.Decimal{ .raw = value.decimal }`.
 pub const decimal_scale: i128 = 1_000_000_000_000;
 
-/// A single cell. `date` values live in `.text` (ISO); the column's
-/// `ColumnType` carries the temporal intent. `decimal` is a raw fixed-point
-/// `i128` at `decimal_scale` — see that constant's doc comment.
+/// Unit of a `.timestamp` cell: `Value.int` counts microseconds since the Unix
+/// epoch (UTC). An `i64` of microseconds spans roughly ±292 000 years, so every
+/// instant `parseIsoTimestamp` accepts (years 0000–9999) fits with room to spare.
+pub const timestamp_units_per_second: i64 = 1_000_000;
+const us_per_day: i64 = 86_400 * timestamp_units_per_second;
+
+/// A single cell. `date` values live in `.text` (ISO) and `timestamp` values in
+/// `.int` (microseconds since the epoch); the column's `ColumnType` carries the
+/// temporal intent. `decimal` is a raw fixed-point `i128` at `decimal_scale` —
+/// see that constant's doc comment.
 pub const Value = union(enum) {
     null,
     int: i64,
@@ -222,6 +239,9 @@ pub const Value = union(enum) {
     /// input) — text→decimal is intentionally NOT attempted here (parsing a
     /// decimal literal is the sibling `decimal` module's job; adding it here
     /// would require depending on it, which this module avoids).
+    /// `.timestamp` keeps an `int` (already microseconds), truncates a `float`
+    /// like `.int` does, and parses `text` with `parseIsoTimestamp` (so an ISO
+    /// date cell becomes its UTC midnight); anything else → null.
     pub fn cast(self: Value, to: ColumnType) ?Value {
         return switch (to) {
             .int => if (self.asInt()) |i| .{ .int = i } else null,
@@ -243,6 +263,12 @@ pub const Value = union(enum) {
                     .{ .decimal = d }
                 else
                     null,
+                else => null,
+            },
+            .timestamp => switch (self) {
+                .int => self,
+                .float => |f| if (floatToInt(i64, f)) |i| .{ .int = i } else null,
+                .text => |t| if (parseIsoTimestamp(t)) |us| .{ .int = us } else null,
                 else => null,
             },
         };
@@ -568,7 +594,11 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
 // ── JSON encoding ────────────────────────────────────────────────────────────
 // Emits a fixed, dependency-free shape:
 //   {"columns":[{"name":..,"type":..}],"rows":[[..],..]}
-// Non-finite floats and null cells become JSON null.
+// Non-finite floats and null cells become JSON null. An `.int` cell of a
+// `.timestamp` column becomes an RFC 3339 string (`formatIsoTimestamp`): a bare
+// number would leave the reader to guess the unit (pandas' `to_json` emits
+// epoch MILLIseconds by default, this module stores microseconds), while the
+// string is unambiguous and `Date.parse` in every browser reads it.
 
 /// Render `d` as JSON. **Output size has no bound tied to input size**: a
 /// single `.float` cell prints its full decimal expansion (`{d}`, not
@@ -595,7 +625,14 @@ pub fn toJson(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
         try buf.append(a, '[');
         for (row, 0..) |v, ci| {
             if (ci > 0) try buf.append(a, ',');
-            try appendJsonValue(a, &buf, v);
+            // A hand-built row may be longer than `columns` (only `deserialize`
+            // and `Builder` guarantee the lengths match), so the column lookup
+            // is bounds-checked; a cell past the schema renders untyped.
+            const timestamp_col = ci < d.columns.len and d.columns[ci].type == .timestamp;
+            if (timestamp_col and v == .int) {
+                var tb: [max_iso_timestamp_len]u8 = undefined;
+                try appendJsonString(a, &buf, formatIsoTimestamp(&tb, v.int));
+            } else try appendJsonValue(a, &buf, v);
         }
         try buf.append(a, ']');
     }
@@ -698,13 +735,12 @@ pub const Date = struct {
     m: u8,
     d: u8,
 
-    /// A monotonic comparable ordinal (proleptic-Gregorian day count via
-    /// Howard Hinnant's days-from-civil algorithm). Good for range filtering
-    /// and ordering: equal dates compare equal, later dates compare greater.
-    /// **Not asserted to be calendar-exact beyond that monotonicity** (e.g. it
-    /// is not independently verified against every historical calendar
-    /// reform) — treat it as an ordering key, not a source of truth for
-    /// calendar arithmetic.
+    /// Days since 1970-01-01 in the proleptic Gregorian calendar (Howard
+    /// Hinnant's days-from-civil), the inverse of `fromOrdinal`: equal dates
+    /// compare equal, later dates compare greater, consecutive days differ by
+    /// one (checked day by day over ~5 400 years in the tests). Proleptic:
+    /// there is no Julian calendar before 1582, so it is not a tool for
+    /// historical (pre-reform) dates.
     pub fn ordinal(self: Date) i64 {
         var y: i64 = self.y;
         var m: i64 = self.m;
@@ -713,23 +749,183 @@ pub const Date = struct {
             y -= 1;
             m += 12;
         }
-        const era = @divFloor(if (y >= 0) y else y - 399, 400);
+        // `@divFloor`, not Hinnant's `(y >= 0 ? y : y - 399) / 400`: that
+        // expression emulates floor division with C's TRUNCATING `/`, and
+        // combined with a division that already floors it put every year
+        // in [-400, -2] one era (146097 days) too early — found 2026-10-04 by
+        // the day-by-day calendar walk in the `fromOrdinal` test.
+        const era = @divFloor(y, 400);
         const yoe = y - era * 400;
         const doy = @divFloor(153 * (m - 3) + 2, 5) + self.d - 1;
         const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
         return era * 146097 + doe - 719468;
     }
+
+    /// The inverse of `ordinal`: the proleptic-Gregorian date `days` after
+    /// 1970-01-01 (Howard Hinnant's civil-from-days). Null only when the year
+    /// does not fit `Date.y` (|days| beyond ~7.8e11, far outside any timestamp).
+    pub fn fromOrdinal(days: i64) ?Date {
+        const z = std.math.add(i64, days, 719468) catch return null;
+        const era = @divFloor(z, 146097);
+        const doe = z - era * 146097; // [0, 146096]
+        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
+        const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0, 365]
+        const mp = @divFloor(5 * doy + 2, 153); // [0, 11], March-based
+        const d = doy - @divFloor(153 * mp + 2, 5) + 1; // [1, 31]
+        const m = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
+        const y = yoe + era * 400 + @intFromBool(m <= 2);
+        return .{ .y = std.math.cast(i32, y) orelse return null, .m = @intCast(m), .d = @intCast(d) };
+    }
+
+    /// Days in month `m` (1–12) of year `y`, Gregorian leap rule.
+    pub fn daysInMonth(y: i32, m: u8) u8 {
+        return switch (m) {
+            2 => if (@mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0)) 29 else 28,
+            4, 6, 9, 11 => 30,
+            else => 31,
+        };
+    }
 };
 
-/// Parse "YYYY-MM-DD" (extra trailing time is ignored). Returns null on malformed.
+/// `n` ASCII digits at `s[i..]` as an integer, or null. Unlike
+/// `std.fmt.parseInt` it refuses a sign, so `"+1"` is not a month.
+fn digitsAt(s: []const u8, i: usize, n: usize) ?u32 {
+    if (i + n > s.len) return null;
+    var v: u32 = 0;
+    for (s[i .. i + n]) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+/// Parse "YYYY-MM-DD" (extra trailing text is ignored). Returns null on
+/// malformed input: every field must be ASCII digits (no sign, no blank) and the
+/// day must exist in that month — `2023-02-29` and `2024-04-31` are refused.
 pub fn parseIsoDate(s: []const u8) ?Date {
     if (s.len < 10) return null;
     if (s[4] != '-' or s[7] != '-') return null;
-    const y = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
-    const m = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
-    const d = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
-    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
-    return .{ .y = y, .m = m, .d = d };
+    const y = digitsAt(s, 0, 4) orelse return null;
+    const m = digitsAt(s, 5, 2) orelse return null;
+    const d = digitsAt(s, 8, 2) orelse return null;
+    if (m < 1 or m > 12) return null;
+    const date: Date = .{ .y = @intCast(y), .m = @intCast(m), .d = @intCast(d) };
+    if (d < 1 or d > Date.daysInMonth(date.y, date.m)) return null;
+    return date;
+}
+
+/// Parse an ISO 8601 / RFC 3339 instant into microseconds since the epoch
+/// (the `.timestamp` cell unit). Accepted, and nothing else:
+///
+///   `YYYY-MM-DD`                                   → UTC midnight
+///   `YYYY-MM-DD(T|t| )HH:MM[:SS[(.|,)F…]][zone]`
+///   zone = `Z` | `z` | `±HH:MM` | `±HHMM` | `±HH`   (absent → UTC)
+///
+/// The fraction may have 1–9 digits; digits past the sixth are truncated
+/// (toward the earlier instant — the fraction only ever adds). Hours 0–23,
+/// minutes 0–59, seconds 0–59: a leap second `:60` is refused, as Python's
+/// `datetime.fromisoformat` refuses it; so is `24:00`. A string with no zone is
+/// read as UTC — the same convention as Arrow's timezone-less timestamp, whose
+/// stored value is the wall-clock time as if it were UTC. Offsets up to ±23:59.
+///
+/// No overflow is possible: a 4-digit year bounds the result to about ±2.6e17 µs.
+pub fn parseIsoTimestamp(s: []const u8) ?i64 {
+    if (s.len < 10) return null;
+    const date = parseIsoDate(s[0..10]) orelse return null;
+    const day_us = date.ordinal() * us_per_day;
+    if (s.len == 10) return day_us;
+
+    var i: usize = 10;
+    if (s[i] != 'T' and s[i] != 't' and s[i] != ' ') return null;
+    i += 1;
+    const hh = digitsAt(s, i, 2) orelse return null;
+    if (i + 2 >= s.len or s[i + 2] != ':') return null;
+    const mm = digitsAt(s, i + 3, 2) orelse return null;
+    i += 5;
+    var ss: u32 = 0;
+    if (i < s.len and s[i] == ':') {
+        ss = digitsAt(s, i + 1, 2) orelse return null;
+        i += 3;
+    }
+    if (hh > 23 or mm > 59 or ss > 59) return null;
+
+    var frac_us: i64 = 0;
+    if (i < s.len and (s[i] == '.' or s[i] == ',')) {
+        i += 1;
+        var n: usize = 0;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            if (n == 9) return null;
+            if (n < 6) frac_us = frac_us * 10 + (s[i] - '0');
+            n += 1;
+        }
+        if (n == 0) return null;
+        var pad = n;
+        while (pad < 6) : (pad += 1) frac_us *= 10;
+    }
+
+    var offset_s: i64 = 0;
+    if (i < s.len) {
+        switch (s[i]) {
+            'Z', 'z' => i += 1,
+            '+', '-' => {
+                const sign: i64 = if (s[i] == '-') -1 else 1;
+                const oh = digitsAt(s, i + 1, 2) orelse return null;
+                i += 3;
+                var om: u32 = 0;
+                if (i < s.len) {
+                    const at = if (s[i] == ':') i + 1 else i;
+                    om = digitsAt(s, at, 2) orelse return null;
+                    i = at + 2;
+                }
+                if (oh > 23 or om > 59) return null;
+                offset_s = sign * @as(i64, oh * 3600 + om * 60);
+            },
+            else => return null,
+        }
+    }
+    if (i != s.len) return null;
+
+    const secs: i64 = @as(i64, hh) * 3600 + @as(i64, mm) * 60 + ss - offset_s;
+    return day_us + secs * timestamp_units_per_second + frac_us;
+}
+
+/// Longest string `formatIsoTimestamp` can produce: `-292278-12-31T23:59:59.999999Z`
+/// plus slack.
+pub const max_iso_timestamp_len = 40;
+
+/// Render a `.timestamp` cell (microseconds since the epoch) as RFC 3339 in UTC:
+/// `YYYY-MM-DDTHH:MM:SS[.F]Z`, the fraction present only when nonzero and with
+/// its trailing zeros trimmed (Go's `RFC3339Nano` layout). Every `i64` is
+/// accepted. A year outside 0000–9999 is written in ISO 8601's expanded form
+/// (`-0001-…`, `+10000-…`), which `parseIsoTimestamp` does not read back.
+pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
+    const days = @divFloor(us, us_per_day);
+    const in_day = @mod(us, us_per_day); // [0, us_per_day)
+    // |days| <= maxInt(i64) / us_per_day ~ 1.07e8, so the year always fits.
+    const date = Date.fromOrdinal(days).?;
+    const secs = @divFloor(in_day, timestamp_units_per_second);
+    const frac: u64 = @intCast(@mod(in_day, timestamp_units_per_second));
+    var w: std.Io.Writer = .fixed(buf);
+    if (date.y < 0) {
+        w.print("-{d:0>4}", .{@abs(date.y)}) catch unreachable;
+    } else if (date.y > 9999) {
+        w.print("+{d}", .{date.y}) catch unreachable;
+    } else w.print("{d:0>4}", .{@as(u32, @intCast(date.y))}) catch unreachable;
+    w.print("-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+        date.m,                                    date.d,
+        @as(u64, @intCast(@divFloor(secs, 3600))), @as(u64, @intCast(@mod(@divFloor(secs, 60), 60))),
+        @as(u64, @intCast(@mod(secs, 60))),
+    }) catch unreachable;
+    if (frac != 0) {
+        var fb: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&fb, "{d:0>6}", .{frac}) catch unreachable;
+        var end: usize = fb.len;
+        while (fb[end - 1] == '0') end -= 1;
+        w.writeByte('.') catch unreachable;
+        w.writeAll(fb[0..end]) catch unreachable;
+    }
+    w.writeByte('Z') catch unreachable;
+    return w.buffered();
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -1096,6 +1292,196 @@ test "parseIsoDate and ordinal monotonicity" {
     try testing.expectEqual(@as(i64, 0), (parseIsoDate("1970-01-01").?).ordinal());
 }
 
+test "parseIsoDate: digits only, and the day must exist in its month" {
+    // Gregorian leap rule: divisible by 4, except centuries, except every 400th.
+    try testing.expect(parseIsoDate("2024-02-29") != null);
+    try testing.expect(parseIsoDate("2000-02-29") != null);
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2023-02-29"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("1900-02-29"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-04-31")); // April has 30
+    try testing.expect(parseIsoDate("2024-12-31") != null);
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-00-10"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-13-10"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-01-00"));
+    // `std.fmt.parseInt` takes a sign; a date field must not.
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-+1-01"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("+024-01-01"));
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-01- 1"));
+    // Trailing text is still ignored (the documented contract).
+    try testing.expectEqual(Date{ .y = 2024, .m = 1, .d = 2 }, parseIsoDate("2024-01-02T10:00").?);
+}
+
+test "Date.fromOrdinal inverts ordinal, anchored on known day counts" {
+    // 0000-01-01 is 719528 days before the epoch: Python's
+    // date(1970,1,1).toordinal() - date(1,1,1).toordinal() = 719162, plus the
+    // 366 days of the (leap) year 0 that Python's calendar does not have.
+    try testing.expectEqual(@as(i64, -719528), (Date{ .y = 0, .m = 1, .d = 1 }).ordinal());
+    try testing.expectEqual(Date{ .y = 0, .m = 1, .d = 1 }, Date.fromOrdinal(-719528).?);
+    try testing.expectEqual(Date{ .y = -1, .m = 12, .d = 31 }, Date.fromOrdinal(-719529).?);
+    // -0400-03-01 is exactly one 400-year era (146097 days) before 0000-03-01,
+    // which is 0000-01-01 + 31 + 29 (year 0 is a leap year) = -719468. The
+    // pre-fix `ordinal` put it one more era earlier.
+    try testing.expectEqual(@as(i64, -719468), (Date{ .y = 0, .m = 3, .d = 1 }).ordinal());
+    try testing.expectEqual(@as(i64, -719468 - 146097), (Date{ .y = -400, .m = 3, .d = 1 }).ordinal());
+    try testing.expectEqual(@as(i64, -719528 - 365), (Date{ .y = -1, .m = 1, .d = 1 }).ordinal()); // -1 is not leap
+    try testing.expectEqual(Date{ .y = 1970, .m = 1, .d = 1 }, Date.fromOrdinal(0).?);
+    try testing.expectEqual(Date{ .y = 1969, .m = 12, .d = 31 }, Date.fromOrdinal(-1).?);
+    // 2000-03-01 is day 11017 (Unix time 951868800 / 86400): just past a
+    // 400-year leap day, the case the era arithmetic exists for.
+    try testing.expectEqual(Date{ .y = 2000, .m = 3, .d = 1 }, Date.fromOrdinal(11017).?);
+    try testing.expectEqual(Date{ .y = 2000, .m = 2, .d = 29 }, Date.fromOrdinal(11016).?);
+    // Round trip over five 400-year eras around the epoch, each step checked
+    // against the calendar itself (the day after d is d+1, or the 1st of the
+    // next month, or 1 January), not against the code under test.
+    var prev = Date.fromOrdinal(-1_000_000).?;
+    var day: i64 = -999_999;
+    while (day <= 1_000_000) : (day += 1) {
+        const d = Date.fromOrdinal(day).?;
+        try testing.expectEqual(day, d.ordinal());
+        if (prev.d < Date.daysInMonth(prev.y, prev.m)) {
+            try testing.expectEqual(Date{ .y = prev.y, .m = prev.m, .d = prev.d + 1 }, d);
+        } else if (prev.m < 12) {
+            try testing.expectEqual(Date{ .y = prev.y, .m = prev.m + 1, .d = 1 }, d);
+        } else try testing.expectEqual(Date{ .y = prev.y + 1, .m = 1, .d = 1 }, d);
+        prev = d;
+    }
+    try testing.expectEqual(@as(?Date, null), Date.fromOrdinal(std.math.maxInt(i64)));
+}
+
+test "parseIsoTimestamp: well-known Unix times, offsets and fractions" {
+    const s = timestamp_units_per_second;
+    try testing.expectEqual(@as(?i64, 0), parseIsoTimestamp("1970-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, 0), parseIsoTimestamp("1970-01-01"));
+    // Published anchors: Y2K = 946684800, the "1234567890" moment, and the
+    // last second a signed 32-bit time_t can hold.
+    try testing.expectEqual(@as(?i64, 946684800 * s), parseIsoTimestamp("2000-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-13T23:31:30Z"));
+    try testing.expectEqual(@as(?i64, 2147483647 * s), parseIsoTimestamp("2038-01-19T03:14:07Z"));
+    // The same instant in other zones: local = UTC + offset.
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-14T00:31:30+01:00"));
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-13T18:01:30-05:30"));
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-13T18:01:30-0530"));
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-14T00:31:30+01"));
+    // Separators: `t` and a space are RFC 3339 §5.6's allowed alternatives to `T`.
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-13 23:31:30z"));
+    try testing.expectEqual(@as(?i64, 1234567890 * s), parseIsoTimestamp("2009-02-13t23:31:30"));
+    // Seconds are optional; no zone means UTC.
+    try testing.expectEqual(@as(?i64, 1234567860 * s), parseIsoTimestamp("2009-02-13T23:31"));
+    // Fractions: scaled to microseconds, digits 7..9 dropped, `,` accepted.
+    try testing.expectEqual(@as(?i64, 500_000), parseIsoTimestamp("1970-01-01T00:00:00.5Z"));
+    try testing.expectEqual(@as(?i64, 250_000), parseIsoTimestamp("1970-01-01T00:00:00,25"));
+    try testing.expectEqual(@as(?i64, 123_456), parseIsoTimestamp("1970-01-01T00:00:00.123456789Z"));
+    try testing.expectEqual(@as(?i64, 1), parseIsoTimestamp("1970-01-01T00:00:00.000001Z"));
+    // Before the epoch: the fraction still counts forward from its second.
+    try testing.expectEqual(@as(?i64, -1), parseIsoTimestamp("1969-12-31T23:59:59.999999Z"));
+    try testing.expectEqual(@as(?i64, -s), parseIsoTimestamp("1969-12-31T23:59:59Z"));
+    // Extremes of the accepted range: 0000-01-01 is day -719528 (see the
+    // fromOrdinal test); 10000-01-01 is 253402300800 (9999-12-31T23:59:59 is
+    // the commonly quoted 253402300799).
+    try testing.expectEqual(@as(?i64, -719528 * 86400 * s), parseIsoTimestamp("0000-01-01"));
+    try testing.expectEqual(@as(?i64, 253402300799 * s + 999_999), parseIsoTimestamp("9999-12-31T23:59:59.999999Z"));
+}
+
+test "parseIsoTimestamp: refuses everything outside the grammar" {
+    const bad = [_][]const u8{
+        "",                "2024-01-0",        "2024-02-30",
+        "2024-01-01T",     "2024-01-01T10",    "2024-01-01T10:0",
+        "2024-01-01T1:00", "2024-01-01X10:00", "2024-01-01T24:00:00Z",
+        "2024-01-01T23:60:00Z", "2024-01-01T23:59:60Z", // no leap second
+        "2024-01-01T10:00:",    "2024-01-01T10:00:5",
+        "2024-01-01T10:00:00.",
+        "2024-01-01T10:00:00.Z",     "2024-01-01T10:00:00.1234567890Z", // 10 fraction digits
+        "2024-01-01T10:00:00Zjunk",  "2024-01-01T10:00:00+24:00",
+        "2024-01-01T10:00:00+01:60", "2024-01-01T10:00:00+1",
+        "2024-01-01T10:00:00+01:",   "2024-01-01T10:00:00+01:0",
+        "2024-01-01T10:00:00 ",      "2024-01-01T+1:00",
+        "2024-01-01T10:00:00+0100x", "2024-01-01T10:00:00Q",
+    };
+    for (bad) |b| {
+        if (parseIsoTimestamp(b)) |v| {
+            std.debug.print("accepted {s} as {d}\n", .{ b, v });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "formatIsoTimestamp: RFC 3339 UTC, trimmed fraction, expanded years" {
+    var buf: [max_iso_timestamp_len]u8 = undefined;
+    const s = timestamp_units_per_second;
+    try testing.expectEqualStrings("1970-01-01T00:00:00Z", formatIsoTimestamp(&buf, 0));
+    try testing.expectEqualStrings("2009-02-13T23:31:30.123456Z", formatIsoTimestamp(&buf, 1234567890 * s + 123_456));
+    try testing.expectEqualStrings("1970-01-01T00:00:00.5Z", formatIsoTimestamp(&buf, 500_000));
+    try testing.expectEqualStrings("1970-01-01T00:00:00.00001Z", formatIsoTimestamp(&buf, 10));
+    try testing.expectEqualStrings("1969-12-31T23:59:59.999999Z", formatIsoTimestamp(&buf, -1));
+    try testing.expectEqualStrings("9999-12-31T23:59:59Z", formatIsoTimestamp(&buf, 253402300799 * s));
+    try testing.expectEqualStrings("+10000-01-01T00:00:00Z", formatIsoTimestamp(&buf, 253402300800 * s));
+    try testing.expectEqualStrings("-0001-12-31T00:00:00Z", formatIsoTimestamp(&buf, -719529 * 86400 * s));
+    // The i64 limits, as numpy prints datetime64[us] at +/-(2**63-1)
+    // ('294247-01-10T04:00:54.775807', '-290308-12-21T19:59:05.224193'),
+    // and minInt is one microsecond before the latter. DuckDB documents the
+    // same maximum for its microsecond TIMESTAMP.
+    try testing.expectEqualStrings("+294247-01-10T04:00:54.775807Z", formatIsoTimestamp(&buf, std.math.maxInt(i64)));
+    try testing.expectEqualStrings("-290308-12-21T19:59:05.224192Z", formatIsoTimestamp(&buf, std.math.minInt(i64)));
+}
+
+test "formatIsoTimestamp / parseIsoTimestamp round-trip across years 0000..9999" {
+    var prng = std.Random.DefaultPrng.init(0x7173);
+    const r = prng.random();
+    const lo: i64 = -719528 * us_per_day;
+    const hi: i64 = 253402300800 * timestamp_units_per_second - 1;
+    var buf: [max_iso_timestamp_len]u8 = undefined;
+    for (0..20_000) |_| {
+        const us = r.intRangeAtMost(i64, lo, hi);
+        const text = formatIsoTimestamp(&buf, us);
+        try testing.expectEqual(@as(?i64, us), parseIsoTimestamp(text));
+    }
+}
+
+test "Value.cast(.timestamp) and toJson of a timestamp column" {
+    const s = timestamp_units_per_second;
+    try testing.expectEqual(Value{ .int = 42 }, (Value{ .int = 42 }).cast(.timestamp).?);
+    try testing.expectEqual(Value{ .int = -3 }, (Value{ .float = -3.9 }).cast(.timestamp).?);
+    try testing.expectEqual(@as(?Value, null), (Value{ .float = std.math.nan(f64) }).cast(.timestamp));
+    try testing.expectEqual(Value{ .int = 1234567890 * s }, (Value{ .text = "2009-02-13T23:31:30Z" }).cast(.timestamp).?);
+    try testing.expectEqual(Value{ .int = 946684800 * s }, (Value{ .text = "2000-01-01" }).cast(.timestamp).?);
+    try testing.expectEqual(@as(?Value, null), (Value{ .text = "yesterday" }).cast(.timestamp));
+    try testing.expectEqual(@as(?Value, null), (Value{ .bool = true }).cast(.timestamp));
+    try testing.expectEqual(@as(?Value, null), (@as(Value, .null)).cast(.timestamp));
+    try testing.expectEqual(@as(?Value, null), (Value{ .decimal = 1 }).cast(.timestamp));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{ .{ .name = "at", .type = .timestamp }, .{ .name = "n", .type = .int } };
+    const r0 = [_]Value{ .{ .int = 1234567890 * s + 500_000 }, .{ .int = 7 } };
+    const r1 = [_]Value{ .null, .{ .int = 1234567890 * s } };
+    // A hand-built row longer than the schema: the extra cell renders untyped.
+    const r2 = [_]Value{ .{ .text = "raw" }, .{ .int = 1 }, .{ .int = 5 } };
+    const rows = [_][]const Value{ &r0, &r1, &r2 };
+    const json = try toJson(a, .{ .columns = &cols, .rows = &rows });
+    try testing.expectEqualStrings(
+        \\{"columns":[{"name":"at","type":"timestamp"},{"name":"n","type":"int"}],"rows":[["2009-02-13T23:31:30.5Z",7],[null,1234567890000000],["raw",1,5]]}
+    , json);
+}
+
+test "wire: a timestamp column round-trips, and column type 7 is still refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{.{ .name = "t", .type = .timestamp }};
+    const r0 = [_]Value{.{ .int = -1 }};
+    const rows = [_][]const Value{&r0};
+    const bytes = try serialize(a, .{ .columns = &cols, .rows = &rows });
+    // ncol=1 | name len 1 | "t" | type 6 | nrow=1 | int tag 1 | -1 as i64 LE.
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 't', 6, 1, 0, 0, 0, 1 } ++ [_]u8{0xff} ** 8, bytes);
+    const back = try deserialize(a, bytes);
+    try testing.expectEqual(ColumnType.timestamp, back.columns[0].type);
+    try testing.expectEqual(Value{ .int = -1 }, back.rows[0][0]);
+    var bad = try a.dupe(u8, bytes);
+    bad[9] = 7;
+    try testing.expectError(error.Corrupt, deserialize(a, bad));
+}
+
 test "Dataset.concat appends rows of a same-schema dataset" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1312,6 +1698,47 @@ test "deserialize: a wire-supplied count larger than the input can supply is rej
     try testing.expectEqual(@as(usize, 0), built.rows.len);
 }
 
+test "deserialize: the column bound is 5 bytes per column, checked before any allocation" {
+    // Mutation 2026-10-04: weakening the bound to `ncol > remaining` survived,
+    // because every existing case either claimed 4e9 columns or was honest.
+    // Five columns need at least 5 x 5 = 25 bytes (u32 name length + 1 type
+    // byte each, `min_encoded_column_bytes`); 24 are present, so the claim is
+    // provably a lie and must be refused without touching the allocator. A
+    // failing allocator turns any allocation into OutOfMemory, so getting
+    // Corrupt proves nothing was allocated.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const claim = "\x05\x00\x00\x00" ++ "\x00" ** 24;
+    try testing.expectError(DeserializeError.Corrupt, deserialize(failing.allocator(), claim));
+    // With 25 bytes the claim is plausible: the decoder allocates (and here
+    // gets OutOfMemory, which shows the bound let it through).
+    try testing.expectError(DeserializeError.OutOfMemory, deserialize(failing.allocator(), claim ++ "\x00"));
+}
+
+test "edge cases the mutation run asked for" {
+    // Two decimals 1 raw unit apart at 2^60: f64 has a 53-bit significand, so
+    // both convert to the same float and only the exact i128 compare tells
+    // them apart (killed: dropping the decimal fast path in `eql`).
+    const big: i128 = 1 << 60;
+    try testing.expectEqual((Value{ .decimal = big }).asFloat().?, (Value{ .decimal = big + 1 }).asFloat().?);
+    try testing.expect(!Value.eql(.{ .decimal = big }, .{ .decimal = big + 1 }));
+    try testing.expect(Value.eql(.{ .decimal = big }, .{ .decimal = big }));
+    // 2^63 is exactly representable as f64 and is one past maxInt(i64), so it
+    // must be refused (killed: `f > hi` instead of `f >= hi`, which reached
+    // `@intFromFloat` with an out-of-range operand).
+    try testing.expectEqual(@as(?i64, null), Value.floatToInt(i64, 9223372036854775808.0));
+    try testing.expectEqual(@as(?i64, -9223372036854775807 - 1), Value.floatToInt(i64, -9223372036854775808.0));
+    // Same names, different type: still a schema mismatch.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c1 = [_]Column{.{ .name = "x", .type = .int }};
+    const c2 = [_]Column{.{ .name = "x", .type = .float }};
+    const d1: Dataset = .{ .columns = &c1, .rows = &.{} };
+    const d2: Dataset = .{ .columns = &c2, .rows = &.{} };
+    try testing.expectError(error.SchemaMismatch, d1.concat(arena.allocator(), d2));
+    // The second separator is checked too.
+    try testing.expectEqual(@as(?Date, null), parseIsoDate("2024-01x01"));
+}
+
 // ── fuzz: `deserialize` is the untrusted-input surface ─────────────────────
 //
 // ⚠ This harness opened with `smith.bytes(&buf)` followed by
@@ -1374,7 +1801,7 @@ const Corpus = struct {
         self.entries[malformed_seeds.len + 0] = testkit.fuzz.seedInto(&self.store[0], empty);
 
         // Every column type and every value tag, including the appended
-        // `decimal` tag 5 — the one whose ordinal the comment in `serialize`
+        // `timestamp` column type 6 and `decimal` tag 5 — the one whose ordinal the comment in `serialize`
         // warns must never renumber.
         const cols = [_]Column{
             .{ .name = "i", .type = .int },
@@ -1383,9 +1810,10 @@ const Corpus = struct {
             .{ .name = "b", .type = .bool },
             .{ .name = "d", .type = .date },
             .{ .name = "m", .type = .decimal },
+            .{ .name = "s", .type = .timestamp },
         };
-        const r0 = [_]Value{ .{ .int = -1 }, .{ .float = 1.5 }, .{ .text = "hi" }, .{ .bool = true }, .{ .text = "2026-09-07" }, .{ .decimal = 12345 } };
-        const r1 = [_]Value{ .null, .null, .{ .text = "" }, .{ .bool = false }, .null, .{ .decimal = -1 } };
+        const r0 = [_]Value{ .{ .int = -1 }, .{ .float = 1.5 }, .{ .text = "hi" }, .{ .bool = true }, .{ .text = "2026-09-07" }, .{ .decimal = 12345 }, .{ .int = 0 } };
+        const r1 = [_]Value{ .null, .null, .{ .text = "" }, .{ .bool = false }, .null, .{ .decimal = -1 }, .null };
         const rows = [_][]const Value{ &r0, &r1 };
         const full = try serialize(a, .{ .columns = &cols, .rows = &rows });
         self.entries[malformed_seeds.len + 1] = testkit.fuzz.seedInto(&self.store[1], full);
@@ -1443,7 +1871,8 @@ test "corpus: every seed reaches deserialize, and the cells decoded are pinned" 
     // The first seed is deliberately the empty image, so it is `len - 1`.
     try testing.expectEqual(entries.len - 1, nonempty);
     // Measured 2026-09-07: with the collapsing draw every seed arrived empty,
-    // 0 were accepted and 0 cells were decoded. After: 2 accepted, 12 cells.
+    // 0 were accepted and 0 cells were decoded. After: 2 accepted, 12 cells;
+    // 14 since the `.timestamp` column joined the built image (2 rows x 7).
     try testing.expectEqual(@as(usize, 2), accepted);
-    try testing.expectEqual(@as(usize, 12), cells);
+    try testing.expectEqual(@as(usize, 14), cells);
 }

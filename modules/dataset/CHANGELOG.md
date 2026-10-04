@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED: `ColumnType.timestamp` (survey 2026-09-30 gap). Cells are `Value.int`
+  microseconds since the Unix epoch (UTC), the PostgreSQL/DuckDB/Arrow `[us]` unit; the column
+  tag is appended (wire byte 6), no new `Value` variant, so no `switch` over `Value` breaks.
+  `parseIsoTimestamp` (RFC 3339 / ISO 8601 subset → µs), `formatIsoTimestamp` (RFC 3339 UTC),
+  `timestamp_units_per_second`, `Date.fromOrdinal`, `Date.daysInMonth`. `Value.cast(.timestamp)`
+  parses text; `toJson` renders a `.timestamp` column's int cells as RFC 3339 strings.
+  ⚠ Downgrade hazard: an older `dataset` refuses a serialized `.timestamp` column as
+  `error.Corrupt`. ⚠ A consumer with an exhaustive `switch` over `ColumnType` needs a
+  `.timestamp` arm (none in wgs, which uses `else`).
+  - FIXED: `Date.ordinal` put every year in [-400, -2] one 400-year era (146097 days) too
+    early — Hinnant's `y - 399` truncating-division trick combined with a division that already
+    floors. Reachable before through `parseIsoDate("-002-…")`; found by the new day-by-day
+    calendar walk.
+  - BEHAVIOUR: `parseIsoDate` now refuses what is not a date: a sign or blank in a field
+    (`"2024-+1-01"` used to parse as January) and a day the month does not have (`2023-02-29`,
+    `2024-04-31`). Years are 0000–9999.
+  - Mutation 2026-10-04: 43 mutants, 42 killed, 1 equivalent; 2 tests added for survivors
+    (the 5-bytes-per-column bound before allocation, exact decimal `eql` at 2^60, `floatToInt`
+    at 2^63, a type-only schema mismatch, the second date separator).
+
 - **2026-09-10** — **A1 fix campaign: four findings from the third audit.**
   - `Value.order` reached `std.math.order`'s `unreachable` on NaN — reachable
     directly from `deserialize`, which hands a `.float` cell any bit pattern

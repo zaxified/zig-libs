@@ -30,7 +30,7 @@ piecemeal.
 ```zig
 const dataset = @import("dataset");
 
-const ColumnType = dataset.ColumnType; // int, float, text, bool, date, decimal
+const ColumnType = dataset.ColumnType; // int, float, text, bool, date, decimal, timestamp
 const Column = dataset.Column;         // { name, type }
 const Value = dataset.Value;           // tagged union: null/int/float/text/bool/decimal
 const Dataset = dataset.Dataset;       // { columns, rows }
@@ -65,10 +65,38 @@ fn serialize(a: Allocator, d: Dataset) ![]u8;
 fn deserialize(a: Allocator, bytes: []const u8) !Dataset; // error.Corrupt on truncation/bad tag
 fn toJson(a: Allocator, d: Dataset) ![]u8; // {"columns":[...],"rows":[...]}; non-finite float -> null
 
-// ISO dates
-fn parseIsoDate(s: []const u8) ?Date;  // "YYYY-MM-DD", trailing time ignored
-fn Date.ordinal(self: Date) i64;       // see caveat below
+// ISO dates and instants
+fn parseIsoDate(s: []const u8) ?Date;  // "YYYY-MM-DD" (digits only, real day), trailing time ignored
+fn Date.ordinal(self: Date) i64;       // days since 1970-01-01, proleptic Gregorian
+fn Date.fromOrdinal(days: i64) ?Date;  // inverse of ordinal
+fn Date.daysInMonth(y: i32, m: u8) u8;
+fn parseIsoTimestamp(s: []const u8) ?i64; // RFC 3339 / ISO 8601 -> microseconds since the epoch
+fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8; // -> "…Z"
+const timestamp_units_per_second: i64 = 1_000_000;
 ```
+
+### `.timestamp` — an instant, in microseconds
+
+A `.timestamp` column holds `Value.int` cells: whole **microseconds since
+1970-01-01T00:00:00Z** — the unit of PostgreSQL's and DuckDB's `TIMESTAMP`
+and of Arrow's `timestamp[us]`. Like `.date` (which reuses `.text`), the
+column tag carries the intent and the cell reuses an existing `Value`
+variant, so no `switch` over `Value` breaks and the wire format gains no new
+value tag (the column type byte is `6`).
+
+- `parseIsoTimestamp` reads `YYYY-MM-DD` (UTC midnight) and
+  `YYYY-MM-DD(T|t| )HH:MM[:SS[.F]][Z|±HH:MM|±HHMM|±HH]`; no zone means UTC
+  (Arrow's convention for a timezone-less timestamp). 1–9 fraction digits,
+  digits past the sixth truncated. A leap second `:60` and `24:00` are refused.
+- `formatIsoTimestamp` writes RFC 3339 in UTC with the fraction trimmed
+  (`2009-02-13T23:31:30.5Z`); years outside 0000–9999 use ISO 8601's
+  expanded form (`+10000-…`), which the parser does not read back.
+- `cast(.timestamp)`: `int` passes, `float` truncates, `text` parses.
+- `toJson` writes a `.timestamp` column's `int` cells as RFC 3339 **strings**
+  — a bare number would leave the reader guessing the unit (pandas emits
+  epoch milliseconds by default).
+- ⚠ An older `dataset` refuses a serialized `.timestamp` column as
+  `error.Corrupt` (column type 6 did not exist).
 
 ### `.decimal` — exact fixed-point money/quantity
 
@@ -93,14 +121,15 @@ formatting, a consumer wraps the raw value itself:
 - The binary wire format gained tag `5` for `.decimal`, **appended** after
   the existing `0..4` tags, so already-serialized data never renumbers.
 
-### `Date.ordinal` — monotonic, not asserted calendar-exact
+### `Date.ordinal` — proleptic Gregorian day count
 
 `ordinal()` uses Howard Hinnant's days-from-civil algorithm to produce a
 proleptic-Gregorian day count: equal dates compare equal, later dates compare
-greater, and 1970-01-01 lands on ordinal 0. This is enough for range
-filtering, sorting and day-difference arithmetic. It is **not independently
-verified against every historical calendar reform** — treat it as a monotonic
-ordering key, not a certified calendar-math primitive.
+greater, and 1970-01-01 lands on ordinal 0. `fromOrdinal` is its inverse; the
+tests walk 2 000 001 consecutive days (about years −768 to 4707) checking
+each step against the calendar rule itself, and pin published anchors
+(0000-01-01 = −719528). It is the proleptic calendar — no Julian dates before
+1582 — so do not use it for historical (pre-reform) date arithmetic.
 
 ### Binary wire format — explicit little-endian, cross-host
 
@@ -135,13 +164,19 @@ shape you'd want for a multi-million-row analytical engine.
   Deferred per the library's perf-investment policy: no current
   high-throughput product needs it (dashboard-sized result sets are the
   actual workload) — revisit if/when one does.
+- **Arrow IPC (or another standard) interchange** — needs the columnar view
+  above first: an IPC writer over boxed rows would be a full transpose per
+  record batch. Revisit with columnar storage.
+- **Timezone-aware timestamps** (a zone name per column, wall-clock
+  rendering) — `.timestamp` is UTC instants only; offsets are applied at parse
+  time. Needs a tz database, which a leaf container should not carry.
 - **`distinct`/dedup at the dataset level** — NOT duplicated here: covered
   by `tabular.distinct` (group-key + keep-first-or-last), which already owns
   that design.
 
-Resolved this cycle: `.decimal` `ColumnType`/`Value` (raw `i128`, no
-`decimal`-module dependency — see above) and `Builder` (streaming/incremental
-construction).
+Resolved: `.decimal` `ColumnType`/`Value` (raw `i128`, no `decimal`-module
+dependency — see above), `Builder` (streaming/incremental construction), and
+(2026-10-04) the `.timestamp` column type.
 
 ## Design notes
 
