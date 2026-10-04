@@ -540,7 +540,13 @@ const Builder = struct {
     iso_dow: ?u32 = null,
 };
 
+/// A numeric field of the input: ASCII digits only. `std.fmt.parseInt` alone
+/// also reads a leading `+`/`-` and `_` separators, so a fixed-width field
+/// such as `MM` accepted `+1`, and the `ZZ` offset hour `-1` became a negative
+/// hour that passed the `oh > 23` check (audit 2026-10-04) -- the same class
+/// `parseDigitField` exists to rule out for `parseXsdDateTime`.
 fn parseUint(comptime T: type, s: []const u8, err: ParseError) ParseError!T {
+    if (!isAllDigits(s)) return err;
     return std.fmt.parseInt(T, s, 10) catch return err;
 }
 
@@ -958,7 +964,10 @@ pub fn parseIsoDate(s: []const u8) ParseError!DateParts {
     const y = parseUint(i32, s[0..4], ParseError.InvalidDate) catch return ParseError.InvalidDate;
     const m = parseUint(u32, s[5..7], ParseError.InvalidDate) catch return ParseError.InvalidDate;
     const d = parseUint(u32, s[8..10], ParseError.InvalidDate) catch return ParseError.InvalidDate;
-    if (m < 1 or m > 12 or d < 1 or d > 31) return ParseError.InvalidDate;
+    // The day must exist in THAT month: `d > 31` let `2023-02-30` through as
+    // a "strict" date, which every later `ymdToEpochDay` silently rolled into
+    // March (audit 2026-10-04; `parseXsdDateTimeNs` had the same bug fixed).
+    if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return ParseError.InvalidDate;
     return .{ .year = y, .month = m, .day = d };
 }
 
@@ -1190,6 +1199,105 @@ test "parse: 2-digit year pivot + month names" {
     try testing.expectEqual(@as(i32, 2024), (try parse("24-01-01", "YY-MM-DD")).year);
     try testing.expectEqual(@as(i32, 1999), (try parse("99-01-01", "YY-MM-DD")).year);
     try testing.expectEqual(@as(u32, 9), (try parse("15 September 2024", "D MMMM YYYY")).month);
+}
+
+test "parse: a numeric field is digits only -- no sign, no separator" {
+    // Every token reads ASCII digits (`date_tokens`: "4-digit year", "2-digit
+    // month", ...); `std.fmt.parseInt` alone also takes `+`/`-` and `_`.
+    // Before 2026-10-04 `+1/05/2024` parsed as January, `1_00` as a year, and
+    // an offset hour of `-1` slipped past the `oh > 23` range check as a
+    // negative number.
+    try testing.expectError(ParseError.InvalidDate, parse("+1/05/2024", "MM/DD/YYYY"));
+    try testing.expectError(ParseError.InvalidDate, parse("01/05/+024", "MM/DD/YYYY"));
+    try testing.expectError(ParseError.InvalidDate, parse("1_00-01-01", "YYYY-MM-DD"));
+    try testing.expectError(ParseError.InvalidTime, parse("+1:30", "hh:mm"));
+    try testing.expectError(ParseError.InvalidTime, parse("2024-01-01+-1:30", "YYYY-MM-DDZZ"));
+    // The well-formed counterparts still parse.
+    try testing.expectEqual(@as(u32, 1), (try parse("01/05/2024", "MM/DD/YYYY")).month);
+    try testing.expectEqual(@as(?i32, 90), (try parse("2024-01-01+01:30", "YYYY-MM-DDZZ")).off_min);
+}
+
+test "parseIsoDate: the day must exist in its month, and fields are digits only" {
+    // "Strict canonical YYYY-MM-DD": a calendar date, so day <= the month's
+    // length (Gregorian leap rule), not merely <= 31; and no sign anywhere.
+    // Before 2026-10-04 `2023-02-30` and `2024-04-31` were accepted (and
+    // rolled into March/May by every caller's `ymdToEpochDay`), as was
+    // `+024-01-01`.
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("2023-02-29"));
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("2023-02-30"));
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("2024-04-31"));
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("+024-01-01"));
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("2024-+1-01"));
+    try testing.expectEqual(DateParts{ .year = 2024, .month = 2, .day = 29 }, try parseIsoDate("2024-02-29"));
+    try testing.expectEqual(DateParts{ .year = 2024, .month = 4, .day = 30 }, try parseIsoDate("2024-04-30"));
+}
+
+test "parse: token edges from the date_tokens table (mutation 2026-10-04)" {
+    // Each assertion is a documented edge no test touched; the mutation run
+    // of 2026-10-04 survived a flip of each one.
+    // YY: "00-69 -> 2000s, 70-99 -> 1900s".
+    try testing.expectEqual(@as(i32, 2069), (try parse("69-01-01", "YY-MM-DD")).year);
+    try testing.expectEqual(@as(i32, 1970), (try parse("70-01-01", "YY-MM-DD")).year);
+    // M / D read "1-2 digits": `115` with `MD` is month 11, day 5.
+    const md = try parse("115", "MD");
+    try testing.expectEqual(@as(u32, 11), md.month);
+    try testing.expectEqual(@as(u32, 5), md.day);
+    // hh is "00-23": 24 is no hour.
+    try testing.expectError(ParseError.InvalidTime, parse("24:00", "hh:mm"));
+    // 12h clock: 12 AM is 00, 12 PM is 12; anything but AM/PM is no meridiem.
+    try testing.expectEqual(@as(u32, 0), (try parse("12:30 AM", "ii:mm A")).hour);
+    try testing.expectEqual(@as(u32, 12), (try parse("12:30 PM", "ii:mm A")).hour);
+    try testing.expectError(ParseError.InvalidTime, parse("12:30 XM", "ii:mm A"));
+    // e: a digit 1-7 must be there.
+    try testing.expectError(ParseError.InvalidFormat, parse("x", "e"));
+    // ZZ: hours 00-23.
+    try testing.expectError(ParseError.InvalidTime, parse("+24:00", "ZZ"));
+    // A literal must match, must fit, and may not be left over past the input.
+    try testing.expectError(ParseError.InvalidFormat, parse("2024/01", "YYYY-MM"));
+    try testing.expectError(ParseError.InvalidFormat, parse("2024-1", "YYYY-12"));
+    try testing.expectError(ParseError.InvalidFormat, parse("2024", "YYYY[!]"));
+    // [*] "skip until the next token": a literal, or a 4-digit year.
+    try testing.expectEqual(@as(i32, 2024), (try parse("abc-2024", "[*]-YYYY")).year);
+    try testing.expectEqual(@as(i32, 2024), (try parse("foo2024", "[*]YYYY")).year);
+}
+
+test "tokenize: more than MAX_TOKENS tokens is TooManyTokens, not an overrun" {
+    // `MAX_TOKENS` (64) sizes the on-stack token array; a longer format is
+    // refused (`ParseError.TooManyTokens`). Mutation 2026-10-04: dropping the
+    // check survived -- nothing fed a format that long. `M-` is two tokens.
+    const long = "M-" ** 33;
+    try testing.expectError(ParseError.TooManyTokens, parse("1-", long));
+    try testing.expectError(error.TooManyTokens, format(testing.allocator, .{ .year = 2024, .month = 1, .day = 1 }, long));
+}
+
+test "format: the 12-hour clock at noon" {
+    // 12:xx is "12 PM" (`ii` = "2-digit hour, 12h (01-12)"); mutation
+    // 2026-10-04 survived printing it as 00 and labelling it AM.
+    const a = testing.allocator;
+    const s = try format(a, .{ .year = 2024, .month = 1, .day = 1, .hour = 12, .minute = 5 }, "ii:mm A");
+    defer a.free(s);
+    try testing.expectEqualStrings("12:05 PM", s);
+}
+
+test "nthWeekdayOfMonth: an occurrence one day past the month end is null" {
+    // Feb 2023 starts on a Wednesday (1 Feb 2023 = ISO weekday 3), so its
+    // 5th Wednesday would be "29 Feb 2023", which does not exist. Mutation
+    // 2026-10-04: admitting day = dim + 1 survived.
+    try testing.expect(nthWeekdayOfMonth(2023, 2, 3, 5) == null);
+    try testing.expectEqual(@as(u32, 22), nthWeekdayOfMonth(2023, 2, 3, 4).?.day);
+}
+
+test "parseIsoDate / parseXsdDateTime: exact shape (mutation 2026-10-04)" {
+    // `parseIsoDate` is "strict canonical YYYY-MM-DD": exactly 10 bytes.
+    try testing.expectError(ParseError.InvalidDate, parseIsoDate("2024-01-01x"));
+    // xsd:dateTime (XML Schema 1.1 Part 2 §3.3.8): `T` separates date and
+    // time; the zone is `Z` or `(+|-)hh:mm` with the colon and minutes
+    // 00-59; every field is digits (`parseDigitField` doc).
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-01-01 12:00:00Z"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-01-01T12:00:00+02_00"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("2024-01-01T12:00:00+02:60"));
+    try testing.expectError(error.InvalidDateTime, parseXsdDateTime("20x4-01-01T12:00:00Z"));
+    try testing.expectEqual(@as(i64, 1704103200), try parseXsdDateTime("2024-01-01T12:00:00+02:00"));
 }
 
 test "parse: pre-1970 dates no longer rejected (BUG-3)" {

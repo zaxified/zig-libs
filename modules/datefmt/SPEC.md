@@ -6,7 +6,7 @@
 
 **Scope:** core — chrono 0.4 (Rust), Go `time` (surveyed 2026-09-30); raised from mvp 2026-09-30 with fractional seconds + ISO week
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -80,6 +80,23 @@ parse/format for every documented token incl. 12h AM/PM and `ZZ` offsets, calend
 (`addMonths` day-clamping, `nthWeekdayOfMonth`), strict ISO parse/format, and malformed-format-string
 error paths. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check
 modules/datefmt`.
+
+**Audit 2026-10-04 (mutation).** 51 schemata mutants over the civil core (leap rule,
+`daysInMonth`, `validate`, ISO week-date bounds), the tokenizer cap, `parse` (YY pivot,
+1-2 digit fields, fraction width/scale, `e` range, AM/PM and 12-hour mapping, `ZZ` sign,
+colon and ranges, literals, `[*]` scans, the time-vs-date error split), `format` (negative
+year, offset sign, fraction truncation, noon), `addMonths` clamp, `nthWeekdayOfMonth`
+bounds, `parseIsoDate` and `parseXsdDateTimeNs` (separator, day, leap second, fraction,
+zone colon/ranges/sign, trailing bytes, digit fields) and `firstInvalidFormatChar`: 49
+killed, 2 equivalent, 0 left alive. Equivalent: dropping `n == 0` in `nthWeekdayOfMonth`
+(n = 0 takes the negative branch, `dim - offset + 7 > dim`, so null anyway); accumulating
+fraction digits past the 9th in `parseXsdDateTimeNs` (their weight is already 0). Two defects
+found while reading and fixed: `parse`'s numeric fields went through `std.fmt.parseInt`
+alone, so a fixed-width field took a sign or `_` (`+1` as month 1, a `ZZ` hour of `-1`
+passing the range check as negative); `parseIsoDate`, documented "strict canonical", checked
+`day <= 31` only, so `2023-02-30` was accepted. 22 survivors were test gaps and got tests
+(token edges from `date_tokens`, literals, wildcards, 12 h noon/midnight, `nthWeekdayOfMonth`
+past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKENS`).
 
 ## Backlog / deferred
 Deferred from v1: locale-aware month/day names; duration/period types;
