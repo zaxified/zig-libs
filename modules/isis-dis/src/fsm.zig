@@ -236,6 +236,27 @@ test "DisChange keys on lan_id, not just dis_system_id: a stale pseudonode byte 
     try testing.expectEqual(remote_new_pn.system_id, c2.new_dis);
 }
 
+test "local stays DIS while its pseudonode id changes: a change, but neither became_dis nor resigned_dis" {
+    // WHY: DisChange field docs -- `became_dis` is "was not, now is" and
+    // `resigned_dis` is "was, now is not". A local DIS whose own pseudonode id
+    // changes (the `lan_id` flip, see the keyed-on-lan_id test) is a change of
+    // pseudonode LSP-ID but the local system never stopped being DIS, so
+    // neither trigger may fire (a spurious `resigned_dis` would purge the LSP
+    // the caller must keep originating; a spurious `became_dis` would
+    // re-originate it).
+    var e = Election.init(me);
+    _ = e.recompute(&.{}, 1);
+    e.local.pseudonode_id = 2;
+    const eff = e.recompute(&.{}, 2);
+    try testing.expect(eff.result.is_local_dis);
+    const c = eff.change orelse return error.TestExpectedChange;
+    try testing.expectEqual(me.system_id, c.old_dis.?);
+    try testing.expectEqual(me.system_id, c.new_dis);
+    try testing.expect(!c.became_dis);
+    try testing.expect(!c.resigned_dis);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0xA, 2 }, &eff.result.lan_id);
+}
+
 test "determinism: identical (candidate-set, now) streams yield identical effects" {
     const Run = struct {
         fn drive() [3]bool {

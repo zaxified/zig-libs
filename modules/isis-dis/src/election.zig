@@ -432,3 +432,28 @@ test "FRR anchor: LAN DIS election, priority + SNPA tie-break, two independent r
         try testing.expectEqual(r2.system_id, from_r3.dis_system_id);
     }
 }
+
+test "SNPA is compared as a big-endian 48-bit number: the FIRST octet is most significant" {
+    // WHY: ISO 10589 §8.4.5 / the `Snpa` doc comment: SNPAs are compared as
+    // unsigned 48-bit big-endian integers. Every other test only varies the
+    // LAST octet, which a byte-reversed (little-endian) compare cannot tell
+    // apart. Here a high first octet with a tiny last octet must beat a low
+    // first octet with a huge last octet, whichever side is local.
+    const hi_first: Snpa = .{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const hi_last: Snpa = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0xFF };
+    const a: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 1 }, .priority = 64, .snpa = hi_first };
+    const b: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 2 }, .priority = 64, .snpa = hi_last };
+    try testing.expectEqual(a.system_id, elect(a, &.{b}).dis_system_id);
+    try testing.expectEqual(a.system_id, elect(b, &.{a}).dis_system_id);
+}
+
+test "system-id tie-break (duplicate SNPA) is also most-significant-octet first, higher wins" {
+    // WHY: `outranks` doc comment -- on equal priority AND equal SNPA the
+    // numerically higher system-id wins, with the same octet order as the SNPA
+    // (big-endian). 01:00:00:00:00:00 > 00:00:00:00:00:FF numerically.
+    const same = snpa(0x44);
+    const a: Candidate = .{ .system_id = .{ 1, 0, 0, 0, 0, 0 }, .priority = 64, .snpa = same };
+    const b: Candidate = .{ .system_id = .{ 0, 0, 0, 0, 0, 0xFF }, .priority = 64, .snpa = same };
+    try testing.expectEqual(a.system_id, elect(a, &.{b}).dis_system_id);
+    try testing.expectEqual(a.system_id, elect(b, &.{a}).dis_system_id);
+}

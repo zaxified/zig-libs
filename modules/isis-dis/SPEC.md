@@ -6,7 +6,7 @@
 
 **Scope:** core — FRR isisd DIS election (10.7, ISO 10589 §8.4.5); holo-isis for the surrounding layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -129,8 +129,10 @@ that incoming Hellos' `lan_id` agree with the elected DIS.
 
 ### 5.2 Change effect
 
-`Election.recompute` emits a `DisChange` iff the elected **DIS system-id** flips
-between calls (identity is the system-id; SNPA and pseudonode-id are fixed to it):
+`Election.recompute` emits a `DisChange` iff the elected **`lan_id`** (DIS system-id ‖
+pseudonode-id) changes between calls — so a pseudonode-id change of the same DIS also
+fires one, with `became_dis` / `resigned_dis` both false (the table below lists the
+system-id flips; code is `fsm.zig`):
 
 | Prior DIS | New DIS | `change`? | `became_dis` | `resigned_dis` |
 |-----------|---------|-----------|--------------|----------------|
@@ -200,6 +202,26 @@ green; the sibling `isis` test suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party implementation
 ported or studied. See `/NOTICE` (no entry required — public spec).
+
+## Mutation run 2026-10-04
+
+First mutation-schemata run (one ReleaseSafe test binary, 28 mutants behind a
+runtime switch over `election.zig` and `fsm.zig`, baseline first): 28 mutants,
+28 killed, 0 equivalent. Covered: priority and SNPA comparison direction, SNPA and
+system-id octet order, the system-id tie-break, `elect`'s scan (argument order,
+`is_local` flag), `lan_id` / `dis_snpa` / `pseudonodeLspId` construction, and the
+FSM change detection (keyed on `lan_id`, first election, `old_dis` / `new_dis` /
+`became_dis` / `resigned_dis` / `at`, stored state, `isLocalDis`).
+
+Four mutants survived the existing tests and were killed by three new tests:
+SNPA and system-id compared byte-reversed (every existing test varied only the
+last octet; new tests put the difference in the first octet, expected from ISO
+10589 §8.4.5 "numerically highest SNPA" with the big-endian octet order the
+`Snpa` doc states), and `became_dis` / `resigned_dis` fired for a local DIS that
+only changes its own pseudonode id (new test; expected from the `DisChange` field
+docs: "was not, now is" / "was, now is not"). No source defects found. Doc drift
+fixed in §5.2: the change is keyed on `lan_id`, not on the system-id alone (the
+code comment in `fsm.zig` already said so).
 
 ## Backlog / deferred
 
