@@ -144,6 +144,134 @@ pub fn stdSample(xs: []const f64) f64 {
     return @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1)));
 }
 
+// ── expanding / ewm ─────────────────────────────────────────────────────────
+
+pub const ExpandingSpec = struct {
+    value_col: []const u8,
+    out: []const u8,
+    func: RollFn = .mean,
+    /// Rows before the `min_periods`-th are null (pandas' default for
+    /// `expanding` is 1; 0 behaves as 1, since row i always has i+1 values).
+    min_periods: usize = 1,
+};
+
+/// Expanding (cumulative) window: row i aggregates rows 0..=i. Same value rule
+/// and `std_sample` convention as `rolling` (null/non-numeric reads as 0; fewer
+/// than 2 values → 0). O(n): running sum/min/max, Welford for the variance.
+pub fn expanding(a: std.mem.Allocator, d: Dataset, spec: ExpandingSpec) Error!Dataset {
+    const v = try floatCol(a, d, spec.value_col);
+    const out = try a.alloc(Value, v.len);
+    var sum: f64 = 0;
+    var mn: f64 = std.math.inf(f64);
+    var mx: f64 = -std.math.inf(f64);
+    var mean: f64 = 0;
+    var m2: f64 = 0;
+    for (v, 0..) |x, i| {
+        const n: f64 = @floatFromInt(i + 1);
+        sum += x;
+        mn = @min(mn, x);
+        mx = @max(mx, x);
+        const delta = x - mean;
+        mean += delta / n;
+        m2 += delta * (x - mean);
+        out[i] = if (i + 1 < spec.min_periods) .null else .{ .float = switch (spec.func) {
+            .sum => sum,
+            .mean => sum / n,
+            .std_sample => if (i == 0) 0 else @sqrt(m2 / (n - 1)),
+            .min => mn,
+            .max => mx,
+        } };
+    }
+    return appendValues(a, d, spec.out, out);
+}
+
+pub const EwmSpec = struct {
+    value_col: []const u8,
+    out: []const u8,
+    /// The decay, given exactly one way (pandas' four spellings):
+    /// `alpha` in (0, 1]; `span` ≥ 1 (α = 2/(span+1)); `com` ≥ 0
+    /// (α = 1/(1+com)); `halflife` > 0 (α = 1 − exp(−ln 2 / halflife)).
+    alpha: ?f64 = null,
+    span: ?f64 = null,
+    com: ?f64 = null,
+    halflife: ?f64 = null,
+    /// pandas' `adjust`: true divides by the sum of the weights (the default);
+    /// false is the recursive form y = (1−α)·y + α·x.
+    adjust: bool = true,
+};
+
+pub const EwmError = Error || error{InvalidDecay};
+
+fn ewmAlpha(spec: EwmSpec) EwmError!f64 {
+    var given: u8 = 0;
+    var alpha: f64 = 0;
+    if (spec.alpha) |x| {
+        given += 1;
+        if (!(x > 0 and x <= 1)) return error.InvalidDecay;
+        alpha = x;
+    }
+    if (spec.span) |x| {
+        given += 1;
+        if (!(x >= 1)) return error.InvalidDecay;
+        alpha = 2 / (x + 1);
+    }
+    if (spec.com) |x| {
+        given += 1;
+        if (!(x >= 0)) return error.InvalidDecay;
+        alpha = 1 / (1 + x);
+    }
+    if (spec.halflife) |x| {
+        given += 1;
+        if (!(x > 0)) return error.InvalidDecay;
+        alpha = 1 - @exp(-std.math.ln2 / x);
+    }
+    if (given != 1 or !std.math.isFinite(alpha) or alpha <= 0) return error.InvalidDecay;
+    return alpha;
+}
+
+/// Exponentially weighted mean, pandas' `ewm(...).mean()` with its defaults
+/// `ignore_na=False`, `min_periods=0`: weights follow ABSOLUTE positions, so a
+/// missing value (null, non-numeric, NaN) still ages the history — for
+/// `[x0, missing, x2]` the weights are (1−α)² and 1 (adjust) or (1−α)² and α
+/// (not adjust), normalized. A missing row repeats the previous mean; rows
+/// before the first value are null. Kept as (mean, total weight) rather than
+/// (Σwx, Σw), so a long gap that underflows the weight degrades to "the next
+/// value", never to 0/0.
+pub fn ewm(a: std.mem.Allocator, d: Dataset, spec: EwmSpec) EwmError!Dataset {
+    const alpha = try ewmAlpha(spec);
+    const ci = try mustIndex(d, spec.value_col);
+    const out = try a.alloc(Value, d.rows.len);
+    var y: ?f64 = null;
+    var w: f64 = 0; // weight of the history behind `y`
+    for (d.rows, 0..) |r, i| {
+        w *= 1 - alpha;
+        const x = r[ci].asFloat();
+        if (x != null and !std.math.isNan(x.?)) {
+            if (y) |prev| {
+                const wx: f64 = if (spec.adjust) 1 else alpha;
+                y = (w * prev + wx * x.?) / (w + wx);
+            } else y = x.?;
+            w = if (spec.adjust) w + 1 else 1;
+        }
+        out[i] = if (y) |m| .{ .float = m } else .null;
+    }
+    return appendValues(a, d, spec.out, out);
+}
+
+fn appendValues(a: std.mem.Allocator, d: Dataset, out: []const u8, values: []const Value) Error!Dataset {
+    const cols = try a.alloc(Column, d.columns.len + 1);
+    @memcpy(cols[0..d.columns.len], d.columns);
+    cols[d.columns.len] = .{ .name = out, .type = .float };
+    const rows = try a.alloc([]const Value, d.rows.len);
+    for (d.rows, 0..) |r, i| {
+        const nr = try a.alloc(Value, cols.len);
+        @memcpy(nr[0..d.columns.len], r);
+        nr[d.columns.len] = values[i];
+        rows[i] = nr;
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
 /// (v − prev) / prev; first row null.
 pub fn pctChange(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
     const v = try floatCol(a, d, spec.value_col);
@@ -746,4 +874,128 @@ test "distinct keeps first (or last) row without summing" {
     try testing.expectEqual(@as(usize, 2), last.rows.len);
     try testing.expectEqualStrings("AAA", last.cell(0, "sym").?.text); // position = first-seen
     try testing.expectApproxEqAbs(@as(f64, 3), last.cell(0, "v").?.float, 1e-9); // value = last-seen
+}
+
+test "ewm: pandas' documented example, adjust true and false" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    // pandas DataFrame.ewm docs: B = [0, 1, 2, NaN, 4], com = 0.5 →
+    // 0, 0.75, 1.615385, 1.615385, 3.670213. Exactly (α = 2/3): 21/13, 345/94.
+    const cols = [_]Column{.{ .name = "b", .type = .float }};
+    const rows = [_][]const Value{ &.{.{ .float = 0 }}, &.{.{ .float = 1 }}, &.{.{ .float = 2 }}, &.{.null}, &.{.{ .float = 4 }} };
+    const d = dsOf(&cols, &rows);
+    const want = [_]f64{ 0, 0.75, 21.0 / 13.0, 21.0 / 13.0, 345.0 / 94.0 };
+    const spellings = [_]EwmSpec{
+        .{ .value_col = "b", .out = "e", .com = 0.5 },
+        .{ .value_col = "b", .out = "e", .span = 2 }, // α = 2/(2+1)
+        .{ .value_col = "b", .out = "e", .alpha = 2.0 / 3.0 },
+    };
+    for (spellings) |sp| {
+        const out = try ewm(a, d, sp);
+        for (want, 0..) |w, i| try testing.expectApproxEqRel(w, out.rows[i][1].float, 1e-12);
+    }
+    // adjust = false, same data, from y = ((1−α)^k·y + α·x) / ((1−α)^k + α):
+    // 0, 2/3, 14/9, 14/9, then k = 2: (1/9·14/9 + 2/3·4) / (1/9 + 2/3) = 230/63.
+    const nf = try ewm(a, d, .{ .value_col = "b", .out = "e", .com = 0.5, .adjust = false });
+    const want_nf = [_]f64{ 0, 2.0 / 3.0, 14.0 / 9.0, 14.0 / 9.0, 230.0 / 63.0 };
+    for (want_nf, 0..) |w, i| try testing.expectApproxEqRel(w, nf.rows[i][1].float, 1e-12);
+    // halflife 1 is α = 1/2: two values 0, 4 (adjust) → (0.5·0 + 4) / 1.5 = 8/3.
+    const hl = try ewm(a, dsOf(&cols, &.{ &.{.{ .float = 0 }}, &.{.{ .float = 4 }} }), .{ .value_col = "b", .out = "e", .halflife = 1 });
+    try testing.expectApproxEqRel(@as(f64, 8.0 / 3.0), hl.rows[1][1].float, 1e-12);
+}
+
+test "ewm: leading nulls stay null; a long gap does not turn into 0/0" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{.{ .name = "b", .type = .float }};
+    var rows: std.ArrayList([]const Value) = .empty;
+    try rows.append(a, &.{.null});
+    try rows.append(a, &.{.{ .float = std.math.nan(f64) }});
+    try rows.append(a, &.{.{ .float = 1 }});
+    // 2000 missing rows: the history's weight 0.5^2000 underflows to 0.
+    for (0..2000) |_| try rows.append(a, &.{.null});
+    try rows.append(a, &.{.{ .float = 5 }});
+    const out = try ewm(a, dsOf(&cols, rows.items), .{ .value_col = "b", .out = "e", .alpha = 0.5 });
+    try testing.expect(out.rows[0][1] == .null);
+    try testing.expect(out.rows[1][1] == .null);
+    try testing.expectEqual(@as(f64, 1), out.rows[2][1].float);
+    try testing.expectEqual(@as(f64, 1), out.rows[1000][1].float); // carried
+    // Weights 0.5^2001 (→ 0) and 1: the mean is the new value.
+    try testing.expectEqual(@as(f64, 5), out.rows[rows.items.len - 1][1].float);
+}
+
+test "ewm: the decay must be given exactly once and be in range" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{.{ .name = "b", .type = .float }};
+    const d = dsOf(&cols, &.{});
+    const bad = [_]EwmSpec{
+        .{ .value_col = "b", .out = "e" },
+        .{ .value_col = "b", .out = "e", .alpha = 0.5, .span = 3 },
+        .{ .value_col = "b", .out = "e", .alpha = 0 },
+        .{ .value_col = "b", .out = "e", .alpha = 1.5 },
+        .{ .value_col = "b", .out = "e", .alpha = std.math.nan(f64) },
+        .{ .value_col = "b", .out = "e", .span = 0.5 },
+        .{ .value_col = "b", .out = "e", .com = -1 },
+        .{ .value_col = "b", .out = "e", .halflife = 0 },
+        .{ .value_col = "b", .out = "e", .com = std.math.inf(f64) }, // α = 0
+    };
+    for (bad) |sp| try testing.expectError(error.InvalidDecay, ewm(a, d, sp));
+    _ = try ewm(a, d, .{ .value_col = "b", .out = "e", .alpha = 1 }); // α = 1 is legal
+    _ = try ewm(a, d, .{ .value_col = "b", .out = "e", .span = 1 }); // span 1 → α = 1
+    try testing.expectError(error.NoSuchColumn, ewm(a, d, .{ .value_col = "z", .out = "e", .alpha = 1 }));
+}
+
+test "expanding: cumulative sum / mean / min / max / std, min_periods" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+    const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 };
+    var rows: [xs.len][]const Value = undefined;
+    for (xs, 0..) |x, i| rows[i] = try a.dupe(Value, &.{.{ .float = x }});
+    const d = dsOf(&cols, &rows);
+    const sum = try expanding(a, d, .{ .value_col = "v", .out = "o", .func = .sum });
+    const mean = try expanding(a, d, .{ .value_col = "v", .out = "o" });
+    const mn = try expanding(a, d, .{ .value_col = "v", .out = "o", .func = .min });
+    const mx = try expanding(a, d, .{ .value_col = "v", .out = "o", .func = .max });
+    var run: f64 = 0;
+    for (xs, 0..) |x, i| {
+        run += x;
+        try testing.expectEqual(run, sum.rows[i][1].float);
+        try testing.expectEqual(run / @as(f64, @floatFromInt(i + 1)), mean.rows[i][1].float);
+        try testing.expectEqual(@as(f64, 2), mn.rows[i][1].float); // 2 is first and smallest
+        try testing.expectEqual(x, mx.rows[i][1].float); // ascending input
+    }
+    // std: row 0 → 0 (rolling's convention); the last row is the textbook
+    // sample sd sqrt(32/7); every row matches the two-pass stdSample of its prefix.
+    const sd = try expanding(a, d, .{ .value_col = "v", .out = "o", .func = .std_sample, .min_periods = 3 });
+    try testing.expect(sd.rows[0][1] == .null);
+    try testing.expect(sd.rows[1][1] == .null);
+    for (2..xs.len) |i| try testing.expectApproxEqRel(stdSample(xs[0 .. i + 1]), sd.rows[i][1].float, 1e-12);
+    try testing.expectApproxEqRel(@sqrt(32.0 / 7.0), sd.rows[xs.len - 1][1].float, 1e-12);
+    const sd1 = try expanding(a, d, .{ .value_col = "v", .out = "o", .func = .std_sample, .min_periods = 0 });
+    try testing.expectEqual(@as(f64, 0), sd1.rows[0][1].float);
+    // A falling series moves the running min.
+    const down = [_][]const Value{ &.{.{ .float = 3 }}, &.{.{ .float = 1 }}, &.{.{ .float = 2 }} };
+    const dmin = try expanding(a, dsOf(&cols, &down), .{ .value_col = "v", .out = "o", .func = .min });
+    try testing.expectEqual(@as(f64, 1), dmin.rows[2][1].float);
+    const dmax = try expanding(a, dsOf(&cols, &down), .{ .value_col = "v", .out = "o", .func = .max });
+    try testing.expectEqual(@as(f64, 3), dmax.rows[2][1].float);
+}
+
+test "edge cases the mutation run asked for (series)" {
+    var f = Fix.init();
+    defer f.deinit();
+    // window 0 has no history to aggregate: every row null, not 0/0.
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+    const rows = [_][]const Value{ &.{.{ .float = 1 }}, &.{.{ .float = 2 }} };
+    const out = try rolling(f.a(), dsOf(&cols, &rows), .{ .value_col = "v", .out = "r", .window = 0 });
+    for (out.rows) |r| try testing.expect(r[1] == .null);
+    // Fewer than two values: 0 by this module's convention, not NaN.
+    try testing.expectEqual(@as(f64, 0), stdSample(&.{5}));
+    try testing.expectEqual(@as(f64, 0), stdSample(&.{}));
 }

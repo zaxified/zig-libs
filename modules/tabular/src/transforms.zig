@@ -7,7 +7,8 @@
 //!
 //! T0 set: map · aggregate(+fx) · weighted_group_sum(+fx) · sort (multi-key) ·
 //! top_n / top_n_with_tail · page · pivot (numeric-aware col ordering) ·
-//! unpivot · resample · reduce · clamp_range · format.
+//! unpivot · resample · reduce · clamp_range · format · filter / filterBy ·
+//! select / drop / rename · dropna / fillna.
 //!
 //! `fx-convert-before-sum` is first-class on aggregate/weighted_group_sum — the
 //! recurring multi-currency correctness fix (a null per-row rate means 1.0).
@@ -61,7 +62,19 @@ pub const Operand = union(enum) {
     num: f64,
 };
 
-pub const BinOp = enum { add, sub, mul, div };
+/// `abs` and `sqrt` are unary: they read `lhs` and ignore `rhs`.
+pub const BinOp = enum { add, sub, mul, div, min, max, abs, sqrt };
+
+/// What `map` writes when an operand is missing (null or non-numeric) or the
+/// result is undefined (`div` by zero, `sqrt` of a negative number).
+pub const OnMissing = enum {
+    /// A missing operand reads as 0 and an undefined result is 0 — the
+    /// historical behaviour, kept as the default.
+    zero,
+    /// Null in, null out; an undefined result is null (SQL's rule, and
+    /// pandas' NaN propagation).
+    null,
+};
 
 pub const MapSpec = struct {
     /// Name of the appended column.
@@ -69,18 +82,22 @@ pub const MapSpec = struct {
     out_type: ColumnType = .float,
     lhs: Operand,
     op: BinOp,
-    rhs: Operand,
+    /// Ignored by the unary ops (`abs`, `sqrt`).
+    rhs: Operand = .{ .num = 0 },
+    on_missing: OnMissing = .zero,
 };
 
 /// Append `out = lhs op rhs` as a new float column (per-row arithmetic:
 /// pl = mv - cost, base = gross * fx, …). Multi-term expressions compose via
-/// successive `map` steps.
+/// successive `map` steps. `min`/`max` follow IEEE `@min`/`@max` (a NaN
+/// operand loses to a number).
 pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
     const li: ?usize = switch (spec.lhs) {
         .col => |c| try mustIndex(d, c),
         .num => null,
     };
-    const rgi: ?usize = switch (spec.rhs) {
+    const unary = spec.op == .abs or spec.op == .sqrt;
+    const rgi: ?usize = if (unary) null else switch (spec.rhs) {
         .col => |c| try mustIndex(d, c),
         .num => null,
     };
@@ -90,31 +107,58 @@ pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
     cols[d.columns.len] = .{ .name = spec.out, .type = spec.out_type };
 
     const rows = try a.alloc([]const Value, d.rows.len);
+    const missing: Value = if (spec.on_missing == .null) .null else .{ .float = 0 };
     for (d.rows, 0..) |r, ri| {
-        const lv = if (li) |i| (r[i].asFloat() orelse 0) else spec.lhs.num;
-        const rv = if (rgi) |i| (r[i].asFloat() orelse 0) else spec.rhs.num;
-        const out: f64 = switch (spec.op) {
-            .add => lv + rv,
-            .sub => lv - rv,
-            .mul => lv * rv,
-            .div => if (rv == 0) 0 else lv / rv,
-        };
         const nr = try a.alloc(Value, cols.len);
         @memcpy(nr[0..d.columns.len], r);
-        nr[d.columns.len] = .{ .float = out };
         rows[ri] = nr;
+        const lo: ?f64 = if (li) |i| r[i].asFloat() else spec.lhs.num;
+        const ro: ?f64 = if (unary) 0 else if (rgi) |i| r[i].asFloat() else spec.rhs.num;
+        if (spec.on_missing == .null and (lo == null or ro == null)) {
+            nr[d.columns.len] = .null;
+            continue;
+        }
+        const lv = lo orelse 0;
+        const rv = ro orelse 0;
+        nr[d.columns.len] = switch (spec.op) {
+            .add => .{ .float = lv + rv },
+            .sub => .{ .float = lv - rv },
+            .mul => .{ .float = lv * rv },
+            .div => if (rv == 0) missing else .{ .float = lv / rv },
+            .min => .{ .float = @min(lv, rv) },
+            .max => .{ .float = @max(lv, rv) },
+            .abs => .{ .float = @abs(lv) },
+            .sqrt => if (lv < 0) missing else .{ .float = @sqrt(lv) },
+        };
     }
     return .{ .columns = cols, .rows = rows };
 }
 
 // ── aggregate (+fx) ─────────────────────────────────────────────────────────
 
-pub const AggFn = enum { sum, mean, count, min, max, first, last };
+/// `sum`/`mean`/`count` count every row of the group (a null or non-numeric
+/// cell adds 0 to `sum` and 1 to `count` — historical behaviour, unlike
+/// pandas' skip-NA). The statistics added 2026-10-04 skip MISSING values
+/// (null, non-numeric, NaN), as pandas does by default:
+///   `std`/`var` — sample (n−1, pandas' default `ddof=1`), null below 2 values;
+///   `median`, `quantile` (`AggCol.q`) — linear interpolation between order
+///     statistics (numpy/pandas default, Hyndman–Fan type 7), null when empty;
+///   `nunique` — distinct non-missing values of any kind, text included
+///     (pandas `nunique()`, `dropna=True`); int 1 and float 1.0 are one value, text
+///     "1" another; a `.decimal` keys on its raw i128, so decimal 1 and int 1
+///     count twice;
+///   `sum_exact` — i128 sum at `dataset.decimal_scale`, output `.decimal`:
+///     `.decimal` cells exactly, `.int` cells exactly (× scale), `.float` cells
+///     through `Value.cast(.decimal)`; null if the total overflows i128.
+pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact };
 
 pub const AggCol = struct {
     src: []const u8,
     out: []const u8,
     func: AggFn,
+    /// Probability for `func = .quantile`, in [0, 1]; anything else (or NaN)
+    /// gives null. Ignored by the other functions.
+    q: f64 = 0.5,
 };
 
 pub const FxConvert = struct {
@@ -136,17 +180,68 @@ const Acc = struct {
     max: ?Value = null,
     first: ?Value = null,
     last: ?Value = null,
+    // Over non-missing numeric values only (Welford's update: stable where
+    // the textbook Σx² − n·mean² cancels catastrophically).
+    n_num: u64 = 0,
+    mean: f64 = 0,
+    m2: f64 = 0,
+    exact: i128 = 0,
+    exact_overflow: bool = false,
+    /// Kept only for the functions that need every value.
+    vals: std.ArrayList(f64) = .empty,
+    distinct: std.StringHashMapUnmanaged(void) = .empty,
+    keep_vals: bool = false,
+    keep_distinct: bool = false,
 
-    fn observe(self: *Acc, v: Value) void {
+    fn forFunc(func: AggFn) Acc {
+        return .{
+            .keep_vals = func == .median or func == .quantile,
+            .keep_distinct = func == .nunique,
+        };
+    }
+
+    /// `v` is the cell after any fx conversion, `raw` the cell as stored and
+    /// `rate` the fx rate applied (1 without fx): `sum_exact` uses `raw` when
+    /// the rate is exactly 1, so a null rate keeps a decimal exact.
+    fn observe(self: *Acc, a: std.mem.Allocator, v: Value, raw: Value, rate: f64) Error!void {
         self.count += 1;
         self.sum += v.asFloat() orelse 0;
         if (self.first == null) self.first = v;
         self.last = v;
         if (self.min == null or v.order(self.min.?) == .lt) self.min = v;
         if (self.max == null or v.order(self.max.?) == .gt) self.max = v;
+
+        if (isMissing(v)) return; // null, NaN: missing, as in pandas
+        if (self.keep_distinct) {
+            // Kind first: the group-key text alone makes text "1" and int 1
+            // the same key.
+            var buf: std.ArrayList(u8) = .empty;
+            try buf.append(a, @intFromEnum(kindOf(v)));
+            try appendValueKey(a, &buf, v);
+            try self.distinct.put(a, try buf.toOwnedSlice(a), {});
+        }
+        const x = v.asFloat() orelse return; // text / bool: not a number
+        self.n_num += 1;
+        const delta = x - self.mean;
+        self.mean += delta / @as(f64, @floatFromInt(self.n_num));
+        self.m2 += delta * (x - self.mean);
+
+        const term: ?i128 = switch (if (rate == 1) raw else v) {
+            .decimal => |r| r,
+            .int => |i| @as(i128, i) * ds.decimal_scale, // |i| < 2^63, scale < 2^40: fits
+            .float => if (v.cast(.decimal)) |c| c.decimal else null,
+            else => null,
+        };
+        if (term) |t| {
+            // Sticky: once the running total has left i128, no later term can
+            // make the result trustworthy again.
+            const r = @addWithOverflow(self.exact, t);
+            if (r[1] != 0) self.exact_overflow = true else self.exact = r[0];
+        }
+        if (self.keep_vals) try self.vals.append(a, x);
     }
 
-    fn result(self: Acc, func: AggFn) Value {
+    fn result(self: Acc, func: AggFn, q: f64) Value {
         return switch (func) {
             .sum => .{ .float = self.sum },
             .mean => .{ .float = if (self.count == 0) 0 else self.sum / @as(f64, @floatFromInt(self.count)) },
@@ -155,9 +250,26 @@ const Acc = struct {
             .max => self.max orelse .null,
             .first => self.first orelse .null,
             .last => self.last orelse .null,
+            .@"var" => if (self.n_num < 2) .null else .{ .float = self.m2 / @as(f64, @floatFromInt(self.n_num - 1)) },
+            .std => if (self.n_num < 2) .null else .{ .float = @sqrt(self.m2 / @as(f64, @floatFromInt(self.n_num - 1))) },
+            .median => quantileOf(self.vals.items, 0.5),
+            .quantile => quantileOf(self.vals.items, q),
+            .nunique => .{ .int = @intCast(self.distinct.count()) },
+            .sum_exact => if (self.exact_overflow) .null else .{ .decimal = self.exact },
         };
     }
 };
+
+/// Type-7 quantile (linear interpolation between the order statistics at
+/// h = (n−1)·q): numpy's and pandas' default. Sorts `xs` in place.
+fn quantileOf(xs: []f64, q: f64) Value {
+    if (xs.len == 0 or !(q >= 0 and q <= 1)) return .null;
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
+    const lo: usize = @intFromFloat(@floor(h));
+    const hi = @min(lo + 1, xs.len - 1);
+    return .{ .float = xs[lo] + (h - @floor(h)) * (xs[hi] - xs[lo]) };
+}
 
 const Group = struct {
     keys: []Value, // group-by key values (from the first row seen)
@@ -179,7 +291,7 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
             const keys = try a.alloc(Value, gidx.len);
             for (gidx, 0..) |ci, i| keys[i] = r[ci];
             const accs = try a.alloc(Acc, spec.aggs.len);
-            @memset(accs, .{});
+            for (accs, spec.aggs) |*acc, ag| acc.* = .forFunc(ag.func);
             gop.value_ptr.* = .{ .keys = keys, .accs = accs };
         }
         const rate = fxRate(r, rate_idx);
@@ -188,7 +300,7 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
             if (rate_idx != null) {
                 if (v.asFloat()) |f| v = .{ .float = f * rate };
             }
-            gop.value_ptr.accs[i].observe(v);
+            try gop.value_ptr.accs[i].observe(a, v, r[ci], rate);
         }
     }
 
@@ -206,7 +318,7 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
         const g = kv.value_ptr.*;
         const nr = try a.alloc(Value, cols.len);
         for (g.keys, 0..) |kvv, i| nr[i] = kvv;
-        for (spec.aggs, 0..) |ag, i| nr[gidx.len + i] = g.accs[i].result(ag.func);
+        for (spec.aggs, 0..) |ag, i| nr[gidx.len + i] = g.accs[i].result(ag.func, ag.q);
         rows[ri] = nr;
     }
     return .{ .columns = cols, .rows = rows };
@@ -214,8 +326,9 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
 
 fn aggOutType(d: Dataset, src_idx: usize, func: AggFn) ColumnType {
     return switch (func) {
-        .sum, .mean => .float,
-        .count => .int,
+        .sum, .mean, .std, .@"var", .median, .quantile => .float,
+        .count, .nunique => .int,
+        .sum_exact => .decimal,
         .min, .max, .first, .last => d.columns[src_idx].type,
     };
 }
@@ -417,6 +530,8 @@ pub const PivotSpec = struct {
     col_key: []const u8,
     value_col: []const u8,
     agg: AggFn = .sum,
+    /// Probability when `agg = .quantile`.
+    q: f64 = 0.5,
 };
 
 /// rowKey × colKey → agg(value) matrix (month×year heatmaps, …). Output: first
@@ -438,8 +553,8 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         try col_keys.put(a, ck, {});
         const ckey = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ rk, ck });
         const cop = try cells.getOrPut(a, ckey);
-        if (!cop.found_existing) cop.value_ptr.* = .{};
-        cop.value_ptr.observe(r[vi]);
+        if (!cop.found_existing) cop.value_ptr.* = .forFunc(spec.agg);
+        try cop.value_ptr.observe(a, r[vi], r[vi], 1);
     }
 
     // sorted distinct column keys — numeric-aware when EVERY key parses as a
@@ -466,7 +581,7 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         const rk = kv.key_ptr.*;
         for (col_list, 0..) |ck, ci| {
             const ckey = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ rk, ck });
-            nr[1 + ci] = if (cells.get(ckey)) |acc| acc.result(spec.agg) else .null;
+            nr[1 + ci] = if (cells.get(ckey)) |acc| acc.result(spec.agg, spec.q) else .null;
         }
         rows[ri] = nr;
     }
@@ -596,8 +711,7 @@ pub fn resample(a: std.mem.Allocator, d: Dataset, spec: ResampleSpec) Error!Data
 
     var buckets: std.StringArrayHashMapUnmanaged(ResAcc) = .empty;
     for (d.rows) |r| {
-        const dt_text = r[di].asText() orelse continue;
-        const date = ds.parseIsoDate(dt_text) orelse continue;
+        const date = rowDate(d, di, r) orelse continue;
         const label = try bucketLabel(a, date, spec.freq);
         const bop = try buckets.getOrPut(a, label);
         if (!bop.found_existing) bop.value_ptr.* = .{};
@@ -632,6 +746,14 @@ fn bucketLabel(a: std.mem.Allocator, date: ds.Date, freq: Freq) Error![]const u8
     };
 }
 
+/// The calendar date (UTC) of a row's date cell: ISO text in any column, or —
+/// in a `.timestamp` column — an `.int` of microseconds since the epoch.
+fn rowDate(d: Dataset, di: usize, r: []const Value) ?ds.Date {
+    if (d.columns[di].type == .timestamp and r[di] == .int)
+        return ds.Date.fromOrdinal(@divFloor(r[di].int, 86_400 * ds.timestamp_units_per_second));
+    return ds.parseIsoDate(r[di].asText() orelse return null);
+}
+
 // ── reduce ──────────────────────────────────────────────────────────────────
 
 /// KPI reduction: aggregate the whole table into a single row (aggregate with no
@@ -658,14 +780,227 @@ pub fn clampRange(a: std.mem.Allocator, d: Dataset, spec: ClampRangeSpec) Error!
 
     var kept: std.ArrayList([]const Value) = .empty;
     for (d.rows) |r| {
-        const dt_text = r[di].asText() orelse continue;
-        const date = ds.parseIsoDate(dt_text) orelse continue;
+        const date = rowDate(d, di, r) orelse continue;
         const o = date.ordinal();
         if (from_ord) |f| if (o < f) continue;
         if (to_ord) |t| if (o > t) continue;
         try kept.append(a, r);
     }
     return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
+}
+
+// ── filter ──────────────────────────────────────────────────────────────────
+
+pub const CmpOp = enum { eq, ne, lt, le, gt, ge, is_null, not_null };
+
+/// `col op value`. A MISSING cell (null, or a NaN float) satisfies only
+/// `is_null` — every comparison against it is false, `ne` included (SQL's
+/// three-valued rule: an absent value is not "different", it is unknown).
+/// A comparison needs comparable kinds: number with number (int/float/decimal
+/// by value, two decimals exactly), text with text (bytewise, so ISO dates
+/// order correctly), bool with bool. A cell of another kind than `value`
+/// matches nothing — a numeric cell never equals a text literal.
+pub const Predicate = struct {
+    col: []const u8,
+    op: CmpOp,
+    /// Ignored by `is_null` / `not_null`.
+    value: Value = .null,
+};
+
+pub const FilterSpec = struct {
+    where: []const Predicate,
+    /// `.all`: a row is kept when every predicate holds (AND; an empty
+    /// `where` keeps every row). `.any`: when at least one holds (OR; an
+    /// empty `where` keeps none).
+    mode: enum { all, any } = .all,
+};
+
+fn isMissing(v: Value) bool {
+    return v == .null or (v == .float and std.math.isNan(v.float));
+}
+
+fn kindOf(v: Value) enum { number, text, bool, other } {
+    return switch (v) {
+        .int, .float, .decimal => .number,
+        .text => .text,
+        .bool => .bool,
+        .null => .other,
+    };
+}
+
+fn holds(p: Predicate, cell: Value) bool {
+    const missing = isMissing(cell);
+    switch (p.op) {
+        .is_null => return missing,
+        .not_null => return !missing,
+        else => {},
+    }
+    if (missing or isMissing(p.value)) return false;
+    if (kindOf(cell) != kindOf(p.value)) return false;
+    const o = cell.order(p.value);
+    return switch (p.op) {
+        .eq => o == .eq,
+        .ne => o != .eq,
+        .lt => o == .lt,
+        .le => o != .gt,
+        .gt => o == .gt,
+        .ge => o != .lt,
+        .is_null, .not_null => unreachable,
+    };
+}
+
+/// Keep the rows satisfying `spec` (rows are borrowed, not copied).
+pub fn filter(a: std.mem.Allocator, d: Dataset, spec: FilterSpec) Error!Dataset {
+    const idxs = try a.alloc(usize, spec.where.len);
+    for (spec.where, 0..) |p, i| idxs[i] = try mustIndex(d, p.col);
+    var kept: std.ArrayList([]const Value) = .empty;
+    for (d.rows) |r| {
+        const keep = switch (spec.mode) {
+            .all => blk: {
+                for (spec.where, idxs) |p, ci| if (!holds(p, r[ci])) break :blk false;
+                break :blk true;
+            },
+            .any => blk: {
+                for (spec.where, idxs) |p, ci| if (holds(p, r[ci])) break :blk true;
+                break :blk false;
+            },
+        };
+        if (keep) try kept.append(a, r);
+    }
+    return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
+}
+
+/// Keep the rows for which `predicate(context, row)` is true — the escape
+/// hatch for any logic `filter`'s spec cannot say. Rows are borrowed.
+pub fn filterBy(
+    a: std.mem.Allocator,
+    d: Dataset,
+    context: anytype,
+    comptime predicate: fn (@TypeOf(context), []const Value) bool,
+) Error!Dataset {
+    var kept: std.ArrayList([]const Value) = .empty;
+    for (d.rows) |r| if (predicate(context, r)) try kept.append(a, r);
+    return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
+}
+
+// ── select / drop / rename ──────────────────────────────────────────────────
+
+/// `select`/`rename`'s error set: a result with two columns of the same name
+/// is refused, since `Dataset.columnIndex` would only ever find the first.
+pub const ColumnsError = Error || error{DuplicateColumn};
+
+fn project(a: std.mem.Allocator, d: Dataset, idxs: []const usize) Error!Dataset {
+    const cols = try a.alloc(Column, idxs.len);
+    for (idxs, 0..) |ci, i| cols[i] = d.columns[ci];
+    const rows = try a.alloc([]const Value, d.rows.len);
+    for (d.rows, 0..) |r, ri| {
+        const nr = try a.alloc(Value, idxs.len);
+        for (idxs, 0..) |ci, i| nr[i] = r[ci];
+        rows[ri] = nr;
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
+/// Keep exactly `names`, in that order.
+pub fn select(a: std.mem.Allocator, d: Dataset, names: []const []const u8) ColumnsError!Dataset {
+    const idxs = try a.alloc(usize, names.len);
+    for (names, 0..) |n, i| {
+        for (names[0..i]) |prev| if (std.mem.eql(u8, prev, n)) return error.DuplicateColumn;
+        idxs[i] = try mustIndex(d, n);
+    }
+    return project(a, d, idxs);
+}
+
+/// Remove `names` (each must exist); the rest keep their order.
+pub fn drop(a: std.mem.Allocator, d: Dataset, names: []const []const u8) Error!Dataset {
+    const gone = try a.alloc(bool, d.columns.len);
+    @memset(gone, false);
+    for (names) |n| gone[try mustIndex(d, n)] = true;
+    var idxs: std.ArrayList(usize) = .empty;
+    for (gone, 0..) |g, ci| if (!g) try idxs.append(a, ci);
+    return project(a, d, idxs.items);
+}
+
+pub const Rename = struct { from: []const u8, to: []const u8 };
+
+/// Rename columns; rows are shared with `d` (only the schema is new). Each
+/// `from` must exist; renames apply simultaneously (`a→b, b→a` swaps).
+pub fn rename(a: std.mem.Allocator, d: Dataset, renames: []const Rename) ColumnsError!Dataset {
+    const cols = try a.dupe(Column, d.columns);
+    const touched = try a.alloc(bool, d.columns.len);
+    @memset(touched, false);
+    for (renames) |rn| {
+        const ci = try mustIndex(d, rn.from);
+        if (touched[ci]) return error.DuplicateColumn; // the same column renamed twice
+        touched[ci] = true;
+        cols[ci].name = rn.to;
+    }
+    for (cols, 0..) |c, i| {
+        if (!touched[i]) continue;
+        for (cols, 0..) |o, j| if (i != j and std.mem.eql(u8, c.name, o.name)) return error.DuplicateColumn;
+    }
+    return .{ .columns = cols, .rows = d.rows };
+}
+
+// ── dropna / fillna ─────────────────────────────────────────────────────────
+
+/// Missing = null, or a NaN float (pandas' `isna`).
+pub const DropNaSpec = struct {
+    /// Columns to inspect; empty = every column.
+    subset: []const []const u8 = &.{},
+    /// `.any`: drop a row with any missing cell in `subset`; `.all`: only a
+    /// row whose `subset` cells are all missing.
+    how: enum { any, all } = .any,
+};
+
+fn subsetIdxs(a: std.mem.Allocator, d: Dataset, subset: []const []const u8) Error![]const usize {
+    const n = if (subset.len == 0) d.columns.len else subset.len;
+    const idxs = try a.alloc(usize, n);
+    for (idxs, 0..) |*ix, i| ix.* = if (subset.len == 0) i else try mustIndex(d, subset[i]);
+    return idxs;
+}
+
+pub fn dropna(a: std.mem.Allocator, d: Dataset, spec: DropNaSpec) Error!Dataset {
+    const idxs = try subsetIdxs(a, d, spec.subset);
+    var kept: std.ArrayList([]const Value) = .empty;
+    for (d.rows) |r| {
+        var n_missing: usize = 0;
+        for (idxs) |ci| n_missing += @intFromBool(isMissing(r[ci]));
+        const drop_row = switch (spec.how) {
+            .any => n_missing > 0,
+            .all => n_missing == idxs.len and idxs.len > 0,
+        };
+        if (!drop_row) try kept.append(a, r);
+    }
+    return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
+}
+
+pub const FillNaSpec = struct {
+    /// Columns to fill; empty = every column.
+    subset: []const []const u8 = &.{},
+    /// Written into every missing cell as is — the column's declared type is
+    /// not changed, so fill a `.float` column with a `.float`.
+    value: Value,
+};
+
+/// Replace missing cells (null, NaN). Rows without a missing cell in `subset`
+/// are shared with `d`, not copied.
+pub fn fillna(a: std.mem.Allocator, d: Dataset, spec: FillNaSpec) Error!Dataset {
+    const idxs = try subsetIdxs(a, d, spec.subset);
+    const rows = try a.alloc([]const Value, d.rows.len);
+    for (d.rows, 0..) |r, ri| {
+        rows[ri] = r;
+        for (idxs) |ci| {
+            if (!isMissing(r[ci])) continue;
+            const nr = try a.dupe(Value, r);
+            for (idxs) |cj| if (isMissing(nr[cj])) {
+                nr[cj] = spec.value;
+            };
+            rows[ri] = nr;
+            break;
+        }
+    }
+    return .{ .columns = d.columns, .rows = rows };
 }
 
 // ── format ──────────────────────────────────────────────────────────────────
@@ -1168,4 +1503,387 @@ test "format: kinds" {
     try testing.expectEqualStrings("+5.00", try format(f.a(), 5, .{ .kind = .signed }));
     try testing.expectEqualStrings("-5.00", try format(f.a(), -5, .{ .kind = .signed }));
     try testing.expectEqualStrings("1.50M", try format(f.a(), 1_500_000, .{ .kind = .compact, .decimals = 2 }));
+}
+
+// ── 2026-10-04: filter / columns / NA / map ops / statistics ────────────────
+
+const nan = std.math.nan(f64);
+
+const filt_cols = [_]Column{ .{ .name = "x", .type = .float }, .{ .name = "s", .type = .text } };
+const filt_rows = [_][]const Value{
+    &.{ .{ .float = 1 }, .{ .text = "a" } },
+    &.{ .null, .{ .text = "b" } },
+    &.{ .{ .float = 3 }, .null },
+    &.{ .{ .float = nan }, .{ .text = "a" } },
+    &.{ .{ .int = 5 }, .{ .text = "c" } },
+};
+const filt_ds: Dataset = .{ .columns = &filt_cols, .rows = &filt_rows };
+
+fn keptRows(d: Dataset) [8]usize {
+    // Index of each kept row in `filt_rows` (they are borrowed, so pointer
+    // identity tells which), padded with maxInt.
+    var out = [_]usize{std.math.maxInt(usize)} ** 8;
+    for (d.rows, 0..) |r, i| {
+        for (filt_rows, 0..) |orig, j| if (r.ptr == orig.ptr) {
+            out[i] = j;
+        };
+    }
+    return out;
+}
+
+fn expectKept(d: Dataset, want: []const usize) !void {
+    try testing.expectEqual(want.len, d.rows.len);
+    const got = keptRows(d);
+    try testing.expectEqualSlices(usize, want, got[0..want.len]);
+}
+
+test "filter: SQL three-valued rule — a missing cell (null or NaN) matches only is_null" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    // x > 2: 3 and the int 5 (int and float compare by value).
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .gt, .value = .{ .float = 2 } }} }), &.{ 2, 4 });
+    // x != 1: NOT the null row and NOT the NaN row — unknown is not "different".
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .ne, .value = .{ .int = 1 } }} }), &.{ 2, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .is_null }} }), &.{ 1, 3 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .not_null }} }), &.{ 0, 2, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .le, .value = .{ .float = 3 } }} }), &.{ 0, 2 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .ge, .value = .{ .float = 3 } }} }), &.{ 2, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .lt, .value = .{ .float = 3 } }} }), &.{0});
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .eq, .value = .{ .float = 3 } }} }), &.{2});
+    // Text compares bytewise; a number never equals text, either way round.
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "s", .op = .eq, .value = .{ .text = "a" } }} }), &.{ 0, 3 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "s", .op = .gt, .value = .{ .text = "a" } }} }), &.{ 1, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .eq, .value = .{ .text = "1" } }} }), &.{});
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .ne, .value = .{ .text = "1" } }} }), &.{});
+    // A null literal compares with nothing.
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .ne }} }), &.{});
+    // AND / OR, and the empty identities (all-of-nothing = true, any-of-nothing = false).
+    const two = [_]Predicate{
+        .{ .col = "x", .op = .lt, .value = .{ .float = 2 } },
+        .{ .col = "s", .op = .eq, .value = .{ .text = "c" } },
+    };
+    try expectKept(try filter(a, filt_ds, .{ .where = &two, .mode = .any }), &.{ 0, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &two }), &.{});
+    const both = [_]Predicate{
+        .{ .col = "x", .op = .not_null },
+        .{ .col = "s", .op = .eq, .value = .{ .text = "a" } },
+    };
+    try expectKept(try filter(a, filt_ds, .{ .where = &both }), &.{0});
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{} }), &.{ 0, 1, 2, 3, 4 });
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{}, .mode = .any }), &.{});
+    try testing.expectError(error.NoSuchColumn, filter(a, filt_ds, .{ .where = &.{.{ .col = "nope", .op = .is_null }} }));
+    // Two decimals one raw unit apart are different values; f64 could not tell.
+    const dc = [_]Column{.{ .name = "m", .type = .decimal }};
+    const dr = [_][]const Value{ &.{.{ .decimal = (1 << 60) + 1 }}, &.{.{ .decimal = 1 << 60 }} };
+    const dd = try filter(a, .{ .columns = &dc, .rows = &dr }, .{ .where = &.{.{ .col = "m", .op = .gt, .value = .{ .decimal = 1 << 60 } }} });
+    try testing.expectEqual(@as(usize, 1), dd.rows.len);
+    try testing.expectEqual(@as(i128, (1 << 60) + 1), dd.rows[0][0].decimal);
+}
+
+fn evenX(min: f64, row: []const Value) bool {
+    const x = row[0].asFloat() orelse return false;
+    return x >= min and @mod(x, 2) == 1;
+}
+
+test "filterBy: arbitrary predicate with context" {
+    var f = Fix.init();
+    defer f.deinit();
+    try expectKept(try filterBy(f.a(), filt_ds, @as(f64, 2), evenX), &.{ 2, 4 });
+}
+
+test "select / drop / rename" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{ .{ .name = "a", .type = .int }, .{ .name = "b", .type = .text }, .{ .name = "c", .type = .float } };
+    const rows = [_][]const Value{&.{ .{ .int = 1 }, .{ .text = "x" }, .{ .float = 2.5 } }};
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    const s1 = try select(a, d, &.{ "c", "a" });
+    try testing.expectEqual(@as(usize, 2), s1.columns.len);
+    try testing.expectEqualStrings("c", s1.columns[0].name);
+    try testing.expectEqual(ColumnType.float, s1.columns[0].type);
+    try testing.expectEqual(@as(f64, 2.5), s1.rows[0][0].float);
+    try testing.expectEqual(@as(i64, 1), s1.rows[0][1].int);
+    try testing.expectError(error.DuplicateColumn, select(a, d, &.{ "a", "a" }));
+    try testing.expectError(error.NoSuchColumn, select(a, d, &.{"z"}));
+
+    const d1 = try drop(a, d, &.{"b"});
+    try testing.expectEqual(@as(usize, 2), d1.columns.len);
+    try testing.expectEqualStrings("a", d1.columns[0].name);
+    try testing.expectEqualStrings("c", d1.columns[1].name);
+    try testing.expectEqual(@as(f64, 2.5), d1.rows[0][1].float);
+    try testing.expectError(error.NoSuchColumn, drop(a, d, &.{"z"}));
+    try testing.expectEqual(@as(usize, 0), (try drop(a, d, &.{ "a", "b", "c" })).columns.len);
+
+    // Simultaneous: a<->b swaps names, the cells stay where they were.
+    const r1 = try rename(a, d, &.{ .{ .from = "a", .to = "b" }, .{ .from = "b", .to = "a" } });
+    try testing.expectEqualStrings("b", r1.columns[0].name);
+    try testing.expectEqualStrings("a", r1.columns[1].name);
+    try testing.expectEqual(ColumnType.int, r1.columns[0].type);
+    try testing.expect(r1.rows.ptr == d.rows.ptr); // rows shared, only the schema is new
+    try testing.expectEqualStrings("a", d.columns[0].name); // input untouched
+    try testing.expectError(error.DuplicateColumn, rename(a, d, &.{.{ .from = "a", .to = "c" }}));
+    try testing.expectError(error.DuplicateColumn, rename(a, d, &.{ .{ .from = "a", .to = "p" }, .{ .from = "a", .to = "q" } }));
+    try testing.expectError(error.NoSuchColumn, rename(a, d, &.{.{ .from = "z", .to = "y" }}));
+    // Renaming to its own name is not a collision.
+    _ = try rename(a, d, &.{.{ .from = "a", .to = "a" }});
+}
+
+test "dropna / fillna: null and NaN are missing" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    try expectKept(try dropna(a, filt_ds, .{}), &.{ 0, 4 });
+    try expectKept(try dropna(a, filt_ds, .{ .subset = &.{"x"} }), &.{ 0, 2, 4 });
+    try expectKept(try dropna(a, filt_ds, .{ .subset = &.{"s"} }), &.{ 0, 1, 3, 4 });
+    // how=all: no row here has BOTH cells missing.
+    try expectKept(try dropna(a, filt_ds, .{ .how = .all }), &.{ 0, 1, 2, 3, 4 });
+    const allnull = [_][]const Value{ &.{ .null, .null }, &.{ .{ .float = nan }, .{ .text = "k" } } };
+    try testing.expectEqual(@as(usize, 1), (try dropna(a, .{ .columns = &filt_cols, .rows = &allnull }, .{ .how = .all })).rows.len);
+    try testing.expectError(error.NoSuchColumn, dropna(a, filt_ds, .{ .subset = &.{"z"} }));
+
+    const filled = try fillna(a, filt_ds, .{ .subset = &.{"x"}, .value = .{ .float = 0 } });
+    try testing.expectEqual(@as(usize, 5), filled.rows.len);
+    try testing.expectEqual(@as(f64, 0), filled.rows[1][0].float);
+    try testing.expectEqual(@as(f64, 0), filled.rows[3][0].float); // NaN filled too
+    try testing.expect(filled.rows[2][1] == .null); // outside the subset
+    try testing.expect(filled.rows[0].ptr == filt_rows[0].ptr); // untouched rows shared
+    try testing.expect(filled.rows[1].ptr != filt_rows[1].ptr);
+    try testing.expect(filt_rows[1][0] == .null); // input not mutated
+    const all = try fillna(a, filt_ds, .{ .value = .{ .text = "?" } });
+    try testing.expectEqualStrings("?", all.rows[2][1].text);
+    try testing.expectEqualStrings("?", all.rows[1][0].text);
+}
+
+test "map: abs / sqrt / min / max, and on_missing" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{ .{ .name = "x", .type = .float }, .{ .name = "y", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .float = -4 }, .{ .float = 1 } },
+        &.{ .{ .float = 9 }, .{ .float = 2 } },
+        &.{ .null, .{ .float = 3 } },
+        &.{ .{ .float = 6 }, .{ .float = 0 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const Case = struct { op: BinOp, zero: [4]?f64, nul: [4]?f64 };
+    const cases = [_]Case{
+        // abs ignores rhs; null reads as 0 under .zero.
+        .{ .op = .abs, .zero = .{ 4, 9, 0, 6 }, .nul = .{ 4, 9, null, 6 } },
+        // sqrt(-4) has no real root: 0 / null; sqrt(9) = 3, sqrt(6) = 2.449…
+        .{ .op = .sqrt, .zero = .{ 0, 3, 0, @sqrt(6.0) }, .nul = .{ null, 3, null, @sqrt(6.0) } },
+        .{ .op = .min, .zero = .{ -4, 2, 0, 0 }, .nul = .{ -4, 2, null, 0 } },
+        .{ .op = .max, .zero = .{ 1, 9, 3, 6 }, .nul = .{ 1, 9, null, 6 } },
+        // 6 / 0 is undefined: 0 (historical) or null.
+        .{ .op = .div, .zero = .{ -4, 4.5, 0, 0 }, .nul = .{ -4, 4.5, null, null } },
+    };
+    for (cases) |c| {
+        for ([_]OnMissing{ .zero, .null }) |om| {
+            const out = try map(a, d, .{ .out = "o", .lhs = .{ .col = "x" }, .op = c.op, .rhs = .{ .col = "y" }, .on_missing = om });
+            const want = if (om == .zero) c.zero else c.nul;
+            for (want, 0..) |w, i| {
+                const got = out.rows[i][2];
+                if (w) |wv| try testing.expectEqual(wv, got.float) else try testing.expect(got == .null);
+            }
+        }
+    }
+    // A unary op needs no rhs column — not even an existing one.
+    const u = try map(a, d, .{ .out = "o", .lhs = .{ .col = "x" }, .op = .abs, .rhs = .{ .col = "missing" } });
+    try testing.expectEqual(@as(f64, 4), u.rows[0][2].float);
+    try testing.expectError(error.NoSuchColumn, map(a, d, .{ .out = "o", .lhs = .{ .col = "x" }, .op = .min, .rhs = .{ .col = "missing" } }));
+}
+
+test "aggregate: std / var / median / quantile / nunique skip missing values" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    // Group "g": 2 4 4 4 5 5 7 9 plus a null, a NaN and a text cell. The
+    // eight numbers are the textbook example with population sd 2: Σ(x−5)² = 32,
+    // so the sample variance is 32/7.
+    const cols = [_]Column{ .{ .name = "k", .type = .text }, .{ .name = "v", .type = .float } };
+    var rows: std.ArrayList([]const Value) = .empty;
+    for ([_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 }) |x| try rows.append(a, try a.dupe(Value, &.{ .{ .text = "g" }, .{ .float = x } }));
+    try rows.append(a, try a.dupe(Value, &.{ .{ .text = "g" }, .null }));
+    try rows.append(a, try a.dupe(Value, &.{ .{ .text = "g" }, .{ .float = nan } }));
+    try rows.append(a, try a.dupe(Value, &.{ .{ .text = "g" }, .{ .text = "x" } }));
+    try rows.append(a, try a.dupe(Value, &.{ .{ .text = "h" }, .{ .int = 3 } }));
+    const d: Dataset = .{ .columns = &cols, .rows = rows.items };
+    const out = try aggregate(a, d, .{ .group_by = &.{"k"}, .aggs = &.{
+        .{ .src = "v", .out = "sd", .func = .std },
+        .{ .src = "v", .out = "var", .func = .@"var" },
+        .{ .src = "v", .out = "med", .func = .median },
+        .{ .src = "v", .out = "q25", .func = .quantile, .q = 0.25 },
+        .{ .src = "v", .out = "q90", .func = .quantile, .q = 0.9 },
+        .{ .src = "v", .out = "qbad", .func = .quantile, .q = 1.5 },
+        .{ .src = "v", .out = "qnan", .func = .quantile, .q = nan },
+        .{ .src = "v", .out = "nu", .func = .nunique },
+        .{ .src = "v", .out = "q0", .func = .quantile, .q = 0 },
+        .{ .src = "v", .out = "q1", .func = .quantile, .q = 1 },
+    } });
+    try testing.expectEqual(@as(usize, 2), out.rows.len);
+    const g = out.rows[0];
+    try testing.expectApproxEqRel(@sqrt(32.0 / 7.0), g[1].float, 1e-15);
+    try testing.expectApproxEqRel(32.0 / 7.0, g[2].float, 1e-15);
+    // Median of 8: mean of the 4th and 5th order statistics, (4 + 5) / 2.
+    try testing.expectEqual(@as(f64, 4.5), g[3].float);
+    // Type 7: h = 7·0.25 = 1.75 → x[1] + 0.75·(x[2] − x[1]) = 4 + 0.75·0 = 4.
+    try testing.expectEqual(@as(f64, 4), g[4].float);
+    // h = 7·0.9 = 6.3 → x[6] + 0.3·(x[7] − x[6]) = 7 + 0.3·2 = 7.6.
+    try testing.expectApproxEqAbs(@as(f64, 7.6), g[5].float, 1e-12);
+    try testing.expect(g[6] == .null);
+    try testing.expect(g[7] == .null);
+    // Distinct non-missing: 2 4 5 7 9 and the text "x" = 6 (null and NaN skipped).
+    try testing.expectEqual(@as(i64, 6), g[8].int);
+    try testing.expectEqual(@as(f64, 2), g[9].float);
+    try testing.expectEqual(@as(f64, 9), g[10].float);
+    // Group "h" has one value: no sample variance; the median is the value.
+    const h = out.rows[1];
+    try testing.expect(h[1] == .null);
+    try testing.expect(h[2] == .null);
+    try testing.expectEqual(@as(f64, 3), h[3].float);
+    try testing.expectEqual(@as(i64, 1), h[8].int);
+    try testing.expectEqual(ColumnType.float, out.columns[1].type);
+    try testing.expectEqual(ColumnType.int, out.columns[8].type);
+}
+
+test "aggregate: nunique keys by kind — text \"1\" is not the number 1, float 1.0 is" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{.{ .name = "v", .type = .text }};
+    const rows = [_][]const Value{ &.{.{ .text = "1" }}, &.{.{ .int = 1 }}, &.{.{ .float = 1.0 }}, &.{.null} };
+    const out = try reduce(a, .{ .columns = &cols, .rows = &rows }, &.{.{ .src = "v", .out = "n", .func = .nunique }});
+    try testing.expectEqual(@as(i64, 2), out.rows[0][0].int);
+}
+
+test "aggregate: sum_exact is i128 addition, null on overflow" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const tenth: i128 = @divExact(ds.decimal_scale, 10);
+    const cols = [_]Column{ .{ .name = "k", .type = .text }, .{ .name = "m", .type = .decimal }, .{ .name = "fx", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "a" }, .{ .decimal = tenth }, .null },
+        &.{ .{ .text = "a" }, .{ .decimal = tenth }, .null },
+        &.{ .{ .text = "a" }, .{ .decimal = tenth }, .null },
+        &.{ .{ .text = "a" }, .{ .int = 2 }, .null },
+        &.{ .{ .text = "a" }, .null, .null },
+        &.{ .{ .text = "b" }, .{ .decimal = std.math.maxInt(i128) }, .null },
+        &.{ .{ .text = "b" }, .{ .decimal = 1 }, .null },
+        &.{ .{ .text = "b" }, .{ .decimal = -5 }, .null },
+        &.{ .{ .text = "c" }, .{ .decimal = 3 * @divExact(ds.decimal_scale, 2) }, .{ .float = 2 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const out = try aggregate(a, d, .{ .group_by = &.{"k"}, .aggs = &.{
+        .{ .src = "m", .out = "exact", .func = .sum_exact },
+        .{ .src = "m", .out = "f64", .func = .sum },
+    } });
+    try testing.expectEqual(ColumnType.decimal, out.columns[1].type);
+    // 0.1 + 0.1 + 0.1 + 2 = 2.3 exactly; the null is skipped.
+    try testing.expectEqual(@as(i128, 23 * tenth), out.rows[0][1].decimal);
+    // Ten 0.1s: exactly 1 in i128; the f64 path gives Python's well-known
+    // sum([0.1] * 10) = 0.9999999999999999.
+    var ten: [10][]const Value = undefined;
+    for (&ten) |*r| r.* = &.{ .{ .text = "a" }, .{ .decimal = tenth }, .null };
+    const t = try aggregate(a, .{ .columns = &cols, .rows = &ten }, .{ .group_by = &.{"k"}, .aggs = &.{
+        .{ .src = "m", .out = "exact", .func = .sum_exact },
+        .{ .src = "m", .out = "f64", .func = .sum },
+    } });
+    try testing.expectEqual(ds.decimal_scale, t.rows[0][1].decimal);
+    try testing.expectEqual(@as(f64, 0.9999999999999999), t.rows[0][2].float);
+    // maxInt + 1 overflows; a later −5 must not "repair" it.
+    try testing.expect(out.rows[1][1] == .null);
+    // With fx: a null rate keeps decimals exact (groups a/b above went through
+    // the same code without fx); rate 2 goes through f64: 1.5 × 2 = 3 exactly.
+    const fxd = try aggregate(a, d, .{ .group_by = &.{"k"}, .aggs = &.{.{ .src = "m", .out = "exact", .func = .sum_exact }}, .fx = .{ .rate_col = "fx" } });
+    try testing.expectEqual(@as(i128, 23 * tenth), fxd.rows[0][1].decimal);
+    try testing.expectEqual(@as(i128, 3 * ds.decimal_scale), fxd.rows[2][1].decimal);
+}
+
+test "pivot: a statistical agg per cell" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{ .{ .name = "r", .type = .text }, .{ .name = "c", .type = .text }, .{ .name = "v", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "x" }, .{ .text = "p" }, .{ .float = 1 } },
+        &.{ .{ .text = "x" }, .{ .text = "p" }, .{ .float = 10 } },
+        &.{ .{ .text = "x" }, .{ .text = "p" }, .{ .float = 2 } },
+    };
+    // Median of {1, 10, 2} is 2; quantile 0.75: h = 1.5 → 2 + 0.5·(10 − 2) = 6.
+    const med = try pivot(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .row_key = "r", .col_key = "c", .value_col = "v", .agg = .median });
+    try testing.expectEqual(@as(f64, 2), med.rows[0][1].float);
+    const q = try pivot(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .row_key = "r", .col_key = "c", .value_col = "v", .agg = .quantile, .q = 0.75 });
+    try testing.expectEqual(@as(f64, 6), q.rows[0][1].float);
+}
+
+test "resample / clampRange read a .timestamp column (UTC calendar day)" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const us = ds.timestamp_units_per_second;
+    const cols = [_]Column{ .{ .name = "t", .type = .timestamp }, .{ .name = "v", .type = .float } };
+    const rows = [_][]const Value{
+        // 1969-12-31T23:59:59Z — one second before the epoch is still 1969.
+        &.{ .{ .int = -us }, .{ .float = 1 } },
+        // 2024-01-31T23:00:00Z and 2024-02-01T01:00:00Z (1706742000, 1706749200).
+        &.{ .{ .int = 1706742000 * us }, .{ .float = 2 } },
+        &.{ .{ .int = 1706749200 * us }, .{ .float = 4 } },
+        &.{ .null, .{ .float = 8 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const m = try resample(a, d, .{ .date_col = "t", .value_col = "v", .freq = .month });
+    try testing.expectEqual(@as(usize, 3), m.rows.len);
+    try testing.expectEqualStrings("1969-12", m.rows[0][0].text);
+    try testing.expectEqualStrings("2024-01", m.rows[1][0].text);
+    try testing.expectEqualStrings("2024-02", m.rows[2][0].text);
+    try testing.expectEqual(@as(f64, 4), m.rows[2][1].float);
+    const c = try clampRange(a, d, .{ .date_col = "t", .from = "2024-02-01" });
+    try testing.expectEqual(@as(usize, 1), c.rows.len);
+    try testing.expectEqual(@as(f64, 4), c.rows[0][1].float);
+}
+
+test "edge cases the mutation run asked for (transforms)" {
+    var f = Fix.init();
+    defer f.deinit();
+    const a = f.a();
+    const cols = [_]Column{ .{ .name = "x", .type = .float }, .{ .name = "y", .type = .float } };
+    const rows = [_][]const Value{
+        &.{ .{ .float = -0.25 }, .null },
+        &.{ .{ .float = 4 }, .{ .float = 1 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    // A null RHS is missing too (only the LHS was checked by the earlier test).
+    const m = try map(a, d, .{ .out = "o", .lhs = .{ .col = "x" }, .op = .add, .rhs = .{ .col = "y" }, .on_missing = .null });
+    try testing.expect(m.rows[0][2] == .null);
+    try testing.expectEqual(@as(f64, 5), m.rows[1][2].float);
+    // sqrt of a negative number above −1 is still undefined (not NaN).
+    const s = try map(a, d, .{ .out = "o", .lhs = .{ .col = "x" }, .op = .sqrt, .rhs = .{ .col = "no such" }, .on_missing = .null });
+    try testing.expect(s.rows[0][2] == .null);
+    try testing.expectEqual(@as(f64, 2), s.rows[1][2].float);
+    // A NaN literal is missing: `x < NaN` holds for no row (Value.order would
+    // otherwise rank NaN above every number).
+    try expectKept(try filter(a, filt_ds, .{ .where = &.{.{ .col = "x", .op = .lt, .value = .{ .float = nan } }} }), &.{});
+    // fillna leaves a row's present cells alone.
+    const all = try fillna(a, filt_ds, .{ .value = .{ .text = "?" } });
+    try testing.expectEqual(@as(f64, 3), all.rows[2][0].float);
+    // dropna(how = all) over zero columns: "all of nothing is missing" must
+    // not drop every row.
+    const empty_rows = [_][]const Value{ &.{}, &.{} };
+    try testing.expectEqual(@as(usize, 2), (try dropna(a, .{ .columns = &.{}, .rows = &empty_rows }, .{ .how = .all })).rows.len);
+    // An int in a column that is NOT `.timestamp` is not a date.
+    const dc = [_]Column{ .{ .name = "t", .type = .date }, .{ .name = "v", .type = .float } };
+    const dr = [_][]const Value{ &.{ .{ .int = 0 }, .{ .float = 1 } }, &.{ .{ .text = "2024-05-06" }, .{ .float = 2 } } };
+    const r = try resample(a, .{ .columns = &dc, .rows = &dr }, .{ .date_col = "t", .value_col = "v", .freq = .year });
+    try testing.expectEqual(@as(usize, 1), r.rows.len);
+    try testing.expectEqualStrings("2024", r.rows[0][0].text);
+    // sum_exact with a null fx rate keeps a decimal that f64 cannot hold:
+    // 123456789.012345678901 has 21 significant digits, f64 carries ~16.
+    const big: i128 = 123456789_012345678901;
+    const fc = [_]Column{ .{ .name = "m", .type = .decimal }, .{ .name = "fx", .type = .float } };
+    const fr = [_][]const Value{&.{ .{ .decimal = big }, .null }};
+    const fx = try aggregate(a, .{ .columns = &fc, .rows = &fr }, .{ .group_by = &.{}, .aggs = &.{.{ .src = "m", .out = "s", .func = .sum_exact }}, .fx = .{ .rate_col = "fx" } });
+    try testing.expectEqual(big, fx.rows[0][0].decimal);
 }
