@@ -1418,6 +1418,17 @@ test "generate: non-UTF-8 metadata is rejected, not silently turned into a JSON 
             Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
         );
     }
+    {
+        // A response description, too (mutation 2026-10-04: dropping its
+        // check survived -- only summary, title and pattern were tested).
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.addDoc(.get, "/x", hOk, .{ .responses = &.{.{ .status = 200, .description = bad }} });
+        try testing.expectError(
+            error.InvalidUtf8,
+            Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
+        );
+    }
     // Valid UTF-8 (including non-ASCII) keeps working.
     {
         var r = router.Router.init(testing.allocator);
@@ -2070,6 +2081,29 @@ test "conformance: the checker rejects a paths key that does not start with '/' 
     );
     defer parsed.deinit();
     try testing.expectError(error.InvalidPathKey, validateOpenApi31(parsed.value));
+}
+
+test "conformance: a response description must be a string; non-operation path-item members are legal" {
+    // OAS 3.1 §4.8.17: Response Object `description` is a REQUIRED string.
+    // §4.8.9: a Path Item may carry `summary`, `description`, `servers` and
+    // `parameters` besides its operations -- they are not operations and must
+    // not be checked as such. Mutation 2026-10-04: both checks survived.
+    const bad_desc = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"/x\":{\"get\":{\"responses\":{\"200\":{\"description\":5}}}}}}",
+        .{},
+    );
+    defer bad_desc.deinit();
+    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(bad_desc.value));
+    const members = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"/x\":{\"summary\":\"s\",\"parameters\":[],\"get\":{\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+        .{},
+    );
+    defer members.deinit();
+    try validateOpenApi31(members.value);
 }
 
 test "endpoint: self-contained docs page (no external assets)" {

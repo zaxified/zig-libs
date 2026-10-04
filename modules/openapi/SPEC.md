@@ -6,7 +6,7 @@
 
 **Scope:** core — FastAPI 0.142 generated spec (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -150,6 +150,17 @@ offline tests in `src/root.zig` (`external anchor: …`); per the governing rule
 run once and is not re-invoked at test time. No `/NOTICE` entry (black-box validating
 oracle, root NOTICE §0); the module's existing NOTICE for the adopted OAI example document
 is unrelated and unaffected.
+
+**Audit 2026-10-04 (mutation).** 35 schemata mutants over the UTF-8 pre-checks, `include`
+filtering, `PathCollision`, pattern templating, operation members (requestBody `required`,
+duplicate statuses, the default 200, `deprecated`), `operationId`, path and query
+parameters (every `InvalidQuerySchema` branch, `allOf` merging, `required`), the endpoint
+(HEAD/GET, 304, 405 + `Allow`, docs path) and `validateOpenApi31`: 34 killed, 1 equivalent,
+0 left alive. Equivalent: admitting a 1-byte `:` segment as a path parameter -- outside the
+input contract (`buildRoutes` takes patterns in `Router.add` syntax, and `router` refuses an
+empty parameter name with `InvalidPattern`). Tests added for the 3 real gaps: a non-UTF-8
+response description, a non-string response `description` (OAS 3.1 §4.8.17), and non-operation
+Path Item members (`summary`, `parameters`; OAS 3.1 §4.8.9) passing the checker.
 
 ## Backlog / deferred
 OpenAPI 3.0/Swagger 2.0 output, request/response runtime validation, and client SDK generation are

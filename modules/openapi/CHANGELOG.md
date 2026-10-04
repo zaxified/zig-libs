@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (35 schemata mutants, 34 killed, 1 equivalent). New
+  tests: a non-UTF-8 response description is `InvalidUtf8`; `validateOpenApi31` refuses a
+  non-string response `description` and accepts non-operation Path Item members. No code change.
+
 - **2026-09-28** — **Query parameters.** `RouteDoc.query_schema` (an object schema, or `allOf` of
   them -- what `validate.writeJsonSchemaFor(T)` writes, `allOf` when `T` declares
   `validate_rules`) becomes one `in: query` parameter per property, after the path parameters,
