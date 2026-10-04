@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: LLDP-MED (TIA-1057
+  capabilities, network policy, location, extended power, inventory), IEEE 802.3 power via MDI
+  (with the 802.3at extension) and 802.1 port+protocol VLAN in `lldp.OrgSpecific.decode`, plus
+  `Builder.addMedCapabilities`/`addMedNetworkPolicy`; DHCPv4 options 42, 43, 60, 66, 67, 82
+  (`relayAgentInfo`), 119 (`domainSearch`, RFC 1035 compression with loop-proof backward-only
+  pointers) and 121 (`classlessRoutes`) as `Message` fields with `Builder` support; new `nd`
+  submodule (ICMPv6 Neighbor Discovery codec, checksum, NS/RS builders). Checked against
+  tcpdump 4.99.6's decoders (LLDP-MED, DHCP, ND incl. "icmp6 sum ok") and RFC 3397's example.
+  Options 82/119/121 are validated lazily by their iterators, so a malformed one never makes
+  `Message.parse` fail (no behaviour change for existing callers). ⚠ `OrgValue` gained union
+  members and `OptionCode` named values — only an exhaustive `switch` over `OrgValue` notices.
+  Mutation: 34 mutants (final), all killed; 4 of them needed new tests.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `cdp.ParseOptions.tolerant_trailing_tlv`
   now only swallows a malformed trailing TLV when every byte from it to the end of the
   buffer is zero (real 802.3 padding); previously it tolerated a malformed TLV anywhere in

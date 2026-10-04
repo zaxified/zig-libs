@@ -241,6 +241,28 @@ pub const ManagementAddress = struct {
 
 pub const oui_ieee_8021 = [3]u8{ 0x00, 0x80, 0xc2 };
 pub const oui_ieee_8023 = [3]u8{ 0x00, 0x12, 0x0f };
+/// TIA (ANSI/TIA-1057, LLDP-MED) — what VoIP phones and PoE switches send.
+pub const oui_tia = [3]u8{ 0x00, 0x12, 0xbb };
+
+/// LLDP-MED capability bits (TIA-1057 §10.2.2.2), for `MedCapabilities.capabilities`.
+pub const MED_CAP = struct {
+    pub const capabilities: u16 = 0x0001;
+    pub const network_policy: u16 = 0x0002;
+    pub const location: u16 = 0x0004;
+    pub const ext_power_pse: u16 = 0x0008;
+    pub const ext_power_pd: u16 = 0x0010;
+    pub const inventory: u16 = 0x0020;
+};
+
+/// LLDP-MED device type (TIA-1057 §10.2.2.3).
+pub const MedDeviceType = enum(u8) {
+    not_defined = 0,
+    endpoint_class_1 = 1,
+    endpoint_class_2 = 2,
+    endpoint_class_3 = 3,
+    network_connectivity = 4,
+    _,
+};
 
 /// A raw organizationally-specific TLV: OUI + subtype + the vendor value.
 pub const OrgSpecific = struct {
@@ -265,6 +287,13 @@ pub const OrgSpecific = struct {
                     if (o.info.len < 2) return null;
                     return .{ .port_vlan_id = std.mem.readInt(u16, o.info[0..2], .big) };
                 },
+                2 => { // Port And Protocol VLAN ID: flags (1) + PPVID (2)
+                    if (o.info.len < 3) return null;
+                    return .{ .port_protocol_vlan = .{
+                        .flags = o.info[0],
+                        .ppvid = std.mem.readInt(u16, o.info[1..3], .big),
+                    } };
+                },
                 3 => { // VLAN Name: vlan id (2) + name len (1) + name
                     if (o.info.len < 3) return null;
                     const name_len: usize = o.info[2];
@@ -286,10 +315,68 @@ pub const OrgSpecific = struct {
                         .operational_mau = std.mem.readInt(u16, o.info[3..5], .big),
                     } };
                 },
+                2 => { // Power Via MDI: support (1), PSE pair (1), class (1) [+ 802.3at]
+                    if (o.info.len < 3) return null;
+                    var pv: PowerViaMdi = .{
+                        .mdi_support = o.info[0],
+                        .pse_power_pair = o.info[1],
+                        .power_class = o.info[2],
+                    };
+                    // IEEE 802.3at-2009 extension: type/source/priority (1),
+                    // PD requested power (2), PSE allocated power (2), both in
+                    // units of 0.1 W. Anything shorter is the 802.3ab form.
+                    if (o.info.len >= 8) pv.dot3at = .{
+                        .type_source_priority = o.info[3],
+                        .pd_requested_dw = std.mem.readInt(u16, o.info[4..6], .big),
+                        .pse_allocated_dw = std.mem.readInt(u16, o.info[6..8], .big),
+                    };
+                    return .{ .power_via_mdi = pv };
+                },
                 4 => { // Maximum Frame Size
                     if (o.info.len < 2) return null;
                     return .{ .max_frame_size = std.mem.readInt(u16, o.info[0..2], .big) };
                 },
+                else => return null,
+            }
+        } else if (std.mem.eql(u8, &o.oui, &oui_tia)) {
+            switch (o.subtype) {
+                1 => { // LLDP-MED Capabilities: capabilities (2) + device type (1)
+                    if (o.info.len < 3) return null;
+                    return .{ .med_capabilities = .{
+                        .capabilities = std.mem.readInt(u16, o.info[0..2], .big),
+                        .device_type = @enumFromInt(o.info[2]),
+                    } };
+                },
+                2 => { // Network Policy: app type (1) + U T X VLAN(12) prio(3) DSCP(6)
+                    if (o.info.len < 4) return null;
+                    const v: u24 = std.mem.readInt(u24, o.info[1..4], .big);
+                    return .{ .med_network_policy = .{
+                        .application = o.info[0],
+                        .unknown_policy = v & (1 << 23) != 0,
+                        .tagged = v & (1 << 22) != 0,
+                        .vlan_id = @intCast((v >> 9) & 0x0fff),
+                        .l2_priority = @intCast((v >> 6) & 0x7),
+                        .dscp = @intCast(v & 0x3f),
+                    } };
+                },
+                3 => { // Location Identification: format (1) + data
+                    if (o.info.len < 1) return null;
+                    return .{ .med_location = .{ .format = o.info[0], .data = o.info[1..] } };
+                },
+                4 => { // Extended Power-via-MDI: type/source/priority (1) + power (2)
+                    if (o.info.len < 3) return null;
+                    const b = o.info[0];
+                    return .{ .med_ext_power = .{
+                        .power_type = @intCast(b >> 6),
+                        .power_source = @intCast((b >> 4) & 0x3),
+                        .priority = @intCast(b & 0x0f),
+                        .power_dw = std.mem.readInt(u16, o.info[1..3], .big),
+                    } };
+                },
+                5...11 => return .{ .med_inventory = .{
+                    .field = @enumFromInt(o.subtype),
+                    .text = o.info,
+                } },
                 else => return null,
             }
         }
@@ -308,11 +395,90 @@ pub const MacPhy = struct {
     operational_mau: u16,
 };
 
+/// IEEE 802.1 Port And Protocol VLAN ID. `flags`: bit 1 = supported,
+/// bit 2 = enabled.
+pub const PortProtocolVlan = struct { flags: u8, ppvid: u16 };
+
+/// IEEE 802.3 Power Via MDI (802.3ab), with the 802.3at extension when sent.
+pub const PowerViaMdi = struct {
+    /// Bit 0 port class PSE, 1 PSE MDI power supported, 2 enabled,
+    /// 3 pair control ability.
+    mdi_support: u8,
+    /// 1 = signal pairs, 2 = spare pairs.
+    pse_power_pair: u8,
+    /// Power class + 1 (1 = class 0 … 5 = class 4).
+    power_class: u8,
+    dot3at: ?struct {
+        /// Bits 7-6 power type, 5-4 power source, 1-0 priority.
+        type_source_priority: u8,
+        /// Units of 0.1 W.
+        pd_requested_dw: u16,
+        pse_allocated_dw: u16,
+    } = null,
+};
+
+pub const MedCapabilities = struct {
+    /// `MED_CAP` bits.
+    capabilities: u16,
+    device_type: MedDeviceType,
+};
+
+/// LLDP-MED Network Policy — the voice VLAN a phone is told to use.
+pub const MedNetworkPolicy = struct {
+    /// 1 voice, 2 voice signaling, 3 guest voice, 4 guest voice signaling,
+    /// 5 softphone voice, 6 video conferencing, 7 streaming video,
+    /// 8 video signaling (TIA-1057 Table 12).
+    application: u8,
+    /// U: the device needs a policy and has none.
+    unknown_policy: bool,
+    /// T: 802.1Q tagged (false = untagged, priority still applies).
+    tagged: bool,
+    vlan_id: u12,
+    l2_priority: u3,
+    dscp: u6,
+};
+
+pub const MedLocation = struct {
+    /// 1 coordinate-based LCI, 2 civic address LCI, 3 ECS ELIN.
+    format: u8,
+    data: []const u8,
+};
+
+pub const MedExtPower = struct {
+    /// 0 PSE, 1 PD (the two "type" encodings TIA-1057 §10.2.5.1 defines).
+    power_type: u2,
+    /// Meaning depends on the type: for a PD, 1 = PSE, 2 = local, 3 = both.
+    power_source: u2,
+    /// 1 critical, 2 high, 3 low (0 unknown).
+    priority: u4,
+    /// Units of 0.1 W (6.5 W = 65).
+    power_dw: u16,
+};
+
+pub const MedInventoryField = enum(u8) {
+    hardware_revision = 5,
+    firmware_revision = 6,
+    software_revision = 7,
+    serial_number = 8,
+    manufacturer = 9,
+    model = 10,
+    asset_id = 11,
+};
+
+pub const MedInventory = struct { field: MedInventoryField, text: []const u8 };
+
 pub const OrgValue = union(enum) {
     port_vlan_id: u16, // IEEE 802.1 subtype 1
+    port_protocol_vlan: PortProtocolVlan, // IEEE 802.1 subtype 2
     vlan_name: VlanName, // IEEE 802.1 subtype 3
     mac_phy: MacPhy, // IEEE 802.3 subtype 1
+    power_via_mdi: PowerViaMdi, // IEEE 802.3 subtype 2
     max_frame_size: u16, // IEEE 802.3 subtype 4
+    med_capabilities: MedCapabilities, // TIA subtype 1
+    med_network_policy: MedNetworkPolicy, // TIA subtype 2
+    med_location: MedLocation, // TIA subtype 3
+    med_ext_power: MedExtPower, // TIA subtype 4
+    med_inventory: MedInventory, // TIA subtypes 5-11
 };
 
 // ── raw TLV iterator ────────────────────────────────────────────────────────
@@ -623,6 +789,26 @@ pub const Builder = struct {
     }
 
     /// IEEE 802.3 Maximum Frame Size (subtype 4).
+    /// LLDP-MED Capabilities (TIA subtype 1) — a MED device sends this first.
+    pub fn addMedCapabilities(b: *Builder, capabilities: u16, device_type: MedDeviceType) BuildError!void {
+        var v: [3]u8 = undefined;
+        std.mem.writeInt(u16, v[0..2], capabilities, .big);
+        v[2] = @intFromEnum(device_type);
+        try b.addOrgSpecific(oui_tia, 1, &v);
+    }
+
+    /// LLDP-MED Network Policy (TIA subtype 2) — e.g. a switch telling a
+    /// phone its voice VLAN.
+    pub fn addMedNetworkPolicy(b: *Builder, p: MedNetworkPolicy) BuildError!void {
+        const bits: u24 = (@as(u24, @intFromBool(p.unknown_policy)) << 23) |
+            (@as(u24, @intFromBool(p.tagged)) << 22) |
+            (@as(u24, p.vlan_id) << 9) | (@as(u24, p.l2_priority) << 6) | p.dscp;
+        var v: [4]u8 = undefined;
+        v[0] = p.application;
+        std.mem.writeInt(u24, v[1..4], bits, .big);
+        try b.addOrgSpecific(oui_tia, 2, &v);
+    }
+
     pub fn addMaxFrameSize(b: *Builder, size: u16) BuildError!void {
         var be: [2]u8 = undefined;
         std.mem.writeInt(u16, &be, size, .big);
@@ -1178,4 +1364,144 @@ test "corpus: every LLDP seed reaches the iterators, and the walked counts are p
     try testing.expectEqual(@as(usize, 4), total.orgs);
     try testing.expectEqual(@as(usize, 3), total.decoded);
     try testing.expectEqual(@as(usize, 3), total.addresses);
+}
+
+// ── 2026-10-04: LLDP-MED, 802.3 power, 802.1 PPVID ─────────────────────────
+
+/// An LLDPDU generated for this test (a VoIP phone's advertisement) and
+/// decoded by tcpdump 4.99.6 (`tcpdump -vv -r`); every expected value below is
+/// what tcpdump printed for it, quoted next to the assertion.
+const lldpdu_med = blk: {
+    const h = "02070400112233445504090567652d302f302f3706020078fe070080c202060064fe0c00120f020f01045100ff012cfe" ++
+        "070012bb01002f03fe080012bb020140c96efe100012bb03020a02435a01055072616861fe070012bb04520041fe0900" ++
+        "12bb054857312e30fe090012bb064657322e31fe090012bb075357322e33fe090012bb08534e313233fe080012bb0941" ++
+        "636d65fe0a0012bb0a50686f6e6539fe070012bb0b4134320000";
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    break :blk out;
+};
+
+test "LLDP-MED, 802.3 power and 802.1 PPVID decode to what tcpdump printed" {
+    const du = try Lldpdu.parse(&lldpdu_med, .{});
+    var it = du.orgIterator();
+    var seen: u32 = 0;
+    var inventory: usize = 0;
+    while (try it.next()) |o| {
+        const v = o.decode() orelse return error.TestUndecodedOrgTlv;
+        switch (v) {
+            // "port and protocol vlan id (PPVID): 100, flags [supported, enabled] (0x06)"
+            .port_protocol_vlan => |p| {
+                try testing.expectEqual(@as(u16, 100), p.ppvid);
+                try testing.expectEqual(@as(u8, 0x06), p.flags);
+                seen |= 1;
+            },
+            // "MDI power support [PSE, supported, enabled, can be controlled],
+            //  power pair signal, power class class3"
+            .power_via_mdi => |p| {
+                try testing.expectEqual(@as(u8, 0x0f), p.mdi_support);
+                try testing.expectEqual(@as(u8, 1), p.pse_power_pair);
+                try testing.expectEqual(@as(u8, 4), p.power_class); // class3 = 3 + 1
+                // tcpdump does not print the 802.3at extension; the test
+                // frame carries 0x51 (type 2 PD / source / priority), 25.5 W
+                // requested and 30.0 W allocated (IEEE 802.3at 79.3.2: 0.1 W units).
+                const at = p.dot3at.?;
+                try testing.expectEqual(@as(u8, 0x51), at.type_source_priority);
+                try testing.expectEqual(@as(u16, 255), at.pd_requested_dw);
+                try testing.expectEqual(@as(u16, 300), at.pse_allocated_dw);
+                seen |= 2;
+            },
+            // "Media capabilities [LLDP-MED capabilities, network policy,
+            //  location identification, extended power via MDI-PSE, Inventory]
+            //  (0x002f)", "Device type [endpoint class 3] (0x03)"
+            .med_capabilities => |c| {
+                try testing.expectEqual(MED_CAP.capabilities | MED_CAP.network_policy | MED_CAP.location |
+                    MED_CAP.ext_power_pse | MED_CAP.inventory, c.capabilities);
+                try testing.expectEqual(MedDeviceType.endpoint_class_3, c.device_type);
+                seen |= 4;
+            },
+            // "Application type [voice] (0x01), Flags [Tagged]",
+            // "Vlan id 100, L2 priority 5, DSCP value 46"
+            .med_network_policy => |n| {
+                try testing.expectEqual(@as(u8, 1), n.application);
+                try testing.expect(n.tagged and !n.unknown_policy);
+                try testing.expectEqual(@as(u12, 100), n.vlan_id);
+                try testing.expectEqual(@as(u3, 5), n.l2_priority);
+                try testing.expectEqual(@as(u6, 46), n.dscp);
+                seen |= 8;
+            },
+            // "Location data format civic address LCI (0x02)"
+            .med_location => |l| {
+                try testing.expectEqual(@as(u8, 2), l.format);
+                try testing.expectEqual(@as(usize, 11), l.data.len);
+                seen |= 16;
+            },
+            // "Power type [PD device], Power source [PSE - primary power
+            //  source]", "Power priority [high] (0x02), Power 6.5 Watts"
+            .med_ext_power => |e| {
+                try testing.expectEqual(@as(u2, 1), e.power_type);
+                try testing.expectEqual(@as(u2, 1), e.power_source);
+                try testing.expectEqual(@as(u4, 2), e.priority);
+                try testing.expectEqual(@as(u16, 65), e.power_dw);
+                seen |= 32;
+            },
+            // "Hardware revision HW1.0" … "Asset ID A42"
+            .med_inventory => |inv| {
+                const want: []const u8 = switch (inv.field) {
+                    .hardware_revision => "HW1.0",
+                    .firmware_revision => "FW2.1",
+                    .software_revision => "SW2.3",
+                    .serial_number => "SN123",
+                    .manufacturer => "Acme",
+                    .model => "Phone9",
+                    .asset_id => "A42",
+                };
+                try testing.expectEqualStrings(want, inv.text);
+                inventory += 1;
+            },
+            else => return error.TestUnexpectedOrgTlv,
+        }
+    }
+    try testing.expectEqual(@as(u32, 63), seen);
+    try testing.expectEqual(@as(usize, 7), inventory);
+}
+
+test "LLDP-MED / power TLVs too short to hold their fields stay raw" {
+    const short = [_]OrgSpecific{
+        .{ .oui = oui_ieee_8021, .subtype = 2, .info = &.{ 6, 0 } },
+        .{ .oui = oui_ieee_8023, .subtype = 2, .info = &.{ 0x0f, 1 } },
+        .{ .oui = oui_tia, .subtype = 1, .info = &.{ 0, 0x2f } },
+        .{ .oui = oui_tia, .subtype = 2, .info = &.{ 1, 0x40, 0xc9 } },
+        .{ .oui = oui_tia, .subtype = 3, .info = &.{} },
+        .{ .oui = oui_tia, .subtype = 4, .info = &.{ 0x52, 0 } },
+        .{ .oui = oui_tia, .subtype = 12, .info = "x" }, // not a MED subtype
+    };
+    for (short) |o| try testing.expect(o.decode() == null);
+    // An 802.3ab power TLV (3 bytes, no 802.3at extension), and one with a
+    // partial extension, decode without one.
+    const ab = (OrgSpecific{ .oui = oui_ieee_8023, .subtype = 2, .info = &.{ 0x0f, 1, 4 } }).decode().?;
+    try testing.expect(ab.power_via_mdi.dot3at == null);
+    const partial = (OrgSpecific{ .oui = oui_ieee_8023, .subtype = 2, .info = &.{ 0x0f, 1, 4, 0x51, 0, 255, 1 } }).decode().?;
+    try testing.expect(partial.power_via_mdi.dot3at == null);
+    // The priority is the whole low nibble (TIA-1057 §10.2.5.2: 4 bits), so a
+    // reserved value 15 reads back as 15, not truncated to 3 bits.
+    const pr = (OrgSpecific{ .oui = oui_tia, .subtype = 4, .info = &.{ 0x5f, 0, 1 } }).decode().?;
+    try testing.expectEqual(@as(u4, 15), pr.med_ext_power.priority);
+    // An empty inventory string is a valid (empty) field.
+    const inv = (OrgSpecific{ .oui = oui_tia, .subtype = 11, .info = "" }).decode().?;
+    try testing.expectEqual(@as(usize, 0), inv.med_inventory.text.len);
+}
+
+test "Builder: LLDP-MED capabilities and network policy reproduce the tcpdump-checked bytes" {
+    var buf: [64]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addMedCapabilities(0x002f, .endpoint_class_3);
+    try b.addMedNetworkPolicy(.{ .application = 1, .unknown_policy = false, .tagged = true, .vlan_id = 100, .l2_priority = 5, .dscp = 46 });
+    // The two TLVs as they sit in `lldpdu_med` (offsets 47..56 and 56..66).
+    try testing.expectEqualSlices(u8, lldpdu_med[47..66], buf[0..b.pos]);
+    // Every policy bit lands where the decoder reads it back.
+    var b2 = Builder.init(&buf);
+    const p: MedNetworkPolicy = .{ .application = 8, .unknown_policy = true, .tagged = false, .vlan_id = 4095, .l2_priority = 7, .dscp = 63 };
+    try b2.addMedNetworkPolicy(p);
+    const o = try OrgSpecific.parse(buf[2..b2.pos]);
+    try testing.expectEqualDeep(OrgValue{ .med_network_policy = p }, o.decode().?);
 }

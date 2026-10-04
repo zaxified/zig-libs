@@ -81,13 +81,21 @@ pub const OptionCode = enum(u8) {
     dns_server = 6,
     host_name = 12,
     domain_name = 15,
+    ntp_servers = 42,
+    vendor_specific = 43,
     requested_ip = 50,
     lease_time = 51,
     option_overload = 52,
     message_type = 53,
     server_id = 54,
     param_request_list = 55,
+    vendor_class_id = 60,
     client_id = 61,
+    tftp_server_name = 66,
+    bootfile_name = 67,
+    relay_agent_info = 82,
+    domain_search = 119,
+    classless_static_route = 121,
     end = 255,
     _,
 };
@@ -196,6 +204,23 @@ pub const Message = struct {
     /// common `htype + address` form is used).
     client_id: ?[]const u8 = null,
     overload: ?Overload = null,
+    /// Option 42 (RFC 2132 §8.3).
+    ntp_servers: ?Ip4List = null,
+    /// Option 43, vendor-defined content (RFC 2132 §8.4).
+    vendor_specific: ?[]const u8 = null,
+    /// Option 60 (RFC 2132 §9.13), e.g. "MSFT 5.0", "PXEClient:…".
+    vendor_class_id: ?[]const u8 = null,
+    /// Options 66/67 (RFC 2132 §9.4/§9.5) — PXE / phone provisioning.
+    tftp_server_name: ?[]const u8 = null,
+    bootfile_name: ?[]const u8 = null,
+    /// Option 82 (RFC 3046); walk it with `relayAgentInfo` (which reports
+    /// malformed sub-options as errors).
+    relay_agent_info: ?[]const u8 = null,
+    /// Option 119 (RFC 3397); decode it with `domainSearch`.
+    domain_search: ?[]const u8 = null,
+    /// Option 121 (RFC 3442); walk it with `classlessRoutes` (which reports a
+    /// malformed route as an error).
+    classless_static_routes: ?[]const u8 = null,
 
     pub fn parse(bytes: []const u8) ParseError!Message {
         if (bytes.len < header_len + magic_cookie.len) return ParseError.Truncated;
@@ -234,10 +259,41 @@ pub const Message = struct {
                 .param_request_list => m.param_request_list = opt.data,
                 .client_id => m.client_id = opt.data,
                 .option_overload => m.overload = @enumFromInt(try one(opt.data)),
+                .ntp_servers => m.ntp_servers = try ip4List(opt.data),
+                .vendor_specific => m.vendor_specific = opt.data,
+                .vendor_class_id => m.vendor_class_id = opt.data,
+                .tftp_server_name => m.tftp_server_name = opt.data,
+                .bootfile_name => m.bootfile_name = opt.data,
+                // 82/119/121 are validated lazily, by their iterators: a
+                // malformed sub-structure must not make the whole message
+                // unparseable — a caller watching for rogue DHCP servers
+                // still needs the header and server id of a message whose
+                // option 121 is garbage.
+                .relay_agent_info => m.relay_agent_info = opt.data,
+                .domain_search => m.domain_search = opt.data,
+                .classless_static_route => m.classless_static_routes = opt.data,
                 else => {}, // unknown/untyped: reachable via optionIterator()
             }
         }
         return m;
+    }
+
+    /// Option 82's sub-options (circuit id = 1, remote id = 2, …).
+    pub fn relayAgentInfo(m: *const Message) ?RelayAgentIterator {
+        const d = m.relay_agent_info orelse return null;
+        return .{ .data = d };
+    }
+
+    /// Option 121's routes, in the order the server sent them.
+    pub fn classlessRoutes(m: *const Message) ?ClasslessRouteIterator {
+        const d = m.classless_static_routes orelse return null;
+        return .{ .data = d };
+    }
+
+    /// Option 119's domain names.
+    pub fn domainSearch(m: *const Message) ?DomainSearchIterator {
+        const d = m.domain_search orelse return null;
+        return .{ .data = d };
     }
 
     /// Re-iterate the raw options field (unknown options included).
@@ -287,6 +343,102 @@ pub const Message = struct {
     fn ip4List(data: []const u8) ParseError!Ip4List {
         if (data.len < 4 or data.len % 4 != 0) return ParseError.BadOptionLength;
         return .{ .bytes = data };
+    }
+};
+
+/// One RFC 3046 sub-option of option 82.
+pub const RelayAgentSubOption = struct {
+    /// 1 = Agent Circuit ID, 2 = Agent Remote ID (RFC 3046 §2.0).
+    code: u8,
+    data: []const u8,
+};
+
+pub const RelayAgentIterator = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    pub fn next(it: *RelayAgentIterator) ParseError!?RelayAgentSubOption {
+        if (it.pos == it.data.len) return null;
+        if (it.data.len - it.pos < 2) return ParseError.BadOptionLength;
+        const len: usize = it.data[it.pos + 1];
+        if (it.data.len - it.pos - 2 < len) return ParseError.BadOptionLength;
+        const out: RelayAgentSubOption = .{ .code = it.data[it.pos], .data = it.data[it.pos + 2 ..][0..len] };
+        it.pos += 2 + len;
+        return out;
+    }
+};
+
+/// One RFC 3442 route: destination prefix and the router to reach it.
+pub const ClasslessRoute = struct {
+    destination: [4]u8,
+    prefix_len: u6,
+    router: [4]u8,
+};
+
+/// RFC 3442 encoding: width (0-32), the ceil(width/8) significant octets of
+/// the destination, then the 4-byte router.
+pub const ClasslessRouteIterator = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    pub fn next(it: *ClasslessRouteIterator) ParseError!?ClasslessRoute {
+        if (it.pos == it.data.len) return null;
+        const width = it.data[it.pos];
+        if (width > 32) return ParseError.BadOptionLength;
+        const sig: usize = (@as(usize, width) + 7) / 8;
+        if (it.data.len - it.pos - 1 < sig + 4) return ParseError.BadOptionLength;
+        var r: ClasslessRoute = .{ .destination = @splat(0), .prefix_len = @intCast(width), .router = undefined };
+        @memcpy(r.destination[0..sig], it.data[it.pos + 1 ..][0..sig]);
+        r.router = it.data[it.pos + 1 + sig ..][0..4].*;
+        it.pos += 1 + sig + 4;
+        return r;
+    }
+};
+
+/// Option 119 (RFC 3397): a list of RFC 1035 domain names, compressed with
+/// pointers whose offsets count from the start of the option data.
+pub const DomainSearchIterator = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    /// The longest dotted name `next` can produce (RFC 1035: 255 octets on
+    /// the wire, one fewer as text).
+    pub const max_name_len = 254;
+
+    /// Decode the next name into `out` (dotted, no trailing dot). A pointer
+    /// must point strictly before the label that holds it, so a hostile
+    /// option cannot loop.
+    pub fn next(it: *DomainSearchIterator, out: *[max_name_len]u8) ParseError!?[]const u8 {
+        if (it.pos == it.data.len) return null;
+        var len: usize = 0;
+        var p = it.pos;
+        var jumped = false;
+        while (true) {
+            if (p >= it.data.len) return ParseError.BadOptionLength;
+            const b = it.data[p];
+            if (b == 0) {
+                if (!jumped) it.pos = p + 1;
+                break;
+            }
+            if (b & 0xc0 == 0xc0) {
+                if (p + 1 >= it.data.len) return ParseError.BadOptionLength;
+                const target = (@as(usize, b & 0x3f) << 8) | it.data[p + 1];
+                if (target >= p) return ParseError.BadOptionLength;
+                if (!jumped) it.pos = p + 2;
+                jumped = true;
+                p = target;
+                continue;
+            }
+            if (b & 0xc0 != 0) return ParseError.BadOptionLength; // 0x40/0x80: reserved
+            if (it.data.len - p - 1 < b) return ParseError.BadOptionLength;
+            const sep: usize = if (len == 0) 0 else 1;
+            if (len + sep + b > max_name_len) return ParseError.BadOptionLength;
+            if (sep == 1) out[len] = '.';
+            @memcpy(out[len + sep ..][0..b], it.data[p + 1 ..][0..b]);
+            len += sep + b;
+            p += 1 + b;
+        }
+        return out[0..len];
     }
 };
 
@@ -348,6 +500,77 @@ pub const Builder = struct {
         b.buf[b.pos + 1] = @intCast(data.len);
         @memcpy(b.buf[b.pos + 2 ..][0..data.len], data);
         b.pos += 2 + data.len;
+    }
+
+    /// Option 42; `addrs` as for `addRouters`.
+    pub fn addNtpServers(b: *Builder, addrs: []const u8) BuildError!void {
+        std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
+        try b.addOption(@intFromEnum(OptionCode.ntp_servers), addrs);
+    }
+
+    pub fn addVendorClassId(b: *Builder, id: []const u8) BuildError!void {
+        try b.addOption(@intFromEnum(OptionCode.vendor_class_id), id);
+    }
+
+    pub fn addTftpServerName(b: *Builder, name: []const u8) BuildError!void {
+        try b.addOption(@intFromEnum(OptionCode.tftp_server_name), name);
+    }
+
+    pub fn addBootfileName(b: *Builder, name: []const u8) BuildError!void {
+        try b.addOption(@intFromEnum(OptionCode.bootfile_name), name);
+    }
+
+    /// Option 82 with an Agent Circuit ID and/or an Agent Remote ID.
+    pub fn addRelayAgentInfo(b: *Builder, circuit_id: ?[]const u8, remote_id: ?[]const u8) BuildError!void {
+        var tmp: [255]u8 = undefined;
+        var n: usize = 0;
+        for ([_]struct { u8, ?[]const u8 }{ .{ 1, circuit_id }, .{ 2, remote_id } }) |sub| {
+            const d = sub[1] orelse continue;
+            if (d.len > 255 or n + 2 + d.len > tmp.len) return BuildError.OptionTooLong;
+            tmp[n] = sub[0];
+            tmp[n + 1] = @intCast(d.len);
+            @memcpy(tmp[n + 2 ..][0..d.len], d);
+            n += 2 + d.len;
+        }
+        try b.addOption(@intFromEnum(OptionCode.relay_agent_info), tmp[0..n]);
+    }
+
+    /// Option 121. Host bits beyond `prefix_len` in a destination are not
+    /// sent (RFC 3442 carries only the significant octets).
+    pub fn addClasslessRoutes(b: *Builder, routes: []const ClasslessRoute) BuildError!void {
+        var tmp: [255]u8 = undefined;
+        var n: usize = 0;
+        for (routes) |r| {
+            if (r.prefix_len > 32) return BuildError.OptionTooLong;
+            const sig: usize = (@as(usize, r.prefix_len) + 7) / 8;
+            if (n + 1 + sig + 4 > tmp.len) return BuildError.OptionTooLong;
+            tmp[n] = r.prefix_len;
+            @memcpy(tmp[n + 1 ..][0..sig], r.destination[0..sig]);
+            @memcpy(tmp[n + 1 + sig ..][0..4], &r.router);
+            n += 1 + sig + 4;
+        }
+        try b.addOption(@intFromEnum(OptionCode.classless_static_route), tmp[0..n]);
+    }
+
+    /// Option 119, uncompressed (every receiver must accept that). Each name
+    /// is dotted text; a label must be 1-63 bytes.
+    pub fn addDomainSearch(b: *Builder, names: []const []const u8) BuildError!void {
+        var tmp: [255]u8 = undefined;
+        var n: usize = 0;
+        for (names) |name| {
+            var labels = std.mem.splitScalar(u8, name, '.');
+            while (labels.next()) |label| {
+                if (label.len == 0 or label.len > 63) return BuildError.OptionTooLong;
+                if (n + 1 + label.len > tmp.len) return BuildError.OptionTooLong;
+                tmp[n] = @intCast(label.len);
+                @memcpy(tmp[n + 1 ..][0..label.len], label);
+                n += 1 + label.len;
+            }
+            if (n + 1 > tmp.len) return BuildError.OptionTooLong;
+            tmp[n] = 0;
+            n += 1;
+        }
+        try b.addOption(@intFromEnum(OptionCode.domain_search), tmp[0..n]);
     }
 
     pub fn addMessageType(b: *Builder, t: MessageType) BuildError!void {
@@ -858,4 +1081,177 @@ test "corpus: every DHCP seed reaches the option walker, and the counts are pinn
     try testing.expectEqual(@as(usize, 15), total.options);
     try testing.expectEqual(@as(usize, 2), total.overloaded);
     try testing.expectEqual(@as(usize, 6), total.ips);
+}
+
+// ── 2026-10-04: options 42, 43, 60, 66, 67, 82, 119, 121 ──────────────────
+
+/// A DHCPACK generated for this test and decoded by tcpdump 4.99.6
+/// (`tcpdump -vvv -r`); the expected values are what tcpdump printed, quoted
+/// next to each assertion. tcpdump has no decoder for option 119, so that one
+/// is checked against RFC 3397's own example below instead.
+const ack_with_options = blk: {
+    const h =
+        "020106001234abcd00000000000000000a01013200000000000000000011223344550000000000000000000000000000" ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000063825363" ++
+        "35010536040a0101012a080a0101050a0101062b060104616263643c084d53465420352e30420c746674702e6578616d" ++
+        "706c654308626f6f742e65666952100106657468303a350206001122334455771803656e67076578616d706c6503636f" ++
+        "6d0004636f7270c0047913080a0a01010116c0a8040a010102000a0101feff";
+    @setEvalBranchQuota(10000);
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    break :blk out;
+};
+
+test "options 42/43/60/66/67/82/121 decode to what tcpdump printed" {
+    const m = try Message.parse(&ack_with_options);
+    // "NTP (42), length 8: 10.1.1.5,10.1.1.6"
+    try testing.expectEqual(@as(usize, 2), m.ntp_servers.?.count());
+    try testing.expectEqual([4]u8{ 10, 1, 1, 6 }, m.ntp_servers.?.at(1));
+    // "Vendor-Option (43), length 6: 1.4.97.98.99.100"
+    try testing.expectEqualSlices(u8, &.{ 1, 4, 97, 98, 99, 100 }, m.vendor_specific.?);
+    // "Vendor-Class (60), length 8: \"MSFT 5.0\""
+    try testing.expectEqualStrings("MSFT 5.0", m.vendor_class_id.?);
+    // "TFTP (66), length 12: \"tftp.example\"", "BF (67), length 8: \"boot.efi\""
+    try testing.expectEqualStrings("tftp.example", m.tftp_server_name.?);
+    try testing.expectEqualStrings("boot.efi", m.bootfile_name.?);
+    // "Circuit-ID SubOption 1, length 6: eth0:5", "Remote-ID SubOption 2, length 6"
+    var ri = m.relayAgentInfo().?;
+    const c = (try ri.next()).?;
+    try testing.expectEqual(@as(u8, 1), c.code);
+    try testing.expectEqualStrings("eth0:5", c.data);
+    const r = (try ri.next()).?;
+    try testing.expectEqual(@as(u8, 2), r.code);
+    try testing.expectEqualSlices(u8, &.{ 0, 0x11, 0x22, 0x33, 0x44, 0x55 }, r.data);
+    try testing.expect((try ri.next()) == null);
+    // "(10.0.0.0/8:10.1.1.1),(192.168.4.0/22:10.1.1.2),(default:10.1.1.254)"
+    const want = [_]ClasslessRoute{
+        .{ .destination = .{ 10, 0, 0, 0 }, .prefix_len = 8, .router = .{ 10, 1, 1, 1 } },
+        .{ .destination = .{ 192, 168, 4, 0 }, .prefix_len = 22, .router = .{ 10, 1, 1, 2 } },
+        .{ .destination = .{ 0, 0, 0, 0 }, .prefix_len = 0, .router = .{ 10, 1, 1, 254 } },
+    };
+    var ci = m.classlessRoutes().?;
+    for (want) |w| try testing.expectEqualDeep(w, (try ci.next()).?);
+    try testing.expect((try ci.next()) == null);
+    // Option 119 is present; its names: the second one is a label plus a
+    // pointer to offset 4 ("example.com" inside the first name).
+    var di = m.domainSearch().?;
+    var name: [DomainSearchIterator.max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("eng.example.com", (try di.next(&name)).?);
+    try testing.expectEqualStrings("corp.example.com", (try di.next(&name)).?);
+    try testing.expect((try di.next(&name)) == null);
+}
+
+test "option 119: RFC 3397 section 2's example decodes to its two names" {
+    // RFC 3397 §2: "eng.apple.com." and "marketing.apple.com.", the second
+    // compressed to "marketing" + a pointer to offset 4.
+    const rfc = [_]u8{ 3, 'e', 'n', 'g', 5, 'a', 'p', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 9, 'm', 'a', 'r', 'k', 'e', 't', 'i', 'n', 'g', 0xc0, 4 };
+    var it: DomainSearchIterator = .{ .data = &rfc };
+    var name: [DomainSearchIterator.max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("eng.apple.com", (try it.next(&name)).?);
+    try testing.expectEqualStrings("marketing.apple.com", (try it.next(&name)).?);
+    try testing.expect((try it.next(&name)) == null);
+}
+
+test "option 119: loops, forward pointers, overruns and reserved label types are refused" {
+    var name: [DomainSearchIterator.max_name_len]u8 = undefined;
+    const bad = [_][]const u8{
+        &.{ 0xc0, 0 }, // points at itself
+        &.{ 1, 'a', 0xc0, 4, 0 }, // points forward
+        &.{ 3, 'a', 'b' }, // label runs past the data
+        &.{ 1, 'a' }, // no terminating zero
+        &.{0x40}, // reserved 01 label type
+        &([_]u8{0x40} ++ [_]u8{'a'} ** 64 ++ [_]u8{0}), // 01 type with 64 bytes behind it: still reserved, not a label
+        &([_]u8{0x80} ++ [_]u8{'a'} ** 128 ++ [_]u8{0}), // 10 type likewise
+        &.{0xc0}, // pointer cut in half
+    };
+    for (bad) |b| {
+        var it: DomainSearchIterator = .{ .data = b };
+        try testing.expectError(error.BadOptionLength, it.next(&name));
+    }
+    // A name longer than 254 characters (five 63-byte labels) is refused,
+    // one of 254 exactly (63+1+63+1+63+1+62) is not.
+    var long: [5 * 64 + 1]u8 = undefined;
+    for (0..5) |i| {
+        long[i * 64] = 63;
+        @memset(long[i * 64 + 1 ..][0..63], 'x');
+    }
+    long[5 * 64] = 0;
+    var li: DomainSearchIterator = .{ .data = &long };
+    try testing.expectError(error.BadOptionLength, li.next(&name));
+    var ok: [64 * 3 + 63 + 1]u8 = undefined;
+    for (0..3) |i| {
+        ok[i * 64] = 63;
+        @memset(ok[i * 64 + 1 ..][0..63], 'y');
+    }
+    ok[192] = 62;
+    @memset(ok[193..255], 'z');
+    ok[255] = 0;
+    var oi: DomainSearchIterator = .{ .data = &ok };
+    try testing.expectEqual(@as(usize, 254), (try oi.next(&name)).?.len);
+}
+
+test "options 82 and 121 with broken framing: the message parses, the iterator refuses" {
+    var buf: [400]u8 = undefined;
+    for ([_]struct { u8, []const u8 }{
+        .{ 82, &.{ 1, 5, 'a' } }, // sub-option longer than the option
+        .{ 82, &.{1} }, // half a sub-option header
+        .{ 121, &.{ 33, 10, 0, 0, 0, 10, 1, 1, 1 } }, // width 33
+        .{ 121, &.{ 33, 10, 0, 0, 0, 0, 10, 1, 1, 1 } }, // width 33 with 5 + 4 bytes behind it (RFC 3442: 0-32)
+        .{ 121, &.{ 24, 10, 0, 0, 10, 1, 1 } }, // router cut short
+    }) |c| {
+        var b = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 1 });
+        try b.addServerId(.{ 10, 9, 9, 9 });
+        try b.addOption(c[0], c[1]);
+        const bytes = try b.finish(.{});
+        // The rest of the message stays readable (a rogue-server check
+        // needs the server id even when option 121 is garbage)…
+        const m = try Message.parse(bytes);
+        try testing.expectEqual([4]u8{ 10, 9, 9, 9 }, m.server_id.?);
+        // …and the broken option reports itself when walked.
+        if (c[0] == 82) {
+            var it = m.relayAgentInfo().?;
+            try testing.expectError(error.BadOptionLength, it.next());
+        } else {
+            var it = m.classlessRoutes().?;
+            try testing.expectError(error.BadOptionLength, it.next());
+        }
+    }
+}
+
+test "Builder: the new options reproduce the tcpdump-checked bytes" {
+    var buf: [400]u8 = undefined;
+    var b = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 0x1234abcd });
+    try b.addMessageType(.ack);
+    try b.addServerId(.{ 10, 1, 1, 1 });
+    try b.addNtpServers(&.{ 10, 1, 1, 5, 10, 1, 1, 6 });
+    try b.addOption(@intFromEnum(OptionCode.vendor_specific), &.{ 1, 4, 'a', 'b', 'c', 'd' });
+    try b.addVendorClassId("MSFT 5.0");
+    try b.addTftpServerName("tftp.example");
+    try b.addBootfileName("boot.efi");
+    try b.addRelayAgentInfo("eth0:5", &.{ 0, 0x11, 0x22, 0x33, 0x44, 0x55 });
+    const built = try b.finish(.{});
+    // The options region of the captured message up to (excluding) option 119.
+    const opts = ack_with_options[header_len + 4 ..];
+    const end119 = std.mem.indexOf(u8, opts, &.{ 119, 24 }).?;
+    try testing.expectEqualSlices(u8, opts[0..end119], built[header_len + 4 ..][0..end119]);
+
+    var b2 = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 1 });
+    // Host bits past /22 are not sent: 192.168.7.9/22 encodes as 192.168.4.
+    try b2.addClasslessRoutes(&.{
+        .{ .destination = .{ 10, 0, 0, 0 }, .prefix_len = 8, .router = .{ 10, 1, 1, 1 } },
+        .{ .destination = .{ 192, 168, 4, 0 }, .prefix_len = 22, .router = .{ 10, 1, 1, 2 } },
+        .{ .destination = .{ 0, 0, 0, 0 }, .prefix_len = 0, .router = .{ 10, 1, 1, 254 } },
+    });
+    try b2.addDomainSearch(&.{ "eng.example.com", "corp.example.com" });
+    const m = try Message.parse(try b2.finish(.{}));
+    const at121 = std.mem.indexOf(u8, opts, &.{ 121, 19 }).?;
+    try testing.expectEqualSlices(u8, opts[at121 + 2 ..][0..19], m.classless_static_routes.?);
+    var di = m.domainSearch().?;
+    var name: [DomainSearchIterator.max_name_len]u8 = undefined;
+    try testing.expectEqualStrings("eng.example.com", (try di.next(&name)).?);
+    try testing.expectEqualStrings("corp.example.com", (try di.next(&name)).?);
+    try testing.expectError(error.OptionTooLong, b2.addDomainSearch(&.{"a..b"}));
 }

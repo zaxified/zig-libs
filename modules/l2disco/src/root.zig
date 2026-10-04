@@ -67,6 +67,9 @@ pub const arp = @import("arp.zig");
 /// DHCP (RFC 2131 / 2132) message + options codec.
 pub const dhcp = @import("dhcp.zig");
 
+/// IPv6 Neighbor Discovery (RFC 4861) codec — the IPv6 counterpart of `arp`.
+pub const nd = @import("nd.zig");
+
 /// 48-bit MAC (EUI-48) address helper.
 pub const mac = @import("mac.zig");
 
@@ -84,6 +87,7 @@ test {
     _ = @import("arp.zig");
     _ = @import("dhcp.zig");
     _ = @import("mac.zig");
+    _ = @import("nd.zig");
     _ = @import("capture_test.zig");
 }
 
