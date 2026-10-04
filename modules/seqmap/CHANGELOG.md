@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (17 mutants, 17 killed by the existing tests; no test or
+  source change).
 - **2026-07-19** — Security audit: one finding fixed (part of the collection-wide audit;
   the root changelog records no further detail than this). Modeled on fping `seqmap.c`
   (design reference, not a test anchor).
