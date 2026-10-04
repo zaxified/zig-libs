@@ -60,4 +60,6 @@ check value are public (ISO 3309, RFC 1952, the reveng CRC catalogue); the
 folding and the GF(2) multiply follow published descriptions (Intel's white
 paper, zlib's documented `crc32_combine` algorithm) and every constant is
 derived in the source; no third-party source was translated, so no NOTICE
-entry.
+entry. The `combine` test vectors
+(`src/kat_vectors.zig`) are captured from Go's `hash/crc32` run as a black-box
+oracle by `tools/gen_kat.go`; nothing of Go's source was consulted or copied.

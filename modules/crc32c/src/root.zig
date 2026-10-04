@@ -484,6 +484,18 @@ test "combine's zero-byte operator x^(8n) is right for every u64 length" {
     }
 }
 
+test "combine matches Go's hash/crc32 past 2^29 and 2^32 bytes" {
+    // Every expected value is Go's (tools/gen_kat.go): the checksum of a
+    // prefix followed by n zero bytes, and of the n zero bytes alone. Only
+    // `hash` of the short prefix and `combine` itself are computed here.
+    const kat = @import("kat_vectors.zig");
+    for (kat.prefixes, 0..) |prefix, p| {
+        for (kat.lengths, 0..) |n, i| {
+            try testing.expectEqual(kat.crc[p][i], combine(hash(prefix), kat.crc[0][i], n));
+        }
+    }
+}
+
 test "fuzz: every backend, extend and combine agree with std on arbitrary bytes" {
     try testing.fuzz({}, fuzzAgree, .{});
 }

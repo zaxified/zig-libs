@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: `combine` is now held to Go's `hash/crc32` (Castagnoli) at lengths
+  around 2^28 … 2^33 and past 5·10^9 bytes, for three prefixes (`tools/gen_kat.go` →
+  `src/kat_vectors.zig`); the test fails with the `len_b ≥ 2^29` defect put back. Anchor
+  grade MIXED → EXTERNAL.
 - **2026-10-04** — Fix: `combine(a, b, len_b)` returned a wrong checksum whenever
   `len_b ≥ 2^29` bytes (512 MiB). Its table of x^(2^k) mod P was folded to 32 entries as
   zlib does for the IEEE polynomial, but CRC-32C's powers repeat every 31. Shorter lengths

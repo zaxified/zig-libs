@@ -53,4 +53,6 @@ Provenance: original work of the zig-libs authors (MIT). The polynomial and
 check values are public (RFC 3720, the reveng CRC catalogue); the
 three-stream split and the GF(2) multiply follow published descriptions
 (Intel's white paper, zlib's documented `crc32_combine` algorithm); no
-third-party source was translated, so no NOTICE entry.
+third-party source was translated, so no NOTICE entry. The `combine` test vectors
+(`src/kat_vectors.zig`) are captured from Go's `hash/crc32` run as a black-box
+oracle by `tools/gen_kat.go`; nothing of Go's source was consulted or copied.
