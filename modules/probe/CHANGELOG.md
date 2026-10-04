@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (27 schemata mutants, 21 killed, 1 equivalent, 5 left
+  alive on resolver/kernel-dependent paths, see SPEC). New tests: `canceledCount` counts only
+  cancellations, one `.up` repetition is reachable, a spent budget is `.timeout` before any
+  connect. No code change.
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

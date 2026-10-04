@@ -6,7 +6,7 @@
 
 **Scope:** core — Prometheus blackbox_exporter v0.28.0 `tcp` prober (connect-only subset) and tcping-style tools (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -172,6 +172,23 @@ produce on loopback. Measured: **200 ms budget → 200.3 ms, 1 000 ms budget →
 outside the gate: 134 367 ms). A signal-storm test (`tgkill` every 10 ms for 600 ms, no `SA_RESTART`)
 pins that `EINTR` recomputes the remainder instead of restarting the budget: 200.7 ms with 20
 signals delivered. Run: `zig build test-probe`.
+
+**Audit 2026-10-04 (mutation).** 27 schemata mutants over `TargetResult`
+(`canceledCount`, `reachable`), the worker/repetition clamps, `probeTcp` (app check, errno
+carry), the aggregation (cancellations excluded, an `.up` without rtt as loss), the
+target cap and fan-out, `overBudget`, `classifyErr`/`classifyErrno`, and `PosixConnector`
+(literal-only, the per-address budget fold, `connectBounded`'s deadline, poll and SO_ERROR
+logic): 21 killed, 1 equivalent, 5 left alive. Equivalent: the `n == 0` early return after
+resolution (with no address the fold never runs and `best` is already `.error`). Alive, all
+on paths no offline test can drive deterministically: the multi-address fold in
+`connectImpl` -- `ran_out` on a per-address timeout, `.refused` outranking a later
+`.error`, and `.refused` surviving a spent budget -- needs a name resolving to two or more
+addresses (the system resolver's answer is host-dependent); `connect()` completing
+synchronously on a non-blocking socket (Linux loopback answers `EINPROGRESS`); and a poll
+wake with `SO_ERROR = 0` but no `POLLOUT` (a kernel edge). Making the fold a pure function
+over per-address verdicts would let all three be pinned. Tests added for the 3 real gaps:
+`canceledCount` counts only cancellations, a single `.up` repetition is reachable, and a
+budget already spent before the connect is `.timeout` with nothing attempted.
 
 ## Backlog / deferred
 Name resolution is not bounded by `timeout_ns` and cannot be by a `poll`-based connector — see the

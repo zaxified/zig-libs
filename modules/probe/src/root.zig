@@ -1561,6 +1561,41 @@ test "live: the std path ignores the same budget — the contrast that makes thi
     try testing.expect(!live_race.done.load(.acquire));
 }
 
+test "canceledCount counts only cancellations; one up repetition is reachable" {
+    // `canceledCount`: repetitions that "never ran to a verdict because the
+    // caller cancelled" -- a timeout is a verdict. `reachable`: "True if at
+    // least one repetition connected" -- one is enough. Mutation 2026-10-04:
+    // counting timeouts as cancelled, and needing two ups, both survived.
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "mix", .outcomes = &.{
+            .{ .status = .canceled },
+            .{ .status = .timeout },
+            .{ .status = .up, .rtt_ns = 5 },
+        } },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const r = try probeTarget(testing.allocator, .{ .host = "mix", .port = 1 }, .{ .connector = fake.connector(), .count = 3 });
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), r.canceledCount());
+    try testing.expectEqual(@as(u64, 1), r.stats.received);
+    try testing.expect(r.reachable());
+}
+
+test "PosixConnector: a budget already spent before the connect is a timeout, and nothing is attempted" {
+    // `connectImpl`: each connect gets the REMAINDER of the budget, "and once
+    // it is gone nothing more is attempted"; with nothing tried and the budget
+    // gone the verdict is `.timeout`. A 1 ns budget is spent by the time the
+    // literal has been parsed. (A closed port proves no connect ran: it would
+    // have answered `.refused` at once.) Mutation 2026-10-04: dropping the
+    // check survived -- and underflowed `timeout_ns - spent_now`.
+    const ln = try listenLoopback(false, 8);
+    _ = tl.close(ln.fd);
+    var pc: PosixConnector = .{ .resolve = .literal_only };
+    var buf: [24]u8 = undefined;
+    const tgt = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    try testing.expectEqual(Status.timeout, pc.connector().connect(tgt, 1).status);
+}
+
 test "live: a closed loopback port is refused fast, and is never reported as a timeout" {
     // Bind to learn a port, then close it: nothing is listening there.
     const ln = try listenLoopback(false, 8);
