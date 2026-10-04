@@ -6,7 +6,7 @@
 
 **Scope:** core — go-chi/chi `middleware.RequestID` v5.3.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -68,6 +68,12 @@ does not fill that need.
 uniqueness across requests, adopt a valid incoming ID, regenerate on a malformed incoming value or
 `trust_incoming=false`, `echo=false` suppresses the response header, custom header name. Green in
 Debug + ReleaseFast. Run: `zig build test-requestid`.
+
+**Audit 2026-10-04 (mutation).** 12 schemata mutants over `current()`, the adopt-or-generate
+middleware (`trust_incoming`, `echo`, `isAdoptable` length cap and charset), and
+`generateInto`'s counter and fields: 12 killed, 0 equivalent, 0 left alive. Two survivors of
+the first run got tests: `current()` is null on a thread no middleware ran on (a fresh thread),
+and the last 12 hex digits of consecutive ids step by one (the per-thread counter).
 
 ## Backlog / deferred
 

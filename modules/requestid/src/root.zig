@@ -200,6 +200,35 @@ const testing = std.testing;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
+test "current() is null on a thread no middleware has run on" {
+    // `current` doc: "or null if no `RequestId` middleware has run on this
+    // thread yet". A fresh thread has fresh thread-locals. Mutation
+    // 2026-10-04: returning the empty slice instead of null survived.
+    const T = struct {
+        fn run(out: *bool) void {
+            out.* = current() == null;
+        }
+    };
+    var was_null = false;
+    const th = try std.Thread.spawn(.{}, T.run, .{&was_null});
+    th.join();
+    try testing.expect(was_null);
+}
+
+test "generateInto: the last 12 hex digits are a per-thread counter that steps by one" {
+    // `generateInto` doc: "16 hex of monotonic ns · 4 hex of a per-thread
+    // nonce · 12 hex of a per-thread counter". The counter is what keeps two
+    // ids apart when the clock has not moved. Mutation 2026-10-04: a frozen
+    // counter survived (two ids then differ only if the nanosecond did).
+    var a: [generated_len]u8 = undefined;
+    var b: [generated_len]u8 = undefined;
+    const ia = generateInto(&a);
+    const ib = generateInto(&b);
+    const ca = try std.fmt.parseInt(u64, ia[20..32], 16);
+    const cb = try std.fmt.parseInt(u64, ib[20..32], 16);
+    try testing.expectEqual((ca + 1) & 0xffffffffffff, cb);
+}
+
 fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
     var in: Reader = .fixed(bytes);
     var out: Writer = .fixed(out_buf);

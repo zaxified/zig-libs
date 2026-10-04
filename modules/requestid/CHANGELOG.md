@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (12 schemata mutants, all killed after two new tests:
+  `current()` null on a fresh thread, `generateInto`'s counter field steps by one). No code change.
+
 - **2026-08-31** — `isAdoptable` (whether an incoming ID would be adopted)
   and `generateInto` (a fresh ID into a caller-owned buffer, nothing
   request-scoped kept) are public, for callers outside the middleware.
