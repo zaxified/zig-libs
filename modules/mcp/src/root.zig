@@ -3910,6 +3910,14 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+test "truncateUtf8 cuts at a codepoint boundary, and at the bound itself when the bytes are not UTF-8" {
+    try testing.expectEqualStrings("ab", truncateUtf8("ab\u{e9}", 3)); // é is 2 bytes
+    try testing.expectEqualStrings("ab\u{e9}", truncateUtf8("ab\u{e9}x", 4));
+    // A `std.json` string is valid UTF-8, so no peer reaches this today; the
+    // bound is the point of the function and must not depend on that.
+    try testing.expectEqual(@as(usize, 3), truncateUtf8("\xff\xfe\xfd\xfc\xfb", 3).len);
+}
+
 const testing = std.testing;
 
 /// App state for ctx-threading tests: the whole point of the module is that a
@@ -4384,6 +4392,33 @@ test "tools/call: NDJSON tool stays text-only (allow_structured=false)" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"trace"}}
     ,
         \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"line\":1}\n{\"line\":2}\n"}],"isError":false}}
+        \\
+    );
+}
+
+fn objectTextHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    call.write("{\"a\":1}");
+    return false;
+}
+
+test "tools/call: allow_structured=false keeps even a single JSON object text-only" {
+    // The NDJSON test above cannot tell: its text is not one object, so it
+    // stays text-only either way. A tool that opted out of structured output
+    // must not get it because its text happens to parse.
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "obj",
+        .description = "prints one object",
+        .input_schema = "{\"type\":\"object\"}",
+        .allow_structured = false,
+        .handler = &objectTextHandler,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"obj"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"a\":1}"}],"isError":false}}
         \\
     );
 }
@@ -5232,15 +5267,18 @@ test "initialize: an over-long clientInfo field is truncated, not rejected" {
     const long_name = "a" ** 300;
     const msg = try std.fmt.allocPrint(
         testing.allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"1\"}}}}}}",
-        .{long_name},
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"{s}\",\"title\":\"{s}\"}}}}}}",
+        .{ long_name, long_name, long_name },
     );
     defer testing.allocator.free(msg);
     try feed(&s, msg);
 
+    // Every field: each is the peer's to choose, and each is kept.
     const ci = s.clientInfo(0).?;
-    try testing.expectEqual(s.max_client_info_field_len, ci.name.len);
-    try testing.expect(std.mem.allEqual(u8, ci.name, 'a'));
+    for ([_][]const u8{ ci.name, ci.version, ci.title.? }) |field| {
+        try testing.expectEqual(s.max_client_info_field_len, field.len);
+        try testing.expect(std.mem.allEqual(u8, field, 'a'));
+    }
 }
 
 test "initialize: re-handshake frees the previous clientInfo copy (no leak)" {
@@ -5537,6 +5575,13 @@ test "sampling: image/audio blocks + priority validation" {
         .max_tokens = 1,
         .model_preferences = .{ .speed_priority = -0.1 },
     }, .{}));
+    // NaN is in no range: `p < 0 or p > 1` is false for it, so the check is
+    // written as "not inside", which NaN fails.
+    try testing.expectError(error.InvalidPriority, s.sendSamplingRequest(&aw.writer, .{
+        .messages = &msgs,
+        .max_tokens = 1,
+        .model_preferences = .{ .intelligence_priority = std.math.nan(f64) },
+    }, .{}));
     try testing.expectError(error.NoMessages, s.sendSamplingRequest(&aw.writer, .{
         .messages = &.{},
         .max_tokens = 1,
@@ -5725,6 +5770,12 @@ test "elicitation schema: the restricted subset is enforced" {
         // only multi-select enums are.
         .{ .schema =
         \\{"type":"object","properties":{"xs":{"type":"array","items":{"type":"string"}}}}
+        , .want = error.SchemaBadItems },
+        // A multi-select enum is an array of STRINGS (the spec's
+        // `items: {type: "string", enum}`): an enum of another item type is
+        // not in the subset, whatever its values look like.
+        .{ .schema =
+        \\{"type":"object","properties":{"xs":{"type":"array","items":{"type":"number","enum":["1"]}}}}
         , .want = error.SchemaBadItems },
         .{ .schema =
         \\{"type":"object","properties":{"x":{"type":"null"}}}
@@ -6075,6 +6126,10 @@ test "elicitation: userinfo cannot smuggle a host past the http loopback allowan
         "http://[::1]/connect",
         "http://[::1]:7717/connect",
         "http://user@localhost:7717/connect",
+        // Userinfo ends at the LAST '@', the WHATWG reading too (`new
+        // URL(...).host` is `localhost:7717`): the earlier '@' is part of
+        // the username, so the client opens loopback.
+        "http://user@name@localhost:7717/connect",
         "http://localhost",
         "http://localhost?x=1",
         // The same rule in the other direction: WHATWG reads this host as
@@ -6420,6 +6475,39 @@ test "correlation: responses go to the right pending request, out of order" {
     try testing.expectEqual(@as(u32, 1), samp.calls);
     try testing.expectEqualStrings("one-answer", samp.text());
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
+}
+
+test "correlation: error wins over result in an answer carrying both; a code outside i32 is internal_error, never a crash" {
+    var s = try serverWithCaps("{\"sampling\":{}}");
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const cases = [_]struct { body: []const u8, code: i32 }{
+        // JSON-RPC forbids both members; the error is the safer reading —
+        // a result read from a message that also says "failed" is a guess.
+        .{ .body = "\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"x\"},\"model\":\"m\"},\"error\":{\"code\":-1,\"message\":\"no\"}", .code = -1 },
+        // The peer's code is any JSON integer; ours is an i32. Out of range
+        // it is not the peer's code at all, so the default stands -- an
+        // `@intCast` here would let any client crash the server.
+        .{ .body = "\"error\":{\"code\":4294967296,\"message\":\"big\"}", .code = error_code.internal_error },
+        .{ .body = "\"error\":{\"code\":-2147483649,\"message\":\"small\"}", .code = error_code.internal_error },
+        .{ .body = "\"error\":{\"code\":2147483647,\"message\":\"edge\"}", .code = std.math.maxInt(i32) },
+        .{ .body = "\"error\":{\"code\":-2147483648,\"message\":\"edge\"}", .code = std.math.minInt(i32) },
+    };
+    for (cases) |c| {
+        var col = Collector{};
+        const id = try s.sendSamplingRequest(&aw.writer, .{
+            .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+            .max_tokens = 10,
+        }, .{ .on_response = &Collector.on, .ctx = &col });
+        aw.clearRetainingCapacity();
+        const line = try std.fmt.allocPrint(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{d},{s}}}", .{ id, c.body });
+        defer testing.allocator.free(line);
+        try s.handleMessage(line, &aw.writer);
+        try testing.expectEqualStrings("", aw.written());
+        try testing.expectEqual(@as(u32, 1), col.calls);
+        try testing.expectEqual(@as(?i32, c.code), col.last_error_code);
+    }
 }
 
 test "correlation: a response for an unknown/foreign id is dropped, never answered" {

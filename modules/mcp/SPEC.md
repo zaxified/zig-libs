@@ -6,7 +6,7 @@
 
 **Scope:** core — MCP TypeScript SDK 2.2.0, server side, MCP spec 2026-07-28 (surveyed 2026-09-30; raised from mvp 2026-09-30 when 2026-07-28 was served)
 
-**Audit:** review 2026-09-02 · mutation ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -383,6 +383,28 @@ requests fit and the 257th does not) rather than in terms of the constant they c
 was one direction short as well: the response harness now pre-arms pending entries so
 `SamplingResult.parse`, `parseContentBlock`, `ElicitationResult.parse` and the error-object decode
 are actually reached, and asserts that it reached them.
+
+### Mutation run 2026-10-04
+
+Mutant schemata over a copy of `root.zig` (one ReleaseSafe build with `testkit`, all 139 tests,
+`setsid -w timeout -s KILL 120` per mutant): **63 mutants, 62 killed, 1 equivalent**. Aimed at what
+the 21 hand mutations of 2026-08 predate or did not reach: the 2026-07-28 path (`classifyRequest`'s
+three refusals and the unsupported-version arm, the stateless-method table, `server/discover`
+without `_meta`, `initialize` forced to the session era), `StateSeal` (MAC, expiry edge, length
+prefixes, principal and head in the MAC), MRTR (`ask`'s key and capability checks, `fromParams`'
+type checks), the id gate (`conformingId`, the response-shaped path, `notifications/initialized`
+with an id, id-less requests), `deliverResponse`, `ClientCapabilities.parse`, the elicitation
+schema subset, the URL guard, `truncateUtf8`, `readLine`'s bound, `max_pending`/`max_peers`, and
+the sampling/elicitation request checks. The equivalent one: `StateSeal.open`'s version-byte check
+— the byte is inside the MAC, so a changed version fails verification anyway (the check only fails
+fast). Eight survivors were gaps, each closed by a test: an answer carrying both `error` and
+`result` (error wins); an error `code` outside i32 (left at internal error — without the range
+check an `@intCast` would let any client crash the server; both i32 edges kept); a long
+`clientInfo.title` (only `name` was checked for truncation); `truncateUtf8` on bytes that are not
+UTF-8 (unreachable through `std.json`, cut at the bound all the same); a multi-select enum whose
+`items.type` is not `string`; userinfo with two `@` over loopback (the LAST `@` ends it, as in
+WHATWG); `allow_structured = false` with text that is one JSON object (the NDJSON test could not
+tell); a NaN model priority. No defect. Run: `zig build test-mcp`.
 
 ## Backlog / deferred
 
