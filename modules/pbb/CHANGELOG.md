@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (44 mutants, 44 killed); added a test for the error class at the exact boundary lengths of the tag-region EtherType and the B-Tag + next-EtherType checks.
+
 - **2026-09-07** — **`fuzzDecode` handed `decode` an EMPTY frame on every input, and
   the EtherType bias it needed to get anywhere had never executed.**
 

@@ -791,6 +791,26 @@ test "decode: B-Tag not followed by the I-TAG EtherType is rejected" {
     _ = try decode(&buf);
 }
 
+test "decode: the error class follows the first missing field, at the exact boundary lengths" {
+    // WHY: `DecodeError.Truncated` is "fewer bytes than the field being read
+    // requires". With exactly B-DA + B-SA + a 2-octet tag-region EtherType
+    // (14 bytes) that EtherType IS fully present, so a wrong value is
+    // `UnexpectedEtherType`, not `Truncated`; one byte less is `Truncated`.
+    // Likewise a B-Tag followed by a complete (but wrong) next EtherType is
+    // exactly 12 + 4 + 2 = 18 bytes and is `MissingITag`; 17 bytes is
+    // `Truncated`.
+    var plain: [b_mac_len + 2]u8 = @splat(0);
+    std.mem.writeInt(u16, plain[b_mac_len..][0..2], 0x0800, .big);
+    try testing.expectError(error.UnexpectedEtherType, decode(&plain));
+    try testing.expectError(error.Truncated, decode(plain[0 .. plain.len - 1]));
+
+    var tagged: [b_mac_len + b_tag_len + 2]u8 = @splat(0);
+    std.mem.writeInt(u16, tagged[b_mac_len..][0..2], b_tpid, .big);
+    std.mem.writeInt(u16, tagged[b_mac_len + b_tag_len ..][0..2], 0x0800, .big);
+    try testing.expectError(error.MissingITag, decode(&tagged));
+    try testing.expectError(error.Truncated, decode(tagged[0 .. tagged.len - 1]));
+}
+
 test "decode: reserved I-TCI bits are ignored (fail-open, per spec), not rejected" {
     const fields: Fields = .{
         .b_da = @splat(0),

@@ -6,7 +6,7 @@
 
 **Scope:** core — Wireshark 4.6.4 ieee8021ah dissector, IEEE 802.1ah (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -213,6 +213,26 @@ B-Tag-without-I-TAG rejection; reserved-bit ignore-on-receipt; I-SID
 tenant-isolation; encode buffer-too-small and caller-buffer≡alloc equivalence;
 and the `std.testing.fuzz` target. Green in Debug and
 `-Doptimize=ReleaseFast`; `zig fmt --check` clean.
+
+## Mutation run 2026-10-04
+
+First mutation-schemata run (one ReleaseSafe test binary, 44 mutants behind a
+runtime switch, baseline first): 44 mutants, 44 killed, 0 equivalent. Covered:
+B-TCI and I-TCI shifts and masks on encode and decode (PCP, DEI, UCA, reserved
+bit, 24-bit I-SID), `headerLen`, the `max_frame_len` and buffer-size comparisons
+in `encode`, `encodeAlloc` and `decode`, MAC field order (B-DA/B-SA, C-DA/C-SA)
+on both sides, the TPID / I-TAG EtherType written, every `Truncated`
+boundary and the `MissingITag` / `UnexpectedEtherType` checks on decode,
+the customer-data offset, and `hasBTag` / `bvid`.
+
+Two mutants survived the existing tests (the `<=` form of the 14-byte
+minimum-length check and of the B-Tag + next-EtherType truncation check): at
+those exact lengths the tests did not distinguish `Truncated` from the
+field-specific error. Both were killed by one new test; expected errors follow
+the `DecodeError` docs ("Truncated: fewer bytes than the field being read
+requires" - at 14 and 18 bytes the EtherType field is complete, so a wrong
+value is `UnexpectedEtherType` / `MissingITag`, one byte less is `Truncated`).
+No source defects found.
 
 ## Backlog / deferred
 
