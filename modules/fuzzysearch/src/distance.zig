@@ -134,3 +134,14 @@ test "osa: rejects over-long inputs" {
     try testing.expectError(error.TooLong, osaDistance(&big, "a"));
     try testing.expectError(error.TooLong, osaDistance("a", &big));
 }
+
+test "osa: inputs of exactly max_ref_len are accepted (only longer ones are TooLong)" {
+    // WHY: `max_ref_len` is documented as the maximum accepted length ("both
+    // inputs must be <= max_ref_len"); distance of a string to itself is 0 and
+    // to the empty string is its length.
+    var big: [max_ref_len]u8 = undefined;
+    @memset(&big, 'a');
+    try testing.expectEqual(@as(u32, 0), try osaDistance(&big, &big));
+    try testing.expectEqual(@as(u32, max_ref_len), try osaDistance(&big, ""));
+    try testing.expectEqual(@as(u32, max_ref_len), try osaDistance("", &big));
+}

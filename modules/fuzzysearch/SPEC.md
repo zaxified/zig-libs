@@ -6,7 +6,7 @@
 
 **Scope:** core — SymSpell 6.7.3 (with Lucene FuzzyQuery / BurntSushi `fst` as the automaton-over-index lineage) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -194,6 +194,32 @@ higher layer if producer authenticity matters. Same posture as `trie`.
 
 No large benchmark is run: correctness is the bar and unit tests stay in the
 thousands-of-keys range so `zig build test-fuzzysearch` never balloons.
+
+## Mutation run 2026-10-04
+
+First mutation-schemata run (one ReleaseSafe test binary, 43 mutants behind a
+runtime switch over `search.zig` and `distance.zig`, baseline first): 43
+mutants, 41 killed, 2 equivalent. Covered: limit checks (`max_query_len`,
+`max_k`, key-buffer share, reference-helper length), ranking order, selector
+eviction/insert position, `cap` and the cell clamp, root and node terminal
+checks, the visit budget (`>=`), the depth check, DP costs (insert / delete /
+substitute / transposition and its guards), pruning thresholds, the edge byte
+loop, and the `distance.zig` reference DP.
+
+10 mutants survived the existing tests; 8 were killed by five new tests
+(inclusive limits at `max_query_len` / `max_k` with a 256-byte query, a key
+exactly filling its `key_buf` share, `max_visited` counting decoded nodes
+exactly, k=0 pruning bounded to the query's own path, `osaDistance` at exactly
+`max_ref_len`).
+
+Equivalent: (1) `end > max_depth` -> `>=` in the walk: the check is
+unreachable on any input, because a node is only pushed while its DP-row
+minimum is <= k, so its depth is <= `max_query_len + max_k + 1` = 511, and one
+v2 edge adds at most `trie.format.max_tail + 1` = 256 bytes; the deepest `end`
+is therefore 767 < `max_depth`. `error.KeyTooLong` from `search` is dead code
+(defensive; the doc comment on `max_depth` implies it can fire). (2) removing
+`osaDistance`'s `a.len == 0` early return: the loop does not run and the same
+`prev[n]` is returned.
 
 ## Deliberately deferred
 

@@ -489,3 +489,98 @@ test "search: usage-limit errors" {
     try testing.expectError(error.QueryTooLong, f.search(&longq, 1, &results, &kb, .{}));
     try testing.expectError(error.DistanceTooLarge, f.search("a", max_k + 1, &results, &kb, .{}));
 }
+
+test "search: limits are inclusive — query of max_query_len and k of max_k are accepted" {
+    // WHY: the doc comments say a LONGER query / a k EXCEEDING max_k is an
+    // error, so a value exactly at the limit must work (query.len == 256 fits
+    // the DP row, k + 1 == 255 fits a u8 cell). Expected distances follow by
+    // construction: a query equal to a key is distance 0; "aa" is 254
+    // deletions away from 256 a's, i.e. exactly at k = max_k.
+    var q: [max_query_len]u8 = undefined;
+    @memset(&q, 'a');
+    for ([_]trie.FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
+        const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
+            .{ .key = &q, .value = 1 },
+            .{ .key = "aa", .value = 3 },
+            .{ .key = "b", .value = 4 }, // 256 edits away: excluded, but its DP cells reach 256
+        }, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var results: [3]Match = undefined;
+        var kb: [3 * max_query_len]u8 = undefined;
+
+        const r1 = try f.search(&q, 0, &results, &kb, .{ .max_visited = 0 });
+        try testing.expectEqual(@as(usize, 1), r1.items.len);
+        try testing.expectEqual(@as(u32, 1), r1.items[0].value);
+        try testing.expectEqual(@as(u32, 0), r1.items[0].distance);
+
+        const r2 = try f.search(&q, max_k, &results, &kb, .{ .max_visited = 0 });
+        try testing.expectEqual(@as(usize, 2), r2.items.len);
+        try testing.expectEqual(@as(u32, 0), r2.items[0].distance);
+        try testing.expectEqual(@as(u32, 254), r2.items[1].distance);
+        try testing.expectEqualStrings("aa", r2.items[1].key);
+    }
+}
+
+test "search: a key that exactly fills its key_buf share is accepted" {
+    // WHY: KeyBufTooSmall is documented as "a matched key does not fit its
+    // share", so a key of exactly `stride` bytes fits.
+    const buf = try build(&.{.{ .key = "praha", .value = 1 }});
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var results: [1]Match = undefined;
+    var kb: [5]u8 = undefined;
+    const r = try f.search("praha", 0, &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 1), r.items.len);
+    try testing.expectEqualStrings("praha", r.items[0].key);
+    var kb4: [4]u8 = undefined;
+    try testing.expectError(error.KeyBufTooSmall, f.search("praha", 0, &results, &kb4, .{}));
+}
+
+test "search: max_visited counts decoded nodes exactly (budget == work is complete, one less is truncated)" {
+    // WHY: SearchOptions.max_visited is "the maximum number of trie nodes
+    // search may decode". The root of this index has three leaf edges, so a
+    // full walk decodes exactly 3 nodes: a budget of 3 completes, a budget of 2
+    // must stop before the third.
+    const buf = try build(&.{
+        .{ .key = "a", .value = 1 },
+        .{ .key = "b", .value = 2 },
+        .{ .key = "c", .value = 3 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var results: [4]Match = undefined;
+    var kb: [4 * 4]u8 = undefined;
+    const r3 = try f.search("a", 0, &results, &kb, .{ .max_visited = 3 });
+    try testing.expectEqual(SearchStatus.complete, r3.status);
+    try testing.expectEqual(@as(usize, 1), r3.items.len);
+    const r2 = try f.search("a", 0, &results, &kb, .{ .max_visited = 2 });
+    try testing.expectEqual(SearchStatus.truncated_budget, r2.status);
+}
+
+test "search: pruning keeps k=0 work to the query's own path" {
+    // WHY: SPEC "Why the pruning is correct": a subtree is skipped the moment
+    // its DP-row minimum exceeds k. For k = 0 only nodes whose path is a prefix
+    // of the query survive, so an exact lookup decodes at most the sum of the
+    // edge counts of the nodes along that one path: here 1 (n) + 1 + 1 + 1 +
+    // 5 + 10 + 10 = 29 in the 6-digit v1 trie (v2 merges chains, never more).
+    // Weaker pruning would still return the same match but expand the 10-way
+    // fan-outs below mismatching edges, far over this budget.
+    var kbuf: [16]u8 = undefined;
+    for ([_]trie.FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
+        var pairs: [500]trie.Pair = undefined;
+        var names: [500][7]u8 = undefined;
+        for (0..500) |i| {
+            _ = std.fmt.bufPrint(&names[i], "n{d:0>6}", .{i}) catch unreachable;
+            pairs[i] = .{ .key = &names[i], .value = @intCast(i) };
+        }
+        const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &pairs, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var results: [2]Match = undefined;
+        const r = try f.search("n000123", 0, &results, &kbuf, .{ .max_visited = 29 });
+        try testing.expectEqual(SearchStatus.complete, r.status);
+        try testing.expectEqual(@as(usize, 1), r.items.len);
+        try testing.expectEqual(@as(u32, 123), r.items[0].value);
+    }
+}
