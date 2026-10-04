@@ -12,24 +12,14 @@
 //! unlinkability against a **global passive adversary**. This module builds
 //! and model-checks that strategy inside `netsim`.
 //!
-//! **Status: complete.** Everything that DEFINES and MEASURES anonymity is real:
-//! the stratified topology + route selection (`routing.zig`, incl. a real
-//! `sphinx` onion round-trip proving the packet substrate), the fixed-size
-//! header codec (`types.zig`), the entire global-passive-adversary anonymity
-//! measurement (`adversary.zig` — effective anonymity set + linking probability
-//! under the mix's own delay law), and a deliberately-broken **FIFO positive
-//! control** (`protocol.zig`) that the harness flags hard. The mixing core —
-//! `mixing.sampleExpDelay` (discrete memoryless / geometric hold),
-//! `mixing.scheduleRelease`, `mixing.nextCover` — is now implemented
-//! (`gate.fable_core_implemented = true`): the real Poisson mix satisfies the
-//! retuned `AnonymityBound` across a clean-run seed sweep, while the FIFO and
-//! no-cover controls fail it under identical measurement (`protocol.zig`).
-//!
-//! Scoped OUT of Phase 1 (documented increments, see `SPEC.md`): full clients/
-//! providers/PKI, sender-chosen per-hop delays in the real onion (the sim uses
-//! the equivalent mix-chosen variant), n−1 active-attack detection via loop
-//! cover, and end-to-end (compose-across-L-hops) anonymity vs the per-mix
-//! anonymity Phase 1 measures.
+//! **Status: core, as a simulator/analysis library.** Phase 1 built the
+//! per-mix invariant and the Poisson core; Phase 2 (2026-10-04) added
+//! providers with mailboxes (`PROVIDER_CFG`, constant-size pulls),
+//! sender-chosen delays as deployed, END-TO-END sender anonymity
+//! (`measureEndToEnd`, `SenderBound`), n−1 detection from loop cover against a
+//! blocking attacker (`Attack`), and traffic cost (`TrafficStats`). Not
+//! modeled (SPEC.md § Backlog): other topologies, batch mixing, mix-originated
+//! loops, sender–receiver unlinkability, a PKI, real network I/O.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -38,7 +28,7 @@ const sphinx = @import("sphinx");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Loopix mixnet (Piotrowska et al. — Nym's design) — Poisson mix + cover traffic over `sphinx`, model-checked in netsim against a global-passive-adversary anonymity invariant",
+    .doc = "Loopix mixnet simulator (Piotrowska et al. — Nym's design) — Poisson mixing, cover traffic, providers with mailboxes and n−1 detection in netsim, scored per mix and end to end against a global passive adversary; no real network I/O",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -56,6 +46,7 @@ pub const meta = .{
 const types = @import("types.zig");
 pub const LoopixConfig = types.LoopixConfig;
 pub const AnonymityBound = types.AnonymityBound;
+pub const SenderBound = types.SenderBound;
 pub const MsgKind = types.MsgKind;
 pub const MixHeader = types.MixHeader;
 
@@ -71,6 +62,10 @@ pub const Transit = adversary.Transit;
 pub const DelayModel = adversary.DelayModel;
 pub const AnonymityResult = adversary.AnonymityResult;
 pub const measure = adversary.measure;
+/// End-to-end sender anonymity, composed backward through every layer.
+pub const measureEndToEnd = adversary.measureEndToEnd;
+pub const Origin = adversary.Origin;
+pub const SenderResult = adversary.SenderResult;
 
 /// FABLE tier — see `mixing.zig`. These three are the irreducible mixing core;
 /// everything else in this module is fully real today.
@@ -87,6 +82,14 @@ pub const Loopix = protocol.Loopix;
 pub const FifoMix = protocol.FifoMix;
 pub const scenario = protocol.scenario;
 pub const DEFAULT_CFG = protocol.DEFAULT_CFG;
+/// Loopix as deployed: providers with mailboxes, sender-chosen holds.
+pub const PROVIDER_CFG = protocol.PROVIDER_CFG;
+pub const providerScenario = protocol.providerScenario;
+/// An n−1 attacker blocking one mix, for the loop-cover detector to catch.
+pub const Attack = protocol.Attack;
+pub const Alarm = protocol.Alarm;
+pub const Delivery = protocol.Delivery;
+pub const TrafficStats = protocol.TrafficStats;
 
 const gate = @import("gate.zig");
 /// Flip once `mixing.zig`'s three stubs are real implementations — see `gate.zig`.

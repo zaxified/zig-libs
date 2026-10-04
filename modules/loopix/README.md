@@ -18,25 +18,37 @@ its contribution is the **anonymity strategy**:
   per layer, so all traffic shares the relay set and is mutually
   indistinguishable at the link level.
 
-**Status: complete.** Everything that *defines and measures* anonymity is
-real, and the irreducible *mixing* core itself is now implemented too (Part 2,
-`gate.fable_core_implemented = true`) — see "What's real" below and SPEC.md's
-"Part 2 result" for the measured anonymity separation.
+**Status: core, as a simulator/analysis library** (graded against the Loopix
+authors' own mix network simulator — see SPEC.md "Compared with"). It does not
+carry a byte over a real network; it tells you, deterministically and with
+positive controls that must fail, how anonymous a Loopix configuration is:
+
+- per mix (effective anonymity set + linking probability, against the mix's own
+  hold law) and **end to end** (which CLIENT sent this packet, composed through
+  every layer — `measureEndToEnd`);
+- with **providers and mailboxes** (constant-size pulls), **sender-chosen
+  delays** as deployed, and **n−1 detection** from loop cover against an
+  attacker blocking a mix (`Attack`, `Loopix.alarms`);
+- at what cost (`TrafficStats`: latency, cover overhead, delivery).
 
 ```zig
 const loopix = @import("loopix");
 
-// Run a mixnet in netsim, then measure anonymity against a global passive
-// adversary that links with the mix's own delay law (Kerckhoffs):
-var mix = try loopix.Loopix.init(gpa, loopix.DEFAULT_CFG, seed);   // real Poisson mix
+// Loopix as deployed: 8 clients behind 2 providers, sender-chosen holds.
+var mix = try loopix.Loopix.init(gpa, loopix.PROVIDER_CFG, seed);
 defer mix.deinit(gpa);
-var gr = try netsim.run(gpa, .{ .seed = seed, .scenario = loopix.scenario,
-    .protocol = mix.protocol(), .until = 2000 }, .{});
-defer gr.trace.deinit();
+_ = try netsim.replay(gpa, .{ .seed = seed, .scenario = loopix.providerScenario,
+    .protocol = mix.protocol(), .until = 2000 }, &.{}, null);
 
-const anon = try loopix.measure(gpa, mix.transcript(),
-    .{ .exponential = 40.0 });        // link with the Poisson hold law
-if (!anon.holds(.{})) return error.AnonymityBroken;  // min set large + no target pinned
+const law: loopix.DelayModel = .{ .exponential = 40.0 }; // the mixes' own hold law
+const per_mix = try loopix.measure(gpa, mix.transcript(), law);
+const e2e = try loopix.measureEndToEnd(gpa, mix.transcript(), mix.origins(),
+    loopix.PROVIDER_CFG.clients, loopix.PROVIDER_CFG.layers - 1, law);
+if (!per_mix.holds(.{}) or !e2e.holds(.{})) return error.AnonymityBroken;
+const cost = mix.stats(); // latency, overhead, delivery
+
+// n−1: block a middle-layer mix for a while; clients notice their loops.
+mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 1400 };
 ```
 
 ## What's real

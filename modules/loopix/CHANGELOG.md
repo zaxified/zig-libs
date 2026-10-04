@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Phase 2: providers, sender-chosen delays, end-to-end anonymity,
+  n−1 detection; scope poc → core as a simulator (user decision, reverses 2026-09-30;
+  re-surveyed against A. Piotrowska's mix network simulator).**
+  `LoopixConfig.providers` / `PROVIDER_CFG` / `providerScenario`: providers forward
+  into the first layer and keep mailboxes that clients pull at a fixed period with
+  fixed-size answers. `sender_chosen_delays`: holds drawn by the sender and carried in
+  the header (`MixHeader.has_delays/delays/recipient`; **wire format grew 39 → 72
+  octets**). `measureEndToEnd` + `SenderBound`: sender anonymity composed backward
+  through all layers (measured worst over 20 seeds: 5.78 of 8 senders / 0.286; FIFO
+  1.00; no cover 2.00). `Attack` + loop watching: an attacker blocking a mix is caught
+  during the attack on 10/10 seeds, no false alarm on 20 clean seeds, and nothing is
+  caught without sender-chosen delays. `TrafficStats`. `LoopixConfig.validate`
+  (`init` now returns `InitError`).
+  **Review (Sonnet, adversarial): 2 HIGH fixed** — L-01 (predates today): `measure`
+  divided tied departures' mass by k twice (1/k² instead of 1/k), so a batch mix could
+  pass `max_link_prob`; L-02: a mix acted on a header that did not name it (an all-zero
+  header indexed `route` past its end). MED fixed: fallback count in `SenderResult`,
+  the no-false-positive test now proves the detector watched and saw loops return,
+  delivery exactly once to the addressed client, mailboxes only from the last layer to
+  the recipient's own provider, malformed packets dropped and counted instead of
+  failing the run. **Mutation:** 24 mutants, all killed after 6 new tests.
+
 - **2026-09-07** — `fuzzMixHeaderDecode` had only ever decoded the empty slice. It drew its
   bytes with `smith.bytes(&buf)` and then took a length from
   `smith.valueRangeAtMost(u8, 0, 64)`; a ranged `Smith` draw reads eight octets as a

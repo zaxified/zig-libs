@@ -79,12 +79,55 @@ pub const LoopixConfig = struct {
     /// preserving arrival order, which is exactly what breaks anonymity).
     fifo_delay: Time = 40,
 
+    /// Providers (Loopix §3: the clients' access points, each holding its
+    /// clients' MAILBOXES). 0 = the Phase-1 topology, clients attached straight
+    /// to layer 0 and receiving straight from the last layer. With N > 0, client
+    /// `c` sends through and receives at provider `c % N`: the ingress provider
+    /// forwards to the first mix, the egress provider stores the packet in the
+    /// recipient's mailbox, and the recipient pulls every `fetch_period`.
+    providers: u8 = 0,
+    /// A client pulls its mailbox this often (provider topology only).
+    fetch_period: Time = 20,
+    /// Every pull answers EXACTLY this many slots, real packets padded with
+    /// dummies — so the size and timing of what a client downloads say nothing
+    /// about whether anyone wrote to it (receiver unobservability).
+    fetch_batch: u8 = 8,
+    /// Loopix as deployed: the SENDER draws every hop's hold and writes it into
+    /// the packet; a mix just obeys it (stateless mixes). `false` = each mix
+    /// draws its own hold (the Phase-1 variant). Same law, same anonymity —
+    /// but only sender-chosen delays let a client know when its own loop cover
+    /// must come back, which is what n−1 detection runs on.
+    sender_chosen_delays: bool = false,
+    /// n−1 detection: a loop cover packet still missing this long after its
+    /// latest possible return (sum of its own hop delays + worst-case link
+    /// latency + one fetch period) counts as LOST.
+    loop_slack: Time = 60,
+    /// ...and a client raises an alarm once this many of its loops are lost.
+    loop_alarm_lost: u32 = 2,
+
+    pub const ConfigError = error{InvalidConfig};
+
+    /// The ranges every field must be in for the header, the casts and the
+    /// mailboxes to be sound (review 2026-10-04, L-14).
+    pub fn validate(self: LoopixConfig) ConfigError!void {
+        if (self.layers == 0 or self.layers > max_layers) return error.InvalidConfig;
+        if (self.width == 0 or self.clients == 0) return error.InvalidConfig;
+        if (self.providers > self.clients) return error.InvalidConfig;
+        if (self.fetch_batch == 0 or self.fetch_batch > 16) return error.InvalidConfig; // protocol.max_fetch_batch
+        if (self.fetch_period == 0 or self.real_period == 0 or self.cover_mean_interval == 0) return error.InvalidConfig;
+        // Holds are carried as u32 and drawn through f64; keep the mean far
+        // from where either stops being exact.
+        if (self.mean_delay > 1 << 20) return error.InvalidConfig;
+        if (self.loop_alarm_lost == 0) return error.InvalidConfig;
+        if (self.nodeCount() > 255) return error.InvalidConfig;
+    }
+
     pub fn mixCount(self: LoopixConfig) usize {
         return @as(usize, self.layers) * @as(usize, self.width);
     }
 
     pub fn nodeCount(self: LoopixConfig) usize {
-        return self.mixCount() + @as(usize, self.clients);
+        return self.mixCount() + @as(usize, self.clients) + @as(usize, self.providers);
     }
 
     /// Node id of mix `(layer, w)`.
@@ -103,9 +146,28 @@ pub const LoopixConfig = struct {
         return @intCast(node / self.width);
     }
 
-    /// Is `node` a client (traffic source/sink) rather than a mix?
+    /// Is `node` a client (traffic source/sink)?
     pub fn isClient(self: LoopixConfig, node: NodeId) bool {
-        return node >= self.mixCount();
+        return node >= self.mixCount() and node < self.mixCount() + @as(usize, self.clients);
+    }
+
+    /// Client index of client node `node`.
+    pub fn clientIndex(self: LoopixConfig, node: NodeId) u8 {
+        return @intCast(node - self.mixCount());
+    }
+
+    /// Node id of provider `p` (after the mixes and the clients).
+    pub fn providerNode(self: LoopixConfig, p: u8) NodeId {
+        return @intCast(self.mixCount() + @as(usize, self.clients) + @as(usize, p));
+    }
+
+    pub fn isProvider(self: LoopixConfig, node: NodeId) bool {
+        return node >= self.mixCount() + @as(usize, self.clients) and node < self.nodeCount();
+    }
+
+    /// The provider client `c` is registered with (provider topology only).
+    pub fn providerOf(self: LoopixConfig, c: u8) NodeId {
+        return self.providerNode(c % self.providers);
     }
 };
 
@@ -149,6 +211,24 @@ pub const AnonymityBound = struct {
     max_link_prob: f64 = 0.9,
 };
 
+/// The END-TO-END invariant (`adversary.measureEndToEnd`): for every real
+/// packet leaving the last mix layer, the adversary's posterior over WHICH
+/// CLIENT sent it must stay spread over at least `min_sender_set` clients
+/// (Serjantov–Danezis `2^H`, at most the client count) and put at most
+/// `max_link_prob` on the true sender. Tuned like `AnonymityBound`, against
+/// `PROVIDER_CFG` (8 clients) over 20 clean seeds, steady-state window,
+/// measured 2026-10-04 — worst real packet over all seeds:
+///
+///     correct Poisson mix : min_sender_set 5.78 of 8, max_link_prob 0.286
+///     FIFO control        : max_link_prob 1.00 (traced straight back)
+///     no-cover control    : min_sender_set 2.00
+///
+/// so both clauses sit with margin on both sides.
+pub const SenderBound = struct {
+    min_sender_set: f64 = 4.0,
+    max_link_prob: f64 = 0.5,
+};
+
 // ── the in-sim mix header ────────────────────────────────────────────────────
 //
 // In production this is an encrypted, fixed-length Sphinx onion (see
@@ -170,10 +250,19 @@ pub const MixHeader = struct {
     /// Number of mix hops in the route (`= layers`); `route[n_hops]` is the
     /// destination client.
     n_hops: u8,
-    /// `route[0..n_hops]` = the chosen mix per layer; `route[n_hops]` = dest.
+    /// `route[0..n_hops]` = the chosen mix per layer; `route[n_hops]` = dest
+    /// (the recipient's provider, in the provider topology).
     route: [max_hops]NodeId,
+    /// Sender-chosen holds: `delays[i]` is what mix `route[i]` must hold the
+    /// packet for. Only meaningful when `has_delays` — otherwise each mix
+    /// draws its own.
+    has_delays: bool = false,
+    delays: [max_hops]u32 = @splat(0),
+    /// The client whose mailbox the packet ends in (== `route[n_hops]` in the
+    /// direct topology).
+    recipient: NodeId = 0,
 
-    pub const wire_len = 1 + 8 + 1 + 1 + max_hops * 4;
+    pub const wire_len = 1 + 8 + 1 + 1 + max_hops * 4 + 1 + max_hops * 4 + 4;
 
     pub fn encode(self: MixHeader, buf: *[wire_len]u8) void {
         buf[0] = @intFromEnum(self.kind);
@@ -185,6 +274,13 @@ pub const MixHeader = struct {
             std.mem.writeInt(u32, buf[off..][0..4], r, .little);
             off += 4;
         }
+        buf[off] = @intFromBool(self.has_delays);
+        off += 1;
+        for (self.delays) |d| {
+            std.mem.writeInt(u32, buf[off..][0..4], d, .little);
+            off += 4;
+        }
+        std.mem.writeInt(u32, buf[off..][0..4], self.recipient, .little);
     }
 
     pub const DecodeError = error{MalformedMixHeader};
@@ -224,6 +320,17 @@ pub const MixHeader = struct {
             r.* = std.mem.readInt(u32, payload[off..][0..4], .little);
             off += 4;
         }
+        h.has_delays = switch (payload[off]) {
+            0 => false,
+            1 => true,
+            else => return error.MalformedMixHeader,
+        };
+        off += 1;
+        for (&h.delays) |*d| {
+            d.* = std.mem.readInt(u32, payload[off..][0..4], .little);
+            off += 4;
+        }
+        h.recipient = std.mem.readInt(u32, payload[off..][0..4], .little);
         return h;
     }
 
@@ -259,6 +366,14 @@ test "LoopixConfig node numbering: mixes then clients, no overlap" {
     try testing.expectEqual(@as(?u8, null), cfg.layerOf(9));
     try testing.expect(!cfg.isClient(8));
     try testing.expect(cfg.isClient(9));
+    try testing.expect(!cfg.isClient(12));
+
+    const pc = LoopixConfig{ .layers = 3, .width = 3, .clients = 4, .providers = 2 };
+    try testing.expectEqual(@as(usize, 15), pc.nodeCount());
+    try testing.expectEqual(@as(NodeId, 13), pc.providerNode(0));
+    try testing.expectEqual(@as(NodeId, 14), pc.providerOf(1));
+    try testing.expectEqual(@as(NodeId, 13), pc.providerOf(2));
+    try testing.expect(pc.isProvider(13) and !pc.isClient(13) and pc.isClient(12));
 }
 
 test "MixHeader round-trips through its fixed-size wire encoding" {
@@ -274,9 +389,15 @@ test "MixHeader round-trips through its fixed-size wire encoding" {
     h.route[1] = 4;
     h.route[2] = 7;
     h.route[3] = 11; // dest client
+    h.has_delays = true;
+    h.delays = .{ 33, 12, 51, 0, 0, 0, 0 };
+    h.recipient = 11;
     var buf: [MixHeader.wire_len]u8 = undefined;
     h.encode(&buf);
     const g = try MixHeader.decode(&buf);
+    try testing.expect(g.has_delays);
+    try testing.expectEqual(@as(u32, 12), g.delays[1]);
+    try testing.expectEqual(@as(NodeId, 11), g.recipient);
     try testing.expectEqual(MsgKind.loop_cover, g.kind);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFE), g.id);
     try testing.expectEqual(@as(u8, 2), g.hop);
@@ -318,6 +439,12 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
     bad_hop[9] = 4; // hop > n_hops
     try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_hop));
 
+    // A delays flag that is neither 0 nor 1.
+    var bad_flag: [MixHeader.wire_len]u8 = undefined;
+    @memset(&bad_flag, 0);
+    bad_flag[39] = 2;
+    try testing.expectError(error.MalformedMixHeader, MixHeader.decode(&bad_flag));
+
     // A well-formed header still decodes at the boundary (n_hops == max_layers).
     var h = MixHeader{ .kind = .real, .id = 42, .hop = max_layers, .n_hops = max_layers, .route = undefined };
     @memset(&h.route, 0);
@@ -337,7 +464,7 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
 // `Smith` corpus-guided coverage of the same function.
 
 /// `testkit.fuzz.seed`: a corpus entry is NOT the header. `Smith.slice` reads
-/// a little-endian `u32` length first, so a raw 39-octet header handed to the
+/// a little-endian `u32` length first, so a raw 72-octet header handed to the
 /// corpus would arrive with its kind byte and half its id shorn off.
 const seed = @import("testkit").fuzz.seed;
 
@@ -376,6 +503,22 @@ const bad_hop_header = blk: {
     break :blk out;
 };
 const long_header = valid_header ++ [_]u8{0xAA} ** 8;
+const delays_header = blk: {
+    var h = MixHeader{ .kind = .real, .id = 5, .hop = 1, .n_hops = 3, .route = .{ 1, 4, 7, 13, 0, 0, 0 } };
+    h.has_delays = true;
+    h.delays = .{ 33, 12, 51, 0, 0, 0, 0 };
+    h.recipient = 10;
+    var buf: [MixHeader.wire_len]u8 = undefined;
+    h.encode(&buf);
+    const out = buf;
+    break :blk out;
+};
+const bad_flag_header = blk: {
+    var b = valid_header;
+    b[39] = 0xFF; // has_delays neither 0 nor 1
+    const out = b;
+    break :blk out;
+};
 
 /// Headers in the format `Smith.slice` reads (see `testkit.fuzz`).
 ///
@@ -393,6 +536,8 @@ const header_seeds = [_][]const u8{
     seed(&bad_nhops_header), // MalformedMixHeader: n_hops past the route capacity
     seed(&bad_hop_header), // MalformedMixHeader: hop > n_hops
     seed(&long_header), // longer than wire_len: still decodes
+    seed(&delays_header), // sender-chosen delays + a recipient: decodes
+    seed(&bad_flag_header), // MalformedMixHeader: has_delays neither 0 nor 1
     seed(&[_]u8{0} ** MixHeader.wire_len), // all zeros: kind .real, hop 0, n_hops 0
     seed(""), // the ONE input the collapsed harness ever ran
 };
@@ -402,7 +547,7 @@ test "fuzz: MixHeader.decode never panics on arbitrary bytes" {
 }
 
 fn fuzzMixHeaderDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
+    var buf: [128]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM —
@@ -430,7 +575,7 @@ test "corpus: every header reaches decode, and the decoded count is pinned" {
     var hops: usize = 0;
     for (header_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
-        var buf: [64]u8 = undefined;
+        var buf: [128]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
         const h = MixHeader.decode(buf[0..len]) catch continue;
@@ -441,6 +586,6 @@ test "corpus: every header reaches decode, and the decoded count is pinned" {
     try testing.expectEqual(header_seeds.len - 1, nonempty);
     // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 decoded
     // and 0 hops — the same empty slice ten times. After:
-    try testing.expectEqual(@as(usize, 4), decoded);
-    try testing.expectEqual(@as(usize, 12), hops);
+    try testing.expectEqual(@as(usize, 5), decoded);
+    try testing.expectEqual(@as(usize, 15), hops);
 }

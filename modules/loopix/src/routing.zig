@@ -47,8 +47,9 @@ pub fn mix64(x: u64) u64 {
 }
 
 /// Fill `out.route` with one mix per layer (chosen by hashing `key`) followed
-/// by `dest`, and set `hop`/`n_hops`. `key` should be unique per message
-/// (e.g. `source*K + seq`) so different messages spread across the mixes.
+/// by `dest` — or, in the provider topology, by `dest`'s provider — and set
+/// `hop`/`n_hops`/`recipient`. `key` should be unique per message (e.g.
+/// `source*K + seq`) so different messages spread across the mixes.
 pub fn pickRoute(cfg: LoopixConfig, key: u64, dest: NodeId, out: *MixHeader) void {
     var h = mix64(key);
     var layer: u8 = 0;
@@ -57,7 +58,8 @@ pub fn pickRoute(cfg: LoopixConfig, key: u64, dest: NodeId, out: *MixHeader) voi
         const w: u8 = @intCast(h % cfg.width);
         out.route[layer] = cfg.mixNode(layer, w);
     }
-    out.route[cfg.layers] = dest;
+    out.route[cfg.layers] = if (cfg.providers > 0) cfg.providerOf(cfg.clientIndex(dest)) else dest;
+    out.recipient = dest;
     out.n_hops = cfg.layers;
     out.hop = 0;
 }
@@ -166,6 +168,14 @@ test "pickRoute: one mix per layer, all in-range, dest in the final slot" {
         try testing.expectEqual(@as(?u8, layer), cfg.layerOf(h.route[layer])); // right layer
     }
     try testing.expectEqual(cfg.clientNode(1), h.route[3]); // dest slot
+    try testing.expectEqual(cfg.clientNode(1), h.recipient);
+
+    // Provider topology: the last slot is the recipient's PROVIDER, and the
+    // recipient rides in its own field (the mailbox to store into).
+    const pc = LoopixConfig{ .layers = 3, .width = 3, .clients = 4, .providers = 2 };
+    pickRoute(pc, 12345, pc.clientNode(3), &h);
+    try testing.expectEqual(pc.providerOf(3), h.route[3]);
+    try testing.expectEqual(pc.clientNode(3), h.recipient);
 }
 
 test "pickDestClient: clients <= 1 falls back to self (only choice available)" {
