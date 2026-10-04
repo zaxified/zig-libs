@@ -243,6 +243,18 @@ test "parseResolvConf: defaults on empty/garbage input" {
     }
 }
 
+test "parseResolvConf: ';' starts a comment like '#', mid-line too" {
+    // resolv.conf(5): a line whose first column is ';' or '#' is a comment;
+    // glibc's res_init also cuts a nameserver value at `strcspn(cp, ";# \t\n")`,
+    // so "192.0.2.53;x" is the server 192.0.2.53. Mutation 2026-10-04: only
+    // '#' was ever exercised.
+    const conf = parseResolvConf(";nameserver 192.0.2.99\nnameserver 192.0.2.53;x\nsearch a.example ;b.example\n");
+    try testing.expectEqual(@as(usize, 1), conf.nservers);
+    try testing.expect(conf.servers()[0].eql(netaddr.parseIp("192.0.2.53").?));
+    try testing.expectEqual(@as(usize, 1), conf.nsearch);
+    try testing.expectEqualStrings("a.example", conf.search()[0]);
+}
+
 test "parseResolvConf: glibc option caps" {
     const conf = parseResolvConf("options ndots:99 timeout:99 attempts:99\n");
     try testing.expectEqual(@as(u8, 15), conf.ndots);
@@ -346,4 +358,23 @@ test "NameIterator: over-long candidates are skipped" {
     const search = [_][]const u8{ long_domain, "ok.example" };
     // "name." + 250 chars > 253 → skipped; the short domain and bare survive.
     try expectCandidates("myhost", &search, 1, &.{ "myhost.ok.example", "myhost" });
+
+    // The 253-char cap is the iterator's own, not the caller's buffer size:
+    // with a roomy buffer a 254-char composed candidate and a 254-char bare
+    // name are still skipped, 253 still yielded (RFC 1035 §2.3.4; the doc
+    // above: "Candidates longer than 253 chars are skipped"). Mutation
+    // 2026-10-04: both checks survived because every caller passed a
+    // 253-byte buffer.
+    var big: [512]u8 = undefined;
+    const d246 = [_][]const u8{"d" ** 246};
+    var fits = NameIterator.init("myhost", &d246, 1); // 6 + 1 + 246 = 253
+    try testing.expectEqual(@as(usize, 253), fits.next(&big).?.len);
+    const d247 = [_][]const u8{"d" ** 247};
+    var over = NameIterator.init("myhost", &d247, 1); // 254: skipped, bare last
+    try testing.expectEqualStrings("myhost", over.next(&big).?);
+    try testing.expect(over.next(&big) == null);
+    var bare = NameIterator.init("b" ** 254, &.{}, 1);
+    try testing.expect(bare.next(&big) == null);
+    var bare253 = NameIterator.init("b" ** 253, &.{}, 1);
+    try testing.expectEqual(@as(usize, 253), bare253.next(&big).?.len);
 }

@@ -1124,6 +1124,13 @@ test "decode: hostile ANCOUNT/QDCOUNT are refused BEFORE the section is allocate
     try testing.expectError(error.Truncated, decode(gpa, qdcount));
     const nscount = "\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00" ++ "\x01a\x00\x00\x01";
     try testing.expectError(error.Truncated, decode(gpa, nscount));
+    // The guard's FACTOR is pinned too (mutation 2026-10-04: a 1-byte
+    // minimum survived the 65 535-in-5-bytes packets above): 1000 records
+    // claimed over 1000 bytes. WHY refused: the smallest record is 11 bytes
+    // (`min_record_wire`: root name, type, class, ttl, rdlength), so 1000 of
+    // them cannot fit in 1000 bytes.
+    const thousand = "\x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00" ++ "\x00" ** 1000;
+    try testing.expectError(error.Truncated, decode(gpa, thousand));
     // And a legitimate small packet still decodes under the same limit.
     var ok = try decode(gpa, "\x00\x01\x80\x00" ++ "\x00\x00" ** 4);
     ok.deinit();
@@ -1173,6 +1180,57 @@ test "decode: bad rdata lengths are rejected" {
     // MX with RDLENGTH 2: the exchange name would come from past the RDATA.
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x0f\x00\x01" ++
         "\x00\x00\x00\x00" ++ "\x00\x02" ++ "\x00\x0a" ++ "\x02mx\x00" ++ "\x00" ** 4);
+    // SOA whose MNAME alone runs past RDLENGTH 1 at the packet end. WHY
+    // BadRecord, not Truncated: `DecodeError.BadRecord` is "an rdata name
+    // running past RDLENGTH", and that is the first thing wrong here. Without
+    // `takeRdataName`'s own window check the decoder went on to read RNAME
+    // from beyond the packet and reported Truncated (mutation 2026-10-04).
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x06\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x01" ++ "\x01x\x00");
+}
+
+test "decode: a 253-char name decodes (the RFC 1035 limit is inclusive)" {
+    // RFC 1035 §2.3.4: 255 octets on the wire = 253 characters of dotted
+    // text. The encoder's edge is pinned above; the decoder's own cap was
+    // not (mutation 2026-10-04: a 252-char cap survived).
+    var buf: [max_query_len]u8 = undefined;
+    const label63 = "a" ** 63;
+    const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ "b" ** 61;
+    const q = try encodeQuery(&buf, name253, .a, .{});
+    var msg = try decode(testing.allocator, q);
+    defer msg.deinit();
+    try testing.expectEqualStrings(name253, msg.questions[0].name);
+}
+
+/// A message of `jumps + 1` questions: question 0 is the name "a", and
+/// question k's name is one pointer to question k-1's name, so decoding the
+/// last one follows exactly `jumps` pointers.
+fn pointerChain(buf: []u8, jumps: usize) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("\x00\x00\x80\x00") catch unreachable;
+    w.writeInt(u16, @intCast(jumps + 1), .big) catch unreachable;
+    w.writeAll("\x00\x00" ** 3) catch unreachable;
+    var prev: usize = header_len;
+    w.writeAll("\x01a\x00\x00\x01\x00\x01") catch unreachable;
+    for (0..jumps) |_| {
+        const here = w.end;
+        w.writeInt(u16, @intCast(0xc000 | prev), .big) catch unreachable;
+        w.writeAll("\x00\x01\x00\x01") catch unreachable;
+        prev = here;
+    }
+    return w.buffered();
+}
+
+test "decode: exactly max_pointer_jumps pointer follows decode, one more is PointerLoop" {
+    // `PointerLoop` is documented as MORE than `max_pointer_jumps` follows in
+    // one name, so a chain of exactly that many is a legal name (mutation
+    // 2026-10-04: `>` → `>=` survived; only an endless cycle was tested).
+    var buf: [header_len + 7 + 6 * (max_pointer_jumps + 1)]u8 = undefined;
+    var ok = try decode(testing.allocator, pointerChain(&buf, max_pointer_jumps));
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, max_pointer_jumps + 1), ok.questions.len);
+    for (ok.questions) |q| try testing.expectEqualStrings("a", q.name);
+    try expectDecodeError(error.PointerLoop, pointerChain(&buf, max_pointer_jumps + 1));
 }
 
 test "decode: opcode field decodes from the right flag bits" {

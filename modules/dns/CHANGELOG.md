@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (54 schemata mutants, all killed after 15 new
+  tests). Decoder edges (253-char name, exactly 16 pointer jumps, the 11-byte record
+  pre-check factor, SOA name past RDLENGTH), class-IN-only CNAME chains, ';' comments in
+  resolv.conf, the 253-char search-candidate cap, and over loopback: wrong-id and
+  wrong-source-port datagrams skipped, a fresh transaction id per retry, `resolve` past a
+  NODATA candidate, `lookupIp` stopping at the first candidate with addresses, DoH non-200
+  refused on the wire and JSON paths. No code change.
+
 - **2026-10-01** — **BEHAVIOURAL:** `lookupIp` no longer reports an outage as
   "no addresses". When no address was found and a query failed (timeout,
   network failure, malformed or spoofed answer), it returns that error

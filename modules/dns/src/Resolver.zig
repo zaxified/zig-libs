@@ -1165,6 +1165,17 @@ test "OwnerChain: a CNAME loop and an over-long chain stay bounded" {
     try testing.expectEqual(OwnerChain.max_cname_chain + 1, chain2.len);
     try testing.expect(chain2.contains("n8"));
     try testing.expect(!chain2.contains("n9"));
+
+    // Only class-IN CNAMEs extend the chain: the alias chain `lookupIp` and
+    // `reverse` trust is the IN one (`collectAddresses` doc: "class IN"); a
+    // CHAOS-class CNAME is another namespace's data. Mutation 2026-10-04:
+    // dropping the class check survived.
+    var chaos = mk.cname("a", "victim.test");
+    chaos.class = .ch;
+    var chain3: OwnerChain = .init("a");
+    chain3.follow(&.{chaos});
+    try testing.expectEqual(@as(usize, 1), chain3.len);
+    try testing.expect(!chain3.contains("victim.test"));
 }
 
 test "jsonQueryUrl: the name is validated like the wire path and percent-encoded" {
@@ -1464,6 +1475,324 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     defer testing.allocator.free(ips);
     try testing.expectEqual(@as(usize, 1), ips.len);
     try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
+}
+
+/// A UDP stub that answers SEVERAL datagrams, each by echoing that query's
+/// own question (so search-list candidates and both families get a reply
+/// that passes `decodeResponse`), shaped by `mode`. Added with the mutation
+/// run of 2026-10-04 for the transport and candidate loops, which `UdpStub`
+/// (one fixed question, one datagram) cannot reach.
+const EchoStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    mode: Mode,
+    /// Stop after this many datagrams, or after `idle_ms` without one.
+    max: usize,
+    idle_ms: i64 = 1000,
+    ids: [8]u16 = @splat(0),
+    served: usize = 0,
+
+    const Mode = enum {
+        /// A → A 192.0.2.1; any other type → NOERROR, no answer.
+        a_only,
+        /// The first query gets NOERROR with no answer (NODATA), then `a_only`.
+        nodata_then_a,
+        /// The first query is never answered, then `a_only`.
+        drop_first,
+        /// Before the honest reply, one with the id flipped claiming
+        /// A 203.0.113.66.
+        wrong_id_first,
+        /// Before the honest reply, one with the RIGHT id and question
+        /// claiming A 203.0.113.66, sent from another source port.
+        other_port_first,
+    };
+
+    const a_honest = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
+    const a_lie = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xcb\x00\x71\x42";
+
+    fn run(st: *EchoStub) void {
+        st.serve() catch |err| std.debug.print("EchoStub: {t}\n", .{err});
+    }
+
+    /// Length of the question section at the start of `bytes` (an
+    /// uncompressed name, as `writeName` emits it, plus type and class).
+    fn questionLen(bytes: []const u8) usize {
+        var i: usize = 0;
+        while (bytes[i] != 0) i += 1 + bytes[i];
+        return i + 1 + 4;
+    }
+
+    fn serve(st: *EchoStub) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        while (st.served < st.max) {
+            const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(st.idle_ms), .clock = .awake } };
+            const incoming = st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io)) catch |err| switch (err) {
+                error.Timeout => return,
+                else => |e| return e,
+            };
+            const q = incoming.data;
+            const n = st.served;
+            st.ids[n] = std.mem.readInt(u16, q[0..2], .big);
+            st.served += 1;
+            const question = q[message.header_len..][0..questionLen(q[message.header_len..])];
+            const is_a = std.mem.readInt(u16, question[question.len - 4 ..][0..2], .big) == @intFromEnum(message.Type.a);
+            var first: [512]u8 = undefined;
+            switch (st.mode) {
+                .a_only => {},
+                .nodata_then_a => if (n == 0) {
+                    try st.sock.send(st.io, &incoming.from, stubResponse(&first, q, 0x8180, question, "", 0));
+                    continue;
+                },
+                .drop_first => if (n == 0) continue,
+                .wrong_id_first => {
+                    const resp = stubResponse(&first, q, 0x8180, question, a_lie, 1);
+                    resp[0] ^= 0xff;
+                    try st.sock.send(st.io, &incoming.from, resp);
+                },
+                .other_port_first => {
+                    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+                    const other = try addr.bind(st.io, .{ .mode = .dgram });
+                    defer other.close(st.io);
+                    try other.send(st.io, &incoming.from, stubResponse(&first, q, 0x8180, question, a_lie, 1));
+                },
+            }
+            var out: [512]u8 = undefined;
+            const honest = if (is_a)
+                stubResponse(&out, q, 0x8180, question, a_honest, 1)
+            else
+                stubResponse(&out, q, 0x8180, question, "", 0);
+            try st.sock.send(st.io, &incoming.from, honest);
+        }
+    }
+};
+
+fn bindEchoStub(io: std.Io, mode: EchoStub.Mode, max: usize) !EchoStub {
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try addr.bind(io, .{ .mode = .dgram });
+    return .{ .io = io, .sock = sock, .mode = mode, .max = max };
+}
+
+/// A real `std.Io` whose `random` yields 0x0101, 0x0202, ... per call, so a
+/// test can tell one transaction id from the next without a 2^-16 flake.
+const SeqRandomIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var next: std.atomic.Value(u8) = .init(1);
+
+    fn init(inner: std.Io) SeqRandomIo {
+        var vt = inner.vtable.*;
+        vt.random = random;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const SeqRandomIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn random(_: ?*anyopaque, buffer: []u8) void {
+        @memset(buffer, next.fetchAdd(1, .monotonic));
+    }
+};
+
+fn expectOnlyHonestA(msg: *const message.Message) !void {
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    try testing.expect(dns.recordIp(msg.answers[0]).?.eql(netaddr.parseIp("192.0.2.1").?));
+}
+
+test "query: a datagram with another id is skipped and the right one still accepted" {
+    // RFC 5452 §9.1: an answer must match the query's id. A reply carrying
+    // another id is not an answer -- and not a reason to give up: the
+    // receive loop must keep waiting for the real one (an off-path spoofer
+    // could otherwise fail every query with one wrong guess). Mutation
+    // 2026-10-04: returning the mismatched datagram survived.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = bindEchoStub(io, .wrong_id_first, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.query("example.com", .a);
+    fut.await(io);
+    var msg = try res;
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+}
+
+test "query: a datagram from another source port is skipped, even with the right id and question" {
+    // RFC 5452 §9.1 again: the reply must come from the address and port the
+    // query went to. Mutation 2026-10-04: dropping the source check survived;
+    // with it gone the forged A 203.0.113.66 won.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = bindEchoStub(io, .other_port_first, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.query("example.com", .a);
+    fut.await(io);
+    var msg = try res;
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+}
+
+test "query: every retry carries a fresh transaction id" {
+    // The comment in `query` states the rule: one id per datagram, so a
+    // retry never re-uses an id an off-path attacker may have seen.
+    // Mutation 2026-10-04: a fixed id survived. `SeqRandomIo` makes the ids
+    // deterministic, so "different" is not a 2^-16 coin toss.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const real_io = threaded.io();
+    var stub = bindEchoStub(real_io, .drop_first, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(real_io);
+    const seq: SeqRandomIo = .init(real_io);
+    var r = Resolver.init(seq.io(), testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 300, .attempts = 2, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try real_io.concurrent(EchoStub.run, .{&stub});
+    const res = r.query("example.com", .a);
+    fut.await(real_io);
+    var msg = try res;
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+    try testing.expectEqual(@as(usize, 2), stub.served);
+    try testing.expect(stub.ids[0] != stub.ids[1]);
+}
+
+/// A resolv.conf in a test tmp dir carrying `search s1.test s2.test`; the
+/// path is written into `path_buf`.
+fn searchConf(io: std.Io, tmp: *const std.testing.TmpDir, path_buf: []u8) ![]const u8 {
+    const conf_path = try std.fmt.bufPrint(path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = "search s1.test s2.test\n" });
+    return conf_path;
+}
+
+test "resolve: a NODATA answer for one search candidate moves on to the next" {
+    // `resolve` returns the first candidate with NOERROR AND answers (Go
+    // `goLookupIPCNAMEOrder` likewise keeps going on an empty answer); a
+    // NODATA reply for host.s1.test is not the answer for "host".
+    // Mutation 2026-10-04: stopping at the empty answer survived.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const conf_path = try searchConf(io, &tmp, &path_buf);
+    var stub = bindEchoStub(io, .nodata_then_a, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .resolv_conf_path = conf_path });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.resolve("host", .a);
+    fut.await(io);
+    var msg = try res;
+    defer msg.deinit();
+    try testing.expectEqualStrings("host.s2.test", msg.questions[0].name);
+    try expectOnlyHonestA(&msg);
+}
+
+test "lookupIp: the first search candidate with an address wins, later ones are not asked" {
+    // `lookupIp` doc + Go `nameList` order: candidates are tried in order and
+    // the first that yields addresses is the answer -- host.s1.test here;
+    // host.s2.test and the bare "host" are other names whose addresses must
+    // not be merged in. Mutation 2026-10-04: dropping the break survived.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const conf_path = try searchConf(io, &tmp, &path_buf);
+    var stub = bindEchoStub(io, .a_only, 6) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .resolv_conf_path = conf_path });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.lookupIp("host");
+    fut.await(io);
+    const ips = try res;
+    defer testing.allocator.free(ips);
+    try testing.expectEqual(@as(usize, 1), ips.len);
+    try testing.expectEqual(@as(usize, 2), stub.served); // A + AAAA for host.s1.test only
+}
+
+/// A plain-HTTP loopback "DoH server" that answers every request with
+/// `503 Service Unavailable` and the body `{}` -- a body neither DoH decoder
+/// would turn into an answer, so a status check that is not made shows up
+/// as a different error (mutation 2026-10-04).
+const Http503 = struct {
+    io: std.Io,
+    server: net.Server,
+    requests: usize,
+
+    fn run(st: *Http503) void {
+        st.serve() catch |err| std.debug.print("Http503: {t}\n", .{err});
+    }
+
+    fn serve(st: *Http503) !void {
+        for (0..st.requests) |_| {
+            const stream = try st.server.accept(st.io);
+            defer stream.close(st.io);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(st.io, &rbuf);
+            const in = &sr.interface;
+            var body_len: usize = 0;
+            while (true) {
+                const line = try in.takeDelimiterInclusive('\n');
+                if (std.mem.eql(u8, line, "\r\n")) break;
+                const key = "content-length:";
+                if (std.ascii.startsWithIgnoreCase(line, key))
+                    body_len = try std.fmt.parseInt(usize, std.mem.trim(u8, line[key.len..], " \t\r\n"), 10);
+            }
+            try in.discardAll(body_len);
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(st.io, &wbuf);
+            try sw.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/dns-message\r\n" ++
+                "Content-Length: 2\r\nConnection: close\r\n\r\n{}");
+            try sw.interface.flush();
+        }
+    }
+};
+
+test "DoH: a non-200 status is DohFailed on both the wire and the JSON path, never decoded" {
+    // RFC 8484 §4.2.1: a DNS answer travels in a 2xx response; anything else
+    // is an HTTP-level failure, not a DNS message to parse. Both paths must
+    // refuse the body of a 503 before reading it as an answer. Mutation
+    // 2026-10-04: dropping the check in `queryJson` survived (and the one in
+    // `dohExchange` had no test either).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: Http503 = .{
+        .io = io,
+        .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}),
+        .requests = 2,
+    };
+    defer stub.server.socket.close(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/dns-query", .{stub.server.socket.address.getPort()});
+    var r = Resolver.init(io, testing.allocator, .{ .doh_url = url, .timeout_ms = 5000, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try io.concurrent(Http503.run, .{&stub});
+    const wire = r.query("example.com", .a);
+    const json = r.queryJson("example.com", .a);
+    fut.await(io);
+    if (wire) |m| {
+        var msg = m;
+        msg.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DohFailed, err);
+    if (json) |a| {
+        var ans = a;
+        ans.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DohFailed, err);
 }
 
 // ⭐ THE QUESTION-CHECK EXCHANGE OVER A SOCKET LIVES IN

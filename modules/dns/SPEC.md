@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver / c-ares stub resolvers (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-12 · mutation none
+**Audit:** review 2026-09-12 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -103,6 +103,22 @@ loaded gate cannot promise: as a test in `src/` it failed 10 runs in 20 under 32
 ⚠ The 7 `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
 public resolvers when the network is up** — they skip via `error.SkipZigTest` only when it is not.
 A gate run on a connected machine is therefore not offline.
+
+**Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
+label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA
+windows for A/AAAA/TXT/CAA/SOA/MX, header bits, EDNS fields), the reply correlation
+(`decodeResponse`, the UDP receive filter, per-datagram ids, TC retry, DoH status), the
+bailiwick chain, the search-list candidate loops, resolv.conf/hosts parsing and
+`reverseName`: 54 killed (one by a hang), 0 equivalent, 0 left alive. 15 had survived the
+existing tests and got one each: the decoder's own 253-char edge, a chain of exactly
+`max_pointer_jumps` pointers, the `min_record_wire` factor under a 4 KiB allocator, an
+SOA name overrunning RDLENGTH (BadRecord, not Truncated), CHAOS-class CNAMEs not
+extending the chain, ';' comments, the 253-char candidate cap with a roomy buffer, and --
+over loopback, with a new multi-datagram `EchoStub` and a 503 HTTP stub -- a wrong-id
+datagram skipped, a datagram from another source port skipped, a fresh id per retry
+(deterministic via `SeqRandomIo`), `resolve` moving past a NODATA candidate, `lookupIp`
+stopping at the first candidate with addresses, and DoH non-200 on both the wire and the
+JSON path.
 
 ## Backlog / deferred
 - ✅ **Closed 2026-09-12 (audit F10):** resolv.conf `options timeout:`/`attempts:` are now
