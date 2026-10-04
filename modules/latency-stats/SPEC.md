@@ -6,7 +6,7 @@
 
 **Scope:** core — HdrHistogram_c 0.11.10 (percentiles) and fping/ping summary statistics (moments) (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -76,6 +76,16 @@ an exact 1..1000 ramp (percentiles + mean + population-variance verbatim), an 81
 cross-checked against a sorted oracle at sigfigs 1–4 within the guaranteed relative error,
 representation-error sweep, `recordCount` ≡ repeated `record`, clamp policy, `add` merge, reset.
 Run: `zig build test-latency-stats`.
+
+**Audit 2026-10-04 (mutation).** 21 schemata mutants over `Stats.lossPct`, the
+`Accumulator` (min/max, Welford update, RFC 3550 jitter gain and previous sample,
+population stddev, `compute`'s losses) and the `Histogram` (config validation, `recordCount`,
+clamping, merge compatibility and extremes, empty `min`, percentile target rounding and the
+p0 floor, `countBetween` order, `highestEquivalent`, bucket-0 index mapping): 19 killed,
+2 equivalent, 0 left alive. Equivalent: updating min/max from an empty merged histogram (its
+extremes are the identity values `maxInt`/0); mapping index range `[half, 2·half)` through
+the general branch of `bucketSubAtIndex` (it yields the same `b = 0, sub = idx`). One test
+added: `recordCount(v, 0)` leaves the histogram untouched, `max()` included.
 
 ## Backlog / deferred
 

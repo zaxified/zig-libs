@@ -834,6 +834,21 @@ test "Histogram: recordCount equals repeated record" {
     try testing.expectEqual(b.max(), a.max());
 }
 
+test "Histogram: recordCount with n = 0 records nothing, not even the extremes" {
+    // `recordCount(v, n)` records `n` occurrences of `v`; zero occurrences
+    // must leave the histogram exactly as it was -- `max()` included, which
+    // reports `max_value` directly. Mutation 2026-10-04: dropping the `n == 0`
+    // early return survived (min/max then moved with no count behind them).
+    var h = try Histogram.init(std.testing.allocator, .{ .highest = 1_000_000 });
+    defer h.deinit();
+    h.recordCount(500, 0);
+    try std.testing.expectEqual(@as(u64, 0), h.totalCount());
+    try std.testing.expectEqual(@as(u64, 0), h.max());
+    h.record(10);
+    h.recordCount(900_000, 0);
+    try std.testing.expectEqual(@as(u64, 10), h.max());
+}
+
 test "Histogram: out-of-range records clamp without corrupting counts" {
     var h = try Histogram.init(testing.allocator, .{ .lowest = 1, .highest = 1000 });
     defer h.deinit();
