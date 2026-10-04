@@ -234,15 +234,30 @@ MODULES = {
             # glibc, not the kernel: `AF_*` is not in `linux/socket.h` (see
             # `conntrack`'s own entry for the same caveat and the same path).
             "/usr/include/x86_64-linux-gnu/bits/socket.h",
+            # 2026-10-04 (netlink mvp -> core: `ip rule`, veth, VLAN): FRA_*,
+            # FR_ACT_*, FIB_RULE_INVERT; VETH_INFO_PEER; ETH_P_8021Q/AD.
+            "/usr/include/linux/fib_rules.h",
+            "/usr/include/linux/veth.h",
+            "/usr/include/linux/if_ether.h",
         ],
         "prefixes": [""],
+        "namespace_aliases": {"RuleAction": "FR_ACT"},
+        "member_aliases": {
+            # The kernel abbreviates this one member; the rest of
+            # `RuleAction` resolves through the namespace alias.
+            "RuleAction.to_table": "FR_ACT_TO_TBL",
+            "VlanProtocol.dot1q": "ETH_P_8021Q",
+            "VlanProtocol.dot1ad": "ETH_P_8021AD",
+        },
         # repo-local constants: bridge.zig's 3 (`bridge_vlan_info_len`,
-        # `vlan_id_max`, `vlan_id_min`) plus root.zig's 4 sizing constants
+        # `vlan_id_max`, `vlan_id_min`) plus root.zig's 7 sizing constants
         # with no kernel macro spelling (`ifinfomsg_len`, `ifaddrmsg_len`,
-        # `rtmsg_len`, `ndmsg_len` -- `ifnamsiz` DOES resolve, against
-        # `if.h`'s `IFNAMSIZ`). If this number grows, something stopped
-        # being checked.
-        "unresolved_budget": 7,
+        # `rtmsg_len`, `ndmsg_len`, `fib_rule_hdr_len` = sizeof(struct
+        # fib_rule_hdr), `LinkStats.wire_len` = sizeof(struct
+        # rtnl_link_stats) and `Link.kind_max`, our own buffer bound --
+        # `ifnamsiz` DOES resolve, against `if.h`'s `IFNAMSIZ`). If this
+        # number grows, something stopped being checked.
+        "unresolved_budget": 10,
     },
     "genetlink": {
         # Audit finding F9: genetlink owns `GENL_ID_CTRL`, `CTRL_CMD_*` and
