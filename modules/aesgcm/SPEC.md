@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSL 4.0 AES-GCM (EVP), against Go `crypto/cipher`, RustCrypto `aes-gcm`, ring and `std.crypto.aead.aes_gcm` (surveyed 2026-09-30)
 
-**Audit:** review none · mutation 2026-09-28
+**Audit:** review 2026-10-04 · mutation 2026-09-28
 
 **Known defects:** none recorded
 
@@ -238,6 +238,23 @@ review, as §2.1 says they must be.
   `pshufb` by assembly) and `-Dcpu=x86_64_v2` (run-time CPUID, compiler
   `pshufb`), and on aarch64 under `qemu-aarch64` with the generic CPU and with
   `+aes` (the generic backend, x86-only tests skipped).
+
+- **Review** (2026-10-04, independent, whole `root.zig` + SPEC + README): no
+  defect found. Checked: the tag comparison is `timing_safe.eql` on both
+  backends and both shapes; a failed decrypt zeroes all of `m` on both
+  backends (the `.aesni` one after having written plaintext there, the
+  `.generic` one before `ctr` runs); the length block is `[len(A)]₆₄ ‖
+  [len(C)]₆₄` in bits, in the byte-reversed lane order (`lengths`); the
+  counter is inc32 (`ctrAdd` adds to the low dword only) and cannot wrap
+  through the API because of the `max_message_len` assert; `powersFor` covers
+  every power the short path, the AD groups (`ghashBytes`) and the tail group
+  (`finishGhash` with `n` = 8) read; every in-place step loads input block j
+  before it stores output at or below it; no table, no secret-indexed
+  address, no secret branch other than the pass/fail bit. Notes, not defects:
+  the length bounds are asserts (as in std), so a ReleaseFast build does not
+  check them — unreachable for TLS records (≤ 2¹⁴ + 256 bytes); `Context` is
+  returned by value, so the caller's copies of it are the caller's to wipe
+  (§2.1 Z2). No code changed, so no new mutation round.
 
 **Anchor grade:** class B · oracle MIXED
 
