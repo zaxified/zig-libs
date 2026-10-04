@@ -808,6 +808,112 @@ const goldens = @import("goldens.zig");
 const seq_capture1: u32 = 1784723839;
 const seq_capture2: u32 = 1784723936;
 
+/// A CT_NEW payload (`nfgenmsg` + `attrs`) for the decode tests below.
+fn newPayload(gpa: std.mem.Allocator, family: Family, attrs: []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, family, 0);
+    try list.appendSlice(gpa, attrs);
+    return list.toOwnedSlice(gpa);
+}
+
+test "nfgenmsg res_id is big-endian both ways" {
+    // `struct nfgenmsg { u8 family; u8 version; __be16 res_id; }`
+    // (linux/netfilter/nfnetlink.h). The kernel writes 0 for conntrack, so a
+    // zero-only test cannot tell the byte order. Mutation 2026-10-04: both
+    // directions' endianness survived.
+    const h = try parseNfgenmsg(&.{ 2, 0, 0x12, 0x34 });
+    try testing.expectEqual(@as(u16, 0x1234), h.res_id);
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try appendNfgenmsg(testing.allocator, &list, .ipv4, 0x1234);
+    try testing.expectEqualSlices(u8, &.{ 2, NFNETLINK_V0, 0x12, 0x34 }, list.items);
+}
+
+test "decode: protoinfo of another protocol, malformed TCP flags, a reply tuple of the wrong family" {
+    // Mutation 2026-10-04: three decoder guards with no test.
+    const gpa = testing.allocator;
+    // (1) Only `CTA_PROTOINFO_TCP` is decoded; a DCCP nest's STATE attribute
+    // (same number, 1) is DCCP's state, not a `TcpState`.
+    {
+        var a: std.ArrayList(u8) = .empty;
+        defer a.deinit(gpa);
+        const pi = try codec.nestBegin(gpa, &a, codec.NLA_F_NESTED | CTA.PROTOINFO);
+        const dccp = try codec.nestBegin(gpa, &a, codec.NLA_F_NESTED | CTA_PROTOINFO.DCCP);
+        try codec.appendAttrU8(gpa, &a, CTA_PROTOINFO_TCP.STATE, 3);
+        try codec.nestEnd(&a, dccp);
+        try codec.nestEnd(&a, pi);
+        const p = try newPayload(gpa, .ipv4, a.items);
+        defer gpa.free(p);
+        try testing.expect((try decodeFlow(p)).tcp_state == null);
+    }
+    // (2) `CTA_PROTOINFO_TCP_FLAGS_*` is `struct nf_ct_tcp_flags { u8 flags;
+    // u8 mask; }` -- exactly 2 bytes; anything else is `BadLength`.
+    {
+        var a: std.ArrayList(u8) = .empty;
+        defer a.deinit(gpa);
+        const pi = try codec.nestBegin(gpa, &a, codec.NLA_F_NESTED | CTA.PROTOINFO);
+        const tcp = try codec.nestBegin(gpa, &a, codec.NLA_F_NESTED | CTA_PROTOINFO.TCP);
+        try codec.appendAttr(gpa, &a, CTA_PROTOINFO_TCP.FLAGS_ORIGINAL, &.{ 1, 2, 3 });
+        try codec.nestEnd(&a, tcp);
+        try codec.nestEnd(&a, pi);
+        const p = try newPayload(gpa, .ipv4, a.items);
+        defer gpa.free(p);
+        try testing.expectError(error.BadLength, decodeFlow(p));
+    }
+    // (3) An AF_INET message whose only tuple (the reply) is IPv6 is not one
+    // connection -- the A5 cross-check against `nfgen_family`.
+    {
+        var a: std.ArrayList(u8) = .empty;
+        defer a.deinit(gpa);
+        const v6: netaddr.Ip = .{ .v6 = @splat(1) };
+        try appendTuple(gpa, &a, CTA.TUPLE_REPLY, .{ .src = v6, .dst = v6, .proto = IPPROTO.TCP });
+        const p = try newPayload(gpa, .ipv4, a.items);
+        defer gpa.free(p);
+        try testing.expectError(error.AddressFamilyMismatch, decodeFlow(p));
+    }
+}
+
+test "build: an ICMPv6 tuple uses the ICMPV6 attribute numbers; a lone tcp_flags_orig still gets PROTOINFO" {
+    // The kernel parses an ICMPv6 tuple through `CTA_PROTO_ICMPV6_*`
+    // (nf_conntrack_proto_icmpv6.c); the ICMP numbers would be ignored.
+    // `buildNewRequest` emits PROTOINFO when ANY of its three fields is set.
+    // Mutation 2026-10-04: both survived (the decoder accepts either ICMP
+    // numbering, so a round trip could not tell).
+    const gpa = testing.allocator;
+    {
+        var a: std.ArrayList(u8) = .empty;
+        defer a.deinit(gpa);
+        const v6: netaddr.Ip = .{ .v6 = @splat(2) };
+        try appendTuple(gpa, &a, CTA.TUPLE_ORIG, .{ .src = v6, .dst = v6, .proto = IPPROTO.ICMPV6, .icmp_type = 128 });
+        var top: codec.AttrIterator = .{ .buf = a.items };
+        const tuple = (try top.next()).?;
+        var inner = tuple.nested();
+        var saw_v6_type = false;
+        while (try inner.next()) |ia| {
+            if (ia.type != CTA_TUPLE.PROTO) continue;
+            var ps = ia.nested();
+            while (try ps.next()) |pa| {
+                if (pa.type == CTA_PROTO.ICMPV6_TYPE) saw_v6_type = true;
+                try testing.expect(pa.type != CTA_PROTO.ICMP_TYPE);
+            }
+        }
+        try testing.expect(saw_v6_type);
+    }
+    {
+        const v4: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 1 } };
+        const tup: Tuple = .{ .src = v4, .dst = v4, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 2 };
+        const req = try buildNewRequest(gpa, 1, .ipv4, codec.NLM_F_REQUEST, .{
+            .orig = tup,
+            .reply = tup.invert(),
+            .tcp_flags_orig = .{ .flags = 2, .mask = 2 },
+        });
+        defer gpa.free(req);
+        const f = try decodeFlow(req[codec.header_len..]);
+        try testing.expectEqual(@as(u8, 2), f.tcp_flags_orig.?.flags);
+    }
+}
+
 test "golden: dump request bytes match `conntrack -L`" {
     if (native_endian != .little) return error.SkipZigTest; // golden bytes are LE
     const unspec = buildDumpRequest(seq_capture1, .unspec);

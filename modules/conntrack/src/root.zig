@@ -818,6 +818,59 @@ fn controlDatagram(pid: u32, seq: u32, flags: u16) [codec.header_len]u8 {
     return b;
 }
 
+/// The first message of the golden dump reply, with its header's `pid`,
+/// `seq` and `type` replaced -- one canned single-entry reply datagram.
+fn goldenFirstMessage(buf: []u8, pid: u32, seq: u32, msg_type: u16) []const u8 {
+    const g = &goldens.dump_reply_three_flows;
+    const len = std.mem.readInt(u32, g[0..4], native_endian);
+    @memcpy(buf[0..len], g[0..len]);
+    std.mem.writeInt(u16, buf[4..6], msg_type, native_endian);
+    std.mem.writeInt(u32, buf[8..12], seq, native_endian);
+    std.mem.writeInt(u32, buf[12..16], pid, native_endian);
+    return buf[0..len];
+}
+
+test "single-entry await: replies for another port or sequence are skipped; a bare ACK is NotFound" {
+    // `awaitFlowOver` answers only a message addressed to THIS socket's port
+    // and THIS request's sequence (a late reply to an earlier request, or one
+    // for another socket, must not be taken as the answer), and a bare ACK
+    // (`NLMSG_ERROR` with code 0) carries no entry. Mutation 2026-10-04: the
+    // pid filter, the seq filter and the bare-ACK mapping all survived --
+    // nothing drove `awaitFlowOver` without a kernel.
+    const id = goldenDumpIdentity();
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    const other_port = goldenFirstMessage(&b1, id.pid +% 1, id.seq, wire.msg_ct_new);
+    const other_seq = goldenFirstMessage(&b2, id.pid, id.seq +% 1, wire.msg_ct_new);
+    var ack: [codec.header_len + 4 + codec.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, ack[0..4], ack.len, native_endian);
+    std.mem.writeInt(u16, ack[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, ack[8..12], id.seq, native_endian);
+    std.mem.writeInt(u32, ack[12..16], id.pid, native_endian);
+    var t: ScriptedTransport = .{
+        .script = &.{ other_port, other_seq, &ack },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    try testing.expectError(error.NotFound, awaitFlowOver(&t, id.seq));
+    try testing.expectEqual(@as(usize, 3), t.recvs);
+}
+
+test "dump engine: a record that is not IPCTNL_MSG_CT_NEW is skipped, not decoded as a flow" {
+    // A dump answers with `IPCTNL_MSG_CT_NEW` records; anything else in the
+    // stream (here the same entry re-typed `CT_DELETE`) is not a table entry
+    // and must not be collected. Mutation 2026-10-04: dropping the type
+    // filter survived.
+    const id = goldenDumpIdentity();
+    var b: [512]u8 = undefined;
+    const deleted = goldenFirstMessage(&b, id.pid, id.seq, wire.msg_ct_delete);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{ .script = &.{ deleted, &done }, .pid = id.pid, .seq = id.seq };
+    const flows = try dumpOver(testing.allocator, &t, .unspec);
+    defer testing.allocator.free(flows);
+    try testing.expectEqual(@as(usize, 0), flows.len);
+}
+
 test "dump engine: a clean multi-part reply is collected and handed over" {
     const id = goldenDumpIdentity();
     const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);

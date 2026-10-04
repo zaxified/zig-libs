@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (34 schemata mutants, all killed after 5 new tests:
+  `nfgenmsg` byte order, PROTOINFO/TCP-flags/family decoding guards, ICMPv6 attribute numbers and
+  the PROTOINFO gate in the builders, and `awaitFlowOver`/`dumpOver` message filtering through the
+  scripted transport). No code change.
+
 - **2026-09-10** — **A1 audit, two findings.** (A1) `dumpOver`/`dumpEachOver` carried the old
   unbounded multi-part reply loop forward when they were factored out of `Socket.dump` — unlike
   the sibling `awaitFlow` (C-06, F6), which got a message budget in the same pass. `DumpError`

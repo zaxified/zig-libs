@@ -6,7 +6,7 @@
 
 **Scope:** core — conntrack-tools / libnetfilter_conntrack (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -299,6 +299,19 @@ Without the namespace (plain `zig build test-conntrack` as an ordinary user) the
 **All tests pass** in Debug and `--release=fast`; unprivileged, the offline tests run and the
 live tests skip-and-pass; under `unshare -rn`, every test runs for real. One fuzz
 target (`decodeFlow` + message walker).
+
+**Audit 2026-10-04 (mutation).** 34 schemata mutants over the codec (`nfgenmsg` length and
+byte order, tuple completeness and inversion incl. the ICMP/ICMPv6 type tables, tuple and
+flow family cross-checks, fixed-size and TCP-flag lengths, counters, PROTOINFO selection),
+the request builders (incomplete/mixed tuples, ICMPv6 attribute numbers, zones, the dump
+flag, the delete id, the PROTOINFO gate) and the engines (`awaitFlowOver`'s pid/seq filter,
+bare ACK and message cap; `dumpOver`'s cap, restart and record-type filter; the EINVAL
+remap): 34 killed (one by a hang), 0 equivalent, 0 left alive. Eleven survivors of the first
+run got tests: `res_id` big-endian both ways, DCCP PROTOINFO not read as TCP, a 3-byte TCP
+flags attribute, an IPv6 reply tuple under AF_INET, ICMPv6 attribute numbers, PROTOINFO for
+a lone `tcp_flags_orig`, `awaitFlowOver` skipping replies for another port or sequence and
+mapping a bare ACK to `NotFound` (driven through the scripted transport), and a dump skipping
+a non-`CT_NEW` record.
 
 ## Deferred (honest list)
 
