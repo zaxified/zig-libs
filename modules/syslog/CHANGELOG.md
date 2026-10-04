@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix: `buildDatagram` (and so `UdpEmitter.send` with `udp_limit >= 2048`)
+  sent a message longer than its scratch buffer cut short WITHOUT the truncation marker — the
+  overflow left exactly `scratch.len` bytes, which the `> udp_limit` check did not see. The
+  marker now replaces the tail whenever the message did not fit.
+- **2026-10-04** — **Tests:** mutation run (33 schemata mutants, 32 killed, 1 equivalent). New
+  tests for the fix and for the year-9999 edge, an empty header field, the 32-byte SD-NAME cap,
+  a budget shorter than the marker, a 108-byte unix socket path and `sendMessage` over
+  `max_fields`.
+
 - **2026-09-28** — **New local delivery (Additive, requested by ttydesk)**: `UnixEmitter`
   (`src/unix.zig`) sends this module's existing RFC 5424/RFC 3164 encoders as one datagram to a
   unix `SOCK_DGRAM` socket, default `"/dev/log"` (`open`/`openDefault`, `send`/`sendBsd`, plus

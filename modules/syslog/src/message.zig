@@ -471,6 +471,21 @@ test "writeRfc3339 clamps a wild offset_minutes instead of printing garbage" {
     try t.expect(std.mem.endsWith(u8, w.buffered(), "-23:59"));
 }
 
+test "RFC 5424 edges: the first instant past year 9999, an empty field, a 33-byte SD-NAME" {
+    // Mutation 2026-10-04: three survivors, one assertion each.
+    // DATE-FULLYEAR is 4DIGIT (RFC 5424 §6.2.3 / RFC 3339): one ms past
+    // 9999-12-31T23:59:59.999 has no 4-digit form and is out of range.
+    try t.expectError(error.TimestampOutOfRange, decompose(.{ .unix_ms = 253402300800_000 }));
+    var buf: [128]u8 = undefined;
+    // §6: a header field is NILVALUE or 1*N printable bytes -- an empty
+    // hostname must not leave an empty field (two adjacent spaces).
+    const empty = Message{ .hostname = "" };
+    try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&empty, &buf));
+    // §6.3.2/§6.3.3: SD-NAME = 1*32PRINTUSASCII; a longer SD-ID is cut at 32.
+    const long_id = Message{ .structured_data = &.{.{ .id = "a" ** 33 }} };
+    try t.expectEqualStrings("<13>1 - - - - - [" ++ "a" ** 32 ++ "]", try bufPrint(&long_id, &buf));
+}
+
 test "bufPrint reports NoSpaceLeft when the buffer is too small" {
     const msg = Message{ .facility = .user, .severity = .notice, .msg = "x" ** 100 };
     var tiny: [16]u8 = undefined;

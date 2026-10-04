@@ -397,6 +397,20 @@ const TestReceiver = struct {
     }
 };
 
+test "a socket path must leave room for the NUL; sendMessage counts its own fields against max_fields" {
+    // `sockaddrUnix` doc: the path must fit "with room for the kernel's
+    // implicit NUL terminator" -- a path of exactly `sun_path`'s size (108
+    // on Linux) does not. `journal.max_fields` bounds MESSAGE plus the
+    // caller's fields. Mutation 2026-10-04: an off-by-one path check and a
+    // missing field-count check in `sendMessage` both survived.
+    const sun_len = @typeInfo(@FieldType(linux.sockaddr.un, "path")).array.len;
+    try std.testing.expectError(error.PathTooLong, UnixEmitter.open("p" ** sun_len));
+    var e = try journal.Emitter.open("/nonexistent-zig-libs-test-socket");
+    defer e.close();
+    const many = [_]journal.Field{.{ .name = "F", .value = "v" }} ** journal.max_fields;
+    try std.testing.expectError(error.TooManyFields, e.sendMessage(.{ .message = "m", .fields = &many }));
+}
+
 fn testSocketPath(tmp: *std.testing.TmpDir, buf: []u8, name: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
 }

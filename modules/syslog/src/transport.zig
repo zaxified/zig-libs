@@ -35,11 +35,17 @@ pub fn buildDatagram(msg: *const Message, scratch: []u8, opts: Options) []const 
     var w: std.Io.Writer = .fixed(scratch);
     // On overflow the fixed writer stops at capacity; the partial content in
     // `scratch` is what we then truncate — either way we clamp below.
-    msg.format(&w) catch {};
+    //
+    // The overflow itself must be remembered: when `udp_limit >= scratch.len`
+    // a message longer than `scratch` comes back exactly `limit` bytes long,
+    // so `bytes.len > limit` alone missed it and the datagram went out cut
+    // short WITHOUT the marker -- a silent truncation, the one thing the
+    // marker exists to rule out (audit 2026-10-04).
+    const overflowed = if (msg.format(&w)) |_| false else |_| true;
     var bytes = w.buffered();
 
     const limit = @min(opts.udp_limit, scratch.len);
-    if (bytes.len > limit) {
+    if (bytes.len > limit or overflowed) {
         const mlen = @min(opts.trunc_marker.len, limit);
         const keep = limit - mlen;
         @memcpy(scratch[keep .. keep + mlen], opts.trunc_marker[0..mlen]);
@@ -151,6 +157,34 @@ test "buildDatagram passes a small message through unchanged" {
     var scratch: [scratch_len]u8 = undefined;
     const dg = buildDatagram(&msg, &scratch, .{});
     try t.expectEqualStrings("<13>1 - - - - - -", dg);
+}
+
+test "buildDatagram: a budget shorter than the marker keeps only the marker's head" {
+    // The datagram is "truncated to `opts.udp_limit`" (doc) -- even when the
+    // marker itself does not fit; it is then cut, never written past the
+    // budget. Mutation 2026-10-04: an unclamped marker survived (it
+    // underflows `limit - mlen`).
+    var scratch: [scratch_len]u8 = undefined;
+    const msg = Message{ .msg = "A" ** 100 };
+    const dg = buildDatagram(&msg, &scratch, .{ .udp_limit = 4 });
+    try std.testing.expectEqualStrings("...[", dg);
+}
+
+test "buildDatagram marks a message that overflows the scratch buffer itself" {
+    // `buildDatagram` doc: the payload is "truncated ... with
+    // `opts.trunc_marker` substituted for the overflowing tail". With a
+    // budget at or above the scratch size, a message longer than the scratch
+    // used to come back exactly `scratch.len` bytes and unmarked, because
+    // only `bytes.len > limit` was checked (audit 2026-10-04).
+    var scratch: [64]u8 = undefined;
+    const msg = Message{ .msg = "x" ** 200 };
+    const dg = buildDatagram(&msg, &scratch, .{ .udp_limit = 2048 });
+    try std.testing.expectEqual(@as(usize, 64), dg.len);
+    try std.testing.expect(std.mem.endsWith(u8, dg, default_trunc_marker));
+    // A message that fits the scratch exactly is still passed through whole.
+    var fits: [256]u8 = undefined;
+    const whole = buildDatagram(&msg, &fits, .{ .udp_limit = 2048 });
+    try std.testing.expect(std.mem.endsWith(u8, whole, "x" ** 200));
 }
 
 test "buildDatagram truncates and appends the marker over budget" {

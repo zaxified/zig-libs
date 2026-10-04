@@ -6,7 +6,7 @@
 
 **Scope:** core — Rust `syslog` crate (Geal/rust-syslog) and Go `log/syslog` as the client yardstick (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -165,6 +165,19 @@ its bytes, assert offline). No `/NOTICE` entry: `rsyslogd` was used purely as a
 black-box receiving oracle — its own parser's rendering was observed, no
 rsyslog source was read or consulted (root `NOTICE` §0, the same relationship
 as `icmp`/`genetlink`/`nftables`/`traceroute`).
+
+**Audit 2026-10-04 (mutation).** 33 schemata mutants over PRI, the timestamp range and
+offset rendering, header-field NILVALUE/length/printable rules, SD-NAME and SD-value
+escaping, the RFC 3164 encoder (sanitizing, TAG filter and cap, day padding), the UDP
+datagram truncation, octet counting, and the unix/journal emitters (socket path, field-name
+rules, binary field form, field-count caps, PRIORITY digit): 32 killed, 1 equivalent, 0 left
+alive. Equivalent: dropping the `om == 0` special case (the general path prints `+00:00`
+for 0 too). One defect found and fixed: `buildDatagram` added the truncation marker only when
+the formatted bytes exceeded `udp_limit`; with `udp_limit >= scratch.len` a message longer
+than the scratch came back exactly `scratch.len` bytes and unmarked. Tests added for the fix
+and for the 6 real gaps (the first instant past year 9999, an empty header field, a 33-byte
+SD-NAME, a budget shorter than the marker, a 108-byte unix socket path, `sendMessage` over
+`max_fields`).
 
 ## Backlog / deferred
 
