@@ -585,11 +585,17 @@ pub const RiskSpec = struct {
     /// reader.zig's `ann_twr = level^(365.25/days) − 1`. Preferred over ann_return.
     date_col: []const u8 = "",
     periods_per_year: f64 = 252,
+    /// Annual risk-free rate, subtracted from the annualized return in the
+    /// Sharpe and Sortino numerators (excess return, as ffn / empyrical /
+    /// quantstats do). 0 keeps the historical rf = 0 ratios. Calmar has no
+    /// risk-free term by definition.
+    rf: f64 = 0,
 };
 
 /// One-row Dataset of risk metrics: ann_vol, downside, var95, cvar95, mdd,
 /// ulcer, sharpe, sortino, calmar. Drawdown is derived from the compounded
-/// return level (self-contained from the return series).
+/// return level (self-contained from the return series). Sharpe = (ann_return
+/// − rf) / ann_vol, Sortino = (ann_return − rf) / downside.
 pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const rvals = try a.alloc(f64, d.rows.len);
@@ -645,8 +651,9 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
         const span_f: f64 = @floatFromInt(@max(@as(i64, 1), span));
         ann_return = std.math.pow(f64, level, 365.25 / span_f) - 1;
     }
-    const sharpe = if (ann_vol != 0) ann_return / ann_vol else 0;
-    const sortino = if (downside != 0) ann_return / downside else 0;
+    const excess = ann_return - spec.rf;
+    const sharpe = if (ann_vol != 0) excess / ann_vol else 0;
+    const sortino = if (downside != 0) excess / downside else 0;
     const calmar = if (mdd != 0) ann_return / @abs(mdd) else 0;
 
     return oneRow(a, &.{
@@ -1390,6 +1397,221 @@ pub fn rollingSharpe(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!
     return rollingApply(a, d, spec, rollingSharpeReducer);
 }
 
+// ── trade statistics (survey 2026-09-30) ────────────────────────────────────
+// quantstats' definitions: a "win" is a positive period return, a "loss" a
+// negative one; zero returns are neither (they are excluded from win rate and
+// from the averages).
+
+/// Positive periods / non-zero periods; 0 when every period is zero.
+pub fn winRate(xs: []const f64) f64 {
+    var wins: usize = 0;
+    var losses: usize = 0;
+    for (xs) |x| {
+        if (x > 0) wins += 1 else if (x < 0) losses += 1;
+    }
+    if (wins + losses == 0) return 0;
+    return @as(f64, @floatFromInt(wins)) / @as(f64, @floatFromInt(wins + losses));
+}
+
+/// Average win / |average loss|. No losses: +inf when there are wins, 0 when
+/// there are none either.
+pub fn payoffRatio(xs: []const f64) f64 {
+    var wsum: f64 = 0;
+    var lsum: f64 = 0;
+    var wins: usize = 0;
+    var losses: usize = 0;
+    for (xs) |x| {
+        if (x > 0) {
+            wsum += x;
+            wins += 1;
+        } else if (x < 0) {
+            lsum += x;
+            losses += 1;
+        }
+    }
+    if (wins == 0) return 0;
+    if (losses == 0) return std.math.inf(f64);
+    const avg_win = wsum / @as(f64, @floatFromInt(wins));
+    const avg_loss = lsum / @as(f64, @floatFromInt(losses));
+    return avg_win / @abs(avg_loss);
+}
+
+/// Σ gains / |Σ losses| — the Omega ratio at threshold 0 (`omegaRatio`, with
+/// its conventions: no losses → +inf, a flat series → 1).
+pub fn profitFactor(xs: []const f64) f64 {
+    return omegaRatio(xs, 0);
+}
+
+/// Kelly fraction f = p − q / b with p = `winRate`, q = 1 − p, b =
+/// `payoffRatio` (quantstats' `kelly_criterion`, rearranged). No wins → −inf
+/// (never bet); no losses → p; no non-zero period → 0.
+pub fn kellyCriterion(xs: []const f64) f64 {
+    const p = winRate(xs);
+    const b = payoffRatio(xs);
+    if (p == 0 and b == 0) {
+        for (xs) |x| if (x < 0) return -std.math.inf(f64);
+        return 0;
+    }
+    return p - (1 - p) / b;
+}
+
+/// |95th percentile| / |5th percentile| (empyrical / quantstats `tail_ratio`,
+/// linear interpolation as numpy's default). A zero 5th percentile gives +inf,
+/// or 0 when the 95th is zero too. Sorts a scratch copy.
+pub fn tailRatio(a: std.mem.Allocator, xs: []const f64) Error!f64 {
+    if (xs.len == 0) return 0;
+    const s = try a.dupe(f64, xs);
+    defer a.free(s);
+    std.mem.sort(f64, s, {}, f64lt);
+    const hi = @abs(quantileSorted(s, 0.95));
+    const lo = @abs(quantileSorted(s, 0.05));
+    if (lo == 0) return if (hi == 0) 0 else std.math.inf(f64);
+    return hi / lo;
+}
+
+pub const TradeStatsSpec = struct {
+    ret_col: []const u8,
+};
+
+/// One-row Dataset: {win_rate, payoff, profit_factor, kelly, tail_ratio}.
+pub fn tradeStats(a: std.mem.Allocator, d: Dataset, spec: TradeStatsSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const xs = try a.alloc(f64, d.rows.len);
+    defer a.free(xs); // scratch
+    for (d.rows, 0..) |r, i| xs[i] = r[ri].asFloat() orelse 0;
+    return oneRow(a, &.{
+        .{ "win_rate", winRate(xs) },
+        .{ "payoff", payoffRatio(xs) },
+        .{ "profit_factor", profitFactor(xs) },
+        .{ "kelly", kellyCriterion(xs) },
+        .{ "tail_ratio", try tailRatio(a, xs) },
+    });
+}
+
+// ── benchmark-relative: Treynor, capture ratios, rolling beta (survey 2026-09-30)
+
+/// Compound annual growth of a return series with `ppy` periods per year:
+/// Π(1+r)^(ppy/n) − 1 (empyrical's `annual_return`). 0 for an empty series.
+fn cagrOf(xs: []const f64, ppy: f64) f64 {
+    if (xs.len == 0) return 0;
+    var level: f64 = 1;
+    for (xs) |x| level *= 1 + x;
+    return std.math.pow(f64, level, ppy / @as(f64, @floatFromInt(xs.len))) - 1;
+}
+
+/// cov(p, b) / var(b) over two equal-length series (0 when var(b) is 0).
+fn betaOf(p: []const f64, b: []const f64) f64 {
+    const mp = mean(p);
+    const mb = mean(b);
+    var cov: f64 = 0;
+    var varb: f64 = 0;
+    for (p, b) |x, y| {
+        cov += (x - mp) * (y - mb);
+        varb += (y - mb) * (y - mb);
+    }
+    return if (varb > 0) cov / varb else 0;
+}
+
+/// Up (or down) capture: CAGR of the portfolio over the periods where the
+/// benchmark rose (fell), divided by the benchmark's CAGR over the same periods
+/// (empyrical's `up_capture` / `down_capture`). 0 when there is no such period.
+fn capture(a: std.mem.Allocator, p: []const f64, b: []const f64, ppy: f64, up: bool) Error!f64 {
+    var ps: std.ArrayList(f64) = .empty;
+    defer ps.deinit(a);
+    var bs: std.ArrayList(f64) = .empty;
+    defer bs.deinit(a);
+    for (p, b) |x, y| {
+        if (if (up) y > 0 else y < 0) {
+            try ps.append(a, x);
+            try bs.append(a, y);
+        }
+    }
+    const bench = cagrOf(bs.items, ppy); // 0 for no such period
+    if (bench == 0) return 0;
+    return cagrOf(ps.items, ppy) / bench;
+}
+
+pub const BenchmarkSpec = struct {
+    port_ret_col: []const u8,
+    bench_ret_col: []const u8,
+    /// Annualized portfolio return for the Treynor numerator (same input as
+    /// `BetaSpec.port_ann`).
+    port_ann: f64,
+    /// Annual risk-free rate.
+    rf: f64 = 0,
+    periods_per_year: f64 = 252,
+};
+
+/// One-row Dataset: {treynor, up_capture, down_capture}. Aligned rows only
+/// (join portfolio and benchmark on date first, as for `betaAlpha`).
+/// treynor = (port_ann − rf) / beta (0 when beta is 0), beta = cov/var(bench).
+/// An up capture above 1 beat the benchmark's rises; a down capture below 1
+/// lost less in its falls.
+pub fn benchmarkStats(a: std.mem.Allocator, d: Dataset, spec: BenchmarkSpec) Error!Dataset {
+    const pi = try mustIndex(d, spec.port_ret_col);
+    const bi = try mustIndex(d, spec.bench_ret_col);
+    const p = try a.alloc(f64, d.rows.len);
+    defer a.free(p);
+    const b = try a.alloc(f64, d.rows.len);
+    defer a.free(b);
+    for (d.rows, 0..) |r, i| {
+        p[i] = r[pi].asFloat() orelse 0;
+        b[i] = r[bi].asFloat() orelse 0;
+    }
+    const beta = betaOf(p, b);
+    return oneRow(a, &.{
+        .{ "treynor", if (beta != 0) (spec.port_ann - spec.rf) / beta else 0 },
+        .{ "up_capture", try capture(a, p, b, spec.periods_per_year, true) },
+        .{ "down_capture", try capture(a, p, b, spec.periods_per_year, false) },
+    });
+}
+
+pub const RollingBetaSpec = struct {
+    port_ret_col: []const u8,
+    bench_ret_col: []const u8,
+    window: usize,
+    /// Optional date column carried through as each window's last date.
+    date_col: []const u8 = "",
+    periods_per_year: f64 = 252,
+};
+
+/// Rolling {beta, alpha} over trailing windows (rows as `rollingApply`: one per
+/// full window). beta = cov/var(bench) in the window; alpha = (mean(port) −
+/// beta·mean(bench))·periods_per_year — Jensen's alpha with rf = 0, annualized
+/// arithmetically (the static `betaAlpha` takes annualized returns instead).
+pub fn rollingBetaAlpha(a: std.mem.Allocator, d: Dataset, spec: RollingBetaSpec) Error!Dataset {
+    const pi = try mustIndex(d, spec.port_ret_col);
+    const bi = try mustIndex(d, spec.bench_ret_col);
+    const di: ?usize = if (spec.date_col.len > 0) try mustIndex(d, spec.date_col) else null;
+    const n = d.rows.len;
+    const p = try a.alloc(f64, n);
+    defer a.free(p);
+    const b = try a.alloc(f64, n);
+    defer a.free(b);
+    for (d.rows, 0..) |r, i| {
+        p[i] = r[pi].asFloat() orelse 0;
+        b[i] = r[bi].asFloat() orelse 0;
+    }
+    const lead: usize = @intFromBool(di != null);
+    const cols = try a.alloc(Column, lead + 2);
+    if (di != null) cols[0] = .{ .name = spec.date_col, .type = d.columns[di.?].type };
+    cols[lead] = .{ .name = "beta", .type = .float };
+    cols[lead + 1] = .{ .name = "alpha", .type = .float };
+    if (spec.window == 0 or n < spec.window) return .{ .columns = cols, .rows = &.{} };
+    const rows = try a.alloc([]const Value, n - spec.window + 1);
+    for (rows, 0..) |*row, k| {
+        const wp = p[k .. k + spec.window];
+        const wb = b[k .. k + spec.window];
+        const beta = betaOf(wp, wb);
+        const nr = try a.alloc(Value, cols.len);
+        if (di) |dci| nr[0] = d.rows[k + spec.window - 1][dci];
+        nr[lead] = .{ .float = beta };
+        nr[lead + 1] = .{ .float = (mean(wp) - beta * mean(wb)) * spec.periods_per_year };
+        row.* = nr;
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
 // ── Brinson (factor) attribution (backlog item) ──────────────────────────────
 
 pub const BrinsonSpec = struct {
@@ -1555,6 +1777,10 @@ test "scratch allocations are released — EVERY allocating public fn, on std.te
     freeDs(a, try rollingMean(a, d, .{ .value_col = "v", .window = 2 }));
     freeDs(a, try rollingVolatility(a, d, .{ .value_col = "v", .window = 2 }));
     freeDs(a, try rollingSharpe(a, d, .{ .value_col = "v", .window = 2 }));
+    freeDs(a, try tradeStats(a, d, .{ .ret_col = "ret" }));
+    freeDs(a, try benchmarkStats(a, d, .{ .port_ret_col = "ret", .bench_ret_col = "bench", .port_ann = 0.1 }));
+    freeDs(a, try rollingBetaAlpha(a, d, .{ .port_ret_col = "ret", .bench_ret_col = "bench", .window = 2, .date_col = "d" }));
+    _ = try tailRatio(a, &[_]f64{ 0.3, -0.1, 0.2 });
 
     // `correlationMatrix` wants the long form, and it is the worst of the set:
     // besides its own three scratch containers it allocates one hash map per
@@ -2660,6 +2886,11 @@ test "FFN reference validation: risk_metrics against external ffn library (8-day
     const mdd_zig = rm.cell(0, "mdd").?.float;
     try testing.expectApproxEqAbs(mdd_ffn, mdd_zig, 1e-6);
 
+    // Downside deviation, FFN: 0.1285982115 — √(Σ min(r,0)² / n)·√252 with the
+    // POPULATION divisor n = 8 (n − 1 would give 0.1375). Pinned 2026-10-04
+    // after a mutation run found nothing held the divisor.
+    try testing.expectApproxEqAbs(@as(f64, 0.1285982115), rm.cell(0, "downside").?.float, 1e-9);
+
     // Validate VaR 95% (negative of 5th percentile)
     // FFN: 0.0165 (5th percentile is ~-0.0165, so -(-0.0165) = 0.0165)
     const var_95_ffn = 0.0165;
@@ -2735,4 +2966,157 @@ test "monteCarlo frees the path buffers it did allocate when one fails" {
         // FailingAllocator's own deinit-time accounting is what catches a leak.
         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+// ── 2026-10-04: rf, trade statistics, benchmark-relative metrics ─────────────
+
+test "riskMetrics: rf is subtracted from the Sharpe and Sortino numerators only" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "r", .type = .float }};
+    const rows = [_][]const Value{ &.{.{ .float = 0.01 }}, &.{.{ .float = -0.02 }}, &.{.{ .float = 0.015 }}, &.{.{ .float = -0.005 }} };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const r0 = try riskMetrics(f.a(), d, .{ .ret_col = "r", .ann_return = 0.10 });
+    const r3 = try riskMetrics(f.a(), d, .{ .ret_col = "r", .ann_return = 0.10, .rf = 0.03 });
+    // Same denominators, numerator 0.10 → 0.07: each ratio scales by 0.7.
+    try testing.expectApproxEqRel(r0.cell(0, "sharpe").?.float * 0.7, r3.cell(0, "sharpe").?.float, 1e-12);
+    try testing.expectApproxEqRel(r0.cell(0, "sortino").?.float * 0.7, r3.cell(0, "sortino").?.float, 1e-12);
+    try testing.expectEqual(r0.cell(0, "calmar").?.float, r3.cell(0, "calmar").?.float);
+    try testing.expectEqual(r0.cell(0, "ann_vol").?.float, r3.cell(0, "ann_vol").?.float);
+    // And the absolute value: sharpe = (0.10 − 0.03) / ann_vol.
+    try testing.expectApproxEqRel(0.07 / r3.cell(0, "ann_vol").?.float, r3.cell(0, "sharpe").?.float, 1e-12);
+}
+
+test "trade statistics: hand-computed on a six-period series" {
+    // 0.02 −0.01 0.03 0 −0.02 0.01: wins 0.02 0.03 0.01 (avg 0.02), losses
+    // −0.01 −0.02 (avg −0.015), the zero is neither.
+    const xs = [_]f64{ 0.02, -0.01, 0.03, 0, -0.02, 0.01 };
+    try testing.expectApproxEqRel(@as(f64, 0.6), winRate(&xs), 1e-12); // 3 / 5
+    try testing.expectApproxEqRel(@as(f64, 4.0 / 3.0), payoffRatio(&xs), 1e-12); // 0.02 / 0.015
+    try testing.expectApproxEqRel(@as(f64, 2), profitFactor(&xs), 1e-12); // 0.06 / 0.03
+    try testing.expectApproxEqRel(@as(f64, 0.3), kellyCriterion(&xs), 1e-12); // 0.6 − 0.4 / (4/3)
+    // Sorted −0.02 −0.01 0 0.01 0.02 0.03 (n = 6): q95 at 0.95·5 = 4.75 →
+    // 0.02 + 0.75·0.01 = 0.0275; q05 at 0.25 → −0.02 + 0.25·0.01 = −0.0175.
+    try testing.expectApproxEqRel(@as(f64, 0.0275 / 0.0175), try tailRatio(testing.allocator, &xs), 1e-12);
+
+    // Degenerate series, each convention stated in the doc comments.
+    const flat = [_]f64{ 0, 0 };
+    try testing.expectEqual(@as(f64, 0), winRate(&flat));
+    try testing.expectEqual(@as(f64, 0), payoffRatio(&flat));
+    try testing.expectEqual(@as(f64, 1), profitFactor(&flat));
+    try testing.expectEqual(@as(f64, 0), kellyCriterion(&flat));
+    try testing.expectEqual(@as(f64, 0), try tailRatio(testing.allocator, &flat));
+    try testing.expectEqual(@as(f64, 0), try tailRatio(testing.allocator, &.{}));
+    const all_up = [_]f64{ 0.01, 0.02 };
+    try testing.expectEqual(@as(f64, 1), winRate(&all_up));
+    try testing.expect(std.math.isPositiveInf(payoffRatio(&all_up)));
+    try testing.expectEqual(@as(f64, 1), kellyCriterion(&all_up)); // p − 0/inf
+    const all_down = [_]f64{ -0.01, -0.02 };
+    try testing.expectEqual(@as(f64, 0), payoffRatio(&all_down));
+    try testing.expect(std.math.isNegativeInf(kellyCriterion(&all_down)));
+    // A zero 5th percentile: +inf.
+    try testing.expect(std.math.isPositiveInf(try tailRatio(testing.allocator, &[_]f64{ 0, 0, 0, 0, 0, 1 })));
+
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "r", .type = .float }};
+    var rows: [xs.len][]const Value = undefined;
+    for (xs, 0..) |x, i| rows[i] = try f.a().dupe(Value, &.{.{ .float = x }});
+    const ts = try tradeStats(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .ret_col = "r" });
+    try testing.expectApproxEqRel(@as(f64, 0.6), ts.cell(0, "win_rate").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 4.0 / 3.0), ts.cell(0, "payoff").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 2), ts.cell(0, "profit_factor").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 0.3), ts.cell(0, "kelly").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 0.0275 / 0.0175), ts.cell(0, "tail_ratio").?.float, 1e-12);
+}
+
+const bench_cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
+// b = 0.10 −0.05 0.20 −0.10, p = 0.05 −0.10 0.10 0.
+const bench_rows = [_][]const Value{
+    &.{ .{ .text = "2024-01-01" }, .{ .float = 0.05 }, .{ .float = 0.10 } },
+    &.{ .{ .text = "2024-04-01" }, .{ .float = -0.10 }, .{ .float = -0.05 } },
+    &.{ .{ .text = "2024-07-01" }, .{ .float = 0.10 }, .{ .float = 0.20 } },
+    &.{ .{ .text = "2024-10-01" }, .{ .float = 0.0 }, .{ .float = -0.10 } },
+};
+
+test "benchmarkStats: Treynor and capture ratios, hand-computed" {
+    var f = Fix.init();
+    defer f.deinit();
+    const d: Dataset = .{ .columns = &bench_cols, .rows = &bench_rows };
+    const out = try benchmarkStats(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.08, .rf = 0.02, .periods_per_year = 4 });
+    // means b 0.0375, p 0.0125; Σ dev_p·dev_b = 0.028125, Σ dev_b² = 0.056875 →
+    // beta = 45/91; Treynor = (0.08 − 0.02) / (45/91).
+    try testing.expectApproxEqRel(@as(f64, 0.06 * 91.0 / 45.0), out.cell(0, "treynor").?.float, 1e-12);
+    // Up periods (b > 0): rows 0, 2 — two quarters = half a year, so CAGR =
+    // product² − 1: bench 1.1·1.2 = 1.32 → 0.7424; port 1.05·1.10 = 1.155 → 0.334025.
+    try testing.expectApproxEqRel(@as(f64, 0.334025 / 0.7424), out.cell(0, "up_capture").?.float, 1e-12);
+    // Down periods: rows 1, 3: bench 0.95·0.90 = 0.855 → −0.268975; port 0.9·1.0 → −0.19.
+    try testing.expectApproxEqRel(@as(f64, 0.19 / 0.268975), out.cell(0, "down_capture").?.float, 1e-12);
+    // No down period at all: 0 by convention; beta 0 → Treynor 0.
+    const up_only = [_][]const Value{ bench_rows[0], bench_rows[2] };
+    const u = try benchmarkStats(f.a(), .{ .columns = &bench_cols, .rows = &up_only }, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.08 });
+    try testing.expectEqual(@as(f64, 0), u.cell(0, "down_capture").?.float);
+    const flat_rows = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0.05 }, .{ .float = 0.01 } },
+        &.{ .{ .text = "2024-01-02" }, .{ .float = 0.02 }, .{ .float = 0.01 } },
+    };
+    const z = try benchmarkStats(f.a(), .{ .columns = &bench_cols, .rows = &flat_rows }, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.08 });
+    try testing.expectEqual(@as(f64, 0), z.cell(0, "treynor").?.float);
+}
+
+test "rollingBetaAlpha: each window hand-computed" {
+    var f = Fix.init();
+    defer f.deinit();
+    const d: Dataset = .{ .columns = &bench_cols, .rows = &bench_rows };
+    const out = try rollingBetaAlpha(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "b", .window = 2, .date_col = "d", .periods_per_year = 4 });
+    try testing.expectEqual(@as(usize, 3), out.rows.len);
+    try testing.expectEqualStrings("d", out.columns[0].name);
+    try testing.expectEqual(dsmod.ColumnType.date, out.columns[0].type);
+    // [0,1]: dev_b ±0.075, dev_p ±0.075 → beta 1; alpha = (−0.025 − 0.025)·4.
+    // [1,2]: dev_b ∓0.125, dev_p ∓0.1 → beta 0.025/0.03125 = 0.8; alpha = (0 − 0.8·0.075)·4.
+    // [2,3]: dev_b ±0.15, dev_p ±0.05 → beta 1/3; alpha = (0.05 − 0.05/3)·4.
+    const want = [_][3]f64{ .{ 1, -0.2, 0 }, .{ 0.8, -0.24, 0 }, .{ 1.0 / 3.0, 0.4 / 3.0, 0 } };
+    const dates = [_][]const u8{ "2024-04-01", "2024-07-01", "2024-10-01" };
+    for (want, 0..) |w, i| {
+        try testing.expectEqualStrings(dates[i], out.rows[i][0].text);
+        try testing.expectApproxEqAbs(w[0], out.rows[i][1].float, 1e-12);
+        try testing.expectApproxEqAbs(w[1], out.rows[i][2].float, 1e-12);
+    }
+    // The full-length window equals the static beta (45/91).
+    const full = try rollingBetaAlpha(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "b", .window = 4 });
+    try testing.expectEqual(@as(usize, 1), full.rows.len);
+    try testing.expectEqual(@as(usize, 2), full.columns.len);
+    try testing.expectApproxEqRel(@as(f64, 45.0 / 91.0), full.rows[0][0].float, 1e-12);
+    // Too short a series, or window 0: no rows, columns still declared.
+    try testing.expectEqual(@as(usize, 0), (try rollingBetaAlpha(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "b", .window = 5 })).rows.len);
+    try testing.expectEqual(@as(usize, 0), (try rollingBetaAlpha(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "b", .window = 0 })).rows.len);
+    try testing.expectError(error.NoSuchColumn, rollingBetaAlpha(f.a(), d, .{ .port_ret_col = "p", .bench_ret_col = "zz", .window = 2 }));
+}
+
+test "edges the mutation run asked for (finstats)" {
+    var f = Fix.init();
+    defer f.deinit();
+    // A benchmark period of exactly 0 is neither up nor down: adding one with a
+    // nonzero portfolio return must leave both captures unchanged.
+    const with_zero = [_][]const Value{
+        bench_rows[0],                                                       bench_rows[1], bench_rows[2], bench_rows[3],
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0.5 }, .{ .float = 0 } },
+    };
+    const out = try benchmarkStats(f.a(), .{ .columns = &bench_cols, .rows = &with_zero }, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.08, .periods_per_year = 4 });
+    try testing.expectApproxEqRel(@as(f64, 0.334025 / 0.7424), out.cell(0, "up_capture").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 0.19 / 0.268975), out.cell(0, "down_capture").?.float, 1e-12);
+
+    // Ulcer index = √(mean of squared percent drawdowns). Returns 0.1, −0.1:
+    // level 1.1 (peak, dd 0), then 0.99 (dd −10 %) → √((0 + 100) / 2) = √50.
+    const ucols = [_]Column{.{ .name = "r", .type = .float }};
+    const urows = [_][]const Value{ &.{.{ .float = 0.1 }}, &.{.{ .float = -0.1 }} };
+    const rm = try riskMetrics(f.a(), .{ .columns = &ucols, .rows = &urows }, .{ .ret_col = "r" });
+    try testing.expectApproxEqRel(@sqrt(50.0), rm.cell(0, "ulcer").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, -0.1), rm.cell(0, "mdd").?.float, 1e-12);
+
+    // R² is the SQUARED correlation: on the bench fixture Σdev_p·dev_b =
+    // 0.028125, Σdev_p² = 0.021875, Σdev_b² = 0.056875.
+    const ba = try betaAlpha(f.a(), .{ .columns = &bench_cols, .rows = &bench_rows }, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0, .bench_ann = 0 });
+    try testing.expectApproxEqRel(@as(f64, 0.028125 * 0.028125 / (0.021875 * 0.056875)), ba.cell(0, "r2").?.float, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 45.0 / 91.0), ba.cell(0, "beta").?.float, 1e-12);
 }

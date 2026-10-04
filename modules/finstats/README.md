@@ -5,7 +5,9 @@ and a Newton-with-bisection-fallback variant), daily time-weighted return,
 risk metrics (vol / VaR / CVaR / Sharpe / Sortino / Calmar / Ulcer /
 max-drawdown, historical), parametric VaR / CVaR at an arbitrary confidence
 (Gaussian and Cornish-Fisher), beta / alpha / R², tracking error /
-information ratio, the Omega ratio, a generic rolling-window reducer, a
+information ratio, the Omega ratio, trade statistics (win rate / payoff /
+profit factor / Kelly / tail ratio), Treynor and up/down capture, rolling
+beta/alpha, a generic rolling-window reducer, a
 seeded Monte-Carlo net-worth projection, a pairwise-Pearson correlation
 matrix, a drawdown-episode state machine, and Brinson-Fachler performance
 attribution. Every function is a pure transform: `Dataset →
@@ -93,6 +95,21 @@ pinned by tests.
 - **`rollingApply`** — generic sliding-window reducer (comptime `fn
   ([]const f64) f64`) over a value column, `n − window + 1` rows;
   `rollingMean`/`rollingVolatility`/`rollingSharpe` are concrete wrappers.
+- **`riskMetrics` risk-free rate** — `RiskSpec.rf` (annual, default 0):
+  Sharpe and Sortino use `ann_return − rf`; Calmar has no rf term.
+- **Trade statistics** (quantstats' definitions; a zero return is neither a
+  win nor a loss) — `winRate` = wins / non-zero periods; `payoffRatio` =
+  avg win / |avg loss| (no losses → +∞, no wins → 0); `profitFactor` =
+  Σ gains / |Σ losses| = `omegaRatio(xs, 0)`; `kellyCriterion` = p − q/b
+  (no wins → −∞); `tailRatio` = |q95| / |q05| (linear interpolation; a zero
+  q05 → +∞, or 0 when q95 is zero too). Node: `tradeStats`.
+- **`benchmarkStats`** — `treynor = (port_ann − rf) / beta`; `up_capture` /
+  `down_capture` = CAGR of the portfolio over the periods where the
+  benchmark rose / fell, over the benchmark's CAGR on the same periods
+  (empyrical's definition; a zero benchmark period is neither; no such
+  period → 0).
+- **`rollingBetaAlpha`** — per trailing window, `beta = cov/var(bench)` and
+  `alpha = (mean(port) − beta·mean(bench))·ppy` (arithmetic, rf = 0).
 - **`brinsonAttribution`** — Brinson-Fachler attribution per segment:
   `allocation = (wp−wb)(rb−Rb)`, `selection = wb(rp−rb)`,
   `interaction = (wp−wb)(rp−rb)` (Rb = Σ wb·rb); the three effects sum
@@ -151,6 +168,11 @@ fn rollingApply(a, d: Dataset, spec: RollingSpec, comptime reducer: fn ([]const 
 fn rollingMean(a, d: Dataset, spec: RollingSpec) !Dataset;
 fn rollingVolatility(a, d: Dataset, spec: RollingSpec) !Dataset;
 fn rollingSharpe(a, d: Dataset, spec: RollingSpec) !Dataset;
+fn tradeStats(a, d: Dataset, spec: TradeStatsSpec) !Dataset;   // {win_rate, payoff, profit_factor, kelly, tail_ratio}
+fn benchmarkStats(a, d: Dataset, spec: BenchmarkSpec) !Dataset; // {treynor, up_capture, down_capture}
+fn rollingBetaAlpha(a, d: Dataset, spec: RollingBetaSpec) !Dataset; // {[date], beta, alpha} per window
+fn winRate(xs) f64; fn payoffRatio(xs) f64; fn profitFactor(xs) f64; fn kellyCriterion(xs) f64;
+fn tailRatio(a, xs) !f64;
 fn monteCarlo(a, spec: MonteCarloSpec) !Dataset;               // {month, p10, p50, p90}
 fn correlationMatrix(a, d: Dataset, spec: CorrSpec) !Dataset;  // {key, <key>…}
 fn drawdownEpisodes(a, d: Dataset, spec: DdEpisodesSpec) !Dataset;
@@ -171,6 +193,11 @@ intentionally out of scope:
 - **Annualization-frequency presets / validation** — `periods_per_year` is a
   free 252-defaulted knob with no daily/weekly/monthly presets or bounds check.
 - **Confidence intervals / standard errors** on the statistics.
+- **A risk-free rate in `rollingSharpe`** — its reducer is a comptime
+  `fn ([]const f64) f64` with no parameters; subtract a per-period rf from
+  the column first (a `tabular` `map`) until a parameterised reducer exists.
+- **Probabilistic / deflated Sharpe, Sterling/Burke ratios, rolling
+  capture** — no consumer asks; each would be another small pure function.
 
 ## Verify
 

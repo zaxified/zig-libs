@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED (survey 2026-09-30 gaps), no breaking change: `RiskSpec.rf` (annual
+  risk-free rate in the Sharpe/Sortino numerators; default 0 = unchanged); trade statistics
+  `winRate`, `payoffRatio`, `profitFactor`, `kellyCriterion`, `tailRatio` + node `tradeStats`;
+  `benchmarkStats` (Treynor, up/down capture, empyrical's CAGR-over-subset definition);
+  `rollingBetaAlpha`. Every value in the new tests is hand-computed; the ffn reference test now
+  also pins `downside` (population divisor, ffn 0.1285982115). Mutation 2026-10-04: 34 mutants,
+  31 killed, 2 equivalent, 1 removed with the redundant check it pointed at; 2 tests added.
+
 - **2026-09-17** — `histogram`: two non-answers that looked like answers, both
   reported by a downstream consumer auditing the new pin. ⚠ **Behaviour change**
   (no `Error` widening, so nothing needs recompiling).
