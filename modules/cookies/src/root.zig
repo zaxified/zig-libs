@@ -772,3 +772,13 @@ test "corpus: every cookie seed reaches the scanner, and the segments yielded ar
     try std.testing.expectEqual(@as(usize, 79), yielded);
     try std.testing.expectEqual(@as(usize, 3), quoted); // the three seeds whose value survives the DQUOTE toggle with a ';' inside
 }
+
+// ── audit 2026-10-04: test asked for by a mutation survivor ──────────────────
+
+test "find matches the cookie name case-sensitively" {
+    // RFC 6265 compares cookie names octet for octet (§5.3 step 11 stores
+    // `Session` and `session` as two cookies), and `find`'s doc says so: a
+    // case-folding match would let `SESSION=…` stand in for `session`.
+    try testing.expectEqualStrings("b", find("Session=a; session=b", "session").?);
+    try testing.expectEqual(@as(?[]const u8, null), find("SESSION=x", "session"));
+}

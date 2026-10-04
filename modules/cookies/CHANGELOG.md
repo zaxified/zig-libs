@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (32 mutants, all killed). One new test:
+  `find` matches cookie names case-sensitively. No behaviour change.
 - **2026-09-07** — Fuzz reach: `fuzzParseNeverPanics` only ever ran `parse("")`.
   `buildCookieHeader`'s first act was `smith.valueRangeAtMost(u8, 0, 9)`, the harness's
   FIRST draw; a `Smith` ranged draw reads eight octets as a little-endian `u64` and

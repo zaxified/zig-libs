@@ -6,7 +6,7 @@
 
 **Scope:** core — Rust `cookie` 0.18 and Go `net/http` cookies (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -85,6 +85,16 @@ segment split, fixed in `root.zig`'s `Iterator.next`) and surfaced several judge
 divergences (python's whole-header abort on one bad segment; its Set-Cookie-attribute-keyword
 capture applied to what is really a `Cookie` request header; last-write-wins on duplicate names;
 DQUOTE-in-name rejection) — each argued against RFC 6265 at its test site, not copied blind.
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 32
+mutants — the DQUOTE span toggle and `;` split, the last-segment advance, first-`=` split,
+both OWS trims, empty-name skip, the DQUOTE strip (length and closing quote), `find`'s name
+match, every `SetCookie.write` check (empty/invalid name, value octets, Path/Domain octets,
+`SameSite=None` without `Secure`, `__Secure-`, all three `__Host-` conditions), `HttpOnly`
+emission, the token/cookie-octet/attribute-octet class bounds (SP, DEL, `=`, `;`, `\`,
+CTL incl. CR/LF in attributes) and the `SameSite` token. First run: 31 killed, 1 alive (a
+case-insensitive name match); one test added (`find` is case-sensitive, RFC 6265 §5.3);
+rerun: 32 killed, 0 equivalent. No defect found.
 
 ## Backlog / deferred
 None recorded before the 2026-09-30 survey.
