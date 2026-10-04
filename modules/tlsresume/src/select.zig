@@ -559,3 +559,36 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     try testing.expectEqual(@as(usize, 1), selection.selected_index);
     try testing.expectEqualSlices(u8, &client_psk, &selection.psk);
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "selectPsk: a ticket from the future and a strike register that cannot allocate both reject" {
+    // A session issued after `now_ms` has no elapsed time to compare the
+    // client's age against (the clock went backwards, or the blob was forged
+    // with a future stamp) — not acceptable. And the strike register's
+    // allocation failure is fail-closed (doc step 5: "fails to allocate —
+    // fail-closed"), never an accept.
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, [_]u8{0x42} ** stek.key_length, 0);
+    const rms = [_]u8{0xAB} ** 32;
+    const nonce = [_]u8{ 0, 0 };
+    const issued_at_ms: i64 = 1_000_000;
+    const state = SessionState(32){ .resumption_master_secret = rms, .ticket_nonce = &nonce, .issued_at_ms = issued_at_ms, .ticket_age_add = 7 };
+    var pt_buf: [128]u8 = undefined;
+    var blob_buf: [160]u8 = undefined;
+    const ticket = try ring.seal(try state.serialize(&pt_buf), [_]u8{0x01} ** stek.nonce_length, &blob_buf);
+    const empty_hash = sha256Of("");
+    const ch_hash = sha256Of("truncated ClientHello");
+    const client_psk = psk.derivePsk(HkdfSha256, rms, &nonce, 32);
+    const binder = psk.computeBinder(HkdfSha256, HmacSha256, psk.binderKey(HkdfSha256, psk.earlySecret(HkdfSha256, &client_psk), &empty_hash), &ch_hash);
+    const identity = OfferedIdentity{ .ticket = ticket, .obfuscated_ticket_age = replay.obfuscateAge(0, 7) };
+    var scratch: [128]u8 = undefined;
+
+    _ = try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, null, &scratch); // control
+    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms - 1, 1_000, null, &scratch));
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var strike = replay.StrikeRegister.init(failing.allocator(), 8, 60_000);
+    defer strike.deinit();
+    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, &strike, &scratch));
+}

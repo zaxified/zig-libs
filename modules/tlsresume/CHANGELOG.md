@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (37 mutants, all killed). Four new tests:
+  NewSessionTicket length prefixes that overrun what follows, `maxEarlyDataSize`'s type/length
+  rule, the strike register's inclusive window / re-arm / eviction boundary, and `selectPsk`
+  rejecting a future-dated ticket and an allocation-failing strike register. No behaviour change.
 - **2026-09-07** — Fuzz reach: both fuzz targets ran one input, and it was the same one
   every time. Each opened `smith.value(bool)` to pick between an unstructured and a
   structured half; a `Smith` scalar draw reads eight octets as a little-endian `u64` and

@@ -519,3 +519,37 @@ test "maxEarlyDataSize: null when no early_data extension is present" {
     };
     try testing.expect(nst.maxEarlyDataSize() == null);
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "decode: every length prefix must fit what follows (RFC 8446 §3.4 vectors)" {
+    // A TLS vector's length prefix must not claim more bytes than remain
+    // (RFC 8446 §3.4); each case below breaks exactly one prefix of an
+    // otherwise valid NewSessionTicket body (lifetime, age_add, empty nonce).
+    var ext_buf: [4]Extension = undefined;
+    const head = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 2, 0 }; // lifetime, age_add, nonce<0>
+    // No room for the ticket's 2-byte length.
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&head, &ext_buf));
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&(head ++ [_]u8{0}), &ext_buf));
+    const with_ticket = head ++ [_]u8{ 0, 1, 0xAA }; // ticket<1> = AA
+    _ = try NewSessionTicket.decode(&(with_ticket ++ [_]u8{ 0, 0 }), &ext_buf); // control: no extensions
+    // extensions<..> claims 8 bytes, 4 present.
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&(with_ticket ++ [_]u8{ 0, 8, 0, 42, 0, 0 }), &ext_buf));
+    // a 2-byte extensions block cannot hold an extension header (type + length).
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&(with_ticket ++ [_]u8{ 0, 2, 0, 42 }), &ext_buf));
+    // an extension whose data length runs past the extensions block.
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&(with_ticket ++ [_]u8{ 0, 6, 0, 42, 0, 4, 0, 0 }), &ext_buf));
+}
+
+test "maxEarlyDataSize: only an early_data extension carrying exactly a uint32" {
+    // RFC 8446 §4.2.10: in NewSessionTicket, `early_data` (type 42) carries
+    // `uint32 max_early_data_size` — 4 bytes. Another type with 4 bytes is
+    // not it, and a 42 of another length is malformed, not a size.
+    const four = [_]u8{ 0, 0, 0x40, 0 };
+    const other: NewSessionTicket = .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = 41, .data = &four }} };
+    try testing.expectEqual(@as(?u32, null), other.maxEarlyDataSize());
+    const short: NewSessionTicket = .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = early_data_extension_type, .data = four[0..3] }} };
+    try testing.expectEqual(@as(?u32, null), short.maxEarlyDataSize());
+    const good: NewSessionTicket = .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = early_data_extension_type, .data = &four }} };
+    try testing.expectEqual(@as(?u32, 0x4000), good.maxEarlyDataSize());
+}

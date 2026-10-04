@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSL 4.0 / BoringSSL TLS 1.3 server tickets; every TLS 1.3 resumption piece is here as engine-agnostic functions, with rotation left to the caller's schedule and no TLS 1.2 tickets (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -254,6 +254,20 @@ binder-key derivations.
    assert the round-tripped PSK matches what a hypothetical peer would have
    derived independently from the same `resumption_master_secret` +
    `ticket_nonce`.
+
+**Mutation (2026-10-04,** schemata over a copy of `ticket.zig` + `select.zig` + `replay.zig` +
+`psk.zig` + `stek.zig`, one ReleaseSafe build, the whole suite): 37 mutants — every length check
+of `NewSessionTicket.decode` (fixed head, nonce, ticket length/zero/body, extensions block,
+extension header, extension data, scratch capacity, trailing bytes), `maxEarlyDataSize`'s type
+and length test, `encode`'s buffer check, `SessionState.parse`'s two bounds, `selectPsk`'s
+negative-age, freshness, binder, strike and fail-closed checks and the echoed index, the age
+de-obfuscation, the freshness and strike window boundaries, the slot re-arm, capacity and
+eviction, both HKDF labels/inputs, the binder compare, the STEK ring's active slot and key-id
+lookup, and the seal/open buffer checks. First run: 26 killed, 11 alive; four tests added (one
+broken TLS vector prefix per case, RFC 8446 §3.4; `early_data` must be type 42 with a uint32,
+§4.2.10; the strike window is inclusive, a re-armed slot starts a new window, eviction keeps a
+live entry; a future-dated ticket and an allocation-failing strike register both reject);
+rerun: 37 killed. No defect found.
 
 ## Backlog / deferred
 

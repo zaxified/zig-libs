@@ -223,3 +223,26 @@ test "StrikeRegister: expired entries are evicted, memory stays bounded" {
     try testing.expect(!try reg.checkAndMark("ticket-a", 2_200));
     try testing.expect(reg.seen.count() <= 2);
 }
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+
+test "StrikeRegister: the window is inclusive, a re-armed slot starts a new window, eviction keeps live entries" {
+    // `checkAndMark` doc: a repeat "within `window_ms`" is a replay — at
+    // exactly `window_ms` it still is. A slot that aged out and was accepted
+    // again is live again from THAT acceptance (else its replay would pass).
+    // And eviction may only drop entries `checkAndMark` itself no longer
+    // treats as live (age > window): dropping one at age == window would
+    // re-open its replay window.
+    var reg = StrikeRegister.init(testing.allocator, 4, 10);
+    defer reg.deinit();
+    try testing.expect(try reg.checkAndMark("a", 0));
+    try testing.expect(!(try reg.checkAndMark("a", 10)));
+    try testing.expect(try reg.checkAndMark("a", 11)); // aged out: re-armed at 11
+    try testing.expect(!(try reg.checkAndMark("a", 15))); // replay of the 11 acceptance
+
+    var one = StrikeRegister.init(testing.allocator, 1, 10);
+    defer one.deinit();
+    try testing.expect(try one.checkAndMark("x", 0));
+    try testing.expect(!(try one.checkAndMark("y", 10))); // "x" still live at age 10: full
+    try testing.expect(try one.checkAndMark("y", 11)); // "x" evictable at age 11
+}
