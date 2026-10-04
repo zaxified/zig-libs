@@ -194,6 +194,92 @@ pub const NFTA_MASQ = struct {
     pub const REG_PROTO_MAX: u16 = 3;
 };
 
+/// `enum nft_reject_attributes`.
+pub const NFTA_REJECT = struct {
+    pub const TYPE: u16 = 1;
+    pub const ICMP_CODE: u16 = 2;
+};
+
+/// `enum nft_reject_types`.
+pub const NFT_REJECT = struct {
+    pub const ICMP_UNREACH: u32 = 0;
+    pub const TCP_RST: u32 = 1;
+    pub const ICMPX_UNREACH: u32 = 2;
+};
+
+/// `enum nft_queue_attributes`. All three values are `NLA_U16`.
+pub const NFTA_QUEUE = struct {
+    pub const NUM: u16 = 1;
+    pub const TOTAL: u16 = 2;
+    pub const FLAGS: u16 = 3;
+    pub const SREG_QNUM: u16 = 4;
+};
+
+/// `NFT_QUEUE_FLAG_BYPASS` — accept the packet when no listener is bound.
+pub const NFT_QUEUE_FLAG_BYPASS: u16 = 0x01;
+/// `NFT_QUEUE_FLAG_CPU_FANOUT` — pick the queue by CPU instead of a hash.
+pub const NFT_QUEUE_FLAG_CPU_FANOUT: u16 = 0x02;
+
+/// `enum nft_redir_attributes`.
+pub const NFTA_REDIR = struct {
+    pub const REG_PROTO_MIN: u16 = 1;
+    pub const REG_PROTO_MAX: u16 = 2;
+    pub const FLAGS: u16 = 3;
+};
+
+/// `enum nft_quota_attributes`. 3 is `NFTA_QUOTA_PAD` (alignment only,
+/// never sent), which is why `CONSUMED` is 4.
+pub const NFTA_QUOTA = struct {
+    pub const BYTES: u16 = 1;
+    pub const FLAGS: u16 = 2;
+    pub const CONSUMED: u16 = 4;
+};
+
+/// `enum nft_quota_flags`.
+pub const NFT_QUOTA_F_INV: u32 = 1 << 0;
+pub const NFT_QUOTA_F_DEPLETED: u32 = 1 << 1;
+
+/// `enum nft_objref_attributes`.
+pub const NFTA_OBJREF = struct {
+    pub const IMM_TYPE: u16 = 1;
+    pub const IMM_NAME: u16 = 2;
+    pub const SET_SREG: u16 = 3;
+    pub const SET_NAME: u16 = 4;
+    pub const SET_ID: u16 = 5;
+};
+
+/// `NFT_OBJECT_*` — the stateful object types this module models. The raw
+/// number is always accepted (`ObjectType` is non-exhaustive).
+pub const ObjectType = enum(u32) {
+    counter = 1,
+    quota = 2,
+    _,
+};
+
+/// `enum nft_reject_inet_code` — the family-independent reject codes an
+/// `inet`/`bridge`/`netdev` rule uses (`reject with icmpx …`).
+pub const IcmpxCode = enum(u8) {
+    no_route = 0,
+    port_unreach = 1,
+    host_unreach = 2,
+    admin_prohibited = 3,
+};
+
+/// What a `reject` answers with.
+pub const RejectWith = union(enum) {
+    /// ICMP (in an `ip` table) or ICMPv6 (in `ip6`) destination-unreachable
+    /// with this raw code — e.g. 1 = host unreachable, 3 = port unreachable
+    /// for ICMP (RFC 792).
+    icmp: u8,
+    /// The abstract code `inet`/`bridge`/`netdev` tables use; the kernel maps
+    /// it to the right ICMP or ICMPv6 code per packet. Bare `reject` in an
+    /// `inet` table is `.{ .icmpx = .port_unreach }` (captured).
+    icmpx: IcmpxCode,
+    /// A TCP RST. Match TCP first (`tcpDport`, `l4proto`) — `nft` only
+    /// accepts it after a TCP dependency, and the golden has one.
+    tcp_reset,
+};
+
 /// `NFT_LOOKUP_F_INV` — invert set membership (`!= @set`).
 pub const NFT_LOOKUP_F_INV: u32 = 1;
 /// `NFT_LIMIT_F_INV` — match when the limit is *exceeded*.
@@ -382,6 +468,17 @@ pub const Expr = union(enum) {
     nat: NatSpec,
     /// `masq` — masquerade, optionally with a port range.
     masq: struct { flags: u32 = 0, reg_proto_min: ?Reg = null, reg_proto_max: ?Reg = null },
+    /// `reject` — `type` is `NFT_REJECT_*`, `icmp_code` the ICMP/ICMPX code
+    /// (0 for a TCP RST). Build it with `Program.reject`.
+    reject: struct { type: u32, icmp_code: u8 },
+    /// `queue` — hand the packet to userspace on `num` … `num + total - 1`.
+    queue: struct { num: u16, total: u16 = 1, flags: u16 = 0 },
+    /// `redir` — `redirect [to :port]`, the port read from a register.
+    redir: struct { reg_proto_min: ?Reg = null, reg_proto_max: ?Reg = null, flags: u32 = 0 },
+    /// `quota` — anonymous byte quota. `over` matches once it is exceeded.
+    quota: struct { bytes: u64, consumed: u64 = 0, over: bool = false },
+    /// `objref` — use a named stateful object (`counter name "c"`).
+    objref: struct { obj_type: ObjectType, name: []const u8 },
     /// Escape hatch: a fully pre-encoded `NFTA_EXPR_DATA` payload under
     /// `name`. Lets a caller reach an expression this module does not model
     /// without forking it.
@@ -402,6 +499,11 @@ pub const Expr = union(enum) {
             .log => "log",
             .nat => "nat",
             .masq => "masq",
+            .reject => "reject",
+            .queue => "queue",
+            .redir => "redir",
+            .quota => "quota",
+            .objref => "objref",
             .raw => |r| r.name,
         };
     }
@@ -426,11 +528,18 @@ pub const BuildError = std.mem.Allocator.Error || RegError || error{
     InvalidPrefixLength,
     /// A `limit` rate that overflows once scaled by its unit.
     RateOutOfRange,
+    /// A `queue` range that is empty or runs past queue 65535.
+    InvalidQueueRange,
+    /// A set element carrying both `data` and `verdict` — a map element has
+    /// one data half, so one of them would be silently dropped.
+    ElemDataConflict,
+    /// An interval whose last key sorts below its first.
+    InvalidRange,
 };
 
 // ── encoding ────────────────────────────────────────────────────────────────
 
-fn appendData(
+pub fn appendData(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     attr_type: u16,
@@ -499,9 +608,11 @@ pub fn appendExpr(
             try appendData(gpa, list, NFTA_BITWISE.XOR, .{ .value = b.xor });
         },
         .lookup => |l| {
+            // `nft` puts DREG between SREG and SET when there is one (the
+            // `tcp dport vmap @vm` golden) and leaves it out otherwise.
             try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.SREG, @intFromEnum(l.sreg));
-            try nl.appendAttrString(gpa, list, NFTA_LOOKUP.SET, l.set);
             if (l.dreg) |d| try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.DREG, @intFromEnum(d));
+            try nl.appendAttrString(gpa, list, NFTA_LOOKUP.SET, l.set);
             if (l.set_id) |id| try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.SET_ID, id);
             if (l.invert) try nl.appendAttrBe32(gpa, list, NFTA_LOOKUP.FLAGS, NFT_LOOKUP_F_INV);
         },
@@ -558,6 +669,41 @@ pub fn appendExpr(
                 try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MIN, @intFromEnum(r));
             if (m.reg_proto_max) |r|
                 try nl.appendAttrBe32(gpa, list, NFTA_MASQ.REG_PROTO_MAX, @intFromEnum(r));
+        },
+        .reject => |r| {
+            try nl.appendAttrBe32(gpa, list, NFTA_REJECT.TYPE, r.type);
+            try nl.appendAttrU8(gpa, list, NFTA_REJECT.ICMP_CODE, r.icmp_code);
+        },
+        .queue => |q| {
+            // ⚠ Checked here, not only in `Program.queue`: an empty range
+            // or one wrapping past 65535 reaches the kernel otherwise, and a
+            // hand-built `Expr` never passes through the Program.
+            if (q.total == 0 or @as(u32, q.num) + q.total - 1 > std.math.maxInt(u16))
+                return error.InvalidQueueRange;
+            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.NUM, q.num);
+            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.TOTAL, q.total);
+            try nl.appendAttrBe16(gpa, list, NFTA_QUEUE.FLAGS, q.flags);
+        },
+        .redir => |r| {
+            if (r.reg_proto_min) |reg|
+                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MIN, @intFromEnum(reg));
+            if (r.reg_proto_max) |reg|
+                try nl.appendAttrBe32(gpa, list, NFTA_REDIR.REG_PROTO_MAX, @intFromEnum(reg));
+            if (r.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_REDIR.FLAGS, r.flags);
+        },
+        .quota => |q| {
+            // `nft` sends all three, CONSUMED before FLAGS, even when zero.
+            try nl.appendAttrBe64(gpa, list, NFTA_QUOTA.BYTES, q.bytes);
+            try nl.appendAttrBe64(gpa, list, NFTA_QUOTA.CONSUMED, q.consumed);
+            try nl.appendAttrBe32(gpa, list, NFTA_QUOTA.FLAGS, if (q.over) NFT_QUOTA_F_INV else 0);
+        },
+        .objref => |o| {
+            try nl.appendAttrBe32(gpa, list, NFTA_OBJREF.IMM_TYPE, @intFromEnum(o.obj_type));
+            // `nft` sends the object name WITHOUT a terminating NUL here
+            // (`counter name c1` → a 6-byte attribute, captured), unlike every
+            // other name attribute; the kernel's NLA_STRING policy accepts
+            // both. Raw bytes keep the golden byte-exact.
+            try nl.appendAttr(gpa, list, NFTA_OBJREF.IMM_NAME, o.name);
         },
         .raw => |r| try list.appendSlice(gpa, r.data),
     }
@@ -621,6 +767,22 @@ pub fn decodeVerdict(data: []const u8) nl.Error!?struct { code: i32, chain: ?[]c
     return null;
 }
 
+/// Decode a `counter` expression's data (`ExprView.data` of an expression
+/// named `"counter"`): the packet and byte totals the kernel reports on a
+/// rule dump. Null when the data carries neither attribute.
+pub fn decodeCounter(data: []const u8) nl.Error!?struct { packets: u64, bytes: u64 } {
+    var it: nl.AttrIterator = .{ .buf = data };
+    var packets: ?u64 = null;
+    var bytes: ?u64 = null;
+    while (try it.next()) |a| switch (a.type) {
+        NFTA_COUNTER.PACKETS => packets = try a.asBe64(),
+        NFTA_COUNTER.BYTES => bytes = try a.asBe64(),
+        else => {},
+    };
+    if (packets == null and bytes == null) return null;
+    return .{ .packets = packets orelse 0, .bytes = bytes orelse 0 };
+}
+
 // ── value helpers ───────────────────────────────────────────────────────────
 
 /// A 2-byte network-order port, ready for a `cmp` against a payload load.
@@ -652,6 +814,18 @@ pub fn ipv4MaskBytes(prefix_len: u6) error{InvalidPrefixLength}![4]u8 {
     else
         ~@as(u32, 0) << @intCast(32 - @as(u32, prefix_len));
     std.mem.writeInt(u32, &out, bits, .big);
+    return out;
+}
+
+/// The 16-byte network mask of an IPv6 prefix length, in wire order.
+/// `prefix_len` above 128 is refused, for the reason `ipv4MaskBytes` gives.
+pub fn ipv6MaskBytes(prefix_len: u8) error{InvalidPrefixLength}![16]u8 {
+    if (prefix_len > 128) return error.InvalidPrefixLength;
+    var out: [16]u8 = @splat(0);
+    const full: usize = prefix_len / 8;
+    @memset(out[0..full], 0xff);
+    const rem: u3 = @intCast(prefix_len % 8);
+    if (rem != 0) out[full] = @as(u8, 0xff) << @intCast(8 - @as(u4, rem));
     return out;
 }
 
@@ -920,6 +1094,45 @@ pub const Program = struct {
         return p.payloadMaskedCmp(.nh, offset, 4, &mask, .eq, &masked);
     }
 
+    /// `ip6 saddr <addr>` (offset 8, 16 bytes into the IPv6 header — RFC 8200
+    /// §3: 4 bytes version/class/label, 2 payload length, 1 next header,
+    /// 1 hop limit). Emits `meta nfproto ipv6` in an `inet` table.
+    pub fn ip6Saddr(p: *Program, addr: [16]u8) *Program {
+        _ = p.nfprotoDep(.ip6);
+        return p.payloadCmp(.nh, 8, 16, .eq, &addr);
+    }
+
+    /// `ip6 daddr <addr>` (offset 24 = 8 + the 16-byte source address).
+    pub fn ip6Daddr(p: *Program, addr: [16]u8) *Program {
+        _ = p.nfprotoDep(.ip6);
+        return p.payloadCmp(.nh, 24, 16, .eq, &addr);
+    }
+
+    /// `ip6 saddr <addr>/<len>` — byte-aligned prefixes shorten the load,
+    /// others load all 16 bytes and mask, exactly as `ip saddr` does (both
+    /// shapes captured: `/32` and `/33`).
+    pub fn ip6SaddrPrefix(p: *Program, addr: [16]u8, prefix_len: u8) *Program {
+        return p.ip6Prefix(8, addr, prefix_len);
+    }
+
+    /// `ip6 daddr <addr>/<len>`.
+    pub fn ip6DaddrPrefix(p: *Program, addr: [16]u8, prefix_len: u8) *Program {
+        return p.ip6Prefix(24, addr, prefix_len);
+    }
+
+    fn ip6Prefix(p: *Program, offset: u32, addr: [16]u8, prefix_len: u8) *Program {
+        const mask = ipv6MaskBytes(prefix_len) catch |e| return p.fail(e);
+        _ = p.nfprotoDep(.ip6);
+        if (prefix_len % 8 == 0) {
+            const n: u32 = prefix_len / 8;
+            if (n == 0) return p; // /0 matches everything
+            return p.payloadCmp(.nh, offset, n, .eq, addr[0..n]);
+        }
+        var masked: [16]u8 = undefined;
+        for (&masked, addr, mask) |*m, a, k| m.* = a & k;
+        return p.payloadMaskedCmp(.nh, offset, 16, &mask, .eq, &masked);
+    }
+
     /// `ip saddr @set`.
     pub fn ipSaddrSet(p: *Program, set: []const u8, set_id: ?u32, invert: bool) *Program {
         _ = p.nfprotoDep(.ip);
@@ -975,6 +1188,96 @@ pub const Program = struct {
 
     pub fn masquerade(p: *Program) *Program {
         return p.push(.{ .masq = .{} });
+    }
+
+    /// `reject [with …]`. See `RejectWith` for which variant a table family
+    /// takes; the kernel refuses an `icmpx` reject in an `ip` table and a
+    /// plain `icmp` one in `inet`.
+    pub fn reject(p: *Program, with: RejectWith) *Program {
+        return p.push(.{ .reject = switch (with) {
+            .icmp => |code| .{ .type = NFT_REJECT.ICMP_UNREACH, .icmp_code = code },
+            .icmpx => |code| .{ .type = NFT_REJECT.ICMPX_UNREACH, .icmp_code = @intFromEnum(code) },
+            .tcp_reset => .{ .type = NFT_REJECT.TCP_RST, .icmp_code = 0 },
+        } });
+    }
+
+    pub const QueueOptions = struct {
+        /// How many queues to spread over (`queue num 2-5` = num 2, total 4).
+        total: u16 = 1,
+        /// Accept instead of drop when no program listens on the queue.
+        bypass: bool = false,
+        /// Choose the queue by CPU rather than by flow hash.
+        fanout: bool = false,
+    };
+
+    /// `queue num <num>[-<num+total-1>] [bypass] [fanout]`.
+    pub fn queue(p: *Program, num: u16, opts: QueueOptions) *Program {
+        if (opts.total == 0 or @as(u32, num) + opts.total - 1 > std.math.maxInt(u16))
+            return p.fail(error.InvalidQueueRange);
+        var flags: u16 = 0;
+        if (opts.bypass) flags |= NFT_QUEUE_FLAG_BYPASS;
+        if (opts.fanout) flags |= NFT_QUEUE_FLAG_CPU_FANOUT;
+        return p.push(.{ .queue = .{ .num = num, .total = opts.total, .flags = flags } });
+    }
+
+    /// `redirect [to :<port>]` (nat chains). The port goes through a
+    /// register, like `nat`'s, so this resets the allocator first.
+    pub fn redirect(p: *Program, port: ?u16) *Program {
+        p.regs.reset();
+        const pt = port orelse return p.push(.{ .redir = .{} });
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const v = p.dupe(&portBytes(pt)) orelse return p;
+        _ = p.push(.{ .immediate = .{ .dreg = reg, .data = .{ .value = v } } });
+        return p.push(.{ .redir = .{
+            .reg_proto_min = reg,
+            .flags = types.NF_NAT_RANGE_PROTO_SPECIFIED,
+        } });
+    }
+
+    /// `quota [over] <bytes> bytes` — an anonymous quota on this rule.
+    pub fn quota(p: *Program, bytes: u64, over: bool) *Program {
+        return p.push(.{ .quota = .{ .bytes = bytes, .over = over } });
+    }
+
+    /// `<type> name "<name>"` — reference a named stateful object.
+    pub fn objref(p: *Program, obj_type: ObjectType, name: []const u8) *Program {
+        const n = p.dupe(name) orelse return p;
+        return p.push(.{ .objref = .{ .obj_type = obj_type, .name = n } });
+    }
+
+    /// `counter name "<name>"`.
+    pub fn counterRef(p: *Program, name: []const u8) *Program {
+        return p.objref(.counter, name);
+    }
+
+    /// `quota name "<name>"`.
+    pub fn quotaRef(p: *Program, name: []const u8) *Program {
+        return p.objref(.quota, name);
+    }
+
+    /// `payload(base, offset, len) vmap @map` — look the field up in a
+    /// verdict map and apply the verdict found (no verdict when absent).
+    /// `set_id` as in `payloadLookup`.
+    pub fn payloadVmap(
+        p: *Program,
+        base: PayloadBase,
+        offset: u32,
+        len: u32,
+        map: []const u8,
+        set_id: ?u32,
+    ) *Program {
+        if (len > max_value_len) return p.fail(error.ValueWidthMismatch);
+        p.regs.reset();
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const m = p.dupe(map) orelse return p;
+        _ = p.push(.{ .payload_load = .{ .base = base, .offset = offset, .len = len, .dreg = reg } });
+        return p.push(.{ .lookup = .{ .set = m, .sreg = reg, .dreg = .verdict, .set_id = set_id } });
+    }
+
+    /// `tcp dport vmap @map`, with the `meta l4proto tcp` dependency.
+    pub fn tcpDportVmap(p: *Program, map: []const u8, set_id: ?u32) *Program {
+        _ = p.l4proto(IPPROTO.TCP);
+        return p.payloadVmap(.th, 2, 2, map, set_id);
     }
 
     /// `snat`/`dnat to <addr>[:<port>]`.
@@ -1101,14 +1404,26 @@ test "payloadCmp/payloadMaskedCmp reject a value wider than one data register" {
     try testing.expectError(error.ValueWidthMismatch, r.finish());
 }
 
-test "an unmappable meta key is rejected at encode time" {
+test "every meta key maps and encodes; the bridge-name keys alias ibriport/obriport" {
+    // Until 2026-10-04 `ibridgename`/`obridgename` had no grounded number and
+    // were refused here with `error.UnsupportedMetaKey`. The `nft` capture
+    // (`meta ibrname` → 17, `meta obrname` → 18) grounded them, so no key is
+    // refused any more — and the only two keys allowed to share a number are
+    // those aliases.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(testing.allocator);
-    try testing.expectError(error.UnsupportedMetaKey, appendExpr(
-        testing.allocator,
-        &list,
-        .{ .meta_load = .{ .key = .ibridgename, .dreg = .r1 } },
-    ));
+    inline for (@typeInfo(MetaKey).@"enum".fields) |f| {
+        const k: MetaKey = @enumFromInt(f.value);
+        try testing.expect(k.key() != null);
+        try appendExpr(testing.allocator, &list, .{ .meta_load = .{ .key = k, .dreg = .r1 } });
+        inline for (@typeInfo(MetaKey).@"enum".fields) |g| {
+            const j: MetaKey = @enumFromInt(g.value);
+            if (f.value < g.value and k.key().? == j.key().?) {
+                const alias = (k == .ibriport and j == .ibridgename) or (k == .obriport and j == .obridgename);
+                try testing.expect(alias);
+            }
+        }
+    }
 }
 
 test "bitwise rejects a mask/xor that disagrees with len" {

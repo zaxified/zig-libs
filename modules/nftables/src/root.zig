@@ -1154,6 +1154,10 @@ test "enum tokens: families, hooks, chain types, policies, special flags" {
     try expectJson("\"drop\"", Policy.drop);
     try expectJson("\"iifname\"", MetaKey.iifname);
     try expectJson("\"l4proto\"", MetaKey.l4proto);
+    // nft knows the bridge-name keys as `ibrname`/`obrname`; `nft -c -j`
+    // rejects "ibridgename" with "unexpected ibridgename" (v1.1.6).
+    try expectJson("\"ibrname\"", MetaKey.ibridgename);
+    try expectJson("\"obrname\"", MetaKey.obridgename);
     // Tokens that are not Zig identifiers:
     try expectJson("\"fully-random\"", NatFlag.fully_random);
     try expectJson("\"tcp reset\"", RejectType.tcp_reset);

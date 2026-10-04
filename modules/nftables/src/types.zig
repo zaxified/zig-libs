@@ -38,6 +38,11 @@ pub const NF_INET = struct {
     pub const FORWARD: u32 = 2;
     pub const LOCAL_OUT: u32 = 3;
     pub const POST_ROUTING: u32 = 4;
+    /// `NF_INET_INGRESS = NF_INET_NUMHOOKS` (linux/netfilter.h) — the
+    /// per-device ingress hook of the `inet` family (Linux 5.10+). It sits
+    /// past the five classic hooks precisely because it is not one of them:
+    /// only `inet` base chains bound to a device (`NFTA_HOOK_DEV`) may use it.
+    pub const INGRESS: u32 = 5;
 };
 
 /// `NF_NETDEV_*` hook numbers (linux/netfilter.h).
@@ -170,10 +175,14 @@ pub const Hook = enum {
                 .forward => NF_INET.FORWARD,
                 .output => NF_INET.LOCAL_OUT,
                 .postrouting => NF_INET.POST_ROUTING,
-                // `ingress` exists in the inet/ip/ip6 families on modern
-                // kernels too, but as NF_INET_INGRESS (=5); the bridge family
-                // has no ingress hook at all. Deferred — see SPEC.md.
-                .ingress, .egress => error.UnsupportedHook,
+                // NF_INET_INGRESS (=5) is an `inet`-family hook only: `nft`
+                // puts 5 on the wire for `type filter hook ingress device lo`
+                // in an inet table (goldens.zig), and the kernel registers no
+                // ingress hook for the ip/ip6/bridge chain types, so mapping
+                // it there would build a chain the kernel refuses. egress has
+                // no inet-family number at all (netdev only).
+                .ingress => if (family == .inet) NF_INET.INGRESS else error.UnsupportedHook,
+                .egress => error.UnsupportedHook,
             },
         };
     }
@@ -280,9 +289,26 @@ pub const MetaKey = enum {
     l4proto,
     secpath,
 
-    /// `NFTA_META_KEY` value (`enum nft_meta_keys`), or null for the two
-    /// bridge-name keys whose kernel key this module could not ground in
-    /// either the UAPI header or a capture (see SPEC.md "Deferred").
+    /// The `nft` JSON token. Equal to the tag name except for the two
+    /// bridge-name keys: `nft` knows them as `ibrname`/`obrname` and rejects
+    /// `ibridgename`/`obridgename` ("syntax error, unexpected ibridgename,
+    /// known keys are …" from `nft -c -j`, measured 2026-10-04 on v1.1.6) —
+    /// the tag names are kept so existing callers still compile.
+    pub fn token(self: MetaKey) []const u8 {
+        return switch (self) {
+            .ibridgename => "ibrname",
+            .obridgename => "obrname",
+            else => @tagName(self),
+        };
+    }
+
+    pub fn jsonStringify(self: MetaKey, jw: anytype) JsonError!void {
+        try jw.write(self.token());
+    }
+
+    /// `NFTA_META_KEY` value (`enum nft_meta_keys`). Never null since
+    /// 2026-10-04 (the bridge-name keys were grounded); the optional is kept
+    /// so existing callers' `orelse` still compiles.
     pub fn key(self: MetaKey) ?u32 {
         return switch (self) {
             .length => 0, // NFT_META_LEN
@@ -310,7 +336,13 @@ pub const MetaKey = enum {
             .cgroup => 23,
             .random => 24, // NFT_META_PRANDOM
             .secpath => 25,
-            .ibridgename, .obridgename => null,
+            // `nft add rule bridge f in meta ibrname "br0"` puts key 17 on the
+            // wire and `meta obrname` 18 (captured 2026-10-04, see the test
+            // below) — the same keys as `ibriport`/`obriport`, which `nft`
+            // decompiles back as `ibrname`/`obrname`: they are aliases of
+            // NFT_META_BRI_IIFNAME/OIFNAME (17/18 in `enum nft_meta_keys`).
+            .ibridgename => 17,
+            .obridgename => 18,
         };
     }
 
@@ -605,6 +637,12 @@ test "hook numbering is per-family" {
     try testing.expectError(error.UnsupportedHook, Hook.prerouting.num(.arp));
     try testing.expectError(error.UnsupportedHook, Hook.input.num(.netdev));
     try testing.expectError(error.UnsupportedHook, Hook.ingress.num(.bridge));
+    // NF_INET_INGRESS = NF_INET_NUMHOOKS = 5 (linux/netfilter.h), inet only;
+    // the same value the `nft` capture of an inet ingress chain carries.
+    try testing.expectEqual(@as(u32, 5), try Hook.ingress.num(.inet));
+    try testing.expectError(error.UnsupportedHook, Hook.ingress.num(.ip));
+    try testing.expectError(error.UnsupportedHook, Hook.ingress.num(.ip6));
+    try testing.expectError(error.UnsupportedHook, Hook.egress.num(.inet));
 }
 
 test "policy, cmp op and limit unit mappings" {
@@ -625,7 +663,16 @@ test "meta key numbering matches the captured nft traffic" {
     try testing.expectEqual(@as(?u32, 15), MetaKey.nfproto.key());
     try testing.expectEqual(@as(?u32, 6), MetaKey.iifname.key());
     try testing.expectEqual(@as(?u32, 7), MetaKey.oifname.key());
-    try testing.expectEqual(@as(?u32, null), MetaKey.ibridgename.key());
+    // `meta ibrname "br0"` → 17 and `meta obrname "br0"` → 18 in a bridge
+    // table (strace of nft v1.1.6, 2026-10-04); `ibriport` sends 17 too and
+    // decompiles as `ibrname`. 17/18 are NFT_META_BRI_IIFNAME/OIFNAME's
+    // positions in `enum nft_meta_keys`.
+    try testing.expectEqual(@as(?u32, 17), MetaKey.ibridgename.key());
+    try testing.expectEqual(@as(?u32, 18), MetaKey.obridgename.key());
+    try testing.expectEqual(MetaKey.ibriport.key(), MetaKey.ibridgename.key());
+    try testing.expectEqualStrings("ibrname", MetaKey.ibridgename.token());
+    try testing.expectEqualStrings("obrname", MetaKey.obridgename.token());
+    try testing.expectEqualStrings("iifname", MetaKey.iifname.token());
     try testing.expectEqual(@as(u32, 16), MetaKey.iifname.width());
     try testing.expectEqual(@as(u32, 1), MetaKey.l4proto.width());
     try testing.expectEqual(@as(u32, 4), MetaKey.mark.width());

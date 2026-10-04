@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED, native backend: verdict and
+  data **maps** (`SetSpec.data`, `SetElem.verdict`, `Program.payloadVmap`/`tcpDportVmap`,
+  decoded back as `SetInfo.data_type/data_len` and `SetElemInfo.verdict`); **named objects**
+  (`Batch.addObject`/`deleteObject` for counters and quotas, `Socket.listObjects` with their
+  values, `Program.counterRef`/`quotaRef`/`objref`); **interval helpers** (`wire.interval`,
+  `wire.prefixInterval` → the start / last+1 `INTERVAL_END` pair, open-ended at the top of the
+  key space); expressions **`reject`** (`icmp`/`icmpx`/`tcp_reset`), **`queue`**, **`redir`**
+  (`Program.redirect`), anonymous **`quota`**; **IPv6 matches** (`ip6Saddr`/`ip6Daddr` and their
+  `…Prefix` forms, `expr.ipv6MaskBytes`); `expr.decodeCounter` for per-rule counters in a dump;
+  `SetElem.userdata`. 26 new byte-exact goldens captured from `nft` v1.1.6 plus a live test that
+  pushes packets through them. FIXED: `Hook.ingress` in an `inet` table is NF_INET_INGRESS (5)
+  instead of `error.UnsupportedHook` (only `inet`; ip/ip6/bridge still refuse it).
+  `MetaKey.ibridgename`/`obridgename` now encode (17/18, grounded by capture) instead of
+  `error.UnsupportedMetaKey`, and the JSON builder writes them as `ibrname`/`obrname` — it used to
+  write `ibridgename`, which `nft -j` rejects. Encoding change: a `lookup` with a `dreg` now
+  places DREG before SET, as `nft` does (no change without one). ⚠ Source-compatible except for
+  exhaustive `switch`es over `expr.Expr` (new members `reject`/`queue`/`redir`/`quota`/`objref`)
+  or over `BuildError` (new `InvalidQueueRange`, `ElemDataConflict`, `InvalidRange`).
+  Mutation: 53 mutants, 48 killed at once, 5 survivors killed by new tests.
+
 - **2026-09-07** — Both fuzz targets walked an empty attribute list. Each opened with
   `smith.bytes(&raw)` and then drew its length with `valueRangeAtMost`, which reads eight input
   octets as a little-endian u64 and returns the range minimum when fewer remain — so the length

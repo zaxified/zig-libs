@@ -220,6 +220,23 @@ pub const NFTA_SET_ELEM_LIST = struct {
     pub const SET_ID: u16 = 4;
 };
 
+/// `enum nft_object_attributes`.
+pub const NFTA_OBJ = struct {
+    pub const TABLE: u16 = 1;
+    pub const NAME: u16 = 2;
+    pub const TYPE: u16 = 3;
+    pub const DATA: u16 = 4;
+    pub const USE: u16 = 5;
+    pub const HANDLE: u16 = 6;
+    pub const USERDATA: u16 = 8;
+};
+
+/// `NFT_SET_MAP` — the set carries a data half per element.
+pub const NFT_SET_MAP: u32 = 0x8;
+
+/// `NFT_DATA_VERDICT` — `NFTA_SET_DATA_TYPE` of a verdict map.
+pub const NFT_DATA_VERDICT: u32 = 0xffffff00;
+
 /// `enum nft_set_elem_flags`.
 pub const NFT_SET_ELEM_INTERVAL_END: u32 = 0x1;
 pub const NFT_SET_ELEM_CATCHALL: u32 = 0x2;
@@ -328,6 +345,18 @@ pub const SetSpec = struct {
     /// Element timeout in **milliseconds** (the kernel's unit here).
     timeout_ms: ?u64 = null,
     userdata: ?[]const u8 = null,
+    /// Non-null makes this a **map** (`NFT_SET_MAP` is set for you): every
+    /// element then carries a data half of this type.
+    data: ?SetData = null,
+};
+
+/// The data half of a map.
+pub const SetData = union(enum) {
+    /// A verdict map (`type … : verdict`) — elements carry `SetElem.verdict`.
+    verdict,
+    /// A data map (`type … : ipv4_addr`, …) — elements carry `SetElem.data`
+    /// of `t.keyLen()` bytes.
+    value: SetDataType,
 };
 
 /// One set element. `key` is the raw key bytes (`key_type.keyLen()` of them).
@@ -341,8 +370,98 @@ pub const SetElem = struct {
     flags: u32 = 0,
     /// Element timeout in milliseconds.
     timeout_ms: ?u64 = null,
-    /// Map data half.
+    /// Map data half (a data map).
     data: ?[]const u8 = null,
+    /// Map data half (a verdict map). Setting both this and `data` is
+    /// `error.ElemDataConflict`.
+    verdict: ?expr.Verdict = null,
+    /// Opaque per-element blob (`NFTA_SET_ELEM_USERDATA`); `nft` keeps its
+    /// own flags there (e.g. an interval open to the top of the key space).
+    userdata: ?[]const u8 = null,
+};
+
+/// One interval of an interval set, as the two classic wire elements: the
+/// first key, and the key one past the last flagged `INTERVAL_END`. `open`
+/// means the interval runs to the top of the key space (last key all-ones),
+/// where "one past" does not exist and `nft` sends the start element alone.
+pub fn Interval(comptime n: usize) type {
+    return struct {
+        start: [n]u8,
+        end: [n]u8,
+        open: bool,
+
+        const Self = @This();
+
+        /// The wire elements (one when `open`, else two). They BORROW
+        /// `self.start`/`self.end`: keep the `Interval` in a variable that
+        /// outlives the batch call — `(try interval(…)).elems(&out)` on a
+        /// temporary leaves the keys dangling.
+        pub fn elems(self: *const Self, out: *[2]SetElem) []const SetElem {
+            out[0] = .{ .key = &self.start };
+            if (self.open) return out[0..1];
+            out[1] = .{ .key = &self.end, .flags = NFT_SET_ELEM_INTERVAL_END };
+            return out[0..2];
+        }
+    };
+}
+
+/// `first-last` (both inclusive, big-endian keys, as the payload carries
+/// them) as an interval-set range. `error.InvalidRange` if `last < first`.
+pub fn interval(comptime n: usize, first: [n]u8, last: [n]u8) BuildError!Interval(n) {
+    if (std.mem.order(u8, &last, &first) == .lt) return error.InvalidRange;
+    var end = last;
+    // end = last + 1, big-endian; a carry out of the top byte means `last`
+    // was all-ones and the interval is open.
+    var i: usize = n;
+    var carry = true;
+    while (carry and i > 0) {
+        i -= 1;
+        end[i] +%= 1;
+        carry = end[i] == 0;
+    }
+    return .{ .start = first, .end = end, .open = carry };
+}
+
+/// `addr/prefix_len` as an interval-set range: the network address to its
+/// broadcast address. Host bits in `addr` are cleared, as `nft` does.
+pub fn prefixInterval(comptime n: usize, addr: [n]u8, prefix_len: u8) BuildError!Interval(n) {
+    if (prefix_len > n * 8) return error.InvalidPrefixLength;
+    var first = addr;
+    var last = addr;
+    for (0..n) |i| {
+        const bits_before: usize = i * 8;
+        const keep: u8 = if (prefix_len >= bits_before + 8)
+            0xff
+        else if (prefix_len <= bits_before)
+            0
+        else
+            @as(u8, 0xff) << @intCast(8 - (prefix_len - bits_before));
+        first[i] = addr[i] & keep;
+        last[i] = first[i] | ~keep;
+    }
+    return interval(n, first, last);
+}
+
+/// A named stateful object (`add counter`/`add quota`).
+pub const ObjectSpec = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    obj: ObjectData,
+    userdata: ?[]const u8 = null,
+};
+
+/// The state a named object starts with.
+pub const ObjectData = union(enum) {
+    counter: struct { packets: u64 = 0, bytes: u64 = 0 },
+    quota: struct { bytes: u64, consumed: u64 = 0, over: bool = false },
+
+    pub fn objType(d: ObjectData) expr.ObjectType {
+        return switch (d) {
+            .counter => .counter,
+            .quota => .quota,
+        };
+    }
 };
 
 // ── message building ────────────────────────────────────────────────────────
@@ -410,11 +529,23 @@ fn appendSetBody(
     try nl.appendAttrString(gpa, list, NFTA_SET.TABLE, spec.table);
     try nl.appendAttrString(gpa, list, NFTA_SET.NAME, spec.name);
     if (!full) return; // a delete keys on table+name only
-    var flag_bits: u32 = 0;
+    var flag_bits: u32 = if (spec.data != null) NFT_SET_MAP else 0;
     for (spec.flags) |f| flag_bits |= f.bit();
     try nl.appendAttrBe32(gpa, list, NFTA_SET.FLAGS, flag_bits);
     try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_TYPE, spec.key_type.id());
     try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_LEN, spec.key_type.keyLen());
+    if (spec.data) |d| switch (d) {
+        // A verdict map's data length is 0: the kernel sizes a verdict itself
+        // (captured: `type inet_service : verdict` → 0xffffff00, 0).
+        .verdict => {
+            try nl.appendAttrBe32(gpa, list, NFTA_SET.DATA_TYPE, NFT_DATA_VERDICT);
+            try nl.appendAttrBe32(gpa, list, NFTA_SET.DATA_LEN, 0);
+        },
+        .value => |t| {
+            try nl.appendAttrBe32(gpa, list, NFTA_SET.DATA_TYPE, t.id());
+            try nl.appendAttrBe32(gpa, list, NFTA_SET.DATA_LEN, t.keyLen());
+        },
+    };
     try nl.appendAttrBe32(gpa, list, NFTA_SET.ID, spec.id);
     if (spec.size) |s| {
         const off = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET.DESC);
@@ -454,12 +585,15 @@ fn appendSetElems(
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, ke);
             try nl.nestEnd(list, koff);
         }
+        if (el.data != null and el.verdict != null) return error.ElemDataConflict;
         if (el.data) |d| {
             const doff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.DATA);
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, d);
             try nl.nestEnd(list, doff);
         }
+        if (el.verdict) |v| try expr.appendData(gpa, list, NFTA_SET_ELEM.DATA, .{ .verdict = v });
         if (el.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET_ELEM.TIMEOUT, t);
+        if (el.userdata) |u| try nl.appendAttr(gpa, list, NFTA_SET_ELEM.USERDATA, u);
         try nl.nestEnd(list, eoff);
     }
     try nl.nestEnd(list, off);
@@ -513,6 +647,9 @@ pub fn commandNameOf(msg_type: u16) []const u8 {
         NFT_MSG.NEWSETELEM => "NEWSETELEM",
         NFT_MSG.GETSETELEM => "GETSETELEM",
         NFT_MSG.DELSETELEM => "DELSETELEM",
+        NFT_MSG.NEWOBJ => "NEWOBJ",
+        NFT_MSG.GETOBJ => "GETOBJ",
+        NFT_MSG.DELOBJ => "DELOBJ",
         else => "?",
     };
 }
@@ -747,6 +884,55 @@ pub const Batch = struct {
         try appendSetElems(b.gpa, &b.buf, table, set, null, elems);
         b.endCommand(h);
     }
+
+    /// `add counter|quota <family> <table> <name> …` — a named stateful
+    /// object that rules reference with `Program.counterRef`/`quotaRef`.
+    pub fn addObject(b: *Batch, spec: ObjectSpec) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.NEWOBJ, nl.NLM_F_CREATE, spec.family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, spec.table);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, spec.name);
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @intFromEnum(spec.obj.objType()));
+        const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
+        switch (spec.obj) {
+            // Unlike the `counter` expression, the object always carries
+            // both values, zero or not (captured `add counter`).
+            .counter => |c| {
+                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_COUNTER.BYTES, c.bytes);
+                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_COUNTER.PACKETS, c.packets);
+            },
+            .quota => |q| {
+                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_QUOTA.BYTES, q.bytes);
+                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_QUOTA.CONSUMED, q.consumed);
+                try nl.appendAttrBe32(
+                    b.gpa,
+                    &b.buf,
+                    expr.NFTA_QUOTA.FLAGS,
+                    if (q.over) expr.NFT_QUOTA_F_INV else 0,
+                );
+            },
+        }
+        try nl.nestEnd(&b.buf, off);
+        if (spec.userdata) |u| try nl.appendAttr(b.gpa, &b.buf, NFTA_OBJ.USERDATA, u);
+        b.endCommand(h);
+    }
+
+    /// `delete counter|quota …`. The kernel keys on table + name + type;
+    /// `nft` also sends an empty `NFTA_OBJ_DATA` nest, and so does this.
+    pub fn deleteObject(
+        b: *Batch,
+        family: Family,
+        table: []const u8,
+        name: []const u8,
+        obj_type: expr.ObjectType,
+    ) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.DELOBJ, 0, family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, table);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, name);
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @intFromEnum(obj_type));
+        const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
+        try nl.nestEnd(&b.buf, off);
+        b.endCommand(h);
+    }
 };
 
 // ── dump requests (outside any batch) ───────────────────────────────────────
@@ -885,6 +1071,25 @@ pub const SetInfo = struct {
     handle: u64 = 0,
     size: ?u32 = null,
     timeout_ms: ?u64 = null,
+    /// A map's data half: `NFT_DATA_VERDICT` for a verdict map, else nft's
+    /// datatype id. Null for a plain set.
+    data_type: ?u32 = null,
+    data_len: ?u32 = null,
+};
+
+/// A named stateful object as the kernel reports it (`NFT_MSG_NEWOBJ` in a
+/// `GETOBJ` dump). `counter`/`quota` carry the decoded state for those two
+/// types; any other type leaves both null and its raw `data` in place.
+pub const ObjectInfo = struct {
+    family: u8,
+    table: []const u8 = "",
+    name: []const u8 = "",
+    obj_type: u32 = 0,
+    handle: u64 = 0,
+    use: u32 = 0,
+    data: []const u8 = &.{},
+    counter: ?struct { packets: u64 = 0, bytes: u64 = 0 } = null,
+    quota: ?struct { bytes: u64 = 0, consumed: u64 = 0, flags: u32 = 0 } = null,
 };
 
 /// One decoded set element. `key`/`key_end`/`data` borrow from the reply.
@@ -894,6 +1099,8 @@ pub const SetElemInfo = struct {
     data: ?[]const u8 = null,
     flags: u32 = 0,
     timeout_ms: ?u64 = null,
+    /// The data half of a verdict-map element.
+    verdict: ?struct { code: i32, chain: ?[]const u8 = null } = null,
 };
 
 fn dataValue(a: nl.Attr) DecodeError![]const u8 {
@@ -969,6 +1176,8 @@ pub fn decodeSet(payload: []const u8) DecodeError!SetInfo {
         NFTA_SET.KEY_LEN => out.key_len = try a.asBe32(),
         NFTA_SET.HANDLE => out.handle = try a.asBe64(),
         NFTA_SET.TIMEOUT => out.timeout_ms = try a.asBe64(),
+        NFTA_SET.DATA_TYPE => out.data_type = try a.asBe32(),
+        NFTA_SET.DATA_LEN => out.data_len = try a.asBe32(),
         NFTA_SET.DESC => {
             var d = a.nested();
             while (try d.next()) |da| switch (da.type) {
@@ -1008,7 +1217,24 @@ pub const SetElemIterator = struct {
                     seen_key = true;
                 },
                 NFTA_SET_ELEM.KEY_END => out.key_end = try dataValue(a),
-                NFTA_SET_ELEM.DATA => out.data = try dataValue(a),
+                NFTA_SET_ELEM.DATA => {
+                    var d = a.nested();
+                    while (try d.next()) |da| switch (da.type) {
+                        expr.NFTA_DATA.VALUE => out.data = da.data,
+                        expr.NFTA_DATA.VERDICT => {
+                            var v = da.nested();
+                            var code: ?i32 = null;
+                            var chain: ?[]const u8 = null;
+                            while (try v.next()) |va| switch (va.type) {
+                                expr.NFTA_VERDICT.CODE => code = @bitCast(try va.asBe32()),
+                                expr.NFTA_VERDICT.CHAIN => chain = va.asString(),
+                                else => {},
+                            };
+                            if (code) |c| out.verdict = .{ .code = c, .chain = chain };
+                        },
+                        else => {},
+                    };
+                },
                 NFTA_SET_ELEM.FLAGS => out.flags = try a.asBe32(),
                 NFTA_SET_ELEM.TIMEOUT => out.timeout_ms = try a.asBe64(),
                 else => {},
@@ -1019,6 +1245,44 @@ pub const SetElemIterator = struct {
         return null;
     }
 };
+
+pub fn decodeObject(payload: []const u8) DecodeError!ObjectInfo {
+    const hdr = try parseNfgenmsg(payload);
+    var out: ObjectInfo = .{ .family = hdr.family };
+    var it = hdr.attrIterator();
+    while (try it.next()) |a| switch (a.type) {
+        NFTA_OBJ.TABLE => out.table = a.asString(),
+        NFTA_OBJ.NAME => out.name = a.asString(),
+        NFTA_OBJ.TYPE => out.obj_type = try a.asBe32(),
+        NFTA_OBJ.HANDLE => out.handle = try a.asBe64(),
+        NFTA_OBJ.USE => out.use = try a.asBe32(),
+        NFTA_OBJ.DATA => out.data = a.data,
+        else => {},
+    };
+    // TYPE may arrive after DATA, so the state is decoded once both are in.
+    var d: nl.AttrIterator = .{ .buf = out.data };
+    switch (out.obj_type) {
+        @intFromEnum(expr.ObjectType.counter) => {
+            out.counter = .{};
+            while (try d.next()) |da| switch (da.type) {
+                expr.NFTA_COUNTER.PACKETS => out.counter.?.packets = try da.asBe64(),
+                expr.NFTA_COUNTER.BYTES => out.counter.?.bytes = try da.asBe64(),
+                else => {},
+            };
+        },
+        @intFromEnum(expr.ObjectType.quota) => {
+            out.quota = .{};
+            while (try d.next()) |da| switch (da.type) {
+                expr.NFTA_QUOTA.BYTES => out.quota.?.bytes = try da.asBe64(),
+                expr.NFTA_QUOTA.CONSUMED => out.quota.?.consumed = try da.asBe64(),
+                expr.NFTA_QUOTA.FLAGS => out.quota.?.flags = try da.asBe32(),
+                else => {},
+            };
+        },
+        else => {},
+    }
+    return out;
+}
 
 pub fn decodeSetElemReply(payload: []const u8) DecodeError!SetElemReply {
     const hdr = try parseNfgenmsg(payload);
@@ -1571,4 +1835,138 @@ test "a set-element list too big for one message is refused, not silently trunca
     // A list that does fit still works, so the bound did not become a refusal
     // of everything.
     try b.addSetElems(.inet, "filter", "blocked", null, elems[0..1000]);
+}
+
+// ── 2026-10-04: objects, maps, counter decode ───────────────────────────────
+
+/// The first command message of a finished batch.
+fn firstCommand(bytes: []const u8) !nl.Message {
+    var it: nl.MessageIterator = .{ .buf = bytes };
+    _ = try it.next(); // BATCH_BEGIN
+    return (try it.next()).?;
+}
+
+test "decodeObject reads back what addObject encodes (counter and quota)" {
+    // The encoder is pinned byte-for-byte by the `add counter`/`add quota`
+    // goldens; a GETOBJ dump reply has the same attribute layout plus
+    // USE/HANDLE (`enum nft_object_attributes`), so decoding the request
+    // checks the decoder against the captured shape.
+    const gpa = testing.allocator;
+    var b = try Batch.init(gpa, 0, .{});
+    defer b.deinit();
+    try b.addObject(.{ .family = .inet, .table = "t", .name = "c", .obj = .{ .counter = .{ .packets = 7, .bytes = 900 } } });
+    try b.addObject(.{ .family = .ip, .table = "t", .name = "q", .obj = .{ .quota = .{ .bytes = 5000, .consumed = 12, .over = true } } });
+    var it: nl.MessageIterator = .{ .buf = try b.finish() };
+    _ = try it.next();
+    const mc = (try it.next()).?;
+    try testing.expectEqual(nftMsg(NFT_MSG.NEWOBJ), mc.type);
+    try testing.expect(mc.flags & nl.NLM_F_CREATE != 0);
+    const c = try decodeObject(mc.payload);
+    try testing.expectEqual(types.NFPROTO.INET, c.family);
+    try testing.expectEqualStrings("c", c.name);
+    try testing.expectEqual(@as(u32, 1), c.obj_type); // NFT_OBJECT_COUNTER
+    try testing.expectEqual(@as(u64, 7), c.counter.?.packets);
+    try testing.expectEqual(@as(u64, 900), c.counter.?.bytes);
+    try testing.expect(c.quota == null);
+    const q = try decodeObject((try it.next()).?.payload);
+    try testing.expectEqual(@as(u32, 2), q.obj_type); // NFT_OBJECT_QUOTA
+    try testing.expectEqual(@as(u64, 5000), q.quota.?.bytes);
+    try testing.expectEqual(@as(u64, 12), q.quota.?.consumed);
+    try testing.expectEqual(expr.NFT_QUOTA_F_INV, q.quota.?.flags);
+    try testing.expect(q.counter == null);
+    try testing.expectEqualStrings("NEWOBJ", commandNameOf(nftMsg(NFT_MSG.NEWOBJ)));
+    try testing.expectEqualStrings("DELOBJ", commandNameOf(nftMsg(NFT_MSG.DELOBJ)));
+    try testing.expectEqualStrings("GETOBJ", commandNameOf(nftMsg(NFT_MSG.GETOBJ)));
+}
+
+test "decodeObject: an unknown object type keeps its raw data; hostile lengths are refused" {
+    // TYPE after DATA, type 9 (not modelled): both decoded-state fields stay
+    // null and the raw nest is handed back.
+    const reply = [_]u8{ 1, 0, 0, 0 } ++ // nfgenmsg: inet
+        [_]u8{ 0x0c, 0x00, 0x04, 0x80, 0x08, 0x00, 0x01, 0x00, 0xaa, 0xbb, 0xcc, 0xdd } ++ // DATA{ [1]=… }
+        [_]u8{ 0x08, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x09 }; // TYPE = 9 (BE)
+    const o = try decodeObject(&reply);
+    try testing.expectEqual(@as(u32, 9), o.obj_type);
+    try testing.expect(o.counter == null and o.quota == null);
+    try testing.expectEqual(@as(usize, 8), o.data.len);
+    // A counter whose PACKETS attribute is 4 bytes instead of 8.
+    const bad = [_]u8{ 1, 0, 0, 0 } ++
+        [_]u8{ 0x08, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 } ++ // TYPE = counter
+        [_]u8{ 0x0c, 0x00, 0x04, 0x80, 0x08, 0x00, 0x02, 0x00, 0, 0, 0, 1 };
+    try testing.expectError(error.BadLength, decodeObject(&bad));
+    // A DATA nest that claims more bytes than the message has.
+    const trunc = [_]u8{ 1, 0, 0, 0 } ++ [_]u8{ 0x40, 0x00, 0x04, 0x80, 0, 0, 0, 0 };
+    try testing.expectError(error.Truncated, decodeObject(&trunc));
+}
+
+test "a verdict-map set and its elements decode back to verdicts" {
+    const gpa = testing.allocator;
+    var b = try Batch.init(gpa, 0, .{});
+    defer b.deinit();
+    try b.addSet(.{ .family = .inet, .table = "t", .name = "vm", .key_type = .inet_service, .data = .verdict, .flags = &.{.interval} });
+    const s = try decodeSet((try firstCommand(b.bytes())).payload);
+    // MAP is ORed into the caller's flags, not instead of them.
+    try testing.expectEqual(NFT_SET_MAP | types.SetFlag.interval.bit(), s.flags);
+    try testing.expectEqual(@as(?u32, NFT_DATA_VERDICT), s.data_type);
+    try testing.expectEqual(@as(?u32, 0), s.data_len);
+
+    var d = try Batch.init(gpa, 0, .{});
+    defer d.deinit();
+    try d.addSet(.{ .family = .ip, .table = "t", .name = "dm", .key_type = .inet_service, .data = .{ .value = .ipv4_addr } });
+    const dm = try decodeSet((try firstCommand(d.bytes())).payload);
+    try testing.expectEqual(NFT_SET_MAP, dm.flags);
+    // A data map: nft's ipv4_addr datatype id (7) and its 4-byte length.
+    try testing.expectEqual(@as(?u32, 7), dm.data_type);
+    try testing.expectEqual(@as(?u32, 4), dm.data_len);
+
+    // A plain set has no data half at all.
+    var p = try Batch.init(gpa, 0, .{});
+    defer p.deinit();
+    try p.addSet(.{ .family = .ip, .table = "t", .name = "s", .key_type = .ipv4_addr });
+    const ps = try decodeSet((try firstCommand(p.bytes())).payload);
+    try testing.expectEqual(@as(u32, 0), ps.flags);
+    try testing.expectEqual(@as(?u32, null), ps.data_type);
+
+    var e = try Batch.init(gpa, 0, .{});
+    defer e.deinit();
+    try e.addSetElems(.inet, "t", "vm", null, &.{
+        .{ .key = &.{ 0, 22 }, .verdict = .drop },
+        .{ .key = &.{ 0, 80 }, .verdict = expr.Verdict.gotoChain("web") },
+        .{ .key = &.{ 0, 81 }, .data = &.{ 10, 0, 0, 1 } },
+    });
+    const reply = try decodeSetElemReply((try firstCommand(e.bytes())).payload);
+    var it = reply.iterator();
+    const e1 = (try it.next()).?;
+    try testing.expectEqual(types.NF.DROP, e1.verdict.?.code);
+    try testing.expect(e1.data == null);
+    const e2 = (try it.next()).?;
+    try testing.expectEqual(types.NFT.GOTO, e2.verdict.?.code);
+    try testing.expectEqualStrings("web", e2.verdict.?.chain.?);
+    const e3 = (try it.next()).?;
+    try testing.expect(e3.verdict == null);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, e3.data.?);
+    try testing.expect((try it.next()) == null);
+}
+
+test "decodeCounter reads a rule dump's counter and refuses a short value" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try expr.appendExpr(gpa, &list, .{ .counter = .{ .packets = 3, .bytes = 180 } });
+    var it: expr.ExprIterator = .{ .attrs = .{ .buf = list.items } };
+    const v = (try it.next()).?;
+    try testing.expectEqualStrings("counter", v.name);
+    const c = (try expr.decodeCounter(v.data)).?;
+    try testing.expectEqual(@as(u64, 3), c.packets);
+    try testing.expectEqual(@as(u64, 180), c.bytes);
+    // A fresh counter as `nft` sends it (empty data) decodes to null.
+    try testing.expect((try expr.decodeCounter(&.{})) == null);
+    // Only BYTES present: packets default to 0, not garbage.
+    const only_bytes = [_]u8{ 0x0c, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0x01, 0x00 };
+    const ob = (try expr.decodeCounter(&only_bytes)).?;
+    try testing.expectEqual(@as(u64, 0), ob.packets);
+    try testing.expectEqual(@as(u64, 256), ob.bytes);
+    // PACKETS with a 4-byte value is malformed.
+    const short = [_]u8{ 0x08, 0x00, 0x02, 0x00, 0, 0, 0, 1 };
+    try testing.expectError(error.BadLength, expr.decodeCounter(&short));
 }

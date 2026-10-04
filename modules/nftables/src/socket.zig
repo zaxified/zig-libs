@@ -296,6 +296,7 @@ pub const Socket = struct {
     pub const RuleList = List(wire.RuleInfo);
     pub const SetList = List(wire.SetInfo);
     pub const SetElemList = List(wire.SetElemInfo);
+    pub const ObjectList = List(wire.ObjectInfo);
 
     /// `family = null` sweeps every family in one dump — see
     /// `wire.buildDumpRequest`. Each result's `.family` names the concrete
@@ -387,6 +388,29 @@ pub const Socket = struct {
         return out;
     }
 
+    /// Dump the named stateful objects (counters, quotas, …) with their
+    /// current values. `family = null` sweeps every family — see
+    /// `listTables`. Reading does not reset anything (`NFT_MSG_GETOBJ`, not
+    /// `GETOBJ_RESET`).
+    pub fn listObjects(self: *Socket, family: ?Family) DumpError!ObjectList {
+        var out: ObjectList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
+        errdefer out.arena.deinit();
+        var items: std.ArrayList(wire.ObjectInfo) = .empty;
+        const a = out.arena.allocator();
+        const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETOBJ, family);
+        try self.dumpInto(&req, wire.NFT_MSG.NEWOBJ, self.nl.seq, struct {
+            fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.ObjectInfo), payload: []const u8) !void {
+                var o = try wire.decodeObject(payload);
+                o.table = try al.dupe(u8, o.table);
+                o.name = try al.dupe(u8, o.name);
+                o.data = try al.dupe(u8, o.data);
+                try list.append(al, o);
+            }
+        }.f, a, &items);
+        out.items = items.items;
+        return out;
+    }
+
     /// Dump the elements of one named set.
     pub fn listSetElems(
         self: *Socket,
@@ -410,6 +434,9 @@ pub const Socket = struct {
                     copy.key = try al.dupe(u8, el.key);
                     if (el.key_end) |k| copy.key_end = try al.dupe(u8, k);
                     if (el.data) |d| copy.data = try al.dupe(u8, d);
+                    if (el.verdict) |v| if (v.chain) |c| {
+                        copy.verdict.?.chain = try al.dupe(u8, c);
+                    };
                     try list.append(al, copy);
                 }
             }
@@ -833,4 +860,214 @@ test "live: an unspec-family dump returns objects from multiple families in one 
         "\nLIVE nftables unspec sweep: one dump returned both an inet and an ip table.\n",
         .{},
     );
+}
+
+const test_table_core = "zig_nftables_live_core";
+
+/// One UDP datagram to `addr`:9 (discard). Only its trip through the output
+/// hook matters; nothing listens.
+fn sendUdp(addr: [4]u8) !void {
+    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var sa: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, 9),
+        .addr = @bitCast(addr),
+    };
+    const rc = linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(rc) != .SUCCESS) return error.SendFailed;
+}
+
+test "live: interval set, named counter/quota, verdict map and inet ingress against the kernel" {
+    // What the goldens cannot show: that the kernel accepts these messages
+    // and that they MEAN what the helpers say. Packets prove the interval
+    // semantics — [first, last+1) must match the last address and miss the
+    // one after it — and the counters are read back through the decoders a
+    // consumer uses (`decodeCounter`, `listObjects`).
+    var sock = try liveSocket("core objects");
+    defer sock.close();
+    dropTable(&sock, .ip, test_table_core);
+    dropTable(&sock, .inet, test_table_core);
+
+    const range = try wire.interval(4, .{ 127, 0, 0, 5 }, .{ 127, 0, 0, 9 });
+    var two: [2]wire.SetElem = undefined;
+
+    // rule 1: ip daddr @r counter      (interval set lookup)
+    var p1 = expr.Program.init(testing.allocator, .ip);
+    defer p1.deinit();
+    _ = p1.payloadLookup(.nh, 16, 4, "r", 1, false).counter().accept();
+    // rule 2: ip daddr 127.0.0.77 counter name "hits" quota name "q"
+    var p2 = expr.Program.init(testing.allocator, .ip);
+    defer p2.deinit();
+    _ = p2.ipDaddr(.{ 127, 0, 0, 77 }).counterRef("hits").quotaRef("q").accept();
+    // rule 3: udp dport vmap @vm      (verdict map; 9 → accept)
+    var p3 = expr.Program.init(testing.allocator, .ip);
+    defer p3.deinit();
+    _ = p3.l4proto(expr.IPPROTO.UDP).payloadVmap(.th, 2, 2, "vm", 2);
+
+    var b = try sock.beginBatch(.{});
+    defer b.deinit();
+    try b.addTable(.{ .family = .ip, .name = test_table_core });
+    try b.addChain(.{
+        .family = .ip,
+        .table = test_table_core,
+        .name = "out",
+        .chain_type = .filter,
+        .hook = .output,
+        .prio = 0,
+    });
+    try b.addChain(.{ .family = .ip, .table = test_table_core, .name = "helper" });
+    try b.addSet(.{ .family = .ip, .table = test_table_core, .name = "r", .key_type = .ipv4_addr, .flags = &.{.interval}, .id = 1 });
+    try b.addSetElems(.ip, test_table_core, "r", 1, range.elems(&two));
+    try b.addSet(.{ .family = .ip, .table = test_table_core, .name = "vm", .key_type = .inet_service, .id = 2, .data = .verdict });
+    try b.addSetElems(.ip, test_table_core, "vm", 2, &.{
+        .{ .key = &expr.portBytes(9), .verdict = .accept },
+        .{ .key = &expr.portBytes(10), .verdict = expr.Verdict.jumpTo("helper") },
+    });
+    try b.addObject(.{ .family = .ip, .table = test_table_core, .name = "hits", .obj = .{ .counter = .{} } });
+    try b.addObject(.{
+        .family = .ip,
+        .table = test_table_core,
+        .name = "q",
+        .obj = .{ .quota = .{ .bytes = 1 << 20, .over = true } },
+    });
+    try b.addRule(.{ .family = .ip, .table = test_table_core, .chain = "out", .exprs = try p1.finish() });
+    try b.addRule(.{ .family = .ip, .table = test_table_core, .chain = "out", .exprs = try p2.finish() });
+    try b.addRule(.{ .family = .ip, .table = test_table_core, .chain = "out", .exprs = try p3.finish() });
+    // An inet table with an ingress base chain on lo (NF_INET_INGRESS).
+    try b.addTable(.{ .family = .inet, .name = test_table_core });
+    try b.addChain(.{
+        .family = .inet,
+        .table = test_table_core,
+        .name = "ing",
+        .chain_type = .filter,
+        .hook = .ingress,
+        .prio = 0,
+        .dev = "lo",
+    });
+    sock.commit(&b) catch |err| switch (err) {
+        error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
+            skipUnprivileged(&sock, "core objects", err);
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    defer {
+        dropTable(&sock, .ip, test_table_core);
+        dropTable(&sock, .inet, test_table_core);
+    }
+
+    // The ingress chain reads back with hooknum 5 on lo.
+    var chains = try sock.listChains(.inet);
+    defer chains.deinit();
+    var saw_ingress = false;
+    for (chains.items) |c| {
+        if (!std.mem.eql(u8, c.table, test_table_core)) continue;
+        try testing.expectEqual(@as(?u32, try types.Hook.ingress.num(.inet)), c.hooknum);
+        try testing.expectEqualStrings("lo", c.dev.?);
+        saw_ingress = true;
+    }
+    try testing.expect(saw_ingress);
+
+    // The map reads back as a verdict map with both verdicts.
+    var sets = try sock.listSets(.ip);
+    defer sets.deinit();
+    var saw_map = false;
+    for (sets.items) |s| {
+        if (!std.mem.eql(u8, s.table, test_table_core) or !std.mem.eql(u8, s.name, "vm")) continue;
+        try testing.expect(s.flags & wire.NFT_SET_MAP != 0);
+        try testing.expectEqual(@as(?u32, wire.NFT_DATA_VERDICT), s.data_type);
+        saw_map = true;
+    }
+    try testing.expect(saw_map);
+    var vm = try sock.listSetElems(.ip, test_table_core, "vm");
+    defer vm.deinit();
+    try testing.expectEqual(@as(usize, 2), vm.items.len);
+    var saw_jump = false;
+    for (vm.items) |e| {
+        const v = e.verdict.?;
+        if (v.code == types.NFT.JUMP) {
+            try testing.expectEqualStrings("helper", v.chain.?);
+            saw_jump = true;
+        } else try testing.expectEqual(types.NF.ACCEPT, v.code);
+    }
+    try testing.expect(saw_jump);
+
+    // Packets: .9 is the LAST address of the range (must count), .10 the
+    // first past it (must not), .4 the one below; .77 hits the named counter.
+    sendUdp(.{ 127, 0, 0, 9 }) catch {
+        // A fresh `unshare -rn` namespace (how the lane runs this module)
+        // starts with `lo` DOWN. This test already holds CAP_NET_ADMIN there
+        // (the batch above committed), so bring it up — ifindex 1 is always
+        // `lo` in a network namespace — and try once more.
+        var rt = netlink.Socket.open(testing.allocator) catch |err|
+            return testkit.skip("LIVE nftables core objects: no rtnetlink ({s})", .{@errorName(err)});
+        defer rt.close();
+        rt.linkUp(1) catch |err|
+            return testkit.skip("LIVE nftables core objects: cannot bring lo up ({s})", .{@errorName(err)});
+        sendUdp(.{ 127, 0, 0, 9 }) catch |err|
+            return testkit.skip("LIVE nftables core objects: no loopback to send on ({s})", .{@errorName(err)});
+    };
+    try sendUdp(.{ 127, 0, 0, 10 });
+    try sendUdp(.{ 127, 0, 0, 4 });
+    try sendUdp(.{ 127, 0, 0, 77 });
+    try sendUdp(.{ 127, 0, 0, 5 });
+
+    var rules = try sock.listRules(.ip, test_table_core, "out");
+    defer rules.deinit();
+    try testing.expectEqual(@as(usize, 3), rules.items.len);
+    var it = rules.items[0].exprIterator();
+    var range_hits: ?u64 = null;
+    while (try it.next()) |e| {
+        if (std.mem.eql(u8, e.name, "counter")) range_hits = (try expr.decodeCounter(e.data)).?.packets;
+    }
+    // .9 and .5 are inside [127.0.0.5, 127.0.0.10); .10 and .4 are not.
+    try testing.expectEqual(@as(?u64, 2), range_hits);
+
+    var objs = try sock.listObjects(.ip);
+    defer objs.deinit();
+    var saw_counter = false;
+    var saw_quota = false;
+    for (objs.items) |o| {
+        if (!std.mem.eql(u8, o.table, test_table_core)) continue;
+        if (std.mem.eql(u8, o.name, "hits")) {
+            try testing.expectEqual(@as(u32, @intFromEnum(expr.ObjectType.counter)), o.obj_type);
+            try testing.expectEqual(@as(u64, 1), o.counter.?.packets);
+            // One IPv4 header (20) + UDP header (8) + 1 payload byte.
+            try testing.expectEqual(@as(u64, 29), o.counter.?.bytes);
+            saw_counter = true;
+        }
+        if (std.mem.eql(u8, o.name, "q")) {
+            try testing.expectEqual(@as(u64, 1 << 20), o.quota.?.bytes);
+            try testing.expectEqual(@as(u64, 29), o.quota.?.consumed);
+            try testing.expect(o.quota.?.flags & expr.NFT_QUOTA_F_INV != 0);
+            saw_quota = true;
+        }
+    }
+    try testing.expect(saw_counter and saw_quota);
+
+    // Listing is a READ: a second dump sees the same count. (GETOBJ_RESET
+    // would answer the same first dump and zero the counter behind it —
+    // mutation 2026-10-04 found nothing told the two apart.)
+    var again = try sock.listObjects(.ip);
+    defer again.deinit();
+    for (again.items) |o| {
+        if (std.mem.eql(u8, o.table, test_table_core) and std.mem.eql(u8, o.name, "hits"))
+            try testing.expectEqual(@as(u64, 1), o.counter.?.packets);
+    }
+
+    // Delete the named counter after its rule is gone (a referenced object
+    // is EBUSY), then confirm it left the dump.
+    var del = try sock.beginBatch(.{});
+    defer del.deinit();
+    try del.deleteRule(.ip, test_table_core, "out", rules.items[1].handle);
+    try del.deleteObject(.ip, test_table_core, "hits", .counter);
+    try sock.commit(&del);
+    var objs2 = try sock.listObjects(.ip);
+    defer objs2.deinit();
+    for (objs2.items) |o| {
+        if (std.mem.eql(u8, o.table, test_table_core))
+            try testing.expect(!std.mem.eql(u8, o.name, "hits"));
+    }
 }

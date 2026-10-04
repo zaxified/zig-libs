@@ -292,6 +292,202 @@ const g_multi_batch =
     "0e000100696d6d6564696174650000001c0002800800010000000000100002800c000280080001000000000114000000" ++
     "1100010004000000000000000000000a";
 
+// ── captured 2026-10-04 (same nft v1.1.6, same recipe) ─────────────────────
+//
+// State the commands below ran against, created first with plain `nft` in the
+// same namespace: `inet filter` with a base chain `input` and a regular chain
+// `helper`, `ip nat` with a prerouting nat chain `pre`, an `ipv4_addr` interval
+// set `blocked` (set id 1 in nft's cache), the verdict map `vm` (id 2) and an
+// `ipv6_addr` interval set `b6` (id 3). `nft` names a set by its cached id as
+// well as its name in every element/lookup message, which is where the ids in
+// the tests come from.
+
+// ### nft add rule inet filter input reject
+const g_rule_reject =
+    "140000001000010000000000000000000000000a54000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000028000480240001800b00010072656a6563740000140002800800010000000002" ++
+    "0500020001000000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input tcp dport 22 reject with tcp reset
+const g_rule_reject_tcp_reset =
+    "140000001000010000000000000000000000000a04010000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000d800048024000180090001006d65746100000000140002800800020000000010" ++
+    "08000100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100" ++
+    "06000000340001800c0001007061796c6f61640024000280080001000000000108000200000000020800030000000002" ++
+    "08000400000000022c00018008000100636d700020000280080001000000000108000200000000000c00038006000100" ++
+    "00160000240001800b00010072656a656374000014000280080001000000000105000200000000001400000011000100" ++
+    "02000000000000000000000a";
+
+// ### nft add rule inet filter input reject with icmpx admin-prohibited
+const g_rule_reject_icmpx_admin =
+    "140000001000010000000000000000000000000a54000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000028000480240001800b00010072656a6563740000140002800800010000000002" ++
+    "0500020003000000140000001100010002000000000000000000000a";
+
+// ### nft add rule ip nat pre reject with icmp host-unreachable
+const g_rule_reject_icmp_host =
+    "140000001000010000000000000000000000000a4c000000060a010c010000000000000002000000080001006e617400" ++
+    "080002007072650028000480240001800b00010072656a65637400001400028008000100000000000500020001000000" ++
+    "140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input queue num 3 bypass
+const g_rule_queue_bypass =
+    "140000001000010000000000000000000000000a5c000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000300004802c0001800a00010071756575650000001c0002800600010000030000" ++
+    "06000200000100000600030000010000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input queue num 2-5 fanout
+const g_rule_queue_fanout =
+    "140000001000010000000000000000000000000a5c000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000300004802c0001800a00010071756575650000001c0002800600010000020000" ++
+    "06000200000400000600030000020000140000001100010002000000000000000000000a";
+
+// ### nft add rule ip nat pre tcp dport 80 redirect to :8080
+const g_rule_redirect_port =
+    "140000001000010000000000000000000000000a28010000060a010c010000000000000002000000080001006e617400" ++
+    "08000200707265000401048024000180090001006d657461000000001400028008000200000000100800010000000001" ++
+    "2c00018008000100636d700020000280080001000000000108000200000000000c000380050001000600000034000180" ++
+    "0c0001007061796c6f616400240002800800010000000001080002000000000208000300000000020800040000000002" ++
+    "2c00018008000100636d700020000280080001000000000108000200000000000c00038006000100005000002c000180" ++
+    "0e000100696d6d6564696174650000001800028008000100000000010c000280060001001f900000240001800a000100" ++
+    "72656469720000001400028008000100000000010800030000000002140000001100010002000000000000000000000a";
+
+// ### nft add rule ip nat pre redirect
+const g_rule_redirect =
+    "140000001000010000000000000000000000000a3c000000060a010c010000000000000002000000080001006e617400" ++
+    "080002007072650018000480140001800a00010072656469720000000400028014000000110001000200000000000000" ++
+    "0000000a";
+
+// ### nft add rule inet filter input quota over 100 mbytes drop
+const g_rule_quota_over =
+    "140000001000010000000000000000000000000a94000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000068000480340001800a00010071756f7461000000240002800c00010000000000" ++
+    "064000000c00040000000000000000000800020000000001300001800e000100696d6d6564696174650000001c000280" ++
+    "0800010000000000100002800c0002800800010000000000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input quota 25 bytes
+const g_rule_quota =
+    "140000001000010000000000000000000000000a64000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000038000480340001800a00010071756f7461000000240002800c00010000000000" ++
+    "000000190c00040000000000000000000800020000000000140000001100010002000000000000000000000a";
+
+// ### nft add counter inet filter c1
+const g_add_counter =
+    "140000001000010000000000000000000000000a4c000000120a01040100000000000000010000000b00010066696c74" ++
+    "65720000070002006331000008000300000000011c0004800c00010000000000000000000c0002000000000000000000" ++
+    "140000001100010002000000000000000000000a";
+
+// ### nft add quota inet filter q1 { over 10 mbytes }
+const g_add_quota =
+    "140000001000010000000000000000000000000a54000000120a01040100000000000000010000000b00010066696c74" ++
+    "6572000007000200713100000800030000000002240004800c0001000000000000a000000c0004000000000000000000" ++
+    "0800020000000001140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input counter name c1
+const g_rule_counter_ref =
+    "140000001000010000000000000000000000000a54000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000028000480240001800b0001006f626a7265660000140002800800010000000001" ++
+    "0600020063310000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input quota name q1 drop
+const g_rule_quota_ref =
+    "140000001000010000000000000000000000000a84000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e70757400000058000480240001800b0001006f626a7265660000140002800800010000000002" ++
+    "0600020071310000300001800e000100696d6d6564696174650000001c0002800800010000000000100002800c000280" ++
+    "0800010000000000140000001100010002000000000000000000000a";
+
+// ### nft delete counter inet filter c1x
+const g_del_counter =
+    "140000001000010000000000000000000000000a34000000140a01000100000000000000010000000b00010066696c74" ++
+    "657200000800020063317800080003000000000104000480140000001100010002000000000000000000000a";
+
+// ### nft add map inet filter vm { type inet_service : verdict; }
+const g_add_vmap =
+    "140000001000010000000000000000000000000a84000000090a01040100000000000000010000000b00010066696c74" ++
+    "6572000007000200766d00000800030000000008080004000000000d080005000000000208000600ffffff0008000700" ++
+    "0000000008000a00000000012a000d000004020000000104000000000308000404000000010004080004040000000100" ++
+    "0604000000000000140000001100010002000000000000000000000a";
+
+// ### nft add element inet filter vm { 22 : accept, 80 : jump helper }
+const g_add_vmap_elems =
+    "140000001000010000000000000000000000000a800000000c0a01040100000000000000010000000b00010066696c74" ++
+    "6572000007000200766d0000080004000000000250000380200001800c0001800600010000160000100002800c000280" ++
+    "08000100000000012c0002800c00018006000100005000001c0002801800028008000100fffffffd0b00020068656c70" ++
+    "65720000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input tcp dport vmap @vm
+const g_rule_vmap =
+    "140000001000010000000000000000000000000ae8000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000bc00048024000180090001006d65746100000000140002800800020000000010" ++
+    "08000100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100" ++
+    "06000000340001800c0001007061796c6f61640024000280080001000000000108000200000000020800030000000002" ++
+    "0800040000000002340001800b0001006c6f6f6b75700000240002800800020000000001080003000000000007000100" ++
+    "766d00000800040000000002140000001100010002000000000000000000000a";
+
+// ### nft add element inet filter blocked { 192.168.1.10-192.168.1.20 }
+const g_add_range =
+    "140000001000010000000000000000000000000a780000000c0a01040100000000000000010000000b00010066696c74" ++
+    "657200000c000200626c6f636b6564000800040000000001440003801800018008000300000000010c00018008000100" ++
+    "00000000100002800c00018008000100c0a8010a1800038008000300000000010c00018008000100c0a8011514000000" ++
+    "1100010002000000000000000000000a";
+
+// ### nft add element inet filter blocked { 172.16.0.0/12 }
+const g_add_prefix12 =
+    "140000001000010000000000000000000000000a600000000c0a01040100000000000000010000000b00010066696c74" ++
+    "657200000c000200626c6f636b65640008000400000000012c000380100001800c00018008000100ac10000018000280" ++
+    "08000300000000010c00018008000100ac200000140000001100010002000000000000000000000a";
+
+// ### nft add element inet filter blocked { 255.255.255.0/24 }
+const g_add_open_interval =
+    "140000001000010000000000000000000000000a540000000c0a01040100000000000000010000000b00010066696c74" ++
+    "657200000c000200626c6f636b6564000800040000000001200003801c0001800c00018008000100ffffff000a000600" ++
+    "0104010000000000140000001100010002000000000000000000000a";
+
+// ### nft add element inet filter b6 { 2001:db8::/32 }
+const g_add_prefix6 =
+    "140000001000010000000000000000000000000a980000000c0a01040100000000000000010000000b00010066696c74" ++
+    "657200000700020062360000080004000000000368000380240001800800030000000001180001801400010000000000" ++
+    "0000000000000000000000001c000280180001801400010020010db80000000000000000000000002400038008000300" ++
+    "00000001180001801400010020010db9000000000000000000000000140000001100010002000000000000000000000a";
+
+// ### nft add chain inet filter ing { type filter hook ingress device lo priority 0; }
+const g_add_chain_inet_ingress =
+    "140000001000010000000000000000000000000a50000000030a01040100000000000000010000000b00010066696c74" ++
+    "6572000008000300696e67000b00070066696c74657200001c0004800800010000000005080002000000000007000300" ++
+    "6c6f0000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input ip6 saddr 2001:db8::/32 drop
+const g_rule_ip6_saddr_prefix32 =
+    "140000001000010000000000000000000000000a10010000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000e400048024000180090001006d6574610000000014000280080002000000000f" ++
+    "08000100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100" ++
+    "0a000000340001800c0001007061796c6f61640024000280080001000000000108000200000000010800030000000008" ++
+    "08000400000000042c00018008000100636d700020000280080001000000000108000200000000000c00038008000100" ++
+    "20010db8300001800e000100696d6d6564696174650000001c0002800800010000000000100002800c00028008000100" ++
+    "00000000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input ip6 daddr 2001:db8::1 drop
+const g_rule_ip6_daddr =
+    "140000001000010000000000000000000000000a1c010000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e707574000000f000048024000180090001006d6574610000000014000280080002000000000f" ++
+    "08000100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100" ++
+    "0a000000340001800c0001007061796c6f61640024000280080001000000000108000200000000010800030000000018" ++
+    "08000400000000103800018008000100636d70002c000280080001000000000108000200000000001800038014000100" ++
+    "20010db8000000000000000000000001300001800e000100696d6d6564696174650000001c0002800800010000000000" ++
+    "100002800c0002800800010000000000140000001100010002000000000000000000000a";
+
+// ### nft add rule inet filter input ip6 saddr 2001:db8::/33 drop
+const g_rule_ip6_saddr_prefix33 =
+    "140000001000010000000000000000000000000a78010000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e7075740000004c01048024000180090001006d6574610000000014000280080002000000000f" ++
+    "08000100000000012c00018008000100636d700020000280080001000000000108000200000000000c00038005000100" ++
+    "0a000000340001800c0001007061796c6f61640024000280080001000000000108000200000000010800030000000008" ++
+    "08000400000000105c0001800c00010062697477697365004c0002800800010000000001080002000000000108000300" ++
+    "000000101800048014000100ffffffff8000000000000000000000001800058014000100000000000000000000000000" ++
+    "000000003800018008000100636d70002c00028008000100000000010800020000000000180003801400010020010db8" ++
+    "000000000000000000000000300001800e000100696d6d6564696174650000001c000280080001000000000010000280" ++
+    "0c0002800800010000000000140000001100010002000000000000000000000a";
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 /// A batch framed exactly like `nft`: sequence numbers from 0, no `NLM_F_ACK`.
@@ -793,4 +989,402 @@ test "golden values: set with size + timeout (NFTA_SET_DESC + NFTA_SET_TIMEOUT)"
         wire.NFTA_SET.DESC,
         wire.NFTA_SET.TIMEOUT,
     }, &order);
+}
+
+// ── 2026-10-04 goldens: reject, queue, redirect, quota, objects, maps,
+//    interval helpers, inet ingress, IPv6 matches ───────────────────────────
+
+fn ruleGolden(hex: []const u8, family: types.Family, table: []const u8, chain: []const u8, p: *expr.Program) !void {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addRule(.{ .family = family, .table = table, .chain = chain, .exprs = try p.finish() });
+    try expectGolden(hex, try b.finish());
+}
+
+test "golden: rule — reject (inet default = icmpx port-unreachable)" {
+    // NFT_REJECT_ICMPX_UNREACH (2) with NFT_REJECT_ICMPX_PORT_UNREACH (1):
+    // the bare `reject` of an inet table, per the capture.
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.reject(.{ .icmpx = .port_unreach });
+    try ruleGolden(g_rule_reject, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — tcp dport 22 reject with tcp reset" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.tcpDport(22).reject(.tcp_reset);
+    try ruleGolden(g_rule_reject_tcp_reset, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — reject with icmpx admin-prohibited" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.reject(.{ .icmpx = .admin_prohibited });
+    try ruleGolden(g_rule_reject_icmpx_admin, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — reject with icmp host-unreachable (ip family)" {
+    // ICMP code 1 = host unreachable (RFC 792), type NFT_REJECT_ICMP_UNREACH.
+    var p = expr.Program.init(gpa, .ip);
+    defer p.deinit();
+    _ = p.reject(.{ .icmp = 1 });
+    try ruleGolden(g_rule_reject_icmp_host, .ip, "nat", "pre", &p);
+}
+
+test "golden: rule — queue num 3 bypass" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.queue(3, .{ .bypass = true });
+    try ruleGolden(g_rule_queue_bypass, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — queue num 2-5 fanout (num 2, total 4)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.queue(2, .{ .total = 4, .fanout = true });
+    try ruleGolden(g_rule_queue_fanout, .inet, "filter", "input", &p);
+}
+
+test "queue rejects an empty range and one running past queue 65535" {
+    // total = 0 queues nothing; 65535 + 2 - 1 = 65536 is not a queue number.
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.queue(1, .{ .total = 0 });
+    try testing.expectError(error.InvalidQueueRange, p.finish());
+    var q = expr.Program.init(gpa, .inet);
+    defer q.deinit();
+    _ = q.queue(65535, .{ .total = 2 });
+    try testing.expectError(error.InvalidQueueRange, q.finish());
+    // …while the last valid one, 65535 alone, encodes.
+    var r = expr.Program.init(gpa, .inet);
+    defer r.deinit();
+    _ = r.queue(65535, .{});
+    _ = try r.finish();
+    // A hand-built Expr that skips the Program is refused by the encoder too.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try testing.expectError(
+        error.InvalidQueueRange,
+        expr.appendExpr(gpa, &list, .{ .queue = .{ .num = 65000, .total = 1000 } }),
+    );
+    try testing.expectError(
+        error.InvalidQueueRange,
+        expr.appendExpr(gpa, &list, .{ .queue = .{ .num = 0, .total = 0 } }),
+    );
+    // total = 0 from a non-zero num: 5 + 0 - 1 = 4 looks in range, so only
+    // the explicit empty-range check refuses it (mutation 2026-10-04).
+    try testing.expectError(
+        error.InvalidQueueRange,
+        expr.appendExpr(gpa, &list, .{ .queue = .{ .num = 5, .total = 0 } }),
+    );
+}
+
+test "golden: rule — tcp dport 80 redirect to :8080" {
+    var p = expr.Program.init(gpa, .ip);
+    defer p.deinit();
+    _ = p.tcpDport(80).redirect(8080);
+    try ruleGolden(g_rule_redirect_port, .ip, "nat", "pre", &p);
+}
+
+test "golden: rule — redirect (no port: an empty redir data nest)" {
+    var p = expr.Program.init(gpa, .ip);
+    defer p.deinit();
+    _ = p.redirect(null);
+    try ruleGolden(g_rule_redirect, .ip, "nat", "pre", &p);
+}
+
+test "golden: rule — quota over 100 mbytes drop" {
+    // 100 mbytes = 100 * 2^20 = 0x6400000 bytes; `over` = NFT_QUOTA_F_INV.
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.quota(100 * 1024 * 1024, true).drop();
+    try ruleGolden(g_rule_quota_over, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — quota 25 bytes (flags 0, still sent)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.quota(25, false);
+    try ruleGolden(g_rule_quota, .inet, "filter", "input", &p);
+}
+
+test "golden: add counter (named object, both values sent even at zero)" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addObject(.{ .family = .inet, .table = "filter", .name = "c1", .obj = .{ .counter = .{} } });
+    try expectGolden(g_add_counter, try b.finish());
+}
+
+test "golden: add quota { over 10 mbytes }" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addObject(.{
+        .family = .inet,
+        .table = "filter",
+        .name = "q1",
+        .obj = .{ .quota = .{ .bytes = 10 * 1024 * 1024, .over = true } },
+    });
+    try expectGolden(g_add_quota, try b.finish());
+}
+
+test "golden: delete counter (an empty NFTA_OBJ_DATA nest)" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.deleteObject(.inet, "filter", "c1x", .counter);
+    try expectGolden(g_del_counter, try b.finish());
+}
+
+test "golden: rule — counter name c1 (objref, name without a NUL)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.counterRef("c1");
+    try ruleGolden(g_rule_counter_ref, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — quota name q1 drop" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.quotaRef("q1").drop();
+    try ruleGolden(g_rule_quota_ref, .inet, "filter", "input", &p);
+}
+
+/// `nft`'s private userdata for the `vm` map (key byteorder/length, data
+/// byteorder/length — opaque to the kernel, passed through like the others).
+const nft_map_userdata = [_]u8{
+    0x00, 0x04, 0x02, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03,
+    0x08, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x08, 0x00, 0x04,
+    0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00,
+};
+
+test "golden: add map { type inet_service : verdict; }" {
+    // NFT_SET_MAP (8) in FLAGS, DATA_TYPE NFT_DATA_VERDICT (0xffffff00),
+    // DATA_LEN 0 — the capture's values.
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSet(.{
+        .family = .inet,
+        .table = "filter",
+        .name = "vm",
+        .key_type = .inet_service,
+        .id = 1,
+        .data = .verdict,
+        .userdata = &nft_map_userdata,
+    });
+    try expectGolden(g_add_vmap, try b.finish());
+}
+
+test "golden: add element to a verdict map { 22 : accept, 80 : jump helper }" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSetElems(.inet, "filter", "vm", 2, &.{
+        .{ .key = &expr.portBytes(22), .verdict = .accept },
+        .{ .key = &expr.portBytes(80), .verdict = expr.Verdict.jumpTo("helper") },
+    });
+    try expectGolden(g_add_vmap_elems, try b.finish());
+}
+
+test "golden: rule — tcp dport vmap @vm (lookup with dreg = verdict)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.tcpDportVmap("vm", 2);
+    try ruleGolden(g_rule_vmap, .inet, "filter", "input", &p);
+}
+
+test "a map element with both a value and a verdict is refused" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try testing.expectError(error.ElemDataConflict, b.addSetElems(.inet, "filter", "vm", null, &.{
+        .{ .key = &expr.portBytes(22), .data = &.{ 1, 2, 3, 4 }, .verdict = .accept },
+    }));
+}
+
+test "golden: interval 192.168.1.10-192.168.1.20 (start, last+1 flagged END)" {
+    // `nft` prefixes the first range it adds to an EMPTY interval set with a
+    // `0.0.0.0` INTERVAL_END element (the capture; a later add into the same
+    // set — the /12 golden below — has none). The kernel does not need it: a
+    // key below the first start finds no element at or below it either way.
+    // The test supplies it by hand and checks the helper's two elements.
+    const r = try wire.interval(4, .{ 192, 168, 1, 10 }, .{ 192, 168, 1, 20 });
+    try testing.expect(!r.open);
+    var two: [2]wire.SetElem = undefined;
+    const pair = r.elems(&two);
+    try testing.expectEqual(@as(usize, 2), pair.len);
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSetElems(.inet, "filter", "blocked", 1, &.{
+        .{ .key = &.{ 0, 0, 0, 0 }, .flags = wire.NFT_SET_ELEM_INTERVAL_END },
+        pair[0],
+        pair[1],
+    });
+    try expectGolden(g_add_range, try b.finish());
+}
+
+test "golden: interval 172.16.0.0/12 (end = 172.32.0.0, the next /12)" {
+    // Host bits are cleared: 172.17.1.1/12 is the same range as 172.16.0.0/12.
+    const r = try wire.prefixInterval(4, .{ 172, 17, 1, 1 }, 12);
+    var two: [2]wire.SetElem = undefined;
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSetElems(.inet, "filter", "blocked", 1, r.elems(&two));
+    try expectGolden(g_add_prefix12, try b.finish());
+}
+
+test "golden: interval 255.255.255.0/24 is open (no element past the top)" {
+    // last = 255.255.255.255 has no successor, so `nft` sends the start
+    // alone, tagged in its private userdata (`01 04 01000000`, opaque to the
+    // kernel) so that it can print the range back.
+    const r = try wire.prefixInterval(4, .{ 255, 255, 255, 0 }, 24);
+    try testing.expect(r.open);
+    var two: [2]wire.SetElem = undefined;
+    const one = r.elems(&two);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    two[0].userdata = &.{ 0x01, 0x04, 0x01, 0x00, 0x00, 0x00 };
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSetElems(.inet, "filter", "blocked", 1, two[0..1]);
+    try expectGolden(g_add_open_interval, try b.finish());
+}
+
+test "golden: interval 2001:db8::/32 (16-byte keys, end 2001:db9::)" {
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const r = try wire.prefixInterval(16, a, 32);
+    var two: [2]wire.SetElem = undefined;
+    const pair = r.elems(&two);
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addSetElems(.inet, "filter", "b6", 3, &.{
+        // nft's empty-set leading marker again, supplied by hand.
+        .{ .key = &([_]u8{0} ** 16), .flags = wire.NFT_SET_ELEM_INTERVAL_END },
+        pair[0],
+        pair[1],
+    });
+    try expectGolden(g_add_prefix6, try b.finish());
+}
+
+test "interval helpers: carries, bounds and refusals" {
+    // 10.0.0.255 + 1 carries into the third byte.
+    const r = try wire.interval(4, .{ 10, 0, 0, 0 }, .{ 10, 0, 0, 255 });
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 1, 0 }, &r.end);
+    // A single address is [a, a+1).
+    const one = try wire.interval(4, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 1 });
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &one.end);
+    // last < first in the first differing byte, even though a later byte is
+    // larger: big-endian keys compare from the top byte.
+    try testing.expectError(error.InvalidRange, wire.interval(4, .{ 10, 0, 1, 0 }, .{ 10, 0, 0, 255 }));
+    // /0 covers everything and is open; /32 is one address.
+    const all = try wire.prefixInterval(4, .{ 1, 2, 3, 4 }, 0);
+    try testing.expect(all.open);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &all.start);
+    const host = try wire.prefixInterval(4, .{ 1, 2, 3, 4 }, 32);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &host.start);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 5 }, &host.end);
+    // /25 splits a byte: 192.0.2.200/25 = 192.0.2.128 .. 192.0.2.255.
+    const half = try wire.prefixInterval(4, .{ 192, 0, 2, 200 }, 25);
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 128 }, &half.start);
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 3, 0 }, &half.end);
+    try testing.expectError(error.InvalidPrefixLength, wire.prefixInterval(4, .{ 1, 2, 3, 4 }, 33));
+    try testing.expectError(error.InvalidPrefixLength, wire.prefixInterval(16, [_]u8{0} ** 16, 129));
+}
+
+test "golden: inet ingress chain on lo (hooknum 5 = NF_INET_INGRESS)" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addChain(.{
+        .family = .inet,
+        .table = "filter",
+        .name = "ing",
+        .chain_type = .filter,
+        .hook = .ingress,
+        .prio = 0,
+        .dev = "lo",
+    });
+    try expectGolden(g_add_chain_inet_ingress, try b.finish());
+}
+
+const db8: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+
+test "golden: rule — ip6 saddr 2001:db8::/32 drop (byte-aligned, 4-byte load at 8)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ip6SaddrPrefix(db8, 32).drop();
+    try ruleGolden(g_rule_ip6_saddr_prefix32, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — ip6 daddr 2001:db8::1 drop (16-byte load at 24)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    var a = db8;
+    a[15] = 1;
+    _ = p.ip6Daddr(a).drop();
+    try ruleGolden(g_rule_ip6_daddr, .inet, "filter", "input", &p);
+}
+
+test "golden: rule — ip6 saddr 2001:db8::/33 drop (bitwise ffffffff80…)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ip6SaddrPrefix(db8, 33).drop();
+    try ruleGolden(g_rule_ip6_saddr_prefix33, .inet, "filter", "input", &p);
+}
+
+test "ipv6MaskBytes: boundaries and refusal" {
+    // /33 = 32 one-bits then one more: ff ff ff ff 80 00 … (the capture's mask).
+    const m33 = try expr.ipv6MaskBytes(33);
+    try testing.expectEqualSlices(u8, &(.{ 0xff, 0xff, 0xff, 0xff, 0x80 } ++ [_]u8{0} ** 11), &m33);
+    const m0 = try expr.ipv6MaskBytes(0);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &m0);
+    const m128 = try expr.ipv6MaskBytes(128);
+    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), &m128);
+    const m127 = try expr.ipv6MaskBytes(127);
+    try testing.expectEqual(@as(u8, 0xfe), m127[15]);
+    try testing.expectError(error.InvalidPrefixLength, expr.ipv6MaskBytes(129));
+    // The Program helper refuses the same way, latched.
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ip6SaddrPrefix(db8, 129);
+    try testing.expectError(error.InvalidPrefixLength, p.finish());
+}
+
+test "ip6Saddr is the /128 prefix: the same 16-byte load at offset 8" {
+    // RFC 8200 puts the source address at byte 8; a /128 prefix is the whole
+    // address, and the /32 golden pins offset 8 for the prefix path — so the
+    // two must encode identically (mutation 2026-10-04: nothing pinned the
+    // full-address helper's offset).
+    var a = expr.Program.init(gpa, .inet);
+    defer a.deinit();
+    _ = a.ip6Saddr(db8);
+    var b = expr.Program.init(gpa, .inet);
+    defer b.deinit();
+    _ = b.ip6SaddrPrefix(db8, 128);
+    var la: std.ArrayList(u8) = .empty;
+    defer la.deinit(gpa);
+    var lb: std.ArrayList(u8) = .empty;
+    defer lb.deinit(gpa);
+    for (try a.finish()) |e| try expr.appendExpr(gpa, &la, e);
+    for (try b.finish()) |e| try expr.appendExpr(gpa, &lb, e);
+    try testing.expectEqualSlices(u8, lb.items, la.items);
+}
+
+test "ip6 prefix clears host bits before the cmp (2001:db8:ffff::1/33)" {
+    // The kernel compares (addr & mask) against the cmp data, so data with
+    // host bits set would never match. /33 keeps bit 32 (the top bit of byte
+    // 4): ff → 80, everything after it zero.
+    var addr = db8;
+    addr[4] = 0xff;
+    addr[5] = 0xff;
+    addr[15] = 1;
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ip6SaddrPrefix(addr, 33);
+    const exprs = try p.finish();
+    const last = exprs[exprs.len - 1].cmp.data.value;
+    try testing.expectEqualSlices(u8, &(.{ 0x20, 0x01, 0x0d, 0xb8, 0x80 } ++ [_]u8{0} ** 11), last);
+}
+
+test "payloadVmap refuses a key wider than one register" {
+    // Same 16-byte bound as payloadCmp/payloadLookup (one NFT_REG_1..4).
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.payloadVmap(.nh, 0, 17, "vm", null);
+    try testing.expectError(error.ValueWidthMismatch, p.finish());
 }

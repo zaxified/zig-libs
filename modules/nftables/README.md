@@ -129,6 +129,40 @@ port-id capture, `NETLINK_EXT_ACK`, sequence allocation, the
 a private copy. What is nftables-specific and stays here: the batch framing, the
 batch ACK/attribution engine and the decoders.
 
+### Maps, named objects, intervals, more statements
+
+```zig
+// A verdict map and the rule that uses it: `tcp dport vmap @svc`.
+try batch.addSet(.{ .family = .inet, .table = "filter", .name = "svc",
+                   .key_type = .inet_service, .id = 7, .data = .verdict });
+try batch.addSetElems(.inet, "filter", "svc", 7, &.{
+    .{ .key = &nft.expr.portBytes(22), .verdict = .accept },
+    .{ .key = &nft.expr.portBytes(80), .verdict = nft.expr.Verdict.jumpTo("web") },
+});
+_ = p.tcpDportVmap("svc", 7);
+
+// Interval sets without hand-built END markers: a range, a CIDR.
+const r = try nft.wire.prefixInterval(4, .{ 10, 0, 0, 0 }, 8);   // keep `r` alive
+var two: [2]nft.wire.SetElem = undefined;
+try batch.addSetElems(.inet, "filter", "blocked", null, r.elems(&two));
+
+// Named counters/quotas, referenced from rules, read back with their values.
+try batch.addObject(.{ .family = .inet, .table = "filter", .name = "ssh",
+                      .obj = .{ .counter = .{} } });
+_ = p.tcpDport(22).counterRef("ssh").accept();
+var objs = try sock.listObjects(null);       // o.counter.?.packets / .bytes
+defer objs.deinit();
+
+// Per-rule counters from a dump: `expr.decodeCounter(e.data)` on a "counter".
+```
+
+Also native: `reject` (`icmp`/`icmpx`/`tcp_reset`), `queue` (range, bypass,
+fanout), `redirect [to :port]`, anonymous `quota`, `ip6 saddr/daddr` with
+prefixes, the `inet` ingress hook (`.hook = .ingress, .dev = "lo"`) and the
+bridge-name meta keys. Every one of them is a byte-exact golden of `nft`'s own
+traffic. Not modelled yet: flowtables, `nft monitor`, `dynset`, `numgen`/`hash`/
+`dup`/`fwd`/`synproxy`/`tproxy` (`Expr.raw` reaches them) — see SPEC.md.
+
 ### Batching is the point
 
 nftables commits are transactions. `Batch` frames
@@ -160,8 +194,10 @@ hatch for hand-built expressions and deliberately does not touch the allocator.
   Each golden names the exact command it came from.
 - **Live tests** under `unshare -rn`: a native create/list/delete round-trip, a
   deliberately bad batch proving the kernel rolled the whole transaction back,
-  and an unspec-family dump (`listTables(null)`) proving a single request
-  returns objects from more than one family.
+  an unspec-family dump (`listTables(null)`) proving a single request
+  returns objects from more than one family, and real packets on `lo` through an
+  interval set, a named counter/quota and a verdict map, read back through
+  `decodeCounter` and `listObjects`.
 - **JSON ↔ native consistency**: the native batch is applied in a netns, then
   `nft -j list ruleset` decompiles it and the result is compared against what the
   JSON builder emits for the same ruleset.
