@@ -6,7 +6,7 @@
 
 **Scope:** core — json5/json5 2.2.3 (JS), JSON5 spec 1.0 (surveyed 2026-09-30); raised from mvp 2026-09-30 with numeric literals + whitespace/continuations
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -73,9 +73,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **JSON5 whitespace between tokens → one plain space:** form feed, vertical tab, NBSP U+00A0,
   BOM U+FEFF, U+2028/U+2029, and the Unicode Zs spaces U+1680, U+2000–U+200A, U+202F, U+205F,
   U+3000. Only *between* tokens: the same bytes inside strings are untouched, and lookalikes that are
-  not whitespace (U+200B, U+180E, …) are not rewritten. Between an unquoted key and its `:` they
-  count as horizontal space (U+2028/U+2029 still end an unquoted key in `preprocess`, exactly as a
-  newline does — annotated skips them like a newline).
+  not whitespace (U+200B, U+180E, …) are not rewritten. Between an unquoted key and its `:` every
+  JSON5 whitespace and line terminator (LF, CR, U+2028, U+2029) is skipped by both entry points —
+  JSON5 §6 lets WhiteSpace and LineTerminator separate any two tokens, so `{a\n: 1}` is `{"a": 1}`.
+  (Until 2026-10-04 a line terminator there sent `preprocess` into `$err_trace` recovery.)
+- **Strings: control characters.** A JSON5 string may hold any character except its quote, `\` and
+  a line terminator (JSON5 §5), so a raw TAB or U+0001 is content; JSON needs U+0000..U+001F escaped
+  (RFC 8259 §7). Both entry points emit them as `\t`, `\b`, `\f` or `\u00XX`; a `\` before one is a
+  NonEscapeCharacter (the character itself) and is emitted the same way. A raw LF/CR inside a string
+  stays raw — it is an unterminated string, refused as before. (Until 2026-10-04 they were copied
+  raw and `std.json` refused the valid document.)
 - **API:** `preprocess(alloc, input)` / `preprocessAnnotated(alloc, input)` are unchanged;
   `preprocessWithOptions` / `preprocessAnnotatedWithOptions` take `Options{ .non_finite,
   .diagnostic }`. `preprocess` may now also return `error.NonFiniteNumber` and
@@ -151,6 +158,22 @@ and asserts against that convention, with two carved-out exceptions:
   `objects/illegal-unquoted-key-number.txt` looks like the same shape but
   needs no carve-out: empirically it already rejects correctly (the leading
   digits break object structure before recovery gets a chance).
+
+**Audit 2026-10-04 (mutation).** 52 schemata mutants over both string branches (line
+continuations, quote conversion and escaping, control characters), comments (CR/LS ends,
+unterminated block, token separation), trailing/lone-comma removal, key-position tracking and
+key whitespace, error recovery (`findKeyColon`, `skipValue`, `trimForMessage`,
+`diagnosticPrefix`, `appendJsonStr`, the line counter), EOF auto-close, `emitNumber`
+(non-finite words, hex cap and conversion, exponent sign, `.5`/`5.` forms) and JSON5
+whitespace/line-terminator decoding: 51 killed, 1 equivalent, 0 left alive. Equivalent:
+letting `removeTrailingComma` strip a comma that follows another comma (`[1,,]` → `[1,]` is
+still rejected by `std.json`: the earlier comma is itself trailing). Two conformance defects
+found and fixed (valid JSON5 refused): raw control characters inside strings were copied
+through unescaped, and `preprocess` treated a line terminator between an unquoted key and its
+`:` as the end of the key (see the two bullets above). Tests added for both fixes and for the
+7 survivors that were test gaps: an inner `"` in a single-quoted string, hex limbs that need
+their nine-digit zero padding, recovery that keeps every sibling key across strings, escapes,
+apostrophes and nesting (both entry points), and the 30-character cap on quoted fragments.
 
 ## Backlog / deferred
 

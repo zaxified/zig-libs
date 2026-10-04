@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Fix: raw control characters (U+0000..U+001F other than LF/CR, e.g. a TAB)
+  inside a `"…"` or `'…'` string are valid JSON5 (JSON5 §5) but were copied through unescaped,
+  so `std.json` refused the document; both entry points now emit `\t`/`\b`/`\f`/`\u00XX` (also
+  for `\` + such a character, a JSON5 NonEscapeCharacter). Inputs that were refused are now
+  accepted; output of every previously accepted input is unchanged.
+- **2026-10-04** — Fix: `preprocess` treated LF, CR, U+2028 or U+2029 between an unquoted key and
+  its `:` as the end of the key and replaced the member with an `$err_trace` diagnostic; JSON5 §6
+  makes them whitespace, as `preprocessAnnotated` already did. `{a\n: 1}` is now `{"a": 1}`.
+- **2026-10-04** — **Tests:** mutation run (52 schemata mutants, 51 killed, 1 equivalent). New
+  tests for both fixes, an inner `"` in a single-quoted string, zero-padded hex limbs
+  (`0x3B9ACA00`), error recovery keeping every sibling key across strings, escapes, apostrophes
+  and nested values on both entry points, and the 30-character diagnostic fragment cap.
+
 - **2026-09-30** — **JSON5 numeric literals, string line continuations and JSON5 whitespace**
   (survey items; scope raised from mvp to core). Both entry points now rewrite into plain JSON:
   hex `0x1A`/`-0xff`/`0X1a` → the exact decimal integer (any value up to

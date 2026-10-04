@@ -98,12 +98,11 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         i += 1 + lt;
                         continue;
                     }
-                    try out.append(alloc, sc);
-                    try out.append(alloc, input[i + 1]);
+                    try appendEscape(&out, alloc, input[i + 1]);
                     i += 2;
                     continue;
                 }
-                try out.append(alloc, sc);
+                try appendStringByte(&out, alloc, sc);
                 i += 1;
                 if (sc == '"') break;
             }
@@ -129,8 +128,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                     if (esc == '\'') {
                         try out.append(alloc, '\''); // \' → ' (unescape)
                     } else {
-                        try out.append(alloc, '\\');
-                        try out.append(alloc, esc);
+                        try appendEscape(&out, alloc, esc);
                     }
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\""); // escape " inside
@@ -138,7 +136,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                     try out.append(alloc, '"'); // the closing quote, only when the input has one
                     break;
                 } else {
-                    try out.append(alloc, sc);
+                    try appendStringByte(&out, alloc, sc);
                 }
             }
             // ⛔ The closing `"` used to be appended UNCONDITIONALLY here, so a
@@ -271,12 +269,13 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         if (!std.ascii.isAlphanumeric(kc) and kc != '_' and kc != '$') break;
                         i += 1;
                     }
-                    // Peek ahead past whitespace to find ':'. Only horizontal
-                    // whitespace here — a newline terminates the unquoted key
-                    // identifier in the simple preprocessor (annotated variant
-                    // handles newlines inside keys separately). JSON5-only
-                    // horizontal whitespace (NBSP, form feed, …) counts.
-                    const j = skipJson5Ws(input, i, false);
+                    // Peek ahead past whitespace to find ':'. ALL JSON5
+                    // whitespace, line terminators included (JSON5 §6:
+                    // WhiteSpace and LineTerminator may separate any two
+                    // tokens), as the annotated entry point does. This used to
+                    // skip horizontal space only, so the valid `{a\n: 1}`
+                    // went into error recovery (audit 2026-10-04).
+                    const j = skipJson5Ws(input, i);
                     if (j >= input.len or input[j] == ':') {
                         // Normal path: output quoted key
                         try out.append(alloc, '"');
@@ -674,22 +673,54 @@ fn lineTerminatorLen(input: []const u8, i: usize) usize {
     };
 }
 
-/// First index at or after `from` that is not whitespace: space and tab, the
-/// JSON5-only kinds, and — with `newlines` — CR/LF too. Without `newlines` the
-/// two JSON5 line terminators U+2028/U+2029 stop the skip as well.
-fn skipJson5Ws(input: []const u8, from: usize, comptime newlines: bool) usize {
+/// First index at or after `from` that is not JSON5 whitespace: space, tab,
+/// CR, LF, and the JSON5-only kinds (U+2028/U+2029 among them).
+fn skipJson5Ws(input: []const u8, from: usize) usize {
     var j = from;
     while (j < input.len) {
         const c = input[j];
-        if (c == ' ' or c == '\t' or (newlines and (c == '\n' or c == '\r'))) {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
             j += 1;
             continue;
         }
         const w = json5WsLen(input, j);
-        if (w == 0 or (!newlines and isLsPs(input, j))) break;
+        if (w == 0) break;
         j += w;
     }
     return j;
+}
+
+/// Append one content byte of a JSON5 string to the JSON output. A JSON5
+/// string may hold any source character except its own quote, `\` and a line
+/// terminator (JSON5 §5 Strings: `JSON5DoubleStringCharacter` /
+/// `JSON5SingleStringCharacter`), so a raw TAB or U+0001 is valid content;
+/// JSON requires every U+0000..U+001F to be escaped (RFC 8259 §7) and
+/// `std.json` refuses them raw. LF and CR pass through raw: inside a string
+/// they are not content but an unterminated string, which must stay a
+/// rejection (the callers' line-continuation and recovery logic handles them).
+fn appendStringByte(out: *std.ArrayList(u8), alloc: std.mem.Allocator, b: u8) !void {
+    if (b >= 0x20 or b == '\n' or b == '\r') return out.append(alloc, b);
+    switch (b) {
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        0x08 => try out.appendSlice(alloc, "\\b"),
+        0x0C => try out.appendSlice(alloc, "\\f"),
+        else => {
+            var buf: [6]u8 = undefined;
+            try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{b}) catch unreachable);
+        },
+    }
+}
+
+/// Append the escape `\` + `esc` (`esc` not a line terminator: the callers
+/// remove those as line continuations first). A control character after `\`
+/// is a JSON5 `NonEscapeCharacter`, i.e. the character itself (JSON5 §5,
+/// ECMAScript 5.1 §7.8.4), so it is emitted as `appendStringByte` would emit
+/// it raw -- `\` + TAB in JSON would be an invalid escape. Everything else is
+/// copied as the two bytes it was.
+fn appendEscape(out: *std.ArrayList(u8), alloc: std.mem.Allocator, esc: u8) !void {
+    if (esc < 0x20 and esc != '\n' and esc != '\r') return appendStringByte(out, alloc, esc);
+    try out.append(alloc, '\\');
+    try out.append(alloc, esc);
 }
 
 /// The `:` that terminates a malformed key, starting the search at `from`.
@@ -1038,12 +1069,14 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                         continue;
                     }
                 }
-                try out.append(alloc, sc);
                 i += 1;
                 if (sc == '\\' and i < input.len) {
-                    try out.append(alloc, input[i]);
+                    try appendEscape(&out, alloc, input[i]);
                     i += 1;
-                } else if (sc == '"') {
+                } else {
+                    try appendStringByte(&out, alloc, sc);
+                }
+                if (sc == '"') {
                     closed = true;
                     break;
                 }
@@ -1102,8 +1135,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     if (esc == '\'') {
                         try out.append(alloc, '\'');
                     } else {
-                        try out.append(alloc, '\\');
-                        try out.append(alloc, esc);
+                        try appendEscape(&out, alloc, esc);
                     }
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\"");
@@ -1112,7 +1144,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     try out.append(alloc, '"');
                     break;
                 } else {
-                    try out.append(alloc, sc);
+                    try appendStringByte(&out, alloc, sc);
                 }
             }
             if (!closed) {
@@ -1245,7 +1277,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     }
                     // Peek past ALL whitespace incl. \n/\r — catches keys
                     // split by a newline (`file_type_o\n  ut: ...`).
-                    const j = skipJson5Ws(input, i, true);
+                    const j = skipJson5Ws(input, i);
                     if (j >= input.len or input[j] == ':') {
                         try out.append(alloc, '"');
                         try out.appendSlice(alloc, input[key_start..i]);
@@ -1901,8 +1933,11 @@ test "corpus: every seed reaches both entry points, and the rewriting they do is
     try std.testing.expectEqual(preprocess_seeds.len, nonempty);
     // Measured 2026-09-07: with the collapsing draw every seed arrived empty —
     // 0 octets out, 0 documents rewritten, 0 diagnostics. After: 22 seeds,
-    // 646 octets, 18 rewritten, 4 carrying a diagnostic.
-    try std.testing.expectEqual(@as(usize, 646), octets);
+    // 646 octets, 18 rewritten, 4 carrying a diagnostic. 2026-10-04: 601 --
+    // `preprocess` now reads the seed `{a\n: 1, b: 2}` as the valid JSON5 it
+    // is, `{"a"\n: 1, "b": 2}` (18 octets), where it used to emit the 63-octet
+    // `{"$err_trace_1": "a: '1' --> malformed key at line 1", "b": 2}`.
+    try std.testing.expectEqual(@as(usize, 601), octets);
     try std.testing.expectEqual(@as(usize, 18), rewritten);
     try std.testing.expectEqual(@as(usize, 4), with_diagnostic);
 }
@@ -2152,6 +2187,119 @@ fn expectRewriteOpts(src: []const u8, options: Options, want: []const u8) !void 
 
 fn expectRewrite(src: []const u8, want: []const u8) !void {
     return expectRewriteOpts(src, .{}, want);
+}
+
+test "strings: raw control characters are valid JSON5 content and come out escaped" {
+    // JSON5 §5 Strings: a string character is any SourceCharacter except the
+    // quote, `\` and a LineTerminator, so TAB, U+0001, BS, FF and VT may sit
+    // in a string raw; JSON (RFC 8259 §7) requires all of U+0000..U+001F to
+    // be escaped. A `\` before such a character is a NonEscapeCharacter, the
+    // character itself (ECMAScript 5.1 §7.8.4). Before 2026-10-04 they were
+    // copied raw and `std.json` refused the document. Both entry points.
+    try expectRewrite("[\"a\tb\"]", "[\"a\\tb\"]");
+    try expectRewrite("['a\x01b']", "[\"a\\u0001b\"]");
+    try expectRewrite("[\"\x08\x0c\x0b\x1f\"]", "[\"\\b\\f\\u000b\\u001f\"]");
+    try expectRewrite("['a\\\tb']", "[\"a\\tb\"]");
+    try expectRewrite("{k: \"x\ty\"}", "{\"k\": \"x\\ty\"}");
+    // And the value is the character: what JSON5 means is what std.json reads.
+    const alloc = std.testing.allocator;
+    const out = try preprocess(alloc, "['a\tb', \"\x01\"]");
+    defer alloc.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\tb", parsed.value.array.items[0].string);
+    try std.testing.expectEqualStrings("\x01", parsed.value.array.items[1].string);
+    // A raw LF/CR is NOT content (it is a LineTerminator): still refused.
+    const lf = try preprocess(alloc, "[\"a\nb\"]");
+    defer alloc.free(lf);
+    try std.testing.expect(!jsonParses(alloc, lf));
+}
+
+test "unquoted key: a line terminator before ':' is whitespace" {
+    // JSON5 §6 (White Space): WhiteSpace and LineTerminator may appear
+    // between any two tokens, so `{a\n: 1}` is valid and means `{"a": 1}`.
+    // `preprocess` used to skip only horizontal space there and sent the key
+    // into $err_trace recovery; `preprocessAnnotated` already accepted it.
+    // LF, CRLF, U+2028 and U+2029, on both entry points.
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "{a\n: 1}", "{a\r\n: 1}", "{a\u{2028}: 1}", "{a \u{2029} : 1}" }) |src| {
+        const plain = try preprocess(alloc, src);
+        defer alloc.free(plain);
+        const ann = try preprocessAnnotated(alloc, src);
+        defer alloc.free(ann.out);
+        for ([_][]const u8{ plain, ann.out }) |out| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+            try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("a").?.integer);
+        }
+    }
+}
+
+// ── mutation run 2026-10-04: one test per mutant the suite let through ─────
+
+test "single-quoted string: an inner double quote is escaped" {
+    // JSON5 'a"b' is the three characters a, ", b; in JSON the quote needs
+    // `\"` (RFC 8259 §7). Mutation 2026-10-04: emitting it raw survived.
+    try expectRewrite("['a\"b']", "[\"a\\\"b\"]");
+}
+
+test "hex literal: a limb below 10^8 keeps its leading zeros" {
+    // 0x3B9ACA00 = 1_000_000_000 = 10^9: two base-10^9 limbs, the low one 0,
+    // which must print as nine zeros. 0x3B9ACA01 likewise ends in ...000000001.
+    // Mutation 2026-10-04: dropping the `{d:0>9}` padding survived.
+    try expectRewrite("[0x3B9ACA00]", "[1000000000]");
+    try expectRewrite("[0x3B9ACA01]", "[1000000001]");
+}
+
+/// Both entry points on `src`: the output must parse, and the top-level
+/// object must still hold every `want` key with its integer value -- error
+/// recovery may replace the malformed member, never its siblings.
+fn expectSiblingsSurvive(src: []const u8, want: []const struct { []const u8, i64 }) !void {
+    const alloc = std.testing.allocator;
+    const plain = try preprocess(alloc, src);
+    defer alloc.free(plain);
+    const ann = try preprocessAnnotated(alloc, src);
+    defer alloc.free(ann.out);
+    for ([_][]const u8{ plain, ann.out }) |out| {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch |err| {
+            std.debug.print("src: {s}\nout: {s}\n", .{ src, out });
+            return err;
+        };
+        defer parsed.deinit();
+        for (want) |kv| {
+            const v = parsed.value.object.get(kv[0]) orelse {
+                std.debug.print("src: {s}\nout: {s}\nmissing key {s}\n", .{ src, out, kv[0] });
+                return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqual(kv[1], v.integer);
+        }
+    }
+}
+
+test "error recovery: the value scan respects strings, escapes and nesting, so siblings survive" {
+    // `findKeyColon` doc: it "steps over string literals (honouring `\\`
+    // escapes)" and stops at `,`/`}`/`]`; `skipValue` doc: it tracks the
+    // quote that OPENED a string and the nesting depth, returning at the
+    // first delimiter of the enclosing level. Each case breaks one of those
+    // and would lose `c`. Mutation 2026-10-04: four such mutants survived
+    // (the F5 apostrophe case among them -- its fix had no test that looked
+    // at the keys after it).
+    try expectSiblingsSurvive("{a b \"x\\\"y:z\", c: 1}", &.{.{ "c", 1 }});
+    try expectSiblingsSurvive("{a b: \"don't\", c: 2, d: 3}", &.{ .{ "c", 2 }, .{ "d", 3 } });
+    try expectSiblingsSurvive("{a b: {p: 1, q: 2}, c: 3}", &.{.{ "c", 3 }});
+    try expectSiblingsSurvive("{x: {a b: 1}, c: 4}", &.{.{ "c", 4 }});
+}
+
+test "error recovery: a huge malformed key yields a capped message" {
+    // `message_fragment_max` (30) caps every raw fragment quoted in a
+    // diagnostic (W2 F10). Mutation 2026-10-04: an uncapped `trimForMessage`
+    // survived. 200 `k`s in, at most 30 of them in the message.
+    const alloc = std.testing.allocator;
+    const out = try preprocess(alloc, "{" ++ "k" ** 200 ++ " x: 1}");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "k" ** (message_fragment_max + 1)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "k" ** message_fragment_max) != null);
 }
 
 test "numeric literals: every JSON5 form becomes a plain JSON number" {
