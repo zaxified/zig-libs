@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED: RFC 9535 JSONPath (survey 2026-09-30 gap) and paths as column keys.
+  - Selectors: quoted names with RFC escapes, negative indices, slices (§2.3.4.2.2 algorithm),
+    unions (`[0, 'a', 1:3]`), `..*` / `..[sel]`; filters over array elements AND object member
+    values with `&&`, `||`, `!`, parentheses, existence tests, singular queries on both sides
+    (`@.a.b`, `@[0]`, `$.x`), `length()` / `count()` / `value()`. Checked against the RFC's own
+    example tables (§2.3.1–§2.5, Table 11). Not supported: `match()` / `search()`.
+  - `JsonCol.key` (and `ShapeSpec.x`/`y`): a key with `.` or `[` that is not a field of the item
+    is a path from it (`meta.ts`, `tags[-1]`; `$…` from the root). An existing field of that
+    exact name still wins, so v1 keys are unchanged.
+  - BEHAVIOUR (filters, RFC semantics): an absent member is Nothing, so `@.x != v` now HOLDS
+    where `x` is missing (it used to fail every comparison), and a cross-type `!=`
+    (`@.n != "a"` on a number) holds; `[?…]` now also filters an object's member values; an index
+    or number literal with a leading zero, a sign other than `-`, or beyond ±(2^53 − 1) is not
+    well-formed (selects nothing). No wgs config uses a filter (checked).
+  - Mutation 2026-10-04: 42 mutants, 39 killed, 2 equivalent (reasoned in SPEC), 1 removed with
+    the dead guard it pointed at; 2 tests added.
+
 - **2026-09-17** — Docs only, no behaviour change: corrected the SCOPE claimed
   for `MAX_MATCHES`. It bounds the RESULT, not the traversal. The counter
   advances only where a match is recorded, so a path whose final name never

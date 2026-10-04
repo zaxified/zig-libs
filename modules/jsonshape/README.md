@@ -26,16 +26,21 @@ Given raw JSON bytes and a `ShapeSpec`:
    - **Legacy dot-path** (no `[`, `*`, `?`, `..`, no leading `$`): a
      dot-separated chain of object-key lookups to one node, which must be
      an array (e.g. `"data.prices"`) — unchanged since v1.
-   - **JSONPath subset** (anything else): object keys, array **indices**
-     (`a.b[2]`), **wildcards** (`a.b[*]` over an array, `a.*` over an
-     object's values), **recursive descent** (`..name`, finds every `name`
-     field under the current node **down to a fixed depth of 64** — deeper
-     matches are silently absent, and the same budget is shared with the
-     path's own segments, so a path of 65+ segments finds nothing), and
-     **filter expressions**
-     (`items[?(@.field == "x")]`, `items[?(@.n > 5)]` — one comparison,
-     ops `== != < <= > >=`, literal a quoted string/number/`true`/`false`/
-     `null`; no `&&`/`||`, no nesting). Any of these can match multiple
+   - **JSONPath** (anything else) — RFC 9535's selectors and semantics:
+     names (`a.b`, `['a b']`, `["k.k"]`, with RFC escapes), **indices**
+     (`[2]`, `[-1]` from the end), **slices** (`[1:5:2]`, `[::-1]`, the RFC's
+     normative algorithm), **wildcards** (`[*]`, `.*`), **unions**
+     (`[0, 'a', 1:3]`), **descendants** (`..name`, `..*`, `..[0]` — every
+     level **down to a fixed depth of 64**; deeper matches are absent, and the
+     same budget is shared with the path's own segments), and **filters**
+     over array elements and object member values: comparisons
+     `== != < <= > >=` between literals, singular queries (`@.a.b`, `@[0]`,
+     `$.x`) and the functions `length()`, `count()`, `value()`; existence
+     tests (`?@.b`, `?@[?@.x]`); `&&`, `||`, `!`, parentheses. Comparison
+     follows RFC 9535 §2.3.5.2.2: an absent member is *Nothing*, which equals
+     only Nothing — so `@.x != 5` holds where `x` is missing. Not supported:
+     `match()`/`search()` (they need an I-Regexp engine). A path that is not
+     well-formed or well-typed selects nothing. Any of these can match multiple
      nodes (a wildcard, a recursive-descent hit in several places, several
      array nodes under a wildcard); each match becomes item(s): an
      `.array` match is flattened (its elements become items — this is how
@@ -45,7 +50,10 @@ Given raw JSON bytes and a `ShapeSpec`:
    - **generic columns** (`spec.columns` non-empty): one column per
      `JsonCol{name, key, type}` — `key` names the field inside each item
      (object key); empty `key` means "the whole item" (useful for
-     array-of-scalars).
+     array-of-scalars). A key with `.` or `[` that is not itself a field of
+     the item is a **path from the item** (`meta.ts`, `tags[-1]`,
+     `prices[?@.cur == 'EUR'].v`; `$…` reads from the document root); the
+     cell is the first node it selects. The `[x,y]` keys take paths too.
    - **`[x,y]` default** (`spec.columns` empty, poc-compatible shorthand):
      two columns, `x` (text) and `y` (float), taken from `spec.x`/`spec.y`
      object keys, or positionally from `item[0]`/`item[1]` when items are
@@ -116,14 +124,11 @@ zig fmt --check modules/jsonshape
 
 ## Deferred (backlog, not implemented here)
 
-Full JSONPath and filter expressions are now supported (see above); the
+RFC 9535 JSONPath is supported except `match()`/`search()` (see above); the
 following remain out of scope — see `SPEC.md` Backlog for the full
 rationale, especially why streaming is a deliberate non-goal rather than
 an oversight:
 
-- **Nested-object flattening** — a dotted column key like `meta.ts` to pull
-  a value out of a nested object per-row is not supported; `JsonCol.key`
-  is a single top-level field name inside each item, not its own path.
 - **Streaming / bounded-memory parse** — the whole document is parsed with
   `parseFromSliceLeaky` up front. Deliberately deferred, not just
   unscheduled: the JSONPath-subset engine (wildcards, recursive descent,
@@ -142,7 +147,6 @@ an oversight:
 - **A `strict` mode** — currently a wrong path and a genuinely-empty
   array/no-matches are indistinguishable (both give zero rows); a mode
   that reports which case occurred would need a richer return type.
-- **Full JSONPath (RFC 9535) compliance** — the filter grammar is
-  one-level only (no `&&`/`||`, no nested filters, no field-vs-field
-  comparison); no slice syntax (`[1:3]`), no multi-index/name union
-  (`['a','b']`, `[0,2]`), no script/function expressions.
+- **`match()` / `search()`** — RFC 9535's regex functions need an I-Regexp
+  (RFC 9485) engine; none exists in this collection yet, and a backtracking
+  one would be a DoS surface on operator-written paths over hostile data.
