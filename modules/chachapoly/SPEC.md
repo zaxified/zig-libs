@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 8439 ChaCha20-Poly1305 as shipped by OpenSSL 4.0 and Go `x/crypto/chacha20poly1305`; no XChaCha20 (which `std`, libsodium, Go and RustCrypto all have) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation ?
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -364,6 +364,50 @@ change to the delegation thresholds or the MAC is therefore live on those
 paths, not staged behind a rewiring step.
 - **XChaCha20-Poly1305 (24-byte nonce, HChaCha20)** *(survey 2026-09-30)*: `std`, libsodium, Go `NewX` and RustCrypto all provide it; it is the usual choice when nonces are random (age-style files, secretbox-alikes, cloud KMS envelopes). Consumers here do not need it today (existing bullet above), but a user rewiring from `std` loses it. Effort: small (HChaCha20 over the existing block function plus the delegation thresholds). Fits §2.
 - **Wycheproof `chacha20_poly1305_test` vectors** *(survey 2026-09-30)*: evidence is RFC 8439 plus a `std` differential; Wycheproof adds tamper, zero-length and nonce-edge cases from a third party. Effort: small (test data only). Fits §2.
+
+### Mutation run 2026-10-04
+
+Mutant schemata over a copy (one ReleaseSafe build with the target's AVX2, so the
+shipped `lanes = 4` plus the tests' L ∈ {1,2,4,8}; `setsid -w timeout -s KILL 20`
+per mutant): **54 mutants, 44 killed, 8 equivalent, 2 not observable in-process**.
+Points: the anti-wrap predicate and both of its call sites, group/tail loop bounds
+and counter steps in `xor`/`stream`, key/nonce word order, the per-lane `iota`, the
+feed-forward, a rotation, the transpose byte order, both AEAD thresholds, every
+zeroing on rejection, the tag comparison, the poly-key and payload counters,
+`pad16`, the length block; in `poly1305.zig` the fast path, the partial-block
+top-up, the wide entry condition, the accumulator seed lane, the group loop, the
+lane fold, `mulRed`'s wrap, final carry and a schoolbook row, `loadBlocks`' 2^128
+bit and a shift, `carryLimbs`' wrap, `normalize`, `importAcc`/`exportAcc`'s top
+limb, the r split, the fold power order, and the power-table wipe in `final`.
+
+First pass: 15 survivors. Five were test gaps, now closed by three tests in
+`poly1305.zig`:
+
+- `final` dropping any of its four power-table wipes (or the whole block) stayed
+  green — r^L, 5·r^L and both fold vectors are key-derived and outside std's own
+  wipe. Test: "final wipes the key-derived power table it built".
+- A partial-block top-up that over-filled (`leftover != 0` afterwards) kept every
+  later bulk on the serial core, bytes unchanged. Test: "a partial block topped up
+  by update still reaches the wide engine" (witness after a 1/5/15-byte head).
+- `normalize` reduced to one carry pass stayed green, because the shipped export
+  path runs three passes where two suffice. Test: "exportAcc drains a limb the
+  first carry pass leaves at exactly 2^26" — expected value derived by hand from
+  2^130 ≡ 5 (mod 2^130 − 5).
+
+Equivalent (reason): the whole-group loop `<=` → `<` (an exact group then goes
+through the staged tail, same bytes, same witness); `xorTail`'s 32-byte chunk
+bound (the bytewise remainder covers it); zeroing `computed_tag` on rejection (a
+stack local, defence in depth, unobservable); `update`'s fast-path pre-check and
+the wide entry's `leftover == 0` (both implied by the later checks); the lane-fold
+`carryLimbs` before `exportAcc` (lane sums stay < 2^30, and `exportAcc`
+normalises anyway); the power table left un-normalised (limb 1 < 2^26 + 2^9 keeps
+5·limb inside `mulRed`'s 2^28.33 bound, and checked arithmetic would have
+panicked otherwise); rebuilding the powers on every `wide` call (performance only).
+
+Not observable in-process: dropping the counter-wrap `@panic` in `xor` or `stream`.
+A test binary cannot survive a panic it provokes; the predicate
+`counterWouldWrap` is pinned at nine points, and the two call sites are one line
+each.
 
 ## Anchoring
 

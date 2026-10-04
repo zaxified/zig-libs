@@ -919,6 +919,78 @@ test "wide_min_groups routes each length to the engine it was measured for" {
     }
 }
 
+test "a partial block topped up by update still reaches the wide engine" {
+    // `update` first fills a pending partial block through std, then hands the
+    // rest to the vector engine if it is still long enough. The routing test
+    // above only ever starts on a block boundary (`create`), so a top-up that
+    // over-filled — leaving `leftover != 0` — kept every later bulk on the
+    // serial core with every byte still equal (mutation run 2026-10-04,
+    // survivor). Here the bulk after a 1/5/15-byte head is far past
+    // `wide_min_bytes` at every width, so it must run wide.
+    const key = [_]u8{0x3D} ** 32;
+    var msg: [1024]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 131);
+    inline for (.{ 2, 4, 8 }) |L| {
+        for ([_]usize{ 1, 5, 15 }) |head| {
+            var st = Generic(L).init(&key);
+            st.update(msg[0..head]);
+            mac_path = .serial_std;
+            st.update(msg[head..]);
+            testing.expectEqual(Path.wide, mac_path) catch |e| {
+                std.debug.print("L={d}: bulk after a {d}-byte head stayed serial\n", .{ L, head });
+                return e;
+            };
+            var tag: [16]u8 = undefined;
+            st.final(&tag);
+            var ref: [16]u8 = undefined;
+            StdPoly.create(&ref, &msg, &key);
+            try testing.expectEqualSlices(u8, &ref, &tag);
+        }
+    }
+}
+
+test "final wipes the key-derived power table it built" {
+    // std's `final` wipes only `inner`. The r^1..r^L table — r^L, 5·r^L and
+    // both lane-fold vectors — lives outside it and is as secret as the key,
+    // and `final`'s own comment promises it is cleared. Nothing asserted that:
+    // dropping any one of the four wipes, or all of them, stayed green
+    // (mutation run 2026-10-04). 512 bytes reaches the wide path at every
+    // width, so the table is built before `final` runs.
+    const key = [_]u8{0xA7} ** 32;
+    var msg: [512]u8 = undefined;
+    @memset(&msg, 0x5C);
+    inline for (.{ 2, 4, 8 }) |L| {
+        var st = Generic(L).init(&key);
+        st.update(&msg);
+        try testing.expect(st.powers_ready);
+        var tag: [16]u8 = undefined;
+        st.final(&tag);
+        try testing.expect(!st.powers_ready);
+        for (st.rl) |w| try testing.expectEqual(@as(u32, 0), w);
+        for (st.sl) |w| try testing.expectEqual(@as(u32, 0), w);
+        for (mem.asBytes(&st.rp)) |b| try testing.expectEqual(@as(u8, 0), b);
+        for (mem.asBytes(&st.sp)) |b| try testing.expectEqual(@as(u8, 0), b);
+    }
+}
+
+test "exportAcc drains a limb the first carry pass leaves at exactly 2^26" {
+    // `exportAcc` promises to normalise its input fully before packing, and the
+    // packing ORs `f[1] << 26` next to `f[2] << 52` — so an undrained limb 1
+    // overlaps limb 2's low bit and silently loses 2^52. One carry pass can
+    // leave limb 1 at 2^26 (the top limb's `5·c` wrap re-carries into it); the
+    // second pass is what drains it. In the shipped pipeline the input already
+    // went through `carryLimbs`, so dropping that second pass stayed green
+    // (mutation run 2026-10-04) — this pins the function's own contract instead
+    // of the redundancy around it.
+    //
+    // Limbs x0 = x1 = 2^26 − 1, x2 = 1, x3 = 0, x4 = 2^26. Modulo
+    // p = 2^130 − 5, x4·2^104 = 2^130 ≡ 5, so
+    //   x ≡ (2^26 − 1) + (2^26 − 1)·2^26 + 1·2^52 + 5 = 2^53 + 4,
+    // which is `h = { 2^53 + 4, 0, 0 }` in std's `[3]u64` accumulator.
+    const h = Generic(4).exportAcc(.{ limb_mask, limb_mask, 1, 0, 1 << 26 });
+    try testing.expectEqual([3]u64{ (1 << 53) + 4, 0, 0 }, h);
+}
+
 test "selected lane count matches the target's features" {
     // Documents (and pins) the comptime selection: no runtime dispatch.
     if (builtin.cpu.has(.x86, .avx512f)) {

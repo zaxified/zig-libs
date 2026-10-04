@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first dated mutation run (54 mutants, 44 killed, 8 equivalent,
+  2 not observable in-process; `SPEC.md` § "Mutation run 2026-10-04"). Three new tests in
+  `poly1305.zig` close the five test gaps it found: `final` must wipe the key-derived
+  power table, a bulk `update` after a partial-block top-up must reach the wide engine,
+  and `exportAcc` must drain a limb its first carry pass leaves at 2^26. No source change.
 - **2026-09-08** — The three `Debug` rows are gone from the constant-time table in
   `SPEC.md` and from `scripts/checks/ctgrind-expected.tsv`. They were a second copy of the
   `ReleaseSafe` positive control (281 in-file contexts against its 210, the same checked
