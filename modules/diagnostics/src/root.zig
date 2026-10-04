@@ -64,6 +64,49 @@ pub const Diagnostic = struct {
     /// Optional suggestion ("did you mean 'COALESCE'?"). Owned by the same
     /// allocator as the rest of the strings.
     suggest: ?[]const u8 = null,
+    /// Secondary spans, each with its own message — "first defined here"
+    /// next to a duplicate key (codespan's secondary labels, LSP's
+    /// `relatedInformation`). The diagnostic's own position is the primary
+    /// span.
+    labels: ?[]const Label = null,
+    /// Extra `note:` / `help:` lines beyond `suggest` (rustc's notes).
+    notes: ?[]const Note = null,
+    /// Where the `code` is documented (miette's code URL, LSP's
+    /// `codeDescription.href`).
+    code_url: ?[]const u8 = null,
+    /// A machine-applicable edit (LSP quick-fix `TextEdit`).
+    fix: ?Fix = null,
+};
+
+/// A secondary span. Positions as in `Diagnostic` (1-based, `col` in bytes,
+/// the end exclusive).
+pub const Label = struct {
+    /// Null means the diagnostic's own `file`.
+    file: ?[]const u8 = null,
+    line: u32,
+    col: ?u32 = null,
+    end_line: ?u32 = null,
+    end_col: ?u32 = null,
+    message: []const u8 = "",
+};
+
+pub const NoteKind = enum { note, help };
+
+pub const Note = struct {
+    kind: NoteKind = .note,
+    message: []const u8,
+};
+
+/// Replace the span [`line`:`col`, `end_line`:`end_col`) with `replacement`
+/// (an empty span inserts). `end_*` default to the start.
+pub const Fix = struct {
+    /// Null means the diagnostic's own `file`.
+    file: ?[]const u8 = null,
+    line: u32,
+    col: u32,
+    end_line: ?u32 = null,
+    end_col: ?u32 = null,
+    replacement: []const u8,
 };
 
 /// Owned collector. All strings referenced by appended `Diagnostic`s are
@@ -164,7 +207,55 @@ pub const Source = struct {
 pub const RenderOptions = struct {
     style: RenderStyle = .short,
     sources: []const Source = &.{},
+    /// ANSI colour (severity in red/yellow/cyan, locations and secondary
+    /// carets in blue). Off by default; the caller decides from isatty and
+    /// NO_COLOR. Only this module's own escape sequences are coloured — text
+    /// from findings is escaped exactly as without colour.
+    color: bool = false,
 };
+
+const Sgr = struct {
+    on: bool,
+    fn sev(self: Sgr, s: Severity) []const u8 {
+        if (!self.on) return "";
+        return switch (s) {
+            .@"error" => "\x1b[1;31m",
+            .warning => "\x1b[1;33m",
+            .info => "\x1b[1;36m",
+        };
+    }
+    fn blue(self: Sgr) []const u8 {
+        return if (self.on) "\x1b[1;34m" else "";
+    }
+    fn bold(self: Sgr) []const u8 {
+        return if (self.on) "\x1b[1m" else "";
+    }
+    fn reset(self: Sgr) []const u8 {
+        return if (self.on) "\x1b[0m" else "";
+    }
+};
+
+/// A span to quote: the primary one or a label.
+const Span = struct {
+    file: ?[]const u8,
+    line: ?u32,
+    col: ?u32,
+    end_line: ?u32,
+    end_col: ?u32,
+};
+
+fn primarySpan(d: Diagnostic) Span {
+    return .{ .file = d.file, .line = d.line, .col = d.col, .end_line = d.end_line, .end_col = d.end_col };
+}
+
+fn labelSpan(d: Diagnostic, l: Label) Span {
+    return .{ .file = l.file orelse d.file, .line = l.line, .col = l.col, .end_line = l.end_line, .end_col = l.end_col };
+}
+
+fn digits(n: u32) usize {
+    var buf: [10]u8 = undefined;
+    return (std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable).len;
+}
 
 /// Write one finding as text. `line`/`col` are 1-based, `col` counted in
 /// bytes; `end_line`/`end_col`, when present, end the span exclusively (as
@@ -176,10 +267,11 @@ pub const RenderOptions = struct {
 /// Carets line up under the span for tabs and multi-byte UTF-8 (one column
 /// per code point); double-width characters are not accounted for.
 pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.Writer.Error!void {
+    const c: Sgr = .{ .on = opts.color };
     switch (opts.style) {
         .short => {
-            if (try writeLocation(w, d)) try w.writeAll(": ");
-            try writeHeader(w, d);
+            if (try writeLocation(w, primarySpan(d))) try w.writeAll(": ");
+            try writeHeader(w, d, c);
             if (d.path.len > 0) {
                 try w.writeAll(" (at ");
                 try writeEscaped(w, d.path);
@@ -189,65 +281,144 @@ pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.W
                 try w.writeAll("; ");
                 try writeEscaped(w, s);
             }
+            if (d.labels) |labels| for (labels) |l| {
+                try w.writeAll("; ");
+                if (try writeLocation(w, labelSpan(d, l))) try w.writeAll(": ");
+                try writeEscaped(w, l.message);
+            };
+            if (d.notes) |notes| for (notes) |n| {
+                try w.print("; {s}: ", .{@tagName(n.kind)});
+                try writeEscaped(w, n.message);
+            };
+            if (d.fix) |f| {
+                try w.writeAll("; fix: ");
+                try writeFix(w, d, f);
+            }
+            if (d.code_url) |u| {
+                try w.writeAll("; see ");
+                try writeEscaped(w, u);
+            }
             try w.writeByte('\n');
         },
         .snippet => {
-            try writeHeader(w, d);
+            try writeHeader(w, d, c);
             try w.writeByte('\n');
-            const quoted = sourceLine(d, opts.sources);
-            var gutter_buf: [10]u8 = undefined;
-            const gutter = if (quoted != null)
-                std.fmt.bufPrint(&gutter_buf, "{d}", .{d.line.?}) catch unreachable
-            else
-                "";
-            if (d.file != null or d.line != null) {
-                try w.splatByteAll(' ', gutter.len);
-                try w.writeAll("--> ");
-                _ = try writeLocation(w, d);
+            // One gutter width for every quoted line, so the bars align.
+            const primary = primarySpan(d);
+            var width: usize = 0;
+            if (sourceLine(primary, opts.sources) != null) width = digits(primary.line.?);
+            if (d.labels) |labels| for (labels) |l| {
+                if (sourceLine(labelSpan(d, l), opts.sources) != null) width = @max(width, digits(l.line));
+            };
+            try writeSpanBlock(w, primary, "-->", '^', c.sev(d.severity), "", width, opts.sources, c);
+            if (d.labels) |labels| for (labels) |l| {
+                try writeSpanBlock(w, labelSpan(d, l), ":::", '-', c.blue(), l.message, width, opts.sources, c);
+            };
+            if (d.path.len > 0) try writeNote(w, width, c, "at", d.path);
+            if (d.notes) |notes| for (notes) |n| try writeNote(w, width, c, @tagName(n.kind), n.message);
+            if (d.suggest) |s| try writeNote(w, width, c, "help", s);
+            if (d.fix) |f| {
+                try w.splatByteAll(' ', width);
+                try w.print(" {s}={s} {s}fix{s}: ", .{ c.blue(), c.reset(), c.bold(), c.reset() });
+                try writeFix(w, d, f);
                 try w.writeByte('\n');
             }
-            if (quoted) |text| {
-                try w.splatByteAll(' ', gutter.len);
-                try w.writeAll(" |\n");
-                try w.print("{s} | ", .{gutter});
-                try writeSourceLine(w, text);
-                try w.writeByte('\n');
-                try w.splatByteAll(' ', gutter.len);
-                try w.writeAll(" | ");
-                try writeCarets(w, d, text);
-                try w.writeByte('\n');
-            }
-            if (d.path.len > 0) {
-                try w.splatByteAll(' ', gutter.len);
-                try w.writeAll(" = at: ");
-                try writeEscaped(w, d.path);
-                try w.writeByte('\n');
-            }
-            if (d.suggest) |s| {
-                try w.splatByteAll(' ', gutter.len);
-                try w.writeAll(" = help: ");
-                try writeEscaped(w, s);
-                try w.writeByte('\n');
-            }
+            if (d.code_url) |u| try writeNote(w, width, c, "see", u);
         },
     }
 }
 
+fn writeNote(w: *std.Io.Writer, width: usize, c: Sgr, kind: []const u8, text: []const u8) std.Io.Writer.Error!void {
+    try w.splatByteAll(' ', width);
+    try w.print(" {s}={s} {s}{s}{s}: ", .{ c.blue(), c.reset(), c.bold(), kind, c.reset() });
+    try writeEscaped(w, text);
+    try w.writeByte('\n');
+}
+
+/// `replace 3:5..3:9 with "x"` / `insert "x" at 3:5` (positions in the
+/// diagnostic's file unless the fix names another).
+fn writeFix(w: *std.Io.Writer, d: Diagnostic, f: Fix) std.Io.Writer.Error!void {
+    const el = f.end_line orelse f.line;
+    const ec = f.end_col orelse f.col;
+    const empty = el == f.line and ec == f.col;
+    if (empty) {
+        try w.writeAll("insert \"");
+        try writeEscaped(w, f.replacement);
+        try w.writeAll("\" at ");
+    } else try w.writeAll("replace ");
+    if (f.file orelse d.file) |file| {
+        try writeEscaped(w, file);
+        try w.writeByte(':');
+    }
+    try w.print("{d}:{d}", .{ f.line, f.col });
+    if (!empty) {
+        try w.print("..{d}:{d} with \"", .{ el, ec });
+        try writeEscaped(w, f.replacement);
+        try w.writeByte('"');
+    }
+}
+
+/// `--> location` (or `::: location` for a label), then the quoted line with
+/// `mark` characters under the span and the label message after them. A span
+/// with no quotable source line is just the location line (plus message).
+fn writeSpanBlock(
+    w: *std.Io.Writer,
+    span: Span,
+    arrow: []const u8,
+    mark: u8,
+    mark_color: []const u8,
+    message: []const u8,
+    width: usize,
+    sources: []const Source,
+    c: Sgr,
+) std.Io.Writer.Error!void {
+    if (span.file == null and span.line == null) return;
+    const quoted = sourceLine(span, sources);
+    try w.splatByteAll(' ', width);
+    try w.print("{s}{s}{s} ", .{ c.blue(), arrow, c.reset() });
+    _ = try writeLocation(w, span);
+    if (quoted == null and message.len > 0) {
+        try w.writeAll(": ");
+        try writeEscaped(w, message);
+    }
+    try w.writeByte('\n');
+    const text = quoted orelse return;
+    try w.splatByteAll(' ', width);
+    try w.print(" {s}|{s}\n", .{ c.blue(), c.reset() });
+    try w.print("{s}", .{c.blue()});
+    try w.splatByteAll(' ', width - digits(span.line.?));
+    try w.print("{d} |{s} ", .{ span.line.?, c.reset() });
+    try writeSourceLine(w, text);
+    try w.writeByte('\n');
+    try w.splatByteAll(' ', width);
+    try w.print(" {s}|{s} ", .{ c.blue(), c.reset() });
+    try writeCarets(w, span, text, mark, mark_color, c.reset());
+    if (message.len > 0) {
+        try w.writeByte(' ');
+        try writeEscaped(w, message);
+    }
+    try w.writeByte('\n');
+}
+
 /// `severity[code]: message`.
-fn writeHeader(w: *std.Io.Writer, d: Diagnostic) std.Io.Writer.Error!void {
+fn writeHeader(w: *std.Io.Writer, d: Diagnostic, c: Sgr) std.Io.Writer.Error!void {
+    try w.writeAll(c.sev(d.severity));
     try w.writeAll(@tagName(d.severity));
     if (d.code.len > 0) {
         try w.writeByte('[');
         try writeEscaped(w, d.code);
         try w.writeByte(']');
     }
+    try w.writeAll(c.reset());
+    try w.writeAll(c.bold());
     try w.writeAll(": ");
     try writeEscaped(w, d.message);
+    try w.writeAll(c.reset());
 }
 
 /// `file:line:col`, as much of it as is known. Returns whether anything was
 /// written.
-fn writeLocation(w: *std.Io.Writer, d: Diagnostic) std.Io.Writer.Error!bool {
+fn writeLocation(w: *std.Io.Writer, d: Span) std.Io.Writer.Error!bool {
     var any = false;
     if (d.file) |f| {
         try writeEscaped(w, f);
@@ -294,7 +465,7 @@ fn writeSourceLine(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void
 
 /// The text of line `d.line` (without its line break) from the matching
 /// source, or null when there is nothing to quote.
-fn sourceLine(d: Diagnostic, sources: []const Source) ?[]const u8 {
+fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
     const line = d.line orelse return null;
     if (line == 0) return null;
     const src = blk: {
@@ -323,7 +494,7 @@ fn columns(bytes: []const u8) usize {
     return n;
 }
 
-fn writeCarets(w: *std.Io.Writer, d: Diagnostic, text: []const u8) std.Io.Writer.Error!void {
+fn writeCarets(w: *std.Io.Writer, d: Span, text: []const u8, mark: u8, on: []const u8, off: []const u8) std.Io.Writer.Error!void {
     const col: usize = @min(@as(usize, d.col orelse 1) -| 1, text.len);
     // Indent with the line's own bytes -- a tab where it had one, a space for
     // every other column -- so the caret sits under the span on any tab width.
@@ -342,7 +513,9 @@ fn writeCarets(w: *std.Io.Writer, d: Diagnostic, text: []const u8) std.Io.Writer
         break :blk @min(@as(usize, ec) -| 1, text.len);
     };
     const n = if (end > col) columns(text[col..@min(end, text.len)]) else 0;
-    try w.splatByteAll('^', @max(n, 1));
+    try w.writeAll(on);
+    try w.splatByteAll(mark, @max(n, 1));
+    try w.writeAll(off);
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
@@ -620,4 +793,198 @@ test "Diagnostics.render renders every finding in order" {
     var w: std.Io.Writer = .fixed(&buf);
     try diag.render(&w, .{});
     try testing.expectEqualStrings("2: info: b\n1: info: a\n", w.buffered());
+}
+
+// ── labels, notes, fix-its, code URL, colour (2026-10-04) ───────────────────
+
+fn renderAlloc(d: Diagnostic, opts: RenderOptions) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try renderOne(&out.writer, d, opts);
+    return out.toOwnedSlice();
+}
+
+const dup_src =
+    \\{
+    \\  a: 1,
+    \\  b: 2,
+    \\  a: 3,
+    \\}
+;
+
+const dup: Diagnostic = .{
+    .path = "a",
+    .file = "c.json5",
+    .line = 4,
+    .col = 3,
+    .end_line = 4,
+    .end_col = 4,
+    .severity = .@"error",
+    .code = "json5.duplicate_key",
+    .message = "duplicate key 'a'",
+    .labels = &.{.{ .line = 2, .col = 3, .end_line = 2, .end_col = 4, .message = "first defined here" }},
+    .notes = &.{.{ .message = "the later value would silently win" }},
+    .fix = .{ .line = 4, .col = 3, .end_line = 4, .end_col = 4, .replacement = "c" },
+    .code_url = "https://example.invalid/json5/duplicate_key",
+    .suggest = "rename one of them",
+};
+
+test "snippet: a secondary label is quoted under ::: with '-' marks, then notes, help, fix, see" {
+    // Layout derived by hand: both quoted lines are 1 digit, so the gutter is
+    // one column; the primary span 4:3..4:4 is one '^' under 'a' (two spaces
+    // in), the label 2:3..2:4 one '-' under the first 'a'.
+    const got = try renderAlloc(dup, .{ .style = .snippet, .sources = &.{.{ .file = "c.json5", .text = dup_src }} });
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        \\error[json5.duplicate_key]: duplicate key 'a'
+        \\ --> c.json5:4:3
+        \\  |
+        \\4 |   a: 3,
+        \\  |   ^
+        \\ ::: c.json5:2:3
+        \\  |
+        \\2 |   a: 1,
+        \\  |   - first defined here
+        \\  = at: a
+        \\  = note: the later value would silently win
+        \\  = help: rename one of them
+        \\  = fix: replace c.json5:4:3..4:4 with "c"
+        \\  = see: https://example.invalid/json5/duplicate_key
+        \\
+    , got);
+}
+
+test "short: labels, notes, fix and URL stay on the one line" {
+    const got = try renderAlloc(dup, .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        "c.json5:4:3: error[json5.duplicate_key]: duplicate key 'a' (at a); rename one of them; " ++
+            "c.json5:2:3: first defined here; note: the later value would silently win; " ++
+            "fix: replace c.json5:4:3..4:4 with \"c\"; see https://example.invalid/json5/duplicate_key\n",
+        got,
+    );
+}
+
+test "snippet: gutter widens to the longest quoted line number; unquotable label is a location line" {
+    // Line 10 needs two gutter columns, so line 2's number is padded.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (1..11) |i| try text.print(testing.allocator, "line{d}\n", .{i});
+    const d: Diagnostic = .{
+        .path = "",
+        .file = "f",
+        .line = 2,
+        .col = 1,
+        .severity = .warning,
+        .code = "x",
+        .message = "m",
+        .labels = &.{
+            // `end_col` counts only with `end_line` (as for the primary span).
+            .{ .line = 10, .col = 1, .end_line = 10, .end_col = 7, .message = "here" },
+            .{ .file = "other", .line = 1, .message = "elsewhere" }, // no source text
+        },
+    };
+    const got = try renderAlloc(d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = text.items }} });
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        \\warning[x]: m
+        \\  --> f:2:1
+        \\   |
+        \\ 2 | line2
+        \\   | ^
+        \\  ::: f:10:1
+        \\   |
+        \\10 | line10
+        \\   | ------ here
+        \\  ::: other:1: elsewhere
+        \\
+    , got);
+}
+
+test "fix: an empty span is an insertion; label and fix text is escaped" {
+    const d: Diagnostic = .{
+        .path = "",
+        .line = 1,
+        .col = 5,
+        .severity = .info,
+        .code = "",
+        .message = "m",
+        .labels = &.{.{ .line = 1, .message = "bad\x1b[31m" }},
+        .fix = .{ .line = 1, .col = 5, .replacement = "\n;" },
+    };
+    const got = try renderAlloc(d, .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("1:5: info: m; 1: bad\\x1b[31m; fix: insert \"\\n;\" at 1:5\n", got);
+}
+
+test "colour: SGR only around our own parts, finding text still escaped; off is byte-identical" {
+    const src = [_]Source{.{ .file = "c.json5", .text = dup_src }};
+    const plain = try renderAlloc(dup, .{ .style = .snippet, .sources = &src });
+    defer testing.allocator.free(plain);
+    const col = try renderAlloc(dup, .{ .style = .snippet, .sources = &src, .color = true });
+    defer testing.allocator.free(col);
+    // Stripping every SGR sequence from the coloured output gives the plain one.
+    var stripped: std.ArrayList(u8) = .empty;
+    defer stripped.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < col.len) {
+        if (col[i] == 0x1b) {
+            i = std.mem.indexOfScalarPos(u8, col, i, 'm').? + 1;
+            continue;
+        }
+        try stripped.append(testing.allocator, col[i]);
+        i += 1;
+    }
+    try testing.expectEqualStrings(plain, stripped.items);
+    try testing.expect(std.mem.startsWith(u8, col, "\x1b[1;31merror[json5.duplicate_key]\x1b[0m"));
+    try testing.expect(std.mem.indexOf(u8, col, "\x1b[1;34m-\x1b[0m first defined here") != null);
+    // A finding carrying an escape sequence still cannot emit one.
+    var hostile = dup;
+    hostile.message = "\x1b[2J";
+    const h = try renderAlloc(hostile, .{ .color = true });
+    defer testing.allocator.free(h);
+    try testing.expect(std.mem.indexOf(u8, h, "\x1b[2J") == null);
+    try testing.expect(std.mem.indexOf(u8, h, "\\x1b[2J") != null);
+}
+
+test "JSON: new fields appear when set and are omitted when not" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeJsonSlice(&out.writer, &.{ dup, .{ .path = "p", .severity = .info, .code = "c", .message = "m" } });
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const first = parsed.value.array.items[0].object;
+    const lab = first.get("labels").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 2), lab.get("line").?.integer);
+    try testing.expectEqualStrings("first defined here", lab.get("message").?.string);
+    try testing.expectEqualStrings("note", first.get("notes").?.array.items[0].object.get("kind").?.string);
+    try testing.expectEqualStrings("c", first.get("fix").?.object.get("replacement").?.string);
+    try testing.expectEqualStrings("https://example.invalid/json5/duplicate_key", first.get("code_url").?.string);
+    const second = parsed.value.array.items[1].object;
+    for ([_][]const u8{ "labels", "notes", "fix", "code_url" }) |k| try testing.expect(second.get(k) == null);
+}
+
+test "note kinds are named, and a hostile code URL is escaped in both styles" {
+    // Mutation 2026-10-04: a `help` note rendered as `note`, and the URL
+    // written raw, both survived the tests above.
+    const d: Diagnostic = .{
+        .path = "",
+        .severity = .warning,
+        .code = "c",
+        .message = "m",
+        .notes = &.{ .{ .kind = .help, .message = "try this" }, .{ .message = "fyi" } },
+        .code_url = "https://x.invalid/\x1b]8;;evil\x07",
+    };
+    const snip = try renderAlloc(d, .{ .style = .snippet });
+    defer testing.allocator.free(snip);
+    try testing.expectEqualStrings(
+        \\warning[c]: m
+        \\ = help: try this
+        \\ = note: fyi
+        \\ = see: https://x.invalid/\x1b]8;;evil\x07
+        \\
+    , snip);
+    const short = try renderAlloc(d, .{});
+    defer testing.allocator.free(short);
+    try testing.expectEqualStrings("warning[c]: m; help: try this; note: fyi; see https://x.invalid/\\x1b]8;;evil\\x07\n", short);
 }

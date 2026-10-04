@@ -64,3 +64,37 @@ The renderer escapes control characters in everything it prints (a key name
 carrying an ANSI escape sequence reaches the terminal as `\x1b`), so a
 `short` finding is always one line. Carets line up across tabs and multi-byte
 UTF-8; double-width characters are not accounted for.
+
+### Labels, notes, fix-its, colour (2026-10-04)
+
+```zig
+try diag.append(.{
+    .path = "a", .file = "c.json5", .line = 4, .col = 3, .end_line = 4, .end_col = 4,
+    .severity = .@"error", .code = "json5.duplicate_key", .message = "duplicate key 'a'",
+    .labels = &.{.{ .line = 2, .col = 3, .end_line = 2, .end_col = 4, .message = "first defined here" }},
+    .notes = &.{.{ .kind = .note, .message = "the later value would silently win" }},
+    .fix = .{ .line = 4, .col = 3, .end_line = 4, .end_col = 4, .replacement = "c" },
+    .code_url = "https://example.invalid/json5/duplicate_key",
+});
+try diag.render(w, .{ .style = .snippet, .sources = &src, .color = true }); // colour: caller decides (isatty, NO_COLOR)
+```
+
+```
+error[json5.duplicate_key]: duplicate key 'a'
+ --> c.json5:4:3
+  |
+4 |   a: 3,
+  |   ^
+ ::: c.json5:2:3
+  |
+2 |   a: 1,
+  |   - first defined here
+  = at: a
+  = note: the later value would silently win
+  = fix: replace c.json5:4:3..4:4 with "c"
+  = see: https://example.invalid/json5/duplicate_key
+```
+
+All four fields are optional and omitted from JSON when unset, so existing
+output is byte-identical. Colour wraps only this module's own text; anything
+taken from a finding is escaped the same way with colour on.
