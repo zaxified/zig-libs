@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core.** Standard Webhooks (`standard`: `v1`
+  HMAC-SHA256 and `v1a` Ed25519, `whsec_`/`whpk_`/`whsk_` keys, multi-signature
+  headers), Stripe (`stripe`) and Slack (`slack`), each with a replay tolerance
+  checked both ways against a caller-supplied `now` (`checkTimestamp`,
+  `default_tolerance_s` = 300, `VerifyError`); the prefixed scheme generalised
+  to SHA-1/SHA-512 and base64 (`Format`, `Digest`, `Encoding`, `signFormat`,
+  `verifyFormat`); the middleware handles every scheme (`Options.scheme`,
+  `digest`, `encoding`, `public_keys`, `clock`, `tolerance_s`;
+  `Verifier.verifyRequest`, `checkFreshness`, `Clock.fromIo`) and refuses a stale
+  delivery before reading its body. Vectors: the Standard Webhooks reference
+  sign test, Slack's documented example, Python `hmac` / `openssl` black-box
+  values. Seeded hostile-header sweep + sign/verify/flip oracle; mutation 37
+  mutants, 0 surviving. Additive: every existing name and signature unchanged.
+  **Behaviour change:** none for the default `.prefixed` scheme. `presentedMac`
+  (private) now goes through the general decoder; the CT-compare pin for this
+  file moves from 2 call sites to 1 (`macEql`, used by every compare) and the
+  plain `std.mem.eql` count from 2 to 4 (version tags `v1`/`v1a`, public).
 - **2026-09-07** — `fuzzVerify` ran exactly one input for its whole existence, and one of its
   two calls was a duplicate of the other. It opened with `smith.bytes(&secret_buf)` plus a
   ranged length, then the same for the body, then `smith.value(bool)` to choose between a raw

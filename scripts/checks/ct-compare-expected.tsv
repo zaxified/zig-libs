@@ -47,5 +47,5 @@ modules/stun/src/root.zig	1	1
 modules/tlsclient/src/Client.zig	2	3
 modules/tlsresume/src/psk.zig	1	0
 modules/voprf/src/root.zig	2	1
-modules/webhooksig/src/root.zig	2	2
+modules/webhooksig/src/root.zig	1	4
 modules/wireguard/src/handshake.zig	4	11

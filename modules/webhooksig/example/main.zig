@@ -129,4 +129,22 @@ pub fn main() !void {
     if (!std.mem.eql(u8, statusOf(got_missing), "401")) return error.ExpectedRejected;
     if (std.mem.indexOf(u8, got_missing, "WWW-Authenticate: Signature") == null) return error.MissingChallenge;
     std.debug.print("missing signature header over the wire: 401 with WWW-Authenticate\n", .{});
+
+    // ── Standard Webhooks (the Svix scheme), against its reference vector ──
+    // A receiver decodes the `whsec_` secret once and checks id, timestamp
+    // and signature; `now` is the receiver's clock (fixed here so the
+    // reference library's 2021 vector stays inside the 5-minute window).
+    var key_buf: [webhooksig.standard.max_secret_len]u8 = undefined;
+    const key = try webhooksig.standard.decodeSecret(&key_buf, "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+    const sw_payload = "{\"test\": 2432232314}";
+    const sw_sig = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=";
+    try webhooksig.standard.verify(.{ .secrets = &.{key} }, "msg_p5jXN8AQM9LWM0D4loKWxJek", "1614265330", sw_sig, sw_payload, 1614265330 + 60, webhooksig.default_tolerance_s);
+    std.debug.print("Standard Webhooks reference signature verifies\n", .{});
+    // The same delivery replayed an hour later is refused by its timestamp.
+    if (webhooksig.standard.verify(.{ .secrets = &.{key} }, "msg_p5jXN8AQM9LWM0D4loKWxJek", "1614265330", sw_sig, sw_payload, 1614265330 + 3600, webhooksig.default_tolerance_s)) |_| {
+        return error.UnexpectedAccept;
+    } else |err| switch (err) {
+        error.TimestampTooOld => std.debug.print("replayed an hour later: TimestampTooOld\n", .{}),
+        else => return err,
+    }
 }

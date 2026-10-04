@@ -1,10 +1,12 @@
 # webhooksig
 
-HMAC-SHA256 request/webhook signature **signing** and **verification**,
-plus a `router` middleware that gates inbound webhooks (GitHub style: a
-single `<prefix><hex-mac>` header value) on a valid signature header — the
-signature layer of the Web/API cluster. **Stripe's `Stripe-Signature`
-scheme is not implemented** — see "Scope" below.
+Webhook signature **signing** and **verification** for the schemes
+receivers meet — **Standard Webhooks** (the Svix scheme: `v1` HMAC-SHA256
+and `v1a` Ed25519), **Stripe**, **Slack**, and the GitHub-style single
+`<prefix><mac>` value (SHA-1/SHA-256/SHA-512, hex or base64) — with a replay
+tolerance on every timestamped scheme, plus a `router` middleware that gates
+inbound webhooks on a valid signature. The signature layer of the Web/API
+cluster.
 
 Provenance: clean-room from RFC 2104 (HMAC) over FIPS 180-4 SHA-256 and the
 publicly-documented GitHub/Stripe webhook-signature schemes (`sha256=<hex>` over
@@ -44,17 +46,21 @@ receiver recomputes the MAC over the **exact bytes it received** and
 compares. Both the header name and the `sha256=` prefix are configurable —
 that covers any provider using GitHub's single-value `<prefix><hex>` shape.
 
-## Scope: GitHub-style only, not Stripe
+## Schemes
 
-Stripe's `Stripe-Signature` header is a different construction: a
-comma-separated list `t=<unix-timestamp>,v1=<hex-mac>[,v0=<hex-mac>]`, and
-the MAC covers `"<timestamp>.<raw body>"`, not the raw body by itself.
-Neither the comma-list parsing nor the timestamp-prefixed signed payload is
-implemented — `header`/`prefix` configure one fixed prefix directly in
-front of the hex MAC, which cannot express Stripe's multi-field header or
-its different signed-payload construction. There is no timestamp field,
-parsed or otherwise, anywhere in this module. Adding Stripe support is a
-separate feature decision, not something this module does today.
+| Scheme | Headers | Signed content | Signature | Key |
+|---|---|---|---|---|
+| `.prefixed` (`Format`) | one, configurable (`X-Hub-Signature-256`) | the body | `<prefix><hex\|base64>` of HMAC-SHA-1/256/512 | the secret as given |
+| `standard` | `webhook-id`, `webhook-timestamp`, `webhook-signature` | `id.ts.body` | space-separated `v1,<b64 HMAC-SHA256>` / `v1a,<b64 Ed25519>` | `whsec_<b64>` (decode with `standard.decodeSecret`), `whpk_`/`whsk_` |
+| `stripe` | `Stripe-Signature` | `ts.body` | `t=<ts>,v1=<hex>[,v1=…]` | `whsec_…` as text |
+| `slack` | `X-Slack-Signature`, `X-Slack-Request-Timestamp` | `v0:ts:body` | `v0=<hex>` | the signing secret as text |
+
+**Replay.** The timestamped schemes refuse a timestamp more than
+`tolerance_s` (default `default_tolerance_s` = 300 s, as every reference)
+from `now` in **either** direction (Stripe's SDKs check only the past). The
+module reads no clock: the free functions take `now`, the middleware a
+`Clock` (`Clock.fromIo(&io)` for the real one). A replay *inside* the window
+is the caller's to stop (remember `webhook-id`s for `tolerance_s`).
 
 The compare is **constant-time**: the recomputed MAC and the decoded
 presented MAC are checked with `std.crypto.timing_safe.eql` over the
@@ -90,6 +96,28 @@ fn onWebhook(ctx: *router.Ctx) !void {
     const body = webhooksig.bodyOf(ctx).?; // the verified raw bytes
     // parse `body` — do NOT call ctx.req.reader(); the stream is consumed.
 }
+```
+
+Standard Webhooks (Svix) receiver:
+
+```zig
+var key_buf: [webhooksig.standard.max_secret_len]u8 = undefined;
+const key = try webhooksig.standard.decodeSecret(&key_buf, "whsec_…");
+var verifier = try webhooksig.Verifier.init(gpa, .{
+    .secret = key,                                   // the decoded key, not "whsec_…"
+    .scheme = .standard_webhooks,
+    .public_keys = &.{try webhooksig.standard.decodePublicKey("whpk_…")}, // optional, for v1a
+    .clock = webhooksig.Clock.fromIo(&io),
+});
+// or without the middleware:
+try webhooksig.standard.verify(.{ .secrets = &.{key} }, id, ts_header, sig_header, body, now, 300);
+```
+
+Stripe / Slack without the middleware:
+
+```zig
+try webhooksig.stripe.verify(&.{endpoint_secret}, stripe_signature, body, now, 300);
+try webhooksig.slack.verify(&.{signing_secret}, slack_ts, slack_sig, body, now, 300);
 ```
 
 Sign an outbound webhook (or in a test):
@@ -129,9 +157,16 @@ middleware's `state` points at it).
   `Verifier` retains the **raw** secrets for its lifetime. Keep it off any
   serialized/loggable surface.
 - **Prefix / header.** `header` (case-insensitive) and `prefix` are both
-  configurable; `prefix = ""` accepts a bare-hex value. Surrounding
-  SP/TAB in the header value is tolerated; the hex is decoded
-  case-insensitively.
+  configurable; `prefix = ""` accepts a bare value. Surrounding
+  SP/TAB in the header value is tolerated; hex is decoded
+  case-insensitively, base64 is standard-alphabet and padded.
+- **Stale first.** For the timestamped schemes the middleware checks the
+  timestamp from the headers alone and answers 401 **before reading the
+  body**.
+- **Bounded work.** At most `max_signatures` (16) entries of one signature
+  header, of them at most `max_ed25519_signatures` (4) `v1a`; at most
+  `max_keys` (8) secrets / public keys. Each HMAC is computed once per key,
+  not per presented signature.
 
 ## API
 
@@ -142,9 +177,17 @@ middleware's `state` points at it).
   prefix).
 - `verify(secret, body, presented) bool` — constant-time single-secret
   check; `verifyWithPrefix(prefix, …)` for a custom prefix.
+- `Format{prefix, digest, encoding}`, `signFormat`, `verifyFormat` — the
+  prefixed scheme with any `Digest` (`sha1`/`sha256`/`sha512`) and
+  `Encoding` (`hex`/`base64`).
+- `standard.{sign, signEd25519, verify, decodeSecret, encodeSecret,
+  decodePublicKey, decodeSigningKey}`, `stripe.{sign, verify}`,
+  `slack.{sign, verify}`, `checkTimestamp`, `VerifyError`, `Clock`.
 - `Verifier.init/​deinit`, `Verifier.middleware()`,
-  `Verifier.verifyBody(body, presented)` (multi-secret, constant-time),
-  `Verifier.secretCount()`.
+  `Verifier.verifyBody(body, presented)` (prefixed, multi-secret,
+  constant-time), `Verifier.verifyRequest(headers, body, now)` (any scheme),
+  `Verifier.checkFreshness`, `Verifier.secretCount()`; `Options.scheme`,
+  `digest`, `encoding`, `public_keys`, `clock`, `tolerance_s`.
 - `bodyOf(ctx) ?[]const u8` — the verified body inside a gated handler.
 
 ## Verification
@@ -156,4 +199,9 @@ known HMAC-SHA256 test vector; custom / empty prefix; `Verifier` rotation
 the socket-free `http.Server.serveStream` (correctly-signed body → 200 with
 the handler re-reading the stashed body; missing header / tampered body /
 wrong secret → 401 with the `WWW-Authenticate: Signature` challenge; custom
-header name + rotation over the wire).
+header name + rotation over the wire). Since 2026-10-04: the Standard
+Webhooks reference library's sign vector, Slack's documented example,
+Python-`hmac` vectors for Stripe / SHA-1 / SHA-512 / base64, an
+`openssl`-signed Ed25519 `v1a` vector, the tolerance boundary both ways,
+every scheme through the middleware, and a seeded hostile-header sweep with
+a sign→verify→flip oracle.
