@@ -251,4 +251,33 @@ pub fn main() !void {
         try q.ack(recovered);
         std.debug.print("reopen over the same store recovered the orphaned lease, dropped the acked job\n", .{});
     }
+
+    // Operator tools: retry the dead-lettered job, refuse a duplicate,
+    // cancel a scheduled one, and keep a long job's lease with a heartbeat.
+    {
+        const dead = try q.deadLetterList(gpa);
+        defer jobqueue.Queue.freeDeadLetterList(gpa, dead);
+        must(dead.len == 1, @src());
+        must(try q.requeueDead(dead[0].id, .{}), @src());
+        must(q.status(dead[0].id).? == .ready, @src());
+
+        const welcome = try q.enqueue("email", "welcome", .{ .unique_key = "welcome:7", .delay_ns = 60 * s });
+        if (q.enqueue("email", "welcome again", .{ .unique_key = "welcome:7" })) |_| {
+            return error.ExpectedDuplicate;
+        } else |err| switch (err) {
+            error.DuplicateJob => std.debug.print("second enqueue of welcome:7 refused: DuplicateJob\n", .{}),
+            else => return err,
+        }
+        must(q.status(welcome).? == .scheduled, @src());
+        must(try q.cancel(welcome), @src());
+        must(q.findUnique("welcome:7") == null, @src());
+
+        const lease = (try q.dequeue(.{ .visibility_timeout_ns = 5 * s })).?;
+        mono.advance(4 * s);
+        try q.extendLease(lease, 5 * s); // heartbeat at 4 s
+        mono.advance(4 * s); // 8 s: past the first deadline, inside the extended one
+        must((try q.reapExpiredLeases()) == 0, @src());
+        try q.ack(lease);
+        std.debug.print("dead job retried, duplicate refused, scheduled job cancelled, heartbeat kept the lease\n", .{});
+    }
 }

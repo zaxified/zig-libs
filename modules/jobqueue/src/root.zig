@@ -140,6 +140,26 @@ pub const Error = error{
     CorruptRecord,
 };
 
+/// `enqueue` with a `unique_key` already held by a live job (see
+/// `EnqueueOptions.unique_key`). Kept out of `Error` so that set is unchanged.
+pub const UniqueError = error{DuplicateJob};
+
+/// `cancel` on a job that a worker holds right now: let the lease run out,
+/// or `ack`/`nack` it. Kept out of `Error` so that set is unchanged.
+pub const CancelError = error{JobLeased};
+
+/// Where a live job is (`Queue.status`).
+pub const Status = enum {
+    /// Visible now (its schedule has arrived), waiting for a worker.
+    ready,
+    /// Waiting for its `run_at` / `delay_ns` / `nack` backoff.
+    scheduled,
+    /// Held by a worker's lease.
+    leased,
+    /// In the dead-letter queue.
+    dead,
+};
+
 /// A reservation handed out by `dequeue`. Borrowed fields (`job_type`,
 /// `payload`, `partition`) point into the queue's own memory and stay valid
 /// until you `ack`/`nack` this lease **or** its visibility timeout lapses —
@@ -180,6 +200,21 @@ pub const EnqueueOptions = struct {
     run_at: ?i64 = null,
     /// Total delivery attempts before dead-lettering. Must be ≥ 1.
     max_attempts: u32 = 5,
+    /// Non-empty = de-duplicate: while a job enqueued with this key is live
+    /// (ready, scheduled, leased or dead-lettered — until it is acked or
+    /// cancelled), another `enqueue` with the same key returns
+    /// `error.DuplicateJob` and writes nothing. Durable (stored in the job
+    /// record), at most `max_field_len` bytes.
+    unique_key: []const u8 = "",
+};
+
+/// `Queue.requeueDead` options.
+pub const RequeueOptions = struct {
+    /// Earliest visibility (wall ns); null = now.
+    run_at: ?i64 = null,
+    /// Start the attempt count over (the job gets its full `max_attempts`
+    /// again). False keeps the count, so one more failure dead-letters it.
+    reset_attempts: bool = true,
 };
 
 pub const DequeueOptions = struct {
@@ -221,6 +256,9 @@ pub const max_field_len: usize = 4096;
 
 // ── on-`kv` record format ────────────────────────────────────────────────────
 //
+// Version 1 (written for every job without a `unique_key`, so a store that
+// uses no unique keys stays readable by older builds):
+//
 //   [0]      version  u8 (= 1)
 //   [1]      state    u8 (0 = ready, 1 = dead)
 //   [2]      priority u8
@@ -231,9 +269,17 @@ pub const max_field_len: usize = 4096;
 //   [23..27) partition_len u32 LE
 //   [27..31) payload_len   u32 LE
 //   [31..]   job_type ++ partition ++ payload
+//
+// Version 2 (a job with a `unique_key`): the same 31 bytes with version = 2,
+// then
+//
+//   [31..35) unique_len    u32 LE
+//   [35..]   job_type ++ partition ++ payload ++ unique_key
 
 const rec_version: u8 = 1;
+const rec_version_unique: u8 = 2;
 const rec_fixed = 31;
+const rec_fixed_v2 = 35;
 
 const JobState = enum(u8) { ready = 0, dead = 1 };
 
@@ -249,6 +295,8 @@ const Job = struct {
     run_at_ns: i64,
     /// In-memory lease generation (durable state does not need it).
     lease_epoch: u32,
+    /// "" = none. Owned; the `unique` index borrows it as its key.
+    unique_key: []u8 = &.{},
 };
 
 const meta_key = "m/next_id";
@@ -385,6 +433,9 @@ pub const Queue = struct {
     leased: std.AutoHashMapUnmanaged(u64, u64),
     /// Dead-lettered ids (state == dead).
     dlq: std.AutoHashMapUnmanaged(u64, void),
+    /// `unique_key` → id of the live job holding it (keys borrowed from the
+    /// job).
+    unique: std.StringHashMapUnmanaged(u64) = .empty,
 
     /// Next id to hand out; mirrors the durable `m/next_id` counter.
     next_id: u64,
@@ -426,8 +477,10 @@ pub const Queue = struct {
     /// the job record and the bumped counter are both fsync'd.
     pub fn enqueue(self: *Queue, job_type: []const u8, payload: []const u8, opts: EnqueueOptions) !JobId {
         if (payload.len > self.opts.max_payload) return Error.PayloadTooLarge;
-        if (job_type.len > max_field_len or opts.partition.len > max_field_len) return Error.FieldTooLarge;
+        if (job_type.len > max_field_len or opts.partition.len > max_field_len or opts.unique_key.len > max_field_len)
+            return Error.FieldTooLarge;
         std.debug.assert(opts.max_attempts >= 1);
+        if (opts.unique_key.len != 0 and self.unique.contains(opts.unique_key)) return UniqueError.DuplicateJob;
 
         const id = self.next_id;
         const wall = self.wall.now();
@@ -452,8 +505,11 @@ pub const Queue = struct {
         errdefer self.gpa.free(job.payload);
         job.partition = try self.gpa.dupe(u8, opts.partition);
         errdefer self.gpa.free(job.partition);
+        job.unique_key = try self.gpa.dupe(u8, opts.unique_key);
+        errdefer self.gpa.free(job.unique_key);
 
         try self.jobs.ensureUnusedCapacity(self.gpa, 1);
+        if (job.unique_key.len != 0) try self.unique.ensureUnusedCapacity(self.gpa, 1);
         // Every new job enters through `pending` regardless of its schedule —
         // one structure to reserve, and `dequeue` migrates the due ones.
         try self.pending.ensureUnusedCapacity(self.gpa, 1);
@@ -467,6 +523,7 @@ pub const Queue = struct {
         try self.db.put(meta_key, &nb);
 
         self.jobs.putAssumeCapacity(id, job);
+        if (job.unique_key.len != 0) self.unique.putAssumeCapacity(job.unique_key, id);
         self.pending.pushAssumeCapacity(.{ .run_at_ns = run_at, .id = id });
         self.ready_n += 1;
         self.next_id = id + 1;
@@ -510,7 +567,11 @@ pub const Queue = struct {
 
         const id = id: while (true) {
             const found = self.bestReady(opts.partition) orelse return null;
-            const job = self.jobs.get(found.id).?;
+            const job = self.jobs.get(found.id) orelse {
+                // Cancelled while visible: its heap entry is a tombstone.
+                self.takeTop(found);
+                continue;
+            };
             if (job.run_at_ns > wall_now) {
                 // Wall clock regressed after this job migrated — put it back.
                 try self.demote(found, job.run_at_ns);
@@ -556,6 +617,78 @@ pub const Queue = struct {
         const job = self.jobs.get(id).?;
         const backoff = opts.backoff_ns orelse self.computeBackoff(job.attempts + 1);
         try self.expireLease(id, backoff);
+    }
+
+    /// Heartbeat: push the lease's visibility deadline to `now +
+    /// visibility_timeout_ns` (monotonic), so a long job is not reaped and
+    /// re-leased while it still runs. Only the current lease may extend
+    /// (`error.StaleLease` otherwise — the job was already reaped, acked or
+    /// re-leased). The deadline can also be shortened this way.
+    pub fn extendLease(self: *Queue, lease: Lease, visibility_timeout_ns: u64) Error!void {
+        const id = try self.validate(lease);
+        self.leased.getPtr(id).?.* = self.mono.now() +| visibility_timeout_ns;
+    }
+
+    /// Remove a job that is not running: a ready, scheduled or dead-lettered
+    /// job is deleted durably (like an `ack`) and releases its `unique_key`.
+    /// True = removed, false = no such job (already acked or cancelled).
+    /// A leased job is `error.JobLeased` — `ack` it, `nack` it, or let its
+    /// lease lapse first. A cancelled ready job leaves a tombstone in the
+    /// dispatch heaps that `dequeue` drops when it reaches it.
+    pub fn cancel(self: *Queue, id: JobId) !bool {
+        const raw = @intFromEnum(id);
+        const job = self.jobs.get(raw) orelse return false;
+        if (self.leased.contains(raw)) return CancelError.JobLeased;
+        var kb: [24]u8 = undefined;
+        try self.db.delete(jobKey(&kb, raw));
+        if (job.state == .dead) {
+            _ = self.dlq.remove(raw);
+        } else {
+            self.ready_n -= 1;
+        }
+        self.removeJob(raw);
+        return true;
+    }
+
+    /// Put a dead-lettered job back in the ready set (an operator's "retry"):
+    /// visible at `opts.run_at` (default now), with its attempt count reset
+    /// unless `opts.reset_attempts` is false. Durable before it returns.
+    /// False = no dead-lettered job with this id.
+    pub fn requeueDead(self: *Queue, id: JobId, opts: RequeueOptions) !bool {
+        const raw = @intFromEnum(id);
+        if (!self.dlq.contains(raw)) return false;
+        const job = self.jobs.get(raw).?;
+        try self.reserveReady();
+        const saved = .{ job.state, job.attempts, job.run_at_ns };
+        job.state = .ready;
+        // Without a reset, one attempt short of the limit: the next failure
+        // dead-letters it again.
+        if (opts.reset_attempts) job.attempts = 0 else job.attempts = job.max_attempts - 1;
+        job.run_at_ns = opts.run_at orelse self.wall.now();
+        self.persistJob(job) catch |e| {
+            job.state, job.attempts, job.run_at_ns = saved;
+            return e;
+        };
+        _ = self.dlq.remove(raw);
+        self.commitReady(job);
+        return true;
+    }
+
+    /// Where job `id` is now, or null when it is gone (acked, cancelled) or
+    /// never existed. `ready` vs `scheduled` is decided against the wall
+    /// clock now.
+    pub fn status(self: *Queue, id: JobId) ?Status {
+        const raw = @intFromEnum(id);
+        const job = self.jobs.get(raw) orelse return null;
+        if (job.state == .dead) return .dead;
+        if (self.leased.contains(raw)) return .leased;
+        return if (job.run_at_ns > self.wall.now()) .scheduled else .ready;
+    }
+
+    /// The live job holding `unique_key`, or null.
+    pub fn findUnique(self: *const Queue, unique_key: []const u8) ?JobId {
+        const id = self.unique.get(unique_key) orelse return null;
+        return @enumFromInt(id);
     }
 
     /// Caller-driven visibility-timeout sweep (like `kv`'s caller-driven
@@ -652,7 +785,10 @@ pub const Queue = struct {
     fn migrateDue(self: *Queue, wall_now: i64) Allocator.Error!void {
         while (self.pending.peek()) |top| {
             if (top.run_at_ns > wall_now) break; // heap is time-ordered: so is the rest
-            const job = self.jobs.get(top.id).?;
+            const job = self.jobs.get(top.id) orelse {
+                _ = self.pending.pop(); // cancelled while scheduled: a tombstone
+                continue;
+            };
             const heap = try self.reservePartition(job.partition);
             _ = self.pending.pop();
             heap.pushAssumeCapacity(.{ .priority = @intFromEnum(job.priority), .id = top.id });
@@ -794,10 +930,12 @@ pub const Queue = struct {
     }
 
     fn encodeJob(self: *Queue, job: *const Job) ![]u8 {
-        const total = rec_fixed + job.job_type.len + job.partition.len + job.payload.len;
+        const v2 = job.unique_key.len != 0;
+        const fixed: usize = if (v2) rec_fixed_v2 else rec_fixed;
+        const total = fixed + job.job_type.len + job.partition.len + job.payload.len + job.unique_key.len;
         const buf = try self.gpa.alloc(u8, total);
         errdefer self.gpa.free(buf);
-        buf[0] = rec_version;
+        buf[0] = if (v2) rec_version_unique else rec_version;
         buf[1] = @intFromEnum(job.state);
         buf[2] = @intFromEnum(job.priority);
         std.mem.writeInt(u32, buf[3..7], job.attempts, .little);
@@ -806,32 +944,54 @@ pub const Queue = struct {
         std.mem.writeInt(u32, buf[19..23], @intCast(job.job_type.len), .little);
         std.mem.writeInt(u32, buf[23..27], @intCast(job.partition.len), .little);
         std.mem.writeInt(u32, buf[27..31], @intCast(job.payload.len), .little);
-        var o: usize = rec_fixed;
+        if (v2) std.mem.writeInt(u32, buf[31..35], @intCast(job.unique_key.len), .little);
+        var o: usize = fixed;
         @memcpy(buf[o..][0..job.job_type.len], job.job_type);
         o += job.job_type.len;
         @memcpy(buf[o..][0..job.partition.len], job.partition);
         o += job.partition.len;
         @memcpy(buf[o..][0..job.payload.len], job.payload);
+        o += job.payload.len;
+        @memcpy(buf[o..][0..job.unique_key.len], job.unique_key);
         return buf;
     }
 
     /// Decode a stored record into a freshly allocated, fully owned `*Job`.
     fn decodeJob(self: *Queue, id: u64, buf: []const u8) !*Job {
-        if (buf.len < rec_fixed or buf[0] != rec_version) return Error.CorruptRecord;
+        if (buf.len < rec_fixed) return Error.CorruptRecord;
+        const v2 = switch (buf[0]) {
+            rec_version => false,
+            rec_version_unique => true,
+            else => return Error.CorruptRecord,
+        };
+        const fixed: usize = if (v2) rec_fixed_v2 else rec_fixed;
+        if (buf.len < fixed) return Error.CorruptRecord;
         const state_raw = buf[1];
         const pri_raw = buf[2];
         if (state_raw > 1 or pri_raw > 3) return Error.CorruptRecord;
         const jt_len = std.mem.readInt(u32, buf[19..23], .little);
         const part_len = std.mem.readInt(u32, buf[23..27], .little);
         const pay_len = std.mem.readInt(u32, buf[27..31], .little);
-        if (rec_fixed + @as(u64, jt_len) + part_len + pay_len != buf.len) return Error.CorruptRecord;
+        const uq_len: u32 = if (v2) std.mem.readInt(u32, buf[31..35], .little) else 0;
+        // A version-2 record exists only for a non-empty key.
+        if (v2 and uq_len == 0) return Error.CorruptRecord;
+        // What this module writes: max_attempts ≥ 1 (asserted at enqueue), a
+        // ready job below its limit, a dead one at it. Anything else would
+        // overflow the attempt arithmetic later, so it is refused here.
+        const attempts = std.mem.readInt(u32, buf[3..7], .little);
+        const max_attempts = std.mem.readInt(u32, buf[7..11], .little);
+        if (max_attempts == 0 or attempts > max_attempts) return Error.CorruptRecord;
+        if (state_raw == 0 and attempts == max_attempts) return Error.CorruptRecord;
+        if (@as(u64, fixed) + jt_len + part_len + pay_len + uq_len != buf.len) return Error.CorruptRecord;
 
-        var o: usize = rec_fixed;
+        var o: usize = fixed;
         const jt = buf[o..][0..jt_len];
         o += jt_len;
         const part = buf[o..][0..part_len];
         o += part_len;
         const pay = buf[o..][0..pay_len];
+        o += pay_len;
+        const uq = buf[o..][0..uq_len];
 
         const job = try self.gpa.create(Job);
         errdefer self.gpa.destroy(job);
@@ -842,8 +1002,8 @@ pub const Queue = struct {
             .partition = undefined,
             .priority = @enumFromInt(pri_raw),
             .state = @enumFromInt(state_raw),
-            .attempts = std.mem.readInt(u32, buf[3..7], .little),
-            .max_attempts = std.mem.readInt(u32, buf[7..11], .little),
+            .attempts = attempts,
+            .max_attempts = max_attempts,
             .run_at_ns = std.mem.readInt(i64, buf[11..19], .little),
             .lease_epoch = 0,
         };
@@ -851,6 +1011,8 @@ pub const Queue = struct {
         job.payload = try self.gpa.dupe(u8, pay);
         errdefer self.gpa.free(job.payload);
         job.partition = try self.gpa.dupe(u8, part);
+        errdefer self.gpa.free(job.partition);
+        job.unique_key = try self.gpa.dupe(u8, uq);
         return job;
     }
 
@@ -866,27 +1028,44 @@ pub const Queue = struct {
             defer self.gpa.free(val);
             const job = try self.decodeJob(id, val);
             errdefer self.freeJob(job);
-            try self.jobs.put(self.gpa, id, job);
+            // Reserve every slot first: once `jobs` owns the job, nothing
+            // below may fail (an error after the put would free it twice —
+            // here and in `open`'s `freeIndex`).
+            if (job.unique_key.len != 0) {
+                // Two live records with one key cannot be written by this
+                // module (`enqueue` refuses the second): a store that has
+                // them was not written by it.
+                if (self.unique.contains(job.unique_key)) return Error.CorruptRecord;
+                try self.unique.ensureUnusedCapacity(self.gpa, 1);
+            }
+            try self.jobs.ensureUnusedCapacity(self.gpa, 1);
+            switch (job.state) {
+                .ready => try self.reserveReady(),
+                .dead => try self.dlq.ensureUnusedCapacity(self.gpa, 1),
+            }
+            self.jobs.putAssumeCapacity(id, job);
+            if (job.unique_key.len != 0) self.unique.putAssumeCapacity(job.unique_key, id);
             switch (job.state) {
                 // A job leased-but-not-acked at crash time was persisted as
                 // `ready` (the lease was in-memory only) — it comes back ready.
-                .ready => {
-                    try self.reserveReady();
-                    self.commitReady(job);
-                },
-                .dead => try self.dlq.put(self.gpa, id, {}),
+                .ready => self.commitReady(job),
+                .dead => self.dlq.putAssumeCapacity(id, {}),
             }
         }
     }
 
     fn removeJob(self: *Queue, id: u64) void {
-        if (self.jobs.fetchRemove(id)) |kve| self.freeJob(kve.value);
+        if (self.jobs.fetchRemove(id)) |kve| {
+            if (kve.value.unique_key.len != 0) _ = self.unique.remove(kve.value.unique_key);
+            self.freeJob(kve.value);
+        }
     }
 
     fn freeJob(self: *Queue, job: *Job) void {
         self.gpa.free(job.job_type);
         self.gpa.free(job.payload);
         self.gpa.free(job.partition);
+        self.gpa.free(job.unique_key);
         self.gpa.destroy(job);
     }
 
@@ -903,6 +1082,7 @@ pub const Queue = struct {
         self.parts.deinit(self.gpa);
         self.leased.deinit(self.gpa);
         self.dlq.deinit(self.gpa);
+        self.unique.deinit(self.gpa);
     }
 };
 
@@ -1434,4 +1614,433 @@ test "computeBackoff: exponential progression, capped, deterministic without jit
     try testing.expectEqual(@as(u64, 800), q.computeBackoff(4));
     try testing.expectEqual(@as(u64, 1000), q.computeBackoff(5)); // 1600 capped
     try testing.expectEqual(@as(u64, 1000), q.computeBackoff(60)); // overflow-safe
+}
+
+// ── core (2026-10-04): cancel, dead-letter requeue, heartbeat, unique jobs ──
+
+test "cancel: ready, scheduled and dead jobs go, durably; a leased one refuses" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    {
+        var q = try h.openQueue();
+        defer q.close();
+        const ready = try q.enqueue("t", "ready", .{});
+        const sched = try q.enqueue("t", "sched", .{ .delay_ns = 10 * one_ms });
+        const dead = try q.enqueue("t", "dead", .{ .max_attempts = 1 });
+        const held = try q.enqueue("t", "held", .{ .priority = .high });
+        const keep = try q.enqueue("t", "keep", .{ .priority = .low });
+
+        const lh = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?; // "held" (high)
+        try testing.expectEqual(held, lh.id);
+        // Lease "ready" (oldest normal) and nack it out? No: lease "dead" by
+        // cancelling "ready" first — the tombstone must be skipped.
+        try testing.expect(try q.cancel(ready));
+        try testing.expectEqual(@as(?Status, null), q.status(ready));
+        const ld = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqual(dead, ld.id); // not the cancelled one
+        try q.nack(ld, .{});
+        try testing.expectEqual(@as(?Status, .dead), q.status(dead));
+
+        try testing.expectError(CancelError.JobLeased, q.cancel(held));
+        try testing.expectEqual(@as(?Status, .scheduled), q.status(sched));
+        try testing.expect(try q.cancel(sched));
+        try testing.expect(try q.cancel(dead));
+        try testing.expect(!try q.cancel(dead)); // already gone
+        try testing.expect(!try q.cancel(@enumFromInt(999)));
+        try testing.expectEqual(@as(usize, 0), q.deadLetterCount());
+        try testing.expectEqual(@as(usize, 1), q.readyCount()); // keep
+        try testing.expectEqual(@as(usize, 2), q.totalCount()); // keep + held
+        // The scheduled tombstone is dropped when its time comes.
+        h.wall.advance(20 * one_ms);
+        const lk = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqual(keep, lk.id);
+        try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+        try q.ack(lk);
+    }
+    // Durable: after a crash only the leased-not-acked "held" comes back.
+    var q = try h.openQueue();
+    defer q.close();
+    try testing.expectEqual(@as(usize, 1), q.totalCount());
+    try testing.expectEqualStrings("held", (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?.payload);
+}
+
+test "requeueDead: an operator retry, with and without an attempt reset, durable" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var id: JobId = undefined;
+    {
+        var q = try h.openQueue();
+        defer q.close();
+        id = try q.enqueue("t", "p", .{ .max_attempts = 2 });
+        for (0..2) |_| try q.nack((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{ .backoff_ns = 0 });
+        try testing.expectEqual(@as(?Status, .dead), q.status(id));
+        try testing.expect(!try q.requeueDead(@enumFromInt(77), .{}));
+        // Reset: a fresh first attempt, visible at run_at only.
+        try testing.expect(try q.requeueDead(id, .{ .run_at = h.wall.ns + 5 }));
+        try testing.expect(!try q.requeueDead(id, .{})); // no longer dead
+        try testing.expectEqual(@as(?Status, .scheduled), q.status(id));
+        try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+        h.wall.advance(5);
+        const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqual(@as(u32, 1), l.attempt);
+        try q.nack(l, .{ .backoff_ns = 0 });
+        try q.nack((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{ .backoff_ns = 0 });
+        try testing.expectEqual(@as(usize, 1), q.deadLetterCount());
+        // No reset: one more failure dead-letters it again.
+        try testing.expect(try q.requeueDead(id, .{ .reset_attempts = false }));
+    }
+    var q = try h.openQueue(); // survives a crash as a ready job with 1 attempt left
+    defer q.close();
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(@as(u32, 2), l.attempt);
+    try q.nack(l, .{ .backoff_ns = 0 });
+    try testing.expectEqual(@as(?Status, .dead), q.status(id));
+}
+
+test "extendLease: a heartbeat keeps a long job from being reaped" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    _ = try q.enqueue("t", "long", .{});
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = 10 * one_ms })).?;
+    h.mono.advance(8 * one_ms);
+    try q.extendLease(l, 10 * one_ms); // deadline now 18 ms
+    h.mono.advance(8 * one_ms); // 16 ms: past the original 10, before 18
+    try testing.expectEqual(@as(usize, 0), try q.reapExpiredLeases());
+    h.mono.advance(2 * one_ms); // 18 ms: the extended deadline (inclusive)
+    try testing.expectEqual(@as(usize, 1), try q.reapExpiredLeases());
+    // The reaped lease can neither extend nor ack.
+    try testing.expectError(Error.StaleLease, q.extendLease(l, one_ms));
+    try testing.expectError(Error.StaleLease, q.ack(l));
+    const l2 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(@as(u32, 2), l2.attempt);
+    try q.ack(l2);
+}
+
+test "unique jobs: one live job per key until ack or cancel, across a reopen" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    {
+        var q = try h.openQueue();
+        defer q.close();
+        const a = try q.enqueue("email", "1", .{ .unique_key = "welcome:42" });
+        try testing.expectError(UniqueError.DuplicateJob, q.enqueue("email", "2", .{ .unique_key = "welcome:42" }));
+        try testing.expectEqual(@as(usize, 1), q.totalCount()); // nothing written
+        try testing.expectEqual(@as(?JobId, a), q.findUnique("welcome:42"));
+        _ = try q.enqueue("email", "3", .{ .unique_key = "welcome:43" });
+        _ = try q.enqueue("email", "4", .{}); // no key: never de-duplicated
+        _ = try q.enqueue("email", "4", .{});
+        // A job without a key is still a version-1 record (older builds read it).
+        var kb: [24]u8 = undefined;
+        const raw4 = (try q.db.get(testing.allocator, jobKey(&kb, 3))).?;
+        defer testing.allocator.free(raw4);
+        try testing.expectEqual(@as(u8, 1), raw4[0]);
+        const raw1 = (try q.db.get(testing.allocator, jobKey(&kb, 1))).?;
+        defer testing.allocator.free(raw1);
+        try testing.expectEqual(@as(u8, 2), raw1[0]);
+        try testing.expectError(Error.FieldTooLarge, q.enqueue("e", "x", .{ .unique_key = "k" ** (max_field_len + 1) }));
+    }
+    var q = try h.openQueue();
+    defer q.close();
+    try testing.expectError(UniqueError.DuplicateJob, q.enqueue("email", "5", .{ .unique_key = "welcome:42" }));
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqualStrings("1", l.payload);
+    // Leased still holds the key; ack releases it.
+    try testing.expectError(UniqueError.DuplicateJob, q.enqueue("email", "5", .{ .unique_key = "welcome:42" }));
+    try q.ack(l);
+    try testing.expectEqual(@as(?JobId, null), q.findUnique("welcome:42"));
+    _ = try q.enqueue("email", "6", .{ .unique_key = "welcome:42" });
+    // Cancel releases it too; a dead job holds it.
+    try testing.expect(try q.cancel(q.findUnique("welcome:43").?));
+    _ = try q.enqueue("email", "7", .{ .unique_key = "welcome:43", .max_attempts = 1, .priority = .critical });
+    try q.nack((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{});
+    try testing.expectEqual(@as(?Status, .dead), q.status(q.findUnique("welcome:43").?));
+    try testing.expectError(UniqueError.DuplicateJob, q.enqueue("email", "8", .{ .unique_key = "welcome:43" }));
+}
+
+test "status: scheduled, ready, leased, dead, gone" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    const id = try q.enqueue("t", "p", .{ .delay_ns = 5, .max_attempts = 1 });
+    try testing.expectEqual(@as(?Status, .scheduled), q.status(id));
+    h.wall.advance(5);
+    try testing.expectEqual(@as(?Status, .ready), q.status(id));
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(@as(?Status, .leased), q.status(id));
+    try q.nack(l, .{});
+    try testing.expectEqual(@as(?Status, .dead), q.status(id));
+    try testing.expect(try q.cancel(id));
+    try testing.expectEqual(@as(?Status, null), q.status(id));
+}
+
+// ── seeded corrupt-record sweep over `decodeJob` ────────────────────────────
+//
+// `kv` CRC-guards every record, so a damaged record reaches `decodeJob` only
+// from a store this module did not write — but then it must be refused, not
+// crash the open. Valid v1 and v2 encodings are damaged at random (length
+// fields, version, state/priority, attempt counts, truncation, random
+// bytes); every result is either `CorruptRecord` or a job that satisfies the
+// invariants the rest of the queue relies on.
+
+test "sweep: damaged job records decode or refuse, never panic, never break an invariant" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    var reach = struct { ok: usize = 0, corrupt: usize = 0, v2_ok: usize = 0, len_field_hits: usize = 0 }{};
+    const bases = [_]Job{
+        .{ .id = 1, .job_type = @constCast("email"), .payload = @constCast("hello"), .partition = @constCast("p"), .priority = .high, .state = .ready, .attempts = 1, .max_attempts = 3, .run_at_ns = 5, .lease_epoch = 0 },
+        .{ .id = 2, .job_type = @constCast("t"), .payload = @constCast(""), .partition = @constCast(""), .priority = .low, .state = .dead, .attempts = 2, .max_attempts = 2, .run_at_ns = -1, .lease_epoch = 0, .unique_key = @constCast("uk") },
+    };
+    for (bases) |base| {
+        const enc = try q.encodeJob(&base);
+        defer testing.allocator.free(enc);
+        // The undamaged encoding round-trips.
+        const back = try q.decodeJob(base.id, enc);
+        try testing.expectEqualStrings(base.unique_key, back.unique_key);
+        try testing.expectEqual(base.attempts, back.attempts);
+        q.freeJob(back);
+        var buf: [128]u8 = undefined;
+        for (0..20_000) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const r = prng.random();
+            @memcpy(buf[0..enc.len], enc);
+            var len = enc.len;
+            for (0..r.intRangeAtMost(usize, 1, 3)) |_| {
+                switch (r.uintLessThan(u8, 6)) {
+                    // A length field (19..35) — the parse that bounds the slices.
+                    0 => {
+                        if (len > 19) buf[19 + r.uintLessThan(usize, @min(16, len - 19))] = r.int(u8);
+                        reach.len_field_hits += 1;
+                    },
+                    1 => buf[0] = r.uintLessThan(u8, 4), // version
+                    2 => buf[1 + r.uintLessThan(usize, 2)] = r.uintLessThan(u8, 5), // state / priority
+                    3 => buf[3 + r.uintLessThan(usize, 8)] = r.int(u8), // attempts / max_attempts
+                    4 => len = r.uintAtMost(usize, len), // truncation
+                    else => if (len > 0) {
+                        buf[r.uintLessThan(usize, len)] = r.int(u8);
+                    },
+                }
+            }
+            const job = q.decodeJob(7, buf[0..len]) catch |e| {
+                try testing.expectEqual(Error.CorruptRecord, e);
+                reach.corrupt += 1;
+                continue;
+            };
+            defer q.freeJob(job);
+            reach.ok += 1;
+            if (job.unique_key.len != 0) reach.v2_ok += 1;
+            try testing.expect(job.max_attempts >= 1 and job.attempts <= job.max_attempts);
+            if (job.state == .ready) try testing.expect(job.attempts < job.max_attempts);
+            try testing.expect(job.job_type.len + job.partition.len + job.payload.len + job.unique_key.len <= len);
+        }
+    }
+    // Measured 2026-10-04: 6 732 decoded (2 865 of them v2), 33 268 refused,
+    // 13 564 length-field hits.
+    try testing.expect(reach.ok > 5000);
+    try testing.expect(reach.corrupt > 15000);
+    try testing.expect(reach.v2_ok > 1000);
+}
+
+// ── seeded model sweep: every operation, with crashes ───────────────────────
+//
+// Random enqueue (with and without unique keys, delays, priorities) /
+// dequeue / ack / nack / extend / reap / cancel / requeueDead / reopen
+// against a model of each job's status, and the counts the queue reports.
+
+test "sweep: random operations and crashes agree with a model" {
+    const Model = struct { status: Status, key: ?u8, payload: u64 };
+    var reach = struct { acks: usize = 0, cancels: usize = 0, requeues: usize = 0, dups: usize = 0, reopens: usize = 0, dead: usize = 0 }{};
+    for (0..60) |seed| {
+        var h: Harness = undefined;
+        h.init();
+        defer h.deinit();
+        var q = try h.openQueue();
+        defer q.close();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var model: std.AutoHashMapUnmanaged(u64, Model) = .empty;
+        defer model.deinit(testing.allocator);
+        var leases: std.ArrayList(Lease) = .empty;
+        defer leases.deinit(testing.allocator);
+        for (0..250) |_| {
+            switch (r.uintLessThan(u8, 12)) {
+                0, 1, 2 => {
+                    const key: ?u8 = if (r.boolean()) r.uintLessThan(u8, 6) else null;
+                    var kb: [4]u8 = undefined;
+                    const ks = if (key) |k| std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable else "";
+                    var held_key = false;
+                    if (key) |k| {
+                        var it = model.valueIterator();
+                        while (it.next()) |m| held_key = held_key or (m.key != null and m.key.? == k);
+                    }
+                    const delay: u64 = if (r.boolean()) 0 else r.uintAtMost(u64, 3);
+                    const id = q.enqueue("t", "x", .{ .unique_key = ks, .delay_ns = delay, .max_attempts = r.intRangeAtMost(u32, 1, 3), .priority = r.enumValue(Priority) }) catch |e| {
+                        try testing.expectEqual(UniqueError.DuplicateJob, e);
+                        try testing.expect(held_key);
+                        reach.dups += 1;
+                        continue;
+                    };
+                    try testing.expect(!held_key);
+                    try model.put(testing.allocator, @intFromEnum(id), .{ .status = .ready, .key = key, .payload = 0 });
+                },
+                3, 4 => if (try q.dequeue(.{ .visibility_timeout_ns = 5 })) |l| {
+                    const m = model.getPtr(@intFromEnum(l.id)).?;
+                    try testing.expect(m.status == .ready);
+                    m.status = .leased;
+                    try leases.append(testing.allocator, l);
+                },
+                5 => if (leases.items.len > 0) {
+                    const l = leases.swapRemove(r.uintLessThan(usize, leases.items.len));
+                    if (q.ack(l)) |_| {
+                        _ = model.remove(@intFromEnum(l.id));
+                        reach.acks += 1;
+                    } else |e| try testing.expectEqual(Error.StaleLease, e);
+                },
+                6 => if (leases.items.len > 0) {
+                    const l = leases.swapRemove(r.uintLessThan(usize, leases.items.len));
+                    if (q.nack(l, .{ .backoff_ns = r.uintAtMost(u64, 2) })) |_| {
+                        // The model keeps `ready` for both visible and scheduled.
+                        model.getPtr(@intFromEnum(l.id)).?.status = if (q.status(l.id).? == .dead) .dead else .ready;
+                    } else |e| try testing.expectEqual(Error.StaleLease, e);
+                },
+                7 => {
+                    if (leases.items.len > 0 and r.boolean())
+                        q.extendLease(leases.items[r.uintLessThan(usize, leases.items.len)], 5) catch {};
+                    h.mono.advance(r.uintAtMost(u64, 4));
+                    h.wall.advance(r.uintAtMost(u64, 2));
+                    _ = try q.reapExpiredLeases();
+                    var it = model.iterator();
+                    while (it.next()) |e| {
+                        if (e.value_ptr.status == .leased) {
+                            const st = q.status(@enumFromInt(e.key_ptr.*)).?;
+                            if (st != .leased) e.value_ptr.status = if (st == .dead) .dead else .ready;
+                        }
+                    }
+                },
+                8 => {
+                    const id = r.intRangeAtMost(u64, 1, q.next_id);
+                    const m = model.get(id);
+                    if (q.cancel(@enumFromInt(id))) |removed| {
+                        try testing.expectEqual(m != null, removed);
+                        if (m) |mm| try testing.expect(mm.status != .leased);
+                        _ = model.remove(id);
+                        reach.cancels += @intFromBool(removed);
+                    } else |e| {
+                        try testing.expectEqual(CancelError.JobLeased, e);
+                        try testing.expect(m.?.status == .leased);
+                    }
+                },
+                9 => {
+                    const id = r.intRangeAtMost(u64, 1, q.next_id);
+                    const was_dead = if (model.get(id)) |m| m.status == .dead else false;
+                    try testing.expectEqual(was_dead, try q.requeueDead(@enumFromInt(id), .{ .reset_attempts = r.boolean() }));
+                    if (was_dead) {
+                        model.getPtr(id).?.status = .ready;
+                        reach.requeues += 1;
+                    }
+                },
+                10 => {
+                    // Crash: leases are lost, every leased job comes back ready.
+                    q.close();
+                    q = try h.openQueue();
+                    leases.clearRetainingCapacity();
+                    var it = model.valueIterator();
+                    while (it.next()) |m| if (m.status == .leased) {
+                        m.status = .ready;
+                    };
+                    reach.reopens += 1;
+                },
+                else => {},
+            }
+            // The model and the queue agree on every job and every count.
+            var ready: usize = 0;
+            var dead: usize = 0;
+            var leased: usize = 0;
+            var it = model.iterator();
+            while (it.next()) |e| {
+                const st = q.status(@enumFromInt(e.key_ptr.*)) orelse return error.JobLost;
+                const want = e.value_ptr.status;
+                const same = st == want or (want == .ready and st == .scheduled);
+                if (!same) {
+                    std.debug.print("seed {d} job {d}: queue {t}, model {t}\n", .{ seed, e.key_ptr.*, st, want });
+                    return error.StatusMismatch;
+                }
+                switch (want) {
+                    .ready, .scheduled => ready += 1,
+                    .dead => dead += 1,
+                    .leased => leased += 1,
+                }
+            }
+            try testing.expectEqual(model.count(), q.totalCount());
+            try testing.expectEqual(ready, q.readyCount());
+            try testing.expectEqual(dead, q.deadLetterCount());
+            try testing.expectEqual(leased, q.leasedCount());
+            reach.dead += dead;
+        }
+    }
+    // Measured 2026-10-04: 588 acks, 683 cancels, 53 dead-letter requeues,
+    // 1 212 refused duplicates, 1 226 crashes, 15 439 dead job-steps.
+    try testing.expect(reach.cancels > 300);
+    try testing.expect(reach.acks > 300);
+    try testing.expect(reach.requeues > 30);
+    try testing.expect(reach.dups > 100);
+    try testing.expect(reach.reopens > 500);
+    try testing.expect(reach.dead > 1000);
+}
+
+// ── tests added for mutation survivors (2026-10-04) ─────────────────────────
+
+test "decodeJob refuses what this module never writes: a keyless v2, a dead job with max_attempts 0" {
+    // Canonical encoding: a job has exactly one record. A version-2 record
+    // exists only for a non-empty key, and max_attempts is ≥ 1 for every job
+    // (`enqueue` asserts it) — a dead record with 0 would make
+    // `requeueDead(.reset_attempts = false)` compute 0 - 1.
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    const keyed: Job = .{ .id = 1, .job_type = @constCast("t"), .payload = @constCast("p"), .partition = @constCast(""), .priority = .normal, .state = .ready, .attempts = 0, .max_attempts = 1, .run_at_ns = 0, .lease_epoch = 0, .unique_key = @constCast("k") };
+    const enc = try q.encodeJob(&keyed);
+    defer testing.allocator.free(enc);
+    // Drop the key: unique_len 0 and one byte shorter — lengths consistent.
+    var keyless: [64]u8 = undefined;
+    @memcpy(keyless[0 .. enc.len - 1], enc[0 .. enc.len - 1]);
+    std.mem.writeInt(u32, keyless[31..35], 0, .little);
+    try testing.expectError(Error.CorruptRecord, q.decodeJob(1, keyless[0 .. enc.len - 1]));
+
+    const plain: Job = .{ .id = 2, .job_type = @constCast("t"), .payload = @constCast(""), .partition = @constCast(""), .priority = .normal, .state = .dead, .attempts = 0, .max_attempts = 1, .run_at_ns = 0, .lease_epoch = 0 };
+    const enc2 = try q.encodeJob(&plain);
+    defer testing.allocator.free(enc2);
+    std.mem.writeInt(u32, enc2[7..11], 0, .little); // max_attempts 0, dead, attempts 0
+    try testing.expectError(Error.CorruptRecord, q.decodeJob(2, enc2));
+}
+
+test "open refuses a store with two live jobs holding one unique key" {
+    // `enqueue` never writes the second; a store that has them was written by
+    // something else, and serving it would break "one live job per key".
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    {
+        var q = try h.openQueue();
+        defer q.close();
+        _ = try q.enqueue("t", "a", .{ .unique_key = "same" });
+        const b = try q.enqueue("t", "b", .{ .unique_key = "other" });
+        // Overwrite job b's record with one carrying the same key as a.
+        const job = q.jobs.get(@intFromEnum(b)).?;
+        const forged: Job = .{ .id = job.id, .job_type = job.job_type, .payload = job.payload, .partition = job.partition, .priority = job.priority, .state = .ready, .attempts = 0, .max_attempts = job.max_attempts, .run_at_ns = job.run_at_ns, .lease_epoch = 0, .unique_key = @constCast("same") };
+        try q.persistJob(&forged);
+    }
+    try testing.expectError(Error.CorruptRecord, h.openQueue());
 }

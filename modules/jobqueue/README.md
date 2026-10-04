@@ -104,9 +104,21 @@ if (try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s })) |lease|
 // (like kv's caller-driven compact):
 _ = try q.reapExpiredLeases();
 
-// Inspect the dead-letter queue:
+// Inspect the dead-letter queue, retry or discard a dead job:
 const dead = try q.deadLetterList(gpa);
 defer jobqueue.Queue.freeDeadLetterList(gpa, dead);
+_ = try q.requeueDead(dead[0].id, .{});   // attempts reset, visible now (or .run_at)
+_ = try q.cancel(dead[1].id);             // durable delete; also for ready/scheduled jobs
+
+// A long job keeps its lease with a heartbeat:
+try q.extendLease(lease, 30 * std.time.ns_per_s);
+
+// At most one live job per key (until acked or cancelled), durable:
+_ = q.enqueue("welcome_email", payload, .{ .unique_key = "welcome:42" }) catch |e| switch (e) {
+    error.DuplicateJob => {}, // already queued
+    else => return e,
+};
+const where = q.status(id); // ?Status: .ready / .scheduled / .leased / .dead, null = gone
 ```
 
 `Options` carries the injectable `wall_clock` / `mono_clock`, the `max_payload`
@@ -129,6 +141,10 @@ consumer **idempotent**.
 - **Exactly-once** — this is at-least-once; the idempotent consumer is the
   app's job.
 - **Rate-limited dispatch** — compose the `ratelimit` module later.
+- **Since 2026-10-04:** job cancel (`cancel`), dead-letter retry
+  (`requeueDead`), lease heartbeat (`extendLease`), unique jobs
+  (`EnqueueOptions.unique_key`, `findUnique`) and `status` — no longer
+  deferred.
 - **Cron-expression schedules** — v1 has only `delay_ns` + `run_at`; no
   `* * * * *` parsing.
 - **A background maintenance thread & compaction-trigger policy** — the
