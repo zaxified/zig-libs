@@ -3042,6 +3042,50 @@ test "min/max: inclusive bounds → greater_than_equal / less_than_equal" {
     try testing.expect(edge.ok()); // inclusive
 }
 
+test "bounds: every lower bound accepts its exact edge, tree and streaming paths" {
+    // Mutation 2026-10-04: `n < min` → `n <= min`, and the same flip on the
+    // array `min_len` of both the tree path (`checkRule`) and the streaming
+    // path (`Walker.closeArray`), all survived -- only the upper edge was
+    // pinned. WHY the edge passes: `Rule.min`/`min_len` are inclusive (the
+    // JSON Schema `minimum`/`minItems`/`minLength` keywords, pydantic
+    // `ge`/`min_length`): a value AT the bound satisfies it, one below fails.
+    const schema = [_]Rule{
+        .{ .field = "n", .kind = .int, .min = 1 },
+        .{ .field = "s", .kind = .string, .min_len = 2 },
+        .{ .field = "a", .kind = .array, .min_len = 2 },
+    };
+    const at_edge = "{\"n\":1,\"s\":\"ab\",\"a\":[1,2]}";
+    var tree = try validateJson(testing.allocator, at_edge, &schema);
+    defer tree.deinit();
+    try testing.expect(tree.ok());
+    var stream = try validateJsonStreaming(testing.allocator, at_edge, &schema, .{});
+    defer stream.deinit();
+    try testing.expect(stream.ok());
+
+    const below = "{\"n\":0,\"s\":\"a\",\"a\":[1]}";
+    var tree_bad = try validateJson(testing.allocator, below, &schema);
+    defer tree_bad.deinit();
+    try testing.expectEqual(@as(usize, 3), tree_bad.errors.len);
+    try expectSchemaAgrees(below, &schema);
+    try expectSchemaAgrees(at_edge, &schema);
+}
+
+test "int gate: an integer beyond i64 fails closed with int_type" {
+    // Mutation 2026-10-04: `typeGate` accepting a `.number_string` that does
+    // not parse as i64 survived. std.json keeps an integer-shaped literal
+    // that overflows i64 as `.number_string`; `typeGate`'s contract (its doc:
+    // "counts as int only when it parses as one") and `rulesFor`'s i64 decode
+    // target both say such a value is not a valid `.int` -- accepting it
+    // would hand `parseInto` a value it cannot represent.
+    const schema = [_]Rule{.{ .field = "n", .kind = .int }};
+    var r = try validateJson(testing.allocator, "{\"n\":99999999999999999999}", &schema);
+    defer r.deinit();
+    try expectError(&r, "n", "int_type");
+    var ok_r = try validateJson(testing.allocator, "{\"n\":9223372036854775807}", &schema);
+    defer ok_r.deinit();
+    try testing.expect(ok_r.ok()); // i64 max still an int
+}
+
 test "length: string codes differ from array codes (pydantic)" {
     const schema = [_]Rule{
         .{ .field = "s", .kind = .string, .min_len = 2, .max_len = 4 },
@@ -3332,6 +3376,10 @@ test "format truth table: hostname" {
         "xn--nxasmq6b.example", // punycode shape
         "123.example",
         ("a" ** 63) ++ ".example", // longest legal label
+        // Exactly 253 bytes, the RFC 1035 §2.3.4 255-octet wire limit minus
+        // the leading length octet and the root label (mutation 2026-10-04:
+        // a 254 cap survived, only a 257-byte name was tested):
+        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 61),
     }, &.{
         "",
         "-bad.example", // hyphen at label start
@@ -3340,6 +3388,7 @@ test "format truth table: hostname" {
         "foo.example.com.", // trailing dot = empty last label
         "foo_bar.example", // underscore
         ("a" ** 64) ++ ".example", // label > 63
+        ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 62), // 254 bytes
         // 257 bytes of valid labels → total-length limit trips:
         ("a" ** 63) ++ "." ++ ("b" ** 63) ++ "." ++ ("c" ** 63) ++ "." ++ ("d" ** 63) ++ ".e",
     });
@@ -3775,6 +3824,10 @@ test "golden: the 400 error-body JSON is well-formed and byte-stable" {
 
 // ── tests: query + path params ──────────────────────────────────────────────
 
+fn isTrue(_: ?*anyopaque, v: Value) bool {
+    return v == .bool and v.bool;
+}
+
 test "query: coercion int/float/bool + parsing-failure codes" {
     const schema = [_]Rule{
         .{ .field = "n", .kind = .int, .required = true },
@@ -3788,6 +3841,14 @@ test "query: coercion int/float/bool + parsing-failure codes" {
     var good2 = try validateQuery(testing.allocator, "n=-7&b=0", &schema);
     defer good2.deinit();
     try testing.expect(good2.ok());
+
+    // "1" coerces to TRUE, as "0" does to false -- pydantic's lax str→bool
+    // set (mutation 2026-10-04: dropping "1" survived). The custom check sees
+    // the coerced value (`Custom.check` doc), so "1" → false would fail too.
+    const want_true = [_]Rule{.{ .field = "b", .kind = .bool, .custom = .{ .check = isTrue, .code = "not_true", .message = "" } }};
+    var one = try validateQuery(testing.allocator, "b=1", &want_true);
+    defer one.deinit();
+    try testing.expect(one.ok());
 
     var bad = try validateQuery(testing.allocator, "n=abc&x=1e&b=yep", &schema);
     defer bad.deinit();

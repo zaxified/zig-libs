@@ -6,7 +6,7 @@
 
 **Scope:** core — go-playground/validator v10.30.5 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -99,6 +99,21 @@ error → pathed-error mapping), query coercion/percent-decoding/duplicate-key h
 body, typed getter, 413 body cap, stacked Query+Body slot chain); an in-process `router`+`http.Server`
 +`http.Client` loopback integration run (invalid POST → 400 with handler never invoked; valid POST →
 decoded struct; bad query param → 400). Run: `zig build test-validate`.
+
+**Audit 2026-10-04 (mutation).** 58 schemata mutants over the input guards (`LimitScan`
+caps and depth, the error cap and `dedupeFrom`, `checkRule` bounds/`allow_null`/fail-closed
+numbers, `.any` constraints, the int gate, every `format` validator's limits, query
+coercion and percent-decoding, the streaming `Walker`'s array bounds, duplicate keys,
+`required` and dedupe): 54 killed, 4 equivalent, 0 left alive. Equivalent: a second
+`partial_number` count in `jsonLimitError` (`Scanner.initCompleteInput` never emits
+`partial_number` -- `endOfBufferInNumber` returns a whole `.number` at end of input);
+skipping `complete()` after a container closes (keys and values still alternate in pairs,
+so member and node counts and therefore every verdict are unchanged); the second-`@` check
+in `isEmail` (the domain goes through `isHostname`, which rejects `@`); the `/?#` scan of
+the scheme in `isUri` (the scheme loop already admits only ALPHA/DIGIT/`+-.`). Tests added
+for the 6 that were real gaps: inclusive lower bounds at their edge on both paths, an
+integer beyond i64 failing `int_type`, the exact 253/254-byte hostname edge, query `b=1`
+coercing to true.
 
 ## Backlog / deferred
 Regex-backed `pattern` support is a tracked future ADOPT dependency (README TODO) — not implemented;

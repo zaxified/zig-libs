@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (58 schemata mutants, 54 killed, 4 equivalent).
+  New tests pin the inclusive lower bounds (`min`, string and array `min_len`) at their exact
+  edge on the tree and the streaming path, an integer literal beyond i64 failing `int_type`,
+  the 253-byte hostname limit (254 rejected), and query `"1"` coercing to `true`. No code change.
+
 - **2026-09-30** — `Pattern.matcher` (new `Matcher`): a string `pattern` checked by a caller-supplied
   function (a regex from any library, or a hand-written test) with the expression's source text carried
   for the exported JSON Schema (`"pattern": source`) and the `string_pattern_mismatch` message. ⚠ An
