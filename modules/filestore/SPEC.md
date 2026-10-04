@@ -6,7 +6,7 @@
 
 **Scope:** core — peterbourgon/diskv (Go), scribble for the typed layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -137,6 +137,18 @@ hazard that remains reachable now that `putWithTTL` closes off self-inflicted re
 record TTL'd *before* the store was reconfigured to `ttl = false` (or by another writer sharing
 `base`) is still served past its deadline, correctly absent under the default, and still reapable by
 `sweep` regardless of the flag. Run: `zig build test-filestore`.
+
+**Audit 2026-10-04 (mutation).** 23 schemata mutants over `segmentSafe`, the name checks on
+every entry point, `putManyBytes` validation and directory sync, the TTL path (`getBytes`
+honouring expiry, `TtlDisabled`, the deadline, the `>=` edge, corrupt and whitespace-padded
+sidecars, `delete` clearing the sidecar), `sweep`, CAS, `list`'s filters, `listTyped`'s
+skip count and `versionOf`'s seed: 22 killed, 0 equivalent, 1 left alive. Alive: `sweep`'s
+re-check of the deadline after taking the key lock -- it only matters when a concurrent
+`putWithTTL` refreshes the deadline between the unlocked check and the lock, which no
+single-threaded test can place. Six survivors of the first run got one test: the 128-byte
+name edge, a bad key late in a `putManyBytes` batch writing nothing, `delete` removing the
+`.expiry` sidecar, a sidecar with a trailing newline, a subdirectory not listed as a key, and
+the version seed pinned to the bytes "filestor".
 
 ## Backlog / deferred
 None open from the original v1 backlog — TTL/expiry, ETag/version CAS, and cross-process ingest

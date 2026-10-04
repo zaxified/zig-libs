@@ -934,6 +934,65 @@ test "putWithTTL: present before the deadline, absent (via get) after — but li
     try t.expectEqualStrings("s1", keys[0]);
 }
 
+test "edges pinned by the 2026-10-04 mutation run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+    const gpa = std.testing.allocator;
+
+    // `segmentSafe`: 1..128 bytes.
+    try t.expect(segmentSafe("k" ** 128));
+    try t.expect(!segmentSafe("k" ** 129));
+
+    // `putManyBytes` validates EVERY key before writing any (a bad key late
+    // in the batch must not leave the earlier ones written, nor escape the
+    // kind directory).
+    try t.expectError(error.InvalidName, store.putManyBytes("batch", &.{
+        .{ .key = "ok", .bytes = "1" },
+        .{ .key = "../evil", .bytes = "2" },
+    }));
+    try t.expect((try store.getBytes(gpa, "batch", "ok")) == null);
+
+    // `putBytes` doc: "Call `delete` first ... to avoid inheriting a stale
+    // expiry" -- so `delete` must remove the `.expiry` sidecar too.
+    try store.putWithTTL("s", "k", "old", 10);
+    _ = try store.delete("s", "k");
+    try store.putBytes("s", "k", "new");
+    clk.now_ns = 1_000_000;
+    {
+        const got = (try store.getBytes(gpa, "s", "k")).?;
+        defer gpa.free(got);
+        try t.expectEqualStrings("new", got);
+    }
+
+    // The sidecar is a decimal text file; a trailing newline (an edited or
+    // `echo`-written deadline) still parses -- `readExpiry` trims it.
+    try store.putWithTTL("s", "e", "v", 10);
+    var pbuf: [900]u8 = undefined;
+    const sidecar = try store.sidecarPath(&pbuf, "s", "e", ".expiry");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sidecar, .data = "5\n" });
+    try t.expect((try store.getBytes(gpa, "s", "e")) == null);
+
+    // `list` reports records (regular files), not a subdirectory.
+    var dbuf: [640]u8 = undefined;
+    const kdir = try store.kindDir(&dbuf, "s");
+    var sbuf: [700]u8 = undefined;
+    try std.Io.Dir.cwd().createDir(std.testing.io, try std.fmt.bufPrint(&sbuf, "{s}/sub", .{kdir}), .default_dir);
+    const keys = try store.list(gpa, "s");
+    defer {
+        for (keys) |k| gpa.free(k);
+        gpa.free(keys);
+    }
+    for (keys) |k| try t.expect(!std.mem.eql(u8, k, "sub"));
+
+    // `version_seed` doc: "filestor" as bytes, so a `Version` is stable across
+    // restarts -- pinned against the bytes, not against itself.
+    try t.expectEqual(std.hash.Wyhash.hash(std.mem.readInt(u64, "filestor", .big), "abc"), versionOf("abc"));
+}
+
 test "sweep: removes only expired keys, leaves live-TTL and no-TTL keys untouched, returns the count" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

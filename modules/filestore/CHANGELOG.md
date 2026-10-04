@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (23 schemata mutants, 22 killed, 1 race-only survivor
+  documented in SPEC). One new test pins the 128-byte name edge, whole-batch validation in
+  `putManyBytes`, `delete` clearing the expiry sidecar, a newline-terminated sidecar, `list`
+  skipping subdirectories and the version seed. No code change.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, six findings
   from the 2026-09-04 audit. `delete` now `fsync`s its directory too (a
   deleted record could come back after a power loss — only `putBytes` synced
