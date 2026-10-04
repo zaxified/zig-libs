@@ -890,6 +890,52 @@ test "spin_ns: a worker keeps looking instead of parking, then parks" {
     }
 }
 
+test "spin_ns: a job submitted during the spin is taken at once, not when the spin runs out" {
+    // `Options.spin_ns` doc: a submit that lands during the spin "skips the
+    // wake, and the worker takes the job without entering the kernel" -- the
+    // spin watches `notify` for exactly that. With a 5 s spin the job must
+    // run long before the spin would have ended. Mutation 2026-10-04: a spin
+    // that ignored `notify` survived (the job then waited out the spin).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .spin_ns = 5 * std.time.ns_per_s });
+    defer pool.deinit();
+    sleepMsIo(io, 50); // the idle worker is now spinning
+    var c = Counter{};
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    awaitCount(io, &c, 1);
+    const ms = @divTrunc(t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds, std.time.ns_per_ms);
+    try testing.expect(ms < 2_500);
+}
+
+test "n_workers = 0 is clamped to one worker; registerSubmitter after drain is Shutdown" {
+    // `Options.n_workers` doc: "clamped to >= 1" -- a pool of zero workers
+    // would accept jobs that never run. `RegisterSubmitterError.Shutdown`:
+    // "The pool is shutting down; new submitters are refused." Mutation
+    // 2026-10-04: dropping either guard survived.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 0, .max_submitters = 1 });
+    defer pool.deinit();
+    try testing.expectEqual(@as(usize, 1), pool.workerCount());
+    var c = Counter{};
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    awaitCount(io, &c, 1);
+    pool.drain();
+    try testing.expectError(error.Shutdown, pool.registerSubmitter());
+}
+
 test "idle → wake: a submit into an idle pool runs promptly" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();

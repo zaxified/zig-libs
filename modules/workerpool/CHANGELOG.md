@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (23 schemata mutants, 21 killed, 2 race-only survivors
+  documented in SPEC §6). New tests: `n_workers = 0` clamps to one worker, `registerSubmitter`
+  after `drain` is `Shutdown`, a job submitted during the spin is taken at once. No code change.
+
 - **2026-09-30** — **New `WorkerPool.wait() bool`: block until the pool is idle without shutting it
   down** (Pithikos `thpool_wait`). Waiters park on their own futex word; a worker wakes them only when
   one is registered, so a pool nobody waits on pays one extra load per job. `false` after a
