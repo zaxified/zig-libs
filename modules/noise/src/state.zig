@@ -15,9 +15,15 @@ const Token = @import("token.zig").Token;
 
 // ── protocol-name fragments (spec §8) ────────────────────────────────────
 
+// A primitive type outside `std` (X448 from the `ed448` sibling, a
+// secp256k1 adapter, a hardware-backed AEAD) joins a suite by declaring its
+// spec §8 name: `pub const noise_name = "448";`. The `std` types below are
+// named here because `std` cannot carry the declaration.
+
 fn dhName(comptime T: type) []const u8 {
+    if (@hasDecl(T, "noise_name")) return T.noise_name;
     if (T == std.crypto.dh.X25519) return "25519";
-    @compileError("noise: no spec §8 protocol name for DH type " ++ @typeName(T));
+    @compileError("noise: no spec §8 protocol name for DH type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
 /// Spec §8's `ChaChaPoly`/`AESGCM` cipher-name fragment. BOTH
@@ -29,18 +35,20 @@ fn dhName(comptime T: type) []const u8 {
 /// initial chaining key, so returning two different strings here would fork
 /// the handshake transcript and silently break interop.
 fn cipherName(comptime T: type) []const u8 {
+    if (@hasDecl(T, "noise_name")) return T.noise_name;
     if (T == chachapoly.ChaCha20Poly1305) return "ChaChaPoly";
     if (T == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return "ChaChaPoly";
     if (T == std.crypto.aead.aes_gcm.Aes256Gcm) return "AESGCM";
-    @compileError("noise: no spec §8 protocol name for AEAD type " ++ @typeName(T));
+    @compileError("noise: no spec §8 protocol name for AEAD type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
 fn hashName(comptime T: type) []const u8 {
+    if (@hasDecl(T, "noise_name")) return T.noise_name;
     if (T == std.crypto.hash.sha2.Sha256) return "SHA256";
     if (T == std.crypto.hash.sha2.Sha512) return "SHA512";
     if (T == std.crypto.hash.blake2.Blake2s256) return "BLAKE2s";
     if (T == std.crypto.hash.blake2.Blake2b512) return "BLAKE2b";
-    @compileError("noise: no spec §8 protocol name for hash type " ++ @typeName(T));
+    @compileError("noise: no spec §8 protocol name for hash type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
 /// Bind a Noise cipher suite: `DH` (spec §4.1, e.g. `std.crypto.dh.X25519`),
@@ -51,6 +59,14 @@ fn hashName(comptime T: type) []const u8 {
 /// Blake2s256`, `.Blake2b512`). Returns a namespace holding `CipherState`/
 /// `SymmetricState`/`HandshakeState` (spec §5) parameterized on that
 /// choice, plus the suite's DH/hash byte widths.
+///
+/// Any other primitive plugs in by shape plus a `pub const noise_name`
+/// (spec §8 fragment): a DH type needs `public_length`, `seed_length`,
+/// `KeyPair` (`.public_key`, `.secret_key`, `generateDeterministic(seed)`)
+/// and `scalarmult(secret, public) ![shared]u8`; an AEAD the std AEAD shape
+/// with a 32-byte key, 12-byte nonce and 16-byte tag (its nonce counter is
+/// big-endian iff its name is `AESGCM`, spec §12); a hash the std hash
+/// shape with a 32- or 64-byte digest.
 pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type {
     return struct {
         /// The DH function type this suite was bound with (spec §4.1).
@@ -67,6 +83,17 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         pub const HASHLEN = Hash.digest_length;
         /// AEAD authentication-tag length (16 for every spec-named AEAD).
         pub const TAGLEN = Cipher.tag_length;
+        /// The spec §8 name suffix this suite contributes:
+        /// `"_25519_ChaChaPoly_SHA256"`.
+        pub const name_suffix = "_" ++ dhName(DH) ++ "_" ++ cipherName(Cipher) ++ "_" ++ hashName(Hash);
+
+        /// Whether a parsed protocol name (`patterns.parseProtocolName`)
+        /// names this suite's three algorithms.
+        pub fn matches(p: patterns.ProtocolName) bool {
+            return std.mem.eql(u8, p.dh, dhName(DH)) and
+                std.mem.eql(u8, p.cipher, cipherName(Cipher)) and
+                std.mem.eql(u8, p.hash, hashName(Hash));
+        }
         /// A DH keypair (spec §4.1's abstract `GENERATE_KEYPAIR()` result).
         pub const KeyPair = DH.KeyPair;
 
@@ -88,7 +115,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
         /// bytes then the 64-bit counter — little-endian for ChaChaPoly,
         /// big-endian for AESGCM (spec §12.3/§12.4).
         fn nonceBytes(n: u64) [Cipher.nonce_length]u8 {
-            const big = Cipher == std.crypto.aead.aes_gcm.Aes256Gcm;
+            const big = comptime std.mem.eql(u8, cipherName(Cipher), "AESGCM");
             var npub = [_]u8{0} ** Cipher.nonce_length;
             std.mem.writeInt(u64, npub[4..12], n, if (big) .big else .little);
             return npub;
@@ -415,6 +442,102 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 transport: ?[2]CipherState,
             };
 
+            /// The keys `init` takes. `e` is the spec's testing hook (leave
+            /// it null: `writeMessage` generates the ephemeral); `psks` holds
+            /// one 32-byte key per `psk` token, in order.
+            pub const Keys = struct {
+                s: ?KeyPair = null,
+                e: ?KeyPair = null,
+                rs: ?[DHLEN]u8 = null,
+                re: ?[DHLEN]u8 = null,
+                psks: []const [32]u8 = &.{},
+            };
+
+            pub const InitError = error{
+                /// The pattern needs a key this party was not given: its own
+                /// static (`s`) or a pre-message key (`rs`, `re`, `e`).
+                MissingKey,
+                /// `psks.len` is not the number of `psk` tokens.
+                PskCountMismatch,
+                /// The pattern breaks spec §7.3: a key sent twice, a DH
+                /// before both of its keys exist, no messages, a pre-message
+                /// token other than `e`/`s`, or a name too long for the
+                /// protocol-name buffer.
+                InvalidPattern,
+            };
+
+            /// The checked `initialize`: validates `pattern` (spec §7.3)
+            /// against the keys this party holds before anything is
+            /// processed, so that `writeMessage`/`readMessage` can never
+            /// reach a missing key or PSK (which `initialize` alone would
+            /// meet as a null unwrap or an out-of-bounds index). Use this
+            /// for any pattern built or parsed at run time.
+            pub fn init(
+                pattern: patterns.HandshakePattern,
+                initiator: bool,
+                prologue: []const u8,
+                keys: Keys,
+            ) InitError!HandshakeState {
+                try checkPattern(pattern, initiator, keys);
+                var hs: HandshakeState = .{};
+                hs.initialize(pattern, initiator, prologue, keys.s, keys.e, keys.rs, keys.re, keys.psks);
+                return hs;
+            }
+
+            fn checkPattern(pattern: patterns.HandshakePattern, initiator: bool, keys: Keys) InitError!void {
+                if (pattern.message_patterns.len == 0) return error.InvalidPattern;
+                if (pattern.name.len + 6 + name_suffix.len > 128) return error.InvalidPattern;
+                // Which public keys exist so far: [0] initiator, [1] responder.
+                var has_e = [2]bool{ false, false };
+                var has_s = [2]bool{ false, false };
+                const me: usize = if (initiator) 0 else 1;
+                const pre = [2][]const Token{ pattern.pre_message_initiator, pattern.pre_message_responder };
+                for (pre, 0..) |toks, side| for (toks) |t| switch (t) {
+                    .e => {
+                        if (has_e[side]) return error.InvalidPattern;
+                        has_e[side] = true;
+                        if (side == me and keys.e == null) return error.MissingKey;
+                        if (side != me and keys.re == null) return error.MissingKey;
+                    },
+                    .s => {
+                        if (has_s[side]) return error.InvalidPattern;
+                        has_s[side] = true;
+                        if (side == me and keys.s == null) return error.MissingKey;
+                        if (side != me and keys.rs == null) return error.MissingKey;
+                    },
+                    else => return error.InvalidPattern,
+                };
+                var psk_count: usize = 0;
+                for (pattern.message_patterns, 0..) |mp, m| {
+                    const sender: usize = m % 2;
+                    for (mp) |t| switch (t) {
+                        .e => {
+                            if (has_e[sender]) return error.InvalidPattern;
+                            has_e[sender] = true;
+                        },
+                        .s => {
+                            if (has_s[sender]) return error.InvalidPattern;
+                            has_s[sender] = true;
+                            if (sender == me and keys.s == null) return error.MissingKey;
+                        },
+                        .ee, .es, .se, .ss => {
+                            // Which key of each side: es = initiator e,
+                            // responder s; se = initiator s, responder e.
+                            const i_static = t == .se or t == .ss;
+                            const r_static = t == .es or t == .ss;
+                            const i_ok = if (i_static) has_s[0] else has_e[0];
+                            const r_ok = if (r_static) has_s[1] else has_e[1];
+                            // A DH on this party's static needs `has_s[me]`,
+                            // which the pre-message or `s` check above only
+                            // grants with `keys.s` present.
+                            if (!i_ok or !r_ok) return error.InvalidPattern;
+                        },
+                        .psk => psk_count += 1,
+                    };
+                }
+                if (psk_count != keys.psks.len) return error.PskCountMismatch;
+            }
+
             /// §5.3 `Initialize(handshake_pattern, initiator, prologue,
             /// s, e, rs, re)`: derives the protocol name (spec §8,
             /// `"Noise_" ++ pattern.name ++ "_25519_ChaChaPoly_SHA256"`
@@ -424,6 +547,9 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             /// public keys into the transcript hash, initiator's first).
             /// `e` is normally `null` (see the `e` field doc); `psks` must
             /// hold one 32-byte key per `psk` token in the pattern.
+            /// Unchecked: a missing key or PSK is a null unwrap / bounds
+            /// panic later (undefined behaviour in ReleaseFast) — `init`
+            /// validates first.
             pub fn initialize(
                 self: *HandshakeState,
                 pattern: patterns.HandshakePattern,
@@ -451,8 +577,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                     }
                 };
 
-                const suffix = comptime "_" ++ dhName(DH) ++ "_" ++
-                    cipherName(Cipher) ++ "_" ++ hashName(Hash);
+                const suffix = name_suffix;
                 var name_buf: [128]u8 = undefined;
                 std.debug.assert(pattern.name.len + 6 + suffix.len <= name_buf.len);
                 const protocol_name = std.fmt.bufPrint(

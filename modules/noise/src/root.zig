@@ -14,9 +14,10 @@
 //! **Status: implemented.** The `CipherState`/`SymmetricState`/`HandshakeState`
 //! methods (spec §5) are wired up over the comptime-parameterized `Suite`: DH
 //! exchange, AEAD seal/open, and the HKDF/HMAC ratchet all run. The
-//! handshake-pattern *data* (`NN`/`NK`/`XX`/`IK` token sequences, spec §7/§9)
-//! is real as well (patterns are pure specification text, not crypto). See
-//! `SPEC.md` and the official test vectors it references.
+//! handshake-pattern *data* is the whole rev-34 catalog (one-way, fundamental
+//! and deferred patterns, spec §7), with PSK modifiers (§9) and protocol-name
+//! parsing (§8); `HandshakeState.init` validates a pattern against the keys a
+//! party holds (§7.3). 87 cacophony vectors run byte-exact. See `SPEC.md`.
 //!
 //! Provenance: clean-room from the Noise Protocol Framework spec rev 34
 //! (noiseprotocol.org) — a public spec, not copyrightable expression, so no
@@ -32,7 +33,7 @@ const chachapoly = @import("chachapoly");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Generic Noise Protocol Framework (spec rev 34) — handshake patterns (NN/NK/XX/IK) over a comptime-parameterized DH/AEAD/hash suite.",
+    .doc = "Generic Noise Protocol Framework (spec rev 34) — all 38 one-way/fundamental/deferred patterns, PSK modifiers, protocol-name parsing, checked init, pluggable DH/AEAD/hash suite; cacophony vectors byte-exact.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -55,6 +56,13 @@ pub const Token = token.Token;
 
 pub const patterns = @import("patterns.zig");
 pub const HandshakePattern = patterns.HandshakePattern;
+/// `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` → pattern + algorithm names.
+pub const parseProtocolName = patterns.parseProtocolName;
+pub const ProtocolName = patterns.ProtocolName;
+/// Backing store for a pattern resolved at run time.
+pub const PatternStorage = patterns.Storage;
+/// A catalog pattern with PSK modifiers, at comptime: `withPsk(patterns.XX, &.{3})`.
+pub const withPsk = patterns.withPsk;
 
 pub const state = @import("state.zig");
 pub const Suite = state.Suite;
@@ -102,6 +110,7 @@ test {
     _ = token;
     _ = patterns;
     _ = state;
+    _ = @import("vectors_test.zig");
 }
 
 test "meta.deps is exactly {chachapoly} (the AEAD; NOT wireguard)" {

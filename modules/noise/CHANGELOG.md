@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core.** The whole rev-34 pattern catalog: one-way
+  `N`/`K`/`X`, the twelve fundamental and the twenty-three deferred patterns
+  (`patterns.catalog`, `patterns.byName`). PSK modifiers (`withPsk` at
+  comptime, `PatternStorage.parse`/`applyPsk` at run time, `psk0`..`psk4`,
+  combinable with `+`); `parseProtocolName` (`Noise_XXpsk3_25519_…`);
+  `Suite.matches`, `Suite.name_suffix`. `HandshakeState.init` — the checked
+  constructor: validates the pattern against the keys held (spec §7.3:
+  `MissingKey`, `PskCountMismatch`, `InvalidPattern`) so a missing key or PSK can
+  no longer reach a null unwrap or an out-of-bounds index. Pluggable primitives:
+  a DH/AEAD/hash type declaring `pub const noise_name` joins a suite (the AESGCM
+  big-endian nonce now follows the name). 87 cacophony vectors (snow's file) run
+  byte-exact, every pattern of the catalog anchored; seeded sweeps over random
+  patterns (whatever `init` accepts completes and agrees), damaged handshake
+  messages and hostile names; mutation 25 mutants, 0 surviving (4 equivalent
+  branches removed). Additive: `initialize` and every existing name unchanged.
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

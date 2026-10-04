@@ -29,11 +29,16 @@ so `bolt8` drives its secp256k1 handshake with its own state
 const noise = @import("noise");
 const std = @import("std");
 
-// Handshake-pattern data (real, spec §7/§9):
-noise.patterns.NN; // -> e ; <- e, ee
-noise.patterns.NK; // pre: <- s ; -> e, es ; <- e, ee
+// Handshake-pattern data, the whole rev-34 catalog (spec §7.4–§7.6):
+// one-way N/K/X, fundamental NN NK NX KN KK KX XN XK XX IN IK IX, and the
+// 23 deferred ones (NK1, X1K1, IX1, …) — `noise.patterns.catalog`.
 noise.patterns.XX; // -> e ; <- e, ee, s, es ; -> s, se
-noise.patterns.IK; // pre: <- s ; -> e, es, s, ss ; <- e, ee, se
+const xx3 = noise.withPsk(noise.patterns.XX, &.{3}); // XXpsk3 (spec §9.2), comptime
+
+// A protocol name, resolved at run time (spec §8):
+var storage: noise.PatternStorage = .{};
+const proto = try noise.parseProtocolName(&storage, "Noise_XXpsk3_25519_ChaChaPoly_SHA256");
+// proto.pattern, proto.dh / .cipher / .hash; S.matches(proto) checks the suite.
 
 // Cipher suite binding (spec §4) — comptime-parameterized on DH/AEAD/Hash:
 const S = noise.Suite(
@@ -44,10 +49,17 @@ const S = noise.Suite(
 // ...or the convenience alias for the same combination:
 const S2 = noise.DefaultSuite;
 
-var hs: S.HandshakeState = .{};
-// hs.initialize(...) then hs.writeMessage(...) / hs.readMessage(...)
-// drive the handshake; SymmetricState.split() then yields the two
-// transport CipherStates.
+// The checked constructor: validates the pattern against the keys this
+// party holds (spec §7.3) — MissingKey, PskCountMismatch, InvalidPattern —
+// so writeMessage/readMessage can never reach a missing key or PSK.
+var hs = try S.HandshakeState.init(proto.pattern, true, prologue, .{ .s = my_static, .psks = &.{psk} });
+// hs.writeMessage(...) / hs.readMessage(...) drive the handshake; the last
+// message's Step.transport carries the two transport CipherStates.
+// (`initialize` remains, unchecked.)
+
+// Any other primitive joins a suite by declaring its spec §8 name, e.g. an
+// X448 adapter over the `ed448` module: `pub const noise_name = "448";`
+// plus the std DH shape (public_length, seed_length, KeyPair, scalarmult).
 ```
 
 ## Verify
@@ -55,6 +67,10 @@ var hs: S.HandshakeState = .{};
 ```
 zig build test-noise
 ```
+
+87 cacophony vectors (snow's `tests/vectors/cacophony.txt`, a verbatim subset
+in `src/testdata/`, extracted by `tools/extract-vectors.py`) run byte-exact:
+every catalog pattern, every PSK variant in the file, all eight 25519 suites.
 
 ## Provenance
 

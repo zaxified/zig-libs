@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! What a protocol implementor does with `noise`: drive a full `Noise_XX`
-//! handshake (mutual authentication, static keys revealed over the wire
-//! rather than known in advance) between an initiator and a responder to
+//! What a protocol implementor does with `noise`: resolve a protocol name
+//! (`Noise_XXpsk3_25519_ChaChaPoly_SHA256`), open both sides with the
+//! checked `init`, drive the handshake (mutual authentication, static keys
+//! revealed over the wire, a pre-shared key mixed in at the end) between an
+//! initiator and a responder to
 //! completion, then use the derived transport `CipherState` pair to
 //! exchange one application message — and show that a tampered ciphertext
 //! fails closed by name rather than silently decoding garbage.
@@ -24,12 +26,23 @@ pub fn main() !void {
     var init_rng = std.Random.DefaultPrng.init(0xC0FFEE);
     var resp_rng = std.Random.DefaultPrng.init(0xDECAFBAD);
 
-    var initiator: Suite.HandshakeState = undefined;
-    var responder: Suite.HandshakeState = undefined;
-    // XX: neither side knows the other's static key in advance (both `rs`
-    // are null); both reveal their static key DURING the handshake.
-    initiator.initialize(noise.patterns.XX, true, "", init_static, null, null, null, &.{});
-    responder.initialize(noise.patterns.XX, false, "", resp_static, null, null, null, &.{});
+    // The protocol is named the way peers agree on it; the name resolves to
+    // the pattern (XX, a PSK mixed in at the end of message 3) and must name
+    // the suite this program binds.
+    var storage: noise.PatternStorage = .{};
+    const proto = try noise.parseProtocolName(&storage, "Noise_XXpsk3_25519_ChaChaPoly_SHA256");
+    if (!Suite.matches(proto)) return error.WrongSuite;
+    const psk = [_][32]u8{[_]u8{0x33} ** 32};
+
+    // XX: neither side knows the other's static key in advance (no `rs`);
+    // both reveal their static key DURING the handshake. `init` checks the
+    // pattern against the keys each side holds before anything runs ...
+    var initiator = try Suite.HandshakeState.init(proto.pattern, true, "", .{ .s = init_static, .psks = &psk });
+    var responder = try Suite.HandshakeState.init(proto.pattern, false, "", .{ .s = resp_static, .psks = &psk });
+    // ... and refuses a session the pattern cannot run, here one without the PSK.
+    if (Suite.HandshakeState.init(proto.pattern, true, "", .{ .s = init_static })) |_| {
+        return error.ExpectedRefusal;
+    } else |err| std.debug.print("{s} without its PSK: {t}\n", .{ proto.pattern.name, err });
 
     var wire: [256]u8 = undefined;
 
