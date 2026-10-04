@@ -48,6 +48,8 @@ pub const meta = .{
 pub const Builder = trie.Builder;
 pub const Pair = trie.Pair;
 pub const freezeFromPairs = trie.freezeFromPairs;
+pub const freezeFromPairsWith = trie.freezeFromPairsWith;
+pub const FreezeOptions = trie.FreezeOptions;
 pub const BuildError = trie.BuildError;
 pub const FreezeError = trie.FreezeError;
 
@@ -167,7 +169,7 @@ fn mutate(arena: std.mem.Allocator, rnd: std.Random, base: []const u8, edits: us
     return buf.items;
 }
 
-fn differentialRound(seed: u64, count: usize) !void {
+fn differentialRound(seed: u64, count: usize, fmt: trie.FreezeOptions) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -176,7 +178,7 @@ fn differentialRound(seed: u64, count: usize) !void {
 
     const pairs = try genKeys(arena, &prng, count);
     const oracle = try Oracle.build(arena, pairs);
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, pairs);
+    const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
     defer testing.allocator.free(buf);
     const f = try Frozen.load(buf);
     try testing.expectEqual(@as(u64, oracle.keys.len), f.keyCount());
@@ -220,10 +222,17 @@ fn differentialRound(seed: u64, count: usize) !void {
     }
 }
 
+const both_formats = [_]trie.FreezeOptions{ .v1, .{ .v2 = .{} } };
+
 test "differential: pruned automaton walk vs brute-force OSA over many key sets" {
-    var seed: u64 = 1;
-    while (seed <= 40) : (seed += 1) {
-        try differentialRound(seed, 40);
+    // Both trie formats: v2 compresses single-child chains into one edge, so
+    // the DP must extend a row per byte of `label ++ tail` and may prune in
+    // the middle of an edge.
+    for (both_formats) |fmt| {
+        var seed: u64 = 1;
+        while (seed <= 40) : (seed += 1) {
+            try differentialRound(seed, 40, fmt);
+        }
     }
 }
 
@@ -238,7 +247,7 @@ test "differential: adversarial hand-picked key sets and boundary queries" {
         &.{ .{ .key = "aaaa", .value = 1 }, .{ .key = "aaab", .value = 2 }, .{ .key = "aaba", .value = 3 }, .{ .key = "abaa", .value = 4 } }, // near-identical cluster
     };
     const queries = [_][]const u8{ "", "a", "the", "abcd", "abx", "město", "mesto", "aaaa", "zzz" };
-    for (sets) |pairs| {
+    for (both_formats) |fmt| for (sets) |pairs| {
         for (queries) |query| {
             var k: u8 = 0;
             while (k <= 4) : (k += 1) {
@@ -246,7 +255,7 @@ test "differential: adversarial hand-picked key sets and boundary queries" {
                 defer arena_state.deinit();
                 const arena = arena_state.allocator();
                 const oracle = try Oracle.build(arena, pairs);
-                const buf = try freezeFromPairs(testing.allocator, testing.allocator, pairs);
+                const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
                 defer testing.allocator.free(buf);
                 const f = try Frozen.load(buf);
 
@@ -263,7 +272,7 @@ test "differential: adversarial hand-picked key sets and boundary queries" {
                 }
             }
         }
-    }
+    };
 }
 
 test "round-trip: build → freeze → load → search equals in-memory brute force" {
@@ -298,7 +307,8 @@ test "positive control: a corrupted stored value makes search DISAGREE with the 
         .{ .key = "alpha", .value = 111 },
         .{ .key = "beta", .value = 222 },
     };
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, &pairs);
+    // Version 1: the walk below decodes v1 nodes by hand.
+    const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &pairs, .v1);
     defer testing.allocator.free(buf);
     // Clean index agrees with the oracle.
     {
@@ -366,16 +376,18 @@ fn runQueries(f: Frozen) void {
 }
 
 test "truncated buffers of every length load-fail or search safely, no panic" {
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, &.{
-        .{ .key = "hello", .value = 1 },
-        .{ .key = "help", .value = 2 },
-        .{ .key = "helm", .value = 3 },
-    });
-    defer testing.allocator.free(buf);
-    var len: usize = 0;
-    while (len < buf.len) : (len += 1) {
-        const f = Frozen.load(buf[0..len]) catch continue;
-        runQueries(f);
+    for (both_formats) |fmt| {
+        const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
+            .{ .key = "hello", .value = 1 },
+            .{ .key = "help", .value = 2 },
+            .{ .key = "helm", .value = 3 },
+        }, fmt);
+        defer testing.allocator.free(buf);
+        var len: usize = 0;
+        while (len < buf.len) : (len += 1) {
+            const f = Frozen.load(buf[0..len]) catch continue;
+            runQueries(f);
+        }
     }
 }
 
@@ -477,7 +489,7 @@ const mutated_seeds = [_][]const u8{
     fuzzSeed("\x01\x01" ++ "\x00\x18\xff"), // root_offset high byte → 0xff, RE-SEALED: MalformedRoot, not HeaderCorrupt
     fuzzSeed("\x01\x01" ++ "\x00\x0c\xff"), // node_region_len damaged, re-sealed: the bound the walk trusts
     fuzzSeed("\x01\x01" ++ "\x00\x10\xff"), // key_count damaged, re-sealed
-    fuzzSeed("\x01\x02" ++ "\x00\x04\x02"), // version → 2, re-sealed: UnsupportedVersion
+    fuzzSeed("\x01\x02" ++ "\x00\x04\x02"), // version → 2, re-sealed: now read as v2, whose footer fails its CRC (HeaderCorrupt)
     fuzzSeed("\x00\x01" ++ "\x00\x18\xff"), // ⭐ the same root_offset flip WITHOUT the re-seal: HeaderCorrupt — all the old harness could ever have measured
     fuzzSeed("\x01\x04" ++ "\x00\x28\xff\x00\x29\xff\x00\x2a\xff\x00\x2b\xff"), // four octets deep in the node region: edge labels and child offsets
     fuzzSeed("\x01\x08" ++ "\x00\x30\x00\x00\x31\x00\x00\x32\x00\x00\x33\x00\x00\x34\xff\x00\x35\xff\x00\x36\xff\x00\x37\xff"), // eight octets of node payload zeroed and maxed
@@ -500,12 +512,13 @@ fn fuzzMutated(base: []const u8, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: mutated-valid-buffer loader + search path never panic" {
-    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    // Version 1: the seed scripts name v1 header offsets.
+    const base = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "praha", .value = 1 },
         .{ .key = "prahasever", .value = 2 },
         .{ .key = "plzen", .value = 3 },
         .{ .key = "brno", .value = 4 },
-    });
+    }, .v1);
     defer testing.allocator.free(base);
     try std.testing.fuzz(base, fuzzMutated, .{ .corpus = &mutated_seeds });
 }
@@ -540,12 +553,13 @@ test "corpus: the mutation scripts actually damage the index, and reach the sear
     // The numbers the empty script cannot produce are the octets actually
     // changed and — the CRC trap — the DAMAGED buffers that still got past
     // `Header.load` into the bounded Levenshtein walk.
-    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    // Version 1: the seed scripts name v1 header offsets.
+    const base = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "praha", .value = 1 },
         .{ .key = "prahasever", .value = 2 },
         .{ .key = "plzen", .value = 3 },
         .{ .key = "brno", .value = 4 },
-    });
+    }, .v1);
     defer testing.allocator.free(base);
 
     var changed_total: usize = 0;

@@ -11,19 +11,22 @@
 //! mmap'd / read-only slice with no per-query allocation on the exact-lookup
 //! path.
 //!
-//! Three query shapes: exact `lookup`, a lexicographic `prefixIterator`, and a
-//! ranked `topN` completions helper with an explicit visit **budget** — the DoS
-//! guard that stops a one-character prefix from walking millions of keys.
+//! Query shapes: exact `lookup`, a lexicographic `prefixIterator` and `range`,
+//! a ranked `topN` completions helper with an explicit visit **budget** — the
+//! DoS guard that stops a one-character prefix from walking millions of keys —
+//! and an `after` cursor for the next page, common-prefix search
+//! (`prefixesOf` / `longestPrefix`), and rank ↔ key (`ordinal` / `keyAt`).
 //!
 //! Keys are arbitrary bytes and are compared bytewise. Unicode normalization
 //! (NFC/case-folding/diacritic-stripping) is the CALLER's responsibility: to get
 //! accent-insensitive matching, fold both the stored keys and the query prefix
 //! the same way before handing them to this module. See SPEC.md.
 //!
-//! Structure: a serialized byte-labelled trie with per-node `subtree_best`
-//! (max descendant value) for top-N pruning. Not minimized into a DAFSA (that
-//! is the documented deferred item); chosen for a robust, easily
-//! bounds-checkable frozen format over an untrusted buffer. See SPEC.md for the
+//! Structure: a serialized, path-compressed (format version 2) byte-labelled
+//! trie with per-node `subtree_best` (max descendant value) for top-N pruning,
+//! written children-first by a streaming builder (`SortedBuilder`). Not
+//! minimized into a DAFSA (that is the documented deferred item); chosen for a
+//! robust, easily bounds-checkable frozen format over an untrusted buffer. See SPEC.md for the
 //! design rationale and the wire format field-by-field.
 
 const std = @import("std");
@@ -46,6 +49,7 @@ pub const meta = .{
 
 const builder = @import("builder.zig");
 const query = @import("query.zig");
+const stream = @import("stream.zig");
 pub const format = @import("format.zig");
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -53,8 +57,15 @@ pub const format = @import("format.zig");
 pub const Builder = builder.Builder;
 pub const Pair = builder.Pair;
 pub const freezeFromPairs = builder.freezeFromPairs;
+pub const freezeFromPairsWith = builder.freezeFromPairsWith;
+pub const FreezeOptions = builder.FreezeOptions;
 pub const BuildError = builder.BuildError;
 pub const FreezeError = builder.FreezeError;
+
+/// Streaming v2 writer over keys in ascending order; see `stream.zig`.
+pub const SortedBuilder = stream.SortedBuilder;
+pub const StreamOptions = stream.Options;
+pub const StreamError = stream.Error;
 
 pub const Frozen = query.Frozen;
 pub const Completion = query.Completion;
@@ -62,8 +73,12 @@ pub const QueryOptions = query.QueryOptions;
 pub const TopNStatus = query.TopNStatus;
 pub const TopNResult = query.TopNResult;
 pub const PrefixIterator = query.PrefixIterator;
+pub const KeyIterator = query.KeyIterator;
+pub const Range = query.Range;
+pub const PrefixesOf = query.PrefixesOf;
 pub const LoadError = query.LoadError;
 pub const QueryError = query.QueryError;
+pub const OrdinalError = query.OrdinalError;
 pub const max_depth = query.max_depth;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ─────────────────────────
@@ -73,6 +88,7 @@ test {
     _ = @import("format.zig");
     _ = @import("builder.zig");
     _ = @import("query.zig");
+    _ = @import("stream.zig");
 }
 
 const testing = std.testing;
@@ -147,7 +163,7 @@ fn genKeys(arena: std.mem.Allocator, prng: *std.Random.DefaultPrng, count: usize
     return pairs;
 }
 
-fn differentialRound(seed: u64, count: usize) !void {
+fn differentialRound(seed: u64, count: usize, fmt: FreezeOptions) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -155,12 +171,24 @@ fn differentialRound(seed: u64, count: usize) !void {
 
     const pairs = try genKeys(arena, &prng, count);
     const oracle = try Oracle.build(arena, pairs);
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, pairs);
+    const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
     defer testing.allocator.free(buf);
-    const f = try Frozen.load(buf);
+    const f = try Frozen.loadVerified(buf);
     try testing.expectEqual(@as(u64, oracle.keys.len), f.keyCount());
 
     const rnd = prng.random();
+
+    // 0. ordinals: rank i ↔ oracle.keys[i], both directions.
+    if (f.hasOrdinals()) {
+        var okb: [64]u8 = undefined;
+        for (oracle.keys, oracle.vals, 0..) |k, v, i| {
+            try testing.expectEqual(@as(?u32, @intCast(i)), try f.ordinal(k));
+            const c = (try f.keyAt(@intCast(i), &okb)).?;
+            try testing.expectEqualStrings(k, c.key);
+            try testing.expectEqual(v, c.value);
+        }
+        try testing.expectEqual(@as(?Completion, null), try f.keyAt(@intCast(oracle.keys.len), &okb));
+    }
     var kb: [64]u8 = undefined;
 
     // Probe set: every stored key, random prefixes of them, and random noise.
@@ -235,9 +263,78 @@ fn differentialRound(seed: u64, count: usize) !void {
                 try testing.expectEqual(mv.items[i], r.items[i].value);
                 try testing.expectEqualStrings(mk.items[i], r.items[i].key);
             }
+
+            // 4. pagination: pages of 3 chained by `after` give the same
+            //    ranking, every item exactly once.
+            var pres: [3]Completion = undefined;
+            var pkb: [3 * 64]u8 = undefined;
+            var after: ?Completion = null;
+            var got: usize = 0;
+            while (true) {
+                const page = try f.topN(query_key, &pres, &pkb, .{ .max_visited = 0, .after = after });
+                if (page.items.len == 0) break;
+                for (page.items) |c| {
+                    try testing.expect(got < mk.items.len);
+                    try testing.expectEqual(mv.items[got], c.value);
+                    try testing.expectEqualStrings(mk.items[got], c.key);
+                    got += 1;
+                }
+                after = page.items[page.items.len - 1];
+            }
+            try testing.expectEqual(mk.items.len, got);
+        }
+
+        // 5. common-prefix search: the oracle keys that are prefixes of the
+        //    probe, in sorted order (= by length).
+        {
+            var it = try f.prefixesOf(query_key);
+            for (oracle.keys, oracle.vals) |ok, ov| {
+                if (!Oracle.hasPrefix(query_key, ok)) continue;
+                const got = (try it.next()) orelse return error.TrieYieldedTooFew;
+                try testing.expectEqualStrings(ok, got.key);
+                try testing.expectEqual(ov, got.value);
+            }
+            try testing.expect((try it.next()) == null);
+        }
+
+        // 6. range: the probe as one bound, a random key/noise as the other,
+        //    random inclusivity; the oracle filters its sorted list.
+        {
+            const other: []const u8 = if (oracle.keys.len > 0 and rnd.boolean())
+                oracle.keys[rnd.intRangeLessThan(usize, 0, oracle.keys.len)]
+            else
+                "bc"[0..rnd.intRangeAtMost(usize, 0, 2)];
+            const swap = rnd.boolean();
+            const r: Range = .{
+                .lo = if (rnd.intRangeLessThan(u8, 0, 5) == 0) null else if (swap) other else query_key,
+                .lo_inclusive = rnd.boolean(),
+                .hi = if (rnd.intRangeLessThan(u8, 0, 5) == 0) null else if (swap) query_key else other,
+                .hi_inclusive = rnd.boolean(),
+            };
+            var it = try f.range(arena, r, 0);
+            defer it.deinit();
+            var rkb: [64]u8 = undefined;
+            for (oracle.keys, oracle.vals) |ok, ov| {
+                if (r.lo) |lo| switch (std.mem.order(u8, ok, lo)) {
+                    .lt => continue,
+                    .eq => if (!r.lo_inclusive) continue,
+                    .gt => {},
+                };
+                if (r.hi) |hi| switch (std.mem.order(u8, ok, hi)) {
+                    .gt => continue,
+                    .eq => if (!r.hi_inclusive) continue,
+                    .lt => {},
+                };
+                const got = (try it.next(&rkb)) orelse return error.TrieYieldedTooFew;
+                try testing.expectEqualStrings(ok, got.key);
+                try testing.expectEqual(ov, got.value);
+            }
+            try testing.expect((try it.next(&rkb)) == null);
         }
     }
 }
+
+const all_formats = [_]FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } };
 
 fn rankBefore(av: u32, ak: []const u8, bv: u32, bk: []const u8) bool {
     if (av != bv) return av > bv;
@@ -245,9 +342,11 @@ fn rankBefore(av: u32, ak: []const u8, bv: u32, bk: []const u8) bool {
 }
 
 test "differential: real trie vs naive oracle across many random key sets" {
-    var seed: u64 = 1;
-    while (seed <= 30) : (seed += 1) {
-        try differentialRound(seed, 40);
+    for (all_formats) |fmt| {
+        var seed: u64 = 1;
+        while (seed <= 30) : (seed += 1) {
+            try differentialRound(seed, 40, fmt);
+        }
     }
 }
 
@@ -261,12 +360,12 @@ test "differential: adversarial hand-picked key sets" {
         &.{ .{ .key = "commonprefixA", .value = 1 }, .{ .key = "commonprefixB", .value = 2 }, .{ .key = "commonprefixC", .value = 3 } }, // differ only in final byte
         &.{ .{ .key = "měšťan", .value = 1 }, .{ .key = "město", .value = 2 }, .{ .key = "řeka", .value = 3 } }, // multi-byte Czech UTF-8
     };
-    for (sets) |pairs| {
+    for (all_formats) |fmt| for (sets) |pairs| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const oracle = try Oracle.build(arena, pairs);
-        const buf = try freezeFromPairs(testing.allocator, testing.allocator, pairs);
+        const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
         defer testing.allocator.free(buf);
         const f = try Frozen.load(buf);
         for (oracle.keys, oracle.vals) |k, v|
@@ -278,7 +377,7 @@ test "differential: adversarial hand-picked key sets" {
         var i: usize = 0;
         while (try it.next(&kb)) |_| i += 1;
         try testing.expectEqual(oracle.keys.len, i);
-    }
+    };
 }
 
 test "round-trip: pre-freeze answers equal post-freeze answers" {
@@ -313,7 +412,7 @@ test "large key set crosses the u16 offset boundary (node region > 64 KiB)" {
         const k = try std.fmt.bufPrint(&kbuf, "addr-{d:0>7}", .{i});
         try b.insert(k, i);
     }
-    const buf = try b.freeze(testing.allocator);
+    const buf = try b.freezeWith(testing.allocator, .v1);
     defer testing.allocator.free(buf);
     try testing.expect(buf.len > 65535); // node region crossed the boundary
     const f = try Frozen.load(buf);
@@ -329,7 +428,8 @@ test "positive control: a corrupted stored value makes the trie DISAGREE with th
         .{ .key = "alpha", .value = 111 },
         .{ .key = "beta", .value = 222 },
     };
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, &pairs);
+    // Version 1: the walk below decodes v1 nodes by hand.
+    const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, &pairs, .v1);
     defer testing.allocator.free(buf);
     // Sanity: a clean index agrees.
     {
@@ -382,11 +482,21 @@ test "permanent malformed control: a back-pointing child offset is rejected, not
 }
 
 test "truncated buffers of every length load-fail without panic" {
-    const buf = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    for (all_formats) |fmt| try truncatedRound(fmt);
+}
+
+fn truncatedRound(fmt: FreezeOptions) !void {
+    const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "hello", .value = 1 },
         .{ .key = "help", .value = 2 },
-    });
+    }, fmt);
     defer testing.allocator.free(buf);
+    // A v2 buffer is found from its END, so every proper prefix must refuse
+    // to load at all (the footer moved); v1 tolerates trailing bytes, so for
+    // it the point is only: no panic, no OOB.
+    if (fmt == .v2) {
+        for (0..buf.len) |n| try testing.expect(Frozen.load(buf[0..n]) catch null == null);
+    }
     var len: usize = 0;
     while (len < buf.len) : (len += 1) {
         // Every truncation either fails to load or loads a header but any query
@@ -407,6 +517,19 @@ fn runQueries(f: Frozen) void {
     var kb: [32]u8 = undefined;
     _ = f.lookup("a") catch {};
     _ = f.lookup("abc") catch {};
+    // The 2026-10-04 queries, bounded the same way as the walks below.
+    _ = f.longestPrefix("prahasever") catch {};
+    _ = f.ordinal("praha") catch {};
+    for (0..4) |i| _ = f.keyAt(@intCast(i), &kb) catch {};
+    if (f.range(testing.allocator, .{ .lo = "p", .hi = "q" }, 1000)) |it_const| {
+        var it = it_const;
+        defer it.deinit();
+        var guard: usize = 0;
+        while (guard < 100) : (guard += 1) {
+            const got = it.next(&kb) catch break;
+            if (got == null) break;
+        }
+    } else |_| {}
     var results: [4]Completion = undefined;
     var tkb: [4 * 32]u8 = undefined;
     _ = f.topN("", &results, &tkb, .{ .max_visited = 1000 }) catch {};
@@ -532,7 +655,7 @@ const mutated_seeds = [_][]const u8{
     fuzzSeed("\x01\x01" ++ "\x00\x18\xff"), // root_offset high byte → 0xff, RE-SEALED: MalformedRoot instead of HeaderCorrupt
     fuzzSeed("\x01\x01" ++ "\x00\x0c\xff"), // node_region_len damaged, re-sealed: the length the walk is bounded by
     fuzzSeed("\x01\x01" ++ "\x00\x10\xff"), // key_count damaged, re-sealed
-    fuzzSeed("\x01\x02" ++ "\x00\x04\x02"), // version → 2, re-sealed: UnsupportedVersion, not HeaderCorrupt
+    fuzzSeed("\x01\x02" ++ "\x00\x04\x02"), // version → 2, re-sealed: now read as a v2 buffer, whose footer (the last 24 bytes) fails its CRC — HeaderCorrupt
     fuzzSeed("\x00\x01" ++ "\x00\x18\xff"), // ⭐ the same root_offset flip WITHOUT the re-seal: HeaderCorrupt, the rejection path the old harness could only have measured
     fuzzSeed("\x01\x04" ++ "\x00\x28\xff\x00\x29\xff\x00\x2a\xff\x00\x2b\xff"), // four octets deep in the node region: edge labels and child offsets
     fuzzSeed("\x01\x08" ++ "\x00\x30\x00\x00\x31\x00\x00\x32\x00\x00\x33\x00\x00\x34\xff\x00\x35\xff\x00\x36\xff\x00\x37\xff"), // eight octets of node payload zeroed and maxed
@@ -558,12 +681,13 @@ fn fuzzMutated(base: []const u8, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: mutated-valid-buffer loader + query path never panic" {
-    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    // Version 1: the seed scripts below name v1 header offsets.
+    const base = try freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "praha", .value = 1 },
         .{ .key = "prahasever", .value = 2 },
         .{ .key = "plzen", .value = 3 },
         .{ .key = "brno", .value = 4 },
-    });
+    }, .v1);
     defer testing.allocator.free(base);
     try std.testing.fuzz(base, fuzzMutated, .{ .corpus = &mutated_seeds });
 }
@@ -598,12 +722,12 @@ test "corpus: the mutation scripts actually damage the index, and reach the trav
     // The numbers the empty script cannot produce are the octets actually
     // changed and — the CRC trap — the number of DAMAGED buffers that still got
     // past `Header.load` into the bounds-checked walk.
-    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    const base = try freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "praha", .value = 1 },
         .{ .key = "prahasever", .value = 2 },
         .{ .key = "plzen", .value = 3 },
         .{ .key = "brno", .value = 4 },
-    });
+    }, .v1);
     defer testing.allocator.free(base);
 
     var changed_total: usize = 0;
@@ -634,4 +758,152 @@ test "corpus: the mutation scripts actually damage the index, and reach the trav
     try testing.expectEqual(@as(usize, 5), damaged_and_loaded);
     try testing.expectEqual(@as(usize, 4), damaged_and_rejected);
     try testing.expectEqual(@as(usize, 2), damaged_and_verified);
+}
+
+// ── format 2: a deterministic corrupt-buffer sweep ───────────────────────────
+//
+// The Smith-driven harnesses above are pinned to version-1 offsets. This one
+// damages version-2 buffers from a seeded PRNG (never `Smith{ .in = random }`,
+// which collapses every ranged draw to its minimum) and RE-SEALS both CRCs on
+// most inputs, so the damage reaches the node walk instead of dying at the
+// footer check. Reach is measured, not assumed: the counts below are what
+// separates "every damaged buffer was rejected at the door" from "the walks
+// ran on damaged nodes and stayed in bounds".
+
+fn resealV2(buf: []u8) void {
+    if (buf.len < format.v2_front_size + format.v2_footer_size) return;
+    const foot = buf[buf.len - format.v2_footer_size ..];
+    const region = std.mem.readInt(u32, foot[0..4], .little);
+    const end = @min(buf.len - format.v2_footer_size, format.v2_front_size + @as(usize, region));
+    if (end >= format.v2_front_size)
+        std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(buf[format.v2_front_size..end]), .little);
+    var c = std.hash.Crc32.init();
+    c.update(buf[0..format.v2_front_size]);
+    c.update(foot[0..20]);
+    std.mem.writeInt(u32, foot[20..24], c.final(), .little);
+}
+
+const SweepReach = struct { loaded: usize = 0, verified: usize = 0, lookups_ok: usize = 0, corrupt: usize = 0 };
+
+fn sweepV2(base: []const u8, seeds: u64, reach: *SweepReach) !void {
+    var copy: [4096]u8 = undefined;
+    std.debug.assert(base.len <= copy.len);
+    var seed: u64 = 0;
+    while (seed < seeds) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        @memcpy(copy[0..base.len], base);
+        const buf = copy[0..base.len];
+        const flips = r.intRangeAtMost(usize, 1, 6);
+        for (0..flips) |_| {
+            // Mostly node bytes; sometimes the front or the footer.
+            const at = r.intRangeLessThan(usize, 0, buf.len);
+            buf[at] = switch (r.intRangeLessThan(u8, 0, 4)) {
+                0 => 0,
+                1 => 0xff,
+                2 => buf[at] ^ (@as(u8, 1) << r.intRangeLessThan(u3, 0, 7)),
+                else => r.int(u8),
+            };
+        }
+        if (r.intRangeLessThan(u8, 0, 8) != 0) resealV2(buf);
+        if (Frozen.loadVerified(buf)) |_| reach.verified += 1 else |_| {}
+        const f = Frozen.load(buf) catch continue;
+        reach.loaded += 1;
+        if (f.lookup("praha")) |_| {
+            reach.lookups_ok += 1;
+        } else |e| {
+            if (e == error.Corrupt) reach.corrupt += 1;
+        }
+        runQueries(f);
+    }
+}
+
+test "format 2: seeded corrupt-buffer sweep never panics, and reaches the walk" {
+    for ([_]FreezeOptions{ .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } }) |fmt| {
+        const base = try freezeFromPairsWith(testing.allocator, testing.allocator, &.{
+            .{ .key = "praha", .value = 1 },                                  .{ .key = "prahasever", .value = 2 },
+            .{ .key = "plzen", .value = 3 },                                  .{ .key = "brno", .value = 4 },
+            .{ .key = "", .value = 5 },                                       .{ .key = "pra", .value = 6 },
+            .{ .key = "prague-and-a-long-tail-that-compresses", .value = 7 },
+        }, fmt);
+        defer testing.allocator.free(base);
+        var reach: SweepReach = .{};
+        try sweepV2(base, 4000, &reach);
+        // Measured 2026-10-04: loaded 2789 / 2941, answered 1893 / 2134,
+        // Corrupt 896 / 807 (plain / ordinals). Most damaged
+        // buffers load (re-sealed), the walk answers on some and reports
+        // Corrupt on others. A harness that only ever hit the CRC check would
+        // show loaded ≈ 500 (the unsealed eighth) and corrupt = 0.
+        try testing.expect(reach.loaded > 2500);
+        try testing.expect(reach.lookups_ok > 1500);
+        try testing.expect(reach.corrupt > 600);
+    }
+}
+
+test "format 2: each load and decode check refuses its own damage" {
+    // One targeted damage per check (mutation 2026-10-04: the seeded sweep
+    // never asserts WHICH error, so dropping any single check below survived
+    // it). Each case re-seals what it does not mean to break.
+    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "ab", .value = 1 }, .{ .key = "ac", .value = 2 },
+    });
+    defer testing.allocator.free(base);
+    // Layout (hand-checked like the stream golden): @12 "ab" leaf (6 bytes),
+    // @18 "ac" leaf (6), @24 node "a" (two edges, so not merged; 17 bytes),
+    // @41 root (12 bytes); region 41 bytes.
+    const h = try format.Header.load(base);
+    try testing.expectEqual(@as(u32, 41), h.node_region_len);
+    try testing.expectEqual(@as(u32, 41), h.root_offset);
+    var buf: [128]u8 = undefined;
+    const n = base.len;
+
+    // Footer CRC: one footer byte flipped, NOT re-sealed.
+    @memcpy(buf[0..n], base);
+    buf[n - 24 + 8] ^= 1; // key_count
+    try testing.expectError(error.HeaderCorrupt, Frozen.load(buf[0..n]));
+
+    // Unknown header flag (bit 1), sealed: a feature, not damage.
+    @memcpy(buf[0..n], base);
+    buf[8] |= 0x02;
+    resealV2(buf[0..n]);
+    try testing.expectError(error.UnsupportedVersion, Frozen.load(buf[0..n]));
+
+    // One byte more than the footer accounts for, sealed: the region length
+    // no longer adds up to the buffer.
+    @memcpy(buf[0 .. n - 24], base[0 .. n - 24]);
+    buf[n - 24] = 0;
+    @memcpy(buf[n - 23 .. n + 1], base[n - 24 ..]);
+    resealV2(buf[0 .. n + 1]);
+    try testing.expectError(error.Truncated, Frozen.load(buf[0 .. n + 1]));
+
+    // root_offset inside the front header, sealed.
+    @memcpy(buf[0..n], base);
+    std.mem.writeInt(u32, buf[n - 24 + 4 ..][0..4], 4, .little);
+    resealV2(buf[0..n]);
+    try testing.expectError(error.MalformedRoot, Frozen.load(buf[0..n]));
+
+    // An unknown NODE flag bit on the root, sealed: loads, then every query
+    // that decodes the root refuses.
+    @memcpy(buf[0..n], base);
+    buf[41] |= 0x04;
+    resealV2(buf[0..n]);
+    try testing.expectError(error.Corrupt, (try Frozen.load(buf[0..n])).lookup("ab"));
+
+    // Edge labels out of order under node "a" ('c' before 'b'), sealed.
+    @memcpy(buf[0..n], base);
+    // "a" @24: flags, tail_len, best(4), n-1, then edges at 31 and 36.
+    std.mem.swap(u8, &buf[31], &buf[36]);
+    resealV2(buf[0..n]);
+    try testing.expectError(error.Corrupt, (try Frozen.load(buf[0..n])).lookup("ab"));
+
+    // An edge pointing at its own node (a v2 child must sit strictly BELOW
+    // its parent): the root's edge → 41, sealed.
+    @memcpy(buf[0..n], base);
+    std.mem.writeInt(u32, buf[41 + 8 ..][0..4], 41, .little);
+    resealV2(buf[0..n]);
+    const f = try Frozen.load(buf[0..n]);
+    try testing.expectError(error.Corrupt, f.lookup("ab"));
+
+    // Positive control: the untouched buffer answers.
+    try testing.expectEqual(@as(?u32, 1), try (try Frozen.loadVerified(base)).lookup("ab"));
 }

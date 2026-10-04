@@ -12,16 +12,20 @@ The module itself is general — any static string→`u32` set that needs prefix
 completion.
 
 - **Model after:** BurntSushi/`fst` (Rust), Lucene FST — the frozen-index
-  autocomplete lineage. (This build is a byte-labelled trie, not a minimized
-  FST/DAFSA; see `SPEC.md` for the A-vs-B decision and the deferred minimization.)
+  autocomplete lineage. (This build is a path-compressed byte-labelled trie,
+  not a minimized FST/DAFSA; see `SPEC.md` for the A-vs-B decision and the
+  deferred minimization.)
 - **Platform:** any — pure logic, no OS dependency (the only clock use is
   test-only benchmarking). **Role:** util. **Concurrency:** `reentrant` — a
   frozen buffer is immutable, so any number of threads may query one buffer
   concurrently with no synchronization.
 - **Deps:** none (`std` only).
 
-> **Status: implemented.** Build → freeze → zero-copy load → query is complete
-> and tested. A naive sorted-slice oracle differential (randomized, over
+> **Status: implemented (scope core since 2026-10-04).** Build → freeze →
+> zero-copy load → query is complete and tested. Frozen format **version 2**
+> (path-compressed, written by a streaming builder) is the default: the RÚIAN
+> address index went from 397 MB to 70 MB (140 → 24.6 B/key) and `topN` got 4×
+> faster; version-1 files still load. A naive sorted-slice oracle differential (randomized, over
 > adversarial key sets — prefix-of-another, duplicates, single-byte, very long,
 > shared-prefix, multi-byte UTF-8) pins `lookup`, prefix enumeration, and
 > top-N ordering; a corrupt-buffer fuzz harness pins the untrusted-buffer
@@ -85,7 +89,37 @@ var it = try f.prefixIterator(gpa, "p");        // lexicographic enumeration
 defer it.deinit();
 var kb: [256]u8 = undefined;                    // one key at a time: max-key is enough
 while (try it.next(&kb)) |c| { /* c.value, c.key */ }
+
+// Next page of a ranking: everything ranked after the last item shown.
+const page2 = try f.topN("p", &results, &key_buf, .{ .after = top.items[top.items.len - 1] });
+
+// A lexicographic range (fst's `range`); bounds may be open (null).
+var r = try f.range(gpa, .{ .lo = "pl", .hi = "pr" }, 10_000);
+defer r.deinit();
+
+// Stored keys that are prefixes of a text (marisa's common-prefix search).
+var ps = try f.prefixesOf("prahasever 12");
+while (try ps.next()) |c| { /* "praha", "prahasever", … shortest first */ }
+const longest = try f.longestPrefix("prahasever 12"); // ?Completion
+
+// Rank ↔ key (marisa's reverse lookup), on a buffer frozen with ordinals.
+const obuf = try b.freezeWith(gpa, .{ .v2 = .{ .ordinals = true } });
+const o = try trie.Frozen.load(obuf);
+const rank = try o.ordinal("praha");           // ?u32, 0-based in sorted order
+const back = try o.keyAt(rank.?, &kb);         // ?Completion
+
+// Streaming build from keys already in ascending order — to any writer, in
+// memory proportional to the longest key, not to the index (fst's model).
+var sb = try trie.SortedBuilder.init(gpa, w, .{}); // w: *std.Io.Writer (a file, a socket)
+defer sb.deinit();
+try sb.insert("plzen", 90);
+try sb.insert("praha", 100);
+try sb.finish();
 ```
+
+`Builder.freezeTo(writer, opts)` streams an unsorted in-memory build the same
+way. `freezeWith(gpa, .v1)` still writes version 1 for a reader built against
+an older module.
 
 A `Completion.key` borrows the caller's `key_buf`; it is valid only until that
 buffer is reused. `loadVerified` adds a one-time full node-region CRC check for
@@ -93,25 +127,33 @@ files crossing a trust boundary; queries are bounds-checked either way.
 
 ### Build-time memory
 
-The frozen buffer is compact (~40 B per key) and the **query side allocates
-nothing** on the `lookup` / `topN` paths — that is the deployed hot path and it
+The frozen buffer is compact (24.6 B per key on the RÚIAN address index in
+version 2) and the **query side allocates nothing** on the `lookup` / `topN` paths — that is the deployed hot path and it
 is lean. The **build** phase keeps the whole trie in just **two growable pools** (a node
 pool + an edge pool), so a millions-of-keys build is a handful of allocations,
 not two per node. That makes build RSS both low and **allocator-insensitive** —
 it does not blow up under a debug/safety allocator. Measured on this repo's host
 (synthetic address keys): build RSS is **linear**, ~80–300 B per key
 (≈ 80–300 MB per 1 M keys, freeing GPA at the low end, bare arena at the high
-end); the frozen output is ~40 MB per 1 M keys. Freeze is a one-time cost — ship
+end). Freeze is a one-time cost — ship
 the frozen buffer and never build in the request path. A bare `ArenaAllocator`
 still costs a little more than a freeing GPA (it never reuses a pool's old halves
 after a realloc), but both are safe at scale; see `SPEC.md` for the numbers.
 
 ### Frozen size depends heavily on how much keys share prefixes
 
-The "~40 B per key" figure above is a rough midpoint, not a guarantee: the
-frozen buffer's bytes-per-key ratio is a function of how much the keyset
-shares prefixes, and it swings **5.6x** across corpus shapes (A1 trie F7,
-2026-09-11). Measured, three corpus shapes:
+Version 2 (2026-10-04) compresses every single-child chain into one node, so
+an unshared key suffix costs about its own bytes instead of 16 bytes per byte.
+Measured on qap's real RÚIAN indexes (same keys, v1 → v2):
+
+| index | keys | v1 | v2 | v2 + ordinals |
+|---|---:|---:|---:|---:|
+| addresses | 2 835 455 | 397 MB, 140.0 B/key | **69.7 MB, 24.6 B/key** (5.7×) | 84.4 MB, 29.8 B/key |
+| streets | 97 179 | 12.3 MB, 126.9 B/key | **2.5 MB, 25.7 B/key** (4.9×) | 3.1 MB, 31.7 B/key |
+
+The bytes-per-key ratio is still a function of how much the keyset shares
+prefixes. Version-1 measurements across corpus shapes (A1 trie F7,
+2026-09-11; v2 is smaller on each, most on the long-suffix ones):
 
 | corpus | B/key | × raw key bytes |
 |---|---:|---:|

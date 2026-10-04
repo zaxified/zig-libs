@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Reads `trie` format version 2** (path-compressed, now
+  `trie`'s default): the Levenshtein walk extends one DP row per byte of each
+  edge's `label ++ tail` and may prune in the middle of an edge; the root comes
+  from `trie.Frozen.rootNode`. Results are unchanged — the differential against
+  brute-force OSA runs on both formats. `freezeFromPairsWith` / `FreezeOptions`
+  are re-exported. Tests that decode v1 nodes by hand, and the fuzz seeds that
+  name v1 header offsets, now build version 1 explicitly.
+
 - **2026-09-07** — **Tests:** both fuzz harnesses were dead, the mutation one
   twice. `fuzzRandom` filled a buffer with `smith.bytes` and then drew the
   length with `valueRangeAtMost(u16, 0, buf.len)`; a ranged `Smith` draw reads

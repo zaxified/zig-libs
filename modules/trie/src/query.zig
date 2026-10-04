@@ -3,16 +3,24 @@
 //! query — the read side: load a frozen buffer and answer queries against it
 //! IN PLACE, with no copy of the index and (for `lookup`) no allocation at all.
 //!
-//! Three query shapes, in the brief's order of importance:
-//!   * `lookup(key)`        — exact match → the stored value, or null.
-//!   * `topN(prefix, …)`    — the best N completions under a prefix, ranked, with
-//!                            an explicit visit budget (the DoS guard).
-//!   * `prefixIterator(pfx)`— every key under a prefix, in lexicographic order.
+//! Query shapes:
+//!   * `lookup(key)`          — exact match → the stored value, or null.
+//!   * `topN(prefix, …)`      — the best N completions under a prefix, ranked,
+//!                              with a visit budget (the DoS guard) and an
+//!                              `after` cursor for the next page.
+//!   * `prefixIterator(pfx)`  — every key under a prefix, in lexicographic order.
+//!   * `range(lo, hi)`        — every key in a lexicographic range, in order.
+//!   * `prefixesOf(key)` / `longestPrefix(key)` — the stored keys that are
+//!                              prefixes of a text (dictionary segmentation,
+//!                              longest-prefix match).
+//!   * `ordinal(key)` / `keyAt(i)` — a key's rank in sorted order and the key
+//!                              at a rank (v2 buffers built with `ordinals`).
 //!
-//! Every offset followed out of the (possibly untrusted) buffer is bounds- and
-//! invariant-checked in `format`; a corrupt buffer yields `error.Corrupt`, never
-//! an OOB read, panic, or infinite loop. Traversal termination is guaranteed by
-//! the strictly-increasing child-offset invariant enforced in `format.follow`.
+//! Both frozen format versions are read; see `format`. Every offset followed
+//! out of the (possibly untrusted) buffer is bounds- and invariant-checked in
+//! `format`; a corrupt buffer yields `error.Corrupt`, never an OOB read, panic,
+//! or infinite loop. Termination is guaranteed by the strictly monotone
+//! child-offset invariant enforced in `format.follow`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,6 +28,9 @@ const format = @import("format.zig");
 
 pub const LoadError = format.LoadError;
 pub const QueryError = format.DecodeError || error{ KeyTooLong, TooComplex };
+/// `ordinal` / `keyAt` on a buffer without the per-edge counts (any v1
+/// buffer, or a v2 buffer frozen without `ordinals`).
+pub const OrdinalError = QueryError || error{NoOrdinals};
 
 /// Options controlling `topN`'s bounded work.
 pub const QueryOptions = struct {
@@ -30,11 +41,17 @@ pub const QueryOptions = struct {
     /// queries usually finish far under budget. 0 means "unbounded" (do not use
     /// on untrusted prefixes).
     max_visited: usize = 50_000,
+    /// Pagination cursor: when set, only completions ranked strictly AFTER
+    /// this one are considered — pass the last item of the previous page to
+    /// get the next page. The key is copied before the walk starts, so it may
+    /// point into the very `key_buf` this call writes. Each page is a fresh
+    /// walk (cost grows with the page number, still capped by `max_visited`).
+    after: ?Completion = null,
 };
 
-/// One completion returned by `topN` / `prefixIterator`. `key` borrows the
-/// caller-supplied key buffer, not the frozen index — it is valid until the
-/// buffer is reused.
+/// One completion returned by `topN` / the iterators. `key` borrows the
+/// caller-supplied key buffer (or, for `prefixesOf`, the caller's text), not
+/// the frozen index — it is valid until that buffer is reused.
 pub const Completion = struct { value: u32, key: []const u8 };
 
 pub const TopNStatus = enum {
@@ -50,6 +67,14 @@ pub const TopNResult = struct {
     status: TopNStatus,
 };
 
+/// A lexicographic key range for `Frozen.range`. A null bound is open.
+pub const Range = struct {
+    lo: ?[]const u8 = null,
+    lo_inclusive: bool = true,
+    hi: ?[]const u8 = null,
+    hi_inclusive: bool = false,
+};
+
 // ── Frozen: a loaded, query-ready view over a frozen buffer ──────────────────
 
 pub const Frozen = struct {
@@ -62,15 +87,15 @@ pub const Frozen = struct {
     pub fn load(buf: []const u8) LoadError!Frozen {
         const header = try format.Header.load(buf);
         // Bound the kept slice to exactly the node region `Header.load` just
-        // proved fits (`buf.len >= header_size + node_region_len`). `nodeAt`'s
-        // every bounds check is against this slice's `.len`, so this is what
-        // keeps a (possibly attacker-chosen) edge from ever resolving into the
-        // trailing padding `Header.load` tolerates on purpose ("an mmap'd file
-        // may be page-rounded") — see A1/trie.md F2: without it, `loadVerified`
-        // still reports success on a buffer whose padding was silently
-        // bit-flipped, because the CRC it checks never covered that padding
-        // and neither did any node's bounds check.
-        const end = format.header_size + @as(usize, header.node_region_len);
+        // proved fits. `nodeAt`'s every bounds check is against this slice's
+        // `.len`, so this is what keeps a (possibly attacker-chosen) edge from
+        // ever resolving into the trailing padding a v1 `Header.load`
+        // tolerates on purpose ("an mmap'd file may be page-rounded") — see
+        // A1/trie.md F2: without it, `loadVerified` still reports success on a
+        // buffer whose padding was silently bit-flipped, because the CRC it
+        // checks never covered that padding and neither did any node's bounds
+        // check. In v2 the same cut keeps nodes out of the footer.
+        const end = header.regionStart() + @as(usize, header.node_region_len);
         return .{ .buf = buf[0..end], .header = header };
     }
 
@@ -87,27 +112,56 @@ pub const Frozen = struct {
         return self.header.key_count;
     }
 
-    fn root(self: Frozen) QueryError!format.NodeView {
+    /// Whether `ordinal` / `keyAt` work on this buffer.
+    pub fn hasOrdinals(self: Frozen) bool {
+        return self.header.hasOrdinals();
+    }
+
+    /// The decoded root node, for walkers outside this module (`fuzzysearch`
+    /// runs its own DFS over `format.NodeView`). Children are reached with
+    /// `format.follow`; in v2 a child's incoming string is `label ++ tail`.
+    pub fn rootNode(self: Frozen) format.DecodeError!format.NodeView {
+        if (self.header.version == format.format_version_2) {
+            const r = try format.nodeAtV2(self.buf, self.header.root_offset, self.header.hasOrdinals());
+            if (r.tail.len != 0) return error.Corrupt; // a root has no incoming edge
+            return r;
+        }
         return format.nodeAt(self.buf, self.header.root_offset);
     }
 
-    /// Walk from the root consuming every byte of `prefix`. Returns the node the
-    /// prefix ends at (the root of that prefix's subtree), or null if the prefix
-    /// is not present as a path. Bounded by `prefix.len`.
-    fn seek(self: Frozen, prefix: []const u8) QueryError!?format.NodeView {
-        var node = try self.root();
-        for (prefix) |b| {
-            const e = node.findEdge(b) orelse return null;
+    const Seek = struct {
+        node: format.NodeView,
+        /// The part of `node`'s incoming tail AFTER the end of the prefix: a
+        /// v2 prefix may end in the middle of a compressed edge. Empty when the
+        /// prefix ends exactly at `node`.
+        rest: []const u8,
+    };
+
+    /// Walk from the root consuming every byte of `prefix`. Returns the node
+    /// whose subtree holds exactly the keys starting with `prefix`, or null if
+    /// no stored key does. Bounded by `prefix.len`.
+    fn seek(self: Frozen, prefix: []const u8) QueryError!?Seek {
+        var node = try self.rootNode();
+        var i: usize = 0;
+        while (i < prefix.len) {
+            const e = node.findEdge(prefix[i]) orelse return null;
             node = try format.follow(node, e.child);
+            i += 1;
+            const t = node.tail;
+            const m = @min(t.len, prefix.len - i);
+            if (!std.mem.eql(u8, t[0..m], prefix[i..][0..m])) return null;
+            i += m;
+            if (m < t.len) return .{ .node = node, .rest = t[m..] };
         }
-        return node;
+        return .{ .node = node, .rest = "" };
     }
 
     /// Exact lookup: the value stored for `key`, or null if `key` is not a
     /// stored key. Zero allocation; O(key.len) node decodes.
     pub fn lookup(self: Frozen, key: []const u8) QueryError!?u32 {
-        const node = (try self.seek(key)) orelse return null;
-        return if (node.terminal) node.value else null;
+        const s = (try self.seek(key)) orelse return null;
+        if (s.rest.len != 0) return null;
+        return if (s.node.terminal) s.node.value else null;
     }
 
     /// Top-N completions under `prefix`, ranked best-first, into the caller's
@@ -127,11 +181,11 @@ pub const Frozen = struct {
     /// effectively free); the frozen index itself is never copied. Call
     /// `deinit` when done.
     ///
-    /// ⚠ Unbounded: nothing in the wire format forbids two edges from pointing
-    /// at the same child, so a buffer that is not self-built (or otherwise
-    /// trusted) can encode far more keys than its size suggests — a buffer
-    /// under 1 KB can be built to enumerate 2^60 keys (A1/trie.md F1). Over an
-    /// untrusted buffer, use `prefixIteratorBounded` instead.
+    /// ⚠ Unbounded: nothing in the v1 wire format forbids two edges from
+    /// pointing at the same child (v2 likewise), so a buffer that is not
+    /// self-built (or otherwise trusted) can encode far more keys than its size
+    /// suggests — a buffer under 1 KB can be built to enumerate 2^60 keys
+    /// (A1/trie.md F1). Over an untrusted buffer, use `prefixIteratorBounded`.
     pub fn prefixIterator(self: Frozen, gpa: Allocator, prefix: []const u8) (QueryError || Allocator.Error)!PrefixIterator {
         return PrefixIterator.init(gpa, self, prefix, 0);
     }
@@ -148,6 +202,97 @@ pub const Frozen = struct {
         max_visited: usize,
     ) (QueryError || Allocator.Error)!PrefixIterator {
         return PrefixIterator.init(gpa, self, prefix, max_visited);
+    }
+
+    /// Iterate every key in `r` in lexicographic order (BurntSushi/fst's
+    /// `range`). Positioning on `r.lo` costs O(lo.len) node decodes; after
+    /// that each key costs what `prefixIterator` pays. `max_visited` bounds
+    /// the whole iteration like `prefixIteratorBounded` (0 = unbounded, for
+    /// self-built buffers only). For "the next page after key K", use
+    /// `.{ .lo = K, .lo_inclusive = false }`.
+    pub fn range(
+        self: Frozen,
+        gpa: Allocator,
+        r: Range,
+        max_visited: usize,
+    ) (QueryError || Allocator.Error)!PrefixIterator {
+        return PrefixIterator.initRange(gpa, self, r, max_visited);
+    }
+
+    /// Iterate the stored keys that are prefixes of `text`, shortest first
+    /// (marisa-trie's common-prefix search; darts' `commonPrefixSearch`). No
+    /// allocation; each `Completion.key` is a slice of `text`. O(text.len)
+    /// node decodes over the whole iteration.
+    pub fn prefixesOf(self: Frozen, text: []const u8) QueryError!PrefixesOf {
+        return .{ .node = try self.rootNode(), .text = text };
+    }
+
+    /// The longest stored key that is a prefix of `text`, or null.
+    pub fn longestPrefix(self: Frozen, text: []const u8) QueryError!?Completion {
+        var it = try self.prefixesOf(text);
+        var best: ?Completion = null;
+        while (try it.next()) |c| best = c;
+        return best;
+    }
+
+    /// The rank of `key` among the stored keys in ascending byte order
+    /// (0-based), or null when `key` is not stored. O(key.len) node decodes,
+    /// no allocation. Needs a v2 buffer frozen with `.ordinals = true`.
+    pub fn ordinal(self: Frozen, key: []const u8) OrdinalError!?u32 {
+        var node = try self.rootNode();
+        if (!self.header.hasOrdinals()) return error.NoOrdinals;
+        var acc: u64 = 0;
+        var i: usize = 0;
+        while (i < key.len) {
+            // The node's own key is a proper prefix of `key`: it sorts first.
+            if (node.terminal) acc += 1;
+            const e = node.findEdge(key[i]) orelse return null;
+            acc += e.before;
+            node = try format.follow(node, e.child);
+            i += 1;
+            const t = node.tail;
+            if (key.len - i < t.len or !std.mem.eql(u8, t, key[i..][0..t.len])) return null;
+            i += t.len;
+        }
+        if (!node.terminal) return null;
+        if (acc > std.math.maxInt(u32)) return error.Corrupt;
+        return @intCast(acc);
+    }
+
+    /// The key at rank `i` (0-based, ascending byte order) and its value,
+    /// reconstructed into `key_buf`; null when `i >= keyCount()`. The inverse
+    /// of `ordinal` — marisa-trie's reverse lookup. O(depth · log 256) node
+    /// work, no allocation. Needs a v2 buffer frozen with `.ordinals = true`.
+    pub fn keyAt(self: Frozen, i: u32, key_buf: []u8) OrdinalError!?Completion {
+        var node = try self.rootNode();
+        if (!self.header.hasOrdinals()) return error.NoOrdinals;
+        if (i >= self.header.key_count) return null;
+        var rem: u64 = i;
+        var len: usize = 0;
+        while (true) {
+            if (node.terminal) {
+                if (rem == 0) return .{ .value = node.value, .key = key_buf[0..len] };
+                rem -= 1;
+            }
+            // The header promised a key at this rank, so it must lie below.
+            if (node.edge_count == 0) return error.Corrupt;
+            // The last edge whose `before` is ≤ rem.
+            var lo: usize = 0;
+            var hi: usize = node.edge_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (node.edge(mid).before <= rem) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) return error.Corrupt;
+            const e = node.edge(lo - 1);
+            rem -= e.before;
+            const child = try format.follow(node, e.child);
+            if (len + 1 + child.tail.len > key_buf.len) return error.KeyTooLong;
+            key_buf[len] = e.label;
+            @memcpy(key_buf[len + 1 ..][0..child.tail.len], child.tail);
+            len += 1 + child.tail.len;
+            node = child;
+        }
     }
 };
 
@@ -182,6 +327,8 @@ const Selector = struct {
     key_buf: []u8,
     stride: usize,
     count: usize = 0,
+    /// Pagination: only items ranked strictly after this are kept.
+    after: ?Completion = null,
 
     fn init(results: []Completion, key_buf: []u8) Selector {
         const n = results.len;
@@ -196,6 +343,7 @@ const Selector = struct {
     fn consider(self: *Selector, value: u32, key: []const u8) QueryError!void {
         const n = self.results.len;
         if (n == 0) return;
+        if (self.after) |a| if (!better(a.value, a.key, value, key)) return;
         if (self.count == n and !better(value, key, self.results[n - 1].value, self.results[n - 1].key))
             return;
         if (key.len > self.stride) return error.KeyTooLong;
@@ -241,19 +389,29 @@ fn topNInto(
     opts: QueryOptions,
 ) QueryError!TopNResult {
     var sel = Selector.init(results, key_buf);
-    const sub = (try self.seek(prefix)) orelse
+    // The cursor key may alias `key_buf`, which the walk overwrites: copy it.
+    var after_store: [max_depth]u8 = undefined;
+    if (opts.after) |a| {
+        if (a.key.len > after_store.len) return error.KeyTooLong;
+        @memcpy(after_store[0..a.key.len], a.key);
+        sel.after = .{ .value = a.value, .key = after_store[0..a.key.len] };
+    }
+    const s = (try self.seek(prefix)) orelse
         return .{ .items = results[0..0], .status = .complete };
+    const sub = s.node;
 
-    // Reconstructed-key path buffer (prefix + labels), and the DFS frame stack.
+    // Reconstructed-key path buffer (prefix + the rest of a compressed edge
+    // the prefix ended in + labels and tails below), and the DFS frame stack.
     var path_store: [max_depth]u8 = undefined;
-    if (prefix.len > path_store.len) return error.KeyTooLong;
+    if (prefix.len + s.rest.len > path_store.len) return error.KeyTooLong;
     @memcpy(path_store[0..prefix.len], prefix);
-    var path_len: usize = prefix.len;
+    @memcpy(path_store[prefix.len..][0..s.rest.len], s.rest);
+    var path_len: usize = prefix.len + s.rest.len;
 
     const Frame = struct { node: format.NodeView, edge_idx: u16, mark: usize };
     var stack: [max_depth]Frame = undefined;
     var sp: usize = 0;
-    stack[sp] = .{ .node = sub, .edge_idx = 0, .mark = prefix.len };
+    stack[sp] = .{ .node = sub, .edge_idx = 0, .mark = path_len };
     sp += 1;
     if (sub.terminal) try sel.consider(sub.value, path_store[0..path_len]);
 
@@ -279,11 +437,13 @@ fn topNInto(
                 child.subtree_best < results[results.len - 1].value)
                 continue :outer;
 
-            if (path_len >= path_store.len or sp >= stack.len) return error.KeyTooLong;
+            if (path_len + 1 + child.tail.len > path_store.len or sp >= stack.len) return error.KeyTooLong;
+            const mark = path_len;
             path_store[path_len] = e.label;
-            path_len += 1;
+            @memcpy(path_store[path_len + 1 ..][0..child.tail.len], child.tail);
+            path_len += 1 + child.tail.len;
             if (child.terminal) try sel.consider(child.value, path_store[0..path_len]);
-            stack[sp] = .{ .node = child, .edge_idx = 0, .mark = path_len - 1 };
+            stack[sp] = .{ .node = child, .edge_idx = 0, .mark = mark };
             sp += 1;
         } else {
             path_len = top.mark;
@@ -294,19 +454,20 @@ fn topNInto(
     return .{ .items = results[0..sel.count], .status = status };
 }
 
-// ── prefix iterator ───────────────────────────────────────────────────────────
+// ── key iterator (prefix and range) ──────────────────────────────────────────
 
-/// Lexicographic-order iterator over every key under a prefix. Pull-based: the
-/// caller paces the work (the natural bound for enumeration), and each `next`
-/// reconstructs the key into a caller buffer. The frozen index is never copied.
+/// Lexicographic-order iterator over the keys under a prefix (`prefixIterator`)
+/// or in a range (`range`). Pull-based: the caller paces the work (the natural
+/// bound for enumeration), and each `next` reconstructs the key into a caller
+/// buffer. The frozen index is never copied.
 pub const PrefixIterator = struct {
     gpa: Allocator,
     frozen: Frozen,
-    /// Reconstructed key so far (prefix + labels along the DFS path).
+    /// Reconstructed key so far (labels and tails along the DFS path).
     path: std.ArrayListUnmanaged(u8) = .empty,
     stack: std.ArrayListUnmanaged(Frame) = .empty,
-    /// True once the subtree root's own terminal (if any) has been considered.
-    exhausted: bool,
+    /// Exclusive upper bound (owned), null when open.
+    hi: ?[]u8 = null,
     /// Node-decode budget for this iterator's whole lifetime. 0 (used by
     /// `Frozen.prefixIterator`) means unbounded — see `prefixIteratorBounded`.
     max_visited: usize = 0,
@@ -322,25 +483,99 @@ pub const PrefixIterator = struct {
     };
 
     fn init(gpa: Allocator, frozen: Frozen, prefix: []const u8, max_visited: usize) (QueryError || Allocator.Error)!PrefixIterator {
-        var it = PrefixIterator{ .gpa = gpa, .frozen = frozen, .exhausted = false, .max_visited = max_visited };
-        const sub = (try frozen.seek(prefix)) orelse {
-            it.exhausted = true;
-            return it;
-        };
+        var it = PrefixIterator{ .gpa = gpa, .frozen = frozen, .max_visited = max_visited };
+        errdefer it.deinit();
+        const s = (try frozen.seek(prefix)) orelse return it;
         try it.path.appendSlice(gpa, prefix);
-        try it.stack.append(gpa, .{ .node = sub, .mark = prefix.len });
+        try it.path.appendSlice(gpa, s.rest);
+        try it.stack.append(gpa, .{ .node = s.node, .mark = it.path.items.len });
+        return it;
+    }
+
+    fn initRange(gpa: Allocator, frozen: Frozen, r: Range, max_visited: usize) (QueryError || Allocator.Error)!PrefixIterator {
+        var it = PrefixIterator{ .gpa = gpa, .frozen = frozen, .max_visited = max_visited };
+        errdefer it.deinit();
+
+        // Normalize to [lo, hi): K ++ 0x00 is the immediate successor of K in
+        // byte order, so an exclusive lo and an inclusive hi both become it.
+        var lo_owned: std.ArrayListUnmanaged(u8) = .empty;
+        defer lo_owned.deinit(gpa);
+        if (r.lo) |lo| {
+            try lo_owned.appendSlice(gpa, lo);
+            if (!r.lo_inclusive) try lo_owned.append(gpa, 0);
+        }
+        const lo = lo_owned.items;
+        if (r.hi) |hi| {
+            const h = try gpa.alloc(u8, hi.len + @intFromBool(r.hi_inclusive));
+            @memcpy(h[0..hi.len], hi);
+            if (r.hi_inclusive) h[hi.len] = 0;
+            it.hi = h;
+            if (std.mem.order(u8, lo, h) != .lt) return it; // empty range
+        }
+
+        // Descend along `lo`, leaving every frame positioned at its first edge
+        // whose subtree can hold a key ≥ lo. Invariant: path == lo[0..path.len].
+        var node = try frozen.rootNode();
+        var mark: usize = 0;
+        while (true) {
+            const d = it.path.items.len;
+            if (d == lo.len) {
+                try it.stack.append(gpa, .{ .node = node, .mark = mark });
+                break;
+            }
+            const b = lo[d];
+            // First edge with label ≥ b.
+            var lo_i: usize = 0;
+            var hi_i: usize = node.edge_count;
+            while (lo_i < hi_i) {
+                const mid = lo_i + (hi_i - lo_i) / 2;
+                if (node.edge(mid).label < b) lo_i = mid + 1 else hi_i = mid;
+            }
+            // This node's own key is a proper prefix of lo: below the range.
+            var frame = Frame{ .node = node, .edge_idx = @intCast(lo_i), .self_done = true, .mark = mark };
+            if (lo_i == node.edge_count or node.edge(lo_i).label != b) {
+                try it.stack.append(gpa, frame);
+                break;
+            }
+            const e = node.edge(lo_i);
+            const child = try format.follow(node, e.child);
+            const t = child.tail;
+            const want = lo[d + 1 ..];
+            const m = @min(t.len, want.len);
+            switch (std.mem.order(u8, t[0..m], want[0..m])) {
+                // The whole child subtree sorts below lo: start after it.
+                .lt => frame.edge_idx += 1,
+                // The whole child subtree sorts above lo: start at it.
+                .gt => {},
+                .eq => if (m == t.len) {
+                    // The edge is a prefix of the rest of lo: descend.
+                    frame.edge_idx += 1;
+                    try it.stack.append(gpa, frame);
+                    mark = d;
+                    try it.path.append(gpa, b);
+                    try it.path.appendSlice(gpa, t);
+                    node = child;
+                    continue;
+                },
+                // .eq with m < t.len: lo ends inside the edge, so every key
+                // below it is longer than lo with lo as prefix — above lo.
+            }
+            try it.stack.append(gpa, frame);
+            break;
+        }
         return it;
     }
 
     pub fn deinit(self: *PrefixIterator) void {
         self.path.deinit(self.gpa);
         self.stack.deinit(self.gpa);
+        if (self.hi) |h| self.gpa.free(h);
         self.* = undefined;
     }
 
-    /// Next key under the prefix, in lexicographic order, reconstructed into
-    /// `key_buf` (which the returned `key` borrows). null when exhausted.
-    /// `error.KeyTooLong` if a key does not fit `key_buf`.
+    /// Next key, in lexicographic order, reconstructed into `key_buf` (which
+    /// the returned `key` borrows). null when exhausted. `error.KeyTooLong` if
+    /// a key does not fit `key_buf`.
     pub fn next(self: *PrefixIterator, key_buf: []u8) (QueryError || Allocator.Error)!?Completion {
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
@@ -356,8 +591,16 @@ pub const PrefixIterator = struct {
                 if (self.max_visited != 0 and self.visited >= self.max_visited) return error.TooComplex;
                 self.visited += 1;
                 const child = try format.follow(top.node, e.child);
+                const mark = self.path.items.len;
                 try self.path.append(self.gpa, e.label);
-                try self.stack.append(self.gpa, .{ .node = child, .mark = self.path.items.len - 1 });
+                try self.path.appendSlice(self.gpa, child.tail);
+                if (self.hi) |h| if (std.mem.order(u8, self.path.items, h) != .lt) {
+                    // Every key from here on starts with this path or sorts
+                    // after it: all ≥ hi. Done.
+                    self.stack.clearRetainingCapacity();
+                    return null;
+                };
+                try self.stack.append(self.gpa, .{ .node = child, .mark = mark });
             } else {
                 const mark = top.mark;
                 self.path.shrinkRetainingCapacity(mark);
@@ -374,6 +617,39 @@ pub const PrefixIterator = struct {
     }
 };
 
+/// The name for a range iterator; the same type as `PrefixIterator`.
+pub const KeyIterator = PrefixIterator;
+
+/// Iterator over the stored keys that are prefixes of a text; see
+/// `Frozen.prefixesOf`. Allocation-free; every step moves strictly forward in
+/// the text, so it decodes at most `text.len + 1` nodes.
+pub const PrefixesOf = struct {
+    node: ?format.NodeView,
+    text: []const u8,
+    pos: usize = 0,
+    self_pending: bool = true,
+
+    pub fn next(self: *PrefixesOf) QueryError!?Completion {
+        while (self.node) |node| {
+            if (self.self_pending) {
+                self.self_pending = false;
+                if (node.terminal) return .{ .value = node.value, .key = self.text[0..self.pos] };
+            }
+            self.node = null;
+            if (self.pos == self.text.len) break;
+            const e = node.findEdge(self.text[self.pos]) orelse break;
+            const child = try format.follow(node, e.child);
+            const t = child.tail;
+            const at = self.pos + 1;
+            if (self.text.len - at < t.len or !std.mem.eql(u8, t, self.text[at..][0..t.len])) break;
+            self.pos = at + t.len;
+            self.node = child;
+            self.self_pending = true;
+        }
+        return null;
+    }
+};
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const builder = @import("builder.zig");
@@ -382,6 +658,13 @@ const testing = std.testing;
 fn build(pairs: []const builder.Pair) ![]u8 {
     return builder.freezeFromPairs(testing.allocator, testing.allocator, pairs);
 }
+
+fn buildWith(pairs: []const builder.Pair, opts: builder.FreezeOptions) ![]u8 {
+    return builder.freezeFromPairsWith(testing.allocator, testing.allocator, pairs, opts);
+}
+
+/// Every format the writer can produce; format-independent tests run on all.
+const all_formats = [_]builder.FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } };
 
 /// Hand-build a `k`-level chain where each non-terminal node has two edges
 /// ('a','b') pointing at the SAME next node, ending in one terminal leaf.
@@ -531,7 +814,10 @@ test "topN: a reconstructed key crossing max_depth is KeyTooLong via the path_le
     @memset(long_key[0..prefix_len], 'a');
     @memcpy(long_key[prefix_len..], "bcdefghijk");
     try b.insert(&long_key, 1);
-    const buf = try b.freeze(testing.allocator);
+    // Version 1 specifically: one node per byte is what makes `sp` grow by
+    // one per suffix byte. (In v2 the suffix is one compressed edge; the
+    // test below covers that path.)
+    const buf = try b.freezeWith(testing.allocator, .v1);
     defer testing.allocator.free(buf);
     const f = try Frozen.load(buf);
 
@@ -540,14 +826,48 @@ test "topN: a reconstructed key crossing max_depth is KeyTooLong via the path_le
     try testing.expectError(error.KeyTooLong, f.topN(long_key[0..prefix_len], &results, &kb, .{}));
 }
 
+test "topN (v2): a key whose compressed edge would cross max_depth is KeyTooLong, at the boundary exactly" {
+    // Two keys share max_depth - 5 bytes, then diverge into 5- and 6-byte
+    // tails: the 5-byte one ends exactly at max_depth (fits), the 6-byte one
+    // one byte past it. The check is `path_len + 1 + tail.len > max_depth`.
+    var b = try builder.Builder.init(testing.allocator);
+    defer b.deinit();
+    var k1: [max_depth]u8 = undefined;
+    @memset(&k1, 'a');
+    k1[max_depth - 5] = 'b';
+    var k2: [max_depth + 1]u8 = undefined;
+    @memset(&k2, 'a');
+    k2[max_depth - 5] = 'c';
+    try b.insert(&k1, 1);
+    const buf1 = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf1);
+    const f1 = try Frozen.load(buf1);
+    var results: [2]Completion = undefined;
+    var kb: [2 * (max_depth + 1)]u8 = undefined;
+    const r = try f1.topN(k1[0 .. max_depth - 5], &results, &kb, .{});
+    try testing.expectEqual(@as(usize, 1), r.items.len);
+    try testing.expectEqual(max_depth, r.items[0].key.len);
+
+    try b.insert(&k2, 2);
+    const buf2 = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf2);
+    const f2 = try Frozen.load(buf2);
+    try testing.expectError(error.KeyTooLong, f2.topN(k1[0 .. max_depth - 5], &results, &kb, .{}));
+}
+
 test "loadVerified rejects a body bit-flip that load accepts" {
-    const buf = try build(&.{.{ .key = "hello", .value = 7 }});
-    defer testing.allocator.free(buf);
-    var corrupt = try testing.allocator.dupe(u8, buf);
-    defer testing.allocator.free(corrupt);
-    corrupt[format.header_size + 2] ^= 0xff; // flip a node byte
-    try testing.expect(Frozen.load(corrupt) != error.BodyCorrupt); // load still opens
-    try testing.expectError(error.BodyCorrupt, Frozen.loadVerified(corrupt));
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&.{.{ .key = "hello", .value = 7 }}, fmt);
+        defer testing.allocator.free(buf);
+        var corrupt = try testing.allocator.dupe(u8, buf);
+        defer testing.allocator.free(corrupt);
+        // A byte inside the node region: v1 nodes start at 36, v2 at 12 (and
+        // v2's last 24 bytes are the footer, which the footer CRC guards).
+        const h = try format.Header.load(buf);
+        corrupt[h.regionStart() + 2] ^= 0xff;
+        try testing.expect(Frozen.load(corrupt) != error.BodyCorrupt); // load still opens
+        try testing.expectError(error.BodyCorrupt, Frozen.loadVerified(corrupt));
+    }
 }
 
 test "an edge redirected into trailing padding is rejected, not silently followed" {
@@ -669,4 +989,202 @@ test "Selector.consider: stride == 0 (key_buf shorter than results.len) is KeyTo
     var sel = Selector.init(&results, &key_buf);
     try sel.consider(1, ""); // count 0 -> 1: an empty key fits an empty stride
     try testing.expectError(error.KeyTooLong, sel.consider(2, "")); // would have divided by self.stride == 0
+}
+
+test "a prefix ending inside a compressed edge still finds the keys below it" {
+    // v2 stores "carpet" under 'c' with tail "arpet"; the prefix "carp" ends
+    // inside that tail. lookup("carp") must miss (not a stored key), while the
+    // prefix queries must reconstruct the FULL key, not "carp".
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&.{ .{ .key = "carpet", .value = 3 }, .{ .key = "dog", .value = 1 } }, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        try testing.expectEqual(@as(?u32, null), try f.lookup("carp"));
+        try testing.expectEqual(@as(?u32, null), try f.lookup("carpets"));
+        try testing.expectEqual(@as(?u32, null), try f.lookup("carx"));
+        try testing.expectEqual(@as(?u32, 3), try f.lookup("carpet"));
+        var it = try f.prefixIterator(testing.allocator, "carp");
+        defer it.deinit();
+        var kb: [16]u8 = undefined;
+        try testing.expectEqualStrings("carpet", (try it.next(&kb)).?.key);
+        try testing.expect((try it.next(&kb)) == null);
+        var results: [2]Completion = undefined;
+        var tkb: [32]u8 = undefined;
+        const r = try f.topN("carp", &results, &tkb, .{});
+        try testing.expectEqual(@as(usize, 1), r.items.len);
+        try testing.expectEqualStrings("carpet", r.items[0].key);
+        try testing.expectEqual(@as(usize, 0), (try f.topN("carx", &results, &tkb, .{})).items.len);
+    }
+}
+
+test "range: bounds, inclusivity, and lo inside / beyond a compressed edge" {
+    // Sorted keys: "", a, ab, abc, abd, b, ba. Expected sets are read off that
+    // list by hand.
+    const pairs = [_]builder.Pair{
+        .{ .key = "", .value = 0 },    .{ .key = "a", .value = 1 },   .{ .key = "ab", .value = 2 },
+        .{ .key = "abc", .value = 3 }, .{ .key = "abd", .value = 4 }, .{ .key = "b", .value = 5 },
+        .{ .key = "ba", .value = 6 },
+    };
+    const Case = struct { r: Range, want: []const []const u8 };
+    const cases = [_]Case{
+        .{ .r = .{}, .want = &.{ "", "a", "ab", "abc", "abd", "b", "ba" } },
+        .{ .r = .{ .lo = "ab" }, .want = &.{ "ab", "abc", "abd", "b", "ba" } },
+        .{ .r = .{ .lo = "ab", .lo_inclusive = false }, .want = &.{ "abc", "abd", "b", "ba" } },
+        .{ .r = .{ .lo = "abb" }, .want = &.{ "abc", "abd", "b", "ba" } }, // lo not stored
+        .{ .r = .{ .lo = "abz" }, .want = &.{ "b", "ba" } }, // past a whole subtree
+        .{ .r = .{ .hi = "abd" }, .want = &.{ "", "a", "ab", "abc" } },
+        .{ .r = .{ .hi = "abd", .hi_inclusive = true }, .want = &.{ "", "a", "ab", "abc", "abd" } },
+        .{ .r = .{ .lo = "a", .hi = "b" }, .want = &.{ "a", "ab", "abc", "abd" } },
+        .{ .r = .{ .lo = "b", .hi = "b" }, .want = &.{} }, // empty
+        .{ .r = .{ .lo = "c", .hi = "a" }, .want = &.{} }, // inverted
+        .{ .r = .{ .lo = "", .lo_inclusive = false }, .want = &.{ "a", "ab", "abc", "abd", "b", "ba" } },
+        .{ .r = .{ .lo = "zzz" }, .want = &.{} },
+    };
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&pairs, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        for (cases) |c| {
+            var it = try f.range(testing.allocator, c.r, 0);
+            defer it.deinit();
+            var kb: [8]u8 = undefined;
+            for (c.want) |w| try testing.expectEqualStrings(w, (try it.next(&kb)).?.key);
+            try testing.expect((try it.next(&kb)) == null);
+        }
+    }
+    // lo ending inside a v2 compressed edge: "carpet" is one edge below the
+    // root, lo = "carp" must still return it, lo = "carq" must not.
+    const buf = try build(&.{ .{ .key = "carpet", .value = 1 }, .{ .key = "dog", .value = 2 } });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var kb: [8]u8 = undefined;
+    {
+        var it = try f.range(testing.allocator, .{ .lo = "carp" }, 0);
+        defer it.deinit();
+        try testing.expectEqualStrings("carpet", (try it.next(&kb)).?.key);
+        try testing.expectEqualStrings("dog", (try it.next(&kb)).?.key);
+    }
+    {
+        var it = try f.range(testing.allocator, .{ .lo = "carq", .hi = "carz" }, 0);
+        defer it.deinit();
+        try testing.expect((try it.next(&kb)) == null);
+    }
+}
+
+test "prefixesOf / longestPrefix: every stored prefix of a text, shortest first" {
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&.{
+            .{ .key = "", .value = 9 },       .{ .key = "pra", .value = 1 },
+            .{ .key = "praha", .value = 2 },  .{ .key = "prahasever", .value = 3 },
+            .{ .key = "prague", .value = 4 },
+        }, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var it = try f.prefixesOf("prahase");
+        const want = [_][]const u8{ "", "pra", "praha" };
+        for (want) |w| try testing.expectEqualStrings(w, (try it.next()).?.key);
+        try testing.expect((try it.next()) == null);
+        try testing.expectEqualStrings("prahasever", (try f.longestPrefix("prahasevernibrno")).?.key);
+        try testing.expectEqualStrings("", (try f.longestPrefix("brno")).?.key);
+    }
+}
+
+test "ordinal / keyAt are inverse over every stored key, and refuse buffers without counts" {
+    const pairs = [_]builder.Pair{
+        .{ .key = "b", .value = 1 }, .{ .key = "", .value = 2 },    .{ .key = "ab", .value = 3 },
+        .{ .key = "a", .value = 4 }, .{ .key = "abc", .value = 5 }, .{ .key = "ba", .value = 6 },
+    };
+    // Sorted: "", a, ab, abc, b, ba → ranks 0..5.
+    const sorted = [_][]const u8{ "", "a", "ab", "abc", "b", "ba" };
+    const buf = try buildWith(&pairs, .{ .v2 = .{ .ordinals = true } });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var kb: [8]u8 = undefined;
+    for (sorted, 0..) |k, i| {
+        try testing.expectEqual(@as(?u32, @intCast(i)), try f.ordinal(k));
+        try testing.expectEqualStrings(k, (try f.keyAt(@intCast(i), &kb)).?.key);
+    }
+    try testing.expectEqual(@as(?Completion, null), try f.keyAt(sorted.len, &kb));
+    try testing.expectEqual(@as(?u32, null), try f.ordinal("abd"));
+    try testing.expectEqual(@as(?u32, null), try f.ordinal("aa"));
+    var tiny: [2]u8 = undefined;
+    try testing.expectError(error.KeyTooLong, f.keyAt(3, &tiny));
+
+    for ([_]builder.FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
+        const plain = try buildWith(&pairs, fmt);
+        defer testing.allocator.free(plain);
+        const g = try Frozen.load(plain);
+        try testing.expectError(error.NoOrdinals, g.ordinal("a"));
+        try testing.expectError(error.NoOrdinals, g.keyAt(0, &kb));
+    }
+}
+
+test "topN pagination: pages chained by `after` enumerate the whole ranking once" {
+    // Values with ties so the key tie-break matters across page boundaries.
+    const pairs = [_]builder.Pair{
+        .{ .key = "a1", .value = 5 },  .{ .key = "a2", .value = 9 }, .{ .key = "a3", .value = 5 },
+        .{ .key = "a4", .value = 1 },  .{ .key = "a5", .value = 5 }, .{ .key = "a6", .value = 7 },
+        .{ .key = "b", .value = 100 },
+    };
+    // By (value desc, key asc): a2 9, a6 7, a1 5, a3 5, a5 5, a4 1.
+    const want = [_][]const u8{ "a2", "a6", "a1", "a3", "a5", "a4" };
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&pairs, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var results: [2]Completion = undefined;
+        var kb: [2 * 8]u8 = undefined;
+        var got: usize = 0;
+        var after: ?Completion = null;
+        while (true) {
+            // The same key_buf every page: `after.key` points into it.
+            const r = try f.topN("a", &results, &kb, .{ .after = after });
+            if (r.items.len == 0) break;
+            for (r.items) |c| {
+                try testing.expectEqualStrings(want[got], c.key);
+                got += 1;
+            }
+            after = r.items[r.items.len - 1];
+        }
+        try testing.expectEqual(want.len, got);
+    }
+}
+
+test "rootNode refuses a v2 root carrying a tail" {
+    // Hand-made v2 buffer: one node (the root), terminal, tail "x". A root has
+    // no incoming edge, so a tail there is corruption, not data.
+    const node = [_]u8{ format.terminal_bit, 1, 'x', 7, 0, 0, 0 };
+    var buf: [format.v2_front_size + node.len + format.v2_footer_size]u8 = undefined;
+    @memcpy(buf[0..4], format.magic);
+    std.mem.writeInt(u16, buf[4..6], format.format_version_2, .little);
+    std.mem.writeInt(u16, buf[6..8], format.endian_marker, .little);
+    std.mem.writeInt(u32, buf[8..12], 0, .little);
+    @memcpy(buf[12..][0..node.len], &node);
+    const foot = buf[12 + node.len ..];
+    std.mem.writeInt(u32, foot[0..4], node.len, .little);
+    std.mem.writeInt(u32, foot[4..8], 12, .little);
+    std.mem.writeInt(u64, foot[8..16], 1, .little);
+    std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(&node), .little);
+    var c = std.hash.Crc32.init();
+    c.update(buf[0..12]);
+    c.update(foot[0..20]);
+    std.mem.writeInt(u32, foot[20..24], c.final(), .little);
+    const f = try Frozen.loadVerified(&buf);
+    try testing.expectError(error.Corrupt, f.lookup(""));
+    // Positive control: the same node with tail_len 0 is a valid one-key index.
+    const ok_node = [_]u8{ format.terminal_bit, 0, 7, 0, 0, 0 };
+    var ok: [format.v2_front_size + ok_node.len + format.v2_footer_size]u8 = undefined;
+    @memcpy(ok[0..12], buf[0..12]);
+    @memcpy(ok[12..][0..ok_node.len], &ok_node);
+    const of = ok[12 + ok_node.len ..];
+    std.mem.writeInt(u32, of[0..4], ok_node.len, .little);
+    std.mem.writeInt(u32, of[4..8], 12, .little);
+    std.mem.writeInt(u64, of[8..16], 1, .little);
+    std.mem.writeInt(u32, of[16..20], std.hash.Crc32.hash(&ok_node), .little);
+    var c2 = std.hash.Crc32.init();
+    c2.update(ok[0..12]);
+    c2.update(of[0..20]);
+    std.mem.writeInt(u32, of[20..24], c2.final(), .little);
+    const g = try Frozen.loadVerified(&ok);
+    try testing.expectEqual(@as(?u32, 7), try g.lookup(""));
 }

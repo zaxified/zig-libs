@@ -44,7 +44,7 @@ walked over the frozen `trie`; (B) a standalone BK-tree frozen to a flat buffer;
 1. **It shares `trie`'s frozen zero-copy index and its proven, hard-won
    robustness.** The hardest part of a frozen, untrusted-file-facing index is a
    bounds-checked decoder that provably never panics / over-reads / loops on a
-   corrupt buffer. `trie` already has one, plus a **strictly-increasing
+   corrupt buffer. `trie` already has one, plus a **strictly monotone
    child-offset invariant** that makes traversal termination provable even on a
    hand-crafted cyclic buffer. Reusing it means fuzzysearch inherits all of that
    for free and adds only a query algorithm on top — far less new attack surface
@@ -97,17 +97,19 @@ indexing — the same contract as `trie`.
 
 ## Frozen wire format
 
-**Reused verbatim from `trie` (format version 1, magic `"ZTR1"`).** `fuzzysearch`
-defines no format of its own and adds no bytes. See `trie`'s SPEC for the header
-(36 bytes: magic, version, endian marker, flags, node-region length, key count,
-root offset, body CRC, header CRC) and node layout (flags/terminal, optional
-`value`, `subtree_best`, `edge_count`, sorted `{label, child_offset}` edges) field
-by field.
+**Reused verbatim from `trie` (both format versions, magic `"ZTR1"`).**
+`fuzzysearch` defines no format of its own and adds no bytes; see `trie`'s SPEC
+field by field. Since 2026-10-04 `trie` writes version 2 by default, which is
+path-compressed: one edge stands for `label ++ child.tail`, several bytes. The
+walk therefore keeps one DP row per BYTE of the path (not per node), extends it
+byte by byte along an edge, and prunes as soon as a row's minimum exceeds `k` —
+in the middle of an edge if need be. Version-1 buffers (one byte per edge) take
+the same code path with empty tails; the differential runs on both.
 
 `fuzzysearch` uses every trie field **except `subtree_best`**, which drives
 `trie`'s value-ranked top-N pruning and is irrelevant to distance-ranked fuzzy
 search; it is read past and ignored. No `format_version` bump is needed — a fuzzy
-search over a v1 trie buffer is a pure read-side capability.
+search over a trie buffer is a pure read-side capability.
 
 ## DoS / bounded-work model
 
@@ -155,7 +157,7 @@ and every offset is followed through `trie`'s bounds-checked `format.nodeAt` /
   corrupt-header (`HeaderCorrupt`), and out-of-region-root (`MalformedRoot`)
   buffers; `loadVerified` adds a node-region CRC (`BodyCorrupt`). A bad offset the
   search follows yields `error.Corrupt`.
-- **Termination** rests on the strictly-increasing bounded-offset invariant, not
+- **Termination** rests on `trie`'s strictly monotone bounded-offset invariant, not
   on trusting any length field — a corrupt `edge_count` can only make a node
   decode fail bounds-checking, never over-read; a back-pointing child offset is
   rejected, not looped. The `max_visited` budget additionally caps total work, so

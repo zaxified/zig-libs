@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **mvp → core.** Frozen **format version 2** is the default:
+  path-compressed (a single-child chain is one node whose `tail` holds the
+  merged bytes), compact leaves (no `subtree_best`, no edge count), children
+  before parents with the root last and the metadata in a 24-byte footer. On
+  qap's RÚIAN address index: 397 MB → 70 MB (140 → 24.6 B/key), `topN` mean
+  315 µs → 76 µs, every key cross-checked. Version-1 buffers still load and
+  answer every query; `freezeWith(gpa, .v1)` still writes one.
+  - **New:** `SortedBuilder` (streaming v2 writer over sorted keys to any
+    `std.Io.Writer`, memory ∝ longest key), `Builder.freezeWith` /
+    `freezeTo`, `freezeFromPairsWith`, `FreezeOptions`; `Frozen.range`
+    (`Range`, inclusive/exclusive bounds, budgeted), `prefixesOf` /
+    `longestPrefix`, `ordinal` / `keyAt` (with `.ordinals = true`, 4 bytes per
+    edge), `QueryOptions.after` (next page of a `topN` ranking),
+    `Frozen.rootNode` / `hasOrdinals`; `KeyIterator` names the range iterator
+    (same type as `PrefixIterator`), `OrdinalError` adds `NoOrdinals`.
+  - **Behaviour change:** `freeze` / `freezeFromPairs` now write version 2 — a
+    reader built against an older `trie` refuses it (`UnsupportedVersion`).
+    A version-2 buffer must be passed at its exact length (the footer is found
+    from the end), unlike v1's tolerated trailing padding.
+  - **Verification:** differential over v1 / v2 / v2+ordinals incl. range,
+    common prefixes, rank ↔ key and chained `topN` pages; a hand-derived v2
+    golden; one targeted damage per v2 load/decode check; a seeded
+    corrupt-buffer sweep with pinned reach (2 × 300 000 seeds clean); mutation
+    38 mutants, 0 surviving (1 argued equivalent). `fuzzysearch` walks v2.
+
 - **2026-09-10** — **Fixes (A1 audit F1–F5).** Five untrusted-input findings
   from the 2026-09-09 audit, closed:
   - **F1 (HIGH):** nothing in the wire format forbade two edges from pointing

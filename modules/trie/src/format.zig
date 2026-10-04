@@ -40,11 +40,21 @@
 //!     edge_count × edge, each: { u8 label, u32 child_offset }, sorted ascending
 //!       by label; child_offset is an absolute buffer offset, strictly greater
 //!       than this node's own offset.
+//!
+//! That is format VERSION 1. Version 2 (the default writer since 2026-10-04)
+//! is described in the "Format version 2" section further down: it keeps the
+//! magic and the `version` field at the same offsets (so one `Header.load`
+//! dispatches on it) and changes the rest. Readers accept both.
 
 const std = @import("std");
 
 pub const magic = "ZTR1";
+/// Version 1 — the layout documented at the top of this file. The name is kept
+/// for the hand-built v1 buffers in tests and in sibling modules.
 pub const format_version: u16 = 1;
+/// Version 2 — path-compressed, children before parents, footer metadata. See
+/// the "Format version 2" section. What `Builder.freeze` writes by default.
+pub const format_version_2: u16 = 2;
 pub const endian_marker: u16 = 0x0102;
 pub const header_size: usize = 36;
 
@@ -110,7 +120,15 @@ pub const Header = struct {
     /// NOT scan the whole node region; per-node bounds-checking during queries
     /// keeps traversal safe. Use `verifyBody` (via `loadVerified` in query.zig)
     /// for a full integrity check of an untrusted file.
+    ///
+    /// Dispatches on the `version` field (same offset in every version): 2 is
+    /// read by `loadV2`, everything else by the version-1 rules below, which
+    /// report any version other than 1 as `UnsupportedVersion` once the v1
+    /// header CRC holds.
     pub fn load(buf: []const u8) LoadError!Header {
+        if (buf.len >= 6 and std.mem.eql(u8, buf[0..4], magic) and
+            std.mem.readInt(u16, buf[4..6], .little) == format_version_2)
+            return loadV2(buf);
         if (buf.len < header_size) return error.Truncated;
         if (!std.mem.eql(u8, buf[0..4], magic)) return error.BadMagic;
         const want_hcrc = std.mem.readInt(u32, buf[32..36], .little);
@@ -146,13 +164,179 @@ pub const Header = struct {
     /// Separate from `load` so the fast path stays O(1); untrusted files should
     /// pass through here (via `Frozen.loadVerified`).
     pub fn verifyBody(self: Header, buf: []const u8) LoadError!void {
-        const start = header_size;
+        const start = self.regionStart();
         const end = start + @as(usize, self.node_region_len);
         if (buf.len < end) return error.Truncated;
-        const want = std.mem.readInt(u32, buf[28..32], .little);
+        const want = if (self.version == format_version_2)
+            std.mem.readInt(u32, buf[end + 16 ..][0..4], .little)
+        else
+            std.mem.readInt(u32, buf[28..32], .little);
         if (std.hash.Crc32.hash(buf[start..end]) != want) return error.BodyCorrupt;
     }
+
+    /// Absolute offset of the first node-region byte.
+    pub fn regionStart(self: Header) usize {
+        return if (self.version == format_version_2) v2_front_size else header_size;
+    }
+
+    /// v2 only: whether edges carry the `before` counts.
+    pub fn hasOrdinals(self: Header) bool {
+        return self.version == format_version_2 and self.flags & v2_flag_ordinals != 0;
+    }
+
+    /// Version-2 header: the 12-byte front plus the 24-byte footer, which must
+    /// END the buffer exactly (v2 tolerates no trailing padding — the footer is
+    /// found from the end). Same error vocabulary as version 1.
+    fn loadV2(buf: []const u8) LoadError!Header {
+        if (buf.len < v2_front_size + v2_footer_size) return error.Truncated;
+        const foot = buf[buf.len - v2_footer_size ..];
+        var crc = std.hash.Crc32.init();
+        crc.update(buf[0..v2_front_size]);
+        crc.update(foot[0..20]);
+        if (crc.final() != std.mem.readInt(u32, foot[20..24], .little)) return error.HeaderCorrupt;
+        if (std.mem.readInt(u16, buf[6..8], .little) != endian_marker) return error.BadEndian;
+        const flags = std.mem.readInt(u32, buf[8..12], .little);
+        // An unknown flag is a feature this build cannot read, not damage: the
+        // footer CRC above already held.
+        if (flags & ~v2_known_flags != 0) return error.UnsupportedVersion;
+        const node_region_len = std.mem.readInt(u32, foot[0..4], .little);
+        if (@as(usize, node_region_len) + v2_front_size + v2_footer_size != buf.len) return error.Truncated;
+        if (node_region_len == 0) return error.MalformedRoot;
+        const root_offset = std.mem.readInt(u32, foot[4..8], .little);
+        // The root is written LAST, so it lies inside the region; the decoder
+        // bounds the rest.
+        if (root_offset < v2_front_size or root_offset >= v2_front_size + @as(usize, node_region_len))
+            return error.MalformedRoot;
+        return .{
+            .version = format_version_2,
+            .flags = flags,
+            .node_region_len = node_region_len,
+            .key_count = std.mem.readInt(u64, foot[8..16], .little),
+            .root_offset = root_offset,
+        };
+    }
 };
+
+// ── Format version 2 ─────────────────────────────────────────────────────────
+//
+// Version 1 spends a whole node (11 bytes + a 5-byte edge in the parent) on
+// every byte of every key suffix no other key shares. On the RÚIAN address
+// index that is 140 bytes per key (2 835 455 keys, 397 MB; measured
+// 2026-10-04). Version 2 changes three things:
+//
+//   * Path compression. A non-terminal node with exactly one child is merged
+//     into that child: the child stores the bytes of the merged chain after
+//     the edge label as its `tail` (≤ 255 bytes; a longer chain keeps a node
+//     every 256 bytes). An edge therefore stands for the string `label ++
+//     child.tail`, and a key may end in the middle of it only as a PREFIX
+//     query — a stored key always ends at a node.
+//   * Compact nodes. A node without edges stores no `subtree_best` (it is
+//     its own value) and no edge count; the edge count is one byte (`n - 1`,
+//     a node has 1..256 edges).
+//   * Children BEFORE parents (post-order), the root last, and the metadata
+//     in a FOOTER. That is what lets `SortedBuilder` stream a buffer to any
+//     writer while holding only the current key's path: a node is written
+//     once all its children are, and nothing before it is revisited. The
+//     termination argument is the mirror image of v1's: a child's offset is
+//     strictly SMALLER than its parent's (`follow` enforces it) and never
+//     below the region start, so any walk visits strictly decreasing offsets.
+//
+// Optional (header flag bit 0, `v2_flag_ordinals`): each edge also carries
+// `before`, the number of stored keys under the node's earlier edges. With it
+// a key's rank in sorted order (`Frozen.ordinal`) and the key at a rank
+// (`Frozen.keyAt`) are O(depth) walks — marisa-trie's reverse lookup.
+//
+// Layout (all integers little-endian):
+//
+//   Front (12 bytes, offset 0):
+//     0   magic           [4]u8 = "ZTR1"
+//     4   version         u16   = 2
+//     6   endian_marker   u16   = 0x0102
+//     8   flags           u32   bit0 = ordinals; other bits must be 0
+//   Node region (offset 12, node_region_len bytes), root last.
+//   Footer (the LAST 24 bytes of the buffer):
+//     +0  node_region_len u32
+//     +4  root_offset     u32   absolute
+//     +8  key_count       u64
+//     +16 body_crc        u32   CRC-32 of the node region
+//     +20 footer_crc      u32   CRC-32 of front[0..12) ++ footer[0..20)
+//
+//   Node:
+//     u8  flags       bit0 = terminal, bit1 = has edges; other bits must be 0
+//     u8  tail_len    then tail_len bytes of tail (0 at the root)
+//     u32 value       present IFF terminal
+//     — present IFF has edges: —
+//     u32 subtree_best
+//     u8  edge_count - 1
+//     edge_count × { u8 label, u32 child_offset [, u32 before] } sorted strictly
+//       ascending by label; child_offset < this node's offset, ≥ 12.
+//   A node without edges has subtree_best = its value (0 if not terminal —
+//   only the root of an empty index is like that).
+
+pub const v2_front_size: usize = 12;
+pub const v2_footer_size: usize = 24;
+pub const v2_flag_ordinals: u32 = 0x1;
+pub const v2_known_flags: u32 = v2_flag_ordinals;
+pub const v2_edges_bit: u8 = 0x02;
+pub const v2_known_node_flags: u8 = terminal_bit | v2_edges_bit;
+pub const max_tail: usize = 255;
+pub const edge_size_ordinals: usize = 9; // label + child_offset + before
+
+/// Decode + fully bounds-check the version-2 node at `off`. The v2
+/// counterpart of `nodeAt`: `error.Corrupt` unless every field lies inside
+/// `buf` (the kept slice ends at the node region, so "inside `buf`" means
+/// inside the region), no unknown flag bit is set, and the edges are strictly
+/// ascending by label.
+pub fn nodeAtV2(buf: []const u8, off: u32, ordinals: bool) DecodeError!NodeView {
+    if (off < v2_front_size or off >= buf.len) return error.Corrupt;
+    var p: usize = off;
+    const flags = buf[p];
+    p += 1;
+    if (flags & ~v2_known_node_flags != 0) return error.Corrupt;
+    const terminal = (flags & terminal_bit) != 0;
+
+    if (p + 1 > buf.len) return error.Corrupt;
+    const tail_len: usize = buf[p];
+    p += 1;
+    if (p + tail_len > buf.len) return error.Corrupt;
+    const tail = buf[p .. p + tail_len];
+    p += tail_len;
+
+    var value: u32 = 0;
+    if (terminal) {
+        if (p + value_size > buf.len) return error.Corrupt;
+        value = std.mem.readInt(u32, buf[p..][0..4], .little);
+        p += value_size;
+    }
+
+    const stride: usize = if (ordinals) edge_size_ordinals else edge_size;
+    var best = value;
+    var edge_count: u16 = 0;
+    if (flags & v2_edges_bit != 0) {
+        if (p + best_size + 1 > buf.len) return error.Corrupt;
+        best = std.mem.readInt(u32, buf[p..][0..4], .little);
+        p += best_size;
+        edge_count = @as(u16, buf[p]) + 1;
+        p += 1;
+        if (p + @as(usize, edge_count) * stride > buf.len) return error.Corrupt;
+        var i: usize = 1;
+        while (i < edge_count) : (i += 1) {
+            if (buf[p + i * stride] <= buf[p + (i - 1) * stride]) return error.Corrupt;
+        }
+    }
+    return .{
+        .buf = buf,
+        .offset = off,
+        .terminal = terminal,
+        .value = value,
+        .subtree_best = best,
+        .edge_count = edge_count,
+        .edges_at = p,
+        .version = format_version_2,
+        .tail = tail,
+        .edge_stride = stride,
+    };
+}
 
 // ── Node decoding (bounds-checked; runs against untrusted buffers) ───────────
 
@@ -161,8 +345,8 @@ pub const Header = struct {
 /// record) lies inside the buffer, so the accessors below cannot read OOB.
 pub const NodeView = struct {
     buf: []const u8,
-    /// This node's own absolute offset — the anchor for the strictly-increasing
-    /// child-offset invariant.
+    /// This node's own absolute offset — the anchor for the child-offset
+    /// invariant (strictly greater than it in v1, strictly smaller in v2).
     offset: u32,
     terminal: bool,
     value: u32,
@@ -170,17 +354,42 @@ pub const NodeView = struct {
     edge_count: u16,
     /// Absolute offset of the first edge record.
     edges_at: usize,
+    /// Format version the node was decoded as; `follow` decodes the child the
+    /// same way and checks the direction that version promises.
+    version: u16 = format_version,
+    /// v2 only: the bytes of the incoming edge after its label (path
+    /// compression). The full string the parent's edge stands for is
+    /// `label ++ tail`. Always empty in v1, and empty at a v2 root.
+    tail: []const u8 = "",
+    /// Bytes per edge record: `edge_size` (5), or `edge_size_ordinals` (9)
+    /// in a v2 buffer built with ordinals.
+    edge_stride: usize = edge_size,
 
-    pub const Edge = struct { label: u8, child: u32 };
+    pub const Edge = struct {
+        label: u8,
+        child: u32,
+        /// v2 with ordinals only (0 otherwise): the number of stored keys in
+        /// the subtrees of the edges BEFORE this one under the same node.
+        before: u32 = 0,
+    };
 
     /// Edge `i` (0..edge_count). Bounds already validated by `nodeAt`.
     pub fn edge(self: NodeView, i: usize) Edge {
         std.debug.assert(i < self.edge_count);
-        const o = self.edges_at + i * edge_size;
+        const o = self.edges_at + i * self.edge_stride;
         return .{
             .label = self.buf[o],
             .child = std.mem.readInt(u32, self.buf[o + 1 .. o + 5][0..4], .little),
+            .before = if (self.edge_stride == edge_size_ordinals)
+                std.mem.readInt(u32, self.buf[o + 5 .. o + 9][0..4], .little)
+            else
+                0,
         };
+    }
+
+    /// True when the buffer carries the per-edge `before` counts.
+    pub fn hasOrdinals(self: NodeView) bool {
+        return self.edge_stride == edge_size_ordinals;
     }
 
     /// Binary-search this node's (label-sorted) edges for `label`.
@@ -270,6 +479,10 @@ pub fn nodeAt(buf: []const u8, off: u32) DecodeError!NodeView {
 /// bounds the number of nodes any traversal can visit (offsets strictly
 /// increase, buffer is finite) and thus rules out infinite loops.
 pub fn follow(parent: NodeView, child: u32) DecodeError!NodeView {
+    if (parent.version == format_version_2) {
+        if (child >= parent.offset) return error.Corrupt;
+        return nodeAtV2(parent.buf, child, parent.hasOrdinals());
+    }
     if (child <= parent.offset) return error.Corrupt;
     return nodeAt(parent.buf, child);
 }

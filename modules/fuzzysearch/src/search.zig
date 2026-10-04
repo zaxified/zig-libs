@@ -23,7 +23,9 @@
 //! Every offset followed out of the (possibly untrusted) buffer is bounds- and
 //! invariant-checked by `trie`'s `format` decoder; a corrupt buffer yields
 //! `error.Corrupt`, never an OOB read, panic, or infinite loop. Traversal
-//! termination rests on `trie`'s strictly-increasing child-offset invariant.
+//! termination rests on `trie`'s strictly monotone child-offset invariant.
+//! Both `trie` formats are walked: in version 2 an edge stands for several
+//! bytes (`label ++ tail`), and the DP extends one row per byte.
 
 const std = @import("std");
 const trie = @import("trie");
@@ -203,7 +205,10 @@ const Selector = struct {
 
 // ── the DP-over-trie walk ─────────────────────────────────────────────────────
 
-const Frame = struct { node: format.NodeView, edge_idx: u16 };
+/// `depth` is the node's byte depth: in a v2 (path-compressed) index one edge
+/// stands for `label ++ child.tail`, so a node can sit several bytes below
+/// its parent, and the DP keeps one row per BYTE, not per node.
+const Frame = struct { node: format.NodeView, edge_idx: u16, depth: usize };
 
 fn searchInto(
     f: trie.Frozen,
@@ -220,16 +225,16 @@ fn searchInto(
     const m = query.len;
     const cap: u16 = @as(u16, k) + 1; // any true distance > k collapses to this
 
-    // DP rows, one per depth on the current path. row_store[d][0..m+1] is the
-    // row for the node at depth d. u8 cells: every distance we care about is
-    // ≤ k ≤ 254, and values above k are capped at `cap` (≤ 255).
+    // DP rows, one per byte depth on the current path. row_store[d][0..m+1] is
+    // the row for the path prefix of length d. u8 cells: every distance we care
+    // about is ≤ k ≤ 254, and values above k are capped at `cap` (≤ 255).
     var row_store: [max_depth + 1][max_query_len + 1]u8 = undefined;
-    // Reconstructed key: path_store[0..depth] are the edge labels root→node.
+    // Reconstructed key: path_store[0..depth] are the bytes root→node.
     var path_store: [max_depth]u8 = undefined;
     var stack: [max_depth + 1]Frame = undefined;
 
     // Root: depth 0, path "". row[0][j] = min(j, cap) (j deletions from query).
-    const root = try format.nodeAt(f.buf, f.header.root_offset);
+    const root = try f.rootNode();
     {
         var j: usize = 0;
         while (j <= m) : (j += 1) row_store[0][j] = @intCast(@min(@as(u16, @intCast(j)), cap));
@@ -239,13 +244,12 @@ fn searchInto(
     }
 
     var sp: usize = 1;
-    stack[0] = .{ .node = root, .edge_idx = 0 };
+    stack[0] = .{ .node = root, .edge_idx = 0, .depth = 0 };
     var visited: usize = 0;
     var status: SearchStatus = .complete;
 
     outer: while (sp > 0) {
         const top = &stack[sp - 1];
-        const d = sp - 1; // depth of the node at the top of the stack
         if (top.edge_idx >= top.node.edge_count) {
             sp -= 1; // done with this node; backtrack
             continue;
@@ -260,40 +264,46 @@ fn searchInto(
         visited += 1;
 
         const child = try format.follow(top.node, e.child); // bounds-checked
-        const nd = d + 1; // child depth
-        if (nd > max_depth) return error.KeyTooLong;
+        const end = top.depth + 1 + child.tail.len; // child's byte depth
+        if (end > max_depth) return error.KeyTooLong;
 
-        // Compute the child's DP row from the parent row (row_store[d]) and, for
-        // the transposition term, the grandparent row (row_store[d-1]).
-        path_store[d] = e.label;
-        const c = e.label;
-        const prev = &row_store[d];
-        const cur = &row_store[nd];
-        cur[0] = @intCast(@min(@as(u16, @intCast(nd)), cap));
-        var row_min: u16 = cur[0];
-        var j: usize = 1;
-        while (j <= m) : (j += 1) {
-            const cost: u16 = if (c == query[j - 1]) 0 else 1;
-            var v: u16 = @min(@min(@as(u16, cur[j - 1]) + 1, @as(u16, prev[j]) + 1), @as(u16, prev[j - 1]) + cost);
-            // Adjacent transposition: needs a grandparent (nd ≥ 2 ⇒ d ≥ 1) and
-            // c == query[j-2], prev_char == query[j-1] where prev_char is the
-            // label leading into the depth-d node = path_store[d-1].
-            if (d >= 1 and j >= 2 and c == query[j - 2] and path_store[d - 1] == query[j - 1]) {
-                v = @min(v, @as(u16, row_store[d - 1][j - 2]) + 1);
+        // Extend the DP one row per byte of the edge's string `label ++ tail`.
+        var d = top.depth; // depth of the row being extended
+        var bi: usize = 0;
+        while (bi <= child.tail.len) : (bi += 1) {
+            const c = if (bi == 0) e.label else child.tail[bi - 1];
+            const nd = d + 1;
+            // Compute row nd from row d and, for the transposition term, row d-1.
+            path_store[d] = c;
+            const prev = &row_store[d];
+            const cur = &row_store[nd];
+            cur[0] = @intCast(@min(@as(u16, @intCast(nd)), cap));
+            var row_min: u16 = cur[0];
+            var j: usize = 1;
+            while (j <= m) : (j += 1) {
+                const cost: u16 = if (c == query[j - 1]) 0 else 1;
+                var v: u16 = @min(@min(@as(u16, cur[j - 1]) + 1, @as(u16, prev[j]) + 1), @as(u16, prev[j - 1]) + cost);
+                // Adjacent transposition: needs a previous byte (d ≥ 1) and
+                // c == query[j-2], prev_char == query[j-1] where prev_char is
+                // the byte before c on the path = path_store[d-1].
+                if (d >= 1 and j >= 2 and c == query[j - 2] and path_store[d - 1] == query[j - 1]) {
+                    v = @min(v, @as(u16, row_store[d - 1][j - 2]) + 1);
+                }
+                if (v > cap) v = cap;
+                cur[j] = @intCast(v);
+                if (v < row_min) row_min = v;
             }
-            if (v > cap) v = cap;
-            cur[j] = @intCast(v);
-            if (v < row_min) row_min = v;
+            // Prune: if the whole row already exceeds k, no longer path can
+            // reach ≤ k (row minimum is non-decreasing down every path). Skip
+            // this subtree — even mid-edge.
+            if (row_min > k) continue :outer;
+            d = nd;
         }
 
-        // Prune: if the whole row already exceeds k, no descendant can reach ≤ k
-        // (row minimum is non-decreasing down every path). Skip this subtree.
-        if (row_min > k) continue :outer;
-
-        if (child.terminal and cur[m] <= k) {
-            try sel.consider(.{ .distance = cur[m], .value = child.value, .key = path_store[0..nd] });
+        if (child.terminal and row_store[end][m] <= k) {
+            try sel.consider(.{ .distance = row_store[end][m], .value = child.value, .key = path_store[0..end] });
         }
-        stack[sp] = .{ .node = child, .edge_idx = 0 };
+        stack[sp] = .{ .node = child, .edge_idx = 0, .depth = end };
         sp += 1;
     }
 

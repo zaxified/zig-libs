@@ -17,6 +17,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
+const stream = @import("stream.zig");
+
+/// Which frozen format `freezeWith` writes. Version 2 is the default and the
+/// recommended one (path-compressed, several times smaller); version 1 exists
+/// so a buffer can still be produced for a reader built against an older
+/// module that only understands v1.
+pub const FreezeOptions = union(enum) {
+    v1,
+    v2: stream.Options,
+};
 
 pub const BuildError = error{
     OutOfMemory,
@@ -149,9 +159,90 @@ pub const Builder = struct {
         n.value = value; // last write wins
     }
 
-    /// Serialize the trie into a freshly-allocated frozen buffer (caller owns
-    /// and frees it). The builder is left intact and may be frozen again.
+    /// Serialize the trie into a freshly-allocated frozen buffer in format
+    /// version 2 (caller owns and frees it). The builder is left intact and may
+    /// be frozen again.
     pub fn freeze(self: *Builder, out_gpa: Allocator) FreezeError![]u8 {
+        return self.freezeWith(out_gpa, .{ .v2 = .{} });
+    }
+
+    /// `freeze` with the format chosen explicitly.
+    pub fn freezeWith(self: *Builder, out_gpa: Allocator, opts: FreezeOptions) FreezeError![]u8 {
+        switch (opts) {
+            .v1 => return self.freezeV1(out_gpa),
+            .v2 => |o| {
+                var out: std.Io.Writer.Allocating = .init(out_gpa);
+                defer out.deinit();
+                self.freezeTo(&out.writer, o) catch |err| return switch (err) {
+                    // The allocating writer fails only when it cannot grow.
+                    error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
+                    error.TooLarge => error.TooLarge,
+                    // Keys come out of the trie in order, once each, before
+                    // `finish`.
+                    error.Unsorted, error.Finished => unreachable,
+                };
+                return out.toOwnedSlice();
+            },
+        }
+    }
+
+    /// Write the trie as a version-2 buffer straight to `w` (a file, a
+    /// socket) without materializing the frozen copy in memory. Walks the
+    /// trie in key order and feeds `SortedBuilder`, whose working memory is
+    /// the length of the longest key, not the size of the index.
+    pub fn freezeTo(self: *Builder, w: *std.Io.Writer, opts: stream.Options) stream.Error!void {
+        self.sortEdges();
+        var sb = try stream.SortedBuilder.init(self.gpa, w, opts);
+        defer sb.deinit();
+        var path: std.ArrayListUnmanaged(u8) = .empty;
+        defer path.deinit(self.gpa);
+        // One cursor per depth: the next edge to descend at that depth.
+        var stack: std.ArrayListUnmanaged(u32) = .empty;
+        defer stack.deinit(self.gpa);
+
+        const root = self.nodes.items[0];
+        if (root.terminal) try sb.insert("", root.value);
+        try stack.append(self.gpa, root.first_edge);
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.* == no_edge) {
+                _ = stack.pop();
+                if (stack.items.len > 0) _ = path.pop();
+                continue;
+            }
+            const e = self.edges.items[top.*];
+            top.* = e.next;
+            try path.append(self.gpa, e.label);
+            const child = self.nodes.items[e.child];
+            if (child.terminal) try sb.insert(path.items, child.value);
+            try stack.append(self.gpa, child.first_edge);
+        }
+        try sb.finish();
+    }
+
+    /// Relink every node's sibling list in ascending label order, so a walk
+    /// along `first_edge`/`next` visits keys in sorted order. Idempotent;
+    /// `insert` prepends, so a later insert just leaves one list unsorted
+    /// again until the next freeze.
+    fn sortEdges(self: *Builder) void {
+        for (self.nodes.items) |*n| {
+            if (n.edge_count < 2) continue;
+            var tmp: [256]u32 = undefined;
+            var cnt: usize = 0;
+            var e = n.first_edge;
+            while (e != no_edge) : (e = self.edges.items[e].next) {
+                tmp[cnt] = e;
+                cnt += 1;
+            }
+            std.mem.sort(u32, tmp[0..cnt], self.edges.items, edgeIdLess);
+            n.first_edge = tmp[0];
+            for (tmp[0 .. cnt - 1], tmp[1..cnt]) |a, b| self.edges.items[a].next = b;
+            self.edges.items[tmp[cnt - 1]].next = no_edge;
+        }
+    }
+
+    /// The version-1 writer (node-id order, header in front).
+    fn freezeV1(self: *Builder, out_gpa: Allocator) FreezeError![]u8 {
         // 1. Post-order max: because a child's id always exceeds its parent's,
         //    iterating ids in reverse visits every child before its parent.
         {
@@ -235,6 +326,10 @@ fn edgeLabelLess(_: void, a: Edge, b: Edge) bool {
     return a.label < b.label;
 }
 
+fn edgeIdLess(edges: []const Edge, a: u32, b: u32) bool {
+    return edges[a].label < edges[b].label;
+}
+
 fn nodeSize(n: *const Node) usize {
     var s: usize = format.flags_size + format.best_size + format.edge_count_size;
     if (n.terminal) s += format.value_size;
@@ -246,13 +341,18 @@ fn nodeSize(n: *const Node) usize {
 pub const Pair = struct { key: []const u8, value: u32 };
 
 pub fn freezeFromPairs(gpa: Allocator, out_gpa: Allocator, pairs: []const Pair) FreezeError![]u8 {
+    return freezeFromPairsWith(gpa, out_gpa, pairs, .{ .v2 = .{} });
+}
+
+/// `freezeFromPairs` with the format chosen explicitly.
+pub fn freezeFromPairsWith(gpa: Allocator, out_gpa: Allocator, pairs: []const Pair, opts: FreezeOptions) FreezeError![]u8 {
     var b = Builder.init(gpa) catch return error.OutOfMemory;
     defer b.deinit();
     // `insert`'s BuildError is now `{OutOfMemory, TooLarge}` — both are
     // already members of FreezeError, so propagate rather than collapse (the
     // old `catch return error.OutOfMemory` would have relabelled TooLarge).
     for (pairs) |pr| b.insert(pr.key, pr.value) catch |err| return err;
-    return b.freeze(out_gpa);
+    return b.freezeWith(out_gpa, opts);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -294,7 +394,7 @@ test "freeze: subtree_best is the max value under each node" {
     try b.insert("ab", 3);
     try b.insert("ac", 9);
     try b.insert("az", 5);
-    const buf = try b.freeze(testing.allocator);
+    const buf = try b.freezeWith(testing.allocator, .v1);
     defer testing.allocator.free(buf);
     const root = try format.nodeAt(buf, format.header_size);
     // root has one edge 'a'; that node's subtree_best is 9.
@@ -318,11 +418,32 @@ test "freeze then load: header key_count and root offset are consistent" {
     var b = try Builder.init(testing.allocator);
     defer b.deinit();
     try b.insert("", 42); // empty key → root terminal
-    const buf = try b.freeze(testing.allocator);
+    const buf = try b.freezeWith(testing.allocator, .v1);
     defer testing.allocator.free(buf);
     const h = try format.Header.load(buf);
     try testing.expectEqual(@as(u64, 1), h.key_count);
     const root = try format.nodeAt(buf, h.root_offset);
     try testing.expect(root.terminal);
     try testing.expectEqual(@as(u32, 42), root.value);
+}
+
+test "freezeTo walks keys in sorted order whatever the insert order" {
+    // Inserted out of order; `SortedBuilder` refuses unsorted input, so a
+    // successful v2 freeze already proves the walk is sorted. The lookups
+    // prove nothing was lost on the way.
+    var b = try Builder.init(testing.allocator);
+    defer b.deinit();
+    const keys = [_][]const u8{ "zeta", "alpha", "", "alp", "beta", "alphabet", "z" };
+    for (keys, 0..) |k, i| try b.insert(k, @intCast(i + 10));
+    const buf = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf);
+    const h = try format.Header.load(buf);
+    try testing.expectEqual(format.format_version_2, h.version);
+    try testing.expectEqual(@as(u64, keys.len), h.key_count);
+    // Insert again after a freeze (lists were relinked) and freeze again.
+    try b.insert("alpha", 99);
+    try b.insert("mid", 5);
+    const buf2 = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf2);
+    try testing.expectEqual(@as(u64, keys.len + 1), (try format.Header.load(buf2)).key_count);
 }
