@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — ADDED (both survey 2026-09-30 gaps), no breaking change: `Limits.prefix`
+  (`Prefix{ width: u8|u16|u32|u64|varint, endian, includes_prefix }`, default = the original
+  u32-LE) honoured by `writeFrame`/`readFrame`/`readFrameAlloc`; `Decoder` — incremental,
+  non-blocking (`feed` / `next`), oversize refused at the prefix, sticky errors, bounded buffer
+  (`error.NotDrained`). New error `BadLength` for a malformed length field (only reachable with a
+  non-default prefix or a self-counting one). Wire bytes checked by hand (protobuf's `300 = ac 02`,
+  network-order u16/u32/u64); a 2000-stream deterministic driver shows `Decoder` and `readFrame`
+  agree on every format and garbage never panics. Mutation 2026-10-04: 24 mutants, 22 killed
+  (one by a hang), 2 equivalent; 1 test added.
+
 - **2026-09-07** — **Tests:** `fuzzReadFrame` never decoded a length prefix.
   It filled a buffer with `smith.bytes` and then drew the stream length with
   `valueRangeAtMost(u16, 0, buf.len)`; a ranged `Smith` draw reads eight octets

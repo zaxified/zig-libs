@@ -12,7 +12,13 @@ Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
 ## Wire shape
 
-A 4-byte little-endian `u32` byte length, then that many raw payload bytes.
+By default a 4-byte little-endian `u32` byte length, then that many raw
+payload bytes. The prefix is configurable (`Limits.prefix`): width
+1/2/4/8 bytes or a LEB128 varint, little- or big-endian, and whether the
+length counts the prefix itself — so the module speaks e.g. tokio-util's
+`LengthDelimitedCodec` default (`.{ .endian = .big }`), Netty's
+`LengthFieldPrepender(2)` (`.{ .width = .u16, .endian = .big }`) or a
+protobuf-style varint stream (`.{ .width = .varint }`).
 This is **length-prefixed** framing — the payload may contain `\n`, `\r`,
 `NUL`, or any other byte; it is not newline-delimited. If you need
 newline-delimited JSON (the MCP stdio convention: one JSON object + `\n` per
@@ -36,6 +42,16 @@ const payload = try framing.readFrame(&r, &buf, .{});
 // Or let the frame size the allocation instead of pre-sizing for the cap:
 const owned = try framing.readFrameAlloc(&r, gpa, .{}); defer gpa.free(owned);
 
+// Another wire format: network-order u16, or a varint
+const net16: framing.Limits = .{ .prefix = .{ .width = .u16, .endian = .big } };
+try framing.writeFrame(&w, payload, net16);
+
+// Non-blocking: feed whatever arrived, take whole frames out
+var dec: framing.Decoder = .init(.{ .max_frame = 64 * 1024 });
+defer dec.deinit(gpa);
+try dec.feed(gpa, received_bytes);
+while (try dec.next()) |frame| handle(frame); // valid until the next feed
+
 // generic JSON envelope over any union(enum) of json-serializable payloads
 const Message = union(enum) {
     hello: struct { id: u64 },
@@ -55,6 +71,14 @@ try Codec.writeFramed(msg, gpa, &w, .{}); // encode + frame in one step
 wire, no separate discriminator field needed. This holds even when a payload
 struct itself contains an inner `enum` field (it serializes as its tag name,
 a plain JSON string) — covered by the "enum-payload variant" test.
+
+The `Decoder` checks the announced length as soon as the prefix is complete
+(an oversize frame is refused before its body is buffered), is sticky after
+an error, and refuses to `feed` more than one frame's worth on top of
+undrained input (`error.NotDrained`) — so its memory stays bounded by
+`max_frame` plus one read. A length field the format cannot produce (a
+varint over 10 bytes / 64 bits or not minimally encoded, a self-counting
+length smaller than its prefix) is `error.BadLength`.
 
 `max_frame` is a runtime parameter (`Limits{ .max_frame = ... }`, default
 `default_max_frame` = 1 MiB) rather than a compile-time constant, enforced on
