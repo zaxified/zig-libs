@@ -4399,7 +4399,7 @@ test "fromOpenSSH: wrong or empty passphrase is IncorrectPassphrase" {
 /// Test helper: assemble a synthetic openssh-key-v1 binary image from SSH
 /// wire pieces, then armor it as an `OPENSSH PRIVATE KEY` PEM block.
 const OpensshTestBuilder = struct {
-    buf: [1024]u8 = undefined,
+    buf: [2048]u8 = undefined,
     len: usize = 0,
 
     fn raw(w: *OpensshTestBuilder, bytes: []const u8) *OpensshTestBuilder {
@@ -4500,6 +4500,387 @@ test "fromOpenSSH: rejects checkint mismatch and non-RSA key types" {
         var b = OpensshTestBuilder{};
         _ = b.raw("openssh-key-v1\x00").str("none").str("none").str("").int(1).str("").str(priv.buf[0..priv.len]);
         try testing.expectError(error.UnsupportedKeyType, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+}
+
+// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+//
+// Each test below breaks exactly ONE property of an otherwise valid input, so
+// only the check under test can refuse it (the older negative tests often
+// failed for an earlier, unrelated reason — e.g. an empty OpenSSH private
+// section is refused by the first `readU32`, whatever the container says).
+
+test "ctEqByte is equality on every byte pair" {
+    // Definition: 1 iff x == y. The OAEP and PSS decoders fold every byte
+    // check through it, so a wrong answer for any pair is a padding oracle.
+    var x: u16 = 0;
+    while (x < 256) : (x += 1) {
+        var y: u16 = 0;
+        while (y < 256) : (y += 1) {
+            try testing.expectEqual(@as(u8, @intFromBool(x == y)), ctEqByte(@intCast(x), @intCast(y)));
+        }
+    }
+}
+
+test "EMSA-PKCS1-v1_5 refuses an encoding with fewer than 8 PS octets" {
+    // RFC 8017 §9.2 step 3: emLen < tLen + 11 → "intended encoded message
+    // length too short". SHA-256's T is 19 + 32 = 51 octets, so 62 is the
+    // shortest legal emLen (PS = exactly 8 × 0xff) and 61 must be refused.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var em: [62]u8 = undefined;
+    try testing.expectError(error.EncodedMessageTooShort, emsaPkcs1v15Encode(Sha256, "m", em[0..61]));
+    try emsaPkcs1v15Encode(Sha256, "m", &em);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, em[0..2]);
+    try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 8), em[2..10]);
+    try testing.expectEqual(@as(u8, 0x00), em[10]);
+}
+
+test "verify refuses a signature that is not exactly k octets, even one equal in value" {
+    // RFC 8017 §8.2.2 step 1 and §8.1.2 step 1: "If the length of the
+    // signature S is not k octets, output 'invalid signature'". A leading
+    // 0x00 keeps the integer value — only the length check can refuse it.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    var long: [257]u8 = undefined;
+    long[0] = 0;
+    long[1..].* = kat2048.sig_sha256;
+    try verifyPkcs1v15(pk, Sha256, kat2048.msg, &kat2048.sig_sha256); // control
+    try testing.expectError(error.SignatureVerificationFailed, verifyPkcs1v15(pk, Sha256, kat2048.msg, &long));
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var sig_buf: [256]u8 = undefined;
+    const sig = try signPss(sk, Sha256, prng.random(), "pss length", 32, &sig_buf);
+    try verifyPss(pk, Sha256, "pss length", sig, 32); // control
+    long[1..].* = sig[0..256].*;
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, "pss length", &long, 32));
+}
+
+/// Re-mask a PSS encoding after the caller edited its unmasked DB: the steps
+/// a signer runs (§9.1.1 steps 9-11), so the result differs from a genuine
+/// encoding only in the edited DB octets.
+fn pssEditDb(comptime Hash: type, em: []u8, em_bits: usize, edit: *const fn (db: []u8) void) void {
+    const h_len = Hash.digest_length;
+    const db = em[0 .. em.len - h_len - 1];
+    const h = em[em.len - h_len - 1 ..][0..h_len];
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * em.len - em_bits);
+    mgf1Xor(Hash, h, db); // unmask
+    db[0] &= top_mask;
+    edit(db);
+    mgf1Xor(Hash, h, db); // mask again
+    db[0] &= top_mask;
+}
+
+test "verifyPss refuses a nonzero PS octet and a wrong separator octet" {
+    // RFC 8017 §9.1.2 step 10: the emLen − hLen − sLen − 2 leftmost octets
+    // of DB must be zero and the next one 0x01, else "inconsistent". H covers
+    // only M' (mHash ‖ salt), not DB, so these edits keep H valid — only the
+    // step-10 checks can refuse them.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const msg = "pss db edits";
+    const salt = [_]u8{0x5a} ** 32;
+    var em: [256]u8 = undefined;
+    try emsaPssEncode(Sha256, msg, &salt, 2047, &em);
+    const good = try rsasp1(256, em, sk);
+    try verifyPss(pk, Sha256, msg, &good, 32); // control
+
+    // ps_len = 256 − 32 − 32 − 2 = 190; DB[190] is the 0x01 separator.
+    const edits = [_]*const fn (db: []u8) void{
+        struct {
+            fn f(db: []u8) void {
+                db[5] = 0x01; // a PS octet
+            }
+        }.f,
+        struct {
+            fn f(db: []u8) void {
+                db[190] = 0x02; // the separator
+            }
+        }.f,
+    };
+    for (edits) |edit| {
+        var bad = em;
+        pssEditDb(Sha256, &bad, 2047, edit);
+        const sig = try rsasp1(256, bad, sk);
+        try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &sig, 32));
+    }
+}
+
+/// A 521-bit key (modBits ≡ 1 mod 8, so emLen = k − 1 for PSS): two primes
+/// found by a Miller–Rabin (40 rounds) search from 2^260 + 2^259 + 12345 and
+/// 2^260 + 2^258 + 67891, with gcd(65537, p − 1) = gcd(65537, q − 1) = 1.
+/// `fromPrimes` re-checks qInv·q ≡ 1 (mod p).
+const kat521 = struct {
+    const e = [_]u8{ 0x01, 0x00, 0x01 };
+    const p = hexLit("18000000000000000000000000000000000000000000000000000000000000314f");
+    const q = hexLit("14000000000000000000000000000000000000000000000000000000000001096d");
+    const n = hexLit("01e000000000000000000000000000000000000000000000000000000000001cbc6400000000000000000000000000000000000000000000000000000000331fc5a3");
+};
+
+test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod 8" {
+    // RFC 8017 §8.1.2 step 2c: EM = I2OSP(m, emLen) with emLen = k − 1 here;
+    // a representative m ≥ 256^emLen is "integer too large" → invalid
+    // signature. So the octet in front of EM must be zero — even when the
+    // rest is a perfectly valid encoding, as built here.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try SecretKey.fromPrimes(&kat521.p, &kat521.q, &kat521.e);
+    const pk = try PublicKey.fromBytes(&kat521.n, &kat521.e);
+    try testing.expectEqual(@as(usize, 521), pk.n.bits());
+    const msg = "emLen = k - 1";
+    var x: [66]u8 = undefined;
+    var salt = [_]u8{0} ** 16;
+    var s: u8 = 0;
+    // 0x01 ‖ EM must stay below n (= 0x01e0…): pick a salt whose EM[0] < 0xe0.
+    while (true) : (s += 1) {
+        @memset(&salt, s);
+        try emsaPssEncode(Sha256, msg, &salt, 520, x[1..]);
+        if (x[1] < 0xe0) break;
+    }
+    x[0] = 0x00;
+    const good = try rsasp1(66, x, sk);
+    try verifyPss(pk, Sha256, msg, &good, 16); // control
+    x[0] = 0x01;
+    const bad = try rsasp1(66, x, sk);
+    try testing.expectError(error.SignatureVerificationFailed, verifyPss(pk, Sha256, msg, &bad, 16));
+}
+
+/// RSAEP of an OAEP encoding with a caller-chosen leading octet Y and DB
+/// (masked as §7.1.1 steps 2.d–2.i do), under `kat2048`: a ciphertext that
+/// differs from a genuine one only where the caller says.
+fn oaepCraft(y: u8, db_in: *const [223]u8) ![256]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var em: [256]u8 = undefined;
+    em[0] = y;
+    const seed = em[1..33];
+    const db = em[33..256];
+    db.* = db_in.*;
+    var prng = std.Random.DefaultPrng.init(42);
+    prng.random().bytes(seed);
+    mgf1Xor(Sha256, seed, db);
+    mgf1Xor(Sha256, db, seed);
+    return rsaep(256, em, try kat2048.publicKey());
+}
+
+test "OAEP decryption refuses a stray PS octet and a missing separator (both entry points)" {
+    // RFC 8017 §7.1.2 step 3g: DB = lHash' ‖ PS ‖ 0x01 ‖ M where PS is zero
+    // octets; "if there is no octet with hexadecimal value 0x01 to separate
+    // PS from M, ... output 'decryption error'". A nonzero non-0x01 octet
+    // before the separator is therefore not PS and the block is invalid.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try kat2048.secretKey();
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    var db: [223]u8 = @splat(0);
+    Sha256.hash("", db[0..32], .{});
+    db[db.len - 4] = 0x01;
+    @memcpy(db[db.len - 3 ..], "msg");
+    const ok_ct = try oaepCraft(0x00, &db); // control
+    try testing.expectEqualStrings("msg", try decryptOaep(sk, Sha256, &ok_ct, "", &out));
+    const r_ok = try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &ok_ct, "", 3, &out, &raw);
+    try testing.expect(r_ok.ok);
+
+    var stray = db;
+    stray[40] = 0x02;
+    const stray_ct = try oaepCraft(0x00, &stray);
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &stray_ct, "", &out));
+    try testing.expect(!(try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &stray_ct, "", 3, &out, &raw)).ok);
+
+    var no_sep = db;
+    @memset(no_sep[32..], 0);
+    const no_sep_ct = try oaepCraft(0x00, &no_sep);
+    try testing.expectError(error.DecryptionError, decryptOaep(sk, Sha256, &no_sep_ct, "", &out));
+
+    // Y ≠ 0 (§7.1.2 step 3g, "if Y is nonzero") through the no-fail entry
+    // point (the erroring one has its own test above).
+    const y_ct = try oaepCraft(0x01, &db);
+    try testing.expect(!(try decryptOaepHNoFail(sk, Sha256, Sha256, .none, &y_ct, "", 3, &out, &raw)).ok);
+}
+
+test "OAEP decryption checks its output buffers up front, from public sizes only" {
+    // `decryptOaep*`'s contract: `out` ≥ k − 2hLen − 2 (the largest message
+    // the key can carry), checked BEFORE the private op so the answer never
+    // depends on the secret plaintext length; `decryptOaepHNoFail`'s `want`
+    // above that bound is the same kind of public precondition failure.
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try kat2048.secretKey();
+    var prng = std.Random.DefaultPrng.init(5);
+    var ct_buf: [256]u8 = undefined;
+    const ct = try encryptOaep(try kat2048.publicKey(), Sha256, prng.random(), "short", "", &ct_buf);
+    const max_msg = 256 - 2 * 32 - 2;
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, decryptOaep(sk, Sha256, ct, "", out[0 .. max_msg - 1]));
+    try testing.expectEqualStrings("short", try decryptOaep(sk, Sha256, ct, "", out[0..max_msg]));
+    try testing.expectError(error.BufferTooSmall, decryptOaepHNoFail(sk, Sha256, Sha256, .none, ct, "", max_msg + 1, &out, &raw));
+}
+
+/// `der` with `extra` appended INSIDE its outer SEQUENCE. Every fixture here
+/// has a two-octet long-form outer length (`30 82 hi lo`).
+fn derAppendInTop(der: []const u8, extra: []const u8, out: []u8) []const u8 {
+    std.debug.assert(der[0] == 0x30 and der[1] == 0x82);
+    @memcpy(out[0..der.len], der);
+    @memcpy(out[der.len..][0..extra.len], extra);
+    const len = std.mem.readInt(u16, der[2..4], .big) + extra.len;
+    std.mem.writeInt(u16, out[2..4], @intCast(len), .big);
+    return out[0 .. der.len + extra.len];
+}
+
+test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are refused" {
+    var buf: [2048]u8 = undefined;
+    // Controls: the fixtures themselves parse.
+    _ = try PublicKey.fromDer(&kat2048_der.pub_pkcs1);
+    _ = try PublicKey.fromDer(&kat2048_der.pub_spki);
+
+    // A DER key is exactly one SEQUENCE TLV (X.690 §8.1.1); anything after it
+    // is not part of the key — refused rather than ignored.
+    inline for (.{ &kat2048_der.pub_pkcs1, &kat2048_der.pub_spki }) |der| {
+        @memcpy(buf[0..der.len], der);
+        buf[der.len] = 0x00;
+        try testing.expectError(error.InvalidDer, PublicKey.fromDer(buf[0 .. der.len + 1]));
+    }
+    @memcpy(buf[0..kat2048_der.priv_pkcs1.len], &kat2048_der.priv_pkcs1);
+    buf[kat2048_der.priv_pkcs1.len] = 0x00;
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(buf[0 .. kat2048_der.priv_pkcs1.len + 1]));
+
+    // RSAPublicKey is SEQUENCE { modulus, publicExponent } (RFC 8017 A.1.1)
+    // and SubjectPublicKeyInfo SEQUENCE { algorithm, subjectPublicKey }
+    // (RFC 5280 §4.1): a third field is not that structure.
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(derAppendInTop(&kat2048_der.pub_pkcs1, &.{ 0x02, 0x01, 0x00 }, &buf)));
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(derAppendInTop(&kat2048_der.pub_spki, &.{ 0x05, 0x00 }, &buf)));
+    // RSAPrivateKey version 0 has no otherPrimeInfos (RFC 8017 A.1.2: "version
+    // SHALL be 0 if there are only two primes").
+    try testing.expectError(error.InvalidDer, SecretKey.fromDer(derAppendInTop(&kat2048_der.priv_pkcs1, &.{ 0x30, 0x00 }, &buf)));
+
+    // The BIT STRING wrapping RSAPublicKey carries whole octets: its
+    // unused-bits octet (X.690 §8.6.2.2) must be 0. Offset 23 = outer header
+    // (4) + AlgorithmIdentifier (15) + BIT STRING header `03 82 01 0f` (4).
+    var spki = kat2048_der.pub_spki;
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x82, 0x01, 0x0f, 0x00 }, spki[19..24]);
+    spki[23] = 0x01;
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(&spki));
+
+    // PKCS#8 version: only v1 (0, RFC 5208) is accepted — SPEC scope, v2
+    // `OneAsymmetricKey` (RFC 5958) is refused. Offset 6 = `30 82 04 bd 02 01 [00]`.
+    var p8 = kat2048_der.priv_pkcs8;
+    try testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x00 }, p8[4..7]);
+    p8[6] = 0x01;
+    try testing.expectError(error.InvalidDer, fromPkcs8(&p8));
+}
+
+test "PEM: a block with no base64 payload is a PEM error, not a DER one" {
+    // RFC 7468 §3: a textual encoding carries base64 data between the
+    // boundaries. An empty body is malformed PEM — reported as InvalidPem
+    // before any DER parser sees zero bytes.
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem("-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n"));
+}
+
+/// The fields of a decoded openssh-key-v1 fixture, so a test can rebuild it
+/// with exactly one field changed.
+const OpensshParts = struct {
+    cipher: []const u8,
+    kdf: []const u8,
+    kdfopts: []const u8,
+    pubkey: []const u8,
+    private: []const u8,
+
+    fn of(bin: []const u8) !OpensshParts {
+        var r = SshReader{ .buf = bin, .pos = "openssh-key-v1\x00".len };
+        const cipher = try r.readString();
+        const kdf = try r.readString();
+        const kdfopts = try r.readString();
+        try testing.expectEqual(@as(u32, 1), try r.readU32());
+        const pubkey = try r.readString();
+        const private = try r.readString();
+        try testing.expectEqual(@as(usize, 0), r.rest().len);
+        return .{ .cipher = cipher, .kdf = kdf, .kdfopts = kdfopts, .pubkey = pubkey, .private = private };
+    }
+
+    fn build(p: OpensshParts, b: *OpensshTestBuilder, nkeys: u32, trailing: []const u8) void {
+        _ = b.raw("openssh-key-v1\x00").str(p.cipher).str(p.kdf).str(p.kdfopts).int(nkeys).str(p.pubkey).str(p.private).raw(trailing);
+    }
+};
+
+test "fromOpenSSH: one bad field in an otherwise valid container is refused" {
+    // PROTOCOL.key: one key per file here (nkeys = 1, SPEC), no bytes after
+    // the private section, `none` cipher ⇔ `none` kdf with empty options,
+    // bcrypt options = string salt ‖ uint32 rounds and nothing more, the
+    // encrypted section a whole number of cipher blocks, and the private
+    // section padded with 1, 2, 3, … up to (never including) a full block.
+    var pem_buf: [4096]u8 = undefined;
+    const plain_block = try pemDecodeBody(openssh_fixture_plain);
+    const plain = try OpensshParts.of(plain_block.der());
+    { // control: the rebuilt container parses
+        var b = OpensshTestBuilder{};
+        plain.build(&b, 1, "");
+        _ = try fromOpenSSH(b.pem(&pem_buf), "");
+    }
+    { // nkeys = 2 with the single key's fields intact
+        var b = OpensshTestBuilder{};
+        plain.build(&b, 2, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // a byte after a valid private section
+        var b = OpensshTestBuilder{};
+        plain.build(&b, 1, "x");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // cipher none with a bcrypt kdf
+        var p = plain;
+        p.kdf = "bcrypt";
+        var b = OpensshTestBuilder{};
+        p.build(&b, 1, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    // The fixture's section ends `… 'b' 01 02 03` (comment, then padding).
+    const sec = plain.private;
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03 }, sec[sec.len - 3 ..]);
+    var sec_buf: [2048]u8 = undefined;
+    { // wrong padding value
+        @memcpy(sec_buf[0..sec.len], sec);
+        sec_buf[sec.len - 1] = 0x04;
+        var p = plain;
+        p.private = sec_buf[0..sec.len];
+        var b = OpensshTestBuilder{};
+        p.build(&b, 1, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+    { // padding 1…11: a correct sequence, but a full block (8) or more of it
+        @memcpy(sec_buf[0..sec.len], sec);
+        for (0..8) |i| sec_buf[sec.len + i] = @intCast(4 + i);
+        var p = plain;
+        p.private = sec_buf[0 .. sec.len + 8];
+        var b = OpensshTestBuilder{};
+        p.build(&b, 1, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), ""));
+    }
+
+    const cbc_block = try pemDecodeBody(openssh_fixture_cbc);
+    const cbc = try OpensshParts.of(cbc_block.der());
+    { // control
+        var b = OpensshTestBuilder{};
+        cbc.build(&b, 1, "");
+        _ = try fromOpenSSH(b.pem(&pem_buf), "hunter2");
+    }
+    { // bcrypt options with a byte after `rounds`
+        var opts: [64]u8 = undefined;
+        @memcpy(opts[0..cbc.kdfopts.len], cbc.kdfopts);
+        opts[cbc.kdfopts.len] = 0;
+        var p = cbc;
+        p.kdfopts = opts[0 .. cbc.kdfopts.len + 1];
+        var b = OpensshTestBuilder{};
+        p.build(&b, 1, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "hunter2"));
+    }
+    { // an encrypted section one byte past a whole number of AES blocks
+        @memcpy(sec_buf[0..cbc.private.len], cbc.private);
+        sec_buf[cbc.private.len] = 0;
+        var p = cbc;
+        p.private = sec_buf[0 .. cbc.private.len + 1];
+        var b = OpensshTestBuilder{};
+        p.build(&b, 1, "");
+        try testing.expectError(error.InvalidOpenSSH, fromOpenSSH(b.pem(&pem_buf), "hunter2"));
     }
 }
 

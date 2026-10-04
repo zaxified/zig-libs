@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSL 4.0 RSA (PKCS#1 v2.2 signatures, OAEP, key parsing); capped at 4096-bit moduli and without RSAES-PKCS1-v1_5 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-12 · mutation none
+**Audit:** review 2026-08-12 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -259,6 +259,31 @@ as a measurement rather than a rediscovery.
 material/serialization) — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring
+
+**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, every non-bench,
+non-fuzz, non-keygen test): 59 mutants on the checks that guard input and state —
+`PublicKey.fromBytes` (size, odd/≥ 3 exponent), the signature-length checks of both
+verifiers, the EMSA-PKCS1-v1_5 length bound, MGF1's counter, `ctEqByte`/`ctSelect`/
+`ctEqMaskUsize`, every OAEP-decode verdict (Y, lHash, stray PS octet, missing separator,
+want-length, buffer preconditions; both the erroring and the no-fail entry point),
+every EMSA-PSS-VERIFY step (pad octet, trailer, top bits, PS, separator, H), the F3
+fault check and the F2 unblinding, `fromPrimes`' validation, the DER walk (child bounds,
+trailing bytes, field counts, OID, BIT STRING unused bits, both version checks), PEM
+(empty body, label length) and the OpenSSH container (string bounds, nkeys, trailing
+bytes, cipher/kdf consistency, kdf options, block alignment, padding, checkints, `n`
+cross-check). First run: 30 killed, 29 alive — most negative tests were refused by an
+earlier, unrelated check (an empty OpenSSH private section fails the first `readU32`,
+whatever the container says). Ten tests added, each breaking ONE property of an
+otherwise valid input with the RFC/PROTOCOL.key clause it cites (block "audit
+2026-10-04" in `root.zig`, incl. a 521-bit key for the emLen = k − 1 case of PSS);
+rerun: 55 killed, 4 equivalent —
+`fromPrimes`' `p == q` (the qInv·q ≡ 1 self-check refuses it too: q mod p = 0) and
+`e < 3` (`DynModint.fromLimbs` refuses an `e` modulus below 3), `decryptOaepHNoFail`'s
+`found_sep` (with no separator `msg_len = db.len − 1 > max_msg_len ≥ want`, so
+`len_ok` is already 0), and `derChild`'s end-of-parent bound (the only nested parent
+is the AlgorithmIdentifier, whose sole child is the fixed rsaEncryption OID; a parent
+end inside it puts the next sibling's tag on an OID octet, none of which is BIT STRING
+or OCTET STRING). No defect found.
 
 **Anchor grade:** class B · oracle EXTERNAL
 

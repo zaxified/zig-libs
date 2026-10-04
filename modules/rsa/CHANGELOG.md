@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: mutation schemata run (59 mutants, 55 killed, 4 equivalent).
+  Ten new negative tests, each breaking exactly one property of an otherwise valid
+  input: over-long signatures (both verifiers), the PKCS#1 v1.5 PS ≥ 8 bound, a
+  nonzero PSS PS/separator octet, a nonzero octet in front of a PSS EM on a 521-bit
+  key, a stray OAEP PS octet / missing separator / Y ≠ 0 through `decryptOaepHNoFail`,
+  the OAEP buffer preconditions, DER trailing bytes / extra fields / BIT STRING unused
+  bits / PKCS#8 v2, an empty PEM body, and one-field-off OpenSSH containers. No
+  behaviour change (the test helper `OpensshTestBuilder` grew to 2 KiB).
 - **2026-10-03** — **Key derivation and Miller-Rabin are constant-time in the
   primes.** `SecretKey.fromPrimes` computes `n`, `λ = lcm(p−1, q−1)`
   (`montint.nt.lcm`), `d`/`dP`/`dQ` (`DynModint.inverseOfModulus`, inverses
