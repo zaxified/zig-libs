@@ -6,7 +6,7 @@
 
 **Scope:** core — Go `crypto/sha256` + `encoding/hex` and RustCrypto `sha2`/`digest` (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -51,6 +51,14 @@ of scope: HMAC/keyed hashing, KDFs, streaming over a network, and constant-time 
 ## Verification
 Official empty-string and `"abc"` known-answer vectors for all 9 algorithms; incremental-equals-
 one-shot; the `/proc`-style size-0 file read. Run: `zig build test-hashdigest`.
+
+**Audit 2026-10-04 (mutation).** 11 schemata mutants over lowercase hex output, `matches` /
+`matchesAlgo` (length guard, exact comparison), the file hashers (byte totals, the update
+loop, the up-front buffer check) and the `ShortBuffer` checks of `hex` and
+`MultiHasher.finalHex`: 9 killed, 2 equivalent, 0 left alive. Equivalent: the
+`announced.len != …` guards in `matches` and `matchesAlgo` -- `std.mem.eql` of slices of
+different lengths is already false. One test added for the two real gaps: a buffer one byte
+short of `hexLength` is `ShortBuffer` in both `hex` and `finalHex`.
 
 ## Backlog / deferred
 - (survey 2026-09-30) **`sha256sum`-style checksum-file parse/verify** (`<hex>  <name>` lines, BSD `SHA256 (f) = hex`): every release-verification tool needs it; ~150 lines, pure Zig, fits CONVENTIONS section 2.

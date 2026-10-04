@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (11 schemata mutants, 9 killed, 2 equivalent; one new
+  test pins the `ShortBuffer` edge of `hex` and `MultiHasher.finalHex`). No code change.
+
 - **2026-07-18** — Security audit: no findings. Modeled on OpenSSL / BLAKE3-C (design
   reference, not a test anchor).
 - **2026-07-07** — New module: Streaming digests — one-shot / incremental / file

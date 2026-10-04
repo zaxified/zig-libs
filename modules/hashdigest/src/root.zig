@@ -318,6 +318,19 @@ test "sha256Hex known-answer vectors, lowercase" {
     for (out) |c| try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
 }
 
+test "a buffer one byte short of hexLength is ShortBuffer, exactly hexLength is enough" {
+    // `hex` / `MultiHasher.finalHex` need room for the whole lowercase hex
+    // digest (`hexLength(algo)` bytes); one byte less is `error.ShortBuffer`,
+    // never a partial digest. Mutation 2026-10-04: an off-by-one in either
+    // check survived (it then wrote past the buffer).
+    var buf: [hex_len]u8 = undefined;
+    try std.testing.expectError(error.ShortBuffer, hex(.sha256, "abc", buf[0 .. hex_len - 1]));
+    try std.testing.expectEqualStrings(abc_hex, try hex(.sha256, "abc", &buf));
+    var h = MultiHasher.init(.sha256);
+    h.update("abc");
+    try std.testing.expectError(error.ShortBuffer, h.finalHex(buf[0 .. hex_len - 1]));
+}
+
 test "sha256HexBuf matches sha256Hex" {
     var out: [hex_len]u8 = undefined;
     sha256Hex(&out, "hello world");
