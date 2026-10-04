@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — Tests: first mutation run (57 mutants, 56 killed, 1 equivalent); 5 tests added in
+  `otpauth.zig` (truncated `%3` label, `0x1F`/DEL rejection, `u64` multiply overflow, exact-fit
+  buffer, `format` of `period = 86400` and `~`). No source change.
 - **2026-09-30** — New: `otp.otpauth` — `parse` / `format` for `otpauth://totp/`
   and `otpauth://hotp/` provisioning URIs (Google Key Uri Format; output shape as
   pyotp's `provisioning_uri`), bounded and allocation-free, with `KeyUri.totpCode`

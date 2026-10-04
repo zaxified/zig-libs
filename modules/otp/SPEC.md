@@ -6,7 +6,7 @@
 
 **Scope:** core — pyotp and pquerna/otp (surveyed 2026-09-30); raised from mvp 2026-09-30 with base32 secrets + `otpauth://` parse/format
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -139,6 +139,30 @@ re-formats and re-parses.
 - `totpVerify`: exact-step accept; ±1/±2 window accept/reject in both
   directions; wrong-code reject across a window; underflow clamp at `t0`;
   non-default `t0`.
+
+## Mutation run 2026-10-04
+
+57 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run) over `root.zig` and
+`otpauth.zig`: dynamic-truncation offset mask, offset byte, sign mask and counter endianness;
+`fmtCode` buffer check; `timeStep` origin; every comparison and the accumulator of `totpVerify`
+(window width, underflow skip, window origin, OR vs last-wins); `parse` URI cap, scheme, `#`,
+type case, `%3`/`%3A`/`%3a` separator detection, `%20` skipping, second colon, leading space,
+escape bounds, buffer-overflow bound, C0/DEL checks, decimal parsing (length cap, overflow),
+digits and period bounds, duplicate and empty secret, base32 case, issuer colon and mismatch,
+missing counter, algorithm mapping, defaults; `format` label/secret/digits/period checks,
+unreserved set, hex case, 40-byte chunk, parameter elision, `WrongKind`.
+First run: 48 killed, 9 survived. Survivors and verdicts:
+
+- Equivalent: empty `secret=` without the explicit `value.len == 0` check (the decoder returns
+  0 bytes and the following `n == 0` check yields the same `InvalidSecret`).
+- Test gaps, now killed: `%3` truncated at the end of a label (out-of-bounds read in the
+  separator scan), `0x1F` and DEL in label/issuer, a decimal that overflows `u64` only in the
+  multiply, a buffer that fits the decoded fields exactly, `format` of `period = 86400` and of
+  the unreserved `~`.
+
+Mutants that cannot be compiled behind a runtime switch (the comptime `Hmac` type selection)
+were not included; every RFC 4226 / 6238 vector pins them. Tests added: 5, all in
+`otpauth.zig`, each with its reason in a comment. No findings. Final: 56 killed, 1 equivalent.
 
 ## Backlog / deferred
 

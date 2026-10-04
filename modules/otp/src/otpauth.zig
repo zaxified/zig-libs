@@ -793,3 +793,67 @@ fn fuzzParse(_: void, smith: *testing.Smith) !void {
     try testing.expectEqual(k.issuer == null, k2.issuer == null);
     if (k.issuer) |i| try testing.expectEqualStrings(i, k2.issuer.?);
 }
+
+// ── tests: mutation-run additions (2026-10-04) ──────────────────────────────
+
+test "parse: a truncated %3 at the end of the label is a bad escape, not an out-of-bounds read" {
+    // `findSeparator` looks for `%3A`/`%3a`; a label ending in `%3` has only
+    // two bytes left and must be passed on to the percent decoder, which
+    // rejects the incomplete escape (documented: bad percent-escape ->
+    // InvalidLabel).
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/a%3?secret=MZXW6", &buf));
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/I:a%3?secret=MZXW6", &buf));
+}
+
+test "parse: the last C0 control byte (0x1F) and DEL (0x7F) are rejected in label and issuer" {
+    // Documented rule: "label and issuer must be non-empty valid UTF-8 without
+    // C0 controls or DEL"; C0 is 0x00..0x1F, so 0x1F is the boundary byte.
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/a%1Fb?secret=MZXW6", &buf));
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/a%7Fb?secret=MZXW6", &buf));
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/I%7F:a?secret=MZXW6", &buf));
+    try testing.expectError(error.InvalidIssuer, parse("otpauth://totp/a?secret=MZXW6&issuer=x%1Fy", &buf));
+    try testing.expectError(error.InvalidIssuer, parse("otpauth://totp/a?secret=MZXW6&issuer=x%7Fy", &buf));
+    // 0x20 (space) and 0x7E (~) are the neighbours that stay valid.
+    const k = try parse("otpauth://totp/a%20b%7E?secret=MZXW6", &buf);
+    try testing.expectEqualStrings("a b~", k.account);
+}
+
+test "parse: a decimal field that overflows u64 is InvalidCounter (no wrap-around)" {
+    // 20 nines is 10^20 - 1 > 2^64 - 1 (about 1.8e19): the multiply by 10
+    // overflows before the add does, so a wrapping multiply would let it through.
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidCounter, parse("otpauth://hotp/x?secret=MZXW6&counter=99999999999999999999", &buf));
+    try testing.expectError(error.InvalidCounter, parse("otpauth://hotp/x?secret=MZXW6&counter=184467440737095516160", &buf));
+}
+
+test "parse: a buffer that exactly fits the decoded fields is enough" {
+    // Decoded sizes: account "a" = 1, secret MFRGGZDF = 5 bytes, issuer "ab"
+    // = 2; 8 bytes in total. `BufferTooSmall` is only for a field that does
+    // not fit, so the last field (issuer) landing on the very last byte
+    // must succeed.
+    var buf: [8]u8 = undefined;
+    const k = try parse("otpauth://totp/a?secret=MFRGGZDF&issuer=ab", &buf);
+    try testing.expectEqualStrings("a", k.account);
+    try testing.expectEqualStrings("abcde", k.secret);
+    try testing.expectEqualStrings("ab", k.issuer.?);
+    var short: [7]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, parse("otpauth://totp/a?secret=MFRGGZDF&issuer=ab", &short));
+}
+
+test "format: period 86400 is accepted, 86401 is not; the unreserved set includes ~" {
+    var out: [256]u8 = undefined;
+    // Documented bound `period` 1..86400 (the same one `parse` enforces).
+    try testing.expectEqualStrings(
+        "otpauth://totp/x?secret=MZXW6&period=86400",
+        try render(&out, .{ .kind = .totp, .secret = "foo", .account = "x", .period = max_period }),
+    );
+    var w = std.Io.Writer.fixed(&out);
+    try testing.expectError(error.InvalidPeriod, format(&w, .{ .kind = .totp, .secret = "foo", .account = "x", .period = max_period + 1 }));
+    // Percent-encoding escapes everything but `A-Za-z0-9-._~` (RFC 3986 unreserved).
+    try testing.expectEqualStrings(
+        "otpauth://totp/a-b.c_d~e?secret=MZXW6",
+        try render(&out, .{ .kind = .totp, .secret = "foo", .account = "a-b.c_d~e" }),
+    );
+}
