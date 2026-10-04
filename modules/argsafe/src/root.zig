@@ -614,6 +614,34 @@ const testing = std.testing;
 
 // --- CharClass: golden allow/reject over representative validators ------
 
+test "documented edges of every predicate (mutation 2026-10-04)" {
+    // Each line is a documented boundary the suite did not touch; a flip of
+    // each one survived the mutation run of 2026-10-04.
+    // `Reason.control_byte`: "< 0x20 or 0x7f" -- DEL is a control byte, and
+    // it is reported as one even when `extra` would otherwise allow it.
+    const del_ok: CharClass = .{ .extra = "\x7f" };
+    try testing.expectEqual(@as(?CharClass.Reason, .control_byte), del_ok.explain("a\x7f"));
+    // `allow_alnum = false` really takes the alphanumerics away.
+    const no_alnum: CharClass = .{ .allow_alnum = false, .extra = "_" };
+    try testing.expect(no_alnum.check("__"));
+    try testing.expectEqual(@as(?CharClass.Reason, .bad_byte), no_alnum.explain("_a"));
+    // isSafeIdentifier: `[A-Za-z0-9_-]` -- no `.`.
+    try testing.expect(!isSafeIdentifier("a.b"));
+    // isSafePath: "≤ 4096 bytes", "no control bytes" (DEL included).
+    const p4096 = "/" ++ "a" ** 4095;
+    try testing.expect(isSafePath(p4096));
+    try testing.expect(!isSafePath(p4096 ++ "a"));
+    try testing.expect(!isSafePath("/a\x7f"));
+    // isSafeBase64 without exact_len: "1..512 bytes".
+    try testing.expect(isSafeBase64("A" ** 512, null));
+    try testing.expect(!isSafeBase64("A" ** 513, null));
+    // isSafeCidrList: hex digits only -- `G`..`Z` are not.
+    try testing.expect(isSafeCidrList("fe80::/10,10.0.0.0/8", ','));
+    try testing.expect(!isSafeCidrList("Z", ','));
+    // isSafeKvValue(printable): "0x20..0x7e" -- DEL is outside.
+    try testing.expect(!isSafeKvValue("a\x7f", true));
+}
+
 test "CharClass reconstructs ubusNameSafe" {
     // ubus: alnum + `_-.*`, first alnum, ≤128, `..` allowed (a ubus glob).
     const c: CharClass = .{ .extra = "_-.*", .first_char = .alnum, .reject_substrings = &.{} };

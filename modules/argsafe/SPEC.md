@@ -6,7 +6,7 @@
 
 **Scope:** core — no direct equivalent; closest: Python `shlex.quote` / Rust `shlex` (argument safety) and Rust `validator` (validators) (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-04
 
 **Known defects:** none recorded
 
@@ -114,6 +114,16 @@ across tokens) substituting consistently, `{{`/`}}` literal-brace escaping, ever
 surfacing with the correct hole name, a flag-injection attempt (leading `-`) refused by default, and
 the `reject_leading_dash = false` opt-out allowing it. Green in Debug and ReleaseFast; `zig fmt
 --check` clean.
+
+**Audit 2026-10-04 (mutation).** 40 schemata mutants over `CharClass.explain` (every
+check, each `first_char` rule, DEL, `allow_alnum`), the convenience predicates (lengths,
+schemes, leading-dash guards, charsets, DEL), `Argv`'s poisoning, and `Template`
+(empty, duplicate holes, argv[0] holes, unknown holes, stray braces, value count, per-value
+check, `{{` rendering): 40 killed, 0 equivalent, 0 left alive. Eight survivors of the first
+run were boundaries no test touched and got one table test: DEL as `control_byte` even when
+`extra` holds it, `allow_alnum = false`, no `.` in `isSafeIdentifier`, the 4096-byte path cap
+and DEL in a path, the 512-byte base64 cap, non-hex letters in a CIDR list, DEL in a printable
+kv value.
 
 ## Backlog / deferred
 

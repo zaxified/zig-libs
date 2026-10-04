@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-04** — **Tests:** mutation run (40 schemata mutants, all killed after one new table
+  test of documented predicate edges: DEL handling, `allow_alnum = false`, length caps, charsets).
+  No code change.
+
 - **2026-09-28** — New `Template`/`Hole`/`Filled`/`Refusal`/`FillOutcome` and
   `CharClass.explain`/`CharClass.Reason`, requested by ttydesk (2026-09-27): an
   argv shape from a **trusted config** (`["systemctl", "restart", "{unit}"]`)
