@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: headless Chrome** (`tools/interop.zig`, `tools/browser_oracle.js`,
+  `src/browser_oracle_test.zig`): 504 `fetch()` calls from two origins under 16 gated and 2 static
+  configurations; Chrome's verdict must equal the configured policy, and the middleware must still
+  answer each request Chrome sent with the head it judged. Anchor grade MIXED → EXTERNAL.
+  - **BEHAVIOURAL:** `methodTokenAllowed` compares methods byte for byte (RFC 9110). A preflight for
+    `patch` -- `fetch()` upper-cases only DELETE/GET/HEAD/OPTIONS/POST/PUT -- was granted with
+    `Access-Control-Allow-Methods: ..., PATCH`, which the browser refuses anyway; it is now a failed
+    preflight. Canonical upper-case tokens answer as before.
+  - `allowed_headers = .list` entries are trimmed before comparing: `" X-A"` used to match no
+    requested header.
+
 - **2026-10-04** — Tests: mutation schemata run (36 mutants, all killed). Two new tests: a
   listed origin grants only its exact serialization (not a longer host or a port variant), and
   a bare OPTIONS under `allow_unconditional_wildcard` carries no Allow-Methods/Max-Age. No

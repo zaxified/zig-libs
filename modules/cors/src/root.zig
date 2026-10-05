@@ -494,15 +494,22 @@ pub const Cors = struct {
         };
     }
 
-    /// Case-insensitive method-token check against `allowed_methods`.
-    /// OPTIONS is always allowed (rs/cors: the preflight vehicle itself is
-    /// never the thing being permitted). Pure — `token` is a raw method
-    /// token (an actual request's method, or a preflight's
-    /// `Access-Control-Request-Method` value).
+    /// Method-token check against `allowed_methods`, byte for byte: a
+    /// method is case-sensitive (RFC 9110 §9.1), and so is the browser's
+    /// own check of a preflight answer. OPTIONS is always allowed (rs/cors:
+    /// the preflight vehicle itself is never the thing being permitted).
+    /// Pure — `token` is a raw method token (an actual request's method, or
+    /// a preflight's `Access-Control-Request-Method` value).
+    ///
+    /// ⛔ It used to ignore case, so a preflight for `patch` -- which
+    /// `fetch()` does not upper-case, unlike GET/POST/PUT/DELETE -- was
+    /// granted with `Access-Control-Allow-Methods: ..., PATCH`, an answer
+    /// Chrome then refused (`patch` is not in it). A grant no browser
+    /// honours; the browser oracle, 2026-10-05.
     pub fn methodTokenAllowed(c: *const Cors, token: []const u8) bool {
-        if (std.ascii.eqlIgnoreCase(token, "OPTIONS")) return true;
+        if (std.mem.eql(u8, token, "OPTIONS")) return true;
         for (c.options.allowed_methods) |m| {
-            if (std.ascii.eqlIgnoreCase(token, m.token())) return true;
+            if (std.mem.eql(u8, token, m.token())) return true;
         }
         return false;
     }
@@ -531,7 +538,11 @@ pub const Cors = struct {
             const name = std.mem.trim(u8, raw, " \t");
             if (name.len == 0) continue;
             const ok = for (list) |h| {
-                if (std.ascii.eqlIgnoreCase(h, name)) break true;
+                // A configured name is trimmed as a requested one is: `" X-A"`
+                // used to match nothing, while the browser reads the joined
+                // `Access-Control-Allow-Headers` with the spaces stripped
+                // (the browser oracle, 2026-10-05).
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, h, " \t"), name)) break true;
             } else false;
             if (!ok) return false;
         }
@@ -924,20 +935,22 @@ test "preflight: .list allowed_headers with NO Access-Control-Request-Headers st
     try expectHeaderLine(got, "Access-Control-Allow-Headers: Content-Type");
 }
 
-test "methodTokenAllowed is genuinely case-insensitive (not just same-case by construction)" {
-    // Every wire-level test sends canonical-case method tokens (they're what
-    // http.Method.token() and real HTTP verbs produce), so the
-    // eqlIgnoreCase in methodTokenAllowed was never exercised on a mismatched
-    // case — call the private helper directly with a lowercase token.
+test "methodTokenAllowed is case-sensitive, as the browser's check is" {
+    // `fetch()` upper-cases only DELETE/GET/HEAD/OPTIONS/POST/PUT; a script's
+    // `patch` reaches the preflight as `patch`, and Chrome refuses an answer
+    // that lists `PATCH` (browser_oracle_test.zig). Granting it was a grant
+    // no browser honours.
     var c: Cors = try .init(testing.allocator, .{
         .allowed_origins = .any,
-        .allowed_methods = &.{.get},
+        .allowed_methods = &.{ .get, .patch },
     });
     defer c.deinit();
-    try testing.expect(c.methodTokenAllowed("get")); // lowercase, configured as .get
-    try testing.expect(c.methodTokenAllowed("GeT"));
-    try testing.expect(c.methodTokenAllowed("options")); // lowercase OPTIONS bypass
-    try testing.expect(!c.methodTokenAllowed("post"));
+    try testing.expect(c.methodTokenAllowed("GET"));
+    try testing.expect(c.methodTokenAllowed("PATCH"));
+    try testing.expect(!c.methodTokenAllowed("patch"));
+    try testing.expect(!c.methodTokenAllowed("GeT"));
+    try testing.expect(c.methodTokenAllowed("OPTIONS"));
+    try testing.expect(!c.methodTokenAllowed("POST"));
 }
 
 test "actual: Vary is withheld (not just Allow-Origin) when the method gate fails" {
@@ -1991,7 +2004,7 @@ const gate_seeds = [_][]const u8{
     fuzzseed.seed("null"), // the second listed origin: the opaque one browsers send
     fuzzseed.seed("https://evil.example"), // an unlisted origin
     fuzzseed.seed("OPTIONS"), // the preflight vehicle: always allowed, whatever the method list says
-    fuzzseed.seed("options"), // ⭐ the same through `eqlIgnoreCase`, which origin matching does not use
+    fuzzseed.seed("options"), // ⭐ refused: methods compare byte for byte (`OPTIONS` is the token)
     fuzzseed.seed("GET"), // a listed method token
     fuzzseed.seed("TRACE"), // an unlisted method token
     fuzzseed.seed("content-type, authorization"), // both listed headers, lowercased as a browser sends them
@@ -2044,7 +2057,9 @@ test "corpus: every gate seed reaches all three gates, and their verdicts are pi
     // the empty string: 0 origins granted, 0 methods allowed, 0 header lists
     // refused — the refusal branch of `requestedHeadersAllowed` had never run.
     try testing.expectEqual(@as(usize, 2), origins_granted);
-    try testing.expectEqual(@as(usize, 3), methods_allowed);
+    // 3 → 2 on 2026-10-05: the `options` seed no longer passes -- methods
+    // compare byte for byte now (`methodTokenAllowed`).
+    try testing.expectEqual(@as(usize, 2), methods_allowed);
     try testing.expectEqual(@as(usize, 10), headers_refused);
 }
 
@@ -2298,4 +2313,10 @@ test "allow_unconditional_wildcard: a bare OPTIONS gets only the wildcard, no pr
     try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
     try expectNoHeader(got, "Access-Control-Allow-Methods");
     try expectNoHeader(got, "Access-Control-Max-Age");
+}
+
+// ── external anchor: headless Chrome against this middleware ───────────────
+// See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
+test {
+    _ = @import("browser_oracle_test.zig");
 }
