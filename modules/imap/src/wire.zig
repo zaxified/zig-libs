@@ -783,6 +783,63 @@ test "literal: the announced size is capped before it is allocated" {
     try testing.expectError(error.LiteralTooLarge, d.literal());
 }
 
+test "literal: both ceilings bite AT their value, and the per-line total resets per line" {
+    const gpa = testing.allocator;
+    // max_literal: exactly at it is accepted, one past it is not.
+    {
+        var r = std.Io.Reader.fixed("{4}\r\nAAAA{5}\r\nBBBBB");
+        var d = Decoder.init(gpa, &r, .{ .max_literal = 4 });
+        const s = (try d.literal()).?;
+        defer gpa.free(s);
+        try testing.expectError(error.LiteralTooLarge, d.literal());
+    }
+    // max_literal_total: a running total of exactly 8 is accepted, 9 is not.
+    {
+        var r = std.Io.Reader.fixed("{4}\r\nAAAA{4}\r\nBBBB{1}\r\nC");
+        var d = Decoder.init(gpa, &r, .{ .max_literal = 8, .max_literal_total = 8 });
+        for (0..2) |_| gpa.free((try d.literal()).?);
+        try testing.expectError(error.LiteralTooLarge, d.literal());
+    }
+    // ...and `startLine` gives the next line a fresh total.
+    {
+        var r = std.Io.Reader.fixed("{8}\r\nAAAAAAAA{8}\r\nBBBBBBBB");
+        var d = Decoder.init(gpa, &r, .{ .max_literal = 8, .max_literal_total = 8 });
+        gpa.free((try d.literal()).?);
+        d.startLine();
+        gpa.free((try d.literal()).?);
+    }
+}
+
+test "quoted: an escape costs both of its bytes against the line budget" {
+    const gpa = testing.allocator;
+    const input = "\"a\\\"b\""; // 6 bytes on the wire, 3 after unescaping
+    {
+        var r = std.Io.Reader.fixed(input);
+        var d = Decoder.init(gpa, &r, .{ .max_line = 6 });
+        const s = (try d.quoted()).?;
+        defer gpa.free(s);
+        try testing.expectEqualStrings("a\"b", s);
+        try testing.expectEqual(@as(usize, 6), d.line_bytes);
+    }
+    {
+        var r = std.Io.Reader.fixed(input);
+        var d = Decoder.init(gpa, &r, .{ .max_line = 5 });
+        try testing.expectError(error.LineTooLong, d.quoted());
+    }
+}
+
+test "atom: every RFC 9051 atom-special, CTL and DEL ends an atom" {
+    for ("(){ %*\"\\]\x00\x1f\x7f") |ch| try testing.expect(!isAtomChar(ch));
+    try testing.expect(isAtomChar('A') and isAtomChar('[') and isAtomChar('$'));
+}
+
+test "nstring: an atom other than NIL is refused, not read as NIL" {
+    const gpa = testing.allocator;
+    var r = std.Io.Reader.fixed("NILL");
+    var d = decoderOver(gpa, &r);
+    try testing.expectError(error.UnexpectedByte, d.expectNString());
+}
+
 test "literal: a truncated body is an error, not a short string" {
     const gpa = testing.allocator;
     var r = std.Io.Reader.fixed("{20}\r\ntoo short");

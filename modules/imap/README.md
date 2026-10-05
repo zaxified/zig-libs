@@ -6,7 +6,7 @@
 
 **Scope:** mvp — go-imap v2 `imapclient` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -332,6 +332,22 @@ exposed a test with no teeth: clearing mailbox state on a failed SELECT was
 already covered by clearing it on entry, so the test could not tell the two
 apart. The transcript now emits untagged data before the refusal, which only
 the failure path can clean up.
+
+**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the wire
+decoder's budgets and refusals, the encoder's argument/sequence-set/section/
+flag/quoting checks, the modified-UTF-7 decoder, tagged-status rejection,
+the session's state and STARTTLS gates, and the BODYSTRUCTURE parser): 38
+killed. The first pass left 17; tests were added for both literal ceilings
+at their exact value and the per-line total's reset in `startLine`, an
+escape's second byte counting against `max_line`, every atom-special
+(the backslash was untested), a non-NIL atom where an nstring is expected, DEL in a
+section specifier (encoder and decoder) and in `quotable`'s 0x7f/0x80 edge,
+a backslash in a flag's second position, a high surrogate followed by a
+non-low one (`&2ADgAA-`), a single injected byte after the STARTTLS OK,
+SELECT before authentication, the BODYSTRUCTURE depth bound at exactly
+`max_depth`, and a parameter key without a value. Equivalent: the explicit
+`=` and CR refusals in a base64 run (the padless decoder rejects both bytes
+as out-of-alphabet anyway).
 
 ## Anchoring
 

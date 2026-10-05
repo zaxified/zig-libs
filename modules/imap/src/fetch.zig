@@ -803,6 +803,32 @@ test "BODYSTRUCTURE: recursion is bounded on the way in" {
     try testing.expectError(error.BodyTooDeep, p.body());
 }
 
+test "BODYSTRUCTURE: the depth bound is exact -- max_depth levels parse, one more does not" {
+    const leaf = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 1 1)";
+    {
+        var f: Fx = undefined;
+        f.init("(" ++ leaf ++ " \"MIXED\")"); // depth 2
+        defer f.deinit();
+        var p = Parser{ .d = &f.d, .opts = .{ .max_depth = 2 } };
+        _ = try p.body();
+    }
+    {
+        var f: Fx = undefined;
+        f.init("((" ++ leaf ++ " \"MIXED\") \"MIXED\")"); // depth 3
+        defer f.deinit();
+        var p = Parser{ .d = &f.d, .opts = .{ .max_depth = 2 } };
+        try testing.expectError(error.BodyTooDeep, p.body());
+    }
+}
+
+test "BODYSTRUCTURE: a parameter key without a value is refused" {
+    var f: Fx = undefined;
+    f.init("(\"TEXT\" \"PLAIN\" (\"CHARSET\") NIL NIL \"7BIT\" 1 1)");
+    defer f.deinit();
+    var p = f.parser();
+    try testing.expectError(error.ParamWithoutValue, p.body());
+}
+
 test "BODYSTRUCTURE: extension fields present and absent both parse" {
     var f: Fx = undefined;
     f.init("(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5 " ++
@@ -886,6 +912,13 @@ test "msg-att: F9 -- a section containing CR/LF/NUL is rejected, not silently ac
     {
         var f: Fx = undefined;
         f.init("(BODY[A\x00B] NIL)");
+        defer f.deinit();
+        var p = f.parser();
+        try testing.expectError(error.UnexpectedByte, p.message(1));
+    }
+    {
+        var f: Fx = undefined;
+        f.init("(BODY[A\x7fB] NIL)"); // DEL: the encoder's `>= 0x7f` boundary
         defer f.deinit();
         var p = f.parser();
         try testing.expectError(error.UnexpectedByte, p.message(1));

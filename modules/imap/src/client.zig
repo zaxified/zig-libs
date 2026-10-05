@@ -1224,6 +1224,26 @@ test "unsolicited untagged data mid-command reaches the observer" {
     try testing.expectEqual(@as(u32, 44), Seen.expunges.items[0]);
 }
 
+test "STARTTLS: a single buffered byte past the OK is already an injection" {
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2 STARTTLS] Ready\r\n" ++
+        "T1 OK Begin TLS negotiation now\r\n" ++ "*");
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    try testing.expectError(error.PlaintextInjection, c.startTls());
+}
+
+test "SELECT before authentication is refused locally" {
+    var p: Peer = undefined;
+    p.init("* OK ready\r\n");
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    try testing.expectError(error.BadState, c.select("INBOX", false));
+    try testing.expectEqual(State.not_authenticated, c.state);
+}
+
 test "PREAUTH means the connection is already authenticated" {
     var p: Peer = undefined;
     p.init("* PREAUTH [CAPABILITY IMAP4rev2] Logged in as smith\r\n");
