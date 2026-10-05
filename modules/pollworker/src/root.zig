@@ -522,6 +522,166 @@ test "JobTable.spawnDetached: /bin/true succeeds, /bin/false fails (real fork/ex
     try std.testing.expectEqual(@as(usize, 0), table.busy());
 }
 
+/// Test helper: run one argv through `spawnDetached` to completion and return
+/// what the worker reported.
+fn runToCompletion(argv: []const []const u8) !ProcResult {
+    const Job = struct { res: ProcResult = undefined };
+    const Table = JobTable(1, Job);
+    const H = struct {
+        fn report(job: *Job, res: ProcResult) void {
+            job.res = res;
+        }
+        var got: ProcResult = undefined;
+        fn onDone(job: *Job) void {
+            got = job.res;
+        }
+    };
+    var table: Table = .{};
+    try table.spawnDetached(std.testing.allocator, argv, H.report);
+    var spins: usize = 0;
+    while (doneCount(&table) < 1) {
+        spins += 1;
+        try std.testing.expect(spins < 5_000_000_000);
+    }
+    table.drain(H.onDone);
+    return H.got;
+}
+
+fn haveFile(path: [*:0]const u8) bool {
+    return @as(isize, @bitCast(linux.access(path, linux.F_OK))) >= 0;
+}
+
+test "spawnDetached: every argv element reaches the child" {
+    if (!haveFile("/bin/sh")) return error.SkipZigTest;
+    const r = try runToCompletion(&.{ "/bin/sh", "-c", "exit 3" });
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = 3, .term_signal = null, .spawn_failed = false }, r);
+}
+
+test "spawnDetached: a target that cannot be exec'd exits 127, not 0" {
+    const r = try runToCompletion(&.{"/nonexistent/pollworker-no-such-binary"});
+    try std.testing.expectEqual(ProcResult{ .ok = false, .exit_code = 127, .term_signal = null, .spawn_failed = false }, r);
+}
+
+test "spawnDetached: the child does not inherit the parent's non-CLOEXEC fds" {
+    if (!haveFile("/bin/sh") or !haveFile("/proc/self/fd")) return error.SkipZigTest;
+    var fds: [2]i32 = undefined;
+    try std.testing.expect(@as(isize, @bitCast(linux.pipe(&fds))) >= 0); // no CLOEXEC
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "[ -e /proc/self/fd/{d} ] && exit 1; exit 0", .{fds[1]});
+    const r = try runToCompletion(&.{ "/bin/sh", "-c", cmd });
+    try std.testing.expectEqual(@as(?u8, 0), r.exit_code);
+}
+
+test "spawnDetached: an empty argv is refused and claims no slot" {
+    const Job = struct { res: ProcResult = undefined };
+    var table: JobTable(1, Job) = .{};
+    const H = struct {
+        fn report(job: *Job, res: ProcResult) void {
+            job.res = res;
+        }
+    };
+    try std.testing.expectError(error.EmptyArgv, table.spawnDetached(std.testing.allocator, &.{}, H.report));
+    try std.testing.expectEqual(@as(usize, 0), table.busy());
+}
+
+test "spawnDetached: an allocation failure at any step leaks nothing and frees the slot" {
+    if (!haveFile("/bin/true")) return error.SkipZigTest;
+    const Job = struct { res: ProcResult = undefined };
+    const Table = JobTable(1, Job);
+    const H = struct {
+        fn report(job: *Job, res: ProcResult) void {
+            job.res = res;
+        }
+        fn onDone(_: *Job) void {}
+    };
+    var idx: usize = 0;
+    while (true) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = idx });
+        var table: Table = .{};
+        table.spawnDetached(failing.allocator(), &.{ "/bin/true", "x" }, H.report) catch |e| {
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            try std.testing.expectEqual(@as(usize, 0), table.busy());
+            try std.testing.expectEqual(failing.allocations, failing.deallocations);
+            continue;
+        };
+        // Every allocation succeeded: let the worker finish and free its own.
+        var spins: usize = 0;
+        while (doneCount(&table) < 1) {
+            spins += 1;
+            try std.testing.expect(spins < 5_000_000_000);
+        }
+        table.drain(H.onDone);
+        try std.testing.expectEqual(failing.allocations, failing.deallocations);
+        try std.testing.expect(idx >= 4); // the failure sweep did reach the later steps
+        break;
+    }
+}
+
+test "JobTable.drain leaves a RUNNING slot alone" {
+    const Job = struct { value: u32 = 0 };
+    var table: JobTable(2, Job) = .{};
+    const H = struct {
+        var calls: u32 = 0;
+        fn onDone(_: *Job) void {
+            calls += 1;
+        }
+    };
+    H.calls = 0;
+    const running = table.claim().?;
+    const done = table.claim().?;
+    table.finish(done);
+    table.drain(H.onDone);
+    try std.testing.expectEqual(@as(u32, 1), H.calls);
+    try std.testing.expectEqual(@as(usize, 1), table.busy()); // the RUNNING one
+    table.finish(running);
+    table.drain(H.onDone);
+    try std.testing.expectEqual(@as(u32, 2), H.calls);
+}
+
+fn ignoreSignal(_: linux.SIG) callconv(.c) void {}
+
+test "Loop.poll: a signal during the wait is Interrupted, not PollFailed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const act: linux.Sigaction = .{ .handler = .{ .handler = ignoreSignal }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &act, &old);
+    defer _ = linux.sigaction(.USR1, &old, null);
+
+    var fds: [2]i32 = undefined;
+    try std.testing.expect(@as(isize, @bitCast(linux.pipe(&fds))) >= 0);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const S = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        // Keep signalling until the poller has seen one, so a signal that
+        // lands before `poll` blocks cannot make this flaky.
+        fn kick(tid: linux.pid_t) void {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = 5_000_000 };
+            while (!stop.load(.acquire)) {
+                _ = linux.tgkill(linux.getpid(), tid, .USR1);
+                _ = linux.nanosleep(&ts, null);
+            }
+        }
+    };
+    S.stop.store(false, .release);
+    const th = try std.Thread.spawn(.{}, S.kick, .{linux.gettid()});
+    defer th.join();
+    defer S.stop.store(true, .release);
+
+    var pfd = [_]Loop.pollfd{.{ .fd = fds[0], .events = Loop.POLL.IN, .revents = 0 }};
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        try std.testing.expect(tries < 1000);
+        _ = Loop.poll(&pfd, 10_000) catch |e| {
+            try std.testing.expectEqual(error.Interrupted, e);
+            break;
+        };
+    }
+}
+
 /// Test helper: number of slots currently in the DONE state.
 fn doneCount(table: anytype) usize {
     var n: usize = 0;
