@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 38 of 40 killed, 2 equivalent; 8 tests added (LAN SNP
+  acceptance; LSP/SNP challenges of router and pseudonode LSPs; LAN send rules and
+  `requestFromCsnp`; pseudonode regression check, `isDead` horizon, extra fragments;
+  non-DIS member crash; inclusive horizon; truncated-poll re-arm; SSN-only
+  non-quiescence), four through a new test-only `Direct` harness that calls the
+  callbacks against a real `netsim.Sim`. No code change.
 - **2026-09-30** — LAN (broadcast) circuits (survey backlog, A9 part 2). `Topology.lans`
   (`Lan`, `LanMember`): a LAN is a full mesh of netsim links; `isis-dis` elects the
   DIS per member view (`setLanPriorityAt`, a crashed member declared dead after

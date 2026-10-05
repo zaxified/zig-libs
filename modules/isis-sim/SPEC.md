@@ -6,7 +6,7 @@
 
 **Scope:** mvp — no direct reference; FRR topotests / containerlab for the use case (surveyed 2026-09-30; poc -> mvp 2026-09-30 after lossy medium, aging and LAN circuits)
 
-**Audit:** review 2026-09-03 · mutation none
+**Audit:** review 2026-09-03 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -241,6 +241,28 @@ determinism proofs plus the positive control, the lossy-medium `MEASURED:` sweep
 `std.testing.allocator` (leak-checked). See `README.md` for the per-test summary.
 Provenance: composes sibling modules over `netsim`; clean-room from ISO/IEC 10589,
 no third-party source ported — no `/NOTICE` entry.
+
+**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the challenge
+handling (LSP and SNP, router and pseudonode), the LAN SNP acceptance and send
+rules, the DIS election/membership/pseudonode paths, both sequence-regression
+checks and the count tripwire, extra fragments, the poll re-arm and horizon
+gates, `requestFromCsnp`, `quiescent`, `isDead`, `agreeOn` and the crash
+hold): 38 killed. The first pass left 20 — most of them paths no scenario
+drives (no node ever loses its sequence number, so nobody is ever challenged)
+or differences visible only in traffic. Eight tests added, four of them driving
+the callbacks one PDU at a time against a real `netsim.Sim` (`Direct`): a CSNP
+from a non-DIS member and a PSNP to one are ignored; challenges by LSP and by
+SNP land above the challenger (and one naming another circuit touches
+nothing); only the DIS sends CSNPs, the DIS sends no PSNP, a member requests
+only what it lacks in PDUs of at most 15; the pseudonode regression check,
+`isDead`'s horizon and every extra fragment; a non-DIS member crash (noticed
+only after `lan_hold_time`, dropped from the pseudonode, sent nothing
+afterwards); the horizon is inclusive for aging ticks and flooding wakeups; a
+truncated poll re-arms; a pending SSN alone is not quiescent. Equivalent:
+requesting a placeholder's "copy" in `requestFromCsnp` (its view — sequence 0,
+lifetime 0, checksum 0 — is exactly the default request entry), and
+`agreeOn`'s sequence comparison (the byte comparison after it covers the
+sequence field).
 
 ## 10. Lossy medium
 
