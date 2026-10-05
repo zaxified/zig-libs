@@ -5,10 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-05** — **Anchoring: JSON Lines read by Python json, Go encoding/json and jq** (`tools/json_oracle.py`,
-  `tools/go_json`, `tools/interop.zig`, `src/json_oracle_test.zig`): 421 entries with hostile and ill-formed
-  strings and extreme numbers; each reader gets every entry back exactly, the U+FFFD substitution matching
-  Python's own decoder. No defect found; no code change. logfmt stays unanchored (go-logfmt not available offline).
+- **2026-10-05** — **Anchoring: JSON Lines read by Python json, Go encoding/json and jq; logfmt read by go-logfmt**
+  (`tools/json_oracle.py`, `tools/go_json`, `tools/go_logfmt`, `tools/interop.zig`, `src/json_oracle_test.zig`): 421
+  entries with hostile and ill-formed strings and extreme numbers; each reader gets every entry back exactly, the
+  U+FFFD substitution matching Python's own decoder. Anchor grade MIXED → EXTERNAL.
+  - **DEFECT fixed, BEHAVIOURAL:** logfmt wrote a control byte as `\xHH`, which go-logfmt (the de-facto reference
+    reader, and Loki's parser after it) refuses as an invalid quoted value -- one control byte in any field made the
+    whole line unreadable. Now `\u00HH`, the JSON-style escape those readers decode. Combined keeps Apache's `\xHH`.
 
 - **2026-10-04** — **Tests:** mutation run (33 schemata mutants, all killed after one new test:
   a logfmt value holding DEL is quoted and hex-escaped). No code change.

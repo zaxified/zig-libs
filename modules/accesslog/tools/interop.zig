@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-//! JSON Lines against three foreign readers: `tools/json_oracle.py` draws
-//! entries (hostile strings, ill-formed UTF-8, extreme numbers), this
-//! program writes each with `writeJsonLines`, and Python's json, Go's
-//! encoding/json (`tools/go_json`) and jq must each read the entry back
-//! exactly. Frozen in `src/json_oracle_vectors.zig`, replayed by
+//! JSON Lines and logfmt against foreign readers: `tools/json_oracle.py`
+//! draws entries (hostile strings, ill-formed UTF-8, extreme numbers), this
+//! program writes each with `writeJsonLines` and `writeLogfmt`, and Python's
+//! json, Go's encoding/json (`tools/go_json`) and jq must each read the JSON
+//! line back to the entry exactly, go-logfmt (`tools/go_logfmt`) the logfmt
+//! one. Frozen in `src/json_oracle_vectors.zig`, replayed by
 //! `src/json_oracle_test.zig` in `test-accesslog`.
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build interop-accesslog` runs it and
@@ -121,8 +122,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var s: std.json.Stringify = .{ .writer = &out.writer };
     try s.beginArray();
     for (entries) |e| {
-        var line: std.Io.Writer.Allocating = .init(arena);
-        try accesslog.writeJsonLines(.{
+        const entry: accesslog.Entry = .{
             .timestamp_ns = e.timestamp_ns,
             .method = try unhex(arena, e.method),
             .target = try unhex(arena, e.target),
@@ -138,8 +138,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             .request_bytes = e.request_bytes,
             .response_bytes = e.response_bytes,
             .latency_ns = e.latency_ns,
-        }, &line.writer);
-        try s.print("\"{x}\"", .{line.written()});
+        };
+        var json_line: std.Io.Writer.Allocating = .init(arena);
+        try accesslog.writeJsonLines(entry, &json_line.writer);
+        var logfmt_line: std.Io.Writer.Allocating = .init(arena);
+        try accesslog.writeLogfmt(entry, &logfmt_line.writer);
+        try s.beginArray();
+        try s.print("\"{x}\"", .{json_line.written()});
+        try s.print("\"{x}\"", .{logfmt_line.written()});
+        try s.endArray();
     }
     try s.endArray();
     try cwd.writeFile(io, .{ .sub_path = ours_path, .data = out.written() });

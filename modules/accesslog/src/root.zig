@@ -374,7 +374,11 @@ fn writeJsonOptU64(w: *std.Io.Writer, v: ?u64) std.Io.Writer.Error!void {
 /// space, tab, `"`, `=`, backslash, a control byte, or is empty
 /// (`logfmtNeedsQuote`). When quoted, `"`/`\` are backslash-escaped, `\n`/
 /// `\r`/`\t` get their short escapes, and any other control byte becomes
-/// `\xHH`. Because *every* character that would ever need escaping is also
+/// `\u00HH` -- the JSON-style escape go-logfmt, the de-facto reference
+/// reader, decodes. (It used to be `\xHH`, which go-logfmt refuses as an
+/// invalid quoted value: one control byte in a field made the whole line
+/// unreadable -- the go-logfmt oracle, `json_oracle_test.zig`, 2026-10-05.)
+/// Because *every* character that would ever need escaping is also
 /// exactly the trigger set for quoting, an unquoted value is guaranteed
 /// escape-free passthrough (a benign `GET`, a plain path) while anything
 /// containing a quote, an `=` (which could otherwise read as a second
@@ -449,7 +453,7 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
         '\n' => try w.writeAll("\\n"),
         '\r' => try w.writeAll("\\r"),
         '\t' => try w.writeAll("\\t"),
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{c}),
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => try w.print("\\u{x:0>4}", .{c}),
         else => try w.writeByte(c),
     };
     try w.writeByte('"');
@@ -644,7 +648,7 @@ test "logfmt: a value holding DEL (0x7F) is quoted and the byte hex-escaped" {
     var e = sampleEntry();
     e.method = "GE\x7fT";
     try writeLogfmt(e, &w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), " method=\"GE\\x7fT\" ") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), " method=\"GE\\u007fT\" ") != null);
     try testing.expect(std.mem.indexOfScalar(u8, w.buffered(), 0x7f) == null);
 }
 
@@ -936,11 +940,11 @@ test "logfmt: an empty value is quoted (an unquoted empty value would vanish, mi
     try testing.expectEqualStrings("\"\"", w.buffered());
 }
 
-test "logfmt: control bytes escape to their own exact \\xHH value, not just 'something'" {
+test "logfmt: control bytes escape to their own exact \\u00HH value, not just 'something'" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeLogfmtValue(&w, "\x01\x1f\x7f");
-    try testing.expectEqualStrings("\"\\x01\\x1f\\x7f\"", w.buffered());
+    try testing.expectEqualStrings("\"\\u0001\\u001f\\u007f\"", w.buffered());
 }
 
 test "combined: injection payload cannot forge a second line or break the quoted fields" {
