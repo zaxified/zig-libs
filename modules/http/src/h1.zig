@@ -544,7 +544,6 @@ pub const RequestHead = struct {
                     try latchContentLength(&head.content_length, entry.value);
                 },
                 "transfer-encoding".len => if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
-                    head.has_transfer_encoding = true;
                     // RFC 9112 §6.1: when `chunked` is present it MUST be the
                     // final transfer-coding; this server supports no other
                     // coding, so the only accepted value is the single token
@@ -553,7 +552,15 @@ pub const RequestHead = struct {
                     // vector) is a TE.TE request-smuggling primitive — leaving
                     // `chunked` false here routes it through the
                     // `has_transfer_encoding and !chunked` → 400 gate below.
-                    if (std.ascii.eqlIgnoreCase(entry.value, "chunked")) head.chunked = true;
+                    //
+                    // A SECOND field line continues the same list (RFC 9110
+                    // §5.3): `gzip` + `chunked` on two lines IS "gzip,
+                    // chunked", and a proxy that combines them reads it so.
+                    // Judging each line alone accepted it as chunked (Go
+                    // oracle, 2026-10-05), so any second line refuses.
+                    head.chunked = !head.has_transfer_encoding and
+                        std.ascii.eqlIgnoreCase(entry.value, "chunked");
+                    head.has_transfer_encoding = true;
                 },
                 "connection".len => if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
                     if (tokenListContains(entry.value, "close")) head.connection_close = true;
@@ -1326,6 +1333,21 @@ test "RequestHead.parse: Transfer-Encoding must be exactly the single 'chunked' 
     try testing.expect(sole.chunked);
     const sole_case = try RequestHead.parse("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: CHUNKED\r\n");
     try testing.expect(sole_case.chunked);
+
+    // The same lists split over field lines are the same lists (RFC 9110
+    // §5.3), whichever line carries `chunked`.
+    for ([_][]const u8{
+        "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+    }) |fields| {
+        var buf: [256]u8 = undefined;
+        const block = try std.fmt.bufPrint(&buf, "POST /u HTTP/1.1\r\nHost: h\r\n{s}", .{fields});
+        const split = try RequestHead.parse(block);
+        try testing.expect(split.has_transfer_encoding);
+        try testing.expect(!split.chunked);
+    }
 }
 
 test "RequestHead.parse: bare-LF line endings are rejected (RFC 9112 §2.2)" {

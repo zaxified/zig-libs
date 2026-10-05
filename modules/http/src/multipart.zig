@@ -49,6 +49,7 @@
 
 const std = @import("std");
 const body = @import("body.zig");
+const h1 = @import("h1.zig");
 
 /// Resource bounds. The overall body size is bounded by the caller's buffer;
 /// these cap the per-body part count and per-part header size so a small body
@@ -184,6 +185,7 @@ pub const Iterator = struct {
             break :blk .{ .raw = it.rest[0..end], .body_off = end + 4 };
         };
         if (hdr.raw.len > it.limits.max_header_bytes) return error.HeadersTooLarge;
+        if (!wellFormedHeaders(hdr.raw)) return error.MalformedBody;
 
         // Body: up to the next "\r\n--boundary"; that CRLF is framing, not
         // body. Position rest just past the dash_boundary for the next call.
@@ -203,6 +205,23 @@ pub const Iterator = struct {
         };
     }
 };
+
+/// Whether every line of a part's header block is `token ":" value`. A line
+/// without a colon, or one that starts with whitespace (a folded
+/// continuation), used to be skipped by the header lookup: a folded
+/// `Content-Disposition` lost its `name`, and `--b CRLF --b` read the second
+/// delimiter as an ignorable header line (Go oracle, 2026-10-05). Neither is
+/// what a browser sends; refusing beats guessing.
+fn wellFormedHeaders(raw: []const u8) bool {
+    if (raw.len == 0) return true;
+    var lines = std.mem.splitSequence(u8, raw, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        if (colon == 0) return false;
+        for (line[0..colon]) |c| if (!h1.isTchar(c)) return false;
+    }
+    return true;
+}
 
 /// Index in `hay` of the first full delimiter `"\r\n--" ++ boundary`, or null.
 fn indexOfDelimiter(hay: []const u8, boundary: []const u8) ?usize {
@@ -373,6 +392,7 @@ pub const Reader = struct {
 
         if (r.parts_seen == r.limits.max_parts) return error.TooManyParts;
         const raw = try r.readHeaders();
+        if (!wellFormedHeaders(raw)) return error.MalformedBody;
         r.parts_seen += 1;
         r.state = .in_body;
         r.known_body = 0;
@@ -1136,6 +1156,32 @@ test "Reader: an endless header block stops at max_header_bytes, not at the end 
     var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{ .max_header_bytes = 16 });
     try testing.expectError(error.HeadersTooLarge, mr.nextPart());
     try testing.expect(chunked.pos < src.len); // never read to the end
+}
+
+test "a part header line must be `token: value`: no colon, a fold or a second delimiter refuse the body" {
+    const bad = [_][]const u8{
+        // A line with no colon.
+        db ++ crlf ++ "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ "NoColon" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
+        // A folded continuation: skipping it lost `name`.
+        db ++ crlf ++ "Content-Disposition: form-data;" ++ crlf ++ " name=\"a\"" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
+        // A second delimiter read as a header line.
+        db ++ crlf ++ db ++ crlf ++ "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
+        // Whitespace before the colon, and an empty name.
+        db ++ crlf ++ "Content-Disposition : form-data; name=\"a\"" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
+        db ++ crlf ++ ": x" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--" ++ crlf,
+    };
+    for (bad) |src| {
+        var it = parse(src, test_boundary, .{});
+        try testing.expectError(error.MalformedBody, it.next());
+        try expectSameAsParseEverywhere(src, .{});
+    }
+    // The refusal is per part: an earlier good part is still yielded.
+    const second_bad = db ++ crlf ++ "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++ "1" ++ crlf ++
+        db ++ crlf ++ "Oops" ++ crlf ++ crlf ++ "2" ++ crlf ++ db ++ "--" ++ crlf;
+    var it = parse(second_bad, test_boundary, .{});
+    try testing.expectEqualStrings("1", (try it.next()).?.value);
+    try testing.expectError(error.MalformedBody, it.next());
+    try expectSameAsParseEverywhere(second_bad, .{});
 }
 
 test "Reader: a bare CR right before the blank line ends the header block where parse does" {

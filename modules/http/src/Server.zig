@@ -1836,6 +1836,12 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // and close, before the handler ever runs.
     if (head.has_transfer_encoding and head.has_content_length)
         return respondError(opts, out, date, 400);
+    // RFC 9112 §6.1: an HTTP/1.0 message with Transfer-Encoding MUST be
+    // treated as having faulty framing (§6.3: 400, then close) -- a 1.0
+    // intermediary does not know the coding and frames it some other way.
+    // This used to decode it as chunked (Go oracle, 2026-10-05).
+    if (head.http1_0 and head.has_transfer_encoding)
+        return respondError(opts, out, date, 400);
     const method = methodFromToken(head.method) orelse return respondError(opts, out, date, 501);
 
     // The request-target, reduced to what routing needs. Origin-form
@@ -5218,6 +5224,14 @@ test "serveStream: Content-Length + Transfer-Encoding together → 400 (CL.TE sm
     // Header order reversed is rejected identically.
     const got2 = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got2, "HTTP/1.1 400 Bad Request\r\n"));
+}
+
+test "serveStream: HTTP/1.0 with Transfer-Encoding → 400, never decoded as chunked (RFC 9112 §6.1)" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(&hits, "POST /echo HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
 }
 
 test "serveStream: request path normalized + traversal-clamped before routing" {

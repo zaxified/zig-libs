@@ -35,8 +35,10 @@
 //! - `If-Match` uses the **strong** comparison (both tags must be strong and
 //!   octet-identical). It is the "only act if unchanged" header for unsafe
 //!   methods.
-//! - `*` matches any current representation (i.e. "the resource exists"). With
-//!   a validator present here, the representation exists, so `*` matches.
+//! - `*` matches any current representation (i.e. "the resource exists"):
+//!   `Validators.exists`, which defaults to "a validator was given".
+//! - A list is split on the commas BETWEEN entity-tags, never inside one: a
+//!   comma is a legal opaque-tag byte (RFC 9110 §8.8.3, `etagc`).
 //! - Dates (`If-Modified-Since` / `If-Unmodified-Since`) compare at
 //!   one-second granularity against `Last-Modified`.
 
@@ -92,6 +94,18 @@ pub const ETag = struct {
 pub const Validators = struct {
     etag: ?[]const u8 = null,
     last_modified: ?i64 = null,
+    /// Whether the resource has a current representation, which is what
+    /// `*` asks (RFC 9110 §13.1.1/§13.1.2). null = it exists iff `etag` or
+    /// `last_modified` is given, so `.{}` says "does not exist" and a
+    /// create-only `PUT` with `If-None-Match: *` proceeds. Set it for a
+    /// resource that exists but has no validator. (Until 2026-10-05 only an
+    /// ETag counted: a resource with just a Last-Modified failed `If-Match: *`
+    /// and let `If-None-Match: *` overwrite it -- Go oracle.)
+    exists: ?bool = null,
+
+    fn representationExists(v: Validators) bool {
+        return v.exists orelse (v.etag != null or v.last_modified != null);
+    }
 };
 
 /// The precondition decision (RFC 9110 §13.2.2).
@@ -160,7 +174,7 @@ pub fn evaluate(method: http.Method, req: *const Server.Request, v: Validators) 
     // ⇒ the representation exists). A match falls through WITHOUT running
     // If-Unmodified-Since (§13.1.2/§13.2.2: If-Match takes precedence).
     if (p.if_match) |list| {
-        if (!listMatches(list, v.etag, false)) return .precondition_failed;
+        if (!listMatches(list, v, false)) return .precondition_failed;
     }
     // Step 2 — If-Unmodified-Since (only when If-Match is absent). An
     // unparseable date is ignored (RFC 9110 §13.1.4).
@@ -176,7 +190,7 @@ pub fn evaluate(method: http.Method, req: *const Server.Request, v: Validators) 
     // representation exists). Present-but-no-match proceeds and SUPPRESSES
     // If-Modified-Since (§13.2.2).
     if (p.if_none_match) |list| {
-        if (listMatches(list, v.etag, true))
+        if (listMatches(list, v, true))
             return if (is_get_head) .not_modified else .precondition_failed;
     }
     // Step 4 — If-Modified-Since (GET/HEAD only, only when If-None-Match is
@@ -270,26 +284,63 @@ pub fn apply(
     }
 }
 
-/// Whether a comma-separated entity-tag list header (`If-Match` /
-/// `If-None-Match`) matches the representation's current `etag`. `weak`
-/// selects the comparison (true = weak, for If-None-Match; false = strong, for
-/// If-Match). A bare `*` element matches iff `current` is non-null (the
-/// representation exists). Malformed elements are skipped.
-fn listMatches(list: []const u8, current: ?[]const u8, weak: bool) bool {
-    var it = std.mem.splitScalar(u8, list, ',');
-    while (it.next()) |raw| {
-        const elem = std.mem.trim(u8, raw, " \t");
-        if (elem.len == 0) continue;
-        if (std.mem.eql(u8, elem, "*")) {
-            if (current != null) return true;
-            continue;
-        }
-        const tag = ETag.parse(elem) orelse continue;
-        const cur = ETag.parse(current orelse continue) orelse continue;
-        if (if (weak) tag.weakEql(cur) else tag.strongEql(cur)) return true;
-    }
+/// Whether an entity-tag list header (`If-Match` / `If-None-Match`) matches
+/// the representation `v` describes. `weak` selects the comparison (true =
+/// weak, for If-None-Match; false = strong, for If-Match). A bare `*`
+/// element matches iff the representation exists. Malformed elements are
+/// skipped.
+fn listMatches(list: []const u8, v: Validators, weak: bool) bool {
+    const current: ?ETag = if (v.etag) |e| ETag.parse(e) else null;
+    var it: TagList = .{ .rest = list };
+    while (it.next()) |elem| switch (elem) {
+        .star => if (v.representationExists()) return true,
+        .tag => |tag| if (current) |cur| {
+            if (if (weak) tag.weakEql(cur) else tag.strongEql(cur)) return true;
+        },
+        .malformed => {},
+    };
     return false;
 }
+
+/// The elements of `#entity-tag` (RFC 9110 §5.6.1 list, §8.8.3 entity-tag).
+/// An opaque-tag ends at its closing quote, so a comma inside one belongs to
+/// the tag. Splitting the raw value on every comma read `"v1,x"` as two
+/// broken elements, and `"x,"v1"` (one tag `"x,"` and trailing junk) as a
+/// match for `"v1"`.
+const TagList = struct {
+    rest: []const u8,
+
+    const Elem = union(enum) { star, tag: ETag, malformed };
+
+    fn next(it: *TagList) ?Elem {
+        const s = std.mem.trimStart(u8, it.rest, " \t,");
+        if (s.len == 0) return null;
+        var i: usize = 0;
+        var elem: Elem = .malformed;
+        if (s[0] == '*') {
+            i = 1;
+            elem = .star;
+        } else {
+            const weak = std.mem.startsWith(u8, s, "W/");
+            if (weak) i = 2;
+            if (i < s.len and s[i] == '"') {
+                if (std.mem.indexOfScalarPos(u8, s, i + 1, '"')) |close| {
+                    elem = .{ .tag = .{ .value = s[i .. close + 1], .weak = weak } };
+                    i = close + 1;
+                }
+            }
+        }
+        // An element ends at OWS and then a comma or the end. Anything else
+        // spoils it; resume after the next comma.
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+        if (i == s.len or s[i] == ',') {
+            it.rest = s[i..];
+            return elem;
+        }
+        it.rest = s[(std.mem.indexOfScalarPos(u8, s, i, ',') orelse s.len)..];
+        return .malformed;
+    }
+};
 
 /// Parse an HTTP-date (RFC 9110 §5.6.7) to epoch seconds, or null if invalid.
 /// A conformant parser MUST accept all three formats, though only IMF-fixdate
@@ -359,7 +410,9 @@ fn parseAsctime(s: []const u8) ?i64 {
 /// tolerance) and convert a broken-down UTC time + `HH:MM:SS` to epoch
 /// seconds.
 fn epochFrom(year: i64, month: u32, day: u32, tod: []const u8) ?i64 {
-    if (day < 1 or day > 31) return null;
+    // The month's own length, not 31: `31 Feb` used to parse as 2 March
+    // (Go oracle, 2026-10-05) -- an invalid date must be ignored.
+    if (day < 1 or day > daysInMonth(year, month)) return null;
     if (tod.len != 8 or tod[2] != ':' or tod[5] != ':') return null;
     const hour = parseDigits(tod[0..2]) orelse return null;
     const min = parseDigits(tod[3..5]) orelse return null;
@@ -367,6 +420,14 @@ fn epochFrom(year: i64, month: u32, day: u32, tod: []const u8) ?i64 {
     if (hour > 23 or min > 59 or sec > 60) return null;
     return daysFromCivil(year, month, day) * std.time.s_per_day +
         @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
+}
+
+fn daysInMonth(year: i64, month: u32) u32 {
+    return switch (month) {
+        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard
@@ -485,8 +546,18 @@ test "parseHttpDate: malformed dates → null" {
         "Xxxday, 06-Nov-94 08:49:37 GMT", // bad full day name
         "Sun Nov 6 08:49:37 1994", // asctime without day padding
         "Sun Nov  6 08:49:37 94", // asctime with 2-digit year
+        "Thu, 31 Feb 2000 00:00:00 GMT", // no 31st in February
+        "Tue, 29 Feb 2100 00:00:00 GMT", // 2100 is not a leap year
+        "Sun, 31 Apr 1994 00:00:00 GMT", // April has 30 days
+        "Sunday, 31-Jun-94 00:00:00 GMT", // RFC 850, June has 30
+        "Sun Feb 30 00:00:00 1994", // asctime, February 30
     };
     for (bad) |s| try testing.expectEqual(@as(?i64, null), parseHttpDate(s));
+    // Month lengths, both sides of the boundary: 29 Feb in a leap year
+    // (2000: divisible by 400) and the last day of a 30-day month parse.
+    try testing.expectEqual(@as(?i64, 951782400), parseHttpDate("Tue, 29 Feb 2000 00:00:00 GMT"));
+    try testing.expect(parseHttpDate("Sat, 30 Apr 1994 00:00:00 GMT") != null);
+    try testing.expect(parseHttpDate("Sun, 31 Dec 1995 00:00:00 GMT") != null);
     // Leap-second tolerance: second 60 parses.
     try testing.expect(parseHttpDate("Sun, 06 Nov 1994 08:49:60 GMT") != null);
 }
@@ -736,6 +807,43 @@ test "evaluate: precedence — If-None-Match suppresses If-Modified-Since" {
             v_both,
         ),
     );
+}
+
+test "evaluate: a comma inside an entity-tag belongs to the tag (RFC 9110 §8.8.3 etagc)" {
+    const v: Validators = .{ .etag = "\"v1,x\"" };
+    // The whole tag matches, alone or as a later element, either comparison.
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: \"v1,x\"\r\n", v));
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: \"a\", \"v1,x\"\r\n", v));
+    try testing.expectEqual(Outcome.not_modified, evalWith(.get, "If-None-Match: \"a\",\"v1,x\"\r\n", v));
+    // Its halves are not tags: `"v1` and `x"` must not match `"v1"`.
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: \"v1,x\"\r\n", v_both));
+    // `"x,"` is one tag, `v1"` trailing junk that spoils the element; a
+    // per-comma split read the second half as `"v1"` and let it through.
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: \"x,\"v1\"\r\n", v_both));
+    // Junk after a tag spoils that element only; the next one still counts.
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: \"a\"junk, \"v1\"\r\n", v_both));
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: \"v1\"junk\r\n", v_both));
+    // An unclosed quote never yields a tag.
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: \"v1\r\n", v_both));
+    // OWS and empty elements around tags are the list rule's and are skipped.
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: , \t\"v1\" ,\r\n", v_both));
+}
+
+test "evaluate: `*` asks whether the representation exists, not whether it has an ETag" {
+    const lm_only: Validators = .{ .last_modified = rfc_epoch };
+    // A Last-Modified alone is a current representation (RFC 9110 §13.1.1-2).
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: *\r\n", lm_only));
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-None-Match: *\r\n", lm_only));
+    try testing.expectEqual(Outcome.not_modified, evalWith(.get, "If-None-Match: *\r\n", lm_only));
+    // No validator at all = no representation: the create-only PUT proceeds
+    // (what qap's `precondition` relies on), If-Match: * fails.
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-None-Match: *\r\n", .{}));
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: *\r\n", .{}));
+    // `exists` overrides the inference both ways.
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-None-Match: *\r\n", .{ .exists = true }));
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: *\r\n", .{ .exists = true }));
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-None-Match: *\r\n", .{ .etag = "\"v1\"", .exists = false }));
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: *\r\n", .{ .etag = "\"v1\"", .exists = false }));
 }
 
 // ── apply end-to-end over the serveStream codec ──────────────────────────

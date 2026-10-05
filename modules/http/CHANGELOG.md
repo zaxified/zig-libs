@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Go's standard library as a differential oracle (`tools/go_oracle/`, replayed by
+  `src/go_oracle.zig`; `zig build interop-http -- --phase go` re-takes it). Fixes it found:
+  - **h1, request smuggling:** `Transfer-Encoding` over two field lines is the same list as on one
+    line (RFC 9110 §5.3) and is now refused the same way; `gzip` + `chunked` on separate lines used
+    to be framed as chunked.
+  - **h1:** an HTTP/1.0 request with `Transfer-Encoding` is answered 400 (RFC 9112 §6.1: faulty
+    framing) instead of being decoded as chunked.
+  - **conditional:** entity-tag lists split between tags, not on every comma (a comma is a legal
+    opaque-tag byte); `If-Match: "x,"v1"` no longer matches `"v1"`.
+  - **conditional:** `*` asks whether the representation exists. New `Validators.exists` (default:
+    a validator was given) -- a resource with only `last_modified` now passes `If-Match: *` and
+    fails `If-None-Match: *`; `.{}` still means "does not exist". **Behaviour change** for callers
+    that pass only `last_modified`.
+  - **conditional:** HTTP-dates check the month's length (`31 Feb` was 2 March).
+  - **multipart (both `parse` and `Reader`):** a part header line that is not `token ":" value`
+    (no colon, a folded continuation, whitespace before the colon) refuses the body with
+    `MalformedBody`; it used to be skipped, so a folded `Content-Disposition` lost its `name`.
+    **Behaviour change** for senders that fold part headers (no browser does).
+
 - **2026-10-04** — Fix (h2, found by h2spec 3.8/1 + 7/1): after a client's GOAWAY the session now
   answers with its own GOAWAY(NO_ERROR) once the client's streams are served (RFC 9113 §6.8), and
   `Server` closes h2c connections lingering (write side shut, at most 64 KiB of further input read
