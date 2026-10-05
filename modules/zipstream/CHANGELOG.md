@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fixes and behaviour changes** found by a Go archive/zip differential oracle
+  (`tools/go_oracle/`, replayed by `src/go_oracle.zig`, re-taken by `zig build interop-zipstream`;
+  Info-ZIP unzip 6.0 as the tiebreaker). The central directory is now this module's own walk, not
+  `std.zip.Iterator`: an entry with an unsupported method or the encryption flag is **listed** and
+  refused when opened (`error.UnsupportedCompressionMethod`, new `error.ZipEncryptedEntry`, new
+  `Entry.encrypted`) — before, one such member made the whole archive unreadable; a malformed extra
+  field no longer refuses the archive (the SPEC already promised that); archives with a prepended stub
+  whose offsets were not adjusted (self-extractors), disk numbers set, or an off directory size are
+  read, as unzip and Go read them; an empty member name is listed (only a trailing '/' is a directory).
+  A stored entry whose compressed and uncompressed sizes differ is refused when opened
+  (`error.ZipBadCentralDirectory`); it was read to the uncompressed size, past the member. Times: the
+  `UT` mtime is read as UNSIGNED 32-bit (2100 came back as 1963; Go, zipinfo and 7-Zip read it
+  unsigned), NTFS (0x000a), PKWARE Unix (0x000d) and `UX` (0x5855) mtimes are read, the last time
+  record wins; `ArchiveWriter` writes `UT` for 1970..2106 (it stopped at 2038). `ArchiveWriter` sets
+  general-purpose bit 11 (UTF-8) for a non-ASCII UTF-8 name; without it Go flagged the name non-UTF-8
+  and unzip showed it in code page 437. ASCII-only archives are byte-identical to before. A missing
+  end record is `error.ZipNoEndRecord` (new member of `Error`, same name std used). Anchor grade
+  MIXED → EXTERNAL. **Consumer note:** code that caught `UnsupportedCompressionMethod` (or std's
+  `ZipEncryptionUnsupported`) from `Archive.init` to skip a whole archive now gets it from
+  `EntryReader.init` for that one entry instead (bxp `pipeline.zig` does the former).
+
 - **2026-10-04** — **Tests:** mutation run (37 schemata mutants, 36 killed, 1 equivalent;
   7 new tests). Pins the central-directory pre-check's exact edge and its own errors (bad
   signature, unsupported method), backslash normalisation, the Unix-host rule for `mode`,

@@ -92,7 +92,7 @@ try zw.addEntry("bin/run.sh", script, .{
 ```
 
 `mtime` goes into the DOS date/time fields (clamped to 1980..2107, even
-seconds) and, for a time that fits a signed 32-bit value, into an Info-ZIP
+seconds) and, for a time from 1970 to 2106 (unsigned 32-bit), into an Info-ZIP
 extended-timestamp (`UT`) extra field carrying the exact UTC instant. Without
 `mtime` the entry gets 1980-01-01 00:00:00 — fixed, so the output stays
 reproducible. `mode` marks the entry as made on Unix with `S_IFREG | mode` in
@@ -135,18 +135,18 @@ way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
 ## Ceiling (documented, not a bug)
 
 - **zip64 reading is supported** (archives/entries over 4 GiB, or archives
-  with more than 65535 central-directory records) — `std.zip.Iterator`
-  itself resolves the zip64 EOCD/locator and each entry's zip64 extra field
-  before `Archive`/`EntryReader` ever see the (already 64-bit) sizes/offsets.
+  with more than 65535 central-directory records): the zip64 end record and
+  locator and each entry's zip64 extra field are resolved by this module's
+  own central-directory walk.
   **zip64 *writing* is not implemented** — `ArchiveWriter` emits classic
   (non-zip64) archives only, and returns `Error.ZipWriteTooLarge` rather than
   silently truncating a field that would overflow the 32/16-bit format.
-- **No encrypted entries** — `std.zip.Iterator` already rejects these on
-  read (`error.ZipEncryptionUnsupported`); `ArchiveWriter` doesn't offer
-  encryption either.
+- **No encrypted entries** — listed (`Entry.encrypted`), refused when opened
+  (`error.ZipEncryptedEntry`); `ArchiveWriter` doesn't offer encryption either.
 - **Store + Deflate only** — the two methods ordinary zip tools and Excel
-  emit, for both reading and writing. Any other read method (bzip2, LZMA,
-  ...) is `error.UnsupportedCompressionMethod`.
+  emit, for both reading and writing. An entry with any other method (bzip2,
+  LZMA, ...) is listed and refused when opened
+  (`error.UnsupportedCompressionMethod`); the rest of the archive stays readable.
 
 ## Deferred (not built)
 

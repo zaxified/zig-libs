@@ -125,15 +125,23 @@ test "DosDateTime: conversions, clamps and invalid fields" {
     try testing.expectEqual(@as(?i64, null), (DosDateTime{ .time = 0, .date = (13 << 5) | 1 }).toUnix());
     try testing.expectEqual(@as(?i64, null), (DosDateTime{ .time = 0, .date = (4 << 5) | 31 }).toUnix());
     try testing.expectEqual(@as(?i64, null), (DosDateTime{ .time = 24 << 11, .date = DosDateTime.min.date }).toUnix());
-    // A time past the signed 32-bit range still gets DOS fields, but no UT
-    // record: the header is 9 bytes shorter.
+    // UT is unsigned (Go, zipinfo, 7-Zip read it so): 2100 gets a UT record
+    // since 2026-10-05 (it had none while UT was taken as signed); a time
+    // before 1970 gets DOS fields only, clamped to 1980 -- the header is 9
+    // bytes shorter.
     const a = testing.allocator;
-    var aw: std.Io.Writer.Allocating = .init(a);
-    defer aw.deinit();
-    var zw = ArchiveWriter.init(a, &aw.writer);
-    defer zw.deinit();
-    try zw.addEntry("x", "y", .{ .method = .store, .mtime = 4102444800 }); // 2100-01-01
-    const lfh = std.mem.bytesToValue(std.zip.LocalFileHeader, aw.writer.buffered()[0..@sizeOf(std.zip.LocalFileHeader)]);
-    try testing.expectEqual(@as(u16, 0), lfh.extra_len);
-    try testing.expectEqual(@as(?i64, 4102444800), (DosDateTime{ .time = lfh.last_modification_time, .date = lfh.last_modification_date }).toUnix());
+    for ([_]struct { t: i64, extra: u16, dos: i64 }{
+        .{ .t = 4102444800, .extra = 9, .dos = 4102444800 }, // 2100-01-01
+        .{ .t = std.math.maxInt(u32), .extra = 9, .dos = 4294967294 }, // 2106-02-07, DOS rounds to an even second
+        .{ .t = -1, .extra = 0, .dos = 315532800 },
+    }) |c| {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var zw = ArchiveWriter.init(a, &aw.writer);
+        defer zw.deinit();
+        try zw.addEntry("x", "y", .{ .method = .store, .mtime = c.t });
+        const lfh = std.mem.bytesToValue(std.zip.LocalFileHeader, aw.writer.buffered()[0..@sizeOf(std.zip.LocalFileHeader)]);
+        try testing.expectEqual(c.extra, lfh.extra_len);
+        try testing.expectEqual(@as(?i64, c.dos), (DosDateTime{ .time = lfh.last_modification_time, .date = lfh.last_modification_date }).toUnix());
+    }
 }
