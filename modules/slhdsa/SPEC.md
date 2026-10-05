@@ -6,7 +6,7 @@
 
 **Scope:** core — FIPS 205 as shipped in liboqs 0.16.0 (slhdsa-c) (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -127,6 +127,16 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
 - Oracle: NIST ACVP gen-val vectors (github.com/usnistgov/ACVP-Server,
   `gen-val/json-files/`, retrieved 2026-07-11) — the same corpus NIST uses
   for FIPS 205 validation testing.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, 33 tests, `setsid -w timeout -s
+KILL 30` per mutant): **11 mutants, all killed, no new test needed**. Points chosen where the
+byte-exact KATs might not reach: the exact signature length, the 255-octet context bound on
+both sides, the pure-mode prefix octet and the context length in it, the context in the
+verify message, `addrnd`, both `idx_tree` masks, the randomizer `R` in `H_msg`, and the final
+root comparison. The arithmetic core (WOTS+, XMSS, FORS, hypertree, address layout) is pinned
+byte-exact by the FIPS 205 / ACVP vectors and was not re-mutated here.
 
 ## Backlog / deferred
 
