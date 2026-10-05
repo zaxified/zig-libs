@@ -649,6 +649,43 @@ test "fromBytesCompressed rejects the compression flag unset" {
     try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(bytes));
 }
 
+test "infinity encodings: only the canonical all-zero form is accepted" {
+    // Mutation run 2026-10-05: none of these refusals had a test.
+    var u = toBytesUncompressed(Affine.identity);
+    try std.testing.expect((try fromBytesUncompressed(u)).infinity);
+    u[0] |= 0x01; // a coordinate bit under the infinity flag
+    try std.testing.expectError(error.InvalidEncoding, fromBytesUncompressed(u));
+    u = toBytesUncompressed(Affine.identity);
+    u[uncompressed_bytes - 1] = 1; // a nonzero trailing byte
+    try std.testing.expectError(error.InvalidEncoding, fromBytesUncompressed(u));
+
+    var c = toBytesCompressed(Affine.identity);
+    try std.testing.expect((try fromBytesCompressed(c)).infinity);
+    c[0] |= 0x20; // infinity + sort is the reserved combination
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(c));
+    c = toBytesCompressed(Affine.identity);
+    c[compressed_bytes - 1] = 1;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(c));
+}
+
+test "uncompressed decoders refuse an off-curve point as NotOnCurve, checked or not" {
+    var bytes = hexBytes(uncompressed_bytes, generator_uncompressed_hex);
+    bytes[uncompressed_bytes - 1] ^= 1; // y ± 1: canonical, off the curve
+    try std.testing.expectError(error.NotOnCurve, fromBytesUncompressedUnchecked(bytes));
+    try std.testing.expectError(error.NotOnCurve, fromBytesUncompressed(bytes));
+}
+
+test "eqlPoints: the identity equals only itself; projective representatives agree" {
+    const g = jacGen();
+    try std.testing.expect(Jacobian.eqlPoints(Jacobian.identity, Jacobian.identity));
+    try std.testing.expect(!Jacobian.eqlPoints(Jacobian.identity, g));
+    try std.testing.expect(!Jacobian.eqlPoints(g, Jacobian.identity));
+    const two = Fp.one.add(Fp.one);
+    const scaled: Jacobian = .{ .x = g.x.mul(two.square()), .y = g.y.mul(two.square().mul(two)), .z = g.z.mul(two) };
+    try std.testing.expect(Jacobian.eqlPoints(g, scaled));
+    try std.testing.expect(!Jacobian.eqlPoints(g, g.negate()));
+}
+
 test "fromBytesUncompressed round-trips the generator's flag/coordinate parsing" {
     const bytes = hexBytes(uncompressed_bytes, generator_uncompressed_hex);
     const p = try fromBytesUncompressed(bytes);

@@ -665,6 +665,21 @@ test "keyGen is deterministic (same IKM/key_info -> same SK) and produces a nonz
     try std.testing.expect(!a.scalar.eql(c.scalar));
 }
 
+test "keyGen matches an independent Python recomputation of the -05 construction" {
+    // NOT an external KAT (the draft has none, see keyGen's doc comment):
+    // the -05 text above re-implemented with Python's hmac/hashlib
+    // (2026-10-05), so the IKM || I2OSP(0, 1) suffix, the I2OSP(L, 2)
+    // info suffix and the raw first-iteration salt are each pinned. The
+    // mutation run of that date dropped the I2OSP(0, 1) octet and nothing
+    // failed.
+    const a = try keyGen(&([_]u8{0xab} ** 32), "");
+    try std.testing.expectEqualSlices(u8, &hexBytes(32, "5122c7e03ead241c21b84fe0afce6ce677f68bb82fb5ca6253b3c7e862a61905"), &a.scalar.toBytes());
+    var ikm: [32]u8 = undefined;
+    for (&ikm, 0..) |*b, i| b.* = @intCast(i);
+    const b = try keyGen(&ikm, "key-info");
+    try std.testing.expectEqualSlices(u8, &hexBytes(32, "15c5471e3f4598a3108d05a8bd55669c4b65d857442cacdb274e38b909ec81f5"), &b.scalar.toBytes());
+}
+
 test "skToPk produces a subgroup-valid, non-identity public key; keyValidate accepts it" {
     const sk = try keyGen(&([_]u8{0x11} ** 32), "");
     const pk = skToPk(sk);
@@ -910,6 +925,15 @@ test "verify rejects a non-subgroup G2 signature (signature_subgroup_check fires
     try std.testing.expect(!popVerify(pk, bad_sig));
     try std.testing.expect(!(try aggregateVerify(&.{pk}, &.{msg}, bad_sig)));
     try std.testing.expect(!(try fastAggregateVerify(&.{pk}, msg, bad_sig)));
+}
+
+test "popVerify rejects the identity key with the identity proof (KeyValidate is the only guard)" {
+    // e(O, Q) · e(-G, O) == 1 for every Q, and O passes the subgroup
+    // check, so without KeyValidate this pair verifies.
+    const identity_pk: PublicKey = .{ .point = g1.Affine.identity };
+    const identity_sig: Signature = .{ .point = g2.Affine.identity };
+    try std.testing.expect(!popVerify(identity_pk, identity_sig));
+    try std.testing.expect(!verify(identity_pk, "any message", identity_sig));
 }
 
 test "aggregateVerify with more signers than one Miller chunk (exercises the chunked pairing accumulator)" {
