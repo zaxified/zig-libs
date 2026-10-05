@@ -187,6 +187,18 @@ pub const Options = struct {
     /// `ceiling_mtu` is unset. Optional and never auto-detected — see
     /// SPEC.md "What is deliberately not done".
     iface: ?[]const u8 = null,
+    /// `probe`: called once per candidate size with the outcome the live
+    /// prober reported, in the order the search asked -- what `tracepath`
+    /// prints as it steps, for a caller that logs or shows progress. Also
+    /// how `tools/interop.zig` records a real kernel's answers for the
+    /// offline replay. Unused by `query`.
+    on_attempt: ?AttemptObserver = null,
+};
+
+/// See `Options.on_attempt`.
+pub const AttemptObserver = struct {
+    ctx: *anyopaque,
+    onAttempt: *const fn (ctx: *anyopaque, wire_size: u16, outcome: ProbeOutcome) void,
 };
 
 // ── protocol floors / defaults ─────────────────────────────────────────────
@@ -798,8 +810,27 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         .seq = randomStartSeq(),
     };
 
-    return searchWith(lp.prober(), floor, ceiling, iface_mtu);
+    const observer = opts.on_attempt orelse return searchWith(lp.prober(), floor, ceiling, iface_mtu);
+    var observed: ObservedProber = .{ .inner = lp.prober(), .observer = observer };
+    return searchWith(observed.prober(), floor, ceiling, iface_mtu);
 }
+
+/// A `Prober` that reports each outcome of `inner` to `Options.on_attempt`.
+const ObservedProber = struct {
+    inner: Prober,
+    observer: AttemptObserver,
+
+    fn prober(self: *ObservedProber) Prober {
+        return .{ .ctx = self, .probeFn = probeFn };
+    }
+
+    fn probeFn(ctx: *anyopaque, wire_size: u16) ProbeOutcome {
+        const self: *ObservedProber = @ptrCast(@alignCast(ctx));
+        const outcome = self.inner.probe(wire_size);
+        self.observer.onAttempt(self.observer.ctx, wire_size, outcome);
+        return outcome;
+    }
+};
 
 fn toSocketFamily(dest: netaddr.Ip) icmp.Socket.Family {
     return switch (dest) {
@@ -1558,4 +1589,33 @@ test "live: probe() against loopback (skipped without CAP_NET_RAW / ping_group_r
     // fragmentation-needed / black-hole classification itself.
     try testing.expectEqual(@as(u32, default_ceiling_mtu), r.mtu);
     try testing.expect(!r.blackhole);
+}
+
+test "Options.on_attempt sees every attempt, in order, with the outcome searchWith acted on" {
+    const Log = struct {
+        sizes: [32]u16 = undefined,
+        outcomes: [32]std.meta.Tag(ProbeOutcome) = undefined,
+        n: usize = 0,
+        fn onAttempt(ctx: *anyopaque, wire_size: u16, outcome: ProbeOutcome) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.sizes[self.n] = wire_size;
+            self.outcomes[self.n] = outcome;
+            self.n += 1;
+        }
+    };
+    var log: Log = .{};
+    var fp: FakeProber = .{ .real_mtu = 1300, .explicit_icmp = true, .hint = null };
+    var observed: ObservedProber = .{ .inner = fp.prober(), .observer = .{ .ctx = &log, .onAttempt = Log.onAttempt } };
+    const r = try searchWith(observed.prober(), min_mtu_v4, 1500, null);
+    try testing.expectEqual(@as(u32, 1300), r.mtu);
+    try testing.expect(log.n > 2);
+    try testing.expectEqual(min_mtu_v4, log.sizes[0]);
+    try testing.expectEqual(@as(u16, 1500), log.sizes[1]);
+    try testing.expectEqual(std.meta.Tag(ProbeOutcome).ok, log.outcomes[0]);
+    try testing.expectEqual(std.meta.Tag(ProbeOutcome).frag_needed, log.outcomes[1]);
+}
+
+// See kernel_oracle_test.zig / tools/interop.zig / tools/kernel_oracle.py.
+test {
+    _ = @import("kernel_oracle_test.zig");
 }

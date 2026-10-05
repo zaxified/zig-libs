@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: real kernels judge `probe` and `query`, and `searchWith` replays their answers**
+  (`tools/kernel_oracle.py`, `tools/interop.zig`, `src/kernel_oracle_test.zig`): 22 scenarios, v4 and v6, each a
+  fresh client -> router -> server topology of network namespaces (`unshare -rmn`): a lowered router->server link
+  (576 … 1499), none, jumbo frames (9000 / 4000), and a router whose nft rule drops its own ICMP Fragmentation
+  Needed / Packet Too Big. `probe` found the smallest configured link MTU in every one and flagged a black hole
+  exactly where the router was made one; iputils `tracepath` agreed on every well-behaved path and, like `query`,
+  read the interface MTU through a black hole. Every attempt is recorded and replayed through `searchWith`, which
+  must ask the same sizes in the same order. Anchor grade MIXED → EXTERNAL. No defect found.
+  - **New (Additive):** `Options.on_attempt: ?AttemptObserver` -- called once per candidate size with the outcome,
+    in search order (what `tracepath` prints as it steps; how the oracle records a transcript).
+
 - **2026-09-10** — A1 fix campaign: the four remaining MEDIUM findings from the
   first audit (P1 applies — this module has zero consumers anywhere in the
   tree, confirmed against `build.zig`'s `example_apps` table too, not only

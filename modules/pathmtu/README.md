@@ -23,7 +23,10 @@ Provenance: clean-room from the RFCs above. A prior in-house ~25-line
 kernel-cache implementation (our own code, not a third-party project)
 was read as the starting point for `query` and is superseded by this
 module — no root `NOTICE` entry applies (no third-party source studied or
-ported).
+ported). DATA: `src/kernel_oracle_vectors.zig` holds what real Linux kernels
+(namespace topologies built by our tooling, `tools/kernel_oracle.py`) answered
+to this module's own probes, and iputils `tracepath`'s pmtu for the same paths
+(run as a black box) — observed behaviour, exempt per root `NOTICE` §0.
 
 ## Why two functions
 
@@ -86,7 +89,7 @@ const found = try pathmtu.probe(dest, .{ .timeout_ms = 1000, .retries = 2 });
   against. A `false` reading is not proof of absence, the same asymmetric
   signal `blackhole` already gives elsewhere in this module (A1 F6).
 
-`Options{ timeout_ms, retries, ceiling_mtu, iface }` is shared by both
+`Options{ timeout_ms, retries, ceiling_mtu, iface, on_attempt }` is shared by both
 functions (matching `sntp.QueryOptions`/`stun.QueryOptions`'s
 `timeout_ms`-based shape rather than inventing a third): `query` only reads
 `iface`; the rest are `probe`-only.
