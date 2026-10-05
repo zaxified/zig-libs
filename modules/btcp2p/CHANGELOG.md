@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 41 of 41 killed, 0 equivalent; 6 tests added (command
+  printable-range edges and a 12-byte command, `MAX_PAYLOAD_LENGTH` edge on decode and refusal
+  on encode, `consumed` across two frames, `MAX_INV_ENTRIES` isolated and its edge,
+  `MAX_ADDR_ENTRIES` edge, a minimal `MIN_TX_LEN` transaction). No code change.
 - **2026-10-05** — Scope re-surveyed (SPEC `## Compared with`), verdict unchanged at **mvp**. The
   2026-09-30 survey still listed `sendheaders`, `wtxidrelay`, `feefilter`, `sendcmpct`, `mempool` as
   missing although `relay.zig` had landed the same day; SPEC, README and the Backlog now agree with

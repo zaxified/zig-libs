@@ -179,6 +179,31 @@ test "hostile: decodeBlock rejects a txn_count with insufficient bytes behind it
     try testing.expectError(error.TooManyItems, decodeBlock(allocator, w.list.items));
 }
 
+test "decodeBlock accepts a block whose one transaction is exactly MIN_TX_LEN octets" {
+    // Mutation run 2026-10-05: raising MIN_TX_LEN by one refused this valid
+    // block (count 1 > 60 / 61) and no test noticed.
+    const allocator = testing.allocator;
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    const header: BlockHeader = .{ .version = 1, .prev_block = @splat(0), .merkle_root = @splat(0), .timestamp = 0, .bits = 0, .nonce = 0 };
+    try header.encode(&w, allocator);
+    try w.putCompactSize(allocator, 1);
+    const before = w.list.items.len;
+    try w.putU32le(allocator, 1); // version
+    try w.putU8(allocator, 1); // one input
+    try w.putBytes(allocator, &([_]u8{0} ** 36)); // prevout
+    try w.putU8(allocator, 0); // empty scriptSig
+    try w.putU32le(allocator, 0xffffffff); // sequence
+    try w.putU8(allocator, 1); // one output
+    try w.putU64le(allocator, 0); // value
+    try w.putU8(allocator, 0); // empty scriptPubKey
+    try w.putU32le(allocator, 0); // locktime
+    try testing.expectEqual(@as(usize, MIN_TX_LEN), w.list.items.len - before);
+    var blk = try decodeBlock(allocator, w.list.items);
+    defer blk.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), blk.txns.len);
+}
+
 test "hostile: decodeBlock on a truncated header fails closed" {
     const allocator = testing.allocator;
     try testing.expectError(error.Truncated, decodeBlock(allocator, &[_]u8{0} ** 40));

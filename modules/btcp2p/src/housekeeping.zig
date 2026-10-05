@@ -242,6 +242,20 @@ test "hostile: Addr rejects a count over MAX_ADDR_ENTRIES even with genuinely en
     try testing.expectError(error.TooManyItems, decodeAddr(allocator, w.list.items));
 }
 
+test "Addr: exactly MAX_ADDR_ENTRIES minimal 30-octet entries decode" {
+    // Mutation run 2026-10-05: the cap's edge (`>` vs `>=`) was unpinned.
+    const allocator = testing.allocator;
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try w.putCompactSize(allocator, MAX_ADDR_ENTRIES);
+    const one_entry: TimedNetAddr = .{ .time = 0, .addr = .{ .services = 0, .ip = @splat(0), .port = 0 } };
+    var i: u64 = 0;
+    while (i < MAX_ADDR_ENTRIES) : (i += 1) try one_entry.encode(&w, allocator);
+    var addr = try decodeAddr(allocator, w.list.items);
+    defer addr.deinit(allocator);
+    try testing.expectEqual(@as(usize, MAX_ADDR_ENTRIES), addr.entries.len);
+}
+
 test "hostile: Addr rejects a huge count with insufficient bytes behind it" {
     const allocator = testing.allocator;
     var w: Writer = .{};

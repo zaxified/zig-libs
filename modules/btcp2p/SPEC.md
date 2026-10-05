@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Bitcoin Core v31 `protocol.h` message set; btcd `wire` / rust-bitcoin `p2p` (surveyed 2026-10-05)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -217,6 +217,17 @@ bytes, get a typed value or a typed error, with no memory of any previous call.
   an unbounded allocation in this pass — the two-layer defense described above (documented maximum
   where one exists, remaining-bytes bound always, incremental-growth loop as the actual safety net)
   held.
+- **Mutation run 2026-10-05** (in-place, Debug, 41 mutants over the envelope's
+  check order and `IsCommandValid`, the reader's bounds, every count cap and
+  remaining-bytes guard, `MIN_TX_LEN`, `version`'s user-agent cap and relay
+  byte, `feefilter`/`sendcmpct` ranges and exact lengths, `NetAddr.ipv4`):
+  31 killed. Six tests added for the ten survivors: the printable-range edges
+  (0x1f/0x7f refused, 0x20/0x7e accepted), a 12-byte command, a declared
+  length of exactly `MAX_PAYLOAD_LENGTH`, encoder `PayloadTooLarge`,
+  `consumed` across two back-to-back frames, the `MAX_INV_ENTRIES` cap
+  isolated from the remaining-bytes guard and its edge, exactly
+  `MAX_ADDR_ENTRIES` entries, a block with one `MIN_TX_LEN`-octet
+  transaction. Equivalent: none.
 
 Run: `zig build test-btcp2p` (Debug and `-Doptimize=ReleaseFast`).
 
