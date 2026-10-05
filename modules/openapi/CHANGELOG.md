@@ -7,7 +7,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-05** — **Anchoring: openapi-spec-validator oracle** (`tools/spec_oracle.py`, `tools/interop.zig`,
   `src/spec_oracle_test.zig`): 102 route tables built through a real router must give the documents the
-  validator accepted; 168 mutated documents must get the validator's verdict from `validateOpenApi31`.
+  validator accepted; 168 mutated documents must get the validator's verdict from `validateOpenApi31`; and FastAPI,
+  given the same routes, must produce the same path templates, methods and path parameters (it does, on every
+  table). Anchor grade MIXED → EXTERNAL.
   - **DEFECT fixed, BEHAVIOURAL:** a route with a literal `{x}` static segment produced a document with a
     template variable and no parameter, which every validator refuses; `build` now fails with
     `error.UnresolvedPathParameter` (exclude such a route with `Info.include`).
