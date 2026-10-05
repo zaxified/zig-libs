@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (54 mutants, all killed after 7 new tests;
+  `SPEC.md` § "Mutation run 2026-10-05"). No defect; the gaps were the attestation-certificate
+  arms the W3C corpus never reaches (Ed25519, RSA, P-384 keys; the AAGUID extension), key/alg
+  binding in `verifySignature`, the exact RS256 floor, `fido-u2f`'s curve rule, and an `authData`
+  one octet short of its attested-credential header. New synthetic fixtures
+  `src/attestation_fixtures.zig` (recipe `tools/gen_attestation_fixtures.py`). No source change.
+
 - **2026-09-30** — **authenticatorData extensions (ED flag) are accepted.** The credential public key
   is split off with the new `cbor.decodePrefix`; with ED set the rest must be exactly one CBOR map,
   returned raw in the new `AuthenticatorData.extensions`. ⚠ Error set: `ExtensionsNotSupported` is

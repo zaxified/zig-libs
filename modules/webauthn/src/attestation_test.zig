@@ -1772,3 +1772,159 @@ test "packed x5c: an attestation certificate below the RSA modulus floor is refu
         clientDataHash(&v.registration_client_data_json),
     ));
 }
+
+// ── mutation run 2026-10-05: synthetic certificates and keys ───────────────
+//
+// The W3C corpus has only ES256 attestation certificates, none carrying the
+// id-fido-gen-ce-aaguid extension, so removing the Ed25519/RSA certificate
+// checks, the non-P-256 curve refusal or the AAGUID comparison left every
+// test green. `attestation_fixtures.zig` (recipe: tools/gen_attestation_fixtures.py)
+// supplies the certificates; each test states the rule it pins.
+
+const fx = @import("attestation_fixtures.zig");
+
+/// A `packed` attestation over W3C §16.7's authData with a given leaf.
+fn packedWith(a: std.mem.Allocator, alg: i64, leaf: []const u8, sig: []const u8) !webauthn.AttestationResult {
+    const v = vectors.packed_es256_full;
+    const obj = try buildAttestationObject(a, .{
+        .fmt = "packed",
+        .alg = alg,
+        .x5c = leaf,
+        .sig = sig,
+        .auth_data = try extractAuthDataRaw(a, &v.attestation_object),
+    });
+    return webauthn.verifyAttestation(a, obj, clientDataHash(&v.registration_client_data_json));
+}
+
+test "packed x5c: Ed25519 and RSA attestation certificates verify, and only with their own alg and a valid signature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const eddsa = cbor.cose.alg_eddsa;
+    const rs256 = webauthn.alg_rs256;
+
+    // Both certificates carry the AAGUID extension with §16.7's AAGUID, so
+    // the positive cases also walk the extension's match path.
+    const ed = try packedWith(a, eddsa, &fx.ed25519_attestation_cert_der, &fx.ed25519_attestation_sig);
+    try testing.expectEqual(webauthn.AttestationType.basic, ed.attestation_type);
+    try testing.expectEqualSlices(u8, &fx.ed25519_attestation_cert_der, ed.leaf_cert_der.?);
+    const rs = try packedWith(a, rs256, &fx.rsa2048_attestation_cert_der, &fx.rsa2048_attestation_sig);
+    try testing.expectEqual(webauthn.AttestationType.basic, rs.attestation_type);
+
+    // §8.2 step 2: sig is checked with the algorithm in `alg`; a certificate
+    // key of another family is UnsupportedAlgorithm before any signature work.
+    try testing.expectError(error.UnsupportedAlgorithm, packedWith(a, cbor.cose.alg_es256, &fx.ed25519_attestation_cert_der, &fx.ed25519_attestation_sig));
+    try testing.expectError(error.UnsupportedAlgorithm, packedWith(a, eddsa, &fx.rsa2048_attestation_cert_der, &fx.rsa2048_attestation_sig));
+
+    // One flipped signature octet is BadSignature on both arms.
+    var ed_bad = fx.ed25519_attestation_sig;
+    ed_bad[10] ^= 1;
+    try testing.expectError(error.BadSignature, packedWith(a, eddsa, &fx.ed25519_attestation_cert_der, &ed_bad));
+    var rs_bad = fx.rsa2048_attestation_sig;
+    rs_bad[10] ^= 1;
+    try testing.expectError(error.BadSignature, packedWith(a, rs256, &fx.rsa2048_attestation_cert_der, &rs_bad));
+}
+
+test "packed x5c: an EC attestation key on P-384 is UnsupportedAlgorithm under ES256" {
+    // ES256 is ECDSA on P-256 (RFC 9053 §2.1); a P-384 certificate key must be
+    // refused by curve, not handed to the P-256 verifier.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.UnsupportedAlgorithm, packedWith(arena.allocator(), cbor.cose.alg_es256, &fx.p384_attestation_cert_der, &([_]u8{0x30} ++ [_]u8{0} ** 7)));
+}
+
+test "packed x5c: the id-fido-gen-ce-aaguid extension must match authData's AAGUID and be an OCTET STRING" {
+    // §8.2.1: "If attestnCert contains an extension with OID
+    // 1.3.6.1.4.1.45724.1.1.4 … verify that the value of this extension
+    // matches the aaguid in authenticatorData." The value is an OCTET STRING;
+    // the same 16 octets in a UTF8String are a malformed extension. Both are
+    // refused before the (here deliberately bogus) signature is looked at.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const junk = [_]u8{0x30} ++ [_]u8{0} ** 7;
+    try testing.expectError(error.AaguidExtensionMismatch, packedWith(a, cbor.cose.alg_es256, &fx.p256_wrong_aaguid_cert_der, &junk));
+    try testing.expectError(error.InvalidCertificate, packedWith(a, cbor.cose.alg_es256, &fx.p256_aaguid_not_octet_string_cert_der, &junk));
+}
+
+test "fido-u2f: a credential key on any curve but P-256 is InvalidKey" {
+    // §8.6 step 3: the credential public key must be an EC2 P-256 key; U2F
+    // has no other. Here it claims secp256k1 (COSE crv 8, RFC 8812) with
+    // 32-octet coordinates, which would otherwise be copied into the U2F
+    // verification data as if it were P-256.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.fido_u2f_es256;
+    const key = try cbor.cose.encodeEc2Key(a, .{ .alg = cbor.cose.alg_es256, .crv = 8, .x = &([_]u8{0x11} ** 32), .y = &([_]u8{0x22} ** 32) });
+    const key_bytes = try cbor.encode(a, key, .{});
+    var auth: std.ArrayList(u8) = .empty;
+    var rp_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("example.org", &rp_hash, .{});
+    try auth.appendSlice(a, &rp_hash);
+    try auth.appendSlice(a, &.{ 0x41, 0, 0, 0, 0 }); // UP | AT, signCount 0
+    try auth.appendSlice(a, &([_]u8{0} ** 16)); // U2F AAGUID is all zero
+    try auth.appendSlice(a, &.{ 0, 16 });
+    try auth.appendSlice(a, &([_]u8{0xc1} ** 16));
+    try auth.appendSlice(a, key_bytes);
+    const obj = try buildAttestationObject(a, .{
+        .fmt = "fido-u2f",
+        .alg = cbor.cose.alg_es256,
+        .x5c = try realX5c(a, &v.attestation_object),
+        .sig = &([_]u8{0x30} ++ [_]u8{0} ** 7),
+        .auth_data = auth.items,
+    });
+    try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(a, obj, clientDataHash(&v.registration_client_data_json)));
+}
+
+test "authData: an attested-credential header one octet short is Truncated, not an out-of-bounds read" {
+    // §6.5.1: AT set means aaguid (16) + credentialIdLength (2) follow the
+    // 37-octet header. With 54 octets the length field is cut in half; the
+    // check is the only thing between it and a read past the buffer.
+    var raw = [_]u8{0} ** 55;
+    raw[32] = 0x41; // UP | AT
+    try testing.expectError(error.Truncated, webauthn.parseAuthenticatorData(testing.allocator, raw[0..54]));
+    try testing.expectError(error.Truncated, webauthn.parseAuthenticatorData(testing.allocator, raw[0..53]));
+}
+
+test "verifySignature: a key is used only with its own curve and algorithm" {
+    // WebAuthn verifies with the credential's algorithm (§7.2 step 20); the
+    // key's family fixes it: EC2 P-256 ⇒ ES256, OKP Ed25519 ⇒ EdDSA, RSA ⇒
+    // RS256 (here). Each valid signature is refused under a mismatch.
+    const msg = "webauthn key/alg binding";
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const ekp = try Ecdsa.KeyPair.generateDeterministic([_]u8{7} ** Ecdsa.KeyPair.seed_length);
+    const epub = ekp.public_key.toUncompressedSec1();
+    var der_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    const der = (try ekp.sign(msg, null)).toDer(&der_buf);
+    const ec2: webauthn.CoseKey = .{ .ec2 = .{ .alg = cbor.cose.alg_es256, .crv = cbor.cose.crv_p256, .x = epub[1..33], .y = epub[33..65] } };
+    try webauthn.verifySignature(ec2, cbor.cose.alg_es256, msg, der);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(ec2, cbor.cose.alg_eddsa, msg, der));
+    var ec2_k1 = ec2;
+    ec2_k1.ec2.crv = 8; // secp256k1 (RFC 8812)
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(ec2_k1, cbor.cose.alg_es256, msg, der));
+
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const dkp = try Ed25519.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const dpub = dkp.public_key.toBytes();
+    const dsig = (try dkp.sign(msg, null)).toBytes();
+    const okp: webauthn.CoseKey = .{ .okp = .{ .alg = cbor.cose.alg_eddsa, .crv = cbor.cose.crv_ed25519, .x = &dpub } };
+    try webauthn.verifySignature(okp, cbor.cose.alg_eddsa, msg, &dsig);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(okp, cbor.cose.alg_es256, msg, &dsig));
+    var okp_x = okp;
+    okp_x.okp.crv = cbor.cose.crv_x25519;
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(okp_x, cbor.cose.alg_eddsa, msg, &dsig));
+
+    const rsa_key: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &fx.rsa2048_credential_n, .e = &fx.rsa2048_credential_e } };
+    try webauthn.verifySignature(rsa_key, webauthn.alg_rs256, fx.rsa_floor_msg, &fx.rsa2048_credential_sig);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(rsa_key, cbor.cose.alg_es256, fx.rsa_floor_msg, &fx.rsa2048_credential_sig));
+}
+
+test "verifySignature: the RS256 credential floor is exactly 2048 bits" {
+    // The F7 test pins a 512-bit key; a floor moved to 1024 or to "> 2048"
+    // stayed green. 2047 is refused, 2048 verifies.
+    const k2048: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &fx.rsa2048_credential_n, .e = &fx.rsa2048_credential_e } };
+    try webauthn.verifySignature(k2048, webauthn.alg_rs256, fx.rsa_floor_msg, &fx.rsa2048_credential_sig);
+    const k2047: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &fx.rsa2047_credential_n, .e = &fx.rsa2047_credential_e } };
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(k2047, webauthn.alg_rs256, fx.rsa_floor_msg, &fx.rsa2047_credential_sig));
+}
