@@ -163,10 +163,16 @@ pub const TraceParent = struct {
     }
 };
 
-/// The child of `parent` for this hop: same trace-id and flags, a fresh
-/// span-id (`parent_id`) identifying the current span.
+/// The child of `parent` for this hop: same trace-id, a fresh span-id
+/// (`parent_id`) identifying the current span, and the parent's `sampled`
+/// flag. Every other flag bit is cleared: Level 1 defines only `sampled`,
+/// and "Vendors MUST set all unparsed / unknown trace-flags to 0 on outgoing
+/// requests" (W3C Trace Context §3.2.2.5 / processing model). An incoming
+/// `...-ff` is still accepted (the spec forbids rejecting it), it just goes
+/// out as `...-01`. Until 2026-10-05 every bit was copied through (found by
+/// the OpenTelemetry Go oracle, `otel_oracle_test.zig`).
 pub fn childOf(parent: TraceParent, span_id: [8]u8) TraceParent {
-    return .{ .trace_id = parent.trace_id, .parent_id = span_id, .flags = parent.flags };
+    return .{ .trace_id = parent.trace_id, .parent_id = span_id, .flags = parent.flags & flag_sampled };
 }
 
 /// A brand-new root context (fresh trace-id + span-id).
@@ -757,6 +763,12 @@ test "childOf keeps the trace and generated ids are unique / non-zero" {
     try testing.expectEqualSlices(u8, &parent.trace_id, &child.trace_id);
     try testing.expectEqualSlices(u8, &span, &child.parent_id);
     try testing.expectEqual(parent.flags, child.flags);
+    // Unknown flag bits are accepted on the way in, zeroed on the way out.
+    const odd = try TraceParent.parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff");
+    try testing.expectEqual(@as(u8, 0xff), odd.flags);
+    try testing.expectEqual(flag_sampled, childOf(odd, span).flags);
+    const unsampled = try TraceParent.parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-fe");
+    try testing.expectEqual(@as(u8, 0), childOf(unsampled, span).flags);
 
     // Successive generated ids differ and are never the invalid all-zero id.
     const a = newTraceId();
@@ -834,6 +846,7 @@ test "TraceContext echo: traceparent header survives the caller's dead frame" {
 test {
     _ = @import("w3c_vectors.zig");
     _ = @import("w3c_conformance_test.zig");
+    _ = @import("otel_oracle_test.zig");
 }
 
 // ── fuzz: TraceParent.parse never panics on arbitrary or shaped bytes ──────

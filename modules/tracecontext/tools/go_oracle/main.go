@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: MIT
+
+// Differential oracle for modules/tracecontext: OpenTelemetry Go's W3C Trace
+// Context propagator (go.opentelemetry.io/otel/propagation.TraceContext,
+// Apache-2.0) as an independent implementation, run as a black box. The
+// request headers are OURS (crafted traceparent/tracestate shapes, every
+// single-character mutation of a valid traceparent, split and duplicated
+// headers); the propagator only answers what it extracts from them. The
+// answers are written as a Zig file src/otel_oracle_test.zig replays through
+// this module's middleware -- no Go at test time.
+//
+//	cd modules/tracecontext/tools/go_oracle && GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod go run . > ../../src/otel_vectors.zig
+//	cd modules/tracecontext/tools/go_oracle && GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod go run . -check ../../src/otel_vectors.zig
+//
+// Needs otel v1.46.0 in the module cache; no network.
+package main
+
+import (
+	"bytes"
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+)
+
+const (
+	tid   = "4bf92f3577b34da6a3ce929d0e0e4736"
+	sid   = "00f067aa0ba902b7"
+	valid = "00-" + tid + "-" + sid + "-01"
+)
+
+type header struct{ name, value string }
+
+type reqCase struct {
+	id      string
+	headers []header
+}
+
+func tp(v string) header { return header{"traceparent", v} }
+func ts(v string) header { return header{"tracestate", v} }
+
+func cases() []reqCase {
+	var cs []reqCase
+	add := func(id string, hs ...header) { cs = append(cs, reqCase{id, hs}) }
+
+	// traceparent shapes
+	shapes := []string{
+		valid, "00-" + tid + "-" + sid + "-00", "00-" + tid + "-" + sid + "-ff", "00-" + tid + "-" + sid + "-02",
+		"00-" + tid + "-" + sid + "-09", "01-" + tid + "-" + sid + "-01", "01-" + tid + "-" + sid + "-01-what-the-future",
+		"cc-" + tid + "-" + sid + "-01-xyz", "cc-" + tid + "-" + sid + "-01", "fe-" + tid + "-" + sid + "-01-",
+		"ff-" + tid + "-" + sid + "-01", "FF-" + tid + "-" + sid + "-01", "0F-" + tid + "-" + sid + "-01",
+		"00-" + tid + "-" + sid + "-01-", "00-" + tid + "-" + sid + "-01-extra", "01-" + tid + "-" + sid + "-01x",
+		"00-" + strings.ToUpper(tid) + "-" + sid + "-01", "00-" + tid + "-" + strings.ToUpper(sid) + "-01",
+		"00-" + tid + "-" + sid + "-0A", "00-00000000000000000000000000000000-" + sid + "-01",
+		"00-" + tid + "-0000000000000000-01", "00-" + tid[:31] + "-" + sid + "-01", "00-" + tid + "0-" + sid + "-01",
+		"00-" + tid + "-" + sid[:15] + "-01", "00-" + tid + "-" + sid + "-1", "00-" + tid + "-" + sid + "-001",
+		"00_" + tid + "_" + sid + "_01", "0-" + tid + "-" + sid + "-01", "000-" + tid + "-" + sid + "-01",
+		"00-" + tid + "-" + sid, "", "00", "garbage", " " + valid, valid + " ", "\t" + valid,
+		"00-" + tid + "-" + sid + "-01,00-" + tid + "-" + sid + "-01",
+		"01-" + tid + "-" + sid + "-01-" + strings.Repeat("x", 200),
+	}
+	for i, v := range shapes {
+		add(fmt.Sprintf("shape%02d", i), tp(v))
+	}
+	// every single-character substitution of the valid header
+	subs := []byte{'0', 'f', 'F', 'g', '-', ' ', '.'}
+	for pos := 0; pos < len(valid); pos++ {
+		for _, c := range subs {
+			if valid[pos] == c {
+				continue
+			}
+			b := []byte(valid)
+			b[pos] = c
+			add(fmt.Sprintf("sub%02d%c", pos, c), tp(string(b)))
+		}
+	}
+	// duplicated traceparent
+	other := "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+	add("dup_same", tp(valid), tp(valid))
+	add("dup_diff", tp(valid), tp(other))
+	add("dup_bad_first", tp("garbage"), tp(valid))
+	add("dup_bad_second", tp(valid), tp("garbage"))
+	add("none")
+	// tracestate shapes, each with a valid traceparent and on its own
+	states := []string{
+		"a=1", "a=1,b=2", "a=1 , b=2", "a=1,\tb=2", ",a=1", "a=1,", "a=1,,b=2", " a=1 ", "", " ",
+		"A=1", "a b=1", "1a=1", "a@b=1", "t@sys=1", "t@Sys=1", "@b=1", "a@=1", "a_-*/=1", "a=", "=1", "a",
+		"a=1=2", "a= 1", "a=1 2", "a=,", "a=\x7e", "a=b,a=c", "a=1;b=2", "foo=bar,foo@tenant=baz",
+		strings.Repeat("k", 256) + "=1", strings.Repeat("k", 257) + "=1", "a=" + strings.Repeat("v", 256),
+		"a=" + strings.Repeat("v", 257), members(32), members(33), "zz=1," + members(31),
+		"a=\x01", "a=1\x7f", "é=1", "a=é",
+	}
+	for i, s := range states {
+		add(fmt.Sprintf("state%02d", i), tp(valid), ts(s))
+		add(fmt.Sprintf("state%02d_alone", i), ts(s))
+	}
+	add("state_split", tp(valid), ts("a=1"), ts("b=2"))
+	add("state_split_empty", tp(valid), ts("a=1"), ts(""))
+	add("state_split_dup", tp(valid), ts("a=1"), ts("a=2"))
+	add("state_bad_parent", tp("garbage"), ts("a=1"))
+	return cs
+}
+
+func members(n int) string {
+	ms := make([]string, n)
+	for i := range ms {
+		ms[i] = fmt.Sprintf("k%d=v%d", i, i)
+	}
+	return strings.Join(ms, ",")
+}
+
+func main() {
+	check := flag.String("check", "", "regenerate and compare with this committed vectors file")
+	flag.Parse()
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "// SPDX-License-Identifier: MIT\n")
+	fmt.Fprintf(&b, "// GENERATED by modules/tracecontext/tools/go_oracle (%s, otel v1.46.0) -- do not hand-edit.\n", runtime.Version())
+	fmt.Fprintf(&b, "//! OpenTelemetry Go's TraceContext propagator on this module's own request headers,\n")
+	fmt.Fprintf(&b, "//! replayed by `otel_oracle_test.zig`. Regenerate with the command in tools/go_oracle/main.go.\n\n")
+	b.WriteString(`pub const Header = struct { name: []const u8, value: []const u8 };
+/// What otel extracted: ` + "`valid`" + ` = a usable remote span context; then its
+/// trace-id, span-id, flags and the tracestate it re-serialized ("" = none).
+pub const Case = struct {
+    id: []const u8,
+    headers: []const Header,
+    /// False when a header value holds a control character: an HTTP server
+    /// refuses the request (400) and no propagator ever sees it.
+    wire_ok: bool,
+    valid: bool,
+    trace_id: []const u8,
+    span_id: []const u8,
+    flags: u8,
+    tracestate: []const u8,
+};
+
+pub const cases = [_]Case{
+`)
+	prop := propagation.TraceContext{}
+	for _, c := range cases() {
+		// What an HTTP server hands the propagator: field values with their
+		// optional whitespace trimmed (RFC 9110 §5.5), and no request at all
+		// when a value holds a control character -- such a request is refused
+		// before any propagator runs (wire_ok = false).
+		h := http.Header{}
+		wireOK := true
+		for _, x := range c.headers {
+			h.Add(x.name, strings.Trim(x.value, " \t"))
+			for i := 0; i < len(x.value); i++ {
+				if b := x.value[i]; (b < 0x20 && b != '\t') || b == 0x7f {
+					wireOK = false
+				}
+			}
+		}
+		sc := trace.SpanContextFromContext(prop.Extract(context.Background(), propagation.HeaderCarrier(h)))
+		hs := make([]string, len(c.headers))
+		for i, x := range c.headers {
+			hs[i] = fmt.Sprintf(".{ .name = %s, .value = %s }", zigStr(x.name), zigStr(x.value))
+		}
+		tidS, sidS := "", ""
+		if sc.IsValid() {
+			tidS, sidS = sc.TraceID().String(), sc.SpanID().String()
+		}
+		if !wireOK {
+			sc = trace.SpanContext{}
+		}
+		fmt.Fprintf(&b, "    .{ .id = %s, .headers = %s, .wire_ok = %v, .valid = %v, .trace_id = %s, .span_id = %s, .flags = %d, .tracestate = %s },\n",
+			zigStr(c.id), zlist(hs), wireOK, sc.IsValid(), zigStr(tidS), zigStr(sidS), byte(sc.TraceFlags()), zigStr(sc.TraceState().String()))
+	}
+	b.WriteString("};\n")
+
+	if *check != "" {
+		old, err := os.ReadFile(*check)
+		if err != nil {
+			fail(err)
+		}
+		if !bytes.Equal(old, b.Bytes()) {
+			fail(fmt.Errorf("%s is stale: otel, Go or the case tables moved -- regenerate and re-judge the divergences", *check))
+		}
+		fmt.Println("vectors are fresh")
+		return
+	}
+	os.Stdout.Write(b.Bytes())
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(1)
+}
+
+// zlist lays out a Zig `&.{...}` the way `zig fmt` does.
+func zlist(items []string) string {
+	switch len(items) {
+	case 0:
+		return "&.{}"
+	case 1:
+		return "&.{" + items[0] + "}"
+	}
+	return "&.{ " + strings.Join(items, ", ") + " }"
+}
+
+// zigStr renders s as a byte-exact Zig string literal.
+func zigStr(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			b.WriteString(`\"`)
+		case c == '\\':
+			b.WriteString(`\\`)
+		case c == '\n':
+			b.WriteString(`\n`)
+		case c == '\r':
+			b.WriteString(`\r`)
+		case c == '\t':
+			b.WriteString(`\t`)
+		case c >= 0x20 && c < 0x7f:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}

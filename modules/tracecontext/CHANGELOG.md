@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fix:** `childOf` (and so the middleware's outgoing `traceparent`) keeps only the
+  `sampled` flag; every other trace-flags bit was copied through, where W3C requires "all unparsed /
+  unknown trace-flags" zeroed on outgoing requests (an incoming `…-ff` is still accepted and goes out
+  `…-01`). Found by a new differential oracle against OpenTelemetry Go's propagator
+  (`tools/go_oracle/`, `src/otel_oracle_test.zig`, 498 header sets). Anchor grade MIXED → EXTERNAL.
+
 - **2026-10-04** — **Tests:** mutation run (22 schemata mutants, all killed after one new test
   covering the byte-35/52 delimiters, `Options.sampled = false` and DEL in a tracestate). No code
   change.
