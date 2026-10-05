@@ -2445,6 +2445,16 @@ test "READ: hostile ranges are PARAMETER_ERROR, never an out-of-bounds read" {
     reply = (try station.handle(read, 40, &out)).?;
     try testing.expect((try responseIin(reply.fragment)).object_unknown);
 
+    // A range whose stop is exactly one past the last point.
+    read = try buildRead(&req, 4, &.{.{
+        .group = 1,
+        .variation = 2,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_1b },
+        .range = .{ .start_stop = .{ .start = 0, .stop = 6 } },
+    }});
+    reply = (try station.handle(read, 45, &out)).?;
+    try testing.expect((try responseIin(reply.fragment)).parameter_error);
+
     // An object header that runs off the end of the fragment.
     const truncated = [_]u8{ 0xC0, 0x01, 1, 2, 0x00, 3 }; // start-stop needs two range octets
     reply = (try station.handle(&truncated, 50, &out)).?;
@@ -2685,6 +2695,46 @@ fn buildCrobRange(
 fn commandStatus(fragment: []const u8) !CommandStatus {
     const decoded = try application.decodeResponseHeader(fragment);
     return @enumFromInt(decoded.rest[decoded.rest.len - 1]);
+}
+
+test "update and reportChange ignore an index one past the database" {
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    const before = station.events.len;
+    station.update(.binary_input, fix.binaries.len, .{ .binary = true }, 10);
+    station.reportChange(.counter, fix.counters.len, 10);
+    try testing.expectEqual(before, station.events.len);
+}
+
+test "a SELECT whose objects are exactly max_select_bytes long still arms" {
+    var fix = Fixture{};
+    var station = fix.station(.{ .select_timeout_ms = 5000 });
+    var out: [512]u8 = undefined;
+    var req: [256]u8 = undefined;
+    // A 2-octet start/stop header (7 octets) and eleven CROBs (11 each): 128.
+    var pos = (try application.encodeRequestHeader(
+        .{ .control = .{ .fir = true, .fin = true, .seq = 1 }, .function = .select },
+        &req,
+    )).len;
+    const body_at = pos;
+    pos += (try objects.encodeObjectHeader(.{
+        .group = 12,
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_2b },
+        .range = .{ .start_stop = .{ .start = 0, .stop = 10 } },
+    }, req[pos..])).len;
+    for (0..11) |_| {
+        pos += (try (objects.g12.V1{
+            .control_code = .{ .op_type = .latch_on, .tcc = .nul },
+            .count = 1,
+            .on_time_ms = 100,
+            .off_time_ms = 100,
+        }).encode(req[pos..])).len;
+    }
+    try testing.expectEqual(Outstation.max_select_bytes, pos - body_at);
+    const reply = (try station.handle(req[0..pos], 1000, &out)).?;
+    try testing.expect(!(try responseIin(reply.fragment)).parameter_error);
+    try testing.expect(station.select != null);
 }
 
 test "SELECT then OPERATE executes exactly once, and arms nothing afterwards" {
@@ -3156,6 +3206,21 @@ test "IMMEDIATE_FREEZE copies counters into frozen counters, freeze-clear zeroes
     try testing.expectEqual(@as(u32, 555), fix.frozen[0].value);
     try testing.expectEqual(@as(u32, 0), fix.counters[0].value);
     try testing.expectEqual(@as(u32, 102), fix.counters[2].value); // untouched
+
+    // A range ending one past the last counter is refused and touches nothing.
+    pos = (try application.encodeRequestHeader(
+        .{ .control = .{ .fir = true, .fin = true, .seq = 2 }, .function = .freeze_clear },
+        &req,
+    )).len;
+    pos += (try objects.encodeObjectHeader(.{
+        .group = 20,
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_1b },
+        .range = .{ .start_stop = .{ .start = 2, .stop = 3 } },
+    }, req[pos..])).len;
+    const refused = (try station.handle(req[0..pos], 250, &out)).?;
+    try testing.expect((try responseIin(refused.fragment)).parameter_error);
+    try testing.expectEqual(@as(u32, 102), fix.counters[2].value);
 
     // The no-ack form answers nothing.
     const no_ack = [_]u8{ 0xC2, 0x08 };

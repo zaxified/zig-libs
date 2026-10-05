@@ -218,6 +218,17 @@ test "reassembler: continuation before FIR is a typed error" {
     try testing.expectError(error.UnexpectedContinuation, reasm.feed(&seg));
 }
 
+test "reassembler: a FIN closes the fragment, so a continuation after it is refused" {
+    var buf: [64]u8 = undefined;
+    var reasm = Reassembler.init(&buf);
+    const whole = TransportHeader{ .fin = true, .fir = true, .seq = 4 };
+    var seg_a: [2]u8 = .{ whole.toByte(), 'a' };
+    try testing.expectEqualSlices(u8, "a", (try reasm.feed(&seg_a)).?);
+    const cont = TransportHeader{ .fin = true, .fir = false, .seq = 5 };
+    var seg_b: [2]u8 = .{ cont.toByte(), 'b' };
+    try testing.expectError(error.UnexpectedContinuation, reasm.feed(&seg_b));
+}
+
 test "reassembler: new FIR restarts reassembly" {
     var buf: [64]u8 = undefined;
     var reasm = Reassembler.init(&buf);

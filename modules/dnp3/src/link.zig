@@ -372,6 +372,8 @@ test "decode: malformed frames never panic" {
 
     try testing.expectError(error.ShortFrame, decodeFrame(&.{ 0x05, 0x64, 0x05 }, &user_buf));
     try testing.expectError(error.BadStartBytes, decodeFrame(&.{ 0x00, 0x00, 0x05, 0xC0, 0, 0, 0, 0, 0, 0 }, &user_buf));
+    // Each start octet is checked on its own: a right first one is not enough.
+    try testing.expectError(error.BadStartBytes, decodeFrame(&.{ 0x05, 0x00, 0x05, 0xC0, 0, 0, 0, 0, 0, 0 }, &user_buf));
     try testing.expectError(error.BadLengthField, decodeFrame(&.{ 0x05, 0x64, 0x02, 0xC0, 0, 0, 0, 0, 0, 0 }, &user_buf));
 
     // Header CRC deliberately wrong.
