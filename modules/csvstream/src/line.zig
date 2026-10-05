@@ -34,6 +34,15 @@ pub const OverflowPolicy = enum {
 /// comptime-known and folds away, so a call site pays nothing for the choice.
 pub const SplitOptions = struct {
     on_overflow: OverflowPolicy = .@"error",
+    /// RFC 4180's `record = field *(COMMA field)`: `a,b,` is THREE fields,
+    /// the last one empty -- what Python's `csv`, Go's `encoding/csv` and
+    /// this module's own `writeRecord` (which writes `["a","b",""]` as
+    /// `a,b,`) all mean by it. Off by default, the module's long-standing
+    /// deviation: a trailing delimiter is consumed and no final empty field
+    /// is emitted, so `a,b,` is two. Turned on, a record written by
+    /// `writeRecord` reads back as the fields written (the Python/Go oracle,
+    /// `oracle_test.zig`, 2026-10-05). `countFields` counts the default way.
+    trailing_empty_field: bool = false,
 };
 
 /// Splits one CSV line into its constituent fields.
@@ -105,6 +114,7 @@ pub fn splitFieldsOpts(
     // either way, so nothing is stranded by skipping it. The same test is the
     // caller's `freeFields` on the success path.
     errdefer freeFields(line, buf[0..count], alloc);
+    var ended_on_delimiter = false;
     // Loop condition: pos <= line.len (one past end) lets the outer while
     // reach the `if (pos == line.len) break` sentinel for the trailing-field
     // case, avoiding a separate post-loop append.
@@ -145,7 +155,10 @@ pub fn splitFieldsOpts(
             }
             const raw = line[start..pos];
             if (pos < line.len) pos += 1; // Skip closing quote.
-            if (pos < line.len and line[pos] == delimiter) pos += 1; // Skip delimiter.
+            if (pos < line.len and line[pos] == delimiter) {
+                pos += 1; // Skip delimiter.
+                ended_on_delimiter = pos == line.len;
+            }
 
             // Unescape doubled quote → single quote only when needed (avoids
             // allocation in the common case).
@@ -159,9 +172,21 @@ pub fn splitFieldsOpts(
             const start = pos;
             while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
             buf[count] = line[start..pos];
-            if (pos < line.len) pos += 1; // Skip delimiter.
+            if (pos < line.len) {
+                pos += 1; // Skip delimiter.
+                ended_on_delimiter = pos == line.len;
+            }
         }
         count += 1;
+    }
+    // The empty field after a final delimiter, when asked for: the loop
+    // above stops at `pos == line.len` with nothing left to scan.
+    var surplus = pos < line.len;
+    if (opts.trailing_empty_field and ended_on_delimiter) {
+        if (count < buf.len) {
+            buf[count] = line[line.len..];
+            count += 1;
+        } else surplus = true;
     }
     // The surplus used to be dropped in silence — and because a header and its
     // rows are usually split with the same buffer, both were truncated to the
@@ -171,7 +196,7 @@ pub fn splitFieldsOpts(
     // (W2 re-audit 2026-09-02, `csvstream` F2). Refusing stays the DEFAULT;
     // `.truncate` is that old behaviour back, but only where a caller asked
     // for it in as many words and took F3 on (see `OverflowPolicy.truncate`).
-    if (count == buf.len and pos < line.len and opts.on_overflow == .@"error") {
+    if (count == buf.len and surplus and opts.on_overflow == .@"error") {
         return error.FieldBufferTooSmall;
     }
     // Falling through on `.truncate` is what makes the surplus safe to drop:
@@ -645,6 +670,27 @@ test "splitFields: trailing delimiter produces no extra empty field" {
     try t.expectEqual(@as(usize, 2), fields.len);
     try t.expectEqualStrings("a", fields[0]);
     try t.expectEqualStrings("b", fields[1]);
+}
+
+test "splitFieldsOpts: trailing_empty_field reads a final delimiter as RFC 4180 does" {
+    // Python's csv, Go's encoding/csv and RFC 4180 read `a,b,` as three
+    // fields; so does this module's own writer write `["a","b",""]`
+    // (the Python/Go oracle, 2026-10-05).
+    var buf: [8][]const u8 = undefined;
+    const rfc: SplitOptions = .{ .trailing_empty_field = true };
+    const f1 = try splitFieldsOpts("a,b,", &buf, ',', '"', t.allocator, rfc);
+    try t.expectEqual(@as(usize, 3), f1.len);
+    try t.expectEqualStrings("", f1[2]);
+    try t.expectEqual(@as(usize, 2), (try splitFieldsOpts("\"a\",", &buf, ',', '"', t.allocator, rfc)).len);
+    try t.expectEqual(@as(usize, 2), (try splitFieldsOpts(",", &buf, ',', '"', t.allocator, rfc)).len);
+    try t.expectEqual(@as(usize, 2), (try splitFieldsOpts("a,b", &buf, ',', '"', t.allocator, rfc)).len);
+    // The extra field counts against the buffer like any other.
+    var two: [2][]const u8 = undefined;
+    try t.expectError(error.FieldBufferTooSmall, splitFieldsOpts("a,b,", &two, ',', '"', t.allocator, rfc));
+    const cut = try splitFieldsOpts("a,b,", &two, ',', '"', t.allocator, .{ .trailing_empty_field = true, .on_overflow = .truncate });
+    try t.expectEqual(@as(usize, 2), cut.len);
+    // Off (the default), the documented deviation stands.
+    try t.expectEqual(@as(usize, 2), (try splitFields("a,b,", &buf, ',', '"', t.allocator)).len);
 }
 
 test "splitFields: quoted field containing delimiter" {

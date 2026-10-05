@@ -167,4 +167,5 @@ test {
 test {
     _ = @import("csv_spectrum_vectors.zig");
     _ = @import("csv_spectrum_test.zig");
+    _ = @import("oracle_test.zig");
 }

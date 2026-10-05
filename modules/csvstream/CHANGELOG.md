@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **`SplitOptions.trailing_empty_field`** (opt-in, default off): a trailing delimiter
+  yields a final empty field, as RFC 4180, Python's `csv` and Go's `encoding/csv` read it, and as this
+  module's own `writeRecord(["a","b",""])` writes it (`a,b,` read back as two fields before). Also
+  through `StreamReader.nextFieldsOpts`. **Anchoring:** a frozen differential oracle against Python and
+  Go (`tools/oracle.py`, `src/oracle_test.zig`): 1833 inputs in `.span` mode, 1882 record offsets
+  against Go's `FieldPos`, 309 written records; replaces the hand-run `gen.py`/`compare.py`/`dump.zig`.
+  Anchor grade MIXED → EXTERNAL.
+
 - **2026-10-04** — **Tests:** mutation run (46 schemata mutants, 42 killed, 4 equivalent;
   6 new tests). Pins the `.span` close-before-CRLF arm, `.first_record` ignoring a leading blank
   line, `freeFields` on a copy adjacent to the record, long rows in both arity checks, reading
