@@ -772,6 +772,40 @@ test "out-of-range member id (including exactly node_count) is ignored, not a bo
     try testing.expect(!bt.isMember(g.nodeCount()));
 }
 
+test "boundaries: source id == node_count, deliversLocally of a non-member, prune=false past an unreachable node" {
+    const gpa = testing.allocator;
+    var g = try goldenGraph(gpa);
+    defer g.deinit();
+    // Source exactly one past the last id: the defined empty result.
+    {
+        var bt = try build(gpa, &g, g.nodeCount(), &.{3});
+        defer bt.deinit();
+        try testing.expectEqual(@as(u32, 0), bt.node_count);
+    }
+    // A reachable non-member never delivers locally, whatever its RPF.
+    {
+        var bt = try build(gpa, &g, 0, &.{3});
+        defer bt.deinit();
+        try testing.expect(bt.rpfIngress(1) != null);
+        try testing.expect(!bt.deliversLocally(1));
+        try testing.expect(!bt.deliversLocally(0)); // the source, not a member
+        try testing.expect(bt.deliversLocally(3));
+    }
+    // prune=false over a graph with an unreachable node: that node is no
+    // one's child (it has no predecessor) and gets no plan entries.
+    {
+        var h = spf.Graph.init(gpa);
+        defer h.deinit();
+        try h.addEdge(0, 1, 1);
+        try h.ensureNode(2); // isolated
+        var bt = try buildWith(gpa, &h, 0, &.{}, .{ .prune = false });
+        defer bt.deinit();
+        try testing.expectEqualSlices(NodeId, &.{1}, bt.replicateTo(0));
+        try testing.expectEqualSlices(NodeId, &.{}, bt.replicateTo(2));
+        try testing.expectEqual(@as(?NodeId, null), bt.rpfIngress(2));
+    }
+}
+
 test "unreachable member: flagged but never a replication target" {
     const gpa = testing.allocator;
     var g = spf.Graph.init(gpa);
