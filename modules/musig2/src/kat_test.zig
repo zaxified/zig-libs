@@ -306,6 +306,81 @@ test "sign REJECTS a secnonce bound to a DIFFERENT signer's pubkey (SecretKeyMis
     try std.testing.expectError(error.SecretKeyMismatch, musig2.sign(ng.secnonce, sk_b, ctx));
 }
 
+// Mutation run 2026-10-05: matching the session's pubkey list without the
+// parity prefix left every test green. BIP327 Sign fails unless
+// cbytes(d'·G) is IN the list byte for byte; 02‖x and 03‖x are different
+// keys (P and −P), so a list holding only the other parity must refuse.
+test "sign refuses when the session lists the signer's x with the other parity" {
+    const std_ecc = std.crypto.ecc.Secp256k1;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk_bytes = [_]u8{0x11} ** 32;
+    const sk = try bip340.SecretKey.fromBytes(sk_bytes);
+    const own = (try std_ecc.basePoint.mul(sk_bytes, .big)).toCompressedSec1();
+    var flipped = own;
+    flipped[0] ^= 1; // 02 <-> 03: the same x, the negated point
+    const other = (try std_ecc.basePoint.mul([_]u8{0x22} ** 32, .big)).toCompressedSec1();
+
+    const ng = try musig2.nonceGen(sk_bytes, own, null, "msg", null, [_]u8{0xCC} ** 32, io);
+    const aggnonce = try musig2.nonceAgg(&.{ng.pubnonce});
+    const pks = [_]musig2.PlainPublicKey{ try .fromBytes(flipped), try .fromBytes(other) };
+    const ctx = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = "msg" };
+    try std.testing.expectError(error.PubkeyNotInSession, musig2.sign(ng.secnonce, sk, ctx));
+}
+
+// Mutation run 2026-10-05: reducing a secnonce scalar mod n instead of
+// refusing it left every test green (the official vector only has k1 = 0).
+// BIP327 Sign: fail if k1' or k2' is not in [1, n − 1]. n + 1 would reduce
+// to the valid-looking 1; n would reduce to 0.
+test "SecNonce refuses k1 or k2 of n or n + 1, not only 0" {
+    const n = std.crypto.ecc.Secp256k1.scalar.field_order;
+    for ([_]u256{ n, n + 1 }) |k| {
+        var kb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &kb, k, .big);
+        const one = [_]u8{0} ** 31 ++ [_]u8{1};
+        const pk = [_]u8{0x02} ++ [_]u8{0} ** 32;
+        const bad_k1 = musig2.SecNonce.fromBytes(kb ++ one ++ pk);
+        const bad_k2 = musig2.SecNonce.fromBytes(one ++ kb ++ pk);
+        try std.testing.expectError(error.InvalidSecNonce, bad_k1.k1Scalar());
+        try std.testing.expectError(error.InvalidSecNonce, bad_k2.k2Scalar());
+    }
+}
+
+// Mutation run 2026-10-05: recognising the infinity encoding by the 32 x
+// bytes alone left every test green. BIP327 cpoint_ext: infinity is
+// bytes(33, 0) exactly; 02‖0^32 is cpoint's input, and x = 0 is on no
+// secp256k1 point (7 is not a square mod p), so the aggnonce is invalid.
+test "AggNonce: infinity is 33 zero bytes exactly; 02/03 followed by 32 zeros is invalid" {
+    const g = std.crypto.ecc.Secp256k1.basePoint.toCompressedSec1();
+    _ = try musig2.AggNonce.fromBytes(([_]u8{0} ** 33) ++ g);
+    _ = try musig2.AggNonce.fromBytes(g ++ ([_]u8{0} ** 33));
+    for ([_]u8{ 0x02, 0x03 }) |prefix| {
+        const bad = [_]u8{prefix} ++ [_]u8{0} ** 32;
+        try std.testing.expectError(error.InvalidAggNonce, musig2.AggNonce.fromBytes(bad ++ g));
+        try std.testing.expectError(error.InvalidAggNonce, musig2.AggNonce.fromBytes(g ++ bad));
+    }
+}
+
+// Mutation run 2026-10-05: dropping the `u > 0` guards left every test green.
+// BIP327 KeyAgg, NonceAgg and PartialSigAgg all take 0 < u; without the
+// guard keyAgg reports PointAtInfinity, nonceAgg returns an all-zero
+// aggnonce and partialSigAgg returns a "signature" s = e·g·tacc.
+test "keyAgg, nonceAgg and partialSigAgg refuse an empty input" {
+    try std.testing.expectError(error.InvalidPublicKey, musig2.keyAgg(&.{}));
+    try std.testing.expectError(error.InvalidPubNonce, musig2.nonceAgg(&.{}));
+
+    const g = std.crypto.ecc.Secp256k1.basePoint.toCompressedSec1();
+    const pks = [_]musig2.PlainPublicKey{try .fromBytes(g)};
+    const ctx = musig2.SessionContext{
+        .aggnonce = try musig2.AggNonce.fromBytes(g ++ g),
+        .pubkeys = &pks,
+        .msg = "msg",
+    };
+    try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigAgg(&.{}, ctx));
+}
+
 test "KAT sign_verify: valid_test_cases — partial signatures byte-exact; partialSigVerify accepts each" {
     const gpa = std.testing.allocator;
     const sk = try bip340.SecretKey.fromBytes(hexN(32, v.sign_verify.sk));

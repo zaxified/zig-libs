@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (54 mutants, 45 killed, 9 equivalent or
+  unobservable; `SPEC.md` § "Mutation run 2026-10-05"). No defect; 4 new tests close the 6 test
+  gaps it found — the aggnonce infinity encoding is exactly 33 zero bytes, secnonce scalars `n`
+  and `n + 1` are refused, `keyAgg`/`nonceAgg`/`partialSigAgg` refuse an empty input, `sign`
+  refuses a session listing the signer's x with the other parity. No source change.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 101**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ 81 of the 103 total contexts are the mandatory self-verify (`partialSigVerifyInternal`) re-running k256's deliberately variable-time GLV/wNAF machinery on the partial signature about to be returned — the same shape `bip340` (63/80) and `adaptor` (74/90) show, at a near-identical ratio. That is a property of this signing family, not of this module, which is why the row is pinned as a bound. The pre-self-verify body is 17, all accepted classes. `root.zig:887`'s masked parity select re-canonicalises the selected bytes (2 contexts) — the mask is one uniform byte so the outcome never varies, reported rather than hidden.
 
 - **2026-09-07** — Test-only, no production change: `fuzzPartialSigVerify`, the harness

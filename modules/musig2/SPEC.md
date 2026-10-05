@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 `musig` module (BIP327) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -333,6 +333,41 @@ cross-signer rejection check.
   (untweaked AND tweaked), plus the end-to-end tests. `zig fmt
   --check modules/musig2/` clean; a repo-hygiene grep for
   scratch/home-directory leakage over this module's tree has no hits.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, 29 tests, `setsid -w timeout -s
+KILL 20` per mutant): **54 mutants, 45 killed, 9 equivalent or unobservable**. Points: `cpoint`'s
+tag and parity, `cpoint_ext`'s infinity rule, every codec's range/curve check, `NonceGen`'s
+preimage (aux xor, each length prefix, the absent-message marker, the index byte) and its pk
+binding, `GetSecondKey`, `KeyAggCoeff`'s second-key rule and `L`, `ApplyTweak` (`g`, `t < n`,
+infinity, `gacc`, `tacc`), every `u > 0` guard, `NonceAgg`'s infinity encoding, the session's
+`b`, `R` (incl. the `G` substitute) and `e`, `Sign`'s secnonce binding, pk-in-session, nonce
+parity, `d`, `s` and self-verify, `PartialSigVerify`'s checks, `Re*` parity, `g'` and equation,
+`PartialSigAgg`'s `tacc` term, `KeySort`, and the blame indices.
+
+First pass: 15 survivors. **No defect in the code; 6 were test gaps**, closed by 4 tests in
+`kat_test.zig`:
+
+- An aggnonce half `02‖0^32` or `03‖0^32` is invalid; only `bytes(33, 0)` is infinity —
+  recognising infinity by the x bytes alone survived.
+- A secnonce scalar of `n` or `n + 1` is `InvalidSecNonce` (the official vector has only
+  `k1 = 0`); reducing mod `n` survived.
+- `keyAgg`, `nonceAgg` and `partialSigAgg` refuse an empty input (`0 < u`); without the guards
+  they returned `PointAtInfinity`, an all-zero aggnonce, and a "signature" `s = e·g·tacc`.
+- `sign` refuses a session listing the signer's x with the other parity prefix — matching the
+  list without the prefix survived.
+
+Equivalent or unobservable (9), each reasoned: `NonceGen`'s `k ≠ 0` (probability 2^-256);
+`GetSecondKey`'s empty guard (every caller fails on an empty list first); `KeyAgg`'s
+infinity check (a rogue-key cancellation needs `P2 = −a1·P1` with `a1` hashed over `P2` —
+not constructible); `R' = R1` versus `O + R1` (the same point); `Sign`'s self-verify and the
+internal pk-in-list check (algebraically always pass for a correct signer — they guard against
+faults, not inputs); the local secnonce wipe (a stack copy, not observable in-process);
+`PartialSigVerify`'s up-front signer-key check (the session's `KeyAgg` refuses the same key,
+only the precedence between two errors changes); `PartialSigVerify`'s `s < n` versus `s mod n`
+(accepting `s + n` needs a valid `s < 2^256 − n`, ~2^-128; `s = n` reduces to 0 and fails the
+equation).
 
 ## Anchoring
 
