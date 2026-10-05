@@ -6,7 +6,7 @@
 
 **Scope:** mvp — NNG 1.12.3 (req/rep over `ipc://`) and D-Bus as the same-host control-plane yardsticks (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -66,6 +66,17 @@ auth/permissions layer on the socket.
 Tests cover the raw transport (`FdReader`/`FdWriter` `std.Io` adapters over a socket fd,
 oversize-frame rejection via `framing.readFrame`, end-of-stream handling) and the framing
 integration. Run: `zig build test-ipcbus`.
+
+**Mutation run 2026-10-05** (in-place, Debug, 25 mutants over the transport
+helpers, the `std.Io` adapters, `Server`'s listen/accept/handle/deinit, `CLOEXEC`
+at every fd creation, and the `Bus`'s cap, eviction, version and frees): 25
+killed, three of them by a deterministic hang (no EOF in `FdReader.stream` or in
+`readExact`, no flush of the reply — each blocks a test forever, so modtest's
+watchdog ends the run). The first pass left 15; seven tests were added (`CLOEXEC`
+on listen, connect and accepted fds; a stale socket path replaced and `deinit`
+unlinking; one-byte `writeAllFd`/`readExact` and `readExact`'s EOF; `drain`'s
+slices, splat and count; `handleOne` closing its fd; `clear` bumping `version`;
+`Bus.set` under every allocation failure). None equivalent.
 
 ## Backlog / deferred
 
