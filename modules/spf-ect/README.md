@@ -115,8 +115,8 @@ of the topology, not of the comparator.
 ## Verify
 
 ```
-zig build test-spf-ect                          # Debug       — 13 pass
-zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 13 pass
+zig build test-spf-ect                          # Debug       — 18 pass
+zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 18 pass
 ```
 
 The property harness is the real check: reversal symmetry, strict-total-order
