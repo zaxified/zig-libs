@@ -618,6 +618,22 @@ test "ternary sampler KAT: scripted draws map to the exact trits (-1, 0, +1)" {
     }
 }
 
+test "encrypt KAT: both fresh error terms land in the ciphertext (zero key, scripted +1 trits)" {
+    if (!gate.scheme_core_implemented) return error.SkipZigTest;
+    // Every draw is +1, and with p0 = p1 = 0 and m = 0 the ciphertext is
+    // exactly (e0, e1). Decryption cannot see a missing e0 -- it only lowers
+    // the noise -- so this is the test that does.
+    var script = ScriptedRandom{ .words = &.{std.math.maxInt(u64)} };
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const pk: B.PublicKey = .{ .p0 = B.Ring.zero(.coeff), .p1 = B.Ring.zero(.coeff) };
+    const ct = inst.encryptForTest(&pk, &B.Plaintext.zero(P.t), script.random());
+    for (0..P.primes.len) |i| for (0..P.n) |j| {
+        try testing.expectEqual(@as(u64, 1), ct.components[0].limbs[i][j]);
+        try testing.expectEqual(@as(u64, 1), ct.components[1].limbs[i][j]);
+    };
+}
+
 test "ternary sampler: every limb is a trit, consistently across limbs, all three occur" {
     if (!gate.scheme_core_implemented) return error.SkipZigTest;
     const B = bfv.Bfv(P);
