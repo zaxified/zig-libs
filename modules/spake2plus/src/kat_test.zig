@@ -596,3 +596,66 @@ test "property: proverFinish REJECTS a shareV tampered to a different (but still
         hexN(32, vec.confirm_v),
     ));
 }
+
+// Mutation run 2026-10-05: a `<` length check survived. RFC 9383 §3.2 (and
+// BoringSSL's Register()) split exactly 80 octets into two 40-octet halves;
+// anything longer is a caller error, not "use the first 80".
+test "computeW0W1 takes exactly 80 octets: 79 and 81 are refused" {
+    const buf = [_]u8{0x5a} ** 81;
+    _ = try spake2plus.computeW0W1(buf[0..80]);
+    try std.testing.expectError(error.InvalidPbkdfOutputLength, spake2plus.computeW0W1(buf[0..79]));
+    try std.testing.expectError(error.InvalidPbkdfOutputLength, spake2plus.computeW0W1(buf[0..81]));
+}
+
+/// Counts frees of memory that still held a non-zero octet. Only meaningful
+/// in ReleaseFast: in the safe modes `Allocator.free` overwrites the slice
+/// with 0xAA before the vtable sees it.
+const WipeCheckAllocator = struct {
+    child: std.mem.Allocator,
+    frees: usize = 0,
+    dirty_frees: usize = 0,
+
+    fn allocator(self: *WipeCheckAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *WipeCheckAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *WipeCheckAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *WipeCheckAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *WipeCheckAllocator = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        if (!std.mem.allEqual(u8, m, 0)) self.dirty_frees += 1;
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+// Review finding 2026-10-05 (during the mutation run): `verifierConfirm` and
+// both `*Finish` on `ConfirmationMismatch` freed their own `TT` without
+// zeroing it. `TT` ends in `w0` and is a one-call pre-image of `K_shared`,
+// and `free` leaves memory intact in ReleaseFast. The caller never sees these
+// buffers, so the module must wipe them (the SPEC's own "freeing it is not
+// the same as zeroing it first").
+test "transcripts the module frees itself are zeroed first (ReleaseFast)" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const vec = v.vectors[0];
+    var wc: WipeCheckAllocator = .{ .child = std.testing.allocator };
+    const a = wc.allocator();
+    var bad = hexN(32, vec.confirm_p);
+    bad[0] ^= 1;
+
+    _ = try spake2plus.verifierConfirm(a, vec.context, vec.id_prover, vec.id_verifier, hexN(32, vec.w0), hexN(65, vec.l), hexN(32, vec.y), hexN(65, vec.share_p), hexN(65, vec.share_v));
+    try std.testing.expectError(error.ConfirmationMismatch, spake2plus.verifierFinish(a, vec.context, vec.id_prover, vec.id_verifier, hexN(32, vec.w0), hexN(65, vec.l), hexN(32, vec.y), hexN(65, vec.share_p), hexN(65, vec.share_v), bad));
+    try std.testing.expectError(error.ConfirmationMismatch, spake2plus.proverFinish(a, vec.context, vec.id_prover, vec.id_verifier, hexN(32, vec.w0), hexN(32, vec.w1), hexN(32, vec.x), hexN(65, vec.share_p), hexN(65, vec.share_v), bad));
+
+    try std.testing.expectEqual(@as(usize, 3), wc.frees);
+    try std.testing.expectEqual(@as(usize, 0), wc.dirty_frees);
+}

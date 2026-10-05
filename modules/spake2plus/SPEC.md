@@ -6,7 +6,7 @@
 
 **Scope:** core — BoringSSL `spake2plus` and the Matter SDK's SPAKE2+ (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -374,6 +374,30 @@ returns it caller-owned in `VerifierConfirmResult.tt`.
 
 - `zig build test-spake2plus` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/spake2plus/` clean.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **33 mutants, 30 killed, 2 equivalent, 1 test gap**. Points: `computeW0W1`'s length and
+halves, every `w0`/`w1`/`x`/`y` canonicality check in all six entry points, every identity check
+(shares, `L`), `X = x·P + w0·M`, `Y − w0·N`, `V`'s scalar, both confirmation checks and their MAC
+inputs and keys, the transcript's `w0` slot, length encoding and identity order, and
+`deriveKeys`' split and info strings.
+
+- **Test gap (closed):** `computeW0W1` with a `<` length check accepted 81+ octets. New test:
+  exactly 80; 79 and 81 refused.
+- **Equivalent (2):** `proverStart`/`verifierStart`'s identity-share check — `x·P = −w0·M` needs
+  the discrete logarithm of `M` (resp. `N`), which RFC 9383 §4 generated to be unknown.
+
+**Review finding while reading for the run (fixed):** `verifierConfirm` freed its transcript,
+and both `*Finish` freed theirs on `ConfirmationMismatch`, without zeroing them. `TT` ends in
+`w0` and is a one-call pre-image of `K_shared`; the caller never sees these buffers, and
+`Allocator.free` leaves memory intact in ReleaseFast (only the safe modes overwrite it with
+0xAA). The § "Threat model / limits" note put the wipe on the caller, which covers the `tt` a
+successful `*Finish` returns but not these three. They now go through `freeTranscript`
+(`secureZero` + `free`). Test: a counting allocator asserts every transcript the module frees
+is all-zero at the vtable — ReleaseFast only (skipped in the safe modes, where `free` already
+overwrites the slice); verified to fail with the wipe removed.
 
 ## Anchoring
 

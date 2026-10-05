@@ -354,6 +354,18 @@ pub fn computeTranscript(
 /// `len(field) || field` — one transcript entry, 8-byte little-endian
 /// length prefix (RFC 9383 §3's `len(S)` definition) followed by the raw
 /// bytes. Returns the new write offset.
+/// Free a transcript this module allocated and never hands to the caller —
+/// `verifierConfirm`'s, and either `*Finish`'s on `ConfirmationMismatch`.
+/// `TT` ends in `w0` and is a one-call pre-image of `K_shared`
+/// (`deriveKeys(tt).k_shared`), so it is zeroed before the memory goes back:
+/// `Allocator.free` only overwrites it in safe modes, never in ReleaseFast.
+/// The `tt` a successful `*Finish` returns is the caller's to wipe (see
+/// SPEC § "Threat model").
+fn freeTranscript(allocator: std.mem.Allocator, tt: []u8) void {
+    std.crypto.secureZero(u8, tt);
+    allocator.free(tt);
+}
+
 fn writeField(out: []u8, offset: usize, field: []const u8) usize {
     std.mem.writeInt(u64, out[offset..][0..8], field.len, .little);
     var off = offset + 8;
@@ -703,7 +715,7 @@ pub fn proverFinish(
     const v = v_point.toUncompressedSec1();
 
     const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
-    errdefer allocator.free(tt);
+    errdefer freeTranscript(allocator, tt);
 
     const keys = deriveKeys(tt);
 
@@ -921,9 +933,10 @@ pub fn verifierConfirm(
 
     // Freed here, not returned: see `VerifierConfirmResult`'s doc comment —
     // `TT` is a one-call pre-image of `K_shared`, which this step must not
-    // hand back.
+    // hand back. Wiped first: `free` does not clear memory in ReleaseFast,
+    // and `TT` also carries `w0` (see `freeTranscript`).
     const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
-    defer allocator.free(tt);
+    defer freeTranscript(allocator, tt);
 
     const keys = deriveKeys(tt);
 
@@ -999,7 +1012,7 @@ pub fn verifierFinish(
     const v = v_point.toUncompressedSec1();
 
     const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
-    errdefer allocator.free(tt);
+    errdefer freeTranscript(allocator, tt);
 
     const keys = deriveKeys(tt);
 
