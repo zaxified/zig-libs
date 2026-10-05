@@ -516,6 +516,30 @@ test "parseRegion bounds a snapshot list instead of overrunning" {
     try testing.expectError(error.BadLength, parseRegion(list.items));
 }
 
+test "parseRegion bounds top-level snapshot ids too" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try handle.append(gpa, &list, .pci("0000:65:00.0"));
+    for (0..max_snapshots + 1) |i| {
+        try codec.appendAttrU32(gpa, &list, uapi.ATTR.REGION_SNAPSHOT_ID, @intCast(i));
+    }
+    try testing.expectError(error.BadLength, parseRegion(list.items));
+}
+
+test "Assembler ignores an empty chunk wherever it claims to be" {
+    const gpa = testing.allocator;
+    var a = try Assembler.init(gpa, 100, 4);
+    errdefer a.deinit(gpa);
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try buildChunks(gpa, &m, &.{.{ .addr = 0, .data = "" }});
+    try a.feed(m.items);
+    var d = a.finish(gpa);
+    defer d.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), d.covered);
+}
+
 test "Assembler reassembles out-of-order chunks by address" {
     const gpa = testing.allocator;
     var a = try Assembler.init(gpa, 0x1000, 12);

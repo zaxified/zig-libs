@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 29 of 40 killed, 2 equivalent; 5 tests added
+  and 1 extended (top-level snapshot ids past `max_snapshots`, an empty chunk
+  outside the window, a 9-octet u64, and `walkStep` over the mock socket: a
+  foreign pid or seq, a negative errno, the message ceiling inside a
+  datagram). 36 of 40 killed after; `param`'s name-echo check and `collect`'s
+  keep-the-first remain untested for want of a seam. No library code changed.
 - **2026-09-07** — **all seven fuzz harnesses fetched their input and threw it away — and the
   collapse made them look perfect.** Each opened `smith.bytes(&buf)` and then sliced the buffer
   to `smith.valueRangeAtMost(u16, 0, buf.len)`; a `Smith` ranged draw reads eight input octets

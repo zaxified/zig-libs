@@ -515,6 +515,11 @@ test "asU64 / appendAttrU64 round-trip and reject a wrong width" {
     try codec.appendAttrU32(gpa, &list, ATTR.REGION_SIZE, 1);
     var it2: codec.AttrIterator = .{ .buf = list.items };
     try testing.expectError(error.BadLength, asU64((try it2.next()).?));
+    // ... and so is one octet too wide.
+    list.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &list, ATTR.REGION_SIZE, &([_]u8{0} ** 9));
+    var it3: codec.AttrIterator = .{ .buf = list.items };
+    try testing.expectError(error.BadLength, asU64((try it3.next()).?));
 }
 
 test "copyName bounds the destination instead of truncating" {
