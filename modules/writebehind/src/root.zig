@@ -882,11 +882,20 @@ pub const Coordinator = struct {
             .del => self.sink.delete(lease.partition),
         };
         if (res) |_| {
+            // `ack` frees the lease's borrowed fields: copy the key out first.
+            var key_buf: [jobqueue.max_field_len]u8 = undefined;
+            const key = key_buf[0..lease.partition.len];
+            @memcpy(key, lease.partition);
             self.wal.ack(lease) catch {};
             if (self.unflushed > 0) self.unflushed -= 1;
-            if (self.dequeueFor(lease.partition) == null) {
-                _ = self.cache.markClean(lease.partition);
-                self.removeKeySet(&self.orphans, lease.partition);
+            // Advance the key as `finishTask` does: its next record goes to the
+            // pool. (Leasing it and dropping the lease hid it for the whole
+            // visibility timeout, and `flushAll` stopped with it pending.)
+            if (self.dequeueFor(key)) |lease2| {
+                self.startFlush(key, lease2);
+            } else {
+                _ = self.cache.markClean(key);
+                self.removeKeySet(&self.orphans, key);
             }
             return true;
         } else |_| {
@@ -1813,6 +1822,149 @@ test "F4: recover() stops at the first sink failure, keeps prior progress, and r
     try testing.expectEqualStrings("v1", rig.sink.get("k1").?);
     try testing.expectEqualStrings("v2", rig.sink.get("k2").?);
     try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+}
+
+test "a put after a del supersedes the tombstone at once" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = try rig.open(2);
+    defer c.deinit();
+    try c.del("k");
+    try c.put("k", "back");
+    try testing.expectEqualStrings("back", (try c.get("k")).?);
+}
+
+test "a failing sink read-through is reported, not turned into a miss" {
+    const BrokenRead = struct {
+        fn vWrite(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn vDelete(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn vRead(_: *anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+            return error.Unreachable;
+        }
+        const vt = Sink.VTable{ .write = vWrite, .delete = vDelete, .read = vRead };
+    };
+    var dummy: u8 = 0;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = threaded.io(),
+        .sink = .{ .ptr = &dummy, .vtable = &BrokenRead.vt },
+        .wal_store = wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 1024,
+        .n_workers = 1,
+    });
+    defer c.deinit();
+    try testing.expectError(error.SinkReadFailed, c.get("absent-from-cache"));
+}
+
+test "recover() applies a WAL delete as a delete" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        var c = try rig.open(2);
+        try c.put("k", "v");
+        c.flushAll();
+        try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+        try c.del("k");
+        c.deinitNoFlush(); // the delete is only in the WAL
+    }
+    var c2 = try rig.open(2);
+    defer c2.deinit();
+    try c2.recover();
+    try testing.expect(rig.sink.peek("k") == null);
+}
+
+test "drain() alone carries one key through every queued record" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var c = try rig.open(2);
+    defer c.deinit();
+    try c.put("k", "a");
+    try c.put("k", "b"); // two WAL records for one key
+    drainUntilQuiescent(c);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("b", rig.sink.peek("k").?);
+}
+
+test "one key never has two sink calls in flight (dirty AND orphan selects it twice)" {
+    const OverlapSink = struct {
+        io: std.Io,
+        inner: MapSink,
+        active: std.atomic.Value(u32) = .init(0),
+        max_active: std.atomic.Value(u32) = .init(0),
+
+        fn enter(self: *@This()) void {
+            const n = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.max_active.fetchMax(n, .acq_rel);
+            // Hold the call open long enough for a second one to overlap it.
+            self.io.sleep(.fromMilliseconds(30), .awake) catch {};
+        }
+        fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.enter();
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            return MapSink.vWrite(&self.inner, key, value);
+        }
+        fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.enter();
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            return MapSink.vDelete(&self.inner, key);
+        }
+        const vt = Sink.VTable{ .write = vWrite, .delete = vDelete };
+    };
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    var os: OverlapSink = .{ .io = threaded.io(), .inner = MapSink.init(testing.allocator) };
+    defer os.inner.deinit();
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = threaded.io(),
+        .sink = .{ .ptr = &os, .vtable = &OverlapSink.vt },
+        .wal_store = wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 1024,
+        .n_workers = 2,
+    });
+    defer c.deinit();
+    try c.put("k", "v"); // dirty in the cache
+    try c.del("k"); // and an orphan: kick() collects "k" from both sources
+    c.flushAll();
+    try testing.expectEqual(@as(u32, 1), os.max_active.load(.acquire));
+    try testing.expect(os.inner.peek("k") == null); // the delete landed last
+}
+
+// Regression (mutation run 2026-10-05). `flushOneSync` read `lease.partition`
+// AFTER `ack` had freed it, then leased that key's next record and dropped the
+// lease: the record stayed invisible for the 60 s visibility timeout and
+// `flushAll` gave up with it pending. In safe modes `free` fills the key with
+// 0xAA, so the lookup missed and an ordinary key passed by accident; a key that
+// IS 0xAA reproduces in every mode what a ReleaseFast build does with any key.
+test "flushOneSync: a key's next record is flushed, not leased and dropped" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const key = "\xaa";
+    {
+        var c = try rig.open(2);
+        try c.put(key, "old");
+        try c.put(key, "new");
+        c.deinitNoFlush();
+    }
+    var c2 = try rig.open(2);
+    defer c2.deinit();
+    c2.flushAll();
+    try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+    try testing.expectEqualStrings("new", rig.sink.peek(key).?);
 }
 
 test "meta is well-formed" {
