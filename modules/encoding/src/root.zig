@@ -69,10 +69,14 @@ pub const Encoding = enum {
         if (eq(s, "utf-8") or eq(s, "utf8") or eq(s, "unicode-1-1-utf-8") or eq(s, "unicode11utf8") or eq(s, "unicode20utf8") or eq(s, "x-unicode20utf8")) return .utf8;
         if (eq(s, "windows-1250") or eq(s, "windows1250") or eq(s, "cp1250") or eq(s, "win1250") or eq(s, "x-cp1250")) return .windows_1250;
         if (eq(s, "windows-1252") or eq(s, "windows1252") or eq(s, "cp1252") or eq(s, "win1252") or eq(s, "x-cp1252") or
-            eq(s, "ansi_x3.4-1968") or eq(s, "ascii") or eq(s, "us-ascii") or eq(s, "cp819") or eq(s, "ibm819")) return .windows_1252;
+            eq(s, "ansi_x3.4-1968") or eq(s, "ascii") or eq(s, "us-ascii")) return .windows_1252;
+        // `cp819`/`ibm819` are IANA's own aliases of ISO_8859-1:1987, so they
+        // follow the departure with the rest of the family; until 2026-10-05
+        // they alone stayed on windows-1252 (found by the Go oracle,
+        // `go_oracle.zig`).
         if (eq(s, "iso-8859-1") or eq(s, "iso8859-1") or eq(s, "iso88591") or eq(s, "iso_8859-1") or
             eq(s, "iso_8859-1:1987") or eq(s, "iso-ir-100") or eq(s, "latin-1") or eq(s, "latin1") or
-            eq(s, "l1") or eq(s, "csisolatin1")) return .iso_8859_1;
+            eq(s, "l1") or eq(s, "csisolatin1") or eq(s, "cp819") or eq(s, "ibm819")) return .iso_8859_1;
         if (eq(s, "iso-8859-2") or eq(s, "iso8859-2") or eq(s, "iso88592") or eq(s, "iso_8859-2") or
             eq(s, "iso_8859-2:1987") or eq(s, "iso-ir-101") or eq(s, "latin-2") or eq(s, "latin2") or
             eq(s, "l2") or eq(s, "csisolatin2")) return .iso_8859_2;
@@ -820,6 +824,7 @@ test {
     // normative_test.zig and ../NOTICE.
     _ = @import("normative_vectors.zig");
     _ = @import("normative_test.zig");
+    _ = @import("go_oracle.zig");
 }
 
 // ── fuzz: decode/encode never panic, OOB or leak on arbitrary bytes ────────

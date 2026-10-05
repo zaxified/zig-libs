@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Behaviour change:** the labels `cp819` and `ibm819` (IANA's own aliases of
+  ISO_8859-1:1987) now select `.iso_8859_1` with the rest of the iso-8859-1 family; they alone selected
+  `.windows_1252` (the WHATWG mapping the module departs from for that family). Found by a golang.org/x/text
+  differential oracle (`tools/go_oracle/`, replayed by `src/go_oracle.zig`): the WHATWG label table via
+  htmlindex, and per-page encodability via charmap over U+0080..U+10FFFF. Anchor grade MIXED → EXTERNAL.
+
 - **2026-10-04** — **mvp → core.** UTF-16 (`decodeUtf16`, `encodeUtf16`, `Utf16Endian`), BOM
   sniffing (`sniffBom`, `Bom`, `decode` = WHATWG "decode": a BOM overrides the fallback and is
   removed), a streaming `Decoder` (chunks of any size, split sequences carried over) and fatal
