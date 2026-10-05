@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fix (RFC 7516 §5.2 step 10):** `decryptCompact` with `alg: dir` now refuses a
+  non-empty Encrypted Key segment (`error.MalformedToken`), as the ECDH-ES branch already did.
+  The segment is outside the AAD, so before this a `dir` token could be altered there and still
+  decrypt. Behaviour change for malformed tokens only. Tests: first dated mutation run (35
+  mutants, 32 killed, 3 equivalent; `SPEC.md` § "Mutation run 2026-10-05") — 8 new tests incl.
+  the first PBES2 KAT (RFC 7517 Appendix C), `expect_alg`/`expect_enc`, the decoy CEK, exact
+  tag/CEK/`iv` lengths and the `max_p2c`/`p2s` edges.
+
 - **2026-09-07** — **Test-only: both fuzz harnesses had already been "fixed"
   once, and both fixes bought nothing, for the same reason.**
   (a) `header.fuzzParse` carried a comment recording the earlier repair —

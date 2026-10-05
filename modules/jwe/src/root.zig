@@ -687,6 +687,12 @@ fn unwrapCek(
                 .symmetric => |s| s,
                 else => return error.KeyMaterialMismatch,
             };
+            // RFC 7516 §5.2 step 10, the same rule as ECDH-ES below: Direct
+            // Encryption carries no Encrypted Key. The segment is not in the
+            // AAD, so without this anyone could splice bytes into it and the
+            // token would still decrypt — a second, different token for the
+            // same message (found 2026-10-05, mutation-run review).
+            if (encrypted_key.len != 0) return error.MalformedToken;
             _ = try alg.dirCek(shared, cek_len, cek);
         },
         .@"RSA-OAEP", .@"RSA-OAEP-256" => {
@@ -1448,4 +1454,241 @@ fn rewriteP2c(gpa: std.mem.Allocator, token: []const u8, p2c: u32) ![]u8 {
     _ = b64.Encoder.encode(new_h, rebuilt.items);
 
     return std.fmt.allocPrint(gpa, "{s}.{s}", .{ new_h, rest });
+}
+
+// ── mutation run 2026-10-05 ─────────────────────────────────────────────────
+//
+// 35 mutants, 18 survivors on the first pass. Each test below names the rule
+// it pins and why its expected value is the right one.
+
+const test_b64 = std.base64.url_safe_no_pad;
+
+/// `header_json` b64url'd, then the four other segments, built by hand so a
+/// test can put exactly the bytes it wants into each.
+fn buildCompact(a: std.mem.Allocator, header_json: []const u8, ek: []const u8, iv: []const u8, ct: []const u8, tag: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ header_json, ek, iv, ct, tag }, 0..) |part, i| {
+        if (i != 0) try out.append(a, '.');
+        const start = out.items.len;
+        try out.resize(a, start + test_b64.Encoder.calcSize(part.len));
+        _ = test_b64.Encoder.encode(out.items[start..], part);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// A token whose content is A128GCM under `cek`, with `ek` as its Encrypted
+/// Key, whatever `ek` actually wraps.
+fn tokenWithCek(a: std.mem.Allocator, header_json: []const u8, ek: []const u8, cek: [16]u8, pt: []const u8) ![]u8 {
+    const iv = [_]u8{0x24} ** 12;
+    var hb: [256]u8 = undefined;
+    const header_b64 = test_b64.Encoder.encode(&hb, header_json);
+    const ct = try a.alloc(u8, pt.len);
+    defer a.free(ct);
+    var tag: [16]u8 = undefined;
+    _ = try enc.encrypt(.A128GCM, &cek, &iv, header_b64, pt, ct, &tag);
+    return buildCompact(a, header_json, ek, &iv, ct, &tag);
+}
+
+test "dir refuses a non-empty encrypted_key segment (RFC 7516 §5.2 step 10)" {
+    // Review finding 2026-10-05: only ECDH-ES checked this. The segment is
+    // outside the AAD, so a dir token with bytes spliced into it decrypted
+    // to the same plaintext — the malleability the ECDH-ES test names.
+    const key = [_]u8{0x2b} ** 16;
+    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{});
+    defer std.testing.allocator.free(token);
+    var it = std.mem.splitScalar(u8, token, '.');
+    const h = it.next().?;
+    try std.testing.expectEqual(@as(usize, 0), it.next().?.len);
+    const forged = try std.fmt.allocPrint(std.testing.allocator, "{s}.AAAAAAAAAAA.{s}", .{ h, it.rest() });
+    defer std.testing.allocator.free(forged);
+    try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, forged, .{}));
+}
+
+test "expect_alg / expect_enc refuse a token of another algorithm" {
+    // The caller's algorithm pin (RFC 8725 §3.1): without it the token's own
+    // header picks the algorithm. Removing either check left every test green.
+    const key = [_]u8{0x2b} ** 16;
+    const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "pinned", "", seededForTest(), .{});
+    defer std.testing.allocator.free(token);
+    try std.testing.expectError(error.AlgMismatch, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{ .expect_alg = .A128KW }));
+    try std.testing.expectError(error.EncMismatch, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{ .expect_enc = .A256GCM }));
+    const ok = try decryptCompact(std.testing.allocator, .{ .symmetric = &key }, token, .{ .expect_alg = .dir, .expect_enc = .A128GCM });
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("pinned", ok);
+}
+
+test "unknown alg/enc and an empty header segment are typed errors, never reach the key path" {
+    // `unwrapCek` has `.unknown => unreachable`; the up-front checks are what
+    // keep an unknown `alg` from it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = [_]u8{0x2b} ** 16;
+    const z = [_]u8{0} ** 16;
+    const bad_alg = try buildCompact(a, "{\"alg\":\"XYZ\",\"enc\":\"A128GCM\"}", "", &z, &z, &z);
+    try std.testing.expectError(error.UnsupportedAlg, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, bad_alg, .{}));
+    const bad_enc = try buildCompact(a, "{\"alg\":\"dir\",\"enc\":\"XYZ\"}", "", &z, &z, &z);
+    try std.testing.expectError(error.UnsupportedEnc, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, bad_enc, .{}));
+    try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, ".AA.AA.AA.AA", .{}));
+}
+
+test "header size limits: the b64 header at max + 1, a member at max_member_len + 1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = [_]u8{0x2b} ** 16;
+    for ([_]usize{ header.max_header_b64_len, header.max_header_b64_len + 1 }) |n| {
+        const big = try a.alloc(u8, n + ".AA.AA.AA.AA".len);
+        @memset(big[0..n], 'e');
+        @memcpy(big[n..], ".AA.AA.AA.AA");
+        if (decryptCompact(std.testing.allocator, .{ .symmetric = &key }, big, .{})) |pt| {
+            std.testing.allocator.free(pt);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            if (n > header.max_header_b64_len) {
+                try std.testing.expectEqual(error.HeaderTooLarge, err);
+            } else {
+                try std.testing.expect(err != error.HeaderTooLarge);
+            }
+        }
+    }
+    for ([_]usize{ header.max_member_len, header.max_member_len + 1 }) |n| {
+        const raw = try a.alloc(u8, n);
+        @memset(raw, 0x11);
+        const enc_iv = try a.alloc(u8, test_b64.Encoder.calcSize(n));
+        _ = test_b64.Encoder.encode(enc_iv, raw);
+        const json = try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\"}}", .{enc_iv});
+        const r = header.parse(a, json);
+        if (n > header.max_member_len) {
+            try std.testing.expectError(error.InvalidHeaderField, r);
+        } else {
+            _ = try r;
+        }
+    }
+}
+
+test "a failed key unwrap never decrypts under a predictable CEK (RFC 7516 §11.5 decoy)" {
+    // A128KW with an Encrypted Key that fails the RFC 3394 integrity check.
+    // The decoy CEK is a hash of the key and the Encrypted Key; without it
+    // the CEK would be whatever `cek_buf` held — 0xAA in the safe modes, so a
+    // token whose content was sealed under 0xAA… would have DECRYPTED.
+    const kek = [_]u8{0x77} ** 16;
+    const bad_ek = [_]u8{0x01} ** 24;
+    for ([_]u8{ 0xAA, 0x00 }) |fill| {
+        const token = try tokenWithCek(std.testing.allocator, "{\"alg\":\"A128KW\",\"enc\":\"A128GCM\"}", &bad_ek, @splat(fill), "predictable");
+        defer std.testing.allocator.free(token);
+        try std.testing.expectError(error.AuthenticationFailed, decryptCompact(std.testing.allocator, .{ .symmetric = &kek }, token, .{}));
+    }
+}
+
+test "content tags must be exactly the enc's length: one octet more is refused, not truncated" {
+    // RFC 7518 §5.2.2.2 / §5.3: the tag is T_LEN octets (16 for both here).
+    // With the length checks moved, the first 16 octets were compared and a
+    // token with a 17-octet tag decrypted.
+    const key = [_]u8{0x2b} ** 32;
+    for ([_]Enc{ .A128GCM, .@"A128CBC-HS256" }) |e| {
+        const k = key[0..e.cekLen().?];
+        const token = try encryptCompact(std.testing.allocator, .dir, e, .{ .symmetric = k }, "tag length", "", seededForTest(), .{});
+        defer std.testing.allocator.free(token);
+        const dot = std.mem.lastIndexOfScalar(u8, token, '.').?;
+        var tag_buf: [17]u8 = undefined;
+        try test_b64.Decoder.decode(tag_buf[0..16], token[dot + 1 ..]);
+        tag_buf[16] = 0;
+        var tb: [32]u8 = undefined;
+        const long = try std.mem.concat(std.testing.allocator, u8, &.{ token[0 .. dot + 1], test_b64.Encoder.encode(&tb, &tag_buf) });
+        defer std.testing.allocator.free(long);
+        if (decryptCompact(std.testing.allocator, .{ .symmetric = k }, long, .{})) |pt| {
+            std.testing.allocator.free(pt);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong length are InvalidKey" {
+    // A wrapped CEK must be exactly the enc's key length (RFC 7516 §5.2
+    // step 9 hands it to the enc as-is); GCMKW's iv is 96 bits and its tag
+    // 128 bits (RFC 7518 §4.7.1). Longer values were silently truncated
+    // with the checks moved, shorter RSA ones read past the buffer.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cek: [16]u8 = undefined;
+
+    var prng = std.Random.DefaultPrng.init(0x6a77_655f_6d75_7421);
+    const kp = try rsa.generate(prng.random(), 1024, 65537);
+    const rsa_parsed = try header.parse(a, "{\"alg\":\"RSA-OAEP\",\"enc\":\"A128GCM\"}");
+    const cek17 = [_]u8{0x5a} ** 17;
+    for ([_]usize{ 15, 17 }) |n| {
+        var ek_buf: [max_encrypted_key_len]u8 = undefined;
+        const ek = try alg.rsaOaepWrap(kp.public_key, .sha1, seededForTest(), cek17[0..n], &ek_buf);
+        try std.testing.expectError(error.InvalidKey, unwrapCek(rsa_parsed, .{ .rsa_private = kp.secret_key }, ek, &cek, 16, .{}));
+    }
+
+    const kek = [_]u8{0x77} ** 16;
+    const iv13 = [_]u8{0x31} ** 13;
+    var ct16: [16]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &([_]u8{0x5a} ** 16), &ct16, &tag);
+    var ivb: [32]u8 = undefined;
+    var tb: [32]u8 = undefined;
+    const tag17 = tag ++ [_]u8{0};
+    const long_iv = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, &iv13), test_b64.Encoder.encode(&tb, &tag) }));
+    try std.testing.expectError(error.InvalidKey, unwrapCek(long_iv, .{ .symmetric = &kek }, &ct16, &cek, 16, .{}));
+    const long_tag = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag17) }));
+    try std.testing.expectError(error.InvalidKey, unwrapCek(long_tag, .{ .symmetric = &kek }, &ct16, &cek, 16, .{}));
+
+    var ct8: [8]u8 = undefined;
+    _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &([_]u8{0x5a} ** 8), &ct8, &tag);
+    const short = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag) }));
+    try std.testing.expectError(error.InvalidKey, unwrapCek(short, .{ .symmetric = &kek }, &ct8, &cek, 16, .{}));
+}
+
+test "PBES2: p2c above max_p2c is WorkFactorTooHigh, p2s under 8 octets is InvalidKey (exact edges)" {
+    // RFC 7518 §4.8.1.1: the salt input is at least 8 octets. `max_p2c` is
+    // inclusive. Both edges moved by one unnoticed before.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cek: [16]u8 = undefined;
+    const password = "correct horse";
+    const p2s8 = "AQIDBAUGBwg"; // 8 octets
+    const p2s7 = "AQIDBAUGBw"; // 7 octets
+    const fmt = "{{\"alg\":\"PBES2-HS256+A128KW\",\"enc\":\"A128GCM\",\"p2s\":\"{s}\",\"p2c\":{d}}}";
+
+    var kek_buf: [32]u8 = undefined;
+    const salt8 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const kek = try alg.pbes2DeriveKek(.hs256_a128kw, password, &salt8, 10, &kek_buf);
+    var ek: [24]u8 = undefined;
+    _ = try aeskw.wrap(kek, &([_]u8{0x5a} ** 16), &ek);
+
+    const at_max = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 10 }));
+    try unwrapCek(at_max, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 });
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 16), &cek);
+    const over = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 11 }));
+    try std.testing.expectError(error.WorkFactorTooHigh, unwrapCek(over, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 }));
+    const short_salt = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s7, 10 }));
+    try std.testing.expectError(error.InvalidKey, unwrapCek(short_salt, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 }));
+}
+
+test "KAT: PBES2-HS256+A128KW against RFC 7517 Appendix C.4/C.5" {
+    // The only PBES2 vectors so far were round-trips, which agree with any
+    // salt construction: the RFC's `UTF8(alg) || 0x00 || p2s` separator could
+    // be changed with every test green. C.4 prints the derived KEK and C.5
+    // the Encrypted Key of C.3's CEK.
+    const p2s = [_]u8{ 217, 96, 147, 112, 150, 117, 70, 247, 127, 8, 155, 137, 174, 42, 80, 215 };
+    const want_kek = [_]u8{ 110, 171, 169, 92, 129, 92, 109, 117, 233, 242, 116, 233, 170, 14, 24, 75 };
+    const want_cek = [_]u8{ 111, 27, 25, 52, 66, 29, 20, 78, 92, 176, 56, 240, 65, 208, 82, 112, 161, 131, 36, 55, 202, 236, 185, 172, 129, 23, 153, 194, 195, 48, 253, 182 };
+    const ek = [_]u8{ 78, 186, 151, 59, 11, 141, 81, 240, 213, 245, 83, 211, 53, 188, 134, 188, 66, 125, 36, 200, 222, 124, 5, 103, 249, 52, 117, 184, 140, 81, 246, 158, 161, 177, 20, 33, 245, 57, 59, 4 };
+    const password = "Thus from my lips, by yours, my sin is purged.";
+
+    var kek_buf: [32]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &want_kek, try alg.pbes2DeriveKek(.hs256_a128kw, password, &p2s, 4096, &kek_buf));
+
+    // The same through the decrypt path, from C.2's protected header.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try header.parse(arena.allocator(), "{\"alg\":\"PBES2-HS256+A128KW\",\"p2s\":\"2WCTcJZ1Rvd_CJuJripQ1w\",\"p2c\":4096,\"enc\":\"A128CBC-HS256\",\"cty\":\"jwk+json\"}");
+    var cek: [32]u8 = undefined;
+    try unwrapCek(parsed, .{ .password = password }, &ek, &cek, 32, .{});
+    try std.testing.expectEqualSlices(u8, &want_cek, &cek);
 }

@@ -6,7 +6,7 @@
 
 **Scope:** core — go-jose v4.1.5 / panva jose (JWE compact) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation none
+**Audit:** review 2026-09-03 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -235,6 +235,40 @@ Design).
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 7516 App A full-token KAT (kat_rfc7516.zig) + RFC 7518 App B/C KATs
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure, 62
+tests, `setsid -w timeout -s KILL 20` per mutant): **35 mutants, 32 killed, 3 equivalent**.
+Points: token segmentation and the header limits, the up-front `alg`/`enc` refusals,
+`expect_alg`/`expect_enc`, the typed key-error passthrough and the §11.5 decoy CEK, the OAEP
+hash choice, every wrapped-CEK and GCMKW `iv`/`tag` length check, `max_p2c` and the `p2s`
+minimum, the ECDH-ES curve checks and both Concat KDF algorithm IDs and KEK sizes, `zip`/`crit`,
+the header member limit, the GCM and CBC-HMAC tag/ciphertext checks, `AL` and the MAC input,
+`dirCek`, the PBES2 salt separator, the ECDH public-key shape, and the Concat KDF counter,
+`keydatalen` and length prefixes.
+
+First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
+
+- **Defect — `dir` accepted a non-empty Encrypted Key.** RFC 7516 §5.2 step 10 requires it to be
+  empty for Direct Encryption and Direct Key Agreement; only the ECDH-ES branch checked. The
+  segment is outside the AAD, so a `dir` token with bytes spliced into it still decrypted — a
+  second, different token for the same message, the malleability the ECDH-ES test names. Now
+  `MalformedToken`, test added (verified red on the old code).
+- **Gaps closed (8 tests in `root.zig`):** `expect_alg`/`expect_enc` had no test at all (the
+  caller's algorithm pin); an unknown `alg`/`enc` and an empty header segment (the up-front
+  check is what keeps `unknown` from `unwrapCek`'s `unreachable`); the header and member
+  limits at max + 1; a failed unwrap must not decrypt under a predictable CEK (without the decoy
+  the CEK was `cek_buf`'s leftovers — 0xAA in the safe modes, and a token sealed under 0xAA
+  decrypted); a 17-octet content tag (GCM and CBC-HMAC compared the first 16); wrapped CEKs of
+  the wrong length (RSA: 15 read past the buffer, 17 truncated) and GCMKW `iv`/`tag` one octet
+  long; the `max_p2c` and `p2s ≥ 8` edges; and the first PBES2 KAT — RFC 7517 Appendix C.4/C.5
+  (derived KEK and Encrypted Key), without which the `alg || 0x00 || p2s` separator could be
+  anything.
+- **Equivalent (3):** the root-level epk-vs-key curve check (`deriveZ` refuses the same pair
+  with the same error); CBC-HMAC's empty-ciphertext refusal (an empty ciphertext can only carry
+  a valid tag if the key holder made it, and then fails unpadding as the same error); a missing
+  P-256 `y` read as `x` (off the curve, refused by the point decoder).
 
 ## Backlog / deferred
 
