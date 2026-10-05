@@ -377,6 +377,16 @@ test "PKCS#7 unpad rejects: pad length > block_len" {
     try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
 }
 
+// Mutation run 2026-10-05: the test above also fails the byte comparison
+// (only the last octet is 0x11), so the `n > block_len` check itself was
+// unpinned — relaxed to `n > 17`, a whole block of 0x11 unpadded to
+// `len - 16`. RFC 5652 §6.3: the pad length is 1..block_len.
+test "PKCS#7 unpad rejects: a whole block of 0x11 (pad 17, every byte consistent)" {
+    const buf = [_]u8{0x41} ** block_len ++ [_]u8{0x11} ** block_len;
+    try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
+    try testing.expectError(error.InvalidPadding, unpadXmlEnc(&buf));
+}
+
 test "PKCS#7 unpad rejects: inconsistent pad bytes" {
     var buf = [_]u8{0x41} ** block_len;
     buf[block_len - 1] = 0x04; // claims last 4 bytes == 0x04

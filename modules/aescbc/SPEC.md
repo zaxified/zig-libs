@@ -6,7 +6,7 @@
 
 **Scope:** core — RustCrypto `cbc` 0.2.1 / Go `crypto/cipher` CBC (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -204,6 +204,16 @@ round-trip suite for `xmlenc`) now run through this module.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** NIST SP800-38A Appendix F.2.5 byte-exact vector in kat_vectors.zig
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **17 mutants, all killed after one test**. Points: both modes' alignment and buffer
+checks and chaining value, `paddedLenPkcs7`, `padPkcs7`'s buffer, and every `unpadPkcs7` /
+`unpadXmlEnc` rule (empty, unaligned, pad 0, pad > 16, which bytes are compared and against
+what). No defect. Gap closed: the "pad length > block_len" test set only the last octet to 0x11,
+so the byte comparison refused it too and `n > block_len` was unpinned (`n > 17` survived) — a
+whole block of 0x11 is now refused by both unpadders.
 
 ## Backlog / deferred
 
