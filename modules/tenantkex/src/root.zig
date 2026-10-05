@@ -155,7 +155,13 @@ pub const WriteError = HS.WriteError || error{ WrongState, HandshakeNotComplete,
 /// guarding msg1 instead of msg2: IK's msg1 must NOT complete the pattern
 /// (`Split()` must not have fired yet), also true only because of IK's
 /// current token layout, not enforced by this module's own state machine.
-pub const ReadError = HS.ReadError || error{ WrongState, HandshakeNotComplete, UnexpectedHandshakeCompletion };
+///
+/// `UnknownInitiator`: msg1 authenticated, but under an initiator static key
+/// other than the one the responder was provisioned with (see
+/// `Responder.init`). IK lets ANY holder of the responder's public key build a
+/// valid msg1 with a static key of its own choosing; refusing every key but
+/// the provisioned one is what authenticates the initiator at all.
+pub const ReadError = HS.ReadError || error{ WrongState, HandshakeNotComplete, UnexpectedHandshakeCompletion, UnknownInitiator };
 
 /// Wire length of msg1 for a cleartext payload of `payload_len` bytes:
 /// e(32) + encrypted-s(32+16) + payload(+16).
@@ -279,20 +285,32 @@ pub const Initiator = struct {
 /// then `writeMessage2`.
 pub const Responder = struct {
     hs: HS,
+    /// The initiator static public key this responder accepts — the
+    /// provisioned key of `ctx.initiator_pe`.
+    expected_initiator: PublicKey,
     state: State = .start,
 
-    const State = enum { start, awaiting_write2, done };
+    const State = enum { start, awaiting_write2, done, failed };
 
     /// Start an IK handshake as the responder. `static_kp` is this PE's static
-    /// keypair (the initiator already knows its public half). `ctx` MUST match
-    /// the initiator's fabric context or msg1 fails to authenticate.
-    pub fn init(static_kp: KeyPair, ctx: FabricContext) Responder {
-        return initEphemeral(static_kp, ctx, null);
+    /// keypair (the initiator already knows its public half);
+    /// `initiator_static` is the provisioned static public key of the PE named
+    /// `ctx.initiator_pe` — the only initiator key `readMessage1` accepts. `ctx`
+    /// MUST match the initiator's fabric context or msg1 fails to authenticate.
+    ///
+    /// ⛔ Until 2026-10-05 the responder took no initiator key and accepted any:
+    /// IK's msg1 carries the initiator's static key, and anyone who knows the
+    /// responder's public key can build a valid msg1 around a key of their own
+    /// (the I-SID and PE ids in the prologue are not secrets). WireGuard, this
+    /// module's model, looks the received key up among its configured peers;
+    /// with one provisioned peer per PE pair, that is this single key.
+    pub fn init(static_kp: KeyPair, initiator_static: PublicKey, ctx: FabricContext) Responder {
+        return initEphemeral(static_kp, initiator_static, ctx, null);
     }
 
     /// As `init`, with an explicit ephemeral keypair (KAT/testing hook).
-    pub fn initEphemeral(static_kp: KeyPair, ctx: FabricContext, ephemeral: ?KeyPair) Responder {
-        var self: Responder = .{ .hs = .{} };
+    pub fn initEphemeral(static_kp: KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?KeyPair) Responder {
+        var self: Responder = .{ .hs = .{}, .expected_initiator = initiator_static };
         var pbuf: [FabricContext.prologue_len]u8 = undefined;
         ctx.writePrologue(&pbuf);
         self.hs.initialize(
@@ -317,11 +335,21 @@ pub const Responder = struct {
     /// Consume msg1, decrypting any initiator payload into `payload_out` and
     /// capturing the initiator's static + ephemeral keys. Returns the payload
     /// length. A tampered msg1 or a mismatched prologue (wrong tenant) fails
-    /// with a typed error and yields no session.
+    /// with a typed error and yields no session; so does a msg1 under any
+    /// initiator static key but `init`'s `initiator_static`
+    /// (`UnknownInitiator`) — its payload is zeroed, the handshake state wiped,
+    /// and the responder can no longer be driven.
     pub fn readMessage1(self: *Responder, message: []const u8, payload_out: []u8) ReadError!usize {
         if (self.state != .start) return error.WrongState;
         const step = try self.hs.readMessage(message, payload_out);
         if (step.transport != null) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
+        const got = self.hs.rs orelse unreachable; // IK's msg1 always carries `s`
+        if (!std.crypto.timing_safe.eql(PublicKey, got, self.expected_initiator)) {
+            std.crypto.secureZero(u8, payload_out[0..step.len]);
+            wipeHandshake(&self.hs);
+            self.state = .failed;
+            return error.UnknownInitiator;
+        }
         self.state = .awaiting_write2;
         return step.len;
     }
@@ -372,7 +400,7 @@ fn runHandshake(ctx_i: FabricContext, ctx_r: FabricContext) !struct { i: Session
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
     var ini = Initiator.init(is, rs.public_key, ctx_i);
-    var rsp = Responder.init(rs, ctx_r);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, ctx_r);
 
     var prng_i = testRandom(0x1111);
     var prng_r = testRandom(0x2222);
@@ -432,6 +460,27 @@ test "composition: keys open in the right orientation via a direct ChaCha20-Poly
     }
 }
 
+test "an initiator static key other than the provisioned one is UnknownInitiator, payload zeroed, no session" {
+    // Review finding 2026-10-05: the responder took no initiator key at all.
+    // IK's msg1 is built by whoever knows the responder's PUBLIC key, around a
+    // static key of their own; the I-SID and PE ids are not secrets either.
+    // Verified before the fix: this exact exchange completed with matching
+    // session keys on both sides.
+    const rs = kp(resp_static_priv);
+    const attacker = kp([_]u8{0x77} ** 32); // provisioned nowhere
+    var ini = Initiator.init(attacker, rs.public_key, demo_ctx);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    var prng = testRandom(0x7777);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl = [_]u8{0} ** 64;
+    const n1 = try ini.writeMessage1(prng.random(), "sneaky", m1[0..message1Len(6)]);
+    try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &pl); // the unauthorised payload is gone
+    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", m2[0..message2Len(0)]));
+    try testing.expectError(error.WrongState, rsp.readMessage1(m1[0..n1], &pl));
+}
+
 test "I-SID binding: different tenant I-SIDs make the handshake FAIL (tenant isolation)" {
     const a = FabricContext{ .isid = 100, .initiator_pe = 1, .responder_pe = 2 };
     const b = FabricContext{ .isid = 200, .initiator_pe = 1, .responder_pe = 2 };
@@ -439,7 +488,7 @@ test "I-SID binding: different tenant I-SIDs make the handshake FAIL (tenant iso
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
     var ini = Initiator.init(is, rs.public_key, a);
-    var rsp = Responder.init(rs, b); // responder thinks it's a DIFFERENT tenant
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, b); // responder thinks it's a DIFFERENT tenant
 
     var prng = testRandom(0x3333);
     var m1: [256]u8 = undefined;
@@ -456,7 +505,7 @@ test "I-SID binding: matching PE ids too — mismatched PE id also fails" {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
     var ini = Initiator.init(is, rs.public_key, a);
-    var rsp = Responder.init(rs, b);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, b);
     var prng = testRandom(0x4444);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -497,7 +546,7 @@ test "auth failure: tampered msg1 byte -> typed error, no keys" {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
     var ini = Initiator.init(is, rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, demo_ctx);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x5555);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -512,7 +561,7 @@ test "auth failure: wrong responder static key -> handshake fails" {
     // Initiator expects a DIFFERENT responder static key than the responder holds.
     const wrong_pub = kp(init_static_priv).public_key;
     var ini = Initiator.init(is, wrong_pub, demo_ctx);
-    var rsp = Responder.init(rs, demo_ctx);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x6666);
     var m1: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -551,7 +600,7 @@ test "KAT (noise as oracle): tenantkex == raw Noise_IK over the bound prologue, 
 
     // --- tenantkex with the same injected ephemerals ---
     var ini = Initiator.initEphemeral(is, rs.public_key, demo_ctx, ie);
-    var rsp = Responder.initEphemeral(rs, demo_ctx, re);
+    var rsp = Responder.initEphemeral(rs, is.public_key, demo_ctx, re);
     var m1: [256]u8 = undefined;
     var m2: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -594,7 +643,7 @@ test "F1: transcript_hash differs between two tenants that otherwise complete id
     const Run = struct {
         fn go(is_: KeyPair, rs_: KeyPair, ctx: FabricContext, seed: u64) !SessionKeys {
             var ini = Initiator.init(is_, rs_.public_key, ctx);
-            var rsp = Responder.init(rs_, ctx);
+            var rsp = Responder.init(rs_, is_.public_key, ctx);
             var prng = testRandom(seed);
             var m1: [256]u8 = undefined;
             var m2: [256]u8 = undefined;
@@ -616,7 +665,7 @@ test "state machine: out-of-order calls are rejected with WrongState" {
     const is = kp(init_static_priv);
     const rs = kp(resp_static_priv);
     var ini = Initiator.init(is, rs.public_key, demo_ctx);
-    var rsp = Responder.init(rs, demo_ctx);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x7777);
     var buf: [256]u8 = undefined;
     var pl: [64]u8 = undefined;
@@ -674,7 +723,7 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
     const r_kp = kp(resp_static_priv);
 
     var ini = Initiator.init(i_kp, r_kp.public_key, demo_ctx);
-    var res = Responder.init(r_kp, demo_ctx);
+    var res = Responder.init(r_kp, i_kp.public_key, demo_ctx);
 
     // Drive a full handshake, so both sides hold live material when wiped —
     // this is the state a real caller finishes in.
@@ -766,7 +815,7 @@ fn genuineMessage2(out: []u8) []const u8 {
     var m1: [wire_buf_len]u8 = undefined;
     const n1 = ini.writeMessage1(prng_i.random(), "", m1[0..msg1_len]) catch unreachable;
 
-    var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+    var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
     var payload: [wire_buf_len]u8 = undefined;
     _ = rsp.readMessage1(m1[0..n1], &payload) catch unreachable;
 
@@ -815,7 +864,7 @@ fn fuzzReadMessage1(_: void, smith: *std.testing.Smith) !void {
     // before; 8 and 1 after.
     const len: usize = smith.slice(&msg);
 
-    var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+    var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
     var payload_out: [wire_buf_len]u8 = undefined;
     // Arbitrary bytes must only ever yield a typed error (short message /
     // bad auth tag) or a successful decode, never a panic or OOB write.
@@ -864,7 +913,7 @@ test "corpus: both handshake targets read their seeds, and what each accepts is 
         var msg: [wire_buf_len]u8 = undefined;
         const len: usize = smith.slice(&msg);
         if (len != 0) nonempty1 += 1;
-        var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+        var rsp = Responder.init(kp(resp_static_priv), kp(init_static_priv).public_key, demo_ctx);
         var payload_out: [wire_buf_len]u8 = undefined;
         if (rsp.readMessage1(msg[0..len], &payload_out)) |_| accepted1 += 1 else |_| {}
     }
@@ -893,4 +942,31 @@ test "corpus: both handshake targets read their seeds, and what each accepts is 
     // the empty message for ever: 0 non-empty, 0 accepted.
     try testing.expectEqual(@as(usize, 1), accepted1);
     try testing.expectEqual(@as(usize, 1), accepted2);
+}
+
+// Mutation run 2026-10-05: the wipe test above runs after a COMPLETED
+// handshake, where `noise`'s split() has already zeroed the chaining key and
+// the ephemeral is spent — so dropping either wipe left it green. A
+// handshake abandoned half-way (and the UnknownInitiator refusal) still holds
+// both; wipe must clear them there.
+test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
+    const rs = kp(resp_static_priv);
+    var ini = Initiator.init(kp(init_static_priv), rs.public_key, demo_ctx);
+    var prng = testRandom(0x8888);
+    var m1: [256]u8 = undefined;
+    _ = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
+    try testing.expect(!std.mem.allEqual(u8, &ini.hs.e.?.secret_key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &ini.hs.symmetric_state.ck, 0));
+    ini.wipe();
+    try testing.expect(std.mem.allEqual(u8, &ini.hs.e.?.secret_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &ini.hs.symmetric_state.ck, 0));
+
+    // The refusal path wipes too: the responder's chaining key after msg1.
+    var ini2 = Initiator.init(kp([_]u8{0x77} ** 32), rs.public_key, demo_ctx);
+    var rsp = Responder.init(rs, kp(init_static_priv).public_key, demo_ctx);
+    const n1 = try ini2.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
+    var pl: [8]u8 = undefined;
+    try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
+    try testing.expect(std.mem.allEqual(u8, &rsp.hs.symmetric_state.ck, 0));
+    try testing.expect(std.mem.allEqual(u8, &rsp.hs.s.?.secret_key, 0));
 }

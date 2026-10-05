@@ -88,7 +88,8 @@ const n1 = try ini.writeMessage1(rng, "", &m1);      // send m1[0..n1]
 const fin = try ini.readMessage2(m2, &payload_buf);  // fin.keys = SessionKeys
 
 // Responder side:
-var rsp = tk.Responder.init(my_static_kp, ctx);
+// ... knows the initiator PE's provisioned static public key, and accepts no other:
+var rsp = tk.Responder.init(my_static_kp, initiator_static_pub, ctx);
 _ = try rsp.readMessage1(m1, &payload_buf);
 var m2: [tk.message2Len(0)]u8 = undefined;
 const rfin = try rsp.writeMessage2(rng, "", &m2);    // send m2, rfin.keys = SessionKeys

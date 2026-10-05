@@ -26,7 +26,7 @@ pub fn main() !void {
 
     var initiator = tenantkex.Initiator.init(pe1_static, pe2_static.public_key, ctx);
     defer initiator.wipe();
-    var responder = tenantkex.Responder.init(pe2_static, ctx);
+    var responder = tenantkex.Responder.init(pe2_static, pe1_static.public_key, ctx);
     defer responder.wipe();
 
     var rng_i = std.Random.DefaultPrng.init(0xC0FFEE);
@@ -61,7 +61,7 @@ pub fn main() !void {
     const wrong_ctx: tenantkex.FabricContext = .{ .isid = 0x00_99_99, .initiator_pe = 1, .responder_pe = 2 };
     var stray_initiator = tenantkex.Initiator.init(pe1_static, pe2_static.public_key, ctx);
     defer stray_initiator.wipe();
-    var mismatched_responder = tenantkex.Responder.init(pe2_static, wrong_ctx);
+    var mismatched_responder = tenantkex.Responder.init(pe2_static, pe1_static.public_key, wrong_ctx);
     defer mismatched_responder.wipe();
 
     var rng2 = std.Random.DefaultPrng.init(0xABCDEF01);

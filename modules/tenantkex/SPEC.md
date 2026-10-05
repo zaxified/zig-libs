@@ -6,7 +6,7 @@
 
 **Scope:** core — snow / WireGuard `Noise_IK` (no reference for a per-tenant prologue-bound IK driver) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -117,10 +117,19 @@ available.
 ## 5. Security model (given the WG tunnel underneath)
 
 * **Mutual authentication.** IK authenticates the responder to the initiator
-  (the initiator encrypts to a static key only the real responder holds) and the
-  initiator to the responder (the responder learns and DH-mixes the initiator's
-  static in `msg1`). A party holding the wrong counterpart static key cannot
-  complete the handshake (`error.DecryptionFailed`) — see the wrong-key test.
+  (the initiator encrypts to a static key only the real responder holds). It
+  does NOT by itself authenticate the initiator: msg1 carries the initiator's
+  static key, and anyone who knows the responder's public key can build a valid
+  msg1 around a key of their own (the I-SID and PE ids in the prologue are not
+  secrets). The responder authenticates the initiator by accepting exactly one
+  key — `Responder.init`'s `initiator_static`, the provisioned key of
+  `ctx.initiator_pe` (WireGuard looks the received key up among its configured
+  peers the same way) — and refuses any other with `error.UnknownInitiator`,
+  zeroing the payload and wiping the handshake. A party holding the wrong
+  responder static key fails with `error.DecryptionFailed`.
+  ⛔ Until 2026-10-05 this paragraph claimed the initiator side too, and the
+  responder took no initiator key and accepted any (verified: an unprovisioned
+  key completed the handshake with matching session keys).
 * **Tenant isolation.** The prologue binding (§3) makes each completed session
   provably scoped to one `(I-SID, PE-pair)`. This is the whole point: many
   tenants share one WG tunnel, and this layer keeps them cryptographically
@@ -173,6 +182,21 @@ different prologue, so their bytes do not apply to tenantkex's transcript.)
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
   transport (the WG-backed channel), not this module.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant), run after the initiator-key fix below: **18 mutants, all killed after one more test**.
+Points: the prologue's three fields, `SessionKeys.wipe`, both message-length helpers, the
+split→key mapping, every `wipeHandshake` step, every state guard, and the new initiator-key
+check, payload wipe and failed state (the mutant removing the check is killed by the regression
+test). Gap closed: the wipe test ran after a completed handshake, where `noise` has already
+zeroed the chaining key and spent the ephemeral, so dropping either wipe stayed green — now
+also checked mid-handshake and after an `UnknownInitiator` refusal.
+
+**Review finding while reading for the run (fixed, breaking):** the responder authenticated no
+initiator — see § 5 "Mutual authentication". `Responder.init`/`initEphemeral` take the
+provisioned `initiator_static` key; `readMessage1` refuses any other.
 
 ## Backlog / deferred
 

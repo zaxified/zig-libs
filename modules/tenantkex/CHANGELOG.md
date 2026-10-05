@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **BREAKING (security fix):** `Responder.init(static_kp, initiator_static, ctx)`
+  and `Responder.initEphemeral(static_kp, initiator_static, ctx, ephemeral)` take the initiator
+  PE's provisioned static public key, and `readMessage1` refuses msg1 under any other with the
+  new `error.UnknownInitiator` (payload zeroed, handshake wiped, responder unusable). Before,
+  the responder accepted ANY initiator static key — anyone who knew the responder's public key
+  could complete a tenant session for any I-SID and PE pair (the prologue's ids are not
+  secrets); SPEC § 5 wrongly claimed IK authenticated the initiator by itself. Migration: pass
+  the key you provisioned for `ctx.initiator_pe`. Tests: first dated mutation run (18/18 after
+  one more test, `SPEC.md` § "Mutation run 2026-10-05").
+
 - **2026-09-07** — **Test-only: both handshake fuzz harnesses handed their
   reader the EMPTY message on every run.** `fuzzReadMessage1` and
   `fuzzReadMessage2` opened with `smith.bytes(&msg)` and then drew
