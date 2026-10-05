@@ -6,7 +6,7 @@
 
 **Scope:** mvp — asonnino/coconut, public-attribute issuance only (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -195,6 +195,30 @@ verify with the `h ≠ 1` guard).
   reproduced tampered κ/ν/σ₁'/σ₂'/response/hidden-response, σ₁'=identity, wrong
   vk, disclosure-count mismatch, and a same-cardinality mask-shuffle (all reject),
   and confirmed `Aw`/`Bw` are directly load-bearing in the transcript (§1a).
+- **Mutation run 2026-10-05** (in-place, ReleaseSafe, 36 mutants over the
+  decoders, `psVerifyPlain`, `signPartial`, `aggregateCredential`,
+  `ShowProof.fromBytes`, `proveCredential`'s `r'` redraw, `verifyCredential`'s
+  guards and the challenge transcript, `lagrange`, `keys` and `params`): 30
+  killed. The first pass left 23 — the owner-verify reproductions above were
+  never committed as tests, so σ₁' = 1 and the mask shuffle were unpinned.
+  Tests were added for: the σ₁' = σ₂' = ν = 1 show proof over any κ (a
+  universal forgery without the identity check); a ν with an order-3
+  component, which passes the NIZK whenever `c ≡ 0 (mod 3)` and the pairing
+  outright; `s` with an order-3 component in `psVerifyPlain`; a proof whose
+  own mask differs from the verifier's; extra disclosed values; a zero first
+  draw of `r'`; every `ShowProof.fromBytes` refusal and κ outside `G2`;
+  `signPartial`'s identity base and short attribute vector;
+  `aggregateCredential`'s `t = 0` and bases differing only in `y`; a zero
+  among the other Lagrange nodes; verification-key shares of different
+  widths. Equivalent: κ outside `G2` in `verifyCredential` (the pairing is not
+  blind to `G2` cofactor torsion, so such a κ fails the equation — a feasible
+  forgery would need a `GT` discrete log); dropping `vk.alpha` from the
+  transcript (it enters through `Aw' = … + [c](A − κ)`, so another `α`
+  changes the recomputed challenge); dropping `σ₂'` (fixed by the pairing
+  given the hashed `σ₁'`, `κ`, `ν`); dropping either the mask or the
+  disclosed indexes (each is a function of the other); and `commonBase`
+  hashing under `gen_dst` (no foreign vector covers `commonBase`, and the two
+  uses hash 8-byte tags vs 48-byte points, so their inputs never coincide).
 
 ## 6. Deferred increments (out of Phase-1 scope)
 

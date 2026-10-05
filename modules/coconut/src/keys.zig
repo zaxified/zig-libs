@@ -414,6 +414,18 @@ fn commitFr(v: u32) Fr {
     return Fr.fromBytes(buf) catch unreachable;
 }
 
+test "aggregateVerificationKeys: refuses shares with different attribute counts" {
+    // Mutation run 2026-10-05: removing the check survived.
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xBEF0);
+    var two = try keygenSeededForTest(allocator, prng.random(), 2, 2, 3);
+    defer two.deinit(allocator);
+    var three = try keygenSeededForTest(allocator, prng.random(), 3, 2, 3);
+    defer three.deinit(allocator);
+    const subset = [_]VerificationKeyShare{ two.vk_shares[0], three.vk_shares[1] };
+    try std.testing.expectError(error.MismatchedAttributes, aggregateVerificationKeys(allocator, &subset));
+}
+
 test "keygen: rejects invalid thresholds" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(1);
