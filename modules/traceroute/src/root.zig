@@ -289,6 +289,10 @@ pub const Options = struct {
     iface: ?[]const u8 = null,
     /// Source address to send from.
     source: ?netaddr.Ip = null,
+    /// UDP method: send from this source port (traceroute(8)'s `--sport`,
+    /// e.g. for a firewall pinhole) instead of a kernel-chosen ephemeral
+    /// one. It is still the correlation token (`LinuxTransport.ident`).
+    source_port: ?u16 = null,
     /// IP TOS / IPv6 traffic class of the probes.
     tos: ?u8 = null,
     /// Routing mark (SO_MARK, policy routing); needs CAP_NET_ADMIN.
@@ -589,9 +593,11 @@ pub fn traceWith(
                 }
             }
 
-            // A terminal error stops the hop early; a destination reply
-            // still gets the hop's full probe count (per-hop RTT stats).
-            if (unreachable_code != null) break;
+            // A terminal hop gets its full probe count, like the
+            // destination's: traceroute(8) prints `!X` for each probe. It
+            // used to stop after the first error and leave the rest of the
+            // hop `.timeout` -- a `*`, i.e. a loss in `Hop.stats`, for probes
+            // that were never sent (kernel oracle 2026-10-05).
         }
 
         if (reached or unreachable_code != null) break :outer;
@@ -855,13 +861,17 @@ pub const LinuxTransport = struct {
             if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.MARK, @ptrCast(&mark), @sizeOf(u32))) != .SUCCESS)
                 return error.UdpSocketFailed;
         }
-        // Bind (to the source address, or any) with port 0: the kernel picks
-        // an ephemeral source port, which becomes the correlation token.
+        // Bind (to the source address, or any) with `source_port`, or port 0:
+        // the kernel picks an ephemeral one. Either way the bound port is the
+        // correlation token.
         const any: SockAddr = if (family == .v4)
             .{ .v4 = .{ .port = 0, .addr = 0 } }
         else
             .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 } };
-        const sa = src orelse any;
+        var sa = src orelse any;
+        if (opts.source_port) |port| switch (sa) {
+            inline else => |*v| v.port = std.mem.nativeToBig(u16, port),
+        };
         const brc = switch (sa) {
             .v4 => |*v| linux.bind(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in)),
             .v6 => |*v| linux.bind(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in6)),
@@ -1371,13 +1381,16 @@ test "destination unreachable terminates and records the code" {
     try testing.expect(!tr.reached);
     try testing.expectEqual(@as(?u8, 13), tr.unreachable_code);
     try testing.expectEqual(@as(usize, 2), tr.hops.len);
-    const p = tr.hops[1].probes[0];
-    try testing.expectEqual(Probe.Kind.dest_unreachable, p.kind);
-    try testing.expectEqual(@as(?u8, 13), p.code);
-    try testing.expect(p.address.?.eql(router_b));
-    // The error stops the hop: probes 2 and 3 were never sent.
-    try testing.expectEqual(@as(usize, 4), f.sent.items.len);
-    try testing.expectEqual(Probe.Kind.timeout, tr.hops[1].probes[1].kind);
+    // Every probe of the terminal hop is sent and answered, as traceroute(8)
+    // prints `!X !X !X`; none is a `*` that was never asked.
+    try testing.expectEqual(@as(usize, 6), f.sent.items.len);
+    for (tr.hops[1].probes) |p| {
+        try testing.expectEqual(Probe.Kind.dest_unreachable, p.kind);
+        try testing.expectEqual(@as(?u8, 13), p.code);
+        try testing.expect(p.address.?.eql(router_b));
+    }
+    const st = tr.hops[1].stats();
+    try testing.expectEqual(st.sent, st.received);
 }
 
 test "a silent hop times out as * and the trace continues" {
@@ -2467,6 +2480,13 @@ test "live: iface/source/tos land on the sockets themselves (skipped without CAP
         // UDP: the token is the bound source port, not the ICMP ident.
         if (method == .udp) try testing.expectEqual(lt.udp_port, lt.ident());
     }
+    // `source_port` binds the UDP socket to it, and it is the token.
+    var lt = LinuxTransport.openWith(dest, .{ .method = .udp, .source_port = 43211 }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer lt.close();
+    try testing.expectEqual(@as(u16, 43211), lt.ident());
 }
 
 fn bringLoopbackUp() void {
@@ -2689,4 +2709,9 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
         };
     }
     try testing.expect(resolved > 0);
+}
+
+// See kernel_oracle_test.zig / tools/interop.zig / tools/kernel_oracle.py.
+test {
+    _ = @import("kernel_oracle_test.zig");
 }

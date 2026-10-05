@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: real routers judge `trace`, and `traceWith` replays their packets**
+  (`tools/kernel_oracle.py`, `tools/interop.zig`, `src/kernel_oracle_test.zig`): 16 live traces through a client ->
+  r1 -> r2 -> r3 -> server chain of network namespaces (`unshare -rmn`) -- clean, a router dropping its Time
+  Exceeded, a router rejecting with Administratively Prohibited, a server dropping everything -- ICMP and UDP, v4
+  and v6. Every hop is what the topology puts at that TTL, and traceroute(8) traced the same. The transport is
+  recorded on a virtual clock and replayed offline. Anchor grade MIXED → EXTERNAL.
+  - **DEFECT fixed, BEHAVIOURAL:** a Destination Unreachable stopped its hop after the first probe and left the
+    rest `.timeout` -- a `*` (and a loss in `Hop.stats`) for probes never sent, where traceroute(8) prints `!X`
+    for each. The terminal hop now gets its full probe count, like the destination's hop.
+  - **New (Additive):** `Options.source_port` -- the UDP method's source port (traceroute(8)'s `--sport`), instead
+    of a kernel-chosen ephemeral one; still the correlation token.
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 items: UDP method, MPLS/ICMP extensions,
   source/interface/TOS). ADDED `Options.method` (`.icmp` default, `.udp` = traceroute(8)'s
   classic UDP-to-33434+ probes, matched on the quoted source port + destination port + quoted

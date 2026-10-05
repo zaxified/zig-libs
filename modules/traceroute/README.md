@@ -43,7 +43,8 @@ destination answers Port Unreachable — the method that still works where ICMP
 echo is filtered). Routers that quote an RFC 4950 MPLS label stack in an RFC
 4884 extension get it on the hop (`Probe.mpls`, what `traceroute -e` shows).
 On a multi-homed host, `Options.iface` / `.source` / `.tos` / `.fwmark` pick
-the egress for the live `trace`.
+the egress for the live `trace`; `.source_port` fixes the UDP method's source
+port (traceroute(8)'s `--sport`).
 
 ```zig
 const traceroute = @import("traceroute");
@@ -78,4 +79,7 @@ Provenance: original work of the zig-libs authors (MIT); clean-room from the
 classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-stepping, a public
 technique) and RFC 792 ICMP message formats via the sibling `icmp` codec. No
 traceroute, mtr or other third-party source consulted or copied — behavior
-only.
+only. DATA: `src/kernel_oracle_vectors.zig` holds what real Linux routers
+(namespace chains built by our tooling, `tools/kernel_oracle.py`) sent back to
+this module's own probes; traceroute(8) was run on the same paths as a black
+box — observed behaviour, exempt per root `NOTICE` §0.
