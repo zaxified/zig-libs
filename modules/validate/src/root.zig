@@ -120,7 +120,8 @@ pub const Pattern = union(enum) {
     prefix: []const u8,
     /// Must end with.
     suffix: []const u8,
-    /// Every byte must be in this set (e.g. "0123456789abcdef-").
+    /// Every character (code point) must be in this set (e.g.
+    /// "0123456789abcdef-"); a string that is not UTF-8 matches no set.
     charset: []const u8,
     /// The caller's matcher, typically a regex from a library of their
     /// choosing. `source` is carried for the exported JSON Schema
@@ -702,6 +703,7 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
         try appendTypeError(b, path, rule.kind);
         return;
     }
+    if (rule.kind == .any and v != .string) try checkNotAString(b, path, rule);
 
     // ⛔ `.any` constrains the VALUE, not nothing. It is the DEFAULT `kind`,
     // and it used to skip every constraint on the rule -- so a rule that
@@ -789,8 +791,16 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
     }
 }
 
-/// JSON-Schema type semantics: `1.0` is a valid integer; a huge number that
-/// std.json kept as `number_string` counts as int only when it parses as one.
+/// JSON-Schema type semantics: `1.0` is a valid integer, and so is an integer
+/// literal too large for an i64 (std.json keeps it as `number_string`), as
+/// `1.5e300` -- a float with no fraction -- always was. A non-finite float is
+/// a `number_string` too, and is no integer.
+///
+/// ⛔ The literal used to count as an int only when it parsed as an i64, so
+/// `100000000000000000000000` was `int_type` while the same number spelled
+/// `1e23` passed; JSON Schema says integer for both (python-jsonschema and
+/// ajv, `schema_oracle_test.zig`, 2026-10-05). Bounds still compare as f64;
+/// a typed `parseInto` bounds every integer field by its bit width.
 fn typeGate(v: Value, kind: Kind) bool {
     return switch (kind) {
         .any => true,
@@ -799,10 +809,7 @@ fn typeGate(v: Value, kind: Kind) bool {
         .int => switch (v) {
             .integer => true,
             .float => |f| std.math.isFinite(f) and @floor(f) == f,
-            .number_string => |s| blk: {
-                _ = std.fmt.parseInt(i64, s, 10) catch break :blk false;
-                break :blk true;
-            },
+            .number_string => |s| std.json.Scanner.isNumberFormattedLikeAnInteger(s),
             else => false,
         },
         .float => v == .integer or v == .float or v == .number_string,
@@ -838,11 +845,55 @@ fn numValue(v: Value) ?f64 {
     };
 }
 
+/// True when `rule` holds a value that is not a string to anything: `one_of`
+/// and a `literal` pattern name the only values allowed, and no number,
+/// boolean, null, array or object is one of them. Every other string
+/// constraint is about a string's text and has nothing to say to another type.
+fn constrainsNonStrings(rule: *const Rule) bool {
+    if (rule.one_of != null) return true;
+    const p = rule.pattern orelse return false;
+    return p == .literal;
+}
+
+/// `.any` met a value that is not a string: `one_of` and a `literal` pattern
+/// refuse it, as the exported `enum`/`const` does for every JSON type.
+///
+/// ⛔ They used to be checked on strings only, so `.{ .kind = .any, .one_of
+/// = &.{"red", "green"} }` accepted `5`, `true`, `null`, `[]` and `{}` --
+/// the `.any` fail-open of the 2026-09-02 audit, left on two constraints --
+/// while the schema the module exports for the same rule refused them all
+/// (python-jsonschema and ajv, `schema_oracle_test.zig`, 2026-10-05).
+fn checkNotAString(b: *Builder, path: []const u8, rule: *const Rule) Allocator.Error!void {
+    if (rule.one_of) |allowed| {
+        const joined = try std.mem.join(b.a(), ", ", allowed);
+        try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
+    }
+    if (rule.pattern) |p| if (p == .literal)
+        try b.appendf(path, "string_pattern_mismatch", "String should be \"{s}\"", .{p.literal});
+}
+
 fn containsString(list: []const []const u8, s: []const u8) bool {
     for (list) |candidate| {
         if (std.mem.eql(u8, candidate, s)) return true;
     }
     return false;
+}
+
+/// Every code point of `s` occurs in `set`. A whole UTF-8 sequence found in a
+/// UTF-8 `set` is found at a code point boundary (no sequence starts inside
+/// another), so a substring search per code point is the membership test.
+///
+/// ⛔ It used to test BYTES: with the set `¢ü` (C2 A2 C3 BC) the string `â`
+/// (C3 A2) passed, every byte being in the set, while the exported
+/// `^[¢ü]*$` refuses it (python-jsonschema and ajv, schema_oracle_test.zig,
+/// 2026-10-05). ASCII sets answer as before.
+fn inCharset(s: []const u8, set: []const u8) bool {
+    const view = std.unicode.Utf8View.init(s) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |cp| {
+        if (std.mem.indexOf(u8, set, cp) == null) return false;
+    }
+    return true;
 }
 
 fn checkPattern(b: *Builder, path: []const u8, s: []const u8, p: Pattern) Allocator.Error!void {
@@ -853,12 +904,8 @@ fn checkPattern(b: *Builder, path: []const u8, s: []const u8, p: Pattern) Alloca
             try b.appendf(path, "string_pattern_mismatch", "String should start with \"{s}\"", .{pre}),
         .suffix => |suf| if (!std.mem.endsWith(u8, s, suf))
             try b.appendf(path, "string_pattern_mismatch", "String should end with \"{s}\"", .{suf}),
-        .charset => |set| for (s) |ch| {
-            if (std.mem.indexOfScalar(u8, set, ch) == null) {
-                try b.append(path, "string_pattern_mismatch", "String contains characters outside the allowed set");
-                break;
-            }
-        },
+        .charset => |set| if (!inCharset(s, set))
+            try b.append(path, "string_pattern_mismatch", "String contains characters outside the allowed set"),
         // pydantic's wording for its own regex `pattern`.
         .matcher => |m| if (!m.matchFn(m.ctx, s))
             try b.appendf(path, "string_pattern_mismatch", "String should match pattern '{s}'", .{m.source}),
@@ -1345,9 +1392,11 @@ fn decodeComponent(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
 /// - field with a default value → not required (matches std.json, which fills
 ///   defaults and errors on other missing fields);
 /// - `?U` → `allow_null` (an explicit JSON null is accepted);
-/// - `bool`/ints/floats → `.bool`/`.int`/`.float`; integer types up to 53
-///   bits (exactly representable in f64) get `min`/`max` from their bit
-///   width, wider unsigned ones keep `min = 0`;
+/// - `bool`/ints/floats → `.bool`/`.int`/`.float`; integer types get
+///   `min`/`max` from their bit width -- exact up to 53 bits, rounded to the
+///   nearest f64 beyond (`i64` → ±2^63), so a value past the type is a pathed
+///   bound error, and only the few just past a 64-bit edge reach the decoder
+///   (an unpathed `invalid`);
 /// - `[]const u8` → `.string`; `[N]u8` → `.string` with exact length;
 /// - other slices → `.array` with a recursive element rule; `[N]U` adds the
 ///   exact length;
@@ -1381,16 +1430,16 @@ fn ruleForType(comptime T: type) Rule {
                 return rule;
             },
             .bool => return .{ .field = "", .kind = .bool },
-            .int => |ii| {
-                var rule: Rule = .{ .field = "", .kind = .int };
-                if (ii.bits <= 53) {
-                    // Exactly representable in f64 → full bounds.
-                    rule.min = @floatFromInt(std.math.minInt(T));
-                    rule.max = @floatFromInt(std.math.maxInt(T));
-                } else if (ii.signedness == .unsigned) {
-                    rule.min = 0;
-                }
-                return rule;
+            .int => {
+                // Exact up to 53 bits; wider, the nearest f64. The type gate
+                // takes any integer (JSON Schema's), so these bounds are what
+                // keeps `1e20` out of an `i64` with a path.
+                return .{
+                    .field = "",
+                    .kind = .int,
+                    .min = @floatFromInt(std.math.minInt(T)),
+                    .max = @floatFromInt(std.math.maxInt(T)),
+                };
             },
             .float => return .{ .field = "", .kind = .float },
             .@"enum" => |ei| {
@@ -2008,7 +2057,15 @@ const Walker = struct {
     /// The container type gate of `checkRule`, for rule `a` and a container
     /// of `kind` (.array / .object): true when the rule's constraints apply.
     fn gate(w: *Walker, seg: ?*Seg, a: Active, kind: Kind) Allocator.Error!bool {
-        if (a.rule.kind == .any or a.rule.kind == kind) return true;
+        if (a.rule.kind == .any) {
+            // A container is not a string: `checkRule`'s `checkNotAString`.
+            if (constrainsNonStrings(a.rule)) {
+                w.use(a.pass);
+                if (!w.b.full()) try checkNotAString(w.b, try w.path(seg), a.rule);
+            }
+            return true;
+        }
+        if (a.rule.kind == kind) return true;
         w.use(a.pass);
         if (!w.b.full()) try appendTypeError(w.b, try w.path(seg), a.rule.kind);
         return false;
@@ -2416,10 +2473,16 @@ const TokenTap = struct {
 //    code points) and `minItems`/`maxItems` on arrays; a `.any` rule states
 //    both, since each keyword applies only to its own type -- exactly how the
 //    validator applies them;
-//  * `.int` → `"integer"`, which in 2020-12 accepts `1.0` as the validator does;
-//  * `allow_null` → a `["<type>", "null"]` type array;
-//  * `pattern`: `literal` → `const`, `prefix`/`suffix`/`charset` → an anchored,
-//    escaped ECMA-262 `pattern`;
+//  * `.int` → `"integer"`, which in 2020-12 accepts `1.0` and an integer of
+//    any size as the validator does;
+//  * `allow_null` → a `["<type>", "null"]` type array, and null in the `enum`
+//    when the rule names its values;
+//  * `one_of` → `enum`, `pattern.literal` → `const` -- both refuse every
+//    non-string, on `.any` too; `prefix`/`suffix`/`charset` → an anchored,
+//    escaped ECMA-262 `pattern` (a `charset` is a class of code points);
+//
+// Checked, rule set by rule set, against python-jsonschema and ajv
+// (`schema_oracle_test.zig`): the validator answers what its schema answers.
 //  * `format` → the 2020-12 format name (`uri-reference`, `date-time`, ...);
 //  * two rules for one field in the same set → `allOf` of both.
 //
@@ -2572,12 +2635,25 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
         try s.objectField("x-maxBytes");
         try s.write(m);
     }
-    if (r.one_of) |allowed| {
+    // `allow_null` accepts null before any constraint, so the values `one_of`
+    // and a `literal` allow are stated as ONE `enum` that lists null too (the
+    // type array alone would let `enum`/`const` refuse it): `one_of`, kept to
+    // the literal when both are set.
+    const literal: ?[]const u8 = if (r.pattern) |p| (if (p == .literal) p.literal else null) else null;
+    if (r.allow_null and (r.one_of != null or literal != null)) {
+        try s.objectField("enum");
+        try s.beginArray();
+        if (r.one_of) |allowed| {
+            for (allowed) |a| if (literal == null or std.mem.eql(u8, a, literal.?)) try s.write(a);
+        } else try s.write(literal.?);
+        try s.write(null);
+        try s.endArray();
+    } else if (r.one_of) |allowed| {
         try s.objectField("enum");
         try s.write(allowed);
     }
     if (r.pattern) |p| switch (p) {
-        .literal => |lit| {
+        .literal => |lit| if (!r.allow_null) {
             try s.objectField("const");
             try s.write(lit);
         },
@@ -3070,20 +3146,31 @@ test "bounds: every lower bound accepts its exact edge, tree and streaming paths
     try expectSchemaAgrees(at_edge, &schema);
 }
 
-test "int gate: an integer beyond i64 fails closed with int_type" {
-    // Mutation 2026-10-04: `typeGate` accepting a `.number_string` that does
-    // not parse as i64 survived. std.json keeps an integer-shaped literal
-    // that overflows i64 as `.number_string`; `typeGate`'s contract (its doc:
-    // "counts as int only when it parses as one") and `rulesFor`'s i64 decode
-    // target both say such a value is not a valid `.int` -- accepting it
-    // would hand `parseInto` a value it cannot represent.
+test "int gate: an integer beyond i64 is an integer; a typed field bounds it" {
+    // Until 2026-10-05 an integer literal past i64 (std.json's
+    // `.number_string`) was `int_type` while `1e20` -- the same number as a
+    // float -- passed; JSON Schema calls both integers (python-jsonschema and
+    // ajv, schema_oracle_test.zig). It also refused every `u64` above 2^63-1
+    // in `parseInto`.
     const schema = [_]Rule{.{ .field = "n", .kind = .int }};
     var r = try validateJson(testing.allocator, "{\"n\":99999999999999999999}", &schema);
     defer r.deinit();
-    try expectError(&r, "n", "int_type");
-    var ok_r = try validateJson(testing.allocator, "{\"n\":9223372036854775807}", &schema);
-    defer ok_r.deinit();
-    try testing.expect(ok_r.ok()); // i64 max still an int
+    try testing.expect(r.ok());
+    var frac = try validateJson(testing.allocator, "{\"n\":1e400}", &schema);
+    defer frac.deinit();
+    try expectError(&frac, "n", "int_type"); // non-finite: no integer
+    // What the old gate guarded: a typed field cannot be handed a value it
+    // cannot hold -- its bit-width bounds answer, with the path.
+    const I = struct { n: i64 };
+    var big = try parseInto(I, testing.allocator, "{\"n\":99999999999999999999}");
+    defer big.deinit();
+    try testing.expect(big == .invalid);
+    try expectError(&big.invalid, "n", "less_than_equal");
+    const U = struct { n: u64 };
+    var umax = try parseInto(U, testing.allocator, "{\"n\":18446744073709551615}");
+    defer umax.deinit();
+    try testing.expect(umax == .ok);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), umax.ok.value.n);
 }
 
 test "length: string codes differ from array codes (pydantic)" {
@@ -5552,6 +5639,12 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
 test {
     _ = @import("json_schema_format_vectors.zig");
     _ = @import("json_schema_format_test.zig");
+}
+
+// ── external anchor: python-jsonschema + ajv on the exported schema ────────
+// See schema_oracle_test.zig / tools/schema_oracle.py.
+test {
+    _ = @import("schema_oracle_test.zig");
 }
 
 test "a rule that forgot its kind is not a no-op: .any constrains the value" {

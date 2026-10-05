@@ -98,7 +98,9 @@ error → pathed-error mapping), query coercion/percent-decoding/duplicate-key h
 `http.Server.serveStream` (golden 400 + handler-not-invoked proof, valid POST → handler sees parsed
 body, typed getter, 413 body cap, stacked Query+Body slot chain); an in-process `router`+`http.Server`
 +`http.Client` loopback integration run (invalid POST → 400 with handler never invoked; valid POST →
-decoded struct; bad query param → 400). Run: `zig build test-validate`.
+decoded struct; bad query param → 400). Run: `zig build test-validate`. The rule semantics and the
+JSON Schema export are replayed against python-jsonschema and ajv (`schema_oracle_test.zig`, see
+Anchoring); regenerate with `tools/schema_oracle.py` (tools/README.md).
 
 **Audit 2026-10-04 (mutation).** 58 schemata mutants over the input guards (`LimitScan`
 caps and depth, the error cap and `dedupeFrom`, `checkRule` bounds/`allow_null`/fail-closed
@@ -165,6 +167,6 @@ for a body the decoder rejects mid-way (so the invalid path still reports every 
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/json_schema_format_test.zig runs the official json-schema-org/JSON-Schema-Test-Suite optional/format files (src/testdata/json-schema-test-suite, 12 formats), which is where the isDuration bug was found; the whole 2020-12 CORE vocabulary in root.zig -- type/properties/items/required and the request-body integration -- is still graded only by this module's own tests
+**What the tests actually contain.** src/json_schema_format_test.zig runs the official json-schema-org/JSON-Schema-Test-Suite optional/format files (src/testdata/json-schema-test-suite, 12 formats), which is where the isDuration bug was found. src/schema_oracle_test.zig replays python-jsonschema 4.19.2 and ajv 8.20.0 (`tools/schema_oracle.py`, frozen 2026-10-05): 313 rule sets (12 crafted, 300 generated: every kind, `required`, `allow_null`, bounds, code-point and byte lengths, `one_of`, the four built-in patterns, nested `fields`/`items` two deep), each of which must export exactly the frozen schema, and 2051 documents that `validateJson` and `validateJsonStreaming` must answer as both validators do -- or as a named class decides (Python's `$` before a final newline, f64 bounds past 2^53, `1e400` as an integer, the byte bounds a schema cannot state, an unpaired surrogate escape), each class pinned to at least one case. Still graded only by this module's own tests: query and path-param coercion and percent-decoding, the `rulesFor` mapping from Zig types, `format` inside the oracle (left to the suite), `custom`/`matcher`, and the error codes and messages (pydantic's vocabulary).
 
-**How it got there.** The anchoring work landed. DONE 76f9d9c: format vocabulary only (rest out of scope), isDuration bug fixed
+**How it got there.** The anchoring work landed. DONE 76f9d9c: format vocabulary only (rest out of scope), isDuration bug fixed. 2026-10-05: the schema oracle -- the rule semantics and the export judged by two foreign 2020-12 validators. It found four defects, all where the validator was looser than the schema it exports: `.any` with `one_of` or a `literal` accepted any non-string (`5`, `null`, `[]`); an integer literal past i64 was `int_type` while `1e23` passed (and `parseInto` refused every `u64` above 2^63-1); a non-ASCII `charset` compared bytes (`â` passed `¢ü`); `allow_null` with `one_of`/`literal` exported an `enum`/`const` that refuses the null the validator accepts.

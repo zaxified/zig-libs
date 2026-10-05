@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: python-jsonschema + ajv oracle** (`tools/schema_oracle.py`,
+  `src/schema_oracle_test.zig`): 313 rule sets must export the frozen schema, and 2051 documents must
+  get both validators' verdict on it, on the tree and the streaming path. **4 DEFECTS fixed**, each a
+  place where the validator was looser than its own exported schema:
+  - **BEHAVIOURAL:** `.any` with `one_of` or a `literal` pattern now refuses a value that is not a
+    string (`enum` / `string_pattern_mismatch`); it accepted `5`, `true`, `null`, `[]`, `{}`.
+  - **BEHAVIOURAL:** an integer literal beyond i64 is an integer (`.int`), as `1e23` always was; it was
+    `int_type`, which also made `parseInto` refuse every `u64` above 2^63-1. `rulesFor` now bounds
+    integer types wider than 53 bits by their width too (nearest f64), so `1e20` into an `i64` is a
+    pathed `less_than_equal`, not a decode failure; `writeJsonSchemaFor` states those bounds too
+    (an `i64` field gains `minimum`/`maximum` ±9.223372036854776e18).
+  - **BEHAVIOURAL:** `Pattern.charset` compares code points, not bytes: `â` no longer passes the set
+    `¢ü`; a string that is not UTF-8 (possible only on the query path) matches no set. ASCII sets
+    answer as before.
+  - `writeJsonSchema`: a rule with `allow_null` and `one_of` / a `literal` exports one `enum` that
+    lists null too (the null was refused by the exported `enum`/`const`).
+
 - **2026-10-04** — **Tests:** mutation run (58 schemata mutants, 54 killed, 4 equivalent).
   New tests pin the inclusive lower bounds (`min`, string and array `min_len`) at their exact
   edge on the tree and the streaming path, an integer literal beyond i64 failing `int_type`,
