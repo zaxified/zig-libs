@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: a real rsyslogd and a real systemd-journald judge every encoder and emitter**
+  (`tools/rsyslog_oracle.py`, `tools/interop.zig`, `src/rsyslog_oracle_test.zig`, replay in `unix.zig`): 617 cases.
+  rsyslogd 8.2512 (unconfined copy, `unshare -rn`) parses each RFC 5424 message from `buildDatagram` (UDP) and the
+  `writeOctetCounted` frame (TCP), and each RFC 3164 line, back to what it meant -- PRI, the timestamp's instant,
+  each header field, every SD-PARAM value (mmpstrucdata), MSG. systemd-journald 259 (`unshare -rm`) stores exactly
+  the fields of each `journal.Emitter` datagram, keeps exactly the field names `validFieldName` accepts, and reads
+  `UnixEmitter`'s datagrams on dev-log (`/dev/log` on a systemd host). Anchor grade MIXED → EXTERNAL.
+  - **DEFECT fixed, BEHAVIOURAL:** `bsd.Message.hostname` defaulted to `"-"`, which rsyslogd reads as the TAG (the
+    real TAG and PID then land in MSG); so did an IPv6 literal, `host:1`, and a hostname like `evil app[1]:`, which
+    forged TAG and PID. `hostname` is now `?[]const u8 = null`, and is sent only when `bsd.validHostname` holds
+    (RFC 1123 labels plus `_`, i.e. a host name or IPv4 address); otherwise the field is omitted, glibc's shape.
+  - **DEFECT fixed, BEHAVIOURAL:** `UnixEmitter.sendBsd` sent the HOSTNAME; journald (the `/dev/log` of a systemd
+    host) then parsed no SYSLOG_IDENTIFIER at all. It now never sends one (local delivery needs none; glibc sends
+    none).
+  - **DEFECT fixed:** a UTC offset past ±23:59 shifted the clock by the full offset but printed the clamped
+    `±23:59`, so the line named a different instant (offset 1440: one minute off at rsyslogd). The offset is now
+    clamped before the shift.
+  - **DEFECT fixed:** `journal.Emitter.send` failed `error.WriteFailed` (`EFAULT`) when a field value was an empty
+    slice from an allocator: Linux checks the address of a zero-length `iovec`, and `alloc(u8, 0)` returns a
+    sentinel. `UnixEmitter.sendRaw` had the same shape. A valid address is substituted for an empty buffer.
+  - **Fixed:** a PID holding `[` or `]` closed `[PID]` early (`a]b` arrived as PID `a`); both now map to `-`. An
+    empty SD-ID or PARAM-NAME is written `-` (SD-NAME is `1*32PRINTUSASCII`; rsyslogd accepted the empty one).
+  - Documented, not ours: rsyslogd refuses an RFC 5424 year ≥ 2100 (listed divergence); journald does not parse
+    RFC 5424 at all on `/dev/log` (everything after `<PRI>` is MESSAGE) -- use `journal` or `sendBsd` there.
+
 - **2026-10-04** — Fix: `buildDatagram` (and so `UdpEmitter.send` with `udp_limit >= 2048`)
   sent a message longer than its scratch buffer cut short WITHOUT the truncation marker — the
   overflow left exactly `scratch.len` bytes, which the `> udp_limit` check did not see. The

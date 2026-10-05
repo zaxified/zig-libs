@@ -29,6 +29,11 @@ message codec split from the network emitter, RFC 3339-ms timestamps,
 structured-data escaping, field-length validation, octet framing) is modeled
 after `joelreymont/pz` `src/core/syslog.zig` (MIT) — no third-party code was
 copied; all code here targets `std.Io.net` and was written from the RFCs.
+DATA: `src/rsyslog_oracle_vectors.zig` holds messages our tooling drew
+(`tools/rsyslog_oracle.py`), the bytes this module encoded and sent for them, and
+whether a real rsyslogd and a real systemd-journald (both run as black boxes, no
+source read) read each back as meant — observed behaviour, exempt per root
+`NOTICE` §0.
 
 ## API
 
@@ -70,6 +75,8 @@ const bmsg = syslog.bsd.Message{
 };
 var bbuf: [256]u8 = undefined;
 _ = try syslog.bsd.bufPrint(&bmsg, &bbuf); // <132>Jul  9 12:34:56 host app[123]: hello
+// HOSTNAME goes out only when `bsd.validHostname` holds (a host name or IPv4 address); null, empty or
+// anything else is omitted -- a receiver would read it as the TAG. `UnixEmitter.sendBsd` never sends it.
 
 // ── transport (only touches the network when constructed) ──
 // UDP: one datagram, truncated with a marker past ~1024 bytes.
@@ -129,6 +136,9 @@ try jrnl.send(&.{
   cap). One datagram per call to a unix `SOCK_DGRAM` socket. `error.NoSpaceLeft` if `send`/`sendBsd`'s
   internal formatting buffer is too small (use `sendRaw` with your own buffer instead);
   `error.MessageTooLarge` if the kernel itself rejects the datagram as too large (`EMSGSIZE`).
+  `sendBsd` never sends the HOSTNAME (glibc's local shape). On a systemd host `/dev/log` is
+  journald, which does not parse RFC 5424 (everything after `<PRI>` becomes MESSAGE) but reads
+  `sendBsd`'s TAG and PID -- or use `journal`, which keeps every field.
 - **`journal`** — the systemd Journal Native Protocol. `Emitter.open(path)` /
   `openDefault()` (`"/run/systemd/journal/socket"`) / `close()` / `send(fields)` /
   `sendMessage(.{ .message, .priority, .identifier, .fields })` (the `MESSAGE`/`PRIORITY`/
@@ -153,7 +163,9 @@ at the length limits, and the RFC 6587 octet-count prefix. The real UDP/TCP
 send paths are compile-checked only and gated behind runtime construction /
 `error.SkipZigTest`. Local delivery (`UnixEmitter`/`journal`) is tested for
 real instead, over throwaway `AF_UNIX` sockets bound in `.zig-cache/tmp/` —
-no daemon needed, see SPEC.md.
+no daemon needed, see SPEC.md. Every encoder and emitter is anchored by a
+real rsyslogd and a real systemd-journald (`zig build interop-syslog`,
+`tools/README.md`), whose verdicts the tests replay offline.
 
 ```
 zig build test-syslog                          # Debug

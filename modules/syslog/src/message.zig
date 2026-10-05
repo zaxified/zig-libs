@@ -102,7 +102,16 @@ pub const DecomposeError = error{
 /// shift) succeeds; anything else returns `error.TimestampOutOfRange` rather
 /// than panicking on the out-of-range `@intCast`.
 pub fn decompose(ts: Timestamp) DecomposeError!CalendarTime {
-    const off_ms: i64 = @as(i64, ts.offset_minutes orelse 0) * 60_000;
+    // An offset past ±23:59 has no `±HH:MM` form: clamp it BEFORE shifting,
+    // so the clock shown and the offset printed still name the caller's
+    // instant. Clamping only the printed suffix (as before 2026-10-05) moved
+    // the instant by the clamped-off minutes -- rsyslogd read 12:34:56Z sent
+    // with offset 1440 as 12:35:56Z (`rsyslog_oracle_test.zig`).
+    const offset: ?i16 = if (ts.offset_minutes) |om|
+        std.math.clamp(om, -@as(i16, max_offset_minutes), @as(i16, max_offset_minutes))
+    else
+        null;
+    const off_ms: i64 = @as(i64, offset orelse 0) * 60_000;
     const adjusted = ts.unix_ms +| off_ms;
     const total_secs = @divFloor(adjusted, 1000);
     if (total_secs < 0 or total_secs > max_epoch_secs) return error.TimestampOutOfRange;
@@ -127,7 +136,7 @@ pub fn decompose(ts: Timestamp) DecomposeError!CalendarTime {
         .minute = @intCast(p.minute),
         .second = @intCast(p.second),
         .milli = milli,
-        .offset_minutes = ts.offset_minutes,
+        .offset_minutes = offset,
     };
 }
 
@@ -148,9 +157,8 @@ fn writeCalendar(w: *std.Io.Writer, c: CalendarTime) std.Io.Writer.Error!void {
             try w.writeAll("+00:00");
         } else {
             const sign: u8 = if (om < 0) '-' else '+';
-            // Clamp to the largest sane UTC offset (±23:59 = 1439 minutes) so a
-            // wild-but-in-range `i16` (e.g. from a hostile/buggy caller) still
-            // prints a valid `±HH:MM` instead of a nonsensical `±546:07`.
+            // `decompose` clamped it to ±23:59 (1439 minutes) before shifting;
+            // the `@min` keeps a hand-built `CalendarTime` two-digit too.
             const a: u16 = @min(@as(u16, @abs(om)), max_offset_minutes);
             try w.writeByte(sign);
             try w.print("{d:0>2}:{d:0>2}", .{ a / 60, a % 60 });
@@ -251,8 +259,11 @@ fn writeField(w: *std.Io.Writer, value: ?[]const u8, max: usize) std.Io.Writer.E
 }
 
 /// Write an SD-NAME (element id / param name): printable US-ASCII minus the
-/// four reserved bytes `= SP ] "`, truncated to `max_sd_name`.
+/// four reserved bytes `= SP ] "`, truncated to `max_sd_name`. An empty name
+/// is written `-`: SD-NAME is `1*32PRINTUSASCII` (RFC 5424 §6), and `[ p="v"]`
+/// or `[id ="v"]` is outside the grammar (rsyslogd happens to accept both).
 fn writeSdName(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
+    if (name.len == 0) return w.writeByte('-');
     var n: usize = 0;
     for (name) |b| {
         if (n >= max_sd_name) break;
@@ -452,23 +463,25 @@ test "format renders NILVALUE '-' for a hostile out-of-range timestamp" {
     try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&msg, &buf));
 }
 
-test "writeRfc3339 clamps a wild offset_minutes instead of printing garbage" {
+test "writeRfc3339 clamps a wild offset_minutes and still names the same instant" {
     // offset_minutes = maxInt/minInt(i16) is nonsense for a UTC offset (real
-    // offsets never exceed ±14:00), but the type allows it. Without a clamp
-    // this prints "+546:07"/"-546:08"; clamped, it prints the largest sane
-    // offset "±23:59". The calendar date itself still shifts by the full
-    // (unclamped) offset via `decompose` — only the printed `±HH:MM` suffix
-    // is clamped — so this only checks the suffix, not the date.
+    // offsets never exceed ±14:00), but the type allows it. Unclamped it
+    // prints "+546:07"/"-546:08"; it is clamped to the largest sane offset
+    // "±23:59" BEFORE the clock is shifted, so clock and offset together
+    // still denote the caller's instant (1970-01-01T00:00:00Z = 23:59 local
+    // at +23:59). rsyslogd judged the old suffix-only clamp a minute off.
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeRfc3339(&w, .{ .unix_ms = 0, .offset_minutes = 32767 });
-    try t.expect(std.mem.endsWith(u8, w.buffered(), "+23:59"));
+    try t.expectEqualStrings("1970-01-01T23:59:00.000+23:59", w.buffered());
 
     w = std.Io.Writer.fixed(&buf);
-    // Base far enough from the epoch that shifting back ~22.7 days by the
-    // wild negative offset stays inside decompose's valid range.
     try writeRfc3339(&w, .{ .unix_ms = 100_000_000_000, .offset_minutes = -32768 });
-    try t.expect(std.mem.endsWith(u8, w.buffered(), "-23:59"));
+    try t.expectEqualStrings("1973-03-02T09:47:40.000-23:59", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    try writeRfc3339(&w, .{ .unix_ms = 1783600496123, .offset_minutes = 1440 });
+    try t.expectEqualStrings("2026-07-10T12:33:56.123+23:59", w.buffered());
 }
 
 test "RFC 5424 edges: the first instant past year 9999, an empty field, a 33-byte SD-NAME" {

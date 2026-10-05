@@ -3,10 +3,19 @@
 //! spoken by many collectors:
 //!
 //!   `<PRI>Mmm dd hh:mm:ss HOSTNAME TAG[PID]: MSG`
+//!   `<PRI>Mmm dd hh:mm:ss TAG[PID]: MSG`          (no HOSTNAME: glibc's shape)
 //!
 //! The timestamp is the local wall clock with a space-padded day; there is no
 //! year, no fractional seconds and no timezone (RFC 3164 §4.1.2). Parsing the
 //! 3164 format is intentionally NOT provided (see README DEFER list).
+//!
+//! HOSTNAME is sent only when it is one (`validHostname`): RFC 3164 has no
+//! NILVALUE and no field delimiter but the space, so a receiver decides
+//! whether the first word IS a hostname by looking at it, and a word that is
+//! not -- `-`, `a b` sanitized to `a-b:`, an IPv6 literal's `:` -- is read as
+//! the TAG, the real TAG shifted into MSG (rsyslogd, `rsyslog_oracle_test.zig`).
+//! Omitting it is what glibc's `syslog()` does; the receiver fills in the
+//! sender.
 
 const std = @import("std");
 const m = @import("message.zig");
@@ -23,15 +32,35 @@ const month_abbr = [_][]const u8{
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
-/// Printable US-ASCII (33‥126); anything else — CR/LF, space, tab, and every
-/// other control byte — maps to `-`. RFC 3164 has no in-band framing of its
-/// own (unlike RFC 6587's octet-counted TCP), so a receiver that frames BSD
-/// lines on `\n` would otherwise let an untrusted HOSTNAME or PID forge a
-/// second record. Mirrors `message.zig`'s `writeField` sanitization for the
-/// RFC 5424 header fields — same "non-printable bytes in header fields map
-/// to `-`" bound SPEC.md already states, now held for BOTH encoders.
-fn writeSanitized(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    for (s) |b| try w.writeByte(if (b >= 33 and b <= 126) b else '-');
+/// HOSTNAME a receiver reads as one (RFC 3164 §4.1.2: "the hostname, the
+/// IPv4 address, or the IPv6 address"): dot-separated labels of 1‥63
+/// letters, digits, `-` and `_`, a label neither starting nor ending with
+/// `-` (RFC 1123 §2.1; `_` as in real host names), ≤ 255 bytes. An IPv4
+/// literal passes as labels of digits. An IPv6 literal does not: its `:` is
+/// the TAG delimiter, and rsyslogd reads `2001:db8::1 app:` as TAG `2001` --
+/// RFC 5424 carries it (`Message.hostname`).
+pub fn validHostname(s: []const u8) bool {
+    if (s.len == 0 or s.len > 255) return false;
+    var labels = std.mem.splitScalar(u8, s, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |b| switch (b) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '_' => {},
+            else => return false,
+        };
+    }
+    return true;
+}
+
+/// PID: printable US-ASCII (33‥126) minus `[` and `]`; anything else maps to
+/// `-`. RFC 3164 has no in-band framing of its own (unlike RFC 6587's
+/// octet-counted TCP), so a receiver that frames BSD lines on `\n` would
+/// otherwise let an untrusted PID forge a second record -- the same bound
+/// `message.zig`'s `writeField` holds for the RFC 5424 header fields; and a
+/// bracket would close `[PID]` early (`a]b` arrived as PID `a` at rsyslogd).
+fn writePid(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    for (s) |b| try w.writeByte(if (b >= 33 and b <= 126 and b != '[' and b != ']') b else '-');
 }
 
 /// TAG per RFC 3164 §5.3: alphanumeric only, truncated to `max_tag`. Also
@@ -51,7 +80,10 @@ pub const Message = struct {
     facility: Facility = .user,
     severity: Severity = .notice,
     timestamp: ?Timestamp = null,
-    hostname: []const u8 = "-",
+    /// Sent only when `validHostname` holds; `null`, empty or anything else
+    /// omits the field (see the file comment). Until 2026-10-05 the default
+    /// was `"-"`, which a receiver read as the TAG.
+    hostname: ?[]const u8 = null,
     tag: []const u8 = "",
     pid: ?[]const u8 = null,
     msg: []const u8 = "",
@@ -71,15 +103,17 @@ pub const Message = struct {
             } else |_| {}
         }
 
-        try writeSanitized(w, self.hostname);
-        try w.writeByte(' ');
+        if (self.hostname) |h| if (validHostname(h)) {
+            try w.writeAll(h);
+            try w.writeByte(' ');
+        };
 
         // TAG (alnum-filtered + truncated), then optional [PID], then ": "
         // and the message text.
         try writeTag(w, self.tag);
         if (self.pid) |pid| {
             try w.writeByte('[');
-            try writeSanitized(w, pid);
+            try writePid(w, pid);
             try w.writeByte(']');
         }
         try w.writeAll(": ");
@@ -160,6 +194,8 @@ test "RFC 3164 line: hostname/tag/pid strip non-printable/non-alnum bytes so an 
     };
     var buf: [256]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
+    // Not a hostname: omitted, not sanitized into a word a receiver reads as TAG.
+    try t.expectEqualStrings("<13>cron-job-x[1-2]: ok", out);
     // No raw control byte anywhere before MSG: a receiver that frames on
     // '\n' cannot see this one line as two (RFC 3164 §4.1.3 record forgery).
     try t.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
@@ -195,4 +231,29 @@ test "TAG longer than 32 bytes is truncated" {
     const out = try bufPrint(&msg, &buf);
     try t.expect(std.mem.indexOf(u8, out, ("t" ** max_tag) ++ ": x") != null);
     try t.expect(std.mem.indexOf(u8, out, "t" ** (max_tag + 1)) == null);
+}
+
+test "HOSTNAME: sent only when it is one; else omitted (glibc's shape)" {
+    // rsyslogd 8.2512 read each of these first words as the TAG
+    // (`rsyslog_oracle_vectors.zig` before 2026-10-05): the old default "-",
+    // an empty one, a trailing '-', an IPv6 literal, a word ending in ':',
+    // and a hostname that forges TAG and PID.
+    var buf: [128]u8 = undefined;
+    for ([_]?[]const u8{ null, "", "-", "--", "a-", "-a", "2001:db8::1", "::1", "h:", "host:1", "[h]", "evil app[1]:", "a..b", "x" ** 64 }) |h| {
+        const msg = Message{ .facility = .local0, .severity = .warning, .timestamp = .{ .unix_ms = 1783600496000 }, .hostname = h, .tag = "app", .pid = "123", .msg = "hello" };
+        try t.expectEqualStrings("<132>Jul  9 12:34:56 app[123]: hello", try bufPrint(&msg, &buf));
+    }
+    for ([_][]const u8{ "host", "1", "host_1", "Host.Example.COM", "192.0.2.1", "a-b.c", "x" ** 63 }) |h| {
+        const msg = Message{ .facility = .local0, .severity = .warning, .timestamp = .{ .unix_ms = 1783600496000 }, .hostname = h, .tag = "app", .msg = "hello" };
+        const out = try bufPrint(&msg, &buf);
+        try t.expect(std.mem.startsWith(u8, out, "<132>Jul  9 12:34:56 "));
+        try t.expect(std.mem.endsWith(u8, out, " app: hello"));
+        try t.expectEqualStrings(h, out["<132>Jul  9 12:34:56 ".len .. out.len - " app: hello".len]);
+    }
+}
+
+test "PID: brackets cannot close [PID] early" {
+    const msg = Message{ .hostname = "host", .tag = "app", .pid = "a]b[c", .msg = "x" };
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("<13>host app[a-b-c]: x", try bufPrint(&msg, &buf));
 }

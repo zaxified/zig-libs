@@ -80,6 +80,7 @@ pub const bsd = struct {
     pub const Message = bsd_mod.Message;
     pub const bufPrint = bsd_mod.bufPrint;
     pub const max_tag = bsd_mod.max_tag;
+    pub const validHostname = bsd_mod.validHostname;
 };
 
 // ── transport: UDP / TCP emitters + framing helpers ─────────────────────────
@@ -117,6 +118,7 @@ test {
     _ = @import("bsd.zig");
     _ = @import("transport.zig");
     _ = @import("unix.zig");
+    _ = @import("rsyslog_oracle_test.zig");
 }
 
 test "meta is well-formed" {

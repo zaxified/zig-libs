@@ -95,9 +95,21 @@ fn closeFd(fd: linux.fd_t) void {
 /// overhead) is bigger than the destination can ever accept in one message.
 pub const WriteError = error{ WriteFailed, MessageTooLarge };
 
+/// A pointer the kernel accepts for an EMPTY buffer. A zero-length Zig slice
+/// may carry any address -- an allocator hands out `maxInt`-aligned
+/// sentinels for `alloc(u8, 0)` -- and Linux checks the address even when the
+/// length is 0: `sendmsg` with such an `iovec` (or `sendto` with such a
+/// buffer) fails `EFAULT`. Found by the journald oracle 2026-10-05: one empty
+/// field value from an allocator made the whole record fail `WriteFailed`.
+fn kernelPtr(bytes: []const u8) [*]const u8 {
+    return if (bytes.len == 0) &newline_byte else bytes.ptr;
+}
+
+const newline_byte: [1]u8 = .{'\n'};
+
 fn sendToAddr(fd: linux.fd_t, addr: *const linux.sockaddr.un, bytes: []const u8) WriteError!void {
     while (true) {
-        const rc = linux.sendto(fd, bytes.ptr, bytes.len, 0, @ptrCast(addr), @sizeOf(linux.sockaddr.un));
+        const rc = linux.sendto(fd, kernelPtr(bytes), bytes.len, 0, @ptrCast(addr), @sizeOf(linux.sockaddr.un));
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc != bytes.len) return error.WriteFailed; // never observed for SOCK_DGRAM; defensive
@@ -147,7 +159,10 @@ pub const UnixEmitter = struct {
     pub const SendError = error{NoSpaceLeft} || WriteError;
 
     /// Format `msg` (RFC 5424) into the internal scratch buffer and send it
-    /// as one datagram. `error.NoSpaceLeft` if `msg` doesn't fit
+    /// as one datagram. On a systemd host `/dev/log` is journald, which does
+    /// not parse RFC 5424 (systemd 259): everything after `<PRI>` arrives as
+    /// MESSAGE. There, `journal` keeps the fields and `sendBsd` the
+    /// identifier and PID. `error.NoSpaceLeft` if `msg` doesn't fit
     /// `scratch_len` — never truncated; use `sendRaw` with your own buffer
     /// for a message that genuinely needs to be larger.
     pub fn send(e: *UnixEmitter, msg: *const message.Message) SendError!void {
@@ -155,9 +170,15 @@ pub const UnixEmitter = struct {
         try e.sendRaw(bytes);
     }
 
-    /// `send`'s RFC 3164 (BSD) twin.
+    /// `send`'s RFC 3164 (BSD) twin, in glibc's local shape: `msg.hostname`
+    /// is NOT sent. A local receiver does not read one -- journald (the
+    /// `/dev/log` of a systemd host) took `host app[1]: hi` as a MESSAGE with
+    /// no SYSLOG_IDENTIFIER, and rsyslogd's imuxsock reads the first word as
+    /// the TAG unless told otherwise -- and the local sender needs none.
     pub fn sendBsd(e: *UnixEmitter, msg: *const bsd_mod.Message) SendError!void {
-        const bytes = bsd_mod.bufPrint(msg, &e.scratch) catch return error.NoSpaceLeft;
+        var local = msg.*;
+        local.hostname = null;
+        const bytes = bsd_mod.bufPrint(&local, &e.scratch) catch return error.NoSpaceLeft;
         try e.sendRaw(bytes);
     }
 
@@ -221,8 +242,6 @@ pub const journal = struct {
     /// any size can be referenced without being copied here.
     const max_header_glue = max_field_name_len + 1 + 8;
 
-    const newline: [1]u8 = .{'\n'};
-
     pub const SendError = error{TooManyFields} || FieldError || WriteError;
 
     /// Builds the `sendmsg` scatter-gather list for `fields` into `header`
@@ -257,9 +276,9 @@ pub const journal = struct {
             }
             iov[n] = .{ .base = h, .len = header_len };
             n += 1;
-            iov[n] = .{ .base = f.value.ptr, .len = f.value.len };
+            iov[n] = .{ .base = kernelPtr(f.value), .len = f.value.len };
             n += 1;
-            iov[n] = .{ .base = &newline, .len = 1 };
+            iov[n] = .{ .base = &newline_byte, .len = 1 };
             n += 1;
         }
         return n;
@@ -446,7 +465,7 @@ test "UnixEmitter: RFC 5424 message arrives byte-exact over a real unix socket" 
     );
 }
 
-test "UnixEmitter: RFC 3164 (BSD) message arrives byte-exact" {
+test "UnixEmitter: RFC 3164 (BSD) message arrives byte-exact, in glibc's local shape (no HOSTNAME)" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [128]u8 = undefined;
@@ -470,7 +489,9 @@ test "UnixEmitter: RFC 3164 (BSD) message arrives byte-exact" {
 
     var recv_buf: [256]u8 = undefined;
     const got = try recv.recv(&recv_buf);
-    try t.expectEqualStrings("<132>Jul  9 12:34:56 host app[123]: hello", got);
+    // journald parses exactly this into SYSLOG_IDENTIFIER=app, SYSLOG_PID=123,
+    // MESSAGE=hello; with `host ` in front it parsed no identifier at all.
+    try t.expectEqualStrings("<132>Jul  9 12:34:56 app[123]: hello", got);
 }
 
 test "UnixEmitter: sendRaw over budget is MessageTooLarge, not a truncated send" {
@@ -655,4 +676,64 @@ test "journal.Emitter.send: a datagram too large for the socket is MessageTooLar
     var big: [65536]u8 = undefined;
     @memset(&big, 'x');
     try t.expectError(error.MessageTooLarge, emitter.send(&.{.{ .name = "MESSAGE", .value = &big }}));
+}
+
+test "journal: an empty value from an allocator is sent, not refused EFAULT" {
+    // `alloc(u8, 0)` returns a sentinel address the kernel refuses even for
+    // a zero-length iovec; `kernelPtr` substitutes a valid one. Before the
+    // fix this send failed `error.WriteFailed` (journald oracle 2026-10-05).
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try testSocketPath(&tmp, &path_buf, "journal-empty.sock");
+    var r = try TestReceiver.bind(path);
+    defer r.close();
+    var e = try journal.Emitter.open(path);
+    defer e.close();
+    const empty = try t.allocator.alloc(u8, 0);
+    defer t.allocator.free(empty);
+    try e.send(&.{ .{ .name = "MESSAGE", .value = "m" }, .{ .name = "EMPTY", .value = empty } });
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("MESSAGE=m\nEMPTY=\n", try r.recv(&buf));
+
+    var u = try UnixEmitter.open(path);
+    defer u.close();
+    try u.sendRaw(empty);
+    try t.expectEqualStrings("", try r.recv(&buf));
+}
+
+// OFFLINE replay of the journald half of the oracle (`tools/interop.zig`,
+// frozen in `rsyslog_oracle_vectors.zig`): a real systemd-journald stored
+// exactly the fields of each `journal` datagram below, and read each
+// `sendBsd` datagram on dev-log (`/dev/log` on a systemd host) as the TAG,
+// PID and MESSAGE it carries. The replay requires the very bytes it read.
+const oracle = @import("rsyslog_oracle_vectors.zig");
+
+test "journald oracle: journal.Emitter and UnixEmitter.sendBsd send the bytes journald read as meant" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try testSocketPath(&tmp, &path_buf, "oracle.sock");
+    var r = try TestReceiver.bind(path);
+    defer r.close();
+    var je = try journal.Emitter.open(path);
+    defer je.close();
+    var ue = try UnixEmitter.open(path);
+    defer ue.close();
+    var buf: [64 * 1024]u8 = undefined;
+
+    for (oracle.journal) |c| {
+        try t.expect(c.ok);
+        try je.send(c.fields);
+        try t.expectEqualSlices(u8, c.datagram, try r.recv(&buf));
+    }
+    for (oracle.journal_send) |c| {
+        try t.expect(c.ok);
+        try je.sendMessage(c.opts);
+        try t.expectEqualSlices(u8, c.datagram, try r.recv(&buf));
+    }
+    for (oracle.rfc3164) |c| {
+        try ue.sendBsd(&c.msg);
+        try t.expectEqualSlices(u8, c.unix, try r.recv(&buf));
+    }
 }
