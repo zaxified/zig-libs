@@ -6,7 +6,7 @@
 
 **Scope:** mvp — draft-irtf-cfrg-bbs-signatures -12 and zkryptium (draft-10); this module pins -04 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -168,6 +168,19 @@ section used to say the check was missing and deferred; that was stale
 executed assertions (byte-exact against `signature001`/`signature004`/
 `proof001`/`proof003`, tamper-rejection against `signature002`/
 `proof004`).
+
+**Mutation run 2026-10-05** (in-place, Debug, 28 mutants over the
+`Signature`/`Proof`/`PublicKey` decoders, `proofGen`/`proofVerify`'s
+input guards, the challenge and domain transcripts, the challenge and
+pairing checks, and `keyGen`): 28 killed. The first pass left 14; tests
+were added for the identity and an order-3 point in every decoded `G1`
+slot (`Signature.a`, `Abar`, `Bbar`) and an on-twist point outside `G2` as
+a public key — nothing in this module pinned that it uses the checked
+decoders —, index `== L` and too many random scalars in `proofGen`, more
+messages than indexes, index `== L` and a duplicate index in `proofVerify`,
+the `keyGen` length edges, and a proof over a forged signature: the
+Schnorr part is consistent for any `(A, e)`, so only the final pairing
+check refuses it, and dropping that check survived every KAT.
 
 ## Remaining hardening
 

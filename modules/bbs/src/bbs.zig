@@ -975,6 +975,84 @@ test "proofVerify validates disclosed_messages/disclosed_indexes count before to
     ));
 }
 
+// ── refusals the mutation run of 2026-10-05 found unpinned ───────────────
+
+/// `(0, 2)`: on `y² = x³ + 4`, of order 3, so outside `G1`.
+const g1_order3_compressed: [G1.compressed_bytes]u8 = .{0x80} ++ .{0} ** (G1.compressed_bytes - 1);
+const g1_identity_compressed: [G1.compressed_bytes]u8 = .{0xc0} ++ .{0} ** (G1.compressed_bytes - 1);
+
+fn testKeyPair() !struct { sk: SecretKey, pk: PublicKey } {
+    var sk_bytes = [_]u8{0} ** 32;
+    sk_bytes[31] = 5;
+    const sk = try SecretKey.fromBytes(sk_bytes);
+    return .{ .sk = sk, .pk = keys.skToPk(sk) };
+}
+
+test "Signature/Proof decoders refuse the identity and a point outside G1" {
+    _ = try G1.fromBytesCompressedUnchecked(g1_order3_compressed); // on the curve
+    try testing.expectError(error.NotInSubgroup, G1.fromBytesCompressed(g1_order3_compressed));
+
+    const kp = try testKeyPair();
+    const messages = [_][]const u8{ "a", "b", "c" };
+    const sig = try sign(testing.allocator, kp.sk, kp.pk, "h", &messages);
+    _ = try Signature.fromBytes(sig);
+    var bad_sig = sig;
+    bad_sig[0..G1.compressed_bytes].* = g1_identity_compressed;
+    try testing.expectError(error.InvalidSignatureEncoding, Signature.fromBytes(bad_sig));
+    bad_sig[0..G1.compressed_bytes].* = g1_order3_compressed;
+    try testing.expectError(error.InvalidSignatureEncoding, Signature.fromBytes(bad_sig));
+
+    const random_scalars = cs.mockedRandomScalars(5, "decoder refusals");
+    const proof = try proofGen(testing.allocator, kp.pk, sig, "h", "", &messages, &.{0}, &random_scalars);
+    defer testing.allocator.free(proof);
+    (try Proof.fromBytes(testing.allocator, proof)).deinit(testing.allocator);
+    const bad = try testing.allocator.dupe(u8, proof);
+    defer testing.allocator.free(bad);
+    for ([_]usize{ 0, G1.compressed_bytes }) |off| {
+        for ([_][G1.compressed_bytes]u8{ g1_identity_compressed, g1_order3_compressed }) |pt| {
+            @memcpy(bad, proof);
+            bad[off..][0..G1.compressed_bytes].* = pt;
+            try testing.expectError(error.InvalidProofEncoding, Proof.fromBytes(testing.allocator, bad));
+        }
+    }
+}
+
+test "proofGen refuses index == L and too MANY random scalars" {
+    const kp = try testKeyPair();
+    const messages = [_][]const u8{ "a", "b", "c" };
+    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    const six = cs.mockedRandomScalars(6, "too many");
+    try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{3}, six[0..4]));
+    try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &six));
+}
+
+test "proofVerify refuses more messages than indexes, index == L, a duplicate index, and a proof over a forged signature" {
+    const kp = try testKeyPair();
+    const messages = [_][]const u8{ "a", "b", "c" };
+    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    const random_scalars = cs.mockedRandomScalars(5, "verify refusals");
+    const proof = try proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &random_scalars);
+    defer testing.allocator.free(proof);
+    try testing.expect(try proofVerify(testing.allocator, kp.pk, proof, "", "", &.{"a"}, &.{0}));
+
+    try testing.expectError(error.DisclosedMessageCountMismatch, proofVerify(testing.allocator, kp.pk, proof, "", "", &.{ "a", "b" }, &.{0}));
+    // L = 1 disclosed + 2 hidden = 3, so index 3 is out of range.
+    try testing.expect(!try proofVerify(testing.allocator, kp.pk, proof, "", "", &.{"a"}, &.{3}));
+    try testing.expect(!try proofVerify(testing.allocator, kp.pk, proof, "", "", &.{ "a", "a" }, &.{ 0, 0 }));
+
+    // A proof over a signature that does not verify: the Schnorr part is
+    // consistent for ANY (A, e), so the challenge matches and only the
+    // pairing check refuses it.
+    var forged = sig;
+    var e = try Fr.fromBytes(forged[G1.compressed_bytes..].*);
+    e = e.add(Fr.one);
+    forged[G1.compressed_bytes..].* = e.toBytes();
+    try testing.expect(!try verify(testing.allocator, kp.pk, forged, "", &messages));
+    const forged_proof = try proofGen(testing.allocator, kp.pk, forged, "", "", &messages, &.{0}, &random_scalars);
+    defer testing.allocator.free(forged_proof);
+    try testing.expect(!try proofVerify(testing.allocator, kp.pk, forged_proof, "", "", &.{"a"}, &.{0}));
+}
+
 // ── the RNG seam (entropy re-audit 2026-08-13) ───────────────────────────
 
 test "RNG seam: calculateRandomScalars really draws entropy, and round-trips through proofGen/proofVerify" {
