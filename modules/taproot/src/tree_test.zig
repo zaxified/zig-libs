@@ -127,6 +127,30 @@ test "leaf script longer than 252 bytes uses a multi-byte CompactSize" {
     try testing.expectEqualSlices(u8, &h.finalResult(), &tree.tapLeafHash(0xc0, &script));
 }
 
+// Mutation run 2026-10-05: moving either CompactSize boundary by one left
+// the suite green (the test above sits at 300, far from both). Bitcoin's
+// CompactSize: n < 0xfd is one byte; 0xfd..0xffff is fd + u16 LE; above that
+// fe + u32 LE. 252/253 and 65535/65536 are the two edges a script can reach.
+test "leaf CompactSize edges: 252, 253, 65535, 65536 bytes" {
+    const Case = struct { len: usize, prefix: []const u8 };
+    const cases = [_]Case{
+        .{ .len = 252, .prefix = &.{0xfc} },
+        .{ .len = 253, .prefix = &.{ 0xfd, 0xfd, 0x00 } },
+        .{ .len = 65535, .prefix = &.{ 0xfd, 0xff, 0xff } },
+        .{ .len = 65536, .prefix = &.{ 0xfe, 0x00, 0x00, 0x01, 0x00 } },
+    };
+    const script = try ta.alloc(u8, 65536);
+    defer ta.free(script);
+    @memset(script, 0xab);
+    for (cases) |c| {
+        var h = bip340.hash.taggedHasher("TapLeaf");
+        h.update(&[_]u8{0xc0});
+        h.update(c.prefix);
+        h.update(script[0..c.len]);
+        try testing.expectEqualSlices(u8, &h.finalResult(), &tree.tapLeafHash(0xc0, script[0..c.len]));
+    }
+}
+
 fn internalKey() !bip340.XOnlyPublicKey {
     return bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
 }

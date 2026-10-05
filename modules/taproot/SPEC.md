@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `taproot` (TaprootBuilder/TaprootSpendInfo), libsecp256k1 `xonly_pubkey_tweak_add` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -215,6 +215,29 @@ Design references: none beyond the BIP341 specification text itself,
   parity bit, a flipped byte in any path node or in the internal key, and a
   different script.
 
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **29 mutants, 21 killed, 8 equivalent or unobservable**. Points: `TapTweak`'s inputs
+and their order, `t < n` on both tweak paths, the identity check, the output parity and reported
+tweak, `tweakSecretKey`'s even-y normalisation and both wipes, `TapLeaf`'s version byte, both
+CompactSize edges and the u16 byte order, `TapBranch` ordering, `validLeafVersion`, the control
+block's parity bit and internal key, the depth limit in both builders, the depth-0 and
+root-depth rules, the merge condition, Merkle path assembly, and `finish`'s root.
+
+First pass: 10 survivors. **No defect in the code; 2 were test gaps** — moving either
+CompactSize boundary by one (`< 0xfd` → `<=`, `<= 0xffff` → `<`) stayed green because the only
+long-script test uses 300 bytes. Closed by one test pinning 252, 253, 65535 and 65536 bytes
+against hand-built CompactSize prefixes (`tree_test.zig`).
+
+Equivalent or unobservable (8): `t < n` on both paths and the tweaked-key identity check
+(`t ≥ n` has probability ~2^-128 and `t·G = −P` needs a discrete log); the depth-0 rule and the
+depth-0 merge (the final `top == 1 and depth == 0` check refuses the same lists, and a second
+depth-0 entry is never pushed); `flatten`'s limit off by one (`buildFromLeaves` refuses depth 129
+itself — `flatten`'s check only bounds the recursion); and the two wipes in `tweakSecretKey`
+(`kp.deinit()` and the `d` scalar are stack copies, not observable in-process — the test named
+after `kp.deinit` pins bip340's `deinit`, not this `defer`; see Backlog).
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL
@@ -226,6 +249,10 @@ Design references: none beyond the BIP341 specification text itself,
 
 ## Backlog / deferred
 
+- **Dead-stack residue of `tweakSecretKey`** (mutation run 2026-10-05): removing its
+  `kp.deinit()` or the `d` wipe changes nothing any test can see. `bip340` and `k256` measure
+  this with a stackprobe (ReleaseFast) and burn the signing region; this module has neither, so
+  whether the internal scalar survives the call is unmeasured. Effort S (copy `bip340`'s probe).
 - ~~Script-tree builder~~ — done 2026-09-30 (`src/tree.zig`).
 - **Huffman tree construction from `(weight, leaf)` pairs** (BIP341's suggested layout) — a policy on top of `buildFromLeaves`; needs a deterministic tie-break rule. Effort S.
 - **Control-block parse / `verifyCommitment` here** — today only `bitcoinscript` verifies; a wallet that only builds does not need it. Would duplicate consensus code or invert the dependency; decide with a consumer.
