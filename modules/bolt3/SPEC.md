@@ -6,7 +6,7 @@
 
 **Scope:** mvp — LDK `chan_utils` / lnd `input`+`shachain` / CLN `common` (BOLT#3 implementations) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -67,6 +67,16 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 - Cross-checks: each derived secret's public point equals the independently
   derived public key; a real shachain secret feeds the revocation derivation.
 - Green in Debug + ReleaseFast.
+- **Mutation run 2026-10-05** (in-place, Debug, 27 mutants over the four
+  derivations' input checks and arithmetic, `hashToScalar` and
+  `perCommitmentSecret`): 20 killed. Six survivors were input refusals no test
+  reached (a bad `per_commitment_point` in `derivePublicKey`, a zero
+  per-commitment secret, a basepoint/revocation secret >= n, each relabelled
+  or skipped); one test now pins them all, and writing it found a bug:
+  `derivePrivateKey` accepted a per-commitment secret >= n (k256's
+  `combMulBase` reduces it), fixed with a regression test. Equivalent:
+  `hashToScalar` without the wide reduction (differs only for a SHA-256 output
+  >= n, probability ~2^-128, no findable input).
 
 ## Backlog / deferred
 
