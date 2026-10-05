@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: headless Chrome** (`tools/interop.zig`, `tools/browser_oracle.js`,
+  `src/browser_oracle_test.zig`): seven configurations, a page with every kind of subresource, framed,
+  embedded and opened from another origin; Chrome's behaviour equals each header's specified effect and it
+  complains about no real configuration (a malformed control draws three complaints). `csp_helmet_default`
+  is now browser-judged. Anchor grade MIXED → EXTERNAL. No defect found; no code change.
+
 - **2026-10-04** — Tests: mutation schemata run (26 mutants, all killed). One new test: the
   `init`-time header-budget sum equals the bytes `apply` serializes, every header enabled.
   No behaviour change.

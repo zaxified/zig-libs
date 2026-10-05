@@ -13,7 +13,11 @@ copied; the `csp_helmet_default` constant reproduces helmet's default policy
 *value* as configuration data) and the OWASP Secure Headers Project
 (best-practice header catalog) — see NOTICE. Header semantics from the
 standards: RFC 6797 (HSTS), CSP Level 3, Fetch/HTML specs (COOP/CORP/COEP),
-RFC 9110.
+RFC 9110. DATA: `src/browser_oracle_vectors.zig` holds what headless Google Chrome
+(run as a black box) did with a page our tooling serves under configurations our
+tooling chose (`tools/interop.zig`, `tools/browser_oracle.js`), including its log
+messages about the malformed control configuration — observed behaviour, exempt per
+root `NOTICE` §0.
 
 - **Model after:** helmet.js defaults + OWASP Secure Headers Project.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — an

@@ -1112,3 +1112,9 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
     try testing.expectEqual(@as(usize, 12), lines); // all eleven named headers + one extra
     try testing.expectEqual(wire_bytes, sh.appliedHeaderBytes());
 }
+
+// ── external anchor: headless Chrome against this header set ───────────────
+// See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
+test {
+    _ = @import("browser_oracle_test.zig");
+}
