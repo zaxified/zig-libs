@@ -2081,3 +2081,9 @@ test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, d
 test {
     _ = @import("bench.zig");
 }
+
+// ── external anchor: Python json + Go encoding/json + jq read JSON Lines ───
+// See json_oracle_test.zig / tools/interop.zig / tools/json_oracle.py.
+test {
+    _ = @import("json_oracle_test.zig");
+}

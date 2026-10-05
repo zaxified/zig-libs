@@ -14,6 +14,10 @@ of logging an `http` request/response pair.
   state). **Deps:** `http` (for the `entryFromRequest` bridge) + std only.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
+DATA: `src/json_oracle_vectors.zig` holds entries our tooling drew
+(`tools/json_oracle.py`) and the JSON Lines this module wrote for them, read back by
+Python json, Go encoding/json and jq (run as black boxes) — observed behaviour,
+exempt per root `NOTICE` §0.
 
 ## Quick start — a hand-built `Entry`
 

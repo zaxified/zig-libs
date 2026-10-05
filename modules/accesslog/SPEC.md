@@ -282,6 +282,10 @@ not something this formatter can detect).
 
 ## Backlog / deferred
 
+- **logfmt anchoring** *(2026-10-05)* — the JSON Lines oracle's pattern with go-logfmt (`github.com/go-logfmt/logfmt`, MIT, the
+  de-facto reference reader) decoding every line back to its entry. Blocked only on fetching the module (network, the
+  user's call); `tools/json_oracle.py` + `tools/interop.zig` are the template.
+
 - ~~**`response_bytes` for a streamed body**~~ — DONE 2026-09-28 (from qap M11.5c): `http`'s new
   `ResponseWriter.bodyBytesSent` counts the body octets of a chunked, compressed (after coding)
   or HTTP/1.0 until-close body, without chunk framing (`%b`), on h1 and h2 alike;
@@ -360,6 +364,6 @@ must be quoted and hex-escaped (`logfmtNeedsQuote` in lockstep with `writeLogfmt
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** Combined anchored by real goaccess 1.10.2 (verdicts frozen as byte literals); JSON/logfmt unanchored, no foreign parser
+**What the tests actually contain.** Combined anchored by real goaccess 1.10.2 (verdicts frozen as byte literals); logfmt unanchored, no foreign parser on this machine JSON Lines: src/json_oracle_test.zig replays three foreign readers (`tools/interop.zig` + `tools/json_oracle.py` + `tools/go_json`, frozen 2026-10-05) -- Python json, Go encoding/json (UseNumber) and jq -- over 421 entries (hostile strings in every string field: quotes, backslashes, every control byte, DEL, `"}],{"x":1`, a literal `\u0000`, valid UTF-8 up to U+10FFFF, and ill-formed UTF-8: truncated, surrogate, overlong, past U+10FFFF, stray continuation; i64/u64 extremes): each reads every line back to exactly its entry, one line per record, in key order (Python, jq), with each ill-formed subsequence as one U+FFFD per maximal subpart -- Python's own `decode('utf-8', 'replace')`, so the substitution policy is foreign-judged too. A mutated line (a changed value, a second value) is caught.
 
-**How it got there.** The anchoring work landed. DONE(combined). Anchor found a REAL BUG: %h carried host:port, goaccess failed 100% of lines (valid=0/failed=2); 3 in-house tests asserted the same wrong shape. JSON/logfmt still lack a foreign parser — no logfmt oracle installed, python json never run
+**How it got there.** The anchoring work landed. DONE(combined). Anchor found a REAL BUG: %h carried host:port, goaccess failed 100% of lines (valid=0/failed=2); 3 in-house tests asserted the same wrong shape. JSON/logfmt still lack a foreign parser — no logfmt oracle installed, python json never run 2026-10-05: JSON Lines anchored by Python json + Go encoding/json + jq -- no defect found. logfmt still lacks a reader here: its de-facto reference, go-logfmt, is not in the Go module cache (fetching it needs the network -- Backlog).
