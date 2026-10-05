@@ -475,6 +475,38 @@ test "bit read and write" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0x03, 0x00, 0x01, 0x01 }, rep[21..]);
 }
 
+test "a write past the end of the area, or shorter than its item, is refused and writes nothing" {
+    var db: [64]u8 = @splat(0);
+    var flags: [16]u8 = @splat(0);
+    var areas = [_]AreaBinding{
+        .{ .area = .db, .db_number = 1, .bytes = &db },
+        .{ .area = .flags, .bytes = &flags },
+    };
+    var r = Responder.init(.{}, &areas);
+    var in: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+    _ = try r.handle(hex("0300001902f08032010000000100080000f0000001000101e0", &in), &out);
+
+    // Four octets at DB1.DBB61 of a 64-octet DB: one past the end.
+    const past = hex("0300002702f080320100000200000e00080501120a100200040001840001e8" ++
+        "0004002012345678", &in);
+    var rep = (try r.handle(past, &out)).?;
+    try testing.expectEqual(@intFromEnum(items.ReturnCode.invalid_address), rep[rep.len - 1]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0 }, db[61..64]);
+
+    // A four-octet item carrying two octets of data.
+    const short = hex("0300002502f080320100000300000e00060501120a100200040001840000a0" ++
+        "000400101234", &in);
+    rep = (try r.handle(short, &out)).?;
+    try testing.expectEqual(@intFromEnum(items.ReturnCode.data_type_inconsistent), rep[rep.len - 1]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, db[20..22]);
+
+    // M16.0 in a 16-octet flag area.
+    const bit = hex("0300002402f080320100000400000e00050501120a100100010000830000800003000101", &in);
+    rep = (try r.handle(bit, &out)).?;
+    try testing.expectEqual(@intFromEnum(items.ReturnCode.invalid_address), rep[rep.len - 1]);
+}
+
 test "PLC control is refused unless explicitly enabled" {
     var db: [16]u8 = @splat(0);
     var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};

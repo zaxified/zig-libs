@@ -540,6 +540,10 @@ test "decode rejects hostile TPDUs" {
     try testing.expectError(error.BadTpduSizeLength, decode(&[_]u8{ 0x0B, 0xE0, 0, 0, 0, 1, 0, 0xC0, 0x03, 1, 2, 3 }));
     // A parameter whose length runs off the end of the variable part.
     try testing.expectError(error.BadParameter, decode(&[_]u8{ 0x09, 0xE0, 0, 0, 0, 1, 0, 0xC1, 0x40, 1, 2, 3 }));
+    // A parameter whose length is exactly one octet too long.
+    try testing.expectError(error.BadParameter, decode(&[_]u8{ 0x09, 0xE0, 0, 0, 0, 1, 0, 0xC1, 0x02, 1 }));
+    // LI one past the buffer.
+    try testing.expectError(error.BadLengthIndicator, decode(&[_]u8{ 0x03, 0xF0, 0x80 }));
     // A dangling parameter code with no length octet.
     try testing.expectError(error.BadParameter, decode(&[_]u8{ 0x07, 0xE0, 0, 0, 0, 1, 0, 0xC1 }));
 }

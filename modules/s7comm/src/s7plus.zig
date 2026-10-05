@@ -288,6 +288,10 @@ test "decode rejects malformed frames" {
     // `trailer[0]`.
     const mistyped_trailer = [_]u8{ 0x72, 0x02, 0x00, 0x02, 0xAA, 0xBB, 0x72, 0x03, 0x00, 0x00 };
     try testing.expectError(error.BadTrailer, decode(&mistyped_trailer));
+    // A V3 data frame whose integrity part is empty.
+    try testing.expectError(error.BadIntegrity, decode(&[_]u8{ 0x72, 0x03, 0x00, 0x01, 0xAA, 0x72, 0x03, 0x00, 0x00 }));
+    // A connect frame with an octet after its data.
+    try testing.expectError(error.BadTrailer, decode(&[_]u8{ 0x72, 0x01, 0x00, 0x01, 0xAA, 0xBB }));
 }
 
 test "encode refuses an integrity part on a type that has none" {

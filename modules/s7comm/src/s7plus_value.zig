@@ -547,6 +547,13 @@ test "an over-wide VLQ is VarIntTooLong, not an overflow" {
     // A value that fits in 5 octets of framing but exceeds u32.
     const big = [_]u8{ 0x9F, 0xFF, 0xFF, 0xFF, 0x7F };
     try testing.expectError(error.VarIntTooLong, getVarUint(u32, &big, 5));
+    // max_octets is a count of octets, inclusive: a sixth one is refused even
+    // when the value it would complete is small.
+    const six = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+    try testing.expectError(error.VarIntTooLong, getVarUint(u32, &six, 5));
+    // A signed value below the target's minimum: -129 for an i8.
+    try testing.expectError(error.VarIntTooLong, getVarInt(i8, &[_]u8{ 0xFE, 0x7F }, 5));
+    try testing.expectEqual(@as(i8, -128), (try getVarInt(i8, &[_]u8{ 0xFF, 0x00 }, 5)).value);
 }
 
 test "reserved flag bit is refused" {
