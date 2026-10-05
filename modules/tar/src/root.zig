@@ -317,7 +317,13 @@ pub const Reader = struct {
             self.pax_mtime = null;
             if (size > std.math.maxInt(u64) - block_size) return error.BadHeader;
 
-            const kind: Kind = switch (h.typeflag) {
+            // Pre-POSIX tars had no directory typeflag: a NUL typeflag ("old
+            // regular file") whose name ends in '/' is a directory. GNU tar
+            // 1.35 and Go both read it so; this reader called it an empty
+            // file, which an extractor would create in place of the directory.
+            // Only NUL: a '0' entry named "dir/" stays a file for both.
+            const old_dir = h.typeflag == 0 and std.mem.endsWith(u8, std.mem.sliceTo(self.path_buf, 0), "/");
+            const kind: Kind = if (old_dir) .dir else switch (h.typeflag) {
                 0, '0', '7' => .file, // '7' = contiguous, treated as regular
                 '5' => .dir,
                 '2' => .symlink,
@@ -342,7 +348,7 @@ pub const Reader = struct {
             // `tar tf` for each of '1','2','3','4','5','6', and 2 entries for
             // '7'. Contiguous files ('7') DO carry content, which is why they
             // are deliberately absent here and stay on the `else` arm.
-            const carries_content = switch (h.typeflag) {
+            const carries_content = !old_dir and switch (h.typeflag) {
                 '1', '2', '3', '4', '5', '6' => false,
                 else => true,
             };
@@ -498,7 +504,8 @@ fn parsePaxTime(value: []const u8) error{BadHeader}!?PaxTime {
     const dot = std.mem.indexOfScalar(u8, rest, '.');
     const int_part = if (dot) |d| rest[0..d] else rest;
     const frac_part = if (dot) |d| rest[d + 1 ..] else "";
-    if (int_part.len == 0 or (dot != null and frac_part.len == 0)) return error.BadHeader;
+    // "1." (an empty fraction) is 1 s: GNU tar 1.35 and Go both read it so.
+    if (int_part.len == 0) return error.BadHeader;
     for (int_part) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
     for (frac_part) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
     const mag = std.fmt.parseInt(u64, int_part, 10) catch return error.BadHeader;
@@ -520,13 +527,22 @@ fn parseHeader(block: *const [block_size]u8) error{BadHeader}!Hdr {
         .name = nullStr(block[0..100]),
         .prefix = if (posix_magic) nullStr(block[345..500]) else "",
         .linkname = nullStr(block[157..257]),
-        .mode = @truncate(octal(block[100..108])),
-        .uid = @truncate(octal(block[108..116])),
-        .gid = @truncate(octal(block[116..124])),
-        .mtime = @bitCast(octal(block[136..148])),
+        .mode = try numField(u32, block[100..108]),
+        .uid = try numField(u32, block[108..116]),
+        .gid = try numField(u32, block[116..124]),
+        .mtime = try numField(i64, block[136..148]),
         .size = try sizeField(block[124..136]),
         .typeflag = block[156],
     };
+}
+
+/// A numeric header field as `T`: octal text, or the GNU/star base-256 form
+/// (`numeric`). A value outside `T` -- a negative or over-`u32` id, a mode
+/// that is not a mode -- is `error.BadHeader`: `Entry` cannot carry it, and
+/// keeping its low bits would report a different owner than the archive
+/// states (GNU tar 1.35 refuses the same values, "out of uid_t range").
+fn numField(comptime T: type, field: []const u8) error{BadHeader}!T {
+    return std.math.cast(T, try numeric(field)) orelse error.BadHeader;
 }
 
 /// Header checksum: unsigned sum of all bytes with the checksum field taken
@@ -565,30 +581,47 @@ fn nullStr(s: []const u8) []const u8 {
     return std.mem.sliceTo(s, 0);
 }
 
-/// Parse a zero/space-padded octal numeric field (mode/uid/gid/mtime).
-/// Lenient — garbage yields 0 (busybox emits oddly padded fields); the
-/// header as a whole is validated by its checksum.
-fn octal(field: []const u8) u64 {
-    const trimmed = std.mem.trim(u8, field, " \x00");
-    if (trimmed.len == 0) return 0;
-    return std.fmt.parseInt(u64, trimmed, 8) catch 0;
-}
-
-/// The size field: octal, or GNU/star base-256 when the leading byte is 0x80.
-/// Base-256 carries an 88-bit magnitude (the 11 bytes after the marker); only
-/// the low 64 of those fit `u64` (`field[4..12]`), so a header whose magnitude
-/// sets any of the high 3 bytes (`field[1..4]`) encodes a size >= 2^64 and is
-/// rejected rather than silently truncated to its low 64 bits.
-fn sizeField(field: []const u8) error{BadHeader}!u64 {
-    if (field.len == 12 and field[0] == 0x80) {
-        for (field[1..4]) |b| {
-            if (b != 0) return error.BadHeader;
-        }
-        var v: u64 = 0;
-        for (field[4..12]) |b| v = (v << 8) | b;
+/// Parse a numeric header field (mode/uid/gid/size/mtime) in either form a
+/// writer uses:
+///  - octal text, padded with spaces or NULs on either side (busybox and old
+///    tars pad oddly); all-padding is 0. Anything else in the digits -- a
+///    letter, an `8`, a sign, an inner space -- is `error.BadHeader`. Lenient
+///    parsing used to read such a field as 0, which for a uid is root.
+///  - GNU/star base-256: a leading 0x80 (positive; the remaining bytes are a
+///    big-endian magnitude) or 0xff (negative, two's complement over the whole
+///    field). GNU tar writes it for an id over 2 097 151 and for a negative or
+///    far-future mtime; reading it as octal garbage reported uid 3000000 as 0.
+///    Any other leading byte with the high bit set is `error.BadHeader`.
+/// The result spans every 8- and 12-byte field (12 bytes are 96 bits).
+fn numeric(field: []const u8) error{BadHeader}!i128 {
+    std.debug.assert(field.len <= 12);
+    if (field.len > 0 and field[0] & 0x80 != 0) {
+        const neg = switch (field[0]) {
+            0x80 => false,
+            0xff => true,
+            else => return error.BadHeader,
+        };
+        var v: i128 = if (neg) -1 else 0;
+        for (field[1..]) |b| v = (v << 8) | b;
         return v;
     }
-    return octal(field);
+    const lead = std.mem.trimStart(u8, field, " \x00");
+    const digits = std.mem.trimEnd(u8, std.mem.sliceTo(lead, 0), " ");
+    // Only padding may follow a NUL: "0001750\x00" yes, "12\x0034" no.
+    for (lead[std.mem.sliceTo(lead, 0).len..]) |c| if (c != 0 and c != ' ') return error.BadHeader;
+    var v: i128 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '7') return error.BadHeader;
+        v = v * 8 + (c - '0');
+    }
+    return v;
+}
+
+/// The size field (`numeric`): negative is `error.BadHeader`, and so is a
+/// base-256 magnitude of 2^64 or more (the 11 bytes after the marker carry 88
+/// bits) rather than its low 64 bits.
+fn sizeField(field: []const u8) error{BadHeader}!u64 {
+    return std.math.cast(u64, try numeric(field)) orelse error.BadHeader;
 }
 
 pub fn padding(size: u64) u64 {
@@ -971,12 +1004,48 @@ pub const PackError = error{ UnsupportedKind, FieldOutOfRange } || Allocator.Err
 pub fn packTarGz(gpa: Allocator, dst: *std.Io.Writer, entries: []const ContentEntry) PackError!void {
     const window = try gpa.alloc(u8, flate.max_window_len);
     defer gpa.free(window);
-    var comp = try flate.Compress.init(dst, window, .gzip, .default);
+    var stage: GzStage = undefined;
+    const out = stage.output(dst);
+    var comp = try flate.Compress.init(out, window, .gzip, .default);
     const tw = Writer.init(&comp.writer);
     for (entries) |ce| try tw.writeEntry(ce.entry, ce.content);
     try tw.finish();
     try comp.finish();
+    try stage.finish(out);
 }
+
+/// `flate.Compress` asserts that its output writer buffers more than 8
+/// bytes. A `std.Io.Writer.Allocating` from `.init` starts with no buffer at
+/// all, and so does an unbuffered file writer: packing into either tripped
+/// that assertion (a panic in safe builds, undefined behaviour in
+/// ReleaseFast), found when the Go oracle's interop program packed into one.
+/// Such a `dst` gets this pass-through instead: the compressed bytes are
+/// staged in its own buffer and forwarded to `dst` on every drain. A `dst`
+/// that buffers enough is used directly, exactly as before.
+const GzStage = struct {
+    dst: *std.Io.Writer,
+    buf: [4096]u8,
+    writer: std.Io.Writer,
+
+    fn output(self: *GzStage, dst: *std.Io.Writer) *std.Io.Writer {
+        if (dst.buffer.len > 8) return dst;
+        self.* = .{ .dst = dst, .buf = undefined, .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } } };
+        self.writer.buffer = &self.buf;
+        return &self.writer;
+    }
+
+    /// Hand what is still staged to `dst` (whose own flush stays the caller's).
+    fn finish(self: *GzStage, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (out == &self.writer) try self.writer.flush();
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *GzStage = @alignCast(@fieldParentPtr("writer", w));
+        try self.dst.writeAll(w.buffered());
+        w.end = 0;
+        return self.dst.writeSplat(data, splat);
+    }
+};
 
 // ── filesystem packer (Linux — statx numeric attrs) ────────────────────────
 
@@ -1010,7 +1079,9 @@ pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.
 
     const window = try gpa.alloc(u8, flate.max_window_len);
     defer gpa.free(window);
-    var comp = try flate.Compress.init(dst, window, .gzip, .default);
+    var stage: GzStage = undefined;
+    const out = stage.output(dst);
+    var comp = try flate.Compress.init(out, window, .gzip, .default);
     const tw = Writer.init(&comp.writer);
 
     var stats: PackStats = .{};
@@ -1024,6 +1095,7 @@ pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.
 
     try tw.finish();
     try comp.finish();
+    try stage.finish(out);
     return stats;
 }
 
@@ -1129,12 +1201,45 @@ test "octal field emit + padding" {
 }
 
 test "octal + size parsing" {
-    try testing.expectEqual(@as(u64, 0o644), octal("0000644\x00"));
-    try testing.expectEqual(@as(u64, 0o755), octal("0000755 "));
-    try testing.expectEqual(@as(u64, 0), octal("\x00\x00\x00"));
-    try testing.expectEqual(@as(u64, 0), octal("garbage!"));
+    try testing.expectEqual(@as(i128, 0o644), try numeric("0000644\x00"));
+    try testing.expectEqual(@as(i128, 0o755), try numeric("0000755 "));
+    try testing.expectEqual(@as(i128, 0o1750), try numeric("  1750 \x00"));
+    try testing.expectEqual(@as(i128, 0), try numeric("\x00\x00\x00"));
+    try testing.expectEqual(@as(i128, 0), try numeric("        "));
     var big: [12]u8 = .{ 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0 };
     try testing.expectEqual(@as(u64, 0x1000), try sizeField(&big));
+}
+
+test "numeric fields: garbage is BadHeader, never 0 (a uid of 0 is root)" {
+    // Each was read as 0 before; GNU tar 1.35 refuses every one ("Archive
+    // contains ... where numeric uid_t value expected"), Go as ErrHeader.
+    for ([_][]const u8{ "garbage!", "12x4567\x00", "0001758\x00", "12 3456\x00", "+5\x00", "-5\x00", "12\x0034", "0644 x" }) |f| {
+        testing.expectError(error.BadHeader, numeric(f)) catch |err| {
+            std.debug.print("numeric field not refused: {s}\n", .{f});
+            return err;
+        };
+    }
+}
+
+test "numeric fields: GNU/star base-256 in every field, range-checked per field" {
+    // uid 3000000 as GNU tar --format=gnu writes it (over 0o7777777).
+    const uid: [8]u8 = .{ 0x80, 0, 0, 0, 0, 0x2d, 0xc6, 0xc0 };
+    try testing.expectEqual(@as(u32, 3_000_000), try numField(u32, &uid));
+    // mtime -1 and 1960-01-01: 0xff marker, two's complement.
+    const m1: [12]u8 = @splat(0xff);
+    try testing.expectEqual(@as(i64, -1), try numField(i64, &m1));
+    var m1960: [12]u8 = @splat(0xff);
+    std.mem.writeInt(i64, m1960[4..12], -315_619_200, .big);
+    try testing.expectEqual(@as(i64, -315_619_200), try numField(i64, &m1960));
+    // Values an Entry cannot hold are refused, not truncated.
+    const neg_id: [8]u8 = @splat(0xff);
+    try testing.expectError(error.BadHeader, numField(u32, &neg_id));
+    const id_2p32: [8]u8 = .{ 0x80, 0, 0, 1, 0, 0, 0, 0 };
+    try testing.expectError(error.BadHeader, numField(u32, &id_2p32));
+    try testing.expectError(error.BadHeader, sizeField(&m1));
+    // A high-bit lead other than 0x80/0xff is neither form.
+    const odd: [8]u8 = .{ 0x81, 0, 0, 0, 0, 0, 0, 1 };
+    try testing.expectError(error.BadHeader, numeric(&odd));
 }
 
 test "padding to 512" {
@@ -1435,6 +1540,34 @@ test "Entry.dupe: an OwnedEntry's path/link_target survive a subsequent next() c
     try testing.expectEqualStrings("first-entry.txt", owned.path);
     try testing.expectEqualStrings("first-target", owned.link_target);
     try testing.expectEqual(Kind.symlink, owned.kind);
+}
+
+test "packTarGz into a writer with no buffer of its own (Allocating.init, an unbuffered sink)" {
+    // Both tripped flate.Compress's `output.buffer.len > 8` assertion before
+    // the GzStage pass-through.
+    const gpa = testing.allocator;
+    const entries = [_]ContentEntry{
+        .{ .entry = .{ .path = "a.txt", .mode = 0o644, .mtime = 1_600_000_000 }, .content = "hello\n" ** 300 },
+        .{ .entry = .{ .path = "d", .kind = .dir, .mode = 0o755 } },
+    };
+    var buffered: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer buffered.deinit();
+    try packTarGz(gpa, &buffered.writer, &entries);
+
+    var empty: std.Io.Writer.Allocating = .init(gpa);
+    defer empty.deinit();
+    try packTarGz(gpa, &empty.writer, &entries);
+    try testing.expectEqualSlices(u8, buffered.written(), empty.written());
+
+    // A writer with an 8-byte buffer: still under the assertion's floor.
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var tiny_buf: [8]u8 = undefined;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var tiny = std.Io.Writer.Hashed(Sha256).initHasher(&sink.writer, .init(.{}), &tiny_buf);
+    try packTarGz(gpa, &tiny.writer, &entries);
+    try tiny.writer.flush();
+    try testing.expectEqualSlices(u8, buffered.written(), sink.written());
 }
 
 test "gzip round-trip: packTarGz -> flate.Decompress -> Reader" {
@@ -1817,6 +1950,8 @@ test "pax mtime parsing: sign, fraction, floor semantics, digit cut-off" {
         .{ .in = "1.000000001", .sec = 1, .nsec = 1 },
         .{ .in = "1.1234567899999", .sec = 1, .nsec = 123_456_789 }, // cut, not rounded
         .{ .in = "007.0", .sec = 7, .nsec = 0 },
+        .{ .in = "1.", .sec = 1, .nsec = 0 },
+        .{ .in = "-1.", .sec = -1, .nsec = 0 },
         .{ .in = "-1", .sec = -1, .nsec = 0 },
         .{ .in = "-1.25", .sec = -2, .nsec = 750_000_000 }, // floor: -2 + 0.75
         .{ .in = "-0.5", .sec = -1, .nsec = 500_000_000 },
@@ -1838,7 +1973,7 @@ test "pax mtime parsing: sign, fraction, floor semantics, digit cut-off" {
     }
     try testing.expectEqual(@as(?PaxTime, null), try parsePaxTime(""));
     const bad = [_][]const u8{
-        "-",   ".5",  "-.5",  "1.",  "1.2.3", "--1",  "+1",                  " 1",                   "1 ",
+        "-",   ".5",  "-.5",  "-.",  "1.2.3", "--1",  "+1",                  " 1",                   "1 ",
         "abc", "1e9", "0x10", "1,5", "1.5x",  "1.-5", "9223372036854775808", "-9223372036854775808", "99999999999999999999999",
     };
     for (bad) |v| {
@@ -1854,7 +1989,7 @@ test "pax 'x' uid/gid/mtime: garbage, overflow or a lying length -> error.BadHea
         .{ "uid", "x" }, .{ "uid", "-1" }, .{ "uid", "+1" },
         .{ "uid", "1e3" },     .{ "uid", " 5" },              .{ "uid", "4294967296" }, // over u32
         .{ "gid", "0x10" },    .{ "gid", "5.5" },             .{ "gid", "99999999999999999999" },
-        .{ "mtime", "abc" },   .{ "mtime", "1." },            .{ "mtime", ".5" },
+        .{ "mtime", "abc" },   .{ "mtime", "-." },            .{ "mtime", ".5" },
         .{ "mtime", "1.2.3" }, .{ "mtime", "1727700007.5x" }, .{ "mtime", "9223372036854775808" },
     };
     for (pairs) |kv| {
@@ -2892,4 +3027,5 @@ test "writer: 8 GiB - 1 is still octal; 8 GiB needs base-256, and a pax 'size' r
 test {
     _ = @import("write_golden_test.zig");
     _ = @import("pax_test.zig");
+    _ = @import("go_oracle.zig");
 }

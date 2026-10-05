@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fixes** found by a Go archive/tar differential oracle (`tools/go_oracle/`,
+  replayed by `src/go_oracle.zig`, re-taken by `zig build interop-tar`): GNU/star base-256 is now read in
+  every numeric field, not only `size` — a uid over 2 097 151 from `tar --format=gnu` was read as 0
+  (root), a negative or far-future mtime as 0. A numeric field holding anything but octal digits and
+  padding (`12x4567`, an `8`, a sign, an inner space) is now `error.BadHeader`; it was read as 0. A
+  base-256 id that does not fit `u32` (negative, ≥ 2^32) is `error.BadHeader`, as GNU tar refuses it. A
+  NUL-typeflag entry whose name ends in `/` is now `.dir` with no content (GNU tar and Go agree; it was
+  an empty `.file`). `packTarGz` and `packDir` no longer trip `flate.Compress`'s assertion on a
+  destination writer with a buffer of 8 bytes or less (`std.Io.Writer.Allocating.init`, an unbuffered
+  file): such a writer gets an internal 4 KiB staging pass-through; output is byte-identical. A pax
+  `mtime` with an empty fraction (`1.`) is accepted as whole seconds (GNU tar and Go do). Anchor grade
+  MIXED → EXTERNAL.
+
 - **2026-10-04** — **Tests:** mutation run (53 schemata mutants, 51 killed, 2 equivalent;
   16 new assertions in 10 tests). Pins the size-overflow guards on the 'g' and pax `size`
   paths, the per-entry scope and deletion (`size=`) of pax records, digit-only pax lengths
