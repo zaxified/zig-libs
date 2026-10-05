@@ -83,6 +83,23 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   NonEscapeCharacter (the character itself) and is emitted the same way. A raw LF/CR inside a string
   stays raw — it is an unterminated string, refused as before. (Until 2026-10-04 they were copied
   raw and `std.json` refused the valid document.)
+- **Strings: JSON5 escapes (2026-10-05).** JSON5 takes ECMAScript 5.1's escapes, a superset of
+  JSON's: `\v` → `\u000b`, `\0` (no digit after it) → `\u0000`, `\xHH` → `\u00HH`, `\'` → `'`,
+  and any other character after `\` (a NonEscapeCharacter) → the character itself (`\q` → `q`,
+  `\é` → `é`). `\1`..`\9`, `\0` before a digit and a short `\x` are not escapes in JSON5 and are
+  left for `std.json` to refuse. An unpaired surrogate escape (`\uD800`) is passed through as the
+  JSON escape it is; `std.json` refuses it (the reference, a JS string, keeps it).
+- **Unquoted keys (2026-10-05):** an identifier is ASCII letters, digits (not first), `_`, `$`,
+  `\uXXXX` escapes spelling such a character or any non-whitespace non-ASCII one, and raw non-ASCII
+  code points that are not JSON5 whitespace — copied into the quoted key unchanged (all valid JSON
+  string content). A superset of ES5.1 IdentifierName (Backlog). A comment may stand between the key
+  and its `:` (JSON5 §6), and the key peek skips it.
+- **Truncated input is not completed (2026-10-05).** Containers left open at the end of input are
+  closed only when the same run already recovered from something (`{a b` → a `$err_trace` entry, then
+  `}`); a document that is merely cut off stays open and `std.json` refuses it, as the reference does.
+  Both entry points apply the rule, so they still agree on whether the result parses.
+- **A dropped `+` keeps two tokens apart:** `1+2` and `1.+3` come out `1 2` / `1 3` (refused),
+  never `12` / `13`.
 - **API:** `preprocess(alloc, input)` / `preprocessAnnotated(alloc, input)` are unchanged;
   `preprocessWithOptions` / `preprocessAnnotatedWithOptions` take `Options{ .non_finite,
   .diagnostic }`. `preprocess` may now also return `error.NonFiniteNumber` and
@@ -185,8 +202,13 @@ Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items
 - ~~Leading `+` sign on numbers~~ — found by the json5-tests corpus.
 - ~~JSON5-only extra whitespace characters~~ (form feed, vertical tab, Unicode
   space/BOM separators) — found by the corpus.
-- Still open: JSON5 string escapes that JSON lacks (`\x41`, `\0`, `\v`, and an escaped non-escape
-  character such as `\a`) are passed through and rejected by `std.json`; not in the two survey items.
+- ~~JSON5 string escapes that JSON lacks (`\x41`, `\0`, `\v`, an escaped non-escape character
+  such as `\a`)~~ — DONE 2026-10-05 (reference JSON5 oracle, see Anchoring).
+- **Unicode ID_Start/ID_Continue for unquoted keys** (reference JSON5 oracle, 2026-10-05): keys
+  take any non-ASCII code point that is not JSON5 whitespace, a superset of ES5.1 IdentifierName
+  (the reference refuses e.g. an emoji key; this module quotes it). Exact classes need Unicode
+  general-category tables (Lu Ll Lt Lm Lo Nl / Mn Mc Nd Pc) — none in this module or a sibling.
+  Effort: medium (a generated range table, pinned to one Unicode version). Fits §2.
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
   `{ out, next_id }` pair; no structured line/col/severity type yet).
 - **DONE 2026-09-30 — JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a
@@ -209,6 +231,8 @@ in src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/json5_tests_test.zig drives preprocess through the upstream json5/json5-tests corpus (src/testdata/json5-tests) honouring its extension convention in both directions, with one known_disagreement pinned; the error-recovery design ($err_trace_N) that root.zig's 27 tests cover is this module's own invention and has no external answer
+**What the tests actually contain.** src/json5_tests_test.zig drives preprocess through the upstream json5/json5-tests corpus (src/testdata/json5-tests) honouring its extension convention in both directions, with one known_disagreement pinned; src/ref_oracle_test.zig replays the reference `json5` package (2.2.3, under bun, `tools/ref_oracle.js` → `ref_oracle_vectors.zig`) on 2672 documents generated from the JSON5 grammar plus single-character mutations: every value the reference parses must come out of `preprocess` + `std.json` identical (doubles by bit pattern, strings by UTF-16 unit, objects by key), every document it refuses must be refused or carry this module's `$err_trace` recovery marker — never silently valid; one listed class (unpaired surrogate escapes, refused by `std.json`). Self only: the error-recovery design ($err_trace_N, `preprocessAnnotated`) that root.zig's tests cover is this module's own invention and has no external answer
+
+**Reference oracle 2026-10-05.** It found five defects, fixed the same day: JSON5-only string escapes (`\v`, `\0`, `\xHH`, NonEscapeCharacters, `\'` in double quotes) made `std.json` refuse valid documents; non-ASCII and `\u`-escaped unquoted keys went into recovery; so did a comment between a key and its colon; a TRUNCATED document was silently completed by EOF auto-close (`{"servers": [{"host": "a"}` read as valid); a dropped `+` joined two numbers (`1+2` → `12`). Result: 1106 of 1204 reference values agree, the other 98 hold an unpaired surrogate; of 1468 refusals, 65 are met by recovery and the rest refused. `bun tools/ref_oracle.js --check` re-takes the vectors.
 
 **How it got there.** The anchoring work landed. DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed

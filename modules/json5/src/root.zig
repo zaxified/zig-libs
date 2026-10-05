@@ -98,8 +98,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         i += 1 + lt;
                         continue;
                     }
-                    try appendEscape(&out, alloc, input[i + 1]);
-                    i += 2;
+                    i += 1 + try appendEscape(&out, alloc, input, i + 1);
                     continue;
                 }
                 try appendStringByte(&out, alloc, sc);
@@ -123,13 +122,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         i += lt;
                         continue;
                     }
-                    const esc = input[i];
-                    i += 1;
-                    if (esc == '\'') {
-                        try out.append(alloc, '\''); // \' → ' (unescape)
-                    } else {
-                        try appendEscape(&out, alloc, esc);
-                    }
+                    i += try appendEscape(&out, alloc, input, i); // \' → ' among them
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\""); // escape " inside
                 } else if (sc == '\'') {
@@ -262,12 +255,12 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
             },
             // ── unquoted identifier in key position ─────────────────────────
             else => {
-                if (key_pos and (std.ascii.isAlphabetic(c) or c == '_' or c == '$')) {
+                if (key_pos and identUnitLen(input, i, true) > 0) {
                     const key_start = i;
                     while (i < input.len) {
-                        const kc = input[i];
-                        if (!std.ascii.isAlphanumeric(kc) and kc != '_' and kc != '$') break;
-                        i += 1;
+                        const n = identUnitLen(input, i, i == key_start);
+                        if (n == 0) break;
+                        i += n;
                     }
                     // Peek ahead past whitespace to find ':'. ALL JSON5
                     // whitespace, line terminators included (JSON5 §6:
@@ -275,7 +268,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                     // tokens), as the annotated entry point does. This used to
                     // skip horizontal space only, so the valid `{a\n: 1}`
                     // went into error recovery (audit 2026-10-04).
-                    const j = skipJson5Ws(input, i);
+                    const j = skipJson5WsAndComments(input, i);
                     if (j >= input.len or input[j] == ':') {
                         // Normal path: output quoted key
                         try out.append(alloc, '"');
@@ -381,11 +374,20 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
     // that the output parses. The oracle that would have caught it was written
     // during the W2 re-audit (`json5` F2) and had never executed on a single
     // input, because the harness's length draw collapsed to 0 (2026-09-07).
-    while (nest.items.len > 0) {
+    //
+    // ⛔ ...but ONLY when this run already recovered from something. Closing
+    // whatever was open regardless turned a merely TRUNCATED document into a
+    // complete one with no trace: `{"servers": [{"host": "a"}` came back as
+    // the valid `{"servers": [{"host": "a"}]}`, a config cut off mid-write
+    // read as one with fewer entries. The reference JSON5 refuses it, and so
+    // does `std.json` now that it is left open (the reference JSON5 oracle,
+    // 2026-10-05). `preprocessAnnotated` applies the same rule, so the two
+    // still agree on whether the result parses.
+    if (err_counter > 0) while (nest.items.len > 0) {
         removeTrailingComma(&out);
         try out.append(alloc, if (nest.items[nest.items.len - 1] == '{') @as(u8, '}') else @as(u8, ']'));
         _ = nest.pop();
-    }
+    };
 
     return out.toOwnedSlice(alloc);
 }
@@ -441,6 +443,45 @@ pub const hex_digits_max = 256;
 
 /// 16^256 = 2^1024 < 10^309, i.e. 35 limbs of nine decimal digits; one spare.
 const hex_limbs_max = 36;
+
+/// Byte length of one IdentifierName unit of an unquoted key at `i` (JSON5
+/// §3, ECMAScript 5.1 §7.6), or 0: an ASCII letter, `_` or `$` (a digit too
+/// when not `start`), a `\uXXXX` escape (kept as is -- it is a JSON escape
+/// too), or one non-ASCII code point that is not JSON5 whitespace or a line
+/// terminator. Copied into the quoted key unchanged, all three are valid JSON
+/// string content.
+///
+/// Non-ASCII is NOT checked against Unicode ID_Start/ID_Continue (no tables
+/// in this module): a superset -- the reference refuses an emoji key, this
+/// module quotes it (SPEC Backlog). Until 2026-10-05 only ASCII was taken,
+/// so `{é: 1}`, `{π: 1}`, `{a\u0062: 1}` and keys with ZWNJ/ZWJ or combining
+/// marks went into `$err_trace` recovery (the reference JSON5 oracle).
+fn identUnitLen(input: []const u8, i: usize, start: bool) usize {
+    const c = input[i];
+    if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') return 1;
+    if (std.ascii.isDigit(c)) return if (start) 0 else 1;
+    if (c == '\\') {
+        if (i + 6 > input.len or input[i + 1] != 'u') return 0;
+        const cp = std.fmt.parseInt(u16, input[i + 2 .. i + 6], 16) catch return 0;
+        if (cp < 0x80) {
+            const b: u8 = @intCast(cp);
+            const ok = std.ascii.isAlphabetic(b) or b == '_' or b == '$' or (!start and std.ascii.isDigit(b));
+            return if (ok) 6 else 0;
+        }
+        // A surrogate half has no character of its own; JSON5 whitespace
+        // and line terminators are never identifier parts.
+        if (cp >= 0xD800 and cp <= 0xDFFF) return 0;
+        if (cp == 0xA0 or cp == 0xFEFF or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or
+            cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000) return 0;
+        return 6;
+    }
+    if (c < 0x80) return 0;
+    if (json5WsLen(input, i) > 0) return 0;
+    const n = std.unicode.utf8ByteSequenceLength(c) catch return 0;
+    if (i + n > input.len) return 0;
+    _ = std.unicode.utf8Decode(input[i..][0..n]) catch return 0;
+    return n;
+}
 
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
@@ -536,6 +577,14 @@ fn emitNumber(
     var negative = false;
     if (i < input.len and (input[i] == '+' or input[i] == '-')) {
         negative = input[i] == '-';
+        // The `+` is dropped, but it was the only thing between this token
+        // and the one before: `1+2` came out `12` and `1.+3` `13` -- two
+        // values joined into one, the `[1/*c*/2]` failure again (the
+        // reference JSON5 oracle, 2026-10-05). A space keeps them two, and
+        // `std.json` refuses them as the reference does.
+        if (input[i] == '+' and out.items.len > 0 and isIdentByte(out.items[out.items.len - 1]) and
+            i + 1 < input.len and (std.ascii.isDigit(input[i + 1]) or input[i + 1] == '.'))
+            try out.append(alloc, ' ');
         i += 1;
     }
 
@@ -675,6 +724,27 @@ fn lineTerminatorLen(input: []const u8, i: usize) usize {
 
 /// First index at or after `from` that is not JSON5 whitespace: space, tab,
 /// CR, LF, and the JSON5-only kinds (U+2028/U+2029 among them).
+/// `skipJson5Ws`, also past whole `//` and `/* */` comments: JSON5 §6 lets
+/// a comment stand wherever whitespace may, so `{a /* c */: 1}` has its colon
+/// after the comment. An unterminated `/*` stops the skip at its start (the
+/// main loop then refuses it as before). Until 2026-10-05 the key peek
+/// stopped at the comment and sent a valid key into `$err_trace` recovery
+/// (the reference JSON5 oracle).
+fn skipJson5WsAndComments(input: []const u8, from: usize) usize {
+    var j = skipJson5Ws(input, from);
+    while (j + 1 < input.len and input[j] == '/') {
+        if (input[j + 1] == '/') {
+            j += 2;
+            while (j < input.len and lineTerminatorLen(input, j) == 0) j += 1;
+        } else if (input[j + 1] == '*') {
+            const end = std.mem.indexOfPos(u8, input, j + 2, "*/") orelse return j;
+            j = end + 2;
+        } else break;
+        j = skipJson5Ws(input, j);
+    }
+    return j;
+}
+
 fn skipJson5Ws(input: []const u8, from: usize) usize {
     var j = from;
     while (j < input.len) {
@@ -711,16 +781,48 @@ fn appendStringByte(out: *std.ArrayList(u8), alloc: std.mem.Allocator, b: u8) !v
     }
 }
 
-/// Append the escape `\` + `esc` (`esc` not a line terminator: the callers
-/// remove those as line continuations first). A control character after `\`
-/// is a JSON5 `NonEscapeCharacter`, i.e. the character itself (JSON5 §5,
-/// ECMAScript 5.1 §7.8.4), so it is emitted as `appendStringByte` would emit
-/// it raw -- `\` + TAB in JSON would be an invalid escape. Everything else is
-/// copied as the two bytes it was.
-fn appendEscape(out: *std.ArrayList(u8), alloc: std.mem.Allocator, esc: u8) !void {
-    if (esc < 0x20 and esc != '\n' and esc != '\r') return appendStringByte(out, alloc, esc);
-    try out.append(alloc, '\\');
-    try out.append(alloc, esc);
+/// Append the JSON form of the JSON5 escape whose character is `input[at]`
+/// (the byte after `\`; never a line terminator: the callers remove those as
+/// line continuations first) and return how many bytes of `input` it used.
+/// JSON5 §5 takes ECMAScript 5.1's escapes (§7.8.4), a superset of JSON's:
+///  - `\b \f \n \r \t \" \\ \/` and `\uXXXX` are JSON already;
+///  - `\v` is U+000B, `\0` (no digit after it) U+0000, `\xHH` U+00HH -- written
+///    as `\u` escapes; `\'` is `'`;
+///  - any other character after `\` is a NonEscapeCharacter: the character
+///    itself (`\q` is `q`, `\é` is `é`, `\` + TAB a TAB, written as
+///    `appendStringByte` writes it);
+///  - `\1`..`\9`, `\0` before a digit and a `\x` without two hex digits are
+///    not escapes in JSON5: they are copied as they were, and `std.json`
+///    refuses them, as the reference does.
+/// Until 2026-10-05 everything but a control character was copied as the two
+/// bytes it was, so `\v`, `\0`, `\x41`, `\q`, `\é` and, in a double-quoted
+/// string, `\'` made `std.json` refuse a valid document (the reference JSON5
+/// oracle, `ref_oracle_test.zig`).
+fn appendEscape(out: *std.ArrayList(u8), alloc: std.mem.Allocator, input: []const u8, at: usize) !usize {
+    const esc = input[at];
+    switch (esc) {
+        'b', 'f', 'n', 'r', 't', '"', '\\', '/', 'u', '1'...'9' => {
+            try out.append(alloc, '\\');
+            try out.append(alloc, esc);
+        },
+        'v' => try out.appendSlice(alloc, "\\u000b"),
+        '\'' => try out.append(alloc, '\''),
+        '0' => if (at + 1 < input.len and std.ascii.isDigit(input[at + 1]))
+            try out.appendSlice(alloc, "\\0")
+        else
+            try out.appendSlice(alloc, "\\u0000"),
+        'x' => {
+            if (at + 2 < input.len and std.ascii.isHex(input[at + 1]) and std.ascii.isHex(input[at + 2])) {
+                try out.appendSlice(alloc, "\\u00");
+                try out.append(alloc, std.ascii.toLower(input[at + 1]));
+                try out.append(alloc, std.ascii.toLower(input[at + 2]));
+                return 3;
+            }
+            try out.appendSlice(alloc, "\\x");
+        },
+        else => try appendStringByte(out, alloc, esc),
+    }
+    return 1;
 }
 
 /// The `:` that terminates a malformed key, starting the search at `from`.
@@ -1071,8 +1173,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 }
                 i += 1;
                 if (sc == '\\' and i < input.len) {
-                    try appendEscape(&out, alloc, input[i]);
-                    i += 1;
+                    i += try appendEscape(&out, alloc, input, i);
                 } else {
                     try appendStringByte(&out, alloc, sc);
                 }
@@ -1130,13 +1231,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                         i += lt;
                         continue;
                     }
-                    const esc = input[i];
-                    i += 1;
-                    if (esc == '\'') {
-                        try out.append(alloc, '\'');
-                    } else {
-                        try appendEscape(&out, alloc, esc);
-                    }
+                    i += try appendEscape(&out, alloc, input, i);
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\"");
                 } else if (sc == '\'') {
@@ -1268,16 +1363,16 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 i += 1;
             },
             else => {
-                if (key_pos and (std.ascii.isAlphabetic(c) or c == '_' or c == '$')) {
+                if (key_pos and identUnitLen(input, i, true) > 0) {
                     const key_start = i;
                     while (i < input.len) {
-                        const kc = input[i];
-                        if (!std.ascii.isAlphanumeric(kc) and kc != '_' and kc != '$') break;
-                        i += 1;
+                        const n = identUnitLen(input, i, i == key_start);
+                        if (n == 0) break;
+                        i += n;
                     }
                     // Peek past ALL whitespace incl. \n/\r — catches keys
                     // split by a newline (`file_type_o\n  ut: ...`).
-                    const j = skipJson5Ws(input, i);
+                    const j = skipJson5WsAndComments(input, i);
                     if (j >= input.len or input[j] == ':') {
                         try out.append(alloc, '"');
                         try out.appendSlice(alloc, input[key_start..i]);
@@ -1463,12 +1558,14 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
     } else {
         dropValueErrs(alloc, &pending_value_errs);
     }
-    while (nest.items.len > 0) {
+    // Only after a recovery, as in `preprocessWithOptions`: a document that
+    // is merely truncated stays open and does not parse (2026-10-05).
+    if (counter > 0) while (nest.items.len > 0) {
         const top = nest.items[nest.items.len - 1];
         removeTrailingComma(&out);
         try out.append(alloc, if (top == '{') @as(u8, '}') else @as(u8, ']'));
         _ = nest.pop();
-    }
+    };
 
     return .{ .out = try out.toOwnedSlice(alloc), .next_id = counter + 1 };
 }
@@ -1937,9 +2034,15 @@ test "corpus: every seed reaches both entry points, and the rewriting they do is
     // `preprocess` now reads the seed `{a\n: 1, b: 2}` as the valid JSON5 it
     // is, `{"a"\n: 1, "b": 2}` (18 octets), where it used to emit the 63-octet
     // `{"$err_trace_1": "a: '1' --> malformed key at line 1", "b": 2}`.
-    try std.testing.expectEqual(@as(usize, 601), octets);
-    try std.testing.expectEqual(@as(usize, 18), rewritten);
-    try std.testing.expectEqual(@as(usize, 4), with_diagnostic);
+    // 2026-10-05: 551 -- the seed `{a /*c*/: 1, b: 2}` is valid JSON5 too (a
+    // comment may stand where whitespace may), now `{"a" : 1, "b": 2}`
+    // instead of a recovery entry 50 octets longer (the reference JSON5 oracle), so
+    // it no longer carries a diagnostic either: 4 -> 3. 550 -- the truncated
+    // seed `{` stays `{` (refused) instead of being closed into `{}` -- and
+    // so is no longer rewritten at all: 18 -> 17.
+    try std.testing.expectEqual(@as(usize, 550), octets);
+    try std.testing.expectEqual(@as(usize, 17), rewritten);
+    try std.testing.expectEqual(@as(usize, 3), with_diagnostic);
 }
 
 test "fuzz: preprocessAnnotated never panics on arbitrary bytes" {
@@ -1994,6 +2097,7 @@ fn jsonParses(alloc: std.mem.Allocator, text: []const u8) bool {
 test {
     _ = @import("json5_tests_vectors.zig");
     _ = @import("json5_tests_test.zig");
+    _ = @import("ref_oracle_test.zig");
 }
 
 test "annotated: an exponent is part of the number, not a bare identifier" {
@@ -2713,4 +2817,82 @@ test "the two entry points agree on whether the new forms parse" {
             try std.testing.expectEqual(plain_ok, jsonParses(alloc, r.out));
         }
     }
+}
+
+// ── found by the reference JSON5 oracle (ref_oracle_test.zig), 2026-10-05 ───
+
+fn expectValue(input: []const u8, want_json: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const out = try preprocess(alloc, input);
+    defer alloc.free(out);
+    const got = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    defer got.deinit();
+    const want = try std.json.parseFromSlice(std.json.Value, alloc, want_json, .{});
+    defer want.deinit();
+    var a: std.Io.Writer.Allocating = .init(alloc);
+    defer a.deinit();
+    var b: std.Io.Writer.Allocating = .init(alloc);
+    defer b.deinit();
+    try std.json.Stringify.value(got.value, .{}, &a.writer);
+    try std.json.Stringify.value(want.value, .{}, &b.writer);
+    try std.testing.expectEqualStrings(b.written(), a.written());
+}
+
+fn expectRefusedByBoth(input: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const plain = try preprocess(alloc, input);
+    defer alloc.free(plain);
+    try std.testing.expect(!jsonParses(alloc, plain));
+    const r = try preprocessAnnotated(alloc, input);
+    defer alloc.free(r.out);
+    try std.testing.expect(!jsonParses(alloc, r.out));
+}
+
+test "strings: the JSON5 escapes JSON lacks become their characters" {
+    // \v \0 \xHH were copied as the two bytes they were, and std.json refused
+    // the valid document; so did \q (a NonEscapeCharacter, the character
+    // itself), \é, and \' inside a double-quoted string.
+    try expectValue("['\\v', '\\0', '\\x41\\xe9', '\\q\\é', \"\\'\", '\\/']", "[\"\\u000b\", \"\\u0000\", \"A\\u00e9\", \"q\\u00e9\", \"'\", \"/\"]");
+    // Not escapes in JSON5, still refused: \1..\9, \0 before a digit, a short \x.
+    try expectRefusedByBoth("['\\1']");
+    try expectRefusedByBoth("['\\01']");
+    try expectRefusedByBoth("['\\x4']");
+}
+
+test "unquoted keys: non-ASCII identifier characters and \\u escapes" {
+    // Only ASCII was taken; these went into $err_trace recovery.
+    try expectValue("{é: 1, π: 2, a\\u0062: 3, a\u{200C}: 4, Z\u{0300}: 5}", "{\"é\": 1, \"π\": 2, \"ab\": 3, \"a\u{200C}\": 4, \"Z\u{0300}\": 5}");
+    // An escape that spells a non-identifier character is not an identifier.
+    const alloc = std.testing.allocator;
+    const out = try preprocess(alloc, "{\\u0020: 1}");
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace_") != null);
+}
+
+test "unquoted keys: a comment between the key and its colon" {
+    try expectValue("{a /* c */: 1, b // c\n: 2}", "{\"a\": 1, \"b\": 2}");
+    const alloc = std.testing.allocator;
+    const r = try preprocessAnnotated(alloc, "{a /* c */: 1}");
+    defer alloc.free(r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "$err") == null);
+}
+
+test "a truncated document is refused, not completed" {
+    // EOF auto-close closed whatever was open, so a config cut off mid-write
+    // read as a complete one with fewer entries.
+    try expectRefusedByBoth("{\"servers\": [{\"host\": \"a\"}");
+    try expectRefusedByBoth("[1, 2");
+    try expectRefusedByBoth("{");
+    // ...while recovery that already happened still closes what it opened.
+    const alloc = std.testing.allocator;
+    const out = try preprocess(alloc, "{a b");
+    defer alloc.free(out);
+    try std.testing.expect(jsonParses(alloc, out));
+}
+
+test "numbers: a dropped + never joins two numbers into one" {
+    // `1+2` came out `12`, `1.+3` `13`.
+    try expectRefusedByBoth("[1+2]");
+    try expectRefusedByBoth("1.+3");
+    try expectValue("[+1, +.5]", "[1, 0.5]");
 }

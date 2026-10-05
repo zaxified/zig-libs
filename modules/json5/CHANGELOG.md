@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Found by a new differential oracle against the reference `json5` package
+  (`tools/ref_oracle.js`, replayed by `src/ref_oracle_test.zig`, 2672 generated documents):
+  - **Fix:** JSON5 string escapes JSON lacks (`\v`, `\0`, `\xHH`, `\q`-style NonEscapeCharacters,
+    `\é`, `\'` inside double quotes) are rewritten to their characters; they were copied and
+    `std.json` refused the valid document.
+  - **Fix:** unquoted keys take non-ASCII code points and `\uXXXX` escapes (`{é: 1}`, `{a\u0062: 1}`,
+    ZWNJ/ZWJ, combining marks), and a comment between a key and its `:` (`{a /* c */: 1}`); both went
+    into `$err_trace` recovery.
+  - **BEHAVIOURAL:** a truncated document (`{"servers": [{"host": "a"}`) is no longer completed at
+    EOF: containers are auto-closed only after a recovery in the same run. Before, a config cut off
+    mid-write parsed as a valid one with fewer entries. Both entry points.
+  - **Fix:** a dropped `+` no longer joins two numbers (`1+2` was `12`, `1.+3` `13`).
+
 - **2026-10-04** — Fix: raw control characters (U+0000..U+001F other than LF/CR, e.g. a TAB)
   inside a `"…"` or `'…'` string are valid JSON5 (JSON5 §5) but were copied through unescaped,
   so `std.json` refused the document; both entry points now emit `\t`/`\b`/`\f`/`\u00XX` (also
