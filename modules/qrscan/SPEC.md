@@ -6,7 +6,7 @@
 
 **Scope:** mvp — zxing-cpp 3.1.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation none
+**Audit:** review 2026-09-04 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -315,6 +315,31 @@ binarisation is deciding a module from a pixel or two.
 
 The three defects above were all found this way rather than by reading the code,
 which is the argument for rendering the input instead of hand-writing bitmaps.
+
+**Mutation run 2026-10-05** (in-place, Debug, 33 mutants over `scan`'s input
+gates, the scratch arithmetic, binarisation, the finder ratio/ring/vertical
+tests, `orient`, the sampler's bounds, the alignment-run walk, outlier rejection,
+the dimension referee, the label table, `solve8` and `readable`): 26 killed. The
+first pass left 19; ten tests were added (both dimension gates exact at 20/21 and
+`max_dimension + 1` with a real buffer behind each — the old over-max test passed
+on the luma check for an empty slice; scratch one byte short; a block at exactly
+`min_contrast` and a pixel exactly at the threshold; a finder whose vertical
+module is 2.5x its horizontal one; a non-square triple refused by `orient`;
+`insideImage` at `x == width`; a light band over 1.5 modules in `alignmentRun`;
+the last label before exhaustion; `solve8` needing a pivot; `readable` on a
+message longer than its probe buffer). Six are equivalent: the candidate-centre
+dark check in `confirmVertical` (the centre is always inside a dark run), the
+`d[0] < 1` guard in `tripleScore` (a coincident pair already scores >= 2 on leg
+error, or NaN, never chosen), `Grid.at`'s horizon guard and `insideImage`'s
+finiteness check (each other's backstop: NaN and ±inf fail its range compares),
+`alignmentRun`'s image-edge refusal (an edge run has an empty light band, which
+the half-module floor refuses), and the rms gate that withholds the projective
+grid from a flat symbol (versions 7/10/14, 0–352.5° in 7.5° steps at 3 and 4
+px/module all read with it removed: the timing referee picks the affine grid
+anyway; the gate only saves sampling). One survivor is left without a test: the
+ring test's `!= 0` (label table exhausted) clause — reaching it needs an image
+that exhausts the 4096 labels and then places a decoy whose centre was labelled
+before exhaustion and whose bars were not.
 
 ## Anchoring
 

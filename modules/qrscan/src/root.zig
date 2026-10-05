@@ -2815,3 +2815,167 @@ test "TEETH: fuzzScan's single smoke run produces a scannable image, not a 1x1 f
     try std.testing.expect(w >= 21);
     try std.testing.expect(h >= 21);
 }
+
+// ── mutation-run tests (2026-10-05) ─────────────────────────────────────────
+
+test "the dimension gate is exact at both ends, with a real buffer behind each refusal" {
+    // Each image has a `luma` of the full `stride * height`, so the luma check
+    // cannot be the reason it is refused; an empty scratch then says which gate
+    // let it through (ScratchTooSmall) and which did not (BadImage).
+    const t = std.testing;
+    var no_scratch: [0]u8 = undefined;
+    const buf = try t.allocator.alloc(u8, @as(usize, max_dimension + 1) * 21);
+    defer t.allocator.free(buf);
+    @memset(buf, 128);
+
+    try t.expectError(Error.BadImage, scan(.{ .luma = buf, .width = 20, .height = 21, .stride = 20 }, &no_scratch));
+    try t.expectError(Error.BadImage, scan(.{ .luma = buf, .width = 21, .height = 20, .stride = 21 }, &no_scratch));
+    try t.expectError(Error.ScratchTooSmall, scan(.{ .luma = buf, .width = 21, .height = 21, .stride = 21 }, &no_scratch));
+    try t.expectError(Error.BadImage, scan(.{ .luma = buf, .width = max_dimension + 1, .height = 21, .stride = max_dimension + 1 }, &no_scratch));
+    try t.expectError(Error.BadImage, scan(.{ .luma = buf, .width = 21, .height = max_dimension + 1, .stride = 21 }, &no_scratch));
+}
+
+test "a scratch buffer one byte short is refused" {
+    const t = std.testing;
+    var pixels: [64 * 64]u8 = undefined;
+    @memset(&pixels, 255);
+    const img: Image = .{ .luma = &pixels, .width = 64, .height = 64, .stride = 64 };
+    var scratch: [scratchSize(64, 64)]u8 = undefined;
+    try t.expectError(Error.ScratchTooSmall, scan(img, scratch[0 .. scratch.len - 1]));
+}
+
+test "binarize: a block at exactly min_contrast has edges, and a pixel at the threshold is light" {
+    const t = std.testing;
+    // One 8x8 block, half 100 and half 124: contrast 24 == min_contrast, mean
+    // 112. Two pixels are moved to 112 in a pair that keeps the mean.
+    var pixels: [64]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = if (i % 2 == 0) 100 else 124;
+    pixels[10] = 112;
+    pixels[11] = 112;
+    const img: Image = .{ .luma = &pixels, .width = 8, .height = 8, .stride = 8 };
+    var bitbuf: [8]u8 = undefined;
+    var bits: Bitmap = .{ .bits = &bitbuf, .width = 8, .height = 8 };
+    var means: [1]u8 = undefined;
+    binarize(img, &bits, &means);
+    try t.expectEqual(@as(u8, 112), means[0]);
+    try t.expect(bits.get(0, 0)); // 100 < 112: dark
+    try t.expect(!bits.get(1, 0)); // 124: light
+    try t.expect(!bits.get(2, 1)); // pixel 10 == 112: not below the threshold
+    try t.expect(!bits.get(3, 1)); // pixel 11 == 112
+}
+
+/// Paint a finder pattern with separate horizontal and vertical module sizes.
+fn paintFinder(pixels: []u8, side: usize, x0: usize, y0: usize, mw: usize, mh: usize) void {
+    for (0..7) |my| {
+        for (0..7) |mx| {
+            const ring = mx == 0 or mx == 6 or my == 0 or my == 6;
+            const centre = mx >= 2 and mx <= 4 and my >= 2 and my <= 4;
+            if (!(ring or centre)) continue;
+            for (0..mh) |dy| {
+                for (0..mw) |dx| pixels[(y0 + my * mh + dy) * side + (x0 + mx * mw + dx)] = 0;
+            }
+        }
+    }
+}
+
+test "a finder whose vertical module disagrees with its horizontal one is not a finder" {
+    const t = std.testing;
+    const side = 120;
+    var pixels: [side * side]u8 = undefined;
+    var scratch: [scratchSize(side, side)]u8 = undefined;
+    var finders: [max_candidates]Finder = undefined;
+    const img: Image = .{ .luma = &pixels, .width = side, .height = side, .stride = side };
+
+    // Control: square modules are found.
+    @memset(&pixels, 255);
+    paintFinder(&pixels, side, 30, 30, 4, 4);
+    var ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    try t.expect(locateFinders(&ws.bits, &finders, true, ws.runs).len > 0);
+
+    // 2 px wide, 5 px tall: both axes are 1:1:3:1:1 and the ring is whole,
+    // but the two units differ by more than one unit.
+    @memset(&pixels, 255);
+    paintFinder(&pixels, side, 30, 20, 2, 5);
+    ws = Workspace.carve(img, &scratch);
+    binarize(img, &ws.bits, ws.means);
+    try t.expectEqual(@as(usize, 0), locateFinders(&ws.bits, &finders, true, ws.runs).len);
+}
+
+test "orient refuses three centres that are not the corners of a square" {
+    const t = std.testing;
+    // Legs 100 and 200: a right angle, but nothing like a QR symbol.
+    var f = [_]Finder{
+        .{ .x = 50, .y = 50, .module = 2, .peak = 2 },
+        .{ .x = 150, .y = 50, .module = 2, .peak = 2 },
+        .{ .x = 50, .y = 250, .module = 2, .peak = 2 },
+    };
+    try t.expect(orient(&f) == null);
+    // Control: with equal legs the same kind of triple is accepted.
+    f[2].y = 150;
+    try t.expect(orient(&f) != null);
+}
+
+test "insideImage: x == width and y == height are outside" {
+    const t = std.testing;
+    var bitbuf: [2]u8 = undefined;
+    const b: Bitmap = .{ .bits = &bitbuf, .width = 4, .height = 4 };
+    try t.expect(insideImage(&b, .{ 3.9, 3.9 }));
+    try t.expect(!insideImage(&b, .{ 4.0, 0 }));
+    try t.expect(!insideImage(&b, .{ 0, 4.0 }));
+}
+
+test "alignmentRun refuses a light band wider than a module and a half" {
+    const t = std.testing;
+    // One row, module 4: light 4, dark 4, light 9, dark 4, light 9, dark 4, light 4.
+    const Band = struct { dark: bool, len: u32 };
+    const bands = [_]Band{
+        .{ .dark = false, .len = 4 }, .{ .dark = true, .len = 4 },
+        .{ .dark = false, .len = 9 }, .{ .dark = true, .len = 4 },
+        .{ .dark = false, .len = 9 }, .{ .dark = true, .len = 4 },
+        .{ .dark = false, .len = 4 },
+    };
+    var bitbuf: [8]u8 = @splat(0);
+    var b: Bitmap = .{ .bits = &bitbuf, .width = 38, .height = 1 };
+    var x: u32 = 0;
+    for (bands) |band| {
+        for (0..band.len) |_| {
+            b.set(x, 0, band.dark);
+            x += 1;
+        }
+    }
+    try t.expectEqual(@as(?f32, null), alignmentRun(&b, 19, 0, .horizontal, 4));
+    // Control: at module 6 the same bands are within tolerance (9 <= 9).
+    try t.expect(alignmentRun(&b, 19, 0, .horizontal, 6) != null);
+}
+
+test "the label table hands out its last label and then reports exhaustion" {
+    const t = std.testing;
+    var labels: Labels = .{};
+    var last: u16 = 0;
+    while (labels.n < max_labels) last = labels.create();
+    try t.expectEqual(@as(u16, max_labels - 1), last);
+    try t.expectEqual(@as(u16, 0), labels.create());
+}
+
+test "solve8 pivots: a system with a zero leading coefficient is solved, not refused" {
+    const t = std.testing;
+    // A cyclic permutation: row r reads x[(r + 1) % 8] = r + 1. The leading
+    // coefficient of row 0 is zero, where elimination without pivoting divides.
+    var a: [8][8]f64 = @splat(@splat(0));
+    var b: [8]f64 = undefined;
+    for (0..8) |r| {
+        a[r][(r + 1) % 8] = 1;
+        b[r] = @floatFromInt(r + 1);
+    }
+    const x = solve8(&a, &b) orelse return error.TestUnexpectedResult;
+    for (0..8) |r| try t.expectApproxEqAbs(@as(f64, @floatFromInt(r + 1)), x[(r + 1) % 8], 1e-9);
+}
+
+test "readable: a grid whose message is longer than the probe buffer still counts as readable" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    const long = "A" ** 300; // longer than readable's 256-byte buffer
+    try qr.encode(&m, long, .{ .ecc = .low });
+    try t.expect(readable(&m));
+}
