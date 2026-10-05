@@ -50,10 +50,13 @@ See `SPEC.md` for the full design/threat-model writeup and exactly what's deferr
 - **Housekeeping** (`housekeeping.zig`) — `ping`/`pong` (modern BIP31 nonce form), `addr`/`getaddr`,
   `reject` (BIP61 — implemented, but flagged deprecated: disabled by Bitcoin Core since v0.18.0,
   removed entirely in v0.20.0).
+- **Relay negotiation** (`relay.zig`) — `sendheaders`, `wtxidrelay`, `sendaddrv2`, `mempool`
+  (payload-less, checked by `expectEmpty`), `feefilter`, `sendcmpct`.
 
-Deliberately out of scope (not requested, or long-dead — SPEC.md has the full rationale): `addrv2`
-(BIP155), `mempool`, `sendheaders`, `feefilter`, BIP152 compact blocks (`sendcmpct`/`cmpctblock`/
-`getblocktxn`/`blocktxn`), BIP37 bloom filters (`filterload`/`filteradd`/`filterclear`/
+Not yet implemented (SPEC.md Backlog): `addrv2` (BIP155 — so a caller that sends `sendaddrv2` cannot
+yet decode the reply), BIP157 compact-filter messages, the rest of BIP152 compact blocks
+(`cmpctblock`/`getblocktxn`/`blocktxn`), BIP324 v2 transport. Deliberately out of scope (SPEC.md has
+the full rationale): BIP37 bloom filters (`filterload`/`filteradd`/`filterclear`/
 `merkleblock`), the retired IP-Transactions messages (`checkorder`/`submitorder`/`reply`), and
 `alert` (retired after a signature-forgery vulnerability; the signing key was burned — never
 implement).

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE** (documentation only):
+  re-survey per `SURVEY-PLAYBOOK.md`. Scope `mvp` → `core`: the 2026-09-30
+  card's "behind" list (no real-code interposition, no storage faults) predated
+  `simio` (2026-10-01), which now provides both on top of netsim's generator and
+  ddmin by design; netsim's own main use case is covered. README now points at
+  `simio`, "Status: complete" reworded to match the scope, `## Compared with`
+  re-verified (FoundationDB added, Maelstrom row confirmed from its README) and
+  the stale `## Verify` count (27) replaced by `scripts/modtest netsim`. Backlog:
+  storage-fault item marked done in `simio`; new items for an end-of-run
+  (liveness) predicate in the search and a crash-notification hook; the
+  message-corruption fault kind stays open.
 - **2026-10-01** — `Prng` (the seeded splitmix64 generator), `ddmin` (the
   shrinker's core, now generic over its oracle) and `cloneTraceSubset` are
   exported from the root, for `simio`, which replays its own traces. Additive;

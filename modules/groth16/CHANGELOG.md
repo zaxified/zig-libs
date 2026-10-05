@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Re-survey: scope mvp → core. Since the 2026-09-30 survey, A8
+  (2026-10-02) made the main use case work and checked it against snarkjs in both
+  directions — circom `.r1cs`/`.wtns` and snarkjs `.zkey`/`.ptau` readers, `zkprove`
+  (Pippenger MSM), phase-2 `newZkey`/`contribute`/`verify` — so the Compared-with row
+  "we prove only a hand-built R1CS against a toy CRS" was stale. Compared-with
+  re-verified (arkworks-rs/groth16 is at 0.6.0, bellman 0.15.0; `ark-circom` added);
+  Backlog re-ranked: multithreading, Solidity verifier/calldata export, reading
+  snarkjs's proof/vk JSON, snarkjs `zkey verify` interop, hash-to-G2, positional file
+  source. README's `msm.zig` row now names Pippenger. Docs only.
 - **2026-10-03** — **`zkey.parse` checks the verifying key's G2 points (β, γ, δ) and every
   contribution's `g2_spx` in `G2`** (`error.NotInSubgroup`, new in `ParseError`), so
   `verifyingKey()` of a parsed file is safe for `bn254.groth16Verify` and a torsion

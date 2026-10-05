@@ -23,7 +23,7 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 | `poly.zig` | dense `Fr[x]` arithmetic + division by the vanishing polynomial `Z(x)=x^n−1` |
 | `domain.zig` | radix-2 evaluation domain — `n`-th roots of unity `ω=5^{(r−1)/n}`, `Z` |
 | `fft.zig` | radix-2 NTT / inverse-NTT over `Fr` + FFT polynomial multiplication |
-| `msm.zig` | naive multi-scalar multiplication in `G1`/`G2` |
+| `msm.zig` | multi-scalar multiplication in `G1`/`G2`: naive (constant-time, the toy prover) and Pippenger (variable-time, `zkprove`) |
 | `r1cs.zig` | rank-1 constraint system + witness satisfaction |
 | `qap.zig` | R1CS→QAP interpolation + the `A·B−C` divisibility oracle |
 | `prover.zig` | **real** `setup`/`prove` (the toy CRS + proof assembly) + `brokenProof` positive control |
