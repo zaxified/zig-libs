@@ -70,7 +70,6 @@ fn pymapPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     const path = try std.fmt.allocPrint(gpa, "{s}/.cache/zig-libs-imap/bin/pymap", .{home});
     errdefer gpa.free(path);
     std.Io.Dir.cwd().access(io, path, .{}) catch {
-        gpa.free(path);
         return skip(
             "pymap not installed. python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip install pymap",
             .{},
