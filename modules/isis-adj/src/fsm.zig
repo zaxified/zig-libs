@@ -1581,6 +1581,21 @@ test "a refreshing hello just before the deadline keeps it Up" {
     try testing.expectEqual(DownReason.hold_expired, gone.adjacency_down.?);
 }
 
+test "tick: nothing before start or after stop, and no Down->Down transition while hunting" {
+    var adj = Adjacency.init(cfgA());
+    const idle = adj.tick(100);
+    try testing.expect(idle.send_hello == null and idle.transition == null);
+    _ = adj.start(0);
+    // Down and still hunting: hellos on cadence, never a transition.
+    const hunt = adj.tick(1_000);
+    try testing.expect(hunt.send_hello != null);
+    try testing.expect(hunt.transition == null);
+    try testing.expectEqual(State.down, adj.currentState());
+    _ = adj.stop();
+    const stopped = adj.tick(5_000);
+    try testing.expect(stopped.send_hello == null and stopped.transition == null);
+}
+
 test "tick emits hellos on the hello_interval cadence" {
     var adj = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 1, .hello_interval = 10 });
     _ = adj.start(0); // next due at 10
@@ -1708,6 +1723,64 @@ test "rxHelloBytes finds a shared area across two wire Area Addresses TLVs" {
     const e = try adj.rxHelloBytes(wire, 1);
     try testing.expect(e.rejected == null);
     try testing.expect(e.adjacency_up);
+}
+
+test "rxHelloBytes finds a shared area in the THIRD wire Area Addresses TLV" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    const other1 = [_]u8{ 0x49, 0x99, 0x98 };
+    const other2 = [_]u8{ 0x49, 0x99, 0x99 };
+    var pdu_buf: [160]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&pdu_buf, .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+    });
+    var val_buf: [15]u8 = undefined;
+    const tw: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } };
+    try pb.tlvs.addTlv(three_way.tlv_code, try tw.encode(&val_buf));
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&other1});
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&other2});
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&our_area});
+    const wire = pb.finish();
+
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+    const e = try adj.rxHelloBytes(wire, 1);
+    try testing.expect(e.rejected == null);
+    try testing.expect(e.adjacency_up);
+}
+
+test "area matching applies to a Level 1 circuit only: L2 and L1/L2 form across a disjoint area" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    const disjoint_area = [_]u8{ 0x49, 0x99, 0x99 };
+    for ([_]isis.pdu.CircuitType{ .level2, .level1_2 }) |ct| {
+        var adj = Adjacency.init(.{
+            .system_id = sys_a,
+            .extended_local_circuit_id = 1,
+            .circuit_type = ct,
+            .local_areas = &.{&our_area},
+        });
+        _ = adj.start(0);
+        const e = adj.rxHello(.{
+            .source_id = sys_b,
+            .holding_time = 30,
+            .circuit_type = ct,
+            .local_circuit_id = 1,
+            .neighbor_area_addresses = &[_]u8{disjoint_area.len} ++ disjoint_area,
+            .three_way = .{
+                .state = .initializing,
+                .extended_local_circuit_id = 0xB1,
+                .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 },
+            },
+        }, 1);
+        try testing.expect(e.rejected == null);
+        try testing.expect(e.adjacency_up);
+    }
 }
 
 // Regression (audit A1 `isis-adj` F16): `isis.header.decode` normalizes a
