@@ -184,6 +184,16 @@ test "KAT: verify external XMSS-SHA2_10_256 (pk, msg, sig) triples" {
     var pk_bad = pk;
     pk_bad.root[0] ^= 1;
     try std.testing.expect(!X.verify(pk_bad, interop_msg, &sig0));
+
+    // The computed root is compared in full: of 2048 tampered randomizers
+    // (each a fresh, unrelated root), about eight would match pk.root in any
+    // single byte.
+    for (0..2048) |i| {
+        var bad = sig0;
+        bad[4] ^= @truncate(i);
+        bad[5] ^= @truncate((i >> 8) + 1);
+        try std.testing.expect(!X.verify(pk, interop_msg, &bad));
+    }
 }
 
 const auth_off = 4 + n + xmss.wots_len * n;
