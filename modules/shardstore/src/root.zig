@@ -1028,3 +1028,74 @@ test "non-power-of-two shard count uses modulo routing and round-trips" {
         try testing.expectEqualStrings("x", got.?);
     }
 }
+
+// Nothing ran two Stores over one backend at once, so dropping the
+// `tryLockExclusive` refusal in `acquireLock` passed every test.
+test "a second live Store over the same paths is refused with error.Locked" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
+    var first = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 2 });
+    try testing.expectError(error.Locked, Store.init(testing.allocator, sim.storage(), .{ .n_shards = 2 }));
+    first.deinit();
+    // Released on deinit: the next open succeeds.
+    var again = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 2 });
+    again.deinit();
+}
+
+// Routing is part of the on-disk format: a key must reach the shard file it was
+// written to by any build of this module. Pins the hash, seed included — the
+// round-trip tests pass with any hash at all.
+test "routing is pinned: known keys route to known shards" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
+    var store = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 8 });
+    defer store.deinit();
+    const keys = [_][]const u8{ "", "a", "stable-key", "user:1", "user:2", "k-0", "k-1", "k-199" };
+    var got: [keys.len]usize = undefined;
+    for (keys, &got) |k, *g| g.* = store.shardFor(k);
+    try testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1, 1, 0, 1, 6 }, &got);
+}
+
+// A shard that fails to open after the store-wide lock is taken must release
+// the lock and close the shards opened before it: a retry reports the same
+// open error (not `error.Locked`), and `testing.allocator` sees no leak.
+test "a failed shard open releases the lock and the shards already opened" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
+    const st = sim.storage();
+    const h = try st.open("shard-00001.kvt", .open_or_create);
+    var junk: [8192]u8 = undefined;
+    @memset(&junk, 0xA5);
+    try st.writeAll(h, &junk, 0);
+    st.close(h);
+
+    const err1 = if (Store.init(testing.allocator, st, .{ .n_shards = 2 })) |_|
+        return error.TestUnexpectedResult
+    else |e|
+        e;
+    try testing.expect(err1 != error.Locked);
+    try testing.expectError(err1, Store.init(testing.allocator, st, .{ .n_shards = 2 }));
+}
+
+// `validateShardNameFits` must format the HIGHEST index, not shard 0: with
+// 100 001 shards the last name has six digits, one more than the rest.
+test "name validation uses the widest shard index" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // kvtree is a COW page store: meta slots overwrite in place
+    // Any backend side effect fails at once, so validating the wrong index
+    // shows up as `error.Crashed` from the manifest write rather than as
+    // 100 000 shard opens.
+    sim.ops_until_crash = 0;
+    // 502 + "-" + 5 digits + ".kvt" = 512 fits; with 6 digits it is 513.
+    var prefix_buf: [502]u8 = undefined;
+    @memset(&prefix_buf, 'b');
+    try testing.expectError(
+        error.ShardNameTooLong,
+        Store.init(testing.allocator, sim.storage(), .{ .n_shards = 100_001, .name_prefix = &prefix_buf }),
+    );
+    try testing.expectEqual(@as(usize, 0), sim.names.count());
+}
