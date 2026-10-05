@@ -6,7 +6,7 @@
 
 **Scope:** mvp — drand `tle` / age (time-lock and hybrid-PQ file encryption); no equivalent AND-of-locks envelope exists (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -203,6 +203,18 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
   wrong-PQ-key attack succeed (so the negative is a real detector), while
   the real key demonstrably depends on both `s_time` and `s_pq` (and on
   round/suite/version).
+- **Mutation run 2026-10-05** (in-place, Debug, 19 mutants over
+  `deriveKeys`' ikm/salt/info/key-nonce split, `seal`'s guard, header and
+  AAD, `parse`'s refusals and `open`'s error mapping and KDF input): 19
+  killed. The first pass left 6; tests were added for `deriveKeys` against
+  a Python HKDF recomputation (the salt, the version byte and the nonce
+  offset each survived the "separates" tests, and version — a constant —
+  cannot be varied by them), a trailing byte past the declared length, an
+  undecodable `U` mapped to `MalformedTimeLock` (the tamper test accepts
+  any error), and `PlaintextTooLarge` (a 2³²-byte slice over one byte,
+  never read on the refusal path). Four mutants first written did not
+  compile (an unused parameter) and were rewritten to compile; all four
+  were then killed.
 
 ## Deliberately deferred (out of scope)
 

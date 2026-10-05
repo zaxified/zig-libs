@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 19 of 19 killed, 0 equivalent; 4 tests added
+  (`deriveKeys` against a Python HKDF recomputation, trailing bytes refused by
+  `parse`, an undecodable time-lock point is `MalformedTimeLock`,
+  `PlaintextTooLarge`). No code change.
 - **2026-09-07** — Test-only, no production change: `fuzzOpen`'s mutation arm - the only one
   that ever hands `Env.open` a real envelope, and therefore the only one that can reach
   `open`'s body at all - had never executed. Its first draw was `smith.value(u8) & 1`, a

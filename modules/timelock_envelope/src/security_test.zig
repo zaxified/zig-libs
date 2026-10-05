@@ -325,6 +325,27 @@ test "tamper: truncating the envelope is rejected, never a panic" {
     try testing.expectError(error.Truncated, Env.open(testing.allocator, base[0..3], kp.dk, round1000Signature()));
 }
 
+test "tamper: an undecodable time-lock point is MalformedTimeLock, not TimeGateClosed" {
+    // Mutation run 2026-10-05: the generic tamper test above accepts any
+    // error, so mapping this case to TimeGateClosed survived.
+    const kp = recipientKeypair(0x0E);
+    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    defer testing.allocator.free(base);
+    const dup = try testing.allocator.dupe(u8, base);
+    defer testing.allocator.free(dup);
+    dup[envelope.header_bytes] &= 0x7f; // clear U's compression flag
+    try testing.expectError(error.MalformedTimeLock, Env.open(testing.allocator, dup, kp.dk, round1000Signature()));
+}
+
+test "seal refuses a plaintext longer than the u32 length field before touching it" {
+    // The slice is never read on the refusal path; a failing allocator
+    // makes any path that gets past the check fail differently.
+    const byte: [1]u8 = .{0};
+    const huge = @as([*]const u8, &byte)[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+    const kp = recipientKeypair(0x0F);
+    try testing.expectError(error.PlaintextTooLarge, Env.seal(testing.failing_allocator, huge, kp.ek, quicknetPubkey(), seal_round, fixedRandomness()));
+}
+
 // ── positive control (proves the negatives actually detect a broken AND) ──
 
 test "positive control: a KDF that dropped s_pq would let the PQ-lock negative pass" {
