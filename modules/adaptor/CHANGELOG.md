@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (25 mutants, 22 killed, 3 equivalent; `SPEC.md`
+  § "Mutation run 2026-10-05"). No defect; one new test pins the range checks of
+  `PreSignature.fromBytes`, `adapt` and `extract`. No source change.
+
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
   dead-stack probe `src/stackprobe_test.zig` (A1 F3) is deleted: it asserted
   nothing and its stderr failed the CI lane in ReleaseFast. Per CONVENTIONS.md

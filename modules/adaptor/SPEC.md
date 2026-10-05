@@ -6,7 +6,7 @@
 
 **Scope:** core — secp256kfun `schnorr_fun::adaptor` (BIP340 adaptor signatures; no standard exists) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation none
+**Audit:** review 2026-09-11 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -287,6 +287,22 @@ this exact construction (no shared code path with `root.zig`). `interop_vectors.
 captured from a real external implementation and frozen as bytes — fully
 offline afterward; see `NOTICE` for the regeneration command if the upstream
 crate needs re-checking.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure,
+`setsid -w timeout -s KILL 20` per mutant): **25 mutants, 22 killed, 3 equivalent**. Points:
+`AdaptorPoint` decoding and `fromSecret`'s range, every `PreSignature.fromBytes` check, the
+self-verify, the nonce derivation's inputs, `k0` and `R + T`, the negation flag in all three
+operations, `preVerify`'s key, ranges, challenge, branch and verdict, `adapt`'s ranges and zero
+secret, and `extract`'s nonce match, range and the `t·G == T` check.
+
+First pass: 8 survivors — **no defect, 5 test gaps** closed by one test: every range check
+outside `preVerify` (r ≥ p and s' ≥ n in `PreSignature.fromBytes`, s' ≥ n and t ≥ n in `adapt`,
+s ≥ n in `extract`) — the vectors are all canonical, so reducing instead of refusing survived;
+`adapt(t = n + 1)` would have produced a signature under t = 1. **Equivalent (3):** `k0 = 0` and
+`R + T = O` (probability ~2^-256 / a discrete logarithm), and `preVerify`'s `r < p` (the x-only
+lift of `r` right after refuses the same values).
 
 ## Backlog / deferred
 

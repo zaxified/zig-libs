@@ -495,3 +495,43 @@ test "corpus: every seed reaches preVerify or its decoder, and both verdicts are
     try std.testing.expectEqual(@as(usize, 2), verified);
     try std.testing.expectEqual(@as(usize, 9), rejected);
 }
+
+// Mutation run 2026-10-05: every scalar/field range check outside `preVerify`
+// stood untested — the vectors are all canonical — so reducing instead of
+// refusing survived in `PreSignature.fromBytes`, `adapt` and `extract`. A
+// value ≥ n (or r ≥ p) is a different encoding, not the same scalar: n + 1
+// reduced is 1, and `adapt` would have published a signature under the
+// wrong adaptor secret.
+test "range checks: r >= p and s' >= n in PreSignature.fromBytes, s' >= n and t >= n in adapt, s >= n in extract" {
+    const vec = v.vectors[0];
+    const n = Secp256k1.scalar.field_order;
+    var n_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &n_bytes, n, .big);
+    var n1_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &n1_bytes, n + 1, .big);
+    const good = adaptor.PreSignature{
+        .r = hexN(32, vec.r),
+        .s_prime = hexN(32, vec.s_prime),
+        .needs_negation = vec.needs_negation,
+    };
+
+    var wire = good.toBytes();
+    _ = try adaptor.PreSignature.fromBytes(wire);
+    @memset(wire[0..32], 0xff); // r >= p
+    try std.testing.expectError(error.InvalidPreSignature, adaptor.PreSignature.fromBytes(wire));
+    wire = good.toBytes();
+    wire[32..64].* = n_bytes; // s' == n
+    try std.testing.expectError(error.InvalidPreSignature, adaptor.PreSignature.fromBytes(wire));
+
+    var bad_s = good;
+    bad_s.s_prime = n_bytes;
+    try std.testing.expectError(error.InvalidPreSignature, adaptor.adapt(bad_s, hexN(32, vec.t)));
+    try std.testing.expectError(error.InvalidAdaptorSecret, adaptor.adapt(good, n1_bytes));
+
+    const sig = try adaptor.adapt(good, hexN(32, vec.t));
+    var full = try bip340.Signature.fromBytes(sig);
+    const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
+    _ = try adaptor.extract(good, full, t_point);
+    full.s = n_bytes;
+    try std.testing.expectError(error.InvalidSignature, adaptor.extract(good, full, t_point));
+}
