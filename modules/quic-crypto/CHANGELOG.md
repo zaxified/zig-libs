@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (23 mutants, 22 killed, 1 equivalent; `SPEC.md`
+  § "Mutation run 2026-10-05"). No defect; new boundary tests for the Retry pseudo-packet (2049
+  octets) and `headerprot.apply` (`pn_offset` past the end, PN one octet past the end). No source
+  change.
+
 - **2026-09-30** — **Retry Integrity Tag (RFC 9001 §5.8) and QUIC v2 (RFC 9369).**
   New `retry.computeRetryTag` / `verifyRetryTag` (AES-128-GCM over the Retry
   Pseudo-Packet, fixed per-version key/nonce) and `Version` (`.v1`, `.v2`) with

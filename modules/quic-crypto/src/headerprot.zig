@@ -437,3 +437,17 @@ test "remove: App. A.5 recovers pn_len 3 + plaintext header; round-trips with ap
     try testing.expectError(error.PacketTooShort, remove(&tiny, .short, 1, rfc_a5_mask));
     try testing.expectEqual(rfc_a5_header_prot[0], tiny[0]);
 }
+
+// Mutation run 2026-10-05: `apply`'s two bounds had no test — every apply
+// test uses an RFC packet that fits. Without the `pn_offset` bound the length
+// subtraction underflows; with the `pn_len` bound one octet loose, apply
+// writes one octet past the packet. Both must be PacketTooShort, and leave
+// the packet untouched.
+test "apply: pn_offset past the end and a PN running one octet past the end are PacketTooShort" {
+    var pkt = [_]u8{ 0x40, 1, 2, 3, 4 };
+    const mask: Mask = .{ 0xff, 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(error.PacketTooShort, apply(&pkt, .short, pkt.len + 1, 1, mask));
+    try testing.expectError(error.PacketTooShort, apply(&pkt, .short, 2, 4, mask)); // needs 6 octets
+    try testing.expectEqualSlices(u8, &.{ 0x40, 1, 2, 3, 4 }, &pkt);
+    try apply(&pkt, .short, 1, 4, mask); // exactly fits
+}

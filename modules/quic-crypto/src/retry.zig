@@ -173,8 +173,11 @@ test "Retry tag: length limits are typed errors, not panics" {
     var long_odcid: [256]u8 = undefined;
     @memset(&long_odcid, 0);
     try testing.expectError(error.PacketTooLong, computeRetryTag(.v1, &long_odcid, ""));
-    // Boundary: exactly max_pseudo_packet_len is accepted.
+    // Boundary: exactly max_pseudo_packet_len is accepted, one octet more is
+    // not (mutation run 2026-10-05: the 2057-octet case above could not tell
+    // `>` from an off-by-one, which overruns the stack buffer).
     _ = try computeRetryTag(.v1, &rfc_odcid, big[0 .. max_pseudo_packet_len - 1 - rfc_odcid.len]);
+    try testing.expectError(error.PacketTooLong, computeRetryTag(.v1, &rfc_odcid, big[0 .. max_pseudo_packet_len - rfc_odcid.len]));
 }
 
 test "Retry tag: empty ODCID and empty token round-trip (compute then verify)" {

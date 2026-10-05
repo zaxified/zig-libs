@@ -6,7 +6,7 @@
 
 **Scope:** core — rustls `quic` API and ngtcp2_crypto (surveyed 2026-09-30); raised from mvp 2026-09-30 with Retry integrity + QUIC v2
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -230,6 +230,21 @@ drive such a test on its own.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **23 mutants, 22 killed, 1 equivalent**. Points: v2 wire decoding, the v2 Retry key and
+nonce, both versions' long-header type bits, the Retry ODCID and pseudo-packet limits and the
+tag-only packet, the nonce's PN byte order, `seal`/`open` buffer and length checks, the ChaCha20
+mask counter, `apply`'s two bounds, `remove`'s empty-packet check, `pn_len` and atomic restore,
+both first-byte masks, the key-update `ku` label and secret, and the Initial client label.
+
+First pass: 4 survivors — **no defect, 3 test gaps** closed: the Retry pseudo-packet at exactly
+2049 octets (the existing 2057-octet case could not see an off-by-one that overruns the stack
+buffer), and `apply` with `pn_offset` past the packet and with a PN one octet past the end (no
+test had a packet that did not fit). **Equivalent:** `verifyRetryTag` refusing a 16-octet
+(tag-only) packet as `PacketTooShort` instead of `IntegrityFailed` — refused either way.
 
 ## Backlog / deferred
 
