@@ -14,9 +14,16 @@
 //! a missing h2spec is a failure, because running this program IS the request
 //! to consult the suite. Install: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`.
 //!
-//!   zig build interop-http                      # every h2spec case
+//! A third phase re-takes the Go standard-library oracle (`tools/go_oracle`,
+//! replayed by `src/go_oracle.zig`): it runs the generator again and fails
+//! when its output differs from the committed `src/go_oracle_vectors.zig` --
+//! a newer Go answering differently, or a case table edited without
+//! regenerating. Needs `go` on PATH, no network.
+//!
+//!   zig build interop-http                      # every phase
 //!   zig build interop-http -- --h2spec PATH     # a non-default binary
 //!   zig build interop-http -- --only http2/6.5  # one section (h2spec's spec ids)
+//!   zig build interop-http -- --phase go        # only the Go oracle (or `h2spec`)
 
 const std = @import("std");
 const http = @import("http");
@@ -137,8 +144,51 @@ fn report(phase: []const u8, v: Verdict, allowed: []const []const u8) bool {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC]\n", .{});
+    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go]\n", .{});
     return 2;
+}
+
+const go_oracle_dir = "modules/http/tools/go_oracle";
+const go_vectors = "modules/http/src/go_oracle_vectors.zig";
+
+/// Re-take the Go oracle into scratch and compare it with the committed
+/// vectors byte for byte.
+/// `env` is passed on explicitly: a child spawned without a map gets an
+/// empty environment, and `go` needs HOME (or GOCACHE) for its build cache.
+fn checkGoOracle(io: std.Io, arena: std.mem.Allocator, env: *const std.process.Environ.Map) !bool {
+    const fresh = scratch ++ "/go_oracle_vectors.zig";
+    var child = std.process.spawn(io, .{
+        // `-out` is relative to the generator's directory, four levels down.
+        .argv = &.{ "go", "run", ".", "-out", "../../../../" ++ fresh },
+        .cwd = .{ .path = go_oracle_dir },
+        .environ_map = env,
+        .stdin = .close,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |e| {
+        std.debug.print("could not spawn go ({t}) -- the oracle is required, not optional\n", .{e});
+        return error.NoGo;
+    };
+    switch (try child.wait(io)) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("go oracle: generator exited {d}\n", .{code});
+            return false;
+        },
+        else => {
+            std.debug.print("go oracle: generator did not exit normally\n", .{});
+            return false;
+        },
+    }
+    const cwd = std.Io.Dir.cwd();
+    const want = try cwd.readFileAlloc(io, go_vectors, arena, .limited(16 << 20));
+    const got = try cwd.readFileAlloc(io, fresh, arena, .limited(16 << 20));
+    if (std.mem.eql(u8, want, got)) {
+        std.debug.print("go oracle: {s} matches a fresh run -- OK\n", .{go_vectors});
+        return true;
+    }
+    std.debug.print("go oracle: a fresh run differs from {s} -- NOT OK\n" ++
+        "  diff {s} {s}; if Go changed, review every changed verdict before copying it over\n", .{ go_vectors, go_vectors, fresh });
+    return false;
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -155,6 +205,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var h2spec: []const u8 = "h2spec";
     var only: ?[]const u8 = null;
+    var phase: enum { all, h2spec, go } = .all;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
@@ -162,12 +213,19 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             h2spec = args.next() orelse return usage();
         } else if (std.mem.eql(u8, a, "--only")) {
             only = args.next() orelse return usage();
+        } else if (std.mem.eql(u8, a, "--phase")) {
+            const p = args.next() orelse return usage();
+            phase = std.meta.stringToEnum(@TypeOf(phase), p) orelse return usage();
         } else {
             std.debug.print("unknown argument '{s}'\n", .{a});
             return usage();
         }
     }
     std.Io.Dir.cwd().createDirPath(io, scratch) catch {};
+
+    const env = try init.environ.createMap(arena);
+    const go_ok = phase == .h2spec or try checkGoOracle(io, arena, &env);
+    if (phase == .go) return if (go_ok) 0 else 1;
 
     // Phase 1: the real `Server`, h1 and h2c prior knowledge on one port.
     const shared = blk: {
@@ -202,5 +260,5 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const a = report("shared h1/h2c port", shared, &.{shared_port_expected});
     const b = report("h2 only (serveStream)", h2only, &.{});
-    return if (a and b) 0 else 1;
+    return if (a and b and go_ok) 0 else 1;
 }

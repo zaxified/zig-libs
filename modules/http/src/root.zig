@@ -503,6 +503,7 @@ test {
     _ = problem;
     _ = curl_interop;
     _ = h11_interop;
+    _ = go_oracle;
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
@@ -513,6 +514,10 @@ const curl_interop = @import("curl_interop.zig");
 /// once and frozen) — tests only, nothing importable, so it is not part of
 /// the public surface.
 const h11_interop = @import("h11_interop.zig");
+
+/// OFFLINE differential anchor against Go's standard library (verdicts
+/// captured by `tools/go_oracle`) — tests only, not public surface.
+const go_oracle = @import("go_oracle.zig");
 
 test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {
     try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn("h2"));

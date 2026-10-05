@@ -329,6 +329,29 @@ then close), each with a regression test that fails without its half (mutation-c
 lingering one deterministic: a GOAWAY followed by 32 KiB of PINGs, `ConnectionResetByPeer` 3 of 3
 without it). The suite needs no fixture: it is the oracle, run before a release.
 
+**Go's standard library as a differential oracle** (2026-10-05, `tools/go_oracle/` → committed
+`src/go_oracle_vectors.zig` → replayed by `src/go_oracle.zig`, no Go at test time). The cases are
+ours; go1.26 answers them through its public API only: a real `net/http.Server` on loopback for h1
+(which requests reach the handler, with what method, target and body, and whether the server
+refuses itself), `http.ServeContent` for preconditions + ranges (status, `Content-Range`, the parts
+of a `multipart/byteranges`), `url.ParseQuery`/`QueryUnescape`/`PathUnescape`, and
+`multipart.Reader.NextRawPart` + `mime.ParseMediaType`. Every disagreement is in a per-area table
+with the RFC rule, which side is off it, and what WE answer -- a case that diverges without an
+entry fails, and so does an entry whose case agrees again or diverges differently. 362 cases; the
+tables hold 17 (h1), 25 (serve), 7 (url), 14 (multipart), most of them us being stricter than Go
+where the RFC allows it (obs-fold, bare LF, CL+TE, invalid Range ignored rather than 416) or Go off
+the RFC (`bytes=-0` → 206 `bytes 100-99/100`, an unknown range unit answered 416, Range honoured on
+POST, a sign accepted in a range position). It found six defects here, all fixed the same day with
+tests that fail without the fix (13 schemata mutants over the fixes, 13 killed):
+`Transfer-Encoding` split over two field lines was judged line by line, so `gzip` + `chunked`
+framed as chunked while the same list on one line was refused (TE.TE desync); an HTTP/1.0 request
+with `Transfer-Encoding` was decoded as chunked instead of refused (RFC 9112 §6.1 MUST); a comma
+inside an entity-tag split the tag (`If-Match: "x,"v1"` matched `"v1"`); `*` asked for an ETag
+rather than for a representation, so a resource with only `Last-Modified` let `If-None-Match: *`
+through; `31 Feb` parsed as 2 March; a malformed or folded part header in multipart was skipped,
+so a folded `Content-Disposition` lost its `name`. `zig build interop-http -- --phase go`
+re-takes the oracle and fails when a fresh run differs from the committed vectors.
+
 ## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
 This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
 framing, multipart bodies, Range headers, HPACK blocks, HTTP/2 frames) into typed values before any
@@ -347,6 +370,17 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
+
+- **From the Go oracle (2026-10-05), judged but open** — each is a recorded divergence in
+  `src/go_oracle.zig`, kept because the current answer is legal; listed here so a later decision
+  can move it. (a) A duplicate `Content-Disposition` parameter takes the first (`body.ContentType
+  .param`); Go refuses the whole disposition -- a front end that does the same sees an unnamed
+  field where we see `a`. (b) Quoted-string parameters come back zero-copy with quoted-pairs not
+  unescaped (`name="a\"b"` → `a\"b`). (c) `h1.ResponseHead` (client side) still accepts
+  `chunked` anywhere in `Transfer-Encoding` and per field line; the request side was tightened.
+  (d) RFC 850 two-digit years use a fixed 70 pivot; RFC 9110 §5.6.7 wants "more than 50 years
+  ahead is the past", which needs a clock -- `69` is right today, `70`-`76` already are not.
+  (e) HTTP/1.0 `Connection: keep-alive` is never honoured; methods outside `Method` get 501.
 
 - ~~**h2 inbound gzip decode.**~~ — **DONE 2026-09-29**: `h2_server.Options.max_decompressed_request_bytes`
   / `verify_inbound_trailer` (forwarded by `connMain`), the same `GunzipBody` over the h2 request
@@ -530,6 +564,6 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`); h1/smuggling goldens self
+**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49). Still self-only: conneg, SSE, gzip response encoding, problem+json, the reverse proxy's header rewriting, the client's response framing
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments

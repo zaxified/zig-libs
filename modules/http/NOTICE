@@ -54,3 +54,12 @@ Design references (behavior only, no source copied)
     server shape, gzip handler.
   - Go `net/http/httputil.ReverseProxy` (**BSD-3-Clause**) and nginx
     `proxy_pass` (**BSD-2-Clause**) — the reverse-proxy behavior.
+
+Test data
+---------
+
+`src/go_oracle_vectors.zig` is generated test data: our own case tables
+(`tools/go_oracle/*.go`) with the answers of the Go 1.26 standard library
+(**BSD-3-Clause**, The Go Authors) recorded next to them -- observed from Go's
+public API run as a black-box oracle on this machine, no Go source read or
+copied. `src/h11_interop.zig` records h11 0.16.0's verdicts the same way.

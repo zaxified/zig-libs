@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE:** the Go oracle itself (`src/go_oracle.zig`,
+  `src/go_oracle_vectors.zig`, `tools/go_oracle/`) is test-only; `root.zig` imports it inside its
+  test block, so nothing new is published. The fixes it found are the entry below.
 - **2026-10-05** — Go's standard library as a differential oracle (`tools/go_oracle/`, replayed by
   `src/go_oracle.zig`; `zig build interop-http -- --phase go` re-takes it). Fixes it found:
   - **h1, request smuggling:** `Transfer-Encoding` over two field lines is the same list as on one
