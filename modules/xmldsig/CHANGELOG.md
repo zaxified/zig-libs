@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (25 mutants, 24 killed, 1 equivalent; `SPEC.md`
+  § "Mutation run 2026-10-05"). No defect; new tests for a non-`ds:Signature` wrapper, epilog
+  PIs and `#WithComments` prolog comments, URIs without `#` and `#` alone, an over-long ECDSA
+  `SignatureValue`, foreign-namespace `InclusiveNamespaces`, and the key-family mismatch. No
+  source change.
+
 - **2026-09-10** — A1 fix campaign, closing the three findings the
   2026-09-03 drift re-audit recorded but did not fix.
   - **`countByAttr`/`findX509Cert` now bound their own recursion**

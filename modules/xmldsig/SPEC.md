@@ -6,7 +6,7 @@
 
 **Scope:** core — xmlsec 1.3.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation none
+**Audit:** review 2026-09-03 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -277,6 +277,25 @@ data or production keys appear.
 **What the tests actually contain.** C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
 
 **How it got there.** The anchoring work landed. DONE 9f9d238: xmlsec1 + signxml, two independent oracles; enveloping + ECDSA + tamper
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure,
+`setsid -w timeout -s KILL 20` per mutant): **25 mutants, 24 killed, 1 equivalent**. Points: the
+C14N/digest/signature algorithm maps, both SHA-1 gates, the `ds:Signature` element check, the
+reference cap, how a bad digest and the signature combine into `valid`, zero references, the
+enveloped-after-C14N order, unknown transforms, every prolog/epilog PI and comment refusal for
+`URI=""`, the digest comparison and its length, the `#` and empty-id rules, `id_attr`
+uniqueness, the ECDSA `SignatureValue` length, the InclusiveNamespaces namespace check, and the
+key-family mismatch.
+
+First pass: 9 survivors. **No defect; 8 test gaps** closed by 5 tests and one extended test:
+a valid SignedInfo under an element that is not `ds:Signature`; an epilog PI and a prolog
+comment under `#WithComments`; `Xobj-1` (no `#`) naming the element with ID obj-1, and `#`
+alone; an ECDSA `SignatureValue` with one octet APPENDED (only the shorter shape was pinned —
+with `<` the first 64 octets verified); an `InclusiveNamespaces` element outside the exc-c14n
+namespace; an RSA method with an EC key (`KeyAlgorithmMismatch`, not a quiet `false`).
+**Equivalent:** `countByAttr`'s early exit at 3 instead of 2 (only "exactly one" matters).
 
 ## Backlog / deferred
 

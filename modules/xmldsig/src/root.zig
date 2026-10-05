@@ -1319,6 +1319,23 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     defer short_res.deinit(a);
     try testing.expect(!short_res.valid);
     try testing.expect(short_res.references[0].digest_valid); // structurally fine up to the signature
+
+    // (d) Mutation run 2026-10-05: one octet APPENDED to a valid r‖s. With the
+    // length check relaxed to `<`, the first 64 octets verified and the
+    // document was accepted; only the shorter shape (c) was pinned.
+    var long_rs: [65]u8 = undefined;
+    @memcpy(long_rs[0..64], &rs);
+    long_rs[64] = 0;
+    var long_b64: [128]u8 = undefined;
+    const long_sig_b64 = std.base64.standard.Encoder.encode(&long_b64, &long_rs);
+    const lengthened = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, long_sig_b64 });
+    defer a.free(lengthened);
+    var doc_l = try xml.parse(a, lengthened, .{});
+    defer doc_l.deinit();
+    const sig_l = childByName(doc_l.root, "Signature").?;
+    var long_res = try verify(a, &doc_l, sig_l, .{ .key = .{ .ecdsa_p256_sec1 = &pub_sec1 } });
+    defer long_res.deinit(a);
+    try testing.expect(!long_res.valid);
 }
 
 test "verify: a prolog PI is not silently outside a URI=\"\" signature" {
@@ -2211,4 +2228,138 @@ test "the xmldsig fuzz harness reaches verify's digest and signature checks (rea
     // 3. And the harness body itself runs to completion on fixed input.
     var smith: std.testing.Smith = .{ .in = &([_]u8{0x01} ** 64 ++ [_]u8{0x00} ** 2048) };
     try fuzzVerifySignature({}, &smith);
+}
+
+// ── mutation run 2026-10-05 ─────────────────────────────────────────────────
+
+/// `buildSignedRsaDoc` with the envelope's opening tag, the Reference's
+/// `<ds:Transform>` list and the mode its digest is computed under chosen by
+/// the caller (URI="" with the enveloped transform first, as there).
+fn buildSignedRsaDocCustom(a: std.mem.Allocator, envelope_open: []const u8, transforms: []const u8, ref_mode: c14n.Mode) ![]u8 {
+    var sk = try rsa.SecretKey.fromPem(test_rsa_priv_pem);
+    defer sk.deinit();
+    const Asm = struct {
+        fn doc(al: std.mem.Allocator, env: []const u8, tr: []const u8, digest: []const u8, sig: []const u8) ![]u8 {
+            return std.fmt.allocPrint(al, "{s}<Data>custom</Data>" ++
+                "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+                "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+                "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+                "<ds:Reference URI=\"\"><ds:Transforms>" ++
+                "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>{s}" ++
+                "</ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+                "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference></ds:SignedInfo>" ++
+                "<ds:SignatureValue>{s}</ds:SignatureValue></ds:Signature></Envelope>", .{ env, tr, digest, sig });
+        }
+    };
+    const empty = try Asm.doc(a, envelope_open, transforms, "", "");
+    defer a.free(empty);
+    var d1 = try xml.parse(a, empty, .{});
+    defer d1.deinit();
+    const ref_canon = try c14n.canonicalize(a, d1.root, .{ .mode = ref_mode, .omit = childByName(d1.root, "Signature").? });
+    defer a.free(ref_canon);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ref_canon, &digest, .{});
+    var db: [64]u8 = undefined;
+    const digest_b64 = std.base64.standard.Encoder.encode(&db, &digest);
+    const with_digest = try Asm.doc(a, envelope_open, transforms, digest_b64, "");
+    defer a.free(with_digest);
+    var d2 = try xml.parse(a, with_digest, .{});
+    defer d2.deinit();
+    const si_canon = try c14n.canonicalize(a, childByName(childByName(d2.root, "Signature").?, "SignedInfo").?, .{ .mode = .exclusive });
+    defer a.free(si_canon);
+    var sig_buf: [256]u8 = undefined;
+    const sig = try rsa.signPkcs1v15(sk, std.crypto.hash.sha2.Sha256, si_canon, &sig_buf);
+    var sb: [512]u8 = undefined;
+    return Asm.doc(a, envelope_open, transforms, digest_b64, std.base64.standard.Encoder.encode(&sb, sig));
+}
+
+fn verifyRsaDoc(a: std.mem.Allocator, src: []const u8, sig_local: []const u8) VerifyError!Result {
+    var doc = xml.parse(a, src, .{}) catch unreachable;
+    defer doc.deinit();
+    const pk = rsa.PublicKey.fromPem(test_rsa_pub_pem) catch unreachable;
+    return verify(a, &doc, childByName(doc.root, sig_local).?, .{ .key = .{ .rsa = pk } });
+}
+
+test "verify: a valid SignedInfo under an element that is not ds:Signature is MalformedSignature" {
+    // The `isDs(signature, "Signature")` check had no test with an element
+    // that otherwise works: with it gone, the same SignedInfo/SignatureValue
+    // under `<ds:Signaturx>` verified as valid.
+    const a = testing.allocator;
+    var sd = try buildSignedRsaDoc(a, false, false);
+    defer sd.deinit(a);
+    var r = try verifyRsaDoc(a, sd.xml, "Signature");
+    r.deinit(a);
+    // Only the element's own tags: `ds:SignatureValue`/`ds:SignatureMethod`
+    // share the prefix and must keep their names.
+    const r1 = try std.mem.replaceOwned(u8, a, sd.xml, "<ds:Signature ", "<ds:Signaturx ");
+    defer a.free(r1);
+    const renamed = try std.mem.replaceOwned(u8, a, r1, "</ds:Signature>", "</ds:Signaturx>");
+    defer a.free(renamed);
+    try testing.expectError(error.MalformedSignature, verifyRsaDoc(a, renamed, "Signaturx"));
+}
+
+test "verify: an epilog PI, and a prolog comment under #WithComments, are outside a URI=\"\" signature" {
+    // The prolog-PI test covers one of the four shapes `validateReference`
+    // refuses; the epilog PI and the comment rule (comments are part of the
+    // document node-set only #WithComments) had none.
+    const a = testing.allocator;
+    var sd = try buildSignedRsaDoc(a, false, false);
+    defer sd.deinit(a);
+    const epi = try std.fmt.allocPrint(a, "{s}<?evil x?>", .{sd.xml});
+    defer a.free(epi);
+    try testing.expectError(error.UriNotResolved, verifyRsaDoc(a, epi, "Signature"));
+
+    const wc = try buildSignedRsaDocCustom(a, "<Envelope xmlns=\"urn:demo\">", "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#WithComments\"/>", .exclusive_with_comments);
+    defer a.free(wc);
+    var ok = try verifyRsaDoc(a, wc, "Signature");
+    defer ok.deinit(a);
+    try testing.expect(ok.valid);
+    const with_comment = try std.fmt.allocPrint(a, "<!--outside-->{s}", .{wc});
+    defer a.free(with_comment);
+    try testing.expectError(error.UriNotResolved, verifyRsaDoc(a, with_comment, "Signature"));
+}
+
+test "verify: a reference URI must start with '#' to name an element, and '#' alone names none" {
+    // "Xobj-1" is not "#obj-1": without the '#' check, `uri[1..]` resolved it
+    // to the element with ID obj-1. An empty id is no reference either.
+    try expectVerifyError("<Envelope ID=\"obj-1\" xmlns=\"urn:demo\">" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"Xobj-1\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>" ++ blind_guard_tail, error.UriNotResolved);
+    try expectVerifyError("<Envelope ID=\"\" xmlns=\"urn:demo\">" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"#\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>" ++ blind_guard_tail, error.UriNotResolved);
+}
+
+test "verify: InclusiveNamespaces is honoured only in the exc-c14n namespace" {
+    // Exclusive C14N §3: the PrefixList comes from an `ec:InclusiveNamespaces`
+    // element in http://www.w3.org/2001/10/xml-exc-c14n#. The same element
+    // in another namespace is foreign content and must not pull the unused
+    // `foo` declaration into the canonical form (the digest was computed
+    // without it). Relaxing the namespace check broke the digest unnoticed.
+    const a = testing.allocator;
+    const doc = try buildSignedRsaDocCustom(a, "<Envelope xmlns=\"urn:demo\" xmlns:foo=\"urn:foo\">", "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">" ++
+        "<x:InclusiveNamespaces xmlns:x=\"urn:not-exc-c14n\" PrefixList=\"foo\"/></ds:Transform>", .exclusive);
+    defer a.free(doc);
+    var r = try verifyRsaDoc(a, doc, "Signature");
+    defer r.deinit(a);
+    try testing.expect(r.references[0].digest_valid);
+    try testing.expect(r.valid);
+}
+
+test "verify: an RSA signature method with an EC key is KeyAlgorithmMismatch, not a quiet false" {
+    // A caller misconfiguration (key family vs SignatureMethod) is a typed
+    // error, distinct from "this signature does not verify".
+    const a = testing.allocator;
+    var sd = try buildSignedRsaDoc(a, false, false);
+    defer sd.deinit(a);
+    var doc = try xml.parse(a, sd.xml, .{});
+    defer doc.deinit();
+    const ec = (try p256.P256.combMulBase([_]u8{0x11} ** 32, .big)).toUncompressedSec1();
+    try testing.expectError(error.KeyAlgorithmMismatch, verify(a, &doc, childByName(doc.root, "Signature").?, .{ .key = .{ .ecdsa_p256_sec1 = &ec } }));
 }
