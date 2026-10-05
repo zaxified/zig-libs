@@ -181,6 +181,20 @@ test "readHopFrame rejects a truncated buffer" {
     try testing.expectError(error.BufferTooSmall, readHopFrame(&buf));
 }
 
+test "hop frame edges: one-short dest, length 1 reserved, exact-fit buffer" {
+    // Mutation run 2026-10-05: none of these three edges had a test.
+    const payload = [_]u8{0xaa} ** 2;
+    const hmac = [_]u8{0xbb} ** hmac_len;
+    var dest: [1 + 2 + hmac_len]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, writeHopFrame(dest[0 .. dest.len - 1], &payload, hmac));
+    const written = try writeHopFrame(&dest, &payload, hmac); // exactly fits
+    const parsed = try readHopFrame(written); // and reads back from exactly that many octets
+    try testing.expectEqual(dest.len, parsed.consumed);
+    var one = [_]u8{0} ** 40;
+    one[0] = 1;
+    try testing.expectError(error.ReservedPayloadLength, readHopFrame(&one));
+}
+
 test "rightShift/leftShift are inverses on a distinguishable buffer" {
     var buf: [16]u8 = undefined;
     for (&buf, 0..) |*b, i| b.* = @intCast(i);
