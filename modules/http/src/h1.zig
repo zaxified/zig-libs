@@ -153,6 +153,26 @@ pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
     }
 }
 
+/// RFC 9112 §5.2 for a user agent: "MUST replace each received obs-fold with
+/// one or more SP octets prior to interpreting the field value". In place,
+/// over a block from `readHead`: every CRLF that is followed by SP or HTAB
+/// becomes two SP, so the continuation joins the field above and the block
+/// keeps its length (slices into it stay valid). The status line's own CRLF
+/// is left alone -- whitespace before the first field is §2.2's case, and
+/// the parse refuses it. Servers do not call this: a request with obs-fold
+/// is refused (§5.2 lets a server choose, and refusing is the smuggling-safe
+/// choice).
+pub fn unfoldObsFold(block: []u8) void {
+    const first_eol = std.mem.indexOf(u8, block, "\r\n") orelse return;
+    var i = first_eol + 2;
+    while (std.mem.indexOfPos(u8, block, i, "\r\n")) |at| : (i = at + 2) {
+        if (at + 2 < block.len and (block[at + 2] == ' ' or block[at + 2] == '\t')) {
+            block[at] = ' ';
+            block[at + 1] = ' ';
+        }
+    }
+}
+
 fn trimLineEnd(line: []const u8) []const u8 {
     return std.mem.trimEnd(u8, line, "\r\n");
 }
@@ -371,8 +391,16 @@ pub const ResponseHead = struct {
     header_block: []const u8,
     /// Parsed `Content-Length`, null if absent or overridden by chunked.
     content_length: ?u64 = null,
-    /// `Transfer-Encoding` includes `chunked`.
+    /// `Transfer-Encoding` is exactly the one token `chunked`, on one field
+    /// line -- the only framing coding this module decodes.
     chunked: bool = false,
+    /// A `Transfer-Encoding` field is present at all. Set without `chunked`
+    /// (another coding, `chunked` not alone, a second field line) the body is
+    /// still transfer-coded in a way this module cannot undo: `Client`
+    /// refuses the response. (Until 2026-10-05 `chunked` anywhere in any line
+    /// framed the body as chunked and handed the rest over still coded --
+    /// Go oracle.)
+    has_transfer_encoding: bool = false,
     /// `Connection: close` was sent.
     connection_close: bool = false,
     /// `Connection: keep-alive` was sent. Only relevant for an `HTTP/1.0`
@@ -422,7 +450,10 @@ pub const ResponseHead = struct {
             if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
                 try latchContentLength(&head.content_length, entry.value);
             } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
-                if (tokenListContains(entry.value, "chunked")) head.chunked = true;
+                // As `RequestHead.parse`: the sole token, on the only line.
+                head.chunked = !head.has_transfer_encoding and
+                    std.ascii.eqlIgnoreCase(entry.value, "chunked");
+                head.has_transfer_encoding = true;
             } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
                 if (tokenListContains(entry.value, "close")) head.connection_close = true;
                 if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
@@ -1193,10 +1224,25 @@ test "ResponseHead.parse: framing headers" {
     const dup = try ResponseHead.parse("HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7\r\n");
     try testing.expectEqual(@as(?u64, 7), dup.content_length);
 
-    // Chunked overrides Content-Length; token match is case-insensitive.
-    const te = try ResponseHead.parse("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: gzip, Chunked\r\n");
-    try testing.expect(te.chunked);
+    // Chunked overrides Content-Length; the token match is case-insensitive.
+    const te = try ResponseHead.parse("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: Chunked\r\n");
+    try testing.expect(te.chunked and te.has_transfer_encoding);
     try testing.expectEqual(@as(?u64, null), te.content_length);
+    // `chunked` not alone, or a second field line: not a framing this module
+    // decodes. `has_transfer_encoding` without `chunked` -- `Client` refuses
+    // it rather than hand over a body that is still coded.
+    for ([_][]const u8{
+        "Transfer-Encoding: gzip, Chunked\r\n",
+        "Transfer-Encoding: chunked, gzip\r\n",
+        "Transfer-Encoding: chunked, chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: identity\r\n",
+    }) |fields| {
+        var buf: [256]u8 = undefined;
+        const head = try ResponseHead.parse(try std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\n{s}", .{fields}));
+        try testing.expect(head.has_transfer_encoding and !head.chunked);
+    }
 
     const cc = try ResponseHead.parse("HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\n");
     try testing.expect(cc.connection_close);
@@ -1375,6 +1421,28 @@ test "RequestHead.iterate walks wire order" {
     try testing.expectEqualStrings("X-A", it.next().?.name);
     try testing.expectEqualStrings("2", it.next().?.value);
     try testing.expect(it.next() == null);
+}
+
+test "unfoldObsFold: a continuation joins its field, in place; the status line's CRLF is left alone" {
+    var block = "HTTP/1.1 200 OK\r\nX-A: 1\r\n 2\r\n\t3\r\nContent-Length: 2\r\n".*;
+    unfoldObsFold(&block);
+    const head = try ResponseHead.parse(&block);
+    try testing.expectEqualStrings("1   2  \t3", head.header("x-a").?);
+    try testing.expectEqual(@as(?u64, 2), head.content_length);
+    // A fold that carries a framing field's value is joined before parsing.
+    var cl = "HTTP/1.1 200 OK\r\nContent-Length:\r\n 5\r\n".*;
+    unfoldObsFold(&cl);
+    try testing.expectEqual(@as(?u64, 5), (try ResponseHead.parse(&cl)).content_length);
+    // Whitespace before the FIRST field is §2.2's case, not a fold: untouched,
+    // and the parse still refuses it.
+    var first = "HTTP/1.1 200 OK\r\n X-A: 1\r\n".*;
+    unfoldObsFold(&first);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n X-A: 1\r\n", &first);
+    try testing.expectError(error.MalformedHead, ResponseHead.parse(&first));
+    // Nothing to do: byte-identical.
+    var plain = "HTTP/1.1 204 No Content\r\nA: b\r\n".*;
+    unfoldObsFold(&plain);
+    try testing.expectEqualStrings("HTTP/1.1 204 No Content\r\nA: b\r\n", &plain);
 }
 
 test "ResponseHead.header lookup and iteration" {
@@ -1734,7 +1802,7 @@ const response_head_seeds = [_][]const u8{
     seed("HTTP/1.0 302 Found\r\n"), // the 1.0 version flag
     seed("HTTP/1.1 404 Not Found\r\n"), // a multi-word reason phrase
     seed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nServer: x\r\n"), // Content-Length framing
-    seed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: gzip, Chunked\r\n"), // chunked wins over Content-Length
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: gzip, Chunked\r\n"), // a coding list: not the sole `chunked`
     seed("HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\n"), // a two-token Connection list
     seed("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n"), // the 1.0 persistence opt-in
     seed("HTTP/1.1 301 Moved\r\nLocation: /new\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n"), // a repeated header, for `iterate`

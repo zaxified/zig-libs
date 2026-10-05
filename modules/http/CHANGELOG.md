@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Client, from the Go oracle's new `client` area** (64 responses against Go's
+  `http.Transport`; `src/go_oracle.zig`). **BEHAVIOURAL, not breaking:**
+  - `Client` refuses (`error.MalformedResponse`) a response whose `Transfer-Encoding` is not the sole
+    `chunked` on one field line (`gzip, chunked`, `chunked, gzip`, `chunked, chunked`, two field
+    lines, `identity`, unknown codings), and any HTTP/1.0 response with `Transfer-Encoding` (RFC 9112
+    §6.1/§6.3). It used to frame `chunked`-anywhere as chunked and hand over a body still coded,
+    and to decode chunked on HTTP/1.0 -- a desync shape for anything that relays it (`proxy`).
+  - `Client` unfolds obs-fold in a response head instead of refusing it (RFC 9112 §5.2: a user agent
+    MUST replace it with SP). New `h1.unfoldObsFold` (in place, length-preserving); the server side
+    still refuses obs-fold in requests.
+  - `h1.ResponseHead`: new `has_transfer_encoding`; `chunked` now means the sole token on the only
+    line, as in `RequestHead`.
 - **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE:** the Go oracle itself (`src/go_oracle.zig`,
   `src/go_oracle_vectors.zig`, `tools/go_oracle/`) is test-only; `root.zig` imports it inside its
   test block, so nothing new is published. The fixes it found are the entry below.

@@ -2155,10 +2155,18 @@ fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
             error.HeadTooLarge => return error.HeadTooLarge,
             error.MalformedHead => return error.MalformedResponse,
         };
+        // `block` is the front of `conn.head_buf`, which is ours to rewrite.
+        h1.unfoldObsFold(conn.head_buf[0..block.len]);
         const head = h1.ResponseHead.parse(block) catch |err| switch (err) {
             error.MalformedHead => return error.MalformedResponse,
             error.UnsupportedVersion => return error.UnsupportedHttpVersion,
         };
+        // A transfer coding other than the sole `chunked` would hand the
+        // caller a body still coded; and an HTTP/1.0 message with
+        // Transfer-Encoding has faulty framing (RFC 9112 §6.1), which a user
+        // agent must discard (§6.3).
+        if (head.has_transfer_encoding and (!head.chunked or head.http1_0))
+            return error.MalformedResponse;
         if (head.status >= 100 and head.status < 200 and head.status != 101) continue;
         return head;
     }

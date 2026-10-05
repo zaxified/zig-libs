@@ -521,3 +521,106 @@ test "go oracle multipart: bodies split into the parts mime/multipart finds, or 
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── client: how a response is framed ─────────────────────────────────────
+
+const Client = @import("Client.zig");
+const testkit = @import("testkit");
+const net = std.Io.net;
+
+/// Answers exactly one connection: reads the request head, writes
+/// `response`, closes.
+const OneShotPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    response: []const u8,
+
+    fn run(p: *OneShotPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        while (true) {
+            const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.response) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+const ClientOutcome = struct { status: u16, body: ?[]u8 };
+
+fn ourClient(io: std.Io, gpa: std.mem.Allocator, c: vectors.ClientCase) !ClientOutcome {
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("go oracle client: listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    var peer: OneShotPeer = .{ .io = io, .listener = &listener, .response = c.response };
+    const thread = try std.Thread.spawn(.{}, OneShotPeer.run, .{&peer});
+    defer thread.join();
+
+    var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+    const method: http_root.Method = if (std.mem.eql(u8, c.method, "HEAD")) .head else .get;
+    var res = client.requestPlain(method, url_text, .{ .follow_redirects = false }) catch
+        return .{ .status = 0, .body = null };
+    defer res.deinit();
+    const body = res.readAllAlloc(gpa, 4096) catch null;
+    return .{ .status = res.status, .body = body };
+}
+
+const http_root = @import("root.zig");
+
+/// Where our client reads a response differently from Go's Transport: what
+/// we return (status 0 = the request failed; `body_ok` = the body read
+/// cleanly), and why.
+const ClientDivergence = struct { id: []const u8, status: u16, body_ok: bool, why: []const u8 };
+
+const client_divergences = [_]ClientDivergence{
+    // ── Go is the one off the RFC ──
+    .{ .id = "te-http10-chunked", .status = 0, .body_ok = false, .why = "RFC 9112 §6.1: an HTTP/1.0 message with Transfer-Encoding has faulty framing, which a user agent discards (§6.3); Go hands over the raw chunked bytes as the body. We used to decode it as chunked: fixed 2026-10-05" },
+    .{ .id = "version-2.0", .status = 0, .body_ok = false, .why = "`HTTP/2.0` is not an HTTP/1.x status line; Go's Transport reads it as one" },
+    // ── we are stricter, deliberately (as the server side is) ──
+    .{ .id = "version-1.2", .status = 0, .body_ok = false, .why = "RFC 9110 §2.5 SHOULD treat 1.2 as 1.1; no HTTP/1.2 exists, refused on purpose (pinned in h1.zig)" },
+    .{ .id = "double-space", .status = 0, .body_ok = false, .why = "status-line = HTTP-version SP status-code SP reason (RFC 9112 §4): one SP; Go skips extra spaces" },
+    .{ .id = "lf-only-head", .status = 0, .body_ok = false, .why = "RFC 9112 §2.2 MAY accept a bare LF; refused on both sides as a framing-desync guard (h1.readHead)" },
+    .{ .id = "space-before-colon", .status = 0, .body_ok = false, .why = "whitespace between a field name and the colon is invalid (RFC 9112 §5.1); Go keeps the field" },
+    .{ .id = "space-before-colon-cl", .status = 0, .body_ok = false, .why = "as space-before-colon, on Content-Length: a recipient that strips the space frames by it, one that does not reads until close" },
+};
+
+test "go oracle client: responses frame as Go's Transport frames them, or the difference is judged" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var bad: usize = 0;
+    for (vectors.client) |c| {
+        const ours = try ourClient(io, gpa, c);
+        defer if (ours.body) |b| gpa.free(b);
+        const agrees = ours.status == c.status and optEql(ours.body, c.body);
+        const listed = find(ClientDivergence, &client_divergences, c.id);
+        const verdict: ?[]const u8 = if (listed) |d|
+            (if (agrees)
+                "agrees now, drop its divergence entry"
+            else if (ours.status != d.status or (ours.body != null) != d.body_ok)
+                "diverges, but not the way its entry says"
+            else
+                null)
+        else if (agrees) null else "diverges";
+        const v = verdict orelse continue;
+        bad += 1;
+        std.debug.print("client {s}: {s}\n  go:   {d} {f}\n  ours: {d} {f}\n", .{
+            c.id,        v,
+            c.status,    std.zig.fmtString(c.body orelse "<error>"),
+            ours.status, std.zig.fmtString(ours.body orelse "<error>"),
+        });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
