@@ -182,6 +182,22 @@ test "init: round-trip with non-empty features and a networks TLV" {
     try testing.expectEqualSlices(u8, &chain_hash, decoded.extension.find(1).?);
 }
 
+test "init: the remote_addr TLV (type 3) is kept, not discarded as unknown-odd" {
+    // Mutation run 2026-10-05: dropping 3 from the known types passed every test.
+    const allocator = testing.allocator;
+    const addr = [_]u8{ 0x01, 192, 0, 2, 1, 0x26, 0x07 }; // IPv4 192.0.2.1:9735
+    const msg: Init = .{
+        .globalfeatures = &.{},
+        .features = &.{},
+        .extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{.{ .type = 3, .value = &addr }}) },
+    };
+    const bytes = try serializeInit(allocator, msg);
+    defer allocator.free(bytes);
+    var decoded = try decodeInit(allocator, bytes);
+    defer decoded.deinit(allocator);
+    try testing.expectEqualSlices(u8, &addr, decoded.extension.find(3).?);
+}
+
 test "hostile: init with a globalfeatures length prefix exceeding remaining bytes fails closed" {
     const bytes = [_]u8{ 0x00, INIT_TYPE, 0x00, 0x64 }; // gflen=100, nothing follows
     try testing.expectError(error.Truncated, decodeInit(testing.allocator, &bytes));

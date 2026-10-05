@@ -6,7 +6,7 @@
 
 **Scope:** mvp — LDK `lightning::ln::msgs` / lnd `lnwire` (BOLT#1/2/7 message sets) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation none
+**Audit:** review 2026-09-03 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -237,6 +237,14 @@ was written, and this same file said so eighteen lines below**: the Anchoring se
 No regtest daemon was needed." It also cited `SPEC.md` as its own source, which is the signature
 of the mechanical `ANCHOR-TASKS.tsv` substitution that produced it. One document, both claims, and
 the stale half is the one a reader hits first.
+
+**Mutation run 2026-10-05** (in-place, Debug, 36 mutants over `tlv.zig`'s BigSize and
+truncated-integer codecs and stream rules, the reader's bounds, `openFrame`, the three
+announcement digests and the `verify*` signer pairing, the known-TLV tables and
+`commitment_signed`'s count guard): 29 killed. Four tests added for the seven survivors:
+BigSize one octet short of each wide form and an encode buffer one short, each digest one
+octet short of its signature block and exactly at it, 65536 `htlc_signatures` refused as
+`FieldTooLong`, `init`'s `remote_addr` (type 3) kept. Equivalent: none.
 
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 

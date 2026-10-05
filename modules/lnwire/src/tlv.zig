@@ -354,6 +354,16 @@ test "BigSize decode vectors: short/no read (Truncated)" {
     }
 }
 
+test "BigSize: one octet short of each wide form is Truncated; encode refuses a one-short buffer" {
+    // Mutation run 2026-10-05: the spec's short reads stop two or more octets
+    // short, so `len < 5`/`len < 9` could each lose one without a test noticing.
+    try testing.expectError(error.Truncated, decodeBigSize(&.{ 0xfe, 0x00, 0x01, 0x00 }));
+    try testing.expectError(error.Truncated, decodeBigSize(&.{ 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 }));
+    var buf: [9]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeBigSize(0x10000, buf[0..4]));
+    try testing.expectError(error.BufferTooSmall, encodeBigSize(0x100000000, buf[0..8]));
+}
+
 // -- BOLT#1 Appendix A: BigSize encoding vectors (byte-exact) --
 
 test "BigSize encode vectors" {

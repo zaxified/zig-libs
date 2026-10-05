@@ -1023,6 +1023,18 @@ test "hostile: channelAnnouncementDigest on a too-short payload fails closed" {
     try testing.expectError(error.Truncated, channelAnnouncementDigest(&([_]u8{0} ** 100)));
 }
 
+test "digests: one octet short of the signature block is Truncated, exactly the block hashes nothing" {
+    // Mutation run 2026-10-05: the too-short test above is far below the edge.
+    const zeros = [_]u8{0} ** CHANNEL_ANNOUNCEMENT_SIG_BYTES;
+    const empty_sha256d = sha256d(&.{});
+    try testing.expectError(error.Truncated, channelAnnouncementDigest(zeros[0 .. CHANNEL_ANNOUNCEMENT_SIG_BYTES - 1]));
+    try testing.expectEqual(empty_sha256d, try channelAnnouncementDigest(&zeros));
+    try testing.expectError(error.Truncated, nodeAnnouncementDigest(zeros[0 .. NODE_ANNOUNCEMENT_SIG_BYTES - 1]));
+    try testing.expectEqual(empty_sha256d, try nodeAnnouncementDigest(zeros[0..NODE_ANNOUNCEMENT_SIG_BYTES]));
+    try testing.expectError(error.Truncated, channelUpdateDigest(zeros[0 .. CHANNEL_UPDATE_SIG_BYTES - 1]));
+    try testing.expectEqual(empty_sha256d, try channelUpdateDigest(zeros[0..CHANNEL_UPDATE_SIG_BYTES]));
+}
+
 test "node_announcement: round-trip + digest offset-64 semantics" {
     const allocator = testing.allocator;
     const msg: NodeAnnouncement = .{
