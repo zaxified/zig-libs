@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation none
+**Audit:** review 2026-09-15 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -439,6 +439,59 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
   reduction constant is load-bearing and the equality checks have teeth.
 - **Gated differentials** (`oracle_test.zig`): SKIP until each gate flips, then
   pin the core bit-for-bit to the portable path.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build of the whole test binary, 50 tests,
+`setsid -w timeout -s KILL 20` per mutant; the four stack-wipe mutants also against a ReleaseFast
+build filtered to `STACKPROBE`, where those probes run): **62 mutants, 47 killed, 15 equivalent
+or unobservable**. Points: BIP340 sign (key/nonce zero checks, both even-y normalisations, `t`,
+the nonce and challenge hash inputs) and verify (`lift_x` parity, `r < p`, `s < n`, even `y(R)`,
+challenge), ECDSA verify (`r, s ≠ 0`, `x(R) mod n`, low-S, the hash), `isLowS`'s boundary, RFC 6979
+(both DRBG separators, the candidate check), `sign`'s key/`r`/`s` checks, recid bits 0 and 1,
+low-S with its recid flip, `recoverPubkey`'s range checks, parity and `−e`, both stack burns and
+both named wipes, `rejectIdentity`, the on-curve check, every `fromSec1` length/tag/parity rule,
+`toCompressedSec1`'s tag, the identity checks of every multiply, the GLV reduction, the signed-
+digit recoding and its sign, `Fe.fromBytes`/`rejectNonCanonical`/`sqrt`/`normalize`/`isOdd`, and
+the GLV split's rounding.
+
+First pass: 24 survivors. **No defect in the code; 7 were test gaps**, closed by 5 tests:
+
+- `ecdsaVerify` with the one-octet `00` public key (the point at infinity) must reject a pair
+  that solves the key-free equation (`r = x(k·G)`, `s = e·k⁻¹`) — with the GLV double-base
+  path's identity-input check removed, that forgery VERIFIED and every test stayed green
+  (`sign.zig`). Plus the group-level pin: `mulDoubleBasePublic` refuses an identity base in
+  either position, like its double-add fallback (`group.zig`).
+- `fromSec1` refuses `00` with trailing bytes, `04` with a 65th coordinate byte, and the X9.62
+  hybrid tags `06`/`07` (libsecp256k1 accepts hybrid; this module's grammar and std, its
+  oracle, do not) — `<` length checks and a hybrid arm survived (`group.zig`).
+- `sign` refuses the private keys 0, `n`, `n + 1` and `2^256 − 1`: without the zero check it
+  signed under the point at infinity (`ecdsa_recover.zig`).
+- `recoverPubkey` with recid bit 1 and `r + n ≥ p`: `r = n − 1` gives `2n − 1 > 2^256`, which
+  without the check panics on `@intCast` in safe modes and truncates in ReleaseFast.
+
+Equivalent or unobservable (15), each reasoned:
+
+- Unreachable branches (probability ≤ 2^-127, or excluded by an earlier check): `bip340Sign`'s
+  `d' = 0` (`combMulBase(0)` already returns the same error) and `k' = 0`, RFC 6979's
+  `cand ≠ 0` and retry separator, `sign`'s `r = 0` and `s = 0`.
+- `bip340Verify`'s `r < p`: `x(R)` is always `< p`, so `r ≥ p` can never equal it.
+- `bip340Verify`'s `s < n` replaced by `s mod n`: accepting `s + n` needs a valid signature with
+  `s < 2^256 − n` (~2^-127 per signature), which cannot be constructed without breaking the
+  challenge hash. Kept, as in BIP340.
+- `ecdsaVerify`'s `r, s ≠ 0`: `s = 0` zeroes both coefficients (identity → reject); `r = 0`
+  needs `x(u1·G) = n`, a discrete logarithm.
+- `rejectIdentity`'s affine `(0, ·)` case: 7 is not a square mod `p` (checked), so no point has
+  `x = 0`; it only mirrors std.
+- `mulPublicGlv`'s identity-input check: an identity base makes every table entry and the
+  result the identity, which `glvCombine` rejects anyway.
+- `signedDigit` with `x > half`: digit 8 is still in the table (`mag ≤ 2^(w−1)`), a different
+  but exact recoding.
+- `normalize`'s second fold: both callers feed `s0 + carry·c < 2^256` (`add`: sum `< 2p`;
+  `reduceWide`: carry 0), so it never fires.
+- The named wipes of the RFC 6979 DRBG state and of `mul`'s digit arrays: the 16 KiB burns in
+  `sign`/`mul` clear the same region (both burns themselves are killed by the probes). Kept as
+  defence in depth.
 
 ## Performance status — VERIFY and SIGN both optimized
 

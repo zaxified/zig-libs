@@ -566,6 +566,45 @@ test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through 
     try testing.expect(real.recid & 2 == 0);
 }
 
+// Mutation run 2026-10-05: dropping `d.isZero()` left the suite green. With
+// d = 0 the signer still produces `s = k⁻¹·e`, a "signature" under the point
+// at infinity. SEC 1 v2 §3.2.1: a private key is in [1, n − 1].
+test "sign refuses a private key of 0, n, or above n" {
+    var hash: [32]u8 = undefined;
+    Sha256.hash("refuse", &hash, .{});
+    var n_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &n_bytes, scalarmod.field_order, .big);
+    var n1_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &n1_bytes, scalarmod.field_order + 1, .big);
+    for ([_][32]u8{ @splat(0), n_bytes, n1_bytes, @splat(0xff) }) |k| {
+        try testing.expectError(error.InvalidPrivateKey, sign(k, hash));
+    }
+    // Positive control: n − 1 is the largest valid key.
+    var top: [32]u8 = undefined;
+    std.mem.writeInt(u256, &top, scalarmod.field_order - 1, .big);
+    _ = try sign(top, hash);
+}
+
+// Mutation run 2026-10-05: dropping the `x_wide >= p` check left the suite
+// green. recid bit 1 means x(R) = r + n, a field element only for
+// r < p − n (~2^128.6). r = p − n gives exactly p (refused by `Fe.fromBytes`
+// even without the check); r = n − 1 gives 2n − 1 > 2^256, which does not fit
+// the 256-bit x at all — without the check `@intCast` panics in safe modes
+// and silently truncates in ReleaseFast.
+test "recoverPubkey: recid bit 1 with r + n >= p is InvalidScalar" {
+    var hash: [32]u8 = undefined;
+    Sha256.hash("recid bit 1", &hash, .{});
+    const s = [_]u8{0} ** 31 ++ [_]u8{1};
+    var r_p: [32]u8 = undefined;
+    std.mem.writeInt(u256, &r_p, fieldmod.field_order - scalarmod.field_order, .big);
+    var r_top: [32]u8 = undefined;
+    std.mem.writeInt(u256, &r_top, scalarmod.field_order - 1, .big);
+    for ([_]u2{ 2, 3 }) |recid| {
+        try testing.expectError(error.InvalidScalar, recoverPubkey(hash, r_p, s, recid));
+        try testing.expectError(error.InvalidScalar, recoverPubkey(hash, r_top, s, recid));
+    }
+}
+
 test "isLowS: half-order boundary" {
     var half: [32]u8 = undefined;
     std.mem.writeInt(u256, &half, scalarmod.field_order >> 1, .big);

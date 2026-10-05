@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (62 mutants, 47 killed, 15 equivalent or
+  unobservable; `SPEC.md` § "Mutation run 2026-10-05"). No defect; 5 new tests close the 7 test
+  gaps it found — `ecdsaVerify` refuses the `00` (infinity) public key even for a pair that
+  solves the key-free equation, `mulDoubleBasePublic` refuses an identity base, `fromSec1`
+  refuses trailing bytes and the hybrid `06`/`07` tags, `sign` refuses keys 0 and `≥ n`,
+  `recoverPubkey` refuses recid bit 1 with `r + n ≥ p`. No source change.
+
 - **2026-09-15** — **NO API CHANGE (secret hygiene), re-audit of F5:**
   `Secp256k1.mul` — the constant-time ECDH multiply (`sphinx`, `bolt8`,
   `bolt3`, `frost`) — left the u256 image of its SECRET scalar on the dead

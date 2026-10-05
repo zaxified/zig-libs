@@ -207,6 +207,33 @@ pub fn ecdsaVerifyLowS(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8)
 /// the verifier that enforces it; the two must never disagree on the boundary.
 pub const isLowS = @import("ecdsa_recover.zig").isLowS;
 
+// Mutation run 2026-10-05: with the double-base multiply's identity-input
+// check removed, every test stayed green — and this forgery verified. SEC 1
+// v2 §3.2.2.1: a valid public key is not O, and `fromSec1` decodes the
+// one-octet `00` as O. Under Q = O the verification equation
+// u1·G + u2·Q == R no longer involves any key, so anyone satisfies it: pick
+// k, set r = x(k·G) mod n and s = e·k⁻¹, then u1 = e·s⁻¹ = k.
+test "ecdsaVerify: the 00 (point at infinity) public key verifies nothing, not even a pair that solves the equation" {
+    const msg = "pay to anyone";
+    var h: [32]u8 = undefined;
+    Sha256.hash(msg, &h, .{});
+    const e = reduceToScalar(h);
+    const k = try Scalar.fromBytes([_]u8{0} ** 31 ++ [_]u8{7}, .big);
+    const R = try Secp256k1.combMulBase(k.toBytes(.big), .big);
+    const r = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
+    const s = e.mul(k.invert());
+    var sig: [64]u8 = undefined;
+    sig[0..32].* = r.toBytes(.big);
+    sig[32..64].* = s.toBytes(.big);
+
+    // The pair does solve the key-free equation: u1·G == R.
+    const u_g = e.mul(s.invert());
+    try std.testing.expect((try Secp256k1.combMulBase(u_g.toBytes(.big), .big)).equivalent(R));
+
+    try std.testing.expect(!ecdsaVerify(&.{0x00}, msg, sig));
+    try std.testing.expect(!ecdsaVerifyPrehashed(&.{0x00}, h, sig));
+}
+
 // ── fuzz: bip340Verify never panics on arbitrary signature/pubkey bytes ──
 //
 // `bip340Verify` is a Schnorr *verifier* — by construction it runs on data

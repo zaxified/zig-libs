@@ -868,6 +868,46 @@ test "recoverY / lift_x matches std" {
     }
 }
 
+// Mutation run 2026-10-05: relaxing the `00` and `04` length checks to `<`,
+// or adding an X9.62 hybrid arm (06/07, which libsecp256k1 accepts), left
+// every test green. The grammar this decoder documents — and std's
+// `fromSec1`, its oracle — is exactly 00 | 02/03 x | 04 x y, so each of these
+// must be refused by both.
+test "fromSec1 refuses what std refuses: trailing bytes after 00/02/04, hybrid 06/07" {
+    const un = Secp256k1.basePoint.toUncompressedSec1();
+    const co = Secp256k1.basePoint.toCompressedSec1();
+    const un_long = un ++ [_]u8{0};
+    const co_long = co ++ [_]u8{0};
+    const hybrid_even = [_]u8{0x06} ++ un[1..65].*; // G has even y: the "matching" hybrid
+    const hybrid_odd = [_]u8{0x07} ++ un[1..65].*;
+
+    const cases = [_][]const u8{ &.{ 0x00, 0x00 }, &un_long, &co_long, &hybrid_even, &hybrid_odd };
+    for (cases) |enc| {
+        try std.testing.expectError(error.InvalidEncoding, Secp256k1.fromSec1(enc));
+        try std.testing.expectError(error.InvalidEncoding, Std.fromSec1(enc));
+    }
+    // The exact-length forms still decode.
+    _ = try Secp256k1.fromSec1(&un);
+    _ = try Secp256k1.fromSec1(&co);
+}
+
+// Mutation run 2026-10-05: dropping either `rejectIdentity` input check in the
+// GLV double-base path left the suite green, although the double-add
+// fallback it must agree with refuses an identity base. The check is what
+// keeps `ecdsaVerify` from accepting the `00` public key (see sign.zig).
+test "mulDoubleBasePublic refuses an identity base, like its double-add fallback" {
+    const five = [_]u8{0} ** 31 ++ [_]u8{5};
+    const P = Secp256k1.basePoint;
+    const O = Secp256k1.identityElement;
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(O, five, P, five, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(P, five, O, five, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublicDoubleAdd(O, five, P, five, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublicDoubleAdd(P, five, O, five, .big));
+    // Positive control: 5·G + 5·G = 10·G.
+    const ten = try Secp256k1.mulDoubleBasePublic(P, five, P, five, .big);
+    try std.testing.expect(ten.equivalent(try P.mulPublic([_]u8{0} ** 31 ++ [_]u8{10}, .big)));
+}
+
 // ── fuzz: fromSec1 never panics on arbitrary attacker-supplied encodings ──
 //
 // The SEC1 point decoder underneath `ecdsaVerify`'s `pubkey_sec1` and every
