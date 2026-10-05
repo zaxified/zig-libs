@@ -67,8 +67,17 @@ pub const ReplayWindow = struct {
         }
         if (seq > self.highest) {
             const shift = seq - self.highest;
-            if (shift >= self.eff()) {
+            if (shift > self.eff()) {
                 self.bitmap = 0; // window jumped clear of every old bit
+            } else if (shift == 64) {
+                // The old high-water mark sits exactly at the trailing edge
+                // (diff == eff == 64), which `accepts` still counts as in the
+                // window — so it must stay marked. Only its bit survives a
+                // 64-place shift (`<< 64` itself is not expressible on u64).
+                // Until 2026-10-05 this case (and `shift == eff` for narrower
+                // windows) cleared the bitmap, and the old high-water mark was
+                // accepted a second time — a replay.
+                self.bitmap = @as(u64, 1) << 63;
             } else {
                 const amt: u6 = @intCast(shift);
                 // The old high-water mark now sits at bit (shift - 1); the rest
@@ -164,7 +173,9 @@ test "bitmap window agrees with a reference set over a randomised trace" {
             // Draw a sequence number near the moving frontier: mostly ahead,
             // sometimes within/behind the window, occasionally far behind.
             const roll = rnd.intRangeAtMost(u8, 0, 99);
-            const seq: u64 = if (roll < 55)
+            const seq: u64 = if (roll < 5)
+                base + sz // jump by exactly the window: the old mark lands on the edge
+            else if (roll < 55)
                 base + rnd.intRangeAtMost(u64, 1, 3) // advance
             else if (roll < 90)
                 base -| rnd.intRangeAtMost(u64, 0, sz + 4) // in/near window
@@ -208,4 +219,24 @@ test "reset drops history but keeps size" {
     try testing.expect(!w.started);
     try testing.expect(w.accepts(1)); // fresh again
     try testing.expectEqual(@as(u7, 16), w.size);
+}
+
+// Review finding 2026-10-05 (mutation run): a jump of exactly the window size
+// cleared the bitmap, but the previous high-water mark is then at diff ==
+// eff, the last slot `accepts` still treats as in-window — so it was accepted
+// again. The randomised trace above only advanced by 1–3 and never hit it.
+test "a jump of exactly the window size keeps the old high-water mark marked (no replay)" {
+    inline for (.{ 8, 32, 64 }) |sz| {
+        var w = ReplayWindow{ .size = sz };
+        w.commit(1000);
+        w.commit(1000 + sz);
+        try testing.expect(!w.accepts(1000)); // diff == eff: in window, already seen
+        try testing.expect(!w.accepts(1000 - 1)); // diff == eff + 1: out of window
+        try testing.expect(w.accepts(1000 + 1)); // in window, never seen
+        // One further: now the old mark falls out of the window.
+        var w2 = ReplayWindow{ .size = sz };
+        w2.commit(1000);
+        w2.commit(1000 + sz + 1);
+        try testing.expect(!w2.accepts(1000));
+    }
 }

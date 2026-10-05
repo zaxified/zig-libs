@@ -6,7 +6,7 @@
 
 **Scope:** core — IPsec ESP (RFC 4303) / DTLS 1.3 record layer (RFC 9147 §5); no single reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -280,6 +280,29 @@ arbitrary bytes:
 - **Concurrency.** `single_owner`: a `Sealer`/`Opener` is owned by one
   thread/loop and holds no lock. Sharing one across threads is the caller's to
   synchronise.
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **34 mutants first pass, 28 killed; after the fix and 2 tests, 35 of 35 killed** (one
+mutant replaced: the original `shift >= eff` became the fix, so its mutant now re-introduces the
+bug). Points: record parse length and version, the nonce layout, every replay-window edge
+(`accepts`: unstarted, fresh, duplicate, trailing edge; `commit`: clear, shift, bit position,
+in-window marking; `reset`), the AAD limit in all three places, `seal`'s buffer and sequence
+ceiling and advance, both `bumpEpoch`s, `rekey`'s nonce-space rule and seq/window restart,
+`open`'s epoch/buffer/AAD/replay checks, failed-plaintext wipe, window commit, and `wipe`.
+
+- **Defect (fixed) — a replay accepted at the window edge.** `commit` cleared the bitmap when
+  a new record advanced the high-water mark by exactly the window size (`shift >= eff`), but the
+  previous high-water mark then sits at `diff == eff`, the last slot `accepts` treats as
+  in-window — so it was accepted a second time (default window: receive seq 0, then seq 64, and
+  a replay of seq 0 opened). The randomised reference-set test advanced by 1–3 only and never hit
+  it. Now `shift > eff` clears; `shift == 64` keeps only the old mark's bit (`<< 64` is not
+  expressible). Test pins sizes 8/32/64; the randomised trace also jumps by exactly the window.
+  The same copy of this window in `oscore` had the same defect, fixed alongside.
+- **Test gaps closed:** AAD of exactly `max_caller_aad` (seal and open; the limit was only
+  checked beyond it), seq restart at 0 after `bumpEpoch`/`rekey` on a sealer that had sealed,
+  and `Opener.rekey` restarting the window.
 
 ## Backlog / deferred
 

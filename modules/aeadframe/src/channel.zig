@@ -881,3 +881,52 @@ test "wipe destroys the key in both halves and leaves the non-secret state alone
     try testing.expectEqual(@as(u32, 3), s.epoch);
     try testing.expectEqual(@as(u32, 3), o.epoch);
 }
+
+// ── mutation run 2026-10-05 ─────────────────────────────────────────────────
+
+test "AAD of exactly max_caller_aad seals and opens; one octet more is refused" {
+    inline for (channels) |Ch| {
+        const key = testKey(31);
+        var s = Ch.Sealer.init(key, 0);
+        var o = Ch.Opener.init(key, 0);
+        const aad = [_]u8{0x61} ** (max_caller_aad + 1);
+        var rec: [record.overhead + 2]u8 = undefined;
+        _ = try s.seal(&rec, "ok", aad[0..max_caller_aad]);
+        var pt: [2]u8 = undefined;
+        _ = try o.open(&pt, &rec, aad[0..max_caller_aad]);
+        try testing.expectEqualStrings("ok", &pt);
+        try testing.expectError(error.AadTooLarge, s.seal(&rec, "ok", &aad));
+        try testing.expectError(error.AadTooLarge, o.open(&pt, &rec, &aad));
+    }
+}
+
+test "bumpEpoch and rekey restart seq at 0 after records were sealed; Opener.rekey restarts the window" {
+    // The documented contract: a new (key, epoch) starts its sequence at 0.
+    // The tests above only checked it on sealers that had not sealed yet.
+    inline for (channels) |Ch| {
+        const key = testKey(41);
+        var s = Ch.Sealer.init(key, 0);
+        var rec: [record.overhead + 1]u8 = undefined;
+        for (0..3) |_| _ = try s.seal(&rec, "x", "");
+        try s.bumpEpoch();
+        try testing.expectEqual(@as(u64, 0), s.seq);
+        for (0..3) |_| _ = try s.seal(&rec, "x", "");
+        try s.rekey(testKey(42), 9);
+        try testing.expectEqual(@as(u64, 0), s.seq);
+
+        // Receiver: a window that has seen seq 0..99 under the old key must
+        // not refuse seq 0 under the new one.
+        var old_s = Ch.Sealer.init(key, 0);
+        var o = Ch.Opener.init(key, 0);
+        var pt: [1]u8 = undefined;
+        for (0..100) |_| {
+            _ = try old_s.seal(&rec, "y", "");
+            _ = try o.open(&pt, &rec, "");
+        }
+        o.rekey(testKey(43), 1);
+        var new_s = Ch.Sealer.init(testKey(43), 1);
+        _ = try new_s.seal(&rec, "z", "");
+        _ = try o.open(&pt, &rec, "");
+        try testing.expectEqualStrings("z", &pt);
+    }
+}

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fix (anti-replay):** `ReplayWindow.commit` cleared the bitmap when the
+  high-water mark advanced by exactly the window size, so the previous high-water mark (then at
+  the window's trailing edge, still in range) was accepted a second time — a replay. Fixed;
+  `Opener.open` now refuses it. Tests: first dated mutation run (35/35 after the fix and 2 new
+  tests; `SPEC.md` § "Mutation run 2026-10-05").
+
 - **2026-09-07** — Fuzz: `Opener.open`'s harness never ran a record. It drew
   `smith.bytes(&buf)` and then a ranged length, which reads eight octets as a
   little-endian u64 and returns the range minimum when fewer remain — so the
