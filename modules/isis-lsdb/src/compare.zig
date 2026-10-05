@@ -160,6 +160,9 @@ test "KAT: equal sequence, differing checksum vs an active stored → newer (pur
     // But when the STORED copy is a purge (zero lifetime), a differing checksum
     // does NOT make the incoming active copy newer — the purge still governs.
     try testing.expectEqual(Ordering.older, compare(v(7, 1000, 0x2222), v(7, 0, 0x1111)));
+    // Nor does an incoming purge beat a stored purge: (c) needs an ACTIVE
+    // stored copy, (d) too.
+    try testing.expectEqual(Ordering.older, compare(v(7, 0, 0x2222), v(7, 0, 0x1111)));
 }
 
 test "KAT: fully identical is same both directions" {

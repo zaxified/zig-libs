@@ -2186,6 +2186,192 @@ test "§7.3.16.4 b): the retained purge header keeps its Checksum verbatim, on b
     try testing.expect(!peer.srmSet(id).?.isSet(0));
 }
 
+test "same/older arrivals: same acks (clears SRM there), older clears a pending SSN there" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    var obuf: [128]u8 = undefined;
+    const wire = buildLsp(&buf, sys_other, 0, 5, 1000);
+    const id = idOf(sys_other, 0);
+
+    // Locally injected: SRM on every circuit. The same copy arriving on 1 is
+    // an implicit ack there and nowhere else.
+    _ = try db.insert(wire, null, 0);
+    try testing.expectEqual(Ordering.same, (try db.insert(wire, 1, 1)).ordering);
+    try testing.expect(!db.srmIsSet(id, 1));
+    try testing.expect(db.srmIsSet(id, 0) and db.srmIsSet(id, 2));
+
+    // SSN pending on 1 (from that same arrival); an OLDER copy then arrives
+    // on 1: we flood ours there instead of acknowledging.
+    try testing.expect(db.ssnSet(id).?.isSet(1));
+    try testing.expectEqual(Ordering.older, (try db.insert(buildLsp(&obuf, sys_other, 0, 4, 1000), 1, 2)).ordering);
+    try testing.expect(db.srmIsSet(id, 1));
+    try testing.expect(!db.ssnSet(id).?.isSet(1));
+}
+
+test "own LSP: an identical echo is an ack, not a challenge; challenge_sequence only rises" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    var pbuf: [128]u8 = undefined;
+    const wire = buildLsp(&buf, sys_local, 0, 5, 1000);
+    const id = idOf(sys_local, 0);
+    _ = try db.insert(wire, null, 0);
+
+    const echo = try db.insert(wire, 1, 1);
+    try testing.expectEqual(Ordering.same, echo.ordering);
+    try testing.expectEqual(@as(?u32, null), echo.self_challenge);
+    try testing.expect(!db.refreshPending(id));
+    try testing.expect(!db.srmIsSet(id, 1));
+    try testing.expect(db.ssnSet(id).?.isSet(1));
+
+    // Two challenges, the second lower: the highest one is what we must beat.
+    // The first also withdraws the pending ack on 1: we re-flood instead.
+    _ = try db.insert(buildLsp(&pbuf, sys_local, 0, 10, 1000), 2, 2);
+    try testing.expectEqual(@as(usize, 0), db.ssnSet(id).?.count());
+    _ = try db.insert(buildLsp(&pbuf, sys_local, 0, 7, 1000), 2, 3);
+    try testing.expectEqual(@as(u32, 10), db.get(id, 3).?.challenge_sequence);
+    // The same through an SNP: a lower newer entry does not lower it either.
+    var cbuf: [256]u8 = undefined;
+    const lower = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = id, .sequence_number = 8, .checksum = 0x4242 }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &lower)), 1, 4);
+    try testing.expectEqual(@as(u32, 10), db.get(id, 4).?.challenge_sequence);
+}
+
+test "own LSP: an SNP entry identical to ours clears SRM on that circuit" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    const wire = buildLsp(&buf, sys_local, 0, 5, 1000);
+    const id = idOf(sys_local, 0);
+    _ = try db.insert(wire, null, 0);
+    const v = db.get(id, 0).?;
+    var cbuf: [256]u8 = undefined;
+    const same = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = id, .sequence_number = 5, .checksum = v.checksum }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &same)), 1, 0);
+    try testing.expect(!db.srmIsSet(id, 1));
+    try testing.expect(db.srmIsSet(id, 0));
+}
+
+test "CSNP completeness: a listed-identical LSP gets no SRM, and a request placeholder is never flooded" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 5, 1000), 0, 0);
+    const id = idOf(sys_other, 0);
+    db.clearSrm(id, 1);
+    const csum = db.get(id, 0).?.checksum;
+
+    // First CSNP: lists our LSP identically and asks for one we lack.
+    var cbuf: [256]u8 = undefined;
+    const want = idOf(sys_other, 9);
+    const first = [_]isis.tlvs.LspEntry{
+        .{ .remaining_lifetime = 1000, .lsp_id = id, .sequence_number = 5, .checksum = csum },
+        .{ .remaining_lifetime = 1000, .lsp_id = want, .sequence_number = 3, .checksum = 0x3333 },
+    };
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &first)), 1, 0);
+    try testing.expect(!db.srmIsSet(id, 1));
+    try testing.expect(db.get(want, 0).?.is_request);
+
+    // Second CSNP omits the requested one: it is a placeholder, nothing to send.
+    const second = [_]isis.tlvs.LspEntry{first[0]};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &second)), 1, 1);
+    try testing.expect(!db.srmIsSet(want, 1));
+    try testing.expect(!db.srmIsSet(id, 1));
+}
+
+test "CSNP completeness is skipped when the entry stream is malformed" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 3, 7, 1000), 0, 0);
+    const id = idOf(sys_other, 3);
+    db.clearSrm(id, 1);
+
+    // A CSNP that does not list #3, followed by a TLV header claiming 200
+    // octets with none behind it (PDU length patched to include it).
+    var cbuf: [256]u8 = undefined;
+    const listed = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = idOf(sys_other, 1), .sequence_number = 1, .checksum = 0x1111 }};
+    const good = buildCsnp(&cbuf, &listed);
+    cbuf[good.len] = isis.tlvs.code.lsp_entries;
+    cbuf[good.len + 1] = 200;
+    const total = good.len + 2;
+    std.mem.writeInt(u16, cbuf[8..10], @intCast(total), .big);
+    db.reconcileCsnp(try isis.Csnp.decode(cbuf[0..total]), 1, 0);
+    // Not a complete summary, so its silence about #3 proves nothing.
+    try testing.expect(!db.srmIsSet(id, 1));
+    // The same CSNP without the trailer is complete: #3 is flooded.
+    std.mem.writeInt(u16, cbuf[8..10], @intCast(good.len), .big);
+    db.reconcileCsnp(try isis.Csnp.decode(good), 1, 0);
+    try testing.expect(db.srmIsSet(id, 1));
+}
+
+test "SNP: an all-zero entry for an unknown LSP requests nothing; a full store requests nothing" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 2, .request_capacity = 2 });
+    defer db.deinit();
+    var cbuf: [256]u8 = undefined;
+    const zero = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 0, .lsp_id = idOf(sys_other, 7), .sequence_number = 0, .checksum = 0 }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &zero)), 1, 0);
+    try testing.expectEqual(@as(usize, 0), db.count());
+
+    // Fill to capacity with real LSPs; a request then has no room.
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 0, 0);
+    const ask = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = idOf(sys_other, 8), .sequence_number = 1, .checksum = 0x4242 }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &ask)), 1, 0);
+    try testing.expectEqual(@as(usize, 2), db.count());
+    try testing.expect(db.get(idOf(sys_other, 8), 0) == null);
+}
+
+test "request placeholder: any real copy fills it (even seq 0) and returns its budget slot" {
+    // capacity 8, request budget 1.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .request_capacity = 1 });
+    defer db.deinit();
+    var cbuf: [256]u8 = undefined;
+    const a = idOf(sys_other, 1);
+    const b = idOf(sys_other, 2);
+    const ask_a = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = a, .sequence_number = 3, .checksum = 0x3333 }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &ask_a)), 1, 0);
+    try testing.expect(db.get(a, 0).?.is_request);
+
+    var buf: [128]u8 = undefined;
+    const r = try db.insert(buildLsp(&buf, sys_other, 1, 0, 1000), 1, 0);
+    try testing.expect(r.stored);
+    try testing.expect(!db.get(a, 0).?.is_request);
+
+    // The single request slot is free again.
+    const ask_b = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1000, .lsp_id = b, .sequence_number = 3, .checksum = 0x3333 }};
+    db.reconcileCsnp(try isis.Csnp.decode(buildCsnp(&cbuf, &ask_b)), 1, 0);
+    try testing.expect(db.get(b, 0).?.is_request);
+}
+
+test "refresh: flagged exactly at the threshold, and counted once" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .refresh_threshold = 50 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 1, 100), null, 0);
+    // t=50: remaining 50 == threshold → flagged.
+    try testing.expectEqual(@as(usize, 1), db.tick(50).refresh_flagged);
+    // Still pending at the next tick: not counted again.
+    try testing.expectEqual(@as(usize, 0), db.tick(51).refresh_flagged);
+}
+
+test "an aged-out purge reads lifetime 0 at any query time; srmIsSet past the circuit table is false" {
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 10), 0, 0);
+    const id = idOf(sys_other, 0);
+    _ = db.tick(10);
+    try testing.expect(db.get(id, 10).?.is_purge);
+    // A reader that asks at an earlier time (isis-sim reads at 0) still sees
+    // the purge's zero lifetime, not the pre-expiry countdown.
+    try testing.expectEqual(@as(?u16, 0), db.remainingLifetime(id, 0));
+    try testing.expect(!db.srmIsSet(id, max_interfaces));
+    try testing.expect(!db.srmIsSet(id, 255));
+}
+
 test "srmIterator walks the LSPs queued for one circuit" {
     var db = Lsdb.init(testing.allocator, testCfg());
     defer db.deinit();

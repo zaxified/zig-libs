@@ -6,7 +6,7 @@
 
 **Scope:** mvp — FRR isisd update process (10.7, `isis_lsp.c` behaviour) and holo-isis `lsdb.rs` (v0.9.0), ISO 10589 §7.3; the update process is complete, but LSP generation, the auth check and LSPDBOverload are missing (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation none
+**Audit:** review 2026-08-11 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -359,6 +359,25 @@ cross-checked against FRRouting `isis_lsp.c:lsp_compare`.
   count.
 - **Integration**: two `Lsdb` instances reconcile a CSNP and flood the delta into
   each other through the `isis` wire codec, converging.
+- **Mutation run 2026-10-05** (in-place, Debug, 52 mutants over the
+  §7.3.16.1 comparison, the receive checksum check, sequence exhaustion, the
+  own-LSP challenge path, the capacity and request-budget bounds, the
+  SRM/SSN matrix, aging/refresh/purge boundaries, `summarise`, and the
+  CSNP/PSNP reconcile incl. completeness): 47 killed. The first pass left 22;
+  nine tests added and one KAT extended: purge vs purge at equal sequence is
+  older; same/older arrivals clear SRM resp. SSN on the arrival circuit; an
+  identical echo of our own LSP is an ack, a challenge withdraws pending SSNs
+  and `challenge_sequence` only rises (by LSP and by SNP); an SNP identical to
+  our own LSP clears SRM there; a listed-identical LSP gets no completeness
+  SRM and a placeholder is never flooded; a malformed CSNP is not complete;
+  an all-zero SNP entry requests nothing and a full store requests nothing; a
+  placeholder is filled by any real copy and returns its budget slot; refresh
+  is flagged exactly at the threshold and counted once; an aged purge reads
+  lifetime 0 at any query time and `srmIsSet` past the circuit table is false.
+  Equivalent: `elapsed > initial_lifetime` (equal gives 0 either way), the
+  three `is_request` checks on the own-LSP paths (a placeholder is only ever
+  made for a foreign LSP-ID), and `summarise`'s `== .gt` skip (map keys are
+  unique, so `.eq` never occurs).
 
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` suite unaffected.

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 47 of 52 killed, 5 equivalent; 9 tests added and one
+  KAT extended (purge vs purge; same/older arrival acks; own-LSP echo, challenge SSN
+  withdrawal and monotone `challenge_sequence`; own SNP ack; CSNP completeness incl. a
+  malformed CSNP and placeholders; all-zero SNP entry and full store; placeholder fill
+  and budget return; refresh threshold; aged-purge lifetime and `srmIsSet` bound). No
+  code change.
 - **2026-09-07** — **Both fuzz harnesses fixed: `fuzzInsert` had only ever been
   handed an empty slice, and every knob in it was structurally stuck on one side.**
 
