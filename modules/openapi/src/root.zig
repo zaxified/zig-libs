@@ -52,6 +52,10 @@
 //! - Routes whose *converted* path collides (only possible with a literal
 //!   `{`/`}` static segment) merge into one path item; the first
 //!   registration wins per method — duplicate JSON keys are never emitted.
+//! - A literal `{`/`}` static segment has no OpenAPI spelling (it reads as
+//!   a template expression with no parameter): `build` refuses the table
+//!   with `error.UnresolvedPathParameter` from its own output check; leave
+//!   such a route out with `Info.include`.
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -879,10 +883,10 @@ const docs_html_tail =
 // Every generation test below checked the emitted JSON only for (a) exact
 // byte-identity with a hand-typed string and (b) `std.json` well-formedness —
 // which proves the writer produces *some* JSON matching what a human typed,
-// never that the document is *valid OpenAPI*. No OpenAPI validator
-// (`openapi-spec-validator`, `redocly`/`spectral`) is installed on this
-// machine (checked: no matching Python package, no `node`/`npm` at all), and
-// this task must not install one, so the tool-oracle route is blocked here.
+// never that the document is *valid OpenAPI*. (When this was written no
+// OpenAPI validator was installed; openapi-spec-validator now judges a
+// generated corpus -- `spec_oracle_test.zig` -- and the checker below is
+// held to its verdicts on mutated documents.)
 //
 // This module only ever *generates* documents — it has no parser for
 // arbitrary third-party OpenAPI text, so "adopt an official example and feed
@@ -915,6 +919,25 @@ pub const ConformanceError = error{
     EmptyResponses,
     InvalidResponse,
     MissingResponseDescription,
+    /// A template expression of a path key (`{id}` in `/users/{id}`) with no
+    /// `in: path` parameter of that name on the operation or its path item
+    /// (OAS 3.1 §4.8.12.1). What a literal `{x}` static route segment used
+    /// to put in a generated document -- built and served, refused by every
+    /// validator (openapi-spec-validator, `spec_oracle_test.zig`, 2026-10-05).
+    UnresolvedPathParameter,
+    /// An `in: path` parameter whose name is no template expression of its
+    /// path (§4.8.12.1: it MUST correspond to one).
+    UndeclaredPathParameter,
+    /// An `in: path` parameter without `required: true` (§4.8.12.1).
+    OptionalPathParameter,
+    /// Two parameters with one name and one location in the same list.
+    DuplicateParameter,
+    /// A parameter that is not an object with a non-empty `name`, an `in` of
+    /// query/header/path/cookie, and exactly one of `schema`/`content`.
+    InvalidParameter,
+    /// A `responses` key that is not `default`, a status code 100-599, or a
+    /// range `1XX`-`5XX`.
+    InvalidResponseKey,
 };
 
 pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
@@ -951,14 +974,124 @@ fn validatePathsObject(paths_val: std.json.Value, comptime kind: PathsKind) Conf
     var it = paths_val.object.iterator();
     while (it.next()) |entry| {
         if (kind == .paths and (entry.key_ptr.len == 0 or entry.key_ptr.*[0] != '/')) return error.InvalidPathKey;
-        try validatePathItem(entry.value_ptr.*);
+        // A webhook's key is a name, not a templated path.
+        try validatePathItem(entry.value_ptr.*, if (kind == .paths) entry.key_ptr.* else null);
     }
+}
+
+/// The template expressions of a path key, in order: `{a}` and `{b}` of
+/// `/x/{a}/{b}`. An unclosed `{` or a `}` outside one is `InvalidPathKey`.
+const TemplateIterator = struct {
+    path: []const u8,
+    i: usize = 0,
+
+    fn next(t: *TemplateIterator) ConformanceError!?[]const u8 {
+        while (t.i < t.path.len) : (t.i += 1) {
+            switch (t.path[t.i]) {
+                '}' => return error.InvalidPathKey,
+                '{' => {
+                    const end = std.mem.indexOfScalarPos(u8, t.path, t.i + 1, '}') orelse return error.InvalidPathKey;
+                    const name = t.path[t.i + 1 .. end];
+                    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '{') != null) return error.InvalidPathKey;
+                    t.i = end + 1;
+                    return name;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+
+fn templateHas(path: []const u8, name: []const u8) ConformanceError!bool {
+    var it: TemplateIterator = .{ .path = path };
+    while (try it.next()) |v| if (std.mem.eql(u8, v, name)) return true;
+    return false;
+}
+
+const parameter_locations = [_][]const u8{ "query", "header", "path", "cookie" };
+
+/// A `parameters` list: each entry well formed, no (name, in) twice, every
+/// path parameter required. A `$ref` entry is not resolved here.
+fn validateParameterList(list_val: std.json.Value) ConformanceError!void {
+    if (list_val != .array) return error.InvalidParameter;
+    const items = list_val.array.items;
+    for (items, 0..) |p, i| {
+        if (p != .object) return error.InvalidParameter;
+        if (p.object.get("$ref") != null) continue;
+        const name = paramField(p, "name") orelse return error.InvalidParameter;
+        const in = paramField(p, "in") orelse return error.InvalidParameter;
+        if (name.len == 0) return error.InvalidParameter;
+        for (parameter_locations) |loc| {
+            if (std.mem.eql(u8, in, loc)) break;
+        } else return error.InvalidParameter;
+        if ((p.object.get("schema") != null) == (p.object.get("content") != null)) return error.InvalidParameter;
+        if (std.mem.eql(u8, in, "path")) {
+            const req = p.object.get("required") orelse return error.OptionalPathParameter;
+            if (req != .bool or !req.bool) return error.OptionalPathParameter;
+        }
+        for (items[0..i]) |q| {
+            const qn = paramField(q, "name") orelse continue;
+            const qi = paramField(q, "in") orelse continue;
+            if (std.mem.eql(u8, qn, name) and std.mem.eql(u8, qi, in)) return error.DuplicateParameter;
+        }
+    }
+}
+
+fn paramField(p: std.json.Value, comptime field: []const u8) ?[]const u8 {
+    if (p != .object) return null;
+    const v = p.object.get(field) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+/// Whether `list` (a `parameters` array, or null) names a path parameter
+/// `name`; `has_ref` is set when it holds an unresolved `$ref`.
+fn listHasPathParam(list: ?std.json.Value, name: []const u8, has_ref: *bool) bool {
+    const l = list orelse return false;
+    if (l != .array) return false;
+    for (l.array.items) |p| {
+        if (p == .object and p.object.get("$ref") != null) has_ref.* = true;
+        const n = paramField(p, "name") orelse continue;
+        const in = paramField(p, "in") orelse continue;
+        if (std.mem.eql(u8, in, "path") and std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// The operation's path parameters against its path key's template, both
+/// ways (§4.8.12.1). An unresolved `$ref` in either list leaves the
+/// "unresolved template variable" direction undecided, so it is skipped.
+fn validatePathTemplate(path: []const u8, item_params: ?std.json.Value, op_params: ?std.json.Value) ConformanceError!void {
+    var has_ref = false;
+    var it: TemplateIterator = .{ .path = path };
+    while (try it.next()) |v| {
+        if (!listHasPathParam(op_params, v, &has_ref) and !listHasPathParam(item_params, v, &has_ref) and !has_ref)
+            return error.UnresolvedPathParameter;
+    }
+    for ([_]?std.json.Value{ item_params, op_params }) |list| {
+        const l = list orelse continue;
+        if (l != .array) continue;
+        for (l.array.items) |p| {
+            const n = paramField(p, "name") orelse continue;
+            const in = paramField(p, "in") orelse continue;
+            if (std.mem.eql(u8, in, "path") and !try templateHas(path, n)) return error.UndeclaredPathParameter;
+        }
+    }
+}
+
+fn validResponseKey(k: []const u8) bool {
+    if (std.mem.eql(u8, k, "default")) return true;
+    if (k.len != 3 or k[0] < '1' or k[0] > '5') return false;
+    if (k[1] == 'X' and k[2] == 'X') return true;
+    return std.ascii.isDigit(k[1]) and std.ascii.isDigit(k[2]);
 }
 
 const http_method_keys = [_][]const u8{ "get", "put", "post", "delete", "options", "head", "patch", "trace" };
 
-fn validatePathItem(item_val: std.json.Value) ConformanceError!void {
+fn validatePathItem(item_val: std.json.Value, path: ?[]const u8) ConformanceError!void {
     if (item_val != .object) return error.InvalidPathItem;
+    const item_params = item_val.object.get("parameters");
+    if (item_params) |l| try validateParameterList(l);
     var it = item_val.object.iterator();
     while (it.next()) |entry| {
         var is_method = false;
@@ -972,6 +1105,9 @@ fn validatePathItem(item_val: std.json.Value) ConformanceError!void {
         // are legal path-item members this checker does not deeply verify.
         if (!is_method) continue;
         try validateOperation(entry.value_ptr.*);
+        const op_params = entry.value_ptr.*.object.get("parameters");
+        if (op_params) |l| try validateParameterList(l);
+        if (path) |p| try validatePathTemplate(p, item_params, op_params);
     }
 }
 
@@ -982,6 +1118,7 @@ fn validateOperation(op_val: std.json.Value) ConformanceError!void {
     if (responses_val.object.count() == 0) return error.EmptyResponses;
     var rit = responses_val.object.iterator();
     while (rit.next()) |rentry| {
+        if (!validResponseKey(rentry.key_ptr.*)) return error.InvalidResponseKey;
         if (rentry.value_ptr.* != .object) return error.InvalidResponse;
         const desc = rentry.value_ptr.*.object.get("description") orelse return error.MissingResponseDescription;
         if (desc != .string) return error.MissingResponseDescription;
@@ -2206,4 +2343,10 @@ test "integration: GET /openapi.json over a real socket returns the documented r
         defer testing.allocator.free(body);
         try testing.expectEqualStrings("hello", body);
     }
+}
+
+// ── external anchor: openapi-spec-validator on generated documents ─────────
+// See spec_oracle_test.zig / tools/interop.zig / tools/spec_oracle.py.
+test {
+    _ = @import("spec_oracle_test.zig");
 }

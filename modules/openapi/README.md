@@ -23,7 +23,10 @@ code. Closes the Web service / API cluster.
 Provenance: clean-room. Design references: FastAPI (MIT; generated-spec
 shape + defaults), utoipa (MIT OR Apache-2.0), OpenAPI Specification 3.1.0
 (Apache-2.0, OpenAPI Initiative). No third-party source copied. See
-`NOTICE`.
+`NOTICE`. DATA: `src/spec_oracle_vectors.zig` holds route tables our tooling drew
+(`tools/spec_oracle.py`), the documents this module built for them, mutations of
+those, and openapi-spec-validator's verdicts (Apache-2.0, run as a black box) —
+observed behaviour, exempt per root `NOTICE` §0.
 
 ## Usage
 

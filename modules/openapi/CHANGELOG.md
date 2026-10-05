@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: openapi-spec-validator oracle** (`tools/spec_oracle.py`, `tools/interop.zig`,
+  `src/spec_oracle_test.zig`): 102 route tables built through a real router must give the documents the
+  validator accepted; 168 mutated documents must get the validator's verdict from `validateOpenApi31`.
+  - **DEFECT fixed, BEHAVIOURAL:** a route with a literal `{x}` static segment produced a document with a
+    template variable and no parameter, which every validator refuses; `build` now fails with
+    `error.UnresolvedPathParameter` (exclude such a route with `Info.include`).
+  - `validateOpenApi31` checks parameters: path template against path parameters both ways, `required: true`
+    on path parameters, duplicates, `in`, exactly one of `schema`/`content`; and `responses` keys. ⚠ New
+    `ConformanceError` (and so `BuildError`) members: `UnresolvedPathParameter`, `UndeclaredPathParameter`,
+    `OptionalPathParameter`, `DuplicateParameter`, `InvalidParameter`, `InvalidResponseKey` -- an exhaustive
+    `switch` needs the new arms.
+
 - **2026-10-04** — **Tests:** mutation run (35 schemata mutants, 34 killed, 1 equivalent). New
   tests: a non-UTF-8 response description is `InvalidUtf8`; `validateOpenApi31` refuses a
   non-string response `description` and accepts non-operation Path Item members. No code change.
