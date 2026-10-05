@@ -374,6 +374,15 @@ sub-tag-length payloads, and the Appendix B.1 restart procedures.
   residue is a property of `std.crypto`'s AES, recorded here rather than
   hidden.
 
+### Replay-window edge, 2026-10-05
+
+`ReplayWindow.update` cleared the mask on a forward jump of exactly `window_size`, though the old
+highest then sits at `diff == window_size`, which `check` treats as in range — so it was
+accepted a second time. Found in `aeadframe`'s copy of this window by that module's mutation
+run; fixed the same way here (`shift > window` clears, `shift == 64` keeps only the old
+highest's bit). Test: "a jump of exactly window_size keeps the old highest marked", verified
+red with the old condition.
+
 ## Backlog / deferred
 
 - **EDHOC (RFC 9528) key exchange** *(survey 2026-09-30)*: OSCORE is used with a pre-shared master secret only, which is the deployment problem the IETF built EDHOC to solve; aiocoap has experimental EDHOC (README) and points at the `lakers` implementation. No sibling. Large (a month: CBOR/COSE, X25519/P-256, signatures, test vectors from RFC 9529 *(inferred)*); fits §2 (`std.crypto` covers the primitives).

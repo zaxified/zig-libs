@@ -323,8 +323,17 @@ pub const ReplayWindow = struct {
         }
         if (seq > rw.highest_seen) {
             const shift = seq - rw.highest_seen;
-            if (shift >= rw.effWindow()) {
+            if (shift > rw.effWindow()) {
                 rw.mask = 0;
+            } else if (shift == 64) {
+                // The old highest_seen sits exactly at the trailing edge
+                // (diff == window == 64), which `check` still treats as in
+                // range, so it must stay marked; `<< 64` is not expressible on
+                // u64. Until 2026-10-05 this case (and `shift == window_size`
+                // for narrower windows) cleared the mask and the old
+                // highest_seen was accepted again — a replay. Same defect as
+                // `aeadframe`'s window, found there by its mutation run.
+                rw.mask = @as(u64, 1) << 63;
             } else {
                 const shift_amt: u6 = @intCast(shift);
                 // The old highest_seen now sits at bit (shift - 1) in the
@@ -1477,6 +1486,20 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
     try std.testing.expect(rw.check(7)); // diff = 3, nothing recorded, so accepted
     try std.testing.expect(rw.check(6)); // diff = 4 == window_size -> still in range, not seen -> allowed
     try std.testing.expect(!rw.check(0)); // far outside the window now
+}
+
+test "ReplayWindow: a jump of exactly window_size keeps the old highest marked (no replay)" {
+    // Review finding 2026-10-05: the shift == window case cleared the mask,
+    // though the old highest is then at diff == window, which `check` still
+    // counts as in range — so it was accepted a second time.
+    inline for (.{ 4, 32, 64 }) |ws| {
+        var rw = ReplayWindow{ .window_size = ws };
+        rw.update(100);
+        rw.update(100 + ws);
+        try std.testing.expect(!rw.check(100)); // diff == window: in range, seen
+        try std.testing.expect(!rw.check(99)); // diff == window + 1: out of range
+        try std.testing.expect(rw.check(101)); // in range, unseen
+    }
 }
 
 /// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,

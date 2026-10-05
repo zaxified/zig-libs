@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fix (anti-replay, RFC 8613 §7.4):** `ReplayWindow.update` cleared the mask
+  when a new sequence number advanced the window by exactly `window_size`, so the previous
+  highest (then at the window's trailing edge, which `check` still treats as in range) was
+  accepted again — a replayed Partial IV. Same defect as `aeadframe`'s copy of this window,
+  found by its mutation run. Fixed and pinned for window sizes 4/32/64.
+
 - **2026-09-13** — **Documentation only.** A1 finding F16: `README.md` and `SPEC.md` described
   the `coap` → `oscore` integration as the intended wiring "already in this repository". No
   module depends on `oscore` and no such seam exists; both now say so and leave the wiring to
