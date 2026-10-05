@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Tests:** POSIX-footer evaluation anchored externally (`src/posix_test.zig`,
+  vectors `posix_kat.zig` from `tools/gen_posix_kat.py` + `tools/go_posix/`): every zone 2037..2050
+  against Python zoneinfo over tzdata 2026a, and 28 POSIX strings no release ships (Jn/n day forms,
+  rule times of -167..167 h, offsets with minutes, rules crossing the UTC year) against the majority of
+  glibc, Python zoneinfo and Go. No defect; no code change. Anchor grade MIXED → EXTERNAL.
+
 - **2026-09-30** — Local wall-clock time → UTC (maturity task C6): `resolveLocal(zone, local)`
   classifies a local time as `unique`, `ambiguous` (fold: both instants) or `nonexistent` (gap:
   the instants it maps to with the offset after / before the jump), and `localToUtc(zone, local,

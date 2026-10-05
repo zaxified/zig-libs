@@ -994,3 +994,7 @@ test "corpus: every footer reaches offsetAt, and the generator actually varies" 
     try testing.expectEqual(@as(usize, 6), nonzero_offset);
     try testing.expectEqual(@as(usize, 11), distinct_generated);
 }
+
+test {
+    _ = @import("posix_test.zig");
+}
