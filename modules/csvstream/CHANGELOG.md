@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **BEHAVIOURAL: `SplitOptions.trailing_empty_field` is now ON by default.** `a,b,`
+  splits into three fields (the last empty), as RFC 4180, Python's `csv` and Go's `encoding/csv` read
+  it; before, the final empty field was dropped, so a row whose LAST value is empty (`1,2,` under
+  `a,b,c`) read as a short row and `writeRecord(["a","b",""])` did not read back. `countFields` counts
+  the same way, which also fixes `.span` mode's arity check for a multi-line record ending on an empty
+  field (`1,"x\ny",` under `a,b,c` fell back to one physical line). **Migration:** pass
+  `.trailing_empty_field = false` to `splitFieldsOpts`/`nextFieldsOpts` to keep the old reading (files
+  that end every row with a stray delimiter); a header `a,b,` now has a third, empty column name.
+
 - **2026-10-05** — **`SplitOptions.trailing_empty_field`** (opt-in, default off): a trailing delimiter
   yields a final empty field, as RFC 4180, Python's `csv` and Go's `encoding/csv` read it, and as this
   module's own `writeRecord(["a","b",""])` writes it (`a,b,` read back as two fields before). Also

@@ -39,8 +39,7 @@ unbalanced-quote flagged per line instead of swallowing the file; BOM stripping;
 against Python `csv` and Go `encoding/csv` over 1833 inputs, record offsets and the writer
 (`tools/oracle.py`, Anchoring), documenting every disagreement; multi-line quoted fields as an opt-in with a stated bound on what a stray quote can
 cost (`.span`, 2026-09-30) — the peers span without one. **Where we are behind:** multi-line
-fields are opt-in, not the default; by default a trailing delimiter drops the final empty field
-(`SplitOptions.trailing_empty_field` opts in to RFC 4180); no separate
+fields are opt-in, not the default; no separate
 escape char (`\"` dialects), no struct/serde mapping, no SIMD (→ Backlog).
 
 ## Design & invariants
@@ -170,10 +169,9 @@ From README "Deferred (not implemented in v1)", now trimmed to what's still actu
   `\`-escaped) use a different one. Not implemented — would touch both `splitFields`/`LineIterator`
   and the new writer's escaping, and no concrete consumer has asked for a non-RFC dialect yet.
 - ~~**Strict RFC 4180 opt-in, remaining half:** (b) a trailing delimiter emitting a final empty
-  field.~~ DONE 2026-10-05 as `SplitOptions.trailing_empty_field` (opt-in). Still open: whether it
-  becomes the DEFAULT — today the module's own `writeRecord(["a","b",""])` output reads back as two
-  fields unless the reader opts in; consumer `bxp` splits headers and rows with the default (decide
-  with its session).
+  field.~~ DONE 2026-10-05 as `SplitOptions.trailing_empty_field`, the DEFAULT the same day (a row
+  whose last value is empty read as a short row; the writer did not round-trip). `false` keeps the
+  old reading.
 - ~~**Differential oracle for `.span` mode**~~ DONE 2026-10-05 (Anchoring).
 
 Implemented this round (previously listed here as deferred): configurable delimiter at the
@@ -257,4 +255,5 @@ upstream. 2026-09-17: a three-reader comparison over 146 one-line vectors, measu
 2026-10-05: the frozen Python/Go oracle above, which also covers `.span` mode and the writer. It found
 the module's own writer and reader disagreeing: `writeRecord(["a","b",""])` writes `a,b,`, which the
 reader read back as two fields (the trailing-delimiter deviation). `SplitOptions.trailing_empty_field`
-is the RFC 4180 reading as an opt-in; the default is unchanged.
+is the RFC 4180 reading, and the default since the same day; `countFields` (and with it `.span`
+mode's arity check) counts the same way.

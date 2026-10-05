@@ -37,12 +37,14 @@ pub const SplitOptions = struct {
     /// RFC 4180's `record = field *(COMMA field)`: `a,b,` is THREE fields,
     /// the last one empty -- what Python's `csv`, Go's `encoding/csv` and
     /// this module's own `writeRecord` (which writes `["a","b",""]` as
-    /// `a,b,`) all mean by it. Off by default, the module's long-standing
-    /// deviation: a trailing delimiter is consumed and no final empty field
-    /// is emitted, so `a,b,` is two. Turned on, a record written by
-    /// `writeRecord` reads back as the fields written (the Python/Go oracle,
-    /// `oracle_test.zig`, 2026-10-05). `countFields` counts the default way.
-    trailing_empty_field: bool = false,
+    /// `a,b,`) all mean by it, and what a row whose LAST value is empty
+    /// looks like (`1,2,` under the header `a,b,c`). On by default since
+    /// 2026-10-05; until then the default dropped the final empty field, so
+    /// that row read as two fields and the module's own writer did not
+    /// round-trip (the Python/Go oracle, `oracle_test.zig`). `false` keeps
+    /// the old reading for a caller whose files end every row with a stray
+    /// delimiter. `countFields` counts the default way.
+    trailing_empty_field: bool = true,
 };
 
 /// Splits one CSV line into its constituent fields.
@@ -210,10 +212,14 @@ pub fn splitFieldsOpts(
 /// How many fields `splitFields` would produce for `line` — the true count,
 /// independent of any buffer. Exists because `splitFields`'s "buf must be
 /// large enough" was a precondition a caller had no way to evaluate: learning
-/// the count meant re-implementing the quote-aware scan.
+/// the count meant re-implementing the quote-aware scan. Counts with the
+/// default `SplitOptions` (a trailing delimiter is one more, empty, field);
+/// a caller splitting with `.trailing_empty_field = false` gets one fewer
+/// for a record that ends on a delimiter.
 pub fn countFields(line: []const u8, delimiter: u8, quote: u8) usize {
     var n: usize = 0;
     var pos: usize = 0;
+    var ended_on_delimiter = false;
     while (pos <= line.len) {
         if (pos == line.len) break;
         if (quote != 0 and line[pos] == quote) {
@@ -231,14 +237,20 @@ pub fn countFields(line: []const u8, delimiter: u8, quote: u8) usize {
                 } else pos += 1;
             }
             if (pos < line.len) pos += 1;
-            if (pos < line.len and line[pos] == delimiter) pos += 1;
+            if (pos < line.len and line[pos] == delimiter) {
+                pos += 1;
+                ended_on_delimiter = pos == line.len;
+            }
         } else {
             while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
-            if (pos < line.len) pos += 1;
+            if (pos < line.len) {
+                pos += 1;
+                ended_on_delimiter = pos == line.len;
+            }
         }
         n += 1;
     }
-    return n;
+    return n + @intFromBool(ended_on_delimiter);
 }
 
 /// One record produced by `LineIterator.next()`: the record bytes (a slice into
@@ -662,14 +674,17 @@ test "splitFields: empty field between delimiters" {
     try t.expectEqualStrings("b", fields[2]);
 }
 
-test "splitFields: trailing delimiter produces no extra empty field" {
-    // After the last field the delimiter is consumed, then pos==len → break.
-    // This deviates from strict RFC 4180 (which would yield a trailing "").
+test "splitFields: trailing delimiter ends with an empty field by default" {
+    // RFC 4180, Python's csv and Go's encoding/csv: `a,b,` is three fields.
+    // A row whose last value is empty must not read as a short row.
     var buf: [8][]const u8 = undefined;
     const fields = try splitFields("a,b,", &buf, ',', '"', t.allocator);
-    try t.expectEqual(@as(usize, 2), fields.len);
+    try t.expectEqual(@as(usize, 3), fields.len);
     try t.expectEqualStrings("a", fields[0]);
     try t.expectEqualStrings("b", fields[1]);
+    try t.expectEqualStrings("", fields[2]);
+    try t.expectEqual(@as(usize, 3), countFields("a,b,", ',', '"'));
+    try t.expectEqual(@as(usize, 2), countFields("\"a\",", ',', '"'));
 }
 
 test "splitFieldsOpts: trailing_empty_field reads a final delimiter as RFC 4180 does" {
@@ -689,8 +704,11 @@ test "splitFieldsOpts: trailing_empty_field reads a final delimiter as RFC 4180 
     try t.expectError(error.FieldBufferTooSmall, splitFieldsOpts("a,b,", &two, ',', '"', t.allocator, rfc));
     const cut = try splitFieldsOpts("a,b,", &two, ',', '"', t.allocator, .{ .trailing_empty_field = true, .on_overflow = .truncate });
     try t.expectEqual(@as(usize, 2), cut.len);
-    // Off (the default), the documented deviation stands.
-    try t.expectEqual(@as(usize, 2), (try splitFields("a,b,", &buf, ',', '"', t.allocator)).len);
+    // Off, the pre-2026-10-05 reading: the final empty field is dropped.
+    const old: SplitOptions = .{ .trailing_empty_field = false };
+    try t.expectEqual(@as(usize, 2), (try splitFieldsOpts("a,b,", &buf, ',', '"', t.allocator, old)).len);
+    try t.expectEqual(@as(usize, 1), (try splitFieldsOpts("\"a\",", &buf, ',', '"', t.allocator, old)).len);
+    try t.expectEqual(@as(usize, 3), (try splitFieldsOpts("a,b,", &buf, ',', '"', t.allocator, .{})).len);
 }
 
 test "splitFields: quoted field containing delimiter" {
@@ -1075,7 +1093,9 @@ test "corpus: every field seed reaches splitFields, and the fields split are pin
     }
     try t.expectEqual(field_seeds.len, nonempty);
     // Measured 2026-09-07: 0 of 11 seeds non-empty and 0 fields split before.
-    try t.expectEqual(@as(usize, 86), fields);
+    // 86 → 88 on 2026-10-05: two seed/knob pairs end on a delimiter, which
+    // now yields the final empty field by default (`trailing_empty_field`).
+    try t.expectEqual(@as(usize, 88), fields);
     try t.expectEqual(@as(usize, 2), errors); // the 66-field seed against the 64-slot buffer, both quote settings
 }
 

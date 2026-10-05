@@ -199,16 +199,13 @@ inconsistent fixture pair. See NOTICE for provenance.
 
 ## Deferred (not implemented)
 
-Two items remain deliberately out of scope (multi-line quoted fields are
+One item remains deliberately out of scope (multi-line quoted fields are
 now the opt-in `.span` mode above):
 
 - **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both
   quoting and escaping; some dialects (`\`-escaped) use a different one. Would
   touch `splitFields`/`LineIterator` and the writer's escaping together, and no
   concrete consumer needs a non-RFC dialect yet.
-- **A trailing delimiter emitting a final empty field** (RFC 4180; `a,b,`
-  → 3 fields). Deviates by design today — see the `splitFields`
-  trailing-delimiter test.
 
 Everything else previously listed here (configurable delimiter, header-row
 handling, typed field coercion, CSV writing, BOM handling, field-count
