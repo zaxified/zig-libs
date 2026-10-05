@@ -828,6 +828,66 @@ test "a queue dequeue survives a failing allocator: value returned, node not fre
     // capacity, not a heap leak (testing.allocator would flag one).
 }
 
+test "a participant pinned at the CURRENT epoch does not block one advance" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2 });
+    defer d.deinit();
+    const a = try d.register();
+    const b = try d.register();
+    const g = d.enterCritical(b); // pinned at epoch 0, the current one
+    d.tryAdvance(a);
+    try testing.expectEqual(@as(u64, 1), d.epoch());
+    d.tryAdvance(a); // now b is a straggler at 0: blocked
+    try testing.expectEqual(@as(u64, 1), d.epoch());
+    g.release();
+    d.unregister(a);
+    d.unregister(b);
+}
+
+test "garbage is reclaimed after exactly two advances (the grace period), not before, not later" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer d.deinit();
+    const p = try d.register();
+    var freed: usize = 0;
+    var v: u64 = 0;
+    const g = d.enterCritical(p);
+    d.retire(p, .{ .ptr = &v, .ctx = &freed, .reclaim = countingReclaim });
+    g.release();
+
+    d.tryAdvance(p); // 0 → 1
+    try testing.expectEqual(@as(u64, 1), d.epoch());
+    try testing.expectEqual(@as(usize, 0), freed);
+    d.tryAdvance(p); // 1 → 2: the bag tagged 0 is now two epochs old
+    try testing.expectEqual(@as(u64, 2), d.epoch());
+    try testing.expectEqual(@as(usize, 1), freed);
+    d.unregister(p);
+}
+
+test "retire drains a bag left from num_epochs ago before reusing its slot" {
+    var d = try Domain.init(testing.allocator, .{ .max_participants = 2, .bag_reserve = 1 });
+    defer d.deinit();
+    const p = try d.register();
+    const q = try d.register();
+    var freed: usize = 0;
+    var x: u64 = 0;
+    var y: u64 = 0;
+
+    var g = d.enterCritical(p);
+    d.retire(p, .{ .ptr = &x, .ctx = &freed, .reclaim = countingReclaim }); // bag 0, epoch 0
+    g.release();
+    // Someone else advances the epoch three times; p never scans its own bags.
+    for (0..num_epochs) |_| d.tryAdvance(q);
+    try testing.expectEqual(@as(u64, num_epochs), d.epoch());
+    try testing.expectEqual(@as(usize, 0), freed);
+
+    g = d.enterCritical(p);
+    d.retire(p, .{ .ptr = &y, .ctx = &freed, .reclaim = countingReclaim }); // bag 0 again
+    g.release();
+    try testing.expectEqual(@as(usize, 1), freed); // x went first, in retire itself
+    try testing.expectEqual(@as(usize, 1), Domain.remainingGarbage(p));
+    d.unregister(p);
+    d.unregister(q);
+}
+
 test "fresh participant is unpinned with empty limbo bags" {
     var d = try Domain.init(testing.allocator, .{ .max_participants = 1 });
     defer d.deinit();
