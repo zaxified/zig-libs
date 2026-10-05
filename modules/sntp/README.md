@@ -19,7 +19,13 @@ offset and round-trip delay.
 Provenance: clean-room from RFC 4330 (SNTPv4) (and RFC 5905 for the timestamp
 format) — original work of the zig-libs authors (MIT). The packet layout and
 offset/delay *design* are modeled after `FObersteiner/ntp_client` (MIT,
-Codeberg); **no third-party code was copied**.
+Codeberg); **no third-party code was copied**. DATA:
+`src/ntp_oracle_vectors.zig` holds the replies a real chronyd 4.8 sent to this
+module's own requests (run as a black box by our tooling,
+`tools/ntp_oracle.py`), judged with beevik/ntp and ntplib (also black boxes) —
+observed behaviour, exempt per root `NOTICE` §0. `tools/go_oracle` pins
+beevik/ntp v1.6.0 (BSD-2-Clause) in its `go.sum`; it is a test instrument, never
+linked into the module.
 
 ## Epoch & fixed-point model
 

@@ -280,8 +280,11 @@ pub const KissCode = enum {
     /// Not one of the 14 codes above. Covers RFC 5905 §7.4's "X"-prefixed
     /// experimental range ("reserved for unregistered experimentation and
     /// development and MUST be ignored if not recognized") and any other
-    /// four-byte value, including non-ASCII bytes — `reference_id` is an
-    /// opaque wire field, not guaranteed text from a hostile or buggy peer.
+    /// four printable ASCII characters (a stratum-0 reply whose Reference ID
+    /// is not -- zeros, control or non-ASCII bytes -- is no Kiss-o'-Death
+    /// but `UnsynchronizedLeap`/`UnsynchronizedStratum`, see
+    /// `decodeResponse`); `parseKissCode` itself maps any value it does not
+    /// know here.
     /// `KissOfDeath.raw` always keeps the original bytes for a caller that
     /// wants to log or re-inspect them.
     unrecognized,
@@ -314,6 +317,14 @@ pub fn parseKissCode(raw: [4]u8) KissCode {
     return .unrecognized;
 }
 
+/// A kiss code is four printable ASCII characters (RFC 5905 §7.4: "a
+/// four-character ASCII string"); anything else in a stratum-0 Reference ID
+/// -- zeros above all -- is no kiss at all.
+fn isKissCode(raw: [4]u8) bool {
+    for (raw) |b| if (b < 0x21 or b > 0x7e) return false;
+    return true;
+}
+
 /// A Kiss-o'-Death signal, decoded from a `stratum == 0` reply.
 pub const KissOfDeath = struct {
     /// The parsed reason, per `parseKissCode`.
@@ -335,13 +346,15 @@ pub const DecodeError = error{
     InvalidVersion,
     /// The reply is not in server mode (mode 4).
     NotServerMode,
-    /// Stratum 0 — a Kiss-o'-Death packet (RFC 4330 §8, RFC 5905 §7.4). Pass
-    /// a non-null `kiss_out` to `decodeResponse` to get the parsed reason.
+    /// Stratum 0 with an ASCII kiss code in the Reference ID — a
+    /// Kiss-o'-Death packet (RFC 4330 §8, RFC 5905 §7.4). Pass a non-null
+    /// `kiss_out` to `decodeResponse` to get the parsed reason.
     KissOfDeath,
     /// Stratum 16 or above: RFC 5905 §7.3 Figure 11 defines 16 as
     /// "unsynchronized" and 17-255 as reserved (RFC 4330 §4 calls the whole
     /// 16-255 range simply "reserved"). Neither is a valid, synchronized
-    /// time source, so both are rejected the same way.
+    /// time source, so both are rejected the same way. Also stratum 0 with
+    /// no kiss code and no LI=3 ("unspecified or invalid", RFC 5905 §7.3).
     UnsynchronizedStratum,
     /// Leap Indicator is `.unsynchronized` (LI = 3, RFC 4330 §4's own "alarm
     /// condition — clock not synchronized"). Audit finding F7: a reply with
@@ -384,6 +397,16 @@ pub fn decodeResponse(bytes: []const u8, kiss_out: ?*KissOfDeath) DecodeError!Re
     if (p.version == 0) return error.InvalidVersion;
     if (p.mode != .server) return error.NotServerMode;
     if (p.stratum == 0) {
+        // Stratum 0 is "unspecified or invalid" (RFC 5905 §7.3); it is a
+        // Kiss-o'-Death only when the Reference ID carries an ASCII kiss code
+        // (RFC 4330 §8, RFC 5905 §7.4). An unsynchronized server answers
+        // LI=3, stratum 0, Reference ID 0 -- chronyd 4.8 and ntpd both do --
+        // and that is "not synchronized", not "go away": it used to come back
+        // as KissOfDeath/.unrecognized, telling a caller that honours KoD to
+        // back off from a server that only needs time (ntp oracle 2026-10-05).
+        if (!isKissCode(p.reference_id)) {
+            return if (p.leap == .unsynchronized) error.UnsynchronizedLeap else error.UnsynchronizedStratum;
+        }
         if (kiss_out) |out| out.* = .{ .code = parseKissCode(p.reference_id), .raw = p.reference_id };
         return error.KissOfDeath;
     }
@@ -866,14 +889,28 @@ test "decodeResponse: an unregistered/malformed kiss code maps to .unrecognized,
     try testing.expectEqual(KissCode.unrecognized, kod.code);
     try testing.expectEqualSlices(u8, "XABC", &kod.raw);
 
-    // A genuinely malformed (non-ASCII) value is likewise `.unrecognized`,
-    // never a decode failure — decodeResponse must not panic on it either.
+    // A non-ASCII value is no kiss code at all: stratum 0 "unspecified or
+    // invalid" (RFC 5905 §7.3), never a panic, never a KoD.
     bytes[12] = 0xFF;
     bytes[13] = 0x00;
     bytes[14] = 0x01;
     bytes[15] = 0xFE;
+    try testing.expectError(error.UnsynchronizedStratum, decodeResponse(&bytes, &kod));
+}
+
+test "decodeResponse: an unsynchronized server's stratum-0 reply is UnsynchronizedLeap, not Kiss-o'-Death" {
+    // chronyd 4.8 with no reference, byte for byte (ntp oracle 2026-10-05):
+    // LI=3 VN=4 mode 4, stratum 0, Reference ID 0.
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0xe4;
+    bytes[3] = 0xe6;
+    var kod: KissOfDeath = .{ .code = .rate, .raw = "SENT".* };
+    try testing.expectError(error.UnsynchronizedLeap, decodeResponse(&bytes, &kod));
+    try testing.expectEqualSlices(u8, "SENT", &kod.raw); // untouched: there was no kiss
+    // The same LI=3 with a kiss code IS one -- chronyd's RATE carries LI=3 too.
+    @memcpy(bytes[12..16], "RATE");
     try testing.expectError(error.KissOfDeath, decodeResponse(&bytes, &kod));
-    try testing.expectEqual(KissCode.unrecognized, kod.code);
+    try testing.expectEqual(KissCode.rate, kod.code);
 }
 
 test "parseKissCode: covers every RFC 5905 §7.4 registered code" {
@@ -1251,7 +1288,9 @@ const decode_seeds = [_][]const u8{
     // KissOfDeath with a registered code, which is what writes `kiss_out`.
     seed("240000000000000000000000524154450000000000000000000000000000000000000000000000000000000000000000"),
     // KissOfDeath with an unregistered code → `.unrecognized`, not an error.
-    seed("240000000000000000000000FF005A5A0000000000000000000000000000000000000000000000000000000000000000"),
+    seed("240000000000000000000000585A5A5A0000000000000000000000000000000000000000000000000000000000000000"),
+    // Stratum 0 without a kiss code (an unsynchronized server's reply): no KoD.
+    seed("E40000000000000000000000000000000000000000000000000000000000000000000001000000000000000100000000"),
 };
 
 test "fuzz: decodeResponse never panics on arbitrary bytes" {
@@ -1310,4 +1349,9 @@ test "corpus: every seed reaches decodeResponse, and the accepted count is pinne
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 2), wrong_length);
     try testing.expectEqual(@as(usize, 2), kissed);
+}
+
+// See ntp_oracle_test.zig / tools/interop.zig / tools/ntp_oracle.py.
+test {
+    _ = @import("ntp_oracle_test.zig");
 }

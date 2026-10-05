@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: a real chronyd, beevik/ntp and ntplib judge `query` and the codec**
+  (`tools/ntp_oracle.py`, `tools/interop.zig`, `tools/go_oracle`, `src/ntp_oracle_test.zig`): chronyd 4.8 per scenario
+  (unprivileged, `-x`, `unshare -rn`) -- stratum 3 to request versions 1-4 and over IPv6, stratum 10, unsynchronized,
+  rate limiting with Kiss-o'-Death RATE, denying the client. `query` and the codec path match the server's
+  configuration; beevik/ntp v1.6.0 reaches the same verdicts; ntplib computes the same offset and delay from the
+  same bytes. Raw replies frozen and replayed offline. Anchor grade MIXED → EXTERNAL.
+  - **DEFECT fixed, BEHAVIOURAL:** an unsynchronized server's reply (LI=3, stratum 0, Reference ID 0 -- what chronyd
+    and ntpd send) came back as `error.KissOfDeath` with code `.unrecognized`, so a caller honouring KoD backed off
+    from a server that merely had no time yet. Stratum 0 is now a Kiss-o'-Death only when the Reference ID is an
+    ASCII kiss code (RFC 4330 §8, RFC 5905 §7.4); otherwise `error.UnsynchronizedLeap` (LI=3) or
+    `error.UnsynchronizedStratum`. beevik/ntp still calls it a KoD (listed divergence).
+
 - **2026-10-01** — `query` takes T1/T4 from the `std.Io` it is given
   (`Io.Timestamp.now(io, .real)`) instead of a direct `clock_gettime`, so it
   runs under a simulated `Io` (`simio`'s pilot). Same clock on a real host;
