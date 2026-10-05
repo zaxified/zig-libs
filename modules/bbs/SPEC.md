@@ -141,14 +141,16 @@ follows `frost`'s "nonces are an explicit input" convention
 ## Deserialization subgroup-checks every untrusted point
 
 Same pitfall class `bls12_381`'s own `SPEC.md` centers its threat
-model on: `G1.fromBytesCompressed`/`G2.fromBytesCompressed` validate
-on-curve-ness only. So each untrusted decode in this module adds the
-identity rejection AND an explicit `subgroupCheck`: `PublicKey.fromBytes`
-(`src/keys.zig`, `G2`), `Signature.fromBytes` and the `Proof` points
-(`src/bbs.zig`, `G1`), each failing with its own error
-(`InvalidPublicKey` / `InvalidSignatureEncoding` / `InvalidProofEncoding`). This
-section used to say the check was missing and deferred; that was stale
-(corrected 2026-09-30 from the survey's report).
+model on. Since 2026-10-03 `G1.fromBytesCompressed`/`G2.fromBytesCompressed`
+check on-curve-ness AND subgroup membership themselves, so each untrusted
+decode in this module adds only the identity rejection on top:
+`PublicKey.fromBytes` (`src/keys.zig`, `G2`), `Signature.fromBytes` and the
+`Proof` points (`src/bbs.zig`, `G1`), each failing with its own error
+(`InvalidPublicKey` / `InvalidSignatureEncoding` / `InvalidProofEncoding`).
+Until 2026-10-03 this module ran its own `subgroupCheck` after an
+on-curve-only decode (see CHANGELOG); the 2026-10-05 mutation run added a
+refusal test for the identity and for an out-of-subgroup point in every
+decoded slot.
 
 ## Cores (implemented) — draft mapping
 
