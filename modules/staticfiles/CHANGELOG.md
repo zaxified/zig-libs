@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **BEHAVIOURAL, not breaking:** a regular file asked for as a directory
+  (`/a.txt/`, `/a.txt%2f`, `/a.txt/.`) answers **404** in `Handler.serve`, `Snapshot`/`Live`
+  (`error.NotFound` from `resolveFile`); it was served as `/a.txt`, so an exact-path rule in a proxy
+  in front was walked around by one slash. A symlink asked for that way stays 403. **Fix:** an
+  over-long directory component (`/dir/<256 bytes>/x`) panicked a Debug build (zig 0.16's
+  `dirStatFile` on `ENAMETOOLONG`); it answers 404 like an over-long leaf. Both found by the new Go
+  `net/http` differential oracle (`tools/go_oracle/`, replayed by `src/go_oracle_test.zig`: 93 path
+  cases against `http.FileServer`, 1282 precondition × range cases against `http.ServeContent`).
+  Anchor grade MIXED → EXTERNAL.
+
 - **2026-09-27** — **`LiveOptions.observer`**: told every rescan's outcome — `unchanged`, `published`
   (the generation and how many files were opened anew) or `failed` — on the thread that ran it (`start`'s,
   or `reload`'s caller). For logging reloads, and for a sandbox probe that must run code on that thread.

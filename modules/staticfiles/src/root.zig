@@ -396,6 +396,14 @@ pub const Opened = struct {
 /// `rel == ""` (the root directory) and a directory target both trigger index
 /// lookup (`opts.index`); a directory with no index returns `error.IsDir`.
 pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) ResolveError!Opened {
+    return openWithinRootAs(root, io, rel, opts, false);
+}
+
+/// `openWithinRoot`, told whether the request named a DIRECTORY (its path
+/// ended in `/`, which `sanitizePath` drops): then the leaf is opened as a
+/// directory only, so a regular file there is `NotFound` (POSIX `ENOTDIR`),
+/// never served at `/file.txt/`.
+fn openWithinRootAs(root: Dir, io: Io, rel: []const u8, opts: Options, want_dir: bool) ResolveError!Opened {
     const follow = opts.follow_symlinks;
 
     if (rel.len == 0) return openIndex(root, root, io, opts);
@@ -433,7 +441,7 @@ pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) Resolve
                 // `openFile`'s `error.SymLinkLoop` does. Ask directly with a
                 // no-follow stat (cheap, and only on this already-slow error
                 // path) so both shapes answer the same way.
-                if (!follow and isSymlinkComponent(parent, io, seg)) return error.Forbidden;
+                if (!follow and e != error.NameTooLong and isSymlinkComponent(parent, io, seg)) return error.Forbidden;
                 return mapOpenError(e);
             };
             if (parent_owned) parent.close(io);
@@ -447,18 +455,25 @@ pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) Resolve
 
     // The leaf: try it as a regular file first. `allow_directory = false` turns
     // a directory target into `error.IsDir` (cheaply on Windows, one fstat
-    // elsewhere) instead of handing back a directory fd.
-    const file = parent.openFile(io, leaf, .{
+    // elsewhere) instead of handing back a directory fd. A request that named
+    // a directory goes straight to the directory branch.
+    const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else parent.openFile(io, leaf, .{
         .follow_symlinks = follow,
         .allow_directory = false,
         .resolve_beneath = true,
-    }) catch |e| switch (e) {
+    });
+    const file = leaf_file catch |e| switch (e) {
         error.IsDir => {
             // A directory: descend into it and serve its index.
             var d = parent.openDir(io, leaf, .{
                 .follow_symlinks = follow,
                 .access_sub_paths = true,
-            }) catch |de| return mapOpenError(de);
+            }) catch |de| {
+                // Reached without opening the leaf as a file (`want_dir`):
+                // a symlinked leaf answers 403 here too, as it does there.
+                if (want_dir and !follow and de != error.NameTooLong and isSymlinkComponent(parent, io, leaf)) return error.Forbidden;
+                return mapOpenError(de);
+            };
             defer d.close(io);
             return openIndex(d, root, io, opts);
         },
@@ -562,6 +577,11 @@ fn verifyContainedDir(root: Dir, io: Io, d: Dir) error{Escaped}!void {
 /// `statFile` with `follow_symlinks = false` is a single stat-family call,
 /// never blocks (unlike opening e.g. a FIFO would), and any failure here
 /// just falls back to the original error mapping.
+///
+/// Never called after `error.NameTooLong`: such a segment cannot be a
+/// symlink, and zig 0.16's Linux `dirStatFile` treats `ENAMETOOLONG` as a
+/// programmer bug -- a Debug build PANICS on `/dir/<256 bytes>/x` (Go's
+/// net/http oracle, 2026-10-05; Release maps it to `Unexpected`).
 fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
     const st = parent.statFile(io, seg, .{ .follow_symlinks = false }) catch return false;
     return st.kind == .sym_link;
@@ -592,7 +612,22 @@ fn mapOpenError(e: anyerror) error{ NotFound, Forbidden, IoError } {
 pub fn resolveFile(root: Dir, io: Io, raw_path: []const u8, opts: Options) (SanitizeError || ResolveError)!Opened {
     var buf: [max_path_bytes]u8 = undefined;
     const rel = try sanitizePath(raw_path, &buf, .{ .allow_dotfiles = opts.serve_dotfiles });
-    return openWithinRoot(root, io, rel, opts);
+    return openWithinRootAs(root, io, rel, opts, namesDirectory(raw_path));
+}
+
+/// Does the raw request path name a directory -- end in `/` once decoded,
+/// ignoring trailing `.` segments (`/a/`, `/a%2f`, `/a/.`)? `sanitizePath`
+/// drops that slash, and without this a regular file answered at
+/// `/secret.txt/` as at `/secret.txt` -- a rule matching the exact path in
+/// front of the server is walked around by one character (Go's net/http
+/// oracle, 2026-10-05: Go redirects, nginx/Apache/POSIX say not found).
+/// Undecodable input answers false; `sanitizePath` refuses it anyway.
+fn namesDirectory(raw: []const u8) bool {
+    var buf: [max_path_bytes]u8 = undefined;
+    const n = percentDecode(raw, &buf) catch return false;
+    var d = buf[0..n];
+    while (mem.endsWith(u8, d, "/.")) d = d[0 .. d.len - 1];
+    return d.len > 0 and d[d.len - 1] == '/';
 }
 
 // ── the HTTP handler ─────────────────────────────────────────────────────────
@@ -869,6 +904,7 @@ pub const Handler = struct {
         var buf: [max_path_bytes]u8 = undefined;
         const rel = try sanitizePath(raw_path, &buf, .{ .allow_dotfiles = h.options.serve_dotfiles });
         const follow = h.options.follow_symlinks;
+        const want_dir = namesDirectory(raw_path);
 
         if (rel.len == 0) {
             via_directory.* = true;
@@ -892,7 +928,7 @@ pub const Handler = struct {
                     .follow_symlinks = follow,
                     .access_sub_paths = true,
                 }) catch |e| {
-                    if (!follow and isSymlinkComponent(parent, h.io, seg)) return error.Forbidden;
+                    if (!follow and e != error.NameTooLong and isSymlinkComponent(parent, h.io, seg)) return error.Forbidden;
                     return mapOpenError(e);
                 };
                 if (parent_owned) parent.close(h.io);
@@ -903,11 +939,14 @@ pub const Handler = struct {
 
         if (mem.eql(u8, leaf, "..")) return error.Forbidden;
 
-        const file = parent.openFile(h.io, leaf, .{
+        // A request that named a directory (`/a.txt/`) never opens the leaf
+        // as a file -- see `namesDirectory`.
+        const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else parent.openFile(h.io, leaf, .{
             .follow_symlinks = follow,
             .allow_directory = false,
             .resolve_beneath = true,
-        }) catch |e| switch (e) {
+        });
+        const file = leaf_file catch |e| switch (e) {
             error.IsDir => {
                 via_directory.* = true;
                 // The leaf IS a directory: open it ONCE, with `.iterate`
@@ -918,7 +957,12 @@ pub const Handler = struct {
                     .follow_symlinks = follow,
                     .access_sub_paths = true,
                     .iterate = true,
-                }) catch |de| return mapOpenError(de);
+                }) catch |de| {
+                    // As in `openWithinRootAs`: under `want_dir` a symlinked
+                    // leaf still answers 403.
+                    if (want_dir and !follow and de != error.NameTooLong and isSymlinkComponent(parent, h.io, leaf)) return error.Forbidden;
+                    return mapOpenError(de);
+                };
                 test_f11_leaf_dir_opens += 1; // A1 F11 measurement
                 if (follow) {
                     verifyContainedDir(h.root, h.io, d) catch {
@@ -1402,7 +1446,9 @@ pub const Snapshot = struct {
         };
         const node = s.paths.get(rel) orelse return sendStatus(rw, 404);
         const id = switch (node) {
-            .file => |id| id,
+            // A file asked for as a directory (`/a.txt/`): not found, as in
+            // `Handler.serve` -- see `namesDirectory`.
+            .file => |id| if (namesDirectory(raw_path)) return sendStatus(rw, 404) else id,
             .dir => |index| blk: {
                 if (s.options.serve.redirect_to_trailing_slash and
                     (req.path.len == 0 or req.path[req.path.len - 1] != '/'))
@@ -1692,6 +1738,10 @@ pub const Live = struct {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = @import("go_oracle_test.zig");
+}
 
 test "mimeType: table, overrides, case, default" {
     try testing.expectEqualStrings("text/html; charset=utf-8", mimeType("index.html", &.{}, "x"));
@@ -2789,6 +2839,37 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     const wire2 = std.fmt.bufPrint(&wire_buf2, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ok_len_name}) catch unreachable;
     const resp2 = runRequest(&h, wire2, &out);
     try testing.expectEqual(@as(u16, 404), statusOf(resp2));
+
+    // The same over-long name as a DIRECTORY component: its failed openDir
+    // used to go on to a no-follow statFile, which zig 0.16 panics on in
+    // Debug for ENAMETOOLONG (Go net/http oracle, 2026-10-05).
+    var wire_buf3: [1024]u8 = undefined;
+    const wire3 = std.fmt.bufPrint(&wire_buf3, "GET /sub/{s}/x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
+    try testing.expectEqual(@as(u16, 404), statusOf(runRequest(&h, wire3, &out)));
+}
+
+test "serve: a file asked for as a directory (/hello.txt/) is 404, never the file" {
+    // Go net/http oracle, 2026-10-05: `sanitizePath` drops a trailing slash,
+    // so `/hello.txt/` was served as `/hello.txt` -- an exact-path rule in
+    // a proxy in front is walked around by one character. POSIX (ENOTDIR),
+    // nginx and Apache say not found; Go redirects to the file.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    for ([_][]const u8{ "/hello.txt/", "/hello.txt%2f", "/hello.txt%2F", "/sub/dir/file.txt/", "/hello.txt/." }) |p| {
+        try testing.expectEqual(@as(u16, 404), statusOf(get(&h, p, &out)));
+        try testing.expectError(error.NotFound, resolveFile(fx.root, testing.io, p, .{}));
+    }
+    // A symlink asked for as a directory is still refused as a symlink.
+    try testing.expectEqual(@as(u16, 403), statusOf(get(&h, "/inside_link/", &out)));
+    try testing.expectEqual(@as(u16, 403), statusOf(get(&h, "/escape/", &out)));
+    try testing.expectError(error.Forbidden, resolveFile(fx.root, testing.io, "/escape/", .{}));
+    // Positive controls: the file without the slash, a directory with one.
+    try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out)));
+    try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/", &out)));
+    var o = try resolveFile(fx.root, testing.io, "/", .{});
+    o.close(testing.io);
 }
 
 test "serve: 206 + Content-Range on a range, 416 on unsatisfiable" {
@@ -3327,20 +3408,21 @@ test "Snapshot: every path answers as Handler does, except a symlink is absent r
     // index is a symlink: to the snapshot a directory with no index).
     const Case = struct { path: []const u8, symlink: bool = false, snap: u16 = 404 };
     const corpus = [_]Case{
-        .{ .path = "/" },                           .{ .path = "/index.html" },
-        .{ .path = "/hello.txt" },                  .{ .path = "/sub/dir/file.txt" },
-        .{ .path = "/sub" },                        .{ .path = "/sub/" },
-        .{ .path = "/sub/dir" },                    .{ .path = "/sub/dir/" },
-        .{ .path = "/missing.txt" },                .{ .path = "/sub/missing/x" },
-        .{ .path = "/.env" },                       .{ .path = "/sub/.hidden" },
-        .{ .path = "/../secret.txt" },              .{ .path = "/..%2fsecret.txt" },
-        .{ .path = "/%2e%2e/secret.txt" },          .{ .path = "/sub/../../secret.txt" },
-        .{ .path = "/foo%00.txt" },                 .{ .path = "/..\\..\\secret.txt" },
-        .{ .path = "/%zz" },                        .{ .path = "/hello.txt?x=1" },
-        .{ .path = "/symidx/" },                    .{ .path = "/symidx", .symlink = true, .snap = 301 },
-        .{ .path = "/escape", .symlink = true },    .{ .path = "/inside_link", .symlink = true },
-        .{ .path = "/linkdir/", .symlink = true },  .{ .path = "/linkdir/loot.txt", .symlink = true },
-        .{ .path = "/linklist/", .symlink = true },
+        .{ .path = "/" },                                     .{ .path = "/index.html" },
+        .{ .path = "/hello.txt" },                            .{ .path = "/sub/dir/file.txt" },
+        .{ .path = "/sub" },                                  .{ .path = "/sub/" },
+        .{ .path = "/sub/dir" },                              .{ .path = "/sub/dir/" },
+        .{ .path = "/missing.txt" },                          .{ .path = "/sub/missing/x" },
+        .{ .path = "/.env" },                                 .{ .path = "/sub/.hidden" },
+        .{ .path = "/../secret.txt" },                        .{ .path = "/..%2fsecret.txt" },
+        .{ .path = "/%2e%2e/secret.txt" },                    .{ .path = "/sub/../../secret.txt" },
+        .{ .path = "/foo%00.txt" },                           .{ .path = "/..\\..\\secret.txt" },
+        .{ .path = "/%zz" },                                  .{ .path = "/hello.txt?x=1" },
+        .{ .path = "/hello.txt/" },                           .{ .path = "/hello.txt%2f" },
+        .{ .path = "/sub/dir/file.txt/." },                   .{ .path = "/symidx/" },
+        .{ .path = "/symidx", .symlink = true, .snap = 301 }, .{ .path = "/escape", .symlink = true },
+        .{ .path = "/inside_link", .symlink = true },         .{ .path = "/linkdir/", .symlink = true },
+        .{ .path = "/linkdir/loot.txt", .symlink = true },    .{ .path = "/linklist/", .symlink = true },
     };
     for (corpus) |c| {
         var a_buf: [4096]u8 = undefined;
