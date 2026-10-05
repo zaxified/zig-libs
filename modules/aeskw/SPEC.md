@@ -6,7 +6,7 @@
 
 **Scope:** core — RustCrypto `aes-kw` 0.3.1 (RFC 3394 + 5649) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -127,6 +127,16 @@ and RFC 5649 padding (see "Scope" above).
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 3394 wrap/unwrap KATs (README Provenance)
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
+mutant): **13 mutants, 12 killed, 1 equivalent**. Points: both length and alignment checks,
+the KEK-width check order, both buffer checks, the counter `t` in both directions and its byte
+order, the integrity check, and both output wipes. No defect. Gap closed: `wrap` with the
+`% 8` check removed wrapped 16 octets of a 17-octet key and left the 17th in the output in the
+clear — no test used an unaligned length ≥ 16; now 17/20/23/25 are refused. **Equivalent:** the
+wipe on a KEK-width error in `unwrap` (the output then holds only a copy of the ciphertext).
 
 ## Backlog / deferred
 

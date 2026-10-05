@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (13 mutants, 12 killed, 1 equivalent; `SPEC.md`
+  § "Mutation run 2026-10-05"): `wrap` refuses key data that is not whole 64-bit blocks at
+  lengths ≥ 16. No source change.
+
 - **2026-09-07** — Fuzz: the no-partial-key-leak oracle had never executed.
   `fuzzUnwrapNoLeak` opened with `smith.value(bool)` and then a ranged `ct_len`,
   both of which return the range minimum when fewer than eight input octets

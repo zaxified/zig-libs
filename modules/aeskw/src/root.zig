@@ -502,3 +502,16 @@ test "F4 regression: wrap validates KEK width before writing plaintext into `out
     // copied in before the KEK width was validated.
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), &out);
 }
+
+// Mutation run 2026-10-05: with the `% 8` check gone, `wrap` of a 17-octet
+// key wrapped 16 octets and left the 17th in the output IN THE CLEAR. No test
+// fed it an unaligned length >= 16. RFC 3394 §2: the key data is n 64-bit
+// blocks, n >= 2.
+test "wrap refuses key data that is not a whole number of 64-bit blocks" {
+    const kek = [_]u8{0x11} ** 16;
+    var out: [64]u8 = undefined;
+    for ([_]usize{ 17, 20, 23, 25 }) |len| {
+        const pt = [_]u8{0x5a} ** 32;
+        try std.testing.expectError(error.InvalidLength, wrap(&kek, pt[0..len], &out));
+    }
+}
