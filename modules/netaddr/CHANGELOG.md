@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Anchoring only, no code change: evidence MIXED → EXTERNAL.
+  The RFC 6724 half (self-tested until now) is replayed against glibc 2.43
+  `getaddrinfo` (6240 destination orderings, gai.conf = the RFC 6724 table) and
+  Linux 7.0 IPv6 source selection (3040 choices), taken in user/net/mount
+  namespaces by `tools/rfc6724_oracle.py`; the parse/format/prefix core, until
+  now backed by measured-and-deleted runs, gets a frozen corpus against glibc
+  `inet_pton`/`inet_ntop` and Python `ipaddress` (`tools/parse_oracle.py`). No
+  defect found. Listed divergences: glibc scopes `::ffff:127.x`/`::ffff:169.254.x`
+  as global, applies a subnet rule 9 to IPv4, prints `::/96` dotted, and the
+  orders of non-transitive lists; Python's prefix syntax extensions.
+
 - **2026-09-12** — **BEHAVIOURAL, not breaking:** `parsePort` (and therefore
   `parseHostPort`) now rejects a leading zero (`host:0080`, `host:00` — but a
   bare `"0"` still parses as port 0), closing the F8 asymmetry the 2026-09-10

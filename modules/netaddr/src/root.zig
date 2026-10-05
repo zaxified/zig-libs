@@ -1075,6 +1075,11 @@ fn expectRoundTrip(text: []const u8, canonical: []const u8) !void {
     }
 }
 
+test {
+    _ = @import("rfc6724_oracle_test.zig");
+    _ = @import("parse_oracle_test.zig");
+}
+
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
     // TEETH for the invariant this module's whole type rests on, and with it
     // the address identity of every module that stores an `Ip`. Measured at
