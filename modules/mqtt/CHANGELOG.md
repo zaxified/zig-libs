@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Tests:** `topic.zig` anchored to a real Eclipse Mosquitto 2.1.2 broker
+  (`tools/topic_oracle.py`, raw MQTT 5.0 packets; replayed by `src/topic_oracle_test.zig` with no
+  broker): which filters it grants, which names it accepts, and for every valid filter × name pair
+  whether the subscription received the publish. No defect; one listed divergence (`$share` alone is an
+  ordinary filter by MQTT 5.0 §4.7–4.8; Mosquitto refuses it). No code change.
+
 - **2026-10-02** — 5.0 sessions survive a server restart whole.
   `Broker.SessionSub` gains `no_local`, `retain_as_published` and `sub_id`
   (defaulted, so hand-built values keep compiling); `sessionStates` reports

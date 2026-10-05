@@ -126,4 +126,5 @@ test {
     _ = broker;
     _ = external_goldens;
     _ = v5_replay;
+    _ = @import("topic_oracle_test.zig");
 }
