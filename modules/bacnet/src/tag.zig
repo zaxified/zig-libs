@@ -1341,6 +1341,7 @@ test "date and time validation refuses impossible values" {
     try testing.expectError(error.InvalidValue, (Date{ .month = 0 }).validate());
     try testing.expectError(error.InvalidValue, (Date{ .month = 15 }).validate());
     try testing.expectError(error.InvalidValue, (Date{ .day = 35 }).validate());
+    try testing.expectError(error.InvalidValue, (Date{ .day = 0 }).validate());
     try testing.expectError(error.InvalidValue, (Date{ .weekday = 8 }).validate());
     try testing.expectError(error.InvalidValue, (Date{ .weekday = 0 }).validate());
 
@@ -1348,6 +1349,7 @@ test "date and time validation refuses impossible values" {
     try (Time{}).validate();
     try testing.expectError(error.InvalidValue, (Time{ .hour = 24 }).validate());
     try testing.expectError(error.InvalidValue, (Time{ .minute = 60 }).validate());
+    try testing.expectError(error.InvalidValue, (Time{ .second = 60 }).validate());
     try testing.expectError(error.InvalidValue, (Time{ .hundredths = 100 }).validate());
 
     try testing.expectEqual(@as(?u16, 2026), (Date{ .year = 126 }).fullYear());
@@ -1375,6 +1377,18 @@ test "reader: an unclosed context tag is Truncated, not a hang" {
     @memset(&deep, 0x3E);
     var r2 = Reader.init(&deep);
     try testing.expectError(error.Truncated, r2.skip());
+}
+
+test "reader: skip refuses a closing bracket that is not its own" {
+    // [3] 21 05 ]4 — the outermost block is closed by somebody else's number.
+    var r = Reader.init(&.{ 0x3E, 0x21, 0x05, 0x4F });
+    try testing.expectError(error.UnexpectedTag, r.skip());
+}
+
+test "reader: a context enumeration wider than 32 bits is refused" {
+    // [1] with five octets of value.
+    var r = Reader.init(&.{ 0x1D, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 });
+    try testing.expectError(error.InvalidValue, r.ctxEnumerated(1));
 }
 
 test "reader: openedBlock hands back the body without the brackets" {

@@ -536,6 +536,11 @@ test "confirmed request: unsegmented ReadProperty" {
 
     var out: [32]u8 = undefined;
     try testing.expectEqualSlices(u8, &wire, try encode(a, &out));
+
+    // Bit 0 of the first octet is reserved.
+    var bad = wire;
+    bad[0] |= 0x01;
+    try testing.expectError(error.InvalidPduType, decode(&bad));
 }
 
 test "SEGMENTATION: the SEG bit moves the service choice by two octets" {
@@ -642,6 +647,7 @@ test "SimpleACK, Reject, Abort and SegmentACK are fixed-size" {
     try testing.expectEqual(@as(u8, 16), sa.segment_ack.actual_window_size);
     try testing.expectEqualSlices(u8, &segack, try encode(sa, &out));
     try testing.expectError(error.Truncated, decode(&.{ 0x40, 0x01, 0x03 }));
+    try testing.expectError(error.Truncated, decode(&.{ 0x40, 0x01, 0x03, 0x10, 0x00 }));
     try testing.expectError(error.InvalidPduType, decode(&.{ 0x44, 0x01, 0x03, 0x10 }));
 }
 
@@ -675,6 +681,9 @@ test "max-APDU codes: reserved values are refused, not guessed" {
     try testing.expectEqual(MaxApdu.up_to_1476, MaxApdu.forOctets(1500));
     try testing.expectEqual(MaxApdu.up_to_480, MaxApdu.forOctets(500));
     try testing.expectEqual(MaxApdu.up_to_50, MaxApdu.forOctets(10));
+    // Each threshold is the code's own length, inclusive.
+    try testing.expectEqual(MaxApdu.up_to_206, MaxApdu.forOctets(206));
+    try testing.expectEqual(MaxApdu.up_to_128, MaxApdu.forOctets(205));
 }
 
 test "every PDU type round-trips through encode/decode" {

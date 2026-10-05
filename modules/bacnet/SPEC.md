@@ -6,7 +6,7 @@
 
 **Scope:** mvp — bacnet-stack (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation none
+**Audit:** review 2026-08-11 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -489,6 +489,22 @@ Labelled honestly, because it was **not** checked against another implementation
   against **both** our device and its own device, so it could not drive that path. RPM is
   nevertheless validated byte-for-byte in both directions by the goldens, and end-to-end between
   our own client and device.
+
+### Mutation run
+
+**Mutation run 2026-10-05** (in-place, Debug, 43 mutants over the BVLC, NPDU,
+APDU, tag and BACnet/SC decoders' bounds, refusal and reserved-bit checks, the
+Date/Time validators, `MaxApdu.forOctets`, and the client's invoke-id
+correlation): 26 killed. The 17 survivors were all missing tests, now added: a
+one-octet-long Result and Delete-FDT-Entry body, a ragged Write-BDT body, a
+ragged body handed to the public `bdtIterator`, a 65536-octet datagram on
+encode, a DLEN one past the buffer, a trailing octet on Reject- and
+I-Could-Be-Router-To-Network, `skip` meeting another block's closing bracket
+at depth 1, day 0 and second 60, a 5-octet context enumeration, the
+Confirmed-Request reserved bit 0, a trailing octet on a SegmentACK,
+`forOctets(206)`, an SC option length one past the frame, exactly
+`max_options + 1` options, and an invoke id that wraps onto a live one. 43 of
+43 killed after. Equivalent: none.
 
 ## Deferred
 

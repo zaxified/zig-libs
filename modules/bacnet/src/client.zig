@@ -1007,6 +1007,29 @@ test "invoke ids are never reused while outstanding" {
     );
 }
 
+test "an invoke id that wraps round onto a live one is skipped" {
+    var rig: Rig = .{};
+    rig.wire();
+    var c = Client(4).init(rig.client_ep.transport(), .{});
+    const first = try c.readProperty(
+        rig.device_ep.address,
+        .{ .type = .analog_input, .instance = 1 },
+        .present_value,
+        null,
+        0,
+    );
+    // 255 ids later the counter is back at `first`, which is still outstanding.
+    c.next_id = first;
+    const second = try c.readProperty(
+        rig.device_ep.address,
+        .{ .type = .analog_input, .instance = 1 },
+        .present_value,
+        null,
+        0,
+    );
+    try testing.expect(second != first);
+}
+
 test "a segmented ComplexACK is refused with an Abort, not mis-parsed" {
     var rig: Rig = .{};
     rig.wire();
