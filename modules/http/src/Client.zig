@@ -109,6 +109,21 @@ const client_proxy = @import("client_proxy.zig");
 /// Outbound proxy settings (`Options.proxy`); see `client_proxy.zig`.
 pub const Proxy = client_proxy.Proxy;
 
+/// A client-side cookie store (Go's `http.CookieJar`), `Options.cookie_jar`:
+/// asked for the cookies of every request this client writes, redirect hops
+/// included, and handed the head of every response it reads, so it can take
+/// the `Set-Cookie` fields. `cookies.Jar.cookieJar()` is one. Both calls may
+/// come from several threads at once.
+pub const CookieJar = struct {
+    ctx: *anyopaque,
+    /// Write `prefix` and then the `Cookie` value for a request to `url`
+    /// (`a=1; b=2`); write nothing at all and return false when no cookie
+    /// applies.
+    write_cookies: *const fn (ctx: *anyopaque, url: http.Url, w: *std.Io.Writer, prefix: []const u8) std.Io.Writer.Error!bool,
+    /// Take what a response to `url` says (its `Set-Cookie` fields).
+    store: *const fn (ctx: *anyopaque, url: http.Url, head: *const h1.ResponseHead) void,
+};
+
 const Client = @This();
 
 io: std.Io,
@@ -241,6 +256,11 @@ pub const Options = struct {
     /// `HTTPS_PROXY` and `NO_PROXY` -- this client never reads the
     /// environment by itself. h2c (`connectH2c`) does not use it.
     proxy: Proxy = .{},
+    /// Cookie store, consulted on every request and response, redirect
+    /// hops included (`CookieJar`). A caller's own `Cookie` header is kept
+    /// and the jar's cookies are appended to it. Null (default): no cookies
+    /// beyond the caller's. Borrowed: must outlive the client.
+    cookie_jar: ?CookieJar = null,
 };
 
 /// Tunables for the idle-connection pool (`Options.pool`).
@@ -773,6 +793,10 @@ pub const Upload = struct {
     conn: *Conn,
     method: http.Method,
     chunked: ?h1.ChunkedWriter,
+    /// The request URL, copied, when `Options.cookie_jar` is set: the jar
+    /// takes the response's cookies in `finish`, long after the caller's
+    /// URL text may be gone.
+    jar_url: ?[]u8 = null,
 
     /// The request-body writer: plaintext bytes in, wire framing out.
     pub fn writer(u: *Upload) *std.Io.Writer {
@@ -799,16 +823,20 @@ pub const Upload = struct {
     }
 
     fn finishInner(u: *Upload) Error!Response {
+        const c = u.conn.client;
+        defer if (u.jar_url) |t| c.gpa.free(t);
         errdefer u.conn.destroy();
         if (u.chunked) |*cw| cw.finish() catch return u.conn.writeFailure();
         try u.conn.flushAll();
         const head = try readResponseHead(u.conn);
+        if (u.jar_url) |t| if (c.options.cookie_jar) |jar| jar.store(jar.ctx, http.Url.parse(t) catch unreachable, &head);
         setupBody(u.conn, u.method, head);
         return .{ .status = head.status, .reason = head.reason, .head = head, .conn = u.conn };
     }
 
     /// Drop the request without reading a response.
     pub fn abort(u: *Upload) void {
+        if (u.jar_url) |t| u.conn.client.gpa.free(t);
         u.conn.destroy();
         u.* = undefined;
     }
@@ -832,7 +860,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
         // Recover the real cause the same way `sendAndReadHead` does, and
         // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
         // can only ever hand back `error.WriteFailed`, so without this a
@@ -854,12 +882,13 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         owned = false;
         conn = try c.dialConn(url);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
         .method = method,
         .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+        .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
 }
 
@@ -882,7 +911,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
         // See `requestStreaming`'s identical catch for why this must consult
         // `conn.writeFailure()` before `isStaleConnError` rather than trust
         // `writeRequestHead`'s own always-`WriteFailed` result.
@@ -892,12 +921,13 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         owned = false;
         conn = try c.dialPlain(url);
         owned = true;
-        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
         .method = method,
         .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+        .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
 }
 
@@ -1612,10 +1642,14 @@ fn sendAndReadHead(
     // pooled connection worth retrying — with the cancelation already
     // spent, the retry then blocks a second time with nothing left to
     // interrupt it.
-    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, c.options.cookie_jar, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
     if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
     try conn.flushAll();
-    return readResponseHead(conn);
+    const head = try readResponseHead(conn);
+    // Every hop's answer, a redirect's included: a login that sets its
+    // session cookie on the 302 is the common case.
+    if (c.options.cookie_jar) |jar| jar.store(jar.ctx, url, &head);
+    return head;
 }
 
 /// The narrow set of failures that mean *this* connection was already dead
@@ -2160,7 +2194,7 @@ fn writeRequestHead(
     strip_sensitive: bool,
     send_close: bool,
 ) error{WriteFailed}!void {
-    return writeRequestHeadVia(w, null, method, url, headers, user_agent, plan, strip_sensitive, send_close);
+    return writeRequestHeadVia(w, null, null, method, url, headers, user_agent, plan, strip_sensitive, send_close);
 }
 
 /// `writeRequestHead` for a connection that may be to a forwarding proxy:
@@ -2169,6 +2203,7 @@ fn writeRequestHead(
 fn writeRequestHeadVia(
     w: *std.Io.Writer,
     proxy: ?client_proxy.Endpoint,
+    jar: ?CookieJar,
     method: http.Method,
     url: http.Url,
     headers: []const http.Header,
@@ -2186,13 +2221,14 @@ fn writeRequestHeadVia(
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
     }
 
-    writeHead(w, proxy, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
+    writeHead(w, proxy, jar, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
 
 fn writeHead(
     w: *std.Io.Writer,
     proxy: ?client_proxy.Endpoint,
+    jar: ?CookieJar,
     method: http.Method,
     url: http.Url,
     headers: []const http.Header,
@@ -2219,6 +2255,7 @@ fn writeHead(
     }
     try w.writeAll("\r\n");
     const own_proxy_auth = if (proxy) |ep| ep.userinfo != null else false;
+    var cookie_written = false;
     if (proxy) |ep| try ep.writeAuthorization(w);
 
     for (headers) |hd| {
@@ -2231,8 +2268,19 @@ fn writeHead(
             std.ascii.eqlIgnoreCase(hd.name, "proxy-authorization"))) continue;
         // The configured proxy's own credentials win over a caller's.
         if (own_proxy_auth and std.ascii.eqlIgnoreCase(hd.name, "proxy-authorization")) continue;
+        if (!cookie_written and std.ascii.eqlIgnoreCase(hd.name, "cookie")) {
+            // One `Cookie` field (RFC 6265 §5.4): the jar's after the caller's.
+            try w.print("{s}: {s}", .{ hd.name, hd.value });
+            if (jar) |j| _ = try j.write_cookies(j.ctx, url, w, "; ");
+            try w.writeAll("\r\n");
+            cookie_written = true;
+            continue;
+        }
         try w.print("{s}: {s}\r\n", .{ hd.name, hd.value });
     }
+    if (!cookie_written) if (jar) |j| {
+        if (try j.write_cookies(j.ctx, url, w, "Cookie: ")) try w.writeAll("\r\n");
+    };
 
     if (!custom_ua) try w.print("User-Agent: {s}\r\n", .{user_agent});
     if (!custom_ae) try w.writeAll("Accept-Encoding: identity\r\n");
@@ -5286,4 +5334,123 @@ test "proxy: an unusable proxy setting is BadProxy before any dial, never a dire
         try testing.expectError(error.BadProxy, client.request(.get, "http://origin.test/", .{}));
         try testing.expectEqual(@as(usize, 0), client.dialCount());
     }
+}
+
+// ── cookie jar (Options.cookie_jar) ─────────────────────────────────────────
+
+/// Answers `answers.len` connections in turn, recording each request head.
+const ScriptedPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    answers: []const []const u8,
+    heads: [4][1024]u8 = undefined,
+    head_lens: [4]usize = @splat(0),
+
+    fn run(p: *ScriptedPeer) void {
+        for (p.answers, 0..) |answer, n| {
+            const s = p.listener.accept(p.io) catch return;
+            defer s.close(p.io);
+            var rbuf: [2048]u8 = undefined;
+            var sr = s.reader(p.io, &rbuf);
+            var head_buf: [1024]u8 = undefined;
+            const got = h1.readHead(&sr.interface, &head_buf) catch return;
+            @memcpy(p.heads[n][0..got.len], got);
+            p.head_lens[n] = got.len;
+            var wbuf: [512]u8 = undefined;
+            var sw = s.writer(p.io, &wbuf);
+            sw.interface.writeAll(answer) catch return;
+            sw.interface.flush() catch return;
+        }
+    }
+
+    fn head(p: *const ScriptedPeer, n: usize) []const u8 {
+        return p.heads[n][0..p.head_lens[n]];
+    }
+};
+
+/// A jar that remembers the last `Set-Cookie` value it was handed, with the
+/// path it came from, and sends it back as is.
+const EchoJar = struct {
+    value: [64]u8 = undefined,
+    len: usize = 0,
+    stored_from: [64]u8 = undefined,
+    stored_from_len: usize = 0,
+    stores: usize = 0,
+
+    fn jar(e: *EchoJar) CookieJar {
+        return .{ .ctx = e, .write_cookies = write, .store = store };
+    }
+
+    fn write(ctx: *anyopaque, url: http.Url, w: *std.Io.Writer, prefix: []const u8) std.Io.Writer.Error!bool {
+        _ = url;
+        const e: *EchoJar = @ptrCast(@alignCast(ctx));
+        if (e.len == 0) return false;
+        try w.writeAll(prefix);
+        try w.writeAll(e.value[0..e.len]);
+        return true;
+    }
+
+    fn store(ctx: *anyopaque, url: http.Url, head: *const h1.ResponseHead) void {
+        const e: *EchoJar = @ptrCast(@alignCast(ctx));
+        e.stores += 1;
+        const v = head.header("set-cookie") orelse return;
+        @memcpy(e.value[0..v.len], v);
+        e.len = v.len;
+        @memcpy(e.stored_from[0..url.path.len], url.path);
+        e.stored_from_len = url.path.len;
+    }
+};
+
+test "cookie jar: a cookie set on a redirect rides the next hop, after the caller's own Cookie" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{ false, true }) |plain| {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(io, .{}) catch |err| {
+            return testkit.loopbackSkip("cookie jar test listen failed ({t})", .{err});
+        };
+        defer listener.deinit(io);
+        var peer: ScriptedPeer = .{ .io = io, .listener = &listener, .answers = &.{
+            "HTTP/1.1 302 Found\r\nLocation: /home\r\nSet-Cookie: sid=42\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        } };
+        const thread = try std.Thread.spawn(.{}, ScriptedPeer.run, .{&peer});
+
+        var echo: EchoJar = .{};
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false }, .cookie_jar = echo.jar() });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/login", .{listener.socket.address.getPort()});
+        const opts: RequestOptions = .{ .headers = &.{.{ .name = "Cookie", .value = "mine=1" }} };
+        {
+            var res = if (plain) try client.requestPlain(.get, url_text, opts) else try client.request(.get, url_text, opts);
+            defer res.deinit();
+            try testing.expectEqual(@as(u16, 200), res.status);
+        }
+        thread.join();
+        // The jar saw both responses; the cookie came from the 302 at /login.
+        try testing.expectEqual(@as(usize, 2), echo.stores);
+        try testing.expectEqualStrings("/login", echo.stored_from[0..echo.stored_from_len]);
+        // Hop 1: only the caller's cookie (the jar was empty). Hop 2: one
+        // Cookie field, the caller's first, the jar's appended.
+        try testing.expect(std.mem.indexOf(u8, peer.head(0), "Cookie: mine=1\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, peer.head(1), "Cookie: mine=1; sid=42\r\n") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, peer.head(1), "Cookie:"));
+    }
+}
+
+test "cookie jar: without a caller Cookie the jar writes its own field, and nothing when empty" {
+    var buf: [512]u8 = undefined;
+    var echo: EchoJar = .{};
+    const url = try http.Url.parse("http://h.test/x");
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+    @memcpy(echo.value[0..3], "k=v");
+    echo.len = 3;
+    w = .fixed(&buf);
+    try writeRequestHeadVia(&w, null, echo.jar(), .get, url, &.{}, "a", .none, false, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: k=v\r\n") != null);
 }

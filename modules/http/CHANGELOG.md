@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Client cookie jar seam** (`Options.cookie_jar`, `Client.CookieJar`, Go's
+  `http.CookieJar` shape): the jar is asked for every request's cookies and handed every response
+  head, redirect hops included (a session cookie set on a 302 rides the next hop); a caller's own
+  `Cookie` header is kept and the jar's cookies appended to it in one field. `cookies.Jar` is the
+  implementation (in the `cookies` module, which depends on this one). Default: none.
 - **2026-10-05** — **Client outbound proxy** (`Options.proxy`, `Client.Proxy`, `Proxy.fromEnviron`):
   `http://` through a forwarding proxy in absolute form, `https://` through a `CONNECT` tunnel, Basic
   `Proxy-Authorization` from the proxy URL's userinfo, Go's `ProxyFromEnvironment` selection rules

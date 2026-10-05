@@ -628,6 +628,10 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   `main` got. A setting it cannot use (unparseable, `https://`/`socks5://`
   proxies, `HTTP_PROXY` under CGI) is `error.BadProxy` before any dial,
   never a silent direct connection.
+- **Cookies:** `Options.cookie_jar` (default: none) — `cookies.Jar.cookieJar()`
+  or any `Client.CookieJar`. Consulted for every request and given every
+  response head, redirect hops included; a caller's own `Cookie` header comes
+  first in the one `Cookie` field, the jar's cookies after it.
 - **TLS:** `tlsclient.Client` (std's `std.crypto.tls.Client` with the server chain verified by RFC 5280 — std checks no basicConstraints, ziglang/zig #35877), system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
 - **Plaintext-only entry points:** `requestPlain`/`requestStreamingPlain`/
