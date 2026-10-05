@@ -1177,3 +1177,30 @@ test "hostile: BIP32_DERIVATION value whose length isn't 4 + 4k is rejected (A1 
     const bad: Map = .{ .records = &recs };
     try testing.expectError(error.InvalidFixedFieldLength, validateInputMap(bad));
 }
+
+// ── mutation run 2026-10-05: edges the tests above left unpinned ─────────
+
+test "WITNESS_UTXO: 7 octets is Truncated; a script followed by stray octets is TrailingBytes" {
+    try testing.expectError(error.Truncated, decodeWitnessUtxoValue(&([_]u8{0} ** 7)));
+    const ok = [_]u8{0} ** 8 ++ [_]u8{ 0x01, 0x51 };
+    try testing.expectEqual(@as(usize, 1), (try decodeWitnessUtxoValue(&ok)).script_pubkey.len);
+    try testing.expectError(error.TrailingBytes, decodeWitnessUtxoValue(&(ok ++ [_]u8{0x00})));
+}
+
+test "PARTIAL_SIG keydata: 33 and 65 octets accepted, 64 refused; SIGHASH_TYPE of 5 octets refused" {
+    const sig = [_]u8{0x30};
+    const key = [_]u8{0x04} ** 65;
+    for ([_]usize{ 33, 65 }) |n| {
+        var recs = [_]Record{.{ .keytype = input_key.PARTIAL_SIG, .keydata = key[0..n], .value = &sig }};
+        try validateInputMap(.{ .records = &recs });
+    }
+    var bad_key = [_]Record{.{ .keytype = input_key.PARTIAL_SIG, .keydata = key[0..64], .value = &sig }};
+    try testing.expectError(error.InvalidPubkeyLength, validateInputMap(.{ .records = &bad_key }));
+    var long_sighash = [_]Record{.{ .keytype = input_key.SIGHASH_TYPE, .keydata = &.{}, .value = &.{ 1, 0, 0, 0, 0 } }};
+    try testing.expectError(error.InvalidFixedFieldLength, validateInputMap(.{ .records = &long_sighash }));
+}
+
+test "global XPUB: a value that is not fingerprint + 4k octets is refused" {
+    var recs = [_]Record{.{ .keytype = global_key.XPUB, .keydata = &([_]u8{0} ** 78), .value = &([_]u8{0} ** 10) }};
+    try testing.expectError(error.InvalidFixedFieldLength, validateGlobalMap(.{ .records = &recs }));
+}

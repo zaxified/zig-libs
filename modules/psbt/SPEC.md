@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Bitcoin Core `psbt.h`/`rpc_psbt` (BIP174/370/371) + rust-bitcoin `psbt` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -152,6 +152,20 @@ format to begin with, it's `0x00`-terminated), so there is no large-allocation-f
 vector the way `bitcointx.tx`'s `vin`/`vout`/witness counts have; duplicate-key detection uses a
 `StringHashMapUnmanaged` over borrowed raw key slices (O(n) per map), not an O(n²) pairwise scan, so
 a legitimately-large PSBT can't be turned into a duplicate-key-check DoS.
+
+**Mutation run 2026-10-05** (in-place, Debug, 58 mutants over `root.zig`'s map parsing and
+per-key validation, `combine`, and `finalize.zig`'s script recognisers, signature selection,
+SIGHASH_SINGLE-bug refusal, UTXO binding, witness-stack codec and field clearing): 34 killed on
+the first pass (four were mis-written and re-run as valid mutants; one of those survived). Twelve
+tests added for the 19 non-equivalent survivors: `WITNESS_UTXO` at 7 octets and with trailing bytes, 64-octet `PARTIAL_SIG` keys
+and a 5-octet `SIGHASH_TYPE`, a malformed global `XPUB`, BIP141's witness-program extremes,
+`parseMultisig`'s m > n / trailing-opcode / 17th-key refusals, empty witness stacks, a sighash
+byte above the declared type, `SINGLE|ANYONECANPAY` hitting the SINGLE bug, bare multisig refusing
+a SINGLE-bug signature and never consulting one past the m-th, a type-mismatched multisig
+signature skipped, a `NON_WITNESS_UTXO` with no output at the prevout index, a v1 20-octet
+program not finalized as P2WPKH. Equivalent: `readBytes`' `n >= remaining` (a read ending exactly
+at the buffer end is always followed by a read that reports the same `Truncated`), and
+`parseMultisig`'s `m == 0` (`smallInt` never returns 0).
 
 ## Threat model / out of scope
 
