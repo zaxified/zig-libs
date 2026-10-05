@@ -6,7 +6,7 @@
 
 **Scope:** mvp — LibreQoS v2.2 shaping-tree generation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -164,6 +164,17 @@ qdisc but no steering filter (also tested).
 duplicate. A compiled plan must return `null`; the permanent positive-control
 test forges a `Plan` with two class ops sharing a handle and asserts the check
 goes RED, so a regression that breaks handle uniqueness cannot pass silently.
+
+**Mutation run 2026-10-05** (in-place, Debug, 30 mutants over `compile`/`assign`,
+the handle counters, `firstOrderingViolation`/`findHandleCollision` and
+`effectiveCeil`): 28 killed. The first pass left 8; five tests were added — a
+root on `cpu == queue_count` (an `>` there dropped it silently), a ceil-0 child
+whose rate exceeds the parent's ceil, `htb_defcls` reaching every HTB root, a
+match-less leaf not spending a filter prio, and an `mq` child counting as
+available only after the `mq` root itself. Equivalent: emitting the effective
+ceil instead of 0 (`tc` builds `ceil 0` as `ceil = rate`, byte-identical), and
+dropping the `is_leaf` guard on `Resolved.match` (an interior match is refused
+earlier with `ClassifierOnInterior`).
 
 ## Deliberately deferred
 
