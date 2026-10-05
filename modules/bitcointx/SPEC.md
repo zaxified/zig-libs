@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `Transaction` + `SighashCache`, Bitcoin Core `CTransaction`/`SignatureHash` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation none
+**Audit:** review 2026-09-15 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -200,6 +200,25 @@ canonical source is `pub const meta` in src/root.zig.
 **What the tests actually contain.** BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector
 
 **How it got there.** The anchoring work landed. DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added
+
+### Mutation run 2026-10-05
+
+Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure, 70
+tests, `setsid -w timeout -s KILL 20` per mutant): **34 mutants, 32 killed, 2 equivalent**.
+Points: every CompactSize width boundary (length, truncation, minimality), `readBytes`, the
+count and witness-item caps, the segwit marker/flag probes and flag value, the superfluous
+witness record, trailing bytes, the witness/input count on serialize, `hasWitnessData`,
+`wtxid`'s fallback, every sighash's input-index check, the legacy SIGHASH_SINGLE bug constant
+and sequence zeroing, `getOp`'s PUSHDATA1 bound, BIP143's SINGLE sequence/output rules, BIP341's
+hash-type set, prevout count, spend-type/annex consistency, base extraction and SINGLE without
+an output, and the legacy base mask. The sighash arithmetic is pinned by Core's `sighash.json`
+and the BIP143/BIP341 vectors.
+
+First pass: 4 survivors — **no defect, 2 test gaps** closed: a 4-octet transaction (version
+only; the marker probe read `bytes[4]` without its bound) and `OP_PUSHDATA1` as the last octet
+of a scriptCode (its length octet read past the end). **Equivalent (2):** the pre-allocation
+caps on the input/output count and the witness item budget moved by one — the input is refused
+either way (`Truncated` instead of `TooManyItems`); the caps bound memory, not correctness.
 
 ## Backlog / deferred
 

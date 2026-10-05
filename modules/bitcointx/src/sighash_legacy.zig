@@ -507,6 +507,18 @@ test "SerializeScriptCode: an undecodable tail truncates, and the length prefix 
     try testing.expectEqual(@as(usize, 1), got.len - 1); // the bytes actually written
 }
 
+// Mutation run 2026-10-05: the PUSHDATA1 length check (`< 1`) had no input
+// that reaches it — the PUSHDATA2 test above stops at the `< 2` check. With it
+// gone, `0x4c` as the LAST byte read its missing length octet past the end.
+// Core: `*pc++`, then `end - pc < 1` fails, cursor at 1 → write 1 byte,
+// declare 1.
+test "SerializeScriptCode: OP_PUSHDATA1 as the last byte truncates without reading past the end" {
+    const script = [_]u8{0x4c};
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x4c }, got);
+}
+
 test "SerializeScriptCode: an empty scriptCode is a bare zero length" {
     const got = try serializedScriptCode(testing.allocator, &.{});
     defer testing.allocator.free(got);

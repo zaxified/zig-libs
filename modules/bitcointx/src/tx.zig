@@ -765,6 +765,11 @@ test "segwit tx: deserialize -> serialize is byte-exact, and txid != wtxid" {
 
 test "hostile: truncated tx (fewer bytes than the fixed 4-byte version field) fails closed" {
     try testing.expectError(error.Truncated, deserialize(testing.allocator, &.{ 0x01, 0x00 }));
+    // Mutation run 2026-10-05: exactly the version and nothing else — the
+    // segwit-marker probe is the next read, and without its bound it read
+    // `bytes[4]` past the end. Also the marker with no flag after it.
+    try testing.expectError(error.Truncated, deserialize(testing.allocator, &.{ 0x02, 0x00, 0x00, 0x00 }));
+    try testing.expectError(error.Truncated, deserialize(testing.allocator, &.{ 0x02, 0x00, 0x00, 0x00, 0x00 }));
 }
 
 test "hostile: truncated tx cut mid-scriptSig fails closed with Truncated (not TooManyItems -- enough bytes remain for the TooManyItems bound check to pass, so this exercises the deeper per-field truncation path)" {

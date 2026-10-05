@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Tests: first dated mutation run (34 mutants, 32 killed, 2 equivalent; `SPEC.md`
+  § "Mutation run 2026-10-05"). No defect; new tests for a version-only transaction and a trailing
+  `OP_PUSHDATA1` in a scriptCode. No source change.
+
 - **2026-09-15** — **BEHAVIOURAL, not breaking:** audit M1, round-2 decision Q2-B (module with
   consumers, hardened directly, no opt-out switch; consumers fixed in the same batch).
   `deserialize`/`deserializePartial` bounded a witness stack's declared item count only against
