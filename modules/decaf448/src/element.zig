@@ -599,6 +599,15 @@ test "repeated addition matches RFC 9496 Appendix B.1's own recipe shape: [k]G v
     }
 }
 
+test "feFromBytesReduced: MAP's input reduction accepts values >= p (RFC 9496 §5.3.4)" {
+    // None of Appendix B.3's halves is >= p, so the vectors never reach the
+    // subtracting branch. 2^448 - 1 reduces to 2^224, and p itself to zero.
+    var want = [_]u8{0} ** 56;
+    want[28] = 1;
+    try testing.expect(feFromBytesReduced([_]u8{0xff} ** 56).eql(try Fe.fromBytes(want)));
+    try testing.expect(feFromBytesReduced(field.p_bytes).eql(Fe.zero));
+}
+
 test "scalarMul: [0]G == identity, [1]G == G" {
     try testing.expect(Element.scalarMul(Element.generator, scalar.zero).equals(Element.identity));
     var one = scalar.zero;

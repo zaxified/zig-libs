@@ -6,7 +6,7 @@
 
 **Scope:** mvp — RFC 9496 decaf448 as in RustCrypto `ed448-goldilocks` (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -167,6 +167,13 @@ are constructed by machinery independent of the stub under test.
   both modes**. `zig fmt --check modules/decaf448/` is clean.
 - A repo-hygiene grep for developer-machine home-directory paths and
   personal identifiers over `modules/decaf448/` is empty.
+- **Mutation run 2026-10-05** (in-place, Debug, 24 mutants over `ctAbs`,
+  `sqrtRatioM1`, `encode`, `decode`'s three refusals and formula, `equals`,
+  `sub`, MAP's reduction and CT selects, `oneWayMap`'s split and the scalar
+  bridge): 24 killed. The first pass left 1: MAP's reduction of an input
+  `>= p` (no Appendix B.3 half reaches it) — a test now pins `2^448 - 1 ->
+  2^224` and `p -> 0`. One mutant that failed to compile was rewritten until
+  it built. None equivalent.
 
 ## Out of scope
 
