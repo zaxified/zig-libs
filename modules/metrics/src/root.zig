@@ -3352,3 +3352,9 @@ test "AccessLog F4: the flusher hands off to a waiter instead of writing everyon
     try f4AssertIdle(&access);
     try testing.expectEqual(fills + 2, gate.newlines.load(.seq_cst));
 }
+
+// ── external anchor: client_golang + expfmt + textparse ────────────────────
+// See go_oracle_test.zig / tools/interop.zig / tools/go_oracle.
+test {
+    _ = @import("go_oracle_test.zig");
+}

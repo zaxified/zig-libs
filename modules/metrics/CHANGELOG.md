@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Anchoring: client_golang + expfmt + textparse oracle** (`tools/go_oracle`,
+  `tools/interop.zig`, `src/go_oracle_test.zig`): 163 operation scripts run on this Registry and on
+  client_golang; expfmt parses our exposition into the families client_golang gathered and the
+  Prometheus server's scrape parser reads the same samples. No defect found; no code change.
+
 - **2026-10-01** — `AccessLog.Options.io`: with it, a call waiting for the flusher parks on the
   `Io`'s futex instead of spinning. Required when the `Io` runs several tasks on one thread
   (`std.Io.Evented`, a simulator): a spinning waiter starved a flusher suspended in `writer`

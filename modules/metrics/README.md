@@ -13,7 +13,11 @@ references: Prometheus client_golang (Apache-2.0 — registry and instrument
 semantics: get-or-register per (name, label values), lazy series creation,
 `le`-inclusive buckets, NaN handling) and the Prometheus text exposition
 format 0.0.4 / OpenMetrics spec (format only). Behavior and format modeled,
-no source copied.
+no source copied. DATA: `src/go_oracle_vectors.zig` holds operation scripts our
+tooling generated (`tools/go_oracle`, `tools/interop.zig`) and this module's own
+exposition after each, judged by client_golang, prometheus/common expfmt and
+Prometheus model/textparse (Apache-2.0, run as black boxes) — observed behaviour,
+exempt per root `NOTICE` §0; no Prometheus source or test corpus is reproduced.
 
 - **Model after:** Prometheus client_golang + text exposition format 0.0.4.
 - **Platform:** posix — the default latency clock is the posix
