@@ -624,3 +624,77 @@ test "go oracle client: responses frame as Go's Transport frames them, or the di
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── proxy: which proxy a URL goes through ────────────────────────────────
+
+const client_proxy = @import("client_proxy.zig");
+
+/// Our answer in the generator's notation: `direct`, `error`, or
+/// `proxy http <host> <port> <user|-> <password|->` (decoded credentials).
+fn ourProxy(c: vectors.ProxyCase, buf: []u8) ![]const u8 {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    for (c.env) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=').?;
+        try env.put(line[0..eq], line[eq + 1 ..]);
+    }
+    const target = try http_root.Url.parse(c.target);
+    const ep = client_proxy.Proxy.fromEnviron(&env).forUrl(target) catch return "error";
+    const e = ep orelse return "direct";
+    var user: []const u8 = "-";
+    var pass: []const u8 = "-";
+    var cred: [1024]u8 = undefined;
+    if (e.userinfo) |ui| {
+        const colon = std.mem.indexOfScalar(u8, ui, ':');
+        user = try percentDecode(ui[0 .. colon orelse ui.len], cred[0..512]);
+        if (colon) |at| pass = try percentDecode(ui[at + 1 ..], cred[512..]);
+    }
+    return std.fmt.bufPrint(buf, "proxy http {s} {d} {s} {s}", .{ e.host, e.port, user, pass });
+}
+
+fn percentDecode(in: []const u8, out: []u8) ![]const u8 {
+    var o: usize = 0;
+    var i: usize = 0;
+    while (i < in.len) : (o += 1) {
+        if (in[i] == '%') {
+            out[o] = try std.fmt.parseInt(u8, in[i + 1 .. i + 3], 16);
+            i += 3;
+        } else {
+            out[o] = in[i];
+            i += 1;
+        }
+    }
+    return out[0..o];
+}
+
+/// Where our proxy choice differs from Go's: what we answer, and why.
+const ProxyDivergence = struct { id: []const u8, ours: []const u8, why: []const u8 };
+
+const proxy_divergences = [_]ProxyDivergence{
+    .{ .id = "proxy-https-scheme", .ours = "error", .why = "only http:// proxies are supported (TLS to the proxy is not); BadProxy rather than a silent direct connection" },
+    .{ .id = "proxy-socks5", .ours = "error", .why = "SOCKS is not supported; BadProxy as for https://" },
+    .{ .id = "proxy-bad-port", .ours = "error", .why = "a port over 65535 is refused when the setting is read; Go accepts the text and fails at the dial" },
+    .{ .id = "proxy-space", .ours = "error", .why = "a proxy setting that does not parse is BadProxy; Go ignores it and connects DIRECTLY -- the request the operator meant to route through a proxy leaks past it" },
+};
+
+test "go oracle proxy: the proxy a URL goes through is Go's ProxyFromEnvironment choice, or the difference is judged" {
+    var bad: usize = 0;
+    for (vectors.proxy) |c| {
+        var buf: [256]u8 = undefined;
+        const ours = try ourProxy(c, &buf);
+        const agrees = std.mem.eql(u8, ours, c.go);
+        const listed = find(ProxyDivergence, &proxy_divergences, c.id);
+        const verdict: ?[]const u8 = if (listed) |d|
+            (if (agrees)
+                "agrees now, drop its divergence entry"
+            else if (!std.mem.eql(u8, ours, d.ours))
+                "diverges, but not the way its entry says"
+            else
+                null)
+        else if (agrees) null else "diverges";
+        const v = verdict orelse continue;
+        bad += 1;
+        std.debug.print("proxy {s}: {s}\n  go:   {s}\n  ours: {s}\n", .{ c.id, v, c.go, ours });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

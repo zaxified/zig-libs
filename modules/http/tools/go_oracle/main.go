@@ -23,7 +23,12 @@ import (
 
 func main() {
 	out := flag.String("out", "", "write the Zig vectors file here (default stdout)")
+	proxyTarget := flag.String("proxycase", "", "internal: answer one proxy case for this URL and exit")
 	flag.Parse()
+	if *proxyTarget != "" {
+		proxyCaseMain(*proxyTarget)
+		return
+	}
 
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "// SPDX-License-Identifier: MIT\n")
@@ -37,6 +42,7 @@ func main() {
 	emitURL(&b)
 	emitMultipart(&b)
 	emitClient(&b)
+	emitProxy(&b)
 	// Every area ends its table with a blank line; the file ends with one newline.
 	b.Truncate(b.Len() - 1)
 

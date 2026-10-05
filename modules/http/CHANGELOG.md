@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Client outbound proxy** (`Options.proxy`, `Client.Proxy`, `Proxy.fromEnviron`):
+  `http://` through a forwarding proxy in absolute form, `https://` through a `CONNECT` tunnel, Basic
+  `Proxy-Authorization` from the proxy URL's userinfo, Go's `ProxyFromEnvironment` selection rules
+  (checked against Go by the oracle's new `proxy` area, 63 cases). New `Error` members `BadProxy`
+  and `ProxyRefused` -- an exhaustive `switch` over `Client.Error` needs the two arms. Default
+  unchanged: no proxy.
 - **2026-10-05** — **Client, from the Go oracle's new `client` area** (64 responses against Go's
   `http.Transport`; `src/go_oracle.zig`). **BEHAVIOURAL, not breaking:**
   - `Client` refuses (`error.MalformedResponse`) a response whose `Transfer-Encoding` is not the sole

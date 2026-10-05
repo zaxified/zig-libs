@@ -616,6 +616,18 @@ provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
   all close the connection instead of pooling it). Set
   `Options.pool.enabled = false` for the old one-shot-per-request behavior
   (`Connection: close` on every request).
+- **Outbound proxy:** `Options.proxy` (default: none). `http://` requests
+  go to the `http` proxy with an absolute-form target; `https://` requests
+  open a `CONNECT` tunnel through the `https` proxy and run TLS to the origin
+  inside it (a non-2xx answer is `error.ProxyRefused`). Credentials in the
+  proxy URL (`http://user:pw@proxy:3128`) become `Proxy-Authorization: Basic`.
+  Selection follows Go's `ProxyFromEnvironment` -- `localhost` and loopback
+  always direct, `no_proxy` names/subdomains/IPs/CIDRs/ports/`*` -- and is
+  held to Go by the oracle. The client never reads the environment itself:
+  `.proxy = http.Client.Proxy.fromEnviron(&env_map)` does, from the map
+  `main` got. A setting it cannot use (unparseable, `https://`/`socks5://`
+  proxies, `HTTP_PROXY` under CGI) is `error.BadProxy` before any dial,
+  never a silent direct connection.
 - **TLS:** `tlsclient.Client` (std's `std.crypto.tls.Client` with the server chain verified by RFC 5280 — std checks no basicConstraints, ziglang/zig #35877), system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
 - **Plaintext-only entry points:** `requestPlain`/`requestStreamingPlain`/

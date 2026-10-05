@@ -105,6 +105,10 @@ const tls = @import("tlsclient");
 /// `bufpool.BufferPool` and `Options.buffer_pool`).
 pub const BufferPool = bufpool.BufferPool;
 
+const client_proxy = @import("client_proxy.zig");
+/// Outbound proxy settings (`Options.proxy`); see `client_proxy.zig`.
+pub const Proxy = client_proxy.Proxy;
+
 const Client = @This();
 
 io: std.Io,
@@ -228,6 +232,15 @@ pub const Options = struct {
     /// fresh h2c dial does. Shared across threads (the pool is internally
     /// synchronized); the allocator behind it must be thread-safe.
     buffer_pool: ?*BufferPool = null,
+    /// Outbound proxy, Go's `ProxyFromEnvironment` rules (`client_proxy.zig`):
+    /// `http://` requests go to the `http` proxy in absolute form
+    /// (`GET http://host/path`), `https://` requests open a `CONNECT` tunnel
+    /// through the `https` proxy and run TLS to the origin inside it.
+    /// Credentials in the proxy URL become `Proxy-Authorization: Basic`.
+    /// Default: no proxy. `Proxy.fromEnviron` reads `HTTP_PROXY`,
+    /// `HTTPS_PROXY` and `NO_PROXY` -- this client never reads the
+    /// environment by itself. h2c (`connectH2c`) does not use it.
+    proxy: Proxy = .{},
 };
 
 /// Tunables for the idle-connection pool (`Options.pool`).
@@ -354,6 +367,14 @@ pub const Error = error{
     /// `RequestOptions.redirect_filter` said no to a redirect target; the
     /// refused host was never dialed.
     RedirectRefused,
+    /// `Options.proxy` names a proxy this client cannot use: it does not
+    /// parse, it is not `http://`, or it is an `http` proxy for an `http://`
+    /// request under CGI (see `Proxy`). Never a silent direct connection.
+    BadProxy,
+    /// The proxy answered `CONNECT` with something other than 2xx (a 407
+    /// wanting credentials, a 403 policy refusal, a 502 it could not reach
+    /// the origin with). Nothing was sent to the origin.
+    ProxyRefused,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -811,7 +832,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
         // Recover the real cause the same way `sendAndReadHead` does, and
         // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
         // can only ever hand back `error.WriteFailed`, so without this a
@@ -833,7 +854,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         owned = false;
         conn = try c.dialConn(url);
         owned = true;
-        writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
@@ -861,7 +882,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
         // See `requestStreaming`'s identical catch for why this must consult
         // `conn.writeFailure()` before `isStaleConnError` rather than trust
         // `writeRequestHead`'s own always-`WriteFailed` result.
@@ -871,7 +892,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         owned = false;
         conn = try c.dialPlain(url);
         owned = true;
-        writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
+        writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
@@ -1261,6 +1282,11 @@ const Conn = struct {
     /// Still requires `isBodyDrained` before actually pooling: an eligible
     /// framing with an only-partially-read body cannot be reused either.
     keep_alive_eligible: bool = false,
+    /// Set when this plaintext connection goes to a forwarding proxy rather
+    /// than the origin: requests on it carry an absolute-form target and
+    /// the proxy's credentials. (A `CONNECT` tunnel leaves it null: inside
+    /// the tunnel the origin is spoken to directly.)
+    forward_proxy: ?client_proxy.Endpoint = null,
 
     const BodyState = union(enum) {
         unset,
@@ -1586,7 +1612,7 @@ fn sendAndReadHead(
     // pooled connection worth retrying — with the cancelation already
     // spent, the retry then blocks a second time with nothing left to
     // interrupt it.
-    writeRequestHead(conn.plainWriter(), method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
+    writeRequestHeadVia(conn.plainWriter(), conn.forward_proxy, method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
     if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
     try conn.flushAll();
     return readResponseHead(conn);
@@ -1677,7 +1703,8 @@ fn dialPlain(c: *Client, url: http.Url) Error!*Conn {
     off += o.max_head_bytes;
     const body_buf = slab[off..][0..body_scratch_len];
 
-    const stream = try c.connectStream(url);
+    const proxy = try c.proxyFor(url);
+    const stream = try c.connectStream(if (proxy) |ep| proxyUrl(ep) else url);
     errdefer stream.close(io);
     _ = c.dial_count.fetchAdd(1, .monotonic);
 
@@ -1693,13 +1720,57 @@ fn dialPlain(c: *Client, url: http.Url) Error!*Conn {
         .body = .unset,
         .origin = undefined,
         .keep_alive_eligible = false,
+        .forward_proxy = proxy,
     };
+    // Keyed by the origin even when it goes through a proxy: the proxy
+    // choice is a pure function of the URL and the client's fixed options,
+    // so one origin is always reached the same way.
     conn.origin.set(url.scheme, url.port, url.host);
     // The stream reader/writer must be initialized at the connection's final
     // heap address.
     conn.sr = stream.reader(io, sock_r);
     conn.sw = stream.writer(io, sock_w);
     return conn;
+}
+
+/// The proxy `url` goes through, if any (`Options.proxy`).
+fn proxyFor(c: *Client, url: http.Url) Error!?client_proxy.Endpoint {
+    return c.options.proxy.forUrl(url) catch error.BadProxy;
+}
+
+/// A proxy as a URL to dial.
+fn proxyUrl(ep: client_proxy.Endpoint) http.Url {
+    return .{ .scheme = .http, .host = ep.host, .port = ep.port, .path = "/", .query = "" };
+}
+
+/// Open a `CONNECT` tunnel to `url`'s origin through the proxy `conn` is
+/// dialed to (RFC 9110 §9.3.6): on a 2xx the connection is the origin's
+/// from the next byte on. A 2xx to CONNECT has no body, so whatever the
+/// proxy sends after the head already belongs to the origin and is left
+/// in the reader for the TLS handshake.
+fn connectTunnel(conn: *Conn, url: http.Url, ep: client_proxy.Endpoint) Error!void {
+    const w = &conn.sw.interface;
+    writeConnect(w, url, ep) catch return conn.writeFailure();
+    w.flush() catch return conn.writeFailure();
+    const block = h1.readHead(&conn.sr.interface, conn.head_buf) catch |err| switch (err) {
+        error.ReadFailed => return conn.readFailure(),
+        error.ConnectionClosed => return error.ConnectionClosed,
+        error.HeadTooLarge => return error.HeadTooLarge,
+        error.MalformedHead => return error.MalformedResponse,
+    };
+    const head = h1.ResponseHead.parse(block) catch |err| switch (err) {
+        error.MalformedHead => return error.MalformedResponse,
+        error.UnsupportedVersion => return error.UnsupportedHttpVersion,
+    };
+    if (head.status < 200 or head.status > 299) return error.ProxyRefused;
+}
+
+fn writeConnect(w: *std.Io.Writer, url: http.Url, ep: client_proxy.Endpoint) std.Io.Writer.Error!void {
+    // authority-form, the port always explicit (RFC 9112 §3.2.3).
+    const open, const close = if (url.hostIsV6()) .{ "[", "]" } else .{ "", "" };
+    try w.print("CONNECT {s}{s}{s}:{d} HTTP/1.1\r\nHost: {s}{s}{s}:{d}\r\n", .{ open, url.host, close, url.port, open, url.host, close, url.port });
+    try ep.writeAuthorization(w);
+    try w.writeAll("\r\n");
 }
 
 /// Dial a fresh `https://` connection: same buffer-slab/`Conn`/dial-count
@@ -1740,7 +1811,8 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
     off += o.max_head_bytes;
     const body_buf = slab[off..][0..body_scratch_len];
 
-    const stream = try c.connectStream(url);
+    const proxy = try c.proxyFor(url);
+    const stream = try c.connectStream(if (proxy) |ep| proxyUrl(ep) else url);
     errdefer stream.close(io);
     _ = c.dial_count.fetchAdd(1, .monotonic);
 
@@ -1762,6 +1834,7 @@ fn dialTls(c: *Client, url: http.Url) Error!*Conn {
     // initialized at the connection's final heap address.
     conn.sr = stream.reader(io, sock_r);
     conn.sw = stream.writer(io, sock_w);
+    if (proxy) |ep| try connectTunnel(conn, url, ep);
 
     var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
     // The caller handed us `io` for sockets; `random`'s silent fallback
@@ -2087,6 +2160,23 @@ fn writeRequestHead(
     strip_sensitive: bool,
     send_close: bool,
 ) error{WriteFailed}!void {
+    return writeRequestHeadVia(w, null, method, url, headers, user_agent, plan, strip_sensitive, send_close);
+}
+
+/// `writeRequestHead` for a connection that may be to a forwarding proxy:
+/// with `proxy` set the target is absolute (`http://host[:port]/path`,
+/// RFC 9112 §3.2.2) and the proxy's credentials ride along.
+fn writeRequestHeadVia(
+    w: *std.Io.Writer,
+    proxy: ?client_proxy.Endpoint,
+    method: http.Method,
+    url: http.Url,
+    headers: []const http.Header,
+    user_agent: []const u8,
+    plan: BodyPlan,
+    strip_sensitive: bool,
+    send_close: bool,
+) error{WriteFailed}!void {
     var custom_host: ?[]const u8 = null;
     var custom_ua = false;
     var custom_ae = false;
@@ -2096,12 +2186,13 @@ fn writeRequestHead(
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
     }
 
-    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
+    writeHead(w, proxy, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
 
 fn writeHead(
     w: *std.Io.Writer,
+    proxy: ?client_proxy.Endpoint,
     method: http.Method,
     url: http.Url,
     headers: []const http.Header,
@@ -2113,7 +2204,12 @@ fn writeHead(
     custom_ua: bool,
     custom_ae: bool,
 ) std.Io.Writer.Error!void {
-    try w.print("{s} {s}", .{ method.token(), url.path });
+    try w.print("{s} ", .{method.token()});
+    if (proxy != null) {
+        try w.writeAll("http://");
+        try url.writeHostHeaderValue(w);
+    }
+    try w.writeAll(url.path);
     if (url.query.len != 0) try w.print("?{s}", .{url.query});
     try w.writeAll(" HTTP/1.1\r\nHost: ");
     if (custom_host) |hv| {
@@ -2122,6 +2218,8 @@ fn writeHead(
         try url.writeHostHeaderValue(w);
     }
     try w.writeAll("\r\n");
+    const own_proxy_auth = if (proxy) |ep| ep.userinfo != null else false;
+    if (proxy) |ep| try ep.writeAuthorization(w);
 
     for (headers) |hd| {
         if (std.ascii.eqlIgnoreCase(hd.name, "host") or
@@ -2131,6 +2229,8 @@ fn writeHead(
         if (strip_sensitive and (std.ascii.eqlIgnoreCase(hd.name, "authorization") or
             std.ascii.eqlIgnoreCase(hd.name, "cookie") or
             std.ascii.eqlIgnoreCase(hd.name, "proxy-authorization"))) continue;
+        // The configured proxy's own credentials win over a caller's.
+        if (own_proxy_auth and std.ascii.eqlIgnoreCase(hd.name, "proxy-authorization")) continue;
         try w.print("{s}: {s}\r\n", .{ hd.name, hd.value });
     }
 
@@ -5030,4 +5130,160 @@ test "CaBundle: shared by two clients, loaded once, never freed by a client" {
     // `ca` is still intact here and freed by its owner (the defer above);
     // a client freeing it would double-free under testing.allocator.
     try testing.expect(ca.scanned);
+}
+
+// ── outbound proxy (Options.proxy) ──────────────────────────────────────────
+
+/// A proxy that answers one connection: records the request head, writes
+/// `answer`, then records the first bytes the client sends after it (the
+/// TLS ClientHello once a CONNECT tunnel is up) until the client hangs up.
+const ProxyPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    answer: []const u8,
+    head: [1024]u8 = undefined,
+    head_len: usize = 0,
+    after: [8]u8 = undefined,
+    after_len: usize = 0,
+
+    fn run(p: *ProxyPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [2048]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var head_buf: [1024]u8 = undefined;
+        const head = h1.readHead(&sr.interface, &head_buf) catch return;
+        @memcpy(p.head[0..head.len], head);
+        p.head_len = head.len;
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.answer) catch return;
+        sw.interface.flush() catch return;
+        p.after_len = sr.interface.readSliceShort(&p.after) catch 0;
+    }
+
+    fn recorded(p: *const ProxyPeer) []const u8 {
+        return p.head[0..p.head_len];
+    }
+};
+
+fn proxyText(buf: []u8, comptime fmt: []const u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf, fmt, .{port}) catch unreachable;
+}
+
+test "proxy: an http:// request goes to the proxy in absolute form, with the proxy's Basic credentials" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{ false, true }) |plain| {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(io, .{}) catch |err| {
+            return testkit.loopbackSkip("proxy test listen failed ({t})", .{err});
+        };
+        defer listener.deinit(io);
+        var peer: ProxyPeer = .{ .io = io, .listener = &listener, .answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" };
+        const thread = try std.Thread.spawn(.{}, ProxyPeer.run, .{&peer});
+
+        var pbuf: [64]u8 = undefined;
+        var client = Client.init(io, testing.allocator, .{
+            .pool = .{ .enabled = false },
+            // The origin is never resolved: the proxy is what gets dialed.
+            .proxy = .{ .http = proxyText(&pbuf, "http://user:pw@127.0.0.1:{d}", listener.socket.address.getPort()) },
+        });
+        defer client.deinit();
+        {
+            var res = if (plain)
+                try client.requestPlain(.get, "http://origin.test:8080/a?b=1", .{ .headers = &.{.{ .name = "Proxy-Authorization", .value = "Basic Y2FsbGVy" }} })
+            else
+                try client.request(.get, "http://origin.test:8080/a?b=1", .{});
+            defer res.deinit();
+            try testing.expectEqual(@as(u16, 200), res.status);
+            const body = try res.readAllAlloc(testing.allocator, 64);
+            defer testing.allocator.free(body);
+            try testing.expectEqualStrings("ok", body);
+        }
+        thread.join();
+        // Absolute-form target (RFC 9112 §3.2.2), Host still the origin, the
+        // configured credentials (user:pw), and not the caller's own.
+        try testing.expect(std.mem.startsWith(u8, peer.recorded(), "GET http://origin.test:8080/a?b=1 HTTP/1.1\r\n" ++
+            "Host: origin.test:8080\r\nProxy-Authorization: Basic dXNlcjpwdw==\r\n"));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, peer.recorded(), "Proxy-Authorization"));
+        try testing.expectEqual(@as(usize, 1), client.dialCount());
+    }
+}
+
+test "proxy: an https:// request opens a CONNECT tunnel and starts TLS to the origin inside it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("proxy test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    var peer: ProxyPeer = .{ .io = io, .listener = &listener, .answer = "HTTP/1.1 200 Connection established\r\n\r\n" };
+    const thread = try std.Thread.spawn(.{}, ProxyPeer.run, .{&peer});
+
+    var pbuf: [64]u8 = undefined;
+    var client = Client.init(io, testing.allocator, .{
+        .pool = .{ .enabled = false },
+        .tls = .{ .verify = .insecure_no_verify },
+        .proxy = .{ .https = proxyText(&pbuf, "127.0.0.1:{d}", listener.socket.address.getPort()) },
+    });
+    defer client.deinit();
+    // The peer reads the start of the handshake and hangs up: the request
+    // fails, but only after the tunnel carried the ClientHello.
+    try testing.expect(std.meta.isError(client.request(.get, "https://origin.test/x", .{})));
+    thread.join();
+    try testing.expectEqualStrings("CONNECT origin.test:443 HTTP/1.1\r\nHost: origin.test:443\r\n", peer.recorded());
+    try testing.expect(peer.after_len >= 2);
+    try testing.expectEqual(@as(u8, 0x16), peer.after[0]); // TLS handshake record
+    try testing.expectEqual(@as(u8, 0x03), peer.after[1]);
+}
+
+test "proxy: a CONNECT refused by the proxy is ProxyRefused, and nothing follows it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("proxy test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    var peer: ProxyPeer = .{ .io = io, .listener = &listener, .answer = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n" };
+    const thread = try std.Thread.spawn(.{}, ProxyPeer.run, .{&peer});
+
+    var pbuf: [64]u8 = undefined;
+    var client = Client.init(io, testing.allocator, .{
+        .pool = .{ .enabled = false },
+        .tls = .{ .verify = .insecure_no_verify },
+        .proxy = .{ .https = proxyText(&pbuf, "http://a:b@127.0.0.1:{d}", listener.socket.address.getPort()) },
+    });
+    defer client.deinit();
+    try testing.expectError(error.ProxyRefused, client.request(.get, "https://origin.test:8443/", .{}));
+    thread.join();
+    try testing.expectEqualStrings("CONNECT origin.test:8443 HTTP/1.1\r\nHost: origin.test:8443\r\n" ++
+        "Proxy-Authorization: Basic YTpi\r\n", peer.recorded());
+    try testing.expectEqual(@as(usize, 0), peer.after_len);
+}
+
+test "proxy: an unusable proxy setting is BadProxy before any dial, never a direct connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]Proxy{
+        .{ .http = "socks5://127.0.0.1:1080" },
+        .{ .http = "proxy host:1" },
+        .{ .http = "127.0.0.1:99999" },
+        .{ .http = "127.0.0.1:3128", .cgi = true },
+    }) |proxy| {
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false }, .proxy = proxy });
+        defer client.deinit();
+        try testing.expectError(error.BadProxy, client.requestPlain(.get, "http://origin.test/", .{}));
+        try testing.expectError(error.BadProxy, client.request(.get, "http://origin.test/", .{}));
+        try testing.expectEqual(@as(usize, 0), client.dialCount());
+    }
 }

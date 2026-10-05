@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server (Go, dusty, zzz have one; here it is deliberately the caller's, and qap does exactly that), no client-side cookie jar (server-side `Cookie` parsing and `Set-Cookie` are the sibling `cookies` module's), no HTTP/3, no PROXY-protocol parsing (→ Backlog).
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server (Go, dusty, zzz have one; here it is deliberately the caller's, and qap does exactly that), no client-side cookie jar (server-side `Cookie` parsing and `Set-Cookie` are the sibling `cookies` module's; an outbound proxy -- forward and `CONNECT`, Go's environment rules -- landed 2026-10-05), no HTTP/3, no PROXY-protocol parsing (→ Backlog).
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -339,8 +339,8 @@ of a `multipart/byteranges`), `url.ParseQuery`/`QueryUnescape`/`PathUnescape`, a
 loopback peer that answers canned bytes (the client area; ours is `Client.requestPlain` against the
 same peer). Every disagreement is in a per-area table
 with the RFC rule, which side is off it, and what WE answer -- a case that diverges without an
-entry fails, and so does an entry whose case agrees again or diverges differently. 426 cases; the
-tables hold 17 (h1), 25 (serve), 7 (url), 14 (multipart), 7 (client), most of them us being stricter than Go
+entry fails, and so does an entry whose case agrees again or diverges differently. 489 cases; the
+tables hold 17 (h1), 25 (serve), 7 (url), 14 (multipart), 7 (client), 4 (proxy), most of them us being stricter than Go
 where the RFC allows it (obs-fold, bare LF, CL+TE, invalid Range ignored rather than 416) or Go off
 the RFC (`bytes=-0` → 206 `bytes 100-99/100`, an unknown range unit answered 416, Range honoured on
 POST, a sign accepted in a range position). It found six defects here, all fixed the same day with
@@ -569,6 +569,6 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49), the client's response framing vs `http.Transport` (64, loopback peer). Still self-only: conneg, SSE, gzip response encoding, problem+json, the reverse proxy's header rewriting
+**What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop + h2spec 145/145 (h2 server, `tools/interop.zig`) + h11 on h1 framing + **Go's standard library as a differential oracle** (2026-10-05, `src/go_oracle.zig`): the h1 server's accept/reject and handler view (104 wires), conditional requests + ranges vs `ServeContent` (114), query/component/path decoding vs `net/url` (95), multipart vs `mime/multipart` (49), the client's response framing vs `http.Transport` (64, loopback peer), outbound proxy selection vs `ProxyFromEnvironment` (63). Still self-only: conneg, SSE, gzip response encoding, problem+json, the reverse proxy's header rewriting
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
