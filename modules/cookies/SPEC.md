@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jshttp/cookie](https://github.com/jshttp/cookie) | TypeScript | MIT | 1.5k | v2.0.1 (2026-06-30) | Minimal parse/serialize pair, the Node/Express cookie parser — the closest peer in scope. *(inferred)* |
 | [nektro/zig-cookies](https://github.com/nektro/zig-cookies) | Zig | MIT | 2 | push 2026-07-08 | Only Zig ecosystem hit; tiny. Zig `std` has no cookie support. *(inferred)* |
 
-**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no `Set-Cookie` parser or client jar, no signed/private cookie values, no percent-encoding helper (→ Backlog items)
+**Where we are ahead:** header-injection guard that refuses rather than auto-quotes, `SameSite=None` without `Secure` refused at build time, `__Host-`/`__Secure-` prefix constraints checked, zero allocation, bounded 4096-byte `set`, and the parse side compared against CPython's `http.cookies` as an oracle (one real bug found). · **Where we are behind:** no signed/private cookie values, no percent-encoding helper (→ Backlog items); the client jar keeps no state across restarts (no persistence)
 
 ## Design & invariants
 - **Allocation-free.** `parse` returns an `Iterator` whose `Cookie{name,value}` pairs **borrow the
@@ -96,12 +96,33 @@ CTL incl. CR/LF in attributes) and the `SameSite` token. First run: 31 killed, 1
 case-insensitive name match); one test added (`find` is case-sensitive, RFC 6265 §5.3);
 rerun: 32 killed, 0 equivalent. No defect found.
 
+**Client jar and Public Suffix List (2026-10-05).** `jar.zig`: `SetCookie.parse` (name-value
+rules, every attribute, last-wins, the 4096/1024-byte caps, control bytes), the §5.1.1
+cookie-date algorithm (all three HTTP date layouts, tokens in any order, two-digit years,
+impossible dates), storage (host-only vs `Domain`, the PSL refusal and its host-only exception,
+no-list fail-closed, IP hosts, default path, Max-Age over Expires, deletion by a past expiry,
+replacement keeping creation order), retrieval (path match, order, Secure only over https) and
+the 6265bis Secure rules, eviction per domain and overall. `psl.zig`: RFC 3492 §7.1 punycode
+samples, normal/wildcard/exception/implicit-`*` rules, a wildcard's base, lowercasing. Anchors:
+libpsl over our own mini list (`psl_oracle.zig`, 50 hosts) and over the full system list
+(`zig build interop-cookies`, 40 476 hosts derived from every rule, 0 differ); Go's
+`net/http/cookiejar` over 54 scenarios (`jar_go_oracle.zig`; 8 judged divergences, each with the
+RFC rule and our answer pinned). Mutation (schemata, one ReleaseSafe build): 28 mutants over
+both files, 27 killed after one test was added (an uppercase rule in the list), 1 equivalent
+(the early return for an already-expired cookie, which `evict` would drop anyway).
+
 ## Backlog / deferred
 None recorded before the 2026-09-30 survey.
 
-- **`Set-Cookie` response-header parser** (survey 2026-09-30) — needed by anything that acts as an HTTP client with cookies (tests of our own server, scrapers); Go `ParseSetCookie` and cookie-rs have it. Effort: small (RFC 6265 §5.2). Fits §2: yes.
+- **A public punycode / IDNA module** (2026-10-05) — `psl.toAscii` punycodes the list's Unicode
+  rules (RFC 3492 encoding, no UTS #46 mapping) privately here; a client that has a Unicode host
+  name needs the full IDNA mapping first, and `http.Url` refuses non-ASCII. A module of its own is
+  the natural home. Effort: medium (UTS #46 tables). Fits §2: yes.
+- **Jar persistence** (2026-10-05) — save/load the non-session cookies. Go's jar has none either.
+
+- ~~**`Set-Cookie` response-header parser**~~ — **DONE 2026-10-05** (`jar.SetCookie.parse`). Was: (survey 2026-09-30) — needed by anything that acts as an HTTP client with cookies (tests of our own server, scrapers); Go `ParseSetCookie` and cookie-rs have it. Effort: small (RFC 6265 §5.2). Fits §2: yes.
 - **Signed / encrypted cookie values** (survey 2026-09-30) — cookie-rs "signed"/"private" jars and gorilla/securecookie; today the caller wires HMAC or `sealedbox` by hand. Effort: small on top of `sealedbox`/HMAC, but the choice of construction needs a decision. Fits §2: yes.
-- **Client-side `CookieJar`** (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
+- ~~**Client-side `CookieJar`**~~ — **DONE 2026-10-05** (`Jar` + `PublicSuffixList`, the list supplied by the caller; no list = host-only cookies). Was: (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
 
 ## Status
 `gap · any · codec · reentrant` + deps: `http` (the `get`/`set` helpers only; parser + builder are
@@ -114,6 +135,6 @@ std-only) — canonical source is `pub const meta` in src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/golden_test.zig runs CPython 3.14.4's http.cookies as a black-box oracle over the Cookie-header parse direction (16 tests, 5 divergences judged against RFC 6265, one real quote-aware split bug found); the Set-Cookie BUILD direction in root.zig is hand-authored against the RFC only
+**What the tests actually contain.** src/golden_test.zig runs CPython 3.14.4's http.cookies as a black-box oracle over the Cookie-header parse direction (16 tests, 5 divergences judged against RFC 6265, one real quote-aware split bug found); the client jar is replayed against Go's net/http/cookiejar (src/jar_go_oracle.zig, 54 scenarios, 8 divergences judged: 2 Secure rules from 6265bis, 6 where Go is off RFC 6265) and the Public Suffix List against libpsl (src/psl_oracle.zig over our own mini list; `zig build interop-cookies` over the full system list, 40 476 hosts, 0 differ); the Set-Cookie BUILD direction in root.zig is hand-authored against the RFC only
 
 **How it got there.** The anchoring work landed. DONE be61caa: python http.cookies oracle; quote-aware split BUG fixed; 5 divergences judged

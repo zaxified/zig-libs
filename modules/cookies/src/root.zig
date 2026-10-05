@@ -25,10 +25,26 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
-    .concurrency = .reentrant, // no state; results borrow the input header
+    .concurrency = .threadsafe, // `Jar` locks itself; the parser and builder have no state
     .model_after = "RFC 6265 (HTTP State Management Mechanism)",
     .deps = .{"http"},
 };
+
+/// The Public Suffix List algorithm, over a list the caller loads (`psl.zig`).
+pub const psl = @import("psl.zig");
+pub const PublicSuffixList = psl.PublicSuffixList;
+
+/// A client-side cookie jar (`jar.zig`): `Set-Cookie` parsing, storage and
+/// `Cookie` selection, pluggable into `http.Client` (`Jar.cookieJar`).
+pub const jar = @import("jar.zig");
+pub const Jar = jar.Jar;
+
+test {
+    _ = psl;
+    _ = @import("psl_oracle.zig");
+    _ = jar;
+    _ = @import("jar_go_oracle.zig");
+}
 
 /// One cookie name/value pair from a `Cookie` request header. Both slices
 /// borrow the parsed header, so it must outlive the `Cookie`.

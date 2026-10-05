@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Client side: `Jar` and `PublicSuffixList`** (new, nothing existing changed).
+  `Jar` is a thread-safe cookie jar (RFC 6265 §5.2-§5.4 + 6265bis Secure rules) that plugs into
+  `http.Client` (`.cookie_jar = jar.cookieJar()`); `jar.SetCookie.parse` parses a `Set-Cookie`
+  field; `parseCookieDate` is the §5.1.1 algorithm. `PublicSuffixList` runs the PSL algorithm over
+  a list the caller loads (no list data shipped); without one the jar keeps host-only cookies.
+  Anchored to libpsl (hermetic over our own mini list; `zig build interop-cookies` over the full
+  system list: 40 476 hosts agree) and to Go's `net/http/cookiejar` (54 scenarios, 8 judged
+  divergences). `meta.concurrency` is now `.threadsafe`.
 - **2026-10-04** — Tests: mutation schemata run (32 mutants, all killed). One new test:
   `find` matches cookie names case-sensitively. No behaviour change.
 - **2026-09-07** — Fuzz reach: `fuzzParseNeverPanics` only ever ran `parse("")`.

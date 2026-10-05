@@ -1,0 +1,20 @@
+// A made-up Public Suffix List for the libpsl oracle (psl_oracle.py): our own
+// rules exercising every rule kind, not data from publicsuffix.org.
+com
+example
+uk
+co.uk
+gov.uk
+jp
+*.kobe.jp
+!city.kobe.jp
+*.ck
+!www.ck
+*.wild.example
+!keep.wild.example
+deep.a.b.example
+github.io
+cn
+公司.cn
+рф
+bücher.example
