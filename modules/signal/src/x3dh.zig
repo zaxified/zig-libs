@@ -540,3 +540,12 @@ test "f_constant is 32 bytes of 0xFF (X25519 domain-separation prefix, spec sec 
     try std.testing.expectEqual(@as(usize, 32), f_constant.len);
     for (f_constant) |b| try std.testing.expectEqual(@as(u8, 0xFF), b);
 }
+
+test "the one-time prekey's DH is mixed into SK (DH4 is not optional decoration)" {
+    const a: [key_length]u8 = @splat(1);
+    const b: [key_length]u8 = @splat(2);
+    const c: [key_length]u8 = @splat(3);
+    const without = deriveSharedSecret(a, b, c, null);
+    const with = deriveSharedSecret(a, b, c, @as([key_length]u8, @splat(4)));
+    try std.testing.expect(!std.mem.eql(u8, &without, &with));
+}

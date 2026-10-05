@@ -386,6 +386,10 @@ test "codec: InitialMessage.fromBytes rejects a ciphertext-length mismatch" {
     defer std.testing.allocator.free(bytes);
     // Truncate the trailing ciphertext byte -> declared length no longer matches.
     try std.testing.expectError(error.InvalidInitialMessage, x3dh.InitialMessage.fromBytes(std.testing.allocator, bytes[0 .. bytes.len - 1]));
+    // ...and so does one trailing byte too many.
+    const longer = try std.mem.concat(std.testing.allocator, u8, &.{ bytes, "!" });
+    defer std.testing.allocator.free(longer);
+    try std.testing.expectError(error.InvalidInitialMessage, x3dh.InitialMessage.fromBytes(std.testing.allocator, longer));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

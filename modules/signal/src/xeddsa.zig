@@ -543,6 +543,35 @@ test "libsignal variant round-trips (self-consistency, both sign-bit branches) a
     try std.testing.expect(seen_sign_bit[1]);
 }
 
+test "verify refuses s + L, an order-2 key that satisfies the equation, and a partly matching R" {
+    const priv = [_]u8{0x42} ** 32;
+    const public = try std.crypto.dh.X25519.recoverPublicKey(priv);
+    const sig = sign(priv, "msg", [_]u8{7} ** 64);
+    try std.testing.expect(verify(public, "msg", sig));
+
+    // `s + L` moves no point, so only the canonicity check refuses it.
+    var malleated = sig;
+    const s_plus_l = std.mem.readInt(u256, sig[32..64], .little) + scalar.field_order;
+    std.mem.writeInt(u256, malleated[32..64], s_plus_l, .little);
+    try std.testing.expect(!verify(public, "msg", malleated));
+
+    // u = 0 maps to the order-2 point A = (0, -1); R = B, s = 1 satisfies
+    // `sB - hA == R` for every message whose h is even.
+    var forged: Signature = undefined;
+    forged[0..32].* = Edwards25519.basePoint.toBytes();
+    forged[32..64].* = [_]u8{1} ++ [_]u8{0} ** 31;
+    for (0..16) |i| try std.testing.expect(!verify([_]u8{0} ** 32, &[_]u8{@intCast(i)}, forged));
+
+    // Every byte of R is compared: of 2048 tampered R values (each with a
+    // fresh h), roughly eight would match R_check on any single byte.
+    for (0..2048) |i| {
+        var t = sig;
+        t[1] ^= @truncate(i);
+        t[2] ^= @truncate((i >> 8) + 1);
+        try std.testing.expect(!verify(public, "msg", t));
+    }
+}
+
 test "edwardsFromMontgomery fail-closed edges: non-canonical u, pole u = p-1, twist u, identity/low-order map images" {
     // Non-canonical: top bit set.
     var bad = [_]u8{0} ** 32;
