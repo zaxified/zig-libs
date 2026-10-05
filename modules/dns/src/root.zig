@@ -133,6 +133,7 @@ test {
     _ = config;
     _ = Resolver;
     _ = @import("goldens.zig");
+    _ = @import("go_oracle.zig");
 }
 
 test "reverseName: IPv4" {

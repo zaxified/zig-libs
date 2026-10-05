@@ -606,13 +606,27 @@ fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
                 .value = try arena.dupe(u8, d.bytes[tag_start + tag_len .. rdata_end]),
             } };
         },
-        .opt => .{ .opt = .{
-            .udp_payload_size = class_raw,
-            .extended_rcode = @truncate(ttl >> 24),
-            .version = @truncate(ttl >> 16),
-            .dnssec_ok = ttl & 0x8000 != 0,
-            .options = try arena.dupe(u8, d.bytes[rdata_start..rdata_end]),
-        } },
+        .opt => blk: {
+            // The options stay undecoded, but their {code, length, data}
+            // framing must tile the RDATA exactly (RFC 6891 §6.1.2): an
+            // option whose length runs past it was handed to the caller as
+            // if well-formed. Go's dnsmessage and dnspython refuse it.
+            const options = d.bytes[rdata_start..rdata_end];
+            var at: usize = 0;
+            while (at < options.len) {
+                if (options.len - at < 4) return error.BadRecord;
+                const len = std.mem.readInt(u16, options[at + 2 ..][0..2], .big);
+                if (len > options.len - at - 4) return error.BadRecord;
+                at += 4 + len;
+            }
+            break :blk .{ .opt = .{
+                .udp_payload_size = class_raw,
+                .extended_rcode = @truncate(ttl >> 24),
+                .version = @truncate(ttl >> 16),
+                .dnssec_ok = ttl & 0x8000 != 0,
+                .options = try arena.dupe(u8, options),
+            } };
+        },
         else => .{ .unknown = try arena.dupe(u8, d.bytes[rdata_start..rdata_end]) },
     };
     if (d.pos > rdata_end) return error.BadRecord; // rdata fields overran RDLENGTH

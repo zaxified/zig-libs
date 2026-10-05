@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Fix:** an OPT record whose EDNS options do not tile its RDATA (an option length
+  running past the end) is now `error.BadRecord`; it was decoded with the malformed stream handed on as
+  `Opt.options`. Found by a golang.org/x/net/dns/dnsmessage differential oracle (`tools/go_oracle/`,
+  replayed by `src/go_oracle.zig`: 81 messages, plus `encodeQuery` byte-identical to dnsmessage's
+  Builder on 18 parameter sets); dnspython 2.8.0 decided the 6 listed divergences.
+
 - **2026-10-04** — **Tests:** mutation run (54 schemata mutants, all killed after 15 new
   tests). Decoder edges (253-char name, exactly 16 pointer jumps, the 11-byte record
   pre-check factor, SOA name past RDLENGTH), class-IN-only CNAME chains, ';' comments in

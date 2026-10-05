@@ -1,6 +1,6 @@
 # `dns` verification instruments
 
-Five instruments. Two are wired into `zig build`; three are run by
+Six instruments. Two are wired into `zig build`; four are run by
 hand. They live here rather than in `src/` because each needs something
 `zig build test-dns` must not require — a foreign toolchain (dnspython), a real
 socket and a second schedulable thread, or the live internet
@@ -25,6 +25,15 @@ not tests. That argument is the reason the hostile-stub harness the 2026-09-04
 audit carried (`run.sh` + `stub.py` + `driver.zig` + its own `build.zig`) is
 **not** here: `interop.zig` covers the same ground, is in the gate, and its
 frames are committed.
+
+## Go dnsmessage oracle (frozen, replayed by `test-dns`)
+
+`tools/go_oracle/` asks golang.org/x/net/dns/dnsmessage v0.59.0 about this module's own message and
+query tables and writes `src/go_oracle_vectors.zig`, which `src/go_oracle.zig` replays with no Go:
+
+    cd modules/dns/tools/go_oracle && GOPROXY=off go run . -out ../../src/go_oracle_vectors.zig
+
+Divergences are listed in `src/go_oracle.zig` with dnspython 2.8.0 as the tiebreaker.
 
 ## Is the decoder's answer the same as a second implementation's?
 

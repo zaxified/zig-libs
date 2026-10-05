@@ -149,6 +149,21 @@ JSON path.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** message.zig goldens hand-built; Resolver has live UDP/TCP/DoH tests vs real 8.8.8.8
+**What the tests actually contain.** message codec: golang.org/x/net/dns/dnsmessage v0.59.0 verdicts
+on 81 messages (`src/go_oracle.zig` + `go_oracle_vectors.zig`: Builder-made, plain and compressed, and
+crafted byte by byte -- pointers, label types, name lengths, RDLENGTH lies, every decoded type short and
+long, OPT shapes) with 6 divergences each decided by dnspython 2.8.0, and `encodeQuery` byte-identical
+to dnsmessage's Builder on 18 parameter sets (refusing the same names); plus 6 real Google DNS
+responses (`goldens.zig`) and the hand-run dnspython corpus differential (`tools/README.md`). Resolver:
+interop frames from a hostile loopback server (`src/testdata/`), live UDP/TCP/DoH in `tools/live.zig`.
+Self only: `config.zig` (resolv.conf / hosts parsing and the search list), written to glibc's and
+Go's documented semantics but not run against either -- that is what keeps this MIXED.
+
+**Go oracle 2026-10-05.** `tools/go_oracle/` (needs x/net v0.59.0 in the module cache; `GOPROXY=off`).
+It found one defect, fixed the same day: an OPT record whose EDNS options do not tile its RDATA (an
+option length past the end) was decoded with the bad stream handed on as `Opt.options`; dnsmessage and
+dnspython refuse it, and now so does `decode` (`BadRecord`). Where dnspython is stricter than both
+dnsmessage and this module (trailing bytes after the message, RDATA longer than its fields, an empty
+TXT, OPT outside the additional section or twice), this module keeps dnsmessage's leniency.
 
 **How it got there.** The anchoring work landed. DONE ea2d000: 6 real Google DNS responses incl. compression, CNAME chain, NXDOMAIN
