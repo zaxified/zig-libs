@@ -177,7 +177,7 @@ resource definitions and no ports, and `aiocoap` is not installed on the audit h
 are frozen and cannot currently be re-taken by following what is written. Recorded, not fixed
 (2026-09-03); closing it means committing the capture client + server script.
 
-`zig build test-coap` — 65 offline tests. Codec (7): golden-byte CON GET round-trip, extended
+`zig build test-coap` — 85 offline tests. Codec (7): golden-byte CON GET round-trip, extended
 option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error
 matrix, `encodedLen` agreement. Options (20): class bits, uint codec boundaries + round-trip, typed
 accessors, URI↔options mapping (percent-encoding, coaps, bad-scheme, a hostile Uri-Host escaped
