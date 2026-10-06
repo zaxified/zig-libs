@@ -37,7 +37,7 @@ database, the newer-LSP comparison, aging/purge, and the SRM/SSN flooding flags
 plus CSNP/PSNP database synchronisation. Pure, time-injected, single-owner: the
 caller supplies `now`, feeds received LSP/CSNP/PSNP PDUs (decoded by `isis`), and
 reads/clears the flags to drive flooding and acknowledgement. Out of scope for
-this increment: everything in §6.
+this increment: everything in §8.
 
 ## 2. What `isis` provides, and what this module adds
 
@@ -284,7 +284,8 @@ placeholders specifically:
 - **SPF / route computation** — reading the stored LSPs' reachability TLVs into a
   shortest-path tree. Purely a consumer of the stored bytes.
 - **Generating our own LSP** — building/fragmenting the local LSP from adjacency
-  + reachability state, sequence-number management, and the ISO Fletcher checksum.
+  + reachability state and sequence-number management; stamping the ISO Fletcher
+  checksum on it is the generator's job (the receive-side check is in scope, §3/§9).
   `refresh_pending` is the trigger hook; `insert(_, null, now)` is how a generated
   LSP enters the DB. LSPDBOverload lives here too.
 - **Authentication** — TLV #10 / RFC 5304/5310 HMAC validation of LSP/SNP PDUs.

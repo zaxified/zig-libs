@@ -26,6 +26,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [tuneinsight/lattigo](https://github.com/tuneinsight/lattigo) | Go | Apache-2.0 | 1.5k | v6.2.0 (2026-02-02) | Its README: BFV as a wrapper over BGV, CKKS, multiparty versions, linear transformations / slot permutations and polynomial evaluation circuits. Source not read (not MIT). |
 | Zig ecosystem | Zig | — | — | — | No FHE library of any kind in `std` (ML-KEM/ML-DSA only) and none found on GitHub (`gh search repos "fhe zig"` returned nothing on 2026-09-30). The sibling `paillier` is additively homomorphic only. |
 
+**Where we are ahead:** the only FHE scheme found for Zig, pure Zig with `std` offering none (and `paillier` additively homomorphic only); exact-integer BFV that adds and multiplies to a bounded depth with relinearization and a noise-budget report. **Where we are even:** the BFV core that SEAL, OpenFHE and Lattigo also carry (keygen, encrypt, decrypt, add, multiply) and SEAL's default parameter/NTT design, but no SEAL vectors have been produced or checked in, so this is a design match, not a verified interop. **Where we are behind:** BGV and CKKS, bootstrapping, batching, Galois rotations, modulus switching and byte codecs (see Backlog), which the references offer; only one security-grade parameter set (`sec_n8192_logq218`), the others being toy sets. *(added 2026-10-06 from the survey table and the README)*
+
 ## What this module is
 
 A leveled **BFV** (Brakerski/Fan–Vercauteren, IACR ePrint 2012/144)

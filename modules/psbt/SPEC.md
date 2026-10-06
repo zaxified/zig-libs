@@ -110,7 +110,7 @@ rather than just pattern-matching Core's message. That surfaced one genuine BIP1
 `PSBT_GLOBAL_VERSION` was checked for shape but never for value, though BIP174 §"Version 0" requires
 it be 0 if present — now fixed (`error.UnsupportedPsbtVersion`; `core_kat_vectors.invalid_v0_scope`'s
 `core_index = 19`/`42` are the external oracle for it). Every other vector this module still accepts
-is BIP370(PSBTv2)/BIP371(Taproot)/MuSig2 content — explicitly out of scope, not a bug; asserted as an
+is BIP370(PSBTv2)/BIP371(Taproot)/MuSig2 content — not supported by this module (BIP370 is Backlog: not yet), not a bug; asserted as an
 accept, not silently skipped (`core_kat_vectors.invalid_out_of_scope`). **Correction:** two of those
 vectors (`core_index = 39`/`40`) were previously bucketed here as "a BIP174 §Signer TXID-cross-check,
 and the Signer is deferred", and therefore asserted as accepts. That was wrong. The justification was
@@ -120,7 +120,7 @@ existed. They are now `core_kat_vectors.invalid_utxo_binding` and are asserted a
 `finalize` (`error.UtxoOutpointMismatch` / `error.MissingUtxo`); `parse`, a pure v0 wire codec that
 never interprets one record against another, still accepts them, which is where this module's layering
 differs from Core's (Core refuses them at deserialize). Of Core's 42 new `valid` vectors, 27
-round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (out of scope), and one
+round-trip byte-exact, 14 are pure-PSBTv2 PSBTs this module correctly refuses (BIP370: not yet, see Backlog), and one
 (`valid[5]`) hits the SAME 0-vin/BIP144-marker ambiguity as the two BIP174 valid vectors above, just
 surfacing as `error.TooManyItems` instead of `error.InvalidWitnessFlag` — same root cause, new facet,
 not a new bug. See `core_kat_test.zig`'s doc comment for the full per-index account.

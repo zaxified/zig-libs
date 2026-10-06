@@ -36,7 +36,8 @@ The IS-IS **decision process** (ISO/IEC 10589 §7.2) for ONE level: read a
 synchronised link-state database (`isis-lsdb`) and produce a forwarding table
 `dest system-id → { next-hop system-id, total metric }`. Pure and deterministic;
 no I/O, no clock (time is only forwarded to `isis-lsdb` so lifetimes age to the
-caller's `now`). Point-to-point topology only this increment. Out of scope: §6.
+caller's `now`). Point-to-point links and LAN segments (via the LSP of the pseudonode,
+§3.2b) are routed; out of scope: §6.
 
 ## 2. What each dependency provides
 
