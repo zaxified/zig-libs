@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **keyboard-interactive (RFC 4256), both roles (ADDITIVE).** Client:
+  `userauth.authenticateKeyboardInteractive` answers any number of SSH_MSG_USERAUTH_INFO_REQUEST
+  rounds through a `KbdResponder` (answers copied, sent and scrubbed at once). Server:
+  `AuthConfig.keyboard_interactive` (`KbdInteractiveCheck`: one round of prompts, the caller's
+  verdict; `AuthMethod.keyboard_interactive`, `AuthFailure.wrong_answers`; listed in
+  USERAUTH_FAILURE). Live-tested: our client against Go `x/crypto/ssh` (two rounds, then exec;
+  a wrong second answer refused — oracle server in `tools/go_kbdint/`), a real OpenSSH `ssh`
+  answering our prompts through `SSH_ASKPASS_REQUIRE=force` (accepted / wrong code refused).
+  `Session.drain` no longer fails when the peer hangs up right after its CLOSE (Go's server does).
 - **2026-10-06** — **Several channels per connection, session requests, TCP/IP forwarding (ADDITIVE; one field made optional).**
   - **Client: `connection.Connection`**, a channel multiplexer over one authenticated transport:
     `openSession` as often as wanted (each channel pumps the others' messages into their own

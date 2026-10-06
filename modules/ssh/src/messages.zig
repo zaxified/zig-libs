@@ -72,6 +72,11 @@ pub const MessageType = enum(u8) {
     _,
 };
 
+/// RFC 4256 §3.2/§3.4: the `keyboard-interactive` method's messages, in the
+/// method-specific range 60-79 (60 is also `publickey`'s PK_OK).
+pub const msg_userauth_info_request: u8 = 60;
+pub const msg_userauth_info_response: u8 = 61;
+
 /// RFC 4254 §5.2 `data_type_code` for SSH_MSG_CHANNEL_EXTENDED_DATA. Only
 /// stderr is defined by the RFC.
 pub const extended_data_stderr: u32 = 1;

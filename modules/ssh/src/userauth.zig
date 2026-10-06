@@ -13,6 +13,8 @@
 //!   - the `publickey` method (§7) including the two-phase
 //!     query→SSH_MSG_USERAUTH_PK_OK→signed-request flow,
 //!   - the `password` method (§8), without the password-change sub-protocol,
+//!   - the `keyboard-interactive` method (RFC 4256): any number of
+//!     challenge rounds client-side, one round of prompts server-side,
 //!   - SSH_MSG_USERAUTH_FAILURE / _SUCCESS / _BANNER (the banner reaching the
 //!     caller through `BannerHandler`, not dropped).
 //!
@@ -49,9 +51,9 @@
 //! `rsa-sha2-512` (RFC 8332, key blob typed `ssh-rsa`) and
 //! `ecdsa-sha2-nistp256` (RFC 5656).
 //!
-//! Deferred (documented in SPEC.md, not stubbed): `keyboard-interactive`
-//! (RFC 4256), `hostbased` (§9), the §8 password-change exchange, agent
-//! forwarding, and certificate (`*-cert-v01@openssh.com`) key types.
+//! Deferred (documented in SPEC.md, not stubbed): `hostbased` (§9), the §8
+//! password-change exchange, agent forwarding, and certificate
+//! (`*-cert-v01@openssh.com`) key types.
 
 const std = @import("std");
 const transport = @import("transport.zig");
@@ -371,6 +373,120 @@ pub fn authenticate(
     return authenticatePublickey(t, gpa, user, key, .{});
 }
 
+/// One RFC 4256 §3.2 prompt.
+pub const KbdPrompt = struct {
+    text: []const u8,
+    /// Whether the answer may be shown as typed (false for a password).
+    echo: bool,
+};
+
+/// One SSH_MSG_USERAUTH_INFO_REQUEST round (RFC 4256 §3.2). Borrowed for
+/// the duration of the responder call.
+pub const KbdChallenge = struct {
+    name: []const u8,
+    instruction: []const u8,
+    prompts: []const KbdPrompt,
+};
+
+/// Answers keyboard-interactive challenges — the caller's terminal, a
+/// stored secret, a TOTP generator. `respondFn` fills `answers` (one per
+/// prompt, same order; borrowed only until it returns — they are copied
+/// out, sent and the copy scrubbed at once) and returns true, or returns
+/// false to give up (`error.AuthenticationFailed`). A round with no prompts
+/// (servers send one to show `instruction`) is answered with no answers.
+pub const KbdResponder = struct {
+    ctx: *anyopaque = transport.no_context,
+    respondFn: *const fn (ctx: *anyopaque, challenge: *const KbdChallenge, answers: [][]const u8) bool,
+};
+
+/// Bounds on a keyboard-interactive exchange (DoS guards).
+pub const max_kbd_prompts = 32;
+pub const max_kbd_rounds = 32;
+
+/// Client: RFC 4256 `keyboard-interactive` — the method PAM and 2FA servers
+/// offer instead of (or besides) `password`. Sends the request, then
+/// answers each SSH_MSG_USERAUTH_INFO_REQUEST through `responder` until the
+/// server decides. `ssh-userauth` must already be requested
+/// (`Transport.requestService`).
+pub fn authenticateKeyboardInteractive(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    user: []const u8,
+    responder: KbdResponder,
+    opts: PasswordOptions,
+) UserauthError!void {
+    if (user.len > max_user_len) return error.NameTooLong;
+    const scratch = try gpa.alloc(u8, scratch_len);
+    defer {
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
+    {
+        var buf: [max_user_len + 128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try messages.writeString(&w, user);
+        try messages.writeString(&w, connection_service);
+        try messages.writeString(&w, "keyboard-interactive");
+        try messages.writeString(&w, ""); // language tag (deprecated, §3.1)
+        try messages.writeString(&w, ""); // submethods: the server chooses
+        try t.sendPacket(w.buffered());
+    }
+
+    var rounds: usize = 0;
+    var seen: usize = 0;
+    while (seen < 256) : (seen += 1) {
+        const pkt = try t.recvPacket(scratch);
+        const mt = msgType(pkt);
+        switch (mt) {
+            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS) => return,
+            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_FAILURE) => return error.AuthenticationFailed,
+            @intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO) => try t.takeExtInfo(pkt.payload),
+            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_BANNER) => {
+                var c = Cursor{ .b = pkt.payload[1..] };
+                const msg = try c.string();
+                if (msg.len > max_banner_len) return error.NameTooLong;
+                if (opts.banner) |h| h.show(msg, try c.string());
+            },
+            messages.msg_userauth_info_request => {
+                rounds += 1;
+                if (rounds > max_kbd_rounds) return error.ProtocolError;
+                var c = Cursor{ .b = pkt.payload[1..] };
+                const name = try c.string();
+                const instruction = try c.string();
+                _ = try c.string(); // language tag
+                const n = try c.uint32();
+                if (n > max_kbd_prompts) return error.ProtocolError;
+                var prompts: [max_kbd_prompts]KbdPrompt = undefined;
+                for (prompts[0..n]) |*p| p.* = .{ .text = try c.string(), .echo = try c.boolean() };
+                var answers: [max_kbd_prompts][]const u8 = @splat("");
+                const challenge: KbdChallenge = .{ .name = name, .instruction = instruction, .prompts = prompts[0..n] };
+                if (!responder.respondFn(responder.ctx, &challenge, answers[0..n])) return error.AuthenticationFailed;
+
+                var len: usize = 16;
+                for (answers[0..n]) |a| {
+                    if (a.len > max_password_len) return error.NameTooLong;
+                    len += 4 + a.len;
+                }
+                const buf = try gpa.alloc(u8, len);
+                defer {
+                    std.crypto.secureZero(u8, buf);
+                    gpa.free(buf);
+                }
+                var w: std.Io.Writer = .fixed(buf);
+                try w.writeByte(messages.msg_userauth_info_response);
+                var nb: [4]u8 = undefined;
+                std.mem.writeInt(u32, &nb, n, .big);
+                try w.writeAll(&nb);
+                for (answers[0..n]) |a| try messages.writeString(&w, a);
+                try t.sendPacket(w.buffered());
+            },
+            else => return error.ProtocolError,
+        }
+    }
+    return error.ProtocolError;
+}
+
 fn sendPublickeyRequest(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -495,6 +611,21 @@ pub const PasswordCheck = struct {
     }
 };
 
+/// Server policy for RFC 4256 `keyboard-interactive`: one round of
+/// `prompts` (SSH_MSG_USERAUTH_INFO_REQUEST), whose answers `checkFn`
+/// judges — a password plus a one-time code, say. Compare in constant time.
+///
+/// ⚠ `user` and `answers` are borrowed for the duration of the call; the
+/// answers are the peer's secrets inside `serveUserauth`'s scratch, which
+/// is scrubbed and freed when it returns.
+pub const KbdInteractiveCheck = struct {
+    ctx: *anyopaque = transport.no_context,
+    name: []const u8 = "",
+    instruction: []const u8 = "",
+    prompts: []const KbdPrompt,
+    checkFn: *const fn (ctx: *anyopaque, user: []const u8, answers: []const []const u8) bool,
+};
+
 /// Why `serveUserauth` returned `error.AuthenticationFailed`.
 ///
 /// RFC 4252 §5.1 gives the *wire* no field for a reason — SSH_MSG_USERAUTH_
@@ -528,6 +659,9 @@ pub const AuthFailure = enum {
     bad_signature,
     /// `AuthConfig.password` said no.
     wrong_password,
+    /// `AuthConfig.keyboard_interactive` said no to the answers (or the
+    /// client answered a different number of prompts than it was asked).
+    wrong_answers,
     /// The peer sent SSH_MSG_DISCONNECT instead of another credential.
     peer_disconnected,
 };
@@ -577,6 +711,8 @@ pub const AuthConfig = struct {
     authorized_key: ?AuthorizedKeyCheck = null,
     /// Enables the `password` method when set.
     password: ?PasswordCheck = null,
+    /// Enables the RFC 4256 `keyboard-interactive` method when set.
+    keyboard_interactive: ?KbdInteractiveCheck = null,
     /// Optional SSH_MSG_USERAUTH_BANNER (§5.4) sent once, before the first
     /// verdict.
     banner: ?[]const u8 = null,
@@ -615,7 +751,7 @@ pub const AuthConfig = struct {
 };
 
 /// Which method actually succeeded.
-pub const AuthMethod = enum { publickey, password };
+pub const AuthMethod = enum { publickey, password, keyboard_interactive };
 
 /// Outcome of a successful `serveUserauth`. The user name is copied into a
 /// fixed buffer (bounded by `max_user_len`) so the caller has no allocation
@@ -743,6 +879,22 @@ pub fn serveUserauth(
             continue;
         }
 
+        if (std.mem.eql(u8, method, "keyboard-interactive") and config.keyboard_interactive != null) {
+            // The answers arrive in `scratch`, over `user`: keep a copy.
+            var res = AuthResult{ .method = .keyboard_interactive };
+            @memcpy(res.user_buf[0..user.len], user);
+            res.user_len = user.len;
+            if (try serveKbdInteractive(t, scratch, res.user(), config.keyboard_interactive.?)) {
+                try sendSuccess(t);
+                return res;
+            }
+            if (config.failure) |out| out.* = .wrong_answers;
+            if (config.on_rejected) |h| h.call(res.user(), .wrong_answers);
+            attempts += 1;
+            try sendFailure(t, config);
+            continue;
+        }
+
         // "none" (§5.2, the conventional way a client asks which methods are
         // available) and anything unsupported both land here.
         if (config.failure) |out| out.* = .no_acceptable_method;
@@ -752,6 +904,46 @@ pub fn serveUserauth(
     }
     t.sendDisconnect(.no_more_auth_methods_available, "too many authentication attempts") catch {};
     return error.AuthenticationFailed;
+}
+
+/// The `keyboard-interactive` half of `serveUserauth` (RFC 4256 §3.2-§3.4):
+/// one INFO_REQUEST, one INFO_RESPONSE, the caller's verdict. `user` must
+/// not point into `scratch` (the response is read there).
+fn serveKbdInteractive(t: *transport.Transport, scratch: []u8, user: []const u8, kbd: KbdInteractiveCheck) UserauthError!bool {
+    if (kbd.prompts.len > max_kbd_prompts) return error.NameTooLong;
+    {
+        var len: usize = 64 + kbd.name.len + kbd.instruction.len;
+        for (kbd.prompts) |p| len += 8 + p.text.len;
+        var buf: [8192]u8 = undefined;
+        if (len > buf.len) return error.NameTooLong;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeByte(messages.msg_userauth_info_request);
+        try messages.writeString(&w, kbd.name);
+        try messages.writeString(&w, kbd.instruction);
+        try messages.writeString(&w, ""); // language tag
+        var nb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &nb, @intCast(kbd.prompts.len), .big);
+        try w.writeAll(&nb);
+        for (kbd.prompts) |p| {
+            try messages.writeString(&w, p.text);
+            try w.writeByte(@intFromBool(p.echo));
+        }
+        try t.sendPacket(w.buffered());
+    }
+    const pkt = try t.recvPacket(scratch);
+    if (msgType(pkt) != messages.msg_userauth_info_response) {
+        t.sendDisconnect(.protocol_error, "expected SSH_MSG_USERAUTH_INFO_RESPONSE") catch {};
+        return error.ProtocolError;
+    }
+    var c = Cursor{ .b = pkt.payload[1..] };
+    const n = try c.uint32();
+    if (n != kbd.prompts.len) return false;
+    var answers: [max_kbd_prompts][]const u8 = undefined;
+    for (answers[0..n]) |*a| {
+        a.* = try c.string();
+        if (a.len > max_password_len) return error.NameTooLong;
+    }
+    return kbd.checkFn(kbd.ctx, user, answers[0..n]);
 }
 
 const PublickeyOutcome = union(enum) {
@@ -836,7 +1028,7 @@ fn sendSuccess(t: *transport.Transport) UserauthError!void {
 /// || boolean partial success`. Partial success is always false — this
 /// module never requires a second method.
 fn sendFailure(t: *transport.Transport, config: AuthConfig) UserauthError!void {
-    var names: [2][]const u8 = undefined;
+    var names: [3][]const u8 = undefined;
     var n: usize = 0;
     if (config.authorized_key != null) {
         names[n] = "publickey";
@@ -844,6 +1036,10 @@ fn sendFailure(t: *transport.Transport, config: AuthConfig) UserauthError!void {
     }
     if (config.password != null) {
         names[n] = "password";
+        n += 1;
+    }
+    if (config.keyboard_interactive != null) {
+        names[n] = "keyboard-interactive";
         n += 1;
     }
     var buf: [128]u8 = undefined;

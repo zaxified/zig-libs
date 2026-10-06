@@ -243,6 +243,10 @@ pub const SshClientOptions = struct {
     /// client with every option above (no host), `$H` the `user@host`
     /// argument, `$OUT` the output file (its last line must be a status).
     script: ?[]const u8 = null,
+    /// Authenticate with keyboard-interactive instead of the key: the client
+    /// answers each prompt by running this shell script (`$1` = the prompt)
+    /// through `SSH_ASKPASS_REQUIRE=force`.
+    askpass_script: ?[]const u8 = null,
 };
 
 /// A real `ssh` dialling our server; `start` returns after OUR server
@@ -300,9 +304,25 @@ pub const SshClient = struct {
 
         const out_path = try std.fmt.allocPrint(gpa, "{s}/out", .{dir_path});
         errdefer gpa.free(out_path);
-        const ssh_cmd = try std.fmt.allocPrint(gpa, "/usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes" ++
+        var auth_buf: [512]u8 = undefined;
+        const auth_opts = if (opts.askpass_script) |script| blk: {
+            const ap = try std.fmt.allocPrint(gpa, "{s}/askpass", .{dir_path});
+            defer gpa.free(ap);
+            var f = try cwd.createFile(io, ap, .{ .permissions = @enumFromInt(0o755) });
+            defer f.close(io);
+            var fbuf: [1024]u8 = undefined;
+            var fw = f.writer(io, &fbuf);
+            try fw.interface.print("#!/bin/sh\n{s}\n", .{script});
+            try fw.interface.flush();
+            break :blk try std.fmt.bufPrint(&auth_buf, "env SSH_ASKPASS={s} SSH_ASKPASS_REQUIRE=force", .{ap});
+        } else "";
+        const methods = if (opts.askpass_script != null)
+            "-o PreferredAuthentications=keyboard-interactive -o BatchMode=no -o NumberOfPasswordPrompts=1"
+        else
+            "-o PreferredAuthentications=publickey -o BatchMode=yes";
+        const ssh_cmd = try std.fmt.allocPrint(gpa, "{s} /usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes" ++
             " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null" ++
-            " -o PreferredAuthentications=publickey -o BatchMode=yes -o ConnectTimeout=10 {s}", .{ port, ck_path, opts.ssh_args });
+            " {s} -o ConnectTimeout=10 {s}", .{ auth_opts, port, ck_path, methods, opts.ssh_args });
         defer gpa.free(ssh_cmd);
         const cmdline = if (opts.script) |script|
             try std.fmt.allocPrint(gpa, "SSH='{s}'; H=alice@127.0.0.1; OUT={s}; exec 2>{s}.err; {s}", .{ ssh_cmd, out_path, out_path, script })
@@ -972,4 +992,149 @@ test "envAccepted: exact names and trailing-* prefixes only" {
     try t.expect(!connection.envAcceptedForTest(&pats, "LANGUAGE"));
     try t.expect(!connection.envAcceptedForTest(&pats, "ZIGGY"));
     try t.expect(!connection.envAcceptedForTest(&.{}, "LANG"));
+}
+
+// ── keyboard-interactive (RFC 4256) ────────────────────────────────────────
+
+/// Answers by prompt text: the Go server asks "Password: " then "Token: ".
+const GoAnswers = struct {
+    token: []const u8,
+    rounds: u32 = 0,
+    saw_instruction: bool = false,
+
+    fn respond(ctx: *anyopaque, ch: *const userauth.KbdChallenge, answers: [][]const u8) bool {
+        const self: *GoAnswers = @ptrCast(@alignCast(ctx));
+        self.rounds += 1;
+        if (std.mem.eql(u8, ch.instruction, "round two")) self.saw_instruction = true;
+        for (ch.prompts, answers) |p, *a| {
+            if (std.mem.eql(u8, p.text, "Password: ") and !p.echo) {
+                a.* = "correct horse";
+            } else if (std.mem.eql(u8, p.text, "Token: ") and p.echo) {
+                a.* = self.token;
+            } else return false;
+        }
+        return true;
+    }
+};
+
+/// Run `go run` on the Go keyboard-interactive server, our client against
+/// it, and the exec after a successful login. Skips without Go or the tool.
+fn liveGoKbd(token: []const u8) !struct { rounds: u32, saw_instruction: bool, out: ?[]u8 } {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const tool = "modules/ssh/tools/go_kbdint";
+    std.Io.Dir.cwd().access(io, tool ++ "/main.go", .{}) catch return error.SkipZigTest;
+
+    var portbuf: [2]u8 = undefined;
+    fillRandom(&portbuf);
+    const port: u16 = 20000 + (std.mem.readInt(u16, &portbuf, .big) % 20000);
+    var pbuf: [8]u8 = undefined;
+    const port_s = try std.fmt.bufPrint(&pbuf, "{d}", .{port});
+    // `spawn` hands the child an EMPTY environment unless given one, and Go
+    // needs HOME (module cache, build cache).
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "go", "-C", tool, "run", ".", port_s },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .environ_map = &env,
+    }) catch return error.SkipZigTest;
+    defer child.kill(io);
+    {
+        var lbuf: [64]u8 = undefined;
+        var r = child.stdout.?.readerStreaming(io, &lbuf);
+        const line = r.interface.takeDelimiterExclusive('\n') catch return error.SkipZigTest;
+        if (!std.mem.eql(u8, line, "READY")) return error.SkipZigTest;
+    }
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rbuf: [32 * 1024]u8 = undefined;
+    var wbuf: [32 * 1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+    defer t.deinit();
+    var scratch: [4096]u8 = undefined;
+    try t.requestService("ssh-userauth", &scratch);
+    var answers: GoAnswers = .{ .token = token };
+    userauth.authenticateKeyboardInteractive(&t, gpa, "alice", .{ .ctx = &answers, .respondFn = GoAnswers.respond }, .{}) catch |e| switch (e) {
+        error.AuthenticationFailed => return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = null },
+        else => return e,
+    };
+    const res = try connection.exec(&t, gpa, "whoami", .{});
+    defer gpa.free(res.stderr);
+    return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = res.stdout };
+}
+
+test "live: keyboard-interactive against Go x/crypto/ssh — two challenge rounds, then exec" {
+    const r = try liveGoKbd("123456");
+    defer if (r.out) |o| std.testing.allocator.free(o);
+    try std.testing.expectEqual(@as(u32, 2), r.rounds);
+    try std.testing.expect(r.saw_instruction);
+    try std.testing.expectEqualStrings("kbd-ok user=alice cmd=whoami", r.out orelse return error.TestUnexpectedResult);
+}
+
+test "live: keyboard-interactive against Go x/crypto/ssh — a wrong second answer is AuthenticationFailed" {
+    const r = try liveGoKbd("000000");
+    try std.testing.expectEqual(@as(u32, 2), r.rounds);
+    try std.testing.expectEqual(@as(?[]u8, null), r.out);
+}
+
+const KbdPolicy = struct {
+    fn check(_: *anyopaque, user: []const u8, answers: []const []const u8) bool {
+        return std.mem.eql(u8, user, "alice") and answers.len == 2 and
+            std.mem.eql(u8, answers[0], "correct horse") and std.mem.eql(u8, answers[1], "424242");
+    }
+};
+
+const kbd_prompts = [_]userauth.KbdPrompt{
+    .{ .text = "Password: ", .echo = false },
+    .{ .text = "One-time code: ", .echo = true },
+};
+
+test "live: a real ssh client logs in to our server with keyboard-interactive (askpass answers)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .askpass_script =
+        \\case "$1" in *Password*) echo 'correct horse';; *code*) echo 424242;; *) exit 1;; esac
+    });
+    defer fx.deinit();
+    const auth = userauth.serveUserauth(&fx.t, gpa, .{ .keyboard_interactive = .{
+        .instruction = "two factors",
+        .prompts = &kbd_prompts,
+        .checkFn = KbdPolicy.check,
+    } }) catch |e| {
+        _ = fx.finish() catch null;
+        fx.dumpErr();
+        return e;
+    };
+    try std.testing.expectEqual(userauth.AuthMethod.keyboard_interactive, auth.method);
+    try std.testing.expectEqualStrings("alice", auth.user());
+    try connection.serveSession(&fx.t, gpa, .{ .user = auth.user(), .exec = info_handler, .stdin_mode = .ignore });
+    const out = try fx.finish();
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "kind=exec cmd=uname -a"));
+}
+
+test "live: a real ssh client with the wrong one-time code is refused by our server" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .askpass_script =
+        \\case "$1" in *Password*) echo 'correct horse';; *code*) echo 999999;; *) exit 1;; esac
+    });
+    defer fx.deinit();
+    var why: userauth.AuthFailure = undefined;
+    const r = userauth.serveUserauth(&fx.t, gpa, .{
+        .keyboard_interactive = .{ .prompts = &kbd_prompts, .checkFn = KbdPolicy.check },
+        .failure = &why,
+    });
+    try std.testing.expect(std.meta.isError(r));
+    try std.testing.expectEqual(userauth.AuthFailure.wrong_answers, why);
 }

@@ -462,7 +462,9 @@ pub const Session = struct {
     }
 
     /// Pump until the peer closes the channel, collecting stdout/stderr and
-    /// the §6.10 exit status. Answers the peer's CLOSE with our own.
+    /// the §6.10 exit status. Answers the peer's CLOSE with our own — unless
+    /// the peer has hung up by then (Go's x/crypto/ssh server closes the
+    /// connection right after its CLOSE): everything was delivered.
     pub fn drain(self: *Session) ChannelError!void {
         while (!self.ch.got_close) {
             switch (try self.pumpOnce()) {
@@ -470,7 +472,7 @@ pub const Session = struct {
                 else => continue,
             }
         }
-        try sendCloseMsg(self.t, &self.ch);
+        sendCloseMsg(self.t, &self.ch) catch |e| if (!hungUp(e)) return e;
     }
 
     pub fn exitStatus(self: *const Session) ?u32 {
