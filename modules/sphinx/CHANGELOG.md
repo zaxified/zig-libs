@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO BEHAVIOURAL CHANGE (constant time by construction):** `process`'s
+  final-hop test compares the deobfuscated `next_hmac` with zero through
+  `std.crypto.timing_safe.eql` instead of `std.mem.allEqual`, whose constant time was an accident
+  of LLVM's vectorisation. Same verdicts; ctgrind `process` unchanged at 40 contexts (digest
+  re-pinned); `check-ct-compare` now pins two constant-time compares in `core.zig`.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Constant-time scope" now records what the 2026-09-09 ctgrind run measured (std's `cmovznzU64` compiles to a branch; the final-hop `allEqual` at `core.zig:472` is constant-time only by accidental vectorisation); route blinding and returning errors read "not yet — see Backlog" instead of "out of scope".
 - **2026-10-05** — Mutation run: 33 of 36 killed, 3 equivalent; 5 tests added or extended
   (`process` frame refusals on genuinely-MACed onions, a route filling exactly 1300 octets,

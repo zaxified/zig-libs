@@ -468,8 +468,16 @@ pub fn process(node_privkey: [32]u8, pkt: OnionPacket, associated_data: []const 
     @memcpy(result.payload_buf[0..frame.payload.len], frame.payload);
     @memset(result.payload_buf[frame.payload.len..], 0);
 
-    // Step 8: an all-zero next_hmac marks the final hop.
-    if (std.mem.allEqual(u8, &frame.hmac, 0)) return result;
+    // Step 8: an all-zero next_hmac marks the final hop. `frame.hmac` is
+    // deobfuscated with this hop's shared secret, so the test is
+    // secret-derived: compared in constant time BY CONSTRUCTION
+    // (`timing_safe.eql`, pinned by check-ct-compare). It used to be
+    // `std.mem.allEqual`, an early-exit loop that LLVM happened to vectorise
+    // into one `vptest` (ctgrind 2026-09-09) — safe by accident only. The
+    // branch on the verdict is the hop's own public decision (forward or
+    // deliver), not a leak.
+    const zero_hmac = [_]u8{0} ** hmac_len;
+    if (std.crypto.timing_safe.eql([hmac_len]u8, frame.hmac, zero_hmac)) return result;
 
     // Step 9a: blinding_factor = SHA256(compressed(epk) ‖ ss) — the same
     // formula deriveHopSecrets runs sender-side.

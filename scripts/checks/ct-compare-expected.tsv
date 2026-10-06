@@ -42,7 +42,7 @@ modules/sessions/src/csrf.zig	1	2
 modules/signal/src/xeddsa.zig	2	0
 modules/snmp/src/usm.zig	5	0
 modules/spake2plus/src/root.zig	2	1
-modules/sphinx/src/core.zig	1	0
+modules/sphinx/src/core.zig	2	0
 modules/ssh/src/transport.zig	2	40
 modules/stun/src/root.zig	1	1
 modules/tenantkex/src/root.zig	1	4

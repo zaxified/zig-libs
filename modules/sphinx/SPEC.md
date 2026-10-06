@@ -175,13 +175,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     branchless bitmask select in source, compiles to `test $0x1,%al; jne`
     at ReleaseFast — std's code, under every secp256k1 consumer, not
     something this module adds or can fix. (2) `process`'s final-hop test
-    (`std.mem.allEqual(u8, &frame.hmac, 0)`, `core.zig:472`) is a
-    secret-derived comparison deciding the one bit per-hop unlinkability
-    hides; `allEqual` is an early-exit loop with no constant-time contract.
-    LLVM happened to vectorise it into one `vptest`/`je` on this target, so
-    it is safe **by accident, not by construction** — a different LLVM or
-    target can restore the loop and no test pins it. Only the HMAC gate
-    (`timing_safe.eql`, `core.zig:437`) is constant-time by construction.
+    is a secret-derived comparison (`frame.hmac` is deobfuscated with the
+    shared secret). Until 2026-10-06 it was `std.mem.allEqual`, an early-exit
+    loop LLVM happened to vectorise into one `vptest`/`je` — safe by
+    accident. It is now `timing_safe.eql` against an all-zero HMAC
+    (`core.zig:480`, pinned by `check-ct-compare`), constant-time by
+    construction like the HMAC gate (`core.zig:437`). Re-measured 2026-10-06:
+    `process` 40 in-file contexts before and after, line for line the same;
+    the one at `core.zig:480` is the branch on the verdict (the hop's own
+    forward-or-deliver decision), not the comparison.
 - **Out of scope for this module** (left to whatever protocol layer wires
   it in): the `payload` TLV field's own value semantics (`amt_to_forward`,
   `short_channel_id`, `payment_data`, etc. — BOLT#4's own payload-format

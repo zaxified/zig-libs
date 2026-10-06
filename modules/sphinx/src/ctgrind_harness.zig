@@ -40,8 +40,9 @@
 //!   direction ECDH, the constant-time HMAC gate
 //!   (`std.crypto.timing_safe.eql`, `core.zig:437`), the ChaCha20
 //!   deobfuscation, `hopframe.readHopFrame`'s bigsize/length parse, the
-//!   `std.mem.allEqual` all-zero check that decides "this is the final
-//!   destination" vs. "forward onward" (`core.zig:472`), and the re-blinding
+//!   all-zero check that decides "this is the final destination" vs.
+//!   "forward onward" (`timing_safe.eql` against zero since 2026-10-06, was
+//!   `std.mem.allEqual`; `core.zig:480`), and the re-blinding
 //!   point-multiply for the outgoing packet.
 //!
 //! Both targets use the REAL, published KAT fixture (`kat_vectors.zig`) for
@@ -191,7 +192,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             // Hop 0 of 5: NOT the final hop, so `result.next_packet` is
             // non-null and the "final hop?" all-zero check inside `process`
-            // (core.zig's `std.mem.allEqual(u8, &frame.hmac, 0)`) actually
+            // (core.zig's `timing_safe.eql(.., frame.hmac, zero_hmac)`) actually
             // runs its "false" path against a real, non-degenerate
             // `next_hmac` -- the exact branch the audit brief flagged as the
             // interesting one (it decides "deliver here" vs. "forward").
@@ -201,7 +202,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // on 2026-09-09 rather than reasoned about:
             //
             //   `if (result.next_packet) |np|` — whether that optional is
-            //   present is decided by `core.zig`'s `allEqual(&frame.hmac, 0)`
+            //   present is decided by `core.zig`'s all-zero test of `frame.hmac`
             //   on decrypted material, so unwrapping it is this harness
             //   branching on a secret-derived tag. That is the artifact dkg's
             //   harness was found producing, and it lands in `unattr`.

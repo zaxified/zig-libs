@@ -782,8 +782,10 @@ signal	ReleaseFast	ratchet	1	2	dc09967e5dddb5c2	92ab00fad0ce5c41
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
 # The rest are unchanged: comb `rejectIdentity` x2, std scalar canonicality x2,
 # std `cmovznzU64` x2.
-sphinx	ReleaseFast	construct	1	8	1f53e7a7d7c472be	cb364f94f78ea089
-sphinx	ReleaseFast	process	1	<=43	1f53e7a7d7c472be	e7c50d755f64b027
+# sphinx digest re-pin 2026-10-06: the final-hop test became timing_safe.eql (was
+# std.mem.allEqual); process 40 / construct 8 contexts, line for line as before.
+sphinx	ReleaseFast	construct	1	8	bd74ec514e2f0996	cb364f94f78ea089
+sphinx	ReleaseFast	process	1	<=43	bd74ec514e2f0996	e7c50d755f64b027
 # bolt3 derive 7 -> 8 (re-pin 2026-10-06; the fix landed 2026-10-05):
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears
