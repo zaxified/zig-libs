@@ -10,7 +10,7 @@
         // new tag is cut, so a copy taken from tag T is built against T.
         .zig_libs = .{
             .url = "git+https://github.com/zaxified/zig-libs#2026-10-06",
-            .hash = "zig_libs-0.0.0-WiQ0GosLLgXawSlBiCORv3KiLp-Fcm-OahLJ1mYYgXDF",
+            .hash = "zig_libs-0.0.0-WiQ0GjpIMAUXiUP753qjYCZWl1cFwsfxZpqsoFeVW2lf",
         },
         // To follow the development branch instead, or to pin one commit,
         // replace the two lines above with one of these and run
