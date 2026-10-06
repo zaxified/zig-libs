@@ -6,7 +6,7 @@
 
 **Scope:** mvp — google/distributed_point_functions and libfss (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation ?
+**Audit:** review 2026-09-09 · mutation 2026-10-06
 
 **Known defects:** none recorded
 
@@ -26,6 +26,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [dkales/dpf-go](https://github.com/dkales/dpf-go) (and `dpf-cpp`) | Go / C++ | MIT | 4 (`dpf-cpp`: 23) | push 2021-03-04 | "A basic implementation of DPFs": point functions with AES-NI, nothing else. Unmaintained. |
 | [weikengchen/libdpf](https://github.com/weikengchen/libdpf) | C / Rust | none detected by the API (not verified) | 14 | push 2026-03-20 | "A template for 2-server 1-bit DPF" with hardware AES for x86_64 and ARM64. |
 | Zig ecosystem | Zig | — | — | — | No FSS or DPF in `std`; none found on GitHub (search 2026-09-30). Sibling `pir` builds two-server PIR on this module; there is no sibling for Prio / VDAF. |
+
+**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. **Where we are behind:** no distributed comparison or interval functions (Google's tree has `dcf/`, libfss offers comparison), no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog). *(added 2026-10-06 from the 2026-09-30 survey table)*
 
 ## What this module is
 
@@ -208,6 +210,18 @@ every formerly-gated test now runs as an executed assertion (all pass, no
 skips, Debug + ReleaseFast). While the flag was `false`, those tests reported **SKIP**
 (`error.SkipZigTest`) — a skip was never a pass.
 
+**Mutation run 2026-10-06** (in-place, Debug, 40 mutants over `dpf.zig`'s
+Gen/Eval/range walk/codec/checker, `mpf.zig`'s seed-reuse guard, interleaved
+walk and checker, both PRGs and the group): 39 killed. The first pass left 3;
+two missing tests were added in `prg.zig` (`Aes128Mmo.convert` against the
+long-hand `H_2 ‖ H_3` — the convert tweak moved to byte 1 survived; and
+`convert(L)` as the low `L` bytes of `convert(32)` for every `L` — the
+second block skipped for `L ∈ 17..24` survived, reading uninitialised bytes).
+Two mutants that first failed to compile were rewritten and counted. One is
+equivalent for value tests: dropping `xorMasked`'s `blackBox` barrier changes
+no value; it is a constant-time property, held by `scripts/checks/ctgrind.sh`
+(CHANGELOG 2026-09-09), not by `zig build test`.
+
 ## Multi-point FSS (`mpf.zig`)
 
 Shares of `f_{A,B}(x) = Σ_j β_j·1{x==α_j}` — non-zero at `k` chosen points.
@@ -362,7 +376,7 @@ of an `n=16` domain (α inside, at the prefix's last point, just past it, and
 at the far end of the domain), prefix lengths 0/1/257 (a full subtree plus a
 straddling leaf), for both parties — with `evalAll`'s naive loop as the
 structurally independent oracle, plus a streaming-form test asserting each
-index is emitted exactly once, in order. Mutation-tested: mis-gating one
+index is emitted exactly once, in order. Mutation-tested (earlier, undated): mis-gating one
 child's seed-CW application (parent's `t` → child's `t`) is caught by three of
 these tests; shortening the prefix by one at the consumer is caught by `pir`'s
 every-record-influences-the-answer test.
@@ -416,7 +430,7 @@ fuzz target's arbitrary key material over a fuzzer-chosen prefix. The oracle is
 `evalEach` (a loop over `dpf.eval`), deliberately left naive and untouched;
 `pir.zig` additionally keeps the pre-interleaving server loop as a test-only
 oracle and requires `Multi.answer`/`answerAggregate` to reproduce it word for
-word. Mutation-tested (each confirmed to turn the suite red):
+word. Mutation-tested (earlier, undated; each confirmed to turn the suite red):
 
 | mutation | caught by |
 |---|---|
