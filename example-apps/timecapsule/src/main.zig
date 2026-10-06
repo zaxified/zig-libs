@@ -60,14 +60,29 @@ const usage =
 /// wire (which carries the round and both lock ciphertexts, and
 /// authenticates everything). The header adds the one fact the envelope
 /// does not know: WHICH beacon chain the round number counts on.
+///
+/// `seal` writes the envelope's version-2 STREAM wire, so a payload of any
+/// size is sealed and opened in bounded memory. `open` also reads the
+/// version-1 one-shot wire that earlier releases of this app wrote — a time
+/// capsule exists to be opened later, so the old format stays readable.
 const capsule_magic = "TCAP";
 const capsule_version: u8 = 1;
 const capsule_header_bytes = capsule_magic.len + 1 + 32;
 
+/// Both envelope versions start with the same 15 bytes: magic, version,
+/// suite, flags, round (u64 LE).
+/// zig-libs request: timelock_envelope — no header parser for the v2 stream
+/// wire (`Envelope.parse` answers UnsupportedVersion); this app reads the
+/// shared prefix itself. Backlog in modules/timelock_envelope/SPEC.md.
+const envelope_prefix_bytes = tle.stream.stream_header_bytes;
+const envelope_round_off = 7;
+
 const failure_exit: u8 = 1;
 const locked_exit: u8 = 3;
 
-const max_plaintext_bytes = 16 * 1024 * 1024;
+/// Upper bound for the in-memory version-1 path only; version 2 streams.
+const max_v1_plaintext_bytes = 16 * 1024 * 1024;
+const io_buffer_bytes = 64 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     // DebugAllocator panicking on leak makes the app a leak detector for the
@@ -197,29 +212,44 @@ fn seal(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     const unlock_at = beacon.publishTime(&info, round);
     const now = beacon.wallNow();
 
-    const plaintext = std.Io.Dir.cwd().readFileAlloc(io, in_file, gpa, .limited(max_plaintext_bytes)) catch |err| {
+    var in_f = std.Io.Dir.cwd().openFile(io, in_file, .{}) catch |err| {
         std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ in_file, err });
         return failure_exit;
     };
-    defer gpa.free(plaintext);
+    defer in_f.close(io);
+    var in_buf: [io_buffer_bytes]u8 = undefined;
+    var in_r = in_f.readerStreaming(io, &in_buf);
+
+    var out = PartialFile.create(gpa, io, out_file) orelse return failure_exit;
+    defer out.deinit(gpa);
+    var out_buf: [io_buffer_bytes]u8 = undefined;
+    var out_w = out.file.writer(io, &out_buf);
 
     // `rnd` is half the raw material of the derived content key; zero it after
     // sealing, the same hygiene keygen/open apply to every other secret here.
     var rnd = Env.SealRandomness.generate(io);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&rnd));
-    const wire = Env.seal(gpa, plaintext, ek, p_pub, round, rnd) catch |err| {
-        std.debug.print("timecapsule: seal failed: {t}\n", .{err});
+    sealed: {
+        out_w.interface.writeAll(capsule_magic) catch break :sealed;
+        out_w.interface.writeByte(capsule_version) catch break :sealed;
+        out_w.interface.writeAll(&info.chain_hash) catch break :sealed;
+        Env.sealStream(gpa, &out_w.interface, &in_r.interface, ek, p_pub, round, rnd) catch |err| {
+            if (err == error.ReadFailed) {
+                std.debug.print("timecapsule: reading {s} failed: {t}\n", .{ in_file, in_r.err.? });
+                out.abort(io);
+                return failure_exit;
+            }
+            break :sealed;
+        };
+        out_w.interface.flush() catch break :sealed;
+        if (!out.commit(io)) return failure_exit;
+        break :sealed;
+    }
+    if (!out.committed) {
+        std.debug.print("timecapsule: writing {s} failed: {s}\n", .{ out_file, errName(out_w.err) });
+        out.abort(io);
         return failure_exit;
-    };
-    defer gpa.free(wire);
-
-    const capsule = try gpa.alloc(u8, capsule_header_bytes + wire.len);
-    defer gpa.free(capsule);
-    @memcpy(capsule[0..4], capsule_magic);
-    capsule[4] = capsule_version;
-    @memcpy(capsule[5..][0..32], &info.chain_hash);
-    @memcpy(capsule[capsule_header_bytes..], wire);
-    try writeWholeFile(io, out_file, capsule, false);
+    }
 
     var when_buf: [40]u8 = undefined;
     std.debug.print("timecapsule: sealed {s} -> {s} (round {d}, publishes {s}{s})\n", .{
@@ -280,8 +310,7 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     @memcpy(&dk, dk_bytes);
     defer std.crypto.secureZero(u8, &dk);
 
-    const cap = readCapsule(gpa, io, in_file) orelse return failure_exit;
-    defer gpa.free(cap.bytes);
+    const cap = readHead(gpa, io, in_file) orelse return failure_exit;
 
     const info = loadInfo(gpa, io, chain_info_path, base) orelse return failure_exit;
     if (!std.mem.eql(u8, &info.chain_hash, &cap.chain_hash)) {
@@ -366,14 +395,73 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     };
     const sig = round.signatureG1() catch unreachable; // verifyRound already required G1
 
-    const plaintext = Env.open(gpa, cap.bytes[capsule_header_bytes..], dk, sig) catch |err| {
+    if (cap.version == tle.envelope.version) return openV1(gpa, io, in_file, out_file, dk, sig);
+
+    var in_f = std.Io.Dir.cwd().openFile(io, in_file, .{}) catch |err| {
+        std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ in_file, err });
+        return failure_exit;
+    };
+    defer in_f.close(io);
+    var in_buf: [io_buffer_bytes]u8 = undefined;
+    var in_r = in_f.readerStreaming(io, &in_buf);
+
+    // The stream releases each chunk once its own tag verifies, but the
+    // payload is complete only when `openStream` returns cleanly — a
+    // truncated or tampered tail shows up only when it is reached. So the
+    // plaintext goes to `<out>.partial` and becomes `<out>` only on success;
+    // on any refusal there is no output file at all, never a partial one.
+    var out = PartialFile.create(gpa, io, out_file) orelse return failure_exit;
+    defer out.deinit(gpa);
+    var out_buf: [io_buffer_bytes]u8 = undefined;
+    var out_w = out.file.writer(io, &out_buf);
+
+    opened: {
+        in_r.interface.discardAll(capsule_header_bytes) catch break :opened;
+        Env.openStream(gpa, &out_w.interface, &in_r.interface, dk, sig) catch |err| switch (err) {
+            error.ReadFailed, error.WriteFailed => break :opened,
+            else => {
+                std.debug.print("timecapsule: open REFUSED: {t}\n", .{err});
+                out.abort(io);
+                return failure_exit;
+            },
+        };
+        out_w.interface.flush() catch break :opened;
+        if (!out.commit(io)) return failure_exit;
+    }
+    if (!out.committed) {
+        std.debug.print("timecapsule: I/O failed while opening {s}: read {s}, write {s}\n", .{
+            in_file, errName(in_r.err), errName(out_w.err),
+        });
+        out.abort(io);
+        return failure_exit;
+    }
+    std.debug.print("timecapsule: opened {s} -> {s} ({d} bytes)\n", .{ in_file, out_file, out_w.logicalPos() });
+    return 0;
+}
+
+/// The version-1 one-shot wire, as earlier releases of this app sealed it:
+/// read whole (bounded), opened in memory.
+fn openV1(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    in_file: []const u8,
+    out_file: []const u8,
+    dk: Kem.DecapsKey,
+    sig: drand.bls12_381.g1.Affine,
+) !u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, in_file, gpa, .limited(capsule_header_bytes + Env.overhead + max_v1_plaintext_bytes)) catch |err| {
+        std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ in_file, err });
+        return failure_exit;
+    };
+    defer gpa.free(bytes);
+    const plaintext = Env.open(gpa, bytes[capsule_header_bytes..], dk, sig) catch |err| {
         std.debug.print("timecapsule: open REFUSED: {t}\n", .{err});
         return failure_exit;
     };
     defer gpa.free(plaintext);
 
     try writeWholeFile(io, out_file, plaintext, false);
-    std.debug.print("timecapsule: opened {s} -> {s} ({d} bytes)\n", .{ in_file, out_file, plaintext.len });
+    std.debug.print("timecapsule: opened {s} -> {s} ({d} bytes, version-1 capsule)\n", .{ in_file, out_file, plaintext.len });
     return 0;
 }
 
@@ -395,8 +483,7 @@ fn capsuleInfo(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     }
     const in_file = in_path orelse return missing("--in");
 
-    const cap = readCapsule(gpa, io, in_file) orelse return failure_exit;
-    defer gpa.free(cap.bytes);
+    const cap = readHead(gpa, io, in_file) orelse return failure_exit;
 
     const info = loadInfo(gpa, io, chain_info_path, base) orelse return failure_exit;
     const unlock_at = beacon.publishTime(&info, cap.round);
@@ -422,43 +509,131 @@ fn capsuleInfo(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 // ---------------------------------------------------------------------------
 // helpers
 
-const Capsule = struct {
-    bytes: []u8, // whole file; envelope wire starts at capsule_header_bytes
+/// What `open`/`info` need before touching any secret: which chain, which
+/// round, which envelope version. Only the prefix is read for version 2; a
+/// version-1 capsule is small and is framing-checked whole, as before.
+const Head = struct {
     chain_hash: [32]u8,
+    version: u8,
     round: u64,
 };
 
-fn readCapsule(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?Capsule {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(capsule_header_bytes + Env.overhead + max_plaintext_bytes)) catch |err| {
+fn readHead(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?Head {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ path, err });
         return null;
     };
-    errdefer comptime unreachable;
-    if (bytes.len < capsule_header_bytes or !std.mem.eql(u8, bytes[0..4], capsule_magic) or bytes[4] != capsule_version) {
-        std.debug.print("timecapsule: {s} is not a version-{d} capsule\n", .{ path, capsule_version });
-        gpa.free(bytes);
-        return null;
-    }
-    const parsed = Env.parse(bytes[capsule_header_bytes..]) catch |err| {
-        std.debug.print("timecapsule: {s}: envelope framing rejected: {t}\n", .{ path, err });
-        gpa.free(bytes);
+    defer f.close(io);
+    const size = f.length(io) catch |err| {
+        std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ path, err });
         return null;
     };
+    var buf: [capsule_header_bytes + envelope_prefix_bytes]u8 = undefined;
+    var r = f.readerStreaming(io, &.{});
+    const got = r.interface.readSliceShort(&buf) catch |err| {
+        std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ path, err });
+        return null;
+    };
+    if (got < capsule_header_bytes or !std.mem.eql(u8, buf[0..4], capsule_magic) or buf[4] != capsule_version) {
+        std.debug.print("timecapsule: {s} is not a version-{d} capsule\n", .{ path, capsule_version });
+        return null;
+    }
+    const env = buf[capsule_header_bytes..got];
+    if (env.len < envelope_prefix_bytes or !std.mem.eql(u8, env[0..4], &tle.envelope.magic)) {
+        std.debug.print("timecapsule: {s}: envelope framing rejected: BadMagic or Truncated\n", .{path});
+        return null;
+    }
+    const version = env[4];
+    if (version == tle.envelope.version) {
+        // Version 1: full framing check, exactly as earlier releases did.
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(capsule_header_bytes + Env.overhead + max_v1_plaintext_bytes)) catch |err| {
+            std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ path, err });
+            return null;
+        };
+        defer gpa.free(bytes);
+        _ = Env.parse(bytes[capsule_header_bytes..]) catch |err| {
+            std.debug.print("timecapsule: {s}: envelope framing rejected: {t}\n", .{ path, err });
+            return null;
+        };
+    } else if (version == tle.stream.stream_version) {
+        if (env[5] != Env.suite_id) {
+            std.debug.print("timecapsule: {s}: envelope framing rejected: SuiteMismatch\n", .{path});
+            return null;
+        }
+        // The smallest valid stream (empty plaintext: one empty last chunk).
+        if (size < capsule_header_bytes + Env.streamSealedLen(0)) {
+            std.debug.print("timecapsule: {s}: envelope framing rejected: Truncated\n", .{path});
+            return null;
+        }
+    } else {
+        std.debug.print("timecapsule: {s}: envelope framing rejected: UnsupportedVersion ({d})\n", .{ path, version });
+        return null;
+    }
+    const round = std.mem.readInt(u64, env[envelope_round_off..][0..8], .little);
     // drand rounds are 1-based; round 0 is not a point on any chain, so a
     // capsule claiming it could never have been sealed legitimately and can
     // never be opened. Reject it here rather than downstream — the beacon
     // arithmetic is saturating and would not crash, but "round 0" is a
     // malformed capsule, and saying so is clearer than computing a fictional
     // unlock time for it.
-    if (parsed.round == 0) {
+    if (round == 0) {
         std.debug.print("timecapsule: {s}: capsule names round 0, which no drand chain has\n", .{path});
-        gpa.free(bytes);
         return null;
     }
-    var cap: Capsule = .{ .bytes = bytes, .chain_hash = undefined, .round = parsed.round };
-    @memcpy(&cap.chain_hash, bytes[5..][0..32]);
-    return cap;
+    var head: Head = .{ .chain_hash = undefined, .version = version, .round = round };
+    @memcpy(&head.chain_hash, buf[5..][0..32]);
+    return head;
 }
+
+/// An output file that appears under its real name only once it is
+/// complete: everything is written to `<path>.partial`, renamed over
+/// `<path>` by `commit`, removed by `abort`.
+const PartialFile = struct {
+    final: []const u8,
+    tmp: []u8,
+    file: std.Io.File,
+    open: bool = true,
+    committed: bool = false,
+
+    fn create(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?PartialFile {
+        const tmp = std.fmt.allocPrint(gpa, "{s}.partial", .{path}) catch {
+            std.debug.print("timecapsule: out of memory\n", .{});
+            return null;
+        };
+        const file = std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true }) catch |err| {
+            std.debug.print("timecapsule: cannot create {s}: {t}\n", .{ tmp, err });
+            gpa.free(tmp);
+            return null;
+        };
+        return .{ .final = path, .tmp = tmp, .file = file };
+    }
+
+    fn close(p: *PartialFile, io: std.Io) void {
+        if (p.open) p.file.close(io);
+        p.open = false;
+    }
+
+    fn commit(p: *PartialFile, io: std.Io) bool {
+        p.close(io);
+        std.Io.Dir.cwd().rename(p.tmp, std.Io.Dir.cwd(), p.final, io) catch |err| {
+            std.debug.print("timecapsule: cannot rename {s} -> {s}: {t}\n", .{ p.tmp, p.final, err });
+            p.abort(io);
+            return false;
+        };
+        p.committed = true;
+        return true;
+    }
+
+    fn abort(p: *PartialFile, io: std.Io) void {
+        p.close(io);
+        if (!p.committed) std.Io.Dir.cwd().deleteFile(io, p.tmp) catch {};
+    }
+
+    fn deinit(p: *PartialFile, gpa: std.mem.Allocator) void {
+        std.debug.assert(!p.open); // every path ends in commit or abort
+        gpa.free(p.tmp);
+    }
+};
 
 fn loadInfo(gpa: std.mem.Allocator, io: std.Io, file_path: ?[]const u8, base: []const u8) ?drand.ChainInfo {
     const doc = beacon.infoDoc(gpa, io, file_path, base) catch |err| {
@@ -526,6 +701,10 @@ fn writeWholeFile(io: std.Io, path: []const u8, bytes: []const u8, secret: bool)
     var fw = file.writer(io, &buf);
     try fw.interface.writeAll(bytes);
     try fw.interface.flush();
+}
+
+fn errName(err: anytype) []const u8 {
+    return if (err) |e| @errorName(e) else "ok";
 }
 
 fn nextValue(args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {

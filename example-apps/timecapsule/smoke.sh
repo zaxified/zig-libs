@@ -12,6 +12,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 BIN="$PWD/zig-out/bin/timecapsule"
+TESTDATA="$PWD/testdata"
 [ -x "$BIN" ] || { echo "smoke: $BIN is not built — run ./init.sh first" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
@@ -167,5 +168,48 @@ for hostile in ffffffffffffffff 0000000000000000; do
         *) fail "a capsule claiming round 0x$hostile made \`info\` exit $rc (134 = panic); output: $(cat hostile.out)" ;;
     esac
 done
+
+# ── 7. streaming: sizes around the 64 KiB chunk edge, byte-exact ───────────
+# seal/open stream the payload in 64 KiB chunks; the edges are the empty
+# payload (one empty last chunk), an exactly chunk-aligned one (the last chunk
+# is full, not empty) and one byte past it.
+: > empty.bin
+head -c 131072 /dev/urandom > aligned.bin
+head -c 200001 /dev/urandom > big.bin
+for f in empty aligned big; do
+    "$BIN" seal --to alice.pk --at round:1000 --in "$f.bin" --out "$f.tc" "${OFFLINE[@]}" >/dev/null 2>&1 \
+        || fail "seal of the $f payload"
+    "$BIN" open --key alice.sk --in "$f.tc" --out "$f.out" "${OFFLINE[@]}" --round-file round1000.json >/dev/null 2>&1 \
+        || fail "open of the $f payload"
+    cmp -s "$f.bin" "$f.out" || fail "the $f payload is not byte-identical after open"
+done
+[ ! -e big.tc.partial ] && [ ! -e big.out.partial ] || fail "a .partial file survived a successful seal/open"
+
+# ── 8. a truncated stream is refused, and leaves NO output behind ──────────
+# Cut big.tc exactly at a chunk boundary: drop the whole last chunk (3393
+# plaintext bytes + 16-byte tag), so every remaining chunk still verifies —
+# only the missing last-chunk flag tells. The chunks before it were already
+# released to the writer, so this is the case `.partial` exists for: no
+# `x`, no `x.partial`, and a pre-existing output file left untouched.
+cp big.tc cut.tc
+truncate -s -3409 cut.tc
+printf 'keep me\n' > keep.out
+if "$BIN" open --key alice.sk --in cut.tc --out keep.out "${OFFLINE[@]}" --round-file round1000.json >cut.log 2>&1; then
+    fail "a stream truncated at a chunk boundary was opened"
+fi
+grep -q "REFUSED" cut.log || fail "truncation was not a typed refusal: $(cat cut.log)"
+[ "$(cat keep.out)" = "keep me" ] || fail "a refused open overwrote the existing output file"
+[ ! -e keep.out.partial ] || fail "a refused open left keep.out.partial behind"
+
+# ── 9. a capsule sealed by the version-1 (one-shot) release still opens ─────
+# testdata/ holds a capsule, its recipient key and its plaintext, made by this
+# app before it moved to the streaming wire (2026-10-06): a time capsule is
+# meant to be opened later, by a newer build.
+cp "$TESTDATA/v1-round1000.sk" v1.sk
+"$BIN" info --in "$TESTDATA/v1-round1000.tc" "${OFFLINE[@]}" > v1info.out 2>&1 || fail "info on the version-1 capsule"
+grep -q "round:    1000" v1info.out || fail "info misread the version-1 capsule's round"
+"$BIN" open --key v1.sk --in "$TESTDATA/v1-round1000.tc" --out v1.out "${OFFLINE[@]}" --round-file round1000.json >/dev/null 2>&1 \
+    || fail "the version-1 capsule does not open"
+cmp -s "$TESTDATA/v1-round1000.txt" v1.out || fail "the version-1 plaintext differs"
 
 echo "smoke: OK"

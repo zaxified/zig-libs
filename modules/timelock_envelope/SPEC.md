@@ -299,7 +299,8 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 ## Backlog / deferred
 
 - ~~**Streaming / chunked AEAD framing**~~ — DONE 2026-10-06: wire version 2 (`stream.zig`), age STREAM via `tlock.age.PayloadStream` (not `aeadframe`: its counter nonce and replay window are a record layer, while age's STREAM with the last-chunk flag is what defeats truncation, and `tlock` already carries a Go-anchored copy).
-- **`timecapsule` example on version 2** — the example app still seals one-shot; switching it to `sealStream`/`openStream` lifts its size limit. Effort: small.
+- ~~**`timecapsule` example on version 2**~~ — DONE 2026-10-06: the app seals the stream wire and still opens version-1 capsules (a genuine v1 capsule is a smoke fixture).
+- **Header parser for the version-2 wire** — `Envelope.parse` answers `UnsupportedVersion` for a stream, so a caller that wants the round before opening (to fetch the beacon signature, or to show the unlock time) reads the shared 15-byte prefix by hand; `timecapsule` does (`readHead` in `example-apps/timecapsule/src/main.zig`). Ideal: `Envelope.parseStreamHeader(prefix: []const u8) OpenError!StreamHeader` (round, suite) over the first `stream_header_bytes`, or one `peekHeader` answering for both versions. Effort: small.
 - **age-format interop (stanza + armor)** *(survey 2026-09-30)* — lets `tle` decrypt the time-lock half and gives users armored files. Effort: medium; fits §2. Question: the SPEC says interop is "not a goal" — deliberate, so kept as a question, not a plan.
 - **Multiple recipients** *(survey 2026-09-30)* — age's core feature. Effort: medium; fits §2.
 

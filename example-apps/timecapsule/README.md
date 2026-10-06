@@ -56,6 +56,14 @@ until the signature appears, which turns the whole dead-man switch into one
 blocking command. `info --in msg.tc` shows the round and the unlock time without
 touching a key. `--at` also takes `@<unix>` and `round:<n>`.
 
+Files of any size work: `seal` and `open` stream the payload in 64 KiB
+authenticated chunks (`timelock_envelope`'s version-2 wire), so memory stays
+flat. Because a truncated or tampered tail is detected only when `open`
+reaches it, the plaintext is written to `<out>.partial` and renamed to
+`<out>` only once the whole capsule has verified — a refused `open` leaves
+no output file, and an existing one untouched. Capsules sealed by earlier
+releases (the version-1 one-shot wire, up to 16 MiB) still open.
+
 `init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
 
 ## Where the "nobody can open it early" comes from
@@ -116,8 +124,7 @@ consumer would use them.
 
 - No key servers, no recipient discovery — you hand `alice.pk` over however
   you hand files over.
-- No armored/ASCII output, no streaming: a capsule is a small binary file
-  (16 MiB plaintext cap).
+- No armored/ASCII output: a capsule is a binary file.
 - No beacon other than quicknet. The chain hash is pinned; a capsule records
   which chain it was sealed on and `open` refuses a mismatched `/info`.
 

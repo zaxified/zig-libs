@@ -92,6 +92,14 @@ directory.
   learned to stop on SIGTERM, because its `DebugAllocator` leak check only
   executes on a clean exit and nothing had ever given it one.
 
+- **`timecapsule` seals the streaming wire:** `seal`/`open` now use
+  `timelock_envelope`'s version-2 STREAM (`sealStream`/`openStream`), so a
+  file of any size seals and opens in flat memory; the 16 MiB cap is gone.
+  `open` writes to `<out>.partial` and renames only after the last chunk
+  verifies, so a refused open never leaves a partial plaintext behind.
+  Version-1 capsules from earlier releases still open — a genuine one is a
+  smoke-test fixture.
+
 - **New example app `timecapsule`:** encrypt a file openable only AFTER a
   chosen wall-clock time (drand/quicknet timelock via `tlock`) and only BY a
   chosen recipient (`hqc` post-quantum KEM), composed through
