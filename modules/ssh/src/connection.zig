@@ -715,7 +715,15 @@ pub fn serveSession(
     defer if (pending) |p| gpa.free(p.command);
 
     while (true) {
-        const pkt = try t.recvPacket(scratch);
+        const pkt = t.recvPacket(scratch) catch |e| {
+            // Our exit-status, EOF and CLOSE are out: the session is over
+            // from the client's side too, and a client may hang up instead
+            // of answering CLOSE — OpenSSH does when a re-exchange it
+            // started is still pending at that point (it queues its CLOSE
+            // behind the exchange and exits).
+            if (ch.sent_close and hungUp(e)) return;
+            return e;
+        };
         const mt: messages.MessageType = @enumFromInt(msgType(pkt));
         switch (mt) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
@@ -857,6 +865,12 @@ pub fn serveSession(
             else => return error.ProtocolError,
         }
     }
+}
+
+/// The peer went away (end of stream, reset, or a write into a closed
+/// socket).
+fn hungUp(e: ChannelError) bool {
+    return e == error.EndOfStream or e == error.ReadFailed or e == error.WriteFailed;
 }
 
 /// Every channel message starts with the recipient channel — ours. A message
@@ -2005,7 +2019,7 @@ test "live interop: real OpenSSH ssh client → our server — RSA user key (RFC
 /// so a crafted message stream can be fed straight into `serveSession`.
 fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(out);
-    var cipher: transport.CipherState = .none;
+    var cipher: transport.CipherState = .plaintext;
     for (payloads) |p| try transport.writePacket(&w, &cipher, .os, p);
     return w.buffered();
 }
@@ -2200,7 +2214,10 @@ test "corpus: the serveSession seeds deliver real channel messages, counts pinne
         reply_octets += sink.buffered().len;
     }
     try std.testing.expectEqual(@as(usize, 12), delivered);
-    try std.testing.expectEqual(@as(usize, 280), reply_octets);
+    // +16 since the transport answers an unrecognized message number with
+    // SSH_MSG_UNIMPLEMENTED (RFC 4253 §11.4) instead of the layer above
+    // failing on it.
+    try std.testing.expectEqual(@as(usize, 296), reply_octets);
 }
 
 test "serveSession REJECT: a peer that overruns the advertised window" {

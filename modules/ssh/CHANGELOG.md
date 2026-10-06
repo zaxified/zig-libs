@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Key re-exchange, strict KEX, SSH_MSG_UNIMPLEMENTED; BREAKING (low-level API only).**
+  - **Rekeying (RFC 4253 §9), both roles.** `Transport.recvPacket` runs a re-exchange the peer
+    starts (its KEXINIT mid-stream); `Transport.rekey()` starts one; `sendPacket`/`recvPacket`
+    start one by themselves past `Transport.rekey_limit_bytes` (default 1 GiB, OpenSSH's for
+    chacha20-poly1305) or `rekey_limit_packets` (2^28). Packets the peer sends before answering
+    our KEXINIT are queued and delivered in order (bounded, `max_pending_bytes`); a client
+    re-exchange requires the host key of the first one. The `max_packets_per_direction` stop now
+    counts packets per key (`under_key`) instead of capping the sequence number, which wraps.
+    Verified live against OpenSSH 10.2p1 in all four directions (`sshd`/`ssh` with
+    `RekeyLimit=32K` starting exchanges, our client/server starting them).
+  - **OpenSSH strict KEX** (`kex-strict-c/s-v00@openssh.com`, the Terrapin countermeasure,
+    CVE-2023-48795): advertised in the initial KEXINIT (`Transport.offer_strict_kex`, default on);
+    when the peer advertises it too (`Transport.strict_kex`), sequence numbers restart at 0 after
+    every NEWKEYS. The initial exchange already refused any message outside it.
+  - **SSH_MSG_UNIMPLEMENTED (RFC 4253 §11.4).** `recvPacket` answers a message number no layer
+    here implements with UNIMPLEMENTED naming its sequence number and reads on (it used to end
+    the connection), records a peer's UNIMPLEMENTED (`peer_unimplemented`), and absorbs
+    SSH_MSG_IGNORE/DEBUG — layers above no longer see transport-generic messages.
+    `Transport.sendUnimplemented(seq)` is there for a layer above.
+  - ⛔ **Fixed: a client that discarded a server's wrongly-guessed first KEX packet (RFC 4253 §7)
+    seeded its read cipher with sequence number 3 instead of 4** and failed the first encrypted
+    packet's MAC. The plaintext phase now counts sequence numbers (`NoneState`); the existing
+    guessing-server test stopped at NEWKEYS and now sends one encrypted packet.
+  - `serveSession` treats the client hanging up after our CLOSE as the end of the session
+    (OpenSSH does that when a re-exchange it started is still pending), not an error.
+  - BREAKING, low-level only: `CipherState.none` carries a `NoneState` (use `.plaintext`);
+    the KEX functions take a `CipherPair` (read + write state; `.single(&c)` for one) instead of
+    one `*CipherState`; `offeredKexAlgorithms` takes a `KexRound` and an
+    `[offered_kex_len]` buffer; `serverHandshake` requires `config.host_keys` to outlive the
+    transport. `Transport.deinit()` frees the re-exchange queue (a no-op otherwise).
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: rekeying is listed once in the Backlog, and the pre-survey list reads "not here yet" instead of "deliberately not here", since the survey files most of its items as tasks.
 - **2026-10-02** — ⛔ **Fixed: the MODP DH secret exponent leaked through timing.** `dhPowModPrime`
   (group14/group16 kex, client and server) used `std.crypto.ff`'s `powWithEncodedExponent`, whose

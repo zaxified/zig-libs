@@ -927,7 +927,7 @@ test "sessionId borrows from the transport (regression: not a dead stack copy)" 
 /// without a socket or a KEX.
 fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(out);
-    var cipher: transport.CipherState = .none;
+    var cipher: transport.CipherState = .plaintext;
     for (payloads) |p| try transport.writePacket(&w, &cipher, .os, p);
     return w.buffered();
 }
@@ -1144,7 +1144,11 @@ test "corpus: the serveUserauth seeds deliver real requests, and the counts are 
     }
     try std.testing.expectEqual(@as(usize, 7), delivered);
     try std.testing.expectEqual(@as(usize, 1), authenticated);
-    try std.testing.expectEqual(@as(usize, 232), reply_octets);
+    // 192 since the transport answers an unrecognized message number itself
+    // (RFC 4253 §11.4): the `0x00` seed now earns one SSH_MSG_UNIMPLEMENTED
+    // (16 octets framed) and the stream continues, where it used to end in
+    // a 56-octet DISCONNECT.
+    try std.testing.expectEqual(@as(usize, 192), reply_octets);
 }
 
 test "serveUserauth: an oversize peer string is a typed error, not a panic" {

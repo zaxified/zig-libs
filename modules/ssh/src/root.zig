@@ -112,6 +112,7 @@ test {
     _ = server;
     _ = userauth;
     _ = connection;
+    _ = @import("interop_test.zig");
 }
 
 test "meta.deps names the rsa module (rsa-sha2 host-key verification)" {

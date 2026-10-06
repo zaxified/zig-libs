@@ -521,7 +521,7 @@ pub const ServerConfig = struct {
 pub fn curve25519KexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
-    cipher: *transport.CipherState,
+    ciphers: transport.CipherPair,
     entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
@@ -532,7 +532,7 @@ pub fn curve25519KexServer(
 ) transport.TransportError!transport.KexResult {
     // SSH_MSG_KEX_ECDH_INIT: byte || string Q_C.
     var buf: [16384]u8 = undefined;
-    const pkt = try transport.readPacket(r, cipher, &buf);
+    const pkt = try transport.readKexPacket(r, ciphers, &buf);
     if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const q_c = try cur.string();
@@ -582,7 +582,7 @@ pub fn curve25519KexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &q_s);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, entropy, ow.buffered());
+    try transport.writePacket(w, ciphers.w, entropy, ow.buffered());
 
     // Legacy path: `k_enc_len == 0` makes `buildCipher` mpint-encode the raw
     // shared secret (byte-identical to the pre-widening result).
@@ -610,7 +610,7 @@ fn isCurve25519Kex(name: []const u8) bool {
 pub fn dhGroupKexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
-    cipher: *transport.CipherState,
+    ciphers: transport.CipherPair,
     entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
@@ -625,7 +625,7 @@ pub fn dhGroupKexServer(
 
     // SSH_MSG_KEXDH_INIT: byte || mpint e.
     var buf: [16384]u8 = undefined;
-    const pkt = try transport.readPacket(r, cipher, &buf);
+    const pkt = try transport.readKexPacket(r, ciphers, &buf);
     if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const e = stripLeadingZeros(try cur.string());
@@ -691,7 +691,7 @@ pub fn dhGroupKexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeMpint(&ow, f);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, entropy, ow.buffered());
+    try transport.writePacket(w, ciphers.w, entropy, ow.buffered());
 
     return res;
 }
@@ -706,7 +706,7 @@ pub fn dhGroupKexServer(
 pub fn mlkem768x25519KexServer(
     r: *std.Io.Reader,
     w: *std.Io.Writer,
-    cipher: *transport.CipherState,
+    ciphers: transport.CipherPair,
     entropy: transport.Entropy,
     client_kexinit_payload: []const u8,
     server_kexinit_payload: []const u8,
@@ -717,7 +717,7 @@ pub fn mlkem768x25519KexServer(
 ) transport.TransportError!transport.KexResult {
     // SSH_MSG_KEX_ECDH_INIT: byte || string C.
     var buf: [16384]u8 = undefined;
-    const pkt = try transport.readPacket(r, cipher, &buf);
+    const pkt = try transport.readKexPacket(r, ciphers, &buf);
     if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
     const cinit = try cur.string();
@@ -779,105 +779,9 @@ pub fn mlkem768x25519KexServer(
     try messages.writeString(&ow, k_s);
     try messages.writeString(&ow, &sreply);
     try messages.writeString(&ow, sig);
-    try transport.writePacket(w, cipher, entropy, ow.buffered());
+    try transport.writePacket(w, ciphers.w, entropy, ow.buffered());
 
     return res;
-}
-
-// ── key install (mirrors transport.zig's private deriveKeyBytes/buildCipher) ─
-
-/// RFC 4253 §7.2 KDF for one key letter, parameterized on the KEX method's
-/// hash `H` (SHA-256 / SHA-512). Mirrors transport.zig's `deriveKeyBytesH`.
-fn deriveKeyBytesH(comptime H: type, out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id: []const u8) void {
-    const dlen = H.digest_length;
-    var first: [64]u8 = undefined;
-    defer std.crypto.secureZero(u8, &first);
-    var s = H.init(.{});
-    s.update(k_enc);
-    s.update(h);
-    s.update(&[_]u8{letter});
-    s.update(session_id);
-    s.final(first[0..dlen]);
-    var written: usize = @min(out.len, dlen);
-    @memcpy(out[0..written], first[0..written]);
-    while (written < out.len) {
-        var s2 = H.init(.{});
-        s2.update(k_enc);
-        s2.update(h);
-        s2.update(out[0..written]);
-        var block: [64]u8 = undefined;
-        defer std.crypto.secureZero(u8, &block);
-        s2.final(block[0..dlen]);
-        const take = @min(dlen, out.len - written);
-        @memcpy(out[written .. written + take], block[0..take]);
-        written += take;
-    }
-}
-
-/// Dispatch the KDF on the KEX method's hash width. Mirrors transport.zig's
-/// private `deriveKey`.
-fn deriveKey(out: []u8, letter: u8, k_enc: []const u8, h: []const u8, session_id: []const u8, hash_len: u8) void {
-    if (hash_len == 64) {
-        deriveKeyBytesH(Sha512, out, letter, k_enc, h, session_id);
-    } else {
-        deriveKeyBytesH(Sha256, out, letter, k_enc, h, session_id);
-    }
-}
-
-const Direction = enum { c2s, s2c };
-
-/// Build the installed `CipherState` for one direction from a negotiated
-/// cipher name and the KEX result. Mirrors transport.zig's private
-/// `buildCipher`; the direction letters (A/C/E = client-to-server, B/D/F =
-/// server-to-client) are fixed by RFC 4253 §7.2 regardless of which role
-/// calls this — the *server* assigns `.s2c` to its WRITE cipher and `.c2s`
-/// to its READ cipher (the exact swap of the client's assignment).
-fn buildCipher(name: []const u8, dir: Direction, kr: transport.KexResult, sid: []const u8, seq: u32) transport.TransportError!transport.CipherState {
-    var kmbuf: [4 + 33]u8 = undefined;
-    defer std.crypto.secureZero(u8, &kmbuf);
-    const k_enc = if (kr.k_enc_len > 0) kr.k_enc[0..kr.k_enc_len] else encodeMpint(&kmbuf, &kr.shared_secret);
-    const h = kr.hash();
-    const hl = kr.hash_len;
-    if (std.mem.eql(u8, name, "chacha20-poly1305@openssh.com")) {
-        var km: [64]u8 = undefined;
-        defer std.crypto.secureZero(u8, &km);
-        deriveKey(&km, if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
-        return .{ .chacha20_poly1305 = .{
-            .key_main = km[0..32].*,
-            .key_header = km[32..64].*,
-            .sequence_number = seq,
-        } };
-    } else if (std.mem.eql(u8, name, "aes256-ctr")) {
-        var iv: [16]u8 = undefined;
-        var ek: [32]u8 = undefined;
-        var mk: [32]u8 = undefined;
-        deriveKey(&iv, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
-        deriveKey(&ek, if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
-        deriveKey(&mk, if (dir == .c2s) 'E' else 'F', k_enc, h, sid, hl);
-        return .{ .aes256_ctr_hmac_sha256 = .{
-            .enc_key = ek,
-            .enc_iv = iv,
-            .mac_key = mk,
-            .sequence_number = seq,
-        } };
-    } else if (std.mem.eql(u8, name, "aes256-gcm@openssh.com") or
-        std.mem.eql(u8, name, "aes128-gcm@openssh.com"))
-    {
-        var iv12: [12]u8 = undefined;
-        deriveKey(&iv12, if (dir == .c2s) 'A' else 'B', k_enc, h, sid, hl);
-        var key: [32]u8 = undefined;
-        defer std.crypto.secureZero(u8, &key);
-        const is256 = std.mem.eql(u8, name, "aes256-gcm@openssh.com");
-        deriveKey(key[0..if (is256) @as(usize, 32) else 16], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
-        return .{ .aes_gcm = .{
-            .key = key,
-            .key_bits = if (is256) .aes256 else .aes128,
-            .fixed_iv = iv12[0..4].*,
-            .invocation_counter = std.mem.readInt(u64, iv12[4..12], .big),
-            .sequence_number = seq,
-        } };
-    }
-    return error.UnsupportedAlgorithm;
 }
 
 /// First name on `preferred` that `available` also lists (RFC 4253 §7.1 —
@@ -914,13 +818,17 @@ fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]co
 /// connection (same struct the client side uses — NOT duplicated here).
 ///
 /// Sequence: version exchange (reused `transport.exchangeVersions` —
-/// role-symmetric) → KEXINIT exchange (our `server_host_key_algorithms`
-/// list is built from `config.host_keys`, plus RFC 8308's `ext-info-s`) →
-/// client-preference negotiation → `curve25519KexServer` → NEWKEYS both ways
-/// → cipher install with the server direction mapping (write = s2c, read =
-/// c2s) → RFC 8308 SSH_MSG_EXT_INFO with `server-sig-algs`, if the client
-/// advertised `ext-info-c` → respond to the client's
-/// SSH_MSG_SERVICE_REQUEST `"ssh-userauth"` with SSH_MSG_SERVICE_ACCEPT.
+/// role-symmetric) → `serverKexRound` (KEXINIT exchange with our host-key
+/// list built from `config.host_keys`, plus RFC 8308's `ext-info-s` and
+/// strict KEX's `kex-strict-s-v00@openssh.com` → client-preference
+/// negotiation → responder KEX → NEWKEYS both ways → cipher install with the
+/// server direction mapping, write = s2c, read = c2s) → RFC 8308
+/// SSH_MSG_EXT_INFO with `server-sig-algs`, if the client advertised
+/// `ext-info-c` → respond to the client's SSH_MSG_SERVICE_REQUEST
+/// `"ssh-userauth"` with SSH_MSG_SERVICE_ACCEPT.
+///
+/// ⚠ `config.host_keys` must outlive `t`: a key re-exchange (RFC 4253 §9),
+/// which the client may start at any time, signs with them again.
 ///
 /// After this returns, `t` is an encrypted transport ready for userauth —
 /// out of scope in THIS FILE, but implemented server-side by
@@ -928,69 +836,117 @@ fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]co
 /// module doc comment).
 pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: ServerConfig) transport.TransportError!void {
     if (config.host_keys.len == 0) return error.UnsupportedAlgorithm;
+    t.role = .server;
+    t.gpa = gpa;
+    t.server_host_keys = config.host_keys;
 
     // 1. Version exchange (role-symmetric; we speak first, which is the
     // conventional server behavior anyway).
     const local_id = transport.IdentificationString{ .softwareversion = config.server_software };
     const v_c = try transport.exchangeVersions(gpa, t.reader, t.writer, local_id);
     defer gpa.free(v_c);
-    var vsbuf: [128]u8 = undefined;
-    const v_s = std.fmt.bufPrint(&vsbuf, "SSH-2.0-{s}", .{config.server_software}) catch
-        return error.VersionExchangeFailed;
+    try t.v_c.set(v_c);
+    var vsbuf: [255]u8 = undefined;
+    try t.v_s.set(std.fmt.bufPrint(&vsbuf, "SSH-2.0-{s}", .{config.server_software}) catch
+        return error.VersionExchangeFailed);
 
+    // 2-6. The initial key exchange.
+    const outcome = try serverKexRound(t, gpa, .initial, null, null);
+    t.finishKex();
+
+    // 6b. RFC 8308 §2.4, the server's FIRST opportunity: SSH_MSG_EXT_INFO
+    // "following the server's first SSH_MSG_NEWKEYS message", i.e. the first
+    // packet we encrypt. It has to be here and not later: `server-sig-algs`
+    // is what tells a client which signature algorithm to use for a key whose
+    // blob type does not name one, and an OpenSSH client decides that before
+    // it sends its first SSH_MSG_USERAUTH_REQUEST — without this it logs
+    // "send_pubkey_test: no mutual signature algorithm" and never offers an
+    // RSA key at all. The RFC's second opportunity (immediately before
+    // SSH_MSG_USERAUTH_SUCCESS) exists for extensions that only make sense
+    // once the user is known; `server-sig-algs` is not one, so we use the
+    // first and only the first.
+    if (outcome.client_wants_ext_info and config.server_sig_algs.len > 0) {
+        var ebuf: [1024]u8 = undefined;
+        var ew: std.Io.Writer = .fixed(&ebuf);
+        try transport.encodeServerSigAlgs(&ew, config.server_sig_algs);
+        try t.sendPacket(ew.buffered());
+    }
+
+    // 7. SSH_MSG_SERVICE_REQUEST "ssh-userauth" → SSH_MSG_SERVICE_ACCEPT
+    // (responder mirror of `transport.Transport.requestService`).
     const scratch = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(scratch);
+    while (true) {
+        const pkt = try t.recvPacket(scratch);
+        switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
+            // The client's own RFC 8308 §2.4 opportunity — OpenSSH always
+            // takes it once we advertise `ext-info-s`, sending
+            // `publickey-hostbound@openssh.com` and `ping@openssh.com`. This
+            // module implements no client-sent extension, and §2.5 says to
+            // ignore what we do not recognize; what it must NOT do is treat
+            // the message as a protocol error, which is what having promised
+            // `ext-info-s` and then refusing the reply would be.
+            .SSH_MSG_EXT_INFO => continue,
+            .SSH_MSG_SERVICE_REQUEST => {
+                var cur = WireCursor{ .b = pkt.payload[1..] };
+                const service = try cur.string();
+                if (!std.mem.eql(u8, service, "ssh-userauth")) return error.ProtocolError;
+                var abuf: [64]u8 = undefined;
+                var aw: std.Io.Writer = .fixed(&abuf);
+                try aw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_SERVICE_ACCEPT));
+                try messages.writeString(&aw, service);
+                try t.sendPacket(aw.buffered());
+                return;
+            },
+            else => return error.ProtocolError,
+        }
+    }
+}
 
-    // 2. Our KEXINIT: host-key algorithms restricted to keys we hold.
-    const hk_names = try gpa.alloc([]const u8, config.host_keys.len);
-    defer gpa.free(hk_names);
-    for (config.host_keys, hk_names) |hk, *name| name.* = hk.algorithmName();
+/// What the initial exchange learned that the handshake still needs.
+pub const ServerKexOutcome = struct {
+    /// The client advertised RFC 8308 `ext-info-c`.
+    client_wants_ext_info: bool,
+};
 
-    var cookie: [16]u8 = undefined;
-    t.entropy.fill(&cookie);
-    const empty: []const []const u8 = &.{};
-    // RFC 8308 §2.1: append `ext-info-s`, the server's half of the indicator
-    // pair. §2.2 makes this a promise to process a client's SSH_MSG_EXT_INFO,
-    // which the post-NEWKEYS loop below honours by consuming one.
-    var offered_kex: [transport.kex_algorithms.len + 1][]const u8 = undefined;
-    const local_kex = transport.KexInit{
-        .cookie = cookie,
-        .kex_algorithms = transport.offeredKexAlgorithms(&offered_kex, .server),
-        .server_host_key_algorithms = hk_names,
-        .encryption_algorithms_client_to_server = &transport.encryption_algorithms,
-        .encryption_algorithms_server_to_client = &transport.encryption_algorithms,
-        .mac_algorithms_client_to_server = &transport.mac_algorithms,
-        .mac_algorithms_server_to_client = &transport.mac_algorithms,
-        .compression_algorithms_client_to_server = &transport.compression_algorithms,
-        .compression_algorithms_server_to_client = &transport.compression_algorithms,
-        .languages_client_to_server = empty,
-        .languages_server_to_client = empty,
-        .first_kex_packet_follows = false,
-        .reserved = 0,
+/// One complete responder key exchange over `t` with `t.server_host_keys`:
+/// the initial one, or a re-exchange (`peer_kexinit` already received;
+/// `ours` set when we sent our KEXINIT first, i.e. `Transport.rekey`).
+/// Called by `serverHandshake` and by `transport.Transport` for a rekey.
+pub fn serverKexRound(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    round: transport.KexRound,
+    peer_kexinit: ?[]const u8,
+    ours: ?[]const u8,
+) transport.TransportError!ServerKexOutcome {
+    if (t.server_host_keys.len == 0) return error.UnsupportedAlgorithm;
+    const scratch = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(scratch);
+    const ciphers = transport.CipherPair{ .r = &t.read_cipher, .w = &t.write_cipher, .skip_generic = round == .rekey };
+
+    // 2. Our KEXINIT (I_S): host-key algorithms restricted to keys we hold.
+    var i_s_owned: ?[]u8 = null;
+    defer if (i_s_owned) |b| gpa.free(b);
+    const i_s = ours orelse blk: {
+        const b = try t.buildKexInit(gpa, round);
+        i_s_owned = b;
+        try transport.writePacket(t.writer, ciphers.w, t.entropy, b);
+        break :blk b;
     };
-    var isbuf: [2048]u8 = undefined;
-    var isw: std.Io.Writer = .fixed(&isbuf);
-    try local_kex.encode(&isw);
-    const i_s = try gpa.dupe(u8, isw.buffered());
-    defer gpa.free(i_s);
 
-    var none_r: transport.CipherState = .none;
-    var none_w: transport.CipherState = .none;
-    // Explicit plaintext-phase packet counts (the `.none` cipher state does
-    // not track sequence numbers) — these seed the installed ciphers below.
-    var sent: u32 = 0;
-    var rcvd: u32 = 0;
+    // The client's KEXINIT (I_C).
+    var i_c_owned: ?[]u8 = null;
+    defer if (i_c_owned) |b| gpa.free(b);
+    const i_c = peer_kexinit orelse blk: {
+        const cpkt = try transport.readKexPacket(t.reader, ciphers, scratch);
+        if (msgType(cpkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXINIT)) return error.ProtocolError;
+        const b = try gpa.dupe(u8, cpkt.payload);
+        i_c_owned = b;
+        break :blk b;
+    };
 
-    try transport.writePacket(t.writer, &none_w, t.entropy, i_s); // our KEXINIT
-    sent += 1;
-
-    const cpkt = try transport.readPacket(t.reader, &none_r, scratch); // client KEXINIT
-    rcvd += 1;
-    if (msgType(cpkt) != @intFromEnum(messages.MessageType.SSH_MSG_KEXINIT)) return error.ProtocolError;
-    const i_c = try gpa.dupe(u8, cpkt.payload);
-    defer gpa.free(i_c);
-
-    var creader: std.Io.Reader = .fixed(cpkt.payload[1..]);
+    var creader: std.Io.Reader = .fixed(i_c[1..]);
     var client_kex = try transport.KexInit.decode(gpa, &creader);
     defer client_kex.deinit(gpa);
 
@@ -1000,13 +956,14 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     // message 7 is an unknown transport message it would answer
     // SSH_MSG_UNIMPLEMENTED.
     const client_wants_ext_info = transport.offersExtInfo(client_kex.kex_algorithms, transport.ext_info_c);
+    if (round == .initial) t.strict_kex = t.offer_strict_kex and transport.offersExtInfo(client_kex.kex_algorithms, transport.kex_strict_c);
 
     // 3. Negotiate (client-preference order per RFC 4253 §7.1).
     const kex_name = pickFirst(client_kex.kex_algorithms, &transport.kex_algorithms) orelse
         return error.UnsupportedAlgorithm;
     var host_key: ?HostKey = null;
     outer: for (client_kex.server_host_key_algorithms) |name| {
-        for (config.host_keys) |hk| {
+        for (t.server_host_keys) |hk| {
             if (std.mem.eql(u8, name, hk.algorithmName())) {
                 host_key = hk;
                 break :outer;
@@ -1038,12 +995,11 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     const comp_s2c = pickFirst(client_kex.compression_algorithms_server_to_client, &transport.compression_algorithms) orelse
         return error.UnsupportedAlgorithm;
 
-    // Record what got negotiated (RFC 4253 §7.1) on `t` for the connection's
-    // lifetime — see `transport.NegotiatedAlgorithms` for why every field
-    // here (`kex_name`/`hk.algorithmName()`/`cipher_c2s`/`cipher_s2c` all
-    // resolve to a `pickFirst`-returned-from-`available` or static-literal
-    // string) is safe to keep past this function returning and freeing
-    // `client_kex`.
+    // Record what got negotiated (RFC 4253 §7.1) on `t` — see
+    // `transport.NegotiatedAlgorithms` for why every field here (`kex_name`/
+    // `hk.algorithmName()`/`cipher_c2s`/`cipher_s2c` all resolve to a
+    // `pickFirst`-returned-from-`available` or static-literal string) is safe
+    // to keep past this function returning and freeing `client_kex`.
     t.negotiated = .{
         .kex = kex_name,
         .host_key = hk.algorithmName(),
@@ -1056,94 +1012,45 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     };
 
     // RFC 4253 §7: a wrongly-guessed first KEX packet must be discarded
-    // (OpenSSH never guesses; this is spec completeness).
+    // (OpenSSH never guesses; this is spec completeness). It still advances
+    // the read sequence number.
     if (client_kex.first_kex_packet_follows) {
         const guess_ok = client_kex.kex_algorithms.len > 0 and
             std.mem.eql(u8, client_kex.kex_algorithms[0], kex_name) and
             client_kex.server_host_key_algorithms.len > 0 and
             std.mem.eql(u8, client_kex.server_host_key_algorithms[0], hk.algorithmName());
         if (!guess_ok) {
-            _ = try transport.readPacket(t.reader, &none_r, scratch);
-            rcvd += 1;
+            _ = try transport.readKexPacket(t.reader, ciphers, scratch);
         }
     }
 
     // 4. Responder-side KEX (reads KEX_ECDH_INIT, writes KEX_ECDH_REPLY).
     // `kex_name` only ever comes from `transport.kex_algorithms`; every one of
     // those dispatches to a working responder implementation here.
+    var v_c_copy = t.v_c;
+    var v_s_copy = t.v_s;
+    const v_c = v_c_copy.slice();
+    const v_s = v_s_copy.slice();
     var kex_result = if (transport.isMlkemKex(kex_name))
-        try mlkem768x25519KexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
+        try mlkem768x25519KexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else if (isCurve25519Kex(kex_name))
-        try curve25519KexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
+        try curve25519KexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa)
     else
-        try dhGroupKexServer(t.reader, t.writer, &none_w, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
+        try dhGroupKexServer(t.reader, t.writer, ciphers, t.entropy, i_c, i_s, v_c, v_s, hk, gpa, kex_name);
     defer kex_result.zeroize();
-    rcvd += 1;
-    sent += 1;
 
     if (t.session_id == null) t.session_id = transport.SessionId.from(kex_result.hash());
-    const sid = t.session_id.?.slice();
 
-    // 5. NEWKEYS both ways (still plaintext).
-    try transport.writePacket(t.writer, &none_w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
-    sent += 1;
-    const nk = try transport.readPacket(t.reader, &none_r, scratch);
-    rcvd += 1;
-    if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
-
-    // 6. Install ciphers — SERVER direction mapping: we ENCRYPT with the
+    // 5-6. NEWKEYS both ways; SERVER direction mapping: we ENCRYPT with the
     // server-to-client keys ('B'/'D'/'F') and DECRYPT with the
-    // client-to-server keys ('A'/'C'/'E'), the exact swap of
-    // `clientHandshake`'s assignment.
-    t.write_cipher = try buildCipher(cipher_s2c, .s2c, kex_result, sid, sent);
-    t.read_cipher = try buildCipher(cipher_c2s, .c2s, kex_result, sid, rcvd);
+    // client-to-server keys ('A'/'C'/'E'), the exact swap of the client's.
+    try transport.writePacket(t.writer, ciphers.w, t.entropy, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    try t.installCipher(.write, cipher_s2c, .s2c, kex_result);
+    const nk = try transport.readKexPacket(t.reader, ciphers, scratch);
+    if (msgType(nk) != @intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)) return error.ProtocolError;
+    try t.installCipher(.read, cipher_c2s, .c2s, kex_result);
 
-    // 6b. RFC 8308 §2.4, the server's FIRST opportunity: SSH_MSG_EXT_INFO
-    // "following the server's first SSH_MSG_NEWKEYS message", i.e. the first
-    // packet we encrypt. It has to be here and not later: `server-sig-algs`
-    // is what tells a client which signature algorithm to use for a key whose
-    // blob type does not name one, and an OpenSSH client decides that before
-    // it sends its first SSH_MSG_USERAUTH_REQUEST — without this it logs
-    // "send_pubkey_test: no mutual signature algorithm" and never offers an
-    // RSA key at all. The RFC's second opportunity (immediately before
-    // SSH_MSG_USERAUTH_SUCCESS) exists for extensions that only make sense
-    // once the user is known; `server-sig-algs` is not one, so we use the
-    // first and only the first.
-    if (client_wants_ext_info and config.server_sig_algs.len > 0) {
-        var ebuf: [1024]u8 = undefined;
-        var ew: std.Io.Writer = .fixed(&ebuf);
-        try transport.encodeServerSigAlgs(&ew, config.server_sig_algs);
-        try t.sendPacket(ew.buffered());
-    }
-
-    // 7. SSH_MSG_SERVICE_REQUEST "ssh-userauth" → SSH_MSG_SERVICE_ACCEPT
-    // (responder mirror of `transport.Transport.requestService`).
-    while (true) {
-        const pkt = try t.recvPacket(scratch);
-        switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
-            .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
-            // The client's own RFC 8308 §2.4 opportunity — OpenSSH always
-            // takes it once we advertise `ext-info-s`, sending
-            // `publickey-hostbound@openssh.com` and `ping@openssh.com`. This
-            // module implements no client-sent extension, and §2.5 says to
-            // ignore what we do not recognize; what it must NOT do is treat
-            // the message as a protocol error, which is what having promised
-            // `ext-info-s` and then refusing the reply would be.
-            .SSH_MSG_EXT_INFO => continue,
-            .SSH_MSG_SERVICE_REQUEST => {
-                var cur = WireCursor{ .b = pkt.payload[1..] };
-                const service = try cur.string();
-                if (!std.mem.eql(u8, service, "ssh-userauth")) return error.ProtocolError;
-                var abuf: [64]u8 = undefined;
-                var aw: std.Io.Writer = .fixed(&abuf);
-                try aw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_SERVICE_ACCEPT));
-                try messages.writeString(&aw, service);
-                try t.sendPacket(aw.buffered());
-                return;
-            },
-            else => return error.ProtocolError,
-        }
-    }
+    return .{ .client_wants_ext_info = client_wants_ext_info };
 }
 
 /// Convenience: `transport.Transport.init` followed by `serverHandshake` —
@@ -1644,16 +1551,19 @@ const SelfTestClient = struct {
         var pbuf: [8192]u8 = undefined;
         try t.requestService("ssh-userauth", &pbuf);
 
-        // Encrypted c2s probe: SSH_MSG_IGNORE with a marker payload.
+        // Encrypted c2s probe: a marker no layer acts on. Not SSH_MSG_IGNORE —
+        // `recvPacket` absorbs transport-generic messages — but a
+        // want_reply=false SSH_MSG_GLOBAL_REQUEST, which reaches the caller.
         var mb: [64]u8 = undefined;
         var mw: std.Io.Writer = .fixed(&mb);
-        try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE));
+        try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
         try messages.writeString(&mw, "probe-c2s");
+        try mw.writeByte(0);
         try t.sendPacket(mw.buffered());
 
         // Encrypted s2c probe back from the server.
         const pkt = try t.recvPacket(&pbuf);
-        if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_IGNORE)) return error.ProtocolError;
+        if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
         if (std.mem.indexOf(u8, pkt.payload, "probe-s2c") == null) return error.ProtocolError;
 
         self.session_id = t.session_id;
@@ -1685,17 +1595,18 @@ fn selfConsistency(host_key: HostKey) !void {
     const keys = [_]HostKey{host_key};
     var t = try accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = &keys });
 
-    // The client's encrypted IGNORE probe must decrypt on our side...
+    // The client's encrypted probe must decrypt on our side...
     var pbuf: [8192]u8 = undefined;
     const pkt = try t.recvPacket(&pbuf);
-    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE), msgType(pkt));
+    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST), msgType(pkt));
     try std.testing.expect(std.mem.indexOf(u8, pkt.payload, "probe-c2s") != null);
 
     // ...and ours on the client's.
     var mb: [64]u8 = undefined;
     var mw: std.Io.Writer = .fixed(&mb);
-    try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE));
+    try mw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
     try messages.writeString(&mw, "probe-s2c");
+    try mw.writeByte(0);
     try t.sendPacket(mw.buffered());
 
     th.join();
@@ -1774,8 +1685,8 @@ const DirectKexClient = struct {
         var wbuf: [32 * 1024]u8 = undefined;
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
-        var none: transport.CipherState = .none;
-        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
+        var none: transport.CipherState = .plaintext;
+        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());
@@ -1807,8 +1718,8 @@ fn directDhConsistency(kex_name: []const u8) !void {
     var sw = stream.writer(io, &wbuf);
 
     const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
-    var none: transport.CipherState = .none;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var none: transport.CipherState = .plaintext;
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1868,8 +1779,8 @@ test "dhGroupKex (client): rejects a genuine rsa-sha2-256 host-key signature whe
     // "rsa-sha2-512".
     const hk = try HostKey.fromOpenSSH(fixture_rsa_key, null);
     try std.testing.expectEqualStrings("rsa-sha2-256", hk.algorithmName());
-    var none: transport.CipherState = .none;
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none, .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
+    var none: transport.CipherState = .plaintext;
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .single(&none), .os, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, hk, gpa, kex_name);
     defer res.zeroize();
 
     th.join();
@@ -1886,7 +1797,7 @@ fn fakeKexdhInit(e_mag: []const u8, out: []u8) ![]const u8 {
     try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_INIT));
     try messages.writeMpint(&pw, e_mag);
 
-    var none: transport.CipherState = .none;
+    var none: transport.CipherState = .plaintext;
     var w: std.Io.Writer = .fixed(out);
     try transport.writePacket(&w, &none, .os, pw.buffered());
     return w.buffered();
@@ -1905,11 +1816,11 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
         var r: std.Io.Reader = .fixed(init_pkt);
         var out_scratch: [8192]u8 = undefined;
         var w: std.Io.Writer = .fixed(&out_scratch);
-        var none: transport.CipherState = .none;
+        var none: transport.CipherState = .plaintext;
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKexServer(&r, &w, &none, .os, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
+            dhGroupKexServer(&r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
         );
     }
 }
@@ -1919,6 +1830,7 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
 const GuessingClient = struct {
     port: u16,
     err: ?anyerror = null,
+    got_probe: bool = false,
     negotiated_kex: [64]u8 = undefined,
     negotiated_kex_len: usize = 0,
 
@@ -1950,11 +1862,17 @@ const GuessingClient = struct {
         var wbuf: [32 * 1024]u8 = undefined;
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
-        const t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
         if (t.negotiated) |neg| {
             self.negotiated_kex_len = @min(neg.kex.len, self.negotiated_kex.len);
             @memcpy(self.negotiated_kex[0..self.negotiated_kex_len], neg.kex[0..self.negotiated_kex_len]);
         }
+        // The first encrypted packet: decrypts only if the read sequence
+        // number counted the discarded guess.
+        var pbuf: [1024]u8 = undefined;
+        const pkt = try t.recvPacket(&pbuf);
+        if (msgType(pkt) != @intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
+        self.got_probe = std.mem.indexOf(u8, pkt.payload, "after-guess") != null;
     }
 };
 
@@ -2005,8 +1923,8 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     const v_s = "SSH-2.0-zig_ssh_guess_test_srv";
 
     var scratch: [64 * 1024]u8 = undefined;
-    var none_r: transport.CipherState = .none;
-    var none_w: transport.CipherState = .none;
+    var none_r: transport.CipherState = .plaintext;
+    var none_w: transport.CipherState = .plaintext;
 
     // 2. Read the client's real KEXINIT.
     const cpkt = try transport.readPacket(&sr.interface, &none_r, &scratch);
@@ -2054,13 +1972,31 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     // actually negotiates. Proves the discard ate exactly one packet, not
     // zero and not two.
     const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
-    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none_w, .os, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, .{ .r = &none_r, .w = &none_w }, .os, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
     defer res.zeroize();
 
     // 6. NEWKEYS both ways.
     try transport.writePacket(&sw.interface, &none_w, .os, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
     const nk = try transport.readPacket(&sr.interface, &none_r, &scratch);
     try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS), msgType(nk));
+
+    // 7. One encrypted packet. This server sent FOUR plaintext packets
+    // (KEXINIT, the guess, KEXDH_REPLY, NEWKEYS) and no strict-KEX
+    // indicator, so its first encrypted packet carries sequence number 4
+    // (RFC 4253 §6.4: every packet counts, a discarded one too). The client
+    // used to seed its read cipher with a fixed 3 and failed this packet's
+    // MAC; nothing before this step encrypted anything, so it went unseen.
+    var st = transport.Transport.init(&sr.interface, &sw.interface);
+    st.write_cipher = none_w;
+    try std.testing.expectEqual(@as(u32, 4), st.write_cipher.sequenceNumber());
+    st.session_id = transport.SessionId.from(res.hash());
+    try st.installCipher(.write, "chacha20-poly1305@openssh.com", .s2c, res);
+    var probe: [32]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&probe);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+    try messages.writeString(&pw, "after-guess");
+    try pw.writeByte(0);
+    try st.sendPacket(pw.buffered());
 
     th.join();
     joined = true;
@@ -2071,6 +2007,7 @@ test "clientHandshake discards a server's wrongly-guessed first KEX packet inste
     // client never entertained the server's group16 guess.
     try std.testing.expectEqual(@as(?anyerror, null), client.err);
     try std.testing.expectEqualStrings("diffie-hellman-group14-sha256", client.negotiated_kex[0..client.negotiated_kex_len]);
+    try std.testing.expect(client.got_probe);
 }
 
 // ── live interop: real OpenSSH `ssh` client → our server (gated) ────────────
