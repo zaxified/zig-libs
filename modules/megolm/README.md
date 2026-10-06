@@ -24,7 +24,8 @@ In scope: an outbound session (create, advance, export the session key at
 the current index, encrypt+sign a message), an inbound session (import a
 session key, fast-forward to a given index, decrypt+verify), the spec's
 wire/export formats (including the base64 encodings and the session-export
-format), and Ed25519 signing/verification of the message frame.
+format), Ed25519 signing/verification of the message frame, and session
+persistence (plain or AEAD-sealed pickles of both session types).
 
 Out of scope: Olm (the pairwise partner protocol — see `signal` for a
 different pairwise ratchet with the same shape of problem), the Matrix
@@ -75,6 +76,40 @@ format" — identical to the session-sharing format minus the signature,
 since re-signing a ratcheted-forward copy isn't possible without the
 original private key).
 
+## Persistence (pickles)
+
+Both session types serialise to a versioned fixed-width byte layout that
+keeps every field, and restore to a session that continues exactly where
+the original left off (same ciphertexts and signatures from an outbound
+session, same decrypts and refusals from an inbound one; the inbound
+`signing_key_verified` flag is kept — `exportAt`/`fromExportedKey` drops
+it). See [SPEC.md](SPEC.md) "Session pickles" for the layout.
+
+```zig
+// Sealed with ChaCha20-Poly1305 under a 32-byte key the caller manages:
+const key: megolm.PickleKey = storage_key;
+var blob: [megolm.pickle.sealed_outbound_len]u8 = undefined;
+out.pickleSealed(io, &key, &blob); // fresh random nonce per call
+// ... after restart:
+var restored = try megolm.OutboundSession.fromSealedPickle(&blob, &key);
+defer restored.deinit();
+
+var in_blob: [megolm.pickle.sealed_inbound_len]u8 = undefined;
+in.pickleSealed(io, &key, &in_blob);
+var in2 = try megolm.InboundGroupSession.fromSealedPickle(&in_blob, &key);
+defer in2.deinit();
+```
+
+`pickle(&buf)` / `fromPickle(bytes)` are the unsealed forms
+(`pickle.outbound_len` = 202, `pickle.inbound_len` = 303 bytes). They
+contain the raw ratchet (and the Ed25519 seed for outbound) and are **not
+authenticated**: wipe the buffer with `std.crypto.secureZero` after use
+and prefer the sealed form for storage. Decoders fail closed with a typed
+`megolm.PickleError` (`Truncated`, `TrailingBytes`, `BadMagic`,
+`UnsupportedVersion`, `WrongKind`, `AuthenticationFailed`, `InvalidFlags`,
+`InvalidSigningKey`, `InconsistentState`). The bytes are this module's own
+format, not libolm's or vodozemac's.
+
 ## Layout
 
 | File | Contents |
@@ -85,12 +120,14 @@ original private key).
 | `src/message.zig` | The wire message codec (version + LEB128-tagged payload + MAC + signature byte ranges) — no keys, no crypto. A decoded `Message` retains the **received** signed span, so verification authenticates the bytes that arrived rather than a canonical re-encoding (`decode` → `encode` is byte-identical) |
 | `src/session_key.zig` | The signed session-sharing format (`SessionKey`, self-verifying) and unsigned session-export format (`ExportedSessionKey`) |
 | `src/session.zig` | `OutboundSession` (encrypt+sign+advance) and `InboundGroupSession` (verify signature → locate ratchet → verify MAC → decrypt) |
+| `src/pickle.zig` | Session persistence: plain and ChaCha20-Poly1305-sealed pickles for both session types, strict decoders, fuzz harness |
 | `src/kat_test.zig` | External anchors (libolm ratchet vectors + a real libolm session-key+message pair) and the reject-teeth battery |
 
 ## Import graph
 
 ```
 megolm → aescbc → std.crypto.core.aes
+       → chachapoly (sealed pickles) / entropy
        → std.crypto.kdf.hkdf.HkdfSha256 / std.crypto.auth.hmac.sha2.HmacSha256 /
          std.crypto.sign.Ed25519 / std.base64
 ```

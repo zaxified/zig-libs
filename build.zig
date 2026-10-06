@@ -372,7 +372,7 @@ const module_list = [_]Module{
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
     .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .test_deps = &.{"testkit"} },
-    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
     .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },

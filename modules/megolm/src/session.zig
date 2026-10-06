@@ -53,6 +53,7 @@ const ratchet_mod = @import("ratchet.zig");
 const cipher_mod = @import("cipher.zig");
 const message_mod = @import("message.zig");
 const session_key_mod = @import("session_key.zig");
+const pickle_mod = @import("pickle.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const Ratchet = ratchet_mod.Ratchet;
@@ -158,6 +159,33 @@ pub const OutboundSession = struct {
 
         self.ratchet.advanceStep();
         return msg;
+    }
+
+    /// Serialise the whole session — ratchet, message index and the
+    /// Ed25519 signing key pair — into the plain pickle layout (pickle.zig).
+    /// `out` then holds the session's secrets in the clear: the caller owns
+    /// it and should `std.crypto.secureZero` it once stored. Prefer
+    /// `pickleSealed` for anything written where others can reach it.
+    pub fn pickle(self: *const OutboundSession, out: *[pickle_mod.outbound_len]u8) void {
+        pickle_mod.encodeOutbound(self, out);
+    }
+
+    /// `pickle`, wrapped in ChaCha20-Poly1305 under `key` with a fresh
+    /// random nonce drawn through `io` (see pickle.zig).
+    pub fn pickleSealed(self: *const OutboundSession, io: std.Io, key: *const pickle_mod.PickleKey, out: *[pickle_mod.sealed_outbound_len]u8) void {
+        pickle_mod.sealOutbound(io, self, key, out);
+    }
+
+    /// Restore a session from `pickle`'s output. Strict: exact length, no
+    /// trailing bytes, and the stored public key must match the seed.
+    pub fn fromPickle(bytes: []const u8) pickle_mod.PickleError!OutboundSession {
+        return pickle_mod.decodeOutbound(bytes);
+    }
+
+    /// Restore a session from `pickleSealed`'s output; a wrong key or any
+    /// altered byte is `error.AuthenticationFailed`.
+    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey) pickle_mod.PickleError!OutboundSession {
+        return pickle_mod.openOutbound(bytes, key);
     }
 };
 
@@ -303,6 +331,34 @@ pub const InboundGroupSession = struct {
     pub fn exportAt(self: *InboundGroupSession, index: u32) ?ExportedSessionKey {
         const r = self.findRatchet(index) orelse return null;
         return .{ .ratchet_index = r.counter, .ratchet = r.data, .signing_key = self.signing_key.toBytes() };
+    }
+
+    /// Serialise the whole session — first-known ratchet, the fast-forward
+    /// cache, the signing key and `signing_key_verified` — into the plain
+    /// pickle layout (pickle.zig). Unlike `exportAt` → `fromExportedKey`,
+    /// a round trip keeps the verified flag. `out` holds ratchet secrets in
+    /// the clear; the caller should `secureZero` it once stored.
+    pub fn pickle(self: *const InboundGroupSession, out: *[pickle_mod.inbound_len]u8) void {
+        pickle_mod.encodeInbound(self, out);
+    }
+
+    /// `pickle`, wrapped in ChaCha20-Poly1305 under `key` with a fresh
+    /// random nonce drawn through `io` (see pickle.zig).
+    pub fn pickleSealed(self: *const InboundGroupSession, io: std.Io, key: *const pickle_mod.PickleKey, out: *[pickle_mod.sealed_inbound_len]u8) void {
+        pickle_mod.sealInbound(io, self, key, out);
+    }
+
+    /// Restore a session from `pickle`'s output. Strict: exact length, no
+    /// trailing bytes, reserved flag bits zero, and the cached ratchet must
+    /// be the first-known one fast-forwarded (else `error.InconsistentState`).
+    pub fn fromPickle(bytes: []const u8) pickle_mod.PickleError!InboundGroupSession {
+        return pickle_mod.decodeInbound(bytes);
+    }
+
+    /// Restore a session from `pickleSealed`'s output; a wrong key or any
+    /// altered byte is `error.AuthenticationFailed`.
+    pub fn fromSealedPickle(bytes: []const u8, key: *const pickle_mod.PickleKey) pickle_mod.PickleError!InboundGroupSession {
+        return pickle_mod.openInbound(bytes, key);
     }
 };
 

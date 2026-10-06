@@ -32,6 +32,9 @@
 //!     `InboundGroupSession` (verify signature, fast-forward, verify MAC,
 //!     decrypt) — the only file holding both ratchet AND Ed25519 key
 //!     material together.
+//!   - `pickle.zig` — session persistence: a versioned fixed-width plain
+//!     layout for both session types and a ChaCha20-Poly1305-sealed form
+//!     under a caller key; strict, fail-closed decoders.
 //!   - `kat_test.zig` — external anchors: libolm's own ratchet-advance test
 //!     vectors and a real libolm-produced session-key + message pair that
 //!     decrypts byte-exactly; see SPEC.md for the anchoring grade of every
@@ -58,7 +61,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied bytes/keys -- no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
     .model_after = "Matrix Megolm (gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md); libolm (megolm.c) and vodozemac (megolm/ratchet.rs) as design references + test-vector source -- see NOTICE",
-    .deps = .{ "aescbc", "entropy" }, // entropy: the R0 draw in `Ratchet.generate`
+    .deps = .{ "aescbc", "entropy", "chachapoly" }, // entropy: the R0 draw in `Ratchet.generate`; chachapoly: sealed pickles
 };
 
 pub const ratchet = @import("ratchet.zig");
@@ -66,6 +69,7 @@ pub const cipher = @import("cipher.zig");
 pub const message = @import("message.zig");
 pub const session_key = @import("session_key.zig");
 pub const session = @import("session.zig");
+pub const pickle = @import("pickle.zig");
 
 // Flat re-exports of the surface most callers use.
 pub const Ratchet = ratchet.Ratchet;
@@ -77,6 +81,8 @@ pub const OutboundSession = session.OutboundSession;
 pub const InboundGroupSession = session.InboundGroupSession;
 pub const DecryptedMessage = session.DecryptedMessage;
 pub const DecryptError = session.DecryptError;
+pub const PickleError = pickle.PickleError;
+pub const PickleKey = pickle.PickleKey;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -89,13 +95,15 @@ test {
     _ = message;
     _ = session_key;
     _ = session;
+    _ = pickle;
     _ = @import("kat_test.zig");
 }
 
-test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive) and entropy (R0)" {
+test "meta.deps names aescbc (the AES-CBC/PKCS7 primitive), entropy (R0) and chachapoly (sealed pickles)" {
     try std.testing.expectEqualStrings("aescbc", meta.deps[0]);
     try std.testing.expectEqualStrings("entropy", meta.deps[1]);
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+    try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
 }
 
 test "meta.role is .util (no owned transport/socket)" {
