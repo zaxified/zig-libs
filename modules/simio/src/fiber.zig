@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! `std.Io.fiber` with one change on aarch64: the context switch does not
-//! list `ffr` (the SVE first-fault register) as clobbered.
+//! `std.Io.fiber` with two changes on aarch64: the context switch does not
+//! list `ffr` (the SVE first-fault register) as clobbered, and it saves and
+//! restores `x18` and `x30` itself instead of trusting the clobber list.
 //!
 //! ⛔ A `std` issue, not ours: on an SVE CPU (the arm64 CI runners —
 //! reproduced locally with `-mcpu=neoverse_n2`/`neoverse_v1`, not with
@@ -11,7 +12,19 @@
 //! nothing (LLVM says so itself: it "may not be preserved across the asm
 //! statement"). Zig upstream does not take agent reports, so the switch is
 //! copied here with that one line dropped; every other architecture uses
-//! `std`'s unchanged. Delete this file once `std` drops `.ffr`.
+//! `std`'s unchanged. Delete this file once `std` drops `.ffr` and preserves
+//! `x18`/`x30` (below).
+//!
+//! ⛔ Also `std`'s: a value live across the switch in `x18` or `x30` came back
+//! as whatever the other fiber left there. `x18` is not in `std`'s clobber
+//! list (on Linux it is an ordinary temporary LLVM allocates), and `x30` is,
+//! but a ReleaseSafe build for an SVE CPU still kept the current `*Fiber` in
+//! `x30` across the asm (llvm-objdump of `maybeYield`). Seen as a Bus error in
+//! `example-simio` on the arm64 CI runner (tag 2026-10-06 matrix) and as a
+//! wild `Host` pointer after `maybeYield` under qemu-aarch64 (`cortex-a72`
+//! for x18, `neoverse-n2` for x30). The asm now pushes both before it saves
+//! `sp` and pops them where it resumes, so neither depends on the clobber
+//! list; a new fiber starts at its own entry and pops nothing.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,10 +35,12 @@ pub const Context = std_fiber.Context;
 pub const Switch = std_fiber.Switch;
 
 /// Fills `s.old` with the current cpu state, and restores the cpu state
-/// stored in `s.new` — `std.Io.fiber.contextSwitch`, minus `ffr` on aarch64.
+/// stored in `s.new` — `std.Io.fiber.contextSwitch`, minus `ffr` on aarch64,
+/// plus a push/pop of `x18` and `x30` around the switch.
 pub inline fn contextSwitch(s: *const Switch) *const Switch {
     if (builtin.cpu.arch != .aarch64) return std_fiber.contextSwitch(s);
     return asm volatile (
+        \\ stp x18, x30, [sp, #-16]!
         \\ ldp x0, x2, [x1]
         \\ ldr x3, [x2, #16]
         \\ mov x4, sp
@@ -36,6 +51,7 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
         \\ mov sp, x4
         \\ br x3
         \\0:
+        \\ ldp x18, x30, [sp], #16
         : [received_message] "={x1}" (-> *const Switch),
         : [message_to_send] "{x1}" (s),
         : .{
