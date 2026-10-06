@@ -211,17 +211,21 @@ function generate() {
   out += "//! The reference JSON5 implementation's verdicts on this module's own documents,\n";
   out += "//! replayed by `ref_oracle_test.zig`. Canonical value form: see the script's header.\n\n";
   out += `pub const ref_version = ${zigStr(refVersion)};\n\n`;
-  out += "/// `ref`: the canonical form of the value the reference parsed `src` to, or null when it refused it.\n";
-  out += "pub const Case = struct { src: []const u8, ref: ?[]const u8 };\n\n";
+  out += "/// `ref`: the canonical form of the value the reference parsed `src` to, or null when it refused it;\n";
+  out += "/// `line`/`column`: where the reference's SyntaxError says it stopped (1-based; 0 when it parsed).\n";
+  out += "pub const Case = struct { src: []const u8, ref: ?[]const u8, line: u32 = 0, column: u32 = 0 };\n\n";
   out += "pub const cases = [_]Case{\n";
   for (const d of docs) {
     let ref = null;
+    let at = "";
     try {
       ref = canon(JSON5.parse(d));
     } catch (e) {
       ref = null;
+      if (!(e instanceof SyntaxError) || !e.lineNumber) throw new Error("reference refused without a position: " + e);
+      at = `, .line = ${e.lineNumber}, .column = ${e.columnNumber}`;
     }
-    out += `    .{ .src = ${zigStr(d)}, .ref = ${ref === null ? "null" : zigStr(ref)} },\n`;
+    out += `    .{ .src = ${zigStr(d)}, .ref = ${ref === null ? "null" : zigStr(ref)}${at} },\n`;
   }
   out += "};\n";
   return out;

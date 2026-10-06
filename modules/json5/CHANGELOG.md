@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL:** `preprocessAnnotated` no longer recovers a bad bare word (`nul`,
+  `tru`) or a single-quoted string broken by a newline OUTSIDE an object (top level, or inside an
+  array) — there is no sibling key to put the `$err` in, so it used to fix them silently: `nul` came
+  out as the valid document `"nul"`, `{a: [tru]}` as `{"a": ["tru"]}`. Now the token goes out as
+  written and `std.json` refuses the document, as `preprocess` and the reference json5 do (the
+  double-quoted branch already behaved so). Anchoring: the reference oracle records where json5
+  2.2.3 stops on each refused document; the editor mode must refuse too or report that line
+  (`ref_oracle_test.zig`). Evidence MIXED → EXTERNAL.
+
 - **2026-10-05** — Found by a new differential oracle against the reference `json5` package
   (`tools/ref_oracle.js`, replayed by `src/ref_oracle_test.zig`, 2672 generated documents):
   - **Fix:** JSON5 string escapes JSON lacks (`\v`, `\0`, `\xHH`, `\q`-style NonEscapeCharacters,

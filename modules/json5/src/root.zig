@@ -1060,7 +1060,7 @@ fn needsLeadingComma(out: []const u8) bool {
 /// Errors discovered after a value has already been emitted (unterminated
 /// strings, invalid bare-identifier literals). Flushed as `, "$err_<N>": "..."`
 /// sibling entries before the next `,` or `}` in the parent object. Only
-/// produced when nest top is `{` — array contents recover silently in v1.
+/// produced when nest top is `{`; elsewhere nothing is recovered (the document stays refused).
 fn flushValueErrs(
     out: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
@@ -1118,8 +1118,8 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
     // value (unterminated strings, invalid bare literals). They cannot be
     // flushed immediately because they must appear as sibling entries *after*
     // the value they describe — the JSON key has already been emitted. They are
-    // flushed at the next ',' or '}' boundary. Errors inside arrays are dropped
-    // because inserting $err_* inside a JSON array would break its structure.
+    // flushed at the next ',' or '}' boundary. Inside an array there is no
+    // sibling key for one, so nothing is recovered there and nothing queued.
     var pending_value_errs: std.ArrayList([]u8) = .empty;
     defer {
         for (pending_value_errs.items) |m| alloc.free(m);
@@ -1215,12 +1215,21 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
             while (i < input.len) {
                 const sc = input[i];
                 if (sc == '\n' or sc == '\r') {
+                    // Not recovered outside an object, as in the double-quoted
+                    // branch above. ⛔ This branch closed the string anyway and
+                    // only guarded the diagnostic, so `'a\nb'` at the top level
+                    // or in an array came out VALID with nothing reported --
+                    // the reference json5 refuses it (`ref_oracle_test.zig`,
+                    // annotated half, 2026-10-06).
+                    if (!isInObject(nest.items)) {
+                        try out.append(alloc, sc);
+                        i += 1;
+                        continue;
+                    }
                     try out.append(alloc, '"');
                     closed = true;
-                    if (isInObject(nest.items)) {
-                        const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
-                        try pending_value_errs.append(alloc, msg);
-                    }
+                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
+                    try pending_value_errs.append(alloc, msg);
                     i = skipValue(input, i);
                     break;
                 }
@@ -1496,19 +1505,26 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             std.mem.eql(u8, ident, "NaN"))
                         {
                             try out.appendSlice(alloc, ident);
+                        } else if (!isInObject(nest.items)) {
+                            // Nowhere to report it, so not recovered: the word
+                            // goes out bare and `std.json` refuses it. ⛔ It was
+                            // wrapped as a string here too, so `nul` became the
+                            // valid document `"nul"` and `[tru]` the array
+                            // `["tru"]`, with no `$err` anywhere -- the reference
+                            // json5 refuses both (`ref_oracle_test.zig`, annotated
+                            // half, 2026-10-06).
+                            try out.appendSlice(alloc, ident);
                         } else {
                             // Wrap the bare word as a string so the output is valid JSON,
                             // then queue an error to be emitted as a sibling entry.
                             try out.append(alloc, '"');
                             try out.appendSlice(alloc, ident);
                             try out.append(alloc, '"');
-                            if (isInObject(nest.items)) {
-                                const err_line = lines.at(input, start);
-                                const msg = try std.fmt.allocPrint(alloc, "'{s}' --> invalid literal in value position at line {d}", .{
-                                    ident, err_line,
-                                });
-                                try pending_value_errs.append(alloc, msg);
-                            }
+                            const err_line = lines.at(input, start);
+                            const msg = try std.fmt.allocPrint(alloc, "'{s}' --> invalid literal in value position at line {d}", .{
+                                ident, err_line,
+                            });
+                            try pending_value_errs.append(alloc, msg);
                         }
                     }
                 } else {

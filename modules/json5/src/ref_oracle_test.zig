@@ -212,3 +212,63 @@ test "ref oracle: preprocess + std.json read every document as the reference JSO
     // hold a lone surrogate; most of the evidence is agreement.
     try testing.expect(agreed_values >= 1000);
 }
+
+/// The first `line N` an `$err` message of `out` names.
+fn firstReportedLine(out: []const u8) ?u32 {
+    var i: usize = 0;
+    while (mem.indexOfPos(u8, out, i, "line ")) |at| {
+        var j = at + 5;
+        while (j < out.len and std.ascii.isDigit(out[j])) j += 1;
+        if (j > at + 5) return std.fmt.parseInt(u32, out[at + 5 .. j], 10) catch null;
+        i = at + 5;
+    }
+    return null;
+}
+
+test "ref oracle: the editor mode never turns a refused document into valid JSON, and reports where the reference stops" {
+    // Every document the reference refuses, through `preprocessAnnotated`:
+    // the output must be refused by `std.json` too, or carry `$err` entries
+    // -- and then the first one names the line the reference's SyntaxError
+    // names. One class: TOKEN_START -- the reference reports the position
+    // just PAST the line terminator that broke a key or an escape (column
+    // 0 or 1 of the next line), this module the line the broken token
+    // starts on.
+    //
+    // ⛔ 56 documents came out valid with no `$err` at all (2026-10-06): a
+    // bad bare word or a single-quoted string broken by a newline, outside
+    // an object, was recovered with nowhere to report it -- `nul` became
+    // `"nul"`, `[tru]` became `["tru"]`.
+    const gpa = testing.allocator;
+    var refused: usize = 0;
+    var same_line: usize = 0;
+    var token_start: usize = 0;
+    var bad: usize = 0;
+    for (vectors.cases) |c| {
+        if (c.ref != null) continue;
+        const r = try json5.preprocessAnnotated(gpa, c.src);
+        defer gpa.free(r.out);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, r.out, .{}) catch {
+            refused += 1;
+            continue;
+        };
+        parsed.deinit();
+        const line = if (r.next_id > 1) firstReportedLine(r.out) else null;
+        if (line) |l| {
+            if (l == c.line) {
+                same_line += 1;
+                continue;
+            }
+            if (l + 1 == c.line and c.column <= 1) {
+                token_start += 1;
+                continue;
+            }
+        }
+        bad += 1;
+        std.debug.print("refused by the reference at {d}:{d}, annotated gives {?d}: src={f}\n    out={s}\n", .{ c.line, c.column, line, std.json.fmt(c.src, .{}), r.out });
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+    // Pinned so a regenerated corpus that stopped reaching either branch shows.
+    try testing.expect(same_line >= 50);
+    try testing.expect(token_start >= 1);
+    try testing.expect(refused >= 1000);
+}
