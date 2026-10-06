@@ -519,7 +519,13 @@ fn signEd25519(sk: Ed25519.SecretKey, content: []const u8, random: ?std.Random, 
     // secret key (identity/non-canonical/weak public half, or a secret key
     // whose embedded public key doesn't match -- std's KeyMismatchError) --
     // all key problems, mapped to KeyMismatch.
-    const key_pair = Ed25519.KeyPair.fromSecretKey(sk) catch return error.KeyMismatch;
+    // NOT `Ed25519.KeyPair.fromSecretKey` alone: `std` checks the embedded
+    // public half against the seed only under `std.debug.runtime_safety`,
+    // so in ReleaseFast a mismatched key signed with the wrong public key —
+    // and two signatures of one message under two public keys give away the
+    // secret scalar. Derive from the seed and compare, in every mode.
+    const key_pair = Ed25519.KeyPair.generateDeterministic(sk.seed()) catch return error.KeyMismatch;
+    if (!std.crypto.timing_safe.eql([32]u8, key_pair.public_key.toBytes(), sk.publicKeyBytes())) return error.KeyMismatch;
     var noise_buf: [Ed25519.noise_length]u8 = undefined;
     const noise: ?[Ed25519.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
@@ -760,6 +766,16 @@ test "KAT: ed25519 verify rejects a tampered signature" {
     var tampered = kat.ed25519_client.signature;
     tampered[0] ^= 0x01;
     try testing.expectError(error.InvalidSignature, verify(.ed25519, pk, .client, &kat.ed25519_client.transcript_hash, &tampered));
+}
+
+test "sign: an Ed25519 secret key whose embedded public half is not its own is KeyMismatch in every mode" {
+    // `std`'s `KeyPair.fromSecretKey` makes this check only under runtime
+    // safety; the ReleaseFast lane is the one that proves ours runs anyway.
+    var bytes = kat.ed25519_client.secret_key_bytes;
+    bytes[63] ^= 0x01; // flip a bit of the public half, keep the seed
+    const sk = SecretKey{ .ed25519 = try Ed25519.SecretKey.fromBytes(bytes) };
+    var out: [Ed25519.Signature.encoded_length]u8 = undefined;
+    try testing.expectError(error.KeyMismatch, sign(.ed25519, sk, .client, &kat.ed25519_client.transcript_hash, null, &out));
 }
 
 test "KAT: ed25519 sign reproduces the cryptography-cross-checked vector byte-exact" {

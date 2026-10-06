@@ -443,8 +443,15 @@ pub const standard = struct {
         return switch (n) {
             32 => Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch error.InvalidKey,
             64 => blk: {
-                const sk = Ed25519.SecretKey.fromBytes(buf) catch break :blk error.InvalidKey;
-                break :blk Ed25519.KeyPair.fromSecretKey(sk) catch error.InvalidKey;
+                // NOT `Ed25519.KeyPair.fromSecretKey`: `std` checks the
+                // embedded public half against the seed only under
+                // `std.debug.runtime_safety`, so in ReleaseFast a mismatched
+                // half was taken as is (and signing one message under two
+                // public keys gives away the secret scalar). Derive from the
+                // seed and compare, in every mode.
+                const kp = Ed25519.KeyPair.generateDeterministic(buf[0..32].*) catch break :blk error.InvalidKey;
+                if (!std.crypto.timing_safe.eql([32]u8, kp.public_key.toBytes(), buf[32..64].*)) break :blk error.InvalidKey;
+                break :blk kp;
             },
             else => error.InvalidKey,
         };
