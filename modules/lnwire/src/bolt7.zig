@@ -267,8 +267,13 @@ pub const AddressIterator = struct {
     pos: usize = 0,
     stopped: bool = false,
 
+    /// An error is final: the iterator stops there (later calls return
+    /// `null`) and `unparsed()` returns the descriptor that failed and
+    /// everything after it — so a caller that catches the error and keeps
+    /// calling `next` ends instead of meeting the same error forever.
     pub fn next(self: *AddressIterator) AddressDecodeError!?Address {
         if (self.stopped or self.pos >= self.bytes.len) return null;
+        errdefer self.stopped = true;
         var r: Reader = .{ .bytes = self.bytes, .pos = self.pos };
         const t: AddressType = @enumFromInt(r.byte() catch unreachable);
         const a: Address = switch (t) {
@@ -2001,9 +2006,21 @@ test "hostile: address descriptors truncated mid-field or non-ASCII fail closed"
     for (cuts) |c| {
         var it = addressIterator(c);
         try testing.expectError(error.Truncated, it.next());
+        // Review 2026-10-06 (PR #5): the error is final. `next` used to leave
+        // `pos` and `stopped` as they were, so every later call met the same
+        // descriptor again — `while (it.next() catch continue)` never ended.
+        try testing.expectEqual(@as(?Address, null), try it.next());
+        try testing.expectEqual(c.len, it.unparsed().len);
     }
     var it = addressIterator(&.{ 5, 2, 'h', 0xFF, 0x26, 0x07 });
     try testing.expectError(error.NonAsciiHostname, it.next());
+    try testing.expectEqual(@as(?Address, null), try it.next());
+    // After a good descriptor, the failing one and its tail stay unparsed.
+    var after = addressIterator(&.{ 1, 1, 2, 3, 4, 0x26, 0x07, 1, 9 });
+    _ = (try after.next()).?;
+    try testing.expectError(error.Truncated, after.next());
+    try testing.expectEqual(@as(?Address, null), try after.next());
+    try testing.expectEqualSlices(u8, &.{ 1, 9 }, after.unparsed());
     // Type 0 is not a defined descriptor: stop, everything is unparsed.
     var z = addressIterator(&.{ 0, 1, 2 });
     try testing.expectEqual(@as(?Address, null), try z.next());

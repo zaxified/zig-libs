@@ -103,7 +103,9 @@ std.debug.print("{d} input tokens\n", .{n.input_tokens});
 - `ImageMediaType` is `image/jpeg`, `image/png`, `image/gif` or `image/webp` — the formats the
   API accepts. A document block also takes `title`, `context` and
   `citations = .{ .enabled = true }` (set them on `block.document`), and both block kinds a
-  `cache_control`.
+  `cache_control`. The answer's citations come back as raw JSON objects (dispatch on their
+  `"type"`: `char_location`, `page_location`, `content_block_location`, …) on
+  `ContentBlock.text.citations`, or one per `Delta.citations_delta` when streaming.
 - `count_tokens` accepts base64 and text document sources, not `url` (the API's rule; this
   client does not police it — the server answers 400, `lastErrorBody` has why).
 - `betas` entries must be plain tokens (`A-Z a-z 0-9 . _ -`); anything else is

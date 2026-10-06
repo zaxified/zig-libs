@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — FIXED (review of PR #5): citations could be requested but not received. A
+  streamed `citations_delta` was `error.MalformedResponse`, ending the stream at the first
+  citation, and a non-streaming text block's `citations` array was dropped. Now
+  `Delta.citations_delta` carries the raw citation object (`MalformedResponse` only without
+  one) and `ContentBlock.text` has `citations: []const std.json.Value` (default empty).
+  **BREAKING only for an exhaustive `switch`** on `Delta` (one new variant); any other
+  unknown delta type stays `MalformedResponse`. Anchored on the citations docs' response and
+  streaming examples.
+
 - **2026-10-06** — ADDED: image and document content blocks, the `system` block-array form,
   `anthropic-beta` headers and `count_tokens`. **BREAKING only for an exhaustive `switch`** on
   `ContentBlockParam` (two new variants) or on `Client.Error` (new `InvalidBeta`); every

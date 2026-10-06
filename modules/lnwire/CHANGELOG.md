@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — FIXED (review of PR #5): an `AddressIterator.next` error is final — the
+  iterator stops (later calls return `null`) and `unparsed()` returns the failing descriptor
+  and its tail. Before, `pos` stayed put and every later call met the same error, so
+  `while (it.next() catch continue)` never ended.
+
 - **2026-10-06** — ADDED: BOLT#2 `channel_reestablish` (136; `decodeChannelReestablish`/
   `serializeChannelReestablish`, `nextFunding()`/`myCurrentFundingLocked()` over the 33-octet
   `FundingTxidFlags` TLVs 1 and 5, `error.InvalidTlvLength` for a known record of any other
