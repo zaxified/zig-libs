@@ -125,11 +125,12 @@ pub const ChassisId = struct {
         return networkAddressIp(c.value);
     }
 
-    /// The value as text for the string-bearing subtypes (alias / name /
-    /// local); null otherwise.
+    /// The value as text for the string-bearing subtypes (component /
+    /// alias / name / local); null otherwise. Both component subtypes are
+    /// an entPhysicalAlias, a string (IEEE 802.1AB 9.5.2.2).
     pub fn text(c: ChassisId) ?[]const u8 {
         return switch (c.subtype) {
-            .interface_alias, .interface_name, .local, .chassis_component => c.value,
+            .interface_alias, .interface_name, .local, .chassis_component, .port_component => c.value,
             else => null,
         };
     }
@@ -149,9 +150,13 @@ pub const PortId = struct {
         return networkAddressIp(p.value);
     }
 
+    /// The value as text for the string-bearing subtypes; null otherwise.
+    /// `port_component` is an entPhysicalAlias, a string (IEEE 802.1AB
+    /// 9.5.3.2) -- it returned null until 2026-10-06, so a neighbour that
+    /// names its port that way showed no port at all (tcpdump oracle).
     pub fn text(p: PortId) ?[]const u8 {
         return switch (p.subtype) {
-            .interface_alias, .interface_name, .local, .agent_circuit_id => p.value,
+            .interface_alias, .port_component, .interface_name, .local, .agent_circuit_id => p.value,
             else => null,
         };
     }
@@ -917,6 +922,16 @@ test "LLDP round-trip: builder reproduces the golden bytes" {
     const du = try Lldpdu.parse(bytes, .{});
     try testing.expect(du.chassis_id.mac().?.eql(kat_mac));
     try testing.expectEqual(@as(u16, 120), du.ttl_s);
+}
+
+test "LLDP: both component subtypes are text, for chassis and port alike (802.1AB entPhysicalAlias)" {
+    // Port ID subtype 2 is reached by the tcpdump oracle; chassis subtype 3
+    // is not, so it is pinned here.
+    const c: ChassisId = .{ .subtype = .port_component, .value = "slot1" };
+    try testing.expectEqualStrings("slot1", c.text().?);
+    const p: PortId = .{ .subtype = .port_component, .value = "1/0/5" };
+    try testing.expectEqualStrings("1/0/5", p.text().?);
+    try testing.expectEqual(@as(?[]const u8, null), (PortId{ .subtype = .mac_address, .value = "abcdef" }).text());
 }
 
 test "LLDP: network-address chassis id + IPv6 management address" {

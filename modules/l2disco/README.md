@@ -71,4 +71,7 @@ described / reverse-engineered format — behaviour reference only), RFC 826
 answered in [`NOTICE`](NOTICE) beside this file: the module vendors real
 tcpdump `tests/*.pcap` capture frames (BSD-3-Clause), which carry required
 attribution, and that file is where the obligation lives. No third-party dissector source
-(Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. License: MIT.
+(Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. `src/testdata/tcpdump_facts.zig`
+(`tools/tcpdump_oracle.py`) holds frames built from the standards and the facts the `tcpdump`
+program printed for them — observed output of a black-box tool, exempt per root `NOTICE` §0.
+License: MIT.

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **FIX:** `lldp.PortId.text()` returned null for the `port_component` subtype and
+  `ChassisId.text()` for its `port_component`, though both are an entPhysicalAlias string (IEEE 802.1AB):
+  a neighbour naming its port that way showed no port at all. Both now return the text. Found by the
+  new tcpdump oracle (`tools/tcpdump_oracle.py` → `src/tcpdump_oracle_test.zig`): 14 LLDP / CDP / DHCP
+  frames reaching every decoded shape, checked against what tcpdump read in them (option 119 via
+  dnspython), and the LLDP / CDP / DHCP Builders reproduce them byte for byte; the ARP encoder now
+  reproduces the vendored real request too.
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED: LLDP-MED (TIA-1057
   capabilities, network policy, location, extended power, inventory), IEEE 802.3 power via MDI
   (with the 802.3at extension) and 802.1 port+protocol VLAN in `lldp.OrgSpecific.decode`, plus

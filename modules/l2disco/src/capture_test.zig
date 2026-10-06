@@ -666,6 +666,10 @@ test "real capture: a genuine ARP request off the wire decodes byte-exactly" {
     try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 104 }, &p.sender_ip);
     try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 1 }, &p.target_ip);
     try testing.expect(p.target_mac.isZero());
+    // ...and the encoder writes those 28 bytes back for the same request
+    // (the rest of the capture is Ethernet padding).
+    const built = arp.EthIpv4.request(Mac.parse("00:1f:29:da:2d:79").?, .{ 192, 168, 1, 104 }, .{ 192, 168, 1, 1 }).encode();
+    try testing.expectEqualSlices(u8, arp_real_request[0..arp.EthIpv4.wire_len], &built);
 }
 
 test "real capture: a real fuzzer-mutated ARP frame with hlen=plen=170 is rejected, not read out of bounds" {
