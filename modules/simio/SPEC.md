@@ -434,7 +434,7 @@ Modules keep their own loopback tests (below, "timeouts").
 tasks on one thread. Fixed — the lock waits through the `Io` when one is known: `kv`
 (`Db`, `Storage.io`), `sessions` (`KvStore`), `writebehind` (`KvtreeSink`, via
 `kvtree.Lock`/`Db.io()`), `mqtt` (`tx_lock` and teardown, `Transport.io`), `http`
-(`h2_upstream` session/dial locks), `metrics` (`AccessLog` waiters, `Options.io`),
+(`h2_upstream` session/dial locks), `accesslog` (`Sink` waiters, `Options.io`; was `metrics.AccessLog` until 2026-10-06),
 `xmss`/`lms` (`Persist.io`). Documented: `ramcache` (callbacks must not suspend).
 By contract already: `h2_server` (without `Dispatcher.io` its tasks must be OS
 threads). The other ~15 spinlock modules guard memory only.

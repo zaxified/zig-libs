@@ -113,12 +113,34 @@ create a series (OOM) skips recording but never fails the request.
 Names, help, buckets, status granularity and the clock are configurable via
 `RequestMetrics.Options`; bad names/buckets fail at `init`, not mid-request.
 
-**Access-log hook:** `on_request` (+ `on_request_ctx`) gets an
-`AccessEntry{ method, path, status, duration_ns, bytes }` per request — a
-hook, not a logger: format/ship it yourself, keep it fast and thread-safe.
-`path` is borrowed (copy to retain); `bytes` is the response body size when
+**Per-request hook:** `on_request` (+ `on_request_ctx`) gets an
+`AccessEntry{ method, path, status, duration_ns, bytes, req, res }` per request —
+a hook, not a logger: keep it fast and thread-safe. Everything in it is
+borrowed for the callback only. `status` is what the server sends (500 for a
+handler that failed before sending); `bytes` is the response body size when
 knowable (exact for buffered bodies, declared Content-Length for identity
 streams, 0 for HEAD/204/304, the octets sent so far for a chunked or compressed stream).
+
+**Access log:** use the `accesslog` module — `req`/`res` give it every field
+(client address, User-Agent, Referer, …) and its `Sink` writes whole lines from
+many threads into one file. (This module's own `AccessLog` writer moved there
+as `accesslog.Sink` on 2026-10-06.)
+
+```zig
+fn logRequest(ctx: ?*anyopaque, e: metrics.AccessEntry) void {
+    const sink: *accesslog.Sink = @ptrCast(@alignCast(ctx.?));
+    var addr_buf: [64]u8 = undefined;
+    var entry = accesslog.entryFromRequest(e.req, e.res, &addr_buf, .{
+        .timestamp_ns = wallClockNs(), // accesslog reads no clock
+        .latency_ns = e.duration_ns,
+    });
+    entry.status = e.status;
+    sink.log(entry);
+}
+
+var sink = accesslog.Sink.init(&log_file_writer.interface, .{ .io = io });
+var rm = try metrics.RequestMetrics.init(&reg, .{ .on_request = logRequest, .on_request_ctx = &sink });
+```
 
 ## Exposition format
 
@@ -161,7 +183,7 @@ concurrent get-or-register convergence stress), middleware tests over the
 socket-free `http.Server.serveStream` (per-method/class counts incl. 404/
 405/handler-error 500, injected-clock deterministic latency buckets,
 in-flight observed mid-request, `.code` granularity, custom names/buckets,
-access-log hook fields, scrape-not-counted proof, endpoint goldens + HEAD +
+per-request hook fields (incl. `req`/`res`), scrape-not-counted proof, endpoint goldens + HEAD +
 405 + pass-through + custom path), plus an in-process integration run
 (`router` + `http.Server` + `http.Client` over loopback: mixed 2xx/3xx/4xx/
 5xx traffic → scrape asserts exact counter values, histogram presence with

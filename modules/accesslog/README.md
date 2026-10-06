@@ -10,7 +10,7 @@ of logging an `http` request/response pair.
 - **Model after:** Apache `mod_log_config` (Combined Log Format + its `ap_escape_logitem`
   escaping rule) + Heroku/`kr/logfmt` (logfmt) + the common JSON-Lines access-log convention
   (Caddy/nginx json access log).
-- **Platform:** any. **Role:** codec. **Concurrency:** reentrant (pure functions, no shared
+- **Platform:** any. **Role:** codec. **Concurrency:** threadsafe (`Sink`; the formatters are pure functions, no shared
   state). **Deps:** `http` (for the `entryFromRequest` bridge) + std only.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
@@ -141,13 +141,46 @@ Only `timestamp_ns`/`method`/`target`/`status` are required (`protocol` defaults
 an explicit `null`, logfmt omits the key, Combined uses its `-` placeholder (`"-"` for the
 quoted Referer/User-Agent fields, matching `mod_log_config`).
 
-## Relationship to `metrics.AccessLog`
+## Many threads, one log file — `Sink`
 
-`metrics` ships its own small built-in access-log writer, driven off the narrower fields its
-`RequestMetrics` middleware can produce for free (method/path/status/duration/bytes — no host,
-UA, referer, time, or request-id). This module is the standalone, fuller-fielded formatter
-(plus logfmt, plus the injection-escaping this README/SPEC documents) for when those extra
-fields matter — the two don't depend on each other.
+The `write*` functions format into whatever writer you hand them. A server logging from many
+request threads or `std.Io` tasks into one file wants `Sink`: whole lines, never interleaved,
+and no request stalls behind another's file write (a group commit — one caller writes the batch
+with the lock released while the others only append).
+
+```zig
+var file_writer = log_file.writer(io, &buf);
+var sink = accesslog.Sink.init(&file_writer.interface, .{ .format = .combined, .io = io });
+// per request:
+var addr_buf: [64]u8 = undefined;
+sink.log(accesslog.entryFromRequest(req, res, &addr_buf, .{ .timestamp_ns = now_ns }));
+```
+
+Pass `.io` when the writer blocks in an `Io` that runs several tasks per thread (a waiting call
+then parks instead of spinning). No `deinit`: when no `log` call is running, everything has been
+written and flushed. Write errors are swallowed — the log never fails a request.
+
+### With `metrics`
+
+`metrics.RequestMetrics` calls an `on_request` hook per request; its `AccessEntry` carries the
+live `req`/`res`. Take `status` and `duration_ns` from the hook (a handler that failed before
+sending is logged as the 500 the server sends):
+
+```zig
+fn logRequest(ctx: ?*anyopaque, e: metrics.AccessEntry) void {
+    const sink: *accesslog.Sink = @ptrCast(@alignCast(ctx.?));
+    var addr_buf: [64]u8 = undefined;
+    var entry = accesslog.entryFromRequest(e.req, e.res, &addr_buf, .{
+        .timestamp_ns = wallClockNs(),
+        .latency_ns = e.duration_ns,
+    });
+    entry.status = e.status;
+    sink.log(entry);
+}
+```
+
+`Sink` used to be `metrics.AccessLog` (removed there 2026-10-06), so there is one access-log
+implementation, with every field and all three formats.
 
 See `SPEC.md` for the full field table, the exact escaping guarantee per format, and the
 `entryFromRequest`/`ResponseWriter.body` byte-count contract.

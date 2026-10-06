@@ -257,17 +257,26 @@ The formatter itself (`write`/`writeJsonLines`/`writeLogfmt`/`writeCombined`) ne
 `http` types — it only consumes the plain `Entry`, so it works identically for a hand-built
 record (tests, non-`http.Server`-backed transports, replaying archived data).
 
-## Relationship to `metrics.AccessLog`
+## `Sink` — many writers, one log (moved from `metrics`, 2026-10-06)
 
-The `metrics` module ships a small built-in access-log writer (JSON/Combined) driven off its
-own narrower `AccessEntry` (method/path/status/duration/bytes only — no host, UA, referer,
-time, or request-id, since that struct is what the `RequestMetrics` middleware can produce for
-free on the request-metrics hot path). This module is the standalone, fuller-fielded formatter
-for when those extra fields matter, and adds logfmt as a third format plus the rigorous
-injection-escaping this SPEC documents. The two are independent — neither imports the other,
-and there is no requirement to pick one over the other; `metrics.AccessLog` stays as the
-zero-extra-dependency default for a bare metrics deployment, and `accesslog` is what a
-production HTTP server (the P2 server this was built for) wires up when it wants full fields.
+`Sink` (`src/sink.zig`) is the thread-safe line writer over one shared `std.Io.Writer`:
+`log(entry)` formats with `write` in `Options.format` and commits the line through a group
+commit. Until 2026-10-06 it was `metrics.AccessLog`, with two narrow formats of its own (a
+five-field JSON and a `.combined` that goaccess refused — that module's known defect); one
+module now owns access logging, and `metrics.RequestMetrics` only offers the hook
+(`AccessEntry.req`/`.res` → `entryFromRequest` → `Sink.log`, README "With `metrics`").
+
+Invariants (`metrics` audit F4, fixed 2026-09-16; its tests and opt-in bench moved along):
+the spinlock is never held across `writer` I/O — lines are formatted under it into an inline
+batch (2 × 4 KiB, no allocation), and a single flusher, one of the calling threads (never a
+background thread), swaps the batch out and writes/flushes it with the lock released. A line
+enters the batch whole or not at all (one longer than a batch is written whole by its caller as
+flusher, after the batch queued before it); per-thread line order is preserved; `flushing` is
+cleared only with an empty batch or a waiter present, so a non-empty batch always has a live
+call committed to writing it; with no call in flight the batch is empty, so there is no
+`deinit`. A waiter parks on the `Options.io` futex when given one (required under an `Io` that
+runs several tasks per thread), else spins boundedly and yields. Writer errors are swallowed by
+whichever call was flusher — an access log never fails the request.
 
 ## Threat model / out of scope
 
@@ -304,7 +313,8 @@ not something this formatter can detect).
 - Every `write*` function takes `entry: Entry` by value and a `*std.Io.Writer` — no allocation,
   no panics (bounded by the caller's writer; a full fixed buffer returns
   `std.Io.Writer.Error`, never overruns or aborts), reentrant (pure functions, no shared or
-  internal state).
+  internal state). `Sink` is the one stateful type and synchronizes itself (see "`Sink`"), so
+  the module's `meta.concurrency` is `threadsafe`.
 - `std`-only + `http` (for `Server.Request`/`Server.ResponseWriter` types in
   `entryFromRequest`) — no other module dependency, no C/libc.
 

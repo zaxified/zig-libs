@@ -55,12 +55,15 @@
 //! spec-shaped bracket formats the string itself (e.g. with the `datefmt`
 //! module) and passes it as `Entry.time_formatted`.
 //!
-//! Relationship to `metrics.AccessLog`: the `metrics` module ships a small
-//! built-in access-log writer (JSON/Combined, driven off its narrower
-//! `AccessEntry` — method/path/status/duration/bytes only, no host/UA/
-//! referer/time/request-id). This module is the standalone, fuller-fielded
-//! formatter for when those extra fields matter; the two are independent
-//! and neither depends on the other.
+//! ## Writing lines from many threads — `Sink`
+//!
+//! The formatters are pure functions over a caller's `Writer`. A server that
+//! logs from many request threads or tasks into one file wants `Sink`
+//! (`sink.zig`): `sink.log(entry)` formats and writes whole lines through a
+//! group commit — never a lock held across the file write, never a torn or
+//! interleaved line. It came from `metrics.AccessLog` (2026-10-06), whose
+//! formats it replaces; `metrics.RequestMetrics` keeps only the per-request
+//! hook, which a caller wires to a `Sink` (README, "With `metrics`").
 
 const std = @import("std");
 const http = @import("http");
@@ -68,7 +71,7 @@ const http = @import("http");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge",
+    .doc = "Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -76,9 +79,9 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
-    // Pure functions over caller-supplied data / a caller-supplied Writer;
-    // no shared or internal state.
-    .concurrency = .reentrant,
+    // The formatters are pure functions over caller-supplied data and a
+    // caller-supplied Writer; `Sink` synchronizes its own shared writer.
+    .concurrency = .threadsafe,
     .model_after = "Apache mod_log_config (Combined Log Format + ap_escape_logitem escaping) + Heroku/kr logfmt + the common JSON-Lines access-log convention (Caddy/nginx json access log)",
     .deps = .{"http"},
 };
@@ -149,6 +152,10 @@ pub const Entry = struct {
 /// also directly callable (`writeJsonLines`/`writeLogfmt`/`writeCombined`)
 /// when the caller already knows which one it wants.
 pub const Format = enum { json_lines, logfmt, combined };
+
+/// The thread-safe line writer over one shared `std.Io.Writer` — see
+/// `sink.zig` and the module doc's "Writing lines from many threads".
+pub const Sink = @import("sink.zig").Sink;
 
 /// Emit `entry` in `format` to `w`. See `writeJsonLines`/`writeLogfmt`/
 /// `writeCombined` for the exact shape of each.
@@ -2084,6 +2091,31 @@ test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, d
 
 test {
     _ = @import("bench.zig");
+    _ = @import("sink.zig");
+}
+
+test "writeJsonLines: target reads back as Python's decode('utf-8', 'replace') (tools/json_path_oracle.py)" {
+    // External anchor for the substitution policy (moved from `metrics` with
+    // its access-log writer, 2026-10-06): 333 paths -- 33 crafted at every
+    // Unicode Table 3-7 edge, 300 drawn from bytes around them -- each
+    // written as `target`, the line parsed, and the field compared with what
+    // Python reads the same bytes as. Per-byte substitution fails on every
+    // truncated prefix (`E2 82` -> two U+FFFD where Python gives one).
+    const vectors = @import("json_path_vectors.zig").cases;
+    var bad: usize = 0;
+    for (vectors) |c| {
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeJsonLines(.{ .timestamp_ns = 0, .method = "GET", .target = c.path, .status = 200 }, &w);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
+        defer parsed.deinit();
+        const got = parsed.value.object.get("target").?.string;
+        if (!std.mem.eql(u8, got, c.want)) {
+            bad += 1;
+            std.debug.print("target {any}: got {any}, want {any}\n", .{ c.path, got, c.want });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
 }
 
 // ── external anchor: Python json + Go encoding/json + jq read JSON Lines ───

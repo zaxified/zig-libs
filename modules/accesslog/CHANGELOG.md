@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED: `Sink` — the thread-safe access-log writer over one shared `std.Io.Writer`
+  (`init(writer, .{ .format, .synchronized, .io })`, `log(entry)`): a group commit, never a lock held
+  across the write, never a torn or interleaved line. Moved from `metrics.AccessLog` (removed there)
+  with its concurrency tests and opt-in F4 bench (`ACCESSLOG_BENCH_F4=1`); it now writes this module's
+  full formats. `meta.concurrency` reentrant → threadsafe. Also moved: the JSON-path oracle
+  (`tools/json_path_oracle.py`, `src/json_path_vectors.zig` — 333 paths read back as Python's
+  `decode('utf-8', 'replace')`), replayed here through `writeJsonLines`' `target`; all pass.
+
 - **2026-10-05** — **Anchoring: JSON Lines read by Python json, Go encoding/json and jq; logfmt read by go-logfmt**
   (`tools/json_oracle.py`, `tools/go_json`, `tools/go_logfmt`, `tools/interop.zig`, `src/json_oracle_test.zig`): 421
   entries with hostile and ill-formed strings and extreme numbers; each reader gets every entry back exactly, the

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BREAKING:** `AccessLog` (with `AccessLog.Format`, `.Options`, `onRequest`) is
+  removed — access logging is the `accesslog` module's. Its group-commit writer moved there as
+  `accesslog.Sink` (same concurrency, tests and F4 bench) and writes `accesslog`'s full formats
+  (JSON Lines, logfmt, Combined with client address and time); its own `.combined` was the known
+  defect (lines goaccess refused) and its `.json` carried five fields. The JSON-path oracle moved
+  with it. No in-tree or known consumer used `AccessLog`.
+  - ADDED: `AccessEntry.req` / `.res` — the live request and response writer, borrowed for the
+    hook, so `accesslog.entryFromRequest` builds a full entry (README "Access log"). **BREAKING only
+    for code that constructs an `AccessEntry` itself.**
+  - Known defect gone; grade 5 → back to the evidence/scope axes.
+
 - **2026-10-06** — **Anchoring: registration rules against client_golang + JSON access log against
   Python** (`tools/go_oracle register` → `src/go_register_test.zig`; `tools/json_path_oracle.py`).
   - **BEHAVIOURAL:** a label name repeated within one call is `InvalidLabelName`; it was accepted and
