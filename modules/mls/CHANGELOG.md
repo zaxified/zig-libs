@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL:** a small-order X25519 HPKE key is refused at admission. A
+  KeyPackage whose `init_key` or leaf `encryption_key` is the all-zero point (or any other
+  small-order encoding) was accepted by an Add, after which every path Commit reaching that
+  leaf failed (`DhFailed`/`Malformed`) until it was removed. Now `createCommit` and
+  `processCommit` refuse such an Add or Update, and the external joiner's own KeyPackage, with
+  `error.LeafNodeInvalid`; `processCommit` refuses one in an UpdatePath (`LeafNodeInvalid` for
+  the leaf, `InvalidUpdatePath` for a parent node); `fromWelcome` and `joinByExternalCommit`
+  refuse an imported tree carrying one (`LeafNodeInvalid`). Detected as std's
+  `error.IdentityElement` from X25519 with a fixed scalar; X25519-KEM suites only; not a
+  `Policy` switch. 4 tests added (detector, `createCommit`, `processCommit` genuine + 4
+  insider forgeries, Welcome tree), RED before. Closes the SPEC Backlog item of the same day.
+
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** no leak on `createCommit`'s failure paths;
+  the mutation run's leak hint was a test artifact. With the committer's-own-Update,
+  two-GroupContextExtensions or duplicate-PSK check deleted, `createCommit` SUCCEEDS, and the
+  "leaked" buffers were the returned `commit`/`group_info` that the test's `expectError`
+  discarded. Checked on clean code anyway: 6 tests drive whole sessions (`create`,
+  `createCommit`, `fromWelcome`, `processCommit`, by-reference Update, `joinByExternalCommit`;
+  empty Commit, Add with `external_pub`, external PSK, path omitted) through
+  `std.testing.checkAllAllocationFailures` — 1339 failure points, all clean — and 1 test fails
+  an HPKE encapsulation midway through the Welcome slots and midway through the UpdatePath
+  ciphertexts: clean. Each instrument was shown to fire by deleting one `errdefer`. Found on
+  the way (SPEC Backlog, not fixed): an Add whose KeyPackage carries an all-zero X25519 key is
+  accepted, after which every path Commit reaching that leaf fails until it is removed.
+
 - **2026-10-06** — **Fixed a double free reachable from a received Commit.** A Commit whose
   proposal list names the same PreSharedKeyID twice made `validateProposalList` free its
   scratch encoding twice — explicitly, and again through its own `errdefer` — on both

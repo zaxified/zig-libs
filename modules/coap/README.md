@@ -145,11 +145,14 @@ server pushes a notification on each change (C7):
   notification: after `max_non_between_acks` NONs (default 5) it answers
   `.confirmable` until you report the client's ACK with `acknowledged`, and it
   also forces a CON every 24 hours (§4.5). `max_non_between_acks = null` turns
-  the budget off — only for an authenticated (DTLS) client.
+  the budget off — only for an authenticated (DTLS) client. Report only an ACK
+  whose Message ID matches the outstanding CON notification, and seed
+  `Server.init` from a CSPRNG: an empty ACK carries no token, so a predictable
+  notification id is all a spoofer needs to reset the budget.
 - **Admission (`Registry.tryRegister`, `AdmitFn`)** — on plain UDP, anyone can
   send an Observe registration, and unconditional FIFO eviction lets an
   attacker evict legitimate subscribers by registering enough new ones. Use
-  `tryRegister(source_id, tok, resource, seq)` instead of `register` on an
+  `tryRegister(source_id, tok, resource, seq, now_ms)` instead of `register` on an
   untrusted transport: it consults an optional `admit_fn`/`admit_ctx` hook
   (`?*anyopaque` ctx, function pointer, no allocation/closures) and an optional
   per-`source_id` cap (`max_per_source`) *before* touching the table, so a

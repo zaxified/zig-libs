@@ -376,6 +376,7 @@ pub const Adapter = struct {
             @intFromEnum(cip.Service.get_attribute_single) => return self.getAttributeSingle(req, class, out),
             @intFromEnum(cip.Service.reset) => {
                 if (!self.cfg.allow_reset) return errorReply(req.service, .privilege_violation, out);
+                if (out.len < 4) return error.BufferTooSmall;
                 self.reset_requested = true;
                 return (cip.Reply{
                     .service = req.service,
@@ -407,17 +408,22 @@ pub const Adapter = struct {
                 const us = connmgr.UnconnectedSend.decode(req.data) catch
                     return errorReply(req.service, .invalid_parameter_value, out);
                 // The route is walked by a real gateway; a leaf device just
-                // answers, which is what a simulator is.
-                var scratch: [4096]u8 = undefined;
-                const inner = try self.route(us.embedded, &scratch, depth + 1);
-                if (out.len < inner.len) return error.BufferTooSmall;
-                @memcpy(out[0..inner.len], inner);
-                return out[0..inner.len];
+                // answers, which is what a simulator is. The inner reply is
+                // built straight into `out` (the request lives elsewhere, so
+                // nothing overlaps). A private 4096-octet scratch used to size
+                // it to itself rather than to the room the caller has, which
+                // inside a `Multiple_Service_Packet` turned a read that could
+                // have come back `partial_transfer` into
+                // `error.BufferTooSmall` (review 2026-10-06).
+                return self.route(us.embedded, out, depth + 1);
             },
             connmgr.Service.forward_open, connmgr.Service.large_forward_open => {
                 const large = req.service == connmgr.Service.large_forward_open;
                 const fo = connmgr.ForwardOpen.decode(req.data, large) catch
                     return errorReply(req.service, .invalid_parameter_value, out);
+                // Room for the reply is checked before a slot is taken, so a
+                // reply that cannot be built leaves no connection behind.
+                if (out.len < 4 + connmgr.ForwardOpenReply.fixed_len) return error.BufferTooSmall;
                 const slot = self.freeConnection() orelse
                     return extendedErrorReply(
                         req.service,
@@ -458,6 +464,8 @@ pub const Adapter = struct {
             connmgr.Service.forward_close => {
                 const fc = connmgr.ForwardClose.decode(req.data) catch
                     return errorReply(req.service, .invalid_parameter_value, out);
+                // As for Forward_Open: no state change without room to say so.
+                if (out.len < 4 + connmgr.ForwardCloseReply.fixed_len) return error.BufferTooSmall;
                 var found = false;
                 for (&self.connections) |*c| {
                     // Matched on the triple, not on a connection id — the
@@ -518,18 +526,55 @@ pub const Adapter = struct {
         // was supplied than this operation can hold" — see `writeTag`'s use
         // of the same status when a write overruns its tag's storage.
         if (ms.count > max_batch) return errorReply(req.service, .too_much_data, out);
-        var replies: [max_batch][]const u8 = undefined;
-        var scratch: [4096]u8 = undefined;
-        var used: usize = 0;
-        var i: usize = 0;
-        while (i < ms.count) : (i += 1) {
-            const embedded = ms.at(i) catch
+        // The whole offset table is validated BEFORE any embedded request
+        // runs. `at(i)` checks entries `i` and `i + 1` only, so validating
+        // lazily applied a write in entry 0 and then refused the packet over
+        // entry 2 — a refusal that reads as "nothing happened" to the
+        // originator while the tag had changed (review 2026-10-06).
+        var embedded: [max_batch][]const u8 = undefined;
+        for (0..ms.count) |i| {
+            embedded[i] = ms.at(i) catch
                 return errorReply(req.service, .invalid_parameter_value, out);
-            const r = try self.route(embedded, scratch[used..], depth + 1);
+        }
+
+        // Every octet of the reply is budgeted before anything runs: the
+        // reply header (4), the count and offset table, and one minimal
+        // reply (4) for each embedded request still to come. Without that a
+        // large read early in the batch exhausted the space, and the overflow
+        // left `handle` as `error.BufferTooSmall` — no reply at all — after
+        // earlier writes in the same batch had been applied (review
+        // 2026-10-06). `max_reply` binds here as it does for a single read.
+        var scratch: [4096]u8 = undefined;
+        var payload: [4096]u8 = undefined;
+        const min_reply: usize = 4;
+        const cap = @min(@min(out.len, self.cfg.max_reply), @min(scratch.len, payload.len));
+        const overhead = 4 + 2 + 2 * ms.count;
+        if (cap < overhead + min_reply * ms.count) {
+            return errorReply(req.service, .reply_data_too_large, out);
+        }
+        const budget = cap - overhead;
+
+        var replies: [max_batch][]const u8 = undefined;
+        var used: usize = 0;
+        for (0..ms.count) |i| {
+            // Invariant: `used <= budget - min_reply * (count - i)`, so `room`
+            // always holds at least one minimal reply.
+            const limit = budget - min_reply * (ms.count - i - 1);
+            const room = scratch[used..limit];
+            const r = self.route(embedded[i], room, depth + 1) catch |e| switch (e) {
+                // Every handler that changes state checks its reply fits
+                // before changing it, so an overflow here has changed
+                // nothing: this entry alone is answered as too large.
+                error.BufferTooSmall => try errorReply(
+                    if (embedded[i].len > 0) embedded[i][0] & 0x7F else 0,
+                    .reply_data_too_large,
+                    room,
+                ),
+                else => return e,
+            };
             replies[i] = r;
             used += r.len;
         }
-        var payload: [4096]u8 = undefined;
         const encoded = cip.MultipleService.encode(replies[0..ms.count], &payload) catch
             return error.BufferTooSmall;
         return (cip.Reply{
@@ -849,6 +894,13 @@ pub const Adapter = struct {
         return v;
     }
 
+    /// `pathElement(path) * esize + byte_offset`, or null when that does not
+    /// fit a `usize`.
+    fn elementOffset(path: []const u8, esize: usize, byte_offset: usize) ?usize {
+        const elem = std.math.mul(usize, pathElement(path), esize) catch return null;
+        return std.math.add(usize, elem, byte_offset) catch null;
+    }
+
     fn readTag(self: *Adapter, req: cip.Request, fragmented: bool, out: []u8) Error![]const u8 {
         const tag = self.findTag(req.path) orelse
             return errorReply(req.service, .path_destination_unknown, out);
@@ -866,8 +918,11 @@ pub const Adapter = struct {
         }
 
         const esize = tag.elementSize();
-        const start_element = pathElement(req.path);
-        const start = start_element * esize + byte_offset;
+        // The member id and `byte_offset` are both peer-supplied u32s; their
+        // octet offset can overflow a 32-bit `usize`, and one that does is
+        // out of range, not a trap (review 2026-10-06).
+        const start = elementOffset(req.path, esize, byte_offset) orelse
+            return errorReply(req.service, .invalid_parameter_value, out);
         if (start > tag.bytes.len) return errorReply(req.service, .invalid_parameter_value, out);
         const want = @min(count * esize, tag.bytes.len - start);
         // The reply must fit both the caller's buffer and the configured
@@ -912,10 +967,13 @@ pub const Adapter = struct {
             return errorReply(req.service, .invalid_attribute_value, out);
         }
         const esize = tag.elementSize();
-        const start = pathElement(req.path) * esize + byte_offset;
-        if (start + values.len > tag.bytes.len) {
+        const start = elementOffset(req.path, esize, byte_offset) orelse
+            return errorReply(req.service, .too_much_data, out);
+        if (start > tag.bytes.len or values.len > tag.bytes.len - start) {
             return errorReply(req.service, .too_much_data, out);
         }
+        // No state change without room to report it (see `multipleService`).
+        if (out.len < 4) return error.BufferTooSmall;
         @memcpy(tag.bytes[start..][0..values.len], values);
         self.writes += 1;
         return (cip.Reply{

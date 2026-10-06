@@ -5,6 +5,64 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** client hardening against a
+  hostile server (review 2026-10-06, open item (b)). `Channel.recvService` now
+  frees everything it decoded when it refuses a response — a string-typed
+  response NodeId, a `ServiceFault`, a response with a Bad ServiceResult, the
+  fields of a struct a truncated body cut short, and a decode that ran out of
+  memory part-way all leaked per response before; it decodes through a private
+  tracking allocator, and an accepted response is still plain caller-allocator
+  memory freed with the same `free*Response`. On a signed or encrypted channel
+  every response chunk's SequenceNumber must now follow the previous one
+  (`security.sequenceFollows`, moved there from `server.zig` and now `pub`;
+  the `issue` OPN response starts the count, tracked in the new defaulted field
+  `Channel.recv_sequence_number`), else the new
+  `ServiceError.SequenceNumberInvalid` — a replayed signed response used to be
+  accepted. (An exhaustive `switch` over `ServiceError` without an `else` needs
+  an arm for the new member; nothing in this repository has one.) The asyncua transcript and the Basic256Sha256 goldens are unchanged
+  and still pass byte for byte.
+
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** the pre-authentication RSA cost
+  of an OpenSecureChannel is bounded (review 2026-10-06, open item (a)). Every OPN
+  chunk used to be RSA-OAEP-decrypted block by block before its signature could
+  be checked — ≈250 private-key operations per 64 KiB chunk under a 2048-bit key,
+  up to `max_chunk_count` chunks, for any stranger. Now an OPN must be a single
+  final chunk (`C` or `A` → `ERR BadTcpMessageTypeInvalid`, as open62541 answers;
+  asyncua sends OPN as one chunk citing OPC 10000-6 §6.7.2), and its encrypted
+  region may not exceed the new `SecurityConfig.max_opn_encrypted_len` (default
+  4096 bytes — at most 16 private-key operations at 2048 bits, 8 at 4096; a real
+  asyncua OPN is 512) → `ERR BadTcpMessageTooLarge`. Both are decided on the
+  header before any RSA operation. The asyncua transcript and the
+  Basic256Sha256 goldens are unchanged and still pass byte for byte.
+
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** Review: adversarial re-review
+  of the code since the 2026-09-02 review (C4–C8) and the server receive path.
+  Five findings, all fixed, each with a test that failed before the fix (see
+  SPEC.md, *Review 2026-10-06*). The two that change what the server accepts:
+  - **H1:** a `renew` OpenSecureChannel must keep the channel's
+    SecurityPolicy; a `#None` channel renewed under Basic256Sha256 is now
+    refused with `ERR BadSecurityPolicyRejected`. Before this, the None token
+    became the overlap token with no keys, and a MSG naming it reached
+    `c.prev_keys.?`: a remote panic (Debug/ReleaseSafe) from any peer with any
+    self-signed certificate, wherever `#None` was offered beside a secured
+    endpoint. The `.?` is now an `ERR` too.
+  - **M1:** on a secured channel every chunk's `SequenceNumber` must be the
+    previous one + 1 (OPC 10000-6 §6.7.2.4, with the wrap below 1024 that
+    open62541 and asyncua accept), else `ERR BadSecurityChecksFailed`. It was
+    read and discarded, so a captured signed or encrypted Write/Call could be
+    replayed for the token's whole life. The asyncua transcript and the
+    Basic256Sha256 goldens are unchanged and still pass byte for byte.
+  - Memory-safety on OutOfMemory only, no change to any output: **L1**
+    `sampleDue` no longer frees `last_value` before its replacement exists (a
+    failure there left a dangling pointer, later freed twice); **L2** C4's
+    `decodeArray`/`decodeVariantArraySlice` grow the list before decoding an
+    element, so a failed growth no longer leaks it; **L3**
+    `NodeStore.dupAttributes` gets C7's errdefers.
+  - Reported and not fixed (owner's decision): the pre-authentication RSA cost
+    of a large or multi-chunk OPN; client-side leaks and the missing
+    `SequenceNumber` check in `Channel.recvService` against a hostile server;
+    `Config.max_lifetime_count` below 3× keep-alive overriding §5.13.2's floor.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** test fixtures re-taken after montint's
   review fix L2 (Miller-Rabin witnesses now near-uniform over `[2, m − 2]`), which changes
   which prime a seeded `rsa.generate` lands on. The self-derived Basic256Sha256 golden

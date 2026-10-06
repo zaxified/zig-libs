@@ -1220,7 +1220,16 @@ to be:
   epoch transition because it is a property of the finished tree and no
   earlier point can answer it.
 
-Both default ON and both are `Policy` switches. Both run in BOTH directions,
+Both default ON and both are `Policy` switches.
+
+Since 2026-10-06 a third rule is taken here, and it is NOT a switch: an
+X25519 HPKE key of small order — a leaf's `encryption_key`, a KeyPackage's
+`init_key`, an UpdatePath node's key, any node key of a tree imported whole
+— is refused at admission (`error.LeafNodeInvalid`; an UpdatePath parent
+node's key `error.InvalidUpdatePath`). RFC 9420 does not name it, but such a
+key is unusable rather than a policy choice: every HPKE encapsulation to it
+fails (RFC 9180 §7.1.4), so admitting one only defers the failure to every
+later Commit that must encrypt to it. See the Backlog's Done list. Both run in BOTH directions,
 and all three `passive-client-*.json` sessions replay green with them on —
 which is itself a small piece of evidence that the reading is the same one
 the reference implementation uses.
@@ -1570,6 +1579,27 @@ Equivalent: the "committer's encryption key must change" check
 (`rejectReusedPathKeys` runs right after it over a tree that still holds the
 committer's old leaf, and refuses the same message with the same error).
 
+**The run's leak hint — RESOLVED 2026-10-06, no leak.** The mutants that
+deleted the committer's-own-Update, two-GroupContextExtensions and
+duplicate-PSK checks made `testing.allocator` report leaks, read at the
+time as missing `errdefer`s on `createCommit`'s later failure paths.
+Reproduced: with those checks gone `createCommit` SUCCEEDS, and the leaked
+buffers are the returned `commit`/`group_info`, which the test's
+`expectError` received as an unexpected success and never freed — a test
+artifact, not a library path. Checked anyway on clean code with
+`std.testing.checkAllAllocationFailures` over whole sessions under one
+failing allocator (`create`, `createCommit`, `fromWelcome`,
+`processCommit`, `updateLeaf`/`createProposal`, `joinByExternalCommit`;
+six shapes: empty full Commit, Add with `external_pub` and extra GroupInfo
+extensions, external PSK, by-reference Update, path omitted, external join
+with a PSK — 148 to 296 failure points each, 1339 in all): every point
+clean. Non-OOM failures after validation are covered too: `DuplicateKeyInTree`
+and `PskNotAvailable` by existing tests, and an HPKE failure midway through
+the Welcome slots and midway through the UpdatePath ciphertexts by a new
+one (an all-zero X25519 key, which admission now refuses — the test seats
+it through a test-only hook; see Backlog, Done). Both instruments were shown to
+fire by deleting one `errdefer` each.
+
 ## Threat model
 
 - **`codec.Reader` on hostile input.** Every `read*` function is bounds-
@@ -1646,6 +1676,11 @@ committer's old leaf, and refuses the same message with the same error).
   does NOT check, and the caller MUST, is listed in its doc comment — most
   importantly that `GroupInfo.signer` names a non-blank leaf whose
   `signature_key` is the one passed in, and the tree-integrity block.
+- **A low-order HPKE key from a peer.** A KeyPackage, LeafNode, UpdatePath
+  or imported tree carrying a small-order X25519 key would make every later
+  encapsulation to it fail — one member wedging every path Commit that
+  reaches its leaf. Refused at admission (`error.LeafNodeInvalid`, or
+  `error.InvalidUpdatePath` for an UpdatePath parent key) since 2026-10-06.
 - **A ratchet tree from an untrusted source (Part 6).** §12.4.3.3 permits
   the tree to arrive out of band precisely because `verifyTreeHash` binds
   it to the SIGNED `GroupContext`. That check is exposed as its own
@@ -1757,6 +1792,28 @@ committer's old leaf, and refuses the same message with the same error).
 - **ReInit and subgroup branch (§11.2/§11.3)** *(survey 2026-09-30)*: named in README as remaining. Effort: small-medium once resumption PSKs (already done) are used. Fits §2.
 
 ### Done (kept for the record, not open)
+
+- **A low-order X25519 key at admission — FIXED 2026-10-06** *(found the
+  same day by the mutation run's leak work)*. An all-zero (or any other
+  small-order) `init_key` or leaf `encryption_key` was well-formed, signed
+  fine, and passed every §12.2/§10.1 check; once seated, every path Commit
+  whose resolution reached it failed for the committer (`DhFailed` from the
+  Welcome, `Malformed` from `treekem.sealUpdatePath`) until a Remove took it
+  out. Now refused where keys enter, in both directions:
+  `checkLeafSelfConsistent` (Add and Update proposals for `createCommit` and
+  `processCommit`, the external joiner's own KeyPackage), the Add arm of
+  `applyProposals` for `init_key`, `processCommit`'s UpdatePath (leaf and
+  parent-node keys) and `verifiedTreeFromGroupInfo` (every node of a tree
+  `fromWelcome` or `joinByExternalCommit` imports). The test is std's own:
+  X25519 with a fixed clamped scalar returns `error.IdentityElement`
+  exactly for the small-order points (`isLowOrderHpkeKey`; X25519-KEM
+  suites only). Tests: the detector over all eight small-order encodings;
+  `createCommit` refusing both KeyPackages with and without a path;
+  `processCommit` refusing a genuine Commit from a non-checking committer
+  and four insider forgeries (Add swapped for either KeyPackage, path leaf
+  key, path node key); a Welcome whose tree carries such a leaf. RED before
+  (`DhFailed`, accepted, `Malformed`, joined), and each of the four
+  admission points was deleted in turn to show a test fails without it.
 
 - **§8.3 external init — DONE 2026-07-29** (`keyschedule.externalInitSender`/
   `externalInitReceiver`), and honestly labelled: it is the only derivation

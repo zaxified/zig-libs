@@ -367,6 +367,13 @@ pub const Registry = struct {
     /// The client acknowledged a confirmable notification on `(tok, resource)`
     /// — its interest is confirmed, so the §7 budget and the §4.5 clock start
     /// over. Returns whether such a subscription exists.
+    ///
+    /// ⚠ The registry does not check that a confirmable notification was
+    /// outstanding: call this only for an ACK whose Message ID matches the
+    /// CON notification the caller is retransmitting for `(tok, resource)` —
+    /// never for an id that went out non-confirmable, and never off the token
+    /// alone (an empty ACK carries none). A forged ACK resets the §7 budget, so
+    /// the notification ids must be unpredictable: see `server.Server.init`.
     pub fn acknowledged(self: *Registry, tok: []const u8, resource: u64, now_ms: u64) bool {
         const e = self.find(tok, resource) orelse return false;
         e.non_since_ack = 0;

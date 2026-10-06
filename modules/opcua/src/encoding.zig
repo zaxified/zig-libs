@@ -350,7 +350,14 @@ fn decodeVariantArraySlice(
         for (list.items) |it| freeItem(d.allocator, it);
         list.deinit(d.allocator);
     }
-    for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
+    for (0..n) |_| {
+        // Grow BEFORE decoding: an element decoded first and then refused by
+        // a failed `append` is in no list the `errdefer` above can see, so it
+        // leaked (review 2026-10-06, L2). The capacity check still runs per
+        // element, so a hostile count cannot pre-size anything.
+        try list.ensureUnusedCapacity(d.allocator, 1);
+        list.appendAssumeCapacity(try decodeItem(d));
+    }
     return try list.toOwnedSlice(d.allocator);
 }
 
@@ -1201,6 +1208,26 @@ test "decodeVariantArraySlice frees already-decoded elements when the array is t
     var r: std.Io.Reader = .fixed(w.buffered());
     var d = Decoder.init(&r, testing.allocator);
     try testing.expectError(error.EndOfStream, decodeVariantArraySlice(&d, ?[]const u8, Decoder.decodeString, freeOptStr));
+}
+
+fn decodeStringArrayVariant(a: std.mem.Allocator, wire: []const u8) !void {
+    var r: std.Io.Reader = .fixed(wire);
+    var d = Decoder.init(&r, a);
+    freeVariant(a, try d.decodeVariant());
+}
+
+test "decodeVariantArraySlice leaks nothing when an allocation fails mid-array (L2)" {
+    // Review 2026-10-06, L2: the OutOfMemory half of C4 — see services.zig's
+    // twin. A String-array Variant (encoding byte 12 | array bit) of three.
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeByte(12 | 0x80);
+    try w.writeInt(i32, 3, .little);
+    inline for (.{ "first", "second", "third" }) |s| {
+        try w.writeInt(i32, s.len, .little);
+        try w.writeAll(s);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeStringArrayVariant, .{w.buffered()});
 }
 
 test "DateTime round-trip" {

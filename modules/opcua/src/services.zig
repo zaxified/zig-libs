@@ -49,6 +49,11 @@ pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transpo
     /// response type or ServiceFault, or its SequenceHeader.RequestId didn't
     /// match the request just sent.
     UnexpectedResponseType,
+    /// On a signed or encrypted channel, a response chunk's SequenceNumber
+    /// was not the previous one + 1 (`security.sequenceFollows`, OPC 10000-6
+    /// §6.7.2.4): a replayed, reordered or dropped chunk. The channel can no
+    /// longer be trusted and should be closed.
+    SequenceNumberInvalid,
 };
 
 /// `SecurityPolicy#None`'s URI (OPC 10000-7 §6.2.1) — the SecurityPolicy the
@@ -377,7 +382,14 @@ fn decodeArray(
         for (list.items) |it| freeItem(d.allocator, it);
         list.deinit(d.allocator);
     }
-    for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
+    for (0..n) |_| {
+        // Grow BEFORE decoding: an element decoded first and then refused by
+        // a failed `append` is in no list the `errdefer` above can see, so it
+        // leaked (review 2026-10-06, L2). The capacity check still runs per
+        // element, so a hostile count cannot pre-size anything.
+        try list.ensureUnusedCapacity(d.allocator, 1);
+        list.appendAssumeCapacity(try decodeItem(d));
+    }
     return try list.toOwnedSlice(d.allocator);
 }
 
@@ -411,6 +423,28 @@ test "decodeArray frees already-decoded elements when the array is truncated (C4
     var r: std.Io.Reader = .fixed(w.buffered());
     var d = encoding.Decoder.init(&r, testing.allocator);
     try testing.expectError(error.EndOfStream, decodeArray(&d, ?[]const u8, decodeStringItem, freeOptStr));
+}
+
+fn decodeThreeStrings(a: std.mem.Allocator, wire: []const u8) !void {
+    var r: std.Io.Reader = .fixed(wire);
+    var d = encoding.Decoder.init(&r, a);
+    freeStringArray(a, try decodeArray(&d, ?[]const u8, decodeStringItem, freeOptStr));
+}
+
+test "decodeArray leaks nothing when an allocation fails mid-array (L2)" {
+    // Review 2026-10-06, L2 — the OutOfMemory half of C4. `list.append(a,
+    // try decodeItem(d))` decoded an element (allocating it) and then lost it
+    // when growing the list failed: the `errdefer` only frees what is already
+    // IN the list. Every allocation is failed in turn; `testing.allocator`
+    // reports anything left behind.
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(i32, 3, .little);
+    inline for (.{ "first", "second", "third" }) |s| {
+        try w.writeInt(i32, s.len, .little);
+        try w.writeAll(s);
+    }
+    try std.testing.checkAllAllocationFailures(testing.allocator, decodeThreeStrings, .{w.buffered()});
 }
 
 /// Skip one Int32-length-prefixed String/ByteString without allocating,
@@ -2932,6 +2966,70 @@ pub fn freeSetMonitoringModeResponse(a: std.mem.Allocator, v: SetMonitoringModeR
 const max_chunk_body: usize = 65536;
 const max_message_size: usize = 65536;
 
+/// The allocator `Channel.recvService` decodes through: a pass-through to
+/// `backing` that remembers every block still live, so a refused response
+/// can be freed whole — including the fields of a struct a truncated body
+/// cut short, which no `free*` function could reach — and an accepted one
+/// is handed to the caller as ordinary `backing` memory (the caller frees it
+/// with `backing`, as before).
+const DecodeTracker = struct {
+    backing: std.mem.Allocator,
+    live: std.AutoHashMapUnmanaged(usize, Block) = .empty,
+
+    const Block = struct { len: usize, alignment: std.mem.Alignment };
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(t: *DecodeTracker) std.mem.Allocator {
+        return .{ .ptr = t, .vtable = &vtable };
+    }
+
+    /// Forget the bookkeeping; the blocks stay with whoever owns them now.
+    fn deinit(t: *DecodeTracker) void {
+        t.live.deinit(t.backing);
+    }
+
+    /// Free every block still live — the refusal path.
+    fn freeAll(t: *DecodeTracker) void {
+        var it = t.live.iterator();
+        while (it.next()) |entry| {
+            const ptr: [*]u8 = @ptrFromInt(entry.key_ptr.*);
+            t.backing.rawFree(ptr[0..entry.value_ptr.len], entry.value_ptr.alignment, @returnAddress());
+        }
+        t.live.clearRetainingCapacity();
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const t: *DecodeTracker = @ptrCast(@alignCast(ctx));
+        t.live.ensureUnusedCapacity(t.backing, 1) catch return null;
+        const ptr = t.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        t.live.putAssumeCapacity(@intFromPtr(ptr), .{ .len = len, .alignment = alignment });
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const t: *DecodeTracker = @ptrCast(@alignCast(ctx));
+        if (!t.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (t.live.getPtr(@intFromPtr(memory.ptr))) |block| block.len = new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const t: *DecodeTracker = @ptrCast(@alignCast(ctx));
+        t.live.ensureUnusedCapacity(t.backing, 1) catch return null;
+        const ptr = t.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        _ = t.live.remove(@intFromPtr(memory.ptr));
+        t.live.putAssumeCapacity(@intFromPtr(ptr), .{ .len = new_len, .alignment = alignment });
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const t: *DecodeTracker = @ptrCast(@alignCast(ctx));
+        _ = t.live.remove(@intFromPtr(memory.ptr));
+        t.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// The low-level "send one service request, receive one service response"
 /// helper `root.zig`'s `SecureChannel`/`Session` are built on: owns the
 /// per-channel bookkeeping (channel/token ids, sequence/request-id
@@ -2954,6 +3052,12 @@ pub const Channel = struct {
     token_id: u32 = 0,
     sequence_number: u32 = 0,
     request_id: u32 = 0,
+    /// The SequenceNumber of the last authenticated (signed/encrypted) chunk
+    /// the server sent; the next must follow it (`security.sequenceFollows`).
+    /// `null` until the first one arrives — which, on a real channel, is the
+    /// `OpenSecureChannel` response that sets the count. Unused at
+    /// SecurityMode=None, where a SequenceNumber proves nothing.
+    recv_sequence_number: ?u32 = null,
     /// `ResponseHeader.service_result` (or a ServiceFault's) from the most
     /// recent call that returned `error.ServiceFault`/`error.BadServiceResult`.
     last_service_result: encoding.StatusCode = 0,
@@ -3104,7 +3208,10 @@ pub const Channel = struct {
     /// result` carries its StatusCode); a Bad `service_result` on the
     /// expected response type maps to `error.BadServiceResult` (same
     /// field); a request-id mismatch or unexpected type-id is
-    /// `error.UnexpectedResponseType`.
+    /// `error.UnexpectedResponseType`; on a signed/encrypted channel a chunk
+    /// whose SequenceNumber does not follow the last one is
+    /// `error.SequenceNumberInvalid`. Every refusal frees whatever it had
+    /// decoded; only a returned response is the caller's to free.
     pub fn recvService(
         ch: *Channel,
         message_type: transport.MessageType,
@@ -3176,16 +3283,41 @@ pub const Channel = struct {
                 },
                 else => unreachable,
             }
-            _ = try hr.takeInt(u32, .little); // SequenceNumber — not independently validated
+            const sequence_number = try hr.takeInt(u32, .little);
+            // An authenticated chunk proves the server sent these bytes, not
+            // that it sent them only once (OPC 10000-6 §6.7.2.4). The server
+            // side's rule, mirrored: the response to an `issue` OPN (sent
+            // before this channel had an id) starts the count, a renewal's
+            // continues it, as open62541 does in both roles. At
+            // SecurityMode=None nothing is authenticated, so nothing is checked.
+            if (opened != null) {
+                const rebase = message_type == .open_secure_channel and ch.channel_id == 0;
+                if (ch.recv_sequence_number) |prev| {
+                    if (!rebase and !security.sequenceFollows(prev, sequence_number)) return error.SequenceNumberInvalid;
+                }
+                ch.recv_sequence_number = sequence_number;
+            }
             const chunk_request_id = try hr.takeInt(u32, .little);
             if (chunk_request_id != ch.request_id) return error.UnexpectedResponseType;
 
             if (try assembler.feed(chunk.header.chunk_type, hr.buffered())) |msg| break msg;
         };
 
+        // Everything decoded below comes from the server and lands in the
+        // caller's allocator, but only a response returned here is the
+        // caller's to free. A refusal — a ServiceFault, a Bad result, an
+        // unexpected type id, a body that runs out half-way through a struct,
+        // an OutOfMemory — frees all of it, whatever the decoder had built so
+        // far (review 2026-10-06: each of those used to leak per response).
+        var tracker: DecodeTracker = .{ .backing = ch.allocator };
+        defer tracker.deinit();
+        errdefer tracker.freeAll();
+        const ta = tracker.allocator();
+
         var r: std.Io.Reader = .fixed(full);
-        var d = encoding.Decoder.init(&r, ch.allocator);
+        var d = encoding.Decoder.init(&r, ta);
         const resp_type = try d.decodeNodeId();
+        defer encoding.freeNodeId(ta, resp_type);
         if (nodeIdEql(resp_type, type_id.service_fault)) {
             const fault = try decodeServiceFault(&d);
             ch.last_service_result = fault.response_header.service_result;
@@ -4486,4 +4618,157 @@ test "RepublishRequest/Response round-trip" {
     defer freeRepublishResponse(testing.allocator, decoded2);
     try testing.expectEqual(@as(u32, 5), decoded2.notification_message.sequence_number);
     try testing.expectEqual(@as(u32, 5), decoded2.notification_message.sequence_number);
+}
+
+// ── Review 2026-10-06, open item (b): a hostile server against the client ───
+// `recvService` decodes server-controlled bytes with the caller's allocator,
+// but only a response it hands back is the caller's to free. Each refusal
+// below used to leak what had been decoded before it was refused —
+// `testing.allocator` reports the leak, so each test failed before the fix.
+
+const hostile_response = struct {
+    /// The unsecured MSG body of a response on channel 7 / token 3:
+    /// SecurityHeader + SequenceHeader (RequestId 1), then `payload`.
+    fn body(buf: []u8, sequence_number: u32, payload: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeInt(u32, 7, .little) catch unreachable; // SecureChannelId
+        w.writeInt(u32, 3, .little) catch unreachable; // TokenId
+        w.writeInt(u32, sequence_number, .little) catch unreachable;
+        w.writeInt(u32, 1, .little) catch unreachable; // RequestId
+        w.writeAll(payload) catch unreachable;
+        return w.buffered();
+    }
+
+    /// A ReadResponse whose header carries a StringTable (an allocation
+    /// to leak) and the given service result, behind its type id.
+    fn readResponse(buf: []u8, service_result: encoding.StatusCode) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        var e = encoding.Encoder.init(&w);
+        e.encodeNodeId(type_id.read_response) catch unreachable;
+        encodeReadResponse(&e, .{
+            .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = service_result, .service_diagnostics = .{}, .string_table = &[_]?[]const u8{ "hostile", "server" }, .additional_header = no_additional_header },
+            .results = &[_]encoding.DataValue{.{ .value = .{ .scalar = .{ .string = "a decoded string" } }, .status = 0 }},
+            .diagnostic_infos = null,
+        }) catch unreachable;
+        return w.buffered();
+    }
+
+    /// Feed one SecurityMode=None MSG chunk carrying `payload` to a fresh
+    /// client channel waiting for a ReadResponse; return what it made of it.
+    fn recv(payload: []const u8) ServiceError!ReadResponse {
+        var body_buf: [1024]u8 = undefined;
+        const b = body(&body_buf, 1, payload);
+        var chunk_buf: [1024]u8 = undefined;
+        var srv_w: std.Io.Writer = .fixed(&chunk_buf);
+        var srv_conn = transport.Connection.init(undefined, &srv_w);
+        srv_conn.sendChunk(.{ .message_type = .message, .chunk_type = .final, .message_size = 8 + @as(u32, @intCast(b.len)) }, b) catch unreachable;
+
+        var out_buf: [64]u8 = undefined;
+        var out_w: std.Io.Writer = .fixed(&out_buf);
+        var in_r: std.Io.Reader = .fixed(srv_w.buffered());
+        var conn = transport.Connection.init(&in_r, &out_w);
+        var ch: Channel = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3, .request_id = 1 };
+        return ch.recvService(.message, ReadResponse, type_id.read_response, decodeReadResponse, result_fns.read);
+    }
+};
+
+test "hostile server: a string-typed response NodeId is refused without a leak" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    try e.encodeNodeId(.{ .string = .{ .namespace = 1, .id = "not-a-response-type" } });
+    try testing.expectError(error.UnexpectedResponseType, hostile_response.recv(w.buffered()));
+}
+
+test "hostile server: a ServiceFault is refused without a leak" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    try e.encodeNodeId(type_id.service_fault);
+    try encodeServiceFault(&e, .{ .response_header = .{ .timestamp = 0, .request_handle = 1, .service_result = 0x80010000, .service_diagnostics = .{}, .string_table = &[_]?[]const u8{"fault detail"}, .additional_header = no_additional_header } });
+    try testing.expectError(error.ServiceFault, hostile_response.recv(w.buffered()));
+}
+
+test "hostile server: a response with a Bad ServiceResult is refused without a leak" {
+    var buf: [512]u8 = undefined;
+    try testing.expectError(error.BadServiceResult, hostile_response.recv(hostile_response.readResponse(&buf, 0x80390000)));
+}
+
+test "hostile server: a truncated response frees the fields decoded before the cut" {
+    var buf: [512]u8 = undefined;
+    const full = hostile_response.readResponse(&buf, 0);
+    // Every cut point: the header's StringTable is decoded long before the
+    // results run out.
+    for (1..full.len) |cut| {
+        if (hostile_response.recv(full[0..cut])) |resp| {
+            freeReadResponse(testing.allocator, resp);
+            return error.TestUnexpectedSuccess;
+        } else |_| {}
+    }
+}
+
+test "hostile server: a decode that runs out of memory part-way leaks nothing" {
+    var buf: [512]u8 = undefined;
+    const full = hostile_response.readResponse(&buf, 0);
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: std.mem.Allocator, payload: []const u8) !void {
+            var body_buf: [1024]u8 = undefined;
+            const b = hostile_response.body(&body_buf, 1, payload);
+            var chunk_buf: [1024]u8 = undefined;
+            var srv_w: std.Io.Writer = .fixed(&chunk_buf);
+            var srv_conn = transport.Connection.init(undefined, &srv_w);
+            try srv_conn.sendChunk(.{ .message_type = .message, .chunk_type = .final, .message_size = 8 + @as(u32, @intCast(b.len)) }, b);
+            var out_buf: [64]u8 = undefined;
+            var out_w: std.Io.Writer = .fixed(&out_buf);
+            var in_r: std.Io.Reader = .fixed(srv_w.buffered());
+            var conn = transport.Connection.init(&in_r, &out_w);
+            var ch: Channel = .{ .conn = &conn, .allocator = a, .channel_id = 7, .token_id = 3, .request_id = 1 };
+            const resp = try ch.recvService(.message, ReadResponse, type_id.read_response, decodeReadResponse, result_fns.read);
+            freeReadResponse(a, resp);
+        }
+    }.run, .{full});
+}
+
+// The client read the server's SequenceNumber and threw it away, so a signed
+// response captured off the wire verified again when played back: an on-path
+// attacker could answer a later Read with an earlier one's values. The same
+// rule as the server's (`security.sequenceFollows`, review 2026-10-06 M1).
+test "hostile server: on a signed channel the response SequenceNumber must be the previous + 1" {
+    const keys = security.deriveKeys("client-nonce-0123456789abcdef012", "server-nonce-0123456789abcdef012", .basic256sha256);
+    var payload_buf: [512]u8 = undefined;
+    const payload = hostile_response.readResponse(&payload_buf, 0);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    // 5 (the first secured chunk sets the count), 5 again (a replay), 7 (a
+    // gap), then 6 (the real successor).
+    const sequence = [_]u32{ 5, 5, 7, 6 };
+    for (sequence) |n| {
+        var body_buf: [1024]u8 = undefined;
+        const sealed = try security.symmetricSignAndEncrypt(testing.allocator, "MSG", hostile_response.body(&body_buf, n, payload), .sign, keys, .server_to_client);
+        defer testing.allocator.free(sealed);
+        try wire.appendSlice(testing.allocator, sealed);
+    }
+
+    var out_buf: [64]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var in_r: std.Io.Reader = .fixed(wire.items);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: Channel = .{
+        .conn = &conn,
+        .allocator = testing.allocator,
+        .channel_id = 7,
+        .token_id = 3,
+        .request_id = 1,
+        .security = .{ .policy = .basic256sha256, .mode = .sign, .keys = keys },
+    };
+    const outcome = [_]?anyerror{ null, error.SequenceNumberInvalid, error.SequenceNumberInvalid, null };
+    for (outcome) |expected| {
+        const got = ch.recvService(.message, ReadResponse, type_id.read_response, decodeReadResponse, result_fns.read);
+        if (expected) |err| {
+            try testing.expectError(err, got);
+        } else {
+            freeReadResponse(testing.allocator, try got);
+        }
+    }
 }

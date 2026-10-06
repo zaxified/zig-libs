@@ -61,6 +61,19 @@ pub fn ackOnly(request: coap.Message) coap.Message {
 pub const Server = struct {
     next_mid: u16,
 
+    /// ⚠ **`seed_mid` must be random (a CSPRNG) on any unsecured transport**
+    /// (RFC 7252 §4.4: the initial Message ID "SHOULD be randomized"). The
+    /// counter advances by one per separate response, so every later id is
+    /// arithmetic on the seed. That matters most for Observe: the ACK that
+    /// resets RFC 7641 §7's notification budget (`observe.Registry.acknowledged`)
+    /// is normally an EMPTY message that echoes only the confirmable
+    /// notification's Message ID — no token — and in the attack §7 is about the
+    /// spoofer chose the token itself in the forged registration. A predictable
+    /// id is therefore all an off-path attacker needs to forge that ACK and
+    /// keep the non-confirmable stream to its victim running ("an attacker may
+    /// still spoof the acknowledgements if the confirmable messages are
+    /// sufficiently predictable", §7). The module has no RNG, so the
+    /// randomness has to be in this seed.
     pub fn init(seed_mid: u16) Server {
         return .{ .next_mid = seed_mid };
     }

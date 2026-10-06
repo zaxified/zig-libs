@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — Review: adversarial re-review of the code after the 2026-09-03 audit (the
+  RFC 7641 §7 notification budget and the `fuzzParse` rewrite). No code change, no behaviour
+  change. 4 findings, 2 fixed in docs: `server.Server.init` now states that `seed_mid` must come
+  from a CSPRNG — the empty ACK that resets the §7 budget echoes only the notification's Message
+  ID, and SPEC/`Client.init` had credited the client's token seed instead; `Registry.acknowledged`
+  states it must be bound to the outstanding CON's Message ID; README's `tryRegister` signature
+  gains `now_ms`. Not fixed, recorded in SPEC: `acknowledged` does not verify a CON was
+  outstanding (needs an API change); an over-long caller-supplied token is truncated into an
+  entry nothing can match (not reachable from `parse`).
+
 - **2026-09-13** — A1 finding "notification volume" (RFC 7641 §7 MUST). Additive API:
   `observe.Registry.notificationType(token, resource, now_ms)` tells the push path whether the
   next notification must be confirmable, and `Registry.acknowledged(token, resource, now_ms)`

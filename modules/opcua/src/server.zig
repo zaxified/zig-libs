@@ -156,6 +156,22 @@ pub const SecurityConfig = struct {
     /// anything past this is `BadCertificateInvalid` rather than an
     /// unbounded allocation driven by a stranger.
     max_certificate_len: usize = 8192,
+    /// Largest encrypted region (SequenceHeader..signature, i.e. everything
+    /// after the clear `AsymmetricAlgorithmSecurityHeader`) of an
+    /// `OpenSecureChannel` this server will RSA-decrypt, bytes. That region is
+    /// decrypted one RSA-OAEP block — one private-key operation — at a time
+    /// *before* its signature can be checked, so every byte of it is work a
+    /// stranger buys for free; without a cap a 64 KiB OPN chunk cost ≈250
+    /// private-key operations under a 2048-bit key (review 2026-10-06). A real
+    /// OPN request is a 32-byte nonce, a few fixed fields and one signature:
+    /// asyncua's is 512 bytes under a 2048-bit key, and even a 4096-bit server
+    /// key with an 8192-bit client signature needs three 512-byte blocks.
+    /// The default is twice that worst case, which bounds an unauthenticated
+    /// OPN to 16 private-key operations at 2048 bits and 8 at 4096. Larger is
+    /// `ERR BadTcpMessageTooLarge`, decided on the clear header alone. (The
+    /// `SenderCertificate` in that header is bounded separately, by
+    /// `max_certificate_len`, and costs no private-key work.)
+    max_opn_encrypted_len: usize = 4096,
 };
 
 pub const Config = struct {
@@ -746,6 +762,9 @@ pub const ConnectionState = enum {
     closed,
 };
 
+/// OPC 10000-6 §6.7.2.4's successor rule, shared with the client side.
+const sequenceFollows = security.sequenceFollows;
+
 /// The negotiated limits (§7.1.3): the minimum of what each side proposed.
 pub const Negotiated = struct {
     receive_buffer_size: u32 = 65_536,
@@ -775,6 +794,12 @@ pub const Connection = struct {
     token_created_ms: i64 = 0,
     token_lifetime_ms: u32 = 0,
     send_sequence_number: u32 = 0,
+    /// The SequenceNumber of the last chunk that arrived *authenticated*
+    /// (signed, and decrypted at SignAndEncrypt). Every later secured chunk
+    /// must carry `sequenceFollows` of it — the replay defence of
+    /// OPC 10000-6 §6.7.2.4. Rebased by an `issue` OPN; unused at `#None`,
+    /// where nothing about a chunk is authenticated anyway.
+    recv_sequence_number: u32 = 0,
     endpoint_url_buf: [256]u8 = undefined,
     endpoint_url_len: usize = 0,
 
@@ -1055,6 +1080,16 @@ pub const Connection = struct {
             try c.fail(out, status.bad_tcp_internal_error, "truncated secure-conversation header");
             return;
         }
+        // An OpenSecureChannel is one final chunk (OPC 10000-6 §6.7.2; asyncua
+        // sends it so, open62541 refuses anything else with this same code).
+        // Decided on the MessageHeader alone, before the security stage: a
+        // multi-chunk OPN was otherwise RSA-decrypted chunk by chunk, up to
+        // `max_chunk_count` of them, before a single signature had been
+        // checked (review 2026-10-06).
+        if (message_type == .open_secure_channel and chunk_type != .final) {
+            try c.fail(out, status.bad_tcp_message_type_invalid, "OpenSecureChannel must be a single final chunk");
+            return;
+        }
         const unsealed: ChunkOpen = switch (message_type) {
             .open_secure_channel => try c.openAsymmetricChunk(header, wire_body, out, now_ms),
             .message, .close_secure_channel => try c.openSymmetricChunk(header, wire_body, out, now_ms),
@@ -1113,12 +1148,28 @@ pub const Connection = struct {
         }
 
         // SequenceHeader (§6.7.3). SecurityMode=None gives no integrity
-        // protection, so a sequence number is not independently validated —
-        // it is only carried back on the response.
-        _ = r.takeInt(u32, .little) catch {
+        // protection, so there a sequence number is not validated — it is only
+        // carried back on the response.
+        const sequence_number = r.takeInt(u32, .little) catch {
             try c.fail(out, status.bad_tcp_internal_error, "truncated sequence header");
             return;
         };
+        // On an authenticated chunk it is the replay defence (§6.7.2.4): the
+        // HMAC/signature proves the bytes came from the peer, not that they
+        // came from it only once. Without this a captured Write or Call
+        // re-executed every time it was played back for as long as the token
+        // lived (review 2026-10-06, M1). An `issue` OPN (SecureChannelId 0)
+        // starts a new channel and with it a new count; a renewal of a secured
+        // channel continues the count like any other chunk, so an old renewal
+        // cannot be replayed to rebase it.
+        if (opened != null) {
+            const rebase = message_type == .open_secure_channel and (channel_id == 0 or c.sec_mode == .none);
+            if (!rebase and !sequenceFollows(c.recv_sequence_number, sequence_number)) {
+                try c.fail(out, status.bad_security_checks_failed, "SequenceNumber does not follow the previous chunk");
+                return;
+            }
+            c.recv_sequence_number = sequence_number;
+        }
         const request_id = r.takeInt(u32, .little) catch {
             try c.fail(out, status.bad_tcp_internal_error, "truncated sequence header");
             return;
@@ -1215,6 +1266,13 @@ pub const Connection = struct {
             try c.fail(out, status.bad_security_policy_rejected, "this server is configured for SecurityPolicy#None only");
             return .failed;
         };
+        // Bound the private-key work before doing any: each RSA-OAEP block of
+        // the encrypted region is one private-key operation, all of them spent
+        // before the signature can say who sent it (review 2026-10-06).
+        if (wire_body.len - view.encrypted_region_offset > sec.max_opn_encrypted_len) {
+            try c.fail(out, status.bad_tcp_message_too_large, "OpenSecureChannel encrypted region exceeds max_opn_encrypted_len");
+            return .failed;
+        }
 
         // The sender must have encrypted to *our* certificate; a mismatched
         // thumbprint means the OPN was meant for a different server (or was
@@ -1309,7 +1367,12 @@ pub const Connection = struct {
                 };
             }
             if (token_id != 0 and token_id == c.prev_token_id and now_ms <= c.prev_token_valid_until_ms) {
-                break :blk c.prev_keys.?;
+                // Never `.?`: a previous token without keys must be a refusal,
+                // not a panic reachable from the wire (review 2026-10-06, H1).
+                break :blk c.prev_keys orelse {
+                    try c.fail(out, status.bad_secure_channel_token_unknown, "no keys for the previous SecurityToken");
+                    return .failed;
+                };
             }
             try c.fail(out, status.bad_secure_channel_token_unknown, "unknown or expired security token");
             return .failed;
@@ -1804,6 +1867,17 @@ pub const Connection = struct {
             .renew => {
                 if (c.channel_id == 0) {
                     try sendFault(ctx, status.bad_secure_channel_id_invalid);
+                    return;
+                }
+                // A renewal re-keys the channel it names under the policy that
+                // channel was opened with (OPC 10000-6 §6.7.4); it is not a way
+                // to change policy. Without this, a `#None` channel "renewed"
+                // under Basic256Sha256 kept its None token as the overlap
+                // token with `prev_keys == null`, and a MSG naming that token
+                // crashed `openSymmetricChunk` (review 2026-10-06, H1). The
+                // reverse direction is already refused in `openAsymmetricChunk`.
+                if (policy != c.sec_policy) {
+                    try c.fail(ctx.out, status.bad_security_policy_rejected, "a renewal cannot change the channel's SecurityPolicy");
                     return;
                 }
                 // §6.7.6: the token being replaced stays valid for the
@@ -3205,20 +3279,30 @@ pub const Connection = struct {
             const changed = if (item.last_value) |last| nodestore.dataValueChanged(last, dv) else true;
             if (!changed) continue;
 
+            // Every allocation happens before anything owned is released or
+            // handed over, so an OutOfMemory here leaves the item exactly as it
+            // was. The old order freed `last_value` and only then duplicated
+            // its replacement: a failure there left `last_value` pointing at
+            // freed memory, which the next sample compared against and
+            // `MonitoredItem.deinit` freed a second time (review 2026-10-06, L1).
+            const new_last = try nodestore.dupDataValue(srv.allocator, dv);
+            errdefer encoding.freeDataValue(srv.allocator, new_last);
             const owned = try nodestore.dupDataValue(srv.allocator, dv);
-            if (item.queue.items.len >= item.queue_size) {
-                if (item.discard_oldest) {
-                    const dropped = item.queue.orderedRemove(0);
-                    encoding.freeDataValue(srv.allocator, dropped);
-                } else {
-                    // Keep the oldest; drop this newest sample instead.
-                    encoding.freeDataValue(srv.allocator, owned);
-                    continue;
-                }
+            errdefer encoding.freeDataValue(srv.allocator, owned);
+            if (item.queue.items.len >= item.queue_size and !item.discard_oldest) {
+                // Keep the oldest; drop this newest sample instead.
+                encoding.freeDataValue(srv.allocator, owned);
+                encoding.freeDataValue(srv.allocator, new_last);
+                continue;
             }
-            try item.queue.append(srv.allocator, owned);
+            try item.queue.ensureUnusedCapacity(srv.allocator, 1);
+            if (item.queue.items.len >= item.queue_size) {
+                const dropped = item.queue.orderedRemove(0);
+                encoding.freeDataValue(srv.allocator, dropped);
+            }
+            item.queue.appendAssumeCapacity(owned);
             if (item.last_value) |last| encoding.freeDataValue(srv.allocator, last);
-            item.last_value = try nodestore.dupDataValue(srv.allocator, dv);
+            item.last_value = new_last;
         }
     }
 
@@ -6328,6 +6412,291 @@ test "secure: token renewal keeps the old token alive for the overlap, then stop
         ) catch unreachable;
         try rig.pump();
         try rig.expectTransportError(status.bad_secure_channel_token_unknown);
+    }
+}
+
+// Review 2026-10-06, H1. A `SecurityPolicy#None` channel "renewed" by a
+// Basic256Sha256 OPN used to be accepted: the renew branch moved the None
+// token into `prev_token_id` with `prev_keys = c.keys`, which is `null` on a
+// None channel. A MSG naming that previous token inside the overlap window then
+// reached `c.prev_keys.?` in `openSymmetricChunk` — a remote panic in Debug and
+// ReleaseSafe (and a garbage key read in ReleaseFast) from any peer that holds
+// any self-signed certificate, on any server whose endpoint list advertises
+// `#None` beside a secured endpoint. A renewal must keep the channel's policy.
+test "secure: a None channel cannot be renewed into Basic256Sha256 (H1)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3A} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+
+    try rig.handshake();
+    try rig.openChannel(); // SecurityPolicy#None, issue
+    const none_token = rig.conn.token_id;
+    try testing.expect(none_token != 0);
+    try testing.expect(rig.conn.keys == null);
+
+    // The same channel id, now under Basic256Sha256 as a `renew`.
+    rig.armSecurity(.sign, pki.client, pki.server.certificate_der);
+    var client_nonce: [32]u8 = undefined;
+    prng.random().bytes(&client_nonce);
+    try rig.sendOpenSecure(.sign, .renew, &client_nonce);
+    if (!rig.conn.isClosed()) {
+        // Pre-fix path: the renewal was granted. A MSG on the superseded None
+        // token is what then reached `prev_keys.?`.
+        rig.clearServerOut();
+        rig.channel.token_id = none_token;
+        rig.channel.security.?.keys = security.deriveKeys(&client_nonce, &client_nonce, .basic256sha256);
+        try rig.channel.sendService(.message, services.type_id.read_request, services.ReadRequest, .{
+            .request_header = rig.header(services.null_node_id),
+            .max_age = 0,
+            .timestamps_to_return = .both,
+            .nodes_to_read = null,
+        }, services.encodeReadRequest);
+        try rig.pump();
+        return error.TestUnexpectedRenewalAccepted;
+    }
+    try rig.expectTransportError(status.bad_security_policy_rejected);
+}
+
+// Review 2026-10-06, M1. The SequenceHeader of a secured chunk was read and
+// discarded, so a MSG chunk captured off the wire verified again when played
+// back: same channel, same token, same keys, valid HMAC. An on-path attacker
+// could re-execute a client's Write or Call as often as the token lived.
+// OPC 10000-6 §6.7.2.4 makes the SequenceNumber the replay defence; open62541
+// and asyncua both demand exactly `previous + 1` (with the wrap below 1024).
+test "secure: a replayed MSG chunk is refused by its SequenceNumber (M1)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3B} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connectSecure(.sign_and_encrypt, pki);
+
+    try rig.channel.sendService(.message, services.type_id.write_request, services.WriteRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .nodes_to_write = &[_]services.WriteValue{.{
+            .node_id = rig.answer_id,
+            .attribute_id = services.attribute_id.value,
+            .index_range = null,
+            .value = .{ .value = .{ .scalar = .{ .int32 = 7 } } },
+        }},
+    }, services.encodeWriteRequest);
+    const captured = try gpa.dupe(u8, rig.client_out.written());
+    defer gpa.free(captured);
+    try rig.pump();
+    try testing.expect(!rig.conn.isClosed());
+    rig.clearServerOut();
+
+    // The very same bytes again.
+    try rig.conn.feed(captured, &rig.server_out.writer, rig.now_ms);
+    try rig.expectTransportError(status.bad_security_checks_failed);
+}
+
+test "secure: SequenceNumber wrap acceptance (M1)" {
+    try testing.expect(sequenceFollows(41, 42));
+    try testing.expect(!sequenceFollows(42, 42)); // replay
+    try testing.expect(!sequenceFollows(42, 41)); // older
+    try testing.expect(!sequenceFollows(42, 44)); // gap (a dropped chunk)
+    try testing.expect(sequenceFollows(std.math.maxInt(u32), 0));
+    try testing.expect(sequenceFollows(std.math.maxInt(u32) - 1000, 1)); // §6.7.2.4 wrap
+    try testing.expect(!sequenceFollows(std.math.maxInt(u32) - 2000, 1)); // too early to wrap
+    try testing.expect(!sequenceFollows(std.math.maxInt(u32), 1024));
+}
+
+// Review 2026-10-06, open item (a). Every OPN chunk was RSA-OAEP-decrypted
+// block by block — one private-key operation per block — before its signature
+// could say who sent it, and nothing bounded how many blocks or how many
+// chunks: ≈250 private-key operations per 64 KiB chunk under a 2048-bit key,
+// up to `max_chunk_count` chunks, all pre-authentication. The forged OPNs
+// below carry a correct clear header (policy, our thumbprint, a valid
+// certificate) and a block-aligned region of garbage. Before the fix each was
+// handed to `openAsymmetricMessage` and refused only once RSA-OAEP had failed
+// on it (`BadSecurityChecksFailed`, "did not decrypt"); now each is refused on
+// the MessageHeader / clear header alone, with a code no decrypt can produce.
+fn forgedOpn(gpa: std.mem.Allocator, pki: TestPki, chunk_type: u8, encrypted_len: usize) ![]u8 {
+    var w = std.Io.Writer.Allocating.init(gpa);
+    errdefer w.deinit();
+    const thumbprint = security.certificateThumbprint(pki.server.certificate_der);
+    try w.writer.writeAll("OPN");
+    try w.writer.writeByte(chunk_type);
+    try w.writer.writeInt(u32, 0, .little); // MessageSize, patched below
+    try w.writer.writeInt(u32, 0, .little); // SecureChannelId: issue
+    for ([_][]const u8{ services.security_policy_basic256sha256_uri, pki.client.certificate_der, &thumbprint }) |field| {
+        try w.writer.writeInt(i32, @intCast(field.len), .little);
+        try w.writer.writeAll(field);
+    }
+    try w.writer.splatByteAll(0xA5, encrypted_len);
+    const bytes = try w.toOwnedSlice();
+    std.mem.writeInt(u32, bytes[4..8], @intCast(bytes.len), .little);
+    return bytes;
+}
+
+test "secure: a multi-chunk or oversize OPN is refused before any RSA operation (review 2026-10-06 a)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3C} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    const k = 64; // the 512-bit test server key: one RSA-OAEP block
+
+    const Case = struct { chunk_type: u8, encrypted_len: usize, expected: encoding.StatusCode };
+    const cases = [_]Case{
+        // Multi-chunk: an intermediate chunk, and an abort, of a small OPN.
+        .{ .chunk_type = 'C', .encrypted_len = 4 * k, .expected = status.bad_tcp_message_type_invalid },
+        .{ .chunk_type = 'A', .encrypted_len = 4 * k, .expected = status.bad_tcp_message_type_invalid },
+        // A single final chunk one block past the default cap (4096).
+        .{ .chunk_type = 'F', .encrypted_len = 4096 + k, .expected = status.bad_tcp_message_too_large },
+    };
+    for (cases) |case| {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        const bytes = try forgedOpn(gpa, pki, case.chunk_type, case.encrypted_len);
+        defer gpa.free(bytes);
+        try rig.conn.feed(bytes, &rig.server_out.writer, rig.now_ms);
+        try rig.expectTransportError(case.expected);
+    }
+}
+
+test "secure: max_opn_encrypted_len admits a real OPN at its size and refuses it one byte under" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    try testing.expectEqual(@as(usize, 4096), (SecurityConfig{ .credentials = pki.server }).max_opn_encrypted_len);
+
+    // The encrypted region a real client OPN carries under these keys.
+    const real_len = blk: {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var client_nonce: [32]u8 = undefined;
+        prng.random().bytes(&client_nonce);
+        try rig.channel.sendService(.open_secure_channel, services.type_id.open_secure_channel_request, services.OpenSecureChannelRequest, .{
+            .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+            .client_protocol_version = 0,
+            .request_type = .issue,
+            .security_mode = .sign_and_encrypt,
+            .client_nonce = &client_nonce,
+            .requested_lifetime = 600_000,
+        }, services.encodeOpenSecureChannelRequest);
+        const wire = rig.client_out.written();
+        const view = security.viewAsymmetricHeader(wire[8..]).?;
+        break :blk wire.len - 8 - view.encrypted_region_offset;
+    };
+    try testing.expect(real_len > 0);
+
+    for ([_]usize{ real_len, real_len - 1 }) |cap| {
+        var config = secureTestConfig(endpoints, pki);
+        config.security.?.max_opn_encrypted_len = cap;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        if (cap == real_len) {
+            _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+            try testing.expect(!rig.conn.isClosed());
+        } else {
+            var client_nonce: [32]u8 = undefined;
+            prng.random().bytes(&client_nonce);
+            try rig.sendOpenSecure(.sign_and_encrypt, .issue, &client_nonce);
+            try rig.expectTransportError(status.bad_tcp_message_too_large);
+        }
+    }
+}
+
+// Review 2026-10-06, L1. Every allocation `sampleDue` makes is failed in turn,
+// on both queue policies and with the queue both short of and at its size, and
+// `testing.allocator` judges the aftermath: a leak, or `last_value` left
+// pointing at freed memory and freed again by `Subscription.deinit`, fails it.
+test "sampleDue: an OutOfMemory leaves the monitored item intact (L1)" {
+    var store = nodestore.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    try store.addStandardNodes(.{ .start_time = TestRig.start_time });
+    const ns = try store.addNamespace(test_ns_uri);
+    const var_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "sampled" } };
+    try store.addVariable(.{
+        .node_id = var_id,
+        .parent_id = nodestore.n0(nodestore.id.objects_folder),
+        .browse_name = .{ .namespace_index = ns, .name = "sampled" },
+        .value = .{ .scalar = .{ .string = "current value" } },
+    });
+
+    for ([_]bool{ true, false }) |discard_oldest| {
+        for ([_]u32{ 1, 4 }) |queue_size| {
+            var fail_index: usize = 0;
+            var saw_success = false;
+            while (!saw_success) : (fail_index += 1) {
+                var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+                const a = failing.allocator();
+                var prng = std.Random.DefaultPrng.init(1);
+                var srv = Server.init(a, &store, TestRig.defaultConfig(), prng.random());
+                defer srv.deinit();
+                var sub: Subscription = .{
+                    .id = 1,
+                    .publishing_interval_ms = 100,
+                    .max_keep_alive_count = 10,
+                    .lifetime_count = 30,
+                    .max_notifications_per_publish = 0,
+                    .publishing_enabled = true,
+                    .priority = 0,
+                    .next_publish_ms = 0,
+                };
+                defer sub.deinit(a);
+                // The item is built with allocations that must not fail; the
+                // failure point is armed only once it is in place.
+                try sub.monitored_items.append(a, .{
+                    .id = 1,
+                    .client_handle = 1,
+                    .node_id = try nodestore.dupNodeId(a, var_id),
+                    .attribute_id = services.attribute_id.value,
+                    .monitoring_mode = .reporting,
+                    .sampling_interval_ms = 100,
+                    .queue_size = queue_size,
+                    .discard_oldest = discard_oldest,
+                    .timestamps_to_return = .neither,
+                    .next_sample_ms = 0,
+                    .last_value = try nodestore.dupDataValue(a, .{ .value = .{ .scalar = .{ .string = "previous value" } } }),
+                });
+                const item = &sub.monitored_items.items[0];
+                // Size 1: the queue is full. Size 4: two slots taken, room left
+                // in the queue, though its backing array has to grow for it.
+                const fill: usize = if (queue_size == 1) 1 else 2;
+                try item.queue.ensureTotalCapacityPrecise(a, fill);
+                for (0..fill) |_| {
+                    item.queue.appendAssumeCapacity(try nodestore.dupDataValue(a, .{ .value = .{ .scalar = .{ .string = "queued" } } }));
+                }
+                failing.fail_index = failing.alloc_index + fail_index;
+
+                Connection.sampleDue(&srv, &sub, 0) catch |err| {
+                    try testing.expectEqual(error.OutOfMemory, err);
+                    // Untouched: the old baseline is still readable and owned.
+                    try testing.expectEqualStrings("previous value", item.last_value.?.value.?.scalar.string.?);
+                    try testing.expectEqual(fill, item.queue.items.len);
+                    continue;
+                };
+                saw_success = true;
+                if (discard_oldest or fill < queue_size) {
+                    try testing.expectEqualStrings("current value", item.last_value.?.value.?.scalar.string.?);
+                }
+            }
+        }
     }
 }
 
