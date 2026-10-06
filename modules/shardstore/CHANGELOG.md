@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the store-wide
+  exclusive lock (`"<name_prefix>.lock"` sidecar taken by `Store.init`, a second live `Store`
+  over the same paths gets `error.Locked`) is now described in SPEC/README, which still said
+  there was no cross-process exclusion. Recorded late: the lock itself (wave-2 F2 fix) never
+  had a changelog entry.
 - **2026-10-05** — Mutation run: 25 of 27 killed, 2 equivalent; 4 tests added (store-wide
   lock refusal, pinned routing, lock and shard release after a failed shard open, name
   validation at the highest index).

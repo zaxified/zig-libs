@@ -160,11 +160,12 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 
 ## Deliberately deferred (out of scope by design, not oversight)
 
-- **All-source trees in one pass** — the caller loops over sources; no batched
-  multi-source build.
+- **All-source trees in one pass** — not yet: the caller loops over sources; no
+  batched multi-source build. See Backlog (`buildAll`) — not deferred by design.
 - **FIB installation** — a plan is returned, not programmed forwarding state.
-- **The 16 SPB ECT algorithm variants / equal-cost multiple trees** — one
-  congruent tree from `spf-ect`'s single deterministic tie-break.
+- **The 16 SPB ECT algorithm variants / equal-cost multiple trees** — not yet:
+  one congruent tree from `spf-ect`'s single deterministic tie-break. See Backlog
+  (ECT-mask tie-break) — not deferred by design.
 - **Replication I/O** — encap, TTL, and sending the copies are `l2encap` /
   `l2forward`.
 - **Designated-forwarder election** — the separate `df-elect` module.
@@ -174,7 +175,7 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 ## Backlog / deferred
 
 - **802.1aq ECT-mask tie-break in `spf-ect` (or a variant hook in `bumtree.build`)** (survey 2026-09-30): two SPB bridges only agree on the tree if they run the same ECT algorithm; a network with a non-Zig bridge needs the standard's, not ours. Effort M (needs the standard's algorithm text; no public vectors, see Anchoring). Fits CONVENTIONS §2 (pure Zig).
-- **All-sources / all-I-SIDs batch (`buildAll`)** (survey 2026-09-30): what an SPB node actually computes on a topology change is the state for every (source, I-SID) pair; today the caller loops over `build`. Effort S. Fits §2. (Already listed as deliberately deferred above; filed here because the reference simulator does it in one pass.)
+- **All-sources / all-I-SIDs batch (`buildAll`)** (survey 2026-09-30): what an SPB node actually computes on a topology change is the state for every (source, I-SID) pair; today the caller loops over `build`. Effort S. Fits §2. (Filed by the survey because the reference simulator does it in one pass; the entry above now points here.)
 
 ## Anchoring
 

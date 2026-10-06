@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [xacrimon/dashmap](https://github.com/xacrimon/dashmap) | Rust | MIT | 4.1k | v6.2.1 (2026-05-17) | Sharded concurrent hash map *(inferred: README not read)*; in-memory, thread-safe on every method, with iteration across shards. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'sharded kv store' --language zig`: no result). |
 
-**Where we are ahead:** durable and crash-safe per shard (each shard is a `kvtree` file) with parallel writers, a manifest that refuses to open a shard set with a different `n_shards`, and a checked owner-thread contract (`OwnerError.NotOwningThread`). **Where we are behind:** no cross-shard iteration or ordered scan, no cross-shard atomicity, no online resharding or slots (fixed `n_shards`, `SPEC` "What it does NOT guarantee"), no cross-process exclusion (a `kvtree` gap), and a single-owner contract per shard where dashmap/concurrent-map are safe from any thread (→ Backlog).
+**Where we are ahead:** durable and crash-safe per shard (each shard is a `kvtree` file) with parallel writers, a manifest that refuses to open a shard set with a different `n_shards`, a store-wide advisory lock so a second live `Store` over the same paths gets `error.Locked` (advisory, local POSIX filesystems only — "What it does NOT guarantee"), and a checked owner-thread contract (`OwnerError.NotOwningThread`). **Where we are behind:** no cross-shard iteration or ordered scan, no cross-shard atomicity, no online resharding or slots (fixed `n_shards`, `SPEC` "What it does NOT guarantee"), and a single-owner contract per shard where dashmap/concurrent-map are safe from any thread (→ Backlog).
 
 ## Problem
 
@@ -95,8 +95,8 @@ record) is refused with `error.CorruptManifest` rather than overwritten.
 
 Two limits, stated rather than papered over: a store created before manifests
 existed has none, so the first `init` that touches it adopts whatever count it
-is given; and the manifest is a *consistency* check, not a lock — see the
-missing cross-process exclusion below.
+is given; and the manifest is a *consistency* check, not a lock — exclusion is
+the separate store-wide lock, whose limits are stated below.
 
 ## Threading contract (precise)
 
@@ -168,12 +168,20 @@ parallel — no more, no less.
   no merge-sorted scan across shards (a k-way merge over per-shard cursors is a
   mechanical future addition, not provided here).
 - **No same-shard write latch.** See the contract above — the caller partitions.
-- **No cross-process exclusion.** `kvtree.Db.open` discards its options and
-  never takes the advisory lock the `Storage` seam offers, so two `Store`s over
-  the same paths do not exclude each other — and this module multiplies that
-  exposure by `n_shards`. Tracked as wave-2 F2, whose fix belongs in `kvtree`.
-  The manifest does not help here: it detects a *different* shard count, not a
-  second concurrent opener with the same one.
+- **Cross-process exclusion: advisory, store-wide, `Store`-level only.**
+  `Store.init` takes ONE exclusive lock on a `"<name_prefix>.lock"` sidecar
+  (`Storage.tryLockExclusive`, `flock` on `FsStorage`) before opening any shard,
+  holds it until `deinit`, and opens every shard with `.lock = .none`. A second
+  `Store` over the same `name_prefix` — another process or another instance in
+  this one — gets `error.Locked`, and a failed shard open releases the lock.
+  What it does NOT cover: it is advisory (anything that writes the files without
+  going through `Store.init` is not stopped); a standalone `kvtree.Db.open` on a
+  single shard file takes that shard's own `"<shard path>.lock"`, not this one,
+  so it does not exclude (and is not excluded by) a live `Store`; the guarantee
+  holds on local POSIX filesystems only (`kv`'s `tryLockExclusive` contract —
+  network shares may make the lock node-local); and `checkManifest` runs before
+  the lock is taken, so a second opener with a different `n_shards` sees
+  `error.ShardCountMismatch` rather than `error.Locked`.
 - **No rebalancing / resharding.** `n_shards` is fixed for the lifetime of the
   on-disk set — now enforced by the manifest rather than merely assumed. Growing
   it means migrating the data (read every key through a `Store` opened with the

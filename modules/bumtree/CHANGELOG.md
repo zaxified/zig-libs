@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the all-sources batch and ECT-variant entries in "Deliberately deferred" now read "not yet — see Backlog", matching the 2026-09-30 survey.
 - **2026-10-05** — Mutation run: 24 of 24 killed, 0 equivalent; 1 test added (source id
   == `node_count`, `deliversLocally` of a reachable non-member, `prune = false` past an
   unreachable node). No code change.

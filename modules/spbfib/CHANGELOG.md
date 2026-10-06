@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the per-B-VID / ECT-set entry in "Deliberately deferred" now reads "not yet — see Backlog", matching the 2026-09-30 survey.
 - **2026-10-05** — Mutation run: 25 of 26 killed, 1 equivalent; 1 test added (only
   metric 0 is a local route). No code change.
 - **2026-09-30** — Anchored on RFC 6329 §5 (Figures 2-4): new `src/rfc6329_example_test.zig` asserts Figure 3 and Figure 4's 12 unicast rows and the 5 group DAs (7300-0x00-0001) against the module; anchor oracle SELF -> EXTERNAL. No code change.

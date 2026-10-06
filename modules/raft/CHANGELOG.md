@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Scope line dates the survey 2026-09-30 and the poc -> mvp re-assessment 2026-10-04, matching Compared with.
 - **2026-10-04** — **`raft.Node`: a runnable server; scope poc → mvp (user decision, reverses 2026-09-30).**
   `Node` (`node.zig`) is one Raft server as a pure state machine — `tick` / `step` /
   `stepBytes` / `propose` → `ready` / `advance` — over caller-owned transport, disk and

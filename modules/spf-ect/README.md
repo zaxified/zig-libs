@@ -25,7 +25,9 @@ one; **not** a max-flow disjoint-path guarantee.
 Pure graph algorithm, zero I/O. Shared kernel of an SPB simulator and an
 encrypted SCADA/OT L2VPN fabric.
 
-- **Status:** complete — both tiers implemented and property-tested.
+- **Status:** the mvp scope (the ECT tie-break over Dijkstra) is implemented —
+  both tiers, property-tested; ECT-ALGORITHM mask variants, ECMP output and the
+  rest are under [Backlog / deferred](#backlog--deferred).
   **Platform:** any.
 - **Deps:** none (std only).
 - **Model after:** the IEEE 802.1aq / RFC 6329 SPB **ECT** path-vector

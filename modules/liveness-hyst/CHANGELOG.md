@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: README "Status" reworded from "complete" to the mvp scope it implements; maturity card gets the blank line between Scope and Audit.
 - **2026-08-13** — Test-only: `src/core.zig`'s single test — `test "core: file
   is reachable from the build"`, body `try std.testing.expect(true);` — was
   replaced by one that asserts `Verdict.since` stamps the last state

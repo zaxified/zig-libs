@@ -81,7 +81,9 @@ takes the tilt from the top edge and corrects for it.
   25° about the vertical axis and 15° about the horizontal, a version 13 to
   15°/20°, a version 1 to 10° — it has no alignment patterns at all, so there is
   nothing a projective fit could be built from. Before there was a projective
-  grid, those were 5°, 0° and 10°.
+  grid, those were 5°, 0° and 10°. The zxing-cpp differential
+  (`tools/README.md`, its own pinhole renders, vertical axis only) measured
+  more: 25° at versions 1 and 15, 30° at version 4.
 - **Curvature is not modelled**, and matters less than you would think: a
   version 1 still reads wrapped on a cylinder 18 modules across, a version 6
   down to 45 and a version 13 down to 200. A label on a can is fine; a large
