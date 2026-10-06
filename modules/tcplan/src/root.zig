@@ -13,7 +13,7 @@
 //! ```zig
 //! const sub = [_]tcplan.Node{
 //!     .{ .name = "alice", .rate_bps = tcplan.mbit(100), .ceil_bps = tcplan.mbit(500),
-//!        .match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } } },
+//!        .match = &.{.{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } }} },
 //! };
 //! const ap = [_]tcplan.Node{
 //!     .{ .name = "ap1", .rate_bps = tcplan.mbit(500), .ceil_bps = tcplan.mbit(500),
@@ -61,6 +61,8 @@ pub const Topology = topology.Topology;
 pub const Node = topology.Node;
 pub const Match = topology.Match;
 pub const Dir = topology.Dir;
+pub const HtbKnobs = topology.HtbKnobs;
+pub const htb_max_prio = topology.htb_max_prio;
 pub const mbit = topology.mbit;
 
 // ── the output model ────────────────────────────────────────────────────────
@@ -88,12 +90,12 @@ const testing = std.testing;
 // container scope so the nested slices have static storage (a topology built
 // from function-local array literals would dangle once returned by value).
 const golden_subs_a = [_]Node{
-    .{ .name = "sub-a1", .rate_bps = mbit(100), .ceil_bps = mbit(200), .match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } } },
-    .{ .name = "sub-a2", .rate_bps = mbit(100), .ceil_bps = mbit(200), .match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 2 } } } },
+    .{ .name = "sub-a1", .rate_bps = mbit(100), .ceil_bps = mbit(200), .match = &.{.{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } }} },
+    .{ .name = "sub-a2", .rate_bps = mbit(100), .ceil_bps = mbit(200), .match = &.{.{ .ipv4 = .{ .addr = .{ 100, 64, 0, 2 } } }} },
 };
 const golden_aps_a = [_]Node{.{ .name = "ap-a1", .rate_bps = mbit(1000), .ceil_bps = mbit(1000), .children = &golden_subs_a }};
 const golden_subs_b = [_]Node{
-    .{ .name = "sub-b1", .rate_bps = mbit(100), .ceil_bps = mbit(500), .match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 3 } } } },
+    .{ .name = "sub-b1", .rate_bps = mbit(100), .ceil_bps = mbit(500), .match = &.{.{ .ipv4 = .{ .addr = .{ 100, 64, 0, 3 } } }} },
 };
 const golden_aps_b = [_]Node{.{ .name = "ap-b1", .rate_bps = mbit(500), .ceil_bps = mbit(500), .children = &golden_subs_b }};
 const golden_roots = [_]Node{
@@ -221,7 +223,7 @@ test "a leaf without a classifier gets a class + CAKE but no filter" {
     const gpa = testing.allocator;
     const subs = &[_]Node{
         .{ .name = "silent", .rate_bps = mbit(50) }, // no match
-        .{ .name = "steered", .rate_bps = mbit(50), .match = .{ .ipv6 = .{ .addr = @splat(0) } } },
+        .{ .name = "steered", .rate_bps = mbit(50), .match = &.{.{ .ipv6 = .{ .addr = @splat(0) } }} },
     };
     const roots = &[_]Node{.{ .name = "site", .rate_bps = mbit(100), .cpu = 0, .children = subs }};
     var p = try compile(gpa, .{ .queue_count = 1, .roots = roots }, 1);
@@ -238,6 +240,85 @@ test "a leaf without a classifier gets a class + CAKE but no filter" {
     };
     try testing.expectEqual(@as(usize, 2), cakes); // both leaves get CAKE
     try testing.expectEqual(@as(usize, 1), filters); // only the one with a match steers
+}
+
+// The dual-stack circuit the iproute2 oracle below was captured for: one
+// queue, a site, and one subscriber owning an IPv4 /32 and an IPv6 /56 with
+// every HTB knob set. `tools/capture_dualstack.sh` lists the `tc` command line
+// each op corresponds to and re-derives `testdata/dualstack_iproute2.txt`.
+const ds_v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+const ds_subs = [_]Node{.{
+    .name = "circuit-1",
+    .rate_bps = mbit(100),
+    .ceil_bps = mbit(200),
+    .htb = .{ .burst = 32 * 1024, .cburst = 64 * 1024, .prio = 2, .quantum = 3000 },
+    .match = &.{
+        .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
+        .{ .ipv6 = .{ .addr = ds_v6, .prefix_len = 56 } },
+    },
+}};
+const ds_roots = [_]Node{.{ .name = "site", .rate_bps = mbit(1000), .ceil_bps = mbit(1000), .cpu = 0, .children = &ds_subs }};
+
+/// Zero the payloads of an HTB class request's `TCA_HTB_RTAB`/`CTAB`
+/// attributes (keeping their headers, so lengths and positions still
+/// compare). The 256-entry rate tables are a pure function of the rate,
+/// `mtu` and link layer — none of which tcplan's knobs touch — and the
+/// capture host's iproute2-6.1.0 rounds some entries differently from the
+/// iproute2-6.19.0 the `tc` module's own goldens pin them against
+/// (`modules/tc/tools/verify_goldens.py htb` MISSes 2 of 4 class goldens on
+/// that host, independent of tcplan). Everything else, `tc_htb_opt` with
+/// its burst/cburst ticks, prio and quantum included, is compared exactly.
+fn maskHtbRateTables(req: []u8) !void {
+    var top: tc.codec.AttrIterator = .{ .buf = req[tc.codec.header_len + tc.tcmsg_len ..] };
+    var masked: usize = 0;
+    while (try top.next()) |a| {
+        if (a.type != tc.TCA.OPTIONS) continue;
+        var inner: tc.codec.AttrIterator = .{ .buf = a.data };
+        while (try inner.next()) |ia| {
+            if (ia.type != tc.TCA_HTB.RTAB and ia.type != tc.TCA_HTB.CTAB) continue;
+            const off = @intFromPtr(ia.data.ptr) - @intFromPtr(req.ptr);
+            @memset(req[off..][0..ia.data.len], 0);
+            masked += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), masked);
+}
+
+test "oracle: dual-stack circuit with HTB knobs is byte-identical to iproute2's requests" {
+    // EXTERNAL anchor: every op of the plan, built through the real `tc`
+    // builders with `.add`, seq 0, and the capture host's psched, must equal
+    // the datagram a stock `tc` binary sent for the corresponding command
+    // (iproute2-6.1.0; `nlmsg_seq` zeroed in the capture). This pins the
+    // knobs' wire placement (burst/cburst as ticks, prio, quantum in
+    // tc_htb_opt) and the multi-match fan-out (two filters, two protocols,
+    // consecutive prios, one classid) against a foreign implementation.
+    if (@import("builtin").cpu.arch.endian() != .little) return error.SkipZigTest; // LE capture
+    const gpa = testing.allocator;
+    var p = try compile(gpa, .{ .queue_count = 1, .roots = &ds_roots }, 1); // lo = ifindex 1
+    defer p.deinit(gpa);
+
+    var lines = std.mem.tokenizeScalar(u8, @embedFile("testdata/dualstack_iproute2.txt"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "//")) continue;
+        try testing.expect(n < p.ops.len);
+        const want = try gpa.alloc(u8, line.len / 2);
+        defer gpa.free(want);
+        _ = try std.fmt.hexToBytes(want, line);
+        const got = try p.ops[n].buildRequest(gpa, 0, .add, tc.ratespec.golden_psched);
+        defer gpa.free(got);
+        if (p.ops[n] == .class) {
+            try maskHtbRateTables(want);
+            try maskHtbRateTables(got);
+        }
+        if (std.mem.indexOfDiff(u8, want, got)) |at| {
+            std.debug.print("op {d}: first diff at byte {d} (want len {d}, got len {d})\n", .{ n, at, want.len, got.len });
+            return error.TestExpectedEqual;
+        }
+        n += 1;
+    }
+    try testing.expectEqual(p.ops.len, n);
+    try testing.expectEqual(@as(usize, 7), n);
 }
 
 test {
