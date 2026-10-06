@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Evidence MIXED → EXTERNAL.** SSE gained a LIVE anchor (`src/sse_interop.zig`: our
+  server's event stream, fetched by curl, dispatched by sseclient-py and httpx-sse and held to the
+  WHATWG §9.2.6 parsing rules over 27 events — CR/CRLF normalisation, leading spaces, NUL, 10 KiB
+  data, sticky ids, retry; no defect; httpx-sse's dispatch of comment-only blocks listed as its
+  own departure). With the conneg, gzip, problem and reverse-proxy anchors above, no path of the
+  module is judged by itself alone any more.
 - **2026-10-06** — **`reasonPhrase` covers the IANA HTTP Status Code Registry**, found by the new LIVE
   CPython check of `problem` (`src/problem_interop.zig`: 625 documents `json.loads`-parsed with
   RFC 9457 member types, `detail` decoded exactly as CPython's `decode("utf-8", "replace")` across
