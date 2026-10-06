@@ -6,8 +6,8 @@
 //! (the genuinely hard selective-disclosure NIZK) cannot be exercised
 //! without `sign`/`verify` already working (every `ProofGen` fixture
 //! first signs, then proves over that signature — see
-//! `bbs.zig`'s module doc comment and the mattrglobal fixture generator
-//! this module's KAT vectors are drawn from), so there is no
+//! `bbs.zig`'s module doc comment and the draft's proof fixtures, which
+//! carry the signature they prove over), so there is no
 //! intermediate state where the "easier" pair is done and testable but
 //! the NIZK pair isn't yet — the same reasoning `bulletproofs`' single
 //! `core_implemented` flag documents for its own two-core split.
@@ -19,9 +19,8 @@
 //! `bbs.Signature`/`bbs.Proof`'s struct + byte codecs — is fully real
 //! today and needs no gate; it is what proves the harness has teeth
 //! independent of whether the four cores are filled in yet (see
-//! `kat_test.zig`'s ungated tests, byte-exact against
-//! `mattrglobal/pairing_crypto`'s `bls12_381_sha_256` fixtures for
-//! generators/`h2s`/`messages_to_scalars`/`KeyGen`).
+//! `kat_test.zig`'s primitive tests, byte-exact against draft-12's
+//! vectors for generators/`h2s`/`messages_to_scalars`/`KeyGen`).
 //!
 //! This is now `true`: a Fable pass implemented all four cores per
 //! `bbs.zig`'s per-step doc-comment contracts, so `kat_test.zig`'s

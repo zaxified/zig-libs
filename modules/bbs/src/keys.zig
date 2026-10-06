@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! keys — BBS `KeyGen`/`SkToPk` (draft-irtf-cfrg-bbs-signatures-04
+//! keys — BBS `KeyGen`/`SkToPk` (draft-irtf-cfrg-bbs-signatures-12
 //! §3.4.1/§3.4.2) and the `SecretKey`/`PublicKey` wire types. REAL — both
 //! functions are ordinary deterministic derivation (a `hash_to_scalar`
 //! call and a fixed-base scalar multiplication), with no ZK judgment;
@@ -115,8 +115,7 @@ pub const PublicKey = struct {
 /// ```
 /// REAL — `ciphersuite.hashToScalar` is already real; this is pure
 /// concatenation plus that call, no ZK judgment. Byte-exact against
-/// `mattrglobal/pairing_crypto`'s `keypair.json` fixture (see
-/// `kat_test.zig`).
+/// draft-12 §8.4.1's key pair (see `kat_test.zig`).
 pub fn keyGen(key_material: []const u8, key_info: []const u8, key_dst: ?[]const u8) KeyGenError!SecretKey {
     if (key_material.len < 32) return error.KeyMaterialTooShort;
     if (key_info.len > 65535) return error.KeyInfoTooLong;

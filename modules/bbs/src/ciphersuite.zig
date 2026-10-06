@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! ciphersuite — the `BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_` ciphersuite
 //! constants and the "mechanical" (non-Fable) building blocks
-//! draft-irtf-cfrg-bbs-signatures-04 §4 defines on top of them:
+//! draft-irtf-cfrg-bbs-signatures-12 §4 defines on top of them:
 //! `expand_message`/`hash_to_scalar` (§4.2.2), `create_generators`
 //! (§4.1.1), `messages_to_scalars` (§4.1.2), `calculate_domain`
 //! (§4.2.3), and the two random-scalar sources ProofGen needs
@@ -17,9 +17,10 @@
 //! RFC-9380 hash-to-curve machinery `create_generators` needs, and
 //! `Fr.reduceWide` for the `OS2IP(..) mod r` reduction every
 //! `hash_to_scalar`-shaped operation in this file performs. See
-//! `../SPEC.md` for the exact draft version pinned (draft-04) and why.
+//! `../SPEC.md` for the exact draft version pinned (draft-12; these primitives are
+//! byte-identical in draft-04, which the module pinned until 2026-10-06).
 //!
-//! ## DST hierarchy (draft-04 §3.8 / §4.1 / §4.2)
+//! ## DST hierarchy (draft-12 §3.5 / §4.1 / §4.2)
 //!
 //! ```
 //! ciphersuite_id  = "BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_"           (35 bytes)
@@ -139,9 +140,7 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 /// stored as raw `(x, y)`, not derived from a compressed literal) from
 /// the draft's own published compressed literal
 /// (`a8ce256102840821a3e94ea9025e4662b205762f9776b3a766c872b948f1fd225e
-/// 7c59698588e70d11406d161b4e28c9`, verified byte-for-byte against
-/// `mattrglobal/pairing_crypto`'s `generators.json` fixture's `"BP"`
-/// field — see `../SPEC.md`/`../NOTICE`). The KAT test below verifies
+/// 7c59698588e70d11406d161b4e28c9`, unchanged in draft-12 §7.2.2). The KAT test below verifies
 /// `toBytesCompressed(P1)` reproduces that exact literal AND
 /// re-derives `P1` via `createGeneratorsWithSeed(1,
 /// bp_generator_seed_message)` for independent self-consistency.
@@ -287,7 +286,7 @@ pub fn calculateDomain(
 /// draws of `OS2IP(get_random(expand_len)) mod r` from a real CSPRNG —
 /// the entropy `ProofGen` needs in normal (non-test) operation. `count`
 /// is `comptime` so the return type is a plain array (no allocator);
-/// every real call site (a future `proofGen` wrapper computing `3 + U`
+/// every real call site (a future `proofGen` wrapper computing `5 + U`
 /// undisclosed messages) knows `U` at the call site already. REAL — pure
 /// `std.Io` entropy draw + `Fr.reduceWide`, no ZK judgment (mirrors
 /// `bls12_381.scalar.Fr.random`'s `io: std.Io` convention, NOT an
@@ -317,19 +316,15 @@ pub fn calculateRandomScalars(comptime count: usize, io: std.Io) [count]Fr {
 /// * count)` call, sliced into `count` consecutive `expand_len`-byte
 /// chunks, each `OS2IP(..) mod r`-reduced. `count` is `comptime` (same
 /// reasoning as `calculateRandomScalars`) — every KAT call site knows the
-/// fixture's `count = 3 + U` at compile time. **NOT for production use**
+/// fixture's `count = 5 + U` at compile time. **NOT for production use**
 /// (the entire point of a "mocked" RNG is that it is PUBLIC and
 /// PREDICTABLE given `SEED`) — see `kat_test.zig`'s gated `proofGen`
 /// tests for how the fixture's `SEED` ("3.141592653589793238462643383279",
 /// the first 30 digits of pi — a nothing-up-my-sleeve value) and
-/// `count` (`3 + U`, varying per fixture) are used.
+/// `count` (`5 + U`, varying per fixture) are used.
 ///
-/// Verified byte-exact against `mattrglobal/pairing_crypto`'s
-/// `mockedRng.json` fixture (`count = 10`) in `kat_test.zig`; see
-/// `../SPEC.md` for why this SAME `SEED`/dst pair (confirmed from that
-/// project's `tools/bbs-fixtures-generator/src/mock_rng.rs`, not merely
-/// inferred) is reused — with a DIFFERENT `count` each time — across
-/// every proof fixture in that ciphersuite's directory.
+/// Verified byte-exact against draft-12 §8.4.5's ten published scalars
+/// (`kat_test.zig`), whose `SEED`/DST are exactly this pair.
 pub fn mockedRandomScalars(comptime count: usize, seed: []const u8) [count]Fr {
     const v = expandMessage(expand_len * count, seed, mocked_scalars_dst);
     var out: [count]Fr = undefined;
@@ -361,13 +356,12 @@ test "P1 re-derives byte-exact via createGeneratorsWithSeed(1, bp_generator_seed
     try testing.expectEqualSlices(u8, &G1.toBytesCompressed(P1), &G1.toBytesCompressed(gens[0]));
 }
 
-test "hashToScalar KAT: draft-04 Appendix hash-to-scalar worked example" {
+test "hashToScalar KAT: the draft's hash-to-scalar worked example (unchanged -03 through -12)" {
     // Message m_1 (draft §7.2) hashed under h2s_dst — this specific
     // worked example is published unchanged across every bbs-signatures
-    // draft revision from -03 through -10 (see SPEC.md's version-pinning
-    // note), so it is not itself draft-04-version-sensitive, but is
-    // reproduced here from mattrglobal/pairing_crypto's `h2s.json`
-    // fixture for consistency with this module's other embedded vectors.
+    // draft revision from -03 through -12 (draft-12 Appendix D.2.3 is
+    // pinned again in `kat_test.zig`); kept here as the primitive's own
+    // unit test.
     var msg_buf: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&msg_buf, "9872ad089e452c7b6e283dfac2a80d58e8d0ff71cc4d5e310a1debdda4a45f02");
     const msg = msg_buf[0..32];

@@ -8,8 +8,7 @@
 //! subroutines, §3.7). All four are IMPLEMENTED (a Fable pass filled the
 //! scaffold and flipped `gate.core_implemented = true`), each carrying a
 //! complete per-step doc-comment contract transcribed from
-//! draft-irtf-cfrg-bbs-signatures-04 — see `../SPEC.md` for why THIS
-//! draft version was pinned and `gate.zig` for the scaffold-then-Fable
+//! draft-irtf-cfrg-bbs-signatures-12 — see `../SPEC.md` for the pin and `gate.zig` for the scaffold-then-Fable
 //! discipline.
 //!
 //! **Why `proofGen`/`proofVerify`, not `sign`/`verify`, are the genuinely
@@ -30,16 +29,16 @@
 //! **Randomness — explicit parameter, not internal entropy** (see
 //! `../README.md`'s "Randomness" section): `proofGen` takes
 //! `random_scalars: []const Fr` as a plain parameter (length MUST be
-//! `3 + U`, `U` = the undisclosed-message count) rather than an `io:
+//! `randomScalarCount(U) = 5 + U`, `U` = the undisclosed-message count) rather than an `io:
 //! std.Io`/internal RNG read. This mirrors `frost`'s "nonces are an
 //! explicit input" convention (`frost/src/root.zig`), and is what makes
 //! the draft's own deterministic `mocked_random_scalars` (KAT
 //! reproducibility, draft §7.1 — `ciphersuite.mockedRandomScalars`) and
 //! real entropy (`ciphersuite.calculateRandomScalars`) interchangeable
 //! at this boundary: `kat_test.zig`'s gated `proofGen` tests pass a
-//! `mockedRandomScalars(3 + U, seed)` slice and assert the exact
+//! `mockedRandomScalars(5 + U, seed)` slice and assert the exact
 //! resulting proof bytes; a real caller would instead pass
-//! `&calculateRandomScalars(3 + U, io)`.
+//! `&calculateRandomScalars(5 + U, io)`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -111,49 +110,53 @@ pub const Signature = struct {
     }
 };
 
-/// A BBS proof: `(Abar, Bbar, r2_hat, r3_hat, m_hat[0..U], c)` — draft
-/// §3.7.2's `ProofFinalize` output shape (`Abar`/`Bbar` two `G1`
-/// points; `r2_hat`/`r3_hat`/`c` three scalars; `m_hat` one scalar per
-/// UNDISCLOSED message). Variable-length wire encoding: `2 *
-/// G1.compressed_bytes + (3 + U) * Fr.encoded_bytes` — `U = m_hat.len`
-/// is recovered from the encoded length itself on decode (draft
-/// §4.2.4.5), not carried out-of-band.
+/// A BBS proof: `(Abar, Bbar, D, e^, r1^, r3^, m^[0..U], c)` — draft-12
+/// §3.7.2's `ProofFinalize` output shape (`Abar`/`Bbar`/`D` three `G1`
+/// points; `e^`/`r1^`/`r3^`/`c` four scalars; `m^` one scalar per
+/// UNDISCLOSED message). Variable-length wire encoding: `3 *
+/// G1.compressed_bytes + (4 + U) * Fr.encoded_bytes` — `U = m_hat.len` is
+/// recovered from the encoded length itself on decode (draft §4.2.4.5),
+/// not carried out-of-band.
 pub const Proof = struct {
     abar: G1.Affine,
     bbar: G1.Affine,
-    r2_hat: Fr,
+    d: G1.Affine,
+    e_hat: Fr,
+    r1_hat: Fr,
     r3_hat: Fr,
     /// One response scalar per UNDISCLOSED message (`m^_j1 .. m^_jU`,
-    /// draft §3.7.2 step 4). Owned by whoever constructed this `Proof`
+    /// draft §3.7.2 step 5). Owned by whoever constructed this `Proof`
     /// (`proofGen`'s return, or `fromBytes`'s allocation) — free with
     /// `deinit`.
     m_hat: []const Fr,
     c: Fr,
 
+    /// `3 * 48 + 4 * 32 = 272` octets with nothing undisclosed.
+    pub const floor_bytes = 3 * G1.compressed_bytes + 4 * Fr.encoded_bytes;
+
     pub fn encodedLen(undisclosed_count: usize) usize {
-        return 2 * G1.compressed_bytes + (3 + undisclosed_count) * Fr.encoded_bytes;
+        return floor_bytes + undisclosed_count * Fr.encoded_bytes;
     }
 
     pub fn deinit(self: Proof, allocator: std.mem.Allocator) void {
         allocator.free(self.m_hat);
     }
 
-    /// `proof_to_octets` (draft §4.2.4.4): `ser(Abar) || ser(Bbar) ||
-    /// I2OSP(r2_hat,32) || I2OSP(r3_hat,32) || I2OSP(m_hat_1,32) || .. ||
-    /// I2OSP(m_hat_U,32) || I2OSP(c,32)`. REAL. Caller owns the returned
-    /// slice.
+    /// `proof_to_octets` (draft §4.2.4.4): `serialize((Abar, Bbar, D, e^,
+    /// r1^, r3^, m^_1, .., m^_U, c))` — points compressed, scalars
+    /// `I2OSP(.., 32)`. Caller owns the returned slice.
     pub fn toBytes(self: Proof, allocator: std.mem.Allocator) ![]u8 {
         const out = try allocator.alloc(u8, encodedLen(self.m_hat.len));
         errdefer allocator.free(out);
         var off: usize = 0;
-        out[off..][0..G1.compressed_bytes].* = G1.toBytesCompressed(self.abar);
-        off += G1.compressed_bytes;
-        out[off..][0..G1.compressed_bytes].* = G1.toBytesCompressed(self.bbar);
-        off += G1.compressed_bytes;
-        out[off..][0..Fr.encoded_bytes].* = self.r2_hat.toBytes();
-        off += Fr.encoded_bytes;
-        out[off..][0..Fr.encoded_bytes].* = self.r3_hat.toBytes();
-        off += Fr.encoded_bytes;
+        for ([_]G1.Affine{ self.abar, self.bbar, self.d }) |p| {
+            out[off..][0..G1.compressed_bytes].* = G1.toBytesCompressed(p);
+            off += G1.compressed_bytes;
+        }
+        for ([_]Fr{ self.e_hat, self.r1_hat, self.r3_hat }) |x| {
+            out[off..][0..Fr.encoded_bytes].* = x.toBytes();
+            off += Fr.encoded_bytes;
+        }
         for (self.m_hat) |m| {
             out[off..][0..Fr.encoded_bytes].* = m.toBytes();
             off += Fr.encoded_bytes;
@@ -164,33 +167,29 @@ pub const Proof = struct {
         return out;
     }
 
-    /// `octets_to_proof` (draft §4.2.4.5): `U` is recovered from
-    /// `bytes.len` (`proof_len_floor = 2*48 + 3*32 = 192`; `U =
-    /// (bytes.len - proof_len_floor) / 32`, REJECTING a remainder).
-    /// Rejects `Abar`/`Bbar` decoding to the identity, and every scalar
-    /// (`r2_hat`/`r3_hat`/each `m_hat`/`c`) being `0` or `>= r`. Does NOT
-    /// subgroup-check `Abar`/`Bbar` (same non-subgroup-checking
-    /// deserialization contract as `Signature.fromBytes`). Caller owns
-    /// the returned `.m_hat` (free via `.deinit`).
+    /// `octets_to_proof` (draft §4.2.4.5): `U = (bytes.len - floor_bytes) /
+    /// 32`, REJECTING a remainder. Each of `Abar`/`Bbar`/`D` must decode to
+    /// a non-identity point of `G1` (the decoder subgroup-checks), and
+    /// every scalar must be in `1..r-1`. Caller owns the returned `.m_hat`
+    /// (free via `.deinit`).
     pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8) BbsError!Proof {
-        const floor = 2 * G1.compressed_bytes + 3 * Fr.encoded_bytes;
-        if (bytes.len < floor) return error.InvalidProofEncoding;
-        if ((bytes.len - floor) % Fr.encoded_bytes != 0) return error.InvalidProofEncoding;
-        const u = (bytes.len - floor) / Fr.encoded_bytes;
+        if (bytes.len < floor_bytes) return error.InvalidProofEncoding;
+        if ((bytes.len - floor_bytes) % Fr.encoded_bytes != 0) return error.InvalidProofEncoding;
+        const u = (bytes.len - floor_bytes) / Fr.encoded_bytes;
 
         var off: usize = 0;
-        // The decoder refuses a point outside the subgroup.
-        const abar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
-        if (abar.infinity) return error.InvalidProofEncoding;
-        off += G1.compressed_bytes;
-        const bbar = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
-        if (bbar.infinity) return error.InvalidProofEncoding;
-        off += G1.compressed_bytes;
-
-        const r2_hat = try fromBytesNonzeroScalar(bytes[off..][0..Fr.encoded_bytes].*);
-        off += Fr.encoded_bytes;
-        const r3_hat = try fromBytesNonzeroScalar(bytes[off..][0..Fr.encoded_bytes].*);
-        off += Fr.encoded_bytes;
+        var points: [3]G1.Affine = undefined;
+        for (&points) |*p| {
+            // The decoder refuses a point outside the subgroup.
+            p.* = G1.fromBytesCompressed(bytes[off..][0..G1.compressed_bytes].*) catch return error.InvalidProofEncoding;
+            if (p.infinity) return error.InvalidProofEncoding;
+            off += G1.compressed_bytes;
+        }
+        var head: [3]Fr = undefined;
+        for (&head) |*x| {
+            x.* = try fromBytesNonzeroScalar(bytes[off..][0..Fr.encoded_bytes].*);
+            off += Fr.encoded_bytes;
+        }
 
         const m_hat = try allocator.alloc(Fr, u);
         errdefer allocator.free(m_hat);
@@ -203,9 +202,16 @@ pub const Proof = struct {
         off += Fr.encoded_bytes;
         std.debug.assert(off == bytes.len);
 
-        return .{ .abar = abar, .bbar = bbar, .r2_hat = r2_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = c };
+        return .{ .abar = points[0], .bbar = points[1], .d = points[2], .e_hat = head[0], .r1_hat = head[1], .r3_hat = head[2], .m_hat = m_hat, .c = c };
     }
 };
+
+/// How many random scalars `proofGen` takes for `undisclosed_count`
+/// undisclosed messages: `5 + U` (draft-12 §3.6.3 — `r1, r2, e~, r1~, r3~`
+/// and one `m~_j` per undisclosed message).
+pub fn randomScalarCount(undisclosed_count: usize) usize {
+    return 5 + undisclosed_count;
+}
 
 fn fromBytesNonzeroScalar(bytes: [Fr.encoded_bytes]u8) BbsError!Fr {
     const s = Fr.fromBytes(bytes) catch return error.InvalidProofEncoding;
@@ -252,7 +258,7 @@ fn computeB(domain: Fr, generators: []const G1.Affine, message_scalars: []const 
 // verifier already holds them in full). `proofVerify`'s `d_j` uses only
 // `disclosed_scalars` (revealed by definition) plus the public
 // `domain`/`P1`/generators; its `t_j` uses only wire-received proof fields
-// (`Abar`/`Bbar`/`r2_hat`/`r3_hat`/`m_hat`/`c`) the prover already
+// (`Abar`/`Bbar`/`D`/`e^`/`r1^`/`r3^`/`m^`/`c`) the prover already
 // transmitted in the clear — the verifier has no secret of its own in that
 // computation to leak. Those two call sites are safe for a variable-time
 // MSM and are what this crossover applies to.
@@ -350,24 +356,21 @@ fn appendU64(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) std.
     try buf.appendSlice(allocator, &b);
 }
 
-/// `ProofChallengeCalculate` (draft §3.7.4), shared by `proofGen` and
+/// `ProofChallengeCalculate` (draft-12 §3.7.4), shared by `proofGen` and
 /// `proofVerify` — the ONE place the Fiat-Shamir transcript is
 /// serialized, so the two sides cannot drift:
 /// ```
-/// c_arr  = (Abar, Bbar, T, R, i1, .., iR, msg_i1, .., msg_iR, domain)
+/// c_arr  = (R, i1, msg_i1, .., iR, msg_iR, Abar, Bbar, D, T1, T2, domain)
 /// c_octs = serialize(c_arr) || I2OSP(len(ph), 8) || ph
-/// c      = hash_to_scalar(c_octs, h2s_dst)      // challenge_dst == h2s_dst
+/// c      = hash_to_scalar(c_octs, api_id || "H2S_")
 /// ```
-/// `serialize` per draft §4.2.4.1: points compressed (48 bytes), the
-/// count `R` and each index as `I2OSP(.., 8)`, scalars as
-/// `I2OSP(.., 32)` (`Fr.toBytes`). Disclosed indexes are serialized
-/// exactly as passed (0-based, ascending — the fixtures' own
-/// convention, byte-confirmed by `proof001`/`proof003`).
+/// `serialize` per draft §4.2.4.1: the count `R` and each index as
+/// `I2OSP(.., 8)`, scalars as `I2OSP(.., 32)`, points compressed. Each
+/// index is followed by ITS message (draft-04 listed all indexes, then all
+/// messages, and put the points first).
 fn calculateChallenge(
     allocator: std.mem.Allocator,
-    abar: G1.Affine,
-    bbar: G1.Affine,
-    t: G1.Affine,
+    points: [5]G1.Affine, // Abar, Bbar, D, T1, T2
     disclosed_indexes: []const usize,
     disclosed_scalars: []const Fr,
     domain: Fr,
@@ -376,12 +379,12 @@ fn calculateChallenge(
     std.debug.assert(disclosed_indexes.len == disclosed_scalars.len);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, &G1.toBytesCompressed(abar));
-    try buf.appendSlice(allocator, &G1.toBytesCompressed(bbar));
-    try buf.appendSlice(allocator, &G1.toBytesCompressed(t));
     try appendU64(&buf, allocator, disclosed_indexes.len);
-    for (disclosed_indexes) |i| try appendU64(&buf, allocator, i);
-    for (disclosed_scalars) |m| try buf.appendSlice(allocator, &m.toBytes());
+    for (disclosed_indexes, disclosed_scalars) |i, m| {
+        try appendU64(&buf, allocator, i);
+        try buf.appendSlice(allocator, &m.toBytes());
+    }
+    for (points) |p| try buf.appendSlice(allocator, &G1.toBytesCompressed(p));
     try buf.appendSlice(allocator, &domain.toBytes());
     try appendU64(&buf, allocator, ph.len);
     try buf.appendSlice(allocator, ph);
@@ -421,10 +424,8 @@ fn negBp2() G2.Affine {
 
 // ── the four Fable-hard cores ────────────────────────────────────────────
 
-/// FABLE CORE — `Sign(SK, PK, header, messages)` (draft §3.5.1 Interface
-/// wrapping §3.6.1's `CoreSign`; `commitment` is always `Identity_G1`
-/// for this Interface — no blind-signature extension point is exposed,
-/// so `comm` below is always the empty octet string).
+/// FABLE CORE — `Sign(SK, PK, header, messages)` (draft-12 §3.5.1
+/// Interface wrapping §3.6.1's `CoreSign`).
 ///
 /// Construction (draft §3.5.1 + §3.6.1, composed):
 /// ```
@@ -432,18 +433,17 @@ fn negBp2() G2.Affine {
 /// 2. generators = ciphersuite.createGenerators(allocator, messages.len + 1)
 ///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
 /// 3. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
-/// 4. e = hash_to_scalar(serialize((sk, domain, msg_1, .., msg_L)), h2s_dst)
-///    // "serialize" per draft §4.2.4.1: sk as I2OSP(sk,32), domain as
-///    // I2OSP(domain,32), each msg_i as I2OSP(msg_i,32), concatenated —
-///    // NOTHING appended for `comm` since it is always "" here.
+/// 4. e = hash_to_scalar(serialize((sk, msg_1, .., msg_L, domain)), h2s_dst)
+///    // "serialize" per draft §4.2.4.1: each scalar as I2OSP(.., 32),
+///    // concatenated. draft-12 puts `domain` LAST (draft-04: right after
+///    // `sk`, with a `comm` slot that was always empty here).
 /// 5. B = P1 + [domain]Q_1 + sum_i [msg_i]H_i        (Jacobian accumulation,
 ///                                                     P1 = ciphersuite.P1)
 /// 6. A = [(sk + e)^-1] B
 /// 7. return Signature{ .a = A.toAffine(), .e = e }.toBytes()
 /// ```
-/// Byte-exact against `mattrglobal/pairing_crypto`'s `signature/
-/// signature001.json` (single message) and `signature004.json`
-/// (10-message) fixtures — see `kat_test.zig`'s gated tests.
+/// Byte-exact against draft-12 §8.4.4 (single and ten messages) and
+/// Appendix D.2.1.1 (no header) — see `kat_test.zig`.
 pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
     const message_scalars = try cs.messagesToScalars(allocator, messages);
     defer allocator.free(message_scalars);
@@ -451,16 +451,17 @@ pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: 
     defer allocator.free(generators);
     const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
 
-    // e = hash_to_scalar(serialize((SK, domain, msg_1, .., msg_L)), h2s_dst)
-    // — draft §3.6.1's e derivation (`signature_dst` == `h2s_dst`, see
-    // `ciphersuite.h2s_dst`); `serialize` per §4.2.4.1 is each scalar's
-    // 32-byte big-endian encoding, concatenated, with NOTHING appended
-    // for the always-empty `comm`.
+    // e = hash_to_scalar(serialize((SK, msg_1, .., msg_L, domain)),
+    // api_id || "H2S_") — draft-12 §3.6.1 step 2; `serialize` per §4.2.4.1
+    // is each scalar's 32-byte big-endian encoding, concatenated.
     var e_input: std.ArrayList(u8) = .empty;
-    defer e_input.deinit(allocator);
+    defer {
+        std.crypto.secureZero(u8, e_input.items); // holds SK
+        e_input.deinit(allocator);
+    }
     try e_input.appendSlice(allocator, &sk.toBytes());
-    try e_input.appendSlice(allocator, &domain.toBytes());
     for (message_scalars) |m| try e_input.appendSlice(allocator, &m.toBytes());
+    try e_input.appendSlice(allocator, &domain.toBytes());
     const e = cs.hashToScalar(e_input.items, cs.h2s_dst);
 
     // B = P1 + [domain]Q_1 + sum_i [msg_i]H_i ;  A = [(SK + e)^-1]B.
@@ -498,10 +499,10 @@ pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: 
 /// not an error — draft §3.6.2 steps 1-2's "if signature_result is
 /// INVALID, return INVALID" maps to a boolean `false` result at the
 /// Interface layer, matching `bls12_381.bls_sig`'s verify-family
-/// convention of never panicking on attacker-controlled input). Byte
-/// pattern for a tamper test is `mattrglobal/pairing_crypto`'s
-/// `signature002.json` (signature001's exact bytes, verified against a
-/// DIFFERENT message set — expected `false`) — see `kat_test.zig`.
+/// convention of never panicking on attacker-controlled input). The six
+/// invalid cases of draft-12 Appendix D.2.1 (modified, extra, missing and
+/// reordered messages, wrong public key, wrong header) are pinned in
+/// `kat_test.zig`.
 pub fn verify(allocator: std.mem.Allocator, pk: PublicKey, signature: [Signature.encoded_bytes]u8, header: []const u8, messages: []const []const u8) BbsError!bool {
     // Fail-closed on malformed signature bytes (draft §3.6.2 steps 1-2's
     // "return INVALID" — a boolean `false` at this Interface layer).
@@ -530,55 +531,46 @@ pub fn verify(allocator: std.mem.Allocator, pk: PublicKey, signature: [Signature
 }
 
 /// FABLE CORE — `ProofGen(PK, signature, header, ph, messages,
-/// disclosed_indexes, random_scalars)` (draft §3.5.3 wrapping §3.6.3's
+/// disclosed_indexes, random_scalars)` (draft-12 §3.5.3 wrapping §3.6.3's
 /// `CoreProofGen`, itself `ProofInit` (§3.7.1) + `ProofChallengeCalculate`
 /// (§3.7.4) + `ProofFinalize` (§3.7.2)) — **the module's genuinely hard
 /// core**, see this file's module doc comment.
 ///
-/// `random_scalars.len` MUST be exactly `3 + U` (`U = messages.len -
-/// disclosed_indexes.len`) — see this file's module doc comment for why
-/// this is an explicit parameter rather than internal entropy;
-/// `ciphersuite.mockedRandomScalars`/`calculateRandomScalars` are the
-/// two intended sources.
+/// `random_scalars.len` MUST be exactly `randomScalarCount(U) = 5 + U`
+/// (`U = messages.len - disclosed_indexes.len`) — see this file's module
+/// doc comment for why this is an explicit parameter rather than internal
+/// entropy; `ciphersuite.mockedRandomScalars`/`calculateRandomScalars` are
+/// the two intended sources.
 ///
-/// Construction (draft §3.6.3 + §3.7.1 + §3.7.4 + §3.7.2, composed;
+/// Construction (draft-12 §3.6.3 + §3.7.1 + §3.7.4 + §3.7.2, composed;
 /// `L = messages.len`, `R = disclosed_indexes.len`, `U = L - R`,
-/// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, both index sets
-/// kept in ascending order):
+/// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, both ascending):
 /// ```
 /// 1. (A, e) = Signature.fromBytes(signature)
-/// 2. message_scalars = ciphersuite.messagesToScalars(allocator, messages)
-/// 3. generators = ciphersuite.createGenerators(allocator, L + 1)
-///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
-/// 4. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
+/// 2. message_scalars = messagesToScalars(messages); generators = createGenerators(L + 1)
+/// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
 ///
 /// -- ProofInit (§3.7.1) --
-/// 5. (r1, r2, r3, m~_j1, .., m~_jU) = random_scalars   // random_scalars[0..3] are r1,r2,r3
-/// 6. B    = P1 + [domain]Q_1 + sum_i [msg_i]H_i
-/// 7. Abar = [r1]A
-/// 8. Bbar = [r1]B - [e]Abar
-/// 9. T    = [r2]Abar + [r3]Bbar + sum_{j in undisclosed} [m~_j]H_j
+/// 4. (r1, r2, e~, r1~, r3~, m~_j1, .., m~_jU) = random_scalars
+/// 5. B    = P1 + [domain]Q_1 + sum_i [msg_i]H_i
+/// 6. D    = [r2]B
+/// 7. Abar = [r1 * r2]A
+/// 8. Bbar = [r1]D - [e]Abar
+/// 9. T1   = [e~]Abar + [r1~]D
+/// 10. T2  = [r3~]D + sum_{j in undisclosed} [m~_j]H_j
 ///
 /// -- ProofChallengeCalculate (§3.7.4) --
-/// 10. c_arr  = (Abar, Bbar, T, R, i1, .., iR, msg_i1, .., msg_iR, domain)
-///     // i1..iR = disclosed_indexes; msg_i1..msg_iR = their message_scalars
-/// 11. c_octs = serialize(c_arr) || I2OSP(len(ph), 8) || ph
-/// 12. challenge = hash_to_scalar(c_octs, h2s_dst)
+/// 11. c = hash_to_scalar(serialize((R, i1, msg_i1, .., Abar, Bbar, D, T1, T2, domain))
+///                        || I2OSP(len(ph), 8) || ph)
 ///
 /// -- ProofFinalize (§3.7.2) --
-/// 13. r4      = -(r1^-1) mod r
-/// 14. r2_hat  = r2 + e * r4 * challenge (mod r)
-/// 15. r3_hat  = r3 + r4 * challenge (mod r)
-/// 16. for j in undisclosed_indexes (in order):
-///         m_hat_j = m~_j + message_scalars[j] * challenge (mod r)
-/// 17. return Proof{ Abar, Bbar, r2_hat, r3_hat, m_hat[0..U], c = challenge }.toBytes()
+/// 12. r3  = r2^-1
+/// 13. e^  = e~ + e * c;  r1^ = r1~ - r1 * c;  r3^ = r3~ - r3 * c
+/// 14. m^_j = m~_j + msg_j * c   for j in undisclosed (in order)
+/// 15. return proof_to_octets((Abar, Bbar, D, e^, r1^, r3^, m^, c))
 /// ```
-/// Byte-exact (given the fixture's own `random_scalars =
-/// ciphersuite.mockedRandomScalars(3 + U, "3.14159...")`) against
-/// `mattrglobal/pairing_crypto`'s `proof/proof001.json` (`U=0`) and
-/// `proof003.json` (`U=6`) fixtures — see `kat_test.zig`'s gated tests
-/// and this file's module doc comment for the mocked-RNG seed
-/// provenance.
+/// Byte-exact (under the draft's mocked RNG, `kat_vectors.mocked_rng`)
+/// against draft-12 §8.4.5 and Appendix D.2.2 — see `kat_test.zig`.
 pub fn proofGen(
     allocator: std.mem.Allocator,
     pk: PublicKey,
@@ -592,7 +584,7 @@ pub fn proofGen(
     if (disclosed_indexes.len > messages.len) return error.TooManyDisclosedIndexes;
     for (disclosed_indexes) |i| if (i >= messages.len) return error.DisclosedIndexOutOfRange;
     const undisclosed_count = messages.len - disclosed_indexes.len;
-    if (random_scalars.len != 3 + undisclosed_count) return error.RandomScalarCountMismatch;
+    if (random_scalars.len != randomScalarCount(undisclosed_count)) return error.RandomScalarCountMismatch;
 
     const sig = try Signature.fromBytes(signature);
 
@@ -605,98 +597,144 @@ pub fn proofGen(
     const undisclosed = try undisclosedIndexes(allocator, messages.len, disclosed_indexes);
     defer allocator.free(undisclosed);
     // A DUPLICATE disclosed index makes the true undisclosed count exceed
-    // `L - R`, so `random_scalars.len == 3 + (L - R)` can no longer be
+    // `L - R`, so `random_scalars.len == 5 + (L - R)` can no longer be
     // the right count for the actual undisclosed set — surfaced as the
     // same count-mismatch error.
     if (undisclosed.len != undisclosed_count) return error.RandomScalarCountMismatch;
 
-    // -- ProofInit (draft §3.7.1) --
+    // -- ProofInit (draft-12 §3.7.1) --
     const r1 = random_scalars[0];
     const r2 = random_scalars[1];
-    const r3 = random_scalars[2];
-    const m_tilde = random_scalars[3..];
-    // `r1 == 0` is not a valid random-scalar draw (probability ~2^-255
-    // from either blessed source, `ciphersuite.mockedRandomScalars`/
-    // `calculateRandomScalars`) and would make `Abar` the identity AND
-    // `r4 = -(r1^-1)` undefined — rejected as a malformed
-    // `random_scalars` input rather than UB.
-    const r1_inv = r1.inv() catch return error.RandomScalarCountMismatch;
+    const e_tilde = random_scalars[2];
+    const r1_tilde = random_scalars[3];
+    const r3_tilde = random_scalars[4];
+    const m_tilde = random_scalars[5..];
+    // `r2 == 0` is not a valid random-scalar draw (probability ~2^-255
+    // from either blessed source) and would make `D` the identity and
+    // `r3 = r2^-1` undefined; `r1 == 0` would make `Abar` the identity.
+    // Both are refused as malformed `random_scalars` rather than UB.
+    const r3 = r2.inv() catch return error.RandomScalarCountMismatch;
+    if (r1.isZero()) return error.RandomScalarCountMismatch;
 
+    // Every multiplication below involves a secret (the signature, the
+    // undisclosed messages folded into `B`, or a blinding scalar), so all
+    // of them use `bls12_381`'s constant-time `scalarMul` — never the
+    // variable-time MSM (see the section comment above `msmPublic`).
     const b = computeB(domain, generators, message_scalars);
-    const abar_j = G1.Jacobian.fromAffine(sig.a).scalarMul(r1);
-    const bbar_j = b.scalarMul(r1).add(abar_j.scalarMul(sig.e).negate());
-    var t_j = abar_j.scalarMul(r2).add(bbar_j.scalarMul(r3));
+    const d_j = b.scalarMul(r2);
+    const abar_j = G1.Jacobian.fromAffine(sig.a).scalarMul(r1.mul(r2));
+    const bbar_j = d_j.scalarMul(r1).add(abar_j.scalarMul(sig.e).negate());
+    const t1_j = abar_j.scalarMul(e_tilde).add(d_j.scalarMul(r1_tilde));
+    var t2_j = d_j.scalarMul(r3_tilde);
     for (undisclosed, m_tilde) |j, mt| {
-        t_j = t_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mt));
+        t2_j = t2_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mt));
     }
     const abar = abar_j.toAffine();
     const bbar = bbar_j.toAffine();
+    const d = d_j.toAffine();
 
-    // -- ProofChallengeCalculate (draft §3.7.4) --
+    // -- ProofChallengeCalculate (draft-12 §3.7.4) --
     const disclosed_scalars = try allocator.alloc(Fr, disclosed_indexes.len);
     defer allocator.free(disclosed_scalars);
     for (disclosed_indexes, disclosed_scalars) |i, *s| s.* = message_scalars[i];
-    const challenge = try calculateChallenge(allocator, abar, bbar, t_j.toAffine(), disclosed_indexes, disclosed_scalars, domain, ph);
+    const challenge = try calculateChallenge(allocator, .{ abar, bbar, d, t1_j.toAffine(), t2_j.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
 
-    // -- ProofFinalize (draft §3.7.2) --
-    const r4 = r1_inv.neg(); // r4 = -(r1^-1) mod r
-    const r2_hat = r2.add(sig.e.mul(r4).mul(challenge));
-    const r3_hat = r3.add(r4.mul(challenge));
+    // -- ProofFinalize (draft-12 §3.7.2) --
+    const e_hat = e_tilde.add(sig.e.mul(challenge));
+    const r1_hat = r1_tilde.sub(r1.mul(challenge));
+    const r3_hat = r3_tilde.sub(r3.mul(challenge));
     const m_hat = try allocator.alloc(Fr, undisclosed.len);
     defer allocator.free(m_hat);
     for (undisclosed, m_tilde, m_hat) |j, mt, *mh| {
         mh.* = mt.add(message_scalars[j].mul(challenge));
     }
 
-    const out: Proof = .{ .abar = abar, .bbar = bbar, .r2_hat = r2_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = challenge };
+    const out: Proof = .{ .abar = abar, .bbar = bbar, .d = d, .e_hat = e_hat, .r1_hat = r1_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = challenge };
     return try out.toBytes(allocator);
 }
 
+/// `ProofVerifyInit` (draft-12 §3.7.3) steps 2-4, MSM-crossover form:
+/// ```
+/// T1 = [c]Bbar + [e^]Abar + [r1^]D
+/// Bv = P1 + [domain]Q_1 + sum_{i in disclosed} [msg_i]H_i
+/// T2 = [c]Bv + [r3^]D + sum_{j in undisclosed} [m^_j]H_j
+/// ```
+/// Every scalar here is PUBLIC to the verifier: `disclosed_scalars` are
+/// revealed by definition, and `e^`/`r1^`/`r3^`/`m^`/`c` are wire-received
+/// proof fields the prover already sent in the clear — see the section
+/// comment above `msmPublic`'s definition for why that makes the
+/// variable-time MSM safe here (unlike `sign`/`proofGen`).
+fn proofVerifyInit(
+    allocator: std.mem.Allocator,
+    generators: []const G1.Affine,
+    domain: Fr,
+    disclosed_indexes: []const usize,
+    disclosed_scalars: []const Fr,
+    undisclosed: []const usize,
+    proof: Proof,
+) std.mem.Allocator.Error!struct { t1: G1.Jacobian, t2: G1.Jacobian } {
+    std.debug.assert(disclosed_indexes.len == disclosed_scalars.len);
+    std.debug.assert(undisclosed.len == proof.m_hat.len);
+    const t1 = try msmPublic(allocator, &.{ proof.bbar, proof.abar, proof.d }, &.{ proof.c, proof.e_hat, proof.r1_hat });
+
+    const bv_points = try allocator.alloc(G1.Affine, disclosed_indexes.len + 2);
+    defer allocator.free(bv_points);
+    const bv_scalars = try allocator.alloc(Fr, disclosed_indexes.len + 2);
+    defer allocator.free(bv_scalars);
+    bv_points[0] = cs.P1;
+    bv_scalars[0] = Fr.one;
+    bv_points[1] = generators[0];
+    bv_scalars[1] = domain;
+    for (disclosed_indexes, disclosed_scalars, bv_points[2..], bv_scalars[2..]) |i, m, *bp, *bs| {
+        bp.* = generators[i + 1];
+        bs.* = m;
+    }
+    const bv = try msmPublic(allocator, bv_points, bv_scalars);
+
+    const t2_points = try allocator.alloc(G1.Affine, undisclosed.len + 2);
+    defer allocator.free(t2_points);
+    const t2_scalars = try allocator.alloc(Fr, undisclosed.len + 2);
+    defer allocator.free(t2_scalars);
+    t2_points[0] = bv.toAffine();
+    t2_scalars[0] = proof.c;
+    t2_points[1] = proof.d;
+    t2_scalars[1] = proof.r3_hat;
+    for (undisclosed, proof.m_hat, t2_points[2..], t2_scalars[2..]) |j, mh, *tp, *ts| {
+        tp.* = generators[j + 1];
+        ts.* = mh;
+    }
+    return .{ .t1 = t1, .t2 = try msmPublic(allocator, t2_points, t2_scalars) };
+}
+
 /// FABLE CORE — `ProofVerify(PK, proof, header, ph, disclosed_messages,
-/// disclosed_indexes)` (draft §3.5.4 wrapping §3.6.4's
+/// disclosed_indexes)` (draft-12 §3.5.4 wrapping §3.6.4's
 /// `CoreProofVerify`, itself `ProofVerifyInit` (§3.7.3) +
 /// `ProofChallengeCalculate` (§3.7.4)).
 ///
-/// `disclosed_messages.len` MUST equal `disclosed_indexes.len` (draft
-/// §3.7.3 ABORT condition 2 — `error.DisclosedMessageCountMismatch`
-/// otherwise). `L` (total original message count) and `U` (undisclosed
-/// count) are BOTH recovered without an explicit parameter: `U =
-/// Proof.fromBytes`'s derived `m_hat.len`, `L = disclosed_indexes.len +
-/// U` (draft §3.7.3 steps 1-4).
+/// `disclosed_messages.len` MUST equal `disclosed_indexes.len`
+/// (`error.DisclosedMessageCountMismatch` otherwise). `L` and `U` are
+/// recovered without an explicit parameter: `U = Proof.fromBytes`'s
+/// derived `m_hat.len`, `L = disclosed_indexes.len + U` (§3.7.3 steps 1-4).
 ///
-/// Construction (draft §3.6.4 + §3.7.3 + §3.7.4, composed;
+/// Construction (draft-12 §3.6.4 + §3.7.3 + §3.7.4, composed;
 /// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, ascending):
 /// ```
-/// 1. proof = Proof.fromBytes(allocator, proof_bytes)   // rejects malformed input
-/// 2. R = disclosed_indexes.len; U = proof.m_hat.len; L = R + U
-/// 3. disclosed_scalars = ciphersuite.messagesToScalars(allocator, disclosed_messages)
-/// 4. generators = ciphersuite.createGenerators(allocator, L + 1)
-///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
+/// 1. (Abar, Bbar, D, e^, r1^, r3^, m^, cp) = Proof.fromBytes(proof)
+/// 2. disclosed_scalars = messagesToScalars(disclosed_messages); generators = createGenerators(L + 1)
+/// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
 ///
 /// -- ProofVerifyInit (§3.7.3) --
-/// 5. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
-/// 6. D = P1 + [domain]Q_1 + sum_{i in disclosed} [disclosed_scalars[i]]H_i
-/// 7. T = [proof.r2_hat]Abar + [proof.r3_hat]Bbar
-///        + sum_{j in undisclosed} [proof.m_hat[j]]H_j
-/// 8. T = T + [proof.c]D
+/// 4. T1 = [cp]Bbar + [e^]Abar + [r1^]D
+/// 5. Bv = P1 + [domain]Q_1 + sum_{i in disclosed} [msg_i]H_i
+/// 6. T2 = [cp]Bv + [r3^]D + sum_{j in undisclosed} [m^_j]H_j
 ///
-/// -- ProofChallengeCalculate (§3.7.4) — MUST reproduce proof.c --
-/// 9.  c_arr  = (proof.abar, proof.bbar, T, R, i1, .., iR, disclosed_scalars, domain)
-/// 10. c_octs = serialize(c_arr) || I2OSP(len(ph), 8) || ph
-/// 11. recomputed_challenge = hash_to_scalar(c_octs, h2s_dst)
-/// 12. if recomputed_challenge != proof.c, return false
+/// -- ProofChallengeCalculate (§3.7.4) — MUST reproduce cp --
+/// 7. if hash_to_scalar(... Abar, Bbar, D, T1, T2, domain ... ph) != cp, return false
 ///
 /// -- pairing check --
-/// 13. return pairing.pairingCheck(&.{
-///         .{ .p = proof.abar, .q = pk.point },
-///         .{ .p = proof.bbar, .q = -BP2 },
-///     })
+/// 8. return e(Abar, W) * e(Bbar, -BP2) == 1
 /// ```
 /// Total/fail-closed on malformed `proof` bytes (returns `false`).
-/// Byte-exact-input-round-trip against `mattrglobal/pairing_crypto`'s
-/// `proof001.json`/`proof003.json` (expect `true`) and `proof004.json`
-/// (tampered presentation header — expect `false`) — see
-/// `kat_test.zig`'s gated tests.
 pub fn proofVerify(
     allocator: std.mem.Allocator,
     pk: PublicKey,
@@ -733,49 +771,14 @@ pub fn proofVerify(
     defer allocator.free(generators);
     const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
 
-    // -- ProofVerifyInit (draft §3.7.3), MSM-crossover form --
-    //
-    // Every scalar below is PUBLIC to the verifier: `disclosed_scalars`
-    // are revealed by definition, and `r2_hat`/`r3_hat`/`m_hat`/`c` are
-    // wire-received proof fields the prover already sent in the clear —
-    // see the section comment above `msmPublic`'s definition for why
-    // that makes the variable-time MSM safe here (unlike `sign`/
-    // `proofGen`).
-    const d_points = try allocator.alloc(G1.Affine, disclosed_indexes.len + 2);
-    defer allocator.free(d_points);
-    const d_scalars = try allocator.alloc(Fr, disclosed_indexes.len + 2);
-    defer allocator.free(d_scalars);
-    d_points[0] = cs.P1;
-    d_scalars[0] = Fr.one;
-    d_points[1] = generators[0];
-    d_scalars[1] = domain;
-    for (disclosed_indexes, disclosed_scalars, d_points[2..], d_scalars[2..]) |i, m, *dp, *ds| {
-        dp.* = generators[i + 1];
-        ds.* = m;
-    }
-    const d_j = try msmPublic(allocator, d_points, d_scalars);
+    // -- ProofVerifyInit (draft-12 §3.7.3) --
+    const init = try proofVerifyInit(allocator, generators, domain, disclosed_indexes, disclosed_scalars, undisclosed, parsed);
 
-    const t_points = try allocator.alloc(G1.Affine, undisclosed.len + 3);
-    defer allocator.free(t_points);
-    const t_scalars = try allocator.alloc(Fr, undisclosed.len + 3);
-    defer allocator.free(t_scalars);
-    t_points[0] = parsed.abar;
-    t_scalars[0] = parsed.r2_hat;
-    t_points[1] = parsed.bbar;
-    t_scalars[1] = parsed.r3_hat;
-    for (undisclosed, parsed.m_hat, t_points[2 .. 2 + undisclosed.len], t_scalars[2 .. 2 + undisclosed.len]) |j, mh, *tp, *ts| {
-        tp.* = generators[j + 1];
-        ts.* = mh;
-    }
-    t_points[t_points.len - 1] = d_j.toAffine();
-    t_scalars[t_scalars.len - 1] = parsed.c;
-    const t_j = try msmPublic(allocator, t_points, t_scalars);
-
-    // -- ProofChallengeCalculate (draft §3.7.4) — MUST reproduce c --
-    const challenge = try calculateChallenge(allocator, parsed.abar, parsed.bbar, t_j.toAffine(), disclosed_indexes, disclosed_scalars, domain, ph);
+    // -- ProofChallengeCalculate (draft-12 §3.7.4) — MUST reproduce cp --
+    const challenge = try calculateChallenge(allocator, .{ parsed.abar, parsed.bbar, parsed.d, init.t1.toAffine(), init.t2.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
     if (!challenge.eql(parsed.c)) return false;
 
-    // -- pairing check: e(Abar, W) == e(Bbar, BP2) (draft §3.6.4 step 5) --
+    // -- pairing check: e(Abar, W) * e(Bbar, -BP2) == 1 (draft §3.6.4 step 6) --
     return cs.pairing.pairingCheck(&.{
         .{ .p = parsed.abar, .q = pk.point },
         .{ .p = parsed.bbar, .q = negBp2() },
@@ -814,9 +817,9 @@ test "Signature.fromBytes rejects e == 0" {
     try testing.expectError(error.InvalidSignatureEncoding, Signature.fromBytes(bytes));
 }
 
-test "Proof.encodedLen matches draft formula (2*48 + (3+U)*32)" {
-    try testing.expectEqual(@as(usize, 192), Proof.encodedLen(0));
-    try testing.expectEqual(@as(usize, 192 + 6 * 32), Proof.encodedLen(6));
+test "Proof.encodedLen matches the draft-12 formula (3*48 + (4+U)*32)" {
+    try testing.expectEqual(@as(usize, 272), Proof.encodedLen(0));
+    try testing.expectEqual(@as(usize, 272 + 6 * 32), Proof.encodedLen(6));
 }
 
 test "Proof round-trips through toBytes/fromBytes (U = 2 undisclosed)" {
@@ -836,7 +839,9 @@ test "Proof round-trips through toBytes/fromBytes (U = 2 undisclosed)" {
     const proof: Proof = .{
         .abar = G1.Affine.generator,
         .bbar = G1.Affine.generator,
-        .r2_hat = some_scalar,
+        .d = G1.Affine.generator,
+        .e_hat = some_scalar,
+        .r1_hat = some_scalar,
         .r3_hat = some_scalar,
         .m_hat = m_hat,
         .c = some_scalar,
@@ -857,7 +862,7 @@ test "Proof round-trips through toBytes/fromBytes (U = 2 undisclosed)" {
 }
 
 test "Proof.fromBytes rejects a length not aligned to a whole scalar count" {
-    const floor = 2 * G1.compressed_bytes + 3 * Fr.encoded_bytes;
+    const floor = Proof.floor_bytes;
     var bad: [floor + 5]u8 = @splat(0);
     // Fill with something that at least parses as points/scalars up to
     // the misalignment so the length check itself is what's exercised.
@@ -907,7 +912,7 @@ test "proofGen validates disclosed_indexes/random_scalars count before touching 
         &.{},
     ));
 
-    // Wrong random_scalars count (need 3 + (3-1) = 5 for disclosed_indexes={0}): caught before the panic.
+    // Wrong random_scalars count (need 5 + (3-1) = 7 for disclosed_indexes={0}): caught before the panic.
     try testing.expectError(error.RandomScalarCountMismatch, proofGen(
         testing.allocator,
         pk,
@@ -940,13 +945,13 @@ test "proofGen REJECTS a duplicate disclosed index instead of silently under-cou
     const sk = try SecretKey.fromBytes(sk_bytes);
     const pk = keys.skToPk(sk);
 
-    // NONZERO scalars throughout — critically r1 != 0, so this exercises
-    // the duplicate-index guard itself rather than the separate `r1 == 0`
-    // rejection at `r1.inv()`.
+    // NONZERO scalars throughout — critically r1, r2 != 0, so this
+    // exercises the duplicate-index guard itself rather than the separate
+    // zero-scalar rejections.
     var one_bytes = [_]u8{0} ** 32;
     one_bytes[31] = 1;
     const one = try Fr.fromBytes(one_bytes);
-    const random_scalars = [_]Fr{one} ** 4; // 3 + formula's undisclosed_count(1)
+    const random_scalars = [_]Fr{one} ** 6; // 5 + formula's undisclosed_count(1)
     try testing.expectError(error.RandomScalarCountMismatch, proofGen(
         testing.allocator,
         pk,
@@ -1002,13 +1007,13 @@ test "Signature/Proof decoders refuse the identity and a point outside G1" {
     bad_sig[0..G1.compressed_bytes].* = g1_order3_compressed;
     try testing.expectError(error.InvalidSignatureEncoding, Signature.fromBytes(bad_sig));
 
-    const random_scalars = cs.mockedRandomScalars(5, "decoder refusals");
+    const random_scalars = cs.mockedRandomScalars(7, "decoder refusals");
     const proof = try proofGen(testing.allocator, kp.pk, sig, "h", "", &messages, &.{0}, &random_scalars);
     defer testing.allocator.free(proof);
     (try Proof.fromBytes(testing.allocator, proof)).deinit(testing.allocator);
     const bad = try testing.allocator.dupe(u8, proof);
     defer testing.allocator.free(bad);
-    for ([_]usize{ 0, G1.compressed_bytes }) |off| {
+    for ([_]usize{ 0, G1.compressed_bytes, 2 * G1.compressed_bytes }) |off| {
         for ([_][G1.compressed_bytes]u8{ g1_identity_compressed, g1_order3_compressed }) |pt| {
             @memcpy(bad, proof);
             bad[off..][0..G1.compressed_bytes].* = pt;
@@ -1021,16 +1026,34 @@ test "proofGen refuses index == L and too MANY random scalars" {
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
     const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
-    const six = cs.mockedRandomScalars(6, "too many");
-    try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{3}, six[0..4]));
-    try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &six));
+    const eight = cs.mockedRandomScalars(8, "too many");
+    try testing.expectError(error.DisclosedIndexOutOfRange, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{3}, eight[0..7]));
+    try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &eight));
+}
+
+test "proofGen refuses a zero r1 or r2 instead of emitting an identity Abar/Bbar/D" {
+    // r1 = 0 makes Abar and Bbar the identity, r2 = 0 makes D the identity
+    // and r3 = r2^-1 undefined: a proof no verifier can decode. Probability
+    // ~2^-255 from a real draw; refused as malformed random scalars. The
+    // 2026-10-06 mutation run found the r1 check unpinned.
+    const kp = try testKeyPair();
+    const messages = [_][]const u8{ "a", "b", "c" };
+    const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
+    var rs = cs.mockedRandomScalars(7, "zero blinding");
+    const ok = try proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &rs);
+    testing.allocator.free(ok);
+    for ([_]usize{ 0, 1 }) |k| {
+        var bad = rs;
+        bad[k] = Fr.zero;
+        try testing.expectError(error.RandomScalarCountMismatch, proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &bad));
+    }
 }
 
 test "proofVerify refuses more messages than indexes, index == L, a duplicate index, and a proof over a forged signature" {
     const kp = try testKeyPair();
     const messages = [_][]const u8{ "a", "b", "c" };
     const sig = try sign(testing.allocator, kp.sk, kp.pk, "", &messages);
-    const random_scalars = cs.mockedRandomScalars(5, "verify refusals");
+    const random_scalars = cs.mockedRandomScalars(7, "verify refusals");
     const proof = try proofGen(testing.allocator, kp.pk, sig, "", "", &messages, &.{0}, &random_scalars);
     defer testing.allocator.free(proof);
     try testing.expect(try proofVerify(testing.allocator, kp.pk, proof, "", "", &.{"a"}, &.{0}));
@@ -1083,8 +1106,8 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
     // 128 drawn bytes right after `entropy.fill` left `zig build
     // test-megolm` green on an assertion of this same shape. Not
     // re-measured here, but each scalar's buffer is filled the same way.
-    const scalars1 = cs.calculateRandomScalars(3, io);
-    const scalars2 = cs.calculateRandomScalars(3, io);
+    const scalars1 = cs.calculateRandomScalars(5, io);
+    const scalars2 = cs.calculateRandomScalars(5, io);
     var any_differs = false;
     for (scalars1, scalars2) |a, b| {
         if (!a.eql(b)) any_differs = true;
@@ -1093,8 +1116,8 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
 
     // And the production path is a working path, not just a typed one:
     // sign a message, then prove-and-verify selective disclosure with
-    // random_scalars drawn from the same `io` (U = 0 undisclosed, so 3
-    // scalars — r1, r2, r3 — matches `calculateRandomScalars(3, io)` above).
+    // random_scalars drawn from the same `io` (U = 0 undisclosed, so 5
+    // scalars — r1, r2, e~, r1~, r3~).
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 1;
     const sk = try SecretKey.fromBytes(sk_bytes);
@@ -1103,7 +1126,7 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
     const sig = try sign(testing.allocator, sk, pk, "header", &messages);
     try testing.expect(try verify(testing.allocator, pk, sig, "header", &messages));
 
-    const random_scalars = cs.calculateRandomScalars(3, io);
+    const random_scalars = cs.calculateRandomScalars(5, io);
     const proof = try proofGen(
         testing.allocator,
         pk,
@@ -1140,9 +1163,9 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
 const Fixtures = struct {
     sig: [Signature.encoded_bytes]u8 = undefined,
     pk: [PublicKey.encoded_bytes]u8 = undefined,
-    /// U = 0, so `Proof.encodedLen(0)` = 192 octets — the floor exactly.
+    /// U = 0, so `Proof.encodedLen(0)` = 272 octets — the floor exactly.
     proof_u0: [Proof.encodedLen(0)]u8 = undefined,
-    /// Three messages, one disclosed: U = 2, 256 octets.
+    /// Three messages, one disclosed: U = 2, 336 octets.
     proof_u2: [Proof.encodedLen(2)]u8 = undefined,
 
     fn build(self: *Fixtures) void {
@@ -1155,14 +1178,14 @@ const Fixtures = struct {
         const one = [_][]const u8{"only message"};
         self.sig = sign(testing.allocator, sk, pk, "header", &one) catch unreachable;
 
-        const rs0 = cs.mockedRandomScalars(3, "corpus");
+        const rs0 = cs.mockedRandomScalars(5, "corpus");
         const p0 = proofGen(testing.allocator, pk, self.sig, "header", "", &one, &.{0}, &rs0) catch unreachable;
         defer testing.allocator.free(p0);
         @memcpy(&self.proof_u0, p0);
 
         const three = [_][]const u8{ "m0", "m1", "m2" };
         const sig3 = sign(testing.allocator, sk, pk, "header", &three) catch unreachable;
-        const rs2 = cs.mockedRandomScalars(5, "corpus");
+        const rs2 = cs.mockedRandomScalars(7, "corpus");
         const p2 = proofGen(testing.allocator, pk, sig3, "header", "", &three, &.{0}, &rs2) catch unreachable;
         defer testing.allocator.free(p2);
         @memcpy(&self.proof_u2, p2);
@@ -1338,10 +1361,10 @@ const ProofCorpus = struct {
         self.push(&fx.proof_u0); // U = 0: the floor length exactly
         self.push(&fx.proof_u2); // U = 2: the m_hat loop runs twice
         var t2 = fx.proof_u2;
-        t2[2 * G1.compressed_bytes + 4 * Fr.encoded_bytes] ^= 0x01; // one octet inside m_hat_1
+        t2[3 * G1.compressed_bytes + 4 * Fr.encoded_bytes] ^= 0x01; // one octet inside m_hat_1
         self.push(&t2);
         var t0 = fx.proof_u0;
-        @memset(t0[2 * G1.compressed_bytes ..][0..Fr.encoded_bytes], 0); // r2_hat = 0
+        @memset(t0[3 * G1.compressed_bytes ..][0..Fr.encoded_bytes], 0); // e_hat = 0
         self.push(&t0);
         t0 = fx.proof_u0;
         @memset(t0[t0.len - Fr.encoded_bytes ..], 0xff); // c >= r
@@ -1410,36 +1433,29 @@ fn testRandomFr(rand: std.Random) Fr {
     return Fr.reduceWide(&buf);
 }
 
-/// TEST-ONLY oracle: reproduces `proofVerify`'s ORIGINAL (pre-F4)
-/// sequential `ProofVerifyInit` `d_j`/`t_j` accumulation verbatim,
-/// unchanged, so the MSM-crossover form now live in `proofVerify` has
-/// something to be checked against that never itself changed. Not called
-/// from production code — differential-test anchor only.
+/// TEST-ONLY oracle: draft-12 `ProofVerifyInit`'s `T1`/`T2` by the plain
+/// sequential constant-time `scalarMul` loop, transcribed from §3.7.3
+/// independently of `proofVerifyInit`'s MSM assembly, so the variable-time
+/// MSM form has something to be checked against.
 fn proofVerifyInitLoopOracle(
     generators: []const G1.Affine,
     domain: Fr,
     disclosed_indexes: []const usize,
     disclosed_scalars: []const Fr,
     undisclosed: []const usize,
-    m_hat: []const Fr,
-    abar: G1.Affine,
-    bbar: G1.Affine,
-    r2_hat: Fr,
-    r3_hat: Fr,
-    c: Fr,
-) struct { d: G1.Jacobian, t: G1.Jacobian } {
-    var d_j = G1.Jacobian.fromAffine(cs.P1)
-        .add(G1.Jacobian.fromAffine(generators[0]).scalarMul(domain));
-    for (disclosed_indexes, disclosed_scalars) |i, m| {
-        d_j = d_j.add(G1.Jacobian.fromAffine(generators[i + 1]).scalarMul(m));
-    }
-    var t_j = G1.Jacobian.fromAffine(abar).scalarMul(r2_hat)
-        .add(G1.Jacobian.fromAffine(bbar).scalarMul(r3_hat));
-    for (undisclosed, m_hat) |j, mh| {
-        t_j = t_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mh));
-    }
-    t_j = t_j.add(d_j.scalarMul(c));
-    return .{ .d = d_j, .t = t_j };
+    proof: Proof,
+) struct { t1: G1.Jacobian, t2: G1.Jacobian } {
+    const mul = struct {
+        fn f(p: G1.Affine, k: Fr) G1.Jacobian {
+            return G1.Jacobian.fromAffine(p).scalarMul(k);
+        }
+    }.f;
+    const t1 = mul(proof.bbar, proof.c).add(mul(proof.abar, proof.e_hat)).add(mul(proof.d, proof.r1_hat));
+    var bv = G1.Jacobian.fromAffine(cs.P1).add(mul(generators[0], domain));
+    for (disclosed_indexes, disclosed_scalars) |i, m| bv = bv.add(mul(generators[i + 1], m));
+    var t2 = bv.scalarMul(proof.c).add(mul(proof.d, proof.r3_hat));
+    for (undisclosed, proof.m_hat) |j, mh| t2 = t2.add(mul(generators[j + 1], mh));
+    return .{ .t1 = t1, .t2 = t2 };
 }
 
 test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPublic, bit-exact, across L" {
@@ -1503,20 +1519,14 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
     }
 }
 
-test "F4 oracle: proofVerify's ProofVerifyInit — MSM form matches the original sequential form, bit-exact, across L" {
+test "F4 oracle: proofVerifyInit's MSM form matches the sequential draft-12 form, bit-exact, across L" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x0D5F_1E17);
     const rand = prng.random();
 
     // total = R (disclosed) + U (undisclosed); cover R/U = 0 and a spread
-    // straddling msm_crossover (== 2) for each of the two MSM calls (d_j
-    // has R+2 terms, t_j has U+3).
-    //
-    // Debug: measured ~17s for this test ALONE, isolated -- same shape as
-    // the sibling F4 oracle test above (dominated by total=300's
-    // createGenerators + msmPublic calls). 8 already clears msm_crossover
-    // == 2 by 4x, so trimming just the 300 case keeps every crossover-
-    // straddling point; full set kept outside Debug.
+    // straddling msm_crossover (== 2) for each MSM call (T1 has 3 terms,
+    // Bv R+2, T2 U+2). Debug trims the 300 case (createGenerators dominates).
     const totals: []const usize = if (builtin.mode == .Debug)
         &[_]usize{ 0, 1, 2, 3, 8 }
     else
@@ -1542,47 +1552,27 @@ test "F4 oracle: proofVerify's ProofVerifyInit — MSM form matches the original
         defer allocator.free(m_hat);
         for (m_hat) |*s| s.* = testRandomFr(rand);
 
+        const point = struct {
+            fn f(r: std.Random) G1.Affine {
+                return G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(testRandomFr(r)).toAffine();
+            }
+        }.f;
+        const proof: Proof = .{
+            .abar = point(rand),
+            .bbar = point(rand),
+            .d = point(rand),
+            .e_hat = testRandomFr(rand),
+            .r1_hat = testRandomFr(rand),
+            .r3_hat = testRandomFr(rand),
+            .m_hat = m_hat,
+            .c = testRandomFr(rand),
+        };
         const domain = testRandomFr(rand);
-        const abar = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(testRandomFr(rand)).toAffine();
-        const bbar = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(testRandomFr(rand)).toAffine();
-        const r2_hat = testRandomFr(rand);
-        const r3_hat = testRandomFr(rand);
-        const c = testRandomFr(rand);
 
-        const want = proofVerifyInitLoopOracle(generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, m_hat, abar, bbar, r2_hat, r3_hat, c);
-
-        // Reproduce exactly what `proofVerify` now builds.
-        const d_points = try allocator.alloc(G1.Affine, disclosed_indexes.items.len + 2);
-        defer allocator.free(d_points);
-        const d_scalars = try allocator.alloc(Fr, disclosed_indexes.items.len + 2);
-        defer allocator.free(d_scalars);
-        d_points[0] = cs.P1;
-        d_scalars[0] = Fr.one;
-        d_points[1] = generators[0];
-        d_scalars[1] = domain;
-        for (disclosed_indexes.items, disclosed_scalars, d_points[2..], d_scalars[2..]) |i, m, *dp, *ds| {
-            dp.* = generators[i + 1];
-            ds.* = m;
-        }
-        const got_d = try msmPublic(allocator, d_points, d_scalars);
-        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.d.toAffine()), &G1.toBytesCompressed(got_d.toAffine()));
-
-        const t_points = try allocator.alloc(G1.Affine, undisclosed.items.len + 3);
-        defer allocator.free(t_points);
-        const t_scalars = try allocator.alloc(Fr, undisclosed.items.len + 3);
-        defer allocator.free(t_scalars);
-        t_points[0] = abar;
-        t_scalars[0] = r2_hat;
-        t_points[1] = bbar;
-        t_scalars[1] = r3_hat;
-        for (undisclosed.items, m_hat, t_points[2 .. 2 + undisclosed.items.len], t_scalars[2 .. 2 + undisclosed.items.len]) |j, mh, *tp, *ts| {
-            tp.* = generators[j + 1];
-            ts.* = mh;
-        }
-        t_points[t_points.len - 1] = got_d.toAffine();
-        t_scalars[t_scalars.len - 1] = c;
-        const got_t = try msmPublic(allocator, t_points, t_scalars);
-        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t.toAffine()), &G1.toBytesCompressed(got_t.toAffine()));
+        const want = proofVerifyInitLoopOracle(generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, proof);
+        const got = try proofVerifyInit(allocator, generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, proof);
+        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t1.toAffine()), &G1.toBytesCompressed(got.t1.toAffine()));
+        try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t2.toAffine()), &G1.toBytesCompressed(got.t2.toAffine()));
     }
 }
 

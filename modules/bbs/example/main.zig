@@ -89,13 +89,13 @@ pub fn main() !void {
     std.debug.print("wallet accepted the credential\n", .{});
 
     // ── the wallet, at the door ──────────────────────────────────────────
-    // `proofGen` needs `3 + undisclosed` blinding scalars. Getting that count
+    // `proofGen` needs `bbs.randomScalarCount(undisclosed)` (= 5 + undisclosed) blinding scalars. Getting that count
     // wrong is a named error rather than a silent short read, which matters
     // because the count depends on the disclosure the user just chose.
     const undisclosed = attributes.len - disclosed_indexes.len;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    const random_scalars = bbs.ciphersuite.calculateRandomScalars(3 + undisclosed, io);
+    const random_scalars = bbs.ciphersuite.calculateRandomScalars(5 + undisclosed, io);
 
     const proof = bbs.proofGen(
         gpa,

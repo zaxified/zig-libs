@@ -64,7 +64,7 @@
 //!   target's only claim is about the SECRET KEY, per the task brief.
 //! * `proofgen` — the two things a BBS proof's whole purpose is to keep
 //!   hidden: the holder's UNDISCLOSED messages and the proof's blinding
-//!   randomness (`random_scalars`, draft §3.7.1's `r1,r2,r3,m~_j1..m~_jU`).
+//!   randomness (`random_scalars`, draft-12 §3.7.1's `r1, r2, e~, r1~, r3~, m~_j1..m~_jU`).
 //!   Setup (never tainted): a real `bbs.sign` call over `L=3` messages
 //!   produces a genuinely valid signature, so `Signature.fromBytes`'s
 //!   structural checks inside `proofGen` pass and this drives the real
@@ -232,7 +232,7 @@ const msg_len = 24;
 /// (`bbs.zig` lines ~628-631) with more than one term.
 const total_messages = 3;
 const disclosed_index: usize = 0;
-const random_scalar_count = 3 + (total_messages - 1); // 3 + U
+const random_scalar_count = 5 + (total_messages - 1); // bbs.randomScalarCount(U)
 
 const Target = enum { sign, proofgen };
 const Taint = enum { yes, no };

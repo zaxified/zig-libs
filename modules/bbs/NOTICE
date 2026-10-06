@@ -26,44 +26,27 @@ already; this module is the one that had not.
 Provenance
 ----------
 
-bbs — the protocol design follows **draft-irtf-cfrg-bbs-signatures-04**
-(fetched 2026-07-16 from `https://www.ietf.org/archive/id/
-draft-irtf-cfrg-bbs-signatures-04.txt`), the BLS12-381-SHA-256
-ciphersuite (§6.2.2). This is a public IETF Internet-Draft; the draft's
-TEXT (the protocol description/equations being followed) is not itself
-a copyrightable implementation, and no source code accompanying the
-draft was consulted or ported — see CONVENTIONS.md §5's merger-doctrine
-note (the same posture this repo's other spec-derived modules take for
-their own IETF sources).
-
-**Why draft-04, not the current draft (`-10` as of this writing)**: the
-BBS Signatures draft's CoreSign/ProofGen wire format changed across
-revisions (confirmed at drafts `-06` and `-05` respectively — see
-`SPEC.md`'s version-pinning section for the byte-level evidence), and
-this module's KAT vectors are drawn from a reference implementation
-whose fixtures happen to match draft-04, not the current draft. See
-`SPEC.md` for the full determination methodology.
+bbs — the protocol design follows **draft-irtf-cfrg-bbs-signatures-12**
+(fetched 2026-10-06 from `https://www.ietf.org/archive/id/
+draft-irtf-cfrg-bbs-signatures-12.txt`), the BLS12-381-SHA-256
+ciphersuite (§7.2.2). Until 2026-10-06 it followed draft-04 (see
+CHANGELOG). This is a public IETF Internet-Draft; the draft's TEXT (the
+protocol description/equations being followed) is not itself a
+copyrightable implementation, and no source code accompanying the draft
+was consulted or ported — see CONVENTIONS.md §5's merger-doctrine note
+(the same posture this repo's other spec-derived modules take for their
+own IETF sources).
 
 Test vectors
 ------------
 
-`mattrglobal/pairing_crypto` (Rust, Apache-2.0,
-`github.com/mattrglobal/pairing_crypto`), commit
-`b91a807d6a2d1d3bb039f2d67a53e21b686b7395`, path
-`tests/fixtures/bbs/bls12_381_sha_256/` — `keypair.json`,
-`generators.json`, `h2s.json`, `MapMessageToScalarAsHash.json`,
-`mockedRng.json`, `signature/signature{001,002,004}.json`,
-`proof/proof{001,003,004}.json` — transcribed verbatim (hex case
-preserved as published) into `src/kat_vectors.zig`. These are published
-test-vector JSON files, and the repository they come from is Apache-2.0
-licensed, so §4 of that licence is what governs their redistribution here. The mocked-RNG seed/DST-reuse convention
-(`SPEC.md`'s "Mocked-RNG seed provenance" section) was additionally
-confirmed from that project's `tools/bbs-fixtures-generator/src/
-mock_rng.rs` and `tools/bbs-fixtures-generator/src/generators/proof.rs`
-— consulted as a DESIGN REFERENCE for how the fixture generator wires
-`SEED`/`count` together (no source ported; this module's own
-`ciphersuite.mockedRandomScalars` is a from-scratch Zig implementation
-of the draft's own §7.1 `seeded_random_scalars` pseudocode).
+The draft's own test vectors (§8.2, §8.4, Appendix D.2 — key pair,
+message scalars, generators, mocked random scalars, signatures, proofs,
+hash-to-scalar), extracted from the draft text by
+`tools/gen_kat_vectors.py` into `src/kat_vectors.zig`. Code components of
+IETF documents are available under the Revised BSD License (IETF Trust
+Legal Provisions §4.e). The previous draft-04 vectors came from
+`mattrglobal/pairing_crypto` (Apache-2.0) and were removed on 2026-10-06.
 
 `bls12_381` (this repo — `modules/bls12_381`) supplies every field/
 group/pairing/hash-to-curve primitive this module builds on
@@ -75,8 +58,8 @@ implemented here.
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this
 module.
 
-**Copyleft:** NONE-SHIPPED — Apache-2.0 is permissive: it imposes attribution,
-not reciprocity, so nothing reproduced here places a copyleft condition on this
+**Copyleft:** NONE-SHIPPED — the vectors are under the Revised BSD License
+(permissive), so nothing reproduced here places a copyleft condition on this
 repository, and no GPL/LGPL/AGPL source was consulted or copied.
 
 Statement of changes, per Apache-2.0 §4(b)

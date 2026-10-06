@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BREAKING (wire format and signatures), API ADDED:** the pin moves from
+  draft-irtf-cfrg-bbs-signatures-04 to **-12**, verified byte-exactly against the draft's own
+  BLS12-381-SHA-256 vectors (§8.4, Appendix D.2: key pair, generators, message scalars, mocked
+  random scalars, 3 valid + 6 invalid signatures, 5 proofs, hash-to-scalar), extracted by the new
+  `tools/gen_kat_vectors.py`. Changes: `sign` hashes `e` over `(SK, msgs.., domain)` (domain
+  last), so signatures differ from -04; `Proof` is `(Abar, Bbar, D, e^, r1^, r3^, m^.., c)` —
+  fields `d`, `e_hat`, `r1_hat` replace `r2_hat`, 272 + 32·U octets (was 192 + 32·U) —
+  and `proofGen` takes `5 + U` random scalars (was `3 + U`); new `randomScalarCount(U)`,
+  `Proof.floor_bytes`. The challenge interleaves each index with its message. A -04 signature or
+  proof does not verify any more. `proofGen` also refuses a zero `r1` (it already refused the
+  zero scalar it inverts). ctgrind proofgen 9 -> 15 contexts, all on published values or the
+  blinding scalars' zero-checks. Mutation run 19/19 killed (one test added).
 - **2026-10-05** — Mutation run: 28 of 28 killed, 0 equivalent; 5 tests added
   (identity and out-of-subgroup points in every decoded slot, `proofGen`/
   `proofVerify` index and count edges, a duplicate index, a proof over a forged

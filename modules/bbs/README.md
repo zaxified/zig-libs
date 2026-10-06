@@ -16,7 +16,7 @@ random-scalar sources), key generation (`KeyGen`/`SkToPk`), the
 cryptographic cores `sign`/`verify`/`proofGen`/`proofVerify` are all
 implemented and byte-exact KAT-pinned against `mattrglobal/pairing_crypto`'s
 official `bls12_381_sha_256` fixtures (pinned to
-draft-irtf-cfrg-bbs-signatures-04 — see [SPEC.md](SPEC.md) for why).
+draft-irtf-cfrg-bbs-signatures-12 — see [SPEC.md](SPEC.md)).
 `gate.core_implemented = true` and the full suite passes
 byte-exact in Debug and ReleaseFast, including the selective-disclosure
 proof vectors (fed the draft's deterministic mocked RNG) and the
@@ -62,7 +62,7 @@ const sig = try bbs.sign(allocator, sk, pk, header, messages);       // §3.5.1
 const ok = try bbs.verify(allocator, pk, sig, header, messages);     // §3.5.2
 
 // Selective disclosure: reveal only `disclosed_indexes`, hide the rest.
-const rs = bbs.ciphersuite.calculateRandomScalars(3 + u, io);        // 3 + undisclosed
+const rs = bbs.ciphersuite.calculateRandomScalars(5 + u, io);        // bbs.randomScalarCount(u)
 const proof = try bbs.proofGen(allocator, pk, sig, header, ph, messages, disclosed_indexes, &rs);
 defer allocator.free(proof);
 const proof_ok = try bbs.proofVerify(allocator, pk, proof, header, ph, disclosed_messages, disclosed_indexes);
@@ -80,10 +80,10 @@ reading `std.Io`/internal entropy directly — see `root.zig`'s
 
 ```zig
 // Real entropy (production):
-const random_scalars = bbs.ciphersuite.calculateRandomScalars(3 + u, io);
+const random_scalars = bbs.ciphersuite.calculateRandomScalars(5 + u, io);
 
 // Deterministic mock RNG (KAT reproducibility, draft §7.1):
-const random_scalars = bbs.ciphersuite.mockedRandomScalars(3 + u, seed);
+const random_scalars = bbs.ciphersuite.mockedRandomScalars(5 + u, seed);
 ```
 
 ## Import graph

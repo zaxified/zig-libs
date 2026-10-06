@@ -763,8 +763,13 @@ spake2plus	ReleaseFast	proverstart	1	7	7adcd93a7e0fa428	5b3e4131495365d6
 spake2plus	ReleaseFast	verifierstart	1	7	7adcd93a7e0fa428	ce61814fc8e1b2b7
 spake2plus	ReleaseFast	proverfinish	1	12	7adcd93a7e0fa428	5cdf0fe20429a208
 spake2plus	ReleaseFast	verifierfinish	1	10	7adcd93a7e0fa428	dbdff43379a90cf5
-bbs	ReleaseFast	sign	1	3	1f73a29d9ec22813	2f5b06d6bd92ab96
-bbs	ReleaseFast	proofgen	1	9	1f73a29d9ec22813	01535db4bf6b0ff6
+# bbs proofgen 9 -> 15 (re-pin 2026-10-06, draft-04 -> draft-12): the proof gained
+# two public points (D, T2) -- serialized into the challenge (bbs.zig:387, 5 points
+# now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
+# zero-check of the blinding scalar r1 (:617, next to r2.inv at :616). Every
+# context is on a value the proof publishes or on "is this random scalar 0".
+bbs	ReleaseFast	sign	1	3	077014fe3a28b572	0929643a5972b8ba
+bbs	ReleaseFast	proofgen	1	15	077014fe3a28b572	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	5dad63b38553aba7	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	21	a6281f1d04b2a243	af24664cb307a403
 coconut	ReleaseFast	user_show	1	27	5dad63b38553aba7	286e5ea12d924b29
