@@ -409,3 +409,106 @@ test "a regular file in the middle of a path is absence, a symlinked one is a re
         try testing.expectError(error.LoaderFailed, l.load(l.ctx, a, "up/SECRET"));
     }
 }
+
+// ── every cap bites AT its bound ────────────────────────────────────────────
+//
+// The bomb tests above run each cap at ten or a hundred times its value, which
+// proves only that something eventually stops: a cap moved one past its bound
+// passed all of them (mutation 2026-10-06). Each case below renders the
+// largest input the cap admits and then the same shape one step larger.
+
+fn renderCapped(opts: jinja.Options, templates: []const jinja.MapLoader.Entry, src: []const u8) ![]u8 {
+    const gpa = testing.allocator;
+    var map: jinja.MapLoader = .{ .entries = templates };
+    var env = try jinja.Environment.initWithLoader(gpa, opts, map.loader());
+    defer env.deinit();
+    return env.renderAlloc(gpa, src, .{ .map = .{ .pairs = &.{} } }, null);
+}
+
+fn expectAtBound(
+    opts: jinja.Options,
+    templates: []const jinja.MapLoader.Entry,
+    ok_src: []const u8,
+    want: []const u8,
+    bad_src: []const u8,
+    want_err: anyerror,
+) !void {
+    const out = try renderCapped(opts, templates, ok_src);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(want, out);
+    if (renderCapped(opts, templates, bad_src)) |o| {
+        testing.allocator.free(o);
+        std.debug.print("\n'{s}' rendered one step past its cap\n", .{bad_src});
+        return error.BoundTooLoose;
+    } else |e| try testing.expectEqual(want_err, e);
+}
+
+test "every render cap bites AT its bound, not one step past it" {
+    const lenient: jinja.Options = .{ .undefined_policy = .lenient };
+
+    // max_output_bytes
+    var o = lenient;
+    o.max_output_bytes = 4;
+    try expectAtBound(o, &.{}, "xxxx", "xxxx", "xxxxx", error.OutputTooLarge);
+
+    // max_templates: three distinct loads fit, a fourth does not.
+    const four: []const jinja.MapLoader.Entry = &.{
+        .{ .name = "t0", .source = "0" }, .{ .name = "t1", .source = "1" },
+        .{ .name = "t2", .source = "2" }, .{ .name = "t3", .source = "3" },
+    };
+    o = lenient;
+    o.max_templates = 3;
+    try expectAtBound(
+        o,
+        four,
+        "{% include 't0' %}{% include 't1' %}{% include 't2' %}",
+        "012",
+        "{% include 't0' %}{% include 't1' %}{% include 't2' %}{% include 't3' %}",
+        error.TooDeep,
+    );
+
+    // max_template_depth, nesting: the entry plus two includes fit in 3.
+    const chain: []const jinja.MapLoader.Entry = &.{
+        .{ .name = "l1", .source = "1{% include 'l2' %}" },
+        .{ .name = "l2", .source = "2{% include 'l3' %}" },
+        .{ .name = "l3", .source = "3" },
+    };
+    o = lenient;
+    o.max_template_depth = 3;
+    try expectAtBound(o, chain, "{% include 'l2' %}", "23", "{% include 'l1' %}", error.TooDeep);
+
+    // max_template_depth, inheritance: a chain of three templates fits in 3.
+    const bases: []const jinja.MapLoader.Entry = &.{
+        .{ .name = "e1", .source = "{% extends 'e2' %}" },
+        .{ .name = "e2", .source = "{% extends 'e3' %}" },
+        .{ .name = "e3", .source = "base" },
+    };
+    try expectAtBound(o, bases, "{% extends 'e2' %}", "base", "{% extends 'e1' %}", error.TooDeep);
+
+    // max_call_depth, macros: f(2) is three nested calls.
+    o = lenient;
+    o.max_call_depth = 3;
+    const m = "{% macro f(n) %}{% if n > 0 %}{{ f(n - 1) }}{% endif %}.{% endmacro %}";
+    try expectAtBound(o, &.{}, m ++ "{{ f(2) }}", "...", m ++ "{{ f(3) }}", error.TooDeep);
+
+    // max_call_depth, recursive loops: one `loop()` per level of nesting.
+    try expectAtBound(
+        o,
+        &.{},
+        "{% for x in [[[[]]]] recursive %}<{{ loop(x) }}>{% endfor %}",
+        "<<<>>>",
+        "{% for x in [[[[[]]]]] recursive %}<{{ loop(x) }}>{% endfor %}",
+        error.TooDeep,
+    );
+}
+
+test "the memory guards refuse one past the cap, before allocating it" {
+    // A 1 MiB budget: with a guard gone, the request reaches the allocator
+    // and comes back `OutOfMemory` (or, for a zero step, never ends), which
+    // is not the typed refusal these expect.
+    try testing.expectEqual(@as(anyerror, error.OutOfRange), renderBombErr(&.{}, "{{ ('x' * 67108865)|length }}", 1 << 20));
+    try testing.expectEqual(@as(anyerror, error.OutOfRange), renderBombErr(&.{}, "{{ ([1] * 4194305)|length }}", 1 << 20));
+    try testing.expectEqual(@as(anyerror, error.OutOfRange), renderBombErr(&.{}, "{{ range(4194305)|length }}", 1 << 20));
+    try testing.expectEqual(@as(anyerror, error.BadArgument), renderBombErr(&.{}, "{{ [1, 2][::0] }}", 1 << 20));
+    try testing.expectEqual(@as(anyerror, error.BadArgument), renderBombErr(&.{}, "{{ range(1, 5, 0)|list }}", 1 << 20));
+}

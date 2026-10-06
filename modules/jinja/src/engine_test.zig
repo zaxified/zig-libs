@@ -796,3 +796,21 @@ test "wordcount, striptags and urlencode answer what the reference answers" {
         try testing.expectEqualStrings(c.want, out);
     }
 }
+
+test "small edges the reference corpus does not reach" {
+    const gpa = testing.allocator;
+    // Index == length is out of range (undefined), not the slot past the end.
+    const out = try renderWith(gpa, .{ .undefined_policy = .lenient }, "[{{ [1, 2][2] }}|{{ [1, 2][-2] }}]", .{ .none = {} });
+    defer gpa.free(out);
+    try testing.expectEqualStrings("[|1]", out);
+    // `truncate`'s `length >= len(end)` admits equality: nothing kept but `end`.
+    const t = try renderWith(gpa, .{}, "{{ 'hello world'|truncate(3, end='...', leeway=0) }}", .{ .none = {} });
+    defer gpa.free(t);
+    try testing.expectEqualStrings("...", t);
+
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    // A closer with nothing open, and a `\x` escape cut off by the end of input.
+    try testing.expectError(error.TemplateSyntaxError, env.compile("{{ 1) }}", null));
+    try testing.expectError(error.TemplateSyntaxError, env.compile("{{ '\\x4", null));
+}

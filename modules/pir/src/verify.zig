@@ -880,6 +880,15 @@ test "ATTACK: BOTH servers zeroing everything is rejected — the presence word 
         @memset(&tampered.ta[b], 0);
     }
     try testing.expectError(error.AnswerRejected, tampered.reconstruct(&got));
+
+    // The same transcript on the wire path (mutation run 2026-10-06: the
+    // presence check dropped from `reconstructFromBytes` alone survived).
+    const zv: [2 * 4]u8 = @splat(0);
+    const zt: [3 * V.tag_word_len]u8 = @splat(0);
+    try testing.expectError(
+        error.AnswerRejected,
+        V.reconstructFromBytes(run.q.secret, &zv, &zv, &zt, &zt, &got),
+    );
 }
 
 test "ATTACK: a replayed answer — from an older query for the SAME index — is rejected" {
@@ -1321,11 +1330,29 @@ test "SELF: geometry errors are returned, never asserted" {
         error.AnswerLengthMismatch,
         V.reconstruct(q.secret, &va, &va, ta[0..2], &ta, &rec),
     );
+    // each tag operand is checked on its own (mutation run 2026-10-06)
+    try testing.expectError(
+        error.AnswerLengthMismatch,
+        V.reconstruct(q.secret, &va, &va, &ta, ta[0..2], &rec),
+    );
     var buf: [7]u8 = undefined;
     try testing.expectError(
         error.AnswerLengthMismatch,
         V.reconstructFromBytes(q.secret, &buf, &buf, &buf, &buf, &rec),
     );
+}
+
+test "EXACT: each channel's keys carry that channel's own seeds" {
+    // Mutation run 2026-10-06: seeding the tag DPF with the VALUE seed `sv0`
+    // kept every test green (the protocol stays correct), while handing
+    // server 0 two keys with the same root seed — the cross-channel reuse
+    // `query`'s SeedReuse check exists to refuse from the caller.
+    const seeds = [4]fss.prg.Seed{ detSeed(40), detSeed(41), detSeed(42), detSeed(43) };
+    const q = try V.query(3, detMac(V.tag_word_len, 40), seeds[0], seeds[1], seeds[2], seeds[3]);
+    for (0..2) |b| {
+        try testing.expectEqualSlices(u8, &seeds[b], &q.shares[b].value.seed);
+        try testing.expectEqualSlices(u8, &seeds[2 + b], &q.shares[b].tag.seed);
+    }
 }
 
 test "SELF: exhaustive length sweep over the verified untrusted boundaries" {

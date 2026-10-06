@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with no longer says every access is `seq_cst` — only the reclamation-relevant ones are (§4a).
 - **2026-10-05** — Mutation run: 28 of 30 killed, 1 equivalent, 1 not killable by
   a test (the `enterCritical` pin store's ordering — litmus territory, SPEC §5); 5
   tests and 1 checker case added (current-epoch pin, two-advance grace period,

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Out of scope" no longer calls the GJKR recovery branch a hard error — it landed 2026-10-01, as the Backlog already records.
 - **2026-10-04** — `EcdsaRefresh` refuses new aux material that repeats a modulus or the
   message key of the old table — this party's own at `start`, a peer's in the announce round
   (`StaleAuxMaterial`; review 2026-10-03 F14).

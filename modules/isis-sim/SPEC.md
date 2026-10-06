@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) interop suite | Go | Apache-2.0 — README only | 0 | v0.9.0 (2026-09-25) | "Continuous interop against FRR" (README) — tests a real daemon against a real peer, not a model. |
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` tests | Rust | MIT | 541 | v0.9.0 | Packet-level and northbound conformance tests; no in-process multi-node simulator found *(inferred from the source listing)*. |
 
-**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer, and SPF routing *through* a pseudonode (`isis-spf` skips pseudonodes, so LAN members are not routed to each other — SPEC §12, Backlog). It proves the composition works; it is not a lab a user configures.
+**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer (SPF routing *through* a pseudonode works since 2026-09-30, `isis-spf`'s `addLanArcs` — SPEC §12). It proves the composition works; it is not a lab a user configures.
 
 ## 1. What this module is
 
@@ -223,7 +223,7 @@ always working regardless, this test would stop failing.
 - **LAN / pseudonodes.** In scope since §12 (DIS election, pseudonode LSP, CSNP/PSNP). Not
   modelled: LAN hellos (membership is static, changed only by scheduled events), a
   restarting DIS, multi-level DIS, LAN and P2P between the same node pair. SPF routing
-  *through* the pseudonode is missing in `isis-spf`, not here.
+  *through* the pseudonode works since 2026-09-30 (`isis-spf` LAN transit, asserted in §12).
 - **SPB data-plane.** Control-plane convergence only; no `l2forward`/PBB
   forwarding.
 - **Scale / performance.** Fabrics are ≤ 6 nodes with a fixed set of golden

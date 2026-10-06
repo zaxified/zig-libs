@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig ecosystem | Zig | — | — | — | Nothing found: GitHub searches for `vdf` in Zig return only Steam Valve-Data-Format parsers (2026-09-30). `std` has no VDF. |
 | cloudflare/circl (Go) | Go | BSD-3-Clause | 1.7k | v1.6.5 (2026-08-05) | Checked for completeness: no VDF package in the repository root listing. |
 
-**Where we are ahead:** the only VDF in Zig, in pure Zig with no GMP and no boost; a group quotient by ±1 with a measured fix for the negation forgery (38 of 38 forgeries accepted before it — specific to the RSA group; class groups of imaginary quadratic fields have no known small-order element *(inferred)*) and a verifier that refuses non-canonical `y`/`π`; an independent OpenSSL modexp oracle for `eval`. **Where we are behind:** no class-group VDF, which is what every deployed implementation uses and what removes the trusted-setup caveat; no Pietrzak proof; a 2048-bit modulus only; squaring speed (chiavdf ships a hand-tuned assembly pipeline) is unmeasured against this module's `std.crypto.ff` path (→ Backlog items).
+**Where we are ahead:** the only VDF in Zig, in pure Zig with no GMP and no boost; a group quotient by ±1 with a measured fix for the negation forgery (38 of 38 forgeries accepted before it — specific to the RSA group; class groups of imaginary quadratic fields have no known small-order element *(inferred)*) and a verifier that refuses non-canonical `y`/`π`; an independent OpenSSL modexp oracle for `eval`. **Where we are behind:** no class-group VDF, which is what every deployed implementation uses and what removes the trusted-setup caveat; no Pietrzak proof; a 2048-bit modulus only; squaring speed (chiavdf ships a hand-tuned assembly pipeline) is unmeasured against this module's `montint` squaring path (→ Backlog items).
 
 ## The construction
 
@@ -105,7 +105,11 @@ reimplemented; `square`/`mul`/`toBytes` are thin wrappers, and
 (`Fe.fromBytes`'s own canonical check, plus an explicit zero check) that
 `prove`/`verify` run for every wire-supplied `x`/`y`/`π`. On top of that
 sit the quotient-group helpers `negate`/`canonicalize`/`isCanonical`/
-`isIdentityClass` (see "The group is Z_N*/{±1}" above).
+`isIdentityClass` (see "The group is Z_N*/{±1}" above). The hot loops —
+`eval`'s and `prove`'s `T` sequential squarings — do not run on
+`std.crypto.ff`: they stay Montgomery-resident in the sibling `montint`
+module (`group.MontN`/`montSquare`; see `group.zig`'s "montint fast-path
+backend" comment).
 
 The RSA-2048 Factoring Challenge modulus (617 decimal digits / 2048 bits)
 is embedded as a hex literal, decoded once per call via

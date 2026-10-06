@@ -237,10 +237,11 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         }
 
         /// Write `e` big-endian into all of `out`, zero-padded on the left.
-        /// `out` must hold the value (`out.len ≥ byteLen()` always does for a
-        /// canonical element). Branches on positions only.
+        /// `out.len ≥ byteLen()` (enough for any canonical element); a shorter
+        /// `out` panics in every optimize mode instead of truncating — the
+        /// lengths are public. Branches on positions only.
         pub fn toBytesBE(self: *const Self, e: *const Elem, out: []u8) void {
-            std.debug.assert(out.len >= self.byteLen());
+            if (out.len < self.byteLen()) @panic("montint: DynModint.toBytesBE output shorter than the modulus");
             for (out, 0..) |*o, i| {
                 const pos = out.len - 1 - i;
                 o.* = if (pos / 8 < max_limbs) @truncate(e[pos / 8] >> @intCast(8 * (pos % 8))) else 0;
@@ -529,7 +530,11 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         // ── primality ───────────────────────────────────────────────────────
 
         /// Miller-Rabin with `rounds` witnesses from `random`: `false` if one
-        /// proves this (odd) modulus composite. Build the modulus with
+        /// proves this (odd) modulus composite, and for `rounds = 0` (no
+        /// evidence either way — refused rather than answered "prime"). A
+        /// composite passes one round with probability at most 1/4 (the
+        /// witnesses are near-uniform over `[2, m − 2]`, see `witness`), so
+        /// `rounds` rounds bound it by `4^−rounds`. Build the modulus with
         /// `fromLimbsBits` from the candidate's known length, so nothing
         /// scans the secret value.
         ///
@@ -537,15 +542,17 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// — this runs on the secret candidates of RSA/Paillier/aux prime
         /// searches, where `std.crypto.ff`'s pow branched on its windows:
         /// `m − 1 = d·2^s` comes from `nt.oddPart` (masked shifts); the
-        /// ladder is `pow` modulo the secret `m`; witnesses are drawn below
-        /// `2^(bits−1)`, so always `< m` with no compare against it; and a
-        /// round's verdicts (`x = 1` at the start, `x = −1` at any of the
-        /// `s` squarings) are OR-ed before the one branch, which a prime
-        /// always passes. What stays observable: `s` itself, through the
+        /// ladder is `pow` modulo the secret `m`; a witness is a random
+        /// string reduced by `reduceBytesBE`, with no compare against `m`
+        /// and no retry loop; and a round's verdicts (`x = 1` at the start,
+        /// `x = −1` at any of the `s` squarings) are OR-ed before the one
+        /// branch, which a prime always passes. What stays observable: `s`
+        /// itself, through the
         /// number of squarings (the 2-adic valuation of `p − 1`: about two
         /// bits of a random prime on average, nothing for `p ≡ 3 mod 4`),
         /// and everything about a REJECTED candidate, a value thrown away.
         pub fn isProbablePrime(self: *const Self, random: std.Random, rounds: usize) bool {
+            if (rounds == 0) return false; // no witness, no evidence: never "prime"
             if (self.nbits < 3) return true; // the only odd 2-bit modulus is 3
             var one = zero;
             one[0] = 1;
@@ -555,23 +562,12 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             var split = nt.oddPart(max_limbs, &mm1);
             defer std.crypto.secureZero(u64, &split.u);
 
-            const wbits = self.nbits - 1;
-            const wlen = (wbits + 7) / 8;
-            const top_mask = @as(u8, 0xff) >> @intCast(8 * wlen - wbits);
-            var buf: [8 * max_limbs]u8 = undefined;
+            var buf: [witness_buf_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &buf);
             var round: usize = 0;
             while (round < rounds) : (round += 1) {
-                // A public witness a ∈ [2, 2^(bits−1)): below m by its length.
-                var a: Elem = undefined;
-                while (true) {
-                    random.bytes(buf[0..wlen]);
-                    buf[0] &= top_mask;
-                    a = loadBE(buf[0..wlen]) catch unreachable;
-                    var hi_or: u64 = 0;
-                    for (a[1..]) |w| hi_or |= w;
-                    if (hi_or != 0 or a[0] >= 2) break;
-                }
+                var a = self.witness(random, &buf, &mm1);
+                defer std.crypto.secureZero(u64, &a);
                 var x = self.pow(&a, &split.u);
                 defer std.crypto.secureZero(u64, &x);
                 var pass = @intFromBool(eql(&x, &one)) | @intFromBool(eql(&x, &mm1));
@@ -585,13 +581,40 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return true;
         }
 
+        /// Room for `bits + 64` random bits (`bits ≤ 64·max_limbs`).
+        const witness_buf_len = 8 * max_limbs + 8;
+
+        /// One Miller-Rabin witness, near-uniform over `[2, m − 2]`: `bits + 64`
+        /// random bits reduced mod `m` (statistical distance from uniform below
+        /// `2^−64`), then `0`, `1` and `m − 1` — which every odd `m` passes, so
+        /// they would spend a round proving nothing — replaced by `2` under a
+        /// mask. The witness depends on the secret `m`, so it stays inside
+        /// constant-time code (`pow`) and is zeroed by the caller.
+        fn witness(self: *const Self, random: std.Random, buf: *[witness_buf_len]u8, mm1: *const Elem) Elem {
+            const wlen = (self.nbits + 64 + 7) / 8;
+            random.bytes(buf[0..wlen]);
+            var a = self.reduceBytesBE(buf[0..wlen]);
+            var above1: u64 = a[0] >> 1; // non-zero ⟺ a ≥ 2
+            for (a[1..]) |w| above1 |= w;
+            var ne_mm1: u64 = 0; // non-zero ⟺ a ≠ m − 1
+            for (a, mm1) |x, y| ne_mm1 |= x ^ y;
+            const trivial = blackBox((nzBit(above1) & nzBit(ne_mm1)) -% 1);
+            var two = zero;
+            two[0] = 2;
+            blend(max_limbs, &a, &two, trivial);
+            return a;
+        }
+
         // ── inversion ───────────────────────────────────────────────────────
 
         /// `a⁻¹ mod m`: if `gcd(a, m) = 1`, writes the inverse (`< m`) to
         /// `out` and returns `true`; else returns `false` (`out` then holds
-        /// garbage). `a < m`. Constant-time in `a` and in the modulus's value
-        /// up to that verdict; the work depends on the modulus's bit length
-        /// only.
+        /// garbage). `a ≥ m` — including any non-zero limb above the slot,
+        /// which the arithmetic would otherwise drop — is refused the same
+        /// way (`false`), never answered with the inverse of a truncated
+        /// value; reduce a wider operand with `reduceLimbs` first.
+        /// Constant-time in `a` and in the modulus's value up to that
+        /// verdict; the work depends on the modulus's bit length only.
         ///
         /// Bernstein–Yang divsteps ("Fast constant-time gcd computation and
         /// modular inversion", 2019, §11), one step at a time: `f = m`,
@@ -614,9 +637,17 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// is for key setup and provers, not for a per-message hot path
         /// (batched 62-step transition matrices are the Backlog item).
         pub fn inverse(self: *const Self, a: *const Elem, out: *Elem) bool {
+            // a < m over all of `Elem`, limbs above the slot included: folded
+            // into the verdict, not branched on.
+            var t = a.*;
+            const below: u1 = limbs.subInto(&t, &self.m); // 1 ⟺ a < m
+            std.crypto.secureZero(u64, &t);
             comptime var s: usize = min_limbs;
             inline while (s <= max_limbs) : (s += step) {
-                if (s == self.L) return self.inverseSlot(s, a, out);
+                if (s == self.L) {
+                    const ok = self.inverseSlot(s, a, out);
+                    return @as(u1, @intFromBool(ok)) & below == 1;
+                }
             }
             unreachable;
         }
@@ -1114,6 +1145,117 @@ test "DynModint isProbablePrime: every odd m < 3000, Carmichael numbers, a 2048-
     limbs.mulSchoolbook(&prod, &pw, &small);
     const pq = try D2.fromLimbsBits(prod[0..D2.max_limbs], 2048 + 64);
     try testing.expect(!pq.isProbablePrime(rnd, 4));
+}
+
+/// `2^127 − 1` (a Mersenne prime) as a `DynModint(256)` modulus.
+fn mersenne127() !DynModint(256) {
+    const D = DynModint(256);
+    var mv = D.zero;
+    mv[0] = ~@as(u64, 0);
+    mv[1] = (@as(u64, 1) << 63) - 1;
+    return D.fromLimbsBits(&mv, 127);
+}
+
+test "DynModint isProbablePrime(rounds = 0) proves nothing: refused (review L1)" {
+    const D = DynModint(256);
+    var prng = std.Random.DefaultPrng.init(0x4c31);
+    const rnd = prng.random();
+    const p = try mersenne127();
+    try testing.expect(!p.isProbablePrime(rnd, 0));
+    try testing.expect(p.isProbablePrime(rnd, 1));
+    var mv = D.zero;
+    mv[0] = 3; // the early answer for the only odd 2-bit modulus
+    const three = try D.fromLimbsBits(&mv, 2);
+    try testing.expect(!three.isProbablePrime(rnd, 0));
+    try testing.expect(three.isProbablePrime(rnd, 1));
+    mv[0] = 561; // composite: zero rounds used to call it prime
+    const c = try D.fromLimbsBits(&mv, 10);
+    try testing.expect(!c.isProbablePrime(rnd, 0));
+}
+
+test "DynModint Miller-Rabin witnesses cover [2, m − 2], upper half included (review L2)" {
+    const D = DynModint(256);
+    var prng = std.Random.DefaultPrng.init(0x4c32);
+    const rnd = prng.random();
+    var buf: [D.witness_buf_len]u8 = undefined;
+    // Small moduli: every value of [2, m − 2] is drawn, nothing outside it.
+    for ([_]u64{ 5, 7, 11, 13, 101 }) |m| {
+        var mv = D.zero;
+        mv[0] = m;
+        const mod = try D.fromLimbsBits(&mv, 64 - @clz(m));
+        var mm1 = mv;
+        mm1[0] -= 1;
+        var seen = [_]bool{false} ** 128;
+        for (0..4000) |_| {
+            const a = mod.witness(rnd, &buf, &mm1);
+            for (a[1..]) |w| try testing.expectEqual(@as(u64, 0), w);
+            try testing.expect(a[0] >= 2 and a[0] <= m - 2);
+            seen[a[0]] = true;
+        }
+        for (2..m - 1) |v| try testing.expect(seen[v]);
+    }
+    // 2^127 − 1: the draws spread over the whole range, about half of them in
+    // the upper half [2^126, m − 2] (the old draw never left [2, 2^126)).
+    const p = try mersenne127();
+    var mm1 = p.m;
+    mm1[0] -= 1;
+    var upper: usize = 0;
+    for (0..256) |_| {
+        const a = p.witness(rnd, &buf, &mm1);
+        try testing.expect(limbs.cmp(&a, &mm1) == .lt);
+        try testing.expect(a[0] >= 2 or a[1] != 0);
+        upper += @intCast((a[1] >> 62) & 1);
+    }
+    try testing.expect(upper >= 96 and upper <= 160);
+}
+
+test "DynModint inverse refuses a ≥ m, in the slot or above it (review L3)" {
+    const D = DynModint(1024);
+    var prng = std.Random.DefaultPrng.init(0x4c33);
+    const mv = randModulus(D, prng.random(), 300);
+    const mod = try D.fromLimbs(&mv);
+    try testing.expect(mod.L < D.max_limbs);
+    var one = D.zero;
+    one[0] = 1;
+    var out: D.Elem = undefined;
+    var a = D.zero;
+    a[0] = 2; // coprime to every odd m
+    try testing.expect(mod.inverse(&a, &out));
+    try testing.expect(D.eql(&mod.mul(&a, &out), &one));
+    // a = m + 2: the same residue, but outside the operand contract
+    var am = mv;
+    _ = limbs.addInto(&am, &a);
+    try testing.expect(!mod.inverse(&am, &out));
+    try testing.expect(!mod.inverse(&mv, &out));
+    // a = 2 + 2^(64·L): a limb above the slot, which the old code dropped,
+    // answering 2⁻¹ — the inverse of a different number
+    var wide = a;
+    wide[mod.L] = 1;
+    try testing.expect(!mod.inverse(&wide, &out));
+    var top = a;
+    top[D.max_limbs - 1] = @as(u64, 1) << 63;
+    try testing.expect(!mod.inverse(&top, &out));
+    // inverseOfModulus reduces its `n` first, so a wide `n` is still served:
+    // m⁻¹ mod 2^(64·(max_limbs − 1)) is m's Hensel inverse
+    var n = D.zero;
+    n[D.max_limbs - 1] = 1;
+    try testing.expect(mod.inverseOfModulus(&n, &out));
+    const hensel = nt.invPow2(D.max_limbs, &mv);
+    try testing.expectEqualSlices(u64, hensel[0 .. D.max_limbs - 1], out[0 .. D.max_limbs - 1]);
+}
+
+test "DynModint toBytesBE: the modulus's width or wider, zero-padded (review L5)" {
+    const p = try mersenne127();
+    try testing.expectEqual(@as(usize, 16), p.byteLen());
+    var exact: [16]u8 = undefined;
+    p.toBytesBE(&p.m, &exact);
+    try testing.expectEqualSlices(u8, &([_]u8{0x7f} ++ [_]u8{0xff} ** 15), &exact);
+    var wide: [20]u8 = undefined;
+    p.toBytesBE(&p.m, &wide);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 4 ++ [_]u8{0x7f} ++ [_]u8{0xff} ** 15), &wide);
+    // A shorter buffer is refused by a panic in every optimize mode (no
+    // in-process test can catch one; the ReleaseFast probe in the 2026-10-06
+    // CHANGELOG entry shows the old code truncating silently instead).
 }
 
 test "DynModint std.crypto.ff bridge round-trips and matches ff's own encoding" {

@@ -138,7 +138,8 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   check); CRT exponents `λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p)` (`nt.divExact` by the even
   `p − 1`); Garner `(p²)⁻¹ mod q²` (`inverse`); factor checks by montint Miller-Rabin and a
   borrow-based closeness compare. ctgrind `keygen` (p, q tainted): no context in that
-  arithmetic; the ≤ 294 left are the `ff` carriers of `p²`, `q²` and of the public `n`, `n²`
+  arithmetic; the ≤ 314 left (294 until montint's 2026-10-06 witness draw, which reads a
+  64-bit-longer string over the same tainted length) are the `ff` carriers of `p²`, `q²` and of the public `n`, `n²`
   (Backlog), the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve
   and its factor-keyed witness stream, length verdicts and the reject verdicts — each class
   named in `ctgrind-expected.tsv`.

@@ -268,6 +268,26 @@ test "checkName rejects a NUL-truncation attempt" {
     try testing.expectError(error.EscapingName, checkName("safe\x00/../../etc/passwd"));
 }
 
+test "checkName refuses a NUL byte on its own, not only beside a `..`" {
+    // The NUL-truncation test above also carries `..`, which is refused by
+    // its own rule — so it never reached the NUL check (mutation 2026-10-06).
+    try testing.expectError(error.EscapingName, checkName("safe\x00.j2"));
+}
+
+test "checkName bounds the whole name and the component count, each on its own" {
+    // 4 × 255-byte components + "/a" = 1025 bytes: every component within
+    // its own cap, so only `max_name_len` can refuse it. The all-`a` probe
+    // below hits the component cap first and never tested this one.
+    const c = "a" ** max_component_len;
+    const long_name = c ++ "/" ++ c ++ "/" ++ c ++ "/" ++ c ++ "/a";
+    comptime std.debug.assert(long_name.len == max_name_len + 1);
+    try testing.expectError(error.MalformedName, checkName(long_name));
+    // 32 one-byte components pass; 33 do not.
+    const at_cap = "a/" ** (max_components - 1) ++ "a";
+    try checkName(at_cap);
+    try testing.expectError(error.MalformedName, checkName("a/" ++ at_cap));
+}
+
 test "checkName bounds name and component length" {
     const long_component = "a" ** (max_component_len + 1);
     try testing.expectError(error.MalformedName, checkName(long_component));

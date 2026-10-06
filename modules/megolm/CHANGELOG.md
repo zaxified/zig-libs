@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the mutation note no longer calls the module "untracked" in the present tense.
 - **2026-09-08** — Test-only, no production change: `fuzzMessageDecode`'s payload generator
   emitted exactly **one** field on every seed, and the field it emitted was always the same one.
   Measured 2026-09-08 over the whole corpus: `fields = 1`, `tag_kinds = {1, 0, 0, 0}`,

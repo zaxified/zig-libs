@@ -6,7 +6,7 @@
 
 **Scope:** core — google/distributed_point_functions PIR (two-server DPF family) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation ?
+**Audit:** review 2026-09-09 · mutation 2026-10-06
 
 **Known defects:** none recorded
 
@@ -26,6 +26,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [menonsamir/spiral](https://github.com/menonsamir/spiral) / [ypir](https://github.com/menonsamir/ypir) | C++ / Rust | MIT / MIT | 41 / 27 | push 2022-05-02 / 2025-04-01 | Single-server PIR (Spiral: RLWE + GSW; YPIR: no offline hint) research code, unmaintained-ish. Different security model *(inferred)*. |
 | [brave-experiments/frodo-pir](https://github.com/brave-experiments/frodo-pir) | Rust | MPL-2.0 | 78 | push 2024-01-10 | Single-server LWE PIR (FrodoPIR); weak-copyleft, source not read. Different security model. |
 | Zig ecosystem | Zig | — | — | — | No PIR library in `std`; none found on GitHub (search 2026-09-30). |
+
+**Where we are ahead:** the only PIR library found for Zig; the reference's two-server DPF trust model, with `k`-record retrieval in one round trip, an aggregate query, keyword lookup, range sharding for multi-core servers and malicious-server detection (`verify.zig`), and — unlike SimplePIR — no per-client hint download. **Where we are behind:** no cuckoo- or simple-hashed sparse database (keyword collisions are false negatives the operator must provision away), no single-server PIR (the non-collusion assumption stays), and no wire format compatible with the reference's protobuf messages (→ Backlog). *(added 2026-10-06 from the 2026-09-30 survey table)*
 
 ## Why this is a module and not an addition to `fss`
 
@@ -820,8 +822,8 @@ That is the access-pattern claim in `answer`'s doc comment, made falsifiable.
 
 ### Harness teeth (mutation testing)
 
-The suite was mutation-tested rather than assumed to work. Each mutation was
-applied, the suite run, and the mutation reverted:
+The suite was mutation-tested rather than assumed to work. Earlier, undated
+run — each mutation was applied, the suite run, and the mutation reverted:
 
 | Mutation | Caught by |
 |---|---|
@@ -832,6 +834,20 @@ applied, the suite run, and the mutation reverted:
 | **(Verified)** the presence-word check dropped from `reconstruct` | the coordinated-zeroing test, the presence-bit-flip sweep, and the unpopulated-index test — 3 tests, exactly the ones that exist because of that word |
 | **(Verified)** the MAC loop checks only word 0 (`per` → `min(per, 1)`) | both bit-flip sweeps, on flips in words ≥ 1 |
 | **(Verified)** the tag comparison truncated to the low `8L` bits — an "inconclusive" check that silently reintroduces the un-widened ring | the tag-answer bit-flip sweep (high-bit flips sail through) **and the top-bit ring-forgery test** — the test built to guard the widening catches its removal |
+
+**Mutation run 2026-10-06** (in-place, Debug, 53 mutants over `pir.zig`'s
+query/keyword map/range answer/codecs/reconstruct/`Multi`, `db.zig`'s
+geometry, and `verify.zig`'s seed guard, odd `m`, presence word, tag checks
+and wipe; `fss` untouched): 52 killed. The first pass left 10; one test was
+added (each channel's keys carry that channel's own seeds — seeding the tag
+DPF with `sv0` survived) and four were extended: the coordinated all-zero
+transcript now also goes through `reconstructFromBytes` (its presence check
+alone could be dropped), too-long buffers and per-operand lengths in both
+geometry tests (`answerToBytes`, `accumulate`, `reconstruct`'s `a1`,
+`Multi.reconstruct*`'s `records_out`, `Verified.reconstruct`'s `t1`), and
+`answerAggregate`'s `DomainTooSmall`. Equivalent: `Verified.answer`'s own
+`n > domain_size` check, which `Value.answer` makes first over the same
+database and the same `domain_size`.
 
 ## Fuzzing
 

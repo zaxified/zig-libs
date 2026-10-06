@@ -189,7 +189,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   cannot) enforce any of that; it is a pure computation. A production
   deployment wanting to avoid a single trusted dealer needs a distributed
   key-generation protocol, which is explicitly out of scope for RFC 9591
-  itself (and hence for this module).
+  itself and not yet in this module (see Backlog).
 - **`verify`/`verifySignatureShare` never panic on adversarial input** —
   both return `bool`/error unions distinguishing "malformed input" from
   "well-formed but doesn't verify," and NEITHER treats "doesn't verify"
@@ -200,15 +200,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## Out of scope
 
 - Ristretto255/Ed25519/Ed448/P-256 ciphersuites (RFC 9591 §6.1-§6.4) —
-  each needs its own module (different group/hash/`Ne`/`Ns`).
+  not yet, see Backlog; each needs its own module (different
+  group/hash/`Ne`/`Ns`).
 - Distributed key generation (an alternative to Appendix C's trusted
-  dealer) — RFC 9591 does not specify one; out of scope by the RFC's own
-  admission, hence out of scope here.
+  dealer) — RFC 9591 does not specify one, so the first version left it
+  out; not yet, see Backlog.
 - Feldman VSS SHARE VERIFICATION (`vss_verify`, Appendix C.2) —
   `trustedDealerKeygen` returns `vss_commitment`, which a caller can
   independently check a share against via `vss_verify`'s formula
   (`S_i == sum(vss_commitment[j] * i^j)`), but this module does not
-  itself expose a `vssVerify` helper. A reasonable, small follow-up.
+  itself expose a `vssVerify` helper. A reasonable, small follow-up —
+  not yet, see Backlog.
 - Distributed/removed-Coordinator deployment shapes (RFC 9591 §7.5) — the
   Coordinator role here is left to the caller/consumer, same as the RFC's
   own framing (this module supplies the per-role FUNCTIONS, not a
@@ -263,7 +265,7 @@ pass, Debug and ReleaseFast.
 
 
 - **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** (survey 2026-09-30): ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
-- **Distributed key generation for FROST** (survey 2026-09-30): the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why this SPEC refused it, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
+- **Distributed key generation for FROST** (survey 2026-09-30): the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why the first version did too, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
 - **`vssVerify` (RFC 9591 Appendix C.2) helper** (survey 2026-09-30): a participant must check its share against the dealer's `vss_commitment`; this SPEC already calls it "a reasonable, small follow-up". Effort: small. Fits §2.
 - **BIP-340-compatible (Taproot) secp256k1 variant** (survey 2026-09-30): `frost-secp256k1-tr` and multi-party-sig produce signatures a Bitcoin node accepts; ours are explicitly not BIP-340 (65-byte, 33-byte points). Effort: medium (x-only key/nonce parity handling and BIP-340 challenge). Fits §2.
 - **Share refresh / repair / re-randomized FROST** (survey 2026-09-30): available in frost-core; needed for long-lived custody keys. Effort: medium each. Fits §2. Lower priority than the four items above.

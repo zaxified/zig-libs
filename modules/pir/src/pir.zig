@@ -1360,6 +1360,14 @@ test "SELF: geometry errors are returned, never asserted" {
     var rec: [6]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, P.reconstruct(out[0..1], &out, &rec));
     try testing.expectError(error.AnswerLengthMismatch, P.reconstructFromBytes(&buf, &buf, &rec));
+    // Too LONG is a mismatch too, and each operand is checked on its own
+    // (mutation run 2026-10-06: `!=` → `<` on these, and dropping the `a1`
+    // check, all survived until these lines existed).
+    var long: [9]u8 = undefined;
+    try testing.expectError(error.AnswerLengthMismatch, P.answerToBytes(&out, &long));
+    try testing.expectError(error.AnswerLengthMismatch, P.reconstruct(&out, out[0..1], &rec));
+    try testing.expectError(error.AnswerLengthMismatch, P.accumulate(&out, out[0..1]));
+    try testing.expectError(error.AnswerLengthMismatch, P.accumulate(out[0..1], &out));
 
     const empty: [0][]const u8 = .{};
     try testing.expectError(error.EmptyDatabase, P.answerSlices(0, shares[0], &empty, &out));
@@ -1943,6 +1951,21 @@ test "SELF: multi-index geometry errors are returned, never asserted" {
     try testing.expectError(error.RecordsLengthMismatch, M.reconstruct(&out, &out, 6, rec[0..6]));
     var buf: [7]u8 = undefined;
     try testing.expectError(error.AnswerLengthMismatch, M.reconstructFromBytes(&buf, &buf, 6, &rec));
+
+    // Mutation run 2026-10-06: a too-LONG records_out, and the aggregate's
+    // domain check, had no test.
+    var rec_long: [2 * 6 + 1]u8 = undefined;
+    try testing.expectError(error.RecordsLengthMismatch, M.reconstruct(&out, &out, 6, &rec_long));
+    var ans_bytes: [4 * 4]u8 = @splat(0);
+    try testing.expectError(
+        error.RecordsLengthMismatch,
+        M.reconstructFromBytes(&ans_bytes, &ans_bytes, 6, &rec_long),
+    );
+    var agg: [2]M.Word = undefined;
+    try testing.expectError(
+        error.DomainTooSmall,
+        M.answerAggregate(0, shares[0], try Database.init(&big, 6), &agg),
+    );
 }
 
 test "SELF: exhaustive length sweep over the multi-index untrusted boundaries" {

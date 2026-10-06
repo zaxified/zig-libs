@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: anchor oracle REDERIVED -> MIXED (the zxing-cpp differential in `tools/oracle.py` is an external anchor for the image-to-text path; `zig build test` stays re-derived); tilt figures in Compared with / Backlog / README now cite the measured 25–30° differential alongside the in-repo sweep.
 - **2026-10-05** — Mutation run: 26 of 33 killed, 6 equivalent, 1 left without a
   test (the ring test's exhausted-label clause); 10 tests added (exact dimension
   gates with a real buffer, scratch one byte short, `min_contrast` and threshold

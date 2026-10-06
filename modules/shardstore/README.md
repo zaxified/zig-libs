@@ -98,8 +98,8 @@ more:
 
 Not provided: cross-shard atomicity (a write group spanning shards is not one
 transaction — transactions/snapshots/cursors stay per-shard), a global ordered
-scan across shards, a same-shard write latch, cross-process exclusion, or
-resharding. See `SPEC.md` for the full contract, the path/naming scheme, and
+scan across shards, a same-shard write latch, exclusion beyond one advisory
+store-wide lock (`"<name_prefix>.lock"`, `error.Locked`), or resharding. See `SPEC.md` for the full contract, the path/naming scheme, and
 the verification argument.
 
 Provenance: original composition (plain key-sharding over single-writer stores);

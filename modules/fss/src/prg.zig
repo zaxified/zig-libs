@@ -439,6 +439,40 @@ test "Aes128Mmo: the LEFT child is the UNTWEAKED MMO — the link to the FIPS an
     try std.testing.expect(!std.mem.eql(u8, &untweaked, &e.s_r));
 }
 
+test "Aes128Mmo: convert is exactly the documented H_2 ‖ H_3, tweak in byte 0" {
+    // Long-hand recomputation, as for `expand` above. Mutation run 2026-10-06:
+    // XORing the convert tweak into byte 1 instead of byte 0 kept every other
+    // test green — the leaf map stays deterministic and distinct from both
+    // children, it is just not the function the module doc defines.
+    const p = Aes128Mmo.init();
+    const s: Seed = [_]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 1, 3, 5, 7, 9, 11, 13, 15 };
+    var x2 = s;
+    x2[0] ^= Aes128Mmo.tweak_convert;
+    var x3 = s;
+    x3[0] ^= Aes128Mmo.tweak_convert + 1;
+    var want: [32]u8 = undefined;
+    want[0..16].* = p.mmo(Aes128Mmo.sigma(x2));
+    want[16..32].* = p.mmo(Aes128Mmo.sigma(x3));
+    try std.testing.expectEqual(std.mem.readInt(u256, &want, .little), p.convert(32, s));
+    try std.testing.expectEqual(std.mem.readInt(u128, want[0..16], .little), p.convert(16, s));
+}
+
+test "every PRG: convert(L) is the low L bytes of convert(32), for every L" {
+    // Pins the two-block threshold at exactly L > 16. Mutation run 2026-10-06:
+    // with the second block computed only for L > 24, L in 17..24 read
+    // uninitialised bytes and nothing noticed — the 32-byte test still took
+    // the two-block path.
+    inline for (prgs) |P| {
+        const p = P.init();
+        const s: Seed = [_]u8{0x3C} ** 16;
+        const full = p.convert(32, s);
+        inline for (1..33) |L| {
+            const T = std.meta.Int(.unsigned, 8 * L);
+            try std.testing.expectEqual(@as(T, @truncate(full)), p.convert(L, s));
+        }
+    }
+}
+
 test "Aes128Mmo: the fixed key is the documented public constant" {
     try std.testing.expectEqualSlices(u8, "fss-dpf-fixedkey", &Aes128Mmo.fixed_key);
     try std.testing.expectEqual(@as(usize, 16), Aes128Mmo.fixed_key.len);

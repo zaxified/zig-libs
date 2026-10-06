@@ -283,9 +283,11 @@ context per target (4 → 5, 11 → 12, 2 → 3), at the inserted line.
 
 ## Consumers
 
-`aaa-gate` / `sessions` (password-backed authentication where the
-server must never see a password; `export_key` for client-side vault
-encryption). The wire structs all have fixed-size `toBytes`/
+None in this collection today: no module depends on `opaque` (checked
+`module_list` in `build.zig`; `aaa-gate` and `sessions`, once named here,
+do not). Intended use: password-backed authentication where the server
+must never see a password, and `export_key` for client-side vault
+encryption. The wire structs all have fixed-size `toBytes`/
 `fromBytes`, so any transport (HTTP body, MCP, raw TCP) can carry
 them.
 

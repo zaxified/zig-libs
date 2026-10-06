@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** test fixtures re-taken after montint's
+  review fix L2 (Miller-Rabin witnesses now near-uniform over `[2, m − 2]`), which changes
+  which prime a seeded `rsa.generate` lands on. The self-derived Basic256Sha256 golden
+  (`server_interop.zig`: both 512-bit certificates and the sealed OPN message) is regenerated
+  from the same seeds, and `src/testdata/asyncua_transcript.txt` is re-captured against a real
+  Python asyncua 2.0.1 peer (`zig build interop-opcua -- --capture`: 7 connections, 1739 steps,
+  0 rejected). No opcua code changed.
+
 - **2026-10-03** — **NO CONSUMER-VISIBLE CHANGE:** the asyncua replay
   transcript was re-taken (`zig build interop-opcua -- --capture`, asyncua
   2.0.1, driver exit 0). `rsa.generate`'s new constant-time Miller-Rabin

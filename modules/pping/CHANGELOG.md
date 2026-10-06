@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: README "Status" reworded from "complete" to the mvp scope it implements; Anchoring names the leftover `gate.fable_core_implemented` switch precisely.
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

@@ -232,17 +232,18 @@ Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
   actual prefix bytes is arithmetically identical to `checksum.compute`'s one
   continuous pass — so this is a robustness feature for a stateful generator,
   not a decode/encode correctness gap. Full citation: `pdu.lsp_checksum_base`.
-- **Non-default ID lengths** in the typed bodies (only 6 is wired; the raw TLV
-  walk is id-length-independent).
-- **Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310); SPB digest
-  (RFC 6329) integrity.
+- **Non-default ID lengths** in the typed bodies — not yet (only 6 is wired; the
+  raw TLV walk is id-length-independent); see Backlog.
+- **Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310) — not yet,
+  see Backlog; SPB digest (RFC 6329) integrity.
 - **Multi-Topology topologies** beyond carrying the MT-ID — MT-ISN (#222), the
-  MT-aware reachability set.
+  MT-aware reachability set — not yet, see Backlog.
 - **The long tail of the IANA TLV registry** (IP reachability #128/#130/#135,
   IP Interface Address #132, TE sub-TLVs, segment-routing, etc.) and the
   un-modeled SPB sub-TLVs (SPB-Inst-Opaque, SPBV, SPB-MCID, SPB-Digest,
   SPB-B-VID) — all reachable and byte-exact through the raw escape hatch;
-  modeling any is additive.
+  modeling any is additive. Typed IP reachability (#128/#130/#132/#135/#236) is
+  not yet modeled — see Backlog; the rest of the tail stays raw.
 
 ## Status
 
@@ -256,7 +257,7 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Typed IP reachability TLVs** (#135 extended IPv4, #236 IPv6, legacy #128/#130, #132 address iterator, #232 IPv6 address) with prefix sub-TLVs (survey 2026-09-30). Why: the first thing an IP IS-IS user decodes from an LSP; holo/FRR/goisis all type them. Effort: ~2–3 days, same iterator shape as #22. Fits CONVENTIONS §2: yes (pure codec).
 - **Authentication TLV #10 with HMAC compute/verify (RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family)** (survey 2026-09-30). Why: production IS-IS runs authenticated; holo (`auth.rs`) and goisis have it, and the siblings `isis-adj`/`isis-lsdb` list it as deferred because the codec has no primitive to call. Effort: ~3 days (`std.crypto.auth.hmac` exists; no dependency needed). Fits §2: yes.
 - **Purge Originator Identification (#13, RFC 6232) and Extended Sequence Number (#229, RFC 7602)** (survey 2026-09-30). Why: FRR and holo emit/consume them; a purge without #13 cannot be traced. Effort: ~1 day. Fits §2: yes.
-- **Non-default ID length in typed bodies (ISO 10589 ID Length 1–8)** (survey 2026-09-30). Why: interop with the rare non-6 deployment; already in the deferred list. Effort: ~2 days, touches every fixed-offset read. Fits §2: yes. Priority low.
+- **Non-default ID length in typed bodies (ISO 10589 ID Length 1–8)** (survey 2026-09-30). Why: interop with the rare non-6 deployment; the deferred list above points here. Effort: ~2 days, touches every fixed-offset read. Fits §2: yes. Priority low.
 - **MT TLVs #222 / #235 / #237** (survey 2026-09-30). Why: multi-topology IS-IS (RFC 5120) in FRR/holo; the MT-ID is already parsed in #143/#144. Effort: ~2 days. Fits §2: yes. Priority low.
 
 ## Anchoring
@@ -268,4 +269,4 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 
 **What the tests actually contain.** Wireshark sharkd validated 5 PDU bodies + TLVs incl. L2 CSNP/PSNP (goldens.zig); long-tail raw-TLV escape hatch stays self-tested
 
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (Auth #10, IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — by design unmodeled, so there is no typed content for Wireshark to validate
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (Auth #10, IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — not modeled (IP-reach, Auth #10 and non-default id-lengths are Backlog items), so there is no typed content for Wireshark to validate

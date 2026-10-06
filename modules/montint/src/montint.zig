@@ -230,9 +230,12 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         }
 
         /// Serialize a normal-domain element to a big-endian byte string.
+        /// `out.len == encoded_bytes`; any other length panics in every
+        /// optimize mode (a short buffer used to be written out of bounds in
+        /// ReleaseFast). The length is public.
         pub fn toBytesBE(self: *const Self, v: *const Elem, out: []u8) void {
             _ = self;
-            std.debug.assert(out.len == encoded_bytes);
+            if (out.len != encoded_bytes) @panic("montint: Modint.toBytesBE output is not encoded_bytes long");
             var bit: usize = 0;
             var oi: usize = out.len;
             @memset(out, 0);

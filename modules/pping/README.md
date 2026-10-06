@@ -23,7 +23,9 @@ produced it — seen going the other way, earlier — is exactly the elapsed rou
 trip. No cooperation from either endpoint, and not one synthetic byte on the
 wire.
 
-- **Status:** complete — parser, bounded table, and the matching core.
+- **Status:** the mvp scope (one TCP flow per estimator) is implemented — parser,
+  bounded table, and the matching core; what a wider scope would add (ICMP, QUIC
+  spin bit) is under [Backlog / deferred](#backlog--deferred).
   **Platform:** any — no sockets, no wall-clock read; `now` is caller-supplied.
 - **Deps:** none (std only).
 - **Model after:** Kathleen Nichols' *pping* (Pollere LLC) passive-RTT
@@ -114,6 +116,6 @@ a public spec. DATA: the scenarios in `src/kat.zig` are hand-built `Observation`
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/parse.zig:207-224 anchors the TCP Timestamps option parser on 2 real SYN/SYN-ACK captures taken with tcpdump off a genuine loopback handshake, including the tsecr<-tsval echo. Everything above the parser is NOT anchored today: match.matchEcho is implemented (the gate in src/gate.zig is on), so the 8 KATs in src/kat.zig run and assert; their expected RTT sequences are hand-built scenarios (our own values, not an external capture)
+**What the tests actually contain.** src/parse.zig:207-224 anchors the TCP Timestamps option parser on 2 real SYN/SYN-ACK captures taken with tcpdump off a genuine loopback handshake, including the tsecr<-tsval echo. Everything above the parser is NOT anchored today: match.matchEcho is implemented (`gate.fable_core_implemented` in src/gate.zig, a switch left from when the core was a stub, is `true`), so the 8 KATs in src/kat.zig run and assert; their expected RTT sequences are hand-built scenarios (our own values, not an external capture)
 
 **How it got there.** The anchoring work landed. DONE a326e4a: real SYN/SYN-ACK timestamp options, tsecr<-tsval correlation anchored

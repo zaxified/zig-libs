@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BREAKING: `nt.divExact` returns
+  `error{NotDivisible}![n]u64`** (was `[n]u64`, garbage for a zero or
+  non-dividing divisor): the quotient is checked as `q·b = a` over the full
+  `2n`-limb product and `b ≠ 0`, constant-time up to that one verdict.
+  Migration: `try`, or map the error — `paillier`'s CRT-exponent derivation,
+  the only caller, now returns `error.InvalidPrimes` on it (updated in the
+  same change). Review 2026-10-03 (L4).
+
+- **2026-10-06** — **Review 2026-10-03 LOW items L1, L2, L3, L5 fixed** (no
+  signature change). `DynModint.isProbablePrime(random, 0)` returns `false`
+  instead of "prime" for every odd modulus (L1). Miller-Rabin witnesses are
+  near-uniform over `[2, m − 2]` — `bits + 64` random bits reduced mod `m`,
+  `0`/`1`/`m − 1` masked to `2`, no retry loop and no compare against `m` —
+  instead of the lower half `[2, 2^(bits−1))`, so the `4^−rounds` bound holds
+  as stated; the draw consumes a different amount of randomness, so a seeded
+  prime search can land on a different prime (L2). `DynModint.inverse`
+  refuses `a ≥ m` in its constant-time verdict, including a non-zero limb
+  above the slot, which used to be dropped and the inverse of the truncated
+  value returned (L3). `DynModint.toBytesBE` with `out` shorter than the
+  modulus and `Modint.toBytesBE` with `out.len ≠ encoded_bytes` now `@panic`
+  in every optimize mode; the old `std.debug.assert` compiled to
+  `unreachable` in ReleaseFast (a probe crashed with SIGSEGV rather than
+  truncating) (L5). New tests for L1–L4 fail on the old code; L5's pins the
+  accepted widths (no in-process test can catch a panic — a ReleaseFast
+  probe showed the old crash and the new panic).
+
 - **2026-10-05** — **Re-survey (documentation only, no code change): scope
   mvp → core.** `SPEC.md`'s `## Compared with` re-checked against
   crypto-bigint 0.7.5, OpenSSL 4.0.3 and `std.crypto.ff`, with

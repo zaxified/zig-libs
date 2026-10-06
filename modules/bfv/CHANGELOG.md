@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the backlog lists byte codecs and parameter selection once each, and the fast-RNS item names only the step still open (the input CRT lift) now that `mulBehz` has landed.
 - **2026-10-05** — Mutation run: 18 of 23 killed, 5 equivalent; 2 tests added
   (an encrypt KAT that pins both fresh error terms, `Ntt.init` refusing a
   composite modulus). No code change.

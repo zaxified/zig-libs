@@ -206,9 +206,10 @@ route has `next_hop == dest`).
 - **B-MAC / SPSourceID extraction from TLVs** — the caller decodes the SPBM-SI
   (RFC 6329 §3.5.4) and SPB-Instance (§3.5.2) sub-TLVs via `isis/spb` and supplies
   the resolved map and IDs; this module takes them as inputs.
-- **Multiple B-VIDs / the 16 ECT algorithm set** — one congruent path per
-  destination from `isis-spf`'s single deterministic ECT selection; no per-B-VID
-  FIB set and no per-flow ECMP.
+- **Multiple B-VIDs / the 16 ECT algorithm set** — not yet: one congruent path
+  per destination from `isis-spf`'s single deterministic ECT selection; no
+  per-B-VID FIB set and no per-flow ECMP. The 2026-09-30 survey moved the
+  per-B-VID FIB set to Backlog (below) — not deferred by design.
 - **Line-rate forwarding** — a FIB is returned, not programmed hardware state.
 - **I-SID service membership** — which local ports belong to a service is
   `l2forward`'s job.

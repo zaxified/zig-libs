@@ -227,8 +227,10 @@ LSP → no LAN; the pseudonode's own LSP never supplies a route).
   the SPT are future work.
 - **Overload bit transit exclusion.** An overloaded node (LSP `overload` flag)
   should not be used for *transit* but remains reachable as a destination.
-  `spf-ect` exposes no per-node transit-exclusion hook and must not be modified,
-  so this is deferred rather than approximated. The bit is available on the
+  `spf-ect` exposes no per-node transit-exclusion hook yet, so this is deferred
+  rather than approximated; the hook is an `spf-ect` Backlog item (2026-09-30
+  survey) and this one waits on it — see Backlog. (`spf-ect` is extended
+  additively when a consumer needs it, as `Graph.addArc` was — below.) The bit is available on the
   decoded LSP for a future increment.
 - **Incremental SPF.** Each call is a full recomputation. Incremental / partial
   SPF on an LSDB delta is a performance optimisation, not needed for correctness.
@@ -241,7 +243,7 @@ LSP → no LAN; the pseudonode's own LSP never supplies a route).
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
 - **IP/IPv6 prefix leaves** (#135/#236 as SPT leaves, best-path selection) (survey 2026-09-30). Why: without it the module cannot produce IP routes for an ordinary IS-IS user; needs the typed reachability TLVs in `isis`. Effort: ~1 week. Fits §2: yes.
-- **Overload-bit transit exclusion** (survey 2026-09-30). Why: operators set it to drain a node; FRR/holo/goisis honour it. Needs a transit-exclusion hook in `spf-ect` (SPEC §6 says the graph module must not be modified — a `spf-ect` backlog item). Effort: ~2 days. Fits §2: yes.
+- **Overload-bit transit exclusion** (survey 2026-09-30). Why: operators set it to drain a node; FRR/holo/goisis honour it. Needs a transit-exclusion hook in `spf-ect` (the hook is `spf-ect`'s Backlog item "Transit-exclusion hook for a node"). Effort: ~2 days. Fits §2: yes.
 - **ECMP next-hop sets** (survey 2026-09-30). Why: IP IS-IS load-shares over equal-cost paths (`max_paths` in holo); the deterministic single-path result is right for SPB only. Needs multi-parent output from `spf-ect`. Effort: ~3 days. Fits §2: yes.
 
 ## Anchoring

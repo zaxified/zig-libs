@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: §6 no longer says `spf-ect` must not be modified; the overload-bit item waits on `spf-ect`'s transit-exclusion hook (Backlog).
 - **2026-09-30** — **Added: LAN transit through pseudonodes.** A pseudonode LSP
   (LSP-ID octet 6 ≠ 0) and member advertisements toward a pseudonode used to be
   dropped, so a broadcast circuit was invisible to SPF. Now every member that

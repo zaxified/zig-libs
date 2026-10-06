@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; **re-surveyed 2026-10-05** after `
 | [FiloSottile/bigmod](https://github.com/FiloSottile/bigmod) (`filippo.io/bigmod`, the exported Go `crypto/internal/bigmod`) | Go | BSD-3-Clause (LICENSE text verified) | 16 | v0.1.0 (2025-05-08, pkg.go.dev, verified) | The Go standard library's RSA/ECDSA backend, exported; README warns the API is not stable. `Nat`/`Modulus` with `Add`/`Sub`/`Mul`/`Mod`, constant-time `Exp`, `ExpShortVarTime`, `Equal`/`IsZero`/`IsOne`/`IsMinusOne`/`IsOdd`, `NewModulusProduct` — but `InverseVarTime` and `GCDVarTime` are **variable-time** (pkg.go.dev function list, verified). No square root, no primality (Go's `crypto/rsa` key generation does that around it *(inferred)*). |
 | [rust-num/num-bigint](https://github.com/rust-num/num-bigint) | Rust | MIT OR Apache-2.0 (`LICENSE-MIT` verified) | 613 | 0.5.1 (crates.io, verified) | What a Rust user reaches for first: general heap bignums with `modpow`, `modinv`, `sqrt`, gcd (`num-integer`). The README says nothing about constant time (verified), so not a secret-key backend — listed because it is the general-purpose alternative a user compares against, not as competition on this module's contract. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; four in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`) run every secret operation on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** square roots mod a prime (crypto-bigint, OpenSSL), a Baillie-PSW/Lucas test (Miller-Rabin only), element `compare`/`isOdd` on `DynModint`/`Modint` (bigmod has `IsOdd`, ff has `compare`), inversion speed for a per-message path (one step at a time, ~one modexp; crypto-bigint batches 62 steps; `rsa`'s per-op blinding inverse still runs on a variable-time `std.math.big` routine, a CT one at this speed would make a 2048-bit CRT sign several times slower *(inferred from the module's own timings)*), the five LOW hardening items of the 2026-10-03 review, and aarch64 runs only the portable path. (Closed since the 2026-09-30 survey: `powPublic`, wide `reduce`, `eql`/`isZero`, run-time-sized moduli — `DynModint`, 2026-10-02; CT inversion, `nt` gcd/lcm/`divExact`, Miller-Rabin — 2026-10-03.)
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; four in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`) run every secret operation on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** square roots mod a prime (crypto-bigint, OpenSSL), a Baillie-PSW/Lucas test (Miller-Rabin only), element `compare`/`isOdd` on `DynModint`/`Modint` (bigmod has `IsOdd`, ff has `compare`), inversion speed for a per-message path (one step at a time, ~one modexp; crypto-bigint batches 62 steps; `rsa`'s per-op blinding inverse still runs on a variable-time `std.math.big` routine, a CT one at this speed would make a 2048-bit CRT sign several times slower *(inferred from the module's own timings)*), and aarch64 runs only the portable path. (Closed since the 2026-09-30 survey: `powPublic`, wide `reduce`, `eql`/`isZero`, run-time-sized moduli — `DynModint`, 2026-10-02; CT inversion, `nt` gcd/lcm/`divExact`, Miller-Rabin — 2026-10-03; the 2026-10-03 review's five LOW hardening items — 2026-10-06.)
 
 **Verdict (2026-10-05): core.** The main use cases of a constant-time Montgomery library over arbitrary odd moduli — RSA/Paillier/DH-style modexp with secret exponents, public-exponent verify, key setup (inverses of `e` mod `λ`, `lcm`, prime search) and VDF squaring — are all covered, tested against `std.math.big.int`/CPython oracles and measured under ctgrind, and in production use by four sibling modules. The remaining gaps are off that path (square roots matter for point decompression and Rabin-style schemes, BPSW strengthens a Miller-Rabin test FIPS 186-5 already accepts *(inferred)*), cosmetic (`compare`/`isOdd`), or speed (per-message inversion, aarch64). Not `parity`: crypto-bigint and OpenSSL still have square roots, faster inversion and a stronger primality test that a user of either would notice missing.
 
@@ -94,7 +94,9 @@ blend, run for the paper's bound — `⌊(49b + 57)/17⌋` steps for `b ≥ 46` 
 `⌊(49b + 80)/17⌋` below (Theorem 11.2) — with `b` the modulus's (public) bit
 length. `d`, `e` are tracked mod `m` (`f ≡ d·a`, `g ≡ e·a`), halving `g`
 becoming `e·2⁻¹`. The verdict checks `g = 0` and `f = ±1`, so a bound that fell
-short would refuse rather than return a wrong value. `inverseOfModulus(n, out)
+short would refuse rather than return a wrong value — and, since 2026-10-06,
+`a < m` over the whole `Elem` (an operand outside the contract is refused in
+the same verdict, not truncated to the slot). `inverseOfModulus(n, out)
 bool` is `m⁻¹ mod n` for ANY `n ≥ 2`, even included — the shape the callers
 have (`Ñ⁻¹ mod φ(Ñ)`, `e⁻¹ mod (p − 1)`), which divsteps cannot take directly:
 `z = n⁻¹ mod m` (odd side), then `m⁻¹ mod n = n − (n·z − 1)/m`, the exact
@@ -121,11 +123,17 @@ theory on plain limb arrays — the key-setup arithmetic no odd modulus carries:
 and `lcm` (odd parts, divsteps on them with `f` odd, the common power of two
 shifted back in; `lcm = (odd(a)/g)·odd(b)·2^max(t_a, t_b)`, the division a
 Hensel one), `divExact` (any divisor, even included: its power of two shifted
-out of the dividend, then Hensel by the odd part), and the shared masked-limb
+out of the dividend, then Hensel by the odd part; `error.NotDivisible` for
+`b = 0` or `b ∤ a`, checked as `q·b = a` over the full product since
+2026-10-06), and the shared masked-limb
 helpers `DynModint.inverse` uses. `DynModint.isProbablePrime(random, rounds)`
 is Miller-Rabin constant-time in the modulus's value along a prime's path:
 `m − 1 = d·2^s` by `nt.oddPart`, the ladder `pow` modulo the secret `m`,
-witnesses below `2^(bits−1)` (no compare against `m`), a round's verdicts
+witnesses near-uniform over `[2, m − 2]` (since 2026-10-06: `bits + 64`
+random bits reduced by `reduceBytesBE`, `0`/`1`/`m − 1` masked to `2` — no
+compare against `m`, no retry loop; before, they were drawn below
+`2^(bits−1)`, so the theorem's `4^−rounds` bound did not literally apply), and
+`rounds = 0` refused (`false`) since 2026-10-06, a round's verdicts
 (`x = 1`, `x = −1` at any of the `s` squarings) OR-ed before the one branch.
 Observable by design: `s` (the squaring count) and everything about a
 rejected candidate. `rsa`, `paillier` and `threshold_ecdsa` run their prime
@@ -643,21 +651,25 @@ speed dispatch, not a correctness bound.
 
 ## Backlog / deferred
 
-- **Review 2026-10-03 (independent, read-only) — no wrong value found; LOW items** (all five still open on 2026-10-05, checked against `src/dyn.zig`/`src/nt.zig`: `isProbablePrime` loops `rounds` times with no guard, witnesses still masked to `bits − 1` bits, `toBytesBE` still `std.debug.assert`s the length, `nt.divExact` still documents garbage for a non-divisor, no `inverse` test with `a ≥ m`): (L1)
-  `isProbablePrime(rounds = 0)` answers "prime" for every odd modulus — refuse or assert `rounds > 0`;
-  (L2) witnesses are drawn from `[2, 2^(bits−1))`, the lower half, so the `4^-rounds` worst-case bound
-  rsa/paillier quote is not the theorem's (uniform over `[2, m−2]`) — reword, or draw below `m`;
-  (L3) `inverse` needs `a < m`: a wider `a` is truncated to the slot or refused (verdict-checked, never
-  a wrong inverse) — pin it in a test; (L4) `nt.divExact(b = 0)` returns garbage, `gcd`/`lcm` are
-  documented for ≥ 1 only — debug assert; (L5) `toBytesBE`'s length check is a debug assert, so a
-  short buffer truncates in ReleaseFast. All callers are safe today. Effort S.
+- ~~**Review 2026-10-03 (independent, read-only) — no wrong value found; five LOW items**~~ ✅ 2026-10-06 (L1–L4 each with a test that failed on the old code; L5 by a ReleaseFast probe, a panic being untestable in-process):
+  (L1) `isProbablePrime(rounds = 0)` now returns `false` (no evidence is not "prime"); (L2) witnesses are
+  near-uniform over `[2, m − 2]` (`bits + 64` random bits reduced mod `m`, trivial ones masked to `2`), so
+  the `4^−rounds` bound rsa/paillier quote is the theorem's; (L3) `inverse` refuses `a ≥ m` in its verdict
+  (CT, folded in) — a non-zero limb above the slot used to be dropped and the inverse of the truncated value
+  returned; (L4) **BREAKING** `nt.divExact` returns `error{NotDivisible}![n]u64`, refusing `b = 0` and a
+  non-divisor (checked `q·b = a` over `2n` limbs; `paillier`, the one caller, maps it to
+  `error.InvalidPrimes`); (L5) `DynModint.toBytesBE` (short `out`) and `Modint.toBytesBE` (`out.len ≠
+  encoded_bytes`) `@panic` in every optimize mode — the old `std.debug.assert` was `unreachable` in
+  ReleaseFast, and a probe there crashed with SIGSEGV instead of truncating. Still documented-only:
+  `nt.gcd`/`lcm`/`oddPart` take `≥ 1` (a zero operand gives garbage; every caller passes `p − 1 ≥ 2`).
 
+- **DONE 2026-10-06 — ctgrind re-pinned after the L1–L5 fix** (`scripts/checks/ctgrind.sh --check`, whole table): context counts unchanged for every montint row (`small`/`portable`/`asmcore` 0, `field` 1, `dyn` 2) and for `threshold_ecdsa prime` (3); only the source digests moved. `paillier keygen` 294 → 314 in-file, old-vs-new stack diff: +2 `nt.divExact`'s new verdict (passes on every valid key), and the witness draw's 16 `loadBE` contexts replaced by 34 in `reduceBytesBE`/`ByteDigits.at`/`horner`/memcpy — the same two documented classes (the length `bits` the harness derives from the tainted factor's top byte, and the CSPRNG keyed by the secret factor), just more sites over a 64-bit-longer string. `threshold_ecdsa` `share`/`nonce`/`betaprime`/`fac` printed results changed (their seeded Paillier key generation consumes witness randomness differently). Re-pinned: source digests, `paillier keygen` bound `<=314` (with the cause in `ctgrind-expected.tsv`), and the `threshold_ecdsa` output pins.
 - ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
 - **`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements** (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); still open (re-survey 2026-10-05): CT `isOdd` and a CT element `compare` (ff has `compare`, bigmod `IsOdd`; today a user writes them on the limbs), and the fixed-width `Modint` has none of `eql`/`isZero`/`neg`. Effort S. Fits §2.
 - ~~**Modular inversion (constant-time, safegcd-style)**~~ ✅ 2026-10-03 `DynModint.inverse` (divsteps) and `inverseOfModulus` (any `n`, even included); `threshold_ecdsa`'s Πmod `d = Ñ⁻¹ mod φ` moved onto it (ctgrind `pimod` 540 → 4). `Field.inv` (Fermat) covers comptime primes.
 - **Batched divsteps** (62 steps per transition matrix, as crypto-bigint/libsecp256k1) — **missing and it matters** (re-survey 2026-10-05): one step at a time costs ~one modexp per inversion, fine for key setup, ~10× too slow for a per-message path; `rsa`'s per-op blinding inverse (`rsa/src/root.zig` `invModN` → `bigModInverse`) still runs on a variable-time `std.math.big` routine over a fresh random `r`, and moving it onto `DynModint.inverse` at ~3.5 ms would make a 2048-bit CRT sign several times slower *(inferred from this SPEC's timings, not measured)*. Effort M. Fits §2.
 - **Square root modulo a prime** (Tonelli-Shanks, with the `p ≡ 3 mod 4` shortcut) — missing; crypto-bigint and OpenSSL `BN_mod_sqrt` have it. Off this module's main use case (RSA/Paillier/DH/VDF never need it); a user wants it for point decompression over a run-time curve or Rabin-style schemes. Effort S–M. Fits §2.
-- **Baillie-PSW (strong Lucas) primality** — missing; `isProbablePrime` is Miller-Rabin only, which FIPS 186-5 accepts with enough rounds *(inferred, standard not re-read)*, so this strengthens rather than unblocks — plus L1/L2 above. Needs a CT Jacobi symbol. Effort M. Fits §2.
+- **Baillie-PSW (strong Lucas) primality** — missing; `isProbablePrime` is Miller-Rabin only, which FIPS 186-5 accepts with enough rounds *(inferred, standard not re-read)*, so this strengthens rather than unblocks. Needs a CT Jacobi symbol. Effort M. Fits §2.
 - ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
 - ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
 - **`DynModint.reduceLimbs` costs two Montgomery multiplies per 64-bit digit** (2026-10-02): a 2L-limb input reduces in 4L multiplies, ~5 % of a CRT half's modexp. A chunked form (`L` limbs at a time, `R²` per chunk) needs `montMul` to accept one operand `≥ m`, which the portable CIOS does (`< R` suffices) but the asm core's contract does not state. Effort S once the asm contract is checked. Fits §2.
