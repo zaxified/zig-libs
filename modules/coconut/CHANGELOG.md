@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the `coconut-crypto` cross-check of the PS core and threshold aggregation moves from "Where we are behind" to "Where we are ahead".
 - **2026-10-05** — Mutation run: 30 of 36 killed, 6 equivalent; 7 tests added and
   1 extended (the σ₁' = 1 universal forgery, a ν and an `s` with an order-3
   component, the proof's own mask, extra disclosed values, a zero `r'` draw,

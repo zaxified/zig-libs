@@ -179,9 +179,9 @@ are constructed by machinery independent of the stub under test.
 
 - `hash_to_decaf448` (RFC 9380 Appendix C's domain-separated
   expand-message construction on top of `oneWayMap`) — RFC 9496
-  §5.3.4's own note places this out of scope for the base group; a
-  future module (or this one, extended) can layer it on once
-  `oneWayMap` is real.
+  §5.3.4's own note places this outside the base group, but that is
+  not a refusal here: not yet — see Backlog (`oneWayMap` already
+  exists to build it on).
 - Batch verification / multi-scalar-multiplication speedups — `Element.
   scalarMul` is a plain per-call delegation to `ed448.ed448.Point.mul`'s
   constant-time 4-bit fixed window (it was a double-and-add until ed448
@@ -245,7 +245,7 @@ no error union at all.
 ## Backlog / deferred
 
 - **Scalar completeness in `decaf448.scalar`** *(survey 2026-09-30)*: `sub`, `negate`, `invert`, `random`, `fromWide`/reduce of a 114-byte digest (via `ed448.scalar.reduceWide`). Checked `rg 'pub fn' modules/decaf448/src/scalar.zig modules/ed448/src/scalar.zig`: only `add`/`mul`/`mulAdd`/`reduceWide`/`clamp`, no inverse or subtraction. A user of `ed448-goldilocks` gets them from the `Field` trait; any blinded protocol (RFC 9497 OPRF has a decaf448 suite) needs `invert`. Effort: small (Fermat inversion over the existing mod-L multiplication). Fits §2.
-- **`hash_to_decaf448`** (RFC 9496 §5.3.4 + RFC 9380 `expand_message_xof` with SHAKE256) *(survey 2026-09-30)*: the SPEC lists it as out of scope because the RFC places it outside the base group, but it is 112 bytes of XOF plus the existing `oneWayMap`, and every consumer of the group needs it. Effort: small. Fits §2.
+- **`hash_to_decaf448`** (RFC 9496 §5.3.4 + RFC 9380 `expand_message_xof` with SHAKE256) *(survey 2026-09-30)*: the RFC places it outside the base group, but it is 112 bytes of XOF plus the existing `oneWayMap`, and every consumer of the group needs it. Effort: small. Fits §2.
 
 ## Anchoring
 

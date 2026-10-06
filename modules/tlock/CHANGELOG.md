@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the age stanza/armor layer moves from "never" to "not yet — see Backlog" in Out of scope.
 - **2026-10-05** — Mutation run: 14 of 16 killed, 2 equivalent; 0 tests added (the
   `fp12Pow` lookup's `<=` twin and the reject-path wipe of `message`, see SPEC).
   No code change.

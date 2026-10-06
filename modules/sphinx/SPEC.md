@@ -168,16 +168,31 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `process` operates on values that are either fully public (the packet
   bytes) or, once past the HMAC gate, this node's own already-established
   secrets.
+  - **What ctgrind measured (2026-09-09, ReleaseFast, see CHANGELOG) — the
+    paragraph above is the intent, not what the binary does:** construct
+    10 / process 43 tainted contexts. (1) std's secp256k1 scalar code is
+    NOT branch-free here: `cmovznzU64` (`secp256k1_scalar_64.zig:104`), a
+    branchless bitmask select in source, compiles to `test $0x1,%al; jne`
+    at ReleaseFast — std's code, under every secp256k1 consumer, not
+    something this module adds or can fix. (2) `process`'s final-hop test
+    (`std.mem.allEqual(u8, &frame.hmac, 0)`, `core.zig:472`) is a
+    secret-derived comparison deciding the one bit per-hop unlinkability
+    hides; `allEqual` is an early-exit loop with no constant-time contract.
+    LLVM happened to vectorise it into one `vptest`/`je` on this target, so
+    it is safe **by accident, not by construction** — a different LLVM or
+    target can restore the loop and no test pins it. Only the HMAC gate
+    (`timing_safe.eql`, `core.zig:437`) is constant-time by construction.
 - **Out of scope for this module** (left to whatever protocol layer wires
   it in): the `payload` TLV field's own value semantics (`amt_to_forward`,
   `short_channel_id`, `payment_data`, etc. — BOLT#4's own payload-format
   section defines these; this module treats `payload` as an opaque byte
-  string throughout), route blinding's `path_key`/`blinding_ss` tweak
-  (BOLT#4 "Route Blinding" — a distinct mechanism layered on top of plain
-  Sphinx, not part of the base onion construction/decryption this module
-  implements), and the return-path error-message obfuscation (BOLT#4
-  "Returning Errors" — reuses this module's shared secrets but is its own
-  wire format and its own `um`-keyed HMAC chain, not built here).
+  string throughout).
+- **Not yet — see Backlog:** route blinding's `path_key`/`blinding_ss`
+  tweak (BOLT#4 "Route Blinding" — a distinct mechanism layered on top of
+  plain Sphinx, not part of the base onion construction/decryption this
+  module implements), and the return-path error-message obfuscation
+  (BOLT#4 "Returning Errors" — reuses this module's shared secrets but is
+  its own wire format and its own `um`-keyed HMAC chain, not built yet).
 
 ## TODO(fable) — done record (fill-in pass completed 2026-07-12)
 
@@ -290,7 +305,7 @@ new ones); `kat_test.zig` now carries zero skips:
 
 - **Failure-message obfuscation / decryption (BOLT#4 "Returning Errors")** *(survey 2026-09-30)* — a forwarding node must wrap failures and a sender must unwrap them to learn which hop failed; without it neither role works. Reuses the shared secrets already derived. Effort: small-medium; fits §2.
 - **Replay-protection hook** *(survey 2026-09-30)* — expose the per-hop shared-secret hash (`SHA256(ss)`, BOLT#4 replay rule) so a caller can plug a log; lnd ships `replaylog`. Effort: small; fits §2.
-- **Route blinding (BOLT#4 "Route Blinding")** *(survey 2026-09-30)* — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (Already noted as out of scope in the Threat model section; the survey lists it as missing and it matters.)
+- **Route blinding (BOLT#4 "Route Blinding")** *(survey 2026-09-30)* — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (The survey lists it as missing and it matters.)
 
 ## Anchoring
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Scope and Anchoring no longer present `announcement_signatures`/`gossip_timestamp_filter` as settled "not debt" — they are "not yet", filed in Backlog.
 - **2026-10-05** — Mutation run: 36 of 36 killed, 0 equivalent; 4 tests added (BigSize
   one-octet-short edges, digest signature-block edges, `commitment_signed` 65536-signature
   refusal, `init` keeps `remote_addr`). No code change.

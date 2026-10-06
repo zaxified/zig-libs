@@ -115,8 +115,8 @@ generic browser-grade parser; malformed/hostile SSE bytes resolve to typed error
 `http.Client.Response.readFailure()` first and surfaces as `error.Canceled` when a
 `std.Io` cancelation is the real cause, `error.HttpFailed` otherwise), not panics. Out of
 scope: OpenAI-compatible variant, retries/429 backoff (compose with `resilience` instead),
-token-counting endpoint, prompt-caching tooling beyond the plain `cache_control` field, files/
-vision content blocks, and the Batch API.
+and prompt-caching tooling beyond the plain `cache_control` field. Not yet — see Backlog:
+the token-counting endpoint, files/vision content blocks, and the Batch API.
 
 **Connection reuse is entirely the caller's call, not this module's (A1 F22, corrected 2026-09-10).**
 Two places in this module's docs (this file's own Out-of-scope line and the README's DEFER list)

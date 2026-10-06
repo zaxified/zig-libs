@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: header encryption and the session-persistence format move from "Out of scope" to "Not yet — see Backlog", matching the Backlog items.
 - **2026-10-05** — Mutation run: 29 of 30 killed, 1 equivalent; 5 tests added
   and 2 extended (skipped-key store at exactly its cap, no receiving chain is
   `MessageKeyNotAvailable`, a rewritten header PN fails the AEAD, XEdDSA

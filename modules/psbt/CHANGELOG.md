@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: BIP370 (PSBTv2) reads "not yet — see Backlog" instead of "out of scope", matching the Backlog item.
 - **2026-10-05** — Mutation run: 56 of 58 killed, 2 equivalent; 12 tests added (map-value
   length edges, global `XPUB` shape, witness-program and multisig recognisers, empty witness
   stacks, sighash-type filtering in single-key and multisig paths, `SINGLE|ANYONECANPAY` and

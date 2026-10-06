@@ -279,7 +279,9 @@ environment with OpenSSH installed.
 ## Backlog / deferred
 
 - ~~DH exponent through `std.crypto.ff`'s pow~~ — **fixed 2026-10-02**: `dhPowModPrime` is montint's `powMont` with a branchless exponent loader (ff's window select compiles to a jump in ReleaseFast — measured). ctgrind target `dh` (0 contexts in montint; 4 on the mpint length of `e`/`K`, inherent to RFC 4251) with the old ff path kept as the `ffpow` positive control.
-Parts 1-3 are implemented. What is deliberately *not* here:
+Parts 1-3 are implemented. What is *not* here yet (not now ≠ never: the dated survey items
+after this list file most of these as tasks; the fixed algorithm menu stays a policy question
+for the owner):
 
 - **Userauth methods:** `keyboard-interactive` (RFC 4256), `hostbased` (RFC 4252 §9), the §8
   password-*change* sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled),
@@ -336,13 +338,13 @@ Parts 1-3 are implemented. What is deliberately *not* here:
   module never sends the server half, so the mode stays off, which is the safe direction —
   advertising it without the sequence-number reset and the "no unexpected messages during KEX"
   discipline it names would be the dangerous half.
-- **Rekeying** (RFC 4253 §9) is still not represented in `Transport`; the fixed algorithm-menu
+- **Fixed algorithm menu; no curve25519 KAT.** Rekeying is a task below; the fixed algorithm-menu
   constants are still not runtime-configurable. RFC 8731 publishes no curve25519-sha256 test
   vectors anywhere — its §5 is IANA Considerations only, and the RFC as a whole has no
   vectors/examples section — so there is no independent KAT to wire for it; this was a
   misstatement in an earlier revision of this note, not an open task.
 
-- **Rekeying (RFC 4253 §9)** *(survey 2026-09-30)*. Already listed above as not represented in `Transport`; a long-lived session (large transfer, tunnel, hours) hits the peer's rekey demand — OpenSSH and libssh2 do it, sshz lists it. Without it long sessions are cut or exposed to cipher usage limits. Effort: medium (KEX state machine reentry, sequence/cipher swap under load). Fits §2.
+- **Rekeying (RFC 4253 §9)** *(survey 2026-09-30)*. Not represented in `Transport`; a long-lived session (large transfer, tunnel, hours) hits the peer's rekey demand — OpenSSH and libssh2 do it, sshz lists it. Without it long sessions are cut or exposed to cipher usage limits. Effort: medium (KEX state machine reentry, sequence/cipher swap under load). Fits §2.
 - **Multiplexed channels (client `openSession` more than once, server channel table)** *(survey 2026-09-30)*. Every SSH library above allows several channels per connection; this module runs one `"session"` and refuses others. A typical user runs commands in parallel or exec + SFTP over one connection. Effort: medium. Fits §2.
 - **`pty-req`, `shell`, `env`, `window-change`, `signal`/`exit-signal`** *(survey 2026-09-30)*. An interactive shell is what a user of `ssh`, `x/crypto/ssh` and russh does first; also `exit-signal` gives the missing exit status of killed commands. Effort: small-medium. Fits §2.
 - **Port forwarding (`direct-tcpip`, `tcpip-forward`) (RFC 4254 §7)** *(survey 2026-09-30)*. The second most common use of SSH after shell. Effort: medium (needs the multi-channel work first). Fits §2.

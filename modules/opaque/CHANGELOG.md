@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: "Consumers" no longer names `aaa-gate`/`sessions`, neither of which depends on `opaque`.
 - **2026-09-15** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M5); no library code
   changed. Targets `register` (client: password, blind), `login` (client: password, blind,
   keyshare seed) and `serverke2` (server: private key, `oprf_seed`, keyshare seed,

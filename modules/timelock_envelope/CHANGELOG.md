@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: streaming and multiple recipients in "Deliberately deferred" now point to their Backlog items ("not yet").
 - **2026-10-05** — Mutation run: 19 of 19 killed, 0 equivalent; 4 tests added
   (`deriveKeys` against a Python HKDF recomputation, trailing bytes refused by
   `parse`, an undecodable time-lock point is `MalformedTimeLock`,

@@ -315,19 +315,15 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 ## Per-module backlog (mechanical, not Fable)
 
-- Byte codecs for `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext` (shape fixed,
-  serialisation to fill in with Part 2).
-- Fast RNS base conversion (Halevi–Polyakov) replacing `convertExact`. The multiply already avoids the
-  exact tensor and the big-integer division (`mulBehz`, BEHZ/HPS shape); what is still wide is the `[0,q)`
-  CRT lift of its inputs, which a fast base conversion would remove.
+- The remaining fast-RNS step: Halevi–Polyakov base conversion replacing `convertExact` for the
+  `[0,q)` CRT lift of the multiply's inputs. The BEHZ/HPS multiply itself has landed (`mulBehz`: no
+  exact tensor, no big-integer division); that input lift is the only wide arithmetic left.
 - CRT-slot batch encoding (`encode.zig`), needs `t ≡ 1 mod 2N`.
-- A parameter-selection helper (`sec_n8192_logq218` is hand-derived; there is
-  no function that picks a chain for a target `N`/`log q`/depth).
-- **Byte codecs for keys and ciphertexts** *(survey 2026-09-30, escalates the item above)*: without them a ciphertext cannot leave the process, so the client/server split that FHE exists for cannot be built; SEAL serializes every object. Small (a day; fixed-width RNS limbs, versioned header); fits CONVENTIONS §2 (pure Zig).
+- **Byte codecs for `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`** *(survey 2026-09-30; shape fixed, serialisation to fill in)*: without them a ciphertext cannot leave the process, so the client/server split that FHE exists for cannot be built; SEAL serializes every object. Small (a day; fixed-width RNS limbs, versioned header); fits CONVENTIONS §2 (pure Zig).
 - **Plaintext-operand ops** (`addPlain`, `mulPlain`, plain-constant multiply) *(survey 2026-09-30)*: the cheapest way to apply a model weight or a mask to a ciphertext, used in almost every SEAL/OpenFHE BFV program; none exists (searched `pub fn` in `src/bfv.zig`). Small; fits §2.
 - **CRT-slot batch encoding + Galois rotations (rotate rows/columns, key switching for `x -> x^g`)** *(survey 2026-09-30)*: SIMD packing is how BFV gets throughput (`t` prime, `t = 1 mod 2N`); the sum-of-slots and matrix-vector products need rotations. Already in the list above for batching; rotations were named "deferred" in the module doc. Medium (a week: slot permutation tables, Galois keys); fits §2.
 - **Modulus switching** *(survey 2026-09-30)*: shrinks ciphertexts and noise after a multiply; SEAL/OpenFHE/Lattigo all offer it. Medium; fits §2.
-- **Standard security-level parameter selection** *(survey 2026-09-30)*: only one security-grade set (`sec_n8192_logq218`) and no `N`/depth chooser, where SEAL ships `CoeffModulus::BFVDefault` for the HomomorphicEncryption.org tables at 128/192/256 bits. Small-to-medium; fits §2. (Same item as the last bullet above, with a target.)
+- **Standard security-level parameter selection** *(survey 2026-09-30)*: only one security-grade set (`sec_n8192_logq218`) and no `N`/depth chooser, where SEAL ships `CoeffModulus::BFVDefault` for the HomomorphicEncryption.org tables at 128/192/256 bits. `sec_n8192_logq218` is hand-derived; there is no function that picks a chain for a target `N`/`log q`/depth. Small-to-medium; fits §2.
 - **BGV and CKKS** *(survey 2026-09-30)*: CKKS is what most SEAL/OpenFHE/Lattigo users actually run (real-number arithmetic, ML inference). Large (a month each: encoder, rescale, bootstrapping for CKKS); fits §2. Torn on whether this is "missing and it matters" for a BFV module — recorded here so the question is asked, not assumed. Listed as a deferred increment by the module already.
 
 ## Anchoring

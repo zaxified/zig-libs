@@ -306,7 +306,7 @@ exact bytes and that nonce isn't published).
   `MessageKeyNotAvailable` (replay of a consumed in-order message, or a
   message before its chain exists), `KeyAgreementFailed` (pathological
   low-order ratchet key), plus `Allocator.Error`.
-- **Out of scope**: header encryption (spec §4 — headers here are
+- **Not yet — see Backlog**: header encryption (spec §4 — headers here are
   cleartext, so the ratchet public key + counters are observable) and a
   stability-committed session-persistence byte format (`State` is an
   in-memory value only). PQXDH seeding was in this list until 2026-08-22;
@@ -422,7 +422,7 @@ provided.
 - **Session state serialization** (a stable byte format for `ratchet.State`) *(survey 2026-09-30)*: SPEC "Out of scope" says `State` is an in-memory value with no stability-committed format; any long-lived client needs to persist sessions. Effort: small-medium. Fits §2.
 - **PQXDH wire codec** *(survey 2026-09-30)*: README: "no wire codec — a caller transmitting a PQXDH bundle writes their own", while X3DH has `PreKeyBundle`/`InitialMessage` codecs. Effort: small. Fits §2.
 - **Sender keys (group messaging), sealed sender, safety numbers/fingerprints, Sesame** *(survey 2026-09-30)*: the parts of libsignal that make it a messenger rather than a handshake. Searched `rg -i 'sealed|sender.?key|sesame|fingerprint|safety' modules/signal/src` — no implementation (only libsignal-variant XEdDSA hits). Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
-- **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet** *(survey 2026-09-30)*: SPEC lists header encryption as out of scope without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.
+- **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet** *(survey 2026-09-30)*: the SPEC excluded header encryption without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.
 
 ## Anchoring
 

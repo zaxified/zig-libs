@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: `hash_to_decaf448` in Out of scope now reads "not yet — see Backlog", matching the Backlog item.
 - **2026-10-05** — Mutation run: 24 of 24 killed, 0 equivalent; 1 test added
   (MAP's mod-p reduction of an input `>= p`, which no RFC 9496 B.3 vector
   reaches). No code change.

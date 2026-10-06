@@ -220,7 +220,8 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 
 - **Streaming / very large payloads.** `seal`/`open` are one-shot and
   buffer the whole plaintext; `pt_len` is a `u32`. A chunked AEAD framing
-  for multi-gigabyte payloads is a separable follow-up.
+  for multi-gigabyte payloads is a separable follow-up — not yet, see
+  Backlog.
 - **`age`-file / armored interchange format.** This module ships its own
   compact binary envelope, not `filippo.io/age` stanza framing. Interop
   with drand's `tle` file format is not a goal.
@@ -228,7 +229,8 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
   and no `sig_R`-vs-`p_pub` pairing check (caller's responsibility, as in
   `tlock`).
 - **Multiple recipients / threshold PQ locks.** A single HQC recipient
-  per envelope; N-of-M or multi-recipient KEM wrapping is not modelled.
+  per envelope; N-of-M or multi-recipient KEM wrapping is not modelled
+  yet (multiple recipients: see Backlog).
 - **Key/parameter agility beyond the three HQC sets and the single
   ChaCha20-Poly1305 / HKDF-SHA256 suite.** `version`/`suite_id` leave
   room to add suites later; only the shipped one is implemented.
@@ -238,7 +240,7 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 
 ## Backlog / deferred
 
-- **Streaming / chunked AEAD framing** *(survey 2026-09-30)* — every `tle`/age user encrypts files of any size; here the whole plaintext is buffered. Effort: medium (STREAM-style chunks, could reuse `aeadframe`); fits §2. (SPEC lists it as deferred; the survey rates it needed for file use.)
+- **Streaming / chunked AEAD framing** *(survey 2026-09-30)* — every `tle`/age user encrypts files of any size; here the whole plaintext is buffered. Effort: medium (STREAM-style chunks, could reuse `aeadframe`); fits §2. (The survey rates it needed for file use.)
 - **age-format interop (stanza + armor)** *(survey 2026-09-30)* — lets `tle` decrypt the time-lock half and gives users armored files. Effort: medium; fits §2. Question: the SPEC says interop is "not a goal" — deliberate, so kept as a question, not a plan.
 - **Multiple recipients** *(survey 2026-09-30)* — age's core feature. Effort: medium; fits §2.
 

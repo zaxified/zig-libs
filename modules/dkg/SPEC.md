@@ -353,9 +353,10 @@ here.
 - **Distributed aux-parameter generation** (jointly producing the ring-Pedersen
   `(Ñ, h1, h2)` and Paillier moduli). Here those are per-party local key material
   attached by `assembleKeyShares`.
-- **Public reconstruction of a QUAL dealer that fails the Feldman check** (GJKR
-  Fig.2 step 4's recovery branch) — Phase 1 treats that as a hard protocol error;
-  a defended Round-2 complaint is handled.
+- ~~**Public reconstruction of a QUAL dealer that fails the Feldman check**~~ (GJKR
+  Fig.2 step 4's recovery branch) — done 2026-10-01: no longer a hard protocol error;
+  `feldman_complaint` + `reveal` rounds rebuild the exposed dealer's polynomial (see
+  "Per-participant API").
 
 ## Meta
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with no longer says no LMS/HSS module exists — it points to the sibling `lms` module (grade 2).
 - **2026-10-05** — Mutation run: 23 of 24 killed, 1 equivalent; 1 test extended
   (the external-vector KAT rejects 2048 tampered randomizers, so `verify`'s
   root comparison must cover every byte). No code change.

@@ -289,8 +289,8 @@ boundary-crossing case):
 The mutation was then reverted via paired editing (not `git checkout`,
 per this repository's standing hazard with that command) and the
 restoration verified by re-running the full suite green (39/39) —
-`modules/megolm/` is untracked (a brand-new module), so `git diff`
-itself has no tracked baseline to compare against here; the restoration
+`modules/megolm/` was untracked at the time (a brand-new module; it is
+tracked now), so `git diff` had no tracked baseline to compare against; the restoration
 was confirmed by direct byte-for-byte comparison of the pre- and
 post-mutation source text instead.
 

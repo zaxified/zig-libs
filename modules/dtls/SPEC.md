@@ -44,8 +44,8 @@ what is exercised). The `error.HandshakeEngineNotImplemented` this section
 used to describe no longer exists in the code. PSK-mode third-party interop
 is also proven — a live wolfSSL 5.9.1 handshake in both roles, see "Live
 third-party interop" below, which lists the four wire defects that only a
-third-party peer could surface. 0-RTT/resumption/key update/CCM stay
-explicitly out of scope, not stubbed; HelloRetryRequest is now IMPLEMENTED
+third-party peer could surface. 0-RTT/resumption/key update/CCM are not
+implemented yet and not stubbed (see Backlog); HelloRetryRequest is now IMPLEMENTED
 (both roles, both key-exchange modes, including RFC 8446 §4.1.4's group
 change). Certificate mode is
 **no longer self-interop only** — a live wolfSSL certificate server is now
@@ -300,7 +300,7 @@ follow-up.
 
 ## Threat model / out of scope
 
-- **Out of scope, by design (not silently skipped):** session resumption /
+- **Not yet — see Backlog (not silently skipped):** session resumption /
   `NewSessionTicket` (no `"res binder"`/resumption-PSK path — only `"ext
   binder"`/externally-configured PSK), 0-RTT/early data, connection
   migration beyond the connection-ID field already framed in `record.zig`.
@@ -340,9 +340,12 @@ follow-up.
     when ML-KEM + DTLS 1.3 are both enabled) empties the key share whenever
     ClientHello1 would exceed the MTU rather than fragment it — both look
     like "peer didn't offer the group" from the other side.
-- Once `keyschedule.pskBinder` is implemented, it MUST be checked (server
-  side) before trusting the offered PSK identity — a missing check is the
-  single highest-impact bug this module could ship with.
+- The PSK binder (`keyschedule.pskBinder`, `src/keyschedule.zig`) MUST be
+  checked (server side) before trusting the offered PSK identity — a
+  missing check is the single highest-impact bug this module could ship
+  with. It is: the server recomputes it over the truncated ClientHello and
+  compares in constant time (`timing_safe.eql`), failing with
+  `error.BinderVerifyFailed` (`Connection.zig`).
 - `aead.Protection.unprotect` must return the typed
   `error.DecryptionFailed` on any tag mismatch, never panic, never leak
   timing differences between "bad tag" and "bad padding"/other failure

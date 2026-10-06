@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: resumption/0-RTT (and key update/CCM) read "not yet — see Backlog" instead of "out of scope, by design"; the stale "once `pskBinder` is implemented" note now records the existing constant-time server-side binder check.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** the application-epoch
   `send`/ack path now refuses (`error.SequenceNumberExhausted`, new
   `SendError` member) the record that would need `send_seq` to wrap past its

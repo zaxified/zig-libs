@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Backlog item 8 no longer says the Part 6 crypto-core pass is "NOT started" — it was completed 2026-07-14 (Status, `threshold.zig`); only the DKG follow-up remains.
 - **2026-10-05** — Mutation run: 39 of 43 killed, 4 equivalent; 8 tests added
   and 1 extended (infinity encodings of `G1`/`G2`, on-curve refusal of the
   uncompressed decoders, `eqlPoints` on the identity, `Fp.fromInt(p)`,

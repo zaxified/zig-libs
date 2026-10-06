@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoinjs/bip174, bitcoinjs-lib `Psbt`](https://github.com/bitcoinjs/bip174) | JavaScript | MIT | 37 | push 2026-09-08 | Creator/Updater/Signer/Combiner/Finalizer/Extractor in one class; `Psbt.fromBase64`, `updateInput`, `signInput`. |
 | [btcsuite/btcd (`btcutil/psbt`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Creator/Updater/Signer/Finalizer/Extractor packages, base64 helpers *(inferred)*. Zig `std` and the Zig ecosystem have no PSBT. |
 
-**Where we are ahead:** the only pure-Zig PSBT; byte-exact against BIP174's vectors, Core's `rpc_psbt.json`, and PSBTs captured from a live regtest Core node for every finalize shape; UTXO-to-outpoint binding and per-signature pre-verification before finalize. **Where we are behind:** no Creator/Updater API (no `from_unsigned_tx`, no typed setters — the maps are built by hand from `Record`s), no Signer (by design, see SPEC), no BIP370 v2 (explicitly out of scope), BIP371 taproot fields only as opaque records except `TAP_KEY_SIG`, finalizer limited to standard spend types.
+**Where we are ahead:** the only pure-Zig PSBT; byte-exact against BIP174's vectors, Core's `rpc_psbt.json`, and PSBTs captured from a live regtest Core node for every finalize shape; UTXO-to-outpoint binding and per-signature pre-verification before finalize. **Where we are behind:** no Creator/Updater API (no `from_unsigned_tx`, no typed setters — the maps are built by hand from `Record`s), no Signer (by design, see SPEC), no BIP370 v2 (not yet, → Backlog), BIP371 taproot fields only as opaque records except `TAP_KEY_SIG`, finalizer limited to standard spend types.
 
 ## Design & invariants
 
@@ -199,11 +199,11 @@ the time `finalize` runs. This module implements Creator/Updater's wire codec (`
 the Combiner (`combine`, which BIP174 itself notes "does not need to know how to interpret scripts
 in order to combine PSBTs"), and now the Input Finalizer/Transaction Extractor above.
 
-**Out of scope: BIP370 (PSBTv2).** BIP174 v0 is what this module implements (the field list in
+**Not yet — see Backlog: BIP370 (PSBTv2).** BIP174 v0 is what this module implements (the field list in
 `global_key`/`input_key`/`output_key` is the complete BIP174 v0 set); BIP370's PSBTv2 extensions
 (explicit input/output counts, per-input `PSBT_IN_PREVIOUS_TXID`/`PSBT_IN_OUTPUT_INDEX` replacing
 the implicit unsigned-tx-derived shape, etc.) are a distinct, larger wire format and a separate future
-task, not attempted here.
+task, not attempted yet.
 
 **`PSBT_IN_RIPEMD160`/`SHA256`/`HASH160`/`HASH256` (`0x0a`-`0x0d`) and `PROPRIETARY` (`0xFC`
 everywhere) are not given typed accessors** — they fall to the generic opaque-passthrough path like
@@ -248,5 +248,5 @@ PSBT dominated by one dense map; size for the dense figure if map size isn't bou
 
 - **Creator/Updater API: PSBT from an unsigned tx, typed setters for UTXOs, scripts, BIP32 derivations** (survey 2026-09-30) — the first two steps of any PSBT workflow; rust-bitcoin, bitcoinjs and btcd all have them. Today a user assembles `Map.records` by hand. Effort M. Fits §2.
 - **BIP371 typed taproot fields (internal key, leaf scripts, tap BIP32 derivation, merkle root) + script-path finalize** (survey 2026-09-30) — taproot wallets need them; `finalize` returns `NonStandardScript` for tapscript. Effort M–L (depends on `taproot` script-tree work). Fits §2.
-- **BIP370 (PSBTv2)** (survey 2026-09-30) — the SPEC calls it out of scope; the second wire format users meet (Core, rust-psbt). Effort L. Fits §2.
+- **BIP370 (PSBTv2)** (survey 2026-09-30) — the second wire format users meet (Core, rust-psbt). Effort L. Fits §2.
 - **Typed accessors for hash-preimage fields (`0x0a`–`0x0d`) and base64 string I/O** (survey 2026-09-30) — PSBTs travel as base64; `std.base64` covers the codec, an `fromBase64`/`toBase64` pair would save every caller a step. Effort S. Fits §2.

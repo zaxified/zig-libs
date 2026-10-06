@@ -1196,15 +1196,10 @@ panics, Debug AND ReleaseFast.
    copy, but avoidable); EIP-7594/PeerDAS cell proofs (explicitly out
    of scope for Part 5 itself, `SPEC.md`'s threat model — `fft`/`ifft`
    are already in place for it).
-8. **Part 6 crypto-core pass (NOT started — see Status)**: fill in
-   `evalPolynomialAt` (Shamir), `feldmanCommitCoefficient` (Feldman
-   commit), `derivePublicKeyShare` (Feldman evaluate-in-the-exponent),
-   and `combineSignatures`'s Lagrange-in-the-exponent step — each
-   stub's doc comment in `threshold.zig` already quotes the exact
-   construction, and `frost.zig`'s already-implemented Horner-
-   evaluation/Lagrange-interpolation loops are a direct porting
-   reference (same shape, different field/group — see "Part 6 design").
-   Once filled in, a full Pedersen/GJKR-style DKG (explicitly out of
+8. **Part 6 follow-ups (the crypto-core pass itself is DONE 2026-07-14
+   — see Status; `evalPolynomialAt`, `feldmanCommitCoefficient`,
+   `derivePublicKeyShare` and `combineSignatures` are implemented in
+   `threshold.zig`)**: a full Pedersen/GJKR-style DKG (explicitly out of
    scope for this trusted-dealer pass, "Part 6 design"/"Out of scope
    for Part 6" above) would be a genuinely separate follow-up
    module/part, not an extension of `threshold.zig` itself.

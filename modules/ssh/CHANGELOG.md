@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: rekeying is listed once in the Backlog, and the pre-survey list reads "not here yet" instead of "deliberately not here", since the survey files most of its items as tasks.
 - **2026-10-02** — ⛔ **Fixed: the MODP DH secret exponent leaked through timing.** `dhPowModPrime`
   (group14/group16 kex, client and server) used `std.crypto.ff`'s `powWithEncodedExponent`, whose
   constant-time window select LLVM compiles to a conditional jump in ReleaseFast (measured by

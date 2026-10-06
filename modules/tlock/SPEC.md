@@ -235,8 +235,8 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 
 - The hybrid `age`-envelope layer (`filippo.io/age` stanzas, armored
   file framing, arbitrary-length payloads) `drand/tlock`'s `tle` CLI
-  wraps this primitive inside of. This module implements the raw
-  128-byte BF-IBE `Ciphertext` only.
+  wraps this primitive inside of — not yet, see Backlog. Today this
+  module implements the raw 128-byte BF-IBE `Ciphertext` only.
 - PQ-hybrid composition (see `root.zig`'s "Honest limitations" —
   gating a `hqc` KEM ciphertext alongside this module's IBE layer for
   long-term confidentiality) — a consumer-side decision, not this
@@ -250,7 +250,7 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 
 ## Backlog / deferred
 
-- **age stanza + armor layer for arbitrary-length payloads** *(survey 2026-09-30)* — the `tle` workflow (encrypt a file, share it, decrypt after round R) needs it; the module already validates against an age file's key. Effort: medium (age STREAM, HKDF header MAC, armor); fits §2. (SPEC "Out of scope" excludes it; survey: the largest gap against `drand/tlock`.)
+- **age stanza + armor layer for arbitrary-length payloads** *(survey 2026-09-30)* — the `tle` workflow (encrypt a file, share it, decrypt after round R) needs it; the module already validates against an age file's key. Effort: medium (age STREAM, HKDF header MAC, armor); fits §2. (Survey: the largest gap against `drand/tlock`.)
 - **G2-signature scheme (`bls-unchained` testnet variant)** *(survey 2026-09-30)* — supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits §2.
 
 ## Anchoring

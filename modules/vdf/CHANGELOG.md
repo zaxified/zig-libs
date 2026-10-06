@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with and the group design note say the squaring loops run on `montint`, not `std.crypto.ff`.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (test-only):** A1/vdf.md F3 closed. Added two
   tests using a real, independently-verified 9-base Arnault-class strong pseudoprime
   (`3825123056546413051 = 149491 * 747451 * 34233211`, fools bases 2,3,5,7,11,13,17,19,23
