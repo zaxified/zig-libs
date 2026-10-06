@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `aes_gcm_test.json` anchors the module
+  (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 79 valid vectors encrypt and decrypt
+  exactly on every backend and the stateless path, 54 modified tags are refused with the output
+  zeroed. No defect. The vectors are Apache-2.0 data: the module now carries a `NOTICE`.
+
 - **2026-10-04** — **NO CONSUMER-VISIBLE CHANGE:** independent review of the
   whole module (tag check, failure wiping, length block, inc32, GHASH power
   count, in-place overlap, constant-time posture); no defect found. Recorded

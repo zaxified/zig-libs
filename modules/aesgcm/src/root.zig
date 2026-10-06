@@ -932,6 +932,65 @@ test "long messages agree with OpenSSL (tools/openssl_kat.py)" {
     }
 }
 
+// Wycheproof's AES-GCM vectors (C2SP/wycheproof, Apache-2.0 data -- see
+// NOTICE), made by `tools/wycheproof.py`: every test with a 128/256-bit key,
+// a 96-bit IV and a 128-bit tag. 79 valid, 54 with a modified tag that must
+// be refused -- third-party rejection cases, where the other anchors only
+// have our own bit flips.
+const wycheproof = @import("testdata/wycheproof.zig").vectors;
+
+test "Wycheproof aes_gcm_test.json: valid vectors encrypt, modified tags are refused" {
+    var counts = [2]usize{ 0, 0 };
+    inline for (.{ Aes128Gcm, Aes256Gcm }) |Gcm| {
+        for (wycheproof) |v| {
+            if (v.bits != Gcm.key_length * 8) continue;
+            counts[@intFromBool(v.valid)] += 1;
+            var key: [Gcm.key_length]u8 = undefined;
+            var iv: [12]u8 = undefined;
+            var tag: [16]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&key, v.key);
+            _ = try std.fmt.hexToBytes(&iv, v.iv);
+            _ = try std.fmt.hexToBytes(&tag, v.tag);
+            const aad = try hexAlloc(v.aad);
+            defer testing.allocator.free(aad);
+            const msg = try hexAlloc(v.msg);
+            defer testing.allocator.free(msg);
+            const ct = try hexAlloc(v.ct);
+            defer testing.allocator.free(ct);
+            const out = try testing.allocator.alloc(u8, msg.len);
+            defer testing.allocator.free(out);
+
+            for (all_backends) |b| {
+                var ctx = Gcm.initWith(b, key) orelse continue;
+                if (v.valid) {
+                    var t: [16]u8 = undefined;
+                    ctx.encrypt(out, &t, msg, aad, iv);
+                    try testing.expectEqualSlices(u8, ct, out);
+                    try testing.expectEqualSlices(u8, &tag, &t);
+                    try ctx.decrypt(out, ct, tag, aad, iv);
+                    try testing.expectEqualSlices(u8, msg, out);
+                } else {
+                    @memset(out, 0xaa);
+                    try testing.expectError(error.AuthenticationFailed, ctx.decrypt(out, ct, tag, aad, iv));
+                    for (out) |byte| try testing.expectEqual(@as(u8, 0), byte); // wiped, not plaintext
+                }
+            }
+            // The stateless path too.
+            if (v.valid) {
+                var t: [16]u8 = undefined;
+                Gcm.encrypt(out, &t, msg, aad, iv, key);
+                try testing.expectEqualSlices(u8, ct, out);
+                try testing.expectEqualSlices(u8, &tag, &t);
+            } else {
+                try testing.expectError(error.AuthenticationFailed, Gcm.decrypt(out, ct, tag, aad, iv, key));
+            }
+        }
+    }
+    // Pinned so a regenerated table that silently lost a class shows here.
+    try testing.expectEqual(@as(usize, 79), counts[1]);
+    try testing.expectEqual(@as(usize, 54), counts[0]);
+}
+
 fn hexAlloc(s: []const u8) ![]u8 {
     const out = try testing.allocator.alloc(u8, s.len / 2);
     _ = try std.fmt.hexToBytes(out, s);

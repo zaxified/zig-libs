@@ -82,8 +82,10 @@ unit (AES-128: 80 `aesenc` per 128 bytes, one per cycle).
 Provenance: original work of the zig-libs authors (MIT). The construction
 follows NIST SP 800-38D and the published descriptions named in *Model after*
 (the Intel white papers on AES-NI key expansion and CLMUL GCM); no third-party
-source was read for or translated into this code, so no NOTICE entry. Test
+source was read for or translated into this code. Test
 vectors: the McGrew–Viega GCM test cases are the specification's own published
 examples; `src/testdata/openssl_kat.zig` is generated data from our own tooling
 (`tools/openssl_kat.py`), which runs OpenSSL as a black-box oracle over inputs
-of our choosing.
+of our choosing; `src/testdata/wycheproof.zig` reproduces 133 Wycheproof
+vectors, Apache-2.0 test data — see [NOTICE](NOTICE), which must travel with
+the module.
