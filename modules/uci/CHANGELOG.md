@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **FIX (behaviour change): `serialize` refuses an empty section type, section name or
+  option key with `error.InvalidName`.** It used to write `config ''` / `option '' 'v'`, which the real
+  libuci refuses as a whole file ("insufficient arguments") — one empty word made the config unloadable on
+  OpenWRT — and `config t ''`, which libuci reads as an anonymous section. `parse` still accepts the empty
+  words (U18, fail-open on read). Found by the new libuci oracle (`tools/interop.zig` + `tools/libuci_corpus.py`
+  → `src/libuci_oracle_test.zig`, 465 inputs): every other input agrees with libuci on the model (0 value
+  divergences) and on reading back what `serialize` writes.
+
 - **2026-10-04** — ADDED (all four survey 2026-09-30 gaps), no breaking change: `applyDelta` /
   `Editor.applyDelta` replay a staged-delta file (`/tmp/.uci/<pkg>`) so a file reader sees what
   `uci get` sees; `Editor` (`set`, `setSection`, `add`, `delete`, `deleteOption`,

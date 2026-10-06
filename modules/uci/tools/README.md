@@ -1,9 +1,10 @@
 # `uci` verification instruments
 
-Eight instruments, run by hand. None is wired into `zig build`: five of them
-(`oracle_dump.c`, `classify.sh`, `diff_run.sh`, `diff_fuzz.py`,
-`capture-grammar.sh`) need the real **`libuci`**, built from source and used as
-a black-box oracle.
+Ten instruments, run by hand. Only `interop.zig` is a `zig build` step
+(`interop-uci`, which no lane runs); six of them (`oracle_dump.c`,
+`classify.sh`, `diff_run.sh`, `diff_fuzz.py`, `capture-grammar.sh`,
+`interop.zig`) need the real **`libuci`**, built from source and used as a
+black-box oracle.
 `zig build test-uci` must require none of it (`CONVENTIONS.md` §9).
 
 Only two kinds of instrument are kept here (`CONVENTIONS.md` §9): recipes for data the
@@ -24,6 +25,7 @@ Figures below were measured on 2026-09-17 against the tree as it stands.
 | `diff_run.sh` | The same without classification, printing raw differences. |
 | `diff_fuzz.py` | Random differential; `--valid` keeps statement shape legal so the parser is actually reached. |
 | `capture-grammar.sh` | Captures the frozen `uci` grammar fixtures the suite pins. |
+| `libuci_corpus.py` + `interop.zig` | `zig build interop-uci -- --capture` (2026-10-06): the 65 probes + 400 seeded `diff_fuzz.py` configs through libuci, and this module's `serialize` of each through libuci again → `src/testdata/libuci_capture.zig`, replayed in the lane by `src/libuci_oracle_test.zig`. Needs `oracle_dump` built as below. |
 | `capture-delta.sh` | Captures `src/testdata/delta_capture.txt` (2026-10-04): real `uci` commands → the delta file written + `uci show`/`-X show`, the expected values of the staged-delta and `Editor` tests. Builds the CLI into `.zig-cache/uci-delta` (override with `BASE=`). |
 
 Measured over the 65 probes: **37 SAME · 23 BOTH-REJECT · 2 fail-open ·

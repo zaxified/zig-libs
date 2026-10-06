@@ -125,6 +125,9 @@ pub const anonymousName = edit.anonymousName;
 
 test {
     _ = edit;
+    // External anchor: the real libuci's model of 465 inputs and of this
+    // module's serialization of them (tools/interop.zig), replayed offline.
+    _ = @import("libuci_oracle_test.zig");
 }
 
 // ── errors / diagnostics ────────────────────────────────────────────────────
@@ -187,8 +190,10 @@ pub const SerializeError = error{
     /// back (audit A1 U10), so it cannot be written.
     UnserializableValue,
     /// Audit A1 U7 (write side): a section name or section type uses a
-    /// character real `uci` would refuse to load — see `ParseError.InvalidName`.
-    /// Deliberately NOT enforced on an option *key* here: `writeWord`
+    /// character real `uci` would refuse to load — see `ParseError.InvalidName`
+    /// -- or a section type, section name or option key is EMPTY, which real
+    /// libuci refuses or reads differently (2026-10-06, libuci oracle). The
+    /// key's characters are deliberately NOT enforced here: `writeWord`
     /// already guarantees any key round-trips safely, quoted or not (audit
     /// A1 U14), and a directly-constructed `Package` (bypassing `parse`,
     /// which does enforce this for keys) is allowed to carry one.
@@ -987,11 +992,17 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
     for (pkg.sections, 0..) |*sec, i| {
         // Audit A1 U7 (write side): a section type/name real `uci` could
         // never have parsed must not be written -- see `ParseError.InvalidName`'s
-        // doc comment for why the option key is deliberately NOT checked here
-        // (audit A1 U14 already guarantees it round-trips safely either way).
-        if (!validTypeChars(sec.type)) return error.InvalidName;
+        // doc comment for why the option key's CHARACTERS are deliberately
+        // NOT checked here (audit A1 U14 already guarantees it round-trips
+        // safely either way). An EMPTY type, name or key is refused: real
+        // libuci rejects the whole file on `config ''` / `option '' v`
+        // ("insufficient arguments") and reads `config t ''` as anonymous
+        // (libuci_oracle_test.zig), so writing one produced a config OpenWRT
+        // cannot load. `parse` still accepts the empty words (U18, fail-open
+        // on read).
+        if (sec.type.len == 0 or !validTypeChars(sec.type)) return error.InvalidName;
         if (sec.name) |n| {
-            if (!validNameChars(n)) return error.InvalidName;
+            if (n.len == 0 or !validNameChars(n)) return error.InvalidName;
             if ((try names.getOrPut(gpa, n)).found_existing) return error.DuplicateSection;
         }
         if (i != 0 or pkg.name != null) try out.append(gpa, '\n');
@@ -1007,6 +1018,7 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
                 .single => "option",
                 .list => "list",
             };
+            if (opt.key.len == 0) return error.InvalidName;
             for (opt.values) |v| {
                 if (opt.kind == .single and v.len == 0) return error.UnserializableValue;
                 try out.append(gpa, '\t');
@@ -1832,7 +1844,7 @@ test "serializer refuses every control byte except tab, newline and carriage ret
     }
 }
 
-test "writeWord's empty-word path round-trips an empty type and an empty key" {
+test "an empty type and an empty key parse (U18), but are refused on write" {
     // Regression for audit A1 U18: `writeWord`'s empty-input branch (falls
     // through to `writeValue`, producing `''`) had no test; a mutation that
     // replaced it with "write nothing" passed the whole suite green, even
@@ -1844,13 +1856,14 @@ test "writeWord's empty-word path round-trips an empty type and an empty key" {
     try testing.expectEqualStrings("", pkg.sections[0].type);
     try testing.expectEqualStrings("", pkg.sections[0].options[0].key);
 
-    const text = try serialize(gpa, &pkg);
-    defer gpa.free(text);
-    try testing.expectEqualStrings("config ''\n\toption '' 'v'\n", text);
-
-    var reparsed = try parse(gpa, text);
-    defer reparsed.deinit(gpa);
-    try testing.expect(pkg.eql(&reparsed));
+    // ...but neither is written any more: real libuci refuses the whole file
+    // on `config ''` and on `option '' v` ("insufficient arguments",
+    // libuci_oracle_test.zig), so the text this test used to expect --
+    // "config ''\n\toption '' 'v'\n" -- was a config OpenWRT cannot load.
+    try testing.expectError(error.InvalidName, serialize(gpa, &pkg));
+    var key_only = try parse(gpa, "config t\n\toption '' v\n");
+    defer key_only.deinit(gpa);
+    try testing.expectError(error.InvalidName, serialize(gpa, &key_only));
 }
 
 test "addOption is not quadratic in distinct keys per section" {
