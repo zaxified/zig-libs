@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **Fixed: `BoundedQueue.len` could report a full queue on arm64.** `tail`'s claim CAS and `head`'s store were relaxed, so a reader could see `head` past the `tail` it had just read and `t - h` wrapped (clamped to `capacity`); x86's ordered stores hid it, and the arm64 lane of tag `2026-10-06` caught it in the existing "len under a concurrent push/pop" test. Both now store with release (the `.single` `advance` moves `head` before freeing the slot), so `len` stays exact on weakly ordered CPUs. No API change; on x86 the generated code is the same.
 - **2026-10-06** — Scope mvp → core. **New:** `BoundedQueue(T, capacity, .{ .consumers })` —
   a fixed-capacity, allocation-free MPMC ring (Vyukov's bounded queue, crossbeam's
   `ArrayQueue`): `push`/`pushWith` refuse and count when full (`refusedCount`), `pop`,

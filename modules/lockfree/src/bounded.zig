@@ -133,8 +133,11 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                 const diff: isize = @bitCast(seq -% pos);
                 if (diff == 0) {
                     // Free for `pos`. Claim it; a lost CAS hands back the
-                    // position another producer moved `tail` to.
-                    if (q.tail.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |actual| {
+                    // position another producer moved `tail` to. Release on
+                    // success: a `len` that reads this `tail` also sees the
+                    // `head` that freed the slot (its consumer moved `head`
+                    // before the slot's release store we acquired above).
+                    if (q.tail.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
                         pos = actual;
                         continue;
                     }
@@ -170,7 +173,10 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                 const seq = slot.seq.load(.acquire);
                 const diff: isize = @bitCast(seq -% (pos +% 1));
                 if (diff == 0) {
-                    if (q.head.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |actual| {
+                    // Release on success: pairs with `len`'s load of `head`,
+                    // so a `len` that sees this `head` sees the `tail` its
+                    // producer claimed before publishing (acquired above).
+                    if (q.head.cmpxchgWeak(pos, pos +% 1, .release, .monotonic)) |actual| {
                         pos = actual;
                         continue;
                     }
@@ -210,10 +216,13 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
             const pos = q.head.load(.monotonic);
             const slot = &q.slots[pos & mask];
             std.debug.assert(slot.seq.load(.monotonic) == pos +% 1);
+            // `head` first, with release, for `len`: a reader that sees it
+            // sees the `tail` that published this item, and a producer that
+            // acquires the freed slot below carries it on to its own `tail`.
+            q.head.store(pos +% 1, .release);
             // Release: our reads of the item happen-before the next lap's
             // producer overwrites it.
             slot.seq.store(pos +% capacity, .release);
-            q.head.store(pos +% 1, .monotonic);
         }
 
         fn requireSingle(comptime name: []const u8) void {
@@ -236,6 +245,10 @@ pub fn BoundedQueue(comptime T: type, comptime capacity_: usize, comptime opts: 
                 // `head` never passes `tail` (a consumer claims `pos` only
                 // after its producer published it), so if `tail` did not move
                 // while `head` was read, `t - h` was the length at that read.
+                // That needs the release stores of `tail` and `head` above:
+                // with relaxed ones an arm64 reader saw `head` past the
+                // `tail` it read and `t - h` wrapped (tag 2026-10-06 matrix;
+                // x86's ordered stores hide it).
                 if (q.tail.load(.seq_cst) == t) return @min(t -% h, capacity);
             }
         }
