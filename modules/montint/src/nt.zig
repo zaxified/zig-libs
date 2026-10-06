@@ -5,7 +5,7 @@
 //!
 //! Everything here is constant-time in the VALUES: the work depends on the
 //! comptime limb count `n` only, every data-dependent choice is a masked
-//! blend, and masks derived from secrets go through an asm barrier
+//! blend (the one branch: `divExact`'s refusal of a non-divisor), and masks derived from secrets go through an asm barrier
 //! (`blackBox`, the montint lesson: LLVM turns a recovered `{0, ~0}` mask
 //! back into a jump). The divsteps loop and its helpers are shared with
 //! `DynModint.inverse`.
@@ -70,10 +70,13 @@ pub fn lcm(comptime n: usize, a: *const [n]u64, b: *const [n]u64) [2 * n]u64 {
     return out;
 }
 
-/// `a / b` for `b ≥ 1` that divides `a` exactly (garbage otherwise): the
-/// power of two in `b` shifted out of `a` (masked one-bit shifts), then a
-/// Hensel division by the odd part — `b` may be even, as `p − 1` is.
-pub fn divExact(comptime n: usize, a: *const [n]u64, b: *const [n]u64) [n]u64 {
+/// `a / b` for a `b ≥ 1` that divides `a` exactly: the power of two in `b`
+/// shifted out of `a` (masked one-bit shifts), then a Hensel division by the
+/// odd part — `b` may be even, as `p − 1` is. `error.NotDivisible` if
+/// `b = 0` or `b ∤ a`: the quotient is checked by `q·b = a` over the full
+/// `2n`-limb product, which only an exact quotient meets. Constant-time in
+/// `a` and `b` up to that verdict (the one branch).
+pub fn divExact(comptime n: usize, a: *const [n]u64, b: *const [n]u64) error{NotDivisible}![n]u64 {
     var pb = oddPart(n, b);
     defer std.crypto.secureZero(u64, &pb.u);
     var s = a.*;
@@ -88,6 +91,18 @@ pub fn divExact(comptime n: usize, a: *const [n]u64, b: *const [n]u64) [n]u64 {
     defer std.crypto.secureZero(u64, &inv);
     var q: [n]u64 = undefined;
     mulLow(n, &q, &s, &inv);
+    // q·b = a over all 2n limbs, and b ≠ 0 (0·q = 0 would pass for a = 0).
+    var prod: [2 * n]u64 = undefined;
+    defer std.crypto.secureZero(u64, &prod);
+    @import("limbs.zig").mulSchoolbook(&prod, &q, b);
+    var diff: u64 = 0;
+    for (prod, 0..) |w, i| diff |= w ^ (if (i < n) a[i] else 0);
+    var b_or: u64 = 0;
+    for (b) |w| b_or |= w;
+    if (blackBox(nzBit(diff) | (nzBit(b_or) ^ 1)) != 0) {
+        std.crypto.secureZero(u64, &q);
+        return error.NotDivisible;
+    }
     return q;
 }
 
@@ -379,7 +394,7 @@ test "nt divExact: (c·b)/b for odd and even b of every width" {
             b[0] |= @as(u64, 1) << 4; // b ≠ 0
             var a: [2 * n]u64 = undefined;
             @import("limbs.zig").mulSchoolbook(&a, &c, &b);
-            try testing.expectEqualSlices(u64, &c, &divExact(n, a[0..n], &b));
+            try testing.expectEqualSlices(u64, &c, &(try divExact(n, a[0..n], &b)));
         }
     }
 }
@@ -389,6 +404,44 @@ fn keepLowBits(comptime n: usize, x: *[n]u64, bits: usize) void {
         const lo = 64 * i;
         if (lo >= bits) w.* = 0 else if (bits - lo < 64) w.* &= (@as(u64, 1) << @intCast(bits - lo)) - 1;
     }
+}
+
+test "nt divExact refuses a zero or non-dividing divisor (review L4)" {
+    const z = [_]u64{0} ** 4;
+    var a = z;
+    var b = z;
+    a[0] = 7;
+    b[0] = 2; // even, 2 ∤ 7: the shifted-out low bit was not zero
+    try testing.expectError(error.NotDivisible, divExact(4, &a, &b));
+    b[0] = 3; // odd, 3 ∤ 7: the Hensel quotient's product overflows n limbs
+    try testing.expectError(error.NotDivisible, divExact(4, &a, &b));
+    b[0] = 6; // even AND an odd part that does not divide
+    a[0] = 8;
+    try testing.expectError(error.NotDivisible, divExact(4, &a, &b));
+    // b = 0: nothing divides by it, 0 included (the old code answered 0/0 = 0)
+    try testing.expectError(error.NotDivisible, divExact(4, &a, &z));
+    try testing.expectError(error.NotDivisible, divExact(4, &z, &z));
+    // b | a in the high limbs only: 2^255 / 2^200, 0 / b
+    var hi = z;
+    hi[3] = @as(u64, 1) << 63;
+    var p200 = z;
+    p200[3] = @as(u64, 1) << 8;
+    const q = try divExact(4, &hi, &p200);
+    try testing.expectEqualSlices(u64, &.{ @as(u64, 1) << 55, 0, 0, 0 }, &q);
+    b[0] = 3;
+    try testing.expectEqualSlices(u64, &z, &(try divExact(4, &z, &b)));
+    // b ∤ a by one: (3·c + 1)/3 over a full-width c
+    const c = [_]u64{ 0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210, 0x1111_2222_3333_4444, 0x0555_6666_7777_8888 };
+    var a3 = z;
+    var carry: u64 = 0;
+    for (&a3, c) |*o, ci| {
+        const w = @as(u128, ci) * 3 + carry;
+        o.* = @truncate(w);
+        carry = @intCast(w >> 64);
+    }
+    try testing.expectEqualSlices(u64, &c, &(try divExact(4, &a3, &b)));
+    a3[0] += 1;
+    try testing.expectError(error.NotDivisible, divExact(4, &a3, &b));
 }
 
 test "nt oddPart of a power of two and of 2^(64n) − 1" {

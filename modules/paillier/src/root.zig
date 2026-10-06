@@ -709,7 +709,7 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
 /// Constant-time in `λ` and `r`.
 fn crtExponent(lam: *const MontElem, rv: *const MontElem, r1: *const MontElem, r_bits: usize, out: *[modulus_bytes]u8) !void {
     const L = MontParams.max_limbs;
-    var k = montint.nt.divExact(L, lam, r1);
+    var k = montint.nt.divExact(L, lam, r1) catch return error.InvalidPrimes; // (r−1) ∤ λ: not a prime of this key
     defer std.crypto.secureZero(u64, &k);
     // The prime's length from its byte string (public), not a scan of it.
     const r_mod = MontParams.fromLimbsBits(rv, r_bits) catch return error.InvalidPrimes; // odd, ≥ 3
