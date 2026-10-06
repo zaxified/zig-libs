@@ -29,7 +29,7 @@ const Io = std.Io;
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const fiber = Io.fiber;
+const fiber = @import("fiber.zig");
 const Prng = netsim.Prng;
 
 comptime {

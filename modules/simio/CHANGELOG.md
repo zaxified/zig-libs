@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the aarch64 context switch is a local copy of `std.Io.fiber.contextSwitch` without `ffr` in its clobber list (`src/fiber.zig`). On an SVE CPU LLVM warns that FFR is a reserved register, and the arm64 CI lanes (tag `2026-10-06`) failed on that warning before any simio test ran; reproduced with `-mcpu=neoverse_v1`, gone with the copy. Runtime on arm64 is still unproven (qemu-user cannot run simio at all, std's original switch included).
 - **2026-10-03** — Re-surveyed against turmoil: Scope `poc` → `core` (the `poc`
   dated from the M1 commit and was never revisited after M5); grade 4 → 2. Three
   gaps a user can hit filed under Backlog (lock deadlock reported as step limit,
