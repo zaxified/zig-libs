@@ -114,6 +114,8 @@ pub const ATTR = struct {
 /// blobmsg value types (blobmsg.h enum blobmsg_type). INT8 doubles as BOOL —
 /// ubus stores booleans as INT8 and `ubus -S` prints them as true/false.
 pub const BM = struct {
+    /// No value -- what libubox's JSON parser makes of a JSON `null`.
+    pub const UNSPEC: u32 = 0;
     pub const ARRAY: u32 = 1;
     pub const TABLE: u32 = 2;
     pub const STRING: u32 = 3;
@@ -238,12 +240,11 @@ pub const Value = union(enum) {
     table: []const u8,
     /// Nested blobmsg children (elements carry empty names).
     array: []const u8,
-    /// Unrecognized blobmsg type id. Kept for API stability; `parseField`
-    /// no longer produces it — an id outside `BM.ARRAY..BM.DOUBLE` is now a
-    /// parse error (`error.BadLength`), matching upstream
-    /// `blobmsg_check_attr_len`'s `id > BLOBMSG_TYPE_LAST` rejection
-    /// (audit F8: this module used to decode such ids to JSON `null`, a
-    /// shape its own encoder could not round-trip).
+    /// A value-less field: `BM.UNSPEC` (id 0), which libubox's JSON parser
+    /// makes of a JSON `null` and which therefore decodes back to `null`.
+    /// An id above `BM.DOUBLE` is a parse error (`error.BadLength`),
+    /// matching upstream `blobmsg_check_attr_len`'s `id >
+    /// BLOBMSG_TYPE_LAST` rejection (audit F8).
     unknown: u32,
 };
 
@@ -334,11 +335,14 @@ pub fn parseField(a: Attr) Error!Field {
         },
         BM.TABLE => .{ .table = payload },
         BM.ARRAY => .{ .array = payload },
-        // blobmsg_check_attr_len: `id > BLOBMSG_TYPE_LAST` (8, i.e. BM.DOUBLE)
-        // is rejected — this also covers id 0 (BLOBMSG_TYPE_UNSPEC), which
-        // upstream never produces on the wire either (F8). `Value.unknown`
-        // stays declared for API stability but `parseField` no longer
-        // reaches it.
+        // UNSPEC is what libubox's `blobmsg_add_json_from_string` writes for
+        // a JSON null, and `blobmsg_format_json` prints it as `null`. Audit
+        // F8 refused id 0 too, on the claim that upstream never puts it on
+        // the wire -- running libubox (libubox_oracle_test.zig) shows it
+        // does, so a ubus reply carrying a null was undecodable as a whole.
+        BM.UNSPEC => .{ .unknown = BM.UNSPEC },
+        // blobmsg_check_attr_len: `id > BLOBMSG_TYPE_LAST` (8, i.e.
+        // BM.DOUBLE) is rejected.
         else => return error.BadLength,
     };
     return .{ .type = a.id, .name = name, .value = value };
@@ -417,7 +421,15 @@ fn streamChildren(
                 // JSON, but a string where the wire declared a number) —
                 // audit F1.
                 if (!std.math.isFinite(v)) return error.InvalidValue;
-                try s.write(v);
+                // `Stringify` prints every f64 in decimal: 1e300 came out
+                // as 301 digits with no point, which JSON readers (Python,
+                // jq) then take as an INTEGER. Past the range where decimal
+                // is short, write the shortest round-trip form in
+                // scientific notation, as libubox's "%.17g" does.
+                const mag = @abs(v);
+                if (mag >= 1e16 or (mag != 0 and mag < 1e-5)) {
+                    try s.print("{e}", .{v});
+                } else try s.write(v);
             },
             .unknown => try s.write(null),
         }
@@ -539,8 +551,11 @@ pub fn appendArray(gpa: std.mem.Allocator, out: *std.ArrayList(u8), name: []cons
 /// Encode one JSON value as a named blobmsg field appended to `out`
 /// (recursive for object/array). The type mapping mirrors ubus's own JSON
 /// parser: object→TABLE, array→ARRAY, string→STRING, bool→INT8,
-/// integer→INT32 (INT64 when it overflows i32), float→DOUBLE. JSON null has
-/// no blobmsg mapping → `error.Unsupported`.
+/// integer→INT32 (INT64 when it overflows i32), float→DOUBLE, null→UNSPEC
+/// with no value -- byte for byte what libubox's
+/// `blobmsg_add_json_from_string` builds (`libubox_oracle_test.zig`). Null
+/// used to be refused here as having "no blobmsg mapping", which libubox,
+/// and so `ubus call`, contradict.
 pub fn encodeJson(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -594,7 +609,8 @@ fn encodeJsonDepth(
             }
         },
         .float => |f| try appendDouble(gpa, out, name, f),
-        else => return error.Unsupported, // null / number_string: no blobmsg mapping
+        .null => try appendField(gpa, out, BM.UNSPEC, name, &.{}),
+        else => return error.Unsupported, // number_string: no lossless blobmsg mapping
     }
 }
 
@@ -903,11 +919,18 @@ test "int32/int64 JSON split at the i32 boundary" {
     try testing.expectEqual(@as(i64, -2147483649), (try it.next()).?.value.int64);
 }
 
-test "JSON null and non-object args are Unsupported" {
+test "JSON null is an UNSPEC field and decodes back to null; non-object args are Unsupported" {
     const gpa = testing.allocator;
+    // This test used to expect error.Unsupported for null; libubox builds an
+    // UNSPEC field instead (libubox_oracle_test.zig), and so does this codec.
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"x\":null}", .{});
     defer parsed.deinit();
-    try testing.expectError(error.Unsupported, encodeArgs(gpa, parsed.value));
+    const bytes = try encodeArgs(gpa, parsed.value);
+    defer gpa.free(bytes);
+    try testing.expectEqualSlices(u8, &.{ 0x80, 0x00, 0x00, 0x08, 0x00, 0x01, 'x', 0x00 }, bytes);
+    const back = try decodeToJsonAlloc(gpa, bytes);
+    defer gpa.free(back);
+    try testing.expectEqualStrings("{\"x\":null}", back);
 
     var arr = try std.json.parseFromSlice(std.json.Value, gpa, "[1,2]", .{});
     defer arr.deinit();
@@ -990,11 +1013,15 @@ test "blobmsg header + scalar validation" {
     try appendField(testing.allocator, &buf, 0x33, "u", &.{0xaa});
     var uf = FieldIterator.init(buf.items);
     try testing.expectError(error.BadLength, uf.next());
-    // id 0 (BLOBMSG_TYPE_UNSPEC) is rejected the same way.
+    // id 0 (BLOBMSG_TYPE_UNSPEC) is NOT: this asserted a rejection until
+    // 2026-10-06, but libubox writes UNSPEC for a JSON null and prints it as
+    // null (libubox_oracle_test.zig).
     buf.clearRetainingCapacity();
-    try appendField(testing.allocator, &buf, 0, "u", &.{0xaa});
+    try appendField(testing.allocator, &buf, 0, "u", &.{});
     uf = FieldIterator.init(buf.items);
-    try testing.expectError(error.BadLength, uf.next());
+    const unspec = (try uf.next()).?;
+    try testing.expectEqual(BM.UNSPEC, unspec.type);
+    try testing.expectEqual(Value{ .unknown = BM.UNSPEC }, unspec.value);
 }
 
 test "F3: a blobmsg name must be NUL-terminated at namelen, and truncates at an embedded NUL" {
@@ -1418,9 +1445,11 @@ test "corpus: every JSON seed reaches encodeArgs, and the octets encoded are pin
     try testing.expectEqual(encode_seeds.len, nonempty);
     // Measured 2026-09-07: 0 / 0 / 0 / 0 before — every seed arrived empty and
     // `std.json` rejected it. After: 12 non-empty / 9 parsed / 6 encoded / 196 octets.
+    // 2026-10-06: 7 encoded / 240 octets -- the seed carrying a JSON null now
+    // encodes (to UNSPEC, as libubox does) instead of being refused.
     try testing.expectEqual(@as(usize, 9), parsed_ok);
-    try testing.expectEqual(@as(usize, 6), encoded_ok);
-    try testing.expectEqual(@as(usize, 196), octets);
+    try testing.expectEqual(@as(usize, 7), encoded_ok);
+    try testing.expectEqual(@as(usize, 240), octets);
 }
 
 // ── real-daemon capture (OpenWRT 25.12.4 VM lane) ───────────────────────────

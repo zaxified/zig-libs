@@ -1218,4 +1218,7 @@ test "integration: real ubusd list + invoke system.board (skips when absent)" {
 
 test {
     _ = codec;
+    // External anchor: libubox's own JSON <-> blobmsg codec on the same
+    // values (tools/libubox_oracle.py), replayed without libubox.
+    _ = @import("libubox_oracle_test.zig");
 }

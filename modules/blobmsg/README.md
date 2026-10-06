@@ -15,7 +15,10 @@ elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
   **Concurrency:** reentrant (no globals; one `Client` per thread/loop).
 - **Deps:** none (std only — `std.json` for the JSON↔blobmsg mapping).
 
-Provenance: original work of the zig-libs authors (MIT). The blob/blobmsg TLV
+Provenance: original work of the zig-libs authors (MIT). `src/testdata/libubox_oracle.zig` holds
+the output of OpenWRT libubox's JSON codec run as a black box (`tools/libubox_oracle.py`; libubox
+and json-c are built from their own sources in the droppable `.zig-cache`, none of either is in this
+repository) — observed behaviour, exempt per root `NOTICE` §0. The blob/blobmsg TLV
 codec is an independent Zig implementation of the OpenWRT libubox wire format
 specified in its headers `blob.h`/`blobmsg.h` (ISC); the ubus envelope reuses
 only the ubus protocol constants + the packed msghdr layout from `ubusmsg.h`

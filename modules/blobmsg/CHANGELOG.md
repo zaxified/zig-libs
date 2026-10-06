@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **FIX (behaviour change), the JSON codec now agrees with libubox's own** (found by the
+  new libubox oracle, `tools/libubox_oracle.py` → `src/libubox_oracle_test.zig`):
+  - `encodeArgs`/`encodeJson` encode a JSON `null` as a value-less `BM.UNSPEC` (id 0) field, as
+    `blobmsg_add_json_from_string` (and so `ubus call`) does; it used to return `error.Unsupported`.
+  - `parseField`/`decodeToJson` read an UNSPEC field as `Value.unknown` → JSON `null`; audit F8 had made
+    id 0 a `BadLength` on the claim that upstream never sends it, so a ubus reply carrying a null was
+    undecodable as a whole.
+  - `decodeToJson` writes a DOUBLE of magnitude ≥ 1e16 or < 1e-5 in scientific notation: `std.json`
+    printed 1e300 as 301 digits with no point, which JSON readers (Python, jq) take as an integer.
+  `BM.UNSPEC` is new. Every other case of the 15 already matched libubox byte for byte.
+
 - **2026-09-10** — **A1 fix campaign: 9 of 11 audit findings closed** (0 in-repo
   consumers, P1 — input hardening was free to tighten). `codec.zig`: a name/STRING
   must be NUL-terminated where declared and truncates at an embedded NUL instead of
