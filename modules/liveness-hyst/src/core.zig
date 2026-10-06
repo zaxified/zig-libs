@@ -108,6 +108,15 @@ pub fn decide(est: *const root.Estimator, now: root.Time) root.Verdict {
     const cost: f64 = if (is_timeout) 1.0 else 0.0;
     const metric = prev.metric + alpha * (cost - prev.metric);
 
+    // ── smoothed RTT for `pathCost()` (same input filter) ───────────────────
+    //
+    // Not used by the state decision below. A timeout feeds `rtt_max` and a
+    // reply is clamped there, so the average is pointwise monotone in the
+    // probe stream (see cost.zig's module doc); the first probe seeds it.
+    const rtt_cap: f64 = @floatFromInt(cfg.path_cost.rtt_max);
+    const rtt_sample: f64 = if (newest.rtt) |r| @min(@as(f64, @floatFromInt(r)), rtt_cap) else rtt_cap;
+    const srtt = if (est.probes_total <= 1) rtt_sample else prev.srtt + alpha * (rtt_sample - prev.srtt);
+
     // Thresholds derived from the smoothing weight so retuning
     // `metric_smoothing` keeps them consistent:
     //   - down: the level two consecutive timeouts reach from a clean metric
@@ -202,6 +211,7 @@ pub fn decide(est: *const root.Estimator, now: root.Time) root.Verdict {
     return .{
         .state = state,
         .metric = metric,
+        .srtt = srtt,
         .since = if (state != prev.state) now else prev.since,
     };
 }

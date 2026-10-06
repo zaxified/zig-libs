@@ -17,11 +17,26 @@
 //! metric, with asymmetric thresholds/damping) — is `core.decide` (`src/core.zig`), which
 //! also documents the adjudicated monotonicity contract: order paths by `pathCost()`
 //! (monotone), treat `state()` as the damped transition-timing signal.
+//!
+//! `pathCost()` combines the smoothed loss with the smoothed RTT (and, opt-in,
+//! jitter) per `Config.path_cost`; `Selector` picks among several paths with
+//! margin + hold hysteresis. Both live in `cost.zig`.
 
 const std = @import("std");
 const netsim = @import("netsim");
 const latency_stats = @import("latency-stats");
 const core = @import("core.zig");
+const cost = @import("cost.zig");
+
+pub const PathCostConfig = cost.PathCostConfig;
+pub const CostInputs = cost.CostInputs;
+pub const CostFn = cost.CostFn;
+pub const defaultCost = cost.defaultCost;
+pub const lossOnlyCost = cost.lossOnlyCost;
+pub const rttPenalty = cost.rttPenalty;
+pub const jitterPenalty = cost.jitterPenalty;
+pub const Selector = cost.Selector;
+pub const SelectorConfig = cost.SelectorConfig;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -100,15 +115,24 @@ pub const Config = struct {
     /// failed — the boundary the flap-damping logic must respect so a
     /// merely-lossy-but-usable link is not flushed to `.down`.
     degraded_loss_threshold: f64 = 0.30,
+
+    /// How `Estimator.pathCost()` combines smoothed loss, RTT and jitter —
+    /// see `PathCostConfig` and `cost.zig`'s module doc. Does not affect
+    /// `state()` or `metric()`.
+    path_cost: PathCostConfig = .{},
 };
 
 /// A liveness verdict at a point in time.
 pub const Verdict = struct {
     state: LinkState = .up,
     /// Smoothed link metric (Babel-style input-filter output): an EWMA of
-    /// per-probe loss cost in [0, 1], lower is better. Doubles as the monotone
-    /// failover-ordering key — see `Estimator.pathCost`.
+    /// per-probe loss cost in [0, 1], lower is better. The loss input of
+    /// `Estimator.pathCost`.
     metric: f64 = 0,
+    /// Smoothed RTT (same EWMA weight as `metric`): replies clamped at
+    /// `Config.path_cost.rtt_max`, timeouts counted as `rtt_max`, seeded by
+    /// the first probe. 0 before any probe. The RTT input of `pathCost`.
+    srtt: f64 = 0,
     /// Caller-clock time of the most recent state transition (dwell-time /
     /// anti-flap accounting, if a caller wants it).
     since: Time = 0,
@@ -180,7 +204,7 @@ pub const Estimator = struct {
     }
 
     /// The current smoothed link metric (EWMA loss cost in [0, 1]; lower is
-    /// better — see `core.decide`).
+    /// better — see `core.decide`). Loss only; order paths by `pathCost()`.
     pub fn metric(self: *const Estimator) f64 {
         return self.verdict.metric;
     }
@@ -196,8 +220,33 @@ pub const Estimator = struct {
     /// inside {`.suspect`, `.down`} (anti-flap damping — see `core.decide`'s
     /// adjudicated contract), which is exactly why forwarding preference must
     /// key off this cost instead.
+    ///
+    /// The value is `Config.path_cost.cost_fn` (default `defaultCost`) applied
+    /// to `costInputs()`: ETX − 1 of the smoothed loss plus a Babel-style
+    /// (RFC 9616) RTT penalty, in nominal link costs — 0 for a clean path at
+    /// or under `rtt_min`. The monotone contract holds for the default and for
+    /// any `cost_fn` non-decreasing in loss and RTT with `jitter_weight = 0`.
+    /// To pick among paths without flapping use `Selector`, which adds the
+    /// margin + hold hysteresis this value deliberately does not carry.
     pub fn pathCost(self: *const Estimator) f64 {
-        return self.verdict.metric;
+        const pc = self.cfg.path_cost;
+        const f = pc.cost_fn orelse &defaultCost;
+        return f(self.costInputs(), pc);
+    }
+
+    /// The smoothed inputs `pathCost()` is computed from.
+    pub fn costInputs(self: *const Estimator) CostInputs {
+        return .{
+            .loss = self.verdict.metric,
+            .srtt = self.verdict.srtt,
+            .jitter = self.stats.snapshot().jitter_ns,
+            .state = self.verdict.state,
+        };
+    }
+
+    /// Smoothed RTT in ticks — see `Verdict.srtt`.
+    pub fn smoothedRtt(self: *const Estimator) f64 {
+        return self.verdict.srtt;
     }
 
     /// Snapshot of the cumulative RTT/jitter/loss statistics.
@@ -263,6 +312,7 @@ test "recentProbes: returns the most recent probes, oldest-first, across a wrapa
 test {
     std.testing.refAllDecls(@This());
     _ = @import("core.zig");
+    _ = @import("cost.zig");
     _ = @import("trace.zig");
     _ = @import("scoring.zig");
     _ = @import("property.zig");
