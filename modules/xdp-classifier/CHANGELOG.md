@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED, **BEHAVIOURAL, not breaking:** VLAN tag skip and IPv6 classification; scope mvp -> core.
+  `ClassifierOptions`/`CpumapSteerOptions` gain `vlan_depth: VlanDepth = .double` (skip 0..2
+  802.1Q `0x8100` / 802.1ad `0x88A8` tags, either TPID at either depth) and `lpm6_map_fd: ?fd_t =
+  null` (IPv6 on the fixed 40-byte header's source/destination address; no extension-header walk,
+  none needed for an address key). New IPv6 API beside the untouched IPv4 one: `Ipv6Prefix`,
+  `ClassifierRule6`, `RuleSet6` (`validate`/`validateSorted`), `LpmKey6` (20-byte key),
+  `lookupReference6`, `createLpm6TrieMap`, `populateRule6`/`populateRuleSet6`, `lpm6_key_size`,
+  `VlanDepth` (`fromInt`). Behavioural: the default `vlan_depth` of 2 means a program built
+  with unchanged options now classifies 802.1Q/QinQ-tagged frames that used to get the default
+  class (F9); `.vlan_depth = .none` without an IPv6 map emits the previous program byte for byte.
+  No map migration: the IPv4 map and its 8-byte key are unchanged, IPv6 is a separate map.
+  Anchored on the real kernel (CAP_BPF-gated `src/kernel_test.zig`): every variant verified (also
+  `BPF_F_STRICT_ALIGNMENT`) and executed via `BPF_PROG_TEST_RUN` on 17 real frames truncated at
+  every length, matching hand-written classes; two weakened programs refused by the verifier. The
+  offline interpreter (`vm.zig`) now enforces bounds-check dominance and runs the same frames
+  plus a 108k-frame sweep and the fuzz harness.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 F1's fix now has a kernel-measured anchor.
   New root-gated test hands a real `PERCPU_ARRAY` lookup a 64 KiB canary buffer and requires the
   bytes the kernel actually wrote to equal `scratchTransferLen()`. The existing unprivileged test

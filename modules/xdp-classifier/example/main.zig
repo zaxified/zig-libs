@@ -66,6 +66,20 @@ pub fn main() !void {
     if (std.mem.readInt(u32, key[0..4], @import("builtin").cpu.arch.endian()) != 32) return error.WrongPrefixLen;
     if (!std.mem.eql(u8, key[4..8], &.{ 10, 1, 2, 3 })) return error.WrongKeyAddr;
 
+    // IPv6: a separate table for a separate 20-byte-key LPM map.
+    const doc_net: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // 2001:db8::
+    const rules6 = [_]xdp.ClassifierRule6{
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 6 },
+    };
+    const rule_set6: xdp.RuleSet6 = .{ .rules = &rules6 };
+    try rule_set6.validate(64);
+    var host6 = doc_net;
+    host6[15] = 1; // 2001:db8::1
+    if (xdp.lookupReference6(&rules6, host6, 0) != 6) return error.WrongLookup;
+    const key6 = xdp.LpmKey6.exact(host6).toBytes();
+    if (key6.len != xdp.lpm6_key_size) return error.WrongKeyLength;
+    std.debug.print("RuleSet6.validate + lookupReference6: 2001:db8::1 -> class 6, 20-byte key\n", .{});
+
     // ── 2. pure: build the classifier + steer programs (data, not a load) ──
 
     const insns = xdp.buildClassifierProgram(.{ .lpm_map_fd = 10, .scratch_map_fd = 11, .default_class = 0 });
@@ -77,6 +91,16 @@ pub fn main() !void {
     }
     if (lpm_lookups != 2) return error.WrongLookupCallCount; // LPM lookup + scratch-map lookup
     std.debug.print("buildClassifierProgram: {d} instructions, ends in exit, 2 map lookups\n", .{insns.len});
+
+    // With an IPv6 map: a third lookup (the IPv6 trie). VLAN depth stays at
+    // its default of 2 (802.1Q / QinQ tags skipped).
+    const insns6 = xdp.buildClassifierProgram(.{ .lpm_map_fd = 10, .scratch_map_fd = 11, .lpm6_map_fd = 12, .vlan_depth = .double });
+    var lookups6: usize = 0;
+    for (insns6) |ins| {
+        if (ins.code == 0x85 and ins.imm == @intFromEnum(linux.BPF.Helper.map_lookup_elem)) lookups6 += 1;
+    }
+    if (lookups6 != 3) return error.WrongLookupCallCount;
+    std.debug.print("buildClassifierProgram(IPv6 + 2 VLAN tags): {d} instructions, 3 map lookups\n", .{insns6.len});
 
     const steer_insns = try xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 4, .cpumap_max_entries = 4 });
     if (steer_insns.len == 0) return error.EmptyProgram;
@@ -120,14 +144,18 @@ pub fn main() !void {
         try xdp.populateRule(lpm_fd, throwaway_rule);
         try xdp.populateRuleSet(lpm_fd, rule_set);
 
-        const real_insns = xdp.buildClassifierProgram(.{ .lpm_map_fd = lpm_fd, .scratch_map_fd = scratch_fd });
+        const lpm6_fd = try xdp.createLpm6TrieMap(16);
+        defer _ = linux.close(lpm6_fd);
+        try xdp.populateRuleSet6(lpm6_fd, rule_set6);
+
+        const real_insns = xdp.buildClassifierProgram(.{ .lpm_map_fd = lpm_fd, .scratch_map_fd = scratch_fd, .lpm6_map_fd = lpm6_fd });
         const prog = ebpf.Program{ .prog_type = .xdp, .insns = real_insns };
         const prog_fd = try ebpf.load(prog, "MIT");
         defer _ = linux.close(prog_fd);
 
         std.debug.print(
-            "CAP_BPF IS available: real maps created, {d} rules populated, program LOADED and ACCEPTED by the in-kernel verifier\n",
-            .{rules.len},
+            "CAP_BPF IS available: real maps created, {d}+{d} IPv4/IPv6 rules populated, program LOADED and ACCEPTED by the in-kernel verifier\n",
+            .{ rules.len, rules6.len },
         );
     } else |err| switch (err) {
         error.PermissionDenied => std.debug.print(

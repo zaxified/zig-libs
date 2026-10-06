@@ -2,9 +2,10 @@
 //! Classifier program builder — composes `ebpf`'s already-verifier-proven
 //! primitives (bounds-check dominance for direct packet access, the
 //! `ld_map_fd`/`ARG_PTR_TO_MAP_KEY`/null-check-before-deref map-lookup
-//! discipline) into a NEW fixed program: parse Ethernet+IPv4, extract a
-//! source or destination /32 lookup key, resolve it against a
-//! `BPF_MAP_TYPE_LPM_TRIE` ruleset map, and stash the resulting class
+//! discipline) into a NEW fixed program: parse Ethernet (skipping up to two
+//! VLAN tags) + IPv4 or IPv6, extract a source or destination /32 or /128
+//! lookup key, resolve it against a `BPF_MAP_TYPE_LPM_TRIE` ruleset map
+//! (one per address family), and stash the resulting class
 //! handle into a scratch map before returning `XDP_PASS`.
 //!
 //! **No Fable-tier core here — see `../README.md`'s "Tier verdict" section
@@ -40,6 +41,42 @@ pub const KeyField = enum {
             .dst => 30,
         };
     }
+
+    /// Same, for the fixed 40-byte IPv6 header (RFC 8200 §3): source address
+    /// at header-offset 8, destination at 24, plus the 14-byte Ethernet header.
+    fn offset6(self: KeyField) i16 {
+        return switch (self) {
+            .src => 22,
+            .dst => 38,
+        };
+    }
+};
+
+/// How many 802.1Q / 802.1ad VLAN tags the generated program skips before it
+/// reads the EtherType it classifies on: 0, 1 or 2 (QinQ). Each tag is a fixed
+/// 4-byte header (TPID + TCI) inserted before the EtherType; either TPID
+/// (`0x8100` 802.1Q, `0x88A8` 802.1ad) is accepted at either depth, as Linux's
+/// own flow dissector does. A frame with MORE tags than this falls to the
+/// default class (its EtherType after `vlan_depth` tags is still a TPID).
+/// An enum, not an integer, so an out-of-range depth is unrepresentable;
+/// `fromInt` converts a configured number.
+pub const VlanDepth = enum(u2) {
+    none = 0,
+    single = 1,
+    double = 2,
+
+    pub fn fromInt(n: u32) ?VlanDepth {
+        return switch (n) {
+            0 => .none,
+            1 => .single,
+            2 => .double,
+            else => null,
+        };
+    }
+
+    pub fn tags(self: VlanDepth) u2 {
+        return @intFromEnum(self);
+    }
 };
 
 /// Fixed contract for `buildClassifierProgram` — a struct, not positional
@@ -65,6 +102,18 @@ pub const ClassifierOptions = struct {
     /// `../README.md` "Scope") OR finds no LPM match. Callers conventionally
     /// reserve 0 for "unclassified / best-effort".
     default_class: u32 = 0,
+    /// VLAN tags skipped before the EtherType check — see `VlanDepth`.
+    /// `.none` emits exactly the pre-2026-10-06 program (byte-identical, see
+    /// the golden test).
+    vlan_depth: VlanDepth = .double,
+    /// The IPv6 `BPF_MAP_TYPE_LPM_TRIE` (see `maps.createLpm6TrieMap`; key =
+    /// `rules.LpmKey6`, 20 bytes; value = a `u32` class handle). `null` (the
+    /// default) emits no IPv6 path: EtherType `0x86DD` then falls to
+    /// `default_class` exactly as before. With a map, an IPv6 packet is
+    /// classified on its source (or destination, per `key_field`) address,
+    /// read from the fixed 40-byte header — see `buildClassifierProgram`
+    /// point 8.
+    lpm6_map_fd: ?linux.fd_t = null,
 };
 
 const XDP_PASS: i32 = 2;
@@ -76,6 +125,158 @@ const XDP_PASS: i32 = 2;
 /// known at compile time), so this is a single fixed instruction immediate,
 /// not a per-call computation.
 const ethertype_ipv4_native: u16 = std.mem.bigToNative(u16, 0x0800);
+/// IPv6 / 802.1Q / 802.1ad EtherTypes (TPIDs), same plain-load convention.
+const ethertype_ipv6_native: u16 = std.mem.bigToNative(u16, 0x86DD);
+const ethertype_8021q_native: u16 = std.mem.bigToNative(u16, 0x8100);
+const ethertype_8021ad_native: u16 = std.mem.bigToNative(u16, 0x88A8);
+
+/// Smallest frame any path classifies: untagged Ethernet (14) + fixed IPv4
+/// (20). Every tag level re-checks this many bytes past the advanced cursor.
+const min_l2_l4v4: i32 = 34;
+/// Ethernet (14) + fixed IPv6 header (40).
+const min_l2_v6: i32 = 54;
+
+/// Shared by both builders: everything up to and including the LPM lookup.
+const ParseSpec = struct {
+    key_field: KeyField,
+    vlan_depth: VlanDepth,
+    lpm_map_fd: linux.fd_t,
+    lpm6_map_fd: ?linux.fd_t,
+};
+
+/// Jumps `emitParseAndLookup` leaves for its caller to point at the "not
+/// classified" block. At most 9: 1 bounds + 1 bounds per tag level (2) +
+/// 1 EtherType + 1 IHL + 1 LPM miss + 3 IPv6 (bounds, version, LPM miss).
+const MissJumps = struct {
+    idx: [16]usize = undefined,
+    tmpl: [16]Insn = undefined,
+    n: usize = 0,
+
+    fn add(self: *MissJumps, idx: usize, tmpl: Insn) void {
+        self.idx[self.n] = idx;
+        self.tmpl[self.n] = tmpl;
+        self.n += 1;
+    }
+
+    fn patchAll(self: *const MissJumps, b: *Buf, target: usize) void {
+        for (self.idx[0..self.n], self.tmpl[0..self.n]) |i, t| b.patchJumpTo(i, t, target);
+    }
+};
+
+/// Emit the packet parse and the LPM lookup. On fall-through out of the
+/// emitted code, `r0` is the non-null LPM value pointer (a hit); every other
+/// outcome is one of the returned miss jumps. Register use: `r1` packet cursor
+/// (advanced 4 per skipped VLAN tag), `r2` data_end, `r3` bounds scratch, `r4`
+/// EtherType/IHL/version, `r5` byte copy; `r6`+ untouched.
+///
+/// Layout (V = the IPv6 block, present only with `lpm6_map_fd`):
+///
+///     r2 = data_end; r1 = data
+///     if r1 + 34 > r2            -> MISS
+///     r4 = eth[12..14]
+///     repeat vlan_depth times:
+///         if r4 == 0x8100 -> TAG          (jumps over the next line)
+///         if r4 != 0x88A8 -> DISPATCH
+///       TAG: r1 += 4
+///         if r1 + 34 > r2        -> MISS
+///         r4 = r1[12..14]
+///     DISPATCH:
+///     [V] if r4 == 0x86DD -> V6
+///     if r4 != 0x0800            -> MISS
+///     IHL == 5, copy 4 bytes, prefixlen 32, lookup lpm  (pre-2026-10-06 code)
+///     if r0 == 0                 -> MISS
+///     [V] goto HIT
+///     [V] V6: if r1 + 54 > r2 -> MISS; version == 6; copy 16 bytes;
+///     [V]     prefixlen 128; lookup lpm6; if r0 == 0 -> MISS
+///     HIT: (caller)
+///
+/// Every jump is FORWARD, every tag level advances the cursor by a constant
+/// and re-establishes bounds-check dominance relative to it before the next
+/// read — the same "ADD a constant to the packet pointer, compare against
+/// data_end, read below it" shape as the untagged path, which is why each
+/// downstream offset (12, 14, 26/30, 22/38) is the same constant whatever the
+/// tag count. With `.none` and no IPv6 map, the emitted code is byte-identical
+/// to the pre-VLAN/IPv6 program.
+fn emitParseAndLookup(b: *Buf, p: ParseSpec) MissJumps {
+    const R = Insn.Reg;
+    var miss: MissJumps = .{};
+
+    b.emit(Insn.ldx(.word, R.r2, R.r1, 4)); // r2 = data_end
+    b.emit(Insn.ldx(.word, R.r1, R.r1, 0)); // r1 = data
+    b.emit(Insn.mov(R.r3, R.r1));
+    b.emit(Insn.add(R.r3, min_l2_l4v4));
+    miss.add(b.reserve(), Insn.jgt(R.r3, R.r2, 0));
+    b.emit(Insn.ldx(.half_word, R.r4, R.r1, 12));
+
+    var to_dispatch: [2]usize = undefined;
+    var level: usize = 0;
+    while (level < p.vlan_depth.tags()) : (level += 1) {
+        b.emit(Insn.jeq(R.r4, @as(i32, ethertype_8021q_native), 1)); // -> TAG (skip next)
+        to_dispatch[level] = b.reserve(); // jne r4, 0x88A8 -> DISPATCH
+        // TAG: advance past the 4-byte tag, re-prove 34 bytes past the cursor.
+        b.emit(Insn.add(R.r1, 4));
+        b.emit(Insn.mov(R.r3, R.r1));
+        b.emit(Insn.add(R.r3, min_l2_l4v4));
+        miss.add(b.reserve(), Insn.jgt(R.r3, R.r2, 0));
+        b.emit(Insn.ldx(.half_word, R.r4, R.r1, 12));
+    }
+    const dispatch_idx = b.len();
+    for (to_dispatch[0..p.vlan_depth.tags()]) |j| {
+        b.patchJumpTo(j, Insn.jne(R.r4, @as(i32, ethertype_8021ad_native), 0), dispatch_idx);
+    }
+
+    const to_v6: ?usize = if (p.lpm6_map_fd != null) b.reserve() else null; // jeq r4, 0x86DD -> V6
+    miss.add(b.reserve(), Insn.jne(R.r4, @as(i32, ethertype_ipv4_native), 0));
+
+    // IPv4 (unchanged from the original program).
+    b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
+    b.emit(Insn.alu_and(R.r4, 0x0f));
+    miss.add(b.reserve(), Insn.jne(R.r4, @as(i32, 5), 0));
+    const key_off = p.key_field.offset();
+    var k: i16 = 0;
+    while (k < 4) : (k += 1) {
+        b.emit(Insn.ldx(.byte, R.r5, R.r1, key_off + k));
+        b.emit(Insn.stx(.byte, R.r10, -4 + k, R.r5));
+    }
+    b.emit(Insn.st(.word, R.r10, -8, 32));
+    b.emit(Insn.mov(R.r2, R.r10));
+    b.emit(Insn.add(R.r2, -8));
+    b.emit(Insn.ld_map_fd1(R.r1, p.lpm_map_fd));
+    b.emit(Insn.ld_map_fd2(p.lpm_map_fd));
+    b.emit(Insn.call(.map_lookup_elem));
+    miss.add(b.reserve(), Insn.jeq(R.r0, 0, 0));
+
+    if (p.lpm6_map_fd) |fd6| {
+        const v4_hit = b.reserve(); // ja -> HIT
+        b.patchJumpTo(to_v6.?, Insn.jeq(R.r4, @as(i32, ethertype_ipv6_native), 0), b.len());
+
+        // V6: one dominating check for Ethernet + the fixed 40-byte header.
+        b.emit(Insn.mov(R.r3, R.r1));
+        b.emit(Insn.add(R.r3, min_l2_v6));
+        miss.add(b.reserve(), Insn.jgt(R.r3, R.r2, 0));
+        // Version nibble must be 6 (fail closed on a mislabelled frame).
+        b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
+        b.emit(Insn.alu_and(R.r4, 0xf0));
+        miss.add(b.reserve(), Insn.jne(R.r4, @as(i32, 0x60), 0));
+        // 16 address bytes -> [r10-16, r10), byte-wise (alignment-safe), then
+        // prefixlen 128 at [r10-20, r10-16): the 20-byte rules.LpmKey6 layout.
+        const off6 = p.key_field.offset6();
+        var j: i16 = 0;
+        while (j < 16) : (j += 1) {
+            b.emit(Insn.ldx(.byte, R.r5, R.r1, off6 + j));
+            b.emit(Insn.stx(.byte, R.r10, -16 + j, R.r5));
+        }
+        b.emit(Insn.st(.word, R.r10, -20, 128));
+        b.emit(Insn.mov(R.r2, R.r10));
+        b.emit(Insn.add(R.r2, -20));
+        b.emit(Insn.ld_map_fd1(R.r1, fd6));
+        b.emit(Insn.ld_map_fd2(fd6));
+        b.emit(Insn.call(.map_lookup_elem));
+        miss.add(b.reserve(), Insn.jeq(R.r0, 0, 0));
+        b.patchJumpTo(v4_hit, Insn.ja(0), b.len());
+    }
+    return miss;
+}
 
 /// Build the `xdp-classifier` program described in `../README.md`.
 ///
@@ -106,13 +307,11 @@ const ethertype_ipv4_native: u16 = std.mem.bigToNative(u16, 0x0800);
 ///     equivalent C bounds check to the identical instruction shape (mov +
 ///     add-immediate-34 + jgt against the SAME two registers) — see the
 ///     golden test below.
-///  3. **IPv4 options are out of scope for v1** (see `../README.md`
+///  3. **IPv4 options are out of scope** (see `../README.md`
 ///     "Scope"): this program checks the IHL nibble equals 5 (a plain
 ///     20-byte header, the overwhelming majority of real traffic) and falls
 ///     to `opts.default_class` otherwise, rather than computing a
-///     variable-length header offset. IPv6 is likewise out of scope — both
-///     are documented, ADDITIVE extensions (a new bounds-check-and-parse
-///     block following this same pattern), not a redesign of what's here.
+///     variable-length header offset (a documented, ADDITIVE extension).
 ///  4. **LPM key construction** copies `opts.key_field`'s 4 address bytes
 ///     byte-wise into the stack (identical technique to `ebpf.xdpFilter`'s
 ///     key copy — alignment-safe, dominated by the same bounds check) and
@@ -150,10 +349,35 @@ const ethertype_ipv4_native: u16 = std.mem.bigToNative(u16, 0x0800);
 ///     in a LibreQoS-style deployment). A DROP-on-no-match variant would be
 ///     a one-instruction change (the DEFAULT block's `mov r0, ...`) but is
 ///     deliberately not what this fixed contract commits to.
+///  8. **VLAN tags (`opts.vlan_depth`, default 2).** Up to that many 4-byte
+///     802.1Q (`0x8100`) or 802.1ad (`0x88A8`) tags are skipped by ADDING 4
+///     to the packet cursor `r1` and re-running the same `mov`/`add 34`/`jgt
+///     data_end` check against the advanced cursor before the next EtherType
+///     read — so every downstream read keeps its fixed constant offset and is
+///     dominated by a check, exactly as on the untagged path (layout in
+///     `emitParseAndLookup`). A frame with more tags than `vlan_depth` is not
+///     classified. The TCI (PCP/DEI/VID) is not inspected: classification is
+///     by address, whatever the VLAN.
+///  9. **IPv6 (`opts.lpm6_map_fd`).** EtherType `0x86DD` (after any skipped
+///     tags) takes a second block: one dominating check for Ethernet + the
+///     fixed 40-byte IPv6 header (54 bytes past the cursor), a version-nibble
+///     check (`== 6`, else default), the 16 source (header offset 8) or
+///     destination (24) address bytes copied byte-wise to `[r10-16, r10)`,
+///     prefixlen 128 at `[r10-20, r10-16)` (`rules.LpmKey6`), and a lookup in
+///     the IPv6 trie; a hit shares the IPv4 path's class load. **No extension
+///     headers are walked, and none need to be:** both addresses live in the
+///     fixed header, which always comes first (RFC 8200 §3–4), so the key is
+///     at a constant offset whatever `Next Header` chain follows. The
+///     consequence to know: with a Routing header the fixed-header
+///     destination is the CURRENT segment's, not the final one — the address
+///     the packet is being forwarded to on this hop, which is what a shaper
+///     on that hop sees.
 ///
-/// Design note on the shared DEFAULT class: a too-short packet, a non-IPv4
-/// EtherType, an IPv4-with-options packet, and an LPM miss are all
-/// deliberately indistinguishable at the output (all four write
+/// Design note on the shared DEFAULT class: a too-short packet, an
+/// unrecognised EtherType (including IPv6 without an IPv6 map, or more VLAN
+/// tags than `vlan_depth`), an IPv4-with-options packet, an IPv6 packet whose
+/// version nibble is not 6, and an LPM miss are all
+/// deliberately indistinguishable at the output (all of them write
 /// `opts.default_class`) — a caller needing to tell them apart needs a
 /// different, richer output shape (e.g. distinct class values per failure
 /// reason, or a ring-buffer trace via `ebpf.ringbufEmit`); collapsing them
@@ -163,60 +387,24 @@ const ethertype_ipv4_native: u16 = std.mem.bigToNative(u16, 0x0800);
 /// classified).
 pub fn buildClassifierProgram(opts: ClassifierOptions) []const Insn {
     const R = Insn.Reg;
-    const key_off = opts.key_field.offset();
 
     var b: Buf = .{ .buf = &prog_buf };
 
-    // (1) ctx->data_end then ctx->data — data_end MUST be read first, the
-    //     second load clobbers r1 (ctx). The verifier retypes these exact
-    //     ctx offsets to PTR_TO_PACKET_END / PTR_TO_PACKET (see
-    //     ebpf.xdpFilter's doc comment point 1).
-    b.emit(Insn.ldx(.word, R.r2, R.r1, 4)); // r2 = data_end
-    b.emit(Insn.ldx(.word, R.r1, R.r1, 0)); // r1 = data
-
-    // (2) Single dominating bounds check: [data, data+34) covers Ethernet
-    //     (14) + fixed IPv4 (20). Every packet read below is at an offset
-    //     < 34 and therefore proven safe by this ONE check (see doc comment
-    //     point 2).
-    b.emit(Insn.mov(R.r3, R.r1));
-    b.emit(Insn.add(R.r3, 34));
-    const bounds_jmp = b.reserve(); // jgt r3, r2 -> DEFAULT
-
-    // (3) EtherType must be IPv4 (see doc comment point 1 for the constant).
-    b.emit(Insn.ldx(.half_word, R.r4, R.r1, 12));
-    const ethertype_jmp = b.reserve(); // jne r4, ethertype_ipv4_native -> DEFAULT
-
-    // (4) IHL must be 5 (no options) — see doc comment point 3.
-    b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
-    b.emit(Insn.alu_and(R.r4, 0x0f));
-    const ihl_jmp = b.reserve(); // jne r4, 5 -> DEFAULT
-
-    // (5) Copy the 4 key-field address bytes into [r10-4, r10) — byte-wise,
-    //     same alignment-safe technique as ebpf.xdpFilter's key copy, each
-    //     read dominated by the single check above.
-    var k: i16 = 0;
-    while (k < 4) : (k += 1) {
-        b.emit(Insn.ldx(.byte, R.r5, R.r1, key_off + k));
-        b.emit(Insn.stx(.byte, R.r10, -4 + k, R.r5));
-    }
-    // Prefixlen = 32 (exact key width — see doc comment point 4). Native-
-    // endian word store, matching rules.LpmKey.toBytes's encoding exactly;
-    // both paths must agree, see rules.zig's module doc.
-    b.emit(Insn.st(.word, R.r10, -8, 32));
-
-    // (6) LPM lookup: r2 = &key (r10-8, 8 bytes: prefixlen+addr), r1 = map
-    //     via pseudo-fd. Same discipline as ebpf.kprobeCounter/xdpFilter.
-    b.emit(Insn.mov(R.r2, R.r10));
-    b.emit(Insn.add(R.r2, -8));
-    b.emit(Insn.ld_map_fd1(R.r1, opts.lpm_map_fd));
-    b.emit(Insn.ld_map_fd2(opts.lpm_map_fd));
-    b.emit(Insn.call(.map_lookup_elem));
-    const lpm_miss_jmp = b.reserve(); // jeq r0, 0 -> DEFAULT
+    // (1)-(6), plus the VLAN skip and the IPv6 block (points 8-9): parse,
+    // build the LPM key, look it up. Falls through on a hit with r0 = the
+    // non-null value pointer; every other outcome is a miss jump to DEFAULT.
+    const miss = emitParseAndLookup(&b, .{
+        .key_field = opts.key_field,
+        .vlan_depth = opts.vlan_depth,
+        .lpm_map_fd = opts.lpm_map_fd,
+        .lpm6_map_fd = opts.lpm6_map_fd,
+    });
 
     // (7) Matched: r6 (callee-saved, see doc comment point 6) = *(u32*)(r0).
     //     r0 has verifier-tracked size == the map's value_size (4), so this
     //     load needs no further bounds check (same reasoning as
-    //     ebpf.kprobeCounter's post-null-check deref).
+    //     ebpf.kprobeCounter's post-null-check deref). Both maps (IPv4 and
+    //     IPv6) have a 4-byte value, so the one load serves both.
     b.emit(Insn.ldx(.word, R.r6, R.r0, 0));
     const skip_default_jmp = b.reserve(); // ja -> TAIL
 
@@ -246,10 +434,7 @@ pub fn buildClassifierProgram(opts: ClassifierOptions) []const Insn {
     b.emit(Insn.mov(R.r0, XDP_PASS));
     b.emit(Insn.exit());
 
-    b.patchJumpTo(bounds_jmp, Insn.jgt(R.r3, R.r2, 0), default_idx);
-    b.patchJumpTo(ethertype_jmp, Insn.jne(R.r4, @as(i32, ethertype_ipv4_native), 0), default_idx);
-    b.patchJumpTo(ihl_jmp, Insn.jne(R.r4, @as(i32, 5), 0), default_idx);
-    b.patchJumpTo(lpm_miss_jmp, Insn.jeq(R.r0, 0, 0), default_idx);
+    miss.patchAll(&b, default_idx);
     b.patchJumpTo(skip_default_jmp, Insn.ja(0), tail_idx);
     b.patchJumpTo(scratch_miss_jmp, Insn.jeq(R.r0, 0, 0), skip_write_idx);
 
@@ -262,7 +447,10 @@ pub fn buildClassifierProgram(opts: ClassifierOptions) []const Insn {
 // map_fd` immediates). Build-then-load; a second call overwrites the first
 // call's slice (see ebpf.kprobeCounter's doc comment for the full rationale
 // — this module's `.concurrency = .single_owner` mirrors ebpf's).
-var prog_buf: [64]Insn = undefined;
+/// Large enough for the biggest program either builder emits (double VLAN +
+/// IPv6: 99 instructions for the classifier — pinned in vm.zig).
+const prog_buf_len = 128;
+var prog_buf: [prog_buf_len]Insn = undefined;
 
 /// Tiny append-and-patch cursor over a fixed backing buffer — the same
 /// shape as ebpf.programs.zig's private `Buf` helper (not exported by
@@ -357,6 +545,12 @@ pub const CpumapSteerOptions = struct {
     /// let exceed `cpumap_max_entries`, so a fully populated map has no miss),
     /// it is exposed only so a defensive caller can opt in.
     redirect_flags: u32 = 0,
+    /// Same meaning as `ClassifierOptions.vlan_depth`.
+    vlan_depth: VlanDepth = .double,
+    /// Same meaning as `ClassifierOptions.lpm6_map_fd`: with it, an IPv6
+    /// packet whose address hits the IPv6 trie is steered by its class
+    /// exactly like an IPv4 one; without it, IPv6 passes.
+    lpm6_map_fd: ?linux.fd_t = null,
 };
 
 pub const SteerBuildError = error{
@@ -369,11 +563,12 @@ pub const SteerBuildError = error{
 
 /// Build the redirect-to-CPUMAP steering program.
 ///
-/// `BPF_PROG_TYPE_XDP`. For each packet it parses Ethernet+IPv4 (the IDENTICAL
-/// `ctx`-decode + single dominating `[data, data+34)` bounds check + EtherType
-/// + IHL-must-be-5 sequence as `buildClassifierProgram` — see that function's
-/// doc comment points 1-4, reused verbatim here), does the SAME LPM lookup on
-/// `opts.key_field`'s /32 key, and then:
+/// `BPF_PROG_TYPE_XDP`. For each packet it runs the IDENTICAL parse and lookup
+/// as `buildClassifierProgram` (one shared emitter, `emitParseAndLookup`: the
+/// `ctx`-decode, the dominating bounds checks, up to `opts.vlan_depth` VLAN
+/// tags skipped, IPv4 with IHL 5 on the /32 key and — with
+/// `opts.lpm6_map_fd` — IPv6 on the /128 key; see that function's doc comment
+/// points 1-4 and 8-9), and then:
 ///
 ///  - **CPU-selection policy: class-reduced, not per-flow-hashed.** The matched
 ///    class handle `c` selects CPU `c % opts.cpu_count`. This mirrors real
@@ -388,8 +583,8 @@ pub const SteerBuildError = error{
 ///  - **Redirect + fallback.** `r2 = class`, `r2 %= cpu_count` (always in
 ///    range), then `bpf_redirect_map(&cpumap, r2, opts.redirect_flags)`; the
 ///    program returns the helper's result (`XDP_REDIRECT` on success). Every
-///    OTHER path — too-short packet, non-IPv4 EtherType, IPv4 options, or an
-///    LPM miss — returns `XDP_PASS`, the safe fallback (the packet continues up
+///    OTHER path — too-short packet, unrecognised EtherType or too many VLAN
+///    tags, IPv4 options, a bad IPv6 version nibble, or an LPM miss — returns `XDP_PASS`, the safe fallback (the packet continues up
 ///    the normal stack, exactly the classifier's "unclassified = best-effort"
 ///    default).
 ///
@@ -402,48 +597,17 @@ pub fn buildCpumapSteerProgram(opts: CpumapSteerOptions) SteerBuildError![]const
     if (opts.cpu_count > opts.cpumap_max_entries) return SteerBuildError.CpuCountExceedsCpumap;
 
     const R = Insn.Reg;
-    const key_off = opts.key_field.offset();
 
     var b: Buf = .{ .buf = &steer_prog_buf };
 
-    // (1) ctx->data_end then ctx->data (data_end first — the second load
-    //     clobbers r1). Same retype as buildClassifierProgram point 1.
-    b.emit(Insn.ldx(.word, R.r2, R.r1, 4)); // r2 = data_end
-    b.emit(Insn.ldx(.word, R.r1, R.r1, 0)); // r1 = data
-
-    // (2) Single dominating bounds check: [data, data+34) covers Ethernet(14)
-    //     + fixed IPv4(20). Reused verbatim from buildClassifierProgram
-    //     point 2.
-    b.emit(Insn.mov(R.r3, R.r1));
-    b.emit(Insn.add(R.r3, 34));
-    const bounds_jmp = b.reserve(); // jgt r3, r2 -> PASS
-
-    // (3) EtherType must be IPv4 (point 1's native-endian constant).
-    b.emit(Insn.ldx(.half_word, R.r4, R.r1, 12));
-    const ethertype_jmp = b.reserve(); // jne r4, ipv4 -> PASS
-
-    // (4) IHL must be 5 (no options) — point 3.
-    b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
-    b.emit(Insn.alu_and(R.r4, 0x0f));
-    const ihl_jmp = b.reserve(); // jne r4, 5 -> PASS
-
-    // (5) Copy the 4 key-field address bytes into [r10-4, r10) and prepend a
-    //     native-endian prefixlen of 32 — identical to buildClassifierProgram
-    //     point 4 (same rules.LpmKey byte layout both sides commit to).
-    var k: i16 = 0;
-    while (k < 4) : (k += 1) {
-        b.emit(Insn.ldx(.byte, R.r5, R.r1, key_off + k));
-        b.emit(Insn.stx(.byte, R.r10, -4 + k, R.r5));
-    }
-    b.emit(Insn.st(.word, R.r10, -8, 32));
-
-    // (6) LPM lookup: r2 = &key, r1 = map via pseudo-fd (point 5 discipline).
-    b.emit(Insn.mov(R.r2, R.r10));
-    b.emit(Insn.add(R.r2, -8));
-    b.emit(Insn.ld_map_fd1(R.r1, opts.lpm_map_fd));
-    b.emit(Insn.ld_map_fd2(opts.lpm_map_fd));
-    b.emit(Insn.call(.map_lookup_elem));
-    const lpm_miss_jmp = b.reserve(); // jeq r0, 0 -> PASS
+    // (1)-(6): the SAME parse + VLAN skip + IPv4/IPv6 LPM lookup as
+    // buildClassifierProgram (one shared emitter). Falls through on a hit.
+    const miss = emitParseAndLookup(&b, .{
+        .key_field = opts.key_field,
+        .vlan_depth = opts.vlan_depth,
+        .lpm_map_fd = opts.lpm_map_fd,
+        .lpm6_map_fd = opts.lpm6_map_fd,
+    });
 
     // (7) Hit: class = *(u32*)(r0), loaded straight into r2 (the redirect KEY
     //     register), then reduced to a valid CPU index by `% cpu_count`. r0 is
@@ -468,10 +632,7 @@ pub fn buildCpumapSteerProgram(opts: CpumapSteerOptions) SteerBuildError![]const
     b.emit(Insn.mov(R.r0, XDP_PASS_action));
     b.emit(Insn.exit());
 
-    b.patchJumpTo(bounds_jmp, Insn.jgt(R.r3, R.r2, 0), pass_idx);
-    b.patchJumpTo(ethertype_jmp, Insn.jne(R.r4, @as(i32, ethertype_ipv4_native), 0), pass_idx);
-    b.patchJumpTo(ihl_jmp, Insn.jne(R.r4, @as(i32, 5), 0), pass_idx);
-    b.patchJumpTo(lpm_miss_jmp, Insn.jeq(R.r0, 0, 0), pass_idx);
+    miss.patchAll(&b, pass_idx);
 
     return b.slice();
 }
@@ -480,7 +641,7 @@ pub fn buildCpumapSteerProgram(opts: CpumapSteerOptions) SteerBuildError![]const
 // contract) so a caller may build a classifier AND a steer program and hold
 // both returned slices at once; a second buildCpumapSteerProgram call still
 // overwrites the previous steer slice, same single_owner discipline.
-var steer_prog_buf: [64]Insn = undefined;
+var steer_prog_buf: [prog_buf_len]Insn = undefined;
 
 // ── tests ────────────────────────────────────────────────────────────────────
 //
@@ -581,8 +742,89 @@ test "golden: buildClassifierProgram matches the hand-derived, clang-cross-check
         .scratch_map_fd = golden_scratch_fd,
         .key_field = .src,
         .default_class = 0,
+        .vlan_depth = .none, // + no IPv6 map: the original program, unchanged
     });
     try testing.expectEqualSlices(Insn, &golden_classifier, insns);
+}
+
+// Golden for the default VLAN depth (2), IPv4 only — SELF-DERIVED by hand from
+// the layout in `emitParseAndLookup`'s doc comment (not from the emitter): the
+// original program with two 7-instruction tag levels inserted after the first
+// EtherType load. TPIDs as plain-loaded on this little-endian host: 0x8100 ->
+// 0x0081 (129), 0x88A8 -> 0xA888 (43144). Behaviour is anchored separately, by
+// the real kernel (kernel_test.zig).
+const golden_classifier_vlan2 = [_]Insn{
+    .{ .code = 0x61, .dst = 2, .src = 1, .off = 4, .imm = 0 }, // 0  r2 = data_end
+    .{ .code = 0x61, .dst = 1, .src = 1, .off = 0, .imm = 0 }, // 1  r1 = data
+    .{ .code = 0xbf, .dst = 3, .src = 1, .off = 0, .imm = 0 }, // 2  r3 = r1
+    .{ .code = 0x07, .dst = 3, .src = 0, .off = 0, .imm = 34 }, // 3  r3 += 34
+    .{ .code = 0x2d, .dst = 3, .src = 2, .off = 36, .imm = 0 }, // 4  jgt -> DEFAULT(41)
+    .{ .code = 0x69, .dst = 4, .src = 1, .off = 12, .imm = 0 }, // 5  r4 = ethertype
+    .{ .code = 0x15, .dst = 4, .src = 0, .off = 1, .imm = 129 }, // 6  jeq 802.1Q -> TAG(8)
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 12, .imm = 43144 }, // 7  jne 802.1ad -> DISPATCH(20)
+    .{ .code = 0x07, .dst = 1, .src = 0, .off = 0, .imm = 4 }, // 8  TAG: r1 += 4
+    .{ .code = 0xbf, .dst = 3, .src = 1, .off = 0, .imm = 0 }, // 9  r3 = r1
+    .{ .code = 0x07, .dst = 3, .src = 0, .off = 0, .imm = 34 }, // 10 r3 += 34
+    .{ .code = 0x2d, .dst = 3, .src = 2, .off = 29, .imm = 0 }, // 11 jgt -> DEFAULT(41)
+    .{ .code = 0x69, .dst = 4, .src = 1, .off = 12, .imm = 0 }, // 12 r4 = inner ethertype
+    .{ .code = 0x15, .dst = 4, .src = 0, .off = 1, .imm = 129 }, // 13 jeq 802.1Q -> TAG(15)
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 5, .imm = 43144 }, // 14 jne 802.1ad -> DISPATCH(20)
+    .{ .code = 0x07, .dst = 1, .src = 0, .off = 0, .imm = 4 }, // 15 TAG: r1 += 4
+    .{ .code = 0xbf, .dst = 3, .src = 1, .off = 0, .imm = 0 }, // 16 r3 = r1
+    .{ .code = 0x07, .dst = 3, .src = 0, .off = 0, .imm = 34 }, // 17 r3 += 34
+    .{ .code = 0x2d, .dst = 3, .src = 2, .off = 22, .imm = 0 }, // 18 jgt -> DEFAULT(41)
+    .{ .code = 0x69, .dst = 4, .src = 1, .off = 12, .imm = 0 }, // 19 r4 = innermost ethertype
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 20, .imm = 8 }, // 20 DISPATCH: jne IPv4 -> DEFAULT(41)
+    .{ .code = 0x71, .dst = 4, .src = 1, .off = 14, .imm = 0 }, // 21 r4 = version_ihl
+    .{ .code = 0x57, .dst = 4, .src = 0, .off = 0, .imm = 15 }, // 22 r4 &= 0x0f
+    .{ .code = 0x55, .dst = 4, .src = 0, .off = 17, .imm = 5 }, // 23 jne 5 -> DEFAULT(41)
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 26, .imm = 0 }, // 24
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -4, .imm = 0 }, // 25
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 27, .imm = 0 }, // 26
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -3, .imm = 0 }, // 27
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 28, .imm = 0 }, // 28
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -2, .imm = 0 }, // 29
+    .{ .code = 0x71, .dst = 5, .src = 1, .off = 29, .imm = 0 }, // 30
+    .{ .code = 0x73, .dst = 10, .src = 5, .off = -1, .imm = 0 }, // 31
+    .{ .code = 0x62, .dst = 10, .src = 0, .off = -8, .imm = 32 }, // 32 prefixlen = 32
+    .{ .code = 0xbf, .dst = 2, .src = 10, .off = 0, .imm = 0 }, // 33
+    .{ .code = 0x07, .dst = 2, .src = 0, .off = 0, .imm = -8 }, // 34
+    .{ .code = 0x18, .dst = 1, .src = 1, .off = 0, .imm = golden_lpm_fd }, // 35
+    .{ .code = 0x00, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 36
+    .{ .code = 0x85, .dst = 0, .src = 0, .off = 0, .imm = 1 }, // 37 map_lookup_elem
+    .{ .code = 0x15, .dst = 0, .src = 0, .off = 2, .imm = 0 }, // 38 jeq r0==0 -> DEFAULT(41)
+    .{ .code = 0x61, .dst = 6, .src = 0, .off = 0, .imm = 0 }, // 39 r6 = class
+    .{ .code = 0x05, .dst = 0, .src = 0, .off = 1, .imm = 0 }, // 40 ja -> TAIL(42)
+    .{ .code = 0xb7, .dst = 6, .src = 0, .off = 0, .imm = 0 }, // 41 DEFAULT: r6 = 0
+    .{ .code = 0x62, .dst = 10, .src = 0, .off = -4, .imm = 0 }, // 42 TAIL
+    .{ .code = 0xbf, .dst = 2, .src = 10, .off = 0, .imm = 0 }, // 43
+    .{ .code = 0x07, .dst = 2, .src = 0, .off = 0, .imm = -4 }, // 44
+    .{ .code = 0x18, .dst = 1, .src = 1, .off = 0, .imm = golden_scratch_fd }, // 45
+    .{ .code = 0x00, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 46
+    .{ .code = 0x85, .dst = 0, .src = 0, .off = 0, .imm = 1 }, // 47
+    .{ .code = 0x15, .dst = 0, .src = 0, .off = 1, .imm = 0 }, // 48 -> SKIP_WRITE(50)
+    .{ .code = 0x63, .dst = 0, .src = 6, .off = 0, .imm = 0 }, // 49
+    .{ .code = 0xb7, .dst = 0, .src = 0, .off = 0, .imm = 2 }, // 50 r0 = XDP_PASS
+    .{ .code = 0x95, .dst = 0, .src = 0, .off = 0, .imm = 0 }, // 51 exit
+};
+
+test "golden: default vlan_depth (2) inserts two tag-skip levels before the original IPv4 parse" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // TPID immediates above are LE
+    const insns = buildClassifierProgram(.{
+        .lpm_map_fd = golden_lpm_fd,
+        .scratch_map_fd = golden_scratch_fd,
+        .key_field = .src,
+        .default_class = 0,
+    });
+    try testing.expectEqualSlices(Insn, &golden_classifier_vlan2, insns);
+}
+
+test "VlanDepth.fromInt accepts 0..2 only" {
+    try testing.expectEqual(VlanDepth.none, VlanDepth.fromInt(0).?);
+    try testing.expectEqual(VlanDepth.single, VlanDepth.fromInt(1).?);
+    try testing.expectEqual(VlanDepth.double, VlanDepth.fromInt(2).?);
+    try testing.expectEqual(@as(?VlanDepth, null), VlanDepth.fromInt(3));
+    try testing.expectEqual(@as(?VlanDepth, null), VlanDepth.fromInt(0xFFFF_FFFF));
 }
 
 test "buildClassifierProgram: key_field = .dst reads offsets 30-33 instead of 26-29" {
@@ -627,7 +869,7 @@ test "structural: every packet-derived read is dominated by the single bounds ch
     const insns = buildClassifierProgram(.{ .lpm_map_fd = 5, .scratch_map_fd = 6 });
     var bounds_check_i: ?usize = null;
     for (insns, 0..) |ins, i| {
-        if (ins.code == 0x2d) bounds_check_i = i; // JMP|JGT|X
+        if (ins.code == 0x2d and bounds_check_i == null) bounds_check_i = i; // first JMP|JGT|X
     }
     try testing.expect(bounds_check_i != null);
     for (insns, 0..) |ins, i| {
@@ -811,6 +1053,7 @@ test "golden: buildCpumapSteerProgram matches the hand-derived sequence" {
         .cpumap_max_entries = 4,
         .key_field = .src,
         .redirect_flags = 0,
+        .vlan_depth = .none,
     });
     try testing.expectEqual(redirect_map_helper_id, @as(i32, 51)); // brief-claimed id, confirmed
     try testing.expectEqualSlices(Insn, &golden_steer, insns);
@@ -887,7 +1130,10 @@ test "structural: steer program is well-formed (redirect_map + cpumap pseudo-fd 
 }
 
 test "structural: every non-hit path falls back to a single trailing XDP_PASS" {
-    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8, .cpumap_max_entries = 8 });
+    // Untagged/IPv4-only shape: every conditional branch is a miss. (With
+    // VLAN skipping, the TPID branches go forward to the next level instead;
+    // that shape is exercised by vm.zig's interpreter and the kernel tests.)
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8, .cpumap_max_entries = 8, .vlan_depth = .none });
 
     // Exactly two exits: the redirect-tail exit and the PASS-tail exit.
     var exits: usize = 0;

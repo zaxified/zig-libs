@@ -466,7 +466,7 @@ way to recognise it.
 | [`wireguard`](modules/wireguard/README.md) | 2 | Native WireGuard device config over genetlink (retires `wg` shell-outs), plus the Noise_IKpsk2 handshake **and** the transport-data seal/open crypto data plane | **linux** | netlink, genetlink, chachapoly, entropy, netaddr |
 | [`workerpool`](modules/workerpool/README.md) | 2 | In-process fixed-width worker pool over `lockfree.MpmcQueue` — type-erased closure jobs, Io-futex idle wakeup (no busy-spin, no lost-wakeup), graceful drain / abrupt shutdown | any | lockfree |
 | [`writebehind`](modules/writebehind/README.md) | 3 | Crash-safe write-behind cache coordinator — fast in-memory acks, async flush to a durable `Sink` via `workerpool`; WAL written before ack so a crash-recovered write survives | any | ramcache, workerpool, jobqueue, kvtree |
-| [`xdp-classifier`](modules/xdp-classifier/README.md) | 3 | XDP packet classifier for a LibreQoS-style edge shaper — IPv4 prefix→traffic-class via LPM-trie lookup, per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map) | **linux** | ebpf |
+| [`xdp-classifier`](modules/xdp-classifier/README.md) | 2 | XDP packet classifier for a LibreQoS-style edge shaper — IPv4/IPv6 prefix→traffic-class via LPM-trie lookup behind 0-2 VLAN tags (802.1Q/QinQ), per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map) | **linux** | ebpf |
 
 **Also worth reaching for from `net`** — these are filed under another library (in brackets), and appear here because a consumer working in `net` has a use for them:
 
