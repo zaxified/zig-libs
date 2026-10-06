@@ -37,8 +37,10 @@
 //! **Anthropic first; OpenAI deferred.** This v1 implements the Anthropic
 //! Messages API only. See the README's Provenance/DEFER notes for the
 //! full deferred-work list (OpenAI-compatible variant, retries/backoff,
-//! token counting, prompt-caching tooling, files/vision, batch API,
-//! connection reuse).
+//! prompt-caching tooling, the Files and Batch APIs, connection reuse).
+//! Image/document content blocks, the `system` block-array form,
+//! `anthropic-beta` headers (`Client.betas`) and `Client.countTokens` are
+//! in.
 
 const std = @import("std");
 
@@ -79,8 +81,22 @@ pub const Tool = types.Tool;
 pub const ToolChoice = types.ToolChoice;
 pub const ThinkingConfig = types.ThinkingConfig;
 pub const MessageRequest = types.MessageRequest;
+pub const CountTokensRequest = types.CountTokensRequest;
+pub const ImageMediaType = types.ImageMediaType;
+pub const ImageSource = types.ImageSource;
+pub const DocumentSource = types.DocumentSource;
+pub const CitationsConfig = types.CitationsConfig;
+pub const SystemBlock = types.SystemBlock;
 pub const stringifyRequestAlloc = types.stringifyAlloc;
+pub const stringifyCountTokensAlloc = types.stringifyCountTokensAlloc;
 
+pub const imageBlock = types.imageBlock;
+pub const imageUrlBlock = types.imageUrlBlock;
+pub const pdfBlock = types.pdfBlock;
+pub const pdfUrlBlock = types.pdfUrlBlock;
+pub const textDocumentBlock = types.textDocumentBlock;
+pub const systemBlock = types.systemBlock;
+pub const systemBlockCached = types.systemBlockCached;
 pub const textBlock = types.textBlock;
 pub const textBlockCached = types.textBlockCached;
 pub const thinkingBlock = types.thinkingBlock;
@@ -102,6 +118,8 @@ pub const Message = response.Message;
 pub const StreamEvent = response.StreamEvent;
 pub const parseMessage = response.parseMessage;
 pub const parseStreamEvent = response.parseStreamEvent;
+pub const TokenCount = response.TokenCount;
+pub const parseTokenCount = response.parseTokenCount;
 
 // ── tests (dark aggregator: force test discovery across all files) ─────────
 

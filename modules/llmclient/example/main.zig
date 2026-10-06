@@ -109,4 +109,30 @@ pub fn main() !void {
         error.MalformedResponse => std.debug.print("unrecognized event type correctly rejected\n", .{}),
         error.OutOfMemory => return err,
     };
+
+    // ── vision + a cached system prompt, and counting it first ──────────────
+    // Real bytes would come from a file; any bytes encode the same way.
+    const png_bytes = "\x89PNG\r\n\x1a\n";
+    const png_b64 = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(png_bytes.len));
+    _ = std.base64.standard.Encoder.encode(png_b64, png_bytes);
+    const vision: llmclient.MessageRequest = .{
+        .max_tokens = 512,
+        .system_blocks = &.{llmclient.systemBlockCached("You are a meticulous image analyst.")},
+        .messages = &.{llmclient.MessageParam.user(&.{
+            llmclient.imageBlock(.@"image/png", png_b64),
+            llmclient.pdfBlock("JVBERi0xLjQK"),
+            llmclient.textBlock("Compare the image with the PDF."),
+        })},
+    };
+    const count_body = try llmclient.stringifyCountTokensAlloc(gpa, .fromMessageRequest(vision));
+    defer gpa.free(count_body);
+    if (std.mem.indexOf(u8, count_body, "max_tokens") != null) @panic("count_tokens body must not carry max_tokens");
+    if (std.mem.indexOf(u8, count_body, "\"cache_control\":{\"type\":\"ephemeral\"}") == null) @panic("system block lost its cache_control");
+    std.debug.print("count_tokens body ({d} bytes)\n", .{count_body.len});
+    const counted = try llmclient.parseTokenCount(arena, "{\"input_tokens\":1028}");
+    std.debug.print("would cost {d} input tokens\n", .{counted.input_tokens});
+    // A beta feature is one field on the client: `client.betas = &.{"name-YYYY-MM-DD"};`
+    // (`error.InvalidBeta` for a name that is not a plain token).
+    const beta_err: llmclient.Client.Error = error.InvalidBeta;
+    std.debug.print("a malformed beta name is {t}\n", .{beta_err});
 }

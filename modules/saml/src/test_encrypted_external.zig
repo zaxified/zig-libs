@@ -30,7 +30,7 @@ const fx = @import("fixtures.zig");
 
 // A freshly generated 2048-bit RSA keypair, `openssl genrsa 2048`, TEST
 // MATERIAL ONLY — this is the SP decryption key xmlsec1 encrypted under.
-const sp_priv_pem =
+pub const sp_priv_pem =
     \\-----BEGIN PRIVATE KEY-----
     \\MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDLF3y7pbHUClju
     \\ahhXbxeXbo+qyxvjgtRNIYNjrA1Z+arB3YxNxjSScw/wZoMH75qrGupxI1OfLYIG
@@ -194,4 +194,24 @@ test "EXTERNAL anchor: tampered ciphertext xmlsec1 itself refuses to decrypt is 
     var cfg = baseConfig(fx.t_valid);
     cfg.sp_decrypt_key = try spKey();
     try testing.expectError(error.AssertionDecryptionFailed, saml.consumeResponseXml(alloc, tampered, cfg));
+}
+
+test "EXTERNAL anchor: rollover — the decrypted assertion verifies under an ADDITIONAL IdP key" {
+    // Decrypt-then-verify with a wrong primary key: the xmlsec1 ciphertext's
+    // inner (openssl/lxml-made) signature is accepted only because its signer
+    // is in `additional_idp_keys`, and `idp_key_index` says so.
+    var prng = std.Random.DefaultPrng.init(0x5011_E001);
+    const old = try rsa.generate(prng.random(), 1024, 65537);
+    var cfg = baseConfig(fx.t_valid);
+    cfg.sp_decrypt_key = try spKey();
+    cfg.idp_key = .{ .rsa = old.public_key };
+    const extra = [_]saml.VerifyKey{fx.idpKey()};
+    cfg.additional_idp_keys = &extra;
+    var res = try saml.consumeResponseXml(testing.allocator, response_with_encrypted_assertion, cfg);
+    defer res.deinit();
+    try testing.expectEqualStrings("alice@example.org", res.name_id);
+    try testing.expectEqual(@as(usize, 1), res.idp_key_index);
+
+    cfg.additional_idp_keys = &.{};
+    try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(testing.allocator, response_with_encrypted_assertion, cfg));
 }

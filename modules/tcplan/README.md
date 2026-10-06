@@ -46,14 +46,24 @@ A `Topology` is a forest of `Node`s on one egress interface:
   same as `rate`). Rates are in **bytes/second** — use `tcplan.mbit(n)` to write
   them in megabit/s.
 - **Leaf nodes** (subscribers) carry the same rates plus a per-subscriber `cake`
-  qdisc config and a `match` classifier (an IPv4/IPv6 host or prefix, in the
-  download `.dst` or upload `.src` direction) that steers the subscriber's
-  packets into its class.
+  qdisc config and `match`, a slice of classifiers (each an IPv4/IPv6 host or
+  prefix, in the download `.dst` or upload `.src` direction) that steer the
+  subscriber's packets into its class. A dual-stack circuit lists its IPv4
+  address and its IPv6 prefix; every entry becomes one `flower` filter into
+  the **same** HTB class, so they share the subscriber's rate.
+- **Any node** may set `htb = .{ .burst, .cburst, .prio, .quantum }`
+  (`tcplan.HtbKnobs`; bytes, bytes, `0…7`, bytes). Each `0` keeps `tc`'s
+  default; the values go verbatim into the class op's `tc.HtbClass`.
 
 ```zig
 const sub = [_]tcplan.Node{
     .{ .name = "alice", .rate_bps = tcplan.mbit(100), .ceil_bps = tcplan.mbit(500),
-       .match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } } },
+       .htb = .{ .prio = 1, .burst = 32 * 1024 },
+       .match = &.{
+           .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
+           .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ [_]u8{0} ** 10,
+                         .prefix_len = 56 } },
+       } },
 };
 const ap = [_]tcplan.Node{
     .{ .name = "ap1", .rate_bps = tcplan.mbit(500), .ceil_bps = tcplan.mbit(500),
@@ -77,8 +87,11 @@ subtree is a `(c+1):…` handle. A subtree is pinned by the `cpu` on its top-lev
 site; every descendant inherits it. A descendant that names a *different* `cpu`
 is a `CpuStraddle` compile error, never a silently-wrong plan. Other guarded
 invariants: a child ceil exceeding its parent's, a `cpu` past `queue_count`, a
-top-level node with no `cpu`, a duplicate node name, a zero rate, and handle
-exhaustion.
+top-level node with no `cpu`, a duplicate node name, a zero rate, handle
+exhaustion, two classifiers anywhere in the topology that could match the same
+packet (`OverlappingMatch` — duplicates and covering prefixes, same family and
+direction), a prefix length past its family (`InvalidPrefix`), and an HTB
+`prio` above 7 (`HtbPrioOutOfRange`; the kernel would clamp it silently).
 
 ## The plan and its handle scheme
 
@@ -89,12 +102,13 @@ tc's `(target, spec)` pairs — in a kernel-valid order:
 2. one HTB root qdisc per used queue (`(c+1):0` under `mq` child `0x7FFF:(c+1)`);
 3. every HTB class, parents before children;
 4. every subscriber's CAKE leaf qdisc;
-5. every subscriber's steering filter (`flower`, attached at its queue HTB root).
+5. one steering filter per subscriber classifier (`flower`, attached at its
+   queue HTB root, in `match` slice order).
 
 Handles are allocated deterministically (no randomness, no map-iteration order):
 class minors run `1,2,3,…` per queue in DFS pre-order; each CAKE leaf qdisc gets
 a globally-unique major from one counter starting above the queue majors; filter
-priorities run `1,2,3,…` per queue. The same topology always compiles to a
+priorities run `1,2,3,…` per queue, one per classifier. The same topology always compiles to a
 byte-identical plan — the property a reconciling shaper relies on. See SPEC.md
 for the full scheme.
 
@@ -138,5 +152,8 @@ Everything is pure logic, so the tests need no privilege and no network: a
 hand-verified golden plan (exact handles, targets, rates, kinds, ordering), an
 executability check that feeds the plan through tc's `build*` functions, a
 determinism check (two compiles are byte-identical), an ordering walk, the full
-set of typed-error invariants, and a permanent positive-control that drives a
-forged handle collision RED.
+set of typed-error invariants, a permanent positive-control that drives a
+forged handle collision RED, and an iproute2 oracle: a dual-stack circuit with
+every HTB knob set compiles to requests byte-identical to what a stock `tc`
+sends for the equivalent command lines (re-derive with
+`tools/capture_dualstack.sh`; see SPEC.md "Anchoring" for what is masked and why).

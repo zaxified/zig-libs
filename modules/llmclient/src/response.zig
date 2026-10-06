@@ -62,7 +62,11 @@ pub const OtherBlock = struct { object: std.json.ObjectMap };
 
 /// One entry of `Message.content`.
 pub const ContentBlock = union(enum) {
-    text: struct { text: []const u8 },
+    /// `citations` is the block's raw citation objects (`char_location`,
+    /// `page_location`, `content_block_location`, …, each dispatched on its
+    /// own `"type"`), empty when the response carries none — present only
+    /// when a request document had `citations = .{ .enabled = true }`.
+    text: struct { text: []const u8, citations: []const std.json.Value = &.{} },
     thinking: struct { thinking: []const u8, signature: []const u8 },
     tool_use: struct { id: []const u8, name: []const u8, input: std.json.Value },
     other: OtherBlock,
@@ -99,6 +103,10 @@ pub const Delta = union(enum) {
     thinking_delta: struct { thinking: []const u8 },
     signature_delta: struct { signature: []const u8 },
     input_json_delta: struct { partial_json: []const u8 },
+    /// One citation to append to the current `text` block's citations
+    /// (the streaming form of `ContentBlock.text.citations`): the raw
+    /// citation object, dispatched on its own `"type"`.
+    citations_delta: struct { citation: std.json.ObjectMap },
 };
 
 pub const MessageDelta = struct {
@@ -202,7 +210,10 @@ fn parseUsage(obj: std.json.ObjectMap) ParseError!Usage {
 
 fn parseContentBlock(obj: std.json.ObjectMap) ContentBlock {
     const t = strField(obj, "type");
-    if (std.mem.eql(u8, t, "text")) return .{ .text = .{ .text = strField(obj, "text") } };
+    if (std.mem.eql(u8, t, "text")) return .{ .text = .{
+        .text = strField(obj, "text"),
+        .citations = arrField(obj, "citations"),
+    } };
     if (std.mem.eql(u8, t, "thinking")) return .{ .thinking = .{
         .thinking = strField(obj, "thinking"),
         .signature = strField(obj, "signature"),
@@ -233,6 +244,9 @@ fn parseDelta(obj: std.json.ObjectMap) ParseError!Delta {
     if (std.mem.eql(u8, t, "thinking_delta")) return .{ .thinking_delta = .{ .thinking = strField(obj, "thinking") } };
     if (std.mem.eql(u8, t, "signature_delta")) return .{ .signature_delta = .{ .signature = strField(obj, "signature") } };
     if (std.mem.eql(u8, t, "input_json_delta")) return .{ .input_json_delta = .{ .partial_json = strField(obj, "partial_json") } };
+    if (std.mem.eql(u8, t, "citations_delta")) return .{ .citations_delta = .{
+        .citation = objField(obj, "citation") orelse return error.MalformedResponse,
+    } };
     return error.MalformedResponse;
 }
 
@@ -338,9 +352,97 @@ pub fn parseStreamEvent(arena: std.mem.Allocator, data: []const u8) ParseError!S
     return error.MalformedResponse;
 }
 
+/// A `POST /v1/messages/count_tokens` response: `{"input_tokens": N}`.
+pub const TokenCount = struct {
+    input_tokens: u64,
+};
+
+/// Parse a `count_tokens` response body. `input_tokens` is required here
+/// (it is the whole answer — a body without it is not a count, and 0 would
+/// be a wrong one): absent, non-numeric, negative, ≥ 2^64 or not finite
+/// is `MalformedResponse`. Other fields are ignored (forward
+/// compatibility). Nothing in the result borrows from `arena`.
+pub fn parseTokenCount(arena: std.mem.Allocator, body: []const u8) ParseError!TokenCount {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedResponse,
+    };
+    if (root != .object) return error.MalformedResponse;
+    const v = root.object.get("input_tokens") orelse return error.MalformedResponse;
+    if (v != .integer and v != .float and v != .number_string) return error.MalformedResponse;
+    return .{ .input_tokens = try u64Field(root.object, "input_tokens") };
+}
+
 // ── tests (offline, canned response bodies) ─────────────────────────────────
 
 const testing = std.testing;
+
+test "external anchor: token-counting docs outputs parse to the documented counts" {
+    // The `json Output` blocks of
+    // platform.claude.com/docs/en/build-with-claude/token-counting.md
+    // (fetched 2026-10-06), verbatim.
+    const cases = [_]struct { body: []const u8, want: u64 }{
+        .{ .body = "{ \"input_tokens\": 14 }", .want = 14 },
+        .{ .body = "{ \"input_tokens\": 403 }", .want = 403 },
+        .{ .body = "{ \"input_tokens\": 1028 }", .want = 1028 },
+        .{ .body = "{ \"input_tokens\": 88 }", .want = 88 },
+        .{ .body = "{ \"input_tokens\": 2188 }", .want = 2188 },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(c.want, (try parseTokenCount(arena.allocator(), c.body)).input_tokens);
+    }
+}
+
+test "parseTokenCount: a body that is not a count is MalformedResponse, never 0 or a panic" {
+    const bad = [_][]const u8{
+        "{}",
+        "{\"input_tokens\":null}",
+        "{\"input_tokens\":\"14\"}",
+        "{\"input_tokens\":-1}",
+        "{\"input_tokens\":1e300}",
+        "{\"input_tokens\":18446744073709551616}",
+        "[14]",
+        "14",
+        "{\"input_tokens\":14",
+        "",
+    };
+    for (bad) |body| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectError(error.MalformedResponse, parseTokenCount(arena.allocator(), body));
+    }
+    // Unknown extra fields are tolerated; 0 and u64 max are counts.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(u64, 0), (try parseTokenCount(arena.allocator(), "{\"input_tokens\":0,\"future\":{}}")).input_tokens);
+    try testing.expectEqual(@as(u64, 7), (try parseTokenCount(arena.allocator(), "{\"input_tokens\":7.0}")).input_tokens);
+}
+
+test "parseMessage: image and document blocks echoed in a response are tolerated as .other (SELF-DERIVED body)" {
+    // The block shapes are the ones this module sends (anchored in
+    // types.zig); a response carrying them back must not fail the parse.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"id":"msg_4","model":"claude-opus-5-5","role":"assistant","content":[
+        \\{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}},
+        \\{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"QUJD"},"title":"t"},
+        \\{"type":"text","text":"after"}],
+        \\"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqual(@as(usize, 3), msg.content.len);
+    try testing.expectEqualStrings("image", msg.content[0].other.object.get("type").?.string);
+    try testing.expectEqualStrings("document", msg.content[1].other.object.get("type").?.string);
+    try testing.expectEqualStrings("after", msg.content[2].text.text);
+
+    const ev = try parseStreamEvent(arena.allocator(),
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"image","source":{"type":"url","url":"https://x"}}}
+    );
+    try testing.expect(ev.content_block_start.content_block == .other);
+}
 
 test "parseMessage: tool_use block and stop_reason refusal" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -644,6 +746,89 @@ test "parseStreamEvent: an unrecognized delta type is MalformedResponse, not an 
     );
 }
 
+// Review 2026-10-06 (PR #5): `DocumentBlock.citations` let a request turn
+// citations on, but the parser knew neither form the answer comes back in —
+// a streamed `citations_delta` was `MalformedResponse` (the stream died at the
+// first citation) and a non-streaming text block's `citations` array was
+// dropped. Both shapes below are the citations docs' own examples
+// (`build-with-claude/citations.md`, § Response structure / Streaming support;
+// the streaming one's elided `...` filled with the char_location fields).
+
+test "parseStreamEvent: a citations_delta carries its citation object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try parseStreamEvent(arena.allocator(),
+        \\{"type": "content_block_delta", "index": 0,
+        \\ "delta": {"type": "citations_delta",
+        \\           "citation": {
+        \\               "type": "char_location",
+        \\               "cited_text": "The grass is green.",
+        \\               "document_index": 0,
+        \\               "document_title": "Example Document",
+        \\               "start_char_index": 0,
+        \\               "end_char_index": 20
+        \\           }}}
+    );
+    const c = ev.content_block_delta.delta.citations_delta.citation;
+    try testing.expectEqual(@as(u32, 0), ev.content_block_delta.index);
+    try testing.expectEqualStrings("char_location", c.get("type").?.string);
+    try testing.expectEqualStrings("The grass is green.", c.get("cited_text").?.string);
+    try testing.expectEqual(@as(i64, 20), c.get("end_char_index").?.integer);
+    // A citations_delta without its citation object is malformed, not empty.
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(arena.allocator(),
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta"}}
+    ));
+}
+
+test "parseMessage: a text block keeps its citations array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"id":"m","model":"m","role":"assistant","usage":{"input_tokens":1,"output_tokens":1},
+        \\ "content": [
+        \\    { "type": "text", "text": "According to the document, " },
+        \\    {
+        \\      "type": "text",
+        \\      "text": "the grass is green",
+        \\      "citations": [
+        \\        {
+        \\          "type": "char_location",
+        \\          "cited_text": "The grass is green.",
+        \\          "document_index": 0,
+        \\          "document_title": "Example Document",
+        \\          "start_char_index": 0,
+        \\          "end_char_index": 20
+        \\        }
+        \\      ]
+        \\    },
+        \\    {
+        \\      "type": "text",
+        \\      "text": "water is essential",
+        \\      "citations": [
+        \\        {
+        \\          "type": "page_location",
+        \\          "cited_text": "Water is essential for life.",
+        \\          "document_index": 1,
+        \\          "document_title": "PDF Document",
+        \\          "start_page_number": 5,
+        \\          "end_page_number": 6
+        \\        }
+        \\      ]
+        \\    }
+        \\ ]}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqual(@as(usize, 3), msg.content.len);
+    try testing.expectEqual(@as(usize, 0), msg.content[0].text.citations.len);
+    const c1 = msg.content[1].text.citations;
+    try testing.expectEqual(@as(usize, 1), c1.len);
+    try testing.expectEqualStrings("char_location", c1[0].object.get("type").?.string);
+    try testing.expectEqualStrings("the grass is green", msg.content[1].text.text);
+    const c2 = msg.content[2].text.citations;
+    try testing.expectEqualStrings("page_location", c2[0].object.get("type").?.string);
+    try testing.expectEqual(@as(i64, 5), c2[0].object.get("start_page_number").?.integer);
+}
+
 test "parseStreamEvent: message_start with no message object is a MalformedResponse error (A1 F18, M29)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -708,5 +893,21 @@ test "fuzz parseStreamEvent never panics" {
         "{\"type\":\"content_block_stop\",\"index\":4294967296}",
         "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":-1}}}",
         "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}",
+    } });
+}
+
+fn fuzzParseTokenCount(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = parseTokenCount(arena.allocator(), buf[0..len]) catch return;
+}
+test "fuzz parseTokenCount never panics" {
+    try testing.fuzz({}, fuzzParseTokenCount, .{ .corpus = &.{
+        "{ \"input_tokens\": 14 }",
+        "{\"input_tokens\":1e300}",
+        "{\"input_tokens\":-1,\"x\":[1,{\"y\":null}]}",
+        "{\"input_tokens\":18446744073709551615}",
     } });
 }

@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — FIXED (review of PR #5): an `AddressIterator.next` error is final — the
+  iterator stops (later calls return `null`) and `unparsed()` returns the failing descriptor
+  and its tail. Before, `pos` stayed put and every later call met the same error, so
+  `while (it.next() catch continue)` never ended.
+
+- **2026-10-06** — ADDED: BOLT#2 `channel_reestablish` (136; `decodeChannelReestablish`/
+  `serializeChannelReestablish`, `nextFunding()`/`myCurrentFundingLocked()` over the 33-octet
+  `FundingTxidFlags` TLVs 1 and 5, `error.InvalidTlvLength` for a known record of any other
+  length) and `update_fail_malformed_htlc` (135; `error.BadOnionBitNotSet` when `failure_code`
+  lacks `BADONION`, on decode and encode); BOLT#7 `announcement_signatures` (259) and
+  `gossip_timestamp_filter` (265, with `matches`); typed `node_announcement` address descriptors
+  (`Address`, `AddressIterator`/`addressIterator`, `encodeAddresses`); `features.zig` (BOLT#9 bit
+  helpers). Anchored byte-exact both directions on rust-lightning `msgs.rs` vectors (commit
+  `15c5d9b8`); two new fuzz harnesses. Scope mvp -> core. Docs: SPEC's claim that the no-TLV
+  decoders validate trailing extension bytes was false (they ignore them, as BOLT#1 permits) and
+  is corrected; a vendored `node_announcement` vector description said onionv3 where the bytes
+  are onionv2. `meta.doc` updated.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Scope and Anchoring no longer present `announcement_signatures`/`gossip_timestamp_filter` as settled "not debt" — they are "not yet", filed in Backlog.
 - **2026-10-05** — Mutation run: 36 of 36 killed, 0 equivalent; 4 tests added (BigSize
   one-octet-short edges, digest signature-block edges, `commitment_signed` 65536-signature

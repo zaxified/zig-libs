@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED: the three gaps the 2026-09-30 survey filed; Scope mvp -> core.
+  Additive only — every new field has a default and default options emit the same bytes
+  as before (no BREAKING, no BEHAVIOURAL change).
+  - **SP metadata**: `buildSpMetadata(alloc, SpMetadataOptions) SpMetadataError![]u8` —
+    `EntityDescriptor`/`SPSSODescriptor` with signing/encryption `KeyDescriptor`s,
+    `SingleLogoutService`, `NameIDFormat`, `AssertionConsumerService` (binding, location,
+    index, isDefault), `AttributeConsumingService`, `Organization`, `ContactPerson`,
+    `validUntil`/`cacheDuration`; optionally signed with the existing SLO signer. Typed
+    refusals for every schema requirement and for characters XML cannot carry. New types
+    `AcsEndpoint`, `SloEndpoint`, `LocalizedString`, `RequestedAttribute`,
+    `AttributeConsumingService`, `Organization`, `ContactType`, `ContactPerson`,
+    `ResponseBinding`, and `binding_*` URI constants.
+  - **IdP certificate rollover**: `additional_idp_keys` on `Config`, `LogoutRequestConfig`,
+    `LogoutResponseConfig`, `ArtifactResponseConfig` (and `additional_keys` on
+    `VerifyRedirectQueryOptions`); a signature is accepted under any configured key,
+    `AuthnResult.idp_key_index` says which. Key-independent refusals still fail closed on
+    the first attempt; XSW pin, tamper and missing-signature verdicts are unchanged.
+  - **AuthnRequest**: `force_authn`, `is_passive`, `protocol_binding` (`ResponseBinding`:
+    POST or Artifact — Redirect is forbidden for the Response by SAMLProf §4.1.2),
+    `attribute_consuming_service_index`, `requested_authn_context` (`Comparison` +
+    `AuthnContextClassRef` list).
+  - Anchor (EXTERNAL): the emitted metadata and AuthnRequests are pinned byte-for-byte in
+    `test_metadata.zig` after `tools/saml_oracle.py` (new; python3-saml 1.16.0 + lxml +
+    xmlsec) validated them against the OASIS metadata/protocol XSDs, verified the signed
+    metadata under xmlsec1 and compared structure with python3-saml's own builder.
+    Rollover is tested over the openssl/lxml-signed and xmlsec1-encrypted fixtures and the
+    openssl Redirect signature (`test_multikey.zig`, +2 tests in the existing files).
+
 - **2026-09-15** — A1 fix campaign, F9 (audit `A1/saml.md`). **Test-only, no
   behavioural change**: the five remaining untested live guards out of F9's
   eleven all got regression tests — M02 (`signedTargetMatches` refuses zero

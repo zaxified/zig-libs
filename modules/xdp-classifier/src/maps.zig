@@ -114,9 +114,13 @@ pub const CreateMapError = error{
 /// `BPF_F_NO_PREALLOC` or swapping the map type is otherwise invisible to
 /// every test in this file except the two CAP_BPF-gated round-trips.
 fn lpmTrieCreateAttr(max_entries: u32) BPF.MapCreateAttr {
+    return lpmTrieCreateAttrSized(lpm_key_size, max_entries);
+}
+
+fn lpmTrieCreateAttrSized(key_size: u32, max_entries: u32) BPF.MapCreateAttr {
     var attr = std.mem.zeroes(BPF.MapCreateAttr);
     attr.map_type = @intFromEnum(BPF.MapType.lpm_trie);
-    attr.key_size = lpm_key_size;
+    attr.key_size = key_size;
     attr.value_size = lpm_value_size;
     attr.max_entries = max_entries;
     attr.map_flags = BPF.BPF_F_NO_PREALLOC;
@@ -124,7 +128,25 @@ fn lpmTrieCreateAttr(max_entries: u32) BPF.MapCreateAttr {
 }
 
 pub fn createLpmTrieMap(max_entries: u32) CreateMapError!linux.fd_t {
-    var attr = BPF.Attr{ .map_create = lpmTrieCreateAttr(max_entries) };
+    return createLpmTrie(lpmTrieCreateAttr(max_entries));
+}
+
+/// `BPF_MAP_TYPE_LPM_TRIE` key layout for the IPv6 ruleset map:
+/// native-endian `u32` prefixlen + a 16-byte IPv6 address — see
+/// `rules.LpmKey6`. The kernel derives the trie's maximum prefix length from
+/// it, `(key_size - 4) * 8 = 128`.
+pub const lpm6_key_size: u32 = 20;
+
+/// Create the IPv6 `BPF_MAP_TYPE_LPM_TRIE` ruleset map (20-byte key, `u32`
+/// class value, `BPF_F_NO_PREALLOC`) — the map
+/// `classifier.ClassifierOptions.lpm6_map_fd` names. A separate map from the
+/// IPv4 one, so an existing IPv4 map and its 8-byte keys are untouched.
+pub fn createLpm6TrieMap(max_entries: u32) CreateMapError!linux.fd_t {
+    return createLpmTrie(lpmTrieCreateAttrSized(lpm6_key_size, max_entries));
+}
+
+fn createLpmTrie(create: BPF.MapCreateAttr) CreateMapError!linux.fd_t {
+    var attr = BPF.Attr{ .map_create = create };
     const rc = linux.bpf(.map_create, &attr, @sizeOf(BPF.MapCreateAttr));
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -196,6 +218,20 @@ pub fn populateRule(lpm_map_fd: linux.fd_t, rule: rules.ClassifierRule) Populate
 /// validation is `rules.zig`'s job, population is this file's).
 pub fn populateRuleSet(lpm_map_fd: linux.fd_t, rule_set: rules.RuleSet) PopulateError!void {
     for (rule_set.rules) |rule| try populateRule(lpm_map_fd, rule);
+}
+
+/// Load one IPv6 rule into the IPv6 LPM map (`createLpm6TrieMap`), keyed by
+/// `rules.LpmKey6` — the 20-byte layout the generated program builds on its
+/// stack for an IPv6 packet.
+pub fn populateRule6(lpm6_map_fd: linux.fd_t, rule: rules.ClassifierRule6) PopulateError!void {
+    const key = rules.LpmKey6.fromPrefix(rule.prefix).toBytes();
+    const value = ruleValueBytes(rule.class);
+    BPF.map_update_elem(lpm6_map_fd, &key, &value, 0) catch |e| return mapPopulateError(e);
+}
+
+/// Load a validated `RuleSet6` (call `RuleSet6.validate` first), in order.
+pub fn populateRuleSet6(lpm6_map_fd: linux.fd_t, rule_set: rules.RuleSet6) PopulateError!void {
+    for (rule_set.rules) |rule| try populateRule6(lpm6_map_fd, rule);
 }
 
 pub const ScratchReadError = error{
@@ -355,6 +391,14 @@ test "F5: createLpmTrieMap's attr carries BPF_F_NO_PREALLOC and the LPM_TRIE map
     try testing.expectEqual(lpm_key_size, attr.key_size);
     try testing.expectEqual(lpm_value_size, attr.value_size);
     try testing.expectEqual(@as(u32, 64), attr.max_entries);
+
+    // The IPv6 map: same type and flag, 20-byte key (=> max prefixlen 128).
+    const attr6 = lpmTrieCreateAttrSized(lpm6_key_size, 32);
+    try testing.expectEqual(@intFromEnum(BPF.MapType.lpm_trie), attr6.map_type);
+    try testing.expectEqual(BPF.BPF_F_NO_PREALLOC, attr6.map_flags);
+    try testing.expectEqual(@as(u32, 20), attr6.key_size);
+    try testing.expectEqual(@as(u32, @sizeOf(@TypeOf(rules.LpmKey6.exact(@splat(0)).toBytes()))), attr6.key_size);
+    try testing.expectEqual(lpm_value_size, attr6.value_size);
 }
 
 test "F5: the scratch map's type is PERCPU_ARRAY, not ARRAY" {
@@ -399,6 +443,47 @@ test "populateRule/populateCpu: an invalid map fd surfaces PopulateError.BadFd" 
     };
     try testing.expectError(PopulateError.BadFd, populateRule(-1, rule));
     try testing.expectError(PopulateError.BadFd, populateCpu(-1, 0, 192, null));
+    try testing.expectError(PopulateError.BadFd, populateRule6(-1, .{ .prefix = .{ .addr = @splat(0), .prefix_len = 0 }, .class = 1 }));
+}
+
+test "createLpm6TrieMap + populateRuleSet6 + real /128 lookup round-trip (needs CAP_BPF/root)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const fd = createLpm6TrieMap(16) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer _ = linux.close(fd);
+
+    const net: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var sub = net;
+    sub[5] = 1;
+    const rule_list = [_]rules.ClassifierRule6{
+        .{ .prefix = .{ .addr = net, .prefix_len = 32 }, .class = 1 },
+        .{ .prefix = .{ .addr = sub, .prefix_len = 48 }, .class = 2 },
+        .{ .prefix = .{ .addr = @splat(0), .prefix_len = 0 }, .class = 9 },
+    };
+    const rule_set: rules.RuleSet6 = .{ .rules = &rule_list };
+    try rule_set.validate(16);
+    try populateRuleSet6(fd, rule_set);
+
+    const queries = [_][16]u8{
+        .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 },
+        .{ 0x20, 0x01, 0x0d, 0xb8, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 },
+        .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+    };
+    for (queries) |q| {
+        const key = rules.LpmKey6.exact(q).toBytes();
+        var value: [4]u8 = undefined;
+        try BPF.map_lookup_elem(fd, &key, &value);
+        const got = std.mem.readInt(u32, &value, builtin.cpu.arch.endian());
+        try testing.expectEqual(rules.lookupReference6(&rule_list, q, 0xFFFF_FFFF), got);
+    }
+
+    // The kernel's own limit: a /129 is past (key_size - 4) * 8 and refused.
+    const bad_key = rules.LpmKey6{ .prefixlen = 129, .addr = net };
+    const one = ruleValueBytes(1);
+    // (std maps EINVAL to this name.)
+    try testing.expectError(error.FieldInAttrNeedsZeroing, BPF.map_update_elem(fd, &bad_key.toBytes(), &one, 0));
 }
 
 test "createLpmTrieMap + populateRule + real lookup round-trip (needs CAP_BPF/root)" {

@@ -272,6 +272,164 @@ fn prefixMatches(prefix: Ipv4Prefix, addr: [4]u8) bool {
     return (bits >> shift) == (a >> shift);
 }
 
+// ── IPv6 ─────────────────────────────────────────────────────────────────────
+//
+// The IPv6 rule table is a SEPARATE table loaded into a SEPARATE
+// `BPF_MAP_TYPE_LPM_TRIE` (key size 20, see `maps.createLpm6TrieMap`) — the
+// IPv4 types above and their 8-byte key are untouched, so an existing IPv4
+// map and its rules keep their exact layout (no migration). Same validation
+// contract, same error set, same last-write-wins oracle semantics as IPv4.
+
+/// One IPv6 CIDR prefix: `addr` in wire order (`addr[0]` is the most
+/// significant octet, e.g. `2001:db8::/32` is `.{ .addr = .{ 0x20, 0x01,
+/// 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .prefix_len = 32 }`) —
+/// the order the generated program copies the address out of the packet in.
+/// `prefix_len` is a `u8` so out-of-spec 129..255 is representable and
+/// rejected by `RuleSet6.validate` rather than unrepresentable-by-accident.
+pub const Ipv6Prefix = struct {
+    addr: [16]u8,
+    prefix_len: u8,
+};
+
+pub const ClassifierRule6 = struct {
+    prefix: Ipv6Prefix,
+    class: u32,
+};
+
+/// An IPv6 rule table, validated as a unit against the IPv6 LPM map it will
+/// be loaded into. Same checks and error precedence as `RuleSet`, with 128 in
+/// place of 32 as the largest prefix length.
+pub const RuleSet6 = struct {
+    rules: []const ClassifierRule6,
+
+    /// O(n²), allocation-free — see `RuleSet.validate` for when that is fine.
+    pub fn validate(self: RuleSet6, max_entries: usize) RuleSetError!void {
+        if (self.rules.len > max_entries) return RuleSetError.TooManyRules;
+        for (self.rules, 0..) |rule, i| {
+            try checkStructural6(rule.prefix);
+            for (self.rules[0..i]) |other| {
+                if (other.prefix.prefix_len == rule.prefix.prefix_len and
+                    std.mem.eql(u8, &other.prefix.addr, &rule.prefix.addr))
+                {
+                    return RuleSetError.DuplicatePrefix;
+                }
+            }
+        }
+    }
+
+    /// O(n log n), same verdict (and precedence) as `validate` on every input;
+    /// `scratch` is caller memory, one `usize` per rule — see
+    /// `RuleSet.validateSorted`.
+    pub fn validateSorted(self: RuleSet6, max_entries: usize, scratch: []usize) RuleSetError!void {
+        if (self.rules.len > max_entries) return RuleSetError.TooManyRules;
+        if (scratch.len < self.rules.len) return RuleSetError.ScratchTooSmall;
+
+        var first_bad: ?struct { index: usize, err: RuleSetError } = null;
+        for (self.rules, 0..) |rule, i| {
+            checkStructural6(rule.prefix) catch |err| {
+                first_bad = .{ .index = i, .err = err };
+                break;
+            };
+        }
+        const limit = if (first_bad) |fb| fb.index else self.rules.len;
+
+        const idx = scratch[0..limit];
+        for (idx, 0..) |*slot, i| slot.* = i;
+        std.sort.pdq(usize, idx, self.rules, sortIndexLessThan6);
+
+        var i: usize = 1;
+        while (i < idx.len) : (i += 1) {
+            const prev = self.rules[idx[i - 1]].prefix;
+            const cur = self.rules[idx[i]].prefix;
+            if (prev.prefix_len == cur.prefix_len and std.mem.eql(u8, &prev.addr, &cur.addr)) {
+                return RuleSetError.DuplicatePrefix;
+            }
+        }
+
+        if (first_bad) |fb| return fb.err;
+    }
+};
+
+fn checkStructural6(prefix: Ipv6Prefix) RuleSetError!void {
+    if (prefix.prefix_len > 128) return RuleSetError.InvalidPrefixLen;
+    if (!hostBitsClear(&prefix.addr, prefix.prefix_len)) return RuleSetError.NonCanonicalPrefix;
+}
+
+fn sortIndexLessThan6(rules: []const ClassifierRule6, a: usize, b: usize) bool {
+    const pa = rules[a].prefix;
+    const pb = rules[b].prefix;
+    if (pa.prefix_len != pb.prefix_len) return pa.prefix_len < pb.prefix_len;
+    return std.mem.order(u8, &pa.addr, &pb.addr) == .lt;
+}
+
+/// True iff every bit of `addr` at index >= `prefix_len` (MSB-first) is 0.
+/// `prefix_len >= 8 * addr.len` is trivially canonical.
+fn hostBitsClear(addr: []const u8, prefix_len: u32) bool {
+    for (addr, 0..) |byte, i| {
+        const byte_start: u32 = @intCast(i * 8);
+        if (prefix_len >= byte_start + 8) continue; // whole byte is prefix
+        const keep: u32 = if (prefix_len > byte_start) prefix_len - byte_start else 0; // 0..7
+        const host_mask: u8 = @as(u8, 0xff) >> @intCast(keep);
+        if (byte & host_mask != 0) return false;
+    }
+    return true;
+}
+
+/// True iff the first `prefix_len` bits (MSB-first) of `a` and `b` agree.
+/// Caller guarantees `prefix_len <= 8 * a.len`.
+fn leadingBitsEqual(a: []const u8, b: []const u8, prefix_len: u32) bool {
+    for (a, b, 0..) |x, y, i| {
+        const byte_start: u32 = @intCast(i * 8);
+        if (prefix_len <= byte_start) return true;
+        const keep: u32 = @min(prefix_len - byte_start, 8); // 1..8
+        const mask: u8 = ~(@as(u8, 0xff) >> @intCast(keep - 1) >> 1);
+        if ((x ^ y) & mask != 0) return false;
+    }
+    return true;
+}
+
+/// The exact 20-byte `BPF_MAP_TYPE_LPM_TRIE` key for the IPv6 map:
+/// `struct { __u32 prefixlen; __u8 data[16]; }` — the kernel's
+/// `struct bpf_lpm_trie_key_u8` with a 16-byte `data` (see
+/// `Documentation/bpf/map_lpm_trie.rst`, whose own example is an IPv6 key of
+/// this shape). `prefixlen` in host byte order, `data` in wire order — the
+/// same convention as the 8-byte IPv4 `LpmKey`, and byte-for-byte what the
+/// generated program builds on its stack for an IPv6 packet.
+pub const LpmKey6 = struct {
+    prefixlen: u32,
+    addr: [16]u8,
+
+    pub fn fromPrefix(p: Ipv6Prefix) LpmKey6 {
+        return .{ .prefixlen = p.prefix_len, .addr = p.addr };
+    }
+
+    /// An exact `/128` lookup key — what the generated program constructs
+    /// per packet.
+    pub fn exact(addr: [16]u8) LpmKey6 {
+        return .{ .prefixlen = 128, .addr = addr };
+    }
+
+    pub fn toBytes(self: LpmKey6) [20]u8 {
+        var buf: [20]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], self.prefixlen, builtin.cpu.arch.endian());
+        buf[4..20].* = self.addr;
+        return buf;
+    }
+};
+
+/// Pure userspace IPv6 longest-prefix-match reference, same contract as
+/// `lookupReference` (ties on equal length go to the LAST rule, matching the
+/// kernel trie's overwrite; `prefix_len > 128` never matches).
+pub fn lookupReference6(rules_: []const ClassifierRule6, addr: [16]u8, default_class: u32) u32 {
+    var best: ?ClassifierRule6 = null;
+    for (rules_) |rule| {
+        if (rule.prefix.prefix_len > 128) continue;
+        if (!leadingBitsEqual(&rule.prefix.addr, &addr, rule.prefix.prefix_len)) continue;
+        if (best == null or rule.prefix.prefix_len >= best.?.prefix.prefix_len) best = rule;
+    }
+    return if (best) |b| b.class else default_class;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -706,6 +864,170 @@ test "F3: validateSorted agrees with validate across a deterministic sweep, incl
             const want = rs.validate(max_entries);
             const got = rs.validateSorted(max_entries, scratch[0..n]);
             try testing.expectEqual(want, got);
+        }
+    }
+}
+
+// ── IPv6 rule-table tests ───────────────────────────────────────────────────
+
+/// `::ffff:a.b.c.d` (RFC 4291 §2.5.5.2, IPv4-mapped) — lets the IPv6 code be
+/// checked against the independently written IPv4 code on the same question.
+fn mapped(v4: [4]u8) [16]u8 {
+    return .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, v4[0], v4[1], v4[2], v4[3] };
+}
+
+const doc_net: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // 2001:db8:: (RFC 3849)
+
+test "RuleSet6.validate: accepts canonical, rejects >128 / host bits / duplicates / overflow" {
+    var sub = doc_net;
+    sub[5] = 0x01; // 2001:db8:1::/48
+    const good = [_]ClassifierRule6{
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 1 },
+        .{ .prefix = .{ .addr = sub, .prefix_len = 48 }, .class = 2 },
+        .{ .prefix = .{ .addr = @splat(0), .prefix_len = 0 }, .class = 9 },
+        .{ .prefix = .{ .addr = @splat(0xff), .prefix_len = 128 }, .class = 3 },
+    };
+    try (RuleSet6{ .rules = &good }).validate(8);
+    var scratch: [4]usize = undefined;
+    try (RuleSet6{ .rules = &good }).validateSorted(8, &scratch);
+
+    const too_long = [_]ClassifierRule6{.{ .prefix = .{ .addr = doc_net, .prefix_len = 129 }, .class = 1 }};
+    try testing.expectError(RuleSetError.InvalidPrefixLen, (RuleSet6{ .rules = &too_long }).validate(8));
+
+    // 2001:db8:1::/32 — bit 47 is set past a /32 boundary.
+    const host = [_]ClassifierRule6{.{ .prefix = .{ .addr = sub, .prefix_len = 32 }, .class = 1 }};
+    try testing.expectError(RuleSetError.NonCanonicalPrefix, (RuleSet6{ .rules = &host }).validate(8));
+
+    // /127 with its single host bit set (the last bit of the address).
+    var last = doc_net;
+    last[15] = 1;
+    const p127 = [_]ClassifierRule6{.{ .prefix = .{ .addr = last, .prefix_len = 127 }, .class = 1 }};
+    try testing.expectError(RuleSetError.NonCanonicalPrefix, (RuleSet6{ .rules = &p127 }).validate(8));
+    const p128 = [_]ClassifierRule6{.{ .prefix = .{ .addr = last, .prefix_len = 128 }, .class = 1 }};
+    try (RuleSet6{ .rules = &p128 }).validate(8);
+
+    const dup = [_]ClassifierRule6{
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 1 },
+        .{ .prefix = .{ .addr = sub, .prefix_len = 48 }, .class = 2 },
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 3 },
+    };
+    try testing.expectError(RuleSetError.DuplicatePrefix, (RuleSet6{ .rules = &dup }).validate(8));
+    try testing.expectError(RuleSetError.DuplicatePrefix, (RuleSet6{ .rules = &dup }).validateSorted(8, &scratch));
+
+    try testing.expectError(RuleSetError.TooManyRules, (RuleSet6{ .rules = &good }).validate(3));
+    try testing.expectError(RuleSetError.ScratchTooSmall, (RuleSet6{ .rules = &good }).validateSorted(8, scratch[0..3]));
+}
+
+test "LpmKey6.toBytes: prefixlen (native u32) ++ 16 wire-order address bytes" {
+    const k = LpmKey6.exact(doc_net).toBytes();
+    try testing.expectEqual(@as(usize, 20), k.len);
+    try testing.expectEqual(@as(u32, 128), std.mem.readInt(u32, k[0..4], builtin.cpu.arch.endian()));
+    try testing.expectEqualSlices(u8, &doc_net, k[4..20]);
+    const f = LpmKey6.fromPrefix(.{ .addr = doc_net, .prefix_len = 32 });
+    try testing.expectEqual(@as(u32, 32), f.prefixlen);
+}
+
+test "lookupReference6: longest prefix wins, last equal-length rule wins, >128 never matches" {
+    var sub = doc_net;
+    sub[5] = 0x01; // 2001:db8:1::/48
+    const rs = [_]ClassifierRule6{
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 1 },
+        .{ .prefix = .{ .addr = sub, .prefix_len = 48 }, .class = 2 },
+        .{ .prefix = .{ .addr = @splat(0), .prefix_len = 0 }, .class = 9 },
+    };
+    var q = sub;
+    q[15] = 0x42;
+    try testing.expectEqual(@as(u32, 2), lookupReference6(&rs, q, 0));
+    q[5] = 0x02;
+    try testing.expectEqual(@as(u32, 1), lookupReference6(&rs, q, 0));
+    try testing.expectEqual(@as(u32, 9), lookupReference6(&rs, mapped(.{ 8, 8, 8, 8 }), 0));
+    try testing.expectEqual(@as(u32, 5), lookupReference6(rs[0..1], mapped(.{ 8, 8, 8, 8 }), 5));
+
+    const out_of_spec = [_]ClassifierRule6{.{ .prefix = .{ .addr = doc_net, .prefix_len = 200 }, .class = 77 }};
+    try testing.expectEqual(@as(u32, 0), lookupReference6(&out_of_spec, doc_net, 0));
+
+    const tie = [_]ClassifierRule6{
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 111 },
+        .{ .prefix = .{ .addr = doc_net, .prefix_len = 32 }, .class = 222 },
+    };
+    try testing.expectEqual(@as(u32, 222), lookupReference6(&tie, doc_net, 0));
+}
+
+test "IPv6 helpers agree with the independent IPv4 code on IPv4-mapped addresses (sweep)" {
+    // Two implementations written separately (u32 shifts for IPv4, a
+    // byte-wise mask walk for IPv6) asked the same question: a v4 rule a/n is
+    // the v6 rule ::ffff:a/(96+n). Canonical-ness and LPM verdicts must agree.
+    var prng = std.Random.DefaultPrng.init(0x6666_0004);
+    const rnd = prng.random();
+    var r4: [6]ClassifierRule = undefined;
+    var r6: [6]ClassifierRule6 = undefined;
+    var trial: usize = 0;
+    while (trial < 4000) : (trial += 1) {
+        const n = rnd.uintLessThan(usize, r4.len + 1);
+        for (r4[0..n], r6[0..n]) |*a, *b| {
+            const plen = rnd.uintAtMost(u6, 32);
+            // Low-entropy addresses so prefixes actually overlap the query.
+            const addr: [4]u8 = .{ 10, rnd.uintLessThan(u8, 3), rnd.uintLessThan(u8, 3), rnd.int(u8) };
+            a.* = .{ .prefix = .{ .addr = addr, .prefix_len = plen }, .class = rnd.int(u32) };
+            b.* = .{ .prefix = .{ .addr = mapped(addr), .prefix_len = @as(u8, 96) + plen }, .class = a.class };
+            try testing.expectEqual(isCanonical(a.prefix), hostBitsClear(&b.prefix.addr, b.prefix.prefix_len));
+        }
+        const q: [4]u8 = .{ 10, rnd.uintLessThan(u8, 3), rnd.uintLessThan(u8, 3), rnd.int(u8) };
+        const dc = rnd.int(u32);
+        try testing.expectEqual(lookupReference(r4[0..n], q, dc), lookupReference6(r6[0..n], mapped(q), dc));
+    }
+}
+
+fn fuzzValidate6SortedAgrees(_: void, smith: *std.testing.Smith) !void {
+    var buf: [24]ClassifierRule6 = undefined;
+    // check-fuzz-reach R1: a full-range u64 first, reduced by hand.
+    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
+    for (buf[0..n]) |*r| {
+        var addr: [16]u8 = @splat(0);
+        // Few distinct addresses so duplicates and near-duplicates occur.
+        addr[0] = smith.value(u8) & 0x03;
+        addr[15] = smith.value(u8) & 0x01;
+        r.* = .{ .prefix = .{ .addr = addr, .prefix_len = smith.value(u8) }, .class = smith.value(u32) };
+    }
+    const rs: RuleSet6 = .{ .rules = buf[0..n] };
+    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 32);
+    var scratch: [buf.len]usize = undefined;
+    try testing.expectEqual(rs.validate(max_entries), rs.validateSorted(max_entries, scratch[0..n]));
+    const q: [16]u8 = if (n > 0) buf[0].prefix.addr else @splat(0);
+    const got = lookupReference6(buf[0..n], q, 0xFFFF_FFFF);
+    var ok = got == 0xFFFF_FFFF;
+    for (buf[0..n]) |r| ok = ok or r.class == got;
+    try testing.expect(ok);
+}
+
+test "fuzz: RuleSet6.validateSorted agrees with validate; lookupReference6 returns default or a loaded class" {
+    try std.testing.fuzz({}, fuzzValidate6SortedAgrees, .{});
+}
+
+test "RuleSet6.validateSorted agrees with validate across a deterministic duplicate-heavy sweep" {
+    var prng = std.Random.DefaultPrng.init(0x6F3);
+    const rnd = prng.random();
+    var buf: [32]ClassifierRule6 = undefined;
+    var scratch: [buf.len]usize = undefined;
+    var n: usize = 0;
+    while (n <= buf.len) : (n += 1) {
+        var trial: usize = 0;
+        while (trial < 24) : (trial += 1) {
+            for (buf[0..n]) |*r| {
+                var addr: [16]u8 = @splat(0);
+                addr[0] = 0x20;
+                addr[15] = rnd.uintLessThan(u8, 3);
+                const plen: u8 = switch (rnd.uintLessThan(u8, 4)) {
+                    0 => 126,
+                    1 => 127,
+                    2 => 128,
+                    else => 129 + rnd.uintLessThan(u8, 3), // out of spec
+                };
+                r.* = .{ .prefix = .{ .addr = addr, .prefix_len = plen }, .class = rnd.int(u32) };
+            }
+            const rs: RuleSet6 = .{ .rules = buf[0..n] };
+            const max_entries = rnd.uintLessThan(usize, 48);
+            try testing.expectEqual(rs.validate(max_entries), rs.validateSorted(max_entries, scratch[0..n]));
         }
     }
 }

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! xdp-classifier — an XDP packet classifier: subscriber IPv4 prefix ->
+//! xdp-classifier — an XDP packet classifier: subscriber IPv4/IPv6 prefix ->
 //! traffic-class handle, for a LibreQoS-style edge shaper. Given a set of
 //! rules `{ ip_prefix -> class_handle }`, this module produces a valid,
-//! verifier-passing XDP eBPF program that, per packet, parses
-//! Ethernet+IPv4, performs a longest-prefix-match lookup against a
-//! `BPF_MAP_TYPE_LPM_TRIE` map keyed on the packet's source (or
-//! destination) IPv4 address, and stashes the resolved class handle into a
-//! scratch map before returning `XDP_PASS`.
+//! verifier-passing XDP eBPF program that, per packet, skips up to two
+//! 802.1Q/802.1ad VLAN tags, parses IPv4 (or IPv6, with an IPv6 map),
+//! performs a longest-prefix-match lookup against a `BPF_MAP_TYPE_LPM_TRIE`
+//! map keyed on the packet's source (or destination) address, and stashes
+//! the resolved class handle into a scratch map before returning `XDP_PASS`.
 //!
 //! **Status: fully implemented, no Fable-tier core.** Unlike the sibling
 //! `ebpf` module (which genuinely needed a Fable pass for its three
@@ -41,7 +41,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "XDP packet classifier for a LibreQoS-style edge shaper — IPv4 prefix→traffic-class via LPM-trie lookup, per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map)",
+    .doc = "XDP packet classifier for a LibreQoS-style edge shaper — IPv4/IPv6 prefix→traffic-class via LPM-trie lookup behind 0-2 VLAN tags (802.1Q/QinQ), per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map)",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -67,12 +67,22 @@ pub const RuleSet = rules_mod.RuleSet;
 pub const RuleSetError = rules_mod.RuleSetError;
 pub const LpmKey = rules_mod.LpmKey;
 pub const lookupReference = rules_mod.lookupReference;
+// IPv6: a separate table, a separate 20-byte-key LPM map (IPv4 untouched).
+pub const Ipv6Prefix = rules_mod.Ipv6Prefix;
+pub const ClassifierRule6 = rules_mod.ClassifierRule6;
+pub const RuleSet6 = rules_mod.RuleSet6;
+pub const LpmKey6 = rules_mod.LpmKey6;
+pub const lookupReference6 = rules_mod.lookupReference6;
 
 const maps_mod = @import("maps.zig");
 pub const createLpmTrieMap = maps_mod.createLpmTrieMap;
 pub const createScratchMap = maps_mod.createScratchMap;
 pub const populateRule = maps_mod.populateRule;
 pub const populateRuleSet = maps_mod.populateRuleSet;
+pub const createLpm6TrieMap = maps_mod.createLpm6TrieMap;
+pub const populateRule6 = maps_mod.populateRule6;
+pub const populateRuleSet6 = maps_mod.populateRuleSet6;
+pub const lpm6_key_size = maps_mod.lpm6_key_size;
 pub const readScratchClass = maps_mod.readScratchClass;
 /// Every possible CPU's scratch slot. ⭐ On a live classifier the packet's own
 /// CPU wrote the value, and that is usually not CPU 0 — prefer this over
@@ -102,6 +112,8 @@ pub const cpumap_value_size = maps_mod.cpumap_value_size;
 const classifier_mod = @import("classifier.zig");
 pub const KeyField = classifier_mod.KeyField;
 pub const ClassifierOptions = classifier_mod.ClassifierOptions;
+/// VLAN tags skipped before the EtherType check (0..2, default 2).
+pub const VlanDepth = classifier_mod.VlanDepth;
 /// No Fable core — see this module's doc comment and `classifier.zig`'s.
 /// Fully implemented, golden-tested, structurally verified, and
 /// CAP_BPF-load-verified (gated).
@@ -130,6 +142,9 @@ test {
     // instrument only, see vm.zig's own doc comment) so it needs this
     // explicit pull-in same as the three above.
     _ = @import("vm.zig");
+    // The real kernel (verifier + BPF_PROG_TEST_RUN) as the oracle for the
+    // VLAN/IPv6 packet path; CAP_BPF-gated, skips otherwise.
+    _ = @import("kernel_test.zig");
 }
 
 test "smoke: module imports and re-exports resolve" {

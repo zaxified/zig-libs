@@ -258,7 +258,7 @@ pub const node_announcement_vectors = [_]NodeAnnouncementVector{
         .extra_hex = "",
     },
     .{
-        .description = "ipv4 + onionv3 + excess_address_data",
+        .description = "ipv4 + onionv2 + excess_address_data (upstream call (false, true, false, true, false, false, true, false); was mislabelled onionv3 until 2026-10-06)",
         .payload_hex = "d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a000122013413a7031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2020201010101010101010101010101010101010101010101010101010101010101010005401fffefdfc260703fffefdfcfbfaf9f8f7f62607216c280b5395a2546e7e4b2663e04f811622f15a4f92e83aa2e92ba2a573c139142c54ae63072a1ec1ee7dc0c04bde5c847806172aa05c92c22ae8e308d1d269",
         .signature_hex = "d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a",
         .features_hex = "22",

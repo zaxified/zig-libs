@@ -23,8 +23,9 @@
 //! fixed fields are preserved verbatim as `.extra` (borrowed, unparsed)
 //! rather than dropped, keeping digest computation forward-compatible.
 //!
-//! Deferred (see `../SPEC.md`): `announcement_signatures`,
-//! `gossip_timestamp_filter` — not in this module's required set.
+//! Also (2026-10-06): `announcement_signatures`, `gossip_timestamp_filter`,
+//! and typed `node_announcement` address descriptors (`AddressIterator`,
+//! `encodeAddresses`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -149,8 +150,9 @@ pub const NodeAnnouncement = struct {
     rgb_color: [3]u8,
     alias: [32]u8,
     /// Borrowed slice: the raw `address descriptor` bytes (BOLT#7's
-    /// `ipv4`/`ipv6`/`torv3`/`dns` encoding) -- opaque here, no per-type
-    /// address parsing (a distinct, self-contained concern; see SPEC.md).
+    /// `ipv4`/`ipv6`/`torv3`/`dns` encoding), kept verbatim because the
+    /// signature covers them. `addressIterator(msg.addresses)` decodes them;
+    /// `encodeAddresses` builds them.
     addresses: []const u8,
     /// Any bytes after `addresses` (module doc comment).
     extra: []const u8 = &.{},
@@ -193,6 +195,172 @@ pub fn serializeNodeAnnouncement(allocator: Allocator, msg: NodeAnnouncement) me
 pub fn nodeAnnouncementDigest(payload: []const u8) message.ReadError![32]u8 {
     if (payload.len < NODE_ANNOUNCEMENT_SIG_BYTES) return error.Truncated;
     return sha256d(payload[NODE_ANNOUNCEMENT_SIG_BYTES..]);
+}
+
+// ── node_announcement address descriptors (BOLT#7) ───────────────────────
+
+/// BOLT#7 `address descriptor` type octets.
+pub const AddressType = enum(u8) {
+    ipv4 = 1,
+    ipv6 = 2,
+    /// Deprecated Tor v2 onion service (12 octets). BOLT#7: receivers
+    /// "SHOULD ignore", origins "SHOULD not announce" — still decoded so the
+    /// descriptors after it stay reachable.
+    torv2 = 3,
+    torv3 = 4,
+    dns = 5,
+    _,
+};
+
+/// One decoded address descriptor. `dns.hostname` borrows the input.
+pub const Address = union(enum) {
+    ipv4: struct { addr: [4]u8, port: u16 },
+    ipv6: struct { addr: [16]u8, port: u16 },
+    torv2: struct { addr: [10]u8, port: u16 },
+    /// prop224 v3 onion: `ed25519_pubkey || checksum || version`. The
+    /// checksum (`sha3(".onion checksum" || pubkey || version)[:2]`) is
+    /// carried, not verified.
+    torv3: struct { ed25519_pubkey: [32]u8, checksum: u16, version: u8, port: u16 },
+    /// ASCII hostname (BOLT#7: non-ASCII MUST be Punycode), 0..255 octets.
+    dns: struct { hostname: []const u8, port: u16 },
+
+    pub fn port(self: Address) u16 {
+        return switch (self) {
+            inline else => |a| a.port,
+        };
+    }
+
+    pub fn addressType(self: Address) AddressType {
+        return switch (self) {
+            .ipv4 => .ipv4,
+            .ipv6 => .ipv6,
+            .torv2 => .torv2,
+            .torv3 => .torv3,
+            .dns => .dns,
+        };
+    }
+};
+
+pub const AddressDecodeError = error{
+    /// A descriptor of a KNOWN type runs past `addrlen` (BOLT#7: "if
+    /// `addrlen` is insufficient to hold the address descriptors of the
+    /// known types: SHOULD send a `warning`").
+    Truncated,
+    /// A DNS hostname octet ≥ 0x80 (BOLT#7: "`hostname` bytes MUST be ASCII").
+    NonAsciiHostname,
+};
+
+/// Walks `node_announcement.addresses`. `next` returns descriptors in wire
+/// order and `null` at the end of the field OR at the first descriptor of
+/// an unknown type — BOLT#7: "SHOULD ignore the first `address descriptor`
+/// that does NOT match the types defined above", and an unknown type has
+/// no known length, so nothing after it can be framed. `unparsed()` then
+/// returns those remaining octets (rust-lightning's `excess_address_data`).
+///
+/// Not enforced here, because they are origin-side rules or receiver
+/// SHOULDs the caller decides on: ascending type order, `port == 0`
+/// ("SHOULD ignore that address descriptor" — check `Address.port()`), and
+/// more than one `dns` descriptor (receiver "MUST not forward" such an
+/// announcement — count them).
+pub const AddressIterator = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    stopped: bool = false,
+
+    /// An error is final: the iterator stops there (later calls return
+    /// `null`) and `unparsed()` returns the descriptor that failed and
+    /// everything after it — so a caller that catches the error and keeps
+    /// calling `next` ends instead of meeting the same error forever.
+    pub fn next(self: *AddressIterator) AddressDecodeError!?Address {
+        if (self.stopped or self.pos >= self.bytes.len) return null;
+        errdefer self.stopped = true;
+        var r: Reader = .{ .bytes = self.bytes, .pos = self.pos };
+        const t: AddressType = @enumFromInt(r.byte() catch unreachable);
+        const a: Address = switch (t) {
+            .ipv4 => .{ .ipv4 = .{ .addr = try r.takeArray(4), .port = try r.u16be() } },
+            .ipv6 => .{ .ipv6 = .{ .addr = try r.takeArray(16), .port = try r.u16be() } },
+            .torv2 => .{ .torv2 = .{ .addr = try r.takeArray(10), .port = try r.u16be() } },
+            .torv3 => .{ .torv3 = .{
+                .ed25519_pubkey = try r.takeArray(32),
+                .checksum = try r.u16be(),
+                .version = try r.byte(),
+                .port = try r.u16be(),
+            } },
+            .dns => blk: {
+                const n = try r.byte();
+                const name = try r.takeBytes(n);
+                for (name) |c| if (c >= 0x80) return error.NonAsciiHostname;
+                break :blk .{ .dns = .{ .hostname = name, .port = try r.u16be() } };
+            },
+            _ => {
+                self.stopped = true;
+                return null;
+            },
+        };
+        self.pos = r.pos;
+        return a;
+    }
+
+    /// The octets `next` did not consume: empty after a clean walk, the
+    /// unknown-typed tail after `next` stopped on one.
+    pub fn unparsed(self: AddressIterator) []const u8 {
+        return self.bytes[self.pos..];
+    }
+};
+
+pub fn addressIterator(addresses: []const u8) AddressIterator {
+    return .{ .bytes = addresses };
+}
+
+pub const AddressEncodeError = error{
+    /// BOLT#7 origin: "MUST NOT create an address descriptor with `port` equal to 0".
+    ZeroPort,
+    /// BOLT#7 origin: "MUST place address descriptors in ascending order".
+    AddressesNotAscending,
+    /// BOLT#7 origin: "MUST NOT announce more than one `type 5` DNS hostname".
+    MultipleDnsHostnames,
+    /// `hostname` is not ASCII, or longer than its `u8` length prefix.
+    InvalidHostname,
+};
+
+/// Encodes `addrs` as a `node_announcement.addresses` field value, enforcing
+/// the origin-node MUSTs above. Append any unknown-typed tail yourself.
+pub fn encodeAddresses(allocator: Allocator, addrs: []const Address) (Allocator.Error || AddressEncodeError)![]u8 {
+    var last: u8 = 0;
+    var dns_seen = false;
+    for (addrs) |a| {
+        if (a.port() == 0) return error.ZeroPort;
+        const t = @intFromEnum(a.addressType());
+        if (t < last) return error.AddressesNotAscending;
+        last = t;
+        if (a == .dns) {
+            if (dns_seen) return error.MultipleDnsHostnames;
+            dns_seen = true;
+            if (a.dns.hostname.len > std.math.maxInt(u8)) return error.InvalidHostname;
+            for (a.dns.hostname) |c| if (c >= 0x80) return error.InvalidHostname;
+        }
+    }
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    for (addrs) |a| {
+        try w.putU8(allocator, @intFromEnum(a.addressType()));
+        switch (a) {
+            .ipv4 => |v| try w.putBytes(allocator, &v.addr),
+            .ipv6 => |v| try w.putBytes(allocator, &v.addr),
+            .torv2 => |v| try w.putBytes(allocator, &v.addr),
+            .torv3 => |v| {
+                try w.putBytes(allocator, &v.ed25519_pubkey);
+                try w.putU16be(allocator, v.checksum);
+                try w.putU8(allocator, v.version);
+            },
+            .dns => |v| {
+                try w.putU8(allocator, @intCast(v.hostname.len));
+                try w.putBytes(allocator, v.hostname);
+            },
+        }
+        try w.putU16be(allocator, a.port());
+    }
+    return w.toOwned(allocator);
 }
 
 // ── channel_update (type 258) ────────────────────────────────────────────
@@ -258,6 +426,86 @@ pub fn serializeChannelUpdate(allocator: Allocator, msg: ChannelUpdate) Allocato
 pub fn channelUpdateDigest(payload: []const u8) message.ReadError![32]u8 {
     if (payload.len < CHANNEL_UPDATE_SIG_BYTES) return error.Truncated;
     return sha256d(payload[CHANNEL_UPDATE_SIG_BYTES..]);
+}
+
+// ── announcement_signatures (type 259) — no tlv_stream ───────────────────
+
+pub const ANNOUNCEMENT_SIGNATURES_TYPE: u16 = 259;
+
+/// The two signatures a channel peer contributes to the eventual
+/// `channel_announcement` (over `channelAnnouncementDigest` of it). Opaque
+/// bytes like every signature here — the caller verifies.
+pub const AnnouncementSignatures = struct {
+    channel_id: message.ChannelId,
+    short_channel_id: ShortChannelId,
+    node_signature: Signature,
+    bitcoin_signature: Signature,
+
+    pub fn deinit(_: *AnnouncementSignatures, _: Allocator) void {}
+};
+
+/// Trailing octets after `bitcoin_signature` are ignored, like every other
+/// message without a `tlv_stream` here (BOLT#1: receiver "MAY ignore the
+/// `extension`").
+pub fn decodeAnnouncementSignatures(bytes: []const u8) message.FrameError!AnnouncementSignatures {
+    var r = try message.openFrame(bytes, ANNOUNCEMENT_SIGNATURES_TYPE);
+    return .{
+        .channel_id = try r.takeArray(32),
+        .short_channel_id = try readScid(&r),
+        .node_signature = try readSignature(&r),
+        .bitcoin_signature = try readSignature(&r),
+    };
+}
+
+pub fn serializeAnnouncementSignatures(allocator: Allocator, msg: AnnouncementSignatures) Allocator.Error![]u8 {
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try message.putFrameType(&w, allocator, ANNOUNCEMENT_SIGNATURES_TYPE);
+    try w.putBytes(allocator, &msg.channel_id);
+    try putScid(&w, allocator, msg.short_channel_id);
+    try w.putBytes(allocator, &msg.node_signature);
+    try w.putBytes(allocator, &msg.bitcoin_signature);
+    return w.toOwned(allocator);
+}
+
+// ── gossip_timestamp_filter (type 265) — no tlv_stream ───────────────────
+
+pub const GOSSIP_TIMESTAMP_FILTER_TYPE: u16 = 265;
+
+pub const GossipTimestampFilter = struct {
+    chain_hash: ChainHash,
+    first_timestamp: u32,
+    timestamp_range: u32,
+
+    pub fn deinit(_: *GossipTimestampFilter, _: Allocator) void {}
+
+    /// BOLT#7 receiver: a gossip message passes when its `timestamp` "is
+    /// greater or equal to `first_timestamp`, and less than `first_timestamp`
+    /// plus `timestamp_range`" — computed in `u64`, so a range reaching past
+    /// 2^32 (rust-lightning's own vector uses `0xffffffff`) does not wrap.
+    pub fn matches(self: GossipTimestampFilter, timestamp: u32) bool {
+        const end: u64 = @as(u64, self.first_timestamp) + self.timestamp_range;
+        return timestamp >= self.first_timestamp and @as(u64, timestamp) < end;
+    }
+};
+
+pub fn decodeGossipTimestampFilter(bytes: []const u8) message.FrameError!GossipTimestampFilter {
+    var r = try message.openFrame(bytes, GOSSIP_TIMESTAMP_FILTER_TYPE);
+    return .{
+        .chain_hash = try r.takeArray(32),
+        .first_timestamp = try r.u32be(),
+        .timestamp_range = try r.u32be(),
+    };
+}
+
+pub fn serializeGossipTimestampFilter(allocator: Allocator, msg: GossipTimestampFilter) Allocator.Error![]u8 {
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try message.putFrameType(&w, allocator, GOSSIP_TIMESTAMP_FILTER_TYPE);
+    try w.putBytes(allocator, &msg.chain_hash);
+    try w.putU32be(allocator, msg.first_timestamp);
+    try w.putU32be(allocator, msg.timestamp_range);
+    return w.toOwned(allocator);
 }
 
 // ── verification seam ─────────────────────────────────────────────────────
@@ -1570,4 +1818,312 @@ test "TEETH: a channel_announcement with unordered node ids is refused (BOLT#7 M
     msg.node_id_2 = @splat(0x07);
     try std.testing.expect(!nodeIdsOrdered(msg));
     try std.testing.expect(!(try verifyChannelAnnouncement(&payload, msg, S.always, null)));
+}
+
+// ── announcement_signatures / gossip_timestamp_filter / addresses ─────────
+// (added 2026-10-06)
+
+const sf_kat = @import("bolt7_sigs_filter_kat_vectors.zig");
+
+test "official vector (rust-lightning msgs.rs encoding_announcement_signatures): both directions" {
+    const allocator = testing.allocator;
+    const v = sf_kat.announcement_signatures_vector;
+    const payload = try hexDecodeAlloc(allocator, v.payload_hex);
+    defer allocator.free(payload);
+    const full = try withTypePrefix(allocator, ANNOUNCEMENT_SIGNATURES_TYPE, payload);
+    defer allocator.free(full);
+
+    const m = try decodeAnnouncementSignatures(full);
+    try testing.expectEqualSlices(u8, &hexToArray(32, v.channel_id_hex), &m.channel_id);
+    try testing.expectEqual(v.short_channel_id, m.short_channel_id);
+    try testing.expectEqualSlices(u8, &hexToArray(64, v.node_signature_hex), &m.node_signature);
+    try testing.expectEqualSlices(u8, &hexToArray(64, v.bitcoin_signature_hex), &m.bitcoin_signature);
+    // Same key, same signed message as rust-lightning's node_announcement
+    // vector: the two upstream tests agree on where node_signature sits.
+    try testing.expectEqualSlices(u8, &hexToArray(64, au_kat.node_announcement_vectors[1].signature_hex), &m.node_signature);
+
+    const out = try serializeAnnouncementSignatures(allocator, .{
+        .channel_id = hexToArray(32, v.channel_id_hex),
+        .short_channel_id = v.short_channel_id,
+        .node_signature = hexToArray(64, v.node_signature_hex),
+        .bitcoin_signature = hexToArray(64, v.bitcoin_signature_hex),
+    });
+    defer allocator.free(out);
+    try testing.expectEqualSlices(u8, full, out);
+}
+
+test "official vector (rust-lightning msgs.rs encoding_gossip_timestamp_filter): both directions + matches()" {
+    const allocator = testing.allocator;
+    const v = sf_kat.gossip_timestamp_filter_vector;
+    const payload = try hexDecodeAlloc(allocator, v.payload_hex);
+    defer allocator.free(payload);
+    const full = try withTypePrefix(allocator, GOSSIP_TIMESTAMP_FILTER_TYPE, payload);
+    defer allocator.free(full);
+
+    const m = try decodeGossipTimestampFilter(full);
+    try testing.expectEqualSlices(u8, &hexToArray(32, v.chain_hash_hex), &m.chain_hash);
+    try testing.expectEqual(v.first_timestamp, m.first_timestamp);
+    try testing.expectEqual(v.timestamp_range, m.timestamp_range);
+
+    const out = try serializeGossipTimestampFilter(allocator, .{
+        .chain_hash = hexToArray(32, v.chain_hash_hex),
+        .first_timestamp = v.first_timestamp,
+        .timestamp_range = v.timestamp_range,
+    });
+    defer allocator.free(out);
+    try testing.expectEqualSlices(u8, full, out);
+
+    // first + range overflows u32 here; the window must not wrap.
+    try testing.expect(m.matches(1590000000));
+    try testing.expect(m.matches(std.math.maxInt(u32)));
+    try testing.expect(!m.matches(1589999999));
+}
+
+test "gossip_timestamp_filter.matches: half-open window, and the 'no gossip' filter" {
+    const f: GossipTimestampFilter = .{ .chain_hash = @splat(0), .first_timestamp = 100, .timestamp_range = 10 };
+    try testing.expect(!f.matches(99));
+    try testing.expect(f.matches(100));
+    try testing.expect(f.matches(109));
+    try testing.expect(!f.matches(110));
+    // BOLT#7's recommended filter for a peer without gossip_queries.
+    const none: GossipTimestampFilter = .{ .chain_hash = @splat(0), .first_timestamp = 0xFFFF_FFFF, .timestamp_range = 0 };
+    try testing.expect(!none.matches(0xFFFF_FFFF));
+    try testing.expect(!none.matches(0));
+}
+
+test "hostile: announcement_signatures / gossip_timestamp_filter truncated, wrong type" {
+    var buf: [2 + 32 + 8 + 64 + 64]u8 = @splat(0xAB);
+    std.mem.writeInt(u16, buf[0..2], ANNOUNCEMENT_SIGNATURES_TYPE, .big);
+    _ = try decodeAnnouncementSignatures(&buf);
+    try testing.expectError(error.Truncated, decodeAnnouncementSignatures(buf[0 .. buf.len - 1]));
+    try testing.expectError(error.WrongType, decodeGossipTimestampFilter(&buf));
+    std.mem.writeInt(u16, buf[0..2], GOSSIP_TIMESTAMP_FILTER_TYPE, .big);
+    _ = try decodeGossipTimestampFilter(buf[0 .. 2 + 32 + 8]);
+    try testing.expectError(error.Truncated, decodeGossipTimestampFilter(buf[0 .. 2 + 32 + 7]));
+}
+
+/// rust-lightning's `do_encoding_node_announcement` address literals.
+const ldk_ipv4: Address = .{ .ipv4 = .{ .addr = .{ 255, 254, 253, 252 }, .port = 9735 } };
+const ldk_ipv6: Address = .{ .ipv6 = .{ .addr = .{ 255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240 }, .port = 9735 } };
+/// Upstream `OnionV2([255, …, 246, 38, 7])`: 10 address octets then the port.
+const ldk_torv2: Address = .{ .torv2 = .{ .addr = .{ 255, 254, 253, 252, 251, 250, 249, 248, 247, 246 }, .port = (38 << 8) | 7 } };
+const ldk_torv3: Address = .{ .torv3 = .{
+    .ed25519_pubkey = .{ 255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 243, 242, 241, 240, 239, 238, 237, 236, 235, 234, 233, 232, 231, 230, 229, 228, 227, 226, 225, 224 },
+    .checksum = 32,
+    .version = 16,
+    .port = 9735,
+} };
+const ldk_dns: Address = .{ .dns = .{ .hostname = "host", .port = 9735 } };
+/// Upstream `excess_address_data` is 64 octets starting with type 33.
+const ldk_excess_len: usize = 64;
+
+fn expectAddress(want: Address, got: Address) !void {
+    try testing.expectEqual(want.addressType(), got.addressType());
+    try testing.expectEqual(want.port(), got.port());
+    switch (want) {
+        .ipv4 => |w| try testing.expectEqualSlices(u8, &w.addr, &got.ipv4.addr),
+        .ipv6 => |w| try testing.expectEqualSlices(u8, &w.addr, &got.ipv6.addr),
+        .torv2 => |w| try testing.expectEqualSlices(u8, &w.addr, &got.torv2.addr),
+        .torv3 => |w| {
+            try testing.expectEqualSlices(u8, &w.ed25519_pubkey, &got.torv3.ed25519_pubkey);
+            try testing.expectEqual(w.checksum, got.torv3.checksum);
+            try testing.expectEqual(w.version, got.torv3.version);
+        },
+        .dns => |w| try testing.expectEqualStrings(w.hostname, got.dns.hostname),
+    }
+}
+
+test "official vectors (rust-lightning msgs.rs encoding_node_announcement): address descriptors, both directions" {
+    const allocator = testing.allocator;
+    // Per vector, in `au_kat.node_announcement_vectors` order: the addresses
+    // upstream pushed, and whether `excess_address_data` follows them.
+    const Case = struct { addrs: []const Address, excess: bool };
+    const cases = [_]Case{
+        .{ .addrs = &.{ ldk_ipv4, ldk_ipv6, ldk_torv2, ldk_torv3, ldk_dns }, .excess = true },
+        .{ .addrs = &.{}, .excess = false },
+        .{ .addrs = &.{ldk_ipv4}, .excess = false },
+        .{ .addrs = &.{ldk_ipv6}, .excess = false },
+        .{ .addrs = &.{ldk_torv2}, .excess = false },
+        .{ .addrs = &.{ldk_torv3}, .excess = false },
+        .{ .addrs = &.{ldk_dns}, .excess = false },
+        .{ .addrs = &.{}, .excess = true },
+        .{ .addrs = &.{ ldk_ipv4, ldk_torv2 }, .excess = true },
+        .{ .addrs = &.{ ldk_ipv6, ldk_torv3 }, .excess = false },
+    };
+    try testing.expectEqual(cases.len, au_kat.node_announcement_vectors.len);
+    for (au_kat.node_announcement_vectors, cases) |v, c| {
+        errdefer std.debug.print("node_announcement vector: {s}\n", .{v.description});
+        const field = try hexDecodeAlloc(allocator, v.addresses_hex);
+        defer allocator.free(field);
+
+        // DECODE.
+        var it = addressIterator(field);
+        for (c.addrs) |want| try expectAddress(want, (try it.next()) orelse return error.MissingAddress);
+        try testing.expectEqual(@as(?Address, null), try it.next());
+        try testing.expectEqual(@as(?Address, null), try it.next()); // stays stopped
+        const tail = it.unparsed();
+        try testing.expectEqual(if (c.excess) ldk_excess_len else 0, tail.len);
+        if (c.excess) try testing.expectEqual(@as(u8, 33), tail[0]);
+
+        // ENCODE: the known descriptors byte-exact; the unknown tail is the
+        // caller's to append.
+        const enc = try encodeAddresses(allocator, c.addrs);
+        defer allocator.free(enc);
+        try testing.expectEqualSlices(u8, field[0 .. field.len - tail.len], enc);
+    }
+}
+
+test "encodeAddresses: refuses what BOLT#7 forbids an origin to send" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.ZeroPort, encodeAddresses(allocator, &.{.{ .ipv4 = .{ .addr = .{ 1, 2, 3, 4 }, .port = 0 } }}));
+    try testing.expectError(error.AddressesNotAscending, encodeAddresses(allocator, &.{ ldk_ipv6, ldk_ipv4 }));
+    try testing.expectError(error.MultipleDnsHostnames, encodeAddresses(allocator, &.{ ldk_dns, ldk_dns }));
+    try testing.expectError(error.InvalidHostname, encodeAddresses(allocator, &.{.{ .dns = .{ .hostname = "h\xc3\xa9", .port = 1 } }}));
+    const long_name: [256]u8 = @splat('a');
+    try testing.expectError(error.InvalidHostname, encodeAddresses(allocator, &.{.{ .dns = .{ .hostname = &long_name, .port = 1 } }}));
+    // Two of one type in a row is ascending (non-decreasing) and allowed.
+    const two = try encodeAddresses(allocator, &.{ ldk_ipv4, ldk_ipv4 });
+    defer allocator.free(two);
+    try testing.expectEqual(@as(usize, 14), two.len);
+    // The longest hostname round-trips.
+    const max = try encodeAddresses(allocator, &.{.{ .dns = .{ .hostname = long_name[0..255], .port = 1 } }});
+    defer allocator.free(max);
+    var it = addressIterator(max);
+    try testing.expectEqual(@as(usize, 255), (try it.next()).?.dns.hostname.len);
+}
+
+test "hostile: address descriptors truncated mid-field or non-ASCII fail closed" {
+    // Each known type cut one octet short.
+    const cuts = [_][]const u8{
+        &.{ 1, 1, 2, 3, 4, 0x26 },
+        &.{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x26 },
+        &.{ 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x26 },
+        &([_]u8{4} ++ [_]u8{0} ** 36),
+        &.{ 5, 4, 'h', 'o', 's', 't', 0x26 },
+        &.{ 5, 200, 'h' }, // hostname length past the field
+        &.{5}, // no length octet
+    };
+    for (cuts) |c| {
+        var it = addressIterator(c);
+        try testing.expectError(error.Truncated, it.next());
+        // Review 2026-10-06 (PR #5): the error is final. `next` used to leave
+        // `pos` and `stopped` as they were, so every later call met the same
+        // descriptor again — `while (it.next() catch continue)` never ended.
+        try testing.expectEqual(@as(?Address, null), try it.next());
+        try testing.expectEqual(c.len, it.unparsed().len);
+    }
+    var it = addressIterator(&.{ 5, 2, 'h', 0xFF, 0x26, 0x07 });
+    try testing.expectError(error.NonAsciiHostname, it.next());
+    try testing.expectEqual(@as(?Address, null), try it.next());
+    // After a good descriptor, the failing one and its tail stay unparsed.
+    var after = addressIterator(&.{ 1, 1, 2, 3, 4, 0x26, 0x07, 1, 9 });
+    _ = (try after.next()).?;
+    try testing.expectError(error.Truncated, after.next());
+    try testing.expectEqual(@as(?Address, null), try after.next());
+    try testing.expectEqualSlices(u8, &.{ 1, 9 }, after.unparsed());
+    // Type 0 is not a defined descriptor: stop, everything is unparsed.
+    var z = addressIterator(&.{ 0, 1, 2 });
+    try testing.expectEqual(@as(?Address, null), try z.next());
+    try testing.expectEqual(@as(usize, 3), z.unparsed().len);
+}
+
+// ── fuzz: the new BOLT#7 decoders + the address walker ────────────────────
+//
+// Every decoder runs on every input (no drawn value selects the path); the
+// address walker runs over the input as an `addresses` field, which is
+// exactly what a peer controls.
+const GossipExtraCorpus = struct {
+    store: [12 * (4 + 256)]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *GossipExtraCorpus, bytes: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], bytes);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *GossipExtraCorpus, allocator: Allocator) ![]const []const u8 {
+        const sigs = try serializeAnnouncementSignatures(allocator, .{
+            .channel_id = fillPattern(32, 1),
+            .short_channel_id = 0x0008_3a84_0000_034d,
+            .node_signature = fillPattern(64, 2),
+            .bitcoin_signature = fillPattern(64, 3),
+        });
+        defer allocator.free(sigs);
+        self.push(sigs);
+        self.push(sigs[0 .. sigs.len - 1]);
+
+        const filt = try serializeGossipTimestampFilter(allocator, .{ .chain_hash = fillPattern(32, 4), .first_timestamp = 1590000000, .timestamp_range = 0xFFFF_FFFF });
+        defer allocator.free(filt);
+        self.push(filt);
+        self.push(filt[0 .. filt.len - 1]);
+
+        // Address fields: every known type, the upstream unknown tail, and refusals.
+        const addrs = try encodeAddresses(allocator, &.{ ldk_ipv4, ldk_ipv6, ldk_torv2, ldk_torv3, ldk_dns });
+        defer allocator.free(addrs);
+        self.push(addrs);
+        self.push(&.{ 1, 127, 0, 0, 1, 0x26, 0x07, 0x21, 0xAA, 0xBB });
+        self.push(&.{ 5, 4, 'h', 'o', 's', 't', 0x26 }); // port cut short
+        self.push(&.{ 5, 1, 0x80, 0x00, 0x01 });
+        self.push(&.{ 4, 0xFF });
+        return self.entries[0..self.n];
+    }
+};
+
+const GossipExtraOutcome = struct { decoded: usize = 0, addresses: usize = 0 };
+
+fn runGossipExtra(bytes: []const u8) GossipExtraOutcome {
+    var o: GossipExtraOutcome = .{};
+    if (decodeAnnouncementSignatures(bytes)) |_| o.decoded += 1 else |_| {}
+    if (decodeGossipTimestampFilter(bytes)) |f| {
+        o.decoded += 1;
+        _ = f.matches(f.first_timestamp);
+    } else |_| {}
+    var it = addressIterator(bytes);
+    // Bounded: every successful `next` consumes at least 3 octets.
+    while (it.next() catch null) |a| {
+        o.addresses += 1;
+        _ = a.port();
+    }
+    _ = it.unparsed();
+    return o;
+}
+
+test "fuzz: announcement_signatures / gossip_timestamp_filter / address descriptors never panic" {
+    var corpus: GossipExtraCorpus = .{};
+    try testing.fuzz({}, fuzzGossipExtra, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+fn fuzzGossipExtra(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    // One faithful `smith.slice` draw (see `fuzzDecodeQueryShortChannelIds`).
+    const len: usize = smith.slice(&buf);
+    _ = runGossipExtra(buf[0..len]);
+}
+
+test "corpus: every gossip-extra seed reaches the decoders, and the counts are pinned" {
+    var corpus: GossipExtraCorpus = .{};
+    const entries = try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var addresses: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const o = runGossipExtra(buf[0..len]);
+        decoded += o.decoded;
+        addresses += o.addresses;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    // The two whole messages; their truncations are refused.
+    try testing.expectEqual(@as(usize, 2), decoded);
+    // 5 from the full field, 1 before the unknown tail, and 1 ipv4 each from
+    // the four message seeds (types 0x0103/0x0109 open with octet 1); the
+    // dns seed is one octet short of its port and refused.
+    try testing.expectEqual(@as(usize, 10), addresses);
 }

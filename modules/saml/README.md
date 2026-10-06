@@ -9,7 +9,8 @@ Top of the SAML cluster: `xml` → `xmldsig` → **`saml`** (plus `xmlenc` + `rs
 for the optional encrypted-assertion path). See `SPEC.md` for the full profile,
 the XSW defense model, and fixture provenance.
 
-Security posture in one breath: the IdP key is configured out-of-band and is the
+Security posture in one breath: the IdP key (or, for certificate rollover, the
+key set) is configured out-of-band and is the
 only thing signatures are checked against (**never** `<KeyInfo>`); a valid
 signature must be *pinned by pointer identity* to the exact assertion consumed;
 no signature ⇒ rejected (no downgrade); the system clock is never read;
@@ -104,6 +105,71 @@ const xml = try saml.buildAuthnRequest(gpa, .{
 defer gpa.free(xml);
 // Apply the binding yourself: deflate + base64 + URL-encode for HTTP-Redirect.
 ```
+
+Further AuthnRequest options (all default to "not emitted"):
+
+```zig
+const req = try saml.buildAuthnRequest(gpa, .{
+    .id = my_request_id,
+    .issue_instant = "2024-06-01T12:00:00Z",
+    .issuer = "https://sp.example.org/metadata",
+    .acs_url = "https://sp.example.org/acs",
+    .force_authn = true,                       // ForceAuthn="true"
+    .is_passive = false,                       // IsPassive
+    .protocol_binding = .http_post,            // or .http_artifact (Redirect is not allowed for a Response)
+    .attribute_consuming_service_index = 1,    // selects an AttributeConsumingService in your metadata
+    .requested_authn_context = .{
+        .comparison = .minimum,                // exact | minimum | maximum | better
+        .class_refs = &.{"http://eidas.europa.eu/LoA/substantial"},
+    },
+});
+// The IdP may still answer with another context: enforce it with Config.required_loa.
+```
+
+## SP metadata — what the IdP registers you from
+
+```zig
+const md = try saml.buildSpMetadata(gpa, .{
+    .entity_id = "https://sp.example.org/metadata",
+    .assertion_consumer_services = &.{
+        .{ .location = "https://sp.example.org/acs", .index = 0, .is_default = true },
+    },
+    .single_logout_services = &.{
+        .{ .binding = saml.binding_http_redirect, .location = "https://sp.example.org/slo" },
+    },
+    .name_id_formats = &.{"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"},
+    .authn_requests_signed = true,
+    .want_assertions_signed = true,
+    .signing_certs_der = &.{sp_cert_der},     // two during an SP key rollover
+    .encryption_certs_der = &.{sp_cert_der},  // the cert for Config.sp_decrypt_key
+    // optional: attribute_consuming_services, organization, contacts,
+    // valid_until / cache_duration (strings you format — no clock here)
+    .id = "_sp-metadata",                     // needed only to sign
+    .sign_with = .{ .rsa = sp_signing_key },  // optional, RSA-SHA256 / exclusive C14N
+});
+defer gpa.free(md);
+```
+
+Every refusal is typed (`SpMetadataError`: duplicate ACS index, two defaults, an empty
+required value, a non-NCName `id`, a character XML cannot carry, ...). The emitted
+documents are validated against the OASIS metadata schema and the signed one against
+xmlsec1 by `tools/saml_oracle.py` (see `SPEC.md` "SP metadata").
+
+## IdP certificate rollover
+
+```zig
+var cfg: saml.Config = .{
+    .idp_entity_id = "https://idp.example.org/saml",
+    .idp_key = current_idp_key,
+    .additional_idp_keys = &.{next_idp_key}, // accepted too, out-of-band like idp_key
+    // ...
+};
+// After consumeResponse: result.idp_key_index (0 = idp_key, 1 = next_idp_key).
+```
+
+The same field is on `LogoutRequestConfig`, `LogoutResponseConfig` and
+`ArtifactResponseConfig`; `VerifyRedirectQueryOptions` has `additional_keys`.
+`<KeyInfo>` still never chooses or supplies a key.
 
 ## Bindings
 

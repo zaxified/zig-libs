@@ -39,6 +39,73 @@ pub const Match = union(enum) {
             .ipv6 => tc.ETH_P.IPV6,
         };
     }
+
+    /// Whether `prefix_len` fits the address family (`<= 32` / `<= 128`).
+    /// The `tc` flower encoder clamps an over-long length silently, so the
+    /// compiler refuses one instead (`error.InvalidPrefix`).
+    pub fn prefixValid(self: Match) bool {
+        return switch (self) {
+            .ipv4 => |v| v.prefix_len <= 32,
+            .ipv6 => |v| v.prefix_len <= 128,
+        };
+    }
+
+    /// Whether `a` and `b` can match the same packet: same family, same
+    /// direction, and the shorter of the two prefixes covers both addresses
+    /// (an exact duplicate is the equal-length case). Host bits beyond the
+    /// prefix are ignored, as the kernel's flower mask ignores them. Both
+    /// must be `prefixValid`.
+    pub fn overlaps(a: Match, b: Match) bool {
+        return switch (a) {
+            .ipv4 => |x| switch (b) {
+                .ipv4 => |y| x.dir == y.dir and
+                    samePrefix(&x.addr, &y.addr, @min(x.prefix_len, y.prefix_len)),
+                .ipv6 => false,
+            },
+            .ipv6 => |x| switch (b) {
+                .ipv6 => |y| x.dir == y.dir and
+                    samePrefix(&x.addr, &y.addr, @min(x.prefix_len, y.prefix_len)),
+                .ipv4 => false,
+            },
+        };
+    }
+};
+
+/// Whether the leading `bits` bits of `a` and `b` are equal.
+fn samePrefix(a: []const u8, b: []const u8, bits: u8) bool {
+    std.debug.assert(a.len == b.len and bits <= a.len * 8);
+    const whole = bits / 8;
+    if (!std.mem.eql(u8, a[0..whole], b[0..whole])) return false;
+    const rem: u4 = @intCast(bits % 8);
+    if (rem == 0) return true;
+    const mask: u8 = @as(u8, 0xFF) << @intCast(8 - rem);
+    return (a[whole] & mask) == (b[whole] & mask);
+}
+
+/// The kernel's highest HTB class priority: `TC_HTB_NUMPRIO - 1` (= 7,
+/// `include/uapi/linux/pkt_sched.h`). `sch_htb` silently clamps a larger
+/// `prio` to it, so the compiler refuses one (`error.HtbPrioOutOfRange`).
+pub const htb_max_prio: u32 = 7;
+
+/// The optional HTB class knobs of a node, emitted verbatim into its class
+/// op's `tc.HtbClass` (the fields of that builder with the same names). Every
+/// zero value is `tc`'s own default, so a node that leaves `htb` at `.{}`
+/// compiles exactly as before.
+pub const HtbKnobs = struct {
+    /// `burst` in bytes — how much may go out at `ceil` speed beyond the
+    /// committed rate before the rate bucket runs dry. 0 derives
+    /// `rate / HZ + mtu` (the `tc` default, computed by the `tc` builder).
+    burst: u32 = 0,
+    /// `cburst` in bytes — the same for the ceil bucket. 0 derives
+    /// `ceil / HZ + mtu`.
+    cburst: u32 = 0,
+    /// `prio` — a lower value is offered spare bandwidth first.
+    /// `0 ... htb_max_prio`.
+    prio: u32 = 0,
+    /// DRR `quantum` in bytes. 0 lets the kernel derive it from the HTB
+    /// root's `r2q` (clamped into 1000..200000); an explicit value is used
+    /// as given.
+    quantum: u32 = 0,
 };
 
 /// One shaping node. Interior when it has children; a subscriber leaf when it
@@ -60,10 +127,20 @@ pub const Node = struct {
     /// class chain must never cross queues. CPUs are 0-based; CPU `c` maps to
     /// `mq` child `c+1` and HTB major `c+1` (see SPEC.md).
     cpu: ?u16 = null,
-    /// The classifier for a subscriber leaf. Ignored (and required to be null)
-    /// on an interior node — only leaves are steered. A leaf with `null` here
-    /// gets its class + CAKE qdisc but no steering filter (documented).
-    match: ?Match = null,
+    /// The classifiers for a subscriber leaf — every address/prefix the
+    /// subscriber owns (typically an IPv4 and an IPv6 prefix). Each entry
+    /// becomes one steering filter, all of them targeting this node's single
+    /// HTB class, so the entries share its rate. Filters are emitted in slice
+    /// order, each taking the next per-queue filter prio. Must be empty on an
+    /// interior node (`ClassifierOnInterior`) — only leaves are steered. A
+    /// leaf with no entries gets its class + CAKE qdisc but no steering
+    /// filter (documented). No two entries anywhere in the topology may
+    /// overlap (`OverlappingMatch`).
+    match: []const Match = &.{},
+    /// Optional HTB class knobs (`burst`/`cburst`/`prio`/`quantum`) for this
+    /// node's class, interior or leaf. The defaults leave them to `tc` and
+    /// the kernel.
+    htb: HtbKnobs = .{},
     /// The per-subscriber CAKE leaf qdisc configuration. Only used for a leaf;
     /// the default (`.{}`) is an unshaped CAKE doing pure AQM/fairness under
     /// the HTB class that already shapes it (the LibreQoS arrangement).
@@ -119,6 +196,51 @@ test "leaf/interior classification and effective ceil" {
     };
     try testing.expect(!interior.isLeaf());
     try testing.expectEqual(@as(u64, 2000), interior.effectiveCeil());
+}
+
+test "match overlap: family, direction, prefix containment, host bits" {
+    const a: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 0 }, .prefix_len = 24 } };
+    const inside: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 77 } } };
+    const outside: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 1, 77 } } };
+    const inside_src: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 77 }, .dir = .src } };
+    try testing.expect(a.overlaps(a)); // exact duplicate
+    try testing.expect(a.overlaps(inside) and inside.overlaps(a)); // symmetric
+    try testing.expect(!a.overlaps(outside));
+    try testing.expect(!a.overlaps(inside_src)); // other direction
+    // Host bits beyond the prefix do not matter: 100.64.0.9/24 == 100.64.0.0/24.
+    const a_host: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 9 }, .prefix_len = 24 } };
+    try testing.expect(a.overlaps(a_host));
+    // A non-byte-aligned boundary: /23 covers .0.x and .1.x but not .2.x.
+    const a23: Match = .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 0 }, .prefix_len = 23 } };
+    try testing.expect(a23.overlaps(outside));
+    try testing.expect(!a23.overlaps(.{ .ipv4 = .{ .addr = .{ 100, 64, 2, 1 } } }));
+    // The last bit decides at /32 and /31.
+    const h1: Match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } };
+    const h0_31: Match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 31 } };
+    const h2_31: Match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 2 }, .prefix_len = 31 } };
+    try testing.expect(!h1.overlaps(.{ .ipv4 = .{ .addr = .{ 10, 0, 0, 0 } } }));
+    try testing.expect(h1.overlaps(h0_31));
+    try testing.expect(!h1.overlaps(h2_31));
+    // /0 covers everything of its family, nothing of the other.
+    const any4: Match = .{ .ipv4 = .{ .addr = @splat(0), .prefix_len = 0 } };
+    try testing.expect(any4.overlaps(outside));
+    const v6: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12, .prefix_len = 32 } };
+    const v6_in: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1 } ++ [_]u8{0} ** 10, .prefix_len = 56 } };
+    const v6_out: Match = .{ .ipv6 = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb9 } ++ [_]u8{0} ** 12, .prefix_len = 48 } };
+    try testing.expect(!any4.overlaps(v6));
+    try testing.expect(v6.overlaps(v6_in) and v6_in.overlaps(v6));
+    try testing.expect(!v6.overlaps(v6_out));
+    const v6_host_a: Match = .{ .ipv6 = .{ .addr = [_]u8{0} ** 15 ++ .{1} } };
+    const v6_host_b: Match = .{ .ipv6 = .{ .addr = [_]u8{0} ** 15 ++ .{2} } };
+    try testing.expect(!v6_host_a.overlaps(v6_host_b));
+    try testing.expect(v6_host_a.overlaps(v6_host_a));
+}
+
+test "match prefix length validity" {
+    try testing.expect((Match{ .ipv4 = .{ .addr = @splat(0), .prefix_len = 32 } }).prefixValid());
+    try testing.expect(!(Match{ .ipv4 = .{ .addr = @splat(0), .prefix_len = 33 } }).prefixValid());
+    try testing.expect((Match{ .ipv6 = .{ .addr = @splat(0), .prefix_len = 128 } }).prefixValid());
+    try testing.expect(!(Match{ .ipv6 = .{ .addr = @splat(0), .prefix_len = 129 } }).prefixValid());
 }
 
 test "match ethertype + mbit helper" {

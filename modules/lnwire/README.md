@@ -40,18 +40,27 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
 - **BOLT#1 setup/control messages** — `init`, `error`/`warning`, `ping`, `pong`.
 - **BOLT#2 channel messages** — `open_channel`, `accept_channel`, `funding_created`,
   `funding_signed`, `channel_ready`, `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`,
-  `commitment_signed`, `revoke_and_ack`, `update_fee`, `shutdown`, `closing_signed`.
+  `commitment_signed`, `revoke_and_ack`, `update_fee`, `shutdown`, `closing_signed`,
+  `update_fail_malformed_htlc` (refuses a `failure_code` without `BADONION`, both directions),
+  `channel_reestablish` (with its `next_funding`/`my_current_funding_locked` TLVs typed and
+  length-checked).
 - **BOLT#7 gossip messages** — `channel_announcement`, `node_announcement`, `channel_update`,
-  `query_short_channel_ids`/`reply_short_channel_ids_end`, `query_channel_range`/
-  `reply_channel_range`, plus `channelAnnouncementDigest`/`nodeAnnouncementDigest`/
-  `channelUpdateDigest`.
+  `announcement_signatures`, `query_short_channel_ids`/`reply_short_channel_ids_end`,
+  `query_channel_range`/`reply_channel_range`, `gossip_timestamp_filter` (with `matches(timestamp)`),
+  plus `channelAnnouncementDigest`/`nodeAnnouncementDigest`/`channelUpdateDigest`.
+- **`node_announcement` address descriptors** — `addressIterator(msg.addresses)` yields typed
+  `Address` values (`ipv4`/`ipv6`/`torv2`/`torv3`/`dns`) and stops at the first unknown type
+  (`unparsed()` returns the rest); `encodeAddresses` builds the field and refuses port 0,
+  non-ascending types, a second DNS name, and non-ASCII hostnames.
+- **BOLT#9 feature bits** — `lnwire.features`: `isSet`, `supports` (either bit of a pair), `set`,
+  `byteLenFor`, `firstUnknownEvenBit`, `minimal`.
 
 Deliberately deferred (SPEC.md has the full rationale): BOLT#11 invoices / BOLT#12 offers
 (bech32-based — the sibling `lninvoice` module), signature verification (caller's secp256k1 — see
 "Use" below), onion routing (the sibling `sphinx` module), several BOLT#2/#7 messages outside this
 module's required set (Interactive Transaction Construction, Channel Establishment v2, Splicing,
-Quiescence, `announcement_signatures`, ...), and per-field TLV-extension value semantics beyond the
-raw `(type, value)` pair.
+Quiescence, `start_batch`, modern closing), and per-field TLV-extension value semantics beyond the
+raw `(type, value)` pair (except `channel_reestablish`'s two records).
 
 ## Use
 
@@ -84,6 +93,34 @@ fn myEcdsaVerify(_: ?*anyopaque, digest: [32]u8, sig: [64]u8, pubkey: [33]u8) bo
     return k256.verify(pubkey, digest, sig); // your secp256k1
 }
 const verified = try lnwire.verifyChannelAnnouncement(gossip_bytes[2..], ann, myEcdsaVerify, null);
+
+// -- reconnect: channel_reestablish --
+var re = try lnwire.decodeChannelReestablish(allocator, reestablish_bytes);
+defer re.deinit(allocator);
+// error.InvalidTlvLength if next_funding / my_current_funding_locked is not 33 octets
+if (re.nextFunding()) |nf| resendCommitmentSigned(nf.txid, nf.retransmit_flags & 1 != 0);
+std.crypto.secureZero(u8, &re.your_last_per_commitment_secret); // caller-owned secret
+
+// -- update_fail_malformed_htlc: error.BadOnionBitNotSet without the BADONION bit --
+const mal = try lnwire.decodeUpdateFailMalformedHtlc(malformed_bytes);
+_ = mal.failure_code & lnwire.BADONION; // always set here
+
+// -- node_announcement addresses + features --
+const node = try lnwire.decodeNodeAnnouncement(node_bytes);
+var it = lnwire.addressIterator(node.addresses);
+while (try it.next()) |addr| switch (addr) {
+    .ipv4 => |a| connectTcp4(a.addr, a.port),
+    .dns => |a| resolve(a.hostname, a.port),
+    else => {},
+};
+if (lnwire.features.firstUnknownEvenBit(node.features, &.{ 0, 4, 6, 8, 12, 14, 16 })) |bit|
+    std.debug.print("node requires unknown feature {d}\n", .{bit});
+
+// -- subscribe to gossip --
+const filt = try lnwire.serializeGossipTimestampFilter(allocator, .{
+    .chain_hash = mainnet_genesis, .first_timestamp = now - 3600, .timestamp_range = 0xFFFF_FFFF,
+});
+defer allocator.free(filt);
 ```
 
 ## Verify
@@ -113,5 +150,11 @@ additionally byte-exact against `lightningdevkit/rust-lightning`'s own encode/de
 vectors, both DECODE and ENCODE directions, dual MIT/Apache-2.0) — `lightning/bolts` carries no
 vectors of its own for these three messages. See `SPEC.md`'s "BOLT#7 announcement/update vectors"
 note and `modules/lnwire/NOTICE` for the required attribution. This closes the previous
-round-trip-only gap for these three messages; only the BOLT#2 channel-management set remains
-round-trip-only.
+round-trip-only gap for these three messages. (The sentence that followed here — "only the
+BOLT#2 channel-management set remains round-trip-only" — was already false: SPEC's Anchoring
+records all 13 BOLT#2 messages against rust-lightning's vectors.)
+
+**Added 2026-10-06:** `channel_reestablish` (3 cases), `update_fail_malformed_htlc`,
+`announcement_signatures`, `gossip_timestamp_filter` are byte-exact against rust-lightning's
+`msgs.rs` encode tests in both directions, and the address-descriptor walker/encoder against the
+10 vendored `node_announcement` cases — see `SPEC.md`'s "Added 2026-10-06" note.

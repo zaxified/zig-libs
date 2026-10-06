@@ -3,7 +3,7 @@
 //!
 //! Two passes over the tree. The **assignment** pass walks queues ascending and
 //! DFS pre-order within a queue, allocating every node its handle (and each
-//! leaf its CAKE major + filter prio) from `HandleSpace`, validating the
+//! leaf its CAKE major + one filter prio per classifier) from `HandleSpace`, validating the
 //! invariants as it goes, and collecting a flat `Resolved` list. The **emit**
 //! pass turns that list into ops in kernel-valid order:
 //!
@@ -11,7 +11,7 @@
 //!   2. one HTB root qdisc per used queue (ascending);
 //!   3. every HTB class (the `Resolved` order is already parents-before-children);
 //!   4. every subscriber's CAKE leaf qdisc;
-//!   5. every subscriber's steering filter.
+//!   5. every subscriber classifier's steering filter.
 //!
 //! Because the assignment pass is a single deterministic traversal with no
 //! maps or hashing, the same topology always compiles to the same plan.
@@ -46,6 +46,16 @@ pub const Error = std.mem.Allocator.Error || handles.Error || error{
     CeilExceedsParent,
     /// A `match` was set on an interior (non-leaf) node; only leaves steer.
     ClassifierOnInterior,
+    /// Two `match` entries — of one subscriber or of two — can match the
+    /// same packet (same family and direction, one prefix covers the other;
+    /// an exact duplicate included). The lower filter prio would win
+    /// silently, so the topology is refused.
+    OverlappingMatch,
+    /// A `match` prefix length exceeds its family (`> 32` for IPv4, `> 128`
+    /// for IPv6); `tc`'s flower encoder would clamp it silently.
+    InvalidPrefix,
+    /// `htb.prio > htb_max_prio` (7); the kernel would clamp it silently.
+    HtbPrioOutOfRange,
     /// `rate_bps == 0` — HTB has no rate to build a class from.
     ZeroRate,
     /// Two nodes share a `name`.
@@ -62,8 +72,11 @@ const Resolved = struct {
     // Leaf-only fields (meaningless when `is_leaf` is false):
     cake: tc.Cake,
     cake_handle: tc.Handle,
-    match: ?Match,
-    prio: u16,
+    match: []const Match,
+    /// The prio of `match[0]`; entry `i` uses `first_prio + i` (allocated
+    /// consecutively from the per-queue counter).
+    first_prio: u16,
+    htb: topology.HtbKnobs,
 };
 
 /// Compile `topo` for interface `ifindex`. Caller owns the returned plan
@@ -104,6 +117,10 @@ pub fn compile(gpa: std.mem.Allocator, topo: Topology, ifindex: u32) Error!Plan 
         }
     }
 
+    // Global classifier disjointness (prefix lengths were range-checked in
+    // `assign`, which `overlaps` relies on).
+    try checkDisjoint(gpa, resolved.items);
+
     // ── emit pass ──
     var ops: std.ArrayList(Operation) = .empty;
     errdefer ops.deinit(gpa);
@@ -128,7 +145,14 @@ pub fn compile(gpa: std.mem.Allocator, topo: Topology, ifindex: u32) Error!Plan 
     for (resolved.items) |r| {
         try ops.append(gpa, .{ .class = .{
             .target = .{ .ifindex = ifindex, .handle = r.class_handle, .parent = r.parent_handle },
-            .spec = .{ .htb = .{ .rate = r.rate_bps, .ceil = r.ceil_bps } },
+            .spec = .{ .htb = .{
+                .rate = r.rate_bps,
+                .ceil = r.ceil_bps,
+                .burst = r.htb.burst,
+                .cburst = r.htb.cburst,
+                .prio = r.htb.prio,
+                .quantum = r.htb.quantum,
+            } },
         } });
     }
 
@@ -141,21 +165,23 @@ pub fn compile(gpa: std.mem.Allocator, topo: Topology, ifindex: u32) Error!Plan 
         } });
     }
 
-    // 5. steering filters (attach at the leaf's queue HTB root, `(c+1):0`).
+    // 5. steering filters (attach at the leaf's queue HTB root, `(c+1):0`):
+    //    one per `match` entry, in slice order, all into the leaf's class.
     for (resolved.items) |r| {
         if (!r.is_leaf) continue;
-        const m = r.match orelse continue;
-        try ops.append(gpa, .{
-            .filter = .{
-                .target = .{
-                    .ifindex = ifindex,
-                    .parent = r.class_handle.qdisc(), // (c+1):0
-                    .prio = r.prio,
-                    .eth_type = m.ethType(),
+        for (r.match, 0..) |m, i| {
+            try ops.append(gpa, .{
+                .filter = .{
+                    .target = .{
+                        .ifindex = ifindex,
+                        .parent = r.class_handle.qdisc(), // (c+1):0
+                        .prio = @intCast(r.first_prio + i),
+                        .eth_type = m.ethType(),
+                    },
+                    .spec = .{ .flower = flowerFor(m, r.class_handle) },
                 },
-                .spec = .{ .flower = flowerFor(m, r.class_handle) },
-            },
-        });
+            });
+        }
     }
 
     return .{ .ops = try ops.toOwnedSlice(gpa) };
@@ -188,7 +214,9 @@ fn assign(
     }
 
     const is_leaf = node.isLeaf();
-    if (!is_leaf and node.match != null) return error.ClassifierOnInterior;
+    if (!is_leaf and node.match.len != 0) return error.ClassifierOnInterior;
+    for (node.match) |m| if (!m.prefixValid()) return error.InvalidPrefix;
+    if (node.htb.prio > topology.htb_max_prio) return error.HtbPrioOutOfRange;
 
     try names.append(gpa, node.name);
 
@@ -203,12 +231,18 @@ fn assign(
         .is_leaf = is_leaf,
         .cake = node.cake,
         .cake_handle = undefined,
-        .match = if (is_leaf) node.match else null,
-        .prio = 0,
+        .match = if (is_leaf) node.match else &.{},
+        .first_prio = 0,
+        .htb = node.htb,
     };
     if (is_leaf) {
         r.cake_handle = tc.Handle.init(try hs.nextCakeMajor(), 0);
-        if (node.match != null) r.prio = try hs.nextPrio(cpu);
+        // One prio per entry, consecutive: nothing else draws from this
+        // queue's counter between these calls.
+        for (node.match, 0..) |_, i| {
+            const p = try hs.nextPrio(cpu);
+            if (i == 0) r.first_prio = p;
+        }
     }
     try resolved.append(gpa, r);
 
@@ -219,6 +253,71 @@ fn assign(
 
 fn cpuToQueue(cpu: u16) u16 {
     return @intCast(@as(u32, cpu) + 1);
+}
+
+/// A classifier reduced to a sortable interval key: within one
+/// (family, direction) class, a prefix is the address range starting at its
+/// masked address. Prefixes are laminar (two ranges are nested or disjoint),
+/// so after sorting by (family, dir, start, length) any overlap shows up
+/// between two *adjacent* keys — an O(n log n) check instead of all pairs.
+const MatchKey = struct {
+    fam: u8,
+    dir: u8,
+    start: [16]u8,
+    len: u8,
+    m: Match,
+
+    fn of(m: Match) MatchKey {
+        var k: MatchKey = .{ .fam = 0, .dir = 0, .start = @splat(0), .len = 0, .m = m };
+        switch (m) {
+            .ipv4 => |v| {
+                k.fam = 4;
+                k.dir = @intFromEnum(v.dir);
+                k.len = v.prefix_len;
+                @memcpy(k.start[0..4], &v.addr);
+            },
+            .ipv6 => |v| {
+                k.fam = 6;
+                k.dir = @intFromEnum(v.dir);
+                k.len = v.prefix_len;
+                k.start = v.addr;
+            },
+        }
+        // Clear the host bits (bit `len` onward).
+        for (&k.start, 0..) |*b, i| {
+            const lo: usize = i * 8;
+            if (k.len >= lo + 8) continue;
+            if (k.len <= lo) {
+                b.* = 0;
+            } else {
+                b.* &= @as(u8, 0xFF) << @intCast(8 - (k.len - lo));
+            }
+        }
+        return k;
+    }
+
+    fn lessThan(_: void, a: MatchKey, b: MatchKey) bool {
+        if (a.fam != b.fam) return a.fam < b.fam;
+        if (a.dir != b.dir) return a.dir < b.dir;
+        return switch (std.mem.order(u8, &a.start, &b.start)) {
+            .lt => true,
+            .gt => false,
+            .eq => a.len < b.len,
+        };
+    }
+};
+
+/// `error.OverlappingMatch` when any two classifiers in the topology — of
+/// one subscriber or of two — can match the same packet.
+fn checkDisjoint(gpa: std.mem.Allocator, resolved: []const Resolved) Error!void {
+    var keys: std.ArrayList(MatchKey) = .empty;
+    defer keys.deinit(gpa);
+    for (resolved) |r| for (r.match) |m| try keys.append(gpa, .of(m));
+    std.mem.sort(MatchKey, keys.items, {}, MatchKey.lessThan);
+    if (keys.items.len < 2) return;
+    for (keys.items[0 .. keys.items.len - 1], keys.items[1..]) |a, b| {
+        if (a.m.overlaps(b.m)) return error.OverlappingMatch;
+    }
 }
 
 /// Map a subscriber `Match` onto a value-typed `flower` spec that flows the
@@ -331,7 +430,7 @@ test "invariant: classifier on an interior node, zero rate, duplicate name" {
         .name = "site",
         .rate_bps = 1000,
         .cpu = 0,
-        .match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } },
+        .match = &.{.{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } }},
         .children = &kid,
     }};
     try testing.expectError(error.ClassifierOnInterior, compile(gpa, .{ .queue_count = 1, .roots = &interior_match }, 1));
@@ -379,7 +478,7 @@ test "a leaf without a classifier does not consume a filter prio" {
     const gpa = testing.allocator;
     const subs = [_]Node{
         .{ .name = "silent", .rate_bps = 500 },
-        .{ .name = "steered", .rate_bps = 500, .match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 9 } } } },
+        .{ .name = "steered", .rate_bps = 500, .match = &.{.{ .ipv4 = .{ .addr = .{ 10, 0, 0, 9 } } }} },
     };
     const roots = [_]Node{.{ .name = "site", .rate_bps = 1000, .cpu = 0, .children = &subs }};
     var p = try compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1);
@@ -387,4 +486,125 @@ test "a leaf without a classifier does not consume a filter prio" {
     const last = p.ops[p.ops.len - 1];
     try testing.expect(last == .filter);
     try testing.expectEqual(@as(u16, 1), last.filter.target.prio);
+}
+
+test "multi-match: one class, one filter per entry, consecutive prios in slice order" {
+    const gpa = testing.allocator;
+    const v6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+    const subs = [_]Node{
+        .{ .name = "dual", .rate_bps = 500, .match = &.{
+            .{ .ipv4 = .{ .addr = .{ 100, 64, 0, 1 } } },
+            .{ .ipv6 = .{ .addr = v6, .prefix_len = 56 } },
+            .{ .ipv4 = .{ .addr = .{ 192, 0, 2, 0 }, .prefix_len = 29 } },
+        } },
+        .{ .name = "next", .rate_bps = 500, .match = &.{.{ .ipv4 = .{ .addr = .{ 100, 64, 0, 2 } } }} },
+    };
+    const roots = [_]Node{.{ .name = "site", .rate_bps = 1000, .cpu = 0, .children = &subs }};
+    var p = try compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1);
+    defer p.deinit(gpa);
+
+    // mq + htb root + 3 classes + 2 cakes + 4 filters.
+    try testing.expectEqual(@as(usize, 11), p.ops.len);
+    const f = p.ops[7..];
+    const want_prio = [_]u16{ 1, 2, 3, 4 };
+    const want_class = [_]u32{ 0x00010002, 0x00010002, 0x00010002, 0x00010003 };
+    const want_eth = [_]u16{ tc.ETH_P.IP, tc.ETH_P.IPV6, tc.ETH_P.IP, tc.ETH_P.IP };
+    for (f, want_prio, want_class, want_eth) |op, prio, cls, eth| {
+        try testing.expect(op == .filter);
+        try testing.expectEqual(prio, op.filter.target.prio);
+        try testing.expectEqual(eth, op.filter.target.eth_type);
+        try testing.expectEqual(@as(u32, 0x00010000), op.filter.target.parent.raw);
+        try testing.expectEqual(cls, op.filter.spec.flower.classid.?.raw);
+    }
+    try testing.expectEqual(@as(u8, 56), f[1].filter.spec.flower.ipv6_dst.?.prefix_len);
+    try testing.expectEqual(@as(u6, 29), f[2].filter.spec.flower.ipv4_dst.?.prefix_len);
+    // Still exactly one CAKE per subscriber.
+    var cakes: usize = 0;
+    for (p.ops) |op| if (op == .qdisc and op.qdisc.spec == .cake) {
+        cakes += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), cakes);
+}
+
+test "invariant: overlapping classifiers are refused, within and across subscribers" {
+    const gpa = testing.allocator;
+    // Within one subscriber: an exact duplicate.
+    const dup_in = [_]Node{.{ .name = "s", .rate_bps = 1000, .cpu = 0, .match = &.{
+        .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } },
+        .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } },
+    } }};
+    try testing.expectError(error.OverlappingMatch, compile(gpa, .{ .queue_count = 1, .roots = &dup_in }, 1));
+
+    // Across subscribers on different queues: a /24 covering another's /32.
+    const across = [_]Node{
+        .{ .name = "a", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv4 = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 24 } }} },
+        .{ .name = "b", .rate_bps = 1000, .cpu = 1, .match = &.{.{ .ipv4 = .{ .addr = .{ 10, 0, 0, 200 } } }} },
+    };
+    try testing.expectError(error.OverlappingMatch, compile(gpa, .{ .queue_count = 2, .roots = &across }, 1));
+
+    // IPv6, input order reversed against sort order: a host given first,
+    // the /32 covering it given second.
+    const v6a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const v6b: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0xff } ++ [_]u8{0} ** 11;
+    const nested = [_]Node{
+        .{ .name = "z", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = v6b } }} },
+        .{ .name = "x", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = v6a, .prefix_len = 32 } }} },
+    };
+    try testing.expectError(error.OverlappingMatch, compile(gpa, .{ .queue_count = 1, .roots = &nested }, 1));
+
+    // Not overlapping: same address in opposite directions; v4 vs v6; and
+    // disjoint IPv6 prefixes either side of a sort boundary.
+    const fine = [_]Node{
+        .{ .name = "up", .rate_bps = 1000, .cpu = 0, .match = &.{
+            .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 }, .dir = .src } },
+            .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 }, .dir = .dst } },
+            .{ .ipv6 = .{ .addr = v6a, .prefix_len = 64 } },
+        } },
+        .{ .name = "other", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = v6b } }} },
+    };
+    var p = try compile(gpa, .{ .queue_count = 1, .roots = &fine }, 1);
+    p.deinit(gpa);
+}
+
+test "invariant: prefix length past the family is refused" {
+    const gpa = testing.allocator;
+    const v4 = [_]Node{.{ .name = "s", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv4 = .{ .addr = @splat(0), .prefix_len = 33 } }} }};
+    try testing.expectError(error.InvalidPrefix, compile(gpa, .{ .queue_count = 1, .roots = &v4 }, 1));
+    const v6 = [_]Node{.{ .name = "s", .rate_bps = 1000, .cpu = 0, .match = &.{.{ .ipv6 = .{ .addr = @splat(0), .prefix_len = 129 } }} }};
+    try testing.expectError(error.InvalidPrefix, compile(gpa, .{ .queue_count = 1, .roots = &v6 }, 1));
+}
+
+test "htb knobs reach the class op; prio past 7 is refused" {
+    const gpa = testing.allocator;
+    const subs = [_]Node{.{ .name = "s", .rate_bps = 500, .htb = .{ .burst = 32768, .cburst = 65536, .prio = 7, .quantum = 3000 } }};
+    const roots = [_]Node{.{ .name = "site", .rate_bps = 1000, .cpu = 0, .htb = .{ .prio = 1 }, .children = &subs }};
+    var p = try compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1);
+    defer p.deinit(gpa);
+    const site = p.ops[2].class.spec.htb;
+    try testing.expectEqual(@as(u32, 1), site.prio);
+    try testing.expectEqual(@as(u32, 0), site.burst);
+    const leaf = p.ops[3].class.spec.htb;
+    try testing.expectEqual(@as(u32, 32768), leaf.burst);
+    try testing.expectEqual(@as(u32, 65536), leaf.cburst);
+    try testing.expectEqual(@as(u32, 7), leaf.prio);
+    try testing.expectEqual(@as(u32, 3000), leaf.quantum);
+
+    const bad = [_]Node{.{ .name = "s", .rate_bps = 1000, .cpu = 0, .htb = .{ .prio = 8 } }};
+    try testing.expectError(error.HtbPrioOutOfRange, compile(gpa, .{ .queue_count = 1, .roots = &bad }, 1));
+}
+
+test "multi-match: prio exhaustion on a later entry is a typed error" {
+    const gpa = testing.allocator;
+    var hs = try handles.HandleSpace.init(gpa, 1);
+    defer hs.deinit(gpa);
+    hs.prio_next[0] = 0xFFFF; // exactly one prio left
+    var resolved: std.ArrayList(Resolved) = .empty;
+    defer resolved.deinit(gpa);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    const two: Node = .{ .name = "s", .rate_bps = 1, .match = &.{
+        .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 1 } } },
+        .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 2 } } },
+    } };
+    try testing.expectError(error.HandleExhausted, assign(gpa, &hs, &resolved, &names, two, 0, handles.htbRoot(0), null));
 }

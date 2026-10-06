@@ -246,6 +246,33 @@ test "verifyRedirectSignature: EXTERNAL anchor tamper — one flipped RelayState
     try testing.expect(!ok);
 }
 
+test "verifyRedirectSignature: rollover — EXTERNAL openssl signature verifies under an ADDITIONAL key" {
+    // The same openssl-made signature as the anchor above, with a different
+    // (wrong) primary key: accepted only because the signer is in
+    // `additional_keys`, and refused again once it is not.
+    const alloc = testing.allocator;
+    const pk = try rsa.PublicKey.fromPem(openssl_pub_pem);
+    const old = try makeKey(0x2011_0001);
+    const opts: saml.VerifyRedirectQueryOptions = .{
+        .kind = .request,
+        .message_field = "AB+C/D==",
+        .relay_state = "a b&c",
+        .sig_alg = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        .signature_b64 = openssl_sig_b64,
+        .key = old.public_key,
+        .additional_keys = &.{pk},
+    };
+    try testing.expect(try saml.verifyRedirectSignature(alloc, opts));
+
+    var without = opts;
+    without.additional_keys = &.{old.public_key};
+    try testing.expect(!try saml.verifyRedirectSignature(alloc, without));
+
+    var tampered = opts;
+    tampered.relay_state = "a b&d";
+    try testing.expect(!try saml.verifyRedirectSignature(alloc, tampered));
+}
+
 // ── End-to-end: LogoutRequest fully round-tripped over the Redirect binding
 //    (encode + sign the query string, decode + verify + consume) ───────────
 

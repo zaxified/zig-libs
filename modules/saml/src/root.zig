@@ -48,8 +48,9 @@
 //! downgrade.
 //!
 //! ## Trust model
-//! The IdP signing key is configured out-of-band (`Config.idp_key`). `<KeyInfo>`
-//! is never trusted to supply it; the certificate seen there is surfaced
+//! The IdP signing key is configured out-of-band (`Config.idp_key`, plus
+//! `Config.additional_idp_keys` for certificate rollover). `<KeyInfo>`
+//! is never trusted to supply or select one; the certificate seen there is surfaced
 //! (`AuthnResult.x509_cert_der`, UNTRUSTED) only so the caller may pin it.
 //!
 //! ## `<saml:EncryptedAssertion>` — the eIDAS encrypt profile
@@ -132,7 +133,7 @@ const P256PublicKey = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, IdP-metadata parser; decrypts `EncryptedAssertion` via `xmlenc`",
+    .doc = "SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, SP-metadata generator, IdP-metadata parser, multi-key IdP rollover; decrypts `EncryptedAssertion` via `xmlenc`",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -295,6 +296,17 @@ pub const Config = struct {
     /// The IdP's configured signing key. Signatures are verified against THIS —
     /// never `<KeyInfo>`.
     idp_key: xmldsig.VerifyKey,
+    /// Further trusted IdP signing keys, for certificate ROLLOVER: a signature
+    /// is accepted when it verifies under `idp_key` OR any key listed here
+    /// (publish the new key here before the IdP switches, drop the old one
+    /// after). Every key in the set is equally trusted and out-of-band, exactly
+    /// like `idp_key` — `<KeyInfo>` still never selects or supplies one. The
+    /// XSW pointer-pin, the one-reference rule and the algorithm allow-list are
+    /// applied identically whichever key verified. Which key did is reported in
+    /// `AuthnResult.idp_key_index`. Cost: a signature whose digests are correct
+    /// but whose value verifies under none of the keys is checked once per key,
+    /// so keep this to the rollover pair. See SPEC.md "Trust model".
+    additional_idp_keys: []const xmldsig.VerifyKey = &.{},
 
     /// This SP's entityID; MUST appear in every `<AudienceRestriction>`.
     sp_entity_id: []const u8,
@@ -458,6 +470,11 @@ pub const AuthnResult = struct {
     /// Raw DER of the `<KeyInfo><X509Certificate>` seen on the verifying
     /// signature, if any. **UNTRUSTED** — present only for pinning. Owned.
     x509_cert_der: ?[]const u8,
+
+    /// Which configured key verified the signature: 0 = `Config.idp_key`,
+    /// `i + 1` = `Config.additional_idp_keys[i]`. Lets a rollover be watched
+    /// (once nothing verifies under the old key any more, drop it).
+    idp_key_index: usize = 0,
 
     pub fn deinit(self: *AuthnResult) void {
         self.arena.deinit();
@@ -724,17 +741,19 @@ fn processResponse(alloc: std.mem.Allocator, doc: *const xml.Document, config: C
     // ── signature + XSW defense ──────────────────────────────────────────────
     var cert_der: ?[]u8 = null;
     errdefer if (cert_der) |d| alloc.free(d);
-    const signed = try verifyCovering(alloc, doc, root, asrt, config, &cert_der);
-    if (!signed) return error.SignatureMissing;
+    const key_index = (try verifyCovering(alloc, doc, root, asrt, config, &cert_der)) orelse return error.SignatureMissing;
 
     // ── the assertion is now trusted: validate + extract ─────────────────────
-    return buildResult(alloc, asrt, config, &cert_der);
+    var result = try buildResult(alloc, asrt, config, &cert_der);
+    result.idp_key_index = key_index;
+    return result;
 }
 
-/// Try to establish that `asrt` is covered by a signature valid under the
-/// configured key, honoring `Config.signature_policy`. On the first valid,
-/// correctly-pinned signature this returns true (and moves any KeyInfo cert into
-/// `cert_out`). A structurally-present-but-invalid signature, or a valid one
+/// Try to establish that `asrt` is covered by a signature valid under one of
+/// the configured keys, honoring `Config.signature_policy`. On the first valid,
+/// correctly-pinned signature this returns the index of the key that verified
+/// it (see `AuthnResult.idp_key_index`; null = no signature found) and moves
+/// any KeyInfo cert into `cert_out`. A structurally-present-but-invalid signature, or a valid one
 /// that points elsewhere, is a hard error (never a silent downgrade to unsigned).
 fn verifyCovering(
     alloc: std.mem.Allocator,
@@ -743,18 +762,17 @@ fn verifyCovering(
     asrt: *const xml.Element,
     config: Config,
     cert_out: *?[]u8,
-) ConsumeError!bool {
-    const opts = sigOpts(config);
+) ConsumeError!?usize {
+    const keys = trustedKeys(config);
 
     // 1. A signature that is a direct child of the Assertion (assertion-signed).
     if (config.signature_policy != .response) {
         if (childEl(asrt, xmldsig.ds_ns, "Signature")) |sig| {
-            var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, doc, &res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
-            moveCert(alloc, &res, cert_out);
-            return true;
+            var kr = try verifyUnderTrustedKeys(alloc, doc, sig, keys);
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, doc, &kr.res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
+            moveCert(alloc, &kr.res, cert_out);
+            return kr.key_index;
         }
     }
 
@@ -762,21 +780,85 @@ fn verifyCovering(
     //    It must cover the Response element that directly contains our assertion.
     if (config.signature_policy != .assertion) {
         if (childEl(root, xmldsig.ds_ns, "Signature")) |sig| {
-            var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            var kr = try verifyUnderTrustedKeys(alloc, doc, sig, keys);
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
             if (asrt.parent != root) return error.SignatureWrappingDetected;
-            moveCert(alloc, &res, cert_out);
-            return true;
+            moveCert(alloc, &kr.res, cert_out);
+            return kr.key_index;
         }
     }
 
-    return false;
+    return null;
 }
 
-fn sigOpts(config: Config) xmldsig.Options {
-    return sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr);
+/// The trusted IdP key set plus the two verify knobs every message type shares.
+/// `primary` is index 0; `additional[i]` is index `i + 1`.
+const TrustedKeys = struct {
+    primary: xmldsig.VerifyKey,
+    additional: []const xmldsig.VerifyKey,
+    allow_weak_sha1: bool,
+    id_attr: []const u8,
+
+    fn count(self: TrustedKeys) usize {
+        return 1 + self.additional.len;
+    }
+    fn at(self: TrustedKeys, i: usize) xmldsig.VerifyKey {
+        return if (i == 0) self.primary else self.additional[i - 1];
+    }
+};
+
+fn trustedKeys(config: Config) TrustedKeys {
+    return .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr };
+}
+
+const KeyedResult = struct { res: xmldsig.Result, key_index: usize };
+
+/// Verify `sig` against the whole trusted key set; succeed with the first key
+/// it verifies under. This is the ONLY place a multi-key decision is made, and
+/// it changes nothing about what is verified — only which configured key the
+/// `<SignatureValue>` is checked with:
+///
+///  - Every key is a configured, out-of-band trust anchor; `<KeyInfo>` is never
+///    consulted to pick one. There is no key confusion to exploit: an attacker
+///    who chooses `<SignatureMethod>` only chooses which subset of the SP's own
+///    trusted keys could possibly match.
+///  - `error.KeyAlgorithmMismatch` (an RSA method against an EC key, or the
+///    reverse) means "this key cannot have made it" and moves on to the next
+///    key. Every other `xmldsig` error — malformed signature, disallowed
+///    algorithm, unresolvable/ambiguous reference, too many references — does
+///    not depend on the key and fails closed at once (`SignatureInvalid`), as it
+///    did with one key.
+///  - A structurally valid signature whose reference digests do NOT match can
+///    never verify under another key either (digests are unkeyed), so it fails
+///    closed after the first attempt instead of being re-canonicalized per key.
+///  - Nothing here is secret: the keys, the document and the signature are all
+///    public, so stopping at the first verifying key leaks nothing (this module
+///    makes no constant-time claim; SPEC.md "Trust model").
+///
+/// No key verifies ⇒ `SignatureInvalid`, the same verdict as before for a
+/// single key. Allocation failure folds into the same error, as the single-key
+/// call sites always did.
+fn verifyUnderTrustedKeys(
+    alloc: std.mem.Allocator,
+    doc: *const xml.Document,
+    sig: *const xml.Element,
+    keys: TrustedKeys,
+) error{SignatureInvalid}!KeyedResult {
+    var i: usize = 0;
+    while (i < keys.count()) : (i += 1) {
+        var res = xmldsig.verify(alloc, doc, sig, sigOptsFor(keys.at(i), keys.allow_weak_sha1, keys.id_attr)) catch |e| switch (e) {
+            error.KeyAlgorithmMismatch => continue,
+            else => return error.SignatureInvalid,
+        };
+        if (res.valid) return .{ .res = res, .key_index = i };
+        const digests_ok = for (res.references) |r| {
+            if (!r.digest_valid) break false;
+        } else true;
+        res.deinit(alloc);
+        if (!digests_ok) return error.SignatureInvalid;
+    }
+    return error.SignatureInvalid;
 }
 
 /// The `xmldsig.Options` triple every message type this module verifies needs
@@ -856,13 +938,14 @@ fn processEncryptedAssertion(
     // ── signature + XSW defense on the DECRYPTED assertion ────────────────────
     var cert_der: ?[]u8 = null;
     errdefer if (cert_der) |d| alloc.free(d);
-    const signed = try verifyCoveringDecrypted(alloc, &inner, outer_doc, outer_root, enc, config, &cert_der);
-    if (!signed) return error.SignatureMissing;
+    const key_index = (try verifyCoveringDecrypted(alloc, &inner, outer_doc, outer_root, enc, config, &cert_der)) orelse return error.SignatureMissing;
 
     // buildResult dupes everything it keeps into its OWN arena (backed by
     // `alloc`), so the returned AuthnResult never borrows from `inner`, which we
     // deinit on return.
-    return buildResult(alloc, asrt, config, &cert_der);
+    var result = try buildResult(alloc, asrt, config, &cert_der);
+    result.idp_key_index = key_index;
+    return result;
 }
 
 /// Establish that the decrypted assertion is covered by a valid signature,
@@ -885,19 +968,18 @@ fn verifyCoveringDecrypted(
     enc: *const xml.Element,
     config: Config,
     cert_out: *?[]u8,
-) ConsumeError!bool {
-    const opts = sigOpts(config);
+) ConsumeError!?usize {
+    const keys = trustedKeys(config);
     const inner_root = inner_doc.root;
 
     // 1. Assertion-level signature, INSIDE the decrypted assertion.
     if (config.signature_policy != .response) {
         if (childEl(inner_root, xmldsig.ds_ns, "Signature")) |sig| {
-            var res = xmldsig.verify(alloc, inner_doc, sig, opts) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
-            moveCert(alloc, &res, cert_out);
-            return true;
+            var kr = try verifyUnderTrustedKeys(alloc, inner_doc, sig, keys);
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, inner_doc, &kr.res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
+            moveCert(alloc, &kr.res, cert_out);
+            return kr.key_index;
         }
     }
 
@@ -905,17 +987,16 @@ fn verifyCoveringDecrypted(
     //    directly contains the EncryptedAssertion ciphertext.
     if (config.signature_policy != .assertion) {
         if (childEl(outer_root, xmldsig.ds_ns, "Signature")) |sig| {
-            var res = xmldsig.verify(alloc, outer_doc, sig, opts) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
+            var kr = try verifyUnderTrustedKeys(alloc, outer_doc, sig, keys);
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, outer_doc, &kr.res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
             if (enc.parent != outer_root) return error.SignatureWrappingDetected;
-            moveCert(alloc, &res, cert_out);
-            return true;
+            moveCert(alloc, &kr.res, cert_out);
+            return kr.key_index;
         }
     }
 
-    return false;
+    return null;
 }
 
 fn moveCert(alloc: std.mem.Allocator, res: *xmldsig.Result, cert_out: *?[]u8) void {
@@ -1803,10 +1884,75 @@ pub const AuthnRequestOptions = struct {
     name_id_format: ?[]const u8 = null,
     /// Emit `AllowCreate="true"` on the NameIDPolicy.
     allow_create: bool = true,
+
+    /// `ForceAuthn="true"`: the IdP MUST authenticate the presenter directly
+    /// rather than rely on a previous security context (SAMLCore §3.4.1).
+    /// Omitted (schema default false) when false.
+    force_authn: bool = false,
+    /// `IsPassive="true"`: the IdP and user agent MUST NOT visibly take control
+    /// of the user interface (SAMLCore §3.4.1); an IdP that cannot answer
+    /// passively returns `NoPassive`. Omitted (schema default false) when false.
+    is_passive: bool = false,
+    /// `ProtocolBinding`: the binding the IdP is asked to deliver the
+    /// `<Response>` with. An enum rather than a URI so the binding SAMLProf
+    /// §4.1.2 forbids for the Response ("The HTTP Redirect binding MUST NOT be
+    /// used") cannot be requested.
+    protocol_binding: ResponseBinding = .http_post,
+    /// `AttributeConsumingServiceIndex`: which `<md:AttributeConsumingService>`
+    /// of this SP's metadata (see `SpMetadataOptions.attribute_consuming_services`)
+    /// the IdP should satisfy. Null ⇒ omitted (the metadata's default applies).
+    attribute_consuming_service_index: ?u16 = null,
+    /// `<samlp:RequestedAuthnContext>`: the authentication context(s) the SP
+    /// asks for. Null ⇒ omitted. An IdP may answer with a context other than the
+    /// one requested — enforce the outcome on the way back with
+    /// `Config.required_loa`, never by trusting the request.
+    requested_authn_context: ?RequestedAuthnContext = null,
+};
+
+/// The bindings an SP may ask the IdP to deliver a Web-SSO `<Response>` with
+/// (`AuthnRequest ProtocolBinding`, and `AssertionConsumerService Binding` in
+/// SP metadata). HTTP-Redirect is deliberately absent — SAMLProf §4.1.2.
+pub const ResponseBinding = enum {
+    http_post,
+    http_artifact,
+
+    pub fn uri(self: ResponseBinding) []const u8 {
+        return switch (self) {
+            .http_post => binding_http_post,
+            .http_artifact => binding_http_artifact,
+        };
+    }
+};
+
+/// SAML Bindings §3 binding identifiers.
+pub const binding_http_post = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
+pub const binding_http_redirect = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
+pub const binding_http_artifact = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
+pub const binding_soap = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
+
+/// `RequestedAuthnContext Comparison` (SAMLCore §3.3.2.2.1). `exact` is the
+/// schema default; it is always written out explicitly.
+pub const AuthnContextComparison = enum {
+    exact,
+    minimum,
+    maximum,
+    better,
+};
+
+/// `<samlp:RequestedAuthnContext>` by class reference (the form every IdP
+/// supports; `AuthnContextDeclRef` is not offered).
+pub const RequestedAuthnContext = struct {
+    comparison: AuthnContextComparison = .exact,
+    /// One `<saml:AuthnContextClassRef>` per entry, in preference order. The
+    /// schema requires at least one: an empty list omits the whole element
+    /// (nothing was requested) rather than emitting an invalid one.
+    class_refs: []const []const u8,
 };
 
 /// Build a `<samlp:AuthnRequest>` document (the caller applies the binding —
 /// deflate+base64+URL-encode for Redirect, or base64 for POST). Owned by caller.
+/// Element order follows SAMLCore §3.4.1's schema: `Issuer`, `NameIDPolicy`,
+/// `RequestedAuthnContext`.
 pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) std.mem.Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
@@ -1825,9 +1971,21 @@ pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) st
         try appendAttrEscaped(alloc, w, d);
         try w.appendSlice(alloc, "\"");
     }
+    if (opts.force_authn) try w.appendSlice(alloc, " ForceAuthn=\"true\"");
+    if (opts.is_passive) try w.appendSlice(alloc, " IsPassive=\"true\"");
     try w.appendSlice(alloc, " AssertionConsumerServiceURL=\"");
     try appendAttrEscaped(alloc, w, opts.acs_url);
-    try w.appendSlice(alloc, "\" ProtocolBinding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\">");
+    try w.appendSlice(alloc, "\" ProtocolBinding=\"");
+    try w.appendSlice(alloc, opts.protocol_binding.uri());
+    try w.appendSlice(alloc, "\"");
+    if (opts.attribute_consuming_service_index) |idx| {
+        var nbuf: [8]u8 = undefined; // u16: at most 5 digits
+        const n = nbuf[0..std.fmt.printInt(&nbuf, idx, 10, .lower, .{})];
+        try w.appendSlice(alloc, " AttributeConsumingServiceIndex=\"");
+        try w.appendSlice(alloc, n);
+        try w.appendSlice(alloc, "\"");
+    }
+    try w.appendSlice(alloc, ">");
     try w.appendSlice(alloc, "<saml:Issuer>");
     try appendTextEscaped(alloc, w, opts.issuer);
     try w.appendSlice(alloc, "</saml:Issuer>");
@@ -1838,8 +1996,23 @@ pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) st
     } else if (opts.allow_create) {
         try w.appendSlice(alloc, "<samlp:NameIDPolicy AllowCreate=\"true\"/>");
     }
+    if (opts.requested_authn_context) |rac| {
+        if (rac.class_refs.len > 0) try appendRequestedAuthnContext(alloc, w, rac);
+    }
     try w.appendSlice(alloc, "</samlp:AuthnRequest>");
     return buf.toOwnedSlice(alloc);
+}
+
+fn appendRequestedAuthnContext(alloc: std.mem.Allocator, w: *std.ArrayList(u8), rac: RequestedAuthnContext) std.mem.Allocator.Error!void {
+    try w.appendSlice(alloc, "<samlp:RequestedAuthnContext Comparison=\"");
+    try w.appendSlice(alloc, @tagName(rac.comparison));
+    try w.appendSlice(alloc, "\">");
+    for (rac.class_refs) |cr| {
+        try w.appendSlice(alloc, "<saml:AuthnContextClassRef>");
+        try appendTextEscaped(alloc, w, cr);
+        try w.appendSlice(alloc, "</saml:AuthnContextClassRef>");
+    }
+    try w.appendSlice(alloc, "</samlp:RequestedAuthnContext>");
 }
 
 // ── IdP metadata parsing ─────────────────────────────────────────────────────
@@ -2083,6 +2256,374 @@ fn signProtocolMessage(
     return std.mem.replaceOwned(u8, alloc, with_digest, empty_sv, filled_sv);
 }
 
+// ── SP metadata generation ───────────────────────────────────────────────────
+//
+// The document an IdP registers this SP from (SAML Metadata §2.3.2 /
+// §2.4.4): `<md:EntityDescriptor>` with one `<md:SPSSODescriptor>`. Built from
+// caller-supplied values only — no clock (`valid_until`/`cache_duration` are
+// strings the caller formats), no RNG (`id` is caller-chosen), and no DER is
+// parsed (certificates are base64-encoded as given). Element order follows the
+// metadata schema: within the descriptor `KeyDescriptor*`, `SingleLogoutService*`,
+// `NameIDFormat*`, `AssertionConsumerService+`, `AttributeConsumingService*`;
+// after it, `Organization?`, `ContactPerson*`.
+//
+// Anchor: the outputs pinned in `test_metadata.zig` validate against the OASIS
+// `saml-schema-metadata-2.0.xsd`, and the signed one verifies under xmlsec1,
+// both via `tools/saml_oracle.py` (python3-saml 1.16.0's bundled schemas and its
+// xmlsec binding). See SPEC.md "SP metadata".
+
+/// `<md:AssertionConsumerService>` — an `IndexedEndpointType`.
+pub const AcsEndpoint = struct {
+    binding: ResponseBinding = .http_post,
+    location: []const u8,
+    /// `index` (xs:unsignedShort); unique among this SP's ACS endpoints.
+    index: u16,
+    /// `isDefault="true"` on at most one endpoint. Null ⇒ attribute omitted.
+    is_default: ?bool = null,
+};
+
+/// `<md:SingleLogoutService>` — an `EndpointType`. `binding` is a URI
+/// (`binding_http_redirect`, `binding_http_post`, `binding_soap`, …).
+pub const SloEndpoint = struct {
+    binding: []const u8,
+    location: []const u8,
+    /// `ResponseLocation`, when responses go to a different URL. Null ⇒ omitted.
+    response_location: ?[]const u8 = null,
+};
+
+/// A string with its `xml:lang`.
+pub const LocalizedString = struct {
+    value: []const u8,
+    lang: []const u8 = "en",
+};
+
+/// `<md:RequestedAttribute>`.
+pub const RequestedAttribute = struct {
+    name: []const u8,
+    name_format: ?[]const u8 = null,
+    friendly_name: ?[]const u8 = null,
+    /// `isRequired="true"`; omitted (schema default false) when false.
+    is_required: bool = false,
+};
+
+/// `<md:AttributeConsumingService>`, selected by an AuthnRequest's
+/// `attribute_consuming_service_index`.
+pub const AttributeConsumingService = struct {
+    index: u16,
+    is_default: ?bool = null,
+    /// At least one (`ServiceName+`).
+    service_names: []const LocalizedString,
+    service_descriptions: []const LocalizedString = &.{},
+    /// At least one (`RequestedAttribute+`).
+    requested_attributes: []const RequestedAttribute,
+};
+
+/// `<md:Organization>`; every list needs at least one entry (schema `+`).
+pub const Organization = struct {
+    names: []const LocalizedString,
+    display_names: []const LocalizedString,
+    urls: []const LocalizedString,
+};
+
+/// `<md:ContactPerson contactType>`.
+pub const ContactType = enum { technical, support, administrative, billing, other };
+
+pub const ContactPerson = struct {
+    contact_type: ContactType,
+    company: ?[]const u8 = null,
+    given_name: ?[]const u8 = null,
+    sur_name: ?[]const u8 = null,
+    /// `EmailAddress` is xs:anyURI — write `mailto:ops@example.org`.
+    email_addresses: []const []const u8 = &.{},
+    telephone_numbers: []const []const u8 = &.{},
+};
+
+pub const SpMetadataOptions = struct {
+    /// `entityID` — this SP's entity identifier (`Config.sp_entity_id`). 1 to
+    /// 1024 characters (SAMLCore §8.3.6).
+    entity_id: []const u8,
+    /// At least one.
+    assertion_consumer_services: []const AcsEndpoint,
+    /// This SP's Single-Logout endpoints (see `consumeLogoutRequest`). Empty ⇒
+    /// none advertised.
+    single_logout_services: []const SloEndpoint = &.{},
+    /// `<md:NameIDFormat>` URIs, in preference order.
+    name_id_formats: []const []const u8 = &.{},
+    /// `AuthnRequestsSigned` — this SP signs its AuthnRequests.
+    authn_requests_signed: bool = false,
+    /// `WantAssertionsSigned`. This module refuses an unsigned assertion
+    /// unless the enclosing Response is signed (`Config.signature_policy`); set
+    /// this to match the policy you configure.
+    want_assertions_signed: bool = true,
+    /// DER certificates published as `<md:KeyDescriptor use="signing">`. Two
+    /// for SP key rollover (current + next). Never parsed — base64-encoded as
+    /// given.
+    signing_certs_der: []const []const u8 = &.{},
+    /// DER certificates published as `<md:KeyDescriptor use="encryption">` —
+    /// the certificate for `Config.sp_decrypt_key`.
+    encryption_certs_der: []const []const u8 = &.{},
+    attribute_consuming_services: []const AttributeConsumingService = &.{},
+    organization: ?Organization = null,
+    contacts: []const ContactPerson = &.{},
+    /// `validUntil` (xsd:dateTime the caller formats). Null ⇒ omitted.
+    valid_until: ?[]const u8 = null,
+    /// `cacheDuration` (xsd:duration, e.g. `PT604800S`). Null ⇒ omitted.
+    cache_duration: ?[]const u8 = null,
+    /// `ID` of the EntityDescriptor — required when `sign_with` is set (the
+    /// signature references it). ASCII NCName: `[A-Za-z_][A-Za-z0-9._-]*`.
+    id: ?[]const u8 = null,
+    /// Sign the metadata (enveloped RSA-SHA256 / exclusive C14N, the first child
+    /// of `EntityDescriptor`), with the same signer `buildLogoutRequest` uses.
+    sign_with: ?SigningKey = null,
+};
+
+pub const SpMetadataError = error{
+    /// `entity_id` empty or longer than 1024 characters (SAMLCore §8.3.6).
+    InvalidEntityId,
+    /// `assertion_consumer_services` was empty (`AssertionConsumerService+`).
+    NoAssertionConsumerService,
+    /// Two ACS endpoints, or two AttributeConsumingServices, share an `index`.
+    DuplicateIndex,
+    /// More than one ACS endpoint, or AttributeConsumingService, says
+    /// `is_default = true`.
+    MultipleDefaults,
+    /// A value the schema requires was empty: an endpoint binding/location, a
+    /// certificate, a service with no name or no requested attribute, an
+    /// organization list, an attribute name.
+    MissingRequiredValue,
+    /// `sign_with` without `id`, or an `id` that is not an ASCII NCName (it
+    /// becomes the signature's `#id` reference).
+    InvalidId,
+    /// A caller string was not UTF-8, or held a character XML 1.0 cannot carry
+    /// (a C0 control other than tab/LF/CR, U+FFFE/U+FFFF). Refused rather than
+    /// emitted as ill-formed XML.
+    InvalidXmlCharacter,
+} || ProtocolMessageBuildError;
+
+/// Build (and, if `opts.sign_with` is set, sign) this SP's metadata. Owned by
+/// the caller. Every caller string is checked for XML 1.0 characters and
+/// escaped; nothing is emitted for an option left at its default.
+pub fn buildSpMetadata(alloc: std.mem.Allocator, opts: SpMetadataOptions) SpMetadataError![]u8 {
+    try validateSpMetadataOptions(opts);
+
+    var open: std.ArrayList(u8) = .empty;
+    defer open.deinit(alloc);
+    try open.appendSlice(alloc, "<md:EntityDescriptor xmlns:md=\"");
+    try open.appendSlice(alloc, md_ns);
+    try open.appendSlice(alloc, "\"");
+    const has_keys = opts.signing_certs_der.len + opts.encryption_certs_der.len > 0;
+    if (has_keys) {
+        try open.appendSlice(alloc, " xmlns:ds=\"");
+        try open.appendSlice(alloc, xmldsig.ds_ns);
+        try open.appendSlice(alloc, "\"");
+    }
+    try mdAttr(alloc, &open, "entityID", opts.entity_id);
+    if (opts.id) |id| try mdAttr(alloc, &open, "ID", id);
+    if (opts.valid_until) |v| try mdAttr(alloc, &open, "validUntil", v);
+    if (opts.cache_duration) |v| try mdAttr(alloc, &open, "cacheDuration", v);
+    try open.appendSlice(alloc, ">");
+
+    var rest: std.ArrayList(u8) = .empty;
+    defer rest.deinit(alloc);
+    const r = &rest;
+    try r.appendSlice(alloc, "<md:SPSSODescriptor");
+    try r.appendSlice(alloc, if (opts.authn_requests_signed) " AuthnRequestsSigned=\"true\"" else " AuthnRequestsSigned=\"false\"");
+    try r.appendSlice(alloc, if (opts.want_assertions_signed) " WantAssertionsSigned=\"true\"" else " WantAssertionsSigned=\"false\"");
+    try r.appendSlice(alloc, " protocolSupportEnumeration=\"");
+    try r.appendSlice(alloc, samlp_ns);
+    try r.appendSlice(alloc, "\">");
+    for (opts.signing_certs_der) |der| try mdKeyDescriptor(alloc, r, "signing", der);
+    for (opts.encryption_certs_der) |der| try mdKeyDescriptor(alloc, r, "encryption", der);
+    for (opts.single_logout_services) |slo| {
+        try r.appendSlice(alloc, "<md:SingleLogoutService");
+        try mdAttr(alloc, r, "Binding", slo.binding);
+        try mdAttr(alloc, r, "Location", slo.location);
+        if (slo.response_location) |rl| try mdAttr(alloc, r, "ResponseLocation", rl);
+        try r.appendSlice(alloc, "/>");
+    }
+    for (opts.name_id_formats) |f| try mdTextElement(alloc, r, "md:NameIDFormat", null, f);
+    for (opts.assertion_consumer_services) |acs| {
+        try r.appendSlice(alloc, "<md:AssertionConsumerService");
+        try mdAttr(alloc, r, "Binding", acs.binding.uri());
+        try mdAttr(alloc, r, "Location", acs.location);
+        try mdIndex(alloc, r, acs.index, acs.is_default);
+        try r.appendSlice(alloc, "/>");
+    }
+    for (opts.attribute_consuming_services) |svc| {
+        try r.appendSlice(alloc, "<md:AttributeConsumingService");
+        try mdIndex(alloc, r, svc.index, svc.is_default);
+        try r.appendSlice(alloc, ">");
+        for (svc.service_names) |n| try mdTextElement(alloc, r, "md:ServiceName", n.lang, n.value);
+        for (svc.service_descriptions) |d| try mdTextElement(alloc, r, "md:ServiceDescription", d.lang, d.value);
+        for (svc.requested_attributes) |ra| {
+            try r.appendSlice(alloc, "<md:RequestedAttribute");
+            try mdAttr(alloc, r, "Name", ra.name);
+            if (ra.name_format) |nf| try mdAttr(alloc, r, "NameFormat", nf);
+            if (ra.friendly_name) |fname| try mdAttr(alloc, r, "FriendlyName", fname);
+            if (ra.is_required) try r.appendSlice(alloc, " isRequired=\"true\"");
+            try r.appendSlice(alloc, "/>");
+        }
+        try r.appendSlice(alloc, "</md:AttributeConsumingService>");
+    }
+    try r.appendSlice(alloc, "</md:SPSSODescriptor>");
+    if (opts.organization) |org| {
+        try r.appendSlice(alloc, "<md:Organization>");
+        for (org.names) |n| try mdTextElement(alloc, r, "md:OrganizationName", n.lang, n.value);
+        for (org.display_names) |n| try mdTextElement(alloc, r, "md:OrganizationDisplayName", n.lang, n.value);
+        for (org.urls) |n| try mdTextElement(alloc, r, "md:OrganizationURL", n.lang, n.value);
+        try r.appendSlice(alloc, "</md:Organization>");
+    }
+    for (opts.contacts) |c| {
+        try r.appendSlice(alloc, "<md:ContactPerson contactType=\"");
+        try r.appendSlice(alloc, @tagName(c.contact_type));
+        try r.appendSlice(alloc, "\">");
+        if (c.company) |v| try mdTextElement(alloc, r, "md:Company", null, v);
+        if (c.given_name) |v| try mdTextElement(alloc, r, "md:GivenName", null, v);
+        if (c.sur_name) |v| try mdTextElement(alloc, r, "md:SurName", null, v);
+        for (c.email_addresses) |v| try mdTextElement(alloc, r, "md:EmailAddress", null, v);
+        for (c.telephone_numbers) |v| try mdTextElement(alloc, r, "md:TelephoneNumber", null, v);
+        try r.appendSlice(alloc, "</md:ContactPerson>");
+    }
+
+    const close = "</md:EntityDescriptor>";
+    if (opts.sign_with) |key| {
+        // `validateSpMetadataOptions` guarantees `id` is set and an NCName,
+        // so the raw `#id` the signer writes needs no escaping.
+        return signProtocolMessage(alloc, open.items, "", rest.items, close, opts.id.?, key);
+    }
+    return std.mem.concat(alloc, u8, &.{ open.items, rest.items, close });
+}
+
+fn validateSpMetadataOptions(opts: SpMetadataOptions) SpMetadataError!void {
+    if (opts.entity_id.len == 0) return error.InvalidEntityId;
+    const eid_chars = std.unicode.utf8CountCodepoints(opts.entity_id) catch return error.InvalidXmlCharacter;
+    if (eid_chars > 1024) return error.InvalidEntityId;
+
+    if (opts.assertion_consumer_services.len == 0) return error.NoAssertionConsumerService;
+    var defaults: usize = 0;
+    for (opts.assertion_consumer_services, 0..) |acs, i| {
+        if (acs.location.len == 0) return error.MissingRequiredValue;
+        for (opts.assertion_consumer_services[0..i]) |prev| {
+            if (prev.index == acs.index) return error.DuplicateIndex;
+        }
+        if (acs.is_default == true) defaults += 1;
+    }
+    if (defaults > 1) return error.MultipleDefaults;
+
+    for (opts.single_logout_services) |slo| {
+        if (slo.binding.len == 0 or slo.location.len == 0) return error.MissingRequiredValue;
+    }
+    for (opts.signing_certs_der) |d| if (d.len == 0) return error.MissingRequiredValue;
+    for (opts.encryption_certs_der) |d| if (d.len == 0) return error.MissingRequiredValue;
+    for (opts.name_id_formats) |f| if (f.len == 0) return error.MissingRequiredValue;
+
+    defaults = 0;
+    for (opts.attribute_consuming_services, 0..) |svc, i| {
+        if (svc.service_names.len == 0 or svc.requested_attributes.len == 0) return error.MissingRequiredValue;
+        for (svc.requested_attributes) |ra| if (ra.name.len == 0) return error.MissingRequiredValue;
+        for (opts.attribute_consuming_services[0..i]) |prev| {
+            if (prev.index == svc.index) return error.DuplicateIndex;
+        }
+        if (svc.is_default == true) defaults += 1;
+    }
+    if (defaults > 1) return error.MultipleDefaults;
+
+    if (opts.organization) |org| {
+        if (org.names.len == 0 or org.display_names.len == 0 or org.urls.len == 0) return error.MissingRequiredValue;
+    }
+
+    if (opts.id) |id| {
+        if (!isAsciiNcName(id)) return error.InvalidId;
+    } else if (opts.sign_with != null) return error.InvalidId;
+}
+
+/// `[A-Za-z_][A-Za-z0-9._-]*` — the ASCII subset of an XML NCName. Narrower
+/// than the production on purpose: the value is spliced into a `#id`
+/// reference URI unescaped, so only characters that need no escaping in an
+/// attribute or a URI fragment are let through.
+fn isAsciiNcName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
+    for (s[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
+    }
+    return true;
+}
+
+/// Refuse what XML 1.0 §2.2 `Char` cannot carry: invalid UTF-8 (which also
+/// covers surrogates), C0 controls other than tab/LF/CR, U+FFFE and U+FFFF.
+fn checkXmlChars(s: []const u8) error{InvalidXmlCharacter}!void {
+    const view = std.unicode.Utf8View.init(s) catch return error.InvalidXmlCharacter;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        0x9, 0xA, 0xD, 0x20...0xD7FF, 0xE000...0xFFFD, 0x10000...0x10FFFF => {},
+        else => return error.InvalidXmlCharacter,
+    };
+}
+
+/// ` name="value"`, value checked and escaped. Tab/LF/CR are written as
+/// character references so attribute-value normalization cannot fold them
+/// into spaces on the way back in.
+fn mdAttr(alloc: std.mem.Allocator, w: *std.ArrayList(u8), name: []const u8, value: []const u8) SpMetadataError!void {
+    try checkXmlChars(value);
+    try w.append(alloc, ' ');
+    try w.appendSlice(alloc, name);
+    try w.appendSlice(alloc, "=\"");
+    for (value) |c| switch (c) {
+        '&' => try w.appendSlice(alloc, "&amp;"),
+        '<' => try w.appendSlice(alloc, "&lt;"),
+        '>' => try w.appendSlice(alloc, "&gt;"),
+        '"' => try w.appendSlice(alloc, "&quot;"),
+        '\t' => try w.appendSlice(alloc, "&#9;"),
+        '\n' => try w.appendSlice(alloc, "&#10;"),
+        '\r' => try w.appendSlice(alloc, "&#13;"),
+        else => try w.append(alloc, c),
+    };
+    try w.append(alloc, '"');
+}
+
+/// `<tag xml:lang="lang">text</tag>`, text checked and escaped (CR as a
+/// character reference so end-of-line normalization keeps it).
+fn mdTextElement(alloc: std.mem.Allocator, w: *std.ArrayList(u8), tag: []const u8, lang: ?[]const u8, text: []const u8) SpMetadataError!void {
+    try checkXmlChars(text);
+    try w.append(alloc, '<');
+    try w.appendSlice(alloc, tag);
+    if (lang) |l| {
+        if (l.len == 0) return error.MissingRequiredValue;
+        try mdAttr(alloc, w, "xml:lang", l);
+    }
+    try w.append(alloc, '>');
+    for (text) |c| switch (c) {
+        '&' => try w.appendSlice(alloc, "&amp;"),
+        '<' => try w.appendSlice(alloc, "&lt;"),
+        '>' => try w.appendSlice(alloc, "&gt;"),
+        '\r' => try w.appendSlice(alloc, "&#13;"),
+        else => try w.append(alloc, c),
+    };
+    try w.appendSlice(alloc, "</");
+    try w.appendSlice(alloc, tag);
+    try w.append(alloc, '>');
+}
+
+fn mdIndex(alloc: std.mem.Allocator, w: *std.ArrayList(u8), index: u16, is_default: ?bool) std.mem.Allocator.Error!void {
+    var nbuf: [8]u8 = undefined; // u16: at most 5 digits
+    const n = nbuf[0..std.fmt.printInt(&nbuf, index, 10, .lower, .{})];
+    try w.appendSlice(alloc, " index=\"");
+    try w.appendSlice(alloc, n);
+    try w.append(alloc, '"');
+    if (is_default) |d| try w.appendSlice(alloc, if (d) " isDefault=\"true\"" else " isDefault=\"false\"");
+}
+
+fn mdKeyDescriptor(alloc: std.mem.Allocator, w: *std.ArrayList(u8), use: []const u8, der: []const u8) std.mem.Allocator.Error!void {
+    try w.appendSlice(alloc, "<md:KeyDescriptor use=\"");
+    try w.appendSlice(alloc, use);
+    try w.appendSlice(alloc, "\"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>");
+    const b64 = try base64EncodeAlloc(alloc, der);
+    defer alloc.free(b64);
+    try w.appendSlice(alloc, b64);
+    try w.appendSlice(alloc, "</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>");
+}
+
 // ── HTTP-Redirect binding: encode + sign the query string ───────────────────
 //
 // The Redirect binding (SAML Bindings §3.4) never embeds a `<ds:Signature>` in
@@ -2215,6 +2756,9 @@ pub const VerifyRedirectQueryOptions = struct {
     /// The `Signature` value, already URL-DECODED (still base64 inside).
     signature_b64: []const u8,
     key: rsa.PublicKey,
+    /// Further trusted IdP keys for certificate rollover: the signature is
+    /// accepted when it verifies under `key` OR any of these.
+    additional_keys: []const rsa.PublicKey = &.{},
 };
 
 /// Verify an HTTP-Redirect binding query-string signature (SAML Bindings
@@ -2235,7 +2779,15 @@ pub fn verifyRedirectSignature(alloc: std.mem.Allocator, opts: VerifyRedirectQue
     const sig = decodeBase64(alloc, opts.signature_b64) catch return error.InvalidEncoding;
     defer alloc.free(sig);
 
-    rsa.verifyPkcs1v15(opts.key, Sha256, signing_input.items, sig) catch return false;
+    rsa.verifyPkcs1v15(opts.key, Sha256, signing_input.items, sig) catch {
+        // Certificate rollover: any configured key may have signed it. All of
+        // them are out-of-band trust anchors; nothing in the query names one.
+        for (opts.additional_keys) |k| {
+            rsa.verifyPkcs1v15(k, Sha256, signing_input.items, sig) catch continue;
+            return true;
+        }
+        return false;
+    };
     return true;
 }
 
@@ -2477,6 +3029,9 @@ pub fn buildLogoutResponse(alloc: std.mem.Allocator, opts: LogoutResponseOptions
 pub const LogoutRequestConfig = struct {
     idp_entity_id: []const u8,
     idp_key: xmldsig.VerifyKey,
+    /// Further trusted IdP keys for certificate rollover — same semantics as
+    /// `Config.additional_idp_keys`.
+    additional_idp_keys: []const xmldsig.VerifyKey = &.{},
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
@@ -2583,10 +3138,9 @@ pub fn consumeLogoutRequestXml(
     switch (source) {
         .embedded => {
             const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-            var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -2666,6 +3220,9 @@ pub fn consumeLogoutRequestXml(
 pub const LogoutResponseConfig = struct {
     idp_entity_id: []const u8,
     idp_key: xmldsig.VerifyKey,
+    /// Further trusted IdP keys for certificate rollover — same semantics as
+    /// `Config.additional_idp_keys`.
+    additional_idp_keys: []const xmldsig.VerifyKey = &.{},
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
@@ -2762,10 +3319,9 @@ pub fn consumeLogoutResponseXml(
     switch (source) {
         .embedded => {
             const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-            var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
-            defer res.deinit(alloc);
-            if (!res.valid) return error.SignatureInvalid;
-            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+            defer kr.res.deinit(alloc);
+            if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -2957,6 +3513,9 @@ pub fn buildArtifactResolveSoap(alloc: std.mem.Allocator, opts: ArtifactResolveO
 pub const ArtifactResponseConfig = struct {
     idp_entity_id: []const u8,
     idp_key: xmldsig.VerifyKey,
+    /// Further trusted IdP keys for certificate rollover — same semantics as
+    /// `Config.additional_idp_keys`.
+    additional_idp_keys: []const xmldsig.VerifyKey = &.{},
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
@@ -3048,10 +3607,9 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     if (!std.mem.eql(u8, irt, config.expected_in_response_to)) return error.InResponseToMismatch;
 
     const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-    var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
-    defer res.deinit(alloc);
-    if (!res.valid) return error.SignatureInvalid;
-    if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+    var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+    defer kr.res.deinit(alloc);
+    if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
 
     const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedSoap;
     const status_code_el = childEl(status, samlp_ns, "StatusCode") orelse return error.MalformedSoap;
@@ -3219,6 +3777,8 @@ test {
     _ = @import("test_issuer.zig");
     _ = @import("test_multins.zig");
     _ = @import("test_response_sig.zig");
+    _ = @import("test_multikey.zig");
+    _ = @import("test_metadata.zig");
 }
 
 const testing = std.testing;

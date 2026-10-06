@@ -1,11 +1,12 @@
 # xdp-classifier
 
 Pure-Zig **XDP packet classifier** for a LibreQoS-style edge shaper: given a
-set of rules `{ ip_prefix (IPv4) -> class_handle:u32 }`, produces a valid,
-verifier-passing XDP eBPF program that, per packet, parses Ethernet+IPv4,
-performs a longest-prefix-match lookup against a `BPF_MAP_TYPE_LPM_TRIE` map
-keyed on the packet's source (or destination) IPv4 address, and stashes the
-resolved class handle into a scratch map before returning `XDP_PASS`.
+set of rules `{ ip_prefix (IPv4 or IPv6) -> class_handle:u32 }`, produces a
+valid, verifier-passing XDP eBPF program that, per packet, skips up to two
+802.1Q / 802.1ad (QinQ) VLAN tags, parses IPv4 or IPv6, performs a
+longest-prefix-match lookup against a `BPF_MAP_TYPE_LPM_TRIE` map keyed on
+the packet's source (or destination) address, and stashes the resolved class
+handle into a scratch map before returning `XDP_PASS`.
 
 - **Model after:** LibreQoS's classify-then-shape architecture (an XDP
   classification stage feeding a downstream `tc`/CAKE queueing stage) — API
@@ -29,7 +30,10 @@ more (`createLpmTrieMap`+`populateRule`, `createCpuMap`+`populateCpu`,
 round-trips that need a real map to exercise the key/value byte encodings
 (F6: an earlier version of this sentence undercounted these four as covered
 by "the real-load checks", which they are not — they never call
-`ebpf.load`). See `SPEC.md` for the full argument; the short version:
+`ebpf.load`). Since 2026-10-06 `src/kernel_test.zig` adds four more gated
+tests that load every VLAN/IPv6 program variant AND run it in the kernel on
+real frames (`BPF_PROG_TEST_RUN`), plus an IPv6-map round-trip in `maps.zig`.
+See `SPEC.md` for the full argument; the short version:
 
 Every verifier-hard PATTERN this program needs — `ctx->data`/`ctx->data_end`
 retyping, bounds-check dominance over a packet region, the map-lookup
@@ -44,10 +48,25 @@ shape for Ethernet+IPv4 — was additionally cross-checked against real
 `clang -O2 -target bpf` disassembly of the equivalent C, not just reasoned
 about by analogy (see `src/classifier.zig`'s golden-test provenance comment).
 
-## Scope (v1)
+## Scope
 
-- **IPv4 only.** IPv6 is a documented, additive extension (a second
-  bounds-check-and-parse block following the same pattern), not built here.
+- **IPv4 and IPv6.** IPv6 needs its own LPM map (`createLpm6TrieMap`, 20-byte
+  key) passed as `lpm6_map_fd`; without one, IPv6 frames fall to the default
+  class exactly as before. IPv6 is classified on the **fixed 40-byte header
+  only**: the source/destination addresses always live there (RFC 8200 §3),
+  so no extension header is walked or needs to be — a Hop-by-Hop or Routing
+  header after it changes nothing about the key. Two consequences to know: the
+  `Next Header` chain is not inspected at all (nothing here classifies on L4),
+  and with a Routing header the fixed-header destination is the current
+  segment's, i.e. the address this hop forwards to. The version nibble must be
+  6 (a frame labelled `0x86DD` with another version gets the default class).
+- **VLAN tags: 0, 1 or 2 skipped (`vlan_depth`, default 2).** Either TPID —
+  `0x8100` (802.1Q) or `0x88A8` (802.1ad) — is accepted at either depth, like
+  Linux's flow dissector. The tag's VID/PCP is not inspected (classification is
+  by address on every VLAN). A frame with more tags than `vlan_depth`, or with
+  another TPID (`0x9100`, …), gets the default class. Each skipped tag is a
+  constant 4-byte cursor advance followed by a fresh bounds check, so every
+  read stays verifier-provable (see `SPEC.md`, "VLAN and IPv6").
 - **Fixed 20-byte IPv4 header (no options).** The generated program checks
   the IHL nibble equals 5 and falls to the configured default class
   otherwise, rather than computing a variable-length header offset.
@@ -57,23 +76,16 @@ about by analogy (see `src/classifier.zig`'s golden-test provenance comment).
   `tc`/queueing stage to act on, it does not drop traffic itself. A
   DROP-on-no-match variant is a one-instruction change but not what this
   fixed contract commits to.
-- A too-short packet, a non-IPv4 EtherType, IPv4-with-options, and an LPM
-  miss are all deliberately indistinguishable at the output (all four write
-  the same configured default class) — see `src/classifier.zig`'s "Design
-  note on the shared DEFAULT class".
-- **VLAN-tagged frames (802.1Q/802.1ad, EtherType `0x8100`/`0x88a8`) are not
-  classified.** They fall through the plain "non-IPv4 EtherType" path to the
-  default class, same as any other EtherType this program does not
-  recognize — there is no VLAN-tag skip, so a tagged IPv4 frame is
-  unclassified even though the IPv4 payload two EtherTypes deeper is exactly
-  what this module targets. Measured (F9): 802.1Q with VID 0/100/4095 and
-  802.1ad QinQ all resolve to the default class, while the identical
-  untagged IPv4 frame resolves to its rule's class. Worth naming explicitly
-  because, unlike IPv6 or IPv4-with-options (which each miss only PART of
-  the traffic), a deployment on a tagged link would see ALL of its traffic
-  fall to best-effort. A future `vlan_depth` option (skip N 4-byte tag
-  headers before the EtherType/IHL checks) is the natural additive
-  extension — not built here, see `SPEC.md`'s backlog.
+- A too-short packet, an unrecognised EtherType (or too many tags),
+  IPv4-with-options, an IPv6 version mismatch, and an LPM miss are all
+  deliberately indistinguishable at the output (all write the same configured
+  default class) — see `src/classifier.zig`'s "Design note on the shared
+  DEFAULT class".
+- **Upgrading from before 2026-10-06:** `vlan_depth` defaults to 2, so a
+  program built with the old options now classifies tagged frames that used
+  to get the default class (F9's measured gap, now closed). Pass
+  `.vlan_depth = .none` for the previous program, byte for byte. The IPv4 map,
+  its 8-byte key and every IPv4 function are unchanged; IPv6 is opt-in.
 
 ## API
 
@@ -101,6 +113,8 @@ const insns = xdp_classifier.buildClassifierProgram(.{
     .scratch_map_fd = scratch_fd,
     .key_field = .src,
     .default_class = 0,
+    .vlan_depth = .double, // the default: skip up to 2 tags (802.1Q / QinQ)
+    .lpm6_map_fd = null, // no IPv6 map: IPv6 gets default_class (see below)
 });
 
 // 4. Load + attach it — both real, working code in the sibling `ebpf`
@@ -121,13 +135,46 @@ const per_cpu = try xdp_classifier.readScratchClassAll(gpa, scratch_fd);
 defer gpa.free(per_cpu);
 ```
 
+### IPv6
+
+A second, independent rule table and map; the IPv4 ones are untouched.
+
+```zig
+const lpm6_fd = try xdp_classifier.createLpm6TrieMap(1024); // LPM_TRIE, 20-byte key
+const rules6 = [_]xdp_classifier.ClassifierRule6{
+    // 2001:db8::/32 -> class 1
+    .{ .prefix = .{ .addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .prefix_len = 32 }, .class = 1 },
+};
+const rule_set6: xdp_classifier.RuleSet6 = .{ .rules = &rules6 };
+try rule_set6.validate(1024); // or validateSorted(max, scratch) for large tables
+try xdp_classifier.populateRuleSet6(lpm6_fd, rule_set6);
+
+const insns = xdp_classifier.buildClassifierProgram(.{
+    .lpm_map_fd = lpm_fd,
+    .scratch_map_fd = scratch_fd,
+    .lpm6_map_fd = lpm6_fd, // IPv6 frames now classified (same key_field)
+});
+```
+
+`Ipv6Prefix { addr: [16]u8, prefix_len: u8 }` (wire order, 0..128),
+`ClassifierRule6`, `RuleSet6` (`validate`/`validateSorted`, same errors and
+precedence as `RuleSet`), `LpmKey6` (the 20-byte key: native `u32` prefixlen +
+16 address bytes), `lookupReference6`, `populateRule6`, `lpm6_key_size`. A
+class handle is a class handle: both tables feed the same scratch map (and,
+for steering, the same `class % cpu_count` CPU choice).
+
+`VlanDepth` is an enum (`.none`, `.single`, `.double`) so an out-of-range
+depth cannot be expressed; `VlanDepth.fromInt(n)` converts a configured
+number (`null` for anything but 0..2).
+
 ### CPUMAP steering (redirect a matched flow to a chosen CPU)
 
 `buildClassifierProgram` classifies and returns `XDP_PASS`; `buildCpumapSteerProgram`
 is the piece that actually **steers** a flow — the last primitive in the
 LibreQoS pipeline `XDP bpf_redirect_map(&cpumap, cpu) → BPF_MAP_TYPE_CPUMAP →
-per-CPU tc MQ/HTB tree`. It reuses the exact same Ethernet+IPv4 parse + LPM
-lookup as the classifier, then redirects the packet to a CPU:
+per-CPU tc MQ/HTB tree`. It reuses the exact same parse (VLAN skip, IPv4, and
+IPv6 when `lpm6_map_fd` is given) + LPM lookup as the classifier — one shared
+emitter — then redirects the packet to a CPU:
 
 ```zig
 // Create the CPUMAP (one slot per CPU) and populate each slot.
@@ -206,7 +253,7 @@ ruleset's intended behavior without a kernel).
   classified concurrently on different RX queues/CPUs never race on one
   shared slot — the same map-type tradeoff `ebpf.kprobeCounter`'s doc
   comment discusses for its own counter map.
-- **Out of scope (deliberate):** IPv6, variable-length IPv4 options, a
+- **Out of scope (deliberate):** variable-length IPv4 options, a
   flow-keyed (rather than single-slot) output map, `bpf_xdp_adjust_meta`-based
   per-packet metadata handoff to a downstream `tc` classifier — see
   `SPEC.md`'s backlog for the reasoning behind each.
