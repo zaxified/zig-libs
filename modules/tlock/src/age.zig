@@ -46,6 +46,8 @@
 //!   refused (`tle` never writes that).
 //! - No streaming I/O: whole buffers in, whole buffers out. Sizes are exact
 //!   and computable up front (`encryptedLen`, `decryptedLen`, `armoredLen`).
+//!   The STREAM layer itself is chunk-at-a-time (`PayloadStream`) for a
+//!   caller that streams.
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
@@ -316,35 +318,99 @@ pub fn openedLen(len: usize) error{MalformedPayload}!usize {
     return len - chunks * tag_bytes;
 }
 
-fn sealPayload(out: []u8, key: [Aead.key_length]u8, plaintext: []const u8) void {
+/// One direction of the age STREAM payload (C2SP `age.md`), one chunk at a
+/// time: ChaCha20-Poly1305 per chunk of `chunk_bytes` under `key`, nonce
+/// `BE88(counter) || last_flag`, empty AD. `sealPayload`/`openPayload`
+/// below are the whole-buffer loops over it, so the Go-`tle` whole-file
+/// KAT exercises exactly this code; a streaming caller drives it itself
+/// (`timelock_envelope`'s stream format does).
+///
+/// The caller decides which chunk is the last one (it must look ahead one
+/// byte); `sealChunk` asserts the shape rules, `openChunk` refuses a
+/// violation with `error.MalformedPayload`:
+/// - a non-last chunk carries exactly `chunk_bytes` of plaintext;
+/// - the last chunk carries 1..`chunk_bytes`, or 0 only as the FIRST chunk
+///   (the empty plaintext);
+/// - nothing follows the last chunk.
+pub const PayloadStream = struct {
+    key: [Aead.key_length]u8,
+    counter: u64 = 0,
+    finished: bool = false,
+
+    pub fn init(key: [Aead.key_length]u8) PayloadStream {
+        return .{ .key = key };
+    }
+
+    /// Seal one chunk: `out.len == plaintext.len + tag_bytes`.
+    pub fn sealChunk(self: *PayloadStream, out: []u8, plaintext: []const u8, last: bool) void {
+        std.debug.assert(!self.finished);
+        std.debug.assert(out.len == plaintext.len + tag_bytes);
+        std.debug.assert(chunkShapeOk(plaintext.len, last, self.counter));
+        const n = plaintext.len;
+        Aead.encrypt(out[0..n], out[n..][0..tag_bytes], plaintext, "", chunkNonce(self.counter, last), self.key);
+        self.counter += 1;
+        self.finished = last;
+    }
+
+    /// Open one sealed chunk into `out` (`out.len == sealed.len - tag_bytes`).
+    /// On `PayloadAuthenticationFailed` `out` is zeroed (chachapoly's
+    /// contract) and the stream must be abandoned.
+    pub fn openChunk(self: *PayloadStream, out: []u8, sealed: []const u8, last: bool) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
+        if (self.finished) return error.MalformedPayload;
+        if (sealed.len < tag_bytes) return error.MalformedPayload;
+        const n = sealed.len - tag_bytes;
+        if (!chunkShapeOk(n, last, self.counter)) return error.MalformedPayload;
+        std.debug.assert(out.len == n);
+        Aead.decrypt(out, sealed[0..n], sealed[n..][0..tag_bytes].*, "", chunkNonce(self.counter, last), self.key) catch
+            return error.PayloadAuthenticationFailed;
+        self.counter += 1;
+        self.finished = last;
+    }
+
+    pub fn wipe(self: *PayloadStream) void {
+        std.crypto.secureZero(u8, &self.key);
+    }
+
+    fn chunkShapeOk(n: usize, last: bool, counter: u64) bool {
+        if (!last) return n == chunk_bytes;
+        return n <= chunk_bytes and (n > 0 or counter == 0);
+    }
+};
+
+/// The whole STREAM payload (nonce excluded) of `plaintext` under `key`:
+/// `out.len == sealedLen(plaintext.len)`.
+pub fn sealPayload(out: []u8, key: [Aead.key_length]u8, plaintext: []const u8) void {
     std.debug.assert(out.len == sealedLen(plaintext.len));
-    var counter: u64 = 0;
+    var stream = PayloadStream.init(key);
+    defer stream.wipe();
     var in_off: usize = 0;
     var out_off: usize = 0;
-    while (true) : (counter += 1) {
+    while (true) {
         const n = @min(chunk_bytes, plaintext.len - in_off);
         const last = in_off + n == plaintext.len;
-        const c = out[out_off..][0 .. n + tag_bytes];
-        Aead.encrypt(c[0..n], c[n..][0..tag_bytes], plaintext[in_off..][0..n], "", chunkNonce(counter, last), key);
+        stream.sealChunk(out[out_off..][0 .. n + tag_bytes], plaintext[in_off..][0..n], last);
         in_off += n;
         out_off += n + tag_bytes;
         if (last) break;
     }
 }
 
-fn openPayload(out: []u8, key: [Aead.key_length]u8, sealed: []const u8) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
+/// Open a whole STREAM payload (nonce excluded): `out.len ==
+/// try openedLen(sealed.len)`. On failure every byte already written is wiped.
+pub fn openPayload(out: []u8, key: [Aead.key_length]u8, sealed: []const u8) error{ MalformedPayload, PayloadAuthenticationFailed }!void {
     std.debug.assert(out.len == try openedLen(sealed.len));
-    var counter: u64 = 0;
+    var stream = PayloadStream.init(key);
+    defer stream.wipe();
     var in_off: usize = 0;
     var out_off: usize = 0;
-    while (true) : (counter += 1) {
+    while (true) {
         const rest = sealed.len - in_off;
         const last = rest <= sealed_chunk_bytes;
         const c = sealed[in_off..][0..@min(rest, sealed_chunk_bytes)];
         const n = c.len - tag_bytes;
-        Aead.decrypt(out[out_off..][0..n], c[0..n], c[n..][0..tag_bytes].*, "", chunkNonce(counter, last), key) catch {
+        stream.openChunk(out[out_off..][0..n], c, last) catch |err| {
             std.crypto.secureZero(u8, out[0..out_off]);
-            return error.PayloadAuthenticationFailed;
+            return err;
         };
         in_off += c.len;
         out_off += n;
@@ -954,4 +1020,38 @@ test "corpus: the age fuzz seeds reach past the first check" {
     }
     try testing.expectEqual(@as(usize, 2), parsed);
     try testing.expectEqual(@as(usize, 1), dearmored);
+}
+
+test "PayloadStream.openChunk refuses every chunk-shape violation before touching the AEAD" {
+    const key = [_]u8{0x42} ** Aead.key_length;
+    var sealer = PayloadStream.init(key);
+    var full: [sealed_chunk_bytes]u8 = undefined;
+    const pt = [_]u8{0x07} ** chunk_bytes;
+    sealer.sealChunk(&full, &pt, false);
+    var tail: [tag_bytes]u8 = undefined; // a genuine empty LAST chunk at counter 1
+    Aead.encrypt(tail[0..0], tail[0..tag_bytes], "", "", chunkNonce(1, true), key);
+
+    var out: [chunk_bytes]u8 = undefined;
+    // A short non-last chunk.
+    var o = PayloadStream.init(key);
+    try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0 .. chunk_bytes - 1], full[0 .. sealed_chunk_bytes - 1], false));
+    // Shorter than a tag.
+    try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0..0], full[0 .. tag_bytes - 1], true));
+    // The genuine first chunk opens; then an EMPTY last chunk is refused
+    // even though its tag is genuine — the empty final chunk is only legal
+    // as the first one.
+    try o.openChunk(&out, &full, false);
+    try std.testing.expectEqualSlices(u8, &pt, &out);
+    try std.testing.expectError(error.MalformedPayload, o.openChunk(out[0..0], &tail, true));
+    // Nothing after the last chunk.
+    var e = PayloadStream.init(key);
+    var empty: [tag_bytes]u8 = undefined;
+    var es = PayloadStream.init(key);
+    es.sealChunk(&empty, "", true);
+    try e.openChunk(out[0..0], &empty, true);
+    try std.testing.expectError(error.MalformedPayload, e.openChunk(out[0..0], &empty, true));
+    // The last flag is authenticated: a full chunk sealed as non-last does
+    // not open as the last one (truncation at a chunk boundary).
+    var t = PayloadStream.init(key);
+    try std.testing.expectError(error.PayloadAuthenticationFailed, t.openChunk(&out, &full, true));
 }

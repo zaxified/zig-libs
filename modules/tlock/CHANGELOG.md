@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **API ADDED, NO BEHAVIOURAL CHANGE:** `age.PayloadStream` — the age STREAM
+  one chunk at a time (`init(key)`, `sealChunk(out, plaintext, last)`, `openChunk(out, sealed,
+  last)` refusing chunk-shape violations with `MalformedPayload`, `wipe`), for callers that
+  stream (`timelock_envelope`'s version 2). `age.sealPayload` / `age.openPayload` (whole-buffer)
+  are now public and are loops over it, so the Go-`tle` whole-file KAT covers the chunk code.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the age layer is now interop-proven against
   Go: drand/tlock's whole-file fixture (`testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`
   and `lorem.txt`, commit `7ceb44a5…`, MIT OR Apache-2.0) is committed under `src/testdata/` and

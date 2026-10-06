@@ -52,6 +52,12 @@ pub const DerivedKeys = envelope.DerivedKeys;
 pub const SealError = envelope.SealError;
 pub const OpenError = envelope.OpenError;
 
+/// The version-2 streaming format (any payload size, bounded memory).
+pub const stream = @import("stream.zig");
+pub const StreamSealError = stream.StreamSealError;
+pub const StreamOpenError = stream.StreamOpenError;
+pub const deriveStreamKey = stream.deriveStreamKey;
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -76,6 +82,8 @@ pub const meta = .{
 test {
     _ = envelope;
     _ = @import("security_test.zig");
+    _ = stream;
+    _ = @import("stream_test.zig");
 }
 
 test "meta.deps is exactly {tlock, hqc, chachapoly, entropy}" {

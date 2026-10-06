@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **ADDED (new wire version, version 1 unchanged):** a streaming format for
+  payloads of any size in bounded memory: `Envelope(Kem).sealStream(gpa, writer, reader, ek,
+  p_pub, round, rnd)` / `.openStream(gpa, writer, reader, dk, round_signature)` over
+  `std.Io.Writer`/`Reader`, `streamSealedLen`, module `stream` (`StreamSealError`,
+  `StreamOpenError`, `deriveStreamKey`). Wire version 2: the same header without `pt_len`, the
+  same two locks, then an age STREAM (64 KiB ChaCha20-Poly1305 chunks via
+  `tlock.age.PayloadStream`) under a key that binds both lock secrets and a SHA-256 of the header
+  and locks. ⚠ `openStream` writes each verified chunk as it goes — discard the output on an
+  error. Version 1's `parse`/`open` refuse version 2 (`UnsupportedVersion`) and vice versa.
+  Anchored: the payload is byte-exactly `tlock.age.sealPayload`'s (Go-`tle`-proven). Mutation
+  run 10/10 killed. Scope mvp -> core.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: streaming and multiple recipients in "Deliberately deferred" now point to their Backlog items ("not yet").
 - **2026-10-05** — Mutation run: 19 of 19 killed, 0 equivalent; 4 tests added
   (`deriveKeys` against a Python HKDF recomputation, trailing bytes refused by

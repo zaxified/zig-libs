@@ -269,7 +269,7 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 
 - ~~age stanza + armor layer for arbitrary-length payloads~~ — DONE 2026-10-06 (`age.zig`).
 - ~~**Whole-file interop KAT for the age layer**~~ — **DONE 2026-10-06**: both files committed under `src/testdata/` (drand/tlock commit `7ceb44a5…`, MIT OR Apache-2.0); `kat_test.zig` decrypts the armored file end-to-end with the pinned round-5423142 signature and compares with `lorem.txt`, refuses it under another chain hash, and refuses a flipped payload byte.
-- **Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer` for files larger than memory. Effort: small (the chunk loop is already per-chunk).
+- **Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer` for files larger than memory. Effort: small — the STREAM layer is chunk-at-a-time since 2026-10-06 (`age.PayloadStream`, used by `timelock_envelope`'s streaming format); what is left is the header read/write around it.
 - **G2-signature scheme (`bls-unchained` testnet variant)** *(survey 2026-09-30)* — supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits §2.
 
 ## Anchoring

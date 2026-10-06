@@ -57,6 +57,7 @@ const tlock = @import("tlock");
 const hqc = @import("hqc");
 const chachapoly = @import("chachapoly");
 const entropy = @import("entropy");
+const stream = @import("stream.zig");
 
 const bls12_381 = tlock.bls12_381;
 const g1 = bls12_381.g1;
@@ -407,6 +408,16 @@ pub fn Envelope(comptime Kem: type) type {
 
             return pt;
         }
+
+        /// The version-2 streaming format (`stream.zig`): the same two
+        /// locks, content as an age-style STREAM over `std.Io.Reader` /
+        /// `std.Io.Writer`, payloads of any size in bounded memory.
+        pub const sealStream = stream.Stream(Kem).seal;
+        /// Open a version-2 stream; see `stream.zig` for the streaming
+        /// release caveat (discard the output on an error).
+        pub const openStream = stream.Stream(Kem).open;
+        /// Total wire size of a `len`-byte plaintext in the stream format.
+        pub const streamSealedLen = stream.Stream(Kem).sealedLen;
     };
 }
 

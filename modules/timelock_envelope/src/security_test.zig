@@ -66,21 +66,21 @@ const wrong_sig_hex =
     "96fce8e2f70e2784577c8f2d8bd36af7a4b0dfd73dd91469d8556b36d2973a4" ++
     "f84681a45b1af2ce0511e5a32dd72508f";
 
-const seal_round: u64 = 1000;
+pub const seal_round: u64 = 1000;
 
-fn quicknetPubkey() g2.Affine {
+pub fn quicknetPubkey() g2.Affine {
     return g2.fromBytesCompressed(hexBytes(96, quicknet_pubkey_hex)) catch unreachable;
 }
-fn round1000Signature() g1.Affine {
+pub fn round1000Signature() g1.Affine {
     return g1.fromBytesCompressed(hexBytes(48, round_1000_sig_hex)) catch unreachable;
 }
-fn wrongSignature() g1.Affine {
+pub fn wrongSignature() g1.Affine {
     return g1.fromBytesCompressed(hexBytes(48, wrong_sig_hex)) catch unreachable;
 }
 
 // Deterministic randomness for reproducible tests (the repo convention:
 // randomness is an explicit input; see envelope.SealRandomness).
-fn fixedRandomness() Env.SealRandomness {
+pub fn fixedRandomness() Env.SealRandomness {
     return .{
         .s_time = [_]u8{0x11} ** envelope.time_secret_bytes,
         .tlock_sigma = [_]u8{0x22} ** envelope.time_secret_bytes,
@@ -88,7 +88,7 @@ fn fixedRandomness() Env.SealRandomness {
     };
 }
 
-fn recipientKeypair(seed_byte: u8) Kem.KeyPair {
+pub fn recipientKeypair(seed_byte: u8) Kem.KeyPair {
     return Kem.keypair(&[_]u8{seed_byte} ** 32);
 }
 

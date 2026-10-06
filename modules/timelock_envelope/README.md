@@ -84,6 +84,28 @@ signature), `AuthFailed` (wrong HQC key, or tampered content/header),
 `MalformedTimeLock` / `BadMagic` / `UnsupportedVersion` / `SuiteMismatch`
 / `Truncated` / `LengthMismatch` (malformed wire buffer).
 
+### Streaming — files of any size (wire version 2)
+
+```zig
+// SEAL from any std.Io.Reader to any std.Io.Writer, ~128 KiB of memory.
+try Env.sealStream(gpa, &file_writer.interface, &file_reader.interface, recipient_ek, p_pub, round, rnd);
+try file_writer.interface.flush();
+
+// OPEN chunk by chunk. ⚠ Each written chunk is authentic and in order, but
+// the plaintext is COMPLETE only when openStream returns without error —
+// on an error, discard what was written.
+try Env.openStream(gpa, &out_writer.interface, &in_reader.interface, recipient_dk, round_signature);
+```
+
+Same two locks and the same AND; the content is an age-style STREAM
+(64 KiB ChaCha20-Poly1305 chunks — `tlock.age.PayloadStream`, the code
+`tlock`'s Go-`tle` decryptor runs) under a key that also binds a SHA-256
+of the header and both locks. Truncation, reordering, dropped or appended
+chunks all fail a tag. `openStream` errors: those of `open`, plus
+`MalformedPayload` (no payload / malformed last chunk); `LengthMismatch`
+does not exist here. Version 1 (`seal`/`open`) and version 2 each refuse
+the other's wire with `UnsupportedVersion`.
+
 ### Randomness
 
 Per the repo convention (`tlock`/`hqc`/`bbs`), `seal`'s randomness is an
@@ -103,7 +125,14 @@ magic "TLE1" | version | suite_id | flags | round(u64 LE) | pt_len(u32 LE)
 ```
 
 The header plus both lock ciphertexts are authenticated as the AEAD AAD;
-the AEAD nonce is *derived* (never stored). Field-by-field layout, the
+the AEAD nonce is *derived* (never stored). Version 2 (streaming) drops
+`pt_len` and the single tag:
+
+```
+magic "TLE1" | 2 | suite_id | flags | round(u64 LE) | tlock_ct(128) | hqc_ct
+             | chunk_0 | … | chunk_last              (STREAM, 64 KiB + 16 each)
+```
+ Field-by-field layout, the
 KDF inputs/domain-separation, and the nonce derivation are in
 [SPEC.md](SPEC.md).
 
