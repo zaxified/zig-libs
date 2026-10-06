@@ -605,6 +605,11 @@ func main() {
 		seed := fs.Int64("seed", 2026, "seed")
 		fs.Parse(os.Args[2:])
 		must(json.NewEncoder(os.Stdout).Encode(gen(*n, *seed)))
+	case "register":
+		if len(os.Args) < 3 {
+			os.Exit(2)
+		}
+		os.Exit(register(os.Args[2]))
 	case "judge":
 		if len(os.Args) < 5 {
 			os.Exit(2)

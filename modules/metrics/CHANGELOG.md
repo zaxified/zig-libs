@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Anchoring: registration rules against client_golang + JSON access log against
+  Python** (`tools/go_oracle register` → `src/go_register_test.zig`; `tools/json_path_oracle.py`).
+  - **BEHAVIOURAL:** a label name repeated within one call is `InvalidLabelName`; it was accepted and
+    written as `m{a="1",a="2"}`, which Prometheus refuses — with the whole scrape.
+  - **BEHAVIOURAL (looser):** `quantile` is an ordinary label name; it was `ReservedLabelName` on the
+    claim that client_golang reserves it everywhere (it does so for summaries only).
+  - **BEHAVIOURAL:** `AccessLog`'s JSON format replaces ill-formed UTF-8 with one U+FFFD per maximal
+    subpart (Unicode §3.9), as the `accesslog` module and Python/WHATWG/Rust do; it was one per byte.
+  - Known defect recorded: `AccessLog` `.combined` lines are refused by goaccess (no host/time).
+  Evidence MIXED → EXTERNAL.
+
 - **2026-10-05** — **Anchoring: client_golang + expfmt + textparse oracle** (`tools/go_oracle`,
   `tools/interop.zig`, `src/go_oracle_test.zig`): 163 operation scripts run on this Registry and on
   client_golang; expfmt parses our exposition into the families client_golang gathered and the

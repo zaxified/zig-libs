@@ -151,9 +151,9 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 /// unvalidated value could make the exposition invalid UTF-8 despite its
 /// own `charset=utf-8` `Content-Type`). Values are escaped at exposition
 /// (`\`, `"` and newline). Names must match `[a-zA-Z_][a-zA-Z0-9_]*`, not
-/// start with `__` (reserved by Prometheus), and not be `le` or `quantile`
-/// (reserved for a histogram's own bucket bound / a summary's own quantile
-/// — `RegisterError.ReservedLabelName`, any instrument kind; audit F13).
+/// start with `__` (reserved by Prometheus), not repeat within one call,
+/// and not be `le` (reserved for a histogram's own bucket bound —
+/// `RegisterError.ReservedLabelName`, any instrument kind; audit F13).
 /// Keep the *set of values* small and fixed — see the cardinality footgun
 /// in the module doc.
 pub const Label = struct {
@@ -287,17 +287,19 @@ pub const RegisterError = error{
     OutOfMemory,
     /// Metric name must match `[a-zA-Z_:][a-zA-Z0-9_:]*`.
     InvalidName,
-    /// Label name must match `[a-zA-Z_][a-zA-Z0-9_]*` and not start with
-    /// the reserved `__`. (`le`/`quantile` are rejected too, but as
-    /// `ReservedLabelName`, not this.)
+    /// Label name must match `[a-zA-Z_][a-zA-Z0-9_]*`, not start with the
+    /// reserved `__`, and not repeat another label of the same call. (`le`
+    /// is rejected too, but as `ReservedLabelName`, not this.)
     InvalidLabelName,
-    /// The label name `le` (reserved for a histogram's own bucket bound) or
-    /// `quantile` (reserved for a summary, which this module does not
-    /// implement) was passed as a caller-supplied label — on ANY
-    /// instrument kind, matching client_golang's reserved-name check
-    /// (audit F13: previously only rejected on histograms, which let a
-    /// counter or gauge register a `le` label that then collided with a
-    /// same-named histogram's own bucket samples — see F5).
+    /// The label name `le` (reserved for a histogram's own bucket bound) was
+    /// passed as a caller-supplied label — on ANY instrument kind, as
+    /// client_golang refuses it (audit F13: previously only rejected on
+    /// histograms, which let a counter or gauge register a `le` label that
+    /// then collided with a same-named histogram's own bucket samples — see
+    /// F5). `quantile` used to be refused too, on the claim that
+    /// client_golang does; it reserves it only for summaries, which this
+    /// module does not have, and takes it on every other kind
+    /// (`go_register_test.zig`, 2026-10-06) — so does this module now.
     ReservedLabelName,
     /// A label value or the HELP text is not valid UTF-8 (audit F6): the
     /// exposition format's `Content-Type` promises `charset=utf-8`, so this
@@ -417,12 +419,16 @@ pub const Registry = struct {
         if (!validMetricName(name)) return error.InvalidName;
         if (!std.unicode.utf8ValidateSlice(help)) return error.InvalidUtf8;
         if (labels.len > max_labels) return error.TooManyLabels;
-        for (labels) |l| {
+        for (labels, 0..) |l, i| {
             if (!validLabelName(l.name)) return error.InvalidLabelName;
-            // `le`/`quantile` are reserved on every kind (F13) — see
+            // ⛔ A repeated label name was accepted and written as
+            // `m{a="1",a="2"}`, which Prometheus refuses -- the whole scrape
+            // with it. client_golang refuses the descriptor
+            // (`go_register_test.zig`, 2026-10-06).
+            for (labels[0..i]) |prev| if (std.mem.eql(u8, prev.name, l.name)) return error.InvalidLabelName;
+            // `le` is reserved on every kind (F13) — see
             // `RegisterError.ReservedLabelName`.
-            if (std.mem.eql(u8, l.name, "le") or std.mem.eql(u8, l.name, "quantile"))
-                return error.ReservedLabelName;
+            if (std.mem.eql(u8, l.name, "le")) return error.ReservedLabelName;
             if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidUtf8;
         }
         if (kind == .histogram) {
@@ -1060,7 +1066,7 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
 /// them, and neither can produce an injection (quote/backslash escaping
 /// holds either way): the JSON writer escapes `"`, `\` and control bytes
 /// 0x00-0x1F, and replaces any byte that is not part of a valid UTF-8
-/// sequence with U+FFFD, one byte at a time, so its output is always valid
+/// sequence with U+FFFD, one per maximal subpart, so its output is always valid
 /// JSON and valid UTF-8 (closes the module's audit F3 — PROBE H no longer
 /// reproduces); the CLF writer additionally escapes DEL (0x7F) as `\xHH`
 /// and passes 0x80-0xFF through raw (CLF carries no UTF-8 promise to keep).
@@ -1272,13 +1278,43 @@ pub const AccessLog = struct {
     }
 };
 
+/// One step of a UTF-8 scan: `len` bytes (never zero) that are one
+/// well-formed sequence (`ok`), or else the maximal subpart of an ill-formed
+/// one -- the longest prefix of some well-formed sequence, or 1 when even the
+/// first byte cannot start one (Unicode 16.0 Table 3-7 and §3.9; the same
+/// classification as `accesslog`'s `utf8Step`).
+fn utf8Step(s: []const u8) struct { len: usize, ok: bool } {
+    const b0 = s[0];
+    if (b0 < 0x80) return .{ .len = 1, .ok = true };
+    const total: usize, const b1_min: u8, const b1_max: u8 = switch (b0) {
+        0xC2...0xDF => .{ 2, 0x80, 0xBF },
+        0xE0 => .{ 3, 0xA0, 0xBF }, // E0 80..9F would be an overlong
+        0xE1...0xEC => .{ 3, 0x80, 0xBF },
+        0xED => .{ 3, 0x80, 0x9F }, // ED A0..BF is a surrogate
+        0xEE...0xEF => .{ 3, 0x80, 0xBF },
+        0xF0 => .{ 4, 0x90, 0xBF }, // F0 80..8F would be an overlong
+        0xF1...0xF3 => .{ 4, 0x80, 0xBF },
+        0xF4 => .{ 4, 0x80, 0x8F }, // F4 90..BF is past U+10FFFF
+        else => return .{ .len = 1, .ok = false },
+    };
+    if (s.len < 2 or s[1] < b1_min or s[1] > b1_max) return .{ .len = 1, .ok = false };
+    if (total == 2) return .{ .len = 2, .ok = true };
+    if (s.len < 3 or s[2] < 0x80 or s[2] > 0xBF) return .{ .len = 2, .ok = false };
+    if (total == 3) return .{ .len = 3, .ok = true };
+    if (s.len < 4 or s[3] < 0x80 or s[3] > 0xBF) return .{ .len = 3, .ok = false };
+    return .{ .len = 4, .ok = true };
+}
+
 /// Write `s` as a double-quoted JSON string, escaping the characters JSON
 /// requires (`"`, `\`, and control bytes 0x00-0x1F). Bytes >= 0x20 that
 /// belong to a valid UTF-8 sequence pass through verbatim; a byte that does
 /// not (F3 in the module's audit -- reachable in `entry.path` via h2, which
 /// does not bound `:path` to printable ASCII the way h1 does) is replaced
-/// with U+FFFD, one byte at a time, so a single bad byte cannot
-/// desynchronize the rest of the string. RFC 9110's obs-text allows
+/// with one U+FFFD per maximal subpart (Unicode 16.0 §3.9), as `accesslog`
+/// writes it and as Python's `decode('utf-8', 'replace')`, WHATWG and Rust's
+/// `from_utf8_lossy` read it (`json_path_vectors.zig`, 2026-10-06). It was
+/// one U+FFFD per byte -- Go's `encoding/json` policy -- so `E2 82` (two
+/// bytes of `€`) gave two where the sibling module gave one. RFC 9110's obs-text allows
 /// 0x80-0xFF in a field value, so `http` is right not to reject it -- this
 /// module is where "always valid JSON, always valid UTF-8" has to hold.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
@@ -1301,18 +1337,9 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             i += 1;
             continue;
         }
-        const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
-            try w.writeAll("\u{FFFD}");
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
-            try w.writeAll("\u{FFFD}");
-            i += 1;
-            continue;
-        }
-        try w.writeAll(s[i .. i + seq_len]);
-        i += seq_len;
+        const step = utf8Step(s[i..]);
+        if (step.ok) try w.writeAll(s[i .. i + step.len]) else try w.writeAll("\u{FFFD}");
+        i += step.len;
     }
     try w.writeByte('"');
 }
@@ -1414,15 +1441,17 @@ test "registration: validation and mismatch errors" {
     try testing.expectError(error.InvalidLabelName, reg.counter("a_total", "x", &.{.{ .name = "__res", .value = "v" }}));
     try testing.expectError(error.InvalidLabelName, reg.counter("a_total", "x", &.{.{ .name = "0bad", .value = "v" }}));
     try testing.expectError(error.ReservedLabelName, reg.histogram("h1", "x", &.{.{ .name = "le", .value = "v" }}, &.{}));
-    // F13: `le`/`quantile` are reserved on EVERY instrument kind now, not
-    // just histograms/summaries — client_golang reserves both regardless of
-    // kind, and this module's own bucket `le` / (unimplemented) summary
-    // `quantile` never flow through this caller-supplied label path, so
-    // there is no legitimate use of either name here. Previously `le` was
-    // accepted on a counter, which is the exact mechanism F5's collision
-    // (`<h>_bucket{le=...}`) needed.
+    // F13: `le` is reserved on EVERY instrument kind, as client_golang
+    // reserves it. Previously it was accepted on a counter, which is the
+    // exact mechanism F5's collision (`<h>_bucket{le=...}`) needed.
+    // `quantile` is reserved by client_golang only for summaries, which this
+    // module does not have, so it is an ordinary label here (it was refused
+    // until the registration oracle, 2026-10-06).
     try testing.expectError(error.ReservedLabelName, reg.counter("a_total", "x", &.{.{ .name = "le", .value = "v" }}));
-    try testing.expectError(error.ReservedLabelName, reg.gauge("a_gauge", "x", &.{.{ .name = "quantile", .value = "0.5" }}));
+    _ = try reg.gauge("a_gauge", "x", &.{.{ .name = "quantile", .value = "0.5" }});
+    // A label name twice in one call: Prometheus refuses the series it
+    // would write (`m{a="1",a="2"}`), and the whole scrape with it.
+    try testing.expectError(error.InvalidLabelName, reg.counter("d_total", "x", &.{ .{ .name = "a", .value = "1" }, .{ .name = "a", .value = "2" } }));
 
     // Too many labels.
     const many: [max_labels + 1]Label = @splat(.{ .name = "l", .value = "v" });
@@ -2647,7 +2676,7 @@ test "AccessLog: json format writes one object per request; specials escaped" {
 // `std.unicode.utf8ValidateSlice` and `std.json`'s parse). RFC 9110's
 // obs-text explicitly allows 0x80-0xFF in a field value, so the fix belongs
 // on this side -- the module turning bytes into JSON -- not in `http`.
-test "AccessLog: json format replaces an invalid UTF-8 byte with U+FFFD, one byte at a time (F3)" {
+test "AccessLog: json format replaces an invalid UTF-8 byte with U+FFFD, one per maximal subpart (F3)" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var access = AccessLog.init(&w, .{ .format = .json });
@@ -2663,6 +2692,30 @@ test "AccessLog: json format replaces an invalid UTF-8 byte with U+FFFD, one byt
     try testing.expect(std.unicode.utf8ValidateSlice(got));
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
     defer parsed.deinit();
+}
+
+test "AccessLog: json path reads back as Python's decode('utf-8', 'replace') (tools/json_path_oracle.py)" {
+    // External anchor for the substitution policy: 333 paths (33 crafted at
+    // every Table 3-7 edge, 300 drawn from bytes around them), each written
+    // as a JSON line, parsed, and its `path` compared with what Python reads
+    // the same bytes as. Per-byte substitution, which this writer used until
+    // 2026-10-06, fails on every truncated prefix (`E2 82` -> two U+FFFD).
+    const vectors = @import("json_path_vectors.zig").cases;
+    var bad: usize = 0;
+    for (vectors) |c| {
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var access = AccessLog.init(&w, .{ .format = .json });
+        access.log(.{ .method = .get, .path = c.path, .status = 200, .duration_ns = 1, .bytes = 0 });
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
+        defer parsed.deinit();
+        const got = parsed.value.object.get("path").?.string;
+        if (!std.mem.eql(u8, got, c.want)) {
+            bad += 1;
+            std.debug.print("path {any}: got {any}, want {any}\n", .{ c.path, got, c.want });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
 }
 
 // A valid multi-byte UTF-8 sequence (unlike a lone invalid byte, above)
@@ -3357,4 +3410,5 @@ test "AccessLog F4: the flusher hands off to a waiter instead of writing everyon
 // See go_oracle_test.zig / tools/interop.zig / tools/go_oracle.
 test {
     _ = @import("go_oracle_test.zig");
+    _ = @import("go_register_test.zig");
 }
