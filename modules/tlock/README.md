@@ -31,6 +31,7 @@ drand/kilic hashes the canonical pairing value's CUBE; see
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `ciphersuite.zig` | **REAL.** `beaconId` (drand's unchained beacon digest / IBE identity), `h1` (identity -> `G1`), `h2`/`h3`/`h4` (drand/kyber's SHA-256 constructions), `randomSigma` |
 | `tlock.zig` | `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec (**REAL**); **FABLE CORE (REAL):** `encrypt`/`decrypt` + the private `fp12Pow`/`gtToDrandRepr` Gt helpers |
+| `age.zig` | The age v1 envelope `tle` writes: `tlock` stanza, header MAC, ChaCha20-Poly1305 STREAM payload, ASCII armor — files of any length |
 | `gate.zig` | The single switch (`core_implemented`, now `true`) gating `encrypt`/`decrypt`'s KAT tests |
 | `kat_test.zig` | The KAT harness — real ungated hash/pairing-sanity tests (against live quicknet data), gated round-trip/tamper-rejection tests, and the byte-exact drand interop vector (decrypt + re-encrypt) |
 
@@ -66,6 +67,49 @@ All of the above — `encrypt`/`decrypt`, the `Ciphertext` codec, and the
 `ciphersuite.*` hash functions — is implemented, usable, and tested now
 (`gate.core_implemented = true`).
 
+### Files of any length: the age envelope `tle` writes (`tlock.age`)
+
+`drand/tlock`'s `tle` CLI does not ship the raw 128-byte ciphertext: it
+wraps a random 16-byte file key in it as an age `tlock` stanza and encrypts
+the file itself with age's STREAM (ChaCha20-Poly1305, 64 KiB chunks).
+`tlock.age` reads and writes that format, binary or armored (`tle -a`).
+
+```zig
+const age = tlock.age;
+
+// Encrypt (rnd = age.Randomness.draw(io) in production):
+const file = try age.encryptAlloc(gpa, plaintext, p_pub, round, chain_hash, rnd, .{ .armor = true });
+defer gpa.free(file);
+
+// Which round must be published before this opens?
+const who = try age.inspectAlloc(gpa, file); // .round, .chain_hash, .ciphertext
+
+// Decrypt once the beacon has published that round's signature:
+const pt = try age.decryptAlloc(gpa, file, round_signature, .{ .chain_hash = chain_hash });
+defer gpa.free(pt);
+```
+
+Allocation-free forms, with exact sizes known up front:
+`age.encrypt(out, …)` / `age.encryptedLen(round, n)`,
+`age.decrypt(out, file, sig, opts)` / `age.decryptedLen(file)`,
+`age.armor(out, bin)` / `age.armoredLen(n)`, `age.dearmor(out, text)` /
+`age.dearmoredLenMax(n)`, `age.isArmored(bytes)`, and
+`age.Header.parse(bin)`.
+
+Decryption order is header syntax → chain hash (if given) → the stanza
+(`error.FoCheckFailed` on a wrong signature) → the header MAC
+(`error.HeaderMacMismatch`, constant-time compare) → the payload chunk by
+chunk (`error.PayloadAuthenticationFailed`; every plaintext byte already
+written is wiped). The parsers are bounded (`max_header_bytes`,
+`max_stanzas`) and fail closed with typed errors. A header must carry
+exactly one `tlock` stanza; other recipient stanzas are parsed, MAC-covered
+and skipped.
+
+⚠ Anchoring: the stanza body is checked byte-exact against the genuine
+`tle` fixture's; the header MAC, STREAM and armor bytes are tested against
+the age specification and in round trip only — no whole `.tle` file is
+decrypted in the tests yet (see [SPEC.md](SPEC.md)'s KAT plan).
+
 ## Randomness
 
 `encrypt`'s `sigma` (BF-IBE's random pad) is a PLAIN PARAMETER, not
@@ -83,10 +127,12 @@ const sigma = [_]u8{0x11} ** tlock.block_bytes;
 ## Import graph
 
 ```
-tlock → bls12_381 (G1/G2 point arithmetic, the pairing, RFC 9380 hash-to-curve)
+tlock → bls12_381  (G1/G2 point arithmetic, the pairing, RFC 9380 hash-to-curve)
+      → entropy    (fail-closed draws of sigma, the file key and the payload nonce)
+      → chachapoly (ChaCha20-Poly1305 for the age STREAM payload)
 ```
 
-`meta.deps = .{"bls12_381"}`.
+`meta.deps = .{ "bls12_381", "entropy", "chachapoly" }`.
 
 ## Verify
 

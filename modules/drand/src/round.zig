@@ -40,6 +40,19 @@
 //! `SHA-256(sig')` — for the same round. Found by the wave-2 audit
 //! (W2-32), which demonstrated the acceptance live.
 //!
+//! For the chained default network (`pedersen-bls-chained`) the
+//! signature is a 96-byte compressed `G2` element; it is decoded into
+//! `sig_g2` under the same discipline — on-curve, order-`r` subgroup
+//! (`SignatureNotInSubgroup`), non-identity (`InvalidPoint`). The reason
+//! differs in degree from `G1`'s: the optimal-ate pairing is bilinear only
+//! on the order-`r` subgroup of `G2`, so an off-subgroup `sig + T` is not
+//! guaranteed to satisfy the equation, and on the one tested it does not
+//! (`verify.zig`). Refusing it at decode is drand's `KeyValidate`
+//! discipline, not reliance on the pairing to fail. `previous_signature`
+//! is retained (up to 96 bytes;
+//! round 1 of the default chain carries the 32-byte genesis seed there)
+//! because the chained message folds it in.
+//!
 //! `randomness`, when present, is retained for the
 //! `randomness == SHA-256(signature)` check `verify` performs.
 //!
@@ -52,6 +65,7 @@ const bls12_381 = @import("bls12_381");
 const json_uint = @import("json_uint.zig");
 
 const g1 = bls12_381.g1;
+const g2 = bls12_381.g2;
 
 /// The largest `/public/<round>` document this parser accepts. A real
 /// round body is ~300 bytes; 64 KiB is generous headroom that still
@@ -59,6 +73,7 @@ const g1 = bls12_381.g1;
 pub const max_document_bytes: usize = 64 * 1024;
 
 const sig_g1_bytes: usize = g1.compressed_bytes; // 48
+const sig_g2_bytes: usize = g2.compressed_bytes; // 96
 
 pub const RoundParseError = error{
     /// Input exceeds `max_document_bytes`.
@@ -69,12 +84,13 @@ pub const RoundParseError = error{
     InvalidHex,
     /// A hex field decoded to the wrong number of bytes.
     InvalidLength,
-    /// The signature bytes are not a valid compressed `G1` point.
+    /// The signature bytes are not a valid compressed `G1` (48-byte) or
+    /// `G2` (96-byte) point, or encode the identity.
     InvalidPoint,
-    /// The signature decoded to a point that is on the curve `E(Fp)` but
-    /// NOT in the order-`r` subgroup `G1`. See the module doc comment:
-    /// the pairing equation cannot see a cofactor-torsion addend, so this
-    /// is the only place a malleated `sig + T` is caught.
+    /// The signature decoded to a point that is on the curve (`E(Fp)` or
+    /// `E'(Fp2)`) but NOT in the order-`r` subgroup. See the module doc
+    /// comment: the pairing equation cannot see a cofactor-torsion addend,
+    /// so this is the only place a malleated `sig + T` is caught.
     SignatureNotInSubgroup,
     OutOfMemory,
 };
@@ -93,12 +109,18 @@ pub const Round = struct {
     /// only when it is a 48-byte compressed `G1` element (quicknet).
     /// `null` for a `G2`-signature (chained) round.
     sig_g1: ?g1.Affine,
+    /// The signature decoded into a `bls12_381` `G2` point — present only
+    /// when it is a 96-byte compressed `G2` element (chained default
+    /// network). `null` for a `G1`-signature round. Defaulted so a
+    /// hand-built `Round` literal from before this field existed still
+    /// compiles.
+    sig_g2: ?g2.Affine = null,
     /// `randomness`, if the document carried it (32 bytes). drand
     /// defines `randomness = SHA-256(signature)`.
     randomness: ?[32]u8,
-    /// `previous_signature`, if present (chained schemes). Retained as
-    /// raw bytes for a future chained-message reconstruction; unused by
-    /// quicknet verification.
+    /// `previous_signature`, if present (chained schemes). Folded into
+    /// the chained message `SHA-256(previous_signature ‖ round_be)`;
+    /// unused by quicknet verification.
     previous_signature: ?PreviousSignature,
 
     pub const PreviousSignature = struct {
@@ -118,6 +140,19 @@ pub const Round = struct {
     /// round is not a `G1`-signature round.
     pub fn signatureG1(self: *const Round) RoundParseError!g1.Affine {
         return self.sig_g1 orelse error.InvalidPoint;
+    }
+
+    /// The signature as a `G2` point, or `error.InvalidPoint` if the
+    /// round is not a `G2`-signature round.
+    pub fn signatureG2(self: *const Round) RoundParseError!g2.Affine {
+        return self.sig_g2 orelse error.InvalidPoint;
+    }
+
+    /// The `previous_signature` bytes, or the empty slice when the
+    /// document carried none (drand's Go `DigestBeacon` then hashes the
+    /// round alone).
+    pub fn previousSignatureBytes(self: *const Round) []const u8 {
+        return if (self.previous_signature) |*p| p.slice() else &.{};
     }
 };
 
@@ -174,6 +209,18 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
         sig_g1 = pt;
     }
 
+    var sig_g2: ?g2.Affine = null;
+    if (sig_len == sig_g2_bytes) {
+        // The chained scheme's G2 signature: the same KeyValidate the G1
+        // signature gets above (subgroup in the decoder, identity here).
+        const pt = g2.fromBytesCompressed(sig_bytes[0..sig_g2_bytes].*) catch |err| return switch (err) {
+            error.NotInSubgroup => error.SignatureNotInSubgroup,
+            else => error.InvalidPoint,
+        };
+        if (pt.infinity) return error.InvalidPoint;
+        sig_g2 = pt;
+    }
+
     var randomness: ?[32]u8 = null;
     if (raw.randomness) |r| {
         var rnd: [32]u8 = undefined;
@@ -194,6 +241,7 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
         .sig_bytes = sig_bytes,
         .sig_len = sig_len,
         .sig_g1 = sig_g1,
+        .sig_g2 = sig_g2,
         .randomness = randomness,
         .previous_signature = previous_signature,
     };
@@ -356,16 +404,70 @@ test "parseRound: max_document_bytes is pinned at 64 KiB, not just self-referent
     try testing.expectEqual(@as(usize, 64 * 1024), max_document_bytes);
 }
 
-test "parseRound: chained round carries previous_signature (G2 sig, sig_g1 null)" {
-    // A 96-byte (G2) signature with a previous_signature — legacy chained
-    // shape. sig_g1 stays null; previous_signature is retained.
-    const chained = "{\"round\":2,\"signature\":\"" ++ ("ab" ** 96) ++
-        "\",\"previous_signature\":\"" ++ ("cd" ** 96) ++ "\"}";
-    const r = try parseRound(testing.allocator, chained);
+// Genuine default-chain (pedersen-bls-chained) round 1000000 — see
+// verify.zig's chained fixtures for provenance.
+const chained_round_1000000_json =
+    \\{"round":1000000,"randomness":"a26ba4d229c666f52a06f1a9be1278dcc7a80dbc1dd2004a1ae7b63cb79fd37e","signature":"87e355169c4410a8ad6d3e7f5094b2122932c1062f603e6628aba2e4cb54f46c3bf1083c3537cd3b99e8296784f46fb40e090961cf9634f02c7dc2a96b69fc3c03735bc419962780a71245b72f81882cf6bb9c961bcf32da5624993bb747c9e5","previous_signature":"86bbc40c9d9347568967add4ddf6e351aff604352a7e1eec9b20dea4ca531ed6c7d38de9956ffc3bb5a7fabe28b3a36b069c8113bd9824135c3bff9b03359476f6b03beec179d4aeff456f4d34bbf702b9af78c3bb44e1892ace8e581bf4afa9"}
+;
+
+test "parseRound: genuine chained round decodes a G2 signature and keeps previous_signature" {
+    const r = try parseRound(testing.allocator, chained_round_1000000_json);
+    try testing.expectEqual(@as(u64, 1000000), r.round);
     try testing.expectEqual(@as(usize, 96), r.sig_len);
     try testing.expect(r.sig_g1 == null);
-    try testing.expect(r.previous_signature != null);
-    try testing.expectEqual(@as(usize, 96), r.previous_signature.?.len);
+    const sig = try r.signatureG2();
+    try testing.expect(!sig.infinity);
+    try testing.expect(g2.Jacobian.fromAffine(sig).subgroupCheck());
+    try testing.expectEqual(@as(usize, 96), r.previousSignatureBytes().len);
+    try testing.expectError(error.InvalidPoint, r.signatureG1());
+}
+
+test "parseRound: a 96-byte signature that is not a G2 point → InvalidPoint (was retained undecoded)" {
+    const junk = "{\"round\":2,\"signature\":\"" ++ ("ab" ** 96) ++
+        "\",\"previous_signature\":\"" ++ ("cd" ** 96) ++ "\"}";
+    try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, junk));
+    const identity = "{\"round\":2,\"signature\":\"c0" ++ ("00" ** 95) ++ "\"}";
+    try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, identity));
+}
+
+/// An on-curve G2 point OUTSIDE the order-r subgroup (scan of small x).
+fn nonSubgroupG2Compressed() ![g2.compressed_bytes]u8 {
+    var x: u8 = 1;
+    while (x < 255) : (x += 1) {
+        var comp = [_]u8{0} ** g2.compressed_bytes;
+        comp[0] = 0x80;
+        comp[g2.compressed_bytes - 1] = x;
+        const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
+        if (pt.infinity) continue;
+        if (!g2.Jacobian.fromAffine(pt).subgroupCheck()) return comp;
+    }
+    return error.NoTorsionPointFound;
+}
+
+test "parseRound: an on-curve G2 signature OUTSIDE the subgroup → SignatureNotInSubgroup" {
+    const comp = try nonSubgroupG2Compressed();
+    const doc = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"round\":2,\"signature\":\"{s}\"}}",
+        .{std.fmt.bytesToHex(comp, .lower)},
+    );
+    defer testing.allocator.free(doc);
+    try testing.expectError(error.SignatureNotInSubgroup, parseRound(testing.allocator, doc));
+}
+
+test "parseRound: previousSignatureBytes is empty when the field is absent; round-1 genesis seed kept" {
+    const r = try parseRound(testing.allocator, round_1000_json);
+    try testing.expectEqual(@as(usize, 0), r.previousSignatureBytes().len);
+    // Default-chain round 1 carries the 32-byte genesis seed (= groupHash).
+    const r1 = try parseRound(testing.allocator,
+        \\{"round":1,"signature":"8d61d9100567de44682506aea1a7a6fa6e5491cd27a0a0ed349ef6910ac5ac20ff7bc3e09d7c046566c9f7f3c6f3b10104990e7cb424998203d8f7de586fb7fa5f60045417a432684f85093b06ca91c769f0e7ca19268375e659c2a2352b4655","previous_signature":"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a"}
+    );
+    try testing.expectEqual(@as(usize, 32), r1.previousSignatureBytes().len);
+}
+
+test "parseRound: previous_signature longer than 96 bytes → InvalidLength" {
+    const bad = "{\"round\":2,\"signature\":\"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39\",\"previous_signature\":\"" ++ ("cd" ** 97) ++ "\"}";
+    try testing.expectError(error.InvalidLength, parseRound(testing.allocator, bad));
 }
 
 test "roundPath / latestPath build the drand request path" {

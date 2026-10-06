@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `pickle.zig` documents that restoring an
+  old outbound pickle rewinds the ratchet and reuses message indices (review of PR #4).
+
+- **2026-10-06** — ADDED: session pickling (`pickle.zig`). `OutboundSession.pickle` /
+  `pickleSealed` / `fromPickle` / `fromSealedPickle` and the same four on `InboundGroupSession`
+  save and restore every field of a session (ratchet and index, the outbound Ed25519 key pair,
+  the inbound first-known ratchet, fast-forward cache, signing key and `signing_key_verified`
+  flag) in a versioned fixed-width layout, optionally sealed with ChaCha20-Poly1305 under a
+  caller-supplied 32-byte `PickleKey`. Before this an outbound session could not be saved, and
+  restoring an inbound one via `exportAt`/`fromExportedKey` lost the verified flag. Decoding is
+  strict and fail-closed (`PickleError`: length, magic, version, kind, tag, flags, key validity,
+  cache consistency). New sibling dependency: `chachapoly`. Fuzzed (`fuzzPickleDecode`).
+  Scope mvp -> core.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the mutation note no longer calls the module "untracked" in the present tense.
 - **2026-09-08** — Test-only, no production change: `fuzzMessageDecode`'s payload generator
   emitted exactly **one** field on every seed, and the field it emitted was always the same one.

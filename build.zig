@@ -356,7 +356,7 @@ const module_list = [_]Module{
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{ "entropy", "montint" }, .heavy = true },
     .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
     // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
     // byte-compare against the genuine drand-Go-produced ciphertext `tlock`
@@ -372,7 +372,7 @@ const module_list = [_]Module{
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
     .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .test_deps = &.{"testkit"} },
-    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
     .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },

@@ -86,4 +86,26 @@ pub fn main() !void {
     std.debug.print("recent probe window: {d} of capacity {d}, total observed={d}\n", .{
         n, liveness_hyst.history_capacity, est.probes_total,
     });
+
+    // Ordering two live paths: an LTE uplink (~50 ms) and a GEO satellite
+    // (~600 ms), both loss-free. `pathCost()` folds the smoothed RTT into the
+    // cost (Babel-style RTT penalty), and a `Selector` keeps the choice from
+    // flapping when the costs are close.
+    var lte = liveness_hyst.Estimator.init(.{});
+    var sat = liveness_hyst.Estimator.init(.{});
+    const paths = [_]*const liveness_hyst.Estimator{ &sat, &lte };
+    var sel = liveness_hyst.Selector.init(.{});
+    var t: liveness_hyst.Time = 0;
+    var chosen: ?usize = null;
+    i = 0;
+    while (i < 50) : (i += 1) {
+        t += 200;
+        lte.onProbeReply(t, 50);
+        sat.onProbeReply(t, 600);
+        chosen = sel.update(t, &paths);
+    }
+    std.debug.print("lte cost={d:.3} sat cost={d:.3} chosen={s}\n", .{
+        lte.pathCost(), sat.pathCost(), if (chosen.? == 1) "lte" else "sat",
+    });
+    if (chosen.? != 1) @panic("with equal loss the lower-RTT path must be chosen");
 }

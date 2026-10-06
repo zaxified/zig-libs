@@ -26,13 +26,13 @@
 //!     and round 5423142's real published signature, fetched live from
 //!     `https://pl-us.testnet.drand.sh/` 2026-07-16, the identical value
 //!     `tlock`'s drand-interop KAT vector decrypts against.
-//!   - The chained-scheme `/info` used for the `UnsupportedScheme` check
-//!     is drand's classic/default mainnet beacon (chain hash
-//!     `8990e7a9...72e51b2ce` -- drand's long-published default chain,
-//!     the same fixture `drand/src/chaininfo.zig`'s own parse test
-//!     carries), included here only to reach `pedersen_bls_chained`
-//!     dispatch -- this module does not verify that scheme by design
-//!     (SPEC.md's "Deliberately deferred").
+//!   - Round C: the chained default network (`pedersen-bls-chained`,
+//!     chain hash `8990e7a9...72e51b2ce`): its real `/info` (the fixture
+//!     `drand/src/chaininfo.zig` pins) and its real round 1000000, whose
+//!     signature/previous_signature/randomness `drand/src/verify.zig`
+//!     pins with their provenance (drand_core's fixtures, recorded from
+//!     drand.cloudflare.com). Signature in G2, key in G1, message folds in
+//!     the previous signature.
 //!
 //! Every negative case below is a REAL rejection this module's own
 //! verification equation produces on genuine or genuinely-adjacent bytes
@@ -88,12 +88,9 @@ const round_5423142_json =
     \\{"round":5423142,"signature":"96fce8e2f70e2784577c8f2d8bd36af7a4b0dfd73dd91469d8556b36d2973a4f84681a45b1af2ce0511e5a32dd72508f"}
 ;
 
-// ── drand's classic/default mainnet chain (published by the League of ──
-// Entropy -- chain hash `8990e7a9...72e51b2ce` is drand's long-published
-// default chain; captured from the same fixture drand's own
-// chaininfo.zig parse test carries), used only to reach the
-// `pedersen_bls_chained` scheme dispatch this module recognizes but
-// deliberately does not verify (SPEC.md).
+// ── Round C: drand's chained default mainnet chain (League of Entropy, ──
+// chain hash `8990e7a9...72e51b2ce`; the same fixtures drand's own
+// chaininfo.zig / verify.zig pin).
 
 const chained_info_json =
     "{\"public_key\":\"868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31\"," ++
@@ -101,6 +98,10 @@ const chained_info_json =
     "\"hash\":\"8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce\"," ++
     "\"groupHash\":\"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a\"," ++
     "\"schemeID\":\"pedersen-bls-chained\",\"metadata\":{\"beaconID\":\"default\"}}";
+
+const chained_round_1000000_json =
+    \\{"round":1000000,"randomness":"a26ba4d229c666f52a06f1a9be1278dcc7a80dbc1dd2004a1ae7b63cb79fd37e","signature":"87e355169c4410a8ad6d3e7f5094b2122932c1062f603e6628aba2e4cb54f46c3bf1083c3537cd3b99e8296784f46fb40e090961cf9634f02c7dc2a96b69fc3c03735bc419962780a71245b72f81882cf6bb9c961bcf32da5624993bb747c9e5","previous_signature":"86bbc40c9d9347568967add4ddf6e351aff604352a7e1eec9b20dea4ca531ed6c7d38de9956ffc3bb5a7fabe28b3a36b069c8113bd9824135c3bff9b03359476f6b03beec179d4aeff456f4d34bbf702b9af78c3bb44e1892ace8e581bf4afa9"}
+;
 
 fn roundA(gpa: std.mem.Allocator) !void {
     const info = try drand.parseInfo(gpa, quicknet_info_json);
@@ -166,12 +167,30 @@ fn roundA(gpa: std.mem.Allocator) !void {
         else => return err,
     }
 
-    // ── negative: a scheme this module recognizes but does not verify ───
+    // ── negative: a quicknet (G1-signature) round against the chained ───
+    // (G2-signature) chain -- the groups disagree before any pairing runs.
     const chained_info = try drand.parseInfo(gpa, chained_info_json);
     if (drand.verifyRound(&chained_info, &rnd)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
-        error.UnsupportedScheme => std.debug.print("round A: pedersen-bls-chained scheme: UnsupportedScheme (expected -- not verified by design)\n", .{}),
+        error.SchemeGroupMismatch => std.debug.print("round A: quicknet round against the chained default chain: SchemeGroupMismatch (expected)\n", .{}),
+        else => return err,
+    }
+}
+
+fn roundC(gpa: std.mem.Allocator) !void {
+    const info = try drand.parseInfo(gpa, chained_info_json);
+    var rnd = try drand.parseRound(gpa, chained_round_1000000_json);
+    try drand.verifyRound(&info, &rnd);
+    std.debug.print("round C: genuine default-chain round 1000000 verifies (pedersen-bls-chained, sig in G2, key in G1)\n", .{});
+
+    // The previous signature is part of the signed message: claim a
+    // different one and the genuine signature no longer verifies.
+    rnd.previous_signature.?.bytes[0] ^= 0x01;
+    if (drand.verifyRound(&info, &rnd)) |_| {
+        return error.UnexpectedAccept;
+    } else |err| switch (err) {
+        error.InvalidSignature => std.debug.print("round C: previous_signature altered: InvalidSignature (expected)\n", .{}),
         else => return err,
     }
 }
@@ -211,6 +230,7 @@ pub fn main() !void {
 
     try roundA(gpa);
     try roundB(gpa);
+    try roundC(gpa);
 
     std.debug.print("OK: all drand example checks passed\n", .{});
 }

@@ -41,6 +41,9 @@
 //!   (128 bytes, byte-for-byte drand's own wire format); the two
 //!   **FABLE CORE** functions `encrypt`/`decrypt` (REAL) + the private
 //!   `fp12Pow`/`gtToDrandRepr` Gt helpers.
+//! - `age.zig` — the age v1 envelope `tle` writes: `tlock` stanza,
+//!   HKDF/HMAC header MAC, ChaCha20-Poly1305 STREAM payload in 64 KiB
+//!   chunks, ASCII armor — arbitrary-length files.
 //! - `gate.zig` — the single switch (`core_implemented`, now `true`)
 //!   gating `encrypt`/`decrypt`'s KAT tests in `kat_test.zig`.
 //! - `kat_test.zig` — the KAT harness: REAL ungated tests (byte-exact
@@ -87,6 +90,9 @@ const std = @import("std");
 
 pub const ciphersuite = @import("ciphersuite.zig");
 pub const gate = @import("gate.zig");
+/// The age v1 envelope `tle` writes: tlock stanza, header MAC, STREAM
+/// payload, armor — arbitrary-length files. See `age.zig`.
+pub const age = @import("age.zig");
 
 const tlock_mod = @import("tlock.zig");
 pub const Ciphertext = tlock_mod.Ciphertext;
@@ -114,7 +120,7 @@ pub const meta = .{
     .role = .util, // no I/O, no wire framing beyond the fixed 128-byte Ciphertext codec
     .concurrency = .reentrant, // every type is a plain value; no globals
     .model_after = "drand/tlock (Go, Gailly/Melissaris/Romailler) + drand/kyber's encrypt/ibe package (Boneh-Franklin \"FullIdent\" IBE, CRYPTO 2001 §4.2) — quicknet's SigsOnG1ID/\"bls-unchained-g1-rfc9380\" scheme; bls12_381 (this repo) supplies the field/group/pairing/hash-to-curve primitives",
-    .deps = .{ "bls12_381", "entropy" }, // entropy: the fail-closed `sigma` draw
+    .deps = .{ "bls12_381", "entropy", "chachapoly" }, // entropy: the fail-closed `sigma`/file-key/nonce draws; chachapoly: the age STREAM payload
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -129,6 +135,7 @@ test {
     _ = ciphersuite;
     _ = gate;
     _ = tlock_mod;
+    _ = age;
     _ = kat_test;
 }
 
@@ -137,10 +144,11 @@ test "meta.model_after names drand/tlock and drand/kyber" {
     try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "drand/kyber") != null);
 }
 
-test "meta.deps is exactly {bls12_381, entropy}" {
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps is exactly {bls12_381, entropy, chachapoly}" {
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
     try std.testing.expectEqualStrings("bls12_381", meta.deps[0]);
     try std.testing.expectEqualStrings("entropy", meta.deps[1]);
+    try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
 }
 
 test "gate IS flipped (encrypt/decrypt are real and interop-verified)" {

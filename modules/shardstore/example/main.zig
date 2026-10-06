@@ -52,6 +52,18 @@ pub fn main() !void {
     defer if (gone) |g| gpa.free(g);
     std.debug.print("after delete, present={}\n", .{gone != null});
 
+    // A merge-sorted scan across all four shards: keys come out in global
+    // order even though they live in four separate kvtree files.
+    {
+        var it = try store.scan(.{
+            .start = .{ .inclusive = "session-1" },
+            .end = .{ .exclusive = "session-2" },
+            .limit = 5,
+        });
+        defer it.deinit(); // before store.deinit: the scan pins every shard
+        while (try it.next()) |e| std.debug.print("scan: {s} = {s}\n", .{ e.key, e.val });
+    }
+
     store.deinit();
 
     // Reopening with a DIFFERENT shard count is refused by name: routing is

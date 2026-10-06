@@ -416,6 +416,303 @@ pub const Store = struct {
         try self.checkOwner();
         return self.shards[self.shardFor(key)].del(key);
     }
+
+    /// A merge-sorted scan over **all** shards: a k-way merge of one
+    /// `kvtree.Cursor` per shard, yielding entries in global key order
+    /// (bytewise, as `kvtree` orders them) within `options`' range, up to
+    /// `options.limit` entries. Call `Scan.next` until it returns null, then
+    /// `Scan.deinit` (always — the scan pins a version of every shard).
+    ///
+    /// **What it sees.** Each shard's cursor is opened here, inside this one
+    /// call, and pins that shard's newest committed version (`Db.cursor`'s
+    /// reclaim-gate pin). Writes committed after `scan` returns — by the
+    /// owner between `next` calls, say — are not visible to this scan, on
+    /// any shard; a fresh `scan` sees them. Under the single-owner contract
+    /// nothing else can commit while this call runs, so the pinned versions
+    /// together are one point-in-time view of the whole store. See
+    /// `Scan`'s doc comment for the precise contract and what a
+    /// `.parallel_per_handle` caller must do.
+    ///
+    /// **Agrees with `get`.** An entry is yielded only from the shard that
+    /// `shardFor` routes its key to, so the scan yields exactly the
+    /// `(key, value)` pairs `get` would return, each key once. A key written
+    /// straight into a non-owning shard through `shardAt` is invisible to
+    /// `get`, and so to the scan.
+    pub fn scan(self: *Store, options: ScanOptions) ScanError!Scan {
+        try self.checkOwner();
+        return Scan.open(self, options);
+    }
+};
+
+// ── merge-sorted scan across shards ──────────────────────────────────────────
+
+/// A yielded entry. Both slices borrow the scan's internal buffers and are
+/// valid only until the next `Scan.next` or `Scan.deinit` call — copy them to
+/// keep them (`kvtree.KV`'s rule, which this is).
+pub const KV = kvtree.KV;
+
+/// One end of a scan range, the way `kvtree.Cursor` positions: `seek(key)`
+/// starts at the first key `>= key` (inclusive), `seekAfter(key)` at the
+/// first key `> key` (exclusive).
+pub const Bound = union(enum) {
+    /// No bound on this side: from the first key / to the last key.
+    unbounded,
+    /// The bound key itself is in range.
+    inclusive: []const u8,
+    /// The bound key itself is not in range.
+    exclusive: []const u8,
+};
+
+pub const ScanDirection = enum {
+    /// Ascending key order (`kvtree.Cursor.next`).
+    forward,
+    /// Descending key order (`kvtree.Cursor.prev`).
+    reverse,
+};
+
+pub const ScanOptions = struct {
+    /// Lower end of the range (the smaller keys), whatever the direction.
+    start: Bound = .unbounded,
+    /// Upper end of the range (the larger keys), whatever the direction. A
+    /// range whose `start` lies above its `end` is empty, not an error.
+    end: Bound = .unbounded,
+    /// Yield at most this many entries; null for no limit. In `.reverse`
+    /// order this keeps the LARGEST `limit` keys of the range.
+    limit: ?usize = null,
+    direction: ScanDirection = .forward,
+};
+
+/// Errors from `Store.scan` and `Scan.next`: `kvtree`'s read errors (the
+/// backend's, `error.Corrupt`, `error.OutOfMemory`) plus the owning-thread
+/// check.
+pub const ScanError = kvtree.GetError || OwnerError;
+
+/// The iterator `Store.scan` returns.
+///
+/// ## Consistency contract
+///
+/// - **Per shard: a snapshot.** Every shard is read at the version that was
+///   newest when `Store.scan` ran. Commits made after that — puts, overwrites,
+///   deletes — never appear in, disappear from, or change the value of what
+///   this scan yields, and the pinned pages stay readable however much is
+///   committed meanwhile (`kvtree`'s reclaim gate). The flip side, also
+///   `kvtree`'s: an open scan holds back page reclamation in every shard, so
+///   `deinit` it promptly.
+/// - **Across shards: one cut, because there is one owner.** All N cursors are
+///   opened inside the single `Store.scan` call. On a `.single_thread` store
+///   (enforced, as for `put`/`get`) no commit can land between two of those
+///   opens, so the scan is a consistent point-in-time view of the whole store.
+///   This is a consequence of the single-owner model, not a cross-shard
+///   snapshot mechanism — `shardstore` has none (no cross-shard atomicity).
+/// - **`.parallel_per_handle` stores.** A `kvtree.Db` is single-owner: opening
+///   and releasing a cursor mutates the shard's reader list, and reading pages
+///   goes through the shard's pager. So `Store.scan`, every `next` and `deinit`
+///   must be serialized with the writers of EVERY shard — the scan is an
+///   operation on all of them. Do that (pause the per-shard writers, or run the
+///   scan on a thread that owns them all) and the cut above holds. Commits
+///   made *between* `next` calls are fine and invisible, as above. Running a
+///   scan concurrently with a per-shard writer thread is a data race this
+///   module cannot detect for `.parallel_per_handle` (it takes no latch).
+/// - **Order and uniqueness.** Keys come out strictly ascending (`.forward`) or
+///   strictly descending (`.reverse`), each at most once, each from its owning
+///   shard (see `Store.scan`). Shards are disjoint by routing, so the merge
+///   never has to break a tie.
+/// - **Errors are sticky.** After `next` returns an error the scan stays
+///   failed and returns the same error again — it never resumes with a gap.
+pub const Scan = struct {
+    gpa: Allocator,
+    store: *const Store,
+    /// One cursor per shard; `cursors[i]` reads `store.shards[i]`.
+    cursors: []kvtree.Cursor,
+    /// The entry each cursor is currently offering, or null once it is
+    /// exhausted or past the far bound. Borrowed from `cursors[i]`.
+    heads: []?KV,
+    /// Indices of cursors with a non-null head, as a binary heap ordered by
+    /// head key (min-heap forward, max-heap reverse).
+    heap: []u32,
+    heap_len: usize = 0,
+    /// The cursor whose head the last `next` yielded. It is advanced at the
+    /// start of the following `next`, so the yielded slices stay valid until
+    /// then.
+    pending: ?u32 = null,
+    /// The bound where the scan stops (the far end in scan direction): an
+    /// owned copy, so the caller's bound slice need not outlive `scan`.
+    stop_key: ?[]u8,
+    stop_inclusive: bool,
+    direction: ScanDirection,
+    remaining: usize,
+    failed: ?ScanError = null,
+
+    fn open(store: *Store, options: ScanOptions) ScanError!Scan {
+        const gpa = store.gpa;
+        const n = store.n_shards;
+
+        const stop: Bound = switch (options.direction) {
+            .forward => options.end,
+            .reverse => options.start,
+        };
+        const stop_key: ?[]u8 = switch (stop) {
+            .unbounded => null,
+            .inclusive, .exclusive => |k| try gpa.dupe(u8, k),
+        };
+        errdefer if (stop_key) |k| gpa.free(k);
+
+        const cursors = try gpa.alloc(kvtree.Cursor, n);
+        errdefer gpa.free(cursors);
+        const heads = try gpa.alloc(?KV, n);
+        errdefer gpa.free(heads);
+        const heap = try gpa.alloc(u32, n);
+        errdefer gpa.free(heap);
+
+        var self: Scan = .{
+            .gpa = gpa,
+            .store = store,
+            .cursors = cursors,
+            .heads = heads,
+            .heap = heap,
+            .stop_key = stop_key,
+            .stop_inclusive = stop == .inclusive,
+            .direction = options.direction,
+            .remaining = options.limit orelse std.math.maxInt(usize),
+        };
+
+        // Open every shard's cursor first, back to back: this is the moment
+        // the scan's view of the store is fixed (see the contract above).
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |*c| c.deinit();
+        while (opened < n) : (opened += 1) {
+            cursors[opened] = try store.shards[opened].cursor();
+        }
+
+        if (self.remaining == 0) {
+            @memset(heads, null);
+            return self;
+        }
+
+        for (cursors, 0..) |*c, i| {
+            switch (options.direction) {
+                .forward => switch (options.start) {
+                    .unbounded => try c.first(),
+                    .inclusive => |k| try c.seek(k),
+                    .exclusive => |k| try c.seekAfter(k),
+                },
+                .reverse => switch (options.end) {
+                    .unbounded => try c.last(),
+                    .inclusive => |k| try c.seekAfter(k),
+                    .exclusive => |k| try c.seek(k),
+                },
+            }
+            try self.fill(@intCast(i));
+            if (self.heads[i] != null) self.push(@intCast(i));
+        }
+        return self;
+    }
+
+    /// Release every shard's pinned version and free the scan's buffers.
+    /// Invalidates any `KV` still held from `next`.
+    pub fn deinit(self: *Scan) void {
+        for (self.cursors) |*c| c.deinit();
+        self.gpa.free(self.cursors);
+        self.gpa.free(self.heads);
+        self.gpa.free(self.heap);
+        if (self.stop_key) |k| self.gpa.free(k);
+        self.* = undefined;
+    }
+
+    /// The next entry in scan order, or null when the range or the limit is
+    /// exhausted. The returned slices are valid until the next call to `next`
+    /// or `deinit`.
+    pub fn next(self: *Scan) ScanError!?KV {
+        // Not sticky: a foreign thread's refused call leaves the owner's scan
+        // intact.
+        try self.store.checkOwner();
+        if (self.failed) |e| return e;
+        if (self.remaining == 0) return null;
+        self.advance() catch |e| {
+            self.failed = e;
+            return e;
+        };
+        if (self.heap_len == 0) return null;
+        const i = self.pop();
+        self.remaining -= 1;
+        self.pending = i;
+        return self.heads[i].?;
+    }
+
+    fn advance(self: *Scan) ScanError!void {
+        const i = self.pending orelse return;
+        self.pending = null;
+        try self.fill(i);
+        if (self.heads[i] != null) self.push(i);
+    }
+
+    /// Set `heads[i]` to cursor `i`'s next entry that is owned by shard `i`
+    /// and inside the far bound, or null.
+    fn fill(self: *Scan, i: u32) ScanError!void {
+        const c = &self.cursors[i];
+        while (true) {
+            const e = (switch (self.direction) {
+                .forward => try c.next(),
+                .reverse => try c.prev(),
+            }) orelse break;
+            if (self.pastStop(e.key)) break;
+            // A key stored in a shard it does not route to is invisible to
+            // `get`; skip it so the scan agrees with `get` and stays
+            // duplicate-free.
+            if (self.store.shardFor(e.key) != i) continue;
+            self.heads[i] = e;
+            return;
+        }
+        self.heads[i] = null;
+    }
+
+    fn pastStop(self: *const Scan, key: []const u8) bool {
+        const b = self.stop_key orelse return false;
+        const ord = std.mem.order(u8, key, b);
+        return switch (self.direction) {
+            .forward => if (self.stop_inclusive) ord == .gt else ord != .lt,
+            .reverse => if (self.stop_inclusive) ord == .lt else ord != .gt,
+        };
+    }
+
+    /// True when cursor `a`'s head comes before cursor `b`'s in scan order.
+    fn before(self: *const Scan, a: u32, b: u32) bool {
+        const ord = std.mem.order(u8, self.heads[a].?.key, self.heads[b].?.key);
+        return switch (self.direction) {
+            .forward => ord == .lt,
+            .reverse => ord == .gt,
+        };
+    }
+
+    fn push(self: *Scan, i: u32) void {
+        var pos = self.heap_len;
+        self.heap_len += 1;
+        self.heap[pos] = i;
+        while (pos > 0) {
+            const parent = (pos - 1) / 2;
+            if (!self.before(self.heap[pos], self.heap[parent])) break;
+            std.mem.swap(u32, &self.heap[pos], &self.heap[parent]);
+            pos = parent;
+        }
+    }
+
+    fn pop(self: *Scan) u32 {
+        const top = self.heap[0];
+        self.heap_len -= 1;
+        self.heap[0] = self.heap[self.heap_len];
+        var pos: usize = 0;
+        while (true) {
+            const l = 2 * pos + 1;
+            if (l >= self.heap_len) break;
+            var best = l;
+            const r = l + 1;
+            if (r < self.heap_len and self.before(self.heap[r], self.heap[l])) best = r;
+            if (!self.before(self.heap[best], self.heap[pos])) break;
+            std.mem.swap(u32, &self.heap[pos], &self.heap[best]);
+            pos = best;
+        }
+        return top;
+    }
 };
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1098,4 +1395,561 @@ test "name validation uses the widest shard index" {
         Store.init(testing.allocator, sim.storage(), .{ .n_shards = 100_001, .name_prefix = &prefix_buf }),
     );
     try testing.expectEqual(@as(usize, 0), sim.names.count());
+}
+
+// ── merge-sorted scan tests ───────────────────────────────────────────────────
+//
+// Anchor: SELF-DERIVED. There is no outside oracle for "a k-way merge over
+// these shards"; the reference is a brute-force one — every key/value written
+// is kept in a plain sorted list, and each scan is compared entry for entry
+// against the slice of that list its options select (filter by range, reverse,
+// truncate to the limit).
+
+/// An owned copy of everything a scan yielded.
+const Collected = struct {
+    keys: std.ArrayList([]u8) = .empty,
+    vals: std.ArrayList([]u8) = .empty,
+
+    fn deinit(c: *Collected, gpa: Allocator) void {
+        for (c.keys.items) |k| gpa.free(k);
+        for (c.vals.items) |v| gpa.free(v);
+        c.keys.deinit(gpa);
+        c.vals.deinit(gpa);
+    }
+};
+
+fn collectScan(gpa: Allocator, store: *Store, options: ScanOptions) !Collected {
+    var out: Collected = .{};
+    errdefer out.deinit(gpa);
+    var it = try store.scan(options);
+    defer it.deinit();
+    while (try it.next()) |e| {
+        try out.keys.ensureUnusedCapacity(gpa, 1);
+        try out.vals.ensureUnusedCapacity(gpa, 1);
+        const k = try gpa.dupe(u8, e.key);
+        errdefer gpa.free(k);
+        const v = try gpa.dupe(u8, e.val);
+        out.keys.appendAssumeCapacity(k);
+        out.vals.appendAssumeCapacity(v);
+    }
+    // Once exhausted, a scan stays exhausted.
+    try testing.expect((try it.next()) == null);
+    return out;
+}
+
+/// The brute-force reference: a sorted, duplicate-free key → value list.
+const RefModel = struct {
+    keys: std.ArrayList([]u8) = .empty,
+    vals: std.ArrayList([]u8) = .empty,
+
+    fn deinit(m: *RefModel, gpa: Allocator) void {
+        for (m.keys.items) |k| gpa.free(k);
+        for (m.vals.items) |v| gpa.free(v);
+        m.keys.deinit(gpa);
+        m.vals.deinit(gpa);
+    }
+
+    const Found = struct { found: bool, index: usize };
+
+    fn find(m: *const RefModel, key: []const u8) Found {
+        var lo: usize = 0;
+        var hi: usize = m.keys.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, m.keys.items[mid], key)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return .{ .found = true, .index = mid },
+            }
+        }
+        return .{ .found = false, .index = lo };
+    }
+
+    fn put(m: *RefModel, gpa: Allocator, key: []const u8, val: []const u8) !void {
+        const f = m.find(key);
+        const v = try gpa.dupe(u8, val);
+        if (f.found) {
+            gpa.free(m.vals.items[f.index]);
+            m.vals.items[f.index] = v;
+            return;
+        }
+        errdefer gpa.free(v);
+        const k = try gpa.dupe(u8, key);
+        errdefer gpa.free(k);
+        try m.keys.insert(gpa, f.index, k);
+        errdefer _ = m.keys.orderedRemove(f.index);
+        try m.vals.insert(gpa, f.index, v);
+    }
+
+    fn del(m: *RefModel, gpa: Allocator, key: []const u8) void {
+        const f = m.find(key);
+        if (!f.found) return;
+        gpa.free(m.keys.orderedRemove(f.index));
+        gpa.free(m.vals.orderedRemove(f.index));
+    }
+
+    fn inRange(key: []const u8, o: ScanOptions) bool {
+        switch (o.start) {
+            .unbounded => {},
+            .inclusive => |b| if (std.mem.order(u8, key, b) == .lt) return false,
+            .exclusive => |b| if (std.mem.order(u8, key, b) != .gt) return false,
+        }
+        switch (o.end) {
+            .unbounded => {},
+            .inclusive => |b| if (std.mem.order(u8, key, b) == .gt) return false,
+            .exclusive => |b| if (std.mem.order(u8, key, b) != .lt) return false,
+        }
+        return true;
+    }
+
+    /// Indices into `keys` the scan with options `o` must yield, in order.
+    fn expected(m: *const RefModel, gpa: Allocator, o: ScanOptions) !std.ArrayList(usize) {
+        var out: std.ArrayList(usize) = .empty;
+        errdefer out.deinit(gpa);
+        const n = m.keys.items.len;
+        const limit = o.limit orelse std.math.maxInt(usize);
+        for (0..n) |j| {
+            if (out.items.len >= limit) break;
+            const i = if (o.direction == .forward) j else n - 1 - j;
+            if (inRange(m.keys.items[i], o)) try out.append(gpa, i);
+        }
+        return out;
+    }
+};
+
+/// Scan with `o` and require exactly the reference's answer — same keys, same
+/// values, same order, nothing extra (which also proves duplicate-freedom).
+fn expectScanMatches(store: *Store, model: *const RefModel, o: ScanOptions) !void {
+    const gpa = testing.allocator;
+    var got = try collectScan(gpa, store, o);
+    defer got.deinit(gpa);
+    var want = try model.expected(gpa, o);
+    defer want.deinit(gpa);
+    try testing.expectEqual(want.items.len, got.keys.items.len);
+    for (want.items, 0..) |wi, j| {
+        try testing.expectEqualStrings(model.keys.items[wi], got.keys.items[j]);
+        try testing.expectEqualStrings(model.vals.items[wi], got.vals.items[j]);
+    }
+    // Strictly monotone in scan direction: no key twice, never out of order.
+    if (got.keys.items.len > 1) for (1..got.keys.items.len) |j| {
+        const ord = std.mem.order(u8, got.keys.items[j - 1], got.keys.items[j]);
+        try testing.expectEqual(if (o.direction == .forward) std.math.Order.lt else .gt, ord);
+    };
+}
+
+test "scan: random keys across N shards come out in global order, both directions" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 3, 8 }) |n_shards| {
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var store = try Store.init(gpa, sim.storage(), .{ .n_shards = n_shards });
+        defer store.deinit();
+        var model: RefModel = .{};
+        defer model.deinit(gpa);
+
+        var prng = std.Random.DefaultPrng.init(0x5ca9_0000 + n_shards);
+        const r = prng.random();
+        var kbuf: [24]u8 = undefined;
+        var vbuf: [24]u8 = undefined;
+        for (0..300) |n| {
+            // Random binary keys of random length, so ordering is bytewise and
+            // includes prefixes of one another.
+            const klen = r.intRangeAtMost(usize, 1, kbuf.len);
+            r.bytes(kbuf[0..klen]);
+            const v = try std.fmt.bufPrint(&vbuf, "v{d}", .{n});
+            try store.put(kbuf[0..klen], v);
+            try model.put(gpa, kbuf[0..klen], v);
+        }
+        // Every shard really holds data, so the merge is exercised.
+        for (store.shards) |*d| {
+            var c = try d.cursor();
+            defer c.deinit();
+            try c.first();
+            try testing.expect((try c.next()) != null);
+        }
+
+        try expectScanMatches(&store, &model, .{});
+        try expectScanMatches(&store, &model, .{ .direction = .reverse });
+    }
+}
+
+test "scan: range bound edges — inclusive, exclusive, unbounded, present and absent keys" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 4 });
+    defer store.deinit();
+    var model: RefModel = .{};
+    defer model.deinit(gpa);
+
+    // Even numbers only, zero-padded so text order is numeric order: "k010",
+    // "k012", … "k098". Odd keys are absent and fall between two present ones.
+    var kbuf: [8]u8 = undefined;
+    var n: usize = 10;
+    while (n < 100) : (n += 2) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>3}", .{n});
+        try store.put(k, k);
+        try model.put(gpa, k, k);
+    }
+
+    // Bound keys: below everything, the first, an absent middle, a present
+    // middle, the last, above everything, prefixes of every key, and "".
+    const probes = [_][]const u8{ "a", "k010", "k051", "k050", "k098", "z", "k", "k0", "" };
+    for (probes) |s| for (probes) |e| {
+        const starts = [_]Bound{ .unbounded, .{ .inclusive = s }, .{ .exclusive = s } };
+        const ends = [_]Bound{ .unbounded, .{ .inclusive = e }, .{ .exclusive = e } };
+        for (starts) |sb| for (ends) |eb| for ([_]ScanDirection{ .forward, .reverse }) |dir| {
+            try expectScanMatches(&store, &model, .{ .start = sb, .end = eb, .direction = dir });
+        };
+    };
+
+    // The edges spelled out, so a reader need not trust the reference:
+    var got = try collectScan(gpa, &store, .{ .start = .{ .inclusive = "k050" }, .end = .{ .inclusive = "k050" } });
+    try testing.expectEqual(@as(usize, 1), got.keys.items.len); // [x, x] is one key
+    got.deinit(gpa);
+    got = try collectScan(gpa, &store, .{ .start = .{ .inclusive = "k050" }, .end = .{ .exclusive = "k050" } });
+    try testing.expectEqual(@as(usize, 0), got.keys.items.len); // [x, x) is empty
+    got.deinit(gpa);
+    got = try collectScan(gpa, &store, .{ .start = .{ .exclusive = "k050" }, .end = .{ .inclusive = "k054" } });
+    try testing.expectEqual(@as(usize, 2), got.keys.items.len); // (50, 54] = 52, 54
+    try testing.expectEqualStrings("k052", got.keys.items[0]);
+    got.deinit(gpa);
+    got = try collectScan(gpa, &store, .{ .start = .{ .inclusive = "k060" }, .end = .{ .inclusive = "k040" } });
+    try testing.expectEqual(@as(usize, 0), got.keys.items.len); // start above end: empty, no error
+    got.deinit(gpa);
+    got = try collectScan(gpa, &store, .{ .start = .{ .exclusive = "k051" }, .end = .{ .exclusive = "k055" }, .direction = .reverse });
+    try testing.expectEqual(@as(usize, 2), got.keys.items.len); // 54, 52
+    try testing.expectEqualStrings("k054", got.keys.items[0]);
+    try testing.expectEqualStrings("k052", got.keys.items[1]);
+    got.deinit(gpa);
+}
+
+test "scan: empty store, empty shards, and the bound slice need not outlive scan()" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 16 });
+    defer store.deinit();
+    var model: RefModel = .{};
+    defer model.deinit(gpa);
+
+    // Entirely empty: nothing, in either direction, with any bounds.
+    try expectScanMatches(&store, &model, .{});
+    try expectScanMatches(&store, &model, .{ .direction = .reverse });
+    try expectScanMatches(&store, &model, .{ .start = .{ .inclusive = "a" }, .end = .{ .inclusive = "z" } });
+
+    // Three keys over sixteen shards: at least thirteen shards stay empty.
+    for ([_][]const u8{ "alpha", "mid", "zulu" }) |k| {
+        try store.put(k, k);
+        try model.put(gpa, k, k);
+    }
+    var empty_shards: usize = 0;
+    for (store.shards) |*d| {
+        var c = try d.cursor();
+        defer c.deinit();
+        try c.first();
+        if ((try c.next()) == null) empty_shards += 1;
+    }
+    try testing.expect(empty_shards >= 13);
+    try expectScanMatches(&store, &model, .{});
+    try expectScanMatches(&store, &model, .{ .direction = .reverse, .limit = 2 });
+
+    // The stop bound is copied: overwriting the caller's buffer after `scan`
+    // returns changes nothing.
+    var bound = "mid".*;
+    var it = try store.scan(.{ .end = .{ .inclusive = &bound } });
+    defer it.deinit();
+    bound = "aaa".*;
+    try testing.expectEqualStrings("alpha", (try it.next()).?.key);
+    try testing.expectEqualStrings("mid", (try it.next()).?.key);
+    try testing.expect((try it.next()) == null);
+}
+
+test "scan: duplicate-free — a key misplaced into a non-owning shard is not yielded" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 4 });
+    defer store.deinit();
+
+    try store.put("dup", "owned");
+    try store.put("solo", "x");
+    const owner = store.shardFor("dup");
+    // Write the same key, with a different value, straight into every other
+    // shard — the only way a key can exist in two shards.
+    for (0..4) |i| if (i != owner) try store.shardAt(i).put("dup", "stray");
+    // And a key that exists ONLY in a shard it does not route to.
+    const orphan_home = store.shardFor("orphan");
+    try store.shardAt((orphan_home + 1) % 4).put("orphan", "stray");
+
+    // `get` sees the owned copy only, and no orphan.
+    const g = (try store.get(gpa, "dup")).?;
+    defer gpa.free(g);
+    try testing.expectEqualStrings("owned", g);
+    try testing.expect((try store.get(gpa, "orphan")) == null);
+
+    // The scan agrees with `get`, in both directions.
+    for ([_]ScanDirection{ .forward, .reverse }) |dir| {
+        var got = try collectScan(gpa, &store, .{ .direction = dir });
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(usize, 2), got.keys.items.len);
+        const di: usize = if (dir == .forward) 0 else 1;
+        try testing.expectEqualStrings("dup", got.keys.items[di]);
+        try testing.expectEqualStrings("owned", got.vals.items[di]);
+        try testing.expectEqualStrings("solo", got.keys.items[1 - di]);
+    }
+}
+
+test "scan: limit — zero, one, partial, exact, beyond, with bounds and reverse" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 5 });
+    defer store.deinit();
+    var model: RefModel = .{};
+    defer model.deinit(gpa);
+
+    var kbuf: [8]u8 = undefined;
+    for (0..60) |n| {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>3}", .{n});
+        try store.put(k, k);
+        try model.put(gpa, k, k);
+    }
+    for ([_]usize{ 0, 1, 7, 20, 59, 60, 61, 1000 }) |limit| {
+        for ([_]ScanDirection{ .forward, .reverse }) |dir| {
+            try expectScanMatches(&store, &model, .{ .limit = limit, .direction = dir });
+            try expectScanMatches(&store, &model, .{
+                .start = .{ .exclusive = "k010" },
+                .end = .{ .inclusive = "k030" },
+                .limit = limit,
+                .direction = dir,
+            });
+        }
+    }
+    // Reverse + limit keeps the largest keys of the range.
+    var got = try collectScan(gpa, &store, .{ .end = .{ .exclusive = "k030" }, .limit = 3, .direction = .reverse });
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), got.keys.items.len);
+    try testing.expectEqualStrings("k029", got.keys.items[0]);
+    try testing.expectEqualStrings("k027", got.keys.items[2]);
+}
+
+test "scan: property — random puts, overwrites and deletes vs a sorted reference" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    const n_shards = 7;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = n_shards });
+    defer store.deinit();
+    var model: RefModel = .{};
+    defer model.deinit(gpa);
+
+    var prng = std.Random.DefaultPrng.init(0x0005_ca75_ca75);
+    const r = prng.random();
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [600]u8 = undefined;
+    var bbuf: [2][16]u8 = undefined;
+
+    const randKey = struct {
+        fn f(rr: std.Random, buf: *[16]u8) []const u8 {
+            // A small alphabet over short keys, so overwrites, deletes of
+            // present keys and bounds that hit real keys are all common.
+            const len = rr.intRangeAtMost(usize, 0, 6);
+            for (buf[0..len]) |*c| c.* = "abcdefgh"[rr.uintLessThan(usize, 8)];
+            return buf[0..len];
+        }
+    }.f;
+
+    for (0..6) |round| {
+        // A batch of mutations per shard, committed as one transaction per
+        // shard (the routed autocommit path is covered by the other tests;
+        // this keeps a few thousand operations quick).
+        var txns: [n_shards]kvtree.Txn = undefined;
+        for (&txns, 0..) |*t, i| t.* = try store.shardAt(i).begin();
+        for (0..600) |_| {
+            const k = randKey(r, &kbuf);
+            const t = &txns[store.shardFor(k)];
+            if (r.uintLessThan(u8, 4) == 0) {
+                try t.del(k);
+                model.del(gpa, k);
+            } else {
+                // Mostly short values, sometimes one long enough for kvtree's
+                // overflow pages (the cursor then yields from its own buffer).
+                const vlen = if (r.uintLessThan(u8, 20) == 0) vbuf.len else r.intRangeAtMost(usize, 0, 12);
+                @memset(vbuf[0..vlen], 'a' + @as(u8, @intCast(round)));
+                if (vlen > 0) vbuf[0] = r.int(u8);
+                try t.put(k, vbuf[0..vlen]);
+                try model.put(gpa, k, vbuf[0..vlen]);
+            }
+        }
+        for (&txns) |*t| try t.commit();
+
+        try expectScanMatches(&store, &model, .{});
+        try expectScanMatches(&store, &model, .{ .direction = .reverse });
+        for (0..60) |_| {
+            var bounds: [2]Bound = undefined;
+            for (&bounds, 0..) |*b, j| b.* = switch (r.uintLessThan(u8, 3)) {
+                0 => .unbounded,
+                1 => .{ .inclusive = randKey(r, &bbuf[j]) },
+                else => .{ .exclusive = randKey(r, &bbuf[j]) },
+            };
+            const limit: ?usize = if (r.boolean()) null else r.uintLessThan(usize, 40);
+            const dir: ScanDirection = if (r.boolean()) .forward else .reverse;
+            try expectScanMatches(&store, &model, .{ .start = bounds[0], .end = bounds[1], .limit = limit, .direction = dir });
+        }
+    }
+    try testing.expect(model.keys.items.len > 1000);
+}
+
+test "scan consistency: a scan sees the store as of scan(); later commits are invisible to it" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 4 });
+    defer store.deinit();
+    var model: RefModel = .{};
+    defer model.deinit(gpa);
+
+    var kbuf: [8]u8 = undefined;
+    for (0..200) |n| {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n * 2});
+        try store.put(k, "old");
+        try model.put(gpa, k, "old");
+    }
+
+    var overwritten: usize = 0;
+    var deleted: usize = 0;
+    var inserted: usize = 0;
+    var it = try store.scan(.{});
+    defer it.deinit();
+    var seen: usize = 0;
+    while (try it.next()) |e| : (seen += 1) {
+        // The scan yields exactly the store as it was when it opened…
+        try testing.expectEqualStrings(model.keys.items[seen], e.key);
+        try testing.expectEqualStrings("old", e.val);
+        // …while the owner keeps committing between `next` calls, on every
+        // shard: overwrite a key not yet reached, delete the one after it,
+        // insert a new key into a gap still ahead. None of it may show up.
+        // (kvtree's reclaim-gate pin keeps the pinned pages intact across
+        // these commits; without it this read would walk recycled pages.)
+        if (seen % 8 == 0 and seen + 7 < model.keys.items.len) {
+            try store.put(model.keys.items[seen + 5], "new");
+            overwritten += 1;
+            try store.delete(model.keys.items[seen + 6]);
+            deleted += 1;
+            const fresh = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{seen * 2 + 9});
+            try store.put(fresh, "new");
+            inserted += 1;
+        }
+    }
+    try testing.expectEqual(model.keys.items.len, seen);
+    try testing.expect(overwritten > 20);
+
+    // A fresh scan sees the new state.
+    var after = try collectScan(gpa, &store, .{});
+    defer after.deinit(gpa);
+    var news: usize = 0;
+    for (after.vals.items) |v| {
+        if (std.mem.eql(u8, v, "new")) news += 1;
+    }
+    try testing.expectEqual(overwritten + inserted, news);
+    try testing.expectEqual(model.keys.items.len - deleted + inserted, after.keys.items.len);
+}
+
+test "scan on a single_thread store: refused from a foreign thread, owner's scan unharmed" {
+    const gpa = testing.allocator;
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 3 });
+    defer store.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| try store.put(k, k);
+
+    var it = try store.scan(.{});
+    defer it.deinit();
+    try testing.expectEqualStrings("a", (try it.next()).?.key);
+
+    const Probe = struct {
+        store: *Store,
+        it: *Scan,
+        open_res: ScanError!void = {},
+        next_res: ScanError!?KV = null,
+
+        fn run(p: *@This()) void {
+            if (p.store.scan(.{})) |s| {
+                var s2 = s;
+                s2.deinit();
+            } else |e| p.open_res = e;
+            p.next_res = p.it.next();
+        }
+    };
+    var probe = Probe{ .store = &store, .it = &it };
+    const t = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    t.join();
+    try testing.expectError(error.NotOwningThread, probe.open_res);
+    try testing.expectError(error.NotOwningThread, probe.next_res);
+
+    // The refusal is not sticky and did not advance the owner's scan.
+    try testing.expectEqualStrings("b", (try it.next()).?.key);
+    try testing.expectEqualStrings("c", (try it.next()).?.key);
+    try testing.expectEqualStrings("d", (try it.next()).?.key);
+    try testing.expect((try it.next()) == null);
+}
+
+test "scan: every allocation failure is reported, sticky, and leak-free" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var store = try Store.init(gpa, sim.storage(), .{ .n_shards = 3 });
+    defer store.deinit();
+
+    // Enough keys for multi-level trees, plus overflow values (the cursor
+    // allocates to assemble those, mid-scan).
+    var kbuf: [8]u8 = undefined;
+    const big = [_]u8{'v'} ** 5000;
+    for (0..300) |n| {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n});
+        try store.put(k, if (n % 50 == 0) &big else k);
+    }
+
+    var fail_at: usize = 0;
+    var completed = false;
+    var mid_scan_failures: usize = 0;
+    while (!completed) : (fail_at += 1) {
+        failing.fail_index = failing.alloc_index + fail_at;
+        failing.resize_fail_index = failing.resize_index + fail_at;
+        var it = store.scan(.{}) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        defer it.deinit();
+        var count: usize = 0;
+        while (true) {
+            const entry = it.next() catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                // Sticky: the scan does not resume with a gap.
+                try testing.expectError(error.OutOfMemory, it.next());
+                mid_scan_failures += 1;
+                break;
+            };
+            if (entry == null) {
+                try testing.expectEqual(@as(usize, 300), count);
+                completed = true;
+                break;
+            }
+            count += 1;
+        }
+    }
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try testing.expect(mid_scan_failures > 0);
 }

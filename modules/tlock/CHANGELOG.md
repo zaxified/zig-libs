@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the age layer is now interop-proven against
+  Go: drand/tlock's whole-file fixture (`testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`
+  and `lorem.txt`, commit `7ceb44a5…`, MIT OR Apache-2.0) is committed under `src/testdata/` and
+  `kat_test.zig` decrypts it end-to-end to the published plaintext (armor, header MAC, STREAM),
+  refuses it under another chain hash and refuses a flipped payload byte. Scope mvp → core.
+
+- **2026-10-06** — ADDED: `tlock.age`, the age v1 envelope drand/tlock's `tle` writes —
+  the `tlock` stanza, the HKDF/HMAC-SHA-256 header MAC, the ChaCha20-Poly1305 STREAM payload
+  in 64 KiB chunks and ASCII armor — so files of any length can be timelocked and opened:
+  `encrypt`/`encryptAlloc`, `decrypt`/`decryptAlloc`, `inspectAlloc`, `Header.parse`,
+  `armor`/`dearmor`, `Randomness.draw`, with exact-size helpers. New dependency: `chachapoly`
+  (this repo). The stanza body is byte-exact against the genuine `tle` fixture; the MAC,
+  STREAM and armor are spec-derived and round-trip-tested, not yet checked against a whole
+  Go-produced file. Fuzz harness on the header, armor and payload decoders. Not breaking.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the age stanza/armor layer moves from "never" to "not yet — see Backlog" in Out of scope.
 - **2026-10-05** — Mutation run: 14 of 16 killed, 2 equivalent; 0 tests added (the
   `fp12Pow` lookup's `<=` twin and the reject-path wipe of `message`, see SPEC).

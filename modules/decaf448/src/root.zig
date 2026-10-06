@@ -59,8 +59,13 @@ pub const meta = .{
 pub const gate = @import("gate.zig");
 pub const scalar = @import("scalar.zig");
 pub const element = @import("element.zig");
+pub const hash = @import("hash.zig");
 
 pub const Element = element.Element;
+/// `hash_to_decaf448` (RFC 9380 Appendix C) — see `hash.hashToElement`.
+pub const hashToElement = hash.hashToElement;
+/// RFC 9497 decaf448-SHAKE256 `HashToScalar` — see `hash.hashToScalar`.
+pub const hashToScalar = hash.hashToScalar;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -71,7 +76,9 @@ test {
     _ = gate;
     _ = scalar;
     _ = element;
+    _ = hash;
     _ = @import("kat_vectors.zig");
+    _ = @import("hash_kat_test.zig");
     _ = @import("kat_test.zig");
 }
 

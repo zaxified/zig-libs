@@ -211,6 +211,55 @@ pub fn matchEcho(
     return sample;
 }
 
+/// The ICMP / ICMPv6 Echo counterpart of `matchEcho`, over the same two
+/// tables, the same aging and the same capacity rule. The difference is that
+/// an echo message is either a probe or an answer, never both:
+///   - **Echo Request** going `obs.dir`: insert `key = identifier<<16 |
+///     sequence` into `same_dir`, first-seen only (a duplicated request keeps
+///     its first time, as a retransmitted TSval does). No match is attempted.
+///   - **Echo Reply** going `obs.dir`: look the key up in `opp_dir` (the
+///     requests that went the other way), emit `now - first_seen` and
+///     **consume** the entry. A duplicate reply ("DUP!" in ping) finds nothing.
+///     A reply never inserts: an unmatched reply leaves no state behind.
+/// The sample's `proto` is `.icmp_echo` or `.icmpv6_echo` and its `tsval`
+/// carries the key.
+pub fn matchEchoReply(
+    same_dir: *TsTable,
+    opp_dir: *TsTable,
+    cfg: root.Config,
+    obs: root.EchoObservation,
+) ?root.RttSample {
+    _ = same_dir.evictOlderThan(obs.now, cfg.max_age);
+    _ = opp_dir.evictOlderThan(obs.now, cfg.max_age);
+    const key = obs.echo.key();
+    switch (obs.echo.kind) {
+        .request => {
+            if (same_dir.indexOf(key) != null) return null;
+            if (same_dir.isFull()) {
+                if (same_dir.oldestIndex()) |oldest| same_dir.removeAt(oldest);
+            }
+            same_dir.insert(key, obs.now) catch |err| switch (err) {
+                error.Full => {},
+            };
+            return null;
+        },
+        .reply => {
+            const idx = opp_dir.indexOf(key) orelse return null;
+            const first_seen = opp_dir.entries[idx].first_seen;
+            opp_dir.removeAt(idx);
+            return .{
+                .rtt = obs.now -| first_seen,
+                .tsval = key,
+                .at = obs.now,
+                .proto = switch (obs.echo.family) {
+                    .v4 => .icmp_echo,
+                    .v6 => .icmpv6_echo,
+                },
+            };
+        },
+    }
+}
+
 test "match: step 5a ages the SAME-direction table too, so memory is bounded over TIME on a stalled direction" {
     // What this pins, and why it is here rather than in `kat.zig`: step 5a
     // sweeps BOTH tables, and every scenario in `kat.zig` only ever observes

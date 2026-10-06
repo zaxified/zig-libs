@@ -16,12 +16,14 @@
 //! posture). `round.roundPath`/`round.latestPath` build the request path
 //! as a convenience; performing the request is the caller's job.
 //!
-//! **Scheme coverage.** Verification targets the League-of-Entropy
-//! **quicknet** scheme `bls-unchained-g1-rfc9380` (signatures in `G1`,
+//! **Scheme coverage.** Verifies the two League-of-Entropy mainnet
+//! schemes: **quicknet** `bls-unchained-g1-rfc9380` (signatures in `G1`,
 //! master key in `G2`, message `H1(SHA-256(round_be))`) — the scheme
-//! `tlock` also targets. The legacy chained scheme and the deprecated
-//! `bls-unchained-on-g1` are RECOGNIZED and parsed but not verified
-//! (`error.UnsupportedScheme`); see `SPEC.md`'s deferred list.
+//! `tlock` also targets — and the chained **default** network's
+//! `pedersen-bls-chained` (signatures in `G2`, key in `G1`, message
+//! `H2(SHA-256(previous_signature ‖ round_be))` under the RFC-9380 `G2`
+//! `_NUL_` DST). The deprecated `bls-unchained-on-g1` is RECOGNIZED and
+//! parsed but not verified (`error.UnsupportedScheme`); see `SPEC.md`.
 //!
 //! ## Layout
 //!
@@ -56,6 +58,9 @@ pub const latestPath = round.latestPath;
 pub const VerifyError = verify.VerifyError;
 pub const verifyRound = verify.verifyRound;
 pub const verifyRoundPoints = verify.verifyRoundPoints;
+pub const verifyChainedRoundPoints = verify.verifyChainedRoundPoints;
+pub const chainedMessage = verify.chainedMessage;
+pub const chained_dst = verify.chained_dst;
 pub const expectedRound = verify.expectedRound;
 
 /// Re-exported: the sibling crypto module every point/pairing comes from.
@@ -73,7 +78,7 @@ pub const meta = .{
     .platform = .any, // pure parse + verify; no I/O, no syscalls
     .role = .client, // a beacon-client core (verification + codec half); transport is the caller's
     .concurrency = .reentrant, // every type is a plain value; no shared state, no globals
-    .model_after = "drand/drand HTTP beacon client + crypto.Scheme.VerifyBeacon (Go) — quicknet's SigsOnG1ID/\"bls-unchained-g1-rfc9380\" scheme; bls12_381 (this repo) supplies the pairing + RFC-9380 hash-to-curve, and tlock.ciphersuite supplies the byte-identical quicknet beaconId/h1 message hashing",
+    .model_after = "drand/drand HTTP beacon client + crypto.Scheme.VerifyBeacon (Go) — quicknet's SigsOnG1ID/\"bls-unchained-g1-rfc9380\" and the default network's \"pedersen-bls-chained\" schemes; bls12_381 (this repo) supplies the pairing + RFC-9380 hash-to-curve, and tlock.ciphersuite supplies the byte-identical quicknet beaconId/h1 message hashing",
     .deps = .{ "bls12_381", "tlock" },
 };
 

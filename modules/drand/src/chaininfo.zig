@@ -28,18 +28,21 @@
 //! trailing garbage, or an out-of-range number all yield a typed
 //! `ParseError`, never a panic, OOB read, hang, or amplified allocation.
 //!
-//! Scheme coverage: the master public key is decoded into a `bls12_381`
-//! `G2` point ONLY for the sig-on-`G1` scheme family (quicknet's
-//! `bls-unchained-g1-rfc9380`), whose key lives in `G2` (96-byte
-//! compressed) and is `KeyValidate`d (on-curve + order-`r` subgroup).
-//! Other schemes still parse (metadata, hash, period, raw key bytes) but
-//! leave `pubkey_g2 == null`; `verify.verifyRound` rejects them with
-//! `error.UnsupportedScheme`. See `SPEC.md`.
+//! Scheme coverage: the master public key is decoded and `KeyValidate`d
+//! (on-curve + order-`r` subgroup + non-identity) for the two verifiable
+//! schemes: into a `G2` point (`pubkey_g2`, 96-byte compressed) for
+//! quicknet's `bls-unchained-g1-rfc9380`, and into a `G1` point
+//! (`pubkey_g1`, 48-byte compressed) for the chained default network's
+//! `pedersen-bls-chained`. Other schemes still parse (metadata, hash,
+//! period, raw key bytes) but leave both points `null`;
+//! `verify.verifyRound` rejects them with `error.UnsupportedScheme`. See
+//! `SPEC.md`.
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
 const json_uint = @import("json_uint.zig");
 
+const g1 = bls12_381.g1;
 const g2 = bls12_381.g2;
 
 /// The largest `/info` document this parser will accept, as a guard
@@ -98,18 +101,20 @@ pub const ParseError = error{
 /// hash (`common.IsDefaultBeaconID` in drand/drand).
 pub const default_beacon_id = "default";
 
-/// The drand scheme a beacon runs, decoded from `schemeID`. Only
-/// `unchained_g1_rfc9380` (quicknet) is verifiable by this module; the
-/// others are recognized so callers get a precise `error.UnsupportedScheme`
-/// from `verify` rather than a confusing parse failure.
+/// The drand scheme a beacon runs, decoded from `schemeID`.
+/// `unchained_g1_rfc9380` (quicknet) and `pedersen_bls_chained` (the
+/// chained default network) are verifiable by this module; the others are
+/// recognized so callers get a precise `error.UnsupportedScheme` from
+/// `verify` rather than a confusing parse failure.
 pub const Scheme = enum {
     /// `bls-unchained-g1-rfc9380` — quicknet. Signatures in `G1`,
     /// master public key in `G2`, message = `H1(SHA256(round_be))` under
     /// the RFC-9380 `..._NUL_` `G1` DST. THE scheme this module verifies.
     unchained_g1_rfc9380,
-    /// `pedersen-bls-chained` — the legacy default mainnet scheme.
-    /// Signatures in `G2`, key in `G1`, message folds in the previous
-    /// signature (`H(round || prev_sig)`). Recognized, not verified.
+    /// `pedersen-bls-chained` — the League of Entropy "default" network.
+    /// Signatures in `G2`, key in `G1`, message
+    /// `H2(SHA-256(previous_signature ‖ round_be))` under the RFC-9380
+    /// `G2` `..._NUL_` DST. Verified (`verify.verifyChainedRoundPoints`).
     pedersen_bls_chained,
     /// `bls-unchained-on-g1` — the deprecated pre-RFC-9380 unchained
     /// scheme (reuses the `G2` DST for `G1` hashing — a known
@@ -127,10 +132,10 @@ pub const Scheme = enum {
     }
 
     /// True iff this module can BLS-verify a round under this scheme
-    /// (i.e. quicknet). `verify.verifyRound` returns
-    /// `error.UnsupportedScheme` for any scheme where this is false.
+    /// (quicknet or the chained default network). `verify.verifyRound`
+    /// returns `error.UnsupportedScheme` for any scheme where this is false.
     pub fn isVerifiable(self: Scheme) bool {
-        return self == .unchained_g1_rfc9380;
+        return self == .unchained_g1_rfc9380 or self == .pedersen_bls_chained;
     }
 };
 
@@ -148,14 +153,19 @@ pub const ChainInfo = struct {
     /// The group hash (`groupHash`) — 32 bytes.
     group_hash: [32]u8,
     /// Raw compressed master-public-key bytes (48 for `G1`-key schemes,
-    /// 96 for `G2`-key schemes). Always populated; `pubkey_g2` is the
-    /// decoded point for the supported scheme only.
+    /// 96 for `G2`-key schemes). Always populated; `pubkey_g2`/`pubkey_g1`
+    /// are the decoded points for the verifiable schemes only.
     pubkey_bytes: [pubkey_max_bytes]u8,
     pubkey_len: usize,
     /// The master public key decoded into a `bls12_381` `G2` point and
     /// `KeyValidate`d — present only for the sig-on-`G1` scheme
     /// (quicknet). `null` for every other scheme.
     pubkey_g2: ?g2.Affine,
+    /// The master public key decoded into a `bls12_381` `G1` point and
+    /// `KeyValidate`d — present only for `pedersen-bls-chained`. `null`
+    /// for every other scheme. Defaulted so a hand-built `ChainInfo`
+    /// literal from before this field existed still compiles.
+    pubkey_g1: ?g1.Affine = null,
     /// `metadata.beaconID` label bytes (e.g. "quicknet").
     beacon_id_buf: [max_beacon_id_bytes]u8,
     beacon_id_len: usize,
@@ -255,7 +265,8 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     const group_hash = try hexExact(32, raw.groupHash);
 
     // Public key: decode the raw compressed bytes (48 or 96), then — for
-    // the sig-on-G1 family only — decode + KeyValidate the G2 point.
+    // the verifiable schemes — decode + KeyValidate the point in the
+    // scheme's key group.
     if (raw.public_key.len == 0 or raw.public_key.len % 2 != 0) return error.InvalidHex;
     const pubkey_nbytes = raw.public_key.len / 2;
     if (pubkey_nbytes > pubkey_max_bytes) return error.InvalidLength;
@@ -266,16 +277,30 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     _ = std.fmt.hexToBytes(pubkey_bytes[0..pubkey_nbytes], raw.public_key) catch return error.InvalidHex;
 
     var pubkey_g2: ?g2.Affine = null;
-    if (scheme.isVerifiable()) {
-        if (pubkey_nbytes != g2.compressed_bytes) return error.InvalidLength;
-        // drand KeyValidate: reject identity and non-subgroup keys (the
-        // decoder checks the subgroup).
-        const pt = g2.fromBytesCompressed(pubkey_bytes[0..g2.compressed_bytes].*) catch |err| return switch (err) {
-            error.NotInSubgroup => error.PublicKeyNotInSubgroup,
-            else => error.InvalidPoint,
-        };
-        if (pt.infinity) return error.InvalidPoint;
-        pubkey_g2 = pt;
+    var pubkey_g1: ?g1.Affine = null;
+    switch (scheme) {
+        .unchained_g1_rfc9380 => {
+            if (pubkey_nbytes != g2.compressed_bytes) return error.InvalidLength;
+            // drand KeyValidate: reject identity and non-subgroup keys (the
+            // decoder checks the subgroup).
+            const pt = g2.fromBytesCompressed(pubkey_bytes[0..g2.compressed_bytes].*) catch |err| return switch (err) {
+                error.NotInSubgroup => error.PublicKeyNotInSubgroup,
+                else => error.InvalidPoint,
+            };
+            if (pt.infinity) return error.InvalidPoint;
+            pubkey_g2 = pt;
+        },
+        .pedersen_bls_chained => {
+            // The same KeyValidate, one group down: the chained key is G1.
+            if (pubkey_nbytes != g1.compressed_bytes) return error.InvalidLength;
+            const pt = g1.fromBytesCompressed(pubkey_bytes[0..g1.compressed_bytes].*) catch |err| return switch (err) {
+                error.NotInSubgroup => error.PublicKeyNotInSubgroup,
+                else => error.InvalidPoint,
+            };
+            if (pt.infinity) return error.InvalidPoint;
+            pubkey_g1 = pt;
+        },
+        .bls_unchained_on_g1, .other => {},
     }
 
     // No chain has period 0; refusing it here keeps `expectedRound` total.
@@ -303,6 +328,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
         .pubkey_bytes = pubkey_bytes,
         .pubkey_len = pubkey_nbytes,
         .pubkey_g2 = pubkey_g2,
+        .pubkey_g1 = pubkey_g1,
         .beacon_id_buf = beacon_id_buf,
         .beacon_id_len = beacon_id_len,
     };
@@ -545,12 +571,73 @@ test "parseInfo: max_document_bytes is pinned at 64 KiB, not just self-referenti
     try testing.expectEqual(@as(usize, 64 * 1024), max_document_bytes);
 }
 
-test "parseInfo: a chained-scheme /info parses but leaves pubkey_g2 null" {
-    // A 48-byte (G1) key under the legacy chained scheme: metadata still
-    // parses; the point is not decoded (verify would reject the scheme).
+test "parseInfo: the chained default /info decodes a KeyValidated G1 key, no G2 key" {
     const info = try parseInfo(testing.allocator, chained_default_info_json);
     try testing.expectEqual(Scheme.pedersen_bls_chained, info.scheme);
+    try testing.expect(info.scheme.isVerifiable());
     try testing.expect(info.pubkey_g2 == null);
+    const pk = info.pubkey_g1.?;
+    try testing.expect(!pk.infinity);
+    try testing.expect(g1.Jacobian.fromAffine(pk).subgroupCheck());
     try testing.expectEqual(@as(usize, 48), info.pubkey_len);
     try testing.expectEqualStrings("default", info.beaconId());
+}
+
+test "parseInfo: quicknet leaves pubkey_g1 null; an unverifiable scheme decodes no point" {
+    const qn = try parseInfo(testing.allocator, quicknet_info_json);
+    try testing.expect(qn.pubkey_g1 == null);
+    // Same chain fields, scheme relabelled: the label is not hashed, so the
+    // document parses, and no point is decoded for a scheme we cannot verify.
+    const relabelled = try std.mem.replaceOwned(u8, testing.allocator, chained_default_info_json, "pedersen-bls-chained", "bls-unchained-on-g1");
+    defer testing.allocator.free(relabelled);
+    const other = try parseInfo(testing.allocator, relabelled);
+    try testing.expect(other.pubkey_g1 == null and other.pubkey_g2 == null);
+}
+
+/// A chained-default-shaped /info around `pk_hex`, with the `hash`
+/// recomputed so that ONLY the key check can refuse it.
+fn chainedInfoWithKey(gpa: std.mem.Allocator, pk_hex: []const u8) ![]u8 {
+    var tmp: ChainInfo = .{
+        .scheme = .pedersen_bls_chained,
+        .period_seconds = 30,
+        .genesis_time = 1595431050,
+        .chain_hash = undefined,
+        .group_hash = try hexExact(32, "176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a"),
+        .pubkey_bytes = [_]u8{0} ** pubkey_max_bytes,
+        .pubkey_len = pk_hex.len / 2,
+        .pubkey_g2 = null,
+        .beacon_id_buf = [_]u8{0} ** max_beacon_id_bytes,
+        .beacon_id_len = 0,
+    };
+    _ = try std.fmt.hexToBytes(tmp.pubkey_bytes[0 .. pk_hex.len / 2], pk_hex);
+    const hash = computeChainHash(&tmp);
+    return std.fmt.allocPrint(gpa, "{{\"public_key\":\"{s}\",\"period\":30,\"genesis_time\":1595431050,\"hash\":\"{s}\",\"groupHash\":\"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a\",\"schemeID\":\"pedersen-bls-chained\",\"metadata\":{{\"beaconID\":\"default\"}}}}", .{ pk_hex, std.fmt.bytesToHex(hash, .lower) });
+}
+
+test "parseInfo: chained key KeyValidate — off-subgroup, identity and wrong length refused" {
+    // Control: the genuine key through the same document builder parses.
+    const good = try chainedInfoWithKey(testing.allocator, "868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31");
+    defer testing.allocator.free(good);
+    _ = try parseInfo(testing.allocator, good);
+
+    // The on-curve G1 point at x = 4 is outside the order-r subgroup.
+    var comp = [_]u8{0} ** g1.compressed_bytes;
+    comp[0] = 0x80;
+    comp[g1.compressed_bytes - 1] = 4;
+    const pt = try g1.fromBytesCompressedUnchecked(comp);
+    try testing.expect(g1.Jacobian.fromAffine(pt).isOnCurve());
+    const torsion = try chainedInfoWithKey(testing.allocator, &std.fmt.bytesToHex(comp, .lower));
+    defer testing.allocator.free(torsion);
+    try testing.expectError(error.PublicKeyNotInSubgroup, parseInfo(testing.allocator, torsion));
+
+    // The identity key: e(identity, ·) = 1, which with an identity
+    // signature would accept every round.
+    const identity = try chainedInfoWithKey(testing.allocator, "c0" ++ ("00" ** 47));
+    defer testing.allocator.free(identity);
+    try testing.expectError(error.InvalidPoint, parseInfo(testing.allocator, identity));
+
+    // A 96-byte (G2-sized) key under the chained label.
+    const g2_sized = try chainedInfoWithKey(testing.allocator, "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a");
+    defer testing.allocator.free(g2_sized);
+    try testing.expectError(error.InvalidLength, parseInfo(testing.allocator, g2_sized));
 }

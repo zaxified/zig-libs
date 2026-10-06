@@ -39,19 +39,19 @@
 //!     TSval wraparound concerns that a subtraction/ordering-based
 //!     comparison would have to reason about.
 //!
-//! **Status: complete — harness and core both implemented.** The bounded
-//! `TsTable` (`table.zig`, full test suite: insert/lookup/remove/aging/
-//! capacity-eviction-primitives/bounded-memory-under-a-long-stream), the TCP
-//! Timestamps option parser (`parse.zig`, KAT corpus + a fuzz-style hostile-
-//! input test proving it never reads out of bounds), and this file's
-//! `Estimator` shell (construction, reset, table-occupancy accessors) are
-//! all real and pass today. The irreducible algorithm itself,
-//! **`match.matchEcho`** (`src/match.zig`), is also implemented (no longer a
-//! stub) per the full contract documented on that function (first-echo
-//! consume, exact-value match, insert-if-first, aging-before-capacity-
-//! eviction). `gate.fable_core_implemented` is `true`, so the tests that
-//! call it transitively (via `Estimator.observe` — see `kat.zig` /
-//! `property.zig`) run for real and report PASS, not SKIP.
+//! **ICMP / ICMPv6 Echo.** The same table answers ping traffic: an Echo
+//! Request's (identifier, sequence) is stored the way a TSval is, and the
+//! Echo Reply carrying the same pair going the other way is the echo that
+//! consumes it (`Estimator.observeEcho`, `match.matchEchoReply`, decoder in
+//! `echo.zig`). Samples come out as the same `RttSample`, tagged by `proto`.
+//!
+//! **Status (core scope: TCP Timestamps and ICMP/ICMPv6 Echo, one flow per
+//! estimator).** The bounded `TsTable` (`table.zig`), the TCP Timestamps
+//! option parser (`parse.zig`), the ICMP/IP echo decoder (`echo.zig`), the
+//! matching core (`match.matchEcho`, `match.matchEchoReply`) and this file's
+//! `Estimator` are implemented and tested; QUIC spin bit, a multi-flow table
+//! and output formats are not (README, Backlog). `gate.fable_core_implemented`
+//! is a leftover switch from when `matchEcho` was a stub; it is `true`.
 //!
 //! Provenance: models the Pollere pping technique (Kathleen Nichols,
 //! <https://github.com/pollere/pping>) and RFC 7323 (TCP Extensions for
@@ -64,7 +64,7 @@ const Allocator = std.mem.Allocator;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — bounded per-direction table, no double-counting of duplicate/delayed ACKs",
+    .doc = "Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) and ICMP/ICMPv6 echo request/reply pairing — bounded per-direction table, no double-counting of duplicate ACKs or duplicate replies",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -91,6 +91,18 @@ pub const TcpTimestamps = parse.Timestamps;
 /// everything else in this module (below) is fully real today.
 const match = @import("match.zig");
 pub const matchEcho = match.matchEcho;
+pub const matchEchoReply = match.matchEchoReply;
+
+const echo_mod = @import("echo.zig");
+pub const IcmpEcho = echo_mod.IcmpEcho;
+pub const IcmpFamily = echo_mod.Family;
+pub const EchoKind = echo_mod.Kind;
+pub const IpAddr = echo_mod.IpAddr;
+pub const IpEcho = echo_mod.IpEcho;
+pub const EchoParseError = echo_mod.ParseError;
+pub const parseIcmpEcho = echo_mod.parseIcmpEcho;
+pub const parseIpEcho = echo_mod.parseIpEcho;
+pub const max_ipv6_extension_headers = echo_mod.max_ipv6_extension_headers;
 
 const gate = @import("gate.zig");
 /// Flip once `match.zig`'s `matchEcho` is a real implementation — see `gate.zig`.
@@ -151,17 +163,52 @@ pub const Config = struct {
     max_age: u64 = 60_000,
 };
 
+/// Which matching rule produced an `RttSample`.
+pub const Proto = enum {
+    /// TCP Timestamps: a TSecr matched the TSval it echoes (`Estimator.observe`).
+    tcp_timestamps,
+    /// ICMP Echo Reply (type 0) matched an Echo Request (type 8) (`observeEcho`).
+    icmp_echo,
+    /// ICMPv6 Echo Reply (129) matched an Echo Request (128) (`observeEcho`).
+    icmpv6_echo,
+};
+
 /// One emitted round-trip-time measurement.
 pub const RttSample = struct {
-    /// Elapsed time between the matched TSval first being observed and its
-    /// TSecr echo arriving — same unit as `Observation.now` / `Config.max_age`.
+    /// Elapsed time between the matched TSval (or Echo Request) first being
+    /// observed and its echo arriving — same unit as `Observation.now` /
+    /// `Config.max_age`.
     rtt: u64,
-    /// The TSval that was matched (useful for correlating a sample back to
-    /// a specific segment, e.g. in a trace/log).
+    /// The value that was matched (useful for correlating a sample back to a
+    /// specific packet, e.g. in a trace/log): the TSval for `.tcp_timestamps`;
+    /// for the echo protocols, `identifier << 16 | sequence` — see
+    /// `echoIdentifier` / `echoSequence`.
     tsval: u32,
     /// The `Observation.now` of the echo that completed the match (i.e. the
     /// time the sample became available, not the time the RTT started).
     at: u64,
+    /// Which matching rule produced this sample.
+    proto: Proto = .tcp_timestamps,
+
+    /// The Echo identifier of an `.icmp_echo` / `.icmpv6_echo` sample.
+    pub fn echoIdentifier(self: RttSample) u16 {
+        return @truncate(self.tsval >> 16);
+    }
+
+    /// The Echo sequence number of an `.icmp_echo` / `.icmpv6_echo` sample.
+    pub fn echoSequence(self: RttSample) u16 {
+        return @truncate(self.tsval);
+    }
+};
+
+/// One decoded ICMP / ICMPv6 Echo message fed to `Estimator.observeEcho`.
+/// `echo` comes from `parseIpEcho` / `parseIcmpEcho`; `dir` is the direction
+/// the packet traveled, labeled consistently for the flow (an `IpEcho` can
+/// pick one with `IpEcho.direction`); `now` is as in `Observation`.
+pub const EchoObservation = struct {
+    dir: Direction,
+    echo: IcmpEcho,
+    now: u64,
 };
 
 /// One parsed packet-level fact fed to `Estimator.observe`: the direction it
@@ -204,8 +251,20 @@ pub const Estimator = struct {
     tables: [2]TsTable,
     /// Total `RttSample`s this estimator has emitted since `init`/`reset`.
     samples_emitted: u64 = 0,
-    /// Total `observe` calls since `init`/`reset` (matches + non-matches).
+    /// Total `observe` / `observeEcho` calls since `init`/`reset` (matches,
+    /// non-matches and refused calls).
     observations_total: u64 = 0,
+    /// What this estimator's tables hold, fixed by the first `observe` (TCP
+    /// TSvals) or `observeEcho` (echo keys) after `init`/`reset`. The two key
+    /// spaces are both `u32` and would collide in one table, so a call of the
+    /// other kind afterwards is refused — returns `null`, changes no table and
+    /// counts in `observations_refused`. A ping flow is its own flow: give it
+    /// its own `Estimator`.
+    traffic: Traffic = .unset,
+    /// Calls refused because they did not match `traffic`.
+    observations_refused: u64 = 0,
+
+    pub const Traffic = enum { unset, tcp_timestamps, icmp_echo };
 
     /// Allocate both directions' tables at `cfg.capacity`. The allocation
     /// happens exactly once, here — nothing later in this type's lifetime
@@ -230,6 +289,15 @@ pub const Estimator = struct {
         for (&self.tables) |*t| t.reset();
         self.samples_emitted = 0;
         self.observations_total = 0;
+        self.traffic = .unset;
+        self.observations_refused = 0;
+    }
+
+    fn admit(self: *Estimator, want: Traffic) bool {
+        if (self.traffic == .unset) self.traffic = want;
+        if (self.traffic == want) return true;
+        self.observations_refused += 1;
+        return false;
     }
 
     /// Fold one observation in. Locates the two relevant tables (this
@@ -240,9 +308,26 @@ pub const Estimator = struct {
     /// observation completed a round trip.
     pub fn observe(self: *Estimator, obs: Observation) ?RttSample {
         self.observations_total += 1;
+        if (!self.admit(.tcp_timestamps)) return null;
         const same = &self.tables[@intFromEnum(obs.dir)];
         const opp = &self.tables[@intFromEnum(obs.dir.opposite())];
         const sample = match.matchEcho(same, opp, self.cfg, obs);
+        if (sample != null) self.samples_emitted += 1;
+        return sample;
+    }
+
+    /// Fold one ICMP / ICMPv6 Echo message in (see `match.matchEchoReply`):
+    /// a request is remembered by (identifier, sequence) in its direction's
+    /// table, a reply going the other way consumes it and returns the sample.
+    /// Duplicate replies, unmatched replies and requests return `null`.
+    /// Refused (returns `null`, touches nothing) on an estimator already
+    /// fed TCP observations — see `traffic`.
+    pub fn observeEcho(self: *Estimator, obs: EchoObservation) ?RttSample {
+        self.observations_total += 1;
+        if (!self.admit(.icmp_echo)) return null;
+        const same = &self.tables[@intFromEnum(obs.dir)];
+        const opp = &self.tables[@intFromEnum(obs.dir.opposite())];
+        const sample = match.matchEchoReply(same, opp, self.cfg, obs);
         if (sample != null) self.samples_emitted += 1;
         return sample;
     }
@@ -338,4 +423,6 @@ test {
     _ = @import("gate.zig");
     _ = @import("kat.zig");
     _ = @import("property.zig");
+    _ = @import("echo.zig");
+    _ = @import("echo_kat.zig");
 }

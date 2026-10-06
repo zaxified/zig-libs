@@ -92,17 +92,12 @@
 //! the `SigsOnG1ID` scheme (`scheme.KeyGroup.PointLen()` = 96 for that
 //! scheme's `KeyGroup = G2`, `cipherVLen = cipherWLen = 16`).
 //!
-//! ## Deliberately NOT in scope here
+//! ## The envelope lives next door
 //!
-//! The outer hybrid `age`-format envelope (`filippo.io/age`'s
-//! recipient/identity stanzas, the armored `-----BEGIN AGE
-//! ENCRYPTED FILE-----` framing, the `tle` CLI's file-level API) that
-//! `drand/tlock` wraps THIS 128-byte `Ciphertext` inside of to encrypt
-//! arbitrary-length payloads. This module implements the BF-IBE
-//! primitive `tlock.go`'s `TimeLock`/`TimeUnlock` call directly (see
-//! `ciphersuite.zig`'s `block_bytes` doc comment) — a hybrid envelope
-//! on top is a natural, separable follow-up (`SPEC.md`'s "Out of
-//! scope").
+//! The outer `age`-format envelope `drand/tlock`'s `tle` wraps THIS
+//! 128-byte `Ciphertext` in (the `tlock` stanza, header MAC, STREAM
+//! payload, ASCII armor) is `age.zig`; this file stays the BF-IBE
+//! primitive `tlock.go`'s `TimeLock`/`TimeUnlock` call directly.
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
