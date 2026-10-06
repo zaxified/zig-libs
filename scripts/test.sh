@@ -1920,6 +1920,41 @@ cmd_interop() {
     # checks. `check-interop` is a compile and stays under the strict rule,
     # because a compiler that succeeds while complaining is exactly what that
     # rule exists to catch. Exit status still decides either way.
+    # ⭐ LOCAL-ONLY ORACLES (user, 2026-10-07). These programs need a peer the
+    # CI runner does not provide — a browser, a container, a network namespace
+    # with nft/ip/wg, a daemon run unconfined, a venv built by hand — and
+    # making each one CI-runnable is its own piece of work. On CI they are
+    # NOT run and are listed below as a coverage gap (the tag message names
+    # them too); on a developer machine `test.sh interop` runs them like the
+    # rest. Their transcripts are still replayed hermetically by test-<m> in
+    # every module lane. Moving one out of this list = installing its peer in
+    # scripts/lib/ci-environment.sh's interop role and seeing it green there.
+    local -A local_only=(
+        [cors]="bun + a browser"
+        [security-headers]="bun + a browser"
+        [http]="h2spec + the oracle venv (~/.local/share/zig-libs/oracle-venvs/http)"
+        [mqtt]="podman + eclipse-mosquitto:2 + paho-mqtt"
+        [nftables]="nft in an unprivileged user+net namespace"
+        [rawsock]="ip in an unprivileged user+net namespace"
+        [wireguard]="ip/wg in an unprivileged user+net namespace"
+        [pathmtu]="unshare + ip + nft + tracepath"
+        [traceroute]="unshare + traceroute"
+        [sntp]="chronyd 4 + ntplib in unshare -rn"
+        [syslog]="rsyslogd run unconfined in unshare -rn"
+        [uci]="libuci's uci binary"
+        [openapi]="the FastAPI venv"
+    )
+    if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+        local kept=() skipped=()
+        for m in "${progs[@]}"; do
+            if [[ -n "${local_only[$m]:-}" ]]; then skipped+=("$m"); else kept+=("$m"); fi
+        done
+        if (( ${#skipped[@]} )); then
+            echo "interop: ${#skipped[@]} LOCAL-ONLY oracle(s) not re-taken on CI — a coverage gap, not a pass:"
+            for m in "${skipped[@]}"; do echo "  $m: needs ${local_only[$m]}"; done
+        fi
+        progs=("${kept[@]}")
+    fi
     # Every program runs, and the failures are named together at the end: one
     # missing peer used to stop the lane at the first program (tag 2026-10-06:
     # accesslog, then acme), leaving every program after it unproven and each
@@ -1935,10 +1970,13 @@ cmd_interop() {
         # tools/pebble.sh brings Pebble up and runs `zig build interop-acme`.
         # `--check`: a live verdict, the committed transcript stays as it is.
         if [[ "$m" == acme ]]; then
-            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" modules/acme/tools/pebble.sh --check
+            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acme/tools/pebble.sh --check
             continue
         fi
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
+        # `timeout`: a program whose peer never answers must fail by name, not
+        # hold the lane until the job is cancelled (interop-mqtt, 2026-10-07:
+        # 22 minutes, and every program after it never ran).
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
     done
     checks_end
     summary
