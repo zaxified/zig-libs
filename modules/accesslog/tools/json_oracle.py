@@ -110,8 +110,16 @@ def judge(entries_path, ours_path, out_path):
     go = subprocess.run(['go', '-C', os.path.join(HERE, 'go_json'), 'run', '.'], input=lines, capture_output=True, check=True,
                         env={**os.environ, 'GOPROXY': 'off'}).stdout.decode('utf-8').split('\n')
     jq = subprocess.run(['jq', '-c', '.'], input=lines, capture_output=True, check=True).stdout.decode('utf-8').split('\n')
-    lf = subprocess.run(['go', '-C', os.path.join(HERE, 'go_logfmt'), 'run', '.'], input=b''.join(logfmt), capture_output=True,
-                        check=True, env={**os.environ, 'GOPROXY': 'off'}).stdout.decode('utf-8').split('\n')
+    # go-logfmt is a third-party module: a fresh runner (the interop lane)
+    # has it in no module cache, and GOPROXY=off made `go run` fail there
+    # ("module lookup disabled") — tag 2026-10-06. Let Go fetch it; go.sum
+    # pins its hash, so a download cannot change what is judged.
+    lf_run = subprocess.run(['go', '-C', os.path.join(HERE, 'go_logfmt'), 'run', '.'], input=b''.join(logfmt),
+                            capture_output=True)
+    if lf_run.returncode != 0:
+        sys.stderr.write(lf_run.stderr.decode('utf-8', 'replace'))
+        lf_run.check_returncode()
+    lf = lf_run.stdout.decode('utf-8').split('\n')
     jq_ver = subprocess.run(['jq', '--version'], capture_output=True, text=True).stdout.strip()
     go_ver = subprocess.run(['go', 'version'], capture_output=True, text=True).stdout.split()[2]
     bad = 0
