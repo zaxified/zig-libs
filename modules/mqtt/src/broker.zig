@@ -2169,12 +2169,47 @@ pub const Broker = struct {
             // is read as 3.1.1, to be refused as before (spec 3.1).
             const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @intFromEnum(packet.PacketType.connect);
             const version: packet.Version = if (conn.state != .awaiting_connect) conn.version else if (first_is_connect) .v5 else .v3_1_1;
-            const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| return b.fail(conn, e)) orelse return .keep;
+            const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| {
+                if (e == error.UnsupportedProtocol and first_is_connect and conn.state == .awaiting_connect) {
+                    refuseProtocolLevel(conn);
+                }
+                return b.fail(conn, e);
+            }) orelse return .keep;
             conn.rx_consumed = dec.consumed;
             conn.last_packet_ms = now;
             const disp = b.handle(conn, dec.packet, now) catch |e| return b.fail(conn, e);
             if (disp == .close) return .close;
         }
+    }
+
+    /// A CONNECT at a protocol level this broker does not speak is answered,
+    /// not dropped: 3.1.1 requires CONNACK 0x01, then close (3.1.2-2), and
+    /// 5.0 permits 0x84 (3.1.2-2 there). The level picks the dialect the
+    /// client most likely reads: above 5, a 5.0-format 0x84 -- Mosquitto's
+    /// answer, pinned by `session_replay.zig` connect_refusals; below 4, and
+    /// for an MQTT 3.1 client (`MQIsdp`), a 3.1.1-format 0x01, which 3.1
+    /// reads the same way. Any other protocol name may simply be
+    /// disconnected (3.1.2-1), and is.
+    fn refuseProtocolLevel(conn: *Connection) void {
+        const raw = conn.rx_buf[0..conn.rx_len];
+        var off: usize = 1;
+        while (off < raw.len and off < 5 and raw[off] & 0x80 != 0) off += 1;
+        off += 1; // the last remaining-length byte
+        if (raw.len < off + 2) return;
+        const name_len = std.mem.readInt(u16, raw[off..][0..2], .big);
+        off += 2;
+        if (raw.len < off + name_len + 1) return;
+        const name = raw[off..][0..name_len];
+        const level = raw[off + name_len];
+        const v: packet.Version = if (std.mem.eql(u8, name, packet.protocol_name) and level > 5)
+            .v5
+        else if ((std.mem.eql(u8, name, packet.protocol_name) and level < 4) or std.mem.eql(u8, name, "MQIsdp"))
+            .v3_1_1
+        else
+            return;
+        var cbuf: [8]u8 = undefined;
+        const bytes = connackRefusal(&cbuf, v, .unacceptable_protocol_version, .unsupported_protocol_version) catch return;
+        conn.lockedWrite(bytes) catch {};
     }
 
     /// A failed `process`: a 5.0 client is first told why with a DISCONNECT
@@ -2278,9 +2313,14 @@ pub const Broker = struct {
     fn handleConnect(b: *Broker, conn: *Connection, c: packet.Connect, now: i64) Error!Disposition {
         conn.version = c.version;
         const v5 = c.version == .v5;
-        // The codec already validated the protocol name/level and (3.1.1)
-        // rejected an empty client-id without clean session. Assign or
+        // The codec already validated the protocol name/level. A 3.1.1 empty
+        // client-id without clean session is answered, not dropped: CONNACK
+        // 0x02, then close (3.1.3-8; Mosquitto and amqtt do the same,
+        // `session_replay.zig` connect_refusals). Otherwise assign or
         // generate the id — 5.0 says which in CONNACK (3.1.3-7).
+        if (!v5 and c.client_id.len == 0 and !c.clean_session) {
+            return b.refuseConnect(conn, .identifier_rejected, .client_identifier_not_valid);
+        }
         var assigned = false;
         if (c.client_id.len == 0) {
             var idbuf: [max_client_id]u8 = undefined;
@@ -4487,6 +4527,37 @@ test "empty client-id is accepted and assigned a generated id" {
     try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
     try testing.expect((try tt.next()).? == .connack);
     try testing.expect(std.mem.startsWith(u8, conn.clientId(), "auto-"));
+}
+
+test "CONNECT refusals are answered before the close (3.1.2-2, 3.1.3-8)" {
+    // The byte-level anchor is Mosquitto (`session_replay.zig`
+    // connect_refusals); these pin the cases it does not cover: an MQTT 3.1
+    // client, which Mosquitto accepts and this broker does not, and a foreign
+    // protocol name, which may be dropped silently (3.1.2-1).
+    const cases = [_]struct { connect: []const u8, answer: []const u8 }{
+        // 3.1.1, empty id without clean session: 0x02.
+        .{ .connect = "\x10\x0c\x00\x04MQTT\x04\x00\x00\x00\x00\x00", .answer = "\x20\x02\x00\x02" },
+        // MQTT 3.1 ("MQIsdp", level 3): 0x01 in the format 3.1 reads too.
+        .{ .connect = "\x10\x0f\x00\x06MQIsdp\x03\x02\x00\x00\x00\x01x", .answer = "\x20\x02\x00\x01" },
+        // "MQTT" below 4: 0x01; above 5: 5.0's 0x84.
+        .{ .connect = "\x10\x0d\x00\x04MQTT\x02\x02\x00\x00\x00\x01x", .answer = "\x20\x02\x00\x01" },
+        .{ .connect = "\x10\x0d\x00\x04MQTT\x07\x02\x00\x00\x00\x01x", .answer = "\x20\x03\x00\x84\x00" },
+        // Not MQTT at all: closed without a word.
+        .{ .connect = "\x10\x0d\x00\x04HTTP\x04\x02\x00\x00\x00\x01x", .answer = "" },
+    };
+    for (cases) |c| {
+        var b = Broker.init(testing.allocator, .{});
+        defer b.deinit();
+        var tt = TestTransport{};
+        const conn = try b.accept(tt.transport());
+        try b.feed(conn, c.connect);
+        if (b.process(conn, 0)) |d| {
+            try testing.expectEqual(Disposition.close, d);
+        } else |_| {}
+        try testing.expectEqualSlices(u8, c.answer, tt.written[0..tt.len]);
+        try testing.expectEqual(@as(usize, 0), b.sessionCount());
+        b.remove(conn);
+    }
 }
 
 fn feedAck(b: *Broker, conn: *Connection, comptime kind: packet.PacketType, id: u16) !void {

@@ -256,7 +256,15 @@ the bytes are frozen in `src/testdata/v5_transcript.txt` and replayed by
 `src/v5_replay.zig` with no peer — our packets re-encode to what mosquitto
 accepted, and paho's recorded chunks reproduce everything paho received.
 
+**External anchor for broker sessions** (`tools/session_oracle.py`): 23 scripted
+scenarios over raw MQTT 3.1.1 (and three 5.0) sockets against Mosquitto 2.1.2 --
+offline queues, redelivery, QoS 2 dedup, retained, Wills, take-over, keep-alive,
+CONNECT refusals, violations, Session Expiry and Will Delay. Frozen in
+`src/testdata/session_transcript.txt`; `src/session_replay.zig` feeds the same
+client bytes to a `Broker` and requires the bytes Mosquitto sent, with one listed,
+spec-permitted divergence (overlapping subscriptions get one copy here).
+
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 and Version 5.0
 specifications (open, royalty-free standards); mosquitto (EPL-2.0 or EDL-1.0) and Eclipse
 Paho (EPL-2.0 or EDL-1.0) are cited as behavior design references only, no
-source was consulted or copied. DATA: `src/external_goldens.zig` holds MQTT 3.1.1 wire bytes captured once from real, independent implementations acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no mosquitto or Paho test corpus is reproduced. DATA: `src/testdata/v5_transcript.txt` holds MQTT 5.0 wire bytes exchanged live with Eclipse Mosquitto 2.1.2 and paho-mqtt 2.1.0 acting as our peers (black boxes, `tools/interop.zig`), frozen offline — observed behaviour, exempt per root `NOTICE` §0.
+source was consulted or copied. DATA: `src/external_goldens.zig` holds MQTT 3.1.1 wire bytes captured once from real, independent implementations acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no mosquitto or Paho test corpus is reproduced. DATA: `src/testdata/v5_transcript.txt` holds MQTT 5.0 wire bytes exchanged live with Eclipse Mosquitto 2.1.2 and paho-mqtt 2.1.0 acting as our peers (black boxes, `tools/interop.zig`), frozen offline — observed behaviour, exempt per root `NOTICE` §0. DATA: `src/testdata/session_transcript.txt` holds MQTT wire bytes exchanged live with Eclipse Mosquitto 2.1.2 by our own scripted clients (`tools/session_oracle.py`), frozen offline — observed behaviour, exempt per root `NOTICE` §0.

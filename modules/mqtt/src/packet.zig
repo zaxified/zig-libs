@@ -1709,8 +1709,10 @@ fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
     const keep_alive_s = try r.u16be();
     const props: Properties = if (v5) try decodeProperties(r, .connect) else .{};
     const client_id = try r.utf8String();
-    // 3.1.1 spec 3.1.3-7; 5.0 lets the server assign an id either way (3.1.3-6).
-    if (!v5 and client_id.len == 0 and !clean_session) return error.MalformedPacket;
+    // An empty id without clean session (3.1.1) is a client fault (3.1.3-7)
+    // but a well-formed packet: the SERVER answers it with CONNACK 0x02
+    // (3.1.3-8), so it must decode -- `Broker.handleConnect` refuses it. The
+    // encoder still refuses to write one (`InvalidClientId`).
 
     var will: ?Will = null;
     if (will_flag) {
@@ -1867,6 +1869,10 @@ test "CONNECT: validation" {
         error.InvalidClientId,
         encodeConnect(&buf, .{ .client_id = "", .clean_session = false }),
     );
+    // ...but a server must read one, to answer it with CONNACK 0x02 (3.1.3-8).
+    const empty_persistent = (try decode("\x10\x0c\x00\x04MQTT\x04\x00\x00\x00\x00\x00")).?.packet.connect;
+    try testing.expectEqualStrings("", empty_persistent.client_id);
+    try testing.expect(!empty_persistent.clean_session);
     try testing.expectError(
         error.InvalidUtf8,
         encodeConnect(&buf, .{ .client_id = &.{ 0xFF, 0xFE } }),

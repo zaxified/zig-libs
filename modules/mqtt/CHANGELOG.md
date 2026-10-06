@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Broker answers a refused CONNECT before closing (fix).** An MQTT 3.1.1 CONNECT
+  with an empty client identifier and CleanSession 0 now gets CONNACK 0x02 (3.1.3-8), and a CONNECT
+  at a protocol level this broker does not speak gets CONNACK "unacceptable protocol version" (3.1.2-2:
+  3.1.1-format 0x01 below level 4 and for MQTT 3.1's `MQIsdp`, 5.0-format 0x84 above level 5);
+  both used to be closed without a word. The codec now DECODES the empty-id, no-clean-session
+  CONNECT (it is well-formed; refusing it is the server's job) — `decode` no longer returns
+  `MalformedPacket` for it; `encodeConnect` still refuses to write one. Found by the new session
+  oracle: **Tests:** broker session state anchored to Eclipse Mosquitto 2.1.2
+  (`tools/session_oracle.py`, 23 scenarios, replayed by `src/session_replay.zig`); NanoMQ and amqtt
+  settle divergences (`--peer`). One listed divergence (overlapping subscriptions, 3.3.5).
+
 - **2026-10-05** — **Tests:** `topic.zig` anchored to a real Eclipse Mosquitto 2.1.2 broker
   (`tools/topic_oracle.py`, raw MQTT 5.0 packets; replayed by `src/topic_oracle_test.zig` with no
   broker): which filters it grants, which names it accepts, and for every valid filter × name pair
