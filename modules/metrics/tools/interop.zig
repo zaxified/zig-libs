@@ -11,7 +11,7 @@
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build interop-metrics` runs it and
 //! `zig build check-interop` compiles it. It needs `go` with the modules in
-//! its cache (GOPROXY=off -- no network); a missing one is a failure.
+//! its cache or fetches them (go.sum pins them); a missing `go` is a failure.
 //!
 //!   zig build interop-metrics              # re-take, write src/go_oracle_vectors.zig
 //!   zig build interop-metrics -- --check   # re-take, compare with the committed file
@@ -111,9 +111,11 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, scratch) catch {};
+    // Go may fetch the oracle's modules: a fresh runner (the interop lane) has
+    // none cached, and GOPROXY=off failed there ("module lookup disabled",
+    // 2026-10-07). go.sum pins every hash and Go's default -mod=readonly
+    // refuses to change it, so a download cannot change what is judged.
     var env = try init.environ.createMap(arena);
-    try env.put("GOPROXY", "off");
-    try env.put("GOFLAGS", "-mod=mod");
     const scripts_path = scratch ++ "/scripts.json";
     const ours_path = scratch ++ "/ours.json";
     const abs = struct {
