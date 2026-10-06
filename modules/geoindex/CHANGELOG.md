@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 30 of 34 killed, 4 equivalent; 8 tests added
+  (header region/root/empty-index edges, `Nodes.at` at `count` and one byte
+  short, reserved flag bits, exact bbox budget, `StackOverflow`, empty `out`,
+  kNN budget). No code change.
 - **2026-09-07** — **Tests:** both fuzz harnesses were dead, the mutation one
   twice. `fuzzRandom` filled a buffer with `smith.bytes` and then drew the
   length with `valueRangeAtMost(u16, 0, buf.len)`; a ranged `Smith` draw reads

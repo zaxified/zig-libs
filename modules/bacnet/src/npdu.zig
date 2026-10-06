@@ -627,6 +627,8 @@ test "control bits promising fields the buffer does not contain" {
     // Reserved bits 6 and 4.
     try testing.expectError(error.InvalidControl, decode(&.{ 0x01, 0x40, 0x10 }));
     try testing.expectError(error.InvalidControl, decode(&.{ 0x01, 0x10, 0x10 }));
+    // DLEN 2 announced, exactly one octet left.
+    try testing.expectError(error.Truncated, decode(&.{ 0x01, 0x20, 0x04, 0xD2, 0x02, 0x0A }));
     // An address length beyond the 7-octet ceiling.
     try testing.expectError(error.InvalidControl, decode(&.{ 0x01, 0x20, 0x00, 0x01, 0x08 }));
 }
@@ -705,6 +707,9 @@ test "Reject-Message-To-Network" {
         &out,
     ));
     try testing.expectError(error.Truncated, decode(&.{ 0x01, 0x80, 0x03, 0x01, 0x04 }));
+    // ... and a trailing octet is not slack to ignore, for either message.
+    try testing.expectError(error.Truncated, decode(&.{ 0x01, 0x80, 0x03, 0x01, 0x04, 0xD2, 0x00 }));
+    try testing.expectError(error.Truncated, decode(&.{ 0x01, 0x80, 0x02, 0x04, 0xD2, 0x07, 0x00 }));
 
     // I-Could-Be-Router-To-Network.
     const icb = [_]u8{ 0x01, 0x80, 0x02, 0x04, 0xD2, 0x07 };

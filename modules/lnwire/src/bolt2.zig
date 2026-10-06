@@ -855,6 +855,15 @@ test "commitment_signed: round-trip with multiple htlc_signatures + funding_txid
     try testing.expectEqualSlices(u8, &funding_txid, decoded.extension.find(1).?);
 }
 
+test "commitment_signed: 65536 htlc_signatures is FieldTooLong, not a truncated u16 count" {
+    // Mutation run 2026-10-05: the guard's edge was unpinned.
+    const allocator = testing.allocator;
+    const sigs = try allocator.alloc(Signature, std.math.maxInt(u16) + 1);
+    defer allocator.free(sigs);
+    const msg: CommitmentSigned = .{ .channel_id = fillPattern(32, 1), .signature = fillPattern(64, 2), .htlc_signatures = sigs };
+    try testing.expectError(error.FieldTooLong, serializeCommitmentSigned(allocator, msg));
+}
+
 test "commitment_signed: round-trip with zero htlc_signatures" {
     const allocator = testing.allocator;
     const msg: CommitmentSigned = .{

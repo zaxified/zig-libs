@@ -435,6 +435,29 @@ test "hostile: Headers rejects a count with insufficient bytes behind it" {
     try testing.expectError(error.TooManyItems, decodeHeaders(allocator, w.list.items));
 }
 
+test "InventoryList: exactly MAX_INV_ENTRIES decodes; one more is refused even with every byte behind it" {
+    // Mutation run 2026-10-05: the over-cap test above has no bytes behind its
+    // count, so the remaining-bytes guard refuses it too and the cap itself was
+    // never isolated, nor was its edge.
+    const allocator = testing.allocator;
+    const zeros = try allocator.alloc(u8, (MAX_INV_ENTRIES + 1) * InvVect.WIRE_LEN);
+    defer allocator.free(zeros);
+    @memset(zeros, 0);
+    for ([_]u64{ MAX_INV_ENTRIES, MAX_INV_ENTRIES + 1 }) |count| {
+        var w: Writer = .{};
+        defer w.deinit(allocator);
+        try w.putCompactSize(allocator, count);
+        try w.putBytes(allocator, zeros[0 .. count * InvVect.WIRE_LEN]);
+        if (count > MAX_INV_ENTRIES) {
+            try testing.expectError(error.TooManyItems, decodeInventoryList(allocator, w.list.items));
+        } else {
+            var list = try decodeInventoryList(allocator, w.list.items);
+            defer list.deinit(allocator);
+            try testing.expectEqual(@as(usize, MAX_INV_ENTRIES), list.items.len);
+        }
+    }
+}
+
 /// `inv`/`getdata`/`notfound` payloads, in the format `Smith.slice` reads.
 ///
 /// Every entry is a fixed 36 octets behind one CompactSize count, so both

@@ -431,6 +431,71 @@ test "bbox: capacity and budget truncation are distinguishable" {
     try testing.expectEqual(BboxStatus.truncated_budget, r2.status);
 }
 
+test "bbox: an empty result buffer over a non-empty index is a capacity truncation, not complete" {
+    const buf = try build(&.{.{ .lat = 1, .lon = 1, .value = 7 }});
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var none: [0]Match = .{};
+    const r = try f.bbox(0, 2, 0, 2, &none, .{});
+    try testing.expectEqual(BboxStatus.truncated_capacity, r.status);
+}
+
+test "bbox: the visit budget is exact — max_visited nodes are decoded, not one more" {
+    // Five leaves under one root: a full scan decodes six records.
+    const buf = try build(&.{
+        .{ .lat = 0, .lon = 0, .value = 1 }, .{ .lat = 1, .lon = 0, .value = 2 },
+        .{ .lat = 2, .lon = 0, .value = 3 }, .{ .lat = 3, .lon = 0, .value = 4 },
+        .{ .lat = 4, .lon = 0, .value = 5 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    try testing.expectEqual(@as(u32, 6), f.header.node_count);
+    var out: [8]Match = undefined;
+    try testing.expectEqual(BboxStatus.complete, (try f.bbox(-1, 5, -1, 1, &out, .{ .max_visited = 6 })).status);
+    try testing.expectEqual(BboxStatus.truncated_budget, (try f.bbox(-1, 5, -1, 1, &out, .{ .max_visited = 5 })).status);
+}
+
+test "bbox: a node with more matching children than the DFS stack holds is StackOverflow, not an overrun" {
+    // max_stack + 1 leaves at one point, all children of a single root.
+    const leaves = max_stack + 1;
+    const buf = try testing.allocator.alloc(u8, format.header_size + (leaves + 1) * format.node_size_bytes);
+    defer testing.allocator.free(buf);
+    for (0..leaves + 1) |i| {
+        const base = format.header_size + i * format.node_size_bytes;
+        const is_root = i == leaves;
+        buf[base + format.off_flags] = if (is_root) 0 else format.leaf_bit;
+        format.writeF64(buf, base + format.off_min_lat, 0);
+        format.writeF64(buf, base + format.off_min_lon, 0);
+        format.writeF64(buf, base + format.off_max_lat, 0);
+        format.writeF64(buf, base + format.off_max_lon, 0);
+        std.mem.writeInt(u32, buf[base + format.off_data ..][0..4], 0, .little);
+        std.mem.writeInt(u16, buf[base + format.off_child_count ..][0..2], if (is_root) @intCast(leaves) else 0, .little);
+    }
+    const header = format.Header{ .flags = 0, .node_count = leaves + 1, .fanout = leaves, .item_count = leaves, .root_index = leaves };
+    header.encode(buf, buf[format.header_size..]);
+    const f = try Frozen.load(buf);
+    var out: [1]Match = undefined;
+    try testing.expectError(error.StackOverflow, f.bbox(0, 0, 0, 0, &out, .{}));
+}
+
+test "knn: the visit budget truncates" {
+    const buf = try build(&.{
+        .{ .lat = 0, .lon = 0, .value = 1 }, .{ .lat = 0, .lon = 1, .value = 2 },
+        .{ .lat = 0, .lon = 2, .value = 3 },
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var out: [3]Neighbor = undefined;
+    var scratch: [16]HeapEntry = undefined;
+    // The root expansion is the one permitted visit; nothing is emitted.
+    const r = try f.knn(0, 0, 3, &out, &scratch, .{ .max_visited = 1 });
+    try testing.expectEqual(KnnStatus.truncated_budget, r.status);
+    try testing.expectEqual(@as(usize, 0), r.items.len);
+    const full = try f.knn(0, 0, 3, &out, &scratch, .{ .max_visited = 4 });
+    try testing.expectEqual(KnnStatus.complete, full.status);
+    try testing.expectEqual(@as(usize, 3), full.items.len);
+}
+
 test "knn: ranks nearest-first and handles k > item_count" {
     const buf = try build(&.{
         .{ .lat = 0, .lon = 0, .value = 10 },

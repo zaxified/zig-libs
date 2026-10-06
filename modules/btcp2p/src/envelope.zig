@@ -451,6 +451,55 @@ test "EncodeError.CommandTooLong: a command name over 12 bytes is rejected" {
     try testing.expectError(error.CommandTooLong, encodeMessage(testing.allocator, .mainnet, "waytoolongcommandname", "x"));
 }
 
+test "boundaries: printable range edges, a 12-byte command, length exactly MAX_PAYLOAD_LENGTH" {
+    // Mutation run 2026-10-05: each edge could move by one without a test noticing.
+    const allocator = testing.allocator;
+    // 0x20 and 0x7e are printable; 0x1f and 0x7f are not (IsCommandValid).
+    for ([_]u8{ 0x1f, 0x7f }) |bad| {
+        var wire = try encodeMessage(allocator, .mainnet, "version", "");
+        defer allocator.free(wire);
+        wire[4 + 0] = bad;
+        try testing.expectError(error.InvalidCommand, decodeMessage(wire, .mainnet));
+    }
+    {
+        const wire = try encodeMessage(allocator, .mainnet, " ~", "");
+        defer allocator.free(wire);
+        const d = try decodeMessage(wire, .mainnet);
+        try testing.expectEqualStrings(" ~", d.message.commandName());
+    }
+    // A command name of exactly COMMAND_LEN bytes fills the field, no NUL at all.
+    {
+        const wire = try encodeMessage(allocator, .mainnet, "abcdefghijkl", "x");
+        defer allocator.free(wire);
+        const d = try decodeMessage(wire, .mainnet);
+        try testing.expectEqualStrings("abcdefghijkl", d.message.commandName());
+    }
+    // A declared length of exactly the cap is legal; with no payload behind it, Truncated.
+    var header: [HEADER_LEN]u8 = undefined;
+    @memcpy(header[0..4], &magic(.mainnet));
+    @memset(header[4..16], 0);
+    std.mem.writeInt(u32, header[16..20], MAX_PAYLOAD_LENGTH, .little);
+    @memset(header[20..24], 0);
+    try testing.expectError(error.Truncated, decodeMessage(&header, .mainnet));
+}
+
+test "consumed stops at the end of the first of two back-to-back messages" {
+    // Mutation run 2026-10-05: only the fuzz corpus fed two frames, and it
+    // asserts nothing about `consumed`.
+    const two = verack_wire ++ verack_wire;
+    const d = try decodeMessage(&two, .mainnet);
+    try testing.expectEqual(@as(usize, HEADER_LEN), d.consumed);
+    const second = try decodeMessage(two[d.consumed..], .mainnet);
+    try testing.expectEqualStrings("verack", second.message.commandName());
+}
+
+test "EncodeError.PayloadTooLarge: a payload over MAX_PAYLOAD_LENGTH is refused" {
+    const big = try testing.allocator.alloc(u8, MAX_PAYLOAD_LENGTH + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try testing.expectError(error.PayloadTooLarge, encodeMessage(testing.allocator, .mainnet, "tx", big));
+}
+
 // ── fuzz: decodeMessage never panics on an arbitrary byte stream ─────────
 //
 // This is the untrusted-input boundary for the entire module (see module

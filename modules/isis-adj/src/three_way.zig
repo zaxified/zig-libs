@@ -298,6 +298,21 @@ test "TLV 240 rejects bad length and bad state, never over-reads" {
     try testing.expectError(error.BadState, ThreeWayTlv.decode(&[_]u8{ 9, 0, 0, 0, 0 }));
 }
 
+test "encode refuses a buffer one octet short of every form" {
+    var buf: [15]u8 = undefined;
+    const forms = [_]ThreeWayTlv{
+        .{ .state = .down },
+        .{ .state = .down, .extended_local_circuit_id = 1 },
+        .{ .state = .up, .extended_local_circuit_id = 1, .neighbor = .{ .system_id = @splat(2) } },
+        .{ .state = .up, .extended_local_circuit_id = 1, .neighbor = .{ .system_id = @splat(2), .extended_local_circuit_id = 3 } },
+    };
+    for (forms) |f| {
+        const n = f.encodedLen();
+        try testing.expectError(error.BufferTooSmall, f.encode(buf[0 .. n - 1]));
+        try testing.expectEqual(n, (try f.encode(buf[0..n])).len);
+    }
+}
+
 test "encode rejects a neighbour block without an extended circuit id" {
     var buf: [16]u8 = undefined;
     const bad: ThreeWayTlv = .{

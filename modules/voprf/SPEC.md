@@ -6,7 +6,7 @@
 
 **Scope:** mvp — RFC 9497 as implemented by CIRCL `oprf` and facebook/voprf (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation none
+**Audit:** review 2026-07-18 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -171,6 +171,21 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
 - `finalize*` → every `Output`; direct `evaluate*` agrees with each
   blinded round trip; fresh-key e2e round trips for all three modes
 - `expandMessageXmd` standalone vs RFC 9380 Appendix K.3
+
+**Mutation run 2026-10-05** (in-place, Debug, 25 mutants over element and
+scalar decoding, `deriveKeyPair`'s retry loop, the composites, `generateProof`,
+every `verifyProof` refusal and its `t2`/`t3` equation, the finalize hash,
+`unblind`'s two refusals, the batch-length checks and the POPRF
+`InverseError`/tweaked-key guards): 21 killed. The first pass left 10; tests
+were added for a proof whose `s` is re-encoded as `s + L` (std's ladder
+multiplies it exactly as `s`, so without the canonicity check a second
+encoding of the same proof verifies), a C/D length mismatch, a non-canonical blind at
+`finalize`, and `skS == -m` / `pkS == -m*G` in POPRF. Two mutants that
+failed to compile were rewritten until they built. Equivalent: identity
+rejection in `hashToGroup` and the zero test and 256th round of
+`deriveKeyPair` (each needs a SHA-512 output that reduces to a chosen
+value), and the canonicity check on the proof's `c` (it is compared byte
+for byte with a canonical hash output, so a non-canonical `c` fails anyway).
 
 ## Left out (deliberately)
 

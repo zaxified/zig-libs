@@ -363,6 +363,7 @@ test "decode rejects a bad protocol id, ROSCTR and short buffers" {
     try testing.expectError(error.UnknownRosctr, decode(&[_]u8{ 0x32, 0x00, 0, 0, 0, 1, 0, 0, 0, 0 }));
     // An Ack-Data that stops before its error octets.
     try testing.expectError(error.ShortPdu, decode(&[_]u8{ 0x32, 0x03, 0, 0, 0, 1, 0, 0, 0, 0 }));
+    try testing.expectError(error.ShortPdu, decode(&[_]u8{ 0x32, 0x03, 0, 0, 0, 1, 0, 0, 0, 0, 0 }));
 }
 
 test "Setup communication round trip" {

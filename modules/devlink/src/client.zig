@@ -1342,6 +1342,73 @@ test "Walk.next errors out instead of looping forever on a never-DONE reply" {
     try testing.expectEqual(max_walk_messages, msgs);
 }
 
+fn appendMessage(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    msg_type: u16,
+    seq: u32,
+    pid: u32,
+    payload: []const u8,
+) !void {
+    const hdr = try codec.appendHeader(gpa, list, msg_type, 0, seq, pid);
+    try list.appendSlice(gpa, payload);
+    codec.finishHeader(list, hdr);
+}
+
+test "Walk.next skips a family message addressed to another socket or request" {
+    const gpa = testing.allocator;
+    const family_id: u16 = 0x19;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendMessage(gpa, &list, family_id, seq, pid + 1, &.{ 1, 1, 0, 0 });
+    try appendMessage(gpa, &list, family_id, seq + 1, pid, &.{ 1, 1, 0, 0 });
+    try appendMessage(gpa, &list, codec.NLMSG_DONE, seq, pid, &.{ 0, 0, 0, 0 });
+
+    var cl: MockDevlink = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    try testing.expectEqual(@as(?WalkMessage, null), try walkStep(&cl, seq, &it, &finished, &msgs));
+    try testing.expect(finished);
+}
+
+test "Walk.next turns an NLMSG_ERROR's negative errno into an error, not an ACK" {
+    const gpa = testing.allocator;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -@as(i32, @intFromEnum(linux.E.NODEV)), @import("builtin").cpu.arch.endian());
+    try appendMessage(gpa, &list, codec.NLMSG_ERROR, seq, pid, &code);
+
+    var cl: MockDevlink = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = 0x19 };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    try testing.expectError(error.NoSuchDevice, walkStep(&cl, seq, &it, &finished, &msgs));
+}
+
+test "Walk.next's ceiling counts messages inside a datagram, not only datagrams" {
+    const gpa = testing.allocator;
+    const family_id: u16 = 0x19;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendMessage(gpa, &list, family_id, seq, pid, &.{ 1, 1, 0, 0 });
+
+    var cl: MockDevlink = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    // One short of the ceiling: the datagram takes it to the ceiling, and the
+    // message inside it is one past.
+    var msgs: u32 = max_walk_messages - 1;
+    try testing.expectError(error.TooManyMessages, walkStep(&cl, seq, &it, &finished, &msgs));
+}
+
 // ── the client's encoder is the public builder ─────────────────────────────
 // The whole point of the `buildX` functions is that they are not a second copy
 // of the request assembly. Two properties hold that together, and both are

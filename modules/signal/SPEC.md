@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libsignal v0.103.1 and the Signal specifications (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation none
+**Audit:** review 2026-09-10 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -365,6 +365,22 @@ exact bytes and that nonce isn't published).
   length rejection; `KDF_CK` 0x01/0x02 constant distinctness. No numeric
   reference vector exists (see below), so this is self-consistency +
   spec-adherence — the same footing as Part 1's X3DH agreement.
+- **Mutation run 2026-10-05** (in-place, Debug, 30 mutants over the
+  ratchet's chain-key and counter advancement, skipped-key handling and
+  both DoS caps, the DH-ratchet step and root composition, `KDF_CK`, the
+  AEAD's associated data, header decoding, XEdDSA's key conversion and
+  verify refusals, the X3DH/PQXDH signature gates, codecs and KDF input,
+  and the initial-message open): 29 killed. The first pass left 9; tests
+  were added for the store holding exactly `max_skip_store` keys and
+  refusing key 2001, a message under a ratchet key with no receiving chain
+  (decrypting it under a zero chain key went unnoticed), a rewritten
+  header PN in the same chain (only the AEAD's associated data can see
+  it), XEdDSA's `s + L`, an order-2 key with a signature that satisfies the
+  equation and a 2048-try partial-`R` match, a trailing byte after an
+  initial message, a ciphertext one byte shorter than the tag, and DH4
+  reaching `SK`. One mutant that failed to compile was rewritten until it
+  built. Equivalent: dropping `verify`'s `rejectLowOrder` (std's
+  `mulDoubleBasePublic` refuses a low-order point itself).
 
 ### Test-vector honesty (Double Ratchet)
 

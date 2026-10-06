@@ -897,6 +897,60 @@ test "parseWitnessProgram: P2WPKH and P2WSH shapes" {
     _ = &p2wsh;
 }
 
+test "parseWitnessProgram: BIP141's extremes (2- and 40-octet programs, version 16) are witness programs" {
+    // Mutation run 2026-10-05: each bound could move by one unnoticed.
+    var v16_min = [_]u8{ 0x60, 0x02, 0xaa, 0xbb };
+    const wp = parseWitnessProgram(&v16_min) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 16), wp.version);
+    try testing.expectEqual(@as(usize, 2), wp.program.len);
+    var v1_max = [_]u8{ 0x51, 40 } ++ [_]u8{0xcc} ** 40;
+    try testing.expectEqual(@as(usize, 40), (parseWitnessProgram(&v1_max) orelse return error.TestUnexpectedResult).program.len);
+    try testing.expect(parseWitnessProgram(&([_]u8{ 0x51, 41 } ++ [_]u8{0xcc} ** 41)) == null);
+    _ = &v16_min;
+    _ = &v1_max;
+}
+
+test "parseMultisig refuses m > n, bytes after OP_CHECKMULTISIG, and a 17th key" {
+    // Mutation run 2026-10-05: none of the three refusals had a test.
+    const pk = [_]u8{0x02} ++ [_]u8{0xaa} ** 32;
+    const a = testing.allocator;
+    var s: std.ArrayList(u8) = .empty;
+    defer s.deinit(a);
+    // OP_3 <pk> <pk> OP_2 OP_CHECKMULTISIG: m = n + 1.
+    try s.append(a, 0x53);
+    for (0..2) |_| {
+        try s.append(a, 33);
+        try s.appendSlice(a, &pk);
+    }
+    try s.appendSlice(a, &.{ 0x52, 0xae });
+    try testing.expect(parseMultisig(s.items) == null);
+    // OP_2 <pk> <pk> OP_2 OP_CHECKMULTISIG OP_NOP: trailing opcode.
+    s.items[0] = 0x52;
+    try testing.expect(parseMultisig(s.items) != null); // control
+    try s.append(a, 0x61);
+    try testing.expect(parseMultisig(s.items) == null);
+    // OP_1 <17 keys> OP_16 OP_CHECKMULTISIG.
+    s.clearRetainingCapacity();
+    try s.append(a, 0x51);
+    for (0..17) |_| {
+        try s.append(a, 33);
+        try s.appendSlice(a, &pk);
+    }
+    try s.appendSlice(a, &.{ 0x60, 0xae });
+    try testing.expect(parseMultisig(s.items) == null);
+}
+
+test "decodeWitnessStack: an empty stack and a stack of one empty item decode" {
+    // Mutation run 2026-10-05: the count bound's edge (`>` vs `>=`) was unpinned.
+    const empty = try decodeWitnessStack(testing.allocator, &.{0x00});
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    const one = try decodeWitnessStack(testing.allocator, &.{ 0x01, 0x00 });
+    defer testing.allocator.free(one);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(@as(usize, 0), one[0].len);
+}
+
 test "appendPush: minimal-push encoding, including the empty (OP_0) dummy" {
     const allocator = testing.allocator;
     {

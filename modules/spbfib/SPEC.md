@@ -6,7 +6,7 @@
 
 **Scope:** mvp — IEEE 802.1aq / RFC 6329 SPBM FIB derivation; no open reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -189,6 +189,15 @@ is green in Debug + `-Doptimize=ReleaseFast`:
   multicast DA (L clear).
 - **Positive control** — a deliberately mis-placed construction (I-SID written
   where the SPSourceID belongs) differs from the correct DA.
+
+**Mutation run 2026-10-05** (in-place, Debug, 26 mutants over `lookup`'s
+binary search, the first-binding rule, the local/next-hop/key choices, the
+sort tie-break, the defaulted option and both group-DA directions): 25 killed
+(two `lookup` bound mutants by a deterministic hang — a lookup miss never
+terminates — caught by the 120 s lane timeout). One test added: only metric 0
+is local (a neighbour at metric 1 is forwarded). Equivalent: taking the local
+route's next-hop B-MAC from `next_hop` instead of `dest` (`isis-spf`'s self
+route has `next_hop == dest`).
 
 `zig fmt --check` clean; `zig build check-catalog` green.
 

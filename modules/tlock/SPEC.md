@@ -6,7 +6,7 @@
 
 **Scope:** mvp — drand/tlock v1.2.0 (`tle`, Go) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -187,6 +187,16 @@ interop vector proved the flag right, in an unexpected place:
   `error.FoCheckFailed`, never a garbage plaintext (four tests).
 - **`fp12Pow` law (ungated, done)**: `base^0/base^1`, exponent
   additivity, and the bilinearity cross-check `e(P,Q)^r == e(rP,Q)`.
+- **Mutation run 2026-10-05** (in-place, Debug, 16 mutants over
+  `Ciphertext.fromBytes`, the FO check, `fp12Pow`'s window and
+  constant-time lookup, `gtToDrandRepr`, and every hash's tag, DST,
+  endianness, masking and truncation): 14 killed, by the drand interop
+  vector, the FO-rejection tests, the `fp12Pow` reference and the
+  `beaconId` vector. No test added. Equivalent: the lookup's `== idx` as
+  `<= idx` (entries are merged in ascending order, so the last one taken is
+  still `table[idx]`, and every entry is still read), and dropping the wipe
+  of `message` on the FO-reject path (a stack local the caller never sees
+  once `decrypt` returns the error — hygiene, not observable by value).
 
 ## Constant-time measurement (ctgrind)
 

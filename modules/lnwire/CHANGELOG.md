@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 36 of 36 killed, 0 equivalent; 4 tests added (BigSize
+  one-octet-short edges, digest signature-block edges, `commitment_signed` 65536-signature
+  refusal, `init` keeps `remote_addr`). No code change.
+
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` already elected the MIT
   arm of `lightningdevkit/rust-lightning`'s dual licence, but the MIT text it elected was
   nowhere in the file — and MIT asks for exactly that ("this permission notice shall be

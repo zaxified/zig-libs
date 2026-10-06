@@ -174,6 +174,11 @@ test "header counts itself" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x00, 0x00, 0x17 }, &h);
 }
 
+test "header refuses a total one past the 16-bit length field" {
+    _ = try header(max_length - header_len);
+    try testing.expectError(error.PayloadTooLong, header(max_length - header_len + 1));
+}
+
 test "round trip" {
     const payload = [_]u8{ 0x02, 0xF0, 0x80, 0x32, 0x01 };
     var buf: [64]u8 = undefined;
@@ -190,6 +195,8 @@ test "decode rejects malformed headers" {
     try testing.expectError(error.ReservedNotZero, decode(&[_]u8{ 0x03, 0x01, 0x00, 0x05, 0x00 }));
     try testing.expectError(error.LengthTooSmall, decode(&[_]u8{ 0x03, 0x00, 0x00, 0x04 }));
     try testing.expectError(error.LengthTooSmall, decode(&[_]u8{ 0x03, 0x00, 0x00, 0x00 }));
+    // Length says 6 octets; 5 are present.
+    try testing.expectError(error.TruncatedPacket, decode(&[_]u8{ 0x03, 0x00, 0x00, 0x06, 0x00 }));
     // Length says 32 octets; only 5 are present.
     try testing.expectError(error.TruncatedPacket, decode(&[_]u8{ 0x03, 0x00, 0x00, 0x20, 0x00 }));
 }
@@ -274,6 +281,16 @@ test "framer refuses a packet larger than its storage instead of blocking foreve
     var f = Framer.init(&storage);
     try f.feed(&[_]u8{ 0x03, 0x00, 0x10, 0x00 }); // announces 4096
     try testing.expectError(error.PayloadTooLong, f.next());
+}
+
+test "framer refuses a feed its storage cannot hold, and waits for a packet one octet short" {
+    var storage: [8]u8 = undefined;
+    var f = Framer.init(&storage);
+    try testing.expectError(error.Overflow, f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x09, 1, 2, 3, 4, 5 }));
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0 });
+    try testing.expect((try f.next()) == null);
+    try f.feed(&[_]u8{0x80});
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0xF0, 0x80 }, (try f.next()).?.payload);
 }
 
 test "framer surfaces a bad version rather than resynchronising" {

@@ -120,6 +120,9 @@ test "write/read round-trip across every size class" {
 test "read rejects non-canonical (non-minimal) encodings" {
     // 0xfd-prefixed but value < 0xfd: value 5 does not need 3 bytes.
     try std.testing.expectError(error.NonCanonical, read(&.{ 0xfd, 0x00, 0x05 }));
+    // The 3-octet form's edge: 0xfc must use the 1-octet form; 0xfd is canonical.
+    try std.testing.expectError(error.NonCanonical, read(&.{ 0xfd, 0x00, 0xfc }));
+    try std.testing.expectEqual(@as(u64, 0xfd), (try read(&.{ 0xfd, 0x00, 0xfd })).value);
     // 0xfe-prefixed but value <= 0xffff.
     try std.testing.expectError(error.NonCanonical, read(&.{ 0xfe, 0x00, 0x00, 0xff, 0xff }));
     // 0xff-prefixed but value <= 0xffffffff.

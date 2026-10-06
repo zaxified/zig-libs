@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 56 of 58 killed, 2 equivalent; 12 tests added (map-value
+  length edges, global `XPUB` shape, witness-program and multisig recognisers, empty witness
+  stacks, sighash-type filtering in single-key and multisig paths, `SINGLE|ANYONECANPAY` and
+  multisig SINGLE-bug refusals, out-of-range `NON_WITNESS_UTXO` prevout, v1 20-octet program).
+  No code change.
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 findings F4 and F7. `finalize` now refuses to assemble a
   legacy input from a SIGHASH_SINGLE signature with no output at the input's index — it signs
   the constant `uint256(1)` and is replayable wherever the bug recurs under the same key — with

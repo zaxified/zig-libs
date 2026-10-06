@@ -6,7 +6,7 @@
 
 **Scope:** mvp — IEEE 802.1aq-2012 SPBM multicast trees (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -149,6 +149,12 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 - **Degenerate cases** — source not in graph, no members, single member == source,
   isolated source, unreachable member.
 - A `testing.allocator` run leak-checks that `deinit` frees `nodes` + `backing`.
+- **Mutation run 2026-10-05** (in-place, Debug, 24 mutants over the
+  accessors' bounds, `rpfCheck`, `deliversLocally`, the source-range guard,
+  membership marking, the count/fill loops, `included` and the defaulted
+  options): 24 killed. The first pass left 4; one test added (source id ==
+  `node_count`, `deliversLocally` of a reachable non-member, `prune = false`
+  past an unreachable node). Equivalent: none.
 
 `zig fmt --check` clean; `zig build check-catalog` green.
 

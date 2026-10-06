@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 24 of 24 killed, 0 equivalent; 1 test added
+  (MAP's mod-p reduction of an input `>= p`, which no RFC 9496 B.3 vector
+  reaches). No code change.
+
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
   changed. `src/kat_vectors.zig` reproduces RFC 9496 Appendix B's test vectors, which the
   module's `Provenance:` statement never mentioned — it answers for the code. The record

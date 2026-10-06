@@ -916,6 +916,50 @@ test "deserializeScalar enforces canonicity" {
     _ = try deserializeScalar([_]u8{0} ** 32); // zero is canonical (validity is contextual)
 }
 
+/// `s + L` as 32 little-endian bytes: the same scalar to the group, a
+/// different (non-canonical) encoding on the wire.
+fn plusOrder(s: [Ns]u8) [Ns]u8 {
+    var out: [Ns]u8 = undefined;
+    std.mem.writeInt(u256, &out, std.mem.readInt(u256, &s, .little) + scalar.field_order, .little);
+    return out;
+}
+
+test "verifyProof refuses s + L (malleability) and a C/D length mismatch" {
+    const kp = try deriveKeyPair(.voprf, [_]u8{0x2b} ** 32, "verifyProof refusals");
+    const blinded = try blind(.voprf, "input", scalarFromWideBytes([_]u8{0x22} ** 64));
+    const ev = try blindEvaluateVerifiable(kp.sk, kp.pk, blinded, scalarFromWideBytes([_]u8{0x33} ** 64));
+    try verifyProof(.voprf, Element.generator, kp.pk, &.{blinded}, &.{ev.evaluated_element}, ev.proof);
+
+    // `s + L` multiplies every point exactly as `s` does, so only the
+    // canonicity check stands between it and a second valid encoding.
+    const forged: Proof = .{ .c = ev.proof.c, .s = plusOrder(ev.proof.s) };
+    try std.testing.expectError(error.InvalidProof, verifyProof(.voprf, Element.generator, kp.pk, &.{blinded}, &.{ev.evaluated_element}, forged));
+
+    const two = [_]Element{ ev.evaluated_element, ev.evaluated_element };
+    try std.testing.expectError(error.InvalidProof, verifyProof(.voprf, Element.generator, kp.pk, &.{blinded}, &two, ev.proof));
+}
+
+test "finalize refuses a non-canonical blind (blind + L)" {
+    const kp = try deriveKeyPair(.oprf, [_]u8{0x7e} ** 32, "non-canonical blind");
+    const b = scalarFromWideBytes([_]u8{0x11} ** 64);
+    const evaluated = blindEvaluate(kp.sk, try blind(.oprf, "input", b));
+    _ = try finalize("input", b, evaluated);
+    try std.testing.expectError(error.InvalidBlind, finalize("input", plusOrder(b), evaluated));
+}
+
+test "POPRF: skS == -m is InverseError, and pkS == -m*G is a refused tweaked key" {
+    const info = "inverse";
+    const sk = scalar.neg(poprfInfoScalar(info));
+    const b = scalarFromWideBytes([_]u8{0x44} ** 64);
+    const blinded = try blind(.poprf, "input", b);
+    var out: [1]Element = undefined;
+    try std.testing.expectError(error.InverseError, blindEvaluatePoprfBatch(sk, &.{blinded}, info, &out, b));
+    try std.testing.expectError(error.InverseError, evaluatePoprf(sk, "input", info));
+
+    const pk: Element = .{ .p = ct25519.mulRistrettoBase(sk) };
+    try std.testing.expectError(error.InvalidInput, blindPoprf("input", info, pk, b));
+}
+
 // ── fuzz: Element.fromBytes / Proof.fromBytes never panic ─────────────────
 //
 // Both are wire-decode entry points for values a peer sends over the OPRF/

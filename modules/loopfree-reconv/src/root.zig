@@ -142,6 +142,13 @@ test "shrink: netsim's own fuzzer finds a naive-ordering loop across seeds; mini
     defer failing.deinit();
     try testing.expectEqual(error.ForwardingLoop, failing.err);
 
+    // `end` is inclusive: a window whose last seed is the failing one finds it.
+    const s = failing.case.seed;
+    try testing.expect(s > 1);
+    var again = (try findFailing(gpa, &f, template, fault_cfg, s - 1, s)) orelse return error.EndSeedNotTried;
+    defer again.deinit();
+    try testing.expectEqual(s, again.case.seed);
+
     var res = try shrink(gpa, &f, &failing);
     defer res.deinit();
     try testing.expect(res.after >= 1);

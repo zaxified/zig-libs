@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Flatbush 4.6.2 + geoflatbush 2.2.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none
+**Audit:** review 2026-08-06 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -245,6 +245,20 @@ authenticity matters.
   rejected as `error.Corrupt`, not looped — proving the checkers have teeth.
 - **Round-trip:** in-memory answers == answers after build → freeze → load; freeze
   is deterministic (byte-identical on refreeze).
+- **Mutation run 2026-10-05** (in-place, Debug, 34 mutants over the header
+  loader's refusals, `Nodes.at`/`child` bounds, the bbox/kNN budgets, stack and
+  capacity paths, the box predicates, heap order and the builder's input
+  checks): 30 killed. The first pass left 14; eight tests were added (region
+  one record short, `root_index == node_count`, an empty index claiming nodes,
+  `at(count)` over a padded buffer, a record one byte past the buffer, reserved
+  flag bits, the exact bbox budget edge, a 4097-child node hitting
+  `StackOverflow`, bbox into an empty `out`, the kNN budget). Four are
+  equivalent: `axisGap` returning 0 above the box (still a lower bound — more
+  work, same answers), a wrapping `node.data + c` (child 0 is checked against
+  the parent first, so any wrap is already `Corrupt`), the builder's value
+  tie-break reversed (another deterministic layout, same answers), and
+  `gridCoord` on a zero-width axis computing 0/0 (`@intFromFloat(NaN)` gives
+  cell 0 here unchecked; illegal behaviour no test can observe).
 - Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
   `zig build check-catalog` exit 0.
 

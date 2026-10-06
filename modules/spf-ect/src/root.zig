@@ -1261,3 +1261,83 @@ test "ensureNode: a sparse id is rejected instead of allocating the range it imp
     // The cap itself, pinned: a change to it is a deliberate edit here.
     try testing.expectEqual(@as(u32, 1 << 20), Graph.max_nodes);
 }
+
+test "addEdge: a failing second arc rolls the first one back (atomic)" {
+    var g = Graph.init(testing.allocator);
+    defer g.deinit();
+    // 1→0 exists alone, so `addEdge(0, 1)` adds 0→1 and then hits the
+    // duplicate on 1→0: the half-added 0→1 must be removed again.
+    try g.addArc(1, 0, 5);
+    try testing.expectError(error.DuplicateEdge, g.addEdge(0, 1, 3));
+    try testing.expectEqual(@as(usize, 0), g.neighbors(0).len);
+    try testing.expectEqualSlices(Edge, &.{.{ .to = 0, .weight = 5 }}, g.neighbors(1));
+}
+
+test "comparePaths: the edge key decides where the node key ties, ahead of forward order" {
+    // Same node set, same endpoints, different edges. Key 2 (sorted
+    // undirected edges {02,13,23} vs {03,12,23}) puts `a` first; plain
+    // forward order (key 3) would put `b` first. Reversal-invariant too.
+    const a = [_]NodeId{ 1, 3, 2, 0 };
+    const b = [_]NodeId{ 1, 2, 3, 0 };
+    const ra = [_]NodeId{ 0, 2, 3, 1 };
+    const rb = [_]NodeId{ 0, 3, 2, 1 };
+    try testing.expectEqual(Order.lt, comparePaths(&a, &b));
+    try testing.expectEqual(Order.lt, comparePaths(&ra, &rb));
+    // Key 3 is plain FORWARD order, as documented — reached only when both
+    // multisets tie, e.g. a sequence and its reverse.
+    try testing.expectEqual(Order.lt, comparePaths(&.{ 1, 2 }, &.{ 2, 1 }));
+}
+
+test "comparePaths and the hot-path comparePathsAlloc agree on arbitrary sequences" {
+    // The doc promises the same result from both; this pins the streaming
+    // cursor (duplicates, exhaustion) against the sort-based one, over
+    // non-simple sequences, prefixes, and the hand-picked cases above.
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const fixed = [_][2][]const NodeId{
+        .{ &.{ 1, 1, 2 }, &.{ 1, 2, 3 } },
+        .{ &.{ 0, 1 }, &.{ 0, 1, 2 } },
+        .{ &.{ 0, 1, 2 }, &.{ 0, 1 } },
+        .{ &.{ 1, 3, 2, 0 }, &.{ 1, 2, 3, 0 } },
+        .{ &.{ 1, 2 }, &.{ 2, 1 } },
+    };
+    for (fixed) |pair| {
+        try testing.expectEqual(comparePaths(pair[0], pair[1]), try comparePathsAlloc(arena.allocator(), pair[0], pair[1]));
+    }
+    // Exhaustion pads with +inf; duplicates count.
+    try testing.expectEqual(Order.lt, comparePaths(&.{ 1, 1, 2 }, &.{ 1, 2, 3 }));
+    try testing.expectEqual(Order.gt, comparePaths(&.{ 0, 1 }, &.{ 0, 1, 2 }));
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_5EED);
+    const rand = prng.random();
+    var pa: [7]NodeId = undefined;
+    var pb: [7]NodeId = undefined;
+    for (0..500) |_| {
+        const la = 1 + rand.uintLessThan(usize, pa.len);
+        const lb = 1 + rand.uintLessThan(usize, pb.len);
+        for (pa[0..la]) |*x| x.* = rand.uintLessThan(NodeId, 4);
+        for (pb[0..lb]) |*x| x.* = rand.uintLessThan(NodeId, 4);
+        _ = arena.reset(.retain_capacity);
+        try testing.expectEqual(comparePaths(pa[0..la], pb[0..lb]), try comparePathsAlloc(arena.allocator(), pa[0..la], pb[0..lb]));
+    }
+}
+
+test "comparePathsDisjoint: fewer primary-tree edges wins over the plain order" {
+    const gpa = testing.allocator;
+    var g = Graph.init(gpa);
+    defer g.deinit();
+    try g.addEdge(0, 1, 1);
+    try g.addEdge(1, 3, 1);
+    try g.addEdge(0, 2, 1);
+    try g.addEdge(2, 3, 1);
+    var primary = try shortestPathTree(gpa, &g, 0);
+    defer primary.deinit();
+    // Primary reaches 3 via 1 (node key {0,1,3} < {0,2,3}).
+    try testing.expectEqual(@as(?NodeId, 1), primary.pred[3]);
+    const via1 = [_]NodeId{ 0, 1, 3 }; // both edges in the primary tree
+    const via2 = [_]NodeId{ 0, 2, 3 }; // one edge in the primary tree
+    try testing.expectEqual(Order.lt, comparePaths(&via1, &via2));
+    try testing.expectEqual(Order.gt, comparePathsDisjoint(&primary, &via1, &via2));
+    try testing.expectEqual(Order.lt, comparePathsDisjoint(&primary, &via2, &via1));
+}

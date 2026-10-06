@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 28 of 28 killed, 0 equivalent; 5 tests added
+  (identity and out-of-subgroup points in every decoded slot, `proofGen`/
+  `proofVerify` index and count edges, a duplicate index, a proof over a forged
+  signature that only the pairing check refuses, `keyGen` length edges). No
+  code change.
 - **2026-10-03** — `PublicKey`/`Signature`/`Proof.fromBytes` rely on `bls12_381`'s checked
   decoders for the subgroup check (errors unchanged); one check per point instead of two.
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 47 / proofgen 134**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. Neither `SPEC.md` nor `README.md` makes a constant-time claim, so this is a first measurement, not evidence for a sentence — stated rather than filled by inventing one. ⭐ Attributing each context to its topmost pattern-matching frame, **zero of the 181 have their leaf inside `bbs.zig`/`ciphersuite.zig`/`keys.zig`** — this module's code only ever appears as a caller. Every real branch is in `bls12_381`'s `scalar.zig`/`fp.zig` or `std.crypto.ff`, all disassembled as real `je`/`jne` rather than assumed. This is where `bls12_381`'s `ctSelect` was first disassembled to `bt`/`jae` — see that module's entry. `proofgen` taints the undisclosed messages, which is the property selective disclosure exists to protect.

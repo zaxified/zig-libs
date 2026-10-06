@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 21 of 25 killed, 4 equivalent; 3 tests added
+  (`verifyProof` refuses `s + L` and a C/D length mismatch, `finalize` refuses
+  a non-canonical blind, POPRF `InverseError` and the identity tweaked key).
+  No code change.
+
 - **2026-09-07** — Test-only, no production change: `fuzzElementFromBytes` had never
   executed its own byte draw. The mode selector `smith.valueRangeAtMost(u8, 0, 2)` came
   BEFORE `smith.bytes(&buf)`, and a ranged `Smith` draw returns the range MINIMUM unless a

@@ -923,6 +923,8 @@ test "an option's header length may not overrun the frame" {
     var buf: [16]u8 = undefined;
     // Marker 0x3f says "header data follows"; the declared length is 0x00ff.
     try testing.expectError(error.Truncated, decode(hex("0102000a3f00ff0102", &buf)));
+    // Declared length 2 with one data octet present: one short.
+    try testing.expectError(error.Truncated, decode(hex("0102000a3f000201", &buf)));
     // ... and the two length octets themselves must be present.
     try testing.expectError(error.Truncated, decode(hex("0102000a3f00", &buf)));
 }
@@ -1009,6 +1011,17 @@ test "more than max_options in one list is refused" {
     frame[3] = 1;
     // max_options + 1 markers all saying "more", then a terminator.
     for (frame[4..][0 .. max_options + 1]) |*b| b.* = option_flags.more | 1;
+    frame[frame.len - 1] = 1;
+    try testing.expectError(error.TooManyOptions, decode(&frame));
+}
+
+test "max_options + 1 options is already too many" {
+    var frame: [4 + max_options + 1]u8 = undefined;
+    frame[0] = 0x01;
+    frame[1] = 0x02;
+    frame[2] = 0;
+    frame[3] = 1;
+    for (frame[4..][0..max_options]) |*b| b.* = option_flags.more | 1;
     frame[frame.len - 1] = 1;
     try testing.expectError(error.TooManyOptions, decode(&frame));
 }

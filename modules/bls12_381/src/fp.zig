@@ -661,6 +661,12 @@ test "Fp.fromBytes rejects p itself (non-canonical) and accepts p-1" {
     _ = try Fp.fromBytes(p_minus_1); // must not error
 }
 
+test "Fp.fromInt rejects p itself and accepts p-1" {
+    try std.testing.expectError(error.Overflow, Fp.fromInt(u384, p_int));
+    const pm1 = try Fp.fromInt(u384, p_int - 1);
+    try std.testing.expect(pm1.add(Fp.one).isZero());
+}
+
 test "Fp.fromInt(4) matches the b=4 curve-constant byte pattern" {
     const four = try Fp.fromInt(u8, 4);
     var expected = [_]u8{0} ** 48;

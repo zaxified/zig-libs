@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 29 of 30 killed, 1 equivalent; 5 tests added
+  and 2 extended (skipped-key store at exactly its cap, no receiving chain is
+  `MessageKeyNotAvailable`, a rewritten header PN fails the AEAD, XEdDSA
+  refuses `s + L`, an order-2 key and a partial `R` match, InitialMessage
+  trailing bytes, a sub-tag initial ciphertext, DH4 mixed into `SK`). No code
+  change.
+
 - **2026-09-13** — **BREAKING** (API and wire): A1 finding F6. X3DH and PQXDH now perform
   the spec's initial-message step. `initiate`/`initiateUnverified` take `initial_plaintext`
   (was an opaque `initial_ciphertext`) and send it sealed with ChaCha20-Poly1305 under

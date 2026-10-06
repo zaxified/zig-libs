@@ -231,6 +231,10 @@ pub fn Ntt(comptime N: usize) type {
 
 const testing = std.testing;
 
+test "init refuses a composite modulus even when 2N divides q - 1" {
+    try testing.expectError(error.NotPrime, Ntt(8).init(33)); // 33 = 3·11, 16 | 32
+}
+
 test "forward → inverse is the identity" {
     const T = Ntt(8);
     const engine = try T.init(97);

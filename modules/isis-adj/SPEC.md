@@ -6,7 +6,7 @@
 
 **Scope:** mvp — holo-isis adjacency layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation none
+**Audit:** review 2026-09-07 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -315,6 +315,20 @@ for it here.
   `holding_time`; the hold expires at Initializing; a missing or malformed
   Area Addresses TLV on an enforced L1 circuit is a mismatch; a TLV lying about
   its length behind the 240 fails the PDU.
+- **Mutation run 2026-10-05** (in-place, Debug, 44 mutants over the TLV 240
+  codec's length and state checks, `start`/`stop`/`tick`, every `rxHello`
+  refusal path, the three-way decision, `applyState` and the defaulted
+  options): 40 killed. The first pass left 8; four tests added (`encode`
+  refuses a buffer one octet short of every form; `tick` does nothing before
+  `start` or after `stop` and makes no Down→Down transition while hunting; a
+  shared area in the THIRD wire Area Addresses TLV; area matching skipped on
+  L2 and L1/L2 circuits). Equivalent: dropping `tlv.count` (the Area
+  Addresses walk right after it iterates the whole stream with `try` and
+  fails the same PDU with the same error), the circuit-id-change check's
+  `state != .down` and its `hold_deadline = 0` (every way into Down clears
+  the recorded neighbour, and a Down hold is never consulted), and the echo's
+  extended-circuit-id equality (a block naming another id was already
+  discarded as `neighbor_mismatch`).
 
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` test suite unaffected.

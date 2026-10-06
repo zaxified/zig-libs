@@ -6,7 +6,7 @@
 
 **Scope:** mvp — IEEE 802.1aq ECT tie-break; petgraph / gonum for the general Dijkstra layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -115,8 +115,8 @@ of the topology, not of the comparator.
 ## Verify
 
 ```
-zig build test-spf-ect                          # Debug       — 13 pass
-zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 13 pass
+zig build test-spf-ect                          # Debug       — 18 pass
+zig build test-spf-ect -Doptimize=ReleaseFast   # ReleaseFast — 18 pass
 ```
 
 The property harness is the real check: reversal symmetry, strict-total-order
@@ -124,6 +124,21 @@ laws on the comparator, an exhaustive brute-force cross-check on every graph up
 to 7 nodes, and second-tree validity plus disjointness. A comparator that is
 merely *consistent* would pass a round-trip test; only the total-order laws and
 the brute-force oracle pin it.
+
+**Mutation run 2026-10-05** (in-place, Debug, 33 mutants over the graph
+builder's refusals and atomicity, `pathTo`, all three comparator keys in both
+the streaming and the sort-based form, the multiset cursor, the disjointness
+key and Dijkstra's relax/tie step): 29 killed (one, a cursor that never
+advances, by a deterministic hang caught by the lane timeout). The first pass
+left 10; four tests added: `addEdge` rolls back its first arc when the second
+fails; the edge key decides a node-key tie ahead of forward order (and key 3
+is forward order); `comparePaths` and `comparePathsAlloc` agree on arbitrary
+sequences (duplicates, prefixes); `comparePathsDisjoint` ranks by primary
+overlap first. Equivalent: key 3 of the hot-path comparator (Dijkstra's two
+candidates always differ in key 1 or 2), dropping the stale-heap-entry skip
+(a settled node re-relaxes to the same predecessors), dropping `e.to != root`
+(the root's predecessor is `null`, which the next clause tests), and adopting
+on `.eq` (`.eq` only for the identical path, i.e. the same predecessor).
 
 Provenance: clean-room from the public IEEE 802.1aq / RFC 6329 description of
 ECT — no third-party source ported or studied, so no `NOTICE` entry is required

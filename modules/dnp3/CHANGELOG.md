@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 28 of 38 killed, 1 equivalent; 3 tests added
+  and 6 existing tests extended (second start octet, continuation after FIN,
+  the top bit of a MAC octet, session keys of the wrong unwrapped length, the
+  g120 qualifier, read/freeze ranges one past the end, `update` one past the
+  database, a SELECT of exactly `max_select_bytes`). 37 of 38 killed after.
+  No library code changed.
 - **2026-09-07** — Fuzz reach: all three harnesses ran on one fixed input. `link.fuzzDecodeFrame`
   opened with `smith.bytes(&frame)` followed by `smith.valueRangeAtMost(u16, 0, frame.len)`; a
   ranged draw reads eight octets as a little-endian u64 and returns the range MINIMUM when

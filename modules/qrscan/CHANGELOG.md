@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 26 of 33 killed, 6 equivalent, 1 left without a
+  test (the ring test's exhausted-label clause); 10 tests added (exact dimension
+  gates with a real buffer, scratch one byte short, `min_contrast` and threshold
+  edges, anisotropic finder, non-square triple, `insideImage` edge, alignment
+  light-band bound, label exhaustion, `solve8` pivoting, `readable` on a long
+  message). No code change.
 - **2026-09-07** — Fuzz reach: an earlier audit fix to `fuzzScan` was correct and bought
   nothing. That fix reordered the harness so the geometry is drawn BEFORE the 16 384
   pixels — with a measurement in its own comment (`w=1 h=1 stride=1 px[0]=0` beforehand) —

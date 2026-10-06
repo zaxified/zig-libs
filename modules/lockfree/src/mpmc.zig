@@ -309,3 +309,52 @@ test "init builds a non-empty (dummy-sentinel) queue; deinit drains it" {
     // The dummy went back to the pool and is intact-poisoned there.
     try np.verifyQuiescent();
 }
+
+/// Link a node after the current last one WITHOUT swinging `tail`: the state
+/// an enqueuer leaves between its link CAS and its tail swing.
+fn linkLagging(q: *MpmcQueue, value: u64) !void {
+    const node = try q.node_pool.acquire();
+    node.* = .{ .value = value, .next = .init(null) };
+    var last = q.tail.load(.monotonic);
+    while (last.next.load(.monotonic)) |n| last = n;
+    last.next.store(node, .monotonic);
+}
+
+test "dequeue over a lagging tail helps it forward, so tail never falls behind head" {
+    var d = try ebr.Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer d.deinit();
+    var np = Pool.init(testing.allocator);
+    defer np.deinit();
+    var q = try MpmcQueue.init(&np, &d);
+    const p = try d.register();
+
+    try linkLagging(&q, 7);
+    try testing.expectEqual(@as(?u64, 7), q.dequeue(p));
+    // The old dummy is retired; a tail still pointing at it would hand it to
+    // the next enqueuer.
+    try testing.expectEqual(q.head.load(.monotonic), q.tail.load(.monotonic));
+    try testing.expectEqual(@as(?u64, null), q.dequeue(p));
+
+    d.unregister(p);
+    q.deinit();
+    try np.verifyQuiescent();
+}
+
+test "enqueue over a lagging tail helps it forward and links after the true last node" {
+    var d = try ebr.Domain.init(testing.allocator, .{ .max_participants = 1 });
+    defer d.deinit();
+    var np = Pool.init(testing.allocator);
+    defer np.deinit();
+    var q = try MpmcQueue.init(&np, &d);
+    const p = try d.register();
+
+    try linkLagging(&q, 7);
+    try q.enqueue(p, 8);
+    try testing.expectEqual(@as(?u64, 7), q.dequeue(p));
+    try testing.expectEqual(@as(?u64, 8), q.dequeue(p));
+    try testing.expectEqual(@as(?u64, null), q.dequeue(p));
+
+    d.unregister(p);
+    q.deinit();
+    try np.verifyQuiescent();
+}

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 39 of 43 killed, 4 equivalent; 8 tests added
+  and 1 extended (infinity encodings of `G1`/`G2`, on-curve refusal of the
+  uncompressed decoders, `eqlPoints` on the identity, `Fp.fromInt(p)`,
+  identity key + identity proof in `popVerify`, a Python-recomputed KeyGen
+  vector, trailing bytes after a verification vector). No code change.
 - **2026-10-03** — **BREAKING (behaviour): the point decoders check subgroup
   membership.** `g1`/`g2` `fromBytesCompressed`/`fromBytesUncompressed` now
   return `error.NotInSubgroup` for an on-curve point outside `G1`/`G2`; the

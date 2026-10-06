@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Snap7 1.4.2; no PLC clock, block list or password, which Snap7 users call routinely (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation none
+**Audit:** review 2026-09-17 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -293,6 +293,22 @@ marker, a bad specification length, a **length that contradicts its transport si
 length that runs past its block and a truncated item header; a **read reply whose per-item return
 code is an error while data is present** (the data must not be handed back), a mismatched PDU
 reference, and a PLC-level error class; plus roughly thirty malformed address strings.
+
+**Mutation run 2026-10-05** (in-place, Debug, 43 mutants over the TPKT codec
+and framer, COTP decode/encode, the S7 header and Setup, item address and
+data-length checks, the responder's area lookup and read/write bounds, the
+S7CommPlus frame trailer/integrity checks and the VLQ decoders): 25 killed.
+Seventeen survivors were missing tests, now added — almost all of them the
+exact one-past boundary of a check whose gross violation was already tested:
+a TPKT total of 65536, a length one octet past the buffer, a framer feed past
+its storage and a packet one octet short, a COTP parameter and an `LI` one
+octet long, an 11-octet Ack-Data, an element address of 2^24, an item one
+octet short, `decodeLength(.bit, 9)`, a write one octet past the area, a
+write shorter than its item and a bit write past the area, an S7CommPlus V3
+frame with an empty integrity part and a connect frame with a trailing octet,
+a sixth VLQ octet completing a small value, and −129 for an `i8`. 42 of 43
+killed after. Equivalent: `li > 254` → `li > 255` in `encodeConnect` (its
+variable part is at most 3 + 4 + 4 octets, so `li` never exceeds 17).
 
 ## S7CommPlus
 

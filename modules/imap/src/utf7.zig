@@ -304,6 +304,8 @@ test "tier 2 (go-imap table): every rejection" {
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+    // A high surrogate followed by a code unit that is not a low one (D800 E000).
+    try testing.expectError(error.InvalidUtf7, decodeAlloc(gpa, "&2ADgAA-"));
 }
 
 test "a base64 run may not encode what could be written directly" {

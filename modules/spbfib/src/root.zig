@@ -395,6 +395,25 @@ test "golden line A-B-C: exact dest-B-MAC FIB incl. a multi-hop next hop" {
     try testing.expect(!c_entry.local);
 }
 
+test "only metric 0 is local: a neighbour at the minimum metric 1 is forwarded" {
+    const gpa = testing.allocator;
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var table = try makeTable(gpa, &.{
+        .{ .dest = a, .next_hop = a, .metric = 0 },
+        .{ .dest = b, .next_hop = b, .metric = 1 },
+    });
+    defer table.deinit();
+    const map = [_]BmacEntry{
+        .{ .system_id = a, .b_mac = bmac(0xA) },
+        .{ .system_id = b, .b_mac = bmac(0xB) },
+    };
+    var fib = try build(gpa, &table, &map);
+    defer fib.deinit();
+    try testing.expect(fib.lookup(bmac(0xA)).?.local);
+    try testing.expect(!fib.lookup(bmac(0xB)).?.local);
+}
+
 test "unknown destination B-MAC is skipped (not a crash)" {
     const gpa = testing.allocator;
     const a = sysId(0xA);

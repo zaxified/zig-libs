@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 40 of 44 killed, 4 equivalent; 4 tests added (`encode`
+  buffer one octet short; `tick` before `start`/after `stop` and while hunting; shared
+  area in the third Area Addresses TLV; area check only on L1 circuits). No code change.
 - **2026-09-13** — **BREAKING:** A1 findings F5, F7, F12, F13, F14 (round-2 decision:
   safe default plus a switch). New `RejectReason.holding_time_too_short` and
   `DownReason.circuit_id_changed` break an exhaustive `switch`; no in-repo consumer.

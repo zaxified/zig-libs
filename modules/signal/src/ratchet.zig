@@ -915,6 +915,60 @@ test "MAX_SKIP: a header claiming a huge N is rejected without OOM" {
     try testing.expectEqual(@as(u32, 1), bob.nr);
 }
 
+/// Encrypt `count` messages from `sender` and return only the last one.
+fn sendMany(sender: *State, count: usize) !Message {
+    const alloc = testing.allocator;
+    for (0..count - 1) |_| (try sender.encrypt(alloc, "x")).deinit(alloc);
+    return sender.encrypt(alloc, "x");
+}
+
+test "MAX_SKIP: the skipped-key store holds exactly max_skip_store keys, not one more" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+
+    // Two chains, each delivering only message n = max_skip: 2 * 1000 keys
+    // stored, which is exactly the cap.
+    for (0..2) |_| {
+        const last = try sendMany(&alice, max_skip + 1);
+        defer last.deinit(alloc);
+        alloc.free(try bob.decrypt(alloc, last.header, last.ciphertext, io));
+        try sendRecv(&bob, &alice, "turn", io);
+    }
+    try testing.expectEqual(max_skip_store, bob.mkskipped.count());
+
+    // One more skipped key would be key number 2001.
+    const over = try sendMany(&alice, 2);
+    defer over.deinit(alloc);
+    try testing.expectError(error.TooManySkippedMessages, bob.decrypt(alloc, over.header, over.ciphertext, io));
+}
+
+test "a receiving chain that does not exist yet is MessageKeyNotAvailable, not a zero key" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+
+    // Alice already knows Bob's ratchet key but has no receiving chain under
+    // it: a message claiming to come from that key has nothing to decrypt it.
+    const header: Header = .{ .dh = alice.dhr.?, .pn = 0, .n = 0 };
+    var ct: [tag_length + 4]u8 = @splat(0);
+    try testing.expectError(error.MessageKeyNotAvailable, alice.decrypt(alloc, header, &ct, io));
+}
+
 test "tamper: flipped ciphertext, wrong AD, and truncated buffer all fail closed" {
     var threaded = testIo();
     defer threaded.deinit();
@@ -969,6 +1023,19 @@ test "tamper: flipped ciphertext, wrong AD, and truncated buffer all fail closed
     const pt = try bob.decrypt(alloc, msg.header, msg.ciphertext, io);
     defer alloc.free(pt);
     try testing.expectEqualSlices(u8, "secret payload", pt);
+
+    // (d) The header is authenticated too: in the same chain PN selects no
+    // key, so only the AEAD's associated data can notice it was rewritten.
+    {
+        const msg2 = try alice.encrypt(alloc, "second");
+        defer msg2.deinit(alloc);
+        var header = msg2.header;
+        header.pn +%= 1;
+        try testing.expectError(
+            error.MessageAuthenticationFailed,
+            bob.decrypt(alloc, header, msg2.ciphertext, io),
+        );
+    }
 }
 
 test "replay of a consumed in-order message is not decryptable" {

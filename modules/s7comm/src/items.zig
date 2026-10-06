@@ -502,6 +502,9 @@ test "counter and timer areas address elements, not bits" {
     try testing.expectEqual(@as(u32, 3), c.byteOffset());
     // A bit index makes no sense there.
     try testing.expectError(error.AddressOutOfRange, Item.at(.timer, 0, 3, 1, .timer, 1));
+    // Element addresses are 24 bits too.
+    _ = try Item.at(.counter, 0, 0xFFFFFF, 0, .counter, 1);
+    try testing.expectError(error.AddressOutOfRange, Item.at(.counter, 0, 0x1000000, 0, .counter, 1));
 }
 
 test "address range is 24 bits" {
@@ -523,6 +526,7 @@ test "item decode rejects a foreign syntax id and a bad marker" {
     wire[2] = 0xB2;
     try testing.expectError(error.UnsupportedSyntaxId, Item.decode(&wire));
     try testing.expectError(error.ShortItem, Item.decode(&[_]u8{ 0x12, 0x0A, 0x10 }));
+    try testing.expectError(error.ShortItem, Item.decode(wire[0 .. wire.len - 1]));
     try testing.expectError(error.ShortItem, Item.decode(&[_]u8{0x12}));
 }
 
@@ -546,6 +550,8 @@ test "length unit follows the data transport size" {
     // A bit-counted length that is neither a whole octet nor a single bit.
     try testing.expectError(error.LengthTransportMismatch, decodeLength(.byte_word_dword, 12));
     try testing.expectError(error.LengthTransportMismatch, decodeLength(.int, 3));
+    // The single-bit exception stops at 8 bits.
+    try testing.expectError(error.LengthTransportMismatch, decodeLength(.bit, 9));
 }
 
 test "data item iterator pads between items but not after the last" {

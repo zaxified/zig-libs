@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Fixed: `derivePrivateKey` accepted a `per_commitment_secret` >= n and
+  silently reduced it (k256 `combMulBase` reduces instead of refusing), although
+  `Error.InvalidSecret` promises a canonical scalar and `deriveRevocationPrivateKey`
+  refused the same bytes; it now returns `error.InvalidSecret` (regression test).
+  Mutation run: 26 of 27 killed, 1 equivalent; 2 tests added (every input refusal
+  of the four derivations, the fix's regression).
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **derive 7 / revocation 10 / shachain 0 / shachain_index 1**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. `SPEC.md`'s "No secret-dependent branching beyond `std.crypto.ecc`'s constant-time scalar ladder" is confirmed: every context in `derive`/`revocation` is one of two already-accepted classes (scalar canonicality, `rejectIdentity`), all disassembled. Settles an audit question: `perCommitmentSecret`'s branch on `index` is not a finding — BOLT #3 treats the commitment number as protocol state both peers already track, and `obscured_commitment_transaction_number` exists to hide it from chain observers, not from the peer. `shachain_index` is an honest positive control that taints the index deliberately, to prove the harness can see that branch at all. ⛔⛔ Instrument defect found here: a fully-inlined callee gets its merged frame reported at `root.zig:0` — never a real source line — and because the classifier matches PATTERN anywhere in the paragraph and BEFORE WITNESS, a bare `root[.]zig` filed two genuine propagation witnesses as in-file. It lies in both directions. The pattern for these two rows is `root[.]zig:[1-9]`.
 
 - **2026-09-09** — Licensing: `NOTICE` kind changed from `provenance note` (record only) to

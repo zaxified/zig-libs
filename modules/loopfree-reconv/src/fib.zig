@@ -295,6 +295,34 @@ test "computeUpdateOrder: mixed increase+decrease set — class A entirely befor
     try testing.expectEqualSlices(NodeId, &.{ 1, 2, 5, 4, 3 }, order);
 }
 
+test "computeUpdateOrder: an equal-distance shift is class B, and ties break by ascending id in both classes" {
+    const gpa = testing.allocator;
+    //   1: 10 -> 5, 6: 10 -> 5  (class A, tied new_dist → 1 before 6)
+    //   2: 20 -> 12              (class A)
+    //   3: 30 -> 45, 7: 30 -> 45 (class B, tied old_dist → 3 before 7)
+    //   4: 40 -> 42              (class B)
+    //   5:  3 -> 3               (class B: equal distance, next hop shifted —
+    //                             LAST, although nearest to the destination)
+    var old_tree = try synthTree(gpa, &.{ 0, 10, 20, 30, 40, 3, 10, 30 }, &.{ null, 0, 0, 0, 0, 0, 0, 0 });
+    defer old_tree.deinit();
+    var new_tree = try synthTree(gpa, &.{ 0, 5, 12, 45, 42, 3, 5, 45 }, &.{ null, 9, 9, 9, 9, 9, 9, 9 });
+    defer new_tree.deinit();
+    const order = try computeUpdateOrder(gpa, &old_tree, &new_tree);
+    defer gpa.free(order);
+    try testing.expectEqualSlices(NodeId, &.{ 1, 6, 2, 4, 3, 7, 5 }, order);
+}
+
+test "changedNodes: a node whose distance moved but whose next hop did not is not changed" {
+    const gpa = testing.allocator;
+    var old_tree = try synthTree(gpa, &.{ 0, 1, 2 }, &.{ null, 0, 1 });
+    defer old_tree.deinit();
+    var new_tree = try synthTree(gpa, &.{ 0, 5, 6 }, &.{ null, 0, 1 });
+    defer new_tree.deinit();
+    const changed = try changedNodes(gpa, &old_tree, &new_tree);
+    defer gpa.free(changed);
+    try testing.expectEqual(@as(usize, 0), changed.len);
+}
+
 test "naiveBadOrder: returns exactly the changed set, ascending by id (not a stub)" {
     const gpa = testing.allocator;
     // 0 -- 1 -- 2, then a cheaper direct 0--2 edge appears (simulating a

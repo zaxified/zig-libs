@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 23 of 24 killed, 1 equivalent; 1 test extended
+  (the external-vector KAT rejects 2048 tampered randomizers, so `verify`'s
+  root comparison must cover every byte). No code change.
+
 - **2026-10-01** — `SigningKey.Persist.io`: the `Io` the persist hook blocks in. With it, `SigningKey.sign`
   guards with an `std.Io.Mutex`, so a second signer parks instead of spinning on one suspended
   in the hook — required when the `Io` runs several tasks on one thread. Without it, unchanged.

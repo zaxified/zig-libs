@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 25 of 43 killed, 1 equivalent; 3 tests added
+  and 8 existing tests extended, nearly all at a one-past boundary (TPKT total
+  65536 and one octet short, framer overflow and partial packet, a COTP
+  parameter and `LI` one long, an 11-octet Ack-Data, a 2^24 element address,
+  a short item, a 9-bit bit length, responder writes past the area or shorter
+  than their item, an empty V3 integrity part, a connect frame's trailing
+  octet, an over-long VLQ with a small value, an `i8` below its minimum). 42
+  of 43 killed after. No library code changed.
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** test only (audit F15). The F6 element budget
   is now pinned across a nested object too, not only across two attributes of one object.
 

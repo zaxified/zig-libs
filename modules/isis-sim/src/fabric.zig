@@ -2979,3 +2979,275 @@ test "determinism: a LAN run with a preemption replays byte-for-byte and a re-ru
     try testing.expect(f1.last_log.eql(&f2.last_log));
     try testing.expectEqual(@as(?u32, 1), f1.pseudonodeSequence(2, 0, 0));
 }
+
+// ── direct-drive tests: the handlers called one PDU at a time ──────────────
+//
+// Some paths no scenario reaches on its own (no node in a scenario ever loses
+// its sequence number, so nobody is ever challenged) or reaches only as a
+// difference in traffic. These drive the protocol callbacks directly against a
+// real `netsim.Sim` holding the same nodes and links a run would.
+
+const Direct = struct {
+    log: netsim.Log = .{},
+    sim: netsim.Sim = undefined,
+
+    /// Build the fabric's nodes and links in `d.sim` and start every node at t=0.
+    fn start(d: *Direct, fab: *Fabric) !void {
+        d.sim = netsim.Sim.init(testing.allocator, 1, fab.protocol(), &d.log, 10_000, 100_000);
+        g_active_fabric = fab;
+        defer g_active_fabric = null;
+        try buildScenario(&d.sim);
+        var n: NodeId = 0;
+        while (n < fab.nodes.len) : (n += 1) try Fabric.onStart(fab, &d.sim, n);
+    }
+
+    fn deinit(d: *Direct) void {
+        d.sim.deinit();
+        d.log.deinit(testing.allocator);
+    }
+};
+
+/// A well-formed, checksummed copy of LSP `id` at `seq`, as a peer would send it.
+fn foreignCopy(buf: []u8, id: isis_lsdb.LspId, seq: u32) ![]const u8 {
+    var b = try isis.pdu.LspBuilder.init(buf, .{
+        .remaining_lifetime = 1_200,
+        .lsp_id = id,
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    return b.finishStamped();
+}
+
+test "LAN: a CSNP from a non-DIS member, and a PSNP sent to a non-DIS member, are ignored" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 1);
+    defer fab.deinit();
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    try testing.expectEqual(@as(?NodeId, 3), fab.disOf(2, 0));
+
+    const unknown = lspIdOf(systemIdForNode(42), 0);
+    const entries = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1_000, .lsp_id = unknown, .sequence_number = 5, .checksum = 0x5555 }};
+    var scratch: [512]u8 = undefined;
+    const from1 = neighbourId7(systemIdForNode(1));
+    try Fabric.onMessage(&fab, &d.sim, 2, 1, try isis_flood.snp.buildCsnp(&scratch, from1, false, @splat(0), @splat(0xFF), &entries));
+    try testing.expect(fab.nodes[2].lsdb.get(unknown, 0) == null);
+    try Fabric.onMessage(&fab, &d.sim, 2, 1, try isis_flood.snp.buildPsnp(&scratch, from1, false, &entries));
+    try testing.expect(fab.nodes[2].lsdb.get(unknown, 0) == null);
+
+    // Control: the same CSNP from the DIS is acted on (the LSP is requested).
+    const from3 = neighbourId7(systemIdForNode(3));
+    try Fabric.onMessage(&fab, &d.sim, 2, 3, try isis_flood.snp.buildCsnp(&scratch, from3, false, @splat(0), @splat(0xFF), &entries));
+    try testing.expect(fab.nodes[2].lsdb.get(unknown, 0).?.is_request);
+}
+
+test "challenges (§7.3.16.1): a newer copy of our LSP or pseudonode LSP is out-originated, by LSP or by SNP" {
+    var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 2, .{ .aging = .{} });
+    defer fab.deinit();
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    var buf: [128]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    try testing.expectEqual(@as(u32, 1), fab.selfSequence(4));
+
+    // Router LSP, challenged by an LSP: the owner lands above the challenger.
+    try Fabric.onMessage(&fab, &d.sim, 4, 0, try foreignCopy(&buf, lspIdOf(systemIdForNode(4), 0), 10));
+    try testing.expectEqual(@as(u32, 11), fab.selfSequence(4));
+    try testing.expectEqual(@as(?u32, 11), fab.storedSequence(4, 4));
+
+    // Router LSP, challenged by an SNP: the next aging pass lands above it.
+    const own4 = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1_000, .lsp_id = lspIdOf(systemIdForNode(4), 0), .sequence_number = 20, .checksum = 0x2020 }};
+    try Fabric.onMessage(&fab, &d.sim, 4, 0, try isis_flood.snp.buildCsnp(&scratch, neighbourId7(systemIdForNode(0)), false, @splat(0), @splat(0xFF), &own4));
+    try fab.ageNode(&d.sim, 4, 0);
+    try testing.expectEqual(@as(u32, 21), fab.selfSequence(4));
+
+    // The DIS's pseudonode LSP, challenged by an LSP.
+    try testing.expect(fab.isDis(3, 0));
+    try Fabric.onMessage(&fab, &d.sim, 3, 0, try foreignCopy(&buf, fab.pseudonodeId(3, 0), 10));
+    try testing.expectEqual(@as(?u32, 11), fab.pseudonodeSequence(3, 0, 3));
+    // A challenge naming a circuit it is not DIS of leaves that one alone.
+    var elsewhere = fab.pseudonodeId(3, 0);
+    elsewhere[6] = 2;
+    try Fabric.onMessage(&fab, &d.sim, 3, 0, try foreignCopy(&buf, elsewhere, 30));
+    try testing.expectEqual(@as(?u32, 11), fab.pseudonodeSequence(3, 0, 3));
+
+    // ...and by a PSNP to the DIS, re-originated on the next aging pass.
+    const pn = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 1_000, .lsp_id = fab.pseudonodeId(3, 0), .sequence_number = 20, .checksum = 0x2020 }};
+    try Fabric.onMessage(&fab, &d.sim, 3, 0, try isis_flood.snp.buildPsnp(&scratch, neighbourId7(systemIdForNode(0)), false, &pn));
+    try fab.ageNode(&d.sim, 3, 0);
+    try testing.expectEqual(@as(?u32, 21), fab.pseudonodeSequence(3, 0, 3));
+}
+
+test "LAN sends: only the DIS sends CSNPs, the DIS sends no PSNP; a member asks only for what it lacks, in PDUs of at most 15" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 3);
+    defer fab.deinit();
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    const member = &fab.nodes[1].lan_circuits[0];
+    const dis = &fab.nodes[3].lan_circuits[0];
+    try testing.expect(!member.is_dis and dis.is_dis);
+    const bytes = [_]u8{0};
+
+    const before = fab.stats.snp_tx;
+    try fab.sendOnLan(&d.sim, 1, member, .{ .iface = member.iface, .kind = .csnp, .bytes = &bytes });
+    try fab.sendOnLan(&d.sim, 3, dis, .{ .iface = dis.iface, .kind = .psnp, .bytes = &bytes });
+    try testing.expectEqual(before, fab.stats.snp_tx);
+    try fab.sendOnLan(&d.sim, 3, dis, .{ .iface = dis.iface, .kind = .csnp, .bytes = &bytes });
+    try testing.expectEqual(before + 3, fab.stats.snp_tx); // to the three other members
+
+    // A CSNP listing exactly what member 1 holds requests nothing...
+    var scratch: [2048]u8 = undefined;
+    const held = fab.nodes[1].lsdb.get(lspIdOf(systemIdForNode(1), 0), 0).?;
+    const same = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = held.remaining_lifetime, .lsp_id = held.lsp_id, .sequence_number = held.sequence_number, .checksum = held.checksum }};
+    const from3 = neighbourId7(systemIdForNode(3));
+    try fab.requestFromCsnp(&d.sim, 1, member, try isis.Csnp.decode(try isis_flood.snp.buildCsnp(&scratch, from3, false, @splat(0), @splat(0xFF), &same)), 0);
+    try testing.expectEqual(before + 3, fab.stats.snp_tx);
+
+    // ...and 16 unknown LSPs are requested in two PSNPs (15 + 1), each to the
+    // three other members.
+    var many: [16]isis.tlvs.LspEntry = undefined;
+    for (&many, 0..) |*e, i| e.* = .{ .remaining_lifetime = 1_000, .lsp_id = lspIdOf(systemIdForNode(@intCast(100 + i)), 0), .sequence_number = 1, .checksum = 0x0101 };
+    var cbuf: [1024]u8 = undefined;
+    var cb = try isis.pdu.CsnpBuilder.init(&cbuf, .{ .source_id = from3, .start_lsp_id = @splat(0), .end_lsp_id = @splat(0xFF) });
+    try isis.tlvs.addLspEntries(&cb.tlvs, many[0..15]); // one #9 TLV holds 15
+    try isis.tlvs.addLspEntries(&cb.tlvs, many[15..]);
+    try fab.requestFromCsnp(&d.sim, 1, member, try isis.Csnp.decode(cb.finish()), 0);
+    try testing.expectEqual(before + 3 + 6, fab.stats.snp_tx);
+}
+
+test "TEETH: a pseudonode sequence that goes backwards is caught; isDead honours the horizon; every extra fragment is originated" {
+    var fab = try Fabric.init(testing.allocator, lan_topo, 4);
+    defer fab.deinit();
+
+    // Node 0 once saw DIS 3's pseudonode LSP at 4 and now holds none.
+    fab.seen_pn_seq[(0 * fab.lans.len + 0) * fab.nodes.len + 3] = 4;
+    var log: netsim.Log = .{};
+    defer log.deinit(testing.allocator);
+    var sim = netsim.Sim.init(testing.allocator, 1, fab.protocol(), &log, 0, 1);
+    defer sim.deinit();
+    try testing.expectError(error.SequenceRegression, Fabric.check(&fab, &sim));
+
+    // A crash scheduled past the horizon has not happened yet.
+    fab.crash = .{ .node = 1, .time = 5_000 };
+    fab.horizon = 1_000;
+    try testing.expect(!fab.isDead(1));
+    fab.horizon = 5_000;
+    try testing.expect(fab.isDead(1));
+
+    // `extra_fragments = 2` means fragments 1 AND 2, besides fragment 0.
+    fab.extra_fragments = 2;
+    try fab.originate(4, 0);
+    try testing.expectEqual(@as(usize, 3), fab.nodes[4].lsdb.count());
+    try testing.expect(fab.nodes[4].lsdb.get(lspIdOf(systemIdForNode(4), 2), 0) != null);
+}
+
+test "LAN: a non-DIS member crash — noticed after lan_hold_time, dropped from the pseudonode, sent nothing afterwards" {
+    var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 0xC0DE, .{ .csnp_interval = 20 });
+    defer fab.deinit();
+    fab.crash = .{ .node = 1, .time = 1_000 };
+    var members: [8]NodeId = undefined;
+
+    // 20 ticks after the crash nobody has noticed (the hold is 30).
+    _ = try fab.runToConvergence(1_020);
+    try testing.expectEqual(@as(?usize, 4), fab.pseudonodeMembers(0, 0, 3, &members));
+
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(2_000));
+    try testing.expectEqual(@as(?usize, 3), fab.pseudonodeMembers(5, 0, 3, &members));
+    try testing.expectEqualSlices(NodeId, &.{ 0, 2, 3 }, members[0..3]);
+    // Once it is declared dead nothing is addressed to it — the DIS's periodic
+    // CSNPs included.
+    var late_drops: usize = 0;
+    for (fab.last_log.entries.items) |e| {
+        if (e.tag == .drop and e.b == 1 and e.time > 1_040) late_drops += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), late_drops);
+}
+
+test "the horizon is inclusive: an aging tick and a flooding wakeup due exactly at it both fire" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+
+    // Aging ticks every 10: one is due at 100 on every node.
+    {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, 5, .{ .aging = .{} });
+        defer fab.deinit();
+        _ = try fab.runToConvergence(100);
+        var ticks_at_100: usize = 0;
+        for (fab.last_log.entries.items) |e| {
+            if (e.tag == .timer and e.b == timer_age and e.time == 100) ticks_at_100 += 1;
+        }
+        try testing.expectEqual(@as(usize, 4), ticks_at_100);
+    }
+
+    // A scheduler wakeup (here: node 0's periodic CSNP) that no message
+    // triggered: find one in a long run, then end a run exactly on it.
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 6, .{ .csnp_interval = 50 });
+    defer fab.deinit();
+    _ = try fab.runToConvergence(1_000);
+    var due: ?Time = null;
+    for (fab.last_log.entries.items) |e| {
+        if (e.tag != .timer or e.a != 0 or e.b != timer_poll or e.time < 500) continue;
+        var triggered = false;
+        for (fab.last_log.entries.items) |m| {
+            if (m.tag == .deliver and m.b == 0 and m.time + poll_delay == e.time) triggered = true;
+        }
+        if (!triggered) {
+            due = e.time;
+            break;
+        }
+    }
+    const t = due orelse return error.NoUntriggeredWakeup;
+    _ = try fab.runToConvergence(t);
+    var fired = false;
+    for (fab.last_log.entries.items) |e| {
+        if (e.tag == .timer and e.a == 0 and e.b == timer_poll and e.time == t) fired = true;
+    }
+    try testing.expect(fired);
+}
+
+test "a poll truncated at 64 effects re-arms itself one tick later" {
+    // A hub with 20 circuits and 4 LSPs to flood on each: 80 effects, more
+    // than one poll's 64. Nothing else may be relied on to poll again (in a
+    // scenario the acks it draws usually do), so the hub must.
+    var edges: [20]Edge = undefined;
+    for (&edges, 0..) |*e, i| e.* = .{ .a = 0, .b = @intCast(i + 1) };
+    var fab = try Fabric.init(testing.allocator, .{ .node_count = 21, .edges = &edges }, 7);
+    defer fab.deinit();
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    var buf: [128]u8 = undefined;
+    for ([_]NodeId{ 1, 2, 3 }) |o| _ = try fab.nodes[0].lsdb.insert(try foreignCopy(&buf, lspIdOf(systemIdForNode(o), 0), 1), null, 0);
+
+    const Count = struct {
+        fn hubPollsAt1(sim: *const netsim.Sim) usize {
+            var n: usize = 0;
+            for (sim.queue.items.items) |ev| switch (ev.kind) {
+                .timer => |t| if (t.node == 0 and t.timer_id == timer_poll and ev.time == 1) {
+                    n += 1;
+                },
+                else => {},
+            };
+            return n;
+        }
+    };
+    const before = Count.hubPollsAt1(&d.sim); // the one `onStart` armed
+    fab.horizon = 1_000;
+    try fab.pollAndSend(&d.sim, 0, 0);
+    try testing.expectEqual(before + 1, Count.hubPollsAt1(&d.sim));
+}
+
+test "quiescence: an unacknowledged SSN alone keeps a node busy" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 8);
+    defer fab.deinit();
+    // Leaf 0 has one circuit: an LSP arriving on it sets SSN there and SRM
+    // nowhere.
+    var buf: [128]u8 = undefined;
+    _ = try fab.nodes[0].lsdb.insert(try foreignCopy(&buf, lspIdOf(systemIdForNode(1), 0), 1), 0, 0);
+    try testing.expectEqual(@as(usize, 0), fab.nodes[0].lsdb.interfacesWithSrm().count());
+    try testing.expect(!fab.quiescent(0));
+}

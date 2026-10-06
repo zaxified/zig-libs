@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 `devlink` 7.2.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -375,6 +375,25 @@ common case):
 
 Everything that needs a real instance prints `SKIPPED: …` and passes. **No live
 test can fail for want of hardware.**
+
+### 4.5 Mutation run
+
+**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the region
+snapshot bounds and chunk `Assembler`, handle validation and echo checks,
+`walkStep`'s pid/seq/family filters, error mapping and message ceiling, the
+version/param/resource/port bounds, `asU64`/`copyName`, and the health
+counters): 29 killed. Seven survivors were missing tests, now added: more
+than `max_snapshots` top-level snapshot ids, an empty chunk outside the
+window, a 9-octet u64 attribute, and three `walkStep` cases over the mock
+socket — a family message for another socket and for another request, an
+`NLMSG_ERROR` with a negative errno, and the ceiling reached by a message
+inside a datagram. Equivalent: `checkHandleEcho`'s `isComplete` (the wanted
+handle is validated non-empty, so a half handle can never `eql` it) and
+`unrecoveredCount`'s `e > c` vs `e >= c` (both give 0 at equality). **Two
+survivors have no test:** `param`'s name-echo compare in `client.zig` and
+`collect` keeping the first family message — both run only on a `*Devlink`
+with a real socket, and no seam reaches them (`walkStep` is the only one).
+36 of 40 killed after.
 
 ## 5. Deferred — and why
 

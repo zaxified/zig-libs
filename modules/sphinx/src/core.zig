@@ -569,6 +569,60 @@ test "HopSecret / ProcessResult field shapes" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, pr.payload());
 }
 
+// ── mutation run 2026-10-05: edges and refusals no test above reached ────
+
+/// An onion for `node_privkey` whose decrypted hop_payloads begin with
+/// `plaintext` (zero-padded to 1300) and whose HMAC is genuine -- so
+/// `process` gets past the integrity check and reaches the frame parser
+/// with whatever framing the test chooses, which `construct` refuses to emit.
+fn sealForTest(node_privkey: [32]u8, plaintext: []const u8, associated_data: []const u8) !OnionPacket {
+    const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
+    var hs: [1]HopSecret = undefined;
+    try deriveHopSecrets([_]u8{0x41} ** 32, &.{node_pub}, &hs);
+    var buf = [_]u8{0} ** hop_payloads_len;
+    @memcpy(buf[0..plaintext.len], plaintext);
+    var stream: [hop_payloads_len]u8 = undefined;
+    keyderive.generateCipherStream(keyderive.generateKey(.rho, hs[0].shared_secret), &stream);
+    for (&buf, stream) |*b, s| b.* ^= s;
+    var hmac: [hmac_len]u8 = undefined;
+    var mac = HmacSha256.init(&keyderive.generateKey(.mu, hs[0].shared_secret));
+    mac.update(&buf);
+    mac.update(associated_data);
+    mac.final(&hmac);
+    return .{ .public_key = hs[0].ephemeral_pubkey, .hop_payloads = buf, .hmac = hmac };
+}
+
+test "process: each frame refusal surfaces as its own error" {
+    const node_privkey = [_]u8{0x42} ** 32;
+    const ad = "ad";
+    // Lengths 0 and 1 are reserved.
+    try std.testing.expectError(error.ReservedPayloadLength, process(node_privkey, try sealForTest(node_privkey, &.{0x00}, ad), ad));
+    try std.testing.expectError(error.ReservedPayloadLength, process(node_privkey, try sealForTest(node_privkey, &.{0x01}, ad), ad));
+    // A non-canonical BigSize length is malformed, not reserved.
+    try std.testing.expectError(error.MalformedPayload, process(node_privkey, try sealForTest(node_privkey, &.{ 0xfd, 0x00, 0x05 }, ad), ad));
+    // A 1290-octet payload: its frame (3 + 1290 + 32 = 1325) runs past the 1300 octets.
+    try std.testing.expectError(error.MalformedPayload, process(node_privkey, try sealForTest(node_privkey, &.{ 0xfd, 0x05, 0x0a }, ad), ad));
+}
+
+test "construct/process: one hop whose frame fills the 1300 octets exactly" {
+    const session_key = [_]u8{0x41} ** 32;
+    const node_privkey = [_]u8{0x42} ** 32;
+    const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
+    var payload: [hop_payloads_len - 3 - hmac_len]u8 = undefined; // 1265
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    try std.testing.expectEqual(hop_payloads_len, hopframe.shiftSize(payload.len));
+    const onion = try construct(session_key, &.{node_pub}, &.{&payload}, "ad");
+    const r = try process(node_privkey, onion, "ad");
+    try std.testing.expectEqualSlices(u8, &payload, r.payload());
+    try std.testing.expect(r.next_packet == null);
+}
+
+test "process: an off-curve ephemeral key is InvalidPublicKey" {
+    var pkt = try sealForTest([_]u8{0x42} ** 32, &.{ 0x02, 0xaa, 0xbb }, "");
+    pkt.public_key[0] = 0x05;
+    try std.testing.expectError(error.InvalidPublicKey, process([_]u8{0x42} ** 32, pkt, ""));
+}
+
 // ── fuzz: a hop's full untrusted-wire decode-then-unwrap pipeline ─────────
 
 fn fuzzProcess(_: void, smith: *std.testing.Smith) !void {

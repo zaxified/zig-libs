@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 38 of 40 killed, 2 equivalent; 8 tests added
+  and 5 extended (literal ceilings at their value and the per-line reset, an
+  escape's line-budget cost, atom-specials, non-NIL nstring, DEL in sections
+  and quoting, a flag's backslash, a surrogate pair with a non-low second
+  half, a one-byte STARTTLS injection, SELECT before LOGIN, the BODYSTRUCTURE
+  depth edge, a valueless body parameter). No code change.
+
+- **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE:** test-only double free fixed in
+  `live_test.zig`'s `pymapPath`. On a host without pymap the `access` catch freed
+  `path` and returned the skip error, and the `errdefer` freed it again, so the
+  "LIVE pymap interop" test crashed (SIGABRT) instead of skipping and
+  `scripts/modtest imap` was red on any such host. Now 156 pass, 1 skip.
+
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `Decoder.charge` gains a
   test-only call counter (`void` outside a test build, so the increment
   compiles to nothing there). F7's regression guard was an opt-in

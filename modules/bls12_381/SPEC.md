@@ -6,7 +6,7 @@
 
 **Scope:** mvp — blst v0.3.17 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -1009,6 +1009,26 @@ see "Part 6 design" below.
   independently equals `g1.zig`'s own pre-existing `[2]G` KAT.
   **`zig build test-bls12_381` (Debug) and `zig test -OReleaseFast`
   report all tests pass, no panics** (`zig fmt --check` clean).
+- **Mutation run 2026-10-05** (in-place, ReleaseSafe, 43 mutants over the
+  `g1`/`g2` codecs and subgroup/on-curve checks, `Fp` canonicality, the
+  `bls_sig` verify family and KeyGen, hash-to-curve, threshold combine and
+  codecs, KZG decode/batch): 39 killed. The first pass left 16; tests were
+  added for the infinity encodings (`G1` and `G2`: a set coordinate bit, a
+  nonzero tail, infinity + sort), the on-curve refusal of the uncompressed
+  decoders (the checked decoder used to answer `NotInSubgroup` for an
+  off-curve point, so nothing noticed the curve check gone), `eqlPoints` on
+  the identity, `Fp.fromInt(p)`, `popVerify` of the identity key with the
+  identity proof (KeyValidate is the only guard there), a KeyGen vector
+  recomputed in Python (drops of the `I2OSP(0, 1)` octet survived), and a
+  trailing byte after a verification vector. Equivalent: the 11-isogeny's
+  exceptional case `or` → `and` (`x_den = ψ²`, `y_den = ψ³`, checked over
+  the table, so they vanish together); the trailing-data refusal of the
+  setup parser (it reads only the embedded, pinned file); and removing
+  `signature_subgroup_check` from `verify` and `coreAggregateVerify` — no
+  feasible input tells: the pairing is not blind to cofactor torsion
+  (measured: `sig + [r]P` fails the equation too), so a non-`G2` signature
+  that passes it needs a `GT` discrete log. The checks stay as the draft's
+  MUST.
 
 ## Status
 

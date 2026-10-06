@@ -469,6 +469,57 @@ test "applyTopologyChange (naive_bad): severing 1-0 flips node1's and node2's ne
     try testing.expect(f.next_pending_id > 0);
 }
 
+test "deliverAt: a reused frame slot starts clean; a short payload and an unminted conductor id are ignored; reset clears all" {
+    const gpa = testing.allocator;
+    var f = Fabric.init(gpa, .naive_bad);
+    var log = netsim.Log{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, f.protocol(), &log, 1000, 1000);
+    defer sim.deinit();
+    try scenario(&sim);
+
+    // Frame 0 and frame MAX_FRAMES share slot 0. Both arrive at the
+    // destination: the second is a new frame, delivered — not a re-delivery
+    // of the first to be absorbed, and not a loop.
+    try f.deliverAt(&sim, f.dest, 0);
+    try f.deliverAt(&sim, f.dest, MAX_FRAMES);
+    try testing.expectEqual(@as(u32, 2), f.retired_frame_id);
+    try testing.expect(!f.loop_violation);
+
+    // A payload shorter than a frame id is dropped, not read past its end.
+    try Fabric.onMessage(&f, &sim, f.dest, 1, &.{ 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 2), f.retired_frame_id);
+
+    // A conductor timer id past the schedule (here: empty) is a no-op.
+    try testing.expectEqual(@as(usize, 0), f.schedule.len);
+    try Fabric.onTimer(&f, &sim, 0, CONDUCTOR_BASE);
+    try testing.expectEqual(@as(u64, 0), f.next_pending_id);
+
+    // `reset` returns every per-run field to its initial value.
+    f.up[0] = false;
+    f.next_hop[1] = 3;
+    f.slot_visited[0] = 1;
+    f.next_pending_id = 4;
+    f.applied_pending_id = 4;
+    f.last_apply_time = 9;
+    f.loop_violation = true;
+    f.loop_frame = 7;
+    f.loop_node = 1;
+    Fabric.reset(&f);
+    try testing.expect(f.up[0]);
+    try testing.expectEqual(@as(?NodeId, null), f.next_hop[1]);
+    try testing.expectEqual(@as(u8, 0), f.slot_visited[0]);
+    try testing.expectEqual(std.math.maxInt(u32), f.slot_owner[0]);
+    try testing.expectEqual(@as(u32, 0), f.next_frame_id);
+    try testing.expectEqual(@as(u32, 0), f.retired_frame_id);
+    try testing.expectEqual(@as(u64, 0), f.next_pending_id);
+    try testing.expectEqual(@as(u64, 0), f.applied_pending_id);
+    try testing.expectEqual(@as(netsim.Time, 0), f.last_apply_time);
+    try testing.expect(!f.loop_violation);
+    try testing.expectEqual(@as(?u32, null), f.loop_frame);
+    try testing.expectEqual(@as(?NodeId, null), f.loop_node);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 28 of 32 killed, 4 equivalent; 3 tests added and one
+  extended (equal-distance shift is class B and intra-class ties ascend by id; a moved
+  distance with an unmoved next hop is not changed; frame-slot reuse, short payload,
+  unminted conductor id and `reset`; `findFailing`'s `end` is inclusive). No code change.
 - **2026-08-18** — Portability fix (`check-portable`): three sites indexed with a raw
   `u64` on a 32-bit target. Two (`self.pending[self.next_pending_id % MAX_PENDING]`,
   `self.pending[(timer_id - FIB_APPLY_BASE) % MAX_PENDING]`) take `% MAX_PENDING` (a

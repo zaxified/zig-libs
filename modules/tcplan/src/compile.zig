@@ -345,3 +345,46 @@ test "invariant: classifier on an interior node, zero rate, duplicate name" {
     };
     try testing.expectError(error.DuplicateName, compile(gpa, .{ .queue_count = 1, .roots = &dup }, 1));
 }
+
+test "invariant: cpu == queue_count is out of range, not silently dropped" {
+    const gpa = testing.allocator;
+    const edge = [_]Node{.{ .name = "s", .rate_bps = 1000, .cpu = 2 }};
+    try testing.expectError(error.CpuOutOfRange, compile(gpa, .{ .queue_count = 2, .roots = &edge }, 1));
+}
+
+test "invariant: a child with ceil 0 is checked by its effective ceil (= its rate)" {
+    const gpa = testing.allocator;
+    const sub = [_]Node{.{ .name = "sub", .rate_bps = 4000 }}; // ceil 0 ⇒ 4000
+    const roots = [_]Node{.{ .name = "site", .rate_bps = 2000, .ceil_bps = 3000, .cpu = 0, .children = &sub }};
+    try testing.expectError(error.CeilExceedsParent, compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1));
+}
+
+test "htb_defcls reaches every per-queue HTB root" {
+    const gpa = testing.allocator;
+    const roots = [_]Node{
+        .{ .name = "a", .rate_bps = 1000, .cpu = 0 },
+        .{ .name = "b", .rate_bps = 1000, .cpu = 1 },
+    };
+    var p = try compile(gpa, .{ .queue_count = 2, .htb_defcls = 0x42, .roots = &roots }, 1);
+    defer p.deinit(gpa);
+    var htb_roots: usize = 0;
+    for (p.ops) |op| if (op == .qdisc and op.qdisc.spec == .htb) {
+        try testing.expectEqual(@as(u32, 0x42), op.qdisc.spec.htb.defcls);
+        htb_roots += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), htb_roots);
+}
+
+test "a leaf without a classifier does not consume a filter prio" {
+    const gpa = testing.allocator;
+    const subs = [_]Node{
+        .{ .name = "silent", .rate_bps = 500 },
+        .{ .name = "steered", .rate_bps = 500, .match = .{ .ipv4 = .{ .addr = .{ 10, 0, 0, 9 } } } },
+    };
+    const roots = [_]Node{.{ .name = "site", .rate_bps = 1000, .cpu = 0, .children = &subs }};
+    var p = try compile(gpa, .{ .queue_count = 1, .roots = &roots }, 1);
+    defer p.deinit(gpa);
+    const last = p.ops[p.ops.len - 1];
+    try testing.expect(last == .filter);
+    try testing.expectEqual(@as(u16, 1), last.filter.target.prio);
+}

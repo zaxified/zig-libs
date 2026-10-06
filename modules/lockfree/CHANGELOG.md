@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 28 of 30 killed, 1 equivalent, 1 not killable by
+  a test (the `enterCritical` pin store's ordering — litmus territory, SPEC §5); 5
+  tests and 1 checker case added (current-epoch pin, two-advance grace period,
+  stale-bag drain in `retire`, lagging tail under `dequeue` and `enqueue`, checker
+  pid edge). No code change.
 - **2026-08-24** — `Atomic` is re-exported by the module root, so a consumer can spell
   `lockfree.Atomic` (a generic alias for `std.atomic.Value`). It was public inside
   `atomic.zig` from the start while `root.zig` published its four neighbours —

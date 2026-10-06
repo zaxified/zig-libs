@@ -155,6 +155,24 @@ test "keyGen rejects key_info longer than 65535 bytes" {
     try testing.expectError(error.KeyInfoTooLong, keyGen(key_material, &big_info, null));
 }
 
+test "keyGen length edges: 31 bytes refused, 32 accepted; 65535-byte key_info is not KeyInfoTooLong" {
+    // Mutation run 2026-10-05: `< 31` and `>= 65535` both survived.
+    try testing.expectError(error.KeyMaterialTooShort, keyGen("0" ** 31, "", null));
+    _ = try keyGen("0" ** 32, "", null);
+    const info: [65535]u8 = @splat('a');
+    try testing.expectError(error.DeriveInputTooLong, keyGen("0" ** 32, &info, null));
+}
+
+test "PublicKey.fromBytes refuses an on-twist point outside G2" {
+    // x = u (c1 = 1, c0 = 0, wire order c1 || c0) is on the twist and not
+    // in G2 (`bls12_381`'s g2 tests pin both facts).
+    var bytes = [_]u8{0} ** PublicKey.encoded_bytes;
+    bytes[0] = 0x80;
+    bytes[47] = 1;
+    _ = try G2.fromBytesCompressedUnchecked(bytes);
+    try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(bytes));
+}
+
 test "skToPk is a fixed-base scalar multiplication of BP2" {
     var sk_bytes = [_]u8{0} ** 32;
     sk_bytes[31] = 7;

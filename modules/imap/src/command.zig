@@ -509,6 +509,12 @@ test "a non-ASCII value is a literal unless UTF-8 is accepted" {
     var e2 = s2.enc(testing.allocator, .{ .quoted_utf8 = true });
     try e2.string("caf\u{e9}");
     try testing.expectEqualStrings("\"caf\u{e9}\"", s2.written());
+
+    // The boundary: DEL is still a TEXT-CHAR (RFC 9051 §9), 0x80 is the
+    // first byte that needs UTF8=ACCEPT.
+    try testing.expect(e.quotable("\x7f"));
+    try testing.expect(!e.quotable("\x80"));
+    try testing.expect(e2.quotable("\x80"));
 }
 
 test "flags: the backslash may only lead" {
@@ -525,6 +531,7 @@ test "flags: the backslash may only lead" {
     try testing.expectError(error.InvalidFlag, e.flag("Se\\en"));
     try testing.expectError(error.InvalidFlag, e.flag(""));
     try testing.expectError(error.InvalidFlag, e.flag("with space"));
+    try testing.expectError(error.InvalidFlag, e.flag("a\\b")); // second position
 }
 
 test "tags never repeat" {
@@ -609,6 +616,7 @@ test "section specifier: the two ways out of the brackets are shut" {
     try testing.expectError(error.InvalidSection, checkSection("A\rB"));
     try testing.expectError(error.InvalidSection, checkSection("A\x00B"));
     try testing.expectError(error.InvalidSection, checkSection("caf\u{e9}"));
+    try testing.expectError(error.InvalidSection, checkSection("A\x7fB")); // DEL
 }
 
 test "round trip: what the encoder writes, the response reader's grammar reads" {

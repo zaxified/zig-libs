@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libuv 1.53.0 (event loop + process spawn + work queue) (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -78,6 +78,15 @@ zero-busy after drain — proves the acquire/release handoff is actually visible
 sequentially consistent by luck). `JobTable.spawnDetached`: real fork/exec against `/bin/true` and
 `/bin/false` (skipped if either binary is absent), asserting exact ok/fail counts and busy-count
 convergence via a bounded spin-wait. Run: `zig build test-pollworker`.
+
+**Mutation run 2026-10-05** (in-place, Debug, 22 mutants over `Loop.poll`/`tick`,
+every `JobTable` state transition, `spawnDetached`'s refusals and rollbacks,
+`OwnedArgv`, the child side of `runChild` and `decodeStatus`): 22 killed. The
+first pass left 9; seven tests were added (a signal during `poll` is `Interrupted`;
+`drain` leaves a RUNNING slot alone; an empty argv is refused without a slot; an
+allocation failure at every step of `spawnDetached` leaks nothing and frees the
+slot; every argv element reaches the child; an unexec'able target exits 127; the
+child does not inherit a non-CLOEXEC fd). None equivalent.
 
 ## Backlog / deferred
 Per the module README's "Not in scope (DEFER)": the curl-specific fetch body (buffer read,

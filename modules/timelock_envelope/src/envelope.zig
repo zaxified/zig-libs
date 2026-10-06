@@ -463,6 +463,32 @@ test "deriveKeys: round, suite and version all separate the key" {
     try testing.expect(!std.mem.eql(u8, &base.key, &other_suite.key));
 }
 
+test "deriveKeys matches an independent Python HKDF recomputation (salt, version byte, key/nonce split)" {
+    // Python hmac/hashlib, 2026-10-05: HKDF-SHA256(salt = kdf_salt,
+    // ikm = 0xA1^16 || 0xB2^32, info = label || 0x01 || 0x10 || be64(42)),
+    // 44 octets = key (32) || nonce (12). The mutation run of that date
+    // changed the salt, the version byte and the nonce offset, and the
+    // "separates" tests above stayed green.
+    const s_time = [_]u8{0xA1} ** time_secret_bytes;
+    const s_pq = [_]u8{0xB2} ** hqc.params.shared_secret_bytes;
+    const k = deriveKeys(s_time, s_pq, 16, 42);
+    var want_key: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_key, "d102cf0c3b0f168a67877302ed2e212482c701580f056baee580da9885ad5c34");
+    var want_nonce: [nonce_bytes]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want_nonce, "f06c0bf2239659f619a2d957");
+    try testing.expectEqualSlices(u8, &want_key, &k.key);
+    try testing.expectEqualSlices(u8, &want_nonce, &k.nonce);
+}
+
+test "parse rejects trailing bytes past the declared length" {
+    var buf = [_]u8{0} ** (Envelope128.overhead + 1);
+    @memcpy(buf[0..4], &magic);
+    buf[4] = version;
+    buf[5] = Envelope128.suite_id;
+    _ = try Envelope128.parse(buf[0..Envelope128.overhead]);
+    try testing.expectError(error.LengthMismatch, Envelope128.parse(&buf));
+}
+
 test "parse rejects truncated / bad-magic / wrong-version / wrong-suite / wrong-length buffers" {
     // Too short.
     try testing.expectError(error.Truncated, Envelope128.parse(&[_]u8{ 'T', 'L' }));

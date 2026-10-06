@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — **Re-survey (documentation only, no code change): scope
+  mvp → core.** `SPEC.md`'s `## Compared with` re-checked against
+  crypto-bigint 0.7.5, OpenSSL 4.0.3 and `std.crypto.ff`, with
+  `filippo.io/bigmod` and `num-bigint` added: the main use cases (CT
+  modexp over run-time odd moduli, public-exponent verify, CT inversion,
+  gcd/lcm, Miller-Rabin key generation) are covered and in use by `rsa`,
+  `paillier`, `threshold_ecdsa` and `vdf`. Remaining gaps filed under
+  Backlog: batched divsteps (per-message inversion speed), square root mod a
+  prime, Baillie-PSW, CT `compare`/`isOdd`, and the 2026-10-03 review's five
+  LOW items (all still open). The Audit line now records that review and the
+  2026-10-03 mutation runs. Stale caveats corrected: `vdf`'s `eval` loop
+  already runs on `montint` (`Modint.montSqr`), not `std.crypto.ff`, and the
+  dynamic-limb-count modulus listed as deferred shipped as `DynModint`.
+
 - **2026-10-03** — **`montint.nt` (constant-time gcd, lcm, odd part, exact
   division on limb arrays) and `DynModint.isProbablePrime`.** `nt.gcd`/`lcm`
   run divsteps on the odd parts and shift the powers of two back in;

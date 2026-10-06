@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Microsoft SEAL 4.4.5, BFV part (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -153,6 +153,24 @@ Two anchor families, per the plan:
   `scaleCheck` ACCEPTS the correct one and REJECTS the wrong one. Proves the
   scaling/noise anchor bites before `encrypt`/`decrypt` exist — this is exactly
   the dropped-`Δ` bug class the Fable core must not commit.
+
+**Mutation run 2026-10-05** (in-place, Debug, 23 mutants over the modular
+arithmetic's selects and refusals, the NTT's prime check and `N⁻¹` scaling,
+CRT reconstruction, the ternary sampler, key generation, encryption,
+decryption's rounding and `s^i` loop, relinearization's digit mask, the
+noise budget, both tensor centerings, the negacyclic fold, the BEHZ
+rounding bit and the auxiliary-prime search): 18 killed. The first pass
+left 7; tests were added for an encryption that leaves out `e0` (decryption
+cannot see it -- it only lowers the noise -- so a zero-key, scripted-draw
+KAT now pins `ct == (e0, e1)`) and for `Ntt.init` on a composite `q` with
+`2N | q − 1`. One mutant that failed to compile was rewritten until it
+built. Equivalent: `primitive2NthRoot`'s divisibility refusal (by Lagrange
+no element then has order `2N`, so the scan finds none anyway),
+`reconstruct`'s `>=` vs `>` (a partial sum equal to `q` would need every
+CRT digit to be 0), the noise budget's `<= 1` vs `< 1` (`log2(1) == 0`),
+the BEHZ rounding bit's `>` vs `>=` (`q` is odd, so `2ρ == q` never
+happens), and `NoAuxiliaryPrimes` (primes `≡ 1 mod 2N` between `2^61`
+and `2^62` are never exhausted by a handful of draws).
 
 ## Part-3 multiply (landed): exact-tensor path + worst-case noise ledger
 

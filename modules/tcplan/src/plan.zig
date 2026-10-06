@@ -162,3 +162,20 @@ test "firstOrderingViolation catches a child before its parent" {
     defer plan.deinit(gpa);
     try testing.expectEqual(@as(?usize, 0), try plan.firstOrderingViolation(gpa));
 }
+
+test "firstOrderingViolation: an mq child is available only after the mq root itself" {
+    const gpa = testing.allocator;
+    const ops = try gpa.alloc(Operation, 2);
+    // A root qdisc that is NOT the mq root, then an HTB root under mq child 1.
+    ops[0] = .{ .qdisc = .{
+        .target = .{ .ifindex = 1, .handle = tc.Handle.init(9, 0), .parent = tc.Handle.root },
+        .spec = .{ .htb = .{} },
+    } };
+    ops[1] = .{ .qdisc = .{
+        .target = .{ .ifindex = 1, .handle = tc.Handle.init(1, 0), .parent = tc.Handle.init(handles.mq_root_major, 1) },
+        .spec = .{ .htb = .{} },
+    } };
+    var plan: Plan = .{ .ops = ops };
+    defer plan.deinit(gpa);
+    try testing.expectEqual(@as(?usize, 1), try plan.firstOrderingViolation(gpa));
+}

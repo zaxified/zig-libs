@@ -577,6 +577,38 @@ test "encode refuses to overflow the length field or the buffer" {
     ));
 }
 
+test "fixed-size bodies are refused one octet long as well as short" {
+    // A Result of three octets, a Delete-FDT-Entry of seven: both one too many.
+    try testing.expectError(error.Truncated, decode(&.{ 0x81, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00 }));
+    try testing.expectError(error.Truncated, decode(&.{ 0x81, 0x08, 0x00, 0x0B, 0xCB, 0x00, 0x71, 0x09, 0xBA, 0xC0, 0x00 }));
+    // Write-BDT is held to whole entries exactly as the Read-BDT-Ack is.
+    var dgram: [32]u8 = @splat(0);
+    dgram[0] = 0x81;
+    dgram[1] = 0x01;
+    std.mem.writeInt(u16, dgram[2..4], 19, .big);
+    try testing.expectError(error.InvalidBody, decode(dgram[0..19]));
+}
+
+test "a BDT iterator over a ragged body stops at the last whole entry" {
+    // `bdtIterator` is public and takes any slice: 10 + 9 octets is one entry.
+    const body: [19]u8 = @splat(0xAA);
+    var it = bdtIterator(&body);
+    try testing.expect(it.next() != null);
+    try testing.expectEqual(@as(?BdtEntry, null), it.next());
+}
+
+test "encode refuses a datagram whose length the u16 field cannot hold" {
+    const gpa = testing.allocator;
+    const npdu_body = try gpa.alloc(u8, std.math.maxInt(u16) - header_len + 1);
+    defer gpa.free(npdu_body);
+    @memset(npdu_body, 0);
+    const out = try gpa.alloc(u8, npdu_body.len + header_len);
+    defer gpa.free(out);
+    try testing.expectError(error.NoSpace, encode(.{ .original_unicast_npdu = npdu_body }, out));
+    // One octet less is exactly 65535 and fits.
+    _ = try encode(.{ .original_unicast_npdu = npdu_body[1..] }, out);
+}
+
 /// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
 /// then the frame. Was a local copy in every file that needed it — 33 across 12
 /// modules — each with its own note about the same trap (the array has to be

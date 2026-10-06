@@ -946,6 +946,9 @@ test "MAC: constant-time verify accepts good, rejects tampered / wrong length" {
     @memcpy(&tampered, t);
     tampered[0] ^= 0x01;
     try testing.expect(!mac.verify(.hmac_sha256_trunc_16, key, msg, null, &tampered));
+    // Every bit of every octet counts, the top one included.
+    tampered[0] ^= 0x01 ^ 0x80;
+    try testing.expect(!mac.verify(.hmac_sha256_trunc_16, key, msg, null, &tampered));
     try testing.expect(!mac.verify(.hmac_sha256_trunc_16, key, msg, null, t[0..15])); // wrong length
 }
 
@@ -1052,6 +1055,7 @@ test "decode: short/garbage g120 objects are typed errors, never panic" {
     try testing.expectError(error.ShortObject, decodeObject(&.{ 120, 2 }));
     // wrong group / qualifier
     try testing.expectError(error.ShortObject, decodeObject(&.{ 99, 2, 0x5B, 1, 0, 0 }));
+    try testing.expectError(error.ShortObject, decodeObject(&.{ 120, 2, 0x5A, 1, 0, 0 }));
     // size claims more than present
     try testing.expectError(error.Truncated, decodeObject(&.{ 120, 2, 0x5B, 1, 40, 0, 0xAA }));
     var i: usize = 0;
@@ -1089,6 +1093,10 @@ test "session-key wrap/unwrap: both sides recover identical keys; wrong update k
     const keys2 = try unwrapSessionKeys(&update_key, wk2, 32, &recovered);
     try testing.expectEqualSlices(u8, &ck32, keys2.control_key);
     try testing.expectEqualSlices(u8, &mk32, keys2.monitoring_key);
+
+    // Keys that unwrap to a length other than the one asked for are refused,
+    // not cut to size.
+    try testing.expectError(error.KeyLength, unwrapSessionKeys(&update_key, wk2, 16, &recovered));
 }
 
 test "full challenge-response flow: build v1 -> compute v2 -> verify = accept; tamper = reject" {

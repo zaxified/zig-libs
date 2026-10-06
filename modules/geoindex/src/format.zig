@@ -352,3 +352,55 @@ test "Nodes.child enforces the strictly-decreasing index invariant" {
     try testing.expectError(error.Corrupt, nodes.child(root, 2)); // == parent → rejected
     try testing.expectError(error.Corrupt, nodes.child(root, 3)); // > parent → rejected
 }
+
+test "header load: region length and root/item/node consistency are each enforced at their edge" {
+    var buf: [header_size + 2 * node_size_bytes]u8 = undefined;
+    @memset(buf[header_size..], 0);
+    var h = Header{ .flags = 0, .node_count = 2, .fanout = 16, .item_count = 1, .root_index = 1 };
+    h.encode(&buf, buf[header_size..]);
+    _ = try Header.load(&buf);
+
+    // One whole node record short: the region does not fit.
+    try testing.expectError(error.Truncated, Header.load(buf[0 .. buf.len - node_size_bytes]));
+
+    // root_index == node_count is one past the last record.
+    h.root_index = 2;
+    h.encode(&buf, buf[header_size..]);
+    try testing.expectError(error.MalformedRoot, Header.load(&buf));
+
+    // An empty index must not claim nodes.
+    h = .{ .flags = 0, .node_count = 2, .fanout = 16, .item_count = 0, .root_index = 0 };
+    h.encode(&buf, buf[header_size..]);
+    try testing.expectError(error.MalformedRoot, Header.load(&buf));
+}
+
+test "Nodes.at: index == count is refused even when trailing padding would hold it" {
+    // Two records' worth of bytes (a page-rounded file), one record declared.
+    var buf: [header_size + 2 * node_size_bytes]u8 = undefined;
+    @memset(&buf, 0);
+    encodeLeaf(&buf, header_size, 1.0, 1.0, 5);
+    const h = Header{ .flags = 0, .node_count = 1, .fanout = 16, .item_count = 1, .root_index = 0 };
+    h.encode(&buf, buf[header_size..][0..node_size_bytes]);
+    const nodes = Nodes.init(&buf, try Header.load(&buf));
+    try testing.expectError(error.Corrupt, nodes.at(1));
+}
+
+test "Nodes.at: a record running one byte past the buffer is refused" {
+    // An inconsistent Nodes (count larger than the buffer holds), which `at`
+    // promises to survive: the last record is one byte short.
+    var buf: [header_size + 2 * node_size_bytes - 1]u8 = undefined;
+    @memset(&buf, 0);
+    const nodes = Nodes{ .buf = &buf, .count = 2 };
+    _ = try nodes.at(0);
+    try testing.expectError(error.Corrupt, nodes.at(1));
+}
+
+test "Nodes.at: only bit0 of flags marks a leaf; reserved bits do not" {
+    var buf: [header_size + node_size_bytes]u8 = undefined;
+    encodeLeaf(&buf, header_size, 1.0, 1.0, 5);
+    buf[header_size + off_flags] = 0x02; // reserved bit set, leaf bit clear
+    const nodes = Nodes{ .buf = &buf, .count = 1 };
+    try testing.expect(!(try nodes.at(0)).leaf);
+    buf[header_size + off_flags] = 0x03;
+    try testing.expect((try nodes.at(0)).leaf);
+}

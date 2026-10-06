@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 30 of 36 killed, 6 equivalent; 7 tests added and
+  1 extended (the σ₁' = 1 universal forgery, a ν and an `s` with an order-3
+  component, the proof's own mask, extra disclosed values, a zero `r'` draw,
+  every `ShowProof.fromBytes` refusal, `signPartial`/`aggregateCredential`
+  input refusals, a zero Lagrange node, mismatched vk shares). No code change.
 - **2026-10-03** — `decodeG1`/`decodeG2` rely on `bls12_381`'s checked decoders, which
   now refuse a point outside the subgroup themselves (the hole of `c8d601e7` closed
   at the source).

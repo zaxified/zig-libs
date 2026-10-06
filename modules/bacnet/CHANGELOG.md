@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-05** — Mutation run: 26 of 43 killed, 0 equivalent; 7 tests added
+  and 8 existing tests extended (fixed-size BVLC bodies one octet long, ragged
+  Write-BDT and `bdtIterator` bodies, the u16 length on encode, DLEN one past
+  the buffer, trailing octets on two network messages and SegmentACK, `skip`
+  at a foreign closing bracket, day 0 / second 60, a wide context enumeration,
+  the Confirmed-Request reserved bit, `forOctets(206)`, an SC option one octet
+  short, `max_options + 1`, invoke-id wrap onto a live transaction). All 43
+  killed after. No library code changed.
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** the BACnet/SC hub and node
   fuzz harnesses recorded what their seeds bought in a source comment, which
   nothing re-evaluates. Both bodies are now factored into `driveHub`/`driveNode`

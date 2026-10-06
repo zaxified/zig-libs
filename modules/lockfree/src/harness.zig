@@ -439,6 +439,14 @@ test "CHECKER TEETH: the multiset verifier rejects lost / duplicated / corrupt h
         try l.appendSlice(alloc, &.{ encode(0, 0), 0xA5A5_A5A5_A5A5_A5A5, encode(0, 2), encode(1, 0), encode(1, 1), encode(1, 2) });
         try testing.expectEqual(Verdict.corrupted, try verify(cfg, &.{l}, alloc));
     }
+    // A producer id exactly one past the last real producer → corrupted (an
+    // off-by-one here would index `seen` past its end).
+    {
+        var l: std.ArrayListUnmanaged(u64) = .empty;
+        defer l.deinit(alloc);
+        try l.appendSlice(alloc, &.{ encode(0, 0), encode(0, 1), encode(0, 2), encode(1, 0), encode(1, 1), encode(2, 0) });
+        try testing.expectEqual(Verdict.corrupted, try verify(cfg, &.{l}, alloc));
+    }
 }
 
 test "ORACLE IS CLEAN: the driver reports `clean` over the correct spinlock queue (no false positive)" {

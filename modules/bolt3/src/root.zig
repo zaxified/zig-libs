@@ -93,6 +93,9 @@ pub fn derivePublicKey(basepoint: [33]u8, per_commitment_point: [33]u8) Error![3
 pub fn derivePrivateKey(basepoint_secret: [32]u8, per_commitment_secret: [32]u8) Error![32]u8 {
     var b = Scalar.fromBytes(basepoint_secret, .big) catch return error.InvalidSecret;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+    // `pointOf` (k256 `combMulBase`) reduces a scalar >= n instead of
+    // refusing it, so canonicality is checked here, as for every other secret.
+    _ = Scalar.fromBytes(per_commitment_secret, .big) catch return error.InvalidSecret;
     const basepoint = pointOf(basepoint_secret) catch return error.InvalidSecret;
     const per_commitment_point = pointOf(per_commitment_secret) catch return error.InvalidSecret;
     const t = hashToScalar(sha2(per_commitment_point, basepoint));
@@ -255,6 +258,28 @@ test "revocation derivation: invalid point / secret surface as typed errors" {
     try std.testing.expectError(error.InvalidPoint, deriveRevocationPublicKey(tv_base_point, bad33));
     try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(bad32, tv_pcs));
     try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(tv_base_secret, bad32));
+}
+
+test "every input is validated: bad per_commitment_point, zero or >= n secrets" {
+    // Mutation run 2026-10-05: each of these refusals could be deleted (or
+    // re-labelled) without any test above noticing.
+    const bad33 = [_]u8{0} ** 33;
+    const zero = [_]u8{0} ** 32;
+    const over_n = [_]u8{0xff} ** 32; // > n: not a canonical scalar
+    try std.testing.expectError(error.InvalidPoint, derivePublicKey(tv_base_point, bad33));
+    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(tv_base_secret, zero));
+    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(over_n, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(over_n, tv_pcs));
+    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(tv_base_secret, over_n));
+}
+
+test "regression: derivePrivateKey refuses a per_commitment_secret >= n" {
+    // Found by the 2026-10-05 mutation run: `pointOf` (k256 `combMulBase`)
+    // reduces a non-canonical scalar mod n, so this secret was accepted and
+    // silently reduced, while `deriveRevocationPrivateKey` refused the same
+    // bytes and `Error.InvalidSecret` promises a canonical (< n) scalar.
+    const over_n = [_]u8{0xff} ** 32;
+    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(tv_base_secret, over_n));
 }
 
 fn hex32(comptime s: *const [64]u8) [32]u8 {

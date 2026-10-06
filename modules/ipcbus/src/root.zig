@@ -569,3 +569,119 @@ test "framing bridge: truncated body (peer closed) errors, does not hang" {
     var payload_buf: [64]u8 = undefined;
     try testing.expectError(error.EndOfStream, framing.readFrame(&fr.interface, &payload_buf, .{}));
 }
+
+fn isCloexec(fd: Fd) !bool {
+    const rc = linux.fcntl(fd, linux.F.GETFD, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.BadFd;
+    return rc & linux.FD_CLOEXEC != 0;
+}
+
+test "listen, connect and accept fds are all CLOEXEC" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    try testing.expect(try isCloexec(srv.listen_fd));
+
+    const c = try connectUnix(path); // queued in the backlog; accept below
+    defer closeFd(c);
+    try testing.expect(try isCloexec(c));
+    const a = try srv.acceptOne();
+    defer closeFd(a);
+    try testing.expect(try isCloexec(a));
+}
+
+test "Server.listen replaces a stale socket file; deinit removes its own" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    // A previous owner that died without cleaning up: its path is still bound.
+    const stale = try listenUnix(path);
+    closeFd(stale);
+
+    var srv = try Server.listen(path);
+    try testing.expect(linux.errno(linux.access(path.ptr, linux.F_OK)) == .SUCCESS);
+    srv.deinit();
+    try testing.expect(linux.errno(linux.access(path.ptr, linux.F_OK)) == .NOENT);
+}
+
+test "writeAllFd / readExact move every byte, one-byte messages included, and readExact reports EOF" {
+    // Non-blocking, so a byte that was never written fails the read instead of
+    // hanging it.
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[1]);
+
+    try writeAllFd(fds[0], "x");
+    try writeAllFd(fds[0], "yz");
+    var got: [3]u8 = undefined;
+    try readExact(fds[1], got[0..1]);
+    try readExact(fds[1], got[1..3]);
+    try testing.expectEqualStrings("xyz", &got);
+
+    try writeAllFd(fds[0], "q");
+    closeFd(fds[0]);
+    var two: [2]u8 = undefined;
+    try testing.expectError(error.EndOfStream, readExact(fds[1], &two));
+}
+
+test "FdWriter.drain writes every slice and the splatted pattern, and reports the count" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[1]);
+
+    // No buffer: every write goes straight to `drain`.
+    var fw = FdWriter.init(fds[0], &.{});
+    const n = try fw.interface.writeSplat(&.{ "ab", "c" }, 3);
+    try testing.expectEqual(@as(usize, 5), n);
+    closeFd(fds[0]);
+
+    var got: [8]u8 = undefined;
+    var len: usize = 0;
+    while (len < got.len) {
+        const rc = linux.read(fds[1], got[len..].ptr, got.len - len);
+        try testing.expect(linux.errno(rc) == .SUCCESS);
+        if (rc == 0) break;
+        len += rc;
+    }
+    try testing.expectEqualStrings("abccc", got[0..len]);
+}
+
+test "handleOne closes the connection fd it was given" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+
+    var wbuf: [64]u8 = undefined;
+    var fw = FdWriter.init(fds[0], &wbuf);
+    try framing.writeFrame(&fw.interface, "hi", .{});
+    try fw.interface.flush();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try Server.handleOne(fds[1], {}, echoDispatch, arena.allocator(), .{});
+    try testing.expectError(error.BadFd, isCloexec(fds[1]));
+
+    var rbuf: [64]u8 = undefined;
+    var fr = FdReader.init(fds[0], &rbuf);
+    var reply: [8]u8 = undefined;
+    try testing.expectEqualStrings("hi", try framing.readFrame(&fr.interface, &reply, .{}));
+}
+
+test "Bus: clear bumps version" {
+    var bus = Bus(2).init(testing.allocator);
+    defer bus.deinit();
+    try bus.set("a", "1");
+    const v = bus.version;
+    bus.clear();
+    try testing.expect(bus.version > v);
+}
+
+fn setNewKey(gpa: std.mem.Allocator) !void {
+    var bus = Bus(2).init(gpa);
+    defer bus.deinit();
+    try bus.set("key", "value");
+}
+
+test "Bus.set leaks nothing when any of its allocations fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, setNewKey, .{});
+}

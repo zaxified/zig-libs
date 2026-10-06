@@ -6,7 +6,7 @@
 
 **Scope:** mvp — RFC 6976 ordered-FIB (oFIB) / Francois et al.; no open implementation found (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation none
+**Audit:** review 2026-07-19 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -150,6 +150,22 @@ are equivalent — see `fib.zig`).
   plus the serializing conductor, finds **no** forwarding loop.
 - unit tests for `changedNodes`, `naiveBadOrder`, `buildGraph`/`applyInitialFib`,
   and `applyTopologyChange` scheduling.
+- **Mutation run 2026-10-05** (in-place, Debug, 32 mutants over
+  `changedNodes`, the two-class order and its tie-breaks, the conductor's
+  serialization and spacing, the loop checker's slot ownership, the message
+  and timer guards, `reset`, and the harness's `findFailing`/ddmin): 28
+  killed. The first pass left 13; tests added for an equal-distance shift
+  being class B and ties breaking by ascending id in both classes, a moved
+  distance with an unmoved next hop not being "changed", a reused frame slot,
+  the 3-octet payload and unminted conductor-id guards, `reset` clearing every
+  per-run field, and `findFailing`'s inclusive `end`. Equivalent: the
+  redundant-event early return (old and new trees are equal, the order is
+  empty), skipping the destination check (the destination's next hop is
+  `null`, so the frame is retired as dropped instead — nothing counts
+  deliveries), the shrinker matching only `.violated` (`ForwardingLoop` is
+  the only violation), and not lowering ddmin's granularity after a removal
+  (termination still needs a full pass at `granularity == len`, so the result
+  stays 1-minimal).
 
 ## Backlog / deferred
 

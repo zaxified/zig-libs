@@ -6,7 +6,7 @@
 
 **Scope:** mvp — opendnp3 3.1.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation none
+**Audit:** review 2026-09-02 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -327,6 +327,19 @@ FIR/FIN/CON/SEQ, `dnp3.al.iin.rst` set before the WRITE of g80v1 and clear after
 set exactly on the responses that carried class-1 events, and the object identifiers in each
 class-0 response (0x0102 g1v2, 0x0302 g3v2, 0x0a02 g10v2, 0x1401 g20v1, 0x1501 g21v1, 0x1e01 g30v1,
 0x2801 g40v1) plus 0x0b02/0x0202 on the event response and 0x3402 (g52v2) on the restart reply.
+
+**Mutation run 2026-10-05** (in-place, Debug, 38 mutants over the link frame
+checks and CRCs, transport reassembly, the SA MAC compare, g120 object decoding,
+session-key unwrap, `SeqCounter`/`KeyExpiry`, and the outstation's
+select-before-operate gate, command and read/freeze range checks): 28 killed.
+Nine survivors were missing tests, now added: the second start octet on its
+own, a continuation after a FIN, bit 7 of a tampered MAC (`ctEql`), session
+keys that unwrap to the wrong length, a g120 header with the wrong qualifier, a
+read range and a freeze range ending one past the last point, `update`/
+`reportChange` one past the database, and a SELECT of exactly
+`max_select_bytes`. Equivalent: dropping `user_len > max_user_data_len` in
+`decodeFrame` (the length octet caps `user_len` at 255 − 5 = 250, which is the
+limit).
 
 ## Backlog / deferred
 

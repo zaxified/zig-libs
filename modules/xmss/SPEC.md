@@ -6,7 +6,7 @@
 
 **Scope:** mvp — xmss-reference (RFC 8391 reference code), go-xmssmt (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation none
+**Audit:** review 2026-09-11 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -191,6 +191,23 @@ left/right-subtree transition (the part of BDS most likely to be
 mis-ported); a dedicated test jumps `idx` out of band (skipping several
 leaves, and landing exactly on the h = 6 transition leaf) and confirms
 the auto-resync still reproduces the from-scratch auth path byte-exactly.
+
+**Mutation run 2026-10-05** (in-place, ReleaseSafe, 24 mutants over both
+exhaustion checks, the index advance and the BDS `covered_idx`/resync
+bookkeeping, the `SigningKey` copy guard and persist hook, `verify`'s
+length check, tree walk and root comparison, the public-key OID check,
+base-w and the checksum, the L-tree carry, the chain and tree bitmasks,
+`H_msg`'s index, the per-leaf `r`, `zeroize`, and BDS's round bound and
+treehash restart): 23 killed. Not advancing `idx` (index reuse) fails two
+tests outright; two exhaustion loops never end under it and were stopped
+by hand. The first pass left 2; the external-vector test now also checks
+2048 tampered randomizers, because a root compared in one byte was
+accepted by every existing rejection (each gives an unrelated root, which
+matches one byte 1 time in 256). One mutant that failed to compile was
+rewritten until it built. Equivalent: BDS's `startidx < 2^h` as `<=`
+(`startidx == 2^h` needs `leaf + 1 = 2^h − 3·2^i` while `2^tau` divides
+`leaf + 1` for some `tau > i`, and that number's 2-adic valuation is
+exactly `i`).
 
 ## Threat notes
 

@@ -661,6 +661,15 @@ test "VerificationVector.fromBytesAlloc rejects a length/count mismatch" {
     var bytes = [_]u8{0} ** 4;
     std.mem.writeInt(u32, bytes[0..4], 3, .big); // claims 3 commitments, has 0
     try std.testing.expectError(error.InvalidEncoding, VerificationVector.fromBytesAlloc(allocator, &bytes));
+
+    // Trailing bytes past the declared count are refused too (mutation
+    // run 2026-10-05: `!=` weakened to `<` survived).
+    var long = [_]u8{0} ** (4 + g1.compressed_bytes + 1);
+    std.mem.writeInt(u32, long[0..4], 1, .big);
+    long[4..][0..g1.compressed_bytes].* = g1.toBytesCompressed(g1.Affine.generator);
+    const exact = try VerificationVector.fromBytesAlloc(allocator, long[0 .. long.len - 1]);
+    allocator.free(exact.commitments);
+    try std.testing.expectError(error.InvalidEncoding, VerificationVector.fromBytesAlloc(allocator, &long));
 }
 
 test "groupPublicKey extracts commitments[0]" {

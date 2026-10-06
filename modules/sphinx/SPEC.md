@@ -6,7 +6,7 @@
 
 **Scope:** mvp — lightning-onion (lnd's `sphinx`) / LDK `onion_utils` (BOLT#4) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation none
+**Audit:** review 2026-09-09 · mutation 2026-10-05
 
 **Known defects:** none recorded
 
@@ -269,6 +269,22 @@ new ones); `kat_test.zig` now carries zero skips:
 - Both `zig build test-sphinx` (Debug) and `-Doptimize=ReleaseFast` pass
   in full, with no skips; the full repo `zig build test` is green;
   `zig fmt --check modules/sphinx/` is clean.
+- **Mutation run 2026-10-05** (in-place, Debug, 36 mutants over `construct`'s
+  route checks and filler, `process`'s HMAC gate, frame-error mapping and
+  `consumed` bound, the blinding chain, `hopframe`, `bigsize`, `packet` and
+  `keyderive`): 21 killed on the first pass (two more were mis-written and
+  re-run as valid mutants). Five tests added or extended for the ten others:
+  `process` on genuinely-MACed frames of length 0, 1, a non-canonical BigSize
+  and a 1290-octet payload that runs past 1300 octets (via a test-only
+  sealing helper, since `construct` refuses to emit them); one hop filling
+  exactly 1300 octets through `construct` and `process`; an off-curve
+  ephemeral key passed straight to `process`; the hop frame's one-short
+  destination, length-1 and exact-fit edges; BigSize `fd00fc`. Equivalent:
+  `n > max_hops + 1` (38 hops need at least 38 × 35 > 1300 octets, so
+  `RouteTooLong` comes from the shift total), `construct`'s own `len < 1` for
+  `len < 2` (`writeHopFrame` refuses the same payload with the same error),
+  and `std.mem.eql` for `timing_safe.eql` on the HMAC (same value for every
+  input; pinned by `check-ct-compare.py`, not by a test).
 
 ## Backlog / deferred
 
