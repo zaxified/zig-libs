@@ -61,6 +61,8 @@ pub const verifyRoundPoints = verify.verifyRoundPoints;
 pub const verifyChainedRoundPoints = verify.verifyChainedRoundPoints;
 pub const chainedMessage = verify.chainedMessage;
 pub const chained_dst = verify.chained_dst;
+pub const QuicknetSuite = verify.QuicknetSuite;
+pub const ChainedSuite = verify.ChainedSuite;
 pub const expectedRound = verify.expectedRound;
 
 /// Re-exported: the sibling crypto module every point/pairing comes from.

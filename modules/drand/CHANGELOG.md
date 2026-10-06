@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL (stricter only on hand-built points), API ADDED:** both schemes
+  now verify through `bls12_381.scheme`: new `QuicknetSuite` (= `MinSigBasic`) and `ChainedSuite`
+  (= `MinPkBasic`); `verifyRoundPoints` / `verifyChainedRoundPoints` keep their signatures and
+  are each one suite `verify` call (the hand-written pairing equations are gone). The suite runs
+  `KeyValidate` on the KEY as well, which closes a gap at the points level:
+  `verifyChainedRoundPoints` accepted a genuine beacon under `pk + T` (`T` a `G1` cofactor-torsion
+  point — the bare equation holds for it); now refused, pinned by a test. `parseInfo` already
+  refused such keys, so `verifyRound` callers see no change. Cost: ~0.17 ms (quicknet) /
+  ~0.12 ms (chained) per call for the key check. `chained_dst` is now `ChainedSuite.dst_sig`
+  (same bytes, comptime-asserted).
 - **2026-10-06** — ADDED: verification of the chained `pedersen-bls-chained` scheme, i.e. the
   League of Entropy "default" network (chain `8990e7a9…b2ce`). `verifyRound` now dispatches on
   the scheme; new `verifyChainedRoundPoints(pk_g1, round, previous_signature, sig_g2)`,

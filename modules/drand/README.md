@@ -82,9 +82,12 @@ oversized JSON or hex yields a typed error (`ParseError` /
 `RoundParseError`), never a panic, OOB read, hang, or amplified
 allocation (documents over 64 KiB are rejected up front).
 
-`verifyRoundPoints(pubkey, round, sig)` exposes the raw pairing equation
-for a caller that already holds decoded `bls12_381` points (e.g. from
-`tlock`).
+`verifyRoundPoints(pubkey, round, sig)` verifies already-decoded
+`bls12_381` points (e.g. from `tlock`). Both schemes are standard BLS
+ciphersuites: `drand.QuicknetSuite` is `bls12_381.scheme.MinSigBasic` and
+`drand.ChainedSuite` is `MinPkBasic`, and the points-level functions are
+their `verify` (with drand's message hashing), so every operand gets
+`KeyValidate` there as well as at parse time.
 
 ### The chained default network
 

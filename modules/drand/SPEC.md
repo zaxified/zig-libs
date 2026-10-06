@@ -86,8 +86,9 @@ period 30 s, genesis 1595431050).
   and by a positive control that they FAIL under the `_POP_` tag, the G1
   tag, and with round and previous signature swapped in the digest. The
   non-conformant DST belongs to `bls-unchained-on-g1`.
-- Equation: `e(public_key, H2(m)) == e(G1_generator, signature)`, as one
-  `pairingCheck` with the generator negated (`verifyChainedRoundPoints`).
+- Equation: `e(public_key, H2(m)) == e(G1_generator, signature)` —
+  `ChainedSuite.verify` (`bls12_381.scheme.MinPkBasic`), reached through
+  `verifyChainedRoundPoints`.
 - `verifyRound` checks the signature over the `previous_signature` the
   document claims; it does not check that the claim is the real previous
   round's signature. That is sound (the network signed the pair, so a
@@ -101,31 +102,41 @@ period 30 s, genesis 1595431050).
 
 ## The verification algorithm
 
-(The chained default network's equation is in its section above.)
-quicknet's verify is drand's `crypto.Scheme.VerifyBeacon`, i.e. the BLS
-verification equation with signatures and key in the SWAPPED groups
-relative to `bls12_381.bls_sig`:
+Both verified schemes are standard ciphersuites of
+draft-irtf-cfrg-bls-signature-05 in their **Basic** (`_NUL_`) form, and
+since 2026-10-06 this module verifies through them
+(`bls12_381.scheme`), owning no pairing equation of its own:
+
+| drand scheme | suite | key | signature | message |
+|---|---|---|---|---|
+| quicknet `bls-unchained-g1-rfc9380` | `QuicknetSuite` = `MinSigBasic` | `G2` | `G1` | `beaconId(round)` |
+| default `pedersen-bls-chained` | `ChainedSuite` = `MinPkBasic` | `G1` | `G2` | `chainedMessage(round, previous_signature)` |
+
+quicknet's equation (drand's `crypto.Scheme.VerifyBeacon`) is
 
 ```
 e(signature, G2_generator) == e(H1(beaconId(round)), public_key)
 ```
 
-evaluated as a single multi-pairing identity check
-(`bls12_381.pairing.pairingCheck`) with the second pairing's G1 point
-negated, so the product is the target-group identity iff the equation
-holds. No cryptography is reimplemented in this module: the pairing and
-hash-to-curve are `bls12_381`'s, and the message hashing is
-`tlock.ciphersuite`'s.
+and the suite's `verify` evaluates it as one multi-pairing with one side
+negated, after `KeyValidate` of BOTH operands (non-identity, order-`r`
+subgroup). `beaconId` is `tlock.ciphersuite`'s, and a comptime check pins
+`tlock`'s `G1` DST to the suite's, so `drand` and `tlock` cannot drift on
+quicknet.
 
-### Why not `bls12_381.bls_sig.verify`
+### History: why this was a hand-written pairing until 2026-10-06
 
-`bls_sig` implements the **minimal-pubkey-size / ProofOfPossession**
-ciphersuite: keys in G1, signatures in G2, messages hashed to G2 under
-`..._RO_POP_`. quicknet is the mirror image (sig in G1, key in G2, hash
-to G1 under `..._RO_NUL_`). Both the groups AND the DST differ, so
-`bls_sig.verify` structurally cannot verify a quicknet round — hence the
-direct pairing check. (This corrected a premise in the build brief,
-which assumed `bls_sig.verify` plus a DST swap would suffice.)
+`bls12_381` used to offer only `bls_sig`, the min-pk / ProofOfPossession
+suite (`_POP_` DST). That verifies neither drand scheme (quicknet has the
+groups swapped, chained the other DST), so both equations were evaluated
+directly on `bls12_381.pairing` with hand-written identity and
+signature-subgroup guards. When `bls12_381.scheme` gained all six suites,
+the two functions became one call each. The move closed one gap: the
+hand-written versions left the key's subgroup membership to `parseInfo`,
+so `verifyChainedRoundPoints` accepted a genuine beacon under `pk + T`
+for a `G1` cofactor-torsion `T` (the bare equation holds for it; a test
+now pins the refusal). Cost of the added key check: ~0.17 ms (quicknet's
+`G2` key) or ~0.12 ms (chained's `G1` key) of a ~4.3 ms verification.
 
 ### randomness
 
@@ -240,7 +251,10 @@ stop) feeding crafted bytes:
   measured NOT to pass the bare pairing (the ate pairing is bilinear only
   on the order-`r` subgroup of `G2`), so for this scheme the subgroup check
   is defence in depth rather than the only guard; it stays, at parse and
-  in `verifyChainedRoundPoints`. A tampered signature, round,
+  in `verifyChainedRoundPoints`. The KEY's subgroup check, by contrast, is
+  load-bearing at the points level: `pk + T` for a `G1` torsion `T` pairs
+  like `pk`, so only `KeyValidate` refuses it (since 2026-10-06 run inside
+  `verifyChainedRoundPoints` too, not only at `parseInfo`). A tampered signature, round,
   `previous_signature` (altered, swapped for another round's, or dropped)
   or `randomness` is refused — each pinned by a test on genuine beacons —
   and a G1-signature round against the chained chain (or the reverse) is

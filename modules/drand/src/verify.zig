@@ -2,53 +2,45 @@
 
 //! verify — BLS-verify a drand beacon round against its chain public key.
 //!
-//! ## Why a raw pairing check, not `bls12_381.bls_sig.verify`
+//! ## Both schemes are standard BLS ciphersuites — verified through `bls12_381.scheme`
 //!
-//! `bls12_381.bls_sig` implements the **minimal-pubkey-size /
-//! ProofOfPossession** ciphersuite: public keys in `G1` (48 B),
-//! signatures in `G2` (96 B), messages hashed to `G2` under the DST
-//! `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`. drand's quicknet is the
-//! MIRROR IMAGE — `bls-unchained-g1-rfc9380`: signatures in `G1` (48 B),
-//! public key in `G2` (96 B), message hashed to `G1` under the RFC-9380
-//! `..._NUL_` DST. The groups AND the DST differ, so `bls_sig.verify`
-//! cannot verify a quicknet round. This module instead performs the same
-//! verification equation drand's own `crypto.Scheme.VerifyBeacon` uses,
-//! directly on `bls12_381.pairing`:
+//! drand's two live mainnet schemes are, byte for byte, two of the six
+//! ciphersuites of draft-irtf-cfrg-bls-signature-05 in their **Basic**
+//! (`_NUL_`) form, so this module verifies through
+//! `bls12_381.scheme` and owns no pairing equation of its own:
 //!
-//! ```
-//! e(signature, G2_generator) == e(H1(beaconId(round)), public_key)
-//! ```
+//! - **quicknet** — `bls-unchained-g1-rfc9380`: signatures in `G1`
+//!   (48 B), public key in `G2` (96 B), message hashed to `G1` under
+//!   `BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_`. That is
+//!   `scheme.MinSigBasic`; the signed message is
+//!   `beaconId(round) = SHA-256(u64be(round))`, REUSED from
+//!   `tlock.ciphersuite` (so this module and `tlock` can never drift on
+//!   quicknet; a comptime check pins `tlock`'s DST to the suite's).
+//! - **the chained default network** — `pedersen-bls-chained` (chain hash
+//!   `8990e7a9…b2ce`): public key in `G1` (48 B), signature in `G2`
+//!   (96 B), message hashed to `G2` under the STANDARD RFC 9380
+//!   `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`. That is
+//!   `scheme.MinPkBasic`. The signed digest folds in the previous round's
+//!   signature — drand's `DigestBeacon` for this scheme:
+//!   `m = SHA-256(previous_signature ‖ u64be(round))` (nothing written for
+//!   an empty `previous_signature`). Source for the DST: drand/drand
+//!   v2.1.7 `crypto/schemes.go` `NewPedersenBLSChained`
+//!   (`bls.NewBLS12381SuiteWithDST(…G1…RO_NUL_, …G2…RO_NUL_)`, the comment
+//!   there reads "default RFC9380 DST for G2"); confirmed by verifying three
+//!   genuine default-chain beacons below, and by the positive control that
+//!   the same beacons FAIL under the `_POP_` DST. (The non-RFC DST belongs
+//!   to the deprecated `bls-unchained-on-g1`, which hashes to `G1` under
+//!   the `G2` DST — still unverified here.)
 //!
-//! rearranged into a single multi-pairing product-is-identity check
-//! (`pairingCheck`) with the second pairing's `G1` point negated. The
-//! message hashing — `beaconId(round) = SHA-256(round_be)` and
-//! `H1 = hashToCurveG1(·, "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_")`
-//! — is REUSED verbatim from `tlock.ciphersuite` (this module and `tlock`
-//! therefore can never drift on the quicknet scheme). No cryptography is
-//! reimplemented here: every primitive comes from `bls12_381`/`tlock`.
-//!
-//! ## The chained default network — `pedersen-bls-chained`
-//!
-//! The League of Entropy "default" chain (chain hash `8990e7a9…b2ce`) has
-//! the groups the other way round: public key in `G1` (48 B), signature
-//! in `G2` (96 B). The signed digest folds in the previous round's
-//! signature — drand's `DigestBeacon` for this scheme:
-//!
-//! ```
-//! m = SHA-256(previous_signature ‖ u64be(round))   (previous_signature omitted when empty)
-//! e(public_key, H2(m)) == e(G1_generator, signature)
-//! ```
-//!
-//! `H2 = hashToCurveG2(·, "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_")` —
-//! the STANDARD RFC 9380 `G2` `_NUL_` DST, not a legacy one. Source:
-//! drand/drand v2.1.7 `crypto/schemes.go` `NewPedersenBLSChained`
-//! (`bls.NewBLS12381SuiteWithDST(…G1…RO_NUL_, …G2…RO_NUL_)`, the comment
-//! there reads "default RFC9380 DST for G2"); confirmed by verifying three
-//! genuine default-chain beacons below, and by the positive control that
-//! the same beacons FAIL under the `_POP_` DST. (The non-RFC DST belongs to
-//! the deprecated `bls-unchained-on-g1`, which hashes to `G1` under the
-//! `G2` DST — still unverified here.) This is `bls12_381.bls_sig`'s group
-//! layout but its `_POP_` DST, so `bls_sig.verify` still cannot be used.
+//! Until 2026-10-06 this file evaluated both equations directly on
+//! `bls12_381.pairing`, because `bls12_381` then offered only the
+//! min-pk / ProofOfPossession suite (`_POP_` DST), which verifies neither.
+//! The suite's `verify` runs drand's `KeyValidate` on BOTH operands
+//! (signature subgroup check; key non-identity + subgroup), which is what
+//! the two guards here had been rebuilding by hand — with one gap: the
+//! key's subgroup membership was left to `parseInfo`. It is now checked
+//! on every call too (~0.17 ms for quicknet's `G2` key, ~0.12 ms for the
+//! chained `G1` key, of a ~4.3 ms verification).
 //!
 //! ## Randomness check
 //!
@@ -97,61 +89,53 @@ pub const VerifyError = error{
     RandomnessMismatch,
 };
 
-/// The BLS-verification equation for one quicknet round, on already-
-/// decoded points. Returns whether
-/// `e(sig, G2gen) == e(H1(beaconId(round)), pubkey)` holds.
+/// The quicknet ciphersuite: draft-irtf-cfrg-bls-signature-05
+/// min-signature-size, Basic — sig in `G1`, key in `G2`, `G1` `_NUL_` DST.
+pub const QuicknetSuite = bls12_381.scheme.MinSigBasic;
+
+/// The `pedersen-bls-chained` ciphersuite: min-pubkey-size, Basic — key in
+/// `G1`, sig in `G2`, `G2` `_NUL_` DST.
+pub const ChainedSuite = bls12_381.scheme.MinPkBasic;
+
+comptime {
+    // `beaconId`/`h1` come from `tlock.ciphersuite`; the hash-to-curve the
+    // suite runs must be the one `tlock` decrypts under.
+    std.debug.assert(std.mem.eql(u8, QuicknetSuite.dst_sig, ciphersuite.dst_g1));
+}
+
+/// The BLS verification of one quicknet round, on already-decoded points:
+/// whether `sig` is a valid `QuicknetSuite` signature over
+/// `beaconId(round)` under `pubkey`
+/// (`e(sig, G2gen) == e(H1(beaconId(round)), pubkey)`).
 ///
 /// This is the low-level core; `verifyRound` wraps it with scheme
 /// dispatch and the `randomness` check. Exposed so a caller who already
 /// holds decoded points (e.g. from `tlock`) can reuse the exact same
 /// check `tlock`'s trust-boundary note points at.
+///
+/// Both operands get `KeyValidate` inside the suite: the identity is
+/// refused (with both the identity the equation is `1 == 1` for every
+/// round — found by the 1A mutation audit when this was a hand-written
+/// pairing), and so is a point outside the order-`r` subgroup. For the
+/// `G1` signature that check is the ONLY guard against malleation: the
+/// pairing is blind to a cofactor-torsion addend `T` (`e(T, Q) = 1`), so
+/// `sig + T` would satisfy the same equation with different wire bytes
+/// (wave-2 audit W2-32). `parseInfo`/`parseRound` refuse all of these at
+/// the parse boundary as well; the guards here are for callers who skip
+/// the parsers.
 pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
-    // ⚠ Reject the identity on BOTH operands before pairing. A pairing with
-    // an identity operand is the target-group identity, so with
-    // `pubkey == 1` and `sig == 1` the equation degenerates to `1 == 1` and
-    // this returned TRUE for every round — a total forgery of this
-    // primitive. `verifyRound` happened to be safe only because
-    // `chaininfo.parseInfo` rejects an identity-encoded public key upstream;
-    // `round.parseRound` does not reject an identity signature, and this
-    // function's own doc comment invites callers to skip both parsers. A
-    // guard living in a caller is not a guard this function has.
-    // Found by the 1A mutation audit.
-    if (pubkey.infinity or sig.infinity) return false;
-
-    // ⚠ Reject a signature that is on the curve but OUTSIDE the order-`r`
-    // subgroup. The pairing equation below is blind to a cofactor-torsion
-    // addend `T`: `e(T, Q)` has order dividing `gcd(ord(T), r) = 1`, so
-    // `e(sig + T, Q) = e(sig, Q)` and the malleated `sig' = sig + T`
-    // satisfies the same equation with different wire bytes. `parseRound`
-    // rejects such a point at the parse boundary; this is the same guard
-    // for the callers this function's doc comment invites to skip the
-    // parser (a guard living in a caller is not a guard this function
-    // has). The public key's subgroup membership is guaranteed by
-    // `chaininfo.parseInfo`; a caller supplying a `g2.Affine` from
-    // elsewhere must run `g2.Jacobian.fromAffine(pk).subgroupCheck()`
-    // itself. Since `bls12_381`'s endomorphism-based subgroup checks
-    // (2026-09-15, A1 F4) the G2 check costs ~0.17 ms and this G1 one
-    // ~0.12 ms (were 3.25 ms and 0.96 ms under `[r]P == O`), and since
-    // its inversion-free Miller loop (2026-09-16, same finding) the whole
-    // verification is ~4.3 ms rather than ~9.7 ms — so skipping the key
-    // check would now save ~4 %, not ~2 %. It is kept anyway, because the
-    // parser has already validated that point; what changed is that the
-    // argument for keeping it got cheaper to make, not weaker.
-    // Found by the wave-2 audit (W2-32).
-    if (!g1.Jacobian.fromAffine(sig).subgroupCheck()) return false;
-
-    const qid = ciphersuite.h1(ciphersuite.beaconId(round));
-    const neg_qid = g1.Jacobian.fromAffine(qid).negate().toAffine();
-    return pairing.pairingCheck(&.{
-        .{ .p = sig, .q = g2.Affine.generator },
-        .{ .p = neg_qid, .q = pubkey },
-    });
+    const msg = ciphersuite.beaconId(round);
+    return QuicknetSuite.verify(.{ .point = pubkey }, &msg, .{ .point = sig });
 }
 
 /// The DST `pedersen-bls-chained` hashes its digest to `G2` under: the
 /// standard RFC 9380 `G2` `_NUL_` tag (drand/drand `crypto/schemes.go`,
-/// `NewPedersenBLSChained`). See the module doc comment.
-pub const chained_dst = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+/// `NewPedersenBLSChained`) — `ChainedSuite`'s. See the module doc comment.
+pub const chained_dst = ChainedSuite.dst_sig;
+
+comptime {
+    std.debug.assert(std.mem.eql(u8, chained_dst, "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_"));
+}
 
 /// The 32-byte digest a `pedersen-bls-chained` round signs:
 /// `SHA-256(previous_signature ‖ u64be(round))`, with nothing written for
@@ -168,34 +152,21 @@ pub fn chainedMessage(round: u64, previous_signature: []const u8) [32]u8 {
     return out;
 }
 
-/// The BLS-verification equation for one `pedersen-bls-chained` round on
-/// already-decoded points: whether
-/// `e(pubkey, H2(chainedMessage(round, previous_signature))) == e(G1gen, sig)`
-/// holds, as one multi-pairing with the second `G1` operand negated.
+/// The BLS verification of one `pedersen-bls-chained` round on
+/// already-decoded points: whether `sig` is a valid `ChainedSuite`
+/// signature over `chainedMessage(round, previous_signature)` under
+/// `pubkey` (`e(pubkey, H2(m)) == e(G1gen, sig)`).
 ///
-/// The same two guards as `verifyRoundPoints`, one group over: the
-/// identity on either operand is refused (with both the identity the
-/// equation is `1 == 1` for every round), and a `G2` signature outside the
-/// order-`r` subgroup is refused. Unlike quicknet's `G1` case, a `G2`
-/// cofactor-torsion addend is NOT known to pass the bare pairing (the ate
-/// pairing is bilinear only on the order-`r` subgroup of `G2`, and the
-/// tested `sig + T` fails it); the check is kept so acceptance never
-/// depends on how the Miller loop treats a point outside its domain.
-/// `parseRound` already
-/// refuses both; these guards are for callers who skip it. The key's
-/// subgroup membership is `parseInfo`'s KeyValidate; a caller supplying a
-/// `g1.Affine` from elsewhere must check it.
+/// The same `KeyValidate` of both operands as `verifyRoundPoints`, one
+/// group over. Unlike quicknet's `G1` case, a `G2` cofactor-torsion addend
+/// is NOT known to pass the bare pairing (the ate pairing is bilinear only
+/// on the order-`r` subgroup of `G2`, and the tested `sig + T` fails it);
+/// the subgroup check still runs, so acceptance never depends on how the
+/// Miller loop treats a point outside its domain. `parseInfo`/`parseRound`
+/// already refuse all of these; the guards are for callers who skip them.
 pub fn verifyChainedRoundPoints(pubkey: g1.Affine, round: u64, previous_signature: []const u8, sig: g2.Affine) bool {
-    if (pubkey.infinity or sig.infinity) return false;
-    if (!g2.Jacobian.fromAffine(sig).subgroupCheck()) return false;
-
     const msg = chainedMessage(round, previous_signature);
-    const hm = bls12_381.hash_to_curve.hashToCurveG2(&msg, chained_dst);
-    const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
-    return pairing.pairingCheck(&.{
-        .{ .p = pubkey, .q = hm },
-        .{ .p = neg_gen, .q = sig },
-    });
+    return ChainedSuite.verify(.{ .point = pubkey }, &msg, .{ .point = sig });
 }
 
 /// Verify a parsed `Round` against a parsed `ChainInfo`. On success the
@@ -1262,6 +1233,39 @@ const chained_seeds = [_][]const u8{
     fuzzSeed(&.{ 0x00, 0, 95, 0, 0x0 }), // key nibble
 };
 
+test "a chain key outside the order-r subgroup is refused by both points-level verifiers" {
+    // Since 2026-10-06 the points-level verifiers run `KeyValidate` on the
+    // key too (the suite's `verify`); before, only `parseInfo` did, and a
+    // caller handing in a decoded key from elsewhere had to remember it.
+
+    // Chained: key in G1. `pk + T` with `T` of G1 cofactor torsion pairs
+    // exactly like `pk` (`e(T, Q) = 1`), so the bare equation HOLDS for a
+    // genuine beacon under the malleated key — the key check is the only
+    // thing refusing it. The old hand-written check accepted this.
+    {
+        const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+        const rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+        const t = try cofactorTorsionPoint();
+        const bad_pk = g1.Jacobian.fromAffine(info.pubkey_g1.?).add(t).toAffine();
+        const msg = chainedMessage(rnd.round, rnd.previousSignatureBytes());
+        const hm = bls12_381.hash_to_curve.hashToCurveG2(&msg, chained_dst);
+        const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
+        try testing.expect(pairing.pairingCheck(&.{ .{ .p = bad_pk, .q = hm }, .{ .p = neg_gen, .q = rnd.sig_g2.? } }));
+        try testing.expect(verifyChainedRoundPoints(info.pubkey_g1.?, rnd.round, rnd.previousSignatureBytes(), rnd.sig_g2.?));
+        try testing.expect(!verifyChainedRoundPoints(bad_pk, rnd.round, rnd.previousSignatureBytes(), rnd.sig_g2.?));
+    }
+    // quicknet: key in G2. Here the bare pairing already fails for `pk + T`
+    // (measured for the chained G2 signature above); refused either way.
+    {
+        const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+        const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
+        const t = try g2CofactorTorsionPoint();
+        const bad_pk = g2.Jacobian.fromAffine(info.pubkey_g2.?).add(t).toAffine();
+        try testing.expect(verifyRoundPoints(info.pubkey_g2.?, rnd.round, rnd.sig_g1.?));
+        try testing.expect(!verifyRoundPoints(bad_pk, rnd.round, rnd.sig_g1.?));
+    }
+}
+
 test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     // Both operands identity => every pairing is the target-group identity,
     // so the equation was `1 == 1` and this returned true for ANY round.
@@ -1281,9 +1285,9 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     // `pubkey = identity, sig` genuine. There is no forged input this
     // one-sided half of the guard alone stops that the pairing check does
     // not already stop — it is pure defense-in-depth, verified redundant,
-    // not an independently pinned property. Kept as a guard in
-    // `verifyRoundPoints` anyway (cheap, and future-proofs a change to the
-    // pairing equation), but a test cannot honestly claim to enforce it.
+    // not an independently pinned property. Kept as a guard (since
+    // 2026-10-06 it is `bls12_381.scheme`'s `KeyValidate`, which refuses an
+    // identity key outright), but a test cannot honestly claim to enforce it.
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
 }
