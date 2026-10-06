@@ -121,7 +121,11 @@ pub const TcpTransport = struct {
         }};
         // A poll that fails outright defers to the real read, which reports
         // the failure properly — but a cancel must not be lost on that path.
-        const n = std.posix.poll(&fds, @intCast(ms)) catch {
+        // `poll(2)` takes an `i32`; a `u32` from 2^31 ms up used to trap in
+        // the `@intCast` (review 2026-10-06). ~24.8 days is "indefinitely"
+        // for every purpose a read timeout serves.
+        const wait: i32 = @intCast(@min(ms, std.math.maxInt(i32)));
+        const n = std.posix.poll(&fds, wait) catch {
             try self.checkCanceled();
             return true;
         };
@@ -461,4 +465,40 @@ test "a cancel during the read timeout's poll is not reported as an idle round" 
     var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
     try io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "a read timeout too large for poll(2) is clamped, not a panic" {
+    // Review 2026-10-06. `setReadTimeout` takes a `u32` and `waitReadable`
+    // handed it to `poll(2)`, whose timeout is an `i32`, through `@intCast`:
+    // any value from 2^31 ms (~24.8 days) up trapped on the first read. The
+    // peer below has already sent a whole message, so the clamped wait
+    // returns at once.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var nop: [encap.header_len]u8 = undefined;
+    _ = try encap.encode(.{
+        .command = .nop,
+        .session_handle = 0,
+        .status = .success,
+        .sender_context = @splat(0),
+        .options = 0,
+        .data = &.{},
+        .total_len = 0,
+    }, &nop);
+    var pw_buf: [64]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(&nop);
+    try pw.interface.flush();
+
+    fixture.tt.setReadTimeout(std.math.maxInt(u32));
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, encap.header_len), try fixture.tt.transport().read(&buf));
+    try testing.expectEqualSlices(u8, &nop, buf[0..encap.header_len]);
 }

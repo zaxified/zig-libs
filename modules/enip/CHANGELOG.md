@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** Review: security re-review of
+  what landed after the 2026-08-11 review — six findings, five fixed, one
+  reported open (details in SPEC.md, `**Review 2026-10-06**`). Behaviour that
+  changes: `Adapter`'s `Multiple_Service_Packet` validates its whole offset
+  table before running any embedded request (a bad later offset used to be
+  refused only after an earlier write had been applied), and budgets its reply
+  up front, answering an embedded request that does not fit as
+  `reply_data_too_large` instead of failing `handle` with
+  `error.BufferTooSmall` — no reply — after earlier writes in the batch had
+  landed; an `Unconnected_Send`'s inner reply is built into the caller's space;
+  `Write Tag`, `Forward_Open`, `Forward_Close` and `Reset` check their reply
+  fits before changing state. `connmgr.UnconnectedSend.decode` refuses a
+  non-zero pad octet after an odd embedded message with the new
+  `DecodeError.BadPad` (a consumer switching exhaustively over that set needs
+  one more arm). The adapter's element offset (`member id × size + byte
+  offset`, all peer-supplied) is computed checked, so it no longer traps on a
+  32-bit `usize`, and `TcpTransport.setReadTimeout` clamps a value past
+  `poll(2)`'s `i32` instead of trapping. Open, not fixed: `TcpTransport`'s read
+  timeout covers only a message's first octet. Each fix has a test that failed
+  before it (the 32-bit one under `-Dtarget=x86-linux-musl`).
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE.** `connmgr`'s fuzz corpus: the
   three entries meant to exercise the accept path of `UnconnectedSend`,
   `ForwardOpen` and `ForwardClose` were typed by hand and, per the harness's own

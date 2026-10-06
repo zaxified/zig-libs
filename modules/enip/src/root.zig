@@ -354,6 +354,142 @@ test "a multiple service packet larger than the reply table is refused, not trun
     try testing.expectEqual(cip.GeneralStatus.too_much_data, reply.general_status);
 }
 
+/// A `Write Tag` of one INT, as a bare CIP request.
+fn encodeWriteInt(name: []const u8, value: i16, out: []u8) ![]const u8 {
+    var path_buf: [64]u8 = undefined;
+    const path = try tagpath.encodePath(name, &path_buf);
+    var v: [2]u8 = undefined;
+    std.mem.writeInt(i16, &v, value, .little);
+    var data_buf: [16]u8 = undefined;
+    const data = try (types.WriteTagRequest{ .type = .int, .count = 1, .values = &v }).encode(&data_buf);
+    return (cip.Request{ .service = cip.LogixService.write_tag, .path = path, .data = data }).encode(out);
+}
+
+/// Wraps already-encoded requests in a `Multiple_Service_Packet` addressed
+/// to the Message Router.
+fn encodeBatch(reqs: []const []const u8, payload_buf: []u8, out: []u8) ![]u8 {
+    const payload = try cip.MultipleService.encode(reqs, payload_buf);
+    var path_buf: [16]u8 = undefined;
+    const router_path = try epath.logicalPath(@intFromEnum(cip.ClassCode.message_router), 1, null, &path_buf);
+    return (cip.Request{
+        .service = @intFromEnum(cip.Service.multiple_service_packet),
+        .path = router_path,
+        .data = payload,
+    }).encode(out);
+}
+
+test "a multiple service packet with a bad offset table executes none of its requests" {
+    // Review 2026-10-06. `MultipleService.at(i)` validates entry `i` and
+    // `i + 1` only, and the adapter used to validate lazily — so a write in
+    // entry 0 was APPLIED, and then entry 1's out-of-range end offset turned
+    // the whole packet into `invalid_parameter_value`. The originator reads
+    // that as "nothing happened" while the tag has changed.
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+
+    var w_buf: [64]u8 = undefined;
+    var g_buf: [32]u8 = undefined;
+    const write = try encodeWriteInt("SCADA[0]", 0x1234, &w_buf);
+    const get = try cip.getAttributesAll(@intFromEnum(cip.ClassCode.identity), 1, &g_buf);
+    var payload_buf: [256]u8 = undefined;
+    var wire_buf: [512]u8 = undefined;
+    const wire = try encodeBatch(&.{ write, get, get }, &payload_buf, &wire_buf);
+    // Request header: service, path size, the 4-octet router path; then the
+    // payload: count (2), offsets (3 x 2). Point the THIRD offset past the end.
+    const table = 2 + 4 + 2;
+    std.mem.writeInt(u16, wire[table + 4 ..][0..2], 0xFFFF, .little);
+
+    var out: [4096]u8 = undefined;
+    const reply = try cip.Reply.decode(try target.messageRouter(wire, &out));
+    try testing.expectEqual(cip.GeneralStatus.invalid_parameter_value, reply.general_status);
+    try testing.expectEqual(@as(i16, 0), std.mem.readInt(i16, scada[0..2], .little));
+    try testing.expectEqual(@as(usize, 0), target.writes);
+}
+
+test "a multiple service packet whose replies overflow is answered per request, not dropped after its writes" {
+    // Review 2026-10-06. Embedded replies were built into a fixed 4096-octet
+    // scratch with no budget for the table, the reply header or the replies
+    // still to come. A batch of reads of a large-enough tag ran it dry, the
+    // overflow surfaced as `error.BufferTooSmall` out of `Adapter.handle` —
+    // no reply at all — AFTER an earlier write in the same batch had been
+    // applied. Any client on the listening socket can send that batch.
+    var scada: [200]u8 = @splat(0);
+    var big: [1024]u8 = @splat(0x11);
+    var real: [20]u8 = @splat(0);
+    var tags = [_]TagBinding{
+        .{ .name = "SCADA", .type = .int, .bytes = &scada },
+        .{ .name = "Big", .type = .sint, .bytes = &big },
+        .{ .name = "RealTag", .type = .real, .bytes = &real },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var paired = PairedTransport{ .target = &target };
+    var buf: [16384]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+
+    var w_buf: [64]u8 = undefined;
+    var r_buf: [64]u8 = undefined;
+    const write = try encodeWriteInt("SCADA[0]", 77, &w_buf);
+    const read = try client.encodeReadTag("Big[0]", big.len, &r_buf);
+    const reqs = [_][]const u8{ write, read, read, read, read, read };
+    var replies: [reqs.len]cip.Reply = undefined;
+    try testing.expectEqual(reqs.len, try c.multipleServices(&reqs, &replies));
+    try testing.expectEqual(@as(usize, 0), paired.failures);
+
+    // The write happened and says so.
+    try testing.expectEqual(@as(i16, 77), std.mem.readInt(i16, scada[0..2], .little));
+    try testing.expect(replies[0].general_status.isSuccess());
+    // Every read answers for itself: whole, partial, or too large to carry.
+    for (replies[1..]) |r| {
+        switch (r.general_status) {
+            .success, .partial_transfer => {
+                const td = try types.TagData.decode(r.data);
+                try testing.expectEqual(DataType.sint, td.type);
+            },
+            .reply_data_too_large => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expect(replies[1].general_status.isSuccess());
+}
+
+test "a member index whose octet offset overflows usize is refused, not a panic" {
+    // Review 2026-10-06. `pathElement(path) * esize + byte_offset` and
+    // `start + values.len` were unchecked; the member id is a peer-supplied
+    // u32, so on a 32-bit target `0xFFFF_FFFF * 4` overflowed `usize` and
+    // trapped. Exercised as RED with `-Dtarget=x86-linux-musl`.
+    var scada: [200]u8 = @splat(0);
+    var dint: [40]u8 = @splat(0);
+    var real: [20]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+
+    var path_buf: [32]u8 = undefined;
+    var b = epath.Builder.init(&path_buf);
+    try b.symbol("TestTag");
+    try b.member(0xFFFF_FFFF);
+    var out: [256]u8 = undefined;
+
+    var rq_buf: [64]u8 = undefined;
+    var rd: [6]u8 = undefined;
+    const rdata = try (types.ReadTagFragmentedRequest{ .count = 1, .byte_offset = 0xFFFF_FFFF }).encode(&rd);
+    const rreq = try (cip.Request{ .service = cip.LogixService.read_tag_fragmented, .path = b.bytes(), .data = rdata }).encode(&rq_buf);
+    const rrep = try cip.Reply.decode(try target.messageRouter(rreq, &out));
+    try testing.expectEqual(cip.GeneralStatus.invalid_parameter_value, rrep.general_status);
+
+    var wq_buf: [64]u8 = undefined;
+    var wd: [16]u8 = undefined;
+    const v = [_]u8{ 1, 2, 3, 4 };
+    const wdata = try (types.WriteTagFragmentedRequest{ .type = .dint, .count = 1, .byte_offset = 0xFFFF_FFFF, .values = &v }).encode(&wd);
+    const wreq = try (cip.Request{ .service = cip.LogixService.write_tag_fragmented, .path = b.bytes(), .data = wdata }).encode(&wq_buf);
+    const wrep = try cip.Reply.decode(try target.messageRouter(wreq, &out));
+    try testing.expectEqual(cip.GeneralStatus.too_much_data, wrep.general_status);
+    try testing.expectEqual(@as(usize, 0), target.writes);
+}
+
 test "round trip: a routed client and an adapter that unwraps the route" {
     var scada: [64]u8 = @splat(0);
     var dint: [8]u8 = @splat(0);

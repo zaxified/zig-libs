@@ -61,6 +61,10 @@ pub const DecodeError = error{
     ConnectionPathOverruns,
     /// The reserved octet after a route-path size is not zero.
     BadReserved,
+    /// The `Unconnected_Send` pad octet after an odd embedded message is not
+    /// zero. It is fixed at zero, and `encode` writes zero, so accepting any
+    /// other value would decode 256 spellings to one value.
+    BadPad,
     /// Bytes remain after the last declared field. Unlike `encap.decode`
     /// (exact) and `cpf.decode` (`TrailingData`), these three bodies used
     /// to be silent prefix decoders with no name saying so -- a consumer
@@ -131,6 +135,7 @@ pub const UnconnectedSend = struct {
         // The pad octet exists only when the embedded message is odd.
         var off: usize = 4 + size + (size % 2);
         if (off + 2 > bytes.len) return error.Truncated;
+        if (size % 2 == 1 and bytes[4 + size] != 0) return error.BadPad;
         const route_words: usize = bytes[off];
         if (bytes[off + 1] != 0) return error.BadReserved;
         off += 2;
@@ -704,6 +709,20 @@ test "unconnected send pads an odd embedded message and not an even one" {
     @memcpy(padded[0..wire2.len], wire2);
     padded[wire2.len] = 0xAA;
     try testing.expectError(error.TrailingData, UnconnectedSend.decode(padded[0 .. wire2.len + 1]));
+}
+
+test "a non-zero Unconnected_Send pad octet is refused, not normalised" {
+    // Review 2026-10-06: `decode` skipped the pad after an odd embedded
+    // message without looking at it, while `encode` always writes zero — so
+    // 256 spellings decoded to one value and re-encoded to a different octet
+    // string (the divergence `epath.checkPad` was introduced to close). The
+    // pad is fixed at zero exactly like the reserved octet two places later.
+    const odd = [_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A' }; // 9 octets
+    var buf: [64]u8 = undefined;
+    const wire = try (UnconnectedSend{ .embedded = &odd, .route_path = &backplane_slot_0 }).encode(&buf);
+    _ = try UnconnectedSend.decode(wire);
+    wire[4 + odd.len] = 0x5A;
+    try testing.expectError(error.BadPad, UnconnectedSend.decode(wire));
 }
 
 test "an embedded size that overruns the request is refused" {
