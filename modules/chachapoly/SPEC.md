@@ -27,7 +27,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | C | ISC (LICENSE read) | 14.0k | 1.0.22 (2026-04-09) | IETF ChaCha20-Poly1305 and XChaCha20-Poly1305 (the latter is what most libsodium-style protocols use) plus the old 64-bit-nonce construction and the secretstream. |
 | Zig `std.crypto.aead.chacha_poly` / `stream.chacha` | Zig | MIT | — | Zig 0.16.0 | `ChaCha20Poly1305`, `XChaCha20Poly1305`, and the 8-round `ChaCha8Poly1305`/`XChaCha8Poly1305` (checked in 0.16.0's `lib/std/crypto/chacha20.zig`). Byte-identical to this module; at the default baseline x86-64 target it is 2.5–3.3× slower per the README. |
 
-**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; short inputs delegate to `std` so nothing loses; three test-witnessed routing thresholds; the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** XChaCha20-Poly1305, the 8/12-round variants and the 64-bit-nonce form that `std` already has (→ Backlog); the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path; not level with OpenSSL's AVX2 ChaCha20 per the README's own numbers; only RFC 8439 and `std`-differential evidence, no Wycheproof vectors.
+**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; short inputs delegate to `std` so nothing loses; three test-witnessed routing thresholds; the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** XChaCha20-Poly1305, the 8/12-round variants and the 64-bit-nonce form that `std` already has (→ Backlog); the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path; not level with OpenSSL's AVX2 ChaCha20 per the README's own numbers.
 
 ## What this module is
 
@@ -304,6 +304,18 @@ control flow exists in the source), not a machine-checked-disassembly audit like
   our AEAD opens `std`'s ciphertext and `std` opens ours (cross-decrypt), and
   both tag-tamper and ciphertext-tamper are rejected. `std` is the authority — a
   divergence in any edge length fails the build.
+- **Wycheproof** `chacha20_poly1305_test.json` (2026-10-06): its 316 tests
+  with a 96-bit nonce — 256 valid, which must seal and open exactly, and 60
+  that must be refused with the output zeroed. Each runs twice: as shipped
+  (only 51 have m + ad above `aead_delegate_max`, so the rest are `std`'s
+  code) and under `force_wide`, so every one also runs this module's AEAD
+  engine. A second test tags each vector's §2.8 MAC input with
+  `Generic(L)` for L ∈ {1,2,4,8} and requires a match exactly for the valid
+  ones; the lane engine absorbs 151 / 38 / 9 of them at L = 2 / 4 / 8 (pinned),
+  among them Wycheproof's 84 Poly1305 carry edge cases. Recipe
+  `tools/wycheproof.py`, Apache-2.0 data, see NOTICE. No defect; a one-bit
+  change in a valid vector's tag fails both tests (negative control,
+  2026-10-06).
 - A `>8`-block (20-block) case exercises two wide passes + a 4-block tail and the
   per-lane counter increment across the boundary, byte-exact vs `std`.
 
@@ -363,7 +375,7 @@ Consumers already wired to this module (`@import("chachapoly")`, all using
 change to the delegation thresholds or the MAC is therefore live on those
 paths, not staged behind a rewiring step.
 - **XChaCha20-Poly1305 (24-byte nonce, HChaCha20)** *(survey 2026-09-30)*: `std`, libsodium, Go `NewX` and RustCrypto all provide it; it is the usual choice when nonces are random (age-style files, secretbox-alikes, cloud KMS envelopes). Consumers here do not need it today (existing bullet above), but a user rewiring from `std` loses it. Effort: small (HChaCha20 over the existing block function plus the delegation thresholds). Fits §2.
-- **Wycheproof `chacha20_poly1305_test` vectors** *(survey 2026-09-30)*: evidence is RFC 8439 plus a `std` differential; Wycheproof adds tamper, zero-length and nonce-edge cases from a third party. Effort: small (test data only). Fits §2.
+- ~~**Wycheproof `chacha20_poly1305_test` vectors**~~ — DONE 2026-10-06 (see Verification). Its nine nonce-size cases need a nonce other than 96 bits, which this API does not take.
 
 ### Mutation run 2026-10-04
 
@@ -416,4 +428,4 @@ each.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 8439 KATs byte-exact + std oracle differential (README/SPEC)
+**What the tests actually contain.** RFC 8439 KATs byte-exact + Wycheproof `chacha20_poly1305_test.json` (316 vectors, own engine forced) + std oracle differential (README/SPEC)

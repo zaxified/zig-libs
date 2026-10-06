@@ -133,3 +133,5 @@ byte-exact black-box correctness oracles (differential tests), not as design
 references — the black-box-oracle relationship root `NOTICE` §0 describes. The
 RFC 8439 §2.3.2/§2.4.2/§2.5.2/§2.8.2 test vectors are public IETF spec
 artifacts (a test oracle under §0, needing no attribution).
+`src/testdata/wycheproof.zig` reproduces 316 Wycheproof vectors, Apache-2.0
+test data — see [NOTICE](NOTICE), which must travel with the module.

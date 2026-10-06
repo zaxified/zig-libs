@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** Wycheproof `chacha20_poly1305_test.json`
+  anchors the module (`tools/wycheproof.py` → `src/testdata/wycheproof.zig`): 256 valid
+  vectors seal and open exactly and 60 invalid ones are refused with the output zeroed,
+  both as shipped and with this module's own engine forced; every vector's MAC input
+  also tags right through `Generic(L)` at L = 1, 2, 4, 8. No defect. The vectors are
+  Apache-2.0 data: the module now carries a `NOTICE`.
+
 - **2026-10-04** — Tests: first dated mutation run (54 mutants, 44 killed, 8 equivalent,
   2 not observable in-process; `SPEC.md` § "Mutation run 2026-10-04"). Three new tests in
   `poly1305.zig` close the five test gaps it found: `final` must wipe the key-derived

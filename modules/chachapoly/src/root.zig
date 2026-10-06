@@ -1588,3 +1588,104 @@ test "the counter-space boundary runs through THIS module's engine, not std's" {
         try testing.expectEqualSlices(u8, theirs[0..len], mine[0..len]);
     }
 }
+
+// Wycheproof's ChaCha20-Poly1305 vectors (C2SP/wycheproof, Apache-2.0 data --
+// see NOTICE), made by `tools/wycheproof.py`: every test with a 96-bit nonce.
+// 256 valid, 60 that must be refused -- third-party rejection and Poly1305
+// carry edge cases, where the other anchors only have our own bit flips.
+const wycheproof = @import("testdata/wycheproof.zig").vectors;
+
+test "Wycheproof chacha20_poly1305_test.json: valid vectors seal and open, invalid ones are refused" {
+    // Each vector runs twice: as shipped (only 51 have m + ad above
+    // `aead_delegate_max`, the rest are std's code) and with `force_wide`, so
+    // every one of them also goes through this module's own AEAD engine.
+    var counts = [2]usize{ 0, 0 };
+    var shipped_wide: usize = 0;
+    for (wycheproof) |v| {
+        counts[@intFromBool(v.valid)] += 1;
+        var key: [32]u8 = undefined;
+        var iv: [12]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&key, v.key);
+        _ = try std.fmt.hexToBytes(&iv, v.iv);
+        _ = try std.fmt.hexToBytes(&tag, v.tag);
+        var ad_buf: [1024]u8 = undefined;
+        var msg_buf: [1024]u8 = undefined;
+        var ct_buf: [1024]u8 = undefined;
+        const ad = try std.fmt.hexToBytes(&ad_buf, v.aad);
+        const msg = try std.fmt.hexToBytes(&msg_buf, v.msg);
+        const ct = try std.fmt.hexToBytes(&ct_buf, v.ct);
+        var out_buf: [1024]u8 = undefined;
+        const out = out_buf[0..msg.len];
+
+        for ([_]bool{ false, true }) |fw| {
+            force_wide = fw;
+            defer force_wide = false;
+            if (v.valid) {
+                var t: [16]u8 = undefined;
+                ChaCha20Poly1305.encrypt(out, &t, msg, ad, iv, key);
+                try testing.expectEqualSlices(u8, ct, out);
+                try testing.expectEqualSlices(u8, &tag, &t);
+                try ChaCha20Poly1305.decrypt(out, ct, tag, ad, iv, key);
+                try testing.expectEqualSlices(u8, msg, out);
+            } else {
+                @memset(out, 0xaa);
+                try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(out, ct, tag, ad, iv, key));
+                for (out) |byte| try testing.expectEqual(@as(u8, 0), byte); // wiped, not plaintext
+            }
+            if (fw) {
+                // Forcing sets the threshold to 0, so empty m and ad (`0 <= 0`)
+                // still go to std.
+                try testing.expectEqual(if (msg.len + ad.len == 0) Path.std_delegated else Path.wide, aead_path);
+            } else if (aead_path == .wide) shipped_wide += 1;
+        }
+    }
+    // Pinned so a regenerated table that silently lost a class shows here.
+    try testing.expectEqual(@as(usize, 256), counts[1]);
+    try testing.expectEqual(@as(usize, 60), counts[0]);
+    try testing.expectEqual(@as(usize, 51), shipped_wide);
+}
+
+test "Wycheproof chacha20_poly1305_test.json: the RFC 8439 MAC input tags right at every lane width" {
+    // The AEAD above reaches only the shipped lane width. Here the RFC 8439
+    // §2.8 MAC input (ad ‖ pad16 ‖ ct ‖ pad16 ‖ le64 lengths) of every vector
+    // is tagged by `Generic(L)` for L = 1, 2, 4, 8: the computed tag must equal
+    // the vector's exactly when the vector is valid. 84 of these vectors are
+    // Wycheproof's Poly1305 carry edge cases.
+    var wide_runs = [_]usize{ 0, 0, 0, 0 };
+    for (wycheproof) |v| {
+        var key: [32]u8 = undefined;
+        var iv: [12]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&key, v.key);
+        _ = try std.fmt.hexToBytes(&iv, v.iv);
+        _ = try std.fmt.hexToBytes(&tag, v.tag);
+        var buf: [1024]u8 = @splat(0);
+        const ad_len = (try std.fmt.hexToBytes(buf[0..], v.aad)).len;
+        const ct_at = (ad_len + 15) / 16 * 16;
+        const ct_len = (try std.fmt.hexToBytes(buf[ct_at..], v.ct)).len;
+        const lens_at = ct_at + (ct_len + 15) / 16 * 16;
+        mem.writeInt(u64, buf[lens_at..][0..8], ad_len, .little);
+        mem.writeInt(u64, buf[lens_at + 8 ..][0..8], ct_len, .little);
+        const mac_in = buf[0 .. lens_at + 16];
+
+        var poly_key = [_]u8{0} ** 32;
+        force_wide = true;
+        ChaCha20.xor(poly_key[0..], poly_key[0..], 0, key, iv);
+        force_wide = false;
+
+        inline for (.{ 1, 2, 4, 8 }, 0..) |L, i| {
+            var t: [16]u8 = undefined;
+            poly1305.Generic(L).create(&t, mac_in, &poly_key);
+            // OR of the byte differences, not a `std.mem` compare: this file's
+            // compare count is pinned by `check-ct-compare`.
+            var diff: u8 = 0;
+            for (t, tag) |x, y| diff |= x ^ y;
+            try testing.expectEqual(v.valid, diff == 0);
+            if (poly1305.mac_path == .wide) wide_runs[i] += 1;
+        }
+    }
+    // How many vectors the lane-parallel engine actually absorbed, per width
+    // (`wide_min_bytes` = 96 / 192 / 384 at L = 2 / 4 / 8; L = 1 is std's).
+    try testing.expectEqualSlices(usize, &.{ 0, 151, 38, 9 }, &wide_runs);
+}
