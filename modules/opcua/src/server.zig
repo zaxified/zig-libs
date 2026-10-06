@@ -156,6 +156,22 @@ pub const SecurityConfig = struct {
     /// anything past this is `BadCertificateInvalid` rather than an
     /// unbounded allocation driven by a stranger.
     max_certificate_len: usize = 8192,
+    /// Largest encrypted region (SequenceHeader..signature, i.e. everything
+    /// after the clear `AsymmetricAlgorithmSecurityHeader`) of an
+    /// `OpenSecureChannel` this server will RSA-decrypt, bytes. That region is
+    /// decrypted one RSA-OAEP block — one private-key operation — at a time
+    /// *before* its signature can be checked, so every byte of it is work a
+    /// stranger buys for free; without a cap a 64 KiB OPN chunk cost ≈250
+    /// private-key operations under a 2048-bit key (review 2026-10-06). A real
+    /// OPN request is a 32-byte nonce, a few fixed fields and one signature:
+    /// asyncua's is 512 bytes under a 2048-bit key, and even a 4096-bit server
+    /// key with an 8192-bit client signature needs three 512-byte blocks.
+    /// The default is twice that worst case, which bounds an unauthenticated
+    /// OPN to 16 private-key operations at 2048 bits and 8 at 4096. Larger is
+    /// `ERR BadTcpMessageTooLarge`, decided on the clear header alone. (The
+    /// `SenderCertificate` in that header is bounded separately, by
+    /// `max_certificate_len`, and costs no private-key work.)
+    max_opn_encrypted_len: usize = 4096,
 };
 
 pub const Config = struct {
@@ -1071,6 +1087,16 @@ pub const Connection = struct {
             try c.fail(out, status.bad_tcp_internal_error, "truncated secure-conversation header");
             return;
         }
+        // An OpenSecureChannel is one final chunk (OPC 10000-6 §6.7.2; asyncua
+        // sends it so, open62541 refuses anything else with this same code).
+        // Decided on the MessageHeader alone, before the security stage: a
+        // multi-chunk OPN was otherwise RSA-decrypted chunk by chunk, up to
+        // `max_chunk_count` of them, before a single signature had been
+        // checked (review 2026-10-06).
+        if (message_type == .open_secure_channel and chunk_type != .final) {
+            try c.fail(out, status.bad_tcp_message_type_invalid, "OpenSecureChannel must be a single final chunk");
+            return;
+        }
         const unsealed: ChunkOpen = switch (message_type) {
             .open_secure_channel => try c.openAsymmetricChunk(header, wire_body, out, now_ms),
             .message, .close_secure_channel => try c.openSymmetricChunk(header, wire_body, out, now_ms),
@@ -1247,6 +1273,13 @@ pub const Connection = struct {
             try c.fail(out, status.bad_security_policy_rejected, "this server is configured for SecurityPolicy#None only");
             return .failed;
         };
+        // Bound the private-key work before doing any: each RSA-OAEP block of
+        // the encrypted region is one private-key operation, all of them spent
+        // before the signature can say who sent it (review 2026-10-06).
+        if (wire_body.len - view.encrypted_region_offset > sec.max_opn_encrypted_len) {
+            try c.fail(out, status.bad_tcp_message_too_large, "OpenSecureChannel encrypted region exceeds max_opn_encrypted_len");
+            return .failed;
+        }
 
         // The sender must have encrypted to *our* certificate; a mismatched
         // thumbprint means the OPN was meant for a different server (or was
@@ -6484,6 +6517,115 @@ test "secure: SequenceNumber wrap acceptance (M1)" {
     try testing.expect(sequenceFollows(std.math.maxInt(u32) - 1000, 1)); // §6.7.2.4 wrap
     try testing.expect(!sequenceFollows(std.math.maxInt(u32) - 2000, 1)); // too early to wrap
     try testing.expect(!sequenceFollows(std.math.maxInt(u32), 1024));
+}
+
+// Review 2026-10-06, open item (a). Every OPN chunk was RSA-OAEP-decrypted
+// block by block — one private-key operation per block — before its signature
+// could say who sent it, and nothing bounded how many blocks or how many
+// chunks: ≈250 private-key operations per 64 KiB chunk under a 2048-bit key,
+// up to `max_chunk_count` chunks, all pre-authentication. The forged OPNs
+// below carry a correct clear header (policy, our thumbprint, a valid
+// certificate) and a block-aligned region of garbage. Before the fix each was
+// handed to `openAsymmetricMessage` and refused only once RSA-OAEP had failed
+// on it (`BadSecurityChecksFailed`, "did not decrypt"); now each is refused on
+// the MessageHeader / clear header alone, with a code no decrypt can produce.
+fn forgedOpn(gpa: std.mem.Allocator, pki: TestPki, chunk_type: u8, encrypted_len: usize) ![]u8 {
+    var w = std.Io.Writer.Allocating.init(gpa);
+    errdefer w.deinit();
+    const thumbprint = security.certificateThumbprint(pki.server.certificate_der);
+    try w.writer.writeAll("OPN");
+    try w.writer.writeByte(chunk_type);
+    try w.writer.writeInt(u32, 0, .little); // MessageSize, patched below
+    try w.writer.writeInt(u32, 0, .little); // SecureChannelId: issue
+    for ([_][]const u8{ services.security_policy_basic256sha256_uri, pki.client.certificate_der, &thumbprint }) |field| {
+        try w.writer.writeInt(i32, @intCast(field.len), .little);
+        try w.writer.writeAll(field);
+    }
+    try w.writer.splatByteAll(0xA5, encrypted_len);
+    const bytes = try w.toOwnedSlice();
+    std.mem.writeInt(u32, bytes[4..8], @intCast(bytes.len), .little);
+    return bytes;
+}
+
+test "secure: a multi-chunk or oversize OPN is refused before any RSA operation (review 2026-10-06 a)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3C} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    const k = 64; // the 512-bit test server key: one RSA-OAEP block
+
+    const Case = struct { chunk_type: u8, encrypted_len: usize, expected: encoding.StatusCode };
+    const cases = [_]Case{
+        // Multi-chunk: an intermediate chunk, and an abort, of a small OPN.
+        .{ .chunk_type = 'C', .encrypted_len = 4 * k, .expected = status.bad_tcp_message_type_invalid },
+        .{ .chunk_type = 'A', .encrypted_len = 4 * k, .expected = status.bad_tcp_message_type_invalid },
+        // A single final chunk one block past the default cap (4096).
+        .{ .chunk_type = 'F', .encrypted_len = 4096 + k, .expected = status.bad_tcp_message_too_large },
+    };
+    for (cases) |case| {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        const bytes = try forgedOpn(gpa, pki, case.chunk_type, case.encrypted_len);
+        defer gpa.free(bytes);
+        try rig.conn.feed(bytes, &rig.server_out.writer, rig.now_ms);
+        try rig.expectTransportError(case.expected);
+    }
+}
+
+test "secure: max_opn_encrypted_len admits a real OPN at its size and refuses it one byte under" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x3D} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    try testing.expectEqual(@as(usize, 4096), (SecurityConfig{ .credentials = pki.server }).max_opn_encrypted_len);
+
+    // The encrypted region a real client OPN carries under these keys.
+    const real_len = blk: {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var client_nonce: [32]u8 = undefined;
+        prng.random().bytes(&client_nonce);
+        try rig.channel.sendService(.open_secure_channel, services.type_id.open_secure_channel_request, services.OpenSecureChannelRequest, .{
+            .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+            .client_protocol_version = 0,
+            .request_type = .issue,
+            .security_mode = .sign_and_encrypt,
+            .client_nonce = &client_nonce,
+            .requested_lifetime = 600_000,
+        }, services.encodeOpenSecureChannelRequest);
+        const wire = rig.client_out.written();
+        const view = security.viewAsymmetricHeader(wire[8..]).?;
+        break :blk wire.len - 8 - view.encrypted_region_offset;
+    };
+    try testing.expect(real_len > 0);
+
+    for ([_]usize{ real_len, real_len - 1 }) |cap| {
+        var config = secureTestConfig(endpoints, pki);
+        config.security.?.max_opn_encrypted_len = cap;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        if (cap == real_len) {
+            _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+            try testing.expect(!rig.conn.isClosed());
+        } else {
+            var client_nonce: [32]u8 = undefined;
+            prng.random().bytes(&client_nonce);
+            try rig.sendOpenSecure(.sign_and_encrypt, .issue, &client_nonce);
+            try rig.expectTransportError(status.bad_tcp_message_too_large);
+        }
+    }
 }
 
 // Review 2026-10-06, L1. Every allocation `sampleDue` makes is failed in turn,

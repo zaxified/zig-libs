@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** the pre-authentication RSA cost
+  of an OpenSecureChannel is bounded (review 2026-10-06, open item (a)). Every OPN
+  chunk used to be RSA-OAEP-decrypted block by block before its signature could
+  be checked — ≈250 private-key operations per 64 KiB chunk under a 2048-bit key,
+  up to `max_chunk_count` chunks, for any stranger. Now an OPN must be a single
+  final chunk (`C` or `A` → `ERR BadTcpMessageTypeInvalid`, as open62541 answers;
+  asyncua sends OPN as one chunk citing OPC 10000-6 §6.7.2), and its encrypted
+  region may not exceed the new `SecurityConfig.max_opn_encrypted_len` (default
+  4096 bytes — at most 16 private-key operations at 2048 bits, 8 at 4096; a real
+  asyncua OPN is 512) → `ERR BadTcpMessageTooLarge`. Both are decided on the
+  header before any RSA operation. The asyncua transcript and the
+  Basic256Sha256 goldens are unchanged and still pass byte for byte.
+
 - **2026-10-06** — **BEHAVIOURAL, not breaking:** Review: adversarial re-review
   of the code since the 2026-09-02 review (C4–C8) and the server receive path.
   Five findings, all fixed, each with a test that failed before the fix (see

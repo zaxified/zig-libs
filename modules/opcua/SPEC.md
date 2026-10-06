@@ -176,6 +176,8 @@ explicitly, each with a test:
 |---|---|---|
 | chunk size | negotiated `receive_buffer_size` | `ERR BadTcpMessageTooLarge`, close |
 | chunks per message | negotiated `max_chunk_count` | `ERR BadTcpMessageTooLarge`, close |
+| chunks per OpenSecureChannel | one final chunk (§6.7.2; what asyncua sends and open62541 enforces), checked on the MessageHeader before any RSA | `ERR BadTcpMessageTypeInvalid`, close |
+| OPN bytes RSA-decrypted before authentication | `SecurityConfig.max_opn_encrypted_len` (4096: ≤ 16 private-key operations at 2048 bits; a real OPN is 512), checked on the clear header before any RSA | `ERR BadTcpMessageTooLarge`, close |
 | reassembled size | negotiated `max_message_size` + the caller's buffer | `ERR BadTcpMessageTooLarge`, close |
 | response size | `max_chunk_count` | `ServiceFault BadEncodingLimitsExceeded` |
 | sessions / subscriptions / monitored items | `Config` | `BadTooManySessions` / `…Subscriptions` / `…MonitoredItems` |
@@ -236,12 +238,18 @@ replacement; an OutOfMemory there left a dangling pointer that was compared
 against and then freed twice. **L2** (fixed) — C4's array decoders still leaked
 an element decoded just before a failed list growth. **L3** (fixed) —
 `NodeStore.dupAttributes` had C7's partial-failure leak and was missed by C7.
-Each has a test that failed before its fix. **Open, reported to the owner, not
-fixed here:** (a) pre-authentication cost of an OPN — every chunk is
+Each has a test that failed before its fix. **Open at the review, reported to
+the owner:** (a) pre-authentication cost of an OPN — every chunk is
 RSA-OAEP-decrypted block by block (≈250 private-key operations for a 64 KiB
 chunk under a 2048-bit key, up to `max_chunk_count` chunks) before its signature
-can be checked; capping the OPN's encrypted size or refusing multi-chunk OPNs is
-a policy decision; (b) the client never checks the server's `SequenceNumber`,
+can be checked. **Fixed 2026-10-06:** an OPN must be one final chunk (`C`/`A` is
+`ERR BadTcpMessageTypeInvalid` on the MessageHeader alone — asyncua sends OPN as
+one chunk citing §6.7.2 and open62541 refuses anything else with that code), and
+its encrypted region may not exceed `SecurityConfig.max_opn_encrypted_len`
+(default 4096 bytes; the recorded asyncua OPN's is 512) — `ERR
+BadTcpMessageTooLarge` on the clear header, before the thumbprint, the
+certificate or any RSA operation; a test feeds forged `C`, `A` and oversize
+OPNs that were refused only after RSA-OAEP failed on them before the fix; (b) the client never checks the server's `SequenceNumber`,
 and `Channel.recvService` decodes with the caller's allocator but frees neither
 a string-typed response NodeId, a `ServiceFault`, a response rejected as Bad, nor
 the fields of a struct a truncated response cut short — a hostile server leaks
