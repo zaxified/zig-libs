@@ -40,6 +40,18 @@ try store.delete("user:42");
 
 const idx = store.shardFor("user:42");        // stable owning-shard index
 
+// Merge-sorted scan across ALL shards: global key order, range bounds, limit.
+var it = try store.scan(.{
+    .start = .{ .inclusive = "user:" },        // or .exclusive / .unbounded
+    .end = .{ .exclusive = "user;" },
+    .limit = 100,                              // null = no limit
+    .direction = .forward,                     // or .reverse
+});
+defer it.deinit();                             // releases every shard's pin
+while (try it.next()) |e| {                    // e.key / e.val valid until next()
+    _ = e;
+}
+
 // Advanced: per-shard kvtree API (transactions / snapshots / ordered cursors
 // are per-shard — see the threading note below).
 var txn = try store.shard("user:42").begin();
@@ -64,6 +76,39 @@ the count at creation and a mismatched reopen fails with
 `error.ShardCountMismatch` — previously it succeeded and silently read *absent*
 for most keys (measured: a 200-key 4-shard store reopened with 8 found 98/200).
 Changing the count means migrating the data; there is no incremental resharding.
+
+## Merge-sorted scan
+
+`store.scan(options)` is a k-way merge over one `kvtree` cursor per shard,
+yielding entries in global (bytewise) key order — the same order a single
+`kvtree` scan would give. `ScanOptions`:
+
+- `start`, `end` — `Bound`s on the low and high end of the range, whichever the
+  direction: `.unbounded`, `.inclusive = key` or `.exclusive = key` (an
+  inclusive start is `kvtree.Cursor.seek`, an exclusive one `seekAfter`). A
+  start above the end is an empty range, not an error.
+- `limit: ?usize = null` — at most this many entries (in `.reverse`, the
+  largest ones).
+- `direction: ScanDirection = .forward` — or `.reverse` (descending).
+
+`Scan.next()` returns `?KV` (slices valid until the next call — copy to keep);
+`Scan.deinit()` always. Errors (`ScanError`: backend I/O, `Corrupt`,
+`OutOfMemory`, `NotOwningThread`) are sticky except `NotOwningThread`.
+
+**What a scan sees.** Every shard at the version that was newest when `scan`
+was called — commits made while the scan is open (including the owner's own,
+between `next` calls) never show up in it; open a new scan to see them. Because
+all shard cursors are opened inside that one call and a `.single_thread` store
+has one owner, the scan is a consistent point-in-time view of the whole store.
+On a `.parallel_per_handle` store the scan touches every shard, so `scan`,
+`next` and `deinit` must be serialized with all per-shard writer threads
+(pause them); the module cannot check that in this mode. An open scan pins
+pages in every shard — `deinit` it promptly.
+
+Each key is yielded once, from its owning shard: the scan returns exactly the
+pairs `get` would (a key written into a non-owning shard via `shardAt` is
+invisible to both). Cost: O(log n_shards) per entry plus one key hash; a
+bounded scan stops reading each shard at the far bound.
 
 ## Routing
 
@@ -97,8 +142,9 @@ more:
     parallelism. You are asserting the backend can take it.
 
 Not provided: cross-shard atomicity (a write group spanning shards is not one
-transaction — transactions/snapshots/cursors stay per-shard), a global ordered
-scan across shards, a same-shard write latch, exclusion beyond one advisory
+transaction — transactions/snapshots/cursors stay per-shard; the scan's
+consistent cut comes from the single-owner rule, not a cross-shard snapshot),
+a same-shard write latch, exclusion beyond one advisory
 store-wide lock (`"<name_prefix>.lock"`, `error.Locked`), or resharding. See `SPEC.md` for the full contract, the path/naming scheme, and
 the verification argument.
 
