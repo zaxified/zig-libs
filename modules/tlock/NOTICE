@@ -128,6 +128,10 @@ drand interop decrypt vector (fetched + verified 2026-07-16, used in
   scheme `"bls-unchained-g1-rfc9380"` — identical to mainnet
   quicknet's), round 5423142. The age header's `tlock` stanza body is
   the raw 128-byte BF-IBE `(U,V,W)` embedded in `kat_test.zig`.
+  Since 2026-10-06 the file itself and the same commit's
+  `testdata/lorem.txt` are committed verbatim under `src/testdata/`
+  (unmodified; drand/tlock `LICENSE-MIT` / `LICENSE-APACHE`, copyright
+  the drand team) and decrypted end-to-end by `kat_test.zig`.
 - Chain info: `GET https://pl-us.testnet.drand.sh/cc9c3984.../info`
   -> `public_key = b15b65b46fb29104f6a4b5d1e11a8da6344463973d423661bb0804846a0ecd1ef93c25057f1c0baab2ac53e56c662b66072f6d84ee791a3382bfb055afab1e6a375538d8ffc451104ac971d2dc9b168e2d3246b0be2015969cbaac298f6502da`
   (matches the copy in `drand/tlock`'s own `tlock_test.go`).

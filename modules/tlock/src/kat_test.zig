@@ -400,6 +400,43 @@ test "drand interop: re-encrypting the recovered (filekey, sigma) reproduces the
     try std.testing.expectEqualSlices(u8, &hexBytes(128, interop_ct_hex), &ct.toBytes());
 }
 
+/// drand/tlock's own whole-file fixture (commit 7ceb44a, `testdata/`, MIT OR
+/// Apache-2.0): a Go-`tle`-produced, ASCII-armored age file timelocked to
+/// quicknet-t round 5423142, and the plaintext it wraps.
+const interop_tle_file = @embedFile("testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle");
+const interop_tle_plaintext = @embedFile("testdata/lorem.txt");
+const interop_chain_hash_hex = "cc9c398442737cbd141526600919edd69f1d6f9b4adb67e4d912fbc64341a9a5";
+
+test "drand interop: a whole Go-tle-produced armored file decrypts to its published plaintext (age layer: armor, header MAC, STREAM)" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    const pt = try tlock.age.decryptAlloc(gpa, interop_tle_file, interopRoundSignature(), .{
+        .chain_hash = hexBytes(32, interop_chain_hash_hex),
+    });
+    defer gpa.free(pt);
+    try std.testing.expectEqualSlices(u8, interop_tle_plaintext, pt);
+
+    // The same file under another chain hash is refused before any pairing.
+    var other = hexBytes(32, interop_chain_hash_hex);
+    other[0] ^= 1;
+    try std.testing.expectError(error.WrongChainHash, tlock.age.decryptAlloc(gpa, interop_tle_file, interopRoundSignature(), .{ .chain_hash = other }));
+}
+
+test "drand interop: the whole Go-tle file is refused when any payload byte is flipped" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    // Work on the binary form so a flip lands in the STREAM payload, not
+    // in the armor's base64 alphabet.
+    const bin_buf = try gpa.alloc(u8, tlock.age.dearmoredLenMax(interop_tle_file.len));
+    defer gpa.free(bin_buf);
+    const bin = try tlock.age.dearmor(bin_buf, interop_tle_file);
+    const last = bin.len - 1; // inside the final chunk's Poly1305 tag
+    bin[last] ^= 0x01;
+    try std.testing.expect(std.meta.isError(tlock.age.decryptAlloc(gpa, bin, interopRoundSignature(), .{})));
+}
+
 test "drand interop: the fixture rejects under a mismatched round signature (FO check, cross-beacon)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 
