@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` (`unshare -rn zig build interop-rawsock`)
+  asks the Linux kernel "who-has" over a veth pair through this module's own socket and ARP builder, and
+  the kernel answers; the request and reply are frozen (`src/testdata/kernel_arp.zig`) and replayed without
+  privileges: `arp.buildRequest` must build the request the kernel answered, `arp.parseReply` must read
+  the kernel's reply. No defect.
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog items 1–4 except the ring). ADDED
   `rawsock.filter`: `compile` (a pcap-filter(7) subset — `ip`/`ip6`/`arp`/`icmp`/`tcp`/`udp`/
   `sctp`, `ether src|dst|host|proto`, `ip [src|dst] host|net`, `ip proto`, `[tcp|udp|sctp]

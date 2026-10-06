@@ -1422,6 +1422,27 @@ test "golden: real capture — arp.parseReply on a real who-has/is-at exchange" 
     try testing.expectEqualSlices(u8, &.{ 0xba, 0x89, 0xdd, 0xc5, 0x71, 0x9a }, &got.mac);
 }
 
+test "kernel ARP: the request the kernel answered is the one buildRequest builds; its reply parses" {
+    // `tools/interop.zig` (`unshare -rn zig build interop-rawsock --
+    // --capture`) sent `arp.buildRequest` through this module's socket on a
+    // veth pair and recv'd the Linux kernel's answer: the request is
+    // anchored by the kernel having answered it, the reply is the kernel's
+    // own bytes. Offline, no privileges.
+    const k = @import("testdata/kernel_arp.zig");
+    var req: [arp.request_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&req, k.request);
+    try testing.expectEqualSlices(u8, &req, &arp.buildRequest(k.mac_a, k.ip_a, k.ip_b));
+
+    var reply: [k.reply.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&reply, k.reply);
+    const eth = EthHeader.parse(&reply).?;
+    try testing.expectEqualSlices(u8, &k.mac_a, &eth.dst);
+    try testing.expectEqualSlices(u8, &k.mac_b, &eth.src);
+    const r = arp.parseReply(&reply).?;
+    try testing.expectEqualSlices(u8, &k.ip_b, &r.ip.v4);
+    try testing.expectEqualSlices(u8, &k.mac_b, &r.mac);
+}
+
 test "golden: real-capture fixture count + size canary — 3 real veth-pair captures" {
     try testing.expectEqual(@as(usize, 42), arp_request_frame.len);
     try testing.expectEqual(@as(usize, 42), arp_reply_frame.len);
