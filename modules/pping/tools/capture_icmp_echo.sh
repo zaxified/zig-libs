@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 #
-# Recipe for the ICMP / ICMPv6 echo goldens in ../src/echo_golden.zig.
+# Recipe for the ICMP / ICMPv6 echo goldens in ../src/echo_kat.zig.
 #
 # Runs iputils `ping` against a second address on loopback inside a throwaway
 # network namespace (`unshare --user --map-root-user --net`: CAP_NET_RAW exists

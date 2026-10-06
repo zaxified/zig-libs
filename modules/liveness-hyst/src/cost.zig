@@ -191,6 +191,8 @@ pub const Selector = struct {
     ///      candidate immediately (fast failover);
     ///   3. otherwise switch only when the candidate has cost at least
     ///      `margin` less than the incumbent at every `update` for `hold`.
+    /// `now` should be monotonic; one that steps back counts as no elapsed
+    /// hold time (the switch is delayed, never made early).
     pub fn update(self: *Selector, now: Time, paths: []const *const Estimator) ?usize {
         if (paths.len == 0) {
             self.current = null;
@@ -223,7 +225,10 @@ pub const Selector = struct {
                 self.challenger = best;
                 self.challenger_since = now;
             }
-            if (now - self.challenger_since >= self.cfg.hold) return self.take(best);
+            // Saturating: a `now` behind `challenger_since` (a caller clock
+            // that stepped back) is no hold time yet, not a trap in the safe
+            // modes or a wrapped "hold long over" in ReleaseFast.
+            if (now -| self.challenger_since >= self.cfg.hold) return self.take(best);
         } else {
             self.challenger = null;
         }
@@ -497,6 +502,36 @@ test "selector: a durable improvement switches once, after hold" {
     try testing.expectEqual(@as(u64, 1), sel.switches);
     try testing.expectEqual(@as(?usize, 1), sel.current);
     try testing.expectEqual(first_better.? + sel.cfg.hold, switched_at.?);
+}
+
+test "selector: a clock that steps back during hold delays the switch, never traps" {
+    // Review 2026-10-06 (PR #4): `now - challenger_since` on the u64 `Time`
+    // trapped in the safe modes when `now` went backwards while a challenger
+    // was accumulating hold time, and wrapped to "hold long over" in
+    // ReleaseFast — an immediate switch.
+    var a = Estimator.init(.{});
+    var b = Estimator.init(.{});
+    const paths = [_]*const Estimator{ &a, &b };
+    var sel = Selector.init(.{});
+    var now: Time = 10_000;
+    for (0..50) |_| {
+        now += 200;
+        a.onProbeReply(now, 30);
+        b.onProbeReply(now, 60);
+        _ = sel.update(now, &paths);
+    }
+    // A degrades until B becomes a challenger.
+    while (sel.challenger == null) {
+        now += 200;
+        a.onProbeReply(now, 110);
+        b.onProbeReply(now, 60);
+        try testing.expectEqual(@as(?usize, 0), sel.update(now, &paths));
+    }
+    try testing.expectEqual(@as(?usize, 1), sel.challenger);
+    try testing.expectEqual(@as(?usize, 0), sel.update(now - 5_000, &paths));
+    try testing.expectEqual(@as(u64, 0), sel.switches);
+    // Hold still counts from where the challenger started.
+    try testing.expectEqual(@as(?usize, 1), sel.update(sel.challenger_since + sel.cfg.hold, &paths));
 }
 
 test "selector: a .down incumbent is left immediately" {

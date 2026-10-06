@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `pickle.zig` documents that restoring an
+  old outbound pickle rewinds the ratchet and reuses message indices (review of PR #4).
+
 - **2026-10-06** — ADDED: session pickling (`pickle.zig`). `OutboundSession.pickle` /
   `pickleSealed` / `fromPickle` / `fromSealedPickle` and the same four on `InboundGroupSession`
   save and restore every field of a session (ratchet and index, the outbound Ed25519 key pair,

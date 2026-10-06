@@ -40,6 +40,18 @@
 //! the bytes are this module's own and are NOT interchangeable with either
 //! library's pickles; nothing of theirs was read beyond public docs.
 //!
+//! ## ⚠ A pickle is a snapshot: never restore an outbound one twice
+//!
+//! Restoring an `OutboundSession` pickle rewinds the ratchet to the index it
+//! was taken at. Encrypting from there again reuses message indices, so two
+//! different plaintexts go out under the same message key — and receivers
+//! that already saw those indices refuse the new ones as replays. Treat the
+//! pickle like the live session: re-pickle after every encrypt that matters,
+//! keep only the newest, and never resume one copy in two places. (The
+//! sealing cannot prevent this: an old pickle is still a genuine one.) An
+//! inbound pickle restored from earlier only loses fast-forward state and
+//! is safe.
+//!
 //! ## Decoding is strict and fail-closed
 //!
 //! Every decoder checks, in order: length ≥ header (`error.Truncated`),
