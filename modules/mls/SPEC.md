@@ -1570,6 +1570,26 @@ Equivalent: the "committer's encryption key must change" check
 (`rejectReusedPathKeys` runs right after it over a tree that still holds the
 committer's old leaf, and refuses the same message with the same error).
 
+**The run's leak hint — RESOLVED 2026-10-06, no leak.** The mutants that
+deleted the committer's-own-Update, two-GroupContextExtensions and
+duplicate-PSK checks made `testing.allocator` report leaks, read at the
+time as missing `errdefer`s on `createCommit`'s later failure paths.
+Reproduced: with those checks gone `createCommit` SUCCEEDS, and the leaked
+buffers are the returned `commit`/`group_info`, which the test's
+`expectError` received as an unexpected success and never freed — a test
+artifact, not a library path. Checked anyway on clean code with
+`std.testing.checkAllAllocationFailures` over whole sessions under one
+failing allocator (`create`, `createCommit`, `fromWelcome`,
+`processCommit`, `updateLeaf`/`createProposal`, `joinByExternalCommit`;
+six shapes: empty full Commit, Add with `external_pub` and extra GroupInfo
+extensions, external PSK, by-reference Update, path omitted, external join
+with a PSK — 148 to 296 failure points each, 1339 in all): every point
+clean. Non-OOM failures after validation are covered too: `DuplicateKeyInTree`
+and `PskNotAvailable` by existing tests, and an HPKE failure midway through
+the Welcome slots and midway through the UpdatePath ciphertexts by a new
+one (an all-zero X25519 key — see Backlog). Both instruments were shown to
+fire by deleting one `errdefer` each.
+
 ## Threat model
 
 - **`codec.Reader` on hostile input.** Every `read*` function is bounds-
@@ -1754,6 +1774,17 @@ committer's old leaf, and refuses the same message with the same error).
 - **`PrivateMessage` handshake messages (proposals/commits)** *(survey 2026-09-30)*: the common wire-format policy in deployments encrypts handshakes too; here `processCommit` returns `PrivateHandshakeNotSupported`. Effort: medium, done together with the item above (needs the secret tree). Fits §2.
 - **More cipher suites**: 0x0002 (P-256/AES-GCM/ECDSA), 0x0003 (X25519/ChaCha20-Poly1305), 0x0007 (P-384), then 0x0004/0x0006 (X448/Ed448) and 0x0005 (P-521) *(survey 2026-09-30)*: `suite.zig` says only 0x0001 is instantiated; the enum names all seven. Sibling `hpke` already has X25519/P-256/P-384 KEMs and std has ECDSA P-256/P-384; X448/Ed448 exist in `ed448` but hpke lacks an X448 KEM (see its Backlog), and P-521 has no std support. Effort: small (0x0003), medium (0x0002, 0x0007), large (0x0005). Fits §2.
 - **Part 3: §7.3/§10.1 LeafNode and KeyPackage validation and X.509 credentials** *(survey 2026-09-30)*: lifetime, capability and extension consistency, credential acceptance; existing README/SPEC list it as "still not built". Every real deployment needs at least the lifetime and capability checks; X.509 credential support needs sibling `x509`. Effort: medium. Fits §2.
+- **An Add whose KeyPackage carries a low-order X25519 key is accepted**
+  *(found 2026-10-06)*. An all-zero `init_key` or leaf `encryption_key` is
+  well-formed and signs fine, so it passes §12.2 and the KeyPackage checks;
+  the HPKE encapsulation to it then fails in the DH step (`hpke`'s
+  `DhFailed`, surfaced as `DhFailed` from the Welcome and as `Malformed`
+  from `treekem.sealUpdatePath`). Once such a leaf is in the tree, every
+  path Commit whose resolution reaches it fails for the committer until a
+  Remove takes it out — a member-level nuisance, not a state corruption
+  (the Commit is refused whole). Rejecting a public key whose DH with a
+  fixed scalar is the identity, at KeyPackage/LeafNode admission, would
+  close it; that belongs with "Part 3" below.
 - **ReInit and subgroup branch (§11.2/§11.3)** *(survey 2026-09-30)*: named in README as remaining. Effort: small-medium once resumption PSKs (already done) are used. Fits §2.
 
 ### Done (kept for the record, not open)

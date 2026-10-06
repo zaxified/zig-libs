@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** no leak on `createCommit`'s failure paths;
+  the mutation run's leak hint was a test artifact. With the committer's-own-Update,
+  two-GroupContextExtensions or duplicate-PSK check deleted, `createCommit` SUCCEEDS, and the
+  "leaked" buffers were the returned `commit`/`group_info` that the test's `expectError`
+  discarded. Checked on clean code anyway: 6 tests drive whole sessions (`create`,
+  `createCommit`, `fromWelcome`, `processCommit`, by-reference Update, `joinByExternalCommit`;
+  empty Commit, Add with `external_pub`, external PSK, path omitted) through
+  `std.testing.checkAllAllocationFailures` — 1339 failure points, all clean — and 1 test fails
+  an HPKE encapsulation midway through the Welcome slots and midway through the UpdatePath
+  ciphertexts: clean. Each instrument was shown to fire by deleting one `errdefer`. Found on
+  the way (SPEC Backlog, not fixed): an Add whose KeyPackage carries an all-zero X25519 key is
+  accepted, after which every path Commit reaching that leaf fails until it is removed.
+
 - **2026-10-06** — **Fixed a double free reachable from a received Commit.** A Commit whose
   proposal list names the same PreSharedKeyID twice made `validateProposalList` free its
   scratch encoding twice — explicitly, and again through its own `errdefer` — on both

@@ -7185,3 +7185,217 @@ test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplica
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(u64, 2), a.epoch);
 }
+
+/// One whole two-party session under ONE allocator, for
+/// `std.testing.checkAllAllocationFailures`: `create`, a first Commit adding
+/// bob, bob's `fromWelcome`, then the `variant`'s target Commit through
+/// `createCommit` and the receiver's `processCommit` (and, where it adds
+/// somebody, the newcomer's `fromWelcome`; for `.external`,
+/// `joinByExternalCommit`). The sweep fails the n-th allocation for every n
+/// and reports any byte not returned, so every failure path of every one of
+/// those functions is checked for leaks, not just the ones a test happens to
+/// construct.
+const LeakSweep = struct {
+    const Variant = enum { plain, add, psk, by_reference, no_path, external };
+
+    const Clients = struct { alice: TestClient, bob: TestClient, carol: TestClient };
+
+    const psk_nonce = [_]u8{0x5a} ** TestSuite.Nh;
+    const psk: content.Proposal = .{ .psk = .{ .id = .{ .external = "sweep" }, .psk_nonce = &psk_nonce } };
+    const psks = [_]ExternalPsk{.{ .psk_id = "sweep", .psk = "sweep-secret" }};
+
+    fn run(fa: std.mem.Allocator, io: std.Io, cl: *const Clients, variant: Variant) !void {
+        var a = try Group(TestSuite).create(fa, .{
+            .io = io,
+            .group_id = "leak-sweep",
+            .key_package_msg = cl.alice.kp_msg,
+            .encryption_priv = cl.alice.enc_priv,
+        });
+        defer a.deinit();
+        var b = blk: {
+            const c1 = try a.createCommit(fa, .{
+                .io = io,
+                .signature_key_pair = cl.alice.sig,
+                .proposals = if (variant == .psk)
+                    &.{ .{ .by_value = .{ .add = cl.bob.kp } }, .{ .by_value = psk } }
+                else
+                    &.{.{ .by_value = .{ .add = cl.bob.kp } }},
+                .external_psks = &psks,
+            });
+            defer c1.deinit(fa);
+            break :blk try cl.bob.join(fa, c1.welcome.?, &psks);
+        };
+        defer b.deinit();
+
+        if (variant == .external) {
+            const c2 = try a.createCommit(fa, .{ .io = io, .signature_key_pair = cl.alice.sig, .include_external_pub = true });
+            defer c2.deinit(fa);
+            try b.processCommit(.{ .commit_msg = c2.commit });
+            var joined = try Group(TestSuite).joinByExternalCommit(fa, fa, .{
+                .io = io,
+                .group_info_msg = c2.group_info,
+                .key_package_msg = cl.carol.kp_msg,
+                .signature_key_pair = cl.carol.sig,
+                .proposals = &.{psk},
+                .external_psks = &psks,
+            });
+            defer joined.group.deinit();
+            defer joined.messages.deinit(fa);
+            try a.processCommit(.{ .commit_msg = joined.messages.commit, .external_psks = &psks });
+            try b.processCommit(.{ .commit_msg = joined.messages.commit, .external_psks = &psks });
+            if (!sameEpoch(&a, &joined.group) or !sameEpoch(&a, &b)) return error.TestUnexpectedResult;
+            return;
+        }
+
+        var proposal_msg: ?[]u8 = null;
+        defer if (proposal_msg) |m| fa.free(m);
+        if (variant == .by_reference) {
+            const new_enc = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(0x99));
+            const leaf = try b.updateLeaf(.{ .signature_key_pair = cl.bob.sig, .encryption_key_pair = new_enc });
+            proposal_msg = try b.createProposal(fa, .{ .signature_key_pair = cl.bob.sig, .proposal = .{ .update = leaf } });
+        }
+        const add_carol: Group(TestSuite).CommitSource = .{ .by_value = .{ .add = cl.carol.kp } };
+        const c2 = try a.createCommit(fa, .{
+            .io = io,
+            .signature_key_pair = cl.alice.sig,
+            .proposals = switch (variant) {
+                .plain => &.{},
+                .add, .no_path => &.{add_carol},
+                .psk => &.{ add_carol, .{ .by_value = psk } },
+                .by_reference => &.{.{ .by_reference = proposal_msg.? }},
+                .external => unreachable,
+            },
+            .external_psks = &psks,
+            .omit_path_when_allowed = variant == .no_path,
+            .include_external_pub = variant == .add,
+            .group_info_extensions = if (variant == .add) &.{.{ .extension_type = 0xff00, .extension_data = "x" }} else &.{},
+        });
+        defer c2.deinit(fa);
+        const proposal_msgs: []const []const u8 = if (proposal_msg) |m| &.{m} else &.{};
+        try b.processCommit(.{ .commit_msg = c2.commit, .proposal_msgs = proposal_msgs, .external_psks = &psks });
+        if (!sameEpoch(&a, &b)) return error.TestUnexpectedResult;
+        if (c2.welcome) |w| {
+            var c = try cl.carol.join(fa, w, &psks);
+            defer c.deinit();
+            if (!sameEpoch(&a, &c)) return error.TestUnexpectedResult;
+        }
+    }
+
+    fn check(variant: Variant) !void {
+        var threaded = std.Io.Threaded.init(testing.allocator, .{});
+        defer threaded.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const cl: Clients = .{
+            .alice = try TestClient.init(aa, "alice", 201),
+            .bob = try TestClient.init(aa, "bob", 202),
+            .carol = try TestClient.init(aa, "carol", 203),
+        };
+        try testing.checkAllAllocationFailures(testing.allocator, run, .{ threaded.io(), &cl, variant });
+    }
+};
+
+test "leaks: every allocation failure of an empty full Commit's session is clean (create, createCommit, fromWelcome, processCommit)" {
+    try LeakSweep.check(.plain);
+}
+
+test "leaks: every allocation failure of a session whose Commit adds a member, publishes external_pub and extra GroupInfo extensions is clean" {
+    try LeakSweep.check(.add);
+}
+
+test "leaks: every allocation failure of a session carrying an external PSK in both Welcomes and a Commit is clean" {
+    try LeakSweep.check(.psk);
+}
+
+test "leaks: every allocation failure of a session committing a received Update BY REFERENCE is clean" {
+    try LeakSweep.check(.by_reference);
+}
+
+test "leaks: every allocation failure of a session whose Add-only Commit omits the path is clean" {
+    try LeakSweep.check(.no_path);
+}
+
+test "leaks: every allocation failure of a session with an external join carrying a PSK is clean" {
+    try LeakSweep.check(.external);
+}
+
+/// A KeyPackage whose init or encryption key is the X25519 all-zero point:
+/// well-formed and validly signed, so it passes every §12.2 and §10.1 check,
+/// and the HPKE encapsulation to it fails only in the DH step.
+fn lowOrderClient(arena: std.mem.Allocator, name: []const u8, seed: u8, which: enum { init, encryption }) !TestClient {
+    var c = try TestClient.init(arena, name, seed);
+    const zero: [TestSuite.Kem.Npk]u8 = @splat(0);
+    const good_init = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 64))).public_key;
+    const good_enc = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(seed +% 128))).public_key;
+    c.kp = try keypackage_mod.create(TestSuite, arena, .{
+        .signature_key_pair = c.sig,
+        .init_key = if (which == .init) zero else good_init,
+        .encryption_key = if (which == .encryption) zero else good_enc,
+        .credential = .{ .basic = name },
+        .capabilities = .{
+            .versions = &.{1},
+            .cipher_suites = &.{1},
+            .extensions = &.{},
+            .proposals = &.{},
+            .credentials = &.{1},
+        },
+        .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+    });
+    const msg: framing.MLSMessage = .{ .key_package = c.kp };
+    c.kp_msg = try msg.encodeAlloc(arena);
+    return c;
+}
+
+test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves nothing allocated" {
+    // The two non-OOM failures `createCommit` can meet AFTER every list
+    // check has passed and after its output buffers exist: an encapsulation
+    // to a member's key failing in the DH step, with some ciphertexts
+    // already built. `testing.allocator` reports anything left behind.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 211);
+    const bob = try TestClient.init(aa, "bob", 212);
+    const carol = try TestClient.init(aa, "carol", 213);
+    const bad_init = try lowOrderClient(aa, "bad-init", 214, .init);
+    const bad_enc = try lowOrderClient(aa, "bad-enc", 215, .encryption);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "leak-hpke",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const before = try stateDigest(&a);
+
+    // Welcome: the first slot (bob) is sealed, the second (`bad_init`) fails.
+    try testing.expectError(error.DhFailed, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_init.kp } } },
+    }));
+    try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
+
+    // UpdatePath: with leaves alice, bob, bad_enc the path seals to bob's
+    // leaf first, then to `bad_enc`'s, which fails.
+    const c1 = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_enc.kp } } },
+    });
+    defer c1.deinit(gpa);
+    const mid = try stateDigest(&a);
+    try testing.expectError(error.Malformed, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
+    }));
+    try testing.expectEqualSlices(u8, &mid, &(try stateDigest(&a)));
+}
