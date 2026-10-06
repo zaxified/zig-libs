@@ -78,6 +78,14 @@ prominent notices of change. Stating the election matters even where nothing
 was copied: without it the module stands formally under BOTH sets of terms, and
 the Apache branch's conditions would then be unmet.
 
+**age envelope (`src/age.zig`, 2026-10-06)**: written from the public
+age v1 specification (C2SP `age.md`, "age-encryption.org/v1") — the
+header grammar, the HKDF-SHA-256/HMAC-SHA-256 header MAC, the STREAM
+payload and the ASCII armor. No age implementation's source was read
+(`filippo.io/age` is BSD-3-Clause: spec and documentation only). The
+`tlock` stanza's argument layout (`<round> <chain hash>`) and its 128-byte
+body are what the genuine `tle` fixture above carries.
+
 **Academic reference**: Boneh, D. and Franklin, M., "Identity-Based
 Encryption from the Weil Pairing", CRYPTO 2001 (the "FullIdent"
 construction, §4.2) — a public academic paper, not a copyrightable

@@ -356,7 +356,7 @@ const module_list = [_]Module{
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{ "entropy", "montint" }, .heavy = true },
     .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
     // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
     // byte-compare against the genuine drand-Go-produced ciphertext `tlock`

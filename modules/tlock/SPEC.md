@@ -38,6 +38,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 **Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the raw 128-byte IBE ciphertext of a 16-byte key - no age stanza/armor layer, no arbitrary-length payloads (a `tle` user's main use), only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254.
 
+**Re-assessed 2026-10-06** (no new web survey): the age layer landed (`age.zig`: `tlock` stanza, header HMAC, STREAM payload, armor, any length) — **even** with `drand/tlock` and `tlock_age` on the quicknet file format *as specified*, but **not yet interop-proven**: the stanza body is byte-exact against the genuine `tle` fixture, while the header MAC, STREAM and armor are tested against the age spec and in round trip only, because the fixture's full bytes are not in this tree. Still **behind** on the G2-signature testnet scheme and BN254, and on streaming I/O (whole buffers only). Scope stays `mvp` until a whole Go-produced `.tle` file decrypts here.
+
 ## Scheme variant pinned: quicknet / `SigsOnG1ID`
 
 drand runs four schemes; two are usable for timelock encryption at all
@@ -187,6 +189,21 @@ interop vector proved the flag right, in an unexpected place:
   `error.FoCheckFailed`, never a garbage plaintext (four tests).
 - **`fp12Pow` law (ungated, done)**: `base^0/base^1`, exponent
   additivity, and the bilinearity cross-check `e(P,Q)^r == e(rP,Q)`.
+- **age envelope (`age.zig`, 2026-10-06).** EXTERNAL: `encrypt` with
+  the fixture's recovered `(filekey, sigma)` writes a stanza line and
+  base64 body whose decoded bytes are the genuine `tle` fixture's 128-byte
+  stanza body, and the file opens under the genuine round-5423142
+  signature. SELF-DERIVED (from the age spec, C2SP `age.md`): the header
+  MAC, the STREAM payload and the armor — round trips at 0, 1, 64 KiB±1,
+  128 KiB and 128 KiB+5 bytes, binary and armored; MAC tampering and a
+  re-spelled stanza line (`HeaderMacMismatch`); a flipped second chunk,
+  truncation at a chunk boundary, inside a tag and inside the nonce, and a
+  changed nonce (all refused, the opened first chunk wiped); 23 typed
+  header refusals, the stanza and size caps, and 11 armor refusals. The
+  primitives are anchored where they live (`chachapoly`: RFC 8439; std's
+  HKDF/HMAC). A `testing.fuzz` harness drives `Header.parse`, `dearmor`
+  and the STREAM opener. **Not done:** a whole Go-produced `.tle` file
+  decrypted here — see Backlog.
 - **Mutation run 2026-10-05** (in-place, Debug, 16 mutants over
   `Ciphertext.fromBytes`, the FO check, `fp12Pow`'s window and
   constant-time lookup, `gtToDrandRepr`, and every hash's tag, DST,
@@ -233,10 +250,10 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 
 ## Out of scope
 
-- The hybrid `age`-envelope layer (`filippo.io/age` stanzas, armored
-  file framing, arbitrary-length payloads) `drand/tlock`'s `tle` CLI
-  wraps this primitive inside of — not yet, see Backlog. Today this
-  module implements the raw 128-byte BF-IBE `Ciphertext` only.
+- age recipients other than `tlock` (X25519, scrypt, plugins): a header
+  may carry them and they are MAC-covered and skipped, but `age.zig`
+  only opens the `tlock` stanza. A general age implementation is not
+  this module's job.
 - PQ-hybrid composition (see `root.zig`'s "Honest limitations" —
   gating a `hqc` KEM ciphertext alongside this module's IBE layer for
   long-term confidentiality) — a consumer-side decision, not this
@@ -250,7 +267,9 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 
 ## Backlog / deferred
 
-- **age stanza + armor layer for arbitrary-length payloads** *(survey 2026-09-30)* — the `tle` workflow (encrypt a file, share it, decrypt after round R) needs it; the module already validates against an age file's key. Effort: medium (age STREAM, HKDF header MAC, armor); fits §2. (Survey: the largest gap against `drand/tlock`.)
+- ~~age stanza + armor layer for arbitrary-length payloads~~ — DONE 2026-10-06 (`age.zig`).
+- **Whole-file interop KAT for the age layer** *(2026-10-06)* — commit the bytes of `drand/tlock`'s `testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle` and `testdata/lorem.txt` (commit `7ceb44a5…`) under `src/testdata/` and decrypt the file end-to-end with the round-5423142 signature already pinned; the stanza half is already byte-exact. This is the one step between `mvp` and `core`. Effort: small.
+- **Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer` for files larger than memory. Effort: small (the chunk loop is already per-chunk).
 - **G2-signature scheme (`bls-unchained` testnet variant)** *(survey 2026-09-30)* — supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits §2.
 
 ## Anchoring
