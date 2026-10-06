@@ -419,6 +419,21 @@ fn directionKeys(keys: *const ChannelKeys, direction: Direction) DirectionKeys {
     };
 }
 
+// ── SequenceNumber ────────────────────────────────────────────────────────
+
+/// Is `next` the SequenceNumber that may follow `prev` on a secured channel?
+/// OPC 10000-6 §6.7.2.4: exactly one more, except that a sender past
+/// `UInt32.MaxValue − 1024` may wrap to any value below 1024. The same rule
+/// open62541 and asyncua apply to what they receive, so a conforming peer
+/// never trips it; a replayed, reordered or dropped chunk always does. Both
+/// directions use it: the server on every authenticated request chunk, the
+/// client (`services.Channel.recvService`) on every authenticated response
+/// chunk (review 2026-10-06).
+pub fn sequenceFollows(prev: u32, next: u32) bool {
+    if (next == prev +% 1) return true;
+    return prev > std.math.maxInt(u32) - 1024 and next < 1024;
+}
+
 // ── SecurityContext ───────────────────────────────────────────────────────
 
 /// Bundles everything a `services.Channel`/`root.SecureChannel` needs to

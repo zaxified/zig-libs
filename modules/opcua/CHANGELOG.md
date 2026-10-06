@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** client hardening against a
+  hostile server (review 2026-10-06, open item (b)). `Channel.recvService` now
+  frees everything it decoded when it refuses a response — a string-typed
+  response NodeId, a `ServiceFault`, a response with a Bad ServiceResult, the
+  fields of a struct a truncated body cut short, and a decode that ran out of
+  memory part-way all leaked per response before; it decodes through a private
+  tracking allocator, and an accepted response is still plain caller-allocator
+  memory freed with the same `free*Response`. On a signed or encrypted channel
+  every response chunk's SequenceNumber must now follow the previous one
+  (`security.sequenceFollows`, moved there from `server.zig` and now `pub`;
+  the `issue` OPN response starts the count, tracked in the new defaulted field
+  `Channel.recv_sequence_number`), else the new
+  `ServiceError.SequenceNumberInvalid` — a replayed signed response used to be
+  accepted. (An exhaustive `switch` over `ServiceError` without an `else` needs
+  an arm for the new member; nothing in this repository has one.) The asyncua transcript and the Basic256Sha256 goldens are unchanged
+  and still pass byte for byte.
+
 - **2026-10-06** — **BEHAVIOURAL, not breaking:** the pre-authentication RSA cost
   of an OpenSecureChannel is bounded (review 2026-10-06, open item (a)). Every OPN
   chunk used to be RSA-OAEP-decrypted block by block before its signature could

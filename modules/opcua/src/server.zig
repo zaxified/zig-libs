@@ -762,15 +762,8 @@ pub const ConnectionState = enum {
     closed,
 };
 
-/// Is `next` the SequenceNumber that may follow `prev` on a secured channel?
-/// OPC 10000-6 §6.7.2.4: exactly one more, except that a sender past
-/// `UInt32.MaxValue − 1024` may wrap to any value below 1024. The same rule
-/// open62541 and asyncua apply to what they receive, so a conforming peer
-/// never trips it; a replayed, reordered or dropped chunk always does.
-fn sequenceFollows(prev: u32, next: u32) bool {
-    if (next == prev +% 1) return true;
-    return prev > std.math.maxInt(u32) - 1024 and next < 1024;
-}
+/// OPC 10000-6 §6.7.2.4's successor rule, shared with the client side.
+const sequenceFollows = security.sequenceFollows;
 
 /// The negotiated limits (§7.1.3): the minimum of what each side proposed.
 pub const Negotiated = struct {

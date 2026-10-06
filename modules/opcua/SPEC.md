@@ -103,6 +103,7 @@ RSA-OAEP-encrypted `UserNameIdentityToken`s.
 | the channel and the session belong together | `ClientSignature` over serverCertificate ‖ serverNonce, verified against the session's `ClientCertificate` | `BadApplicationSignatureInvalid` |
 | the session cannot move channels | session is channel-bound; no transfer is implemented | `BadSecureChannelIdInvalid` |
 | the client can authenticate *us* | `ServerSignature` over clientCertificate ‖ clientNonce | client-side check |
+| the client cannot be fed a replayed response | `Channel.recvService` applies the same `sequenceFollows` rule to every authenticated response chunk; the `issue` OPN response starts the count | `error.SequenceNumberInvalid` (client) |
 | a password is not readable or replayable | RSA-OAEP over `UInt32 len ‖ password ‖ serverNonce`, nonce compared constant-time | `BadIdentityTokenInvalid` |
 | a policy cannot be downgraded | a plaintext password against a non-`#None` `UserTokenPolicy` is refused | `BadIdentityTokenInvalid` |
 
@@ -249,11 +250,20 @@ its encrypted region may not exceed `SecurityConfig.max_opn_encrypted_len`
 (default 4096 bytes; the recorded asyncua OPN's is 512) — `ERR
 BadTcpMessageTooLarge` on the clear header, before the thumbprint, the
 certificate or any RSA operation; a test feeds forged `C`, `A` and oversize
-OPNs that were refused only after RSA-OAEP failed on them before the fix; (b) the client never checks the server's `SequenceNumber`,
-and `Channel.recvService` decodes with the caller's allocator but frees neither
-a string-typed response NodeId, a `ServiceFault`, a response rejected as Bad, nor
-the fields of a struct a truncated response cut short — a hostile server leaks
-client memory per response; (c) `Config.max_lifetime_count` below three
+OPNs that were refused only after RSA-OAEP failed on them before the fix; (b) the
+client never checks the server's `SequenceNumber`, and `Channel.recvService`
+decodes with the caller's allocator but frees neither a string-typed response
+NodeId, a `ServiceFault`, a response rejected as Bad, nor the fields of a struct
+a truncated response cut short — a hostile server leaks client memory per
+response. **Fixed 2026-10-06:** `recvService` decodes through a tracking
+pass-through allocator and frees everything it decoded on every refusal (an
+accepted response is returned as plain caller-allocator memory, as before), and
+on a signed/encrypted channel every response chunk's `SequenceNumber` must pass
+the server's own `security.sequenceFollows` (the `issue` OPN response starts the
+count, everything after continues it, as open62541 does in both roles) else
+`error.SequenceNumberInvalid`; six tests — one per leak shape, an every-cut
+truncation sweep, `checkAllAllocationFailures`, and a replay/gap sequence —
+each failed before the fix; (c) `Config.max_lifetime_count` below three
 keep-alive counts silently overrides §5.13.2's floor (an operator setting, not
 peer input). The M1 check is the rule open62541 and asyncua apply; the asyncua
 transcript replays byte-for-byte under it, the open62541 live tests did not run
