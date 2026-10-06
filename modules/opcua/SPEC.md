@@ -6,7 +6,7 @@
 
 **Scope:** mvp — open62541 v1.5.8 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-09-07
+**Audit:** review 2026-10-06 · mutation 2026-09-07
 
 **Known defects:** none recorded
 
@@ -98,6 +98,8 @@ RSA-OAEP-encrypted `UserNameIdentityToken`s.
 | every chunk is authentic | HMAC-SHA256 over the plaintext incl. the MessageHeader; AES-256-CBC under it at SignAndEncrypt | `BadSecurityChecksFailed` |
 | a token cannot outlive its lease | `now_ms - created > RevisedLifetime` | `BadSecureChannelTokenUnknown` |
 | a renewal does not cut off in-flight messages | the previous token stays valid for `token_renewal_overlap_ms`, capped at its own expiry | `BadSecureChannelTokenUnknown` past the window |
+| a renewal cannot change the policy | a `renew` OPN must arrive under the policy the channel was opened with (`#None` → Basic256Sha256 refused; the reverse already was) | `BadSecurityPolicyRejected` |
+| a chunk cannot be replayed, reordered or dropped | every authenticated chunk's `SequenceNumber` must be the previous one + 1 (wrap below 1024 once past `UInt32.MaxValue − 1024`, §6.7.2.4); an `issue` OPN starts a new count, a secured `renew` continues it | `BadSecurityChecksFailed` |
 | the channel and the session belong together | `ClientSignature` over serverCertificate ‖ serverNonce, verified against the session's `ClientCertificate` | `BadApplicationSignatureInvalid` |
 | the session cannot move channels | session is channel-bound; no transfer is implemented | `BadSecureChannelIdInvalid` |
 | the client can authenticate *us* | `ServerSignature` over clientCertificate ‖ clientNonce | client-side check |
@@ -210,6 +212,45 @@ on a different SecureChannel is `BadSecureChannelIdInvalid` (session transfer
 between channels is not implemented, which closes that door rather than
 opening it half-way).
 
+**Review 2026-10-06** (adversarial re-review; the last review was 2026-09-02).
+Scope: the code that landed after it — C4–C8 of 2026-09-10 (`decodeArray`/
+`decodeVariantArraySlice` `freeItem`, the `nodestore` `dup*` errdefers, the new
+`free*` for `RelativePath`/`BrowsePath`/`BrowsePathResult`,
+`Config.max_lifetime_count`) — and the server receive path end to end: HEL/ACK
+negotiation, chunk framing and reassembly limits, the OPN security stage
+(thumbprint, certificate checks, OAEP decrypt, PKCS#1 v1.5 verify, padding
+strip), the symmetric stage (token selection, AES-CBC, HMAC, padding), renewal
+and the overlap window, CreateSession/ActivateSession (certificate binding,
+`ClientSignature`, identity tokens), service dispatch and the subscription
+engine. Every row of the threat-model table above was checked against the code.
+Findings: **H1** (fixed) — a `#None` channel could be "renewed" by a
+Basic256Sha256 OPN; the None token became the overlap token with no keys, and a
+MSG naming it hit `c.prev_keys.?` in `openSymmetricChunk`: a remote panic in
+Debug/ReleaseSafe, from any peer holding any self-signed certificate (the
+default `certificate_policy = null`), on any server advertising `#None` beside a
+secured endpoint. **M1** (fixed) — the inbound `SequenceNumber` of secured
+chunks was read and discarded, so a captured signed/encrypted Write or Call
+re-executed whenever an on-path attacker played it back within the token's
+life. **L1** (fixed) — `sampleDue` freed `last_value` before duplicating its
+replacement; an OutOfMemory there left a dangling pointer that was compared
+against and then freed twice. **L2** (fixed) — C4's array decoders still leaked
+an element decoded just before a failed list growth. **L3** (fixed) —
+`NodeStore.dupAttributes` had C7's partial-failure leak and was missed by C7.
+Each has a test that failed before its fix. **Open, reported to the owner, not
+fixed here:** (a) pre-authentication cost of an OPN — every chunk is
+RSA-OAEP-decrypted block by block (≈250 private-key operations for a 64 KiB
+chunk under a 2048-bit key, up to `max_chunk_count` chunks) before its signature
+can be checked; capping the OPN's encrypted size or refusing multi-chunk OPNs is
+a policy decision; (b) the client never checks the server's `SequenceNumber`,
+and `Channel.recvService` decodes with the caller's allocator but frees neither
+a string-typed response NodeId, a `ServiceFault`, a response rejected as Bad, nor
+the fields of a struct a truncated response cut short — a hostile server leaks
+client memory per response; (c) `Config.max_lifetime_count` below three
+keep-alive counts silently overrides §5.13.2's floor (an operator setting, not
+peer input). The M1 check is the rule open62541 and asyncua apply; the asyncua
+transcript replays byte-for-byte under it, the open62541 live tests did not run
+here (no container runtime).
+
 ## Codec-only vs driven
 
 Everything in `encoding` and `services` is a codec; what makes it *driven* is
@@ -257,7 +298,8 @@ whether a state machine in `root` (client) or `server` (server) uses it.
   trust policy rejects, a certificate outside its validity window, an absent /
   stale-nonce / foreign-key `ClientSignature`, a `CreateSession` presenting a
   certificate other than the channel's, a session replayed on a second
-  channel, a replayed encrypted password, and a plaintext password against an
+  channel, a replayed encrypted password, a replayed MSG chunk, a `#None`
+  channel renewed under Basic256Sha256, and a plaintext password against an
   encrypted `UserTokenPolicy`. Certificate parsing additionally gets every
   prefix of a real certificate, every single-byte mutation of one, hand-built
   malformed DER, and `std.testing.fuzz`.

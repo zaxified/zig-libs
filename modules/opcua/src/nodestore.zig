@@ -633,24 +633,39 @@ pub const NodeStore = struct {
     }
 
     fn dupAttributes(a: std.mem.Allocator, attrs: Attributes) StoreError!Attributes {
+        // `value`, `data_type`, `array_dimensions`: three allocating steps, so
+        // each earlier one needs an `errdefer` (C7's shape; review 2026-10-06,
+        // L3 — this helper was missed then).
         return switch (attrs) {
-            .variable => |v| .{ .variable = .{
-                .value = try dupDataValue(a, v.value),
-                .data_type = try dupNodeId(a, v.data_type),
-                .value_rank = v.value_rank,
-                .array_dimensions = if (v.array_dimensions) |d| try a.dupe(u32, d) else null,
-                .access_level = v.access_level,
-                .user_access_level = v.user_access_level,
-                .minimum_sampling_interval = v.minimum_sampling_interval,
-                .historizing = v.historizing,
-            } },
-            .variable_type => |v| .{ .variable_type = .{
-                .value = try dupDataValue(a, v.value),
-                .data_type = try dupNodeId(a, v.data_type),
-                .value_rank = v.value_rank,
-                .array_dimensions = if (v.array_dimensions) |d| try a.dupe(u32, d) else null,
-                .is_abstract = v.is_abstract,
-            } },
+            .variable => |v| blk: {
+                const value = try dupDataValue(a, v.value);
+                errdefer encoding.freeDataValue(a, value);
+                const data_type = try dupNodeId(a, v.data_type);
+                errdefer encoding.freeNodeId(a, data_type);
+                break :blk .{ .variable = .{
+                    .value = value,
+                    .data_type = data_type,
+                    .value_rank = v.value_rank,
+                    .array_dimensions = if (v.array_dimensions) |d| try a.dupe(u32, d) else null,
+                    .access_level = v.access_level,
+                    .user_access_level = v.user_access_level,
+                    .minimum_sampling_interval = v.minimum_sampling_interval,
+                    .historizing = v.historizing,
+                } };
+            },
+            .variable_type => |v| blk: {
+                const value = try dupDataValue(a, v.value);
+                errdefer encoding.freeDataValue(a, value);
+                const data_type = try dupNodeId(a, v.data_type);
+                errdefer encoding.freeNodeId(a, data_type);
+                break :blk .{ .variable_type = .{
+                    .value = value,
+                    .data_type = data_type,
+                    .value_rank = v.value_rank,
+                    .array_dimensions = if (v.array_dimensions) |d| try a.dupe(u32, d) else null,
+                    .is_abstract = v.is_abstract,
+                } };
+            },
             .reference_type => |v| .{ .reference_type = .{
                 .is_abstract = v.is_abstract,
                 .symmetric = v.symmetric,
@@ -1803,6 +1818,24 @@ test "dup helpers leak nothing on OutOfMemory at any allocation point (C7)" {
     try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeLocalizedText, .{});
     try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeExtensionObject, .{});
     try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeVariantExtensionObjectArray, .{});
+}
+
+fn dupAndFreeAttributes(a: std.mem.Allocator) !void {
+    // Every allocating field set, so each step has an earlier one to leak.
+    const value: encoding.DataValue = .{ .value = .{ .scalar = .{ .string = "v" } } };
+    const data_type: encoding.NodeId = .{ .string = .{ .namespace = 1, .id = "dt" } };
+    const all = [_]Attributes{
+        .{ .variable = .{ .value = value, .data_type = data_type, .array_dimensions = &.{3} } },
+        .{ .variable_type = .{ .value = value, .data_type = data_type, .array_dimensions = &.{3} } },
+    };
+    for (all) |attrs| NodeStore.freeAttributes(a, try NodeStore.dupAttributes(a, attrs));
+}
+
+test "dupAttributes leaks nothing on OutOfMemory at any allocation point (L3)" {
+    // Review 2026-10-06, L3: the sixth helper of C7's shape. `dupAttributes`
+    // duplicated `value`, then `data_type`, then `array_dimensions` inside one
+    // struct literal, with no `errdefer` between them.
+    try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeAttributes, .{});
 }
 
 test "addNamespace / refreshNamespaceArray keeps i=2255 in sync" {
