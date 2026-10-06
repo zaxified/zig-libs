@@ -1,8 +1,9 @@
 # lockfree
 
 Lock-free concurrency primitives for shared-memory worker pools:
-**epoch-based reclamation (EBR)** plus a **Michael-Scott MPMC queue** built on
-it. This is the workspace's first lock-free structure; its immediate consumer
+**epoch-based reclamation (EBR)**, a **Michael-Scott MPMC queue** built on
+it, and a **bounded, allocation-free MPMC ring** (Vyukov) for hand-offs where
+the producer must never wait. This is the workspace's first lock-free structure; its immediate consumer
 is the in-process worker pool (P2 DL4), which needs a multi-producer /
 multi-consumer work queue whose retired nodes are freed safely — the
 use-after-free/ABA-notorious kernel of any lock-free data structure.
@@ -35,6 +36,18 @@ const me = try domain.register();
 defer domain.unregister(me);
 try q.enqueue(me, 42);          // lock-free MS-queue producer
 const v = q.dequeue(me);         // ?u64 (null when empty)
+
+// Any payload type: `lockfree.Queue(Job)`, with `Queue(Job).Pool` as its pool.
+
+// The bounded ring: no domain, no pool, no allocation after `init`.
+const Ring = lockfree.BoundedQueue(Record, 1024, .{ .consumers = .single });
+const ring = try allocator.create(Ring); // slots are inline: heap, not stack
+ring.init();
+if (!ring.push(rec)) {}                 // full: refused, counted in refusedCount()
+while (ring.front()) |r| {              // one consumer, in place
+    export(r);
+    ring.advance();
+}
 ```
 
 - `Domain` / `Participant` / `Guard` / `Retired` / `Config` — the **EBR**
@@ -47,11 +60,20 @@ const v = q.dequeue(me);         // ?u64 (null when empty)
   is surfaceable), and if that reserve is exhausted under a failing allocator the
   node is *abandoned* — never freed under live readers, never a panic — and
   counted in `Domain.droppedRetires`. See `SPEC.md` §4.
-- `MpmcQueue` / `Node` — the **Michael-Scott** unbounded MPMC queue over EBR.
+- `Queue(T)` / `MpmcQueue` / `Node` — the **Michael-Scott** unbounded MPMC
+  queue over EBR, generic over its payload (`MpmcQueue` is `Queue(u64)`).
   `init`/`deinit`/`reclaimNode` are mechanical; `enqueue`/`dequeue` (the CAS
   loops) are the Fable core. Because EBR keeps a retired node physically alive
   while any thread is pinned on it, the ABA problem is dissolved — no tagged
   pointer or double-word CAS is needed.
+- `BoundedQueue(T, capacity, .{ .consumers })` / `BoundedOptions` / `Consumers`
+  — **Vyukov's bounded MPMC ring** (crossbeam's `ArrayQueue`): `capacity` slots
+  inline (a power of two, ≥ 2), one CAS per operation, no allocation, no EBR.
+  `push`/`pushWith` (fill in place) return false and count the refusal when
+  full; `pop`; with `.consumers = .single` a CAS-free `pop` and in-place
+  `front`/`advance`; `len`/`isEmpty`/`isFull` snapshots. A producer stalled
+  between claiming and publishing a slot makes the queue read empty at that
+  slot until it finishes (nothing lost or reordered) — see `SPEC.md` §4b.
 - `NodePool(T)` / `PoolError` — a **poisoning** node pool: freed nodes are
   overwritten with a `0xA5` canary and reused first, so a use-after-free is
   caught by `verifyQuiescent` (or the next `acquire`). This is the in-tree UAF
@@ -61,7 +83,8 @@ const v = q.dequeue(me);         // ?u64 (null when empty)
   test-only, used by the harness oracle; never on a lock-free path.
 - `runStress` / `StressConfig` / `Verdict` — the concurrent stress driver: N
   producers push disjoint tagged ranges, M consumers drain, and the merged
-  multiset is checked for lost / duplicated / corrupted items.
+  multiset is checked for lost / duplicated / corrupted items, and each
+  consumer's list for one producer's items out of order (`reordered`).
 - `RefQueue` — a correct coarse-spinlock queue: the driver's no-false-positive
   control **and** the linearizability oracle. `BrokenRing` — a deliberately
   racy queue (non-atomic indices) that proves the driver has teeth.
@@ -103,6 +126,10 @@ runs for real. The harness proves it bites before *and* after the core exists:
   on x86-TSO cannot distinguish a `seq_cst` pin store from a `.release` one
   (verified: that demotion passes 60/60 runs here). Correctness therefore rests
   on the memory-ordering argument in `ebr.zig`, not on seed volume.
+- **BOUNDED (probabilistic + deterministic):** the same driver over a 64-slot
+  `BoundedQueue` (8×8 and 8×1 × 50 000, the full path hit constantly), a
+  drop-on-full run with an in-place consumer, a concurrent `len` check, and the
+  two stalled-claim corners driven by hand.
 
 See `SPEC.md` for the EBR-vs-hazard decision, the Fable-core boundary, the
 honest deterministic-vs-probabilistic breakdown of each test, why sanitizers

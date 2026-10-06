@@ -41,6 +41,7 @@ const atomic = @import("atomic.zig");
 const pool = @import("pool.zig");
 const ebr = @import("ebr.zig");
 const mpmc = @import("mpmc.zig");
+const bounded = @import("bounded.zig");
 
 // ── tagged-value encoding: pid in the high 16 bits, seq in the low 48 ────────
 
@@ -83,13 +84,20 @@ pub const Verdict = enum {
     /// A value came out that was never enqueued (memory corruption / a read
     /// of a poisoned, reclaimed slot).
     corrupted,
+    /// One consumer received two items of one producer out of that
+    /// producer's order. Impossible for any FIFO queue: the producer's
+    /// enqueues are ordered, so their dequeues are, and one consumer's
+    /// dequeues are ordered by its program order.
+    reordered,
 };
 
 pub const StressError = error{StressThreadFailed};
 
-/// The multiset invariant checker. Adapter-independent and deterministic —
-/// this is the piece the "CHECKER TEETH" test bites directly. Reports the
-/// FIRST anomaly found (corrupted, then duplicated, then lost).
+/// The multiset invariant checker, plus the per-consumer FIFO check.
+/// Adapter-independent and deterministic — this is the piece the "CHECKER
+/// TEETH" test bites directly. Reports the FIRST anomaly found (corrupted,
+/// duplicated or reordered as met in list order, then lost). `lists[c]` must
+/// hold consumer `c`'s items in the order it dequeued them.
 pub fn verify(
     cfg: StressConfig,
     lists: []const std.ArrayListUnmanaged(u64),
@@ -100,8 +108,14 @@ pub fn verify(
     defer allocator.free(seen);
     @memset(seen, false);
 
+    // Per consumer: the next sequence number each producer may still send it
+    // (one past the last it delivered).
+    const next_seq = try allocator.alloc(u64, cfg.producers);
+    defer allocator.free(next_seq);
+
     var count: u64 = 0;
     for (lists) |list| {
+        @memset(next_seq, 0);
         for (list.items) |v| {
             const pid = decodePid(v);
             const seq = decodeSeq(v);
@@ -115,6 +129,8 @@ pub fn verify(
             const idx = pid * cfg.per_producer + seq_idx;
             if (seen[idx]) return .duplicated;
             seen[idx] = true;
+            if (seq < next_seq[pid]) return .reordered;
+            next_seq[pid] = seq + 1;
             count += 1;
         }
     }
@@ -439,6 +455,26 @@ test "CHECKER TEETH: the multiset verifier rejects lost / duplicated / corrupt h
         try l.appendSlice(alloc, &.{ encode(0, 0), 0xA5A5_A5A5_A5A5_A5A5, encode(0, 2), encode(1, 0), encode(1, 1), encode(1, 2) });
         try testing.expectEqual(Verdict.corrupted, try verify(cfg, &.{l}, alloc));
     }
+    // (0,1) before (0,0) at one consumer → reordered, though the multiset is
+    // complete.
+    {
+        var l: std.ArrayListUnmanaged(u64) = .empty;
+        defer l.deinit(alloc);
+        try l.appendSlice(alloc, &.{ encode(0, 1), encode(0, 0), encode(0, 2), encode(1, 0), encode(1, 1), encode(1, 2) });
+        try testing.expectEqual(Verdict.reordered, try verify(cfg, &.{l}, alloc));
+    }
+    // The same items split over two consumers, each in order, interleaved
+    // across producers → clean: FIFO binds one producer's items at one
+    // consumer, not the merge of two consumers.
+    {
+        var a: std.ArrayListUnmanaged(u64) = .empty;
+        defer a.deinit(alloc);
+        var b: std.ArrayListUnmanaged(u64) = .empty;
+        defer b.deinit(alloc);
+        try a.appendSlice(alloc, &.{ encode(1, 0), encode(0, 1), encode(1, 2) });
+        try b.appendSlice(alloc, &.{ encode(0, 0), encode(1, 1), encode(0, 2) });
+        try testing.expectEqual(Verdict.clean, try verify(cfg, &.{ a, b }, alloc));
+    }
     // A producer id exactly one past the last real producer → corrupted (an
     // off-by-one here would index `seen` past its end).
     {
@@ -486,7 +522,7 @@ test "REAL CORE: MPMC + EBR survive N×M stress with no lost/dup/corrupt and no 
     const alloc = testing.allocator;
     var domain = try ebr.Domain.init(alloc, .{ .max_participants = 32 });
     defer domain.deinit();
-    var node_pool = mpmc.Pool.init(alloc);
+    var node_pool = mpmc.MpmcQueue.Pool.init(alloc);
     defer node_pool.deinit();
     var q = try mpmc.MpmcQueue.init(&node_pool, &domain);
     defer q.deinit();
@@ -497,4 +533,105 @@ test "REAL CORE: MPMC + EBR survive N×M stress with no lost/dup/corrupt and no 
 
     // Drain, quiesce, then the pool canary must show no use-after-free.
     try node_pool.verifyQuiescent();
+}
+
+// ── the bounded ring under the same driver ───────────────────────────────────
+
+/// Drives a `BoundedQueue`. The driver's producers must never lose an item,
+/// so a refused push backs off and retries — the queue is small enough that
+/// the "full" path runs constantly, not just the fast path.
+fn BoundedAdapter(comptime Q: type) type {
+    return struct {
+        q: *Q,
+        const Self = @This();
+        const ThreadCtx = void;
+        fn initThread(self: *Self) !ThreadCtx {
+            _ = self;
+        }
+        fn deinitThread(self: *Self, ctx: ThreadCtx) void {
+            _ = self;
+            _ = ctx;
+        }
+        fn enqueue(self: *Self, ctx: ThreadCtx, v: u64) !void {
+            _ = ctx;
+            var backoff: atomic.Backoff = .{};
+            while (!self.q.push(v)) backoff.pause();
+        }
+        fn dequeue(self: *Self, ctx: ThreadCtx) ?u64 {
+            _ = ctx;
+            return self.q.pop();
+        }
+    };
+}
+
+fn boundedStress(comptime consumers: bounded.Consumers, cfg: StressConfig) !void {
+    const alloc = testing.allocator;
+    // 64 slots against 8 producers: most pushes meet a full ring, and every
+    // slot goes round thousands of laps.
+    const Q = bounded.BoundedQueue(u64, 64, .{ .consumers = consumers });
+    const q = try alloc.create(Q);
+    defer alloc.destroy(q);
+    q.init();
+    var adapter: BoundedAdapter(Q) = .{ .q = q };
+    try testing.expectEqual(Verdict.clean, try runStress(BoundedAdapter(Q), &adapter, cfg, alloc));
+    try testing.expect(q.isEmpty());
+}
+
+test "BOUNDED MPMC: N×M stress over a small ring, no lost/dup/corrupt/reordered item" {
+    try boundedStress(.multi, .{ .producers = 8, .consumers = 8, .per_producer = 50_000 });
+}
+
+test "BOUNDED MPSC: N×1 stress over a small ring through the CAS-free single-consumer pop" {
+    try boundedStress(.single, .{ .producers = 8, .consumers = 1, .per_producer = 50_000 });
+}
+
+test "BOUNDED drop-on-full: every accepted item arrives exactly once, in order; every refusal is counted" {
+    // qap's shape: producers never wait, one consumer drains in place.
+    const alloc = testing.allocator;
+    const Q = bounded.BoundedQueue(u64, 256, .{ .consumers = .single });
+    const q = try alloc.create(Q);
+    defer alloc.destroy(q);
+    q.init();
+    const producers = 6;
+    const per = 40_000;
+    const Shared = struct {
+        accepted: std.atomic.Value(u64) = .init(0),
+        finished: std.atomic.Value(usize) = .init(0),
+    };
+    const Producer = struct {
+        fn run(ring: *Q, pid: usize, sh: *Shared) void {
+            var n: u64 = 0;
+            for (0..per) |i| {
+                if (ring.push(encode(pid, i))) n += 1;
+            }
+            _ = sh.accepted.fetchAdd(n, .monotonic);
+            _ = sh.finished.fetchAdd(1, .release);
+        }
+    };
+    var sh: Shared = .{};
+    var threads: [producers]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Producer.run, .{ q, i, &sh });
+    var got: u64 = 0;
+    var next: [producers]u64 = @splat(0);
+    while (true) {
+        const all_done = sh.finished.load(.acquire) == producers;
+        if (q.front()) |item| {
+            const pid = decodePid(item.*);
+            const seq = decodeSeq(item.*);
+            try testing.expect(pid < producers);
+            // Strictly increasing per producer: no duplicate, no reorder
+            // (gaps are the refused pushes).
+            try testing.expect(seq >= next[pid]);
+            next[pid] = seq + 1;
+            q.advance();
+            got += 1;
+        } else if (all_done) {
+            break;
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+    for (threads) |t| t.join();
+    try testing.expectEqual(sh.accepted.load(.monotonic), got);
+    try testing.expectEqual(@as(u64, producers * per), got + q.refusedCount());
 }

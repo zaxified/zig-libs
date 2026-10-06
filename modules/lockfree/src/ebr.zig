@@ -802,7 +802,7 @@ test "a queue dequeue survives a failing allocator: value returned, node not fre
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     var d = try Domain.init(testing.allocator, .{ .max_participants = 1, .bag_reserve = 0 });
     defer d.deinit();
-    var np = mpmc.Pool.init(testing.allocator);
+    var np = mpmc.MpmcQueue.Pool.init(testing.allocator);
     defer np.deinit();
     var q = try mpmc.MpmcQueue.init(&np, &d);
 

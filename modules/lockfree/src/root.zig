@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! lockfree — lock-free concurrency primitives for shared-memory worker
-//! pools: **epoch-based reclamation** (`ebr`) plus a **Michael-Scott MPMC
-//! queue** (`mpmc`) built on it. The immediate consumer is the in-process
+//! pools: **epoch-based reclamation** (`ebr`), a **Michael-Scott MPMC
+//! queue** (`mpmc`, generic `Queue(T)`) built on it, and a **bounded,
+//! allocation-free MPMC ring** (`bounded`, Vyukov) that needs no reclamation. The immediate consumer is the in-process
 //! worker pool (P2 DL4); this is the workspace's first lock-free structure.
 //!
 //! **Status: core implemented.** The mechanical layer (Phase-1 scaffold) —
@@ -21,14 +22,14 @@
 //! See `SPEC.md` for the EBR-vs-hazard decision, the verification strategy
 //! (and its honest probabilistic-vs-deterministic breakdown), the exact
 //! Fable-core boundary, and the out-of-scope next increments (a lock-free
-//! hash map; hazard-pointer reclamation; a bounded ring variant).
+//! hash map; hazard-pointer reclamation; a work-stealing deque).
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Lock-free concurrency primitives for shared-memory worker pools — Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation, under a strict seq_cst discipline",
+    .doc = "Lock-free concurrency primitives for shared-memory worker pools — generic Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation under a strict seq_cst discipline, and a bounded allocation-free Vyukov MPMC ring",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -68,8 +69,14 @@ pub const Retired = ebr.Retired;
 pub const Config = ebr.Config;
 
 const mpmc = @import("mpmc.zig");
+pub const Queue = mpmc.Queue;
 pub const MpmcQueue = mpmc.MpmcQueue;
-pub const Node = mpmc.Node;
+pub const Node = mpmc.MpmcQueue.Node;
+
+const bounded = @import("bounded.zig");
+pub const BoundedQueue = bounded.BoundedQueue;
+pub const BoundedOptions = bounded.Options;
+pub const Consumers = bounded.Consumers;
 
 const harness = @import("harness.zig");
 pub const StressConfig = harness.StressConfig;
@@ -85,6 +92,7 @@ test {
     _ = pool;
     _ = ebr;
     _ = mpmc;
+    _ = bounded;
     _ = harness;
 }
 

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — Scope mvp → core. **New:** `BoundedQueue(T, capacity, .{ .consumers })` —
+  a fixed-capacity, allocation-free MPMC ring (Vyukov's bounded queue, crossbeam's
+  `ArrayQueue`): `push`/`pushWith` refuse and count when full (`refusedCount`), `pop`,
+  and with `.consumers = .single` a CAS-free `pop` plus in-place `front`/`advance`;
+  `len`/`isEmpty`/`isFull` snapshots. **New:** `Queue(T)` — the Michael-Scott queue is
+  generic over its payload; `MpmcQueue` is now `Queue(u64)` and `Node`, `NodePool(Node)`
+  and every existing call keep working unchanged. **Changed:** `Verdict` has a new
+  variant `reordered` — `verify` now also checks that each consumer received each
+  producer's items in that producer's order (FIFO); an exhaustive `switch` on
+  `Verdict` outside this module needs the new arm. Mutation run over the new code:
+  15 of 16 killed, 1 equivalent (SPEC §5).
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Compared with no longer says every access is `seq_cst` — only the reclamation-relevant ones are (§4a).
 - **2026-10-05** — Mutation run: 28 of 30 killed, 1 equivalent, 1 not killable by
   a test (the `enterCritical` pin store's ordering — litmus territory, SPEC §5); 5
