@@ -506,8 +506,8 @@ test {
     _ = h11_interop;
     _ = go_oracle;
     _ = conneg_oracle;
-    _ = problem_interop;
-    _ = sse_interop;
+    _ = problem_oracle;
+    _ = sse_oracle;
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
@@ -522,13 +522,13 @@ const gzip_interop = @import("gzip_interop.zig");
 /// answers, frozen) — tests only, not part of the public surface.
 const conneg_oracle = @import("conneg_oracle.zig");
 
-/// LIVE CPython check of `problem` documents (JSON validity, RFC 9457 member
-/// types, U+FFFD substitution, default titles) — tests only.
-const problem_interop = @import("problem_interop.zig");
+/// OFFLINE anchor for `problem` + `reasonPhrase` (CPython's verdicts, frozen by
+/// `tools/oracles.zig`) — tests only.
+const problem_oracle = @import("problem_oracle.zig");
 
-/// LIVE sseclient-py + httpx-sse decoding of this module's event streams —
-/// tests only.
-const sse_interop = @import("sse_interop.zig");
+/// OFFLINE anchor for `sse` (sseclient-py + httpx-sse verdicts, frozen by
+/// `tools/oracles.zig`) — tests only.
+const sse_oracle = @import("sse_oracle.zig");
 
 /// OFFLINE third-party interop (wire-framing edge cases vs h11, captured
 /// once and frozen) — tests only, nothing importable, so it is not part of

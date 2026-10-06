@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — The CPython / sseclient-py / httpx-sse anchors moved out of the module (CONVENTIONS §9:
+  a module spawns no foreign toolchain — `check-module-purity` was red on `main` from `7af4c581`):
+  they are now `zig build interop-http -- --phase problem|sse` (`tools/oracles.zig`), which freeze what
+  the oracles accepted into `src/problem_oracle_vectors.zig` / `src/sse_oracle_vectors.zig`; the module
+  replays those bytes (`src/problem_oracle.zig`, `src/sse_oracle.zig`) with no Python. The LIVE gzip
+  test keeps curl and gzip(1) (peers, not toolchains) and drops its CPython decoder. Tests only.
 - **2026-10-06** — **Evidence MIXED → EXTERNAL.** SSE gained a LIVE anchor (`src/sse_interop.zig`: our
   server's event stream, fetched by curl, dispatched by sseclient-py and httpx-sse and held to the
   WHATWG §9.2.6 parsing rules over 27 events — CR/CRLF normalisation, leading spaces, NUL, 10 KiB

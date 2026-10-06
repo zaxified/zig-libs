@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 
 //! LIVE third-party decoders for **gzip response compression**: this module's
-//! server compresses (`Options.compression`), and three independent gzip
+//! server compresses (`Options.compression`), and two independent gzip
 //! implementations decode what went over a real loopback socket:
 //!
 //!   * curl `--compressed` (libcurl's content decoding over zlib's
 //!     `inflate`, which checks the RFC 1952 trailer: CRC-32 and ISIZE);
-//!   * `gzip -dc` (GNU gzip's own inflate; refuses a bad CRC or length);
-//!   * Python's `gzip.decompress` (CPython's zlib binding plus its own
-//!     header/trailer reader, which checks CRC-32 and ISIZE itself).
+//!   * `gzip -dc` (GNU gzip's own inflate; refuses a bad CRC or length).
+//!
+//! (CPython's `gzip.decompress` was a third until 2026-10-06: a module may
+//! not spawn a foreign toolchain, CONVENTIONS §9, and both of these are
+//! peers, not toolchains.)
 //!
 //! Before this file the encoder was checked only against std's own
 //! `flate.Decompress` — a decoder from the same family as the encoder it
@@ -17,12 +19,12 @@
 //! code we did not write, at levels 1, 6 and 9, on HTTP/1.1 and HTTP/2.
 //!
 //! The decoders are proven to have teeth on every run: the raw body is also
-//! fed to them with its CRC-32 and then its ISIZE flipped, and both must
+//! fed to gzip(1) with its CRC-32 and then its ISIZE flipped, and it must
 //! refuse it. A decoder that accepted those would make the positive results
 //! meaningless.
 //!
 //! Every test **skips loudly** (`SKIPPED: …` + `error.SkipZigTest`) when
-//! curl, gzip or python3 is missing — never silently. Children write to files
+//! curl or gzip is missing — never silently. Children write to files
 //! in a temp dir; no child's pipe is ever read to EOF.
 
 const std = @import("std");
@@ -151,23 +153,12 @@ fn run(io: std.Io, dir: std.Io.Dir, argv: []const []const u8, stdout_name: ?[]co
     };
 }
 
-/// CPython's `gzip.decompress`: reads `in`, writes the plain bytes to `out`.
-/// Exit 1 on any decode error (bad header, bad deflate, CRC or ISIZE).
-const python_decode =
-    \\import gzip, sys
-    \\try:
-    \\    data = gzip.decompress(open(sys.argv[1], 'rb').read())
-    \\except Exception as e:
-    \\    print(e, file=sys.stderr); sys.exit(1)
-    \\open(sys.argv[2], 'wb').write(data)
-;
-
 fn readFile(io: std.Io, dir: std.Io.Dir, gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     return dir.readFileAlloc(io, name, gpa, .limited(4 << 20));
 }
 
 /// Fetch `path` twice — decoded by curl, and raw — then decode the raw body
-/// with gzip(1) and Python; all three must give `expected`.
+/// with gzip(1); both must give `expected`.
 fn checkRoute(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -203,13 +194,8 @@ fn checkRoute(
     defer gpa.free(by_gzip);
     try testing.expectEqualSlices(u8, expected, by_gzip);
 
-    try testing.expectEqual(@as(u8, 0), try run(io, dir, &.{ "python3", "-c", python_decode, "raw.gz", "py.out" }, null));
-    const by_python = try readFile(io, dir, gpa, "py.out");
-    defer gpa.free(by_python);
-    try testing.expectEqualSlices(u8, expected, by_python);
-
     // Teeth: the same member with its CRC-32, then its ISIZE, corrupted must
-    // be refused by both strict decoders.
+    // be refused by gzip(1).
     const raw = try readFile(io, dir, gpa, "raw.gz");
     defer gpa.free(raw);
     for ([_]usize{ 8, 4 }) |from_end| {
@@ -218,7 +204,6 @@ fn checkRoute(
         bad[bad.len - from_end] ^= 0x01;
         try dir.writeFile(io, .{ .sub_path = "bad.gz", .data = bad });
         try testing.expect(try run(io, dir, &.{ "gzip", "-dc", "bad.gz" }, null) != 0);
-        try testing.expect(try run(io, dir, &.{ "python3", "-c", python_decode, "bad.gz", "bad.out" }, null) != 0);
     }
 }
 
@@ -239,7 +224,7 @@ fn checkAll(level: u4, protos: []const []const u8) !void {
     for (protos) |proto| for (routes) |r| try checkRoute(io, gpa, tmp.dir, live.url(), proto, r);
 }
 
-test "LIVE gzip: curl, gzip(1) and CPython decode our level-6 members on HTTP/1.1 and h2c" {
+test "LIVE gzip: curl and gzip(1) decode our level-6 members on HTTP/1.1 and h2c" {
     try checkAll(6, &.{ "--http1.1", "--http2-prior-knowledge" });
 }
 
