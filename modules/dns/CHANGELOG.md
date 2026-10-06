@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Fix (behaviour change), `config.parseResolvConf` now does what glibc 2.43 does
+  with the same file** (found by the new glibc oracle, `tools/config_oracle.py` →
+  `src/config_oracle_test.zig`):
+  - a `#` or `;` is a comment only in the first column: `search a.example # x` used to drop
+    everything from `#`, glibc searches `#` and `x` too; `nameserver 192.0.2.1;x` used to be the
+    server 192.0.2.1, glibc (and Go) refuse it;
+  - option values read as atoi: `ndots:junk` is 0 (was: kept 1, so names were tried in the other
+    order), `ndots:2x` is 2 (was: ignored); `timeout` below 1 becomes 1 and `attempts` below 1 keeps
+    the default, as Go does (glibc would send no query at all);
+  - up to 32 search domains instead of 6 (`max_search`): glibc has had no fixed limit since 2.26 and
+    queried all eight of an eight-domain list.
+  The hosts-file functions already agreed with glibc on every case.
+
 - **2026-10-05** — **Fix:** an OPT record whose EDNS options do not tile its RDATA (an option length
   running past the end) is now `error.BadRecord`; it was decoded with the malformed stream handed on as
   `Opt.options`. Found by a golang.org/x/net/dns/dnsmessage differential oracle (`tools/go_oracle/`,

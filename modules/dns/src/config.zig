@@ -5,9 +5,14 @@
 //! everything here is unit-testable on fixtures.
 //!
 //! Semantics mirror glibc's resolver and Go's `net/dnsconfig_unix.go` /
-//! `net/dnsclient_unix.go` (`conf.nameList`): MAXNS=3 nameservers, MAXDNSRCH=6
-//! search domains, last `search`/`domain` directive wins, glibc option caps
-//! (ndots ≤ 15, timeout ≤ 30, attempts ≤ 5).
+//! `net/dnsclient_unix.go` (`conf.nameList`), checked against glibc 2.43 by
+//! `config_oracle_test.zig`: MAXNS=3 nameservers, up to `max_search` search
+//! domains (glibc has no fixed limit since 2.26), last `search`/`domain`
+//! directive wins, a comment is a line whose FIRST column is `#` or `;`
+//! (resolv.conf(5); mid-line they are ordinary text), option values read as
+//! atoi does (leading digits, none = 0) with glibc's caps (ndots ≤ 15,
+//! timeout ≤ 30, attempts ≤ 5) and Go's floors (timeout ≥ 1; attempts < 1
+//! keeps the default, where glibc would then send no query at all).
 
 const std = @import("std");
 const netaddr = @import("netaddr");
@@ -17,8 +22,11 @@ const message = @import("message.zig");
 
 /// glibc MAXNS.
 pub const max_nameservers = 3;
-/// glibc MAXDNSRCH.
-pub const max_search = 6;
+/// Search domains kept. glibc's old MAXDNSRCH was 6; since 2.26 it, like Go,
+/// has no fixed limit (2.43 queried all eight of an eight-domain list), so
+/// this is only the size of `ResolvConf`'s fixed array -- domains past it
+/// are dropped.
+pub const max_search = 32;
 
 pub const ResolvConf = struct {
     servers_buf: [max_nameservers]netaddr.Ip = undefined,
@@ -46,8 +54,11 @@ pub const ResolvConf = struct {
 pub fn parseResolvConf(content: []const u8) ResolvConf {
     var conf: ResolvConf = .{};
     var lines = std.mem.tokenizeAny(u8, content, "\r\n");
-    while (lines.next()) |whole_line| {
-        const line = whole_line[0 .. std.mem.indexOfAny(u8, whole_line, "#;") orelse whole_line.len];
+    while (lines.next()) |line| {
+        // A comment is a line whose first column is '#' or ';' -- mid-line,
+        // both are ordinary text: glibc 2.43 takes "search a.example
+        // ;b.example" as two domains and refuses "nameserver 192.0.2.1;x".
+        if (line[0] == '#' or line[0] == ';') continue;
         var words = std.mem.tokenizeAny(u8, line, " \t");
         const key = words.next() orelse continue;
         if (std.mem.eql(u8, key, "nameserver")) {
@@ -71,11 +82,12 @@ pub fn parseResolvConf(content: []const u8) ResolvConf {
         } else if (std.mem.eql(u8, key, "options")) {
             while (words.next()) |opt| {
                 if (std.mem.startsWith(u8, opt, "ndots:")) {
-                    conf.ndots = parseCapped(opt["ndots:".len..], 15) orelse conf.ndots;
+                    conf.ndots = @intCast(@min(atoi(opt["ndots:".len..]), 15));
                 } else if (std.mem.startsWith(u8, opt, "timeout:")) {
-                    conf.timeout_s = parseCapped(opt["timeout:".len..], 30) orelse conf.timeout_s;
+                    conf.timeout_s = @intCast(std.math.clamp(atoi(opt["timeout:".len..]), 1, 30));
                 } else if (std.mem.startsWith(u8, opt, "attempts:")) {
-                    conf.attempts = parseCapped(opt["attempts:".len..], 5) orelse conf.attempts;
+                    const n = atoi(opt["attempts:".len..]);
+                    if (n >= 1) conf.attempts = @intCast(@min(n, 5));
                 }
             }
         }
@@ -83,10 +95,15 @@ pub fn parseResolvConf(content: []const u8) ResolvConf {
     return conf;
 }
 
-/// Parse a small decimal with a glibc-style upper cap; null on junk.
-fn parseCapped(text: []const u8, cap: u8) ?u8 {
-    const v = std.fmt.parseInt(u8, text, 10) catch return null;
-    return @min(v, cap);
+/// The leading decimal digits of `text`, as atoi / Go's dtoi read an option
+/// value: "2x" is 2, "junk" is 0. Saturates instead of overflowing.
+fn atoi(text: []const u8) u32 {
+    var v: u32 = 0;
+    for (text) |c| {
+        if (c < '0' or c > '9') break;
+        v = v *| 10 +| (c - '0');
+    }
+    return v;
 }
 
 /// Parse an IP literal, tolerating a `%zone` suffix (dropped — routing scope
@@ -243,16 +260,32 @@ test "parseResolvConf: defaults on empty/garbage input" {
     }
 }
 
-test "parseResolvConf: ';' starts a comment like '#', mid-line too" {
-    // resolv.conf(5): a line whose first column is ';' or '#' is a comment;
-    // glibc's res_init also cuts a nameserver value at `strcspn(cp, ";# \t\n")`,
-    // so "192.0.2.53;x" is the server 192.0.2.53. Mutation 2026-10-04: only
-    // '#' was ever exercised.
-    const conf = parseResolvConf(";nameserver 192.0.2.99\nnameserver 192.0.2.53;x\nsearch a.example ;b.example\n");
+test "parseResolvConf: ';' and '#' comment out a line only from the first column" {
+    // resolv.conf(5): a line whose first column is ';' or '#' is a comment.
+    // Mid-line they are text. This test used to assert the opposite -- that
+    // "192.0.2.53;x" is the server 192.0.2.53 and ";b.example" a comment --
+    // on a reading of glibc's source that glibc 2.43 itself contradicts:
+    // run against it (config_oracle_test.zig), it refuses that server and
+    // queries "h.;b.example".
+    const conf = parseResolvConf(";nameserver 192.0.2.99\nnameserver 192.0.2.53;x\nnameserver 192.0.2.54 ; text\nsearch a.example ;b.example\n");
     try testing.expectEqual(@as(usize, 1), conf.nservers);
-    try testing.expect(conf.servers()[0].eql(netaddr.parseIp("192.0.2.53").?));
-    try testing.expectEqual(@as(usize, 1), conf.nsearch);
+    try testing.expect(conf.servers()[0].eql(netaddr.parseIp("192.0.2.54").?));
+    try testing.expectEqual(@as(usize, 2), conf.nsearch);
     try testing.expectEqualStrings("a.example", conf.search()[0]);
+    try testing.expectEqualStrings(";b.example", conf.search()[1]);
+}
+
+test "parseResolvConf: option values read as atoi does, with Go's floors" {
+    const junk = parseResolvConf("options ndots:junk timeout:junk attempts:junk\n");
+    try testing.expectEqual(@as(u8, 0), junk.ndots); // glibc and Go: 0
+    try testing.expectEqual(@as(u8, 1), junk.timeout_s); // Go's floor (glibc: 0)
+    try testing.expectEqual(@as(u8, 2), junk.attempts); // Go keeps the default (glibc: no query)
+    const digits = parseResolvConf("options ndots:2x timeout:3s attempts:4y\n");
+    try testing.expectEqual(@as(u8, 2), digits.ndots);
+    try testing.expectEqual(@as(u8, 3), digits.timeout_s);
+    try testing.expectEqual(@as(u8, 4), digits.attempts);
+    const huge = parseResolvConf("options ndots:99999999999999999999\n");
+    try testing.expectEqual(@as(u8, 15), huge.ndots);
 }
 
 test "parseResolvConf: glibc option caps" {

@@ -134,6 +134,9 @@ test {
     _ = Resolver;
     _ = @import("goldens.zig");
     _ = @import("go_oracle.zig");
+    // External anchor for config.zig: glibc's behaviour on the same files
+    // (tools/config_oracle.py), replayed without glibc or a namespace.
+    _ = @import("config_oracle_test.zig");
 }
 
 test "reverseName: IPv4" {

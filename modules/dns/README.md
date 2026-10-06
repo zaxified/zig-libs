@@ -25,7 +25,7 @@ derivation was a bookkeeping error.
 | File | Role |
 |------|------|
 | `src/message.zig` | Pure wire codec: encode query / decode response — header, question, RR sections, **name-compression pointers** (strictly-backwards rule + jump budget: loops impossible), A/AAAA/PTR/CNAME/NS/MX/TXT/SOA, EDNS(0) OPT. No I/O; golden-byte tested; fuzzed. |
-| `src/config.zig` | `/etc/resolv.conf` + `/etc/hosts` parsing, Go-`nameList` search expansion. Pure string logic, fixture-tested. |
+| `src/config.zig` | `/etc/resolv.conf` + `/etc/hosts` parsing, Go-`nameList` search expansion. Pure string logic, checked against glibc's own behaviour on the same files (`tools/config_oracle.py`). |
 | `src/Resolver.zig` | Blocking client: UDP (TC bit → TCP retry), TCP (2-byte length prefix), DoH POST/GET (`application/dns-message`), DoH-JSON (`application/dns-json`). |
 | `src/root.zig` | Vocabulary re-exports + netaddr bridges (`reverseName`, `recordIp`). |
 | `src/testdata/reply_*.bin` | Three replies captured off a real loopback socket by `tools/interop.zig`: one lying about the question, one with no question section, one honest. Replayed hermetically by `Resolver.zig`. |
