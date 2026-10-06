@@ -212,7 +212,7 @@ async function main() {
 
   const profile = path.join(SCRATCH, "chrome-profile");
   const chrome = Bun.spawn(
-    ["google-chrome", "--headless=new", `--remote-debugging-port=${DEVTOOLS}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--disable-extensions", "about:blank"],
+    ["google-chrome", "--headless=new", `--remote-debugging-port=${DEVTOOLS}`, `--user-data-dir=${profile}`, "--no-first-run", "--password-store=basic", "--use-mock-keychain", "--no-default-browser-check", "--disable-gpu", "--disable-extensions", "about:blank"],
     { stdout: "ignore", stderr: "ignore" },
   );
   let chromeVersion = "";
