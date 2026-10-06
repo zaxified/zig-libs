@@ -24,11 +24,11 @@ pub fn main() !void {
 
     // ── build our own KEXINIT the way clientHandshake does ─────────────────
     //
-    // `offeredKexAlgorithms` appends the RFC 8308 §2.1 `ext-info-c` indicator
-    // to the module's own `kex_algorithms` list — that is what tells a peer
-    // this side is prepared to receive an SSH_MSG_EXT_INFO.
-    var kex_buf: [transport.kex_algorithms.len + 1][]const u8 = undefined;
-    const offered_kex = transport.offeredKexAlgorithms(&kex_buf, .client);
+    // `offeredKexAlgorithms` appends, on the initial KEXINIT, the RFC 8308
+    // §2.1 `ext-info-c` indicator (this side accepts SSH_MSG_EXT_INFO) and
+    // OpenSSH's strict-KEX indicator to the module's own `kex_algorithms`.
+    var kex_buf: [transport.offered_kex_len][]const u8 = undefined;
+    const offered_kex = transport.offeredKexAlgorithms(&kex_buf, .client, .initial);
 
     const cookie: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const sent: transport.KexInit = .{
@@ -52,10 +52,10 @@ pub fn main() !void {
     try sent.encode(&pw);
 
     // Frame it through the Binary Packet Protocol exactly as the plaintext
-    // pre-NEWKEYS phase does (`CipherState.none`), into an in-memory "wire".
+    // pre-NEWKEYS phase does (`CipherState.plaintext`), into an in-memory "wire".
     var wire_buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&wire_buf);
-    var write_cipher: transport.CipherState = .none;
+    var write_cipher: transport.CipherState = .plaintext;
     // `.os`: padding from getrandom(2); a deterministic `Io` would pass
     // `.{ .io = io }` instead (see `transport.Entropy`).
     try transport.writePacket(&w, &write_cipher, .os, pw.buffered());
@@ -63,7 +63,7 @@ pub fn main() !void {
     // "Receive" it back out of the same bytes, the way a peer would off a
     // real socket.
     var r: std.Io.Reader = .fixed(w.buffered());
-    var read_cipher: transport.CipherState = .none;
+    var read_cipher: transport.CipherState = .plaintext;
     var rbuf: [2048]u8 = undefined;
     const pkt = try transport.readPacket(&r, &read_cipher, &rbuf);
     std.debug.print("KEXINIT framed as {d}-byte packet, {d}-byte payload\n", .{ pkt.packet_length, pkt.payload.len });
@@ -91,11 +91,11 @@ pub fn main() !void {
 
     var ext_wire_buf: [512]u8 = undefined;
     var eww: std.Io.Writer = .fixed(&ext_wire_buf);
-    var ext_write_cipher: transport.CipherState = .none;
+    var ext_write_cipher: transport.CipherState = .plaintext;
     try transport.writePacket(&eww, &ext_write_cipher, .os, ext_payload);
 
     var er: std.Io.Reader = .fixed(eww.buffered());
-    var ext_read_cipher: transport.CipherState = .none;
+    var ext_read_cipher: transport.CipherState = .plaintext;
     var erbuf: [512]u8 = undefined;
     const ext_pkt = try transport.readPacket(&er, &ext_read_cipher, &erbuf);
 

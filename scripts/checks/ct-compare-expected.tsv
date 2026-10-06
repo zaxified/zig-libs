@@ -20,6 +20,7 @@ modules/ctap2pin/src/root.zig	3	0
 modules/dkg/src/core.zig	2	0
 modules/dnssec/src/ds.zig	1	0
 modules/dtls/src/Connection.zig	4	8
+modules/dtls/src/certverify.zig	1	1
 modules/dtls/src/keyschedule.zig	2	2
 modules/ecvrf/src/ecvrf.zig	1	0
 modules/idempotency/src/root.zig	1	0
@@ -43,12 +44,12 @@ modules/signal/src/xeddsa.zig	2	0
 modules/snmp/src/usm.zig	5	0
 modules/spake2plus/src/root.zig	2	1
 modules/sphinx/src/core.zig	2	0
-modules/ssh/src/transport.zig	2	40
+modules/ssh/src/transport.zig	3	42
 modules/stun/src/root.zig	1	1
 modules/tenantkex/src/root.zig	1	4
 modules/tlock/src/age.zig	1	8
 modules/tlsclient/src/Client.zig	2	4
 modules/tlsresume/src/psk.zig	1	0
 modules/voprf/src/root.zig	2	1
-modules/webhooksig/src/root.zig	1	4
+modules/webhooksig/src/root.zig	2	4
 modules/wireguard/src/handshake.zig	4	11

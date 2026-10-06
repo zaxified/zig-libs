@@ -5,13 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Review of the new code, fixes (no API change beyond two constants).** ⛔ Fixed:
+  a failed OPEN_CONFIRMATION send in `serveConnection` freed the channel twice (H1); a client's
+  message on a channel we had already closed ended the whole connection instead of being dropped
+  (M1, RFC 4254 §5.3); a `Connection` channel freed before the peer's CLOSE made its late traffic
+  fail every other channel — `Session.deinit` now sends CLOSE and the id is kept until the peer's
+  (M2); the rekey queue is also bounded by count (`max_pending_packets`) and no longer shifts on
+  every pop (M3); unaccepted `forwarded-tcpip` channels are capped (`max_unaccepted_forwards`, M4);
+  `rekey_limit_* = 0` looped for ever (L6); `Transport.deinit` wipes the traffic keys (L7); smaller
+  ones L1/L3/L5. Tests for M1 (crafted wire), M2 and L6 (live), teeth checked by mutation. The
+  keyboard-interactive test against Go moved out of `src` into `tools/interop.zig` (module purity:
+  `test-ssh` needs no Go); `src` has a loopback client↔server keyboard-interactive test instead.
 - **2026-10-06** — **keyboard-interactive (RFC 4256), both roles (ADDITIVE).** Client:
   `userauth.authenticateKeyboardInteractive` answers any number of SSH_MSG_USERAUTH_INFO_REQUEST
   rounds through a `KbdResponder` (answers copied, sent and scrubbed at once). Server:
   `AuthConfig.keyboard_interactive` (`KbdInteractiveCheck`: one round of prompts, the caller's
   verdict; `AuthMethod.keyboard_interactive`, `AuthFailure.wrong_answers`; listed in
-  USERAUTH_FAILURE). Live-tested: our client against Go `x/crypto/ssh` (two rounds, then exec;
-  a wrong second answer refused — oracle server in `tools/go_kbdint/`), a real OpenSSH `ssh`
+  USERAUTH_FAILURE). Tested: our client ↔ our server over loopback; our client against Go
+  `x/crypto/ssh` in the new interop program `tools/interop.zig` (`zig build interop-ssh`: two
+  rounds, then exec; a wrong second answer refused — oracle server `tools/go_kbdint/`); a real OpenSSH `ssh`
   answering our prompts through `SSH_ASKPASS_REQUIRE=force` (accepted / wrong code refused).
   `Session.drain` no longer fails when the peer hangs up right after its CLOSE (Go's server does).
 - **2026-10-06** — **Several channels per connection, session requests, TCP/IP forwarding (ADDITIVE; one field made optional).**

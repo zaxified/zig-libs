@@ -996,93 +996,101 @@ test "envAccepted: exact names and trailing-* prefixes only" {
 
 // ── keyboard-interactive (RFC 4256) ────────────────────────────────────────
 
-/// Answers by prompt text: the Go server asks "Password: " then "Token: ".
-const GoAnswers = struct {
-    token: []const u8,
-    rounds: u32 = 0,
+/// Our client's keyboard-interactive against our own server, over a loopback
+/// socket — the hermetic half; Go `x/crypto/ssh` (multi-round) is
+/// `tools/interop.zig` (`zig build interop-ssh`), OpenSSH the live tests below.
+const LoopbackKbd = struct {
+    port: u16,
+    answer: []const u8,
+    err: ?anyerror = null,
+    seen_prompts: u32 = 0,
     saw_instruction: bool = false,
 
     fn respond(ctx: *anyopaque, ch: *const userauth.KbdChallenge, answers: [][]const u8) bool {
-        const self: *GoAnswers = @ptrCast(@alignCast(ctx));
-        self.rounds += 1;
-        if (std.mem.eql(u8, ch.instruction, "round two")) self.saw_instruction = true;
+        const self: *LoopbackKbd = @ptrCast(@alignCast(ctx));
+        self.saw_instruction = std.mem.eql(u8, ch.instruction, "two factors");
         for (ch.prompts, answers) |p, *a| {
-            if (std.mem.eql(u8, p.text, "Password: ") and !p.echo) {
-                a.* = "correct horse";
-            } else if (std.mem.eql(u8, p.text, "Token: ") and p.echo) {
-                a.* = self.token;
-            } else return false;
+            self.seen_prompts += 1;
+            a.* = if (!p.echo) "correct horse" else self.answer;
         }
         return true;
     }
+
+    fn run(self: *LoopbackKbd, io: std.Io) void {
+        self.client(io) catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn client(self: *LoopbackKbd, io: std.Io) !void {
+        const gpa = std.testing.allocator;
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", self.port);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var rbuf: [32 * 1024]u8 = undefined;
+        var wbuf: [32 * 1024]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+        defer t.deinit();
+        var scratch: [4096]u8 = undefined;
+        try t.requestService("ssh-userauth", &scratch);
+        try userauth.authenticateKeyboardInteractive(&t, gpa, "alice", .{ .ctx = self, .respondFn = respond }, .{});
+    }
 };
 
-/// Run `go run` on the Go keyboard-interactive server, our client against
-/// it, and the exec after a successful login. Skips without Go or the tool.
-fn liveGoKbd(token: []const u8) !struct { rounds: u32, saw_instruction: bool, out: ?[]u8 } {
+fn loopbackKbd(answer: []const u8) !struct { client: LoopbackKbd, server: anyerror!userauth.AuthResult, why: ?userauth.AuthFailure } {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const tool = "modules/ssh/tools/go_kbdint";
-    std.Io.Dir.cwd().access(io, tool ++ "/main.go", .{}) catch return error.SkipZigTest;
-
-    var portbuf: [2]u8 = undefined;
-    fillRandom(&portbuf);
-    const port: u16 = 20000 + (std.mem.readInt(u16, &portbuf, .big) % 20000);
-    var pbuf: [8]u8 = undefined;
-    const port_s = try std.fmt.bufPrint(&pbuf, "{d}", .{port});
-    // `spawn` hands the child an EMPTY environment unless given one, and Go
-    // needs HOME (module cache, build cache).
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
-    var child = std.process.spawn(io, .{
-        .argv = &.{ "go", "-C", tool, "run", ".", port_s },
-        .stdout = .pipe,
-        .stderr = .ignore,
-        .environ_map = &env,
-    }) catch return error.SkipZigTest;
-    defer child.kill(io);
-    {
-        var lbuf: [64]u8 = undefined;
-        var r = child.stdout.?.readerStreaming(io, &lbuf);
-        const line = r.interface.takeDelimiterExclusive('\n') catch return error.SkipZigTest;
-        if (!std.mem.eql(u8, line, "READY")) return error.SkipZigTest;
-    }
-
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    const stream = try addr.connect(io, .{ .mode = .stream });
+    var port: u16 = 0;
+    var listener = try listenLoopback(io, &port);
+    defer listener.deinit(io);
+    var c: LoopbackKbd = .{ .port = port, .answer = answer };
+    const th = try std.Thread.spawn(.{}, LoopbackKbd.run, .{ &c, io });
+    var joined = false;
+    defer if (!joined) th.join();
+    const stream = try acceptBounded(io, &listener, 30_000);
     defer stream.close(io);
     var rbuf: [32 * 1024]u8 = undefined;
     var wbuf: [32 * 1024]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
-    var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+    const keys = [_]server.HostKey{testHostKey(0x55)};
+    var t = try server.accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = &keys });
     defer t.deinit();
-    var scratch: [4096]u8 = undefined;
-    try t.requestService("ssh-userauth", &scratch);
-    var answers: GoAnswers = .{ .token = token };
-    userauth.authenticateKeyboardInteractive(&t, gpa, "alice", .{ .ctx = &answers, .respondFn = GoAnswers.respond }, .{}) catch |e| switch (e) {
-        error.AuthenticationFailed => return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = null },
-        else => return e,
+    var why: ?userauth.AuthFailure = null;
+    const RejectRec = struct {
+        fn on(ctx: *anyopaque, _: ?[]const u8, reason: userauth.AuthFailure) void {
+            const w: *?userauth.AuthFailure = @ptrCast(@alignCast(ctx));
+            w.* = reason;
+        }
     };
-    const res = try connection.exec(&t, gpa, "whoami", .{});
-    defer gpa.free(res.stderr);
-    return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = res.stdout };
+    const r = userauth.serveUserauth(&t, gpa, .{
+        .keyboard_interactive = .{ .instruction = "two factors", .prompts = &kbd_prompts, .checkFn = KbdPolicy.check },
+        .max_attempts = 1,
+        .on_rejected = .{ .ctx = &why, .onFn = RejectRec.on },
+    });
+    th.join();
+    joined = true;
+    return .{ .client = c, .server = r, .why = why };
 }
 
-test "live: keyboard-interactive against Go x/crypto/ssh — two challenge rounds, then exec" {
-    const r = try liveGoKbd("123456");
-    defer if (r.out) |o| std.testing.allocator.free(o);
-    try std.testing.expectEqual(@as(u32, 2), r.rounds);
-    try std.testing.expect(r.saw_instruction);
-    try std.testing.expectEqualStrings("kbd-ok user=alice cmd=whoami", r.out orelse return error.TestUnexpectedResult);
-}
+test "loopback: keyboard-interactive, our client against our server — accepted, then a wrong code refused" {
+    const ok = try loopbackKbd("424242");
+    if (ok.client.err) |e| return e;
+    const res = try ok.server;
+    try std.testing.expectEqual(userauth.AuthMethod.keyboard_interactive, res.method);
+    try std.testing.expectEqualStrings("alice", res.user());
+    try std.testing.expectEqual(@as(u32, 2), ok.client.seen_prompts);
+    try std.testing.expect(ok.client.saw_instruction);
 
-test "live: keyboard-interactive against Go x/crypto/ssh — a wrong second answer is AuthenticationFailed" {
-    const r = try liveGoKbd("000000");
-    try std.testing.expectEqual(@as(u32, 2), r.rounds);
-    try std.testing.expectEqual(@as(?[]u8, null), r.out);
+    const no = try loopbackKbd("000000");
+    const client_err = no.client.err orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(error.AuthenticationFailed, client_err);
+    try std.testing.expect(std.meta.isError(no.server));
+    try std.testing.expectEqual(@as(?userauth.AuthFailure, .wrong_answers), no.why);
 }
 
 const KbdPolicy = struct {
@@ -1137,4 +1145,41 @@ test "live: a real ssh client with the wrong one-time code is refused by our ser
     });
     try std.testing.expect(std.meta.isError(r));
     try std.testing.expectEqual(userauth.AuthFailure.wrong_answers, why);
+}
+
+test "live: a Session freed mid-command is closed for us; the next channel on the connection is unaffected" {
+    // Review 2026-10-06 M2: freeing a `Connection` channel used to leave it
+    // open at sshd, and its late output then failed whichever channel was
+    // pumping (`error.ChannelClosed`).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    {
+        const abandoned = try conn.openSession(.{});
+        try abandoned.exec("/bin/sh -c 'sleep 1; printf late-output; exit 9'");
+        abandoned.deinit(); // no drain: sends our CLOSE, keeps the id as a zombie
+    }
+    const next = try conn.openSession(.{});
+    defer next.deinit();
+    try next.exec("/bin/sh -c 'sleep 2; printf next'");
+    try next.drain();
+    try std.testing.expectEqualStrings("next", next.stdout.items);
+}
+
+test "live: rekey_limit_bytes = 0 re-keys after every packet instead of looping" {
+    // Review 2026-10-06 L6.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    fx.t.rekey_limit_bytes = 0;
+    var res = try connection.exec(&fx.t, gpa, "printf zero", .{});
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("zero", res.stdout);
+    try std.testing.expect(fx.t.kex_count > 3);
 }

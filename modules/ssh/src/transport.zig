@@ -2078,6 +2078,12 @@ pub const default_rekey_limit_packets: u32 = 1 << 28;
 /// the peer's KEXINIT (RFC 4253 §9 lets the peer keep sending until it has
 /// seen ours). A peer that floods instead of answering is refused.
 pub const max_pending_bytes: usize = 8 * 1024 * 1024;
+/// Scratch a re-exchange WE started reads the peer's packets into (see
+/// `Transport.rekey`).
+pub const rekey_scratch_len: usize = 256 * 1024;
+
+/// …and on their number (tiny packets cost more than their payload).
+pub const max_pending_packets: usize = 4096;
 
 /// An identification string (RFC 4253 §4.2: at most 255 characters
 /// including CR LF), kept for the exchange hash of every later re-exchange.
@@ -2180,6 +2186,9 @@ pub const Transport = struct {
     server_host_keys: []const srv.HostKey = &.{},
     in_kex: bool = false,
     pending: std.ArrayList(PendingPacket) = .empty,
+    /// Index of the next queued packet (popping from the front without
+    /// shifting the list each time).
+    pending_head: usize = 0,
     pending_bytes: usize = 0,
 
     /// A `std.Io` cancellation of a blocking read on `reader` reaches this
@@ -2198,10 +2207,17 @@ pub const Transport = struct {
     /// nothing otherwise, so a transport that never re-keys needs no
     /// `deinit`; calling it is always safe.
     pub fn deinit(t: *Transport) void {
+        // The traffic keys and the session id outlive nothing the caller
+        // needs (review 2026-10-06 L7).
+        std.crypto.secureZero(u8, std.mem.asBytes(&t.read_cipher));
+        std.crypto.secureZero(u8, std.mem.asBytes(&t.write_cipher));
+        t.read_cipher = .plaintext;
+        t.write_cipher = .plaintext;
         const gpa = t.gpa orelse return;
-        for (t.pending.items) |p| gpa.free(p.payload);
+        for (t.pending.items[t.pending_head..]) |p| gpa.free(p.payload);
         t.pending.deinit(gpa);
         t.pending = .empty;
+        t.pending_head = 0;
         t.pending_bytes = 0;
     }
 
@@ -2247,7 +2263,7 @@ pub const Transport = struct {
     /// what it means is the caller's to decide.
     pub fn recvPacket(t: *Transport, buf: []u8) TransportError!Packet {
         while (true) {
-            if (t.pending.items.len > 0) return t.popPending(buf);
+            if (t.pending_head < t.pending.items.len) return t.popPending(buf);
             if (t.wantsRekey()) {
                 try t.rekey();
                 continue; // the exchange may have queued packets
@@ -2310,7 +2326,10 @@ pub const Transport = struct {
         try writePacket(t.writer, &t.write_cipher, t.entropy, ours);
         t.noteTraffic(ours.len);
 
-        const scratch = try gpa.alloc(u8, 64 * 1024);
+        // Channel data may arrive here (to be queued) in packets as large as
+        // the caller let the peer send — more than the 64 KiB a key-exchange
+        // packet needs (review 2026-10-06 L1).
+        const scratch = try gpa.alloc(u8, rekey_scratch_len);
         defer gpa.free(scratch);
         while (true) {
             const seq = t.read_cipher.sequenceNumber();
@@ -2333,7 +2352,8 @@ pub const Transport = struct {
                         try t.sendUnimplemented(seq);
                         continue;
                     }
-                    if (t.pending_bytes + pkt.payload.len > max_pending_bytes) return error.ProtocolError;
+                    if (t.pending_bytes + pkt.payload.len > max_pending_bytes or
+                        t.pending.items.len - t.pending_head >= max_pending_packets) return error.ProtocolError;
                     const copy = try gpa.dupe(u8, pkt.payload);
                     errdefer gpa.free(copy);
                     try t.pending.append(gpa, .{ .payload = copy, .seq = seq });
@@ -2344,7 +2364,10 @@ pub const Transport = struct {
     }
 
     fn wantsRekey(t: *const Transport) bool {
-        return t.kex_count > 0 and !t.in_kex and t.gpa != null and
+        // `packets_since_kex > 0`: a limit of 0 means "after every packet",
+        // not "again right after the exchange that just finished" (review
+        // 2026-10-06 L6: that looped for ever).
+        return t.kex_count > 0 and !t.in_kex and t.gpa != null and t.packets_since_kex > 0 and
             (t.bytes_since_kex >= t.rekey_limit_bytes or t.packets_since_kex >= t.rekey_limit_packets);
     }
 
@@ -2362,7 +2385,12 @@ pub const Transport = struct {
 
     fn popPending(t: *Transport, buf: []u8) TransportError!Packet {
         const gpa = t.gpa.?;
-        const p = t.pending.orderedRemove(0);
+        const p = t.pending.items[t.pending_head];
+        t.pending_head += 1;
+        if (t.pending_head == t.pending.items.len) {
+            t.pending.clearRetainingCapacity();
+            t.pending_head = 0;
+        }
         defer gpa.free(p.payload);
         t.pending_bytes -= p.payload.len;
         if (p.payload.len > buf.len) return error.PacketTooLarge;

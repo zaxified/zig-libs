@@ -653,6 +653,10 @@ pub const DirectTcpipOptions = struct {
     session: SessionOptions = .{},
 };
 
+/// `forwarded-tcpip` channels a `Connection` holds before `acceptForwarded`
+/// takes them; further opens are refused with `resource_shortage`.
+pub const max_unaccepted_forwards = 16;
+
 /// The remote address a `forwarded-tcpip` channel (RFC 4254 §7.2) arrived
 /// for, and who connected to it.
 pub const ForwardedOrigin = struct {
@@ -690,6 +694,10 @@ pub const Connection = struct {
     remote_forwards: u32 = 0,
     /// Replies to our global requests (§4), in order.
     global_reply: ?GlobalReply = null,
+    /// Local ids of channels freed by `Session.deinit` before the peer's
+    /// CLOSE arrived (or before an open was answered): their late messages
+    /// are dropped instead of failing whichever channel is pumping.
+    zombies: std.ArrayList(u32) = .empty,
     window_size: u32 = default_window_size,
     max_packet_size: u32 = default_max_packet_size,
 
@@ -704,6 +712,7 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         while (self.channels.items.len > 0) self.channels.items[self.channels.items.len - 1].deinit();
         self.channels.deinit(self.gpa);
+        self.zombies.deinit(self.gpa);
         self.forwarded.deinit(self.gpa);
         self.forwarded_origin.deinit(self.gpa);
         self.gpa.free(self.scratch);
@@ -732,6 +741,13 @@ pub const Connection = struct {
     }
 
     fn unregister(self: *Connection, s: *Session) void {
+        // Not closed both ways yet: send our CLOSE (best effort — deinit
+        // cannot fail) and remember the id until the peer's CLOSE, so its
+        // late traffic is dropped (review 2026-10-06 M2).
+        if (!s.ch.got_close) {
+            if (s.ch.open) sendCloseMsg(self.t, &s.ch) catch {};
+            self.zombies.append(self.gpa, s.ch.local_id) catch {};
+        }
         for (self.channels.items, 0..) |x, i| if (x == s) {
             _ = self.channels.swapRemove(i);
             break;
@@ -856,11 +872,30 @@ pub const Connection = struct {
             => {
                 var c = Cursor{ .b = pkt.payload[1..] };
                 const recipient = try c.uint32();
-                const s = self.find(recipient) orelse return error.ChannelClosed;
+                const s = self.find(recipient) orelse {
+                    try self.zombieMessage(mt, recipient, &c);
+                    return .other;
+                };
                 const ev = try s.handleChannelPacket(pkt.payload);
                 return if (target == s) ev else .other;
             },
             else => return error.ProtocolError,
+        }
+    }
+
+    /// A message for a channel no `Session` owns any more: dropped if the id
+    /// is a zombie (an abandoned open that is confirmed now gets our CLOSE;
+    /// the peer's CLOSE retires the id), a protocol violation otherwise.
+    fn zombieMessage(self: *Connection, mt: messages.MessageType, recipient: u32, c: *Cursor) ChannelError!void {
+        const i = std.mem.indexOfScalar(u32, self.zombies.items, recipient) orelse return error.ChannelClosed;
+        switch (mt) {
+            .SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
+                var ch: ChannelState = .{ .local_id = recipient, .local_window = 0, .local_window_initial = 0, .local_max_packet = 0 };
+                ch.remote_id = try c.uint32();
+                try sendCloseMsg(self.t, &ch);
+            },
+            .SSH_MSG_CHANNEL_OPEN_FAILURE, .SSH_MSG_CHANNEL_CLOSE => _ = self.zombies.swapRemove(i),
+            else => {},
         }
     }
 
@@ -886,15 +921,21 @@ pub const Connection = struct {
         _ = try c.string(); // originator address
         const originator_port = try c.uint32();
 
+        // A server may open forwarded channels faster than the caller accepts
+        // them; each would buffer up to `max_output` (review 2026-10-06 M4).
+        if (self.forwarded.items.len >= max_unaccepted_forwards) {
+            return sendOpenFailure(self.t, sender, .resource_shortage, "too many unaccepted forwarded channels");
+        }
+        try self.forwarded.ensureUnusedCapacity(self.gpa, 1);
+        try self.forwarded_origin.ensureUnusedCapacity(self.gpa, 1);
         const s = try self.newChannel(.{ .window_size = self.window_size, .max_packet_size = self.max_packet_size });
         errdefer s.deinit();
         s.ch.remote_id = sender;
         s.ch.remote_window = window;
         s.ch.remote_max_packet = max_packet;
         s.ch.open = true;
-        try self.forwarded.append(self.gpa, s);
-        errdefer _ = self.forwarded.pop();
-        try self.forwarded_origin.append(self.gpa, .{ .connected_port = connected_port, .originator_port = originator_port });
+        self.forwarded.appendAssumeCapacity(s);
+        self.forwarded_origin.appendAssumeCapacity(.{ .connected_port = connected_port, .originator_port = originator_port });
 
         var buf: [32]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -1326,6 +1367,15 @@ const Server = struct {
         return error.ChannelClosed;
     }
 
+    /// RFC 4254 §5.3: once our CLOSE is out, the peer may still send for
+    /// the channel until it has seen it (a `window-change`, trailing data).
+    /// Those are dropped — we may send nothing more on it — and only its
+    /// CLOSE still counts (review 2026-10-06 M1: they used to end the whole
+    /// connection with `error.ChannelClosed`).
+    fn closingByUs(sc: *const ServerChannel) bool {
+        return sc.ch.sent_close and !sc.ch.got_close;
+    }
+
     fn activeSessions(srv: *const Server) usize {
         var n: usize = 0;
         for (srv.channels.items) |sc| {
@@ -1368,8 +1418,8 @@ const Server = struct {
                 if (max_packet == 0) {
                     return srv.refuseOpen(kind, sender, .connect_failed, "zero maximum packet size");
                 }
+                try srv.channels.ensureUnusedCapacity(srv.gpa, 1);
                 const sc = try srv.gpa.create(ServerChannel);
-                errdefer srv.gpa.destroy(sc);
                 sc.* = .{ .ch = .{
                     .local_id = srv.next_id,
                     .local_window = srv.config.window_size,
@@ -1380,7 +1430,10 @@ const Server = struct {
                     .remote_max_packet = max_packet,
                     .open = true,
                 } };
-                try srv.channels.append(srv.gpa, sc);
+                // Owned by `channels` from here on (`deinit` frees it): no
+                // errdefer past this line, or a failed send below would
+                // free it twice (review 2026-10-06 H1).
+                srv.channels.appendAssumeCapacity(sc);
                 srv.next_id +%= 1;
                 srv.served_one = true;
 
@@ -1394,18 +1447,25 @@ const Server = struct {
             },
             .SSH_MSG_CHANNEL_WINDOW_ADJUST => {
                 const sc = try srv.find(&c);
+                if (closingByUs(sc)) return;
                 sc.ch.remote_window +|= try c.uint32();
             },
             .SSH_MSG_CHANNEL_DATA => {
                 const sc = try srv.find(&c);
+                if (closingByUs(sc)) return;
                 const data = try c.string();
                 try sc.ch.acceptData(data.len);
-                if (sc.stdin.items.len + data.len > srv.config.max_input) return error.OutputTooLarge;
-                try sc.stdin.appendSlice(srv.gpa, data);
+                // `.ignore`: the handler never sees stdin, so none is kept
+                // (review 2026-10-06 L3); the window is still accounted.
+                if (srv.config.stdin_mode == .collect_until_eof) {
+                    if (sc.stdin.items.len + data.len > srv.config.max_input) return error.OutputTooLarge;
+                    try sc.stdin.appendSlice(srv.gpa, data);
+                }
                 try maybeAdjustWindow(srv.t, &sc.ch);
             },
             .SSH_MSG_CHANNEL_EXTENDED_DATA => {
                 const sc = try srv.find(&c);
+                if (closingByUs(sc)) return;
                 _ = try c.uint32();
                 const data = try c.string();
                 try sc.ch.acceptData(data.len);
@@ -1413,6 +1473,7 @@ const Server = struct {
             },
             .SSH_MSG_CHANNEL_EOF => {
                 const sc = try srv.find(&c);
+                if (closingByUs(sc)) return;
                 sc.ch.got_eof = true;
                 // stdin is complete — now the handler can see all of it.
                 if (sc.pending) |*p| p.ready = true;
@@ -1424,10 +1485,7 @@ const Server = struct {
             },
             .SSH_MSG_CHANNEL_REQUEST => {
                 const sc = try srv.find(&c);
-                // We have already torn our side down: a request now cannot
-                // be served (RFC 4254 §5.3 — after CLOSE only the peer's
-                // CLOSE is still expected).
-                if (sc.ch.sent_close) return error.ChannelClosed;
+                if (closingByUs(sc)) return;
                 const req = try c.string();
                 const want_reply = try c.boolean();
                 try srv.channelRequest(sc, req, want_reply, &c);
@@ -3187,4 +3245,44 @@ test "serveSession: subsystem_names rejects a name not on the list before CHANNE
         @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS)),
         subsystem_reply2.payload[0],
     );
+}
+
+test "serveSession: messages the client sends after our CLOSE are dropped, not a connection error (RFC 4254 §5.3)" {
+    // Review 2026-10-06 M1. The handler runs at once (`.ignore`), so our
+    // exit-status/EOF/CLOSE go out right after the exec; the client — which
+    // has not seen them yet — still sends a window-change, data and EOF,
+    // then its CLOSE. All but the CLOSE must be dropped silently.
+    const t = std.testing;
+    var b0: [64]u8 = undefined;
+    const open = try channelOpenPayload(&b0, 7, 1 << 20, 1 << 15);
+    var b1: [64]u8 = undefined;
+    const exec_req = SessionCorpus.execPayload(&b1, 0, "id");
+    var b2: [64]u8 = undefined;
+    var ww: std.Io.Writer = .fixed(&b2);
+    try writeChannelHeader(&ww, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ww, "window-change");
+    try ww.writeByte(0);
+    for (0..4) |_| try writeU32(&ww, 80);
+    var b3: [64]u8 = undefined;
+    const data = SessionCorpus.dataPayload(&b3, 0, "late");
+    var b4: [16]u8 = undefined;
+    const eof = SessionCorpus.onePayload(&b4, .SSH_MSG_CHANNEL_EOF, 0);
+    var b5: [16]u8 = undefined;
+    const close = SessionCorpus.onePayload(&b5, .SSH_MSG_CHANNEL_CLOSE, 0);
+
+    var wire: [1024]u8 = undefined;
+    const framed = try framePackets(&wire, &.{ open, exec_req, ww.buffered(), data, eof, close });
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    try serveSession(&tr, t.allocator, .{ .exec = fuzz_label.handler(), .stdin_mode = .ignore });
+
+    // Nothing after our CLOSE: the last packet we wrote is that CLOSE.
+    var rr: std.Io.Reader = .fixed(sink.buffered());
+    var c: transport.CipherState = .plaintext;
+    var pbuf: [512]u8 = undefined;
+    var last: u8 = 0;
+    while (transport.readPacket(&rr, &c, &pbuf)) |pkt| last = pkt.payload[0] else |_| {}
+    try t.expectEqual(@as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
 }
