@@ -216,4 +216,6 @@ native path is clean-room from the kernel UAPI headers
 traffic. No libnftables, libnftnl, libmnl or nftables source was consulted or
 copied; `nft` is used only as a capture subject and a test oracle. libnftables
 itself is GPL-2.0: it is referenced solely as the specification of its JSON
-input/output format (an interface, not code).
+input/output format (an interface, not code). `src/testdata/nft_json.zig` holds
+`nft`'s own JSON listings of rulesets this module built (`tools/interop.zig`),
+observed output of a black-box tool, exempt per root `NOTICE` §0.

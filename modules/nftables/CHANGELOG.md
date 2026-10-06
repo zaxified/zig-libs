@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the JSON builder is anchored to a real `nft`.
+  `tools/interop.zig` (`unshare -rn zig build interop-nftables -- --capture`) applies eight builder
+  scenarios with `nft -j -f -` and freezes `nft -j list ruleset`; `src/json_oracle_test.zig` replays
+  them without nft or privileges — every field sent comes back with its value. No defect.
+
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog). ADDED, native backend: verdict and
   data **maps** (`SetSpec.data`, `SetElem.verdict`, `Program.payloadVmap`/`tcpDportVmap`,
   decoded back as `SetInfo.data_type/data_len` and `SetElemInfo.verdict`); **named objects**

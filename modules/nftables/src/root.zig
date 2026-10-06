@@ -1009,6 +1009,9 @@ test {
         _ = native;
         _ = @import("consistency.zig");
     }
+    // External anchor: the JSON builder's output as a real `nft` applied and
+    // listed it (tools/interop.zig), replayed without nft or privileges.
+    _ = @import("json_oracle_test.zig");
 }
 
 /// Assert `v` serializes to exactly `expected` (minified std.json).
