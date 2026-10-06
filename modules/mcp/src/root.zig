@@ -3998,6 +3998,7 @@ fn expectResponse(s: *Server, msg: []const u8, expected: []const u8) !void {
 // A bare `pub const x = @import(...)` does not pull x's tests in (CONVENTIONS §6).
 test {
     _ = header_annotations;
+    _ = @import("sdk_oracle.zig");
 }
 
 test "jsonrpc: malformed JSON -> -32700, no panic" {
