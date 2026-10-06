@@ -230,6 +230,12 @@ see "Part 6 design" below.
   entry 21); `g1`/`g2.Jacobian.clearCofactor` remains what it always
   was — a correct way to land arbitrary points in the subgroup — it
   just is not RFC 9380's `clear_cofactor`.
+- **`expand_message_xof` (SHAKE-256), 2026-10-06**: RFC 9380 §5.3.2, for the
+  `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite of draft-irtf-cfrg-bbs-signatures
+  Appendix A.1 (`hashToCurveG1PartsWith(.xof_shake256, ..)`; G2 has no XOF
+  variant — no consumer). K.6-anchored; the G1 suite itself is anchored by
+  `bbs`'s draft-12 SHAKE-256 generators. The §5.3.3 long-DST rehash is not
+  implemented for either expander (`dst.len <= 255` asserted).
 - **`expand_message_xmd` reuse decision (flagged, not unilateral)**:
   `modules/frost` and `modules/voprf` each already carry an in-module
   `expand_message_xmd`, but both are hardcoded to a fixed `ell`

@@ -97,31 +97,6 @@ pub const octet_point_length = G1.compressed_bytes; // 48
 /// `k = 128`, `log2(r) = 255` — i.e. `ceil(383/8) = 48`.
 pub const expand_len = 48;
 
-pub const ciphersuite_id = "BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_";
-/// The BBS Signatures Interface's (draft §3.5) fixed `api_id` — draft
-/// §3.8's format `ciphersuite_id || CREATE_GENERATORS_ID ||
-/// MAP_TO_SCALAR_ID`, with `CREATE_GENERATORS_ID = "H2G_"` (§4.1.1) and
-/// `MAP_TO_SCALAR_ID = "HM2S_"` (§4.1.2) and no `ADD_INFO`.
-pub const api_id = ciphersuite_id ++ "H2G_HM2S_";
-
-pub const seed_dst = api_id ++ "SIG_GENERATOR_SEED_";
-pub const generator_dst = api_id ++ "SIG_GENERATOR_DST_";
-pub const generator_seed_message = api_id ++ "MESSAGE_GENERATOR_SEED";
-pub const bp_generator_seed_message = api_id ++ "BP_MESSAGE_GENERATOR_SEED";
-pub const map_msg_dst = api_id ++ "MAP_MSG_TO_SCALAR_AS_HASH_";
-/// Shared by `calculate_domain` (as `domain_dst`), `CoreSign` (as
-/// `signature_dst`), and `ProofChallengeCalculate` (as `challenge_dst`)
-/// — draft §4.2.3/§3.6.1/§3.7.4 each independently define "api_id ||
-/// H2S_" under a different local name; it is the SAME literal DST.
-pub const h2s_dst = api_id ++ "H2S_";
-/// `api_id`-prefixed, NOT `ciphersuite_id`-prefixed — see this file's
-/// module doc comment ("DST hierarchy") for why, and the byte-exact
-/// KAT confirmation in `keys.zig`.
-pub const keygen_dst = api_id ++ "KEYGEN_DST_";
-/// `api_id`-prefixed, NOT `ciphersuite_id`-prefixed — see this file's
-/// module doc comment ("DST hierarchy") and the KAT test below.
-pub const mocked_scalars_dst = api_id ++ "MOCK_RANDOM_SCALARS_DST_";
-
 fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
     @setEvalBranchQuota(100_000);
     var out: [n]u8 = undefined;
@@ -129,158 +104,11 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
     return out;
 }
 
-/// `P1`, the ciphersuite's fixed `G1` point (draft §6.2.2) — the
-/// constant summand in `CoreSign`/`CoreVerify`/`ProofInit`/
-/// `ProofVerifyInit`'s `B`/`D` accumulation (`bbs.zig`). Hardcoded as
-/// affine `(x, y)` coordinates — DECOMPRESSED OFFLINE (not via
-/// `G1.fromBytesCompressed` at comptime: that path's `recoverY` calls
-/// `Fp.sqrt`, a modular exponentiation whose comptime cost blows past
-/// `@setEvalBranchQuota`'s practical range for a bare top-level
-/// constant — the same reason `bls12_381.g1.Affine.generator` itself is
-/// stored as raw `(x, y)`, not derived from a compressed literal) from
-/// the draft's own published compressed literal
-/// (`a8ce256102840821a3e94ea9025e4662b205762f9776b3a766c872b948f1fd225e
-/// 7c59698588e70d11406d161b4e28c9`, unchanged in draft-12 §7.2.2). The KAT test below verifies
-/// `toBytesCompressed(P1)` reproduces that exact literal AND
-/// re-derives `P1` via `createGeneratorsWithSeed(1,
-/// bp_generator_seed_message)` for independent self-consistency.
-pub const P1: G1.Affine = .{
-    .x = Fp.fromBytes(hexBytes(48, "08ce256102840821a3e94ea9025e4662b205762f9776b3a766c872b948f1fd225e7c59698588e70d11406d161b4e28c9")) catch
-        @compileError("bbs: bad P1.x constant"),
-    .y = Fp.fromBytes(hexBytes(48, "10a711acd16ff43e30b3373b7b6a9233945ec74adf00b0481fbcd5e3b1e342e7a105b4966195e6a678857a0e0493d5b1")) catch
-        @compileError("bbs: bad P1.y constant"),
-};
-
 /// `BP2`, the ciphersuite's fixed `G2` base point (draft §6.2: "The base
 /// points BP1 and BP2 ... are the points BP and BP' ... as defined in
 /// [pairing-friendly-curves]") — exactly `bls12_381`'s own standard `G2`
 /// generator; no separate constant is needed.
 pub const BP2: G2.Affine = G2.Affine.generator;
-
-/// `expand_message` (RFC 9380 §5.3.1, `expand_message_xmd` variant) —
-/// thin re-export of `bls12_381.hash_to_curve.expandMessageXmd`, kept as
-/// a local name so every draft-shaped call site here reads
-/// `ciphersuite.expandMessage(..)` rather than reaching into a sibling
-/// module directly. `len_in_bytes` is `comptime` for the same reason
-/// `expandMessageXmd` itself requires it — see that function's doc
-/// comment (`bls12_381/src/hash_to_curve.zig`).
-pub fn expandMessage(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
-    return hash_to_curve.expandMessageXmd(len_in_bytes, msg, dst);
-}
-
-/// `hash_to_scalar(msg, dst)` (draft §4.2.2): `OS2IP(expand_message(msg,
-/// dst, expand_len)) mod r`. REAL — `expand_message` (above) plus
-/// `Fr.reduceWide` (already real, `bls12_381/src/scalar.zig`) for the
-/// `mod r` reduction; `expand_len = 48 <= 64`, `Fr.reduceWide`'s own
-/// width ceiling.
-///
-/// NOTE: this is the GENERIC hash-to-scalar helper used internally by
-/// `calculate_domain`/`messages_to_scalars`/`keys.keyGen`/
-/// `mockedRandomScalars` (each supplying its own `dst`) — do NOT confuse
-/// with `messagesToScalars` (below), which is the draft's
-/// `MapMessageToScalarAsHash`-specific wrapper (fixed `map_msg_dst`) a
-/// caller signing/proving messages should actually use.
-pub fn hashToScalar(msg: []const u8, dst: []const u8) Fr {
-    return Fr.reduceWide(&expandMessage(expand_len, msg, dst));
-}
-
-/// `create_generators(count)` (draft §4.1.1) using the STANDARD seed
-/// message (`generator_seed_message`) — the `(Q_1, H_1, ..., H_{count-1})`
-/// sequence the Interface (`Sign`/`Verify`/`ProofGen`/`ProofVerify`) uses
-/// when `create_generators(L+1, ...)` is called: `out[0]` is `Q_1`,
-/// `out[1..]` are `H_1..H_L`. Caller owns the returned slice (free with
-/// `allocator`). REAL — see `createGeneratorsWithSeed` for the
-/// construction; `P1`'s OWN derivation (a DIFFERENT, one-off seed
-/// message) is the reason that function takes `seed_message` as a
-/// parameter instead of being inlined here.
-pub fn createGenerators(allocator: std.mem.Allocator, count: usize) std.mem.Allocator.Error![]G1.Affine {
-    return createGeneratorsWithSeed(allocator, count, generator_seed_message);
-}
-
-/// `create_generators(count)` (draft §4.1.1), generalized over the seed
-/// MESSAGE (draft's own `generator_seed` input — renamed here to avoid
-/// colliding with `seed_dst`, a DST, in naming) so `P1`'s derivation
-/// (`bp_generator_seed_message`) and the standard Interface derivation
-/// (`generator_seed_message`, via `createGenerators`) share one
-/// implementation, per the draft's own note ("replacing the defined
-/// generator_seed with the value ...").
-///
-/// Construction (draft §4.1.1, verbatim, 1-indexed):
-/// ```
-/// v = expand_message(seed_message, seed_dst, expand_len)
-/// for i in 1..=count:
-///     v = expand_message(v || I2OSP(i, 8), seed_dst, expand_len)
-///     generator_i = hash_to_curve_g1(v, generator_dst)
-/// return (generator_1, ..., generator_count)
-/// ```
-/// `hash_to_curve_g1` is `bls12_381.hash_to_curve.hashToCurveG1` — full
-/// RFC 9380 hash-to-curve (hash-to-field, SSWU map, 11-isogeny,
-/// cofactor clear), already real (`bls12_381` Part 3).
-pub fn createGeneratorsWithSeed(allocator: std.mem.Allocator, count: usize, seed_message: []const u8) std.mem.Allocator.Error![]G1.Affine {
-    const out = try allocator.alloc(G1.Affine, count);
-    errdefer allocator.free(out);
-    var v = expandMessage(expand_len, seed_message, seed_dst);
-    // `i` only ever ranges over `1..=count`, and `count` is already `usize`
-    // (it bounds the `allocator.alloc` above) — there is no value `i` can
-    // hold that a `usize` can't. The `u64` here was accidental width, not a
-    // requirement: the draft's `I2OSP(i, 8)` is the WIRE format (an 8-byte
-    // big-endian field), not a claim that `i` itself needs 64-bit range, and
-    // `std.mem.writeInt(u64, ...)` accepts a `usize` argument via ordinary
-    // implicit widening on every host. Narrowed rather than cast at the
-    // boundary; identical semantics, so no new test.
-    var i: usize = 1;
-    while (i <= count) : (i += 1) {
-        var input: [expand_len + 8]u8 = undefined;
-        input[0..expand_len].* = v;
-        std.mem.writeInt(u64, input[expand_len..][0..8], i, .big);
-        v = expandMessage(expand_len, &input, seed_dst);
-        out[i - 1] = hash_to_curve.hashToCurveG1(&v, generator_dst);
-    }
-    return out;
-}
-
-/// `messages_to_scalars(messages)` (draft §4.1.2, `MAP_TO_SCALAR_ID =
-/// "HM2S_"`): each message independently mapped via `hash_to_scalar(msg,
-/// map_msg_dst)`. REAL. Caller owns the returned slice.
-pub fn messagesToScalars(allocator: std.mem.Allocator, messages: []const []const u8) std.mem.Allocator.Error![]Fr {
-    const out = try allocator.alloc(Fr, messages.len);
-    errdefer allocator.free(out);
-    for (messages, 0..) |m, i| out[i] = hashToScalar(m, map_msg_dst);
-    return out;
-}
-
-/// `calculate_domain(PK, Q_1, H_points, header)` (draft §4.2.3), `api_id`
-/// fixed to this ciphersuite's Interface `api_id`:
-/// ```
-/// dom_octs  = I2OSP(L, 8) || ser(Q_1) || ser(H_1) || .. || ser(H_L) || api_id
-/// dom_input = ser(PK) || dom_octs || I2OSP(len(header), 8) || header
-/// domain    = hash_to_scalar(dom_input, h2s_dst)
-/// ```
-/// `ser(..)` for a `G1`/`G2` point is its ciphersuite-fixed compressed
-/// encoding (`G1.toBytesCompressed`/`G2.toBytesCompressed` — already
-/// real). REAL: pure concatenation + `hashToScalar`, no ZK judgment.
-pub fn calculateDomain(
-    allocator: std.mem.Allocator,
-    pk_bytes: [G2.compressed_bytes]u8,
-    q1: G1.Affine,
-    h_points: []const G1.Affine,
-    header: []const u8,
-) std.mem.Allocator.Error!Fr {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, &pk_bytes);
-    var l_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &l_buf, h_points.len, .big);
-    try buf.appendSlice(allocator, &l_buf);
-    try buf.appendSlice(allocator, &G1.toBytesCompressed(q1));
-    for (h_points) |h| try buf.appendSlice(allocator, &G1.toBytesCompressed(h));
-    try buf.appendSlice(allocator, api_id);
-    var h_len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &h_len_buf, header.len, .big);
-    try buf.appendSlice(allocator, &h_len_buf);
-    try buf.appendSlice(allocator, header);
-    return hashToScalar(buf.items, h2s_dst);
-}
 
 /// `calculate_random_scalars(count)` (draft §4.2.1): `count` INDEPENDENT
 /// draws of `OS2IP(get_random(expand_len)) mod r` from a real CSPRNG —
@@ -310,29 +138,261 @@ pub fn calculateRandomScalars(comptime count: usize, io: std.Io) [count]Fr {
     return out;
 }
 
-/// `seeded_random_scalars(SEED, count)` (draft §7.1) — the DETERMINISTIC
-/// mock RNG the draft's own test vectors use so `ProofGen`'s output is
-/// reproducible: ONE `expand_message(SEED, mocked_scalars_dst, expand_len
-/// * count)` call, sliced into `count` consecutive `expand_len`-byte
-/// chunks, each `OS2IP(..) mod r`-reduced. `count` is `comptime` (same
-/// reasoning as `calculateRandomScalars`) — every KAT call site knows the
-/// fixture's `count = 5 + U` at compile time. **NOT for production use**
-/// (the entire point of a "mocked" RNG is that it is PUBLIC and
-/// PREDICTABLE given `SEED`) — see `kat_test.zig`'s gated `proofGen`
-/// tests for how the fixture's `SEED` ("3.141592653589793238462643383279",
-/// the first 30 digits of pi — a nothing-up-my-sleeve value) and
-/// `count` (`5 + U`, varying per fixture) are used.
-///
-/// Verified byte-exact against draft-12 §8.4.5's ten published scalars
-/// (`kat_test.zig`), whose `SEED`/DST are exactly this pair.
-pub fn mockedRandomScalars(comptime count: usize, seed: []const u8) [count]Fr {
-    const v = expandMessage(expand_len * count, seed, mocked_scalars_dst);
-    var out: [count]Fr = undefined;
-    inline for (0..count) |i| {
-        out[i] = Fr.reduceWide(v[i * expand_len ..][0..expand_len]);
-    }
-    return out;
+/// The two ciphersuites of draft-12 §7.2: BLS12-381-SHA-256 (§7.2.2) and
+/// BLS12-381-SHAKE-256 (§7.2.1). They differ only in `ciphersuite_id`
+/// (hence every DST), `P1`, and the `expand_message` behind
+/// `hash_to_scalar` and `hash_to_curve_g1` (XMD/SHA-256 vs XOF/SHAKE-256);
+/// `expand_len`, the point/scalar widths and every algorithm are shared.
+pub const SuiteKind = enum { sha256, shake256 };
+
+pub fn Suite(comptime kind: SuiteKind) type {
+    return struct {
+        const Self = @This();
+        pub const suite = kind;
+
+        pub const ciphersuite_id = switch (kind) {
+            .sha256 => "BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_",
+            .shake256 => "BBS_BLS12381G1_XOF:SHAKE-256_SSWU_RO_",
+        };
+        /// The RFC 9380 expander the suite's `hash_to_curve_g1` and
+        /// `expand_message` use (§7.2.1/§7.2.2).
+        pub const expander: hash_to_curve.Expander = switch (kind) {
+            .sha256 => .xmd_sha256,
+            .shake256 => .xof_shake256,
+        };
+        /// The BBS Signatures Interface's (draft §3.5) fixed `api_id` — draft
+        /// §3.8's format `ciphersuite_id || CREATE_GENERATORS_ID ||
+        /// MAP_TO_SCALAR_ID`, with `CREATE_GENERATORS_ID = "H2G_"` (§4.1.1) and
+        /// `MAP_TO_SCALAR_ID = "HM2S_"` (§4.1.2) and no `ADD_INFO`.
+        pub const api_id = Self.ciphersuite_id ++ "H2G_HM2S_";
+
+        pub const seed_dst = Self.api_id ++ "SIG_GENERATOR_SEED_";
+        pub const generator_dst = Self.api_id ++ "SIG_GENERATOR_DST_";
+        pub const generator_seed_message = Self.api_id ++ "MESSAGE_GENERATOR_SEED";
+        pub const bp_generator_seed_message = Self.api_id ++ "BP_MESSAGE_GENERATOR_SEED";
+        pub const map_msg_dst = Self.api_id ++ "MAP_MSG_TO_SCALAR_AS_HASH_";
+        /// Shared by `calculate_domain` (as `domain_dst`), `CoreSign` (as
+        /// `signature_dst`), and `ProofChallengeCalculate` (as `challenge_dst`)
+        /// — draft §4.2.3/§3.6.1/§3.7.4 each independently define "api_id ||
+        /// H2S_" under a different local name; it is the SAME literal DST.
+        pub const h2s_dst = Self.api_id ++ "H2S_";
+        /// `api_id`-prefixed, NOT `ciphersuite_id`-prefixed — see this file's
+        /// module doc comment ("DST hierarchy") for why, and the byte-exact
+        /// KAT confirmation in `keys.zig`.
+        pub const keygen_dst = Self.api_id ++ "KEYGEN_DST_";
+        /// `api_id`-prefixed, NOT `ciphersuite_id`-prefixed — see this file's
+        /// module doc comment ("DST hierarchy") and the KAT test below.
+        pub const mocked_scalars_dst = Self.api_id ++ "MOCK_RANDOM_SCALARS_DST_";
+
+        /// `P1`, the ciphersuite's fixed `G1` point (draft §6.2.2) — the
+        /// constant summand in `CoreSign`/`CoreVerify`/`ProofInit`/
+        /// `ProofVerifyInit`'s `B`/`D` accumulation (`bbs.zig`). Hardcoded as
+        /// affine `(x, y)` coordinates — DECOMPRESSED OFFLINE (not via
+        /// `G1.fromBytesCompressed` at comptime: that path's `recoverY` calls
+        /// `Fp.sqrt`, a modular exponentiation whose comptime cost blows past
+        /// `@setEvalBranchQuota`'s practical range for a bare top-level
+        /// constant — the same reason `bls12_381.g1.Affine.generator` itself is
+        /// stored as raw `(x, y)`, not derived from a compressed literal) from
+        /// the draft's own published compressed literal
+        /// (`a8ce256102840821a3e94ea9025e4662b205762f9776b3a766c872b948f1fd225e
+        /// 7c59698588e70d11406d161b4e28c9`, unchanged in draft-12 §7.2.2). The KAT test below verifies
+        /// `toBytesCompressed(P1)` reproduces that exact literal AND
+        /// re-derives `P1` via `createGeneratorsWithSeed(1,
+        /// bp_generator_seed_message)` for independent self-consistency.
+        pub const P1: G1.Affine = switch (kind) {
+            .sha256 => .{
+                .x = Fp.fromBytes(hexBytes(48, "08ce256102840821a3e94ea9025e4662b205762f9776b3a766c872b948f1fd225e7c59698588e70d11406d161b4e28c9")) catch
+                    @compileError("bbs: bad P1.x constant"),
+                .y = Fp.fromBytes(hexBytes(48, "10a711acd16ff43e30b3373b7b6a9233945ec74adf00b0481fbcd5e3b1e342e7a105b4966195e6a678857a0e0493d5b1")) catch
+                    @compileError("bbs: bad P1.y constant"),
+            },
+            // draft-12 §7.2.1: 8929dfbc7e6642c4ed9cba0856e493f8b9d7d5fcb0c31ef8fdcd34d50648a56c795e106e9eada6e0bda386b414150755
+            .shake256 => .{
+                .x = Fp.fromBytes(hexBytes(48, "0929dfbc7e6642c4ed9cba0856e493f8b9d7d5fcb0c31ef8fdcd34d50648a56c795e106e9eada6e0bda386b414150755")) catch
+                    @compileError("bbs: bad P1.x constant"),
+                .y = Fp.fromBytes(hexBytes(48, "0821b086b7a53a10752b0f380b16bd711b6bf735fbcbd7b181e291c991481f3958a08370ea714ae22a904082d64fa607")) catch
+                    @compileError("bbs: bad P1.y constant"),
+            },
+        };
+
+        /// `expand_message` (RFC 9380 §5.3.1, `expand_message_xmd` variant) —
+        /// thin re-export of `bls12_381.hash_to_curve.expandMessageXmd`, kept as
+        /// a local name so every draft-shaped call site here reads
+        /// `ciphersuite.expandMessage(..)` rather than reaching into a sibling
+        /// module directly. `len_in_bytes` is `comptime` for the same reason
+        /// `expandMessageXmd` itself requires it — see that function's doc
+        /// comment (`bls12_381/src/hash_to_curve.zig`).
+        pub fn expandMessage(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
+            return switch (kind) {
+                .sha256 => hash_to_curve.expandMessageXmd(len_in_bytes, msg, dst),
+                .shake256 => hash_to_curve.expandMessageXof(len_in_bytes, msg, dst),
+            };
+        }
+
+        /// `hash_to_scalar(msg, dst)` (draft §4.2.2): `OS2IP(expand_message(msg,
+        /// dst, expand_len)) mod r`. REAL — `expand_message` (above) plus
+        /// `Fr.reduceWide` (already real, `bls12_381/src/scalar.zig`) for the
+        /// `mod r` reduction; `expand_len = 48 <= 64`, `Fr.reduceWide`'s own
+        /// width ceiling.
+        ///
+        /// NOTE: this is the GENERIC hash-to-scalar helper used internally by
+        /// `calculate_domain`/`messages_to_scalars`/`keys.keyGen`/
+        /// `mockedRandomScalars` (each supplying its own `dst`) — do NOT confuse
+        /// with `messagesToScalars` (below), which is the draft's
+        /// `MapMessageToScalarAsHash`-specific wrapper (fixed `map_msg_dst`) a
+        /// caller signing/proving messages should actually use.
+        pub fn hashToScalar(msg: []const u8, dst: []const u8) Fr {
+            return Fr.reduceWide(&Self.expandMessage(expand_len, msg, dst));
+        }
+
+        /// `create_generators(count)` (draft §4.1.1) using the STANDARD seed
+        /// message (`generator_seed_message`) — the `(Q_1, H_1, ..., H_{count-1})`
+        /// sequence the Interface (`Sign`/`Verify`/`ProofGen`/`ProofVerify`) uses
+        /// when `create_generators(L+1, ...)` is called: `out[0]` is `Q_1`,
+        /// `out[1..]` are `H_1..H_L`. Caller owns the returned slice (free with
+        /// `allocator`). REAL — see `createGeneratorsWithSeed` for the
+        /// construction; `P1`'s OWN derivation (a DIFFERENT, one-off seed
+        /// message) is the reason that function takes `seed_message` as a
+        /// parameter instead of being inlined here.
+        pub fn createGenerators(allocator: std.mem.Allocator, count: usize) std.mem.Allocator.Error![]G1.Affine {
+            return Self.createGeneratorsWithSeed(allocator, count, Self.generator_seed_message);
+        }
+
+        /// `create_generators(count)` (draft §4.1.1), generalized over the seed
+        /// MESSAGE (draft's own `generator_seed` input — renamed here to avoid
+        /// colliding with `seed_dst`, a DST, in naming) so `P1`'s derivation
+        /// (`bp_generator_seed_message`) and the standard Interface derivation
+        /// (`generator_seed_message`, via `createGenerators`) share one
+        /// implementation, per the draft's own note ("replacing the defined
+        /// generator_seed with the value ...").
+        ///
+        /// Construction (draft §4.1.1, verbatim, 1-indexed):
+        /// ```
+        /// v = expand_message(seed_message, seed_dst, expand_len)
+        /// for i in 1..=count:
+        ///     v = expand_message(v || I2OSP(i, 8), seed_dst, expand_len)
+        ///     generator_i = hash_to_curve_g1(v, generator_dst)
+        /// return (generator_1, ..., generator_count)
+        /// ```
+        /// `hash_to_curve_g1` is `bls12_381.hash_to_curve.hashToCurveG1` — full
+        /// RFC 9380 hash-to-curve (hash-to-field, SSWU map, 11-isogeny,
+        /// cofactor clear), already real (`bls12_381` Part 3).
+        pub fn createGeneratorsWithSeed(allocator: std.mem.Allocator, count: usize, seed_message: []const u8) std.mem.Allocator.Error![]G1.Affine {
+            const out = try allocator.alloc(G1.Affine, count);
+            errdefer allocator.free(out);
+            var v = Self.expandMessage(expand_len, seed_message, Self.seed_dst);
+            // `i` only ever ranges over `1..=count`, and `count` is already `usize`
+            // (it bounds the `allocator.alloc` above) — there is no value `i` can
+            // hold that a `usize` can't. The `u64` here was accidental width, not a
+            // requirement: the draft's `I2OSP(i, 8)` is the WIRE format (an 8-byte
+            // big-endian field), not a claim that `i` itself needs 64-bit range, and
+            // `std.mem.writeInt(u64, ...)` accepts a `usize` argument via ordinary
+            // implicit widening on every host. Narrowed rather than cast at the
+            // boundary; identical semantics, so no new test.
+            var i: usize = 1;
+            while (i <= count) : (i += 1) {
+                var input: [expand_len + 8]u8 = undefined;
+                input[0..expand_len].* = v;
+                std.mem.writeInt(u64, input[expand_len..][0..8], i, .big);
+                v = Self.expandMessage(expand_len, &input, Self.seed_dst);
+                out[i - 1] = hash_to_curve.hashToCurveG1PartsWith(Self.expander, &.{&v}, Self.generator_dst);
+            }
+            return out;
+        }
+
+        /// `messages_to_scalars(messages)` (draft §4.1.2, `MAP_TO_SCALAR_ID =
+        /// "HM2S_"`): each message independently mapped via `hash_to_scalar(msg,
+        /// map_msg_dst)`. REAL. Caller owns the returned slice.
+        pub fn messagesToScalars(allocator: std.mem.Allocator, messages: []const []const u8) std.mem.Allocator.Error![]Fr {
+            const out = try allocator.alloc(Fr, messages.len);
+            errdefer allocator.free(out);
+            for (messages, 0..) |m, i| out[i] = Self.hashToScalar(m, Self.map_msg_dst);
+            return out;
+        }
+
+        /// `calculate_domain(PK, Q_1, H_points, header)` (draft §4.2.3), `api_id`
+        /// fixed to this ciphersuite's Interface `api_id`:
+        /// ```
+        /// dom_octs  = I2OSP(L, 8) || ser(Q_1) || ser(H_1) || .. || ser(H_L) || api_id
+        /// dom_input = ser(PK) || dom_octs || I2OSP(len(header), 8) || header
+        /// domain    = hash_to_scalar(dom_input, h2s_dst)
+        /// ```
+        /// `ser(..)` for a `G1`/`G2` point is its ciphersuite-fixed compressed
+        /// encoding (`G1.toBytesCompressed`/`G2.toBytesCompressed` — already
+        /// real). REAL: pure concatenation + `hashToScalar`, no ZK judgment.
+        pub fn calculateDomain(
+            allocator: std.mem.Allocator,
+            pk_bytes: [G2.compressed_bytes]u8,
+            q1: G1.Affine,
+            h_points: []const G1.Affine,
+            header: []const u8,
+        ) std.mem.Allocator.Error!Fr {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, &pk_bytes);
+            var l_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &l_buf, h_points.len, .big);
+            try buf.appendSlice(allocator, &l_buf);
+            try buf.appendSlice(allocator, &G1.toBytesCompressed(q1));
+            for (h_points) |h| try buf.appendSlice(allocator, &G1.toBytesCompressed(h));
+            try buf.appendSlice(allocator, Self.api_id);
+            var h_len_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &h_len_buf, header.len, .big);
+            try buf.appendSlice(allocator, &h_len_buf);
+            try buf.appendSlice(allocator, header);
+            return Self.hashToScalar(buf.items, Self.h2s_dst);
+        }
+
+        /// `seeded_random_scalars(SEED, count)` (draft §7.1) — the DETERMINISTIC
+        /// mock RNG the draft's own test vectors use so `ProofGen`'s output is
+        /// reproducible: ONE `expand_message(SEED, mocked_scalars_dst, expand_len
+        /// * count)` call, sliced into `count` consecutive `expand_len`-byte
+        /// chunks, each `OS2IP(..) mod r`-reduced. `count` is `comptime` (same
+        /// reasoning as `calculateRandomScalars`) — every KAT call site knows the
+        /// fixture's `count = 5 + U` at compile time. **NOT for production use**
+        /// (the entire point of a "mocked" RNG is that it is PUBLIC and
+        /// PREDICTABLE given `SEED`) — see `kat_test.zig`'s gated `proofGen`
+        /// tests for how the fixture's `SEED` ("3.141592653589793238462643383279",
+        /// the first 30 digits of pi — a nothing-up-my-sleeve value) and
+        /// `count` (`5 + U`, varying per fixture) are used.
+        ///
+        /// Verified byte-exact against draft-12 §8.4.5's ten published scalars
+        /// (`kat_test.zig`), whose `SEED`/DST are exactly this pair.
+        pub fn mockedRandomScalars(comptime count: usize, seed: []const u8) [count]Fr {
+            const v = Self.expandMessage(expand_len * count, seed, Self.mocked_scalars_dst);
+            var out: [count]Fr = undefined;
+            inline for (0..count) |i| {
+                out[i] = Fr.reduceWide(v[i * expand_len ..][0..expand_len]);
+            }
+            return out;
+        }
+    };
 }
+
+pub const Sha256 = Suite(.sha256);
+pub const Shake256 = Suite(.shake256);
+
+// The SHA-256 suite under the names this file had before it gained a
+// second suite (every existing caller and test uses them).
+pub const ciphersuite_id = Sha256.ciphersuite_id;
+pub const expander = Sha256.expander;
+pub const api_id = Sha256.api_id;
+pub const seed_dst = Sha256.seed_dst;
+pub const generator_dst = Sha256.generator_dst;
+pub const generator_seed_message = Sha256.generator_seed_message;
+pub const bp_generator_seed_message = Sha256.bp_generator_seed_message;
+pub const map_msg_dst = Sha256.map_msg_dst;
+pub const h2s_dst = Sha256.h2s_dst;
+pub const keygen_dst = Sha256.keygen_dst;
+pub const mocked_scalars_dst = Sha256.mocked_scalars_dst;
+pub const P1 = Sha256.P1;
+pub const expandMessage = Sha256.expandMessage;
+pub const hashToScalar = Sha256.hashToScalar;
+pub const createGenerators = Sha256.createGenerators;
+pub const createGeneratorsWithSeed = Sha256.createGeneratorsWithSeed;
+pub const messagesToScalars = Sha256.messagesToScalars;
+pub const calculateDomain = Sha256.calculateDomain;
+pub const mockedRandomScalars = Sha256.mockedRandomScalars;
 
 // ── tests ────────────────────────────────────────────────────────────────
 

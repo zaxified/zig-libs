@@ -25,7 +25,7 @@ signature/proof tamper-rejection cases.
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
-| `ciphersuite.zig` | **REAL.** `BBS_BLS12381G1_XMD:SHA-256_SSWU_RO_` constants (`P1`/`BP2`/DSTs), `expandMessage`/`hashToScalar`/`createGenerators`/`messagesToScalars`/`calculateDomain`/`calculateRandomScalars`/`mockedRandomScalars` |
+| `ciphersuite.zig` | **REAL.** `Suite(.sha256 / .shake256)` — both draft-12 ciphersuites' constants (`P1`/DSTs) and `expandMessage`/`hashToScalar`/`createGenerators`/`messagesToScalars`/`calculateDomain`/`calculateRandomScalars`/`mockedRandomScalars` |
 | `keys.zig` | **REAL.** `keyGen`/`skToPk`, `SecretKey`/`PublicKey` + byte codecs |
 | `bbs.zig` | `Signature`/`Proof` structs + byte codecs (**REAL**); **FABLE CORE:** `sign`/`verify`/`proofGen`/`proofVerify` (implemented) |
 | `gate.zig` | The single switch (`core_implemented`) gating the four cores' KAT tests |
@@ -70,6 +70,20 @@ const proof_ok = try bbs.proofVerify(allocator, pk, proof, header, ph, disclosed
 
 `Signature`/`Proof`'s `toBytes`/`fromBytes` codecs are also usable
 directly (construct a value and round-trip it).
+
+### Ciphersuites
+
+The top-level functions are BLS12-381-SHA-256 (`bbs.sha256`). The draft's
+second suite, BLS12-381-SHAKE-256, has the same four functions:
+
+```zig
+const sk = try bbs.keyGenWith(bbs.ciphersuite.Shake256, key_material, key_info, null);
+const sig = try bbs.shake256.sign(allocator, sk, pk, header, messages);
+const ok = try bbs.shake256.verify(allocator, pk, sig, header, messages);
+// bbs.shake256.proofGen / bbs.shake256.proofVerify likewise.
+```
+
+A signature or proof made under one suite does not verify under the other.
 
 ## Randomness
 

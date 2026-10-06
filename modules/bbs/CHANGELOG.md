@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **ADDED:** the draft's second ciphersuite, **BLS12-381-SHAKE-256**
+  (`BBS_BLS12381G1_XOF:SHAKE-256_SSWU_RO_`, draft-12 §7.2.1): `bbs.shake256.sign/verify/proofGen/
+  proofVerify`, `bbs.Scheme(Suite)`, `bbs.sha256` (= the top-level functions), `keyGenWith(Suite,
+  ..)`, `ciphersuite.Suite(.sha256 / .shake256)` with `ciphersuite.Sha256`/`Shake256` (the old
+  top-level `ciphersuite.*` names stay, as the SHA-256 suite). Byte-exact on all of the draft's
+  SHAKE-256 vectors (§8.3, Appendix D.1: keys, generators, `P1`, message scalars, mocked
+  scalars, hash-to-scalar, 3 valid + 6 invalid signatures, 5 proofs), via the new
+  `bls12_381.hash_to_curve.expandMessageXof`. The SHA-256 path's bytes are unchanged (ctgrind
+  output pin did not move). Scope mvp -> core.
 - **2026-10-06** — **BREAKING (wire format and signatures), API ADDED:** the pin moves from
   draft-irtf-cfrg-bbs-signatures-04 to **-12**, verified byte-exactly against the draft's own
   BLS12-381-SHA-256 vectors (§8.4, Appendix D.2: key pair, generators, message scalars, mocked

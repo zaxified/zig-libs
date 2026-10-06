@@ -226,9 +226,9 @@ fn fromBytesNonzeroScalar(bytes: [Fr.encoded_bytes]u8) BbsError!Fr {
 /// step 6 (draft §3.6.1/§3.6.2/§3.7.1). `generators[0]` is `Q_1`,
 /// `generators[1..]` are `H_1..H_L` (exactly `createGenerators(L + 1)`'s
 /// layout).
-fn computeB(domain: Fr, generators: []const G1.Affine, message_scalars: []const Fr) G1.Jacobian {
+fn computeB(p1: G1.Affine, domain: Fr, generators: []const G1.Affine, message_scalars: []const Fr) G1.Jacobian {
     std.debug.assert(generators.len == message_scalars.len + 1);
-    var b = G1.Jacobian.fromAffine(cs.P1)
+    var b = G1.Jacobian.fromAffine(p1)
         .add(G1.Jacobian.fromAffine(generators[0]).scalarMul(domain));
     for (generators[1..], message_scalars) |h, m| {
         b = b.add(G1.Jacobian.fromAffine(h).scalarMul(m));
@@ -334,14 +334,14 @@ fn msmPublic(allocator: std.mem.Allocator, points: []const G1.Affine, scalars: [
 /// computed via `msmPublic` instead of `computeB`'s sequential loop. See
 /// the section comment above for why this may ONLY be called on public
 /// message scalars (`verify`, never `sign`/`proofGen`).
-fn computeBPublic(allocator: std.mem.Allocator, domain: Fr, generators: []const G1.Affine, message_scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
+fn computeBPublic(allocator: std.mem.Allocator, p1: G1.Affine, domain: Fr, generators: []const G1.Affine, message_scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
     std.debug.assert(generators.len == message_scalars.len + 1);
     const n = generators.len + 1; // + P1
     const points = try allocator.alloc(G1.Affine, n);
     defer allocator.free(points);
     const scalars = try allocator.alloc(Fr, n);
     defer allocator.free(scalars);
-    points[0] = cs.P1;
+    points[0] = p1;
     scalars[0] = Fr.one;
     points[1] = generators[0];
     scalars[1] = domain;
@@ -369,6 +369,7 @@ fn appendU64(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) std.
 /// index is followed by ITS message (draft-04 listed all indexes, then all
 /// messages, and put the points first).
 fn calculateChallenge(
+    comptime Suite: type,
     allocator: std.mem.Allocator,
     points: [5]G1.Affine, // Abar, Bbar, D, T1, T2
     disclosed_indexes: []const usize,
@@ -388,7 +389,7 @@ fn calculateChallenge(
     try buf.appendSlice(allocator, &domain.toBytes());
     try appendU64(&buf, allocator, ph.len);
     try buf.appendSlice(allocator, ph);
-    return cs.hashToScalar(buf.items, cs.h2s_dst);
+    return Suite.hashToScalar(buf.items, Suite.h2s_dst);
 }
 
 /// The ascending complement of `disclosed_indexes` within `0..total` —
@@ -424,235 +425,6 @@ fn negBp2() G2.Affine {
 
 // ── the four Fable-hard cores ────────────────────────────────────────────
 
-/// FABLE CORE — `Sign(SK, PK, header, messages)` (draft-12 §3.5.1
-/// Interface wrapping §3.6.1's `CoreSign`).
-///
-/// Construction (draft §3.5.1 + §3.6.1, composed):
-/// ```
-/// 1. message_scalars = ciphersuite.messagesToScalars(allocator, messages)   // [msg_1..msg_L]
-/// 2. generators = ciphersuite.createGenerators(allocator, messages.len + 1)
-///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
-/// 3. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
-/// 4. e = hash_to_scalar(serialize((sk, msg_1, .., msg_L, domain)), h2s_dst)
-///    // "serialize" per draft §4.2.4.1: each scalar as I2OSP(.., 32),
-///    // concatenated. draft-12 puts `domain` LAST (draft-04: right after
-///    // `sk`, with a `comm` slot that was always empty here).
-/// 5. B = P1 + [domain]Q_1 + sum_i [msg_i]H_i        (Jacobian accumulation,
-///                                                     P1 = ciphersuite.P1)
-/// 6. A = [(sk + e)^-1] B
-/// 7. return Signature{ .a = A.toAffine(), .e = e }.toBytes()
-/// ```
-/// Byte-exact against draft-12 §8.4.4 (single and ten messages) and
-/// Appendix D.2.1.1 (no header) — see `kat_test.zig`.
-pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
-    const message_scalars = try cs.messagesToScalars(allocator, messages);
-    defer allocator.free(message_scalars);
-    const generators = try cs.createGenerators(allocator, messages.len + 1);
-    defer allocator.free(generators);
-    const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
-
-    // e = hash_to_scalar(serialize((SK, msg_1, .., msg_L, domain)),
-    // api_id || "H2S_") — draft-12 §3.6.1 step 2; `serialize` per §4.2.4.1
-    // is each scalar's 32-byte big-endian encoding, concatenated.
-    var e_input: std.ArrayList(u8) = .empty;
-    defer {
-        std.crypto.secureZero(u8, e_input.items); // holds SK
-        e_input.deinit(allocator);
-    }
-    try e_input.appendSlice(allocator, &sk.toBytes());
-    for (message_scalars) |m| try e_input.appendSlice(allocator, &m.toBytes());
-    try e_input.appendSlice(allocator, &domain.toBytes());
-    const e = cs.hashToScalar(e_input.items, cs.h2s_dst);
-
-    // B = P1 + [domain]Q_1 + sum_i [msg_i]H_i ;  A = [(SK + e)^-1]B.
-    const b = computeB(domain, generators, message_scalars);
-    // `SK + e == 0` needs hash_to_scalar's output to equal `-SK` —
-    // probability ~2^-255 (breaking SHA-256), same "astronomically
-    // unlikely, surfaced as an error rather than UB" posture as
-    // `keys.KeyGenError.InvalidSecretKey`. Likewise `A == Identity_G1`
-    // (only when `B` is the identity — a degenerate message/domain
-    // combination) cannot be encoded as a valid signature
-    // (`Signature.fromBytes` rejects it), so it fails here, closed.
-    const sk_plus_e_inv = sk.scalar.add(e).inv() catch return error.InvalidSignatureEncoding;
-    const a = b.scalarMul(sk_plus_e_inv).toAffine();
-    if (a.infinity) return error.InvalidSignatureEncoding;
-    return (Signature{ .a = a, .e = e }).toBytes();
-}
-
-/// FABLE CORE — `Verify(PK, signature, header, messages)` (draft §3.5.2
-/// wrapping §3.6.2's `CoreVerify`).
-///
-/// Construction (draft §3.5.2 + §3.6.2, composed):
-/// ```
-/// 1. (A, e) = Signature.fromBytes(signature)   // rejects malformed input
-/// 2. message_scalars = ciphersuite.messagesToScalars(allocator, messages)
-/// 3. generators = ciphersuite.createGenerators(allocator, messages.len + 1)
-///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
-/// 4. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
-/// 5. B = P1 + [domain]Q_1 + sum_i [msg_i]H_i
-/// 6. return pairing.pairingCheck(&.{
-///        .{ .p = A,  .q = (pk.point + [e]BP2) },
-///        .{ .p = B,  .q = -BP2 },
-///    })    // e(A, W + [e]BP2) * e(B, -BP2) == 1  <=>  e(A,W+[e]BP2) == e(B,BP2)
-/// ```
-/// Total/fail-closed on malformed `signature` bytes (returns `false`,
-/// not an error — draft §3.6.2 steps 1-2's "if signature_result is
-/// INVALID, return INVALID" maps to a boolean `false` result at the
-/// Interface layer, matching `bls12_381.bls_sig`'s verify-family
-/// convention of never panicking on attacker-controlled input). The six
-/// invalid cases of draft-12 Appendix D.2.1 (modified, extra, missing and
-/// reordered messages, wrong public key, wrong header) are pinned in
-/// `kat_test.zig`.
-pub fn verify(allocator: std.mem.Allocator, pk: PublicKey, signature: [Signature.encoded_bytes]u8, header: []const u8, messages: []const []const u8) BbsError!bool {
-    // Fail-closed on malformed signature bytes (draft §3.6.2 steps 1-2's
-    // "return INVALID" — a boolean `false` at this Interface layer).
-    const sig = Signature.fromBytes(signature) catch return false;
-
-    const message_scalars = try cs.messagesToScalars(allocator, messages);
-    defer allocator.free(message_scalars);
-    const generators = try cs.createGenerators(allocator, messages.len + 1);
-    defer allocator.free(generators);
-    const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
-    // `message_scalars` here are the caller's OWN plaintext messages
-    // (non-selective CoreVerify) — public to this call, so the
-    // MSM-crossover path (`computeBPublic`) is safe; see the section
-    // comment above `computeBPublic`'s definition.
-    const b = (try computeBPublic(allocator, domain, generators, message_scalars)).toAffine();
-
-    // e(A, W + [e]BP2) == e(B, BP2)  <=>
-    // e(A, W + [e]BP2) * e(B, -BP2) == 1  (draft §3.6.2 step 6).
-    const w_plus_e_bp2 = G2.Jacobian.fromAffine(pk.point)
-        .add(G2.Jacobian.fromAffine(cs.BP2).scalarMul(sig.e))
-        .toAffine();
-    return cs.pairing.pairingCheck(&.{
-        .{ .p = sig.a, .q = w_plus_e_bp2 },
-        .{ .p = b, .q = negBp2() },
-    });
-}
-
-/// FABLE CORE — `ProofGen(PK, signature, header, ph, messages,
-/// disclosed_indexes, random_scalars)` (draft-12 §3.5.3 wrapping §3.6.3's
-/// `CoreProofGen`, itself `ProofInit` (§3.7.1) + `ProofChallengeCalculate`
-/// (§3.7.4) + `ProofFinalize` (§3.7.2)) — **the module's genuinely hard
-/// core**, see this file's module doc comment.
-///
-/// `random_scalars.len` MUST be exactly `randomScalarCount(U) = 5 + U`
-/// (`U = messages.len - disclosed_indexes.len`) — see this file's module
-/// doc comment for why this is an explicit parameter rather than internal
-/// entropy; `ciphersuite.mockedRandomScalars`/`calculateRandomScalars` are
-/// the two intended sources.
-///
-/// Construction (draft-12 §3.6.3 + §3.7.1 + §3.7.4 + §3.7.2, composed;
-/// `L = messages.len`, `R = disclosed_indexes.len`, `U = L - R`,
-/// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, both ascending):
-/// ```
-/// 1. (A, e) = Signature.fromBytes(signature)
-/// 2. message_scalars = messagesToScalars(messages); generators = createGenerators(L + 1)
-/// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
-///
-/// -- ProofInit (§3.7.1) --
-/// 4. (r1, r2, e~, r1~, r3~, m~_j1, .., m~_jU) = random_scalars
-/// 5. B    = P1 + [domain]Q_1 + sum_i [msg_i]H_i
-/// 6. D    = [r2]B
-/// 7. Abar = [r1 * r2]A
-/// 8. Bbar = [r1]D - [e]Abar
-/// 9. T1   = [e~]Abar + [r1~]D
-/// 10. T2  = [r3~]D + sum_{j in undisclosed} [m~_j]H_j
-///
-/// -- ProofChallengeCalculate (§3.7.4) --
-/// 11. c = hash_to_scalar(serialize((R, i1, msg_i1, .., Abar, Bbar, D, T1, T2, domain))
-///                        || I2OSP(len(ph), 8) || ph)
-///
-/// -- ProofFinalize (§3.7.2) --
-/// 12. r3  = r2^-1
-/// 13. e^  = e~ + e * c;  r1^ = r1~ - r1 * c;  r3^ = r3~ - r3 * c
-/// 14. m^_j = m~_j + msg_j * c   for j in undisclosed (in order)
-/// 15. return proof_to_octets((Abar, Bbar, D, e^, r1^, r3^, m^, c))
-/// ```
-/// Byte-exact (under the draft's mocked RNG, `kat_vectors.mocked_rng`)
-/// against draft-12 §8.4.5 and Appendix D.2.2 — see `kat_test.zig`.
-pub fn proofGen(
-    allocator: std.mem.Allocator,
-    pk: PublicKey,
-    signature: [Signature.encoded_bytes]u8,
-    header: []const u8,
-    ph: []const u8,
-    messages: []const []const u8,
-    disclosed_indexes: []const usize,
-    random_scalars: []const Fr,
-) BbsError![]u8 {
-    if (disclosed_indexes.len > messages.len) return error.TooManyDisclosedIndexes;
-    for (disclosed_indexes) |i| if (i >= messages.len) return error.DisclosedIndexOutOfRange;
-    const undisclosed_count = messages.len - disclosed_indexes.len;
-    if (random_scalars.len != randomScalarCount(undisclosed_count)) return error.RandomScalarCountMismatch;
-
-    const sig = try Signature.fromBytes(signature);
-
-    const message_scalars = try cs.messagesToScalars(allocator, messages);
-    defer allocator.free(message_scalars);
-    const generators = try cs.createGenerators(allocator, messages.len + 1);
-    defer allocator.free(generators);
-    const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
-
-    const undisclosed = try undisclosedIndexes(allocator, messages.len, disclosed_indexes);
-    defer allocator.free(undisclosed);
-    // A DUPLICATE disclosed index makes the true undisclosed count exceed
-    // `L - R`, so `random_scalars.len == 5 + (L - R)` can no longer be
-    // the right count for the actual undisclosed set — surfaced as the
-    // same count-mismatch error.
-    if (undisclosed.len != undisclosed_count) return error.RandomScalarCountMismatch;
-
-    // -- ProofInit (draft-12 §3.7.1) --
-    const r1 = random_scalars[0];
-    const r2 = random_scalars[1];
-    const e_tilde = random_scalars[2];
-    const r1_tilde = random_scalars[3];
-    const r3_tilde = random_scalars[4];
-    const m_tilde = random_scalars[5..];
-    // `r2 == 0` is not a valid random-scalar draw (probability ~2^-255
-    // from either blessed source) and would make `D` the identity and
-    // `r3 = r2^-1` undefined; `r1 == 0` would make `Abar` the identity.
-    // Both are refused as malformed `random_scalars` rather than UB.
-    const r3 = r2.inv() catch return error.RandomScalarCountMismatch;
-    if (r1.isZero()) return error.RandomScalarCountMismatch;
-
-    // Every multiplication below involves a secret (the signature, the
-    // undisclosed messages folded into `B`, or a blinding scalar), so all
-    // of them use `bls12_381`'s constant-time `scalarMul` — never the
-    // variable-time MSM (see the section comment above `msmPublic`).
-    const b = computeB(domain, generators, message_scalars);
-    const d_j = b.scalarMul(r2);
-    const abar_j = G1.Jacobian.fromAffine(sig.a).scalarMul(r1.mul(r2));
-    const bbar_j = d_j.scalarMul(r1).add(abar_j.scalarMul(sig.e).negate());
-    const t1_j = abar_j.scalarMul(e_tilde).add(d_j.scalarMul(r1_tilde));
-    var t2_j = d_j.scalarMul(r3_tilde);
-    for (undisclosed, m_tilde) |j, mt| {
-        t2_j = t2_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mt));
-    }
-    const abar = abar_j.toAffine();
-    const bbar = bbar_j.toAffine();
-    const d = d_j.toAffine();
-
-    // -- ProofChallengeCalculate (draft-12 §3.7.4) --
-    const disclosed_scalars = try allocator.alloc(Fr, disclosed_indexes.len);
-    defer allocator.free(disclosed_scalars);
-    for (disclosed_indexes, disclosed_scalars) |i, *s| s.* = message_scalars[i];
-    const challenge = try calculateChallenge(allocator, .{ abar, bbar, d, t1_j.toAffine(), t2_j.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
-
-    // -- ProofFinalize (draft-12 §3.7.2) --
-    const e_hat = e_tilde.add(sig.e.mul(challenge));
-    const r1_hat = r1_tilde.sub(r1.mul(challenge));
-    const r3_hat = r3_tilde.sub(r3.mul(challenge));
-    const m_hat = try allocator.alloc(Fr, undisclosed.len);
-    defer allocator.free(m_hat);
-    for (undisclosed, m_tilde, m_hat) |j, mt, *mh| {
-        mh.* = mt.add(message_scalars[j].mul(challenge));
-    }
-
-    const out: Proof = .{ .abar = abar, .bbar = bbar, .d = d, .e_hat = e_hat, .r1_hat = r1_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = challenge };
-    return try out.toBytes(allocator);
-}
-
 /// `ProofVerifyInit` (draft-12 §3.7.3) steps 2-4, MSM-crossover form:
 /// ```
 /// T1 = [c]Bbar + [e^]Abar + [r1^]D
@@ -666,6 +438,7 @@ pub fn proofGen(
 /// variable-time MSM safe here (unlike `sign`/`proofGen`).
 fn proofVerifyInit(
     allocator: std.mem.Allocator,
+    p1: G1.Affine,
     generators: []const G1.Affine,
     domain: Fr,
     disclosed_indexes: []const usize,
@@ -681,7 +454,7 @@ fn proofVerifyInit(
     defer allocator.free(bv_points);
     const bv_scalars = try allocator.alloc(Fr, disclosed_indexes.len + 2);
     defer allocator.free(bv_scalars);
-    bv_points[0] = cs.P1;
+    bv_points[0] = p1;
     bv_scalars[0] = Fr.one;
     bv_points[1] = generators[0];
     bv_scalars[1] = domain;
@@ -706,84 +479,334 @@ fn proofVerifyInit(
     return .{ .t1 = t1, .t2 = try msmPublic(allocator, t2_points, t2_scalars) };
 }
 
-/// FABLE CORE — `ProofVerify(PK, proof, header, ph, disclosed_messages,
-/// disclosed_indexes)` (draft-12 §3.5.4 wrapping §3.6.4's
-/// `CoreProofVerify`, itself `ProofVerifyInit` (§3.7.3) +
-/// `ProofChallengeCalculate` (§3.7.4)).
-///
-/// `disclosed_messages.len` MUST equal `disclosed_indexes.len`
-/// (`error.DisclosedMessageCountMismatch` otherwise). `L` and `U` are
-/// recovered without an explicit parameter: `U = Proof.fromBytes`'s
-/// derived `m_hat.len`, `L = disclosed_indexes.len + U` (§3.7.3 steps 1-4).
-///
-/// Construction (draft-12 §3.6.4 + §3.7.3 + §3.7.4, composed;
-/// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, ascending):
-/// ```
-/// 1. (Abar, Bbar, D, e^, r1^, r3^, m^, cp) = Proof.fromBytes(proof)
-/// 2. disclosed_scalars = messagesToScalars(disclosed_messages); generators = createGenerators(L + 1)
-/// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
-///
-/// -- ProofVerifyInit (§3.7.3) --
-/// 4. T1 = [cp]Bbar + [e^]Abar + [r1^]D
-/// 5. Bv = P1 + [domain]Q_1 + sum_{i in disclosed} [msg_i]H_i
-/// 6. T2 = [cp]Bv + [r3^]D + sum_{j in undisclosed} [m^_j]H_j
-///
-/// -- ProofChallengeCalculate (§3.7.4) — MUST reproduce cp --
-/// 7. if hash_to_scalar(... Abar, Bbar, D, T1, T2, domain ... ph) != cp, return false
-///
-/// -- pairing check --
-/// 8. return e(Abar, W) * e(Bbar, -BP2) == 1
-/// ```
-/// Total/fail-closed on malformed `proof` bytes (returns `false`).
-pub fn proofVerify(
-    allocator: std.mem.Allocator,
-    pk: PublicKey,
-    proof: []const u8,
-    header: []const u8,
-    ph: []const u8,
-    disclosed_messages: []const []const u8,
-    disclosed_indexes: []const usize,
-) BbsError!bool {
-    if (disclosed_messages.len != disclosed_indexes.len) return error.DisclosedMessageCountMismatch;
+/// The four BBS cores for one ciphersuite (`ciphersuite.Sha256` or
+/// `ciphersuite.Shake256`, draft-12 §7.2). `Signature`/`Proof` and their
+/// codecs are suite-independent.
+pub fn Scheme(comptime Suite: type) type {
+    return struct {
+        pub const suite = Suite;
 
-    // Fail-closed on malformed proof bytes (draft §3.6.4 steps 1-2's
-    // "return INVALID"); only a genuine allocation failure propagates.
-    const parsed = Proof.fromBytes(allocator, proof) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
+        /// FABLE CORE — `Sign(SK, PK, header, messages)` (draft-12 §3.5.1
+        /// Interface wrapping §3.6.1's `CoreSign`).
+        ///
+        /// Construction (draft §3.5.1 + §3.6.1, composed):
+        /// ```
+        /// 1. message_scalars = ciphersuite.messagesToScalars(allocator, messages)   // [msg_1..msg_L]
+        /// 2. generators = ciphersuite.createGenerators(allocator, messages.len + 1)
+        ///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
+        /// 3. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
+        /// 4. e = hash_to_scalar(serialize((sk, msg_1, .., msg_L, domain)), h2s_dst)
+        ///    // "serialize" per draft §4.2.4.1: each scalar as I2OSP(.., 32),
+        ///    // concatenated. draft-12 puts `domain` LAST (draft-04: right after
+        ///    // `sk`, with a `comm` slot that was always empty here).
+        /// 5. B = P1 + [domain]Q_1 + sum_i [msg_i]H_i        (Jacobian accumulation,
+        ///                                                     P1 = ciphersuite.P1)
+        /// 6. A = [(sk + e)^-1] B
+        /// 7. return Signature{ .a = A.toAffine(), .e = e }.toBytes()
+        /// ```
+        /// Byte-exact against draft-12 §8.4.4 (single and ten messages) and
+        /// Appendix D.2.1.1 (no header) — see `kat_test.zig`.
+        pub fn sign(allocator: std.mem.Allocator, sk: SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
+            const message_scalars = try Suite.messagesToScalars(allocator, messages);
+            defer allocator.free(message_scalars);
+            const generators = try Suite.createGenerators(allocator, messages.len + 1);
+            defer allocator.free(generators);
+            const domain = try Suite.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
+
+            // e = hash_to_scalar(serialize((SK, msg_1, .., msg_L, domain)),
+            // api_id || "H2S_") — draft-12 §3.6.1 step 2; `serialize` per §4.2.4.1
+            // is each scalar's 32-byte big-endian encoding, concatenated.
+            var e_input: std.ArrayList(u8) = .empty;
+            defer {
+                std.crypto.secureZero(u8, e_input.items); // holds SK
+                e_input.deinit(allocator);
+            }
+            try e_input.appendSlice(allocator, &sk.toBytes());
+            for (message_scalars) |m| try e_input.appendSlice(allocator, &m.toBytes());
+            try e_input.appendSlice(allocator, &domain.toBytes());
+            const e = Suite.hashToScalar(e_input.items, Suite.h2s_dst);
+
+            // B = P1 + [domain]Q_1 + sum_i [msg_i]H_i ;  A = [(SK + e)^-1]B.
+            const b = computeB(Suite.P1, domain, generators, message_scalars);
+            // `SK + e == 0` needs hash_to_scalar's output to equal `-SK` —
+            // probability ~2^-255 (breaking SHA-256), same "astronomically
+            // unlikely, surfaced as an error rather than UB" posture as
+            // `keys.KeyGenError.InvalidSecretKey`. Likewise `A == Identity_G1`
+            // (only when `B` is the identity — a degenerate message/domain
+            // combination) cannot be encoded as a valid signature
+            // (`Signature.fromBytes` rejects it), so it fails here, closed.
+            const sk_plus_e_inv = sk.scalar.add(e).inv() catch return error.InvalidSignatureEncoding;
+            const a = b.scalarMul(sk_plus_e_inv).toAffine();
+            if (a.infinity) return error.InvalidSignatureEncoding;
+            return (Signature{ .a = a, .e = e }).toBytes();
+        }
+
+        /// FABLE CORE — `Verify(PK, signature, header, messages)` (draft §3.5.2
+        /// wrapping §3.6.2's `CoreVerify`).
+        ///
+        /// Construction (draft §3.5.2 + §3.6.2, composed):
+        /// ```
+        /// 1. (A, e) = Signature.fromBytes(signature)   // rejects malformed input
+        /// 2. message_scalars = ciphersuite.messagesToScalars(allocator, messages)
+        /// 3. generators = ciphersuite.createGenerators(allocator, messages.len + 1)
+        ///    (Q_1, H_1, ..., H_L) = (generators[0], generators[1..])
+        /// 4. domain = ciphersuite.calculateDomain(allocator, pk.toBytes(), Q_1, H_1..H_L, header)
+        /// 5. B = P1 + [domain]Q_1 + sum_i [msg_i]H_i
+        /// 6. return pairing.pairingCheck(&.{
+        ///        .{ .p = A,  .q = (pk.point + [e]BP2) },
+        ///        .{ .p = B,  .q = -BP2 },
+        ///    })    // e(A, W + [e]BP2) * e(B, -BP2) == 1  <=>  e(A,W+[e]BP2) == e(B,BP2)
+        /// ```
+        /// Total/fail-closed on malformed `signature` bytes (returns `false`,
+        /// not an error — draft §3.6.2 steps 1-2's "if signature_result is
+        /// INVALID, return INVALID" maps to a boolean `false` result at the
+        /// Interface layer, matching `bls12_381.bls_sig`'s verify-family
+        /// convention of never panicking on attacker-controlled input). The six
+        /// invalid cases of draft-12 Appendix D.2.1 (modified, extra, missing and
+        /// reordered messages, wrong public key, wrong header) are pinned in
+        /// `kat_test.zig`.
+        pub fn verify(allocator: std.mem.Allocator, pk: PublicKey, signature: [Signature.encoded_bytes]u8, header: []const u8, messages: []const []const u8) BbsError!bool {
+            // Fail-closed on malformed signature bytes (draft §3.6.2 steps 1-2's
+            // "return INVALID" — a boolean `false` at this Interface layer).
+            const sig = Signature.fromBytes(signature) catch return false;
+
+            const message_scalars = try Suite.messagesToScalars(allocator, messages);
+            defer allocator.free(message_scalars);
+            const generators = try Suite.createGenerators(allocator, messages.len + 1);
+            defer allocator.free(generators);
+            const domain = try Suite.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
+            // `message_scalars` here are the caller's OWN plaintext messages
+            // (non-selective CoreVerify) — public to this call, so the
+            // MSM-crossover path (`computeBPublic`) is safe; see the section
+            // comment above `computeBPublic`'s definition.
+            const b = (try computeBPublic(allocator, Suite.P1, domain, generators, message_scalars)).toAffine();
+
+            // e(A, W + [e]BP2) == e(B, BP2)  <=>
+            // e(A, W + [e]BP2) * e(B, -BP2) == 1  (draft §3.6.2 step 6).
+            const w_plus_e_bp2 = G2.Jacobian.fromAffine(pk.point)
+                .add(G2.Jacobian.fromAffine(cs.BP2).scalarMul(sig.e))
+                .toAffine();
+            return cs.pairing.pairingCheck(&.{
+                .{ .p = sig.a, .q = w_plus_e_bp2 },
+                .{ .p = b, .q = negBp2() },
+            });
+        }
+
+        /// FABLE CORE — `ProofGen(PK, signature, header, ph, messages,
+        /// disclosed_indexes, random_scalars)` (draft-12 §3.5.3 wrapping §3.6.3's
+        /// `CoreProofGen`, itself `ProofInit` (§3.7.1) + `ProofChallengeCalculate`
+        /// (§3.7.4) + `ProofFinalize` (§3.7.2)) — **the module's genuinely hard
+        /// core**, see this file's module doc comment.
+        ///
+        /// `random_scalars.len` MUST be exactly `randomScalarCount(U) = 5 + U`
+        /// (`U = messages.len - disclosed_indexes.len`) — see this file's module
+        /// doc comment for why this is an explicit parameter rather than internal
+        /// entropy; `ciphersuite.mockedRandomScalars`/`calculateRandomScalars` are
+        /// the two intended sources.
+        ///
+        /// Construction (draft-12 §3.6.3 + §3.7.1 + §3.7.4 + §3.7.2, composed;
+        /// `L = messages.len`, `R = disclosed_indexes.len`, `U = L - R`,
+        /// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, both ascending):
+        /// ```
+        /// 1. (A, e) = Signature.fromBytes(signature)
+        /// 2. message_scalars = messagesToScalars(messages); generators = createGenerators(L + 1)
+        /// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
+        ///
+        /// -- ProofInit (§3.7.1) --
+        /// 4. (r1, r2, e~, r1~, r3~, m~_j1, .., m~_jU) = random_scalars
+        /// 5. B    = P1 + [domain]Q_1 + sum_i [msg_i]H_i
+        /// 6. D    = [r2]B
+        /// 7. Abar = [r1 * r2]A
+        /// 8. Bbar = [r1]D - [e]Abar
+        /// 9. T1   = [e~]Abar + [r1~]D
+        /// 10. T2  = [r3~]D + sum_{j in undisclosed} [m~_j]H_j
+        ///
+        /// -- ProofChallengeCalculate (§3.7.4) --
+        /// 11. c = hash_to_scalar(serialize((R, i1, msg_i1, .., Abar, Bbar, D, T1, T2, domain))
+        ///                        || I2OSP(len(ph), 8) || ph)
+        ///
+        /// -- ProofFinalize (§3.7.2) --
+        /// 12. r3  = r2^-1
+        /// 13. e^  = e~ + e * c;  r1^ = r1~ - r1 * c;  r3^ = r3~ - r3 * c
+        /// 14. m^_j = m~_j + msg_j * c   for j in undisclosed (in order)
+        /// 15. return proof_to_octets((Abar, Bbar, D, e^, r1^, r3^, m^, c))
+        /// ```
+        /// Byte-exact (under the draft's mocked RNG, `kat_vectors.mocked_rng`)
+        /// against draft-12 §8.4.5 and Appendix D.2.2 — see `kat_test.zig`.
+        pub fn proofGen(
+            allocator: std.mem.Allocator,
+            pk: PublicKey,
+            signature: [Signature.encoded_bytes]u8,
+            header: []const u8,
+            ph: []const u8,
+            messages: []const []const u8,
+            disclosed_indexes: []const usize,
+            random_scalars: []const Fr,
+        ) BbsError![]u8 {
+            if (disclosed_indexes.len > messages.len) return error.TooManyDisclosedIndexes;
+            for (disclosed_indexes) |i| if (i >= messages.len) return error.DisclosedIndexOutOfRange;
+            const undisclosed_count = messages.len - disclosed_indexes.len;
+            if (random_scalars.len != randomScalarCount(undisclosed_count)) return error.RandomScalarCountMismatch;
+
+            const sig = try Signature.fromBytes(signature);
+
+            const message_scalars = try Suite.messagesToScalars(allocator, messages);
+            defer allocator.free(message_scalars);
+            const generators = try Suite.createGenerators(allocator, messages.len + 1);
+            defer allocator.free(generators);
+            const domain = try Suite.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
+
+            const undisclosed = try undisclosedIndexes(allocator, messages.len, disclosed_indexes);
+            defer allocator.free(undisclosed);
+            // A DUPLICATE disclosed index makes the true undisclosed count exceed
+            // `L - R`, so `random_scalars.len == 5 + (L - R)` can no longer be
+            // the right count for the actual undisclosed set — surfaced as the
+            // same count-mismatch error.
+            if (undisclosed.len != undisclosed_count) return error.RandomScalarCountMismatch;
+
+            // -- ProofInit (draft-12 §3.7.1) --
+            const r1 = random_scalars[0];
+            const r2 = random_scalars[1];
+            const e_tilde = random_scalars[2];
+            const r1_tilde = random_scalars[3];
+            const r3_tilde = random_scalars[4];
+            const m_tilde = random_scalars[5..];
+            // `r2 == 0` is not a valid random-scalar draw (probability ~2^-255
+            // from either blessed source) and would make `D` the identity and
+            // `r3 = r2^-1` undefined; `r1 == 0` would make `Abar` the identity.
+            // Both are refused as malformed `random_scalars` rather than UB.
+            const r3 = r2.inv() catch return error.RandomScalarCountMismatch;
+            if (r1.isZero()) return error.RandomScalarCountMismatch;
+
+            // Every multiplication below involves a secret (the signature, the
+            // undisclosed messages folded into `B`, or a blinding scalar), so all
+            // of them use `bls12_381`'s constant-time `scalarMul` — never the
+            // variable-time MSM (see the section comment above `msmPublic`).
+            const b = computeB(Suite.P1, domain, generators, message_scalars);
+            const d_j = b.scalarMul(r2);
+            const abar_j = G1.Jacobian.fromAffine(sig.a).scalarMul(r1.mul(r2));
+            const bbar_j = d_j.scalarMul(r1).add(abar_j.scalarMul(sig.e).negate());
+            const t1_j = abar_j.scalarMul(e_tilde).add(d_j.scalarMul(r1_tilde));
+            var t2_j = d_j.scalarMul(r3_tilde);
+            for (undisclosed, m_tilde) |j, mt| {
+                t2_j = t2_j.add(G1.Jacobian.fromAffine(generators[j + 1]).scalarMul(mt));
+            }
+            const abar = abar_j.toAffine();
+            const bbar = bbar_j.toAffine();
+            const d = d_j.toAffine();
+
+            // -- ProofChallengeCalculate (draft-12 §3.7.4) --
+            const disclosed_scalars = try allocator.alloc(Fr, disclosed_indexes.len);
+            defer allocator.free(disclosed_scalars);
+            for (disclosed_indexes, disclosed_scalars) |i, *s| s.* = message_scalars[i];
+            const challenge = try calculateChallenge(Suite, allocator, .{ abar, bbar, d, t1_j.toAffine(), t2_j.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
+
+            // -- ProofFinalize (draft-12 §3.7.2) --
+            const e_hat = e_tilde.add(sig.e.mul(challenge));
+            const r1_hat = r1_tilde.sub(r1.mul(challenge));
+            const r3_hat = r3_tilde.sub(r3.mul(challenge));
+            const m_hat = try allocator.alloc(Fr, undisclosed.len);
+            defer allocator.free(m_hat);
+            for (undisclosed, m_tilde, m_hat) |j, mt, *mh| {
+                mh.* = mt.add(message_scalars[j].mul(challenge));
+            }
+
+            const out: Proof = .{ .abar = abar, .bbar = bbar, .d = d, .e_hat = e_hat, .r1_hat = r1_hat, .r3_hat = r3_hat, .m_hat = m_hat, .c = challenge };
+            return try out.toBytes(allocator);
+        }
+
+        /// FABLE CORE — `ProofVerify(PK, proof, header, ph, disclosed_messages,
+        /// disclosed_indexes)` (draft-12 §3.5.4 wrapping §3.6.4's
+        /// `CoreProofVerify`, itself `ProofVerifyInit` (§3.7.3) +
+        /// `ProofChallengeCalculate` (§3.7.4)).
+        ///
+        /// `disclosed_messages.len` MUST equal `disclosed_indexes.len`
+        /// (`error.DisclosedMessageCountMismatch` otherwise). `L` and `U` are
+        /// recovered without an explicit parameter: `U = Proof.fromBytes`'s
+        /// derived `m_hat.len`, `L = disclosed_indexes.len + U` (§3.7.3 steps 1-4).
+        ///
+        /// Construction (draft-12 §3.6.4 + §3.7.3 + §3.7.4, composed;
+        /// `undisclosed_indexes = {0..L-1} \ disclosed_indexes`, ascending):
+        /// ```
+        /// 1. (Abar, Bbar, D, e^, r1^, r3^, m^, cp) = Proof.fromBytes(proof)
+        /// 2. disclosed_scalars = messagesToScalars(disclosed_messages); generators = createGenerators(L + 1)
+        /// 3. domain = calculateDomain(PK, Q_1, H_1..H_L, header)
+        ///
+        /// -- ProofVerifyInit (§3.7.3) --
+        /// 4. T1 = [cp]Bbar + [e^]Abar + [r1^]D
+        /// 5. Bv = P1 + [domain]Q_1 + sum_{i in disclosed} [msg_i]H_i
+        /// 6. T2 = [cp]Bv + [r3^]D + sum_{j in undisclosed} [m^_j]H_j
+        ///
+        /// -- ProofChallengeCalculate (§3.7.4) — MUST reproduce cp --
+        /// 7. if hash_to_scalar(... Abar, Bbar, D, T1, T2, domain ... ph) != cp, return false
+        ///
+        /// -- pairing check --
+        /// 8. return e(Abar, W) * e(Bbar, -BP2) == 1
+        /// ```
+        /// Total/fail-closed on malformed `proof` bytes (returns `false`).
+        pub fn proofVerify(
+            allocator: std.mem.Allocator,
+            pk: PublicKey,
+            proof: []const u8,
+            header: []const u8,
+            ph: []const u8,
+            disclosed_messages: []const []const u8,
+            disclosed_indexes: []const usize,
+        ) BbsError!bool {
+            if (disclosed_messages.len != disclosed_indexes.len) return error.DisclosedMessageCountMismatch;
+
+            // Fail-closed on malformed proof bytes (draft §3.6.4 steps 1-2's
+            // "return INVALID"); only a genuine allocation failure propagates.
+            const parsed = Proof.fromBytes(allocator, proof) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
+            defer parsed.deinit(allocator);
+
+            const r_count = disclosed_indexes.len;
+            const u_count = parsed.m_hat.len;
+            const total = r_count + u_count; // L, recovered per draft §3.7.3 steps 1-4
+            for (disclosed_indexes) |i| if (i >= total) return false;
+
+            const undisclosed = try undisclosedIndexes(allocator, total, disclosed_indexes);
+            defer allocator.free(undisclosed);
+            // Duplicate disclosed index => the complement is bigger than U — the
+            // disclosed set cannot belong to this proof. Reject, closed.
+            if (undisclosed.len != u_count) return false;
+
+            const disclosed_scalars = try Suite.messagesToScalars(allocator, disclosed_messages);
+            defer allocator.free(disclosed_scalars);
+            const generators = try Suite.createGenerators(allocator, total + 1);
+            defer allocator.free(generators);
+            const domain = try Suite.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
+
+            // -- ProofVerifyInit (draft-12 §3.7.3) --
+            const init = try proofVerifyInit(allocator, Suite.P1, generators, domain, disclosed_indexes, disclosed_scalars, undisclosed, parsed);
+
+            // -- ProofChallengeCalculate (draft-12 §3.7.4) — MUST reproduce cp --
+            const challenge = try calculateChallenge(Suite, allocator, .{ parsed.abar, parsed.bbar, parsed.d, init.t1.toAffine(), init.t2.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
+            if (!challenge.eql(parsed.c)) return false;
+
+            // -- pairing check: e(Abar, W) * e(Bbar, -BP2) == 1 (draft §3.6.4 step 6) --
+            return cs.pairing.pairingCheck(&.{
+                .{ .p = parsed.abar, .q = pk.point },
+                .{ .p = parsed.bbar, .q = negBp2() },
+            });
+        }
     };
-    defer parsed.deinit(allocator);
-
-    const r_count = disclosed_indexes.len;
-    const u_count = parsed.m_hat.len;
-    const total = r_count + u_count; // L, recovered per draft §3.7.3 steps 1-4
-    for (disclosed_indexes) |i| if (i >= total) return false;
-
-    const undisclosed = try undisclosedIndexes(allocator, total, disclosed_indexes);
-    defer allocator.free(undisclosed);
-    // Duplicate disclosed index => the complement is bigger than U — the
-    // disclosed set cannot belong to this proof. Reject, closed.
-    if (undisclosed.len != u_count) return false;
-
-    const disclosed_scalars = try cs.messagesToScalars(allocator, disclosed_messages);
-    defer allocator.free(disclosed_scalars);
-    const generators = try cs.createGenerators(allocator, total + 1);
-    defer allocator.free(generators);
-    const domain = try cs.calculateDomain(allocator, pk.toBytes(), generators[0], generators[1..], header);
-
-    // -- ProofVerifyInit (draft-12 §3.7.3) --
-    const init = try proofVerifyInit(allocator, generators, domain, disclosed_indexes, disclosed_scalars, undisclosed, parsed);
-
-    // -- ProofChallengeCalculate (draft-12 §3.7.4) — MUST reproduce cp --
-    const challenge = try calculateChallenge(allocator, .{ parsed.abar, parsed.bbar, parsed.d, init.t1.toAffine(), init.t2.toAffine() }, disclosed_indexes, disclosed_scalars, domain, ph);
-    if (!challenge.eql(parsed.c)) return false;
-
-    // -- pairing check: e(Abar, W) * e(Bbar, -BP2) == 1 (draft §3.6.4 step 6) --
-    return cs.pairing.pairingCheck(&.{
-        .{ .p = parsed.abar, .q = pk.point },
-        .{ .p = parsed.bbar, .q = negBp2() },
-    });
 }
+
+/// BLS12-381-SHA-256 (draft-12 §7.2.2).
+pub const sha256 = Scheme(cs.Sha256);
+/// BLS12-381-SHAKE-256 (draft-12 §7.2.1).
+pub const shake256 = Scheme(cs.Shake256);
+
+// The SHA-256 suite under the names this file had before it gained a
+// second suite.
+pub const sign = sha256.sign;
+pub const verify = sha256.verify;
+pub const proofGen = sha256.proofGen;
+pub const proofVerify = sha256.proofVerify;
 
 // ── tests (REAL, ungated — Signature/Proof codec only) ───────────────────
 
@@ -1489,7 +1512,7 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
 
         // The oracle: computeB, UNCHANGED, still `sign`'s/`proofGen`'s only
         // path.
-        const want = computeB(domain, generators, message_scalars).toAffine();
+        const want = computeB(cs.P1, domain, generators, message_scalars).toAffine();
         const want_bytes = G1.toBytesCompressed(want);
 
         // The same (points, scalars) computeBPublic assembles internally.
@@ -1514,7 +1537,7 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
         try testing.expectEqualSlices(u8, &want_bytes, &G1.toBytesCompressed(got_pippenger));
 
         // The actual dispatcher, as `verify` calls it.
-        const got_public = (try computeBPublic(allocator, domain, generators, message_scalars)).toAffine();
+        const got_public = (try computeBPublic(allocator, cs.P1, domain, generators, message_scalars)).toAffine();
         try testing.expectEqualSlices(u8, &want_bytes, &G1.toBytesCompressed(got_public));
     }
 }
@@ -1570,7 +1593,7 @@ test "F4 oracle: proofVerifyInit's MSM form matches the sequential draft-12 form
         const domain = testRandomFr(rand);
 
         const want = proofVerifyInitLoopOracle(generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, proof);
-        const got = try proofVerifyInit(allocator, generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, proof);
+        const got = try proofVerifyInit(allocator, cs.P1, generators, domain, disclosed_indexes.items, disclosed_scalars, undisclosed.items, proof);
         try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t1.toAffine()), &G1.toBytesCompressed(got.t1.toAffine()));
         try testing.expectEqualSlices(u8, &G1.toBytesCompressed(want.t2.toAffine()), &G1.toBytesCompressed(got.t2.toAffine()));
     }

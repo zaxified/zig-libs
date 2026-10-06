@@ -117,6 +117,12 @@ pub const PublicKey = struct {
 /// concatenation plus that call, no ZK judgment. Byte-exact against
 /// draft-12 §8.4.1's key pair (see `kat_test.zig`).
 pub fn keyGen(key_material: []const u8, key_info: []const u8, key_dst: ?[]const u8) KeyGenError!SecretKey {
+    return keyGenWith(cs.Sha256, key_material, key_info, key_dst);
+}
+
+/// `keyGen` under either ciphersuite (`cs.Sha256` / `cs.Shake256`): the
+/// suite fixes the default `key_dst` and the `hash_to_scalar` expander.
+pub fn keyGenWith(comptime Suite: type, key_material: []const u8, key_info: []const u8, key_dst: ?[]const u8) KeyGenError!SecretKey {
     if (key_material.len < 32) return error.KeyMaterialTooShort;
     if (key_info.len > 65535) return error.KeyInfoTooLong;
     if (key_material.len + 2 + key_info.len > max_derive_input_len) return error.DeriveInputTooLong;
@@ -127,8 +133,8 @@ pub fn keyGen(key_material: []const u8, key_info: []const u8, key_dst: ?[]const 
     @memcpy(buf[key_material.len + 2 ..][0..key_info.len], key_info);
     const derive_input = buf[0 .. key_material.len + 2 + key_info.len];
 
-    const dst = key_dst orelse cs.keygen_dst;
-    const sk = cs.hashToScalar(derive_input, dst);
+    const dst = key_dst orelse Suite.keygen_dst;
+    const sk = Suite.hashToScalar(derive_input, dst);
     if (sk.isZero()) return error.InvalidSecretKey;
     return .{ .scalar = sk };
 }

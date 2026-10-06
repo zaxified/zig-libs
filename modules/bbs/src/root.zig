@@ -90,10 +90,21 @@ pub const verify = bbs_mod.verify;
 pub const proofGen = bbs_mod.proofGen;
 /// FABLE CORE — see `bbs.zig`.
 pub const proofVerify = bbs_mod.proofVerify;
+/// `randomScalarCount(U)` — how many random scalars `proofGen` takes.
+pub const randomScalarCount = bbs_mod.randomScalarCount;
+/// The four cores for one ciphersuite; `sign`/`verify`/`proofGen`/
+/// `proofVerify` above are `sha256`'s.
+pub const Scheme = bbs_mod.Scheme;
+/// BLS12-381-SHA-256 (draft-12 §7.2.2) — the default suite.
+pub const sha256 = bbs_mod.sha256;
+/// BLS12-381-SHAKE-256 (draft-12 §7.2.1).
+pub const shake256 = bbs_mod.shake256;
 
 pub const SecretKey = keys.SecretKey;
 pub const PublicKey = keys.PublicKey;
 pub const keyGen = keys.keyGen;
+/// `keyGen` under a chosen suite (`ciphersuite.Sha256` / `ciphersuite.Shake256`).
+pub const keyGenWith = keys.keyGenWith;
 pub const skToPk = keys.skToPk;
 
 /// Re-exported: the sibling module this module builds on.

@@ -228,6 +228,48 @@ pub fn expandMessageXmdParts(comptime len_in_bytes: usize, parts: []const []cons
     return out;
 }
 
+/// Which RFC 9380 §5.3 `expand_message` a hash-to-field runs: the XMD
+/// expander over SHA-256 (every RFC 9380 BLS12-381 suite) or the XOF
+/// expander over SHAKE-256 (the `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite
+/// draft-irtf-cfrg-bbs-signatures Appendix A defines for BBS).
+pub const Expander = enum { xmd_sha256, xof_shake256 };
+
+/// `expand_message_xof` (RFC 9380 §5.3.2) with SHAKE-256:
+/// ```
+/// DST_prime     = DST || I2OSP(len(DST), 1)
+/// msg_prime     = msg || I2OSP(len_in_bytes, 2) || DST_prime
+/// uniform_bytes = SHAKE256(msg_prime, len_in_bytes)
+/// ```
+/// `dst.len` MUST be `<= 255` (as for `expandMessageXmd`; the §5.3.3
+/// long-DST rehash is not implemented). Verified byte-exact against RFC
+/// 9380 Appendix K.6 at `len_in_bytes` 0x20 and 0x80.
+pub fn expandMessageXof(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
+    return expandMessageXofParts(len_in_bytes, &.{msg}, dst);
+}
+
+/// `expandMessageXof` over a message given as consecutive parts.
+pub fn expandMessageXofParts(comptime len_in_bytes: usize, parts: []const []const u8, dst: []const u8) [len_in_bytes]u8 {
+    comptime std.debug.assert(len_in_bytes > 0 and len_in_bytes <= 65535);
+    std.debug.assert(dst.len <= 255);
+    var h = std.crypto.hash.sha3.Shake256.init(.{});
+    for (parts) |part| h.update(part);
+    var l_i_b_str: [2]u8 = undefined;
+    std.mem.writeInt(u16, &l_i_b_str, len_in_bytes, .big);
+    h.update(&l_i_b_str);
+    h.update(dst);
+    h.update(&[_]u8{@intCast(dst.len)});
+    var out: [len_in_bytes]u8 = undefined;
+    h.squeeze(&out);
+    return out;
+}
+
+fn expandParts(comptime expander: Expander, comptime len_in_bytes: usize, parts: []const []const u8, dst: []const u8) [len_in_bytes]u8 {
+    return switch (expander) {
+        .xmd_sha256 => expandMessageXmdParts(len_in_bytes, parts, dst),
+        .xof_shake256 => expandMessageXofParts(len_in_bytes, parts, dst),
+    };
+}
+
 // ── hash_to_field (RFC 9380 §5.2) — REAL ────────────────────────────────
 
 /// `L` for BLS12-381 (RFC 9380 §8.8.1/§8.8.2, both `G1` and `G2`):
@@ -265,7 +307,13 @@ pub fn hashToFieldFp(comptime count: usize, msg: []const u8, dst: []const u8) [c
 
 /// `hashToFieldFp` over a message given as parts (`expandMessageXmdParts`).
 pub fn hashToFieldFpParts(comptime count: usize, parts: []const []const u8, dst: []const u8) [count]Fp {
-    const uniform = expandMessageXmdParts(count * l_bytes, parts, dst);
+    return hashToFieldFpPartsWith(.xmd_sha256, count, parts, dst);
+}
+
+/// `hashToFieldFpParts` under either expander (`L = 64` for both: `k =
+/// 128` for the SHAKE-256 suite as for SHA-256).
+pub fn hashToFieldFpPartsWith(comptime expander: Expander, comptime count: usize, parts: []const []const u8, dst: []const u8) [count]Fp {
+    const uniform = expandParts(expander, count * l_bytes, parts, dst);
     var out: [count]Fp = undefined;
     inline for (0..count) |i| {
         out[i] = reduceWideToFp(uniform[i * l_bytes ..][0..l_bytes].*);
@@ -742,7 +790,15 @@ pub fn hashToCurveG1(msg: []const u8, dst: []const u8) g1.Affine {
 
 /// `hashToCurveG1` of `parts[0] || parts[1] || ...`, without concatenating.
 pub fn hashToCurveG1Parts(parts: []const []const u8, dst: []const u8) g1.Affine {
-    const u = hashToFieldFpParts(2, parts, dst);
+    return hashToCurveG1PartsWith(.xmd_sha256, parts, dst);
+}
+
+/// `hashToCurveG1Parts` under either expander: `.xof_shake256` is the
+/// `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite (draft-irtf-cfrg-bbs-signatures
+/// Appendix A.1) — the same map, isogeny and `h_eff`, only
+/// `expand_message` differs.
+pub fn hashToCurveG1PartsWith(comptime expander: Expander, parts: []const []const u8, dst: []const u8) g1.Affine {
+    const u = hashToFieldFpPartsWith(expander, 2, parts, dst);
     const q0 = g1.Jacobian.fromAffine(mapToCurveG1(u[0]));
     const q1 = g1.Jacobian.fromAffine(mapToCurveG1(u[1]));
     return q0.add(q1).scalarMulBytes(&g1_h_eff_bytes).toAffine();
@@ -1312,4 +1368,30 @@ test "hashToCurve*Parts equals hashToCurve* over the concatenation, wherever the
     // Swapped halves: a different message, a different point.
     const swapped = [_][]const u8{ msg[17..], msg[0..17] };
     try std.testing.expect(!std.mem.eql(u8, &g1.toBytesCompressed(want1), &g1.toBytesCompressed(hashToCurveG1Parts(&swapped, dst))));
+}
+
+test "expandMessageXof(SHAKE-256) matches RFC 9380 Appendix K.6" {
+    const dst = "QUUX-V01-CS02-with-expander-SHAKE256";
+    const cases = [_]struct { msg: []const u8, short: []const u8, long: []const u8 }{
+        .{
+            .msg = "abc",
+            .short = "b39e493867e2767216792abce1f2676c197c0692aed061560ead251821808e07",
+            .long = "a54303e6b172909783353ab05ef08dd435a558c3197db0c132134649708e0b9b4e34fb99b92a9e9e28fc1f1d8860d85897a8e021e6382f3eea10577f968ff6df6c45fe624ce65ca25932f679a42a404bc3681efe03fcd45ef73bb3a8f79ba784f80f55ea8a3c367408f30381299617f50c8cf8fbb21d0f1e1d70b0131a7b6fbe",
+        },
+        .{
+            .msg = "abcdef0123456789",
+            .short = "245389cf44a13f0e70af8665fe5337ec2dcd138890bb7901c4ad9cfceb054b65",
+            .long = "e42e4d9538a189316e3154b821c1bafb390f78b2f010ea404e6ac063deb8c0852fcd412e098e231e43427bd2be1330bb47b4039ad57b30ae1fc94e34993b162ff4d695e42d59d9777ea18d3848d9d336c25d2acb93adcad009bcfb9cde12286df267ada283063de0bb1505565b2eb6c90e31c48798ecdc71a71756a9110ff373",
+        },
+    };
+    for (cases) |c| {
+        var want_s: [0x20]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want_s, c.short);
+        try std.testing.expectEqualSlices(u8, &want_s, &expandMessageXof(0x20, c.msg, dst));
+        var want_l: [0x80]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want_l, c.long);
+        try std.testing.expectEqualSlices(u8, &want_l, &expandMessageXof(0x80, c.msg, dst));
+        // Parts = the concatenation.
+        try std.testing.expectEqualSlices(u8, &want_l, &expandMessageXofParts(0x80, &.{ c.msg[0..1], c.msg[1..] }, dst));
+    }
 }

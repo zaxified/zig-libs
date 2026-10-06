@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **API ADDED, NO BEHAVIOURAL CHANGE:** `hash_to_curve.expandMessageXof` /
+  `expandMessageXofParts` (RFC 9380 §5.3.2 with SHAKE-256; byte-exact against Appendix K.6 at
+  0x20 and 0x80), `hash_to_curve.Expander` (`.xmd_sha256` / `.xof_shake256`),
+  `hashToFieldFpPartsWith` and `hashToCurveG1PartsWith` — the `BLS12381G1_XOF:SHAKE-256_SSWU_RO_`
+  suite `bbs`'s SHAKE-256 ciphersuite needs (draft-irtf-cfrg-bbs-signatures-12 Appendix A.1; same
+  map, isogeny and `h_eff`). No RFC 9380 vector exists for that G1 suite; it is anchored in `bbs`,
+  whose SHAKE-256 generators and `P1` (hash-to-curve outputs) reproduce draft-12 §8.3 byte-exactly.
+  The existing XMD functions are unchanged wrappers over the new `…With(.xmd_sha256, …)`.
 - **2026-10-06** — Scope mvp → core. **New:** all six ciphersuites of
   draft-irtf-cfrg-bls-signature-05 §4.2 through `bls_sig.Bls(variant, scheme)`
   (`scheme.zig`): min-pk and min-sig, times Basic, MessageAugmentation and
