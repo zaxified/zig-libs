@@ -16,8 +16,8 @@ Take this directory and nothing else — it is a self-contained project, and the
 rest of the collection arrives as a pinned dependency, not as a checkout:
 
 ```sh
-curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-09-19.tar.gz \
-  | tar -xz --strip-components=2 'zig-libs-2026-09-19/example-apps/zstd-cli'
+curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-10-06.tar.gz \
+  | tar -xz --strip-components=2 'zig-libs-2026-10-06/example-apps/zstd-cli'
 cd zstd-cli
 ```
 
