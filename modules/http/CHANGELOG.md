@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **`conneg`, from a new Werkzeug + python-mimeparse oracle** (`src/conneg_oracle.zig`,
+  `tools/conneg_oracle/gen.py`; 66 Accept, 20 Accept-Language, 18 Accept-Encoding cases, every
+  divergence judged against RFC 9110). **BEHAVIOURAL:** (1) a comma inside a quoted-string parameter
+  value no longer ends an `Accept` element (`foo="a,b"` was split in two); (2) a media range's
+  parameters must be on the offer — `text/html;level=1` no longer admits a bare `text/html`, and a
+  range with parameters outranks the same range without (`MediaRange.specificity` can now return 3),
+  exactly RFC 9110 §12.5.1's example table; offers may carry parameters; (3) `*/subtype` is refused as
+  a media range. No in-repo or known consumer negotiates media types (qap uses `encodingQuality` only).
+  `body.indexOfUnquoted` is now public. Gzip responses gained a LIVE anchor
+  (`src/gzip_interop.zig`: curl/zlib, gzip(1), CPython decode levels 1/6/9 on HTTP/1.1 and h2c, and
+  refuse a flipped CRC-32 or ISIZE).
+
 - **2026-10-05** — **Client cookie jar seam** (`Options.cookie_jar`, `Client.CookieJar`, Go's
   `http.CookieJar` shape): the jar is asked for every request's cookies and handed every response
   head, redirect hops included (a session cookie set on a 302 rides the next hop); a caller's own

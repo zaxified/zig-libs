@@ -502,13 +502,23 @@ test {
     _ = conneg;
     _ = problem;
     _ = curl_interop;
+    _ = gzip_interop;
     _ = h11_interop;
     _ = go_oracle;
+    _ = conneg_oracle;
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
 /// only, nothing importable, so it is not part of the public surface.
 const curl_interop = @import("curl_interop.zig");
+
+/// LIVE third-party gzip decoders (curl/zlib, gzip(1), CPython) on this
+/// module's compressed responses — tests only, not part of the public surface.
+const gzip_interop = @import("gzip_interop.zig");
+
+/// OFFLINE differential anchor for `conneg` (Werkzeug + python-mimeparse
+/// answers, frozen) — tests only, not part of the public surface.
+const conneg_oracle = @import("conneg_oracle.zig");
 
 /// OFFLINE third-party interop (wire-framing edge cases vs h11, captured
 /// once and frozen) — tests only, nothing importable, so it is not part of

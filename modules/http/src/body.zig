@@ -125,7 +125,7 @@ pub const ParamIterator = struct {
 /// Index of the first `needle` byte in `s` that is NOT inside a quoted-string
 /// (`"…"`, with `\` escaping the next byte), or null. Used to split media-type
 /// parameters without being fooled by a `;` inside `boundary="a;b"`.
-fn indexOfUnquoted(s: []const u8, needle: u8) ?usize {
+pub fn indexOfUnquoted(s: []const u8, needle: u8) ?usize {
     var i: usize = 0;
     var in_quote = false;
     while (i < s.len) : (i += 1) {

@@ -105,12 +105,14 @@ pub const MediaRange = struct {
     }
 
     /// A specificity rank for RFC 9110 §12.5.1 "most specific wins" ordering,
-    /// higher = more specific: `*/*` → 0, `type/*` → 1, `type/subtype` → 2.
-    /// (N2 breaks further ties by parameter count, then earlier position.)
+    /// higher = more specific: `*/*` → 0, `type/*` → 1, `type/subtype` → 2,
+    /// `type/subtype` with parameters → 3 (`text/html;level=1` overrides
+    /// `text/html` for a `level=1` representation — the RFC's own example).
+    /// (N2 breaks further ties by weight, then earlier position.)
     pub fn specificity(self: MediaRange) u2 {
         if (std.mem.eql(u8, self.type, "*")) return 0;
         if (std.mem.eql(u8, self.subtype, "*")) return 1;
-        return 2;
+        return if (self.params.len == 0) 2 else 3;
     }
 
     /// The value of media-range parameter `name` (case-insensitive), or null.
@@ -144,9 +146,9 @@ pub const Accept = struct {
             // elements).
             self.rest = std.mem.trimStart(u8, self.rest, " \t,");
             if (self.rest.len == 0) return null;
-            // ',' only ever separates elements — it cannot appear inside a
-            // media-range or a qvalue — so a plain scalar scan is safe.
-            const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
+            // ',' separates elements, except inside a quoted-string
+            // parameter value (`foo="a,b"`, RFC 9110 §5.6.6).
+            const end = body.indexOfUnquoted(self.rest, ',') orelse self.rest.len;
             const elem = std.mem.trim(u8, self.rest[0..end], " \t");
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else "";
             countHeaderElement();
@@ -187,6 +189,9 @@ pub fn parseElement(elem: []const u8) ?MediaRange {
     const type_ = std.mem.trim(u8, range[0..slash], " \t");
     const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
     if (type_.len == 0 or subtype_.len == 0) return null;
+    // `*/subtype` is not a media-range (RFC 9110 §12.5.1: `*/*`, `type/*`
+    // or `type/subtype`).
+    if (std.mem.eql(u8, type_, "*") and !std.mem.eql(u8, subtype_, "*")) return null;
 
     // Walk the tail as ';'-separated params, tracking byte offsets so the
     // pre-`q` section can be captured as a slice. The first param named "q"
@@ -196,7 +201,7 @@ pub fn parseElement(elem: []const u8) ?MediaRange {
     var weight: u16 = q_default;
     var pos: usize = 0;
     while (pos < tail.len) {
-        const seg_end = std.mem.indexOfScalarPos(u8, tail, pos, ';') orelse tail.len;
+        const seg_end = if (body.indexOfUnquoted(tail[pos..], ';')) |i| pos + i else tail.len;
         const seg = tail[pos..seg_end];
         const eq = std.mem.indexOfScalar(u8, seg, '=') orelse seg.len;
         const name = std.mem.trim(u8, seg[0..eq], " \t");
@@ -249,7 +254,8 @@ pub const Negotiated = struct {
 };
 
 /// Choose the best representation for the client's `Accept` header from the
-/// server's `offers` (concrete `type/subtype` media types, in server-preference
+/// server's `offers` (concrete `type/subtype` media types, optionally with
+/// parameters a range can select on — `text/html;level=1` — in server-preference
 /// order — earlier = preferred on ties). Returns null → the caller responds
 /// **406 Not Acceptable** (no offer matched, or every match was `q=0`).
 ///
@@ -304,7 +310,7 @@ fn negotiateOffersFast(accept_header: []const u8, offers: []const []const u8) ?N
     while (it.next()) |mr| {
         for (offers, 0..) |_, i| {
             const ot = types[i] orelse continue; // skip malformed offers
-            if (!mr.matches(ot.type, ot.subtype)) continue;
+            if (!rangeAccepts(mr, ot)) continue;
             const s: i8 = mr.specificity();
             if (!matched[i] or s > spec[i] or (s == spec[i] and mr.weight > weight[i])) {
                 matched[i] = true;
@@ -339,7 +345,7 @@ fn negotiateOffersSlow(accept_header: []const u8, offers: []const []const u8) ?N
         var best_weight: u16 = 0;
         var it = accept(accept_header);
         while (it.next()) |mr| {
-            if (!mr.matches(ot.type, ot.subtype)) continue;
+            if (!rangeAccepts(mr, ot)) continue;
             const spec: i8 = mr.specificity();
             if (!matched or spec > best_spec or (spec == best_spec and mr.weight > best_weight)) {
                 matched = true;
@@ -362,12 +368,12 @@ pub fn negotiateContentType(req: *const Server.Request, offers: []const []const 
     return negotiate(req.header("accept") orelse "", offers);
 }
 
-/// A concrete `type/subtype` split of a server offer.
-const TypePair = struct { type: []const u8, subtype: []const u8 };
+/// A concrete `type/subtype` split of a server offer, plus its raw
+/// `;`-parameter section (empty when none).
+const TypePair = struct { type: []const u8, subtype: []const u8, params: []const u8 = "" };
 
-/// Split an offered media type `type/subtype` (OWS-trimmed, both parts
-/// non-empty). Returns null for a malformed offer (no `/`, empty half). Any
-/// `;`-parameters on the offer are ignored (an offer is matched by type only).
+/// Split an offered media type `type/subtype[;params]` (OWS-trimmed, both
+/// parts non-empty). Returns null for a malformed offer (no `/`, empty half).
 fn splitType(mt: []const u8) ?TypePair {
     const semi = std.mem.indexOfScalar(u8, mt, ';');
     const range = std.mem.trim(u8, if (semi) |i| mt[0..i] else mt, " \t");
@@ -375,7 +381,31 @@ fn splitType(mt: []const u8) ?TypePair {
     const type_ = std.mem.trim(u8, range[0..slash], " \t");
     const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
     if (type_.len == 0 or subtype_.len == 0) return null;
-    return .{ .type = type_, .subtype = subtype_ };
+    return .{ .type = type_, .subtype = subtype_, .params = if (semi) |i| mt[i + 1 ..] else "" };
+}
+
+/// Whether the range `mr` applies to the offer `ot`: its type/subtype match
+/// (wildcards included) AND every parameter it names is on the offer with the
+/// same value (RFC 9110 §12.5.1: `text/html;level=1` applies to a `level=1`
+/// representation only). Parameter names compare case-insensitively; values
+/// exactly, except `charset`, whose values are case-insensitive (§8.3.2).
+fn rangeAccepts(mr: MediaRange, ot: TypePair) bool {
+    if (!mr.matches(ot.type, ot.subtype)) return false;
+    var want = mr.paramsIter();
+    outer: while (want.next()) |w| {
+        var have: body.ParamIterator = .{ .rest = ot.params };
+        while (have.next()) |h| {
+            if (!std.ascii.eqlIgnoreCase(w.name, h.name)) continue;
+            const same = if (std.ascii.eqlIgnoreCase(w.name, "charset"))
+                std.ascii.eqlIgnoreCase(w.value, h.value)
+            else
+                std.mem.eql(u8, w.value, h.value);
+            if (same) continue :outer;
+            return false;
+        }
+        return false;
+    }
+    return true;
 }
 
 // ── N3: Accept-Language (RFC 4647) + Accept-Encoding (RFC 9110 §12.5.3) ───────
@@ -1451,4 +1481,25 @@ test "G7: negotiateEncoding() walks the header once, not once per coding" {
     try testing.expect(header_elements_for_testing >= codings.len * g7_ranges);
     try testing.expectEqual(slow, fast);
     try testing.expectEqual(@as(usize, 7), fast.?.index);
+}
+
+test "Werkzeug oracle findings: quoted commas, range parameters, */subtype" {
+    // A quoted-string parameter value may hold a comma; it does not end the
+    // element.
+    var buf: [4]MediaRange = undefined;
+    const mrs = parse("text/html;foo=\"bar,baz\", text/plain;q=0.5", &buf);
+    try testing.expectEqual(@as(usize, 2), mrs.len);
+    try testing.expectEqualStrings("bar,baz", mrs[0].param("foo").?);
+    // A range's parameters must be on the offer: `text/html;level=1` alone
+    // does not admit a bare `text/html` (RFC 9110 §12.5.1's example), and the
+    // parameterless `text/html;q=0.7` decides `level=3`.
+    try testing.expectEqual(@as(?Negotiated, null), negotiate("text/html;level=1", &.{"text/html"}));
+    const rfc = "text/*;q=0.3, text/html;q=0.7, text/html;level=1, text/html;level=2;q=0.4, */*;q=0.5";
+    try testing.expectEqual(@as(u16, 1000), negotiate(rfc, &.{"text/html;level=1"}).?.weight);
+    try testing.expectEqual(@as(u16, 700), negotiate(rfc, &.{"text/html"}).?.weight);
+    try testing.expectEqual(@as(u16, 400), negotiate(rfc, &.{"text/html;level=2"}).?.weight);
+    try testing.expectEqual(@as(u16, 700), negotiate(rfc, &.{"text/html;level=3"}).?.weight);
+    try testing.expectEqual(@as(u16, 1000), negotiate("text/html;charset=utf-8", &.{"text/html;charset=UTF-8"}).?.weight);
+    // `*/html` is not a media-range: skipped, so text/plain wins.
+    try testing.expectEqualStrings("text/plain", negotiate("*/html, text/plain;q=0.5", &.{ "text/html", "text/plain" }).?.media_type);
 }
