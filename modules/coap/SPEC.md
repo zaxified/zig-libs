@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libcoap; no resource registry or `.well-known/core` discovery, no RFC 8323 TCP (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-09-03
+**Audit:** review 2026-10-06 · mutation 2026-09-03
 
 **Known defects:** none recorded
 
@@ -114,13 +114,40 @@ calling them addressed, which reads as though the UDP surface had been enumerate
    `notificationType` is not bounded, which is why the push-path contract is in `observe.zig`'s
    module doc comment. Recorded as unbounded by the 2026-09-03 audit, fixed 2026-09-13 (A1).
    Note also §7's closing sentence — "an attacker
-   may still spoof the acknowledgements if the confirmable messages are sufficiently predictable" —
-   which is why `client.Client.init` now documents its token seed as a CSPRNG requirement.
+   may still spoof the acknowledgements if the confirmable messages are sufficiently predictable".
+   The confirmable messages it means are the server's notifications, and their ACK is normally an
+   empty message echoing only the **Message ID** — so what has to be unpredictable is
+   `server.Server.init`'s `seed_mid`, not the client's token (in the amplification attack the
+   spoofer chose the token itself). Until the 2026-10-06 review this paragraph credited
+   `client.Client.init`'s token seed; `Server.init` now carries the CSPRNG requirement. The
+   registry also does not check that a CON was outstanding when `acknowledged` is called: binding
+   the ACK to the CON's Message ID is the caller's (documented) job, not enforced here.
 
 Items 1–2 remain properties of *unauthenticated* CoAP, not bugs in this codec/state-tracking layer: the
 hook and cap bound what an *admitted* or *uncapped* misbehaving source can do, but the real fix for
 an untrusted network is DTLS (peer authentication) terminated by the caller, feeding a real
 `source_id` and `admit_fn` policy into `Registry.tryRegister`.
+
+**Review 2026-10-06 (adversarial, post-2026-09-03 code).** Scope: the RFC 7641 §7 notification
+budget (2026-09-13: `Registry.notificationType`/`acknowledged`, `Entry.non_since_ack`/`last_ack_ms`,
+the §4.5 24-hour rule) and the 2026-09-07 `fuzzParse` rewrite, plus every claim of this threat model
+against the code. Checked: budget arithmetic (saturating counter, saturating clock difference, a
+budget lowered at run time below the live count, `0` and `null`), that a refresh neither resets the
+budget nor the 24-hour clock while a fresh slot starts both, eviction/cancel moving the new fields
+with their entry, `tryRegister`'s reject-before-touch, and that the fuzz harness's round-trip
+assertion holds (the option-nibble encoding is canonical, so `serialize` of any accepted datagram
+reproduces it). No memory-safety, panic or allocation defect found. Findings: **M1** (doc/contract,
+fixed in docs) — this section and `Client.init` attributed §7's ACK-predictability warning to the
+client's token seed; the ACK that resets the budget echoes only the server notification's Message
+ID, which came from an undocumented `Server.init(seed_mid)` counter, so a constant seed let an
+off-path spoofer forge the ACK and defeat the budget. `Server.init` and `acknowledged` now state the
+requirement; nothing here can test a seed's entropy. **L1** (not fixed, API change) — `acknowledged`
+resets the budget whether or not a confirmable notification was outstanding; enforcing it needs the
+CON's Message ID in the registry (a signature change). **L2** (not fixed, not peer-reachable) —
+`register`/`tryRegister` silently truncate a token longer than 8 octets and `find` then never
+matches it, so such an entry can be neither notified, acknowledged nor cancelled; `parse` rejects
+TKL > 8, so only a caller can supply one. **L3** (fixed) — README's `tryRegister` signature lacked
+`now_ms` since 2026-09-03.
 
 ## Verification
 **External anchor (`external_goldens.zig`, +8 tests).** README/SPEC previously described this

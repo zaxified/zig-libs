@@ -116,9 +116,10 @@ pub const Client = struct {
     /// argument — that an off-path attacker "has to guess both the Message ID
     /// and the Token" — is void against a client seeded with a constant: given
     /// one observed (or simply assumed) starting point, every later exchange's
-    /// pair is arithmetic. RFC 7641 §7 makes the same point from the other end,
-    /// noting an attacker can spoof acknowledgements "if the confirmable
-    /// messages are sufficiently predictable".
+    /// pair is arithmetic. (RFC 7641 §7's warning that an attacker can spoof
+    /// acknowledgements "if the confirmable messages are sufficiently
+    /// predictable" is about the SERVER's confirmable notifications, whose ACK
+    /// echoes only their Message ID — see `server.Server.init`, not this seed.)
     ///
     /// `seed_mid` matters less (a wrong guess yields `.unrelated`), but there is
     /// no reason not to randomise it too.
