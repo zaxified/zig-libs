@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL, not breaking:** `TcpTransport.setReadTimeout`
+  now bounds the **whole** encapsulation message a `read` returns, not just the
+  wait for its first octet — the open MED finding of today's review (SPEC.md,
+  `**Review 2026-10-06**`, item 6). A peer that sent one octet, part of a
+  header, or a header and part of its body and then went quiet used to hold
+  the reading thread (the adapter's included) without limit; that read now
+  fails with `error.ReadFailed` once the timeout passes. The deadline is taken
+  from the monotonic clock when the read starts, and a message that arrives in
+  pieces inside it is still read whole. Unchanged: no octet before the
+  deadline is still `0` ("nothing this round"), no timeout still blocks, and
+  `TransportError` has no new variant.
+
 - **2026-10-06** — **BEHAVIOURAL, not breaking:** Review: security re-review of
   what landed after the 2026-08-11 review — six findings, five fixed, one
   reported open (details in SPEC.md, `**Review 2026-10-06**`). Behaviour that

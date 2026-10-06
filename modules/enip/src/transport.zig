@@ -79,7 +79,10 @@ pub const TcpTransport = struct {
     wbuf: [8192]u8 = undefined,
     reader: ?std.Io.net.Stream.Reader = null,
     writer: ?std.Io.net.Stream.Writer = null,
-    /// Milliseconds a read may wait before reporting "nothing this round".
+    /// Milliseconds one `read` may take, measured on the monotonic clock
+    /// from the moment it starts — for the **whole** message, not just its
+    /// first octet. Nothing arriving in that time is "nothing this round"
+    /// (`0`); part of a message arriving and the rest not is `ReadFailed`.
     /// Null blocks indefinitely.
     read_timeout_ms: ?u32 = null,
 
@@ -96,15 +99,23 @@ pub const TcpTransport = struct {
         self.stream.close(self.io);
     }
 
-    /// Bounds how long a read blocks. Implemented with `poll(2)` rather than
+    /// Bounds how long a read blocks — the whole message, so a peer that
+    /// sends part of one and goes quiet cannot hold the reading thread past
+    /// it. Implemented with `poll(2)` against a deadline rather than
     /// `SO_RCVTIMEO`, because an `EAGAIN` surfacing out of `std.Io` is treated
     /// there as a programmer error.
     pub fn setReadTimeout(self: *TcpTransport, milliseconds: u32) void {
         self.read_timeout_ms = milliseconds;
     }
 
-    /// True when the socket has something to read, false when the wait
-    /// elapsed with nothing there.
+    /// The point past which a `read` started now gives up, or null for none.
+    fn deadline(self: *TcpTransport) ?std.Io.Timestamp {
+        const ms = self.read_timeout_ms orelse return null;
+        return std.Io.Timestamp.now(self.io, .awake).addDuration(.fromMilliseconds(ms));
+    }
+
+    /// True when the socket has something to read, false when `until` passed
+    /// with nothing there. Null `until` waits in the read itself.
     ///
     /// `std.posix.poll` is **not** a `std.Io` cancellation point: it restarts
     /// itself on `EINTR`, so the signal `Future.cancel` sends is swallowed and
@@ -112,8 +123,14 @@ pub const TcpTransport = struct {
     /// `checkCancel` below, a canceled read would come back as `false` and
     /// then as `0` from `readFn` — "nothing available this round" — and the
     /// caller would keep polling a connection it had already abandoned.
-    fn waitReadable(self: *TcpTransport) TransportError!bool {
-        const ms = self.read_timeout_ms orelse return true;
+    fn waitReadable(self: *TcpTransport, until: ?std.Io.Timestamp) TransportError!bool {
+        const end = until orelse return true;
+        // What is left of the deadline, rounded up so a sub-millisecond
+        // remainder still waits instead of spinning, and never negative: a
+        // passed deadline still polls once with 0, so data already there is
+        // taken rather than refused.
+        const left_ns = @max(std.Io.Timestamp.now(self.io, .awake).durationTo(end).nanoseconds, 0);
+        const left_ms = @divTrunc(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
         var fds = [_]std.posix.pollfd{.{
             .fd = self.stream.socket.handle,
             .events = std.posix.POLL.IN,
@@ -124,7 +141,7 @@ pub const TcpTransport = struct {
         // `poll(2)` takes an `i32`; a `u32` from 2^31 ms up used to trap in
         // the `@intCast` (review 2026-10-06). ~24.8 days is "indefinitely"
         // for every purpose a read timeout serves.
-        const wait: i32 = @intCast(@min(ms, std.math.maxInt(i32)));
+        const wait: i32 = @intCast(@min(left_ms, std.math.maxInt(i32)));
         const n = std.posix.poll(&fds, wait) catch {
             try self.checkCanceled();
             return true;
@@ -132,6 +149,40 @@ pub const TcpTransport = struct {
         if (n != 0) return true;
         try self.checkCanceled();
         return false;
+    }
+
+    /// Fills `dest` from offset `have`, one network read per readable wait,
+    /// and returns how much of it is filled — `dest.len` unless `until`
+    /// passed first. Review 2026-10-06: this replaced `readSliceAll`, which
+    /// blocked without limit once the first octet had been seen.
+    fn fillUntil(
+        self: *TcpTransport,
+        dest: []u8,
+        have: usize,
+        until: ?std.Io.Timestamp,
+    ) TransportError!usize {
+        const r = &self.reader.?.interface;
+        var got = have;
+        while (got < dest.len) {
+            // Take what an earlier network read left buffered first, and only
+            // that: `Io.Reader.readVec` would follow a partial copy with a
+            // network read of its own — unbounded, past the deadline.
+            const buffered = @min(r.bufferedLen(), dest.len - got);
+            if (buffered != 0) {
+                @memcpy(dest[got..][0..buffered], r.buffered()[0..buffered]);
+                r.toss(buffered);
+                got += buffered;
+                continue;
+            }
+            if (!try self.waitReadable(until)) return got;
+            // The buffer is empty here, so this is exactly one network read.
+            var vec = [1][]u8{dest[got..]};
+            got += r.readVec(&vec) catch |e| switch (e) {
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => return self.readFailure(),
+            };
+        }
+        return got;
     }
 
     /// `Io.checkCancel` acknowledges the request, so it reports a pending
@@ -167,22 +218,25 @@ pub const TcpTransport = struct {
         const self: *TcpTransport = @ptrCast(@alignCast(ctx));
         self.ensure();
         if (buf.len < encap.header_len) return error.ReadFailed;
-        const r = &self.reader.?.interface;
-        // Anything already buffered by a previous read counts as readable.
-        if (r.bufferedLen() == 0 and !try self.waitReadable()) return 0;
-        r.readSliceAll(buf[0..encap.header_len]) catch |e| switch (e) {
-            error.EndOfStream => return error.EndOfStream,
-            error.ReadFailed => return self.readFailure(),
-        };
-        const total = encap.peekTotalLen(buf[0..encap.header_len]) catch return error.ReadFailed;
+        const until = self.deadline();
+        const head = buf[0..encap.header_len];
+        const got = try self.fillUntil(head, 0, until);
+        // Nothing at all before the deadline is the graceful idle. Part of a
+        // header is not: those octets are consumed, so the connection is out
+        // of step and unusable.
+        if (got == 0) return 0;
+        if (got < head.len) return error.ReadFailed;
+        const total = encap.peekTotalLen(head) catch return error.ReadFailed;
         if (total > buf.len) return error.ReadFailed;
-        // Past the header there is no graceful idle: a timeout here means the
-        // peer stopped mid-message and the connection is unusable, so even a
-        // clean close counts as a failure. A cancel is still a cancel.
-        r.readSliceAll(buf[encap.header_len..total]) catch |e| switch (e) {
+        // Past the header there is no graceful idle: the deadline passing
+        // here means the peer stopped mid-message and the connection is
+        // unusable, so even a clean close counts as a failure. A cancel is
+        // still a cancel.
+        const body = self.fillUntil(buf[0..total], encap.header_len, until) catch |e| switch (e) {
             error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return self.readFailure(),
+            else => |te| return te,
         };
+        if (body < total) return error.ReadFailed;
         return total;
     }
 
@@ -501,4 +555,105 @@ test "a read timeout too large for poll(2) is clamped, not a panic" {
     var buf: [64]u8 = undefined;
     try testing.expectEqual(@as(usize, encap.header_len), try fixture.tt.transport().read(&buf));
     try testing.expectEqualSlices(u8, &nop, buf[0..encap.header_len]);
+}
+
+// ── the read timeout bounds the whole message ──────────────────────────────
+//
+// Review 2026-10-06. The timeout used to bound only the wait for a message's
+// first octet: once one had arrived, `readSliceAll` blocked for the rest
+// without limit, so a peer that sent one octet (or most of a header, or a
+// header and part of its body) and went quiet held the reading thread — the
+// adapter's included — for as long as it kept the connection open. The peer
+// below goes quiet for `stall_ms` and then shuts its side down, so a reader
+// that does not honour the deadline comes back late and with a different
+// error instead of hanging the lane.
+
+const stall_ms = 3000;
+
+fn shutdownAfter(io: std.Io, peer: *const std.Io.net.Stream, ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch return;
+    peer.shutdown(io, .both) catch {};
+}
+
+fn expectStalledMessageTimesOut(prefix: []const u8) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var pw_buf: [64]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(prefix);
+    try pw.interface.flush();
+    var closer = try io.concurrent(shutdownAfter, .{ io, &fixture.peer, stall_ms });
+    defer closer.cancel(io);
+
+    fixture.tt.setReadTimeout(100);
+    var buf: [64]u8 = undefined;
+    const start = std.Io.Timestamp.now(io, .awake);
+    const got = fixture.tt.transport().read(&buf);
+    const elapsed = start.untilNow(io, .awake).toMilliseconds();
+    // A partial message is consumed and cannot be put back, so the connection
+    // is unusable: `ReadFailed`, not the idle `0` an empty wait reports.
+    try testing.expectError(error.ReadFailed, got);
+    try testing.expect(elapsed < 2000);
+}
+
+/// A NOP header announcing `body_len` octets of data.
+fn nopHeader(body_len: u16) [encap.header_len]u8 {
+    var h: [encap.header_len]u8 = @splat(0);
+    std.mem.writeInt(u16, h[0..2], @intFromEnum(encap.Command.nop), .little);
+    std.mem.writeInt(u16, h[2..4], body_len, .little);
+    return h;
+}
+
+test "read timeout: one octet then silence fails within the timeout" {
+    try expectStalledMessageTimesOut(&.{0x00});
+}
+
+test "read timeout: a partial header then silence fails within the timeout" {
+    const h = nopHeader(0);
+    try expectStalledMessageTimesOut(h[0..10]);
+}
+
+test "read timeout: a header and a partial body then silence fails within the timeout" {
+    const h = nopHeader(8);
+    try expectStalledMessageTimesOut(&(h ++ [_]u8{ 1, 2, 3 }));
+}
+
+test "read timeout: a message arriving in pieces inside the deadline is read whole" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    const msg = nopHeader(4) ++ [_]u8{ 9, 8, 7, 6 };
+    var pw_buf: [64]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(msg[0..5]);
+    try pw.interface.flush();
+    var sender = try io.concurrent(sendLater, .{ io, &pw.interface, msg[5..], 50 });
+    defer _ = sender.cancel(io) catch {};
+
+    fixture.tt.setReadTimeout(2000);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(msg.len, try fixture.tt.transport().read(&buf));
+    try testing.expectEqualSlices(u8, &msg, buf[0..msg.len]);
+    // An idle connection still reports "nothing this round", not a failure.
+    fixture.tt.setReadTimeout(50);
+    try testing.expectEqual(@as(usize, 0), try fixture.tt.transport().read(&buf));
+}
+
+fn sendLater(io: std.Io, w: *std.Io.Writer, bytes: []const u8, ms: i64) !void {
+    try io.sleep(.fromMilliseconds(ms), .awake);
+    try w.writeAll(bytes);
+    try w.flush();
 }

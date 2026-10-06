@@ -556,6 +556,13 @@ containment, not confidentiality or integrity against an active attacker:
   hostile peer cannot drive memory growth. Nesting inside `Unconnected_Send`
   and `Multiple_Service_Packet` is depth-capped so it cannot drive *stack*
   growth either.
+- **Time is bounded too, once `setReadTimeout` is set.** `TcpTransport`'s
+  read timeout is a deadline for the *whole* encapsulation message on the
+  monotonic clock, not for its first octet, so a peer that sends part of a
+  message and goes quiet (slowloris) costs the reading thread — the adapter's
+  included — at most that long, and the read fails with `ReadFailed`. With no
+  timeout set a read blocks indefinitely, by design; a server facing untrusted
+  peers sets one.
 - **`Reset` (service 0x05) is implemented and is dangerous.** On the Identity
   object it reboots the device; there is no authentication step in front of it
   anywhere in the protocol. It is exposed because a diagnostic tool and a fleet
@@ -588,8 +595,8 @@ peer-supplied size and index, refusal paths that leave state changed, error
 paths that can leave `Adapter.handle` with no reply, and each threat-model
 claim above against the code. The 2026-09-10 decoders are bounds-safe (every
 offset is `usize` over at most 255 words) and round-trip exactly; the
-cancellation mapping is exhaustive. Six findings, five fixed, each with a
-test that failed before its fix:
+cancellation mapping is exhaustive. Six findings, all fixed (five at the
+review, (6) later the same day), each with a test that failed before its fix:
 (1) MED — a `Multiple_Service_Packet` whose embedded replies outgrew the
 4096-octet reply scratch made `handle` fail with `error.BufferTooSmall` (no
 reply at all) **after** earlier writes in the same batch had been applied;
@@ -606,11 +613,19 @@ pad octet was accepted and re-encoded as zero; now `BadPad`. (4) LOW —
 `usize` (the member id and offset are peer-supplied u32s); outside
 `meta.targets`, RED shown with `-Dtarget=x86-linux-musl`. (5) LOW —
 `setReadTimeout` ≥ 2^31 ms trapped in the `@intCast` to `poll(2)`'s `i32`; now
-clamped. **Open, reported to the owner, not fixed here:** `TcpTransport`'s read
-timeout bounds only the wait for a message's *first* octet; once one has
-arrived, `readSliceAll` blocks without limit for the rest, so a peer that sends
-one octet and stops holds the reading thread indefinitely despite
-`setReadTimeout` (a deadline-bounded fill loop is the fix). Also noted, not
+clamped. (6) MED — fixed 2026-10-06: `TcpTransport`'s read timeout bounded
+only the wait for a message's *first* octet; once one had arrived,
+`readSliceAll` blocked without limit for the rest, so a peer that sent one
+octet (or part of a header, or a header and part of its body) and stopped held
+the reading thread — the adapter's too, which rides the same `readFn` —
+indefinitely despite `setReadTimeout`. The timeout is now one deadline per
+`read`, taken from `std.Io.Clock` `.awake` when the read starts; a fill loop
+does one network read per `poll(2)` wait on the time left, so the whole
+message is bounded. No octet by the deadline is still the idle `0`; a partial
+message is `ReadFailed` (its octets are consumed, the stream is out of step).
+Tests over loopback: one octet, a partial header, and a header with a partial
+body, each followed by silence, fail with `ReadFailed` in < 2 s at a 100 ms
+timeout (before: blocked until the peer's 3 s shutdown). Also noted, not
 defects: the reply decoders `ForwardOpenReply`/`ForwardCloseReply` stay prefix
 decoders; `Client.forwardOpen` does not check the reply's originator triple,
 `sendConnectedCip` does not check the reply's connection id, and
