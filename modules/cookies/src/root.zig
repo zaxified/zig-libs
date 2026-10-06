@@ -145,11 +145,15 @@ pub const WriteError = error{
     /// A name/value/attribute byte would break the header (control char, or a
     /// separator like `;`/`,`/`"`/`\`/SP the grammar forbids) — refused so a
     /// reflected value can't inject a Set-Cookie attribute or a second header.
+    /// Also an attribute a browser would ignore or a cookie it would drop:
+    /// a Path that is not absolute or is over 1024 bytes, a Domain that is
+    /// not a host name, an `expires` that is not an IMF-fixdate, a name +
+    /// value over 4096 bytes.
     InvalidCookie,
     /// `same_site == .none` without `secure` — browsers would drop it.
     InsecureSameSiteNone,
-    /// The name uses a reserved prefix (RFC 6265bis §4.1.3) whose constraints
-    /// are not met: `__Secure-` requires `secure`; `__Host-` requires `secure`,
+    /// The name uses a reserved prefix (RFC 6265bis §4.1.3, matched without
+    /// regard to case) whose constraints are not met: `__Secure-` requires `secure`; `__Host-` requires `secure`,
     /// `Path=/`, and no `Domain`. Browsers silently reject such a cookie, so it
     /// is refused here loudly rather than sent and dropped.
     CookiePrefixViolation,
@@ -181,20 +185,36 @@ pub const SetCookie = struct {
     /// the caller's writer propagate as `std.Io.Writer.Error` (WriteFailed).
     pub fn write(sc: SetCookie, w: *std.Io.Writer) (WriteError || std.Io.Writer.Error)!void {
         // 1. Validate before writing any bytes.
+        //
+        // ⛔ Anchored on headless Chrome + Go's net/http
+        // (`setcookie_oracle_test.zig`, 2026-10-06), which found the writer
+        // emitting lines a browser drops or reads as something else:
+        // `expires` was not checked at all (`"<date>; Domain=evil"` injected
+        // an attribute, `"tomorrow"` made a session cookie); a relative,
+        // empty or > 1024-byte Path and an empty Domain were ignored by the
+        // browser; a Domain with a space, a trailing dot or a non-ASCII
+        // byte, and a name + value past 4096 bytes, made it drop the cookie;
+        // `__secure-`/`__HOST-` escaped the prefix rules browsers apply
+        // without regard to case. A quoted value (`"x"`), which the grammar
+        // allows, was refused.
         if (sc.name.len == 0) return error.InvalidCookie;
         for (sc.name) |c| if (!isTokenChar(c)) return error.InvalidCookie;
         // Do NOT auto-quote a bad value — reject it (injection guard).
-        for (sc.value) |c| if (!isCookieOctet(c)) return error.InvalidCookie;
-        if (sc.path) |p| for (p) |c| if (!isAttrOctet(c)) return error.InvalidCookie;
-        if (sc.domain) |d| for (d) |c| if (!isAttrOctet(c)) return error.InvalidCookie;
+        if (!isCookieValue(sc.value)) return error.InvalidCookie;
+        if (sc.name.len + sc.value.len > max_name_value_bytes) return error.InvalidCookie;
+        if (sc.path) |p| if (!isPathValue(p)) return error.InvalidCookie;
+        if (sc.domain) |d| if (!isDomainValue(d)) return error.InvalidCookie;
+        if (sc.expires) |e| if (!isImfFixdate(e)) return error.InvalidCookie;
         if (sc.same_site) |ss| {
             if (ss == .none and !sc.secure) return error.InsecureSameSiteNone;
         }
-        // RFC 6265bis §4.1.3 cookie name prefixes (case-sensitive). A browser
-        // silently drops a cookie that violates these; reject it here instead.
-        if (std.mem.startsWith(u8, sc.name, "__Secure-") and !sc.secure)
+        // RFC 6265bis §4.1.3 cookie name prefixes, matched without regard to
+        // case as browsers match them (Chrome drops `__secure-a=1` too). A
+        // browser silently drops a cookie that violates these; reject it
+        // here instead.
+        if (startsWithIgnoreCase(sc.name, "__Secure-") and !sc.secure)
             return error.CookiePrefixViolation;
-        if (std.mem.startsWith(u8, sc.name, "__Host-")) {
+        if (startsWithIgnoreCase(sc.name, "__Host-")) {
             const path_is_root = sc.path != null and std.mem.eql(u8, sc.path.?, "/");
             if (!sc.secure or sc.domain != null or !path_is_root)
                 return error.CookiePrefixViolation;
@@ -255,10 +275,77 @@ pub const SetCookie = struct {
         };
     }
 
-    /// Bare Path/Domain attribute-value check: no CTL and no `;` (these feed
-    /// the attribute verbatim).
-    fn isAttrOctet(c: u8) bool {
-        return c >= 0x20 and c != 0x7f and c != ';';
+    /// RFC 6265 §4.1.1 cookie-value: `*cookie-octet` or the same between
+    /// two DQUOTEs (the quotes are part of the value a browser stores).
+    fn isCookieValue(v: []const u8) bool {
+        const inner = if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+        for (inner) |c| if (!isCookieOctet(c)) return false;
+        return true;
+    }
+
+    /// RFC 6265bis §5.6: a user agent ignores an attribute whose value is
+    /// longer than this, and the whole cookie when name + value is longer
+    /// than `max_name_value_bytes`.
+    const max_attribute_value_bytes = 1024;
+    const max_name_value_bytes = 4096;
+
+    /// Path: absolute (a browser takes any other value as "no Path" and
+    /// uses the request's directory), RFC 6265bis av-octets (printable
+    /// ASCII and SP, no `;`), at most 1024 bytes.
+    fn isPathValue(p: []const u8) bool {
+        if (p.len == 0 or p[0] != '/' or p.len > max_attribute_value_bytes) return false;
+        for (p) |c| if (c < 0x20 or c > 0x7e or c == ';') return false;
+        return true;
+    }
+
+    /// Domain: a host name -- dot-separated labels of letters, digits, `-`
+    /// and `_` (1–63 bytes, no `-` at either end), optionally after one
+    /// leading dot, which browsers ignore. No trailing dot, no empty value
+    /// (a browser ignores it), nothing non-ASCII (encode an IDN as
+    /// punycode first).
+    fn isDomainValue(d: []const u8) bool {
+        const host = if (d.len != 0 and d[0] == '.') d[1..] else d;
+        if (host.len == 0 or host.len > 253) return false;
+        var labels = std.mem.splitScalar(u8, host, '.');
+        while (labels.next()) |label| {
+            if (label.len == 0 or label.len > 63) return false;
+            if (label[0] == '-' or label[label.len - 1] == '-') return false;
+            for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+        }
+        return true;
+    }
+
+    /// RFC 9110 §5.6.7 IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`: the
+    /// form `expires` is documented to take, and the only one written.
+    fn isImfFixdate(e: []const u8) bool {
+        if (e.len != 29) return false;
+        const days = [_][]const u8{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+        const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        const day_ok = for (days) |d| {
+            if (std.mem.eql(u8, e[0..3], d)) break true;
+        } else false;
+        const month_ok = for (months) |m| {
+            if (std.mem.eql(u8, e[8..11], m)) break true;
+        } else false;
+        if (!day_ok or !month_ok) return false;
+        if (!std.mem.eql(u8, e[3..5], ", ") or e[7] != ' ' or e[11] != ' ' or e[16] != ' ' or
+            e[19] != ':' or e[22] != ':' or !std.mem.eql(u8, e[25..], " GMT")) return false;
+        return inRange(e[5..7], 1, 31) and inRange(e[12..16], 0, 9999) and inRange(e[17..19], 0, 23) and
+            inRange(e[20..22], 0, 59) and inRange(e[23..25], 0, 60);
+    }
+
+    /// `s` is all decimal digits and its value lies in `min..max`.
+    fn inRange(s: []const u8, min: u32, max: u32) bool {
+        var n: u32 = 0;
+        for (s) |c| {
+            if (!std.ascii.isDigit(c)) return false;
+            n = n * 10 + (c - '0');
+        }
+        return n >= min and n <= max;
+    }
+
+    fn startsWithIgnoreCase(s: []const u8, prefix: []const u8) bool {
+        return s.len >= prefix.len and std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix);
     }
 };
 
@@ -285,10 +372,11 @@ pub fn get(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
 ///
 /// It is also, deliberately, not a second budget to get wrong. `http`'s
 /// per-response copy store is 4096 bytes for ALL header and trailer bytes, so
-/// any value this buffer could reject is one `setHeader` would have rejected
-/// anyway (`error.HeaderBytesExhausted`, and sooner — the name costs bytes
-/// too). This buffer is therefore never the binding constraint: the refusal a
-/// caller actually meets comes from the writer's own accounting.
+/// any value this buffer could reject is one `addSetCookie` would have
+/// rejected anyway (`error.HeaderBytesExhausted`, and sooner once other
+/// headers have spent some of the store). This buffer is therefore never the
+/// binding constraint: the refusal a caller actually meets comes from the
+/// writer's own accounting.
 ///
 /// That last paragraph used to be maintained by comment on both sides —
 /// `http`'s `header_copy_bytes` was a private `const`, so this file could not
@@ -304,7 +392,7 @@ comptime {
     std.debug.assert(max_set_cookie_bytes >= 4096);
     // CEILING — the doc claim above ("never the binding constraint") is only
     // true while this buffer cannot outgrow the response writer's copy store.
-    // Raising this alone would make `set` accept a value `setHeader` must
+    // Raising this alone would make `set` accept a value `addSetCookie` must
     // then reject, moving the refusal from a clean `BufferTooSmall` here to a
     // budget error that depends on what else the handler already set.
     // Catches upward drift. Measured before this assertion existed: 4096 →
@@ -316,7 +404,7 @@ comptime {
 /// invalid cookie (`WriteError`) before touching the response.
 ///
 /// The value is formatted into a `max_set_cookie_bytes` buffer on THIS frame
-/// and handed to `setHeader`, which copies it into the response writer's own
+/// and handed to `addSetCookie`, which copies it into the response writer's own
 /// storage before returning — which is why no buffer is asked of the caller.
 /// It used to take one, because the head (this value included) is not
 /// serialized onto the wire until the serving loop calls `end()`, after the
@@ -324,13 +412,18 @@ comptime {
 /// on the handler's frame was then read after that frame died. The writer
 /// copies now, so the parameter bought nothing.
 ///
-/// NOTE: the server emits at most **one** `Set-Cookie` per response —
-/// `setHeader` replaces by name — so a second `set` overwrites the first.
-/// Setting multiple cookies in one response is not supported through this path.
+/// Each call adds one more `Set-Cookie` line (`addSetCookie`), in call order
+/// -- RFC 6265 §3: a server must not fold cookies into one field, so a
+/// session cookie and a CSRF cookie are two lines. As Go's `http.SetCookie`,
+/// `set` never replaces: setting the same name twice sends both, and the
+/// browser keeps the later one.
+///
+/// ⛔ It used `setHeader`, which replaces by name: a second `set` silently
+/// dropped the first cookie (found 2026-10-06 with the Set-Cookie oracle).
 pub fn set(res: *http.Server.ResponseWriter, sc: SetCookie) SetError!void {
     var buf: [max_set_cookie_bytes]u8 = undefined;
     const value = try sc.bufPrint(&buf);
-    try res.setHeader("Set-Cookie", value);
+    try res.addSetCookie(value);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -611,7 +704,7 @@ noinline fn clobberDeadFrame() void {
 
 test "set: the cookie outlives the frame it was formatted in" {
     // What this pins: `set` no longer takes a caller buffer because
-    // `setHeader` COPIES the value into the response writer's own storage.
+    // `addSetCookie` COPIES the value into the response writer's own storage.
     // Nothing else in this module's suite would notice if that copy went
     // away — `writeHead` runs inside `end()`, which the serving loop calls
     // after the handler returns, and `serveStream` offers no seam between the
@@ -635,6 +728,25 @@ test "set: the cookie outlives the frame it was formatted in" {
     try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid9=4242; Path=/; HttpOnly\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
     try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+}
+
+test "set: two cookies in one response are two Set-Cookie lines" {
+    // `set` used `setHeader`, which replaces by name: the session cookie
+    // below vanished when the CSRF cookie was set.
+    const Writer = std.Io.Writer;
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try set(&rw, .{ .name = "sid", .value = "1", .path = "/", .http_only = true });
+    try set(&rw, .{ .name = "csrf", .value = "2", .path = "/" });
+    try rw.end();
+    const wire = out.buffered();
+    const first = std.mem.indexOf(u8, wire, "Set-Cookie: sid=1; Path=/; HttpOnly\r\n") orelse return error.TestExpectedSid;
+    const second = std.mem.indexOf(u8, wire, "Set-Cookie: csrf=2; Path=/\r\n") orelse return error.TestExpectedCsrf;
+    try testing.expect(first < second); // call order
 }
 
 test "max_set_cookie_bytes: pinned by value and to http's copy store" {
@@ -664,7 +776,9 @@ test "set: an over-long cookie is refused, not truncated" {
     // limit needs its own test: a value past `max_set_cookie_bytes` must fail
     // loudly. A truncated `Set-Cookie` is worse than none — it still parses,
     // so the client would store a silently corrupted value.
-    var huge: [max_set_cookie_bytes + 1]u8 = undefined;
+    // Name + value is 4096 bytes, the most `write` takes (a browser drops
+    // more); with the `=` the line is 4097, one past the buffer.
+    var huge: [max_set_cookie_bytes - 1]u8 = undefined;
     @memset(&huge, 'x');
     try testing.expectError(error.BufferTooSmall, set(&rw, .{ .name = "n", .value = &huge }));
     // Nothing reached the response: no header, and the next `set` still works.
@@ -675,11 +789,13 @@ test "set: an over-long cookie is refused, not truncated" {
     try testing.expect(std.mem.indexOf(u8, wire, "x") == null);
 
     // The other refusal a caller can meet is the writer's own copy budget,
-    // which bites first (the header name costs bytes too) — also an error,
-    // also not a truncation.
+    // shared by every header of the response: a cookie that fits the buffer
+    // but not what earlier headers left of the budget is also an error, also
+    // not a truncation.
     var out2: Writer = .fixed(&out_buf);
     var rw2: http.Server.ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{});
-    var big: [max_set_cookie_bytes - 8]u8 = undefined;
+    try rw2.setHeader("X-Pad", "p" ** 64);
+    var big: [max_set_cookie_bytes - 40]u8 = undefined;
     @memset(&big, 'y');
     try testing.expectError(error.HeaderBytesExhausted, set(&rw2, .{ .name = "n", .value = &big }));
 }
@@ -688,6 +804,12 @@ test "set: an over-long cookie is refused, not truncated" {
 // `Cookie`-header parsing (see golden_test.zig's module doc-comment).
 test {
     _ = @import("golden_test.zig");
+}
+
+// External anchor: headless Chrome + Go's net/http on the Set-Cookie lines
+// `SetCookie.write` builds (see setcookie_oracle_test.zig).
+test {
+    _ = @import("setcookie_oracle_test.zig");
 }
 
 // ── fuzz: parse never panics on arbitrary or cookie-shaped bytes ───────────

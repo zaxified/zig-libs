@@ -33,10 +33,10 @@ belongs on the `Set-Cookie` build side (next part).
 
 - `get(req, name) ?[]const u8` / `set(res, sc) !void` — thin `http`
   helpers: read a cookie off a request, or serialize a `SetCookie` into the
-  response's `Set-Cookie` header (the server emits one Set-Cookie per
-  response — `setHeader` replaces by name). `set` needs no buffer from the
+  response as one more `Set-Cookie` line (each call appends, in call
+  order, so a session and a CSRF cookie are two lines). `set` needs no buffer from the
   caller: it formats into a `max_set_cookie_bytes` (4096, RFC 6265 §6.1)
-  buffer of its own, and `setHeader` copies the bytes into the response
+  buffer of its own, and `addSetCookie` copies the bytes into the response
   writer before returning. Longer than that ⇒ `BufferTooSmall`, never a
   truncated cookie.
 

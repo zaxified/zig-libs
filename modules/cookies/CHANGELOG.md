@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Anchoring: Set-Cookie BUILD direction against headless Chrome + Go**
+  (`tools/setcookie_oracle.js`, `tools/go_setcookie`, `src/setcookie_oracle_test.zig`): 65 cases,
+  each line served to Chrome 154 and read by Go 1.26's `ParseSetCookie`; `write` must produce the
+  line Chrome stores as meant and refuse the rest. **Fixes:**
+  - **BEHAVIOURAL:** `set` appends (`http.ResponseWriter.addSetCookie`) instead of `setHeader`, which
+    replaced by name — a second `set` in one response silently dropped the first cookie.
+  - **BEHAVIOURAL:** `expires` is checked (IMF-fixdate only). It was written verbatim:
+    `"<date>; Domain=evil.example"` injected an attribute, `"tomorrow"` made a session cookie.
+  - **BEHAVIOURAL:** Path must be absolute, ≤ 1024 bytes, printable ASCII (Chrome ignores a relative,
+    empty or longer Path; Go drops a non-ASCII one). Domain must be a host name (labels of
+    letters/digits/`-`/`_`, one leading dot allowed, ≤ 253 bytes): a space, a trailing dot, a
+    non-ASCII byte or an empty value made Chrome drop or ignore it. Name + value ≤ 4096 bytes
+    (Chrome drops more). All `error.InvalidCookie`.
+  - **BEHAVIOURAL:** the `__Secure-` / `__Host-` prefix rules apply without regard to case, as Chrome
+    applies them (`__secure-a=1` without `Secure` is `CookiePrefixViolation` now).
+  - **BEHAVIOURAL (looser):** a quoted value (`"x"`), which the RFC 6265 grammar allows, is written.
+  Evidence MIXED → EXTERNAL.
+
 - **2026-10-05** — **Client side: `Jar` and `PublicSuffixList`** (new, nothing existing changed).
   `Jar` is a thread-safe cookie jar (RFC 6265 §5.2-§5.4 + 6265bis Secure rules) that plugs into
   `http.Client` (`.cookie_jar = jar.cookieJar()`); `jar.SetCookie.parse` parses a `Set-Cookie`
