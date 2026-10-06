@@ -727,9 +727,13 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
     switch (effective) {
         .int, .float => {
             if (numValue(v)) |n| {
-                if (rule.min) |m| if (n < m)
+                // Written as "not inside", so a NaN fails every bound it has.
+                // ⛔ `n < m` / `n > m` are both false for NaN: query `x=nan`
+                // passed `min = 0, max = 100` (pydantic refuses it;
+                // `query_oracle_test.zig`, 2026-10-06). JSON cannot spell NaN.
+                if (rule.min) |m| if (!(n >= m))
                     try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
-                if (rule.max) |m| if (n > m)
+                if (rule.max) |m| if (!(n <= m))
                     try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
             } else {
                 // A value that survived the type gate but whose numeric text
@@ -1259,14 +1263,29 @@ fn assertLookup(comptime P: type) void {
 }
 
 /// Coerce one string value to the rule's kind, then run the shared checks.
+///
+/// ⛔ Anchored on pydantic (lax mode, fed the decoded bytes), Go's strconv and
+/// Python's `int()`/`float()` -- `query_oracle_test.zig`, 2026-10-06. Four
+/// departures were fixed here: an integer past i64 was `int_parsing` (so a
+/// `u64` query field refused 2^63..2^64-1; all three take any integer);
+/// `1__0` passed as an integer and `0x10`/`0x1p3` as floats (`std.fmt`
+/// grammar, refused by pydantic and Python); a value that is not UTF-8
+/// passed as a string (pydantic: `string_unicode`). `t`/`f`/`on`/`yes`…
+/// were `bool_parsing`; pydantic's whole vocabulary is taken now.
 fn checkCoerced(b: *Builder, path: []const u8, s: []const u8, rule: *const Rule) Allocator.Error!void {
     const v: Value = switch (rule.kind) {
-        .string, .any => .{ .string = s },
-        .int => .{ .integer = std.fmt.parseInt(i64, s, 10) catch {
+        .string, .any => blk: {
+            if (!std.unicode.utf8ValidateSlice(s)) {
+                try b.append(path, "string_unicode", "Input should be a valid string, unable to parse as unicode");
+                return;
+            }
+            break :blk .{ .string = s };
+        },
+        .int => try coerceInt(b.a(), s) orelse {
             try b.append(path, "int_parsing", "Input should be a valid integer, unable to parse string as an integer");
             return;
-        } },
-        .float => .{ .float = std.fmt.parseFloat(f64, s) catch {
+        },
+        .float => .{ .float = coerceFloat(s) orelse {
             try b.append(path, "float_parsing", "Input should be a valid number, unable to parse string as a number");
             return;
         } },
@@ -1282,10 +1301,55 @@ fn checkCoerced(b: *Builder, path: []const u8, s: []const u8, rule: *const Rule)
     try checkRule(b, path, v, rule);
 }
 
+/// pydantic's string-to-bool vocabulary, compared without case. It holds
+/// every spelling Go's `strconv.ParseBool` takes, plus what HTML forms and
+/// config files say (`on`, `yes`); whitespace is not stripped.
 fn parseBool(s: []const u8) ?bool {
-    if (std.ascii.eqlIgnoreCase(s, "true") or std.mem.eql(u8, s, "1")) return true;
-    if (std.ascii.eqlIgnoreCase(s, "false") or std.mem.eql(u8, s, "0")) return false;
+    const words = [_]struct { []const u8, bool }{
+        .{ "true", true },   .{ "1", true },  .{ "t", true },  .{ "y", true },  .{ "yes", true }, .{ "on", true },
+        .{ "false", false }, .{ "0", false }, .{ "f", false }, .{ "n", false }, .{ "no", false }, .{ "off", false },
+    };
+    for (words) |w| if (std.ascii.eqlIgnoreCase(s, w[0])) return w[1];
     return null;
+}
+
+/// Decimal integer text: an optional sign, then digits with single `_`
+/// between them (Python's and pydantic's grammar). An i64 becomes
+/// `.integer`; a longer one a `.number_string` of its bare digits, which the
+/// int gate takes and the bounds compare as f64 -- as a JSON integer past
+/// i64 does. Null when the text is no integer. Whitespace is not stripped
+/// (pydantic strips it; Go's strconv and the JSON number grammar do not).
+fn coerceInt(a: Allocator, s: []const u8) Allocator.Error!?Value {
+    const body = if (s.len != 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
+    if (body.len == 0 or !std.ascii.isDigit(body[0]) or !std.ascii.isDigit(body[body.len - 1])) return null;
+    for (body, 0..) |c, i| {
+        if (std.ascii.isDigit(c)) continue;
+        if (c != '_' or body[i + 1] == '_') return null; // last byte is a digit, so i + 1 is in range
+    }
+    if (std.fmt.parseInt(i64, s, 10)) |n| return .{ .integer = n } else |err| switch (err) {
+        error.Overflow => {},
+        error.InvalidCharacter => return null,
+    }
+    const out = try a.alloc(u8, s.len);
+    var n: usize = 0;
+    if (s[0] == '-') {
+        out[0] = '-';
+        n = 1;
+    }
+    for (body) |c| if (c != '_') {
+        out[n] = c;
+        n += 1;
+    };
+    return .{ .number_string = out[0..n] };
+}
+
+/// Decimal float text, or `nan`/`inf`/`infinity` -- `std.fmt.parseFloat`'s
+/// grammar without its hexadecimal form, which pydantic, Python's `float()`
+/// and JSON all refuse.
+fn coerceFloat(s: []const u8) ?f64 {
+    const body = if (s.len != 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
+    if (body.len >= 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
 }
 
 const RawPair = struct { name: []const u8, value: []const u8 };
@@ -4027,6 +4091,41 @@ test "parseQueryLeaky: decoding, first duplicate wins, encoded key, unknown keys
     try testing.expectEqual(@as(u8, 3), v.limit);
 }
 
+test "parseQueryLeaky: the text coercions the query oracle found broken" {
+    // Each assertion is one departure `query_oracle_test.zig` caught
+    // (2026-10-06); see `checkCoerced` and the bounds in `checkRule`.
+    const Q = struct {
+        id: u64 = 0,
+        price: f64 = 0,
+        on: bool = false,
+        name: []const u8 = "",
+
+        pub const validate_rules: []const Rule = &.{.{ .field = "price", .kind = .float, .min = 0, .max = 100 }};
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A u64 past i64 decodes; it used to be `int_parsing`.
+    const v = (try parseQueryLeaky(Q, a, "id=18446744073709551615&on=on&price=1_0.5", .{})).ok;
+    try testing.expectEqual(std.math.maxInt(u64), v.id);
+    try testing.expect(v.on); // pydantic's `on`
+    try testing.expectEqual(@as(f64, 10.5), v.price);
+
+    // NaN is inside no bound.
+    const nan = (try parseQueryLeaky(Q, a, "price=nan", .{})).invalid;
+    try testing.expectEqual(@as(usize, 2), nan.errors.len);
+    try testing.expectEqualStrings("greater_than_equal", nan.errors[0].code);
+    try testing.expectEqualStrings("less_than_equal", nan.errors[1].code);
+
+    // `std.fmt` spellings no reference takes; bytes that are not UTF-8.
+    const bad = (try parseQueryLeaky(Q, a, "id=1__0&price=0x10&name=%ff", .{})).invalid;
+    try testing.expectEqual(@as(usize, 3), bad.errors.len);
+    try expectError(&bad, "id", "int_parsing");
+    try expectError(&bad, "price", "float_parsing");
+    try expectError(&bad, "name", "string_unicode");
+}
+
 test "parseQueryLeaky: every broken field is reported, derived and declared rules deduped" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -5645,6 +5744,12 @@ test {
 // See schema_oracle_test.zig / tools/schema_oracle.py.
 test {
     _ = @import("schema_oracle_test.zig");
+}
+
+// ── external anchor: query decoding + coercion (pydantic, Go, WHATWG) ──────
+// See query_oracle_test.zig / tools/query_oracle.py.
+test {
+    _ = @import("query_oracle_test.zig");
 }
 
 test "a rule that forgot its kind is not a no-op: .any constrains the value" {

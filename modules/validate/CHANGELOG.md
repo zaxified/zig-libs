@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Anchoring: query decoding + coercion oracle** (`tools/query_oracle.py`,
+  `src/query_oracle_test.zig`): Python `parse_qsl`, Go `net/url` and WHATWG `URLSearchParams` judge the
+  decoding; pydantic 2.13.5 (lax, fed the decoded bytes) judges the coercion and the error code, with
+  Go's strconv and Python's `int()`/`float()` as tie-breakers. Decoding agreed. **5 DEFECTS fixed** in
+  `validateQuery` / `validateParams` / `parseQueryLeaky`:
+  - **BEHAVIOURAL:** a NaN (`x=nan`) fails `min`/`max` (both); every comparison with NaN was false, so
+    it passed any bound.
+  - **BEHAVIOURAL:** an integer past i64 coerces (as `.number_string`, bounds in f64, like a JSON
+    integer); it was `int_parsing`, so a `u64` field of `parseQueryLeaky` refused 2^63..2^64-1.
+  - **BEHAVIOURAL:** `1__0` is `int_parsing`, `0x10` / `0x1p3` are `float_parsing` (`std.fmt` took them).
+  - **BEHAVIOURAL:** a `.string`/`.any` value that is not UTF-8 is `string_unicode`; it passed unless the
+    rule had a length bound, and with `one_of`/`pattern` it got `enum`/`string_pattern_mismatch`.
+  - **BEHAVIOURAL (looser):** bool coercion takes pydantic's whole vocabulary, case-insensitive:
+    `t`/`y`/`yes`/`on` and `f`/`n`/`no`/`off` besides `true`/`1`/`false`/`0` (HTML checkboxes send `on`).
+  Judged and kept: whitespace around a number and `5.0` as an int stay refused (pydantic takes them,
+  Go's strconv and the JSON grammar do not). Evidence MIXED → EXTERNAL.
+
 - **2026-10-05** — **Anchoring: python-jsonschema + ajv oracle** (`tools/schema_oracle.py`,
   `src/schema_oracle_test.zig`): 313 rule sets must export the frozen schema, and 2051 documents must
   get both validators' verdict on it, on the tree and the streaming path. **4 DEFECTS fixed**, each a
