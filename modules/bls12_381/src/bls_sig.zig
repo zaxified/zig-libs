@@ -1,56 +1,32 @@
 // SPDX-License-Identifier: MIT
 //! bls_sig — Part 4 of the `bls12_381` arc: BLS signatures per
-//! **draft-irtf-cfrg-bls-signature-05**, **minimal-pubkey-size,
-//! ProofOfPossession ciphersuite ONLY**
-//! (`BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`): public keys live in
-//! `G1` (48-byte compressed — `PublicKey`), signatures live in `G2`
-//! (96-byte compressed — `Signature`), messages are hashed onto `G2`
-//! via Part 3's `hash_to_curve.hashToCurveG2` under this ciphersuite's
-//! own DST (`dst_sig`). This is the ciphersuite Ethereum's consensus
-//! layer (and most production BLS deployments) actually use: small
-//! (48-byte) public keys are stored/gossiped far more often than the
-//! (96-byte) signatures they verify, so putting the smaller element in
-//! the more-frequently-transmitted slot is the usual real-world
-//! trade-off. Builds directly on Parts 1-3 (`g1.zig`/`g2.zig`'s point
-//! arithmetic and wire codecs, `pairing.zig`'s `pairingCheck`,
-//! `hash_to_curve.zig`'s `hashToCurveG2`) — this file adds nothing to
-//! the field/group/pairing math itself, only the BLS-signature-specific
-//! wiring and the "rogue-key"-defeating equations (plain verify,
-//! proof-of-possession).
+//! **draft-irtf-cfrg-bls-signature-05**, all six ciphersuites of §4.2.
+//! This file holds what they share — `SecretKey`, `keyGen` (§2.3), the
+//! error set — and re-exports `scheme.zig`'s `Bls(variant, scheme)` and
+//! its six instances (`MinPkBasic`, `MinPkAug`, `MinPkPop`, `MinSigBasic`,
+//! `MinSigAug`, `MinSigPop`).
 //!
-//! **Out of scope for this file** (see `SPEC.md`'s "Out of scope"):
-//! the **min-sig** variant (public keys in `G2`, signatures in `G1` —
-//! the API below is shaped so a sibling `PublicKeyMinSig`/
-//! `SignatureMinSig` pair COULD be added later without disturbing this
-//! one, but none is implemented here — "Part 4b"); the **Basic** and
-//! **MessageAugmentation** schemes (draft §3.1/§3.2 — different
-//! rogue-key mitigations than ProofOfPossession's; this file implements
-//! ONLY the ProofOfPossession scheme, §3.3).
+//! The file-level names (`PublicKey`, `Signature`, `sign`, `verify`,
+//! `aggregate*`, `fastAggregateVerify`, `popProve`/`popVerify`,
+//! `verifyBatch`, `dst_sig`, `dst_pop`) are the **minimal-pubkey-size
+//! ProofOfPossession** suite `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
+//! — Ethereum's consensus-layer suite, and this module's only one before
+//! the other five existed. They are aliases of `MinPkPop`, so code written
+//! against them is unchanged.
 //!
-//! **Status: COMPLETE (crypto-core pass, 2026-07-14).** Everything is
-//! REAL: wire codecs (`SecretKey`/`PublicKey`/`Signature`
-//! `toBytes`/`fromBytes`, reusing `Fr`'s and `g1`'s/`g2`'s own codecs
-//! directly), `keyGen` (draft §2.3 — HKDF-based), `skToPk`,
-//! `keyValidate`, `aggregate`/`aggregatePublicKeys`, AND the
-//! security-critical pairing-based cores — `sign`, `verify`,
-//! `coreAggregateVerify`/`aggregateVerify`, `fastAggregateVerify`,
-//! `popProve`/`popVerify` — each implementing exactly the draft
-//! pseudocode its doc comment quotes, byte-exact against
-//! `ethereum/bls12-381-tests` v0.1.2 vectors (see the KAT tests below
-//! and `NOTICE`). Every verify-family entry point is TOTAL on
-//! attacker-controlled input: the mandatory `signature_subgroup_check`
-//! and `KeyValidate` preconditions run fail-closed (return `false`,
-//! never panic) BEFORE any pairing work — see each function's doc
-//! comment and `SPEC.md`'s threat model.
+//! Evidence: the min-pk POP suite is byte-exact against
+//! `ethereum/bls12-381-tests` v0.1.2 (tests below); all six suites are
+//! byte-exact against supranational/blst run as a black box
+//! (`blst_interop_test.zig`); min-pk and min-sig Basic also verify live
+//! drand mainnet beacons (`scheme.zig`). Every verify-family entry point
+//! is TOTAL on attacker-controlled input — see `scheme.zig`.
 //!
 //! Const-time discipline: the secret-key paths (`keyGen`, `skToPk`,
-//! `sign`, `popProve`) use Part 1's constant-time double-and-add-always
-//! `scalarMul` and contain no secret-dependent branches (`keyGen`'s
-//! retry branch fires with probability ~2^-255 on the derived scalar
-//! being zero — the draft's own construction); the verify family
-//! (`verify`/`aggregate*`/`popVerify`) operates on PUBLIC data only and
-//! is variable-time, like the pairing and hash-to-curve it is built on
-//! (`SPEC.md`, "Constant-time choices").
+//! `sign`, `popProve`) use the constant-time double-and-add-always
+//! `scalarMul` and contain no secret-dependent branches (`keyGen`'s retry
+//! branch fires with probability ~2^-255); the verify family operates on
+//! PUBLIC data only and is variable-time (`SPEC.md`, "Constant-time
+//! choices").
 
 const std = @import("std");
 const g1 = @import("g1.zig");
@@ -60,28 +36,6 @@ const pairingmod = @import("pairing.zig");
 const hash_to_curve = @import("hash_to_curve.zig");
 
 pub const Fr = scalarmod.Fr;
-
-// ── ciphersuite constants ───────────────────────────────────────────
-//
-// draft-irtf-cfrg-bls-signature-05 §4.2.3, "BLS_SIG_BLS12381G2_XMD:
-// SHA-256_SSWU_RO_POP_" — the minimal-pubkey-size, ProofOfPossession
-// ciphersuite. Fetched 2026-07-14 from
-// https://www.ietf.org/archive/id/draft-irtf-cfrg-bls-signature-05.txt
-// — see NOTICE.
-
-/// The ciphersuite ID AND `hash_to_point` DST for ordinary message
-/// signing (`sign`/`verify`/`coreAggregateVerify`'s `hashToCurveG2`
-/// `dst` argument — draft §4.2.3; see their doc comments).
-pub const dst_sig = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-
-/// The SEPARATE DST used ONLY for proof-of-possession hashing
-/// (`popProve`/`popVerify`, draft §4.2.3). Using `dst_sig` here by
-/// mistake would let a PoP double as a forged ordinary signature over
-/// the public-key bytes (the classic reason PoP schemes use a
-/// domain-separated hash for the possession proof, not the message
-/// DST) — exactly the kind of mistake `SPEC.md`'s threat model calls
-/// out.
-pub const dst_pop = "BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 pub const BlsError = error{
     /// `keyGen`'s IKM precondition (draft §2.3: "IKM MUST be at least
@@ -130,49 +84,6 @@ pub const SecretKey = struct {
     /// any public key/signature already derived from it.
     pub fn deinit(self: *SecretKey) void {
         std.crypto.secureZero(u8, std.mem.asBytes(self));
-    }
-};
-
-/// A BLS public key: a `G1` point (min-pk variant). Wraps `g1.Affine`
-/// directly.
-pub const PublicKey = struct {
-    point: g1.Affine,
-
-    pub const encoded_bytes = g1.compressed_bytes; // 48
-
-    /// REAL — delegates to `g1.toBytesCompressed`/`fromBytesCompressed`
-    /// directly, so decoding checks on-curve and subgroup membership
-    /// (`error.NotInSubgroup`). It still accepts the identity, which
-    /// draft §2.5's `KeyValidate` refuses: `verify` and friends run
-    /// `keyValidate` (below) themselves, and a `PublicKey` built without
-    /// this decoder gets the same check there.
-    pub fn toBytes(self: PublicKey) [encoded_bytes]u8 {
-        return g1.toBytesCompressed(self.point);
-    }
-
-    pub fn fromBytes(bytes: [encoded_bytes]u8) BlsError!PublicKey {
-        return .{ .point = try g1.fromBytesCompressed(bytes) };
-    }
-};
-
-/// A BLS signature: a `G2` point (min-pk variant — the message-hash
-/// group). Wraps `g2.Affine` directly.
-pub const Signature = struct {
-    point: g2.Affine,
-
-    pub const encoded_bytes = g2.compressed_bytes; // 96
-
-    /// REAL — same shape as `PublicKey.toBytes`/`fromBytes`, one tower
-    /// level up: decoding checks subgroup membership. `verify` and
-    /// friends still run `g2.Jacobian.subgroupCheck` on `sig.point`
-    /// (draft §2.7 step 3, "signature_subgroup_check"), because a
-    /// `Signature` can be built without this decoder.
-    pub fn toBytes(self: Signature) [encoded_bytes]u8 {
-        return g2.toBytesCompressed(self.point);
-    }
-
-    pub fn fromBytes(bytes: [encoded_bytes]u8) BlsError!Signature {
-        return .{ .point = try g2.fromBytesCompressed(bytes) };
     }
 };
 
@@ -226,21 +137,13 @@ comptime {
 /// caller (the draft imposes no upper bound itself); widen the buffer
 /// if a longer `key_info` caller ever appears.
 ///
-/// **NOT wired against an external byte-exact KAT** (see this file's
-/// module doc comment and the owner-facing scaffold report): the
-/// draft's own Appendix B is explicitly "TBA" for KeyGen test vectors
-/// as of `-05`, and **EIP-2333 is a DIFFERENT algorithm despite the
-/// textual similarity** (same HKDF shape, same `"BLS-SIG-KEYGEN-SALT-"`
-/// string) — EIP-2333's `derive_master_SK` PRE-HASHES the salt on the
-/// FIRST call (`salt = H("BLS-SIG-KEYGEN-SALT-")`), which is exactly
-/// the `-04`-compatible behavior the draft's own text above documents
-/// as DIFFERENT from `-05`'s (raw ASCII string on the first call,
-/// hashing only on retry). Reusing an EIP-2333 vector here without
-/// adapting for that difference would silently pin the WRONG
-/// algorithm — flagged rather than guessed. `TODO(fable)`: if a
-/// byte-exact `-05`-compatible KeyGen vector surfaces, wire it; until
-/// then this function is exercised only by the self-consistent
-/// round-trip test below (`keyGen` -> `skToPk` -> ... -> `verify`).
+/// Anchored byte-exact to blst's `key_gen_v5` (`blst_interop_test.zig`)
+/// and to an independent recomputation of the -05 text: the draft's own
+/// Appendix B is still "TBA". **EIP-2333 and blst's default `key_gen` are
+/// the -04-compatible variant** — they pre-hash the salt on the first
+/// round (`salt = H("BLS-SIG-KEYGEN-SALT-")`), which -05 does only on a
+/// retry — so the same IKM gives a DIFFERENT key there. For Ethereum-
+/// style hierarchical keys use `eip2333.zig`.
 pub fn keyGen(ikm: []const u8, key_info: []const u8) BlsError!SecretKey {
     if (ikm.len < 32) return error.IkmTooShort;
     std.debug.assert(key_info.len <= 254);
@@ -272,336 +175,36 @@ pub fn keyGen(ikm: []const u8, key_info: []const u8) BlsError!SecretKey {
     }
 }
 
-/// draft §2.4 `SkToPk(SK) = point_to_pubkey([SK]G1)` (min-pk variant —
-/// `P` is the `G1` generator; the message hash and signature live in
-/// the OTHER group, `G2`, for this ciphersuite). REAL: a thin,
-/// judgment-free wrapper over Part 1's already-real, constant-time
-/// `g1.Jacobian.scalarMul` — `SK` is a genuine secret here, so the
-/// constant-time path is required and is exactly what `scalarMul`
-/// already provides (`g1.zig`'s own constant-time discipline).
-pub fn skToPk(sk: SecretKey) PublicKey {
-    const p = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(sk.scalar);
-    return .{ .point = p.toAffine() };
-}
+// ── the ciphersuites (scheme.zig) and this file's min-pk POP names ──────
 
-/// draft §2.5 `KeyValidate(PK)`: `PK` must decode to a NON-IDENTITY
-/// point in the order-`r` subgroup `G1`. REAL — a thin, judgment-free
-/// composition of already-real Part-1 primitives (`Affine.infinity`,
-/// `g1.Jacobian.subgroupCheck`); this is exactly the check `SPEC.md`'s
-/// threat model (and this file's module doc comment) says every
-/// trust-boundary entry point MUST perform on an externally-supplied
-/// public key, made explicit and reusable here — `sign`/`verify`/
-/// `coreAggregateVerify`/`fastAggregateVerify`/`popVerify`'s doc
-/// comments all call this out as a mandatory precondition.
-pub fn keyValidate(pk: PublicKey) bool {
-    if (pk.point.infinity) return false;
-    return g1.Jacobian.fromAffine(pk.point).subgroupCheck();
-}
+const schememod = @import("scheme.zig");
+pub const Variant = schememod.Variant;
+pub const Scheme = schememod.Scheme;
+pub const Bls = schememod.Bls;
+pub const MinPkPop = schememod.MinPkPop;
+pub const MinPkBasic = schememod.MinPkBasic;
+pub const MinPkAug = schememod.MinPkAug;
+pub const MinSigBasic = schememod.MinSigBasic;
+pub const MinSigAug = schememod.MinSigAug;
+pub const MinSigPop = schememod.MinSigPop;
+pub const negatedG1Generator = schememod.negatedG1Generator;
 
-/// The negated `G1` generator, `-P` in the draft's own notation — the
-/// fixed second operand every `pairingCheck`-based verify equation in
-/// this file needs: `e(X,Y) == e(P,Z)` rearranges to
-/// `pairingCheck({X,Y}, {-P,Z})` (`pairing.zig`'s product-check form).
-/// REAL: `g1.Jacobian.negate` is already real (Part 1); this is just a
-/// named, reusable wrapper so every verify-family function below can
-/// share it instead of
-/// recomputing it inline.
-pub fn negatedG1Generator() g1.Affine {
-    return g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
-}
-
-// ── signing / verification (SECURITY-CRITICAL) ──────────────────────
-
-/// draft §2.6 `CoreSign(SK, message)`, this ciphersuite's DST
-/// (`dst_sig`). Construction (quoted from the draft's pseudocode,
-/// fetched 2026-07-14 — see NOTICE):
-///
-/// ```
-/// Q = hash_to_point(message)        // hash_to_curve.hashToCurveG2(message, dst_sig)
-/// R = SK * Q                        // g2.Jacobian.scalarMul
-/// signature = point_to_signature(R) // Signature{ .point = R.toAffine() }
-/// return signature
-/// ```
-///
-/// `hashToCurveG2` (Part 3) already lands `Q` in the order-`r` subgroup
-/// (RFC 9380's `clear_cofactor`), so no extra subgroup check is needed
-/// on `Q` here — only on EXTERNALLY-supplied points (`verify`'s `sig`
-/// argument, `keyValidate`'s `pk`, both elsewhere).
-pub fn sign(sk: SecretKey, msg: []const u8) Signature {
-    const q = hash_to_curve.hashToCurveG2(msg, dst_sig);
-    // Constant-time scalar multiplication (double-and-add-always,
-    // g2.zig): `sk` is a genuine secret here. `msg` and `q` are public
-    // (hash-to-curve itself is variable-time by design — SPEC.md's
-    // threat model).
-    const r = g2.Jacobian.fromAffine(q).scalarMul(sk.scalar);
-    return .{ .point = r.toAffine() };
-}
-
-/// draft §2.7 `CoreVerify(PK, message, signature)` for the min-pk
-/// variant, EXPRESSED in this module's own
-/// `pairing.pairing(p: G1.Affine, q: G2.Affine) -> Gt` argument
-/// convention: the draft's abstract `C1 = pairing(Q, xP)` / `C2 =
-/// pairing(R, P)` becomes, with `Q, R ∈ G2` and `xP, P ∈ G1` for min-pk —
-///
-/// ```
-/// C1 = pairing.pairing(xP, Q)   =  e(PK, H(message))
-/// C2 = pairing.pairing(P, R)    =  e(G1_generator, signature)
-/// accept iff C1 == C2
-/// ```
-///
-/// — i.e. the SAME check, computed as ONE shared multi-Miller-loop +
-/// ONE final exponentiation via
-///
-/// ```
-/// pairing.pairingCheck(&.{
-///     .{ .p = pk.point, .q = Q },
-///     .{ .p = negatedG1Generator(), .q = sig.point },
-/// })
-/// ```
-///
-/// (`pairing.zig`'s product-check idiom: `e(A,B)*e(-C,D) == 1` iff
-/// `e(A,B) == e(C,D)`) — the form `verify`/`coreAggregateVerify`/
-/// `fastAggregateVerify`/`popVerify` should ALL actually use, not two
-/// separate `pairing.pairing` calls (the whole point of `pairingCheck`
-/// existing, see its own doc comment).
-///
-/// MANDATORY preconditions (draft §2.7 steps 2-4 — skipping ANY of
-/// these is the classic BLS forgery/rogue-key class of bug this
-/// module's `SPEC.md` centers its threat model on; `pk`/`sig` are
-/// FULLY ATTACKER-CONTROLLED at this entry point, so every failure
-/// below MUST return `false`, never panic or error):
-///   1. `signature_subgroup_check(R)` — `g2.Jacobian.fromAffine(sig.
-///      point).subgroupCheck()`.
-///   2. `keyValidate(pk)` — this file's own `keyValidate`, ALREADY
-///      real; call it (it itself covers the non-identity + subgroup
-///      checks on `pk`).
-///   3. `Q = hash_to_curve.hashToCurveG2(msg, dst_sig)`.
-pub fn verify(pk: PublicKey, msg: []const u8, sig: Signature) bool {
-    // Draft §2.7 steps 2-4, fail-closed: BOTH mandatory checks run
-    // before any pairing work, and every failure returns false (never
-    // panics — pk/sig are attacker-controlled at this entry point).
-    if (!g2.Jacobian.fromAffine(sig.point).subgroupCheck()) return false; // signature_subgroup_check
-    if (!keyValidate(pk)) return false; // non-identity + G1 subgroup
-    const q = hash_to_curve.hashToCurveG2(msg, dst_sig);
-    // e(PK, H(m)) == e(G1_gen, sig), as one shared multi-Miller-loop +
-    // one final exponentiation (see doc comment above).
-    return pairingmod.pairingCheck(&.{
-        .{ .p = pk.point, .q = q },
-        .{ .p = negatedG1Generator(), .q = sig.point },
-    });
-}
-
-// ── aggregation (REAL: plain point summation, no pairing) ───────────
-
-/// draft §2.8 `Aggregate((signature_1, ..., signature_n))`: sums the
-/// signatures' `G2` points. REAL — mechanical Jacobian point
-/// summation over already-real Part-1 `g2.Jacobian.add`; no pairing
-/// and no security judgment involved (the SECURITY-CRITICAL part of
-/// aggregation lives entirely on the VERIFY side —
-/// `coreAggregateVerify`/`fastAggregateVerify`, above/below).
-/// Precondition `n >= 1` (draft): `error.EmptySet` otherwise, matching
-/// the draft's own INVALID-on-empty-input contract. Does NOT subgroup-
-/// check its inputs (a `Signature` value is assumed already validated by
-/// whatever produced it — `Signature.fromBytes` checks;
-/// `coreAggregateVerify`/`fastAggregateVerify` re-check the
-/// AGGREGATE result's subgroup membership themselves, per the draft).
-pub fn aggregate(sigs: []const Signature) BlsError!Signature {
-    if (sigs.len == 0) return error.EmptySet;
-    var acc = g2.Jacobian.fromAffine(sigs[0].point);
-    for (sigs[1..]) |s| acc = acc.add(g2.Jacobian.fromAffine(s.point));
-    return .{ .point = acc.toAffine() };
-}
-
-/// The `G1`-side analogue of `aggregate`, used internally by
-/// `fastAggregateVerify`'s construction (draft §3.3.4 steps 1-4: `PK =
-/// point_to_pubkey(sum of pubkey_to_point(PK_i))`) and exposed
-/// publicly since it is also the "eth_aggregate_pubkeys"-shaped
-/// primitive (the consensus-spec-tests BLS suite's own handler name for
-/// exactly this operation) callers commonly want standalone. REAL —
-/// same reasoning as `aggregate`.
-pub fn aggregatePublicKeys(pks: []const PublicKey) BlsError!PublicKey {
-    if (pks.len == 0) return error.EmptySet;
-    var acc = g1.Jacobian.fromAffine(pks[0].point);
-    for (pks[1..]) |pk| acc = acc.add(g1.Jacobian.fromAffine(pk.point));
-    return .{ .point = acc.toAffine() };
-}
-
-// ── aggregate verification (SECURITY-CRITICAL) ──────────────────────
-
-/// draft §3.3.3 `CoreAggregateVerify` for the ProofOfPossession scheme
-/// (draft §3.2's MESSAGE-AUGMENTATION variant, which prepends `PK_i ||`
-/// to each message before hashing, is a DIFFERENT scheme and OUT OF
-/// SCOPE here — see this file's module doc comment / `SPEC.md`).
-/// Construction:
-///
-/// ```
-/// R = signature_to_point(signature)
-/// if !signature_subgroup_check(R): return false
-/// C1 = 1_GT
-/// for i in 1..n:
-///     if !KeyValidate(PK_i): return false
-///     C1 = C1 * pairing(Q_i, xP_i)     where Q_i = hash_to_point(message_i, dst)
-/// C2 = pairing(R, P)
-/// return C1 == C2
-/// ```
-///
-/// In this module's `pairingCheck` product form (see `verify`'s doc
-/// comment for the same idiom on a single pair): the pairs are
-/// `{ pk_i, hashToCurveG2(msg_i, dst) }` for EVERY `i`, PLUS one
-/// trailing `{ negatedG1Generator(), sig.point }`, product-checked
-/// against `1_Gt` with ONE shared final exponentiation. Because this
-/// function takes no allocator and `n` is caller-controlled, the pairs
-/// are NOT materialized as a single heap slice; instead the raw Miller
-/// values are accumulated over fixed-size STACK chunks
-/// (`multiMillerLoop` per chunk, `Fp12.mul` between chunks) and final-
-/// exponentiated ONCE at the end — exactly equivalent to a single
-/// `pairing.pairingCheck` call over all `n+1` pairs (Miller values
-/// multiply — `Fp12.conjugate` is multiplicative — and
-/// `finalExponentiation` is a group homomorphism; `pairingCheck`'s own
-/// doc comment makes the same argument), and exactly as cheap: the
-/// chunk width below matches `pairing.zig`'s own internal Miller batch
-/// width, so the shared-squaring saving is identical to what one giant
-/// slice would get. `dst` is a parameter (not hardcoded to `dst_sig`)
-/// so `aggregateVerify` below can be a pure wrapper — the
-/// ProofOfPossession scheme itself only ever calls this with `dst_sig`.
-///
-/// Preconditions `n >= 1` and `pks.len == msgs.len`
-/// (`error.EmptySet`/`error.LengthMismatch`) are checked BEFORE any
-/// pairing work; every SECURITY failure (subgroup/`KeyValidate`)
-/// returns `false`, never panics — `pks`/`sig` are attacker-controlled
-/// at this entry point.
-///
-/// NOTE (draft §3.1): when used via the Basic scheme's
-/// `AggregateVerify`, all messages MUST be distinct; the
-/// ProofOfPossession scheme (this file) instead defends rogue keys via
-/// `popProve`/`popVerify` at registration time, so distinct messages
-/// are not required here — see `fastAggregateVerify`'s doc comment.
-pub fn coreAggregateVerify(pks: []const PublicKey, msgs: []const []const u8, sig: Signature, dst: []const u8) BlsError!bool {
-    if (pks.len == 0) return error.EmptySet;
-    if (pks.len != msgs.len) return error.LengthMismatch;
-
-    // Draft §3.3.3 step 3: signature_subgroup_check, before any pairing.
-    if (!g2.Jacobian.fromAffine(sig.point).subgroupCheck()) return false;
-
-    var f = pairingmod.Fp12.one;
-    var pairs_buf: [8]pairingmod.PairingPair = undefined; // 8 == pairing.zig's miller_batch_max
-    var pending: usize = 0;
-    for (pks, msgs) |pk, msg| {
-        // Draft §3.3.3 step 6: KeyValidate EVERY public key.
-        if (!keyValidate(pk)) return false;
-        pairs_buf[pending] = .{ .p = pk.point, .q = hash_to_curve.hashToCurveG2(msg, dst) };
-        pending += 1;
-        if (pending == pairs_buf.len) {
-            f = f.mul(pairingmod.multiMillerLoop(pairs_buf[0..pending]));
-            pending = 0;
-        }
-    }
-    pairs_buf[pending] = .{ .p = negatedG1Generator(), .q = sig.point };
-    pending += 1;
-    f = f.mul(pairingmod.multiMillerLoop(pairs_buf[0..pending]));
-    // One shared final exponentiation over the whole accumulated
-    // Miller product — the `pairingCheck` idiom, chunk-accumulated.
-    return pairingmod.finalExponentiation(f).eql(pairingmod.Fp12.one);
-}
-
-/// draft §3.3.3 `AggregateVerify`: `coreAggregateVerify` fixed to this
-/// file's ciphersuite DST (`dst_sig`). Pure wrapper, not a distinct
-/// algorithm — the ProofOfPossession scheme does not augment messages
-/// with public keys (that is `MessageAugmentation`'s trick, draft §3.2,
-/// out of scope here).
-pub fn aggregateVerify(pks: []const PublicKey, msgs: []const []const u8, sig: Signature) BlsError!bool {
-    return coreAggregateVerify(pks, msgs, sig, dst_sig);
-}
-
-/// draft §3.3.4 `FastAggregateVerify(PKs, message, signature)`:
-/// aggregate the public keys (this file's own REAL
-/// `aggregatePublicKeys`), then `CoreVerify` the aggregate key against
-/// the single shared message. Construction:
-///
-/// ```
-/// aggregate = pubkey_to_point(PK_1)
-/// for i in 2..n: aggregate += pubkey_to_point(PK_i)
-/// PK = point_to_pubkey(aggregate)
-/// return CoreVerify(PK, message, signature)     // == this file's verify()
-/// ```
-///
-/// i.e. `const agg_pk = try aggregatePublicKeys(pks); return
-/// verify(agg_pk, msg, sig);` once `verify` itself is filled in.
-///
-/// **SECURITY PRECONDITION callers MUST satisfy (draft §3.3.4,
-/// verbatim, fetched 2026-07-14 — see NOTICE): "The caller MUST know a
-/// proof of possession for all PK_i, and PopVerify(PK_i, proof_i) MUST
-/// be VALID"** for every key being aggregated. This is NOT checked by
-/// this function (nor could it be — a PoP is checked ONCE, at
-/// key-registration time, not per-verify) — it is precisely what makes
-/// the ProofOfPossession scheme's `FastAggregateVerify` safe against
-/// rogue-key attacks WITHOUT the more expensive per-message
-/// `KeyValidate`-style aggregation checks that plain multi-signature
-/// schemes need: `popProve`/`popVerify` (below) bind each secret key to
-/// its claimed public key once, ahead of time. Skipping this
-/// precondition at the CALLER's registration step is a real forgery
-/// vector — see `SPEC.md`'s threat model.
-pub fn fastAggregateVerify(pks: []const PublicKey, msg: []const u8, sig: Signature) BlsError!bool {
-    if (pks.len == 0) return error.EmptySet;
-    const agg_pk = try aggregatePublicKeys(pks);
-    // `verify` performs the mandatory checks on the AGGREGATE
-    // (signature subgroup check + KeyValidate of the aggregate key) —
-    // exactly the draft's construction; per-key validity is the PoP
-    // precondition above, established at registration, not here.
-    return verify(agg_pk, msg, sig);
-}
-
-// ── proof of possession (SECURITY-CRITICAL) ─────────────────────────
-
-/// draft §3.3.2 `PopProve(SK)`: a self-signature over the SIGNER'S OWN
-/// public key bytes, hashed under the SEPARATE `dst_pop` DST (NOT
-/// `dst_sig` — see that constant's doc comment for why conflating the
-/// two would be a signature/PoP-confusion vulnerability). Construction:
-///
-/// ```
-/// PK = SkToPk(SK)                     // this file's REAL skToPk
-/// Q = hash_pubkey_to_point(PK)        // hashToCurveG2(&PK.toBytes(), dst_pop)
-/// R = SK * Q                          // g2.Jacobian.scalarMul
-/// proof = point_to_signature(R)
-/// return proof
-/// ```
-pub fn popProve(sk: SecretKey) Signature {
-    const pk = skToPk(sk);
-    const q = hash_to_curve.hashToCurveG2(&pk.toBytes(), dst_pop);
-    // Constant-time scalar multiplication — `sk` is a genuine secret
-    // (same reasoning as `sign`; the hashed message here — the public
-    // key's own serialization — is public).
-    const r = g2.Jacobian.fromAffine(q).scalarMul(sk.scalar);
-    return .{ .point = r.toAffine() };
-}
-
-/// draft §3.3.3 `PopVerify(PK, proof)`: verifies a `popProve` output
-/// against the SAME `dst_pop` hash of `PK`'s own bytes. Same equation
-/// shape as `verify` (see that function's doc comment for the
-/// `pairingCheck` product-form idiom), over `hash_pubkey_to_point`
-/// instead of `hash_to_point`:
-///
-/// ```
-/// R = signature_to_point(proof)
-/// if !signature_subgroup_check(R): return false
-/// if !KeyValidate(PK): return false
-/// Q = hash_pubkey_to_point(PK)        // hashToCurveG2(&PK.toBytes(), dst_pop)
-/// return pairing.pairingCheck(&.{
-///     .{ .p = PK.point, .q = Q },
-///     .{ .p = negatedG1Generator(), .q = proof.point },
-/// })
-/// ```
-pub fn popVerify(pk: PublicKey, proof: Signature) bool {
-    // Same fail-closed discipline as `verify`: both mandatory checks
-    // run before any pairing work; every failure returns false.
-    if (!g2.Jacobian.fromAffine(proof.point).subgroupCheck()) return false; // proof_subgroup_check
-    if (!keyValidate(pk)) return false; // non-identity + G1 subgroup
-    const q = hash_to_curve.hashToCurveG2(&pk.toBytes(), dst_pop);
-    return pairingmod.pairingCheck(&.{
-        .{ .p = pk.point, .q = q },
-        .{ .p = negatedG1Generator(), .q = proof.point },
-    });
-}
+pub const dst_sig = MinPkPop.dst_sig;
+pub const dst_pop = MinPkPop.dst_pop;
+pub const PublicKey = MinPkPop.PublicKey;
+pub const Signature = MinPkPop.Signature;
+pub const skToPk = MinPkPop.skToPk;
+pub const keyValidate = MinPkPop.keyValidate;
+pub const sign = MinPkPop.sign;
+pub const verify = MinPkPop.verify;
+pub const aggregate = MinPkPop.aggregate;
+pub const aggregatePublicKeys = MinPkPop.aggregatePublicKeys;
+pub const coreAggregateVerify = MinPkPop.coreAggregateVerify;
+pub const aggregateVerify = MinPkPop.aggregateVerify;
+pub const fastAggregateVerify = MinPkPop.fastAggregateVerify;
+pub const popProve = MinPkPop.popProve;
+pub const popVerify = MinPkPop.popVerify;
+pub const verifyBatch = MinPkPop.verifyBatch;
 
 // ── test helpers ─────────────────────────────────────────────────────
 

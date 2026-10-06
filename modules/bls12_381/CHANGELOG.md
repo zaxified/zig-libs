@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — Scope mvp → core. **New:** all six ciphersuites of
+  draft-irtf-cfrg-bls-signature-05 §4.2 through `bls_sig.Bls(variant, scheme)`
+  (`scheme.zig`): min-pk and min-sig, times Basic, MessageAugmentation and
+  ProofOfPossession, with the instances `MinPkBasic`, `MinPkAug`, `MinPkPop`,
+  `MinSigBasic`, `MinSigAug`, `MinSigPop`. The file-level `bls_sig` names (`sign`,
+  `verify`, `PublicKey`, …) are now aliases of `MinPkPop` and behave as before.
+  **New:** `verifyBatch` (random-linear-combination batch verification of independent
+  signatures, every suite); `eip2333` (`deriveMasterSk`, `deriveChildSk`,
+  `derivePath`, `parsePath`); `msm` (`g1Msm`, `g2Msm`, Pippenger, public data only —
+  `kzg.g1Msm` delegates to it); `hash_to_curve.hashToCurveG{1,2}Parts` and the
+  `…Parts` variants of `expandMessageXmd`/`hashToFieldFp{,2}` (hash a message given as
+  parts without concatenating). Evidence: all six suites byte-exact against blst run as
+  a black box (`tools/blst-vectors`), `keyGen` against blst's `key_gen_v5` (its first
+  KAT; blst's default `key_gen` is the draft -04 variant), live drand beacons for both
+  Basic layouts, EIP-2333 against the EIP and blst. Mutation run over the new code:
+  32 of 36 killed, 4 equivalent.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Backlog item 8 no longer says the Part 6 crypto-core pass is "NOT started" — it was completed 2026-07-14 (Status, `threshold.zig`); only the DKG follow-up remains.
 - **2026-10-05** — Mutation run: 39 of 43 killed, 4 equivalent; 8 tests added
   and 1 extended (infinity encodings of `G1`/`G2`, on-curve refusal of the

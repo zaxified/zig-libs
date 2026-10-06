@@ -25,13 +25,23 @@ vectors at every published stage (Appendix K.1; J.9.1/J.10.1 `u`,
 `Q0`/`Q1`, final `P` — all 5 messages each), with the isogeny
 coefficient tables sourced programmatically from the RFC's raw text
 and verified by an independent implementation (see `NOTICE`). Part 4
-(`bls_sig.zig`) is BLS signatures per draft-irtf-cfrg-bls-signature-05,
-minimal-pubkey-size/ProofOfPossession ciphersuite — `keyGen`/`skToPk`/
-`keyValidate`, `sign`/`verify`, signature/pubkey aggregation with
-`aggregateVerify`/`fastAggregateVerify`, and proof-of-possession
-(`popProve`/`popVerify`), byte-exact against `ethereum/bls12-381-tests`
-v0.1.2 vectors, with the mandatory subgroup/`KeyValidate` checks
-fail-closed at every verify entry point. Part 5 (`kzg.zig`) is EIP-4844
+(`bls_sig.zig`, `scheme.zig`) is BLS signatures per
+draft-irtf-cfrg-bls-signature-05, **all six ciphersuites**:
+`bls_sig.Bls(variant, scheme)` for min-pk / min-sig times Basic /
+MessageAugmentation / ProofOfPossession (`bls_sig.MinPkPop`, `MinSigBasic`,
+… — the file-level `bls_sig.sign`/`verify`/… are `MinPkPop`, Ethereum's
+suite) — `keyGen`/`skToPk`/`keyValidate`, `sign`/`verify`,
+signature/pubkey aggregation with `aggregateVerify` (and, for POP,
+`fastAggregateVerify` and `popProve`/`popVerify`), and `verifyBatch`
+(random-linear-combination batch verification of independent
+signatures). Byte-exact against `ethereum/bls12-381-tests` v0.1.2 and,
+for all six suites and `keyGen`, against supranational/blst run as a
+black box; live drand beacons verify under both Basic layouts. The
+mandatory subgroup/`KeyValidate` checks are fail-closed at every verify
+entry point. `eip2333.zig` derives Ethereum validator keys
+(`deriveMasterSk`/`deriveChildSk`/`derivePath`, EIP-2334 paths), checked
+against the EIP's vectors and blst; `msm.zig` is Pippenger
+multi-scalar multiplication for `G1` and `G2` (public data only). Part 5 (`kzg.zig`) is EIP-4844
 (deneb) KZG polynomial commitments: the trusted-setup loader (parses
 and validates the embedded official Ethereum KZG ceremony
 `trusted_setup.txt`, on-curve + subgroup-checking all 8257 points —

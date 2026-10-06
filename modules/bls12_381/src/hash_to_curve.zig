@@ -157,6 +157,16 @@ fn fp2c(comptime c0_hex: *const [96:0]u8, comptime c1_hex: *const [96:0]u8) Fp2 
 /// general multi-block loop frost/voprf's fixed-`ell` specializations
 /// never needed.
 pub fn expandMessageXmd(comptime len_in_bytes: usize, msg: []const u8, dst: []const u8) [len_in_bytes]u8 {
+    return expandMessageXmdParts(len_in_bytes, &.{msg}, dst);
+}
+
+/// `expandMessageXmd` over a message given as consecutive parts —
+/// `msg = parts[0] || parts[1] || ...` — without concatenating them: the
+/// message enters the expansion only through one streamed `SHA-256`
+/// (`b_0`), so the parts are fed to it in order. What the
+/// MessageAugmentation BLS scheme needs to hash `PK || message` for an
+/// arbitrarily long message with no allocator.
+pub fn expandMessageXmdParts(comptime len_in_bytes: usize, parts: []const []const u8, dst: []const u8) [len_in_bytes]u8 {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     const b_in_bytes = Sha256.digest_length; // 32
     const s_in_bytes = 64; // SHA-256 input block size
@@ -177,7 +187,7 @@ pub fn expandMessageXmd(comptime len_in_bytes: usize, msg: []const u8, dst: []co
 
     var h0 = Sha256.init(.{});
     h0.update(&z_pad);
-    h0.update(msg);
+    for (parts) |part| h0.update(part);
     h0.update(&l_i_b_str);
     h0.update(&[_]u8{0x00});
     h0.update(dst_prime);
@@ -250,7 +260,12 @@ fn reduceWideToFp(bytes: [l_bytes]u8) Fp {
 /// `hashToCurveG1` tests further down, which additionally need the
 /// still-stubbed `mapToCurveG1`).
 pub fn hashToFieldFp(comptime count: usize, msg: []const u8, dst: []const u8) [count]Fp {
-    const uniform = expandMessageXmd(count * l_bytes, msg, dst);
+    return hashToFieldFpParts(count, &.{msg}, dst);
+}
+
+/// `hashToFieldFp` over a message given as parts (`expandMessageXmdParts`).
+pub fn hashToFieldFpParts(comptime count: usize, parts: []const []const u8, dst: []const u8) [count]Fp {
+    const uniform = expandMessageXmdParts(count * l_bytes, parts, dst);
     var out: [count]Fp = undefined;
     inline for (0..count) |i| {
         out[i] = reduceWideToFp(uniform[i * l_bytes ..][0..l_bytes].*);
@@ -275,7 +290,12 @@ pub fn hashToFieldFp(comptime count: usize, msg: []const u8, dst: []const u8) [c
 /// `c0`/`c1` both checked) — see the tests below. REAL and PASSING
 /// today, same status as `hashToFieldFp`.
 pub fn hashToFieldFp2(comptime count: usize, msg: []const u8, dst: []const u8) [count]Fp2 {
-    const uniform = expandMessageXmd(count * 2 * l_bytes, msg, dst);
+    return hashToFieldFp2Parts(count, &.{msg}, dst);
+}
+
+/// `hashToFieldFp2` over a message given as parts (`expandMessageXmdParts`).
+pub fn hashToFieldFp2Parts(comptime count: usize, parts: []const []const u8, dst: []const u8) [count]Fp2 {
+    const uniform = expandMessageXmdParts(count * 2 * l_bytes, parts, dst);
     var out: [count]Fp2 = undefined;
     inline for (0..count) |i| {
         const e0 = reduceWideToFp(uniform[(2 * i) * l_bytes ..][0..l_bytes].*);
@@ -717,7 +737,12 @@ const g2_h_eff_bytes: [80]u8 = hexBytes(80, "0bc69f08f2ee75b3584c6a0ea91b352888e
 /// Pinned byte-exact against RFC 9380 Appendix J.9.1's final `P` (all
 /// 5 published messages) by the tests below.
 pub fn hashToCurveG1(msg: []const u8, dst: []const u8) g1.Affine {
-    const u = hashToFieldFp(2, msg, dst);
+    return hashToCurveG1Parts(&.{msg}, dst);
+}
+
+/// `hashToCurveG1` of `parts[0] || parts[1] || ...`, without concatenating.
+pub fn hashToCurveG1Parts(parts: []const []const u8, dst: []const u8) g1.Affine {
+    const u = hashToFieldFpParts(2, parts, dst);
     const q0 = g1.Jacobian.fromAffine(mapToCurveG1(u[0]));
     const q1 = g1.Jacobian.fromAffine(mapToCurveG1(u[1]));
     return q0.add(q1).scalarMulBytes(&g1_h_eff_bytes).toAffine();
@@ -742,7 +767,12 @@ pub fn encodeToCurveG1(msg: []const u8, dst: []const u8) g1.Affine {
 /// `h_eff` for `clear_cofactor`). Pinned byte-exact against RFC 9380
 /// Appendix J.10.1's final `P` (all 5 messages) by the tests below.
 pub fn hashToCurveG2(msg: []const u8, dst: []const u8) g2.Affine {
-    const u = hashToFieldFp2(2, msg, dst);
+    return hashToCurveG2Parts(&.{msg}, dst);
+}
+
+/// `hashToCurveG2` of `parts[0] || parts[1] || ...`, without concatenating.
+pub fn hashToCurveG2Parts(parts: []const []const u8, dst: []const u8) g2.Affine {
+    const u = hashToFieldFp2Parts(2, parts, dst);
     const q0 = g2.Jacobian.fromAffine(mapToCurveG2(u[0]));
     const q1 = g2.Jacobian.fromAffine(mapToCurveG2(u[1]));
     return q0.add(q1).scalarMulBytes(&g2_h_eff_bytes).toAffine();
@@ -1264,4 +1294,22 @@ test "iso curve constants: g1_iso_z is nonzero, g2_iso_a/g2_iso_b decode as docu
     try std.testing.expect(g2_iso_a.c0.isZero());
     try std.testing.expectEqual(@as(u8, 240), g2_iso_a.c1.toBytes()[47]);
     try std.testing.expect(g2_iso_b.c0.eql(g2_iso_b.c1));
+}
+
+test "hashToCurve*Parts equals hashToCurve* over the concatenation, wherever the cut falls" {
+    // The parts variant streams the message into b_0; a part dropped,
+    // repeated or reordered changes the point. Cuts at 0, inside and at
+    // the end, including empty parts.
+    const msg = "BLS message augmentation prefixes the 48-byte public key to this";
+    const dst = "QUUX-V01-CS02-with-BLS12381G1_XMD:SHA-256_SSWU_RO_";
+    const want1 = hashToCurveG1(msg, dst);
+    const want2 = hashToCurveG2(msg, dst);
+    for ([_]usize{ 0, 1, 17, msg.len - 1, msg.len }) |cut| {
+        const parts = [_][]const u8{ msg[0..cut], "", msg[cut..] };
+        try std.testing.expectEqual(g1.toBytesCompressed(want1), g1.toBytesCompressed(hashToCurveG1Parts(&parts, dst)));
+        try std.testing.expectEqual(g2.toBytesCompressed(want2), g2.toBytesCompressed(hashToCurveG2Parts(&parts, dst)));
+    }
+    // Swapped halves: a different message, a different point.
+    const swapped = [_][]const u8{ msg[17..], msg[0..17] };
+    try std.testing.expect(!std.mem.eql(u8, &g1.toBytesCompressed(want1), &g1.toBytesCompressed(hashToCurveG1Parts(&swapped, dst))));
 }

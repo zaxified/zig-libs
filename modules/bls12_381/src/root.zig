@@ -58,8 +58,11 @@ pub const scalar = @import("scalar.zig");
 pub const pairing = @import("pairing.zig");
 pub const hash_to_curve = @import("hash_to_curve.zig");
 pub const bls_sig = @import("bls_sig.zig");
+pub const scheme = @import("scheme.zig");
 pub const kzg = @import("kzg.zig");
+pub const msm = @import("msm.zig");
 pub const threshold = @import("threshold.zig");
+pub const eip2333 = @import("eip2333.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -73,7 +76,7 @@ pub const Gt = pairing.Gt;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures, KZG commitments, threshold BLS.",
+    .doc = "BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures (all six draft ciphersuites, batch verification), EIP-2333 key derivation, G1/G2 MSM, KZG commitments, threshold BLS.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -102,8 +105,12 @@ test {
     _ = pairing;
     _ = hash_to_curve;
     _ = bls_sig;
+    _ = scheme;
     _ = kzg;
+    _ = msm;
     _ = threshold;
+    _ = eip2333;
+    _ = @import("blst_interop_test.zig");
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {

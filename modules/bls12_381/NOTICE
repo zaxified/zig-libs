@@ -631,6 +631,28 @@ clean.
 `SPEC.md`'s "Part 4 design" section and `bls_sig.zig`'s module doc
 comment for the settled design record.
 
+Part 4, 2026-10-06 (scheme.zig, eip2333.zig, msm.zig) — provenance
+-------------------------------------------------------------------
+
+1. **draft-irtf-cfrg-bls-signature-05** §3.1-§3.3 and §4.2 — the six
+   ciphersuite IDs and the Basic / MessageAugmentation / ProofOfPossession
+   rules, implemented from the draft text (same fetch as Part 4 above).
+2. **EIP-2333** (https://eips.ethereum.org/EIPS/eip-2333, CC0-1.0, fetched
+   2026-10-06) — algorithm pseudocode and the test cases transcribed into
+   `src/eip2333.zig`. **EIP-2334** for the path shape.
+3. **supranational/blst 0.3.16 Rust bindings** (Apache-2.0) — run as a
+   BLACK-BOX oracle by `tools/blst-vectors`, which calls only its public
+   API and prints `src/blst_vectors.zig`. No blst source was read or
+   copied; the generated file holds values blst computed, not its code.
+4. **drand mainnet beacons** (public chain data, already pinned in
+   `modules/drand`) — the `default` chain's round 1000000 and quicknet's
+   round 1000, used as KATs in `src/scheme.zig`.
+5. Pippenger (`msm.zig`) is the code formerly in `kzg.zig`, generalised
+   over the point type; batch verification with random coefficients is
+   the textbook small-exponent test (Bellare, Garay, Rabin, "Fast batch
+   verification for modular exponentiation and digital signatures",
+   EUROCRYPT 1998), named, not read as source.
+
 Part 5 (kzg.zig) — provenance and test-vector sourcing (SCAFFOLD PASS, 2026-07-14)
 ------------------------------------------------------------------------------------
 

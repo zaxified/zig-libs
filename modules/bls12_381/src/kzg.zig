@@ -49,6 +49,7 @@ const g1 = @import("g1.zig");
 const g2 = @import("g2.zig");
 const scalar = @import("scalar.zig");
 const pairing = @import("pairing.zig");
+const msmmod = @import("msm.zig");
 
 pub const Fr = scalar.Fr;
 
@@ -258,29 +259,7 @@ pub const TrustedSetup = struct {
 /// Variable-time Jacobian + Jacobian addition (EFD `add-2007-bl`, the
 /// branchy twin of `g1.Jacobian.add` — see the section comment above).
 fn jacAddVartime(a: g1.Jacobian, b: g1.Jacobian) g1.Jacobian {
-    if (a.isIdentity()) return b;
-    if (b.isIdentity()) return a;
-    const z1z1 = a.z.square();
-    const z2z2 = b.z.square();
-    const ua = a.x.mul(z2z2); // U1
-    const ub = b.x.mul(z1z1); // U2
-    const sa = a.y.mul(b.z).mul(z2z2); // S1
-    const sb = b.y.mul(a.z).mul(z1z1); // S2
-    const h = ub.sub(ua);
-    const s_diff = sb.sub(sa);
-    if (h.isZero()) {
-        if (s_diff.isZero()) return a.double(); // P == Q
-        return g1.Jacobian.identity; // P == -Q
-    }
-    const i = h.add(h).square();
-    const j = h.mul(i);
-    const rr = s_diff.add(s_diff);
-    const v = ua.mul(i);
-    const x3 = rr.square().sub(j).sub(v.add(v));
-    const s1j = sa.mul(j);
-    const y3 = rr.mul(v.sub(x3)).sub(s1j.add(s1j));
-    const z3 = a.z.add(b.z).square().sub(z1z1).sub(z2z2).mul(h);
-    return .{ .x = x3, .y = y3, .z = z3 };
+    return msmmod.addVartime(g1.Jacobian, a, b);
 }
 
 /// Variable-time Jacobian + Affine ("mixed") addition (EFD
@@ -288,30 +267,7 @@ fn jacAddVartime(a: g1.Jacobian, b: g1.Jacobian) g1.Jacobian {
 /// `Z2`-dependent multiplications) — the inner-loop operation
 /// `g1Msm`'s bucket accumulation lives on.
 fn jacMixedAddVartime(a: g1.Jacobian, b: g1.Affine) g1.Jacobian {
-    if (b.infinity) return a;
-    if (a.isIdentity()) return g1.Jacobian.fromAffine(b);
-    const z1z1 = a.z.square();
-    const ub = b.x.mul(z1z1); // U2
-    const sb = b.y.mul(a.z).mul(z1z1); // S2
-    const h = ub.sub(a.x);
-    const s_diff = sb.sub(a.y);
-    if (h.isZero()) {
-        if (s_diff.isZero()) return a.double(); // P == Q
-        return g1.Jacobian.identity; // P == -Q
-    }
-    const hh = h.square();
-    const i = blk: { // I = 4*HH
-        const hh2 = hh.add(hh);
-        break :blk hh2.add(hh2);
-    };
-    const j = h.mul(i);
-    const rr = s_diff.add(s_diff);
-    const v = a.x.mul(i);
-    const x3 = rr.square().sub(j).sub(v.add(v));
-    const yj = a.y.mul(j);
-    const y3 = rr.mul(v.sub(x3)).sub(yj.add(yj));
-    const z3 = a.z.add(h).square().sub(z1z1).sub(hh);
-    return .{ .x = x3, .y = y3, .z = z3 };
+    return msmmod.mixedAddVartime(g1, a, b);
 }
 
 /// Variable-time `[s]P` (big-endian byte-string scalar), plain
@@ -796,34 +752,6 @@ pub fn ifft(allocator: std.mem.Allocator, values: []const Fr, roots: []const Fr)
 
 // ── MSM ─────────────────────────────────────────────────────────────────
 
-/// Bucket-window width for `g1Msm`, by input size — the classic
-/// Pippenger trade-off (`ceil(256/c)` windows, each costing `n` bucket
-/// insertions + `~2*2^c` aggregation additions; `c ≈ log2(n) - 4` is
-/// near-optimal for this range, capped at 8 so the bucket array stays a
-/// small fixed stack-friendly allocation).
-fn msmWindowBits(n: usize) usize {
-    if (n < 4) return 2;
-    if (n < 16) return 3;
-    if (n < 64) return 4;
-    if (n < 256) return 5;
-    if (n < 1024) return 6;
-    if (n < 4096) return 7;
-    return 8;
-}
-
-/// Bits `[bit_off, bit_off + c)` of a 32-byte big-endian scalar, as the
-/// little-endian window digit Pippenger's bucket phase consumes.
-fn scalarWindowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
-    var digit: usize = 0;
-    for (0..c) |i| {
-        const b = bit_off + i;
-        if (b >= 256) break;
-        const bit: usize = (bytes[31 - (b >> 3)] >> @as(u3, @intCast(b & 7))) & 1;
-        digit |= bit << @as(std.math.Log2Int(usize), @intCast(i));
-    }
-    return digit;
-}
-
 /// Multi-scalar multiplication in `G1`: `sum_i scalars[i] * points[i]`
 /// (spec's `g1_lincomb`) — the operation `blobToKzgCommitment` and
 /// `computeKzgProofImpl`'s quotient-commitment step both reduce to, and
@@ -831,9 +759,9 @@ fn scalarWindowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
 /// Construction: Pippenger's bucket method (see e.g. Bernstein's
 /// "Pippenger's exponentiation algorithm" survey; every production MSM —
 /// `blst`, `zkcrypto` — is a variant): split each 256-bit scalar into
-/// `ceil(256/c)`-many `c`-bit windows (`msmWindowBits`); per window,
+/// `ceil(256/c)`-many `c`-bit windows (`msm.zig`, shared with `G2`); per window,
 /// drop each point into the bucket indexed by its digit
-/// (`jacMixedAddVartime` — the points are affine), then aggregate
+/// (mixed addition — the points are affine), then aggregate
 /// buckets with the running-sum trick (`sum_d d * bucket[d]` in `2*(2^c
 /// - 1)` additions), and fold windows most-significant-first with `c`
 /// doublings between them. All arithmetic is the variable-time
@@ -845,50 +773,12 @@ fn scalarWindowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
 /// never materialized).
 pub fn g1Msm(allocator: std.mem.Allocator, points: []const g1.Affine, scalars: []const Fr) KzgError!g1.Jacobian {
     std.debug.assert(points.len == scalars.len);
-    if (points.len == 0) return g1.Jacobian.identity;
-
-    // Serialize every scalar once up front (windows re-read them
-    // ceil(256/c) times).
-    const scalar_bytes = try allocator.alloc([32]u8, scalars.len);
-    defer allocator.free(scalar_bytes);
-    for (scalar_bytes, scalars) |*bytes, s| bytes.* = s.toBytes();
-
-    const c = msmWindowBits(points.len);
-    const n_buckets = (@as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(c))) - 1; // digit 0 excluded
-    const buckets = try allocator.alloc(g1.Jacobian, n_buckets);
-    defer allocator.free(buckets);
-
-    const n_windows = (256 + c - 1) / c;
-    var acc = g1.Jacobian.identity;
-    var w = n_windows;
-    while (w > 0) {
-        w -= 1;
-        if (w != n_windows - 1) {
-            for (0..c) |_| acc = acc.double();
-        }
-
-        @memset(buckets, g1.Jacobian.identity);
-        var any = false;
-        for (points, scalar_bytes) |point, *bytes| {
-            const digit = scalarWindowDigit(bytes, w * c, c);
-            if (digit == 0) continue;
-            buckets[digit - 1] = jacMixedAddVartime(buckets[digit - 1], point);
-            any = true;
-        }
-        if (!any) continue;
-
-        // sum_d (d+1) * buckets[d] via the running-sum trick.
-        var running = g1.Jacobian.identity;
-        var window_sum = g1.Jacobian.identity;
-        var d = n_buckets;
-        while (d > 0) {
-            d -= 1;
-            running = jacAddVartime(running, buckets[d]);
-            window_sum = jacAddVartime(window_sum, running);
-        }
-        acc = jacAddVartime(acc, window_sum);
-    }
-    return acc;
+    // Pippenger lives in `msm.zig` (both groups); the length check above
+    // keeps this signature's assert contract, so only OOM can come back.
+    return msmmod.g1Msm(allocator, points, scalars) catch |err| switch (err) {
+        error.LengthMismatch => unreachable,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 // ── polynomial evaluation ───────────────────────────────────────────────
