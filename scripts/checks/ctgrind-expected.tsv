@@ -191,8 +191,8 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	2a6dacfd1a726319	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	c866c51a27730cf4	870a36cbebbc4588
-chachapoly	ReleaseSafe	aead	1	>=1	c866c51a27730cf4	870a36cbebbc4588
+chachapoly	ReleaseFast	aead	1	4	af92603a6e5ed4e7	870a36cbebbc4588
+chachapoly	ReleaseSafe	aead	1	>=1	af92603a6e5ed4e7	870a36cbebbc4588
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
@@ -259,7 +259,7 @@ ct25519	ReleaseFast	msm	1	0	1eae4e8bf12a8d65	55f7fb062759921f
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
 ct25519	ReleaseFast	x25519	1	0	1eae4e8bf12a8d65	8af2fe8213b778aa
-decaf448	ReleaseFast	scalarmul	1	0	c359478c7f4ea246	77a1bd1038ca1053
+decaf448	ReleaseFast	scalarmul	1	0	44f7704d82e61c75	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
 # declassifies Y, so what remains is a claim about the secret alone.
@@ -735,8 +735,14 @@ paillier	ReleaseFast	keygen	1	<=314	96e598abc9064c6e	61a35e2d95a376cf
 # fp12pow` were green throughout and are left untouched.
 # Source pin moved 2026-10-02 (b9d999db changed doc comments only): --stacks
 # reads the same lines, tlock.zig:358,361 and 406,430,432.
-tlock	ReleaseFast	fp12pow	1	5	80982f3950525903	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	8	80982f3950525903	3a939f7ff5b39d03
+# Source pin moved 2026-10-06 (5ed12e77 age envelope, cd939f7d subgroup checks;
+# tag 2026-10-06 ctgrind lane): the same call sites 9 lines up -- --stacks
+# reads tlock.zig:349 (h3 -> Fr.fromBytes), :352 (r*G2 toAffine/inv) for
+# fp12pow, and :397 (pairing final-exp inv), :421, :423, :424 (the FO
+# re-encryption compare: toBytesCompressed + mem.eql) for decrypt; the leaves
+# are in bls12_381 (field/fp/fp2/g2.zig) since tlock moved onto it.
+tlock	ReleaseFast	fp12pow	1	5	bb25a5198dbaac47	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	8	bb25a5198dbaac47	3a939f7ff5b39d03
 ibe	ReleaseFast	extract	1	1	140a7d3db097ec1b	686f0732e74c5ef7
 ibe	ReleaseFast	decrypt	1	10	ba4d234657626842	fb52b6c55cc51706
 ibe	ReleaseFast	fp12pow	1	0	140a7d3db097ec1b	d2e187260f9f18a2
@@ -780,7 +786,7 @@ hpke	ReleaseFast	p256_authdecap	1	4	ceef922c5fee3703	4b0f0c964acb8411
 hpke	ReleaseFast	p384_decap	1	2	ceef922c5fee3703	6b70bba9cc229a39
 hpke	ReleaseFast	p384_authdecap	1	4	ceef922c5fee3703	2741ac2ff5069767
 hpke	ReleaseFast	open	1	1	cd2271d9a14497cf	59883c70dcd08ee6
-signal	ReleaseFast	sign	1	1	1b83757d7d8f0161	b2a0053066d93a75
+signal	ReleaseFast	sign	1	1	0b85e553109d6bbe	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	dc09967e5dddb5c2	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
@@ -938,6 +944,6 @@ bip32	ReleaseFast	mnemonic	1	3	008c60b09bb381e3	d42db8cf9cdc2200
 # Source pin moved 2026-10-02 (d30dce13: `x86_asm` also off for the self-hosted
 # backend on a baseline CPU; the ReleaseFast/LLVM build is unchanged): --stacks
 # reads the same one line, root.zig:793 (NiKey.open) and :266 (Generic.open).
-aesgcm	ReleaseFast	ctx	1	4	8f53d52e916f2339	beb9b7dd29864dad
-aesgcm	ReleaseFast	stateless	1	4	8f53d52e916f2339	beb9b7dd29864dad
-aesgcm	ReleaseFast	generic	1	4	8f53d52e916f2339	beb9b7dd29864dad
+aesgcm	ReleaseFast	ctx	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
+aesgcm	ReleaseFast	stateless	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
+aesgcm	ReleaseFast	generic	1	4	6ec74fb0c56bb12b	beb9b7dd29864dad
