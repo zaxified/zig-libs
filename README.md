@@ -539,7 +539,7 @@ way to recognise it.
 | [`ct25519`](modules/ct25519/README.md) | 2 | Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` with key generation on the fixed-base comb (2.4× std). | any | — |
 | [`ctap2`](modules/ctap2/README.md) | 2 | CTAP2 (FIDO2) `authenticatorClientPIN` command layer over a caller-supplied transport: GetInfo, PIN retries/set/change/token-with-permissions, both PIN protocols, CTAPHID packet codec. | any | cbor, ctap2pin |
 | [`ctap2pin`](modules/ctap2pin/README.md) | 2 | CTAP2 `pinUvAuthProtocol` (FIDO2/WebAuthn) — both protocol versions: ECDH-P256 key agreement, encrypt/decrypt, authenticate/verify. | any | p256 |
-| [`decaf448`](modules/decaf448/README.md) | 3 | decaf448 prime-order group (RFC 9496) over `ed448` — eliminates cofactor-4 pitfalls for threshold signing, VRFs, anonymous credentials. | any | ed448 |
+| [`decaf448`](modules/decaf448/README.md) | 2 | decaf448 prime-order group (RFC 9496) over `ed448` — eliminates cofactor-4 pitfalls for threshold signing, VRFs, anonymous credentials. | any | ed448 |
 | [`dkg`](modules/dkg/README.md) | 3 | Dealer-free Distributed Key Generation (GJKR) for `threshold_ecdsa` — bias-resistant secp256k1 key sharing feeding threshold signing. | any | threshold_ecdsa, paillier |
 | [`drand`](modules/drand/README.md) | 3 | drand randomness-beacon client — chain-info and round codec, BLS-verifies a round signature against the chain public key. Transport-agnostic. | any | bls12_381, tlock |
 | [`dtls`](modules/dtls/README.md) | 3 | DTLS 1.3 (RFC 9147), PSK mode — key schedule, AEAD record layer, handshake fragmentation/reassembly, anti-replay window. | any | rsa, x509, chachapoly |

@@ -2,7 +2,9 @@ decaf448 — third-party attribution
 ====================================================================
 
 This file carries a CONDITION, added 2026-09-09. `src/kat_vectors.zig`
-reproduces the test vectors published in RFC 9496 Appendix B. Redistributing
+reproduces the test vectors published in RFC 9496 Appendix B
+(and, since 2026-10-06, `src/hash_kat_test.zig` those of RFC 9380 K.6 and
+RFC 9497 A.2). Redistributing
 this module — alone, or as part of zig-libs — must keep this file with it.
 
 WHY THIS FILE DID NOT EXIST UNTIL NOW. `README.md`'s `Provenance:` statement
@@ -24,6 +26,12 @@ WHAT WAS TAKEN
     extracted programmatically from the RFC text at scaffold time and diffed
     byte-for-byte against it, not hand-transcribed. Whitespace and line
     wrapping were removed; no value was otherwise changed.
+  - `src/hash_kat_test.zig` (added 2026-10-06) — the `expand_message_xof`
+    (SHAKE256) vectors of RFC 9380 Appendix K.6 and the decaf448-SHAKE256
+    vectors of RFC 9497 Appendix A.2. Transcribed from the CFRG working
+    groups' generator output for those drafts (the values the RFCs print);
+    whitespace and line wrapping removed, nothing else changed. The same
+    IETF Trust grant below covers them.
 
 THE GRANT THIS RESTS ON
 -----------------------
@@ -40,6 +48,12 @@ Reproduced as the Revised BSD License requires:
 
     Copyright (c) 2023 IETF Trust and the persons identified as the
     authors of RFC 9496. All rights reserved.
+
+    Copyright (c) 2023 IETF Trust and the persons identified as the
+    authors of RFC 9380. All rights reserved.
+
+    Copyright (c) 2023 IETF Trust and the persons identified as the
+    authors of RFC 9497. All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are

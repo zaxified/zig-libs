@@ -417,10 +417,10 @@ pub const Element = struct {
 /// from behind `gate.core_implemented` (now `true`), per the scaffold
 /// convention that gated tests guard the once-stubbed cores. Note:
 /// decaf448's derivation function takes
-/// ALREADY-UNIFORM 112-byte input — no hash function inside; a caller
-/// wanting `hash_to_decaf448` (RFC 9380 Appendix C) supplies its own
-/// domain-separated expand-message step before calling this, out of
-/// scope for this module (RFC 9496 §5.3.4's own note).
+/// ALREADY-UNIFORM 112-byte input — no hash function inside; for
+/// `hash_to_decaf448` (RFC 9380 Appendix C) of an arbitrary message with a
+/// domain separation tag, use `hash.hashToElement`, which runs
+/// `expand_message_xof` (SHAKE256) and then this function.
 pub fn oneWayMap(b: [112]u8) Element {
     const p1 = mapToElement(b[0..56].*);
     const p2 = mapToElement(b[56..112].*);

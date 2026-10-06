@@ -85,11 +85,108 @@ pub fn mul(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
     return fromEd448(ed448.scalar.mul(toEd448(a), toEd448(b)));
 }
 
+/// `-a (mod l)`, `a` canonical (`< l`, the same contract as `add`).
+/// Constant-time: a fixed 56-byte borrow-propagating subtraction `l - a`
+/// (which lies in `[1, l]`), then `ed448.scalar.add`'s branch-free
+/// conditional subtract folds the single out-of-range value `l` (from
+/// `a == 0`) back to `0`.
+pub fn negate(a: CompressedScalar) CompressedScalar {
+    var diff: ed448.scalar.CompressedScalar = undefined;
+    var borrow: u16 = 0;
+    for (0..ed448.scalar.encoded_bytes) |i| {
+        const ai: u16 = if (i < encoded_bytes) a[i] else 0;
+        // Operands < 2^8, borrow <= 1: a negative true result wraps into
+        // [0xff00, 0xffff] (bit 15 set); a non-negative one stays < 2^8.
+        const d = @as(u16, ed448.scalar.l_bytes[i]) -% ai -% borrow;
+        diff[i] = @truncate(d);
+        borrow = d >> 15;
+    }
+    return fromEd448(ed448.scalar.add(diff, ed448.scalar.zero));
+}
+
+/// `a - b (mod l)`, both canonical. Constant-time (`negate` then `add`).
+pub fn sub(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
+    return add(a, negate(b));
+}
+
+/// `l - 2`, the Fermat exponent `invert` raises to (`l` is prime, so
+/// `a^(l-2) == a^-1` for `a != 0`). `l`'s low byte is `0xf3`, so
+/// subtracting 2 borrows from nothing.
+const l_minus_2: CompressedScalar = blk: {
+    var e = fromEd448(ed448.scalar.l_bytes);
+    e[0] -= 2;
+    break :blk e;
+};
+
+/// `a^-1 (mod l)` by Fermat's little theorem, `a^(l-2)`. Constant-time with
+/// respect to `a`: plain left-to-right square-and-multiply over the PUBLIC,
+/// fixed exponent `l - 2` — the only branch is on a bit of that constant,
+/// and every step is `ed448.scalar.mul`, itself constant-time (fixed
+/// schoolbook multiply plus fixed-iteration reduction).
+///
+/// `invert(0)` returns `0` (there is no inverse; `0^(l-2) == 0`). A caller
+/// for which a zero scalar is an error must check for it — e.g. RFC 9497's
+/// `Blind` redraws a zero blind before it is ever inverted.
+pub fn invert(a: CompressedScalar) CompressedScalar {
+    const a57 = toEd448(a);
+    var acc = toEd448(one);
+    var bit: usize = 8 * encoded_bytes;
+    while (bit > 0) {
+        bit -= 1;
+        acc = ed448.scalar.mul(acc, acc);
+        if ((l_minus_2[bit / 8] >> @intCast(bit % 8)) & 1 == 1) {
+            acc = ed448.scalar.mul(acc, a57);
+        }
+    }
+    return fromEd448(acc);
+}
+
+/// The scalar `1`.
+pub const one: CompressedScalar = blk: {
+    var s = zero;
+    s[0] = 1;
+    break :blk s;
+};
+
+/// Reduce an `n`-byte little-endian integer modulo `l` (`n <= 114`,
+/// checked at compile time). Constant-time: zero-extends to 114 bytes
+/// (value-preserving) and delegates to `ed448.scalar.reduceWide`'s
+/// fixed-iteration binary reduction. `n = 64` is RFC 9497's decaf448
+/// `HashToScalar` width (see `hash.hashToScalar`).
+pub fn reduce(comptime n: usize, bytes: [n]u8) CompressedScalar {
+    comptime if (n > 114) @compileError("scalar.reduce: at most 114 bytes");
+    var wide = [_]u8{0} ** 114;
+    wide[0..n].* = bytes;
+    return fromEd448(ed448.scalar.reduceWide(wide));
+}
+
+/// Reduce a 114-byte little-endian integer (e.g. a SHAKE256 digest)
+/// modulo `l` — the wide reduction RFC 8032 uses for edwards448 and the
+/// one a uniform scalar is drawn from. With 912 input bits against a
+/// 446-bit `l`, the distance from uniform is below `2^-466`.
+pub fn fromWide(wide: [114]u8) CompressedScalar {
+    return reduce(114, wide);
+}
+
+pub const RandomError = std.Io.RandomSecureError;
+
+/// A uniformly random scalar: 114 bytes from `io.randomSecure` (the
+/// fail-closed source — no silent fallback seed; see the `entropy` module's
+/// doc comment for why the degrading `io.random` is not used for secrets),
+/// wide-reduced by `fromWide`. Constant-time; may return `0` with
+/// probability `~2^-446`. Errors are `randomSecure`'s own
+/// (`EntropyUnavailable`, `Canceled`), passed through to the caller.
+pub fn random(io: std.Io) RandomError!CompressedScalar {
+    var buf: [114]u8 = undefined;
+    try io.randomSecure(&buf);
+    defer std.crypto.secureZero(u8, &buf);
+    return fromWide(buf);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "toEd448/fromEd448 round-trip on zero and one" {
-    var one = zero;
-    one[0] = 1;
+    try std.testing.expectEqual(@as(u8, 1), one[0]);
     try std.testing.expectEqualSlices(u8, &one, &fromEd448(toEd448(one)));
     try std.testing.expectEqualSlices(u8, &zero, &fromEd448(toEd448(zero)));
 }
@@ -119,11 +216,128 @@ test "rejectNonCanonical rejects l itself (via the width bridge) and accepts l-1
 }
 
 test "add/mul: identities, delegated correctly to ed448.scalar" {
-    var one = zero;
-    one[0] = 1;
     var two = zero;
     two[0] = 2;
     try std.testing.expectEqualSlices(u8, &two, &add(one, one));
     try std.testing.expectEqualSlices(u8, &one, &mul(one, one));
     try std.testing.expectEqualSlices(u8, &zero, &mul(one, zero));
+}
+
+// ── big-integer oracle (SELF-DERIVED) ───────────────────────────────────
+//
+// The tests below recompute each new operation with Zig's native wide
+// integers (`u1024`, compiler-rt division) — a second, independent
+// arithmetic that shares no code with `ed448.scalar`'s limb machinery. It is
+// SELF-DERIVED (same repository, same compiler), not an external anchor; the
+// external anchor for `invert`/`fromWide`-style reduction is RFC 9497's
+// decaf448 OPRF vectors in `kat_test.zig`.
+
+const Big = u1024;
+const l_big: Big = std.mem.readInt(u456, &ed448.scalar.l_bytes, .little);
+
+fn bigOf(s: CompressedScalar) Big {
+    return std.mem.readInt(u448, &s, .little);
+}
+
+fn scalarOf(v: Big) CompressedScalar {
+    std.debug.assert(v < l_big);
+    var out: CompressedScalar = undefined;
+    std.mem.writeInt(u448, &out, @intCast(v), .little);
+    return out;
+}
+
+/// A canonical pseudo-random scalar from a fixed-seed PRNG (test fixture,
+/// not a secret): reduce 114 random bytes through the ORACLE, not `fromWide`.
+fn testScalar(r: std.Random) CompressedScalar {
+    var wide: [114]u8 = undefined;
+    r.bytes(&wide);
+    return scalarOf(@as(Big, std.mem.readInt(u912, &wide, .little)) % l_big);
+}
+
+test "oracle: l read as an integer has 446 bits" {
+    try std.testing.expectEqual(@as(u16, 446), 1024 - @clz(l_big));
+}
+
+test "negate/sub agree with the big-integer oracle (SELF-DERIVED)" {
+    var prng = std.Random.DefaultPrng.init(0xdeca_f448);
+    const r = prng.random();
+    for (0..64) |_| {
+        const a = testScalar(r);
+        const b = testScalar(r);
+        try std.testing.expectEqualSlices(u8, &scalarOf((l_big - bigOf(a)) % l_big), &negate(a));
+        try std.testing.expectEqualSlices(u8, &scalarOf((bigOf(a) + l_big - bigOf(b)) % l_big), &sub(a, b));
+        // identities
+        try std.testing.expectEqualSlices(u8, &zero, &add(a, negate(a)));
+        try std.testing.expectEqualSlices(u8, &a, &add(sub(a, b), b));
+        try std.testing.expectEqualSlices(u8, &negate(sub(a, b)), &sub(b, a));
+    }
+}
+
+test "negate/sub edge values: 0, 1, l-1" {
+    const l_minus_1 = scalarOf(l_big - 1);
+    try std.testing.expectEqualSlices(u8, &zero, &negate(zero));
+    try std.testing.expectEqualSlices(u8, &l_minus_1, &negate(one));
+    try std.testing.expectEqualSlices(u8, &one, &negate(l_minus_1));
+    try std.testing.expectEqualSlices(u8, &zero, &sub(l_minus_1, l_minus_1));
+    try std.testing.expectEqualSlices(u8, &l_minus_1, &sub(zero, one));
+    try std.testing.expectEqualSlices(u8, &one, &sub(zero, l_minus_1));
+}
+
+test "invert: a * invert(a) == 1, and matches the big-integer oracle (SELF-DERIVED)" {
+    var prng = std.Random.DefaultPrng.init(0x1a7e_4e45);
+    const r = prng.random();
+    for (0..4) |_| {
+        const a = testScalar(r);
+        const inv = invert(a);
+        try std.testing.expectEqualSlices(u8, &one, &mul(a, inv));
+        // oracle: a * inv == 1 (mod l), checked in u1024
+        try std.testing.expectEqual(@as(Big, 1), (bigOf(a) * bigOf(inv)) % l_big);
+    }
+}
+
+test "invert edge values: 0 -> 0, 1 -> 1, l-1 -> l-1, 2 -> (l+1)/2" {
+    try std.testing.expectEqualSlices(u8, &zero, &invert(zero));
+    try std.testing.expectEqualSlices(u8, &one, &invert(one));
+    const l_minus_1 = scalarOf(l_big - 1);
+    try std.testing.expectEqualSlices(u8, &l_minus_1, &invert(l_minus_1));
+    var two = zero;
+    two[0] = 2;
+    try std.testing.expectEqualSlices(u8, &scalarOf((l_big + 1) / 2), &invert(two));
+}
+
+test "fromWide/reduce agree with the big-integer oracle (SELF-DERIVED)" {
+    var prng = std.Random.DefaultPrng.init(0x00f1_0e1d);
+    const r = prng.random();
+    for (0..32) |_| {
+        var wide: [114]u8 = undefined;
+        r.bytes(&wide);
+        const want = @as(Big, std.mem.readInt(u912, &wide, .little)) % l_big;
+        try std.testing.expectEqualSlices(u8, &scalarOf(want), &fromWide(wide));
+        const w64 = wide[0..64].*;
+        const want64 = @as(Big, std.mem.readInt(u512, &w64, .little)) % l_big;
+        try std.testing.expectEqualSlices(u8, &scalarOf(want64), &reduce(64, w64));
+    }
+    const ff = [_]u8{0xff} ** 114;
+    const want_ff = ((@as(Big, 1) << 912) - 1) % l_big;
+    try std.testing.expectEqualSlices(u8, &scalarOf(want_ff), &fromWide(ff));
+    // l itself and 0 reduce to 0
+    var l114 = [_]u8{0} ** 114;
+    l114[0..57].* = ed448.scalar.l_bytes;
+    try std.testing.expectEqualSlices(u8, &zero, &fromWide(l114));
+    try std.testing.expectEqualSlices(u8, &zero, &fromWide([_]u8{0} ** 114));
+}
+
+test "random: canonical and (overwhelmingly) distinct" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = try random(io);
+    const b = try random(io);
+    try rejectNonCanonical(a);
+    try rejectNonCanonical(b);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b)); // collide w/ prob ~2^-446
+}
+
+test "random: entropy failure is reported, not papered over" {
+    try std.testing.expectError(error.EntropyUnavailable, random(std.Io.failing));
 }
