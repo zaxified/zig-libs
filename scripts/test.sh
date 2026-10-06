@@ -1920,16 +1920,27 @@ cmd_interop() {
     # checks. `check-interop` is a compile and stays under the strict rule,
     # because a compiler that succeeds while complaining is exactly what that
     # rule exists to catch. Exit status still decides either way.
-    local m_rc=0
+    # Every program runs, and the failures are named together at the end: one
+    # missing peer used to stop the lane at the first program (tag 2026-10-06:
+    # accesslog, then acme), leaving every program after it unproven and each
+    # one costing another full matrix to discover.
+    checks_begin
     for m in "${progs[@]}"; do
         # The program's own arguments go after `--`. `opcua`'s peer is asyncua,
         # which lives in the venv OPCUA_PYTHON names (the module's live test
         # reads the same variable); without it the program uses `python3`.
         local prog_args=()
         [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(-- --python "$OPCUA_PYTHON")
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"} || m_rc=1
+        # acme's program is a client of Pebble and cannot start it itself;
+        # tools/pebble.sh brings Pebble up and runs `zig build interop-acme`.
+        # `--check`: a live verdict, the committed transcript stays as it is.
+        if [[ "$m" == acme ]]; then
+            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" modules/acme/tools/pebble.sh --check
+            continue
+        fi
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
     done
-    (( m_rc )) || true
+    checks_end
     summary
 }
 

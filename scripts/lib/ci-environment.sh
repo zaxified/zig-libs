@@ -227,6 +227,18 @@ python3 -m venv "$HOME/.cache/zig-libs-opcua" >/dev/null 2>&1 || true
 "$HOME/.cache/zig-libs-opcua/bin/pip" -q install asyncua cryptography >/dev/null 2>&1 \
     && echo "opcua venv: OK" || echo "opcua venv: install failed"
 echo "::endgroup::"
+
+echo "::group::interop: Pebble (acme)"
+# acme's anchor is Pebble, Let's Encrypt's test CA, run as a black-box binary
+# by modules/acme/tools/pebble.sh from $PEBBLE_BIN (its default below). Pinned:
+# the transcript records Pebble's behaviour, and a moved oracle must be a
+# deliberate bump. A failed install is not hidden: pebble.sh then fails the
+# interop-acme step by name.
+GOBIN="$HOME/.local/share/zig-libs/oracle-bin/pebble" \
+    go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1 \
+    github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1 >/dev/null 2>&1 \
+    && echo "pebble: v2.10.1" || echo "pebble: install failed"
+echo "::endgroup::"
 fi
 
 if want ctgrind; then
