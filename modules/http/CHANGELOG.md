@@ -5,6 +5,51 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — The CPython / sseclient-py / httpx-sse anchors moved out of the module (CONVENTIONS §9:
+  a module spawns no foreign toolchain — `check-module-purity` was red on `main` from `7af4c581`):
+  they are now `zig build interop-http -- --phase problem|sse` (`tools/oracles.zig`), which freeze what
+  the oracles accepted into `src/problem_oracle_vectors.zig` / `src/sse_oracle_vectors.zig`; the module
+  replays those bytes (`src/problem_oracle.zig`, `src/sse_oracle.zig`) with no Python. The LIVE gzip
+  test keeps curl and gzip(1) (peers, not toolchains) and drops its CPython decoder. Tests only.
+- **2026-10-06** — **Evidence MIXED → EXTERNAL.** SSE gained a LIVE anchor (`src/sse_interop.zig`: our
+  server's event stream, fetched by curl, dispatched by sseclient-py and httpx-sse and held to the
+  WHATWG §9.2.6 parsing rules over 27 events — CR/CRLF normalisation, leading spaces, NUL, 10 KiB
+  data, sticky ids, retry; no defect; httpx-sse's dispatch of comment-only blocks listed as its
+  own departure). With the conneg, gzip, problem and reverse-proxy anchors above, no path of the
+  module is judged by itself alone any more.
+- **2026-10-06** — **`reasonPhrase` covers the IANA HTTP Status Code Registry**, found by the new LIVE
+  CPython check of `problem` (`src/problem_interop.zig`: 625 documents `json.loads`-parsed with
+  RFC 9457 member types, `detail` decoded exactly as CPython's `decode("utf-8", "replace")` across
+  Unicode table 3-8 / overlongs / surrogates / every C0 control / 600 random byte strings — no
+  defect there; teeth: CPython must refuse a raw control character and raw invalid UTF-8). 21 codes
+  had no phrase, six of them RFC 9110's own (203, 205, 300, 305, 402, 407): their status line went
+  out as `HTTP/1.1 402 ` and an `about:blank` problem carried no `title`. **BEHAVIOURAL:** those
+  status lines now carry the registry phrase. 418 and 510 stay phrase-less (registry: unused /
+  obsoleted).
+- **2026-10-06** — **`proxy`, from the Go oracle's new `rproxy` area** (37 cases: Go's
+  `httputil.ReverseProxy` and `ProxyHandler` between a raw client and a raw backend; what reaches
+  the backend and what reaches the client compared after normalisation). **BEHAVIOURAL fixes:**
+  (1) a repeated backend response field kept only its LAST line (`setHeader` replaces by name) —
+  two `Set-Cookie` lines reached the client as one; now `Set-Cookie` lines are relayed each
+  (`addSetCookie`) and other repeated fields joined with commas, on the h1 and h2 paths;
+  (2) only the first `Connection` line was honoured, so a field named in a second one leaked
+  through (both directions); (3) the client's `X-Forwarded-For` line was forwarded AND folded into
+  the new chain (two fields upstream), and only its first line was folded; now every line joins
+  the one chain; (4) an `X-Forwarded-For` the client listed in `Connection` still seeded the chain.
+  Judged divergences: no `TE: trailers` upstream (this proxy relays no trailers), every `Proxy-*`
+  dropped.
+- **2026-10-06** — **`conneg`, from a new Werkzeug + python-mimeparse oracle** (`src/conneg_oracle.zig`,
+  `tools/conneg_oracle/gen.py`; 66 Accept, 20 Accept-Language, 18 Accept-Encoding cases, every
+  divergence judged against RFC 9110). **BEHAVIOURAL:** (1) a comma inside a quoted-string parameter
+  value no longer ends an `Accept` element (`foo="a,b"` was split in two); (2) a media range's
+  parameters must be on the offer — `text/html;level=1` no longer admits a bare `text/html`, and a
+  range with parameters outranks the same range without (`MediaRange.specificity` can now return 3),
+  exactly RFC 9110 §12.5.1's example table; offers may carry parameters; (3) `*/subtype` is refused as
+  a media range. No in-repo or known consumer negotiates media types (qap uses `encodingQuality` only).
+  `body.indexOfUnquoted` is now public. Gzip responses gained a LIVE anchor
+  (`src/gzip_interop.zig`: curl/zlib, gzip(1), CPython decode levels 1/6/9 on HTTP/1.1 and h2c, and
+  refuse a flipped CRC-32 or ISIZE).
+
 - **2026-10-05** — **Client cookie jar seam** (`Options.cookie_jar`, `Client.CookieJar`, Go's
   `http.CookieJar` shape): the jar is asked for every request's cookies and handed every response
   head, redirect hops included (a session cookie set on a 302 rides the next hop); a caller's own

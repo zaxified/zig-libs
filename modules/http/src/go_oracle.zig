@@ -698,3 +698,227 @@ test "go oracle proxy: the proxy a URL goes through is Go's ProxyFromEnvironment
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── rproxy: what a reverse proxy passes on, both ways ────────────────────
+
+const proxy_mod = @import("proxy.zig");
+
+/// A raw backend: answers `n` connections one at a time, each by recording
+/// the request head and body it received and writing `response` (read from
+/// `current` when the connection arrives).
+const RawBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    n: usize,
+    current: *const vectors.RProxyCase,
+    head: [4096]u8 = undefined,
+    head_len: usize = 0,
+    body: [256]u8 = undefined,
+    body_len: usize = 0,
+
+    fn run(b: *RawBackend) void {
+        for (0..b.n) |_| b.one() catch {};
+    }
+
+    fn one(b: *RawBackend) !void {
+        const s = try b.listener.accept(b.io);
+        defer s.close(b.io);
+        var rbuf: [4096]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        const msg = try readMessage(&sr.interface, &b.head, &b.body);
+        b.head_len = msg.head;
+        b.body_len = msg.body;
+        var wbuf: [512]u8 = undefined;
+        var sw = s.writer(b.io, &wbuf);
+        try sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n");
+        try sw.interface.writeAll(b.current.resp_extra);
+        try sw.interface.writeAll("\r\nok");
+        try sw.interface.flush();
+    }
+};
+
+/// Read one HTTP/1.1 message: the head into `head`, the body (by
+/// Content-Length, or chunked and decoded) into `body`.
+fn readMessage(r: *std.Io.Reader, head: []u8, body_out: []u8) !struct { head: usize, body: usize } {
+    var hl: usize = 0;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        @memcpy(head[hl..][0..line.len], line);
+        hl += line.len;
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    const h = head[0..hl];
+    var bl: usize = 0;
+    if (headerValue(h, "content-length")) |v| {
+        const n = try std.fmt.parseInt(usize, v, 10);
+        try r.readSliceAll(body_out[0..n]);
+        bl = n;
+    } else if (headerValue(h, "transfer-encoding")) |v| if (std.ascii.eqlIgnoreCase(v, "chunked")) {
+        while (true) {
+            const size_line = try r.takeDelimiterInclusive('\n');
+            const size_text = std.mem.trim(u8, size_line[0 .. std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len], " \t\r\n");
+            const n = try std.fmt.parseInt(usize, size_text, 16);
+            if (n == 0) {
+                while (!std.mem.eql(u8, try r.takeDelimiterInclusive('\n'), "\r\n")) {}
+                break;
+            }
+            try r.readSliceAll(body_out[bl..][0..n]);
+            bl += n;
+            _ = try r.takeDelimiterInclusive('\n');
+        }
+    };
+    return .{ .head = hl, .body = bl };
+}
+
+fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    _ = it.next();
+    while (it.next()) |l| {
+        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(l[0..colon], name)) return std.mem.trim(u8, l[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+const up_ignore = [_][]const u8{ "connection", "content-length", "transfer-encoding", "via", "x-forwarded-proto", "x-forwarded-host", "user-agent" };
+const down_ignore = [_][]const u8{ "connection", "content-length", "transfer-encoding", "via", "date", "server" };
+
+/// The generator's normalisation: field names lower-cased, values trimmed,
+/// `ignore`d names dropped, lines stably sorted by name. Returns the first
+/// line; the field lines go to `out`.
+fn normHead(head: []const u8, ignore: []const []const u8, text: []u8, out: [][]const u8) !struct { first: []const u8, lines: [][]const u8 } {
+    var it = std.mem.splitSequence(u8, std.mem.trimEnd(u8, head, "\r\n"), "\r\n");
+    const first = it.next().?;
+    var n: usize = 0;
+    var used: usize = 0;
+    lines: while (it.next()) |l| {
+        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        for (ignore) |ig| if (std.ascii.eqlIgnoreCase(l[0..colon], ig)) continue :lines;
+        var w: std.Io.Writer = .fixed(text[used..]);
+        try w.print("{s}: {s}", .{ l[0..colon], std.mem.trim(u8, l[colon + 1 ..], " \t") });
+        const s = text[used..][0..w.buffered().len];
+        for (s[0..colon]) |*ch| ch.* = std.ascii.toLower(ch.*);
+        used += s.len;
+        out[n] = s;
+        n += 1;
+    }
+    const byName = struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            const an = a[0..std.mem.indexOfScalar(u8, a, ':').?];
+            const bn = b[0..std.mem.indexOfScalar(u8, b, ':').?];
+            return std.mem.order(u8, an, bn) == .lt;
+        }
+    };
+    std.sort.insertion([]const u8, out[0..n], {}, byName.lt);
+    return .{ .first = first, .lines = out[0..n] };
+}
+
+fn sameLines(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+/// Where our proxy passes on something different from Go's ReverseProxy, and
+/// why. `side` is which record differs ("up" = what the backend received,
+/// "down" = what the client received).
+const RProxyDivergence = struct { id: []const u8, side: []const u8, why: []const u8 };
+
+const rproxy_divergences = [_]RProxyDivergence{
+    .{ .id = "conn-lists-te", .side = "up", .why = "TE is hop-by-hop (RFC 9110 §7.6.1); Go re-sends `TE: trailers` upstream, which promises the backend a trailer section reaches the client -- this proxy relays none (h1 streams the body only, h2 does not surface trailers), so it does not make the promise" },
+    .{ .id = "te-trailers", .side = "up", .why = "TE is hop-by-hop (RFC 9110 §7.6.1); Go re-sends `TE: trailers` upstream, which promises the backend a trailer section reaches the client -- this proxy relays none (h1 streams the body only, h2 does not surface trailers), so it does not make the promise" },
+    .{ .id = "te-gzip-trailers", .side = "up", .why = "TE is hop-by-hop (RFC 9110 §7.6.1); Go re-sends `TE: trailers` upstream, which promises the backend a trailer section reaches the client -- this proxy relays none (h1 streams the body only, h2 does not surface trailers), so it does not make the promise" },
+    .{ .id = "proxy-other", .side = "up", .why = "every `Proxy-*` field is dropped (module doc): a proxy credential under any name never leaks to the origin; Go drops only Proxy-Authorization/-Authenticate/-Connection" },
+    .{ .id = "resp-proxy-other", .side = "down", .why = "as proxy-other, on the response" },
+};
+
+test "go oracle rproxy: the proxy passes on what Go's ReverseProxy passes on, or the difference is judged" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("go oracle rproxy: listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    var current: *const vectors.RProxyCase = &vectors.rproxy[0];
+    var backend: RawBackend = .{ .io = io, .listener = &listener, .n = vectors.rproxy.len, .current = current };
+    const backend_thread = try std.Thread.spawn(.{}, RawBackend.run, .{&backend});
+    defer backend_thread.join();
+
+    var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer proxy_client.deinit();
+    var ph = proxy_mod.ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
+        .rewrite_host = false,
+    });
+    var front = Server.init(io, gpa, .{ .handler = proxy_mod.ProxyHandler.handler, .context = &ph });
+    defer front.deinit();
+    front.bind() catch |err| return testkit.loopbackSkip("go oracle rproxy: bind failed ({t})", .{err});
+    const front_thread = try std.Thread.spawn(.{}, rproxyServe, .{&front});
+    defer front_thread.join();
+    defer front.shutdown();
+    const front_addr = try net.IpAddress.parse("127.0.0.1", front.boundAddress().getPort());
+
+    var bad: usize = 0;
+    for (&vectors.rproxy) |*c| {
+        current = c;
+        backend.current = c;
+        backend.head_len = 0;
+        backend.body_len = 0;
+        const s = try front_addr.connect(io, .{ .mode = .stream });
+        var wbuf: [1024]u8 = undefined;
+        var sw = s.writer(io, &wbuf);
+        try sw.interface.writeAll(c.wire);
+        try sw.interface.flush();
+        var rbuf: [4096]u8 = undefined;
+        var sr = s.reader(io, &rbuf);
+        var down_head: [4096]u8 = undefined;
+        var down_body: [256]u8 = undefined;
+        const msg = readMessage(&sr.interface, &down_head, &down_body) catch {
+            s.close(io);
+            std.debug.print("rproxy {s}: no response from our proxy\n", .{c.id});
+            bad += 1;
+            continue;
+        };
+        s.close(io);
+
+        var t1: [4096]u8 = undefined;
+        var l1: [64][]const u8 = undefined;
+        const up = try normHead(backend.head[0..backend.head_len], &up_ignore, &t1, &l1);
+        var t2: [4096]u8 = undefined;
+        var l2: [64][]const u8 = undefined;
+        const down = try normHead(down_head[0..msg.head], &down_ignore, &t2, &l2);
+        const up_line = if (std.mem.lastIndexOf(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
+        const status = std.fmt.parseInt(u16, down.first[9..12], 10) catch 0;
+
+        const up_ok = std.mem.eql(u8, up_line, c.up_line) and sameLines(up.lines, c.up) and
+            std.mem.eql(u8, backend.body[0..backend.body_len], c.up_body);
+        const down_ok = status == c.status and sameLines(down.lines, c.down);
+        for ([_]struct { side: []const u8, ok: bool }{ .{ .side = "up", .ok = up_ok }, .{ .side = "down", .ok = down_ok } }) |r| {
+            var listed = false;
+            for (rproxy_divergences) |d| {
+                if (std.mem.eql(u8, d.id, c.id) and std.mem.eql(u8, d.side, r.side)) listed = true;
+            }
+            if (r.ok == !listed) continue;
+            bad += 1;
+            std.debug.print("rproxy {s} ({s}): {s}\n", .{ c.id, r.side, if (r.ok) "agrees now, drop its divergence entry" else "diverges" });
+            if (!r.ok) {
+                const go_lines, const our_lines = if (std.mem.eql(u8, r.side, "up")) .{ c.up, up.lines } else .{ c.down, down.lines };
+                std.debug.print("  go:  ", .{});
+                for (go_lines) |l| std.debug.print(" [{s}]", .{l});
+                std.debug.print("\n  ours:", .{});
+                for (our_lines) |l| std.debug.print(" [{s}]", .{l});
+                std.debug.print("\n", .{});
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+fn rproxyServe(s: *Server) void {
+    s.serve() catch {};
+}

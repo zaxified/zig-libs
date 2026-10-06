@@ -14,11 +14,13 @@
 //!   match (the `router` module) plugs in from *above* — see "Layering".
 //! - **Hop-by-hop header stripping** (RFC 9110 §7.6.1): `Connection`,
 //!   `Keep-Alive`, `TE`, `Trailer`/`Trailers`, `Transfer-Encoding`,
-//!   `Upgrade`, every `Proxy-*`, and every field named in the request's
-//!   `Connection` token list — dropped in both directions so per-hop
-//!   framing never leaks end-to-end.
+//!   `Upgrade`, every `Proxy-*`, and every field named in any of the
+//!   message's `Connection` lines — dropped in both directions so per-hop
+//!   framing never leaks end-to-end. A repeated response field is relayed
+//!   whole: `Set-Cookie` line by line, any other joined with commas.
 //! - **Forwarding headers:** appends the socket peer to `X-Forwarded-For`
-//!   (RFC 7239 de-facto), sets `X-Forwarded-Proto` / `X-Forwarded-Host`,
+//!   (de-facto; every inbound line joins the chain, which is dropped when the
+//!   client lists the field in `Connection`), sets `X-Forwarded-Proto` / `X-Forwarded-Host`,
 //!   and injects `Via: 1.1 <pseudonym>` (RFC 9110 §7.6.3) on request and
 //!   response, appending to any existing `Via`.
 //! - **Host rewrite:** the forwarded `Host` becomes the backend authority
@@ -106,6 +108,7 @@ const h2 = @import("h2.zig");
 const Server = @import("Server.zig");
 const Client = @import("Client.zig");
 const h2_upstream = @import("h2_upstream.zig");
+const hpack = @import("hpack.zig");
 const netaddr = @import("netaddr");
 
 /// Which protocol the proxy forwards to a backend over. `.http1` (the
@@ -248,16 +251,16 @@ pub const ProxyHandler = struct {
 
         // ── relay status + response headers ─────────────────────────────
         rw.setStatus(res.status);
-        const resp_conn = res.header("connection");
         var it = res.head.iterate();
-        while (it.next()) |entry| {
-            if (isHopByHop(entry.name, resp_conn)) continue;
+        var at: usize = 0;
+        while (it.next()) |entry| : (at += 1) {
+            if (isHopByHop(entry.name, null) or connectionLists(res.head.iterate(), entry.name)) continue;
             // `Transfer-Encoding` is hop-by-hop (above); `Content-Length` is
             // copied so `rw` re-frames identity with the exact length. The
             // writer manages `Connection`/`Date`/`Server` itself.
             if (std.ascii.eqlIgnoreCase(entry.name, "connection") or
                 std.ascii.eqlIgnoreCase(entry.name, "via")) continue;
-            rw.setHeader(entry.name, entry.value) catch return self.relayFailed(rw);
+            relayField(rw, res.head.iterate(), at, entry.name, entry.value) catch return self.relayFailed(rw);
         }
         // Response-side Via (append to the backend's own, if any).
         const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
@@ -340,13 +343,12 @@ pub const ProxyHandler = struct {
 
         // ── relay status + response headers ─────────────────────────────
         rw.setStatus(res.status);
-        const resp_conn = res.header("connection");
-        for (res.headers.fields) |f| {
+        for (res.headers.fields, 0..) |f, at| {
             if (f.name.len != 0 and f.name[0] == ':') continue; // pseudo-headers (:status)
-            if (isHopByHop(f.name, resp_conn)) continue;
+            if (isHopByHop(f.name, null) or connectionLists(FieldIter{ .fields = res.headers.fields }, f.name)) continue;
             if (std.ascii.eqlIgnoreCase(f.name, "connection") or
                 std.ascii.eqlIgnoreCase(f.name, "via")) continue;
-            rw.setHeader(f.name, f.value) catch return self.relayFailed(rw);
+            relayField(rw, FieldIter{ .fields = res.headers.fields }, at, f.name, f.value) catch return self.relayFailed(rw);
         }
         const via = buildVia(&via_buf, res.header("via"), self.config.via_pseudonym) catch
             return self.relayFailed(rw);
@@ -440,7 +442,6 @@ pub const ProxyHandler = struct {
         via_buf: []u8,
     ) error{TooManyHeaders}![]http.Header {
         var n: usize = 0;
-        const req_conn = req.header("connection");
         var it = req.head.iterate();
         while (it.next()) |entry| {
             const name = entry.name;
@@ -449,7 +450,9 @@ pub const ProxyHandler = struct {
             if (std.ascii.eqlIgnoreCase(name, "host")) continue;
             if (std.ascii.eqlIgnoreCase(name, "content-length")) continue;
             if (std.ascii.eqlIgnoreCase(name, "via")) continue; // re-injected below
-            if (isHopByHop(name, req_conn)) continue;
+            // Folded into the one chain built below, every line of it.
+            if (std.ascii.eqlIgnoreCase(name, "x-forwarded-for")) continue;
+            if (isHopByHop(name, null) or connectionLists(req.head.iterate(), name)) continue;
             if (n == store.len) return error.TooManyHeaders;
             store[n] = .{ .name = entry.name, .value = entry.value };
             n += 1;
@@ -527,14 +530,69 @@ fn buildForwardedFor(buf: []u8, req: *Server.Request) ?[]const u8 {
     var ip_buf: [netaddr.max_ip_text_len]u8 = undefined;
     const ip_text = netaddr.formatIp(ip.unmap(), &ip_buf);
 
+    // The existing chain is every `X-Forwarded-For` line, in order (RFC 9110
+    // §5.3: repeated lines are one comma-separated list) — unless the client
+    // named the field in `Connection`, which makes its value this hop's only.
     var w: std.Io.Writer = .fixed(buf);
-    if (req.header("x-forwarded-for")) |existing| {
-        w.print("{s}, {s}", .{ existing, ip_text }) catch return ip_shortcut(buf, ip_text);
-    } else {
-        w.writeAll(ip_text) catch return null;
+    if (!connectionLists(req.head.iterate(), "x-forwarded-for")) {
+        var it = req.head.iterate();
+        while (it.next()) |e| {
+            if (!std.ascii.eqlIgnoreCase(e.name, "x-forwarded-for")) continue;
+            w.print("{s}, ", .{e.value}) catch return ip_shortcut(buf, ip_text);
+        }
     }
+    w.writeAll(ip_text) catch return ip_shortcut(buf, ip_text);
     return w.buffered();
 }
+
+/// Whether any `Connection` field line in `fields` (an iterator yielding
+/// `.name`/`.value`) lists `name` (RFC 9110 §7.6.1). Every line counts:
+/// `Connection: a` + `Connection: b` is the one list `a, b` (§5.3).
+fn connectionLists(fields: anytype, name: []const u8) bool {
+    var it = fields;
+    while (it.next()) |e| {
+        if (std.ascii.eqlIgnoreCase(e.name, "connection") and h1.tokenListContains(e.value, name)) return true;
+    }
+    return false;
+}
+
+/// `connectionLists`/`relayField` over an h2 response's field slice.
+const FieldIter = struct {
+    fields: []const hpack.Field,
+    i: usize = 0,
+
+    fn next(it: *FieldIter) ?hpack.Field {
+        if (it.i == it.fields.len) return null;
+        defer it.i += 1;
+        return it.fields[it.i];
+    }
+};
+
+/// Relay one backend response field, the `at`-th of `fields`, keeping every
+/// line: `Set-Cookie` lines each stay a line of their own (RFC 6265 §3; they
+/// cannot be joined); any other repeated field is sent once, at its first
+/// line, as the comma-joined list of all of them (RFC 9110 §5.3) —
+/// `setHeader` replaces by name, so relaying line by line kept only the last.
+fn relayField(rw: *Server.ResponseWriter, fields: anytype, at: usize, name: []const u8, value: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(name, "set-cookie")) return rw.addSetCookie(value);
+    var joined: [max_joined_field_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&joined);
+    var it = fields;
+    var i: usize = 0;
+    var count: usize = 0;
+    while (it.next()) |e| : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(e.name, name)) continue;
+        if (i < at) return; // not the first line: already sent, joined
+        try w.writeAll(if (count == 0) "" else ", ");
+        try w.writeAll(e.value);
+        count += 1;
+    }
+    try rw.setHeader(name, if (count <= 1) value else w.buffered());
+}
+
+/// Longest comma-joined value `relayField` builds from repeated lines; a
+/// longer one fails the relay (502), as a header too big for the writer does.
+const max_joined_field_len = 8 * 1024;
 
 /// Fallback when the combined XFF chain would overflow `buf`: forward just
 /// this hop's peer (never drop the header entirely — the backend still needs

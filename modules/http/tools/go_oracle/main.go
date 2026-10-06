@@ -43,6 +43,7 @@ func main() {
 	emitMultipart(&b)
 	emitClient(&b)
 	emitProxy(&b)
+	emitRProxy(&b)
 	// Every area ends its table with a blank line; the file ends with one newline.
 	b.Truncate(b.Len() - 1)
 

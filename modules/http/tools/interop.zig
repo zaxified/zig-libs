@@ -24,9 +24,13 @@
 //!   zig build interop-http -- --h2spec PATH     # a non-default binary
 //!   zig build interop-http -- --only http2/6.5  # one section (h2spec's spec ids)
 //!   zig build interop-http -- --phase go        # only the Go oracle (or `h2spec`)
+//!   zig build interop-http -- --phase problem   # CPython on problem+json (or `sse`:
+//!                                               # sseclient-py + httpx-sse); see oracles.zig
+//!   zig build interop-http -- --phase sse --write   # re-take the frozen vectors
 
 const std = @import("std");
 const http = @import("http");
+const oracles = @import("oracles.zig");
 
 const Server = http.Server;
 const Writer = std.Io.Writer;
@@ -144,7 +148,7 @@ fn report(phase: []const u8, v: Verdict, allowed: []const []const u8) bool {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go]\n", .{});
+    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go|problem|sse] [--write]\n", .{});
     return 2;
 }
 
@@ -205,7 +209,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var h2spec: []const u8 = "h2spec";
     var only: ?[]const u8 = null;
-    var phase: enum { all, h2spec, go } = .all;
+    var phase: enum { all, h2spec, go, problem, sse } = .all;
+    var write = false;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
@@ -213,6 +218,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             h2spec = args.next() orelse return usage();
         } else if (std.mem.eql(u8, a, "--only")) {
             only = args.next() orelse return usage();
+        } else if (std.mem.eql(u8, a, "--write")) {
+            write = true;
         } else if (std.mem.eql(u8, a, "--phase")) {
             const p = args.next() orelse return usage();
             phase = std.meta.stringToEnum(@TypeOf(phase), p) orelse return usage();
@@ -224,8 +231,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     std.Io.Dir.cwd().createDirPath(io, scratch) catch {};
 
     const env = try init.environ.createMap(arena);
+    if (phase == .problem) return if (try oracles.problemPhase(io, gpa, arena, &env, write)) 0 else 1;
+    if (phase == .sse) return if (try oracles.ssePhase(io, gpa, arena, &env, write)) 0 else 1;
     const go_ok = phase == .h2spec or try checkGoOracle(io, arena, &env);
     if (phase == .go) return if (go_ok) 0 else 1;
+    const py_ok = phase == .h2spec or (try oracles.problemPhase(io, gpa, arena, &env, false) and
+        try oracles.ssePhase(io, gpa, arena, &env, false));
 
     // Phase 1: the real `Server`, h1 and h2c prior knowledge on one port.
     const shared = blk: {
@@ -260,5 +271,5 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const a = report("shared h1/h2c port", shared, &.{shared_port_expected});
     const b = report("h2 only (serveStream)", h2only, &.{});
-    return if (a and b and go_ok) 0 else 1;
+    return if (a and b and go_ok and py_ok) 0 else 1;
 }

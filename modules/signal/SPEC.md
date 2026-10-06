@@ -380,7 +380,9 @@ exact bytes and that nonce isn't published).
   initial message, a ciphertext one byte shorter than the tag, and DH4
   reaching `SK`. One mutant that failed to compile was rewritten until it
   built. Equivalent: dropping `verify`'s `rejectLowOrder` (std's
-  `mulDoubleBasePublic` refuses a low-order point itself).
+  `mulDoubleBasePublic` refuses a low-order point itself: its `x(4A) == 0`
+  test catches the order-2 point `4A` of an order-8 key too; an order-8 key
+  whose equation holds is pinned by a test, 2026-10-06).
 
 ### Test-vector honesty (Double Ratchet)
 

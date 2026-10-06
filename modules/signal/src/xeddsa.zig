@@ -572,6 +572,49 @@ test "verify refuses s + L, an order-2 key that satisfies the equation, and a pa
     }
 }
 
+test "verify refuses an order-8 key that satisfies the equation" {
+    // For an order-8 A, `sB - hA` depends on `h mod 8` alone, so `R = sB`
+    // satisfies the equation for one message in eight. Two layers refuse it:
+    // `rejectLowOrder`, and std's `mulDoubleBasePublic`, whose `x(4A) == 0`
+    // test catches the order-2 point `4A` (so dropping either alone is an
+    // equivalent mutant — this pins the outcome, not one layer).
+    const t8 = try Edwards25519.fromBytes([32]u8{
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+        0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+    });
+    const identity = Edwards25519.identityElement.toBytes();
+    try std.testing.expect(@reduce(.Or, @as(@Vector(32, u8), t8.dbl().dbl().toBytes()) != @as(@Vector(32, u8), identity)));
+    try std.testing.expectEqualSlices(u8, &identity, &t8.dbl().dbl().dbl().toBytes());
+
+    // Its Montgomery u = (1 + y) / (1 - y).
+    var y_bytes = t8.toBytes();
+    y_bytes[31] &= 0x7F;
+    const y = Fe.fromBytes(y_bytes);
+    const u = Fe.one.add(y).mul(Fe.one.sub(y).invert()).toBytes();
+    const a_point = try edwardsFromMontgomery(u);
+    try std.testing.expect(@reduce(.Or, @as(@Vector(32, u8), a_point.dbl().dbl().toBytes()) != @as(@Vector(32, u8), identity)));
+
+    var forged: Signature = undefined;
+    const s = [_]u8{9} ++ [_]u8{0} ** 31;
+    forged[0..32].* = (try Edwards25519.basePoint.mul(s)).toBytes();
+    forged[32..64].* = s;
+    var hits: usize = 0;
+    for (0..64) |i| {
+        const msg = [_]u8{@intCast(i)};
+        var h64: [64]u8 = undefined;
+        var st = Sha512.init(.{});
+        st.update(forged[0..32]);
+        st.update(&a_point.toBytes());
+        st.update(&msg);
+        st.final(&h64);
+        if (scalar.reduce64(h64)[0] % 8 != 0) continue;
+        hits += 1; // without `rejectLowOrder`, this one verifies
+        try std.testing.expect(!verify(u, &msg, forged));
+        try std.testing.expect(!libsignal.verify(u, &msg, forged));
+    }
+    try std.testing.expect(hits > 0);
+}
+
 test "edwardsFromMontgomery fail-closed edges: non-canonical u, pole u = p-1, twist u, identity/low-order map images" {
     // Non-canonical: top bit set.
     var bad = [_]u8{0} ** 32;

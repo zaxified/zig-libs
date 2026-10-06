@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Evidence MIXED → EXTERNAL: the official MCP Python SDK 2.3.0 as a differential
+  client** (`tools/sdk_oracle/drive.py`; frozen transcript replayed by `src/sdk_oracle.zig`). Both eras
+  — `initialize` session and stateless 2026-07-28 with `server/discover` and a multi round-trip tool —
+  over tools, resources, templates, prompts and ping: every answer accepted by the SDK's typed client,
+  40 checks passed (teeth: the SDK refuses a stub's malformed `tools/list`). No defect. The SDK still
+  sends `ping` on the 2026-07-28 path, which that revision removed; our -32601 stands.
 - **2026-10-02** — `Server.addTool` checks the tool's `x-mcp-header`
   annotations (spec 2026-07-28) and refuses a tool that breaks them —
   `HeaderAnnotationNotReachable`, `HeaderAnnotationInvalidName`,
