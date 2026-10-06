@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Fixed a double free reachable from a received Commit.** A Commit whose
+  proposal list names the same PreSharedKeyID twice made `validateProposalList` free its
+  scratch encoding twice — explicitly, and again through its own `errdefer` — on both
+  `createCommit` and `processCommit` (after authentication, so any member could send it).
+  Mutation run: 40 of 41 killed, 1 equivalent; 4 tests added and 2 extended (insider-forged
+  Commits refused by each path rule's own error, proposal authentication, an external
+  Commit's signature, the remaining §12.2 list rules and §7.3 encryption-key uniqueness via
+  `createCommit`, `join`'s PSK-list identity, `applyUpdatePath`'s §7.9.2 check). SPEC:
+  done/resolved Backlog entries moved under "Done"; the long-lived-group memory growth is
+  now named in "Where we are behind".
+
 - **2026-09-11** — **BREAKING + BEHAVIOURAL.** `Group.processCommit` and `Group.createCommit` are
   transactional: a Commit is adopted whole or not at all, and a refusal at any step leaves the
   group exactly as it was. Until now a failure after the tree had been mutated set a poison

@@ -1178,6 +1178,20 @@ test "join: end-to-end against a Welcome this file also produced" {
         .init_key_pair = init_kp,
         .signer_key = sig_kp.public_key,
     }));
+    // …nor by resolving a DIFFERENT PSK of the same count and encoded width:
+    // the list is compared by identity, not only by count and length
+    // (mutation 2026-10-06: no test reached the byte comparison).
+    const other_psk = [_]keyschedule.PreSharedKey(TestSuite){.{
+        .id = .{ .id = .{ .external = "some-PSK" }, .psk_nonce = &[_]u8{0x11} ** 32 },
+        .secret = "k",
+    }};
+    try testing.expectError(error.PskMismatch, join(TestSuite, alloc, .{
+        .welcome = .{ .cipher_suite = TestSuite.id, .secrets = &slots2, .encrypted_group_info = egi },
+        .key_package_ref = &kp_ref,
+        .init_key_pair = init_kp,
+        .signer_key = sig_kp.public_key,
+        .psks = &other_psk,
+    }));
 }
 
 test "join: a confirmation_tag that does not match the derived confirmation_key is rejected" {

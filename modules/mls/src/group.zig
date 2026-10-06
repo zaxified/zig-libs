@@ -2772,11 +2772,12 @@ pub fn Group(comptime S: type) type {
                     errdefer gpa.free(enc);
                     var w = codec.Writer.init(enc);
                     try id.encode(&w);
+                    // The `errdefer` above frees `enc` on this return; an
+                    // explicit free here as well was a double free, reached
+                    // by any Commit — sent or RECEIVED — naming one PSK twice
+                    // (found by the 2026-10-06 mutation run).
                     for (psk_ids.items) |seen| {
-                        if (std.mem.eql(u8, seen, enc)) {
-                            gpa.free(enc);
-                            return error.InvalidProposalList;
-                        }
+                        if (std.mem.eql(u8, seen, enc)) return error.InvalidProposalList;
                     }
                     try psk_ids.append(gpa, enc);
                 },
@@ -6836,4 +6837,351 @@ test "transactional: a Commit refused at the confirmation tag leaves no copy of 
     try b.processCommit(.{ .commit_msg = c.commit });
     try expectSameEpoch(&a, &b);
     try testing.expect(scan.liveHoldingNeedle() >= 1);
+}
+
+// ── mutation run 2026-10-06: receive-side rules no test reached ─────────────
+//
+// Every refusal below is a rule `processCommit` runs BEFORE §12.4.2's
+// confirmation-tag bullet. A forged message that breaks one of them also
+// fails that tag (the transcript and the tree hash cover the edited bytes),
+// so with the rule deleted the receiver still refuses — with `MacMismatch`,
+// at the end. That is why these assert the rule's OWN error: it is the only
+// thing that tells "the rule ran" from "something later happened to catch
+// it", and a mutation run found 13 rules deleted without one test noticing.
+
+/// An edit to a member's own message, re-signed and re-tagged afterwards
+/// with keys that member legitimately holds — an INSIDER (any member has the
+/// epoch's `membership_key` and its own signature key), not a stranger. The
+/// confirmation tag is left as it was; see the comment above.
+const Reframe = struct {
+    epoch: ?u64 = null,
+    drop_path: bool = false,
+    leaf_source: ?tree.LeafNodeSource = null,
+    /// Either of these two re-signs the path's LeafNode afterwards.
+    leaf_encryption_key: ?[]const u8 = null,
+    leaf_parent_hash: ?[]const u8 = null,
+    flip_leaf_signature: bool = false,
+    path_node0_key: ?[]const u8 = null,
+    flip_signature: bool = false,
+};
+
+fn reframeMemberMessage(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    msg_bytes: []const u8,
+    signer: TestSuite.Sig.KeyPair,
+    receiver: *const Group(TestSuite),
+    edit: Reframe,
+) ![]u8 {
+    var r = codec.Reader.init(msg_bytes);
+    const msg = try framing.MLSMessage.decode(arena, &r);
+    try testing.expect(r.atEnd());
+    var pm = msg.public_message;
+    if (edit.epoch) |e| pm.content.epoch = e;
+    switch (pm.content.body) {
+        .commit => |c0| {
+            var commit = c0;
+            if (edit.drop_path) commit.path = null;
+            if (commit.path) |p0| {
+                var path = p0;
+                if (edit.leaf_source) |s| path.leaf_node.leaf_node_source = s;
+                if (edit.leaf_encryption_key) |k| path.leaf_node.encryption_key = k;
+                if (edit.leaf_parent_hash) |h| path.leaf_node.parent_hash = h;
+                if (edit.leaf_encryption_key != null or edit.leaf_parent_hash != null) {
+                    const ls = try path.leaf_node.sign(TestSuite, gpa, signer, receiver.group_id, pm.content.sender.member);
+                    path.leaf_node.signature = try arena.dupe(u8, &ls.toBytes());
+                }
+                if (edit.flip_leaf_signature) {
+                    const s = try arena.dupe(u8, path.leaf_node.signature);
+                    s[32] ^= 0x01; // low bit of `S`: still canonical, no longer valid
+                    path.leaf_node.signature = s;
+                }
+                if (edit.path_node0_key) |k| {
+                    const nodes = try arena.dupe(treekem.UpdatePathNode, path.nodes);
+                    nodes[0].encryption_key = k;
+                    path.nodes = nodes;
+                }
+                commit.path = path;
+            }
+            pm.content.body = .{ .commit = commit };
+        },
+        else => {},
+    }
+    const gc = try receiver.groupContextAlloc(gpa);
+    defer gpa.free(gc);
+    const sig = try framing.signFramedContent(TestSuite, gpa, signer, .mls_public_message, pm.content, gc);
+    const sig_bytes = try arena.dupe(u8, &sig.toBytes());
+    if (edit.flip_signature) sig_bytes[32] ^= 0x01;
+    pm.auth.signature = sig_bytes;
+    const tag = try framing.membershipTag(TestSuite, gpa, receiver.secrets.membership_key, pm.content, pm.auth, gc);
+    pm.membership_tag = try arena.dupe(u8, &tag);
+    const out: framing.MLSMessage = .{ .public_message = pm };
+    return out.encodeAlloc(gpa);
+}
+
+test "§12.4.2: an insider's forged Commit is refused by the rule it breaks, before the confirmation tag" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 101);
+    const bob = try TestClient.init(aa, "bob", 102);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "insider",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // An empty Commit: it needs a path (§12.4), and in a two-leaf tree that
+    // path has one node.
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    defer c.deinit(gpa);
+
+    // The helper is faithful: an empty edit reproduces the Commit byte for
+    // byte (Ed25519 and the MAC are deterministic), so every refusal below
+    // is about its edit and nothing else.
+    {
+        const same = try reframeMemberMessage(gpa, aa, c.commit, alice.sig, &b, .{});
+        defer gpa.free(same);
+        try testing.expectEqualSlices(u8, c.commit, same);
+    }
+
+    const alice_leaf_key = b.ratchet_tree.nodes[0].?.leaf.encryption_key;
+    const bob_leaf_key = b.ratchet_tree.nodes[2].?.leaf.encryption_key;
+    const cases = [_]struct { want: anyerror, edit: Reframe }{
+        // §12.4.2 bullet 3: the signature, under a VALID membership tag.
+        .{ .want = error.SignatureVerificationFailed, .edit = .{ .flip_signature = true } },
+        // Bullet 7: a pathless Commit whose proposal list needs a path.
+        .{ .want = error.PathRequired, .edit = .{ .drop_path = true } },
+        // Bullet 8 / §7.3: the path's LeafNode source must be `commit`…
+        .{ .want = error.InvalidUpdatePath, .edit = .{ .leaf_source = .update } },
+        // …its signature must verify…
+        .{ .want = error.SignatureVerificationFailed, .edit = .{ .flip_leaf_signature = true } },
+        // …its encryption key must change…
+        .{ .want = error.InvalidUpdatePath, .edit = .{ .leaf_encryption_key = alice_leaf_key } },
+        // …no path key may already be in the tree…
+        .{ .want = error.InvalidUpdatePath, .edit = .{ .path_node0_key = bob_leaf_key } },
+        // …and its parent_hash must be the one the path implies. Two rules
+        // refuse this, both `Malformed`: §7.9.2's check in `applyUpdatePath`
+        // (pinned on its own in `kat_treekem_test.zig`) and, independently,
+        // the receiver's HPKE open, whose context binds the tree hash.
+        .{ .want = error.Malformed, .edit = .{ .leaf_parent_hash = &([_]u8{0x5a} ** TestSuite.Nh) } },
+    };
+    for (cases, 0..) |cs, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        const bad = try reframeMemberMessage(gpa, aa, c.commit, alice.sig, &b, cs.edit);
+        defer gpa.free(bad);
+        try testing.expectError(cs.want, b.processCommit(.{ .commit_msg = bad }));
+        try testing.expectEqual(@as(u64, 1), b.epoch);
+    }
+
+    try b.processCommit(.{ .commit_msg = c.commit });
+    try expectSameEpoch(&a, &b);
+}
+
+test "§12.4.2 bullet 4: every proposal handed to processCommit is authenticated, referenced or not" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 111);
+    const bob = try TestClient.init(aa, "bob", 112);
+    const carol = try TestClient.init(aa, "carol", 113);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "proposal-auth",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    const p = try a.createProposal(gpa, .{ .signature_key_pair = alice.sig, .proposal = .{ .add = carol.kp } });
+    defer gpa.free(p);
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    defer c.deinit(gpa);
+
+    const bad_tag = try gpa.dupe(u8, p);
+    defer gpa.free(bad_tag);
+    bad_tag[bad_tag.len - 1] ^= 0x01; // the membership_tag is the last field
+    const bad_sig = try reframeMemberMessage(gpa, aa, p, alice.sig, &b, .{ .flip_signature = true });
+    defer gpa.free(bad_sig);
+    const bad_epoch = try reframeMemberMessage(gpa, aa, p, alice.sig, &b, .{ .epoch = b.epoch + 1 });
+    defer gpa.free(bad_epoch);
+
+    const cases = [_]struct { want: anyerror, msg: []const u8 }{
+        .{ .want = error.MacMismatch, .msg = bad_tag },
+        .{ .want = error.SignatureVerificationFailed, .msg = bad_sig },
+        .{ .want = error.WrongEpoch, .msg = bad_epoch },
+    };
+    for (cases, 0..) |cs, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        try testing.expectError(cs.want, b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{cs.msg} }));
+        try testing.expectEqual(@as(u64, 1), b.epoch);
+    }
+    try b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{p} });
+    try expectSameEpoch(&a, &b);
+}
+
+test "§6.1: an external Commit's signature is checked by the signature, not caught later by the confirmation tag" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 121);
+    const dave = try TestClient.init(aa, "dave", 122);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "ext-sig",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+        defer c.deinit(gpa);
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // The message ends `signature<64> confirmation_tag<32>` (no membership
+    // tag for this sender): flip the low bit of the signature's `S`.
+    const bad = try gpa.dupe(u8, joined.messages.commit);
+    defer gpa.free(bad);
+    try testing.expectEqual(@as(u8, 0x20), bad[bad.len - 33]);
+    try testing.expectEqual(@as(u8, 0x40), bad[bad.len - 98]);
+    bad[bad.len - 65] ^= 0x01;
+    try testing.expectError(error.SignatureVerificationFailed, a.processCommit(.{ .commit_msg = bad }));
+    try testing.expectEqual(@as(u64, 1), a.epoch);
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try testing.expectEqual(@as(u64, 2), a.epoch);
+}
+
+test "§12.2/§7.3: createCommit refuses the remaining list rules, and a duplicate encryption key" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 131);
+    const bob = try TestClient.init(aa, "bob", 132);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "list-rules",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        c.deinit(gpa);
+    }
+
+    const nonce = [_]u8{0x44} ** TestSuite.Nh;
+    const psk: content.Proposal = .{ .psk = .{ .id = .{ .external = "x" }, .psk_nonce = &nonce } };
+    const gce: content.Proposal = .{ .group_context_extensions = &.{} };
+    // An Update the committer itself proposed, committed by reference.
+    const own_update = blk: {
+        const new_enc = try TestSuite.Kem.KeyPair.generateDeterministic(@splat(0x77));
+        const leaf = try a.updateLeaf(.{ .signature_key_pair = alice.sig, .encryption_key_pair = new_enc });
+        break :blk try a.createProposal(gpa, .{ .signature_key_pair = alice.sig, .proposal = .{ .update = leaf } });
+    };
+    defer gpa.free(own_update);
+    // A member whose LeafNode reuses bob's ENCRYPTION key under a signature
+    // key of its own — so only §7.3's encryption-key half can refuse it.
+    const twin = try keypackage_mod.create(TestSuite, aa, .{
+        .signature_key_pair = try TestSuite.Sig.KeyPair.generateDeterministic(@splat(133)),
+        .init_key = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(134))).public_key,
+        .encryption_key = bob.kp.leaf_node.encryption_key[0..TestSuite.Kem.Npk].*,
+        .credential = .{ .basic = "twin" },
+        .capabilities = .{
+            .versions = &.{1},
+            .cipher_suites = &.{1},
+            .extensions = &.{},
+            .proposals = &.{},
+            .credentials = &.{1},
+        },
+        .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+    });
+
+    const cases = [_]struct { want: anyerror, proposals: []const Group(TestSuite).CommitSource }{
+        // "an Update proposal generated by the committer"
+        .{ .want = error.InvalidProposalList, .proposals = &.{.{ .by_reference = own_update }} },
+        // "multiple GroupContextExtensions proposals"
+        .{ .want = error.InvalidProposalList, .proposals = &.{ .{ .by_value = gce }, .{ .by_value = gce } } },
+        // "multiple PreSharedKey proposals that reference the same PreSharedKeyID"
+        .{ .want = error.InvalidProposalList, .proposals = &.{ .{ .by_value = psk }, .{ .by_value = psk } } },
+        // An Add of a client already in the group, with no Remove of it.
+        .{ .want = error.InvalidProposalList, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} },
+        // §7.3: two leaves with one encryption key.
+        .{ .want = error.DuplicateKeyInTree, .proposals = &.{.{ .by_value = .{ .add = twin } }} },
+    };
+    for (cases, 0..) |cs, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        try testing.expectError(cs.want, a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = cs.proposals,
+            .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
+        }));
+        try testing.expectEqual(@as(u64, 1), a.epoch);
+    }
+    // The PSK proposal alone is fine, which is what makes the third case
+    // about the duplicate.
+    const ok = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = psk }},
+        .external_psks = &.{.{ .psk_id = "x", .psk = "k" }},
+    });
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(u64, 2), a.epoch);
 }

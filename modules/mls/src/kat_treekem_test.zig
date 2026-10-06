@@ -517,6 +517,7 @@ test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree 
     defer parsed.deinit();
 
     var checked: usize = 0;
+    var tampered: usize = 0;
     for (parsed.value.array.items) |entry| {
         const ratchet_tree_hex = entry.object.get("ratchet_tree").?.string;
         const update_paths = entry.object.get("update_paths").?.array.items;
@@ -558,7 +559,27 @@ test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree 
             const got = try treehash.rootHash(S, testing.allocator, &dt.tree);
             try testing.expectEqualSlices(u8, want_tree_hash_after, &got);
             checked += 1;
+
+            // Negative control for §7.9.2's per-Commit check: the same path
+            // with one bit of the leaf's claimed `parent_hash` flipped must
+            // be refused. Through `Group.processCommit` a receiver's HPKE
+            // context catches this too (it binds the tree hash), so this is
+            // the only place the check itself is pinned (mutation 2026-10-06).
+            const ph = update_path.leaf_node.parent_hash orelse continue;
+            if (ph.len == 0) continue;
+            const bad_ph = try testing.allocator.dupe(u8, ph);
+            defer testing.allocator.free(bad_ph);
+            bad_ph[0] ^= 0x01;
+            var bad_path = update_path;
+            bad_path.leaf_node.parent_hash = bad_ph;
+            var dt2 = try decodeTree(testing.allocator, ratchet_tree_hex);
+            defer dt2.deinit(testing.allocator);
+            var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena2.deinit();
+            try testing.expectError(error.Malformed, treekem.applyUpdatePath(arena2.allocator(), &dt2.tree, sender, bad_path));
+            tampered += 1;
         }
     }
     try testing.expectEqual(@as(usize, 62), checked); // all 62 update paths merged
+    try testing.expect(tampered > 0);
 }
