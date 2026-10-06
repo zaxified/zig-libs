@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — Mutation run: 36 of 38 killed, 2 equivalent; 5 tests added (every
+  render cap at its bound and one past it, the memory guards and zero steps under a small
+  budget, `checkName`'s name-length/component-count bounds and a lone NUL, index ==
+  length, `truncate` at `length == len(end)`, two lexer refusals). No defect found.
+
 - **2026-09-07** — **All five fuzz harnesses were replaying one fixed input — the empty
   template, the empty context datum, one table entry of 32 — and now each has a corpus
   with a measured reach guard.** Every target opened with a ranged draw

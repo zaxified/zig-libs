@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Jinja2 3.1.6 (surveyed 2026-09-30): faithful core and oracle-checked, but a typical Jinja2 user hits absent filters (`format`, `groupby`, `wordwrap`) and ASCII-only case mapping
 
-**Audit:** review 2026-09-02 · mutation ?
+**Audit:** review 2026-09-02 · mutation 2026-10-06
 
 **Known defects:** none recorded
 
@@ -349,8 +349,8 @@ every entry to carry its inputs, and requires the provenance header to be
 present. Measured 2026-09-06: a dropped case, a flipped output byte, and a
 missing header field each fail it.
 
-**Load-bearing check.** The oracle is verified to be load-bearing by mutation,
-once per surface. For the expression engine: changing `pyMod` from Python's
+**Load-bearing check** (earlier mutation checks, before 2026-10-06). The oracle
+is verified to be load-bearing by mutation, once per surface. For the expression engine: changing `pyMod` from Python's
 floored remainder to `@rem` (C truncation) — a change no unit test notices —
 turns `mod_negatives` red in the replay (`1|1|-1|-1` vs `1|-1|1|-1`). For
 composition: making every `{% block %}` behave as if it were `scoped` — the
@@ -358,6 +358,23 @@ single most tempting simplification in the whole inheritance implementation,
 and one that no self-written test would catch because it makes blocks see
 *more* — turns `block_in_for_is_not_scoped_by_default` red in the replay
 (`<><>` vs `<1><2>`). Both mutations were reverted.
+
+**Mutation run 2026-10-06** (in-place, Debug, 38 mutants over the loader's name
+checks, every render cap, `range`/slice/index bounds, the autoescape and
+`xmlattr` decisions, the two memory guards, `//` and the float-to-int range, the
+parser's nesting bound and two lexer refusals): 36 killed. The first pass left
+20 — the reference replay never reaches a cap or a refusal, and the bomb tests
+run each cap at ten times its value, so a cap moved one past its bound passed
+them all. Tests added: every render cap at its bound and one past it
+(`max_output_bytes`, `max_templates`, `max_template_depth` for nesting and for
+inheritance, `max_call_depth` for macros and for recursive loops), the memory
+guards and zero steps under a 1 MiB budget, `checkName`'s whole-name and
+component-count bounds and a lone NUL byte, index == length, `truncate` at
+`length == len(end)`, an unmatched closer and a cut-off `\x` escape. Equivalent:
+`checkName`'s leading-`/` rule (the empty first component refuses the same
+names as `MalformedName`, and the test accepts either refusal by design), and
+the negative-step slice's `i >= len` guard (`i` starts at most `len - 1` and
+only decreases).
 
 **What the corpus is weighted towards.** Not the easy paths: whitespace-control
 combinations including `+` and the option interactions, `loop` inside nested
