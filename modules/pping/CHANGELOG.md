@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED: ICMP / ICMPv6 Echo RTT. `parseIpEcho` (IPv4 or IPv6
+  packet, extension-header walk capped at 8, typed `EchoParseError`) and
+  `parseIcmpEcho` decode Echo Request/Reply (types 8/0, 128/129);
+  `Estimator.observeEcho` pairs a request with the reply carrying the same
+  (identifier, sequence) back the other way, in the same bounded tables with
+  the same aging and capacity eviction, consuming on first match so duplicate
+  replies yield nothing; `IpEcho.direction` labels an address pair;
+  `matchEchoReply` is the bare core. `RttSample` gained `proto: Proto =
+  .tcp_timestamps` plus `echoIdentifier()` / `echoSequence()`. An estimator now
+  fixes `traffic` on its first call and refuses (returns `null`, counts
+  `observations_refused`) the other kind — **BEHAVIOURAL** only for a caller
+  mixing the new echo calls into a TCP estimator; TCP-only use is unchanged.
+  Anchored on real iputils `ping` captures (IPv4, including a 65535 -> 0
+  sequence wrap; `tools/capture_icmp_echo.sh`); ICMPv6 packets are
+  SELF-DERIVED and tcpdump-checked (`tools/icmpv6_crosscheck.py`). New
+  `testing.fuzz` harness on `parseIpEcho`. Scope mvp -> core. The `root.zig`
+  "Status: complete" wording is replaced by the scope it implements.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: README "Status" reworded from "complete" to the mvp scope it implements; Anchoring names the leftover `gate.fable_core_implemented` switch precisely.
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
