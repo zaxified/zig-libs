@@ -788,6 +788,7 @@ const ServerState = struct {
             .algorithm_mismatch => "the key blob's type does not match the algorithm the request named",
             .bad_signature => "the key was authorized, but the signature did not verify under it",
             .peer_disconnected => "the client sent SSH_MSG_DISCONNECT instead of another credential",
+            .wrong_answers => "the keyboard-interactive answers were refused",
         };
         std.debug.print("Failed authentication from {s}: {t} — {s}\n", .{ peer, why, detail });
     }

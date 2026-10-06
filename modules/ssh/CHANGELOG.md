@@ -16,7 +16,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   ones L1/L3/L5. Tests for M1 (crafted wire), M2 and L6 (live), teeth checked by mutation. The
   keyboard-interactive test against Go moved out of `src` into `tools/interop.zig` (module purity:
   `test-ssh` needs no Go); `src` has a loopback client↔server keyboard-interactive test instead.
-- **2026-10-06** — **keyboard-interactive (RFC 4256), both roles (ADDITIVE).** Client:
+- **2026-10-06** — **keyboard-interactive (RFC 4256), both roles. BREAKING for exhaustive switches:**
+  `userauth.AuthFailure` gained `.wrong_answers` and `userauth.AuthMethod` gained
+  `.keyboard_interactive` — a `switch` over either without `else` must add the arm (ssh-demo did). Client:
   `userauth.authenticateKeyboardInteractive` answers any number of SSH_MSG_USERAUTH_INFO_REQUEST
   rounds through a `KbdResponder` (answers copied, sent and scrubbed at once). Server:
   `AuthConfig.keyboard_interactive` (`KbdInteractiveCheck`: one round of prompts, the caller's
