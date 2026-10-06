@@ -29,7 +29,9 @@ The ultimate data source in that lineage is WealthFolio (**AGPL-3.0**); the
 relationship is data-only interop — only the SQLite schema was read via SQL, no
 WealthFolio source or crates were linked or ported — so no AGPL obligation
 attaches. Algorithms and constants are exact and the numeric behaviour is
-pinned by tests.
+pinned by tests. `src/testdata/oracle_vectors.zig` holds reference values
+computed by pyxirr, scipy, numpy, pandas and empyrical-reloaded
+(`tools/oracle.py`) — their outputs on our inputs, used as black-box oracles.
 
 ## Numeric conventions (kept exact — these are decisions, not bugs)
 

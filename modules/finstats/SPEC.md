@@ -137,6 +137,13 @@ Everything from the original backlog is now implemented (see Design & invariants
 above). Remaining, genuinely deferred: annualization-frequency presets/bounds checking beyond the
 free `periods_per_year` knob; confidence intervals/standard errors on the statistics.
 
+- **Foreign anchors for the remaining SELF paths** *(2026-10-06)*: R PerformanceAnalytics `VaR`/`ES`
+  with `method = "modified"` is the reference Cornish-Fisher implementation (R is not installed on the
+  oracle host); `Return.portfolio`/Modified Dietz and a Brinson-Fachler worked example from a
+  published text would anchor `twrDaily` and `brinsonAttribution`; pandas `corr(min_periods)` and
+  ffn `drawdown_details` the correlation matrix and the drawdown episodes. Effort: small each, once
+  the oracle is at hand (`tools/oracle.py` takes another section). Fits §2.
+
 - ~~**Risk-free rate in Sharpe / Sortino**~~ *(survey 2026-09-30)* — **done 2026-10-04**
   (`RiskSpec.rf`, annual, subtracted from the annualized-return numerator — this module's Sharpe is
   CAGR/vol, not ffn's mean/std of per-period excess returns, so the rf enters where the return
@@ -164,6 +171,6 @@ src/root.zig.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/root.zig:1559 pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; xirr, TWR/Modified-Dietz, beta/alpha, Brinson attribution, Omega and Cornish-Fisher remain hand-computed fixtures with no foreign oracle
+**What the tests actually contain.** src/root.zig pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; since 2026-10-06 `src/oracle_test.zig` replays `tools/oracle.py`'s reference values over five seeded 250-day series and ten dated cash-flow schedules: xirr and xirrPrecise vs pyxirr (ACT/365.25, both `opening` modes), skewness / excess kurtosis vs scipy, invNormCdf (within Acklam's 1.15e-9) and normalPdf vs scipy.stats.norm, gaussianVaR / gaussianCVaR vs norm.ppf and a numerically integrated tail mean, quantile vs numpy, riskMetrics' ann_vol / downside / var95 / cvar95 / mdd and omegaRatio vs empyrical-reloaded, beta / r2 vs scipy linregress, rollingMean / rollingVolatility vs pandas. Still SELF (no foreign implementation found): twrDaily (Modified Dietz), brinsonAttribution, the Cornish-Fisher VaR/CVaR, Sharpe/Sortino/Calmar's CAGR-over-calendar-days numerator, ulcer, correlationMatrix, drawdownEpisodes, trade statistics
 
 **How it got there.** The anchoring work landed. DONE 1e757f4: ffn oracle on 8-return series; conventions established first

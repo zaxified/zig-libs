@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** foreign reference values anchor xirr/xirrPrecise
+  (pyxirr, ACT/365.25), skewness/kurtosis, the normal quantile and density, Gaussian VaR/CVaR,
+  quantile, riskMetrics' vol/downside/VaR/CVaR/max-drawdown, omega, beta/r² and the rolling mean and
+  volatility (`tools/oracle.py` → `src/testdata/oracle_vectors.zig`, replayed by
+  `src/oracle_test.zig`). No defect. twrDaily, Brinson and Cornish-Fisher stay self (backlog).
+
 - **2026-10-04** — ADDED (survey 2026-09-30 gaps), no breaking change: `RiskSpec.rf` (annual
   risk-free rate in the Sharpe/Sortino numerators; default 0 = unchanged); trade statistics
   `winRate`, `payoffRatio`, `profitFactor`, `kellyCriterion`, `tailRatio` + node `tradeStats`;

@@ -3120,3 +3120,9 @@ test "edges the mutation run asked for (finstats)" {
     try testing.expectApproxEqRel(@as(f64, 0.028125 * 0.028125 / (0.021875 * 0.056875)), ba.cell(0, "r2").?.float, 1e-12);
     try testing.expectApproxEqRel(@as(f64, 45.0 / 91.0), ba.cell(0, "beta").?.float, 1e-12);
 }
+
+test {
+    // External anchor: reference values from pyxirr, scipy, numpy, pandas and
+    // empyrical-reloaded (tools/oracle.py).
+    _ = @import("oracle_test.zig");
+}
