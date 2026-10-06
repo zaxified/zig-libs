@@ -16,11 +16,12 @@ pub const message = @import("message.zig");
 pub const bolt1 = @import("bolt1.zig");
 pub const bolt2 = @import("bolt2.zig");
 pub const bolt7 = @import("bolt7.zig");
+pub const features = @import("features.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management and gossip messages, over `bolt8`.",
+    .doc = "Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management (incl. reestablish) and gossip messages, address descriptors and feature bits, over `bolt8`.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -100,6 +101,14 @@ pub const serializeShutdown = bolt2.serializeShutdown;
 pub const ClosingSigned = bolt2.ClosingSigned;
 pub const decodeClosingSigned = bolt2.decodeClosingSigned;
 pub const serializeClosingSigned = bolt2.serializeClosingSigned;
+pub const BADONION = bolt2.BADONION;
+pub const UpdateFailMalformedHtlc = bolt2.UpdateFailMalformedHtlc;
+pub const decodeUpdateFailMalformedHtlc = bolt2.decodeUpdateFailMalformedHtlc;
+pub const serializeUpdateFailMalformedHtlc = bolt2.serializeUpdateFailMalformedHtlc;
+pub const ChannelReestablish = bolt2.ChannelReestablish;
+pub const FundingTxidFlags = bolt2.FundingTxidFlags;
+pub const decodeChannelReestablish = bolt2.decodeChannelReestablish;
+pub const serializeChannelReestablish = bolt2.serializeChannelReestablish;
 
 // ── re-exports: BOLT#7 gossip messages ──────────────────────────────────
 
@@ -131,6 +140,17 @@ pub const serializeQueryChannelRange = bolt7.serializeQueryChannelRange;
 pub const ReplyChannelRange = bolt7.ReplyChannelRange;
 pub const decodeReplyChannelRange = bolt7.decodeReplyChannelRange;
 pub const serializeReplyChannelRange = bolt7.serializeReplyChannelRange;
+pub const AnnouncementSignatures = bolt7.AnnouncementSignatures;
+pub const decodeAnnouncementSignatures = bolt7.decodeAnnouncementSignatures;
+pub const serializeAnnouncementSignatures = bolt7.serializeAnnouncementSignatures;
+pub const GossipTimestampFilter = bolt7.GossipTimestampFilter;
+pub const decodeGossipTimestampFilter = bolt7.decodeGossipTimestampFilter;
+pub const serializeGossipTimestampFilter = bolt7.serializeGossipTimestampFilter;
+pub const Address = bolt7.Address;
+pub const AddressType = bolt7.AddressType;
+pub const AddressIterator = bolt7.AddressIterator;
+pub const addressIterator = bolt7.addressIterator;
+pub const encodeAddresses = bolt7.encodeAddresses;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -143,6 +163,7 @@ test {
     _ = bolt1;
     _ = bolt2;
     _ = bolt7;
+    _ = features;
     _ = @import("bolt1_kat_test.zig");
     _ = @import("bolt2_kat_test.zig");
 }

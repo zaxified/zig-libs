@@ -170,6 +170,20 @@ actually emitted, transcribed mechanically, is an anchor).
     external vectors before this pass — self round-trip and hostile-
     truncation only. Driven by `bolt1_kat_test.zig`.
 
+  * `lightning/src/ln/msgs.rs`, `encoding_channel_reestablish`,
+    `encoding_channel_reestablish_with_next_funding_txid`,
+    `encoding_channel_reestablish_with_funding_locked_txid`,
+    `encoding_update_fail_malformed_htlc`, `encoding_announcement_signatures`,
+    `encoding_gossip_timestamp_filter` (fetched 2026-10-06, `main` branch commit
+    `15c5d9b8459e852f2b33586e586e3e90307114ee`; upstream `LICENSE-MIT` re-checked
+    the same day, still the MIT body with no copyright line) — every case,
+    transcribed mechanically (decimal `vec![..]` literals converted to hex by
+    regex, lengths checked) into `src/bolt2_reestablish_malformed_kat_vectors.zig`
+    and `src/bolt7_sigs_filter_kat_vectors.zig`. Driven by `bolt2.zig`'s and
+    `bolt7.zig`'s "official vector (rust-lightning msgs.rs encoding_…)" tests.
+    The 10 `encoding_node_announcement` vectors above additionally anchor the
+    address-descriptor walker/encoder (`bolt7.zig`) and `features.zig`.
+
 Implementation vs. test-data distinction: the BOLT#1/#2/#7 wire-format
 CODEC in `bolt1.zig`/`bolt2.zig`/`bolt7.zig` is this module's own
 clean-room work from the public spec text (`01-messaging.md` /

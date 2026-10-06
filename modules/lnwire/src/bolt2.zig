@@ -4,15 +4,16 @@
 //! `accept_channel`, `funding_created`, `funding_signed`,
 //! `channel_ready`, `update_add_htlc`, `update_fulfill_htlc`,
 //! `update_fail_htlc`, `commitment_signed`, `revoke_and_ack`,
-//! `update_fee`, `shutdown`, `closing_signed`.
+//! `update_fee`, `shutdown`, `closing_signed` — plus (2026-10-06)
+//! `update_fail_malformed_htlc` (with BOLT#2's `BADONION` receiver rule)
+//! and `channel_reestablish` (with its `next_funding` /
+//! `my_current_funding_locked` TLVs, length-checked).
 //!
 //! Deferred (see `../SPEC.md`): Interactive Transaction Construction
 //! (`tx_*`), Channel Establishment v2 (`open_channel2`/`accept_channel2`),
-//! Channel Splicing, Quiescence (`stfu`), `update_fail_malformed_htlc`,
-//! `start_batch`, modern Closing Negotiation (`closing_complete`/
-//! `closing_sig`), `channel_reestablish` — none named in this module's
-//! required set; each is a self-contained follow-on, not a corner cut
-//! inside a message this file claims to implement.
+//! Channel Splicing, Quiescence (`stfu`), `start_batch`, modern Closing
+//! Negotiation (`closing_complete`/`closing_sig`) — each a self-contained
+//! follow-on, not a corner cut inside a message this file implements.
 //!
 //! Every message's trailing `tlv_stream` is decoded generically via
 //! `message.Extension` (see `message.zig`'s doc comment) into its
@@ -591,6 +592,188 @@ pub fn serializeClosingSigned(allocator: Allocator, msg: ClosingSigned) Allocato
     return w.toOwned(allocator);
 }
 
+// ── update_fail_malformed_htlc (type 135) — no tlv_stream ────────────────
+
+pub const UPDATE_FAIL_MALFORMED_HTLC_TYPE: u16 = 135;
+/// BOLT#4's `BADONION` failure-code flag: "unparsable onion encrypted by
+/// sending peer". BOLT#2: a receiver of `update_fail_malformed_htlc` whose
+/// `failure_code` lacks it "MUST send a `warning` and close the connection,
+/// or send an `error` and fail the channel".
+pub const BADONION: u16 = 0x8000;
+
+pub const MalformedError = error{
+    /// `failure_code` does not carry the `BADONION` bit (BOLT#2 MUST-fail).
+    BadOnionBitNotSet,
+};
+
+pub const UpdateFailMalformedHtlc = struct {
+    channel_id: ChannelId,
+    id: u64,
+    sha256_of_onion: Sha256,
+    failure_code: u16,
+
+    pub fn deinit(_: *UpdateFailMalformedHtlc, _: Allocator) void {}
+};
+
+/// Decodes `update_fail_malformed_htlc` and enforces BOLT#2's receiver rule
+/// on `failure_code`: without the `BADONION` bit the message is refused with
+/// `error.BadOnionBitNotSet` — fail-closed here rather than left to the
+/// caller, because accepting it means relaying a non-onion failure code
+/// upstream as if this hop had failed to parse the onion. Like every other
+/// message without a `tlv_stream`, bytes after `failure_code` are ignored
+/// (BOLT#1: a receiver "MAY ignore the `extension`").
+pub fn decodeUpdateFailMalformedHtlc(bytes: []const u8) (message.FrameError || MalformedError)!UpdateFailMalformedHtlc {
+    const m = try decodeUpdateFailMalformedHtlcLayout(bytes);
+    if (m.failure_code & BADONION == 0) return error.BadOnionBitNotSet;
+    return m;
+}
+
+/// The same `BADONION` rule on the sending side: a malformed-onion failure
+/// code without the bit is a message the peer is required to fail the
+/// channel over, so it is refused before it reaches the wire.
+pub fn serializeUpdateFailMalformedHtlc(allocator: Allocator, msg: UpdateFailMalformedHtlc) (Allocator.Error || MalformedError)![]u8 {
+    if (msg.failure_code & BADONION == 0) return error.BadOnionBitNotSet;
+    return serializeUpdateFailMalformedHtlcLayout(allocator, msg);
+}
+
+/// Wire layout only, no `BADONION` rule. Private: it exists so the tests can
+/// read rust-lightning's vector, whose `failure_code` is 255 (no `BADONION`
+/// bit), field by field and byte-exact both ways.
+fn decodeUpdateFailMalformedHtlcLayout(bytes: []const u8) message.FrameError!UpdateFailMalformedHtlc {
+    var r = try message.openFrame(bytes, UPDATE_FAIL_MALFORMED_HTLC_TYPE);
+    return .{
+        .channel_id = try r.takeArray(32),
+        .id = try r.u64be(),
+        .sha256_of_onion = try r.takeArray(32),
+        .failure_code = try r.u16be(),
+    };
+}
+
+fn serializeUpdateFailMalformedHtlcLayout(allocator: Allocator, msg: UpdateFailMalformedHtlc) Allocator.Error![]u8 {
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try message.putFrameType(&w, allocator, UPDATE_FAIL_MALFORMED_HTLC_TYPE);
+    try w.putBytes(allocator, &msg.channel_id);
+    try w.putU64be(allocator, msg.id);
+    try w.putBytes(allocator, &msg.sha256_of_onion);
+    try w.putU16be(allocator, msg.failure_code);
+    return w.toOwned(allocator);
+}
+
+// ── channel_reestablish (type 136) ────────────────────────────────────────
+
+pub const CHANNEL_REESTABLISH_TYPE: u16 = 136;
+/// `channel_reestablish_tlvs` TLV types (BOLT#2, `lightning/bolts` master).
+pub const REESTABLISH_TLV_NEXT_FUNDING: u64 = 1;
+pub const REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED: u64 = 5;
+const channel_reestablish_known_tlv = [_]u64{ REESTABLISH_TLV_NEXT_FUNDING, REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED };
+
+/// The value both `channel_reestablish` TLVs carry: a funding txid
+/// (`sha256`, wire byte order — not reversed for display) and a
+/// `retransmit_flags` bitfield. Exactly 33 octets on the wire.
+pub const FundingTxidFlags = struct {
+    txid: Sha256,
+    retransmit_flags: u8,
+
+    pub const wire_len: usize = 33;
+
+    /// The 33-octet TLV value, for building a `channel_reestablish`'s
+    /// `extension.records` entry.
+    pub fn toBytes(self: FundingTxidFlags) [wire_len]u8 {
+        var out: [wire_len]u8 = undefined;
+        @memcpy(out[0..32], &self.txid);
+        out[32] = self.retransmit_flags;
+        return out;
+    }
+
+    fn fromBytes(v: []const u8) FundingTxidFlags {
+        return .{ .txid = v[0..32].*, .retransmit_flags = v[32] };
+    }
+};
+
+pub const TlvLengthError = error{
+    /// A KNOWN TLV record's length is not the one its encoding requires
+    /// (BOLT#1: "if `length` is not exactly equal to that required for the
+    /// known encoding for `type`: MUST fail to parse the `tlv_stream`").
+    InvalidTlvLength,
+};
+
+pub const ChannelReestablish = struct {
+    channel_id: ChannelId,
+    /// BOLT#2's 48-bit counter, carried in a `u64` (no range check: the spec
+    /// defines no receiver rule for the high 16 bits).
+    next_commitment_number: u64,
+    next_revocation_number: u64,
+    /// SECRET — the last per-commitment secret received from the peer, echoed
+    /// back so it can prove (or detect) data loss. **Caller-owned**
+    /// (CONVENTIONS §2.1 Z2), on the same terms as
+    /// `RevokeAndAck.per_commitment_secret`: `deinit` frees only the TLV
+    /// extension, so `std.crypto.secureZero` this field once it is checked.
+    your_last_per_commitment_secret: [32]u8,
+    my_current_per_commitment_point: Point,
+    extension: Extension = .{},
+
+    pub fn deinit(self: *ChannelReestablish, allocator: Allocator) void {
+        self.extension.deinit(allocator);
+    }
+
+    /// `next_funding` (TLV 1), if present. Its length was checked at decode.
+    pub fn nextFunding(self: ChannelReestablish) ?FundingTxidFlags {
+        const v = self.extension.find(REESTABLISH_TLV_NEXT_FUNDING) orelse return null;
+        if (v.len != FundingTxidFlags.wire_len) return null;
+        return FundingTxidFlags.fromBytes(v);
+    }
+
+    /// `my_current_funding_locked` (TLV 5), if present.
+    pub fn myCurrentFundingLocked(self: ChannelReestablish) ?FundingTxidFlags {
+        const v = self.extension.find(REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED) orelse return null;
+        if (v.len != FundingTxidFlags.wire_len) return null;
+        return FundingTxidFlags.fromBytes(v);
+    }
+};
+
+fn checkReestablishTlvLengths(ext: Extension) TlvLengthError!void {
+    for (ext.records) |rec| {
+        if (rec.value.len != FundingTxidFlags.wire_len) return error.InvalidTlvLength;
+    }
+}
+
+pub fn decodeChannelReestablish(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!ChannelReestablish {
+    var r = try message.openFrame(bytes, CHANNEL_REESTABLISH_TYPE);
+    var m: ChannelReestablish = undefined;
+    m.channel_id = try r.takeArray(32);
+    m.next_commitment_number = try r.u64be();
+    m.next_revocation_number = try r.u64be();
+    m.your_last_per_commitment_secret = try r.takeArray(32);
+    m.my_current_per_commitment_point = try readPoint(&r);
+    m.extension = try message.decodeExtension(allocator, r.rest(), &channel_reestablish_known_tlv);
+    errdefer m.extension.deinit(allocator);
+    // Both known records are `sha256 || byte`; any other length is a
+    // stream BOLT#1 says MUST fail, not a record to hand back raw.
+    try checkReestablishTlvLengths(m.extension);
+    return m;
+}
+
+/// Refuses (`error.InvalidTlvLength`) to emit a known TLV record of the
+/// wrong length — the peer would be required to fail the stream. Records
+/// are written in the order given; build them in increasing type order.
+pub fn serializeChannelReestablish(allocator: Allocator, msg: ChannelReestablish) (Allocator.Error || TlvLengthError)![]u8 {
+    for (msg.extension.records) |rec| {
+        const known = rec.type == REESTABLISH_TLV_NEXT_FUNDING or rec.type == REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED;
+        if (known and rec.value.len != FundingTxidFlags.wire_len) return error.InvalidTlvLength;
+    }
+    var w: Writer = .{};
+    defer w.deinit(allocator);
+    try message.putFrameType(&w, allocator, CHANNEL_REESTABLISH_TYPE);
+    try w.putBytes(allocator, &msg.channel_id);
+    try w.putU64be(allocator, msg.next_commitment_number);
+    try w.putU64be(allocator, msg.next_revocation_number);
+    try w.putBytes(allocator, &msg.your_last_per_commitment_secret);
+    try w.putBytes(allocator, &msg.my_current_per_commitment_point);
+    try message.encodeExtension(&w, allocator, msg.extension);
+    return w.toOwned(allocator);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1120,4 +1303,320 @@ test "corpus: every open_channel seed reaches the decoder, and the counts are pi
     try testing.expectEqual(entries.len, nonempty);
     try testing.expectEqual(@as(usize, 3), decoded);
     try testing.expectEqual(@as(usize, 2), tlv_records);
+}
+
+// ── channel_reestablish / update_fail_malformed_htlc (added 2026-10-06) ──
+
+const rm_kat = @import("bolt2_reestablish_malformed_kat_vectors.zig");
+
+fn hexArray(comptime n: usize, hex: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+/// `payload_hex` behind this module's own 2-octet frame type.
+fn framedHex(allocator: Allocator, msg_type: u16, payload_hex: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, 2 + payload_hex.len / 2);
+    errdefer allocator.free(out);
+    std.mem.writeInt(u16, out[0..2], msg_type, .big);
+    _ = try std.fmt.hexToBytes(out[2..], payload_hex);
+    return out;
+}
+
+test "official vector (rust-lightning msgs.rs encoding_channel_reestablish*): channel_reestablish, both directions" {
+    const allocator = testing.allocator;
+    for (rm_kat.channel_reestablish_vectors) |v| {
+        errdefer std.debug.print("channel_reestablish vector: {s}\n", .{v.description});
+        const full = try framedHex(allocator, CHANNEL_REESTABLISH_TYPE, v.payload_hex);
+        defer allocator.free(full);
+
+        // DECODE: every field against the struct literal upstream encoded.
+        var m = try decodeChannelReestablish(allocator, full);
+        defer m.deinit(allocator);
+        try testing.expectEqualSlices(u8, &hexArray(32, v.channel_id_hex), &m.channel_id);
+        try testing.expectEqual(v.next_commitment_number, m.next_commitment_number);
+        try testing.expectEqual(v.next_revocation_number, m.next_revocation_number);
+        try testing.expectEqualSlices(u8, &hexArray(32, v.your_last_per_commitment_secret_hex), &m.your_last_per_commitment_secret);
+        try testing.expectEqualSlices(u8, &hexArray(33, v.my_current_per_commitment_point_hex), &m.my_current_per_commitment_point);
+        if (v.next_funding_txid_hex) |h| {
+            const nf = m.nextFunding() orelse return error.ExpectedNextFunding;
+            try testing.expectEqualSlices(u8, &hexArray(32, h), &nf.txid);
+            try testing.expectEqual(v.next_funding_flags, nf.retransmit_flags);
+        } else try testing.expect(m.nextFunding() == null);
+        if (v.funding_locked_txid_hex) |h| {
+            const fl = m.myCurrentFundingLocked() orelse return error.ExpectedFundingLocked;
+            try testing.expectEqualSlices(u8, &hexArray(32, h), &fl.txid);
+            try testing.expectEqual(v.funding_locked_flags, fl.retransmit_flags);
+        } else try testing.expect(m.myCurrentFundingLocked() == null);
+
+        // ENCODE: built from the vector's fields alone, byte-exact.
+        var recs: [2]message.tlv.RawRecord = undefined;
+        var n: usize = 0;
+        var nf_bytes: [FundingTxidFlags.wire_len]u8 = undefined;
+        var fl_bytes: [FundingTxidFlags.wire_len]u8 = undefined;
+        if (v.next_funding_txid_hex) |h| {
+            nf_bytes = (FundingTxidFlags{ .txid = hexArray(32, h), .retransmit_flags = v.next_funding_flags }).toBytes();
+            recs[n] = .{ .type = REESTABLISH_TLV_NEXT_FUNDING, .value = &nf_bytes };
+            n += 1;
+        }
+        if (v.funding_locked_txid_hex) |h| {
+            fl_bytes = (FundingTxidFlags{ .txid = hexArray(32, h), .retransmit_flags = v.funding_locked_flags }).toBytes();
+            recs[n] = .{ .type = REESTABLISH_TLV_MY_CURRENT_FUNDING_LOCKED, .value = &fl_bytes };
+            n += 1;
+        }
+        const built: ChannelReestablish = .{
+            .channel_id = hexArray(32, v.channel_id_hex),
+            .next_commitment_number = v.next_commitment_number,
+            .next_revocation_number = v.next_revocation_number,
+            .your_last_per_commitment_secret = hexArray(32, v.your_last_per_commitment_secret_hex),
+            .my_current_per_commitment_point = hexArray(33, v.my_current_per_commitment_point_hex),
+            .extension = .{ .records = recs[0..n] },
+        };
+        const out = try serializeChannelReestablish(allocator, built);
+        defer allocator.free(out);
+        try testing.expectEqualSlices(u8, full, out);
+    }
+}
+
+test "official vector (rust-lightning msgs.rs encoding_update_fail_malformed_htlc): layout both ways, and the BADONION refusal" {
+    const allocator = testing.allocator;
+    const v = rm_kat.update_fail_malformed_htlc_vector;
+    const full = try framedHex(allocator, UPDATE_FAIL_MALFORMED_HTLC_TYPE, v.payload_hex);
+    defer allocator.free(full);
+
+    const m = try decodeUpdateFailMalformedHtlcLayout(full);
+    try testing.expectEqualSlices(u8, &hexArray(32, v.channel_id_hex), &m.channel_id);
+    try testing.expectEqual(v.id, m.id);
+    try testing.expectEqualSlices(u8, &hexArray(32, v.sha256_of_onion_hex), &m.sha256_of_onion);
+    try testing.expectEqual(v.failure_code, m.failure_code);
+
+    const built: UpdateFailMalformedHtlc = .{
+        .channel_id = hexArray(32, v.channel_id_hex),
+        .id = v.id,
+        .sha256_of_onion = hexArray(32, v.sha256_of_onion_hex),
+        .failure_code = v.failure_code,
+    };
+    const out = try serializeUpdateFailMalformedHtlcLayout(allocator, built);
+    defer allocator.free(out);
+    try testing.expectEqualSlices(u8, full, out);
+
+    // failure_code 255 has no BADONION bit: BOLT#2 says the receiver MUST
+    // fail it, and the public codec does — in both directions.
+    try testing.expectError(error.BadOnionBitNotSet, decodeUpdateFailMalformedHtlc(full));
+    try testing.expectError(error.BadOnionBitNotSet, serializeUpdateFailMalformedHtlc(allocator, built));
+}
+
+test "update_fail_malformed_htlc: BADONION codes pass, the bit alone decides" {
+    const allocator = testing.allocator;
+    // BOLT#4's invalid_onion_version / _hmac / _key / _blinding are
+    // BADONION|PERM|4,5,6,24 = 0xC004, 0xC005, 0xC006, 0xC018.
+    for ([_]u16{ 0xC004, 0xC005, 0xC006, 0xC018, BADONION }) |code| {
+        const msg: UpdateFailMalformedHtlc = .{ .channel_id = fillPattern(32, 1), .id = 9, .sha256_of_onion = fillPattern(32, 2), .failure_code = code };
+        const bytes = try serializeUpdateFailMalformedHtlc(allocator, msg);
+        defer allocator.free(bytes);
+        try testing.expectEqual(@as(usize, 2 + 32 + 8 + 32 + 2), bytes.len);
+        const back = try decodeUpdateFailMalformedHtlc(bytes);
+        try testing.expectEqual(code, back.failure_code);
+        try testing.expectEqual(msg.id, back.id);
+    }
+    // PERM|4 without BADONION (0x4004), the bit's neighbour 0x7FFF, and 0.
+    for ([_]u16{ 0x4004, 0x7FFF, 0 }) |code| {
+        const msg: UpdateFailMalformedHtlc = .{ .channel_id = fillPattern(32, 1), .id = 9, .sha256_of_onion = fillPattern(32, 2), .failure_code = code };
+        try testing.expectError(error.BadOnionBitNotSet, serializeUpdateFailMalformedHtlc(allocator, msg));
+    }
+}
+
+test "hostile: update_fail_malformed_htlc truncated inside failure_code fails closed" {
+    var bytes: [2 + 32 + 8 + 32 + 1]u8 = @splat(0x80);
+    std.mem.writeInt(u16, bytes[0..2], UPDATE_FAIL_MALFORMED_HTLC_TYPE, .big);
+    try testing.expectError(error.Truncated, decodeUpdateFailMalformedHtlc(&bytes));
+}
+
+fn reestablishBase() ChannelReestablish {
+    return .{
+        .channel_id = fillPattern(32, 1),
+        .next_commitment_number = 42,
+        .next_revocation_number = 41,
+        .your_last_per_commitment_secret = fillPattern(32, 2),
+        .my_current_per_commitment_point = fillPattern(33, 3),
+    };
+}
+
+test "channel_reestablish: both TLVs together, unknown odd discarded" {
+    const allocator = testing.allocator;
+    const nf = (FundingTxidFlags{ .txid = fillPattern(32, 7), .retransmit_flags = 1 }).toBytes();
+    const fl = (FundingTxidFlags{ .txid = fillPattern(32, 8), .retransmit_flags = 0 }).toBytes();
+    var msg = reestablishBase();
+    msg.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+        .{ .type = 1, .value = &nf },
+        .{ .type = 5, .value = &fl },
+        .{ .type = 7, .value = &.{ 0xAA, 0xBB } },
+    }) };
+    const bytes = try serializeChannelReestablish(allocator, msg);
+    defer allocator.free(bytes);
+    var m = try decodeChannelReestablish(allocator, bytes);
+    defer m.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), m.extension.records.len);
+    try testing.expectEqualSlices(u8, &fillPattern(32, 7), &m.nextFunding().?.txid);
+    try testing.expectEqual(@as(u8, 0), m.myCurrentFundingLocked().?.retransmit_flags);
+    try testing.expectEqual(@as(u64, 42), m.next_commitment_number);
+}
+
+test "hostile: channel_reestablish refuses wrong-length known TLVs, unknown even TLVs, truncation" {
+    const allocator = testing.allocator;
+    const plain = try serializeChannelReestablish(allocator, reestablishBase());
+    defer allocator.free(plain);
+    try testing.expectEqual(@as(usize, 2 + 113), plain.len);
+
+    var buf: [2 + 113 + 40]u8 = undefined;
+    @memcpy(buf[0..plain.len], plain);
+    // next_funding with 32 octets (the length before `retransmit_flags`).
+    buf[plain.len] = 0x01;
+    buf[plain.len + 1] = 32;
+    @memset(buf[plain.len + 2 ..][0..32], 0x11);
+    try testing.expectError(error.InvalidTlvLength, decodeChannelReestablish(allocator, buf[0 .. plain.len + 2 + 32]));
+    // my_current_funding_locked with 34 octets.
+    buf[plain.len] = 0x05;
+    buf[plain.len + 1] = 34;
+    @memset(buf[plain.len + 2 ..][0..34], 0x11);
+    try testing.expectError(error.InvalidTlvLength, decodeChannelReestablish(allocator, buf[0 .. plain.len + 2 + 34]));
+    // Unknown even type 2.
+    buf[plain.len] = 0x02;
+    buf[plain.len + 1] = 0;
+    try testing.expectError(error.UnknownEvenType, decodeChannelReestablish(allocator, buf[0 .. plain.len + 2]));
+    // One octet short of the point.
+    try testing.expectError(error.Truncated, decodeChannelReestablish(allocator, plain[0 .. plain.len - 1]));
+
+    // The encoder refuses the same wrong length.
+    var bad = reestablishBase();
+    const short_value = fillPattern(32, 1);
+    bad.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{.{ .type = 1, .value = &short_value }}) };
+    try testing.expectError(error.InvalidTlvLength, serializeChannelReestablish(allocator, bad));
+}
+
+// ── fuzz: the two new BOLT#2 decoders over the same arbitrary bytes ───────
+//
+// Both decoders run on every input, so no drawn value selects the path
+// (check-fuzz-reach R2(c)); a seed's own frame type decides which one gets
+// past `openFrame`.
+const ReestablishCorpus = struct {
+    store: [12 * (4 + 256)]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ReestablishCorpus, bytes: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], bytes);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ReestablishCorpus, allocator: Allocator) ![]const []const u8 {
+        const plain = try serializeChannelReestablish(allocator, reestablishBase());
+        defer allocator.free(plain);
+        self.push(plain);
+
+        const nf = (FundingTxidFlags{ .txid = fillPattern(32, 7), .retransmit_flags = 1 }).toBytes();
+        var both = reestablishBase();
+        both.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+            .{ .type = 1, .value = &nf },
+            .{ .type = 5, .value = &nf },
+        }) };
+        const both_bytes = try serializeChannelReestablish(allocator, both);
+        defer allocator.free(both_bytes);
+        self.push(both_bytes);
+
+        var odd = reestablishBase();
+        odd.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{.{ .type = 9, .value = &.{0x01} }}) };
+        const odd_bytes = try serializeChannelReestablish(allocator, odd);
+        defer allocator.free(odd_bytes);
+        self.push(odd_bytes);
+
+        // Refusals: wrong-length known TLV, unknown even, truncation, bare frame.
+        {
+            var b: [256]u8 = undefined;
+            @memcpy(b[0..plain.len], plain);
+            b[plain.len] = 0x01;
+            b[plain.len + 1] = 0x01;
+            b[plain.len + 2] = 0xEE;
+            self.push(b[0 .. plain.len + 3]);
+            b[plain.len] = 0x04;
+            b[plain.len + 1] = 0x00;
+            self.push(b[0 .. plain.len + 2]);
+        }
+        self.push(plain[0 .. plain.len - 1]);
+        self.push(plain[0..2]);
+
+        const good: UpdateFailMalformedHtlc = .{ .channel_id = fillPattern(32, 1), .id = 3, .sha256_of_onion = fillPattern(32, 2), .failure_code = 0xC005 };
+        const mal = try serializeUpdateFailMalformedHtlc(allocator, good);
+        defer allocator.free(mal);
+        self.push(mal);
+        {
+            var b: [256]u8 = undefined;
+            @memcpy(b[0..mal.len], mal);
+            std.mem.writeInt(u16, b[mal.len - 2 ..][0..2], 0x4005, .big); // no BADONION
+            self.push(b[0..mal.len]);
+        }
+        self.push(mal[0 .. mal.len - 1]);
+        return self.entries[0..self.n];
+    }
+};
+
+const ReestablishFuzzOutcome = struct { reestablish: bool = false, malformed: bool = false, records: usize = 0 };
+
+fn runReestablishMalformed(allocator: Allocator, bytes: []const u8) ReestablishFuzzOutcome {
+    var out: ReestablishFuzzOutcome = .{};
+    if (decodeChannelReestablish(allocator, bytes)) |decoded| {
+        var m = decoded;
+        defer m.deinit(allocator);
+        out.reestablish = true;
+        out.records = m.extension.records.len;
+        _ = m.nextFunding();
+        _ = m.myCurrentFundingLocked();
+    } else |_| {}
+    if (decodeUpdateFailMalformedHtlc(bytes)) |_| {
+        out.malformed = true;
+    } else |_| {}
+    return out;
+}
+
+test "fuzz: decodeChannelReestablish / decodeUpdateFailMalformedHtlc never panic on arbitrary bytes" {
+    var corpus: ReestablishCorpus = .{};
+    try testing.fuzz({}, fuzzReestablishMalformed, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+fn fuzzReestablishMalformed(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    // One faithful `smith.slice` draw (see `fuzzDecodeOpenChannel`).
+    const len: usize = smith.slice(&buf);
+    _ = runReestablishMalformed(testing.allocator, buf[0..len]);
+}
+
+test "corpus: every reestablish/malformed seed reaches a decoder, and the counts are pinned" {
+    var corpus: ReestablishCorpus = .{};
+    const allocator = testing.allocator;
+    const entries = try corpus.build(allocator);
+    var nonempty: usize = 0;
+    var reestablish: usize = 0;
+    var malformed: usize = 0;
+    var records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const o = runReestablishMalformed(allocator, buf[0..len]);
+        if (o.reestablish) reestablish += 1;
+        if (o.malformed) malformed += 1;
+        records += o.records;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    // plain, both TLVs, unknown-odd.
+    try testing.expectEqual(@as(usize, 3), reestablish);
+    // Only the BADONION one; its 0x4005 twin is refused.
+    try testing.expectEqual(@as(usize, 1), malformed);
+    // 2 from the both-TLV seed; the unknown-odd record is discarded.
+    try testing.expectEqual(@as(usize, 2), records);
 }
