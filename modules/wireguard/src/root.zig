@@ -1893,4 +1893,7 @@ test {
     // External anchor: real kernel + real `wg`-tool netlink bytes, captured
     // once and frozen (see kernel_goldens.zig's module doc-comment).
     _ = @import("kernel_goldens.zig");
+    // External anchor: real handshakes and data packets exchanged with the
+    // kernel's WireGuard (tools/interop.zig), replayed without root.
+    _ = @import("kernel_handshake_replay.zig");
 }

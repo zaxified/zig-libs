@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** the handshake and data plane are anchored to the
+  Linux kernel's WireGuard without root. `tools/interop.zig` (`unshare -rn zig build
+  interop-wireguard -- --capture`) records both directions — the kernel's initiation answered and
+  its keepalive opened; our initiation (the KAT's `msg1`, byte for byte) and a tunnelled ICMP echo
+  accepted, the echo reply opened — and `src/kernel_handshake_replay.zig` replays them in every
+  lane. No defect.
+
 - **2026-09-07** — Both fuzz targets ran one fixed input. Each opened with `smith.bytes(&buf)`
   and then drew its length with `valueRangeAtMost`, which reads eight input octets as a
   little-endian u64 and returns the range minimum when fewer remain — so the length was 0 on

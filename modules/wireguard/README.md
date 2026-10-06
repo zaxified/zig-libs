@@ -125,7 +125,11 @@ one WireGuard protocol. Implemented over `std.crypto` (X25519,
 ChaCha20-Poly1305, keyed BLAKE2s-128 for mac1, HKDF-over-HMAC-BLAKE2s); no
 `netlink` dependency. Verified with a full-handshake known-answer vector,
 initiator↔responder self-consistency, and a netns-gated live interop
-against the in-kernel WireGuard implementation. Provenance: see `/NOTICE`.
+against the in-kernel WireGuard implementation, whose exchanges in both
+directions (handshake, keepalive, a tunnelled ping) are frozen by
+`tools/interop.zig` into `src/testdata/kernel_handshake.zig` and replayed
+without root by `src/kernel_handshake_replay.zig` — observed wire bytes of a
+black-box peer, exempt per root `NOTICE` §0. Provenance: see `/NOTICE`.
 
 WireGuard's under-load DoS mitigation (whitepaper §5.4.7) is part of it:
 `CookieChecker.admit()` decides `accept` / `cookie_reply` / `drop` for an

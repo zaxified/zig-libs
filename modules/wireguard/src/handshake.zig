@@ -1176,6 +1176,17 @@ test "KAT: full handshake, byte-exact messages and transport keys" {
     try testing.expectEqual(@as(PrivateKey, @splat(0)), ini.local_ephemeral.?.private);
 }
 
+test "KAT: msg1 is the initiation the Linux kernel accepted" {
+    // The KAT was derived from an independent reference, not from a foreign
+    // implementation. `tools/interop.zig` sent this very initiation to the
+    // kernel's WireGuard, which answered it (the transcript's `b_response`):
+    // the vector is a message a real peer took, not only one we agree with.
+    const rec = @import("testdata/kernel_handshake.zig");
+    var accepted: [kat.msg1.len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&accepted, rec.b_initiation);
+    try testing.expectEqualSlices(u8, &kat.msg1, &accepted);
+}
+
 // ── differential: the std -> chachapoly AEAD swap is inert ────────────────
 //
 // `noise.Aead` is the SIMD `chachapoly` sibling; `noise.StdAead` is
