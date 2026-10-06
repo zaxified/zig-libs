@@ -31,6 +31,8 @@ these headers to interface with the kernel. Extracted from the `wireguard`
 module (its first consumer, where this layer originally lived as a private
 `genl.zig`) so other genetlink families can reuse it without depending on
 `wireguard`; no third-party design reference beyond the kernel header.
+`src/testdata/kernel_families.zig` holds the kernel's own GETFAMILY replies
+(`tools/families_capture.py`) — observed wire bytes, exempt per root `NOTICE` §0.
 
 ## API
 

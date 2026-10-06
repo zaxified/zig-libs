@@ -1335,6 +1335,55 @@ test "ctrlGetFamilyOver: positive control — a well-formed matching reply resol
     try testing.expectEqual(@as(usize, 1), t.recvs);
 }
 
+// Real exchanges with the kernel's controller for families with SEVERAL
+// multicast groups (nlctrl, captured above, has one) and for one that does
+// not exist, frozen by `tools/families_capture.py` with Python's own socket
+// and decoded there too -- so the ids expected below come from a second
+// decoder, not from this module.
+const kernel_families = @import("testdata/kernel_families.zig");
+
+test "kernel replay: real GETFAMILY replies resolve every multicast group, as a second decoder read them" {
+    var multi: usize = 0;
+    for (kernel_families.exchanges) |x| {
+        var raw: [4][8192]u8 = undefined;
+        var dgrams: [4][]const u8 = undefined;
+        for (x.datagrams, 0..) |h, i| dgrams[i] = try std.fmt.hexToBytes(&raw[i], h);
+        const script = dgrams[0..x.datagrams.len];
+
+        var t: GenlScripted = .{ .script = script, .pid = x.pid };
+        if (x.id == null) {
+            // The kernel's NLMSG_ERROR for an unknown family.
+            try testing.expectEqual(@as(u32, @intFromEnum(linux.E.NOENT)), x.errno);
+            try testing.expectError(error.FamilyNotFound, ctrlGetFamilyOver(&t, x.family, .family_id, 1));
+            continue;
+        }
+        try testing.expectEqual(@as(?u32, x.id.?), try ctrlGetFamilyOver(&t, x.family, .family_id, 1));
+
+        // Every group the generator decoded, plus one the family lacks, over
+        // the same reply (the F6 path).
+        var names: [16][]const u8 = undefined;
+        var out: [16]?u32 = undefined;
+        for (x.groups, 0..) |g, i| names[i] = g.name;
+        names[x.groups.len] = "zig-libs-nope";
+        const n = x.groups.len + 1;
+        t = .{ .script = script, .pid = x.pid };
+        @memset(out[0..n], null);
+        _ = try ctrlGetFamilyOver(&t, x.family, .{ .many_groups = .{ .names = names[0..n], .out = out[0..n] } }, 1);
+        for (x.groups, 0..) |g, i| try testing.expectEqual(@as(?u32, g.id), out[i]);
+        try testing.expectEqual(@as(?u32, null), out[x.groups.len]);
+
+        // ...and one at a time, the last group especially (the walk has to
+        // step over every entry before it).
+        for (x.groups) |g| {
+            t = .{ .script = script, .pid = x.pid };
+            try testing.expectEqual(@as(?u32, g.id), try ctrlGetFamilyOver(&t, x.family, .{ .one_group = g.name }, 1));
+        }
+        if (x.groups.len > 1) multi += 1;
+    }
+    // netdev at least (core since 6.5); the capture had four such families.
+    try testing.expect(multi >= 1);
+}
+
 test "F1: ctrlGetFamilyOver gives up instead of spinning when the reply never terminates" {
     // Shape (a) from the audit: no NLMSG_DONE, no ACK — a NOOP addressed to
     // us on our own seq, forever. Without a budget this loop never returns.
