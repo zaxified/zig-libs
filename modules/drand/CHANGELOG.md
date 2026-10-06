@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED: verification of the chained `pedersen-bls-chained` scheme, i.e. the
+  League of Entropy "default" network (chain `8990e7a9…b2ce`). `verifyRound` now dispatches on
+  the scheme; new `verifyChainedRoundPoints(pk_g1, round, previous_signature, sig_g2)`,
+  `chainedMessage(round, previous_signature)` (= `SHA-256(previous_signature ‖ u64be(round))`)
+  and `chained_dst`; new fields `ChainInfo.pubkey_g1` and `Round.sig_g2` (both defaulted to
+  `null`, so existing struct literals compile) and `Round.signatureG2()` /
+  `Round.previousSignatureBytes()`. The DST is the standard RFC 9380
+  `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_` (drand v2.1.7 `crypto/schemes.go`), not the
+  "legacy" DST this SPEC claimed. EXTERNAL anchor: genuine default-chain rounds 1, 1000000 and
+  2634945 verify (from drand's Go test suite and `drand_core`'s fixtures; recipe
+  `tools/fetch_chained.py`), with refusals for a tampered signature, round, previous signature
+  and randomness, and positive controls for the DST and digest order. A third fuzz harness
+  damages the default-chain fixtures. `scripts/modtest drand`: 82/82 (was 61/61), Debug and
+  ReleaseSafe. **BEHAVIOURAL, not breaking:** for a `pedersen-bls-chained` chain `verifyRound`
+  verifies instead of returning `UnsupportedScheme`, and `parseInfo` now KeyValidates its key —
+  a key that is not a 48-byte `G1` subgroup point is `InvalidLength` / `InvalidPoint` /
+  `PublicKeyNotInSubgroup` where it used to parse. `parseRound` now decodes any 96-byte
+  signature as `G2` — one that is not a valid subgroup point is `InvalidPoint` /
+  `SignatureNotInSubgroup` where it used to be retained undecoded. Scope mvp -> core.
+
 - **2026-10-03** — `chaininfo`/`round` rely on `bls12_381`'s checked decoders for the
   subgroup check (errors unchanged: `PublicKeyNotInSubgroup`, `SignatureNotInSubgroup`).
 - **2026-09-16** — **NO API CHANGE, faster:** A1 finding F4, together with `bls12_381`'s inversion-free Miller loop (same commit). `verifyRoundPoints` **9.27 → 4.28 ms** (ReleaseFast, process CPU time, 7 interleaved paired reps with both arms in ONE binary; new faster in 7/7, ranges 9.24–9.44 vs 4.17–4.51 — no overlap). All 60 live quicknet rounds of the audit corpus verify under both arms and agree. What the remaining 4.28 ms is made of, measured separately (same method, a different run — so composition, not a subtraction of the numbers above): Miller loop 2.32 ms, final exponentiation 1.74 ms, `h1` hash-to-curve 0.79 ms, `G1` subgroup check 0.13 ms. F4's original claim was a 5.6× gap against drand's own Go client (13.70 vs 2.44 ms CPU, 2026-09-07); this module has not re-run the Go arm, so no new ratio is quoted here — only the measured change to our own side.

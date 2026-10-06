@@ -27,6 +27,29 @@
 //! therefore can never drift on the quicknet scheme). No cryptography is
 //! reimplemented here: every primitive comes from `bls12_381`/`tlock`.
 //!
+//! ## The chained default network — `pedersen-bls-chained`
+//!
+//! The League of Entropy "default" chain (chain hash `8990e7a9…b2ce`) has
+//! the groups the other way round: public key in `G1` (48 B), signature
+//! in `G2` (96 B). The signed digest folds in the previous round's
+//! signature — drand's `DigestBeacon` for this scheme:
+//!
+//! ```
+//! m = SHA-256(previous_signature ‖ u64be(round))   (previous_signature omitted when empty)
+//! e(public_key, H2(m)) == e(G1_generator, signature)
+//! ```
+//!
+//! `H2 = hashToCurveG2(·, "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_")` —
+//! the STANDARD RFC 9380 `G2` `_NUL_` DST, not a legacy one. Source:
+//! drand/drand v2.1.7 `crypto/schemes.go` `NewPedersenBLSChained`
+//! (`bls.NewBLS12381SuiteWithDST(…G1…RO_NUL_, …G2…RO_NUL_)`, the comment
+//! there reads "default RFC9380 DST for G2"); confirmed by verifying three
+//! genuine default-chain beacons below, and by the positive control that
+//! the same beacons FAIL under the `_POP_` DST. (The non-RFC DST belongs to
+//! the deprecated `bls-unchained-on-g1`, which hashes to `G1` under the
+//! `G2` DST — still unverified here.) This is `bls12_381.bls_sig`'s group
+//! layout but its `_POP_` DST, so `bls_sig.verify` still cannot be used.
+//!
 //! ## Randomness check
 //!
 //! drand defines a round's `randomness` as `SHA-256(signature)`. When the
@@ -53,16 +76,19 @@ const ciphersuite = tlock.ciphersuite;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const VerifyError = error{
-    /// The chain's scheme is not one this module can verify (only
-    /// quicknet `bls-unchained-g1-rfc9380` is supported).
+    /// The chain's scheme is not one this module can verify (quicknet
+    /// `bls-unchained-g1-rfc9380` and the chained default network's
+    /// `pedersen-bls-chained` are supported).
     UnsupportedScheme,
     /// The `ChainInfo` and `Round` disagree on the signature group
-    /// (e.g. a `G2`-signature chained round against a quicknet chain).
+    /// (e.g. a `G2`-signature chained round against a quicknet chain, or
+    /// a `G1`-signature quicknet round against the chained chain).
     SchemeGroupMismatch,
-    /// The chain public key was not decoded (only populated for the
-    /// supported scheme) — a `ChainInfo` for an unsupported scheme.
+    /// The chain public key for the scheme's key group was not decoded —
+    /// a hand-built `ChainInfo` (`parseInfo` always decodes it).
     MissingPublicKey,
-    /// The round has no decodable `G1` signature point.
+    /// The round has no decoded signature point in the scheme's
+    /// signature group — a hand-built `Round`.
     MissingSignature,
     /// The pairing equation did not hold — the signature is not a valid
     /// threshold signature for this round under this chain key.
@@ -122,20 +148,88 @@ pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
     });
 }
 
+/// The DST `pedersen-bls-chained` hashes its digest to `G2` under: the
+/// standard RFC 9380 `G2` `_NUL_` tag (drand/drand `crypto/schemes.go`,
+/// `NewPedersenBLSChained`). See the module doc comment.
+pub const chained_dst = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+
+/// The 32-byte digest a `pedersen-bls-chained` round signs:
+/// `SHA-256(previous_signature ‖ u64be(round))`, with nothing written for
+/// an empty `previous_signature` (drand's `DigestBeacon`). Round 1 of the
+/// default chain chains to the 32-byte genesis seed (the `groupHash`).
+pub fn chainedMessage(round: u64, previous_signature: []const u8) [32]u8 {
+    var h = Sha256.init(.{});
+    h.update(previous_signature);
+    var round_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &round_be, round, .big);
+    h.update(&round_be);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// The BLS-verification equation for one `pedersen-bls-chained` round on
+/// already-decoded points: whether
+/// `e(pubkey, H2(chainedMessage(round, previous_signature))) == e(G1gen, sig)`
+/// holds, as one multi-pairing with the second `G1` operand negated.
+///
+/// The same two guards as `verifyRoundPoints`, one group over: the
+/// identity on either operand is refused (with both the identity the
+/// equation is `1 == 1` for every round), and a `G2` signature outside the
+/// order-`r` subgroup is refused. Unlike quicknet's `G1` case, a `G2`
+/// cofactor-torsion addend is NOT known to pass the bare pairing (the ate
+/// pairing is bilinear only on the order-`r` subgroup of `G2`, and the
+/// tested `sig + T` fails it); the check is kept so acceptance never
+/// depends on how the Miller loop treats a point outside its domain.
+/// `parseRound` already
+/// refuses both; these guards are for callers who skip it. The key's
+/// subgroup membership is `parseInfo`'s KeyValidate; a caller supplying a
+/// `g1.Affine` from elsewhere must check it.
+pub fn verifyChainedRoundPoints(pubkey: g1.Affine, round: u64, previous_signature: []const u8, sig: g2.Affine) bool {
+    if (pubkey.infinity or sig.infinity) return false;
+    if (!g2.Jacobian.fromAffine(sig).subgroupCheck()) return false;
+
+    const msg = chainedMessage(round, previous_signature);
+    const hm = bls12_381.hash_to_curve.hashToCurveG2(&msg, chained_dst);
+    const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
+    return pairing.pairingCheck(&.{
+        .{ .p = pubkey, .q = hm },
+        .{ .p = neg_gen, .q = sig },
+    });
+}
+
 /// Verify a parsed `Round` against a parsed `ChainInfo`. On success the
-/// signature is a genuine threshold-BLS signature for `round.round` under
-/// `info`'s chain key, AND (when present) the round's `randomness` equals
+/// signature is a genuine threshold-BLS signature for `round.round` (and,
+/// for the chained scheme, `round.previous_signature`) under `info`'s
+/// chain key, AND (when present) the round's `randomness` equals
 /// `SHA-256(signature)`. Any failure is a typed `VerifyError` — never a
 /// panic or a silent false-accept.
+///
+/// For `pedersen-bls-chained` this verifies the round's own signature
+/// over the `previous_signature` the document CLAIMS; it does not check
+/// that the claim is the real previous round's signature. That is still
+/// sound — the network signed `(previous_signature, round)` together, so
+/// a forged `previous_signature` fails the equation — but a caller walking
+/// the chain may also compare it with the round it verified before.
 pub fn verifyRound(info: *const ChainInfo, round: *const Round) VerifyError!void {
-    if (!info.scheme.isVerifiable()) return error.UnsupportedScheme;
-    const pubkey = info.pubkey_g2 orelse return error.MissingPublicKey;
-
-    // A quicknet round's signature must be the 48-byte G1 element.
-    if (round.sig_len != g1.compressed_bytes) return error.SchemeGroupMismatch;
-    const sig = round.sig_g1 orelse return error.MissingSignature;
-
-    if (!verifyRoundPoints(pubkey, round.round, sig)) return error.InvalidSignature;
+    switch (info.scheme) {
+        .unchained_g1_rfc9380 => {
+            const pubkey = info.pubkey_g2 orelse return error.MissingPublicKey;
+            // A quicknet round's signature must be the 48-byte G1 element.
+            if (round.sig_len != g1.compressed_bytes) return error.SchemeGroupMismatch;
+            const sig = round.sig_g1 orelse return error.MissingSignature;
+            if (!verifyRoundPoints(pubkey, round.round, sig)) return error.InvalidSignature;
+        },
+        .pedersen_bls_chained => {
+            const pubkey = info.pubkey_g1 orelse return error.MissingPublicKey;
+            // A chained round's signature must be the 96-byte G2 element.
+            if (round.sig_len != g2.compressed_bytes) return error.SchemeGroupMismatch;
+            const sig = round.sig_g2 orelse return error.MissingSignature;
+            if (!verifyChainedRoundPoints(pubkey, round.round, round.previousSignatureBytes(), sig))
+                return error.InvalidSignature;
+        },
+        .bls_unchained_on_g1, .other => return error.UnsupportedScheme,
+    }
 
     // drand: randomness = SHA-256(signature). Check it when present.
     if (round.randomness) |claimed| {
@@ -282,28 +376,50 @@ test "verifyRound: randomness is compared in FULL — a flip in the last or a mi
     try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &r2));
 }
 
-test "verifyRound: quicknet chain info against a G2 (chained-shaped) round → SchemeGroupMismatch" {
+test "verifyRound: quicknet chain info against a G2 (chained) round → SchemeGroupMismatch" {
     // Gap found by mutation testing: this branch had NO discriminating
     // test — disabling it left every test green (the code still errors,
     // just via the `MissingSignature` fallback instead of the specific
     // `SchemeGroupMismatch` this mismatch is supposed to report). A
     // realistic way to hit this: a caller fetches `/info` from a
-    // verifiable (quicknet) chain but round data from a different,
-    // chained-scheme beacon (96-byte G2 signature).
+    // verifiable (quicknet) chain but round data from the chained default
+    // beacon (96-byte G2 signature). Since 2026-10-06 that signature is a
+    // genuine default-chain round (`parseRound` now decodes G2 and refuses
+    // the junk bytes this test used before).
     const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
-    const g2_shaped_round = "{\"round\":1000,\"signature\":\"" ++ ("ab" ** 96) ++ "\"}";
-    const rnd = try round_mod.parseRound(testing.allocator, g2_shaped_round);
+    const rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
     try testing.expect(rnd.sig_g1 == null);
     try testing.expectError(error.SchemeGroupMismatch, verifyRound(&info, &rnd));
 }
 
-test "verifyRound: an unsupported (chained) scheme → UnsupportedScheme" {
-    const chained =
-        \\{"public_key":"868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31","period":30,"genesis_time":1595431050,"hash":"8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce","groupHash":"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a","schemeID":"pedersen-bls-chained","metadata":{"beaconID":"default"}}
-    ;
-    const info = try chaininfo.parseInfo(testing.allocator, chained);
+test "verifyRound: chained chain info against a G1 (quicknet) round → SchemeGroupMismatch" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
     const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
-    try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &rnd));
+    try testing.expectError(error.SchemeGroupMismatch, verifyRound(&info, &rnd));
+}
+
+test "verifyRound: hand-built values without the scheme's points → MissingPublicKey / MissingSignature" {
+    var info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    var rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    rnd.sig_g2 = null;
+    try testing.expectError(error.MissingSignature, verifyRound(&info, &rnd));
+    info.pubkey_g1 = null;
+    try testing.expectError(error.MissingPublicKey, verifyRound(&info, &rnd));
+}
+
+test "verifyRound: an unsupported scheme (bls-unchained-on-g1, unknown) → UnsupportedScheme" {
+    // The chained default document relabelled: the label is not hashed, so
+    // it parses, and no point is decoded for a scheme this module does not
+    // verify.
+    for ([_][]const u8{ "bls-unchained-on-g1", "no-such-scheme" }) |label| {
+        const doc = try std.mem.replaceOwned(u8, testing.allocator, chaininfo.chained_default_info_json, "pedersen-bls-chained", label);
+        defer testing.allocator.free(doc);
+        const info = try chaininfo.parseInfo(testing.allocator, doc);
+        const rnd = try round_mod.parseRound(testing.allocator, round_1000_json);
+        try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &rnd));
+        const crnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+        try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &crnd));
+    }
 }
 
 // ── expectedRound: freshness, not authenticity ──────────────────────────
@@ -430,6 +546,240 @@ test "W2-32: the full public path refuses the forged round-1000 document" {
     try testing.expectError(error.InvalidSignature, verifyRound(&info, &handmade));
 }
 
+// ── pedersen-bls-chained: the League of Entropy default network ───────
+//
+// EXTERNAL anchor: genuine beacons of the default chain (chain hash
+// 8990e7a9…b2ce), not values this module computed. Provenance (recipe and
+// the comparison against the live API in `tools/fetch_chained.py`):
+//   - round 1 and round 1000000 (signature, previous_signature, randomness):
+//     the test fixtures of thibmeu/drand-rs `drand_core` 0.0.19 (MIT,
+//     `src/beacon.rs`), recorded there from
+//     `curl https://drand.cloudflare.com/public/{1,1000000}`;
+//   - round 2634945 (signature, previous_signature) and the public key:
+//     drand/drand v2.1.7 (MIT/Apache-2.0) `crypto/schemes_test.go`
+//     `TestVerifyBeacon`, which verifies them with drand's own Go scheme.
+// The `/info` document is the live one `chaininfo.zig` already pins.
+// api.drand.sh was not reachable from the session that committed these
+// (egress policy), so `tools/fetch_chained.py` is the re-check against the
+// live network, not the source.
+
+const chained_info_json = chaininfo.chained_default_info_json;
+
+/// Default-chain round 1: chains to the 32-byte genesis seed.
+const chained_round_1_json =
+    \\{"round":1,"randomness":"101297f1ca7dc44ef6088d94ad5fb7ba03455dc33d53ddb412bbc4564ed986ec","signature":"8d61d9100567de44682506aea1a7a6fa6e5491cd27a0a0ed349ef6910ac5ac20ff7bc3e09d7c046566c9f7f3c6f3b10104990e7cb424998203d8f7de586fb7fa5f60045417a432684f85093b06ca91c769f0e7ca19268375e659c2a2352b4655","previous_signature":"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a"}
+;
+
+const chained_round_1000000_json =
+    \\{"round":1000000,"randomness":"a26ba4d229c666f52a06f1a9be1278dcc7a80dbc1dd2004a1ae7b63cb79fd37e","signature":"87e355169c4410a8ad6d3e7f5094b2122932c1062f603e6628aba2e4cb54f46c3bf1083c3537cd3b99e8296784f46fb40e090961cf9634f02c7dc2a96b69fc3c03735bc419962780a71245b72f81882cf6bb9c961bcf32da5624993bb747c9e5","previous_signature":"86bbc40c9d9347568967add4ddf6e351aff604352a7e1eec9b20dea4ca531ed6c7d38de9956ffc3bb5a7fabe28b3a36b069c8113bd9824135c3bff9b03359476f6b03beec179d4aeff456f4d34bbf702b9af78c3bb44e1892ace8e581bf4afa9"}
+;
+
+/// No `randomness` field: drand's Go test carries none, and a value we
+/// computed would not be an anchor.
+const chained_round_2634945_json =
+    \\{"round":2634945,"signature":"814778ed1e480406beb43b74af71ce2f0373e0ea1bfdfea8f9ed62c876c20fcbc7f0163860e3da42ed2148756015f4551451898ffe06d384b4d002245025571b6b7a752f7158b40ad92b13b6d703ad31922a617f2c7f6d960b84d56cf1d79eef","previous_signature":"8bd96294383b4d1e04e736360bd7a487f9f409f1e7bd800b720656a310d577b3bdb1e1631af6c5782a1d8979c502f395036181eff4058960fc40bb7034cdae1991d3eda518ab204a077d2f7e724974cf87b407e549bd815cf0b8e5a3832f675d"}
+;
+
+test "verifyRound: genuine default-chain rounds 1, 1000000 and 2634945 verify (pedersen-bls-chained)" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    for ([_][]const u8{ chained_round_1_json, chained_round_1000000_json, chained_round_2634945_json }) |doc| {
+        const rnd = try round_mod.parseRound(testing.allocator, doc);
+        try verifyRound(&info, &rnd);
+    }
+}
+
+test "chained: published randomness equals SHA-256(signature); round 1 chains to the genesis seed" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    for ([_][]const u8{ chained_round_1_json, chained_round_1000000_json }) |doc| {
+        const rnd = try round_mod.parseRound(testing.allocator, doc);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(rnd.signatureBytes(), &digest, .{});
+        try testing.expectEqualSlices(u8, &digest, &rnd.randomness.?);
+    }
+    // drand's genesis seed is the groupHash: two independently published
+    // documents agree on it.
+    const r1 = try round_mod.parseRound(testing.allocator, chained_round_1_json);
+    try testing.expectEqualSlices(u8, &info.group_hash, r1.previousSignatureBytes());
+}
+
+test "chained: a second chained network's genuine beacon verifies under its own key, not the default's" {
+    // drand/drand v2.1.7 `TestVerifyBeacon`'s second pedersen-bls-chained
+    // vector (a chain other than the default; key and beacon both from it).
+    var pk_bytes: [48]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pk_bytes, "922a2e93828ff83345bae533f5172669a26c02dc76d6bf59c80892e12ab1455c229211886f35bb56af6d5bea981024df");
+    const other_pk = try g1.fromBytesCompressed(pk_bytes);
+    const rnd = try round_mod.parseRound(testing.allocator,
+        \\{"round":3361396,"signature":"9904b4ec42e82cb42ad53f171cf0510a5eedff8b5e02e2db5a187489f7875307746998b9a6cf82130d291126d4b83cea1048c9b3f07a067e632c20391dc059d22d6a8e835f3980c8bd0183fb6df00a8fbbe6b8c9f61e888dfa76e12af4d4e355","previous_signature":"a2377f4e0403f0fd05f709a3292be1b2b59fe990a673ad7b7561b5bd5982b882a2378d36e39befb6ea3bb7aac113c50a18fb07aa4f9a59f95f1aaa7826dafbfcdbf22347c29996c294286fd11b402ad83edd83fa21fe6735fccb65785edbed47"}
+    );
+    try testing.expect(verifyChainedRoundPoints(other_pk, rnd.round, rnd.previousSignatureBytes(), rnd.sig_g2.?));
+    // Cross-chain: the same beacon under the default chain's key, and a
+    // default-chain beacon under the other key.
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    const d = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    try testing.expect(!verifyChainedRoundPoints(other_pk, d.round, d.previousSignatureBytes(), d.sig_g2.?));
+}
+
+test "chained: tampered signature is refused (parse or verify)" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    // Last nibble 5 → 4, and a byte in the middle: both are typed refusals.
+    for ([_][2][]const u8{ .{ "c9e5\",\"previous", "c9e4\",\"previous" }, .{ "87e355169c", "87e355169d" } }) |sub| {
+        const doc = try std.mem.replaceOwned(u8, testing.allocator, chained_round_1000000_json, sub[0], sub[1]);
+        defer testing.allocator.free(doc);
+        try testing.expect(!std.mem.eql(u8, doc, chained_round_1000000_json));
+        if (round_mod.parseRound(testing.allocator, doc)) |rnd| {
+            try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+        } else |err| {
+            try testing.expect(err == error.InvalidPoint or err == error.SignatureNotInSubgroup);
+        }
+    }
+}
+
+test "chained: genuine signature under the WRONG round → InvalidSignature" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    var rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    for ([_]u64{ 999999, 1000001, 1000000 + (1 << 32) }) |r| {
+        rnd.round = r;
+        try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    }
+}
+
+test "chained: tampered or missing previous_signature → InvalidSignature" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    const genuine = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    try verifyRound(&info, &genuine); // control
+    // One byte of previous_signature flipped (first, middle, last).
+    for ([_]usize{ 0, 47, 95 }) |i| {
+        var rnd = genuine;
+        rnd.previous_signature.?.bytes[i] ^= 0x01;
+        try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    }
+    // Another round's previous_signature (round 2634945's).
+    const other = try round_mod.parseRound(testing.allocator, chained_round_2634945_json);
+    var swapped = genuine;
+    swapped.previous_signature = other.previous_signature;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &swapped));
+    // Dropped: the message becomes SHA-256(round) alone.
+    var dropped = genuine;
+    dropped.previous_signature = null;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &dropped));
+    // Through the parser too: the round-1 genesis seed replaced.
+    const doc = try std.mem.replaceOwned(u8, testing.allocator, chained_round_1_json, "176f93498eac", "176f93498ead");
+    defer testing.allocator.free(doc);
+    const r1 = try round_mod.parseRound(testing.allocator, doc);
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &r1));
+}
+
+test "chained: tampered randomness (valid signature) → RandomnessMismatch" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    const doc = try std.mem.replaceOwned(u8, testing.allocator, chained_round_1000000_json, "a26ba4d2", "a26ba4d3");
+    defer testing.allocator.free(doc);
+    const rnd = try round_mod.parseRound(testing.allocator, doc);
+    try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &rnd));
+}
+
+test "chained positive control: the DST and the message order are load-bearing" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    const rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    const pk = info.pubkey_g1.?;
+    const sig = rnd.sig_g2.?;
+    const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
+    const Check = struct {
+        fn holds(p: g1.Affine, ng: g1.Affine, s: g2.Affine, msg: []const u8, dst: []const u8) bool {
+            const hm = bls12_381.hash_to_curve.hashToCurveG2(msg, dst);
+            return pairing.pairingCheck(&.{ .{ .p = p, .q = hm }, .{ .p = ng, .q = s } });
+        }
+    };
+    const msg = chainedMessage(rnd.round, rnd.previousSignatureBytes());
+    // The construction verifyChainedRoundPoints uses holds…
+    try testing.expect(Check.holds(pk, neg_gen, sig, &msg, chained_dst));
+    // …the min-pubkey-size `_POP_` DST (`bls_sig`'s) does not…
+    try testing.expect(!Check.holds(pk, neg_gen, sig, &msg, "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"));
+    // …the G1 tag does not…
+    try testing.expect(!Check.holds(pk, neg_gen, sig, &msg, "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"));
+    // …and neither does the digest with round and previous signature swapped.
+    var swapped: [32]u8 = undefined;
+    var h = Sha256.init(.{});
+    var round_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &round_be, rnd.round, .big);
+    h.update(&round_be);
+    h.update(rnd.previousSignatureBytes());
+    h.final(&swapped);
+    try testing.expect(!Check.holds(pk, neg_gen, sig, &swapped, chained_dst));
+}
+
+/// A pure `G2` cofactor-torsion point: `[r]·P` for an on-curve `P` outside
+/// the order-`r` subgroup. `sig + T` is a different on-curve encoding of
+/// "the signature plus something the order-`r` part cannot see".
+fn g2CofactorTorsionPoint() !g2.Jacobian {
+    var x: u8 = 1;
+    while (x < 255) : (x += 1) {
+        var comp = [_]u8{0} ** g2.compressed_bytes;
+        comp[0] = 0x80;
+        comp[g2.compressed_bytes - 1] = x;
+        const pt = g2.fromBytesCompressedUnchecked(comp) catch continue;
+        if (pt.infinity) continue;
+        const j = g2.Jacobian.fromAffine(pt);
+        if (!j.subgroupCheck()) return j.scalarMulBytes(&bls12_381.scalar.r_bytes);
+    }
+    return error.NoTorsionPointFound;
+}
+
+test "chained: sig + G2 cofactor torsion is refused at parse and by both verify entry points" {
+    const info = try chaininfo.parseInfo(testing.allocator, chained_info_json);
+    const rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    const t = try g2CofactorTorsionPoint();
+    try testing.expect(!t.isIdentity());
+    try testing.expect(!t.subgroupCheck());
+    const mal = g2.Jacobian.fromAffine(rnd.sig_g2.?).add(t).toAffine();
+    const mal_bytes = g2.toBytesCompressed(mal);
+    try testing.expect(!std.mem.eql(u8, &mal_bytes, rnd.signatureBytes()));
+
+    // Measured, and the difference from quicknet's W2-32 test: in G2 the
+    // bare equation does NOT hold for sig + T (the ate pairing is bilinear
+    // only on the order-r subgroup of G2), so here the subgroup guard is
+    // defence in depth, not the only thing standing between T and an
+    // accept. Pinned so a later reader does not reason from the G1 case.
+    const msg = chainedMessage(rnd.round, rnd.previousSignatureBytes());
+    const hm = bls12_381.hash_to_curve.hashToCurveG2(&msg, chained_dst);
+    const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
+    try testing.expect(!pairing.pairingCheck(&.{ .{ .p = info.pubkey_g1.?, .q = hm }, .{ .p = neg_gen, .q = mal } }));
+
+    // The points-level primitive refuses it…
+    try testing.expect(verifyChainedRoundPoints(info.pubkey_g1.?, rnd.round, rnd.previousSignatureBytes(), rnd.sig_g2.?));
+    try testing.expect(!verifyChainedRoundPoints(info.pubkey_g1.?, rnd.round, rnd.previousSignatureBytes(), mal));
+
+    // …the parser refuses the forged document (randomness recomputed)…
+    var digest: [32]u8 = undefined;
+    Sha256.hash(&mal_bytes, &digest, .{});
+    const forged = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"round\":1000000,\"randomness\":\"{s}\",\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}",
+        .{ std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(mal_bytes, .lower), std.fmt.bytesToHex(rnd.previous_signature.?.bytes, .lower) },
+    );
+    defer testing.allocator.free(forged);
+    try testing.expectError(error.SignatureNotInSubgroup, round_mod.parseRound(testing.allocator, forged));
+
+    // …and so does verifyRound for a hand-built Round.
+    var handmade = rnd;
+    handmade.sig_bytes = mal_bytes;
+    handmade.sig_g2 = mal;
+    handmade.randomness = digest;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &handmade));
+}
+
+test "verifyChainedRoundPoints rejects identity operands" {
+    try testing.expect(!verifyChainedRoundPoints(g1.Affine.identity, 1, "", g2.Affine.identity));
+    try testing.expect(!verifyChainedRoundPoints(g1.Affine.identity, 7, "abc", g2.Affine.identity));
+}
+
+test "chainedMessage: SHA-256(previous_signature ‖ u64be(round)), nothing written for an empty previous" {
+    var expect: [32]u8 = undefined;
+    Sha256.hash(&.{ 0xaa, 0xbb, 0, 0, 0, 0, 0, 0, 0x01, 0x02 }, &expect, .{});
+    try testing.expectEqualSlices(u8, &expect, &chainedMessage(0x0102, &.{ 0xaa, 0xbb }));
+    try testing.expectEqualSlices(u8, &ciphersuite.beaconId(1000), &chainedMessage(1000, ""));
+}
+
 // ── POSITIVE CONTROL: prove the test actually pins the scheme ──────────
 
 /// Deliberately-broken beaconId: hashes the round LITTLE-endian instead
@@ -539,6 +889,8 @@ const parse_seeds = [_][]const u8{
     parseSeed("null"), // valid JSON that is not an object
     parseSeed("\x00\xff\xfe not json at all"), // non-UTF-8 bytes
     parseSeed(""), // the empty document: what the collapsed harness ran, every time
+    parseSeed(chaininfo.chained_default_info_json), // the genuine chained default /info (G1 key)
+    parseSeed(chained_round_1000000_json), // a genuine chained round (G2 signature)
 };
 
 test "fuzz: chain-info + round parse and verify never panic on arbitrary input" {
@@ -582,20 +934,21 @@ test "corpus: every parse seed reaches a parser, and what each one decodes is pi
         const input = buf[0..len];
         if (chaininfo.parseInfo(testing.allocator, input)) |info| {
             infos += 1;
-            if (info.pubkey_g2 != null) pubkeys_decoded += 1;
+            if (info.pubkey_g2 != null or info.pubkey_g1 != null) pubkeys_decoded += 1;
         } else |_| {}
         if (round_mod.parseRound(testing.allocator, input)) |rnd| {
             rounds += 1;
-            if (rnd.sig_g1 != null) sigs_decoded += 1;
+            if (rnd.sig_g1 != null or rnd.sig_g2 != null) sigs_decoded += 1;
         } else |_| {}
     }
     // One seed is deliberately the empty document.
     try testing.expectEqual(parse_seeds.len - 1, nonempty);
     // Measured 2026-09-07: every counter below was 0 before the draw was fixed.
-    try testing.expectEqual(@as(usize, 2), infos);
-    try testing.expectEqual(@as(usize, 2), pubkeys_decoded);
-    try testing.expectEqual(@as(usize, 4), rounds);
-    try testing.expectEqual(@as(usize, 4), sigs_decoded);
+    // 2026-10-06: +1 each for the chained /info and round seeds.
+    try testing.expectEqual(@as(usize, 3), infos);
+    try testing.expectEqual(@as(usize, 3), pubkeys_decoded);
+    try testing.expectEqual(@as(usize, 5), rounds);
+    try testing.expectEqual(@as(usize, 5), sigs_decoded);
 }
 
 // ── fuzz: the verify path itself, which the harness above cannot reach ────
@@ -730,9 +1083,11 @@ fn checkFixture(c: Choices) !void {
         try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\"}}", .{ round_no, &sig });
 
     // The key, hash and groupHash are all inputs to the chain hash, so any
-    // alteration of them must fail the parse; an untouched trio must parse
-    // regardless of the scheme label (which is not hashed).
-    const info_damaged = pk_damaged or hash_damaged or ghash_damaged;
+    // alteration of them must fail the parse. The scheme label is not
+    // hashed, but `pedersen-bls-chained` KeyValidates a 48-byte G1 key, so
+    // quicknet's 96-byte key under that label must fail too (since
+    // 2026-10-06); under the other labels an untouched trio parses.
+    const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
         if (!info_damaged) return e; // fixture or parser drifted
         return;
@@ -796,6 +1151,115 @@ const drand_seeds = [_][]const u8{
     fuzzSeed(&.{ 0x00, 2, 63, 0, 0xe }), // randomness nibble
     fuzzSeed(&.{ 0x00, 0, 191, 0, 0xb }), // key nibble
     fuzzSeed(&.{ 0x00, 3, 5, 0, 0xf, 4, 7, 0, 0xa }), // hash + groupHash
+};
+
+// ── fuzz: the chained verify path on damaged default-chain documents ────
+//
+// The same shape as `checkFixture`, over the genuine default-chain /info
+// and round 1000000. Fields: 0 key, 1 signature, 2 randomness, 3 hash,
+// 4 groupHash, 5 previous_signature. Scheme labels: 0 the genuine
+// `pedersen-bls-chained`, 1 quicknet's label (a 48-byte key under it must be
+// refused at parse), 2 `bls-unchained-on-g1` and 3 "" (parse, unverifiable).
+
+const chained_pubkey_hex = "868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31";
+const chained_hash_hex = "8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce";
+const chained_group_hash_hex = "176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a";
+const chained_sig_hex = "87e355169c4410a8ad6d3e7f5094b2122932c1062f603e6628aba2e4cb54f46c3bf1083c3537cd3b99e8296784f46fb40e090961cf9634f02c7dc2a96b69fc3c03735bc419962780a71245b72f81882cf6bb9c961bcf32da5624993bb747c9e5";
+const chained_prev_hex = "86bbc40c9d9347568967add4ddf6e351aff604352a7e1eec9b20dea4ca531ed6c7d38de9956ffc3bb5a7fabe28b3a36b069c8113bd9824135c3bff9b03359476f6b03beec179d4aeff456f4d34bbf702b9af78c3bb44e1892ace8e581bf4afa9";
+const chained_randomness_hex = "a26ba4d229c666f52a06f1a9be1278dcc7a80dbc1dd2004a1ae7b63cb79fd37e";
+const chained_round: u64 = 1000000;
+
+fn checkChainedFixture(c: Choices) !void {
+    var pk: [chained_pubkey_hex.len]u8 = chained_pubkey_hex.*;
+    var sig: [chained_sig_hex.len]u8 = chained_sig_hex.*;
+    var rand_hex: [chained_randomness_hex.len]u8 = chained_randomness_hex.*;
+    var hash: [chained_hash_hex.len]u8 = chained_hash_hex.*;
+    var ghash: [chained_group_hash_hex.len]u8 = chained_group_hash_hex.*;
+    var prev: [chained_prev_hex.len]u8 = chained_prev_hex.*;
+    const pk_damaged = applyDamage(&c, 0, &pk, chained_pubkey_hex);
+    const sig_damaged = applyDamage(&c, 1, &sig, chained_sig_hex);
+    const rand_damaged = applyDamage(&c, 2, &rand_hex, chained_randomness_hex);
+    const hash_damaged = applyDamage(&c, 3, &hash, chained_hash_hex);
+    const ghash_damaged = applyDamage(&c, 4, &ghash, chained_group_hash_hex);
+    const prev_damaged = applyDamage(&c, 5, &prev, chained_prev_hex);
+    const scheme: []const u8 = switch (c.scheme_idx) {
+        0 => "pedersen-bls-chained",
+        1 => genuine_scheme,
+        2 => "bls-unchained-on-g1",
+        3 => "",
+    };
+    const round_no: u64 = if (c.wrong_round) chained_round + 1 + @as(u64, c.scheme_idx) * 7919 else chained_round;
+
+    var info_buf: [768]u8 = undefined;
+    const info_json = try std.fmt.bufPrint(
+        &info_buf,
+        "{{\"public_key\":\"{s}\",\"period\":30,\"genesis_time\":1595431050," ++
+            "\"hash\":\"{s}\",\"groupHash\":\"{s}\",\"schemeID\":\"{s}\"," ++
+            "\"metadata\":{{\"beaconID\":\"default\"}}}}",
+        .{ &pk, &hash, &ghash, scheme },
+    );
+    var round_buf: [768]u8 = undefined;
+    const round_json = if (c.with_randomness)
+        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig, &prev })
+    else
+        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &sig, &prev });
+
+    const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
+    const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
+        if (!info_damaged) return e;
+        return;
+    };
+    if (info_damaged) return error.DamagedInfoParsed;
+
+    const rnd = round_mod.parseRound(testing.allocator, round_json) catch |e| {
+        if (!sig_damaged) return e;
+        return;
+    };
+
+    const crypto_intact = !sig_damaged and !prev_damaged and (!c.with_randomness or !rand_damaged) and
+        !c.wrong_round and c.scheme_idx == 0;
+    if (verifyRound(&info, &rnd)) |_| {
+        if (!crypto_intact) return error.DamagedRoundVerified;
+    } else |_| {
+        if (crypto_intact) return error.GenuineRoundRejected;
+    }
+}
+
+test "chained fixture checks, deterministic: the positive control and one damage per field" {
+    try checkChainedFixture(.{}); // intact → must verify
+    try checkChainedFixture(.{ .with_randomness = false });
+    try checkChainedFixture(.{ .wrong_round = true });
+    try checkChainedFixture(.{ .scheme_idx = 1 });
+    try checkChainedFixture(.{ .scheme_idx = 2 });
+    try checkChainedFixture(.{ .scheme_idx = 3 });
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 1, .index = 191, .nibble = 0x4 }, null, null, null } }); // sig, last nibble
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 2, .index = 63, .nibble = 0xf }, null, null, null } }); // randomness
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 0, .index = 95, .nibble = 0x0 }, null, null, null } }); // key
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 3, .index = 0, .nibble = 0x0 }, null, null, null } }); // hash
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 4, .index = 10, .nibble = 0x1 }, null, null, null } }); // groupHash
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 5, .index = 0, .nibble = 0x0 }, null, null, null } }); // previous_signature, first nibble
+    try checkChainedFixture(.{ .ops = .{ .{ .field = 5, .index = 191, .nibble = 0x0 }, null, null, null } }); // previous_signature, last nibble
+}
+
+test "fuzz: verifyRound on genuine and damaged default-chain documents" {
+    try std.testing.fuzz({}, fuzzVerifyChainedRound, .{ .corpus = &chained_seeds });
+}
+
+fn fuzzVerifyChainedRound(_: void, smith: *std.testing.Smith) !void {
+    var raw: [24]u8 = undefined;
+    const n = smith.slice(&raw);
+    try checkChainedFixture(Choices.fromBytes(raw[0..n]));
+}
+
+const chained_seeds = [_][]const u8{
+    fuzzSeed(&.{}), // intact
+    fuzzSeed(&.{0x01}), // no randomness
+    fuzzSeed(&.{0x02}), // wrong round
+    fuzzSeed(&.{0x04}), // quicknet label over a G1 key
+    fuzzSeed(&.{ 0x00, 1, 191, 0, 0x4 }), // signature nibble
+    fuzzSeed(&.{ 0x00, 5, 7, 0, 0x3 }), // previous_signature nibble
+    fuzzSeed(&.{ 0x00, 2, 63, 0, 0xf }), // randomness nibble
+    fuzzSeed(&.{ 0x00, 0, 95, 0, 0x0 }), // key nibble
 };
 
 test "verifyRoundPoints rejects identity operands (total-forgery guard)" {

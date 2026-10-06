@@ -1,6 +1,6 @@
 # `drand` verification instruments
 
-Six instruments. None is wired into `zig build`: each is run by
+Seven instruments. None is wired into `zig build`: each is run by
 hand and prints what it found. They are here rather than in `src/` because each
 needs a foreign toolchain — a Python, a Go, and in most cases the live network — which
 a module must never require (`CONVENTIONS.md` §9).
@@ -32,6 +32,7 @@ that changes without a human reading the diff is a vector nobody checked.
 | `gen_vectors.py` | — | Formats what `fetch.py` captured as Zig literals. |
 | `go/main.go` | Does an independently written BLS12-381 client (drand's own `crypto`/`kyber`) verify the same live rounds this module verifies? | The differential oracle CONVENTIONS.md §9 asks for: a foreign implementation driven through its own public API over the same wire-format documents. |
 | `verify_driver.zig` | What does THIS module's own `parseInfo`/`parseRound`/`verifyRound` make of those same documents? | The other half of the differential — talks to `drand` only through its public exports, never copies module source. |
+| `fetch_chained.py` | Where do the chained default-network (`pedersen-bls-chained`) beacons pinned in `src/verify.zig` come from, and does the live chain still serve them? | `packages` re-downloads drand/drand v2.1.7 and `drand_core` 0.0.19 and confirms every pinned value appears there verbatim (run 2026-10-06: 12/12 found); `live` compares them with api.drand.sh (not reachable from the committing session: egress 403). See the last section. |
 
 ## O1 differential oracle — adopted 2026-09-17
 
@@ -83,3 +84,24 @@ ZIG oracle: 60/60 live rounds verified (rejected 0)
 GO oracle:  5/5 live quicknet rounds verified (rejected 0)     # quicknet-t
 ZIG oracle: 5/5 live rounds verified (rejected 0)
 ```
+
+## Chained default-network fixtures — added 2026-10-06
+
+`src/verify.zig` verifies three genuine beacons of the League of Entropy default
+chain (`pedersen-bls-chained`, chain hash `8990e7a9…b2ce`): rounds 1, 1000000 and
+2634945. api.drand.sh was refused by the session's egress policy (HTTP 403 on
+CONNECT), so the values were taken from two published packages and re-checked
+there by `python3 fetch_chained.py packages <workdir>` (12/12 found):
+
+- drand/drand v2.1.7 (MIT/Apache-2.0), `crypto/schemes_test.go` `TestVerifyBeacon`:
+  round 2634945 and the chain public key — drand's own Go scheme verifies them.
+- `drand_core` 0.0.19 (thibmeu/drand-rs, MIT), `src/beacon.rs`: rounds 1 and
+  1000000 with their `randomness`, recorded there from `drand.cloudflare.com`.
+
+Only data was taken from either package. The DST
+(`BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`, the standard RFC 9380 `G2` tag) was
+read from drand v2.1.7 `crypto/schemes.go` `NewPedersenBLSChained` and confirmed by
+all three beacons verifying under it and failing under `_POP_`. Whoever next has
+access to the beacon should run `python3 fetch_chained.py live`; it exits non-zero
+on any disagreement with the pinned values. The Go oracle above was not extended to
+the chained scheme.
