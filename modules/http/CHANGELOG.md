@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **`reasonPhrase` covers the IANA HTTP Status Code Registry**, found by the new LIVE
+  CPython check of `problem` (`src/problem_interop.zig`: 625 documents `json.loads`-parsed with
+  RFC 9457 member types, `detail` decoded exactly as CPython's `decode("utf-8", "replace")` across
+  Unicode table 3-8 / overlongs / surrogates / every C0 control / 600 random byte strings — no
+  defect there; teeth: CPython must refuse a raw control character and raw invalid UTF-8). 21 codes
+  had no phrase, six of them RFC 9110's own (203, 205, 300, 305, 402, 407): their status line went
+  out as `HTTP/1.1 402 ` and an `about:blank` problem carried no `title`. **BEHAVIOURAL:** those
+  status lines now carry the registry phrase. 418 and 510 stay phrase-less (registry: unused /
+  obsoleted).
 - **2026-10-06** — **`proxy`, from the Go oracle's new `rproxy` area** (37 cases: Go's
   `httputil.ReverseProxy` and `ProxyHandler` between a raw client and a raw backend; what reaches
   the backend and what reaches the client compared after normalisation). **BEHAVIOURAL fixes:**
