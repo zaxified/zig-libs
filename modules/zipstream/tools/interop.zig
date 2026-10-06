@@ -175,7 +175,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     // `env` is passed on explicitly: a child spawned without a map gets an
     // empty environment, and `go` needs HOME (or GOCACHE) for its build cache.
-    const env = try init.environ.createMap(arena);
+    var env = try init.environ.createMap(arena);
+    // The oracle's version is part of the claim: the committed vectors were
+    // taken with go1.26.0, and the CI runner's own Go gave different verdicts
+    // (interop lane, 2026-10-07). Pin it; `go` fetches that toolchain when the
+    // installed one differs. Bump deliberately, then review every changed
+    // verdict before `--regen`.
+    try env.put("GOTOOLCHAIN", "go1.26.0");
     const fresh_path = scratch ++ "/go_oracle_vectors.zig";
     var child = std.process.spawn(io, .{
         // Paths are relative to the generator's directory, four levels down.
