@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **`proxy`, from the Go oracle's new `rproxy` area** (37 cases: Go's
+  `httputil.ReverseProxy` and `ProxyHandler` between a raw client and a raw backend; what reaches
+  the backend and what reaches the client compared after normalisation). **BEHAVIOURAL fixes:**
+  (1) a repeated backend response field kept only its LAST line (`setHeader` replaces by name) —
+  two `Set-Cookie` lines reached the client as one; now `Set-Cookie` lines are relayed each
+  (`addSetCookie`) and other repeated fields joined with commas, on the h1 and h2 paths;
+  (2) only the first `Connection` line was honoured, so a field named in a second one leaked
+  through (both directions); (3) the client's `X-Forwarded-For` line was forwarded AND folded into
+  the new chain (two fields upstream), and only its first line was folded; now every line joins
+  the one chain; (4) an `X-Forwarded-For` the client listed in `Connection` still seeded the chain.
+  Judged divergences: no `TE: trailers` upstream (this proxy relays no trailers), every `Proxy-*`
+  dropped.
 - **2026-10-06** — **`conneg`, from a new Werkzeug + python-mimeparse oracle** (`src/conneg_oracle.zig`,
   `tools/conneg_oracle/gen.py`; 66 Accept, 20 Accept-Language, 18 Accept-Encoding cases, every
   divergence judged against RFC 9110). **BEHAVIOURAL:** (1) a comma inside a quoted-string parameter
