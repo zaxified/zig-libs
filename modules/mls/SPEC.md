@@ -1220,7 +1220,16 @@ to be:
   epoch transition because it is a property of the finished tree and no
   earlier point can answer it.
 
-Both default ON and both are `Policy` switches. Both run in BOTH directions,
+Both default ON and both are `Policy` switches.
+
+Since 2026-10-06 a third rule is taken here, and it is NOT a switch: an
+X25519 HPKE key of small order — a leaf's `encryption_key`, a KeyPackage's
+`init_key`, an UpdatePath node's key, any node key of a tree imported whole
+— is refused at admission (`error.LeafNodeInvalid`; an UpdatePath parent
+node's key `error.InvalidUpdatePath`). RFC 9420 does not name it, but such a
+key is unusable rather than a policy choice: every HPKE encapsulation to it
+fails (RFC 9180 §7.1.4), so admitting one only defers the failure to every
+later Commit that must encrypt to it. See the Backlog's Done list. Both run in BOTH directions,
 and all three `passive-client-*.json` sessions replay green with them on —
 which is itself a small piece of evidence that the reading is the same one
 the reference implementation uses.
@@ -1587,7 +1596,8 @@ with a PSK — 148 to 296 failure points each, 1339 in all): every point
 clean. Non-OOM failures after validation are covered too: `DuplicateKeyInTree`
 and `PskNotAvailable` by existing tests, and an HPKE failure midway through
 the Welcome slots and midway through the UpdatePath ciphertexts by a new
-one (an all-zero X25519 key — see Backlog). Both instruments were shown to
+one (an all-zero X25519 key, which admission now refuses — the test seats
+it through a test-only hook; see Backlog, Done). Both instruments were shown to
 fire by deleting one `errdefer` each.
 
 ## Threat model
@@ -1666,6 +1676,11 @@ fire by deleting one `errdefer` each.
   does NOT check, and the caller MUST, is listed in its doc comment — most
   importantly that `GroupInfo.signer` names a non-blank leaf whose
   `signature_key` is the one passed in, and the tree-integrity block.
+- **A low-order HPKE key from a peer.** A KeyPackage, LeafNode, UpdatePath
+  or imported tree carrying a small-order X25519 key would make every later
+  encapsulation to it fail — one member wedging every path Commit that
+  reaches its leaf. Refused at admission (`error.LeafNodeInvalid`, or
+  `error.InvalidUpdatePath` for an UpdatePath parent key) since 2026-10-06.
 - **A ratchet tree from an untrusted source (Part 6).** §12.4.3.3 permits
   the tree to arrive out of band precisely because `verifyTreeHash` binds
   it to the SIGNED `GroupContext`. That check is exposed as its own
@@ -1774,20 +1789,31 @@ fire by deleting one `errdefer` each.
 - **`PrivateMessage` handshake messages (proposals/commits)** *(survey 2026-09-30)*: the common wire-format policy in deployments encrypts handshakes too; here `processCommit` returns `PrivateHandshakeNotSupported`. Effort: medium, done together with the item above (needs the secret tree). Fits §2.
 - **More cipher suites**: 0x0002 (P-256/AES-GCM/ECDSA), 0x0003 (X25519/ChaCha20-Poly1305), 0x0007 (P-384), then 0x0004/0x0006 (X448/Ed448) and 0x0005 (P-521) *(survey 2026-09-30)*: `suite.zig` says only 0x0001 is instantiated; the enum names all seven. Sibling `hpke` already has X25519/P-256/P-384 KEMs and std has ECDSA P-256/P-384; X448/Ed448 exist in `ed448` but hpke lacks an X448 KEM (see its Backlog), and P-521 has no std support. Effort: small (0x0003), medium (0x0002, 0x0007), large (0x0005). Fits §2.
 - **Part 3: §7.3/§10.1 LeafNode and KeyPackage validation and X.509 credentials** *(survey 2026-09-30)*: lifetime, capability and extension consistency, credential acceptance; existing README/SPEC list it as "still not built". Every real deployment needs at least the lifetime and capability checks; X.509 credential support needs sibling `x509`. Effort: medium. Fits §2.
-- **An Add whose KeyPackage carries a low-order X25519 key is accepted**
-  *(found 2026-10-06)*. An all-zero `init_key` or leaf `encryption_key` is
-  well-formed and signs fine, so it passes §12.2 and the KeyPackage checks;
-  the HPKE encapsulation to it then fails in the DH step (`hpke`'s
-  `DhFailed`, surfaced as `DhFailed` from the Welcome and as `Malformed`
-  from `treekem.sealUpdatePath`). Once such a leaf is in the tree, every
-  path Commit whose resolution reaches it fails for the committer until a
-  Remove takes it out — a member-level nuisance, not a state corruption
-  (the Commit is refused whole). Rejecting a public key whose DH with a
-  fixed scalar is the identity, at KeyPackage/LeafNode admission, would
-  close it; that belongs with "Part 3" below.
 - **ReInit and subgroup branch (§11.2/§11.3)** *(survey 2026-09-30)*: named in README as remaining. Effort: small-medium once resumption PSKs (already done) are used. Fits §2.
 
 ### Done (kept for the record, not open)
+
+- **A low-order X25519 key at admission — FIXED 2026-10-06** *(found the
+  same day by the mutation run's leak work)*. An all-zero (or any other
+  small-order) `init_key` or leaf `encryption_key` was well-formed, signed
+  fine, and passed every §12.2/§10.1 check; once seated, every path Commit
+  whose resolution reached it failed for the committer (`DhFailed` from the
+  Welcome, `Malformed` from `treekem.sealUpdatePath`) until a Remove took it
+  out. Now refused where keys enter, in both directions:
+  `checkLeafSelfConsistent` (Add and Update proposals for `createCommit` and
+  `processCommit`, the external joiner's own KeyPackage), the Add arm of
+  `applyProposals` for `init_key`, `processCommit`'s UpdatePath (leaf and
+  parent-node keys) and `verifiedTreeFromGroupInfo` (every node of a tree
+  `fromWelcome` or `joinByExternalCommit` imports). The test is std's own:
+  X25519 with a fixed clamped scalar returns `error.IdentityElement`
+  exactly for the small-order points (`isLowOrderHpkeKey`; X25519-KEM
+  suites only). Tests: the detector over all eight small-order encodings;
+  `createCommit` refusing both KeyPackages with and without a path;
+  `processCommit` refusing a genuine Commit from a non-checking committer
+  and four insider forgeries (Add swapped for either KeyPackage, path leaf
+  key, path node key); a Welcome whose tree carries such a leaf. RED before
+  (`DhFailed`, accepted, `Malformed`, joined), and each of the four
+  admission points was deleted in turn to show a test fails without it.
 
 - **§8.3 external init — DONE 2026-07-29** (`keyschedule.externalInitSender`/
   `externalInitReceiver`), and honestly labelled: it is the only derivation

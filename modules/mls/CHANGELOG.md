@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **BEHAVIOURAL:** a small-order X25519 HPKE key is refused at admission. A
+  KeyPackage whose `init_key` or leaf `encryption_key` is the all-zero point (or any other
+  small-order encoding) was accepted by an Add, after which every path Commit reaching that
+  leaf failed (`DhFailed`/`Malformed`) until it was removed. Now `createCommit` and
+  `processCommit` refuse such an Add or Update, and the external joiner's own KeyPackage, with
+  `error.LeafNodeInvalid`; `processCommit` refuses one in an UpdatePath (`LeafNodeInvalid` for
+  the leaf, `InvalidUpdatePath` for a parent node); `fromWelcome` and `joinByExternalCommit`
+  refuse an imported tree carrying one (`LeafNodeInvalid`). Detected as std's
+  `error.IdentityElement` from X25519 with a fixed scalar; X25519-KEM suites only; not a
+  `Policy` switch. 4 tests added (detector, `createCommit`, `processCommit` genuine + 4
+  insider forgeries, Welcome tree), RED before. Closes the SPEC Backlog item of the same day.
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** no leak on `createCommit`'s failure paths;
   the mutation run's leak hint was a test artifact. With the committer's-own-Update,
   two-GroupContextExtensions or duplicate-PSK check deleted, `createCommit` SUCCEEDS, and the

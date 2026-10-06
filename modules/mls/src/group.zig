@@ -60,7 +60,9 @@
 //!     UpdatePath public key already present in the tree — and the
 //!     signature on every `LeafNode` it installs. It does not check
 //!     lifetimes, credential acceptability, or capability/extension
-//!     support.
+//!     support. It does refuse a small-order X25519 HPKE key wherever one
+//!     enters (`isLowOrderHpkeKey`) — not a §7.3 rule, but such a key is
+//!     unusable and would make every later encapsulation to it fail.
 //!
 //! **Atomicity: a Commit is adopted whole, or not at all.** `processCommit`
 //! and `createCommit` run every step that writes group state against a
@@ -136,7 +138,8 @@ pub const Error = error{
     PathRequired,
     /// §12.4.2: an `UpdatePath` bullet failed — wrong `leaf_node_source`,
     /// the committer's encryption key did not change, or a public key in
-    /// the UpdatePath already appears in the tree.
+    /// the UpdatePath already appears in the tree — or a parent node's key
+    /// in it is a small-order X25519 point (`isLowOrderHpkeKey`).
     InvalidUpdatePath,
     /// A `PreSharedKeyID` in the Commit could not be resolved to key
     /// material (§12.4.2: "Verify that all PreSharedKey proposals ... are
@@ -165,8 +168,11 @@ pub const Error = error{
     /// supplied out of band.
     RatchetTreeUnavailable,
     /// §7.3: a `LeafNode` broke one of the rules this object owns (see the
-    /// "the §7.3 rules this object CAN own" section) — today, an extension
-    /// its own `capabilities` do not list.
+    /// "the §7.3 rules this object CAN own" section) — an extension its own
+    /// `capabilities` do not list — or a `LeafNode`/`KeyPackage` HPKE key
+    /// (`encryption_key`, `init_key`, or any node key of an imported tree)
+    /// is a small-order X25519 point, to which no HPKE encapsulation can
+    /// succeed (`isLowOrderHpkeKey`).
     LeafNodeInvalid,
     /// §7.3/§12.4.3.1: two nodes of the ratchet tree carry the same
     /// `encryption_key`, or two leaves the same `signature_key`.
@@ -1046,6 +1052,7 @@ pub fn Group(comptime S: type) type {
             try welcome_mod.verifyTreeHash(S, gpa, &rt, group_info.group_context);
             try treekem.validateParentHashes(S, gpa, &rt);
             try verifyEveryLeafSignature(S, gpa, &rt, group_info.group_context.group_id);
+            try rejectLowOrderTreeKeys(S, &rt);
             const signer_key = try leafSignatureKey(&rt, group_info.signer);
             try group_info.verifySignature(S, gpa, signer_key);
             return rt;
@@ -1275,6 +1282,9 @@ pub fn Group(comptime S: type) type {
                 // tree (a committer replaying another node's key would make
                 // the path secrets decryptable by its owner).
                 try rejectReusedPathKeys(&w.ratchet_tree, path);
+                // Nor may one be low-order: every later path Commit whose
+                // resolution reaches it would fail to encrypt.
+                try rejectLowOrderPathKeys(S, path);
 
                 try treekem.applyUpdatePath(arena, &w.ratchet_tree, committer, path);
 
@@ -2636,6 +2646,9 @@ pub fn Group(comptime S: type) type {
                     try kp.verifySignature(S, gpa);
                     try verifyLeafSignature(S, gpa, kp.leaf_node, .key_package, null, null);
                     try self.checkLeafSelfConsistent(kp.leaf_node);
+                    // The Welcome is encrypted to `init_key`: a low-order
+                    // one makes every Commit adding it fail (`DhFailed`).
+                    if (isLowOrderHpkeKey(S, kp.init_key)) return error.LeafNodeInvalid;
                     const owned = try dupLeafNode(arena, kp.leaf_node);
                     // §12.1.1's placement: the leftmost blank leaf,
                     // extending the tree to the right if there is none.
@@ -3089,8 +3102,12 @@ pub fn Group(comptime S: type) type {
         // Commits its receivers must reject. Both are `Policy` switches
         // defaulting ON.
 
-        /// The §7.3 rules that read the leaf alone.
+        /// The §7.3 rules that read the leaf alone, plus this module's own
+        /// refusal of a low-order HPKE `encryption_key` (`isLowOrderHpkeKey`;
+        /// not a `Policy` switch — such a key is unusable, not a policy
+        /// choice).
         fn checkLeafSelfConsistent(self: *const Self, leaf: tree.LeafNode) !void {
+            if (isLowOrderHpkeKey(S, leaf.encryption_key)) return error.LeafNodeInvalid;
             if (!self.policy.check_leaf_extensions_supported) return;
             for (leaf.extensions) |ext| {
                 if (std.mem.indexOfScalar(u16, leaf.capabilities.extensions, ext.extension_type) == null)
@@ -3365,6 +3382,57 @@ fn rejectReusedPathKeys(t: *const tree.RatchetTree, path: treekem.UpdatePath) !v
         for (path.nodes) |n| {
             if (std.mem.eql(u8, key, n.encryption_key)) return error.InvalidUpdatePath;
         }
+    }
+}
+
+/// Test-only: lets the HPKE-failure leak test seat a low-order key that
+/// admission would refuse. Never consulted outside `zig test`.
+var test_admit_low_order_keys: bool = false;
+
+/// RFC 9180 §7.1's `kem_id` for DHKEM(X25519, HKDF-SHA256).
+const x25519_kem_id: u16 = 0x0020;
+
+/// True when `key` is an X25519 public key of small order (the all-zero
+/// encoding, `u = 1`, the order-8 points and their non-canonical twins).
+/// HPKE to such a key fails in the DH step (`hpke`'s `DhFailed`, RFC 9180
+/// §7.1.4's all-zero check), so a leaf or KeyPackage carrying one would be
+/// admitted and then make every later encapsulation to it — a Welcome, any
+/// path Commit whose resolution reaches it — fail until a Remove takes it
+/// out. Detected as std's own refusal: a clamped scalar is a multiple of
+/// the cofactor 8, so X25519 with ANY fixed scalar yields the identity
+/// (`error.IdentityElement`) exactly for the small-order points. Public
+/// data, so the probe need not be constant time. Only X25519-KEM suites
+/// are judged; a key of the wrong length is the length checks' business,
+/// not this one's.
+fn isLowOrderHpkeKey(comptime S: type, key: []const u8) bool {
+    if (comptime S.Kem.kem_id != x25519_kem_id) return false;
+    if (@import("builtin").is_test and test_admit_low_order_keys) return false;
+    if (key.len != std.crypto.dh.X25519.public_length) return false;
+    const probe: [std.crypto.dh.X25519.secret_length]u8 = @splat(0x5a);
+    _ = std.crypto.dh.X25519.scalarmult(probe, key[0..std.crypto.dh.X25519.public_length].*) catch return true;
+    return false;
+}
+
+/// `isLowOrderHpkeKey` over every HPKE public key in a tree that arrived
+/// whole from someone else (`fromWelcome`, `joinByExternalCommit`).
+fn rejectLowOrderTreeKeys(comptime S: type, t: *const tree.RatchetTree) error{LeafNodeInvalid}!void {
+    for (t.nodes) |maybe| {
+        const node = maybe orelse continue;
+        const key = switch (node) {
+            .leaf => |l| l.encryption_key,
+            .parent => |p| p.encryption_key,
+        };
+        if (isLowOrderHpkeKey(S, key)) return error.LeafNodeInvalid;
+    }
+}
+
+/// `isLowOrderHpkeKey` over an UpdatePath's keys: the leaf's is a LeafNode
+/// key (`LeafNodeInvalid`), the parent nodes' are the path's own
+/// (`InvalidUpdatePath`).
+fn rejectLowOrderPathKeys(comptime S: type, path: treekem.UpdatePath) error{ LeafNodeInvalid, InvalidUpdatePath }!void {
+    if (isLowOrderHpkeKey(S, path.leaf_node.encryption_key)) return error.LeafNodeInvalid;
+    for (path.nodes) |n| {
+        if (isLowOrderHpkeKey(S, n.encryption_key)) return error.InvalidUpdatePath;
     }
 }
 
@@ -6863,6 +6931,8 @@ const Reframe = struct {
     flip_leaf_signature: bool = false,
     path_node0_key: ?[]const u8 = null,
     flip_signature: bool = false,
+    /// Replaces the KeyPackage of the first inline Add.
+    add0_key_package: ?keypackage_mod.KeyPackage = null,
 };
 
 fn reframeMemberMessage(
@@ -6882,6 +6952,17 @@ fn reframeMemberMessage(
         .commit => |c0| {
             var commit = c0;
             if (edit.drop_path) commit.path = null;
+            if (edit.add0_key_package) |kp| {
+                const props = try arena.dupe(content.ProposalOrRef, commit.proposals);
+                for (props) |*p| switch (p.*) {
+                    .proposal => |pr| if (pr == .add) {
+                        p.* = .{ .proposal = .{ .add = kp } };
+                        break;
+                    },
+                    else => {},
+                };
+                commit.proposals = props;
+            }
             if (commit.path) |p0| {
                 var path = p0;
                 if (edit.leaf_source) |s| path.leaf_node.leaf_node_source = s;
@@ -7365,6 +7446,10 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
     const carol = try TestClient.init(aa, "carol", 213);
     const bad_init = try lowOrderClient(aa, "bad-init", 214, .init);
     const bad_enc = try lowOrderClient(aa, "bad-enc", 215, .encryption);
+    // Admission refuses both KeyPackages (`isLowOrderHpkeKey`); this test is
+    // about the failure paths AFTER admission, so it seats them anyway.
+    test_admit_low_order_keys = true;
+    defer test_admit_low_order_keys = false;
 
     var a = try Group(TestSuite).create(gpa, .{
         .io = io,
@@ -7398,4 +7483,176 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
         .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
     }));
     try testing.expectEqualSlices(u8, &mid, &(try stateDigest(&a)));
+}
+
+// ── low-order X25519 keys at admission ─────────────────────────────────────
+
+test "low-order X25519 keys: every small-order encoding is detected, a real key is not" {
+    const hex = [_][]const u8{
+        "0000000000000000000000000000000000000000000000000000000000000000", // 0
+        "0100000000000000000000000000000000000000000000000000000000000000", // 1
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", // order 8
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157", // order 8
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p - 1
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p + 1
+        "0000000000000000000000000000000000000000000000000000000000000080", // 0, high bit set
+    };
+    for (hex) |h| {
+        var k: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&k, h);
+        try testing.expect(isLowOrderHpkeKey(TestSuite, &k));
+    }
+    const good = (try TestSuite.Kem.KeyPair.generateDeterministic(@splat(7))).public_key;
+    try testing.expect(!isLowOrderHpkeKey(TestSuite, &good));
+    // Length is not this check's business.
+    try testing.expect(!isLowOrderHpkeKey(TestSuite, &[_]u8{0} ** 31));
+}
+
+test "low-order X25519 keys: createCommit refuses an Add whose init_key or encryption_key is one" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 221);
+    const bad_init = try lowOrderClient(aa, "bad-init", 222, .init);
+    const bad_enc = try lowOrderClient(aa, "bad-enc", 223, .encryption);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "low-order-create",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const before = try stateDigest(&a);
+    for ([_]keypackage_mod.KeyPackage{ bad_init.kp, bad_enc.kp }) |kp| {
+        for ([_]bool{ false, true }) |omit| {
+            const r = a.createCommit(gpa, .{
+                .io = io,
+                .signature_key_pair = alice.sig,
+                .proposals = &.{.{ .by_value = .{ .add = kp } }},
+                .omit_path_when_allowed = omit,
+            });
+            if (r) |c| {
+                c.deinit(gpa);
+                return error.TestUnexpectedResult;
+            } else |e| try testing.expectEqual(error.LeafNodeInvalid, e);
+            try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
+        }
+    }
+}
+
+test "low-order X25519 keys: processCommit refuses an insider's Commit that adds one or carries one in its path" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 231);
+    const bob = try TestClient.init(aa, "bob", 232);
+    const carol = try TestClient.init(aa, "carol", 233);
+    const bad_init = try lowOrderClient(aa, "bad-init", 234, .init);
+    const bad_enc = try lowOrderClient(aa, "bad-enc", 235, .encryption);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "low-order-process",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // Forged by the insider from a Commit adding carol: the Add swapped for
+    // `bad_init`'s or `bad_enc`'s (validly self-signed) KeyPackage, the
+    // path's leaf key or its first node key swapped for the all-zero point.
+    const c = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
+    });
+    defer c.deinit(gpa);
+    const zero: [32]u8 = @splat(0);
+    const cases = [_]struct { want: anyerror, edit: Reframe }{
+        .{ .want = error.LeafNodeInvalid, .edit = .{ .add0_key_package = bad_init.kp } },
+        .{ .want = error.LeafNodeInvalid, .edit = .{ .add0_key_package = bad_enc.kp } },
+        .{ .want = error.LeafNodeInvalid, .edit = .{ .leaf_encryption_key = &zero } },
+        .{ .want = error.InvalidUpdatePath, .edit = .{ .path_node0_key = &zero } },
+    };
+    for (cases, 0..) |cs, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        const bad = try reframeMemberMessage(gpa, aa, c.commit, alice.sig, &b, cs.edit);
+        defer gpa.free(bad);
+        try testing.expectError(cs.want, b.processCommit(.{ .commit_msg = bad }));
+        try testing.expectEqual(@as(u64, 1), b.epoch);
+    }
+    try b.processCommit(.{ .commit_msg = c.commit });
+    try expectSameEpoch(&a, &b);
+
+    // Then a genuine Commit from a committer that does not check: the Add of
+    // `bad_enc` reaches bob signed, tagged and confirmed.
+    test_admit_low_order_keys = true;
+    const c2_or_err = a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = bad_enc.kp } }},
+    });
+    test_admit_low_order_keys = false;
+    const c2 = try c2_or_err;
+    defer c2.deinit(gpa);
+    try testing.expectError(error.LeafNodeInvalid, b.processCommit(.{ .commit_msg = c2.commit }));
+    try testing.expectEqual(@as(u64, 2), b.epoch);
+}
+
+test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 241);
+    const bob = try TestClient.init(aa, "bob", 242);
+    const bad_enc = try lowOrderClient(aa, "bad-enc", 243, .encryption);
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "low-order-welcome",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    // A committer that does not check seats `bad_enc` beside bob, pathless
+    // so nothing is encrypted to the bad key; bob's Welcome carries the tree.
+    test_admit_low_order_keys = true;
+    const c0 = a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = bad_enc.kp } } },
+        .omit_path_when_allowed = true,
+    });
+    test_admit_low_order_keys = false;
+    const c = try c0;
+    defer c.deinit(gpa);
+    if (bob.join(gpa, c.welcome.?, &.{})) |g| {
+        var gg = g;
+        gg.deinit();
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expectEqual(error.LeafNodeInvalid, e);
 }
