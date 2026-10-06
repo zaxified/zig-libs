@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Anchoring: Pebble** (`tools/pebble.sh`, `tools/interop.zig`, `tools/pebble_helper`,
+  `src/pebble_replay_test.zig`): the client against Let's Encrypt's ACME test CA in `-strict` mode —
+  HTTP-01 (one and two names), DNS-01 wildcard, TLS-ALPN-01, an unreachable name and a blocked one,
+  6/6, every chain verified to Pebble's root; Pebble's answers replayed in the module's lane.
+  - **BEHAVIOURAL (diagnostics):** after `error.AuthorizationFailed`, `lastProblem` is the failed
+    challenge's `error` problem (`urn:ietf:params:acme:error:connection: …`), as RFC 8555 §8 places it;
+    it was the first bytes of the authorization JSON.
+  Evidence MIXED → EXTERNAL.
+
 - **2026-10-04** — Tests: mutation schemata run (47 mutants, 43 killed, 3 equivalent, 1 alive
   by design). Nine new tests: validly signed JWS whose header breaks RFC 8555 §6.2 / RFC 7518
   (alg, jwk+kid, kty, short coordinate, 65-octet signature, an embedded jwk against the account

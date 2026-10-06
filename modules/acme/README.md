@@ -22,7 +22,10 @@ RFC 7638 (JWK thumbprint), RFC 2986 (PKCS#10) and RFC 5915 (EC private keys).
 Design references only, behavior only, no code copied:
 `golang.org/x/crypto/acme` (BSD-3-Clause, The Go Authors; nonce-refill /
 badNonce-retry + POST-as-GET client semantics) and certbot (Apache-2.0; flow
-shape only).
+shape only). Test data: `src/testdata/pebble_transcript.zig` is a capture
+of what Pebble (Let's Encrypt's ACME test CA, MPL-2.0, run as a black-box
+oracle binary outside the repository) answered this client, recorded by our own
+tooling (`tools/pebble.sh`, `tools/pebble_helper`); no Pebble code is in it.
 
 ## ⚠ Staging by default
 

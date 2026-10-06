@@ -109,6 +109,8 @@ test {
     _ = jws;
     _ = x509;
     _ = Client;
+    // External anchor: Pebble's answers, replayed (tools/pebble.sh).
+    _ = @import("pebble_replay_test.zig");
 }
 
 test "needsRenewal: boundary at exactly within_days, expiry, malformed input" {

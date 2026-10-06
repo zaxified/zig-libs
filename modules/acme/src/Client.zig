@@ -446,7 +446,10 @@ fn solveAuthorization(c: *Client, a: Allocator, authz_url: []const u8) Error!voi
     switch (authz.status) {
         .valid => return,
         .pending => {},
-        else => return error.AuthorizationFailed,
+        else => {
+            c.noteAuthzProblem(pr.body);
+            return error.AuthorizationFailed;
+        },
     }
 
     switch (c.options.challenge_type) {
@@ -553,7 +556,7 @@ fn notifyAndPoll(c: *Client, a: Allocator, challenge_url: []const u8, authz_url:
             .valid => return,
             .pending, .processing => wait_ms = ppr.retry_after_ms orelse c.options.poll_interval_ms,
             else => {
-                c.noteProblem(ppr.body);
+                c.noteAuthzProblem(ppr.body);
                 return error.AuthorizationFailed;
             },
         }
@@ -716,6 +719,30 @@ fn noteProblem(c: *Client, body: []const u8) void {
     const n = @min(body.len, c.problem_buf.len);
     @memcpy(c.problem_buf[0..n], body[0..n]);
     c.problem_len = n;
+}
+
+/// Record why an authorization failed: the first challenge's `error`
+/// problem (RFC 8555 §8, "the error that caused the challenge to fail"),
+/// else the body as `noteProblem` takes it.
+///
+/// ⛔ The authorization body went to `noteProblem` whole. It is not a
+/// problem document, so `lastProblem` held the first bytes of the
+/// authorization JSON -- `{ "status": "invalid", "identifier": …` -- and
+/// never the reason (Pebble, `tools/pebble.sh`, 2026-10-06).
+fn noteAuthzProblem(c: *Client, body: []const u8) void {
+    const Authz = struct {
+        challenges: []const struct { @"error": ?Problem = null } = &.{},
+    };
+    if (std.json.parseFromSlice(Authz, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        for (parsed.value.challenges) |ch| if (ch.@"error") |p| if (p.type.len != 0) {
+            var w: std.Io.Writer = .fixed(&c.problem_buf);
+            w.print("{s}: {s}", .{ p.type, p.detail }) catch {}; // truncation is fine
+            c.problem_len = w.buffered().len;
+            return;
+        };
+    } else |_| {}
+    c.noteProblem(body);
 }
 
 fn note(c: *Client, msg: []const u8) void {
