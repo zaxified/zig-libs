@@ -355,7 +355,7 @@ way to recognise it.
 | [`idempotency`](modules/idempotency/README.md) | 2 | Idempotency-Key dedup of unsafe retries — middleware + ramcache-backed store replaying a cached response without re-running the handler | any | router, http, ramcache |
 | [`jwe`](modules/jwe/README.md) | 2 | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption; A192* unsupported (no AES-192 in std) | any | rsa, p256, aescbc, aeskw |
 | [`jwt`](modules/jwt/README.md) | 2 | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256 |
-| [`llmclient`](modules/llmclient/README.md) | 3 | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
+| [`llmclient`](modules/llmclient/README.md) | 2 | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
 | [`metrics`](modules/metrics/README.md) | 2 | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware + access-log writer (combined/JSON) | posix | router, http |
 | [`openapi`](modules/openapi/README.md) | 2 | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | [`ratelimit`](modules/ratelimit/README.md) | 2 | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |

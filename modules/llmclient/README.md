@@ -71,6 +71,46 @@ prompts are all on `MessageRequest` — see `src/types.zig` for the full
 shape and the `textBlock`/`thinkingBlock`/`toolUseBlock`/`toolResultBlock`
 content-block constructors.
 
+### Images, PDFs, cached system prompts, beta headers, token counting
+
+```zig
+// Base64 data goes on the wire verbatim: standard alphabet, padded, no newlines.
+const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+defer gpa.free(b64);
+_ = std.base64.standard.Encoder.encode(b64, png);
+
+const req: llmclient.MessageRequest = .{
+    .model = "claude-opus-5-5",
+    .max_tokens = 1024,
+    // The array form of `system`; each block may be a cache breakpoint.
+    // (`.system = "..."`, the plain string, still works. Both set → the
+    // string goes first as an uncached block.)
+    .system_blocks = &.{llmclient.systemBlockCached(long_stable_instructions)},
+    .messages = &.{llmclient.MessageParam.user(&.{
+        llmclient.imageBlock(.@"image/png", b64), // or imageUrlBlock(url)
+        llmclient.pdfBlock(pdf_b64), // or pdfUrlBlock(url), textDocumentBlock(text)
+        llmclient.textBlock("Compare the chart with the report."),
+    })},
+};
+
+client.betas = &.{"context-management-2025-06-27"}; // → `anthropic-beta: ...` on every request
+
+// POST /v1/messages/count_tokens — what `req` would cost, without running it.
+const n = try client.countTokens(gpa, .fromMessageRequest(req));
+std.debug.print("{d} input tokens\n", .{n.input_tokens});
+```
+
+- `ImageMediaType` is `image/jpeg`, `image/png`, `image/gif` or `image/webp` — the formats the
+  API accepts. A document block also takes `title`, `context` and
+  `citations = .{ .enabled = true }` (set them on `block.document`), and both block kinds a
+  `cache_control`.
+- `count_tokens` accepts base64 and text document sources, not `url` (the API's rule; this
+  client does not police it — the server answers 400, `lastErrorBody` has why).
+- `betas` entries must be plain tokens (`A-Z a-z 0-9 . _ -`); anything else is
+  `error.InvalidBeta` before a byte is sent. Several are joined with commas into one header,
+  the form Anthropic documents.
+- Image/document blocks that come back inside a response parse as `ContentBlock.other`.
+
 **Knobs on `Client`, and what each one bounds** (defaults in brackets):
 `max_response_bytes` [10 MiB] — a buffered body's bytes on the wire;
 `max_parsed_bytes` [64 MiB] — the memory one response or one stream event
@@ -116,10 +156,11 @@ never followed.
   consumer needs it; not built here).
 - Retries / 429 backoff — compose with the `resilience` module later
   rather than duplicating retry policy in this client.
-- Token counting endpoint (`/v1/messages/count_tokens`).
-- Prompt-caching tooling beyond the plain `cache_control` block field
-  (breakpoint-placement helpers, cache-hit diagnostics).
-- Files/vision (image and document content blocks, the Files API).
+- Prompt-caching tooling beyond the per-block `cache_control` field
+  (top-level automatic `cache_control`, breakpoint-placement helpers,
+  cache-hit diagnostics).
+- The Files API (and `file` image/document sources that reference it).
+- Block-array `tool_result` content (images inside a tool result).
 - Batch API (`/v1/messages/batches`).
 - Upstreaming `sse_parse` as `http.sse.ClientReader` — it's fully generic
   SSE parsing with nothing Anthropic-specific in it, and belongs in `http`

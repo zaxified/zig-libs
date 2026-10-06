@@ -3,7 +3,9 @@
 //! `Client` — the Anthropic Messages API surface over the sibling
 //! `http.Client`: `create` for a buffered `POST /v1/messages`, `stream`
 //! for the Server-Sent-Events variant (`stream: true`), pulling one
-//! `StreamEvent` at a time via `EventIterator`.
+//! `StreamEvent` at a time via `EventIterator`, and `countTokens` for
+//! `POST /v1/messages/count_tokens`. `betas` adds an `anthropic-beta`
+//! header to all three.
 //!
 //! `http.Client` handles real HTTPS (the h1 stack's TLS is
 //! `std.crypto.tls`, not a BYO-TLS stub — that caveat only applies to the
@@ -21,6 +23,8 @@ const sse_parse = @import("sse_parse.zig");
 const Client = @This();
 
 pub const MessageRequest = types.MessageRequest;
+pub const CountTokensRequest = types.CountTokensRequest;
+pub const TokenCount = response.TokenCount;
 pub const Message = response.Message;
 pub const StreamEvent = response.StreamEvent;
 
@@ -59,6 +63,13 @@ max_event_bytes: usize = sse_parse.Parser.default_max_data_bytes,
 /// deadline on a concurrent task; when the `std.Io` cannot spare one the
 /// read runs unbounded, as `http.Client` does in the same situation.
 read_timeout_ms: u32 = 60_000,
+/// Beta feature names (e.g. `"context-management-2025-06-27"`), sent on
+/// every request as one `anthropic-beta: a,b,...` header — the
+/// comma-joined form Anthropic documents as equivalent to repeating the
+/// header. Empty (the default) sends no header. Each name must be a
+/// non-empty run of `A-Z a-z 0-9 . _ -`; anything else (a comma, a space,
+/// a CR/LF) is `error.InvalidBeta` before a byte is sent.
+betas: []const []const u8 = &.{},
 
 error_scratch: [error_scratch_len]u8 = undefined,
 error_len: usize = 0,
@@ -79,12 +90,17 @@ pub const Error = error{
     /// so a caller can tell "the peer sent too much" from "the connection
     /// died".
     ResponseTooLarge,
-    /// `base_url` plus `/v1/messages` doesn't fit the 256-byte URL buffer.
+    /// `base_url` plus the endpoint path (`/v1/messages`,
+    /// `/v1/messages/count_tokens`) doesn't fit the 256-byte URL buffer.
     /// A caller configuration mistake, not anything the peer sent — kept
     /// distinct from `MalformedResponse` (whose name and doc comment are
     /// both about the wire) so a caller can't confuse "my base_url is too
     /// long" with "the server sent garbage" (A1 F23).
     BaseUrlTooLong,
+    /// An entry of `betas` is empty or has a byte outside
+    /// `A-Z a-z 0-9 . _ -` — a caller configuration mistake, refused
+    /// before the request is sent.
+    InvalidBeta,
 };
 
 pub fn init(http_client: *http.Client, api_key: []const u8) Client {
@@ -105,16 +121,51 @@ fn noteError(c: *Client, body: []const u8) void {
     c.error_len = n;
 }
 
-fn requestHeaders(c: *const Client) [3]http.Header {
-    return .{
-        .{ .name = "x-api-key", .value = c.api_key },
-        .{ .name = "anthropic-version", .value = c.anthropic_version },
-        .{ .name = "content-type", .value = "application/json" },
+/// The headers every request carries, into `out`; the joined
+/// `anthropic-beta` value (when `betas` is non-empty) is allocated from
+/// `a` and must outlive the request.
+fn requestHeaders(c: *const Client, a: std.mem.Allocator, out: *[4]http.Header) Error![]const http.Header {
+    out[0] = .{ .name = "x-api-key", .value = c.api_key };
+    out[1] = .{ .name = "anthropic-version", .value = c.anthropic_version };
+    out[2] = .{ .name = "content-type", .value = "application/json" };
+    if (c.betas.len == 0) return out[0..3];
+    var len: usize = c.betas.len - 1;
+    for (c.betas) |b| {
+        if (!validBeta(b)) return error.InvalidBeta;
+        len += b.len;
+    }
+    const joined = a.alloc(u8, len) catch return error.OutOfMemory;
+    var i: usize = 0;
+    for (c.betas, 0..) |b, n| {
+        if (n != 0) {
+            joined[i] = ',';
+            i += 1;
+        }
+        @memcpy(joined[i..][0..b.len], b);
+        i += b.len;
+    }
+    out[3] = .{ .name = "anthropic-beta", .value = joined };
+    return out[0..4];
+}
+
+fn validBeta(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => {},
+        else => return false,
     };
+    return true;
+}
+
+const messages_path = "/v1/messages";
+const count_tokens_path = "/v1/messages/count_tokens";
+
+fn endpointUrl(base_url: []const u8, path: []const u8, buf: []u8) error{BaseUrlTooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ base_url, path }) catch return error.BaseUrlTooLong;
 }
 
 fn messagesUrl(base_url: []const u8, buf: []u8) error{BaseUrlTooLong}![]const u8 {
-    return std.fmt.bufPrint(buf, "{s}/v1/messages", .{base_url}) catch return error.BaseUrlTooLong;
+    return endpointUrl(base_url, messages_path, buf);
 }
 
 fn mapHttpError(err: http.Client.Error) Error {
@@ -306,12 +357,48 @@ pub fn create(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std
     const a = arena.allocator();
 
     const body = types.stringifyAlloc(a, non_stream) catch return error.OutOfMemory;
+    const resp_body = try c.postBuffered(a, messages_path, body);
 
+    // The parse, under `max_parsed_bytes` (A1 F5): the wire cap bounds
+    // bytes, this bounds what they turn into.
+    var bounded: BoundedAllocator = .{ .child = a, .limit = c.max_parsed_bytes };
+    const msg = response.parseMessage(bounded.allocator(), resp_body) catch |err| switch (err) {
+        error.OutOfMemory => return if (bounded.exceeded) error.ResponseTooLarge else error.OutOfMemory,
+        error.MalformedResponse => return error.MalformedResponse,
+    };
+    return .{ .arena = arena, .value = msg };
+}
+
+/// `POST /v1/messages/count_tokens`: how many input tokens `req` would
+/// cost, without running the model. Same headers, bounds and redirect
+/// rule as `create`; `CountTokensRequest.fromMessageRequest` counts a
+/// `MessageRequest` as it would be sent. Nothing is retained after the
+/// call returns.
+pub fn countTokens(c: *Client, gpa: std.mem.Allocator, req: CountTokensRequest) Error!TokenCount {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const body = types.stringifyCountTokensAlloc(a, req) catch return error.OutOfMemory;
+    const resp_body = try c.postBuffered(a, count_tokens_path, body);
+
+    var bounded: BoundedAllocator = .{ .child = a, .limit = c.max_parsed_bytes };
+    return response.parseTokenCount(bounded.allocator(), resp_body) catch |err| switch (err) {
+        error.OutOfMemory => return if (bounded.exceeded) error.ResponseTooLarge else error.OutOfMemory,
+        error.MalformedResponse => return error.MalformedResponse,
+    };
+}
+
+/// One buffered JSON `POST` to `base_url ++ path`: the response body,
+/// allocated from `a`, when the status is 2xx; otherwise the body goes to
+/// `lastErrorBody` and the call is `error.UnexpectedStatus`.
+fn postBuffered(c: *Client, a: std.mem.Allocator, path: []const u8, body: []const u8) Error![]u8 {
     var url_buf: [256]u8 = undefined;
-    const url = try messagesUrl(c.base_url, &url_buf);
-    const hdrs = c.requestHeaders();
+    const url = try endpointUrl(c.base_url, path, &url_buf);
+    var hdr_buf: [4]http.Header = undefined;
+    const hdrs = try c.requestHeaders(a, &hdr_buf);
 
-    var res = c.http_client.request(.post, url, requestOptions(&hdrs, body)) catch |err|
+    var res = c.http_client.request(.post, url, requestOptions(hdrs, body)) catch |err|
         return mapHttpError(err);
     defer res.deinit();
 
@@ -329,15 +416,7 @@ pub fn create(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std
         c.noteError(resp_body);
         return error.UnexpectedStatus;
     }
-
-    // The parse, under `max_parsed_bytes` (A1 F5): the wire cap above
-    // bounds bytes, this bounds what they turn into.
-    var bounded: BoundedAllocator = .{ .child = a, .limit = c.max_parsed_bytes };
-    const msg = response.parseMessage(bounded.allocator(), resp_body) catch |err| switch (err) {
-        error.OutOfMemory => return if (bounded.exceeded) error.ResponseTooLarge else error.OutOfMemory,
-        error.MalformedResponse => return error.MalformedResponse,
-    };
-    return .{ .arena = arena, .value = msg };
+    return resp_body;
 }
 
 /// `POST /v1/messages` with `stream: true` forced; returns an
@@ -353,9 +432,10 @@ pub fn stream(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!Eve
 
     var url_buf: [256]u8 = undefined;
     const url = try messagesUrl(c.base_url, &url_buf);
-    const hdrs = c.requestHeaders();
+    var hdr_buf: [4]http.Header = undefined;
+    const hdrs = try c.requestHeaders(build_arena.allocator(), &hdr_buf);
 
-    var res = c.http_client.request(.post, url, requestOptions(&hdrs, body)) catch |err|
+    var res = c.http_client.request(.post, url, requestOptions(hdrs, body)) catch |err|
         return mapHttpError(err);
     errdefer res.deinit();
 
@@ -517,7 +597,9 @@ test "Client.create: golden request body, headers, and non-2xx surfaces Unexpect
     // live network: header construction and URL building are pure/offline
     // testable (mirrors `http.Client.writeRequestHead`'s golden tests).
     var c: Client = .init(undefined, "sk-test-key");
-    const hdrs = c.requestHeaders();
+    var hdr_buf: [4]http.Header = undefined;
+    const hdrs = try c.requestHeaders(testing.allocator, &hdr_buf);
+    try testing.expectEqual(@as(usize, 3), hdrs.len); // no `betas` → no anthropic-beta
     try testing.expectEqualStrings("x-api-key", hdrs[0].name);
     try testing.expectEqualStrings("sk-test-key", hdrs[0].value);
     try testing.expectEqualStrings("anthropic-version", hdrs[1].name);
@@ -773,6 +855,23 @@ const FakePeer = struct {
     /// you want.
     last_body_buf: [8192]u8 = undefined,
     last_body_len: usize = 0,
+    /// The request-target and `anthropic-beta` value of that same request
+    /// (`beta_count` = how many `anthropic-beta` lines it carried).
+    last_target_buf: [128]u8 = undefined,
+    last_target_len: usize = 0,
+    last_beta_buf: [256]u8 = undefined,
+    last_beta_len: usize = 0,
+    last_beta_count: usize = 0,
+
+    fn lastTarget(p: *const FakePeer) []const u8 {
+        return p.last_target_buf[0..p.last_target_len];
+    }
+    fn lastBeta(p: *const FakePeer) []const u8 {
+        return p.last_beta_buf[0..p.last_beta_len];
+    }
+    fn lastBody(p: *const FakePeer) []const u8 {
+        return p.last_body_buf[0..p.last_body_len];
+    }
 
     fn run(p: *FakePeer) void {
         for (p.scripts) |script| {
@@ -787,6 +886,19 @@ const FakePeer = struct {
             if (p.stop.load(.acquire) != 0) continue; // `finish` unparking us
             const head = http.h1.readHead(&sr.interface, &head_buf) catch continue;
             const req = http.h1.RequestHead.parse(head) catch continue;
+            p.last_target_len = @min(req.target.len, p.last_target_buf.len);
+            @memcpy(p.last_target_buf[0..p.last_target_len], req.target[0..p.last_target_len]);
+            p.last_beta_len = 0;
+            p.last_beta_count = 0;
+            var lines = std.mem.splitSequence(u8, req.header_block, "\r\n");
+            while (lines.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                if (!std.ascii.eqlIgnoreCase(line[0..colon], "anthropic-beta")) continue;
+                p.last_beta_count += 1;
+                const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                p.last_beta_len = @min(v.len, p.last_beta_buf.len);
+                @memcpy(p.last_beta_buf[0..p.last_beta_len], v[0..p.last_beta_len]);
+            }
             // Capture the body (up to the capture buffer's size) so a test
             // can assert what actually went out on the wire, then drain
             // whatever's left so the client's write never blocks.
@@ -1158,6 +1270,122 @@ test "BoundedAllocator: refuses past the limit, credits frees back, and flags th
 // need no credentials and so don't hit this problem. Exercise this path
 // manually via a real `main`/CLI wired up with a key from `Init`, using
 // the exact shape below.
+// ── anthropic-beta, count_tokens ───────────────────────────────────────────
+
+test "requestHeaders: betas go out as one comma-joined anthropic-beta header (the documented form)" {
+    var c: Client = .init(undefined, "k");
+    c.betas = &.{ "context-management-2025-06-27", "fast-mode-2026-02-01" };
+    var hdr_buf: [4]http.Header = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const hdrs = try c.requestHeaders(arena.allocator(), &hdr_buf);
+    try testing.expectEqual(@as(usize, 4), hdrs.len);
+    try testing.expectEqualStrings("anthropic-beta", hdrs[3].name);
+    try testing.expectEqualStrings("context-management-2025-06-27,fast-mode-2026-02-01", hdrs[3].value);
+
+    c.betas = &.{"only-one-2025-01-01"};
+    try testing.expectEqualStrings("only-one-2025-01-01", (try c.requestHeaders(arena.allocator(), &hdr_buf))[3].value);
+}
+
+test "requestHeaders: a beta name that could split or smuggle a header is InvalidBeta, refused before sending" {
+    var c: Client = .init(undefined, "k");
+    var hdr_buf: [4]http.Header = undefined;
+    const bad = [_][]const u8{ "", "a,b", "a b", "a\r\nx-api-key: stolen", "a\nb", "a:b", "caf\xc3\xa9" };
+    for (bad) |b| {
+        c.betas = &.{ "ok-2025-01-01", b };
+        try testing.expectError(error.InvalidBeta, c.requestHeaders(testing.allocator, &hdr_buf));
+    }
+}
+
+test "Client.create / stream / countTokens: anthropic-beta is on the wire, once, for every endpoint" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .many_blocks = 1 },
+        .{ .sse_raw = "data: {\"type\":\"ping\"}\n\n" },
+        .{ .blob = "{\"input_tokens\":3}" },
+        .{ .many_blocks = 1 },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    c.betas = &.{ "beta-a-2026-01-01", "beta-b-2026-02-02" };
+
+    var parsed = try c.create(testing.allocator, canned_request);
+    parsed.deinit();
+    try testing.expectEqualStrings("/v1/messages", lb.peer.lastTarget());
+    try testing.expectEqualStrings("beta-a-2026-01-01,beta-b-2026-02-02", lb.peer.lastBeta());
+    try testing.expectEqual(@as(usize, 1), lb.peer.last_beta_count);
+
+    var it = try c.stream(testing.allocator, canned_request);
+    it.deinit();
+    try testing.expectEqualStrings("beta-a-2026-01-01,beta-b-2026-02-02", lb.peer.lastBeta());
+
+    _ = try c.countTokens(testing.allocator, .fromMessageRequest(canned_request));
+    try testing.expectEqualStrings("beta-a-2026-01-01,beta-b-2026-02-02", lb.peer.lastBeta());
+
+    // And none at all once `betas` is empty again.
+    c.betas = &.{};
+    var parsed2 = try c.create(testing.allocator, canned_request);
+    parsed2.deinit();
+    try testing.expectEqual(@as(usize, 0), lb.peer.last_beta_count);
+}
+
+test "Client.countTokens: POSTs the count_tokens body to /v1/messages/count_tokens and returns input_tokens" {
+    var lb: Loopback = undefined;
+    // The docs' own output, verbatim (token-counting.md, fetched 2026-10-06).
+    try lb.start(&.{.{ .blob = "{ \"input_tokens\": 14 }" }});
+    defer lb.finish();
+    var c = try lb.client();
+
+    var req: MessageRequest = canned_request;
+    req.system = "You are a scientist";
+    req.stream = true;
+    const count = try c.countTokens(testing.allocator, .fromMessageRequest(req));
+    try testing.expectEqual(@as(u64, 14), count.input_tokens);
+    try testing.expectEqualStrings("/v1/messages/count_tokens", lb.peer.lastTarget());
+    try testing.expectEqualStrings(
+        "{\"model\":\"claude-opus-4-8\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\"," ++
+            "\"text\":\"audit canary prompt\"}]}],\"system\":\"You are a scientist\"}",
+        lb.peer.lastBody(),
+    );
+}
+
+test "Client.countTokens: non-2xx is UnexpectedStatus + lastErrorBody; a body that is not a count is MalformedResponse; the wire cap holds" {
+    const err_body = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens: Extra inputs are not permitted\"}}";
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .status = .{ .code = 400, .body = err_body } },
+        .{ .blob = "{\"tokens\":14}" },
+        .{ .blob = "{\"input_tokens\":-5}" },
+        .{ .many_blocks = 1000 },
+        .{ .redirect = 1 },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    const req: CountTokensRequest = .fromMessageRequest(canned_request);
+
+    try testing.expectError(error.UnexpectedStatus, c.countTokens(testing.allocator, req));
+    try testing.expectEqualStrings(err_body, c.lastErrorBody().?);
+    try testing.expectError(error.MalformedResponse, c.countTokens(testing.allocator, req));
+    try testing.expectError(error.MalformedResponse, c.countTokens(testing.allocator, req));
+    c.max_response_bytes = 1024;
+    try testing.expectError(error.ResponseTooLarge, c.countTokens(testing.allocator, req));
+    // Never followed, as for create (A1 F1).
+    try testing.expectError(error.UnexpectedStatus, c.countTokens(testing.allocator, req));
+    try testing.expectEqualStrings("redirect", c.lastErrorBody().?);
+}
+
+test "Client.create: an invalid beta is refused before any connection is made" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{});
+    defer lb.finish();
+    var c = try lb.client();
+    c.betas = &.{"bad beta"};
+    try testing.expectError(error.InvalidBeta, c.create(testing.allocator, canned_request));
+    try testing.expectError(error.InvalidBeta, c.stream(testing.allocator, canned_request));
+    try testing.expectError(error.InvalidBeta, c.countTokens(testing.allocator, .fromMessageRequest(canned_request)));
+    try testing.expectEqual(@as(usize, 0), lb.http_client.dialCount());
+}
+
 test "live: create a minimal message (manual only — see doc comment)" {
     // `if (false)` still type-checks `liveCreateExample` (so a real API
     // change here would fail `zig build test-llmclient`), but never

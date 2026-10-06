@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — ADDED: image and document content blocks, the `system` block-array form,
+  `anthropic-beta` headers and `count_tokens`. **BREAKING only for an exhaustive `switch`** on
+  `ContentBlockParam` (two new variants) or on `Client.Error` (new `InvalidBeta`); every
+  existing request serializes byte-for-byte as before (golden tests unchanged).
+  - `ContentBlockParam.image` (`ImageSource`: base64 with `ImageMediaType` jpeg/png/gif/webp,
+    or url) and `.document` (`DocumentSource`: base64 PDF, plain text, or url; optional
+    `title`, `context`, `citations`, `cache_control`); helpers `imageBlock`, `imageUrlBlock`,
+    `pdfBlock`, `pdfUrlBlock`, `textDocumentBlock`. Such blocks echoed back in a response
+    parse as `ContentBlock.other`, never an error.
+  - `MessageRequest.system_blocks: ?[]const SystemBlock` — the array-of-text-blocks `system`
+    with per-block `cache_control` (`systemBlock`, `systemBlockCached`). The plain `system`
+    string still works; when both are set the string becomes an uncached first block.
+  - `Client.betas` — sent as one comma-joined `anthropic-beta` header on every request; a name
+    outside `A-Z a-z 0-9 . _ -` is `error.InvalidBeta` before anything is sent.
+  - `Client.countTokens(gpa, CountTokensRequest) → TokenCount` on
+    `POST /v1/messages/count_tokens` (same headers, bounds, redirect refusal as `create`);
+    `CountTokensRequest.fromMessageRequest` drops `max_tokens`/`stream`;
+    `stringifyCountTokensAlloc`, `parseTokenCount` (a body without a representable
+    `input_tokens` is `error.MalformedResponse`, never 0), with a fuzz harness.
+  - Anchored to Anthropic's published docs examples (vision, PDF, citations, prompt caching,
+    token counting; JSON-compared). `scripts/modtest llmclient`: 51 → 71 pass (+1 skip).
+
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the threat-model out-of-scope line now lists `count_tokens`, files/vision content blocks and the Batch API as "not yet — see Backlog".
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `create` and `EventIterator.next` body-read cancel tests canceled after a fixed
   sleep. Both now cancel once the client is inside the socket read under test (`ReadCueIo`, a
