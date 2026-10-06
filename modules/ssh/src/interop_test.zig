@@ -239,6 +239,10 @@ pub const SshClientOptions = struct {
     remote: []const u8 = "'uname -a'",
     /// Shell redirection for the client's stdin (default `/dev/null`).
     stdin_from: []const u8 = "/dev/null",
+    /// A whole shell script instead of the single `ssh` call: `$SSH` is the
+    /// client with every option above (no host), `$H` the `user@host`
+    /// argument, `$OUT` the output file (its last line must be a status).
+    script: ?[]const u8 = null,
 };
 
 /// A real `ssh` dialling our server; `start` returns after OUR server
@@ -296,13 +300,14 @@ pub const SshClient = struct {
 
         const out_path = try std.fmt.allocPrint(gpa, "{s}/out", .{dir_path});
         errdefer gpa.free(out_path);
-        const cmdline = try std.fmt.allocPrint(gpa,
-            \\/usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes \
-            \\ -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            \\ -o GlobalKnownHostsFile=/dev/null -o PreferredAuthentications=publickey \
-            \\ -o BatchMode=yes -o ConnectTimeout=10 {s} \
-            \\ alice@127.0.0.1 {s} < {s} > {s} 2>{s}.err; echo $? >> {s}
-        , .{ port, ck_path, opts.ssh_args, opts.remote, opts.stdin_from, out_path, out_path, out_path });
+        const ssh_cmd = try std.fmt.allocPrint(gpa, "/usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes" ++
+            " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null" ++
+            " -o PreferredAuthentications=publickey -o BatchMode=yes -o ConnectTimeout=10 {s}", .{ port, ck_path, opts.ssh_args });
+        defer gpa.free(ssh_cmd);
+        const cmdline = if (opts.script) |script|
+            try std.fmt.allocPrint(gpa, "SSH='{s}'; H=alice@127.0.0.1; OUT={s}; exec 2>{s}.err; {s}", .{ ssh_cmd, out_path, out_path, script })
+        else
+            try std.fmt.allocPrint(gpa, "{s} alice@127.0.0.1 {s} < {s} > {s} 2>{s}.err; echo $? >> {s}", .{ ssh_cmd, opts.remote, opts.stdin_from, out_path, out_path, out_path });
         defer gpa.free(cmdline);
 
         var child = std.process.spawn(io, .{
@@ -335,6 +340,19 @@ pub const SshClient = struct {
         self.sw = self.stream.writer(io, &self.wbuf);
         self.t = try server.accept(&self.sr.interface, &self.sw.interface, gpa, .{ .host_keys = &self.host_keys });
         return self;
+    }
+
+    /// Accept the client's next connection (a script that runs `ssh`
+    /// twice) and run our server handshake on it, replacing `t`.
+    pub fn acceptNext(self: *SshClient) !void {
+        self.t.deinit();
+        self.stream.close(self.io);
+        self.stream_open = false;
+        self.stream = try acceptBounded(self.io, &self.listener, 30_000);
+        self.stream_open = true;
+        self.sr = self.stream.reader(self.io, &self.rbuf);
+        self.sw = self.stream.writer(self.io, &self.wbuf);
+        self.t = try server.accept(&self.sr.interface, &self.sw.interface, self.gpa, .{ .host_keys = &self.host_keys });
     }
 
     fn checkKey(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
@@ -600,4 +618,358 @@ test "live: our server re-keys every 16 KiB against a real ssh client — it fol
     try expectPattern(out[0..out.len -| 2], big_output_len);
     try std.testing.expectEqualStrings("0\n", out[out.len -| 2..]);
     try std.testing.expect(kex_count >= 10);
+}
+
+// ── channels: several at once, session requests, TCP/IP forwarding ─────────
+
+test "live: three sessions side by side on one connection to sshd (Connection)" {
+    // RFC 4254 §5: channels are independent. The slow one is drained LAST,
+    // so its output arrives while the other two are being pumped and must
+    // be applied to the right channel.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+
+    const slow = try conn.openSession(.{});
+    defer slow.deinit();
+    const a = try conn.openSession(.{});
+    defer a.deinit();
+    const b = try conn.openSession(.{});
+    defer b.deinit();
+    try std.testing.expect(slow.ch.local_id != a.ch.local_id and a.ch.local_id != b.ch.local_id);
+
+    try slow.exec("/bin/sh -c 'i=0; while [ $i -lt 200 ]; do printf S; i=$((i+1)); done; exit 4'");
+    try a.exec("printf A; printf a >&2; exit 5");
+    try b.exec("/bin/sh -c 'cat; exit 6'");
+    try b.writeData("from-b");
+    try b.sendEof();
+    try a.drain();
+    try b.drain();
+    try slow.drain();
+    try std.testing.expectEqualStrings("A", a.stdout.items);
+    try std.testing.expectEqualStrings("a", a.stderr.items);
+    try std.testing.expectEqualStrings("from-b", b.stdout.items);
+    try std.testing.expectEqual(@as(usize, 200), slow.stdout.items.len);
+    try std.testing.expectEqual(@as(?u32, 5), a.exitStatus());
+    try std.testing.expectEqual(@as(?u32, 6), b.exitStatus());
+    try std.testing.expectEqual(@as(?u32, 4), slow.exitStatus());
+
+    // A channel opened after others closed works the same.
+    const again = try conn.openSession(.{});
+    defer again.deinit();
+    try again.exec("printf again");
+    try again.drain();
+    try std.testing.expectEqualStrings("again", again.stdout.items);
+}
+
+test "live: pty-req + window-change against sshd — the command runs on a terminal of that size" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    const s = try conn.openSession(.{});
+    defer s.deinit();
+    try s.requestPty(.{ .term = "vt100", .cols = 80, .rows = 24 });
+    try s.windowChange(132, 43, 0, 0);
+    try s.exec("/bin/sh -c 'echo \"T=$TERM\"; stty size; tty; exit 3'");
+    try s.drain();
+    const out = s.stdout.items;
+    try std.testing.expect(std.mem.indexOf(u8, out, "T=vt100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "43 132") != null); // rows cols, after the resize
+    try std.testing.expect(std.mem.indexOf(u8, out, "/dev/pts/") != null);
+    try std.testing.expectEqual(@as(?u32, 3), s.exitStatus());
+}
+
+test "live: shell against sshd — the login shell reads its commands from the channel" {
+    // No pty: an interactive shell on a terminal may query the terminal and
+    // wait for an answer (fish does), which says nothing about SSH. The
+    // commands are valid in sh, bash and fish alike.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    const s = try conn.openSession(.{});
+    defer s.deinit();
+    try s.shell();
+    try s.writeData("echo shell-ok\nexit 3\n");
+    try s.sendEof();
+    try s.drain();
+    try std.testing.expect(std.mem.indexOf(u8, s.stdout.items, "shell-ok") != null);
+    try std.testing.expectEqual(@as(?u32, 3), s.exitStatus());
+}
+
+test "live: env is delivered only for names sshd accepts (AcceptEnv)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{ .extra = &.{"AcceptEnv=ZIGTEST_*"} });
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    const s = try conn.openSession(.{});
+    defer s.deinit();
+    try s.setEnv("ZIGTEST_GREETING", "hello env");
+    // A name outside AcceptEnv: sshd answers CHANNEL_FAILURE.
+    try std.testing.expectError(error.ChannelRequestFailed, s.setEnv("NOT_ACCEPTED", "x"));
+    try s.exec("printf '%s|%s' \"$ZIGTEST_GREETING\" \"$NOT_ACCEPTED\"");
+    try s.drain();
+    try std.testing.expectEqualStrings("hello env|", s.stdout.items);
+}
+
+test "live: signal TERM reaches the remote command, which reports exit-signal" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    const s = try conn.openSession(.{});
+    defer s.deinit();
+    // `exec` so the signal hits sleep itself, not a shell waiting on it.
+    try s.exec("exec sleep 30");
+    try s.signal("TERM");
+    try s.drain();
+    try std.testing.expect(s.exit_signal != null);
+    try std.testing.expectEqualStrings("TERM", s.exit_signal.?.name());
+    try std.testing.expectEqual(@as(?u32, null), s.exitStatus());
+}
+
+/// A one-shot TCP echo peer for the forwarding tests: accepts one
+/// connection, reads to EOF, writes back `prefix ++ what it read`, closes.
+const EchoPeer = struct {
+    listener: std.Io.net.Server,
+    port: u16,
+    prefix: []const u8 = "echo:",
+    err: ?anyerror = null,
+
+    fn run(self: *EchoPeer, io: std.Io) void {
+        self.serve(io) catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn serve(self: *EchoPeer, io: std.Io) !void {
+        const stream = try acceptBounded(io, &self.listener, 30_000);
+        defer stream.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var w = stream.writer(io, &wbuf);
+        var got: [4096]u8 = undefined;
+        var n: usize = 0;
+        while (n < got.len) {
+            const k = r.interface.readSliceShort(got[n..]) catch break;
+            if (k == 0) break;
+            n += k;
+        }
+        try w.interface.writeAll(self.prefix);
+        try w.interface.writeAll(got[0..n]);
+        try w.interface.flush();
+    }
+};
+
+test "live: direct-tcpip — sshd connects to a local port for us and relays both ways (ssh -L)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var fx = try Sshd.start(gpa, io, .{ .extra = &.{"AllowTcpForwarding=yes"} });
+    defer fx.deinit();
+
+    var peer: EchoPeer = .{ .listener = undefined, .port = 0 };
+    peer.listener = try listenLoopback(io, &peer.port);
+    defer peer.listener.deinit(io);
+    const th = try std.Thread.spawn(.{}, EchoPeer.run, .{ &peer, io });
+    var joined = false;
+    defer if (!joined) th.join();
+
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+    const fwd = try conn.openDirectTcpip(.{ .host = "127.0.0.1", .port = peer.port });
+    defer fwd.deinit();
+    try fwd.writeData("ping over ssh");
+    try fwd.sendEof();
+    try fwd.drain();
+    th.join();
+    joined = true;
+    if (peer.err) |e| return e;
+    try std.testing.expectEqualStrings("echo:ping over ssh", fwd.stdout.items);
+
+    // A port nothing listens on: sshd refuses the channel.
+    try std.testing.expectError(error.ChannelOpenFailed, conn.openDirectTcpip(.{ .host = "127.0.0.1", .port = 1 }));
+}
+
+const ForwardDialer = struct {
+    port: u32,
+    reply: [256]u8 = undefined,
+    reply_len: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *ForwardDialer, io: std.Io) void {
+        self.dial(io) catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn dial(self: *ForwardDialer, io: std.Io) !void {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", @intCast(self.port));
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var w = stream.writer(io, &wbuf);
+        try w.interface.writeAll("hello from a dialer");
+        try w.interface.flush();
+        try stream.shutdown(io, .send);
+        while (self.reply_len < self.reply.len) {
+            const k = r.interface.readSliceShort(self.reply[self.reply_len..]) catch break;
+            if (k == 0) break;
+            self.reply_len += k;
+        }
+    }
+};
+
+test "live: tcpip-forward — sshd listens for us and opens forwarded-tcpip channels back (ssh -R)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var fx = try Sshd.start(gpa, io, .{ .extra = &.{"AllowTcpForwarding=yes"} });
+    defer fx.deinit();
+    var conn = try connection.Connection.init(&fx.t, gpa);
+    defer conn.deinit();
+
+    // Port 0: sshd picks one and says which (RFC 4254 §7.1).
+    const port = conn.requestRemoteForward("127.0.0.1", 0) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    try std.testing.expect(port != 0);
+
+    var dialer: ForwardDialer = .{ .port = port };
+    const th = try std.Thread.spawn(.{}, ForwardDialer.run, .{ &dialer, io });
+    var joined = false;
+    defer if (!joined) th.join();
+
+    const got = try conn.acceptForwarded();
+    defer got.session.deinit();
+    try std.testing.expectEqual(port, got.origin.connected_port);
+    // Read the dialer's bytes to its EOF, answer, close.
+    while (!got.session.ch.got_eof) _ = try got.session.pumpOnce();
+    try std.testing.expectEqualStrings("hello from a dialer", got.session.stdout.items);
+    try got.session.writeData("reply from our client");
+    try got.session.sendEof();
+    try got.session.drain();
+    th.join();
+    joined = true;
+    if (dialer.err) |e| return e;
+    try std.testing.expectEqualStrings("reply from our client", dialer.reply[0..dialer.reply_len]);
+
+    try conn.cancelRemoteForward("127.0.0.1", port);
+}
+
+// ── our server: several channels, pty, env, shell (real ssh client) ─────────
+
+const info_handler: connection.CommandHandler = .{ .runInfoFn = struct {
+    fn f(
+        _: *anyopaque,
+        gpa: std.mem.Allocator,
+        info: *const connection.RequestInfo,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        _: *std.ArrayList(u8),
+    ) connection.CommandError!u32 {
+        try stdout.print(gpa, "kind={t} cmd={s} ch={d}", .{ info.kind, info.command, info.channel });
+        if (info.pty) |pty| try stdout.print(gpa, " pty={s}:{d}x{d}", .{ pty.term(), pty.cols, pty.rows });
+        for (info.env) |e| try stdout.print(gpa, " env:{s}={s}", .{ e.name, e.value });
+        if (stdin.len > 0) try stdout.print(gpa, " stdin={s}", .{stdin});
+        try stdout.append(gpa, '\n');
+        return 0;
+    }
+}.f };
+
+test "live: our server serves several channels of one ssh connection (ControlMaster multiplexing)" {
+    // The master holds the connection (-N: no session of its own); three
+    // clients run through its socket, two of them at the same time, each a
+    // separate session channel on OUR connection; then the master is told
+    // to exit, which disconnects.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .script =
+        \\S=$OUT.sock; $SSH -o ControlMaster=yes -o ControlPath=$S -N -f $H &&
+        \\{ $SSH -o ControlPath=$S $H first > $OUT.1 & $SSH -o ControlPath=$S $H second > $OUT.2 & wait; } &&
+        \\$SSH -o ControlPath=$S $H third > $OUT.3; r=$?;
+        \\cat $OUT.1 $OUT.2 $OUT.3 > $OUT; echo $r >> $OUT; $SSH -o ControlPath=$S -O exit $H 2>/dev/null
+    });
+    defer fx.deinit();
+    const auth = try fx.authenticate();
+    connection.serveConnection(&fx.t, gpa, .{ .user = auth.user(), .exec = info_handler, .stdin_mode = .ignore }) catch |e| {
+        fx.dumpErr();
+        return e;
+    };
+    const out = try fx.finish();
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=third") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "0\n"));
+}
+
+test "live: our server — ssh -tt gets a pty, SetEnv passes AcceptEnv-style names, a shell reads stdin" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{ .script =
+        \\$SSH -tt -o SetEnv="ZIGTEST_ONE=1 OTHER=2" $H 'echo hi' > $OUT.1 </dev/null;
+        \\printf 'typed into the shell' | $SSH -T $H > $OUT.2; r=$?;
+        \\cat $OUT.1 $OUT.2 > $OUT; echo $r >> $OUT
+    });
+    defer fx.deinit();
+    // First connection: the -tt exec.
+    {
+        const auth = try fx.authenticate();
+        try connection.serveSession(&fx.t, gpa, .{
+            .user = auth.user(),
+            .exec = info_handler,
+            .accept_env = &.{"ZIGTEST_*"},
+            .stdin_mode = .ignore,
+        });
+    }
+    // Second connection: a shell with stdin.
+    try fx.acceptNext();
+    {
+        const auth = try fx.authenticate();
+        try connection.serveSession(&fx.t, gpa, .{ .user = auth.user(), .shell = info_handler });
+    }
+    const out = try fx.finish();
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " pty=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " env:ZIGTEST_ONE=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "OTHER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kind=shell cmd= ch=0 stdin=typed into the shell") != null);
+}
+
+test "envAccepted: exact names and trailing-* prefixes only" {
+    const t = std.testing;
+    const pats = [_][]const u8{ "LANG", "LC_*", "ZIG" };
+    try t.expect(connection.envAcceptedForTest(&pats, "LANG"));
+    try t.expect(connection.envAcceptedForTest(&pats, "LC_ALL"));
+    try t.expect(connection.envAcceptedForTest(&pats, "LC_"));
+    try t.expect(!connection.envAcceptedForTest(&pats, "LANGUAGE"));
+    try t.expect(!connection.envAcceptedForTest(&pats, "ZIGGY"));
+    try t.expect(!connection.envAcceptedForTest(&.{}, "LANG"));
 }

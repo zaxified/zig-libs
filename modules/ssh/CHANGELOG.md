@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-06** — **Several channels per connection, session requests, TCP/IP forwarding (ADDITIVE; one field made optional).**
+  - **Client: `connection.Connection`**, a channel multiplexer over one authenticated transport:
+    `openSession` as often as wanted (each channel pumps the others' messages into their own
+    buffers), `openDirectTcpip` (RFC 4254 §7.2, `ssh -L`), `requestRemoteForward` /
+    `cancelRemoteForward` + `acceptForwarded` (§7.1 `tcpip-forward`, incoming `forwarded-tcpip`,
+    `ssh -R`). Standalone `Session.open` is unchanged.
+  - **Session requests (client):** `requestPty` (§6.2), `shell` (§6.5), `setEnv` (§6.4),
+    `windowChange` (§6.7), `signal` (§6.9), generic `requestRaw`; `exit-signal` (§6.10) is recorded
+    in `Session.exit_signal`.
+  - **Server: `serveConnection`** serves up to `ServeConfig.max_sessions` concurrent session
+    channels until the client disconnects; a handler becomes runnable while another channel's
+    output waits for window space and runs next (handlers never nest). `serveSession` is its
+    one-channel form (same wire behaviour; its tests and pinned corpus counts are unchanged).
+    New `ServeConfig.shell`, `allow_pty` (default on), `accept_env` (exact or `PREFIX*`, refused
+    otherwise). `CommandHandler.runInfoFn` receives a `RequestInfo` (request kind, command, pty,
+    accepted environment, channel); `runFn` became optional (`.{ .runFn = f }` still compiles).
+  - Live-tested against OpenSSH 10.2p1: three concurrent sessions to `sshd`, pty + window-change,
+    shell, env with `AcceptEnv`, signal TERM → exit-signal, direct-tcpip through `sshd` to a local
+    echo peer, tcpip-forward with a dialer connecting to the port `sshd` bound; a real `ssh`
+    ControlMaster running three (two concurrent) sessions over one connection to our server,
+    `ssh -tt` (pty-req), `SetEnv` filtered by `accept_env`, and a stdin-fed shell.
 - **2026-10-06** — **Key re-exchange, strict KEX, SSH_MSG_UNIMPLEMENTED; BREAKING (low-level API only).**
   - **Rekeying (RFC 4253 §9), both roles.** `Transport.recvPacket` runs a re-exchange the peer
     starts (its KEXINIT mid-stream); `Transport.rekey()` starts one; `sendPacket`/`recvPacket`

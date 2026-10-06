@@ -192,11 +192,11 @@ fn sendExitStatus(t: *transport.Transport, ch: *ChannelState, status: u32) Chann
     return t.sendPacket(w.buffered());
 }
 
-// ── client: a session channel ──────────────────────────────────────────────
+// ── client: channels ───────────────────────────────────────────────────────
 
 pub const SessionOptions = struct {
-    /// Our channel number (§5.1 "sender channel"). Any value; only one
-    /// channel per connection is supported, so the default is fine.
+    /// Our channel number (§5.1 "sender channel") for a standalone
+    /// `Session.open`. A `Connection` numbers its channels itself.
     local_channel_id: u32 = 0,
     window_size: u32 = default_window_size,
     max_packet_size: u32 = default_max_packet_size,
@@ -204,24 +204,61 @@ pub const SessionOptions = struct {
     max_output: usize = default_max_output,
 };
 
-/// A client-side RFC 4254 §6.1 `"session"` channel.
+/// RFC 4254 §6.2 `pty-req`. `modes` is the encoded terminal-modes string
+/// (§8: opcode/uint32 pairs ending in TTY_OP_END = 0); the default asks for
+/// nothing beyond the server's defaults.
+pub const PtyOptions = struct {
+    term: []const u8 = "xterm",
+    cols: u32 = 80,
+    rows: u32 = 24,
+    width_px: u32 = 0,
+    height_px: u32 = 0,
+    modes: []const u8 = &.{0},
+};
+
+/// RFC 4254 §6.10 `exit-signal`: the remote command died on a signal.
+/// `name` is the signal without the "SIG" prefix ("TERM", "KILL", …).
+pub const ExitSignal = struct {
+    name_buf: [32]u8 = undefined,
+    name_len: u8 = 0,
+    core_dumped: bool = false,
+
+    pub fn name(self: *const ExitSignal) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// A client-side channel: an RFC 4254 §6.1 `"session"`, or a TCP/IP
+/// forwarding channel (§7.2 `direct-tcpip`, `forwarded-tcpip`) opened through
+/// a `Connection` — the same byte-stream API either way.
 ///
-/// Owns the collected `stdout`/`stderr` and the packet scratch; `deinit`
-/// frees them. Message handling funnels through `pumpOnce`, so a streaming
-/// caller (NETCONF over `subsystem`, say) can interleave `writeData` and
+/// Owns the collected `stdout`/`stderr`. Message handling funnels through
+/// `pumpOnce`, so a streaming caller (NETCONF over `subsystem`, an
+/// interactive shell, a forwarded TCP stream) can interleave `writeData` and
 /// `pumpOnce` and drain `stdout` itself, while the one-shot `exec` helper
-/// below just pumps to EOF.
+/// below just pumps to EOF. For a forwarding channel `stdout` is simply the
+/// bytes that came from the far end.
 pub const Session = struct {
     t: *transport.Transport,
     gpa: std.mem.Allocator,
+    /// Packet scratch: owned by a standalone session, borrowed from the
+    /// `Connection` otherwise.
     scratch: []u8,
     ch: ChannelState,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
     max_output: usize,
+    /// The multiplexer this channel belongs to, or `null` for a standalone
+    /// `Session.open` (one channel on the transport, as before).
+    conn: ?*Connection = null,
+    /// §6.10 `exit-signal`, once the peer has reported one.
+    exit_signal: ?ExitSignal = null,
+    open_failed: bool = false,
 
     /// RFC 4254 §5.1: send SSH_MSG_CHANNEL_OPEN `"session"` and wait for the
-    /// confirmation. Requires a transport that has completed userauth.
+    /// confirmation. Requires a transport that has completed userauth. The
+    /// channel is then the only one on `t`; to run several at once use a
+    /// `Connection`.
     pub fn open(
         t: *transport.Transport,
         gpa: std.mem.Allocator,
@@ -242,51 +279,44 @@ pub const Session = struct {
                 .local_max_packet = opts.max_packet_size,
             },
         };
-
-        var buf: [64]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
-        try messages.writeString(&w, "session");
-        try writeU32(&w, self.ch.local_id);
-        try writeU32(&w, self.ch.local_window);
-        try writeU32(&w, self.ch.local_max_packet);
-        try t.sendPacket(w.buffered());
-
-        while (true) {
-            const pkt = try t.recvPacket(scratch);
-            switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
-                .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
-                // OpenSSH sends `hostkeys-00@openssh.com` right after
-                // userauth, i.e. exactly here.
-                .SSH_MSG_GLOBAL_REQUEST => {
-                    var c = Cursor{ .b = pkt.payload[1..] };
-                    _ = try c.string();
-                    if (try c.boolean())
-                        try t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
-                    continue;
-                },
-                .SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
-                    var c = Cursor{ .b = pkt.payload[1..] };
-                    const recipient = try c.uint32();
-                    if (recipient != self.ch.local_id) return error.ChannelOpenFailed;
-                    self.ch.remote_id = try c.uint32();
-                    self.ch.remote_window = try c.uint32();
-                    self.ch.remote_max_packet = try c.uint32();
-                    if (self.ch.remote_max_packet == 0) return error.ChannelOpenFailed;
-                    self.ch.open = true;
-                    return self;
-                },
-                .SSH_MSG_CHANNEL_OPEN_FAILURE => return error.ChannelOpenFailed,
-                else => return error.ProtocolError,
+        try self.sendOpen("session", &.{});
+        while (!self.ch.open) {
+            switch (try self.pumpOnce()) {
+                .open_failed => return error.ChannelOpenFailed,
+                else => {},
             }
         }
+        return self;
     }
 
+    /// Free what the session holds. For a channel of a `Connection` this
+    /// also unregisters it and frees the `Session` itself (it was allocated
+    /// by the `Connection`); close it first if the peer is still talking.
     pub fn deinit(self: *Session) void {
         self.stdout.deinit(self.gpa);
         self.stderr.deinit(self.gpa);
+        if (self.conn) |c| {
+            c.unregister(self);
+            const gpa = self.gpa;
+            self.* = undefined;
+            gpa.destroy(self);
+            return;
+        }
         self.gpa.free(self.scratch);
         self.* = undefined;
+    }
+
+    fn sendOpen(self: *Session, kind: []const u8, extra: []const u8) ChannelError!void {
+        const buf = try self.gpa.alloc(u8, 64 + kind.len + extra.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+        try messages.writeString(&w, kind);
+        try writeU32(&w, self.ch.local_id);
+        try writeU32(&w, self.ch.local_window);
+        try writeU32(&w, self.ch.local_max_packet);
+        try w.writeAll(extra);
+        try self.t.sendPacket(w.buffered());
     }
 
     /// §6.5: SSH_MSG_CHANNEL_REQUEST `"exec"` with `want_reply = TRUE`,
@@ -304,19 +334,84 @@ pub const Session = struct {
         return self.request("subsystem", name);
     }
 
+    /// §6.5 `"shell"`: the user's login shell on this channel. Usually after
+    /// `requestPty`; then the channel is an interactive byte stream.
+    pub fn shell(self: *Session) ChannelError!void {
+        return self.requestRaw("shell", true, &.{});
+    }
+
+    /// §6.2 `"pty-req"`: a pseudo-terminal for this channel.
+    pub fn requestPty(self: *Session, opts: PtyOptions) ChannelError!void {
+        const buf = try self.gpa.alloc(u8, 32 + opts.term.len + opts.modes.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try messages.writeString(&w, opts.term);
+        try writeU32(&w, opts.cols);
+        try writeU32(&w, opts.rows);
+        try writeU32(&w, opts.width_px);
+        try writeU32(&w, opts.height_px);
+        try messages.writeString(&w, opts.modes);
+        return self.requestRaw("pty-req", true, w.buffered());
+    }
+
+    /// §6.4 `"env"`: one environment variable for the command or shell to
+    /// come. Servers refuse names they were not told to accept (OpenSSH's
+    /// `AcceptEnv`), which arrives as `error.ChannelRequestFailed`.
+    pub fn setEnv(self: *Session, name: []const u8, value: []const u8) ChannelError!void {
+        const buf = try self.gpa.alloc(u8, 16 + name.len + value.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try messages.writeString(&w, name);
+        try messages.writeString(&w, value);
+        return self.requestRaw("env", true, w.buffered());
+    }
+
+    /// §6.7 `"window-change"`: the terminal was resized (no reply).
+    pub fn windowChange(self: *Session, cols: u32, rows: u32, width_px: u32, height_px: u32) ChannelError!void {
+        var buf: [16]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeU32(&w, cols);
+        try writeU32(&w, rows);
+        try writeU32(&w, width_px);
+        try writeU32(&w, height_px);
+        return self.requestRaw("window-change", false, w.buffered());
+    }
+
+    /// §6.9 `"signal"`: deliver signal `name` (without "SIG": "TERM",
+    /// "INT", "KILL", …) to the remote command (no reply).
+    pub fn signal(self: *Session, name: []const u8) ChannelError!void {
+        var buf: [40]u8 = undefined;
+        if (name.len > 32) return error.ProtocolError;
+        var w: std.Io.Writer = .fixed(&buf);
+        try messages.writeString(&w, name);
+        return self.requestRaw("signal", false, w.buffered());
+    }
+
     /// Generic §5.4 channel request carrying a single `string` argument,
     /// with `want_reply = TRUE`.
     pub fn request(self: *Session, request_type: []const u8, argument: []const u8) ChannelError!void {
+        const buf = try self.gpa.alloc(u8, 8 + argument.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try messages.writeString(&w, argument);
+        return self.requestRaw(request_type, true, w.buffered());
+    }
+
+    /// §5.4 channel request with a caller-encoded type-specific payload.
+    /// With `want_reply` it waits for SSH_MSG_CHANNEL_SUCCESS (or returns
+    /// `error.ChannelRequestFailed`); without, it returns once sent.
+    pub fn requestRaw(self: *Session, request_type: []const u8, want_reply: bool, payload: []const u8) ChannelError!void {
         if (!self.ch.open or self.ch.sent_close or self.ch.got_close) return error.ChannelClosed;
 
-        const buf = try self.gpa.alloc(u8, 64 + request_type.len + argument.len);
+        const buf = try self.gpa.alloc(u8, 64 + request_type.len + payload.len);
         defer self.gpa.free(buf);
         var w: std.Io.Writer = .fixed(buf);
         try writeChannelHeader(&w, .SSH_MSG_CHANNEL_REQUEST, self.ch.remote_id);
         try messages.writeString(&w, request_type);
-        try w.writeByte(1); // want_reply
-        try messages.writeString(&w, argument);
+        try w.writeByte(@intFromBool(want_reply));
+        try w.writeAll(payload);
         try self.t.sendPacket(w.buffered());
+        if (!want_reply) return;
 
         // The reply may be preceded by data/window messages; `pumpOnce`
         // handles those and reports the verdict when it arrives.
@@ -390,30 +485,60 @@ pub const Session = struct {
         window_adjust,
         request_success,
         request_failure,
+        open_confirmed,
+        open_failed,
         /// A peer request we answered but that carried no payload of
-        /// interest (e.g. `exit-status`), or an ignorable message.
+        /// interest (e.g. `exit-status`), a message for another channel of
+        /// the same `Connection`, or an ignorable message.
         other,
     };
 
     /// Read and process exactly one incoming message. The streaming seam:
     /// data lands in `stdout`/`stderr`, windows are accounted for and topped
-    /// up, `exit-status` is recorded.
+    /// up, `exit-status` / `exit-signal` are recorded. On a `Connection`, the
+    /// message may belong to another of its channels: it is applied there and
+    /// this returns `.other`.
     pub fn pumpOnce(self: *Session) ChannelError!Event {
+        if (self.conn) |c| return c.pumpFor(self);
         const pkt = try self.t.recvPacket(self.scratch);
         const mt: messages.MessageType = @enumFromInt(msgType(pkt));
         switch (mt) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => return .other,
             .SSH_MSG_DISCONNECT => return error.ChannelClosed,
             .SSH_MSG_GLOBAL_REQUEST => {
-                // §4: answer any global request we do not implement.
-                var c = Cursor{ .b = pkt.payload[1..] };
-                _ = try c.string();
-                if (try c.boolean())
-                    try self.t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
+                try refuseGlobalRequest(self.t, pkt.payload);
                 return .other;
             },
+            .SSH_MSG_CHANNEL_OPEN => {
+                try refuseChannelOpen(self.t, pkt.payload);
+                return .other;
+            },
+            else => return self.handleChannelPacket(pkt.payload),
+        }
+    }
+
+    /// Apply one channel message (types 91-100) addressed to this channel.
+    fn handleChannelPacket(self: *Session, payload: []const u8) ChannelError!Event {
+        const mt: messages.MessageType = @enumFromInt(if (payload.len == 0) 0 else payload[0]);
+        var c = Cursor{ .b = payload[1..] };
+        switch (mt) {
+            .SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
+                const recipient = try c.uint32();
+                if (recipient != self.ch.local_id or self.ch.open) return error.ProtocolError;
+                self.ch.remote_id = try c.uint32();
+                self.ch.remote_window = try c.uint32();
+                self.ch.remote_max_packet = try c.uint32();
+                if (self.ch.remote_max_packet == 0) return error.ChannelOpenFailed;
+                self.ch.open = true;
+                return .open_confirmed;
+            },
+            .SSH_MSG_CHANNEL_OPEN_FAILURE => {
+                const recipient = try c.uint32();
+                if (recipient != self.ch.local_id or self.ch.open) return error.ProtocolError;
+                self.open_failed = true;
+                return .open_failed;
+            },
             .SSH_MSG_CHANNEL_WINDOW_ADJUST => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 const add = try c.uint32();
                 // §5.2 windows are 32-bit; saturate rather than wrap.
@@ -421,7 +546,6 @@ pub const Session = struct {
                 return .window_adjust;
             },
             .SSH_MSG_CHANNEL_DATA => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 const data = try c.string();
                 try self.ch.acceptData(data.len);
@@ -431,7 +555,6 @@ pub const Session = struct {
                 return .data;
             },
             .SSH_MSG_CHANNEL_EXTENDED_DATA => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 const code = try c.uint32();
                 const data = try c.string();
@@ -446,24 +569,30 @@ pub const Session = struct {
                 return .extended_data;
             },
             .SSH_MSG_CHANNEL_EOF => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 self.ch.got_eof = true;
                 return .eof;
             },
             .SSH_MSG_CHANNEL_CLOSE => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 self.ch.got_close = true;
                 return .closed;
             },
             .SSH_MSG_CHANNEL_REQUEST => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 const req = try c.string();
                 const want_reply = try c.boolean();
                 if (std.mem.eql(u8, req, "exit-status")) {
                     self.ch.exit_status = try c.uint32();
+                } else if (std.mem.eql(u8, req, "exit-signal")) {
+                    // §6.10: string signal name, boolean core dumped,
+                    // string error message, string language tag.
+                    const sig = try c.string();
+                    var es: ExitSignal = .{ .core_dumped = try c.boolean() };
+                    const n = @min(sig.len, es.name_buf.len);
+                    @memcpy(es.name_buf[0..n], sig[0..n]);
+                    es.name_len = @intCast(n);
+                    self.exit_signal = es;
                 } else if (want_reply) {
                     var buf: [8]u8 = undefined;
                     var w: std.Io.Writer = .fixed(&buf);
@@ -473,12 +602,10 @@ pub const Session = struct {
                 return .other;
             },
             .SSH_MSG_CHANNEL_SUCCESS => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 return .request_success;
             },
             .SSH_MSG_CHANNEL_FAILURE => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 try self.expectOurChannel(&c);
                 return .request_failure;
             },
@@ -493,6 +620,287 @@ pub const Session = struct {
         const recipient = try c.uint32();
         if (recipient != self.ch.local_id) return error.ChannelClosed;
         if (!self.ch.open) return error.ChannelClosed;
+    }
+};
+
+/// §4: answer a global request we do not implement (`want_reply` only).
+fn refuseGlobalRequest(t: *transport.Transport, payload: []const u8) ChannelError!void {
+    var c = Cursor{ .b = payload[1..] };
+    _ = try c.string();
+    if (try c.boolean())
+        try t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
+}
+
+/// §5.1: refuse a channel the peer opens towards us (an X11, agent or
+/// forwarded-tcpip channel we never asked for).
+fn refuseChannelOpen(t: *transport.Transport, payload: []const u8) ChannelError!void {
+    var c = Cursor{ .b = payload[1..] };
+    _ = try c.string();
+    const sender = try c.uint32();
+    try sendOpenFailure(t, sender, .administratively_prohibited, "not accepted by this client");
+}
+
+/// `direct-tcpip` (RFC 4254 §7.2): ask the server to connect to
+/// `host:port` and relay that TCP stream over a channel. `originator_*`
+/// tell it who asked (informational).
+pub const DirectTcpipOptions = struct {
+    host: []const u8,
+    port: u32,
+    originator_host: []const u8 = "127.0.0.1",
+    originator_port: u32 = 0,
+    session: SessionOptions = .{},
+};
+
+/// The remote address a `forwarded-tcpip` channel (RFC 4254 §7.2) arrived
+/// for, and who connected to it.
+pub const ForwardedOrigin = struct {
+    connected_port: u32,
+    originator_port: u32,
+};
+
+/// A client-side channel multiplexer (RFC 4254 §5): several channels on one
+/// authenticated transport — sessions run side by side, TCP/IP forwarding
+/// in both directions. Every packet is read through the `Connection` and
+/// applied to the channel it names, whichever channel's call is pumping.
+///
+///     var conn = try ssh.connection.Connection.init(&t, gpa);
+///     defer conn.deinit();
+///     const a = try conn.openSession(.{});
+///     defer a.deinit();
+///     const b = try conn.openSession(.{});
+///     defer b.deinit();
+///     try a.exec("make"); try b.exec("tail -f log");
+///
+/// Channels it opens are heap-allocated `Session`s; `Session.deinit` frees
+/// one. Single-owner like the transport under it.
+pub const Connection = struct {
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    channels: std.ArrayList(*Session) = .empty,
+    next_id: u32 = 0,
+    /// `forwarded-tcpip` channels the server opened for a remote forward we
+    /// requested, waiting for `acceptForwarded`.
+    forwarded: std.ArrayList(*Session) = .empty,
+    forwarded_origin: std.ArrayList(ForwardedOrigin) = .empty,
+    /// Remote forwards granted and not cancelled (incoming
+    /// `forwarded-tcpip` is accepted only while this is non-zero).
+    remote_forwards: u32 = 0,
+    /// Replies to our global requests (§4), in order.
+    global_reply: ?GlobalReply = null,
+    window_size: u32 = default_window_size,
+    max_packet_size: u32 = default_max_packet_size,
+
+    const GlobalReply = struct { ok: bool, port: ?u32 };
+
+    pub fn init(t: *transport.Transport, gpa: std.mem.Allocator) std.mem.Allocator.Error!Connection {
+        return .{ .t = t, .gpa = gpa, .scratch = try gpa.alloc(u8, scratch_len) };
+    }
+
+    /// Frees the multiplexer. Channels still registered are freed too
+    /// (without telling the peer); deinit them first to close them properly.
+    pub fn deinit(self: *Connection) void {
+        while (self.channels.items.len > 0) self.channels.items[self.channels.items.len - 1].deinit();
+        self.channels.deinit(self.gpa);
+        self.forwarded.deinit(self.gpa);
+        self.forwarded_origin.deinit(self.gpa);
+        self.gpa.free(self.scratch);
+        self.* = undefined;
+    }
+
+    fn newChannel(self: *Connection, opts: SessionOptions) ChannelError!*Session {
+        const s = try self.gpa.create(Session);
+        errdefer self.gpa.destroy(s);
+        s.* = .{
+            .t = self.t,
+            .gpa = self.gpa,
+            .scratch = self.scratch,
+            .max_output = opts.max_output,
+            .conn = self,
+            .ch = .{
+                .local_id = self.next_id,
+                .local_window = opts.window_size,
+                .local_window_initial = opts.window_size,
+                .local_max_packet = opts.max_packet_size,
+            },
+        };
+        self.next_id +%= 1;
+        try self.channels.append(self.gpa, s);
+        return s;
+    }
+
+    fn unregister(self: *Connection, s: *Session) void {
+        for (self.channels.items, 0..) |x, i| if (x == s) {
+            _ = self.channels.swapRemove(i);
+            break;
+        };
+        for (self.forwarded.items, 0..) |x, i| if (x == s) {
+            _ = self.forwarded.orderedRemove(i);
+            _ = self.forwarded_origin.orderedRemove(i);
+            break;
+        };
+    }
+
+    fn openChannel(self: *Connection, kind: []const u8, extra: []const u8, opts: SessionOptions) ChannelError!*Session {
+        const s = try self.newChannel(opts);
+        errdefer s.deinit();
+        try s.sendOpen(kind, extra);
+        while (!s.ch.open) {
+            if (s.open_failed) return error.ChannelOpenFailed;
+            _ = try self.pumpFor(s);
+        }
+        return s;
+    }
+
+    /// RFC 4254 §6.1: open another `"session"` channel.
+    pub fn openSession(self: *Connection, opts: SessionOptions) ChannelError!*Session {
+        return self.openChannel("session", &.{}, opts);
+    }
+
+    /// RFC 4254 §7.2 `direct-tcpip` ("local forwarding", `ssh -L`): the
+    /// server connects to `opts.host:opts.port`; the returned channel carries
+    /// that TCP stream (`writeData` / `stdout`, EOF both ways).
+    pub fn openDirectTcpip(self: *Connection, opts: DirectTcpipOptions) ChannelError!*Session {
+        const buf = try self.gpa.alloc(u8, 32 + opts.host.len + opts.originator_host.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try messages.writeString(&w, opts.host);
+        try writeU32(&w, opts.port);
+        try messages.writeString(&w, opts.originator_host);
+        try writeU32(&w, opts.originator_port);
+        return self.openChannel("direct-tcpip", w.buffered(), opts.session);
+    }
+
+    /// RFC 4254 §7.1 `tcpip-forward` ("remote forwarding", `ssh -R`): ask
+    /// the server to listen on `bind_address:port` and open a
+    /// `forwarded-tcpip` channel to us for every connection
+    /// (`acceptForwarded`). `port` 0 lets the server pick; the port actually
+    /// bound is returned.
+    pub fn requestRemoteForward(self: *Connection, bind_address: []const u8, port: u32) ChannelError!u32 {
+        const reply = try self.globalRequest("tcpip-forward", bind_address, port);
+        if (!reply.ok) return error.ChannelRequestFailed;
+        self.remote_forwards += 1;
+        return reply.port orelse port;
+    }
+
+    /// RFC 4254 §7.1 `cancel-tcpip-forward`.
+    pub fn cancelRemoteForward(self: *Connection, bind_address: []const u8, port: u32) ChannelError!void {
+        const reply = try self.globalRequest("cancel-tcpip-forward", bind_address, port);
+        if (!reply.ok) return error.ChannelRequestFailed;
+        self.remote_forwards -|= 1;
+    }
+
+    fn globalRequest(self: *Connection, name: []const u8, address: []const u8, port: u32) ChannelError!GlobalReply {
+        const buf = try self.gpa.alloc(u8, 32 + name.len + address.len);
+        defer self.gpa.free(buf);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_GLOBAL_REQUEST));
+        try messages.writeString(&w, name);
+        try w.writeByte(1); // want_reply
+        try messages.writeString(&w, address);
+        try writeU32(&w, port);
+        self.global_reply = null;
+        try self.t.sendPacket(w.buffered());
+        while (self.global_reply == null) _ = try self.pumpFor(null);
+        const r = self.global_reply.?;
+        self.global_reply = null;
+        return r;
+    }
+
+    /// The next `forwarded-tcpip` channel the server opened for a remote
+    /// forward (pumping until one arrives), with where it came from.
+    pub fn acceptForwarded(self: *Connection) ChannelError!struct { session: *Session, origin: ForwardedOrigin } {
+        while (self.forwarded.items.len == 0) _ = try self.pumpFor(null);
+        const s = self.forwarded.orderedRemove(0);
+        const o = self.forwarded_origin.orderedRemove(0);
+        return .{ .session = s, .origin = o };
+    }
+
+    /// Read and apply one message; the event is reported only if it
+    /// concerns `target` (`.other` otherwise).
+    fn pumpFor(self: *Connection, target: ?*Session) ChannelError!Session.Event {
+        const pkt = try self.t.recvPacket(self.scratch);
+        const mt: messages.MessageType = @enumFromInt(msgType(pkt));
+        switch (mt) {
+            .SSH_MSG_DISCONNECT => return error.ChannelClosed,
+            .SSH_MSG_GLOBAL_REQUEST => {
+                try refuseGlobalRequest(self.t, pkt.payload);
+                return .other;
+            },
+            .SSH_MSG_REQUEST_SUCCESS => {
+                var c = Cursor{ .b = pkt.payload[1..] };
+                // §7.1: a `tcpip-forward` for port 0 answers the port bound.
+                self.global_reply = .{ .ok = true, .port = c.uint32() catch null };
+                return .other;
+            },
+            .SSH_MSG_REQUEST_FAILURE => {
+                self.global_reply = .{ .ok = false, .port = null };
+                return .other;
+            },
+            .SSH_MSG_CHANNEL_OPEN => {
+                try self.peerOpen(pkt.payload);
+                return .other;
+            },
+            .SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+            .SSH_MSG_CHANNEL_OPEN_FAILURE,
+            .SSH_MSG_CHANNEL_WINDOW_ADJUST,
+            .SSH_MSG_CHANNEL_DATA,
+            .SSH_MSG_CHANNEL_EXTENDED_DATA,
+            .SSH_MSG_CHANNEL_EOF,
+            .SSH_MSG_CHANNEL_CLOSE,
+            .SSH_MSG_CHANNEL_REQUEST,
+            .SSH_MSG_CHANNEL_SUCCESS,
+            .SSH_MSG_CHANNEL_FAILURE,
+            => {
+                var c = Cursor{ .b = pkt.payload[1..] };
+                const recipient = try c.uint32();
+                const s = self.find(recipient) orelse return error.ChannelClosed;
+                const ev = try s.handleChannelPacket(pkt.payload);
+                return if (target == s) ev else .other;
+            },
+            else => return error.ProtocolError,
+        }
+    }
+
+    fn find(self: *Connection, local_id: u32) ?*Session {
+        for (self.channels.items) |s| if (s.ch.local_id == local_id) return s;
+        return null;
+    }
+
+    /// The server opens a channel towards us: `forwarded-tcpip` for a remote
+    /// forward we hold is accepted and queued; anything else is refused.
+    fn peerOpen(self: *Connection, payload: []const u8) ChannelError!void {
+        var c = Cursor{ .b = payload[1..] };
+        const kind = try c.string();
+        const sender = try c.uint32();
+        const window = try c.uint32();
+        const max_packet = try c.uint32();
+        if (!std.mem.eql(u8, kind, "forwarded-tcpip") or self.remote_forwards == 0) {
+            return sendOpenFailure(self.t, sender, .administratively_prohibited, "not accepted by this client");
+        }
+        if (max_packet == 0) return sendOpenFailure(self.t, sender, .connect_failed, "zero maximum packet size");
+        _ = try c.string(); // address that was connected
+        const connected_port = try c.uint32();
+        _ = try c.string(); // originator address
+        const originator_port = try c.uint32();
+
+        const s = try self.newChannel(.{ .window_size = self.window_size, .max_packet_size = self.max_packet_size });
+        errdefer s.deinit();
+        s.ch.remote_id = sender;
+        s.ch.remote_window = window;
+        s.ch.remote_max_packet = max_packet;
+        s.ch.open = true;
+        try self.forwarded.append(self.gpa, s);
+        errdefer _ = self.forwarded.pop();
+        try self.forwarded_origin.append(self.gpa, .{ .connected_port = connected_port, .originator_port = originator_port });
+
+        var buf: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeChannelHeader(&w, .SSH_MSG_CHANNEL_OPEN_CONFIRMATION, sender);
+        try writeU32(&w, s.ch.local_id);
+        try writeU32(&w, s.ch.local_window);
+        try writeU32(&w, s.ch.local_max_packet);
+        try self.t.sendPacket(w.buffered());
     }
 };
 
@@ -547,9 +955,41 @@ pub fn exec(
     };
 }
 
-// ── server: serve one session channel ──────────────────────────────────────
+// ── server: session channels ───────────────────────────────────────────────
 
 pub const CommandError = std.mem.Allocator.Error || error{CommandFailed};
+
+/// §6.2 `pty-req` as the client sent it.
+pub const PtyInfo = struct {
+    term_buf: [64]u8 = undefined,
+    term_len: u8 = 0,
+    cols: u32 = 0,
+    rows: u32 = 0,
+    width_px: u32 = 0,
+    height_px: u32 = 0,
+
+    pub fn term(self: *const PtyInfo) []const u8 {
+        return self.term_buf[0..self.term_len];
+    }
+};
+
+/// One §6.4 `env` variable a client set and `ServeConfig.accept_env` let
+/// through.
+pub const EnvVar = struct { name: []const u8, value: []const u8 };
+
+/// Everything a handler may want to know about the request it serves —
+/// what `CommandHandler.runInfoFn` receives. Borrowed for the call.
+pub const RequestInfo = struct {
+    user: []const u8,
+    kind: enum { exec, subsystem, shell },
+    /// The command line (`exec`), the subsystem name, or empty (`shell`).
+    command: []const u8,
+    /// The pseudo-terminal the client asked for on this channel, if any.
+    pty: ?PtyInfo,
+    env: []const EnvVar,
+    /// Our number for the channel (distinct per concurrent channel).
+    channel: u32,
+};
 
 /// Server policy hook: run `command` for `user`, appending output to
 /// `stdout`/`stderr`, and return the exit status the client will see in the
@@ -567,12 +1007,16 @@ pub const CommandError = std.mem.Allocator.Error || error{CommandFailed};
 /// (or two virtual hosts) has nowhere but a global to keep what the handler
 /// dispatches on. Leave it at `transport.no_context` for a stateless handler.
 ///
+/// Set `runFn` (user and command only) or `runInfoFn` (the whole
+/// `RequestInfo`: request kind, pty, accepted environment, channel); with
+/// both set, `runInfoFn` wins.
+///
 /// A reason for refusing is already expressible here and needs no separate
 /// channel: that is exactly what the returned exit status and `stderr` are,
 /// and RFC 4254 §6.10 delivers both to the client.
 pub const CommandHandler = struct {
     ctx: *anyopaque = transport.no_context,
-    runFn: *const fn (
+    runFn: ?*const fn (
         ctx: *anyopaque,
         gpa: std.mem.Allocator,
         user: []const u8,
@@ -580,7 +1024,15 @@ pub const CommandHandler = struct {
         stdin: []const u8,
         stdout: *std.ArrayList(u8),
         stderr: *std.ArrayList(u8),
-    ) CommandError!u32,
+    ) CommandError!u32 = null,
+    runInfoFn: ?*const fn (
+        ctx: *anyopaque,
+        gpa: std.mem.Allocator,
+        info: *const RequestInfo,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        stderr: *std.ArrayList(u8),
+    ) CommandError!u32 = null,
 
     pub fn run(
         self: CommandHandler,
@@ -591,7 +1043,21 @@ pub const CommandHandler = struct {
         stdout: *std.ArrayList(u8),
         stderr: *std.ArrayList(u8),
     ) CommandError!u32 {
-        return self.runFn(self.ctx, gpa, user, command, stdin, stdout, stderr);
+        const info: RequestInfo = .{ .user = user, .kind = .exec, .command = command, .pty = null, .env = &.{}, .channel = 0 };
+        return self.runInfo(gpa, &info, stdin, stdout, stderr);
+    }
+
+    pub fn runInfo(
+        self: CommandHandler,
+        gpa: std.mem.Allocator,
+        info: *const RequestInfo,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        stderr: *std.ArrayList(u8),
+    ) CommandError!u32 {
+        if (self.runInfoFn) |f| return f(self.ctx, gpa, info, stdin, stdout, stderr);
+        if (self.runFn) |f| return f(self.ctx, gpa, info.user, info.command, stdin, stdout, stderr);
+        return error.CommandFailed;
     }
 };
 
@@ -637,6 +1103,22 @@ pub const ServeConfig = struct {
     exec: ?CommandHandler = null,
     /// Handler for §6.5 `"subsystem"` (`command` is the subsystem name).
     subsystem: ?CommandHandler = null,
+    /// Handler for §6.5 `"shell"` (`command` is empty). `null` → refused.
+    /// The handler is one-shot like the others, so a "shell" here is batch:
+    /// with the default `stdin_mode` it sees everything the client typed
+    /// once the client sends EOF.
+    shell: ?CommandHandler = null,
+    /// Accept §6.2 `"pty-req"` (recorded and handed to the handler in
+    /// `RequestInfo.pty`; nothing here allocates a terminal). Without it a
+    /// `ssh -t` client is told SSH_MSG_CHANNEL_FAILURE and goes on without one.
+    allow_pty: bool = true,
+    /// §6.4 `"env"` names to accept (exact, or a prefix ending in `*`, like
+    /// OpenSSH's `AcceptEnv`); everything else is refused, the OpenSSH
+    /// default. Accepted variables reach the handler in `RequestInfo.env`.
+    accept_env: []const []const u8 = &.{},
+    /// Concurrent session channels `serveConnection` serves (§5.1); one more
+    /// is refused with `resource_shortage`. `serveSession` serves one.
+    max_sessions: u32 = 8,
     /// Restricts which subsystem NAMES `subsystem` is offered for
     /// (A1/examples/ssh.md S3b). Today's request dispatch below only looks
     /// at the request TYPE ("exec" vs "subsystem") — once `subsystem` is
@@ -683,12 +1165,14 @@ pub const ServeConfig = struct {
 
 /// Server: accept and serve exactly one `"session"` channel, then return.
 ///
-/// Handles §5.1 open (rejecting any channel type other than `"session"`,
-/// and any second channel, with SSH_MSG_CHANNEL_OPEN_FAILURE), buffers the
-/// client's stdin with full window accounting, runs `config.exec` /
-/// `config.subsystem` on the matching request, streams the result back as
-/// CHANNEL_DATA / CHANNEL_EXTENDED_DATA (respecting the client's window and
-/// maximum packet size), then sends `exit-status`, EOF and CLOSE.
+/// `serveConnection` with `max_sessions = 1` that returns once that channel
+/// is closed both ways: §5.1 open (rejecting any channel type other than
+/// `"session"`, and any second concurrent channel, with
+/// SSH_MSG_CHANNEL_OPEN_FAILURE), stdin buffered with full window
+/// accounting, `config.exec` / `config.subsystem` / `config.shell` run on the
+/// matching request, the result streamed back as CHANNEL_DATA /
+/// CHANNEL_EXTENDED_DATA (respecting the client's window and maximum packet
+/// size), then `exit-status`, EOF and CLOSE.
 ///
 /// Returns when the channel is closed both ways, or on SSH_MSG_DISCONNECT.
 pub fn serveSession(
@@ -696,175 +1180,435 @@ pub fn serveSession(
     gpa: std.mem.Allocator,
     config: ServeConfig,
 ) ChannelError!void {
-    const scratch = try gpa.alloc(u8, scratch_len);
-    defer gpa.free(scratch);
+    var cfg = config;
+    cfg.max_sessions = 1;
+    var srv = try Server.init(t, gpa, cfg, .first_channel);
+    defer srv.deinit();
+    return srv.run();
+}
 
-    var ch = ChannelState{
-        .local_id = 0,
-        .local_window = config.window_size,
-        .local_window_initial = config.window_size,
-        .local_max_packet = config.max_packet_size,
+/// Server: serve session channels (RFC 4254 §6) until the client
+/// disconnects — up to `config.max_sessions` at once, each running its
+/// handler on its own request. While one channel's output waits for window
+/// space, the others' messages are still read and applied; a handler that
+/// becomes runnable meanwhile runs next.
+///
+/// Returns on SSH_MSG_DISCONNECT, or when the client hangs up with no
+/// channel left open.
+pub fn serveConnection(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    config: ServeConfig,
+) ChannelError!void {
+    var srv = try Server.init(t, gpa, config, .until_disconnect);
+    defer srv.deinit();
+    return srv.run();
+}
+
+/// One server-side channel's state beyond the §5 flow control.
+const ServerChannel = struct {
+    ch: ChannelState,
+    stdin: std.ArrayList(u8) = .empty,
+    /// A request was accepted on this channel (only one per channel, §6.5).
+    ran: bool = false,
+    /// Accepted request waiting to run (see `ServeConfig.stdin_mode`), or
+    /// ready to run now.
+    pending: ?Pending = null,
+    pty: ?PtyInfo = null,
+    env: std.ArrayList(EnvVar) = .empty,
+
+    const Pending = struct {
+        handler: CommandHandler,
+        kind: @FieldType(RequestInfo, "kind"),
+        command: []u8,
+        ready: bool,
     };
-    var stdin: std.ArrayList(u8) = .empty;
-    defer stdin.deinit(gpa);
-    var ran = false;
-    // A request accepted but not yet run (waiting for the client's EOF, see
-    // `ServeConfig.stdin_mode`). The command is copied out of the packet
-    // scratch, which the next `recvPacket` overwrites.
-    var pending: ?struct { handler: CommandHandler, command: []u8 } = null;
-    defer if (pending) |p| gpa.free(p.command);
 
-    while (true) {
-        const pkt = t.recvPacket(scratch) catch |e| {
-            // Our exit-status, EOF and CLOSE are out: the session is over
-            // from the client's side too, and a client may hang up instead
-            // of answering CLOSE — OpenSSH does when a re-exchange it
-            // started is still pending at that point (it queues its CLOSE
-            // behind the exchange and exits).
-            if (ch.sent_close and hungUp(e)) return;
-            return e;
-        };
-        const mt: messages.MessageType = @enumFromInt(msgType(pkt));
+    fn deinit(sc: *ServerChannel, gpa: std.mem.Allocator) void {
+        sc.stdin.deinit(gpa);
+        if (sc.pending) |p| gpa.free(p.command);
+        for (sc.env.items) |e| {
+            gpa.free(e.name);
+            gpa.free(e.value);
+        }
+        sc.env.deinit(gpa);
+    }
+
+    fn done(sc: *const ServerChannel) bool {
+        return sc.ch.got_close and sc.ch.sent_close;
+    }
+};
+
+const Server = struct {
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    config: ServeConfig,
+    mode: enum { first_channel, until_disconnect },
+    scratch: []u8,
+    channels: std.ArrayList(*ServerChannel) = .empty,
+    next_id: u32 = 0,
+    /// `serveSession`: the one channel has been opened (and maybe finished).
+    served_one: bool = false,
+    disconnected: bool = false,
+
+    fn init(t: *transport.Transport, gpa: std.mem.Allocator, config: ServeConfig, mode: @FieldType(Server, "mode")) ChannelError!Server {
+        return .{ .t = t, .gpa = gpa, .config = config, .mode = mode, .scratch = try gpa.alloc(u8, scratch_len) };
+    }
+
+    fn deinit(srv: *Server) void {
+        for (srv.channels.items) |sc| {
+            sc.deinit(srv.gpa);
+            srv.gpa.destroy(sc);
+        }
+        srv.channels.deinit(srv.gpa);
+        srv.gpa.free(srv.scratch);
+    }
+
+    fn run(srv: *Server) ChannelError!void {
+        while (true) {
+            if (srv.nextReady()) |sc| {
+                try srv.runPending(sc);
+                continue;
+            }
+            srv.sweep();
+            if (srv.disconnected) return;
+            if (srv.mode == .first_channel and srv.served_one and srv.channels.items.len == 0) return;
+
+            const pkt = srv.t.recvPacket(srv.scratch) catch |e| {
+                // The client may hang up instead of answering our CLOSE —
+                // OpenSSH does when a re-exchange it started is still
+                // pending at that point (it queues its CLOSE behind the
+                // exchange and exits).
+                if (hungUp(e) and srv.allClosedByUs()) return;
+                return e;
+            };
+            try srv.dispatch(pkt.payload);
+        }
+    }
+
+    /// Every open channel has had our CLOSE (nothing left to deliver).
+    fn allClosedByUs(srv: *const Server) bool {
+        if (srv.mode == .first_channel and !srv.served_one) return false;
+        for (srv.channels.items) |sc| if (!sc.ch.sent_close) return false;
+        return true;
+    }
+
+    fn nextReady(srv: *Server) ?*ServerChannel {
+        for (srv.channels.items) |sc| {
+            if (sc.pending) |p| if (p.ready and !sc.ch.sent_close) return sc;
+        }
+        return null;
+    }
+
+    /// Free channels closed both ways.
+    fn sweep(srv: *Server) void {
+        var i: usize = 0;
+        while (i < srv.channels.items.len) {
+            const sc = srv.channels.items[i];
+            if (sc.done()) {
+                sc.deinit(srv.gpa);
+                srv.gpa.destroy(sc);
+                _ = srv.channels.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    fn find(srv: *Server, c: *Cursor) ChannelError!*ServerChannel {
+        const recipient = try c.uint32();
+        for (srv.channels.items) |sc| {
+            if (sc.ch.local_id == recipient) {
+                if (!sc.ch.open or sc.ch.got_close) return error.ChannelClosed;
+                return sc;
+            }
+        }
+        return error.ChannelClosed;
+    }
+
+    fn activeSessions(srv: *const Server) usize {
+        var n: usize = 0;
+        for (srv.channels.items) |sc| {
+            if (!sc.done()) n += 1;
+        }
+        return n;
+    }
+
+    fn refuseOpen(srv: *Server, kind: []const u8, sender: u32, reason: messages.ChannelOpenFailureReason, desc: []const u8) ChannelError!void {
+        try sendOpenFailure(srv.t, sender, reason, desc);
+        if (srv.config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
+    }
+
+    /// Apply one packet from the client. Never runs a handler (that is
+    /// `run`'s job), so it is safe to call while another channel's output
+    /// is waiting for window space.
+    fn dispatch(srv: *Server, payload: []const u8) ChannelError!void {
+        const mt: messages.MessageType = @enumFromInt(if (payload.len == 0) 0 else payload[0]);
+        var c = Cursor{ .b = payload[1..] };
         switch (mt) {
-            .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
-            .SSH_MSG_DISCONNECT => return,
-            .SSH_MSG_GLOBAL_REQUEST => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                _ = try c.string();
-                if (try c.boolean())
-                    try t.sendPacket(&[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_REQUEST_FAILURE)});
-            },
+            .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => {},
+            .SSH_MSG_DISCONNECT => srv.disconnected = true,
+            .SSH_MSG_GLOBAL_REQUEST => try refuseGlobalRequest(srv.t, payload),
             .SSH_MSG_CHANNEL_OPEN => {
-                var c = Cursor{ .b = pkt.payload[1..] };
                 const kind = try c.string();
                 const sender = try c.uint32();
                 const window = try c.uint32();
                 const max_packet = try c.uint32();
-                if (ch.open or ch.got_close) {
-                    const reason: messages.ChannelOpenFailureReason = .resource_shortage;
-                    const desc = "only one session channel is supported";
-                    try sendOpenFailure(t, sender, reason, desc);
-                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
-                    continue;
+                if (srv.activeSessions() >= srv.config.max_sessions or
+                    (srv.mode == .first_channel and srv.served_one))
+                {
+                    return srv.refuseOpen(kind, sender, .resource_shortage, if (srv.config.max_sessions == 1)
+                        "only one session channel is supported"
+                    else
+                        "too many session channels");
                 }
                 if (!std.mem.eql(u8, kind, "session")) {
-                    const reason: messages.ChannelOpenFailureReason = .unknown_channel_type;
-                    const desc = "only \"session\" channels are supported";
-                    try sendOpenFailure(t, sender, reason, desc);
-                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
-                    continue;
+                    return srv.refuseOpen(kind, sender, .unknown_channel_type, "only \"session\" channels are supported");
                 }
                 if (max_packet == 0) {
-                    const reason: messages.ChannelOpenFailureReason = .connect_failed;
-                    const desc = "zero maximum packet size";
-                    try sendOpenFailure(t, sender, reason, desc);
-                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
-                    continue;
+                    return srv.refuseOpen(kind, sender, .connect_failed, "zero maximum packet size");
                 }
-                ch.remote_id = sender;
-                ch.remote_window = window;
-                ch.remote_max_packet = max_packet;
-                ch.open = true;
+                const sc = try srv.gpa.create(ServerChannel);
+                errdefer srv.gpa.destroy(sc);
+                sc.* = .{ .ch = .{
+                    .local_id = srv.next_id,
+                    .local_window = srv.config.window_size,
+                    .local_window_initial = srv.config.window_size,
+                    .local_max_packet = srv.config.max_packet_size,
+                    .remote_id = sender,
+                    .remote_window = window,
+                    .remote_max_packet = max_packet,
+                    .open = true,
+                } };
+                try srv.channels.append(srv.gpa, sc);
+                srv.next_id +%= 1;
+                srv.served_one = true;
 
                 var buf: [32]u8 = undefined;
                 var w: std.Io.Writer = .fixed(&buf);
-                try writeChannelHeader(&w, .SSH_MSG_CHANNEL_OPEN_CONFIRMATION, ch.remote_id);
-                try writeU32(&w, ch.local_id);
-                try writeU32(&w, ch.local_window);
-                try writeU32(&w, ch.local_max_packet);
-                try t.sendPacket(w.buffered());
+                try writeChannelHeader(&w, .SSH_MSG_CHANNEL_OPEN_CONFIRMATION, sc.ch.remote_id);
+                try writeU32(&w, sc.ch.local_id);
+                try writeU32(&w, sc.ch.local_window);
+                try writeU32(&w, sc.ch.local_max_packet);
+                try srv.t.sendPacket(w.buffered());
             },
             .SSH_MSG_CHANNEL_WINDOW_ADJUST => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
-                ch.remote_window +|= try c.uint32();
+                const sc = try srv.find(&c);
+                sc.ch.remote_window +|= try c.uint32();
             },
             .SSH_MSG_CHANNEL_DATA => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
+                const sc = try srv.find(&c);
                 const data = try c.string();
-                try ch.acceptData(data.len);
-                if (stdin.items.len + data.len > config.max_input) return error.OutputTooLarge;
-                try stdin.appendSlice(gpa, data);
-                try maybeAdjustWindow(t, &ch);
+                try sc.ch.acceptData(data.len);
+                if (sc.stdin.items.len + data.len > srv.config.max_input) return error.OutputTooLarge;
+                try sc.stdin.appendSlice(srv.gpa, data);
+                try maybeAdjustWindow(srv.t, &sc.ch);
             },
             .SSH_MSG_CHANNEL_EXTENDED_DATA => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
+                const sc = try srv.find(&c);
                 _ = try c.uint32();
                 const data = try c.string();
-                try ch.acceptData(data.len);
-                try maybeAdjustWindow(t, &ch);
+                try sc.ch.acceptData(data.len);
+                try maybeAdjustWindow(srv.t, &sc.ch);
             },
             .SSH_MSG_CHANNEL_EOF => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
-                ch.got_eof = true;
+                const sc = try srv.find(&c);
+                sc.ch.got_eof = true;
                 // stdin is complete — now the handler can see all of it.
-                if (pending) |p| {
-                    defer gpa.free(p.command);
-                    pending = null;
-                    try runCommand(t, gpa, &ch, config, p.handler, p.command, stdin.items, scratch);
-                }
+                if (sc.pending) |*p| p.ready = true;
             },
             .SSH_MSG_CHANNEL_CLOSE => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
-                ch.got_close = true;
-                try sendCloseMsg(t, &ch);
-                return;
+                const sc = try srv.find(&c);
+                sc.ch.got_close = true;
+                try sendCloseMsg(srv.t, &sc.ch);
             },
             .SSH_MSG_CHANNEL_REQUEST => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                try expectChannel(&ch, &c);
+                const sc = try srv.find(&c);
                 // We have already torn our side down: a request now cannot
                 // be served (RFC 4254 §5.3 — after CLOSE only the peer's
                 // CLOSE is still expected).
-                if (ch.sent_close) return error.ChannelClosed;
+                if (sc.ch.sent_close) return error.ChannelClosed;
                 const req = try c.string();
                 const want_reply = try c.boolean();
-
-                const handler: ?CommandHandler = if (std.mem.eql(u8, req, "exec"))
-                    config.exec
-                else if (std.mem.eql(u8, req, "subsystem"))
-                    config.subsystem
-                else
-                    null;
-
-                if (handler == null or ran) {
-                    // pty-req / shell / env / signal / window-change and a
-                    // second exec on the same channel all land here.
-                    if (want_reply) try sendChannelReply(t, &ch, false);
-                    continue;
-                }
-                const command = try c.string();
-                // S3b: for "subsystem", `command` is the requested NAME, not
-                // a command line. An empty `subsystem_names` (the default)
-                // accepts any name, same as before this field existed; a
-                // non-empty one rejects a name not on it right here, before
-                // SSH_MSG_CHANNEL_SUCCESS ever goes out.
-                if (std.mem.eql(u8, req, "subsystem") and config.subsystem_names.len > 0 and
-                    !nameInList(config.subsystem_names, command))
-                {
-                    if (want_reply) try sendChannelReply(t, &ch, false);
-                    continue;
-                }
-                if (want_reply) try sendChannelReply(t, &ch, true);
-                ran = true;
-                switch (config.stdin_mode) {
-                    .ignore => try runCommand(t, gpa, &ch, config, handler.?, command, &.{}, scratch),
-                    .collect_until_eof => {
-                        if (ch.got_eof) {
-                            try runCommand(t, gpa, &ch, config, handler.?, command, stdin.items, scratch);
-                        } else {
-                            pending = .{ .handler = handler.?, .command = try gpa.dupe(u8, command) };
-                        }
-                    },
-                }
+                try srv.channelRequest(sc, req, want_reply, &c);
             },
             else => return error.ProtocolError,
         }
     }
+
+    fn channelRequest(srv: *Server, sc: *ServerChannel, req: []const u8, want_reply: bool, c: *Cursor) ChannelError!void {
+        const gpa = srv.gpa;
+        if (std.mem.eql(u8, req, "pty-req")) {
+            if (!srv.config.allow_pty or sc.ran) {
+                if (want_reply) try sendChannelReply(srv.t, &sc.ch, false);
+                return;
+            }
+            const term = try c.string();
+            var pty: PtyInfo = .{
+                .cols = try c.uint32(),
+                .rows = try c.uint32(),
+                .width_px = try c.uint32(),
+                .height_px = try c.uint32(),
+            };
+            _ = try c.string(); // encoded terminal modes (§8): nothing here to apply them to
+            const n = @min(term.len, pty.term_buf.len);
+            @memcpy(pty.term_buf[0..n], term[0..n]);
+            pty.term_len = @intCast(n);
+            sc.pty = pty;
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, true);
+            return;
+        }
+        if (std.mem.eql(u8, req, "env")) {
+            const name = try c.string();
+            const value = try c.string();
+            const ok = !sc.ran and sc.env.items.len < max_env_vars and envAccepted(srv.config.accept_env, name);
+            if (ok) {
+                const n = try gpa.dupe(u8, name);
+                errdefer gpa.free(n);
+                const v = try gpa.dupe(u8, value);
+                errdefer gpa.free(v);
+                try sc.env.append(gpa, .{ .name = n, .value = v });
+            }
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, ok);
+            return;
+        }
+        if (std.mem.eql(u8, req, "window-change")) {
+            // §6.7: never `want_reply`; the new size is recorded for a
+            // handler that has not run yet.
+            if (sc.pty) |*pty| {
+                pty.cols = try c.uint32();
+                pty.rows = try c.uint32();
+                pty.width_px = try c.uint32();
+                pty.height_px = try c.uint32();
+            }
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, sc.pty != null);
+            return;
+        }
+
+        const kind: @FieldType(RequestInfo, "kind") = if (std.mem.eql(u8, req, "exec"))
+            .exec
+        else if (std.mem.eql(u8, req, "subsystem"))
+            .subsystem
+        else if (std.mem.eql(u8, req, "shell"))
+            .shell
+        else {
+            // signal / xon-xoff / x11-req / auth-agent-req / keepalive and
+            // anything else: a one-shot handler has nothing to deliver a
+            // signal to, and the rest are not implemented.
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, false);
+            return;
+        };
+        const handler: ?CommandHandler = switch (kind) {
+            .exec => srv.config.exec,
+            .subsystem => srv.config.subsystem,
+            .shell => srv.config.shell,
+        };
+        if (handler == null or sc.ran) {
+            // A second exec/shell on the same channel lands here too.
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, false);
+            return;
+        }
+        const command: []const u8 = if (kind == .shell) "" else try c.string();
+        // S3b: for "subsystem", `command` is the requested NAME, not a
+        // command line. An empty `subsystem_names` (the default) accepts any
+        // name; a non-empty one rejects a name not on it right here, before
+        // SSH_MSG_CHANNEL_SUCCESS ever goes out.
+        if (kind == .subsystem and srv.config.subsystem_names.len > 0 and
+            !nameInList(srv.config.subsystem_names, command))
+        {
+            if (want_reply) try sendChannelReply(srv.t, &sc.ch, false);
+            return;
+        }
+        if (want_reply) try sendChannelReply(srv.t, &sc.ch, true);
+        sc.ran = true;
+        const ready = switch (srv.config.stdin_mode) {
+            .ignore => true,
+            .collect_until_eof => sc.ch.got_eof,
+        };
+        if (srv.config.stdin_mode == .ignore) sc.stdin.clearRetainingCapacity();
+        sc.pending = .{ .handler = handler.?, .kind = kind, .command = try gpa.dupe(u8, command), .ready = ready };
+    }
+
+    /// Run a ready handler and stream its result back, then close the
+    /// channel down the RFC 4254 §5.3 way: data → `exit-status` → EOF → CLOSE.
+    fn runPending(srv: *Server, sc: *ServerChannel) ChannelError!void {
+        const p = sc.pending.?;
+        sc.pending = null;
+        defer srv.gpa.free(p.command);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(srv.gpa);
+        var err_out: std.ArrayList(u8) = .empty;
+        defer err_out.deinit(srv.gpa);
+
+        const stdin: []const u8 = if (srv.config.stdin_mode == .ignore) &.{} else sc.stdin.items;
+        const info: RequestInfo = .{
+            .user = srv.config.user,
+            .kind = p.kind,
+            .command = p.command,
+            .pty = sc.pty,
+            .env = sc.env.items,
+            .channel = sc.ch.local_id,
+        };
+        const status = p.handler.runInfo(srv.gpa, &info, stdin, &out, &err_out) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.CommandFailed => return error.CommandFailed,
+        };
+
+        if (!try srv.sendData(sc, out.items, null)) return;
+        if (!try srv.sendData(sc, err_out.items, messages.extended_data_stderr)) return;
+        try sendExitStatus(srv.t, &sc.ch, status);
+        try sendEofMsg(srv.t, &sc.ch);
+        try sendCloseMsg(srv.t, &sc.ch);
+    }
+
+    /// `data` as CHANNEL_DATA (`data_type == null`) or CHANNEL_EXTENDED_DATA,
+    /// chunked to the client's window and maximum packet size (§5.2). While
+    /// the window is shut, every incoming packet is applied (to any channel)
+    /// via `dispatch`. False when the client closed this channel meanwhile.
+    fn sendData(srv: *Server, sc: *ServerChannel, data: []const u8, data_type: ?u32) ChannelError!bool {
+        var rest = data;
+        while (rest.len > 0) {
+            while (sc.ch.remote_window == 0) {
+                if (sc.ch.got_close) return false;
+                if (srv.disconnected) return error.ChannelClosed;
+                const pkt = try srv.t.recvPacket(srv.scratch);
+                try srv.dispatch(pkt.payload);
+            }
+            if (sc.ch.got_close) return false;
+            const limit = @min(@min(sc.ch.remote_max_packet, max_send_chunk), sc.ch.remote_window);
+            const n = @min(@as(usize, limit), rest.len);
+            var buf: [max_send_chunk + 64]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            if (data_type) |code| {
+                try writeChannelHeader(&w, .SSH_MSG_CHANNEL_EXTENDED_DATA, sc.ch.remote_id);
+                try writeU32(&w, code);
+            } else {
+                try writeChannelHeader(&w, .SSH_MSG_CHANNEL_DATA, sc.ch.remote_id);
+            }
+            try messages.writeString(&w, rest[0..n]);
+            try srv.t.sendPacket(w.buffered());
+            sc.ch.remote_window -= @intCast(n);
+            rest = rest[n..];
+        }
+        return true;
+    }
+};
+
+/// Cap on accepted `env` variables per channel.
+const max_env_vars = 64;
+
+/// Test seam for `interop_test.zig` (the patterns are not attacker data,
+/// the name is).
+pub const envAcceptedForTest = if (@import("builtin").is_test) envAccepted else {};
+
+/// `ServeConfig.accept_env` membership: an exact name, or a pattern ending
+/// in `*` that matches by prefix.
+fn envAccepted(patterns: []const []const u8, name: []const u8) bool {
+    for (patterns) |p| {
+        if (p.len > 0 and p[p.len - 1] == '*') {
+            if (std.mem.startsWith(u8, name, p[0 .. p.len - 1])) return true;
+        } else if (std.mem.eql(u8, p, name)) return true;
+    }
+    return false;
 }
 
 /// The peer went away (end of stream, reset, or a write into a closed
@@ -873,22 +1617,11 @@ fn hungUp(e: ChannelError) bool {
     return e == error.EndOfStream or e == error.ReadFailed or e == error.WriteFailed;
 }
 
-/// Every channel message starts with the recipient channel — ours. A message
-/// for a channel we never opened, or one the peer has already closed, is a
-/// typed error rather than something applied to whatever channel we do have.
-/// (`sent_close` is deliberately NOT checked here: the peer's own CLOSE in
-/// answer to ours is the normal way §5.3 ends.)
 /// `ServeConfig.subsystem_names` membership test — linear scan, since the
 /// list is a handful of static names a caller wrote out, not attacker data.
 fn nameInList(names: []const []const u8, name: []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
-}
-
-fn expectChannel(ch: *ChannelState, c: *Cursor) ChannelError!void {
-    const recipient = try c.uint32();
-    if (!ch.open or ch.got_close) return error.ChannelClosed;
-    if (recipient != ch.local_id) return error.ChannelClosed;
 }
 
 fn sendOpenFailure(
@@ -915,97 +1648,6 @@ fn sendChannelReply(t: *transport.Transport, ch: *ChannelState, ok: bool) Channe
         ch.remote_id,
     );
     return t.sendPacket(w.buffered());
-}
-
-/// Run the handler and stream its result back, then close the channel down
-/// the RFC 4254 §5.3 way: data → `exit-status` → EOF → CLOSE.
-fn runCommand(
-    t: *transport.Transport,
-    gpa: std.mem.Allocator,
-    ch: *ChannelState,
-    config: ServeConfig,
-    handler: CommandHandler,
-    command: []const u8,
-    stdin: []const u8,
-    scratch: []u8,
-) ChannelError!void {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    var err_out: std.ArrayList(u8) = .empty;
-    defer err_out.deinit(gpa);
-
-    const status = handler.run(gpa, config.user, command, stdin, &out, &err_out) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.CommandFailed => return error.CommandFailed,
-    };
-
-    try sendChannelData(t, ch, out.items, null, scratch);
-    try sendChannelData(t, ch, err_out.items, messages.extended_data_stderr, scratch);
-    try sendExitStatus(t, ch, status);
-    try sendEofMsg(t, ch);
-    try sendCloseMsg(t, ch);
-}
-
-/// Send `data` as CHANNEL_DATA (`data_type == null`) or CHANNEL_EXTENDED_DATA,
-/// chunked to respect the peer's window and maximum packet size (§5.2).
-/// Waits for SSH_MSG_CHANNEL_WINDOW_ADJUST when the window is exhausted.
-fn sendChannelData(
-    t: *transport.Transport,
-    ch: *ChannelState,
-    data: []const u8,
-    data_type: ?u32,
-    scratch: []u8,
-) ChannelError!void {
-    if (data.len == 0) return;
-    var rest = data;
-    while (rest.len > 0) {
-        while (ch.remote_window == 0) {
-            // The only message that can unblock us is a window adjust; any
-            // other channel traffic is processed minimally.
-            const pkt = try t.recvPacket(scratch);
-            const mt: messages.MessageType = @enumFromInt(msgType(pkt));
-            switch (mt) {
-                .SSH_MSG_CHANNEL_WINDOW_ADJUST => {
-                    // audit `ssh` F5: this used to discard `recipient_channel`
-                    // (`_ = try c.uint32()`) instead of checking it like
-                    // every other channel message site does — latent while
-                    // the module is single-channel, but a WINDOW_ADJUST for
-                    // some other channel would have been silently credited
-                    // to this one the moment a second channel exists.
-                    var c = Cursor{ .b = pkt.payload[1..] };
-                    try expectChannel(ch, &c);
-                    ch.remote_window +|= try c.uint32();
-                },
-                .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => {},
-                .SSH_MSG_CHANNEL_EOF => {
-                    var c = Cursor{ .b = pkt.payload[1..] };
-                    try expectChannel(ch, &c);
-                    ch.got_eof = true;
-                },
-                .SSH_MSG_CHANNEL_CLOSE => {
-                    var c = Cursor{ .b = pkt.payload[1..] };
-                    try expectChannel(ch, &c);
-                    ch.got_close = true;
-                    return error.ChannelClosed;
-                },
-                else => return error.ProtocolError,
-            }
-        }
-        const limit = @min(@min(ch.remote_max_packet, max_send_chunk), ch.remote_window);
-        const n = @min(@as(usize, limit), rest.len);
-        var buf: [max_send_chunk + 64]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        if (data_type) |code| {
-            try writeChannelHeader(&w, .SSH_MSG_CHANNEL_EXTENDED_DATA, ch.remote_id);
-            try writeU32(&w, code);
-        } else {
-            try writeChannelHeader(&w, .SSH_MSG_CHANNEL_DATA, ch.remote_id);
-        }
-        try messages.writeString(&w, rest[0..n]);
-        try t.sendPacket(w.buffered());
-        ch.remote_window -= @intCast(n);
-        rest = rest[n..];
-    }
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -1065,7 +1707,7 @@ test "maybeAdjustWindow does not overflow u32 on a large configured window" {
     try t.expectEqual(@as(u32, 0x9000_0000), ch.local_window); // unchanged
 }
 
-test "sendChannelData rejects a WINDOW_ADJUST addressed to another channel" {
+test "Server.sendData rejects a WINDOW_ADJUST addressed to another channel" {
     // audit `ssh` F5: the wait loop used to discard `recipient_channel`
     // (`_ = try c.uint32()`) instead of checking it against `expectChannel`
     // like every other channel-message site. Latent while the module is
@@ -1087,20 +1729,25 @@ test "sendChannelData rejects a WINDOW_ADJUST addressed to another channel" {
     var sink: std.Io.Writer = .fixed(&sink_buf);
     var tr = transport.Transport.init(&r, &sink);
 
-    var ch = ChannelState{
-        .local_id = 5,
-        .remote_id = 7,
-        .local_window = 1 << 20,
-        .local_window_initial = 1 << 20,
-        .local_max_packet = 1024,
-        .remote_window = 0, // forces the wait loop to run
-        .remote_max_packet = 1024,
-        .open = true,
+    var srv = try Server.init(&tr, t.allocator, .{}, .until_disconnect);
+    defer srv.deinit();
+    const sc = try t.allocator.create(ServerChannel);
+    sc.* = .{
+        .ch = .{
+            .local_id = 5,
+            .remote_id = 7,
+            .local_window = 1 << 20,
+            .local_window_initial = 1 << 20,
+            .local_max_packet = 1024,
+            .remote_window = 0, // forces the wait loop to run
+            .remote_max_packet = 1024,
+            .open = true,
+        },
     };
-    var scratch: [256]u8 = undefined;
-    try t.expectError(error.ChannelClosed, sendChannelData(&tr, &ch, "hello", null, &scratch));
+    try srv.channels.append(t.allocator, sc);
+    try t.expectError(error.ChannelClosed, srv.sendData(sc, "hello", null));
     // The mismatched grant must not have been credited.
-    try t.expectEqual(@as(u32, 0), ch.remote_window);
+    try t.expectEqual(@as(u32, 0), sc.ch.remote_window);
 }
 
 test "max_send_chunk fits in one binary packet" {
