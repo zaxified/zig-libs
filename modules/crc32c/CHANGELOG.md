@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Performance, not breaking: the x86-64 `crc32q` chains stay
+  64-bit (no narrowing and widening around every instruction): against Go
+  `hash/crc32` Castagnoli (new `tools/bench.zig`, `zig build bench-crc32c`)
+  1 KiB 1.34 → 0.91×, 1 MiB 1.25 → 1.01×. New deterministic fuzz driver
+  `CRC32C_FUZZ`.
+
 - **2026-10-07** — Tests only (pilot): instruction-count cases in `src/count.zig`, skipped unless
   `ZIGLIBS_COUNT` names one, held by `scripts/count-insns crc32c` to `tools/count.tsv` (instructions per
   round under cachegrind, ReleaseFast, `-mcpu=x86_64_v3`): `crc32c-4KiB` 2 139.

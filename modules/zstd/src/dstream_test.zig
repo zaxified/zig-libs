@@ -471,3 +471,30 @@ test "the hint counts the next block header; a raw block streams in pieces" {
         .{ .cut = 509, .out = 4096, .hint = 500, .in_pos = 509, .out_pos = 500 },
     }, false);
 }
+
+test "a call after an error does not resume the broken raw block (fuzz 2026-10-07: ZSTD_FUZZ seekable, seed 4202)" {
+    // Content size 2, but the last block is raw and holds 1 byte: the frame
+    // ends in CorruptionDetected while the decoder still stands in that
+    // block with nothing left to read. Fed again without a reset, it used to
+    // take one more byte as the next piece of the block and subtract it from
+    // the 0 bytes left -- an integer-overflow panic in a safe build, a
+    // wrapped size in ReleaseFast. Fed one byte at a time, so the stream
+    // decodes block by block (whole input at once takes the one-shot path).
+    const frame = [_]u8{ 0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x02, 0x09, 0x00, 0x00, 'A' };
+    var s = try zstd.DecompressStream.init(gpa, .{});
+    defer s.deinit();
+    var dst: [16]u8 = undefined;
+    var out: zstd.OutBuffer = .{ .dst = &dst };
+    var failed = false;
+    for (0..frame.len) |i| {
+        var in: zstd.InBuffer = .{ .src = frame[i..][0..1] };
+        _ = s.decompressStream(&out, &in) catch |e| {
+            try std.testing.expectEqual(error.CorruptionDetected, e);
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    var more: zstd.InBuffer = .{ .src = "B" };
+    if (s.decompressStream(&out, &more)) |_| return error.TestUnexpectedResult else |_| {}
+}

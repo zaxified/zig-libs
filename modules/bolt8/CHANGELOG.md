@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the five `testing.fuzz`
+  harnesses (acts 1–3, transport length and message) are generic over their
+  source and run by testkit's deterministic driver `BOLT8_FUZZ` (new
+  `src/fuzz_test.zig`); the local copy of `testkit.fuzz.seed` is gone now that
+  testkit is a test dependency. Test code only.
+- **2026-10-07** — The test-only `Initiator.genAct1WithEphemeral` /
+  `Responder.genAct2WithEphemeral` are declared `void` outside a test build
+  instead of hitting a `@compileError` inside them, and the secp256k1 `dh`
+  adapter declares `noise_name = "secp256k1"`. Production code still cannot
+  call either hook (it does not compile); what changed is that
+  `check-testonly`/`check-pubfn-reach` can now reference every declaration,
+  which had kept this module out of `test_deps` (testkit).
+
 - **2026-10-04** — Tests: mutation run (32 mutants, 29 killed, 3 equivalent). New tests for
   a message of exactly 65535 bytes, an output buffer one byte too large, and
   `generateDeterministic` on 0, `n` and `n − 1`. No behaviour change.

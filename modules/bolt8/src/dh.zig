@@ -33,6 +33,13 @@
 //! here (unlike `handshake.zig`'s act-driver, which decides WHEN each DH
 //! happens and what gets mixed with its output).
 
+/// Noise spec §8's name for this DH function, as `noise` asks a primitive
+/// outside `std` to declare it: BOLT#8's protocol name is
+/// `Noise_XK_secp256k1_ChaChaPoly_SHA256`. Declared so that every type
+/// `noise.HandshakeState` builds from this adapter has a name, which is what
+/// `check-testonly` touches when it references the module's declarations.
+pub const noise_name = "secp256k1";
+
 const std = @import("std");
 const Secp256k1 = @import("k256").Secp256k1;
 const Sha256 = std.crypto.hash.sha2.Sha256;

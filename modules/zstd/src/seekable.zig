@@ -521,6 +521,9 @@ pub const Seekable = struct {
     /// on where the last call stopped continues the frame instead of
     /// decoding it again from its start.
     pub fn decompress(s: *Seekable, dst: []u8, offset: u64) ReadError!usize {
+        // A failed read leaves the frame's decoder mid-block; the next read
+        // must start the frame afresh, never continue from there.
+        errdefer s.cur_frame = std.math.maxInt(u32);
         const eos = s.table.decompressedSize();
         if (offset >= eos) return 0;
         const len: usize = @intCast(@min(dst.len, eos - offset));

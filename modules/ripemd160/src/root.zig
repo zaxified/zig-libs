@@ -551,6 +551,37 @@ test "fuzz: streaming update matches one-shot hash, at every split the input pic
 }
 
 fn fuzzStreamingMatchesOneShot(_: void, smith: *testing.Smith) !void {
+    // Bytes first, in one `smith.slice`; the harness then reads them back
+    // through `Replay` (check-fuzz-reach sees the draw only here).
+    var msg: [stream_buf_len]u8 = undefined;
+    const n = smith.slice(&msg);
+    var src: Replay = .{ .data = msg[0..n] };
+    return streamHarness(Replay, &src, testing.allocator);
+}
+
+/// The one drawn byte string, handed to the harness as its `slice`.
+const Replay = struct {
+    data: []const u8,
+    pub fn slice(self: *Replay, buf: []u8) u32 {
+        @memcpy(buf[0..self.data.len], self.data);
+        return @intCast(self.data.len);
+    }
+};
+
+const fuzz_driver = fuzzseed.driver;
+const Reach = enum { empty, one_chunk, multi_chunk, block_plus };
+var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: Reach) void {
+    reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// Generic over the choice source (`testing.Smith` under `--fuzz`, the
+/// driver's `Rng`): the only draw is the one `slice`, the chunk sizes come
+/// out of its bytes.
+fn streamHarness(comptime Src: type, src: *Src, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var msg: [stream_buf_len]u8 = undefined;
     // ⚠ One `smith.slice`, and the chunk sizes come out of the drawn bytes
     // rather than out of a second draw. The old shape was
@@ -567,8 +598,10 @@ fn fuzzStreamingMatchesOneShot(_: void, smith: *testing.Smith) !void {
     // Measured 2026-09-07 over the corpus: 0 of 15 seeds arrived non-empty
     // before and 0 `update` calls were made; 14 of 15 and 168 after, over 1009
     // octets, 12 of the 14 split across more than one call.
-    const n = smith.slice(&msg);
+    const n = src.slice(&msg);
     const data = msg[0..n];
+    if (n == 0) mark(.empty);
+    if (n > Ripemd160.block_length) mark(.block_plus);
 
     var one_shot: [Ripemd160.digest_length]u8 = undefined;
     Ripemd160.hash(data, &one_shot, .{});
@@ -582,16 +615,43 @@ fn fuzzStreamingMatchesOneShot(_: void, smith: *testing.Smith) !void {
     var script: fuzzseed.Cursor = .{ .bytes = data };
     var d = Ripemd160.init(.{});
     var off: usize = 0;
+    var calls: usize = 0;
     while (off < data.len) {
         const chunk = script.ranged(1, 97);
         const c = @min(chunk, data.len - off);
         d.update(data[off..][0..c]);
         off += c;
+        calls += 1;
     }
     var streamed: [Ripemd160.digest_length]u8 = undefined;
     d.final(&streamed);
+    if (data.len > 0 and calls > 1) mark(.multi_chunk);
+    if (data.len > 0 and calls == 1) mark(.one_chunk);
 
     try testing.expectEqualSlices(u8, &one_shot, &streamed);
+}
+
+test "fuzz driver: RIPEMD160_FUZZ" {
+    fuzz_driver.run(streamHarness, .{ .prefix = "RIPEMD160_FUZZ", .name = "ripemd160" }) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
+    reach = @splat(0);
+    for (0..500) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        streamHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |e| {
+            std.debug.print("seed {d}: {t}\n", .{ seed, e });
+            return e;
+        };
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "corpus: every seed reaches update, and the split the harness performs is pinned" {

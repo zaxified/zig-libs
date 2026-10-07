@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `CRC32_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only. New `tools/bench.zig` (`zig build bench-crc32`) against zlib `crc32_z` (and Go `hash/crc32`).
 - **2026-10-04** — Tests: `combine` is now held to Go's `hash/crc32` (IEEE) at lengths
   around 2^28 … 2^33 and past 5·10^9 bytes, for three prefixes (`tools/gen_kat.go` →
   `src/kat_vectors.zig`). Anchor grade MIXED → EXTERNAL.

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `ICMP_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only.
 - **2026-10-04** — Tests: the encoder is held to `ping`'s captured requests (v4 byte for byte,
   v6 but the kernel-filled checksum) and the kernel-answered timestamp request; the ICMP
   error types loopback cannot produce are checked against tcpdump's decoding

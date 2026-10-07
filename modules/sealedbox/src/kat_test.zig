@@ -142,6 +142,7 @@ test "TEETH CHECK: corrupting the classic box vector's expected ciphertext makes
 /// corpus raw would reach `open` with four octets of its ephemeral public key
 /// missing — which is an authentication failure for an uninteresting reason.
 const seed = @import("testkit").fuzz.seed;
+const fuzz_test = @import("fuzz_test.zig");
 
 /// The module's own KAT sealed box, decoded at comptime so the corpus can
 /// carry it and the three mutants below.
@@ -189,13 +190,23 @@ test "fuzz: open never panics on arbitrary ciphertext bytes" {
 }
 
 fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return openHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// The harness body, generic over its source (testkit's fuzz driver feeds it
+/// a PRNG, `testing.fuzz` a cursor over the Smith bytes).
+pub fn openHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     const kp = sealedbox.KeyPair{
         .public_key = hexDecode32(kat.recipient_pk_hex),
         .secret_key = hexDecode32(kat.recipient_sk_hex),
     };
 
     var sealed_buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call. The length used to be drawn FIRST, with
+    // ⚠ One `slice` call, FIRST. The length used to be drawn FIRST, with
     // `smith.valueRangeAtMost(u16, 0, 256)`, and the bytes read into
     // `sealed_buf[0..sealed_len]` afterwards — but a ranged `Smith` draw reads
     // eight octets as a little-endian u64 and returns the range MINIMUM unless
@@ -206,12 +217,37 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     // 2026-09-07 over the corpus above: **0 of 8 seeds non-empty and 0 boxes
     // opened before, 7 of 8 non-empty (one seed IS the empty ciphertext) and 1
     // opened after.**
-    const sealed_len: usize = smith.slice(&sealed_buf);
+    var sealed_len: usize = src.slice(&sealed_buf);
+
+    // Random bytes alone never open (that is the AEAD's job), so the choice
+    // after the bytes steers some runs to the module's own KAT box: intact it
+    // must open, with one byte flipped it must be refused.
+    var must: enum { none, open, refuse } = .none;
+    switch (src.index(4)) {
+        0, 1 => {},
+        2 => {
+            @memcpy(sealed_buf[0..kat_sealed.len], &kat_sealed);
+            sealed_len = kat_sealed.len;
+            must = .open;
+        },
+        else => {
+            @memcpy(sealed_buf[0..kat_sealed.len], &kat_sealed);
+            sealed_len = kat_sealed.len;
+            sealed_buf[src.index(sealed_len)] ^= @as(u8, 1) << @intCast(src.index(8));
+            must = .refuse;
+        },
+    }
     const sealed = sealed_buf[0..sealed_len];
 
     var out_buf: [256]u8 = undefined;
     const out_len = if (sealed_len >= sealedbox.overhead) sealed_len - sealedbox.overhead else 0;
-    sealedbox.open(out_buf[0..out_len], sealed, kp) catch return;
+    if (sealedbox.open(out_buf[0..out_len], sealed, kp)) |_| {
+        if (must == .refuse) return error.TamperedBoxOpened;
+        fuzz_test.mark(.opened);
+    } else |_| {
+        if (must == .open) return error.ValidBoxRefused;
+        fuzz_test.mark(.refused);
+    }
 }
 
 // ── fuzz: seal on arbitrary plaintext ───────────────────────────────────
@@ -224,6 +260,14 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
 // (not a `catch`) is deliberate here, so an unexpected error is a fuzz
 // failure, the same way a panic would be.
 fn fuzzSeal(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return sealHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+pub fn sealHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     const io = std.testing.io;
     const kp = sealedbox.KeyPair{
         .public_key = hexDecode32(kat.recipient_pk_hex),
@@ -231,7 +275,7 @@ fn fuzzSeal(_: void, smith: *std.testing.Smith) !void {
     };
 
     var msg_buf: [256]u8 = undefined;
-    const msg_len: usize = smith.slice(&msg_buf);
+    const msg_len: usize = src.slice(&msg_buf);
     const msg = msg_buf[0..msg_len];
 
     var out_buf: [256 + sealedbox.overhead]u8 = undefined;
@@ -242,6 +286,7 @@ fn fuzzSeal(_: void, smith: *std.testing.Smith) !void {
     const opened = opened_buf[0..msg.len];
     try sealedbox.open(opened, out, kp);
     try testing.expectEqualSlices(u8, msg, opened);
+    fuzz_test.mark(.sealed_roundtrip);
 }
 
 test "fuzz: seal never fails or panics on arbitrary plaintext, and the result opens back" {

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `BIP340_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only.
 - **2026-09-15** — A1 F2. Security fix, no API change: `sign` left the effective
   signing scalar `d` and the nonce (`rand`, both `k` candidates) on the dead
   stack — measured on the audited tree at ReleaseFast, `d` ×2 and the nonce

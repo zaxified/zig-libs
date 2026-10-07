@@ -296,16 +296,21 @@ fn shift(comptime t: *const [4][256]u32, c: u32) u32 {
 }
 
 const X86 = struct {
-    fn step8(c: u32, v: u64) u32 {
-        return @truncate(asm ("crc32q %[v], %[c]"
+    /// `crc32q` reads and writes a 64-bit register (the top half is zero), so
+    /// the chain stays 64-bit: narrowing and widening around every
+    /// instruction put a move into each dependent step.
+    const State = u64;
+    fn step8(c: u64, v: u64) u64 {
+        return asm ("crc32q %[v], %[c]"
             : [c] "=r" (-> u64),
             : [v] "r" (v),
-              [_] "0" (@as(u64, c)),
-        ));
+              [_] "0" (c),
+        );
     }
 };
 
 const Arm = struct {
+    const State = u32;
     fn step8(c: u32, v: u64) u32 {
         return asm (
             \\.arch_extension crc
@@ -323,23 +328,24 @@ fn threeWay(comptime Isa: type, reg: u32, bytes: []const u8) u32 {
     inline for (.{ .{ long_block, &shift_long }, .{ short_block, &shift_short } }) |blk| {
         const n = blk[0];
         while (p.len >= 3 * n) : (p = p[3 * n ..]) {
-            var c0 = c;
-            var c1: u32 = 0;
-            var c2: u32 = 0;
+            var c0: Isa.State = c;
+            var c1: Isa.State = 0;
+            var c2: Isa.State = 0;
             var i: usize = 0;
             while (i < n) : (i += 8) {
                 c0 = Isa.step8(c0, std.mem.readInt(u64, p[i..][0..8], .little));
                 c1 = Isa.step8(c1, std.mem.readInt(u64, p[n + i ..][0..8], .little));
                 c2 = Isa.step8(c2, std.mem.readInt(u64, p[2 * n + i ..][0..8], .little));
             }
-            c = shift(blk[1], c0) ^ c1;
-            c = shift(blk[1], c) ^ c2;
+            c = shift(blk[1], @truncate(c0)) ^ @as(u32, @truncate(c1));
+            c = shift(blk[1], c) ^ @as(u32, @truncate(c2));
         }
     }
-    while (p.len >= 8) : (p = p[8..]) c = Isa.step8(c, std.mem.readInt(u64, p[0..8], .little));
+    var tail: Isa.State = c;
+    while (p.len >= 8) : (p = p[8..]) tail = Isa.step8(tail, std.mem.readInt(u64, p[0..8], .little));
     // The last few bytes by table: the byte-wide instruction is the one the
     // self-hosted x86 backend's assembler cannot encode (Zig 0.16, Debug).
-    return tableUpdate(c, p);
+    return tableUpdate(@truncate(tail), p);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -496,6 +502,9 @@ test "combine matches Go's hash/crc32 past 2^29 and 2^32 bytes" {
     }
 }
 
+const testkit = @import("testkit");
+const fuzz_driver = testkit.fuzz.driver;
+
 test "fuzz: every backend, extend and combine agree with std on arbitrary bytes" {
     try testing.fuzz({}, fuzzAgree, .{});
 }
@@ -504,14 +513,81 @@ test "fuzz: every backend, extend and combine agree with std on arbitrary bytes"
 /// path of the three-way split.
 var fuzz_buf: [6 * long_block + 3 * short_block + 64]u8 = undefined;
 
-fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
-    const len = smith.slice(&fuzz_buf);
+/// Reach counters for the in-suite test (the driver's own `hit` is process-wide
+/// and printed only by `fuzz_driver.run`).
+const Reach = enum { empty, short, split_short, split_long, cut_inside, hw_backend };
+var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: Reach) void {
+    reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+fn fuzzHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const len = src.slice(&fuzz_buf);
     const data = fuzz_buf[0..len];
+    if (len == 0) mark(.empty) else if (len < 3 * short_block) mark(.short) else if (len < 3 * long_block) mark(.split_short) else mark(.split_long);
     const want = std.hash.crc.Crc32Iscsi.hash(data);
-    for (all_backends) |b| if (hashWith(b, data)) |got| try testing.expectEqual(want, got);
-    const cut = smith.valueRangeAtMost(u32, 0, len);
+    for (all_backends) |b| if (hashWith(b, data)) |got| {
+        if (b != .table) mark(.hw_backend);
+        try testing.expectEqual(want, got);
+    };
+    const cut = src.valueRangeAtMost(u32, 0, len);
+    if (cut > 0 and cut < len) mark(.cut_inside);
     try testing.expectEqual(want, extend(hash(data[0..cut]), data[cut..]));
     try testing.expectEqual(want, combine(hash(data[0..cut]), hash(data[cut..]), len - cut));
+}
+
+fn fuzzAgree(_: void, smith: *std.testing.Smith) !void {
+    // Bytes first, in one `slice`; the cut is then read from them by a cursor
+    // (a ranged `Smith` draw first collapses every seed, `check-fuzz-reach`).
+    var data: [fuzz_buf.len]u8 = undefined;
+    const n = smith.slice(&data);
+    var src: ScriptSource = .{ .data = data[0..n], .cur = .{ .bytes = data[0..n] } };
+    return fuzzHarness(ScriptSource, &src, testing.allocator);
+}
+
+/// `testing.fuzz`'s source: `slice` hands back the one drawn byte string, every
+/// range is read from it by a cursor.
+const ScriptSource = struct {
+    data: []const u8,
+    cur: testkit.fuzz.Cursor,
+
+    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+        @memcpy(buf[0..self.data.len], self.data);
+        return @intCast(self.data.len);
+    }
+    pub fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
+        // Four octets, so a cut can land anywhere in a 49 984-octet message.
+        const w: u32 = (@as(u32, self.cur.word()) << 16) | self.cur.word();
+        const span: u64 = @as(u64, at_most - at_least) + 1;
+        return at_least + @as(T, @intCast(w % span));
+    }
+};
+
+test "fuzz driver: CRC32C_FUZZ" {
+    fuzz_driver.run(fuzzHarness, .{ .prefix = "CRC32C_FUZZ", .name = "crc32c" }) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
+    reach = @splat(0);
+    for (0..500) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        fuzzHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |e| {
+            std.debug.print("seed {d}: {t}\n", .{ seed, e });
+            return e;
+        };
+    }
+    // hw_backend depends on the CPU the suite runs on; the rest must be reached.
+    for (reach, 0..) |n, i| if (n == 0 and i != @intFromEnum(Reach.hw_backend)) {
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "the shift tables are the zero-byte operator they claim to be" {

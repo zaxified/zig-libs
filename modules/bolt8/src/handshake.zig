@@ -140,20 +140,23 @@ pub const Ephemeral = union(enum) {
     }
 };
 
-/// The compile-time guard on the two `…WithEphemeral` KAT entry points.
+/// The test-build-only guard on the two `…WithEphemeral` KAT entry points.
 /// BOLT#8 Appendix A fixes `e.priv` on both sides ("note: this is a violation
 /// of the spec, which requires randomness"), so the vectors are unreachable
 /// without a hook that pins the ephemeral exactly — and there is no legitimate
 /// production use for one: Noise_XK has no session resumption and no
 /// pre-agreed share, every run draws a fresh `e`. So the hook exists, and it
-/// does not exist outside a test build.
-fn assertTestOnly(comptime who: []const u8) void {
-    comptime if (!builtin.is_test) @compileError(
-        "bolt8: " ++ who ++ " pins the act's ephemeral keypair and is reachable only from a test " ++
-            "build (BOLT#8 Appendix A's fixed-`e.priv` vectors). Production must call " ++
-            "genAct1/genAct2 with an `Ephemeral` — `.csprng` draws a fresh share, which is the " ++
-            "only shape Noise_XK's forward secrecy is defined for.",
-    );
+/// does not exist outside a test build: there each `…WithEphemeral` is
+/// declared `void`, and a call does not compile. Production must call
+/// `genAct1`/`genAct2` with an `Ephemeral` — `.csprng` draws a fresh share,
+/// which is the only shape Noise_XK's forward secrecy is defined for.
+///
+/// `void`, not a `@compileError` inside the function (as until 2026-10-07):
+/// `check-testonly` and `check-pubfn-reach` reference every public
+/// declaration of a non-test build, and a `@compileError` there fails them,
+/// which had kept this module out of `test_deps` (and testkit's fuzz driver).
+fn testOnly(comptime f: anytype) if (builtin.is_test) @TypeOf(f) else type {
+    return if (builtin.is_test) f else void;
 }
 
 /// The result of a completed Act Three: the transport send/receive keys
@@ -272,12 +275,11 @@ pub const Initiator = struct {
         return self.act1(dh.KeyPair.generate(ephemeral.source()));
     }
 
-    /// **TEST ONLY** (`@compileError` outside a test build — see
-    /// `assertTestOnly`): run Act One over exactly `e` instead of a drawn
-    /// share, which is how BOLT#8 Appendix A's fixed-`e.priv` vectors are
-    /// reproduced byte-exact.
-    pub fn genAct1WithEphemeral(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
-        assertTestOnly("Initiator.genAct1WithEphemeral");
+    /// **TEST ONLY** (`void` outside a test build — see `testOnly`): run Act
+    /// One over exactly `e` instead of a drawn share, which is how BOLT#8
+    /// Appendix A's fixed-`e.priv` vectors are reproduced byte-exact.
+    pub const genAct1WithEphemeral = testOnly(genAct1WithEphemeralImpl);
+    fn genAct1WithEphemeralImpl(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
         return self.act1(e);
     }
 
@@ -475,11 +477,11 @@ pub const Responder = struct {
         return self.act2(dh.KeyPair.generate(ephemeral.source()));
     }
 
-    /// **TEST ONLY** (`@compileError` outside a test build — see
-    /// `assertTestOnly`): the Appendix A responder-side KAT hook, mirroring
+    /// **TEST ONLY** (`void` outside a test build — see `testOnly`): the
+    /// Appendix A responder-side KAT hook, mirroring
     /// `Initiator.genAct1WithEphemeral`.
-    pub fn genAct2WithEphemeral(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
-        assertTestOnly("Responder.genAct2WithEphemeral");
+    pub const genAct2WithEphemeral = testOnly(genAct2WithEphemeralImpl);
+    fn genAct2WithEphemeralImpl(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
         return self.act2(e);
     }
 

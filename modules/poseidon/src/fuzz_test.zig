@@ -25,19 +25,69 @@ const bls = @import("bls12_381_poseidon.zig");
 /// An arbitrary field element from fuzz bytes. `reduceWide` rather than
 /// `fromBytes` so no draw is ever rejected — the fuzzer should spend its
 /// budget on the permutation, not on retrying out-of-range 32-byte strings.
-fn arbitraryFr(comptime Fr: type, smith: *std.testing.Smith) Fr {
+fn arbitraryFr(comptime Fr: type, smith: anytype) Fr {
     var be: [32]u8 = undefined;
     smith.bytes(&be);
     return Fr.reduceWide(&be);
 }
 
 fn fuzzInjective(P: bn.Perm(3), smith: *std.testing.Smith) !void {
+    return injectiveBn(std.testing.Smith, P, smith);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const Reach = enum { bn_slot0, bn_slot1, bn_slot2, bls_slot0, bls_slot1, bls_slot2, framing };
+var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+
+fn mark(r: Reach) void {
+    reach[@intFromEnum(r)] += 1;
+    switch (r) {
+        inline else => |l| fuzz_driver.hit(@tagName(l)),
+    }
+}
+
+// `Perm(t).init()` re-derives the constants (~ms): once per process, not per run.
+var bn3_cache: ?bn.Perm(3) = null;
+var bn5_cache: ?bn.Perm(5) = null;
+var bls3_cache: ?bls.Perm(3) = null;
+fn bn3() bn.Perm(3) {
+    if (bn3_cache == null) bn3_cache = bn.Perm(3).init();
+    return bn3_cache.?;
+}
+fn bn5() bn.Perm(5) {
+    if (bn5_cache == null) bn5_cache = bn.Perm(5).init();
+    return bn5_cache.?;
+}
+fn bls3() bls.Perm(3) {
+    if (bls3_cache == null) bls3_cache = bls.Perm(3).init();
+    return bls3_cache.?;
+}
+
+/// The harnesses are generic over the choice source (`testing.Smith` under
+/// `--fuzz`, the driver's `Rng`). Their first draw is `bytes`, so the corpus
+/// below (raw frames) is still read faithfully.
+fn driverInjectiveBn(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    return injectiveBn(S, bn3(), src);
+}
+fn driverFraming(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    return framingAgrees(S, bn5(), src);
+}
+fn driverInjectiveBls(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    return injectiveBls(S, bls3(), src);
+}
+
+fn injectiveBn(comptime S: type, P: bn.Perm(3), smith: *S) !void {
     var a: [3]bn.Fr = undefined;
     for (&a) |*x| x.* = arbitraryFr(bn.Fr, smith);
 
     // Perturb exactly one slot by a non-zero delta, so the two inputs are
     // guaranteed distinct and the outputs therefore must be too.
     const slot = smith.value(u8) % 3;
+    mark(@enumFromInt(@intFromEnum(Reach.bn_slot0) + slot));
     var delta = arbitraryFr(bn.Fr, smith);
     if (delta.isZero()) delta = bn.fromU64(1);
 
@@ -179,6 +229,11 @@ test "fuzz: the BN254 t=3 permutation is injective" {
 }
 
 fn fuzzFramingAgrees(P: bn.Perm(5), smith: *std.testing.Smith) !void {
+    return framingAgrees(std.testing.Smith, P, smith);
+}
+
+fn framingAgrees(comptime S: type, P: bn.Perm(5), smith: *S) !void {
+    mark(.framing);
     // `hash` is `hashN(1, zero, …)`; `hashN(k, …)` must be a prefix of the
     // permutation output for any k. Cheap, total, and it pins the framing
     // against a "helpful" future change that starts squeezing or padding.
@@ -204,11 +259,16 @@ test "fuzz: hash framing is a prefix of the permutation" {
 }
 
 fn fuzzBlsInjective(P: bls.Perm(3), smith: *std.testing.Smith) !void {
+    return injectiveBls(std.testing.Smith, P, smith);
+}
+
+fn injectiveBls(comptime S: type, P: bls.Perm(3), smith: *S) !void {
     // Same property on the other field — different prime, different Grain
     // seed width, entirely separate constant tables.
     var a: [3]bls.Fr = undefined;
     for (&a) |*x| x.* = arbitraryFr(bls.Fr, smith);
     const slot = smith.value(u8) % 3;
+    mark(@enumFromInt(@intFromEnum(Reach.bls_slot0) + slot));
     var delta = arbitraryFr(bls.Fr, smith);
     if (delta.isZero()) delta = bls.fromU64(1);
     var b = a;
@@ -225,4 +285,40 @@ fn fuzzBlsInjective(P: bls.Perm(3), smith: *std.testing.Smith) !void {
 
 test "fuzz: the BLS12-381 t=3 permutation is injective" {
     try std.testing.fuzz(bls.Perm(3).init(), fuzzBlsInjective, .{ .corpus = &inj_seeds });
+}
+
+test "fuzz driver: POSEIDON_FUZZ" {
+    var skipped: usize = 0;
+    // One driver run per harness; `POSEIDON_FUZZ_ONLY=<name>` picks one.
+    inline for (.{
+        .{ driverInjectiveBn, "poseidon-bn254-injective" },
+        .{ driverFraming, "poseidon-bn254-framing" },
+        .{ driverInjectiveBls, "poseidon-bls12-381-injective" },
+    }) |h| {
+        fuzz_driver.run(h[0], .{ .prefix = "POSEIDON_FUZZ", .name = h[1] }) catch |e| switch (e) {
+            // Not asked for (no budget, or `_ONLY` names another target).
+            error.SkipZigTest => skipped += 1,
+            else => return e,
+        };
+    }
+    if (skipped == 3) return error.SkipZigTest;
+}
+
+test "fuzz harness: seeds in every test run, and it gets everywhere" {
+    reach = @splat(0);
+    // 60 per harness: a permutation is ~ms in the Debug test lane.
+    inline for (.{ driverInjectiveBn, driverFraming, driverInjectiveBls }) |h| {
+        for (0..60) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, std.testing.allocator) catch |e| {
+                std.debug.print("seed {d}: {t}\n", .{ seed, e });
+                return e;
+            };
+        }
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }

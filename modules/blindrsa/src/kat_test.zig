@@ -15,6 +15,7 @@ const std = @import("std");
 const testing = std.testing;
 const blindrsa = @import("root.zig");
 const kat = @import("kat_vectors.zig");
+const fuzz_test = @import("fuzz_test.zig");
 const rsa = @import("rsa");
 const Sha384 = std.crypto.hash.sha2.Sha384;
 
@@ -853,6 +854,16 @@ fn applyDamage(script: []const u8, bytes: *[kat.a1.sig.len]u8) struct { sig: []c
 }
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    var script: [128]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return verifyHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// Harness body, generic over its source (testkit's fuzz driver feeds it a
+/// PRNG, `testing.fuzz` a cursor over the Smith bytes).
+pub fn verifyHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     const pk = kat.publicKey() catch return;
 
     var script: [64]u8 = undefined;
@@ -868,11 +879,24 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     // the corpus above: **0 of 9 scripts changed a byte, 1 distinct signature
     // and 1 distinct length before; 5 of 9 flip, 17 flips in total, 9 distinct
     // signatures and 3 distinct lengths after.**
-    const n: usize = smith.slice(&script);
+    var n: usize = src.slice(&script);
+    // One run in six verifies the pristine signature, so the accept path is
+    // judged too (the damage script alone rarely leaves it untouched).
+    if (src.index(6) == 0) n = 0;
     var bytes: [kat.a1.sig.len]u8 = undefined;
     const damaged = applyDamage(script[0..n], &bytes);
 
-    blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, damaged.sig, kat.a1.salt.len) catch return;
+    // Verdict: the signature is the RFC's own exactly when it is full length
+    // and byte-identical (a flip may write the byte already there); only then
+    // may `verify` accept. Anything else accepted would be a forgery.
+    const pristine = std.mem.eql(u8, damaged.sig, &kat.a1.sig);
+    if (blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, damaged.sig, kat.a1.salt.len)) |_| {
+        if (!pristine) return error.DamagedSignatureAccepted;
+        fuzz_test.mark(.verified);
+    } else |_| {
+        if (pristine) return error.PristineSignatureRejected;
+        fuzz_test.mark(.rejected);
+    }
 }
 
 test "corpus: every damage script actually damages, and the counts are pinned" {

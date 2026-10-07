@@ -24,6 +24,7 @@ const prng = @import("prng.zig");
 const reedsolomon = @import("reedsolomon.zig");
 const kem = @import("kem.zig");
 const v = @import("kat_vectors_kem.zig");
+const fuzz_test = @import("fuzz_test.zig");
 
 const Kem128 = kem.Kem(params.hqc128, reedsolomon.generator_hqc128);
 const Kem192 = kem.Kem(params.hqc192, reedsolomon.generator_hqc192);
@@ -362,13 +363,57 @@ test "implicit reject: rejection value depends on which ciphertext byte was corr
 // smallest parameter set): the decoder cost is the same shape at every
 // security level, and the gate only requires one harness to exist
 // per module.
-fn fuzzDecaps(_: void, smith: *std.testing.Smith) !void {
+var fuzz_kp: ?Kem128.KeyPair = null;
+
+fn fuzzKeypair() Kem128.KeyPair {
+    if (fuzz_kp) |kp| return kp;
     const seed_kem = [_]u8{0x37} ** params.seed_bytes;
-    const kp = Kem128.keypair(&seed_kem);
+    fuzz_kp = Kem128.keypair(&seed_kem);
+    return fuzz_kp.?;
+}
+
+fn fuzzDecaps(_: void, smith: *std.testing.Smith) !void {
+    var script: [Kem128.ct_bytes + 256]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return decapsHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// Harness body, generic over its source (testkit's fuzz driver feeds it a
+/// PRNG, `testing.fuzz` a cursor over the Smith bytes). The ciphertext bytes
+/// are drawn FIRST. Mode 0 is the original harness: arbitrary bytes into
+/// `decaps`. Modes 1 and 2 give the random bytes something to be measured
+/// against: a genuine ciphertext must decapsulate to its shared secret, and
+/// the same one with a single bit flipped must NOT (implicit rejection).
+pub fn decapsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const kp = fuzzKeypair();
 
     var ct: Kem128.Ciphertext = undefined;
-    smith.bytes(&ct);
-    _ = Kem128.decaps(kp.dk, ct);
+    src.bytes(&ct);
+    switch (src.index(3)) {
+        0 => {
+            _ = Kem128.decaps(kp.dk, ct);
+            fuzz_test.mark(.arbitrary);
+        },
+        else => |mode| {
+            var coins: [Kem128.coins_bytes]u8 = undefined;
+            src.bytes(&coins);
+            const enc = Kem128.encaps(kp.ek, &coins);
+            if (mode == 1) {
+                const ss = Kem128.decaps(kp.dk, enc.ct);
+                if (!std.mem.eql(u8, &ss, &enc.ss)) return error.GenuineCiphertextDecapsDiffers;
+                fuzz_test.mark(.roundtrip);
+            } else {
+                var bad = enc.ct;
+                const bit = src.index(bad.len * 8);
+                bad[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+                const ss = Kem128.decaps(kp.dk, bad);
+                if (std.mem.eql(u8, &ss, &enc.ss)) return error.TamperedCiphertextAccepted;
+                fuzz_test.mark(.implicit_reject);
+            }
+        },
+    }
 }
 
 test "fuzz: decaps never panics on arbitrary ciphertext bytes" {

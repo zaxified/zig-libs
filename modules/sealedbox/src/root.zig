@@ -530,6 +530,7 @@ fn parseKeyHex(text: []const u8) KeyEncodingError![32]u8 {
 // a submodule's tests into the test binary — this reference does.
 test {
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // Value-returning shims for the tests below, which compare keys and texts

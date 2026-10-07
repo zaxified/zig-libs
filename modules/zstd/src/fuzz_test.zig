@@ -252,13 +252,13 @@ fn decodeStreamAnything(input: []const u8) void {
 fn fuzzDecodeStream(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    decodeStreamAnything(buf[0..len]);
+    return viaScript(DecodeStream, buf[0..len]);
 }
 
 fn fuzzDecodeDictionary(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    decodeWithDictionary(buf[0..len]);
+    return viaScript(DecodeDict, buf[0..len]);
 }
 
 /// A seekable stream from arbitrary bytes (`seekable.Seekable`): the table
@@ -281,26 +281,112 @@ fn seekableAnything(input: []const u8) void {
 fn fuzzSeekable(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    seekableAnything(buf[0..len]);
+    return viaScript(SeekableT, buf[0..len]);
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    decodeAnything(buf[0..len]);
+    return viaScript(DecodeT, buf[0..len]);
 }
 
 fn fuzzStream(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    try streamRoundTrip(buf[0..len]);
+    return viaScript(StreamT, buf[0..len]);
 }
 
 fn fuzzCompress(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
-    try roundTrip(buf[0..len]);
+    return viaScript(CompressT, buf[0..len]);
 }
+
+// ── the deterministic driver ────────────────────────────────────────────────
+//
+// `ZSTD_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `ZSTD_FUZZ_ONLY=
+// <name>` picks a target). Every target checks the drawn bytes exactly as the
+// `--fuzz` harness always did, then a second input: a seed from the target's
+// own corpus with up to three octets changed -- uniformly random octets are
+// almost never a valid frame, so alone they would stay at the header check.
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const Reach = enum { raw_nonempty, structured_run, mutated };
+var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: Reach) void {
+    reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// `testing.fuzz`'s source: `slice` hands back the one drawn byte string,
+/// every other choice is read from it by a cursor.
+const ScriptSource = struct {
+    data: []const u8,
+    cur: @import("testkit").fuzz.Cursor,
+
+    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+        @memcpy(buf[0..self.data.len], self.data);
+        return @intCast(self.data.len);
+    }
+    pub fn index(self: *ScriptSource, len: usize) usize {
+        // Two octets: a mutation can land anywhere in a 64 KB input.
+        const w: usize = self.cur.word();
+        return w % len;
+    }
+    pub fn value(self: *ScriptSource, comptime T: type) T {
+        return switch (T) {
+            u8 => self.cur.byte(),
+            else => @compileError("ScriptSource.value: unsupported type"),
+        };
+    }
+};
+
+fn viaScript(comptime T: type, data: []const u8) anyerror!void {
+    var src: ScriptSource = .{ .data = data, .cur = .{ .bytes = data } };
+    return T.harness(ScriptSource, &src, std.testing.allocator);
+}
+
+fn Target(comptime f: anytype, comptime corpus: []const []const u8) type {
+    return struct {
+        fn run(input: []const u8) anyerror!void {
+            if (@typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?) == .error_union) {
+                try f(input);
+            } else {
+                f(input);
+            }
+        }
+
+        fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+            _ = gpa;
+            var buf: [fuzz_buf_len]u8 = undefined;
+            const len: usize = src.slice(&buf);
+            if (len != 0) mark(.raw_nonempty);
+            try run(buf[0..len]);
+
+            // A corpus entry (`fuzzSeed` frames start with a 4-octet length),
+            // sometimes changed in a few places.
+            const frame = corpus[src.index(corpus.len)];
+            const body = frame[4..];
+            @memcpy(buf[0..body.len], body);
+            for (0..src.index(4)) |_| {
+                if (body.len == 0) break;
+                buf[src.index(body.len)] = src.value(u8);
+                mark(.mutated);
+            }
+            mark(.structured_run);
+            try run(buf[0..body.len]);
+        }
+    };
+}
+
+const CompressT = Target(roundTrip, &fuzz_seed_corpus);
+const StreamT = Target(streamRoundTrip, &fuzz_seed_corpus);
+const DecodeT = Target(decodeAnything, &decode_seed_corpus);
+const DecodeDict = Target(decodeWithDictionary, &decode_dict_seed_corpus);
+const DecodeStream = Target(decodeStreamAnything, &decode_stream_seed_corpus);
+const SeekableT = Target(seekableAnything, &seekable_seed_corpus);
 
 const seed_words = "the frame of the block of the window, the match of the literal; " ** 40;
 const seed_runs = ("a" ** 300) ++ ("b" ** 300) ++ ("a" ** 300);
@@ -478,4 +564,46 @@ test "fuzz corpus reaches the compressor intact" {
         try streamRoundTrip(buf[0..len]);
     }
     try std.testing.expectEqual(fuzz_seed_corpus.len - 1, nonempty);
+}
+
+test "fuzz driver: ZSTD_FUZZ" {
+    var skipped: usize = 0;
+    // A compression run is a whole round trip (a level up to 21 over up to
+    // 64 KB), so the limit per input is generous and a run is worth several
+    // decoder runs of the budget (`scale`; the streamed one is ~50 runs/s).
+    inline for (.{
+        .{ CompressT, "zstd-compress", 4 },
+        .{ StreamT, "zstd-stream", 20 },
+        .{ DecodeT, "zstd-decode", 1 },
+        .{ DecodeDict, "zstd-decode-dict", 1 },
+        .{ DecodeStream, "zstd-decode-stream", 1 },
+        .{ SeekableT, "zstd-seekable", 1 },
+    }) |t| {
+        fuzz_driver.run(t[0].harness, .{ .prefix = "ZSTD_FUZZ", .name = t[1], .default_limit_ms = 20_000, .scale = t[2] }) catch |e| switch (e) {
+            // Not asked for (no budget, or `_ONLY` names another target).
+            error.SkipZigTest => skipped += 1,
+            else => return e,
+        };
+    }
+    if (skipped == 6) return error.SkipZigTest;
+}
+
+test "fuzz harness: seeds in every test run, and it gets everywhere" {
+    reach = @splat(0);
+    // 25 per target: a compression run is a round trip of up to 64 KB at the
+    // Debug lane's speed.
+    inline for (.{ CompressT, StreamT, DecodeT, DecodeDict, DecodeStream, SeekableT }) |T| {
+        for (0..25) |seed| {
+            var prng = std.Random.DefaultPrng.init(seed);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            T.harness(fuzz_driver.Rng, &rng, std.testing.allocator) catch |e| {
+                std.debug.print("seed {d}: {t}\n", .{ seed, e });
+                return e;
+            };
+        }
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit\n", .{@as(Reach, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }

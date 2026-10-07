@@ -35,6 +35,7 @@ const field = @import("field.zig");
 const scalar = @import("scalar.zig");
 const Fe = field.Fe;
 const Shake256 = std.crypto.hash.sha3.Shake256;
+const fuzz_test = @import("fuzz_test.zig");
 
 pub const meta = .{
     .platform = .any,
@@ -819,9 +820,23 @@ test "fuzz: Point.fromBytes never crashes on arbitrary bytes" {
 }
 
 fn fuzzPointFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var script: [128]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return pointHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// Harness body, generic over its source (testkit's fuzz driver feeds it a
+/// PRNG, `testing.fuzz` a cursor over the Smith bytes).
+pub fn pointHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [57]u8 = undefined;
-    smith.bytes(&buf);
-    const p = Point.fromBytes(buf) catch return;
+    src.bytes(&buf);
+    const p = Point.fromBytes(buf) catch {
+        fuzz_test.mark(.point_rejected);
+        return;
+    };
+    fuzz_test.mark(.point_decoded);
     _ = p.toBytes();
     _ = p.clearCofactor();
 }
@@ -831,9 +846,27 @@ test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
 }
 
 fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var script: [128]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return signatureHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+pub fn signatureHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [Signature.encoded_length]u8 = undefined;
-    smith.bytes(&buf);
-    const sig = Signature.fromBytes(buf) catch return;
+    src.bytes(&buf);
+    // Half the runs force the scalar half below the group order, so the
+    // decoder's `s < L` check is judged on both sides.
+    if (src.value(bool)) {
+        buf[buf.len - 1] = 0;
+        buf[buf.len - 2] &= 0x3f;
+    }
+    const sig = Signature.fromBytes(buf) catch {
+        fuzz_test.mark(.sig_rejected);
+        return;
+    };
+    fuzz_test.mark(.sig_decoded);
     _ = sig.toBytes();
 }
 

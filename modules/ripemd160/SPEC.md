@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz ? · ct none
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean, RIPEMD160_FUZZ) · ct none
 
 **Performance:** not measured
 

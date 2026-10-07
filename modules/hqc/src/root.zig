@@ -148,5 +148,6 @@ test {
     _ = pke;
     _ = kem;
     _ = @import("kem_kat_test.zig");
+    _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
 }

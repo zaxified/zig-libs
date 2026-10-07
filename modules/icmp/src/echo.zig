@@ -967,29 +967,133 @@ test "fuzz: parsers never crash on arbitrary packets" {
 }
 
 fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
+    // Bytes first, in one `smith.slice` (see `checkPacket` for why it is one
+    // call); the structured half of `parsersHarness` then reads its choices
+    // from those same bytes through a cursor. A corpus entry is still checked
+    // as itself: the raw check always runs on exactly the drawn packet.
     var buf: [256]u8 = undefined;
-    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
-    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
-    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    const n = smith.slice(&buf);
+    var src: ScriptSource = .{ .data = buf[0..n], .cur = .{ .bytes = buf[0..n] } };
+    return parsersHarness(ScriptSource, &src, std.testing.allocator);
+}
+
+const fuzz_driver = @import("testkit").fuzz.driver;
+
+const Reach = enum { raw_nonempty, v4_reply, v4_error, v6_reply, v6_error, strip_checked, mutated };
+var reach: [@typeInfo(Reach).@"enum".fields.len]usize = @splat(0);
+
+fn mark(comptime l: Reach) void {
+    reach[@intFromEnum(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+/// `testing.fuzz`'s source: `slice` hands back the one drawn byte string,
+/// every other choice is read from it by a cursor.
+const ScriptSource = struct {
+    data: []const u8,
+    cur: @import("testkit").fuzz.Cursor,
+
+    pub fn slice(self: *ScriptSource, buf: []u8) u32 {
+        @memcpy(buf[0..self.data.len], self.data);
+        return @intCast(self.data.len);
+    }
+    pub fn index(self: *ScriptSource, len: usize) usize {
+        return self.cur.ranged(0, @intCast(len - 1));
+    }
+    pub fn value(self: *ScriptSource, comptime T: type) T {
+        return switch (T) {
+            u8 => self.cur.byte(),
+            else => @compileError("ScriptSource.value: unsupported type"),
+        };
+    }
+};
+
+/// Two checks of the parsers per run: the drawn packet as it is (what the
+/// harness has always done, and what a corpus entry means), then a packet
+/// taken from `parser_seeds` with up to two octets changed -- uniform random
+/// octets almost never pass the receive-side checksum gate, so on their own
+/// they prove only that the `else` arms return `.ignored`.
+fn parsersHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = src.slice(&buf);
+    if (len != 0) mark(.raw_nonempty);
+    try checkPacket(buf[0..len]);
+
+    // `seed()` frames start with the 4-octet little-endian length `Smith.slice` reads.
+    const frame = parser_seeds[src.index(parser_seeds.len)];
+    var pkt: [256]u8 = undefined;
+    const body = frame[4..];
+    @memcpy(pkt[0..body.len], body);
+    var plen = body.len;
+    for (0..src.index(3)) |_| {
+        if (plen == 0) break;
+        pkt[src.index(plen)] = src.value(u8);
+        mark(.mutated);
+    }
+    // Sometimes truncate: a short read of a valid packet is the other edge.
+    if (plen > 0 and src.index(4) == 0) plen = src.index(plen + 1);
+    try checkPacket(pkt[0..plen]);
+}
+
+fn checkPacket(packet: []const u8) !void {
+    // ⚠ The packet arrives from ONE `slice` draw, never `bytes` followed by a
+    // ranged length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM --
     // so `len` was 0 on every input and all three parsers were handed an empty
     // slice, which they reject on their first line. Measured 2026-09-07 over
     // the corpus above: 0 of 17 seeds non-empty and 0 packets classified as
     // anything but `.ignored` before; 16 of 17 non-empty (the empty datagram is
     // a seed on purpose) and 8 classified after.
-    const len: usize = smith.slice(&buf);
+    const len = packet.len;
+    const buf = packet;
     const raw = parseV4(buf[0..len], false);
     const stripped = parseV4(buf[0..len], true);
-    _ = parseV6(buf[0..len]);
+    const raw6 = parseV6(buf[0..len]);
+    switch (raw) {
+        .echo_reply => mark(.v4_reply),
+        .icmp_error => mark(.v4_error),
+        .ignored => {},
+    }
+    switch (raw6) {
+        .echo_reply => mark(.v6_reply),
+        .icmp_error => mark(.v6_error),
+        .ignored => {},
+    }
 
     // The strip path must be the plain path over what follows the IP header,
     // and nothing else: with a minimum-length IPv4 header in front, the two
     // calls have to agree.
     if (len >= 20 and (buf[0] & 0x0f) == 5) {
+        mark(.strip_checked);
         try std.testing.expectEqual(parseV4(buf[20..len], false), stripped);
     }
     // An error reply only ever comes back for a type this parser claims, and
     // never for a packet too short to hold the quote it reports.
     if (raw == .icmp_error) try std.testing.expect(len >= echo_header_len + 20 + echo_header_len);
+}
+
+test "fuzz driver: ICMP_FUZZ" {
+    fuzz_driver.run(parsersHarness, .{ .prefix = "ICMP_FUZZ", .name = "icmp" }) catch |e| switch (e) {
+        error.SkipZigTest => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
+test "fuzz harness: 500 seeds in every test run, and it gets everywhere" {
+    reach = @splat(0);
+    for (0..500) |seed_n| {
+        var prng = std.Random.DefaultPrng.init(seed_n);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        parsersHarness(fuzz_driver.Rng, &rng, std.testing.allocator) catch |e| {
+            std.debug.print("seed {d}: {t}\n", .{ seed_n, e });
+            return e;
+        };
+    }
+    for (reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Reach, @enumFromInt(i))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "corpus: every parser seed reaches the parsers, and the counts are pinned" {

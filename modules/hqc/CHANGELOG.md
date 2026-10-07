@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `HQC_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only.
 - **2026-10-04** — Tests: mutation run (29 mutants, 26 killed, 3 equivalent). New tests pin
   the implicit-rejection key to `J(H(ek), sigma, c)` (dropping sigma from `J` used to pass)
   and the rejection sampler's refusal of a draw equal to its threshold. No behaviour change.

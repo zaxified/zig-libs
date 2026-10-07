@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `BLINDRSA_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only.
 - **2026-10-02** — ctgrind harness: taints the value fields of rsa's new
   `montint.DynModint` (`p_mont`/`q_mont`) but not their slot `L`, the key size.
   `sign` row 216 → 7 in-file — rsa's CRT path left `std.crypto.ff`; what

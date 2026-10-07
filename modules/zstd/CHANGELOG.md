@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **Fixed (found by the new deterministic fuzz driver):** a
+  decoder that had failed inside a raw last block (content size short of the
+  frame header's) and was then fed again without a reset took the next byte as
+  more of that block and subtracted it from the 0 bytes left — an
+  integer-overflow panic in safe builds, a wrapped size in ReleaseFast.
+  `Seekable.decompress` did exactly that on its next read of the same frame.
+  `Decompressor.decompressContinue` now refuses a raw piece longer than what is
+  left (`error.SrcSizeWrong`), and a failed `Seekable.decompress` drops the
+  frame in progress so the next read restarts it. libzstd has the same state
+  after an error (it wraps silently; its contract asks for a reset).
+  Regression test in `dstream_test.zig`. New `src/fuzz_test.zig` driver
+  `ZSTD_FUZZ` (compress, stream, decode, decode-dict, decode-stream,
+  seekable). New `tools/bench.zig` (`zig build bench-zstd`) against libzstd.
+
 - **2026-10-07** — Faster decoding of long-distance frames (Z34, the same
   output and errors): a block whose offset table reaches 4 MB and beyond
   is decoded 8 sequences ahead with its match sources prefetched

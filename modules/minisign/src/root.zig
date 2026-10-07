@@ -1242,6 +1242,7 @@ test "formatKeyId matches the CLI's le64-hex convention" {
 const tkfuzz = @import("testkit").fuzz;
 const fuzzSeed = tkfuzz.seed;
 const kat = @import("kat_vectors.zig");
+const fuzz_test = @import("fuzz_test.zig");
 
 const sig_file_buf_len = 1024;
 
@@ -1286,7 +1287,15 @@ fn fuzzB64Line(cur: *tkfuzz.Cursor, comptime wire_length: usize, out: *[Base64Co
 }
 
 fn fuzzParseSignatureFile(_: void, smith: *std.testing.Smith) !void {
-    const allocator = std.testing.allocator;
+    var script: [sig_file_buf_len]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return sigFileHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// Harness body, generic over its source (testkit's fuzz driver feeds it a
+/// PRNG, `testing.fuzz` a cursor over the Smith bytes).
+pub fn sigFileHarness(comptime S: type, src: *S, allocator: std.mem.Allocator) anyerror!void {
     var buf: [sig_file_buf_len]u8 = undefined;
     // ⚠ ONE `smith.slice` call, and it is the FIRST draw. The harness used to
     // open with `smith.bytes(&comment_buf)` + a ranged length, and every knob
@@ -1305,15 +1314,41 @@ fn fuzzParseSignatureFile(_: void, smith: *std.testing.Smith) !void {
     // Measured 2026-09-07 over the corpus above: **1 distinct file and 0
     // signature files parsed before; 10 files, 3 parsed, and the generator
     // producing 9 distinct skeletons instead of 1, after.**
-    const n: usize = smith.slice(&buf);
+    const n: usize = src.slice(&buf);
     const drawn = buf[0..n];
-    _ = parseSignatureFile(drawn) catch {};
+    if (parseSignatureFile(drawn)) |_| fuzz_test.mark(.sig_file_parsed) else |_| fuzz_test.mark(.sig_file_rejected);
 
     var cur: tkfuzz.Cursor = .{ .bytes = drawn };
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try buildFuzzSignatureFile(&text, allocator, &cur);
-    _ = parseSignatureFile(text.items) catch return;
+    if (parseSignatureFile(text.items)) |_| fuzz_test.mark(.sig_file_parsed) else |_| fuzz_test.mark(.sig_file_rejected);
+
+    // (c) A well-formed file from drawn fields (known algorithm tag, printable
+    // trusted comment): random bytes essentially never get that far, so this
+    // is what judges the accept path. It MUST parse and give the fields back;
+    // the same file with one byte changed must merely not trap.
+    var raw: RawSignature = undefined;
+    raw.sig_alg = if (src.index(2) == 0) sig_alg_legacy else sig_alg_prehashed;
+    src.bytes(&raw.key_number);
+    src.bytes(&raw.signature);
+    var gsig: [signature_length]u8 = undefined;
+    src.bytes(&gsig);
+    var tc: [32]u8 = undefined;
+    const tc_len = src.index(tc.len + 1);
+    for (tc[0..tc_len]) |*c| c.* = 0x20 + @as(u8, @intCast(src.index(95)));
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try writeSignatureFile(&aw.writer, "fuzz", raw, tc[0..tc_len], gsig);
+    const parsed = parseSignatureFile(aw.written()) catch return error.WellFormedSignatureFileRejected;
+    if (!std.mem.eql(u8, &parsed.signature.toBytes(), &raw.toBytes()) or
+        !std.mem.eql(u8, parsed.trusted_comment, tc[0..tc_len]) or
+        !std.mem.eql(u8, &parsed.global_signature, &gsig)) return error.SignatureFileRoundTrip;
+    fuzz_test.mark(.sig_file_parsed);
+    const damaged = try allocator.dupe(u8, aw.written());
+    defer allocator.free(damaged);
+    damaged[src.index(damaged.len)] ^= @as(u8, 1) << @intCast(src.index(8));
+    _ = parseSignatureFile(damaged) catch {};
 }
 
 /// The 4-line skeleton, with the comment text and both payloads driven by the
@@ -1423,24 +1458,32 @@ test "fuzz: parseSecretKeyFile/openSecretKey never panic on arbitrary bytes" {
 }
 
 fn fuzzParseSecretKeyFile(_: void, smith: *std.testing.Smith) !void {
-    const allocator = std.testing.allocator;
+    var script: [secret_key_file_buf_len]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return secretKeyFileHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+pub fn secretKeyFileHarness(comptime S: type, src: *S, allocator: std.mem.Allocator) anyerror!void {
     var buf: [secret_key_file_buf_len]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = src.slice(&buf);
     const drawn = buf[0..n];
     if (parseSecretKeyFile(drawn)) |parsed| {
+        fuzz_test.mark(.key_file_parsed);
         var pw_buf: [16]u8 = undefined;
         const pw_len: usize = @min(pw_buf.len, drawn.len);
         @memcpy(pw_buf[0..pw_len], drawn[0..pw_len]);
         _ = openSecretKey(allocator, parsed.key, pw_buf[0..pw_len]) catch {};
-    } else |_| {}
+    } else |_| fuzz_test.mark(.key_file_rejected);
 
     var cur: tkfuzz.Cursor = .{ .bytes = drawn };
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try buildFuzzSecretKeyFile(&text, allocator, &cur);
     if (parseSecretKeyFile(text.items)) |parsed| {
+        fuzz_test.mark(.key_file_parsed);
         _ = openSecretKey(allocator, parsed.key, "fuzz password") catch {};
-    } else |_| {}
+    } else |_| fuzz_test.mark(.key_file_rejected);
 }
 
 /// The 2-line skeleton, with the comment text and the `RawSecretKey` fields
@@ -1553,6 +1596,14 @@ test "fuzz: isPrintableComment never panics on arbitrary bytes" {
 }
 
 fn fuzzIsPrintableComment(_: void, smith: *std.testing.Smith) !void {
+    var script: [64]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return commentHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+pub fn commentHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var buf: [64]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
@@ -1562,8 +1613,8 @@ fn fuzzIsPrintableComment(_: void, smith: *std.testing.Smith) !void {
     // no end to walk to. Measured 2026-09-07 over the corpus above: **0 of 13
     // seeds non-empty and 0 comments accepted before, 12 of 13 non-empty (one
     // seed IS the empty comment) and 5 accepted after.**
-    const len: usize = smith.slice(&buf);
-    _ = isPrintableComment(buf[0..len]);
+    const len: usize = src.slice(&buf);
+    if (isPrintableComment(buf[0..len])) fuzz_test.mark(.comment_printable) else fuzz_test.mark(.comment_rejected);
 }
 
 test "corpus: every comment reaches isPrintableComment, and the verdicts are pinned" {
@@ -1597,6 +1648,7 @@ test "corpus: every comment reaches isPrintableComment, and the verdicts are pin
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {

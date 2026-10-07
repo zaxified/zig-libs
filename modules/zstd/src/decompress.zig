@@ -975,6 +975,14 @@ pub const Decompressor = struct {
                         d.expected = 0;
                     },
                     0 => {
+                        // More than is left of the block can only arrive after
+                        // an error left this stage standing (e.g. a last block
+                        // short of the content size) and the caller fed on
+                        // without a reset: `nextSrcSizeWithInputSize` answers 1
+                        // for an exhausted raw block, as libzstd's does, and
+                        // `expected - 1` would underflow (libzstd wraps it).
+                        // Found by the ZSTD_FUZZ seekable target, 2026-10-07.
+                        if (src.len > d.expected) return error.SrcSizeWrong;
                         if (src.len > dst.len) return error.DstSizeTooSmall;
                         @memcpy(dst[0..src.len], src);
                         r_size = src.len;

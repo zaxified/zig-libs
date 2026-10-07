@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `ED448_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only. New `tools/bench.zig` (`zig build bench-ed448`) against OpenSSL Ed448/X448.
 - **2026-10-04** — Fix (BEHAVIOURAL): `verify`/`verifyPh` now reject `S >= L` themselves
   (`error.InvalidScalar`). Before, only `Signature.fromBytes` checked it, so a `Signature`
   built field by field with `S + L` (or bits 448..455 set) verified — a malleable second

@@ -362,23 +362,75 @@ fn freshReceiver() Transport {
     return Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 }
 
-fn fuzzRecvLength(_: void, smith: *std.testing.Smith) !void {
+const fuzz_test = @import("fuzz_test.zig");
+
+/// A genuine `sendMessage("hello")` frame from the published KAT keys: the
+/// length frame, then the 5 + 16 octet body.
+fn genuineFrame() [length_frame_len + 5 + 16]u8 {
+    var out: [length_frame_len + 5 + 16]u8 = undefined;
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    sender.sendMessage("hello", &out) catch unreachable;
+    return out;
+}
+
+/// `frame` as a `testing.fuzz` corpus entry (what `testkit.fuzz.seed` makes at
+/// comptime; the frame here is only known at run time).
+fn runtimeSeed(comptime n: usize, frame: *const [n]u8) [4 + n]u8 {
+    var out: [4 + n]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], n, .little);
+    out[4..].* = frame.*;
+    return out;
+}
+
+/// Harness body, generic over its source (testkit's fuzz driver feeds it a
+/// PRNG, `testing.fuzz` a cursor over the Smith bytes). The raw frame is drawn
+/// FIRST; the overlay choice after it. Random bytes never pass the AEAD tag, so
+/// the overlays put a genuine frame (must be accepted, length 5) and the same
+/// frame with one bit flipped (must be refused) in front of the decoder.
+pub fn recvLengthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     var t = freshReceiver();
     // Fixed-size read (not a ranged draw before it), so every input, fuzzed
     // or not, reaches `decryptWithAd` for real -- no `Smith` length-draw
     // collapse for this harness to fall into.
     var lc: [length_frame_len]u8 = undefined;
-    smith.bytes(&lc);
-    _ = t.recvLength(&lc) catch return;
+    src.bytes(&lc);
+    var must_accept = false;
+    var must_refuse = false;
+    switch (src.index(3)) {
+        0 => {},
+        1 => {
+            lc = genuineFrame()[0..length_frame_len].*;
+            must_accept = true;
+        },
+        else => {
+            lc = genuineFrame()[0..length_frame_len].*;
+            lc[src.index(length_frame_len)] ^= @as(u8, 1) << @intCast(src.index(8));
+            must_refuse = true;
+        },
+    }
+    const l = t.recvLength(&lc) catch {
+        if (must_accept) return error.GenuineLengthFrameRefused;
+        fuzz_test.mark(.length_refused);
+        return;
+    };
+    if (must_refuse) return error.CorruptedLengthFrameAccepted;
+    if (must_accept and l != 5) return error.GenuineLengthWrong;
+    fuzz_test.mark(.length_accepted);
+}
+fn fuzzRecvLength(_: void, smith: *std.testing.Smith) !void {
+    var script: [64]u8 = undefined;
+    const k = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..k] } };
+    return recvLengthHarness(fuzz_test.ScriptSource, &src, testing.allocator);
 }
 test "fuzz Transport.recvLength never panics" {
     // Seeded with a genuine encrypted length frame (from the published
     // message-test fixture) so the corpus reaches the accept path at least
     // once, not just the near-certain AEAD-tag rejection of random bytes.
-    var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
-    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    try seed_sender.sendMessage("hello", &seed_out);
-    try testing.fuzz({}, fuzzRecvLength, .{ .corpus = &.{seed_out[0..length_frame_len]} });
+    const seed_out = genuineFrame();
+    const seed = runtimeSeed(length_frame_len, seed_out[0..length_frame_len]);
+    try testing.fuzz({}, fuzzRecvLength, .{ .corpus = &.{&seed} });
 }
 
 /// `recvMessage`'s nonce is the SECOND use of `rx.cipher` in a real
@@ -387,22 +439,50 @@ test "fuzz Transport.recvLength never panics" {
 /// which is never what a real message body is keyed with -- so this target
 /// first spends one genuine `recvLength` call (on the published seed's own
 /// length frame, result ignored) purely to advance the nonce the way real
-/// usage would, THEN fuzzes only the message body.
-fn fuzzRecvMessage(_: void, smith: *std.testing.Smith) !void {
+/// usage would, THEN fuzzes only the message body (overlays as for
+/// `recvLengthHarness`: genuine body must be accepted and read "hello", a
+/// bit-flipped one must be refused).
+pub fn recvMessageHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const genuine = genuineFrame();
     var t = freshReceiver();
-    _ = t.recvLength(&fixed_seed_length_frame) catch {};
+    _ = t.recvLength(genuine[0..length_frame_len]) catch {};
     var c: [5 + 16]u8 = undefined;
-    smith.bytes(&c);
+    src.bytes(&c);
+    var must_accept = false;
+    var must_refuse = false;
+    switch (src.index(3)) {
+        0 => {},
+        1 => {
+            c = genuine[length_frame_len..].*;
+            must_accept = true;
+        },
+        else => {
+            c = genuine[length_frame_len..].*;
+            c[src.index(c.len)] ^= @as(u8, 1) << @intCast(src.index(8));
+            must_refuse = true;
+        },
+    }
     var out: [5]u8 = undefined;
-    _ = t.recvMessage(&c, &out) catch return;
+    t.recvMessage(&c, &out) catch {
+        if (must_accept) return error.GenuineMessageRefused;
+        fuzz_test.mark(.message_refused);
+        return;
+    };
+    if (must_refuse) return error.CorruptedMessageAccepted;
+    if (must_accept and !std.mem.eql(u8, &out, "hello")) return error.GenuineMessageWrong;
+    fuzz_test.mark(.message_accepted);
 }
-var fixed_seed_length_frame: [length_frame_len]u8 = undefined;
+fn fuzzRecvMessage(_: void, smith: *std.testing.Smith) !void {
+    var script: [64]u8 = undefined;
+    const k = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..k] } };
+    return recvMessageHarness(fuzz_test.ScriptSource, &src, testing.allocator);
+}
 test "fuzz Transport.recvMessage never panics" {
-    var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
-    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
-    try seed_sender.sendMessage("hello", &seed_out);
-    fixed_seed_length_frame = seed_out[0..length_frame_len].*;
-    try testing.fuzz({}, fuzzRecvMessage, .{ .corpus = &.{seed_out[length_frame_len..]} });
+    const seed_out = genuineFrame();
+    const seed = runtimeSeed(5 + 16, seed_out[length_frame_len..]);
+    try testing.fuzz({}, fuzzRecvMessage, .{ .corpus = &.{&seed} });
 }
 
 test "corpus: the transport seeds reach a real AEAD decrypt, not just the length gate" {

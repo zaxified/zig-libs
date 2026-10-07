@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `MINISIGN_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only. New `tools/bench.zig` (`zig build bench-minisign`) against the minisign CLI.
 - **2026-10-04** — Tests: mutation schemata run (43 mutants, 42 killed, 1 equivalent).
   Four new tests: malformed / overlong / out-of-range / C1-control UTF-8 refused by
   `isPrintableComment` (U+009B is the 8-bit CSI), a CRLF signature file verifies, the

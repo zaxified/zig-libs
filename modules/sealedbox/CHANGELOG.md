@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `SEALEDBOX_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only. New `tools/bench.zig` (`zig build bench-sealedbox`) against libsodium `crypto_box_seal`.
 - **2026-09-16** — **BREAKING:** the secret-key text codecs that measured a
   leak write into caller buffers (audit A1 L8, a measured defect on a module
   with no consumer — the QUESTIONS-ROUND-2 Q3 rule).

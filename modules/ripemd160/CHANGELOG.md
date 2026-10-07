@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
+  bodies are now generic over their source and run by testkit's deterministic
+  driver `RIPEMD160_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
+  every test run); test code only.
 - **2026-09-15** — **A1 fix campaign, perf pass: `compress`'s 80-round schedule
   unrolled at compile time (`inline for` instead of a runtime `while`
   loop).** Measured A/B, same process, ReleaseFast, 8 KiB input, 5

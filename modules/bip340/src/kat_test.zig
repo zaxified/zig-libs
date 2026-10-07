@@ -27,6 +27,7 @@ const std = @import("std");
 const bip340 = @import("root.zig");
 const v = @import("kat_vectors.zig");
 const k256 = @import("k256");
+const fuzz_test = @import("fuzz_test.zig");
 const Scalar = k256.Secp256k1.scalar.Scalar;
 
 fn hexAlloc(gpa: std.mem.Allocator, hex_str: []const u8) ![]u8 {
@@ -324,6 +325,17 @@ test "fuzz: verify never panics on corrupted signature bytes" {
 }
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    var script: [128]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: fuzz_test.ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return verifyHarness(fuzz_test.ScriptSource, &src, std.testing.allocator);
+}
+
+/// The harness body, generic over its source (testkit's fuzz driver feeds it
+/// a PRNG, `testing.fuzz` a cursor over the Smith bytes). The signature bytes
+/// are drawn FIRST; the overlay choice after them.
+pub fn verifyHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
     const vec0 = v.vectors[0];
     const pk = bip340.XOnlyPublicKey.fromBytes(hex32(vec0.public_key) catch unreachable) catch return;
     var msg_buf: [32]u8 = undefined;
@@ -332,14 +344,46 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     // ⚠ ONE byte-first draw. Never a ranged draw before the bytes: see the
     // block comment above for the four months that cost.
     var buf: [64]u8 = undefined;
-    const n: usize = smith.slice(&buf);
+    const n: usize = src.slice(&buf);
     // `fromBytes` takes exactly 64 octets, so a short draw is zero-padded the
     // way a short wire read would have to be.
     var bytes: [64]u8 = [_]u8{0} ** 64;
     @memcpy(bytes[0..n], buf[0..n]);
 
-    const sig = bip340.Signature.fromBytes(bytes) catch return;
-    _ = bip340.verify(pk, &msg_buf, sig);
+    // Overlays steer random bytes to the places the range checks and the
+    // curve equation live; random 64 octets alone are never out of range.
+    var pristine = false;
+    switch (src.index(5)) {
+        0 => {},
+        1 => bytes[src.index(64)] ^= @as(u8, 1) << @intCast(src.index(8)),
+        2 => @memset(bytes[0..32], 0xFF), // r >= p
+        3 => @memset(bytes[32..49], 0xFF), // s > n
+        else => {
+            // The published signature itself: the one input that must verify.
+            var sig0: [64]u8 = undefined;
+            _ = std.fmt.hexToBytes(&sig0, vec0.signature) catch unreachable;
+            bytes = sig0;
+            pristine = true;
+        },
+    }
+
+    const sig = bip340.Signature.fromBytes(bytes) catch {
+        fuzz_test.mark(.rejected);
+        return;
+    };
+    fuzz_test.mark(.decoded);
+    const ok = bip340.verify(pk, &msg_buf, sig);
+    if (pristine) {
+        if (!ok) return error.ValidSignatureRejected;
+        fuzz_test.mark(.verified);
+    } else if (ok) {
+        // A signature other than the published one verifying over this
+        // (key, message) would be a forgery -- unless it is the same bytes.
+        var sig0: [64]u8 = undefined;
+        _ = std.fmt.hexToBytes(&sig0, vec0.signature) catch unreachable;
+        if (!std.mem.eql(u8, &sig0, &bytes)) return error.ForgedSignatureAccepted;
+        fuzz_test.mark(.verified);
+    }
 }
 
 test "corpus: every signature seed reaches fromBytes, and the outcomes are pinned" {

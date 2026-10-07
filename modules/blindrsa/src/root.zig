@@ -841,6 +841,7 @@ pub fn verify(pk: rsa.PublicKey, comptime Hash: type, prepared_msg: []const u8, 
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 test "meta names RFC 9474 and the sibling rsa dep" {
