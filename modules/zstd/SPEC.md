@@ -27,14 +27,14 @@ Zig rows before std's were added 2026-10-07 (stars and pushes as of that date).
 | [gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) (`zstd` crate) | Rust | BSD-3-Clause | 657 | v0.14.0 (2026-09-04) | Bindings to libzstd — full features, but links the C library. |
 | [DataDog/zstd](https://github.com/DataDog/zstd) | Go (cgo) | BSD-3-Clause | 806 | v1.5.7+patch2 (2026-04-21) | cgo bindings to libzstd — same trade-off as the Rust bindings. |
 | [muhammad-fiaz/zstd.zig](https://github.com/muhammad-fiaz/zstd.zig) | Zig | MIT | 14 | v0.0.4 (2026-10-04) | Pure Zig since v0.0.2 (v0.0.1 bound libzstd), needs Zig 0.17; its own encoder, not libzstd's bytes. Measured here 2026-10-07 on the Silesia corpus (`-mcpu=x86_64_v3`, ReleaseFast): ratio 1.53 at level 3 and 1.95 at 19 where libzstd and this module reach 3.21 and 4.01, compression in 4.6–12× and decoding (libzstd's frames) in 3.8–4.4× libzstd's time; its frames are valid (`zstd -t`, 84 of 84). Decodes the legacy v0.1–v0.5 frames. |
-| [c4milo/stdx](https://github.com/c4milo/stdx) `zstd` | Zig | none stated (no `LICENSE`, GitHub: none) | 1 | — (push 2026-10-05) | Decoder only, no compressor. Its own CI tables claim 1.18–1.32× libzstd's decoding speed at level 3 on an EPYC 7763; not measured here, and its source not read (no licence). |
+| [c4milo/stdx](https://github.com/c4milo/stdx) `zstd` | Zig | none stated (no `LICENSE`, GitHub: none) | 1 | — (push 2026-10-05) | Decoder only, no compressor. Measured here 2026-10-07 (built and run sandboxed, its source not read: no licence): 0.84–0.92× libzstd's cycles decoding libzstd's Silesia frames, the 24 of levels 1 and 19 byte for byte; its own CI claims 1.18–1.32× libzstd's speed. Its docs credit hand-written assembly for sequence execution (see Z33). |
 | Zig `std.compress.zstd` | Zig | MIT | — | Zig 0.16.0 | Decoder only (`Decompress`; checked in 0.16.0's `lib/std/compress/`): no compressor, no dictionaries, no training. |
 
 **Where we are ahead:** of the implementations above that do not link libzstd, the only one
 that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
 dictionaries, training, multithreading and the seekable format without linking C. **Where we
 are behind:** run-time CPU dispatch (Z22), the legacy formats (refused), and decoding
-speed: 1.04–1.16× libzstd's cycles (Z33), where stdx claims to be faster than libzstd.
+speed: 1.04–1.16× libzstd's cycles (Z33), where stdx's decoder takes 0.84–0.92×.
 
 ## What this module is, and what it is not
 
@@ -3591,6 +3591,15 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   hot loop extracts with `bzhi`), and the prefetching sequence decoder,
   which libzstd switches to past 16 MB of history (`mozilla`, `webster`,
   `nci`) and this port does not have (see *Decoder*).
+  Beyond parity: c4milo/stdx decodes the same frames in 0.84–0.92×
+  libzstd's cycles (0.82–0.93× its instructions; same method, same run, the
+  trial above at 1.00–1.02×). Its design notes (`docs/decisions.md`,
+  2026-09-27) say its Zig sequence loop had stalled at 0.72–0.94× libzstd's
+  speed with 24–67 % more instructions — this port's symptom — and that
+  hand-written assembly for sequence execution (aarch64, then x86-64) is
+  what passed it. An assembly loop here would be a decision of its own
+  (portability, the 32-bit lanes, the mutation and fuzz anchors), not part
+  of Z33.
 - ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
   *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
   `contrib/seekable_format`.
