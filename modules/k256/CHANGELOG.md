@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `mulDoubleBasePublic`
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `mulDoubleBasePublic`
   with `basePoint` as one base (every BIP340/ECDSA/adaptor verifier) runs the new
   `ecmult.zig`: Jacobian coordinates with incomplete formulas (public data only), mixed
   additions against P's odd multiples brought to one common Z, and a comptime affine
@@ -15,7 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   and std (random, 23 edge scalars × G/−G/2G/φ(G)/projective, exact cancellations to the
   identity) and a corrupted-table negative control; ctgrind counts unchanged, digests
   re-pinned.
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.invert` and
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.invert` and
   `Fe.sqrt` use the run-of-ones addition chain (255 S + 15 M / 253 S + 13 M, libsecp256k1's
   chain) instead of square-and-multiply over the whole exponent; the amd64 field core finishes
   its Solinas reduction with ONE conditional subtraction after fold 2 (the value is then

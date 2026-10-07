@@ -94,12 +94,12 @@ Inversion is Fermat (`a^(p−2)`) and square roots `a^((p+1)/4)` (valid because
 `p ≡ 3 mod 4`, BIP340's `lift_x` root), both through libsecp256k1's run-of-ones
 addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed tail):
 255 S + 15 M and 253 S + 13 M, a fixed schedule, so constant-time in `a`. Until
-2026-10-08 both ran a square-and-multiply over the whole exponent (~2× the work);
+2026-10-07 both ran a square-and-multiply over the whole exponent (~2× the work);
 `powConst` remains as their test oracle.
 
 The amd64 core needs only TWO folds: after fold 2 the value is `< 2^256 + 2^67 <
 2p`, so one masked "`+c`, keep if it (or fold 2) carried" step finishes — see
-`fast_core.zig`'s module doc (2026-10-08; it had mirrored all four folds plus a
+`fast_core.zig`'s module doc (2026-10-07; it had mirrored all four folds plus a
 separate canonicalise). The portable `reduceWide` keeps the four-fold form.
 
 ## Point representation & scalar multiplication
@@ -137,7 +137,7 @@ Scalar multiply variants:
 - **`mulDoubleBasePublic`** — VARIABLE-TIME `s1·P1 + s2·P2`, the verifier's
   `s·G − e·P` workhorse (BIP340 verify + ECDSA verify). When one base is
   `basePoint` (exact limbs — every verifier passes the constant) it runs
-  `ecmult.mulDoubleBaseG` (2026-10-08): libsecp256k1's `ecmult` shape — Jacobian
+  `ecmult.mulDoubleBaseG` (2026-10-07): libsecp256k1's `ecmult` shape — Jacobian
   coordinates with the incomplete `a = 0` formulas (dbl 2M+5S, mixed add 8M+3S;
   the special cases are branches, legal because everything is public), GLV+wNAF
   on both scalars, P's odd multiples brought to one common Z so they act as
@@ -565,7 +565,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 ## Backlog (the Fable phase + beyond)
 
 - **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
-  33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-08: addition-chain
+  33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
   — verify 85 → 59 µs. Open, by expected gain: (1) a variable-time safegcd inversion for
   public data (verify's affine conversion, ~6 µs on the chain today); (2) `verifyBatch` /

@@ -300,8 +300,30 @@ pub const SignError = error{
 /// does not consume `io`.
 pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
-    return signImpl(secret_key, msg, aux_rand, computeUnverified);
+    return signImpl(.{ .secret = secret_key }, msg, aux_rand, computeUnverified);
 }
+
+/// `sign` with steps 1-2 already done: `key_pair` is what
+/// `KeyPair.fromSecretKey` returned, kept by a caller that signs repeatedly
+/// with one key (libsecp256k1's `schnorrsig_sign32` takes its keypair the
+/// same way). Saves the `d·G` multiply and its inversion on every call;
+/// produces the same bytes as `sign` with that key's `SecretKey`.
+///
+/// `KeyPair`'s fields are public, so a pair can be forged or corrupted (a
+/// `public` that is not `secret·G`, the odd-y `d'` instead of `d`, a zero
+/// or `≥ n` scalar). Such a pair never yields a signature: a scalar `≥ n` is
+/// `error.InvalidSecretKey` (step 9 parses it), and every other mismatch
+/// fails the step-10 self-check against `key_pair.public`
+/// (`error.SignatureVerificationFailed`).
+pub fn signWithKeyPair(key_pair: *const KeyPair, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
+    _ = io; // as in `sign`
+    return signImpl(.{ .pair = key_pair }, msg, aux_rand, computeUnverified);
+}
+
+/// The key `signImpl` signs with: a secret key (steps 1-2 run inside the
+/// burned frame) or a caller's ready `KeyPair`. Which variant is used is
+/// the caller's choice of API, public.
+const SignKey = union(enum) { secret: SecretKey, pair: *const KeyPair };
 
 /// The (steps 1-9, no self-check) result `computeUnverified` — or a test's
 /// deliberately-corrupted stand-in — hands to `signImpl`.
@@ -333,12 +355,12 @@ const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey };
 /// self-check's own verdict ignored/short-circuited (RED) — plus a
 /// positive control (an honest computation still succeeds).
 fn signImpl(
-    secret_key: SecretKey,
+    key: SignKey,
     msg: []const u8,
     aux_rand: [32]u8,
-    compute: *const fn (SecretKey, []const u8, [32]u8) SignError!ComputeResult,
+    compute: *const fn (SignKey, []const u8, [32]u8) SignError!ComputeResult,
 ) SignError![64]u8 {
-    const computed = try computeAndBurn(secret_key, msg, aux_rand, compute);
+    const computed = try computeAndBurn(key, msg, aux_rand, compute);
     const parsed = Signature.fromBytes(computed.sig) catch return error.SignatureVerificationFailed;
     if (!verify(computed.pubkey, msg, parsed)) return error.SignatureVerificationFailed;
     return computed.sig;
@@ -361,12 +383,12 @@ fn signImpl(
 /// that depth are zeroed whatever layout a compiler picks for the frames in
 /// between. Same fix as `k256`'s `ecdsa_recover.sign` (A1 k256 G2).
 fn computeAndBurn(
-    secret_key: SecretKey,
+    key: SignKey,
     msg: []const u8,
     aux_rand: [32]u8,
-    compute: *const fn (SecretKey, []const u8, [32]u8) SignError!ComputeResult,
+    compute: *const fn (SignKey, []const u8, [32]u8) SignError!ComputeResult,
 ) SignError!ComputeResult {
-    const result = compute(secret_key, msg, aux_rand);
+    const result = compute(key, msg, aux_rand);
     burnSignStack();
     return result;
 }
@@ -393,9 +415,13 @@ noinline fn burnSignStack() void {
 /// Steps 1-9 of `sign` (no self-check) — the real computation `signImpl`
 /// runs in production, and the honest baseline the F5 test's corrupted
 /// stand-in derives from. `noinline`: see `burnSignStack`.
-noinline fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!ComputeResult {
-    // Steps 1-2: even-y-normalized effective scalar d + x-only public key.
-    var kp = try KeyPair.fromSecretKey(secret_key);
+noinline fn computeUnverified(key: SignKey, msg: []const u8, aux_rand: [32]u8) SignError!ComputeResult {
+    // Steps 1-2: even-y-normalized effective scalar d + x-only public key
+    // (or the caller's pair, which already holds them; the copy is zeroed).
+    var kp = switch (key) {
+        .secret => |sk| try KeyPair.fromSecretKey(sk),
+        .pair => |p| p.*,
+    };
     defer kp.deinit();
     var d_bytes = kp.secret;
     defer std.crypto.secureZero(u8, &d_bytes);
@@ -699,7 +725,7 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
 
     // Positive control: signImpl with the real computation is exactly what
     // sign() does -- same bytes, no regression from the seam.
-    const honest = try signImpl(sk, msg, aux_rand, computeUnverified);
+    const honest = try signImpl(.{ .secret = sk }, msg, aux_rand, computeUnverified);
     const via_sign = try sign(sk, msg, aux_rand, undefined);
     try std.testing.expectEqualSlices(u8, &honest, &via_sign);
 
@@ -710,23 +736,23 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
     // inside signImpl, THIS is what turns red: the corrupted signature
     // would be returned as `ok(...)` instead of erroring.
     const corruptS = struct {
-        fn call(k: SecretKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
+        fn call(k: SignKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
             var r = try computeUnverified(k, m, a);
             r.sig[63] ^= 0x01; // flip a bit of s -- the M14b-shaped fault
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(sk, msg, aux_rand, corruptS));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = sk }, msg, aux_rand, corruptS));
 
     // Same for a fault in R (the first 32 bytes, step 5-6's output).
     const corruptR = struct {
-        fn call(k: SecretKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
+        fn call(k: SignKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
             var r = try computeUnverified(k, m, a);
             r.sig[0] ^= 0x01;
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(sk, msg, aux_rand, corruptR));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = sk }, msg, aux_rand, corruptR));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {
@@ -755,7 +781,7 @@ test "KeyPair.deinit zeroizes the effective signing scalar but leaves public unt
 }
 
 noinline fn stackprobeComputeAndBurn(sk: SecretKey, aux: [32]u8) void {
-    const result = computeAndBurn(sk, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
+    const result = computeAndBurn(.{ .secret = sk }, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
     std.mem.doNotOptimizeAway(&result);
 }
 

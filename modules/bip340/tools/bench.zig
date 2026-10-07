@@ -17,8 +17,11 @@
 //! Workloads, each timed per operation:
 //!   keypair  secret key -> x-only public key (ours: `KeyPair.fromSecretKey`,
 //!            theirs: `keypair_create` + `keypair_xonly_pub`)
-//!   sign     BIP340 signature of a 32-byte message (ours takes a secret key,
-//!            theirs a ready keypair; ours also derives the public key inside)
+//!   sign     BIP340 signature of a 32-byte message from a ready key pair
+//!            (ours: `signWithKeyPair`, theirs: `schnorrsig_sign32`); ours
+//!            also runs its mandatory self-verification
+//! Until 2026-10-07 ours signed with `sign(secret_key)`, which also derives
+//! the public key on every call (~27 µs more than the pair form).
 //!   verify   one signature (ours lifts the x-only key per call, theirs parses
 //!            it once beforehand)
 //! plus an informational row `verifyBatch/sig`, ours only (libsecp has no batch
@@ -49,6 +52,7 @@ const Row = struct { ns: f64, count: u64 };
 const Ctx = struct {
     io: std.Io,
     sk: bip340.SecretKey,
+    kp: *const bip340.KeyPair,
     pk: bip340.XOnlyPublicKey,
     msg: [32]u8,
     aux: [32]u8,
@@ -62,7 +66,7 @@ fn doKeypair(c: Ctx) usize {
     return 1;
 }
 fn doSign(c: Ctx) usize {
-    const s = bip340.sign(c.sk, &c.msg, c.aux, c.io) catch unreachable;
+    const s = bip340.signWithKeyPair(c.kp, &c.msg, c.aux, c.io) catch unreachable;
     std.mem.doNotOptimizeAway(&s);
     return 1;
 }
@@ -190,7 +194,7 @@ pub fn main(init: std.process.Init) !u8 {
         it.* = .{ .pubkey = k.public, .msg = try arena.dupe(u8, &m), .sig = try bip340.Signature.fromBytes(s) };
     }
 
-    const ctx: Ctx = .{ .io = io, .sk = sk, .pk = kp.public, .msg = msg, .aux = aux, .sig = sig, .batch = items };
+    const ctx: Ctx = .{ .io = io, .sk = sk, .kp = &kp, .pk = kp.public, .msg = msg, .aux = aux, .sig = sig, .batch = items };
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);

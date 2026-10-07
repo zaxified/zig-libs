@@ -13,7 +13,7 @@ the design and threat model.
 | File | Contents |
 |---|---|
 | `hash.zig` | `taggedHash`/`taggedHasher` (BIP340's `SHA256(SHA256(tag)‖SHA256(tag)‖msg)`, all three domain tags, comptime-midstate-optimized) + `taggedHashRuntime`/`taggedHasherRuntime` (same construction for tags only known at runtime, e.g. BOLT#12's per-stream nonce-leaf tag) |
-| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `xonlyBytesOf` (structural 33-or-32-byte point field → 32-byte x-only view), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `sign`, `verify`, `verifyBatch` |
+| `root.zig` | `XOnlyPublicKey` (parse + `lift_x`), `xonlyBytesOf` (structural 33-or-32-byte point field → 32-byte x-only view), `SecretKey`/`PublicKey`/`KeyPair` (even-y normalization + derivation), `Signature` (parse/serialize + canonical range checks), `sign`, `signWithKeyPair`, `verify`, `verifyBatch` |
 | `kat_vectors.zig` | The 19 official BIP340 test vectors, embedded |
 | `kat_test.zig` | Full KAT assertions (codecs, derivation, sign round-trip, verify accept/reject) + batch-verification correctness tests |
 
@@ -51,6 +51,7 @@ const bytes = sig.toBytes();
 
 ```zig
 const sig_bytes = try bip340.sign(sk, msg, aux_rand, io); // includes the spec-mandated self-verify
+const sig2 = try bip340.signWithKeyPair(&kp, msg, aux_rand, io); // same bytes, skips re-deriving P
 const ok = bip340.verify(xonly, msg, sig); // never panics/errors: false on every failure path
 const batch_ok = bip340.verifyBatch(&.{.{ .pubkey = xonly, .msg = msg, .sig = sig }}, io);
 ```

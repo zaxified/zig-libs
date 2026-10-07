@@ -52,7 +52,7 @@
 //!          `T` carries out (`p = 2^256 − c`), and then `W − p` is `T`'s low
 //!          256 bits (CF2 = 1 forces `V < 2^67`, so `T` cannot carry too).
 //!          Select with an `sbb`/`neg`/`or` mask + XOR-blend — no branch, no
-//!          CMOV. Result `< p`. Until 2026-10-08 this step was two further
+//!          CMOV. Result `< p`. Until 2026-10-07 this step was two further
 //!          `c·carry` folds plus a separate canonicalise, mirroring
 //!          `normalize` literally; the `< 2p` bound makes them redundant.
 //!          CF2 = 1 is reached by the edge inputs of `oracle_test.zig`
@@ -144,7 +144,7 @@ const solinas_reduce =
     \\ xorl %%r15d, %%r15d
     // fold 2: += c·x4 (c·x4 < 2^67: lo→rax, hi→rcx ≤ 2^3); CF2 → rsi (was 0).
     // The total W = V + CF2·2^256 is now < 2^256 + 2^67 < 2p, so ONE
-    // conditional subtraction of p finishes the reduction (2026-10-08; it
+    // conditional subtraction of p finishes the reduction (2026-10-07; it
     // replaced two more c·carry folds and a separate canonicalise, ~15
     // cycles off the serial chain).
     \\ mulxq %%rcx, %%rax, %%rcx

@@ -378,7 +378,7 @@ pub const Fe = struct {
     ///
     /// `p − 2` = 223 ones, a zero, 22 ones, 4 zeros, `101101` — the
     /// `onesRuns` head plus a fixed tail: 255 squarings + 15 multiplies, about
-    /// half the cost of the square-and-multiply loop it replaced (2026-10-08).
+    /// half the cost of the square-and-multiply loop it replaced (2026-10-07).
     /// `powConst` stays as its differential oracle in the tests.
     pub fn invert(a: Fe) Fe {
         const r = onesRuns(a);

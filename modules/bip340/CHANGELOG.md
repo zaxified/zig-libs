@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NEW API:** `signWithKeyPair(*const KeyPair, msg, aux_rand, io)`, the
+  `sign` of a caller who keeps the `KeyPair` (libsecp256k1's `schnorrsig_sign32` takes its
+  keypair the same way): same bytes as `sign`, without re-deriving `d·G` and its inversion on
+  every call (~27 µs). Same path as `sign` (burned stack, mandatory step-10 self-check); a
+  forged pair (wrong `public`, other-parity, zero or `n` scalar) returns an error, never a
+  signature — pinned on every official secret-key vector. With k256's speed-ups of the same
+  day, bench-bip340 now reads keypair 1.31×, sign 4.32× (with keypair), verify 1.76×
+  libsecp256k1 (was 1.56 / 7.37 / 2.56×). ctgrind `sign` 80 → 82, all in the self-check's
+  variable-time verify (see `ctgrind-expected.tsv`).
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
   bodies are now generic over their source and run by testkit's deterministic
   driver `BIP340_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in

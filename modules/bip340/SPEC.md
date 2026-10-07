@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 1.56–7.37× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.31–4.32× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
 
 **Known defects:** none recorded
 

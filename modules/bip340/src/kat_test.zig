@@ -16,7 +16,9 @@
 //!     normalization + derived-public-key computation, on every vector
 //!     that has a known secret key (indices 0-3, 15-18).
 //!   - Full `sign` round-trip: every secret-key vector signs to the exact
-//!     64 published signature bytes.
+//!     64 published signature bytes — and so does `signWithKeyPair`, while
+//!     forged key pairs (wrong public key, other-parity/zero/`n` scalar)
+//!     return an error instead of a signature.
 //!   - Full `verify`: every vector's `verification result` column matched
 //!     exactly — all TRUE rows accept, all 10 FALSE rows reject.
 //!   - `verifyBatch` correctness (no official KAT vectors exist for it):
@@ -135,6 +137,42 @@ test "KAT: sign reproduces the expected signature for every secret-key vector" {
         const got = try bip340.sign(sk, msg, aux, io);
         try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
     }
+}
+
+test "KAT: signWithKeyPair gives sign's bytes; forged key pairs never sign" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var signed: usize = 0;
+    for (v.vectors) |vec| {
+        const sk_hex = vec.secret_key orelse continue;
+        const sk = try bip340.SecretKey.fromBytes(try hex32(sk_hex));
+        const aux = try hex32(vec.aux_rand.?);
+        const msg = try hexAlloc(gpa, vec.message);
+        defer gpa.free(msg);
+        var kp = try bip340.KeyPair.fromSecretKey(sk);
+        defer kp.deinit();
+        const got = try bip340.signWithKeyPair(&kp, msg, aux, io);
+        try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
+        signed += 1;
+
+        // Forged pairs: a public key that is not secret·G, the scalar of
+        // the other y parity, zero, and n itself.
+        var wrong_pub = kp;
+        wrong_pub.public.x[31] ^= 1;
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&wrong_pub, msg, aux, io));
+        var other_parity = kp;
+        other_parity.secret = (try Scalar.fromBytes(kp.secret, .big)).neg().toBytes(.big);
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&other_parity, msg, aux, io));
+        var zero = kp;
+        zero.secret = [_]u8{0} ** 32;
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&zero, msg, aux, io));
+        var order = kp;
+        std.mem.writeInt(u256, &order.secret, k256.Secp256k1.scalar.field_order, .big);
+        try std.testing.expectError(error.InvalidSecretKey, bip340.signWithKeyPair(&order, msg, aux, io));
+    }
+    try std.testing.expect(signed >= 4);
 }
 
 test "KAT: verify accepts every TRUE vector and rejects every FALSE (negative) vector" {
