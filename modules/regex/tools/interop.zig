@@ -4,6 +4,7 @@
 //! (default) the committed ones, which `test-regex` uses:
 //!  - `tools/go_regexp_oracle`   Go `regexp`, black box → `src/go_vectors.zig`
 //!  - `tools/go_casefold`        Go `unicode.SimpleFold` → `src/casefold.zig`
+//!  - `tools/go_unicode`         Go `unicode` categories + scripts → `src/unicode_tables.zig`
 //! The check ignores the `// GENERATED … (Go version)` line: a runner with
 //! another Go patch release passes when every answer agrees.
 //!
@@ -21,6 +22,7 @@ const Tool = struct { name: []const u8, dir: []const u8, file: []const u8 };
 const tools = [_]Tool{
     .{ .name = "Go regexp oracle", .dir = "modules/regex/tools/go_regexp_oracle", .file = "../../src/go_vectors.zig" },
     .{ .name = "Go case-folding table", .dir = "modules/regex/tools/go_casefold", .file = "../../src/casefold.zig" },
+    .{ .name = "Go Unicode class tables", .dir = "modules/regex/tools/go_unicode", .file = "../../src/unicode_tables.zig" },
 };
 
 pub fn main(init: std.process.Init.Minimal) !u8 {

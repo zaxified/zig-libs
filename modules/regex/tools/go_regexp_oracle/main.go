@@ -25,7 +25,9 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"runtime"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 const seed = 0x7265676578 // "regex"
@@ -47,8 +49,7 @@ var crafted = []string{
 	`[^]`, `[\d]`, `[\D]`, `[\w-z]`, `[a-\d]`, `[[:alpha:]]`, `[[:^alpha:]]`, `[[:foo:]]`, `[[:alpha:]`,
 	`[[:]`, `[[]`, `[\]]`, `[\[]`, `[a&&b]`, `\d`, `\D`, `\s`, `\S`, `\w`, `\W`, `\b`, `\B`, `\A`, `\z`,
 	`\Z`, `\a`, `\f`, `\t`, `\n`, `\r`, `\v`, `\0`, `\07`, `\012`, `\1`, `\8`, `\12`, `\x41`, `\x4`, `\x{41}`,
-	`\x{}`, `\x{110000}`, `\x{10FFFF}`, `\xg1`, `\Q`, `\Qa.b`, `\Qa.b\E`, `\Q\E`, `\Qab\E*`, `\E`, `\pL`,
-	`\p{Greek}`, `\PL`, `\C`, `\y`, `\_`, `\-`, `\ `, `\é`, `\`, `a\`, `(a`, `a)`, `)`, `(?:a`, `(?i)a`,
+	`\x{}`, `\x{110000}`, `\x{10FFFF}`, `\xg1`, `\Q`, `\Qa.b`, `\Qa.b\E`, `\Q\E`, `\Qab\E*`, `\E`, `\C`, `\y`, `\_`, `\-`, `\ `, `\é`, `\`, `a\`, `(a`, `a)`, `)`, `(?:a`, `(?i)a`,
 	`(?i:a)b`, `(?-i)a`, `(?i-s)a`, `(?)`, `(?-)`, `(?i-)`, `(?--i)`, `(?z)`, `(?P<n>a)`, `(?<n>a)`,
 	`(?P<>a)`, `(?P<n-1>a)`, `(?P<n>a)(?P<n>b)`, `(?P=n)`, `(?P<n`, `(?#c)`, `(?=a)`, `(?!a)`, `(?<=a)`,
 	`(?ims)a`, `(?U)a+`, `(?U)a+?`, `a(?i)b|c`, `(a)(b)(c)`, `((a)|(b))*`, `(a*)*`, `(a*)+`, `(a|b)*c`,
@@ -73,8 +74,78 @@ var crafted = []string{
 	`a(?i)*`, `a(?i)+b`, "\\\n", "\\\x01", "\\\x7f", `\x{+41}`, `\x{4_1}`, `\x+1`, `\x{000000041}`, `\x{0010FFFF}`, `\xG1`,
 }
 
+// Unicode classes: every name Go knows (categories, their aliases, scripts),
+// each over the first and last code point of its class and a mixed sample;
+// then the grammar around them — negation, folding, classes, bad names.
+var unicodeSample = "aA1 _\u00a0\u00b2\u00bd\u01c5\u0301\u0378\u03a9\u0416\u05d0\u0663\u0905\u2028\u2029\u20ac\u2167\u3042\u4e2d\ue000\U0001f600\U000e0001\U0010ffff\xff"
+
+var unicodeCrafted = []string{
+	`\pL`, `\PL`, `\pN+`, `\p{^L}`, `\P{^L}`, `\p{Any}`, `\P{Any}`, `\p{^Any}`, `\p{any}`, `\p{greek}`, `\p{GREEK}`,
+	`\p{letter}`, `\p{Is_Greek}`, `\p{IsGreek}`, `\p{L&}`, `\p{ Greek}`, `\p{Greek }`, `\p{}`, `\p{^}`, `\p`, `\P`,
+	`\pLu`, `\p{Lu`, `\p{Lu}u`, `\pé`, `\p{`, `\p}`, `\p^L`, `\p{Script=Greek}`, `\p{sc=Greek}`, `\p{gc=L}`,
+	`\p{cntrl}`, `\p{digit}`, `\p{punct}`, `\p{alpha}`, `\p{Cn}`, `\p{^Cn}`, `\p{C}`, `\p{LC}`, `\p{L_}`,
+	`\p{Cased_Letter}`, `\p{Uppercase_Letter}`, `\p{uppercase_letter}`, `\p{Uppercase Letter}`, `\PN`, `\pZ`, `\p{Zs}+`,
+	`[\p{Greek}\d]`, `[^\p{L}]`, `[\P{L}]`, `[^\P{L}]`, `[\p{L}\p{N}]+`, `[\p{^L}a]`, `[a-\pL]`, `[\pL-z]`,
+	`(?i)\p{Lu}`, `(?i)\p{Ll}`, `(?i)\P{Lu}`, `(?i)\p{^Lu}`, `(?i)[\p{Lu}]`, `(?i)[^\p{Lu}]`, `(?i)\p{Lt}`, `(?i)\p{Greek}`,
+	`(?i)\P{Ll}`, `(?i)[\P{Ll}]`, `(?i)\p{Latin}`, `(?i)\p{Cyrillic}+`, `(?i)[^\P{Lt}]`,
+	`\pL\pN`, `(\p{Lu})(\p{Ll}+)`, `\p{Han}+|\p{Hiragana}+`, `^\p{L}*$`, `\b\p{L}+\b`,
+	// Loose names (TR18, Go 1.25+), and the computed classes.
+	`\pl`, `\p{ascii}`, `\p{ASCII}+`, `\P{ASCII}`, `(?i)\p{ASCII}`, `\p{Assigned}`, `\P{Assigned}`, `\p{^assigned}`, `[^\p{Assigned}]`,
+	`\p{^ L}`, `\p{ ^L}`, `\p{L u}`, `\p{L-u}`, "\\p{L\tu}", `\p{L.u}`, `\p{__Lu__}`, `\p{-}`, `\p{_}`, `\p{ }`, `\p{^^L}`,
+	`\p{uPPercase_lETTER}`, `\p{lowercaseletter}`, `\p{Zyyy}`, `\p{Common}`, `\p{common}`, `\p{Inherited}`, `\p{Unknown}`,
+	`\p{ſcript}`, `\p{Latın}`, `\p{\x{212a}atakana}`, `\p{K}`, `\p{Greek_}`, `\p{_Greek}`, `\p{Han}+`,
+	`\p{` + strings.Repeat("L", 60) + `}`, `\p{` + strings.Repeat("_", 60) + `L}`, `\p{L` + strings.Repeat(" ", 60) + `}`,
+	`\p{L}\p{L}\p{L}\p{L}\p{L}\p{L}\p{L}\p{L}`, `\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}`,
+}
+
+var unicodeInputs = []string{"", "a", "A", "aB", "Ab", "ǅ", "ǆ", "Ǆ", "Ω", "ω", "ϴ", "Ж", "ж", "ß", "ẞ", "k", "\u212a", "1", "٣", "Ⅷ", "ⅷ",
+	" ", "\u00a0", "\u2028", "€", "😀", "\u0301", "中文", "あ", "\ue000", "\u0378", "\U000e0001", "\xff", "abc123", "Straße", "ΑΒΓ",
+	unicodeSample}
+
+func unicodeNames() []string {
+	var ns []string
+	for k := range unicode.Categories {
+		ns = append(ns, k)
+	}
+	for k := range unicode.CategoryAliases {
+		ns = append(ns, k)
+	}
+	for k := range unicode.Scripts {
+		ns = append(ns, k)
+	}
+	sort.Strings(ns)
+	return ns
+}
+
+// The first and last code point of a class, as inputs that sit on its edges.
+func classEdges(name string) []string {
+	t := unicode.Categories[name]
+	if t == nil {
+		t = unicode.Scripts[name]
+	}
+	if t == nil {
+		t = unicode.Categories[unicode.CategoryAliases[name]]
+	}
+	var first, last rune = -1, -1
+	for c := rune(0); c <= unicode.MaxRune; c++ {
+		if unicode.Is(t, c) {
+			if first < 0 {
+				first = c
+			}
+			last = c
+		}
+	}
+	out := []string{unicodeSample}
+	for _, c := range []rune{first, first - 1, last, last + 1} {
+		if c >= 0 && c <= unicode.MaxRune && (c < 0xd800 || c > 0xdfff) {
+			out = append(out, string(c))
+		}
+	}
+	return out
+}
+
 // The alphabet random patterns and inputs share.
-var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "É", "č", "Č", "ß", "ẞ", "k", "s", "_", "-", "\xff"}
+var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "É", "č", "Č", "ß", "ẞ", "k", "s", "_", "-", "\xff", "Ω", "ж", "٣", "中"}
 
 func randInput() string {
 	var b strings.Builder
@@ -97,7 +168,7 @@ func randAtom(depth int) string {
 	case r < 38:
 		return "."
 	case r < 52:
-		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `\d`, `\w`, `\s`, `\D`, `\W`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`, `[á-ž]`, `[^É]`}[rnd.IntN(15)]
+		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `\d`, `\w`, `\s`, `\D`, `\W`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`, `[á-ž]`, `[^É]`, `\pL`, `\p{Lu}`, `\P{Ll}`, `[\p{Greek}\d]`, `\p{Latin}`}[rnd.IntN(20)]
 	case r < 58:
 		return []string{`^`, `$`, `\b`, `\B`, `\A`, `\z`}[rnd.IntN(6)]
 	case r < 64 && depth < 3:
@@ -189,8 +260,11 @@ func zstr(s string) string {
 func ints(xs []int) string {
 	var b strings.Builder
 	b.WriteString("&.{")
-	for _, x := range xs {
-		fmt.Fprintf(&b, "%d,", x)
+	for i, x := range xs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "%d", x)
 	}
 	b.WriteString("}")
 	return b.String()
@@ -205,8 +279,11 @@ func emitPattern(b *bytes.Buffer, pat string, inputs []string) {
 	}
 	full := fullMatcher(pat)
 	fmt.Fprintf(b, ".{ .pattern = %s, .ok = true, .names = &.{", zstr(pat))
-	for _, n := range re.SubexpNames() {
-		b.WriteString(zstr(n) + ",")
+	for i, n := range re.SubexpNames() {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(zstr(n))
 	}
 	b.WriteString("}, .cases = &.{\n")
 	for _, in := range inputs {
@@ -244,6 +321,13 @@ func main() {
 	b.WriteString("pub const crafted = [_]Pattern{\n")
 	for _, p := range crafted {
 		emitPattern(&b, p, fixedInputs)
+	}
+	b.WriteString("};\n\npub const unicode_classes = [_]Pattern{\n")
+	for _, p := range unicodeCrafted {
+		emitPattern(&b, p, unicodeInputs)
+	}
+	for _, n := range unicodeNames() {
+		emitPattern(&b, `\p{`+n+`}`, classEdges(n))
 	}
 	b.WriteString("};\n\npub const random = [_]Pattern{\n")
 	for i := 0; i < nRandom; i++ {

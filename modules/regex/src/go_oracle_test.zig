@@ -8,8 +8,13 @@
 //! test time.
 //!
 //! Listed divergences, each counted and pinned so a drift either way shows:
-//!  - UNICODE_CLASS: `\pL`, `\p{Greek}`, `\PL` compile in Go; here
-//!    `error.UnsupportedUnicodeClass` (SPEC Backlog).
+//!  - GO_DEFECT: Go 1.26 refuses `\p{Name}` for every script whose name has
+//!    an underscore or an inner capital (`Old_Persian`, `SignWriting` — 46 of
+//!    163), in every spelling, although its documentation names
+//!    `unicode.Scripts` as the classes and its 1.25 release notes promise TR18
+//!    loose matching for script names. Here they compile, matched loosely like
+//!    every other name; their tables were checked against Go's
+//!    `unicode.Scripts` for every code point (`tools/go_unicode`).
 //!  - CAPACITY: a pattern whose program needs more than `max_insts` (1024)
 //!    instructions, or that nests deeper than `max_depth` (250), compiles in
 //!    Go; here `error.PatternTooLarge` / `error.NestingDepth` — the price of
@@ -21,19 +26,23 @@ const testing = std.testing;
 const regex = @import("root.zig");
 const v = @import("go_vectors.zig");
 
-fn unicodeClass(pattern: []const u8) bool {
-    return std.mem.indexOf(u8, pattern, "\\p") != null or std.mem.indexOf(u8, pattern, "\\P") != null;
-}
+const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, capacity: usize = 0, go_defect: usize = 0, bad: usize = 0 };
 
-const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, unicode_class: usize = 0, capacity: usize = 0, bad: usize = 0 };
+/// `\p{Name}` with a script name Go 1.26 cannot look up (GO_DEFECT above):
+/// one with an underscore or a capital past its first letter.
+fn goDefectScript(pattern: []const u8) bool {
+    if (!std.mem.startsWith(u8, pattern, "\\p{") or pattern[pattern.len - 1] != '}') return false;
+    const name = pattern[3 .. pattern.len - 1];
+    if (name.len < 3) return false; // a two-letter category (`Lu`)
+    for (name[1..]) |c| if (c == '_' or std.ascii.isUpper(c)) return true;
+    return false;
+}
 
 fn replay(set: []const v.Pattern, t: *Tally) !void {
     for (set) |p| {
         t.patterns += 1;
         var re = regex.Regex.compile(testing.allocator, p.pattern) catch |e| {
-            if (p.ok and unicodeClass(p.pattern) and e == error.UnsupportedUnicodeClass) {
-                t.unicode_class += 1;
-            } else if (p.ok and (e == error.PatternTooLarge or e == error.NestingDepth)) {
+            if (p.ok and (e == error.PatternTooLarge or e == error.NestingDepth)) {
                 t.capacity += 1;
             } else if (p.ok) {
                 t.bad += 1;
@@ -42,6 +51,10 @@ fn replay(set: []const v.Pattern, t: *Tally) !void {
             continue;
         };
         defer re.deinit(testing.allocator);
+        if (!p.ok and goDefectScript(p.pattern)) {
+            t.go_defect += 1;
+            continue;
+        }
         if (!p.ok) {
             t.bad += 1;
             std.debug.print("/{s}/: Go refuses it, here it compiles\n", .{p.pattern});
@@ -96,10 +109,11 @@ fn replay(set: []const v.Pattern, t: *Tally) !void {
 test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     var t: Tally = .{};
     try replay(&v.crafted, &t);
+    try replay(&v.unicode_classes, &t);
     try replay(&v.random, &t);
     // The tally only when a check fails: a passing step's stderr fails CI.
-    errdefer std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, CAPACITY {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.capacity, t.bad });
+    errdefer std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), CAPACITY {d}, GO_DEFECT {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.capacity, t.go_defect, t.bad });
     try testing.expectEqual(@as(usize, 0), t.bad);
-    try testing.expectEqual(@as(usize, 3), t.unicode_class);
+    try testing.expectEqual(@as(usize, 46), t.go_defect);
     try testing.expectEqual(@as(usize, 4), t.capacity);
 }

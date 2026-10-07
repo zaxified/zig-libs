@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const casefold = @import("casefold.zig");
+const unicode_tables = @import("unicode_tables.zig");
 
 /// Instructions in one program — also what bounds the VM's own scratch.
 pub const max_insts = 1024;
@@ -60,9 +61,9 @@ pub const Error = error{
     NestingDepth,
     /// Past `max_insts`, `max_ranges`, `max_nodes` or `max_groups`.
     PatternTooLarge,
-    /// `\pL`, `\p{Greek}` — Unicode property classes need tables this module
-    /// does not carry yet (SPEC Backlog).
-    UnsupportedUnicodeClass,
+    /// `\p{Name}` with a name that is not a Unicode general category, its
+    /// alias, a script or `Any`; or a `\p{` with no `}`.
+    InvalidUnicodeClass,
 };
 
 /// An inclusive range of code points.
@@ -458,7 +459,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         fn parseEscape(b: *Self, flags: Flags) Error!u16 {
             switch (try b.escape(false, flags.fold)) {
                 .rune => |cp| return b.literal(cp, flags),
-                .class => |cl| return b.node(.{ .kind = .class, .a = cl.start, .b = cl.len }),
+                .class => |cl| return b.classNode(cl.start),
                 .assert => |a| return b.node(.{ .kind = .assert, .a = @intFromEnum(a) }),
                 .quoted => |text| {
                     // A concat of literals (the enclosing concat takes it as one operand).
@@ -539,7 +540,31 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     if (std.ascii.isUpper(c)) try b.negateFrom(start);
                     return .{ .class = .{ .start = start, .len = b.nranges - start } };
                 },
-                'p', 'P' => return error.UnsupportedUnicodeClass,
+                'p', 'P' => {
+                    // `\pL` (one letter), `\p{Name}`, `\p{^Name}` (negated).
+                    if (b.eof()) return error.InvalidUnicodeClass;
+                    var name: []const u8 = undefined;
+                    if (b.peek() == '{') {
+                        const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidUnicodeClass;
+                        name = b.src[b.pos + 1 .. end];
+                        b.pos = end + 1;
+                    } else {
+                        const s = b.pos;
+                        _ = b.nextRune();
+                        name = b.src[s..b.pos];
+                    }
+                    var negated = c == 'P';
+                    if (name.len != 0 and name[0] == '^') {
+                        negated = !negated;
+                        name = name[1..];
+                    }
+                    const start = b.nranges;
+                    try b.addUnicodeClass(name);
+                    if (fold) try b.foldFrom(start);
+                    b.normalizeFrom(start);
+                    if (negated) try b.negateFrom(start);
+                    return .{ .class = .{ .start = start, .len = b.nranges - start } };
+                },
                 'A', 'z', 'b', 'B' => {
                     if (in_class) return error.InvalidEscape;
                     return .{ .assert = switch (c) {
@@ -562,6 +587,38 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     if (c < 0x80 and !std.ascii.isAlphanumeric(c)) return .{ .rune = c };
                     return error.InvalidEscape;
                 },
+            }
+        }
+
+        /// Append the ranges of the Unicode class `name`, matched loosely (Unicode
+        /// TR18: ASCII case ignored, spaces, `_` and `-` dropped — what Go 1.25+
+        /// documents): `Any`, `ASCII`, `Assigned`, or a name of
+        /// `unicode_tables.zig` (the union of its stored tables).
+        fn addUnicodeClass(b: *Self, name: []const u8) Error!void {
+            var buf: [max_class_name]u8 = undefined;
+            const key = looseName(name, &buf) orelse return error.InvalidUnicodeClass;
+            if (std.mem.eql(u8, key, "any")) return b.addRange(.{ .lo = 0, .hi = 0x10ffff });
+            if (std.mem.eql(u8, key, "ascii")) return b.addRange(.{ .lo = 0, .hi = 0x7f });
+            if (std.mem.eql(u8, key, "assigned")) {
+                const start = b.nranges;
+                try b.addBase(unicode_tables.cn);
+                return b.negateFrom(start);
+            }
+            const entry = findUnicodeName(key) orelse return error.InvalidUnicodeClass;
+            for (entry.parts) |part| try b.addBase(part);
+        }
+
+        /// Append stored table `part`, decoded from its varints.
+        fn addBase(b: *Self, part: u8) Error!void {
+            const t = unicode_tables.bases[part];
+            const bytes = unicode_tables.data[t.offset..][0..t.size];
+            var i: usize = 0;
+            var next: u32 = 0;
+            for (0..t.count) |_| {
+                const lo = next + readVarint(bytes, &i);
+                const hi = lo + readVarint(bytes, &i);
+                try b.addRange(.{ .lo = @intCast(lo), .hi = @intCast(hi) });
+                next = hi + 1;
             }
         }
 
@@ -607,7 +664,24 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             }
             b.normalizeFrom(start);
             if (negated) try b.negateFrom(start);
-            return b.node(.{ .kind = .class, .a = start, .b = b.nranges - start });
+            return b.classNode(start);
+        }
+
+        /// A class node for `ranges[start..]`. When an earlier class holds the
+        /// same ranges, the node points at those and the copy is dropped —
+        /// `\p{L}` is ~700 ranges, and a pattern that names it a few times
+        /// would otherwise run out of `max_ranges` where Go compiles it.
+        fn classNode(b: *Self, start: u16) Error!u16 {
+            const len = b.nranges - start;
+            const mine = b.ranges[start..b.nranges];
+            for (b.nodes[0..b.nnodes]) |nd| {
+                if (nd.kind != .class or nd.b != len or nd.a + nd.b > start) continue;
+                if (sameRanges(b.ranges[nd.a..][0..nd.b], mine)) {
+                    b.nranges = start;
+                    return b.node(.{ .kind = .class, .a = nd.a, .b = len });
+                }
+            }
+            return b.node(.{ .kind = .class, .a = start, .b = len });
         }
 
         /// One class member: a code point, or null after appending an escape's set.
@@ -863,6 +937,56 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             }
         }
     };
+}
+
+/// Longer than any Unicode class name in its loose form.
+const max_class_name = 48;
+
+/// `name` in its loose form into `buf`: ASCII letters lower-cased, spaces,
+/// underscores and hyphens dropped. Null when nothing is left or it does not fit.
+fn looseName(name: []const u8, buf: *[max_class_name]u8) ?[]const u8 {
+    var n: usize = 0;
+    for (name) |c| {
+        if (c == ' ' or c == '_' or c == '-') continue;
+        if (n == buf.len) return null;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return if (n == 0) null else buf[0..n];
+}
+
+/// The entry of a Unicode class name in its loose form, by binary search.
+fn findUnicodeName(name: []const u8) ?unicode_tables.Name {
+    const names = &unicode_tables.names;
+    var lo: usize = 0;
+    var hi: usize = names.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        switch (std.mem.order(u8, names[mid].name, name)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return names[mid],
+        }
+    }
+    return null;
+}
+
+/// One LEB128 varint at `bytes[i.*..]` (the generator writes at most three bytes).
+fn readVarint(bytes: []const u8, i: *usize) u32 {
+    var v: u32 = 0;
+    var shift: u5 = 0;
+    while (true) {
+        const c = bytes[i.*];
+        i.* += 1;
+        v |= @as(u32, c & 0x7f) << shift;
+        if (c < 0x80) return v;
+        shift += 7;
+    }
+}
+
+fn sameRanges(x: []const Range, y: []const Range) bool {
+    for (x, y) |p, q| if (p.lo != q.lo or p.hi != q.hi) return false;
+    return true;
 }
 
 fn hexDigit(c: u8) ?u32 {

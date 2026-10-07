@@ -729,6 +729,32 @@ test "(?i) folds by Unicode simple case folding" {
     try testing.expect(cz.fullMatch("PŘÍLIŠ ŽLUŤOUČKÝ"));
 }
 
+test "Unicode classes: categories, scripts, aliases, loose names, negation, folding" {
+    try expectFind("\\pL+", "12žluť3", "žluť");
+    try expectFind("\\p{Lu}\\p{Ll}+", "x Ωmega", "Ωmega");
+    try expectFind("\\p{Greek}+", "abc αβγ", "αβγ");
+    try expectFind("\\p{Han}+", "x中文y", "中文");
+    try expectFind("\\PL+", "ab12cd", "12");
+    try expectFind("\\p{^L}+", "ab12cd", "12");
+    try expectFind("\\P{^N}+", "ab٣3cd", "٣3"); // double negation
+    try expectFind("[\\p{Greek}\\d]+", "xα1β", "α1β");
+    try expectFind("[^\\p{L}\\s]+", "ab, cd", ",");
+    try expectFind("\\p{lowercase letter}+", "ABcdE", "cd"); // loose: case, space, _ and - ignored
+    try expectFind("\\p{old_persian}", "\u{103a0}", "\u{103a0}"); // Go 1.26 refuses it (GO_DEFECT)
+    try expectFind("\\p{ASCII}+", "éabcé", "abc");
+    try expectFind("\\p{Assigned}", "\u{378}a", "a");
+    try expectFind("\\p{Any}", "\u{378}", "\u{378}");
+    try expectFind("(?i)\\p{Lu}+", "abcD1", "abcD"); // folded like any class
+    try expectFind("(?i)\\P{Lu}", "aB1", "1"); // folded, then negated
+    // The tables also compile at comptime; a class named twice is stored once.
+    const ident = comptime comptimeCompile("\\p{L}[\\p{L}\\p{N}_]*");
+    try testing.expect(ident.fullMatch("π_2ž"));
+    try testing.expect(!ident.fullMatch("2π"));
+    var many = try Regex.compile(testing.allocator, "\\p{L}" ** 12);
+    defer many.deinit(testing.allocator);
+    try testing.expect(many.ranges.len < 2 * 1000);
+}
+
 test "leftmost-first, greedy and lazy" {
     try expectFind("a|ab", "ab", "a");
     try expectFind("ab|a", "ab", "ab");
@@ -799,7 +825,7 @@ test "syntax errors" {
         .{ "\\y", error.InvalidEscape },
         .{ "(?P<>a)", error.InvalidNamedCapture },
         .{ "(?z)", error.InvalidPerlOp },
-        .{ "\\pL", error.UnsupportedUnicodeClass },
+        .{ "\\p{Klingon}", error.InvalidUnicodeClass },
         .{ "\xff", error.InvalidUtf8 },
     };
     inline for (bad) |c| {
