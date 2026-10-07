@@ -1,32 +1,37 @@
 // SPDX-License-Identifier: MIT
 
-//! regex — RE2-syntax regular expressions in linear time.
+//! regex — RE2-syntax regular expressions in linear time, at parity with
+//! Go's `regexp`.
 //!
 //! The grammar of Go's `regexp/syntax` (RE2): literals, `.`, classes
-//! (`[a-z]`, `[^…]`, `\d\s\w`, `[[:alpha:]]`), groups (capturing, named
-//! `(?P<n>…)`/`(?<n>…)`, non-capturing `(?:…)`), alternation, greedy and lazy
-//! repetition up to `{1000}`, the flags `i m s U`, and the empty-width
-//! assertions `^ $ \A \z \b \B`. Matching is a Pike VM over a Thompson NFA:
-//! time linear in pattern × input, no backtracking, so no pattern can make it
-//! explode (no backreferences or lookaround — RE2 leaves them out for that
-//! reason). Leftmost-first semantics, as Go's `regexp` and Perl.
+//! (`[a-z]`, `[^…]`, `\d\s\w`, `[[:alpha:]]`, Unicode `\pL`/`\p{Greek}`),
+//! groups (capturing, named `(?P<n>…)`/`(?<n>…)`, non-capturing `(?:…)`),
+//! alternation, greedy and lazy repetition up to `{1000}`, the flags
+//! `i m s U`, and the empty-width assertions `^ $ \A \z \b \B`; or its POSIX
+//! ERE grammar (`compilePosix`). Matching is a Pike VM over a Thompson NFA,
+//! and for short texts a bit-state backtracker: each visits a (position,
+//! instruction) at most once, so time is linear in pattern × input and no
+//! pattern can make it explode (no backreferences or lookaround — RE2 leaves
+//! them out for that reason). Leftmost-first semantics, as Go's `regexp` and
+//! Perl, or leftmost-longest (`Regex.longest`, POSIX).
 //!
 //! Compiling needs no allocator: `comptimeCompile` builds the program at
 //! compile time (a bad pattern is a compile error), `compile` at run time.
 //! `isMatch` and `fullMatch` run in fixed stack scratch, with no allocator;
 //! submatch positions (`Matcher`) take scratch sized by the program, once.
+//! On top of a search: replace (`$1`, `${name}`), split, quote, literal
+//! prefix, and matching from a `std.Io.Reader` in constant memory.
 //!
 //! Input is UTF-8 and matched per code point; an invalid byte reads as
 //! U+FFFD, one byte wide (as Go). `(?i)` folds by Unicode's simple case
-//! folding (`(?i)é` matches `É`). Not yet: Unicode property classes
-//! (`\pL`, `\p{Greek}`) (SPEC Backlog).
+//! folding (`(?i)é` matches `É`).
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const replace = @import("replace.zig");
 
 pub const meta = .{
-    .doc = "RE2-syntax regular expressions — Pike VM, linear time, comptime compile, alloc-free match",
+    .doc = "RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,

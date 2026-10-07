@@ -200,7 +200,11 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     var pm = try regex.Matcher.init(gpa, re);
     defer pm.deinit();
     pm.pike_only = true;
-    for (0..input.len + 1) |from| {
+    // Every start on a short input; on a long one (the repeated inputs) a
+    // stride, so the checks stay linear in the input.
+    const stride: usize = if (input.len > 32) 37 else 1;
+    var from: usize = 0;
+    while (from <= input.len) : (from += stride) {
         const f1 = m.captures(input, from, g1[0..ng]);
         const f2 = pm.captures(input, from, g2[0..ng]);
         if (f1 != f2) return error.EnginesDisagree;
@@ -242,21 +246,32 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     while (it.next()) |x| removed += x.end - x.start;
     if (out.written().len + removed != input.len) return error.ReplaceRemovesOtherThanMatches;
 
+    // The matches once, then each piece against them (both in order).
+    var spans: [512]regex.Span = undefined;
+    var ns: usize = 0;
+    var it2 = m.iterator(input);
+    while (it2.next()) |x| : (ns += 1) {
+        if (ns == spans.len) return error.TooManyMatches;
+        spans[ns] = x;
+    }
     var sp = m.split(input, null);
     var pieces: usize = 0;
+    var k: usize = 0;
     while (sp.next()) |piece| : (pieces += 1) {
         const at = @intFromPtr(piece.ptr) - @intFromPtr(input.ptr);
         if (input.len != 0 and at + piece.len > input.len) return error.SplitOutsideInput;
-        var it2 = m.iterator(input);
-        while (it2.next()) |x| if (x.end > x.start and at < x.end and x.start < at + piece.len) return error.SplitOverlapsMatch;
+        while (k < ns and spans[k].end <= at) k += 1;
+        var j = k;
+        while (j < ns and spans[j].start < at + piece.len) : (j += 1) {
+            if (spans[j].end > spans[j].start and at < spans[j].end) return error.SplitOverlapsMatch;
+        }
     }
     if (pieces > input.len + 2) return error.SplitTooMany;
 
     out.clearRetainingCapacity();
     const complete = try re.literalPrefix(&out.writer);
     const prefix = out.written();
-    var it3 = m.iterator(input);
-    while (it3.next()) |x| if (!std.mem.startsWith(u8, input[x.start..], prefix)) return error.MatchWithoutLiteralPrefix;
+    for (spans[0..ns]) |x| if (!std.mem.startsWith(u8, input[x.start..], prefix)) return error.MatchWithoutLiteralPrefix;
     if (complete and !re.fullMatch(prefix)) return error.CompletePrefixNotMatched;
 
     if (std.unicode.utf8ValidateSlice(input)) {
