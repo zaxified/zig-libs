@@ -24,6 +24,21 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Module grades v2 (2026-10-08) — every module re-graded, most one step lower.** The scale
+  is now scope-led: 1 ahead of the competition (parity plus a dated, measured lead; a speed
+  lead must beat the fastest implementation in the field, not just the reference), 2 parity,
+  3 core, 4 mvp, 5 proof of concept or a known defect. Three axes joined scope, evidence,
+  audit and defects: **hardening** (fuzz driver and ctgrind runs), **performance** (worst-case
+  ratio against the reference and the fastest), and for class C/D modules an **evidence**
+  line (reference model vs hand-computed values). The audit now records its mutation score
+  and the hash of the source it read, so an audit older than the code counts less; evidence 1
+  needs a live `tools/interop.zig` oracle. The card prints a profile (`S2 E1 A1 H1 P2`), the
+  catalog cell the capping axes (`3 (S,P)`), and `check-catalog-table` refuses a module with a
+  downstream consumer at grade 4 or 5. The cards start pessimistic (no source hashes, no
+  recorded hardening dates, no speed measurements, C/D unclassified): 197 modules at 3, 47 at
+  4, none at 1 or 2 until the real data is recorded. Rule: `maturityGrade` in `build.zig`;
+  vocabulary: `modules/_template/SPEC.md`; CONVENTIONS.md §8 and §9 (a comparative benchmark
+  is now a kept instrument).
 - **Module grades (2026-09-30).** Every catalog row now carries a grade, 1 (best) to 5
   (fix now), and every module's `SPEC.md` (`README.md` for the few without one) opens with a
   `## Maturity` card — scope against other implementations, audit (latest review and mutation

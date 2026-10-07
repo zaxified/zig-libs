@@ -1174,7 +1174,7 @@ pub fn build(b: *std.Build) void {
     {
         const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
         st.* = std.Build.Step.init(.{ .id = .custom, .name = "maturity-report", .owner = b, .makeFn = printMaturityReport });
-        b.step("maturity-report", "Print every module's maturity grade as TSV, worst first (grade, module, limited by, scope, audit, consumer)").dependOn(st);
+        b.step("maturity-report", "Print every module's maturity grade as TSV, worst first (grade, module, profile, limited by, scope, audit, current src hash, whether the audited src is fresh, consumer)").dependOn(st);
     }
 
     // `zig build app-list` — the names in `example_apps`, one per line, so
@@ -2532,6 +2532,7 @@ const CatalogStep = struct {
         // reported by check-catalog-table.
         var stale_cards: std.ArrayList(struct { path: []const u8, data: []const u8 }) = .empty;
         var card_failed = false;
+        const today = todayDay(io);
         for (module_list) |m| {
             const src = b.build_root.handle.readFileAlloc(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), b.allocator, .limited(2 * 1024 * 1024)) catch |err| {
                 std.log.err("{s}: cannot read modules/{s}/src/root.zig: {t}", .{ verb, m.name, err });
@@ -2560,10 +2561,21 @@ const CatalogStep = struct {
                 card_failed = true;
                 continue;
             };
-            const grade = maturityGrade(b, mat) orelse {
+            const grade = maturityGrade(b, mat, today) orelse {
                 card_failed = true;
                 continue;
             };
+            // A project outside this repo builds on it, so it must be fit for
+            // production: 4 is "the main path only", 5 "do not consume". The
+            // fix is the module (or the consumer), never the gate.
+            if (mat.consumer and grade.n >= 4) {
+                std.log.err(
+                    "{s}: module '{s}' has a downstream consumer but grade {d} ({s}) -- a consumed module must be 3 or better",
+                    .{ verb, m.name, grade.n, grade.limits },
+                );
+                card_failed = true;
+                continue;
+            }
             const fixed = withGradeLine(b, mat.src, grade.line(b));
             if (!std.mem.eql(u8, fixed, mat.src)) stale_cards.append(b.allocator, .{ .path = mat.path, .data = fixed }) catch @panic("OOM");
             docs.put(m.name, .{ .doc = doc, .note = note, .grade = grade.cell(b) }) catch @panic("OOM");
@@ -2707,21 +2719,28 @@ fn printMaturityReport(step: *std.Build.Step, options: std.Build.Step.MakeOption
     const Line = struct { n: u8, text: []const u8 };
     var lines: std.ArrayList(Line) = .empty;
     var failed = false;
+    const today = todayDay(io);
     for (module_list) |m| {
         const mat = moduleMaturity(b, io, m.name) orelse {
             failed = true;
             continue;
         };
-        const g = maturityGrade(b, mat) orelse {
+        const g = maturityGrade(b, mat, today) orelse {
             failed = true;
             continue;
         };
         const scope_line = maturityLine(m.name, mat.path, mat.src, "**Scope:** ").?;
         const audit_line = maturityLine(m.name, mat.path, mat.src, "**Audit:** ").?;
-        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
-            g.cell(b),                               m.name,
-            if (g.limits.len > 0) g.limits else "-", scope_line,
-            audit_line,                              if (mat.consumer) "consumer" else "-",
+        // `src now` is what an auditor copies into the card's `src <hash>`
+        // when an audit closes; `src fresh` says whether the recorded one
+        // still matches.
+        const fresh = if (mat.audited_src) |h| (if (std.mem.eql(u8, h, mat.current_src)) "fresh" else "STALE") else "?";
+        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            g.cell(b),                             m.name,
+            g.profile,                             if (g.limits.len > 0) g.limits else "-",
+            scope_line,                            audit_line,
+            mat.current_src,                       fresh,
+            if (mat.consumer) "consumer" else "-",
         }) }) catch @panic("OOM");
     }
     if (failed) return step.fail("maturity-report: a module's maturity card is missing or malformed (logged above)", .{});
@@ -2733,7 +2752,7 @@ fn printMaturityReport(step: *std.Build.Step, options: std.Build.Step.MakeOption
     }.lt);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
-    try stdout.interface.writeAll("grade\tmodule\tlimited by\tscope\taudit\tconsumer\n");
+    try stdout.interface.writeAll("grade\tmodule\tprofile\tlimited by\tscope\taudit\tsrc now\tsrc fresh\tconsumer\n");
     for (lines.items) |l| try stdout.interface.writeAll(l.text);
     try stdout.interface.flush();
 }
@@ -4126,33 +4145,79 @@ fn moduleAnchorGrade(b: *std.Build, io: std.Io, name: []const u8) ?AnchorGrade {
 
 /// A module's maturity card: the `## Maturity` section of `modules/<name>/SPEC.md`
 /// (`README.md` for the modules that have no SPEC.md, the same fallback as
-/// `moduleAnchorGrade`). Four lines are written by hand and one is generated:
+/// `moduleAnchorGrade`). The Grade line is generated; the rest is written by hand
+/// (grading v2, 2026-10-08; the vocabulary is in `modules/_template/SPEC.md`):
 ///
-///   **Grade:** ...                    -- generated by `zig build gen-catalog`
-///   **Scope:** unsurveyed | <parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)
-///   **Audit:** review <date|?|none> · mutation <date|?|none>
+///   **Grade:** ...          -- generated by `zig build gen-catalog`
+///   **Scope:** unsurveyed | <ahead|parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)
+///   **Ahead:** <speed|correctness|feature> — <claim> (measured YYYY-MM-DD) [· <claim> ...]
+///                           -- required with scope `ahead`, refused without it
+///   **Audit:** review <date|?|none> · mutation <date|?|none> [(<killed>/<total>[, <n> eq])] · src <hash|?>
+///   **Hardening:** fuzz <date|?|none|n/a — why> · ct <date|?|none|n/a — why>
+///   **Performance:** ref <x>× <impl> [· fastest <y|?>× <impl> | · fastest ref] (measured YYYY-MM-DD)
+///                    | not measured | n/a — <why>
+///   **Evidence:** model-fuzz — … | model — … | kat — … | unclassified   -- class C/D only
 ///   **Known defects:** none recorded | <what, and where it is tracked>
 ///   **Downstream consumer:** yes | no
 ///
-/// The evidence axis is NOT restated here: it is the module's anchor grade, read
-/// from its one line by `moduleAnchorGrade`, so the card cannot disagree with it.
+/// For class A/B the evidence axis is NOT restated here: it is the module's anchor
+/// grade, read from its one line by `moduleAnchorGrade`, plus whether the module
+/// has a live differential oracle (`tools/interop.zig`, run by the interop lane).
 ///
 /// WHY A CARD AND NOT A TIER LABEL. A stable/beta/experimental tag was rejected
 /// earlier (CONVENTIONS.md §8) because one coarse word hides the detail and rots.
 /// The grade answers both objections: it is computed from named axes by the rule
-/// in `maturityGrade` -- never chosen by feel -- and the axis that caps it is
-/// printed beside it, so a 3 says what would make it a 2.
+/// in `maturityGrade` -- never chosen by feel -- and the axes are printed beside
+/// it as a profile, so a 3 says what would make it a 2.
 const Maturity = struct {
+    name: []const u8,
     path: []const u8,
     src: []const u8,
-    scope: enum { unsurveyed, parity, core, mvp, poc },
-    review: bool,
-    mutation: bool,
+    scope: enum { unsurveyed, ahead, parity, core, mvp, poc },
+    /// Days since 1970-01-01 of the `(surveyed …)` date; null while unsurveyed.
+    surveyed: ?i64,
+    /// The OLDEST `(measured …)` date among the `**Ahead:**` claims, in days --
+    /// a lead is only as fresh as its stalest leg. Null without the line.
+    ahead_measured: ?i64,
+    ahead_speed: bool,
+    review: AuditMark,
+    mutation: AuditMark,
+    mutation_score: ?MutationScore,
+    /// The `src <hash>` the audit ran over; null for `src ?`.
+    audited_src: ?[]const u8,
+    /// `moduleSrcHash` of the tree as it is now.
+    current_src: []const u8,
+    fuzz: Hardening,
+    ct: Hardening,
+    perf: Perf,
+    /// Class C/D only (no outside truth exists, so the anchor's oracle is `n/a`).
+    evidence_cd: ?EvidenceCD,
+    /// `modules/<name>/tools/interop.zig` exists: a differential oracle against a
+    /// foreign implementation that the interop lane re-takes.
+    live_oracle: bool,
     /// null = "none recorded"
     defects: ?[]const u8,
     consumer: bool,
     anchor: AnchorGrade,
 };
+
+const AuditMark = enum { dated, unknown, none };
+const MutationScore = struct { killed: u32, total: u32, equivalent: u32 };
+const Hardening = enum { dated, unknown, none, na };
+const Perf = union(enum) {
+    not_measured,
+    na,
+    /// Worst-case time ratios, ours/theirs (lower is better). `fastest` null =
+    /// the fastest implementation in the field has not been measured.
+    measured: struct { ref: f64, fastest: ?f64 },
+};
+const EvidenceCD = enum { model_fuzz, model, kat, unclassified };
+
+/// How old a lead may be before the grade stops believing it, and how old a
+/// survey may be before the scope verdict is provisional again. Competitors
+/// move; a lead measured against last year's release is not a lead.
+const ahead_max_age_days = 180;
+const survey_max_age_days = 365;
 
 const maturity_heading = "\n## Maturity\n";
 const maturity_grade_prefix = "**Grade:** ";
@@ -4166,6 +4231,22 @@ fn maturityLine(name: []const u8, path: []const u8, src: []const u8, comptime pr
         std.log.err("module '{s}': {s} has no `{s}` line in its `## Maturity` card (see modules/_template/SPEC.md)", .{ name, path, prefix });
         return null;
     };
+    return maturityLineAt(name, path, src, prefix, at);
+}
+
+/// Like `maturityLine`, but a missing line is an answer (null), not an error.
+/// Errors (a doubled line) are reported through `bad`.
+fn maturityLineOpt(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8, bad: *bool) ?[]const u8 {
+    const needle = "\n" ++ prefix;
+    const at = std.mem.indexOf(u8, src, needle) orelse return null;
+    return maturityLineAt(name, path, src, prefix, at) orelse {
+        bad.* = true;
+        return null;
+    };
+}
+
+fn maturityLineAt(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8, at: usize) ?[]const u8 {
+    const needle = "\n" ++ prefix;
     if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
         std.log.err("module '{s}': {s} states `{s}` twice", .{ name, path, prefix });
         return null;
@@ -4177,12 +4258,134 @@ fn maturityLine(name: []const u8, path: []const u8, src: []const u8, comptime pr
 
 fn isAuditDate(v: []const u8) bool {
     if (std.mem.eql(u8, v, "?")) return true;
-    if (v.len != 10 or v[4] != '-' or v[7] != '-') return false;
-    for (v, 0..) |c, i| {
-        if (i == 4 or i == 7) continue;
-        if (!std.ascii.isDigit(c)) return false;
+    return parseDay(v) != null;
+}
+
+/// `YYYY-MM-DD` as days since 1970-01-01 (proleptic Gregorian), or null.
+fn parseDay(v: []const u8) ?i64 {
+    if (v.len != 10 or v[4] != '-' or v[7] != '-') return null;
+    const y = std.fmt.parseInt(i64, v[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(i64, v[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, v[8..10], 10) catch return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    // Howard Hinnant's days_from_civil.
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// The date right after `marker` in `s` (e.g. `(measured 2026-10-07)`), in days.
+fn dayAfter(s: []const u8, comptime marker: []const u8) ?i64 {
+    const at = std.mem.indexOf(u8, s, marker) orelse return null;
+    const rest = s[at + marker.len ..];
+    if (rest.len < 10) return null;
+    return parseDay(rest[0..10]);
+}
+
+/// Today, in days since 1970-01-01, for the age rules.
+fn todayDay(io: std.Io) i64 {
+    return @divFloor(std.Io.Clock.real.now(io).toSeconds(), 86400);
+}
+
+/// A fingerprint of the module's Zig sources -- code AND tests, since a
+/// mutation score is a statement about both. Not cryptographic: it only has to
+/// change when the audited text changes. Data files under `src/` are left out
+/// on purpose: re-taking an interop transcript is not a change the audit read.
+fn moduleSrcHash(b: *std.Build, io: std.Io, name: []const u8) ?[]const u8 {
+    var dir = b.build_root.handle.openDir(io, b.fmt("modules/{s}/src", .{name}), .{ .iterate = true }) catch |err| {
+        std.log.err("module '{s}': cannot open modules/{s}/src to fingerprint it: {t}", .{ name, name, err });
+        return null;
+    };
+    defer dir.close(io);
+    var paths: std.ArrayList([]const u8) = .empty;
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err| {
+        std.log.err("module '{s}': cannot walk modules/{s}/src: {t}", .{ name, name, err });
+        return null;
+    }) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
+        paths.append(b.allocator, b.dupe(e.path)) catch @panic("OOM");
     }
-    return true;
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var h = std.hash.Wyhash.init(0);
+    const gpa = std.heap.page_allocator;
+    for (paths.items) |p| {
+        const data = dir.readFileAlloc(io, p, gpa, .limited(64 * 1024 * 1024)) catch |err| {
+            std.log.err("module '{s}': cannot read modules/{s}/src/{s}: {t}", .{ name, name, p, err });
+            return null;
+        };
+        defer gpa.free(data);
+        h.update(p);
+        h.update(&.{0});
+        h.update(data);
+        h.update(&.{0});
+    }
+    return b.fmt("{x:0>16}", .{h.final()});
+}
+
+fn parseAuditMark(v: []const u8) ?AuditMark {
+    if (std.mem.eql(u8, v, "none")) return .none;
+    if (std.mem.eql(u8, v, "?")) return .unknown;
+    if (parseDay(v) != null) return .dated;
+    return null;
+}
+
+/// `fuzz <value>` / `ct <value>`: a date (optionally followed by a note in
+/// brackets), `?`, `none`, or `n/a — <why>` with a non-empty why.
+fn parseHardening(v: []const u8) ?Hardening {
+    if (std.mem.eql(u8, v, "none")) return .none;
+    if (std.mem.eql(u8, v, "?")) return .unknown;
+    if (std.mem.startsWith(u8, v, "n/a — ")) {
+        return if (std.mem.trim(u8, v["n/a — ".len..], " ").len > 0) .na else null;
+    }
+    if (v.len >= 10 and parseDay(v[0..10]) != null and (v.len == 10 or v[10] == ' ')) return .dated;
+    return null;
+}
+
+/// The number before `×` at the start of `s`; a range `a–b` reads as its upper
+/// end, because the card records the WORST workload, never an average that
+/// hides a loss.
+fn parseRatio(s: []const u8) ?f64 {
+    const end = std.mem.indexOf(u8, s, "×") orelse return null;
+    var num = std.mem.trim(u8, s[0..end], " ");
+    if (std.mem.indexOf(u8, num, "–")) |dash| num = num[dash + "–".len ..];
+    return std.fmt.parseFloat(f64, num) catch null;
+}
+
+fn parsePerf(name: []const u8, path: []const u8, line: []const u8) ?Perf {
+    if (std.mem.eql(u8, line, "not measured")) return .not_measured;
+    if (std.mem.startsWith(u8, line, "n/a — ") and std.mem.trim(u8, line["n/a — ".len..], " ").len > 0) return .na;
+    const usage = "expected `not measured`, `n/a — <why>` or `ref <x>× <impl> [· fastest <y|?>× <impl> | · fastest ref] (measured YYYY-MM-DD)`";
+    if (!std.mem.startsWith(u8, line, "ref ") or dayAfter(line, "(measured ") == null) {
+        std.log.err("module '{s}': {s} `**Performance:** {s}` -- {s}", .{ name, path, line, usage });
+        return null;
+    }
+    const ref = parseRatio(line["ref ".len..]) orelse {
+        std.log.err("module '{s}': {s} `**Performance:**` has no ratio after `ref` -- {s}", .{ name, path, usage });
+        return null;
+    };
+    var fastest: ?f64 = null;
+    if (std.mem.indexOf(u8, line, " · fastest ")) |at| {
+        const rest = line[at + " · fastest ".len ..];
+        if (std.mem.startsWith(u8, rest, "ref")) {
+            fastest = ref;
+        } else if (!std.mem.startsWith(u8, rest, "?")) {
+            fastest = parseRatio(rest) orelse {
+                std.log.err("module '{s}': {s} `**Performance:**` has no ratio after `fastest` -- {s}", .{ name, path, usage });
+                return null;
+            };
+        }
+    }
+    return .{ .measured = .{ .ref = ref, .fastest = fastest } };
 }
 
 /// Parse a module's maturity card. Null means a failure the caller must report,
@@ -4200,18 +4403,20 @@ fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
         return null;
     }
     _ = maturityLine(name, path, src, maturity_grade_prefix) orelse return null;
+    var bad = false;
 
     const scope_line = maturityLine(name, path, src, "**Scope:** ") orelse return null;
+    var surveyed: ?i64 = null;
     const scope: @FieldType(Maturity, "scope") = blk: {
         if (std.mem.eql(u8, scope_line, "unsurveyed")) break :blk .unsurveyed;
-        inline for (.{ "parity", "core", "mvp", "poc" }) |word| {
+        inline for (.{ "ahead", "parity", "core", "mvp", "poc" }) |word| {
             if (std.mem.startsWith(u8, scope_line, word ++ " — ")) {
                 // A surveyed scope is a claim about other implementations at a
                 // point in time; without the date nobody can tell it has aged.
-                if (std.mem.indexOf(u8, scope_line, "(surveyed 20") == null) {
+                surveyed = dayAfter(scope_line, "(surveyed ") orelse {
                     std.log.err("module '{s}': {s} `**Scope:**` names no `(surveyed YYYY-MM-DD)`", .{ name, path });
                     return null;
-                }
+                };
                 // The verdict is only as good as the list it was measured
                 // against; a reader must be able to see who "the competition" was.
                 if (std.mem.indexOf(u8, src, "\n## Compared with\n") == null) {
@@ -4222,27 +4427,150 @@ fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
             }
         }
         std.log.err(
-            "module '{s}': {s} `**Scope:** {s}` -- expected `unsurveyed` or `<parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)`",
+            "module '{s}': {s} `**Scope:** {s}` -- expected `unsurveyed` or `<ahead|parity|core|mvp|poc> — <reference> (surveyed YYYY-MM-DD)`",
             .{ name, path, scope_line },
         );
         return null;
     };
 
-    const audit_line = maturityLine(name, path, src, "**Audit:** ") orelse return null;
-    const audit_ok = std.mem.startsWith(u8, audit_line, "review ") and std.mem.indexOf(u8, audit_line, " · mutation ") != null;
-    if (!audit_ok) {
-        std.log.err("module '{s}': {s} `**Audit:** {s}` -- expected `review <YYYY-MM-DD|?|none> · mutation <YYYY-MM-DD|?|none>`", .{ name, path, audit_line });
+    // A lead is a set of dated, typed claims. Each claim starts with its kind
+    // and ends with its measurement date; claims are separated by ` · `, so a
+    // claim's own text may not contain that separator.
+    var ahead_measured: ?i64 = null;
+    var ahead_speed = false;
+    if (maturityLineOpt(name, path, src, "**Ahead:** ", &bad)) |ahead_line| {
+        if (scope != .ahead) {
+            std.log.err("module '{s}': {s} has an `**Ahead:**` line but its scope is not `ahead` -- a lead is graded only on top of parity", .{ name, path });
+            return null;
+        }
+        var claims = std.mem.splitSequence(u8, ahead_line, " · ");
+        while (claims.next()) |claim| {
+            const kind_ok = for ([_][]const u8{ "speed — ", "correctness — ", "feature — " }) |k| {
+                if (std.mem.startsWith(u8, claim, k)) break true;
+            } else false;
+            const measured = dayAfter(claim, "(measured ");
+            if (!kind_ok or measured == null or !std.mem.endsWith(u8, claim, ")")) {
+                std.log.err(
+                    "module '{s}': {s} `**Ahead:**` claim `{s}` -- expected `<speed|correctness|feature> — <claim> (measured YYYY-MM-DD)`, claims separated by ` · `",
+                    .{ name, path, claim },
+                );
+                return null;
+            }
+            if (std.mem.startsWith(u8, claim, "speed — ")) ahead_speed = true;
+            ahead_measured = if (ahead_measured) |old| @min(old, measured.?) else measured.?;
+        }
+    } else if (scope == .ahead) {
+        std.log.err("module '{s}': {s} claims scope `ahead` without an `**Ahead:**` line saying in what, and measured how", .{ name, path });
         return null;
     }
-    const sep = std.mem.indexOf(u8, audit_line, " · mutation ").?;
-    const review_v = audit_line["review ".len..sep];
-    const mutation_v = audit_line[sep + " · mutation ".len ..];
-    for ([_][]const u8{ review_v, mutation_v }) |v| {
-        if (!std.mem.eql(u8, v, "none") and !isAuditDate(v)) {
-            std.log.err("module '{s}': {s} `**Audit:**` value '{s}' is not YYYY-MM-DD, `?` or `none`", .{ name, path, v });
+    if (bad) return null;
+
+    const audit_line = maturityLine(name, path, src, "**Audit:** ") orelse return null;
+    const audit_usage = "expected `review <YYYY-MM-DD|?|none> · mutation <YYYY-MM-DD|?|none> [(<killed>/<total>[, <n> eq])] · src <hash|?>`";
+    var audit_parts = std.mem.splitSequence(u8, audit_line, " · ");
+    const review_part = audit_parts.next().?;
+    const mutation_part = audit_parts.next() orelse "";
+    const src_part = audit_parts.next() orelse "";
+    if (audit_parts.next() != null or !std.mem.startsWith(u8, review_part, "review ") or
+        !std.mem.startsWith(u8, mutation_part, "mutation ") or !std.mem.startsWith(u8, src_part, "src "))
+    {
+        std.log.err("module '{s}': {s} `**Audit:** {s}` -- {s}", .{ name, path, audit_line, audit_usage });
+        return null;
+    }
+    const review = parseAuditMark(review_part["review ".len..]);
+    const mutation_rest = mutation_part["mutation ".len..];
+    const mutation_v = mutation_rest[0 .. std.mem.indexOfScalar(u8, mutation_rest, ' ') orelse mutation_rest.len];
+    const mutation = parseAuditMark(mutation_v);
+    var mutation_score: ?MutationScore = null;
+    const score_text = std.mem.trim(u8, mutation_rest[mutation_v.len..], " ");
+    if (score_text.len > 0) score: {
+        // `(39/42, 3 eq)` or `(11/11)`
+        if (score_text[0] != '(' or score_text[score_text.len - 1] != ')') break :score;
+        const inner = score_text[1 .. score_text.len - 1];
+        const slash = std.mem.indexOfScalar(u8, inner, '/') orelse break :score;
+        const comma = std.mem.indexOf(u8, inner, ", ");
+        const killed = std.fmt.parseInt(u32, inner[0..slash], 10) catch break :score;
+        const total = std.fmt.parseInt(u32, inner[slash + 1 .. comma orelse inner.len], 10) catch break :score;
+        var eq: u32 = 0;
+        if (comma) |c| {
+            const tail = inner[c + 2 ..];
+            if (!std.mem.endsWith(u8, tail, " eq")) break :score;
+            eq = std.fmt.parseInt(u32, tail[0 .. tail.len - 3], 10) catch break :score;
+        }
+        if (killed + eq > total) break :score;
+        mutation_score = .{ .killed = killed, .total = total, .equivalent = eq };
+    }
+    const src_v = src_part["src ".len..];
+    const src_ok = std.mem.eql(u8, src_v, "?") or (src_v.len == 16 and for (src_v) |c| {
+        if (!std.ascii.isHex(c)) break false;
+    } else true);
+    if (review == null or mutation == null or (score_text.len > 0 and mutation_score == null) or !src_ok) {
+        std.log.err("module '{s}': {s} `**Audit:** {s}` -- {s} (the src hash is the 16 hex digits `zig build maturity-report` prints)", .{ name, path, audit_line, audit_usage });
+        return null;
+    }
+    if (mutation.? == .none and mutation_score != null) {
+        std.log.err("module '{s}': {s} `**Audit:**` gives a mutation score for a run that is `none`", .{ name, path });
+        return null;
+    }
+
+    const hard_line = maturityLine(name, path, src, "**Hardening:** ") orelse return null;
+    const hard_usage = "expected `fuzz <YYYY-MM-DD [(…)]|?|none|n/a — why> · ct <YYYY-MM-DD [(…)]|?|none|n/a — why>`";
+    const ct_at = std.mem.indexOf(u8, hard_line, " · ct ");
+    if (!std.mem.startsWith(u8, hard_line, "fuzz ") or ct_at == null) {
+        std.log.err("module '{s}': {s} `**Hardening:** {s}` -- {s}", .{ name, path, hard_line, hard_usage });
+        return null;
+    }
+    const fuzz = parseHardening(hard_line["fuzz ".len..ct_at.?]);
+    const ct = parseHardening(hard_line[ct_at.? + " · ct ".len ..]);
+    if (fuzz == null or ct == null) {
+        std.log.err("module '{s}': {s} `**Hardening:** {s}` -- {s}", .{ name, path, hard_line, hard_usage });
+        return null;
+    }
+    // A harness in the tree contradicts "fuzzing does not apply here".
+    if (fuzz.? == .na) {
+        const scan = scanModuleForFuzz(b, io, name) catch |err| {
+            std.log.err("module '{s}': cannot scan for fuzz harnesses: {t}", .{ name, err });
+            return null;
+        };
+        if (scan.harnesses > 0) {
+            std.log.err("module '{s}': {s} says `fuzz n/a` but modules/{s}/src has {d} fuzz harness(es) -- record when the driver last ran them, or `?`", .{ name, path, name, scan.harnesses });
             return null;
         }
     }
+
+    const perf_line = maturityLine(name, path, src, "**Performance:** ") orelse return null;
+    const perf = parsePerf(name, path, perf_line) orelse return null;
+    if (ahead_speed) {
+        const fastest = switch (perf) {
+            .measured => |p| p.fastest,
+            else => null,
+        };
+        if (fastest == null or fastest.? >= 1.0) {
+            std.log.err(
+                "module '{s}': {s} claims a speed lead, but `**Performance:**` does not show it beating the FASTEST implementation in the field (`fastest <y>×` with y < 1) -- beating the reference alone is parity",
+                .{ name, path },
+            );
+            return null;
+        }
+    }
+
+    const faces_out = anchor.class == 'A' or anchor.class == 'B';
+    var evidence_cd: ?EvidenceCD = null;
+    if (maturityLineOpt(name, path, src, "**Evidence:** ", &bad)) |ev| {
+        if (faces_out) {
+            std.log.err("module '{s}': {s} is class {c}; its evidence is the anchor grade, so an `**Evidence:**` line is a second copy -- remove it", .{ name, path, anchor.class });
+            return null;
+        }
+        evidence_cd = if (std.mem.startsWith(u8, ev, "model-fuzz — ")) .model_fuzz else if (std.mem.startsWith(u8, ev, "model — ")) .model else if (std.mem.startsWith(u8, ev, "kat — ")) .kat else if (std.mem.eql(u8, ev, "unclassified")) .unclassified else {
+            std.log.err("module '{s}': {s} `**Evidence:** {s}` -- expected `model-fuzz — …`, `model — …`, `kat — …` or `unclassified`", .{ name, path, ev });
+            return null;
+        };
+    } else if (!faces_out) {
+        if (bad) return null;
+        std.log.err("module '{s}': {s} is class {c} (no outside truth), so it needs an `**Evidence:**` line saying what its tests are checked against", .{ name, path, anchor.class });
+        return null;
+    }
+    if (bad) return null;
 
     const defects_line = maturityLine(name, path, src, "**Known defects:** ") orelse return null;
     if (defects_line.len == 0) {
@@ -4256,104 +4584,213 @@ fn moduleMaturity(b: *std.Build, io: std.Io, name: []const u8) ?Maturity {
         return null;
     };
 
+    const live = if (b.build_root.handle.access(io, b.fmt("modules/{s}/tools/interop.zig", .{name}), .{})) true else |_| false;
+
     return .{
+        .name = name,
         .path = path,
         .src = src,
         .scope = scope,
-        .review = !std.mem.eql(u8, review_v, "none"),
-        .mutation = !std.mem.eql(u8, mutation_v, "none"),
+        .surveyed = surveyed,
+        .ahead_measured = ahead_measured,
+        .ahead_speed = ahead_speed,
+        .review = review.?,
+        .mutation = mutation.?,
+        .mutation_score = mutation_score,
+        .audited_src = if (std.mem.eql(u8, src_v, "?")) null else src_v,
+        .current_src = moduleSrcHash(b, io, name) orelse return null,
+        .fuzz = fuzz.?,
+        .ct = ct.?,
+        .perf = perf,
+        .evidence_cd = evidence_cd,
+        .live_oracle = live,
         .defects = if (std.mem.eql(u8, defects_line, "none recorded")) null else defects_line,
         .consumer = consumer,
         .anchor = anchor,
     };
 }
 
-/// The grade, 1 (best) .. 5 (fix now) -- the Czech school scale. It is the WORST
-/// of the axes below, so it can only be raised by fixing the axis that caps it:
+/// The grade, 1 (best) .. 5 (do not consume) -- the Czech school scale. It is
+/// the WORST of the axes below, so it can only be raised by fixing the axis that
+/// caps it (grading v2, owner's decision 2026-10-08):
 ///
-///   scope     parity 1 · core 2 · mvp 3 · poc 4 · unsurveyed -> provisional (`?`)
-///   evidence  oracle EXTERNAL 1 · MIXED 2 · REDERIVED 3 · SELF 4 · n/a (class C/D,
-///             no outside truth exists) -> no cap
-///   audit     review + mutation run 1 · only one of them 2 · neither 3
-///   defects   any known open defect 5
+///   S scope       ahead 1 (lead ≤ 180 days old, else 2) · parity 2 · core 3 · mvp 4
+///                 · poc 5 · unsurveyed or surveyed > 365 days ago -> provisional (`?`)
+///   E evidence    A/B: EXTERNAL with a live oracle (tools/interop.zig) 1 · EXTERNAL 2
+///                 · MIXED 3 · REDERIVED 4 · SELF 5
+///                 C/D: model-fuzz 1 · model 2 · kat 3 · unclassified 3
+///   A audit       review + mutation dated, score without unexplained survivors, over
+///                 the current src 1 · both dated otherwise 2 · only one, or a `?` 3
+///                 · neither 4
+///   H hardening   every applicable item (fuzz, ct) dated 1 · some 3 · none 4 · all n/a: no cap
+///   P performance ref ≤ 1 and fastest ≤ 1.25 1 · ref ≤ 1 2 · ref ≤ 2 or not measured 3
+///                 · ref > 2 4 · n/a: no cap
+///   D defects     any known open defect 5
 ///
-/// "Provisional" means the scope axis is unknown, so the grade is an upper bound:
-/// a survey can lower it, never raise it.
+/// "Provisional" means the scope verdict is unknown or stale, so the grade is an
+/// upper bound: a survey can lower it, never raise it.
 const MaturityGrade = struct {
     n: u8,
     provisional: bool,
     /// ", "-joined axes that cap the grade; empty for a 1.
     limits: []const u8,
+    /// One letter per capping axis, for the catalog cell.
+    letters: []const u8,
+    /// `S2 E1 A1 H– P2` -- every axis, `–` where it does not apply.
+    profile: []const u8,
 
     fn cell(g: MaturityGrade, b: *std.Build) []const u8 {
-        return b.fmt("{d}{s}", .{ g.n, if (g.provisional) "?" else "" });
+        const q = if (g.provisional) "?" else "";
+        if (g.letters.len == 0) return b.fmt("{d}{s}", .{ g.n, q });
+        return b.fmt("{d}{s} ({s})", .{ g.n, q, g.letters });
     }
 
     fn line(g: MaturityGrade, b: *std.Build) []const u8 {
         var out: std.Io.Writer.Allocating = .init(b.allocator);
         const w = &out.writer;
-        w.print("{s}{s}", .{ maturity_grade_prefix, g.cell(b) }) catch @panic("OOM");
+        w.print("{s}{d}{s} · {s}", .{ maturity_grade_prefix, g.n, if (g.provisional) "?" else "", g.profile }) catch @panic("OOM");
         if (g.limits.len > 0) w.print(" · limited by {s}", .{g.limits}) catch @panic("OOM");
-        if (g.provisional) w.writeAll(" · provisional: scope against other implementations not surveyed yet") catch @panic("OOM");
+        if (g.provisional) w.writeAll(" · provisional: scope against other implementations not surveyed, or the survey is over a year old") catch @panic("OOM");
         w.writeAll(" *(generated by `zig build gen-catalog`)*") catch @panic("OOM");
         return out.written();
     }
 };
 
-fn maturityGrade(b: *std.Build, m: Maturity) ?MaturityGrade {
-    const Axis = struct { n: u8, why: []const u8 };
-    var axes: [4]?Axis = .{ null, null, null, null };
+fn maturityGrade(b: *std.Build, m: Maturity, today: i64) ?MaturityGrade {
+    const Axis = struct { letter: u8, n: u8, why: []const u8 };
+    var axes: [6]?Axis = .{ null, null, null, null, null, null };
 
+    // S -- scope.
     axes[0] = switch (m.scope) {
         .unsurveyed => null,
-        .parity => .{ .n = 1, .why = "scope (parity)" },
-        .core => .{ .n = 2, .why = "scope (core)" },
-        .mvp => .{ .n = 3, .why = "scope (mvp)" },
-        .poc => .{ .n = 4, .why = "scope (poc)" },
+        .ahead => if (today - m.ahead_measured.? <= ahead_max_age_days)
+            .{ .letter = 'S', .n = 1, .why = "scope (ahead)" }
+        else
+            .{ .letter = 'S', .n = 2, .why = b.fmt("scope (the lead was measured over {d} days ago -- re-measure)", .{ahead_max_age_days}) },
+        .parity => .{ .letter = 'S', .n = 2, .why = "scope (parity)" },
+        .core => .{ .letter = 'S', .n = 3, .why = "scope (core)" },
+        .mvp => .{ .letter = 'S', .n = 4, .why = "scope (mvp)" },
+        .poc => .{ .letter = 'S', .n = 5, .why = "scope (poc)" },
+    };
+    const survey_stale = if (m.surveyed) |d| today - d > survey_max_age_days else false;
+
+    // E -- evidence.
+    if (m.evidence_cd) |ev| {
+        axes[1] = switch (ev) {
+            .model_fuzz => .{ .letter = 'E', .n = 1, .why = "evidence (model, fuzz-compared)" },
+            .model => .{ .letter = 'E', .n = 2, .why = "evidence (reference model, no differential fuzz)" },
+            .kat => .{ .letter = 'E', .n = 3, .why = "evidence (hand-computed KATs only)" },
+            .unclassified => .{ .letter = 'E', .n = 3, .why = "evidence (class C/D, not classified yet)" },
+        };
+    } else {
+        const oracle = m.anchor.oracle;
+        const word_end = std.mem.indexOfAny(u8, oracle, " \t(") orelse oracle.len;
+        const word = oracle[0..word_end];
+        axes[1] = if (std.mem.eql(u8, word, "EXTERNAL"))
+            (if (m.live_oracle)
+                .{ .letter = 'E', .n = 1, .why = "evidence (EXTERNAL, live oracle)" }
+            else
+                .{ .letter = 'E', .n = 2, .why = "evidence (EXTERNAL, frozen vectors only -- no tools/interop.zig)" })
+        else if (std.mem.eql(u8, word, "MIXED"))
+            .{ .letter = 'E', .n = 3, .why = "evidence (oracle MIXED)" }
+        else if (std.mem.eql(u8, word, "REDERIVED"))
+            .{ .letter = 'E', .n = 4, .why = "evidence (oracle REDERIVED)" }
+        else if (std.mem.eql(u8, word, "SELF"))
+            .{ .letter = 'E', .n = 5, .why = "evidence (oracle SELF)" }
+        else {
+            std.log.err("module anchor oracle '{s}' in {s} is not EXTERNAL/MIXED/REDERIVED/SELF (class A/B cannot be n/a)", .{ oracle, m.path });
+            return null;
+        };
+    }
+
+    // A -- audit.
+    axes[2] = blk: {
+        if (m.review == .none and m.mutation == .none) break :blk .{ .letter = 'A', .n = 4, .why = "audit (none recorded)" };
+        if (m.review == .none) break :blk .{ .letter = 'A', .n = 3, .why = "audit (no review recorded)" };
+        if (m.mutation == .none) break :blk .{ .letter = 'A', .n = 3, .why = "audit (no mutation run recorded)" };
+        if (m.review == .unknown or m.mutation == .unknown) break :blk .{ .letter = 'A', .n = 3, .why = "audit (a date is `?`)" };
+        const s = m.mutation_score orelse break :blk .{ .letter = 'A', .n = 2, .why = "audit (no mutation score recorded)" };
+        const survivors = s.total - s.killed - s.equivalent;
+        if (survivors > 0) break :blk .{ .letter = 'A', .n = 2, .why = b.fmt("audit ({d} unexplained mutation survivor(s))", .{survivors}) };
+        const audited = m.audited_src orelse break :blk .{ .letter = 'A', .n = 2, .why = "audit (src it ran over not recorded)" };
+        if (!std.mem.eql(u8, audited, m.current_src)) break :blk .{ .letter = 'A', .n = 2, .why = "audit (src changed since)" };
+        break :blk .{ .letter = 'A', .n = 1, .why = "audit" };
     };
 
-    const oracle = m.anchor.oracle;
-    const word_end = std.mem.indexOfAny(u8, oracle, " \t(") orelse oracle.len;
-    const word = oracle[0..word_end];
-    axes[1] = if (std.mem.eql(u8, word, "EXTERNAL"))
-        .{ .n = 1, .why = "evidence (oracle EXTERNAL)" }
-    else if (std.mem.eql(u8, word, "MIXED"))
-        .{ .n = 2, .why = "evidence (oracle MIXED)" }
-    else if (std.mem.eql(u8, word, "REDERIVED"))
-        .{ .n = 3, .why = "evidence (oracle REDERIVED)" }
-    else if (std.mem.eql(u8, word, "SELF"))
-        .{ .n = 4, .why = "evidence (oracle SELF)" }
-    else if (std.mem.eql(u8, word, "n/a"))
-        null
-    else {
-        std.log.err("module anchor oracle '{s}' in {s} is not EXTERNAL/MIXED/REDERIVED/SELF/n/a", .{ oracle, m.path });
-        return null;
+    // H -- hardening.
+    axes[3] = blk: {
+        var applicable: u8 = 0;
+        var dated: u8 = 0;
+        var none: u8 = 0;
+        for ([_]Hardening{ m.fuzz, m.ct }) |h| switch (h) {
+            .na => {},
+            .dated => {
+                applicable += 1;
+                dated += 1;
+            },
+            .none => {
+                applicable += 1;
+                none += 1;
+            },
+            .unknown => applicable += 1,
+        };
+        if (applicable == 0) break :blk null;
+        if (dated == applicable) break :blk .{ .letter = 'H', .n = 1, .why = "hardening" };
+        if (none == applicable) break :blk .{ .letter = 'H', .n = 4, .why = "hardening (none of fuzz/ct done)" };
+        break :blk .{ .letter = 'H', .n = 3, .why = "hardening (fuzz/ct not all recorded)" };
     };
 
-    axes[2] = if (m.review and m.mutation)
-        .{ .n = 1, .why = "audit" }
-    else if (m.review)
-        .{ .n = 2, .why = "audit (no mutation run recorded)" }
-    else if (m.mutation)
-        .{ .n = 2, .why = "audit (no review recorded)" }
-    else
-        .{ .n = 3, .why = "audit (none recorded)" };
+    // P -- performance.
+    axes[4] = switch (m.perf) {
+        .na => null,
+        .not_measured => .{ .letter = 'P', .n = 3, .why = "performance (not measured)" },
+        .measured => |p| if (p.ref > 2.0)
+            .{ .letter = 'P', .n = 4, .why = "performance (over 2× slower than the reference)" }
+        else if (p.ref > 1.0)
+            .{ .letter = 'P', .n = 3, .why = "performance (slower than the reference)" }
+        else if (p.fastest == null)
+            .{ .letter = 'P', .n = 2, .why = "performance (fastest in the field not measured)" }
+        else if (p.fastest.? > 1.25)
+            .{ .letter = 'P', .n = 2, .why = "performance (over 1.25× the fastest in the field)" }
+        else
+            .{ .letter = 'P', .n = 1, .why = "performance" },
+    };
 
-    if (m.defects != null) axes[3] = .{ .n = 5, .why = "a known defect" };
+    // D -- defects.
+    if (m.defects != null) axes[5] = .{ .letter = 'D', .n = 5, .why = "a known defect" };
 
     var n: u8 = 1;
     for (axes) |a| {
         if (a) |x| n = @max(n, x.n);
     }
     var limits: std.ArrayList(u8) = .empty;
+    var letters: std.ArrayList(u8) = .empty;
     for (axes) |a| {
         const x = a orelse continue;
         if (n == 1 or x.n != n) continue;
-        if (limits.items.len > 0) limits.appendSlice(b.allocator, ", ") catch @panic("OOM");
+        if (limits.items.len > 0) {
+            limits.appendSlice(b.allocator, ", ") catch @panic("OOM");
+            letters.append(b.allocator, ',') catch @panic("OOM");
+        }
         limits.appendSlice(b.allocator, x.why) catch @panic("OOM");
+        letters.append(b.allocator, x.letter) catch @panic("OOM");
     }
+    var profile: std.ArrayList(u8) = .empty;
+    for (axes[0..5], "SEAHP") |a, letter| {
+        if (profile.items.len > 0) profile.append(b.allocator, ' ') catch @panic("OOM");
+        profile.append(b.allocator, letter) catch @panic("OOM");
+        if (letter == 'S' and m.scope == .unsurveyed) {
+            profile.append(b.allocator, '?') catch @panic("OOM");
+        } else if (a) |x| {
+            profile.append(b.allocator, '0' + x.n) catch @panic("OOM");
+        } else {
+            profile.appendSlice(b.allocator, "–") catch @panic("OOM");
+        }
+    }
+    if (m.defects != null) profile.appendSlice(b.allocator, " D5") catch @panic("OOM");
     // A 5 is already the floor, so an unsurveyed scope cannot lower it further.
-    return .{ .n = n, .provisional = m.scope == .unsurveyed and n < 5, .limits = limits.items };
+    const provisional = (m.scope == .unsurveyed or survey_stale) and n < 5;
+    return .{ .n = n, .provisional = provisional, .limits = limits.items, .letters = letters.items, .profile = profile.items };
 }
 
 /// `m.src` with its `**Grade:**` line replaced by `line`.

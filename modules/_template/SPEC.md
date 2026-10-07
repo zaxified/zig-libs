@@ -12,32 +12,83 @@
 
 **Scope:** unsurveyed
 
-**Audit:** review none · mutation none
+**Audit:** review none · mutation none · src ?
+
+**Hardening:** fuzz none · ct n/a — <why this module holds no secret>
+
+**Performance:** not measured
+
+**Evidence:** unclassified
 
 **Known defects:** none recorded
 
 **Downstream consumer:** no
 
 <!-- The card a consumer reads first, and the one the README catalog's Grade
-     column is computed from. Four lines are yours; the Grade line is generated
-     from them plus the anchor grade below (CONVENTIONS.md §8, "Maturity").
+     column is computed from. Everything but the Grade line is yours; the Grade
+     line is generated from them plus the anchor grade below (CONVENTIONS.md §8,
+     "Maturity"). The grade is the WORST axis; the profile beside it (S E A H P)
+     shows every axis, so a 3 says what would make it a 2.
 
-     Scope     — how much of what a user expects this module covers, against the
+     Scope (S) — how much of what a user expects this module covers, against the
                  reference implementation and the notable Rust/Go/C ones. Set only
                  by a survey (SURVEY-PLAYBOOK.md), never by feel:
-                 `parity — <reference, version> (surveyed YYYY-MM-DD)` nothing a
-                   user would notice is missing;
-                 `core — …` the main use cases, gaps listed under Backlog;
-                 `mvp — …` the happy path, gaps a user will hit;
-                 `poc — …` a demonstration, not for production.
-                 `unsurveyed` until then — the grade then carries a `?`.
-     Audit     — the latest `review` (a security/adversarial audit of THIS module
+                 `ahead — <reference, version> (surveyed YYYY-MM-DD)` parity AND a
+                   measured lead, stated on an `**Ahead:**` line (below) → 1;
+                 `parity — …` nothing a user would notice is missing → 2;
+                 `core — …` the main use cases, gaps listed under Backlog → 3;
+                 `mvp — …` the happy path, gaps a user will hit → 4;
+                 `poc — …` a demonstration, finish it before anyone consumes it → 5.
+                 `unsurveyed` until then — the grade then carries a `?`, and so
+                 does a survey older than a year.
+     Ahead     — only with scope `ahead`, refused without it. One or more claims,
+                 separated by ` · `, each `<kind> — <claim> (measured YYYY-MM-DD)`:
+                 `speed` — faster than the FASTEST implementation in the field (not
+                   merely the reference); `**Performance:**` must show `fastest <y>×`
+                   with y < 1, from a bench kept in `tools/` (CONVENTIONS.md §9);
+                 `correctness` — a defect in the reference found by our oracle, with
+                   the case that reproduces it;
+                 `feature` — something a user notices that the reference lacks.
+                 A lead older than 180 days counts as parity until re-measured.
+     Audit (A) — the latest `review` (a security/adversarial audit of THIS module
                  whose findings or verdict are recorded) and the latest `mutation`
                  run over its tests: YYYY-MM-DD, `?` when it happened but the date
-                 is lost, `none`.
-     Known defects — an open defect that makes the module unsafe to rely on. Any
-                 text other than `none recorded` sets the grade to 5.
-     Downstream consumer — `yes` if a project outside this repo depends on it. -->
+                 is lost, `none`. After the mutation date, its score:
+                 `(<killed>/<total>, <n> eq)` — survivors not shown equivalent keep
+                 the audit at 2. `src` is the hash of the Zig sources the audit
+                 read (`zig build maturity-report`, column `src now`); once the code
+                 changes the audit is STALE and counts 2. Carrying a hash over a
+                 purely mechanical change (a Zig migration, `zig fmt`) is allowed;
+                 the commit that does it says so.
+                 1 = both dated, scored clean, over the current src · 2 = both, but
+                 stale/unscored · 3 = one of them, or a `?` · 4 = neither.
+     Hardening (H) — `fuzz`: when the deterministic fuzz driver last ran this
+                 module's harnesses (`YYYY-MM-DD (<seeds>, reach <r>%)`); `ct`: when
+                 ctgrind last checked its secret-dependent code. Each is a date,
+                 `?` (done, not recorded), `none`, or `n/a — <why>` (refused for
+                 fuzz when the module has a harness). 1 = every applicable item
+                 dated · 3 = some · 4 = none · all n/a = no cap.
+     Performance (P) — worst-workload time ratios, ours/theirs, lower is better:
+                 `ref <x>× <impl> · fastest <y>× <impl> (measured YYYY-MM-DD)`;
+                 `fastest ?` when the fastest in the field is not measured,
+                 `fastest ref` when the reference IS the fastest. A range `a–b` is
+                 read as b. `not measured`, or `n/a — <why>` where speed is not
+                 what a user picks this module for.
+                 1 = x ≤ 1 and y ≤ 1.25 · 2 = x ≤ 1 · 3 = x ≤ 2, or not measured
+                 · 4 = x > 2.
+     Evidence (E) — class C/D only (no outside truth; class A/B take E from the
+                 anchor grade below — EXTERNAL with a live `tools/interop.zig`
+                 oracle 1, frozen EXTERNAL 2, MIXED 3, REDERIVED 4, SELF 5):
+                 `model-fuzz — <model>` an independent reference model the fuzz
+                   driver compares against → 1;
+                 `model — <model>` a reference model or a checked invariant → 2;
+                 `kat — <what>` hand-computed values only → 3; `unclassified` → 3.
+                 Delete the line for a class A/B module.
+     Known defects (D) — an open defect that makes the module unsafe to rely on.
+                 Any text other than `none recorded` sets the grade to 5.
+     Downstream consumer — `yes` if a project outside this repo depends on it.
+                 A consumed module must grade 3 or better; check-catalog-table
+                 fails otherwise. -->
 
 ## Compared with
 

@@ -58,12 +58,16 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
 ## Where the verdict goes
 
 The survey ends by setting the module's **`**Scope:**` line** in the `## Maturity` card of its
-`SPEC.md` — `parity`, `core`, `mvp` or `poc`, naming the reference implementation and the
-survey date (definitions in `modules/_template/SPEC.md`) — by writing the SPEC's
+`SPEC.md` — `ahead`, `parity`, `core`, `mvp` or `poc`, naming the reference implementation
+and the survey date (definitions in `modules/_template/SPEC.md`) — by writing the SPEC's
 `## Compared with` table (every project compared against: link, language, licence, stars,
-latest release or push, what a user notices; the reference marked; `check-catalog-table`
-refuses a surveyed Scope without it), and by filing the "missing and it matters" items under
-the SPEC's `## Backlog / deferred`. Then run `zig build gen-catalog`:
+latest release or push, what a user notices; the reference marked **reference** and the
+fastest implementation in the field marked **fastest** — usually a C, C++ or Rust one, rarely
+the reference; `check-catalog-table` refuses a surveyed Scope without the table), and by filing
+the "missing and it matters" items under the SPEC's `## Backlog / deferred`. `ahead` is
+parity plus a lead, and the survey states the lead on the card's `**Ahead:**` line; a speed
+lead is measured against the **fastest** row, never just the reference, with the bench kept
+in `tools/` and its ratios on the `**Performance:**` line. Then run `zig build gen-catalog`:
 the module's grade loses its provisional `?` and may go down. A survey that leaves the Scope
 line at `unsurveyed` has not finished.
 

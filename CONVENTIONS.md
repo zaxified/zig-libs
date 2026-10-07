@@ -836,18 +836,35 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = a computed grade over a per-module card, plus the explicit caveats**
-  (revised 2026-09-30; before that, caveats only). Every module meets the same floor (§6/§7:
+  (revised 2026-09-30; before that, caveats only. **Grading v2, 2026-10-08, owner's decision:**
+  the scale moved down a step and gained axes, so that the grade separates what v1 lumped
+  together — 175 of 238 modules sat on one number). Every module meets the same floor (§6/§7:
   tests green in both release lanes — `ReleaseSafe` and `ReleaseFast` —
   plus oracle/KAT verification where one exists). Above the floor, each module's `SPEC.md`
   (`README.md` for the few without one) opens with a `## Maturity` card — **Scope** against
-  other implementations (`parity`/`core`/`mvp`/`poc`, set only by a survey per
-  `SURVEY-PLAYBOOK.md`, otherwise `unsurveyed`), **Audit** (latest in-house review and latest
-  mutation run, dated), **Known defects**, **Downstream consumer** (a project outside this
-  collection imports it; sibling modules do not count) — and the anchor grade
-  supplies the evidence axis. The **grade** is 1 (best) … 5 (fix now), the worst of those axes;
-  `?` marks it provisional while the scope is unsurveyed. The exact rule is `maturityGrade` in
-  `build.zig`, the scale is explained in the README's "Module grades", and the grade appears in
-  the catalog next to the module's description.
+  other implementations (`ahead`/`parity`/`core`/`mvp`/`poc` = 1…5, set only by a survey per
+  `SURVEY-PLAYBOOK.md`, otherwise `unsurveyed`; `ahead` needs an `**Ahead:**` line of dated,
+  typed claims, and a SPEED claim must beat the fastest implementation in the field, not just
+  the reference), **Audit** (latest in-house review and mutation run, dated, with the mutation
+  score and the hash of the source the audit read — a changed source makes the audit stale),
+  **Hardening** (fuzz-driver and ctgrind runs where they apply), **Performance** (worst-case
+  ratio against the reference and against the fastest in the field), **Evidence** (class C/D
+  only: what the tests are checked against when no outside truth exists), **Known defects**
+  and **Downstream consumer** (a project outside this collection imports it; sibling modules
+  do not count) — and for class A/B the anchor grade supplies the evidence axis, raised to 1
+  only when a live `tools/interop.zig` oracle re-takes it. The **grade** is 1 (ahead of the
+  competition) … 5 (proof of concept or a known defect — do not consume), the worst of those
+  axes; `?` marks it provisional while the scope is unsurveyed or the survey is over a year
+  old, and a lead older than 180 days counts as parity until re-measured. A consumed module
+  must grade 3 or better (`check-catalog-table` fails otherwise). The exact rule is
+  `maturityGrade` in `build.zig`, the vocabulary is in `modules/_template/SPEC.md`, the scale
+  is explained in the README's "Module grades", and the grade appears in the catalog next to
+  the module's description with the capping axes in brackets.
+  ⚠ The v2 cards started pessimistic on purpose (2026-10-08): no audit carries a source hash
+  (`src ?` → audit 2), hardening dates were not recorded (`?` → 3), nothing is measured for
+  speed (`not measured` → 3), and every class C/D module is `unclassified` (3). Lines marked
+  "initial v2 fill, not reviewed" are a mechanical guess awaiting a reader. A module is raised
+  by recording the real thing, never by editing the guess.
   **Why this is not the tier label rejected earlier.** A per-module `stability` tag
   (stable/beta/experimental) was rejected because a coarse word hides exactly the detail the
   caveat lines carry, and rots. The grade answers both: it is never chosen, only computed from
@@ -856,9 +873,10 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   ebpf's "real-kernel verifier acceptance unverified") stay where they were. Against rot:
   `gen-catalog` writes both the card's Grade line and the catalog cell from one computation,
   `check-catalog-table` fails when either is stale, and a surveyed scope must carry its date.
-  What the gate cannot see is a hand-written axis going out of date (a scope surveyed before a
-  big feature landed, an audit older than the code) — `zig build maturity-report` is the
-  maintainer's list for that, worst first.
+  What the gate cannot see is a hand-written axis going out of date — a scope surveyed before
+  a big feature landed — except where v2 made age mechanical: the audit's source hash, the
+  lead's measurement date and the survey date. `zig build maturity-report` is the
+  maintainer's list for the rest, worst first.
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.
@@ -973,7 +991,7 @@ that reaches it can notice.
   records, findings and working notes live outside this repository; so does the scratch
   that produced them, until it is deleted.
 
-  Exactly two kinds are kept, and the auditor decides which **when the audit closes**, not
+  Exactly three kinds are kept, and the auditor decides which **when the audit closes**, not
   in a later clean-up:
 
   1. **A recipe for committed data** — whatever produced goldens, KATs, fixtures or
@@ -982,7 +1000,13 @@ that reaches it can notice.
      only through its public API or wire format. It does not anchor on source text, so it
      survives refactoring and the next audit can reuse it.
 
-  Both go to `modules/<name>/tools/`, each with a header saying what it needs and what it
+  3. **A comparative benchmark against foreign implementations** that backs a
+     `**Performance:**` ratio or an `**Ahead:** speed` claim in the maturity card (added
+     2026-10-08 with grading v2). Like the oracle it drives the module only through its
+     public API, so it survives refactoring — and without it the ratio is a number nobody
+     can re-check, which is exactly what kind 1 forbids for a golden.
+
+  All three go to `modules/<name>/tools/`, each with a header saying what it needs and what it
   produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and
   snapshot copies of the module are **not** kept.
 
