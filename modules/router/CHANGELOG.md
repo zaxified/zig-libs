@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Parity with go-chi/chi (the reference): chi's `{name}` captures — whole
+  segment (same as `:name`) and **inside a segment** (`/files/{name}.{ext}`, `v{major}`,
+  `{id}.json`), a bare `*` wildcard (captured as `"*"`); `with` (inline per-route middleware),
+  `mount` (copy a built router under a prefix, with its groups, docs and 404/405 overrides),
+  `any` (every method), `Group.not_found`/`method_not_allowed` overrides, `HostRouter` (one
+  router per host, exact / `*.suffix` / default), `PatternCaptures`. `Static` takes the same
+  patterns (the differential test now draws them). **Behaviour change:** a `{`/`}` in a pattern
+  used to be a literal byte of a static segment; `{x}` is now a capture and a stray brace is
+  `error.InvalidPattern` (in-repo, only an `openapi` test relied on the literal). A regexp
+  constraint (`{id:[0-9]+}`) is refused until the `regex` module exists.
 - **2026-10-04** — Tests: mutation schemata run (32 mutants, 31 killed, 1 equivalent). Five
   new tests: a direct caller's `%00` path answered 400 in both normalizing postures, no
   trailing-slash redirect from `/` or toward a variant lacking the method, fallbacks running the

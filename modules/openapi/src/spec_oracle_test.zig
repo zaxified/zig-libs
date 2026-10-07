@@ -57,8 +57,11 @@ test "spec oracle: every route table builds the document the validator accepted"
         }
     }
     try testing.expectEqual(@as(usize, 0), bad);
-    // The literal-brace table is refused, the rest build.
-    try testing.expect(refused >= 1 and refused < vectors.tables.len / 2);
+    // Every table builds: the one refusal the oracle used to hold (a literal
+    // `{x}` static segment) cannot be registered since router reads `{x}` as
+    // a capture (2026-10-07); `validateOpenApi31`'s own template check is
+    // held by the mutations below (`drop_path_param`).
+    try testing.expectEqual(@as(usize, 0), refused);
 }
 
 test "spec oracle: validateOpenApi31 answers what the validator answered on each mutation" {

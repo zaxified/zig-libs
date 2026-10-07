@@ -10,8 +10,8 @@ Driven by tools/interop.zig (`zig build interop-openapi`):
     spec_oracle.py judge TABLES DOCS OUT    verdicts; writes the Zig vectors to OUT
 
 `gen` draws route tables from a fixed seed: patterns with static segments
-(UTF-8, dots, tildes, percent signs, literal braces), `:params` and a final
-`*wildcard`, every method, and `RouteDoc` metadata (summary, description,
+(UTF-8, dots, tildes, percent signs), `:params`, `{name}` captures (whole and
+inside a segment) and a final `*wildcard`, every method, and `RouteDoc` metadata (summary, description,
 tags, deprecated, request/query/response schemas). interop.zig registers each
 table on a `router.Router` and builds the document; `judge` has the validator
 check every document built, then mutates documents into the shapes a
@@ -78,8 +78,11 @@ def gen_pattern(rng):
         r = rng.random()
         if r < 0.55:
             segs.append(rng.choice(STATIC))
-        else:
+        elif r < 0.75:
             segs.append(':' + rng.choice(PARAMS))
+        else:
+            # router's `{name}` captures, whole or inside a segment (2026-10-07).
+            segs.append(rng.choice(['{%s}', '{%s}.json', 'v{%s}', '{%s}-{b}']) % rng.choice(PARAMS))
     if rng.random() < 0.2:
         segs.append('*' + rng.choice(['rest', 'path', 'id']))
     p = '/' + '/'.join(segs)
@@ -131,9 +134,12 @@ def gen():
         {'method': 'get', 'pattern': '/users/:id/posts/:postId', 'doc': {'query_schema': QUERY[3], 'responses': []}},
         {'method': 'post', 'pattern': '/', 'doc': {'request_schema': SCHEMAS[1], 'responses': [{'status': 201, 'description': 'Created'}]}},
     ]})
-    # A literal-brace static segment has no OpenAPI spelling: the build refuses it.
+    # router's `{name}` captures (2026-10-07): whole, inside a segment, and a
+    # a final wildcard -- templates with their parameters, never a literal brace.
     tables.append({'title': 'T', 'version': '1', 'description': None, 'bearer': False, 'routes': [
         {'method': 'get', 'pattern': '/a/{x}', 'doc': None},
+        {'method': 'get', 'pattern': '/files/{name}.{ext}', 'doc': None},
+        {'method': 'put', 'pattern': '/s/v{n}/*rest', 'doc': None},
     ]})
     json.dump(tables, sys.stdout)
 

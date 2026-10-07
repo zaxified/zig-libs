@@ -26,12 +26,14 @@ python3 -m venv ~/.local/share/zig-libs/oracle-venvs/fastapi
 
 `ZIGLIBS_FASTAPI_PY` overrides the interpreter's path.
 
-**What the replay holds** (2026-10-05, openapi-spec-validator 0.7.1): 102 tables, every
-built document accepted by the validator and rebuilt byte for byte (the one table
-with a literal `{x}` segment refused with `UnresolvedPathParameter`); 168 mutations
-(12 per kind) on which `validateOpenApi31` answers as the validator did, except the
+**What the replay holds** (re-taken 2026-10-07, openapi-spec-validator 0.7.1): 102 tables
+(router patterns with `:params`, `{name}` captures whole and inside a segment, and a final
+`*wildcard`), every built document accepted by the validator and rebuilt byte for byte; 168
+mutations (12 per kind) on which `validateOpenApi31` answers as the validator did, except the
 classes SCOPE (an unknown member it does not police: it accepts), VALIDATOR_LAX (a
 path parameter missing from its template, forbidden by OAS 3.1 §4.8.12.1 but let
 through by the validator: it refuses) and OPENAPI_30 (it accepts 3.1.x only). And every
 built document maps its routes as FastAPI 0.142.2 does: the same path templates, methods
-and path parameters (101 tables, 250 templates).
+and path parameters (102 tables, 289 templates, 91 with a capture inside a segment).
+Until 2026-10-07 one crafted table held a literal `{x}` static segment, refused with
+`UnresolvedPathParameter`; `router` now reads `{x}` as a capture and refuses a stray brace.

@@ -49,13 +49,12 @@
 //!   `error.InvalidQuerySchema`.
 //! - `operationId` is omitted (optional in OpenAPI; no stable naming
 //!   source in a fn-pointer table).
-//! - Routes whose *converted* path collides (only possible with a literal
-//!   `{`/`}` static segment) merge into one path item; the first
-//!   registration wins per method — duplicate JSON keys are never emitted.
-//! - A literal `{`/`}` static segment has no OpenAPI spelling (it reads as
-//!   a template expression with no parameter): `build` refuses the table
-//!   with `error.UnresolvedPathParameter` from its own output check; leave
-//!   such a route out with `Info.include`.
+//! - Router patterns convert to OpenAPI templates: `:id`/`*rest` → `{id}`/
+//!   `{rest}` (a bare `*` → `{*}`); `{name}` captures, whole or inside a
+//!   segment (`/files/{name}.{ext}`), already are templates. `router`
+//!   refuses a stray `{`/`}`, so a template with no parameter cannot come
+//!   from a route; `build`'s own output check still refuses one
+//!   (`error.UnresolvedPathParameter`).
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -341,8 +340,10 @@ fn checkUtf8(s: []const u8) BuildError!void {
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 }
 
-/// `:param` / `*wild` segments → `{param}` / `{wild}` OpenAPI templates;
-/// static segments pass through byte-for-byte.
+/// `:param` / `*wild` segments → `{param}` / `{wild}` OpenAPI templates (a
+/// bare `*` → `{*}`); `{name}` captures, whole or inside a segment
+/// (`{name}.{ext}`), already are templates; static segments pass through
+/// byte-for-byte.
 fn convertPattern(arena: Allocator, pattern: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var it = std.mem.splitScalar(u8, pattern, '/');
@@ -352,7 +353,7 @@ fn convertPattern(arena: Allocator, pattern: []const u8) Allocator.Error![]const
         first = false;
         if (seg.len != 0 and (seg[0] == ':' or seg[0] == '*')) {
             try out.append(arena, '{');
-            try out.appendSlice(arena, seg[1..]);
+            try out.appendSlice(arena, if (seg.len == 1) "*" else seg[1..]);
             try out.append(arena, '}');
         } else {
             try out.appendSlice(arena, seg);
@@ -496,11 +497,8 @@ fn writeOperationId(
     while (it.next()) |seg| {
         if (seg.len == 0) continue;
         try id.append(arena, '_');
-        if (seg.len >= 2 and seg[0] == '{' and seg[seg.len - 1] == '}') {
-            try id.appendSlice(arena, seg[1 .. seg.len - 1]);
-        } else {
-            try id.appendSlice(arena, seg);
-        }
+        // Template braces dropped: `{id}` → `id`, `{name}.{ext}` → `name.ext`.
+        for (seg) |c| if (c != '{' and c != '}') try id.append(arena, c);
     }
     try jw.objectField("operationId");
     try jw.write(id.items);
@@ -518,12 +516,10 @@ fn writeOperationId(
 /// below (path segments are bounded in practice; router patterns are
 /// short) stays as defense in depth, deduping without allocating.
 fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool) Writer.Error!void {
-    var it = std.mem.splitScalar(u8, pattern, '/');
+    var it: router.PatternCaptures = .init(pattern);
     var seen_buf: [64][]const u8 = undefined;
     var seen_count: usize = 0;
-    while (it.next()) |seg| {
-        if (seg.len < 2 or (seg[0] != ':' and seg[0] != '*')) continue;
-        const name = seg[1..];
+    while (it.next()) |name| {
         const dup = for (seen_buf[0..seen_count]) |s| {
             if (std.mem.eql(u8, s, name)) break true;
         } else false;
@@ -1421,26 +1417,31 @@ test "generate: a query_schema that does not name parameters is error.InvalidQue
     }
 }
 
-test "generate: colliding (method, path) from two different patterns is a build error, not a silent drop (F5)" {
-    // "/users/:id" and the literal "/users/{id}" both convert to the same
-    // OpenAPI path template, and both are legal, independently
-    // dispatchable `router` routes. Before the F5 fix, the module silently
-    // kept only the FIRST registration and dropped the second's
-    // `RouteDoc` (and, for a param/wildcard pair, the second's entire
-    // documented operation) from the document without a trace. That is a
-    // different situation from a genuinely duplicate key (F3: two
-    // `RouteDoc.Response`s sharing a status code, one underlying route --
-    // "first wins" there is correct because there is only ONE value to
-    // pick from), so it is now `error.PathCollision` instead.
+test "generate: router's `{name}` captures, whole and inside a segment, become path templates and parameters" {
+    // Since router took chi's `{name}` spelling (2026-10-07), "/users/{id}"
+    // is the same route as "/users/:id" -- the router refuses the second
+    // registration itself, so this module's F5 collision check is left to
+    // the pairs that still convert alike (`:p` vs `*p`, below).
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.addDoc(.get, "/users/:id", hOk, .{ .summary = "First" });
-    try r.addDoc(.get, "/users/{id}", hOk, .{ .summary = "Second" });
+    try testing.expectError(error.DuplicateRoute, r.addDoc(.get, "/users/{id}", hOk, .{ .summary = "Second" }));
+    try r.get("/files/{name}.{ext}", hOk);
+    try r.get("/static/*", hOk);
 
-    try testing.expectError(
-        error.PathCollision,
-        Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
-    );
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+    const paths = parsed.value.object.get("paths").?.object;
+    const files = paths.get("/files/{name}.{ext}").?.object.get("get").?.object;
+    try testing.expectEqualStrings("get_files_name.ext", files.get("operationId").?.string);
+    const params = files.get("parameters").?.array.items;
+    try testing.expectEqual(@as(usize, 2), params.len);
+    try testing.expectEqualStrings("name", params[0].object.get("name").?.string);
+    try testing.expectEqualStrings("ext", params[1].object.get("name").?.string);
+    try testing.expect(paths.get("/static/{*}") != null);
 }
 
 test "generate: /f/:p and /f/*p collide too (F5) — audit's own repro" {

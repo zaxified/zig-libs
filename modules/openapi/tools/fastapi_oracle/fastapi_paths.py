@@ -10,9 +10,11 @@ accepted) and prints, per table, FastAPI's own document reduced to
 
 A router pattern becomes a Starlette path: `:name` -> `{name}`, `*name` ->
 `{name:path}` (Starlette's converter for a rest-of-path capture), every other
-segment verbatim.
+segment verbatim -- `{name}` captures, whole or inside a segment, already are
+Starlette's spelling.
 """
 import json
+import re
 import sys
 import warnings
 
@@ -47,7 +49,12 @@ def reduce(tables):
         app = FastAPI()
         try:
             for n, r in enumerate(t['routes']):
-                names = [s[1:] for s in r['pattern'].split('/') if s[:1] in (':', '*')]
+                names = []
+                for s in r['pattern'].split('/'):
+                    if s[:1] in (':', '*'):
+                        names.append(s[1:])
+                    else:
+                        names += re.findall(r'\{([^}]+)\}', s)
                 app.add_api_route(starlette_path(r['pattern']), endpoint(names, n), methods=[r['method'].upper()])
             doc = app.openapi()
         except Exception as e:  # FastAPI refusing the table is its verdict

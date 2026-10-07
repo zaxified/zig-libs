@@ -47,9 +47,13 @@ try r.use(.{ .run = logger });          // middleware BEFORE routes (chi rule)
 try r.get("/hello", hello);
 try r.get("/users/:id", user);
 try r.get("/static/*path", serveFile);  // trailing wildcard
+try r.get("/files/{name}.{ext}", file); // chi's `{name}`, also inside a segment
 const api = try r.group("/api");        // prefix + per-group middleware
 try api.use(.{ .run = requireAuth });   // gates every response under "/api",
 try api.get("/things/:id", thing);      // including 404/405/auto-OPTIONS/redirect
+try (try r.with(&.{audit})).post("/admin", admin); // middleware for one route
+try r.mount("/v2", &v2_router);         // a built router under a prefix
+try r.any("/hook", webhook);            // every method
 
 var server = http.Server.init(io, gpa, .{
     .handler = r.handler(),
@@ -80,7 +84,8 @@ OpenAPI 3.1 document.
 
 | Topic | Behavior |
 |---|---|
-| Precedence | static > `:param` > `*wildcard` per segment, with chi-style backtracking (an endpoint-less static prefix falls back to a param sibling) |
+| Precedence | static > in-segment pattern > `:param` > `*wildcard` per segment, with chi-style backtracking (an endpoint-less static prefix falls back to a param sibling) |
+| Patterns | `:id` and `{id}` capture one whole segment; `{name}` inside a segment with literal text around it (`{name}.{ext}`, `v{major}`, `{id}.json`) — see "Patterns inside a segment"; `*rest` (or a bare `*`, captured as `"*"`) the remainder |
 | Params | `:param` never matches an empty segment; `*wildcard` must be the last segment and captures the remainder without the leading slash (may be `""`); a pattern must not reuse one capture name twice (`error.DuplicateParamName`) or contain an empty segment other than a single trailing one (`error.InvalidPattern`) |
 | Matching | raw bytes — no percent-decoding, no case folding |
 | Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; a fallback (404/405/auto-OPTIONS/redirect — see below) runs the chain of whichever group's prefix the request path falls under, router-level `use` alone when it falls under none — a `group("/api").use(requireAuth)` gate sees every response for `/api`, not only the ones a route actually served |
@@ -189,6 +194,65 @@ handler that percent-decodes a captured segment before using it as a key
 (e.g. as a filesystem path or object-store key) must still treat the decoded
 result as untrusted and re-validate it (see `filestore`'s `segmentSafe`
 allowlist for one way to do that).
+
+## Patterns inside a segment
+
+chi's `{name}` spelling, with literal text around the captures:
+
+```zig
+try r.get("/files/{name}.{ext}", file);   // a.b.c -> name=a, ext=b.c
+try r.get("/files/{name}.json", json);    // a.b.json -> name=a.b (tried first: more literal)
+try r.get("/v{major}/status", status);    // v2 -> major=2
+try r.get("/u/{id}", user);               // the same capture as "/u/:id"
+```
+
+One pass per segment, no backtracking inside it: a capture followed by more of the pattern ends
+at the **first** occurrence of the literal after it; the last capture takes everything up to the
+literal suffix, which must end the segment; **no capture is ever empty** (`/files/.b` is not a
+match — chi would give `name=""`). Two captures need literal text between them (`{a}{b}` is
+`error.InvalidPattern`), and a stray `{`/`}` is refused rather than kept as a literal. Between
+siblings: static first, then the in-segment patterns — the longer literal prefix first, then the
+more literal bytes, then registration order — then `:param`, then `*wildcard`, with the same
+backtracking (and 405 `Allow` union) as every other candidate. Two patterns that differ only in
+capture names (`{a}.json` vs `{b}.json`) cannot share a position: `error.ParamNameConflict`.
+`router.PatternCaptures` iterates a pattern's capture names (what `openapi` builds its
+parameters from).
+
+Not yet: chi's regexp constraint `{id:[0-9]+}` is refused (`error.InvalidPattern`) until the
+`regex` module lands.
+
+## Composing routers: `with`, `mount`, `any`, per-group fallbacks
+
+- `r.with(&.{mw, ...})` (and `group.with`) returns an **inline group**: no prefix, the middleware
+  appended to the chain of the routes registered through it only. Allowed after routes exist. It
+  never scopes a fallback — a 404/405/redirect runs the enclosing prefixed group's chain.
+- `r.mount("/api", &sub)` (and `group.mount`) copies a fully built `Router` under a prefix: its
+  routes, `use` middleware, groups, inline groups, docs, and its `not_found`/`method_not_allowed`
+  when it overrode them (they answer the fallbacks under `/api`). A snapshot — routes added to
+  `sub` later are not served, and `sub` may be deinitialized right after. `sub`'s dispatch-wide
+  settings (`state`, trailing slash, normalization, precedence, auto-OPTIONS) do not travel.
+  Patterns join like a group's: `sub`'s `/` is `/api/`, and `/api` reaches it through the
+  trailing-slash policy (chi serves both). `"/"` merges `sub` at the root.
+- `r.any(pattern, h)` registers `h` for every method (chi's `Handle`).
+- `group.not_found` / `group.method_not_allowed` override the router's fallbacks for paths under
+  the group (the deepest group with an override wins), behind the group's chain.
+
+## Host routing (`HostRouter`)
+
+One `Router` per site, chosen by the `Host` header (HTTP/2: `:authority`):
+
+```zig
+var hosts = router.HostRouter.init(gpa);
+defer hosts.deinit();
+try hosts.map("api.example.com", &api);
+try hosts.map("*.example.com", &tenant);  // a.example.com, a.b.example.com; not example.com
+hosts.default = &www;                     // anything else (also: no Host)
+var server = http.Server.init(io, gpa, .{ .handler = hosts.handler(), .context = &hosts });
+```
+
+ASCII case-insensitive, port and one trailing dot ignored, an IPv6 literal keeps its brackets
+(`[::1]`). Exact host first, then the wildcard with the longest suffix, then `default`, then
+`not_found` (404, no middleware). Read-only once built.
 
 ## A comptime table (`Static`)
 

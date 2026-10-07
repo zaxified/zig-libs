@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) router | Zig | MIT | 1.6k | no release (push 2026-08-26) | `:param` and `*` routes, per-route middleware lists with a `replace`/`append` strategy, per-route config; welded to httpz's server. |
 | [lalinsky/dusty](https://github.com/lalinsky/dusty) router | Zig | MIT (LICENSE text) | 133 | v0.3.1 (2026-09-21) | "Router with support for parameters and wildcards" *(README)*; welded to dusty. Source not read. |
 
-**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (review 2026-09-11, findings F1–F11 fixed). **Where we are behind:** patterns are whole-segment only (no regexp, no `prefix-:id`/`:name.ext`), no sub-router `Mount`, no per-route inline middleware (`With`), no host routing (→ Backlog).
+**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (review 2026-09-11, findings F1–F11 fixed). **On par since 2026-10-07:** chi's `{name}` captures, whole and inside a segment (`{name}.{ext}`), a bare `*`, `With` (inline per-route middleware), `Mount` of a built router (with its groups, docs and 404/405 overrides), `Handle` for every method (`any`), sub-router `NotFound`/`MethodNotAllowed` (`Group.not_found`/`method_not_allowed`), host routing (`HostRouter`, chi's separate `hostrouter`). **Where we are behind:** regexp constraints (`{id:[0-9]+}`) — refused until the `regex` module exists (→ Backlog).
 
 ## Design & invariants
 
@@ -50,7 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   middleware entirely, and a trailing-slash redirect skipped the FULL chain including router-level
   `use` — answered straight from `dispatch`, letting an unauthenticated caller enumerate the route
   table via the 301-vs-404 difference).
-- **Deterministic precedence:** static > `:param` > `*wildcard` per segment, with chi-style
+- **Deterministic precedence:** static > in-segment pattern (`{name}.{ext}`; longer literal prefix, then more literal bytes, then registration order) > `:param`/`{name}` > `*wildcard` per segment, with chi-style
   backtracking (an endpoint-less static prefix falls back to a param sibling). Raw byte matching —
   no percent-decoding, no case folding; `:param` never matches empty, `*wildcard` must be last and
   captures the remainder (possibly `""`).
@@ -162,10 +162,11 @@ entered; the new test reaches it. No code defect found.
 
 ## Backlog / deferred
 
-- **Mid-segment / constrained params (`/files/:name.:ext`, `/{id:[0-9]+}`)** *(survey 2026-09-30)* — chi users write these routinely for numeric ids and file extensions; here `:`/`*` only introduce whole segments and validation is left to the handler (returns 404 by hand). Effort: medium (trie node kinds; regexp itself does not fit §2 cheaply — a small fixed set of constraints such as `int`/`uuid`/`alpha` would). Fits §2 in the constraint-set form.
-- **Per-route inline middleware (`With`)** *(survey 2026-09-30)* — today middleware attach only to the router or a group; a single route needing an auth or rate-limit gate must be put in its own group. Effort: small (extend `add` with a middleware slice frozen into the chain at add time). Fits §2.
-- **Sub-router `Mount`** *(survey 2026-09-30)* — chi/axum compose independently built routers under a prefix; `group` covers prefixing but not merging a pre-built `Router`. Effort: medium (needs the trie node re-parent and fallback-scoping rules of `groupFor`). Fits §2. Lower value while groups exist.
-- **Host-based routing** *(survey 2026-09-30)* — gorilla/mux matches on `Host`; here a caller dispatches to one `Router` per host by hand. Effort: small as a tiny wrapper; may belong in a separate helper. Fits §2.
+- **Regexp constraints (`{id:[0-9]+}`)** *(survey 2026-09-30; user 2026-10-07: a zig-libs `regex` module, not a fixed constraint set)* — chi users write these routinely for numeric ids. Blocked on the new `regex` module (RE2 syntax, linear time, compiles at comptime too, so `Static` can take it). Until then `classifySegment` refuses a `:` inside `{…}`. Fits §2.
+- ~~**Mid-segment params**~~ — DONE 2026-10-07 (chi's `{name}` inside a segment; semantics in README "Patterns inside a segment").
+- ~~**Per-route inline middleware (`With`)**~~ — DONE 2026-10-07 (`with`, inline groups).
+- ~~**Sub-router `Mount`**~~ — DONE 2026-10-07 (a copy of a built router; `Group.not_found`/`method_not_allowed` carry its fallbacks).
+- ~~**Host-based routing**~~ — DONE 2026-10-07 (`HostRouter`).
 
 ## Status
 

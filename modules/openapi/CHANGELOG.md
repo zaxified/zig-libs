@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Follows `router`'s `{name}` captures: a whole-segment or in-segment capture
+  (`/files/{name}.{ext}`) is already an OpenAPI template and gets its path parameters (via
+  `router.PatternCaptures`); a bare `*` becomes `{*}`; `operationId` drops template braces
+  (`get_files_name.ext`). The spec oracle re-taken with such patterns drawn (102 tables, all
+  built and accepted; FastAPI maps them the same). The literal-`{x}` table it used to hold is
+  gone — `router` no longer registers a literal brace.
 - **2026-10-05** — **Anchoring: openapi-spec-validator oracle** (`tools/spec_oracle.py`, `tools/interop.zig`,
   `src/spec_oracle_test.zig`): 102 route tables built through a real router must give the documents the
   validator accepted; 168 mutated documents must get the validator's verdict from `validateOpenApi31`; and FastAPI,

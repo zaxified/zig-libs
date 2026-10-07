@@ -3,9 +3,12 @@
 //! router — REST routing on top of `http.Server`.
 //!
 //! Maps `(method, path pattern)` to handlers: static segments, named params
-//! (`/users/:id`) and a trailing wildcard (`/static/*path`), with the
-//! deterministic precedence static > param > wildcard (chi-style
-//! backtracking). The matcher is a per-segment trie precomputed at `add`
+//! (`/users/:id` or chi's `/users/{id}`), captures inside a segment
+//! (`/files/{name}.{ext}`) and a trailing wildcard (`/static/*path`), with
+//! the deterministic precedence static > in-segment pattern > param >
+//! wildcard (chi-style backtracking). Routers compose: `group` (prefix +
+//! middleware), `with` (middleware for single routes), `mount` (a built
+//! router under a prefix); `HostRouter` picks a router by host. The matcher is a per-segment trie precomputed at `add`
 //! time; `dispatch` is read-only, lock-free and allocation-free (params
 //! live on the stack), so one Router safely serves all of `http.Server`'s
 //! connection threads at once.
@@ -457,6 +460,10 @@ pub const Router = struct {
     /// endpoint. Not a tree: `Group` only points at its parent, so the
     /// router keeps the flat index.
     groups: std.ArrayList(*Group),
+    /// Every registration as it was made (group + pattern relative to it +
+    /// handler + doc), in registration order — what `mount` replays into
+    /// another router. `route_list` is the public view; this is the recipe.
+    defs: std.ArrayList(RouteDef),
 
     /// All registration state (nodes, patterns, chains, groups) lives in an
     /// internal arena owned by the Router — `deinit` frees everything.
@@ -467,6 +474,7 @@ pub const Router = struct {
             .mws = .empty,
             .route_list = .empty,
             .groups = .empty,
+            .defs = .empty,
         };
     }
 
@@ -524,6 +532,48 @@ pub const Router = struct {
     }
     pub fn options(r: *Router, pattern: []const u8, h: Handler) AddError!void {
         return r.add(.options, pattern, h);
+    }
+
+    /// Register `h` for every `http.Method` at `pattern` (chi's `Handle`).
+    /// An explicit route for one method registered before or after is a
+    /// `error.DuplicateRoute` — `any` claims them all.
+    pub fn any(r: *Router, pattern: []const u8, h: Handler) AddError!void {
+        return addAny(r, null, pattern, h);
+    }
+
+    /// An inline group (chi's `With`): no prefix, `mws` appended to the chain
+    /// of every route registered through it — per-route middleware without
+    /// a group of its own. `r.with(&.{auth}).get("/admin", h)`. Allowed
+    /// after routes exist (it changes no other route's chain). An inline
+    /// group never scopes a fallback: a 404/405/redirect for a path it
+    /// would have served runs the chain of the enclosing (prefixed) group,
+    /// because no route of the inline group was reached. `mws` is copied.
+    pub fn with(r: *Router, mws: []const Middleware) error{OutOfMemory}!*Group {
+        return makeInline(r, null, mws);
+    }
+
+    /// Attach a copy of the fully built `sub` under `prefix` (chi's `Mount`):
+    /// every route of `sub` at `prefix ++ pattern`, behind this router's
+    /// chain (plus, for `Group.mount`, the group's), then `sub`'s own `use`
+    /// middleware, then its groups' — exactly the chain `sub` would have
+    /// run on its own. `sub`'s groups, inline groups and docs come along,
+    /// and so do its `not_found`/`method_not_allowed` when it overrode
+    /// them: they answer the fallbacks under `prefix` (see
+    /// `Group.not_found`). `prefix` is a group prefix (`"/api"`), or `"/"`
+    /// to merge `sub` at the root.
+    ///
+    /// A snapshot: routes added to `sub` afterwards are not served here,
+    /// and `sub` may be deinitialized once this returns (every string and
+    /// chain is copied; handlers and middleware `state` pointers are the
+    /// caller's, as always). `sub`'s dispatch-wide settings (`state`,
+    /// `trailing_slash`, `normalize_path`, `method_precedence`,
+    /// `auto_options`, `bad_request`) do not travel — this router's apply.
+    /// Patterns join like a group's: `sub`'s `"/"` becomes `"/api/"`, and
+    /// `"/api"` reaches it through the trailing-slash policy (chi serves
+    /// both). On error the router holds whatever was inserted before it —
+    /// treat a failed mount as a startup failure.
+    pub fn mount(r: *Router, prefix: []const u8, sub: *const Router) MountError!void {
+        return mountInto(r, null, prefix, sub);
     }
 
     /// A prefixed sub-router with its own middleware. Routes added through
@@ -620,7 +670,7 @@ pub const Router = struct {
             const endpoint = if (r.auto_options and req.method == .options)
                 defaultAutoOptions
             else
-                r.method_not_allowed;
+                r.fallbackHandler(req.path, .method_not_allowed);
             var ctx: Ctx = .{ .req = req, .res = rw, .params = &params, .state = r.state };
             const next: Next = .{ .chain = r.fallbackChain(req.path), .endpoint = endpoint };
             return next.run(&ctx);
@@ -629,7 +679,7 @@ pub const Router = struct {
         if (r.trailing_slash == .redirect)
             if (try r.tryRedirect(req, rw)) return;
 
-        return r.runFallback(req, rw, r.not_found);
+        return r.runFallback(req, rw, r.fallbackHandler(req.path, .not_found));
     }
 
     fn runFallback(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter, h: Handler) anyerror!void {
@@ -649,6 +699,7 @@ pub const Router = struct {
         var best: ?*Group = null;
         for (r.groups.items) |g| {
             if (g.own_chain == null) continue; // no route ever reached it
+            if (g.is_inline) continue; // scopes routes, never a path
             if (!std.mem.startsWith(u8, path, g.prefix)) continue;
             if (path.len > g.prefix.len and path[g.prefix.len] != '/') continue;
             if (best == null or g.prefix.len > best.?.prefix.len) best = g;
@@ -666,6 +717,19 @@ pub const Router = struct {
     fn fallbackChain(r: *const Router, path: []const u8) []const Middleware {
         if (r.groupFor(path)) |g| return g.own_chain.?;
         return r.mws.items;
+    }
+
+    /// The 404 or 405 handler for a fallback at `path`: the override of the
+    /// deepest enclosing group that has one (`Group.not_found` /
+    /// `method_not_allowed` — a mounted router's own overrides land there),
+    /// else the router's.
+    fn fallbackHandler(r: *const Router, path: []const u8, comptime which: enum { not_found, method_not_allowed }) Handler {
+        var it = r.groupFor(path);
+        while (it) |g| : (it = g.parent) {
+            if (g.is_inline) continue;
+            if (@field(g, @tagName(which))) |h| return h;
+        }
+        return @field(r, @tagName(which));
     }
 
     /// Probe the other trailing-slash variant; when it has this route,
@@ -735,6 +799,13 @@ pub const Router = struct {
         const doc_copy: ?*const RouteDoc = if (doc) |d| try dupeDoc(a, d) else null;
         try r.insert(method, full, h, chain);
         try r.route_list.append(a, .{ .method = method, .pattern = full, .doc = doc_copy });
+        try r.defs.append(a, .{
+            .group = g,
+            .pattern = full[full.len - pattern.len ..],
+            .method = method,
+            .handler = h,
+            .doc = doc_copy,
+        });
         r.routes_added = true;
         var it: ?*Group = g;
         while (it) |gr| : (it = gr.parent) {
@@ -832,69 +903,78 @@ pub const Router = struct {
                 seg = cur[0..i];
                 next = cur[i + 1 ..];
             }
-            if (seg.len != 0 and seg[0] == '*') {
-                const name = seg[1..];
-                if (name.len == 0 or next != null) return error.InvalidPattern;
-                if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
-                for (seen_names[0..seen_names_len]) |s| {
-                    if (std.mem.eql(u8, s, name)) return error.DuplicateParamName;
+            const kind = try classifySegment(seg);
+            // F8: every capture of the segment against the names seen so far.
+            var caps: CaptureIter = .{ .text = if (kind == .pattern) seg else "" };
+            const single: ?[]const u8 = switch (kind) {
+                .param, .wildcard => |name| name,
+                else => null,
+            };
+            var single_done = false;
+            while (true) {
+                const name = if (!single_done and single != null) blk: {
+                    single_done = true;
+                    break :blk single.?;
+                } else if (caps.next()) |c| c.name else break;
+                for (seen_names[0..seen_names_len]) |sn| {
+                    if (std.mem.eql(u8, sn, name)) return error.DuplicateParamName;
                 }
                 nparams += 1;
                 if (nparams > max_params) return error.TooManyParams;
                 seen_names[seen_names_len] = name;
                 seen_names_len += 1;
-                if (node.wildcard) |wc| {
-                    if (!std.mem.eql(u8, wc.name, name)) return error.ParamNameConflict;
-                    node = wc.node;
-                } else {
-                    const child = try a.create(Node);
-                    child.* = .{};
-                    node.wildcard = .{ .name = try a.dupe(u8, name), .node = child };
-                    node = child;
-                }
-                rest = null;
-            } else if (seg.len != 0 and seg[0] == ':') {
-                const name = seg[1..];
-                if (name.len == 0) return error.InvalidPattern;
-                if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
-                for (seen_names[0..seen_names_len]) |s| {
-                    if (std.mem.eql(u8, s, name)) return error.DuplicateParamName;
-                }
-                nparams += 1;
-                if (nparams > max_params) return error.TooManyParams;
-                seen_names[seen_names_len] = name;
-                seen_names_len += 1;
-                if (node.param) |p| {
-                    if (!std.mem.eql(u8, p.name, name)) return error.ParamNameConflict;
-                    node = p.node;
-                } else {
-                    const child = try a.create(Node);
-                    child.* = .{};
-                    node.param = .{ .name = try a.dupe(u8, name), .node = child };
-                    node = child;
-                }
-                rest = next;
-            } else {
-                // F11 (A1/router.md): an empty segment is legal ONLY as the
-                // final one -- a trailing slash, e.g. `/x/`, is a real,
-                // distinct route per the module doc ("a trailing slash is
-                // a normal (empty) static segment"). A LEADING or INTERIOR
-                // empty segment (`//x`, `/a//b`) used to be silently
-                // accepted into the trie; dispatching it later made
-                // `tryRedirect` emit a protocol-relative `Location`
-                // (`//evil.example/x`), which a browser reads as
-                // `http://evil.example/x` -- an open redirect.
-                if (seg.len == 0 and next != null) return error.InvalidPattern;
-                if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
-                if (node.static.get(seg)) |child| {
-                    node = child;
-                } else {
-                    const child = try a.create(Node);
-                    child.* = .{};
-                    try node.static.put(a, try a.dupe(u8, seg), child);
-                    node = child;
-                }
-                rest = next;
+            }
+            switch (kind) {
+                .wildcard => |name| {
+                    if (next != null) return error.InvalidPattern;
+                    if (node.wildcard) |wc| {
+                        if (!std.mem.eql(u8, wc.name, name)) return error.ParamNameConflict;
+                        node = wc.node;
+                    } else {
+                        const child = try a.create(Node);
+                        child.* = .{};
+                        node.wildcard = .{ .name = try a.dupe(u8, name), .node = child };
+                        node = child;
+                    }
+                    rest = null;
+                },
+                .param => |name| {
+                    if (node.param) |p| {
+                        if (!std.mem.eql(u8, p.name, name)) return error.ParamNameConflict;
+                        node = p.node;
+                    } else {
+                        const child = try a.create(Node);
+                        child.* = .{};
+                        node.param = .{ .name = try a.dupe(u8, name), .node = child };
+                        node = child;
+                    }
+                    rest = next;
+                },
+                .pattern => {
+                    node = try insertPattern(a, node, seg);
+                    rest = next;
+                },
+                .static => {
+                    // F11 (A1/router.md): an empty segment is legal ONLY as the
+                    // final one -- a trailing slash, e.g. `/x/`, is a real,
+                    // distinct route per the module doc ("a trailing slash is
+                    // a normal (empty) static segment"). A LEADING or INTERIOR
+                    // empty segment (`//x`, `/a//b`) used to be silently
+                    // accepted into the trie; dispatching it later made
+                    // `tryRedirect` emit a protocol-relative `Location`
+                    // (`//evil.example/x`), which a browser reads as
+                    // `http://evil.example/x` -- an open redirect.
+                    if (seg.len == 0 and next != null) return error.InvalidPattern;
+                    if (node.static.get(seg)) |child| {
+                        node = child;
+                    } else {
+                        const child = try a.create(Node);
+                        child.* = .{};
+                        try node.static.put(a, try a.dupe(u8, seg), child);
+                        node = child;
+                    }
+                    rest = next;
+                },
             }
         }
         const idx = @intFromEnum(method);
@@ -914,6 +994,22 @@ pub const Router = struct {
             const distance = total_segments - @as(u32, @intCast(i));
             ancestors[i].min_reach = @min(ancestors[i].min_reach, distance);
         }
+    }
+
+    /// The child of `node` for the in-segment pattern `seg` (created, in
+    /// precedence order, when new). Two patterns that differ only in their
+    /// capture names cannot both live at one position — the second could
+    /// never match — so that is a `ParamNameConflict`, as for `:a` vs `:b`.
+    fn insertPattern(a: Allocator, node: *Node, seg: []const u8) AddError!*Node {
+        for (node.patterns.items) |e| {
+            if (std.mem.eql(u8, e.text, seg)) return e.node;
+            if (samePatternShape(e.text, seg)) return error.ParamNameConflict;
+        }
+        const child = try a.create(Node);
+        child.* = .{};
+        const at = patternSlot(Node.PatEdge, node.patterns.items, seg);
+        try node.patterns.insert(a, at, .{ .text = try a.dupe(u8, seg), .node = child });
+        return child;
     }
 
     comptime {
@@ -966,6 +1062,21 @@ pub const Group = struct {
     /// fallback for a path under this group's prefix still runs its
     /// middleware, even when no route actually matched.
     own_chain: ?[]const Middleware = null,
+    /// The prefix this group added to its parent's (`""` for an inline
+    /// group) — what `mount` re-creates the group from.
+    own_prefix: []const u8,
+    /// Position in `Router.groups` (creation order).
+    index: usize,
+    /// Made by `with`: adds middleware, no prefix, never scopes a fallback.
+    is_inline: bool = false,
+    /// Overrides `Router.not_found` for a 404 whose path falls under this
+    /// group's prefix (the deepest group with an override wins; chi's
+    /// sub-router `NotFound`). Runs behind the group's chain, like the
+    /// router's. Ignored on an inline group.
+    not_found: ?Handler = null,
+    /// Overrides `Router.method_not_allowed` the same way; `Allow` is set
+    /// before it runs.
+    method_not_allowed: ?Handler = null,
 
     /// Append group middleware; must precede routes added through this
     /// group (or its children).
@@ -1005,27 +1116,230 @@ pub const Group = struct {
         return g.add(.options, pattern, h);
     }
 
+    /// `Router.any` under this group.
+    pub fn any(g: *Group, pattern: []const u8, h: Handler) AddError!void {
+        return addAny(g.router, g, pattern, h);
+    }
+
     /// A nested group: prefixes and middleware accumulate.
     pub fn group(g: *Group, prefix: []const u8) GroupError!*Group {
         return makeGroup(g.router, g, prefix);
     }
+
+    /// `Router.with` under this group: this group's prefix and chain, plus
+    /// `mws`.
+    pub fn with(g: *Group, mws: []const Middleware) error{OutOfMemory}!*Group {
+        return makeInline(g.router, g, mws);
+    }
+
+    /// `Router.mount` under this group: `sub`'s routes at
+    /// `g.prefix ++ prefix ++ pattern`, behind this group's chain.
+    pub fn mount(g: *Group, prefix: []const u8, sub: *const Router) MountError!void {
+        return mountInto(g.router, g, prefix, sub);
+    }
+};
+
+pub const MountError = AddError || error{
+    /// As for `group`; `"/"` is also accepted (merge at the root).
+    InvalidPrefix,
+    /// A router mounted into itself.
+    SelfMount,
+};
+
+/// One registration as `addRoute` received it — see `Router.defs`.
+const RouteDef = struct {
+    group: ?*Group,
+    /// Relative to `group` (a suffix of the stored full pattern).
+    pattern: []const u8,
+    method: http.Method,
+    handler: Handler,
+    doc: ?*const RouteDoc,
 };
 
 fn makeGroup(r: *Router, parent: ?*Group, prefix: []const u8) GroupError!*Group {
     if (prefix.len < 2 or prefix[0] != '/' or prefix[prefix.len - 1] == '/')
         return error.InvalidPrefix;
+    return newGroup(r, parent, prefix, false);
+}
+
+fn makeInline(r: *Router, parent: ?*Group, mws: []const Middleware) error{OutOfMemory}!*Group {
+    const g = try newGroup(r, parent, "", true);
+    try g.mws.appendSlice(r.arena.allocator(), mws);
+    return g;
+}
+
+fn newGroup(r: *Router, parent: ?*Group, prefix: []const u8, is_inline: bool) error{OutOfMemory}!*Group {
     const a = r.arena.allocator();
     const g = try a.create(Group);
+    const own = try a.dupe(u8, prefix);
     g.* = .{
         .router = r,
         .parent = parent,
-        .prefix = try std.mem.concat(a, u8, &.{ if (parent) |p| p.prefix else "", prefix }),
+        .prefix = try std.mem.concat(a, u8, &.{ if (parent) |p| p.prefix else "", own }),
         .mws = .empty,
         .routes_added = false,
         .own_chain = null,
+        .own_prefix = own,
+        .index = r.groups.items.len,
+        .is_inline = is_inline,
     };
     try r.groups.append(a, g);
     return g;
+}
+
+fn addAny(r: *Router, g: ?*Group, pattern: []const u8, h: Handler) AddError!void {
+    for (std.enums.values(http.Method)) |m| try Router.addRoute(r, g, m, pattern, h, null);
+}
+
+fn mountInto(r: *Router, parent: ?*Group, prefix: []const u8, sub: *const Router) MountError!void {
+    if (sub == r) return error.SelfMount;
+    const root_mount = prefix.len == 1 and prefix[0] == '/';
+    const mg = if (root_mount)
+        try newGroup(r, parent, "", false)
+    else
+        try makeGroup(r, parent, prefix);
+    const a = r.arena.allocator();
+    try mg.mws.appendSlice(a, sub.mws.items);
+    if (sub.not_found != defaultNotFound) mg.not_found = sub.not_found;
+    if (sub.method_not_allowed != defaultMethodNotAllowed) mg.method_not_allowed = sub.method_not_allowed;
+
+    // `sub.groups` is in creation order, so a parent is mapped before its
+    // children.
+    const mapped = try a.alloc(*Group, sub.groups.items.len);
+    for (sub.groups.items, mapped) |sg, *slot| {
+        const p = if (sg.parent) |sp| mapped[sp.index] else mg;
+        const ng = try newGroup(r, p, sg.own_prefix, sg.is_inline);
+        try ng.mws.appendSlice(a, sg.mws.items);
+        ng.not_found = sg.not_found;
+        ng.method_not_allowed = sg.method_not_allowed;
+        slot.* = ng;
+    }
+    for (sub.defs.items) |d| {
+        const g = if (d.group) |sg| mapped[sg.index] else mg;
+        const doc: ?RouteDoc = if (d.doc) |p| p.* else null;
+        try Router.addRoute(r, g, d.method, d.pattern, d.handler, doc);
+    }
+}
+
+// ── host routing ────────────────────────────────────────────────────────────
+
+pub const HostError = error{
+    OutOfMemory,
+    /// Empty, contains '/', ':' or whitespace, or a `*` anywhere but a
+    /// leading `*.` label (`*.example.com`).
+    InvalidHost,
+    /// This host pattern is already mapped.
+    DuplicateHost,
+};
+
+/// Dispatch on the request's host to one `Router` per site (chi's
+/// `hostrouter`, gorilla/mux's `Host`). Matching is on the `Host` header
+/// (HTTP/2: `:authority`, which `http.Server` presents as `Host`), ASCII
+/// case-insensitive, with the port and one trailing dot removed — `Example.COM:8080`
+/// and `example.com.` both reach `example.com`; an IPv6 literal keeps its
+/// brackets (`[::1]`). Precedence: the exact host, then the `*.suffix`
+/// pattern with the longest suffix (`*.example.com` matches any host with at
+/// least one more label: `a.example.com`, `a.b.example.com`, not
+/// `example.com` itself), then `default`, then `not_found`. Building is
+/// single-owner; a built `HostRouter` is read-only — reentrant, like `Router`.
+pub const HostRouter = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: std.ArrayList(HostEntry),
+    /// Serves a request no mapped host matches (including one with no `Host`).
+    default: ?*Router = null,
+    /// Answers when nothing matched and there is no `default`. Runs with no
+    /// middleware — no router claimed the request.
+    not_found: Handler = defaultNotFound,
+    /// `Ctx.state` for `not_found` (each `Router` keeps its own `state`).
+    state: ?*anyopaque = null,
+
+    const HostEntry = struct {
+        /// Lowercased; for a wildcard, the suffix with its leading dot
+        /// (`".example.com"`).
+        host: []const u8,
+        wildcard: bool,
+        router: *Router,
+    };
+
+    pub fn init(gpa: Allocator) HostRouter {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .entries = .empty };
+    }
+
+    pub fn deinit(hr: *HostRouter) void {
+        hr.arena.deinit();
+        hr.* = undefined;
+    }
+
+    /// Route requests for `host` (`"api.example.com"` or `"*.example.com"`)
+    /// to `router`, which must outlive the `HostRouter`.
+    pub fn map(hr: *HostRouter, host: []const u8, router: *Router) HostError!void {
+        const wildcard = std.mem.startsWith(u8, host, "*.");
+        const name = if (wildcard) host[1..] else host;
+        if (name.len == 0 or (wildcard and name.len == 1)) return error.InvalidHost;
+        // An IPv6 literal keeps its brackets and may hold ':'; nothing else may.
+        const literal = !wildcard and name.len > 2 and name[0] == '[' and name[name.len - 1] == ']';
+        for (name, 0..) |c, i| switch (c) {
+            '/', '*', ' ', '\t', '\r', '\n' => return error.InvalidHost,
+            ':' => if (!literal) return error.InvalidHost,
+            '[', ']' => if (!literal or (i != 0 and i != name.len - 1)) return error.InvalidHost,
+            else => {},
+        };
+        const a = hr.arena.allocator();
+        const lower = try std.ascii.allocLowerString(a, std.mem.trimEnd(u8, name, "."));
+        if (lower.len == 0 or (wildcard and lower.len == 1)) return error.InvalidHost;
+        for (hr.entries.items) |e| {
+            if (e.wildcard == wildcard and std.mem.eql(u8, e.host, lower)) return error.DuplicateHost;
+        }
+        try hr.entries.append(a, .{ .host = lower, .wildcard = wildcard, .router = router });
+    }
+
+    /// The router `host` (a raw `Host` value) dispatches to, or null.
+    pub fn routerFor(hr: *const HostRouter, raw_host: ?[]const u8) ?*Router {
+        const host = normalizeHost(raw_host orelse return hr.default);
+        var best: ?HostEntry = null;
+        for (hr.entries.items) |e| {
+            if (e.wildcard) {
+                if (host.len <= e.host.len or !std.ascii.endsWithIgnoreCase(host, e.host)) continue;
+                if (best) |b| if (!b.wildcard or b.host.len >= e.host.len) continue;
+                best = e;
+            } else if (std.ascii.eqlIgnoreCase(host, e.host)) {
+                return e.router;
+            }
+        }
+        if (best) |b| return b.router;
+        return hr.default;
+    }
+
+    /// The `http.Server.Handler` adapter; the server's `context` MUST be the
+    /// `HostRouter`.
+    pub fn handler(_: *const HostRouter) http.Server.Handler {
+        return hostAdapter;
+    }
+
+    pub fn dispatch(hr: *HostRouter, req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+        if (hr.routerFor(req.header("Host"))) |r| return r.dispatch(req, rw);
+        var empty: Params = .{};
+        var ctx: Ctx = .{ .req = req, .res = rw, .params = &empty, .state = hr.state };
+        return hr.not_found(&ctx);
+    }
+};
+
+/// `Host` without its port and one trailing dot (case is left alone — the
+/// comparisons fold it).
+fn normalizeHost(raw: []const u8) []const u8 {
+    var h = std.mem.trim(u8, raw, " \t");
+    if (h.len != 0 and h[0] == '[') {
+        if (std.mem.indexOfScalar(u8, h, ']')) |i| return h[0 .. i + 1];
+        return h;
+    }
+    if (std.mem.lastIndexOfScalar(u8, h, ':')) |i| h = h[0..i];
+    if (h.len > 1 and h[h.len - 1] == '.') h = h[0 .. h.len - 1];
+    return h;
+}
+
+fn hostAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    const hr: *HostRouter = @ptrCast(@alignCast(req.context.?));
+    return hr.dispatch(req, rw);
 }
 
 // ── the comptime table ─────────────────────────────────────────────────────
@@ -1140,6 +1454,7 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
 /// A comptime table node. Children are indices into the same table.
 const StaticNode = struct {
     statics: []const StaticEdge = &.{},
+    patterns: []const StaticPatEdge = &.{},
     param: ?StaticEdge = null,
     wildcard: ?StaticEdge = null,
     /// Route index per method.
@@ -1150,6 +1465,8 @@ const StaticNode = struct {
 
 /// A static child (`seg` = its segment) or a named capture (`seg` = the name).
 const StaticEdge = struct { seg: []const u8, child: u32 };
+/// An in-segment pattern child (`text` = the pattern segment).
+const StaticPatEdge = struct { text: []const u8, child: u32 };
 
 /// The comptime table as `matchIn` sees it: a `Ref` is an index.
 const StaticTree = struct {
@@ -1163,6 +1480,12 @@ const StaticTree = struct {
             if (std.mem.eql(u8, e.seg, seg)) return e.child;
         }
         return null;
+    }
+    inline fn patterns(t: StaticTree, n: Ref) []const StaticPatEdge {
+        return t.nodes[n].patterns;
+    }
+    inline fn patChild(_: StaticTree, e: StaticPatEdge) Ref {
+        return e.child;
     }
     inline fn param(t: StaticTree, n: Ref) ?Edge {
         const e = t.nodes[n].param orelse return null;
@@ -1219,13 +1542,26 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
                     seg = cur[0..i];
                     next = cur[i + 1 ..];
                 }
-                const kind: enum { static, param, wildcard } = if (seg.len != 0 and seg[0] == '*')
-                    .wildcard
-                else if (seg.len != 0 and seg[0] == ':')
-                    .param
-                else
-                    .static;
+                const kind = classifySegment(seg) catch unreachable; // validated above
                 switch (kind) {
+                    .pattern => {
+                        var found: ?u32 = null;
+                        for (nodes[node].patterns) |e| {
+                            if (std.mem.eql(u8, e.text, seg)) found = e.child;
+                            if (found == null and samePatternShape(e.text, seg)) @compileError(std.fmt.comptimePrint(
+                                "router.Static: route {d} ({s}): pattern '{s}' conflicts with '{s}' at the same position -- see router.AddError.ParamNameConflict",
+                                .{ ri, rt.pattern, seg, e.text },
+                            ));
+                        }
+                        node = found orelse blk: {
+                            const child: u32 = len;
+                            len += 1;
+                            const ps = nodes[node].patterns;
+                            const at = patternSlot(StaticPatEdge, ps, seg);
+                            nodes[node].patterns = ps[0..at] ++ &[_]StaticPatEdge{.{ .text = seg, .child = child }} ++ ps[at..];
+                            break :blk child;
+                        };
+                    },
                     .static => {
                         var found: ?u32 = null;
                         for (nodes[node].statics) |e| {
@@ -1238,8 +1574,7 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
                             break :blk child;
                         };
                     },
-                    .param, .wildcard => {
-                        const name = seg[1..];
+                    .param, .wildcard => |name| {
                         const slot = if (kind == .param) &nodes[node].param else &nodes[node].wildcard;
                         if (slot.*) |e| {
                             if (!std.mem.eql(u8, e.seg, name)) @compileError(std.fmt.comptimePrint(
@@ -1292,22 +1627,222 @@ pub fn validatePattern(pattern: []const u8) AddError!void {
             seg = cur[0..i];
             next = cur[i + 1 ..];
         }
-        if (seg.len != 0 and (seg[0] == '*' or seg[0] == ':')) {
-            const name = seg[1..];
-            if (name.len == 0) return error.InvalidPattern;
-            if (seg[0] == '*' and next != null) return error.InvalidPattern;
-            if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
+        const kind = try classifySegment(seg);
+        switch (kind) {
+            .static => {
+                // F11: an empty segment only as the final one (a trailing slash).
+                if (seg.len == 0 and next != null) return error.InvalidPattern;
+            },
+            .wildcard => if (next != null) return error.InvalidPattern,
+            .param => {},
+            .pattern => {},
+        }
+        var caps: CaptureIter = .{ .text = if (kind == .pattern) seg else "" };
+        var single: ?[]const u8 = switch (kind) {
+            .param, .wildcard => |name| name,
+            else => null,
+        };
+        while (true) {
+            const name = if (single) |x| blk: {
+                single = null;
+                break :blk x;
+            } else if (caps.next()) |c| c.name else break;
             for (names[0..n]) |x| if (std.mem.eql(u8, x, name)) return error.DuplicateParamName;
             if (n == max_params) return error.TooManyParams;
             names[n] = name;
             n += 1;
-        } else {
-            // F11: an empty segment only as the final one (a trailing slash).
-            if (seg.len == 0 and next != null) return error.InvalidPattern;
-            if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
         }
         rest = next;
     }
+}
+
+// ── pattern segments ────────────────────────────────────────────────────────
+
+/// The capture names of a registered pattern, left to right — `:id`, `{id}`,
+/// each `{name}` inside a segment, `*rest`, and a bare `*` as `"*"`. For
+/// what `routes()` returns (a pattern `add` accepted); an invalid pattern
+/// yields an unspecified subset.
+pub const PatternCaptures = struct {
+    rest: ?[]const u8,
+    inner: CaptureIter = .{ .text = "" },
+
+    pub fn init(pattern: []const u8) PatternCaptures {
+        return .{ .rest = if (pattern.len != 0) pattern[1..] else null };
+    }
+
+    pub fn next(pc: *PatternCaptures) ?[]const u8 {
+        while (true) {
+            if (pc.inner.next()) |c| return c.name;
+            const cur = pc.rest orelse return null;
+            var seg = cur;
+            pc.rest = null;
+            if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+                seg = cur[0..i];
+                pc.rest = cur[i + 1 ..];
+            }
+            switch (classifySegment(seg) catch continue) {
+                .param, .wildcard => |name| return name,
+                .pattern => pc.inner = .{ .text = seg },
+                .static => {},
+            }
+        }
+    }
+};
+
+/// What one `/`-separated pattern segment is.
+const SegKind = union(enum) {
+    /// Literal bytes (possibly empty: a trailing slash).
+    static,
+    /// `:name` or `{name}` — one whole, non-empty segment.
+    param: []const u8,
+    /// `*name`, or a bare `*` (captured as `"*"`, chi's spelling) — the
+    /// remainder of the path; last segment only.
+    wildcard: []const u8,
+    /// Literal text around `{name}` captures inside one segment
+    /// (`{name}.{ext}`, `v{major}`, `{id}.json`). See `matchSegPattern`.
+    pattern,
+};
+
+/// Classify `seg` and check its grammar: a capture name is non-empty and
+/// holds none of `/:*{}`; two captures need literal text between them (`{a}{b}`
+/// has no defined split); literal text holds no `:`, `*`, `{` or `}`.
+fn classifySegment(seg: []const u8) AddError!SegKind {
+    if (seg.len != 0 and (seg[0] == '*' or seg[0] == ':')) {
+        const name = seg[1..];
+        if (seg[0] == '*' and name.len == 0) return .{ .wildcard = "*" };
+        if (!validCaptureName(name)) return error.InvalidPattern;
+        return if (seg[0] == '*') .{ .wildcard = name } else .{ .param = name };
+    }
+    if (std.mem.indexOfAny(u8, seg, "{}") == null) {
+        if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
+        return .static;
+    }
+    var i: usize = 0;
+    var prev_capture = false;
+    var captures: usize = 0;
+    while (i < seg.len) {
+        switch (seg[i]) {
+            '{' => {
+                if (prev_capture) return error.InvalidPattern;
+                const close = std.mem.indexOfScalarPos(u8, seg, i, '}') orelse return error.InvalidPattern;
+                const inner = seg[i + 1 .. close];
+                // `{name:regexp}` (chi) is parsed here once the `regex` module
+                // exists; until then a constraint is refused, not ignored.
+                if (!validCaptureName(inner)) return error.InvalidPattern;
+                captures += 1;
+                prev_capture = true;
+                i = close + 1;
+            },
+            '}', ':', '*' => return error.InvalidPattern,
+            else => {
+                prev_capture = false;
+                i += 1;
+            },
+        }
+    }
+    if (captures == 1 and seg[0] == '{' and seg[seg.len - 1] == '}')
+        return .{ .param = seg[1 .. seg.len - 1] };
+    return .pattern;
+}
+
+fn validCaptureName(name: []const u8) bool {
+    return name.len != 0 and std.mem.indexOfAny(u8, name, "/:*{}") == null;
+}
+
+/// The captures of a validated pattern segment, left to right.
+const CaptureIter = struct {
+    text: []const u8,
+    i: usize = 0,
+
+    const Capture = struct {
+        name: []const u8,
+        /// Index of the `{` in `text`.
+        start: usize,
+        /// Index just past the `}`.
+        end: usize,
+    };
+
+    fn next(it: *CaptureIter) ?Capture {
+        const open = std.mem.indexOfScalarPos(u8, it.text, it.i, '{') orelse return null;
+        const close = std.mem.indexOfScalarPos(u8, it.text, open, '}').?;
+        it.i = close + 1;
+        return .{ .name = it.text[open + 1 .. close], .start = open, .end = close + 1 };
+    }
+};
+
+/// Match one path segment against a validated pattern segment, pushing its
+/// captures. Deterministic, one pass, no backtracking inside the segment:
+/// a capture that is followed by more of the pattern ends at the FIRST
+/// occurrence of the literal after it (at least one byte in: no capture is
+/// ever empty), and the last capture takes everything up to the literal
+/// suffix, which must end the segment. So `{name}.{ext}` splits `a.b.c` into
+/// `a` + `b.c`, and `{id}.json` reads `a.b.json` as `a.b`. On false the
+/// caller restores `params.len`.
+fn matchSegPattern(text: []const u8, seg: []const u8, params: *Params) bool {
+    var it: CaptureIter = .{ .text = text };
+    var ti: usize = 0; // into text
+    var si: usize = 0; // into seg
+    while (it.next()) |c| {
+        const lead = text[ti..c.start];
+        if (!std.mem.startsWith(u8, seg[si..], lead)) return false;
+        si += lead.len;
+        // The literal that follows this capture, up to the next one or the end.
+        const lit_end = std.mem.indexOfScalarPos(u8, text, c.end, '{') orelse text.len;
+        const lit = text[c.end..lit_end];
+        const value_end = if (lit.len == 0)
+            seg.len // last capture, nothing after it
+        else if (lit_end == text.len) blk: {
+            // Last capture: the literal is the segment's suffix.
+            if (!std.mem.endsWith(u8, seg, lit) or seg.len - lit.len < si) return false;
+            break :blk seg.len - lit.len;
+        } else std.mem.indexOfPos(u8, seg, @min(si + 1, seg.len), lit) orelse return false;
+        if (value_end <= si) return false; // never empty
+        params.push(c.name, seg[si..value_end]);
+        si = value_end;
+        ti = c.end;
+    }
+    return std.mem.eql(u8, seg[si..], text[ti..]);
+}
+
+/// Same literals and capture count, names aside — two such patterns accept
+/// exactly the same segments.
+fn samePatternShape(a: []const u8, b: []const u8) bool {
+    var ia: CaptureIter = .{ .text = a };
+    var ib: CaptureIter = .{ .text = b };
+    var pa: usize = 0;
+    var pb: usize = 0;
+    while (true) {
+        const ca = ia.next();
+        const cb = ib.next();
+        if ((ca == null) != (cb == null)) return false;
+        const ea = if (ca) |c| c.start else a.len;
+        const eb = if (cb) |c| c.start else b.len;
+        if (!std.mem.eql(u8, a[pa..ea], b[pb..eb])) return false;
+        if (ca == null) return true;
+        pa = ca.?.end;
+        pb = cb.?.end;
+    }
+}
+
+/// Where a new pattern goes among its siblings: they are tried in order, the
+/// longer literal prefix first (`v{n}.json` before `{a}.json`), then the
+/// more literal bytes in all, then registration order. The order decides
+/// only between patterns that accept the same segment.
+fn patternSlot(comptime E: type, edges: []const E, text: []const u8) usize {
+    const key = patternRank(text);
+    for (edges, 0..) |e, i| {
+        const k = patternRank(e.text);
+        if (key[0] > k[0] or (key[0] == k[0] and key[1] > k[1])) return i;
+    }
+    return edges.len;
+}
+
+fn patternRank(text: []const u8) [2]usize {
+    const lead = std.mem.indexOfScalar(u8, text, '{') orelse text.len;
+    var literal: usize = text.len;
+    var it: CaptureIter = .{ .text = text };
+    while (it.next()) |c| literal -= c.end - c.start;
+    return .{ lead, literal };
 }
 
 /// The target's path portion -- up to '?', or the whole target when there is
@@ -1368,6 +1903,9 @@ fn answerRedirect(ctx: *Ctx) anyerror!void {
 /// static segment, so `/x` and `/x/` are naturally distinct routes.
 const Node = struct {
     static: std.StringArrayHashMapUnmanaged(*Node) = .empty,
+    /// In-segment patterns (`{name}.{ext}`), in precedence order — see
+    /// `patternSlot`.
+    patterns: std.ArrayList(PatEdge) = .empty,
     param: ?Edge = null,
     wildcard: ?Edge = null,
     endpoints: [method_count]?Endpoint = @splat(null),
@@ -1401,6 +1939,7 @@ const Node = struct {
     min_reach: u32 = std.math.maxInt(u32),
 
     const Edge = struct { name: []const u8, node: *Node };
+    const PatEdge = struct { text: []const u8, node: *Node };
 
     fn hasEndpoint(n: *const Node) bool {
         for (n.endpoints) |ep| {
@@ -1485,6 +2024,12 @@ const RuntimeTree = struct {
     inline fn static(_: RuntimeTree, n: Ref, seg: []const u8) ?Ref {
         return n.static.get(seg);
     }
+    inline fn patterns(_: RuntimeTree, n: Ref) []const Node.PatEdge {
+        return n.patterns.items;
+    }
+    inline fn patChild(_: RuntimeTree, e: Node.PatEdge) Ref {
+        return e.node;
+    }
     inline fn param(_: RuntimeTree, n: Ref) ?Edge {
         const e = n.param orelse return null;
         return .{ .name = e.name, .ref = e.node };
@@ -1557,6 +2102,15 @@ fn matchIn(
         if (tree.minReach(child) <= remaining_after_seg) {
             if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
         }
+    }
+    for (tree.patterns(node)) |pe| {
+        const child = tree.patChild(pe);
+        if (tree.minReach(child) > remaining_after_seg) continue;
+        const saved = params.len;
+        if (matchSegPattern(pe.text, seg, params)) {
+            if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
+        }
+        params.len = saved;
     }
     if (seg.len != 0) if (tree.param(node)) |p| {
         if (tree.minReach(p.ref) <= remaining_after_seg) {
@@ -2541,7 +3095,10 @@ test "add: pattern validation, duplicates, param conflicts, caps" {
     try testing.expectError(error.InvalidPattern, r.get("nope", hHello));
     try testing.expectError(error.InvalidPattern, r.get("", hHello));
     try testing.expectError(error.InvalidPattern, r.get("/x/:", hHello)); // empty param name
-    try testing.expectError(error.InvalidPattern, r.get("/x/*", hHello)); // empty wildcard name
+    try testing.expectError(error.InvalidPattern, r.get("/x/{}", hHello)); // empty capture name
+    try testing.expectError(error.InvalidPattern, r.get("/x/{a}{b}", hHello)); // no literal between captures
+    try testing.expectError(error.InvalidPattern, r.get("/x/{a", hHello)); // unclosed
+    try testing.expectError(error.InvalidPattern, r.get("/x/a}", hHello)); // stray '}'
     try testing.expectError(error.InvalidPattern, r.get("/x/*w/y", hHello)); // wildcard not last
     try testing.expectError(error.InvalidPattern, r.get("/x/a:b", hHello)); // ':' inside a segment
     try testing.expectError(error.InvalidPattern, r.get("/x/a*b", hHello)); // '*' inside a segment
@@ -2999,8 +3556,9 @@ test "Static: trailing-slash variant mirrors Router's redirect probe" {
 
 test "validatePattern and Router.add refuse the same patterns" {
     const bad = [_][]const u8{
-        "",                            "x", "//x", "/a//b", "/:", "/*", "/*w/x", "/a:b", "/:a/:a", "/:a/*a", "/:x:y",
-        "/:a/:b/:c/:d/:e/:f/:g/:h/:i",
+        "",                            "x",     "//x",                              "/a//b", "/:",  "/*/x",     "/*w/x",     "/a:b",      "/:a/:a", "/:a/*a", "/:x:y",
+        "/:a/:b/:c/:d/:e/:f/:g/:h/:i", "/{}",   "/{a}{b}",                          "/{a",   "/a}", "/{a}.{a}", "/:a/{a}.x", "/{a}.x/*a", "/{a/b}", "/x{a}*", "/{a:b}",
+        "/{a}:x",                      "/{:x}", "/{a}.{b}/{c}-{d}/{e}_{f}/:g/*h/i",
     };
     for (bad) |pat| {
         var r = Router.init(testing.allocator);
@@ -3010,6 +3568,8 @@ test "validatePattern and Router.add refuse the same patterns" {
     }
     try validatePattern("/x/");
     try validatePattern("/a/:b/*c");
+    try validatePattern("/a/*");
+    try validatePattern("/f/{name}.{ext}/v{n}/{id}");
 }
 
 // M2.2 -- the differential test: the comptime table against the runtime trie,
@@ -3035,11 +3595,16 @@ fn diffTable(comptime seed: u64, comptime count: usize) []const StaticRoute {
             var d: usize = 0;
             while (d < depth) : (d += 1) {
                 state = state *% 6364136223846793005 +% 1442695040888963407;
-                const pick = (state >> 33) % 10;
+                const pick = (state >> 33) % 13;
+                const ds = std.fmt.comptimePrint("{d}", .{d});
                 const seg: []const u8 = if (pick < 6)
                     diff_vocab[pick % diff_vocab.len]
                 else if (pick < 9)
-                    ":p" ++ std.fmt.comptimePrint("{d}", .{d})
+                    ":p" ++ ds
+                else if (pick < 12)
+                    // In-segment patterns; names fixed per depth, so two
+                    // tables entries never conflict on a name.
+                    ([_][]const u8{ "{p" ++ ds ++ "}.x", "v{p" ++ ds ++ "}", "{p" ++ ds ++ "}.{q" ++ ds ++ "}" })[pick - 9]
                 else if (d + 1 == depth) "*w" else diff_vocab[0];
                 pat = pat ++ "/" ++ seg;
             }
@@ -3062,7 +3627,7 @@ fn diffTable(comptime seed: u64, comptime count: usize) []const StaticRoute {
 }
 
 fn diffPath(rng: std.Random, buf: []u8) []const u8 {
-    const words = diff_vocab ++ [_][]const u8{ "42", "" };
+    const words = diff_vocab ++ [_][]const u8{ "42", "", "a.x", "v42", "x.y.x", "1.2", "v", ".x" };
     var w: std.Io.Writer = .fixed(buf);
     const depth = 1 + rng.uintLessThan(usize, 5);
     for (0..depth) |_| {
@@ -3248,4 +3813,373 @@ test "Params.get matches the whole name, not a prefix of it" {
     try r.get("/u/:user_id", hNamePrefix);
     var buf: [1024]u8 = undefined;
     try testing.expectEqualStrings("42", bodyOf(runWire(&r, wire("GET", "/u/42"), &buf)));
+}
+
+// ── With / any / Mount / per-group fallbacks (parity with chi, 2026-10-07) ───
+
+test "with: inline middleware for one route, after routes exist, never on a fallback" {
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    try r.use(.{ .run = mwA });
+    try r.get("/open", hTrace);
+    // `with` after a route is fine: it changes no other route's chain.
+    const gated = try r.with(&.{ .{ .run = mwG }, .{ .run = mwV } });
+    try gated.get("/admin", hTrace);
+    try (try gated.with(&.{.{ .run = mwB }})).get("/admin/deep", hTrace);
+
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, wire("GET", "/admin"), &buf);
+    try testing.expectEqualStrings("AGVHvga", trace.get());
+    trace = .{};
+    _ = runWire(&r, wire("GET", "/admin/deep"), &buf);
+    try testing.expectEqualStrings("AGVBHbvga", trace.get());
+    trace = .{};
+    _ = runWire(&r, wire("GET", "/open"), &buf);
+    try testing.expectEqualStrings("AHa", trace.get());
+    // A 405 on the inline route's path and a 404 run the router chain only.
+    trace = .{};
+    try expectStatus(runWire(&r, wire("POST", "/admin"), &buf), "405");
+    try testing.expectEqualStrings("Aa", trace.get());
+    trace = .{};
+    try expectStatus(runWire(&r, wire("GET", "/nope"), &buf), "404");
+    try testing.expectEqualStrings("Aa", trace.get());
+    // Router-level `use` is still frozen by a route added through `with`.
+    try testing.expectError(error.RoutesAlreadyRegistered, r.use(.{ .run = mwB }));
+}
+
+test "with under a group: the group's prefix and chain, plus the inline middleware" {
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    const api = try r.group("/api");
+    try api.use(.{ .run = mwG });
+    try (try api.with(&.{.{ .run = mwV }})).get("/x/:id", hTrace);
+
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("ok", bodyOf(runWire(&r, wire("GET", "/api/x/1"), &buf)));
+    try testing.expectEqualStrings("GVHvg", trace.get());
+    // The 405 under /api runs /api's chain, not the inline one.
+    trace = .{};
+    try expectStatus(runWire(&r, wire("PUT", "/api/x/1"), &buf), "405");
+    try testing.expectEqualStrings("Gg", trace.get());
+    try testing.expectEqualStrings("/api/x/:id", r.routes()[0].pattern);
+}
+
+test "any: every method at one pattern; a second registration is a duplicate" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.any("/hook", hHello);
+    var buf: [1024]u8 = undefined;
+    inline for (.{ "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS" }) |m|
+        try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire(m, "/hook"), &buf)));
+    try testing.expectEqual(std.enums.values(http.Method).len, r.routes().len);
+    try testing.expectError(error.DuplicateRoute, r.post("/hook", hHello));
+    const g = try r.group("/g");
+    try g.any("/x", hHello);
+    try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("PATCH", "/g/x"), &buf)));
+}
+
+fn hNfSub(ctx: *Ctx) anyerror!void {
+    ctx.res.setStatus(404);
+    try ctx.res.writeAll("sub-nf");
+}
+fn hMnaSub(ctx: *Ctx) anyerror!void {
+    ctx.res.setStatus(405);
+    try ctx.res.writeAll("sub-mna");
+}
+
+test "mount: a built router under a prefix — routes, chains, groups, docs, fallbacks" {
+    var trace: Trace = .{};
+    var sub = Router.init(testing.allocator);
+    try sub.use(.{ .run = mwB });
+    try sub.get("/", hTrace);
+    try sub.addDoc(.get, "/users/:id", hUser, .{ .summary = "user" });
+    const v = try sub.group("/v1");
+    try v.use(.{ .run = mwV });
+    try v.get("/things", hTrace);
+    try (try sub.with(&.{.{ .run = mwG }})).post("/things", hTrace);
+    sub.not_found = hNfSub;
+    sub.method_not_allowed = hMnaSub;
+
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    try r.use(.{ .run = mwA });
+    try r.get("/", hRoot);
+    try r.mount("/api", &sub);
+    // A snapshot: the sub-router can go away, and later additions to it
+    // are not served by `r`.
+    sub.deinit();
+
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, wire("GET", "/api/"), &buf);
+    try testing.expectEqualStrings("ABHba", trace.get());
+    trace = .{};
+    _ = runWire(&r, wire("GET", "/api/v1/things"), &buf);
+    try testing.expectEqualStrings("ABVHvba", trace.get());
+    trace = .{};
+    _ = runWire(&r, wire("POST", "/things"), &buf);
+    try testing.expectEqualStrings("Aa", trace.get()); // not mounted at the root
+    trace = .{};
+    _ = runWire(&r, wire("POST", "/api/things"), &buf);
+    try testing.expectEqualStrings("ABGHgba", trace.get());
+    try testing.expectEqualStrings("user=7", bodyOf(runWire(&r, wire("GET", "/api/users/7"), &buf)));
+    // `/api` reaches the sub-router's "/" through the trailing-slash policy.
+    try expectStatus(runWire(&r, wire("GET", "/api"), &buf), "301");
+
+    // The sub-router's overrides answer under its prefix, behind its chain.
+    trace = .{};
+    try testing.expectEqualStrings("sub-nf", bodyOf(runWire(&r, wire("GET", "/api/nope"), &buf)));
+    try testing.expectEqualStrings("ABba", trace.get());
+    try testing.expectEqualStrings("sub-mna", bodyOf(runWire(&r, wire("DELETE", "/api/users/7"), &buf)));
+    try testing.expectEqualStrings("sub-nf", bodyOf(runWire(&r, wire("GET", "/api/v1/nope"), &buf)));
+    // ... and only there.
+    try testing.expectEqualStrings("Not Found\n", bodyOf(runWire(&r, wire("GET", "/nope"), &buf)));
+    try testing.expectEqualStrings("Method Not Allowed\n", bodyOf(runWire(&r, wire("DELETE", "/"), &buf)));
+
+    const rs = r.routes();
+    try testing.expectEqual(@as(usize, 5), rs.len);
+    try testing.expectEqualStrings("/api/users/:id", rs[2].pattern);
+    try testing.expectEqualStrings("user", rs[2].doc.?.summary.?);
+    try testing.expectEqualStrings("/api/v1/things", rs[3].pattern);
+}
+
+test "mount: under a group, at the root, nested, and the refusals" {
+    var trace: Trace = .{};
+    var leaf = Router.init(testing.allocator);
+    defer leaf.deinit();
+    try leaf.get("/x", hTrace);
+    var mid = Router.init(testing.allocator);
+    defer mid.deinit();
+    try mid.use(.{ .run = mwV });
+    try mid.mount("/leaf", &leaf);
+
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    const g = try r.group("/g");
+    try g.use(.{ .run = mwG });
+    try g.mount("/mid", &mid);
+    try r.mount("/", &leaf);
+
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, wire("GET", "/g/mid/leaf/x"), &buf);
+    try testing.expectEqualStrings("GVHvg", trace.get());
+    trace = .{};
+    try testing.expectEqualStrings("ok", bodyOf(runWire(&r, wire("GET", "/x"), &buf)));
+
+    try testing.expectError(error.SelfMount, r.mount("/self", &r));
+    try testing.expectError(error.InvalidPrefix, r.mount("api", &leaf));
+    try testing.expectError(error.InvalidPrefix, r.mount("/api/", &leaf));
+    // A route the mount would add already exists.
+    try testing.expectError(error.DuplicateRoute, r.mount("/", &leaf));
+}
+
+test "group overrides: the deepest group with a not_found wins; inline groups never scope one" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    const api = try r.group("/api");
+    api.not_found = hNfSub;
+    const v1 = try api.group("/v1");
+    try v1.get("/a", hHello);
+    const v2 = try api.group("/v2");
+    v2.not_found = hNfCustom;
+    try v2.get("/a", hHello);
+    const inl = try r.with(&.{});
+    inl.not_found = hNfCustom; // ignored: an inline group scopes no path
+    try inl.get("/b", hHello);
+
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("sub-nf", bodyOf(runWire(&r, wire("GET", "/api/v1/zz"), &buf)));
+    try testing.expectEqualStrings("custom-nf", bodyOf(runWire(&r, wire("GET", "/api/v2/zz"), &buf)));
+    try testing.expectEqualStrings("Not Found\n", bodyOf(runWire(&r, wire("GET", "/zz"), &buf)));
+}
+
+fn runWireHost(hr: *HostRouter, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{ .handler = hr.handler(), .context = hr, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+fn hostWire(comptime host: []const u8) []const u8 {
+    return "GET /x HTTP/1.1\r\nHost: " ++ host ++ "\r\nConnection: close\r\n\r\n";
+}
+
+fn hA(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("A");
+}
+fn hB(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("B");
+}
+fn hC(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("C");
+}
+fn hD(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("D");
+}
+
+test "HostRouter: exact > longest wildcard > default > not_found; port, case, trailing dot" {
+    var ra = Router.init(testing.allocator);
+    defer ra.deinit();
+    try ra.get("/x", hA);
+    var rb = Router.init(testing.allocator);
+    defer rb.deinit();
+    try rb.get("/x", hB);
+    var rc = Router.init(testing.allocator);
+    defer rc.deinit();
+    try rc.get("/x", hC);
+    var rd = Router.init(testing.allocator);
+    defer rd.deinit();
+    try rd.get("/x", hD);
+
+    var hr = HostRouter.init(testing.allocator);
+    defer hr.deinit();
+    try hr.map("api.example.com", &ra);
+    try hr.map("*.example.com", &rb);
+    try hr.map("*.eu.example.com", &rc);
+    try hr.map("[::1]", &rd);
+
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("A", bodyOf(runWireHost(&hr, hostWire("api.example.com"), &buf)));
+    try testing.expectEqualStrings("A", bodyOf(runWireHost(&hr, hostWire("API.Example.COM:8443"), &buf)));
+    try testing.expectEqualStrings("A", bodyOf(runWireHost(&hr, hostWire("api.example.com."), &buf)));
+    try testing.expectEqualStrings("B", bodyOf(runWireHost(&hr, hostWire("www.example.com"), &buf)));
+    try testing.expectEqualStrings("B", bodyOf(runWireHost(&hr, hostWire("a.b.example.com"), &buf)));
+    try testing.expectEqualStrings("C", bodyOf(runWireHost(&hr, hostWire("x.eu.example.com"), &buf)));
+    // The wildcard needs at least one more label.
+    try expectStatus(runWireHost(&hr, hostWire("example.com"), &buf), "404");
+    try expectStatus(runWireHost(&hr, hostWire("badexample.com"), &buf), "404");
+    try testing.expectEqualStrings("D", bodyOf(runWireHost(&hr, hostWire("[::1]:8080"), &buf)));
+
+    hr.default = &rc;
+    try testing.expectEqualStrings("C", bodyOf(runWireHost(&hr, hostWire("other.org"), &buf)));
+    try testing.expectEqual(@as(?*Router, &rc), hr.routerFor(null));
+
+    try testing.expectError(error.DuplicateHost, hr.map("API.example.com", &rb));
+    try testing.expectError(error.DuplicateHost, hr.map("*.Example.com", &ra));
+    inline for (.{ "", "*.", "a*.b", "a/b", "a:80", "**.x", "x.*", "[::1", "*.[::1]", "[a]b]" }) |bad|
+        try testing.expectError(error.InvalidHost, hr.map(bad, &ra));
+}
+
+// ── in-segment patterns (chi's `{name}`, 2026-10-07) ─────────────────────────
+
+fn hPat(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll(ctx.matchedPattern().?);
+    for (ctx.params.entries[0..ctx.params.len]) |e| {
+        try ctx.res.writeAll(" ");
+        try ctx.res.writeAll(e.name);
+        try ctx.res.writeAll("=");
+        try ctx.res.writeAll(e.value);
+    }
+}
+
+test "patterns: {name} is :name; captures split at the first literal, the last one at the suffix; never empty" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/files/{name}.{ext}", hPat);
+    try r.get("/f/{a}--{b}", hPat);
+    try r.get("/x/{id}suf", hPat);
+    try r.get("/q/a{x}b{y}c", hPat);
+    try r.get("/u/{id}", hPat);
+    try r.get("/static/*", hPat);
+
+    var buf: [1024]u8 = undefined;
+    const cases = .{
+        .{ "/files/a.b.c", "/files/{name}.{ext} name=a ext=b.c" },
+        .{ "/f/a--b--c", "/f/{a}--{b} a=a b=b--c" },
+        .{ "/x/asufsuf", "/x/{id}suf id=asuf" },
+        .{ "/q/a1b2c", "/q/a{x}b{y}c x=1 y=2" },
+        .{ "/q/a1b2cc", "/q/a{x}b{y}c x=1 y=2c" },
+        .{ "/u/7", "/u/{id} id=7" },
+        .{ "/static/a/b", "/static/* *=a/b" },
+        .{ "/static/", "/static/* *=" },
+    };
+    inline for (cases) |c| try testing.expectEqualStrings(c[1], bodyOf(runWire(&r, wire("GET", c[0]), &buf)));
+    // An empty capture is no match: chi would accept these (`name=`).
+    inline for (.{ "/files/.b", "/files/a.", "/x/suf", "/q/abbc", "/f/--x" }) |miss|
+        try expectStatus(runWire(&r, wire("GET", miss), &buf), "404");
+    // `{id}` and `:id` are the same capture at the same position.
+    try testing.expectError(error.DuplicateRoute, r.get("/u/:id", hPat));
+    try testing.expectError(error.ParamNameConflict, r.get("/u/:other", hPat));
+}
+
+test "patterns: precedence static > pattern (longer literal prefix first) > param > wildcard, with backtracking" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/z/prefix", hPat);
+    try r.get("/z/{id}", hPat);
+    try r.get("/z/pre{id}", hPat);
+    try r.get("/z/*rest", hPat);
+    try r.get("/w/{a}.{b}", hPat);
+    try r.get("/w/{a}.json", hPat);
+    try r.get("/w/v{n}.json", hPat);
+    // A pattern whose remainder fails backtracks to the param.
+    try r.get("/b/{a}.{b}/end", hPat);
+    try r.get("/b/{a}/x", hPat);
+
+    var buf: [1024]u8 = undefined;
+    const cases = .{
+        .{ "/z/prefix", "/z/prefix" },
+        .{ "/z/prez", "/z/pre{id} id=z" },
+        .{ "/z/pre", "/z/{id} id=pre" },
+        .{ "/z/abc", "/z/{id} id=abc" },
+        .{ "/z/a/b", "/z/*rest rest=a/b" },
+        .{ "/w/v2.json", "/w/v{n}.json n=2" },
+        .{ "/w/a.b.json", "/w/{a}.json a=a.b" },
+        .{ "/w/a.xml", "/w/{a}.{b} a=a b=xml" },
+        .{ "/b/1.2/end", "/b/{a}.{b}/end a=1 b=2" },
+        .{ "/b/1.2/x", "/b/{a}/x a=1.2" },
+    };
+    inline for (cases) |c| try testing.expectEqualStrings(c[1], bodyOf(runWire(&r, wire("GET", c[0]), &buf)));
+    // Same shape, other names: the second could never match.
+    try testing.expectError(error.ParamNameConflict, r.get("/w/{x}.{y}", hPat));
+    try r.post("/w/{a}.{b}", hPat); // same pattern, another method
+    // The 405 Allow unions every pattern candidate the path reaches.
+    const got = runWire(&r, wire("DELETE", "/w/a.json"), &buf);
+    try expectStatus(got, "405");
+    try expectHeaderLine(got, "Allow: GET, HEAD, POST");
+}
+
+test "patterns: Static answers as Router does" {
+    const routes = [_]StaticRoute{
+        .{ .method = .get, .pattern = "/z/prefix" },
+        .{ .method = .get, .pattern = "/z/{id}" },
+        .{ .method = .get, .pattern = "/z/pre{id}" },
+        .{ .method = .get, .pattern = "/w/{a}.{b}" },
+        .{ .method = .get, .pattern = "/w/{a}.json" },
+        .{ .method = .post, .pattern = "/w/v{n}.json" },
+        .{ .method = .get, .pattern = "/s/*" },
+    };
+    const T = Static(&routes, .{});
+    var p: Params = .{};
+    try testing.expectEqual(Match{ .found = 2 }, T.match(.get, "/z/prez", &p));
+    try testing.expectEqualStrings("z", p.get("id").?);
+    try testing.expectEqual(Match{ .found = 4 }, T.match(.get, "/w/a.b.json", &p));
+    try testing.expectEqualStrings("a.b", p.get("a").?);
+    try testing.expectEqual(Match{ .found = 6 }, T.match(.get, "/s/x/y", &p));
+    try testing.expectEqualStrings("x/y", p.get("*").?);
+    // POST-only pattern: GET falls back to `{a}.json`.
+    try testing.expectEqual(Match{ .found = 4 }, T.match(.get, "/w/v1.json", &p));
+    try testing.expectEqual(Match{ .found = 5 }, T.match(.post, "/w/v1.json", &p));
+}
+
+test "PatternCaptures: every capture kind, in order" {
+    var it: PatternCaptures = .init("/a/:id/{name}.{ext}/v{n}/{x}/*");
+    for ([_][]const u8{ "id", "name", "ext", "n", "x", "*" }) |want| try testing.expectEqualStrings(want, it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+    var empty: PatternCaptures = .init("/");
+    try testing.expectEqual(@as(?[]const u8, null), empty.next());
 }
