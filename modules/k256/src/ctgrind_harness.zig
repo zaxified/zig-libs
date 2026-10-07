@@ -103,10 +103,10 @@
 //! `field`'s zero is the strong claim, and it is only readable next to the
 //! others: `mul`/`comb`/`sign` being non-zero proves the taint propagates
 //! through this module's arithmetic at all, so `field`'s zero means "no branch
-//! found", not "the harness is blind". Within `field`, `Fe.invert` runs
-//! `powConst`, whose `while (ee != 0)` / `if (ee & 1 == 1)` branch is on the
-//! PUBLIC constant exponent `p − 2` — untainted, and therefore invisible here,
-//! which is precisely the claim `field.zig:274` makes.
+//! found", not "the harness is blind". Within `field`, `Fe.invert` runs a
+//! fixed addition chain (`onesRuns` + tail, since 2026-10-08; before that
+//! `powConst`, whose bit-loop branch was on the PUBLIC exponent `p − 2`): its
+//! only loops are the `sqn` counters, comptime-fixed, so untainted.
 //!
 //! ## What this harness does NOT pin (deliberately)
 //!

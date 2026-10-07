@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.invert` and
+  `Fe.sqrt` use the run-of-ones addition chain (255 S + 15 M / 253 S + 13 M, libsecp256k1's
+  chain) instead of square-and-multiply over the whole exponent; the amd64 field core finishes
+  its Solinas reduction with ONE conditional subtraction after fold 2 (the value is then
+  `< 2^256 + 2^67 < 2p`) instead of two more `c·carry` folds plus a separate canonicalise.
+  bench-bip340, same host: verify 87.7 → 74.0 µs (2.62 → 2.20× libsecp256k1), sign 164 →
+  140 µs, keypair 33.0 → 27.1 µs. Held by the tests vs std, a new chain-vs-`powConst` test on
+  edge elements, the asm edge differential (whose `(p−1)²` reaches the CF2 = 1 case: a mutant
+  dropping it FAILS), and ctgrind: counts unchanged (field 0), digests re-pinned. The k256
+  micro-bench row "field sq" now says "sq+mul", which is what it always timed.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.add` reduces
   with two carry chains and one masked select instead of the general `normalize` (three chains,
   two selects), and the curve formulas' `3b = 21` multiple is one `Fe.mulSmall(21)` (256×64

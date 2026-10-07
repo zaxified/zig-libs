@@ -84,7 +84,7 @@ test "bench (opt-in via K256_BENCH)" {
         while (i < fmul_iters) : (i += 1) kz = kz.sq().mul(kb);
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(kz);
-        std.debug.print("{s} field sq : {d:>6} ns/op   ", .{ k256_label, dt / fmul_iters });
+        std.debug.print("{s} field sq+mul: {d:>3} ns/op   ", .{ k256_label, dt / fmul_iters });
 
         var sz = sa;
         t0 = nowNs();
@@ -92,7 +92,7 @@ test "bench (opt-in via K256_BENCH)" {
         while (i < fmul_iters) : (i += 1) sz = sz.sq().mul(sbf);
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sz);
-        std.debug.print("std field sq : {d:>6} ns/op\n", .{dt / fmul_iters});
+        std.debug.print("std field sq+mul: {d:>3} ns/op\n", .{dt / fmul_iters});
     }
 
     // ── constant-time base-point scalar multiply ──

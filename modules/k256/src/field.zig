@@ -349,22 +349,56 @@ pub const Fe = struct {
         return result;
     }
 
+    /// `a^(2^223 − 1)` and the shorter runs of ones it is built from — the
+    /// shared prefix of the `p − 2` and `(p + 1)/4` addition chains. Both
+    /// exponents are, in binary, 223 ones followed by a short tail, so a
+    /// run-of-ones chain (`x_k = a^(2^k − 1)`, `x_{j+k} = x_j^(2^k)·x_k`)
+    /// reaches the head in 218 squarings and 11 multiplies, where the bit loop
+    /// in `powConst` multiplies on every one bit. Same chain as libsecp256k1's
+    /// `secp256k1_fe_inv`/`fe_sqrt`. The schedule is fixed, so constant-time.
+    const OnesRuns = struct { x2: Fe, x3: Fe, x22: Fe, x223: Fe };
+
+    fn onesRuns(a: Fe) OnesRuns {
+        const x2 = a.sq().mul(a);
+        const x3 = x2.sq().mul(a);
+        const x6 = x3.sqn(3).mul(x3);
+        const x9 = x6.sqn(3).mul(x3);
+        const x11 = x9.sqn(2).mul(x2);
+        const x22 = x11.sqn(11).mul(x11);
+        const x44 = x22.sqn(22).mul(x22);
+        const x88 = x44.sqn(44).mul(x44);
+        const x176 = x88.sqn(88).mul(x88);
+        const x220 = x176.sqn(44).mul(x44);
+        const x223 = x220.sqn(3).mul(x3);
+        return .{ .x2 = x2, .x3 = x3, .x22 = x22, .x223 = x223 };
+    }
+
     /// Multiplicative inverse via Fermat's little theorem: `a^(p−2) mod p`
     /// (`invert(0) == 0`, matching std). Constant-time in `a`.
     ///
-    /// A short addition chain (libsecp256k1 uses ~255 squarings + 15 multiplies)
-    /// is the fast path a later phase can substitute; this scaffold uses the
-    /// straightforward public-exponent square-and-multiply — correctness over
-    /// cleverness, since inversion is amortised (one per affine conversion).
+    /// `p − 2` = 223 ones, a zero, 22 ones, 4 zeros, `101101` — the
+    /// `onesRuns` head plus a fixed tail: 255 squarings + 15 multiplies, about
+    /// half the cost of the square-and-multiply loop it replaced (2026-10-08).
+    /// `powConst` stays as its differential oracle in the tests.
     pub fn invert(a: Fe) Fe {
-        return a.powConst(field_order - 2);
+        const r = onesRuns(a);
+        var t = r.x223.sqn(23).mul(r.x22);
+        t = t.sqn(5).mul(a);
+        t = t.sqn(3).mul(r.x2);
+        return t.sqn(2).mul(a);
     }
 
     /// Square root via `a^((p+1)/4)` (valid because `p ≡ 3 (mod 4)`), returning
     /// `error.NotSquare` if `a` is not a quadratic residue. This is BIP340's
     /// `lift_x` square root.
+    ///
+    /// `(p + 1)/4` = 223 ones, a zero, 22 ones, `000011`, `00`: the
+    /// `onesRuns` head plus 31 squarings and 2 multiplies (253 S + 13 M).
     pub fn sqrt(a: Fe) NotSquareError!Fe {
-        const x = a.powConst((field_order + 1) / 4);
+        const r = onesRuns(a);
+        var t = r.x223.sqn(23).mul(r.x22);
+        t = t.sqn(6).mul(r.x2);
+        const x = t.sqn(2);
         if (x.sq().equivalent(a)) return x;
         return error.NotSquare;
     }
@@ -513,6 +547,27 @@ test "differential vs std.Fe: sqrt agrees on residues and non-residues" {
         } else |_| {
             try std.testing.expectError(error.NotSquare, a.k.sqrt());
         }
+    }
+}
+
+// The addition chains in `invert`/`sqrt` against the plain exponentiation
+// they replaced, on the edge elements the random draws above never hit.
+test "invert/sqrt addition chains == powConst(p−2) / powConst((p+1)/4)" {
+    const edges = [_]u256{ 0, 1, 2, 3, 7, 1 << 32, (1 << 255), field_order - 2, field_order - 1 };
+    inline for (edges) |e| try expectChainsMatch(try Fe.fromInt(e));
+    var prng = std.Random.DefaultPrng.init(0xC4A1_0B5E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 200) : (i += 1) try expectChainsMatch(randFe(rand).k);
+}
+
+fn expectChainsMatch(a: Fe) !void {
+    try std.testing.expectEqual(a.powConst(field_order - 2).toInt(), a.invert().toInt());
+    const root = a.powConst((field_order + 1) / 4);
+    if (a.sqrt()) |x| {
+        try std.testing.expectEqual(root.toInt(), x.toInt());
+    } else |_| {
+        try std.testing.expect(!root.sq().equivalent(a));
     }
 }
 

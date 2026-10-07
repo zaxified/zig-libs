@@ -41,20 +41,22 @@
 //!     terms are added with one `adc` chain. The doubled cross sum is
 //!     `< 2^449` and the final sum is exactly `a² < 2^512`, so every top-limb
 //!     carry provably fits.
-//!   * **Solinas reduce** (shared string, appended to both blocks) — the SAME
-//!     fold sequence as the portable oracle `field.reduceWide` + `normalize`,
-//!     on explicit limbs, bounds `<2^290 → <2^257 → <2^256+c → <2^256`:
+//!   * **Solinas reduce** (shared string, appended to both blocks) — the same
+//!     congruences as the portable oracle `field.reduceWide` + `normalize`,
+//!     on explicit limbs, bounds `<2^290 → <2^256+2^67 (< 2p) → <p`:
 //!       1. fold 1: `(t0..t3) += c·(t4..t7)` via dual carry chains; both
 //!          chains' final carries land in the excess word `x4 < 2^34`.
 //!       2. fold 2: `+= c·x4` (`c·x4 < 2^67`, a 2-limb add); carry-out CF2.
-//!       3. fold 3: `+= c·CF2` — the 2^256 bit folded BRANCHLESS via
-//!          `imul` of the 0/1 carry byte (no data-dependent Jcc); carry CF3.
-//!       4. fold 4: `+= c·CF3` (when CF3 = 1 the low word is `< c`, so the
-//!          add cannot carry again — same argument as `field.normalize`).
-//!       5. canonicalise: compute `V + c` in scratch; its carry-out ⟺
-//!          `V ≥ p` (because `p = 2^256 − c`); select the wrapped value with
-//!          an `sbb` mask + XOR-blend — masked select, no branch, no CMOV
-//!          needed. Result `< p`.
+//!          The value `W = V + CF2·2^256` is now `< 2^256 + 2^67 < 2p`.
+//!       3. finish: compute `T = V + c` in scratch. `W ≥ p` ⟺ CF2 = 1 or
+//!          `T` carries out (`p = 2^256 − c`), and then `W − p` is `T`'s low
+//!          256 bits (CF2 = 1 forces `V < 2^67`, so `T` cannot carry too).
+//!          Select with an `sbb`/`neg`/`or` mask + XOR-blend — no branch, no
+//!          CMOV. Result `< p`. Until 2026-10-08 this step was two further
+//!          `c·carry` folds plus a separate canonicalise, mirroring
+//!          `normalize` literally; the `< 2p` bound makes them redundant.
+//!          CF2 = 1 is reached by the edge inputs of `oracle_test.zig`
+//!          ("fast_core edge cases": e.g. `(p−1)²`), never by random draws.
 //!
 //! ## Constant-time contract
 //!
@@ -141,46 +143,40 @@ const solinas_reduce =
     // flags dead; r15 becomes the zero register for the remaining folds.
     \\ xorl %%r15d, %%r15d
     // fold 2: += c·x4 (c·x4 < 2^67: lo→rax, hi→rcx ≤ 2^3); CF2 → rsi (was 0).
+    // The total W = V + CF2·2^256 is now < 2^256 + 2^67 < 2p, so ONE
+    // conditional subtraction of p finishes the reduction (2026-10-08; it
+    // replaced two more c·carry folds and a separate canonicalise, ~15
+    // cycles off the serial chain).
     \\ mulxq %%rcx, %%rax, %%rcx
     \\ addq %%rax, %%r8
     \\ adcq %%rcx, %%r9
     \\ adcq %%r15, %%r10
     \\ adcq %%r15, %%r11
     \\ adcq %%r15, %%rsi
-    // fold 3: += c·CF2 — branchless: multiply the 0/1 carry by c. CF3 → rsi.
-    \\ imulq %%rdx, %%rsi
-    \\ addq %%rsi, %%r8
-    \\ adcq %%r15, %%r9
-    \\ adcq %%r15, %%r10
-    \\ adcq %%r15, %%r11
-    \\ movq %%r15, %%rsi
-    \\ adcq %%r15, %%rsi
-    // fold 4: += c·CF3 (no carry out: when CF3 = 1 the low word is < c).
-    \\ imulq %%rdx, %%rsi
-    \\ addq %%rsi, %%r8
-    \\ adcq %%r15, %%r9
-    \\ adcq %%r15, %%r10
-    \\ adcq %%r15, %%r11
-    // canonicalise: T = V + c carries out ⟺ V ≥ p = 2^256 − c, and then T's
-    // low 256 bits are exactly V − p. Masked select via sbb + XOR-blend.
+    // finish: T = V + c (mod 2^256). W ≥ p ⟺ CF2 = 1 or T carries out, and
+    // then W − p is exactly T's low 256 bits (with CF2 = 1, V < 2^67 so T
+    // cannot carry: the two cases are disjoint). Masked select via
+    // sbb/neg/or + XOR-blend, branch-free.
     \\ movq %%r8, %%rax
     \\ addq %%rdx, %%rax
     \\ movq %%r9, %%rcx
     \\ adcq %%r15, %%rcx
-    \\ movq %%r10, %%rsi
-    \\ adcq %%r15, %%rsi
+    \\ movq %%r10, %%r12
+    \\ adcq %%r15, %%r12
     \\ movq %%r11, %%rdx
     \\ adcq %%r15, %%rdx
     \\ sbbq %%r13, %%r13
+    \\ negq %%rsi
+    \\ orq %%rsi, %%r13
     \\ xorq %%r8, %%rax
     \\ andq %%r13, %%rax
     \\ xorq %%rax, %%r8
     \\ xorq %%r9, %%rcx
     \\ andq %%r13, %%rcx
     \\ xorq %%rcx, %%r9
-    \\ xorq %%r10, %%rsi
-    \\ andq %%r13, %%rsi
-    \\ xorq %%rsi, %%r10
+    \\ xorq %%r10, %%r12
+    \\ andq %%r13, %%r12
+    \\ xorq %%r12, %%r10
     \\ xorq %%r11, %%rdx
     \\ andq %%r13, %%rdx
     \\ xorq %%rdx, %%r11
