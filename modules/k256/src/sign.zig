@@ -116,7 +116,7 @@ pub fn bip340Verify(pubkey_xonly: [32]u8, msg: []const u8, sig: [64]u8) bool {
         e.neg().toBytes(.big),
         .big,
     ) catch return false;
-    const Ra = R.affineCoordinates();
+    const Ra = R.affineCoordinatesPublic();
     if (Ra.y.isOdd()) return false;
     return std.mem.eql(u8, &Ra.x.toBytes(.big), &rbytes);
 }
@@ -180,7 +180,7 @@ pub fn ecdsaVerifyPrehashed(pubkey_sec1: []const u8, digest: [32]u8, sig_rs: [64
         .big,
     ) catch return false;
     // v = x(R) mod n; accept iff v == r.
-    const v = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
+    const v = reduceToScalar(R.affineCoordinatesPublic().x.toBytes(.big));
     return v.equivalent(r);
 }
 

@@ -388,6 +388,21 @@ pub const Fe = struct {
         return t.sqn(2).mul(a);
     }
 
+    /// Multiplicative inverse for a PUBLIC element — VARIABLE-TIME
+    /// (`invertPublic(0) == 0`, as `invert`). Never call it on a secret: its
+    /// running time depends on the value. The verifier's affine conversion
+    /// of `s·G − e·P` is what it is for.
+    ///
+    /// Bernstein–Yang safegcd ("Fast constant-time gcd computation and
+    /// modular inversion", 2019) in libsecp256k1's variable-time form
+    /// (`secp256k1_modinv64_var`, MIT): batches of 62 divsteps on the low
+    /// limbs build a 2×2 transition matrix, which is applied to `(f, g)`
+    /// (shrinking them) and to `(d, e)` (tracking the inverse mod p) in
+    /// signed 62-bit limbs. ~3× faster than the addition chain here.
+    pub fn invertPublic(a: Fe) Fe {
+        return .{ ._limbs = fromU256(safegcd.inverse(a.value())) };
+    }
+
     /// Square root via `a^((p+1)/4)` (valid because `p ≡ 3 (mod 4)`), returning
     /// `error.NotSquare` if `a` is not a quadratic residue. This is BIP340's
     /// `lift_x` square root.
@@ -401,6 +416,197 @@ pub const Fe = struct {
         const x = t.sqn(2);
         if (x.sq().equivalent(a)) return x;
         return error.NotSquare;
+    }
+};
+
+// ── safegcd (variable-time inversion of PUBLIC values) ──────────────────────
+//
+// Signed 62-bit limbs: `v[0] + v[1]·2^62 + … + v[4]·2^248`, each limb in
+// (−2^62, 2^62) between steps. Ported from libsecp256k1's `modinv64_impl.h`
+// (MIT) — `divsteps_62_var`, `update_de_62`, `update_fg_62_var`,
+// `normalize_62` and the `modinv64_var` loop — with its bounds: `d, e` stay in
+// (−2p, p), the matrix entries satisfy `|u| + |v| ≤ 2^62`.
+const safegcd = struct {
+    const S62 = [5]i64;
+    const m62: u64 = std.math.maxInt(u64) >> 2;
+    /// `p = 2^256 − 2^32 − 977` as `−(2^32 + 977) + 256·2^248`.
+    const modulus: S62 = .{ -0x1000003D1, 0, 0, 0, 256 };
+    /// `p^−1 mod 2^62` by Newton's iteration (each step doubles the correct
+    /// low bits, starting from 1 bit: p is odd).
+    const modulus_inv62: u64 = blk: {
+        const pl: u64 = @truncate(field_order);
+        var x: u64 = 1;
+        for (0..6) |_| x = x *% (2 -% pl *% x);
+        break :blk x & m62;
+    };
+    const Trans = struct { u: i64, v: i64, q: i64, r: i64 };
+
+    fn fromInt(x: u256) S62 {
+        var out: S62 = undefined;
+        for (0..4) |i| out[i] = @intCast(@as(u64, @truncate(x >> @intCast(62 * i))) & m62);
+        out[4] = @intCast(x >> 248);
+        return out;
+    }
+
+    fn toInt(v: S62) u256 {
+        var x: u256 = 0;
+        for (0..5) |i| x |= @as(u256, @as(u64, @intCast(v[i]))) << @intCast(62 * i);
+        return x;
+    }
+
+    inline fn lo62(x: i128) i64 {
+        return @intCast(@as(u64, @truncate(@as(u128, @bitCast(x)))) & m62);
+    }
+
+    /// 62 divsteps on the low bits of `f` (odd) and `g`, returning the new
+    /// `eta = −delta` and the transition matrix scaled by 2^62.
+    fn divsteps62Var(eta_in: i64, f0: u64, g0: u64, t: *Trans) i64 {
+        var u: u64 = 1;
+        var v: u64 = 0;
+        var q: u64 = 0;
+        var r: u64 = 1;
+        var f = f0;
+        var g = g0;
+        var eta = eta_in;
+        var i: u32 = 62;
+        while (true) {
+            // Count zeros only up to i (sentinel bit at position i).
+            const zeros: u6 = @intCast(@ctz(g | (@as(u64, std.math.maxInt(u64)) << @intCast(i))));
+            g >>= zeros;
+            u <<= zeros;
+            v <<= zeros;
+            eta -= zeros;
+            i -= zeros;
+            if (i == 0) break;
+            var w: u64 = undefined;
+            if (eta < 0) {
+                // eta < 0: negate it and replace (f, g) with (g, −f).
+                eta = -eta;
+                const tf = f;
+                f = g;
+                g = 0 -% tf;
+                const tu = u;
+                u = q;
+                q = 0 -% tu;
+                const tv = v;
+                v = r;
+                r = 0 -% tv;
+                // Cancel up to 6 bits of g (no more than i, nor eta + 1).
+                const limit: u32 = @intCast(@min(eta + 1, @as(i64, i)));
+                const m = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - limit)) & 63;
+                w = (f *% g *% (f *% f -% 2)) & m;
+            } else {
+                // Cancel up to 4 bits of g.
+                const limit: u32 = @intCast(@min(eta + 1, @as(i64, i)));
+                const m = (@as(u64, std.math.maxInt(u64)) >> @intCast(64 - limit)) & 15;
+                w = f +% (((f +% 1) & 4) << 1);
+                w = ((0 -% w) *% g) & m;
+            }
+            g +%= f *% w;
+            q +%= u *% w;
+            r +%= v *% w;
+        }
+        t.* = .{ .u = @bitCast(u), .v = @bitCast(v), .q = @bitCast(q), .r = @bitCast(r) };
+        return eta;
+    }
+
+    /// `(d, e) ← (t·(d, e) + p·(md, me)) / 2^62`, with `md, me` chosen so the
+    /// division is exact and the results stay in (−2p, p).
+    fn updateDe(d: *S62, e: *S62, t: Trans) void {
+        const sd = d[4] >> 63;
+        const se = e[4] >> 63;
+        var md = (t.u & sd) + (t.v & se);
+        var me = (t.q & sd) + (t.r & se);
+        var cd: i128 = @as(i128, t.u) * d[0] + @as(i128, t.v) * e[0];
+        var ce: i128 = @as(i128, t.q) * d[0] + @as(i128, t.r) * e[0];
+        md -= @intCast((modulus_inv62 *% @as(u64, @truncate(@as(u128, @bitCast(cd)))) +% @as(u64, @bitCast(md))) & m62);
+        me -= @intCast((modulus_inv62 *% @as(u64, @truncate(@as(u128, @bitCast(ce)))) +% @as(u64, @bitCast(me))) & m62);
+        cd += @as(i128, modulus[0]) * md;
+        ce += @as(i128, modulus[0]) * me;
+        cd >>= 62;
+        ce >>= 62;
+        for (1..5) |i| {
+            cd += @as(i128, t.u) * d[i] + @as(i128, t.v) * e[i] + @as(i128, modulus[i]) * md;
+            ce += @as(i128, t.q) * d[i] + @as(i128, t.r) * e[i] + @as(i128, modulus[i]) * me;
+            d[i - 1] = lo62(cd);
+            e[i - 1] = lo62(ce);
+            cd >>= 62;
+            ce >>= 62;
+        }
+        d[4] = @intCast(cd);
+        e[4] = @intCast(ce);
+    }
+
+    /// `(f, g) ← t·(f, g) / 2^62` over the first `len` limbs.
+    fn updateFgVar(len: usize, f: *S62, g: *S62, t: Trans) void {
+        var cf: i128 = @as(i128, t.u) * f[0] + @as(i128, t.v) * g[0];
+        var cg: i128 = @as(i128, t.q) * f[0] + @as(i128, t.r) * g[0];
+        cf >>= 62;
+        cg >>= 62;
+        for (1..len) |i| {
+            cf += @as(i128, t.u) * f[i] + @as(i128, t.v) * g[i];
+            cg += @as(i128, t.q) * f[i] + @as(i128, t.r) * g[i];
+            f[i - 1] = lo62(cf);
+            g[i - 1] = lo62(cg);
+            cf >>= 62;
+            cg >>= 62;
+        }
+        f[len - 1] = @intCast(cf);
+        g[len - 1] = @intCast(cg);
+    }
+
+    /// Bring `r` from (−2p, p) to [0, p), negated first when `sign < 0`.
+    fn normalize62(r: *S62, sign: i64) void {
+        var cond_add = r[4] >> 63;
+        for (r, modulus) |*ri, mi| ri.* += mi & cond_add;
+        const cond_negate = sign >> 63;
+        for (r) |*ri| ri.* = (ri.* ^ cond_negate) - cond_negate;
+        for (0..4) |i| {
+            r[i + 1] += r[i] >> 62;
+            r[i] &= @as(i64, @intCast(m62));
+        }
+        cond_add = r[4] >> 63;
+        for (r, modulus) |*ri, mi| ri.* += mi & cond_add;
+        for (0..4) |i| {
+            r[i + 1] += r[i] >> 62;
+            r[i] &= @as(i64, @intCast(m62));
+        }
+    }
+
+    /// `x^−1 mod p` for `x < p` (0 ↦ 0). Variable-time.
+    fn inverse(x: u256) u256 {
+        var d: S62 = .{ 0, 0, 0, 0, 0 };
+        var e: S62 = .{ 1, 0, 0, 0, 0 };
+        var f: S62 = modulus;
+        var g: S62 = fromInt(x);
+        var len: usize = 5;
+        var eta: i64 = -1; // eta = −delta; delta starts at 1
+        while (true) {
+            var t: Trans = undefined;
+            eta = divsteps62Var(eta, @bitCast(f[0]), @bitCast(g[0]), &t);
+            updateDe(&d, &e, t);
+            updateFgVar(len, &f, &g, t);
+            if (g[0] == 0) {
+                var cond: i64 = 0;
+                for (g[1..len]) |gi| cond |= gi;
+                if (cond == 0) break;
+            }
+            // Drop the top limb once both f and g fit in one fewer.
+            const fn_ = f[len - 1];
+            const gn = g[len - 1];
+            var cond: i64 = @as(i64, @intCast(len)) - 2;
+            cond >>= 63;
+            cond |= fn_ ^ (fn_ >> 63);
+            cond |= gn ^ (gn >> 63);
+            if (cond == 0) {
+                f[len - 2] |= @bitCast(@as(u64, @bitCast(fn_)) << 62);
+                g[len - 2] |= @bitCast(@as(u64, @bitCast(gn)) << 62);
+                len -= 1;
+            }
+        }
+        // f = ±1 now; d·x ≡ f.
+        normalize62(&d, f[len - 1]);
+        return toInt(d);
     }
 };
 
@@ -569,6 +775,43 @@ fn expectChainsMatch(a: Fe) !void {
     } else |_| {
         try std.testing.expect(!root.sq().equivalent(a));
     }
+}
+
+test "invertPublic (safegcd) == invert on edges, structured and random elements" {
+    const edges = [_]u256{
+        0,                                                                  1,                2,               3,               977,
+        1 << 32,                                                            (1 << 62) - 1,    1 << 62,         (1 << 124) + 1,  1 << 248,
+        (1 << 255),                                                         field_order >> 1, field_order - 2, field_order - 1, field_order - (1 << 62),
+        0x5555555555555555555555555555555555555555555555555555555555555555,
+    };
+    inline for (edges) |v| {
+        const a = try Fe.fromInt(v);
+        try std.testing.expectEqual(a.invert().toInt(), a.invertPublic().toInt());
+    }
+    var prng = std.Random.DefaultPrng.init(0x5AFE_6CD);
+    const rand = prng.random();
+    const iters: usize = if (builtin.mode == .Debug) 3000 else 30000;
+    for (0..iters) |i| {
+        // Random, plus sparse values (few set bits) that stress long runs of
+        // zero divsteps and the limb-shrinking path.
+        var v: u256 = rand.int(u256);
+        if (i % 3 == 1) v = @as(u256, 1) << rand.int(u8) | @as(u256, rand.int(u64));
+        if (i % 3 == 2) v = field_order - 1 - rand.int(u128);
+        if (v >= field_order) v -= field_order;
+        const a = Fe{ ._limbs = fromU256(v) };
+        const inv = a.invertPublic();
+        if (v == 0) {
+            try std.testing.expect(inv.isZero());
+        } else {
+            try std.testing.expect(a.mul(inv).equivalent(Fe.one));
+            try std.testing.expect(inv.toInt() < field_order);
+        }
+    }
+}
+
+test "safegcd: p^-1 mod 2^62 matches libsecp256k1's constant" {
+    // `secp256k1_const_modinfo_fe.modulus_inv62` in libsecp256k1's field_5x52_impl.h.
+    try std.testing.expectEqual(@as(u64, 0x27C7F6E22DDACACF), safegcd.modulus_inv62);
 }
 
 test "algebraic identities: a·a⁻¹ = 1, a − a = 0, (a·b) = (b·a)" {

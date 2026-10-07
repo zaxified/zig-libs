@@ -241,6 +241,18 @@ pub const Secp256k1 = struct {
         return ret;
     }
 
+    /// `affineCoordinates` for a PUBLIC point — VARIABLE-TIME: the inversion
+    /// is `Fe.invertPublic` (safegcd) and the identity test a branch. The
+    /// verifiers' conversion of `s·G − e·P`. Same result as
+    /// `affineCoordinates` for every input.
+    pub fn affineCoordinatesPublic(p: Secp256k1) AffineCoordinates {
+        const affine_0 = p.x.equivalent(AffineCoordinates.identityElement.x) and
+            (p.y.isZero() or p.y.equivalent(AffineCoordinates.identityElement.y));
+        if (p.z.isZero() or affine_0) return AffineCoordinates.identityElement;
+        const zinv = p.z.invertPublic();
+        return .{ .x = p.x.mul(zinv), .y = p.y.mul(zinv) };
+    }
+
     /// True iff both represent the same point.
     pub fn equivalent(a: Secp256k1, b: Secp256k1) bool {
         if (a.sub(b).rejectIdentity()) {

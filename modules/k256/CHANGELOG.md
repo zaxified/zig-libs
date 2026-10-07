@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NEW API:** `Fe.invertPublic` (VARIABLE-TIME safegcd inversion for public
+  values; Bernstein–Yang divsteps in libsecp256k1's `modinv64_var` form, signed 62-bit limbs)
+  and `Secp256k1.affineCoordinatesPublic` on top of it. The verifiers (`bip340Verify`,
+  `ecdsaVerify`, and `bip340.verify`) convert `s·G − e·P` with it: bench-bip340 verify 59.2 →
+  53.2 µs (1.57× libsecp256k1), sign 96.8 → 90.1 µs (3.99×, its self-check verifies). Held by
+  equality with `invert` on edge elements and `a·a⁻¹ = 1` on 30,000 random/sparse/near-p
+  values (ReleaseSafe count), `p⁻¹ mod 2^62` equal to libsecp's constant, and
+  `affineCoordinatesPublic == affineCoordinates` incl. the identity.
 - **2026-10-07** — **NEW API:** `Secp256k1.mulMultiBasePublic(g_s, points, scalars, endian)`,
   VARIABLE-TIME `g_s·G + Σ s_i·P_i` for public data: `ecmult`'s Straus core generalised to up
   to `ecmult.multi_max_points` (16) bases per pass — every point's odd-multiple table brought

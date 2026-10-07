@@ -97,6 +97,12 @@ addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed ta
 2026-10-07 both ran a square-and-multiply over the whole exponent (~2× the work);
 `powConst` remains as their test oracle.
 
+For PUBLIC values only, `Fe.invertPublic` (2026-10-07) is a VARIABLE-TIME
+safegcd inversion (Bernstein–Yang divsteps, ported from libsecp256k1's
+`modinv64_var`): ~1.5 µs against ~7.5 µs for the chain on this host. The
+verifiers use it through `Secp256k1.affineCoordinatesPublic`; nothing on a
+secret path may.
+
 The amd64 core needs only TWO folds: after fold 2 the value is `< 2^256 + 2^67 <
 2p`, so one masked "`+c`, keep if it (or fold 2) carried" step finishes — see
 `fast_core.zig`'s module doc (2026-10-07; it had mirrored all four folds plus a
@@ -572,8 +578,8 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 - **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
   33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
-  — verify 85 → 59 µs. Open, by expected gain: (1) a variable-time safegcd inversion for
-  public data (verify's affine conversion, ~6 µs on the chain today); (2) ~~`verifyBatch` on a multi-point Straus~~ DONE 2026-10-07
+  — verify 85 → 59 µs. Open, by expected gain: (1) ~~variable-time safegcd inversion~~ DONE 2026-10-07
+  (`Fe.invertPublic`, verify 59 → 53 µs); (2) ~~`verifyBatch` on a multi-point Straus~~ DONE 2026-10-07
   (`mulMultiBasePublic`, 79 → 51 µs/sig); a double-base with two arbitrary points still runs
   the RCB `glvCombine` (no consumer on a hot path); (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
   skip the select; (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,

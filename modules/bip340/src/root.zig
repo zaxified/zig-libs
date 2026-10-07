@@ -524,7 +524,7 @@ pub fn verify(pubkey: XOnlyPublicKey, msg: []const u8, sig: Signature) bool {
     ) catch return false;
 
     // Steps 7-8: even y and x(R) == r.
-    const r_xy = r_point.affineCoordinates();
+    const r_xy = r_point.affineCoordinatesPublic();
     if (r_xy.y.isOdd()) return false;
     return std.mem.eql(u8, &r_xy.x.toBytes(.big), &sig.r);
 }

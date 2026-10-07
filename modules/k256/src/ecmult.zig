@@ -654,3 +654,21 @@ test "ecmult: Secp256k1.mulMultiBasePublic chunks past multi_max_points; empty a
     const zero = [_]u8{0} ** 32;
     try std.testing.expectError(error.IdentityElement, Secp256k1.mulMultiBasePublic(zero, &.{ pts[0], pts[0].neg() }, &.{ sb[0], sb[0] }, .big));
 }
+
+test "affineCoordinatesPublic == affineCoordinates (random projective points, identity)" {
+    var prng = std.Random.DefaultPrng.init(0xAFF1_E0B5);
+    const rand = prng.random();
+    for (0..200) |_| {
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        var p = Secp256k1.basePoint.mulPublic(kb, .big) catch continue;
+        p = p.add(Secp256k1.basePoint.dbl()); // a z far from 1
+        const want = p.affineCoordinates();
+        const got = p.affineCoordinatesPublic();
+        try std.testing.expectEqual(want.x.toInt(), got.x.toInt());
+        try std.testing.expectEqual(want.y.toInt(), got.y.toInt());
+    }
+    const o = Secp256k1.identityElement;
+    try std.testing.expectEqual(o.affineCoordinates().x.toInt(), o.affineCoordinatesPublic().x.toInt());
+    try std.testing.expectEqual(o.affineCoordinates().y.toInt(), o.affineCoordinatesPublic().y.toInt());
+}

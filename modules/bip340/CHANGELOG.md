@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO API CHANGE (faster):** `verify` converts `s·G − e·P` with k256's
+  variable-time `affineCoordinatesPublic` (safegcd): verify 59.2 → 53.2 µs (1.57×
+  libsecp256k1), sign 3.99× (its self-check). ctgrind `sign` 83 → 90, all in that inversion.
 - **2026-10-07** — **NO API CHANGE (same acceptance set, faster):** `verifyBatch` evaluates
   `(Σ a_i·s_i)·G − Σ a_i·R_i − Σ (a_i·e_i)·P_i = O` as one multi-base sum through k256's new
   `Secp256k1.mulMultiBasePublic` (one doubling chain per 8 items) instead of a double-base

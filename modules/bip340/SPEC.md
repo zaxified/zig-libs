@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 1.31–4.32× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.30–3.99× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
 
 **Known defects:** none recorded
 
@@ -284,4 +284,4 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
 
 ## Backlog / deferred
 
-- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
+- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`; with safegcd the same night verify 1.57×, sign 3.99×, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
