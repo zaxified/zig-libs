@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MIT
+
+// Differential oracle for the regex module: Go's `regexp` (BSD-3-Clause, the
+// module's declared reference — RE2 syntax and leftmost-first semantics),
+// run as a black box through its public API. The patterns and inputs are
+// OURS — crafted syntax cases and seeded random expressions below; Go only
+// answers them, and the answers are written out as a Zig file that
+// `src/go_oracle_test.zig` replays hermetically. No Go source was read.
+//
+//	cd modules/regex/tools/go_regexp_oracle
+//	GOTOOLCHAIN=go1.26.0 GOPROXY=off go run . -out ../../src/go_vectors.zig
+//	GOTOOLCHAIN=go1.26.0 GOPROXY=off go run . -check ../../src/go_vectors.zig
+//
+// Standard library only; needs `zig` on PATH (the output goes through
+// `zig fmt --stdin`).
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"os/exec"
+	"regexp"
+	"regexp/syntax"
+	"runtime"
+	"strings"
+)
+
+const seed = 0x7265676578 // "regex"
+
+var rnd = rand.New(rand.NewPCG(seed, seed^0x5a5a))
+
+const (
+	nRandom = 600
+	nInputs = 14
+)
+
+// Syntax cases: the compile verdict, and for the valid ones matches over the
+// fixed inputs below.
+var crafted = []string{
+	``, `a`, `abc`, `a|b|c`, `a|`, `|a`, `()`, `(|)`, `(?:)`, `a*`, `a+`, `a?`, `a*?`, `a+?`, `a??`,
+	`a**`, `a*+`, `a+*`, `a??*`, `a{2}`, `a{2,}`, `a{2,3}`, `a{2}?`, `a{2}{3}`, `a{2}*`, `a{,3}`, `a{`, `a{1`,
+	`a{1,`, `{`, `{1}`, `x{1001}`, `x{1000}`, `x{0}`, `x{0,0}`, `x{3,2}`, `*`, `+a`, `?`, `(*)`, `a|*`,
+	`^*`, `$+`, `\b*`, `(?i)*`, `.`, `[a]`, `[]a]`, `[^]a]`, `[a-]`, `[-a]`, `[a-c-e]`, `[z-a]`, `[a`, `[]`,
+	`[^]`, `[\d]`, `[\D]`, `[\w-z]`, `[a-\d]`, `[[:alpha:]]`, `[[:^alpha:]]`, `[[:foo:]]`, `[[:alpha:]`,
+	`[[:]`, `[[]`, `[\]]`, `[\[]`, `[a&&b]`, `\d`, `\D`, `\s`, `\S`, `\w`, `\W`, `\b`, `\B`, `\A`, `\z`,
+	`\Z`, `\a`, `\f`, `\t`, `\n`, `\r`, `\v`, `\0`, `\07`, `\012`, `\1`, `\8`, `\12`, `\x41`, `\x4`, `\x{41}`,
+	`\x{}`, `\x{110000}`, `\x{10FFFF}`, `\xg1`, `\Q`, `\Qa.b`, `\Qa.b\E`, `\Q\E`, `\Qab\E*`, `\E`, `\pL`,
+	`\p{Greek}`, `\PL`, `\C`, `\y`, `\_`, `\-`, `\ `, `\é`, `\`, `a\`, `(a`, `a)`, `)`, `(?:a`, `(?i)a`,
+	`(?i:a)b`, `(?-i)a`, `(?i-s)a`, `(?)`, `(?-)`, `(?i-)`, `(?--i)`, `(?z)`, `(?P<n>a)`, `(?<n>a)`,
+	`(?P<>a)`, `(?P<n-1>a)`, `(?P<n>a)(?P<n>b)`, `(?P=n)`, `(?P<n`, `(?#c)`, `(?=a)`, `(?!a)`, `(?<=a)`,
+	`(?ims)a`, `(?U)a+`, `(?U)a+?`, `a(?i)b|c`, `(a)(b)(c)`, `((a)|(b))*`, `(a*)*`, `(a*)+`, `(a|b)*c`,
+	`(?m)^a$`, `^a$`, `a$`, `\bab\b`, `é`, `[é]`, `[^é]`, `(?i)k`, `(?i)s`, `(?i)[k-l]`, `(?i)[^k]`,
+	`\x{212a}`, `(?i)\x{212a}`, `x*y*`, `(x|xy)z`, `(xy|x)z`, `.*`, `.+`, `(?s).*`, "a\nb", "[\n]",
+	`(((((a)))))`, `a{2,3}?b`, `(a+)+$`, `\.\*\+`,
+	`(?i)\W`, `(?i)\w`, `(?i)\S`, `(?i)\D`, `(?i)[\W]`, `(?i)[^\w]`, `(?i)[^\W]`, `(?i)[\Wx]`, `(?i)[[:^alpha:]]`,
+	`(?i)[[:^lower:]]`, `(?i)[[:lower:]]`, `(?i)[^k]`, `(?i)[^s]`, `(?i)[^a-z]`, `(?i)\x{17f}`, `(?i)[\x{17f}]`, `(?i)\x{212a}`,
+}
+
+// The alphabet random patterns and inputs share. `É` is left out of inputs:
+// case folding beyond ASCII is a documented gap, pinned by the crafted cases.
+var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "k", "s", "_", "-", "\xff"}
+
+func randInput() string {
+	var b strings.Builder
+	for i, n := 0, rnd.IntN(9); i < n; i++ {
+		b.WriteString(inputRunes[rnd.IntN(len(inputRunes))])
+	}
+	return b.String()
+}
+
+var fixedInputs = []string{"", "a", "ab", "abc", "aab", "ba", "a\nb", "xyz", "A", "k", "K", "\u212a", "s", "S", "\u017f", "é", "É", "123", "a b", "aaa", "\xff"}
+
+var groupCount int
+
+func randAtom(depth int) string {
+	r := rnd.IntN(100)
+	switch {
+	case r < 30:
+		return []string{"a", "b", "c", "A", "1", "é", "k", " ", "-", `\n`, `\.`}[rnd.IntN(11)]
+	case r < 38:
+		return "."
+	case r < 52:
+		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `\d`, `\w`, `\s`, `\D`, `\W`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`}[rnd.IntN(13)]
+	case r < 58:
+		return []string{`^`, `$`, `\b`, `\B`, `\A`, `\z`}[rnd.IntN(6)]
+	case r < 64 && depth < 3:
+		return "(?" + []string{"i", "m", "s", "U", "i-s", "-i"}[rnd.IntN(6)] + ")"
+	case r < 85 && depth < 3:
+		inner := randAlt(depth + 1)
+		switch rnd.IntN(4) {
+		case 0:
+			return "(?:" + inner + ")"
+		case 1:
+			groupCount++
+			return fmt.Sprintf("(?P<g%d>%s)", groupCount, inner)
+		case 2:
+			return "(?i:" + inner + ")"
+		default:
+			return "(" + inner + ")"
+		}
+	default:
+		return "a"
+	}
+}
+
+func randRepeat(atom string) string {
+	if strings.HasPrefix(atom, "(?") && strings.HasSuffix(atom, ")") && !strings.Contains(atom, ":") && !strings.Contains(atom, "<") {
+		return atom // a bare flag group takes no repetition
+	}
+	r := rnd.IntN(100)
+	var op string
+	switch {
+	case r < 60:
+		return atom
+	case r < 70:
+		op = "*"
+	case r < 78:
+		op = "+"
+	case r < 85:
+		op = "?"
+	default:
+		lo := rnd.IntN(3)
+		switch rnd.IntN(3) {
+		case 0:
+			op = fmt.Sprintf("{%d}", lo)
+		case 1:
+			op = fmt.Sprintf("{%d,}", lo)
+		default:
+			op = fmt.Sprintf("{%d,%d}", lo, lo+rnd.IntN(3))
+		}
+	}
+	if rnd.IntN(4) == 0 {
+		op += "?"
+	}
+	return atom + op
+}
+
+func randConcat(depth int) string {
+	var b strings.Builder
+	for i, n := 0, 1+rnd.IntN(4); i < n; i++ {
+		b.WriteString(randRepeat(randAtom(depth)))
+	}
+	return b.String()
+}
+
+func randAlt(depth int) string {
+	s := randConcat(depth)
+	for rnd.IntN(4) == 0 {
+		s += "|" + randConcat(depth)
+	}
+	return s
+}
+
+func zstr(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range []byte(s) {
+		switch {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20 || c > 0x7e:
+			fmt.Fprintf(&b, "\\x%02x", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func ints(xs []int) string {
+	var b strings.Builder
+	b.WriteString("&.{")
+	for _, x := range xs {
+		fmt.Fprintf(&b, "%d,", x)
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+func emitPattern(b *bytes.Buffer, pat string, inputs []string) {
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		// The verdict only; the error text is Go's own wording.
+		fmt.Fprintf(b, ".{ .pattern = %s, .ok = false },\n", zstr(pat))
+		return
+	}
+	full := fullMatcher(pat)
+	fmt.Fprintf(b, ".{ .pattern = %s, .ok = true, .names = &.{", zstr(pat))
+	for _, n := range re.SubexpNames() {
+		b.WriteString(zstr(n) + ",")
+	}
+	b.WriteString("}, .cases = &.{\n")
+	for _, in := range inputs {
+		sub := re.FindStringSubmatchIndex(in)
+		var all []int
+		for _, m := range re.FindAllStringIndex(in, -1) {
+			all = append(all, m...)
+		}
+		fmt.Fprintf(b, ".{ .input = %s, .match = %v, .full = %v, .sub = %s, .all = %s },\n",
+			zstr(in), re.MatchString(in), full.MatchString(in), ints(sub), ints(all))
+	}
+	b.WriteString("} },\n")
+}
+
+const header = `/// Go's answers for one input: MatchString, a full match (` + "`\\\\A(?:re)\\\\z`" + `),
+/// FindStringSubmatchIndex (empty: no match; -1: a group that took no part)
+/// and FindAllStringIndex flattened.
+pub const Case = struct { input: []const u8, match: bool, full: bool, sub: []const i32, all: []const i32 };
+/// ` + "`ok`" + `: Go compiles the pattern. ` + "`names`" + `: SubexpNames.
+pub const Pattern = struct { pattern: []const u8, ok: bool, names: []const []const u8 = &.{}, cases: []const Case = &.{} };
+
+`
+
+func main() {
+	out := flag.String("out", "", "write the Zig vectors file here (default stdout)")
+	check := flag.String("check", "", "re-take and compare with this committed file")
+	flag.Parse()
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "// SPDX-License-Identifier: MIT\n")
+	fmt.Fprintf(&b, "// GENERATED by modules/regex/tools/go_regexp_oracle (%s regexp) -- do not hand-edit.\n", runtime.Version())
+	b.WriteString("//! Go regexp's answers to this module's own patterns and inputs, replayed by\n")
+	b.WriteString("//! `go_oracle_test.zig`. Regenerate with the command in tools/go_regexp_oracle/main.go.\n\n")
+	b.WriteString(header)
+	b.WriteString("pub const crafted = [_]Pattern{\n")
+	for _, p := range crafted {
+		emitPattern(&b, p, fixedInputs)
+	}
+	b.WriteString("};\n\npub const random = [_]Pattern{\n")
+	for i := 0; i < nRandom; i++ {
+		groupCount = 0
+		p := randAlt(0)
+		var inputs []string
+		for j := 0; j < nInputs; j++ {
+			inputs = append(inputs, randInput())
+		}
+		emitPattern(&b, p, inputs)
+	}
+	b.WriteString("};\n")
+
+	fmtCmd := exec.Command("zig", "fmt", "--stdin")
+	fmtCmd.Stdin = bytes.NewReader(b.Bytes())
+	fmtCmd.Stderr = os.Stderr
+	formatted, err := fmtCmd.Output()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "zig fmt --stdin:", err)
+		os.Exit(2)
+	}
+	b.Reset()
+	b.Write(formatted)
+
+	switch {
+	case *check != "":
+		old, err := os.ReadFile(*check)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if !bytes.Equal(dropVersionLine(old), dropVersionLine(b.Bytes())) {
+			ol := strings.Split(string(old), "\n")
+			nl := strings.Split(b.String(), "\n")
+			for i := 0; i < len(ol) || i < len(nl); i++ {
+				var x, y string
+				if i < len(ol) {
+					x = ol[i]
+				}
+				if i < len(nl) {
+					y = nl[i]
+				}
+				if x != y {
+					fmt.Fprintf(os.Stderr, "DRIFT at line %d:\n  committed: %s\n  re-taken:  %s\n", i+1, x, y)
+					break
+				}
+			}
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "regexp oracle: committed vectors match a fresh re-take")
+	case *out != "":
+		if err := os.WriteFile(*out, b.Bytes(), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	default:
+		os.Stdout.Write(b.Bytes())
+	}
+}
+
+func dropVersionLine(b []byte) []byte {
+	var keep [][]byte
+	for _, l := range bytes.Split(b, []byte("\n")) {
+		if !bytes.HasPrefix(l, []byte("// GENERATED ")) {
+			keep = append(keep, l)
+		}
+	}
+	return bytes.Join(keep, []byte("\n"))
+}
+
+// fullMatcher is the pattern anchored at both ends of the text, built on its
+// parsed form rather than by pasting text around it (`\Q` would swallow a
+// pasted `)`).
+func fullMatcher(pat string) *regexp.Regexp {
+	parsed, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		panic(err)
+	}
+	wrapped := &syntax.Regexp{Op: syntax.OpConcat, Flags: syntax.Perl, Sub: []*syntax.Regexp{
+		{Op: syntax.OpBeginText}, parsed, {Op: syntax.OpEndText},
+	}}
+	return regexp.MustCompile(wrapped.String())
+}

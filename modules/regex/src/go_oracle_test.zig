@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: MIT
+
+//! Replays `go_vectors.zig`: Go `regexp`'s answers (`tools/go_regexp_oracle`)
+//! to this module's own crafted syntax cases and seeded random patterns.
+//! Per pattern: the compile verdict and the group names; per input:
+//! `isMatch` (MatchString), `fullMatch` (`\A(?:re)\z`), `Matcher.captures`
+//! (FindStringSubmatchIndex) and the iterator (FindAllStringIndex). No Go at
+//! test time.
+//!
+//! Listed divergences, each counted and pinned so a drift either way shows:
+//!  - UNICODE_CLASS: `\pL`, `\p{Greek}`, `\PL` compile in Go; here
+//!    `error.UnsupportedUnicodeClass` (SPEC Backlog).
+
+const std = @import("std");
+const testing = std.testing;
+const regex = @import("root.zig");
+const v = @import("go_vectors.zig");
+
+fn unicodeClass(pattern: []const u8) bool {
+    return std.mem.indexOf(u8, pattern, "\\p") != null or std.mem.indexOf(u8, pattern, "\\P") != null;
+}
+
+const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, unicode_class: usize = 0, bad: usize = 0 };
+
+fn replay(set: []const v.Pattern, t: *Tally) !void {
+    for (set) |p| {
+        t.patterns += 1;
+        var re = regex.Regex.compile(testing.allocator, p.pattern) catch |e| {
+            if (p.ok and unicodeClass(p.pattern) and e == error.UnsupportedUnicodeClass) {
+                t.unicode_class += 1;
+            } else if (p.ok) {
+                t.bad += 1;
+                std.debug.print("/{s}/: Go compiles it, here {t}\n", .{ p.pattern, e });
+            }
+            continue;
+        };
+        defer re.deinit(testing.allocator);
+        if (!p.ok) {
+            t.bad += 1;
+            std.debug.print("/{s}/: Go refuses it, here it compiles\n", .{p.pattern});
+            continue;
+        }
+        if (re.names.len != p.names.len) {
+            t.bad += 1;
+            std.debug.print("/{s}/: {d} groups, Go {d}\n", .{ p.pattern, re.names.len - 1, p.names.len - 1 });
+            continue;
+        }
+        for (re.names, p.names) |a, b| if (!std.mem.eql(u8, a, b)) {
+            t.bad += 1;
+            std.debug.print("/{s}/: group name {s}, Go {s}\n", .{ p.pattern, a, b });
+        };
+        var m = try regex.Matcher.init(testing.allocator, &re);
+        defer m.deinit();
+        for (p.cases) |c| {
+            t.cases += 1;
+            if (c.match) t.matched += 1;
+            var ok = re.isMatch(c.input) == c.match and re.fullMatch(c.input) == c.full;
+            var out: [regex.max_groups]?regex.Span = undefined;
+            const groups = out[0..re.names.len];
+            const found = m.captures(c.input, 0, groups);
+            if (found != (c.sub.len != 0)) ok = false;
+            if (found and c.sub.len == 2 * groups.len) for (groups, 0..) |g, i| {
+                const ws = c.sub[2 * i];
+                const we = c.sub[2 * i + 1];
+                if (g) |s| {
+                    if (ws != s.start or we != s.end) ok = false;
+                } else if (ws != -1) ok = false;
+            };
+            var it = m.iterator(c.input);
+            var i: usize = 0;
+            while (it.next()) |s| : (i += 2) {
+                if (i + 1 >= c.all.len or c.all[i] != s.start or c.all[i + 1] != s.end) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (i != c.all.len) ok = false;
+            if (!ok) {
+                t.bad += 1;
+                if (t.bad <= 40) std.debug.print("/{s}/ on \"{f}\": go match={} full={} sub={any} all={any}; ours match={} full={} sub={any}\n", .{
+                    p.pattern,           std.zig.fmtString(c.input), c.match, c.full, c.sub, c.all,
+                    re.isMatch(c.input), re.fullMatch(c.input),      groups,
+                });
+            }
+        }
+    }
+}
+
+test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
+    var t: Tally = .{};
+    try replay(&v.crafted, &t);
+    try replay(&v.random, &t);
+    std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.bad });
+    try testing.expectEqual(@as(usize, 0), t.bad);
+    try testing.expectEqual(@as(usize, 3), t.unicode_class);
+}
