@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.add` reduces
+  with two carry chains and one masked select instead of the general `normalize` (three chains,
+  two selects), and the curve formulas' `3b = 21` multiple is one `Fe.mulSmall(21)` (256×64
+  product + one fold) instead of four adds. Measured, same host, A/B interleaved: BIP340 verify
+  107 → 85 µs, sign 195 → 155 µs; comb `k·G` 34 → 23 µs. Per-limb `@addWithOverflow` chains
+  were tried first and were 30 % SLOWER (LLVM emits setc/or, not adc) — `add` stays on `u256`.
+  Held by the module's tests vs std, a 5,000,000-case random+edge differential of
+  add/sub/dbl/mulSmall vs `u512` (negative control fails), and ctgrind: in-file counts and
+  output pins unchanged, source digests re-pinned. New `Fe.mulSmall(a, comptime k)` (k < 32).
 - **2026-10-05** — Tests: first dated mutation run (62 mutants, 47 killed, 15 equivalent or
   unobservable; `SPEC.md` § "Mutation run 2026-10-05"). No defect; 5 new tests close the 7 test
   gaps it found — `ecdsaVerify` refuses the `00` (infinity) public key even for a pair that

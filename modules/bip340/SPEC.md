@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 2.00–9.30× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.56–7.37× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
 
 **Known defects:** none recorded
 
@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | Reference: `schnorrsig` module (sign, verify, keypair, x-only keys); constant-time by construction and by valgrind CI. Also has `sign_custom` for non-32-byte messages, which `sign` here covers because `msg` is a slice. No batch verification in the library *(inferred)*; this module has `verifyBatch`. **Measured 2026-10-07** (`zig build bench-bip340`, ReleaseFast vs v0.8.0 compiled with `zig cc -O3`, x86-64 asm, upstream default tables; signatures cross-verified and byte-identical first): ours/libsecp256k1 keypair 2.00, verify 3.39, sign 9.30 (ours verifies its own signature before returning and derives the public key per call). |
+| [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) — **reference** | C | MIT | 2.5k | v0.8.0 (2026-08-03) | Reference: `schnorrsig` module (sign, verify, keypair, x-only keys); constant-time by construction and by valgrind CI. Also has `sign_custom` for non-32-byte messages, which `sign` here covers because `msg` is a slice. No batch verification in the library *(inferred)*; this module has `verifyBatch`. **Measured 2026-10-07** (`zig build bench-bip340`, ReleaseFast vs v0.8.0 compiled with `zig cc -O3`, x86-64 asm, upstream default tables; signatures cross-verified and byte-identical first): ours/libsecp256k1 keypair 2.00, verify 3.39, sign 9.30 (ours verifies its own signature before returning and derives the public key per call); after the k256 field add/`mulSmall` change the same day: keypair 1.56, verify 2.56, sign 7.37. |
 | [rust-bitcoin/rust-secp256k1](https://github.com/rust-bitcoin/rust-secp256k1) | Rust (C FFI) | CC0-1.0 | 431 | push 2026-08-17 | Bindings to libsecp256k1 — same semantics, links C. |
 | [btcsuite/btcd (`btcec/v2/schnorr`)](https://github.com/btcsuite/btcd/tree/master/btcec) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Pure Go BIP340 sign/verify. |
 | [paulmillr/noble-curves (schnorr)](https://github.com/paulmillr/noble-curves) | TypeScript | MIT | 960 | 2.4.0 (push 2026-09-08) | Pure-JS BIP340 sign/verify *(inferred; README not read)*. |
@@ -287,4 +287,4 @@ beyond the BIP340 specification text itself and `std.crypto.ecc.Secp256k1`
 
 ## Backlog / deferred
 
-- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`: keypair 2.00×, verify 3.39×, sign 9.30× libsecp256k1 v0.8.0 time). Likely causes (not profiled): sign re-derives the public key and re-verifies the signature inside `sign` (fault-injection guard); verify uses `std`'s generic Secp256k1 arithmetic against libsecp's hand-tuned field code and large precomputed tables. `verifyBatch` per signature (64-item batch) is no faster than a single `verify` today (see the bench row). Closing the gap needs a dedicated ecmult in `src/`, out of this benchmark task's scope.
+- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) is no faster than a single `verify` today.

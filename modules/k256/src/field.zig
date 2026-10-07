@@ -249,8 +249,32 @@ pub const Fe = struct {
     }
 
     /// `(a + b) mod p`, constant-time.
+    ///
+    /// With `a, b < p` the sum is `< 2p < 2^257`. Let `t = s + c` over 256
+    /// bits (`c = 2^256 − p`); then `s ≥ p` exactly when the add carried out
+    /// or `t` did, and in that case `t` is `s − p`: two carry chains and one
+    /// masked select, where `normalize` (written for a general carry) spends
+    /// three chains and two selects. Kept on `u256` on purpose: per-limb
+    /// `@addWithOverflow` chains measured 30% SLOWER on verify (2026-10-07)
+    /// despite half the instructions — LLVM turns them into setc/or carry
+    /// chains instead of `adc`.
     pub fn add(a: Fe, b: Fe) Fe {
         const s = @addWithOverflow(a.value(), b.value());
+        const t = @addWithOverflow(s[0], @as(u256, c_fold));
+        const mask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, s[1] | t[1])));
+        return .{ ._limbs = fromU256((t[0] & mask) | (s[0] & ~mask)) };
+    }
+
+    /// `k·a mod p` for a small comptime `k` (the curve formulas' `3b = 21`).
+    /// One 256×64 product and one Solinas fold instead of a chain of `add`s:
+    /// `k·a < 2^261`, its high word `h < 2^5`, and `lo + c·h` then fits
+    /// `normalize`'s `s0 + carry·2^256` contract.
+    pub fn mulSmall(a: Fe, comptime k: u64) Fe {
+        comptime std.debug.assert(k < 32);
+        const w: u320 = @as(u320, a.value()) * k;
+        const lo: u256 = @truncate(w);
+        const hi: u256 = @intCast(w >> 256);
+        const s = @addWithOverflow(lo, hi * c_fold);
         return .{ ._limbs = normalize(s[0], s[1]) };
     }
 

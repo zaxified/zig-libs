@@ -170,8 +170,7 @@ pub const Secp256k1 = struct {
         Z3 = Z3.dbl();
         var t1 = p.y.mul(p.z);
         var t2 = p.z.sq();
-        const t2_4 = t2.dbl().dbl();
-        t2 = t2_4.dbl().dbl().add(t2_4).add(t2);
+        t2 = t2.mulSmall(21); // 3b, b = 7
         var X3 = t2.mul(Z3);
         var Y3 = t0.add(t2);
         Z3 = t1.mul(Z3);
@@ -209,12 +208,10 @@ pub const Secp256k1 = struct {
         Y3 = X3.sub(Y3);
         X3 = t0.dbl();
         t0 = X3.add(t0);
-        const t2_4 = t2.dbl().dbl();
-        t2 = t2_4.dbl().dbl().add(t2_4).add(t2);
+        t2 = t2.mulSmall(21); // 3b, b = 7
         var Z3 = t1.add(t2);
         t1 = t1.sub(t2);
-        const Y3_4 = Y3.dbl().dbl();
-        Y3 = Y3_4.dbl().dbl().add(Y3_4).add(Y3);
+        Y3 = Y3.mulSmall(21); // 3b
         X3 = t4.mul(Y3);
         t2 = t3.mul(t1);
         X3 = t2.sub(X3);
