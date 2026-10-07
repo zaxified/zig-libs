@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **Fix (behaviour change), `h1.ChunkedReader` reads chunk extensions.** Everything
+  after the first `;` on a chunk-size line used to pass unread, so a bare CR, a control byte or an
+  unterminated quoted-string inside an extension decoded clean -- room for a parser in front to read
+  the same line differently. The rest of the line must now be RFC 9112 §7.1.1 `chunk-ext` (token
+  names, token or quoted-string values, BWS inside), or the body fails `malformed_chunk`.
+  Whitespace between the size and the first `;` stays refused, as Go's server refuses it (go oracle
+  `chunk-ext-ws` agrees). Extensions are still ignored once valid.
+
 - **2026-10-06** — The CPython / sseclient-py / httpx-sse anchors moved out of the module (CONVENTIONS §9:
   a module spawns no foreign toolchain — `check-module-purity` was red on `main` from `7af4c581`):
   they are now `zig build interop-http -- --phase problem|sse` (`tools/oracles.zig`), which freeze what

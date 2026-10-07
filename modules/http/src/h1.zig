@@ -765,9 +765,21 @@ pub const ChunkedReader = struct {
                     if (raw.len < 2 or raw[raw.len - 2] != '\r' or raw[raw.len - 1] != '\n')
                         return c.fail(.malformed_chunk);
                     const line = raw[0 .. raw.len - 2];
-                    // "<hex-size>[;extensions]"
-                    const size_text = if (std.mem.indexOfScalar(u8, line, ';')) |i| line[0..i] else line;
+                    // "<hex-size>[;extensions]": the size is the run of hex
+                    // digits, and what follows it must be RFC 9112 §7.1.1's
+                    // chunk-ext exactly. Extensions are still ignored, but
+                    // no longer unread: anything after a ';' used to pass,
+                    // so a bare CR, a control byte or an unterminated
+                    // quoted-string reached no verdict here while a parser
+                    // in front of this one could read the same line
+                    // differently -- the disagreement chunked smuggling is
+                    // built on.
+                    const size_len = for (line, 0..) |ch, i| {
+                        if (!std.ascii.isHex(ch)) break i;
+                    } else line.len;
+                    const size_text = line[0..size_len];
                     if (size_text.len == 0 or size_text.len > 16) return c.fail(.malformed_chunk);
+                    if (!isChunkExt(line[size_len..])) return c.fail(.malformed_chunk);
                     var size: u64 = 0;
                     for (size_text) |ch| {
                         const d = std.fmt.charToDigit(ch, 16) catch return c.fail(.malformed_chunk);
@@ -835,6 +847,77 @@ pub const ChunkedReader = struct {
         return error.ReadFailed;
     }
 };
+
+/// Is `ext` a chunk-ext (RFC 9112 §7.1.1), possibly empty?
+///
+///     chunk-ext     = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+///     chunk-ext-name = token
+///     chunk-ext-val  = token / quoted-string
+///
+/// One deliberate narrowing: the first `;` must follow the size directly.
+/// The grammar allows BWS there (`5 ;a`), but whitespace after a chunk size
+/// is refused as before -- Go's server refuses `5 ;a=b` too (go oracle
+/// `chunk-ext-ws`), and `5 ` is a judged divergence already
+/// (`chunk-size-trailing-space`). Between and inside extensions BWS is
+/// accepted as RFC 9110 §5.6.3 asks; whitespace that ends the line is not.
+fn isChunkExt(ext: []const u8) bool {
+    if (ext.len > 0 and ext[0] != ';') return false;
+    var i: usize = 0;
+    while (i < ext.len) {
+        i = skipBws(ext, i);
+        if (i == ext.len or ext[i] != ';') return false;
+        i = skipToken(ext, skipBws(ext, i + 1)) orelse return false;
+        const eq = skipBws(ext, i);
+        if (eq < ext.len and ext[eq] == '=') {
+            const v = skipBws(ext, eq + 1);
+            i = if (v < ext.len and ext[v] == '"')
+                skipQuotedString(ext, v) orelse return false
+            else
+                skipToken(ext, v) orelse return false;
+        }
+    }
+    return true;
+}
+
+fn skipBws(s: []const u8, start: usize) usize {
+    var i = start;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    return i;
+}
+
+/// The index past the token at `start`, or null when none starts there.
+fn skipToken(s: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < s.len and isTchar(s[i])) i += 1;
+    return if (i == start) null else i;
+}
+
+/// The index past the quoted-string (RFC 9110 §5.6.4) opening at `start`, or
+/// null when it is malformed or never closed.
+fn skipQuotedString(s: []const u8, start: usize) ?usize {
+    var i = start + 1;
+    while (i < s.len) : (i += 1) {
+        switch (s[i]) {
+            '"' => return i + 1,
+            // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+            '\\' => {
+                i += 1;
+                if (i == s.len or !isQuotedPairChar(s[i])) return null;
+            },
+            // qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+            '\t', ' ', 0x21, 0x23...0x5b, 0x5d...0x7e, 0x80...0xff => {},
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn isQuotedPairChar(ch: u8) bool {
+    return switch (ch) {
+        '\t', ' ', 0x21...0x7e, 0x80...0xff => true,
+        else => false,
+    };
+}
 
 // ── Content-Length bounded reader ───────────────────────────────────────────
 
@@ -1550,6 +1633,51 @@ test "ChunkedReader: chunk-size at exactly the 16 hex-digit cap still decodes (F
     // Positive control for the guard above: 16 digits is the documented
     // ceiling, not one past it, and must not be rejected as collateral.
     try expectChunkedDecode("0000000000000005\r\nabcde\r\n0\r\n\r\n", "abcde");
+}
+
+test "ChunkedReader: a chunk extension must be RFC 9112 §7.1.1 chunk-ext, not anything after a ';'" {
+    // Before, the text after the first ';' was never read: every one of the
+    // rejected lines below decoded clean but `3 ;a`, refused before as now.
+    // Each accepted line is one the grammar allows, BWS inside the extension
+    // included (RFC 9110 §5.6.3), so the check cannot have been bought by
+    // refusing real extensions.
+    const accepted = [_][]const u8{
+        "3;a\r\nabc\r\n0\r\n\r\n",
+        "3;a=b\r\nabc\r\n0\r\n\r\n",
+        "3;a;b=c\r\nabc\r\n0\r\n\r\n",
+        "3; a = b\r\nabc\r\n0\r\n\r\n",
+        "3;a=\"x y\"\r\nabc\r\n0\r\n\r\n",
+        "3;a=\"q\\\"d\"\r\nabc\r\n0\r\n\r\n", // quoted-pair
+        "3;a=\"\"\r\nabc\r\n0\r\n\r\n", // empty quoted-string
+    };
+    for (accepted) |wire| try expectChunkedDecode(wire, "abc");
+
+    const rejected = [_][]const u8{
+        "3;\r\nabc\r\n0\r\n\r\n", // no name
+        "3;=b\r\nabc\r\n0\r\n\r\n", // no name before '='
+        "3;a=\r\nabc\r\n0\r\n\r\n", // no value after '='
+        "3;a\rb\r\nabc\r\n0\r\n\r\n", // bare CR inside the line
+        "3;a\x00\r\nabc\r\n0\r\n\r\n", // control byte
+        "3;a=\"x\r\nabc\r\n0\r\n\r\n", // quoted-string never closed
+        "3;a=\"x\x01\"\r\nabc\r\n0\r\n\r\n", // control byte inside quotes
+        "3;a=b c\r\nabc\r\n0\r\n\r\n", // a second word in a token value
+        "3 \r\nabc\r\n0\r\n\r\n", // whitespace with no ';' after it
+        "3 ;a\r\nabc\r\n0\r\n\r\n", // BWS before the first ';': refused, as Go does (see isChunkExt)
+        "3;a \r\nabc\r\n0\r\n\r\n", // whitespace ending the line
+        "3,a\r\nabc\r\n0\r\n\r\n", // not ';'
+    };
+    for (rejected) |wire| {
+        var src: Reader = .fixed(wire);
+        var cbuf: [64]u8 = undefined;
+        var cr: ChunkedReader = .init(&src, &cbuf);
+        var out: [256]u8 = undefined;
+        var w: Writer = .fixed(&out);
+        testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w)) catch |e| {
+            std.debug.print("accepted: {f}\n", .{std.zig.fmtString(wire)});
+            return e;
+        };
+        try testing.expectEqual(ChunkedReader.FailReason.malformed_chunk, cr.fail_reason.?);
+    }
 }
 
 test "ChunkedReader captures trailers when a buffer is provided" {
