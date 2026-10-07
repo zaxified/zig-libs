@@ -16,7 +16,8 @@ Consumer view, API and purpose: [README.md](README.md).
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. The two
+Zig rows before std's were added 2026-10-07 (stars and pushes as of that date).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -25,12 +26,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (`ruzstd`) | Rust | MIT | 451 | v0.9.0 (2026-07-26) | Pure Rust; its README: a "fully operational" decoder, and a compressor that "does not yet reach the speed, ratio or configurability of the original zstd library". |
 | [gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) (`zstd` crate) | Rust | BSD-3-Clause | 657 | v0.14.0 (2026-09-04) | Bindings to libzstd — full features, but links the C library. |
 | [DataDog/zstd](https://github.com/DataDog/zstd) | Go (cgo) | BSD-3-Clause | 806 | v1.5.7+patch2 (2026-04-21) | cgo bindings to libzstd — same trade-off as the Rust bindings. |
+| [muhammad-fiaz/zstd.zig](https://github.com/muhammad-fiaz/zstd.zig) | Zig | MIT | 14 | v0.0.4 (2026-10-04) | Pure Zig since v0.0.2 (v0.0.1 bound libzstd), needs Zig 0.17; its own encoder, not libzstd's bytes. Measured here 2026-10-07 on the Silesia corpus (`-mcpu=x86_64_v3`, ReleaseFast): ratio 1.53 at level 3 and 1.95 at 19 where libzstd and this module reach 3.21 and 4.01, compression in 4.6–12× and decoding (libzstd's frames) in 3.8–4.4× libzstd's time; its frames are valid (`zstd -t`, 84 of 84). Decodes the legacy v0.1–v0.5 frames. |
+| [c4milo/stdx](https://github.com/c4milo/stdx) `zstd` | Zig | none stated (no `LICENSE`, GitHub: none) | 1 | — (push 2026-10-05) | Decoder only, no compressor. Its own CI tables claim 1.18–1.32× libzstd's decoding speed at level 3 on an EPYC 7763; not measured here, and its source not read (no licence). |
 | Zig `std.compress.zstd` | Zig | MIT | — | Zig 0.16.0 | Decoder only (`Decompress`; checked in 0.16.0's `lib/std/compress/`): no compressor, no dictionaries, no training. |
 
 **Where we are ahead:** of the implementations above that do not link libzstd, the only one
 that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
 dictionaries, training, multithreading and the seekable format without linking C. **Where we
-are behind:** run-time CPU dispatch (Z22) and the legacy formats (refused).
+are behind:** run-time CPU dispatch (Z22), the legacy formats (refused), and decoding
+speed: 1.04–1.16× libzstd's cycles (Z33), where stdx claims to be faster than libzstd.
 
 ## What this module is, and what it is not
 
@@ -3562,6 +3566,31 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   per-function target features, so ~~say so in the README~~ (done
   2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
   still open: revisit run-time dispatch when Zig can.
+- **Z33 — Decoder: the sequence loop keeps its cursors in locals.** Found
+  2026-10-07 while comparing Zig implementations. Decoding libzstd's Silesia
+  frames (`dickens`, `mozilla` at levels 3 and 19; `-mcpu=x86_64_v3`,
+  ReleaseFast, user cycles per decode, 5 interleaved rounds, median) takes
+  1.04–1.16× libzstd's cycles (Ubuntu's libzstd 1.5.7) and 1.13–1.20× its
+  instructions. Profile of `dickens` level 19: in both, about 40 % of the
+  cycles wait on the match copy's load (memory, not code). The rest is the
+  sequence loop: 121 hot instructions against libzstd's 63, and 20.5 % of
+  the samples on stack loads and stores against 8.9 %. Cause:
+  `execSequence` reads and writes `st.lit_pos`, `lit_end`, `lit_src` and
+  `h.out`, `h.prefix` through pointers, and a byte store into `out` may
+  alias any of them, so they are reloaded for every sequence; libzstd keeps
+  `litPtr`, `litEnd`, `op` and `prefixStart` in locals. Also
+  `execSequenceEnd` is inlined into the loop, where libzstd has it
+  `FORCE_NOINLINE`. Tried on a copy: a local literal cursor and a local copy
+  of `History` in `decompressSequences`, `execSequenceEnd` `noinline` —
+  1.01–1.05× libzstd's cycles and 1.04–1.06× its instructions, the 24
+  Silesia frames of levels 1 and 19 decoded byte for byte; `noinline`
+  alone gave 1.06–1.09×, inside the run-to-run spread (±4 %). Left: make
+  the change (the streaming path included), the decoder goldens, fuzz and
+  a mutation sweep of the touched lines, re-measure by *Speed*'s method;
+  then what remains, candidates unmeasured: `readBitsFast` (libzstd's
+  hot loop extracts with `bzhi`), and the prefetching sequence decoder,
+  which libzstd switches to past 16 MB of history (`mozilla`, `webster`,
+  `nci`) and this port does not have (see *Decoder*).
 - ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
   *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
   `contrib/seekable_format`.
