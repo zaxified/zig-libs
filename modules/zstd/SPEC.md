@@ -34,7 +34,7 @@ Zig rows before std's were added 2026-10-07 (stars and pushes as of that date).
 that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
 dictionaries, training, multithreading and the seekable format without linking C. **Where we
 are behind:** run-time CPU dispatch (Z22), the legacy formats (refused), and decoding
-speed: 1.04–1.16× libzstd's cycles (Z33), where stdx's decoder takes 0.84–0.92×.
+speed: at libzstd's (0.97–1.06× its cycles since Z33), where stdx's decoder takes 0.84–0.92×.
 
 ## What this module is, and what it is not
 
@@ -3566,7 +3566,10 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   per-function target features, so ~~say so in the README~~ (done
   2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
   still open: revisit run-time dispatch when Zig can.
-- **Z33 — Decoder: the sequence loop keeps its cursors in locals.** Found
+- ~~**Z33 — Decoder: the sequence loop keeps its cursors in locals.**~~
+  Done 2026-10-07: 0.97–1.06× libzstd's cycles, 1.04–1.06× its
+  instructions, by the trial below (`LitCursor`, a local `History`,
+  `execSequenceEnd` out of line). Found
   2026-10-07 while comparing Zig implementations. Decoding libzstd's Silesia
   frames (`dickens`, `mozilla` at levels 3 and 19; `-mcpu=x86_64_v3`,
   ReleaseFast, user cycles per decode, 5 interleaved rounds, median) takes
@@ -3584,10 +3587,10 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   of `History` in `decompressSequences`, `execSequenceEnd` `noinline` —
   1.01–1.05× libzstd's cycles and 1.04–1.06× its instructions, the 24
   Silesia frames of levels 1 and 19 decoded byte for byte; `noinline`
-  alone gave 1.06–1.09×, inside the run-to-run spread (±4 %). Left: make
-  the change (the streaming path included), the decoder goldens, fuzz and
-  a mutation sweep of the touched lines, re-measure by *Speed*'s method;
-  then what remains, candidates unmeasured: `readBitsFast` (libzstd's
+  alone gave 1.06–1.09×, inside the run-to-run spread (±4 %). The change
+  moves no decision (the same reads, the same order), so the decoder
+  goldens and fuzz stand as its anchor (`modtest zstd`, ReleaseSafe,
+  284/284). What remains, candidates: `readBitsFast` (libzstd's
   hot loop extracts with `bzhi`), and the prefetching sequence decoder,
   which libzstd switches to past 16 MB of history (`mozilla`, `webster`,
   `nci`) and this port does not have (see *Decoder*).

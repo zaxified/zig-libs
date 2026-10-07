@@ -660,9 +660,18 @@ inline fn copyFromExt(h: *const History, o_lit_end: usize, seq: *Seq, op: *usize
     return false;
 }
 
+/// The block's literals as the sequence loop walks them: `State`'s
+/// `lit_src[lit_pos..lit_end]`, held in a local for the loop's duration
+/// (libzstd's `litPtr`/`litEnd`). Through `*State` every byte the loop
+/// stores into `out` may alias the fields, so they were reloaded and
+/// stored back for each sequence: 13–20 % more instructions than libzstd
+/// (SPEC.md, Z33).
+const LitCursor = struct { src: []const u8, pos: usize, end: usize };
+
 /// `ZSTD_execSequenceEnd`: the careful path near the end of the output
-/// or of the literals.
-fn execSequenceEnd(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st: *State) Error!usize {
+/// or of the literals. Out of line, as libzstd's `FORCE_NOINLINE`: inlined,
+/// it crowded the hot loop's registers.
+noinline fn execSequenceEnd(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st: *LitCursor) Error!usize {
     var seq = seq_in;
     var op = op_in;
     const o_lit_end = op + seq.lit_length;
@@ -671,11 +680,11 @@ fn execSequenceEnd(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st
     const oend_w: isize = @as(isize, @intCast(oend)) - wildcopy_overlength;
 
     if (sequence_length > oend - op) return error.DstSizeTooSmall;
-    if (seq.lit_length > st.lit_end - st.lit_pos) return error.CorruptionDetected;
+    if (seq.lit_length > st.end - st.pos) return error.CorruptionDetected;
 
-    safecopyNoOverlap(h.out, op, oend_w, st.lit_src, st.lit_pos, seq.lit_length);
+    safecopyNoOverlap(h.out, op, oend_w, st.src, st.pos, seq.lit_length);
     op = o_lit_end;
-    st.lit_pos += seq.lit_length;
+    st.pos += seq.lit_length;
 
     var match: usize = undefined;
     if (seq.offset > o_lit_end - h.prefix) {
@@ -689,22 +698,22 @@ fn execSequenceEnd(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st
 }
 
 /// `ZSTD_execSequence`.
-inline fn execSequence(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st: *State) Error!usize {
+inline fn execSequence(h: *const History, op_in: usize, oend: usize, seq_in: Seq, st: *LitCursor) Error!usize {
     var seq = seq_in;
     var op = op_in;
     const o_lit_end = op + seq.lit_length;
     const sequence_length = seq.lit_length + seq.match_length;
     const o_match_end = op + sequence_length;
-    const i_lit_end = st.lit_pos + seq.lit_length;
+    const i_lit_end = st.pos + seq.lit_length;
 
-    if (i_lit_end > st.lit_end or oend < wildcopy_overlength or o_match_end > oend - wildcopy_overlength)
+    if (i_lit_end > st.end or oend < wildcopy_overlength or o_match_end > oend - wildcopy_overlength)
         return execSequenceEnd(h, op, oend, seq, st);
 
     // copy literals: 16 bytes at once, the rest wildly
-    copy16(h.out, op, st.lit_src, st.lit_pos);
-    if (seq.lit_length > 16) wildcopyNoOverlap(h.out, op + 16, st.lit_src, st.lit_pos + 16, seq.lit_length - 16);
+    copy16(h.out, op, st.src, st.pos);
+    if (seq.lit_length > 16) wildcopyNoOverlap(h.out, op + 16, st.src, st.pos + 16, seq.lit_length - 16);
     op = o_lit_end;
-    st.lit_pos = i_lit_end;
+    st.pos = i_lit_end;
 
     var match: usize = undefined;
     if (seq.offset > o_lit_end - h.prefix) {
@@ -739,10 +748,15 @@ fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usiz
         ss.of = FseState.init(&ss.d, st.of_ptr);
         ss.ml = FseState.init(&ss.d, st.ml_ptr);
 
+        // The history and the literal cursor as locals, not behind
+        // pointers a byte store may alias (see `LitCursor`).
+        const hl = h.*;
+        var lit: LitCursor = .{ .src = st.lit_src, .pos = st.lit_pos, .end = st.lit_end };
         while (nb_seq != 0) : (nb_seq -= 1) {
             const seq = decodeSequence(&ss, nb_seq == 1);
-            op += try execSequence(h, op, oend, seq, st);
+            op += try execSequence(&hl, op, oend, seq, &lit);
         }
+        st.lit_pos = lit.pos;
 
         // check if reached exact end
         if (!ss.d.endOfStream()) return error.CorruptionDetected;

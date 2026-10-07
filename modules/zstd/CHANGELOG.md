@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Faster decoding (Z33, the same output): the sequence
+  loop keeps the literal cursor and the history in locals instead of
+  reading them through `*State` after every byte store, and the
+  end-of-buffer path is out of line, as libzstd has it. Decoding libzstd's
+  Silesia frames takes 0.97–1.06× libzstd's cycles (was 1.04–1.18×), with
+  4–6 % more instructions than libzstd (was 13–20 %).
 - **2026-09-28** — Faster decoding with a trained `DDict` (Z32): the
   context points at the `DDict`'s entropy tables for a frame, as libzstd's
   `ZSTD_copyDDictParameters` does, instead of copying their 27 KB per

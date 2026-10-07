@@ -3,8 +3,8 @@
 **Zstandard (RFC 8878) compressor** for every level — 1–22 and the negative
 ("fast") levels — emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
 and level, and a **decoder** ported from libzstd's, one-shot and streaming (also as a
-`std.Io.Reader`): 1.04–1.16× its CPU cycles on the Silesia corpus (Z33 in
-SPEC.md is the rest of that gap), checksums verified,
+`std.Io.Reader`): 0.97–1.06× its CPU cycles on the Silesia corpus (SPEC.md,
+Z33), checksums verified,
 concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
 leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
