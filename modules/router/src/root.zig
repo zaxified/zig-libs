@@ -78,7 +78,7 @@ const regex = @import("regex");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "REST routing — trie matcher (params/wildcards), middleware chain, groups, 404/405",
+    .doc = "REST routing, go-chi/chi parity — trie matcher ({name}, in-segment, regexp, wildcard), middleware, groups/mount, host routing, 404/405",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -540,7 +540,9 @@ pub const Router = struct {
 
     /// Register `h` for every `http.Method` at `pattern` (chi's `Handle`).
     /// An explicit route for one method registered before or after is a
-    /// `error.DuplicateRoute` — `any` claims them all.
+    /// `error.DuplicateRoute` — `any` claims them all. Not atomic: on an
+    /// error the methods before the failing one stay registered — treat it
+    /// as a startup failure, like every `add` error.
     pub fn any(r: *Router, pattern: []const u8, h: Handler) AddError!void {
         return addAny(r, null, pattern, h);
     }
@@ -699,14 +701,30 @@ pub const Router = struct {
     /// `addRoute` — exactly when that first happens): the group whose
     /// middleware would wrap a route at this path if one existed. `"/api"`
     /// matches `"/api/x"` and `"/api"` itself, but not `"/apix"`.
+    ///
+    /// The prefix is compared segment by segment: a static segment must be
+    /// equal, a capture segment (`:id`, `{tenant}`, `v{n}`) takes any
+    /// non-empty one — a constraint is not checked here, so a fallback may
+    /// run a group's middleware for a path its routes would refuse, which
+    /// errs toward MORE gating, never less. Ties go to the more deeply
+    /// nested group, then the later one: `api.mount("/", &sub)` (prefix
+    /// `/api`, nested in `api`) wins over `api` itself, so the mounted
+    /// router's middleware and overrides answer its fallbacks.
     fn groupFor(r: *const Router, path: []const u8) ?*Group {
         var best: ?*Group = null;
+        var best_rank: [3]usize = undefined;
         for (r.groups.items) |g| {
             if (g.own_chain == null) continue; // no route ever reached it
             if (g.is_inline) continue; // scopes routes, never a path
-            if (!std.mem.startsWith(u8, path, g.prefix)) continue;
-            if (path.len > g.prefix.len and path[g.prefix.len] != '/') continue;
-            if (best == null or g.prefix.len > best.?.prefix.len) best = g;
+            const segs = prefixCovers(g.prefix, path) orelse continue;
+            var depth: usize = 0;
+            var it = g.parent;
+            while (it) |p| : (it = p.parent) depth += 1;
+            const rank = [3]usize{ segs, depth, g.index };
+            if (best == null or std.mem.order(usize, &rank, &best_rank) == .gt) {
+                best = g;
+                best_rank = rank;
+            }
         }
         return best;
     }
@@ -1152,6 +1170,37 @@ pub const MountError = AddError || error{
     SelfMount,
 };
 
+/// How many segments of group prefix `prefix` cover `path`, or null when the
+/// path is not under it (see `Router.groupFor`).
+fn prefixCovers(prefix: []const u8, path: []const u8) ?usize {
+    if (prefix.len == 0) return 0;
+    var pre: ?[]const u8 = prefix[1..];
+    var rest: ?[]const u8 = if (path.len != 0 and path[0] == '/') path[1..] else return null;
+    var n: usize = 0;
+    while (pre) |pc| {
+        var ps = pc;
+        pre = null;
+        if (std.mem.indexOfScalar(u8, pc, '/')) |i| {
+            ps = pc[0..i];
+            pre = pc[i + 1 ..];
+        }
+        const cur = rest orelse return null;
+        var seg = cur;
+        rest = null;
+        if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+            seg = cur[0..i];
+            rest = cur[i + 1 ..];
+        }
+        switch (classifySegment(ps) catch return null) {
+            .static => if (!std.mem.eql(u8, ps, seg)) return null,
+            .wildcard => return n + 1,
+            .param, .pattern => if (seg.len == 0) return null,
+        }
+        n += 1;
+    }
+    return n;
+}
+
 /// One registration as `addRoute` received it — see `Router.defs`.
 const RouteDef = struct {
     group: ?*Group,
@@ -1335,12 +1384,27 @@ pub const HostRouter = struct {
 fn normalizeHost(raw: []const u8) []const u8 {
     var h = std.mem.trim(u8, raw, " \t");
     if (h.len != 0 and h[0] == '[') {
-        if (std.mem.indexOfScalar(u8, h, ']')) |i| return h[0 .. i + 1];
+        // `[v6]` or `[v6]:port`; anything else after `]` stays, and matches no
+        // mapping (`map` refuses it).
+        const i = std.mem.indexOfScalar(u8, h, ']') orelse return h;
+        if (i + 1 == h.len or isPort(h[i + 1 ..])) return h[0 .. i + 1];
         return h;
     }
-    if (std.mem.lastIndexOfScalar(u8, h, ':')) |i| h = h[0..i];
+    if (std.mem.lastIndexOfScalar(u8, h, ':')) |i| {
+        // Only a numeric port is cut; `a.example.com:xyz` stays whole and
+        // matches nothing.
+        if (!isPort(h[i..])) return h;
+        h = h[0..i];
+    }
     if (h.len > 1 and h[h.len - 1] == '.') h = h[0 .. h.len - 1];
     return h;
+}
+
+/// `:` followed by at least one decimal digit and nothing else.
+fn isPort(s: []const u8) bool {
+    if (s.len < 2 or s[0] != ':') return false;
+    for (s[1..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn hostAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
@@ -1623,6 +1687,9 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
 /// and `Static`, so the grammar is stated once.
 pub fn validatePattern(pattern: []const u8) AddError!void {
     if (pattern.len == 0 or pattern[0] != '/') return error.InvalidPattern;
+    // Nothing deeper than `max_path_segments` can ever match (and `Static`
+    // sizes its tables by it).
+    if (std.mem.count(u8, pattern, "/") > max_path_segments) return error.InvalidPattern;
     var names: [max_params][]const u8 = undefined;
     var n: usize = 0;
     var rest: ?[]const u8 = pattern[1..];
@@ -1843,12 +1910,18 @@ fn matchSegPattern(text: []const u8, regexes: []const ?regex.Regex, seg: []const
             break :blk seg.len - lit.len;
         } else std.mem.indexOfPos(u8, seg, @min(si + 1, seg.len), lit) orelse return false;
         if (value_end <= si) return false; // never empty
-        if (regexes[ci]) |re| if (!re.fullMatch(seg[si..value_end])) return false;
+        if (regexes[ci]) |*re| if (!constraintHolds(re, seg[si..value_end])) return false;
         params.push(c.name, seg[si..value_end]);
         si = value_end;
         ti = c.end;
     }
     return std.mem.eql(u8, seg[si..], text[ti..]);
+}
+
+/// `noinline`: the regex VM's stack scratch (~6 KiB) must stay out of the
+/// recursive `matchIn` frame, which an inlined call would grow at every level.
+noinline fn constraintHolds(re: *const regex.Regex, value: []const u8) bool {
+    return re.fullMatch(value);
 }
 
 /// Same literals, capture count and constraints, names aside — two such
@@ -3492,9 +3565,10 @@ test "match depth is bounded by the router, not by whatever caps the path upstre
     var r = Router.init(gpa);
     defer r.deinit();
 
-    // Two registered routes: one exactly AT the depth limit, one just past it.
-    // Both are perfectly well-formed patterns — the second is refused at match
-    // time by the cap, not by `add`.
+    // Two routes: one exactly AT the depth limit, one just past it. Since
+    // 2026-10-07 `add` refuses the second (review L2: `Static` sizes its
+    // tables by the limit); it goes into the trie by `insert` directly, so the
+    // match-time cap is still what this test pins.
     var at_limit: std.ArrayList(u8) = .empty;
     defer at_limit.deinit(gpa);
     for (0..max_path_segments) |_| try at_limit.appendSlice(gpa, "/a");
@@ -3504,7 +3578,8 @@ test "match depth is bounded by the router, not by whatever caps the path upstre
     try past_limit.appendSlice(gpa, "/a");
 
     try r.get(at_limit.items, hRoot);
-    try r.get(past_limit.items, hHello);
+    try testing.expectError(error.InvalidPattern, r.get(past_limit.items, hHello));
+    try r.insert(.get, past_limit.items, hHello, &.{});
 
     // At the limit: matched.
     {
@@ -4329,4 +4404,120 @@ test "constraints: Static compiles them at comptime and answers as Router does" 
     try testing.expectEqual(Match{ .found = 1 }, T.match(.get, "/u/x42", &p));
     try testing.expectEqual(Match{ .found = 2 }, T.match(.get, "/f/a.xml", &p));
     try testing.expectEqual(Match.not_found, T.match(.get, "/f/a.txt", &p));
+}
+
+// ── tests asked for by the 2026-10-07 mutation run ───────────────────────────
+
+test "patterns: a capture may start with its own delimiter — the search for the literal starts one byte in" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/files/{name}.{ext}", hPat);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("/files/{name}.{ext} name=.b ext=c", bodyOf(runWire(&r, wire("GET", "/files/.b.c"), &buf)));
+}
+
+test "patterns: the longer literal prefix wins even against more literal bytes" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/w/{a}.json", hPat); // literal 5, prefix 0
+    try r.get("/w/v{n}", hPat); // literal 1, prefix 1
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("/w/v{n} n=1.json", bodyOf(runWire(&r, wire("GET", "/w/v1.json"), &buf)));
+    try testing.expectEqualStrings("/w/{a}.json a=x1", bodyOf(runWire(&r, wire("GET", "/w/x1.json"), &buf)));
+}
+
+test "constraints: a backslash escapes a brace inside the regexp" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/e/{x:a\\}}", hPat);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("/e/{x:a\\}} x=a}", bodyOf(runWire(&r, wire("GET", "/e/a}"), &buf)));
+}
+
+test "mount: a group nested in a group of the sub-router keeps both prefixes" {
+    var sub = Router.init(testing.allocator);
+    defer sub.deinit();
+    const v1 = try sub.group("/v1");
+    const x = try v1.group("/x");
+    try x.get("/y", hHello);
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.mount("/api", &sub);
+    try testing.expectEqualStrings("/api/v1/x/y", r.routes()[0].pattern);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("GET", "/api/v1/x/y"), &buf)));
+}
+
+test "HostRouter: a wildcard needs a label of its own — a host that IS the suffix does not match" {
+    var ra = Router.init(testing.allocator);
+    defer ra.deinit();
+    try ra.get("/x", hA);
+    var hr = HostRouter.init(testing.allocator);
+    defer hr.deinit();
+    try hr.map("*.example.com", &ra);
+    try testing.expectEqual(@as(?*Router, null), hr.routerFor(".example.com"));
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("a.example.com"));
+}
+
+// ── tests asked for by the 2026-10-07 review ────────────────────────────────
+
+fn mwAuth(_: ?*anyopaque, ctx: *Ctx, next: Next) anyerror!void {
+    _ = next;
+    ctx.res.setStatus(401);
+    try ctx.res.writeAll("auth");
+}
+
+test "review M1: a router mounted at a group's own prefix answers that prefix's fallbacks (no redirect leak)" {
+    var sub = Router.init(testing.allocator);
+    defer sub.deinit();
+    try sub.use(.{ .run = mwAuth });
+    try sub.get("/secret/", hHello);
+    sub.not_found = hNfSub;
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    const api = try r.group("/api");
+    try api.get("/open", hHello);
+    try api.mount("/", &sub);
+
+    var buf: [1024]u8 = undefined;
+    // The trailing-slash redirect toward /api/secret/ runs the sub's gate.
+    try expectStatus(runWire(&r, wire("GET", "/api/secret"), &buf), "401");
+    // An unrouted path under /api is the sub's 404 behind its gate, too.
+    try expectStatus(runWire(&r, wire("GET", "/api/nope"), &buf), "401");
+    // A real route of the outer group is still served.
+    try testing.expectEqualStrings("hello", bodyOf(runWire(&r, wire("GET", "/api/open"), &buf)));
+}
+
+test "review M2: a group prefix with a capture scopes fallbacks segment by segment" {
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    const t = try r.group("/t/{tenant}");
+    try t.use(.{ .run = mwG });
+    t.not_found = hNfSub;
+    try t.get("/items", hTrace);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("sub-nf", bodyOf(runWire(&r, wire("GET", "/t/acme/nope"), &buf)));
+    try testing.expectEqualStrings("Gg", trace.get());
+    trace = .{};
+    try expectStatus(runWire(&r, wire("POST", "/t/acme/items"), &buf), "405");
+    try testing.expectEqualStrings("Gg", trace.get());
+    // Not under the prefix: `/t/` with an empty tenant, `/tx/...`.
+    try testing.expectEqualStrings("Not Found\n", bodyOf(runWire(&r, wire("GET", "/tx/acme"), &buf)));
+}
+
+test "review L2/L3: deeper than max_path_segments is refused; Host junk after ] or a non-numeric port routes nowhere" {
+    try testing.expectError(error.InvalidPattern, validatePattern("/a" ** (max_path_segments + 1)));
+    try validatePattern("/a" ** max_path_segments);
+    var ra = Router.init(testing.allocator);
+    defer ra.deinit();
+    var hr = HostRouter.init(testing.allocator);
+    defer hr.deinit();
+    try hr.map("[::1]", &ra);
+    try hr.map("a.example.com", &ra);
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("[::1]:8080"));
+    try testing.expectEqual(@as(?*Router, null), hr.routerFor("[::1]evil"));
+    try testing.expectEqual(@as(?*Router, null), hr.routerFor("a.example.com:xyz"));
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("a.example.com:443"));
 }

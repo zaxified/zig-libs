@@ -70,14 +70,18 @@ does not match `É`; K/k/U+212A and S/s/U+017F do fold, as in Go), `ReplaceAll`/
 ## Limits
 
 A program holds at most `max_insts` (1024) instructions, 4096 class ranges and 63 groups; groups
-and repetitions nest at most 1000 deep (Go's limits for repetition count and nesting). A pattern
-past one is `error.PatternTooLarge` / `error.NestingDepth` at compile time — never a truncated
-program. `isMatch`/`fullMatch` take ~6 KiB of stack.
+and repetitions nest at most `max_depth` (250) deep; a counted repetition is at most `{1000}` and
+nested counted repetitions multiply to at most 1000 (Go's rule). A pattern past one is
+`error.PatternTooLarge` / `error.NestingDepth` / `error.InvalidRepeatSize` at compile time — never
+a truncated program, never a compile that runs away. Go accepts larger programs and deeper
+nesting (the oracle's CAPACITY divergence). Compiling the deepest accepted pattern fits a
+512 KiB thread stack in Debug; `isMatch`/`fullMatch` take ~6 KiB of stack. A `Matcher` keeps a
+pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
 ## Verification
 
 - Go `regexp` as a differential oracle (`tools/go_regexp_oracle`, replayed by
-  `src/go_oracle_test.zig`): 791 patterns (crafted syntax edges + 600 random), 11,277 inputs —
+  `src/go_oracle_test.zig`): 827 patterns (crafted syntax edges + 600 random), 11,676 inputs —
   compile verdict, group names, match, full match, submatch indices, all matches.
 - A deterministic robustness driver: 20,000 random metacharacter-dense patterns and inputs
   (invalid UTF-8 included) compile or refuse, and the entry points agree, without a trap.

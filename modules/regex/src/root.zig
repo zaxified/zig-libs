@@ -39,6 +39,7 @@ pub const Error = syntax.Error;
 pub const max_insts = syntax.max_insts;
 pub const max_groups = syntax.max_groups;
 pub const max_repeat = syntax.max_repeat;
+pub const max_depth = syntax.max_depth;
 
 const Inst = syntax.Inst;
 const Range = syntax.Range;
@@ -134,7 +135,9 @@ pub const Regex = struct {
         return m.find(input, 0);
     }
 
-    fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+    /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
+    /// never by a caller's frame that inlined it.
+    noinline fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
         var lists: [2]StateSet = .{ .{}, .{} };
         var stack: [2 * max_insts]u16 = undefined;
         var cur: *StateSet = &lists[0];
@@ -328,14 +331,14 @@ pub const Matcher = struct {
     /// Leftmost-first match starting the search at `from` (the text before
     /// `from` still counts for `^`/`\b`), or null.
     pub fn find(m: *Matcher, input: []const u8, from: usize) ?Span {
-        if (!m.run(input, from, false)) return null;
+        if (from > input.len or !m.run(input, from, false)) return null;
         return .{ .start = m.best[0], .end = m.best[1] };
     }
 
     /// Like `find`, filling `out[i]` with group i's span (null: the group
     /// took no part); `out` may be shorter or longer than the group count.
     pub fn captures(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
-        if (!m.run(input, from, false)) return false;
+        if (from > input.len or !m.run(input, from, false)) return false;
         for (out, 0..) |*slot, i| {
             slot.* = if (2 * i + 1 < m.k and m.best[2 * i] != nil and m.best[2 * i + 1] != nil)
                 .{ .start = m.best[2 * i], .end = m.best[2 * i + 1] }
@@ -487,17 +490,14 @@ fn decode(input: []const u8, i: usize) Decoded {
     return .{ .cp = cp, .w = len };
 }
 
-/// The code point that ends just before `i`, or null at the start.
+/// What the assertions need of the text just before `i`: null at the start,
+/// the byte when it is ASCII, and U+FFFD for any non-ASCII code point — the
+/// assertions look only at ASCII (`\n` for `(?m)^`, ASCII word characters
+/// for `\b`, as RE2), so which non-ASCII code point it was never matters.
 fn runeBefore(input: []const u8, i: usize) ?u21 {
     if (i == 0) return null;
-    // A code point is at most four bytes: try each start, nearest first, and
-    // take the one whose decoding ends exactly at `i`.
-    var back: usize = 1;
-    while (back <= 4 and back <= i) : (back += 1) {
-        const d = decode(input, i - back);
-        if (i - back + d.w == i and (back == 1 or d.cp != 0xfffd)) return d.cp;
-    }
-    return 0xfffd;
+    const c = input[i - 1];
+    return if (c < 0x80) c else 0xfffd;
 }
 
 fn isWord(cp: ?u21) bool {
@@ -699,4 +699,29 @@ test "robustness: random patterns and inputs compile or refuse, and match, witho
         }
     }
     try testing.expect(compiled > 2_000); // the driver reaches the matcher
+}
+
+test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {
+    const Run = struct {
+        fn go(out: *[2]?anyerror) void {
+            const deep = "(?:" ** (max_depth - 1) ++ "a*" ++ ")" ** (max_depth - 1);
+            const deeper = "(?:" ** (max_depth + 1) ++ "a" ++ ")" ** (max_depth + 1);
+            var b = std.heap.page_allocator.create(Builder) catch unreachable;
+            defer std.heap.page_allocator.destroy(b);
+            out[0] = if (b.compile(deep)) |_| null else |e| e;
+            out[1] = if (b.compile(deeper)) |_| null else |e| e;
+        }
+    };
+    var out: [2]?anyerror = .{ null, null };
+    const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Run.go, .{&out});
+    t.join();
+    try testing.expectEqual(@as(?anyerror, null), out[0]);
+    try testing.expectEqual(@as(?anyerror, error.NestingDepth), out[1]);
+}
+
+test "nested counted repetitions multiply, as Go limits them — no compile-time blow-up" {
+    try testing.expectError(error.InvalidRepeatSize, Regex.compile(testing.allocator, "(?:(?:(?:a{0}){1000}){1000}){1000}"));
+    try testing.expectError(error.InvalidRepeatSize, Regex.compile(testing.allocator, "(?:a{2}|b{600}){2}"));
+    var ok = try Regex.compile(testing.allocator, "(?:(?:a{0}){100}){10}");
+    ok.deinit(testing.allocator);
 }

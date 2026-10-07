@@ -22,8 +22,11 @@ pub const max_nodes = 2048;
 pub const max_groups = 64;
 /// `{n,m}`: n, m ≤ 1000 (Go's documented limit).
 pub const max_repeat = 1000;
-/// Nesting of groups and repetitions (Go's documented limit).
-pub const max_depth = 1000;
+/// Nesting of groups and repetitions. Go goes deeper; 250 keeps the
+/// recursive parser and compiler within a 512 KiB thread stack even in a
+/// Debug build (a compile of untrusted patterns runs on whatever thread the
+/// caller has), and no real pattern nests this far.
+pub const max_depth = 250;
 
 pub const Error = error{
     /// A `\` escape this grammar does not define (`\8`, `\y`, a backreference).
@@ -102,6 +105,9 @@ const Node = struct {
     b: u32 = 0,
     /// literal: fold case. repeat: greedy.
     flag: bool = false,
+    /// repeat: written `{n}`, `{n,}` or `{n,m}` (counts toward the nested
+    /// repetition limit; `*`, `+` and `?` do not).
+    counted: bool = false,
     /// capture/repeat: the operand; concat/alternate: the first operand.
     child: u16 = none,
     /// The next operand of the enclosing concat/alternate.
@@ -216,15 +222,16 @@ pub const Builder = struct {
                 // Wrap the operand in place: it keeps its link in the list.
                 const inner = try b.node(b.nodes[operand]);
                 b.nodes[inner].next = none;
-                b.nodes[operand] = .{ .kind = .repeat, .a = rep.min, .b = rep.max, .flag = rep.greedy, .child = inner, .next = b.nodes[operand].next };
+                b.nodes[operand] = .{ .kind = .repeat, .a = rep.min, .b = rep.max, .flag = rep.greedy, .counted = rep.counted, .child = inner, .next = b.nodes[operand].next };
+                // Nested counted repetitions multiply: Go refuses a product
+                // past 1000, and that also bounds the compiler's work (an
+                // empty body emits nothing, so no capacity would stop it).
+                if (rep.counted and b.repeatSize(operand) > max_repeat) return error.InvalidRepeatSize;
                 repeated = true;
                 continue;
             }
-            const n = try b.parseAtom(flags, depth) orelse {
-                // A flag group `(?i)` is no operand: `(?i)*` repeats nothing.
-                operand = none;
-                continue;
-            };
+            // A flag group `(?i)` is transparent: `a(?i)*` repeats `a` (Go).
+            const n = try b.parseAtom(flags, depth) orelse continue;
             repeated = false;
             if (b.nodes[n].kind == .concat and b.nodes[n].flag) {
                 // `\Q...\E`: its literals join this concat one by one, so a
@@ -245,12 +252,33 @@ pub const Builder = struct {
         return cat;
     }
 
+    /// The repetition size Go limits: a counted repetition multiplies its
+    /// operand's size by its count (the max, or the min when unbounded; at
+    /// least 1); anything else is the largest size among its operands.
+    fn repeatSize(b: *const Builder, n: u16) u64 {
+        const nd = b.nodes[n];
+        var inner: u64 = 1;
+        switch (nd.kind) {
+            .capture, .repeat => inner = b.repeatSize(nd.child),
+            .concat, .alternate => {
+                var c = nd.child;
+                while (c != none) : (c = b.nodes[c].next) inner = @max(inner, b.repeatSize(c));
+            },
+            else => {},
+        }
+        if (nd.kind == .repeat and nd.counted) {
+            const count: u64 = if (nd.b == inf) nd.a else nd.b;
+            return @max(count, 1) * inner;
+        }
+        return inner;
+    }
+
     fn append(b: *Builder, cat: u16, last: u16, n: u16) u16 {
         if (last == none) b.nodes[cat].child = n else b.nodes[last].next = n;
         return n;
     }
 
-    const Rep = struct { min: u32, max: u32, greedy: bool };
+    const Rep = struct { min: u32, max: u32, greedy: bool, counted: bool = false };
 
     /// A repetition operator at `pos`, consumed; null (nothing consumed) for a
     /// `{` that does not start a valid `{n}`, `{n,}` or `{n,m}`.
@@ -280,7 +308,7 @@ pub const Builder = struct {
                 if (p >= b.src.len or b.src[p] != '}') return null;
                 b.pos = p + 1;
                 if (lo > max_repeat or (hi != null and (hi.? > max_repeat or hi.? < lo))) return error.InvalidRepeatSize;
-                r = .{ .min = lo, .max = hi orelse inf, .greedy = true };
+                r = .{ .min = lo, .max = hi orelse inf, .greedy = true, .counted = true };
             },
             else => unreachable,
         }
@@ -458,18 +486,23 @@ pub const Builder = struct {
             'x' => {
                 if (b.eof()) return error.InvalidEscape;
                 if (b.peek() == '{') {
+                    // Any number of hex digits (leading zeros too), at most U+10FFFF.
                     const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidEscape;
                     const digits = b.src[b.pos + 1 .. end];
-                    if (digits.len == 0 or digits.len > 8) return error.InvalidEscape;
-                    const v = std.fmt.parseInt(u32, digits, 16) catch return error.InvalidEscape;
-                    if (v > 0x10ffff) return error.InvalidEscape;
+                    if (digits.len == 0) return error.InvalidEscape;
+                    var v: u32 = 0;
+                    for (digits) |d| {
+                        v = v * 16 + (hexDigit(d) orelse return error.InvalidEscape);
+                        if (v > 0x10ffff) return error.InvalidEscape;
+                    }
                     b.pos = end + 1;
                     return .{ .rune = @intCast(v) };
                 }
                 if (b.pos + 2 > b.src.len) return error.InvalidEscape;
-                const v = std.fmt.parseInt(u8, b.src[b.pos..][0..2], 16) catch return error.InvalidEscape;
+                const hi = hexDigit(b.src[b.pos]) orelse return error.InvalidEscape;
+                const lo = hexDigit(b.src[b.pos + 1]) orelse return error.InvalidEscape;
                 b.pos += 2;
-                return .{ .rune = v };
+                return .{ .rune = @intCast(hi * 16 + lo) };
             },
             'd', 'D', 's', 'S', 'w', 'W' => {
                 const start = b.nranges;
@@ -502,8 +535,9 @@ pub const Builder = struct {
                 return .{ .quoted = text };
             },
             else => {
-                // Any ASCII punctuation, and space, escapes itself.
-                if (c < 0x80 and !std.ascii.isAlphanumeric(c) and c >= ' ' and c != 0x7f) return .{ .rune = c };
+                // Any ASCII byte that is not a letter or digit escapes itself
+                // (punctuation, space, control characters — as Go).
+                if (c < 0x80 and !std.ascii.isAlphanumeric(c)) return .{ .rune = c };
                 return error.InvalidEscape;
             },
         }
@@ -685,8 +719,9 @@ pub const Builder = struct {
             },
             .alternate => {
                 // split L1, next; L1: a; jmp end; next: split L2, next2; ...
-                var jumps: [max_insts]u16 = undefined;
-                var njumps: usize = 0;
+                // The pending `jmp end`s are chained through their own target
+                // field (no array in this recursive frame).
+                var chain: u16 = none;
                 var c = nd.child;
                 while (c != none) : (c = b.nodes[c].next) {
                     if (b.nodes[c].next == none) {
@@ -696,12 +731,16 @@ pub const Builder = struct {
                     const split = b.here();
                     try b.emit(.{ .split = .{ .x = split + 1, .y = none } });
                     try b.emitNode(c);
-                    jumps[njumps] = b.here();
-                    njumps += 1;
-                    try b.emit(.{ .jmp = none });
+                    const j = b.here();
+                    try b.emit(.{ .jmp = chain });
+                    chain = j;
                     b.insts[split].split.y = b.here();
                 }
-                for (jumps[0..njumps]) |j| b.insts[j] = .{ .jmp = b.here() };
+                while (chain != none) {
+                    const prev = b.insts[chain].jmp;
+                    b.insts[chain] = .{ .jmp = b.here() };
+                    chain = prev;
+                }
             },
             .repeat => try b.emitRepeat(nd),
         }
@@ -769,20 +808,33 @@ pub const Builder = struct {
             return;
         }
         // (max - min) optional copies, each skipping to the end: x{2,4} = xx(x(x)?)?
-        var splits: [max_insts]u16 = undefined;
-        var nsplits: usize = 0;
+        // The pending splits are chained through their `y` (no array in this
+        // recursive frame).
+        var chain: u16 = none;
         i = min;
         while (i < max) : (i += 1) {
-            if (nsplits == splits.len) return error.PatternTooLarge;
-            splits[nsplits] = b.here();
-            nsplits += 1;
-            try b.emit(.{ .split = .{ .x = none, .y = none } });
+            const sp = b.here();
+            try b.emit(.{ .split = .{ .x = none, .y = chain } });
+            chain = sp;
             try b.emitNode(nd.child);
         }
         const out = b.here();
-        for (splits[0..nsplits]) |s| b.insts[s] = .{ .split = if (greedy) .{ .x = s + 1, .y = out } else .{ .x = out, .y = s + 1 } };
+        while (chain != none) {
+            const prev = b.insts[chain].split.y;
+            b.insts[chain] = .{ .split = if (greedy) .{ .x = chain + 1, .y = out } else .{ .x = out, .y = chain + 1 } };
+            chain = prev;
+        }
     }
 };
+
+fn hexDigit(c: u8) ?u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
 
 fn overlap(r: Range, lo: u21, hi: u21) ?Range {
     const a = @max(r.lo, lo);

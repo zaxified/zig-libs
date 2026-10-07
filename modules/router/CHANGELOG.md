@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **BEHAVIOURAL, not breaking** (review fixes): a fallback (404/405/auto-OPTIONS/
+  redirect) now picks its group by comparing the prefix segment by segment — a group or mount
+  prefix with a capture (`/t/:id`, `/t/{tenant}`) scopes its fallbacks, which it never did — and
+  on a tie the more deeply nested, then the later group wins (`api.mount("/", &sub)` runs `sub`'s
+  middleware on `/api`'s fallbacks; before, a redirect skipped it). `add` refuses a pattern deeper
+  than `max_path_segments`; `HostRouter` cuts only a numeric port and ignores a Host with junk
+  after `]`. Scope `core` → `parity` with go-chi/chi.
+- **2026-10-07** — Tests: mutation schemata run over the chi-parity code (35 mutants, 33 killed,
+  2 equivalent); five tests added. No behaviour change.
 - **2026-10-07** — Regexp constraints, chi's `{id:[0-9]+}`: the whole capture must match the
   regexp (RE2 syntax, new dependency `regex`; compiled at `add`, at comptime for `Static`);
   a constrained pattern is tried before an unconstrained sibling of equal rank; a bad regexp is

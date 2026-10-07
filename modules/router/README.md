@@ -246,6 +246,10 @@ regexp that does not compile is `error.InvalidConstraint`. Braces inside a const
 - `r.any(pattern, h)` registers `h` for every method (chi's `Handle`).
 - `group.not_found` / `group.method_not_allowed` override the router's fallbacks for paths under
   the group (the deepest group with an override wins), behind the group's chain.
+- Which group a fallback belongs to: its prefix is compared segment by segment (a capture in it,
+  `/t/{tenant}`, takes any non-empty segment); the group covering the most segments wins, ties
+  going to the more deeply nested group, then the later one — so `api.mount("/", &sub)` answers
+  `/api`'s fallbacks with `sub`'s middleware and overrides.
 
 ## Host routing (`HostRouter`)
 

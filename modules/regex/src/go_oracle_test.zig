@@ -10,6 +10,11 @@
 //! Listed divergences, each counted and pinned so a drift either way shows:
 //!  - UNICODE_CLASS: `\pL`, `\p{Greek}`, `\PL` compile in Go; here
 //!    `error.UnsupportedUnicodeClass` (SPEC Backlog).
+//!  - CAPACITY: a pattern whose program needs more than `max_insts` (1024)
+//!    instructions, or that nests deeper than `max_depth` (250), compiles in
+//!    Go; here `error.PatternTooLarge` / `error.NestingDepth` — the price of
+//!    matching in fixed stack scratch with no allocator, and of a recursive
+//!    parser that fits a small thread stack.
 
 const std = @import("std");
 const testing = std.testing;
@@ -20,7 +25,7 @@ fn unicodeClass(pattern: []const u8) bool {
     return std.mem.indexOf(u8, pattern, "\\p") != null or std.mem.indexOf(u8, pattern, "\\P") != null;
 }
 
-const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, unicode_class: usize = 0, bad: usize = 0 };
+const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, unicode_class: usize = 0, capacity: usize = 0, bad: usize = 0 };
 
 fn replay(set: []const v.Pattern, t: *Tally) !void {
     for (set) |p| {
@@ -28,6 +33,8 @@ fn replay(set: []const v.Pattern, t: *Tally) !void {
         var re = regex.Regex.compile(testing.allocator, p.pattern) catch |e| {
             if (p.ok and unicodeClass(p.pattern) and e == error.UnsupportedUnicodeClass) {
                 t.unicode_class += 1;
+            } else if (p.ok and (e == error.PatternTooLarge or e == error.NestingDepth)) {
+                t.capacity += 1;
             } else if (p.ok) {
                 t.bad += 1;
                 std.debug.print("/{s}/: Go compiles it, here {t}\n", .{ p.pattern, e });
@@ -90,7 +97,8 @@ test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     var t: Tally = .{};
     try replay(&v.crafted, &t);
     try replay(&v.random, &t);
-    std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.bad });
+    std.debug.print("go oracle: {d} patterns, {d} cases ({d} matched), UNICODE_CLASS {d}, CAPACITY {d}, unexplained {d}\n", .{ t.patterns, t.cases, t.matched, t.unicode_class, t.capacity, t.bad });
     try testing.expectEqual(@as(usize, 0), t.bad);
     try testing.expectEqual(@as(usize, 3), t.unicode_class);
+    try testing.expectEqual(@as(usize, 4), t.capacity);
 }
