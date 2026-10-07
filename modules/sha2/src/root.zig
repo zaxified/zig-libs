@@ -496,6 +496,7 @@ const testing = std.testing;
 
 test {
     _ = @import("bench.zig");
+    _ = @import("count.zig");
 }
 
 fn unhex(comptime n: usize, hex: []const u8) [n]u8 {

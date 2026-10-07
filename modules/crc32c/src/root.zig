@@ -526,3 +526,7 @@ test "the shift tables are the zero-byte operator they claim to be" {
         try testing.expectEqual(tableUpdate(r, zeros[0..short_block]), shift(&shift_short, r));
     }
 }
+
+test {
+    _ = @import("count.zig");
+}

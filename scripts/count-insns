@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Hold a module's instruction counts per operation to a committed baseline (pilot).
+
+    hw run -- scripts/count-insns sha2              # compare with modules/sha2/tools/count.tsv
+    hw run -- scripts/count-insns sha2 --rewrite    # measure and write the baseline anew
+
+Why counts: a timed benchmark needs a quiet machine, and neither this desktop
+(shared by several sessions) nor a CI runner is one. The number of instructions
+a case executes does not move with the load beside it, so it can be compared
+across sittings and machines. What it cannot see: cache misses, mispredicts,
+the kernel, and any code path the build did not pin -- a timed run on a quiet
+machine still judges those.
+
+How: the module's tests are built once (`zig test modules/<m>/src/root.zig`,
+ReleaseFast, `-mcpu=x86_64_v3` so a CPU-dispatched path is fixed and valgrind,
+which hides AVX-512, takes the same one) with `--test-filter "count ("`, so
+only the module's `src/count.zig` test runs. For each case it runs under
+`valgrind --tool=cachegrind --cache-sim=no` with `ZIGLIBS_COUNT=<case>=<n>`
+twice at n = R and once at n = 2R. The cost of R rounds is
+I(2R) - I(R): process start, the test runner and the case's setup are paid
+equally in both and cancel. The two R runs must agree to within a quarter of
+the threshold, or the case is unstable (it does not do the same work every
+run) and fails. The standard method of call-count benchmarking (iai-callgrind
+in Rust); pepegrillo's `instructions` tool is another instance.
+
+Baseline `modules/<m>/tools/count.tsv`: comment lines name zig, valgrind and
+the cpu flag; a baseline taken under another zig or valgrind is not compared
+(exit 2: nothing could be judged). Rows: case, rounds, instructions per round.
+A case fails when it moved by more than THRESHOLD in EITHER direction: a gain
+is written into the baseline in a commit that says why.
+
+Exit: 0 every case within the threshold, 1 a case moved or is unstable,
+2 nothing could be judged (no valgrind, a build failure, a stale baseline).
+"""
+import os
+import re
+import subprocess
+import sys
+
+THRESHOLD = 0.02
+CPU = "x86_64_v3"
+
+
+def die(msg, code=2):
+    print(f"count-insns: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def tool_versions():
+    zig = subprocess.run(["zig", "version"], capture_output=True, text=True).stdout.strip()
+    vg = subprocess.run(["valgrind", "--version"], capture_output=True, text=True).stdout.strip()
+    return zig, vg
+
+
+def build(module, out):
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    r = subprocess.run(["zig", "test", f"modules/{module}/src/root.zig", "-OReleaseFast", f"-mcpu={CPU}",
+                        "--test-filter", "count (", f"-femit-bin={out}", "--test-no-exec",
+                        "--cache-dir", ".zig-cache"], capture_output=True, text=True)
+    if r.returncode:
+        die(f"build of {module} failed:\n{r.stderr[-2000:]}")
+
+
+def count(binary, case, rounds):
+    env = dict(os.environ, ZIGLIBS_COUNT=f"{case}={rounds}")
+    r = subprocess.run(["valgrind", "--tool=cachegrind", "--cache-sim=no", "--cachegrind-out-file=/dev/null",
+                        binary], capture_output=True, text=True, env=env)
+    if r.returncode:
+        die(f"{case} x{rounds} failed under valgrind:\n{r.stderr[-2000:]}")
+    m = re.search(r"I\s+refs:\s+([\d,]+)", r.stderr)
+    if not m:
+        die(f"no 'I refs' line for {case}:\n{r.stderr[-1000:]}")
+    if "1 skipped" in r.stderr or "SKIP" in r.stderr:
+        die(f"{case}: the count test was skipped -- ZIGLIBS_COUNT did not reach it")
+    return int(m.group(1).replace(",", ""))
+
+
+def per_round(binary, case, rounds):
+    a = count(binary, case, rounds)
+    b = count(binary, case, rounds)
+    c = count(binary, case, 2 * rounds)
+    cost = (c - a) / rounds
+    unstable = abs(a - b) > THRESHOLD / 4 * cost * rounds
+    return cost, unstable, (a, b, c)
+
+
+def read_baseline(path):
+    meta, rows = {}, []
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                k, _, v = line[1:].strip().partition(":")
+                meta[k.strip()] = v.strip()
+            elif line.strip():
+                case, rounds, cost = line.split("\t")
+                rows.append((case, int(rounds), float(cost)))
+    return meta, rows
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0].startswith("-"):
+        die(__doc__.split("\n\n")[1])
+    module, rewrite = args[0], "--rewrite" in args[1:]
+    path = f"modules/{module}/tools/count.tsv"
+    if not os.path.exists(path):
+        die(f"{path} missing: it names the cases and their rounds")
+    meta, rows = read_baseline(path)
+    zig, vg = tool_versions()
+    if not rewrite and (meta.get("zig") != zig or meta.get("valgrind") != vg or meta.get("cpu") != CPU):
+        die(f"baseline taken under zig {meta.get('zig')}, {meta.get('valgrind')}, cpu {meta.get('cpu')}; "
+            f"this is zig {zig}, {vg}, cpu {CPU}: rewrite it (--rewrite) in a commit of its own")
+    binary = f".zig-cache/count/{module}"
+    build(module, binary)
+
+    moved, out = 0, []
+    for case, rounds, base in rows:
+        cost, unstable, raw = per_round(binary, case, rounds)
+        delta = (cost - base) / base if base else float("inf")
+        if unstable:
+            verdict = f"UNSTABLE: two runs of {rounds} rounds counted {raw[0]} and {raw[1]}"
+            moved += 1
+        elif rewrite:
+            verdict = "written"
+        elif abs(delta) > THRESHOLD:
+            verdict = f"MOVED {delta:+.2%} (threshold {THRESHOLD:.0%})"
+            moved += 1
+        else:
+            verdict = f"ok {delta:+.2%}"
+        print(f"{module} {case}: {cost:.1f} instructions per round (baseline {base:.1f}) -- {verdict}")
+        out.append((case, rounds, cost))
+
+    if rewrite and not moved:
+        with open(path, "w") as f:
+            f.write(f"# zig: {zig}\n# valgrind: {vg}\n# cpu: {CPU}\n")
+            f.write("# case\trounds\tinstructions per round (scripts/count-insns)\n")
+            for case, rounds, cost in out:
+                f.write(f"{case}\t{rounds}\t{cost:.1f}\n")
+    sys.exit(1 if moved else 0)
+
+
+if __name__ == "__main__":
+    main()

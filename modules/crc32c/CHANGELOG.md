@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Tests only (pilot): instruction-count cases in `src/count.zig`, skipped unless
+  `ZIGLIBS_COUNT` names one, held by `scripts/count-insns crc32c` to `tools/count.tsv` (instructions per
+  round under cachegrind, ReleaseFast, `-mcpu=x86_64_v3`): `crc32c-4KiB` 2 139.
+
 - **2026-10-04** — Tests: `combine` is now held to Go's `hash/crc32` (Castagnoli) at lengths
   around 2^28 … 2^33 and past 5·10^9 bytes, for three prefixes (`tools/gen_kat.go` →
   `src/kat_vectors.zig`); the test fails with the `len_b ≥ 2^29` defect put back. Anchor
