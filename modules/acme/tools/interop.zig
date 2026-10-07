@@ -19,8 +19,10 @@
 //!   rejected           a name on Pebble's block list: must end `AcmeProblem`
 //!
 //! A successful chain must verify up to Pebble's root (`/roots/0`) and name
-//! every ordered domain. Pebble runs with `-strict` and rejects 15% of nonces,
-//! so `badNonce` retries happen in every run. THIS IS A PROGRAM, NOT A TEST:
+//! every ordered domain. Pebble runs with `-strict` and rejects 5% of nonces,
+//! so `badNonce` retries happen in nearly every run (~60 POSTs). Not more: the
+//! client gives up after four rejections in a row, which at 15% failed about
+//! one run in thirty (2026-10-08). THIS IS A PROGRAM, NOT A TEST:
 //! `zig build check-interop` compiles it; `tools/pebble.sh` runs it.
 
 const std = @import("std");

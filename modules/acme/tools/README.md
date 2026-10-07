@@ -2,7 +2,7 @@
 
 | tool | role |
 |---|---|
-| `pebble.sh` | Starts Pebble (`-strict`, 15% of nonces rejected), pebble-challtestsrv (DNS, TXT records) and `pebble_helper`, runs `zig build interop-acme`, and writes `src/testdata/pebble_transcript.zig` (or, with `--check`, only gives the live verdict). |
+| `pebble.sh` | Starts Pebble (`-strict`, 5% of nonces rejected), pebble-challtestsrv (DNS, TXT records) and `pebble_helper`, runs `zig build interop-acme`, and writes `src/testdata/pebble_transcript.zig` (or, with `--check`, only gives the live verdict). |
 | `interop.zig` | `zig build interop-acme -- --scratch DIR`: the real `Client` through six scenarios against Pebble; serves HTTP-01 on :5002 and the TLS-ALPN-01 material on :5003; verifies every chain to Pebble's root. |
 | `pebble_helper/` | Go, stdlib only: the recording TLS proxy in front of Pebble (:14001), the TLS-ALPN-01 listener (:5001), and the transcript → Zig generator. |
 

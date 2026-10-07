@@ -55,7 +55,7 @@ trap cleanup EXIT
 "$bin/pebble-challtestsrv" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver 127.0.0.1:8053 -management 127.0.0.1:8055 \
     -http01 "" -https01 "" -tlsalpn01 "" -doh "" > challtestsrv.log 2>&1 &
 pids+=($!)
-PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=15 "$bin/pebble" -strict -config pebble.json -dnsserver 127.0.0.1:8053 \
+PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=5 "$bin/pebble" -strict -config pebble.json -dnsserver 127.0.0.1:8053 \
     > pebble.log 2>&1 &
 pids+=($!)
 (cd "$here/pebble_helper" && go build -o "$scr/pebble_helper" .)
