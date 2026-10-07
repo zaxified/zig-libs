@@ -376,7 +376,7 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
-**`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
+**`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — DONE 2026-10-07 (`GOTOOLCHAIN=go1.26.0` in the environment `tools/interop.zig` hands the Go oracle; h2spec v2.2.1 and the SSE venv installed by ci-environment's interop role; the CI interop lane re-took all three phases green, probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
 
 - **From the Go oracle (2026-10-05), judged but open** — each is a recorded divergence in
   `src/go_oracle.zig`, kept because the current answer is legal; listed here so a later decision

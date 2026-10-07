@@ -23,7 +23,10 @@
 #              by any test: a C compiler and wolfSSL headers (dtls), and
 #              jinja2 / sympy / brotli / protobuf, a grpcio venv and an
 #              asyncua venv (the Python-driven ones; `signal` needs only
-#              python3, `dns` no peer at all).
+#              python3, `dns` no peer at all). Since 2026-10-07 also the
+#              peers of the thirteen formerly local-only programs (netns
+#              tools, mosquitto, FastAPI, h2spec, chronyd, rsyslog, bun) and
+#              the userns sysctl it shares with `tests`.
 #   all      — both, for a machine that will do both.
 #
 # ⛔ THE `interop` HALF IS NOT DELETABLE, and that is the whole reason it is a
@@ -80,7 +83,12 @@ echo "ci-environment: role=$ROLE"
 export DEBIAN_FRONTEND=noninteractive
 APT_QUIET=(-y -qq -o Dpkg::Use-Pty=0)
 
-if want tests; then
+# ⚠ BOTH ROLES, not only `tests` (2026-10-07). The netns-backed interop
+# programs (nftables, rawsock, wireguard, pathmtu, traceroute, sntp, syslog)
+# enter `unshare -rn` themselves; on the interop lane this block used to be
+# skipped, the capability report said "unshare -rn unavailable", and those seven
+# oracles could only ever run on a developer machine.
+if want tests || want interop; then
 echo "::group::userns"
 # Ubuntu restricts unprivileged user namespaces via AppArmor (24.04 and 26.04
 # alike), which is what makes `unshare -rn` fail on a stock runner. Without it
@@ -99,6 +107,9 @@ echo 'net.ipv4.ping_group_range=0 2147483647' \
 sudo sysctl --system >/dev/null 2>&1 || true
 echo "ping_group_range: $(cat /proc/sys/net/ipv4/ping_group_range 2>/dev/null || echo unknown)"
 echo "::endgroup::"
+fi
+
+if want tests; then
 
 echo "::group::yaml conformance suite"
 # yaml/yaml-test-suite is the LANGUAGE's own conformance corpus, written by
@@ -238,6 +249,91 @@ GOBIN="$HOME/.local/share/zig-libs/oracle-bin/pebble" \
     go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1 \
     github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1 >/dev/null 2>&1 \
     && echo "pebble: v2.10.1" || echo "pebble: install failed"
+echo "::endgroup::"
+
+# ⭐ THE FORMERLY LOCAL-ONLY ORACLES (2026-10-07). Until this day thirteen
+# interop programs ran on developer machines only (`local_only` in
+# scripts/test.sh cmd_interop). Each group below installs one program's peers
+# at the path that program looks in; a module leaves `local_only` once its
+# program is green on this lane. Versions are the ones the committed vectors
+# were taken with — a moved oracle must be a deliberate bump.
+echo "::group::interop: netns peers (nftables rawsock wireguard pathmtu traceroute)"
+sudo apt-get install "${APT_QUIET[@]}" iproute2 nftables iputils-ping iputils-tracepath traceroute >/dev/null 2>&1 \
+    && echo "ip/nft/ping/tracepath/traceroute: OK" || echo "netns tools: install failed"
+# Loaded here because root inside an unprivileged user namespace cannot
+# autoload a module: `ip link add type wireguard` there fails if it is absent.
+for km in veth wireguard nf_tables; do
+    sudo modprobe "$km" 2>/dev/null && echo "module $km: OK" || echo "module $km: not loadable"
+done
+echo "::endgroup::"
+
+echo "::group::interop: mqtt (mosquitto container + paho)"
+# Pulled here, not by `podman run`: tools/interop.zig bounds every podman call,
+# and a first pull from docker.io is the slow one. The venv path is the fixed,
+# repo-relative one the program uses (this script runs from the checkout).
+podman pull -q docker.io/library/eclipse-mosquitto:2 >/dev/null 2>&1 \
+    && echo "mosquitto image: OK" || echo "mosquitto image: pull failed"
+python3 -m venv .zig-cache/mqtt-interop/venv >/dev/null 2>&1 || true
+.zig-cache/mqtt-interop/venv/bin/pip -q install "paho-mqtt==2.1.0" >/dev/null 2>&1 \
+    && echo "paho venv: OK" || echo "paho venv: install failed"
+echo "::endgroup::"
+
+ORACLE_VENVS="$HOME/.local/share/zig-libs/oracle-venvs"
+echo "::group::interop: openapi (openapi-spec-validator + FastAPI)"
+# The validator is imported by the SYSTEM python3 (tools/spec_oracle.py), so it
+# goes there — in a pip call of its own: a failed transaction must not take the
+# python-oracle set above down with it (the asyncua lesson, 2026-09-18).
+sudo pip3 install --break-system-packages -q --root-user-action=ignore \
+    "openapi-spec-validator==0.7.1" >/dev/null 2>&1 \
+    && echo "openapi-spec-validator: 0.7.1" || echo "openapi-spec-validator: install failed"
+python3 -m venv "$ORACLE_VENVS/fastapi" >/dev/null 2>&1 || true
+"$ORACLE_VENVS/fastapi/bin/pip" -q install "fastapi==0.142.2" >/dev/null 2>&1 \
+    && echo "fastapi venv: 0.142.2" || echo "fastapi venv: install failed"
+echo "::endgroup::"
+
+echo "::group::interop: http (h2spec, SSE venv, Go 1.26.0)"
+# h2spec is found on PATH only; v2.2.1 is the build the vectors were taken with.
+GOBIN="$HOME/.local/share/zig-libs/oracle-bin/h2spec" \
+    go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1+incompatible >/dev/null 2>&1 \
+    && sudo ln -sf "$HOME/.local/share/zig-libs/oracle-bin/h2spec/h2spec" /usr/local/bin/h2spec \
+    && echo "h2spec: v2.2.1" || echo "h2spec: install failed"
+python3 -m venv "$ORACLE_VENVS/http" >/dev/null 2>&1 || true
+"$ORACLE_VENVS/http/bin/pip" -q install "sseclient-py==1.9.0" "httpx==0.28.1" "httpx-sse==0.4.3" >/dev/null 2>&1 \
+    && echo "http venv: OK" || echo "http venv: install failed"
+echo "::endgroup::"
+
+echo "::group::interop: sntp (chronyd copy, ntplib, Go module cache)"
+# chronyd runs from a COPY at the path tools/ntp_oracle.py looks in, so a
+# distribution AppArmor profile attached by path cannot confine it; the
+# package's own service is stopped — it is installed for the binary and its
+# libraries, not to discipline the runner's clock.
+sudo apt-get install "${APT_QUIET[@]}" chrony >/dev/null 2>&1 \
+    && sudo systemctl disable --now chrony >/dev/null 2>&1; true
+CHRONY_DIR="$HOME/.local/share/zig-libs/oracle-bin/chrony/usr/sbin"
+mkdir -p "$CHRONY_DIR" && cp /usr/sbin/chronyd "$CHRONY_DIR/" 2>/dev/null \
+    && echo "chronyd: $("$CHRONY_DIR/chronyd" -v 2>&1 | head -1)" || echo "chronyd: install failed"
+python3 -m venv "$ORACLE_VENVS/ntplib" >/dev/null 2>&1 || true
+"$ORACLE_VENVS/ntplib/bin/pip" -q install "ntplib==0.4.0" >/dev/null 2>&1 \
+    && echo "ntplib venv: 0.4.0" || echo "ntplib venv: install failed"
+# The oracle builds with GOPROXY=off (no network at gate time), so the module
+# cache — beevik/ntp and the pinned go1.26.0 toolchain itself — is filled here.
+(cd modules/sntp/tools/go_oracle && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
+    && echo "sntp go modules: OK" || echo "sntp go modules: download failed"
+echo "::endgroup::"
+
+echo "::group::interop: syslog (rsyslogd)"
+# Installed for /usr/sbin/rsyslogd and its plugins; tools/rsyslog_oracle.py
+# runs a copy, unconfined, inside `unshare -rn`. journald comes with systemd.
+sudo apt-get install "${APT_QUIET[@]}" rsyslog >/dev/null 2>&1 \
+    && echo "rsyslogd: $(/usr/sbin/rsyslogd -v 2>/dev/null | head -1)" || echo "rsyslog: install failed"
+echo "::endgroup::"
+
+echo "::group::interop: browser oracles (cors security-headers: bun + Chrome)"
+# bun lands in ~/.bun/bin, where tools/interop.zig looks after PATH. Chrome is
+# found on PATH; the hosted image ships google-chrome.
+curl -fsSL https://bun.sh/install 2>/dev/null | bash -s "bun-v1.3.12" >/dev/null 2>&1 \
+    && echo "bun: $("$HOME/.bun/bin/bun" --version)" || echo "bun: install failed"
+command -v google-chrome >/dev/null 2>&1 && echo "chrome: $(google-chrome --version)" || echo "chrome: MISSING"
 echo "::endgroup::"
 fi
 

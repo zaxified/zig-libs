@@ -230,7 +230,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     std.Io.Dir.cwd().createDirPath(io, scratch) catch {};
 
-    const env = try init.environ.createMap(arena);
+    var env = try init.environ.createMap(arena);
+    // The Go oracle is compared byte for byte, so its version is part of the
+    // claim: the committed vectors were taken with go1.26.0 and a runner's own
+    // Go drifts (tar/zipstream, interop lane 2026-10-07). `go` fetches the
+    // pinned toolchain when the installed one differs.
+    try env.put("GOTOOLCHAIN", "go1.26.0");
     if (phase == .problem) return if (try oracles.problemPhase(io, gpa, arena, &env, write)) 0 else 1;
     if (phase == .sse) return if (try oracles.ssePhase(io, gpa, arena, &env, write)) 0 else 1;
     const go_ok = phase == .h2spec or try checkGoOracle(io, arena, &env);

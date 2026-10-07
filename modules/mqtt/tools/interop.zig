@@ -75,10 +75,43 @@ fn appendHex(gpa: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8)
     for (bytes) |b| try out.appendSlice(gpa, &.{ digits[b >> 4], digits[b & 15] });
 }
 
+/// The container a watchdog exit must not leave behind (a podman id is 64
+/// hex digits); empty while none runs.
+var live_id_buf: [80]u8 = undefined;
+var live_id_len: std.atomic.Value(usize) = .init(0);
+
+/// ⚠ A plain OS thread and a raw `exit_group`, not an `io.concurrent` task and
+/// `std.process.exit`: on the CI runner (2026-10-07) the program sat 22
+/// minutes with no output although the `io.concurrent` watchdog had a 120 s
+/// budget, and nothing in the source explains it. A thread that only sleeps
+/// and then ends the process cannot be held up by anything the `Io` does.
 fn watchdog(io: std.Io) void {
-    io.sleep(.fromSeconds(120), .awake) catch return;
-    std.debug.print("FAIL: interop-mqtt took over 120 s — a peer stopped answering\n", .{});
-    std.process.exit(3);
+    var ts: std.os.linux.timespec = .{ .sec = budget_s, .nsec = 0 };
+    while (std.os.linux.errno(std.os.linux.nanosleep(&ts, &ts)) == .INTR) {}
+    std.debug.print("FAIL: interop-mqtt took over {d} s — a peer stopped answering (last step: {s})\n", .{ budget_s, step_name.load(.acquire).* });
+    const n = live_id_len.load(.acquire);
+    if (n != 0) {
+        // Bounded: a hung podman must not hold the exit either.
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "podman", "rm", "-f", "-t", "0", live_id_buf[0..n] },
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } },
+        })) |r| {
+            std.heap.page_allocator.free(r.stdout);
+            std.heap.page_allocator.free(r.stderr);
+        } else |_| std.debug.print("interop-mqtt: could not remove container {s}\n", .{live_id_buf[0..n]});
+    }
+    std.os.linux.exit_group(3);
+}
+
+const budget_s = 180;
+var step_name: std.atomic.Value(*const []const u8) = .init(&step_names[0]);
+const step_names = [_][]const u8{ "start", "preflight", "image pull", "podman run", "mosquitto ready", "client vs mosquitto", "paho vs broker" };
+
+/// Names the step the watchdog reports, and prints it: a CI log that ends
+/// mid-run must say where.
+fn step(i: usize) void {
+    step_name.store(&step_names[i], .release);
+    std.debug.print("interop-mqtt: step {s}\n", .{step_names[i]});
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -101,8 +134,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             return 2;
         }
     }
-    var dog = try io.concurrent(watchdog, .{io});
-    defer dog.cancel(io);
+    const dog = try std.Thread.spawn(.{}, watchdog, .{io});
+    dog.detach();
+    step(1);
+    try preflight(io);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -127,8 +162,25 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
 // ── our Client against a real mosquitto ────────────────────────────────────
 
+/// Every peer the program needs, refused by name before anything starts: a
+/// missing one must fail in a second, with the command that installs it.
+fn preflight(io: std.Io) !void {
+    std.Io.Dir.cwd().access(io, python, .{}) catch {
+        std.debug.print("interop-mqtt: no paho venv at {s} — python3 -m venv .zig-cache/mqtt-interop/venv && .zig-cache/mqtt-interop/venv/bin/pip install paho-mqtt==2.1.0\n", .{python});
+        return error.PahoVenvMissing;
+    };
+}
+
+/// A child that stays silent for this long is treated as hung. `std.process.run`
+/// applies the timeout to each read, so it bounds silence, not the total; the
+/// watchdog bounds the total.
+const peer_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } };
+
 fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
-    const r = try std.process.run(gpa, io, .{ .argv = argv });
+    const r = std.process.run(gpa, io, .{ .argv = argv, .timeout = peer_timeout }) catch |e| {
+        std.debug.print("`{s} {s}`: {s}\n", .{ argv[0], if (argv.len > 1) argv[1] else "", @errorName(e) });
+        return e;
+    };
     defer gpa.free(r.stderr);
     switch (r.term) {
         .exited => |code| if (code == 0) return r.stdout,
@@ -159,9 +211,21 @@ const Mosquitto = struct {
         const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
         const cmd = try std.fmt.allocPrint(gpa, "cp /usr/sbin/mosquitto /tmp/mosquitto && exec /tmp/mosquitto -p {s}", .{port_str});
         defer gpa.free(cmd);
+        // The pull is its own step: on a fresh runner `podman run` would pull
+        // first, silently, inside a call whose stdout is the container id.
+        step(2);
+        if (run(gpa, io, &.{ "podman", "image", "exists", image })) |o| gpa.free(o) else |_| {
+            const o = try run(gpa, io, &.{ "podman", "pull", "-q", image });
+            gpa.free(o);
+        }
+        step(3);
         const raw_id = try run(gpa, io, &.{ "podman", "run", "-d", "--rm", "--network", "host", image, "sh", "-c", cmd });
         defer gpa.free(raw_id);
         const id = try gpa.dupe(u8, std.mem.trim(u8, raw_id, " \n"));
+        if (id.len <= live_id_buf.len) {
+            @memcpy(live_id_buf[0..id.len], id);
+            live_id_len.store(id.len, .release);
+        }
         errdefer {
             kill(gpa, io, id);
             gpa.free(id);
@@ -172,6 +236,7 @@ const Mosquitto = struct {
         const version = try gpa.dupe(u8, first);
         errdefer gpa.free(version);
         const m = Mosquitto{ .id = id, .port = port, .version = version };
+        step(4);
         try m.waitReady(io);
         return m;
     }
@@ -218,7 +283,8 @@ const Mosquitto = struct {
     /// Removed outright: mosquitto ignores SIGTERM for a while, and `--rm`
     /// would leave the removal to conmon, which `hw run` reaps with the job.
     fn kill(gpa: std.mem.Allocator, io: std.Io, id: []const u8) void {
-        const r = std.process.run(gpa, io, .{ .argv = &.{ "podman", "rm", "-f", "-t", "0", id } }) catch return;
+        live_id_len.store(0, .release);
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "podman", "rm", "-f", "-t", "0", id }, .timeout = peer_timeout }) catch return;
         gpa.free(r.stdout);
         gpa.free(r.stderr);
     }
@@ -311,6 +377,7 @@ fn expectMessageProps(gpa: std.mem.Allocator, m: mqtt.Message, topic: []const u8
 fn clientVsMosquitto(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !void {
     var mq = try Mosquitto.start(gpa, io);
     defer mq.stop(gpa, io);
+    step(5);
     std.debug.print("interop-mqtt: our Client vs {s} on port {d}\n", .{ mq.version, mq.port });
     try out.print(gpa, "peer {s}\ncase client\n", .{mq.version});
 
@@ -544,7 +611,8 @@ fn pahoVsBroker(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !vo
     var port_buf: [8]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
     std.debug.print("interop-mqtt: paho-mqtt vs our Broker on port {d}\n", .{port});
-    const r = try std.process.run(gpa, io, .{ .argv = &.{ python, paho_script, "127.0.0.1", port_str } });
+    step(6);
+    const r = try std.process.run(gpa, io, .{ .argv = &.{ python, paho_script, "127.0.0.1", port_str }, .timeout = peer_timeout });
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
 

@@ -1929,21 +1929,12 @@ cmd_interop() {
     # rest. Their transcripts are still replayed hermetically by test-<m> in
     # every module lane. Moving one out of this list = installing its peer in
     # scripts/lib/ci-environment.sh's interop role and seeing it green there.
-    local -A local_only=(
-        [cors]="bun + a browser"
-        [security-headers]="bun + a browser"
-        [http]="h2spec + the oracle venv (~/.local/share/zig-libs/oracle-venvs/http)"
-        [mqtt]="podman + eclipse-mosquitto:2 + paho-mqtt"
-        [nftables]="nft in an unprivileged user+net namespace"
-        [rawsock]="ip in an unprivileged user+net namespace"
-        [wireguard]="ip/wg in an unprivileged user+net namespace"
-        [pathmtu]="unshare + ip + nft + tracepath"
-        [traceroute]="unshare + traceroute"
-        [sntp]="chronyd 4 + ntplib in unshare -rn"
-        [syslog]="rsyslogd run unconfined in unshare -rn"
-        [uci]="libuci's uci binary"
-        [openapi]="the FastAPI venv"
-    )
+    # ✅ EMPTY SINCE 2026-10-07 (same day): all thirteen (cors security-headers
+    # http mqtt nftables rawsock wireguard pathmtu traceroute sntp syslog uci
+    # openapi) went green on the interop lane once their peers were installed
+    # and the userns sysctl reached this role. The list stays as the place a
+    # future program whose peer the runner cannot have is named — `[m]="needs"`.
+    local -A local_only=()
     if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
         local kept=() skipped=()
         for m in "${progs[@]}"; do
@@ -1965,7 +1956,31 @@ cmd_interop() {
         # which lives in the venv OPCUA_PYTHON names (the module's live test
         # reads the same variable); without it the program uses `python3`.
         local prog_args=()
-        [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(-- --python "$OPCUA_PYTHON")
+        [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(--python "$OPCUA_PYTHON")
+        # ⭐ `--check` ON CI (2026-10-07): a program that has it compares the
+        # re-taken anchor with the committed one. Without it the run rewrites
+        # the committed vectors on the runner and only the peer's own verdict
+        # decides, so an oracle that moved — or a module that now answers
+        # differently — went green. Locally the default stays a re-take: the
+        # developer reads the diff.
+        # Detected by the argument PARSE (`eql(u8, a, "--check")`), not by the
+        # string: signal passes "--check" to its own Python driver and refuses
+        # it as an argument (probe run, 2026-10-07).
+        if [[ "${GITHUB_ACTIONS:-}" == true ]] && grep -qF -- '"--check")' "modules/$m/tools/interop.zig"; then
+            prog_args+=(--check)
+        fi
+        (( ${#prog_args[@]} )) && prog_args=(-- "${prog_args[@]}")
+        # nftables, rawsock and wireguard configure a network namespace of
+        # their own and refuse to start without euid 0 there (exit 2, "run it
+        # under `unshare -rn`"). `netns-run` does not fit: it maps the caller
+        # back to its own uid.
+        local wrap=()
+        case "$m" in nftables | rawsock | wireguard) wrap=(unshare -rn) ;; esac
+        # uci's oracle is libuci built from pinned source into .zig-cache; the
+        # recipe is idempotent, so a developer's existing build is reused.
+        if [[ "$m" == uci ]]; then
+            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-uci-oracle" timeout -k 10 600 modules/uci/tools/build-oracle.sh
+        fi
         # acme's program is a client of Pebble and cannot start it itself;
         # tools/pebble.sh brings Pebble up and runs `zig build interop-acme`.
         # `--check`: a live verdict, the committed transcript stays as it is.
@@ -1976,7 +1991,7 @@ cmd_interop() {
         # `timeout`: a program whose peer never answers must fail by name, not
         # hold the lane until the job is cancelled (interop-mqtt, 2026-10-07:
         # 22 minutes, and every program after it never ran).
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 ${wrap[@]+"${wrap[@]}"} zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
     done
     checks_end
     summary

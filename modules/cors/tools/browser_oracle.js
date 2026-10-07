@@ -18,6 +18,14 @@
 // same from run to run; a port in use is a failure.
 
 const fs = require("fs");
+// A hard bound on the whole run. A DevTools reply that never comes (Chrome
+// died after connecting) leaves a promise pending while the page servers keep
+// bun alive, so without this the run ends only at the lane's outer timeout.
+// `unref`: a run that finishes is not held up by the timer.
+setTimeout(() => {
+  console.error("browser oracle: no verdict in 180 s -- Chrome or a server stopped answering");
+  process.exit(3);
+}, 180_000).unref();
 const path = require("path");
 
 const args = process.argv.slice(2);

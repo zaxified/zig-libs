@@ -114,7 +114,7 @@ def zbytes(h):
 def judge(exe, out_path):
     go = os.path.join(os.path.dirname(os.path.abspath(out_path)), 'go_oracle')
     subprocess.run(['go', 'build', '-o', go, '.'], cwd=os.path.join(HERE, 'go_oracle'), check=True,
-                   env=dict(os.environ, GOPROXY='off', GOFLAGS='-mod=mod'))
+                   env=dict(os.environ, GOPROXY='off', GOFLAGS='-mod=mod', GOTOOLCHAIN='go1.26.0'))
     p = subprocess.run(['unshare', '-rn', sys.executable, os.path.abspath(__file__), 'inner', os.path.abspath(exe), go],
                        capture_output=True, text=True)
     sys.stderr.write(p.stderr)
