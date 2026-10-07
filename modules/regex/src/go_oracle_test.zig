@@ -110,6 +110,10 @@ fn replay(set: []const v.Pattern, mode: Mode, t: *Tally) !void {
             var out: [regex.max_groups]?regex.Span = undefined;
             const groups = out[0..re.names.len];
             if (!searches(&m, c.input, c.sub, c.all, groups)) ok = false;
+            if (!try readerAgrees(&re, &m, c, groups)) {
+                ok = false;
+                std.debug.print("  (Reader)\n", .{});
+            }
             if (p.api) {
                 t.api += 1;
                 if (!try apiAgrees(&re, &m, p, c)) ok = false;
@@ -201,6 +205,29 @@ fn apiAgrees(re: *const regex.Regex, m: *regex.Matcher, p: v.Pattern, c: v.Case)
         std.debug.print("/{s}/ on \"{f}\" FindAllSubmatchIndex differs from Go\n", .{ p.pattern, std.zig.fmtString(c.input) });
     }
     return ok;
+}
+
+/// `isMatchReader` and `capturesReader` (Go's MatchReader,
+/// FindReaderSubmatchIndex) against MatchString and FindStringSubmatchIndex,
+/// the text arriving one byte per read into a 4-byte buffer.
+fn readerAgrees(re: *const regex.Regex, m: *regex.Matcher, c: v.Case, groups: []?regex.Span) !bool {
+    var buf: [4]u8 = undefined;
+    var tr: std.testing.Reader = .init(&buf, &.{.{ .buffer = c.input }});
+    tr.artificial_limit = .limited(1);
+    if (try re.isMatchReader(&tr.interface) != c.match) return false;
+    var buf2: [4]u8 = undefined;
+    var tr2: std.testing.Reader = .init(&buf2, &.{.{ .buffer = c.input }});
+    tr2.artificial_limit = .limited(1);
+    const found = try m.capturesReader(&tr2.interface, groups);
+    if (found != (c.sub.len != 0)) return false;
+    if (found) for (groups, 0..) |g, i| {
+        const ws = c.sub[2 * i];
+        const we = c.sub[2 * i + 1];
+        if (g) |sp| {
+            if (ws != sp.start or we != sp.end) return false;
+        } else if (ws != -1) return false;
+    };
+    return true;
 }
 
 /// `Matcher.captures` against FindStringSubmatchIndex (`sub`) and the

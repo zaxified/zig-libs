@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Reading from a `std.Io.Reader` (Go's `MatchReader`, `FindReaderIndex`,
+  `FindReaderSubmatchIndex`): `Regex.isMatchReader`, `Matcher.findReader`,
+  `Matcher.capturesReader` — constant memory, no allocator, `error.ReadFailed` from a failing
+  reader. New public declarations only.
 - **2026-10-07** — Go's API on top of a search: `Regex.expand` (`$1`, `${name}`, `$$`),
   `Matcher.replaceAll` / `replaceAllLiteral` / `replaceAllFunc` (to a `std.Io.Writer`) and
   `Regex.replaceAll` / `replaceAllLiteral` (allocating), `Matcher.split` (`SplitIterator`) and

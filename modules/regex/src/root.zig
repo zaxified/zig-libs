@@ -230,9 +230,25 @@ pub const Regex = struct {
         return m.find(input, 0);
     }
 
+    /// Go's `MatchReader`: does the pattern match anywhere in what `r`
+    /// yields? Reads code point by code point, no further than it must (at
+    /// most three code points past the end of a match); no allocator,
+    /// constant memory. `r`'s buffer must hold at least 4 bytes (one UTF-8 sequence).
+    pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) error{ReadFailed}!bool {
+        var t: ReaderText = .init(r);
+        const found = re.runSetOn(&t, false);
+        if (t.failed) return error.ReadFailed;
+        return found;
+    }
+
+    fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+        var t: SliceText = .{ .input = input };
+        return re.runSetOn(&t, full);
+    }
+
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
     /// never by a caller's frame that inlined it.
-    noinline fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+    noinline fn runSetOn(re: *const Regex, text: anytype, full: bool) bool {
         // `undefined`, not `.{}`: a default-initialised StateSet is written
         // whole (~2 KiB each) on every call — measured as 85 % of `isMatch`.
         var lists: [2]StateSet = undefined;
@@ -248,21 +264,21 @@ pub const Regex = struct {
             if (!full and cur.n == 0) {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != 0) return false;
-                if (pf.first != null) {
-                    pos = pf.next(input, pos) orelse return false;
-                    prev = runeBefore(input, pos);
+                if (@TypeOf(text.*).can_skip and pf.first != null) {
+                    pos = text.skip(pf, pos) orelse return false;
+                    prev = text.before(pos);
                 }
             }
-            const here = decode(input, pos);
+            const here = text.at(pos);
             if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, &stack);
             // No thread left: anchored, nothing can start later; unanchored,
             // the next position starts a new one.
             if (cur.n == 0 and (full or here.cp == null)) return false;
             nxt.clear(words);
-            const after = if (here.cp != null) decode(input, pos + here.w) else here;
+            const after = if (here.cp != null) text.at(pos + here.w) else here;
             for (cur.pcs[0..cur.n]) |pc| {
                 switch (re.insts[pc]) {
-                    .match => if (!full or pos == input.len) return true,
+                    .match => if (!full or here.cp == null) return true,
                     else => if (here.cp) |cp| if (re.consumes(pc, cp))
                         re.closureSet(nxt, pc + 1, cp, after.cp, &stack),
                 }
@@ -591,13 +607,17 @@ pub const Matcher = struct {
     /// took no part); `out` may be shorter or longer than the group count.
     pub fn captures(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
         if (from > input.len or !m.run(input, from, false)) return false;
+        m.fillCaptures(out);
+        return true;
+    }
+
+    fn fillCaptures(m: *const Matcher, out: []?Span) void {
         for (out, 0..) |*slot, i| {
             slot.* = if (2 * i + 1 < m.k and m.best[2 * i] != nil and m.best[2 * i + 1] != nil)
                 .{ .start = m.best[2 * i], .end = m.best[2 * i + 1] }
             else
                 null;
         }
-        return true;
     }
 
     /// Successive non-overlapping matches (Go's `FindAll`: an empty match
@@ -664,31 +684,59 @@ pub const Matcher = struct {
     /// nothing; later threads of the same start may still find a longer one,
     /// and threads that started later are dropped.
     fn run(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
+        var t: SliceText = .{ .input = input };
+        return m.runOn(&t, from, full);
+    }
+
+    /// Go's `FindReaderIndex`: the leftmost match in what `r` yields, as byte
+    /// offsets from where `r` stood. Reads no further than it must (at most
+    /// three code points past the match's end); constant memory. `r`'s buffer must
+    /// hold at least 4 bytes.
+    pub fn findReader(m: *Matcher, r: *std.Io.Reader) error{ReadFailed}!?Span {
+        var t: ReaderText = .init(r);
+        const found = m.runOn(&t, 0, false);
+        if (t.failed) return error.ReadFailed;
+        if (!found) return null;
+        return .{ .start = m.best[0], .end = m.best[1] };
+    }
+
+    /// Go's `FindReaderSubmatchIndex`: `findReader` that also fills `out` as
+    /// `captures` does.
+    pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) error{ReadFailed}!bool {
+        var t: ReaderText = .init(r);
+        const found = m.runOn(&t, 0, false);
+        if (t.failed) return error.ReadFailed;
+        if (!found) return false;
+        m.fillCaptures(out);
+        return true;
+    }
+
+    fn runOn(m: *Matcher, text: anytype, from: usize, full: bool) bool {
         const re = m.re;
         var cur = &m.lists[0];
         var nxt = &m.lists[1];
         cur.clear();
         var matched = false;
         var pos = from;
-        var prev = runeBefore(input, from);
+        var prev = text.before(from);
         const pf = re.prefilter;
         while (true) {
             if (!matched and cur.n == 0 and !full) {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != from) break;
-                if (pf.first != null) {
-                    pos = pf.next(input, pos) orelse break;
-                    prev = runeBefore(input, pos);
+                if (@TypeOf(text.*).can_skip and pf.first != null) {
+                    pos = text.skip(pf, pos) orelse break;
+                    prev = text.before(pos);
                 }
             }
-            const here = decode(input, pos);
+            const here = text.at(pos);
             if (!matched and (!pf.anchored or pos == from)) {
                 @memset(m.tmp, nil);
                 m.addThread(cur, 0, pos, prev, here.cp);
             }
             if (cur.n == 0 and (matched or here.cp == null)) break;
             nxt.clear();
-            const after = if (here.cp != null) decode(input, pos + here.w) else here;
+            const after = if (here.cp != null) text.at(pos + here.w) else here;
             var i: usize = 0;
             while (i < cur.n) : (i += 1) {
                 const pc = cur.pcs[i];
@@ -696,7 +744,7 @@ pub const Matcher = struct {
                 if (re.longest and matched and caps[0] > m.best[0]) continue; // started later
                 switch (re.insts[pc]) {
                     .match => {
-                        if (full and pos != input.len) continue;
+                        if (full and here.cp != null) continue;
                         if (re.longest) {
                             // The first thread to end here is the leftmost-first
                             // among equals; a later step is longer.
@@ -777,6 +825,88 @@ pub const Matcher = struct {
 };
 
 // ── text ────────────────────────────────────────────────────────────────────
+
+/// The VMs read text through one of these. `at(pos)` is the code point at
+/// `pos`; the VMs only ever ask for the current position and the one after it.
+const SliceText = struct {
+    input: []const u8,
+
+    const can_skip = true;
+
+    fn at(t: *const SliceText, pos: usize) Decoded {
+        return decode(t.input, pos);
+    }
+
+    fn before(t: *const SliceText, pos: usize) ?u21 {
+        return runeBefore(t.input, pos);
+    }
+
+    fn skip(t: *const SliceText, pf: Prefilter, pos: usize) ?usize {
+        return pf.next(t.input, pos);
+    }
+};
+
+/// A `std.Io.Reader` decoded as `decode` reads a slice, in a window of two
+/// code points: `win[0]` at byte offset `base`, `win[1]` right after it. Asking
+/// for a later position slides the window; nothing before it is kept.
+const ReaderText = struct {
+    r: *std.Io.Reader,
+    base: usize = 0,
+    win: [2]Decoded = undefined,
+    /// The reader failed; the VM saw the end of the text there.
+    failed: bool = false,
+
+    /// No skipping ahead: the bytes between would have to be read anyway.
+    const can_skip = false;
+
+    fn init(r: *std.Io.Reader) ReaderText {
+        var t: ReaderText = .{ .r = r };
+        t.win[0] = t.read();
+        t.win[1] = if (t.win[0].cp != null) t.read() else t.win[0];
+        return t;
+    }
+
+    fn at(t: *ReaderText, pos: usize) Decoded {
+        while (pos > t.base and t.win[0].cp != null) {
+            t.base += t.win[0].w;
+            t.win[0] = t.win[1];
+            t.win[1] = if (t.win[0].cp != null) t.read() else t.win[0];
+        }
+        std.debug.assert(pos == t.base);
+        return t.win[0];
+    }
+
+    fn before(_: *const ReaderText, pos: usize) ?u21 {
+        std.debug.assert(pos == 0);
+        return null;
+    }
+
+    fn skip(_: *const ReaderText, _: Prefilter, pos: usize) ?usize {
+        return pos;
+    }
+
+    /// The next code point; an invalid sequence is U+FFFD, one byte, and the
+    /// bytes after its first stay unread.
+    fn read(t: *ReaderText) Decoded {
+        const bad: Decoded = .{ .cp = 0xfffd, .w = 1 };
+        const c = t.r.takeByte() catch |e| {
+            if (e == error.ReadFailed) t.failed = true;
+            return .{ .cp = null, .w = 0 };
+        };
+        if (c < 0x80) return .{ .cp = c, .w = 1 };
+        const len = std.unicode.utf8ByteSequenceLength(c) catch return bad;
+        const rest = t.r.peek(len - 1) catch |e| {
+            if (e == error.ReadFailed) t.failed = true;
+            return bad;
+        };
+        var buf: [4]u8 = undefined;
+        buf[0] = c;
+        @memcpy(buf[1..len], rest);
+        const cp = std.unicode.utf8Decode(buf[0..len]) catch return bad;
+        t.r.toss(len - 1);
+        return .{ .cp = cp, .w = len };
+    }
+};
 
 const Decoded = struct { cp: ?u21, w: usize };
 
@@ -1009,6 +1139,41 @@ test "replace, expand, split, quoteMeta, literalPrefix, source (Go's API on top 
     while (it.nextCaptures(&groups)) |_| years += 1;
     try testing.expectEqual(@as(usize, 2), years);
     try testing.expectEqual(Span{ .start = 8, .end = 12 }, groups[1].?);
+}
+
+test "reader front end (Go's MatchReader, FindReaderIndex): constant memory, reads no further than it must" {
+    var re = try Regex.compile(testing.allocator, "(\\p{L}+)=(\\d+)");
+    defer re.deinit(testing.allocator);
+    var m = try Matcher.init(testing.allocator, &re);
+    defer m.deinit();
+    const text = "-- žluť=42; rest of a long stream";
+    var buf: [4]u8 = undefined;
+    var tr: std.testing.Reader = .init(&buf, &.{.{ .buffer = text }});
+    tr.artificial_limit = .limited(1);
+    var out: [3]?Span = undefined;
+    try testing.expect(try m.capturesReader(&tr.interface, &out));
+    try testing.expectEqualStrings("žluť=42", out[0].?.slice(text));
+    try testing.expectEqualStrings("42", out[2].?.slice(text));
+    // The match ends at the `;`: the reader stopped within three bytes of it.
+    var left: usize = 0;
+    while (tr.interface.takeByte()) |_| left += 1 else |_| {}
+    errdefer std.debug.print("left {d} of {d} after the match\n", .{ left, text.len - out[0].?.end });
+    try testing.expect(left + 3 >= text.len - out[0].?.end);
+
+    var fixed: std.Io.Reader = .fixed("no match here");
+    try testing.expectEqual(@as(?Span, null), try m.findReader(&fixed));
+    var any: std.Io.Reader = .fixed("x=1");
+    try testing.expect(try re.isMatchReader(&any));
+
+    // A failing reader is an error, not a silent "no match".
+    const Failing = struct {
+        fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+    var fbuf: [8]u8 = undefined;
+    var failing: std.Io.Reader = .{ .vtable = &.{ .stream = Failing.stream }, .buffer = &fbuf, .seek = 0, .end = 0 };
+    try testing.expectError(error.ReadFailed, re.isMatchReader(&failing));
 }
 
 test "captures and names" {
