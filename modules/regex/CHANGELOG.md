@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Leftmost-longest matching (Go's `Longest()`): `Regex.longest`, or
+  `Options.longest`. POSIX ERE syntax (Go's `CompilePOSIX`): `Regex.compilePosix`,
+  `compileOptions(.., .{ .syntax = .posix })`, `comptimeCompileOptions`,
+  `compileUsingOptions`, `validateSyntax`, `Builder.compileSyntax` — no Perl escapes or `(?…)`,
+  `^`/`$` at line breaks, a negated class never matches `\n`, a repetition may repeat a
+  repetition, leftmost-longest. New public: `Options`, `Syntax`; nothing breaks.
 - **2026-10-07** — **BREAKING:** Unicode classes: `\pL`, `\p{Greek}`, `\PL`, `\p{^Name}`, inside
   `[…]` and under `(?i)` — every general category, its long alias (`\p{Letter}`) and script of
   Unicode 15.0, plus `Any`, `ASCII`, `Assigned`; names match loosely (case, spaces, `_`, `-`

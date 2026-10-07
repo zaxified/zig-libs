@@ -144,6 +144,58 @@ func classEdges(name string) []string {
 	return out
 }
 
+// POSIX ERE (CompilePOSIX): the crafted cases again, and cases of its own —
+// what it refuses, line anchors, negated classes and newlines, a
+// repetition of a repetition, and where leftmost-longest differs.
+var posixCrafted = []string{
+	`a*?`, `a+?`, `a??`, `a{2}?`, `a**`, `a*+`, `a{2}{3}`, `a{2}*`, `(a*)*`, `(a*)+`, `(a|ab)(c|bcd)(d*)`, `(a+|b+)*`,
+	`(a|ab)(bc|c)`, `(ab|a)(bc|c)`, `a|ab|abc`, `(a*)(a*)`, `(a*?)(a*)`, `x*(a|ab)`, `(.*)(.*)`, `(a?)(ab)?b?`, `^$`,
+	`^`, `$`, `^a`, `a$`, `^a$`, `[^a]`, `[^\n]`, `[^a\n]`, `[[:^alpha:]]`, `[^[:alpha:]]`, `[\x00-\x7f]`, `.`, `.*`,
+	`(?i)a`, `(?:a)`, `(?P<n>a)`, `\d`, `\w`, `\s`, `\b`, `\A`, `\z`, `\Qa\E`, `\pL`, `[\d]`, `\x41`, `\n`, `\012`,
+	`[a-c-]`, `[-a]`, `[a-b-]`, `[--a]`, `[!--]`, `[a\-b]`, `[a-b-c]`, `[a-c--]`, `[a-c-\-]`, `[^-a]`, `[a-c-[:alpha:]]`,
+	`[[:alpha:]-z]`, `[a-c-]]`, `[ab-]`,
+	`(a{500}){3}`, `((a{0}){100}){10}`, `a{1001}`, `(|a)`, `()`, `(a)|b`, `(a|b)*c`, `((a)|b)*`, `(a*)*b`,
+}
+
+func randPosixAtom(depth int) string {
+	r := rnd.IntN(100)
+	switch {
+	case r < 35:
+		return []string{"a", "b", "c", "A", "1", "é", " ", `\n`, `\.`}[rnd.IntN(9)]
+	case r < 43:
+		return "."
+	case r < 58:
+		return []string{`[ab]`, `[^a]`, `[a-c]`, `[^a-c\n]`, `[[:alpha:]]`, `[[:^digit:]]`, `[é1]`, `[a-]`, `[^É]`}[rnd.IntN(9)]
+	case r < 64:
+		return []string{`^`, `$`}[rnd.IntN(2)]
+	case r < 85 && depth < 3:
+		return "(" + randPosixAlt(depth+1) + ")"
+	default:
+		return "a"
+	}
+}
+
+func randPosixConcat(depth int) string {
+	var b strings.Builder
+	for i, n := 0, 1+rnd.IntN(4); i < n; i++ {
+		a := randPosixAtom(depth)
+		// Repetitions may stack in POSIX: up to two operators.
+		for k := 0; k < 2 && rnd.IntN(3) == 0; k++ {
+			a += []string{"*", "+", "?", "{2}", "{1,}", "{0,2}"}[rnd.IntN(6)]
+		}
+		b.WriteString(a)
+	}
+	return b.String()
+}
+
+func randPosixAlt(depth int) string {
+	s := randPosixConcat(depth)
+	for rnd.IntN(4) == 0 {
+		s += "|" + randPosixConcat(depth)
+	}
+	return s
+}
+
 // The alphabet random patterns and inputs share.
 var inputRunes = []string{"a", "b", "c", "A", "B", "1", "2", " ", "\n", "é", "É", "č", "Č", "ß", "ẞ", "k", "s", "_", "-", "\xff", "Ω", "ж", "٣", "中"}
 
@@ -271,13 +323,31 @@ func ints(xs []int) string {
 }
 
 func emitPattern(b *bytes.Buffer, pat string, inputs []string) {
-	re, err := regexp.Compile(pat)
+	emitPatternIn(b, pat, inputs, false)
+}
+
+// emitPatternIn answers a pattern in Perl syntax (leftmost-first, plus the
+// same searches after Longest()) or in POSIX syntax (CompilePOSIX:
+// leftmost-longest).
+func emitPatternIn(b *bytes.Buffer, pat string, inputs []string, posix bool) {
+	var re *regexp.Regexp
+	var err error
+	if posix {
+		re, err = regexp.CompilePOSIX(pat)
+	} else {
+		re, err = regexp.Compile(pat)
+	}
 	if err != nil {
 		// The verdict only; the error text is Go's own wording.
 		fmt.Fprintf(b, ".{ .pattern = %s, .ok = false },\n", zstr(pat))
 		return
 	}
-	full := fullMatcher(pat)
+	full := fullMatcher(pat, posix)
+	var longest *regexp.Regexp
+	if !posix {
+		longest = regexp.MustCompile(pat)
+		longest.Longest()
+	}
 	fmt.Fprintf(b, ".{ .pattern = %s, .ok = true, .names = &.{", zstr(pat))
 	for i, n := range re.SubexpNames() {
 		if i > 0 {
@@ -292,16 +362,31 @@ func emitPattern(b *bytes.Buffer, pat string, inputs []string) {
 		for _, m := range re.FindAllStringIndex(in, -1) {
 			all = append(all, m...)
 		}
-		fmt.Fprintf(b, ".{ .input = %s, .match = %v, .full = %v, .sub = %s, .all = %s },\n",
+		fmt.Fprintf(b, ".{ .input = %s, .match = %v, .full = %v, .sub = %s, .all = %s",
 			zstr(in), re.MatchString(in), full.MatchString(in), ints(sub), ints(all))
+		if longest != nil {
+			var lall []int
+			for _, m := range longest.FindAllStringIndex(in, -1) {
+				lall = append(lall, m...)
+			}
+			lsub := longest.FindStringSubmatchIndex(in)
+			if !equalInts(lsub, sub) || !equalInts(lall, all) {
+				fmt.Fprintf(b, ", .lsub = %s, .lall = %s", ints(lsub), ints(lall))
+			} else {
+				b.WriteString(", .same_longest = true")
+			}
+		}
+		b.WriteString(" },\n")
 	}
 	b.WriteString("} },\n")
 }
 
 const header = `/// Go's answers for one input: MatchString, a full match (` + "`\\\\A(?:re)\\\\z`" + `),
 /// FindStringSubmatchIndex (empty: no match; -1: a group that took no part)
-/// and FindAllStringIndex flattened.
-pub const Case = struct { input: []const u8, match: bool, full: bool, sub: []const i32, all: []const i32 };
+/// and FindAllStringIndex flattened. For a Perl-syntax pattern also the same
+/// two searches after ` + "`Longest()`" + ` — ` + "`lsub`/`lall`" + `, or ` + "`same_longest`" + ` when they
+/// equal ` + "`sub`/`all`" + `. A POSIX set's answers are CompilePOSIX's (leftmost-longest).
+pub const Case = struct { input: []const u8, match: bool, full: bool, sub: []const i32, all: []const i32, lsub: []const i32 = &.{}, lall: []const i32 = &.{}, same_longest: bool = false };
 /// ` + "`ok`" + `: Go compiles the pattern. ` + "`names`" + `: SubexpNames.
 pub const Pattern = struct { pattern: []const u8, ok: bool, names: []const []const u8 = &.{}, cases: []const Case = &.{} };
 
@@ -338,6 +423,19 @@ func main() {
 			inputs = append(inputs, randInput())
 		}
 		emitPattern(&b, p, inputs)
+	}
+	b.WriteString("};\n\npub const posix = [_]Pattern{\n")
+	for _, p := range append(append([]string{}, crafted...), posixCrafted...) {
+		emitPatternIn(&b, p, fixedInputs, true)
+	}
+	b.WriteString("};\n\npub const posix_random = [_]Pattern{\n")
+	for i := 0; i < nRandom/2; i++ {
+		p := randPosixAlt(0)
+		var inputs []string
+		for j := 0; j < nInputs; j++ {
+			inputs = append(inputs, randInput())
+		}
+		emitPatternIn(&b, p, inputs, true)
 	}
 	b.WriteString("};\n")
 
@@ -388,6 +486,18 @@ func main() {
 	}
 }
 
+func equalInts(x, y []int) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func dropVersionLine(b []byte) []byte {
 	var keep [][]byte
 	for _, l := range bytes.Split(b, []byte("\n")) {
@@ -401,8 +511,12 @@ func dropVersionLine(b []byte) []byte {
 // fullMatcher is the pattern anchored at both ends of the text, built on its
 // parsed form rather than by pasting text around it (`\Q` would swallow a
 // pasted `)`).
-func fullMatcher(pat string) *regexp.Regexp {
-	parsed, err := syntax.Parse(pat, syntax.Perl)
+func fullMatcher(pat string, posix bool) *regexp.Regexp {
+	flags := syntax.Perl
+	if posix {
+		flags = syntax.POSIX
+	}
+	parsed, err := syntax.Parse(pat, flags)
 	if err != nil {
 		panic(err)
 	}

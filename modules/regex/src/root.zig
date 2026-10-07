@@ -37,6 +37,21 @@ pub const meta = .{
 };
 
 pub const Error = syntax.Error;
+pub const Syntax = syntax.Syntax;
+
+/// How `compileOptions` reads a pattern and which match it reports.
+pub const Options = struct {
+    syntax: Syntax = .perl,
+    /// Leftmost-longest instead of leftmost-first (Go's `Longest()`): among
+    /// the matches that start leftmost, the longest; among those, the one
+    /// leftmost-first would find first. Null: what the syntax implies — off
+    /// for `.perl`, on for `.posix` (Go's `CompilePOSIX`).
+    longest: ?bool = null,
+
+    fn isLongest(o: Options) bool {
+        return o.longest orelse (o.syntax == .posix);
+    }
+};
 pub const max_insts = syntax.max_insts;
 pub const max_groups = syntax.max_groups;
 pub const max_repeat = syntax.max_repeat;
@@ -66,27 +81,46 @@ pub const Regex = struct {
     owned: bool = false,
     /// What the search may skip, from `analyze` (the defaults skip nothing).
     prefilter: Prefilter = .{},
+    /// Leftmost-longest matching (Go's `Longest()`; see `Options.longest`).
+    /// May be set after compiling, before the `Regex` is shared.
+    longest: bool = false,
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
     /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
     /// scratch; a larger one in a full `Builder` from `gpa`.
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
+        return compileOptions(gpa, pattern, .{});
+    }
+
+    /// `compile` in POSIX ERE syntax with leftmost-longest matching (Go's
+    /// `CompilePOSIX`).
+    pub fn compilePosix(gpa: std.mem.Allocator, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
+        return compileOptions(gpa, pattern, .{ .syntax = .posix });
+    }
+
+    /// `compile` with a choice of syntax and match semantics.
+    pub fn compileOptions(gpa: std.mem.Allocator, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
         var small: syntax.BuilderOf(small_capacity) = undefined;
-        if (compileWith(gpa, &small, pattern)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
+        if (compileWith(gpa, &small, pattern, opts)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
         const b = try gpa.create(syntax.Builder);
         defer gpa.destroy(b);
-        return compileWith(gpa, b, pattern);
+        return compileWith(gpa, b, pattern, opts);
     }
 
     /// `compile` with the caller's `Builder` (~80 KiB of compile scratch, any
     /// lifetime) — for compiling many patterns, or into an arena that should
     /// not hold the scratch.
     pub fn compileUsing(gpa: std.mem.Allocator, b: *Builder, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
-        return compileWith(gpa, b, pattern);
+        return compileWith(gpa, b, pattern, .{});
     }
 
-    fn compileWith(gpa: std.mem.Allocator, b: anytype, pattern: []const u8) (Error || std.mem.Allocator.Error)!Regex {
-        try b.compile(pattern);
+    /// `compileUsing` with a choice of syntax and match semantics.
+    pub fn compileUsingOptions(gpa: std.mem.Allocator, b: *Builder, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
+        return compileWith(gpa, b, pattern, opts);
+    }
+
+    fn compileWith(gpa: std.mem.Allocator, b: anytype, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
+        try b.compileSyntax(pattern, opts.syntax);
         const insts = try gpa.dupe(Inst, b.insts[0..b.ninsts]);
         errdefer gpa.free(insts);
         const ranges = try gpa.dupe(Range, b.ranges[0..b.nranges]);
@@ -101,7 +135,7 @@ pub const Regex = struct {
             slot.* = try gpa.dupe(u8, n);
             done += 1;
         }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges) };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges), .longest = opts.isLongest() };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -239,22 +273,32 @@ pub const Regex = struct {
 
 /// Compile `pattern` at compile time; a bad pattern is a compile error.
 pub fn comptimeCompile(comptime pattern: []const u8) Regex {
+    return comptimeCompileOptions(pattern, .{});
+}
+
+/// `comptimeCompile` with a choice of syntax and match semantics.
+pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Options) Regex {
     comptime {
         @setEvalBranchQuota(2_000_000);
         var b: syntax.Builder = .{};
-        b.compile(pattern) catch |e| @compileError("regex: \"" ++ pattern ++ "\": " ++ @errorName(e));
+        b.compileSyntax(pattern, opts.syntax) catch |e| @compileError("regex: \"" ++ pattern ++ "\": " ++ @errorName(e));
         const insts = b.insts[0..b.ninsts].*;
         const ranges = b.ranges[0..b.nranges].*;
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges) };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges), .longest = opts.isLongest() };
     }
 }
 
 /// Check `pattern` without keeping a program (what `router` does at `add`).
 pub fn validate(pattern: []const u8, scratch: *syntax.Builder) Error!void {
     return scratch.compile(pattern);
+}
+
+/// Check `pattern` in the given syntax without keeping a program.
+pub fn validateSyntax(pattern: []const u8, syntax_: Syntax, scratch: *syntax.Builder) Error!void {
+    return scratch.compileSyntax(pattern, syntax_);
 }
 
 pub const Builder = syntax.Builder;
@@ -516,8 +560,11 @@ pub const Matcher = struct {
         }
     };
 
-    /// The Pike VM. Threads in a list are in priority order; a match cuts
-    /// every lower-priority thread of the same step (leftmost-first).
+    /// The Pike VM. Threads in a list are in priority order, those that
+    /// started earlier first. Leftmost-first: a match cuts every
+    /// lower-priority thread of the same step. Leftmost-longest: a match cuts
+    /// nothing; later threads of the same start may still find a longer one,
+    /// and threads that started later are dropped.
     fn run(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
         const re = m.re;
         var cur = &m.lists[0];
@@ -548,9 +595,19 @@ pub const Matcher = struct {
             while (i < cur.n) : (i += 1) {
                 const pc = cur.pcs[i];
                 const caps = cur.caps[i * m.k ..][0..m.k];
+                if (re.longest and matched and caps[0] > m.best[0]) continue; // started later
                 switch (re.insts[pc]) {
                     .match => {
                         if (full and pos != input.len) continue;
+                        if (re.longest) {
+                            // The first thread to end here is the leftmost-first
+                            // among equals; a later step is longer.
+                            if (matched and m.best[1] == pos) continue;
+                            @memcpy(m.best, caps);
+                            m.best[1] = pos;
+                            matched = true;
+                            continue;
+                        }
                         @memcpy(m.best, caps);
                         m.best[1] = pos;
                         matched = true;
@@ -765,6 +822,34 @@ test "leftmost-first, greedy and lazy" {
     try expectFind("(?U)a+", "aaa", "a");
     try expectFind("x*", "aaa", "");
     try expectFind("(a*)*b", "aaab", "aaab");
+}
+
+test "leftmost-longest (Go's Longest) and POSIX ERE syntax (Go's CompilePOSIX)" {
+    var re = try Regex.compile(testing.allocator, "a|ab|abc");
+    defer re.deinit(testing.allocator);
+    try testing.expectEqualStrings("a", (try re.find(testing.allocator, "abcd")).?.slice("abcd"));
+    re.longest = true;
+    try testing.expectEqualStrings("abc", (try re.find(testing.allocator, "abcd")).?.slice("abcd"));
+    // Among the longest, the one leftmost-first finds first: (a)(bcd), not (ab)(cd).
+    var ll = try Regex.compileOptions(testing.allocator, "(a|ab)(c|bcd)(d*)", .{ .longest = true });
+    defer ll.deinit(testing.allocator);
+    var m = try Matcher.init(testing.allocator, &ll);
+    defer m.deinit();
+    var out: [4]?Span = undefined;
+    try testing.expect(m.captures("abcd", 0, &out));
+    try testing.expectEqual(Span{ .start = 0, .end = 4 }, out[0].?);
+    try testing.expectEqual(Span{ .start = 0, .end = 1 }, out[1].?);
+    // POSIX: no Perl escapes or (?…); ^/$ at line breaks; a negated class
+    // skips newlines; `a*?` is (a*)?; leftmost-longest by default.
+    try testing.expectError(error.InvalidEscape, Regex.compilePosix(testing.allocator, "\\d"));
+    try testing.expectError(error.MissingRepeatArgument, Regex.compilePosix(testing.allocator, "(?i)a"));
+    try testing.expectError(error.InvalidCharRange, Regex.compilePosix(testing.allocator, "[a-c-e]"));
+    var px = try Regex.compilePosix(testing.allocator, "^b[^a]*$");
+    defer px.deinit(testing.allocator);
+    try testing.expect(px.longest);
+    try testing.expectEqualStrings("bc", (try px.find(testing.allocator, "a\nbc\nd")).?.slice("a\nbc\nd"));
+    const cpx = comptime comptimeCompileOptions("a**|b{2}{2}", .{ .syntax = .posix });
+    try testing.expect(cpx.fullMatch("bbbb"));
 }
 
 test "captures and names" {

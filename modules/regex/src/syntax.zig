@@ -125,6 +125,18 @@ const Flags = struct {
     ungreedy: bool = false, // U
 };
 
+/// Which grammar a pattern is read in.
+pub const Syntax = enum {
+    /// Go's `regexp.Compile` (RE2's Perl-like syntax): everything in the
+    /// module doc.
+    perl,
+    /// Go's `regexp.CompilePOSIX` (POSIX ERE, egrep): no `\d \s \w \b \A \z
+    /// \Q \p` and no `(?…)`; `^`/`$` match at line breaks; a negated class
+    /// never matches `\n`; a repetition may repeat a repetition (`a**`,
+    /// `a{2}{3}`; `a*?` is `(a*)?`, not lazy).
+    posix,
+};
+
 /// Table capacities of a `BuilderOf`. The defaults are the module's
 /// documented limits; a smaller builder refuses a larger pattern with
 /// `error.PatternTooLarge` (what `Regex.compile` retries with the full one).
@@ -155,8 +167,13 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         // ── parser state ──
         src: []const u8 = "",
         pos: usize = 0,
+        posix: bool = false,
 
         pub fn compile(b: *Self, pattern: []const u8) Error!void {
+            return b.compileSyntax(pattern, .perl);
+        }
+
+        pub fn compileSyntax(b: *Self, pattern: []const u8, syntax: Syntax) Error!void {
             // Reset the counters only: `b.* = .{}` would write all ~80 KiB of
             // tables on every compile (measured: most of a short pattern's cost).
             b.ninsts = 0;
@@ -164,6 +181,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             b.nnodes = 0;
             b.ngroups = 1;
             b.pos = 0;
+            b.posix = syntax == .posix;
             b.names[0] = "";
             if (!std.unicode.utf8ValidateSlice(pattern)) return error.InvalidUtf8;
             b.src = pattern;
@@ -240,7 +258,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                         continue;
                     };
                     if (operand == none) return error.MissingRepeatArgument;
-                    if (repeated) return error.InvalidNestedRepeat;
+                    if (repeated and !b.posix) return error.InvalidNestedRepeat;
                     if (depth + 1 > max_depth) return error.NestingDepth;
                     // Wrap the operand in place: it keeps its link in the list.
                     const inner = try b.node(b.nodes[operand]);
@@ -335,7 +353,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 },
                 else => unreachable,
             }
-            if (!b.eof() and b.peek() == '?') {
+            // POSIX has no lazy marker: a `?` after a repetition repeats it.
+            if (!b.posix and !b.eof() and b.peek() == '?') {
                 b.pos += 1;
                 r.greedy = false;
             }
@@ -372,11 +391,11 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 },
                 '^' => {
                     b.pos += 1;
-                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line) Assert.begin_line else Assert.begin_text) });
+                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line or b.posix) Assert.begin_line else Assert.begin_text) });
                 },
                 '$' => {
                     b.pos += 1;
-                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line) Assert.end_line else Assert.end_text) });
+                    return try b.node(.{ .kind = .assert, .a = @intFromEnum(if (flags.multi_line or b.posix) Assert.end_line else Assert.end_text) });
                 },
                 '\\' => return try b.parseEscape(flags.*),
                 else => return try b.literal(b.nextRune(), flags.*),
@@ -387,7 +406,9 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             b.pos += 1; // (
             var name: ?[]const u8 = null;
             var inner = flags.*;
-            if (std.mem.startsWith(u8, b.src[b.pos..], "?P<") or std.mem.startsWith(u8, b.src[b.pos..], "?<")) {
+            if (b.posix) {
+                // No `(?…)`: the `?` is a repetition with nothing before it.
+            } else if (std.mem.startsWith(u8, b.src[b.pos..], "?P<") or std.mem.startsWith(u8, b.src[b.pos..], "?<")) {
                 b.pos += if (b.src[b.pos + 1] == 'P') 3 else 2;
                 const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '>') orelse return error.InvalidNamedCapture;
                 const n = b.src[b.pos..end];
@@ -486,6 +507,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             if (b.eof()) return error.TrailingBackslash;
             const c = b.peek();
             if (c >= 0x80) return error.InvalidEscape;
+            // POSIX: none of the Perl and Unicode class escapes, assertions or `\Q`.
+            if (b.posix and std.mem.indexOfScalar(u8, "dDsSwWpPAzbBQ", c) != null) return error.InvalidEscape;
             b.pos += 1;
             switch (c) {
                 'a' => return .{ .rune = 0x07 },
@@ -645,6 +668,10 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     b.pos += 1;
                     break;
                 }
+                // POSIX: a `-` is a member only first or last (`[a-c-e]`,
+                // `[[:alpha:]-z]` are refused); Perl takes it anywhere.
+                if (b.posix and c == '-' and !first and !(b.pos + 1 < b.src.len and b.src[b.pos + 1] == ']'))
+                    return error.InvalidCharRange;
                 first = false;
                 // Each member is folded on its own, before any negation of its own
                 // (`[\W]`, `[[:^alpha:]]`); the class's `^` comes last.
@@ -662,6 +689,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 } else try b.addRange(.{ .lo = lo, .hi = lo });
                 if (flags.fold) try b.foldFrom(item);
             }
+            // POSIX: a negated class never matches a newline (Go without ClassNL).
+            if (negated and b.posix) try b.addRange(.{ .lo = '\n', .hi = '\n' });
             b.normalizeFrom(start);
             if (negated) try b.negateFrom(start);
             return b.classNode(start);
