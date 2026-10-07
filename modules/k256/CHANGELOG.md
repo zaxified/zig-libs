@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `mulDoubleBasePublic`
+  with `basePoint` as one base (every BIP340/ECDSA/adaptor verifier) runs the new
+  `ecmult.zig`: Jacobian coordinates with incomplete formulas (public data only), mixed
+  additions against P's odd multiples brought to one common Z, and a comptime affine
+  G/φ(G) table at wNAF width 10 (32 KiB .rodata). bench-bip340 verify 74.0 → 59.2 µs
+  (2.20 → 1.76× libsecp256k1). GLV split/wNAF moved from `group.zig` into `ecmult.zig`
+  (wNAF now generic in its width). Held by a differential vs the double-and-add oracle
+  and std (random, 23 edge scalars × G/−G/2G/φ(G)/projective, exact cancellations to the
+  identity) and a corrupted-table negative control; ctgrind counts unchanged, digests
+  re-pinned.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE (same values, faster):** `Fe.invert` and
   `Fe.sqrt` use the run-of-ones addition chain (255 S + 15 M / 253 S + 13 M, libsecp256k1's
   chain) instead of square-and-multiply over the whole exponent; the amd64 field core finishes

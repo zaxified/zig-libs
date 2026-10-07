@@ -76,6 +76,7 @@ pub const meta = .{
 test {
     _ = field;
     _ = group;
+    _ = @import("ecmult.zig");
     _ = scalar;
     _ = sign;
     _ = ecdsa_recover;

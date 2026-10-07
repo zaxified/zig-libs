@@ -90,12 +90,17 @@ carry, and the second/third fold's top word must be handled without a
 data-dependent branch. The differential (`oracle_test.zig`) pins it bit-for-bit to
 `reduceWide`.
 
-Inversion is Fermat (`a^(p−2)`) via a runtime square-and-multiply over the PUBLIC
-exponent (constant-time in the secret element `a`; the sq/mul schedule depends
-only on the fixed exponent). A short addition chain (libsecp256k1 uses ~255 sq +
-15 mul) is the fast path a later phase can drop in — inversion is amortised (one
-per affine conversion), so the scaffold favours obvious correctness. Square roots
-use `a^((p+1)/4)` (valid because `p ≡ 3 mod 4`), which is BIP340's `lift_x` root.
+Inversion is Fermat (`a^(p−2)`) and square roots `a^((p+1)/4)` (valid because
+`p ≡ 3 mod 4`, BIP340's `lift_x` root), both through libsecp256k1's run-of-ones
+addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed tail):
+255 S + 15 M and 253 S + 13 M, a fixed schedule, so constant-time in `a`. Until
+2026-10-08 both ran a square-and-multiply over the whole exponent (~2× the work);
+`powConst` remains as their test oracle.
+
+The amd64 core needs only TWO folds: after fold 2 the value is `< 2^256 + 2^67 <
+2p`, so one masked "`+c`, keep if it (or fold 2) carried" step finishes — see
+`fast_core.zig`'s module doc (2026-10-08; it had mirrored all four folds plus a
+separate canonicalise). The portable `reduceWide` keeps the four-fold form.
 
 ## Point representation & scalar multiplication
 
@@ -130,7 +135,17 @@ Scalar multiply variants:
   dispatch point for the gated GLV core. Portable fallback: plain vartime
   double-and-add.
 - **`mulDoubleBasePublic`** — VARIABLE-TIME `s1·P1 + s2·P2`, the verifier's
-  `s·G − e·P` workhorse (BIP340 verify + ECDSA verify).
+  `s·G − e·P` workhorse (BIP340 verify + ECDSA verify). When one base is
+  `basePoint` (exact limbs — every verifier passes the constant) it runs
+  `ecmult.mulDoubleBaseG` (2026-10-08): libsecp256k1's `ecmult` shape — Jacobian
+  coordinates with the incomplete `a = 0` formulas (dbl 2M+5S, mixed add 8M+3S;
+  the special cases are branches, legal because everything is public), GLV+wNAF
+  on both scalars, P's odd multiples brought to one common Z so they act as
+  affine points of an isomorphic curve, and G/φ(G) odd multiples as a comptime
+  AFFINE table at wNAF width `g_window = 10` (2 × 256 entries, 32 KiB .rodata;
+  width 12 measured 0.6 % faster for 4× the table, not taken). Otherwise the RCB
+  GLV combine (`glvCombine`) runs; it and the plain double-and-add are the
+  oracles `ecmult.zig`'s tests pin it to (plus std).
 
 The fast-path DESIGN the Fable phase targets: a comptime fixed-base wNAF table for
 `G` (constant-time base-point mul), and GLV for variable-base — documented here so
@@ -549,13 +564,16 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 
 ## Backlog (the Fable phase + beyond)
 
-- **Speed toward libsecp256k1 (2026-10-07, perf over BIP340 verify after the add/mulSmall change):**
-  point add 36 %, double 33 %, `lift_x` square root + affine inversion ~25 %. Next levers, by
-  expected gain: (1) a precomputed AFFINE table for G and φ(G) (comptime, wider window) used by a
-  base-point double-base multiply — fewer adds on the G half and mixed additions; (2) a
-  variable-time safegcd inversion for public data (verify's affine conversion); (3) lazily
-  reduced field elements (libsecp's magnitude tracking) so add/sub skip the select. Each needs
-  ctgrind re-measured where it touches CT paths.
+- **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
+  33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-08: addition-chain
+  inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
+  — verify 85 → 59 µs. Open, by expected gain: (1) a variable-time safegcd inversion for
+  public data (verify's affine conversion, ~6 µs on the chain today); (2) `verifyBatch` /
+  any two-arbitrary-point double-base still on the RCB `glvCombine` — a multi-point Strauss
+  with ONE global Z across all tables (libsecp's `ecmult_strauss_wnaf`) would move it onto
+  `ecmult`; (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
+  skip the select; (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,
+  store/load). Each needs ctgrind re-measured where it touches CT paths.
 
 1. ~~`fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the
    special-prime fold (watch the fold-carry propagation; see montint's asm notes).~~

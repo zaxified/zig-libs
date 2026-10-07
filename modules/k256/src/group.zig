@@ -35,6 +35,7 @@ const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
+const ecmult = @import("ecmult.zig");
 
 const IdentityElementError = std.crypto.errors.IdentityElementError;
 const EncodingError = std.crypto.errors.EncodingError;
@@ -475,12 +476,35 @@ pub const Secp256k1 = struct {
     /// the verifier's `s·G − e·P` workhorse. `error.IdentityElement` if the
     /// result is neutral (the BIP340 "sG − eP is infinite" reject). Dispatches
     /// to the GLV core when `gate.glv_scalarmul_implemented`, else the plain
-    /// interleaved double-and-add below.
+    /// interleaved double-and-add below. When one base IS `basePoint` (the
+    /// same limbs, as every verifier passes it) the GLV core is
+    /// `ecmult.mulDoubleBaseG`: Jacobian, mixed additions, precomputed G.
     pub fn mulDoubleBasePublic(p1: Secp256k1, s1_: [32]u8, p2: Secp256k1, s2_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         if (comptime gate.glv_scalarmul_implemented) {
+            if (p1.isBasePointLimbs()) return mulBaseDoubleGlv(s1_, p2, s2_, endian);
+            if (p2.isBasePointLimbs()) return mulBaseDoubleGlv(s2_, p1, s1_, endian);
             return mulDoubleBaseGlv(p1, s1_, p2, s2_, endian);
         }
         return mulDoubleBasePublicDoubleAdd(p1, s1_, p2, s2_, endian);
+    }
+
+    /// True iff `p` holds `basePoint`'s exact representation (z = 1). A
+    /// projectively equal G with another z simply takes the generic path.
+    fn isBasePointLimbs(p: Secp256k1) bool {
+        return std.mem.eql(u64, &p.x._limbs, &basePoint.x._limbs) and
+            std.mem.eql(u64, &p.y._limbs, &basePoint.y._limbs) and
+            std.mem.eql(u64, &p.z._limbs, &basePoint.z._limbs);
+    }
+
+    /// `g_s·G + s·p` via `ecmult`. The homogeneous `(X : Y : Z)` goes in as
+    /// Jacobian `(X·Z, Y·Z², Z)` and the Jacobian result comes back as
+    /// `(X·Z, Y, Z³)` — both represent the same affine point.
+    fn mulBaseDoubleGlv(g_s: [32]u8, p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        try p.rejectIdentity();
+        const pj = ecmult.Gej{ .x = p.x.mul(p.z), .y = p.y.mul(p.z.sq()), .z = p.z, .inf = false };
+        const r = ecmult.mulDoubleBaseG(scalarValue(g_s, endian), pj, scalarValue(s_, endian)) orelse
+            return error.IdentityElement;
+        return .{ .x = r.x.mul(r.z), .y = r.y, .z = r.z.sq().mul(r.z) };
     }
 
     /// Portable variable-time interleaved double-and-add for two bases (the
@@ -507,60 +531,14 @@ pub const Secp256k1 = struct {
 
 /// Odd-multiple table size for width-5 wNAF: {1,3,5,…,15}·P.
 const glv_table_len = 8;
-/// wNAF digit-string length: a 256-bit magnitude yields at most 257 digits.
-const glv_wnaf_len = 257;
+/// GLV split + wNAF recoding live in `ecmult.zig` (shared with the
+/// generator fast path there).
+const GlvHalf = ecmult.GlvHalf;
+const splitToSignedHalves = ecmult.splitToSignedHalves;
+const glv_wnaf_len = ecmult.wnaf_len;
 
-const GlvHalf = struct { mag: u256, negative: bool };
-
-/// Reduce a raw 256-bit scalar mod `n` and split it into the two signed GLV
-/// halves of `k ≡ r1 + r2·λ (mod n)`. Returns null when `k ≡ 0 (mod n)` (the
-/// multiple is the identity). Reducing first is legal for any raw scalar
-/// because the curve group has prime order `n` (`s·P = (s mod n)·P`) — the
-/// portable double-and-add scans raw bits and agrees for the same reason.
-fn splitToSignedHalves(s_raw: u256) ?[2]GlvHalf {
-    const n = scalarmod.field_order;
-    // 2^256 < 2n, so a single conditional subtract fully reduces.
-    const s = if (s_raw >= n) s_raw - n else s_raw;
-    if (s == 0) return null;
-    var sb: [32]u8 = undefined;
-    std.mem.writeInt(u256, &sb, s, .little);
-    // s < n is canonical and every intermediate of the split is in range.
-    const split = scalarmod.splitScalar(sb, .little) catch unreachable;
-    return .{ glvHalf(split.r1), glvHalf(split.r2) };
-}
-
-/// Resolve one split residue to a signed magnitude. A residue with any high
-/// bit set represents the negative `−(n − r)` (the balanced split guarantees
-/// |r| ≈ √n, so the two cases are cleanly separated by bit 128). Either
-/// interpretation is ≡ r (mod n), so correctness never depends on the
-/// threshold — only the ~128-bit magnitude (and hence the halved doubling
-/// count) does.
-fn glvHalf(r_le: [32]u8) GlvHalf {
-    const v = std.mem.readInt(u256, &r_le, .little);
-    if ((v >> 128) != 0) return .{ .mag = scalarmod.field_order - v, .negative = true };
-    return .{ .mag = v, .negative = false };
-}
-
-/// Width-5 wNAF digit string: nonzero digits are odd, in [−15, 15], at least
-/// 4 zeros apart. The half's sign is folded into the digits.
-fn wnafDigits(h: GlvHalf) [glv_wnaf_len]i8 {
-    var e = [_]i8{0} ** glv_wnaf_len;
-    var v = h.mag;
-    var i: usize = 0;
-    while (v != 0) : (i += 1) {
-        if (@as(u1, @truncate(v)) == 1) {
-            const w: i32 = @intCast(v & 31);
-            const d: i32 = if (w >= 16) w - 32 else w;
-            if (d >= 0) {
-                v -= @as(u256, @intCast(d));
-            } else {
-                v += @as(u256, @intCast(-d));
-            }
-            e[i] = @intCast(if (h.negative) -d else d);
-        }
-        v >>= 1;
-    }
-    return e;
+fn wnafDigits(h: GlvHalf) [glv_wnaf_len]i16 {
+    return ecmult.wnafDigits(5, h);
 }
 
 /// The odd multiples {1,3,…,15}·p (projective).
@@ -587,7 +565,7 @@ fn phiTable(tab: *const [glv_table_len]Secp256k1) [glv_table_len]Secp256k1 {
 /// odd-multiple tables: one shared doubling chain (its length = the highest
 /// nonzero digit position, ~128 for the balanced halves), one point add or
 /// sub per nonzero digit. `error.IdentityElement` if the result is neutral.
-fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *const [k][glv_wnaf_len]i8) IdentityElementError!Secp256k1 {
+fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *const [k][glv_wnaf_len]i16) IdentityElementError!Secp256k1 {
     // Number of digit positions up to the highest nonzero across all strings.
     var top: usize = 0;
     for (es) |e| {
