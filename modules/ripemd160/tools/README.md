@@ -45,3 +45,25 @@ Measured today:
 ripemd160 is itself usually OpenSSL-backed — "two oracles" that share a backend
 are one witness wearing two hats, and that should be visible rather than
 assumed away.
+
+## `bench.zig` — comparative benchmark against Bitcoin Core and OpenSSL
+
+The program behind the `**Performance:**` line of the maturity card
+(`CONVENTIONS.md` §9, kind 3). Not a test, not run by any lane.
+
+```bash
+zig build bench-ripemd160     # always ReleaseFast; run from the repository root
+```
+
+The card's reference is Bitcoin Core v29.0's `CRIPEMD160`: the shim
+`c_bench/bitcoin_bench.cpp` is built with `zig c++ -O3 -std=c++20` together with
+Core's own `ripemd160.cpp` (+ `crypto/ripemd160.h`, `crypto/common.h`,
+`compat/endian.h`, `compat/byteswap.h`), looked up in
+`.zig-cache/foreign/bitcoin-ripemd` or `$BITCOIN_RIPEMD_SRC`. If missing, the
+program prints the fetch recipe (raw.githubusercontent.com, tag v29.0, sha256 of
+`ripemd160.cpp` `126156e7107e8636be1b92869c1b7c3aa2b8067d6cdaf143595b23a2d26c66a3`)
+and exits 2; review the files before compiling them. A second side,
+`c_bench/openssl_bench.c`, is built with `zig cc` against the system
+`libcrypto.so.3` (`/usr/lib/x86_64-linux-gnu/libcrypto.so.3`, or `$CRYPTO_SO`;
+no headers needed) for an extra column. Workloads: one-shot digest of 64 B,
+64 KiB and 1 MiB. All three digests must be equal before any timing starts.

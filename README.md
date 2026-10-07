@@ -541,7 +541,7 @@ way to recognise it.
 | [`bech32`](modules/bech32/README.md) | 3 (S,H,P) | Bitcoin address encodings — bech32 (BIP173) / bech32m (BIP350) codec, segwit address encode/decode, base58check, P2PKH/P2WPKH. | any | ripemd160 |
 | [`bfv`](modules/bfv/README.md) | 4 (S,E) | BFV leveled homomorphic encryption (Fan-Vercauteren) over `Z_q[X]/(X^N+1)`, RNS — exact-integer keygen/encrypt/decrypt/multiply/relinearize. **No security level claimed.** | any | entropy |
 | [`bip32`](modules/bip32/README.md) | 3 (S,H,P) | BIP-39 mnemonic seed phrases + BIP-32 hierarchical-deterministic keys over secp256k1 — the wallet key-derivation foundation. | any | k256, ripemd160, bech32 |
-| [`bip340`](modules/bip340/README.md) | 3 (P) | BIP340 Schnorr signatures over secp256k1 (Bitcoin Taproot's signature scheme) — sign, verify, batch verify, x-only keys. | any | k256 |
+| [`bip340`](modules/bip340/README.md) | 4 (P) | BIP340 Schnorr signatures over secp256k1 (Bitcoin Taproot's signature scheme) — sign, verify, batch verify, x-only keys. | any | k256 |
 | [`bitcoinscript`](modules/bitcoinscript/README.md) | 3 (S,H,P) | Bitcoin Script consensus interpreter — full opcode set, CHECKSIG/CHECKMULTISIG; verifies bare/P2SH/segwit/P2TR key-path scripts. | any | bitcointx, k256, bip340, ripemd160 |
 | [`bitcointx`](modules/bitcointx/README.md) | 3 (S,E,H,P) | Bitcoin transaction (de)serialization + signature hashing — legacy, BIP143 segwit-v0, and BIP341 taproot key-path sighash. | any | bip340 |
 | [`blindrsa`](modules/blindrsa/README.md) | 3 (P) | RSA Blind Signatures (RFC 9474, RSABSSA) over `rsa` — the anonymous-token / Privacy Pass primitive: blind, sign, finalize, verify. | any | rsa |
