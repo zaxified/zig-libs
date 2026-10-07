@@ -16,8 +16,12 @@
 //! (empyrical, quantstats) and sharpe / sortino / calmar (CAGR from ffn,
 //! denominators from empyrical; the division stays this module's own).
 //!
+//! The Cornish-Fisher pair is anchored on R PerformanceAnalytics through a
+//! second generator, `tools/cf_oracle.R` → `testdata/cf_vectors.zig` (R is a
+//! one-shot tool: the vectors are committed, R is not needed to replay them).
+//!
 //! Not covered, for want of a foreign implementation: `twrDaily`,
-//! `brinsonAttribution`, the Cornish-Fisher pair (see SPEC Anchoring).
+//! `brinsonAttribution` (see SPEC Anchoring).
 
 const std = @import("std");
 const testing = std.testing;
@@ -283,5 +287,30 @@ test "oracle: correlationMatrix against pandas DataFrame.corr(min_periods)" {
                 try testing.expect(got == .null);
             }
         }
+    }
+}
+
+const cf = @import("testdata/cf_vectors.zig");
+
+test "oracle: Cornish-Fisher VaR/CVaR against R PerformanceAnalytics" {
+    for (cf.cases) |c| {
+        errdefer std.debug.print("series {s} conf {d}\n", .{ c.series, c.conf });
+        // The moments PerformanceAnalytics used: same skew/kurtosis definitions
+        // as this module's (population), on the same series.
+        const s = for (ref.series) |x| {
+            if (std.mem.eql(u8, x.name, c.series)) break x;
+        } else unreachable;
+        try near(c.skew, fs.skewness(s.values), 1e-12, 1e-10);
+        try near(c.kurt, fs.excessKurtosis(s.values), 1e-12, 1e-10);
+        const v = fs.cornishFisherVaR(c.mean, c.sd, c.skew, c.kurt, c.conf);
+        const cv = fs.cornishFisherCVaR(c.mean, c.sd, c.skew, c.kurt, c.conf);
+        // Acklam's Φ⁻¹ (|rel err| < 1.15e-9 on z) is the whole error budget:
+        // measured ≤ 2.5e-9 (VaR) and ≤ 3.3e-9 (CVaR) relative on these cases.
+        try near(c.var_, v, 1e-12, 1e-8);
+        try near(c.cvar, cv, 1e-12, 1e-8);
+        try testing.expect(cv >= v);
+        // The oracle's own uncertainty is well inside the tolerance: R's two
+        // integrations (in z and in p) agree.
+        try near(c.cvar, c.cvar_p, 0, 1e-9);
     }
 }

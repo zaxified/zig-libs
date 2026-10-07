@@ -1144,40 +1144,32 @@ pub fn cornishFisherVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, c
     return -(mean_ + zcf * std_dev);
 }
 
-fn cfQuantileReturn(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, p: f64) f64 {
-    const z = invNormCdf(p);
-    const zcf = cornishFisherZ(z, skew, excess_kurt);
-    return mean_ + std_dev * zcf;
-}
-
 /// Cornish-Fisher (modified) CVaR: −(1/α)·∫₀^α Q_CF(p) dp — the tail mean of
-/// the CF-implied quantile function, via fixed-step trapezoidal quadrature
-/// (deterministic, no allocation). This is the mathematically faithful
-/// tail-expectation of the CF quantile. A naive shortcut — plugging the
-/// CF z-score into the closed-form Gaussian ES ratio (`φ(z_cf)/α`) the way
-/// `cornishFisherVaR` plugs it into the VaR formula — is deliberately NOT
-/// used here: for negative-skew/fat-tailed inputs that shortcut can invert
-/// and report CVaR < VaR, violating the CVaR ≥ VaR invariant (verified while
-/// developing this function; the quadrature form does not have that
-/// failure mode for the skew/kurtosis ranges real return series produce).
-/// Collapses to `gaussianCVaR` (within quadrature error) when skew =
-/// excess_kurt = 0.
+/// the CF-implied quantile function, `Q_CF(p) = mean + std_dev·cf(Φ⁻¹(p))`.
+/// Exact, in closed form: substituting p = Φ(z) turns the integral into
+/// ∫ cf(z)·φ(z) dz over (−∞, a], a = Φ⁻¹(α), and `cf` is a cubic, whose
+/// truncated Gaussian moments are ∫z⁰φ = α, ∫z¹φ = −φ(a), ∫z²φ = α − a·φ(a),
+/// ∫z³φ = −(a² + 2)·φ(a). Collecting the terms:
+///
+///   CVaR = −mean + std_dev·φ(a)/α · [1 + a·s/6 − (1 − a²)·k/24 + (1 − 2a²)·s²/36]
+///
+/// (s = skew, k = excess_kurt), which is `gaussianCVaR` exactly when s = k = 0.
+/// Until 2026-10-07 this was a 2000-step trapezoidal quadrature from p = 1e-9,
+/// which overstated CVaR by up to 1.4e-3 relative on fat-tailed series (the
+/// integrand is steep as p → 0); R PerformanceAnalytics' modified-VaR quantile
+/// integrated by R's adaptive quadrature exposed it (src/oracle_test.zig).
+/// A naive shortcut — plugging the CF z-score into the Gaussian ES ratio
+/// (`φ(z_cf)/α`) the way `cornishFisherVaR` plugs it into the VaR formula — is
+/// a different, wrong quantity: for negative-skew/fat-tailed inputs it can
+/// report CVaR < VaR. Nor is this PerformanceAnalytics' `ES(method =
+/// "modified")`, which is Boudt, Peterson & Croux's Edgeworth estimator.
 pub fn cornishFisherCVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, confidence: f64) f64 {
     const alpha = 1.0 - confidence;
     if (alpha <= 0) return cornishFisherVaR(mean_, std_dev, skew, excess_kurt, confidence);
-    const steps: usize = 2000;
-    const eps = 1e-9;
-    const h = (alpha - eps) / @as(f64, @floatFromInt(steps));
-    var total: f64 = 0;
-    var i: usize = 0;
-    while (i <= steps) : (i += 1) {
-        const p = eps + @as(f64, @floatFromInt(i)) * h;
-        const w: f64 = if (i == 0 or i == steps) 0.5 else 1.0;
-        total += w * cfQuantileReturn(mean_, std_dev, skew, excess_kurt, p);
-    }
-    const integral = total * h;
-    const mean_tail = integral / alpha;
-    return -mean_tail;
+    const a = invNormCdf(alpha);
+    const a2 = a * a;
+    const bracket = 1.0 + a * skew / 6.0 - (1.0 - a2) * excess_kurt / 24.0 + (1.0 - 2.0 * a2) * skew * skew / 36.0;
+    return -mean_ + std_dev * normalPdf(a) / alpha * bracket;
 }
 
 /// Sample skewness (moment coefficient g1, population-normalized: divides by

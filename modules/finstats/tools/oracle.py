@@ -72,8 +72,11 @@ New inputs (the zero-return series, drawdown price series, correlation frame)
 come from a SEPARATE generator seeded 20261007 and are emitted AFTER everything
 else, so the values above are byte-identical to before.
 
+The Cornish-Fisher pair is anchored on R PerformanceAnalytics by
+tools/cf_oracle.R, over the series `--series-csv` prints (see that file).
+
 Not here, because no foreign implementation was found to anchor them on:
-twrDaily (Modified Dietz), brinsonAttribution, the Cornish-Fisher pair.
+twrDaily (Modified Dietz), brinsonAttribution.
 """
 import datetime as dt
 import sys
@@ -339,5 +342,16 @@ def main():
     sys.stdout.write("\n".join(o) + "\n")
 
 
+def dump_series():
+    """`--series-csv`: the five seeded series (the RNG's first draws, so the
+    same values `main` emits) as `name,value` lines, for tools/cf_oracle.R."""
+    for name, r in series().items():
+        for x in r:
+            sys.stdout.write(f"{name},{float(x)!r}\n")
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--series-csv"]:
+        dump_series()
+    else:
+        main()

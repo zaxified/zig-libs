@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — **BEHAVIOURAL, not breaking — Fixed: `cornishFisherCVaR` (and `parametricRisk`'s `cvar_cf`) overstated the Cornish-Fisher CVaR by up to 1.4e-3 relative** on fat-tailed series: it integrated the CF quantile with a 2000-step trapezoid from p = 1e-9, where the integrand is steep. It is now the exact closed form (the CF cubic against truncated Gaussian moments), within 3.3e-9 of R PerformanceAnalytics' modified-VaR quantile integrated by R; values change in roughly the fourth significant digit, smaller CVaRs. `cornishFisherVaR` is unchanged and now anchored on PerformanceAnalytics too (`tools/cf_oracle.R`).
+
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** more of the module is anchored on foreign implementations (`tools/oracle.py` → `src/oracle_test.zig`): `correlationMatrix` vs pandas `corr(min_periods)`, `drawdownEpisodes` vs ffn `drawdown_details`, ulcer vs ffn and quantstats, `tradeStats` vs quantstats, up/down capture vs empyrical, Treynor vs quantstats, and the CAGR numerator and denominators of Sharpe/Sortino/Calmar vs ffn/empyrical. No result changed; `riskMetrics`' doc comment now states the drawdown baseline and the ulcer denominator those comparisons rely on.
 
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** foreign reference values anchor xirr/xirrPrecise
