@@ -52,14 +52,23 @@ precedent set by `modules/hqc/tools/oracle_hqc.c`.
 ### Building the reference oracle
 
 ```bash
-BASE=<repo>/.zig-cache/uci-differential           # droppable; rebuilt by this recipe
-mkdir -p "$BASE"/{ref,out,probes}
-cd "$BASE/ref" && git clone --depth 1 https://git.openwrt.org/project/uci.git uci
-cd uci && printf '/* audit */\n' > uci_config.h
-gcc -O1 -std=gnu99 -I. -DUCI_PREFIX='"'"$BASE/ref/root"'"' \
-    -o "$BASE/out/oracle_dump" <repo>/modules/uci/tools/oracle_dump.c \
-    libuci.c file.c util.c delta.c parse.c
+modules/uci/tools/build-oracle.sh                 # from the repo root
+zig build interop-uci -Doptimize=ReleaseSafe -- --check
 ```
+
+`build-oracle.sh` is the whole recipe, idempotent, into the droppable
+`<repo>/.zig-cache/uci-differential` (override with `BASE=`): libuci pinned to
+commit `74f6277aabff...` (the one `src/testdata/libuci_capture.zig` was captured
+with; `git.openwrt.org`, falling back to the GitHub mirror), `uci_config.h`,
+`out/oracle_dump`, and `corpus.json` from `libuci_corpus.py`. It needs only
+`gcc`, `git` and `python3`; an existing checkout at the pinned commit is reused.
+
+`interop-uci` checks that the oracle and corpus exist (and names the script
+otherwise) and fails if `oracle_dump` exits non-zero (libuci rejecting a config
+is an `ERR` line, exit 0). With `--check` it also compares the rebuilt transcript
+byte for byte with the committed capture and exits 1 at the first differing case;
+`--capture` rewrites the capture instead. The plain run proves little: use `--check`
+on CI.
 
 `diff_run.sh` and `classify.sh` derive `BASE` from their own location, so they
 need no editing to run from a checkout anywhere.
