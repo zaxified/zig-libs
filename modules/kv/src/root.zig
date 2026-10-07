@@ -2553,10 +2553,15 @@ test "real filesystem: read_only neither creates, empties nor writes" {
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "missing", .{}));
 
     const w = try st.open("f", .create_truncate);
+    defer st.close(w);
     try st.writeAll(w, "data", 0);
     try st.sync(w);
 
     const r = try st.open("f", .read_only);
+    // Closed by hand below (the slot it frees is the point); until then a
+    // failed check must not leak it.
+    var r_open = true;
+    defer if (r_open) st.close(r);
     var buf: [8]u8 = undefined;
     try testing.expectEqualStrings("data", buf[0..try st.pread(r, &buf, 0)]);
     try testing.expectError(error.AccessDenied, st.writeAll(r, "XXXX", 0));
@@ -2567,10 +2572,10 @@ test "real filesystem: read_only neither creates, empties nor writes" {
     // The reader follows what the writer appends through its own handle.
     try st.writeAll(w, "more", 4);
     try testing.expectEqualStrings("datamore", buf[0..try st.pread(r, &buf, 0)]);
-    defer st.close(w);
 
     // The slot a read-only handle leaves behind carries no read-only flag.
     st.close(r);
+    r_open = false;
     const again = try st.open("g", .open_or_create);
     defer st.close(again);
     try testing.expectEqual(r, again);
