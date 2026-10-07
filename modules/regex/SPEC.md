@@ -51,30 +51,31 @@ the caller (`Matcher`), so captures never die at the next search; typed compile-
 instead of a runtime blow-up; anchored on the reference by a differential oracle (none of the Zig
 libraries documents one); a compile cheap enough to run per call (stack scratch, ~0.2–0.5 µs for
 a short pattern); every documented Go script name works (Go 1.26 refuses 46); a reader front end
-in constant memory without an allocator. **Speed against Go 1.26** (2026-10-07, x86-64,
-ReleaseFast vs `go build`, 24 shared workloads, same match counts on all; scratch bench, numbers
-are ours/Go time): no-match scans of 1 MiB — literal 0.23, `[XYZ]ABC…` 0.10, twelve-way
-alternation 0.28, `(?i)` 0.08; find-all over bxp rows 0.21–0.89; over 1 MiB of Czech/Greek/
-Cyrillic text (`\p{L}+`, `\b\w+\b`, `(?i)žluť\w*`, …) 0.15–0.79; short-string submatches
-0.43–0.95; compile + match per call 0.19–0.29. **Where we are behind:** speed in three places —
-`[ -~]*ABC…$` over 1 MiB 1.28× (the Pike VM re-walks its start closure every byte, as Go's NFA
-does), `INV-([0-9]{4}-[0-9]{4})` find-all over 85 KiB 1.27× (too long for the backtracker's bit
-budget, so the Pike VM with per-thread captures), an anchored find-all 101 vs 65 ns; no DFA (Go
-has none either; RE2 and Rust do). Unicode tables are 15.0 (Go 1.26's); quangdn42/regex.zig
-carries 17.0. CAPACITY: 1024 instructions and nesting 250, where Go allocates further.
-**Head-to-head with quangdn42/regex.zig** (bxp's engine, commit `a22a2e68`, both through their
-public APIs, 2026-10-07, x86-64 ReleaseFast, same answers on every case): per row with the
-pattern compiled per call (bxp's REGEX_MATCH / REGEX_EXTRACT, nine template patterns × eight memo
-rows) ours/quangd = 0.24 (0.14–0.43 per case); precompiled find-all over 83 KiB = 0.32 overall,
-behind only on `#([0-9]+)` (1.80) — measured before the backtracker and the literal prefilter,
-which made our find-all 1.3–4.5× faster again.
+in constant memory without an allocator. **Speed against Go 1.26** (2026-10-07 night, x86-64,
+ReleaseFast vs `go build`, 18 shared workloads incl. Go's own Easy/Medium/Hard benchmarks, same
+match counts on all; scratch bench, numbers are ours/Go time, lower is better): ahead on all 18 —
+no-match scans of 1 MiB 0.02–0.44 (`[ -~]*ABC…$` 0.08, twelve-way alternation 0.02, by the lazy
+DFA); `INV-([0-9]{4}-[0-9]{4})` find-all over 85 KiB 0.25–0.27 and dense `[A-Z]+` over 1 MiB 0.24
+(the backtracker's window); over 1 MiB of Czech/Greek/Cyrillic text (`\p{L}+`, `\b\w+\b`,
+`(?i)žluť\w*`, …) 0.05–0.32; short-string find and submatches 0.58–0.88; compile + submatch per
+call 0.39. **Where we are behind:** Unicode tables are 15.0 (Go 1.26's); quangdn42/regex.zig
+carries 17.0. CAPACITY: 1024 instructions and nesting 250, where Go allocates further (kept as a
+listed divergence). The DFA answers `isMatch`/`fullMatch` only; searches with positions run the
+backtracker or the Pike VM (RE2 and Rust run a forward and a reverse DFA there — not needed to lead
+Go here). **Head-to-head with quangdn42/regex.zig** (bxp's engine, commit `a22a2e68`, both through
+their public APIs, re-run 2026-10-07 night after the backtracker, the literal prefilter, the DFA and
+the window, x86-64 ReleaseFast, same answers on every case): per row with the pattern compiled per
+call (bxp's REGEX_MATCH / REGEX_EXTRACT, nine template patterns × eight memo rows) ours/quangd =
+0.27 (0.19–0.40 per case); precompiled find-all over 83 KiB = 0.09 overall (0.02–0.55; the former
+loss `#([0-9]+)` 1.80 is now 0.55).
 
 ## What this module is, and what it is not
 
 A matcher for RE2's language with RE2's guarantee: time linear in pattern × input. It is not a
 PCRE: backreferences, lookaround, atomic groups, possessive quantifiers and recursion are refused
 by design (`error.InvalidEscape` / `error.InvalidPerlOp`), because each of them needs
-backtracking. It has no DFA: dense scans of long texts run at Go's speed, not RE2's.
+backtracking. Its lazy DFA serves `isMatch`/`fullMatch` only (on the stack, ASCII transitions
+cached); a search that reports positions or groups runs a backtracker or a Pike VM.
 
 ## Design & invariants
 
@@ -123,12 +124,24 @@ backtracking. It has no DFA: dense scans of long texts run at Go's speed, not RE
   state once per step, assertions judged from the code points on either side. An unanchored search
   starts a new thread at every position until a match is found. `isMatch`/`fullMatch` keep state
   sets on the stack (no captures); `Matcher` keeps per-thread capture slots in scratch made once.
-- **The backtracker** (leftmost-first only): while (positions × instructions) ≤ 256 Kbit (Go's
-  bound), `Matcher` searches depth-first with one visited bit per (position, instruction), so
-  every state is explored once — linear, like the VM — and carries one set of captures instead
-  of a copy per thread (short-string submatches 4–11× faster than the VM). The bits are kept
-  across start positions (a state that failed fails from any start) and only the used prefix is
-  cleared afterwards; past 16 Ki pending jobs, or on OOM, the search goes to the Pike VM. The
+- **The lazy DFA** (`isMatch`, `fullMatch`; programs ≤ 128 instructions): a state is the set of
+  instructions to follow from a position plus what an assertion can tell of the code point
+  before it (start of text, `\n`, word, other — all `assertHolds` reads). A step closes the set
+  over empty transitions with the next code point known (so `$`, `\b` are exact), consumes it,
+  and adds the start again for an unanchored search. Up to 32 states and their transitions on
+  ASCII bytes are kept in ~4.7 KiB of stack; a non-ASCII step is worked out each time; a full
+  table is emptied and refilled (each step then costs what an NFA step does — still linear).
+  The state holding only the start uses the prefilter's skip. Larger programs and the reader
+  front end run the NFA set simulation (`runSetOn`).
+- **The backtracker** (leftmost-first only): `Matcher` searches depth-first with one visited bit
+  per (position, instruction), so every state is explored once — linear, like the VM — and
+  carries one set of captures instead of a copy per thread (short-string submatches 4–11× faster
+  than the VM). The bits cover a window of positions, 256 Kbit / instructions wide (Go's budget,
+  which Go applies to the whole text): kept across start positions inside it (a state that
+  failed fails from any start), and moved — the used bits cleared — once a start lies past every
+  position visited. An exploration that runs off the window's end, past 16 Ki pending jobs, or on
+  OOM hands the search to the Pike VM from that start (no match begins earlier). A short match
+  in a long text is thus found by the backtracker (find-all over 85 KiB 4–5× faster). The
   robustness driver and the fuzz harness compare the two engines, groups included.
 - **Reader front end.** Both VMs read through a text adapter; for a `std.Io.Reader` it is a
   window of two code points decoded exactly as a slice (U+FFFD one byte wide, the rest of a bad
@@ -147,8 +160,9 @@ backtracking. It has no DFA: dense scans of long texts run at Go's speed, not RE
 ## Threat model
 
 Patterns and input may both be hostile. Time is O(pattern × input) by construction, in both
-engines; memory is bounded by the compile-time capacities and the backtracker's fixed budget
-(≤ 32 KiB of bits, ≤ 16 Ki jobs) — no allocation grows with the input. Compile work is
+engines and the DFA (a full DFA table is emptied, never grown: a step then costs an NFA step);
+memory is bounded by the compile-time capacities, the DFA's ~4.7 KiB of stack and the
+backtracker's fixed budget (≤ 32 KiB of bits, ≤ 16 Ki jobs) — no allocation grows with the input. Compile work is
 bounded too: nested counted repetitions multiply to at most 1000 (Go's rule — an empty body emits
 nothing, so the instruction capacity alone would not stop `((a{0}){1000}){1000}…`). The parser and
 compiler recurse once per nesting level, bounded by `max_depth` (250) — a deeply nested pattern
@@ -161,6 +175,29 @@ Debug build (tested).
 feature and a deterministic robustness driver (20,000 random patterns × 4 inputs, invalid UTF-8
 included: compile-or-refuse, the entry points agree, the prefilter only skips, the backtracker and
 the Pike VM give the same groups at every start, no trap).
+
+**Third round (2026-10-07 night, speed: the lazy DFA and the backtracker's window; fuzz POSIX).**
+*Tests:* the DFA against the NFA (reader) and `Matcher.find` on 11 patterns × 300 random texts
+(assertions, `(?m)`, non-ASCII, anchored) and on 20 KB texts whose tables are emptied hundreds of
+times — one anchored pattern carries the position's parity in its state, so a single wrong
+transition shows in the answer; the window: find-all with groups against the Pike VM over 40 KB
+with sparse matches, and a program whose window is a whole number of words walked to its very
+end. *Mutation* (schemata, ReleaseSafe): 11 mutants — the row reset after a flush, the word and
+newline context, the clear on a window move, the window's edge (`>` for `>=`), the idle test,
+the handover start, the restart bit, caching a transition across a flush, and two in
+leftmost-longest; 2 survived the first tests (the window's edge — reachable only when the
+window is word-aligned; caching across a flush — self-healing in a state that forgets after 7
+bytes) and were closed by the two targeted tests above; 11/11 killed. *Fuzz:* a POSIX ERE grammar
+of its own (a third of the runs; POSIX reached 20 % of all runs, was ~1 %) and an independent
+leftmost-longest reference — the leftmost start with a full-matching substring, the longest such
+— for every assertion-free pattern (Perl patterns through their `Longest` twin); it alone kills
+a longest mode that stops at the first match. 200,000 runs clean (2,900/s, ReleaseSafe); the
+first run caught a harness error (a damaged pattern turned into `\b`), not an engine one. *Review*
+(independent, read-only, questions on DFA ≡ NFA, window ≡ Pike VM, bounds and linearity, the
+fuzz reference): no HIGH, MEDIUM or LOW; 4 INFO — one taken (an assert that a consuming
+instruction is never last, which the DFA's next-set index relies on), three are speed-only
+notes or limits of the reference by design (it shares the compiled program; inputs over 24
+bytes skip it).
 
 **Second round (2026-10-07, the parity work: `\p`, POSIX, leftmost-longest, the API on top,
 the reader, the backtracker, the literal prefilter).** *Oracle:* every Perl-syntax case replayed
@@ -212,18 +249,15 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
 
 ## Backlog / deferred
 
-- **Speed past Go's: a lazy DFA with a caller-owned cache** *(survey 2026-10-07)* — RE2's and
-  Rust's; would take the three cases where we trail Go (dense `[ -~]*…`, long-text find-all with
-  captures) well past it. Not needed for parity. Fits §2 with caller-owned scratch.
+- **A DFA for searches with positions** *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
+  night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
+  capture engine runs; dense long-text find-all is already 0.24–0.32 of Go's time, so speed only.
+  Would need caller-owned (`Matcher`) cache scratch.
 - **Capacity past 1024 instructions / nesting 250** *(2026-10-07; kept as the listed CAPACITY
   divergence by the user's decision, may be revisited)* — Go compiles `a{1000}b{1000}`; here
   `error.PatternTooLarge`. Would need a heap program and heap VM scratch for large patterns while
   small ones stay allocation-free.
 - **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
-- **Fuzz: a POSIX grammar of its own** *(2026-10-07)* — the shared grammar reaches POSIX in ~1 %
-  of runs (most random patterns use Perl syntax POSIX refuses).
-- **Refresh the quangdn42/regex.zig head-to-head** *(2026-10-07)* — taken before the backtracker
-  and the literal prefilter.
 - **`RegexSet`** *(survey 2026-10-07)* — Rust's and RE2's, not Go's.
 - **Unicode 17.0** — follows Go: regenerate the tables when Go's `unicode` moves.
 - **Sibling modules that can now adopt it** *(2026-10-07)* — `validate` (`Pattern.matcher` takes a

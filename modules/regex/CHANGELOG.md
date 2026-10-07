@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Faster, same answers, now ahead of Go 1.26 on every shared workload: `isMatch` /
+  `fullMatch` run a lazy DFA on the stack (programs up to 128 instructions) — Go's Hard benchmark
+  `[ -~]*ABC…$` over 1 MiB 16× faster than before (was 1.25× slower than Go, now 0.08), a 12-way
+  alternation 12×; the bit-state backtracker covers a window of positions instead of refusing
+  any text longer than its budget, so a short match in a long text no longer falls to the Pike VM
+  — find-all with groups over 85 KiB 4.8× faster (1.30× slower than Go → 0.27), dense find-all
+  over 1 MiB ~2×. No public API change; `isMatch`/`fullMatch` take ~4.7 KiB more stack (in a frame
+  of their own, never live together with the NFA's).
 - **2026-10-07** — Fixes from the audit of the entries below: a surrogate literal (`\x{D800}`, which Go
   compiles) panicked in the literal-prefix walk at compile time — now written as U+FFFD, as Go;
   `expand` with a repeated group name takes the first group of that name that took part (Go), not

@@ -248,8 +248,64 @@ pub const Regex = struct {
     }
 
     fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+        if (re.runDfa(input, full)) |found| return found;
         var t: SliceText = .{ .input = input };
         return re.runSetOn(&t, full);
+    }
+
+    /// `runSet` as a lazy DFA (`Dfa`) — null for a program too large for it.
+    /// Each state is the set of instructions to follow from a position, and
+    /// what the code point before it was, as far as an assertion can tell;
+    /// a transition on an ASCII byte is worked out once and then looked up.
+    /// `noinline`: its stack scratch is never live with `runSetOn`'s.
+    noinline fn runDfa(re: *const Regex, input: []const u8, full: bool) ?bool {
+        if (re.insts.len > Dfa.max_insts) return null;
+        var d: Dfa = undefined;
+        d.n = 0;
+        const pf = &re.prefilter;
+        // A thread may start at every position, not only the first.
+        const restart = !full and !pf.anchored;
+        const skip = restart and pf.first != null;
+        const start: Dfa.Set = .{ 1, 0 };
+        var s = d.intern(start, .start, restart);
+        var pos: usize = 0;
+        while (true) {
+            if (skip and d.idle[s]) {
+                // No thread alive: jump to where a match can start.
+                pos = pf.next(input, pos) orelse return false;
+                s = d.intern(start, .of(runeBefore(input, pos)), restart);
+            }
+            if (pos == input.len) return re.dfaAccepts(d.keys[s], d.ctxs[s]);
+            const c = input[pos];
+            if (c < 0x80) {
+                const t = d.trans[s][c];
+                if (t >= 2) {
+                    s = t - 2;
+                    pos += 1;
+                    continue;
+                }
+                if (t == 1) return true;
+            }
+            const here = decode(input, pos);
+            const next = re.dfaStep(d.keys[s], d.ctxs[s], here.cp.?, restart, full) orelse {
+                if (c < 0x80) d.trans[s][c] = 1;
+                return true;
+            };
+            if (next[0] == 0 and next[1] == 0) return false; // no thread left
+            const ctx: Dfa.Ctx = .of(here.cp);
+            var cache = c < 0x80;
+            const ns = d.find(next, ctx) orelse blk: {
+                if (d.n == Dfa.max_states) {
+                    // Full: start over; the current state is not needed again.
+                    d.n = 0;
+                    cache = false;
+                }
+                break :blk d.add(next, ctx, restart);
+            };
+            if (cache) d.trans[s][c] = ns + 2;
+            pos += here.w;
+            s = ns;
+        }
     }
 
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
@@ -294,6 +350,85 @@ pub const Regex = struct {
             prev = here.cp;
             std.mem.swap(*StateSet, &cur, &nxt);
         }
+    }
+
+    /// The instructions a DFA state's set reaches without consuming input,
+    /// at a position between `prev` and `next`: the consuming ones and the
+    /// match. `matched`: the match is among them.
+    fn dfaClosure(re: *const Regex, k: Dfa.Set, prev: ?u21, next: ?u21, matched: *bool) Dfa.Set {
+        var seen: Dfa.Set = .{ 0, 0 };
+        var out: Dfa.Set = .{ 0, 0 };
+        var stack: [3 * Dfa.max_insts]u16 = undefined;
+        var sp: usize = 0;
+        for (k, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                stack[sp] = @intCast(wi * 64 + @ctz(w));
+                sp += 1;
+            }
+        }
+        matched.* = false;
+        while (sp != 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            const bit = @as(u64, 1) << @truncate(pc);
+            if (seen[pc >> 6] & bit != 0) continue;
+            seen[pc >> 6] |= bit;
+            switch (re.insts[pc]) {
+                .jmp => |t| {
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |sx| {
+                    stack[sp] = sx.y;
+                    stack[sp + 1] = sx.x;
+                    sp += 2;
+                },
+                .save => {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .assert => |a| if (assertHolds(a, prev, next)) {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .match => {
+                    matched.* = true;
+                    out[pc >> 6] |= bit;
+                },
+                .rune, .any, .any_not_nl => out[pc >> 6] |= bit,
+            }
+        }
+        return out;
+    }
+
+    /// One DFA step from set `k` after `ctx`, over code point `cp`: the set
+    /// for the position after it, or null when a match ends before `cp`
+    /// (never in a full match, which must end at the end of the text).
+    fn dfaStep(re: *const Regex, k: Dfa.Set, ctx: Dfa.Ctx, cp: u21, restart: bool, full: bool) ?Dfa.Set {
+        var matched: bool = undefined;
+        const cl = re.dfaClosure(k, ctx.rep(), cp, &matched);
+        if (matched and !full) return null;
+        var nk: Dfa.Set = .{ @intFromBool(restart), 0 };
+        for (cl, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) : (w &= w - 1) {
+                const pc: u16 = @intCast(wi * 64 + @ctz(w));
+                if (re.consumes(pc, cp)) {
+                    // A consuming instruction is never last (the program ends in `match`).
+                    std.debug.assert(pc + 1 < re.insts.len);
+                    nk[(pc + 1) >> 6] |= @as(u64, 1) << @truncate(pc + 1);
+                }
+            }
+        }
+        return nk;
+    }
+
+    /// Does set `k` after `ctx` reach the match at the end of the text?
+    fn dfaAccepts(re: *const Regex, k: Dfa.Set, ctx: Dfa.Ctx) bool {
+        var matched: bool = undefined;
+        _ = re.dfaClosure(k, ctx.rep(), null, &matched);
+        return matched;
     }
 
     /// Add `pc0` and every state reachable from it without consuming input,
@@ -405,6 +540,73 @@ const StateSet = struct {
     fn clear(s: *StateSet, words: usize) void {
         s.n = 0;
         @memset(s.seen.masks[0..words], 0);
+    }
+};
+
+/// `Regex.runDfa`'s scratch, on the stack (~4.7 KiB): up to `max_states`
+/// states of a program of up to `max_insts` instructions, and their
+/// transitions on ASCII bytes. A full table is emptied and refilled.
+const Dfa = struct {
+    const max_insts = 128;
+    const max_states = 32;
+    /// One bit per instruction.
+    const Set = [2]u64;
+
+    /// What an assertion can tell of the code point before a position.
+    const Ctx = enum(u8) {
+        start,
+        newline,
+        word,
+        other,
+
+        fn of(cp: ?u21) Ctx {
+            const c = cp orelse return .start;
+            if (c == '\n') return .newline;
+            return if (isWord(c)) .word else .other;
+        }
+
+        /// A code point of this class, as `assertHolds` sees it.
+        fn rep(ctx: Ctx) ?u21 {
+            return switch (ctx) {
+                .start => null,
+                .newline => '\n',
+                .word => 'a',
+                .other => ' ',
+            };
+        }
+    };
+
+    keys: [max_states]Set,
+    ctxs: [max_states]Ctx,
+    /// The state's set is the start alone: no thread is alive.
+    idle: [max_states]bool,
+    n: u8,
+    /// `trans[s][c]`: 0 not worked out yet, 1 a match ends before `c`,
+    /// otherwise the next state + 2.
+    trans: [max_states][128]u8,
+
+    fn find(d: *const Dfa, k: Set, ctx: Ctx) ?u8 {
+        for (d.keys[0..d.n], d.ctxs[0..d.n], 0..) |key, c, i| {
+            if (key[0] == k[0] and key[1] == k[1] and c == ctx) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Add a state (the table has room).
+    fn add(d: *Dfa, k: Set, ctx: Ctx, restart: bool) u8 {
+        const i = d.n;
+        d.keys[i] = k;
+        d.ctxs[i] = ctx;
+        d.idle[i] = restart and k[0] == 1 and k[1] == 0;
+        @memset(&d.trans[i], 0);
+        d.n += 1;
+        return i;
+    }
+
+    fn intern(d: *Dfa, k: Set, ctx: Ctx, restart: bool) u8 {
+        if (d.find(k, ctx)) |i| return i;
+        if (d.n == max_states) d.n = 0;
+        return d.add(k, ctx, restart);
     }
 };
 
@@ -742,10 +944,19 @@ pub const Matcher = struct {
     /// nothing; later threads of the same start may still find a longer one,
     /// and threads that started later are dropped.
     fn run(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
-        if (!full and !m.pike_only and !m.re.longest) if (m.backtrack(input, from)) |found| return found;
+        var start = from;
+        if (!full and !m.pike_only and !m.re.longest) switch (m.backtrack(input, from)) {
+            .found => return true,
+            .none => return false,
+            .pike => |at| start = at,
+        };
         var t: SliceText = .{ .input = input };
-        return m.runOn(&t, from, full);
+        return m.runOn(&t, start, full);
     }
+
+    /// What `backtrack` settled: a match, none, or no answer — the Pike VM
+    /// takes over from `start` (no match begins before it).
+    const Backtracked = union(enum) { found, none, pike: usize };
 
     /// Leftmost-first search by backtracking with a visited bit per
     /// (position, instruction) — each state is explored once, so the time is
@@ -753,47 +964,66 @@ pub const Matcher = struct {
     /// the preferred branch first finds the leftmost-first match first, and
     /// carries one set of captures instead of one per thread. A state that
     /// failed once fails again from any start, so the bits are kept across
-    /// start positions. Null when the text is too long for the bit budget, or
-    /// the scratch cannot grow: the caller runs the Pike VM.
-    fn backtrack(m: *Matcher, input: []const u8, from: usize) ?bool {
+    /// start positions. The bits cover a window of positions from `base`
+    /// (the bit budget's worth), not the whole text: a search whose match is
+    /// short backtracks however long the text is. Once a start lies past
+    /// every position visited, the window moves there (no later start
+    /// revisits an earlier position). When the exploration runs off the
+    /// window's end, or the scratch cannot grow, the Pike VM takes over.
+    fn backtrack(m: *Matcher, input: []const u8, from: usize) Backtracked {
         const re = m.re;
         const n = re.insts.len;
-        const width = input.len - from + 1;
-        if (width > max_backtrack_bits / n) return null;
+        const width = @min(input.len - from + 1, max_backtrack_bits / n);
+        if (width < 2) return .{ .pike = from };
         const words = (width * n + 63) / 64;
         if (m.bt_visited.items.len < words) {
             const old = m.bt_visited.items.len;
-            m.bt_visited.resize(m.gpa, words) catch return null;
+            m.bt_visited.resize(m.gpa, words) catch return .{ .pike = from };
             @memset(m.bt_visited.items[old..], 0);
         }
-        var hi = from; // the furthest position a state was visited at
+        var win: Window = .{ .base = from, .width = width, .hi = from };
         defer {
-            // Leave the bits zero: only the prefix that was used.
-            const used = ((hi - from + 1) * n + 63) / 64;
-            @memset(m.bt_visited.items[0..used], 0);
+            win.clear(m.bt_visited.items, n);
             m.bt_jobs.clearRetainingCapacity();
         }
         const pf = &re.prefilter;
         var start = from;
         while (true) {
-            if (pf.anchored and start != from) return false;
-            if (pf.first != null) start = pf.next(input, start) orelse return false;
-            switch (m.backtrackAt(input, from, start, &hi)) {
-                .found => return true,
-                .oom => return null,
+            if (pf.anchored and start != from) return .none;
+            if (pf.first != null) start = pf.next(input, start) orelse return .none;
+            if (start > win.hi) {
+                win.clear(m.bt_visited.items, n);
+                win = .{ .base = start, .width = width, .hi = start };
+            }
+            switch (m.backtrackAt(input, start, &win)) {
+                .found => return .found,
+                .pike => return .{ .pike = start },
                 .none => {},
             }
-            if (start >= input.len) return false;
+            if (start >= input.len) return .none;
             start += decode(input, start).w;
         }
     }
 
-    fn backtrackAt(m: *Matcher, input: []const u8, from: usize, start: usize, hi: *usize) enum { found, none, oom } {
+    /// The positions `backtrack`'s bits stand for: `base` up to, not
+    /// including, `base + width`; `hi` the furthest one visited.
+    const Window = struct {
+        base: usize,
+        width: usize,
+        hi: usize,
+
+        /// Zero the bits that were used, leaving the scratch all zero.
+        fn clear(w: *const Window, visited: []u64, n: usize) void {
+            @memset(visited[0 .. ((w.hi - w.base + 1) * n + 63) / 64], 0);
+        }
+    };
+
+    fn backtrackAt(m: *Matcher, input: []const u8, start: usize, win: *Window) enum { found, none, pike } {
         const re = m.re;
         const n = re.insts.len;
         const visited = m.bt_visited.items;
         @memset(m.tmp, nil);
-        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = 0, .pos = start } }) catch return .oom;
+        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = 0, .pos = start } }) catch return .pike;
         const limit = max_backtrack_jobs;
         while (m.bt_jobs.pop()) |job| {
             var pc: u16 = undefined;
@@ -809,11 +1039,12 @@ pub const Matcher = struct {
                 },
             }
             while (true) {
-                const bit = (pos - from) * n + pc;
+                if (pos - win.base >= win.width) return .pike;
+                const bit = (pos - win.base) * n + pc;
                 const mask = @as(u64, 1) << @truncate(bit);
                 if (visited[bit >> 6] & mask != 0) break;
                 visited[bit >> 6] |= mask;
-                hi.* = @max(hi.*, pos);
+                win.hi = @max(win.hi, pos);
                 switch (re.insts[pc]) {
                     .match => {
                         @memcpy(m.best, m.tmp);
@@ -828,15 +1059,15 @@ pub const Matcher = struct {
                         pc += 1;
                     },
                     .split => |sp| {
-                        if (m.bt_jobs.items.len >= limit) return .oom;
-                        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = sp.y, .pos = pos } }) catch return .oom;
+                        if (m.bt_jobs.items.len >= limit) return .pike;
+                        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = sp.y, .pos = pos } }) catch return .pike;
                         pc = sp.x;
                     },
                     .jmp => |t| pc = t,
                     .save => |slot| {
                         if (slot < m.k) {
-                            if (m.bt_jobs.items.len >= limit) return .oom;
-                            m.bt_jobs.append(m.gpa, .{ .restore = .{ .slot = slot, .val = m.tmp[slot] } }) catch return .oom;
+                            if (m.bt_jobs.items.len >= limit) return .pike;
+                            m.bt_jobs.append(m.gpa, .{ .restore = .{ .slot = slot, .val = m.tmp[slot] } }) catch return .pike;
                             m.tmp[slot] = pos;
                         }
                         pc += 1;
@@ -1346,7 +1577,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
     const text = try gpa.alloc(u8, 40_000);
     defer gpa.free(text);
     for (text) |*c| c.* = "abcAB -1\n"[rng.uintLessThan(usize, 9)];
-    const patterns = [_][]const u8{ "(a+)(b*)c", "AB-1", "(?:a|b)*?c(A)", "((a)|b)+?B", "x*", "[ab]{3,}(c|\\n)", "(a*)*(b*)*c?$" };
+    const patterns = [_][]const u8{ "(a+)(b*)c", "AB-1", "(?:a|b)*?c(A)", "((a)|b)+?B", "x*", "[ab]{3,}(c|\\n)", "(a*)*(b*)*c?$", "AB-1(a|b)\\n", "1\\n([ab]{2}) c", "(?:b|[ab]{40})A{2}" };
     var ga: [8]?Span = undefined;
     var gb: [8]?Span = undefined;
     for (patterns) |p| {
@@ -1358,6 +1589,20 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
         defer pm.deinit();
         pm.pike_only = true;
         const ng = re.names.len;
+        // Every match over the whole text: for the larger programs the
+        // backtracker's window (budget / instructions) is shorter than the
+        // text, so it moves from one sparse match to the next, or runs off
+        // its end into the Pike VM.
+        var it = m.iterator(text);
+        var pit = pm.iterator(text);
+        while (true) {
+            const s1 = it.nextCaptures(ga[0..ng]);
+            const s2 = pit.nextCaptures(gb[0..ng]);
+            errdefer std.debug.print("/{s}/ find-all at {any}\n", .{ p, s2 });
+            try testing.expectEqual(s2, s1);
+            if (s1 == null) break;
+            try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
+        }
         // Starts from far (Pike) to near the end (backtracker), each window length.
         for ([_]usize{ 0, 100, 20_000, 39_000, 39_900, 39_990, 40_000 }) |from| {
             for ([_]usize{ 40, 300, 5_000, 40_000 }) |len| {
@@ -1384,6 +1629,103 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
     try testing.expect(dm.bt_jobs.capacity >= Matcher.max_backtrack_jobs); // the jobs did not
     try testing.expectEqual(Span{ .start = 0, .end = long.len }, dg[0].?);
     try testing.expectEqual(Span{ .start = long.len - 2, .end = long.len - 1 }, dg[1].?);
+}
+
+test "the lazy DFA agrees with the NFA: more states than its table, assertions, non-ASCII" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x646661);
+    const rng = prng.random();
+    // `(a|b)*a(a|b){6}` needs 2^7 states, four times the table: it is
+    // emptied and refilled many times over one text.
+    const patterns = [_][]const u8{
+        "(a|b)*a(a|b){6}$",   "(a|b)*a(a|b){6}c", "\\ba[ab]{5}\\b", "(?m)^b[ab]*a$",
+        "(?m)^(?:ab|ba)+\\n",
+        "\\B[ab]{3}č",
+        "(?i)[áa]{2}[bB]{2}",
+        "[^ab\\n]a{3}",
+        "(?:a|b|č)*ač{2}",
+        "\\Aa(?:b|a)*\\z",    "a{0,3}$",
+    };
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        try testing.expect(re.insts.len <= Dfa.max_insts);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        for (0..300) |round| {
+            var text: [600]u8 = undefined;
+            var len: usize = 0;
+            const n = rng.uintLessThan(usize, if (round < 100) 24 else 400);
+            while (len < n) {
+                const piece: []const u8 = switch (rng.uintLessThan(u8, 12)) {
+                    0...4 => "a",
+                    5...8 => "b",
+                    9 => "\n",
+                    10 => "č",
+                    else => " ",
+                };
+                @memcpy(text[len..][0..piece.len], piece);
+                len += piece.len;
+            }
+            const in = text[0..len];
+            // The NFA: through a reader (`runSetOn`), and the Matcher's find.
+            var r: std.Io.Reader = .fixed(in);
+            const nfa = try re.isMatchReader(&r);
+            errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(in) });
+            try testing.expectEqual(nfa, re.isMatch(in));
+            try testing.expectEqual(m.find(in, 0) != null, re.isMatch(in));
+            var t: SliceText = .{ .input = in };
+            try testing.expectEqual(re.runSetOn(&t, true), re.fullMatch(in));
+        }
+    }
+    // Long texts: the tables are emptied hundreds of times per text, some of
+    // them while the DFA stands in the state about to be renumbered 0. The
+    // anchored pattern's states carry the parity of the position, so one
+    // wrong transition shows in the answer however far from the end it was.
+    var long: [20_000]u8 = undefined;
+    for ([_][]const u8{ "(a|b)*a(a|b){6}c", "(?:a|b)*b(?:a|b){5}(?:\\b|a)c", "\\A(?:[ab][ab])*a[ab]{12}c" }) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        for (0..24) |_| {
+            for (&long) |*c| c.* = "ab"[rng.uintLessThan(u8, 2)];
+            long[long.len - 1] = 'c';
+            var r: std.Io.Reader = .fixed(&long);
+            errdefer std.debug.print("/{s}/ on a long text\n", .{p});
+            try testing.expectEqual(try re.isMatchReader(&r), re.isMatch(&long));
+            for ([_]usize{ 200, 3_000, 19_999 }) |cut| {
+                var r2: std.Io.Reader = .fixed(long[0..cut]);
+                try testing.expectEqual(try re.isMatchReader(&r2), re.isMatch(long[0..cut]));
+            }
+        }
+    }
+}
+
+test "the backtracker's window: an exploration that reaches its very end is handed over" {
+    // A program whose window (budget / instructions) is a whole number of
+    // 64-bit words, on a text longer than the window that `[ab]*` runs
+    // through to the end: the walk reaches the first position past the window.
+    const gpa = testing.allocator;
+    var src: [80]u8 = undefined;
+    var found = false;
+    for (1..60) |k| {
+        const p = try std.fmt.bufPrint(&src, "a[ab]*{s}", .{("c" ** 60)[0..k]});
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        const n = re.insts.len;
+        const width = Matcher.max_backtrack_bits / n;
+        if (width * n % 64 != 0) continue;
+        found = true;
+        const text = try gpa.alloc(u8, width + 50);
+        defer gpa.free(text);
+        for (text, 0..) |*c, i| c.* = "ab"[i % 2];
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        try testing.expectEqual(@as(?Span, null), m.find(text, 0));
+        // Followed by a match: found, by the Pike VM, from where the walk stopped.
+        @memcpy(text[text.len - k ..], ("c" ** 60)[0..k]);
+        try testing.expectEqual(@as(?Span, .{ .start = 0, .end = text.len }), m.find(text, 0));
+    }
+    try testing.expect(found);
 }
 
 test "surrogates compile and match nothing; Expand takes the first group of a name that took part" {

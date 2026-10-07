@@ -3,8 +3,9 @@
 RE2-syntax regular expressions in linear time, at parity with Go's `regexp`: its Perl and POSIX
 grammars (Unicode classes `\p{…}` included), leftmost-first and leftmost-longest matching, and its
 API — find, submatches, find-all, replace with `$1`/`${name}` templates, split, quote, literal
-prefix, matching from a `std.Io.Reader`. A Pike VM over a Thompson NFA, and for short texts a
-bit-state backtracker; both visit each (position, instruction) at most once, so no pattern and no
+prefix, matching from a `std.Io.Reader`. A Pike VM over a Thompson NFA, a bit-state backtracker
+for short matches, a lazy DFA for yes/no; each visits a (position, instruction) at most once
+per step, so no pattern and no
 input can make a match explode: safe for patterns and text an attacker controls. Compiling at
 comptime needs no allocator, and `isMatch`/`fullMatch` need none either.
 
@@ -123,24 +124,27 @@ pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 nodes) in ~9 KiB of stack scratch, and only a larger one in a full `Builder` from the allocator.
 At compile time the program is analysed once: a pattern anchored at `\A`/`^` is tried at the
 start only; a literal prefix of two bytes or more is searched for by a 32-byte vector scan, a
-single first byte by `indexOfScalar`. Searches with groups in a short text (≤ 256 Kbit of
-position × instruction) run on a bit-state backtracker, with one set of captures instead of one
-per thread; longer ones on the Pike VM.
+single first byte by `indexOfScalar`. `isMatch`/`fullMatch` run a lazy DFA on the stack
+(programs up to 128 instructions; transitions on ASCII bytes cached). Searches with groups run on
+a bit-state backtracker over a window of 256 Kbit / instructions positions — a short match in a
+long text included — with one set of captures instead of one per thread; an exploration longer
+than the window goes to the Pike VM.
 
-Against Go 1.26 `regexp` (2026-10-07, x86-64, ReleaseFast vs `go build`, 24 shared workloads,
-same match counts; ours/Go time, lower is better):
+Against Go 1.26 `regexp` (2026-10-07 night, x86-64, ReleaseFast vs `go build`, 18 shared
+workloads incl. Go's own Easy/Medium/Hard, same match counts; ours/Go time, lower is better —
+ahead on all 18):
 
 | workload | ours/Go |
 |---|--:|
-| no-match scan of 1 MiB: literal, `[XYZ]ABC…`, 12-way alternation, `(?i)…` | 0.08–0.28 |
-| no-match scan of 1 MiB: `[ -~]*ABC…$` | 1.28 |
-| find-all over 85 KiB of bank rows (8 patterns) | 0.21–0.89, `INV-…` 1.27 |
-| find-all over 1 MiB of Czech/Greek/Cyrillic (`\p{L}+`, `\b\w+\b`, `(?i)žluť\w*`, …) | 0.15–0.79 |
-| short-string submatches (email, date, invoice number) | 0.43–0.95 |
-| compile + match / submatch per call | 0.19–0.29 |
+| no-match scan of 1 MiB: literal, `[XYZ]ABC…`, `[ -~]*ABC…$`, 12-way alternation, `(?i)…` | 0.02–0.44 |
+| find-all over 85 KiB of invoice rows (`INV-…`, with and without groups) | 0.25–0.27 |
+| find-all over 1 MiB: dense `[A-Z]+`, literal | 0.24–0.26 |
+| find-all over 1 MiB of Czech/Greek/Cyrillic (`\p{L}+`, `\b\w+\b`, `(?i)žluť\w*`, digits) | 0.05–0.32 |
+| short-string find / submatches (anchored, pair, email) | 0.58–0.88 |
+| compile + submatch per call | 0.39 |
 
-No DFA (Go has none either). Against quangdn42/regex.zig on bxp's per-row workload: ~4× faster
-per row (SPEC "Compared with").
+Against quangdn42/regex.zig on bxp's workload: ~3.7× faster per row with the pattern compiled per
+call, ~11× on precompiled find-all (SPEC "Compared with").
 
 ## Verification
 
@@ -152,11 +156,12 @@ per row (SPEC "Compared with").
   LiteralPrefix on 460 patterns; QuoteMeta of every ASCII byte. Listed divergences, pinned:
   GO_DEFECT, LITERAL_PREFIX, CAPACITY (SPEC "Anchoring").
 - The Unicode tables are checked against Go's for every code point when generated.
-- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`, 200,000 runs clean) hold
-  the engines to each other: the backtracker and the Pike VM give the same groups at every start,
-  the reader the slice's answer, leftmost-longest starts where leftmost-first does; the
-  prefilter only skips; `replaceAll("$0")` is the identity.
-- Two rounds of independent review and mutation testing (SPEC "Verification").
+- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`, 200,000 runs clean, a third
+  in a POSIX grammar of its own) hold the engines to each other: the DFA and the NFA, the
+  backtracker and the Pike VM give the same groups at every start, the reader the slice's
+  answer; leftmost-longest equals an independent substring reference; the prefilter only skips;
+  `replaceAll("$0")` is the identity.
+- Three rounds of independent review and mutation testing (SPEC "Verification").
 - The exponential-backtracking classic `(a+)+$` on `a…ab` (5,000 bytes) is instant.
 
 `zig build test-regex`

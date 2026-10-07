@@ -24,7 +24,15 @@
 //!     the matches; every match begins with `literalPrefix`, and a complete
 //!     prefix is matched in full; `quoteMeta(input)` matches the input exactly.
 //!
-//! A share of the patterns is compiled in POSIX syntax (`compilePosix`).
+//! A third of the patterns is drawn from a POSIX ERE grammar of its own
+//! (bracket expressions with `[:class:]`, intervals, stacked repetitions
+//! `a**` that only POSIX takes, now and then a Perl-only form for the
+//! refusal path) and compiled with `compilePosix`. For leftmost-longest —
+//! POSIX, and every pattern's `Longest` twin — a reference that shares no
+//! engine with it: the leftmost start from which some substring matches in
+//! full, and the longest such substring, by `fullMatch` (the DFA) over every
+//! pair of code-point boundaries. Only for patterns without assertions, whose
+//! meaning does not depend on the text around a substring.
 //!
 //! The Go oracle (`go_oracle_test.zig`) is what holds the answers to Go's;
 //! this holds the engine to itself over far more shapes. Planted mutants
@@ -33,6 +41,9 @@
 //! byte-wise iterator advance and a kept empty-adjacent match; it does NOT see
 //! `_` dropped from `\w` or a swapped split priority — pure semantics with no
 //! reference here, both killed by the Go oracle.
+//! 2026-10-07 night: a leftmost-longest that stops at its first match passes
+//! the old "starts where first does, ends no earlier" check; the substring
+//! reference fails it.
 //!
 //! Driver: `REGEX_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT` as documented there). 500 seeds also run in every
@@ -46,7 +57,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref };
 var reach: [@typeInfo(Label).@"enum".fields.len]usize = @splat(0);
 
 fn hit(comptime l: Label) void {
@@ -58,6 +69,8 @@ const Gen = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
     literal_only: bool = true,
+    /// An assertion (`^ $ \b …`) was drawn: no substring reference.
+    asserts: bool = false,
     groups: usize = 0,
 
     fn put(g: *Gen, s: []const u8) void {
@@ -78,7 +91,10 @@ fn genAtom(comptime S: type, src: *S, g: *Gen, depth: u32) void {
         3 => g.meta("."),
         4 => g.meta(([_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[[:alpha:]]", "[^[:digit:]\\n]", "\\pL", "\\p{Greek}", "\\PN", "[\\p{Lu}a]", "(?i)\\p{Ll}" })[src.index(13)]),
         5 => g.meta(([_][]const u8{ "\\d", "\\w", "\\s", "\\D", "\\W", "\\S", "\\.", "\\x{e9}", "\\Qa.\\E" })[src.index(9)]),
-        6 => g.meta(([_][]const u8{ "^", "$", "\\b", "\\B", "\\A", "\\z" })[src.index(6)]),
+        6 => {
+            g.asserts = true;
+            g.meta(([_][]const u8{ "^", "$", "\\b", "\\B", "\\A", "\\z" })[src.index(6)]);
+        },
         7 => {
             // A flag group takes no repetition of its own.
             g.meta(([_][]const u8{ "(?i)", "(?m)", "(?s)", "(?U)", "(?-i)" })[src.index(5)]);
@@ -96,6 +112,44 @@ fn genAtom(comptime S: type, src: *S, g: *Gen, depth: u32) void {
     }
 }
 
+/// An atom of POSIX ERE (Go's `CompilePOSIX`): no Perl classes, flags,
+/// non-capturing groups or lazy repetitions — `*?` is `*` repeated by `?`.
+fn genAtomPosix(comptime S: type, src: *S, g: *Gen, depth: u32) void {
+    switch (src.valueRangeAtMost(u8, 0, if (depth < 2) 11 else 7)) {
+        0, 1, 2 => g.put(([_][]const u8{ "a", "b", "c", "é", "1", " ", "-" })[src.index(7)]),
+        3 => g.meta("."),
+        4, 5 => g.meta(([_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[^]b]", "[[:alpha:]]", "[[:digit:]a]", "[^[:space:]]", "[[:upper:][:lower:]]", "[[:punct:]é]", "[-a]", "[a-a]" })[src.index(14)]),
+        6 => g.meta(([_][]const u8{ "\\.", "\\*", "\\[", "\\\\", "\\(", "\\-" })[src.index(6)]),
+        7 => {
+            if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+                // Perl only: refused here.
+                g.meta(([_][]const u8{ "\\d", "(?:a)", "(?i)a", "\\b", "\\pL", "\\Qa\\E", "[[:foo:]]" })[src.index(7)]);
+            } else {
+                g.asserts = true;
+                g.meta(([_][]const u8{ "^", "$" })[src.index(2)]);
+            }
+        },
+        else => {
+            g.meta("(");
+            g.groups += 1;
+            genAltPosix(S, src, g, depth + 1);
+            g.put(")");
+        },
+    }
+    // Repetitions, stacked now and then (`a+*`, `a{2}?`).
+    for (0..src.valueRangeAtMost(u8, 0, 2)) |_| {
+        if (src.valueRangeAtMost(u8, 0, 2) != 0) break;
+        g.meta(([_][]const u8{ "*", "+", "?", "{2}", "{0,2}", "{1,}", "{0}", "{1,3}" })[src.index(8)]);
+    }
+}
+
+fn genAltPosix(comptime S: type, src: *S, g: *Gen, depth: u32) void {
+    for (0..src.valueRangeAtMost(u8, 1, 3), 0..) |_, i| {
+        if (i != 0) g.meta("|");
+        for (0..src.valueRangeAtMost(u8, 1, 3)) |_| genAtomPosix(S, src, g, depth);
+    }
+}
+
 /// One to three alternatives of one to four atoms. A loop, not recursion:
 /// a source that keeps answering the minimum (Smith outside `--fuzz`) must
 /// still end.
@@ -108,10 +162,12 @@ fn genAlt(comptime S: type, src: *S, g: *Gen, depth: u32) void {
 
 fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var g: Gen = .{};
-    genAlt(S, src, &g, 0);
+    const posix = src.valueRangeAtMost(u8, 0, 2) == 0;
+    if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0);
     // A share of the patterns is damaged byte-wise: the parser's error paths.
     if (src.valueRangeAtMost(u8, 0, 4) == 0 and g.len != 0) {
         g.literal_only = false;
+        g.asserts = true; // `ab` damaged to `\b`: whatever it now says
         for (0..src.valueRangeAtMost(u8, 1, 3)) |_| {
             g.buf[src.index(g.len)] = ([_]u8{ '(', ')', '[', ']', '{', '}', '\\', '*', '|', 0xff, ':', '?' })[src.index(12)];
         }
@@ -136,10 +192,12 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         input = long_buf[0..ll];
     }
 
-    const posix = src.valueRangeAtMost(u8, 0, 5) == 0;
+    // Printed only when a check fails, for the replay.
+    errdefer std.debug.print("regex fuzz: {s} \"{f}\" on \"{f}\"\n", .{ if (posix) "posix" else "perl", std.zig.fmtString(pattern), std.zig.fmtString(input) });
     var re = regex.Regex.compileOptions(gpa, pattern, .{ .syntax = if (posix) .posix else .perl }) catch |e| {
         if (e == error.OutOfMemory) return e;
         hit(.refused);
+        if (posix) hit(.posix_refused);
         return;
     };
     defer re.deinit(gpa);
@@ -183,6 +241,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 
     try crossChecks(gpa, &re, &m, input, found);
     if (posix) hit(.posix);
+    if (!g.asserts and input.len <= input_buf.len) try longestReference(gpa, &re, input);
 
     if (g.literal_only and !posix) {
         hit(.literal);
@@ -281,6 +340,33 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
         defer qre.deinit(gpa);
         if (!qre.fullMatch(input)) return error.QuoteMetaDoesNotMatch;
     }
+}
+
+/// Leftmost-longest (`re` itself in POSIX syntax, its `Longest` twin
+/// otherwise) against the substring reference (see the file comment).
+fn longestReference(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8) anyerror!void {
+    var lre = re.*;
+    lre.longest = true;
+    var lm = try regex.Matcher.init(gpa, &lre);
+    defer lm.deinit();
+    const got = lm.find(input, 0);
+    var want: ?regex.Span = null;
+    var s: usize = 0;
+    while (s <= input.len and want == null) : (s += 1) {
+        if (!onBoundary(input, s)) continue;
+        var e = input.len + 1;
+        while (e > s) {
+            e -= 1;
+            if (!onBoundary(input, e)) continue;
+            if (re.fullMatch(input[s..e])) {
+                want = .{ .start = s, .end = e };
+                break;
+            }
+        }
+    }
+    hit(.longest_ref);
+    if ((got == null) != (want == null)) return error.LongestReferenceDisagrees;
+    if (got) |x| if (x.start != want.?.start or x.end != want.?.end) return error.LongestReferenceSpan;
 }
 
 /// Not inside a UTF-8 sequence: the inputs hold only ASCII, `é`/`É` and a
