@@ -960,6 +960,11 @@ that reaches it can notice.
   `check-scripts-doc` already holds each file there to a mention. A shared harness written
   in Zig that modules *import* is a different thing and goes to
   [`testkit`](modules/testkit) under §6.1 instead — `test_deps`, never `deps`.
+- **Committed measurement data follows its owner** (owner's rule, 2026-10-07). A baseline
+  that belongs to one module — `scripts/count-insns`' `count.tsv`, its instructions per
+  operation — lives in `modules/<name>/tools/`; one about zig-libs as a whole goes to a
+  repo-level `tools/` (created when the first such file exists). The script that reads it
+  is a several-module instrument and stays in `scripts/`.
 - **Audit instruments are disposable by default** (owner's rule, 2026-09-17; replaces the
   2026-09-06 wording that every measured number must have its instrument in this tree). An
   audit's durable output is the finding, the fix, and a test in `modules/<name>/src/` that
