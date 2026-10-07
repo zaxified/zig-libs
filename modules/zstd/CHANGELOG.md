@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-07** — Faster decoding of long-distance frames (Z34, the same
+  output and errors): a block whose offset table reaches 4 MB and beyond
+  is decoded 8 sequences ahead with its match sources prefetched
+  (libzstd's long-offset schedule, chosen by this module's own rule).
+  Silesia at level 19: 0.945× libzstd's cycles (was 1.027×), level 3
+  unchanged.
 - **2026-10-07** — Faster decoding (Z33, the same output): the sequence
   loop keeps the literal cursor and the history in locals instead of
   reading them through `*State` after every byte store, and the

@@ -34,7 +34,7 @@ Zig rows before std's were added 2026-10-07 (stars and pushes as of that date).
 that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
 dictionaries, training, multithreading and the seekable format without linking C. **Where we
 are behind:** run-time CPU dispatch (Z22), the legacy formats (refused), and decoding
-speed: at libzstd's (0.97–1.06× its cycles since Z33), where stdx's decoder takes 0.84–0.92×.
+speed: 1.0× libzstd's cycles at level 3 and 0.95× at level 19 (Z33, Z34), where stdx's decoder takes 0.84–0.92× at both.
 
 ## What this module is, and what it is not
 
@@ -1319,10 +1319,12 @@ frames are accepted: literals are decoded into the context's own buffer
 (libzstd parks them at the far end of `dst` when there is room, saving a
 copy — the limit that puts on a block's output is kept; its "split"
 placement, for more than 64 KB of literals with little room left, is not);
-and only the "short" sequence decoder is ported (libzstd switches to a
-prefetching one for cold dictionaries and long distances, which checks the
-bitstream's end before its last eight sequences run). On corrupt input
-either can change only the reported error. Like libzstd, the one-shot
+and the prefetching sequence loop is taken by this port's own rule (long
+offsets in the block's offset table, Z34), not libzstd's (cold
+dictionaries, past 16 MB of history), while libzstd's prefetching decoder
+checks the bitstream's end before its last eight sequences run and this
+port's loops do not. On corrupt input either can change only the reported
+error. Like libzstd, the one-shot
 decoder does not hold raw and RLE blocks to the frame's
 `Block_Maximum_Size`, while the piecewise decoder under the stream refuses
 any block over it (RFC 8878 §3.1.1.2.4) — so a malformed frame can be
@@ -3590,10 +3592,7 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   alone gave 1.06–1.09×, inside the run-to-run spread (±4 %). The change
   moves no decision (the same reads, the same order), so the decoder
   goldens and fuzz stand as its anchor (`modtest zstd`, ReleaseSafe,
-  284/284). What remains, candidates: `readBitsFast` (libzstd's
-  hot loop extracts with `bzhi`), and the prefetching sequence decoder,
-  which libzstd switches to past 16 MB of history (`mozilla`, `webster`,
-  `nci`) and this port does not have (see *Decoder*).
+  284/284). What remained went to Z34 (prefetching) and Z35 (assembly).
   Beyond parity: c4milo/stdx decodes the same frames in 0.84–0.92×
   libzstd's cycles (0.82–0.93× its instructions; same method, same run, the
   trial above at 1.00–1.02×). Its design notes (`docs/decisions.md`,
@@ -3603,6 +3602,41 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   what passed it. An assembly loop here would be a decision of its own
   (portability, the 32-bit lanes, the mutation and fuzz anchors), not part
   of Z33.
+- ~~**Z34 — Decoder: prefetch the match sources of blocks with long
+  offsets.**~~ Done 2026-10-07. About 40 % of the decoding cycles at level 3
+  and 63 % at level 19 went to the match copy's first load (`copy16`):
+  waiting on memory. `decodeAhead` runs libzstd's
+  `ZSTD_decompressSequencesLong` schedule -- decode 8 sequences ahead,
+  prefetch each one's match source (2 cache lines), execute the oldest --
+  for a block whose offset table has at least 7 256ths of its cells at 22
+  extra bits or more (offsets from 4 MB), never for the predefined table.
+  Silesia (`-mcpu=x86_64_v3`, ReleaseFast, user cycles per decode, 4
+  interleaved rounds, median): level 19 0.945× libzstd's cycles (was
+  1.027×; webster 0.76, osdb 0.85, dickens 0.88, the worst ooffice 1.06),
+  level 3 1.015× (unchanged). How the rule was chosen, on the same 24
+  frames: prefetching every block 1.18× at level 3; libzstd's rule (more
+  than 22 bits and over 16 MB of history) never fires on a level 19 window
+  of 8 MB; 20 bits at 32/256 and 22 bits with the predefined table
+  included both cost 7–10 % at level 3. Two traps measured on the way: a
+  second copy of the loop inside `decompressSequences` slowed the plain
+  loop by 14 % (inlining and registers), and handing it `&ss`, `&op`,
+  `&lit` put them back in memory (Z33's cause) -- it is `noinline` and
+  takes and returns them by value. Anchor: both loops forced on and off
+  over the corpus at levels 1, 3 and 19, with damaged copies, must give the
+  same bytes or the same error (`decoder_test.zig`); the rule itself
+  changes no output, so mutants of its thresholds are equivalent by
+  construction (what they change is measured above, not tested).
+- **Z35 — Decoder: the sequence loop in assembly (x86-64, aarch64).**
+  Approved by the user 2026-10-07, then deferred by them in favour of Z34
+  after the numbers: a BMI2 x86-64 loop (decode with `shrx`/`bzhi`, no
+  branch per read; 32-byte literal copies; the Zig `execSequence` for
+  anything outside the margins) decoded the 36 Silesia frames of levels 1,
+  3 and 19 byte for byte and took 0.968× libzstd's cycles at level 3 (the
+  Zig loop 1.012×) and 1.001× at level 19 (1.005×), with 0.92× its
+  instructions. A first version shifting through `cl` was 1.12–1.29×; one
+  that loaded a match's second 16 bytes unconditionally was 1.33× on
+  dickens level 19 (a second cache line, a second miss). aarch64 not
+  written. Worth reopening only on top of Z34, against its numbers.
 - ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
   *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
   `contrib/seekable_format`.

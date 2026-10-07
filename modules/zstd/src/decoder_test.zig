@@ -494,3 +494,56 @@ test "frames no encoder writes decode as in libzstd (4 streams of 6 literals, X1
         try std.testing.expectEqual(cs.out_fnv, Crafted.fnv(got.items));
     }
 }
+
+const dblock = @import("dblock.zig");
+const corpus = @import("testdata/corpus.zig");
+
+const Outcome = union(enum) { ok: []u8, err: anyerror };
+
+fn decodeWith(mode: dblock.PrefetchMode, src: []const u8) Outcome {
+    dblock.setPrefetchForTest(mode);
+    return if (decodeAll(src)) |out| .{ .ok = out } else |e| .{ .err = e };
+}
+
+test "the prefetching sequence loop decodes as the plain one, valid and damaged frames" {
+    // No corpus input is large enough for the decoder to pick the
+    // prefetching loop by itself (offsets of 4 MB and up), so both loops are
+    // forced, and must agree on every frame and every damaged copy: the
+    // same bytes, or the same error.
+    defer dblock.setPrefetchForTest(.auto);
+    var prng: std.Random.DefaultPrng = .init(0x5eed_2034);
+    const rnd = prng.random();
+    var frames: usize = 0;
+    for (corpus.cases) |case| {
+        if (case.len > 100_000) continue;
+        const src = try gpa.alloc(u8, case.len);
+        defer gpa.free(src);
+        corpus.generate(case, src);
+        for ([_]i32{ 1, 3, 19 }) |level| {
+            const z = try zstd.compressAlloc(gpa, src, .{ .level = level });
+            defer gpa.free(z);
+            frames += 1;
+            for (0..9) |round| {
+                const damaged = try gpa.dupe(u8, z);
+                defer gpa.free(damaged);
+                if (round > 0) damaged[rnd.uintLessThan(usize, damaged.len)] ^= @as(u8, 1) << rnd.int(u3);
+                const a = decodeWith(.always, damaged);
+                defer if (a == .ok) gpa.free(a.ok);
+                const b = decodeWith(.never, damaged);
+                defer if (b == .ok) gpa.free(b.ok);
+                switch (a) {
+                    .ok => |out| {
+                        try std.testing.expect(b == .ok);
+                        try std.testing.expectEqualSlices(u8, b.ok, out);
+                        if (round == 0) try std.testing.expectEqualSlices(u8, src, out);
+                    },
+                    .err => |e| {
+                        try std.testing.expect(b == .err);
+                        try std.testing.expectEqual(b.err, e);
+                    },
+                }
+            }
+        }
+    }
+    try std.testing.expect(frames > 50);
+}

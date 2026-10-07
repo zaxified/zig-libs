@@ -8,17 +8,20 @@
 //! - literals always live in the context's own buffer (or in the source,
 //!   for raw literals with room behind them), never inside `dst` — libzstd
 //!   parks them at the far end of `dst` when it can, to save a copy;
-//! - only the "short" sequence decoder is ported; libzstd switches to the
-//!   prefetching one for cold dictionaries and long distances, which
-//!   executes the same sequences in the same order.
-//! On corrupt input either choice can change which error is reported (not
-//! whether one is): the prefetching decoder checks the end of the bitstream
-//! before executing its last eight sequences. Where libzstd would put the
+//! - the prefetching sequence loop (`decodeAhead`, libzstd's
+//!   `ZSTD_decompressSequencesLong` schedule) is chosen by this port's own
+//!   rule (`usePrefetch`: long offsets in the block's table), not by
+//!   libzstd's (cold dictionaries, past 16 MB of history); both loops
+//!   execute the same sequences in the same order, with the same errors.
+//! On corrupt input libzstd's choice can change which error it reports (not
+//! whether one is): its prefetching decoder checks the end of the bitstream
+//! before executing its last eight sequences, which `decodeAhead` does not. Where libzstd would put the
 //! literals into `dst`, the limit that puts on the block's output is kept
 //! (see `decompressBlock`); its "split" placement (over 64 KB of literals
 //! with little room left) is not, which again changes only the error.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fill = @import("fill.zig");
 const dbits = @import("dbits.zig");
 const huf = @import("huf_dec.zig");
@@ -733,6 +736,101 @@ inline fn execSequence(h: *const History, op_in: usize, oend: usize, seq_in: Seq
     return sequence_length;
 }
 
+/// The prefetching loop's lead: libzstd's `STORED_SEQS`.
+const decode_ahead = 8;
+/// A block takes the prefetching loop (`decodeAhead`) when at least
+/// `prefetch_min_share` 256ths of its offset table's cells are codes of
+/// `prefetch_offset_bits` extra bits or more: offsets of 4 MB and up, past
+/// the caches. libzstd's rule (`ZSTD_getOffsetInfo`): more than 22 bits, 7
+/// 256ths, and only past 16 MB of history -- which never fires for a level
+/// 19 window of 8 MB. Measured 2026-10-07 on the Silesia corpus (SPEC.md,
+/// Z34): level 19 0.94x the plain loop's cycles (webster 0.75, mr 0.79,
+/// dickens 0.87), level 3 unchanged; prefetching every block costs 18 % at
+/// level 3. The predefined table says nothing about the block's offsets
+/// (it lists codes to 28) and never selects it.
+const prefetch_offset_bits = 22;
+const prefetch_min_share = 7;
+
+pub const PrefetchMode = enum { auto, always, never };
+/// Test hook: the suite decodes with the loop forced on and off and
+/// compares. A constant outside tests.
+const prefetch_toggle = if (builtin.is_test) struct {
+    var mode: PrefetchMode = .auto;
+} else struct {
+    const mode: PrefetchMode = .auto;
+};
+/// Void outside tests (a `@compileError` body would trip the gates that
+/// reference every public declaration).
+pub const setPrefetchForTest = if (builtin.is_test) setPrefetchMode else {};
+fn setPrefetchMode(mode: PrefetchMode) void {
+    prefetch_toggle.mode = mode;
+}
+
+fn usePrefetch(st: *const State) bool {
+    return switch (prefetch_toggle.mode) {
+        .always => true,
+        .never => false,
+        .auto => st.of_ptr != &of_default and longOffsetShare(st.of_ptr) >= prefetch_min_share,
+    };
+}
+
+/// `ZSTD_getOffsetInfo`'s `longOffsetShare`, scaled to 256ths.
+fn longOffsetShare(t: *const SeqTable) u32 {
+    const n = @as(u32, 1) << @intCast(t.table_log);
+    var c: u32 = 0;
+    for (t.cells[0..n]) |cell| c += @intFromBool(cell.nb_additional_bits >= prefetch_offset_bits);
+    return c << @intCast(off_fse_log - t.table_log);
+}
+
+const AheadOut = struct { ss: SeqState, op: usize, lit_pos: usize };
+
+/// `ZSTD_decompressSequencesLong`'s schedule: decodes `decode_ahead`
+/// sequences in front of the one it executes and prefetches each one's
+/// match source, so that its load has left memory by the time the
+/// sequence runs. The same reads and the same executions in the same
+/// order as the plain loop -- the same bytes and the same errors. Out of
+/// line, so that the plain loop keeps its registers.
+noinline fn decodeAhead(ss_in: SeqState, hl: History, op_in: usize, oend: usize, lit_in: LitCursor, nb_seq: u32) Error!AheadOut {
+    var ss = ss_in;
+    var lit = lit_in;
+    var op = op_in;
+    var ring: [decode_ahead]Seq = undefined;
+    const total: usize = nb_seq;
+    var pf_pos: usize = op;
+    var decoded: usize = 0;
+    while (decoded < decode_ahead) : (decoded += 1) {
+        const seq = decodeSequence(&ss, false);
+        prefetchMatch(hl.out, pf_pos, seq);
+        pf_pos +%= seq.lit_length +% seq.match_length;
+        ring[decoded] = seq;
+    }
+    var done: usize = 0;
+    while (decoded < total) : ({
+        decoded += 1;
+        done += 1;
+    }) {
+        const seq = decodeSequence(&ss, decoded + 1 == total);
+        prefetchMatch(hl.out, pf_pos, seq);
+        pf_pos +%= seq.lit_length +% seq.match_length;
+        op += try execSequence(&hl, op, oend, ring[done % decode_ahead], &lit);
+        ring[decoded % decode_ahead] = seq;
+    }
+    while (done < total) : (done += 1) op += try execSequence(&hl, op, oend, ring[done % decode_ahead], &lit);
+    return .{ .ss = ss, .op = op, .lit_pos = lit.pos };
+}
+
+/// Prefetches the two cache lines a match starting at `pos` in `out`
+/// reads first. A match reaching before `out` (into a dictionary) is not
+/// prefetched; on a corrupt stream the address may be anything, which a
+/// prefetch never faults on.
+inline fn prefetchMatch(out: []u8, pos: usize, seq: Seq) void {
+    const at = pos +% seq.lit_length;
+    if (seq.offset > at) return;
+    const addr = @intFromPtr(out.ptr) +% (at - seq.offset);
+    @prefetch(@as([*]const u8, @ptrFromInt(addr)), .{ .rw = .read, .locality = 3, .cache = .data });
+    @prefetch(@as([*]const u8, @ptrFromInt(addr +% 64)), .{ .rw = .read, .locality = 3, .cache = .data });
+}
+
 /// `ZSTD_decompressSequences_body`. Writes at `h.out[op0..op0 + capacity]`.
 fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usize, src: []const u8, nb_seq_in: u32) Error!usize {
     var op = op0;
@@ -752,6 +850,15 @@ fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usiz
         // pointers a byte store may alias (see `LitCursor`).
         const hl = h.*;
         var lit: LitCursor = .{ .src = st.lit_src, .pos = st.lit_pos, .end = st.lit_end };
+        if (nb_seq > decode_ahead and usePrefetch(st)) {
+            // By value in and out: an address handed to a call would put
+            // these back in memory for the loop below (see `LitCursor`).
+            const r = try decodeAhead(ss, hl, op, oend, lit, nb_seq);
+            ss = r.ss;
+            op = r.op;
+            lit.pos = r.lit_pos;
+            nb_seq = 0;
+        }
         while (nb_seq != 0) : (nb_seq -= 1) {
             const seq = decodeSequence(&ss, nb_seq == 1);
             op += try execSequence(&hl, op, oend, seq, &lit);
